@@ -67,7 +67,20 @@ export type HarnessEvent =
       sessionId: string;
       reason: string;
     }
-  | { type: 'step_start'; stepN: number }
+  | {
+      type: 'step_start';
+      stepN: number;
+      // Local chars/4 estimate of the prompt tokens about to be sent.
+      // Computed via `providers/tokens.ts:estimatePromptTokens` over
+      // the full outbound payload (messages + system + tool schemas).
+      // Lets the TUI render a `↑ ~N` cell on the live chip before
+      // any provider event has arrived — operator sees an input
+      // signal from frame 1 of the turn, even on providers that only
+      // emit official usage at stream close (OpenAI). The official
+      // count replaces this estimate the moment `assistant:usage`
+      // lands. Optional only for legacy / replay paths.
+      promptTokensEstimate?: number;
+    }
   | { type: 'provider_event'; event: StreamEvent }
   | {
       type: 'tool_invoking';

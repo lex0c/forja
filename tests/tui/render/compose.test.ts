@@ -126,6 +126,8 @@ describe('composeLive layout', () => {
       outputTokens: null,
       cacheRead: null,
       cacheCreation: null,
+      outputEstimated: 0,
+      inputEstimated: null,
     };
     const tool: ActiveTool = {
       toolId: 't1',
@@ -173,6 +175,8 @@ describe('composeLive layout', () => {
       outputTokens: null,
       cacheRead: null,
       cacheCreation: null,
+      outputEstimated: 0,
+      inputEstimated: null,
     };
     const out = composeLive(s, caps, 1000);
     // [BLANK, chip, BLANK, rule, input, rule, footer] = 7.
@@ -212,6 +216,8 @@ describe('composeLive layout', () => {
       outputTokens: null,
       cacheRead: null,
       cacheCreation: null,
+      outputEstimated: 0,
+      inputEstimated: null,
     };
     s.thinking = { startedAt: 0, messageId: 'm1' };
     const out = composeLive(s, caps, 1000);

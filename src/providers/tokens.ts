@@ -1,4 +1,9 @@
-import type { ProviderMessage, ProviderToolDef } from './types.ts';
+import {
+  estimateOpenAIMessagesTokens,
+  estimateOpenAIPromptTokens,
+  estimateOpenAITextTokens,
+} from './tokens-openai.ts';
+import type { ProviderFamily, ProviderMessage, ProviderToolDef } from './types.ts';
 
 // Local chars/4 heuristic for prompt token estimation. Used where a
 // real per-provider tokenizer would be expensive or unavailable:
@@ -67,4 +72,44 @@ export const estimatePromptTokens = (
   }
   for (const m of messages) chars += charsInMessage(m);
   return Math.ceil(chars / 4);
+};
+
+// Per-provider prompt-token estimator. Dispatches on `ProviderFamily`
+// to pick the most accurate LOCAL tokenizer available (TOKEN_TUNING.md
+// §8.1):
+//   - openai → tiktoken o200k_base via `tokens-openai.ts` (~0.5% error)
+//   - everything else → chars/4 heuristic (~5-25% error)
+//
+// Used by the harness pre-flight (forwarded to the chip as
+// `inputEstimated`) AND by the tokenizer-discrepancy detector so the
+// `chars/4 vs official` ratio collapses to near-zero on OpenAI, and
+// the forensic signal stays meaningful for the heuristic providers.
+// Anthropic stays on chars/4 because their tokenizer isn't public
+// and any community port would drift relative to billed counts.
+export const estimatePromptTokensFor = (
+  family: ProviderFamily,
+  messages: ProviderMessage[],
+  options: { system?: string; tools?: readonly ProviderToolDef[] } = {},
+): number => {
+  if (family === 'openai') return estimateOpenAIPromptTokens(messages, options);
+  return estimatePromptTokens(messages, options);
+};
+
+// Per-provider just-the-messages estimator. Mirror of the dispatch
+// above for the Provider.countTokens interface.
+export const estimateMessagesTokensFor = (
+  family: ProviderFamily,
+  messages: ProviderMessage[],
+): number => {
+  if (family === 'openai') return estimateOpenAIMessagesTokens(messages);
+  return estimateMessagesTokens(messages);
+};
+
+// Per-provider plain-text estimator for OUTPUT-side accounting (no
+// message framing, just the streamed assistant text). Used by the
+// tokenizer-discrepancy detector against `usage.output_tokens`.
+export const estimateTextTokensFor = (family: ProviderFamily, text: string): number => {
+  if (family === 'openai') return estimateOpenAITextTokens(text);
+  // Chars/4 with ceiling — empty string contributes 0.
+  return text.length === 0 ? 0 : Math.ceil(text.length / 4);
 };

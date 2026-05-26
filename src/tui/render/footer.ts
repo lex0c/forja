@@ -20,6 +20,35 @@ const formatCost = (usd: number): string => {
   return `$${usd.toFixed(4)}`;
 };
 
+// Linear-projection of the session's end-of-run cost, assuming each
+// remaining step costs the same as the current per-step average.
+// Returns the formatted `→ ~$X.XX` tail OR null when not enough
+// signal yet / no cap configured.
+//
+// Suppressed cases:
+//   - `steps === 0` (no per-step average yet)
+//   - `maxSteps === 0` (no cap, no horizon to project to)
+//   - `steps >= maxSteps` (no remaining steps — projection collapses
+//     to current cost and adding `→ ~$X` is just noise)
+//   - `costUsd <= 0` (nothing burned yet, projection of zero growth
+//     is meaningless)
+//   - `projected <= costUsd` (numerical edge — degenerate state, hide
+//     rather than print a tail that doesn't add information)
+//
+// The projection uses `cost * (maxSteps / steps)`. It assumes linear
+// growth, which over-estimates on sessions where early steps burn
+// disproportionately (compaction, system-prompt heavy first turn)
+// and under-estimates on sessions where later steps escalate. Both
+// drift directions are acceptable: the projection's job is "is this
+// run going to be expensive enough that I should abort", not exact
+// forecasting — the chip already carries the precise burned cost.
+const projectCost = (costUsd: number, steps: number, maxSteps: number): string | null => {
+  if (steps <= 0 || maxSteps <= 0 || steps >= maxSteps || costUsd <= 0) return null;
+  const projected = costUsd * (maxSteps / steps);
+  if (projected <= costUsd) return null;
+  return `→ ~${formatCost(projected)}`;
+};
+
 // True iff something is animating in the live region (a tool is
 // running, the model is generating text, or thinking is active).
 // Drives the contextual "esc to interrupt" hint.
@@ -109,7 +138,18 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
     rightParts.push(dim(caps, `• ${status.model ?? ''}`));
     if (status.planMode) rightParts.push(dim(caps, 'plan'));
     if (status.maxSteps > 0) rightParts.push(dim(caps, `${status.steps}/${status.maxSteps}`));
-    rightParts.push(dim(caps, formatCost(status.costUsd)));
+    // Cost cell + optional `→ ~$X.XX` projection tail. The projection
+    // attaches to the cost cell rather than getting its own slot —
+    // the two numbers belong to the same "money" group, and the
+    // arrow makes the relationship visible at a glance. The
+    // `~` prefix on the projected number flags it as estimate
+    // (matches the chip's `↑ ~N` / `↓ ~N` convention).
+    const projection = projectCost(status.costUsd, status.steps, status.maxSteps);
+    const costCell =
+      projection !== null
+        ? `${formatCost(status.costUsd)} ${projection}`
+        : formatCost(status.costUsd);
+    rightParts.push(dim(caps, costCell));
     if (state.bgProcesses.size > 0) {
       rightParts.push(dim(caps, `bg ${state.bgProcesses.size}`));
     }

@@ -116,6 +116,15 @@ export type InputUpdateEvent = BaseEvent & {
 export type AssistantStartEvent = BaseEvent & {
   type: 'assistant:start';
   messageId: string;
+  // Pre-flight prompt-token estimate forwarded from `step_start` —
+  // chars/4 of the outbound payload (`messages` + system + tool
+  // schemas), computed by the harness in `providers/tokens.ts`. Lets
+  // the live chip render a `↑ ~N` cell from frame 1 of the turn,
+  // before any provider event has arrived. Replaced by the official
+  // `inputTokens` once `assistant:usage` lands. Absent on legacy /
+  // replay paths or when the adapter didn't observe a preceding
+  // `step_start` (out-of-order streams).
+  inputEstimated?: number;
 };
 export type AssistantDeltaEvent = BaseEvent & {
   type: 'assistant:delta';

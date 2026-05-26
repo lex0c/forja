@@ -1,9 +1,10 @@
 import OpenAI from 'openai';
-// Shared chars/4 heuristic — see `src/providers/tokens.ts` for accuracy
-// bounds. OpenAI has no server-side countTokens endpoint until tiktoken
-// lands in M5.
 import { deriveSeedFromRequest } from '../seed.ts';
-import { estimateMessagesTokens } from '../tokens.ts';
+// Local tiktoken (o200k_base) via gpt-tokenizer. Spec TOKEN_TUNING.md
+// §8.1: OpenAI tokenizer is public, accuracy ~0.5%. The harness uses
+// the same path for its pre-flight `inputEstimated` so the live chip
+// shows a near-billable count from frame 1 of the turn.
+import { estimateOpenAIMessagesTokens } from '../tokens-openai.ts';
 import type {
   ConstrainedRequest,
   ConstrainedResult,
@@ -218,6 +219,6 @@ export const createOpenAIProvider = (
     generateConstrained: (_req: ConstrainedRequest): Promise<ConstrainedResult> =>
       Promise.reject(new Error('generateConstrained not implemented for OpenAI in M4.2')),
     countTokens: (messages: ProviderMessage[]): Promise<number> =>
-      Promise.resolve(estimateMessagesTokens(messages)),
+      Promise.resolve(estimateOpenAIMessagesTokens(messages)),
   };
 };

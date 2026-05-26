@@ -520,11 +520,20 @@ describe('createOpenAIProvider', () => {
     expect(err?.message).toMatch(/tool_use blocks must appear on assistant/);
   });
 
-  test('countTokens uses the chars/4 heuristic', async () => {
+  test('countTokens uses the o200k_base tiktoken (slice 6)', async () => {
+    // Pre-slice-6 this was chars/4 ("12 / 4 = 3"). The provider now
+    // routes through `estimateOpenAIMessagesTokens` which uses the
+    // real tiktoken o200k_base BPE. The exact count for "hello world!"
+    // depends on the encoding's internal merges — we pin a tight
+    // range (3-5 tokens) that holds across gpt-tokenizer minor
+    // versions, plus the message-framing overhead (~3 tokens).
     const provider = createOpenAIProvider('gpt-4o', { apiKey: 'sk-test' });
-    // 12 chars / 4 = 3
     const tokens = await provider.countTokens([{ role: 'user', content: 'hello world!' }]);
-    expect(tokens).toBe(3);
+    // Body is 2-3 tokens, framing adds ~3. Realistic total: 5-7.
+    // The previous `=== 3` expectation would have signaled tiktoken
+    // ran with the wrong encoding or didn't run at all.
+    expect(tokens).toBeGreaterThanOrEqual(5);
+    expect(tokens).toBeLessThanOrEqual(10);
   });
 
   test('countTokens accounts for tool_use and tool_result blocks', async () => {

@@ -23,6 +23,7 @@
 
 export type FailureClass =
   | 'provider'
+  | 'tokenizer'
   | 'tool'
   | 'sandbox'
   | 'permission'
@@ -35,6 +36,7 @@ export type FailureClass =
 
 export const FAILURE_CLASSES: ReadonlySet<FailureClass> = new Set<FailureClass>([
   'provider',
+  'tokenizer',
   'tool',
   'sandbox',
   'permission',
@@ -109,6 +111,23 @@ export const CODE_VOCABULARY: ReadonlyMap<string, FailureClass> = new Map<string
   // model only acted on the last 500" — without this row that
   // discrepancy is invisible to any post-hoc query.
   ['storage.resume_truncated', 'storage'],
+  // Tokenizer subsystem (TOKEN_TUNING.md §8.3). Emitted when the
+  // local chars/4 estimate diverges from the provider's billed
+  // count by more than ±10%. Two distinct sub-shapes:
+  //   - `tokenizer.discrepancy.input`  — estimated prompt size vs
+  //                                       `usage.input_tokens`.
+  //   - `tokenizer.discrepancy.output` — local `text.length / 4`
+  //                                       vs `usage.output_tokens`.
+  // Recovery is always `degraded`: estimate is still usable for the
+  // compaction trigger (which over-estimates conservatively), but a
+  // sustained >10% drift means our heuristic is increasingly wrong
+  // for this provider/model (model changed tokenizer, language
+  // shifted, code-heavy turn). Payload carries both numbers so
+  // forensics can compute the ratio over time and decide whether
+  // the heuristic needs a recalibration or the model is genuinely
+  // out of distribution.
+  ['tokenizer.discrepancy.input', 'tokenizer'],
+  ['tokenizer.discrepancy.output', 'tokenizer'],
 ]);
 
 export const isFailureCode = (code: string): boolean => CODE_VOCABULARY.has(code);

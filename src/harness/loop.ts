@@ -45,7 +45,7 @@ import type {
   ProviderToolResultBlock,
   ProviderToolUseBlock,
 } from '../providers/index.ts';
-import { estimatePromptTokens } from '../providers/tokens.ts';
+import { estimatePromptTokensFor } from '../providers/tokens.ts';
 import { buildAutoTerse } from '../recap/auto-display.ts';
 import { projectRecap } from '../recap/projection.ts';
 import { buildResumeContext, shouldSkipResumeContext } from '../recap/resume-context.ts';
@@ -84,6 +84,7 @@ import {
   messagesToProviderMessages,
 } from './resume.ts';
 import { DEFAULT_RETRY, generateWithRetry } from './retry.ts';
+import { checkTokenizerDiscrepancy } from './tokenizer-discrepancy.ts';
 import {
   type ExitReason,
   type HarnessConfig,
@@ -2384,7 +2385,25 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         }
 
         steps += 1;
-        safeEmit(config.onEvent, { type: 'step_start', stepN: steps });
+        // Pre-flight token estimate of the outbound payload (messages
+        // + system + tool schemas). Forwarded on step_start so the
+        // TUI's live assistant chip can render a `↑ ~N` cell from the
+        // first frame of the turn, before any provider event arrives.
+        // Dispatches per provider family (TOKEN_TUNING.md §8.1):
+        // OpenAI uses the real o200k_base tokenizer (~0.5% error);
+        // everything else uses the chars/4 heuristic (~5-25% error).
+        // Replaced by the provider's official count once
+        // `assistant:usage` lands at message_start (Anthropic) /
+        // message_stop (OpenAI).
+        const promptTokensEstimate = estimatePromptTokensFor(config.provider.family, messages, {
+          ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
+          ...(tools.length > 0 ? { tools } : {}),
+        });
+        safeEmit(config.onEvent, {
+          type: 'step_start',
+          stepN: steps,
+          promptTokensEstimate,
+        });
 
         const resolvedMaxTokens = resolveMaxOutputTokens(budget, config.provider.capabilities);
         const req: GenerateRequest = {
@@ -2521,6 +2540,29 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // accepted and processed. Flipping the flag tells the renderer
         // to mark aggregate cost as a lower bound.
         if (!collected.usageSeen) usageComplete = false;
+
+        // Tokenizer-discrepancy check (TOKEN_TUNING.md §8.3). Only
+        // meaningful when we have both ends of the comparison — the
+        // pre-flight estimate AND the provider-billed numbers. Best-
+        // effort: the helper internally swallows sink failures so a
+        // forensics-table write hiccup can't derail the loop. We
+        // skip when there's no failureSink wired (caller didn't ask
+        // for forensics) or when usage didn't arrive — the codes
+        // module enforces the vocabulary, but the loop is the right
+        // place to gate on "do we have inputs that produce a
+        // meaningful answer".
+        if (collected.usageSeen && config.failureSink !== undefined) {
+          checkTokenizerDiscrepancy({
+            sessionId,
+            stepN: steps,
+            providerId: config.provider.id,
+            providerFamily: config.provider.family,
+            inputEstimated: promptTokensEstimate,
+            collectedText: collected.text,
+            usage: collected.usage,
+            failureSink: config.failureSink,
+          });
+        }
 
         // === Self-critique gate (ORCHESTRATION.md §6) ===
         // Runs BEFORE the assistant turn is persisted so a `redo`
@@ -3853,10 +3895,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // sail over the cap when the surrounding overhead is what's
         // pushing it close.
         //
-        // estimatePromptTokens is the local chars/4 heuristic: free
-        // (no HTTP), conservative (overestimates by ~10-25% vs real
-        // tokenizers), good enough for a 70%-of-window threshold that
-        // already includes a buffer.
+        // estimatePromptTokensFor dispatches per provider family —
+        // OpenAI uses real o200k_base tiktoken (~0.5% error); other
+        // families fall back to chars/4 (~5-25% error, conservative
+        // bias). Both are free (no HTTP) and good enough for a
+        // 70%-of-window threshold that already includes a buffer,
+        // but the OpenAI path also gives compaction a much tighter
+        // estimate of when to actually fire.
         //
         // DB messages stay untouched; only the in-memory `messages`
         // array sent to the provider gets rewritten. Audit + replay can
@@ -3872,7 +3917,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           steps < budget.maxSteps &&
           config.provider.capabilities.context_window > 0
         ) {
-          const promptTokens = estimatePromptTokens(messages, {
+          const promptTokens = estimatePromptTokensFor(config.provider.family, messages, {
             ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
             ...(tools.length > 0 ? { tools } : {}),
           });

@@ -119,6 +119,13 @@ interface AdapterState {
   // cost field anyway. Kept here so a future patch that surfaces
   // running cost on step_start has a place to live.
   costUsd: number;
+  // Stashed prompt-token estimate from the most recent `step_start`.
+  // Forwarded onto the next `assistant:start` so the chip can render
+  // `↑ ~N` from frame 1 of the turn. Cleared after each forward (so a
+  // later orphan `assistant:start` without a preceding `step_start`
+  // doesn't inherit a stale estimate). Null when no step has fired
+  // yet or the harness didn't carry an estimate (legacy / replay).
+  pendingPromptEstimate: number | null;
 }
 
 // Map the harness's exit reason to the renderer's `session:end.reason`.
@@ -159,6 +166,7 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
     steps: 0,
     costUsd: 0,
     providerWaiting: false,
+    pendingPromptEstimate: null,
   };
 
   // Close the "Awaiting model" indicator. Called from the
@@ -273,6 +281,13 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
 
       case 'step_start': {
         state.steps = event.stepN;
+        // Stash the prompt-token estimate so the next `assistant:start`
+        // can forward it onto the UI. We don't emit a separate event
+        // — the chip needs both the messageId (only known when the
+        // provider's `start` arrives) and the estimate, so it's
+        // cleaner to merge them on `assistant:start` than to plumb a
+        // parallel signal the reducer would have to correlate.
+        state.pendingPromptEstimate = event.promptTokensEstimate ?? null;
         out.push({
           type: 'step:budget',
           ts,
@@ -317,7 +332,19 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
             endThinking(ts, out);
             endAssistant(ts, out);
             state.currentMessageId = ev.message_id;
-            out.push({ type: 'assistant:start', ts, messageId: ev.message_id });
+            // Forward the stashed pre-flight estimate (if any). Clear
+            // it so a later orphan provider `start` (no preceding
+            // step_start — out-of-order replay) doesn't reuse a stale
+            // number from a prior step.
+            out.push({
+              type: 'assistant:start',
+              ts,
+              messageId: ev.message_id,
+              ...(state.pendingPromptEstimate !== null
+                ? { inputEstimated: state.pendingPromptEstimate }
+                : {}),
+            });
+            state.pendingPromptEstimate = null;
             return out;
 
           case 'text_delta': {

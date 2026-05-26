@@ -41,6 +41,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "~0.91.1",
     "@google/genai": "~1.50.1",
+    "gpt-tokenizer": "^3.4.0",
     "openai": "~6.34.0",
     "remark": "^15.0.1",
     "remark-gfm": "^4.0.1",

@@ -313,9 +313,16 @@ describe('normalizeAnthropicStream', () => {
     }
   });
 
-  test('does NOT double-emit usage on the happy path', async () => {
-    // Both message_stop and finally can emit; the usageEmitted
-    // sentinel must guard against doubling.
+  test('emits usage TWICE on the happy path: once on message_start (input+cache, early), once on message_stop (full)', async () => {
+    // Anthropic carries `input_tokens` + `cache_*` on
+    // `message_start.message.usage` (cumulative for the whole
+    // message — these numbers don't change later) and the final
+    // `output_tokens` on `message_delta.usage` right before
+    // `message_stop`. We emit twice so the live chip can render
+    // the input/cache numbers from frame 1 of the turn (long turns
+    // would otherwise show `[Xs]` with no token signal for minutes).
+    // The `finally` branch is still guarded by `usageEmitted` so a
+    // happy-path stream doesn't get a third emit on iterator close.
     const events = await collect(
       normalizeAnthropicStream(
         fromEvents([
@@ -330,7 +337,19 @@ describe('normalizeAnthropicStream', () => {
       ),
     );
     const usageEvents = events.filter((e) => e.kind === 'usage');
-    expect(usageEvents).toHaveLength(1);
+    expect(usageEvents).toHaveLength(2);
+    // Pin the contents: first carries input only (output not seen
+    // yet), second carries the full cumulative numbers.
+    if (usageEvents[0]?.kind === 'usage') {
+      expect(usageEvents[0].usage.input).toBe(10);
+      expect(usageEvents[0].usage.output).toBe(0);
+    }
+    if (usageEvents[1]?.kind === 'usage') {
+      expect(usageEvents[1].usage.input).toBe(10);
+      expect(usageEvents[1].usage.output).toBe(5);
+    }
+    // No third emit from the `finally` branch.
+    expect(events.filter((e) => e.kind === 'usage')).toHaveLength(2);
   });
 
   test('emits a usage event with input/output/cache splits from message_start + message_delta', async () => {
@@ -361,7 +380,13 @@ describe('normalizeAnthropicStream', () => {
         ]),
       ),
     );
-    const u = events.find((e) => e.kind === 'usage');
+    // Two usage emits now (start + stop) — the final/canonical
+    // numbers live on the LAST one. The early start-time emit carries
+    // input + cache numbers only (output still 0); the stop-time emit
+    // carries the full cumulative shape.
+    const usages = events.filter((e) => e.kind === 'usage');
+    expect(usages).toHaveLength(2);
+    const u = usages.at(-1);
     if (u?.kind !== 'usage') throw new Error('expected usage event');
     expect(u.usage).toEqual({ input: 200, output: 17, cache_read: 1000, cache_creation: 500 });
   });
@@ -389,7 +414,9 @@ describe('normalizeAnthropicStream', () => {
         ]),
       ),
     );
-    const u = events.find((e) => e.kind === 'usage');
+    // Two usage emits (start + stop); the FINAL one carries the
+    // running-max output. The start-time emit carried output: 0.
+    const u = events.filter((e) => e.kind === 'usage').at(-1);
     if (u?.kind !== 'usage') throw new Error('expected usage event');
     expect(u.usage.output).toBe(50);
     expect(u.usage.input).toBe(200);

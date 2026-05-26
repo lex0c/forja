@@ -124,6 +124,24 @@ export async function* normalizeAnthropicStream(
         case 'message_start':
           yield { kind: 'start', message_id: event.message.id };
           mergeUsage(event.message.usage);
+          // Emit usage immediately so the live chip can render the
+          // input/cache numbers from the first frame of the turn.
+          // Anthropic carries input_tokens + cache_* on
+          // `message_start.message.usage` (cumulative for the whole
+          // message — these numbers don't change later). Without this
+          // emit, the chip would only see `usage` at `message_stop`,
+          // which on long turns means several minutes of `[Xs]` with
+          // no token signal at all. We DO NOT mark `usageEmitted` here
+          // because the message-stop branch still needs to emit the
+          // final usage (which carries the output_tokens delta).
+          if (usageSeen) {
+            // Snapshot the accumulator: subsequent merges (output
+            // tokens at message_delta) will mutate `usage` in place,
+            // and the consumer holds a reference. Without the spread,
+            // a test (or any consumer that buffers events) would
+            // observe the post-stop numbers on the first emit too.
+            yield { kind: 'usage', usage: { ...usage } };
+          }
           break;
 
         case 'content_block_start':

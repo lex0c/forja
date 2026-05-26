@@ -159,6 +159,28 @@ export interface PendingAssistant {
   outputTokens: number | null;
   cacheRead: number | null;
   cacheCreation: number | null;
+  // Local estimate of output tokens accumulated from `assistant:delta`
+  // text length (chars/4 heuristic — `~5-25%` drift on English, more
+  // on code-heavy turns per TOKEN_TUNING.md §8.1). Lives alongside
+  // `outputTokens` so the chip can render `↓ ~234` during streaming
+  // and switch to `↓ 234` (no tilde) the moment the official count
+  // lands at `message_stop`. Reset to 0 at `assistant:start`.
+  //
+  // The estimate is intentionally NOT merged with `outputTokens` — we
+  // keep "estimated" and "official" as separate signals so the
+  // operator can see whether the number on screen is provider-
+  // authoritative or local guesswork. Estimation lying small is fine
+  // (compaction trigger is conservative); lying small while *looking*
+  // authoritative is the failure mode this split avoids.
+  outputEstimated: number;
+  // Pre-flight prompt-token estimate forwarded via
+  // `assistant:start.inputEstimated` (originating from the harness's
+  // `step_start.promptTokensEstimate` — chars/4 over the outbound
+  // payload). Stamped once at turn start; never updated. The chip
+  // prefers `inputTokens` (official) when present, falls back to
+  // `inputEstimated` with a `~` prefix. Null when the producer
+  // didn't carry an estimate (legacy / replay / orphan stream).
+  inputEstimated: number | null;
 }
 
 // One option in a confirm modal. Spec: UI.md §5.5 / §4.10.13.
@@ -948,6 +970,8 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             outputTokens: null,
             cacheRead: null,
             cacheCreation: null,
+            outputEstimated: 0,
+            inputEstimated: event.inputEstimated ?? null,
           },
         },
         permanent: [],
@@ -969,9 +993,29 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         outputTokens: null,
         cacheRead: null,
         cacheCreation: null,
+        outputEstimated: 0,
+        inputEstimated: null,
       };
+      // Accumulate local output estimate. Chars/4 heuristic, same as
+      // `src/providers/tokens.ts` — `~5-25%` drift documented in
+      // TOKEN_TUNING.md §8.1 (worse on code, better on English prose).
+      // The estimate is per-delta-text-length, summed across the
+      // turn; it never includes thinking content (those arrive as
+      // `thinking:delta`, a separate event branch that doesn't
+      // touch pendingAssistant). Using a running sum (not a recompute
+      // of buf.text.length / 4) costs O(1) per delta and stays stable
+      // under multi-byte text — a recompute would re-walk the whole
+      // buffer every frame for no precision gain at this heuristic.
+      const estDelta = Math.ceil(event.text.length / 4);
       return {
-        state: { ...state, pendingAssistant: { ...buf, text: buf.text + event.text } },
+        state: {
+          ...state,
+          pendingAssistant: {
+            ...buf,
+            text: buf.text + event.text,
+            outputEstimated: buf.outputEstimated + estDelta,
+          },
+        },
         permanent: [],
       };
     }

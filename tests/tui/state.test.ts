@@ -344,6 +344,77 @@ describe('assistant streaming', () => {
     expect(r.state.pendingAssistant?.text).toBe('');
   });
 
+  test('assistant:delta accumulates outputEstimated from text length (chars/4)', () => {
+    // The pin: outputEstimated is a running sum of `ceil(text.len/4)`
+    // across deltas, NOT a recompute of the full buffer. Both shapes
+    // converge to the same number for ASCII text, but the running
+    // sum costs O(1) per delta and stays stable under multi-byte
+    // text (the heuristic is intentionally simple; a delta of length
+    // 5 contributes ceil(5/4)=2, regardless of buf.text.length).
+    const r = drive([
+      { type: 'assistant:start', ts: 1000, messageId: 'm1' },
+      // 8 chars → +2 tokens
+      { type: 'assistant:delta', ts: 1100, messageId: 'm1', text: 'eight ch' },
+      // 5 chars → +2 tokens (ceil(5/4))
+      { type: 'assistant:delta', ts: 1200, messageId: 'm1', text: 'fivex' },
+    ]);
+    expect(r.state.pendingAssistant?.outputEstimated).toBe(4);
+    expect(r.state.pendingAssistant?.text).toBe('eight chfivex');
+  });
+
+  test('outputEstimated resets per turn (fresh assistant:start)', () => {
+    // The accumulator is per-message. A second turn opening (new
+    // messageId) must start the estimate from 0, not inherit the
+    // prior turn's running sum.
+    const r = drive([
+      { type: 'assistant:start', ts: 1000, messageId: 'm1' },
+      { type: 'assistant:delta', ts: 1100, messageId: 'm1', text: 'first turn' },
+      { type: 'assistant:start', ts: 2000, messageId: 'm2' },
+    ]);
+    expect(r.state.pendingAssistant?.messageId).toBe('m2');
+    expect(r.state.pendingAssistant?.outputEstimated).toBe(0);
+  });
+
+  test('assistant:start carries inputEstimated onto pendingAssistant', () => {
+    // Pre-flight estimate path: the harness adapter forwards
+    // `step_start.promptTokensEstimate` via `assistant:start.inputEstimated`.
+    // The reducer stamps it once at turn-start; never updates after.
+    const r = drive([{ type: 'assistant:start', ts: 1000, messageId: 'm1', inputEstimated: 4500 }]);
+    expect(r.state.pendingAssistant?.inputEstimated).toBe(4500);
+  });
+
+  test('assistant:start without inputEstimated leaves pending field null', () => {
+    // Legacy / replay / orphan stream — the field is optional on the
+    // event. Reducer must not synthesize a fake 0; the chip needs
+    // the null to know whether to render `↑ ~N` or skip the cell.
+    const r = drive([{ type: 'assistant:start', ts: 1000, messageId: 'm1' }]);
+    expect(r.state.pendingAssistant?.inputEstimated).toBeNull();
+  });
+
+  test('outputEstimated lives alongside outputTokens (not merged)', () => {
+    // After official usage arrives, both fields coexist: outputTokens
+    // is the authoritative count, outputEstimated is the local guess.
+    // Keeping them separate lets the chip's render logic decide which
+    // to surface, and lets future telemetry log discrepancies (spec
+    // TOKEN_TUNING.md §8.3 — `tokenizer.discrepancy`).
+    const r = drive([
+      { type: 'assistant:start', ts: 1000, messageId: 'm1' },
+      { type: 'assistant:delta', ts: 1100, messageId: 'm1', text: 'twelve chars' },
+      {
+        type: 'assistant:usage',
+        ts: 1200,
+        messageId: 'm1',
+        inputTokens: 50,
+        outputTokens: 4,
+        cacheRead: 0,
+        cacheCreation: 0,
+      },
+    ]);
+    // 12 chars → ceil(12/4) = 3 estimated; official says 4.
+    expect(r.state.pendingAssistant?.outputEstimated).toBe(3);
+    expect(r.state.pendingAssistant?.outputTokens).toBe(4);
+  });
+
   test('delta-only path (no start) gets startedAt from delta.ts', () => {
     // Out-of-order arrival shouldn't stamp startedAt at 0 (would
     // render absurd elapsed time on the chip).

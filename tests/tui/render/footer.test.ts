@@ -85,6 +85,8 @@ describe('renderFooter', () => {
       outputTokens: null,
       cacheRead: null,
       cacheCreation: null,
+      outputEstimated: 0,
+      inputEstimated: null,
     };
     expect(renderFooter(s, caps)).toContain('esc to interrupt');
   });
@@ -125,6 +127,8 @@ describe('renderFooter', () => {
       outputTokens: null,
       cacheRead: null,
       cacheCreation: null,
+      outputEstimated: 0,
+      inputEstimated: null,
     };
     const out = renderFooter(s, caps);
     expect(out).toContain('esc again to force');
@@ -154,8 +158,13 @@ describe('renderFooter', () => {
     s.bgProcesses.set('p1', { processId: 'p1', command: 'npm run dev' });
     s.bgProcesses.set('p2', { processId: 'p2', command: 'pytest' });
     const out = renderFooter(s, caps);
-    // Order: model · steps/max · cost · bg N.
-    expect(out).toContain('• sonnet-4.6 · 3/50 · $0.0120 · bg 2');
+    // Order: model · steps/max · cost · bg N. The cost cell now
+    // carries a projection tail (`$0.0120 → ~$0.2000`) when the
+    // session has burned cost and maxSteps gives a horizon — both
+    // true for this fixture. Pin checks the surrounding structure
+    // without coupling to the projected number itself.
+    expect(out).toContain('• sonnet-4.6 · 3/50 · $0.0120');
+    expect(out).toContain('· bg 2');
   });
 
   test('bg counter only surfaces when size > 0 (zero processes drops the token)', () => {
@@ -192,7 +201,14 @@ describe('renderFooter', () => {
     const s = startedSession({ planMode: true });
     s.bgProcesses.set('p1', { processId: 'p1', command: 'x' });
     const out = renderFooter(s, caps);
-    expect(out).toContain('• sonnet-4.6 · plan · 3/50 · $0.0120 · bg 1');
+    // Pin the structure; projection tail (`→ ~$X`) attaches to cost
+    // when steps/maxSteps signal allows. Slice 8 added that — the
+    // adjacent ordering of model · plan · steps · cost is what
+    // this pin defends.
+    expect(out).toContain('• sonnet-4.6 · plan · 3/50 · $0.0120');
+    expect(out).toContain('· bg 1');
+    // Cost still comes BEFORE bg in the assembly order (UI.md §4.4).
+    expect((out ?? '').indexOf('$0.0120')).toBeLessThan((out ?? '').indexOf('bg 1'));
   });
 
   test('subagents counter > 0 surfaces as `subagents N` after bg', () => {
@@ -507,6 +523,69 @@ describe('renderFooter', () => {
       expect(out).toContain('• sonnet-4.6');
       expect(out).toContain('3/50');
       expect(out).toContain('$0.0120');
+    });
+  });
+
+  // Cost projection (slice 8). The footer's cost cell grows a
+  // `→ ~$X.XX` tail when steps/maxSteps allow a linear projection of
+  // session-end cost. Suppressed in degenerate cases (no horizon, no
+  // burn, at the cap) so the operator only sees the tail when it
+  // carries new information.
+  describe('cost projection tail', () => {
+    test('renders `→ ~$Y` when steps > 0 and steps < maxSteps with positive cost', () => {
+      // Defaults: steps=3, maxSteps=50, cost=$0.012.
+      // projected = 0.012 * (50 / 3) = $0.20.
+      const out = renderFooter(startedSession(), caps);
+      expect(out).toContain('$0.0120 → ~$0.2000');
+    });
+
+    test('suppressed when steps === 0 (no per-step average yet)', () => {
+      const s = startedSession({ steps: 0 });
+      const out = renderFooter(s, caps);
+      // No `→` tail, but a literal `0/maxSteps` segment is fine —
+      // assert specifically on the projection glyph.
+      expect(out).not.toContain('→');
+    });
+
+    test('suppressed when steps === maxSteps (no remaining horizon)', () => {
+      // At the cap, projection collapses to current cost — the tail
+      // would just repeat the cost number, which is noise.
+      const s = startedSession({ steps: 50 });
+      const out = renderFooter(s, caps);
+      expect(out).not.toContain('→');
+    });
+
+    test('suppressed when maxSteps === 0 (no cap configured)', () => {
+      // Producers that don't pass a step cap (one-shot SDK without
+      // budget) shouldn't see a projection. The step counter itself
+      // is also suppressed when maxSteps === 0, so the cost line
+      // reads just `$X.XXXX`.
+      const s = startedSession({ maxSteps: 0 });
+      const out = renderFooter(s, caps);
+      expect(out).not.toContain('→');
+    });
+
+    test('suppressed when costUsd === 0 (nothing burned yet)', () => {
+      // Projection of zero growth is meaningless. A turn where the
+      // first step hasn't billed any cost (provider returned no
+      // usage event) reads as cost=0 — leave the cell as a plain
+      // `$0.0000` rather than promising `→ ~$0.0000`.
+      const s = startedSession({ costUsd: 0 });
+      const out = renderFooter(s, caps);
+      expect(out).not.toContain('→');
+    });
+
+    test('projection format matches the current cost format (decimals scale together)', () => {
+      // formatCost picks 4/3/2 decimals based on magnitude. The
+      // projected number flows through the same formatter so the
+      // pair reads consistently — `$0.0120 → ~$0.2000` (both 4d),
+      // not `$0.0120 → ~$0.20`.
+      const out = renderFooter(startedSession({ costUsd: 0.012 }), caps);
+      expect(out).toContain('$0.0120 → ~$0.2000');
+      // Pin a different magnitude band: cost > $1 uses 3 decimals.
+      // steps=3/maxSteps=50, cost=$2.5 → projected $41.667 (band 3d).
+      const big = renderFooter(startedSession({ costUsd: 2.5 }), caps);
+      expect(big).toContain('$2.500 → ~$41.667');
     });
   });
 });

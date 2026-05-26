@@ -131,6 +131,63 @@ describe('harness-adapter — session lifecycle', () => {
     expect(out.map((e) => e.type)).not.toContain('provider:waiting:end');
   });
 
+  test('step_start stashes promptTokensEstimate; first provider start forwards as assistant:start.inputEstimated', () => {
+    // 3-layer token accounting (TOKEN_TUNING.md §8): the harness
+    // computes a chars/4 estimate of the outbound payload BEFORE the
+    // provider call and forwards it on step_start. The adapter
+    // stashes the number (the chip needs both messageId and estimate
+    // to render, and messageId only arrives with the provider's
+    // `start` event) and merges them onto assistant:start.
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'step_start', stepN: 1, promptTokensEstimate: 4500 });
+    const out = a.translate({
+      type: 'provider_event',
+      event: { kind: 'start', message_id: 'm1' },
+    });
+    const assistantStart = out.find((e) => e.type === 'assistant:start');
+    if (assistantStart?.type !== 'assistant:start') {
+      throw new Error('expected assistant:start in output');
+    }
+    expect(assistantStart.inputEstimated).toBe(4500);
+  });
+
+  test('estimate cleared after forward — orphan provider start does not reuse stale value', () => {
+    // Defensive: if a provider `start` arrives without a preceding
+    // step_start (replay edge, out-of-order stream), it must not
+    // pick up a leftover estimate from the previous step. The
+    // estimate is one-shot per step.
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'step_start', stepN: 1, promptTokensEstimate: 4500 });
+    a.translate({
+      type: 'provider_event',
+      event: { kind: 'start', message_id: 'm1' },
+    });
+    // Now a second provider `start` (no intervening step_start):
+    const out = a.translate({
+      type: 'provider_event',
+      event: { kind: 'start', message_id: 'm2' },
+    });
+    const assistantStart = out.find((e) => e.type === 'assistant:start');
+    if (assistantStart?.type !== 'assistant:start') {
+      throw new Error('expected assistant:start in output');
+    }
+    expect(assistantStart.inputEstimated).toBeUndefined();
+  });
+
+  test('step_start without promptTokensEstimate (legacy harness) → no inputEstimated on assistant:start', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'step_start', stepN: 1 });
+    const out = a.translate({
+      type: 'provider_event',
+      event: { kind: 'start', message_id: 'm1' },
+    });
+    const assistantStart = out.find((e) => e.type === 'assistant:start');
+    if (assistantStart?.type !== 'assistant:start') {
+      throw new Error('expected assistant:start in output');
+    }
+    expect(assistantStart.inputEstimated).toBeUndefined();
+  });
+
   test('two step_starts back to back close the prior gate before opening a new one', () => {
     // Defensive close-before-open in the step_start case.
     // Pinned so a regression that opened a second gate without
