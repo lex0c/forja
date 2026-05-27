@@ -1,5 +1,11 @@
-import { beforeAll, describe, expect, test } from 'bun:test';
-import { initBashParser, parseBash } from '../../src/permissions/bash-parser.ts';
+import { beforeAll, beforeEach, describe, expect, test } from 'bun:test';
+import {
+  __pushTimeoutForTest,
+  __resetBashParserRateLimitForTest,
+  getRecentParseTimeoutCount,
+  initBashParser,
+  parseBash,
+} from '../../src/permissions/bash-parser.ts';
 
 beforeAll(async () => {
   await initBashParser();
@@ -76,6 +82,88 @@ describe('parseBash — timeout defense (slice 110, R2 #204)', () => {
     const r = parseBash('   ');
     // Trimmed-empty input — tree-sitter still produces a tree.
     expect(r).not.toBeNull();
+  });
+});
+
+// Rate-limit defense (hardening, follow-up to slice 110). The
+// PARSE_TIMEOUT_MS cap alone bounded SINGLE-call latency but not
+// the cumulative cost of N pathological inputs in a row — N calls
+// burned N×TIMEOUT_MS of single-threaded engine. The window-based
+// counter short-circuits subsequent parses after RATE_LIMIT_MAX_TIMEOUTS
+// have fired within RATE_LIMIT_WINDOW_MS so the attack cost stays
+// flat instead of linear.
+describe('parseBash — rate-limit window (DoS hardening)', () => {
+  beforeEach(() => {
+    __resetBashParserRateLimitForTest();
+  });
+
+  test('counter starts at zero on a fresh module / after reset', () => {
+    expect(getRecentParseTimeoutCount()).toBe(0);
+  });
+
+  test('counter reports the number of in-window timeouts', () => {
+    const now = Date.now();
+    __pushTimeoutForTest(now);
+    __pushTimeoutForTest(now);
+    expect(getRecentParseTimeoutCount()).toBe(2);
+  });
+
+  test('expired entries are evicted from the count', () => {
+    // Push timeouts that are well outside the 30s window. Reading
+    // the counter triggers eviction; the stale entries drop.
+    const stale = Date.now() - 60_000;
+    __pushTimeoutForTest(stale);
+    __pushTimeoutForTest(stale);
+    expect(getRecentParseTimeoutCount()).toBe(0);
+  });
+
+  test('rate-limit fires after 3 in-window timeouts', () => {
+    // Seed 3 fresh timeouts. The next parse must throw a rate-
+    // limit error WITHOUT running the grammar — the message
+    // identifies the threshold + window for forensic clarity.
+    const now = Date.now();
+    __pushTimeoutForTest(now);
+    __pushTimeoutForTest(now);
+    __pushTimeoutForTest(now);
+    expect(() => parseBash('echo hi')).toThrow(/rate-limited/);
+    expect(() => parseBash('echo hi')).toThrow(/3 parse timeouts in last 30000ms/);
+  });
+
+  test('rate-limit clears once entries age out of the window', () => {
+    // Seed 3 stale timeouts. The next parse runs normally
+    // because evictExpiredTimeouts drops them before the gate.
+    const stale = Date.now() - 60_000;
+    __pushTimeoutForTest(stale);
+    __pushTimeoutForTest(stale);
+    __pushTimeoutForTest(stale);
+    const r = parseBash('echo hi');
+    expect(r).not.toBeNull();
+    expect(getRecentParseTimeoutCount()).toBe(0);
+  });
+
+  test('rate-limit message identifies the reason, not a generic parse error', () => {
+    // Operators reading audit rows distinguish 'parser unavailable
+    // (rate-limited)' from 'parser unavailable (timeout)' as
+    // distinct triage paths. The exact substring 'rate-limited'
+    // must remain stable.
+    const now = Date.now();
+    for (let i = 0; i < 3; i += 1) __pushTimeoutForTest(now);
+    try {
+      parseBash('echo hi');
+      throw new Error('expected throw');
+    } catch (e) {
+      expect((e as Error).message).toContain('rate-limited');
+      expect((e as Error).message).toContain('30000ms');
+    }
+  });
+
+  test('first 2 in-window timeouts do NOT trip the gate', () => {
+    // The threshold is `>= 3`. 2 timeouts leaves the window with
+    // 1 slot — the next call parses normally.
+    const now = Date.now();
+    __pushTimeoutForTest(now);
+    __pushTimeoutForTest(now);
+    expect(() => parseBash('echo hi')).not.toThrow();
   });
 });
 
