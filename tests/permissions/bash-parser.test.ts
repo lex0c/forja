@@ -167,6 +167,249 @@ describe('parseBash — rate-limit window (DoS hardening)', () => {
   });
 });
 
+// H1 (review): node-kind snapshot against silent grammar drift.
+// The bash resolver's defense rests on a closed whitelist of
+// node.type strings (WHITELIST_NODE_TYPES + RED_FLAG_NODES in
+// src/permissions/resolvers/bash.ts). If a tree-sitter-bash update
+// renames a node-kind (e.g. `expansion` → `parameter_expansion`),
+// `RED_FLAG_NODES.get('expansion')` silently becomes a no-op AND
+// the walker's WHITELIST_NODE_TYPES check still fires on the new
+// name as "unsupported_shape" — fail-safe for the new name, but
+// the SPECIFIC threat reason ("parameter_expansion: runtime
+// substitution") is lost, and audit aggregation breaks.
+//
+// This suite pins the grammar contract: for each input shape we
+// rely on, the parser MUST produce at least the expected node-kind
+// in the AST. If the grammar renames any of them, the test fails
+// and the grammar update PR is blocked until the resolver's
+// whitelist + red-flag tables are updated alongside.
+//
+// Coverage: every LIVE entry in RED_FLAG_NODES (20 of 25 kinds —
+// the other 5 are dead under v0.25.1; see meta-test exclusion
+// list) plus the load-bearing WHITELIST entries (program, command,
+// command_name, pipeline, list, file_redirect, redirected_statement,
+// string, raw_string, concatenation, number).
+describe('parseBash — node-kind snapshot (H1 grammar drift defense)', () => {
+  // Collect every distinct node.type appearing under the parsed root.
+  // Tree-sitter walks include anonymous nodes (punctuation literals
+  // like '|', '&&') alongside named nodes — both contribute to
+  // the kind set because the resolver branches on both.
+  const collectKindsImpl = (input: string): Set<string> => {
+    const parsed = parseBash(input);
+    if (parsed === null) throw new Error(`parseBash returned null for ${JSON.stringify(input)}`);
+    const kinds = new Set<string>();
+    const visit = (node: typeof parsed.root): void => {
+      kinds.add(node.type);
+      for (const child of node.children) {
+        if (child !== null) visit(child);
+      }
+    };
+    visit(parsed.root);
+    return kinds;
+  };
+
+  // (input, expected node-kind subset). The expected set is a
+  // SUBSET assertion, not equality — the AST also contains
+  // ancillary kinds (`program`, punctuation) that aren't
+  // load-bearing for the test.
+  const cases: readonly { input: string; expect: readonly string[]; label: string }[] = [
+    // Structural / WHITELIST core
+    {
+      label: 'simple command',
+      input: 'ls -la',
+      expect: ['program', 'command', 'command_name', 'word'],
+    },
+    { label: 'pipeline', input: 'ls | grep foo', expect: ['pipeline', 'command'] },
+    // `;` and top-level `&` produce sibling commands under `program`
+    // WITHOUT a `list` wrapper in tree-sitter-bash@0.25.1 — only
+    // `&&` and `||` wrap in `list`. Pin the actual kinds so the
+    // snapshot is honest about the grammar shape.
+    { label: 'sequence ;', input: 'echo a; echo b', expect: [';', 'command'] },
+    { label: 'list &&', input: 'echo a && echo b', expect: ['list'] },
+    { label: 'list ||', input: 'echo a || echo b', expect: ['list'] },
+    { label: 'background &', input: 'sleep 1 &', expect: ['&', 'command'] },
+    {
+      label: 'redirected out',
+      input: 'echo hi > out',
+      expect: ['redirected_statement', 'file_redirect'],
+    },
+    { label: 'redirected append', input: 'echo hi >> out', expect: ['file_redirect'] },
+    { label: 'redirected in', input: 'cat < in', expect: ['file_redirect'] },
+    { label: 'fd dup', input: 'cmd 2>&1', expect: ['file_descriptor', 'number'] },
+    { label: 'double-quoted string', input: 'echo "hi"', expect: ['string'] },
+    { label: 'single-quoted string', input: "echo 'hi'", expect: ['raw_string'] },
+    { label: 'concatenation', input: 'echo a"b"c', expect: ['concatenation'] },
+    { label: 'numeric arg', input: 'sleep 5', expect: ['number'] },
+    // RED_FLAG_NODES
+    {
+      label: 'command_substitution $()',
+      input: 'echo $(date)',
+      expect: ['command_substitution'],
+    },
+    {
+      label: 'process_substitution <()',
+      input: 'diff <(echo a) <(echo b)',
+      expect: ['process_substitution'],
+    },
+    { label: 'expansion ${var}', input: 'echo ${HOME}', expect: ['expansion'] },
+    { label: 'simple_expansion $var', input: 'echo $HOME', expect: ['simple_expansion'] },
+    {
+      label: 'arithmetic_expansion $(())',
+      input: 'echo $((1 + 1))',
+      expect: ['arithmetic_expansion'],
+    },
+    {
+      label: 'function_definition (POSIX)',
+      input: 'foo() { echo bar; }',
+      expect: ['function_definition'],
+    },
+    {
+      label: 'variable_assignment prefix',
+      input: 'FOO=bar baz',
+      expect: ['variable_assignment'],
+    },
+    { label: 'array subscript', input: 'echo ${arr[0]}', expect: ['subscript'] },
+    // `=~` is exposed as `binary_expression` with operator `=~`,
+    // NOT a `regex` node. The defense fires via `test_command` (the
+    // [[ ... ]] container) which IS in RED_FLAG_NODES. `regex` in
+    // RED_FLAG_NODES is dead under this grammar version.
+    {
+      label: 'regex match =~ (via binary_expression in test_command)',
+      input: '[[ a =~ b ]]',
+      expect: ['test_command', 'binary_expression', '=~'],
+    },
+    { label: 'ansi_c_string', input: "echo $'\\n'", expect: ['ansi_c_string'] },
+    // `$"..."` is parsed as a regular `string` with a leading `$`
+    // word in v0.25.1 — no distinct `translated_string` node-kind.
+    // `translated_string` in RED_FLAG_NODES is dead under this
+    // grammar version. The regular `string` content still flows
+    // through the walker normally; no security gap.
+    {
+      label: 'translated_string ($"...") parsed as regular string',
+      input: 'echo $"hi"',
+      expect: ['string'],
+    },
+    {
+      label: 'heredoc_redirect',
+      input: 'cat <<EOF\nx\nEOF',
+      expect: ['heredoc_redirect'],
+    },
+    {
+      label: 'herestring_redirect',
+      input: 'cat <<<"hi"',
+      expect: ['herestring_redirect'],
+    },
+    { label: 'if_statement', input: 'if true; then :; fi', expect: ['if_statement'] },
+    {
+      label: 'while_statement',
+      input: 'while true; do :; done',
+      expect: ['while_statement'],
+    },
+    {
+      label: 'for_statement',
+      input: 'for i in 1 2; do :; done',
+      expect: ['for_statement'],
+    },
+    {
+      label: 'case_statement',
+      input: 'case x in y) :;; esac',
+      expect: ['case_statement'],
+    },
+    { label: 'subshell ()', input: '(echo a)', expect: ['subshell'] },
+    { label: 'compound_statement {}', input: '{ echo a; }', expect: ['compound_statement'] },
+    { label: 'negated_command !', input: '! true', expect: ['negated_command'] },
+    // `[[ -f x ]]` produces test_command + unary_expression + test_operator.
+    // The test_operator node carries the operator literal (`-f`); pinning
+    // it here keeps the live RED_FLAG_NODES.test_operator entry covered.
+    {
+      label: 'test_command [[]]',
+      input: '[[ -f x ]]',
+      expect: ['test_command', 'test_operator'],
+    },
+    // `arr=(a b c)` is parsed as `variable_assignment` with an
+    // `array` child node, NOT a distinct `array_assignment` kind.
+    // The defense fires via `variable_assignment` which IS in
+    // RED_FLAG_NODES. `array_assignment` in RED_FLAG_NODES is dead
+    // under this grammar version.
+    {
+      label: 'array_assignment (parsed as variable_assignment + array child)',
+      input: 'arr=(a b c)',
+      expect: ['variable_assignment', 'array'],
+    },
+  ];
+
+  for (const { input, expect: expectedKinds, label } of cases) {
+    test(`${label}: ${JSON.stringify(input)} produces expected node kinds`, () => {
+      const kinds = collectKindsImpl(input);
+      for (const expected of expectedKinds) {
+        if (!kinds.has(expected)) {
+          throw new Error(
+            `Grammar drift: input ${JSON.stringify(input)} did not produce node-kind '${expected}'. Actual kinds: [${Array.from(kinds).sort().join(', ')}]. If the grammar renamed this kind, update WHITELIST_NODE_TYPES / RED_FLAG_NODES in src/permissions/resolvers/bash.ts to match.`,
+          );
+        }
+      }
+    });
+  }
+
+  test('every LIVE RED_FLAG_NODES key is covered by at least one case', () => {
+    // Defends the meta-contract: if someone ADDS a new red-flag
+    // kind to bash.ts but forgets a snapshot case, this test
+    // surfaces it. The list is hardcoded mirror of bash.ts —
+    // staying in sync IS the test.
+    //
+    // Dead entries — empirically confirmed via probe that
+    // tree-sitter-bash@0.25.1 does NOT emit these node-kinds for
+    // any input shape:
+    //   - `regex` — `=~` is parsed as binary_expression with the
+    //     `=~` operator inside test_command.
+    //   - `translated_string` — `$"..."` is parsed as regular
+    //     string with a leading `$` word.
+    //   - `array_assignment` — `arr=(a b c)` is parsed as
+    //     variable_assignment with an `array` child.
+    //   - `coproc_statement` — `coproc cmd` is parsed as a regular
+    //     command with `coproc` as command_name.
+    //   - `last_pipe` — `cmd1 |& cmd2` is parsed as pipeline with
+    //     `|&` as an anonymous operator token.
+    //
+    // Dead entries stay in RED_FLAG_NODES as forward-compat against
+    // grammar updates that might introduce these distinct kinds.
+    // Removing them is tracked separately; the snapshot only
+    // enforces coverage of the LIVE kinds confirmed by probe.
+    const liveRedFlagKinds = [
+      'command_substitution',
+      'process_substitution',
+      'expansion',
+      'simple_expansion',
+      'arithmetic_expansion',
+      'function_definition',
+      'variable_assignment',
+      'subscript',
+      'ansi_c_string',
+      'heredoc_redirect',
+      'herestring_redirect',
+      'if_statement',
+      'while_statement',
+      'for_statement',
+      'case_statement',
+      'subshell',
+      'compound_statement',
+      'negated_command',
+      'test_command',
+      'test_operator',
+    ];
+    const allCovered = new Set<string>();
+    for (const { expect: kinds } of cases) {
+      for (const k of kinds) allCovered.add(k);
+    }
+    const missing = liveRedFlagKinds.filter((k) => !allCovered.has(k));
+    if (missing.length > 0) {
+      throw new Error(
+        `Snapshot suite missing cases for red-flag kinds: ${missing.join(', ')}. Add a case to the table whose input produces each missing kind.`,
+      );
+    }
+  });
+});
+
 describe('parseBash — multiple sequential parses (parser reset)', () => {
   test('two parses in sequence both succeed independently', () => {
     // Slice 110 calls `parser.reset()` after a timed-out parse

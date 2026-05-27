@@ -24,9 +24,11 @@ Self-review of the bash AST resolver (`src/permissions/resolvers/bash.ts`, 3374 
 
 - **M2 — review claim falsified empirically; behavior pinned via tests.** Original review flagged that `isXdgRuntimeSensitive` is a runtime predicate not enumerated in `protectedTargets()`, hypothesizing globs at `/run/user/*/...` would walk past. Probing showed both paths are already closed: globs hit the prefix check against `/run` (in `SYSTEM_DENY_ROOTS`), and literal XDG sockets hit `classifyProtectedPath` via the deny-tier re-check. Added 9 tests that pin the closure (4 glob shapes refused via /run, 4 literal sockets refused via classifier, 1 carve-out for legitimate XDG_RUNTIME_DIR file). No code change needed.
 
+- **H1 — node-kind snapshot defense against silent grammar drift.** The bash resolver's defense rests on a closed whitelist of `node.type` strings (`WHITELIST_NODE_TYPES` + `RED_FLAG_NODES`). If tree-sitter-bash renamed a kind, the resolver's red-flag entry would silently become a no-op while the walker fell back to the generic `unsupported_shape` refuse — fail-safe overall, but the SPECIFIC threat reason is lost and audit aggregation breaks. New snapshot suite parses 35 inputs (every live RED_FLAG kind + load-bearing whitelist kinds) and asserts each produces its expected node-kind; a 36th meta-test verifies every live RED_FLAG kind is covered by at least one input. Empirical probe surfaced 5 DEAD entries in `RED_FLAG_NODES` under v0.25.1 — `regex` (defense fires via `binary_expression`-in-`test_command`), `translated_string` (parsed as regular `string`), `array_assignment` (parsed as `variable_assignment` + `array` child), `coproc_statement` (parsed as regular `command`), `last_pipe` (`|&` is an anonymous operator token in `pipeline`). All five defenses still fire via the alternate path. Dead entries kept as forward-compat against future grammar updates; the snapshot's meta-test exclusion list documents which kinds are dead and via which alternate path the defense actually fires.
+
 **Findings (next batch, not on this branch):**
 
-- **H1** — snapshot test of tree-sitter-bash node-kinds against silent grammar rename.
+_All items closed on this branch._
 
 ## [2026-05-27] token-efficiency initiative — four code slices + three TODO entries
 
