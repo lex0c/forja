@@ -78,6 +78,16 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
     const text = `${pct}% context used`;
     rightParts.push(ratio >= CONTEXT_WARN_THRESHOLD ? paint(caps, 'warn', text) : dim(caps, text));
   }
+  // Cache hit-rate across the REPL session. Denominator is "input
+  // billed" (input + cacheRead + cacheCreation); numerator is what
+  // arrived cached. Suppressed until any usage event has landed so
+  // we don't show `0% cached` against zero traffic.
+  const inputBilled =
+    status.sessionUncachedInput + status.sessionCacheRead + status.sessionCacheCreation;
+  if (inputBilled > 0) {
+    const pct = Math.round((status.sessionCacheRead / inputBilled) * 100);
+    rightParts.push(dim(caps, `${pct}% cached`));
+  }
   const right = rightParts.join(sep);
 
   const leftW = visualWidth(left);

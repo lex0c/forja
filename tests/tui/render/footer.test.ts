@@ -272,6 +272,66 @@ describe('renderFooter', () => {
     });
   });
 
+  describe('% cached chip', () => {
+    test('renders hit-rate as `Npct cached` after the context-used chip', () => {
+      const out =
+        renderFooter(
+          startedSession({
+            sessionUncachedInput: 1000,
+            sessionCacheRead: 7000,
+            sessionCacheCreation: 2000,
+          }),
+          caps,
+        ) ?? '';
+      // 7000 / (1000 + 7000 + 2000) = 70%.
+      expect(out).toContain('70% cached');
+    });
+
+    test('suppressed when no input has been billed yet', () => {
+      const out = renderFooter(startedSession(), caps) ?? '';
+      expect(out).not.toContain('cached');
+    });
+
+    test('100% cached when every input token hit the cache', () => {
+      const out = renderFooter(startedSession({ sessionCacheRead: 5000 }), caps) ?? '';
+      expect(out).toContain('100% cached');
+    });
+
+    test('0% cached when nothing hit the cache (all-fresh session)', () => {
+      const out = renderFooter(startedSession({ sessionUncachedInput: 5000 }), caps) ?? '';
+      expect(out).toContain('0% cached');
+    });
+
+    test('paints `secondary` (grey, SGR 90), NOT warn — this is informational', () => {
+      const colored: Capabilities = { ...caps, color: 'basic' };
+      const out =
+        renderFooter(
+          startedSession({
+            sessionUncachedInput: 1000,
+            sessionCacheRead: 7000,
+            sessionCacheCreation: 2000,
+          }),
+          colored,
+        ) ?? '';
+      expect(out).toContain(`${CSI}90m70% cached${CSI}0m`);
+    });
+
+    test('renders AFTER `% context used`', () => {
+      const out =
+        renderFooter(
+          startedSession({
+            contextWindow: 200_000,
+            lastTurnContextTokens: 90_000,
+            sessionUncachedInput: 1000,
+            sessionCacheRead: 7000,
+            sessionCacheCreation: 2000,
+          }),
+          caps,
+        ) ?? '';
+      expect(out.indexOf('45% context used')).toBeLessThan(out.indexOf('70% cached'));
+    });
+  });
+
   describe('"always visible" lead chips before session:start', () => {
     test('model + tokens + ctx render even with sessionId null', () => {
       // Simulates the boot window: banner landed (model + window

@@ -150,6 +150,15 @@ export interface StatusState {
   // inputTokens + cacheRead + cacheCreation of the latest turn —
   // what occupied the context window when the model generated.
   lastTurnContextTokens: number;
+  // Cache breakdown across the whole REPL session. Hit-rate chip
+  // reads `sessionCacheRead / (sessionCacheRead + sessionCacheCreation
+  // + sessionUncachedInput)` — fraction of input that arrived cached.
+  // The three categories are mutually exclusive on the Anthropic
+  // shape (input = paid full rate; cacheRead = paid 0.1×; cacheCreation
+  // = paid 1.25×), so their sum is the canonical "input billed" total.
+  sessionCacheRead: number;
+  sessionCacheCreation: number;
+  sessionUncachedInput: number;
 }
 
 export interface PendingAssistant {
@@ -487,6 +496,9 @@ export const createInitialState = (): LiveState => ({
     contextWindow: 0,
     sessionTotalTokens: 0,
     lastTurnContextTokens: 0,
+    sessionCacheRead: 0,
+    sessionCacheCreation: 0,
+    sessionUncachedInput: 0,
   },
   activeTools: new Map(),
   pendingToolEndBatch: null,
@@ -1047,6 +1059,9 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         // Fallback to the prior value when the turn yielded no usage
         // event (provider edge case) so the chip doesn't flicker to 0%.
         lastTurnContextTokens: turnContext > 0 ? turnContext : state.status.lastTurnContextTokens,
+        sessionUncachedInput: state.status.sessionUncachedInput + input,
+        sessionCacheRead: state.status.sessionCacheRead + cacheRead,
+        sessionCacheCreation: state.status.sessionCacheCreation + cacheCreation,
       };
       // Emit a permanent ONLY when there's prose to land in
       // scrollback. Tool-only turns (Anthropic emits tool_use
