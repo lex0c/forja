@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  AUDIT_TS_PAST_SKEW_MS,
   type AuditEmitInput,
   type AuditSink,
   buildHashPayload,
@@ -452,15 +453,14 @@ describe('createSqliteSink — slice 129 R5 ts validation', () => {
 // VERIFY TIME (`verifyChain` reports `ts_monotonic_break`). Both
 // layers close the "attacker with DB write back-dates a row" path.
 describe('createSqliteSink — slice 163 past-skew ts monotonicity', () => {
-  test('refuses emit when ts is more than 1h before previous row', () => {
+  test('refuses emit when ts is more than the past-skew window before previous row', () => {
     const { sink } = fresh();
     // Use wall clock as the anchor so the future-skew check above
     // doesn't trip on test fixture dates.
     const baseTs = Date.now();
     sink.emit(baseInput({ ts: baseTs }));
-    // Now try to emit at baseTs - 2h. Past skew window is 1h →
-    // refuse.
-    const farPast = baseTs - 2 * 60 * 60 * 1000;
+    // One second past the window boundary — forgery refused.
+    const farPast = baseTs - AUDIT_TS_PAST_SKEW_MS - 1_000;
     expect(() => sink.emit(baseInput({ ts: farPast }))).toThrow(/forgery/);
   });
 
@@ -468,9 +468,11 @@ describe('createSqliteSink — slice 163 past-skew ts monotonicity', () => {
     const { sink } = fresh();
     const baseTs = Date.now();
     sink.emit(baseInput({ ts: baseTs }));
-    // 30 min before the previous row — within the 1h window. Legit
-    // NTP smear / clock-back-adjust scenario.
-    const nearPast = baseTs - 30 * 60 * 1000;
+    // Halfway through the window — covers legitimate NTP smear and
+    // overnight laptop suspend (window expanded to 24h for the
+    // suspend-resume case; previously 1h falsely-rejected the first
+    // emit on wake-up).
+    const nearPast = baseTs - Math.floor(AUDIT_TS_PAST_SKEW_MS / 2);
     expect(() => sink.emit(baseInput({ ts: nearPast }))).not.toThrow();
   });
 
@@ -497,7 +499,9 @@ describe('createSqliteSink — slice 163 past-skew ts monotonicity', () => {
     const rows = listApprovalsLogByInstall(db, identity.install_id);
     const row2 = rows[1];
     if (row2 === undefined) throw new Error('expected 2 rows');
-    const backTs = baseTs - 2 * 60 * 60 * 1000;
+    // One second past the window boundary — forgery still caught
+    // even with the expanded 24h window.
+    const backTs = baseTs - AUDIT_TS_PAST_SKEW_MS - 1_000;
     const tamperedRow = { ...row2, ts: backTs };
     const newHash = sha256Hex(row2.prev_hash + canonicalize(buildHashPayload(tamperedRow)));
     db.exec(
@@ -515,8 +519,8 @@ describe('createSqliteSink — slice 163 past-skew ts monotonicity', () => {
     const { sink } = fresh();
     const baseTs = Date.now();
     sink.emit(baseInput({ ts: baseTs }));
-    // 30 min earlier — within window, emit accepts.
-    sink.emit(baseInput({ ts: baseTs - 30 * 60 * 1000 }));
+    // Halfway through the window — within bound, emit accepts.
+    sink.emit(baseInput({ ts: baseTs - Math.floor(AUDIT_TS_PAST_SKEW_MS / 2) }));
     // Forward again.
     sink.emit(baseInput({ ts: baseTs + 5000 }));
     const verify = sink.verifyChain();
