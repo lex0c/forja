@@ -98,6 +98,60 @@ const seedChildSession = (cwd: string): { sessionId: string } => {
 };
 
 describe('runSubagentChild', () => {
+  test('emits systemSegments alongside systemPrompt; flatten round-trips', async () => {
+    // Subagent child mirrors the parent bootstrap: snapshots the
+    // stable prefix (playbook + reference + schema + reflection +
+    // parallel hint) before appending memory, then surfaces both
+    // the canonical concatenated string AND the per-segment view
+    // so the Anthropic adapter can place a cache breakpoint
+    // between them. Capture `req.systemSegments` via a provider
+    // stub and verify the round-trip invariant.
+    const { flattenSystemSegments } = await import('../../src/providers/types.ts');
+    let capturedSystemPrompt: string | undefined;
+    let capturedSegments: import('../../src/providers/types.ts').SystemSegment[] | undefined;
+    const capturingProvider: Provider = {
+      id: 'mock/m',
+      family: 'anthropic',
+      capabilities: {
+        tools: 'native',
+        cache: false,
+        vision: false,
+        streaming: true,
+        constrained: 'tools',
+        context_window: 1000,
+        output_max_tokens: 100,
+        cost_per_1k_input: 0,
+        cost_per_1k_output: 0,
+        notes: [],
+      },
+      async *generate(req): AsyncGenerator<StreamEvent> {
+        capturedSystemPrompt = req.system;
+        capturedSegments = req.systemSegments;
+        yield { kind: 'start', message_id: 'mock-msg' };
+        yield { kind: 'text_delta', text: 'done' };
+        yield { kind: 'stop', reason: 'end_turn' };
+      },
+      generateConstrained: () => Promise.reject(new Error('n/a')),
+      countTokens: () => Promise.resolve(0),
+    };
+    const { sessionId } = seedChildSession(dbDir);
+    const exitCode = await runSubagentChild({
+      sessionId,
+      dbPath,
+      providerOverride: capturingProvider,
+      userAgentsDir: null,
+      projectAgentsDir: null,
+      errSink: () => {},
+    });
+    expect(exitCode).toBe(0);
+    expect(capturedSegments).toBeDefined();
+    // Stable segment is always present and flagged cacheable.
+    expect(capturedSegments?.[0]?.id).toBe('stable');
+    expect(capturedSegments?.[0]?.cacheBreakpoint).toBe(true);
+    // Round-trip invariant: flatten(segments) === systemPrompt.
+    expect(flattenSystemSegments(capturedSegments ?? [])).toBe(capturedSystemPrompt ?? '');
+  });
+
   test('happy path: runs harness, publishes done payload, exits 0', async () => {
     const { sessionId } = seedChildSession(dbDir);
     const errMessages: string[] = [];
@@ -943,6 +997,9 @@ You are the worker.`,
       }
 
       const recordedSystem: Array<string | undefined> = [];
+      const recordedSegments: Array<
+        import('../../src/providers/types.ts').SystemSegment[] | undefined
+      > = [];
       const recordingProvider: Provider = {
         id: 'mock/m',
         family: 'anthropic',
@@ -960,6 +1017,7 @@ You are the worker.`,
         },
         async *generate(req): AsyncGenerator<StreamEvent> {
           recordedSystem.push(req.system);
+          recordedSegments.push(req.systemSegments);
           yield { kind: 'start', message_id: 'mock-msg' };
           yield { kind: 'text_delta', text: 'done' };
           yield { kind: 'stop', reason: 'end_turn' };
@@ -986,6 +1044,21 @@ You are the worker.`,
       expect(sys).toContain('You are explore.');
       expect(sys).toContain('# Memory');
       expect(sys).toContain('[project_local] role — full-stack TS dev');
+      // systemSegments split — when memory branch fires, the
+      // child emits two segments (stable prefix + memory) so the
+      // Anthropic adapter places a breakpoint between them.
+      // Round-trip invariant: flatten(segments) === systemPrompt.
+      const segs = recordedSegments[0];
+      const { flattenSystemSegments } = await import('../../src/providers/types.ts');
+      expect(segs).toBeDefined();
+      expect(segs?.length).toBe(2);
+      expect(segs?.[0]?.id).toBe('stable');
+      expect(segs?.[0]?.text).toContain('You are explore.');
+      expect(segs?.[0]?.text).not.toContain('# Memory');
+      expect(segs?.[1]?.id).toBe('memory');
+      expect(segs?.[1]?.text).toContain('# Memory');
+      expect(segs?.[1]?.cacheBreakpoint).toBe(true);
+      expect(flattenSystemSegments(segs ?? [])).toBe(sys ?? '');
     } finally {
       if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME;
       else process.env.XDG_CONFIG_HOME = originalXdg;
@@ -1089,6 +1162,9 @@ You are the worker.`,
       }
 
       const recordedSystem: Array<string | undefined> = [];
+      const recordedSegments: Array<
+        import('../../src/providers/types.ts').SystemSegment[] | undefined
+      > = [];
       const recordingProvider: Provider = {
         id: 'mock/m',
         family: 'anthropic',
@@ -1106,6 +1182,7 @@ You are the worker.`,
         },
         async *generate(req): AsyncGenerator<StreamEvent> {
           recordedSystem.push(req.system);
+          recordedSegments.push(req.systemSegments);
           yield { kind: 'start', message_id: 'mock-msg' };
           yield { kind: 'text_delta', text: 'done' };
           yield { kind: 'stop', reason: 'end_turn' };
@@ -1196,6 +1273,9 @@ You are the worker.`,
       }
 
       const recordedSystem: Array<string | undefined> = [];
+      const recordedSegments: Array<
+        import('../../src/providers/types.ts').SystemSegment[] | undefined
+      > = [];
       const recordingProvider: Provider = {
         id: 'mock/m',
         family: 'anthropic',
@@ -1213,6 +1293,7 @@ You are the worker.`,
         },
         async *generate(req): AsyncGenerator<StreamEvent> {
           recordedSystem.push(req.system);
+          recordedSegments.push(req.systemSegments);
           yield { kind: 'start', message_id: 'mock-msg' };
           yield { kind: 'text_delta', text: 'done' };
           yield { kind: 'stop', reason: 'end_turn' };
