@@ -82,6 +82,9 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
 
   const leftW = visualWidth(left);
   const rightW = visualWidth(right);
-  const padding = ' '.repeat(Math.max(0, caps.cols - FRAME_MARGIN_WIDTH - leftW - rightW));
-  return `${FRAME_MARGIN}${left}${padding}${right}`;
+  // Symmetric margins (UI.md §6.3): 2sp on the left already, mirror
+  // it on the right so the trailing chip (model name in particular)
+  // doesn't kiss the terminal edge.
+  const padding = ' '.repeat(Math.max(0, caps.cols - 2 * FRAME_MARGIN_WIDTH - leftW - rightW));
+  return `${FRAME_MARGIN}${left}${padding}${right}${FRAME_MARGIN}`;
 };
