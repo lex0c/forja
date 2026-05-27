@@ -107,7 +107,7 @@ describe('session lifecycle', () => {
     }
   });
 
-  test('session:banner emits a session-banner permanent without mutating LiveState', () => {
+  test('session:banner stamps model + contextWindow onto status and emits the banner permanent', () => {
     const initial = createInitialState();
     const r = applyEvent(initial, {
       type: 'session:banner',
@@ -123,8 +123,12 @@ describe('session lifecycle', () => {
         { kind: 'flag', name: 'checkpoints' },
       ],
     });
-    // State unchanged — banner is pure scrollback.
-    expect(r.state).toEqual(initial);
+    // Banner is the earliest signal carrying provider capabilities;
+    // mirroring model + contextWindow onto status here lets the
+    // footer render `<model> · …% context used` during the idle
+    // boot window before the first `session:start`.
+    expect(r.state.status.model).toBe('anthropic/claude-sonnet-4-6');
+    expect(r.state.status.contextWindow).toBe(200000);
     expect(r.permanent).toEqual([
       {
         kind: 'session-banner',
@@ -326,6 +330,102 @@ describe('assistant streaming', () => {
     expect(result.permanent).toEqual([
       { kind: 'assistant', text: 'reply', durationMs: 8200, outputTokens: 234 },
     ]);
+  });
+
+  test('assistant:end rolls turn tokens into status (session total + last-turn context)', () => {
+    const result = drive([
+      { type: 'assistant:start', ts: 1000, messageId: 'm1' },
+      { type: 'assistant:delta', ts: 1100, messageId: 'm1', text: 'reply' },
+      {
+        type: 'assistant:usage',
+        ts: 9100,
+        messageId: 'm1',
+        inputTokens: 100,
+        outputTokens: 200,
+        cacheRead: 1000,
+        cacheCreation: 500,
+      },
+      { type: 'assistant:end', ts: 9200, messageId: 'm1' },
+    ]);
+    // sessionTotalTokens = input + cacheRead + cacheCreation + output
+    //                    = 100 + 1000 + 500 + 200 = 1800.
+    expect(result.state.status.sessionTotalTokens).toBe(1800);
+    // lastTurnContextTokens = input + cacheRead + cacheCreation = 1600.
+    expect(result.state.status.lastTurnContextTokens).toBe(1600);
+  });
+
+  test('assistant:end accumulates session tokens across multiple turns', () => {
+    const result = drive([
+      { type: 'assistant:start', ts: 1000, messageId: 'm1' },
+      {
+        type: 'assistant:usage',
+        ts: 1100,
+        messageId: 'm1',
+        inputTokens: 50,
+        outputTokens: 100,
+        cacheRead: 0,
+        cacheCreation: 0,
+      },
+      { type: 'assistant:end', ts: 1200, messageId: 'm1' },
+      { type: 'assistant:start', ts: 2000, messageId: 'm2' },
+      {
+        type: 'assistant:usage',
+        ts: 2100,
+        messageId: 'm2',
+        inputTokens: 200,
+        outputTokens: 300,
+        cacheRead: 0,
+        cacheCreation: 0,
+      },
+      { type: 'assistant:end', ts: 2200, messageId: 'm2' },
+    ]);
+    // 150 (turn 1: 50+100) + 500 (turn 2: 200+300) = 650.
+    expect(result.state.status.sessionTotalTokens).toBe(650);
+    // Last-turn snapshot REPLACES (does not accumulate): only the
+    // most recent turn's input-side tokens, so it reflects current
+    // context occupancy, not lifetime usage.
+    expect(result.state.status.lastTurnContextTokens).toBe(200);
+  });
+
+  test('assistant:end with no usage preserves prior lastTurnContextTokens (no zero flicker)', () => {
+    // Provider edge case: a turn ends without an `assistant:usage`
+    // event ever landing. The chip would otherwise drop back to
+    // 0% — bad UX since the actual context occupancy didn't
+    // suddenly empty.
+    let state = createInitialState();
+    state = { ...state, status: { ...state.status, lastTurnContextTokens: 5000 } };
+    state = applyEvent(state, { type: 'assistant:start', ts: 1000, messageId: 'm1' }).state;
+    state = applyEvent(state, { type: 'assistant:end', ts: 1200, messageId: 'm1' }).state;
+    expect(state.status.lastTurnContextTokens).toBe(5000);
+  });
+
+  test('session:start does NOT reset session-total tokens (REPL-scoped accumulation)', () => {
+    // The operator thinks of the whole REPL as one session, even
+    // though each user submit spawns its own harness `session:*`
+    // bracket. The cumulative chip must survive boundary events
+    // so the operator sees "I've burned X tokens in this REPL"
+    // rather than "I burned X in the last single turn".
+    let state = createInitialState();
+    state = {
+      ...state,
+      status: {
+        ...state.status,
+        sessionTotalTokens: 5000,
+        lastTurnContextTokens: 1200,
+        contextWindow: 200000,
+      },
+    };
+    const result = applyEvent(state, {
+      type: 'session:start',
+      ts: 100,
+      sessionId: 's2',
+      profile: 'autonomous',
+      project: 'forja',
+      model: 'sonnet-4.6',
+    });
+    expect(result.state.status.sessionTotalTokens).toBe(5000);
+    expect(result.state.status.lastTurnContextTokens).toBe(1200);
+    expect(result.state.status.contextWindow).toBe(200000);
   });
 
   test('consecutive assistant:start events open a fresh turn (startedAt reset)', () => {

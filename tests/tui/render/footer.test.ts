@@ -31,7 +31,7 @@ const startedSession = (overrides: Partial<LiveState['status']> = {}): LiveState
 };
 
 describe('renderFooter', () => {
-  test('idle state: help hint left, model + steps + cost right', () => {
+  test('idle state: help hint left, model right (cost/steps chips removed)', () => {
     const out = renderFooter(startedSession(), caps);
     expect(out).not.toBeNull();
     expect(out).toContain('? for help');
@@ -40,9 +40,11 @@ describe('renderFooter', () => {
     // in every non-armed state so operators on terminals/WMs that
     // eat Shift+Enter can discover the alternative.
     expect(out).toContain('\\+Enter newline');
-    expect(out).toContain('• sonnet-4.6');
-    expect(out).toContain('3/50');
-    expect(out).toContain('$0.0120');
+    expect(out).toContain('sonnet-4.6');
+    // Cost + step counter were removed from the footer — too
+    // low-signal next to the tokens / context-used chips.
+    expect(out).not.toContain('$0.');
+    expect(out).not.toContain('3/50');
     // Interrupt cue absent when nothing is running.
     expect(out).not.toContain('esc to interrupt');
   });
@@ -143,59 +145,154 @@ describe('renderFooter', () => {
     expect(out).not.toContain('esc to interrupt');
   });
 
-  test('plan mode adds `plan` between model and budget', () => {
+  test('plan mode does NOT add a `plan` chip (chip removed at operator request)', () => {
     const s = startedSession({ planMode: true });
-    const out = renderFooter(s, caps);
-    expect(out).toContain('• sonnet-4.6 · plan · 3/50');
+    const out = renderFooter(s, caps) ?? '';
+    expect(out).not.toContain('plan');
   });
 
-  test('bg processes show as `bg N` after cost (spec UI.md §4.4 line 245)', () => {
+  test('cost does NOT surface in the footer (chip removed)', () => {
+    const out = renderFooter(startedSession({ costUsd: 12.34 }), caps) ?? '';
+    expect(out).not.toContain('$');
+  });
+
+  test('bg processes do NOT surface in the footer (chip removed)', () => {
     const s = startedSession();
     s.bgProcesses.set('p1', { processId: 'p1', command: 'npm run dev' });
     s.bgProcesses.set('p2', { processId: 'p2', command: 'pytest' });
-    const out = renderFooter(s, caps);
-    // Order: model · steps/max · cost · bg N.
-    expect(out).toContain('• sonnet-4.6 · 3/50 · $0.0120 · bg 2');
-  });
-
-  test('bg counter only surfaces when size > 0 (zero processes drops the token)', () => {
-    const s = startedSession();
-    expect(s.bgProcesses.size).toBe(0);
-    const out = renderFooter(s, caps);
+    const out = renderFooter(s, caps) ?? '';
     expect(out).not.toContain('bg ');
-    expect(out).toContain('• sonnet-4.6 · 3/50');
   });
 
-  test('memoryCount > 0 surfaces as `mem N` after cost (BACKLOG D68 follow-up)', () => {
-    const state = startedSession({ memoryCount: 7 });
-    const out = renderFooter(state, caps) ?? '';
-    expect(out).toContain('mem 7');
-    // Ordering: cost comes before mem.
-    expect(out.indexOf('$')).toBeLessThan(out.indexOf('mem 7'));
-  });
-
-  test('memoryCount === 0 drops the token entirely', () => {
-    const out = renderFooter(startedSession({ memoryCount: 0 }), caps) ?? '';
+  test('memoryCount does NOT surface in the footer (chip removed)', () => {
+    const out = renderFooter(startedSession({ memoryCount: 7 }), caps) ?? '';
     expect(out).not.toContain('mem ');
   });
 
-  test('memoryCount and bg coexist (bg before mem per spec §4.10.6 priority)', () => {
-    const state = startedSession({ memoryCount: 3 });
-    state.bgProcesses.set('p1', { processId: 'p1', command: 'sleep' });
-    const out = renderFooter(state, caps) ?? '';
-    expect(out).toContain('bg 1');
-    expect(out).toContain('mem 3');
-    expect(out.indexOf('bg 1')).toBeLessThan(out.indexOf('mem 3'));
+  describe('session-total tokens chip', () => {
+    test('renders compact `Nk tokens` right after the model chip', () => {
+      const out =
+        renderFooter(
+          startedSession({
+            sessionTotalTokens: 12_400,
+            lastTurnContextTokens: 90_000,
+            contextWindow: 200_000,
+          }),
+          caps,
+        ) ?? '';
+      expect(out).toContain('12k tokens');
+      // Order: model · tokens · context%. Tokens come right after
+      // model so the operator's load cluster reads
+      // identity → weight → saturation.
+      expect(out.indexOf('sonnet-4.6')).toBeLessThan(out.indexOf('12k tokens'));
+      expect(out.indexOf('12k tokens')).toBeLessThan(out.indexOf('45% context used'));
+    });
+
+    test('zero tokens drops the chip entirely', () => {
+      const out = renderFooter(startedSession({ sessionTotalTokens: 0 }), caps) ?? '';
+      expect(out).not.toContain('tokens');
+    });
+
+    test('format degrades with magnitude', () => {
+      expect(renderFooter(startedSession({ sessionTotalTokens: 850 }), caps) ?? '').toContain(
+        '850 tokens',
+      );
+      // Sub-10k: one decimal where it adds info, integer otherwise.
+      expect(renderFooter(startedSession({ sessionTotalTokens: 1234 }), caps) ?? '').toContain(
+        '1.2k tokens',
+      );
+      expect(renderFooter(startedSession({ sessionTotalTokens: 2000 }), caps) ?? '').toContain(
+        '2k tokens',
+      );
+      // 10k+ rounds to whole thousands.
+      expect(renderFooter(startedSession({ sessionTotalTokens: 45_678 }), caps) ?? '').toContain(
+        '46k tokens',
+      );
+      // Million-scale degrades again.
+      expect(renderFooter(startedSession({ sessionTotalTokens: 1_200_000 }), caps) ?? '').toContain(
+        '1.2M tokens',
+      );
+    });
   });
 
-  test('bg + plan mode coexist in correct order (model · plan · steps · cost · bg)', () => {
-    const s = startedSession({ planMode: true });
-    s.bgProcesses.set('p1', { processId: 'p1', command: 'x' });
-    const out = renderFooter(s, caps);
-    expect(out).toContain('• sonnet-4.6 · plan · 3/50 · $0.0120 · bg 1');
+  describe('% context used chip', () => {
+    test('renders `X% context used` when contextWindow and lastTurnContextTokens are set', () => {
+      const out =
+        renderFooter(
+          startedSession({ contextWindow: 200_000, lastTurnContextTokens: 90_000 }),
+          caps,
+        ) ?? '';
+      expect(out).toContain('45% context used');
+    });
+
+    test('suppressed when contextWindow is 0 (banner not seen yet)', () => {
+      const out =
+        renderFooter(startedSession({ contextWindow: 0, lastTurnContextTokens: 90_000 }), caps) ??
+        '';
+      expect(out).not.toContain('context used');
+    });
+
+    test('suppressed when no turn has landed yet', () => {
+      const out =
+        renderFooter(startedSession({ contextWindow: 200_000, lastTurnContextTokens: 0 }), caps) ??
+        '';
+      expect(out).not.toContain('context used');
+    });
+
+    test('paints `warn` (yellow, SGR 33) when ratio crosses the 80% threshold', () => {
+      const colored: Capabilities = { ...caps, color: 'basic' };
+      const out =
+        renderFooter(
+          startedSession({ contextWindow: 200_000, lastTurnContextTokens: 170_000 }),
+          colored,
+        ) ?? '';
+      // 170k / 200k = 85% → past the 80% gate, painted warn.
+      expect(out).toContain('85% context used');
+      expect(out).toContain(`${CSI}33m85% context used${CSI}0m`);
+    });
+
+    test('stays `secondary` (grey, SGR 90) below the 80% threshold', () => {
+      const colored: Capabilities = { ...caps, color: 'basic' };
+      const out =
+        renderFooter(
+          startedSession({ contextWindow: 200_000, lastTurnContextTokens: 100_000 }),
+          colored,
+        ) ?? '';
+      expect(out).toContain('50% context used');
+      expect(out).toContain(`${CSI}90m50% context used${CSI}0m`);
+    });
+
+    test('clamps to 100% when usage exceeds the window (provider edge case)', () => {
+      const out =
+        renderFooter(
+          startedSession({ contextWindow: 100_000, lastTurnContextTokens: 250_000 }),
+          caps,
+        ) ?? '';
+      expect(out).toContain('100% context used');
+    });
   });
 
-  test('subagents counter > 0 surfaces as `subagents N` after bg', () => {
+  describe('"always visible" lead chips before session:start', () => {
+    test('model + tokens + ctx render even with sessionId null', () => {
+      // Simulates the boot window: banner landed (model + window
+      // stamped), tokens accumulated via assistant:end, but the
+      // user hasn't submitted yet so sessionId is still null.
+      const s = createInitialState();
+      s.status = {
+        ...s.status,
+        model: 'anthropic/claude-opus-4-7',
+        contextWindow: 200_000,
+        sessionTotalTokens: 12_400,
+        lastTurnContextTokens: 90_000,
+      };
+      const out = renderFooter(s, caps) ?? '';
+      expect(out).toContain('anthropic/claude-opus-4-7');
+      expect(out).toContain('12k tokens');
+      expect(out).toContain('45% context used');
+    });
+  });
+
+  test('subagents counter does NOT surface in the footer (chip removed)', () => {
     const s = startedSession();
     s.subagents.set('child-1', {
       subagentId: 'child-1',
@@ -205,121 +302,22 @@ describe('renderFooter', () => {
       startedAt: 0,
       liveCostUsd: 0,
     });
-    s.subagents.set('child-2', {
-      subagentId: 'child-2',
-      name: 'review',
-      goal: 'check diff',
-      progress: '',
-      startedAt: 0,
-      liveCostUsd: 0,
-    });
-    const out = renderFooter(s, caps) ?? '';
-    expect(out).toContain('subagents 2');
-  });
-
-  test('subagents counter === 0 drops the token', () => {
-    const s = startedSession();
-    expect(s.subagents.size).toBe(0);
     const out = renderFooter(s, caps) ?? '';
     expect(out).not.toContain('subagents ');
   });
 
-  test('bg + subagents coexist with bg before subagents', () => {
-    const s = startedSession();
-    s.bgProcesses.set('p1', { processId: 'p1', command: 'pytest' });
-    s.subagents.set('child-1', {
-      subagentId: 'child-1',
-      name: 'explore',
-      goal: 'g',
-      progress: '',
-      startedAt: 0,
-      liveCostUsd: 0,
-    });
-    const out = renderFooter(s, caps) ?? '';
-    expect(out).toContain('bg 1');
-    expect(out).toContain('subagents 1');
-    expect(out.indexOf('bg 1')).toBeLessThan(out.indexOf('subagents 1'));
-  });
-
-  test('parallelStatus surfaces as `subagents R+Q/cap` (D234)', () => {
+  test('parallelStatus does NOT surface subagents/tools chips (chips removed)', () => {
     const s = startedSession();
     s.parallelStatus = {
       subagentsRunning: 2,
       subagentsQueued: 3,
       subagentsCap: 3,
-      toolsRunning: 0,
-      toolsCap: 0,
-    };
-    const out = renderFooter(s, caps) ?? '';
-    expect(out).toContain('subagents 2+3/3');
-  });
-
-  test('parallelStatus omits queue suffix when queue is 0', () => {
-    const s = startedSession();
-    s.parallelStatus = {
-      subagentsRunning: 2,
-      subagentsQueued: 0,
-      subagentsCap: 3,
-      toolsRunning: 0,
-      toolsCap: 0,
-    };
-    const out = renderFooter(s, caps) ?? '';
-    expect(out).toContain('subagents 2/3');
-    expect(out).not.toContain('+0');
-  });
-
-  test('parallelStatus suppresses subagents chip when running+queued is 0', () => {
-    const s = startedSession();
-    s.parallelStatus = {
-      subagentsRunning: 0,
-      subagentsQueued: 0,
-      subagentsCap: 3,
-      toolsRunning: 0,
-      toolsCap: 0,
-    };
-    const out = renderFooter(s, caps) ?? '';
-    expect(out).not.toContain('subagents ');
-  });
-
-  test('parallelStatus surfaces tools chip when running > 1 (D234)', () => {
-    const s = startedSession();
-    s.parallelStatus = {
-      subagentsRunning: 0,
-      subagentsQueued: 0,
-      subagentsCap: 3,
       toolsRunning: 3,
       toolsCap: 3,
     };
     const out = renderFooter(s, caps) ?? '';
-    expect(out).toContain('tools 3/3');
-  });
-
-  test('parallelStatus suppresses tools chip at 1 in flight (single-tool noise)', () => {
-    const s = startedSession();
-    s.parallelStatus = {
-      subagentsRunning: 0,
-      subagentsQueued: 0,
-      subagentsCap: 3,
-      toolsRunning: 1,
-      toolsCap: 3,
-    };
-    const out = renderFooter(s, caps) ?? '';
+    expect(out).not.toContain('subagents ');
     expect(out).not.toContain('tools ');
-  });
-
-  test('parallelStatus null falls back to legacy subagents N from live map', () => {
-    const s = startedSession();
-    s.parallelStatus = null;
-    s.subagents.set('child-1', {
-      subagentId: 'child-1',
-      name: 'explore',
-      goal: 'g',
-      progress: '',
-      startedAt: 0,
-      liveCostUsd: 0,
-    });
-    const out = renderFooter(s, caps) ?? '';
-    expect(out).toContain('subagents 1');
   });
 
   test('null when modal is up', () => {
@@ -359,12 +357,6 @@ describe('renderFooter', () => {
     expect(out).toContain(`${CSI}90m`);
   });
 
-  test('cost format degrades with magnitude (under $1 = 4 decimals)', () => {
-    expect(renderFooter(startedSession({ costUsd: 0.0008 }), caps)).toContain('$0.0008');
-    expect(renderFooter(startedSession({ costUsd: 1.234 }), caps)).toContain('$1.234');
-    expect(renderFooter(startedSession({ costUsd: 100.5 }), caps)).toContain('$100.50');
-  });
-
   test('overflow: long content collapses padding to 0 (truncation kicks in upstream)', () => {
     // Stuff the model name to push the right column past caps.cols.
     // visualWidth(left) + visualWidth(right) > caps.cols → padding=0.
@@ -378,15 +370,14 @@ describe('renderFooter', () => {
     expect(visualWidth(out ?? '')).toBeGreaterThanOrEqual(caps.cols);
   });
 
-  test('right column gated by sessionId (single proxy, all-or-nothing)', () => {
-    // Status with model set but sessionId still null → still pre-
-    // session for footer purposes. Avoids the half-state bug where
-    // model rendered but cost/budget didn't.
+  test('pre-session: model visible before sessionId is set', () => {
+    // Model chip is "always visible" — surfaces as soon as
+    // session:banner lands (before sessionId is set on
+    // session:start), and stays across idle gaps between turns.
     const half = createInitialState();
-    half.status = { ...half.status, model: 'sonnet-4.6', maxSteps: 50 };
+    half.status = { ...half.status, model: 'sonnet-4.6' };
     const out = renderFooter(half, caps);
-    expect(out).not.toContain('•');
-    expect(out).not.toContain('sonnet-4.6');
+    expect(out).toContain('sonnet-4.6');
   });
 
   describe('slash popover open suppresses help hints', () => {
@@ -404,13 +395,11 @@ describe('renderFooter', () => {
       expect(out).not.toContain('\\+Enter newline');
     });
 
-    test('right column stays intact (model/steps/cost still visible)', () => {
+    test('right column stays intact (model still visible)', () => {
       const s = startedSession();
       s.slash = { suggestions: [], selectedIdx: -1 };
       const out = renderFooter(s, caps);
-      expect(out).toContain('• sonnet-4.6');
-      expect(out).toContain('3/50');
-      expect(out).toContain('$0.0120');
+      expect(out).toContain('sonnet-4.6');
     });
 
     test('interrupt cue still surfaces if a run is in flight', () => {
@@ -502,11 +491,9 @@ describe('renderFooter', () => {
       const s = startedSession();
       s.exitArmed = { at: 1000 };
       const out = renderFooter(s, caps);
-      // The model/steps/cost remain in the right column — the gate
-      // only takes over the left.
-      expect(out).toContain('• sonnet-4.6');
-      expect(out).toContain('3/50');
-      expect(out).toContain('$0.0120');
+      // The model remains in the right column — the gate only
+      // takes over the left.
+      expect(out).toContain('sonnet-4.6');
     });
   });
 });
