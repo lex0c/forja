@@ -185,13 +185,13 @@ export interface PendingAssistant {
 // `key` is the hotkey that activates the option directly (typically
 // '1','2','3' for numbered lists; can be a letter for mnemonics).
 // `value` is the semantic answer the manager resolves with — a
-// string union per flavor; permission uses 'yes' | 'session-allow' |
-// 'no'. Cancel (Esc) is NOT a regular option — it returns 'cancel'
-// distinct from 'no' so audit can tell explicit rejection from
-// "user closed the modal without deciding".
+// string union per flavor; permission uses 'yes' | 'no'. Cancel
+// (Esc) is NOT a regular option — it returns 'cancel' distinct from
+// 'no' so audit can tell explicit rejection from "user closed the
+// modal without deciding".
 //
-// `shortcut` is an optional secondary key (e.g. 'shift+tab' for the
-// session-allow option). Renderer shows it in parens after the label.
+// `shortcut` is an optional secondary key (named chord like
+// 'shift+tab'). Renderer shows it in parens after the label.
 export interface ConfirmOption {
   key: string;
   label: string;
@@ -277,7 +277,7 @@ export interface ConfirmState {
 
 // Permission flavor's answer values. Other flavors define their
 // own semantic union; this one's union is the most common.
-export type PermissionAnswer = 'yes' | 'session-allow' | 'no' | 'cancel';
+export type PermissionAnswer = 'yes' | 'no' | 'cancel';
 
 // Slash command autocomplete state. Spec UI.md §5.3. Set when the
 // input buffer starts with `/`; cleared when the user submits, Esc,
@@ -1393,26 +1393,13 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       //      lines around the action are load-bearing — they make
       //      the action read as a deliberate decision instead of a
       //      config row, matching reference terminal designs.
-      //   3. Options + footer: option 2's label promotes the matched
-      //      rule pattern ("Yes, don't ask again for: rm -rf *")
-      //      via buildPermissionOptions — same source the manager
-      //      uses for selection clamping, so labels and count can't
-      //      drift. Footer gains "Tab to amend" and
-      //      "Ctrl+E to explain" hints — handlers land in later
-      //      slices; the hint reservation pre-flows the footer.
-
-      // Option 2's label is driven by `sessionAllowTarget` (the
-      // pattern the bridge will actually promote on session-allow),
-      // NOT by `event.rule`. Compound-command confirms emit no
-      // `rule` (no pattern matched — the guard fired structurally),
-      // but the bridge still derives a literal from args; that
-      // literal is what `sessionAllowTarget` carries. Falling back
-      // to `event.rule` keeps backward compat with synthesized
-      // events that pre-date this field.
-      const options = buildPermissionOptions(
-        event.toolName,
-        event.sessionAllowTarget ?? event.rule,
-      );
+      //   3. Options + footer: Yes / No via buildPermissionOptions
+      //      — same source the manager uses for selection clamping,
+      //      so labels and count can't drift. Footer reserves
+      //      "Tab to amend" and "Ctrl+E to explain" hints — handlers
+      //      land in later slices; the hint reservation pre-flows
+      //      the footer.
+      const options = buildPermissionOptions();
 
       // Anti-spoof: only the agent's `name` (the definition's
       // declared name from the agents/*.md frontmatter) reaches the

@@ -25,8 +25,7 @@ import { type HarnessConfig, type HarnessResult, runAgent } from '../harness/ind
 import { effectiveBudget, resolveMaxOutputTokens } from '../harness/types.ts';
 import { dispatchChain } from '../hooks/dispatcher.ts';
 import type { HookChainResult, HookEventPayload } from '../hooks/types.ts';
-import { escapeGlobMetacharacters } from '../permissions/index.ts';
-import type { PolicySource, PolicyToolsSection } from '../permissions/index.ts';
+import type { PolicySource } from '../permissions/index.ts';
 import { createDefaultRegistry } from '../providers/registry.ts';
 import { buildAutoTerse } from '../recap/auto-display.ts';
 import { stripAnsi } from '../sanitize/index.ts';
@@ -72,175 +71,6 @@ import {
   parseSlashInput,
 } from './slash/index.ts';
 import { APP_NAME, VERSION } from './version.ts';
-
-// Runtime guard for `keyof PolicyToolsSection` — the engine's
-// PolicySource.section is typed as `string` (loose) for forward
-// compat with future categories, but the session-allow bridge
-// can only promote a rule into one of the known sections. The
-// list mirrors `PolicyToolsSection` in src/permissions/types.ts;
-// adding a section there means adding it here too. Type assertion
-// in the guard's return narrows `string` → `keyof PolicyToolsSection`
-// for the caller without a runtime cast.
-const POLICY_SECTION_KEYS: ReadonlySet<keyof PolicyToolsSection> = new Set<
-  keyof PolicyToolsSection
->(['bash', 'read_file', 'write_file', 'edit_file', 'glob', 'grep', 'fetch_url']);
-
-const isPolicySectionKey = (s: string): s is keyof PolicyToolsSection =>
-  POLICY_SECTION_KEYS.has(s as keyof PolicyToolsSection);
-
-// Catch-all glob patterns whose promotion would effectively
-// disable the policy gate for the rest of the session. The init
-// template's defaults include `confirm: ['*']` for bash so any
-// unmatched-allow command pops a modal; an operator who clicks
-// "Yes, don't ask again for: *" on one such confirm would erect
-// an unbounded session-allow that admits every future bash call.
-// We treat the modal click as "yes for THIS specific command",
-// not "yes for everything" — derivePromotionTarget falls through
-// to the args-derived literal when matchedRule lands here.
-//
-// Heuristic — only the bare `*` and `**` shapes (post-trim) count.
-// An operator with a deliberately broad pattern like `'/**'` or
-// `'rm *'` gets promotion as authored; the override here is
-// scoped to the pure-wildcard catch-alls that show up in the
-// stock template.
-const CATCH_ALL_PATTERNS: ReadonlySet<string> = new Set(['*', '**']);
-
-const isCatchAllPattern = (pattern: string): boolean => CATCH_ALL_PATTERNS.has(pattern.trim());
-
-// For search tools (glob/grep), the engine's checkPath matches
-// against a synthetic-descendant target (`<root>/.forja-check`)
-// rather than the literal root, so an allow_paths rule like
-// `src/**` matches `src` as a search root. Session promotion has
-// to follow the same convention: a literal `/proj` rule never
-// matches `/proj/.forja-check` (Bun.Glob's `**` requires at
-// least one path segment, and a bare path requires exact match),
-// so an operator who session-allows grep rooted at `/proj` would
-// otherwise be re-prompted on the next identical call. Append
-// `/**` to make the rule descendant-capable; if the input
-// already ends in `**`, leave it alone (defensive — args.cwd
-// usually carries literal paths, but a future caller might pass
-// a glob).
-const ensureDescendantGlob = (root: string): string => {
-  if (root.endsWith('**')) return root;
-  const trimmed = root.endsWith('/') ? root.slice(0, -1) : root;
-  return `${trimmed}/**`;
-};
-
-// Derives the pattern that would be promoted onto the engine's
-// session-allow Map for a given confirm. Falls back from the
-// engine's matched rule to a literal extracted from the tool args
-// when:
-//   - No rule fired (compound-command guard, missing-arg rejections)
-//     — without the fallback, option 2 of the modal would silently
-//     no-op for those confirms while still claiming to "not ask
-//     again".
-//   - The matched rule is a pure catch-all (`*`, `**`) — promoting
-//     it would erect a session-allow that admits every future call
-//     for the section. The operator's click on a single confirm
-//     should authorize the literal command they saw, not the
-//     unbounded universe of similar commands.
-// The literal becomes a session rule that exact-matches future
-// identical commands; operator's "yes for this one shape" maps to
-// "yes for this exact pattern".
-//
-// Section semantics (matches engine.ts checkBash/checkPath/
-// checkFetch consumption of session rules):
-//   - bash: literal command string from args.command. Bash
-//     session rules are matched against the command via glob, so
-//     promoting the literal as the pattern means future calls
-//     with the same command shape match.
-//   - read_file / write_file / edit_file: args.path. Promoted as
-//     an `allow_paths` entry; future calls against the same path
-//     match.
-//   - grep: args.path when set, otherwise the request cwd. The
-//     engine's resolveFsTarget treats absent args.path as "search
-//     the session cwd"; the promotion mirrors that effective root.
-//     The derived root is wrapped via ensureDescendantGlob so the
-//     stored pattern is descendant-capable (`<root>/**`) — engine
-//     checkPath probes search tools with a synthetic descendant
-//     target, and a bare-path rule would never match.
-//   - glob: args.cwd when set, otherwise the request cwd. Same
-//     reason as grep — glob has no `path` arg, and resolveFsTarget
-//     falls back to session cwd when args.cwd is absent. Same
-//     descendant-glob wrapping applies.
-//   - fetch_url: args.url's hostname. Promoted as an `allow_hosts`
-//     entry; future calls to any URL on the same host match.
-//
-// The cwd fallback for glob/grep matters specifically when an
-// operator's policy uses a catch-all rule (`*`/`**`) and the
-// agent invokes glob/grep without args.cwd/args.path: derivation
-// falls through to args (catch-all override), finds nothing,
-// returns undefined, and the bridge can't promote — operator who
-// clicked "Yes, don't ask again" gets re-prompted on every
-// identical call. Deriving from the request cwd closes that
-// no-op path.
-//
-// Args-derived literals are escaped via escapeGlobMetacharacters
-// before being returned: the engine stores session-allow rules
-// as glob patterns, so a raw `args.command` like `echo *` would
-// otherwise be interpreted as "any echo invocation" and admit
-// later injection variants (the engine consults session-allow
-// BEFORE the compound-shell guard). Escaping makes the rule
-// match the literal command only. Matched-rule values are
-// returned verbatim — those came from operator-authored YAML
-// where wildcards are intentional.
-//
-// Returns undefined when the args don't carry the expected field
-// AND no fallback applies. Bridge guards on undefined to fall
-// back to one-shot allow.
-const derivePromotionTarget = (
-  section: keyof PolicyToolsSection,
-  args: Record<string, unknown>,
-  matchedRule: string | undefined,
-  cwd: string,
-): string | undefined => {
-  if (matchedRule !== undefined && matchedRule.length > 0 && !isCatchAllPattern(matchedRule)) {
-    return matchedRule;
-  }
-  switch (section) {
-    case 'bash': {
-      const v = args.command;
-      if (typeof v !== 'string' || v.length === 0) return undefined;
-      return escapeGlobMetacharacters(v);
-    }
-    case 'read_file':
-    case 'write_file':
-    case 'edit_file': {
-      const v = args.path;
-      if (typeof v !== 'string' || v.length === 0) return undefined;
-      return escapeGlobMetacharacters(v);
-    }
-    case 'grep': {
-      const v = args.path;
-      const root = typeof v === 'string' && v.length > 0 ? v : cwd;
-      if (root.length === 0) return undefined;
-      // Escape the literal root before appending `/**` so the
-      // wildcard part stays intentional. Without escaping, a
-      // root that contains `*` (rare but possible) would broaden
-      // the rule beyond the operator's intent.
-      return ensureDescendantGlob(escapeGlobMetacharacters(root));
-    }
-    case 'glob': {
-      const v = args.cwd;
-      const root = typeof v === 'string' && v.length > 0 ? v : cwd;
-      if (root.length === 0) return undefined;
-      return ensureDescendantGlob(escapeGlobMetacharacters(root));
-    }
-    case 'fetch_url': {
-      const v = args.url;
-      if (typeof v !== 'string' || v.length === 0) return undefined;
-      try {
-        // Hostnames per RFC 1123 cannot contain glob meta — `*`,
-        // `?`, `\\` are never valid in a DNS label. URL.hostname
-        // would have rejected the URL or returned an exotic form
-        // long before we got here. Pass through without escape.
-        return new URL(v).hostname;
-      } catch {
-        return undefined;
-      }
-    }
-  }
-};
 
 export interface RunReplOptions {
   args: ParsedArgs;
@@ -1358,29 +1188,6 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // req.source undefined). For parent-side confirms the rule
     // came from operator-authored YAML, so trust is implicit.
     let displayRule = req.source?.rule;
-    // The pattern the bridge would promote onto the engine on
-    // session-allow. For parent-side confirms with a known
-    // section, this is `source.rule` if the engine matched a real
-    // rule, otherwise a literal extracted from args (the bash
-    // command, the fs path, the URL host) so option 2 doesn't
-    // promise something the bridge then silently no-ops on. For
-    // subagent confirms we leave it undefined: promotion is
-    // disabled (deferred slice), and the modal's option 2 falls
-    // back to the vague "Yes, allow all <tool> during this
-    // session" wording — matching the no-op behavior.
-    let sessionAllowTarget: string | undefined;
-    if (
-      req.subagent === undefined &&
-      req.source?.section !== undefined &&
-      isPolicySectionKey(req.source.section)
-    ) {
-      sessionAllowTarget = derivePromotionTarget(
-        req.source.section,
-        req.args,
-        req.source.rule,
-        req.cwd,
-      );
-    }
     if (req.subagent !== undefined) {
       command = sanitizeForSubagentDisplay(command);
       displayToolName = sanitizeForSubagentDisplay(req.toolName);
@@ -1389,9 +1196,6 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       if (displayRule !== undefined) {
         displayRule = sanitizeForSubagentDisplay(displayRule);
       }
-      // sessionAllowTarget is undefined for subagent — no
-      // sanitization needed. When IPC source marshaling lands and
-      // the subagent guard goes away, sanitize this field too.
     }
     const answer = await modalManager.askPermission(
       {
@@ -1407,13 +1211,6 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // source yet). The reducer renders one line per
         // available field; missing fields just don't render.
         ...(displayRule !== undefined ? { rule: displayRule } : {}),
-        // Forward the promotion target separately from the
-        // matched rule. The reducer drives option 2's label off
-        // this field; matched-rule attribution stays driven by
-        // `rule`. Decoupled so a compound-command confirm (no
-        // matched rule, but a literal to promote) renders option
-        // 2 accurately while the matched-rule line stays absent.
-        ...(sessionAllowTarget !== undefined ? { sessionAllowTarget } : {}),
         ...(req.source?.layer !== undefined ? { layer: req.source.layer } : {}),
         // Forward subagent attribution so the modal can label the
         // request as coming from a child run (spec
@@ -1428,44 +1225,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       // operator on a stale request.
       req.signal !== undefined ? { signal: req.signal } : undefined,
     );
-    // Map the spec-shape answer to the harness's boolean contract.
-    // 'session-allow' promotes the chosen pattern onto the engine's
-    // session-scoped allowlist BEFORE returning true so the next
-    // matching call short-circuits past the modal. The pattern
-    // comes from `sessionAllowTarget` — the same value that drove
-    // option 2's label, so the operator's "Yes, don't ask again
-    // for: <X>" promise matches what addSessionAllow registers.
-    //
-    // sessionAllowTarget is set above only when:
-    //   - the request originated parent-side (req.subagent ===
-    //     undefined). Subagent confirms gate against the CHILD's
-    //     own engine (constructed from `policySnapshot =
-    //     parent.policy()` in runtime.ts; the snapshot does NOT
-    //     carry session rules — they live in the parent's closure
-    //     Map, not in Policy). Promoting onto parent on a child
-    //     confirm would write a rule the child never sees, so the
-    //     child re-prompts on every step while the parent's engine
-    //     accrues inert state. Skip promotion entirely; subagent
-    //     session-allow needs both IPC source marshaling AND a
-    //     child-engine push-down (or folding session rules into
-    //     `policy()` snapshot), neither of which exists today.
-    //     Tracked as a separate follow-up slice.
-    //   - source.section is a known PolicyToolsSection key. The
-    //     engine emits valid sections today; the runtime guard is
-    //     defense-in-depth against a future engine emitting an
-    //     unknown section name we don't have a derivation rule for.
-    //   - args carry the field the section needs (command/path/
-    //     cwd/url). When missing or non-string, derivePromotionTarget
-    //     returns undefined and we fall back to one-shot allow.
-    if (
-      answer === 'session-allow' &&
-      sessionAllowTarget !== undefined &&
-      req.source?.section !== undefined &&
-      isPolicySectionKey(req.source.section)
-    ) {
-      baseConfig.permissionEngine.addSessionAllow(req.source.section, sessionAllowTarget);
-    }
-    return answer === 'yes' || answer === 'session-allow';
+    // Modal returns 'yes' / 'no' / 'cancel'. The previous
+    // 'session-allow' value was removed alongside option 2 — the
+    // engine's addSessionAllow API stays available for non-modal
+    // surfaces (future `/perms` slash commands).
+    return answer === 'yes';
   };
 
   // Bridge for the `memory_write` tool's confirm modal (MEMORY.md

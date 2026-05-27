@@ -1,7 +1,7 @@
 // End-to-end test for the modal pattern: manager → bus → reducer →
 // rendered output. Covers the spec-shape modal (UI.md §4.10.13):
-// 3-option list, hotkey activation, Esc=cancel, navigation preserves
-// content.
+// 2-option list (Yes / No), hotkey activation, Esc=cancel,
+// navigation preserves content.
 
 import { describe, expect, test } from 'bun:test';
 import { createBus } from '../../src/tui/bus.ts';
@@ -71,8 +71,7 @@ describe('modal navigation preserves contents', () => {
   test('initial ask renders context label, action, source attribution, options', () => {
     // Modal redesign (design/permission-modal-redesign.md): title
     // is now the per-tool context label ("Bash command"), the
-    // action lifts into its own block with breathing room, and
-    // option 2 promotes the matched rule.
+    // action lifts into its own block with breathing room.
     const s = make();
     void s.manager.askPermission({
       toolName: 'bash',
@@ -87,10 +86,9 @@ describe('modal navigation preserves contents', () => {
     // Action block.
     expect(out).toContain('rm -rf ./build');
     expect(out).toContain('matched rule: bash.rm.rf');
-    // Options.
+    // Options — Yes / No only (session-allow option removed).
     expect(out).toContain('1. Yes');
-    expect(out).toContain("2. Yes, don't ask again for: bash.rm.rf");
-    expect(out).toContain('3. No');
+    expect(out).toContain('2. No');
     // Footer carries only `Esc to cancel` — `Tab to amend` and
     // `Ctrl+E to explain` were promised earlier but their handlers
     // never landed, so advertising them is a UX hazard on a
@@ -111,16 +109,14 @@ describe('modal navigation preserves contents', () => {
     const before = s.rendered() ?? '';
     s.fs.dispatch(key('up'));
     const after = s.rendered() ?? '';
-    // All four blocks survive the navigation.
+    // All blocks survive the navigation.
     expect(after).toContain('Bash command');
     expect(after).toContain('rm -rf ./build');
     expect(after).toContain('1. Yes');
-    expect(after).toContain('3. No');
-    // Cursor moved from option 3 (No) to option 2 (session-allow).
-    // Without rule on this ask, option 2 falls back to the per-tool
-    // wording.
-    expect(before).toMatch(/> 3\. No/);
-    expect(after).toMatch(/> 2\. Yes, allow all bash during this session/);
+    expect(after).toContain('2. No');
+    // Cursor moved from option 2 (No) to option 1 (Yes).
+    expect(before).toMatch(/> 2\. No/);
+    expect(after).toMatch(/> 1\. Yes/);
     s.fs.dispatch(key('escape'));
   });
 
@@ -131,14 +127,12 @@ describe('modal navigation preserves contents', () => {
       command: 'src/foo.ts',
       cwd: '/r',
     });
-    s.fs.dispatch(key('up')); // 2 → 1
-    s.fs.dispatch(key('up')); // 1 → 0
-    s.fs.dispatch(key('down')); // 0 → 1
+    s.fs.dispatch(key('up')); // 1 → 0 ('Yes')
+    s.fs.dispatch(key('down')); // 0 → 1 ('No')
     const out = s.rendered() ?? '';
     expect(out).toContain('Editing file');
     expect(out).toContain('src/foo.ts');
-    // No-rule ask: option 2 falls back to per-tool wording.
-    expect(out).toMatch(/> 2\. Yes, allow all edit_file during this session/);
+    expect(out).toMatch(/> 2\. No/);
     s.fs.dispatch(key('escape'));
   });
 

@@ -87,7 +87,7 @@ const make = (overrides: { onInterrupt?: () => void } = {}): Setup => {
   return { bus, fs, manager, events, timer, ids: () => ids.slice() };
 };
 
-describe('askPermission (3-option modal per UI.md §4.10.13)', () => {
+describe('askPermission (2-option modal per UI.md §4.10.13)', () => {
   test('emits permission:ask, pushes a focus handler', () => {
     const s = make();
     const promise = s.manager.askPermission({
@@ -170,40 +170,26 @@ describe('askPermission (3-option modal per UI.md §4.10.13)', () => {
     await expect(promise).resolves.toBe('yes');
   });
 
-  test('hotkey "2" resolves "session-allow"', async () => {
+  test('hotkey "2" resolves "no" (same as default Enter)', async () => {
     const s = make();
     const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
     s.fs.dispatch(charKey('2'));
-    await expect(promise).resolves.toBe('session-allow');
-  });
-
-  test('hotkey "3" resolves "no" (same as default Enter)', async () => {
-    const s = make();
-    const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
-    s.fs.dispatch(charKey('3'));
     await expect(promise).resolves.toBe('no');
-  });
-
-  test('Shift+Tab as secondary shortcut activates session-allow option', async () => {
-    const s = make();
-    const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
-    s.fs.dispatch(key('tab', { shift: true }));
-    await expect(promise).resolves.toBe('session-allow');
   });
 
   test('Up arrow moves selection up by one; Enter resolves the new selection', async () => {
     const s = make();
     const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
-    // Default is index 2 ('no'). Up → 1 ('session-allow'). Enter resolves it.
+    // Default is index 1 ('no'). Up → 0 ('yes'). Enter resolves it.
     s.fs.dispatch(key('up'));
     s.fs.dispatch(key('enter'));
-    await expect(promise).resolves.toBe('session-allow');
+    await expect(promise).resolves.toBe('yes');
   });
 
   test('Down arrow at the bottom is a no-op (clamps to last index)', async () => {
     const s = make();
     const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
-    // Default = last (index 2). Down should clamp.
+    // Default = last (index 1). Down should clamp.
     s.fs.dispatch(key('down'));
     s.fs.dispatch(key('enter'));
     await expect(promise).resolves.toBe('no');
@@ -212,7 +198,6 @@ describe('askPermission (3-option modal per UI.md §4.10.13)', () => {
   test('Up at the top is a no-op (clamps to index 0)', async () => {
     const s = make();
     const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
-    s.fs.dispatch(key('up')); // 2 → 1
     s.fs.dispatch(key('up')); // 1 → 0
     s.fs.dispatch(key('up')); // clamps at 0
     s.fs.dispatch(key('up')); // still 0
@@ -227,7 +212,7 @@ describe('askPermission (3-option modal per UI.md §4.10.13)', () => {
     s.fs.dispatch(key('up'));
     const emitted = s.events.slice(beforeNav);
     expect(emitted).toHaveLength(1);
-    expect(emitted[0]).toMatchObject({ type: 'modal:select', selectedIndex: 1 });
+    expect(emitted[0]).toMatchObject({ type: 'modal:select', selectedIndex: 0 });
     s.fs.dispatch(key('escape'));
     return promise;
   });
@@ -279,14 +264,14 @@ describe('askPermission (3-option modal per UI.md §4.10.13)', () => {
     const s = make();
     const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
     const beforeNav = s.events.length;
-    s.fs.dispatch(key('up')); // 2 → 1
     s.fs.dispatch(key('up')); // 1 → 0
     s.fs.dispatch(key('down')); // 0 → 1
+    s.fs.dispatch(key('up')); // 1 → 0
     const indices = s.events
       .slice(beforeNav)
       .filter((e): e is Extract<UIEvent, { type: 'modal:select' }> => e.type === 'modal:select')
       .map((e) => e.selectedIndex);
-    expect(indices).toEqual([1, 0, 1]);
+    expect(indices).toEqual([0, 1, 0]);
     s.fs.dispatch(key('escape'));
     await promise;
   });
@@ -306,12 +291,12 @@ describe('askPermission (3-option modal per UI.md §4.10.13)', () => {
   test('modal:answer carries the user-selected decision string', async () => {
     const s = make();
     const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
-    s.fs.dispatch(charKey('2')); // session-allow
+    s.fs.dispatch(charKey('2')); // No
     await promise;
     const answer = s.events.find(
       (e): e is Extract<UIEvent, { type: 'modal:answer' }> => e.type === 'modal:answer',
     );
-    expect(answer?.decision).toBe('session-allow');
+    expect(answer?.decision).toBe('no');
   });
 
   test('modal:answer carries "cancel" on Esc (distinct from "no")', async () => {

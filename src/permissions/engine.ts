@@ -377,10 +377,12 @@ export interface PermissionEngine {
   // attributed to the built-in default.
   provenance(): SectionProvenance;
   // Append a pattern to the session-scoped allowlist for the
-  // given section. Used by the REPL's "Yes, don't ask again
-  // for: <rule>" modal answer — the bridge calls this BEFORE
-  // returning true so subsequent calls matching the pattern
-  // skip the modal entirely.
+  // given section. The permission modal no longer carries a
+  // "session-allow" option (removed alongside option 2); this API
+  // exists for non-modal promotion paths (future `/perms` slash
+  // commands, programmatic test setup, audit replay). Subsequent
+  // engine.check() calls matching the pattern short-circuit to
+  // allow.
   //
   // The pattern semantics depend on the section:
   //   - bash → matched against `args.command` (glob).
