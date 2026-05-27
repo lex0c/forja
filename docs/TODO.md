@@ -1564,3 +1564,112 @@ get the dominant input-cost reduction Anthropic advertises
 (~70% per `PROVIDERS.md §5.1`). At the limit, this is bigger
 than #1 + #2 combined for operator usage patterns that involve
 real-world pacing (reading output, thinking, switching apps).
+
+---
+
+# Operator feedback infrastructure (fine-tuning pre-req)
+
+## Explicit operator feedback widget per turn
+
+**Status:** deferred. Forja's audit captures a near-complete
+training signal — `prompt_versions` (content-addressed system
+prompts), `messages` (role + content + token usage),
+`tool_calls` (input + raw output preserved even when
+summarized), `cost_progress_events`, `failure_events`, plus the
+`audit_timeline` view (`AUDIT.md §2.1`) that unifies all of
+the above. Outcome signals exist via `outcome_signals` with the
+four NEGATIVE proxies declared in `src/outcomes/codes.ts:16-20`
+(`tool_error`, `failure_event`, `checkpoint_reverted`,
+`session_aborted`). What's missing is an EXPLICIT POSITIVE /
+per-turn signal from the operator — the dataset has plenty of
+"this went wrong" rows and no "this answer was helpful" rows.
+
+**What it is:** a TUI surface that lets the operator rate the
+last assistant turn (or the last tool call) without breaking
+flow. Shape options (decide at pull-in):
+
+- **Minimal**: two keybindings (e.g., `Alt+Up` / `Alt+Down`)
+  that emit `signal_kind: 'operator_positive'` /
+  `'operator_negative'` against the current step. Zero
+  cognitive overhead; binary signal.
+- **Nuanced**: one-key shortcut opens a popover with reasons
+  (`wrong tool`, `right tool, bad args`, `solved my problem`,
+  `kept me unblocked`, …). Better data quality, friction
+  trade-off.
+- **Implicit augment**: track `restart_after`, `undo_within_N`,
+  `corrected_in_next_turn` as additional implicit signal
+  kinds. Cheaper than a widget but inferential — not
+  ground-truth.
+
+**Why deferred:** Forja has no fine-tuning effort in flight
+today; landing the widget without a downstream consumer is
+infrastructure built for the abstract. The substrate
+(`outcome_signals`) already exists, so when the need crystallizes
+it's a small additive change, not a redesign. Also: an
+ill-designed widget that interrupts flow degrades the operator
+experience for everyone in exchange for data quality only the
+fine-tuning workflow benefits from. The cost/benefit only
+makes sense when there's a buyer.
+
+**Where it would land:**
+
+- `src/outcomes/codes.ts:16-20` — extend `OutcomeSignalKind`
+  with `operator_positive` / `operator_negative` (or richer
+  set). Add to migration's CHECK enum. Per `codes.ts:11`, a
+  new kind requires `(a)` entry here, `(b)` ALTER on enum,
+  `(c)` wiring at observation site — the contract is
+  documented inline.
+- `src/storage/migrations/` — new migration adding the new
+  signal_kinds to the CHECK constraint.
+- `src/tui/keys.ts` + `src/tui/render/footer.ts` — keybind
+  registration; small footer chip showing "rated ↑" / "rated
+  ↓" for the most recent turn so the operator knows the
+  rating registered.
+- `src/tui/events.ts` — new `feedback:rate` UIEvent.
+- `src/tui/state.ts` — reducer tracks pending rating per
+  turn (so it can attach to the right `tool_call_id` or
+  `message_id`).
+- `src/cli/repl.ts` — bridge bus event to
+  `appendOutcomeSignal` with the right ids.
+- `src/cli/slash/commands/` — `/feedback metrics` (or
+  similar) for the operator to review their own rating
+  history before exporting.
+
+**New tests:**
+
+- Keybind emits the event with correct payload.
+- Reducer attaches the rating to the most recent
+  `tool_call_id` (or `message_id` for prose-only turns).
+- Storage layer persists the new kind with the configured
+  default weight.
+
+**Pull-in signal:**
+
+- Fine-tuning effort is planned (LoRA, DPO, full SFT — any of
+  them needs labeled data).
+- OR: systematic quality regression evaluation needs to A/B
+  changes (e.g., post-token-efficiency-initiative review:
+  "did #4's summarization hurt quality?").
+- OR: operator explicitly asks for a way to flag turns for
+  review.
+
+**Cost when pulled:**
+
+- Minimal binary version: ~2 days (keybinding + reducer + 1
+  migration + 1 slash + tests).
+- Nuanced popover version: ~4-5 days (add modal + reason
+  vocab + reducer state + richer storage).
+- Implicit-only version: ~1 day (detector that scans audit
+  trail for restart / undo / correction patterns, emits new
+  signal kinds without a TUI surface).
+
+**Spec reference:** extends `PERMISSION_ENGINE.md §6.3.2`'s
+calibration plan (which today only considers system-observed
+proxies) and `AUDIT.md §1` (adds a new outcome_signal kind).
+The widget itself touches `UI.md §4.10.6` (footer chip) and
+new keybinding entries.
+
+**Magnitude:** zero direct token savings (this entry isn't
+token-efficiency). Multiplier on every future quality-driven
+optimization: without ground-truth labels, every A/B comparison
+relies on inference from negative proxies + heuristics.
