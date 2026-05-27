@@ -1679,11 +1679,13 @@ const cmdTar: CommandResolver = (positional, tokens, ctx) => {
       }
     }
     if (t === '--checkpoint-action') {
-      // Space-separated form. We can't safely peek the next token
-      // because numeric values are stripped from args by tree-
-      // sitter — refuse unconditionally; the legitimate forms
-      // (sleep, dot) are equally unanalyzable via the static
-      // resolver.
+      // Space-separated form. The action value can be `exec=<cmd>`
+      // (arbitrary-exec — the exploit), `sleep`, `dot`, `bell`, etc.
+      // Refuse unconditionally regardless of the value because every
+      // shape requires runtime inspection to safely characterize.
+      // Pre-M1 we also lacked the numeric value (tree-sitter dropped
+      // it); post-M1 the value is in args but the security calculus
+      // is unchanged — refuse on the flag alone is the right floor.
       return {
         refuse:
           'tar: --checkpoint-action <value> requires runtime inspection — refusing static analysis',
@@ -1900,18 +1902,16 @@ const cmdSsh: CommandResolver = (_positional, tokens, ctx) => {
     }
   }
 
-  // ssh flag schema. The tree-sitter bash grammar tokenizes numeric
-  // literals as `number` nodes and the analyzer DROPS them from
-  // `shape.args` (only `word`/`string`/`raw_string`/`concatenation`
-  // survive). So a flag whose value is always numeric (`-p 2222`)
-  // arrives here as just `['-p', ...next-token...]` — the value is
-  // already gone, and a generic "consume next" would eat the WRONG
-  // token (the target host). Three flag classes:
+  // ssh flag schema. M1 (review) brought `number` nodes into
+  // `shape.args` (pre-M1 they were dropped by the walker). So
+  // `-p 2222` now arrives as `['-p', '2222', ...]` and the resolver
+  // must consume the numeric next-token instead of leaving it for
+  // the target-host scan. Three flag classes:
   //
-  //   - numericValueFlags: value is strictly numeric → stripped from
-  //     args → DON'T consume next (it's not the value).
+  //   - numericValueFlags: value is strictly numeric → peek next;
+  //     consume when present (post-M1 the value is in args).
   //   - stringValueFlags: value is always a string (path / kv / host)
-  //     → stays in args → peek next; consume if non-flag.
+  //     → peek next; consume if non-flag.
   //   - portForwardFlags: value is `[bind:]port:host:remote_port` for
   //     -L/-R, `[bind:]port` for -D, `local_tun[:remote_tun]` for -w.
   //     Slice 125: `-w` was previously in `numericValueFlags` (bare
@@ -1958,7 +1958,17 @@ const cmdSsh: CommandResolver = (_positional, tokens, ctx) => {
   const explicitFileReads: string[] = [];
   for (let i = 0; i < tokens.length; i += 1) {
     const t = tokens[i] ?? '';
-    if (numericValueFlags.has(t)) continue; // value already stripped from args
+    if (numericValueFlags.has(t)) {
+      // M1: numeric value is now in args. Consume it so the next
+      // scan iteration doesn't pick the value as the target host
+      // (e.g., `ssh -p 2222 host` would otherwise read targetIdx=1
+      // as '2222' instead of 'host'). Skip the consume only when
+      // the next token is itself a flag (operator omitted the
+      // value — malformed input; let the target scan find host).
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) i += 1;
+      continue;
+    }
     if (stringValueFlags.has(t)) {
       const next = tokens[i + 1];
       if (next !== undefined && !next.startsWith('-')) {
@@ -1971,8 +1981,14 @@ const cmdSsh: CommandResolver = (_positional, tokens, ctx) => {
       hasPortForward = true;
       const next = tokens[i + 1];
       // `:` in next → colon-shaped port-forward spec (consume).
-      // No `:` → bare numeric port (stripped) OR the target host
-      // (don't consume; let the next iteration pick it as target).
+      // No `:` → bare numeric port OR the target host. M1 brought
+      // numeric literals into args (pre-M1 they were dropped, so a
+      // bare `-D 8080` left only `-D` in tokens and the loop
+      // correctly read the next non-`:`-shaped token as the host).
+      // Post-M1, `ssh -D 8080 host` produces tokens=['-D','8080','host']
+      // and a colon-only check would leave '8080' for the target
+      // scan to mis-attribute. Add a numeric-only guard so the
+      // bare-port shape gets consumed alongside the colon shape.
       //
       // Slice 127 (R3 P0-3): for `-w`, the value `any` is the
       // documented ssh syntax ("auto-pick tun device"). It's a
@@ -1980,7 +1996,8 @@ const cmdSsh: CommandResolver = (_positional, tokens, ctx) => {
       // pre-slice it leaked into the target-detection branch as
       // a host → emitted `net-egress:any`. Consume it like a
       // colon-shape spec.
-      if (next?.includes(':') || (t === '-w' && next === 'any')) i += 1;
+      const isNumericPort = next !== undefined && /^\d+$/.test(next);
+      if (next?.includes(':') || isNumericPort || (t === '-w' && next === 'any')) i += 1;
       continue;
     }
     if (t.startsWith('-')) continue;
@@ -2499,6 +2516,18 @@ const literalText = (node: Node): string | null => {
   let raw: string;
   if (node.type === 'word' || node.type === 'raw_string') {
     raw = node.text;
+  } else if (node.type === 'number') {
+    // M1 (review). Tree-sitter-bash tokenizes numeric literals
+    // (`-p 2222`, `-maxdepth 3`, `head -c 100`) as `number` nodes.
+    // Pre-M1 the walker silently dropped them from `shape.args`
+    // because `literalText` only accepted word/string/raw_string —
+    // a future cmdXxx resolver that needed a numeric value would
+    // fail silently. Slice 125 history (`ssh -w 0:1` mis-detected
+    // as host `0:1`) shows the pattern HAS bitten before. Treating
+    // `number` as a literal that flows into args is the honest
+    // shape; resolvers that previously assumed numbers were dropped
+    // (ssh, tar's `--checkpoint-action` peek) are updated alongside.
+    raw = node.text;
   } else if (node.type === 'string') {
     // string can contain string_content children and optional
     // string_expansion / command_substitution. If any of those red-
@@ -2612,8 +2641,13 @@ const walkAst = (root: Node): WalkResult => {
           child.type === 'word' ||
           child.type === 'string' ||
           child.type === 'raw_string' ||
-          child.type === 'concatenation'
+          child.type === 'concatenation' ||
+          child.type === 'number'
         ) {
+          // M1 (review). `number` joined the literal types so numeric
+          // args (`-p 2222`, `-maxdepth 3`) survive into shape.args.
+          // Pre-M1 they fell through to the recursive visit branch
+          // below and got silently dropped from the resolver's view.
           const text = literalText(child);
           if (text === null) {
             return 'bash_shape_not_recognized: dynamic content inside string arg';
