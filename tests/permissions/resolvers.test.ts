@@ -570,18 +570,58 @@ describe('bash resolver — simple commands', () => {
     }
   });
 
-  test('ln -t /opt/dir target1: -t value does not surface as duplicate write', () => {
-    // `-t TARGET_DIRECTORY` consumes the next token; /opt/dir is
-    // the link directory hint. The resolver still emits write-fs
-    // for the sources (over-attribute on sources is a known
-    // limitation — separate issue from numeric-leak); we verify
-    // -t's value doesn't double up as a write.
-    const r = resolveCapabilities('bash', { command: 'ln -t /opt/dir target1' }, CTX);
+  test('ln -t /opt/dir src1 src2: -t value IS the write destination', () => {
+    // `-t DIR` makes DIR the link-creation directory. The resolver
+    // MUST emit write-fs for DIR (so a deny rule on DIR can fire)
+    // and read-fs for each source.
+    const r = resolveCapabilities('bash', { command: 'ln -t /opt/dir src1 src2' }, CTX);
     expect(r.kind).toBe('ok');
     if (r.kind === 'ok') {
       const s = capStrings(r.capabilities);
-      expect(s).not.toContain('write-fs:/opt/dir');
+      expect(s).toContain('write-fs:/opt/dir');
+      expect(s).toContain('read-fs:/work/proj/src1');
+      expect(s).toContain('read-fs:/work/proj/src2');
+      expect(s).not.toContain('write-fs:/work/proj/src1');
     }
+  });
+
+  test('ln --target-directory=/opt/dir src: combined form also emits write-fs', () => {
+    const r = resolveCapabilities('bash', { command: 'ln --target-directory=/opt/dir src' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/opt/dir');
+      expect(s).toContain('read-fs:/work/proj/src');
+    }
+  });
+
+  test('ln -t /protected src does NOT bypass deny on /protected (regression pin)', () => {
+    // Pre-fix, `-t` was in LN_VALUE_FLAGS so the destination got
+    // dropped — a `deny: write-fs:/protected/**` would silently
+    // allow link creation there. The destination MUST surface.
+    const r = resolveCapabilities('bash', { command: 'ln -t /protected src' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/protected');
+    }
+  });
+
+  test('ln src dst: no -t — existing fallback (both positionals as writes)', () => {
+    // Without -t, current behavior is to emit write-fs for every
+    // positional. Pin it so the -t fix doesn't regress the legacy
+    // path.
+    const r = resolveCapabilities('bash', { command: 'ln src dst' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/work/proj/dst');
+    }
+  });
+
+  test('ln -t with no sources is refused', () => {
+    const r = resolveCapabilities('bash', { command: 'ln -t /opt/dir' }, CTX);
+    expect(r.kind).toBe('refuse');
   });
 
   test('rsync --bwlimit 1000 src dst: numeric rate is NOT a bogus source', () => {

@@ -1752,14 +1752,12 @@ const TOUCH_VALUE_FLAGS: ReadonlySet<string> = new Set([
   '--reference',
   '--time',
 ]);
-const LN_VALUE_FLAGS: ReadonlySet<string> = new Set([
-  '-t',
-  '--target-directory',
-  '-T',
-  '-S',
-  '--suffix',
-  '--backup',
-]);
+// ln's value-flags whose operand is NOT a write target. `-t /dir`
+// and `--target-directory=/dir` ARE write destinations and are
+// handled below in cmdLn — listing them here would drop the
+// destination from capability attribution, letting `ln -t
+// /protected src` bypass a `deny: write-fs:/protected/**` rule.
+const LN_VALUE_FLAGS: ReadonlySet<string> = new Set(['-S', '--suffix']);
 const MKTEMP_VALUE_FLAGS: ReadonlySet<string> = new Set(['-p', '--tmpdir', '--suffix']);
 
 const emitTargetsAsWrites = (positional: readonly string[], ctx: ResolverContext) => {
@@ -1802,8 +1800,44 @@ const cmdTouch: CommandResolver = (_positional, tokens, ctx) => {
   };
 };
 
+// `ln -t DIR SRC...` / `--target-directory=DIR SRC...` inverts the
+// shape: DIR is the write destination (links are created there),
+// SRC... are read sources. Without this branch the LN_VALUE_FLAGS
+// approach would silently drop DIR from the capability set,
+// letting `ln -t /protected src` bypass a deny on /protected.
+// Parallel to cmdMvCp's --target-directory handling.
 const cmdLn: CommandResolver = (_positional, tokens, ctx) => {
-  return emitTargetsAsWrites(stripFlags(tokens, LN_VALUE_FLAGS), ctx);
+  let targetDir: string | null = null;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i] ?? '';
+    if (t.startsWith('--target-directory=')) {
+      const v = t.slice('--target-directory='.length);
+      if (v.length > 0) targetDir = v;
+    } else if (t === '--target-directory' || t === '-t') {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) targetDir = next;
+    }
+  }
+  const positional = stripFlags(tokens, LN_VALUE_FLAGS);
+
+  if (targetDir !== null) {
+    // All positionals are sources (links created inside targetDir).
+    // Filter targetDir out if it appears in positional (space-
+    // separated `-t DIR` leaves DIR in args).
+    const srcs = positional.filter((p) => p !== targetDir);
+    if (srcs.length === 0) {
+      return { refuse: 'ln: -t/--target-directory needs at least one source' };
+    }
+    return {
+      capabilities: [
+        ...srcs.map((s) => readFs(resolveArg(s, ctx))),
+        writeFs(resolveArg(targetDir, ctx)),
+      ],
+      confidence: 'high',
+    };
+  }
+
+  return emitTargetsAsWrites(positional, ctx);
 };
 
 const cmdMktemp: CommandResolver = (_positional, tokens, ctx) => {
