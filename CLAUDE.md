@@ -16,6 +16,7 @@ The architectural spec lives in `docs/spec/AGENTIC_CLI.md`. Each subsystem has a
 |---|---|
 | Harness, loop, budget, profiles | `AGENTIC_CLI` §5, `STATE_MACHINE`, `ORCHESTRATION` |
 | Tools | `AGENTIC_CLI` §7, `CONTRACTS` §2.6 |
+| Tool output reduction (summarize hook, markers, audit invariants) | `OUTPUT_POLICY` |
 | Provider adapters | `PROVIDERS`, `LOCAL_MODELS`, `AGENTIC_CLI` §14 |
 | Permissions | `AGENTIC_CLI` §8 |
 | Trust / sandbox / threat model | `AGENTIC_CLI` §9, `SECURITY_GUIDELINE` |

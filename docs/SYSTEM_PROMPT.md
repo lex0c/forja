@@ -66,9 +66,13 @@ input.systemPrompt                                  ← base (typically empty)
 
 The order is **not arbitrary** — it interacts with three things:
 
-- **Cache breakpoints** (`CONTEXT_TUNING §3`). The leading region (identity + environment + task discipline + response format + constraints) is the most stable across sessions for a given operator; pushing it first puts it inside cache breakpoint #1's stable region. Date is in the environment block but the day-level granularity tolerates cache misses at midnight UTC.
+- **Cache breakpoints** (`CONTEXT_TUNING §3`). Bootstrap emits TWO segments via `HarnessConfig.systemSegments` (a `string | SystemSegment[]` channel parallel to the canonical `systemPrompt` string):
+  - **`stable` segment** — identity + environment + task discipline + response format + constraints + tool ergonomics + base systemPrompt + project pointer. This is the most stable region across the REPL session; gets its own `cache_control` marker so it persists when memory rotates.
+  - **`memory` segment** — memory section + skill catalog. The high-churn region (invalidates on `memory_write` and skill palette changes); gets its own `cache_control` marker so a memory write doesn't drop the entire prefix.
+  
+  `flattenSystemSegments(segments) === systemPrompt` is the invariant — audit hash + non-segment-aware adapters (OpenAI, Google) read the canonical string; Anthropic reads the array. Date stays in the environment block; the per-bootstrap re-evaluation means resume on day N+1 sees `today: N+1` correctly (semantic continuity wins over the marginal cache cost of one extra `cache_creation` per cross-day resume).
 - **Reader attention.** The model reads top to bottom; the load-bearing role marker + correctness rules go first so a long memory section or skill catalog at the tail does not push the policy posture out of attention.
-- **Dynamic-content tail.** Project pointer, memory section, and skill catalog are the most session-variant pieces. Putting them last localizes cache invalidation to the tail when a new memory file lands or a skill is added.
+- **Dynamic-content tail.** Project pointer, memory section, and skill catalog are the most session-variant pieces. Putting them last + segmenting them with cache breakpoints localizes cache invalidation to the tail when a new memory file lands or a skill is added.
 
 ### 2.3 Hash registration
 
@@ -230,7 +234,7 @@ When a new layer is needed (e.g., a new spec section in `CONTEXT_TUNING §1`):
    - Principal: edit `bootstrap.ts` around the existing chain (~lines 786–821 for the prepend chain; ~lines 1192–1203 for tail appends). Position by spec layer order (`§1.1`).
    - Subagent: edit `subagent-child.ts` (~lines 858–873). Most subagent additions belong as trailing blocks before the parallel hint.
 4. **Update the catalog table** in §5 of this document with one row for the new composer.
-5. **Decide cache breakpoint impact.** A new outer (prepended) layer pushes everything below it later in the prompt and can move content past cache breakpoint #1. Document the impact in `CONTEXT_TUNING §3` if non-trivial.
+5. **Decide cache breakpoint impact.** A new outer (prepended) layer pushes everything below it later in the prompt. Bootstrap currently splits the prompt into a `stable` segment (everything up to and including the project pointer) and a `memory` segment (memory section + skill catalog). A layer prepended in the chain lands inside `stable`; a layer appended after the memory section ends up inside `memory`. Document the impact in `CONTEXT_TUNING §3.1` if non-trivial (e.g., a new high-churn block landing in `stable` would force more `cache_creation` writes than necessary — move it to `memory` instead).
 6. **Add unit tests** that assert the layer appears at the correct position relative to other layers (pattern: see `tests/cli/identity-prompt.test.ts` / `tests/cli/constraints-prompt.test.ts`). Composer tests should be order-asserting, not just content-asserting — a layer at the wrong position is as broken as missing content.
 7. **Run the regression eval** (`bun run eval:regression`) against the new prompt and verify the gate stays green. If a previously-green case now fails, the new layer changed model behavior in a way the corpus catches — a real signal, not noise. See `docs/spec/CONTEXT_TUNING §1.8.5` for the evolution protocol.
 

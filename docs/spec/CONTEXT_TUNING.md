@@ -295,14 +295,48 @@ Total estável (cache hit): ~5-10k tokens. Variável: ~5-30k tokens.
 
 ### 3.1 Breakpoints declarados
 
-Anthropic permite até 4 breakpoints. Usar todos:
+Anthropic permite até 4 breakpoints `cache_control` por request. A implementação **fundida** dos quatro listados originalmente (após `[system]`, `[tool_schemas]`, `[project_context]`, `[memory_index]`) excederia o teto quando combinada com o quinto marker que o adapter da Anthropic precisa pra amortizar a `conversation tail` — sem o tail anchor, prior turns não readem em cache rate e o ganho intra-sessão evapora.
+
+Layout efetivo implementado (`src/providers/anthropic/cache.ts`):
 
 ```
-breakpoint #1: após [system]
-breakpoint #2: após [tool_schemas]
-breakpoint #3: após [project_context]
-breakpoint #4: após [memory_index]
+breakpoint #1: após segmento stable        (identity + env + ergonomics
+                                            + constraints + project pointer
+                                            — invalidam raramente, fundidos
+                                            num único envelope)
+breakpoint #2: após segmento memory        (memory_index + skill catalog
+                                            — o segmento de alta-rotação;
+                                            invalida em memory_write e
+                                            skill palette change)
+breakpoint #3: após [tool_schemas]         (cache_control na última tool;
+                                            ancora a lista inteira como
+                                            uma unidade)
+breakpoint #4: tail da conversation        (cache_control no último content
+                                            block da última message — move
+                                            a cada turn, prior turns reads
+                                            em 0.10× cached rate)
 ```
+
+`[project_context]` (pointer pra AGENTS.md) fica fundido com o segmento `stable` em vez de ter breakpoint próprio. Justificativa: pointer é pequeno (algumas centenas de tokens) e raramente invalida (só em rename/remove de AGENTS.md); gastar um breakpoint dedicado custaria o tail anchor (cujo impacto econômico é dominante).
+
+**Produção de segments (lado do bootstrap)**
+
+`GenerateRequest` carrega dois canais paralelos pra system:
+
+```ts
+interface GenerateRequest {
+  system?: string;                       // string canônica (hash, audit, OpenAI/Google)
+  systemSegments?: SystemSegment[];     // adapter-side cache hint (Anthropic)
+}
+
+interface SystemSegment {
+  id: 'stable' | 'memory';
+  text: string;
+  cacheBreakpoint?: boolean;            // adapter emite cache_control quando true
+}
+```
+
+Invariante: `flattenSystemSegments(systemSegments) === system`. Bootstrap (`src/cli/bootstrap.ts`) e subagent-child (`src/cli/subagent-child.ts`) snapshot o prefixo estável antes de appendar memory/skills, então emitem ambas as formas. Adapters que não suportam per-segment caching (OpenAI, Google) leem `req.system` direto; segments é payload adapter-specific que esses adapters ignoram transparentemente.
 
 ### 3.2 Por que ordem importa
 
@@ -932,6 +966,13 @@ Sem eval-driven selection, escolha de estratégia vira gosto pessoal e regride s
 ---
 
 ## 12. Selective context inclusion
+
+Cross-ref `OUTPUT_POLICY.md` — redução acontece em DOIS níveis complementares:
+
+1. **Per-tool output** no momento do tool result (Tier 1 determinístico via `metadata.summarize`). Reduz heavy fields ANTES do conteúdo entrar no histórico de mensagens. Audit retém raw.
+2. **Compaction da história** (esta seção) quando o contexto cresce além do threshold. Opera sobre messages já no histórico.
+
+Compaction só roda quando #1 não foi suficiente. As duas camadas são independentes: turn-tempo (per-output) vs session-tempo (per-history).
 
 ### 12.1 Quando elidir
 

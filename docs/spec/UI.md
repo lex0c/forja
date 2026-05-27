@@ -241,7 +241,7 @@ Mais de 8 todos: trunca pra "▶ running + próximas 2 pending + ✗ failed", co
 
 ### 4.4 Status line (sempre presente, 1 linha)
 
-> **Removida.** A "status line acima do input" foi absorvida pelo footer §4.10.6, que já mostra `model · [plan] · steps/max · cost · [bg N]` no canto direito. Renderer não emite mais uma linha separada — duplicar info em duas posições só consome espaço vertical (e em REPL com input outdented §6.3, a linha de status no fim da live region competia visualmente com o próprio input, sem ganho informativo). Seção mantida aqui como histórico de design; conteúdo canônico está em §4.10.6.
+> **Removida.** A "status line acima do input" foi absorvida pelo footer §4.10.6, que mostra `model · [tokens] · [context%] · [cached%]` no canto direito. Renderer não emite mais uma linha separada — duplicar info em duas posições só consome espaço vertical (e em REPL com input outdented §6.3, a linha de status no fim da live region competia visualmente com o próprio input, sem ganho informativo). Seção mantida aqui como histórico de design; conteúdo canônico está em §4.10.6.
 
 ```
 [autonomous] · forja · sonnet-4.6 · 12/200 · $0.04 · mem 4u · bg 1
@@ -467,22 +467,39 @@ Expansion (`ctrl+o`) abre um painel scrollable com o JSON args completo + output
 
 #### 4.10.6 Footer (status surface dinâmico)
 
-Sempre 1 linha, dim, **abaixo do input box** (com régua entre eles).
+Sempre 1 linha, dim, **abaixo do input box** (com régua entre eles). Margens simétricas de 2sp (frame margin §6.3) na esquerda e direita — chips à direita não colam na borda.
 
 | Estado | Esquerda | Direita |
 |---|---|---|
-| Idle | `? for help · \+Enter newline` | `• <model> · <steps>/<max> · $<cost>` |
+| Idle | `? for help · \+Enter newline` | `<model> · [<tokens>] · [<context%>] · [<cached%>]` |
 | Idle, exit armed (§5.4) | `Press Ctrl-C again to exit` (`warn`) | (mesmo) |
-| Running | `? for help · \+Enter newline · esc to interrupt` | `• <model> · <steps>/<max> · $<cost>` |
+| Running | `? for help · \+Enter newline · esc to interrupt` | (mesmo) |
 | Soft-aborted (ainda processando) | `? for help · \+Enter newline · esc again to force` | (mesmo) |
-| Plan mode | `? for help · \+Enter newline` | `• <model> · plan · <steps>/<max> · $<cost>` |
 | Modal up | (suprimido — modal cobre footer) | (suprimido) |
 
 Esquerda = **"o que posso fazer agora?"**. Hint de help + interrupt **só quando interruptable**.
 
-Direita = **"o que está em vigor?"**. Model · [plan ·] steps/max · cost. Slash commands implícitos: `/model`, `/plan`, `/budget` mudam cada um. Memory badge / bg / mcp (§4.4 conteúdo original) entram conforme presentes; em < 100 cols, somem por ordem de prioridade: mcp → bg → mem → cost label.
+Direita = **"o que está em vigor?"**. Três chips informacionais "sempre visíveis" assim que o `session:banner` chega (boot), permanecem durante o gap idle entre turns. Ordem fixa:
 
-Princípio: footer é **status surface, não help surface**. Nada de listar atalhos ou opções de menu. Help fica atrás de `?`.
+1. **`<model>`** — id fully-qualified do provider (ex: `anthropic/claude-opus-4-7`). Sem prefixo de bullet. Suprimido só quando o banner ainda não landou (pre-boot).
+2. **`<N>k tokens`** (opcional) — total acumulado da sessão REPL (`inputTokens + outputTokens + cacheRead + cacheCreation` somados por turn). Formato compacto:
+   - `< 1000`: `850 tokens`
+   - `< 10000`: `1.2k tokens` (uma decimal quando agrega informação)
+   - `< 1_000_000`: `46k tokens` (milhares inteiros)
+   - `>= 1_000_000`: `1.2M tokens`
+   - Suprimido até o primeiro `assistant:usage` event.
+3. **`<X>% context used`** (opcional) — `lastTurnContextTokens / contextWindow * 100`. `lastTurnContextTokens` = `inputTokens + cacheRead + cacheCreation` do turn mais recente (output excluído — a fração mede o que ocupou a janela ANTES do modelo gerar). Pinta `warn` (amarelo, SGR 33) quando ratio >= 0.8; abaixo disso `secondary` (cinza, SGR 90). Suprimido enquanto `contextWindow === 0` ou nenhum turn landou.
+4. **`<Y>% cached`** (opcional) — hit-rate de cache: `sessionCacheRead / (sessionCacheRead + sessionCacheCreation + sessionUncachedInput)`. Denominador é "input billed" (output deliberadamente excluído — a pergunta é "do input que mandei, quanto chegou em cache?"). Pintado `secondary` sempre (informacional, não saturation alert). Suprimido até o primeiro turn.
+
+**Chips removidos do design original:**
+- `plan` badge (estado plan-mode existe no state mas não vai pro footer)
+- `<steps>/<max>` (low-signal pra decisões do operator; runaway-loop é responsabilidade do harness)
+- `$<cost>` (formato 4-decimais fica `$0.0000` na maioria dos turns; valor está em `cost_progress_events` pra audit)
+- `bg N` / `subagents N+Q/cap` / `mem N` (signal-to-noise pobre em 80-col)
+
+A simplificação é deliberada — footer ficou denso demais com 7+ chips concorrendo pela atenção do operator. Estado removido do footer continua live no audit (`sessions`, `cost_progress_events`, `subagent_runs`) e em modais quando relevante.
+
+Princípio mantido: footer é **status surface, não help surface**. Nada de atalhos ou menu options. Help fica atrás de `?`.
 
 #### 4.10.7 Sub-content connector
 
@@ -512,33 +529,28 @@ ASCII fallback: SGR `7` é universal em qualquer terminal — sem fallback neces
 
 #### 4.10.9 Welcome banner (scrollback)
 
-Emitido **uma vez** no boot do REPL, como `PermanentItem` kind `'session-banner'`. Estruturado em **3 blocos** separados por linha em branco — banner em densidade alta colava no input e violava o princípio "hierarquia vem de spacing/peso, não de cor" (§6.4). Spacing carrega a estrutura; paleta segue mínima.
+Emitido **uma vez** no boot do REPL, como `PermanentItem` kind `'session-banner'`. Duas linhas consecutivas, sem linha em branco entre elas.
 
 ```
-forja v0.0.0
-
-anthropic/claude-sonnet-4-6 · 200k ctx · max 4096 out
+Forja v0.0.0
 /run/media/lex/.../forja
-
-policy: project (5 rules) · subagents: 2 · ✓ checkpoints · ✓ memory (14)
 ```
 
-| Bloco | Linhas | Estilo | Pergunta |
-|---|---|---|---|
-| 1 (title) | 1 | `bold` | Qual versão? |
-| 2 (identity) | 2 | `secondary` | Qual modelo (limites concretos: context window, max output) e em qual cwd? |
-| 3 (env) | 0 ou 1 | misto | O que está ligado nesta sessão? |
+| Linha | Estilo | Pergunta |
+|---|---|---|
+| 1 (title) | `<bold>app</bold> <secondary>version</secondary>` | Qual versão? |
+| 2 (cwd) | `secondary` | Em qual cwd? |
 
-**Versão prefixada com `v`** (`forja v0.0.0`, não `forja 0.0.0`) — convenção semver, identifica a string como versão à primeira leitura.
+**Versão prefixada com `v`** (`Forja v0.0.0`, não `Forja 0.0.0`) — convenção semver, identifica a string como versão à primeira leitura. App e version têm **paint tokens distintos** — bold pra app (nome próprio), secondary pra version (metadata). Cor disabled (`NO_COLOR`), ambos renderizam sem SGR.
 
-**Bloco 3 (env)** mistura dois estilos numa única linha, separados por ` · `:
+**Removidos do design original** (esta forma supersede a anterior de 3 blocos com identity + env):
 
-- **Indicadores de capability binária habilitada** (`checkpoints`, `memory`) usam o glyph `✓` (§6.2) pintado com token `success` (§6.1); o nome do indicador fica em `default`. Contagem opcional entre parênteses (`✓ memory (14)`). Itens em estado desligado **não são impressos** — a linha lista o que existe, não o que não existe.
-- **Metadata key:value não-binária** (`policy: project (N rules)`, `subagents: N`) fica em `dim`. Sem glyph.
+- Linha de identity (`<model> · 200k ctx · max <N> out`) saiu — model + context-window % vivem agora no footer §4.10.6 como chips sempre-visíveis. Manter identity no banner duplicava informação que o operator já vê no footer toda hora.
+- Bloco de env (`✓ checkpoints · subagents: N · ✓ memory (14)`) saiu — sinal baixo no boot, e os subsistemas correspondentes (checkpoints, memory, subagents) têm surfaces próprios (slash commands, audit queries) onde a informação detalhada importa mais.
 
-Quando nenhum indicador binário estaria true e nenhuma metadata útil existe (sem subagents, sem checkpoints, sem memory, sem policy customizada), o **bloco 3 é omitido inteiro** — banner termina após o bloco 2, sem linha em branco terminal vazia. Producer (`session:banner`) sinaliza isso enviando `env: []`.
+Os campos correspondentes (`contextWindow`, `maxOutputTokens`, `env`) **continuam no `PermanentItem.session-banner`** — apenas o renderer da TUI não os exibe. Consumidores NDJSON (`--json` mode) e audit replay leem o payload completo.
 
-Vai pro scrollback — uma vez impresso, scrolla naturalmente conforme a conversa cresce. **Sem header fixo.** Sem logo. Sem mascot. (Se um dia identidade visual virar pauta, ASCII art opcional via flag — não default.)
+Vai pro scrollback — uma vez impresso, scrolla naturalmente conforme a conversa cresce. **Sem header fixo.** Sem logo. Sem mascot.
 
 Em modo `--json`, o banner é emitido como `{type: 'session:banner', ...}` no NDJSON em vez de linhas formatadas.
 
@@ -588,7 +600,7 @@ Banidos do vocabulário operacional:
 ─────────────────────────────────────────────────────────────────────  ← régua (full width, col 0)
 > ▌                                                                   ← input + cursor (col 0)
 ─────────────────────────────────────────────────────────────────────  ← régua (full width, col 0)
-  ? for help · \+Enter newline · esc to interrupt   • sonnet-4.6 · 3/50 · $0.012  ← footer (padded)
+  ? for help · \+Enter newline · esc to interrupt   anthropic/claude-sonnet-4-6 · 12k tokens · 45% context used  ← footer (padded, 2sp margins each side)
 ```
 
 Live region (entre as réguas e a inferior):
