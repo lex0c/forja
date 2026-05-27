@@ -673,12 +673,27 @@ const cmdFind: CommandResolver = (_positional, tokens, ctx) => {
   // not a file — not decoded.
   const fprintFlags: ReadonlySet<string> = new Set(['-fprint', '-fprintf', '-fls']);
   const writeTargets: string[] = [];
+  // -newer / -anewer / -cnewer FILE: find stats FILE to read its
+  // mtime/atime/ctime for the comparison. The FILE is consumed by
+  // FIND_VALUE_FLAGS (so it doesn't land as a bogus search root)
+  // but the read MUST surface as an explicit capability — a
+  // policy denying reads from `/secrets/**` should refuse
+  // `find . -newer /secrets/stamp` on the comparison file.
+  const newerFlags: ReadonlySet<string> = new Set(['-newer', '-anewer', '-cnewer']);
+  const comparisonReadTargets: string[] = [];
   for (let i = 0; i < tokens.length; i += 1) {
     const t = tokens[i] ?? '';
     if (fprintFlags.has(t)) {
       const next = tokens[i + 1];
       if (next !== undefined && next.length > 0 && !next.startsWith('-')) {
         writeTargets.push(resolveArg(next, ctx));
+      }
+      continue;
+    }
+    if (newerFlags.has(t)) {
+      const next = tokens[i + 1];
+      if (next !== undefined && next.length > 0 && !next.startsWith('-')) {
+        comparisonReadTargets.push(resolveArg(next, ctx));
       }
     }
   }
@@ -704,12 +719,17 @@ const cmdFind: CommandResolver = (_positional, tokens, ctx) => {
         ...paths.map((p) => readFs(p)),
         ...paths.map((p) => deleteFs(p)),
         ...writeTargets.map((p) => writeFs(p)),
+        ...comparisonReadTargets.map((p) => readFs(p)),
       ],
       confidence: 'high',
     };
   }
   return {
-    capabilities: [...paths.map((p) => readFs(p)), ...writeTargets.map((p) => writeFs(p))],
+    capabilities: [
+      ...paths.map((p) => readFs(p)),
+      ...writeTargets.map((p) => writeFs(p)),
+      ...comparisonReadTargets.map((p) => readFs(p)),
+    ],
     confidence: 'high',
   };
 };

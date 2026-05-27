@@ -901,6 +901,49 @@ describe('bash resolver — numeric literals flow into args', () => {
     }
   });
 
+  test('find -newer FILE emits read-fs for the comparison file', () => {
+    // find stats the comparison file to read its mtime; the FILE
+    // is consumed from the positional list (it's NOT a search
+    // root) but the read MUST surface as an explicit capability
+    // so policy denials on the comparison path can fire.
+    const r = resolveCapabilities('bash', { command: 'find . -newer /secrets/stamp' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const reads = capStrings(r.capabilities).filter((c) => c.startsWith('read-fs:'));
+      expect(reads).toContain('read-fs:/work/proj');
+      expect(reads).toContain('read-fs:/secrets/stamp');
+    }
+  });
+
+  test('find -anewer and -cnewer also emit the comparison-file read', () => {
+    const r1 = resolveCapabilities('bash', { command: 'find src -anewer /tmp/stamp' }, CTX);
+    expect(r1.kind).toBe('ok');
+    if (r1.kind === 'ok') {
+      expect(capStrings(r1.capabilities)).toContain('read-fs:/tmp/stamp');
+    }
+    const r2 = resolveCapabilities('bash', { command: 'find src -cnewer /tmp/stamp' }, CTX);
+    expect(r2.kind).toBe('ok');
+    if (r2.kind === 'ok') {
+      expect(capStrings(r2.capabilities)).toContain('read-fs:/tmp/stamp');
+    }
+  });
+
+  test('find -newer FILE does NOT treat FILE as a search root', () => {
+    // Defends both sides of the rule: the explicit comparison
+    // read must appear AND the FILE must NOT leak as a path
+    // positional (no readFs from the search-root walk emitting
+    // `/secrets/stamp` as a directory under cwd).
+    const r = resolveCapabilities('bash', { command: 'find . -newer /secrets/stamp' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const reads = capStrings(r.capabilities).filter((c) => c.startsWith('read-fs:'));
+      // The cwd-relative would-be-bogus form (`<cwd>/secrets/stamp`)
+      // must NOT appear — only the absolute literal that the
+      // comparison-file decode emits.
+      expect(reads).not.toContain('read-fs:/work/proj/secrets/stamp');
+    }
+  });
+
   test('find with multiple roots + value flags: only real roots in positional', () => {
     // `find src tests -type f -maxdepth 2 -name '*.ts'` — two
     // search roots; -type, -maxdepth, -name each consume a value
