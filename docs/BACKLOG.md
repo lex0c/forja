@@ -2,6 +2,28 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-27] bash AST resolver hardening — review findings → fixes
+
+Self-review of the bash AST resolver (`src/permissions/resolvers/bash.ts`, 3374 LOC + `bash-parser.ts`, 148 LOC + `protected_paths.ts`, 386 LOC) against the threat surface in `TREE_SITTER_SHELL.md §9` and the envelope/escape spec in `PERMISSION_ENGINE.md §10`. Three HIGH and five MEDIUM findings; ship-critical subset on this branch.
+
+**Branch:** `feat/bash-resolver-hardening` (off `develop`).
+
+**Findings (ship-critical first):**
+
+- **H3 — subagent envelope bypass for empty-cap side-effect tools.** `bash_kill` / `bash_output` carry `category: 'misc'` (the resolver's `args.command` requirement made `'bash'` default-deny every kill/poll). Resolver returns `{ kind: 'ok', capabilities: [], confidence: 'high' }` for these. The §10.1 envelope gate at `engine.ts:1513` skips when `resolvedCapabilities.length === 0` — pure-LLM subagent (`effectiveCapabilities: []`) or narrowed envelope BOTH let the call through. `bash.ts:3367` admitted the bug in comment. Spec §10.1: "pure-LLM subagent recebe **nenhuma** capability (sem tools side effect)"; §10.3: "escape impossível" — empty-cap call to a tool with `writes:true|exec:true` violates both. Fix: engine accepts new `isToolSideEffect?` callback in `EngineOptions`; envelope gate fires for any side-effect tool independent of cap count. Bootstrap wires the callback from the tool registry's `metadata.writes || metadata.exec`. Caps-rich path unchanged.
+
+- **H2 — parse-timeout DoS via single-threaded engine.** `PARSE_TIMEOUT_MS = 5_000` in `bash-parser.ts`. Bun runs JS single-threaded; N adversarial inputs (deeply nested quotes / pathological heredocs) burn ~5N seconds of engine before refusing. Mitigation: drop ceiling to 1500ms (still 100×+ over legitimate input parse cost), track timeouts via shared counter, transition to `degraded` after 3 in 30s. Audit emit on each timeout for forensic trail.
+
+- **M3 — silent symlink-defense degrade when `ctx.realpath` unwired.** `canonicalizeForClassification` returns null with no warning when realpath callback absent. Slices 176 + 178 (the entire symlink/cwd-scope-escape defense) silently disabled. Bootstrap audit emit on construction when callback missing; existing test paths (which intentionally omit realpath) get a fail-safe `disable-symlink-defense-acknowledged` flag.
+
+**Findings (next batch, not on this branch):**
+
+- **H1** — snapshot test of tree-sitter-bash node-kinds against silent grammar rename.
+- **M1** — `number` nodes included in `literalText` extraction (slice 125 history showed past bypass via this).
+- **M2** — Wayland/XDG socket coverage in `couldGlobReachProtected` (today `isXdgRuntimeSensitive` is a function, not in `protectedTargets()` → glob `/run/user/*/...` walks past).
+- **M5** — extend `RM_REFUSE_ROOTS` with `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.config`. Asymmetry: `rm -rf /etc` refuse vs `rm -rf ~/.ssh` only confirm.
+- **M6** — `bash`/`sh`/`zsh`/`dash`/`ksh`/`fish` to `HARD_REFUSE_COMMANDS` with stable refusal reason. Today falls through `unknown_command`.
+
 ## [2026-05-27] token-efficiency initiative — four code slices + three TODO entries
 
 Audit-driven pass on Forja's runtime cost surface. The five-axis review (compaction, prompt caching, tool-output minimization, edit-tool profile, tool catalog density, system-prompt stability) identified four landable items and two more that hinge on real-world baseline data. Four code commits + three forward-tracking TODO entries shipped on branch `chore/improves`.

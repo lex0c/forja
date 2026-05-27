@@ -690,6 +690,17 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       path: sandboxAvail.path,
       trustWarnings: sandboxAvail.trustWarnings,
     },
+    // Side-effect oracle for the §10.1 envelope gate. Closes the
+    // bash_kill / bash_output bypass where a narrowed subagent
+    // invokes a tool whose resolver returns no caps but whose
+    // metadata declares writes/exec. The callback re-reads the
+    // registry on each check (not snapshotted) so MCP tools
+    // registered post-bootstrap are observed without re-plumbing.
+    isToolSideEffect: (toolName) => {
+      const tool = toolRegistry.get(toolName);
+      if (tool === null) return false;
+      return tool.metadata.writes === true || tool.metadata.exec === true;
+    },
   });
   const permissionEngine = permResult.engine;
   const policyLayers = permResult.layerNames as ('enterprise' | 'user' | 'project' | 'session')[];

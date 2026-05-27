@@ -246,6 +246,21 @@ export interface EngineOptions {
   // static rules / classifier / sandbox plan). A subagent cannot
   // escape its declared envelope via any rule-pipeline path.
   effectiveCapabilities?: readonly Capability[];
+  // Side-effect oracle for the envelope gate. Spec §10.1 mandates
+  // pure-LLM subagent has no side-effect tools and §10.3 says escape
+  // is impossible — but several tools (`bash_kill`, `bash_output`,
+  // `bash_background` without a `command` arg) carry `metadata.writes`
+  // or `metadata.exec` while their resolver returns
+  // `capabilities: []` (the resolver lacks the args to attribute
+  // anything). Without this callback the envelope gate skips them
+  // (`resolvedCapabilities.length === 0` path), letting a narrowed
+  // subagent invoke side-effect tools outside the envelope.
+  //
+  // Bootstrap wires the callback from the tool registry's
+  // `metadata.writes || metadata.exec`. When omitted, the engine
+  // keeps the pre-slice behavior (preserves test ergonomics that
+  // build engines without a registry).
+  isToolSideEffect?: (toolName: string) => boolean;
 }
 
 // `GrantSnapshot` lives in `src/permissions/grant-types.ts` — single
@@ -1308,6 +1323,7 @@ export const createPermissionEngine = (
   // cap is uncovered → deny. Non-empty ⇒ narrowed envelope: every
   // resolved cap must be covered by `effectiveCovers`.
   const effectiveCapabilities = options.effectiveCapabilities;
+  const isToolSideEffect = options.isToolSideEffect;
   // policy_hash is stamped on every audit row. Recomputed on hot
   // reload so post-swap rows carry the new hash. Canonical hash so
   // two engines with semantically equivalent policies produce the
@@ -1505,21 +1521,58 @@ export const createPermissionEngine = (
     // emits a resolved capability OUTSIDE its declared envelope is
     // structurally rejected — no policy rule can override.
     //
-    // Misc-category tools land here with `resolvedCapabilities = []`
-    // and trivially pass; pure-LLM children stay free to invoke
-    // them. The check fires ONLY when the engine was built with
+    // Two refuse paths:
+    //
+    //   (a) Resolver emitted at least one cap. Run `effectiveCovers`
+    //       and refuse if any of them is uncovered. This is the
+    //       canonical envelope check from slice 95.
+    //
+    //   (b) Resolver emitted ZERO caps but the tool declares a side
+    //       effect (`metadata.writes` or `metadata.exec`). Spec
+    //       §10.1 mandates pure-LLM subagent has no side-effect
+    //       tools; §10.3 says escape is impossible. Pre-fix,
+    //       `bash_kill` / `bash_output` (category 'misc', empty caps
+    //       from the resolver) silently passed even under
+    //       `effectiveCapabilities: []`. The `isToolSideEffect`
+    //       oracle is bootstrap-wired from the tool registry's
+    //       `metadata.writes || metadata.exec`; when omitted (test
+    //       harnesses that don't construct a registry), branch (b)
+    //       is skipped to preserve pre-slice behavior.
+    //
+    // Misc-category tools without `writes`/`exec` (purely
+    // informational ToolContext accessors) still trivially pass —
+    // they hit branch (a) with caps=[] and skip branch (b) because
+    // the oracle returns false.
+    //
+    // The check fires ONLY when the engine was built with
     // `effectiveCapabilities` (i.e. it's a child engine); root
     // engines skip the stage entirely.
-    if (effectiveCapabilities !== undefined && resolvedCapabilities.length > 0) {
-      const { uncovered } = effectiveCovers(effectiveCapabilities, resolvedCapabilities, cwd);
-      if (uncovered.length > 0) {
-        const uncoveredStrings = sortCapabilities(uncovered).map(formatCapability);
+    if (effectiveCapabilities !== undefined) {
+      if (resolvedCapabilities.length > 0) {
+        const { uncovered } = effectiveCovers(effectiveCapabilities, resolvedCapabilities, cwd);
+        if (uncovered.length > 0) {
+          const uncoveredStrings = sortCapabilities(uncovered).map(formatCapability);
+          const decision: Decision = {
+            kind: 'deny',
+            reason: `subagent capability outside declared envelope: ${uncoveredStrings.join(', ')}`,
+            source: { layer: 'default', section: 'subagent-effective' },
+          };
+          const e = emitAudit(toolName, args, decision, resolvedCapabilities, 0, {}, null);
+          return withApprovalSeq(decision, e.seq);
+        }
+      } else if (isToolSideEffect?.(toolName) === true) {
+        // Empty caps + declared side-effect tool. Per spec §10.3
+        // refuse outright — there's nothing in the envelope that
+        // could ever cover an opaque side effect. The reason names
+        // the tool because the operator's audit needs to see WHICH
+        // tool tripped the gate (resolved caps are empty by
+        // definition here).
         const decision: Decision = {
           kind: 'deny',
-          reason: `subagent capability outside declared envelope: ${uncoveredStrings.join(', ')}`,
+          reason: `subagent envelope blocks side-effect tool '${toolName}': resolver emitted no capability but the tool declares writes/exec (spec §10.1, §10.3)`,
           source: { layer: 'default', section: 'subagent-effective' },
         };
-        const e = emitAudit(toolName, args, decision, resolvedCapabilities, 0, {}, null);
+        const e = emitAudit(toolName, args, decision, [], 0, {}, null);
         return withApprovalSeq(decision, e.seq);
       }
     }
