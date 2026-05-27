@@ -46,17 +46,15 @@ export interface ResolverContext {
   // posture as `realpath`: tests omit and stay on the lexical-
   // only path; production wiring passes `fs.readlinkSync`.
   readlink?: (p: string) => string;
-  // Hardening (M3): the symlink-aware defenses (slices 176, 178)
-  // silently no-op when `realpath` is absent — a regression where
-  // someone unwires the production hook (engine.ts:1495) would
-  // disable the entire symlink-escape defense without any signal.
-  // The resolver writes a one-time stderr warn the first time it
-  // observes ctx.realpath as undefined; tests that INTENTIONALLY
-  // omit `realpath` (per the comments above) set this flag to
-  // suppress the warning so the test log stays clean.
+  // Silences the one-time stderr warning the bash resolver emits
+  // when it observes `realpath` as undefined. The warning exists
+  // to flag accidental regression in production wiring; tests that
+  // INTENTIONALLY omit `realpath` (per the comments above) set
+  // this flag to keep the test log clean.
   //
   // Production callers MUST leave this undefined / false — the
-  // warning is the audit signal that flags accidental removal.
+  // warning is the audit signal that flags accidental removal of
+  // the symlink-escape defense.
   suppressDegradeWarnings?: boolean;
 }
 

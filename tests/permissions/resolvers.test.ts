@@ -18,7 +18,7 @@ beforeAll(async () => {
   await initBashParser();
 });
 
-// `suppressDegradeWarnings` keeps the resolver's M3 warn-once
+// `suppressDegradeWarnings` keeps the bash resolver's warn-once
 // stderr message off this test file's output. Tests here
 // intentionally build a ResolverContext without realpath/readlink —
 // see registry.ts:ResolverContext for the rationale.
@@ -744,15 +744,12 @@ describe('bash resolver — rm hardcoded blocklist (slice 147)', () => {
   });
 });
 
-// M1 (review): `number` nodes now flow into shape.args. Tree-sitter-
-// bash tokenizes numeric literals (`-p 2222`, `-maxdepth 3`) as
-// `number` nodes; pre-M1 the walker silently dropped them. A future
-// resolver that needed numeric flag values would fail; slice 125's
-// `ssh -w 0:1` mis-detected as host `0:1` shows the pattern bit
-// before. Tests pin the new behavior end-to-end via the ssh / find /
-// head resolvers — each must NOT mis-attribute a numeric arg as a
-// path / host.
-describe('bash resolver — M1 numeric literals flow into args', () => {
+// Tree-sitter-bash tokenizes numeric literals (`-p 2222`,
+// `-maxdepth 3`) as `number` nodes that flow into `shape.args`;
+// resolvers must consume them explicitly so they don't get
+// mis-attributed as paths / hosts. Tests pin the behavior
+// end-to-end via the ssh / find / cat resolvers.
+describe('bash resolver — numeric literals flow into args', () => {
   test('ssh -p 2222 host emits net-egress:host (not host=2222)', () => {
     const r = resolveCapabilities('bash', { command: 'ssh -p 2222 user@example.com' }, CTX);
     expect(r.kind).toBe('ok');
@@ -766,10 +763,9 @@ describe('bash resolver — M1 numeric literals flow into args', () => {
   });
 
   test('ssh -D 8080 host emits net-egress:host (bare numeric port forward)', () => {
-    // Port-forward `-D bare_port` shape. Pre-M1 the '8080' was
-    // dropped → tokens=['-D','host'] → target='host'. Post-M1 the
-    // '8080' is in args; without the M1 update to the port-forward
-    // handler, target-detect would pick '8080' as the host.
+    // Bare-port `-D <port>` shape: the port-forward handler must
+    // consume the numeric value so the target-host scan picks
+    // 'user@example.com', not '8080'.
     const r = resolveCapabilities('bash', { command: 'ssh -D 8080 user@example.com' }, CTX);
     expect(r.kind).toBe('ok');
     if (r.kind === 'ok') {
@@ -779,9 +775,8 @@ describe('bash resolver — M1 numeric literals flow into args', () => {
   });
 
   test('ssh -L 8080:internal:80 host preserves colon-shaped consume', () => {
-    // The pre-M1 colon-shape path stays intact — `-L`/`-R` always
-    // carry a `:` in their value. M1 only added the numeric-only
-    // branch on top.
+    // Colon-shape spec — `-L`/`-R` always carry `:` in the value;
+    // the handler consumes the whole arg in one shot.
     const r = resolveCapabilities(
       'bash',
       { command: 'ssh -L 8080:internal:80 user@example.com' },
@@ -796,26 +791,21 @@ describe('bash resolver — M1 numeric literals flow into args', () => {
   test('ssh with missing numeric value (malformed `ssh -p host`) still finds host', () => {
     // Operator omitted the port value. The numeric-flag handler
     // peeks next, sees 'host' starts with non-flag char (no `-`),
-    // and consumes — but ssh treats that as a malformed port. The
-    // resolver doesn't model ssh's parse errors; we just verify it
-    // doesn't crash and doesn't mis-attribute.
+    // and consumes — ssh itself treats that as a malformed port.
+    // The resolver doesn't model ssh's parse errors; we just verify
+    // it doesn't crash and doesn't mis-attribute.
     const r = resolveCapabilities('bash', { command: 'ssh -p user@host.example' }, CTX);
-    // Either ok (resolver consumed the next token incorrectly,
-    // matching ssh's own confusion) or a clean shape; either way
-    // no throw.
     expect(['ok', 'refuse']).toContain(r.kind);
   });
 
   test('find . -maxdepth 3 -name foo runs (numeric flows through positionals)', () => {
-    // Pre-M1: '3' was dropped → positional=['.', 'foo']. Post-M1:
     // shape.args = ['.', '-maxdepth', '3', '-name', 'foo']. stripFlags
     // removes '-maxdepth' and '-name'; positional = ['.', '3', 'foo'].
     // cmdFind treats positionals as filesystem paths, so '3' becomes
-    // a readFs target. This IS a known limitation of the resolver
-    // (find's flag schema isn't fully modeled) but the over-attribute
-    // is conservative: read-fs:/work/proj/3 is harmless since the
-    // file doesn't exist and the kernel returns ENOENT. Pin behavior
-    // so any future refactor surfaces a diff.
+    // a readFs target. Known limitation (find's flag schema isn't
+    // fully modeled) but the over-attribute is conservative:
+    // read-fs:/work/proj/3 is harmless since the file doesn't exist
+    // and the kernel returns ENOENT.
     const r = resolveCapabilities('bash', { command: 'find . -maxdepth 3 -name foo' }, CTX);
     expect(r.kind).toBe('ok');
     if (r.kind === 'ok') {
@@ -825,12 +815,8 @@ describe('bash resolver — M1 numeric literals flow into args', () => {
   });
 
   test('numeric-only arg flows into the read-fs classifier (cat 2222)', () => {
-    // Pre-M1: `cat 2222` → tree-sitter parses '2222' as number,
-    // walker dropped it. cmdRead's positional was empty so it
-    // emitted readFs(cwd). Post-M1: '2222' arrives as a positional;
-    // cmdRead emits readFs(<cwd>/2222). Behavior diff is observable
-    // but neither shape is a security regression — the post-M1 form
-    // is more honest about what would actually be read.
+    // `cat 2222` — '2222' arrives as a positional; cmdRead emits
+    // readFs(<cwd>/2222). Honest about what would actually be read.
     const r = resolveCapabilities('bash', { command: 'cat 2222' }, CTX);
     expect(r.kind).toBe('ok');
     if (r.kind === 'ok') {
@@ -840,22 +826,14 @@ describe('bash resolver — M1 numeric literals flow into args', () => {
   });
 });
 
-// M2 (review): originally flagged as a gap — `isXdgRuntimeSensitive`
-// is a runtime predicate in protected_paths.ts and isn't enumerated
-// in `protectedTargets()`, so I hypothesized that
-// `couldGlobReachProtected` would walk past glob shapes pointed at
-// XDG sockets (`/run/user/<uid>/gnupg/S.gpg-agent`,
-// `/run/user/<uid>/wayland-0`, etc.).
-//
-// Empirical check disproves it: `/run` is in `SYSTEM_DENY_ROOTS` and
-// the glob-prefix check sees `/run/user/...` as a prefix-extension of
-// `/run/` and refuses. Literal (non-glob) XDG sensitive paths are
-// caught by `classifyProtectedPath` via the `/run/user/<uid>` →
-// `isXdgRuntimeSensitive` re-deny path. M2 turned out to be already
-// closed. These tests PIN the closure so a future refactor of either
-// path (e.g., narrowing SYSTEM_DENY_ROOTS to exclude `/run`) would
-// resurface the gap explicitly via a red test.
-describe('bash resolver — M2 XDG/Wayland socket coverage (closure pin)', () => {
+// XDG/Wayland socket coverage is closed via two complementary
+// paths: globs at `/run/user/*` hit the prefix check against
+// `/run` (SYSTEM_DENY_ROOTS), and literal XDG sensitive paths
+// hit `classifyProtectedPath` via the `/run/user/<uid>` →
+// `isXdgRuntimeSensitive` re-deny. These tests PIN the closure
+// so a future refactor (e.g., narrowing SYSTEM_DENY_ROOTS to
+// exclude `/run`) surfaces the gap explicitly via a red test.
+describe('bash resolver — XDG/Wayland socket coverage (closure pin)', () => {
   test.each([
     'cat /run/user/*/gnupg/S.gpg-agent',
     'cat /run/user/*/dbus/system_bus_socket',
@@ -888,12 +866,11 @@ describe('bash resolver — M2 XDG/Wayland socket coverage (closure pin)', () =>
   });
 });
 
-// M5 (review): home-relative credential / config dirs in
-// RM_REFUSE_ROOTS-equivalent posture. `rm -rf ~/.ssh` pre-M5
-// only escalated to confirm — same blast radius as `rm -rf /etc`
-// which was refused. M5 closes the asymmetry. Subpaths still go
+// Home-relative credential / config dirs in RM_REFUSE_ROOTS-
+// equivalent posture: `rm -rf ~/.ssh` refuses with the same
+// blast-radius reasoning as `rm -rf /etc`. Subpaths still go
 // through the regular escalate tier.
-describe('bash resolver — M5 home credential/config dir refuse', () => {
+describe('bash resolver — home credential/config dir refuse', () => {
   test.each(['~/.ssh', '~/.gnupg', '~/.aws', '~/.kube', '~/.config', '~/.local', '~/.docker'])(
     'rm -rf %s is Refused (home credential/config dir)',
     (target) => {
@@ -908,10 +885,9 @@ describe('bash resolver — M5 home credential/config dir refuse', () => {
   test('rm of SUBPATH inside ~/.ssh is NOT refused at the rm blocklist', () => {
     // ~/.ssh/old_id_rsa is a deeper path; it routes through the
     // protected-path classifier (escalate tier) rather than rm's
-    // hardcoded blocklist. Confirms M5 doesn't over-refuse — the
-    // rule only catches the ROOT dir.
+    // hardcoded blocklist. Confirms the rule doesn't over-refuse —
+    // it only catches the ROOT dir.
     const r = resolveCapabilities('bash', { command: 'rm ~/.ssh/old_id_rsa' }, CTX);
-    // Either ok with delete-fs OR a refuse-NOT-attributed-to-M5.
     if (r.kind === 'refuse') {
       expect(r.reason).not.toContain('credential/config dir');
     }
@@ -919,35 +895,24 @@ describe('bash resolver — M5 home credential/config dir refuse', () => {
 
   test('rm -rf $HOME/.ssh (literal-home shape) is also Refused', () => {
     // The resolver expands ~ and the resolved path equals
-    // <ctx.home>/.ssh. We pass a manually-tilded form via the
-    // resolver's expandTilde path — and the bare-literal form is
-    // covered by tildeEscalateDirs in the per-arg classifier. The
-    // M5 rule fires when the resolved string matches a refused
-    // home dir.
+    // <ctx.home>/.ssh, matching a refused home dir.
     const r = resolveCapabilities('bash', { command: 'rm -rf ~/.aws' }, CTX);
     expect(r.kind).toBe('refuse');
   });
 
-  test('M5 other-user home: rm -rf /home/other/.ssh is NOT M5-refused (operator policy gate)', () => {
-    // Known gap (M-nit-2 review): CTX.home is '/work/proj', so the
-    // command targets a literal path under another user's home
+  test('other-user home: rm -rf /home/other/.ssh is NOT refused (operator policy gate)', () => {
+    // Known gap: CTX.home is '/work/proj', so the command targets
+    // a literal path under another user's home
     // (`/home/operator/.ssh`). The resolved string doesn't match
-    // any entry in refusedHomeDirs (built from ctx.home), and
-    // `/home` is the only RM_REFUSE_ROOTS entry under that prefix
-    // (not `/home/<other>`). classifyProtectedPath resolves
-    // tildeEscalateDirs against ctx.home too, so the path doesn't
-    // hit there either. The call falls through to a normal
-    // delete-fs capability; operator policy is the final gate.
-    //
-    // Tradeoff: hard-refusing every absolute path under `/home/*`
-    // would break legitimate sysadmin workflows (`rm
-    // /home/old-user/...` during account cleanup). Pinning the
-    // behavior here means a future refactor that hardens this
-    // path surfaces the change explicitly via this test.
+    // any entry in refusedHomeDirs (built from ctx.home); `/home`
+    // is the only RM_REFUSE_ROOTS entry under that prefix (not
+    // `/home/<other>`); classifyProtectedPath resolves
+    // tildeEscalateDirs against ctx.home too. The call falls
+    // through to a normal delete-fs capability; operator policy is
+    // the final gate. Pinned so a future refactor hardening this
+    // path surfaces the change explicitly.
     const r = resolveCapabilities('bash', { command: 'rm -rf /home/operator/.ssh' }, CTX);
     if (r.kind === 'refuse') {
-      // If refused, reason MUST NOT cite M5 — that would mean M5
-      // grew an unexpected match.
       expect(r.reason).not.toContain('credential/config dir');
     } else {
       expect(r.kind).toBe('ok');
@@ -958,12 +923,12 @@ describe('bash resolver — M5 home credential/config dir refuse', () => {
   });
 });
 
-// M6 (review): shell-as-command. `bash script.sh`, `sh -c '...'`,
-// `zsh -i` — same threat shape as `eval`: inner shell runs anything,
-// no static capability resolution possible. Pre-M6 these fell to
-// unknown_command refuse (safe but generic); M6 routes them through
-// HARD_REFUSE_COMMANDS with a stable refusal reason.
-describe('bash resolver — M6 shell-as-command hard-refuse', () => {
+// Shell-as-command. `bash script.sh`, `sh -c '...'`, `zsh -i` —
+// same threat shape as `eval`: inner shell runs anything, no
+// static capability resolution possible. HARD_REFUSE_COMMANDS
+// gives them a stable refusal reason aligned with
+// `eval`/`source`/`command`/`builtin`.
+describe('bash resolver — shell-as-command hard-refuse', () => {
   test.each(['bash', 'sh', 'zsh', 'dash', 'ksh', 'fish'])(
     '%s as a command name is hard-refused',
     (shell) => {
@@ -979,10 +944,9 @@ describe('bash resolver — M6 shell-as-command hard-refuse', () => {
   );
 
   test('bash with -c inline flag is also hard-refused (not interpreter path)', () => {
-    // Pre-M6 `bash -c '...'` matched cmdInterpreter via `bash` not
-    // in COMMAND_TABLE → unknown_command. With M6, `bash` enters
-    // HARD_REFUSE before COMMAND_TABLE lookup, so the refusal is
-    // attributed to the shell-as-command rule.
+    // `bash` enters HARD_REFUSE before COMMAND_TABLE lookup, so
+    // `bash -c '...'` lands in the shell-as-command rule rather
+    // than the unknown_command catchall.
     const r = resolveCapabilities('bash', { command: 'bash -c "ls /"' }, CTX);
     expect(r.kind).toBe('refuse');
     if (r.kind === 'refuse') {

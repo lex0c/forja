@@ -181,27 +181,18 @@ const RED_FLAG_NODES: ReadonlyMap<string, string> = new Map([
   ['negated_command', 'negated_command (!cmd): control flow not modeled'],
   ['test_command', 'test_command ([[ ]]): conditional context'],
   ['test_operator', 'test_operator: conditional context'],
-  // M-nit-1 follow-up: 5 entries removed after empirical probe via
-  // the H1 grammar-drift snapshot suite confirmed they were dead
-  // under tree-sitter-bash@0.25.1:
-  //   - 'regex' — `=~` parses as binary_expression INSIDE test_command;
-  //     defense fires via test_command.
-  //   - 'translated_string' — `$"..."` parses as regular string with
-  //     a leading `$` word; no distinct node-kind. Defense via the
-  //     normal string walker path.
-  //   - 'array_assignment' — `arr=(a b c)` parses as variable_assignment
-  //     with an `array` child node; defense via variable_assignment.
-  //   - 'coproc_statement' — `coproc cmd` parses as a regular command
-  //     with `coproc` as command_name; defense via unknown_command
-  //     refuse (coproc not in COMMAND_TABLE).
-  //   - 'last_pipe' — `|&` is an anonymous operator token inside
-  //     pipeline; no distinct node-kind, but pipeline-to-shell
-  //     detection (detectPipeToShell) still catches the threat shape.
-  //
-  // If a future grammar version introduces a distinct node-kind for
-  // any of these, the H1 snapshot suite surfaces the new kind via
-  // its meta-test failure, and the entry can be re-added at that
-  // time with the up-to-date name.
+  // Note: tree-sitter-bash@0.25.1 does NOT emit distinct node-kinds
+  // for several shapes that look like they'd warrant their own
+  // entry — defenses for those route through alternate paths:
+  //   - `=~` regex match → `binary_expression` inside `test_command`
+  //   - `$"..."` translated string → regular `string` walker
+  //   - `arr=(a b c)` → `variable_assignment` + `array` child
+  //   - `coproc cmd` → regular `command` with `coproc` as name
+  //     (falls through to `unknown_command` refuse)
+  //   - `|&` last-pipe → anonymous operator token inside `pipeline`
+  //     (caught by `detectPipeToShell` when the threat shape applies)
+  // The grammar-drift snapshot suite surfaces any future kind a
+  // version bump introduces.
 ]);
 
 // Hard refuses by command name. §13 reject list from
@@ -239,15 +230,12 @@ const HARD_REFUSE_COMMANDS: ReadonlySet<string> = new Set([
   // table.
   'command',
   'builtin',
-  // M6 (review). Shell-as-command (e.g., `bash script.sh`, `sh -c
-  // ...`). Today these fall through to `unknown_command` refuse,
-  // which IS safe but produces a generic refusal string. Adding
-  // them here gives audit a stable "shell-as-command laundering"
-  // reason and aligns them with `eval`/`source` in classification.
-  // Same threat shape: the inner shell can run anything, so static
-  // capability resolution is impossible. The pipe-to-shell defense
-  // (SHELL_INTERPRETERS) already catches `... | sh`; this catches
-  // the direct-spawn `sh script.sh` shape.
+  // Shell-as-command (e.g., `bash script.sh`, `sh -c ...`). Same
+  // threat shape as `eval`: inner shell runs anything, static
+  // capability resolution impossible. SHELL_INTERPRETERS already
+  // catches `... | sh` (pipe-to-shell); this catches the direct-
+  // spawn shape with a stable refusal reason aligned with
+  // `eval`/`source`/`command`/`builtin`.
   'bash',
   'sh',
   'zsh',
@@ -679,27 +667,25 @@ const RM_REFUSE_ROOTS: ReadonlySet<string> = new Set([
   '/private',
 ]);
 
-// M5 (review). Home-relative roots whose ENTIRE-DIRECTORY deletion is
-// catastrophic. Subpaths (`~/.ssh/old_id_rsa`) still route through the
-// regular escalate tier in `classifyProtectedPath`; only `rm` against
-// the ROOT itself (`rm -rf ~/.ssh`) hits this list. Asymmetry pre-M5:
-// `rm -rf /etc` was refused but `rm -rf ~/.ssh` only escalated to
-// confirm — same blast radius, different policy posture. List
-// resolved against `ctx.home` at check time so per-user paths
-// (`/home/alice/.ssh`, `/Users/bob/.ssh`) all hit the same rule.
+// Home-relative roots whose ENTIRE-DIRECTORY deletion is
+// catastrophic — credential / config trees that mirror the
+// posture of RM_REFUSE_ROOTS on the system side. `rm -rf /etc` and
+// `rm -rf ~/.ssh` have the same blast radius (operator
+// credentials destroyed); both must refuse at the resolver.
+// Subpaths (`~/.ssh/old_id_rsa`) still route through the regular
+// escalate tier in `classifyProtectedPath`; only `rm` against the
+// ROOT itself hits this list. Resolved against `ctx.home` at
+// check time so per-user paths (`/home/alice/.ssh`,
+// `/Users/bob/.ssh`) all hit the same rule.
 //
-// Known gap (M-nit-2 review): the resolved set is anchored on
-// `ctx.home`, so `rm -rf /home/OTHER_USER/.ssh` (literal absolute
-// path targeting another operator's home) does NOT match this rule.
+// Known gap: the resolved set is anchored on `ctx.home`, so
+// `rm -rf /home/OTHER_USER/.ssh` does NOT match this rule.
 // `/home/OTHER_USER` is also not in RM_REFUSE_ROOTS (only `/home`
-// root is), and `classifyProtectedPath` resolves
-// tildeEscalateDirs against `ctx.home` too. Net: the call resolves
-// to a normal `delete-fs` capability and falls to operator policy.
-// Tradeoff: hard-refusing every absolute path under `/home/*` would
-// break legitimate sysadmin workflows (`rm /home/old-user/...`
-// during account cleanup); pinning the behavior in a test (see
-// resolvers.test.ts "M5 other-user home") lets policy operators
-// gate this case with an explicit deny rule if they need to.
+// root is), and `classifyProtectedPath` resolves tildeEscalateDirs
+// against `ctx.home` too. Net: the call resolves to a normal
+// `delete-fs` capability and falls to operator policy.
+// Hard-refusing every absolute path under `/home/*` would break
+// legitimate sysadmin cleanup workflows.
 //
 // Coverage:
 //   .ssh           — SSH private keys + authorized_keys
@@ -711,9 +697,8 @@ const RM_REFUSE_ROOTS: ReadonlySet<string> = new Set([
 //   .docker        — Docker config + credsStore registry auth
 //
 // Out of scope: `~/Documents`, `~/Desktop`, etc. — user data dirs
-// whose deletion is destructive but operator-recoverable (less
-// catastrophic than credential dirs). Operator who wants `rm ~/Documents`
-// can confirm via the modal.
+// whose deletion is destructive but operator-recoverable. Operator
+// who wants `rm ~/Documents` can confirm via the modal.
 const RM_REFUSE_HOME_DIRS: readonly string[] = [
   '.ssh',
   '.gnupg',
@@ -750,12 +735,12 @@ const cmdRm: CommandResolver = (positional, _tokens, ctx) => {
         refuse: `rm: refuse to delete operator home '${resolved}' (hardcoded blocklist; spec §5.2)`,
       };
     }
-    // M5: home-relative credential / config dirs. Symmetric to
-    // RM_REFUSE_ROOTS — root-of-dir deletion only; subpaths route
-    // through the regular escalate tier via classifyProtectedPath.
+    // Home-relative credential / config dirs. Root-of-dir
+    // deletion only; subpaths route through the regular escalate
+    // tier via classifyProtectedPath.
     if (refusedHomeDirs.has(resolved)) {
       return {
-        refuse: `rm: refuse to delete operator credential/config dir '${resolved}' (hardcoded blocklist; M5 review)`,
+        refuse: `rm: refuse to delete operator credential/config dir '${resolved}' (hardcoded blocklist)`,
       };
     }
   }
@@ -1701,9 +1686,6 @@ const cmdTar: CommandResolver = (positional, tokens, ctx) => {
       // (arbitrary-exec — the exploit), `sleep`, `dot`, `bell`, etc.
       // Refuse unconditionally regardless of the value because every
       // shape requires runtime inspection to safely characterize.
-      // Pre-M1 we also lacked the numeric value (tree-sitter dropped
-      // it); post-M1 the value is in args but the security calculus
-      // is unchanged — refuse on the flag alone is the right floor.
       return {
         refuse:
           'tar: --checkpoint-action <value> requires runtime inspection — refusing static analysis',
@@ -1920,14 +1902,13 @@ const cmdSsh: CommandResolver = (_positional, tokens, ctx) => {
     }
   }
 
-  // ssh flag schema. M1 (review) brought `number` nodes into
-  // `shape.args` (pre-M1 they were dropped by the walker). So
-  // `-p 2222` now arrives as `['-p', '2222', ...]` and the resolver
-  // must consume the numeric next-token instead of leaving it for
-  // the target-host scan. Three flag classes:
+  // ssh flag schema. Numeric literals (e.g., `-p 2222`) arrive in
+  // `shape.args` as `number` nodes; the resolver must consume them
+  // explicitly instead of leaving them for the target-host scan.
+  // Three flag classes:
   //
   //   - numericValueFlags: value is strictly numeric → peek next;
-  //     consume when present (post-M1 the value is in args).
+  //     consume when present.
   //   - stringValueFlags: value is always a string (path / kv / host)
   //     → peek next; consume if non-flag.
   //   - portForwardFlags: value is `[bind:]port:host:remote_port` for
@@ -1977,12 +1958,11 @@ const cmdSsh: CommandResolver = (_positional, tokens, ctx) => {
   for (let i = 0; i < tokens.length; i += 1) {
     const t = tokens[i] ?? '';
     if (numericValueFlags.has(t)) {
-      // M1: numeric value is now in args. Consume it so the next
-      // scan iteration doesn't pick the value as the target host
-      // (e.g., `ssh -p 2222 host` would otherwise read targetIdx=1
-      // as '2222' instead of 'host'). Skip the consume only when
-      // the next token is itself a flag (operator omitted the
-      // value — malformed input; let the target scan find host).
+      // Consume the numeric value so the next scan iteration
+      // doesn't pick it as the target host (`ssh -p 2222 host`
+      // would otherwise read '2222' as the host). Skip the consume
+      // when next is itself a flag (operator omitted the value —
+      // malformed input; let the target scan find host).
       const next = tokens[i + 1];
       if (next !== undefined && !next.startsWith('-')) i += 1;
       continue;
@@ -1998,22 +1978,16 @@ const cmdSsh: CommandResolver = (_positional, tokens, ctx) => {
     if (portForwardFlags.has(t)) {
       hasPortForward = true;
       const next = tokens[i + 1];
-      // `:` in next → colon-shaped port-forward spec (consume).
-      // No `:` → bare numeric port OR the target host. M1 brought
-      // numeric literals into args (pre-M1 they were dropped, so a
-      // bare `-D 8080` left only `-D` in tokens and the loop
-      // correctly read the next non-`:`-shaped token as the host).
-      // Post-M1, `ssh -D 8080 host` produces tokens=['-D','8080','host']
-      // and a colon-only check would leave '8080' for the target
-      // scan to mis-attribute. Add a numeric-only guard so the
-      // bare-port shape gets consumed alongside the colon shape.
-      //
-      // Slice 127 (R3 P0-3): for `-w`, the value `any` is the
-      // documented ssh syntax ("auto-pick tun device"). It's a
-      // word (survives tree-sitter strip) without a colon, so
-      // pre-slice it leaked into the target-detection branch as
-      // a host → emitted `net-egress:any`. Consume it like a
-      // colon-shape spec.
+      // Three shapes the value can take:
+      //   - colon-shaped (`bind:port:host:remote`) → consume.
+      //   - bare numeric (`-D 8080`) → consume (else the target
+      //     scan would pick '8080' as the host).
+      //   - `-w any` → ssh's documented "auto-pick tun device"
+      //     literal. Slice 127 (R3 P0-3) added this: pre-slice the
+      //     `any` token leaked into target detection and emitted
+      //     `net-egress:any`.
+      // Other shapes (e.g., next is the host literal itself) →
+      // don't consume; let the target scan pick it up.
       const isNumericPort = next !== undefined && /^\d+$/.test(next);
       if (next?.includes(':') || isNumericPort || (t === '-w' && next === 'any')) i += 1;
       continue;
@@ -2535,16 +2509,11 @@ const literalText = (node: Node): string | null => {
   if (node.type === 'word' || node.type === 'raw_string') {
     raw = node.text;
   } else if (node.type === 'number') {
-    // M1 (review). Tree-sitter-bash tokenizes numeric literals
-    // (`-p 2222`, `-maxdepth 3`, `head -c 100`) as `number` nodes.
-    // Pre-M1 the walker silently dropped them from `shape.args`
-    // because `literalText` only accepted word/string/raw_string —
-    // a future cmdXxx resolver that needed a numeric value would
-    // fail silently. Slice 125 history (`ssh -w 0:1` mis-detected
-    // as host `0:1`) shows the pattern HAS bitten before. Treating
-    // `number` as a literal that flows into args is the honest
-    // shape; resolvers that previously assumed numbers were dropped
-    // (ssh, tar's `--checkpoint-action` peek) are updated alongside.
+    // Tree-sitter-bash tokenizes numeric literals as their own
+    // node-kind (`-p 2222`, `-maxdepth 3`). Treating them as
+    // literals that flow into args keeps the resolver honest;
+    // per-command handlers that care about numeric flag values
+    // consume the next token explicitly.
     raw = node.text;
   } else if (node.type === 'string') {
     // string can contain string_content children and optional
@@ -2662,10 +2631,6 @@ const walkAst = (root: Node): WalkResult => {
           child.type === 'concatenation' ||
           child.type === 'number'
         ) {
-          // M1 (review). `number` joined the literal types so numeric
-          // args (`-p 2222`, `-maxdepth 3`) survive into shape.args.
-          // Pre-M1 they fell through to the recursive visit branch
-          // below and got silently dropped from the resolver's view.
           const text = literalText(child);
           if (text === null) {
             return 'bash_shape_not_recognized: dynamic content inside string arg';
@@ -3080,23 +3045,20 @@ const couldGlobReachProtected = (
 const tierRank = (t: 'deny' | 'escalate' | null): number =>
   t === 'deny' ? 2 : t === 'escalate' ? 1 : 0;
 
-// Hardening (M3 from the bash-resolver review). The symlink-aware
-// defenses below silently no-op when `ctx.realpath` is missing —
-// that's intentional for tests (which build paths that don't exist
-// on disk) but catastrophic in production if someone accidentally
-// removes the engine wire-up at `engine.ts:1495`. The warning fires
-// once per process (subsequent missing-realpath checks stay silent
-// to avoid log spam) and only when the caller didn't opt out via
-// `ctx.suppressDegradeWarnings`. Production wiring leaves the flag
-// undefined; the warning is the audit signal that flags regression.
+// The symlink-aware defenses below silently no-op when
+// `ctx.realpath` is missing — intentional for tests (which build
+// paths that don't exist on disk) but catastrophic in production
+// if the engine wire-up is ever removed. The warning fires once
+// per process and only when the caller didn't opt out via
+// `ctx.suppressDegradeWarnings`. Production wiring leaves the
+// flag undefined; the warning IS the audit signal that flags
+// regression.
 //
-// TODO (M-nit-3 follow-up): currently writes to stderr. In headless
-// / CI environments where stderr isn't captured, the warning can be
-// swallowed silently. Promote to a `failure_events` row via
-// `ctx.failureSink?.emit({code: 'permissions.realpath_unwired', ...})`
-// once ResolverContext carries the failure sink. The tamper-evident
-// failure_events table is queryable and survives operator log
-// rotation; stderr alone doesn't.
+// TODO: in headless / CI environments where stderr isn't
+// captured, the warning can be swallowed silently. Promote to a
+// `failure_events` row once ResolverContext carries the failure
+// sink — the tamper-evident table is queryable and survives log
+// rotation.
 let realpathMissingWarned = false;
 const warnRealpathMissingOnce = (ctx: ResolverContext): void => {
   if (realpathMissingWarned) return;

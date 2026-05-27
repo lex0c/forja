@@ -3385,9 +3385,9 @@ describe('engine — effective capabilities envelope (§10.1, slice 95)', () => 
     expect(decision.reason).toContain('write-fs:');
   });
 
-  // Hardening: side-effect tools that emit ZERO resolved capabilities
+  // Side-effect tools that emit ZERO resolved capabilities
   // (bash_kill / bash_output — resolver has no `args.command` to
-  // attribute from; category 'misc') used to silently pass the
+  // attribute from; category 'misc') must not silently pass the
   // envelope gate. Spec §10.1 mandates pure-LLM child has no
   // side-effect tools; §10.3 says escape is impossible. The
   // `isToolSideEffect` oracle closes the gap.
@@ -3398,10 +3398,9 @@ describe('engine — effective capabilities envelope (§10.1, slice 95)', () => 
       isToolSideEffect: (name) => name === 'bash_kill',
     });
     // bash_kill carries `args.process_id` but no `args.command` —
-    // the bash resolver short-circuits to `capabilities: []`. Pre-
-    // fix, the gate's `resolvedCapabilities.length > 0` guard
-    // skipped, and the call landed downstream where the catch-all
-    // bash policy allowed it.
+    // the bash resolver short-circuits to `capabilities: []`.
+    // Without the oracle, the gate's `length > 0` guard would
+    // skip and the catch-all bash policy would allow.
     const decision = eng.check('bash_kill', 'misc', { process_id: 'bg-1' });
     expect(decision.kind).toBe('deny');
     expect(decision.source?.section).toBe('subagent-effective');
@@ -3425,27 +3424,25 @@ describe('engine — effective capabilities envelope (§10.1, slice 95)', () => 
   });
 
   test('isToolSideEffect: non-side-effect misc tool still passes with caps=[]', () => {
-    // bash_output is `metadata.writes: false`; bootstrap-wired
-    // oracle returns false → branch (b) skipped → caps=[] short-
-    // circuits as before. Confirms the fix doesn't over-refuse.
+    // bash_output is `metadata.writes: false`; the oracle returns
+    // false → caps=[] short-circuits as before. Confirms the gate
+    // doesn't over-refuse.
     const eng = createPermissionEngine(policy({ tools: {} }), {
       cwd: CWD,
       effectiveCapabilities: [],
-      isToolSideEffect: (name) => name === 'bash_kill', // bash_output not in the side-effect set
+      isToolSideEffect: (name) => name === 'bash_kill',
     });
     const decision = eng.check('bash_output', 'misc', { process_id: 'bg-1' });
     expect(decision.source?.section).not.toBe('subagent-effective');
   });
 
-  test('isToolSideEffect omitted: pre-slice behavior preserved (caps=[] passes)', () => {
-    // Test-harness ergonomics: engines built without an
-    // `isToolSideEffect` callback must keep the original behavior
-    // (the gate skips when caps=[]). This is what 9000+ existing
-    // unit tests rely on; the fix is opt-in via bootstrap.
+  test('isToolSideEffect omitted: legacy behavior preserved (caps=[] passes)', () => {
+    // Engines built without an `isToolSideEffect` callback keep
+    // the original behavior (the gate skips when caps=[]). The
+    // fix is opt-in via bootstrap wiring.
     const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['*'] } } }), {
       cwd: CWD,
       effectiveCapabilities: [],
-      // isToolSideEffect intentionally omitted
     });
     const decision = eng.check('bash_kill', 'misc', { process_id: 'bg-1' });
     expect(decision.source?.section).not.toBe('subagent-effective');

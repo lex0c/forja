@@ -167,9 +167,9 @@ describe('parseBash — rate-limit window (DoS hardening)', () => {
   });
 });
 
-// H1 (review): node-kind snapshot against silent grammar drift.
-// The bash resolver's defense rests on a closed whitelist of
-// node.type strings (WHITELIST_NODE_TYPES + RED_FLAG_NODES in
+// Node-kind snapshot against silent grammar drift. The bash
+// resolver's defense rests on a closed whitelist of node.type
+// strings (WHITELIST_NODE_TYPES + RED_FLAG_NODES in
 // src/permissions/resolvers/bash.ts). If a tree-sitter-bash update
 // renames a node-kind (e.g. `expansion` → `parameter_expansion`),
 // `RED_FLAG_NODES.get('expansion')` silently becomes a no-op AND
@@ -187,9 +187,7 @@ describe('parseBash — rate-limit window (DoS hardening)', () => {
 // Coverage: every entry in RED_FLAG_NODES plus the load-bearing
 // WHITELIST entries (program, command, command_name, pipeline, list,
 // file_redirect, redirected_statement, string, raw_string,
-// concatenation, number). RED_FLAG_NODES was pruned in M-nit-1 of
-// 5 dead entries that this snapshot's earlier run revealed; the
-// table now contains only kinds the grammar actively emits.
+// concatenation, number).
 describe('parseBash — node-kind snapshot (H1 grammar drift defense)', () => {
   // Collect every distinct node.type appearing under the parsed root.
   // Tree-sitter walks include anonymous nodes (punctuation literals
@@ -358,15 +356,12 @@ describe('parseBash — node-kind snapshot (H1 grammar drift defense)', () => {
     // surfaces it. The list is hardcoded mirror of bash.ts —
     // staying in sync IS the test.
     //
-    // RED_FLAG_NODES post-M-nit-1 pruning. Each kind here MUST be
-    // emitted by tree-sitter-bash@0.25.1 for at least one shape;
-    // the 5 dead entries this snapshot surfaced (regex,
-    // translated_string, array_assignment, coproc_statement,
-    // last_pipe) were removed from RED_FLAG_NODES in bash.ts and
-    // are no longer listed below. If a future grammar version
-    // introduces a new kind, the test that exercises that shape
-    // surfaces it via the "Grammar drift" error message — the
-    // table can then re-grow to match.
+    // Each kind here MUST be emitted by tree-sitter-bash@0.25.1
+    // for at least one input shape — the list mirrors
+    // RED_FLAG_NODES and staying in sync IS the test. If a future
+    // grammar version introduces a new kind, the case that
+    // exercises that shape surfaces it via the "Grammar drift"
+    // error message.
     const liveRedFlagKinds = [
       'command_substitution',
       'process_substitution',

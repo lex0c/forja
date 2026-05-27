@@ -1524,20 +1524,20 @@ export const createPermissionEngine = (
     // Two refuse paths:
     //
     //   (a) Resolver emitted at least one cap. Run `effectiveCovers`
-    //       and refuse if any of them is uncovered. This is the
-    //       canonical envelope check from slice 95.
+    //       and refuse if any of them is uncovered.
     //
     //   (b) Resolver emitted ZERO caps but the tool declares a side
     //       effect (`metadata.writes` or `metadata.exec`). Spec
     //       §10.1 mandates pure-LLM subagent has no side-effect
-    //       tools; §10.3 says escape is impossible. Pre-fix,
-    //       `bash_kill` / `bash_output` (category 'misc', empty caps
-    //       from the resolver) silently passed even under
+    //       tools; §10.3 says escape is impossible. `bash_kill` /
+    //       `bash_output` (category 'misc', empty caps from the
+    //       resolver because they carry no `args.command` to
+    //       attribute from) would otherwise pass under
     //       `effectiveCapabilities: []`. The `isToolSideEffect`
     //       oracle is bootstrap-wired from the tool registry's
     //       `metadata.writes || metadata.exec`; when omitted (test
-    //       harnesses that don't construct a registry), branch (b)
-    //       is skipped to preserve pre-slice behavior.
+    //       harnesses without a registry), branch (b) is skipped
+    //       so legacy callers see the prior behavior.
     //
     // Misc-category tools without `writes`/`exec` (purely
     // informational ToolContext accessors) still trivially pass —
