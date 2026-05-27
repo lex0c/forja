@@ -2,6 +2,32 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-27] sandbox enforcement honesty — `doctor` + in-process comment
+
+Investigation surfaced that the production default broker mode is `in-process` (`bootstrap.ts:1339`), which means bash spawns are NOT wrapped with bwrap/sandbox-exec — even when the sandbox binary is present on the host. The `sandbox` check in `agent doctor` reported "bwrap ok" regardless, leading operators to believe enforcement was active. Worse: `bootstrap.ts:1532-1535` makes the `'spawn'` mode unreachable from compiled binaries entirely (`import.meta.dir` inside a Bun-compiled binary resolves to `/$bunfs/...` which `bun run` can't address as a worker source path). Result: the official release artifact has no path to enable sandbox enforcement.
+
+**Branch:** continued on `fix/permission-engine-review`.
+
+**Shipped on this branch:**
+
+- **`in-process.ts` comment correction.** The module's header docs claimed "the supplied exec handles [sandbox wrap], per the existing sandbox-runner". The production caller (`bootstrap.ts:1577` in the `'in-process'` branch) wires `createBashHandler({ scrubEnv })` with NO `sandboxRunner` — `bashHandler.execute` then calls `Bun.spawn(['bash', '-s'], ...)` directly. The comment was aspirational and factually wrong against the live wire-up. Rewritten to (a) name the production wiring explicitly, (b) point at the `'spawn'` branch as the only enforcement path, (c) cross-reference the compiled-binary limitation.
+
+- **`doctor` enforcement-honesty check (`sandbox_enforcement`).** New check inserted between `hash_chain` and `sealing` in the doctor pipeline. Always reports `warn` on linux/darwin with detail spelling out the gap and remediation pointing at `--broker spawn`. Two non-trivial branches:
+  - **Compiled binary detected** (`import.meta.dir.includes('/$bunfs/')`) → remediation says "run from source checkout AND pass --broker spawn" because the binary itself can't reach the spawn mode.
+  - **Source checkout** → remediation just says "pass --broker spawn".
+
+  Re-probes `detectSandboxAvailability` locally so the verdict tracks actual binary presence (not the `sandbox` check's status field, which lumps absent-binary and non-canonical-binary into the same `warn` bucket — different enforcement implications). 2 new tests pin the warn-when-binary-present and warn-when-binary-absent shapes; existing tests that asserted "all checks passed" rewritten to acknowledge that linux/darwin doctor runs will ALWAYS surface this warn (the whole point of the check).
+
+**Top deferred follow-ups (no work on this branch):**
+
+- **P0 — Compiled binary cannot enable sandbox enforcement.** The error at `bootstrap.ts:1532-1535` is honest but the consequence is that the `bun build --compile` artifact (the documented distribution path) ships with no possible enforcement. Two paths to close: (a) Bun asset-embed the worker.ts source with `import { ... } with { type: 'file' }` and rewrite the spawn command to read the embedded file; (b) ship the worker as a standalone helper binary alongside the main binary. Both need design work — registered here so future investigation has a starting point.
+
+- **P0 — Switch the default broker to `spawn` once the compiled-binary path lands.** Today the `'in-process' ?? input.brokerMode` default at `bootstrap.ts:1339` means the dominant user path has zero sandbox enforcement. The default should flip the moment compiled-binary mode supports spawn; until then, operators have to know to pass `--broker spawn` (and run from source).
+
+- **P1 — Telemetry / banner surface for the in-process default.** The new `doctor` check only fires when the operator runs `agent doctor` explicitly. The REPL banner could carry a one-line warning ("⚠ sandbox enforcement disabled — see `agent doctor`") so operators starting a session straight from the binary see the signal too.
+
+**Tests + validation:** `bun run typecheck` (clean), `bun run lint` (clean), `bun test tests/cli/doctor.test.ts` → 51/51 pass (49 baseline + 2 new for sandbox_enforcement branches).
+
 ## [2026-05-27] permission engine code review — P0/P1 fixes + 16-finding sweep
 
 End-to-end self-review on `src/permissions/` (~16.6k LOC + ~17k LOC of tests) against `docs/spec/PERMISSION_ENGINE.md`. 16 findings: 3 P0/P1 (correctness + security), 5 medium (UX + spec drift), 8 nits + spec-drift annotations. This branch lands the P0/P1 fixes that have a clean, low-risk shape; the design-call items (`formatCapability` coerce-to-wildcard, regex policy/parsing distinction in ANTI_PATTERNS) and the deferred medium items stay open for follow-up.

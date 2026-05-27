@@ -82,7 +82,16 @@ describe('runDoctor', () => {
     rmSync(tmp, { recursive: true, force: true });
   });
 
-  test('all checks pass → exit 0 + "all checks passed" footer', async () => {
+  test('core checks resolve → exit 0 + sandbox_enforcement always warns on linux/darwin', async () => {
+    // Sandbox binary present, no fs/policy issues — every probe
+    // resolves cleanly. But the `sandbox_enforcement` check
+    // (§13.7) intentionally stays at `warn` on linux/darwin
+    // because the default broker mode is `in-process` and bash
+    // spawns aren't wrapped despite the binary being available.
+    // Operators see "sandbox: ok bwrap" + "sandbox_enforcement:
+    // warn" — honest framing of "the tool exists, you're not
+    // using it by default". Exit code stays 0 (warnings are
+    // recoverable; nothing here blocks bootstrap).
     const out = captured();
     const code = await runDoctor({
       env,
@@ -97,10 +106,12 @@ describe('runDoctor', () => {
     const text = out.lines.join('');
     expect(text).toContain('platform');
     expect(text).toContain('sandbox');
+    expect(text).toContain('sandbox_enforcement');
     expect(text).toContain('config_dir');
     expect(text).toContain('data_dir');
     expect(text).toContain('git');
-    expect(text).toContain('summary: all checks passed');
+    // At least one warn (the enforcement check). Footer reflects.
+    expect(text).toMatch(/warning\(s\)/);
   });
 
   // Slice 123 (R9 P1): pre-slice `dirWritable` short-circuited on
@@ -187,6 +198,97 @@ describe('runDoctor', () => {
     expect(text).toMatch(/warning\(s\)/);
   });
 
+  test('sandbox_enforcement check stays warn even when sandbox binary is present (§13.7)', async () => {
+    // The enforcement-honesty check (§13.7) flags that the default
+    // broker is in-process and bash spawns aren't wrapped. It is
+    // intentional that this stays at `warn` on linux/darwin even
+    // on an otherwise-clean host — operator deserves the signal
+    // that "binary present ≠ enforcement active".
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      readFile: (path) => (path === '/proc/sys/user/max_user_namespaces' ? '15000\n' : null),
+      runCmd: (cmd) => {
+        if (cmd === 'nft') return 'nftables v1.0.9\n';
+        if (cmd === 'getenforce') return 'Enforcing\n';
+        return null;
+      },
+      out: out.write,
+    });
+    const events = out.lines
+      .join('')
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    const enforcement = events.find((e) => e.kind === 'check' && e.name === 'sandbox_enforcement');
+    expect(enforcement).toBeDefined();
+    expect(enforcement?.status).toBe('warn');
+    // Detail names the in-process default explicitly. Operators
+    // grep for this string in postmortems ("was sandbox actually
+    // active?").
+    expect(enforcement?.detail).toContain('in-process');
+    expect(enforcement?.remediation).toContain('--broker spawn');
+  });
+
+  test('sandbox_enforcement on compiled binary points at source-checkout remediation', async () => {
+    // Bun's `bun build --compile` rewrites import.meta.dir to
+    // `/$bunfs/...` and `bootstrap.ts:1532` refuses to construct
+    // the spawn broker on that path. Test seam forces the
+    // compiled-binary branch deterministically — the alternative
+    // (build a real compiled fixture per test) is too expensive.
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      readFile: (path) => (path === '/proc/sys/user/max_user_namespaces' ? '15000\n' : null),
+      runCmd: () => null,
+      isCompiledBinary: () => true,
+      out: out.write,
+    });
+    const events = out.lines
+      .join('')
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    const enforcement = events.find((e) => e.kind === 'check' && e.name === 'sandbox_enforcement');
+    expect(enforcement?.status).toBe('warn');
+    expect(enforcement?.detail).toContain('compiled binary');
+    expect(enforcement?.remediation).toContain('source checkout');
+  });
+
+  test('sandbox_enforcement reports unreachable when sandbox binary is missing', async () => {
+    // Sandbox binary absent → enforcement check has nothing to
+    // gate on. Stays warn (the engine still runs degraded) but
+    // detail points at the upstream cause.
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => (cmd === 'bwrap' || cmd === 'sandbox-exec' ? null : `/usr/bin/${cmd}`),
+      exists: (p) =>
+        p !== '/usr/bin/bwrap' && p !== '/usr/bin/sandbox-exec' && p.startsWith('/usr/bin/'),
+      readFile: (path) => (path === '/proc/sys/user/max_user_namespaces' ? '15000\n' : null),
+      runCmd: () => null,
+      out: out.write,
+    });
+    const events = out.lines
+      .join('')
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    const enforcement = events.find((e) => e.kind === 'check' && e.name === 'sandbox_enforcement');
+    expect(enforcement?.status).toBe('warn');
+    expect(enforcement?.detail).toContain('sandbox binary missing');
+  });
+
   test('missing git → warn, exit 0', async () => {
     const out = captured();
     const code = await runDoctor({
@@ -223,10 +325,10 @@ describe('runDoctor', () => {
     });
     expect(code).toBe(0);
     const lines = out.lines.join('').trim().split('\n').filter(Boolean);
-    // 11 checks (slice 90 added user_namespaces + net_filtering +
-    // mac_lsm) + 1 info (capability ceiling + engine version) +
-    // 1 summary.
-    expect(lines.length).toBe(13);
+    // 12 checks (slice 90 added user_namespaces + net_filtering +
+    // mac_lsm; §13.7 enforcement check brings the total to 12) +
+    // 1 info (capability ceiling + engine version) + 1 summary.
+    expect(lines.length).toBe(14);
     const events = lines.map((l) => JSON.parse(l));
     expect(events[0].kind).toBe('check');
     expect(events[0].name).toBe('platform');
@@ -238,7 +340,11 @@ describe('runDoctor', () => {
     const summary = events[events.length - 1];
     expect(summary.kind).toBe('summary');
     expect(summary.ok).toBe(true);
-    expect(summary.counts).toEqual({ ok: 11, warn: 0, fail: 0 });
+    // 11 ok + 1 warn (sandbox_enforcement on linux/darwin) +
+    // 0 fail. The single warn is the enforcement-honesty signal
+    // and never resolves to ok on linux/darwin because the default
+    // broker is in-process.
+    expect(summary.counts).toEqual({ ok: 11, warn: 1, fail: 0 });
   });
 
   test('--json: failures bump summary.ok to false + exit 1', async () => {
