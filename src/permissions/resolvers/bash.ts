@@ -1758,7 +1758,12 @@ const TOUCH_VALUE_FLAGS: ReadonlySet<string> = new Set([
 // destination from capability attribution, letting `ln -t
 // /protected src` bypass a `deny: write-fs:/protected/**` rule.
 const LN_VALUE_FLAGS: ReadonlySet<string> = new Set(['-S', '--suffix']);
-const MKTEMP_VALUE_FLAGS: ReadonlySet<string> = new Set(['-p', '--tmpdir', '--suffix']);
+// mktemp value-flags whose operand is NOT a path destination.
+// `-p DIR` / `--tmpdir[=DIR]` ARE write destinations — handled in
+// cmdMktemp so a policy denying writes outside the workspace
+// (e.g., /tmp) sees the actual write location. Listing them here
+// would drop DIR from capability attribution.
+const MKTEMP_VALUE_FLAGS: ReadonlySet<string> = new Set(['--suffix']);
 
 const emitTargetsAsWrites = (positional: readonly string[], ctx: ResolverContext) => {
   if (positional.length === 0) {
@@ -1840,8 +1845,46 @@ const cmdLn: CommandResolver = (_positional, tokens, ctx) => {
   return emitTargetsAsWrites(positional, ctx);
 };
 
+// `mktemp -p DIR TEMPLATE` / `--tmpdir=DIR TEMPLATE` creates the
+// file inside DIR. The destination MUST surface as a write so a
+// policy denying writes outside the workspace (e.g., `/tmp`) can
+// fire. Without DIR explicitly resolved, mktemp picks `$TMPDIR`
+// or `/tmp` at runtime — that case stays as the fallback (cwd-
+// relative attribution) and is a known limitation.
 const cmdMktemp: CommandResolver = (_positional, tokens, ctx) => {
-  return emitTargetsAsWrites(stripFlags(tokens, MKTEMP_VALUE_FLAGS), ctx);
+  let tmpdir: string | null = null;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i] ?? '';
+    if (t.startsWith('--tmpdir=')) {
+      const v = t.slice('--tmpdir='.length);
+      if (v.length > 0) tmpdir = v;
+    } else if (t === '--tmpdir' || t === '-p') {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) tmpdir = next;
+    }
+  }
+  const positional = stripFlags(tokens, MKTEMP_VALUE_FLAGS);
+
+  if (tmpdir !== null) {
+    // Filter tmpdir out of positional in case the space-separated
+    // form leaked through.
+    const templates = positional.filter((p) => p !== tmpdir);
+    if (templates.length === 0) {
+      // -p DIR with no template — mktemp picks a default template
+      // like `tmp.XXXXXX`. Emit write-fs(DIR) as the broader scope.
+      return {
+        capabilities: [writeFs(resolveArg(tmpdir, ctx))],
+        confidence: 'high',
+      };
+    }
+    const resolvedDir = resolveArg(tmpdir, ctx);
+    return {
+      capabilities: templates.map((p) => writeFs(resolvePath(resolvedDir, p))),
+      confidence: 'high',
+    };
+  }
+
+  return emitTargetsAsWrites(positional, ctx);
 };
 
 // `cd` is a builtin; in a tool-call context the cwd change doesn't

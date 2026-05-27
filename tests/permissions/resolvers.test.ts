@@ -560,13 +560,51 @@ describe('bash resolver — simple commands', () => {
     }
   });
 
-  test('mktemp -p /tmp template: -p directory value does not double-write', () => {
+  test('mktemp -p /tmp template: write surfaces under /tmp, NOT cwd', () => {
+    // Regression pin: pre-fix `-p` was in MKTEMP_VALUE_FLAGS so the
+    // destination DIR (/tmp) was dropped — a `deny:
+    // write-fs:/tmp/**` policy silently allowed creation there.
+    // The resolver now emits write-fs(/tmp/tmpXXXXXX), not
+    // write-fs(<cwd>/tmpXXXXXX).
     const r = resolveCapabilities('bash', { command: 'mktemp -p /tmp tmpXXXXXX' }, CTX);
     expect(r.kind).toBe('ok');
     if (r.kind === 'ok') {
       const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/tmp/tmpXXXXXX');
+      expect(s).not.toContain('write-fs:/work/proj/tmpXXXXXX');
+    }
+  });
+
+  test('mktemp --tmpdir=/tmp template: combined form also resolves under DIR', () => {
+    const r = resolveCapabilities('bash', { command: 'mktemp --tmpdir=/tmp tmpXXXXXX' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/tmp/tmpXXXXXX');
+    }
+  });
+
+  test('mktemp -p /protected: no template — write-fs of DIR is the broader scope', () => {
+    // Without a template, mktemp picks a default like tmp.XXXXXX
+    // — we can't pre-compute the final path. Emit write-fs(DIR)
+    // as the conservative scope so a policy on /protected fires.
+    const r = resolveCapabilities('bash', { command: 'mktemp -p /protected' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/protected');
+    }
+  });
+
+  test('mktemp template (no -p): existing cwd-fallback preserved', () => {
+    // Without -p, mktemp picks $TMPDIR or /tmp at runtime — we
+    // don't know the path statically. Fall back to cwd-relative
+    // attribution (the legacy behavior).
+    const r = resolveCapabilities('bash', { command: 'mktemp tmpXXXXXX' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
       expect(s).toContain('write-fs:/work/proj/tmpXXXXXX');
-      expect(s).not.toContain('write-fs:/tmp');
     }
   });
 
