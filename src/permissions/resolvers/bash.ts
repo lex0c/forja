@@ -1303,66 +1303,22 @@ const cmdNpmLike: CommandResolver = (_positional, tokens, ctx) => {
   // can match against the literal token. Realistic operators
   // either trust npm globally or use confirm rules; the marker
   // makes the intent visible in the audit row.
+  // npm/yarn/pnpm/bun's redirect flags are all long-only (no short
+  // forms) with REQUIRED values. Helper handles combined + spaced
+  // forms uniformly.
+  const NPM_WRITE_PATH_SPECS: readonly { longForm: string }[] = [
+    { longForm: '--prefix' },
+    { longForm: '--pack-destination' },
+    { longForm: '--cache' },
+    { longForm: '--modules-folder' },
+  ];
   const writeTargets: string[] = [];
-  let globalFlag = false;
-  for (let i = 0; i < tokens.length; i += 1) {
-    const t = tokens[i] ?? '';
-    if (t === '-g' || t === '--global') {
-      globalFlag = true;
-      continue;
-    }
-    if (t.startsWith('--prefix=')) {
-      const v = t.slice('--prefix='.length);
-      if (v.length > 0) writeTargets.push(v);
-      continue;
-    }
-    if (t === '--prefix') {
-      const next = tokens[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
-        writeTargets.push(next);
-        i += 1;
-      }
-      continue;
-    }
-    if (t.startsWith('--pack-destination=')) {
-      const v = t.slice('--pack-destination='.length);
-      if (v.length > 0) writeTargets.push(v);
-      continue;
-    }
-    if (t === '--pack-destination') {
-      const next = tokens[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
-        writeTargets.push(next);
-        i += 1;
-      }
-      continue;
-    }
-    if (t.startsWith('--cache=')) {
-      const v = t.slice('--cache='.length);
-      if (v.length > 0) writeTargets.push(v);
-      continue;
-    }
-    if (t === '--cache') {
-      const next = tokens[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
-        writeTargets.push(next);
-        i += 1;
-      }
-      continue;
-    }
-    if (t.startsWith('--modules-folder=')) {
-      const v = t.slice('--modules-folder='.length);
-      if (v.length > 0) writeTargets.push(v);
-      continue;
-    }
-    if (t === '--modules-folder') {
-      const next = tokens[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
-        writeTargets.push(next);
-        i += 1;
-      }
-    }
+  for (const spec of NPM_WRITE_PATH_SPECS) {
+    for (const v of extractValueFlag(tokens, spec)) writeTargets.push(v);
   }
+  // `-g` / `--global` is a boolean — tracked separately so the
+  // marker `<npm-global-prefix>` write-fs can be emitted.
+  const globalFlag = tokens.some((t) => t === '-g' || t === '--global');
 
   const caps: Capability[] = [
     exec('arbitrary'),
@@ -1410,66 +1366,24 @@ const cmdPip: CommandResolver = (_positional, tokens, ctx) => {
   // Pre-slice `pip install --target /tmp/exfil foo` walked past
   // `deny: write-fs:/tmp/**`. Decode each and emit writeFs so the
   // engine sees the actual redirected write.
+  // pip's redirect flags — REQUIRED values. `--target` aliases `-t`
+  // and `--download` aliases `-d`; both short forms support the
+  // attached shape (`pip -t/tmp/exfil foo` was a bypass pre-fix).
+  // The other three are long-only.
+  const PIP_WRITE_PATH_SPECS: readonly { longForm: string; shortForm?: string }[] = [
+    { longForm: '--target', shortForm: '-t' },
+    { longForm: '--prefix' },
+    { longForm: '--root' },
+    { longForm: '--cache-dir' },
+    { longForm: '--download', shortForm: '-d' },
+  ];
   const writeTargets: string[] = [];
-  let userFlag = false;
-  for (let i = 0; i < tokens.length; i += 1) {
-    const t = tokens[i] ?? '';
-    if (t === '--user') {
-      userFlag = true;
-      continue;
-    }
-    if (t === '--target' || t === '-t') {
-      const next = tokens[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
-        writeTargets.push(next);
-        i += 1;
-      }
-      continue;
-    }
-    if (t.startsWith('--target=')) {
-      const v = t.slice('--target='.length);
-      if (v.length > 0) writeTargets.push(v);
-      continue;
-    }
-    if (t === '--prefix' || t === '--root') {
-      const next = tokens[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
-        writeTargets.push(next);
-        i += 1;
-      }
-      continue;
-    }
-    if (t.startsWith('--prefix=')) {
-      const v = t.slice('--prefix='.length);
-      if (v.length > 0) writeTargets.push(v);
-      continue;
-    }
-    if (t.startsWith('--root=')) {
-      const v = t.slice('--root='.length);
-      if (v.length > 0) writeTargets.push(v);
-      continue;
-    }
-    if (t === '--cache-dir') {
-      const next = tokens[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
-        writeTargets.push(next);
-        i += 1;
-      }
-      continue;
-    }
-    if (t.startsWith('--cache-dir=')) {
-      const v = t.slice('--cache-dir='.length);
-      if (v.length > 0) writeTargets.push(v);
-      continue;
-    }
-    if (t === '-d' || t === '--download') {
-      const next = tokens[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
-        writeTargets.push(next);
-        i += 1;
-      }
-    }
+  for (const spec of PIP_WRITE_PATH_SPECS) {
+    for (const v of extractValueFlag(tokens, spec)) writeTargets.push(v);
   }
+  // `--user` is a boolean — tracked separately so `~/.local` write
+  // scope can be emitted.
+  const userFlag = tokens.some((t) => t === '--user');
 
   const caps: Capability[] = [exec('arbitrary'), readFs(ctx.cwd), netEgress('pypi.org')];
   for (const p of writeTargets) caps.push(writeFs(resolveArg(p, ctx)));

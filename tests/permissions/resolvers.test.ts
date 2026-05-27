@@ -1007,6 +1007,41 @@ describe('bash resolver — simple commands', () => {
       expect(s).toContain('read-fs:/protected');
     }
   });
+
+  test('pip -t/tmp/exfil foo: attached short -t emits write-fs(target)', () => {
+    // pip's `-t DIR` (short alias of --target) redirects install
+    // root. Pre-fix the exact-match decoder missed `-t/path` →
+    // policy `deny: write-fs:/tmp/**` was bypassed.
+    const r = resolveCapabilities('bash', { command: 'pip install -t/tmp/exfil foo' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/tmp/exfil');
+    }
+  });
+
+  test('pip -d/tmp/dump foo: attached short -d emits write-fs(download dir)', () => {
+    const r = resolveCapabilities('bash', { command: 'pip install -d/tmp/dump foo' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/tmp/dump');
+    }
+  });
+
+  test('pip --target=/tmp/exfil foo: combined long form (regression pin)', () => {
+    const r = resolveCapabilities('bash', { command: 'pip install --target=/tmp/exfil foo' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/tmp/exfil');
+    }
+  });
+
+  test('npm --prefix=/tmp/exfil install foo: combined long form preserved', () => {
+    const r = resolveCapabilities('bash', { command: 'npm install --prefix=/tmp/exfil foo' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/tmp/exfil');
+    }
+  });
 });
 
 describe('bash resolver — refusals', () => {
