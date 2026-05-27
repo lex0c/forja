@@ -19,6 +19,7 @@
 //                                                audit row (audit-loud)
 //   - all of the above clean                   → state=ready
 
+import { realpathSync } from 'node:fs';
 import type { FailureEventSink } from '../failures/index.ts';
 import type { DB } from '../storage/db.ts';
 import { archivePolicy } from '../storage/repos/policy-archive.ts';
@@ -193,14 +194,35 @@ export { mergeTrustedHosts } from './risk-score.ts';
 // hard exceptions per the v1 leak-test invariant.
 export const preflightPermissionEngine = (input: PreflightInput): PreflightResult => {
   const env = input.env ?? process.env;
-  const home = input.home ?? env.HOME ?? process.env.HOME ?? input.cwd;
+  // Canonicalize cwd + home here too (best-effort, same fallback
+  // chain as `bootstrapPermissionEngine`). Without this, callers
+  // that run preflight separately and pass the cached result into
+  // bootstrap would have a `resolved` policy whose `projectPolicyPath`
+  // discovery walked a lexical cwd while bootstrap's engine would
+  // get the canonical form — the two paths could disagree on which
+  // `.agent/policy.toml` file applies when cwd is symlinked.
+  const cwd = (() => {
+    try {
+      return realpathSync(input.cwd);
+    } catch {
+      return input.cwd;
+    }
+  })();
+  const homeRaw = input.home ?? env.HOME ?? process.env.HOME ?? cwd;
+  const home = (() => {
+    try {
+      return realpathSync(homeRaw);
+    } catch {
+      return homeRaw;
+    }
+  })();
   const identity = ensureInstallId({
     env,
     ...(input.now !== undefined ? { now: input.now } : {}),
     ...(input.uuid !== undefined ? { uuid: input.uuid } : {}),
   });
   const resolved = resolvePolicy({
-    cwd: input.cwd,
+    cwd,
     home,
     env,
     ...(input.enterprisePath !== undefined ? { enterprisePath: input.enterprisePath } : {}),
@@ -365,6 +387,41 @@ export const bootstrapPermissionEngine = async (
   // engine's first check() finds a warm parser.
   await initBashParser();
 
+  // Canonicalize cwd + home up front so every downstream consumer
+  // (resolvePolicy / projectPolicyPath, engine + ctx.cwd in
+  // resolvers, matcher.matchPathPrepared, protected_paths classifier)
+  // sees the same physical path. Pre-fix, a cwd that prefixed a
+  // symlink (firmlinks on macOS, /tmp/projlink → /actual/proj,
+  // managed-NFS layouts, `cd $(mktemp -d)` under tmpfs symlinks)
+  // leaked the lexical form into:
+  //   - matcher's `prepareTarget`: target gets realpath'd but
+  //     `absCwd = resolve(cwd)` stays lexical; `relativize(lexicalCwd,
+  //     canonicalTarget)` returns null → allow_paths default-denies.
+  //   - bash resolver's `detectCwdScopeEscape`: lexical-inside-cwd vs
+  //     canonical-outside-cwd returns true on every legitimate call
+  //     → confidence='low' → confirm-on-every-tool.
+  //   - engine's `resolveForProtected`: protected-path classifier
+  //     compares canonical target against lexical cwd-relative
+  //     escalate dirs, silently misses `.git` / `.agent` / `.claude`
+  //     when cwd is symlinked.
+  // Sandbox runner already canonicalizes cwd (slice 155) at the wrap
+  // boundary; this closes the engine-side gap so the two layers agree
+  // on the physical path.
+  //
+  // Best-effort: realpath failures fall back to the lexical input so
+  // tests building engines against synthetic / non-existent cwds keep
+  // working. Production callers always pass an existing cwd; the only
+  // legitimate failure case is `cd` into a dir that was removed
+  // mid-session, which produces a downstream error regardless of
+  // canonicalization.
+  const cwd = (() => {
+    try {
+      return realpathSync(input.cwd);
+    } catch {
+      return input.cwd;
+    }
+  })();
+
   const events: StateTransition[] = [];
   const controller = createStateController({
     initial: 'init',
@@ -391,7 +448,23 @@ export const bootstrapPermissionEngine = async (
     },
   });
 
-  const home = input.home ?? input.env?.HOME ?? process.env.HOME ?? input.cwd;
+  // Same canonicalization rationale as cwd — `home` flows into the
+  // protected-paths classifier (`classifyProtectedPath` resolves
+  // tilde-escalate entries against `home`) and the resolver context.
+  // A managed-NFS-style `/home/op → /data/users/op` would otherwise
+  // leak the symlink form into resolved capability scopes for
+  // `~/.ssh/id_rsa` reads, missing the matcher's prefix check against
+  // the canonical path. Defaults to cwd (already canonical above)
+  // when no home is supplied — preserves the prior fallback chain
+  // shape while keeping canonical semantics.
+  const homeRaw = input.home ?? input.env?.HOME ?? process.env.HOME ?? cwd;
+  const home = (() => {
+    try {
+      return realpathSync(homeRaw);
+    } catch {
+      return homeRaw;
+    }
+  })();
 
   // Phases 1 + 2: install_id + policy load. Pre-flight (callable
   // separately by the CLI driver) lets a malformed policy throw
@@ -420,7 +493,7 @@ export const bootstrapPermissionEngine = async (
     }
     try {
       resolveResult = resolvePolicy({
-        cwd: input.cwd,
+        cwd,
         home,
         env: input.env ?? process.env,
         ...(input.enterprisePath !== undefined ? { enterprisePath: input.enterprisePath } : {}),
@@ -541,7 +614,7 @@ export const bootstrapPermissionEngine = async (
   // were silently accepted" from "list is correct").
   const trustedHosts = mergeTrustedHosts(resolveResult.policy.tools.fetch_url?.trusted_hosts ?? []);
   const engine = createPermissionEngine(resolveResult.policy, {
-    cwd: input.cwd,
+    cwd,
     home,
     provenance: resolveResult.provenance,
     audit: sink,
@@ -663,7 +736,7 @@ export const bootstrapPermissionEngine = async (
   let policyWatcher: PolicyWatcher | undefined;
   if (input.watchPolicy === true && archiveState !== 'refusing') {
     const resolveOptionsForWatcher: Parameters<typeof watchAndReload>[0]['resolveOptions'] = {
-      cwd: input.cwd,
+      cwd,
       home,
       env: input.env ?? process.env,
       ...(input.enterprisePath !== undefined ? { enterprisePath: input.enterprisePath } : {}),
