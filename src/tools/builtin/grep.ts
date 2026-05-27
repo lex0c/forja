@@ -1,6 +1,12 @@
 import { isAbsolute, resolve } from 'node:path';
 import { maybeWrapSandboxArgv } from '../../permissions/index.ts';
-import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
+import {
+  ERROR_CODES,
+  type SummarizedOutput,
+  type Tool,
+  type ToolResult,
+  toolError,
+} from '../types.ts';
 
 export interface GrepInput {
   pattern: string;
@@ -87,6 +93,7 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
     parallel_safe: true,
     display: 'list',
     cost: { latency_ms_typical: 100 },
+    summarize: (result) => summarizeGrepOutput(result),
   },
   async execute(args, ctx): Promise<ToolResult<GrepOutput>> {
     if (ctx.signal.aborted) {
@@ -235,4 +242,56 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
       truncated,
     };
   },
+};
+
+// Hit-count threshold for the group-by-file fold. Below this the
+// matches array passes through unchanged so the model gets full
+// per-line context for small result sets. At/above, hits collapse
+// to one row per file with a count + the first hit as exemplar.
+const GREP_GROUP_THRESHOLD = 50;
+
+interface GroupedGrepMatch {
+  file: string;
+  count: number;
+  firstLine: number;
+  firstText: string;
+}
+
+// Grep result summarizer. When match count crosses the threshold,
+// collapse to one row per file — the model usually wants to know
+// WHICH files contain the pattern far more than every individual
+// line, and "show me line 42 of foo.ts" can be re-asked via a
+// narrower grep.
+//
+// Contract: invoked only on success results (harness routes
+// ToolError through a separate path).
+const summarizeGrepOutput = (result: unknown): SummarizedOutput => {
+  const out = result as GrepOutput;
+  const originalBytes = Buffer.byteLength(JSON.stringify(result), 'utf8');
+  if (out.matches.length < GREP_GROUP_THRESHOLD) {
+    return { result, reduced: false, originalBytes, policy: 'noop' };
+  }
+  const byFile = new Map<string, GroupedGrepMatch>();
+  for (const m of out.matches) {
+    const existing = byFile.get(m.file);
+    if (existing === undefined) {
+      byFile.set(m.file, {
+        file: m.file,
+        count: 1,
+        firstLine: m.line,
+        firstText: m.text,
+      });
+    } else {
+      existing.count += 1;
+    }
+  }
+  return {
+    result: {
+      ...out,
+      matches: Array.from(byFile.values()),
+    },
+    reduced: true,
+    originalBytes,
+    policy: 'group_by_file',
+  };
 };

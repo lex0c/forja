@@ -1,6 +1,12 @@
 import { isAbsolute, resolve } from 'node:path';
 import { Glob } from 'bun';
-import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
+import {
+  ERROR_CODES,
+  type SummarizedOutput,
+  type Tool,
+  type ToolResult,
+  toolError,
+} from '../types.ts';
 
 export interface GlobInput {
   pattern: string;
@@ -57,6 +63,7 @@ export const globTool: Tool<GlobInput, GlobOutput> = {
     parallel_safe: true,
     display: 'list',
     cost: { latency_ms_typical: 25 },
+    summarize: (result) => summarizeGlobOutput(result),
   },
   async execute(args, ctx): Promise<ToolResult<GlobOutput>> {
     if (ctx.signal.aborted) {
@@ -111,4 +118,37 @@ export const globTool: Tool<GlobInput, GlobOutput> = {
     matches.sort();
     return { pattern: args.pattern, matches, count: matches.length, truncated };
   },
+};
+
+// Match-count threshold for the head-tail policy. Below it, the
+// full sorted list passes through — operators expect glob results
+// to be canonical (sort order + completeness). At/above, the
+// surface keeps the alphabetically-first and last N paths plus a
+// count of the middle that was dropped.
+const GLOB_SUMMARIZE_THRESHOLD = 200;
+const GLOB_HEAD_TAIL_KEEP = 50;
+
+// Glob result summarizer. Slices the matches array to head + tail
+// when length crosses the threshold. The sorted order makes
+// head/tail informative — alphabetically clustered paths surface
+// the directory layout without needing every entry.
+//
+// Contract: invoked only on success results (harness routes
+// ToolError through a separate path).
+const summarizeGlobOutput = (result: unknown): SummarizedOutput => {
+  const out = result as GlobOutput;
+  const originalBytes = Buffer.byteLength(JSON.stringify(result), 'utf8');
+  if (out.matches.length < GLOB_SUMMARIZE_THRESHOLD) {
+    return { result, reduced: false, originalBytes, policy: 'noop' };
+  }
+  const head = out.matches.slice(0, GLOB_HEAD_TAIL_KEEP);
+  const tail = out.matches.slice(out.matches.length - GLOB_HEAD_TAIL_KEEP);
+  const elided = out.matches.length - head.length - tail.length;
+  const summarizedMatches = [...head, `[... ${elided} paths elided ...]`, ...tail];
+  return {
+    result: { ...out, matches: summarizedMatches },
+    reduced: true,
+    originalBytes,
+    policy: 'head_tail',
+  };
 };

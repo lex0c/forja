@@ -1024,6 +1024,39 @@ export const invokeTool = async (
     output: result,
     durationMs: duration,
   });
+  // Output summarization (tools/output-summarizer.ts). When the
+  // tool declares `metadata.summarize`, apply it AFTER the raw
+  // result is in the audit row but BEFORE we serialize for the
+  // model. This keeps replay/forensics seeing the full output
+  // while the next-turn `tool_result.content` carries a digest of
+  // the heavy fields. The marker the harness prepends below tells
+  // the model it's reading a summary and gives it the policy +
+  // original byte count so it can re-invoke with narrower args if
+  // it lost load-bearing detail.
+  //
+  // Pure tool error path is not summarized — ToolError shapes are
+  // small by construction and the model needs the exact error
+  // text. The success branch only.
+  let resultForModel: unknown = result;
+  let summaryMarker: string | null = null;
+  if (tool.metadata.summarize !== undefined) {
+    try {
+      const summary = tool.metadata.summarize(result, effectiveArgs);
+      if (summary.reduced) {
+        resultForModel = summary.result;
+        summaryMarker = `[forja:output_summarized policy=${summary.policy} original_bytes=${summary.originalBytes}]`;
+      }
+    } catch (e) {
+      // A throw from summarize is a bug in the tool implementation,
+      // not an operator-visible failure. Log to stderr and fall
+      // through with the raw result — the model just sees the
+      // unsummarized output, the worst case being a larger
+      // tool_result block.
+      deps.errSink?.(
+        `forja: invoke-tool: summarize threw in ${input.toolName}: ${e instanceof Error ? e.message : String(e)}\n`,
+      );
+    }
+  }
   // Slice 181 — capture PostToolUse additionalContext to inject
   // into the model's tool_result content below alongside the
   // PreToolUse-stage context.
@@ -1055,7 +1088,7 @@ export const invokeTool = async (
   //     forensic visibility.
   // Bounded scope — false positives are operator-visible (the
   // marker is preserved across replay) but never break the call.
-  const resultJson = JSON.stringify(result);
+  const resultJson = JSON.stringify(resultForModel);
   const injectionScan = scanForInjection(resultJson);
   let content: string;
   if (injectionScan.ok) {
@@ -1065,6 +1098,14 @@ export const invokeTool = async (
       `forja: invoke-tool: prompt-injection suspect in ${input.toolName} output: ${injectionScan.reason ?? 'unknown'}\n`,
     );
     content = `[forja:injection_suspect ${injectionScan.reason ?? 'unknown'}]\n${resultJson}`;
+  }
+  // Prepend the summarization marker AFTER the injection wrap so a
+  // suspect-output that was ALSO summarized renders both markers
+  // (operator/model see both signals). Ordering: summarize marker
+  // first (it describes the body's shape), then injection marker
+  // (it warns about content). Hook-context blocks below stay last.
+  if (summaryMarker !== null) {
+    content = `${summaryMarker}\n${content}`;
   }
   // Slice 181 — append hook-emitted additionalContext to the
   // tool_result content so the model reads it on the next call.
