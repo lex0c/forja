@@ -139,20 +139,29 @@ const stripFlags = (
 //   short spaced:     -f VAL
 //   short attached:   -fVAL              (only single-letter short)
 //
-// The previous decode pattern (combined long + spaced long + spaced
-// short) missed the attached short form, so `ln -t/dir src`,
-// `mktemp -p/tmp X`, `touch -r/ref file`, `rsync -T/tmp src dst`
-// each bypassed the per-flag policy gate. Returns ALL values found
-// across the token stream.
+// Returns ALL values found across the token stream.
 //
 // `shortForm` must be a single-letter flag (length 2 including the
 // leading dash) for the attached branch to fire. Multi-letter
 // "short" options used by find (`-newer`, `-maxdepth`) don't use
 // attached form in coreutils; pass them via `longForm` only.
+//
+// `optionalValue: true` models the GNU `--foo[=VAL]` shape — the
+// value is consumable ONLY via `=` (combined long) or attached
+// short (`-fVAL`). Spaced forms (`--foo VAL` / `-f VAL`) leave VAL
+// as a positional, matching getopt's optional-argument semantics
+// (e.g., `mktemp --tmpdir tmpXXX` — `tmpXXX` is the TEMPLATE, NOT
+// the tmpdir). Required-argument flags (the default) accept all
+// four shapes.
 const extractValueFlag = (
   tokens: readonly string[],
-  spec: { readonly longForm?: string; readonly shortForm?: string },
+  spec: {
+    readonly longForm?: string;
+    readonly shortForm?: string;
+    readonly optionalValue?: boolean;
+  },
 ): string[] => {
+  const optional = spec.optionalValue === true;
   const out: string[] = [];
   for (let i = 0; i < tokens.length; i += 1) {
     const t = tokens[i] ?? '';
@@ -164,6 +173,7 @@ const extractValueFlag = (
         continue;
       }
       if (t === spec.longForm) {
+        if (optional) continue;
         const next = tokens[i + 1];
         if (next !== undefined && !next.startsWith('-')) out.push(next);
         continue;
@@ -171,13 +181,14 @@ const extractValueFlag = (
     }
     if (spec.shortForm !== undefined) {
       if (t === spec.shortForm) {
+        if (optional) continue;
         const next = tokens[i + 1];
         if (next !== undefined && !next.startsWith('-')) out.push(next);
         continue;
       }
-      // Attached form — only single-letter shorts. Length 2 catches
-      // `-t`, `-p`, `-r`, `-T`, `-f`, etc., and not `-newer` /
-      // `-maxdepth` which aren't attached-form anyway.
+      // Attached form — only single-letter shorts. Always honored
+      // even when optionalValue=true (attached IS how getopt
+      // expresses optional values for short options).
       if (
         spec.shortForm.length === 2 &&
         t.startsWith(spec.shortForm) &&
@@ -1750,10 +1761,18 @@ const cmdLn: CommandResolver = (_positional, tokens, ctx) => {
 // or `/tmp` at runtime — that case stays as the fallback (cwd-
 // relative attribution) and is a known limitation.
 const cmdMktemp: CommandResolver = (_positional, tokens, ctx) => {
-  const tmpdirMatches = extractValueFlag(tokens, {
-    longForm: '--tmpdir',
-    shortForm: '-p',
-  });
+  // `-p DIR` and `--tmpdir[=DIR]` have different getopt shapes:
+  //   - `-p` is REQUIRED-argument (per `mktemp --help` "-p DIR");
+  //     consume spaced + attached short forms.
+  //   - `--tmpdir` is OPTIONAL-argument; consume ONLY via `=` or
+  //     attached short. Spaced `--tmpdir tmpXXX` leaves tmpXXX as
+  //     the TEMPLATE (default tmpdir used by mktemp at runtime).
+  //     Without optionalValue=true the helper would over-consume
+  //     the template and emit a wrong write-fs scope.
+  const tmpdirMatches = [
+    ...extractValueFlag(tokens, { shortForm: '-p' }),
+    ...extractValueFlag(tokens, { longForm: '--tmpdir', optionalValue: true }),
+  ];
   const tmpdir: string | null =
     tmpdirMatches.length > 0 ? (tmpdirMatches[tmpdirMatches.length - 1] ?? null) : null;
   const positional = stripFlags(tokens, MKTEMP_VALUE_FLAGS);

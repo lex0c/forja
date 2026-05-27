@@ -644,6 +644,35 @@ describe('bash resolver — simple commands', () => {
     }
   });
 
+  test('mktemp --tmpdir tmpA tmpB: spaced --tmpdir treats both as templates', () => {
+    // Per `mktemp --help`, `--tmpdir[=DIR]` is optional-argument:
+    // the spaced form does NOT consume the next token as DIR.
+    // Both `tmpA` and `tmpB` are templates; mktemp uses
+    // $TMPDIR/`/tmp` at runtime. Pre-fix the resolver consumed
+    // 'tmpA' as the tmpdir and emitted writeFs(/cwd/tmpA/tmpB) —
+    // a bogus directory-join. Post-fix emits one writeFs per
+    // template (cwd-relative; the runtime-resolved tmpdir is a
+    // known limitation).
+    const r = resolveCapabilities('bash', { command: 'mktemp --tmpdir tmpA tmpB' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/work/proj/tmpA');
+      expect(s).toContain('write-fs:/work/proj/tmpB');
+      expect(s).not.toContain('write-fs:/work/proj/tmpA/tmpB');
+    }
+  });
+
+  test('mktemp --tmpdir=/tmp tmpXXX: combined form still joins DIR/template', () => {
+    // The `=`-combined form IS how --tmpdir takes a value. Combined
+    // form must still emit write-fs:/tmp/tmpXXX.
+    const r = resolveCapabilities('bash', { command: 'mktemp --tmpdir=/tmp tmpXXX' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/tmp/tmpXXX');
+    }
+  });
+
   test('ln -t /opt/dir src1 src2: -t value IS the write destination', () => {
     // `-t DIR` makes DIR the link-creation directory. The resolver
     // MUST emit write-fs for DIR (so a deny rule on DIR can fire)
