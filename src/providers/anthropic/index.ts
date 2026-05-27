@@ -14,6 +14,7 @@ import {
   MAX_CACHE_BREAKPOINTS_PER_REQUEST,
   countCacheBreakpoints,
   messagesWithTailCacheBreakpoint,
+  systemSegmentsWithCacheBreakpoints,
   systemWithCacheBreakpoint,
   toolsWithCacheBreakpoint,
 } from './cache.ts';
@@ -83,9 +84,16 @@ export const createAnthropicProvider = (
     // Cache breakpoints (CONTEXT_TUNING.md §3.1, PROVIDERS.md §3.1):
     // anchors are placed on (a) the system block, (b) the last tool,
     // and (c) the last message's last content block. See
-    // `./cache.ts` for the full strategy and the gap to four
-    // breakpoints (the [project_context] / [memory_index] split).
-    const cachedSystem = systemWithCacheBreakpoint(req.system);
+    // `./cache.ts` for the full strategy. When the producer
+    // supplies `systemSegments`, the prefix is split into multiple
+    // TextBlockParams — segments flagged `cacheBreakpoint: true`
+    // anchor independent invalidation envelopes (CONTEXT_TUNING.md
+    // §3.1). Without segments, the entire system string is one
+    // block as before.
+    const cachedSystem =
+      req.systemSegments !== undefined
+        ? systemSegmentsWithCacheBreakpoints(req.systemSegments)
+        : systemWithCacheBreakpoint(req.system);
     const cachedTools =
       req.tools !== undefined
         ? toolsWithCacheBreakpoint(req.tools.map(toAnthropicTool))
@@ -202,7 +210,10 @@ export const createAnthropicProvider = (
           "anthropic generateConstrained: 'tools' must be empty (forced schema tool only)",
         );
       }
-      const cachedSystem = systemWithCacheBreakpoint(req.system);
+      const cachedSystem =
+        req.systemSegments !== undefined
+          ? systemSegmentsWithCacheBreakpoints(req.systemSegments)
+          : systemWithCacheBreakpoint(req.system);
       const cachedMessages = messagesWithTailCacheBreakpoint(req.messages.map(toAnthropicMessage));
       const schemaTool: Anthropic.Tool = {
         name: req.output_schema_name,

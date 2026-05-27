@@ -49,6 +49,7 @@ import {
 } from '../permissions/index.ts';
 import { createDefaultRegistry } from '../providers/index.ts';
 import type { Provider } from '../providers/index.ts';
+import type { SystemSegment } from '../providers/types.ts';
 import { scrubEnv } from '../sanitize/index.ts';
 import { redactSecrets } from '../sanitize/secrets.ts';
 import {
@@ -706,6 +707,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   const isCwdTrusted = trustPath !== null && isTrusted(trustPath, cwd);
 
   let resolvedSystemPrompt: string | undefined;
+  let resolvedSystemSegments: SystemSegment[] | undefined;
   let systemPromptHash: string | undefined;
   let memoryRegistry: ReturnType<typeof createMemoryRegistry>;
   let skillCatalog: ReturnType<typeof createSkillCatalog>;
@@ -1184,6 +1186,17 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       if (storedTrust === null) return true; // never confirmed
       return storedTrust.lastConfirmedHash !== currentHash; // drift
     })();
+    // Snapshot the "stable" portion of the prompt — identity, env,
+    // ergonomics, constraints, base systemPrompt, project pointer.
+    // Everything composed BEFORE the memory/skills append. Captured
+    // here so the Anthropic adapter can place a cache breakpoint
+    // after this segment, separating it from the memory_index +
+    // skills tail that invalidates on `memory_write` / skill palette
+    // changes. CONTEXT_TUNING.md §3.1 declares 4 breakpoints; this
+    // implements the [system] / [memory_index] split (the
+    // [project_context] dedicated breakpoint is fused with [system]
+    // here because the pointer is small and invalidates rarely).
+    const stableSegmentText = resolvedSystemPrompt ?? '';
     const memorySection = assembleMemorySection({
       registry: memoryRegistry,
       bootContext,
@@ -1197,10 +1210,20 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // surfaced/filtered audit is emitted by the harness loop after
     // createSession — the session row must exist before a
     // skill_events row can reference it.
-    resolvedSystemPrompt = composeSystemPrompt(
-      resolvedSystemPrompt,
-      assembleSkillCatalogSection(skillCatalog),
-    );
+    const skillSectionText = assembleSkillCatalogSection(skillCatalog);
+    resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, skillSectionText);
+    // Build the segment list mirroring resolvedSystemPrompt's
+    // composition. `flattenSystemSegments(systemSegments)` must
+    // equal `resolvedSystemPrompt` — both adapters and the audit
+    // hash see identical content; segments only change which
+    // boundaries the cache marker lands on.
+    const memorySegmentText = composeSystemPrompt(memorySection.text, skillSectionText) ?? '';
+    resolvedSystemSegments = [
+      { id: 'stable', text: stableSegmentText, cacheBreakpoint: true },
+      ...(memorySegmentText.length > 0
+        ? [{ id: 'memory' as const, text: memorySegmentText, cacheBreakpoint: true }]
+        : []),
+    ];
 
     // Register the assembled system prompt in `prompt_versions`
     // (AUDIT.md §1.3.3): content-addressed, idempotent by hash so a
@@ -1401,6 +1424,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
             ? 'user-config'
             : 'default',
     ...(resolvedSystemPrompt !== undefined ? { systemPrompt: resolvedSystemPrompt } : {}),
+    ...(resolvedSystemSegments !== undefined ? { systemSegments: resolvedSystemSegments } : {}),
     ...(systemPromptHash !== undefined ? { systemPromptHash } : {}),
     ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
     ...(input.resumeFromSessionId !== undefined

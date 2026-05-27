@@ -2395,6 +2395,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           messages: [...messages],
           max_tokens: resolvedMaxTokens,
           ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
+          ...(config.systemSegments !== undefined ? { systemSegments: config.systemSegments } : {}),
           ...(tools.length > 0 ? { tools } : {}),
           ...(config.temperature !== undefined ? { temperature: config.temperature } : {}),
           ...(config.topP !== undefined ? { top_p: config.topP } : {}),

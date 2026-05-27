@@ -5,10 +5,16 @@ import {
   MAX_CACHE_BREAKPOINTS_PER_REQUEST,
   countCacheBreakpoints,
   messagesWithTailCacheBreakpoint,
+  systemSegmentsWithCacheBreakpoints,
   systemWithCacheBreakpoint,
   toolsWithCacheBreakpoint,
 } from '../../src/providers/anthropic/cache.ts';
-import type { ProviderContentBlock, ProviderMessage } from '../../src/providers/types.ts';
+import {
+  type ProviderContentBlock,
+  type ProviderMessage,
+  type SystemSegment,
+  flattenSystemSegments,
+} from '../../src/providers/types.ts';
 
 const tool = (name: string): Anthropic.Tool => ({
   name,
@@ -39,6 +45,88 @@ describe('systemWithCacheBreakpoint', () => {
     expect(out).toEqual([
       { type: 'text', text: 'you are a helpful agent', cache_control: ANTHROPIC_CACHE_EPHEMERAL },
     ]);
+  });
+});
+
+describe('systemSegmentsWithCacheBreakpoints', () => {
+  test('emits one block per segment with cache_control where flagged', () => {
+    const segments: SystemSegment[] = [
+      { id: 'stable', text: 'identity + env', cacheBreakpoint: true },
+      { id: 'memory', text: 'memory index body', cacheBreakpoint: true },
+    ];
+    expect(systemSegmentsWithCacheBreakpoints(segments)).toEqual([
+      { type: 'text', text: 'identity + env', cache_control: ANTHROPIC_CACHE_EPHEMERAL },
+      { type: 'text', text: 'memory index body', cache_control: ANTHROPIC_CACHE_EPHEMERAL },
+    ]);
+  });
+
+  test('omits cache_control on segments without cacheBreakpoint flag', () => {
+    const out = systemSegmentsWithCacheBreakpoints([
+      { id: 'stable', text: 'unmarked' },
+      { id: 'memory', text: 'marked', cacheBreakpoint: true },
+    ]);
+    expect(out).toEqual([
+      { type: 'text', text: 'unmarked' },
+      { type: 'text', text: 'marked', cache_control: ANTHROPIC_CACHE_EPHEMERAL },
+    ]);
+  });
+
+  test('drops empty-text segments instead of wasting a breakpoint slot', () => {
+    const out = systemSegmentsWithCacheBreakpoints([
+      { id: 'stable', text: 'body', cacheBreakpoint: true },
+      { id: 'memory', text: '', cacheBreakpoint: true },
+    ]);
+    expect(out).toEqual([{ type: 'text', text: 'body', cache_control: ANTHROPIC_CACHE_EPHEMERAL }]);
+  });
+
+  test('returns undefined when every segment is empty', () => {
+    expect(systemSegmentsWithCacheBreakpoints([])).toBeUndefined();
+    expect(
+      systemSegmentsWithCacheBreakpoints([
+        { id: 'stable', text: '' },
+        { id: 'memory', text: '' },
+      ]),
+    ).toBeUndefined();
+  });
+
+  test('countCacheBreakpoints sees 2 from this layout plus tool + tail = 4 (within limit)', () => {
+    const cachedSystem = systemSegmentsWithCacheBreakpoints([
+      { id: 'stable', text: 'a', cacheBreakpoint: true },
+      { id: 'memory', text: 'b', cacheBreakpoint: true },
+    ]);
+    const cachedTools = toolsWithCacheBreakpoint([tool('t1')]);
+    const cachedMessages = messagesWithTailCacheBreakpoint([userMsg('hi')]);
+    const count = countCacheBreakpoints({
+      system: cachedSystem,
+      tools: cachedTools,
+      messages: cachedMessages,
+    });
+    expect(count).toBe(4);
+    expect(count).toBeLessThanOrEqual(MAX_CACHE_BREAKPOINTS_PER_REQUEST);
+  });
+});
+
+describe('flattenSystemSegments', () => {
+  test('joins segments with the same `\\n\\n` separator composeSystemPrompt uses', () => {
+    expect(
+      flattenSystemSegments([
+        { id: 'stable', text: 'identity + env' },
+        { id: 'memory', text: 'memory body' },
+      ]),
+    ).toBe('identity + env\n\nmemory body');
+  });
+
+  test('drops empty segments — flattened form omits double-blank artifacts', () => {
+    expect(
+      flattenSystemSegments([
+        { id: 'stable', text: 'identity' },
+        { id: 'memory', text: '' },
+      ]),
+    ).toBe('identity');
+  });
+
+  test('empty array → empty string', () => {
+    expect(flattenSystemSegments([])).toBe('');
   });
 });
 

@@ -537,7 +537,7 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
-  test('boot banner includes memory env entry when registry has entries (D68 follow-up)', async () => {
+  test('boot banner does NOT render memory env entry (env block removed)', async () => {
     const stdin = makeStdin();
     const writes: string[] = [];
     const promise = runRepl({
@@ -553,10 +553,10 @@ describe('repl — boot + smoke', () => {
     await tick();
     await tick();
     const all = writes.join('');
-    // `meta` env entry renders as `key: value` in the banner block
-    // (UI.md §4.10.9 envelopes the key in the `dim` palette but the
-    // raw text still contains the literal "memory: 3").
-    expect(all).toContain('memory: 3');
+    // env block was removed from the boot banner — registry count
+    // still flows through to the PermanentItem for NDJSON / audit
+    // consumers, but the TUI no longer renders it.
+    expect(all).not.toContain('memory: 3');
     stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
@@ -583,7 +583,7 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
-  test('boot banner includes skills env entry when the catalog has entries', async () => {
+  test('boot banner does NOT render skills env entry (env block removed)', async () => {
     const stdin = makeStdin();
     const writes: string[] = [];
     const promise = runRepl({
@@ -599,7 +599,7 @@ describe('repl — boot + smoke', () => {
     await tick();
     await tick();
     const all = writes.join('');
-    expect(all).toContain('skills: 5');
+    expect(all).not.toContain('skills: 5');
     stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
@@ -625,9 +625,10 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
-  test('boot emits welcome banner with correct content + omits empty env entries', async () => {
-    // Stub has subagents: 0 + enableCheckpoints: false → both env
-    // entries should be omitted (banner has 3 lines, no env).
+  test('boot emits welcome banner with correct content (title + cwd only)', async () => {
+    // Banner was trimmed to two lines: title (`Forja v0.0.0`) + cwd.
+    // Identity line (model / ctx / max-output) moved to footer chips;
+    // env block (subagents, skills, checkpoints, memory) was dropped.
     const stdin = makeStdin();
     const writes: string[] = [];
     const promise = runRepl({
@@ -640,20 +641,19 @@ describe('repl — boot + smoke', () => {
         writes.push(s);
       },
     });
-    // Wait for the boot banner emit + initial frame to flush
-    // through the renderer's frame scheduler. Two ticks are enough
-    // for the bus → reducer → write chain.
     await tick();
     await tick();
     const all = writes.join('');
-    // Banner now uses the v-prefixed version (UI.md §4.10.9).
-    expect(all).toContain('forja v0.0.0');
-    expect(all).toContain('mock/m');
-    expect(all).toContain('200k ctx');
-    expect(all).toContain('max 4096 out');
+    // App name and version are painted with DIFFERENT SGR wraps
+    // (bold for app, secondary for version), so a color-enabled
+    // terminal places an ANSI reset between them — substring
+    // 'Forja v0.0.0' wouldn't match. Check each segment present.
+    expect(all).toContain('Forja');
+    expect(all).toContain('v0.0.0');
     expect(all).toContain('/path/to/repo');
-    // No env block because both subagents and checkpoints were
-    // empty/disabled (D68 — omit when nothing to summarize).
+    // Removed surfaces.
+    expect(all).not.toContain('200k ctx');
+    expect(all).not.toContain('max 4096 out');
     expect(all).not.toContain('subagents');
     expect(all).not.toContain('checkpoints');
     stdin.feed('\x04');
@@ -2675,36 +2675,26 @@ describe('repl — slash commands integration', () => {
       },
     });
     await tick();
-    // Turn 1: drive session_start, observe boot-time maxSteps
-    // (200 from DEFAULT_BUDGET — bumped from 50 when cost became
-    // the primary engagement gate; step count is now the
-    // runaway-loop backstop) in the rendered status line.
+    // Turn 1: drive session_start with boot-time maxSteps (200 from
+    // DEFAULT_BUDGET). The footer chip for steps was removed, so
+    // verify the contract directly: the HarnessConfig the stub
+    // received carries the correct cap.
     stdin.feed('go\r');
     await tick();
+    expect(ra.captured[0]?.configs[0]?.budget?.maxSteps).toBe(200);
     ra.emitInto(0, { type: 'session_start', sessionId: 'sess-1' });
     await flushFrame();
-    expect(writes.join('')).toContain('0/200');
     ra.finish(0);
     await tick();
-    // Mutate via slash command, then turn 2. The cutoff sits AFTER
-    // the new session_start fires, so any lingering "0/50" frames
-    // from session 1's idle render are excluded — we only check
-    // frames produced once the new turn's adapter ctx has emitted.
+    // Mutate via slash command, then turn 2 — runAgent must be
+    // called with the post-mutation maxSteps.
     stdin.feed('/budget steps 99\r');
     await flushFrame();
     stdin.feed('next\r');
     await tick();
-    const cutoff = writes.length;
+    expect(ra.captured[1]?.configs[0]?.budget?.maxSteps).toBe(99);
     ra.emitInto(1, { type: 'session_start', sessionId: 'sess-2' });
     await flushFrame();
-    const post = writes.slice(cutoff).join('');
-    // Adapter ctx for turn 2 must carry the post-mutation maxSteps.
-    // (A transient `0/50` frame may slip between session:start and the
-    // following step:budget — the renderer paints session:start's
-    // model/sessionId update before step:budget's maxSteps lands. The
-    // contract is that the new value DOES appear; intermediate
-    // frames are renderer scheduling, not regression.)
-    expect(post).toContain('0/99');
     ra.finish(1);
     await tick();
     stdin.feed('\x04');
@@ -2736,15 +2726,13 @@ describe('repl — slash commands integration', () => {
     // operator flow (toggle + immediately prompt).
     stdin.feed('/plan on\r');
     await flushFrame();
-    const cutoff = writes.length;
     stdin.feed('go\r');
     await tick();
+    // Footer `plan` chip was removed; verify the contract directly
+    // by inspecting the HarnessConfig the stub received.
+    expect(ra.captured[0]?.configs[0]?.planMode).toBe(true);
     ra.emitInto(0, { type: 'session_start', sessionId: 'sess-1' });
     await flushFrame();
-    // Footer renders `· plan ·` between model and steps when planMode
-    // landed in session:start. Pre-fix the token was missing.
-    const post = writes.slice(cutoff).join('');
-    expect(post).toContain('plan');
     ra.finish(0);
     await tick();
     stdin.feed('\x04');
@@ -4004,7 +3992,11 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
     expect(await promise).toBe(130);
   });
 
-  test('valid id reflected in banner env as `resumed: <short>`', async () => {
+  test('resume id does NOT leak into the banner env (env block removed)', async () => {
+    // The banner used to surface `resumed: <first 8 chars>` as a
+    // meta env entry. Env block was dropped from the renderer — the
+    // resume id still flows through to the PermanentItem.env list
+    // for NDJSON / audit consumers, but the TUI no longer renders it.
     const stub = makeBootstrapStub();
     const resumedId = 'sess-abcdef-the-rest-is-padding';
     createSession(stub.db, {
@@ -4025,14 +4017,9 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
       },
     });
     await tick();
-    // Banner env renders `resumed: <first 8 chars of the id>`.
-    // The short form keeps the banner readable on 80-col terminals
-    // while still letting the operator visually confirm which
-    // session they reopened.
     const all = writes.join('');
-    expect(all).toContain('resumed');
-    expect(all).toContain(resumedId.slice(0, 8));
-    // Exit cleanly.
+    expect(all).not.toContain('resumed:');
+    expect(all).not.toContain(resumedId.slice(0, 8));
     stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
@@ -4360,11 +4347,12 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
     });
     await tick();
     const all = writes.join('');
-    // The banner's `forja v` appears BEFORE the replayed content
-    // in the write stream. The reverse order would mean replay
-    // ran too early (banner was emitted but not yet drained, or
-    // replay raced ahead).
-    const bannerIdx = all.indexOf('forja v');
+    // The banner appears BEFORE the replayed content in the write
+    // stream. The reverse order would mean replay ran too early
+    // (banner was emitted but not yet drained, or replay raced
+    // ahead). Anchor on `Forja` alone — color-enabled output
+    // splits `Forja` from `v0.0.0` with an SGR reset between them.
+    const bannerIdx = all.indexOf('Forja');
     const historyIdx = all.indexOf('MARKER2');
     expect(bannerIdx).toBeGreaterThanOrEqual(0);
     expect(historyIdx).toBeGreaterThan(bannerIdx);
