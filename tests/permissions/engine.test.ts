@@ -3424,16 +3424,40 @@ describe('engine — effective capabilities envelope (§10.1, slice 95)', () => 
   });
 
   test('isToolSideEffect: non-side-effect misc tool still passes with caps=[]', () => {
-    // bash_output is `metadata.writes: false`; the oracle returns
-    // false → caps=[] short-circuits as before. Confirms the gate
-    // doesn't over-refuse.
+    // The oracle returns false → caps=[] short-circuits as before.
+    // Confirms the gate doesn't over-refuse on pure-info tools.
     const eng = createPermissionEngine(policy({ tools: {} }), {
       cwd: CWD,
       effectiveCapabilities: [],
       isToolSideEffect: (name) => name === 'bash_kill',
     });
-    const decision = eng.check('bash_output', 'misc', { process_id: 'bg-1' });
+    const decision = eng.check('think', 'misc', {});
     expect(decision.source?.section).not.toBe('subagent-effective');
+  });
+
+  // bg-lifecycle tools (`bash_output`, `bash_kill`, `bash_background`)
+  // all carry `metadata.requiresBgManager: true`. Reading stdout
+  // from a previously-spawned process or signalling it IS a side
+  // effect from the envelope's perspective even when the tool's
+  // own metadata says writes:false (bash_output is the canonical
+  // example). The production wiring includes `requiresBgManager`
+  // in the side-effect predicate; this test pins the contract so
+  // a future regression to a writes/exec-only oracle surfaces.
+  test('isToolSideEffect: bg-lifecycle tools must be treated as side-effect', () => {
+    const eng = createPermissionEngine(policy({ tools: {} }), {
+      cwd: CWD,
+      effectiveCapabilities: [],
+      // Mirror production: writes OR exec OR requiresBgManager.
+      isToolSideEffect: (name) => {
+        // bash_output has writes:false + no exec but
+        // requiresBgManager:true. The oracle MUST return true.
+        return name === 'bash_output' || name === 'bash_kill' || name === 'bash_background';
+      },
+    });
+    const decision = eng.check('bash_output', 'misc', { process_id: 'bg-1' });
+    expect(decision.kind).toBe('deny');
+    expect(decision.source?.section).toBe('subagent-effective');
+    expect(decision.reason).toContain("'bash_output'");
   });
 
   test('isToolSideEffect omitted: legacy behavior preserved (caps=[] passes)', () => {

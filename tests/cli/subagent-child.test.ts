@@ -519,6 +519,105 @@ describe('runSubagentChild', () => {
     }
   });
 
+  test('side-effect oracle covers bash_output (requiresBgManager) under narrowed envelope', async () => {
+    // bash_output has metadata.writes:false and no exec — only
+    // `requiresBgManager: true` flags it as bg-lifecycle. A
+    // writes/exec-only oracle would let a narrowed subagent read
+    // any process_id it could guess; the production oracle also
+    // checks `requiresBgManager` so reads/signals on bg processes
+    // refuse under the envelope.
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const subagentRunsRepo = await import('../../src/storage/repos/subagent-runs.ts');
+    const messagesRepo = await import('../../src/storage/repos/messages.ts');
+
+    const db = openDb(dbPath);
+    let childId: string;
+    try {
+      migrate(db);
+      const parent = sessionsRepo.createSession(db, { model: 'mock/m', cwd: dbDir });
+      const child = sessionsRepo.createSession(db, {
+        model: 'mock/m',
+        cwd: dbDir,
+        parentSessionId: parent.id,
+      });
+      childId = child.id;
+      subagentRunsRepo.insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'narrowed-output',
+        scope: 'project',
+        sourcePath: '/fake/narrowed.md',
+        sourceSha256: 'c'.repeat(64),
+        systemPrompt: 'narrowed subagent.',
+        toolsWhitelist: ['bash_output'],
+        budgetMaxSteps: 5,
+        budgetMaxCostUsd: 0.0,
+        effectiveCapabilities: ['read-fs:src/**'],
+        policySnapshot: { defaults: { mode: 'bypass' }, tools: {} },
+      });
+      messagesRepo.appendMessage(db, {
+        sessionId: child.id,
+        role: 'user',
+        content: 'read bg output',
+      });
+    } finally {
+      db.close();
+    }
+
+    const provider: Provider = {
+      id: 'mock/m',
+      family: 'anthropic',
+      capabilities: {
+        tools: 'native',
+        cache: false,
+        vision: false,
+        streaming: true,
+        constrained: 'tools',
+        context_window: 1000,
+        output_max_tokens: 100,
+        cost_per_1k_input: 0,
+        cost_per_1k_output: 0,
+        notes: [],
+      },
+      async *generate(): AsyncGenerator<StreamEvent> {
+        yield { kind: 'start', message_id: 'mock-1' };
+        yield { kind: 'tool_use_start', id: 'tu1', name: 'bash_output' };
+        yield {
+          kind: 'tool_use_stop',
+          id: 'tu1',
+          final_args: { process_id: 'fake-pid' },
+        };
+        yield { kind: 'stop', reason: 'tool_use' };
+      },
+      generateConstrained: () => Promise.reject(new Error('n/a')),
+      countTokens: () => Promise.resolve(0),
+    };
+
+    const exit = await runSubagentChild({
+      sessionId: childId,
+      dbPath,
+      providerOverride: provider,
+      userAgentsDir: null,
+      projectAgentsDir: null,
+      errSink: () => undefined,
+    });
+    expect(exit).toBe(0);
+
+    const db2 = openDb(dbPath);
+    try {
+      const row = db2
+        .query<{ status: string }, [string]>(
+          `SELECT tc.status AS status
+             FROM tool_calls tc
+             JOIN messages m ON tc.message_id = m.id
+            WHERE m.session_id = ? AND tc.tool_name = 'bash_output'`,
+        )
+        .get(childId);
+      expect(row?.status).toBe('denied');
+    } finally {
+      db2.close();
+    }
+  });
+
   test('missing policy snapshot (pre-015 row) falls back to strict defaults', async () => {
     // Backwards-compat: a row inserted before migration 015
     // has policy_snapshot='{}' (the column default). The read

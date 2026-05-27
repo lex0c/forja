@@ -709,7 +709,17 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       isToolSideEffect: (toolName) => {
         const tool = fullRegistry.get(toolName);
         if (tool === null) return false;
-        return tool.metadata.writes === true || tool.metadata.exec === true;
+        // `requiresBgManager` rides along with writes/exec — touching
+        // bg-process lifecycle (read stdout, send signal) IS a side
+        // effect from the envelope's perspective even when the tool's
+        // own metadata says writes:false (bash_output reads stdout of
+        // a previously-spawned process; a narrowed subagent should
+        // not freely consume that stream).
+        return (
+          tool.metadata.writes === true ||
+          tool.metadata.exec === true ||
+          tool.metadata.requiresBgManager === true
+        );
       },
     });
 
