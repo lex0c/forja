@@ -840,6 +840,54 @@ describe('bash resolver — M1 numeric literals flow into args', () => {
   });
 });
 
+// M2 (review): originally flagged as a gap — `isXdgRuntimeSensitive`
+// is a runtime predicate in protected_paths.ts and isn't enumerated
+// in `protectedTargets()`, so I hypothesized that
+// `couldGlobReachProtected` would walk past glob shapes pointed at
+// XDG sockets (`/run/user/<uid>/gnupg/S.gpg-agent`,
+// `/run/user/<uid>/wayland-0`, etc.).
+//
+// Empirical check disproves it: `/run` is in `SYSTEM_DENY_ROOTS` and
+// the glob-prefix check sees `/run/user/...` as a prefix-extension of
+// `/run/` and refuses. Literal (non-glob) XDG sensitive paths are
+// caught by `classifyProtectedPath` via the `/run/user/<uid>` →
+// `isXdgRuntimeSensitive` re-deny path. M2 turned out to be already
+// closed. These tests PIN the closure so a future refactor of either
+// path (e.g., narrowing SYSTEM_DENY_ROOTS to exclude `/run`) would
+// resurface the gap explicitly via a red test.
+describe('bash resolver — M2 XDG/Wayland socket coverage (closure pin)', () => {
+  test.each([
+    'cat /run/user/*/gnupg/S.gpg-agent',
+    'cat /run/user/*/dbus/system_bus_socket',
+    'cat /run/user/1000/g*',
+    'cat /run/u*/1000/gnupg',
+  ])('glob shape %s is refused via /run prefix', (cmd) => {
+    const r = resolveCapabilities('bash', { command: cmd }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test.each([
+    'cat /run/user/1000/gnupg/S.gpg-agent',
+    'cat /run/user/1000/wayland-0',
+    'cat /run/user/1000/bus',
+    'cat /run/user/1000/keyring/control',
+  ])('literal XDG sensitive %s is refused via classifier deny tier', (cmd) => {
+    const r = resolveCapabilities('bash', { command: cmd }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') {
+      expect(r.reason).toContain('protected zone');
+    }
+  });
+
+  test('legitimate XDG_RUNTIME_DIR file (non-socket) is NOT refused', () => {
+    // /run/user/<uid>/myapp/cache is the legitimate carve-out:
+    // operator workflows store per-session app state there. Refusing
+    // would break agent-as-user use cases.
+    const r = resolveCapabilities('bash', { command: 'cat /run/user/1000/myapp/cache' }, CTX);
+    expect(r.kind).toBe('ok');
+  });
+});
+
 // M5 (review): home-relative credential / config dirs in
 // RM_REFUSE_ROOTS-equivalent posture. `rm -rf ~/.ssh` pre-M5
 // only escalated to confirm — same blast radius as `rm -rf /etc`

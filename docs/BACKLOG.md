@@ -22,10 +22,11 @@ Self-review of the bash AST resolver (`src/permissions/resolvers/bash.ts`, 3374 
 
 - **M1 — numeric literals silently dropped from `shape.args`.** Tree-sitter-bash tokenizes integers (`-p 2222`, `-maxdepth 3`, `head -c 100`) as `number` nodes; the walker only accepted `word|string|raw_string|concatenation` in args. Slice 125 history (`ssh -w 0:1` mis-detected as host `0:1`) shows the pattern bit before; future cmd resolvers needing numeric flag values would silently fail. Fix: `literalText` and the walker now accept `number`; ssh's `numericValueFlags` handler updated to consume the next-token (pre-M1 it assumed-and-skipped); tar's `--checkpoint-action` comment updated. End-to-end tests pin `ssh -p 2222 host` → `net-egress:host` (not `2222`).
 
+- **M2 — review claim falsified empirically; behavior pinned via tests.** Original review flagged that `isXdgRuntimeSensitive` is a runtime predicate not enumerated in `protectedTargets()`, hypothesizing globs at `/run/user/*/...` would walk past. Probing showed both paths are already closed: globs hit the prefix check against `/run` (in `SYSTEM_DENY_ROOTS`), and literal XDG sockets hit `classifyProtectedPath` via the deny-tier re-check. Added 9 tests that pin the closure (4 glob shapes refused via /run, 4 literal sockets refused via classifier, 1 carve-out for legitimate XDG_RUNTIME_DIR file). No code change needed.
+
 **Findings (next batch, not on this branch):**
 
 - **H1** — snapshot test of tree-sitter-bash node-kinds against silent grammar rename.
-- **M2** — Wayland/XDG socket coverage in `couldGlobReachProtected` (today `isXdgRuntimeSensitive` is a function, not in `protectedTargets()` → glob `/run/user/*/...` walks past).
 
 ## [2026-05-27] token-efficiency initiative — four code slices + three TODO entries
 
