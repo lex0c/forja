@@ -1743,7 +1743,13 @@ const cmdEnv: CommandResolver = (positional) => {
 // path (mode bits, timestamps, link suffixes, etc.); without
 // consuming them the operand lands as a bogus writeFs target
 // (`mkdir -m 755 dir` → bogus `write-fs:<cwd>/755`).
-const MKDIR_VALUE_FLAGS: ReadonlySet<string> = new Set(['-m', '--mode', '-Z', '--context']);
+// `-Z` and `--context` are NOT here: per `mkdir --help`, `-Z` takes
+// NO operand (sets the default SELinux context); `--context[=CTX]`
+// has an optional value that must use `=`. The next token after
+// either flag is the DIRECTORY operand, not a value to consume —
+// including them would drop the real write target and let policies
+// like `deny: write-fs:/tmp/**` miss `mkdir -Z /tmp/dir`.
+const MKDIR_VALUE_FLAGS: ReadonlySet<string> = new Set(['-m', '--mode']);
 const TOUCH_VALUE_FLAGS: ReadonlySet<string> = new Set([
   '-d',
   '--date',

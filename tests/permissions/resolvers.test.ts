@@ -526,6 +526,42 @@ describe('bash resolver — simple commands', () => {
     }
   });
 
+  test('mkdir -Z /tmp/outside: -Z takes NO value — /tmp/outside IS the target', () => {
+    // Per `mkdir --help`, `-Z` sets the default SELinux context
+    // with no operand; the next token is the DIRECTORY. Pre-fix,
+    // listing -Z in MKDIR_VALUE_FLAGS dropped /tmp/outside and the
+    // resolver emitted only write-fs:<cwd>, letting `deny:
+    // write-fs:/tmp/**` miss the actual creation.
+    const r = resolveCapabilities('bash', { command: 'mkdir -Z /tmp/outside' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/tmp/outside');
+    }
+  });
+
+  test('mkdir --context /tmp/outside: optional value is = only — target preserved', () => {
+    // `--context[=CTX]` per mkdir --help: CTX, when present, uses
+    // `=`. Space-separated next token is the DIRECTORY operand.
+    const r = resolveCapabilities('bash', { command: 'mkdir --context /tmp/outside' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/tmp/outside');
+    }
+  });
+
+  test('mkdir --context=ctxname /tmp/outside: combined form keeps target', () => {
+    // The `=`-combined form already drops via the leading-`-`
+    // rule. Pin that target attribution still surfaces.
+    const r = resolveCapabilities('bash', { command: 'mkdir --context=ctxname /tmp/outside' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/tmp/outside');
+    }
+  });
+
   test('touch -t 202001010000 file: timestamp value is NOT a bogus path', () => {
     const r = resolveCapabilities('bash', { command: 'touch -t 202001010000 file.txt' }, CTX);
     expect(r.kind).toBe('ok');
