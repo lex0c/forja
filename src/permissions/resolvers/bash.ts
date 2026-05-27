@@ -82,21 +82,47 @@ const expandTilde = (path: string, home: string): string => {
 const resolveArg = (path: string, ctx: ResolverContext): string =>
   resolvePath(ctx.cwd, expandTilde(path, ctx.home));
 
+const EMPTY_FLAG_SET: ReadonlySet<string> = new Set();
+
 // POSIX-aware positional extraction: tokens before `--` get the
 // classic "starts-with-`-` is a flag" treatment; `--` itself is
 // consumed; everything after is positional regardless of leading
 // dash (per POSIX utility convention, e.g. `rm -- -rf` deletes a
 // file literally named `-rf`).
-const stripFlags = (tokens: readonly string[]): string[] => {
+//
+// `valueFlags` (optional) lists flags whose NEXT space-separated
+// token is the flag's value rather than a path/positional. Each
+// such next-token is consumed alongside the flag. Per-command
+// resolvers pass their own set: `head -n 5 file` → with
+// `valueFlags={'-n'}` the '5' is consumed and only 'file' survives
+// as a positional. Without the set, '5' would land as a bogus
+// path operand (numeric literals flow into `shape.args` as `number`
+// nodes, then through stripFlags as regular positionals).
+//
+// Combined forms like `--lines=5` are already dropped — they start
+// with `-` and never reach the positional list.
+const stripFlags = (
+  tokens: readonly string[],
+  valueFlags: ReadonlySet<string> = EMPTY_FLAG_SET,
+): string[] => {
   const positional: string[] = [];
   let afterSep = false;
+  let skipNext = false;
   for (const t of tokens) {
+    if (skipNext) {
+      skipNext = false;
+      continue;
+    }
     if (afterSep) {
       positional.push(t);
       continue;
     }
     if (t === '--') {
       afterSep = true;
+      continue;
+    }
+    if (valueFlags.has(t)) {
+      skipNext = true;
       continue;
     }
     if (!t.startsWith('-')) positional.push(t);
@@ -390,6 +416,25 @@ const cmdRead: CommandResolver = (positional, _tokens, ctx) => {
   };
 };
 
+// Variant of cmdRead for utilities that take a numeric value flag
+// (`head -n 5 file`, `tail -c 100 file`). The value would
+// otherwise land in `positional` as a bogus path operand
+// (`read-fs:<cwd>/5`) and trip narrow envelopes or strict policies.
+// Re-strips `tokens` with the flag-value set so we ignore the
+// generic `positional` parameter.
+const READ_WITH_SIZE_VALUE_FLAGS: ReadonlySet<string> = new Set(['-n', '-c', '--lines', '--bytes']);
+
+const cmdReadWithSize: CommandResolver = (_positional, tokens, ctx) => {
+  const positional = stripFlags(tokens, READ_WITH_SIZE_VALUE_FLAGS);
+  if (positional.length === 0) {
+    return { capabilities: [readFs(ctx.cwd)], confidence: 'high' };
+  }
+  return {
+    capabilities: positional.map((p) => readFs(resolveArg(p, ctx))),
+    confidence: 'high',
+  };
+};
+
 // Pure-output writers (echo / printf). They emit their arguments
 // verbatim to stdout — a string like "/etc/passwd" passed to echo
 // is NOT a filesystem read, it's text. No read-fs capability is
@@ -419,7 +464,27 @@ const FIND_EXEC_FLAGS: ReadonlySet<string> = new Set([
   '-okdir',
 ]);
 
-const cmdGrep: CommandResolver = (positional, tokens, ctx) => {
+// grep flags whose next space-separated token is a numeric value
+// (context window size, max-count, etc.). Without consuming them
+// in stripFlags, `grep -A 5 pattern file` would leave '5' in the
+// positional list and cmdGrep would emit a bogus `read-fs:<cwd>/5`.
+// `-f` / `--file` / `--include-from` / `--exclude-from` /
+// `--exclude-dir-from` are NOT here — their explicit decode below
+// already records the file read AND the positional[0]=pattern
+// convention still applies after the leading flag is dropped.
+const GREP_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  '-A',
+  '-B',
+  '-C',
+  '-m',
+  '--after-context',
+  '--before-context',
+  '--context',
+  '--max-count',
+]);
+
+const cmdGrep: CommandResolver = (_positional, tokens, ctx) => {
+  const positional = stripFlags(tokens, GREP_VALUE_FLAGS);
   if (tokens.some((t) => FIND_EXEC_FLAGS.has(t))) {
     return {
       capabilities: [exec('arbitrary'), readFs(ctx.cwd)],
@@ -532,13 +597,59 @@ const cmdGrep: CommandResolver = (positional, tokens, ctx) => {
 // `-delete` is a positional-style filter from find's grammar (not a
 // flag with a value); stripFlags leaves it in the `tokens` array. We
 // scan tokens to detect it.
-const cmdFind: CommandResolver = (positional, tokens, ctx) => {
+// find flags whose next space-separated token is a value (depth
+// limit, time predicate, size, name pattern, type filter, etc.) —
+// NOT a search-root path. Without consuming them in stripFlags,
+// `find . -maxdepth 2 -type f -name foo src` would land `2`, `f`,
+// `foo` as bogus readFs targets alongside the real roots `.` and
+// `src`.
+const FIND_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  // Depth / time / size / numeric predicates
+  '-maxdepth',
+  '-mindepth',
+  '-amin',
+  '-atime',
+  '-cmin',
+  '-ctime',
+  '-mmin',
+  '-mtime',
+  '-size',
+  '-uid',
+  '-gid',
+  '-inum',
+  '-links',
+  // Pattern / type / mode predicates (string values)
+  '-name',
+  '-iname',
+  '-path',
+  '-ipath',
+  '-regex',
+  '-iregex',
+  '-user',
+  '-group',
+  '-perm',
+  '-type',
+  // File-comparison predicates — FILE operand isn't a search path.
+  '-newer',
+  '-anewer',
+  '-cnewer',
+  // -fprint / -fprintf / -fls take a FILE operand. The explicit
+  // decode below also consumes it and emits write-fs; listing here
+  // drops the FILE from the path-positional list.
+  '-fprint',
+  '-fprintf',
+  '-fls',
+  '-printf',
+]);
+
+const cmdFind: CommandResolver = (_positional, tokens, ctx) => {
   if (tokens.some((t) => FIND_EXEC_FLAGS.has(t))) {
     return {
       capabilities: [exec('arbitrary'), readFs(ctx.cwd)],
       confidence: 'medium',
     };
   }
+  const positional = stripFlags(tokens, FIND_VALUE_FLAGS);
   const paths = positional.length === 0 ? [ctx.cwd] : positional.map((p) => resolveArg(p, ctx));
 
   // Slice 174 (review — info-leak P1). find's `-fprint`,
@@ -1431,12 +1542,19 @@ const cmdPip: CommandResolver = (_positional, tokens, ctx) => {
   return { capabilities: caps, confidence: 'medium' };
 };
 
+// `chmod MODE FILE...` / `chown OWNER FILE...` — first positional
+// is MODE (numeric `644` or symbolic `u+x`) or OWNER (`root`,
+// `root:wheel`), not a path. Pre-M1 the numeric mode was dropped
+// by the walker; post-M1 it lands as a positional and would emit a
+// bogus `write-fs:<cwd>/644`. The first positional is also a bogus
+// path for the symbolic-mode case (which pre-dated M1).
 const cmdChmodChown: CommandResolver = (positional, _tokens, ctx) => {
-  if (positional.length === 0) {
-    return { refuse: 'chmod/chown: missing target' };
+  if (positional.length < 2) {
+    return { refuse: 'chmod/chown: needs MODE/OWNER plus at least one target' };
   }
+  const targets = positional.slice(1);
   return {
-    capabilities: positional.map((p) => writeFs(resolveArg(p, ctx))),
+    capabilities: targets.map((p) => writeFs(resolveArg(p, ctx))),
     confidence: 'high',
   };
 };
@@ -2328,8 +2446,8 @@ const cmdCargo: CommandResolver = (positional, tokens, ctx) => {
 const COMMAND_TABLE: ReadonlyMap<string, CommandResolver> = new Map<string, CommandResolver>([
   ['ls', cmdRead],
   ['cat', cmdRead],
-  ['head', cmdRead],
-  ['tail', cmdRead],
+  ['head', cmdReadWithSize],
+  ['tail', cmdReadWithSize],
   ['wc', cmdRead],
   ['file', cmdRead],
   ['stat', cmdRead],

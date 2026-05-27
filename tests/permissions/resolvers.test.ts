@@ -415,12 +415,40 @@ describe('bash resolver — simple commands', () => {
     }
   });
 
-  test('chmod produces write-fs of target', () => {
+  test('chmod produces write-fs of target (mode is NOT a bogus path)', () => {
     const r = resolveCapabilities('bash', { command: 'chmod 755 ./script.sh' }, CTX);
+    expect(r.kind).toBe('ok');
     if (r.kind === 'ok') {
-      const s = capStrings(r.capabilities).sort();
+      const s = capStrings(r.capabilities);
       expect(s).toContain('write-fs:/work/proj/script.sh');
+      // The numeric mode '755' must NOT be classified as a path.
+      expect(s).not.toContain('write-fs:/work/proj/755');
     }
+  });
+
+  test('chmod with symbolic mode also drops the mode token', () => {
+    const r = resolveCapabilities('bash', { command: 'chmod u+x script.sh' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/work/proj/script.sh');
+      expect(s).not.toContain('write-fs:/work/proj/u+x');
+    }
+  });
+
+  test('chown drops the OWNER token from path attribution', () => {
+    const r = resolveCapabilities('bash', { command: 'chown root file.conf' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/work/proj/file.conf');
+      expect(s).not.toContain('write-fs:/work/proj/root');
+    }
+  });
+
+  test('chmod with only MODE (no target) is refused', () => {
+    const r = resolveCapabilities('bash', { command: 'chmod 755' }, CTX);
+    expect(r.kind).toBe('refuse');
   });
 });
 
@@ -798,19 +826,18 @@ describe('bash resolver — numeric literals flow into args', () => {
     expect(['ok', 'refuse']).toContain(r.kind);
   });
 
-  test('find . -maxdepth 3 -name foo runs (numeric flows through positionals)', () => {
-    // shape.args = ['.', '-maxdepth', '3', '-name', 'foo']. stripFlags
-    // removes '-maxdepth' and '-name'; positional = ['.', '3', 'foo'].
-    // cmdFind treats positionals as filesystem paths, so '3' becomes
-    // a readFs target. Known limitation (find's flag schema isn't
-    // fully modeled) but the over-attribute is conservative:
-    // read-fs:/work/proj/3 is harmless since the file doesn't exist
-    // and the kernel returns ENOENT.
+  test('find . -maxdepth 3 -name foo: numeric depth + name pattern are NOT bogus paths', () => {
+    // shape.args = ['.', '-maxdepth', '3', '-name', 'foo']. With
+    // FIND_VALUE_FLAGS, the '3' value of -maxdepth and the 'foo'
+    // value of -name are both consumed alongside their flags; only
+    // '.' (the real search root) survives as a path positional.
     const r = resolveCapabilities('bash', { command: 'find . -maxdepth 3 -name foo' }, CTX);
     expect(r.kind).toBe('ok');
     if (r.kind === 'ok') {
-      const hasRead = capStrings(r.capabilities).some((c) => c.startsWith('read-fs:'));
-      expect(hasRead).toBe(true);
+      const reads = capStrings(r.capabilities).filter((c) => c.startsWith('read-fs:'));
+      expect(reads).toContain('read-fs:/work/proj');
+      expect(reads).not.toContain('read-fs:/work/proj/3');
+      expect(reads).not.toContain('read-fs:/work/proj/foo');
     }
   });
 
@@ -822,6 +849,75 @@ describe('bash resolver — numeric literals flow into args', () => {
     if (r.kind === 'ok') {
       const reads = capStrings(r.capabilities).filter((c) => c.startsWith('read-fs:'));
       expect(reads.length).toBeGreaterThan(0);
+    }
+  });
+
+  // The generic walker promotes every `number` AST node into
+  // `shape.args`, so commands with numeric flag values (`head -n 5
+  // README.md`, `tail -c 100 app.log`, `find -maxdepth 2 src`,
+  // `grep -A 5 pattern file`) used to emit bogus
+  // `read-fs:<cwd>/5` / `<cwd>/2` capabilities alongside the real
+  // path. In narrowed subagent envelopes or strict policies that
+  // tripped unnecessary denies / confirms. The per-command flag-
+  // value consumption below scopes the fix to commands whose flag
+  // schema explicitly takes a numeric (or short string) operand.
+  test('head -n 5 README.md: numeric -n value is NOT a bogus path', () => {
+    const r = resolveCapabilities('bash', { command: 'head -n 5 README.md' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const reads = capStrings(r.capabilities).filter((c) => c.startsWith('read-fs:'));
+      expect(reads).toContain('read-fs:/work/proj/README.md');
+      expect(reads).not.toContain('read-fs:/work/proj/5');
+    }
+  });
+
+  test('tail -c 100 app.log: numeric -c value is NOT a bogus path', () => {
+    const r = resolveCapabilities('bash', { command: 'tail -c 100 app.log' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const reads = capStrings(r.capabilities).filter((c) => c.startsWith('read-fs:'));
+      expect(reads).toContain('read-fs:/work/proj/app.log');
+      expect(reads).not.toContain('read-fs:/work/proj/100');
+    }
+  });
+
+  test('grep -A 5 pattern file: numeric context value is NOT a bogus path', () => {
+    const r = resolveCapabilities('bash', { command: 'grep -A 5 pattern file' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const reads = capStrings(r.capabilities).filter((c) => c.startsWith('read-fs:'));
+      expect(reads).toContain('read-fs:/work/proj/file');
+      expect(reads).not.toContain('read-fs:/work/proj/5');
+    }
+  });
+
+  test('long-form flags also consume their value (head --lines 5 file)', () => {
+    const r = resolveCapabilities('bash', { command: 'head --lines 5 file' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const reads = capStrings(r.capabilities).filter((c) => c.startsWith('read-fs:'));
+      expect(reads).toContain('read-fs:/work/proj/file');
+      expect(reads).not.toContain('read-fs:/work/proj/5');
+    }
+  });
+
+  test('find with multiple roots + value flags: only real roots in positional', () => {
+    // `find src tests -type f -maxdepth 2 -name '*.ts'` — two
+    // search roots; -type, -maxdepth, -name each consume a value
+    // that must NOT leak as a path.
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'find src tests -type f -maxdepth 2 -name foo' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const reads = capStrings(r.capabilities).filter((c) => c.startsWith('read-fs:'));
+      expect(reads).toContain('read-fs:/work/proj/src');
+      expect(reads).toContain('read-fs:/work/proj/tests');
+      expect(reads).not.toContain('read-fs:/work/proj/f');
+      expect(reads).not.toContain('read-fs:/work/proj/2');
+      expect(reads).not.toContain('read-fs:/work/proj/foo');
     }
   });
 });
