@@ -2564,6 +2564,65 @@ const cmdRsync: CommandResolver = (_positional, tokens, ctx) => {
     }
   }
 
+  // Side-effect paths that RSYNC_VALUE_FLAGS drops from the
+  // positional list (so they don't leak as bogus sources) but that
+  // still need to surface as capabilities. Without an explicit
+  // decode here, a policy gating these paths can be bypassed.
+  //
+  //   Writes:
+  //     --log-file FILE           log written during transfer
+  //     --write-batch FILE        batch dump written
+  //     --only-write-batch FILE   alternate batch dump
+  //     --temp-dir DIR / -T DIR   temp files staged in DIR
+  //     --partial-dir DIR         partial transfers saved in DIR
+  //
+  //   Reads:
+  //     --read-batch FILE         batch dump consumed
+  //     --compare-dest DIR        comparison source
+  //     --copy-dest DIR           comparison + copy fallback
+  //     --link-dest DIR           hardlink source
+  //
+  // Each flag accepts both `--flag=VALUE` (combined) and `--flag
+  // VALUE` (space-separated) forms.
+  const WRITE_FILE_FLAGS: ReadonlySet<string> = new Set([
+    '--log-file',
+    '--write-batch',
+    '--only-write-batch',
+    '--temp-dir',
+    '-T',
+    '--partial-dir',
+  ]);
+  const READ_FILE_FLAGS: ReadonlySet<string> = new Set([
+    '--read-batch',
+    '--compare-dest',
+    '--copy-dest',
+    '--link-dest',
+  ]);
+  const flagWrites: string[] = [];
+  const flagReads: string[] = [];
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i] ?? '';
+    const eqIdx = t.indexOf('=');
+    if (t.startsWith('--') && eqIdx !== -1) {
+      const flag = t.slice(0, eqIdx);
+      const v = t.slice(eqIdx + 1);
+      if (v.length > 0) {
+        if (WRITE_FILE_FLAGS.has(flag)) flagWrites.push(v);
+        else if (READ_FILE_FLAGS.has(flag)) flagReads.push(v);
+      }
+      continue;
+    }
+    if (WRITE_FILE_FLAGS.has(t)) {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) flagWrites.push(next);
+      continue;
+    }
+    if (READ_FILE_FLAGS.has(t)) {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) flagReads.push(next);
+    }
+  }
+
   const dest = positional[positional.length - 1] as string;
   const sources = positional.slice(0, -1);
   const anyRemote = isRemote(dest) || sources.some(isRemote);
@@ -2571,9 +2630,9 @@ const cmdRsync: CommandResolver = (_positional, tokens, ctx) => {
   const caps: Capability[] = [];
   if (anyRemote) caps.push(readFs(resolveArg('~/.ssh', ctx)));
   if (passwordFile !== null) caps.push(readFs(resolveArg(passwordFile, ctx)));
-  // Slice 179: manifest reads from --files-from / --exclude-from /
-  // --include-from. Each file is read once at rsync startup.
   for (const p of manifestFileReads) caps.push(readFs(resolveArg(p, ctx)));
+  for (const p of flagWrites) caps.push(writeFs(resolveArg(p, ctx)));
+  for (const p of flagReads) caps.push(readFs(resolveArg(p, ctx)));
 
   if (isRemote(dest)) {
     caps.push(netEgress(extractHost(dest)));

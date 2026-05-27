@@ -737,14 +737,120 @@ describe('bash resolver — simple commands', () => {
     }
   });
 
-  test('rsync --compare-dest /backup src dst: comparison dir not a bogus source', () => {
+  test('rsync --compare-dest /backup src dst: comparison dir surfaces as read', () => {
+    // rsync reads /backup as additional comparison source. Pre-fix
+    // the FILE was dropped by RSYNC_VALUE_FLAGS but never re-emitted
+    // — a `deny: read-fs:/backup/**` would miss the access.
     const r = resolveCapabilities('bash', { command: 'rsync --compare-dest /backup src dst' }, CTX);
     expect(r.kind).toBe('ok');
     if (r.kind === 'ok') {
       const s = capStrings(r.capabilities);
       expect(s).toContain('read-fs:/work/proj/src');
       expect(s).toContain('write-fs:/work/proj/dst');
-      expect(s).not.toContain('read-fs:/backup');
+      expect(s).toContain('read-fs:/backup');
+    }
+  });
+
+  test('rsync --copy-dest /backup src dst: copy fallback dir surfaces as read', () => {
+    const r = resolveCapabilities('bash', { command: 'rsync --copy-dest /backup src dst' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/backup');
+    }
+  });
+
+  test('rsync --link-dest /backup src dst: hardlink source dir surfaces as read', () => {
+    const r = resolveCapabilities('bash', { command: 'rsync --link-dest /backup src dst' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/backup');
+    }
+  });
+
+  test('rsync --temp-dir /var/tmp src dst: temp staging dir surfaces as write', () => {
+    const r = resolveCapabilities('bash', { command: 'rsync --temp-dir /var/tmp src dst' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/var/tmp');
+    }
+  });
+
+  test('rsync -T /var/tmp src dst: -T short form for --temp-dir', () => {
+    const r = resolveCapabilities('bash', { command: 'rsync -T /var/tmp src dst' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/var/tmp');
+    }
+  });
+
+  test('rsync --partial-dir /tmp/partial src dst: partial-transfer dir surfaces as write', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'rsync --partial-dir /tmp/partial src dst' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/tmp/partial');
+    }
+  });
+
+  test('rsync --log-file /tmp/log src dst: log file surfaces as write', () => {
+    // `--log-file FILE` creates a log at FILE. Without explicit
+    // decode, FILE was consumed by RSYNC_VALUE_FLAGS but never
+    // re-emitted — a `deny: write-fs:/tmp/**` policy would miss
+    // the log creation.
+    const r = resolveCapabilities('bash', { command: 'rsync --log-file /tmp/log src dst' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/tmp/log');
+      expect(s).toContain('read-fs:/work/proj/src');
+      expect(s).toContain('write-fs:/work/proj/dst');
+    }
+  });
+
+  test('rsync --log-file=/tmp/log src dst: combined form emits write', () => {
+    const r = resolveCapabilities('bash', { command: 'rsync --log-file=/tmp/log src dst' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/tmp/log');
+    }
+  });
+
+  test('rsync --write-batch /tmp/batch src dst: batch dump surfaces as write', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'rsync --write-batch /tmp/batch src dst' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/tmp/batch');
+    }
+  });
+
+  test('rsync --only-write-batch /tmp/batch src dst: alternate batch flag', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'rsync --only-write-batch /tmp/batch src dst' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/tmp/batch');
+    }
+  });
+
+  test('rsync --read-batch /tmp/batch src dst: batch input surfaces as read', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'rsync --read-batch /tmp/batch src dst' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/tmp/batch');
     }
   });
 });
