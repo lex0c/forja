@@ -94,8 +94,12 @@ export const bashFuzzTarget: FuzzTarget<BashFuzzInput> = {
     }
     // ResolverContext.home is unused by the bash resolver's
     // capability emission (paths come from positional args), but
-    // the interface requires it. Use realistic-looking defaults.
-    const ctx = { cwd: '/work/proj', home: '/home/op' };
+    // the interface requires it. `suppressDegradeWarnings` keeps
+    // the warn-once stderr message out of fuzz-loop output — the
+    // target deliberately omits realpath/readlink because the
+    // structural invariants it pins don't need symlink-aware
+    // classification.
+    const ctx = { cwd: '/work/proj', home: '/home/op', suppressDegradeWarnings: true };
     const result = resolver({ command: input.command }, ctx);
 
     if (result.kind !== 'ok' && result.kind !== 'conservative' && result.kind !== 'refuse') {

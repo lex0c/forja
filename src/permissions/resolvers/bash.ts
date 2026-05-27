@@ -82,15 +82,37 @@ const expandTilde = (path: string, home: string): string => {
 const resolveArg = (path: string, ctx: ResolverContext): string =>
   resolvePath(ctx.cwd, expandTilde(path, ctx.home));
 
+const EMPTY_FLAG_SET: ReadonlySet<string> = new Set();
+
 // POSIX-aware positional extraction: tokens before `--` get the
 // classic "starts-with-`-` is a flag" treatment; `--` itself is
 // consumed; everything after is positional regardless of leading
 // dash (per POSIX utility convention, e.g. `rm -- -rf` deletes a
 // file literally named `-rf`).
-const stripFlags = (tokens: readonly string[]): string[] => {
+//
+// `valueFlags` (optional) lists flags whose NEXT space-separated
+// token is the flag's value rather than a path/positional. Each
+// such next-token is consumed alongside the flag. Per-command
+// resolvers pass their own set: `head -n 5 file` → with
+// `valueFlags={'-n'}` the '5' is consumed and only 'file' survives
+// as a positional. Without the set, '5' would land as a bogus
+// path operand (numeric literals flow into `shape.args` as `number`
+// nodes, then through stripFlags as regular positionals).
+//
+// Combined forms like `--lines=5` are already dropped — they start
+// with `-` and never reach the positional list.
+const stripFlags = (
+  tokens: readonly string[],
+  valueFlags: ReadonlySet<string> = EMPTY_FLAG_SET,
+): string[] => {
   const positional: string[] = [];
   let afterSep = false;
+  let skipNext = false;
   for (const t of tokens) {
+    if (skipNext) {
+      skipNext = false;
+      continue;
+    }
     if (afterSep) {
       positional.push(t);
       continue;
@@ -99,9 +121,87 @@ const stripFlags = (tokens: readonly string[]): string[] => {
       afterSep = true;
       continue;
     }
+    if (valueFlags.has(t)) {
+      skipNext = true;
+      continue;
+    }
     if (!t.startsWith('-')) positional.push(t);
   }
   return positional;
+};
+
+// Extract values for a "value-flag" — a flag whose operand follows
+// the flag itself. Covers all four shapes POSIX getopt + GNU
+// coreutils accept:
+//
+//   long combined:    --foo=VAL
+//   long spaced:      --foo VAL
+//   short spaced:     -f VAL
+//   short attached:   -fVAL              (only single-letter short)
+//
+// Returns ALL values found across the token stream.
+//
+// `shortForm` must be a single-letter flag (length 2 including the
+// leading dash) for the attached branch to fire. Multi-letter
+// "short" options used by find (`-newer`, `-maxdepth`) don't use
+// attached form in coreutils; pass them via `longForm` only.
+//
+// `optionalValue: true` models the GNU `--foo[=VAL]` shape — the
+// value is consumable ONLY via `=` (combined long) or attached
+// short (`-fVAL`). Spaced forms (`--foo VAL` / `-f VAL`) leave VAL
+// as a positional, matching getopt's optional-argument semantics
+// (e.g., `mktemp --tmpdir tmpXXX` — `tmpXXX` is the TEMPLATE, NOT
+// the tmpdir). Required-argument flags (the default) accept all
+// four shapes.
+const extractValueFlag = (
+  tokens: readonly string[],
+  spec: {
+    readonly longForm?: string;
+    readonly shortForm?: string;
+    readonly optionalValue?: boolean;
+  },
+): string[] => {
+  const optional = spec.optionalValue === true;
+  const out: string[] = [];
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i] ?? '';
+    if (spec.longForm !== undefined) {
+      const combinedPrefix = `${spec.longForm}=`;
+      if (t.startsWith(combinedPrefix)) {
+        const v = t.slice(combinedPrefix.length);
+        if (v.length > 0) out.push(v);
+        continue;
+      }
+      if (t === spec.longForm) {
+        if (optional) continue;
+        const next = tokens[i + 1];
+        if (next !== undefined && !next.startsWith('-')) out.push(next);
+        continue;
+      }
+    }
+    if (spec.shortForm !== undefined) {
+      if (t === spec.shortForm) {
+        if (optional) continue;
+        const next = tokens[i + 1];
+        if (next !== undefined && !next.startsWith('-')) out.push(next);
+        continue;
+      }
+      // Attached form — only single-letter shorts. Always honored
+      // even when optionalValue=true (attached IS how getopt
+      // expresses optional values for short options).
+      if (
+        spec.shortForm.length === 2 &&
+        t.startsWith(spec.shortForm) &&
+        t.length > spec.shortForm.length
+      ) {
+        const rest = t.slice(spec.shortForm.length);
+        // POSIX getopt doesn't recognize `=` after short form, but
+        // some wrappers emit it; tolerate by stripping a leading `=`.
+        out.push(rest.startsWith('=') ? rest.slice(1) : rest);
+      }
+    }
+  }
+  return out;
 };
 
 // ─── Whitelist + red-flag node types (§9.1, §3.5) ──────────
@@ -169,9 +269,7 @@ const RED_FLAG_NODES: ReadonlyMap<string, string> = new Map([
     'variable_assignment prefix (PATH=/tmp cmd): can override binary resolution',
   ],
   ['subscript', 'array_subscript: indexed/associative array access'],
-  ['regex', 'regex_match (=~): runtime evaluation'],
   ['ansi_c_string', "ansi_c_string ($'...'): escape semantics not modeled"],
-  ['translated_string', 'translated_string ($"..."): locale-dependent'],
   ['heredoc_redirect', 'heredoc_redirect (<<DELIM): body interpretation not modeled'],
   ['herestring_redirect', 'herestring_redirect (<<<): body interpretation not modeled'],
   ['if_statement', 'if_statement: control flow not modeled'],
@@ -183,20 +281,18 @@ const RED_FLAG_NODES: ReadonlyMap<string, string> = new Map([
   ['negated_command', 'negated_command (!cmd): control flow not modeled'],
   ['test_command', 'test_command ([[ ]]): conditional context'],
   ['test_operator', 'test_operator: conditional context'],
-  // Slice 178 (review — P2 defense in depth). Three node shapes
-  // that pre-slice walked past the analyzer's whitelist check
-  // without a direct refuse mapping. Adding them here closes the
-  // window: any AST containing one of these now hits the
-  // RED_FLAG_NODES refuse path with a specific diagnostic instead
-  // of falling through to `unsupported_shape` (which is correct
-  // but less specific). Defense in depth — the
-  // WHITELIST_NODE_TYPES check is the primary gate.
-  ['array_assignment', 'array_assignment (arr=(a b c)): runtime list expansion'],
-  [
-    'coproc_statement',
-    'coproc_statement (coproc cmd): background coprocess with bidirectional pipes',
-  ],
-  ['last_pipe', 'last_pipe (|& or pipefail-shape): error-propagation semantics not modeled'],
+  // Note: tree-sitter-bash@0.25.1 does NOT emit distinct node-kinds
+  // for several shapes that look like they'd warrant their own
+  // entry — defenses for those route through alternate paths:
+  //   - `=~` regex match → `binary_expression` inside `test_command`
+  //   - `$"..."` translated string → regular `string` walker
+  //   - `arr=(a b c)` → `variable_assignment` + `array` child
+  //   - `coproc cmd` → regular `command` with `coproc` as name
+  //     (falls through to `unknown_command` refuse)
+  //   - `|&` last-pipe → anonymous operator token inside `pipeline`
+  //     (caught by `detectPipeToShell` when the threat shape applies)
+  // The grammar-drift snapshot suite surfaces any future kind a
+  // version bump introduces.
 ]);
 
 // Hard refuses by command name. §13 reject list from
@@ -234,6 +330,18 @@ const HARD_REFUSE_COMMANDS: ReadonlySet<string> = new Set([
   // table.
   'command',
   'builtin',
+  // Shell-as-command (e.g., `bash script.sh`, `sh -c ...`). Same
+  // threat shape as `eval`: inner shell runs anything, static
+  // capability resolution impossible. SHELL_INTERPRETERS already
+  // catches `... | sh` (pipe-to-shell); this catches the direct-
+  // spawn shape with a stable refusal reason aligned with
+  // `eval`/`source`/`command`/`builtin`.
+  'bash',
+  'sh',
+  'zsh',
+  'dash',
+  'ksh',
+  'fish',
   // Slice 180 (review — HARD_REFUSE gap). Six families added; each
   // shares the rationale of `eval` / `dd` / `mkfs.*`: there's no
   // safe way the static resolver can shape these into a typed
@@ -382,6 +490,25 @@ const cmdRead: CommandResolver = (positional, _tokens, ctx) => {
   };
 };
 
+// Variant of cmdRead for utilities that take a numeric value flag
+// (`head -n 5 file`, `tail -c 100 file`). The value would
+// otherwise land in `positional` as a bogus path operand
+// (`read-fs:<cwd>/5`) and trip narrow envelopes or strict policies.
+// Re-strips `tokens` with the flag-value set so we ignore the
+// generic `positional` parameter.
+const READ_WITH_SIZE_VALUE_FLAGS: ReadonlySet<string> = new Set(['-n', '-c', '--lines', '--bytes']);
+
+const cmdReadWithSize: CommandResolver = (_positional, tokens, ctx) => {
+  const positional = stripFlags(tokens, READ_WITH_SIZE_VALUE_FLAGS);
+  if (positional.length === 0) {
+    return { capabilities: [readFs(ctx.cwd)], confidence: 'high' };
+  }
+  return {
+    capabilities: positional.map((p) => readFs(resolveArg(p, ctx))),
+    confidence: 'high',
+  };
+};
+
 // Pure-output writers (echo / printf). They emit their arguments
 // verbatim to stdout — a string like "/etc/passwd" passed to echo
 // is NOT a filesystem read, it's text. No read-fs capability is
@@ -411,7 +538,27 @@ const FIND_EXEC_FLAGS: ReadonlySet<string> = new Set([
   '-okdir',
 ]);
 
-const cmdGrep: CommandResolver = (positional, tokens, ctx) => {
+// grep flags whose next space-separated token is a numeric value
+// (context window size, max-count, etc.). Without consuming them
+// in stripFlags, `grep -A 5 pattern file` would leave '5' in the
+// positional list and cmdGrep would emit a bogus `read-fs:<cwd>/5`.
+// `-f` / `--file` / `--include-from` / `--exclude-from` /
+// `--exclude-dir-from` are NOT here — their explicit decode below
+// already records the file read AND the positional[0]=pattern
+// convention still applies after the leading flag is dropped.
+const GREP_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  '-A',
+  '-B',
+  '-C',
+  '-m',
+  '--after-context',
+  '--before-context',
+  '--context',
+  '--max-count',
+]);
+
+const cmdGrep: CommandResolver = (_positional, tokens, ctx) => {
+  const positional = stripFlags(tokens, GREP_VALUE_FLAGS);
   if (tokens.some((t) => FIND_EXEC_FLAGS.has(t))) {
     return {
       capabilities: [exec('arbitrary'), readFs(ctx.cwd)],
@@ -436,57 +583,19 @@ const cmdGrep: CommandResolver = (positional, tokens, ctx) => {
   //   --file=<file>      (long with equals)
   //   --file <file>      (long with space — not standard POSIX but
   //                       GNU grep accepts it)
-  // `-f -` reads patterns from stdin; not a file read.
+  // `-f -` reads patterns from stdin (not a file read); filtered
+  // below. Slice 179 added --include-from / --exclude-from /
+  // --exclude-dir-from to the same defense.
+  const GREP_FILE_PATH_SPECS: readonly { longForm: string; shortForm?: string }[] = [
+    { longForm: '--file', shortForm: '-f' },
+    { longForm: '--include-from' },
+    { longForm: '--exclude-from' },
+    { longForm: '--exclude-dir-from' },
+  ];
   const patternFileReads: string[] = [];
-  for (let i = 0; i < tokens.length; i += 1) {
-    const t = tokens[i] ?? '';
-    if (t === '-f' || t === '--file') {
-      const next = tokens[i + 1];
-      if (next !== undefined && next !== '-' && !next.startsWith('-')) {
-        patternFileReads.push(resolveArg(next, ctx));
-        i += 1;
-      }
-      continue;
-    }
-    if (t.startsWith('--file=')) {
-      const target = t.slice('--file='.length);
-      if (target.length > 0 && target !== '-') {
-        patternFileReads.push(resolveArg(target, ctx));
-      }
-      continue;
-    }
-    if (t.startsWith('-f') && t.length > 2 && !t.startsWith('--')) {
-      const target = t.slice(2);
-      if (target.length > 0 && target !== '-') {
-        patternFileReads.push(resolveArg(target, ctx));
-      }
-      continue;
-    }
-    // Slice 179 (review — permission-bypass P1). GNU grep also
-    // reads pattern lists from `--include-from` / `--exclude-from`
-    // / `--exclude-dir-from` — same threat shape as `-f`: an
-    // adversarial `grep --include-from /etc/shadow -r ./src`
-    // walked past `deny: read-fs:/etc/**` because the resolver
-    // didn't emit a read on the file. Mirror slice 174's `-f`
-    // decoding for these three flags.
-    if (t === '--include-from' || t === '--exclude-from' || t === '--exclude-dir-from') {
-      const next = tokens[i + 1];
-      if (next !== undefined && next !== '-' && !next.startsWith('-')) {
-        patternFileReads.push(resolveArg(next, ctx));
-        i += 1;
-      }
-      continue;
-    }
-    if (
-      t.startsWith('--include-from=') ||
-      t.startsWith('--exclude-from=') ||
-      t.startsWith('--exclude-dir-from=')
-    ) {
-      const eqIdx = t.indexOf('=');
-      const target = t.slice(eqIdx + 1);
-      if (target.length > 0 && target !== '-') {
-        patternFileReads.push(resolveArg(target, ctx));
-      }
+  for (const spec of GREP_FILE_PATH_SPECS) {
+    for (const v of extractValueFlag(tokens, spec)) {
+      if (v !== '-') patternFileReads.push(resolveArg(v, ctx));
     }
   }
 
@@ -524,13 +633,59 @@ const cmdGrep: CommandResolver = (positional, tokens, ctx) => {
 // `-delete` is a positional-style filter from find's grammar (not a
 // flag with a value); stripFlags leaves it in the `tokens` array. We
 // scan tokens to detect it.
-const cmdFind: CommandResolver = (positional, tokens, ctx) => {
+// find flags whose next space-separated token is a value (depth
+// limit, time predicate, size, name pattern, type filter, etc.) —
+// NOT a search-root path. Without consuming them in stripFlags,
+// `find . -maxdepth 2 -type f -name foo src` would land `2`, `f`,
+// `foo` as bogus readFs targets alongside the real roots `.` and
+// `src`.
+const FIND_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  // Depth / time / size / numeric predicates
+  '-maxdepth',
+  '-mindepth',
+  '-amin',
+  '-atime',
+  '-cmin',
+  '-ctime',
+  '-mmin',
+  '-mtime',
+  '-size',
+  '-uid',
+  '-gid',
+  '-inum',
+  '-links',
+  // Pattern / type / mode predicates (string values)
+  '-name',
+  '-iname',
+  '-path',
+  '-ipath',
+  '-regex',
+  '-iregex',
+  '-user',
+  '-group',
+  '-perm',
+  '-type',
+  // File-comparison predicates — FILE operand isn't a search path.
+  '-newer',
+  '-anewer',
+  '-cnewer',
+  // -fprint / -fprintf / -fls take a FILE operand. The explicit
+  // decode below also consumes it and emits write-fs; listing here
+  // drops the FILE from the path-positional list.
+  '-fprint',
+  '-fprintf',
+  '-fls',
+  '-printf',
+]);
+
+const cmdFind: CommandResolver = (_positional, tokens, ctx) => {
   if (tokens.some((t) => FIND_EXEC_FLAGS.has(t))) {
     return {
       capabilities: [exec('arbitrary'), readFs(ctx.cwd)],
       confidence: 'medium',
     };
   }
+  const positional = stripFlags(tokens, FIND_VALUE_FLAGS);
   const paths = positional.length === 0 ? [ctx.cwd] : positional.map((p) => resolveArg(p, ctx));
 
   // Slice 174 (review — info-leak P1). find's `-fprint`,
@@ -552,15 +707,21 @@ const cmdFind: CommandResolver = (positional, tokens, ctx) => {
   // path) and is deliberately NOT classified as a read. find's
   // `-print` / `-printf` / `-ls` (no `f` prefix) write to stdout,
   // not a file — not decoded.
-  const fprintFlags: ReadonlySet<string> = new Set(['-fprint', '-fprintf', '-fls']);
+  // find's `-foo VALUE` predicates use a single-dash "long" form
+  // with space-separated value; no attached / `=` shape is
+  // accepted by GNU find. Pass via longForm only.
+  const FIND_WRITE_PATH_FLAGS: readonly string[] = ['-fprint', '-fprintf', '-fls'];
+  const FIND_READ_PATH_FLAGS: readonly string[] = ['-newer', '-anewer', '-cnewer'];
   const writeTargets: string[] = [];
-  for (let i = 0; i < tokens.length; i += 1) {
-    const t = tokens[i] ?? '';
-    if (fprintFlags.has(t)) {
-      const next = tokens[i + 1];
-      if (next !== undefined && next.length > 0 && !next.startsWith('-')) {
-        writeTargets.push(resolveArg(next, ctx));
-      }
+  const comparisonReadTargets: string[] = [];
+  for (const flag of FIND_WRITE_PATH_FLAGS) {
+    for (const v of extractValueFlag(tokens, { longForm: flag })) {
+      writeTargets.push(resolveArg(v, ctx));
+    }
+  }
+  for (const flag of FIND_READ_PATH_FLAGS) {
+    for (const v of extractValueFlag(tokens, { longForm: flag })) {
+      comparisonReadTargets.push(resolveArg(v, ctx));
     }
   }
 
@@ -585,12 +746,17 @@ const cmdFind: CommandResolver = (positional, tokens, ctx) => {
         ...paths.map((p) => readFs(p)),
         ...paths.map((p) => deleteFs(p)),
         ...writeTargets.map((p) => writeFs(p)),
+        ...comparisonReadTargets.map((p) => readFs(p)),
       ],
       confidence: 'high',
     };
   }
   return {
-    capabilities: [...paths.map((p) => readFs(p)), ...writeTargets.map((p) => writeFs(p))],
+    capabilities: [
+      ...paths.map((p) => readFs(p)),
+      ...writeTargets.map((p) => writeFs(p)),
+      ...comparisonReadTargets.map((p) => readFs(p)),
+    ],
     confidence: 'high',
   };
 };
@@ -659,6 +825,48 @@ const RM_REFUSE_ROOTS: ReadonlySet<string> = new Set([
   '/private',
 ]);
 
+// Home-relative roots whose ENTIRE-DIRECTORY deletion is
+// catastrophic — credential / config trees that mirror the
+// posture of RM_REFUSE_ROOTS on the system side. `rm -rf /etc` and
+// `rm -rf ~/.ssh` have the same blast radius (operator
+// credentials destroyed); both must refuse at the resolver.
+// Subpaths (`~/.ssh/old_id_rsa`) still route through the regular
+// escalate tier in `classifyProtectedPath`; only `rm` against the
+// ROOT itself hits this list. Resolved against `ctx.home` at
+// check time so per-user paths (`/home/alice/.ssh`,
+// `/Users/bob/.ssh`) all hit the same rule.
+//
+// Known gap: the resolved set is anchored on `ctx.home`, so
+// `rm -rf /home/OTHER_USER/.ssh` does NOT match this rule.
+// `/home/OTHER_USER` is also not in RM_REFUSE_ROOTS (only `/home`
+// root is), and `classifyProtectedPath` resolves tildeEscalateDirs
+// against `ctx.home` too. Net: the call resolves to a normal
+// `delete-fs` capability and falls to operator policy.
+// Hard-refusing every absolute path under `/home/*` would break
+// legitimate sysadmin cleanup workflows.
+//
+// Coverage:
+//   .ssh           — SSH private keys + authorized_keys
+//   .gnupg         — GPG private keys + keyrings
+//   .aws           — AWS credentials + config (long-lived API keys)
+//   .kube          — Kubernetes cluster configs + tokens
+//   .config        — Operator's app config root (XDG_CONFIG_HOME default)
+//   .local         — XDG_DATA_HOME default; agent data, shell history
+//   .docker        — Docker config + credsStore registry auth
+//
+// Out of scope: `~/Documents`, `~/Desktop`, etc. — user data dirs
+// whose deletion is destructive but operator-recoverable. Operator
+// who wants `rm ~/Documents` can confirm via the modal.
+const RM_REFUSE_HOME_DIRS: readonly string[] = [
+  '.ssh',
+  '.gnupg',
+  '.aws',
+  '.kube',
+  '.config',
+  '.local',
+  '.docker',
+];
+
 const cmdRm: CommandResolver = (positional, _tokens, ctx) => {
   if (positional.length === 0) {
     return { refuse: 'rm: missing target' };
@@ -668,6 +876,9 @@ const cmdRm: CommandResolver = (positional, _tokens, ctx) => {
   // attributed to the resolver (forensically traceable to a
   // specific spec line) rather than to a downstream policy check
   // that could be misconfigured away.
+  const refusedHomeDirs = new Set<string>(
+    ctx.home !== '' ? RM_REFUSE_HOME_DIRS.map((rel) => resolvePath(ctx.home, rel)) : [],
+  );
   for (const arg of positional) {
     const resolved = resolveArg(arg, ctx);
     if (RM_REFUSE_ROOTS.has(resolved)) {
@@ -682,6 +893,14 @@ const cmdRm: CommandResolver = (positional, _tokens, ctx) => {
         refuse: `rm: refuse to delete operator home '${resolved}' (hardcoded blocklist; spec §5.2)`,
       };
     }
+    // Home-relative credential / config dirs. Root-of-dir
+    // deletion only; subpaths route through the regular escalate
+    // tier via classifyProtectedPath.
+    if (refusedHomeDirs.has(resolved)) {
+      return {
+        refuse: `rm: refuse to delete operator credential/config dir '${resolved}' (hardcoded blocklist)`,
+      };
+    }
   }
   return {
     capabilities: positional.map((p) => deleteFs(resolveArg(p, ctx))),
@@ -692,20 +911,15 @@ const cmdRm: CommandResolver = (positional, _tokens, ctx) => {
 const cmdMvCp: CommandResolver = (positional, tokens, ctx) => {
   // Slice 125 (R2 P1): GNU `-t <dir>` / `--target-directory=<dir>`
   // inverts the positional shape. `mv -t /etc src1 src2` makes
-  // `/etc` the destination and `src1`, `src2` the sources. Pre-
-  // slice cmdMvCp treated `src2` as dest (wrong shape; protected-
-  // path classifier still fired on `/etc` via the per-arg loop,
-  // but the emitted write-fs scope was wrong).
-  let targetDir: string | null = null;
-  for (let i = 0; i < tokens.length; i += 1) {
-    const t = tokens[i] ?? '';
-    if (t.startsWith('--target-directory=')) {
-      targetDir = t.slice('--target-directory='.length);
-    } else if (t === '--target-directory' || t === '-t') {
-      const next = tokens[i + 1];
-      if (next !== undefined && !next.startsWith('-')) targetDir = next;
-    }
-  }
+  // `/etc` the destination and `src1`, `src2` the sources.
+  // All 4 getopt shapes honored (combined long, spaced long,
+  // spaced short, attached short `-t/etc`) via extractValueFlag.
+  const targetDirMatches = extractValueFlag(tokens, {
+    longForm: '--target-directory',
+    shortForm: '-t',
+  });
+  const targetDir: string | null =
+    targetDirMatches.length > 0 ? (targetDirMatches[targetDirMatches.length - 1] ?? null) : null;
 
   if (targetDir !== null) {
     // All positionals are sources; targetDir is the destination.
@@ -757,142 +971,43 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
   // no operand is wget syntactic noise), we don't emit a write
   // capability — the URL-side egress still covers the net side, and
   // the operator's modal will see the literal command.
+  // Simple path-flag decodes — flags whose value is a literal
+  // FILE path, no embedded `@` / `<` parsing. Each spec is
+  // honored across all 4 getopt shapes via extractValueFlag.
+  // The value `-` (curl stdin/stdout marker) is filtered out.
+  const CURL_WRITE_PATH_SPECS: readonly { longForm: string; shortForm?: string }[] = [
+    { longForm: '--output', shortForm: '-o' },
+    { longForm: '--output-document', shortForm: '-O' },
+    { longForm: '--cookie-jar', shortForm: '-c' },
+    { longForm: '--dump-header', shortForm: '-D' },
+    { longForm: '--trace' },
+    { longForm: '--trace-ascii' },
+  ];
+  const CURL_READ_PATH_SPECS: readonly { longForm: string; shortForm?: string }[] = [
+    { longForm: '--upload-file', shortForm: '-T' },
+    { longForm: '--config', shortForm: '-K' },
+    { longForm: '--netrc-file' },
+    { longForm: '--cacert' },
+  ];
   const writeTargets: string[] = [];
-  // Slice 128 (R4 P1-Launder): read targets from `--upload-file`/`-T`
-  // (curl PUT body) and `--config`/`-K` (curl config file containing
-  // URLs + credentials). Plus additional write targets from
-  // `--cookie-jar`/`-c` and `--dump-header`/`-D` which write file
-  // outputs cmdCurlWget pre-slice missed entirely.
   const readTargets: string[] = [];
+  for (const spec of CURL_WRITE_PATH_SPECS) {
+    for (const v of extractValueFlag(tokens, spec)) {
+      if (v !== '-') writeTargets.push(v);
+    }
+  }
+  for (const spec of CURL_READ_PATH_SPECS) {
+    for (const v of extractValueFlag(tokens, spec)) {
+      if (v !== '-') readTargets.push(v);
+    }
+  }
+
+  // Custom decodes — flags whose value carries an `@<file>` /
+  // `<<file>` / `name@file` shape that needs prefix-stripping
+  // before recording a read. Iteration-based; the spec helper
+  // doesn't capture these forms.
   for (let i = 0; i < tokens.length; i += 1) {
     const t = tokens[i] ?? '';
-    // curl long form `--output=<path>`
-    if (t.startsWith('--output=')) {
-      const target = t.slice('--output='.length);
-      if (target.length > 0) writeTargets.push(target);
-      continue;
-    }
-    // curl short combined form `-o<path>` (no space)
-    if (t.length > 2 && t.startsWith('-o') && !t.startsWith('--')) {
-      writeTargets.push(t.slice(2));
-      continue;
-    }
-    // wget long form `--output-document=<path>`
-    if (t.startsWith('--output-document=')) {
-      const target = t.slice('--output-document='.length);
-      if (target.length > 0) writeTargets.push(target);
-      continue;
-    }
-    // Slice 128: --cookie-jar / -c <path> writes cookies.
-    if (t.startsWith('--cookie-jar=')) {
-      const target = t.slice('--cookie-jar='.length);
-      if (target.length > 0) writeTargets.push(target);
-      continue;
-    }
-    // Slice 128: --dump-header / -D <path> writes response headers.
-    if (t.startsWith('--dump-header=')) {
-      const target = t.slice('--dump-header='.length);
-      if (target.length > 0) writeTargets.push(target);
-      continue;
-    }
-    // Slice 128: --upload-file / -T <path> reads file as PUT body.
-    if (t.startsWith('--upload-file=')) {
-      const target = t.slice('--upload-file='.length);
-      if (target.length > 0) readTargets.push(target);
-      continue;
-    }
-    // Slice 128: --config / -K <path> reads URL list / credentials.
-    if (t.startsWith('--config=')) {
-      const target = t.slice('--config='.length);
-      if (target.length > 0) readTargets.push(target);
-      continue;
-    }
-    // Separated forms: `-o <path>`, `--output <path>`, `-O <path>`,
-    // `--output-document <path>`. Skip the value-less degenerate
-    // shape `-O-` (writes to stdout) and `-O` followed by another
-    // flag (likely a typo; let the operator's modal catch it).
-    if (t === '-o' || t === '--output' || t === '-O' || t === '--output-document') {
-      const next = tokens[i + 1];
-      if (next !== undefined && next !== '-' && !next.startsWith('-')) {
-        writeTargets.push(next);
-        i += 1;
-      }
-      continue;
-    }
-    // Slice 128 (R4 P1-Launder): separated forms for the new flags.
-    if (t === '--cookie-jar' || t === '-c' || t === '--dump-header' || t === '-D') {
-      const next = tokens[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
-        writeTargets.push(next);
-        i += 1;
-      }
-      continue;
-    }
-    if (t === '--upload-file' || t === '-T' || t === '--config' || t === '-K') {
-      const next = tokens[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
-        readTargets.push(next);
-        i += 1;
-      }
-      continue;
-    }
-    // Slice 179 (review — permission-bypass P1). Four more curl
-    // flags missed by slices 98 + 128 + 174:
-    //   --trace <file>         writes full HTTP trace (headers +
-    //                           body) — dumps Bearer tokens etc.
-    //   --trace-ascii <file>   ASCII-only trace; same threat
-    //   --netrc-file <file>    READS credentials from netrc-shaped
-    //                           file (different path than ~/.netrc)
-    //   --cacert <file>        READS the CA bundle (cert disclosure
-    //                           if operator's policy gates it)
-    // Pre-slice `curl --trace /tmp/exfil https://api.example` walked
-    // past `deny: write-fs:/tmp/**` because the trace write was
-    // invisible. `--netrc-file` reads were invisible to operator
-    // `deny: read-fs:~/.aws/**`.
-    if (t.startsWith('--trace=')) {
-      const v = t.slice('--trace='.length);
-      if (v.length > 0) writeTargets.push(v);
-      continue;
-    }
-    if (t.startsWith('--trace-ascii=')) {
-      const v = t.slice('--trace-ascii='.length);
-      if (v.length > 0) writeTargets.push(v);
-      continue;
-    }
-    if (t === '--trace' || t === '--trace-ascii') {
-      const next = tokens[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
-        writeTargets.push(next);
-        i += 1;
-      }
-      continue;
-    }
-    if (t.startsWith('--netrc-file=')) {
-      const v = t.slice('--netrc-file='.length);
-      if (v.length > 0) readTargets.push(v);
-      continue;
-    }
-    if (t === '--netrc-file') {
-      const next = tokens[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
-        readTargets.push(next);
-        i += 1;
-      }
-      continue;
-    }
-    if (t.startsWith('--cacert=')) {
-      const v = t.slice('--cacert='.length);
-      if (v.length > 0) readTargets.push(v);
-      continue;
-    }
-    if (t === '--cacert') {
-      const next = tokens[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
-        readTargets.push(next);
-        i += 1;
-      }
-      continue;
-    }
     // Slice 174 (review — info-leak P0). curl's POST body flags
     // expand a leading `@` into "read body from this file":
     //   curl --data @/etc/shadow         (file → request body)
@@ -1188,66 +1303,22 @@ const cmdNpmLike: CommandResolver = (_positional, tokens, ctx) => {
   // can match against the literal token. Realistic operators
   // either trust npm globally or use confirm rules; the marker
   // makes the intent visible in the audit row.
+  // npm/yarn/pnpm/bun's redirect flags are all long-only (no short
+  // forms) with REQUIRED values. Helper handles combined + spaced
+  // forms uniformly.
+  const NPM_WRITE_PATH_SPECS: readonly { longForm: string }[] = [
+    { longForm: '--prefix' },
+    { longForm: '--pack-destination' },
+    { longForm: '--cache' },
+    { longForm: '--modules-folder' },
+  ];
   const writeTargets: string[] = [];
-  let globalFlag = false;
-  for (let i = 0; i < tokens.length; i += 1) {
-    const t = tokens[i] ?? '';
-    if (t === '-g' || t === '--global') {
-      globalFlag = true;
-      continue;
-    }
-    if (t.startsWith('--prefix=')) {
-      const v = t.slice('--prefix='.length);
-      if (v.length > 0) writeTargets.push(v);
-      continue;
-    }
-    if (t === '--prefix') {
-      const next = tokens[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
-        writeTargets.push(next);
-        i += 1;
-      }
-      continue;
-    }
-    if (t.startsWith('--pack-destination=')) {
-      const v = t.slice('--pack-destination='.length);
-      if (v.length > 0) writeTargets.push(v);
-      continue;
-    }
-    if (t === '--pack-destination') {
-      const next = tokens[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
-        writeTargets.push(next);
-        i += 1;
-      }
-      continue;
-    }
-    if (t.startsWith('--cache=')) {
-      const v = t.slice('--cache='.length);
-      if (v.length > 0) writeTargets.push(v);
-      continue;
-    }
-    if (t === '--cache') {
-      const next = tokens[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
-        writeTargets.push(next);
-        i += 1;
-      }
-      continue;
-    }
-    if (t.startsWith('--modules-folder=')) {
-      const v = t.slice('--modules-folder='.length);
-      if (v.length > 0) writeTargets.push(v);
-      continue;
-    }
-    if (t === '--modules-folder') {
-      const next = tokens[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
-        writeTargets.push(next);
-        i += 1;
-      }
-    }
+  for (const spec of NPM_WRITE_PATH_SPECS) {
+    for (const v of extractValueFlag(tokens, spec)) writeTargets.push(v);
   }
+  // `-g` / `--global` is a boolean — tracked separately so the
+  // marker `<npm-global-prefix>` write-fs can be emitted.
+  const globalFlag = tokens.some((t) => t === '-g' || t === '--global');
 
   const caps: Capability[] = [
     exec('arbitrary'),
@@ -1295,66 +1366,24 @@ const cmdPip: CommandResolver = (_positional, tokens, ctx) => {
   // Pre-slice `pip install --target /tmp/exfil foo` walked past
   // `deny: write-fs:/tmp/**`. Decode each and emit writeFs so the
   // engine sees the actual redirected write.
+  // pip's redirect flags — REQUIRED values. `--target` aliases `-t`
+  // and `--download` aliases `-d`; both short forms support the
+  // attached shape (`pip -t/tmp/exfil foo` was a bypass pre-fix).
+  // The other three are long-only.
+  const PIP_WRITE_PATH_SPECS: readonly { longForm: string; shortForm?: string }[] = [
+    { longForm: '--target', shortForm: '-t' },
+    { longForm: '--prefix' },
+    { longForm: '--root' },
+    { longForm: '--cache-dir' },
+    { longForm: '--download', shortForm: '-d' },
+  ];
   const writeTargets: string[] = [];
-  let userFlag = false;
-  for (let i = 0; i < tokens.length; i += 1) {
-    const t = tokens[i] ?? '';
-    if (t === '--user') {
-      userFlag = true;
-      continue;
-    }
-    if (t === '--target' || t === '-t') {
-      const next = tokens[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
-        writeTargets.push(next);
-        i += 1;
-      }
-      continue;
-    }
-    if (t.startsWith('--target=')) {
-      const v = t.slice('--target='.length);
-      if (v.length > 0) writeTargets.push(v);
-      continue;
-    }
-    if (t === '--prefix' || t === '--root') {
-      const next = tokens[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
-        writeTargets.push(next);
-        i += 1;
-      }
-      continue;
-    }
-    if (t.startsWith('--prefix=')) {
-      const v = t.slice('--prefix='.length);
-      if (v.length > 0) writeTargets.push(v);
-      continue;
-    }
-    if (t.startsWith('--root=')) {
-      const v = t.slice('--root='.length);
-      if (v.length > 0) writeTargets.push(v);
-      continue;
-    }
-    if (t === '--cache-dir') {
-      const next = tokens[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
-        writeTargets.push(next);
-        i += 1;
-      }
-      continue;
-    }
-    if (t.startsWith('--cache-dir=')) {
-      const v = t.slice('--cache-dir='.length);
-      if (v.length > 0) writeTargets.push(v);
-      continue;
-    }
-    if (t === '-d' || t === '--download') {
-      const next = tokens[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
-        writeTargets.push(next);
-        i += 1;
-      }
-    }
+  for (const spec of PIP_WRITE_PATH_SPECS) {
+    for (const v of extractValueFlag(tokens, spec)) writeTargets.push(v);
   }
+  // `--user` is a boolean — tracked separately so `~/.local` write
+  // scope can be emitted.
+  const userFlag = tokens.some((t) => t === '--user');
 
   const caps: Capability[] = [exec('arbitrary'), readFs(ctx.cwd), netEgress('pypi.org')];
   for (const p of writeTargets) caps.push(writeFs(resolveArg(p, ctx)));
@@ -1370,12 +1399,46 @@ const cmdPip: CommandResolver = (_positional, tokens, ctx) => {
   return { capabilities: caps, confidence: 'medium' };
 };
 
-const cmdChmodChown: CommandResolver = (positional, _tokens, ctx) => {
-  if (positional.length === 0) {
-    return { refuse: 'chmod/chown: missing target' };
+// `chmod MODE FILE...` / `chown OWNER FILE...` — first positional
+// is MODE (numeric `644` or symbolic `u+x`) or OWNER (`root`,
+// `root:wheel`), not a path. The first positional must NOT be
+// emitted as a writeFs target.
+//
+// Exception: `chmod --reference=REF FILE...` (and chown). With
+// `--reference`, GNU coreutils drops the MODE/OWNER positional
+// entirely — every remaining positional IS a target. The
+// reference file (REF) is read for its current mode/owner; emit a
+// readFs for it. Both the combined-form `--reference=REF` and the
+// space-separated `--reference REF` are honored.
+const CHMOD_VALUE_FLAGS: ReadonlySet<string> = new Set(['--reference']);
+
+const cmdChmodChown: CommandResolver = (_positional, tokens, ctx) => {
+  const positional = stripFlags(tokens, CHMOD_VALUE_FLAGS);
+
+  // hasReference: was the `--reference` literal seen at all (with
+  // or without an extractable value)? Drops the MODE/OWNER
+  // positional from the branch. referenceFile: the decoded path,
+  // when extractable. Last match wins on multiple occurrences.
+  const hasReference = tokens.some((t) => t === '--reference' || t.startsWith('--reference='));
+  const refMatches = extractValueFlag(tokens, { longForm: '--reference' });
+  const referenceFile: string | null =
+    refMatches.length > 0 ? (refMatches[refMatches.length - 1] ?? null) : null;
+
+  if (hasReference) {
+    if (positional.length === 0) {
+      return { refuse: 'chmod/chown: --reference needs at least one target' };
+    }
+    const caps: Capability[] = positional.map((p) => writeFs(resolveArg(p, ctx)));
+    if (referenceFile !== null) caps.push(readFs(resolveArg(referenceFile, ctx)));
+    return { capabilities: caps, confidence: 'high' };
   }
+
+  if (positional.length < 2) {
+    return { refuse: 'chmod/chown: needs MODE/OWNER plus at least one target' };
+  }
+  const targets = positional.slice(1);
   return {
-    capabilities: positional.map((p) => writeFs(resolveArg(p, ctx))),
+    capabilities: targets.map((p) => writeFs(resolveArg(p, ctx))),
     confidence: 'high',
   };
 };
@@ -1505,14 +1568,149 @@ const cmdEnv: CommandResolver = (positional) => {
 
 // Filesystem-mutating utilities that create or touch a target.
 // mkdir / touch / ln / mktemp: positional args are the targets.
-const cmdMkdir: CommandResolver = (positional, _tokens, ctx) => {
+// Each takes its own set of value-flags whose operand is NOT a
+// path (mode bits, timestamps, link suffixes, etc.); without
+// consuming them the operand lands as a bogus writeFs target
+// (`mkdir -m 755 dir` → bogus `write-fs:<cwd>/755`).
+// `-Z` and `--context` are NOT here: per `mkdir --help`, `-Z` takes
+// NO operand (sets the default SELinux context); `--context[=CTX]`
+// has an optional value that must use `=`. The next token after
+// either flag is the DIRECTORY operand, not a value to consume —
+// including them would drop the real write target and let policies
+// like `deny: write-fs:/tmp/**` miss `mkdir -Z /tmp/dir`.
+const MKDIR_VALUE_FLAGS: ReadonlySet<string> = new Set(['-m', '--mode']);
+const TOUCH_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  '-d',
+  '--date',
+  '-t',
+  '-r',
+  '--reference',
+  '--time',
+]);
+// ln's value-flags whose operand is NOT a write target. `-t /dir`
+// and `--target-directory=/dir` ARE write destinations and are
+// handled below in cmdLn — listing them here would drop the
+// destination from capability attribution, letting `ln -t
+// /protected src` bypass a `deny: write-fs:/protected/**` rule.
+const LN_VALUE_FLAGS: ReadonlySet<string> = new Set(['-S', '--suffix']);
+// mktemp value-flags whose operand is NOT a path destination.
+// `-p DIR` / `--tmpdir[=DIR]` ARE write destinations — handled in
+// cmdMktemp so a policy denying writes outside the workspace
+// (e.g., /tmp) sees the actual write location. Listing them here
+// would drop DIR from capability attribution.
+const MKTEMP_VALUE_FLAGS: ReadonlySet<string> = new Set(['--suffix']);
+
+const emitTargetsAsWrites = (positional: readonly string[], ctx: ResolverContext) => {
   if (positional.length === 0) {
-    return { capabilities: [writeFs(ctx.cwd)], confidence: 'high' };
+    return { capabilities: [writeFs(ctx.cwd)], confidence: 'high' as const };
   }
   return {
     capabilities: positional.map((p) => writeFs(resolveArg(p, ctx))),
-    confidence: 'high',
+    confidence: 'high' as const,
   };
+};
+
+const cmdMkdir: CommandResolver = (_positional, tokens, ctx) => {
+  return emitTargetsAsWrites(stripFlags(tokens, MKDIR_VALUE_FLAGS), ctx);
+};
+
+// touch's `-r REF` / `--reference=REF` reads REF's mtime/atime.
+// Emit a readFs alongside the targets so a policy that denies reads
+// from the reference's path can fire.
+const cmdTouch: CommandResolver = (_positional, tokens, ctx) => {
+  const positional = stripFlags(tokens, TOUCH_VALUE_FLAGS);
+  const refMatches = extractValueFlag(tokens, { longForm: '--reference', shortForm: '-r' });
+  const referenceFile: string | null =
+    refMatches.length > 0 ? (refMatches[refMatches.length - 1] ?? null) : null;
+  const base = emitTargetsAsWrites(positional, ctx);
+  if (referenceFile === null) return base;
+  return {
+    capabilities: [...base.capabilities, readFs(resolveArg(referenceFile, ctx))],
+    confidence: base.confidence,
+  };
+};
+
+// `ln -t DIR SRC...` / `--target-directory=DIR SRC...` inverts the
+// shape: DIR is the write destination (links are created there),
+// SRC... are read sources. Without this branch the LN_VALUE_FLAGS
+// approach would silently drop DIR from the capability set,
+// letting `ln -t /protected src` bypass a deny on /protected.
+// Parallel to cmdMvCp's --target-directory handling.
+const cmdLn: CommandResolver = (_positional, tokens, ctx) => {
+  // Last `-t`/`--target-directory` wins (matches coreutils
+  // semantics — later override earlier). All 4 getopt shapes
+  // honored via extractValueFlag.
+  const targetDirMatches = extractValueFlag(tokens, {
+    longForm: '--target-directory',
+    shortForm: '-t',
+  });
+  const targetDir: string | null =
+    targetDirMatches.length > 0 ? (targetDirMatches[targetDirMatches.length - 1] ?? null) : null;
+  const positional = stripFlags(tokens, LN_VALUE_FLAGS);
+
+  if (targetDir !== null) {
+    // All positionals are sources (links created inside targetDir).
+    // Filter targetDir out if it appears in positional (space-
+    // separated `-t DIR` leaves DIR in args).
+    const srcs = positional.filter((p) => p !== targetDir);
+    if (srcs.length === 0) {
+      return { refuse: 'ln: -t/--target-directory needs at least one source' };
+    }
+    return {
+      capabilities: [
+        ...srcs.map((s) => readFs(resolveArg(s, ctx))),
+        writeFs(resolveArg(targetDir, ctx)),
+      ],
+      confidence: 'high',
+    };
+  }
+
+  return emitTargetsAsWrites(positional, ctx);
+};
+
+// `mktemp -p DIR TEMPLATE` / `--tmpdir=DIR TEMPLATE` creates the
+// file inside DIR. The destination MUST surface as a write so a
+// policy denying writes outside the workspace (e.g., `/tmp`) can
+// fire. Without DIR explicitly resolved, mktemp picks `$TMPDIR`
+// or `/tmp` at runtime — that case stays as the fallback (cwd-
+// relative attribution) and is a known limitation.
+const cmdMktemp: CommandResolver = (_positional, tokens, ctx) => {
+  // `-p DIR` and `--tmpdir[=DIR]` have different getopt shapes:
+  //   - `-p` is REQUIRED-argument (per `mktemp --help` "-p DIR");
+  //     consume spaced + attached short forms.
+  //   - `--tmpdir` is OPTIONAL-argument; consume ONLY via `=` or
+  //     attached short. Spaced `--tmpdir tmpXXX` leaves tmpXXX as
+  //     the TEMPLATE (default tmpdir used by mktemp at runtime).
+  //     Without optionalValue=true the helper would over-consume
+  //     the template and emit a wrong write-fs scope.
+  const tmpdirMatches = [
+    ...extractValueFlag(tokens, { shortForm: '-p' }),
+    ...extractValueFlag(tokens, { longForm: '--tmpdir', optionalValue: true }),
+  ];
+  const tmpdir: string | null =
+    tmpdirMatches.length > 0 ? (tmpdirMatches[tmpdirMatches.length - 1] ?? null) : null;
+  const positional = stripFlags(tokens, MKTEMP_VALUE_FLAGS);
+
+  if (tmpdir !== null) {
+    // Filter tmpdir out of positional in case the space-separated
+    // form leaked through.
+    const templates = positional.filter((p) => p !== tmpdir);
+    if (templates.length === 0) {
+      // -p DIR with no template — mktemp picks a default template
+      // like `tmp.XXXXXX`. Emit write-fs(DIR) as the broader scope.
+      return {
+        capabilities: [writeFs(resolveArg(tmpdir, ctx))],
+        confidence: 'high',
+      };
+    }
+    const resolvedDir = resolveArg(tmpdir, ctx);
+    return {
+      capabilities: templates.map((p) => writeFs(resolvePath(resolvedDir, p))),
+      confidence: 'high',
+    };
+  }
+
+  return emitTargetsAsWrites(positional, ctx);
 };
 
 // `cd` is a builtin; in a tool-call context the cwd change doesn't
@@ -1621,11 +1819,10 @@ const cmdTar: CommandResolver = (positional, tokens, ctx) => {
       }
     }
     if (t === '--checkpoint-action') {
-      // Space-separated form. We can't safely peek the next token
-      // because numeric values are stripped from args by tree-
-      // sitter — refuse unconditionally; the legitimate forms
-      // (sleep, dot) are equally unanalyzable via the static
-      // resolver.
+      // Space-separated form. The action value can be `exec=<cmd>`
+      // (arbitrary-exec — the exploit), `sleep`, `dot`, `bell`, etc.
+      // Refuse unconditionally regardless of the value because every
+      // shape requires runtime inspection to safely characterize.
       return {
         refuse:
           'tar: --checkpoint-action <value> requires runtime inspection — refusing static analysis',
@@ -1842,18 +2039,15 @@ const cmdSsh: CommandResolver = (_positional, tokens, ctx) => {
     }
   }
 
-  // ssh flag schema. The tree-sitter bash grammar tokenizes numeric
-  // literals as `number` nodes and the analyzer DROPS them from
-  // `shape.args` (only `word`/`string`/`raw_string`/`concatenation`
-  // survive). So a flag whose value is always numeric (`-p 2222`)
-  // arrives here as just `['-p', ...next-token...]` — the value is
-  // already gone, and a generic "consume next" would eat the WRONG
-  // token (the target host). Three flag classes:
+  // ssh flag schema. Numeric literals (e.g., `-p 2222`) arrive in
+  // `shape.args` as `number` nodes; the resolver must consume them
+  // explicitly instead of leaving them for the target-host scan.
+  // Three flag classes:
   //
-  //   - numericValueFlags: value is strictly numeric → stripped from
-  //     args → DON'T consume next (it's not the value).
+  //   - numericValueFlags: value is strictly numeric → peek next;
+  //     consume when present.
   //   - stringValueFlags: value is always a string (path / kv / host)
-  //     → stays in args → peek next; consume if non-flag.
+  //     → peek next; consume if non-flag.
   //   - portForwardFlags: value is `[bind:]port:host:remote_port` for
   //     -L/-R, `[bind:]port` for -D, `local_tun[:remote_tun]` for -w.
   //     Slice 125: `-w` was previously in `numericValueFlags` (bare
@@ -1881,30 +2075,38 @@ const cmdSsh: CommandResolver = (_positional, tokens, ctx) => {
   const portForwardFlags: ReadonlySet<string> = new Set(['-L', '-R', '-D', '-w']);
 
   // Slice 174 (review — info-leak P1). ssh's `-F <config>` (custom
-  // ssh_config) and `-i <identity>` (private key file) silently
-  // consumed the next token without emitting any read capability.
-  // Pre-slice the resolver always emitted `readFs(~/.ssh)` because
-  // ssh implicitly touches the default config + known_hosts there,
-  // but a custom `-F /etc/agent/ssh.conf` or `-i /tmp/exfil-key.pem`
-  // pointed at paths OUTSIDE `~/.ssh` — those reads were invisible
-  // to the engine. An adversarial `ssh -F /etc/shadow user@host`
-  // (yes, shadow as config — ssh will refuse but it READS the file
-  // first) would walk past `deny: read-fs:/etc/**`. We now emit
-  // `readFs(<path>)` for the operand when these flags are present.
-  // The default `readFs(~/.ssh)` still fires for the implicit
-  // touches of `~/.ssh/config` / `~/.ssh/known_hosts`.
-  const fileValueFlags: ReadonlySet<string> = new Set(['-F', '-i', '-S']);
+  // ssh_config), `-i <identity>` (private key file), and `-S
+  // <ctlsocket>` (control socket — ssh creates AND reads it) need
+  // explicit readFs caps so policies denying reads from those
+  // specific paths can fire (e.g., `ssh -i /tmp/exfil-key.pem` or
+  // attached `ssh -i/tmp/exfil-key`). The default `readFs(~/.ssh)`
+  // still fires for the implicit touches of `~/.ssh/config` /
+  // `~/.ssh/known_hosts`.
+  const SSH_FILE_READ_FLAGS: readonly string[] = ['-F', '-i', '-S'];
+  const explicitFileReads: string[] = [];
+  for (const flag of SSH_FILE_READ_FLAGS) {
+    for (const v of extractValueFlag(tokens, { shortForm: flag })) {
+      explicitFileReads.push(resolveArg(v, ctx));
+    }
+  }
 
   let targetIdx = -1;
   let hasPortForward = false;
-  const explicitFileReads: string[] = [];
   for (let i = 0; i < tokens.length; i += 1) {
     const t = tokens[i] ?? '';
-    if (numericValueFlags.has(t)) continue; // value already stripped from args
+    if (numericValueFlags.has(t)) {
+      // Consume the numeric value so the next scan iteration
+      // doesn't pick it as the target host (`ssh -p 2222 host`
+      // would otherwise read '2222' as the host). Skip the consume
+      // when next is itself a flag (operator omitted the value —
+      // malformed input; let the target scan find host).
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) i += 1;
+      continue;
+    }
     if (stringValueFlags.has(t)) {
       const next = tokens[i + 1];
       if (next !== undefined && !next.startsWith('-')) {
-        if (fileValueFlags.has(t)) explicitFileReads.push(resolveArg(next, ctx));
         i += 1;
       }
       continue;
@@ -1912,17 +2114,18 @@ const cmdSsh: CommandResolver = (_positional, tokens, ctx) => {
     if (portForwardFlags.has(t)) {
       hasPortForward = true;
       const next = tokens[i + 1];
-      // `:` in next → colon-shaped port-forward spec (consume).
-      // No `:` → bare numeric port (stripped) OR the target host
-      // (don't consume; let the next iteration pick it as target).
-      //
-      // Slice 127 (R3 P0-3): for `-w`, the value `any` is the
-      // documented ssh syntax ("auto-pick tun device"). It's a
-      // word (survives tree-sitter strip) without a colon, so
-      // pre-slice it leaked into the target-detection branch as
-      // a host → emitted `net-egress:any`. Consume it like a
-      // colon-shape spec.
-      if (next?.includes(':') || (t === '-w' && next === 'any')) i += 1;
+      // Three shapes the value can take:
+      //   - colon-shaped (`bind:port:host:remote`) → consume.
+      //   - bare numeric (`-D 8080`) → consume (else the target
+      //     scan would pick '8080' as the host).
+      //   - `-w any` → ssh's documented "auto-pick tun device"
+      //     literal. Slice 127 (R3 P0-3) added this: pre-slice the
+      //     `any` token leaked into target detection and emitted
+      //     `net-egress:any`.
+      // Other shapes (e.g., next is the host literal itself) →
+      // don't consume; let the target scan pick it up.
+      const isNumericPort = next !== undefined && /^\d+$/.test(next);
+      if (next?.includes(':') || isNumericPort || (t === '-w' && next === 'any')) i += 1;
       continue;
     }
     if (t.startsWith('-')) continue;
@@ -2020,7 +2223,70 @@ const cmdScp: CommandResolver = (positional, _tokens, ctx) => {
 //   - read-fs(~/.ssh) when ssh transport is in play
 //   - delete-fs(local dest) when --delete or any --delete-* flag
 //     is present (rsync can delete extraneous files on dest)
-const cmdRsync: CommandResolver = (positional, tokens, ctx) => {
+// rsync value-flags whose space-separated next token is a value,
+// not a source/dest path. Without consuming them, `rsync --bwlimit
+// 1000 src dst` would land '1000' as a positional source → bogus
+// readFs:<cwd>/1000. The `=`-combined form (`--bwlimit=1000`) is
+// already dropped by stripFlags's leading-dash rule. Includes
+// every flag whose explicit decode is below (password-file,
+// files-from, include-from, exclude-from) so the value also drops
+// from the path-positional list (the decode itself emits the
+// correct read-fs).
+const RSYNC_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  // Numeric value flags
+  '--bwlimit',
+  '--port',
+  '--timeout',
+  '--contimeout',
+  '--io-timeout',
+  '--max-size',
+  '--min-size',
+  '--max-delete',
+  '--max-alloc',
+  '--modify-window',
+  '--protocol',
+  '-B',
+  '--block-size',
+  '--checksum-seed',
+  // String non-path values (filters, formats, modes)
+  '--filter',
+  '-f',
+  '--include',
+  '--exclude',
+  '--info',
+  '--debug',
+  '--out-format',
+  '--log-format',
+  '--log-file-format',
+  '--chown',
+  '--chmod',
+  '--usermap',
+  '--groupmap',
+  '--checksum-choice',
+  // Path-string value flags — these have explicit decodes below
+  // that emit the right read/write; listing here drops the value
+  // from the positional list too.
+  '--password-file',
+  '--files-from',
+  '--include-from',
+  '--exclude-from',
+  '--temp-dir',
+  '-T',
+  '--compare-dest',
+  '--copy-dest',
+  '--link-dest',
+  '--partial-dir',
+  '--log-file',
+  '--read-batch',
+  '--write-batch',
+  '--only-write-batch',
+  // Remote-option pass-through (consumes value)
+  '--remote-option',
+  '-M',
+]);
+
+const cmdRsync: CommandResolver = (_positional, tokens, ctx) => {
+  const positional = stripFlags(tokens, RSYNC_VALUE_FLAGS);
   // Slice 125 (R2 P0-2): rsync transport-command flags. `-e <cmd>`
   // and `--rsh=<cmd>` substitute the transport (rsync exec's the
   // literal command string + args locally — GTFOBins reference:
@@ -2117,6 +2383,34 @@ const cmdRsync: CommandResolver = (positional, tokens, ctx) => {
     }
   }
 
+  // Side-effect paths that RSYNC_VALUE_FLAGS drops from the
+  // positional list (so they don't leak as bogus sources) but that
+  // still need to surface as capabilities. Without an explicit
+  // decode here, a policy gating these paths can be bypassed.
+  // extractValueFlag covers all 4 getopt shapes including attached
+  // short form `-T/dir`.
+  const RSYNC_WRITE_PATH_SPECS: readonly { longForm: string; shortForm?: string }[] = [
+    { longForm: '--log-file' },
+    { longForm: '--write-batch' },
+    { longForm: '--only-write-batch' },
+    { longForm: '--temp-dir', shortForm: '-T' },
+    { longForm: '--partial-dir' },
+  ];
+  const RSYNC_READ_PATH_SPECS: readonly { longForm: string; shortForm?: string }[] = [
+    { longForm: '--read-batch' },
+    { longForm: '--compare-dest' },
+    { longForm: '--copy-dest' },
+    { longForm: '--link-dest' },
+  ];
+  const flagWrites: string[] = [];
+  const flagReads: string[] = [];
+  for (const spec of RSYNC_WRITE_PATH_SPECS) {
+    for (const v of extractValueFlag(tokens, spec)) flagWrites.push(v);
+  }
+  for (const spec of RSYNC_READ_PATH_SPECS) {
+    for (const v of extractValueFlag(tokens, spec)) flagReads.push(v);
+  }
+
   const dest = positional[positional.length - 1] as string;
   const sources = positional.slice(0, -1);
   const anyRemote = isRemote(dest) || sources.some(isRemote);
@@ -2124,9 +2418,9 @@ const cmdRsync: CommandResolver = (positional, tokens, ctx) => {
   const caps: Capability[] = [];
   if (anyRemote) caps.push(readFs(resolveArg('~/.ssh', ctx)));
   if (passwordFile !== null) caps.push(readFs(resolveArg(passwordFile, ctx)));
-  // Slice 179: manifest reads from --files-from / --exclude-from /
-  // --include-from. Each file is read once at rsync startup.
   for (const p of manifestFileReads) caps.push(readFs(resolveArg(p, ctx)));
+  for (const p of flagWrites) caps.push(writeFs(resolveArg(p, ctx)));
+  for (const p of flagReads) caps.push(readFs(resolveArg(p, ctx)));
 
   if (isRemote(dest)) {
     caps.push(netEgress(extractHost(dest)));
@@ -2155,26 +2449,14 @@ const cmdMake: CommandResolver = (_positional, tokens, ctx) => {
   // `make -C /etc/agent target` would NOT surface `/etc/agent` to
   // the operator's policy or the §11 escalate-tier classifier.
   //
-  // Parse `-C <dir>` / `--directory <dir>` / `--directory=<dir>` and
-  // shift the scope. If multiple -C flags appear, the LAST one wins
-  // (make's actual behavior: each -C overrides the previous). We
-  // accept the rightmost as the effective root.
-  let workDir: string | null = null;
-  for (let i = 0; i < tokens.length; i += 1) {
-    const t = tokens[i] ?? '';
-    if (t === '-C' || t === '--directory') {
-      const next = tokens[i + 1];
-      if (next !== undefined && !next.startsWith('-')) {
-        workDir = next;
-        i += 1;
-      }
-      continue;
-    }
-    if (t.startsWith('--directory=')) {
-      const v = t.slice('--directory='.length);
-      if (v.length > 0) workDir = v;
-    }
-  }
+  // Last -C wins (make's actual behavior). All 4 getopt shapes
+  // honored including attached short `-C/path`.
+  const workDirMatches = extractValueFlag(tokens, {
+    longForm: '--directory',
+    shortForm: '-C',
+  });
+  const workDir: string | null =
+    workDirMatches.length > 0 ? (workDirMatches[workDirMatches.length - 1] ?? null) : null;
   const root = workDir !== null ? resolveArg(workDir, ctx) : ctx.cwd;
   return {
     capabilities: [exec('arbitrary'), readFs(root), writeFs(root)],
@@ -2199,19 +2481,11 @@ const cmdMake: CommandResolver = (_positional, tokens, ctx) => {
 // `target/` dir under cwd and reaches crates.io for deps.
 const cmdCargo: CommandResolver = (positional, tokens, ctx) => {
   const sub = positional[0];
-  // Slice 125 (R2 P1): `--target-dir=<path>` and `--target-dir <path>`
-  // redirect the build output dir. When present, the write-fs scope
-  // moves from `<cwd>/target` to that path.
-  let targetDir: string | null = null;
-  for (let i = 0; i < tokens.length; i += 1) {
-    const t = tokens[i] ?? '';
-    if (t.startsWith('--target-dir=')) {
-      targetDir = t.slice('--target-dir='.length);
-    } else if (t === '--target-dir') {
-      const next = tokens[i + 1];
-      if (next !== undefined && !next.startsWith('-')) targetDir = next;
-    }
-  }
+  // `--target-dir=PATH` / `--target-dir PATH` redirects the build
+  // output dir. cargo's long-only flag — no short alias.
+  const targetDirMatches = extractValueFlag(tokens, { longForm: '--target-dir' });
+  const targetDir: string | null =
+    targetDirMatches.length > 0 ? (targetDirMatches[targetDirMatches.length - 1] ?? null) : null;
   const buildOutputDir =
     targetDir !== null ? resolveArg(targetDir, ctx) : resolvePath(ctx.cwd, 'target');
 
@@ -2261,8 +2535,8 @@ const cmdCargo: CommandResolver = (positional, tokens, ctx) => {
 const COMMAND_TABLE: ReadonlyMap<string, CommandResolver> = new Map<string, CommandResolver>([
   ['ls', cmdRead],
   ['cat', cmdRead],
-  ['head', cmdRead],
-  ['tail', cmdRead],
+  ['head', cmdReadWithSize],
+  ['tail', cmdReadWithSize],
   ['wc', cmdRead],
   ['file', cmdRead],
   ['stat', cmdRead],
@@ -2295,9 +2569,9 @@ const COMMAND_TABLE: ReadonlyMap<string, CommandResolver> = new Map<string, Comm
   ['perl', cmdInterpreter],
   // Filesystem-mutating builtins / utilities
   ['mkdir', cmdMkdir],
-  ['touch', cmdMkdir],
-  ['ln', cmdMkdir],
-  ['mktemp', cmdMkdir],
+  ['touch', cmdTouch],
+  ['ln', cmdLn],
+  ['mktemp', cmdMktemp],
   // No-op / shell-level builtins
   ['sleep', cmdNoOp],
   ['true', cmdNoOp],
@@ -2441,6 +2715,13 @@ const literalText = (node: Node): string | null => {
   let raw: string;
   if (node.type === 'word' || node.type === 'raw_string') {
     raw = node.text;
+  } else if (node.type === 'number') {
+    // Tree-sitter-bash tokenizes numeric literals as their own
+    // node-kind (`-p 2222`, `-maxdepth 3`). Treating them as
+    // literals that flow into args keeps the resolver honest;
+    // per-command handlers that care about numeric flag values
+    // consume the next token explicitly.
+    raw = node.text;
   } else if (node.type === 'string') {
     // string can contain string_content children and optional
     // string_expansion / command_substitution. If any of those red-
@@ -2554,7 +2835,8 @@ const walkAst = (root: Node): WalkResult => {
           child.type === 'word' ||
           child.type === 'string' ||
           child.type === 'raw_string' ||
-          child.type === 'concatenation'
+          child.type === 'concatenation' ||
+          child.type === 'number'
         ) {
           const text = literalText(child);
           if (text === null) {
@@ -2970,6 +3252,38 @@ const couldGlobReachProtected = (
 const tierRank = (t: 'deny' | 'escalate' | null): number =>
   t === 'deny' ? 2 : t === 'escalate' ? 1 : 0;
 
+// The symlink-aware defenses below silently no-op when
+// `ctx.realpath` is missing — intentional for tests (which build
+// paths that don't exist on disk) but catastrophic in production
+// if the engine wire-up is ever removed. The warning fires once
+// per process and only when the caller didn't opt out via
+// `ctx.suppressDegradeWarnings`. Production wiring leaves the
+// flag undefined; the warning IS the audit signal that flags
+// regression.
+//
+// TODO: in headless / CI environments where stderr isn't
+// captured, the warning can be swallowed silently. Promote to a
+// `failure_events` row once ResolverContext carries the failure
+// sink — the tamper-evident table is queryable and survives log
+// rotation.
+let realpathMissingWarned = false;
+const warnRealpathMissingOnce = (ctx: ResolverContext): void => {
+  if (realpathMissingWarned) return;
+  if (ctx.suppressDegradeWarnings === true) return;
+  realpathMissingWarned = true;
+  process.stderr.write(
+    'forja: bash resolver running WITHOUT realpath/readlink wired — symlink-escape defenses (slices 176, 178) are inactive. Production wiring at engine.ts injects fs.realpathSync/readlinkSync; if you see this in production, the wire-up was removed.\n',
+  );
+};
+
+// Test seam — reset the warn-once latch so a test exercising the
+// warning path can verify it fires. Production callers never need
+// this; it's symmetric to the other __reset*ForTest helpers in this
+// module's neighborhood.
+export const __resetRealpathWarnLatchForTest = (): void => {
+  realpathMissingWarned = false;
+};
+
 // Resolve a lexical absolute path to its canonical form for
 // classification, with three sequential fallbacks. Used by BOTH
 // `classifyArgWithCanonical` (protected-path tier check) and
@@ -2998,7 +3312,10 @@ const tierRank = (t: 'deny' | 'escalate' | null): number =>
 //   4. Give up — return null and the caller falls back to the
 //      lexical classification.
 const canonicalizeForClassification = (lexicalAbs: string, ctx: ResolverContext): string | null => {
-  if (ctx.realpath === undefined) return null;
+  if (ctx.realpath === undefined) {
+    warnRealpathMissingOnce(ctx);
+    return null;
+  }
   try {
     return ctx.realpath(lexicalAbs);
   } catch {
@@ -3071,7 +3388,11 @@ const classifyArgWithCanonical = (
   });
   // Deny on lexical short-circuits — canonical can only stay-or-deny,
   // it cannot relax. Skip the realpath roundtrip in the hot path.
-  if (lexicalTier === 'deny' || ctx.realpath === undefined) return lexicalTier;
+  if (lexicalTier === 'deny') return lexicalTier;
+  if (ctx.realpath === undefined) {
+    warnRealpathMissingOnce(ctx);
+    return lexicalTier;
+  }
 
   const canonical = canonicalizeForClassification(lexicalAbs, ctx);
   if (canonical === null || canonical === lexicalAbs) return lexicalTier;
@@ -3105,7 +3426,10 @@ const classifyArgWithCanonical = (
 // symlinks pointing outside the project root); low-confidence funnels
 // the call through the operator's modal, which is the right trade.
 const detectCwdScopeEscape = (lexicalAbs: string, ctx: ResolverContext): boolean => {
-  if (ctx.realpath === undefined) return false;
+  if (ctx.realpath === undefined) {
+    warnRealpathMissingOnce(ctx);
+    return false;
+  }
   const canonical = canonicalizeForClassification(lexicalAbs, ctx);
   if (canonical === null || canonical === lexicalAbs) return false;
   const cwdPrefix = ctx.cwd.endsWith('/') ? ctx.cwd : `${ctx.cwd}/`;

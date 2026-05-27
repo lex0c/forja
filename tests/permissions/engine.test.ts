@@ -3384,6 +3384,106 @@ describe('engine — effective capabilities envelope (§10.1, slice 95)', () => 
     // is uncovered.
     expect(decision.reason).toContain('write-fs:');
   });
+
+  // Side-effect tools that emit ZERO resolved capabilities
+  // (bash_kill / bash_output — resolver has no `args.command` to
+  // attribute from; category 'misc') must not silently pass the
+  // envelope gate. Spec §10.1 mandates pure-LLM child has no
+  // side-effect tools; §10.3 says escape is impossible. The
+  // `isToolSideEffect` oracle closes the gap.
+  test('isToolSideEffect: pure-LLM child denies side-effect tool with caps=[]', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['*'] } } }), {
+      cwd: CWD,
+      effectiveCapabilities: [],
+      isToolSideEffect: (name) => name === 'bash_kill',
+    });
+    // bash_kill carries `args.process_id` but no `args.command` —
+    // the bash resolver short-circuits to `capabilities: []`.
+    // Without the oracle, the gate's `length > 0` guard would
+    // skip and the catch-all bash policy would allow.
+    const decision = eng.check('bash_kill', 'misc', { process_id: 'bg-1' });
+    expect(decision.kind).toBe('deny');
+    expect(decision.source?.section).toBe('subagent-effective');
+    expect(decision.reason).toContain("'bash_kill'");
+    expect(decision.reason).toContain('writes/exec');
+  });
+
+  test('isToolSideEffect: narrowed envelope also blocks side-effect tool with caps=[]', () => {
+    // Even a narrowed child (NOT pure-LLM) must not invoke a
+    // side-effect tool whose resolver returns no caps — there's
+    // nothing in the envelope that could plausibly cover an
+    // opaque side effect.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['*'] } } }), {
+      cwd: CWD,
+      effectiveCapabilities: [{ kind: 'read-fs', scope: 'src/**' }],
+      isToolSideEffect: (name) => name === 'bash_kill',
+    });
+    const decision = eng.check('bash_kill', 'misc', { process_id: 'bg-1' });
+    expect(decision.kind).toBe('deny');
+    expect(decision.source?.section).toBe('subagent-effective');
+  });
+
+  test('isToolSideEffect: non-side-effect misc tool still passes with caps=[]', () => {
+    // The oracle returns false → caps=[] short-circuits as before.
+    // Confirms the gate doesn't over-refuse on pure-info tools.
+    const eng = createPermissionEngine(policy({ tools: {} }), {
+      cwd: CWD,
+      effectiveCapabilities: [],
+      isToolSideEffect: (name) => name === 'bash_kill',
+    });
+    const decision = eng.check('think', 'misc', {});
+    expect(decision.source?.section).not.toBe('subagent-effective');
+  });
+
+  // bg-lifecycle tools (`bash_output`, `bash_kill`, `bash_background`)
+  // all carry `metadata.requiresBgManager: true`. Reading stdout
+  // from a previously-spawned process or signalling it IS a side
+  // effect from the envelope's perspective even when the tool's
+  // own metadata says writes:false (bash_output is the canonical
+  // example). The production wiring includes `requiresBgManager`
+  // in the side-effect predicate; this test pins the contract so
+  // a future regression to a writes/exec-only oracle surfaces.
+  test('isToolSideEffect: bg-lifecycle tools must be treated as side-effect', () => {
+    const eng = createPermissionEngine(policy({ tools: {} }), {
+      cwd: CWD,
+      effectiveCapabilities: [],
+      // Mirror production: writes OR exec OR requiresBgManager.
+      isToolSideEffect: (name) => {
+        // bash_output has writes:false + no exec but
+        // requiresBgManager:true. The oracle MUST return true.
+        return name === 'bash_output' || name === 'bash_kill' || name === 'bash_background';
+      },
+    });
+    const decision = eng.check('bash_output', 'misc', { process_id: 'bg-1' });
+    expect(decision.kind).toBe('deny');
+    expect(decision.source?.section).toBe('subagent-effective');
+    expect(decision.reason).toContain("'bash_output'");
+  });
+
+  test('isToolSideEffect omitted: legacy behavior preserved (caps=[] passes)', () => {
+    // Engines built without an `isToolSideEffect` callback keep
+    // the original behavior (the gate skips when caps=[]). The
+    // fix is opt-in via bootstrap wiring.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['*'] } } }), {
+      cwd: CWD,
+      effectiveCapabilities: [],
+    });
+    const decision = eng.check('bash_kill', 'misc', { process_id: 'bg-1' });
+    expect(decision.source?.section).not.toBe('subagent-effective');
+  });
+
+  test('isToolSideEffect: root engine (no envelope) skips the side-effect check', () => {
+    // Root agent (undefined effectiveCapabilities). Even with the
+    // oracle wired, the gate never fires — only child engines have
+    // an envelope to enforce.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['*'] } } }), {
+      cwd: CWD,
+      isToolSideEffect: (name) => name === 'bash_kill',
+      // effectiveCapabilities omitted ⇒ root
+    });
+    const decision = eng.check('bash_kill', 'misc', { process_id: 'bg-1' });
+    expect(decision.source?.section).not.toBe('subagent-effective');
+  });
 });
 
 // Slice 163 (review — Batch A audit hardening). reloadPolicy now

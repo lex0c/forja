@@ -690,6 +690,26 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       path: sandboxAvail.path,
       trustWarnings: sandboxAvail.trustWarnings,
     },
+    // Side-effect oracle for the §10.1 envelope gate. Closes the
+    // bash_kill / bash_output / bash_background bypass where a
+    // narrowed subagent invokes a tool whose resolver returns no
+    // caps but whose metadata declares writes / exec / bgManager
+    // dependence. `requiresBgManager` rides along because reading
+    // or signalling bg-process lifecycle IS a side effect from
+    // the envelope's perspective even when no fs write happens
+    // (e.g., bash_output is `writes:false` but reads stdout from
+    // a previously-spawned process). The callback re-reads the
+    // registry on each check (not snapshotted) so MCP tools
+    // registered post-bootstrap are observed without re-plumbing.
+    isToolSideEffect: (toolName) => {
+      const tool = toolRegistry.get(toolName);
+      if (tool === null) return false;
+      return (
+        tool.metadata.writes === true ||
+        tool.metadata.exec === true ||
+        tool.metadata.requiresBgManager === true
+      );
+    },
   });
   const permissionEngine = permResult.engine;
   const policyLayers = permResult.layerNames as ('enterprise' | 'user' | 'project' | 'session')[];

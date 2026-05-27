@@ -148,6 +148,13 @@ export interface BootstrapPermissionEngineInput {
   // when sandbox tooling is missing at probe time (other failure
   // classes wire from their own subsystems).
   failureSink?: FailureEventSink;
+  // Side-effect oracle for the subagent envelope gate. Forwarded
+  // straight to `createPermissionEngine` (EngineOptions has the
+  // doc); the CLI bootstrap builds this from the tool registry by
+  // looking up `metadata.writes || metadata.exec`. Optional so
+  // headless unit-test callers that build an engine without a
+  // registry preserve their existing setup.
+  isToolSideEffect?: (toolName: string) => boolean;
 }
 
 export interface PreflightResult {
@@ -544,6 +551,7 @@ export const bootstrapPermissionEngine = async (
     ...(sandbox !== undefined ? { sandbox } : {}),
     ...(input.telemetry !== undefined ? { telemetry: input.telemetry } : {}),
     ...(input.now !== undefined ? { now: input.now } : {}),
+    ...(input.isToolSideEffect !== undefined ? { isToolSideEffect: input.isToolSideEffect } : {}),
   });
 
   // Emit `sandbox.path_resolved` when the resolver flagged the

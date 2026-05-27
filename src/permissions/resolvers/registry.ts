@@ -46,6 +46,16 @@ export interface ResolverContext {
   // posture as `realpath`: tests omit and stay on the lexical-
   // only path; production wiring passes `fs.readlinkSync`.
   readlink?: (p: string) => string;
+  // Silences the one-time stderr warning the bash resolver emits
+  // when it observes `realpath` as undefined. The warning exists
+  // to flag accidental regression in production wiring; tests that
+  // INTENTIONALLY omit `realpath` (per the comments above) set
+  // this flag to keep the test log clean.
+  //
+  // Production callers MUST leave this undefined / false — the
+  // warning is the audit signal that flags accidental removal of
+  // the symlink-escape defense.
+  suppressDegradeWarnings?: boolean;
 }
 
 export type Resolver = (args: Record<string, unknown>, ctx: ResolverContext) => ResolverResult;
