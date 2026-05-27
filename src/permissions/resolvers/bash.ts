@@ -169,9 +169,7 @@ const RED_FLAG_NODES: ReadonlyMap<string, string> = new Map([
     'variable_assignment prefix (PATH=/tmp cmd): can override binary resolution',
   ],
   ['subscript', 'array_subscript: indexed/associative array access'],
-  ['regex', 'regex_match (=~): runtime evaluation'],
   ['ansi_c_string', "ansi_c_string ($'...'): escape semantics not modeled"],
-  ['translated_string', 'translated_string ($"..."): locale-dependent'],
   ['heredoc_redirect', 'heredoc_redirect (<<DELIM): body interpretation not modeled'],
   ['herestring_redirect', 'herestring_redirect (<<<): body interpretation not modeled'],
   ['if_statement', 'if_statement: control flow not modeled'],
@@ -183,20 +181,27 @@ const RED_FLAG_NODES: ReadonlyMap<string, string> = new Map([
   ['negated_command', 'negated_command (!cmd): control flow not modeled'],
   ['test_command', 'test_command ([[ ]]): conditional context'],
   ['test_operator', 'test_operator: conditional context'],
-  // Slice 178 (review — P2 defense in depth). Three node shapes
-  // that pre-slice walked past the analyzer's whitelist check
-  // without a direct refuse mapping. Adding them here closes the
-  // window: any AST containing one of these now hits the
-  // RED_FLAG_NODES refuse path with a specific diagnostic instead
-  // of falling through to `unsupported_shape` (which is correct
-  // but less specific). Defense in depth — the
-  // WHITELIST_NODE_TYPES check is the primary gate.
-  ['array_assignment', 'array_assignment (arr=(a b c)): runtime list expansion'],
-  [
-    'coproc_statement',
-    'coproc_statement (coproc cmd): background coprocess with bidirectional pipes',
-  ],
-  ['last_pipe', 'last_pipe (|& or pipefail-shape): error-propagation semantics not modeled'],
+  // M-nit-1 follow-up: 5 entries removed after empirical probe via
+  // the H1 grammar-drift snapshot suite confirmed they were dead
+  // under tree-sitter-bash@0.25.1:
+  //   - 'regex' — `=~` parses as binary_expression INSIDE test_command;
+  //     defense fires via test_command.
+  //   - 'translated_string' — `$"..."` parses as regular string with
+  //     a leading `$` word; no distinct node-kind. Defense via the
+  //     normal string walker path.
+  //   - 'array_assignment' — `arr=(a b c)` parses as variable_assignment
+  //     with an `array` child node; defense via variable_assignment.
+  //   - 'coproc_statement' — `coproc cmd` parses as a regular command
+  //     with `coproc` as command_name; defense via unknown_command
+  //     refuse (coproc not in COMMAND_TABLE).
+  //   - 'last_pipe' — `|&` is an anonymous operator token inside
+  //     pipeline; no distinct node-kind, but pipeline-to-shell
+  //     detection (detectPipeToShell) still catches the threat shape.
+  //
+  // If a future grammar version introduces a distinct node-kind for
+  // any of these, the H1 snapshot suite surfaces the new kind via
+  // its meta-test failure, and the entry can be re-added at that
+  // time with the up-to-date name.
 ]);
 
 // Hard refuses by command name. §13 reject list from
@@ -682,6 +687,19 @@ const RM_REFUSE_ROOTS: ReadonlySet<string> = new Set([
 // confirm — same blast radius, different policy posture. List
 // resolved against `ctx.home` at check time so per-user paths
 // (`/home/alice/.ssh`, `/Users/bob/.ssh`) all hit the same rule.
+//
+// Known gap (M-nit-2 review): the resolved set is anchored on
+// `ctx.home`, so `rm -rf /home/OTHER_USER/.ssh` (literal absolute
+// path targeting another operator's home) does NOT match this rule.
+// `/home/OTHER_USER` is also not in RM_REFUSE_ROOTS (only `/home`
+// root is), and `classifyProtectedPath` resolves
+// tildeEscalateDirs against `ctx.home` too. Net: the call resolves
+// to a normal `delete-fs` capability and falls to operator policy.
+// Tradeoff: hard-refusing every absolute path under `/home/*` would
+// break legitimate sysadmin workflows (`rm /home/old-user/...`
+// during account cleanup); pinning the behavior in a test (see
+// resolvers.test.ts "M5 other-user home") lets policy operators
+// gate this case with an explicit deny rule if they need to.
 //
 // Coverage:
 //   .ssh           — SSH private keys + authorized_keys
@@ -3071,6 +3089,14 @@ const tierRank = (t: 'deny' | 'escalate' | null): number =>
 // to avoid log spam) and only when the caller didn't opt out via
 // `ctx.suppressDegradeWarnings`. Production wiring leaves the flag
 // undefined; the warning is the audit signal that flags regression.
+//
+// TODO (M-nit-3 follow-up): currently writes to stderr. In headless
+// / CI environments where stderr isn't captured, the warning can be
+// swallowed silently. Promote to a `failure_events` row via
+// `ctx.failureSink?.emit({code: 'permissions.realpath_unwired', ...})`
+// once ResolverContext carries the failure sink. The tamper-evident
+// failure_events table is queryable and survives operator log
+// rotation; stderr alone doesn't.
 let realpathMissingWarned = false;
 const warnRealpathMissingOnce = (ctx: ResolverContext): void => {
   if (realpathMissingWarned) return;

@@ -927,6 +927,35 @@ describe('bash resolver — M5 home credential/config dir refuse', () => {
     const r = resolveCapabilities('bash', { command: 'rm -rf ~/.aws' }, CTX);
     expect(r.kind).toBe('refuse');
   });
+
+  test('M5 other-user home: rm -rf /home/other/.ssh is NOT M5-refused (operator policy gate)', () => {
+    // Known gap (M-nit-2 review): CTX.home is '/work/proj', so the
+    // command targets a literal path under another user's home
+    // (`/home/operator/.ssh`). The resolved string doesn't match
+    // any entry in refusedHomeDirs (built from ctx.home), and
+    // `/home` is the only RM_REFUSE_ROOTS entry under that prefix
+    // (not `/home/<other>`). classifyProtectedPath resolves
+    // tildeEscalateDirs against ctx.home too, so the path doesn't
+    // hit there either. The call falls through to a normal
+    // delete-fs capability; operator policy is the final gate.
+    //
+    // Tradeoff: hard-refusing every absolute path under `/home/*`
+    // would break legitimate sysadmin workflows (`rm
+    // /home/old-user/...` during account cleanup). Pinning the
+    // behavior here means a future refactor that hardens this
+    // path surfaces the change explicitly via this test.
+    const r = resolveCapabilities('bash', { command: 'rm -rf /home/operator/.ssh' }, CTX);
+    if (r.kind === 'refuse') {
+      // If refused, reason MUST NOT cite M5 — that would mean M5
+      // grew an unexpected match.
+      expect(r.reason).not.toContain('credential/config dir');
+    } else {
+      expect(r.kind).toBe('ok');
+      if (r.kind === 'ok') {
+        expect(capStrings(r.capabilities)).toContain('delete-fs:/home/operator/.ssh');
+      }
+    }
+  });
 });
 
 // M6 (review): shell-as-command. `bash script.sh`, `sh -c '...'`,

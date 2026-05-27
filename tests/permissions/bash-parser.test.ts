@@ -184,11 +184,12 @@ describe('parseBash — rate-limit window (DoS hardening)', () => {
 // and the grammar update PR is blocked until the resolver's
 // whitelist + red-flag tables are updated alongside.
 //
-// Coverage: every LIVE entry in RED_FLAG_NODES (20 of 25 kinds —
-// the other 5 are dead under v0.25.1; see meta-test exclusion
-// list) plus the load-bearing WHITELIST entries (program, command,
-// command_name, pipeline, list, file_redirect, redirected_statement,
-// string, raw_string, concatenation, number).
+// Coverage: every entry in RED_FLAG_NODES plus the load-bearing
+// WHITELIST entries (program, command, command_name, pipeline, list,
+// file_redirect, redirected_statement, string, raw_string,
+// concatenation, number). RED_FLAG_NODES was pruned in M-nit-1 of
+// 5 dead entries that this snapshot's earlier run revealed; the
+// table now contains only kinds the grammar actively emits.
 describe('parseBash — node-kind snapshot (H1 grammar drift defense)', () => {
   // Collect every distinct node.type appearing under the parsed root.
   // Tree-sitter walks include anonymous nodes (punctuation literals
@@ -357,24 +358,15 @@ describe('parseBash — node-kind snapshot (H1 grammar drift defense)', () => {
     // surfaces it. The list is hardcoded mirror of bash.ts —
     // staying in sync IS the test.
     //
-    // Dead entries — empirically confirmed via probe that
-    // tree-sitter-bash@0.25.1 does NOT emit these node-kinds for
-    // any input shape:
-    //   - `regex` — `=~` is parsed as binary_expression with the
-    //     `=~` operator inside test_command.
-    //   - `translated_string` — `$"..."` is parsed as regular
-    //     string with a leading `$` word.
-    //   - `array_assignment` — `arr=(a b c)` is parsed as
-    //     variable_assignment with an `array` child.
-    //   - `coproc_statement` — `coproc cmd` is parsed as a regular
-    //     command with `coproc` as command_name.
-    //   - `last_pipe` — `cmd1 |& cmd2` is parsed as pipeline with
-    //     `|&` as an anonymous operator token.
-    //
-    // Dead entries stay in RED_FLAG_NODES as forward-compat against
-    // grammar updates that might introduce these distinct kinds.
-    // Removing them is tracked separately; the snapshot only
-    // enforces coverage of the LIVE kinds confirmed by probe.
+    // RED_FLAG_NODES post-M-nit-1 pruning. Each kind here MUST be
+    // emitted by tree-sitter-bash@0.25.1 for at least one shape;
+    // the 5 dead entries this snapshot surfaced (regex,
+    // translated_string, array_assignment, coproc_statement,
+    // last_pipe) were removed from RED_FLAG_NODES in bash.ts and
+    // are no longer listed below. If a future grammar version
+    // introduces a new kind, the test that exercises that shape
+    // surfaces it via the "Grammar drift" error message — the
+    // table can then re-grow to match.
     const liveRedFlagKinds = [
       'command_substitution',
       'process_substitution',
