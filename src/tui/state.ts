@@ -140,6 +140,25 @@ export interface StatusState {
   // animate per-memory-write — too much noise for too little
   // signal). 0 == no segment rendered.
   memoryCount: number;
+  // Source: session:banner. Persists across session:start boundaries
+  // (each REPL submit is its own harness session, but the operator
+  // sees the REPL as one).
+  contextWindow: number;
+  // REPL-scoped (does NOT reset on session:start) so the chip
+  // accumulates across the operator's whole REPL run.
+  sessionTotalTokens: number;
+  // inputTokens + cacheRead + cacheCreation of the latest turn —
+  // what occupied the context window when the model generated.
+  lastTurnContextTokens: number;
+  // Cache breakdown across the whole REPL session. Hit-rate chip
+  // reads `sessionCacheRead / (sessionCacheRead + sessionCacheCreation
+  // + sessionUncachedInput)` — fraction of input that arrived cached.
+  // The three categories are mutually exclusive on the Anthropic
+  // shape (input = paid full rate; cacheRead = paid 0.1×; cacheCreation
+  // = paid 1.25×), so their sum is the canonical "input billed" total.
+  sessionCacheRead: number;
+  sessionCacheCreation: number;
+  sessionUncachedInput: number;
 }
 
 export interface PendingAssistant {
@@ -474,6 +493,12 @@ export const createInitialState = (): LiveState => ({
     maxCostUsd: null,
     planMode: false,
     memoryCount: 0,
+    contextWindow: 0,
+    sessionTotalTokens: 0,
+    lastTurnContextTokens: 0,
+    sessionCacheRead: 0,
+    sessionCacheCreation: 0,
+    sessionUncachedInput: 0,
   },
   activeTools: new Map(),
   pendingToolEndBatch: null,
@@ -898,8 +923,18 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
     }
 
     case 'session:banner':
+      // Banner is the earliest carrier of provider capabilities; mirror
+      // model + contextWindow onto status so the footer renders during
+      // the idle window between boot and first user submit.
       return {
-        state,
+        state: {
+          ...state,
+          status: {
+            ...state.status,
+            model: event.model,
+            contextWindow: event.contextWindow,
+          },
+        },
         permanent: [
           {
             kind: 'session-banner',
@@ -1010,6 +1045,24 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       const text = buf?.text ?? '';
       const durationMs = buf !== null ? event.ts - buf.startedAt : null;
       const outputTokens = buf?.outputTokens ?? null;
+      // Aggregate at the turn boundary (not on `assistant:usage`):
+      // Anthropic streams cumulative counts, so reading the buffer's
+      // final snapshot avoids double-counting.
+      const input = buf?.inputTokens ?? 0;
+      const cacheRead = buf?.cacheRead ?? 0;
+      const cacheCreation = buf?.cacheCreation ?? 0;
+      const output = outputTokens ?? 0;
+      const turnContext = input + cacheRead + cacheCreation;
+      const status: StatusState = {
+        ...state.status,
+        sessionTotalTokens: state.status.sessionTotalTokens + turnContext + output,
+        // Fallback to the prior value when the turn yielded no usage
+        // event (provider edge case) so the chip doesn't flicker to 0%.
+        lastTurnContextTokens: turnContext > 0 ? turnContext : state.status.lastTurnContextTokens,
+        sessionUncachedInput: state.status.sessionUncachedInput + input,
+        sessionCacheRead: state.status.sessionCacheRead + cacheRead,
+        sessionCacheCreation: state.status.sessionCacheCreation + cacheCreation,
+      };
       // Emit a permanent ONLY when there's prose to land in
       // scrollback. Tool-only turns (Anthropic emits tool_use
       // blocks without accompanying text) used to also emit so the
@@ -1022,7 +1075,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // tool-heavy flows and undermines the differential anti-flicker.
       const permanent: PermanentItem[] =
         text.length > 0 ? [{ kind: 'assistant', text, durationMs, outputTokens }] : [];
-      return { state: { ...state, pendingAssistant: null }, permanent };
+      return { state: { ...state, status, pendingAssistant: null }, permanent };
     }
 
     case 'thinking:start':

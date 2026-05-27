@@ -683,6 +683,11 @@ export interface HarnessConfig {
   bgLogDir?: string;
   cwd: string;
   systemPrompt?: string;
+  // Per-segment view of the same prompt for adapters that support
+  // multi-block cache marking (Anthropic). When set,
+  // `flattenSystemSegments(systemSegments) === systemPrompt`.
+  // Adapters that ignore segments read `systemPrompt` directly.
+  systemSegments?: import('../providers/types.ts').SystemSegment[];
   // SHA256 hex of the assembled system prompt, recorded in
   // `prompt_versions` (AUDIT.md §1.3). The loop stamps this on every
   // `messages.prompt_hash` and `tool_calls.prompt_hash` row so the

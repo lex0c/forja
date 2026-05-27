@@ -11,6 +11,7 @@ import { mergeTrustedHosts } from '../permissions/bootstrap-engine.ts';
 import { parseCapability } from '../permissions/capabilities.ts';
 import { createPermissionEngine, createSqliteSink, ensureInstallId } from '../permissions/index.ts';
 import { type Provider, createDefaultRegistry } from '../providers/index.ts';
+import type { SystemSegment } from '../providers/types.ts';
 import {
   type DB,
   closeDb,
@@ -880,6 +881,14 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     // "no memory" / "wantsMemory=false" branch without special
     // casing on the consumer side.
     let eagerExposures: ReturnType<typeof assembleMemorySection>['eagerLoaded'] = [];
+    // Snapshot the stable prefix (playbook + reference + schema +
+    // reflection + parallel hint) before memory is appended. Same
+    // shape as bootstrap.ts emits for the parent: an Anthropic
+    // adapter sees two segments and places the breakpoint between
+    // them, so a child's `memory_read` mid-run only invalidates the
+    // memory segment, not the playbook prefix.
+    const stableSegmentText = resolvedSystemPrompt;
+    let memorySegmentText = '';
     if (opts.memoryCwd !== undefined && wantsMemory) {
       // Resolve repo root from the parent's cwd. Same fix as
       // bootstrap.ts: parent's invocation cwd may be a subdir
@@ -931,7 +940,17 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       });
       resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, memorySection.text) ?? '';
       eagerExposures = memorySection.eagerLoaded;
+      memorySegmentText = memorySection.text;
     }
+    // Build the segment list mirroring resolvedSystemPrompt. The
+    // invariant `flattenSystemSegments(segments) === systemPrompt`
+    // must hold — both adapters and audit see identical bytes.
+    const resolvedSystemSegments: SystemSegment[] = [
+      { id: 'stable', text: stableSegmentText, cacheBreakpoint: true },
+      ...(memorySegmentText.length > 0
+        ? [{ id: 'memory' as const, text: memorySegmentText, cacheBreakpoint: true }]
+        : []),
+    ];
 
     // Register the subagent's assembled prompt in `prompt_versions`
     // (AUDIT.md §1.3.3) as kind 'playbook'. Idempotent by hash so a
@@ -1020,6 +1039,7 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       db,
       cwd: session.cwd,
       systemPrompt: resolvedSystemPrompt,
+      systemSegments: resolvedSystemSegments,
       ...(systemPromptHash !== undefined ? { systemPromptHash } : {}),
       userPrompt,
       preassignedSessionId: opts.sessionId,

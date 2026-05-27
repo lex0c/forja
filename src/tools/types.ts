@@ -31,8 +31,12 @@ export interface ToolError {
 
 export type ToolResult<O> = O | ToolError;
 
-export const isToolError = <O>(r: ToolResult<O>): r is ToolError =>
-  typeof r === 'object' && r !== null && (r as ToolError).is_error === true;
+// Accepts `unknown` so callers holding a value of indeterminate
+// shape (e.g., the `summarize` hook receives `result: unknown`)
+// can narrow without a multi-step cast. The duck-type check is
+// the same regardless of compile-time shape.
+export const isToolError = (r: unknown): r is ToolError =>
+  typeof r === 'object' && r !== null && (r as { is_error?: unknown }).is_error === true;
 
 // Display hints from CONTRACTS §2 cláusula 7. Pure metadata for the UI;
 // the harness ignores them.
@@ -135,6 +139,43 @@ export interface ToolMetadata {
     latency_ms_typical?: number;
     max_output_bytes?: number;
   };
+  // Deterministic output summarizer. The harness calls this AFTER
+  // `tool.execute()` settles AND AFTER the raw result is persisted
+  // to the `tool_calls.output` audit column — only the model-facing
+  // copy (the next-turn `tool_result.content`) is reduced.
+  //
+  // Tools with outputs that can grow into tens of KB (bash stdout,
+  // grep hit lists, glob match arrays) attach a summarizer that
+  // returns a shrunken result of the SAME shape. The harness
+  // prepends a `[forja:output_summarized policy=X original_bytes=N]`
+  // marker so the model knows what it's reading is a digest, not
+  // the full output, and can re-invoke the tool with narrower args
+  // if it needs detail.
+  //
+  // Implementations MUST be pure (no I/O, no time-dependence) so
+  // audit-replay reproduces the same digest.
+  summarize?: (result: unknown, args: Record<string, unknown>) => SummarizedOutput;
+}
+
+// Result of a `ToolMetadata.summarize` call. Carries the reduced
+// result object (same shape as the raw result), a flag indicating
+// whether any reduction actually happened, and the diagnostic
+// fields the harness encodes into the marker.
+export interface SummarizedOutput {
+  // The result object the harness JSON-stringifies into the
+  // model's `tool_result.content`. Same shape as the raw result;
+  // only the heavy string fields inside are shorter.
+  result: unknown;
+  // True iff at least one byte was dropped. When false, the harness
+  // sends the raw result through unchanged and emits no marker.
+  reduced: boolean;
+  // Pre-summary byte count of the JSON-serialized raw result.
+  // Surfaced in the marker so the model sees the magnitude of
+  // what was elided.
+  originalBytes: number;
+  // Policy label — drives the marker text. Free-form; the tool
+  // and the harness share the strings.
+  policy: string;
 }
 
 export interface ToolContext {

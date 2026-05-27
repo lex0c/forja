@@ -4,7 +4,14 @@ import {
   type BrokerRequest,
   type BrokerResponse,
 } from '../../broker/index.ts';
-import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
+import { HEAD_TAIL_DEFAULT_LINES, headTailSummary } from '../output-summarizer.ts';
+import {
+  ERROR_CODES,
+  type SummarizedOutput,
+  type Tool,
+  type ToolResult,
+  toolError,
+} from '../types.ts';
 import { resolveAndValidateBashCwd } from './_bash-cwd.ts';
 
 // Buffer above the handler's effective timeout for the broker
@@ -104,6 +111,7 @@ export const bashTool: Tool<BashInput, BashOutput> = {
     idempotent: false,
     display: 'raw',
     cost: { latency_ms_typical: 100, max_output_bytes: 4 * 1024 * 1024 },
+    summarize: (result) => summarizeBashOutput(result),
   },
   async execute(args, ctx): Promise<ToolResult<BashOutput>> {
     if (ctx.signal.aborted) {
@@ -241,4 +249,51 @@ export const bashTool: Tool<BashInput, BashOutput> = {
       truncated: stdoutTruncated || stderrTruncated,
     };
   },
+};
+
+// Per-stream byte threshold for the head-tail summarizer. Set
+// lower than bash's 4 MiB raw-output cap on purpose — even a 64 KB
+// stdout is heavy to carry across multiple turns, while a typical
+// bash command produces a few hundred bytes. The threshold is the
+// inflection point where keeping the full output costs more in
+// context than the elision marker costs in fidelity.
+const BASH_SUMMARIZE_THRESHOLD = 16 * 1024;
+
+// Bash result summarizer. Head-tails stdout and stderr
+// independently (operators read each as a separate stream;
+// concatenating before slicing would mix them). Leaves the small
+// scalar fields (`exit_code`, `duration_ms`, `timed_out`,
+// `truncated`) untouched — they're load-bearing and tiny.
+//
+// Contract: invoked only on success results. The harness routes
+// ToolError shapes through a separate path that never reaches
+// `metadata.summarize`.
+const summarizeBashOutput = (result: unknown): SummarizedOutput => {
+  const out = result as BashOutput;
+  const opts = {
+    maxBytes: BASH_SUMMARIZE_THRESHOLD,
+    headLines: HEAD_TAIL_DEFAULT_LINES,
+    tailLines: HEAD_TAIL_DEFAULT_LINES,
+  };
+  const stdoutSummary = headTailSummary(out.stdout, opts);
+  const stderrSummary = headTailSummary(out.stderr, opts);
+  const reduced = stdoutSummary.reduced || stderrSummary.reduced;
+  if (!reduced) {
+    return {
+      result,
+      reduced: false,
+      originalBytes: stdoutSummary.originalBytes + stderrSummary.originalBytes,
+      policy: 'noop',
+    };
+  }
+  return {
+    result: {
+      ...out,
+      stdout: stdoutSummary.text,
+      stderr: stderrSummary.text,
+    },
+    reduced: true,
+    originalBytes: stdoutSummary.originalBytes + stderrSummary.originalBytes,
+    policy: 'head_tail',
+  };
 };

@@ -128,9 +128,49 @@ export interface ProviderToolDef {
   input_schema: ProviderToolInputSchema;
 }
 
+// One slice of the system prompt with its own cache-invalidation
+// envelope. Adapters that support per-segment cache marking
+// (Anthropic) honor `cacheBreakpoint: true` by emitting a
+// `cache_control` marker after the segment. Adapters without
+// per-segment caching (OpenAI, Google) flatten the array to a
+// single string — see `flattenSystemSegments` below.
+//
+// Spec: CONTEXT_TUNING.md §3.1 declares 4 breakpoints in the
+// system+prefix area; this type is the producer-side surface the
+// Anthropic adapter consumes to anchor them.
+export interface SystemSegment {
+  // Diagnostic id — lets future cache-stats audit attribute
+  // invalidation to a specific segment. Producer (bootstrap) and
+  // consumer (anthropic cache) share the strings; extend the union
+  // when a new segment type lands.
+  id: 'stable' | 'memory';
+  text: string;
+  // When true, the adapter emits a cache breakpoint marker after
+  // this segment. Other adapters ignore the flag.
+  cacheBreakpoint?: boolean;
+}
+
+// Flatten a SystemSegment[] back into the concatenated string form
+// other providers (OpenAI, Google) and the audit/hash path require.
+// Joins with the same `\n\n` separator `composeSystemPrompt` uses
+// when fusing sections so adapters reading the string see identical
+// content to the Anthropic adapter reading the segments.
+export const flattenSystemSegments = (segments: SystemSegment[]): string =>
+  segments
+    .map((s) => s.text)
+    .filter((t) => t.length > 0)
+    .join('\n\n');
+
 export interface GenerateRequest {
   model: string;
   system?: string;
+  // Optional structured form. When set, adapters that support
+  // per-segment cache marking use it; others fall back to `system`.
+  // Producer MUST set both when emitting segments — `system` is the
+  // canonical string for hash/audit, `systemSegments` is the
+  // adapter-side cache hint. `flattenSystemSegments(systemSegments)`
+  // must equal `system` (asserted in tests).
+  systemSegments?: SystemSegment[];
   messages: ProviderMessage[];
   tools?: ProviderToolDef[];
   max_tokens: number;

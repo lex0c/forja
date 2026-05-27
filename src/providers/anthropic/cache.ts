@@ -1,5 +1,5 @@
 import type Anthropic from '@anthropic-ai/sdk';
-import type { ProviderContentBlock, ProviderMessage } from '../types.ts';
+import type { ProviderContentBlock, ProviderMessage, SystemSegment } from '../types.ts';
 
 // Anchor `cache_control: { type: 'ephemeral' }` markers at the
 // breakpoints CONTEXT_TUNING.md §3.1 declares. Each marker tells
@@ -8,31 +8,33 @@ import type { ProviderContentBlock, ProviderMessage } from '../types.ts';
 // 5-minute ephemeral cache (read at 0.10× input cost vs 1.00×
 // uncached) instead of paying the full input price every turn.
 //
-// CONTEXT_TUNING.md §3.1 declares four breakpoints —
-//   1. after [system]
-//   2. after [tool_schemas]
-//   3. after [project_context]   (AGENTS.md)
-//   4. after [memory_index]
-// — but Forja's current system-prompt composition fuses
-// [system], [project_context], and [memory_index] into a single
-// concatenated string at `composeSystemPrompt` (`memory-prompt.ts:225`).
-// Splitting the string back into four discrete TextBlockParams
-// would require restructuring the prompt assembly pipeline; out of
-// scope for this slice. We anchor three breakpoints instead:
+// Forja's layout anchors the four breakpoints Anthropic permits
+// per request:
 //
-//   - system block (combines #1, #3, #4 — invalidates together
-//     when memory_index or project_context changes)
-//   - last tool (= #2)
-//   - last message's last content block (the conversation tail
-//     anchor; lets each turn cache everything it just sent so the
-//     next turn reads ~70% of input from cache)
+//   1. stable system segment (identity + env + ergonomics +
+//      constraints + project pointer — each invalidates rarely,
+//      fused into one envelope)
+//   2. memory + skills segment (invalidates on `memory_write`
+//      and skill catalog changes — the high-churn segment)
+//   3. last tool (cache_control on the final tool definition
+//      anchors the whole tool list as one unit)
+//   4. conversation tail (cache_control on the last message's
+//      last content block — moves each turn, so prior turns
+//      read at 0.10× cached rate)
 //
-// The fourth breakpoint becomes recoverable by splitting
-// `composeSystemPrompt` into a TextBlockParam[] producer; tracked
-// for a follow-up. The economics of the three-breakpoint layout
-// already capture the dominant input-cost reduction documented in
-// PROVIDERS.md §5.1 ("Cache amortiza custo em sessão longa em
-// ~70% no input").
+// CONTEXT_TUNING.md §3.1 lists [project_context] as a separate
+// breakpoint, but adding a 5th marker would exceed Anthropic's
+// per-request cap and force dropping the tail anchor — which
+// amortizes intra-session growth and has much higher economic
+// impact than isolating a small pointer. Project pointer fuses
+// with the stable segment.
+//
+// Producer side: bootstrap emits `systemSegments` alongside the
+// canonical `systemPrompt` string, with breakpoint flags on the
+// stable and memory segments. `systemSegmentsWithCacheBreakpoints`
+// (below) honors the flags. Other providers ignore segments and
+// read the concatenated `system` string; `flattenSystemSegments`
+// guarantees both surfaces see identical content.
 
 const EPHEMERAL: Anthropic.CacheControlEphemeral = { type: 'ephemeral' };
 
@@ -46,6 +48,28 @@ export const systemWithCacheBreakpoint = (
 ): Anthropic.TextBlockParam[] | undefined => {
   if (system === undefined || system.length === 0) return undefined;
   return [{ type: 'text', text: system, cache_control: EPHEMERAL }];
+};
+
+// Multi-segment variant. Each `SystemSegment` becomes its own
+// TextBlockParam; segments with `cacheBreakpoint: true` get a
+// cache_control marker after them, splitting the prefix into
+// distinct invalidation envelopes. Drops empty-text segments
+// silently — they would render as empty blocks and waste a
+// breakpoint slot. Returns undefined when nothing survives the
+// filter so callers fall back to the request's `system` string.
+export const systemSegmentsWithCacheBreakpoints = (
+  segments: SystemSegment[],
+): Anthropic.TextBlockParam[] | undefined => {
+  const blocks: Anthropic.TextBlockParam[] = [];
+  for (const seg of segments) {
+    if (seg.text.length === 0) continue;
+    blocks.push(
+      seg.cacheBreakpoint
+        ? { type: 'text', text: seg.text, cache_control: EPHEMERAL }
+        : { type: 'text', text: seg.text },
+    );
+  }
+  return blocks.length === 0 ? undefined : blocks;
 };
 
 // Attach a cache_control marker to the LAST tool in the array.
@@ -114,9 +138,9 @@ export const messagesWithTailCacheBreakpoint = (
 
 // Defensive helper: count cache_control markers across a request.
 // Anthropic enforces a hard limit of 4 breakpoints per request and
-// 400s the call when exceeded. Three is the planned layout
-// (system + last tool + tail message); future work that adds the
-// fourth (memory_index split) must update this assertion.
+// 400s the call when exceeded. The layout maxes at 4 (stable
+// system + memory + last tool + tail). Adding a 5th would force
+// dropping one of the existing four.
 export const countCacheBreakpoints = (req: {
   system?: Anthropic.TextBlockParam[] | undefined;
   tools?: Anthropic.Tool[] | undefined;

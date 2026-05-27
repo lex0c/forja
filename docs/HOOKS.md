@@ -248,7 +248,7 @@ The harness aggregates `additionalContext` across the chain in execution order (
 - `PostToolUse` context → appended to the same `tool_result.content` under `event=PostToolUse` markers. On failures, `PostToolUseFailure` context appends after `PostToolUse`'s.
 - `UserPromptSubmit` context → injected ahead of the user's prompt in the context window.
 
-The markers are stable strings the model is trained to recognize as side-channel context rather than tool output.
+The markers are stable strings the model is trained to recognize as side-channel context rather than tool output. They coexist with other harness-injected markers — see `OUTPUT_POLICY.md §4` for the canonical ordering when multiple apply to the same `tool_result.content` (summarize → injection → hook-context).
 
 ### 7.2 updatedInput
 

@@ -141,7 +141,7 @@ describe('formatPermanent', () => {
     });
   });
 
-  describe('session-banner (UI.md §4.10.9 — 3 blocks)', () => {
+  describe('session-banner', () => {
     const baseBanner = {
       kind: 'session-banner' as const,
       app: 'forja',
@@ -156,17 +156,10 @@ describe('formatPermanent', () => {
       ],
     };
 
-    test('emits title / identity / cwd / env in 3 blocks separated by blank lines (Unicode)', () => {
-      // Each line padded with the §6.3 frame margin (2sp). UI.md §4.10.9
-      // splits the banner into title · identity (model + limits + cwd)
-      // · env, separated by blank lines.
+    test('emits title + cwd only — no identity, no env block', () => {
       expect(formatPermanent(baseBanner, unicode)).toEqual([
         pad('forja v0.1.0'),
-        pad(''),
-        pad('anthropic/claude-sonnet-4-6 · 200k ctx · max 4096 out'),
         pad('/home/lex/forja'),
-        pad(''),
-        pad('subagents: 2 · ✓ checkpoints'),
       ]);
     });
 
@@ -175,65 +168,34 @@ describe('formatPermanent', () => {
       expect(out[0]).toBe(pad('forja v2.3.4'));
     });
 
-    test('falls back to ASCII glyphs (* for ✓, - for ·) when unicode disabled', () => {
-      const out = formatPermanent(baseBanner, ascii);
-      // Block 2 identity uses the same separator.
-      expect(out[2]).toBe(pad('anthropic/claude-sonnet-4-6 - 200k ctx - max 4096 out'));
-      // Block 3 env (after blank at index 4).
-      expect(out[5]).toBe(pad('subagents: 2 - * checkpoints'));
+    test('title paints app bold and version secondary (when color enabled)', () => {
+      const out = formatPermanent(baseBanner, colored);
+      // bold = SGR 1, secondary = SGR 90. Each segment carries its
+      // own wrap so the version reads as meta against the app name.
+      expect(out[0]).toContain('\x1b[1mforja\x1b[0m');
+      expect(out[0]).toContain('\x1b[90mv0.1.0\x1b[0m');
     });
 
-    test('omits env block entirely when env is empty', () => {
-      const out = formatPermanent({ ...baseBanner, env: [] }, ascii);
-      // title + blank + identity + cwd. Banner ends after the cwd line.
-      expect(out).toEqual([
-        pad('forja v0.1.0'),
-        pad(''),
-        pad('anthropic/claude-sonnet-4-6 - 200k ctx - max 4096 out'),
-        pad('/home/lex/forja'),
-      ]);
-    });
-
-    test('flag with count renders as ✓ name (count)', () => {
-      const out = formatPermanent(
-        {
-          ...baseBanner,
-          env: [{ kind: 'flag' as const, name: 'memory', count: 14 }],
-        },
-        unicode,
-      );
-      expect(out[5]).toBe(pad('✓ memory (14)'));
-    });
-
-    test('mixes flag + meta entries joined by dim · separator', () => {
+    test('env contents do NOT leak into the rendered banner', () => {
+      // env still rides on the PermanentItem for NDJSON / audit,
+      // but the TUI renderer must not surface flag names or meta
+      // values regardless of how rich the env payload is.
       const out = formatPermanent(
         {
           ...baseBanner,
           env: [
             { kind: 'meta' as const, key: 'policy', value: 'project (5 rules)' },
-            { kind: 'meta' as const, key: 'subagents', value: '2' },
             { kind: 'flag' as const, name: 'checkpoints' },
             { kind: 'flag' as const, name: 'memory', count: 14 },
           ],
         },
         unicode,
       );
-      expect(out[5]).toBe(
-        pad('policy: project (5 rules) · subagents: 2 · ✓ checkpoints · ✓ memory (14)'),
-      );
-    });
-
-    test('applies bold to title, secondary to identity/cwd and to the whole env line', () => {
-      const out = formatPermanent(baseBanner, colored);
-      // 0: title (bold), 1: blank, 2: identity (secondary), 3: cwd (secondary),
-      // 4: blank, 5: env (uniformly secondary).
-      expect(out[0]).toContain(`${CSI}1m`);
-      expect(out[2]).toContain(`${CSI}90m`);
-      expect(out[3]).toContain(`${CSI}90m`);
-      expect(out[5]).toContain(`${CSI}90m`);
-      // env line carries no success / dim runs — one secondary run.
-      expect(out[5]).not.toContain(`${CSI}32m`);
-      expect(out[5]).not.toContain(`${CSI}2m`);
+      expect(out).toHaveLength(2);
+      const joined = out.join('\n');
+      expect(joined).not.toContain('checkpoints');
+      expect(joined).not.toContain('memory');
+      expect(joined).not.toContain('policy');
     });
 
     test('emits no SGR when color disabled', () => {

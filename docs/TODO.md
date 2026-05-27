@@ -1139,3 +1139,537 @@ keeping cwd redirects" that glob can't express precisely.
 schema would change), `SECURITY_GUIDELINE.md` (threat model
 adjustments), `src/permissions/matcher.ts` (current glob
 matcher to be augmented or replaced).
+
+---
+
+# Token-efficiency initiative
+
+Four related items that together close the loop on input-cost
+reduction (cache hit-rate + tool-output minimization). They were
+identified during a 2026-05-26 audit that compared Forja's runtime
+against industry observations of how mature agents extract
+token-efficiency wins (cache locality, structured compaction,
+semantic vs. generic tool output, observability of the cache
+layer).
+
+Order matters: **#3 lands first** (visibility — without it every
+other change is unfalsifiable); then **#1** (largest structural
+win); then **#4** (largest tool-loop win); **#2** is conditional
+on what #3 measures (its blast radius collapses once #1 splits
+the system block).
+
+The items are sequenced this way deliberately. Bundle order
+matches: `feat/token-eff-cache-stats` → `feat/token-eff-system-split`
+→ `feat/token-eff-output-summarize` → `feat/token-eff-today-eviction`.
+
+## Cache hit-rate observability
+
+**Status:** deferred. Field `UsageInfo.cache_read` / `cache_creation`
+(`src/providers/types.ts:58-63`) is plumbed through the assistant
+turn and consumed by `computeCost` (`src/providers/cost.ts:30-42`),
+but operator-facing surface stops there — no chip in the footer,
+no aggregate per session, no audit event, no recap line. Today
+"did caching help?" requires a manual SQL join across
+`message_usage` rows.
+
+**What it is:** expose cache health at three levels of granularity:
+
+1. **Footer chip** — `${pct}% cached`, where
+   `pct = cacheRead / (cacheRead + cacheCreation + uncachedInput)`.
+   Sits to the right of `% context used`. No `warn` color (this
+   is informational, not a saturation alert).
+2. **Per-session aggregate** — new columns on the `sessions` row
+   (`cache_read_total`, `cache_creation_total`,
+   `uncached_input_total`) updated at the end of each turn.
+3. **Audit event** — `provider:cache_stats` per turn, NDJSON-
+   consumable. Lets external tooling chart hit-rate over time
+   without re-aggregating from raw usage rows.
+4. **Recap line** — `cache: 73% (read 12k / write 4k / fresh 5k)`
+   in the session-end terse render.
+
+**Why deferred:** zero direct token savings; documented as the
+"multiplier" for the rest of this initiative. The chip surface is
+small enough to bundle with the structural fixes, but landing it
+first means subsequent work can be measured rather than asserted.
+
+**Where it would land:**
+
+- `src/tui/state.ts` — `StatusState` gains `sessionCacheRead`,
+  `sessionCacheCreation`, `sessionUncachedInput`; reducer in
+  `assistant:end` accumulates from `pendingAssistant`.
+- `src/tui/render/footer.ts` — new chip slot after `% context used`,
+  suppressed until any usage event has landed.
+- `src/storage/migrations/` — new migration adding three columns
+  to `sessions`.
+- `src/harness/loop.ts` (around the usage update site, near
+  `totalCostUsd += turnCostUsd`) — write the aggregates back.
+- `src/recap/terse.ts` (or the equivalent renderer) — new line
+  rendered from session aggregates.
+- `src/audit/events.ts` (or `src/harness/types.ts` `HarnessEvent`) —
+  declare the `provider:cache_stats` shape.
+
+**Pull-in signal:** committing to either #1 or #4 below. Without
+this surface, those changes ship blind.
+
+**Cost when pulled:** ~1 day for the chip + state slice (sliceable
+alone, demonstrable from `bun run dev`). ~1 day for migration +
+session-repo + recap + audit event.
+
+**Spec reference:** small additions to `UI.md §4.10.6` (chip)
+and `AUDIT.md` (event). No subsystem reframing.
+
+## System prompt cache-breakpoint split
+
+**Status:** deferred. `src/providers/anthropic/cache.ts:16-29`
+already documents the gap explicitly — the comment block calls
+out that fusing `[system] + [project_context] + [memory_index]`
+into a single `TextBlockParam` collapses three of the four
+breakpoints `CONTEXT_TUNING.md §3.1` declares. Today's runtime
+uses 3 of the 4 Anthropic-permitted markers (system, last tool,
+conversation tail); the fourth is reachable as soon as
+`composeSystemPrompt` (`src/cli/memory-prompt.ts:360`) returns
+structured segments instead of a concatenated string.
+
+**What it is:** change the system-prompt assembly to emit
+discrete segments, each with its own invalidation envelope:
+
+| Segment | Breakpoint | Invalidation |
+|---|---|---|
+| identity + environment + ergonomics + constraints | ✅ | cross-session, new `today` |
+| project pointer | (sub-segment of identity block) | rare — repo move |
+| memory index | ✅ | per `memory_write` / lifecycle event |
+| tools schema | ✅ (existing) | tool palette change |
+| conversation tail | ✅ (existing) | per turn |
+
+A `memory_write` mid-session today invalidates the entire CP#1
+(~6K tokens of identity + env + project + memory). After the
+split, only the memory segment (~2K tokens) re-pays cache-write
+cost. The identity prefix sails through.
+
+**Why deferred:** structural change to `GenerateRequest.system`
+contract (`src/providers/types.ts:131-167`) — touches every
+provider adapter (Anthropic, OpenAI, Google). Adapters that
+don't natively support multi-segment system blocks (OpenAI,
+Google) collapse the array back to a single concatenated string
+transparently.
+
+**Where it would land:**
+
+- `src/providers/types.ts:131-167` — `system?: string | SystemSegment[]`.
+  New type:
+
+  ```ts
+  export interface SystemSegment {
+    id: 'identity' | 'environment' | 'project' | 'memory' | …;
+    text: string;
+    cacheBreakpoint?: boolean;  // adapter-specific
+  }
+  ```
+
+- `src/cli/memory-prompt.ts:360` — `composeSystemPrompt` returns
+  `SystemSegment[]`.
+- `src/cli/bootstrap.ts:785-821` — assembler keeps the per-section
+  `composeWith*` helpers but final step produces the array
+  rather than a concatenated string.
+- `src/providers/anthropic/cache.ts:44-49` —
+  `systemWithCacheBreakpoint` accepts `SystemSegment[]`, maps
+  segments with `cacheBreakpoint: true` to `TextBlockParam` with
+  ephemeral marker.
+- `src/providers/anthropic/index.ts:88, 205` — call sites.
+- `src/providers/openai/`, `src/providers/google/` — adapters
+  collapse `SystemSegment[]` to a single string (compat path).
+- `src/providers/anthropic/cache.ts:117-145` —
+  `countCacheBreakpoints` continues to assert `≤ 4` per request;
+  the planned layout reaches exactly 4 (3 system-side + 1 tail).
+
+**New tests:**
+
+- `tests/providers/anthropic-cache.test.ts` — one breakpoint per
+  `cacheBreakpoint: true` segment.
+- A `memory_write` between turns invalidates ONLY the memory
+  segment (`cache_creation` accrues to that block; the rest
+  reads from cache).
+- Total breakpoint count stays `≤ 4` under typical Forja prompt.
+- OpenAI / Google adapters receive a concatenated string when
+  fed `SystemSegment[]` (compat regression).
+
+**Pull-in signal:** cache observability (above) has landed and
+operator can quote a baseline hit-rate.
+
+**Cost when pulled:** ~2 days. Spec PR against
+`CONTEXT_TUNING.md §3.1` ratifying the 4-breakpoint layout that
+section already predicts.
+
+**Estimated economic impact:** sessions with N memory writes
+save `(N × ~4K_tokens × cache_write_rate)`. On Opus
+($6.25/M cache write): ~$0.025 saved per memory write. Modest
+per-session, compounds with project-pointer changes and skill-
+catalog updates that today also bust the fused block.
+
+## Tool-output auto-summarization
+
+**Status:** deferred. Static caps live on each tool today —
+`src/tools/builtin/bash.ts` (4 MiB), `read-file.ts` (10 MiB /
+2000 lines), `grep.ts` (200 results), `glob.ts` (1000 matches),
+`bash-output.ts` (64 KiB / stream). The caps prevent
+catastrophic blowouts but do nothing about a "500 KB stdout that
+fits under the cap and rides the conversation history until
+compaction at 70% context fires." Largest single tool-loop win
+remaining.
+
+**What it is:** a two-tier output reduction stage that sits
+between tool execution and the `tool_result` message:
+
+**Tier 1 — deterministic policies** (no LLM, no extra latency):
+
+| Tool | Threshold | Policy |
+|---|---|---|
+| `bash` (stdout/stderr) | > 16 KB | head-tail (100 lines each + `[N lines elided]` marker) |
+| `bash_output` (background poll) | > 8 KB | head-tail (50 / 50) |
+| `read_file` | already paginated | no change |
+| `grep` | > 50 hits | group-by-file (path + count per file) |
+| `glob` | > 200 matches | head-tail by path with count |
+| `fetch_url` | > 32 KB | structure fingerprint for HTML / JSON (extract keys, drop bodies) |
+
+**Tier 2 — LLM summarizer** (opt-in per tool, Haiku-cheap):
+triggers above ~64 KB when deterministic head-tail loses too
+much signal. Prompt: "Summarize this tool output for an agent
+that called `<tool>` with goal `<goal>`. Keep only what's
+relevant. ≤ 200 tokens."
+
+Both tiers emit a marker on the `tool_result` block:
+`output_summarized: true`, `original_bytes: N`. The audit log
+(`tool_outputs` row) retains the raw output. A future
+`expand_last_output` tool can re-fetch the raw when the model
+realises it needs detail it lost.
+
+**Why deferred:** policy question (per-tool thresholds, when to
+escalate to LLM tier, how operators override) is not a runtime
+emergency. Want #3 in place first so the win is measurable;
+without it, deciding which policies pay off is guesswork.
+
+**Where it would land:**
+
+- `src/tools/output-summarizer.ts` (new) — Tier 1 policies as
+  pure functions:
+
+  ```ts
+  export interface OutputSummary {
+    summarized: string;
+    reduced: boolean;
+    originalBytes: number;
+    policy: string;  // 'head_tail' | 'group_by_file' | …
+  }
+
+  export const headTailSummary = (text: string, opts: {
+    maxBytes: number; headLines: number; tailLines: number;
+  }): OutputSummary;
+
+  export const groupByFileSummary = (matches: GrepMatch[]):
+    OutputSummary;
+
+  export const structureFingerprintSummary = (output: string):
+    OutputSummary;
+  ```
+
+- `src/tools/llm-output-summarizer.ts` (new) — Tier 2,
+  Haiku-driven, parameterized by goal + tool name.
+- `src/tools/invoke-tool.ts` — hook between tool execution and
+  `tool_result` construction. Single decision point.
+- `src/tools/builtin/{bash,grep,glob,fetch_url}.ts` — declare
+  policy + threshold in tool metadata.
+- `src/storage/repos/tool-outputs.ts` (or wherever audit
+  persistence lives) — guarantee raw output is preserved
+  irrespective of summarization.
+- `src/tools/builtin/expand_last_output.ts` (future, low
+  priority) — operator/model-driven escape hatch to re-fetch the
+  pre-summary content.
+
+**New tests:**
+
+- `bash` > 16 KB triggers `head_tail`; ≤ 16 KB passes through.
+- `grep` with 100 hits across 5 files: `group_by_file` produces
+  ~5 lines.
+- Summarized result carries `output_summarized: true`.
+- Audit log retains original after summarization.
+- LLM summarizer is not called when deterministic policy
+  reduces below threshold.
+
+**Pull-in signal:** observed hit-rate (#3) shows non-trivial
+input-cost spend on tool-result blocks. Concretely: median
+session input includes > 5K tokens of `tool_result` content per
+turn averaged across 10 sessions.
+
+**Cost when pulled:** ~3 days for Tier 1 across the four tools
++ tests. ~1 day for Tier 2 + opt-in wiring + Haiku integration.
+
+**Spec reference:** new section in `TOOL_ERGONOMICS.md`
+("Output policy"), or a sibling `OUTPUT_POLICY.md`. Cross-ref
+from `CONTEXT_TUNING.md §6` (compaction relies on outputs
+already being right-sized).
+
+**Risk:** summarization that drops a load-bearing detail. The
+`expand_last_output` escape hatch is the planned mitigation but
+not strictly required for first ship — `output_summarized: true`
+plus the per-tool policy contract is enough signal for the model
+to re-invoke the tool with narrower args.
+
+## Eviction of `today` from the cached system prefix
+
+**Status:** deferred. `src/cli/environment-prompt.ts:118` emits
+`- today: ${input.today}` inside the environment block that
+sits in cache breakpoint #1; `src/cli/bootstrap.ts:811` captures
+the value once at bootstrap. Within a session the date is
+stable and CP#1 reads cleanly; across session boundaries that
+span local midnight, CP#1 invalidates and pays a full
+`cache_creation` for the prefix.
+
+**What it is:** move the `today` field out of the cached system
+prefix. Anthropic does not expose an "ephemeral system" surface,
+so the only sane home is the first `user` message of the
+conversation:
+
+```text
+[context]
+today: 2026-05-26
+
+<actual user prompt>
+```
+
+Subsequent turns do not re-inject. A resumed session keeps the
+original `today` from when the session was first booted —
+correct semantics: continuity of the work session matters more
+than "wall-clock today" for the model's interpretation of
+relative time references inside that work.
+
+**Why deferred:** blast radius collapses once #1 (system split)
+lands. With identity + environment isolated to their own
+breakpoint segment (~1K tokens), a cross-session midnight cross
+costs ~`1K × cache_write_rate` = ~$0.006 per Opus resume — too
+small to chase in isolation. Worth doing only if #3
+measurements show cross-session resume is a common access
+pattern AND the cumulative cost shows up in operator-visible
+spend.
+
+**Where it would land:**
+
+- `src/cli/environment-prompt.ts:118` — remove the `today` line
+  from `renderEnvironmentSection`.
+- `src/cli/environment-prompt.ts` (new export) —
+  `renderTodayPreamble(today: string): string` for the first-turn
+  injection format.
+- `src/harness/loop.ts` (message-init path) — on session start,
+  prepend the preamble to the first user message before sending.
+- `src/storage/repos/sessions.ts` — persist `boot_today` on the
+  session row so resume does not re-inject.
+
+**New tests:**
+
+- `today` does not appear anywhere in the rendered system
+  prompt.
+- First turn of a fresh session carries the preamble in
+  `messages[0]`.
+- Second turn does NOT re-inject.
+- Resume from a prior session does not re-inject and keeps the
+  original `boot_today`.
+
+**Pull-in signal:** #3 measurements show > 10% of sessions
+suffer a cache miss on CP#1 due to midnight crossing OR
+operator-driven `forja resume` after the date has changed.
+Without that evidence, this is theoretical cleanup.
+
+**Cost when pulled:** ~0.5 day.
+
+**Spec reference:** small amendment to `CONTEXT_TUNING.md §1.8`
+where `today` is currently justified as part of the env block.
+
+## Anthropic `extended_cache` (1h TTL)
+
+**Status:** deferred. Forja's Anthropic adapter pins
+`cache: 'server_5min'` (see `src/providers/anthropic/capabilities.ts:6`)
+and emits `cache_control: { type: 'ephemeral' }` with no `ttl`
+field, which defaults to the 5-minute server cache. Identified
+during the post-#1/#3/#4 token-efficiency audit as the largest
+remaining cache miss vector: ANY gap > 5 minutes between turns —
+operator pausing to think, reading a long output, switching
+windows — kills the entire cache, not just one segment.
+
+**What it is:** opt into Anthropic's 1-hour extended cache
+(`CONTEXT_TUNING.md §3.3`) by emitting
+`cache_control: { type: 'ephemeral', ttl: '1h' }` and reflecting
+the capability via `cache: 'server_persistent'` (or a new
+`server_1h` variant) on `ProviderCapabilities`. Trade-off
+Anthropic discloses: cache writes cost ~2× input rate instead of
+1.25×, but reads stay at 0.10× for the full hour. Math crosses
+zero around the second turn after a > 5min gap.
+
+**Why deferred:**
+
+1. **Pricing trade-off needs real data.** A session with
+   frequent < 5min cadence between turns sees zero benefit and
+   pays slightly more on writes. Without baseline from the
+   `% cached` chip (#3), we'd ship blind on whether typical
+   operator usage actually has the > 5min gaps the 1h TTL
+   amortizes.
+2. **Per-call opt-in** vs **global setting**: Anthropic lets the
+   `ttl` ride per cache_control marker, so a more nuanced policy
+   could mark the high-stability segments (stable + memory) with
+   `1h` and leave the conversation tail at `5min` (tail moves
+   every turn anyway). That mixed policy might dominate either
+   pure default — but it adds complexity worth validating with
+   data first.
+
+**Where it would land:**
+
+- `src/providers/anthropic/cache.ts:39` — `EPHEMERAL` constant
+  becomes either a factory taking `ttl` or a pair of constants
+  (`EPHEMERAL_5MIN`, `EPHEMERAL_1H`). Each `cache_control`
+  call site picks the right one based on segment role.
+- `src/providers/anthropic/capabilities.ts:6` — `cache` field
+  reflects the active mode; potentially adds `server_1h` /
+  `server_persistent` to `CacheMode` in `providers/types.ts:10`.
+- Config surface: `[providers.anthropic] extended_cache = true`
+  in user / project TOML; wired into bootstrap when the adapter
+  is instantiated.
+- `src/cli/bootstrap.ts` — read the config flag and pass it to
+  `createAnthropicProvider`.
+- Per-segment policy variant: extend `SystemSegment` with
+  optional `cacheTtl?: '5min' | '1h'` so producers can pick per
+  segment, and `systemSegmentsWithCacheBreakpoints` honors it.
+
+**New tests:**
+
+- `tests/providers/anthropic-cache.test.ts` — cache_control with
+  `ttl: '1h'` flows through when the flag is set; default `5min`
+  otherwise. Per-segment override respected when present.
+- `tests/cli/bootstrap.test.ts` — config flag round-trips into
+  the adapter instance.
+
+**Pull-in signal:** cache observability (#3) has accumulated
+enough sessions to show:
+- median gap between turns in real operator usage, OR
+- `% cached` chip stabilizing below ~70% in long sessions
+  (suggesting cache_control is being invalidated mid-session by
+  TTL, not by content change).
+
+**Cost when pulled:** ~1 day (uniform 1h TTL). ~2 days for the
+per-segment mixed policy + tests.
+
+**Spec reference:** `CONTEXT_TUNING.md §3.3` already documents
+the trade-off and recommends the flag for sessions > 30min;
+landing it is making the spec real. No spec PR needed.
+
+**Magnitude (uncertain):** sessions with regular > 5min pauses
+get the dominant input-cost reduction Anthropic advertises
+(~70% per `PROVIDERS.md §5.1`). At the limit, this is bigger
+than #1 + #2 combined for operator usage patterns that involve
+real-world pacing (reading output, thinking, switching apps).
+
+---
+
+# Operator feedback infrastructure (fine-tuning pre-req)
+
+## Explicit operator feedback widget per turn
+
+**Status:** deferred. Forja's audit captures a near-complete
+training signal — `prompt_versions` (content-addressed system
+prompts), `messages` (role + content + token usage),
+`tool_calls` (input + raw output preserved even when
+summarized), `cost_progress_events`, `failure_events`, plus the
+`audit_timeline` view (`AUDIT.md §2.1`) that unifies all of
+the above. Outcome signals exist via `outcome_signals` with the
+four NEGATIVE proxies declared in `src/outcomes/codes.ts:16-20`
+(`tool_error`, `failure_event`, `checkpoint_reverted`,
+`session_aborted`). What's missing is an EXPLICIT POSITIVE /
+per-turn signal from the operator — the dataset has plenty of
+"this went wrong" rows and no "this answer was helpful" rows.
+
+**What it is:** a TUI surface that lets the operator rate the
+last assistant turn (or the last tool call) without breaking
+flow. Shape options (decide at pull-in):
+
+- **Minimal**: two keybindings (e.g., `Alt+Up` / `Alt+Down`)
+  that emit `signal_kind: 'operator_positive'` /
+  `'operator_negative'` against the current step. Zero
+  cognitive overhead; binary signal.
+- **Nuanced**: one-key shortcut opens a popover with reasons
+  (`wrong tool`, `right tool, bad args`, `solved my problem`,
+  `kept me unblocked`, …). Better data quality, friction
+  trade-off.
+- **Implicit augment**: track `restart_after`, `undo_within_N`,
+  `corrected_in_next_turn` as additional implicit signal
+  kinds. Cheaper than a widget but inferential — not
+  ground-truth.
+
+**Why deferred:** Forja has no fine-tuning effort in flight
+today; landing the widget without a downstream consumer is
+infrastructure built for the abstract. The substrate
+(`outcome_signals`) already exists, so when the need crystallizes
+it's a small additive change, not a redesign. Also: an
+ill-designed widget that interrupts flow degrades the operator
+experience for everyone in exchange for data quality only the
+fine-tuning workflow benefits from. The cost/benefit only
+makes sense when there's a buyer.
+
+**Where it would land:**
+
+- `src/outcomes/codes.ts:16-20` — extend `OutcomeSignalKind`
+  with `operator_positive` / `operator_negative` (or richer
+  set). Add to migration's CHECK enum. Per `codes.ts:11`, a
+  new kind requires `(a)` entry here, `(b)` ALTER on enum,
+  `(c)` wiring at observation site — the contract is
+  documented inline.
+- `src/storage/migrations/` — new migration adding the new
+  signal_kinds to the CHECK constraint.
+- `src/tui/keys.ts` + `src/tui/render/footer.ts` — keybind
+  registration; small footer chip showing "rated ↑" / "rated
+  ↓" for the most recent turn so the operator knows the
+  rating registered.
+- `src/tui/events.ts` — new `feedback:rate` UIEvent.
+- `src/tui/state.ts` — reducer tracks pending rating per
+  turn (so it can attach to the right `tool_call_id` or
+  `message_id`).
+- `src/cli/repl.ts` — bridge bus event to
+  `appendOutcomeSignal` with the right ids.
+- `src/cli/slash/commands/` — `/feedback metrics` (or
+  similar) for the operator to review their own rating
+  history before exporting.
+
+**New tests:**
+
+- Keybind emits the event with correct payload.
+- Reducer attaches the rating to the most recent
+  `tool_call_id` (or `message_id` for prose-only turns).
+- Storage layer persists the new kind with the configured
+  default weight.
+
+**Pull-in signal:**
+
+- Fine-tuning effort is planned (LoRA, DPO, full SFT — any of
+  them needs labeled data).
+- OR: systematic quality regression evaluation needs to A/B
+  changes (e.g., post-token-efficiency-initiative review:
+  "did #4's summarization hurt quality?").
+- OR: operator explicitly asks for a way to flag turns for
+  review.
+
+**Cost when pulled:**
+
+- Minimal binary version: ~2 days (keybinding + reducer + 1
+  migration + 1 slash + tests).
+- Nuanced popover version: ~4-5 days (add modal + reason
+  vocab + reducer state + richer storage).
+- Implicit-only version: ~1 day (detector that scans audit
+  trail for restart / undo / correction patterns, emits new
+  signal kinds without a TUI surface).
+
+**Spec reference:** extends `PERMISSION_ENGINE.md §6.3.2`'s
+calibration plan (which today only considers system-observed
+proxies) and `AUDIT.md §1` (adds a new outcome_signal kind).
+The widget itself touches `UI.md §4.10.6` (footer chip) and
+new keybinding entries.
+
+**Magnitude:** zero direct token savings (this entry isn't
+token-efficiency). Multiplier on every future quality-driven
+optimization: without ground-truth labels, every A/B comparison
+relies on inference from negative proxies + heuristics.

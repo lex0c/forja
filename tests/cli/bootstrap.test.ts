@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULT_MODEL, bootstrap } from '../../src/cli/bootstrap.ts';
 import type { Provider } from '../../src/providers/index.ts';
+import { flattenSystemSegments } from '../../src/providers/types.ts';
 
 let workdir: string;
 let dbPath: string;
@@ -203,6 +204,29 @@ describe('bootstrap', () => {
     expect(config.systemPrompt).toBeDefined();
     expect(config.systemPrompt).toContain('# Parallelism');
     expect(config.systemPrompt).toContain('emit MULTIPLE tool calls in a SINGLE turn');
+    db.close();
+  });
+
+  test('emits systemSegments and flattenSystemSegments round-trips to systemPrompt', async () => {
+    // Anthropic adapter uses per-segment cache markers; the
+    // segment payload must reconstitute to the same string the
+    // audit / hash / non-segment-aware adapters consume.
+    const { config, db } = await bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+    });
+    expect(config.systemSegments).toBeDefined();
+    // The stable segment is always present; memory segment is
+    // conditional on whether memory_index or skills rendered.
+    expect(config.systemSegments?.[0]?.id).toBe('stable');
+    expect(config.systemSegments?.[0]?.cacheBreakpoint).toBe(true);
+    // Round-trip: the flattened segment list must exactly equal
+    // the canonical systemPrompt the audit hash was computed over.
+    expect(flattenSystemSegments(config.systemSegments ?? [])).toBe(config.systemPrompt ?? '');
     db.close();
   });
 

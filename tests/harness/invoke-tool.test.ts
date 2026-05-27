@@ -69,6 +69,51 @@ const crashingTool: Tool<unknown, unknown> = {
   },
 };
 
+// Synthetic tool exercising the summarize hook end-to-end:
+// returns a result the summarizer ALWAYS reduces, so the test
+// can assert the audit row holds the raw body while the
+// tool_result.content carries the summarized digest + marker.
+const summarizingTool: Tool = {
+  name: 'summarizes',
+  description: 'returns a result the metadata.summarize call reduces',
+  inputSchema: { type: 'object' },
+  metadata: {
+    category: 'misc',
+    writes: false,
+    idempotent: true,
+    summarize: (result) => ({
+      result: { ...(result as object), body: '<reduced>' },
+      reduced: true,
+      originalBytes: 12345,
+      policy: 'test_policy',
+    }),
+  },
+  async execute() {
+    return { body: 'original full body' };
+  },
+};
+
+// Synthetic tool whose summarize throws — exercises the
+// defense-in-depth path in invoke-tool: a buggy summarizer must
+// not poison the call; the harness should log + fall through
+// with the raw result.
+const summarizeThrowsTool: Tool = {
+  name: 'summarize_throws',
+  description: 'summarizer throws',
+  inputSchema: { type: 'object' },
+  metadata: {
+    category: 'misc',
+    writes: false,
+    idempotent: true,
+    summarize: () => {
+      throw new Error('boom in summarize');
+    },
+  },
+  async execute() {
+    return { body: 'normal' };
+  },
+};
+
 const restrictedTool: Tool = {
   name: 'write_file', // matches policy section name
   description: 'write a file',
@@ -174,6 +219,88 @@ describe('invokeTool', () => {
     );
     expect(inv.failed).toBe(false);
     expect(inv.outputTruncated).toBeUndefined();
+  });
+
+  describe('summarize hook', () => {
+    test('audit row keeps the raw result; tool_result carries summarized + marker', async () => {
+      const deps = buildDeps(summarizingTool);
+      const inv = await invokeTool(
+        { toolUseId: 'tu1', toolName: 'summarizes', args: {}, messageId },
+        deps,
+      );
+      expect(inv.failed).toBe(false);
+      // tool_result content carries the summarization marker AND
+      // the reduced body — the original "full body" string is gone.
+      expect(inv.toolResult.content).toContain('[forja:output_summarized');
+      expect(inv.toolResult.content).toContain('policy=test_policy');
+      expect(inv.toolResult.content).toContain('original_bytes=12345');
+      expect(inv.toolResult.content).toContain('<reduced>');
+      expect(inv.toolResult.content).not.toContain('original full body');
+      // Audit row preserves the raw output exactly.
+      const row = getToolCall(db, inv.toolCallId);
+      expect(row?.output).toEqual({ body: 'original full body' });
+    });
+
+    test('summarize with reduced:false leaves content unchanged (no marker)', async () => {
+      const passthroughTool: Tool = {
+        name: 'passthrough',
+        description: 'summarizer that never reduces',
+        inputSchema: { type: 'object' },
+        metadata: {
+          category: 'misc',
+          writes: false,
+          idempotent: true,
+          summarize: (result) => ({
+            result,
+            reduced: false,
+            originalBytes: 0,
+            policy: 'noop',
+          }),
+        },
+        async execute() {
+          return { value: 'pristine' };
+        },
+      };
+      const deps = buildDeps(passthroughTool);
+      const inv = await invokeTool(
+        { toolUseId: 'tu1', toolName: 'passthrough', args: {}, messageId },
+        deps,
+      );
+      expect(inv.failed).toBe(false);
+      expect(inv.toolResult.content).not.toContain('[forja:output_summarized');
+      expect(inv.toolResult.content).toContain('pristine');
+    });
+
+    test('summarize that throws falls back to raw result + logs to errSink', async () => {
+      const errs: string[] = [];
+      const registry = createToolRegistry();
+      registry.register(summarizeThrowsTool);
+      const deps = {
+        db,
+        registry,
+        engine: createPermissionEngine(policy({}), { cwd: '/p' }),
+        ctx: makeCtx({ cwd: '/p' }),
+        errSink: (s: string) => errs.push(s),
+      };
+      const inv = await invokeTool(
+        { toolUseId: 'tu1', toolName: 'summarize_throws', args: {}, messageId },
+        deps,
+      );
+      expect(inv.failed).toBe(false);
+      expect(inv.toolResult.content).not.toContain('[forja:output_summarized');
+      expect(inv.toolResult.content).toContain('normal');
+      expect(errs.some((e) => e.includes('summarize threw'))).toBe(true);
+    });
+
+    test('tool without summarize metadata is unaffected (no marker, raw content)', async () => {
+      const deps = buildDeps(okTool);
+      const inv = await invokeTool(
+        { toolUseId: 'tu1', toolName: 'echo', args: { msg: 'hi' }, messageId },
+        deps,
+      );
+      expect(inv.failed).toBe(false);
+      expect(inv.toolResult.content).not.toContain('[forja:output_summarized');
+    });
   });
 
   test('onExecutionStart fires once the tool body runs (allow path)', async () => {

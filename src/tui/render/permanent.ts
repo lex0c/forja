@@ -134,44 +134,16 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       return ['', paint(caps, 'secondary', verb)].map(padFrame);
     }
     case 'session-banner': {
-      // UI.md §4.10.9. Three stacked blocks separated by a blank
-      // line (spacing carries hierarchy, §6.4):
-      //   1. title (bold) — `forja v0.0.0`
-      //   2. identity (secondary, 2 lines) — `model · N ctx · max M out` + cwd
-      //   3. env (mixed) — `✓ name` flags + `key: value` meta joined
-      //      by ` · `. Omitted entirely when env is empty.
-      // Version is prefixed with `v` (semver convention) regardless of
-      // what the producer sent — operators read `v0.0.0` as a version
-      // string at a glance, `0.0.0` as ambiguous.
-      const sep = caps.unicode ? '·' : '-';
-      const checkGlyph = caps.unicode ? '✓' : '*';
+      // Two stacked lines: `<app> <version>` and `<cwd>`. The
+      // identity (model · ctx · max out) and env (flags / meta)
+      // blocks were dropped — model lives in the footer chips and
+      // the env detail was low-signal at boot. `item.env` still
+      // flows into the PermanentItem for NDJSON / audit consumers.
       const versionDisplay = item.version.startsWith('v') ? item.version : `v${item.version}`;
-      const identityLine = paint(
-        caps,
-        'secondary',
-        [
-          item.model,
-          `${Math.round(item.contextWindow / 1000)}k ctx`,
-          `max ${item.maxOutputTokens} out`,
-        ].join(` ${sep} `),
-      );
-      const lines: string[] = [
-        paint(caps, 'bold', `${item.app} ${versionDisplay}`),
-        '',
-        identityLine,
+      return [
+        `${paint(caps, 'bold', item.app)} ${paint(caps, 'secondary', versionDisplay)}`,
         paint(caps, 'secondary', item.cwd),
-      ];
-      if (item.env.length > 0) {
-        const parts = item.env.map((e) => {
-          if (e.kind === 'flag') {
-            const tail = e.count !== undefined ? ` (${e.count})` : '';
-            return `${checkGlyph} ${e.name}${tail}`;
-          }
-          return `${e.key}: ${e.value}`;
-        });
-        lines.push('', paint(caps, 'secondary', parts.join(` ${sep} `)));
-      }
-      return lines.map(padFrame);
+      ].map(padFrame);
     }
     case 'user-submit': {
       // UI.md §4.10.8 — inverse bar acts as a structural divider in
