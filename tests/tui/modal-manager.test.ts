@@ -101,7 +101,12 @@ describe('askPermission (2-option modal per UI.md §4.10.13)', () => {
     return promise;
   });
 
-  test('default selectedIndex = last option (No); Enter without navigating resolves "no"', async () => {
+  test('default selectedIndex = first option (Yes) for permission flavor; Enter resolves "yes"', async () => {
+    // Permission flavor overrides D5/D65's "last = safe" default —
+    // accept-the-call is the dominant workflow on a 2-option modal
+    // and operators don't want the extra keystroke. Other flavors
+    // (trust / memory / critique / plan-review) keep the
+    // last-option default; their tests pin that separately.
     const s = make();
     const promise = s.manager.askPermission({
       toolName: 'bash',
@@ -109,7 +114,7 @@ describe('askPermission (2-option modal per UI.md §4.10.13)', () => {
       cwd: '/',
     });
     s.fs.dispatch(key('enter'));
-    await expect(promise).resolves.toBe('no');
+    await expect(promise).resolves.toBe('yes');
   });
 
   test('Esc resolves "cancel" (distinct from "no")', async () => {
@@ -177,19 +182,20 @@ describe('askPermission (2-option modal per UI.md §4.10.13)', () => {
     await expect(promise).resolves.toBe('no');
   });
 
-  test('Up arrow moves selection up by one; Enter resolves the new selection', async () => {
+  test('Down arrow moves selection down by one; Enter resolves the new selection', async () => {
     const s = make();
     const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
-    // Default is index 1 ('no'). Up → 0 ('yes'). Enter resolves it.
-    s.fs.dispatch(key('up'));
+    // Permission default is index 0 ('yes'). Down → 1 ('no').
+    s.fs.dispatch(key('down'));
     s.fs.dispatch(key('enter'));
-    await expect(promise).resolves.toBe('yes');
+    await expect(promise).resolves.toBe('no');
   });
 
   test('Down arrow at the bottom is a no-op (clamps to last index)', async () => {
     const s = make();
     const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
-    // Default = last (index 1). Down should clamp.
+    // Default = 0 ('yes'). Down → 1 ('no'). Down again clamps at 1.
+    s.fs.dispatch(key('down'));
     s.fs.dispatch(key('down'));
     s.fs.dispatch(key('enter'));
     await expect(promise).resolves.toBe('no');
@@ -198,21 +204,21 @@ describe('askPermission (2-option modal per UI.md §4.10.13)', () => {
   test('Up at the top is a no-op (clamps to index 0)', async () => {
     const s = make();
     const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
-    s.fs.dispatch(key('up')); // 1 → 0
-    s.fs.dispatch(key('up')); // clamps at 0
-    s.fs.dispatch(key('up')); // still 0
+    // Default = 0 ('yes') already at top; Up clamps.
+    s.fs.dispatch(key('up'));
+    s.fs.dispatch(key('up'));
     s.fs.dispatch(key('enter'));
     await expect(promise).resolves.toBe('yes');
   });
 
-  test('Up arrow emits modal:select with the new selectedIndex', () => {
+  test('Down arrow emits modal:select with the new selectedIndex', () => {
     const s = make();
     const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
     const beforeNav = s.events.length;
-    s.fs.dispatch(key('up'));
+    s.fs.dispatch(key('down'));
     const emitted = s.events.slice(beforeNav);
     expect(emitted).toHaveLength(1);
-    expect(emitted[0]).toMatchObject({ type: 'modal:select', selectedIndex: 0 });
+    expect(emitted[0]).toMatchObject({ type: 'modal:select', selectedIndex: 1 });
     s.fs.dispatch(key('escape'));
     return promise;
   });
@@ -264,14 +270,15 @@ describe('askPermission (2-option modal per UI.md §4.10.13)', () => {
     const s = make();
     const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
     const beforeNav = s.events.length;
-    s.fs.dispatch(key('up')); // 1 → 0
+    // Permission default is index 0; Up at top is a no-op (no emit).
     s.fs.dispatch(key('down')); // 0 → 1
     s.fs.dispatch(key('up')); // 1 → 0
+    s.fs.dispatch(key('down')); // 0 → 1
     const indices = s.events
       .slice(beforeNav)
       .filter((e): e is Extract<UIEvent, { type: 'modal:select' }> => e.type === 'modal:select')
       .map((e) => e.selectedIndex);
-    expect(indices).toEqual([0, 1, 0]);
+    expect(indices).toEqual([1, 0, 1]);
     s.fs.dispatch(key('escape'));
     await promise;
   });

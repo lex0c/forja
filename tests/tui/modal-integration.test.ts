@@ -99,7 +99,7 @@ describe('modal navigation preserves contents', () => {
     s.fs.dispatch(key('escape'));
   });
 
-  test('Up navigation does NOT wipe title/preview/options', () => {
+  test('Down navigation does NOT wipe title/preview/options', () => {
     const s = make();
     void s.manager.askPermission({
       toolName: 'bash',
@@ -107,16 +107,16 @@ describe('modal navigation preserves contents', () => {
       cwd: '/home/lex/forja',
     });
     const before = s.rendered() ?? '';
-    s.fs.dispatch(key('up'));
+    s.fs.dispatch(key('down'));
     const after = s.rendered() ?? '';
     // All blocks survive the navigation.
     expect(after).toContain('Bash command');
     expect(after).toContain('rm -rf ./build');
     expect(after).toContain('1. Yes');
     expect(after).toContain('2. No');
-    // Cursor moved from option 2 (No) to option 1 (Yes).
-    expect(before).toMatch(/> 2\. No/);
-    expect(after).toMatch(/> 1\. Yes/);
+    // Permission default puts cursor on Yes; Down moves to No.
+    expect(before).toMatch(/> 1\. Yes/);
+    expect(after).toMatch(/> 2\. No/);
     s.fs.dispatch(key('escape'));
   });
 
@@ -127,12 +127,12 @@ describe('modal navigation preserves contents', () => {
       command: 'src/foo.ts',
       cwd: '/r',
     });
-    s.fs.dispatch(key('up')); // 1 → 0 ('Yes')
     s.fs.dispatch(key('down')); // 0 → 1 ('No')
+    s.fs.dispatch(key('up')); // 1 → 0 ('Yes')
     const out = s.rendered() ?? '';
     expect(out).toContain('Editing file');
     expect(out).toContain('src/foo.ts');
-    expect(out).toMatch(/> 2\. No/);
+    expect(out).toMatch(/> 1\. Yes/);
     s.fs.dispatch(key('escape'));
   });
 

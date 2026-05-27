@@ -17,7 +17,7 @@
 
 import { sanitizeOneLineForDisplay } from '../sanitize/ansi.ts';
 import type { SessionBannerEnvEntry, TodoItemForUI, UIEvent } from './events.ts';
-import { buildPermissionOptions } from './modal-manager.ts';
+import { PERMISSION_DEFAULT_SELECTED_INDEX, buildPermissionOptions } from './modal-manager.ts';
 
 // Map a tool name to the modal's context label. Replaces the older
 // "Run command" / "Subagent permission — <name>" titles with
@@ -1467,7 +1467,12 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             // the matched-rule path; no separate question row.
             question: null,
             options,
-            selectedIndex: options.length - 1,
+            // Per-flavor cursor default. Sourced from the same
+            // constant the manager's drain() reads so cursor (this
+            // reducer state) and Enter resolution (manager) stay
+            // in sync — a flip in one without the other would
+            // silently desync the modal.
+            selectedIndex: PERMISSION_DEFAULT_SELECTED_INDEX,
             // Only `Esc to cancel` is wired up. The earlier slices
             // listed `Tab to amend` and `Ctrl+E to explain` here
             // hoping the handlers would land soon — but they

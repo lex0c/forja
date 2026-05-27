@@ -35,6 +35,12 @@ interface Pending<Answer extends string = string> {
   open: () => string; // emits the *:ask event with a fresh promptId, returns the id
   resolve: (answer: Answer) => void;
   options: readonly ConfirmOption[];
+  // Initial cursor position. Defaults to last option (D5/D65
+  // conservative-choice convention) when undefined. Permission
+  // flavor overrides to 0 (Yes) per operator UX call — the modal
+  // is short enough that the safety-default ergonomics weren't
+  // worth the extra keystroke for the dominant case.
+  defaultIndex?: number;
   // Optional timeout handle so we can clear it on early resolve.
   timeout: unknown;
   // Detach the producer-signal abort listener on early resolve.
@@ -287,6 +293,15 @@ export const buildPermissionOptions = (): ConfirmOption[] => [
   { key: '2', label: 'No', value: 'no' },
 ];
 
+// Permission flavor's initial cursor position. Single source of
+// truth for BOTH (a) the manager's `drain()`, which determines what
+// Enter resolves to, and (b) the reducer's `permission:ask` case,
+// which determines where the cursor renders. Without this shared
+// constant the two sides could drift on a flip and the operator
+// would see the cursor on one option while Enter resolved the
+// other — silent but catastrophic on a security modal.
+export const PERMISSION_DEFAULT_SELECTED_INDEX = 0;
+
 export interface ModalManager {
   // Permission flavor. Returns the user's choice (or 'cancel' on Esc /
   // close / timeout). Callers translate semantics: yes → execute,
@@ -418,8 +433,14 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
     const next = queue.shift();
     if (next === undefined) return;
     const promptId = next.open();
-    // Default selectedIndex = last option (conservative choice).
-    active = { promptId, selectedIndex: next.options.length - 1, pending: next };
+    // Default selectedIndex = last option (D5/D65 conservative
+    // choice). Per-flavor override flows via `pending.defaultIndex`
+    // — permission flavor uses 0 (Yes) so the dominant accept-the-
+    // call workflow doesn't require an extra keystroke.
+    const max = next.options.length - 1;
+    const requested = next.defaultIndex ?? max;
+    const initialIndex = Math.max(0, Math.min(max, requested));
+    active = { promptId, selectedIndex: initialIndex, pending: next };
     // Initial queue-depth snapshot for the just-opened modal. The
     // event MUST fire AFTER `next.open()` so the reducer has
     // already created the modal slot before this update lands —
@@ -555,6 +576,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
     optionsList: readonly ConfirmOption[],
     timeoutMs: number | undefined,
     signal: AbortSignal | undefined,
+    defaultIndex?: number,
   ): Promise<Answer> =>
     new Promise<Answer>((resolve) => {
       // Already-closed manager: resolve immediately as 'cancel' so
@@ -572,6 +594,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
         resolve,
         options: optionsList,
         timeout: null,
+        ...(defaultIndex !== undefined ? { defaultIndex } : {}),
       };
       queue.push(pending as Pending);
       // Live update for an existing modal: a new ask just landed
@@ -698,6 +721,12 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
         buildPermissionOptions(),
         opts?.timeoutMs,
         opts?.signal,
+        // Permission flavor overrides D5/D65's "last = safe"
+        // default — accept-the-call is the dominant workflow on a
+        // small modal and operators don't want the extra keystroke.
+        // Other flavors keep the last-option default by omitting
+        // this argument.
+        PERMISSION_DEFAULT_SELECTED_INDEX,
       ),
     askTrust: (args, opts) =>
       enqueueConfirm<TrustAnswer>(
