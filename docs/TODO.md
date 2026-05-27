@@ -1482,3 +1482,85 @@ Without that evidence, this is theoretical cleanup.
 
 **Spec reference:** small amendment to `CONTEXT_TUNING.md §1.8`
 where `today` is currently justified as part of the env block.
+
+## Anthropic `extended_cache` (1h TTL)
+
+**Status:** deferred. Forja's Anthropic adapter pins
+`cache: 'server_5min'` (see `src/providers/anthropic/capabilities.ts:6`)
+and emits `cache_control: { type: 'ephemeral' }` with no `ttl`
+field, which defaults to the 5-minute server cache. Identified
+during the post-#1/#3/#4 token-efficiency audit as the largest
+remaining cache miss vector: ANY gap > 5 minutes between turns —
+operator pausing to think, reading a long output, switching
+windows — kills the entire cache, not just one segment.
+
+**What it is:** opt into Anthropic's 1-hour extended cache
+(`CONTEXT_TUNING.md §3.3`) by emitting
+`cache_control: { type: 'ephemeral', ttl: '1h' }` and reflecting
+the capability via `cache: 'server_persistent'` (or a new
+`server_1h` variant) on `ProviderCapabilities`. Trade-off
+Anthropic discloses: cache writes cost ~2× input rate instead of
+1.25×, but reads stay at 0.10× for the full hour. Math crosses
+zero around the second turn after a > 5min gap.
+
+**Why deferred:**
+
+1. **Pricing trade-off needs real data.** A session with
+   frequent < 5min cadence between turns sees zero benefit and
+   pays slightly more on writes. Without baseline from the
+   `% cached` chip (#3), we'd ship blind on whether typical
+   operator usage actually has the > 5min gaps the 1h TTL
+   amortizes.
+2. **Per-call opt-in** vs **global setting**: Anthropic lets the
+   `ttl` ride per cache_control marker, so a more nuanced policy
+   could mark the high-stability segments (stable + memory) with
+   `1h` and leave the conversation tail at `5min` (tail moves
+   every turn anyway). That mixed policy might dominate either
+   pure default — but it adds complexity worth validating with
+   data first.
+
+**Where it would land:**
+
+- `src/providers/anthropic/cache.ts:39` — `EPHEMERAL` constant
+  becomes either a factory taking `ttl` or a pair of constants
+  (`EPHEMERAL_5MIN`, `EPHEMERAL_1H`). Each `cache_control`
+  call site picks the right one based on segment role.
+- `src/providers/anthropic/capabilities.ts:6` — `cache` field
+  reflects the active mode; potentially adds `server_1h` /
+  `server_persistent` to `CacheMode` in `providers/types.ts:10`.
+- Config surface: `[providers.anthropic] extended_cache = true`
+  in user / project TOML; wired into bootstrap when the adapter
+  is instantiated.
+- `src/cli/bootstrap.ts` — read the config flag and pass it to
+  `createAnthropicProvider`.
+- Per-segment policy variant: extend `SystemSegment` with
+  optional `cacheTtl?: '5min' | '1h'` so producers can pick per
+  segment, and `systemSegmentsWithCacheBreakpoints` honors it.
+
+**New tests:**
+
+- `tests/providers/anthropic-cache.test.ts` — cache_control with
+  `ttl: '1h'` flows through when the flag is set; default `5min`
+  otherwise. Per-segment override respected when present.
+- `tests/cli/bootstrap.test.ts` — config flag round-trips into
+  the adapter instance.
+
+**Pull-in signal:** cache observability (#3) has accumulated
+enough sessions to show:
+- median gap between turns in real operator usage, OR
+- `% cached` chip stabilizing below ~70% in long sessions
+  (suggesting cache_control is being invalidated mid-session by
+  TTL, not by content change).
+
+**Cost when pulled:** ~1 day (uniform 1h TTL). ~2 days for the
+per-segment mixed policy + tests.
+
+**Spec reference:** `CONTEXT_TUNING.md §3.3` already documents
+the trade-off and recommends the flag for sessions > 30min;
+landing it is making the spec real. No spec PR needed.
+
+**Magnitude (uncertain):** sessions with regular > 5min pauses
+get the dominant input-cost reduction Anthropic advertises
+(~70% per `PROVIDERS.md §5.1`). At the limit, this is bigger
+than #1 + #2 combined for operator usage patterns that involve
+real-world pacing (reading output, thinking, switching apps).
