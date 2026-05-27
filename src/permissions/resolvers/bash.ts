@@ -1564,11 +1564,46 @@ const cmdPip: CommandResolver = (_positional, tokens, ctx) => {
 
 // `chmod MODE FILE...` / `chown OWNER FILE...` — first positional
 // is MODE (numeric `644` or symbolic `u+x`) or OWNER (`root`,
-// `root:wheel`), not a path. Pre-M1 the numeric mode was dropped
-// by the walker; post-M1 it lands as a positional and would emit a
-// bogus `write-fs:<cwd>/644`. The first positional is also a bogus
-// path for the symbolic-mode case (which pre-dated M1).
-const cmdChmodChown: CommandResolver = (positional, _tokens, ctx) => {
+// `root:wheel`), not a path. The first positional must NOT be
+// emitted as a writeFs target.
+//
+// Exception: `chmod --reference=REF FILE...` (and chown). With
+// `--reference`, GNU coreutils drops the MODE/OWNER positional
+// entirely — every remaining positional IS a target. The
+// reference file (REF) is read for its current mode/owner; emit a
+// readFs for it. Both the combined-form `--reference=REF` and the
+// space-separated `--reference REF` are honored.
+const CHMOD_VALUE_FLAGS: ReadonlySet<string> = new Set(['--reference']);
+
+const cmdChmodChown: CommandResolver = (_positional, tokens, ctx) => {
+  const positional = stripFlags(tokens, CHMOD_VALUE_FLAGS);
+
+  let referenceFile: string | null = null;
+  let hasReference = false;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i] ?? '';
+    if (t.startsWith('--reference=')) {
+      hasReference = true;
+      const v = t.slice('--reference='.length);
+      if (v.length > 0) referenceFile = v;
+    } else if (t === '--reference') {
+      hasReference = true;
+      const next = tokens[i + 1];
+      if (next !== undefined && next.length > 0 && !next.startsWith('-')) {
+        referenceFile = next;
+      }
+    }
+  }
+
+  if (hasReference) {
+    if (positional.length === 0) {
+      return { refuse: 'chmod/chown: --reference needs at least one target' };
+    }
+    const caps: Capability[] = positional.map((p) => writeFs(resolveArg(p, ctx)));
+    if (referenceFile !== null) caps.push(readFs(resolveArg(referenceFile, ctx)));
+    return { capabilities: caps, confidence: 'high' };
+  }
+
   if (positional.length < 2) {
     return { refuse: 'chmod/chown: needs MODE/OWNER plus at least one target' };
   }

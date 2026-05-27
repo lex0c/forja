@@ -450,6 +450,61 @@ describe('bash resolver — simple commands', () => {
     const r = resolveCapabilities('bash', { command: 'chmod 755' }, CTX);
     expect(r.kind).toBe('refuse');
   });
+
+  test('chmod --reference=template target: target is write-fs, template is read-fs', () => {
+    // GNU `chmod --reference=RFILE FILE...` syntax: no MODE
+    // positional. ALL positionals are targets; RFILE is read for
+    // its current mode.
+    const r = resolveCapabilities('bash', { command: 'chmod --reference=template target' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/work/proj/target');
+      expect(s).toContain('read-fs:/work/proj/template');
+    }
+  });
+
+  test('chmod --reference=template t1 t2 t3: ALL targets get write-fs', () => {
+    // Multiple targets — none of them should be silently dropped
+    // as a presumed MODE positional.
+    const r = resolveCapabilities('bash', { command: 'chmod --reference=template t1 t2 t3' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/work/proj/t1');
+      expect(s).toContain('write-fs:/work/proj/t2');
+      expect(s).toContain('write-fs:/work/proj/t3');
+      expect(s).toContain('read-fs:/work/proj/template');
+    }
+  });
+
+  test('chmod --reference template target (space-separated form)', () => {
+    const r = resolveCapabilities('bash', { command: 'chmod --reference template target' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/work/proj/target');
+      expect(s).toContain('read-fs:/work/proj/template');
+      // `template` must NOT also appear as a write target (it's
+      // the reference, not a target).
+      expect(s).not.toContain('write-fs:/work/proj/template');
+    }
+  });
+
+  test('chown --reference=template target also honored', () => {
+    const r = resolveCapabilities('bash', { command: 'chown --reference=template target' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/work/proj/target');
+      expect(s).toContain('read-fs:/work/proj/template');
+    }
+  });
+
+  test('chmod --reference=template with no targets is refused', () => {
+    const r = resolveCapabilities('bash', { command: 'chmod --reference=template' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
 });
 
 describe('bash resolver — refusals', () => {
