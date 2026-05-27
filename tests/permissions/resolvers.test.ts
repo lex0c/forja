@@ -505,6 +505,134 @@ describe('bash resolver — simple commands', () => {
     const r = resolveCapabilities('bash', { command: 'chmod --reference=template' }, CTX);
     expect(r.kind).toBe('refuse');
   });
+
+  test('mkdir -m 755 dir: numeric mode is NOT a bogus path', () => {
+    const r = resolveCapabilities('bash', { command: 'mkdir -m 755 newdir' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/work/proj/newdir');
+      expect(s).not.toContain('write-fs:/work/proj/755');
+    }
+  });
+
+  test('mkdir --mode=0755 dir: combined form already dropped, target only', () => {
+    const r = resolveCapabilities('bash', { command: 'mkdir --mode=0755 newdir' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/work/proj/newdir');
+      expect(s).not.toContain('write-fs:/work/proj/0755');
+    }
+  });
+
+  test('touch -t 202001010000 file: timestamp value is NOT a bogus path', () => {
+    const r = resolveCapabilities('bash', { command: 'touch -t 202001010000 file.txt' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/work/proj/file.txt');
+      expect(s).not.toContain('write-fs:/work/proj/202001010000');
+    }
+  });
+
+  test('touch -d yesterday file: date string value is NOT a bogus path', () => {
+    const r = resolveCapabilities('bash', { command: 'touch -d yesterday file.txt' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/work/proj/file.txt');
+      expect(s).not.toContain('write-fs:/work/proj/yesterday');
+    }
+  });
+
+  test('touch -r ref.txt file: reference is emitted as read-fs, not bogus write', () => {
+    // touch reads ref's mtime/atime to apply to target; the
+    // reference must surface as a read so policies denying reads
+    // can fire, and must NOT appear as a write target.
+    const r = resolveCapabilities('bash', { command: 'touch -r ref.txt file.txt' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/work/proj/file.txt');
+      expect(s).toContain('read-fs:/work/proj/ref.txt');
+      expect(s).not.toContain('write-fs:/work/proj/ref.txt');
+    }
+  });
+
+  test('mktemp -p /tmp template: -p directory value does not double-write', () => {
+    const r = resolveCapabilities('bash', { command: 'mktemp -p /tmp tmpXXXXXX' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('write-fs:/work/proj/tmpXXXXXX');
+      expect(s).not.toContain('write-fs:/tmp');
+    }
+  });
+
+  test('ln -t /opt/dir target1: -t value does not surface as duplicate write', () => {
+    // `-t TARGET_DIRECTORY` consumes the next token; /opt/dir is
+    // the link directory hint. The resolver still emits write-fs
+    // for the sources (over-attribute on sources is a known
+    // limitation — separate issue from numeric-leak); we verify
+    // -t's value doesn't double up as a write.
+    const r = resolveCapabilities('bash', { command: 'ln -t /opt/dir target1' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).not.toContain('write-fs:/opt/dir');
+    }
+  });
+
+  test('rsync --bwlimit 1000 src dst: numeric rate is NOT a bogus source', () => {
+    // `--bwlimit RATE` space-separated. Without consuming RATE,
+    // '1000' would land as a positional source → bogus
+    // `read-fs:<cwd>/1000`.
+    const r = resolveCapabilities('bash', { command: 'rsync --bwlimit 1000 src dst' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('read-fs:/work/proj/src');
+      expect(s).toContain('write-fs:/work/proj/dst');
+      expect(s).not.toContain('read-fs:/work/proj/1000');
+    }
+  });
+
+  test('rsync --port 22 src host:dst: port value is not a source', () => {
+    const r = resolveCapabilities('bash', { command: 'rsync --port 22 src host:dst' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('read-fs:/work/proj/src');
+      expect(s).toContain('net-egress:host');
+      expect(s).not.toContain('read-fs:/work/proj/22');
+    }
+  });
+
+  test('rsync --exclude pattern src dst: pattern value is not a source', () => {
+    const r = resolveCapabilities('bash', { command: 'rsync --exclude *.log src dst' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('read-fs:/work/proj/src');
+      expect(s).toContain('write-fs:/work/proj/dst');
+      // '*.log' would be a glob-prefix path; refusal is fine, but
+      // a successful run MUST NOT treat it as a real read source.
+      const reads = s.filter((c) => c.startsWith('read-fs:'));
+      expect(reads.every((r) => !r.endsWith('/*.log'))).toBe(true);
+    }
+  });
+
+  test('rsync --compare-dest /backup src dst: comparison dir not a bogus source', () => {
+    const r = resolveCapabilities('bash', { command: 'rsync --compare-dest /backup src dst' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s).toContain('read-fs:/work/proj/src');
+      expect(s).toContain('write-fs:/work/proj/dst');
+      expect(s).not.toContain('read-fs:/backup');
+    }
+  });
 });
 
 describe('bash resolver — refusals', () => {

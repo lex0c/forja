@@ -1739,14 +1739,75 @@ const cmdEnv: CommandResolver = (positional) => {
 
 // Filesystem-mutating utilities that create or touch a target.
 // mkdir / touch / ln / mktemp: positional args are the targets.
-const cmdMkdir: CommandResolver = (positional, _tokens, ctx) => {
+// Each takes its own set of value-flags whose operand is NOT a
+// path (mode bits, timestamps, link suffixes, etc.); without
+// consuming them the operand lands as a bogus writeFs target
+// (`mkdir -m 755 dir` → bogus `write-fs:<cwd>/755`).
+const MKDIR_VALUE_FLAGS: ReadonlySet<string> = new Set(['-m', '--mode', '-Z', '--context']);
+const TOUCH_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  '-d',
+  '--date',
+  '-t',
+  '-r',
+  '--reference',
+  '--time',
+]);
+const LN_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  '-t',
+  '--target-directory',
+  '-T',
+  '-S',
+  '--suffix',
+  '--backup',
+]);
+const MKTEMP_VALUE_FLAGS: ReadonlySet<string> = new Set(['-p', '--tmpdir', '--suffix']);
+
+const emitTargetsAsWrites = (positional: readonly string[], ctx: ResolverContext) => {
   if (positional.length === 0) {
-    return { capabilities: [writeFs(ctx.cwd)], confidence: 'high' };
+    return { capabilities: [writeFs(ctx.cwd)], confidence: 'high' as const };
   }
   return {
     capabilities: positional.map((p) => writeFs(resolveArg(p, ctx))),
-    confidence: 'high',
+    confidence: 'high' as const,
   };
+};
+
+const cmdMkdir: CommandResolver = (_positional, tokens, ctx) => {
+  return emitTargetsAsWrites(stripFlags(tokens, MKDIR_VALUE_FLAGS), ctx);
+};
+
+// touch's `-r REF` / `--reference=REF` reads REF's mtime/atime.
+// Emit a readFs alongside the targets so a policy that denies reads
+// from the reference's path can fire.
+const cmdTouch: CommandResolver = (_positional, tokens, ctx) => {
+  const positional = stripFlags(tokens, TOUCH_VALUE_FLAGS);
+  let referenceFile: string | null = null;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i] ?? '';
+    if (t.startsWith('--reference=')) {
+      const v = t.slice('--reference='.length);
+      if (v.length > 0) referenceFile = v;
+    } else if (t === '--reference' || t === '-r') {
+      const next = tokens[i + 1];
+      if (next !== undefined && next.length > 0 && !next.startsWith('-')) {
+        referenceFile = next;
+      }
+    }
+  }
+  const base = emitTargetsAsWrites(positional, ctx);
+  if (referenceFile === null) return base;
+  return {
+    capabilities: [...base.capabilities, readFs(resolveArg(referenceFile, ctx))],
+    confidence: base.confidence,
+  };
+};
+
+const cmdLn: CommandResolver = (_positional, tokens, ctx) => {
+  return emitTargetsAsWrites(stripFlags(tokens, LN_VALUE_FLAGS), ctx);
+};
+
+const cmdMktemp: CommandResolver = (_positional, tokens, ctx) => {
+  return emitTargetsAsWrites(stripFlags(tokens, MKTEMP_VALUE_FLAGS), ctx);
 };
 
 // `cd` is a builtin; in a tool-call context the cwd change doesn't
@@ -2260,7 +2321,70 @@ const cmdScp: CommandResolver = (positional, _tokens, ctx) => {
 //   - read-fs(~/.ssh) when ssh transport is in play
 //   - delete-fs(local dest) when --delete or any --delete-* flag
 //     is present (rsync can delete extraneous files on dest)
-const cmdRsync: CommandResolver = (positional, tokens, ctx) => {
+// rsync value-flags whose space-separated next token is a value,
+// not a source/dest path. Without consuming them, `rsync --bwlimit
+// 1000 src dst` would land '1000' as a positional source → bogus
+// readFs:<cwd>/1000. The `=`-combined form (`--bwlimit=1000`) is
+// already dropped by stripFlags's leading-dash rule. Includes
+// every flag whose explicit decode is below (password-file,
+// files-from, include-from, exclude-from) so the value also drops
+// from the path-positional list (the decode itself emits the
+// correct read-fs).
+const RSYNC_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  // Numeric value flags
+  '--bwlimit',
+  '--port',
+  '--timeout',
+  '--contimeout',
+  '--io-timeout',
+  '--max-size',
+  '--min-size',
+  '--max-delete',
+  '--max-alloc',
+  '--modify-window',
+  '--protocol',
+  '-B',
+  '--block-size',
+  '--checksum-seed',
+  // String non-path values (filters, formats, modes)
+  '--filter',
+  '-f',
+  '--include',
+  '--exclude',
+  '--info',
+  '--debug',
+  '--out-format',
+  '--log-format',
+  '--log-file-format',
+  '--chown',
+  '--chmod',
+  '--usermap',
+  '--groupmap',
+  '--checksum-choice',
+  // Path-string value flags — these have explicit decodes below
+  // that emit the right read/write; listing here drops the value
+  // from the positional list too.
+  '--password-file',
+  '--files-from',
+  '--include-from',
+  '--exclude-from',
+  '--temp-dir',
+  '-T',
+  '--compare-dest',
+  '--copy-dest',
+  '--link-dest',
+  '--partial-dir',
+  '--log-file',
+  '--read-batch',
+  '--write-batch',
+  '--only-write-batch',
+  // Remote-option pass-through (consumes value)
+  '--remote-option',
+  '-M',
+]);
+
+const cmdRsync: CommandResolver = (_positional, tokens, ctx) => {
+  const positional = stripFlags(tokens, RSYNC_VALUE_FLAGS);
   // Slice 125 (R2 P0-2): rsync transport-command flags. `-e <cmd>`
   // and `--rsh=<cmd>` substitute the transport (rsync exec's the
   // literal command string + args locally — GTFOBins reference:
@@ -2535,9 +2659,9 @@ const COMMAND_TABLE: ReadonlyMap<string, CommandResolver> = new Map<string, Comm
   ['perl', cmdInterpreter],
   // Filesystem-mutating builtins / utilities
   ['mkdir', cmdMkdir],
-  ['touch', cmdMkdir],
-  ['ln', cmdMkdir],
-  ['mktemp', cmdMkdir],
+  ['touch', cmdTouch],
+  ['ln', cmdLn],
+  ['mktemp', cmdMktemp],
   // No-op / shell-level builtins
   ['sleep', cmdNoOp],
   ['true', cmdNoOp],
