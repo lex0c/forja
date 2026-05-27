@@ -66,12 +66,31 @@ export const headTailSummary = (text: string, opts: HeadTailOptions): TextSummar
   // line, e.g. a base64 blob), head + tail by line count won't
   // reduce. Fall back to a byte-window: keep the first ~half of
   // maxBytes and the last ~half, with the elision marker between.
+  //
+  // The byte-window slices over the UTF-8 byte buffer (NOT the
+  // UTF-16 string), because `maxBytes` is a byte budget and the
+  // input may contain multi-byte sequences (CJK, emoji). String
+  // `.slice(0, N)` cuts at code-unit position N, which for CJK
+  // text would mean cutting at char N while the underlying bytes
+  // are 3× larger — the resulting "summary" can end up the same
+  // size as (or bigger than) the input, with a misleading
+  // negative `dropped` count.
   if (lines.length <= opts.headLines + opts.tailLines) {
+    const buf = Buffer.from(text, 'utf8');
     const halfBudget = Math.floor(opts.maxBytes / 2);
-    const head = text.slice(0, halfBudget);
-    const tail = text.slice(text.length - halfBudget);
-    const dropped =
-      originalBytes - Buffer.byteLength(head, 'utf8') - Buffer.byteLength(tail, 'utf8');
+    const headEnd = utf8BoundaryAtOrBefore(buf, halfBudget);
+    const tailStart = utf8BoundaryAtOrAfter(buf, buf.length - halfBudget);
+    // Cuts overlap or touch — input is too small in actual byte
+    // count to reduce safely (rare; bytes calculation above
+    // should have skipped this case, but multibyte rounding can
+    // squeeze the window). Return passthrough rather than emit a
+    // bigger "summary" with negative elision metadata.
+    if (tailStart <= headEnd) {
+      return { text, reduced: false, originalBytes };
+    }
+    const head = buf.subarray(0, headEnd).toString('utf8');
+    const tail = buf.subarray(tailStart).toString('utf8');
+    const dropped = originalBytes - headEnd - (buf.length - tailStart);
     return {
       text: `${head}\n[... ${formatBytes(dropped)} dropped ...]\n${tail}`,
       reduced: true,
@@ -88,6 +107,32 @@ export const headTailSummary = (text: string, opts: HeadTailOptions): TextSummar
     reduced: true,
     originalBytes,
   };
+};
+
+// True iff `b` is a UTF-8 continuation byte (`10xxxxxx`) — i.e.
+// the byte sits in the middle of a multi-byte codepoint, not at
+// the start. Codepoint boundaries are every byte that ISN'T a
+// continuation byte.
+const isUtf8Continuation = (b: number | undefined): boolean =>
+  b !== undefined && (b & 0xc0) === 0x80;
+
+// Walk backward from `pos` until we land on a UTF-8 codepoint
+// boundary. Clamps to `buf.length` upper bound so callers can
+// pass any position. Returns 0 when no boundary found (empty
+// buffer or pathological input).
+const utf8BoundaryAtOrBefore = (buf: Buffer, pos: number): number => {
+  let p = Math.min(pos, buf.length);
+  while (p > 0 && isUtf8Continuation(buf[p])) p--;
+  return p;
+};
+
+// Mirror of the above walking forward. Used to find the START of
+// the tail slice — we want the smallest codepoint boundary at or
+// after the target byte position.
+const utf8BoundaryAtOrAfter = (buf: Buffer, pos: number): number => {
+  let p = Math.max(0, pos);
+  while (p < buf.length && isUtf8Continuation(buf[p])) p++;
+  return p;
 };
 
 // Compact byte-count rendering for elision markers. Mirrors the

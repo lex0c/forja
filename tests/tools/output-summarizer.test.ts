@@ -46,6 +46,48 @@ describe('headTailSummary', () => {
     expect(Buffer.byteLength(out.text, 'utf8')).toBeLessThan(giant.length);
   });
 
+  test('byte-window fallback handles multi-byte UTF-8 (no duplication, no negative dropped)', () => {
+    // `你` = 3 bytes in UTF-8 but 1 UTF-16 code unit. Pre-fix the
+    // byte-window used String.prototype.slice which counts code
+    // units — for a 6000-char (18 KB) input crossing a 16 KB
+    // threshold, `slice(0, 8192)` returned the entire string and
+    // the tail slice duplicated part of it, producing a "summary"
+    // larger than the input with a negative `dropped` marker.
+    const giant = '你'.repeat(6000);
+    const originalBytes = Buffer.byteLength(giant, 'utf8');
+    expect(originalBytes).toBe(18000);
+    const out = headTailSummary(giant, {
+      maxBytes: 16 * 1024,
+      headLines: 80,
+      tailLines: 80,
+    });
+    expect(out.reduced).toBe(true);
+    expect(out.originalBytes).toBe(originalBytes);
+    // Result must be smaller than the input — actual reduction, not
+    // a degenerate "summary" that's bigger than what it summarizes.
+    expect(Buffer.byteLength(out.text, 'utf8')).toBeLessThan(originalBytes);
+    // Dropped marker reports a positive byte count (never negative).
+    const droppedMatch = out.text.match(/\[\.\.\. (\d+(?:\.\d+)?)(B|KB|MB) dropped \.\.\.\]/);
+    expect(droppedMatch).not.toBeNull();
+  });
+
+  test('byte-window slices land on UTF-8 codepoint boundaries (no truncation mid-codepoint)', () => {
+    // Mix of ASCII + 3-byte CJK + 4-byte emoji. Slicing without
+    // boundary awareness would split a codepoint and emit
+    // U+FFFD replacement chars. The boundary helper ensures both
+    // head and tail decode back to valid UTF-8.
+    const mixed = `${'a'.repeat(8000)}${'你'.repeat(3000)}${'🦊'.repeat(2000)}${'z'.repeat(8000)}`;
+    const out = headTailSummary(mixed, {
+      maxBytes: 4 * 1024,
+      headLines: 50,
+      tailLines: 50,
+    });
+    expect(out.reduced).toBe(true);
+    // No U+FFFD (replacement char) in the output — boundary-aware
+    // slicing preserved all kept codepoints intact.
+    expect(out.text).not.toContain('�');
+  });
+
   test('exposes default head/tail line count for tools to consume', () => {
     expect(HEAD_TAIL_DEFAULT_LINES).toBeGreaterThan(0);
   });
