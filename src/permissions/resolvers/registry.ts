@@ -46,6 +46,18 @@ export interface ResolverContext {
   // posture as `realpath`: tests omit and stay on the lexical-
   // only path; production wiring passes `fs.readlinkSync`.
   readlink?: (p: string) => string;
+  // Hardening (M3): the symlink-aware defenses (slices 176, 178)
+  // silently no-op when `realpath` is absent — a regression where
+  // someone unwires the production hook (engine.ts:1495) would
+  // disable the entire symlink-escape defense without any signal.
+  // The resolver writes a one-time stderr warn the first time it
+  // observes ctx.realpath as undefined; tests that INTENTIONALLY
+  // omit `realpath` (per the comments above) set this flag to
+  // suppress the warning so the test log stays clean.
+  //
+  // Production callers MUST leave this undefined / false — the
+  // warning is the audit signal that flags accidental removal.
+  suppressDegradeWarnings?: boolean;
 }
 
 export type Resolver = (args: Record<string, unknown>, ctx: ResolverContext) => ResolverResult;

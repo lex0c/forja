@@ -2970,6 +2970,33 @@ const couldGlobReachProtected = (
 const tierRank = (t: 'deny' | 'escalate' | null): number =>
   t === 'deny' ? 2 : t === 'escalate' ? 1 : 0;
 
+// Hardening (M3 from the bash-resolver review). The symlink-aware
+// defenses below silently no-op when `ctx.realpath` is missing —
+// that's intentional for tests (which build paths that don't exist
+// on disk) but catastrophic in production if someone accidentally
+// removes the engine wire-up at `engine.ts:1495`. The warning fires
+// once per process (subsequent missing-realpath checks stay silent
+// to avoid log spam) and only when the caller didn't opt out via
+// `ctx.suppressDegradeWarnings`. Production wiring leaves the flag
+// undefined; the warning is the audit signal that flags regression.
+let realpathMissingWarned = false;
+const warnRealpathMissingOnce = (ctx: ResolverContext): void => {
+  if (realpathMissingWarned) return;
+  if (ctx.suppressDegradeWarnings === true) return;
+  realpathMissingWarned = true;
+  process.stderr.write(
+    'forja: bash resolver running WITHOUT realpath/readlink wired — symlink-escape defenses (slices 176, 178) are inactive. Production wiring at engine.ts injects fs.realpathSync/readlinkSync; if you see this in production, the wire-up was removed.\n',
+  );
+};
+
+// Test seam — reset the warn-once latch so a test exercising the
+// warning path can verify it fires. Production callers never need
+// this; it's symmetric to the other __reset*ForTest helpers in this
+// module's neighborhood.
+export const __resetRealpathWarnLatchForTest = (): void => {
+  realpathMissingWarned = false;
+};
+
 // Resolve a lexical absolute path to its canonical form for
 // classification, with three sequential fallbacks. Used by BOTH
 // `classifyArgWithCanonical` (protected-path tier check) and
@@ -2998,7 +3025,10 @@ const tierRank = (t: 'deny' | 'escalate' | null): number =>
 //   4. Give up — return null and the caller falls back to the
 //      lexical classification.
 const canonicalizeForClassification = (lexicalAbs: string, ctx: ResolverContext): string | null => {
-  if (ctx.realpath === undefined) return null;
+  if (ctx.realpath === undefined) {
+    warnRealpathMissingOnce(ctx);
+    return null;
+  }
   try {
     return ctx.realpath(lexicalAbs);
   } catch {
@@ -3071,7 +3101,11 @@ const classifyArgWithCanonical = (
   });
   // Deny on lexical short-circuits — canonical can only stay-or-deny,
   // it cannot relax. Skip the realpath roundtrip in the hot path.
-  if (lexicalTier === 'deny' || ctx.realpath === undefined) return lexicalTier;
+  if (lexicalTier === 'deny') return lexicalTier;
+  if (ctx.realpath === undefined) {
+    warnRealpathMissingOnce(ctx);
+    return lexicalTier;
+  }
 
   const canonical = canonicalizeForClassification(lexicalAbs, ctx);
   if (canonical === null || canonical === lexicalAbs) return lexicalTier;
@@ -3105,7 +3139,10 @@ const classifyArgWithCanonical = (
 // symlinks pointing outside the project root); low-confidence funnels
 // the call through the operator's modal, which is the right trade.
 const detectCwdScopeEscape = (lexicalAbs: string, ctx: ResolverContext): boolean => {
-  if (ctx.realpath === undefined) return false;
+  if (ctx.realpath === undefined) {
+    warnRealpathMissingOnce(ctx);
+    return false;
+  }
   const canonical = canonicalizeForClassification(lexicalAbs, ctx);
   if (canonical === null || canonical === lexicalAbs) return false;
   const cwdPrefix = ctx.cwd.endsWith('/') ? ctx.cwd : `${ctx.cwd}/`;

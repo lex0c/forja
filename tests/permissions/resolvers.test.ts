@@ -1,6 +1,7 @@
-import { beforeAll, describe, expect, test } from 'bun:test';
+import { beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { initBashParser } from '../../src/permissions/bash-parser.ts';
 import { type Capability, formatCapability } from '../../src/permissions/capabilities.ts';
+import { __resetRealpathWarnLatchForTest } from '../../src/permissions/resolvers/bash.ts';
 // Importing the index file loads every builtin resolver via its
 // side-effecting register calls.
 import {
@@ -17,7 +18,15 @@ beforeAll(async () => {
   await initBashParser();
 });
 
-const CTX: ResolverContext = { cwd: '/work/proj', home: '/home/op' };
+// `suppressDegradeWarnings` keeps the resolver's M3 warn-once
+// stderr message off this test file's output. Tests here
+// intentionally build a ResolverContext without realpath/readlink —
+// see registry.ts:ResolverContext for the rationale.
+const CTX: ResolverContext = {
+  cwd: '/work/proj',
+  home: '/home/op',
+  suppressDegradeWarnings: true,
+};
 
 const capStrings = (caps: readonly Capability[]): string[] => caps.map(formatCapability);
 
@@ -1466,7 +1475,7 @@ describe('bash resolver — slice 176 symlink-bypass detection (command-bypass P
     const r = resolveCapabilities(
       'bash',
       { command: 'cat innocent.txt' },
-      { cwd: '/work/proj', home: '/home/op' },
+      { cwd: '/work/proj', home: '/home/op', suppressDegradeWarnings: true },
     );
     expect(r.kind).toBe('ok');
   });
@@ -1484,6 +1493,97 @@ describe('bash resolver — slice 176 symlink-bypass detection (command-bypass P
     };
     const r = resolveCapabilities('bash', { command: 'cat src/main.ts' }, ctxWithRealpath);
     expect(r.kind).toBe('ok');
+  });
+});
+
+// Hardening (M3): visibility for the silent realpath degrade. The
+// symlink-aware defenses (slices 176, 178) no-op when `ctx.realpath`
+// is undefined — fine for tests that opt in via
+// `suppressDegradeWarnings: true`, dangerous in production if the
+// engine wire-up at engine.ts:1495 is ever removed. The resolver
+// writes a one-time stderr warn the first time it sees realpath
+// missing without suppression.
+describe('bash resolver — M3 realpath degrade visibility', () => {
+  beforeEach(() => {
+    __resetRealpathWarnLatchForTest();
+  });
+
+  test('warn fires once when realpath is missing and not suppressed', () => {
+    // Capture stderr from `process.stderr.write` to assert the warn
+    // text. Restore the original at the end so the rest of the suite
+    // sees normal stderr.
+    const writes: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    (process.stderr as { write: typeof original }).write = ((chunk: string | Uint8Array) => {
+      writes.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf-8'));
+      return true;
+    }) as typeof original;
+    try {
+      // No suppress flag → first call emits the warn.
+      resolveCapabilities(
+        'bash',
+        { command: 'cat src/main.ts' },
+        { cwd: '/work/proj', home: '/home/op' },
+      );
+      // Second call within the same process — the latch keeps it
+      // silent so the operator's log isn't spammed.
+      resolveCapabilities(
+        'bash',
+        { command: 'cat src/other.ts' },
+        { cwd: '/work/proj', home: '/home/op' },
+      );
+    } finally {
+      (process.stderr as { write: typeof original }).write = original;
+    }
+    const warnLines = writes.filter((w) => w.includes('realpath/readlink wired'));
+    expect(warnLines.length).toBe(1);
+    expect(warnLines[0]).toContain('symlink-escape defenses');
+    expect(warnLines[0]).toContain('engine.ts');
+  });
+
+  test('warn is suppressed when ctx.suppressDegradeWarnings is true', () => {
+    const writes: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    (process.stderr as { write: typeof original }).write = ((chunk: string | Uint8Array) => {
+      writes.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf-8'));
+      return true;
+    }) as typeof original;
+    try {
+      resolveCapabilities(
+        'bash',
+        { command: 'cat src/main.ts' },
+        { cwd: '/work/proj', home: '/home/op', suppressDegradeWarnings: true },
+      );
+    } finally {
+      (process.stderr as { write: typeof original }).write = original;
+    }
+    const warnLines = writes.filter((w) => w.includes('realpath/readlink wired'));
+    expect(warnLines.length).toBe(0);
+  });
+
+  test('warn does NOT fire when realpath is wired (production path)', () => {
+    // Identity realpath stand-in. The defense is active; no warn.
+    const writes: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    (process.stderr as { write: typeof original }).write = ((chunk: string | Uint8Array) => {
+      writes.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf-8'));
+      return true;
+    }) as typeof original;
+    try {
+      resolveCapabilities(
+        'bash',
+        { command: 'cat src/main.ts' },
+        {
+          cwd: '/work/proj',
+          home: '/home/op',
+          realpath: (p) => p,
+        },
+      );
+    } finally {
+      (process.stderr as { write: typeof original }).write = original;
+    }
+    const warnLines = writes.filter((w) => w.includes('realpath/readlink wired'));
+    expect(warnLines.length).toBe(0);
   });
 });
 
@@ -3159,7 +3259,7 @@ describe('bash resolver — glob/brace bypass detection (slices 125 + 127)', () 
     // literal prefix `/home/op` byte-startsWith matched /home/op/.ssh.
     // Post-fix: segment-aware match requires the prefix to be a
     // parent dir (trailing /), so `/home/op` doesn't match `.ssh`.
-    const HOME_CTX = { cwd: '/home/op', home: '/home/op' };
+    const HOME_CTX = { cwd: '/home/op', home: '/home/op', suppressDegradeWarnings: true };
     const r = resolveCapabilities('bash', { command: 'ls *' }, HOME_CTX);
     expect(r.kind).toBe('ok');
   });

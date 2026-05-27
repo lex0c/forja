@@ -14,7 +14,7 @@ Self-review of the bash AST resolver (`src/permissions/resolvers/bash.ts`, 3374 
 
 - **H2 — parse-timeout DoS via single-threaded engine.** `PARSE_TIMEOUT_MS = 5_000` in `bash-parser.ts`. Bun runs JS single-threaded; N adversarial inputs (deeply nested quotes / pathological heredocs) burn ~5N seconds of engine before refusing. Mitigation: drop ceiling to 1500ms (still 100×+ over legitimate input parse cost), track timeouts via shared counter, transition to `degraded` after 3 in 30s. Audit emit on each timeout for forensic trail.
 
-- **M3 — silent symlink-defense degrade when `ctx.realpath` unwired.** `canonicalizeForClassification` returns null with no warning when realpath callback absent. Slices 176 + 178 (the entire symlink/cwd-scope-escape defense) silently disabled. Bootstrap audit emit on construction when callback missing; existing test paths (which intentionally omit realpath) get a fail-safe `disable-symlink-defense-acknowledged` flag.
+- **M3 — silent symlink-defense degrade when `ctx.realpath` unwired.** `canonicalizeForClassification`, `classifyArgWithCanonical`, and `detectCwdScopeEscape` all returned silently with no signal when realpath was absent — slices 176 + 178 (the symlink/cwd-scope-escape defense) silently disabled with no audit trail. Fix: resolver writes a one-time stderr warning identifying the regression and pointing at the production wire-up site (`engine.ts:1495`). Tests that intentionally omit realpath set `ctx.suppressDegradeWarnings: true` to keep the log clean; production callers leave the flag undefined so the warning is the regression signal.
 
 **Findings (next batch, not on this branch):**
 
