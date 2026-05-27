@@ -685,6 +685,18 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     const childTrustedHosts = mergeTrustedHosts(
       audit.policySnapshot.tools.fetch_url?.trusted_hosts ?? [],
     );
+
+    // Build the full builtin registry BEFORE constructing the
+    // engine so the side-effect oracle can consult it. Order
+    // matters: the engine's envelope gate uses the oracle on
+    // every check, and `effectiveCapabilities` IS populated in
+    // child engines, so without the oracle a narrowed subagent
+    // could invoke `bash_kill` / `bash_output` (resolver returns
+    // caps=[]) outside the envelope. Parity with the bootstrap
+    // wiring in `cli/bootstrap.ts`.
+    const fullRegistry = createToolRegistry();
+    registerBuiltinTools(fullRegistry);
+
     const permissionEngine = createPermissionEngine(audit.policySnapshot, {
       cwd: session.cwd,
       ...(effectiveCapabilitiesParsed !== undefined
@@ -694,6 +706,11 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       telemetry: childTelemetry,
       sessionId: opts.sessionId,
       trustedHosts: childTrustedHosts,
+      isToolSideEffect: (toolName) => {
+        const tool = fullRegistry.get(toolName);
+        if (tool === null) return false;
+        return tool.metadata.writes === true || tool.metadata.exec === true;
+      },
     });
 
     // The audit row carries the canonical toolset (`tools_whitelist`)
@@ -701,8 +718,6 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     // the registry from that list — NOT by re-loading the
     // definition .md from disk, which could have drifted between
     // spawn and child read.
-    const fullRegistry = createToolRegistry();
-    registerBuiltinTools(fullRegistry);
     const childRegistry = createToolRegistry();
     // Per-playbook tool_restrictions snapshot (`PLAYBOOKS.md` §1.1,
     // migration 024). Wrap every tool in a pre-flight gate that
