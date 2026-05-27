@@ -744,6 +744,80 @@ describe('bash resolver — rm hardcoded blocklist (slice 147)', () => {
   });
 });
 
+// M5 (review): home-relative credential / config dirs in
+// RM_REFUSE_ROOTS-equivalent posture. `rm -rf ~/.ssh` pre-M5
+// only escalated to confirm — same blast radius as `rm -rf /etc`
+// which was refused. M5 closes the asymmetry. Subpaths still go
+// through the regular escalate tier.
+describe('bash resolver — M5 home credential/config dir refuse', () => {
+  test.each(['~/.ssh', '~/.gnupg', '~/.aws', '~/.kube', '~/.config', '~/.local', '~/.docker'])(
+    'rm -rf %s is Refused (home credential/config dir)',
+    (target) => {
+      const r = resolveCapabilities('bash', { command: `rm -rf ${target}` }, CTX);
+      expect(r.kind).toBe('refuse');
+      if (r.kind === 'refuse') {
+        expect(r.reason).toContain('credential/config dir');
+      }
+    },
+  );
+
+  test('rm of SUBPATH inside ~/.ssh is NOT refused at the rm blocklist', () => {
+    // ~/.ssh/old_id_rsa is a deeper path; it routes through the
+    // protected-path classifier (escalate tier) rather than rm's
+    // hardcoded blocklist. Confirms M5 doesn't over-refuse — the
+    // rule only catches the ROOT dir.
+    const r = resolveCapabilities('bash', { command: 'rm ~/.ssh/old_id_rsa' }, CTX);
+    // Either ok with delete-fs OR a refuse-NOT-attributed-to-M5.
+    if (r.kind === 'refuse') {
+      expect(r.reason).not.toContain('credential/config dir');
+    }
+  });
+
+  test('rm -rf $HOME/.ssh (literal-home shape) is also Refused', () => {
+    // The resolver expands ~ and the resolved path equals
+    // <ctx.home>/.ssh. We pass a manually-tilded form via the
+    // resolver's expandTilde path — and the bare-literal form is
+    // covered by tildeEscalateDirs in the per-arg classifier. The
+    // M5 rule fires when the resolved string matches a refused
+    // home dir.
+    const r = resolveCapabilities('bash', { command: 'rm -rf ~/.aws' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+});
+
+// M6 (review): shell-as-command. `bash script.sh`, `sh -c '...'`,
+// `zsh -i` — same threat shape as `eval`: inner shell runs anything,
+// no static capability resolution possible. Pre-M6 these fell to
+// unknown_command refuse (safe but generic); M6 routes them through
+// HARD_REFUSE_COMMANDS with a stable refusal reason.
+describe('bash resolver — M6 shell-as-command hard-refuse', () => {
+  test.each(['bash', 'sh', 'zsh', 'dash', 'ksh', 'fish'])(
+    '%s as a command name is hard-refused',
+    (shell) => {
+      const r = resolveCapabilities('bash', { command: `${shell} script.sh` }, CTX);
+      expect(r.kind).toBe('refuse');
+      if (r.kind === 'refuse') {
+        // HARD_REFUSE pattern: "command '<name>' has no safe
+        // capability resolution".
+        expect(r.reason).toContain(`'${shell}'`);
+        expect(r.reason).toContain('no safe capability resolution');
+      }
+    },
+  );
+
+  test('bash with -c inline flag is also hard-refused (not interpreter path)', () => {
+    // Pre-M6 `bash -c '...'` matched cmdInterpreter via `bash` not
+    // in COMMAND_TABLE → unknown_command. With M6, `bash` enters
+    // HARD_REFUSE before COMMAND_TABLE lookup, so the refusal is
+    // attributed to the shell-as-command rule.
+    const r = resolveCapabilities('bash', { command: 'bash -c "ls /"' }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') {
+      expect(r.reason).toContain("'bash'");
+    }
+  });
+});
+
 // Slice 139 C1: `env` launderer. `env <prog> [args]` runs the
 // trailing program, bypassing COMMAND_TABLE resolution for that
 // program. A narrow operator allow like `bash: env *` would

@@ -16,13 +16,15 @@ Self-review of the bash AST resolver (`src/permissions/resolvers/bash.ts`, 3374 
 
 - **M3 — silent symlink-defense degrade when `ctx.realpath` unwired.** `canonicalizeForClassification`, `classifyArgWithCanonical`, and `detectCwdScopeEscape` all returned silently with no signal when realpath was absent — slices 176 + 178 (the symlink/cwd-scope-escape defense) silently disabled with no audit trail. Fix: resolver writes a one-time stderr warning identifying the regression and pointing at the production wire-up site (`engine.ts:1495`). Tests that intentionally omit realpath set `ctx.suppressDegradeWarnings: true` to keep the log clean; production callers leave the flag undefined so the warning is the regression signal.
 
+- **M5 — `rm` blocklist asymmetry between system and home credential dirs.** `rm -rf /etc` refused but `rm -rf ~/.ssh` only confirmed — same blast radius, different policy posture. Added `RM_REFUSE_HOME_DIRS` (`.ssh`, `.gnupg`, `.aws`, `.kube`, `.config`, `.local`, `.docker`) resolved against `ctx.home` at check time. Subpaths still route through the regular escalate tier; only deletion of the dir root triggers the refuse.
+
+- **M6 — shells as commands fell through to `unknown_command`.** `bash script.sh`, `sh -c '...'`, `zsh -i` and friends were refused via the unknown-command catchall, producing a generic reason string. Added `bash`/`sh`/`zsh`/`dash`/`ksh`/`fish` to `HARD_REFUSE_COMMANDS` so the refusal carries the stable `'<shell>' has no safe capability resolution` message — same posture as `eval`/`source`/`command`/`builtin`. The pipe-to-shell defense already caught `... | sh`; M6 catches the direct-spawn shape.
+
 **Findings (next batch, not on this branch):**
 
 - **H1** — snapshot test of tree-sitter-bash node-kinds against silent grammar rename.
 - **M1** — `number` nodes included in `literalText` extraction (slice 125 history showed past bypass via this).
 - **M2** — Wayland/XDG socket coverage in `couldGlobReachProtected` (today `isXdgRuntimeSensitive` is a function, not in `protectedTargets()` → glob `/run/user/*/...` walks past).
-- **M5** — extend `RM_REFUSE_ROOTS` with `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.config`. Asymmetry: `rm -rf /etc` refuse vs `rm -rf ~/.ssh` only confirm.
-- **M6** — `bash`/`sh`/`zsh`/`dash`/`ksh`/`fish` to `HARD_REFUSE_COMMANDS` with stable refusal reason. Today falls through `unknown_command`.
 
 ## [2026-05-27] token-efficiency initiative — four code slices + three TODO entries
 

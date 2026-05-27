@@ -234,6 +234,21 @@ const HARD_REFUSE_COMMANDS: ReadonlySet<string> = new Set([
   // table.
   'command',
   'builtin',
+  // M6 (review). Shell-as-command (e.g., `bash script.sh`, `sh -c
+  // ...`). Today these fall through to `unknown_command` refuse,
+  // which IS safe but produces a generic refusal string. Adding
+  // them here gives audit a stable "shell-as-command laundering"
+  // reason and aligns them with `eval`/`source` in classification.
+  // Same threat shape: the inner shell can run anything, so static
+  // capability resolution is impossible. The pipe-to-shell defense
+  // (SHELL_INTERPRETERS) already catches `... | sh`; this catches
+  // the direct-spawn `sh script.sh` shape.
+  'bash',
+  'sh',
+  'zsh',
+  'dash',
+  'ksh',
+  'fish',
   // Slice 180 (review — HARD_REFUSE gap). Six families added; each
   // shares the rationale of `eval` / `dd` / `mkfs.*`: there's no
   // safe way the static resolver can shape these into a typed
@@ -659,6 +674,38 @@ const RM_REFUSE_ROOTS: ReadonlySet<string> = new Set([
   '/private',
 ]);
 
+// M5 (review). Home-relative roots whose ENTIRE-DIRECTORY deletion is
+// catastrophic. Subpaths (`~/.ssh/old_id_rsa`) still route through the
+// regular escalate tier in `classifyProtectedPath`; only `rm` against
+// the ROOT itself (`rm -rf ~/.ssh`) hits this list. Asymmetry pre-M5:
+// `rm -rf /etc` was refused but `rm -rf ~/.ssh` only escalated to
+// confirm — same blast radius, different policy posture. List
+// resolved against `ctx.home` at check time so per-user paths
+// (`/home/alice/.ssh`, `/Users/bob/.ssh`) all hit the same rule.
+//
+// Coverage:
+//   .ssh           — SSH private keys + authorized_keys
+//   .gnupg         — GPG private keys + keyrings
+//   .aws           — AWS credentials + config (long-lived API keys)
+//   .kube          — Kubernetes cluster configs + tokens
+//   .config        — Operator's app config root (XDG_CONFIG_HOME default)
+//   .local         — XDG_DATA_HOME default; agent data, shell history
+//   .docker        — Docker config + credsStore registry auth
+//
+// Out of scope: `~/Documents`, `~/Desktop`, etc. — user data dirs
+// whose deletion is destructive but operator-recoverable (less
+// catastrophic than credential dirs). Operator who wants `rm ~/Documents`
+// can confirm via the modal.
+const RM_REFUSE_HOME_DIRS: readonly string[] = [
+  '.ssh',
+  '.gnupg',
+  '.aws',
+  '.kube',
+  '.config',
+  '.local',
+  '.docker',
+];
+
 const cmdRm: CommandResolver = (positional, _tokens, ctx) => {
   if (positional.length === 0) {
     return { refuse: 'rm: missing target' };
@@ -668,6 +715,9 @@ const cmdRm: CommandResolver = (positional, _tokens, ctx) => {
   // attributed to the resolver (forensically traceable to a
   // specific spec line) rather than to a downstream policy check
   // that could be misconfigured away.
+  const refusedHomeDirs = new Set<string>(
+    ctx.home !== '' ? RM_REFUSE_HOME_DIRS.map((rel) => resolvePath(ctx.home, rel)) : [],
+  );
   for (const arg of positional) {
     const resolved = resolveArg(arg, ctx);
     if (RM_REFUSE_ROOTS.has(resolved)) {
@@ -680,6 +730,14 @@ const cmdRm: CommandResolver = (positional, _tokens, ctx) => {
     if (resolved === ctx.home && ctx.home !== '') {
       return {
         refuse: `rm: refuse to delete operator home '${resolved}' (hardcoded blocklist; spec §5.2)`,
+      };
+    }
+    // M5: home-relative credential / config dirs. Symmetric to
+    // RM_REFUSE_ROOTS — root-of-dir deletion only; subpaths route
+    // through the regular escalate tier via classifyProtectedPath.
+    if (refusedHomeDirs.has(resolved)) {
+      return {
+        refuse: `rm: refuse to delete operator credential/config dir '${resolved}' (hardcoded blocklist; M5 review)`,
       };
     }
   }
