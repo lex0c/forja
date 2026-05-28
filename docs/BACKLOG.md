@@ -2,6 +2,60 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-28] seed memory — slice 7: registry integration + [seed] visibility
+
+Closes the seed end-to-end loop (`docs/spec/MEMORY.md §5.7.3 + §5.7.4`). The bootstrap-installed vendor catalog now flows into the system prompt the model sees, into `memory_read` lookups, and into `/memory list` / `/memory search` results — with a discreet `[seed]` marker so the model knows which entries are vendor-curated meta-behavior vs operator-authored.
+
+**Branch:** continued on `feat/memory-seeds`.
+
+**Design.** Seeds remain a sub-location under user scope, not a fourth `MemoryScope` value (per spec §5.7.4 + the slice-2 BACKLOG entry's rationale). The discriminator lives on `MemoryListing.subdir?: 'seeds'`. Slice 7 added a fourth scope-snapshot to the registry (`scope: 'user', subdir: 'seeds'`) AFTER the three SCOPE_ORDER entries, so precedence resolves to:
+
+```
+project_local > project_shared > user (top) > user/seeds
+```
+
+An operator-authored `<user>/safe-edit-discipline.md` eclipses the vendor seed of the same name. Vendor-curated content is the fallback layer — matches slice-4's "preserve what the user touched" upgrade rule, applied here at the lookup boundary rather than at write time.
+
+**Shipped on this branch:**
+
+- **`src/memory/registry.ts` — `MemoryListing.subdir`.** New optional `MemorySubdir = 'seeds'` field. `ScopeSnapshot` gains the same field. `refresh()` builds 3 SCOPE_ORDER snapshots + 1 seeds snapshot via `loadSeedsIndex(roots)`. `allListings()` and `findListing()` propagate `subdir` on the returned listing.
+
+- **`findListing` scope-filter walk fix.** The prior loop bailed after the first snapshot matching `scope` — with seeds as a second user-scope snapshot, a `lookup('safe-edit-discipline', { scope: 'user' })` would miss the seed when the user-top didn't carry it. The loop now walks every matching snapshot in precedence order. Pinned with a regression test.
+
+- **`readForListing(listing)` dispatch helper.** Consolidates the six `readMemoryByName(roots, listing.scope, listing.name)` call sites in the registry into one helper that routes `listing.subdir === 'seeds'` through `readSeedByName(roots, name)` (slice 2) and everything else through `readMemoryByName`. Adding a future subdir (slice 6 team seeds, or any spec extension) touches one place.
+
+- **`src/cli/memory-prompt.ts` — `[seed]` marker.** The rendered line gains a `[seed]` flag between the scope tag and the `[memory: quarantined]` flag, only when `listing.subdir === 'seeds'`. Spec §5.7.3: "UI mostrar `[seed]` discreto na lista — transparência." When dedupe drops the seed in favor of an operator-authored memory of the same name, the surviving listing carries no marker — the model sees just `[user] foo — hook`, correctly attributing the source to the operator.
+
+**Bootstrap behavior.** Previously, with `installVendorSeeds` plumbed but no registry integration, the `# Memory` section on a fresh session was header-only (zero entries). Post-slice-7, fresh sessions ship the 10 canonical vendor seeds in the eager section — the model sees `safe-edit-discipline`, `no-fabrication`, `confirm-blast-radius`, etc. before its first response. The bootstrap test `memory registry is wired even when no memories exist` was rewritten to reflect this — seed-bearing prompts are the new fresh-session baseline.
+
+**Tests + validation:**
+- `tests/memory/registry.test.ts`: 5 new tests covering list/read end-to-end (seed entries land with `subdir='seeds'`; `read('safe-edit-discipline')` returns the seed body via `readSeedByName`; an operator-authored override eclipses the seed; `findListing(name, 'user')` falls through to seeds; `list({ states: ['active'] })` peek path dispatches correctly on subdir).
+- `tests/cli/memory-prompt.test.ts`: 3 new tests pinning the `[seed]` marker (renders for seeds; dropped when an operator override eclipses; mix of operator-mem + seed gets both rendered with only the seed marked).
+- `tests/cli/bootstrap.test.ts`: bootstrap "no operator memories" test rewritten to assert seeds DO show up in the rendered prompt.
+- `bun run typecheck` clean, `bun run lint` clean.
+- `bun test tests/memory/ tests/cli/` → 2573 pass (up from 2553 in slice 4; +20 net new tests; the bootstrap rewrite replaced one assertion-shape but added more).
+
+**The seed end-to-end loop is now closed.** Vendor catalog → `<user>/seeds/` install → registry merge → eager prompt section → `memory_read` lookup all work together. Slice 5 (interactive `[k/v/a/m]` modal for user_kept conflicts + `agent init --no-seeds`) and slice 6 (team seeds opt-in via `seed_origin: team`) remain as scoped follow-ups, but the model can read the vendor catalog without them.
+
+**Post-review tightening (same slice).** Four findings from the slice-7 code review applied:
+
+(1) **`/memory delete <seed-name>` now actually deletes the seed body.** Slice-7 closed the READ side via `readForListing`, but the mutation surface was flat: `removeMemory(roots, scope, name)` resolved via `memoryFilePath(roots, 'user', name)` regardless of where the body actually lived, so operator-driven deletes of a seed silently no-oped (top-level path didn't exist) while the seed body persisted at `<user>/seeds/<name>.md`. Fix: `MemorySubdir` lifted to `types.ts`; `RegistryReadResult` carries `subdir` from the underlying listing; `RemoveMemoryInput` accepts an optional `subdir` and dispatches `seedMemoryFilePath` + `seedIndexFilePath` when set. `confirmAndDelete` threads `peek.subdir` through to `removeMemory`.
+
+(2) **Seed deletes force the legacy route, never the state-machine.** The state-machine route's tombstone semantics resolve under `<scope-root>/.tombstones/`, but slice-2's `seedTombstonePath` expects `<user>/seeds/.tombstones/`. Until slice 5+ extends transitions for seed-specific tombstone routing, `confirmAndDelete` bypasses `deleteViaTransition` whenever `subdir === 'seeds'` so the subdir-aware `removeMemory` is the only writer for seeds.
+
+(3) **Malformed `<user>/seeds/MEMORY.md` now surfaces a stderr warn at refresh time.** Previously `loadSeedsIndex` returned `{kind:'malformed', error}` and the registry silently dropped every seed for that boot — operator never learned the cause. Slice-4's installer rewrites the file on every boot so the corruption window is small, but the diagnostic-drop is now observable.
+
+(4) **Bootstrap test regex replaced with a `toContain` of a specific canonical seed.** The old regex `[a-z-]+` would reject a future seed name with digits (e.g., `v2-edit-discipline`); the test was brittle to catalog naming changes. Pinning `safe-edit-discipline` keeps the test deterministic without depending on regex meta.
+
+**Tests:** 2 new regression tests in `tests/cli/slash/memory.test.ts` covering `/memory delete <seed-name>` (verifies the right file gets removed; index entry cleared) and the legacy-route-for-seeds invariant (verifies no `<user>/.tombstones/` artifact, no `quarantined`/`evicted` audit row for seed deletions). 2575 pass; typecheck + lint clean.
+
+**Deferred follow-ups (not blocking slice 7):**
+- **#3 fresh-install peek cost** — efficiency, fits a separate boot-perf sweep.
+- **#5 scope-pinning contract drift** — needs slash-command call-site audit; deliberate design choice in slice 7.
+- **#7 invariant assertion (`subdir==='seeds'` ⇒ `scope==='user'`)** — defensive; revisit with slice-6 team seeds.
+- **#9 flag render order for quarantined seeds** — UX, spec doesn't pin order.
+- **#10 provenance schema lacks subdir** — analyst-pain debt for slice 5+.
+
 ## [2026-05-28] seed memory — slice 4: upgrade lifecycle + archive
 
 Slice 4 of seed memory (`docs/spec/MEMORY.md §5.7.5`). The installer now reconciles three sources of truth — bundled catalog, on-disk bodies, and a persistent manifest — so vendor catalog bumps land for clean operators and never overwrite operator-edited content.

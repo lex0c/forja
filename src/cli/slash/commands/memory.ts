@@ -29,6 +29,7 @@ import {
   type MemoryListing,
   type MemoryRegistry,
   type MemoryScope,
+  type MemorySubdir,
   type TombstoneEntry,
   applyProposal,
   clearSharedTrust,
@@ -1360,6 +1361,7 @@ const handleDelete = async (
       [`(body parse failed: ${peek.error})`],
       'imported',
       'legacy',
+      peek.subdir,
     );
   }
   if (peek.kind === 'missing') {
@@ -1375,6 +1377,7 @@ const handleDelete = async (
       ['(body file missing — only the index entry will be cleared)'],
       'imported',
       'legacy',
+      peek.subdir,
     );
   }
 
@@ -1393,6 +1396,7 @@ const handleDelete = async (
     peek.file.body.split('\n'),
     peek.file.frontmatter.source,
     state === 'active' ? 'state-machine' : 'legacy',
+    peek.subdir,
   );
 };
 
@@ -1414,6 +1418,7 @@ const confirmAndDelete = async (
   preview: string[],
   source: string,
   route: DeleteRoute,
+  subdir?: MemorySubdir,
 ): Promise<SlashResult> => {
   const answer = await ctx.modalManager.askMemoryAction({
     action: 'delete',
@@ -1448,7 +1453,18 @@ const confirmAndDelete = async (
   // machine-legal label. Follow-up: spec EVICTION §4.1 may grow
   // an explicit `user_purge` motivo on active→evicted to clean
   // this attribution.
-  if (route === 'state-machine') {
+  // Seeds (subdir='seeds') always take the legacy route. The state-
+  // machine path's tombstone semantics resolve under the scope's
+  // .tombstones/ — for a seed, that would move the body OUT of
+  // <user>/seeds/.tombstones/ where slice-2's seedTombstonePath
+  // expects it, into <user>/.tombstones/. Until slice 5+ extends
+  // the transition lifecycle to handle seed-specific tombstone
+  // routing, removeMemory + the subdir-aware path resolver is the
+  // safe path. Operator restore for seeds: slice 4 archives the
+  // body when the catalog drops it, so `/memory delete <seed>`
+  // followed by an undo would route through the archive surface,
+  // not the tombstone surface.
+  if (route === 'state-machine' && subdir !== 'seeds') {
     return await deleteViaTransition(ctx, registry, roots, scope, name);
   }
 
@@ -1458,7 +1474,7 @@ const confirmAndDelete = async (
   // wants). Future slice can route quarantined/invalidated/evicted
   // through transitionMemoryState too — out of scope here because
   // the volume is tiny and the legacy path is well-tested.
-  const result = removeMemory({ roots, scope, name });
+  const result = removeMemory({ roots, scope, name, ...(subdir !== undefined && { subdir }) });
   if (result.kind === 'sandbox_violation') {
     registry.recordEvent({
       action: 'refused',

@@ -1659,3 +1659,159 @@ describe('createMemoryRegistry — recordOverrideSignal (S3.2)', () => {
     expect(rows[0]?.sessionId).toBe(sessionId);
   });
 });
+
+// ── Slice 7: registry integration of <user>/seeds/ ──────────────────────
+
+describe('createMemoryRegistry — seeds subdir integration (spec §5.7.4)', () => {
+  const seedContent = (name: string, version = '1.0'): string =>
+    `---\nname: ${name}\ndescription: hook for ${name}\ntype: feedback\nsource: seed\nseed_origin: vendor\nseed_version: "${version}"\n---\n\nbody for ${name}.\n`;
+
+  test('list() includes seed entries with subdir="seeds" alongside user-top entries', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Role](role.md) — full-stack TS\n');
+    writeMemory(roots.user, 'role', fmUser('role'), 'body');
+    // Install a vendor seed directly via the installer to exercise
+    // the slice-2 paths + slice-3 install + slice-7 registry merge
+    // end-to-end.
+    const { installVendorSeeds } = await import('../../src/memory/seeds-installer.ts');
+    installVendorSeeds({
+      roots,
+      source: [
+        {
+          filename: 'safe-edit-discipline.md',
+          name: 'safe-edit-discipline',
+          description: 'ler antes de Edit',
+          version: '1.0',
+          content: seedContent('safe-edit-discipline'),
+        },
+      ],
+    });
+
+    const reg = createMemoryRegistry({ roots });
+    const list = reg.list();
+    const roleListing = list.find((l) => l.name === 'role');
+    const seedListing = list.find((l) => l.name === 'safe-edit-discipline');
+    expect(roleListing?.scope).toBe('user');
+    expect(roleListing?.subdir).toBeUndefined();
+    expect(seedListing?.scope).toBe('user');
+    expect(seedListing?.subdir).toBe('seeds');
+  });
+
+  test('read("seed-name") loads the body from <user>/seeds/ via readSeedByName', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const { installVendorSeeds } = await import('../../src/memory/seeds-installer.ts');
+    installVendorSeeds({
+      roots,
+      source: [
+        {
+          filename: 'safe-edit-discipline.md',
+          name: 'safe-edit-discipline',
+          description: 'ler antes de Edit',
+          version: '1.0',
+          content: seedContent('safe-edit-discipline'),
+        },
+      ],
+    });
+    const reg = createMemoryRegistry({ roots });
+    const result = reg.read('safe-edit-discipline');
+    if (result.kind !== 'present') {
+      throw new Error(`expected present, got ${result.kind}`);
+    }
+    expect(result.scope).toBe('user');
+    expect(result.file.frontmatter.source).toBe('seed');
+    expect(result.file.frontmatter.seed_origin).toBe('vendor');
+    expect(result.file.body).toBe('body for safe-edit-discipline.\n');
+  });
+
+  test('user-top entry of the same name eclipses the seed', async () => {
+    // An operator who authored their own `<user>/safe-edit-discipline.md`
+    // ought to see it preferred over the vendor seed of the same name.
+    // The registry's precedence: project_local > project_shared > user > user/seeds.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const { installVendorSeeds } = await import('../../src/memory/seeds-installer.ts');
+    installVendorSeeds({
+      roots,
+      source: [
+        {
+          filename: 'safe-edit-discipline.md',
+          name: 'safe-edit-discipline',
+          description: 'vendor hook',
+          version: '1.0',
+          content: seedContent('safe-edit-discipline'),
+        },
+      ],
+    });
+    // Operator-authored override at the top level.
+    writeIndex(roots.user, '- [Mine](safe-edit-discipline.md) — operator hook\n');
+    writeMemory(
+      roots.user,
+      'safe-edit-discipline',
+      'name: safe-edit-discipline\ndescription: operator hook\ntype: feedback\nsource: user_explicit\n',
+      'operator body.\n',
+    );
+    const reg = createMemoryRegistry({ roots });
+    const result = reg.read('safe-edit-discipline');
+    if (result.kind !== 'present') {
+      throw new Error(`expected present, got ${result.kind}`);
+    }
+    expect(result.file.frontmatter.source).toBe('user_explicit');
+    expect(result.file.body).toBe('operator body.\n');
+  });
+
+  test('findListing(name, "user") falls through to seeds when user-top lacks the name', async () => {
+    // Slice-7 fix: the prior findListing bailed out after the first
+    // scope-matching snapshot. With seeds as a second user snapshot,
+    // the lookup must walk both — otherwise a scope-pinned read for
+    // a seed would miss it.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const { installVendorSeeds } = await import('../../src/memory/seeds-installer.ts');
+    installVendorSeeds({
+      roots,
+      source: [
+        {
+          filename: 'safe-edit-discipline.md',
+          name: 'safe-edit-discipline',
+          description: 'vendor hook',
+          version: '1.0',
+          content: seedContent('safe-edit-discipline'),
+        },
+      ],
+    });
+    const reg = createMemoryRegistry({ roots });
+    const listing = reg.lookup('safe-edit-discipline', { scope: 'user' });
+    expect(listing?.subdir).toBe('seeds');
+    const result = reg.read('safe-edit-discipline', { scope: 'user' });
+    expect(result.kind).toBe('present');
+  });
+
+  test('seed appears in retain-with-state filter without paying a second peek', async () => {
+    // Regression: the list({ states: [...] }) path peeks each
+    // listing via readForListing — must dispatch on subdir, not
+    // hardcode readMemoryByName.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const { installVendorSeeds } = await import('../../src/memory/seeds-installer.ts');
+    installVendorSeeds({
+      roots,
+      source: [
+        {
+          filename: 'safe-edit-discipline.md',
+          name: 'safe-edit-discipline',
+          description: 'ler antes de Edit',
+          version: '1.0',
+          content: seedContent('safe-edit-discipline'),
+        },
+      ],
+    });
+    const reg = createMemoryRegistry({ roots });
+    const listed = reg.list({ states: ['active'] });
+    const seed = listed.find((l) => l.name === 'safe-edit-discipline');
+    expect(seed?.subdir).toBe('seeds');
+    expect(seed?.state).toBe('active');
+    expect(seed?.file?.frontmatter.source).toBe('seed');
+  });
+});

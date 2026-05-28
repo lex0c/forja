@@ -18,11 +18,17 @@ import {
   upsertIndexEntry,
 } from './index-file.ts';
 import { readMemoryByName } from './loader.ts';
-import { ScopeError, indexFilePath, memoryFilePath } from './paths.ts';
+import {
+  ScopeError,
+  indexFilePath,
+  memoryFilePath,
+  seedIndexFilePath,
+  seedMemoryFilePath,
+} from './paths.ts';
 import type { ScopeRoots } from './paths.ts';
 import type { MemoryRegistry } from './registry.ts';
 import { transitionMemoryState } from './transitions.ts';
-import type { MemoryFile, MemoryScope, MemorySource } from './types.ts';
+import type { MemoryFile, MemoryScope, MemorySource, MemorySubdir } from './types.ts';
 import { type WriteMemoryResult, writeMemory } from './writer.ts';
 
 // Lifecycle primitives for the memory subsystem (spec MEMORY.md §5.5,
@@ -75,6 +81,13 @@ export interface RemoveMemoryInput {
   roots: ScopeRoots;
   scope: MemoryScope;
   name: string;
+  // Sub-location discriminator (spec §5.7.4). When set, the body and
+  // index resolve under `<scope-root>/<subdir>/` instead of
+  // `<scope-root>/`. Only `'seeds'` today, only valid with
+  // scope='user'. Slice-7 review fix #1 — without this, an operator
+  // running `/memory delete <seed-name>` would silently target the
+  // top-level path and the seed body would survive.
+  subdir?: MemorySubdir;
 }
 
 const isEnoent = (err: unknown): boolean =>
@@ -114,11 +127,12 @@ const loadOrEmptyIndex = (path: string): ParsedIndex => {
 // flock-based serialization is the right answer when /memory audit
 // or admin tooling makes concurrent GC plausible.
 export const removeMemory = (input: RemoveMemoryInput): RemoveMemoryResult => {
-  const { roots, scope, name } = input;
+  const { roots, scope, name, subdir } = input;
 
   let bodyPath: string;
   try {
-    bodyPath = memoryFilePath(roots, scope, name);
+    bodyPath =
+      subdir === 'seeds' ? seedMemoryFilePath(roots, name) : memoryFilePath(roots, scope, name);
   } catch (err) {
     // Promote ScopeError / FrontmatterError into discriminated
     // result. The two reach this catch via memoryFilePath:
@@ -191,7 +205,7 @@ export const removeMemory = (input: RemoveMemoryInput): RemoveMemoryResult => {
   // Spec §3.2 SECURITY CONTRACT mandates href is a UI hint, not
   // path-bearing — so we match by canonical filename, not by
   // operator-edited href text.
-  const indexPath = indexFilePath(roots, scope);
+  const indexPath = subdir === 'seeds' ? seedIndexFilePath(roots) : indexFilePath(roots, scope);
   let parsed: ParsedIndex;
   try {
     parsed = loadOrEmptyIndex(indexPath);

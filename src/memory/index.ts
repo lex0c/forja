@@ -9,6 +9,7 @@ export type {
   MemoryScope,
   MemorySource,
   MemoryState,
+  MemorySubdir,
   MemoryTrust,
   MemoryType,
 } from './types.ts';

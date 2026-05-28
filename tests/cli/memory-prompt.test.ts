@@ -892,3 +892,89 @@ describe('assembleMemorySection — eagerLoaded inventory (S1/T1.4)', () => {
     expect(r1.eagerLoaded[0]?.memoryContentHash).toBe(r2.eagerLoaded[0]?.memoryContentHash);
   });
 });
+
+// ── Slice 7: seeds end-to-end visibility ───────────────────────────────
+
+describe('assembleMemorySection — seeds end-to-end (spec §5.7.3)', () => {
+  const seedContent = (name: string): string =>
+    `---\nname: ${name}\ndescription: hook for ${name}\ntype: feedback\nsource: seed\nseed_origin: vendor\nseed_version: "1.0"\n---\n\nbody for ${name}.\n`;
+
+  test('vendor seed appears in eager section with [seed] marker', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const { installVendorSeeds } = await import('../../src/memory/seeds-installer.ts');
+    installVendorSeeds({
+      roots,
+      source: [
+        {
+          filename: 'safe-edit-discipline.md',
+          name: 'safe-edit-discipline',
+          description: 'ler antes de Edit',
+          version: '1.0',
+          content: seedContent('safe-edit-discipline'),
+        },
+      ],
+    });
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    // The render places `[seed]` between the scope tag and the
+    // description, mirroring the `[memory: quarantined]` pattern.
+    // Spec §5.7.3: "UI mostrar `[seed]` discreto na lista —
+    // transparência."
+    expect(result.text).toMatch(/^- \[user\] safe-edit-discipline \[seed\] — ler antes de Edit$/m);
+    expect(result.entryCount).toBe(1);
+  });
+
+  test('operator-authored memory of the same name eclipses the seed and DROPS the marker', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const { installVendorSeeds } = await import('../../src/memory/seeds-installer.ts');
+    installVendorSeeds({
+      roots,
+      source: [
+        {
+          filename: 'safe-edit-discipline.md',
+          name: 'safe-edit-discipline',
+          description: 'vendor hook',
+          version: '1.0',
+          content: seedContent('safe-edit-discipline'),
+        },
+      ],
+    });
+    writeIndex(roots.user, '- [Mine](safe-edit-discipline.md) — operator hook\n');
+    writeBody(roots.user, 'safe-edit-discipline', { type: 'feedback' });
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    // Dedupe keeps the user-top entry (precedence wins). The
+    // emitted line carries NO `[seed]` marker because the
+    // surviving listing is the operator-authored one.
+    expect(result.text).toContain('[user] safe-edit-discipline — operator hook');
+    expect(result.text).not.toContain('[seed]');
+    expect(result.entryCount).toBe(1);
+  });
+
+  test('seed alongside an unrelated user memory: both appear, only seed carries the marker', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const { installVendorSeeds } = await import('../../src/memory/seeds-installer.ts');
+    installVendorSeeds({
+      roots,
+      source: [
+        {
+          filename: 'no-fabrication.md',
+          name: 'no-fabrication',
+          description: 'verify before claim',
+          version: '1.0',
+          content: seedContent('no-fabrication'),
+        },
+      ],
+    });
+    writeIndex(roots.user, '- [Role](role.md) — full-stack TS\n');
+    writeBody(roots.user, 'role', { type: 'user' });
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    expect(result.text).toContain('[user] role — full-stack TS');
+    expect(result.text).toMatch(/^- \[user\] no-fabrication \[seed\] — verify before claim$/m);
+    expect(result.entryCount).toBe(2);
+  });
+});

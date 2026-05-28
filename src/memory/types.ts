@@ -37,6 +37,17 @@ export type MemoryTrust = 'trusted' | 'untrusted';
 // `MemoryType`, not a scope — it can live in any of the three.
 export type MemoryScope = 'user' | 'project_shared' | 'project_local';
 
+// Sub-location discriminator for memories that live in a
+// subdirectory under their scope root. Today only the vendor seed
+// catalog uses this (`<user>/seeds/` per spec §5.7.4). Slice 7
+// introduced the discriminator so callers — registry, lifecycle,
+// transitions, slash commands — can route disk operations to the
+// right path. Lives in types.ts (not registry.ts) so every
+// subsystem can thread it through without crossing module
+// boundaries; the alternative (importing from registry) would
+// invert the dependency graph.
+export type MemorySubdir = 'seeds';
+
 // Lifecycle states per spec §3.1.1 — declared subset of EVICTION
 // §3's 7-state vocabulary. Memory omits `shadow`: the trust
 // field already encodes "loaded but not vinculante" semantics

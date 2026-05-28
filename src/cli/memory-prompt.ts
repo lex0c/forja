@@ -305,8 +305,17 @@ export const assembleMemorySection = (
     if (seen.has(listing.name)) continue;
     seen.add(listing.name);
     const state = file?.frontmatter.state;
-    const flag = state === 'quarantined' ? ' [memory: quarantined]' : '';
-    lines.push(`- [${listing.scope}] ${listing.name}${flag} — ${listing.entry.hook}`);
+    const stateFlag = state === 'quarantined' ? ' [memory: quarantined]' : '';
+    // Spec §5.7.3: "UI mostrar `[seed]` discreto na lista —
+    // transparência." The model should know which entries come
+    // from the vendor catalog vs operator-authored memories so it
+    // can weight their authority appropriately. The marker is
+    // visible per-listing without changing the scope tag (the
+    // body still lives in user scope per slice-7 design).
+    const seedFlag = listing.subdir === 'seeds' ? ' [seed]' : '';
+    lines.push(
+      `- [${listing.scope}] ${listing.name}${seedFlag}${stateFlag} — ${listing.entry.hook}`,
+    );
     included++;
     eagerLoaded.push(toEagerExposure(listing.scope, listing.name, file));
   }

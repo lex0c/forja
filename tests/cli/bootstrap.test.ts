@@ -708,7 +708,7 @@ When the goal is to orient in a new repo.
     db.close();
   });
 
-  test('memory registry is wired even when no memories exist (empty list)', async () => {
+  test('memory registry is wired and includes vendor seeds even when no operator memories exist', async () => {
     const { config, db } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
@@ -717,23 +717,33 @@ When the goal is to orient in a new repo.
       enterprisePolicyPath: null,
       userPolicyPath: null,
     });
-    // Post-review: the memory header ALWAYS renders when the
-    // registry is wired (even with zero entries), so the model
-    // sees the save-criteria + 4-type semantics + DO-NOT-save list
-    // on fresh sessions — exactly when it's most likely to propose
-    // a bad inferred save. The header lands without any index
-    // lines when the registry has zero memories.
+    // Post-slice-7 reality: the bootstrap auto-installs the vendor
+    // seed catalog (slice 3) AND the registry merges it into the
+    // user-scope listings (slice 7). With no operator-authored
+    // memories, the # Memory section still renders save-criteria
+    // guidance AND the 10 canonical vendor seeds, each carrying
+    // the `[seed]` marker per spec §5.7.3. Project scopes stay
+    // empty — no `[project_local]` / `[project_shared]` lines.
     expect(config.systemPrompt).toBeDefined();
     expect(config.systemPrompt).toContain('# Parallelism');
     expect(config.systemPrompt).toContain('# Memory');
     expect(config.systemPrompt).toContain('memory_write when');
-    // Header-only: no inventory lines render with zero entries.
     expect(config.systemPrompt).not.toContain('- [project_local]');
     expect(config.systemPrompt).not.toContain('- [project_shared]');
-    expect(config.systemPrompt).not.toContain('- [user]');
-    // And the registry is still threaded through for tools.
+    // Vendor seeds visible: spec §5.7.3 marker present, scope tag
+    // `[user]` (seeds live under user scope per §5.7.4). Pin one
+    // specific canonical seed instead of a regex shape so future
+    // seed names with digits (e.g., `v2-edit`) wouldn't break the
+    // test even though slice-7 [seed] rendering handles them fine
+    // (slice-7 review fix #8).
+    expect(config.systemPrompt).toContain('[seed]');
+    expect(config.systemPrompt).toContain('[user] safe-edit-discipline [seed] —');
+    // Registry threads through; list() includes the seed entries
+    // marked subdir='seeds'.
     expect(config.memoryRegistry).toBeDefined();
-    expect(config.memoryRegistry?.list()).toEqual([]);
+    const listings = config.memoryRegistry?.list() ?? [];
+    const seedListings = listings.filter((l) => l.subdir === 'seeds');
+    expect(seedListings.length).toBeGreaterThan(0);
     db.close();
   });
 

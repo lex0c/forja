@@ -4006,3 +4006,75 @@ describe('/memory governance audit — F10 provenance lineage', () => {
     expect(text).toContain('memory_read');
   });
 });
+
+// ── Slice 7 review fix #1: /memory delete dispatches by subdir ───────
+
+describe('/memory delete — seed dispatch (slice-7 review fix #1)', () => {
+  test('deletes the seed body at <user>/seeds/<name>.md, NOT the top-level path', async () => {
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    const { installVendorSeeds } = await import('../../../src/memory/seeds-installer.ts');
+    const seed = {
+      filename: 'safe-edit-discipline.md',
+      name: 'safe-edit-discipline',
+      description: 'ler antes de Edit',
+      version: '1.0',
+      content:
+        '---\nname: safe-edit-discipline\ndescription: ler antes de Edit\ntype: feedback\nsource: seed\nseed_origin: vendor\nseed_version: "1.0"\n---\n\nbody for safe-edit-discipline.\n',
+    };
+    installVendorSeeds({ roots, source: [seed] });
+    registry.reload();
+    // Sanity: the body lives under <user>/seeds/, NOT at top-level.
+    expect(existsSync(join(roots.user, 'seeds', 'safe-edit-discipline.md'))).toBe(true);
+    expect(existsSync(join(roots.user, 'safe-edit-discipline.md'))).toBe(false);
+
+    stubMemoryAction(ctx, 'yes');
+    const r = await memoryCommand.exec(['delete', 'safe-edit-discipline'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+
+    // The seed body is gone.
+    expect(existsSync(join(roots.user, 'seeds', 'safe-edit-discipline.md'))).toBe(false);
+    // The top-level user-scope path was NEVER touched (it never existed).
+    expect(existsSync(join(roots.user, 'safe-edit-discipline.md'))).toBe(false);
+    // Index entry removed from seeds/MEMORY.md.
+    const seedsIndex = readFileSync(join(roots.user, 'seeds', 'MEMORY.md'), 'utf-8');
+    expect(seedsIndex).not.toContain('safe-edit-discipline.md');
+  });
+
+  test('seed delete takes the legacy route even when state is active (state-machine forced off for seeds)', async () => {
+    // The state-machine route's tombstones would land at
+    // <user>/.tombstones/, breaking slice-2's
+    // <user>/seeds/.tombstones/ contract. Seeds force the legacy
+    // route so removeMemory's subdir-aware path resolver handles
+    // the delete.
+    const repo = makeTmp();
+    const { ctx, db, registry, roots } = makeCtx(repo);
+    const { installVendorSeeds } = await import('../../../src/memory/seeds-installer.ts');
+    installVendorSeeds({
+      roots,
+      source: [
+        {
+          filename: 'no-fabrication.md',
+          name: 'no-fabrication',
+          description: 'verify before claim',
+          version: '1.0',
+          content:
+            '---\nname: no-fabrication\ndescription: verify before claim\ntype: feedback\nsource: seed\nseed_origin: vendor\nseed_version: "1.0"\n---\n\nbody.\n',
+        },
+      ],
+    });
+    registry.reload();
+    stubMemoryAction(ctx, 'yes');
+    await memoryCommand.exec(['delete', 'no-fabrication'], ctx);
+
+    // No tombstone landed at <user>/.tombstones/.
+    expect(existsSync(join(roots.user, '.tombstones'))).toBe(false);
+    // memory_events records 'deleted' (legacy route) — NOT
+    // 'quarantined'/'evicted' (state-machine route).
+    const { listMemoryEventsByName } = await import('../../../src/storage/repos/memory-events.ts');
+    const events = listMemoryEventsByName(db, 'no-fabrication');
+    expect(events.find((e) => e.action === 'deleted')).toBeDefined();
+    expect(events.find((e) => e.action === 'quarantined')).toBeUndefined();
+    expect(events.find((e) => e.action === 'evicted')).toBeUndefined();
+  });
+});

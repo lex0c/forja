@@ -18,8 +18,10 @@ import {
   type MemoryFileResult,
   type ScopeIndexResult,
   loadScopeIndex,
+  loadSeedsIndex,
   memoryNameFromPath,
   readMemoryByName,
+  readSeedByName,
 } from './loader.ts';
 import type { ScopeRoots } from './paths.ts';
 import type {
@@ -29,6 +31,7 @@ import type {
   MemoryScope,
   MemorySource,
   MemoryState,
+  MemorySubdir,
 } from './types.ts';
 import { type WriteMemoryResult, writeMemory } from './writer.ts';
 
@@ -55,6 +58,12 @@ import { type WriteMemoryResult, writeMemory } from './writer.ts';
 export interface MemoryListing {
   scope: MemoryScope;
   name: string;
+  // Subdirectory under the scope root, when the body lives in one.
+  // Only the user scope has a subdir today (`'seeds'`); the others
+  // are flat. Consumers that resolve a listing back to a file path
+  // MUST dispatch on this field — e.g., `read(name)` routes via
+  // `readSeedByName` when set, `readMemoryByName` otherwise.
+  subdir?: MemorySubdir;
   // Index entry as parsed. The lookup may use this to display title
   // and hook without loading the body. `entry.href` is NOT trusted
   // for path resolution — see SECURITY CONTRACT in `index-file.ts`.
@@ -394,10 +403,16 @@ export interface RegistryOverrideSignalInput extends AuditOverride {
   excludeScopes?: ReadonlyArray<MemoryScope>;
 }
 
+// `subdir` propagates from the underlying listing so callers that
+// drive mutations (`/memory delete`, future `/memory restore` for
+// seeds, etc.) can route disk operations to the right path. Slice-7
+// review fix #1 — without this, the delete path lost subdir between
+// peek and removeMemory and silently deleted the wrong file (or
+// no file).
 export type RegistryReadResult =
-  | { kind: 'present'; scope: MemoryScope; file: MemoryFile }
-  | { kind: 'missing'; scope: MemoryScope }
-  | { kind: 'malformed'; scope: MemoryScope; error: string }
+  | { kind: 'present'; scope: MemoryScope; subdir?: MemorySubdir; file: MemoryFile }
+  | { kind: 'missing'; scope: MemoryScope; subdir?: MemorySubdir }
+  | { kind: 'malformed'; scope: MemoryScope; subdir?: MemorySubdir; error: string }
   | { kind: 'unknown' };
 
 export interface MemorySearchHit {
@@ -428,11 +443,28 @@ export interface CreateMemoryRegistryInput {
 }
 
 // Precedence is: local first (most specific), then shared, then user.
-// Used both for the `list()` order and for `lookup` fallback.
+// The vendor seed catalog (spec §5.7.4) is a sub-location under
+// user scope, NOT a 4th scope — it shares scope='user' but lives
+// at <user>/seeds/<name>.md. Refresh() builds a fourth snapshot
+// for it AFTER the three SCOPE_ORDER entries, so precedence-wise:
+//
+//   project_local > project_shared > user > user/seeds
+//
+// An operator-authored memory at <user>/safe-edit.md eclipses a
+// vendor seed of the same name. Vendor-curated meta-behavior is
+// the fallback layer; operator customization always wins (matches
+// the slice-4 upgrade lifecycle's "preserve what the user touched"
+// rule, applied here at the lookup boundary rather than at write
+// time).
 const SCOPE_ORDER: readonly MemoryScope[] = ['project_local', 'project_shared', 'user'];
 
 interface ScopeSnapshot {
   scope: MemoryScope;
+  // When set, the snapshot's bodies live in `<scope-root>/<subdir>/`
+  // instead of `<scope-root>/`. Only `'seeds'` today, only paired
+  // with scope='user'. Distinguishes the user-seeds snapshot from
+  // the user-top snapshot at lookup time.
+  subdir?: MemorySubdir;
   // 'absent' / 'malformed' produce empty entries and a separate
   // diagnostic field the audit layer can read.
   entries: IndexEntry[];
@@ -478,11 +510,38 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
   let snapshots: ScopeSnapshot[] = [];
 
   const refresh = (): void => {
-    snapshots = SCOPE_ORDER.map((scope) => {
+    const scopeSnapshots: ScopeSnapshot[] = SCOPE_ORDER.map((scope) => {
       const result = loadScopeIndex(roots, scope);
       const entries = result.kind === 'present' ? result.index.entries : [];
       return { scope, entries, diagnostic: result };
     });
+    // Slice 7: append the user-seeds snapshot AFTER the user-top
+    // entry so a name collision resolves to the operator-authored
+    // copy first. `scope: 'user'` matches the eventual audit
+    // attribution (seed reads land in `memory_events` against
+    // user scope, with `source: 'seed'` carrying the catalog
+    // origin signal). The discriminator is `subdir: 'seeds'`.
+    const seedResult = loadSeedsIndex(roots);
+    if (seedResult.kind === 'malformed') {
+      // Operator hand-edited <user>/seeds/MEMORY.md and broke its
+      // shape; slice-4's installer rewrites it on every boot so the
+      // window is small, but until that next rewrite the model loses
+      // every seed for this session. Surface a stderr line so the
+      // operator sees the cause instead of "seeds vanished from
+      // /memory list silently" (slice-7 review fix #4). Mirrors the
+      // slice-4 manifest warn shape.
+      process.stderr.write(
+        `forja: seed index at <user>/seeds/MEMORY.md malformed (${seedResult.error}); seeds dropped this boot\n`,
+      );
+    }
+    const seedEntries = seedResult.kind === 'present' ? seedResult.index.entries : [];
+    scopeSnapshots.push({
+      scope: 'user',
+      subdir: 'seeds',
+      entries: seedEntries,
+      diagnostic: seedResult,
+    });
+    snapshots = scopeSnapshots;
   };
   refresh();
 
@@ -504,7 +563,13 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
     for (const snap of snapshots) {
       for (const entry of snap.entries) {
         try {
-          out.push({ scope: snap.scope, name: memoryNameFromPath(entry.href), entry });
+          const listing: MemoryListing = {
+            scope: snap.scope,
+            name: memoryNameFromPath(entry.href),
+            entry,
+          };
+          if (snap.subdir !== undefined) listing.subdir = snap.subdir;
+          out.push(listing);
         } catch {
           // Malformed href; skip silently. See above.
         }
@@ -514,6 +579,13 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
   };
 
   const findListing = (name: string, scope?: MemoryScope): MemoryListing | null => {
+    // Iterate every snapshot whose scope matches the filter (or all,
+    // when scope is undefined). The user scope now contains TWO
+    // snapshots (top-level + seeds subdir), so pinning the scope
+    // must NOT terminate after the first one — fall through to
+    // user-seeds when the top-level user snapshot doesn't carry
+    // the name. Precedence is preserved because snapshots are in
+    // precedence order (user-top precedes user-seeds).
     for (const snap of snapshots) {
       if (scope !== undefined && snap.scope !== scope) continue;
       for (const entry of snap.entries) {
@@ -523,7 +595,9 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
         // operator-edited indexes.
         try {
           if (memoryNameFromPath(entry.href) === name) {
-            return { scope: snap.scope, name, entry };
+            const hit: MemoryListing = { scope: snap.scope, name, entry };
+            if (snap.subdir !== undefined) hit.subdir = snap.subdir;
+            return hit;
           }
         } catch {
           // Malformed href (no .md suffix) — skip silently. The
@@ -532,11 +606,19 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
           // `parsedIndex.malformedLines`.
         }
       }
-      // No match in this scope. If the caller pinned a scope, stop
-      // here — strict lookup, no fallback.
-      if (scope !== undefined) return null;
     }
     return null;
+  };
+
+  // Read a listing's body from disk, dispatching on `subdir`. Slice
+  // 7 collapsed the six readMemoryByName call sites here into one
+  // helper so adding a new subdir (or a slice-6 team-seeds variant)
+  // touches one place instead of six.
+  const readForListing = (listing: MemoryListing): MemoryFileResult => {
+    if (listing.subdir === 'seeds') {
+      return readSeedByName(roots, listing.name);
+    }
+    return readMemoryByName(roots, listing.scope, listing.name);
   };
 
   const auditRead = (
@@ -699,7 +781,7 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
         // edits. Cross-call consistency is the next list()
         // call's responsibility.
         const enriched: (MemoryListing | null)[] = filtered.map((l) => {
-          const fileResult = readMemoryByName(roots, l.scope, l.name);
+          const fileResult = readForListing(l);
           if (fileResult.kind !== 'present') return null;
           const fm = fileResult.file.frontmatter;
           const state: MemoryState = fm.state ?? 'active';
@@ -734,7 +816,7 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
     read(name, opts: ReadOptions = {}): RegistryReadResult {
       const listing = findListing(name, opts.scope);
       if (listing === null) return { kind: 'unknown' };
-      const fileResult = readMemoryByName(roots, listing.scope, name);
+      const fileResult = readForListing(listing);
       if (fileResult.kind === 'present') {
         const auditOverride: AuditOverride = {
           ...(opts.auditSessionId !== undefined ? { auditSessionId: opts.auditSessionId } : {}),
@@ -743,12 +825,26 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
         };
         auditRead(listing, fileResult, auditOverride);
         auditExposure(listing, fileResult, auditOverride);
-        return { kind: 'present', scope: listing.scope, file: fileResult.file };
+        const out: RegistryReadResult = {
+          kind: 'present',
+          scope: listing.scope,
+          file: fileResult.file,
+        };
+        if (listing.subdir !== undefined) out.subdir = listing.subdir;
+        return out;
       }
       if (fileResult.kind === 'missing') {
-        return { kind: 'missing', scope: listing.scope };
+        const out: RegistryReadResult = { kind: 'missing', scope: listing.scope };
+        if (listing.subdir !== undefined) out.subdir = listing.subdir;
+        return out;
       }
-      return { kind: 'malformed', scope: listing.scope, error: fileResult.error };
+      const out: RegistryReadResult = {
+        kind: 'malformed',
+        scope: listing.scope,
+        error: fileResult.error,
+      };
+      if (listing.subdir !== undefined) out.subdir = listing.subdir;
+      return out;
     },
 
     peek(name, opts: ScopeOption = {}): RegistryReadResult {
@@ -758,14 +854,28 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
       // so callers can branch identically.
       const listing = findListing(name, opts.scope);
       if (listing === null) return { kind: 'unknown' };
-      const fileResult = readMemoryByName(roots, listing.scope, name);
+      const fileResult = readForListing(listing);
       if (fileResult.kind === 'present') {
-        return { kind: 'present', scope: listing.scope, file: fileResult.file };
+        const out: RegistryReadResult = {
+          kind: 'present',
+          scope: listing.scope,
+          file: fileResult.file,
+        };
+        if (listing.subdir !== undefined) out.subdir = listing.subdir;
+        return out;
       }
       if (fileResult.kind === 'missing') {
-        return { kind: 'missing', scope: listing.scope };
+        const out: RegistryReadResult = { kind: 'missing', scope: listing.scope };
+        if (listing.subdir !== undefined) out.subdir = listing.subdir;
+        return out;
       }
-      return { kind: 'malformed', scope: listing.scope, error: fileResult.error };
+      const out: RegistryReadResult = {
+        kind: 'malformed',
+        scope: listing.scope,
+        error: fileResult.error,
+      };
+      if (listing.subdir !== undefined) out.subdir = listing.subdir;
+      return out;
     },
 
     search(query, opts: SearchOptions = {}): MemorySearchHit[] {
@@ -836,7 +946,7 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
         // an explicit flag so the default `memory_search` tool call
         // stays cheap.
         if (opts.deep === true) {
-          const fileResult = readMemoryByName(roots, listing.scope, listing.name);
+          const fileResult = readForListing(listing);
           if (fileResult.kind !== 'present') continue;
           const snippet = matchSnippet(splitBodyLines(fileResult.file.body), q);
           if (snippet === null) continue;
@@ -1057,7 +1167,7 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
         seen.add(key);
         const listing = findListing(e.memoryName, e.memoryScope);
         if (listing === null) continue;
-        const fileResult = readMemoryByName(roots, listing.scope, e.memoryName);
+        const fileResult = readForListing(listing);
         if (fileResult.kind !== 'present') continue;
         const fm = fileResult.file.frontmatter;
         if (fm.type !== 'project' && fm.type !== 'reference') continue;
