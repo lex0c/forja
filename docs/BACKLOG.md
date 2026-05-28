@@ -2,6 +2,26 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-28] seed memory — `loadSeedManifest` filters invalid-name keys so `agent init` self-heals
+
+Bug fix on top of slice 5b's installer surface. A hand-edited or corrupt `<user>/seeds/.installed.json` key that fails `validateName` (e.g., `"../old"`, or any name outside the kebab-case domain) crashed `agent init --only=seeds`: the orphan-archive loop called `archiveSeed → seedMemoryFilePath → validateName`, which threw, aborting the install BEFORE the manifest could be rewritten. The loader's contract was "malformed rows are recoverable" but invalid-name keys violated that contract silently.
+
+**Branch:** continued on `feat/memory-seeds`.
+
+**Fix at the loader boundary** (primary). `loadSeedManifest` now runs `validateName(key)` FIRST in the per-entry validation chain — before the structural shape check, before the version/hash type check. Invalid-name keys emit the same stderr warn pattern as the other corruptions (`forja: seed manifest at <path>: dropping entry "<key>" (invalid seed name: <reason>)`) and are dropped from the in-memory load. The installer's end-of-pass `writeSeedManifest` rewrites the file without them — self-heal is complete in one pass.
+
+**Defense-in-depth at the orphan loop** (secondary). The archive loop wraps `archiveSeed` in a try/catch with a stderr warn pointing at the same self-heal outcome. The primary fix makes this branch unreachable today, but it stays in place against a future refactor that loosens the loader's validation or a different caller bypasses the loader entirely — the invariant "manifest writes always happen at the end of the pass" survives either way.
+
+**Shipped on this branch:**
+
+- **`src/memory/seeds-manifest.ts`** — new `validateName` import; per-entry try/catch around `validateName(key)` at the top of the load loop with the stderr warn naming the rejected key + the reason.
+
+- **`src/memory/seeds-installer.ts`** — try/catch around the `archiveSeed` call in the orphan loop with a stderr line naming the seed and pointing at the self-healing rewrite below.
+
+- **`tests/memory/seeds-installer.test.ts`** — new test under "manifest persistence" pinning the self-heal: a manifest with a `"../old"` key alongside a valid `alpha-rule` entry → install does NOT throw, the invalid key is gone from the rewritten manifest, the valid sibling survives, and no spurious archive landed on disk.
+
+**Tests + validation:** `bun run typecheck` clean, `bun run lint` clean. `bun test tests/memory/seeds-installer.test.ts` → 28 pass; adjacent (`tests/memory/seeds-disabled.test.ts tests/cli/slash/memory.test.ts tests/cli/init-seeds.test.ts`) → 252 pass, no regression.
+
 ## [2026-05-28] seed memory — `/memory seeds list` distinguishes `absent` from `active`
 
 Bug fix on top of slice 5b. The `list` subcommand classified every non-disabled canonical seed as `active` based only on the `.disabled.json` sentinel — but a seed can be ABSENT from the loaded set without ever being in the sentinel. Three cases land in `absent`:

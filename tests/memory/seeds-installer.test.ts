@@ -399,6 +399,41 @@ describe('installVendorSeeds — manifest persistence', () => {
     const manifest = loadSeedManifest(roots);
     expect(manifest[seed.name]).toBeDefined();
   });
+
+  test('manifest with an invalid-name key (e.g., `../old`) self-heals — install does not throw', () => {
+    // Reported bug: a hand-edited or corrupt manifest key that
+    // fails `validateName` would crash `agent init --only=seeds`
+    // because the orphan-archive loop called `seedMemoryFilePath`
+    // on it BEFORE the manifest could be rewritten — leaving no
+    // recovery path. Fix: `loadSeedManifest` filters invalid-name
+    // keys at load time (with stderr warn), so the orphan loop
+    // never sees them and the rewrite drops them from disk.
+    const roots = makeRoots();
+    const seed = makeSeed({ name: 'alpha-rule' });
+    // Land a valid manifest first so seedsRoot exists.
+    installVendorSeeds({ roots, source: [seed] });
+    // Now corrupt the manifest by adding an entry with a path-
+    // traversal key that validateName rejects. Mix in one VALID
+    // entry too so we can prove the loader doesn't drop valid
+    // siblings alongside the invalid row.
+    writeFileSync(
+      seedManifestPath(roots),
+      JSON.stringify({
+        '../old': { version: '1.0', hash: 'deadbeef' },
+        'alpha-rule': { version: '1.0', hash: hashSeedContent(seed.content) },
+      }),
+    );
+    // Install must complete without throwing.
+    expect(() => installVendorSeeds({ roots, source: [seed] })).not.toThrow();
+    // The invalid key is gone from the rewritten manifest; the
+    // valid sibling survives the self-heal.
+    const manifest = loadSeedManifest(roots);
+    expect(Object.hasOwn(manifest, '../old')).toBe(false);
+    expect(manifest['alpha-rule']).toBeDefined();
+    // No spurious archive file landed (validateName rejected the
+    // name before the archive loop could touch the filesystem).
+    expect(existsSync(seedArchivedDir(roots))).toBe(false);
+  });
 });
 
 // Per-seed opt-out sentinel (spec §5.7.6). The installer honors

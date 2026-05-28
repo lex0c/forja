@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { atomicWrite } from './atomic.ts';
+import { validateName } from './frontmatter.ts';
 import { seedManifestPath } from './paths.ts';
 import type { ScopeRoots } from './paths.ts';
 
@@ -80,6 +81,26 @@ export const loadSeedManifest = (roots: ScopeRoots): SeedManifest => {
 
   const out: SeedManifest = {};
   for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+    // Name validation runs FIRST so an invalid key (e.g., a hand-
+    // edited `"../old"` path-traversal attempt, or a key that
+    // contains characters the seed-name domain rejects) is dropped
+    // before any downstream consumer (orphan-archive loop, sentinel
+    // diff) calls `seedMemoryFilePath(key)` — which would throw on
+    // `validateName` and abort the entire install. Without this
+    // check, a corrupt manifest blocks `agent init --only=seeds`
+    // even though the loader's contract is "malformed rows are
+    // recoverable". Self-heal works because the installer rewrites
+    // the manifest at the end of the pass; the invalid key is
+    // dropped from the in-memory load AND from the rewritten file.
+    try {
+      validateName(key);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `forja: seed manifest at ${path}: dropping entry ${JSON.stringify(key)} (invalid seed name: ${msg})\n`,
+      );
+      continue;
+    }
     if (value === null || typeof value !== 'object' || Array.isArray(value)) {
       // Per-entry corruption: warn the operator naming the key
       // (slice-4 review fix #6). Without this, a hand-edited

@@ -287,8 +287,25 @@ export const installVendorSeeds = (opts: InstallVendorSeedsOptions): SeedsInstal
   // it for /memory list).
   for (const [name, _entry] of Object.entries(oldManifest)) {
     if (canonicalNames.has(name)) continue;
-    const archivedAs = archiveSeed(opts.roots, name, nowFn());
-    if (archivedAs !== null) archived.push(archivedAs);
+    // Defense-in-depth: `loadSeedManifest` already drops invalid-
+    // name keys with an stderr warn, so by construction every name
+    // reaching this point passes `validateName`. The try/catch
+    // exists for the case where a future refactor loosens the
+    // loader's validation (or a different caller bypasses it) —
+    // without it, an unexpected invalid name would throw in
+    // `seedMemoryFilePath` and abort the install before the
+    // self-healing `writeSeedManifest` below could run. Skipping
+    // here preserves the "manifest writes always happen at the end
+    // of the pass" invariant.
+    try {
+      const archivedAs = archiveSeed(opts.roots, name, nowFn());
+      if (archivedAs !== null) archived.push(archivedAs);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `forja: seed installer: skipping orphan archive for ${JSON.stringify(name)} (${msg}); the manifest rewrite below drops it\n`,
+      );
+    }
     // newManifest deliberately omits this entry — the seed is
     // gone from the canonical pack.
   }
