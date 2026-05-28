@@ -4,11 +4,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   listOrphanFiles,
+  listSeedOrphanFiles,
   loadScopeIndex,
+  loadSeedsIndex,
   memoryNameFromPath,
   readMemoryByName,
+  readSeedByName,
 } from '../../src/memory/loader.ts';
 import type { ScopeRoots } from '../../src/memory/paths.ts';
+import { seedsRoot } from '../../src/memory/paths.ts';
 
 const tmpDirs: string[] = [];
 
@@ -255,6 +259,39 @@ describe('listOrphanFiles', () => {
     writeFileSync(join(roots.user, 'subdir', 'nested.md'), '');
     expect(listOrphanFiles(roots, 'user')).toEqual([]);
   });
+
+  test('excludes a directory whose name ends in .md (operator typo / attacker plant)', () => {
+    // A directory entry like `weird.md/` would pass a name-shape
+    // filter that doesn't check the dirent type — the orphan list
+    // would then carry a phantom path that isn't a file. Downstream
+    // gc/audit callers acting on the list (rm, move, format) would
+    // see a non-regular inode where they expected a body file.
+    // The withFileTypes filter rejects this at the source.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    mkdirSync(roots.user, { recursive: true });
+    mkdirSync(join(roots.user, 'weird.md'));
+    expect(listOrphanFiles(roots, 'user')).toEqual([]);
+  });
+
+  test('excludes a symlinked .md entry from the orphan list (S5 parity)', () => {
+    // The loader's S5 gate refuses symlinked bodies at READ time
+    // (readMemoryAt → checkRegularFile). The orphan walker should
+    // match that posture: a symlinked entry is not a "real" file
+    // and shouldn't be advertised as an orphan body that gc could
+    // safely act on.
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return;
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    mkdirSync(roots.user, { recursive: true });
+    const targetPath = join(repo, 'target.md');
+    writeFileSync(
+      targetPath,
+      '---\nname: t\ndescription: t\ntype: user\nsource: user_explicit\n---\n',
+    );
+    symlinkSync(targetPath, join(roots.user, 'linked.md'));
+    expect(listOrphanFiles(roots, 'user')).toEqual([]);
+  });
 });
 
 describe('memoryNameFromPath', () => {
@@ -265,5 +302,169 @@ describe('memoryNameFromPath', () => {
 
   test('throws when file does not end in .md', () => {
     expect(() => memoryNameFromPath('/x/y/role.txt')).toThrow();
+  });
+});
+
+describe('loadSeedsIndex (spec §5.7.4)', () => {
+  test('returns absent when seeds/ dir does not exist', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    expect(loadSeedsIndex(roots).kind).toBe('absent');
+  });
+
+  test('returns absent when seeds/ exists but MEMORY.md missing', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    mkdirSync(seedsRoot(roots), { recursive: true });
+    expect(loadSeedsIndex(roots).kind).toBe('absent');
+  });
+
+  test('returns parsed entries when seeds/MEMORY.md exists', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(seedsRoot(roots), '- [Safe edit](safe-edit-discipline.md) — ler antes de Edit\n');
+    const result = loadSeedsIndex(roots);
+    if (result.kind !== 'present') {
+      throw new Error(`expected present, got ${result.kind}`);
+    }
+    expect(result.index.entries).toEqual([
+      { title: 'Safe edit', href: 'safe-edit-discipline.md', hook: 'ler antes de Edit' },
+    ]);
+  });
+
+  test('refuses symlinked seeds/MEMORY.md (mirrors loadScopeIndex S5 gate)', () => {
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return;
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    mkdirSync(seedsRoot(roots), { recursive: true });
+    const targetPath = join(repo, 'attacker-seed-index.md');
+    writeFileSync(targetPath, '- [Evil](evil.md) — fortress\n');
+    symlinkSync(targetPath, join(seedsRoot(roots), 'MEMORY.md'));
+    const result = loadSeedsIndex(roots);
+    expect(result.kind).toBe('malformed');
+    if (result.kind === 'malformed') {
+      expect(result.error).toContain('symlink');
+    }
+  });
+});
+
+describe('readSeedByName (spec §5.7.4)', () => {
+  const seedFrontmatter =
+    'name: safe-edit-discipline\n' +
+    'description: ler antes de Edit; Edit em existente\n' +
+    'type: feedback\n' +
+    'source: seed\n' +
+    'seed_origin: vendor\n' +
+    'seed_version: "1.0"\n';
+
+  test('returns missing when seed file does not exist', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    expect(readSeedByName(roots, 'safe-edit-discipline').kind).toBe('missing');
+  });
+
+  test('returns parsed seed when present', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeMemory(seedsRoot(roots), 'safe-edit-discipline', seedFrontmatter, 'Body line.\n');
+    const result = readSeedByName(roots, 'safe-edit-discipline');
+    if (result.kind !== 'present') {
+      throw new Error(`expected present, got ${result.kind}`);
+    }
+    expect(result.file.frontmatter.source).toBe('seed');
+    expect(result.file.frontmatter.seed_origin).toBe('vendor');
+    expect(result.file.frontmatter.seed_version).toBe('1.0');
+  });
+
+  test('returns malformed on bad frontmatter', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeMemory(
+      seedsRoot(roots),
+      'bad',
+      // source=seed without seed_origin/seed_version → cross-field error
+      'name: bad\ndescription: x\ntype: feedback\nsource: seed\n',
+      'body',
+    );
+    const result = readSeedByName(roots, 'bad');
+    expect(result.kind).toBe('malformed');
+    if (result.kind === 'malformed') {
+      expect(result.error).toMatch(/seed_origin|seed_version/);
+    }
+  });
+
+  test('throws on path traversal name (sandbox)', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    expect(() => readSeedByName(roots, '../escape')).toThrow();
+    expect(() => readSeedByName(roots, 'has/slash')).toThrow();
+  });
+
+  test('refuses symlinked seed body (S5 gate parity)', () => {
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return;
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    mkdirSync(seedsRoot(roots), { recursive: true });
+    const targetPath = join(repo, 'attacker-seed-body.md');
+    writeFileSync(targetPath, `---\n${seedFrontmatter}---\n\nATTACKER_SEED_PAYLOAD\n`);
+    symlinkSync(targetPath, join(seedsRoot(roots), 'evil.md'));
+    const result = readSeedByName(roots, 'evil');
+    expect(result.kind).toBe('malformed');
+    if (result.kind === 'malformed') {
+      expect(result.error).toContain('symlink');
+      expect(JSON.stringify(result)).not.toContain('ATTACKER_SEED_PAYLOAD');
+    }
+  });
+});
+
+describe('listSeedOrphanFiles (spec §5.7.4)', () => {
+  const seedFrontmatter = (name: string): string =>
+    `name: ${name}\ndescription: x\ntype: feedback\nsource: seed\nseed_origin: vendor\nseed_version: "1.0"\n`;
+
+  test('returns empty when seeds dir absent', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    expect(listSeedOrphanFiles(roots)).toEqual([]);
+  });
+
+  test('returns empty when all seeds are indexed', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(seedsRoot(roots), '- [A](a.md) — a\n');
+    writeMemory(seedsRoot(roots), 'a', seedFrontmatter('a'), '');
+    expect(listSeedOrphanFiles(roots)).toEqual([]);
+  });
+
+  test('reports orphan seeds not in seeds/MEMORY.md', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(seedsRoot(roots), '- [A](a.md) — a\n');
+    writeMemory(seedsRoot(roots), 'a', seedFrontmatter('a'), '');
+    writeMemory(seedsRoot(roots), 'orphan', seedFrontmatter('orphan'), '');
+    expect(listSeedOrphanFiles(roots)).toEqual([join(seedsRoot(roots), 'orphan.md')]);
+  });
+
+  test('does not see seeds when only the top-level user scope has files', () => {
+    // Regression guard: listSeedOrphanFiles must read the seeds/
+    // subdir, not the user-scope root. If it accidentally read the
+    // parent, hand-authored user memories would show up as "seed
+    // orphans" — completely wrong attribution.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeMemory(
+      roots.user,
+      'role',
+      'name: role\ndescription: y\ntype: user\nsource: user_explicit\n',
+      '',
+    );
+    expect(listSeedOrphanFiles(roots)).toEqual([]);
+  });
+
+  test('excludes a directory named <name>.md inside seeds/ (parity with listOrphanFiles)', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    mkdirSync(seedsRoot(roots), { recursive: true });
+    mkdirSync(join(seedsRoot(roots), 'weird.md'));
+    expect(listSeedOrphanFiles(roots)).toEqual([]);
   });
 });

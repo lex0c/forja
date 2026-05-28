@@ -22,7 +22,7 @@
 // they'll fold into the weighted token stream alongside title +
 // description.
 
-import type { MemoryRegistry, MemoryScope } from '../../memory/index.ts';
+import { type MemoryRegistry, type MemoryScope, listingScopeOption } from '../../memory/index.ts';
 import { type BM25Document, createBM25Index, tokenize } from '../bm25.ts';
 import type { ViewSearch } from '../pipeline.ts';
 import type { Candidate, RetrievalQuery, RetrievalView } from '../types.ts';
@@ -207,7 +207,7 @@ export const createMemoryView = (deps: MemoryViewDeps): ViewSearch => ({
         // `unknown` fall through as title+description only (the
         // candidate is still ranked on its name + description
         // signal).
-        const file = deps.registry.peek(l.name, { scope: l.scope });
+        const file = deps.registry.peek(l.name, listingScopeOption(l));
         if (file.kind === 'present') {
           const bodyTokens = tokenize(file.file.body);
           for (let i = 0; i < BODY_WEIGHT; i++) tokens.push(...bodyTokens);

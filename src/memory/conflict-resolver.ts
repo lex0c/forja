@@ -13,9 +13,14 @@
 // TIEBREAK CHAIN (first decisive tier wins; later tiers run only on
 // ties)
 //
-// 1. Provenance tier — `user_explicit > inferred > imported`.
-//    The operator's deliberate authorship outranks model-proposed
-//    memories. `inferred` is a confirmed write but still came from
+// 1. Provenance tier — `user_explicit > seed > inferred > imported`.
+//    The operator's deliberate authorship outranks every other
+//    source. `seed` sits next because vendor-curated meta-behavior
+//    has gone through review before shipping with the binary — it
+//    beats a model-proposed `inferred` write but yields to anything
+//    the operator wrote themselves (spec §5.7.3's "tratamento como
+//    qualquer outra memória" + §5.7.5's "preserva o que o user
+//    mexeu"). `inferred` is a confirmed write but still came from
 //    the model's read of conversation; `imported` is the weakest
 //    (came from a foreign source via promotion / sync).
 //
@@ -81,8 +86,9 @@ export interface ConflictResolution {
 // stay readable at the call site.
 const PROVENANCE_RANK: Record<MemorySource, number> = {
   user_explicit: 0,
-  inferred: 1,
-  imported: 2,
+  seed: 1,
+  inferred: 2,
+  imported: 3,
 };
 
 // project_local outranks user outranks project_shared. Same comment

@@ -717,12 +717,12 @@ When the goal is to orient in a new repo.
       enterprisePolicyPath: null,
       userPolicyPath: null,
     });
-    // Post-review: the memory header ALWAYS renders when the
-    // registry is wired (even with zero entries), so the model
-    // sees the save-criteria + 4-type semantics + DO-NOT-save list
-    // on fresh sessions — exactly when it's most likely to propose
-    // a bad inferred save. The header lands without any index
-    // lines when the registry has zero memories.
+    // Bootstrap does NOT install vendor seeds — that's the
+    // `agent init` job (spec §5.7.4 + §5.7.8). An operator who
+    // never ran init sees the # Memory section's save-criteria
+    // guidance but no inventory lines, including no vendor seeds.
+    // This preserves the principle that nothing arrives in the
+    // user scope without an explicit operator action.
     expect(config.systemPrompt).toBeDefined();
     expect(config.systemPrompt).toContain('# Parallelism');
     expect(config.systemPrompt).toContain('# Memory');
@@ -731,6 +731,7 @@ When the goal is to orient in a new repo.
     expect(config.systemPrompt).not.toContain('- [project_local]');
     expect(config.systemPrompt).not.toContain('- [project_shared]');
     expect(config.systemPrompt).not.toContain('- [user]');
+    expect(config.systemPrompt).not.toContain('[seed]');
     // And the registry is still threaded through for tools.
     expect(config.memoryRegistry).toBeDefined();
     expect(config.memoryRegistry?.list()).toEqual([]);

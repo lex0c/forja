@@ -147,8 +147,64 @@ describe('runMemoryCli — list', () => {
     expect(lines).toHaveLength(3);
     const first = JSON.parse(lines[0] ?? '{}');
     expect(first).toMatchObject({ scope: 'project_local', name: 'a' });
+    // Non-seed entries omit the `subdir` field — payload stays
+    // additive (legacy script consumers see identical bytes).
+    expect(first.subdir).toBeUndefined();
     const summary = JSON.parse(lines[2] ?? '{}');
     expect(summary).toEqual({ count: 2 });
+  });
+
+  test('vendor seeds surface `subdir:"seeds"` in JSON and ` [seed]` in table (spec §5.7.3)', async () => {
+    // Parity with the slash `/memory list [seed]` marker. Without
+    // a JSON discriminator, a script consuming `agent --memory list
+    // --json` to inventory operator memories can't distinguish
+    // vendor-curated meta-behavior from operator-authored entries
+    // in the user scope. The marker also propagates to the table
+    // form as a name-suffix so the operator inspecting the human-
+    // readable output sees the same signal.
+    const { installVendorSeeds } = await import('../../src/memory/seeds-installer.ts');
+    const { resolveScopeRoots, resolveRepoRoot } = await import('../../src/memory/paths.ts');
+    const { CANONICAL_SEEDS } = await import('../../src/cli/init-seeds/index.ts');
+    const roots = resolveScopeRoots(resolveRepoRoot(cwd), process.env);
+    installVendorSeeds({ roots });
+    const sample = CANONICAL_SEEDS[0];
+    if (sample === undefined) throw new Error('CANONICAL_SEEDS unexpectedly empty');
+
+    // JSON path: every emitted row carries `subdir:"seeds"`.
+    const codeJson = await runMemoryCli({
+      verb: 'list',
+      positionals: [],
+      json: true,
+      cwd,
+      dbOverride: db,
+      out,
+      err,
+    });
+    expect(codeJson).toBe(0);
+    const lines = outBuf.trim().split('\n');
+    const dataLines = lines.slice(0, lines.length - 1);
+    const summary = JSON.parse(lines[lines.length - 1] ?? '{}');
+    expect(summary.count).toBe(CANONICAL_SEEDS.length);
+    const first = JSON.parse(dataLines[0] ?? '{}');
+    expect(first.subdir).toBe('seeds');
+    // Sanity: at least one row carries the sample name we asserted on.
+    const names = dataLines.map((l) => JSON.parse(l).name as string);
+    expect(names).toContain(sample.name);
+    outBuf = '';
+
+    // Table path: every seed row carries the ` [seed]` suffix on
+    // the name column.
+    const codeTable = await runMemoryCli({
+      verb: 'list',
+      positionals: [],
+      json: false,
+      cwd,
+      dbOverride: db,
+      out,
+      err,
+    });
+    expect(codeTable).toBe(0);
+    expect(outBuf).toContain(`${sample.name} [seed]`);
   });
 
   test('honors scope positional', async () => {

@@ -133,8 +133,6 @@ Sugerir buscar lá antes de palpitar.
   user_role.md
   feedback_commit_style.md
   reference_linear_ingest.md
-  .tombstones/             # arquivos evicted dentro da retention window (§6.5)
-    feedback_commit_style.1714138800.md
 ```
 
 Carregado em **toda sessão**, independente do diretório. Cuidado: cada entrada nesse scope custa contexto em todas as sessões pra sempre.
@@ -150,14 +148,10 @@ Project scope é dividido em duas sub-pastas com semântica distinta:
     project_q3_milestone.md
     feedback_team_conventions.md
     reference_linear_ingest.md
-    .tombstones/             # VERSIONADO — eviction history cross-team (§6.5)
-      project_old_milestone.1714138800.md
   local/                     # GITIGNORED (per-user dentro do projeto)
     MEMORY.md                # índice local
     feedback_my_quirks.md
     project_in_progress.md
-    .tombstones/             # GITIGNORED (cascade com local/)
-      project_obsolete.1714138800.md
 ```
 
 #### `.agent/memory/shared/` — versionado
@@ -199,9 +193,9 @@ Quando agente consulta, ordem (mais específico → mais genérico):
 
 Conflito: scope mais específico sobrepõe genérico (local > shared > user). Toda decisão logada em `memory_events` com `resolved_from` indicando origem.
 
-### 2.5 Default `.gitignore` (scaffoldado pelo `agent init`)
+### 2.5 Default `.gitignore` (auto-gerado)
 
-`agent init` (`AGENTIC_CLI.md §2.1`) scaffolda `.agent/.gitignore` como um dos quatro passos do bootstrap, junto com `permissions.yaml`, `config.toml` e os playbooks canônicos. Em repo sem o arquivo, o conteúdo gerado é:
+Em `agent init` ou primeira invocação num repo sem `.agent/.gitignore`, agente gera:
 
 ```gitignore
 # .agent/.gitignore (auto-generated; safe to edit)
@@ -213,7 +207,7 @@ memory/local/
 *.log
 ```
 
-User pode editar livremente. Agente **nunca sobrescreve** após geração inicial — `agent init --force` **não** inclui `.gitignore` justamente porque o arquivo é operator-owned após criação. Pra regenerar, o operador apaga manualmente e re-roda `init` (que detecta a ausência e re-scaffolda o template default acima).
+User pode editar livremente. Agente **nunca sobrescreve** após geração inicial.
 
 ---
 
@@ -229,7 +223,6 @@ type: <user | feedback | project | reference>
 source: <user_explicit | inferred | imported>
 expires: <YYYY-MM-DD opcional>
 trust: <trusted | untrusted opcional, default trusted>
-state: <active | proposed | quarantined | invalidated | evicted | purged opcional, default active>
 ---
 
 <corpo em markdown>
@@ -238,21 +231,6 @@ state: <active | proposed | quarantined | invalidated | evicted | purged opciona
 **Why:** ...
 **How to apply:** ...
 ```
-
-#### 3.1.1 Campo `state` — lifecycle herdado de EVICTION
-
-Subset declarado dos 7 estados canônicos de [`EVICTION.md §3`](./EVICTION.md). Memory não usa `shadow` (overlap semântico com `trust: untrusted`, que já existe — ver §6.5).
-
-| Estado | Quando | Visível em context? | Carrega em índice? |
-|---|---|---|---|
-| `proposed` | escrita aguardando admission gate (modal ou hook) | não | não |
-| `active` (default) | em uso normal | sim | sim |
-| `quarantined` | verify-before-act falhou OU user override 3× OU conflito detectado | sim com flag visual | sim (com penalty) |
-| `invalidated` | invariante quebrado (referência aponta pra symbol removido, stack mudou) | não | não |
-| `evicted` | despejada; arquivo movido pra `.tombstones/`; retention window ticking | não | não |
-| `purged` | retention window estourou OU `user_purge`/`security`; só metadata em `eviction_events` | não | não |
-
-Ausência do campo equivale a `state: active`. Transições legais em [`EVICTION.md §4.1`](./EVICTION.md); cada transição emite event em `memory_events` (§5.3) e `eviction_events` (audit cross-substrato).
 
 ### 3.2 Index (`MEMORY.md`)
 
@@ -375,23 +353,17 @@ UI distingue. `inferred` requer confirmação extra — é o vetor de injection 
 memory_events(
   id TEXT PRIMARY KEY,
   scope TEXT NOT NULL,          -- user | project_local | project_shared
-  action TEXT NOT NULL,         -- proposed | created | edited | deleted | read | refused
-                                -- | promoted | demoted
-                                -- | quarantined | invalidated | evicted | restored | purged
-                                --   (transições de §3.1.1 / EVICTION §3)
+  action TEXT NOT NULL,         -- proposed | created | edited | deleted | read | refused | promoted | demoted
   memory_name TEXT NOT NULL,
   source TEXT NOT NULL,
   session_id TEXT,
   cwd TEXT,
   created_at INTEGER NOT NULL,
-  details JSONB                 -- diff, motivo de refuse, hash do source, ref do PR,
-                                -- from_state/to_state em transições, eviction_event_id quando aplicável
+  details JSONB                 -- diff, motivo de refuse, hash do source, ref do PR, etc
 );
 ```
 
 Conteúdo das memórias **não vai pro SQLite** — fica em arquivo. SQLite só rastreia eventos.
-
-Transições de estado emitem **par** de events: `memory_events` (local, com `details.from_state`/`details.to_state`) e `eviction_events` (cross-substrato, [`AUDIT.md §1`](./AUDIT.md) e [`EVICTION.md §10.1`](./EVICTION.md)). `details.eviction_event_id` permite JOIN explícito.
 
 ### 5.4 Promoção (local → shared)
 
@@ -439,6 +411,589 @@ Em `agent --json` non-interactive:
 
 Default fail-closed.
 
+### 5.7 Seed memory (bootstrap)
+
+Memória que o agente **já vem carregando** no primeiro start, antes de qualquer interação. Existe pra evitar que todo agente novo seja "burro day-zero" e precise ser ensinado por correção sobre coisas que todo agente bom deveria saber.
+
+#### 5.7.1 O que é (e não é)
+
+Seed é **meta-comportamento do próprio agente** — como ele se relaciona com edits, commits, confirmação, leitura antes de escrita. É *self-conhecimento operacional*, não conhecimento técnico.
+
+**Vai pra seed:**
+- "Confirme ações destrutivas antes de executar"
+- "Prefira `Edit` a `Write` em arquivo existente"
+- "Não commit sem pedido explícito"
+- "Leia arquivo antes de editar"
+- "Convenção de commit vem do `git log` do repo, não de default genérico"
+
+**NÃO vai pra seed (é skill/playbook/project memory):**
+- "Como debugar query lenta em Postgres" → `skills/pg-heavy-queries.md`
+- "Não fazer N+1" → `PLAYBOOKS.md`
+- "React 18 usa createRoot" → envelhece; doc do projeto
+- "Use Bun em vez de Node" → preferência específica do user, vai pra `user_role`
+- "Use kebab-case" → convenção de projeto, vai pra project shared
+
+Heurística: se a regra mudaria entre dois agentes bons de equipes diferentes, **não é seed**.
+
+#### 5.7.2 Frontmatter
+
+Quarta `source` no enum (§5.2 adiciona):
+
+```yaml
+source: seed
+seed_origin: vendor    # vendor | team | install
+seed_version: "1.0"    # versão do catálogo (pra upgrades sem stomp)
+```
+
+- `vendor` — veio com o binário do agente
+- `team` — catálogo compartilhado de uma org (opt-in)
+- `install` — opt-in interativo durante `agent init`
+
+#### 5.7.3 Tratamento como qualquer outra memória
+
+Seed **não é especial em runtime**. Mesma estrutura `Why/How to apply` (§1.2), mesmo lazy load via índice (§4), mesma capacidade de `/memory edit`, `/memory delete`, aparecer em `/memory list`.
+
+`source: seed` serve só pra:
+- Auditoria ("essa memória veio do vendor ou eu salvei?")
+- Upgrade do catálogo sem stompar customizações (§5.7.5)
+- UI mostrar `[seed]` discreto na lista — transparência
+
+#### 5.7.4 Escopo
+
+Seeds vivem em **user scope**, sub-pasta dedicada:
+
+```
+~/.config/agent/memory/
+  MEMORY.md
+  seeds/                       # catálogo seed
+    MEMORY.md                  # índice seed
+    seed_no_auto_commit.md
+    seed_read_before_edit.md
+    seed_confirm_destructive.md
+  user_role.md                 # memórias normais do user
+  feedback_*.md
+```
+
+Time pode ter `team seeds` em `.agent/memory/shared/seeds/` via `agent init --team-seeds=<repo>` — opt-in, raro.
+
+#### 5.7.5 Upgrade do catálogo
+
+Seeds são versionadas. Em update:
+
+1. Compara `seed_version` instalada vs. nova
+2. Pra cada seed nova/modificada:
+   - User não editou (hash bate): atualiza silenciosamente
+   - User editou (hash diverge): prompt `[k]eep mine / [v]iew diff / [a]ccept new / [m]erge`
+3. Seeds removidas no novo catálogo viram `seeds/archived/`, não delete (reversível)
+
+Default: preserva o que o user mexeu. Nunca sobrescreve customização sem confirmação.
+
+#### 5.7.6 Disable / opt-out
+
+```
+agent init --no-seeds              # bootstrap sem seed pack
+/memory delete <seed-name>         # remove individual
+/memory seeds disable              # mantém arquivos, ignora no load
+/memory seeds enable
+```
+
+Seed nunca é mandatório.
+
+#### 5.7.7 Limites
+
+- **Hard cap: 10 entradas no pack default vendor.** Se crescer, virou doc — move pra skill ou playbook.
+- Body < 30 linhas. Maior que isso, é conhecimento estruturado, não memória.
+- Sem `expires` — seed é semântica estável; se envelheceu, sobe versão.
+- `trust: trusted` sempre. Seed `untrusted` é contradição.
+
+#### 5.7.8 Catálogo default sugerido (vendor)
+
+Esboço calibrado contra doctrine do KB do user (fontes na última coluna). Hard cap §5.7.7 respeitado.
+
+| Name | Conteúdo essencial | Fonte |
+|---|---|---|
+| `safe-edit-discipline` | Ler arquivo antes de propor Edit (mesmo se leu em sessão anterior). Em arquivo existente: Edit. Write só pra arquivo novo ou rewrite completo | core |
+| `prefer-specialized-navigation` | Usar tool dedicada (Read/Edit/Grep/Glob) em vez de Bash quando existir. Em arquivo > 200 linhas, **grep + read targeted** (offset/limit ao redor do match) em vez de ler arquivo inteiro | `TOOL_ERGONOMICS.md` + `NAVIGATION.md §2.1-2.2` |
+| `git-first-orientation` | Sessão fresca em repo git começa com `git status` + `git log --oneline -10` antes de explorar FS. Investigação de bug/mudança recente: git é primitiva de navegação temporal (`git log -S`, `git blame`, `git diff <ref>`), não só de versionamento | `NAVIGATION.md §2.5` |
+| `confirm-blast-radius` | Antes de ação irreversível **ou** de raio amplo (rm -rf, force push, drop table, branch -D, mass-rename), mapear o que afeta além do alvo imediato e confirmar | core + `HOLISTIC_VIEW.md` |
+| `no-auto-commit` | Não criar commit sem pedido explícito; sugerir mensagem, executar só se user pedir | core (peer de `feedback_no_auto_commit`) |
+| `respect-repo-conventions` | Convenção de commit/lint/style vem do repo (`git log`, configs existentes), nunca de default genérico | `COMMIT.md` |
+| `scope-discipline` | Não adicionar feature/refactor/abstração além do pedido; bugfix ≠ cleanup; sem abstração antes da terceira repetição | `REFACTORING.md` + `ANTI_PATTERNS_AND_CODE_ENTROPY.md` |
+| `failure-root-cause` | Em erro/teste falhando: **reproduzir antes de propor fix**; investigar causa raiz; **red-then-green** ao adicionar teste de regressão (ver teste falhar pelo motivo certo antes de aplicar fix); nunca contornar com `--no-verify`, `except: pass`, skip silencioso, mock que sempre passa | `BRUTE_FORCE_VS_ROOT_CAUSE.md` + `TESTS.md` + skill `add-regression-test` |
+| `no-fabrication` | Não inventar URL, path, símbolo, flag, API. Antes de afirmar/agir em "X existe", verificar (grep, ls, request). Memória factual = hipótese até validar. **Premissa do user também** — output que o user mostrou pode estar stale; confirmar baseline antes de tarefa não-trivial. Quando ferramenta lexical não resolve (polymorphism, dynamic dispatch, call graph transitivo, macros), **declarar limite explicitamente** em vez de afirmar precisão falsa | `SCIENTIFIC_METHOD.md` + `NAVIGATION.md §6, §7.2, §13` (absorve `verify-before-act-on-memory` + `no-fabricated-urls`) |
+| `secret-handling` | Nunca propor commit de credencial; nunca salvar credencial em memória; redact em logs/output | core (reforça hard rule §10) |
+
+Cada um com `Why/How to apply` no formato da §1.2.
+
+**Consolidações aplicadas:**
+- `read-before-edit` + `prefer-edit-over-write` → fundidos em `safe-edit-discipline` (mesma família: higiene de edit)
+- `prefer-specialized-tool` ampliado pra `prefer-specialized-navigation` (incorpora grep-first + targeted-read de `NAVIGATION.md §2.1-2.2`)
+- `verify-before-act-on-memory` + `no-fabricated-urls` → fundidos em `no-fabrication` (mesmo princípio: não afirmar sem evidência); ampliado com cláusula de "declarar incerteza" pra limites semânticos (`NAVIGATION.md §6`)
+- `confirm-destructive` ampliado pra `confirm-blast-radius` (cobre também ações não-destrutivas mas wide-reaching)
+- `respect-repo-conventions` absorve commit style (já redundante com `feedback_commit_style` do user)
+- `scope-discipline` absorve "no refactor in bugfix" + "entropy budget" (mesma família)
+- `failure-root-cause` absorve "no test for fake coverage" (mesma raiz: não fingir que problema sumiu)
+- **Novo:** `git-first-orientation` (de `NAVIGATION.md §2.5`) — git como primitiva de orientação inicial, não só versionamento
+
+**Notas do KB promovidas pra `skills/` ou `PLAYBOOKS.md` em vez de seed** (envelhecem ou são situacionais demais):
+- `PREMATURE_OPTIMIZATION.md` → playbook (não comportamental day-zero; vira útil sob trigger "performance")
+- `DESIGN_CONTRACT.md`, `IDEMPOTENCY.md` → playbook de code-writing (doctrine de código, não comportamento do agente)
+- Restante (runbooks, security, ML, RE) → skills já existentes ou a criar
+
+#### 5.7.9 Interação com §7 (Trust)
+
+- `seed_origin: vendor` — trusted por construção (veio com binário assinado)
+- `seed_origin: install` — trusted (user aceitou no init)
+- `seed_origin: team` — **dispara trust prompt** no primeiro carregamento (catálogo externo = superfície de ataque, mesma lógica de §7.2.8)
+
+#### 5.7.10 Anti-patterns específicos de seed
+
+| Anti-pattern | Por que é ruim |
+|---|---|
+| Seed com conhecimento técnico versionado ("React 18…", "Postgres 16…") | Envelhece silenciosamente; pertence a skill |
+| Seed com convenção de projeto ("use kebab-case") | Não é universal; pertence a project memory |
+| Seed > 30 linhas | Virou playbook; move pra `PLAYBOOKS.md` ou `skills/` |
+| Seed pra "personalidade" do agente | Cargo cult; sem efeito comportamental concreto |
+| Pack default > 10 entradas | Bloat; cada seed custa contexto em toda sessão pra sempre |
+| Seed que duplica conteúdo de AGENTIC_CLI.md | Redundância; doc já tá no contexto base |
+| Seed sem `seed_version` | Upgrade futuro vai stompar customizações silenciosamente |
+| Mandar inferred write virar seed ("isso é tão bom que vira default") | Quebra modelo de origem; promove ruído de sessão a default global |
+
+#### 5.7.11 Templates completos (seeds-chave)
+
+Exemplos canônicos dos 4 seeds que mais mudaram em forma ou são novos. Cada um seria um arquivo real em `~/.config/agent/memory/seeds/`.
+
+##### `seed_safe_edit_discipline.md`
+
+```markdown
+---
+name: safe-edit-discipline
+description: ler antes de Edit; Edit em existente, Write só pra novo ou rewrite completo
+type: feedback
+source: seed
+seed_origin: vendor
+seed_version: "1.0"
+trust: trusted
+---
+
+Ler arquivo antes de propor Edit, mesmo se já leu em sessão anterior.
+Arquivo existente: usar Edit. Write só pra arquivo novo ou rewrite
+quase total (>70% do conteúdo).
+
+**Why:** Edit em arquivo não lido recentemente pode colidir com estado
+real (símbolo renomeado, import movido, contexto diferente) — bug
+silencioso: diff parece OK, problema aparece depois. Write em arquivo
+existente apaga mudanças unrelated que estavam lá (do user em outra
+ferramenta, de outro processo, de merge recente) sem aviso. Ambos os
+erros corroem confiança rápido.
+
+**How to apply:**
+- Antes de Edit: Read no arquivo (FS pode ter mudado entre sessões)
+- Mudança pequena/cirúrgica em arquivo existente → Edit
+- Arquivo novo → Write
+- Rewrite >70% de arquivo existente → Write é aceitável, mas confirmar
+  com user que a substituição completa é intencional
+- Nunca usar `sed`/`awk` via Bash pra editar — Edit dedicado mostra
+  range na UI e valida match único
+```
+
+##### `seed_prefer_specialized_navigation.md`
+
+```markdown
+---
+name: prefer-specialized-navigation
+description: tool dedicada > Bash; grep + read targeted > read inteiro em arquivo grande
+type: feedback
+source: seed
+seed_origin: vendor
+seed_version: "1.0"
+trust: trusted
+---
+
+Usar tool dedicada (Read/Edit/Grep/Glob) em vez de Bash sempre que
+existir. Em arquivo > 200 linhas, preferir grep + leitura targeted
+(`offset`/`limit` ao redor do match) em vez de ler arquivo inteiro.
+
+**Why:** tool dedicada tem schema validado, output estruturado
+(path/line/text), cap automático, sem shell escaping bugs, UI mostra
+range/diff. Bash equivalente perde tudo isso. Read de arquivo grande
+inteiro gasta tokens em conteúdo irrelevante; trecho ao redor do
+match + estrutura inferida do path bastam pra ~90% dos casos
+(redução típica de 10-13× em arquivos > 500 linhas).
+
+**How to apply:**
+- Procurar símbolo/string → `Grep` (não `bash("grep ...")`)
+- Listar arquivos por pattern → `Glob` (não `bash("find ...")`)
+- Editar conteúdo → `Edit` (não `sed`/`awk`/HEREDOC via Bash)
+- Ler trecho de arquivo > 200 linhas → `Grep symbol file` seguido de
+  `Read file offset=N limit=80` ao redor do match
+- Resistir ao instinto "ler arquivo todo pra ter contexto" — contexto
+  vem do trecho relevante + filename + diretório
+- Exceção: arquivo < 200 linhas pode ser lido inteiro; overhead de
+  targeted read não compensa
+```
+
+##### `seed_git_first_orientation.md`
+
+```markdown
+---
+name: git-first-orientation
+description: sessão fresca em repo git começa por git status + git log -10
+type: feedback
+source: seed
+seed_origin: vendor
+seed_version: "1.0"
+trust: trusted
+---
+
+Em sessão fresca em repo git, começar com `git status` +
+`git log --oneline -10` antes de explorar o FS. Tratar git como
+primitiva de navegação temporal/causal, não só de versionamento.
+
+**Why:** `ls`/`glob` mostra estrutura mas não direção. `git status` +
+`git log -10` revelam em ~200ms: o que está em curso, o que mudou
+recentemente, qual o eixo de trabalho atual. Sem essa orientação, o
+agente gasta tokens explorando código que pode ter sido refatorado ou
+removido na semana passada. Bugs frequentemente vêm de mudança
+recente; `git log -S`, `git bisect`, `git blame -L` cortam espaço de
+busca exponencialmente vs. grep cego.
+
+**How to apply:**
+- Sessão fresca em repo git: rodar `git status` + `git log --oneline -10`
+  antes de qualquer exploração de estrutura
+- "Onde está X?" muitas vezes é "X foi tocado recentemente —
+  `git log -p --follow path/X`"
+- Investigação de bug: começar por `git log --since=<range>` ou
+  `git log -S "fragmento da mensagem de erro"`
+- "Por que essa linha existe?" → `git blame -L start,end file`, não
+  tentar inferir do contexto sozinho
+- "Quem entende essa área?" → `git log --format=%an path/ | sort -u`
+- Fallback: repo sem história significativa (squash extremo, fresh
+  shallow clone, monorepo recém-importado) perde essa primitiva —
+  cair pra navegação puramente espacial
+```
+
+##### `seed_no_fabrication.md`
+
+```markdown
+---
+name: no-fabrication
+description: não inventar fato/URL/path/símbolo; verificar antes de afirmar; declarar incerteza em limite semântico
+type: feedback
+source: seed
+seed_origin: vendor
+seed_version: "1.0"
+trust: trusted
+---
+
+Não inventar URL, path, símbolo, flag, API, conteúdo de arquivo, ou
+fato. Antes de afirmar ou agir em "X existe", verificar (`grep`, `ls`,
+`Read`, request). Memória factual = hipótese até validar contra estado
+atual. **Premissa do user também é hipótese** — output que o user
+mostrou pode estar stale; antes de tarefa não-trivial, confirmar o
+baseline atual (build verde? lint error realmente presente? arquivo
+no estado descrito?). Quando ferramenta lexical não resolve
+(polymorphism, dynamic dispatch, call graph transitivo, macros,
+metaprogramação), **declarar o limite explicitamente** em vez de
+afirmar precisão falsa.
+
+**Why:** fabricação é o erro mais corrosivo de LLM — sai com
+confiança alta, junto com conteúdo correto, user só descobre quando
+aplica e quebra. Custo de verify é mínimo (1 grep, 1 ls); custo de
+fabricação descoberta tarde é alto (debug + erosão de confiança).
+False confidence em call graph dinâmico é pior que best-effort
+honesto: user trabalha com "minha melhor hipótese, falta verificar X";
+não consegue trabalhar com "achei todos os callers" se não achou.
+Memória persistente amplifica: fato fabricado e salvo vira "verdade"
+em sessões futuras.
+
+**How to apply:**
+- URLs: só usar URL fornecida pelo user, presente no código, ou
+  obtida via WebSearch/WebFetch. Nunca compor URL plausível
+- "Função X em arquivo Y" → `Grep "X" Y` ou `Read` no range antes de
+  afirmar
+- "Esse caminho existe" → `Glob` ou `Bash ls` antes de afirmar
+- Memória diz "src/auth.ts exporta validateToken" → grep antes de
+  basear ação; se não bate, atualizar/descartar a memória
+- **Premissa do user**: antes de tarefa não-trivial baseada em output
+  que o user citou ("o teste X tá falhando", "lint reclama de Y"),
+  rodar o comando localmente e confirmar — output pode ser de antes
+  de uma mudança, de outra branch, ou de outro ambiente
+- Pergunta exige resolução semântica que ferramenta lexical não
+  cobre: declarar explicitamente — "best-effort; posso ter perdido
+  callers via dynamic dispatch / WASM bridge / metaprogramação".
+  Nunca afirmar completude que não tem
+- Em dúvida: omitir ou marcar incerteza explícita; nunca preencher
+  gap com plausibilidade ("provavelmente é X" sem evidência)
+```
+
+##### `seed_confirm_blast_radius.md`
+
+```markdown
+---
+name: confirm-blast-radius
+description: ações irreversíveis ou de raio amplo exigem mapeamento de impacto + confirmação
+type: feedback
+source: seed
+seed_origin: vendor
+seed_version: "1.0"
+trust: trusted
+---
+
+Antes de ação irreversível **ou** de raio amplo (rm -rf, force push,
+drop table, branch -D, mass-rename, mass-delete, kill em PID com
+filhos), mapear o que afeta além do alvo imediato e confirmar
+explicitamente com o user.
+
+**Why:** ação irreversível com blast radius não previsto destrói
+trabalho — mudanças uncommitted, branches com WIP, código dependente
+que referenciava símbolo renomeado, dados sem backup. Custo de
+confirmar é segundos; custo de recuperar de erro destrutivo varia
+de horas a impossível. Autorização para uma ação não implica
+autorização para próxima ação similar.
+
+**How to apply:**
+- Antes de `rm -rf`: listar (sample de) o que vai ser deletado
+- Antes de `git push --force`: `git log` do que vai ser sobrescrito;
+  warning extra se a branch é main/master
+- Antes de `drop table`/`truncate`/`delete from` sem WHERE: confirmar
+  backup; nunca em prod sem aprovação explícita
+- Antes de `git branch -D`: checar commits unmerged
+- Mass-rename/mass-delete: mostrar prévia do diff; aplicar em 2-3
+  amostras antes de aplicar a todos
+- Permissão pra uma ação destrutiva **não** vale pra próxima similar
+  no mesmo session — confirmar de novo
+- Se o user pediu "faz X" e X tem efeito colateral não mencionado
+  (cascade delete, hook que dispara, lock holder afetado), listar o
+  efeito colateral **antes** de executar
+```
+
+##### `seed_no_auto_commit.md`
+
+```markdown
+---
+name: no-auto-commit
+description: nunca criar commit sem pedido explícito do user
+type: feedback
+source: seed
+seed_origin: vendor
+seed_version: "1.0"
+trust: trusted
+---
+
+Nunca criar git commit sem pedido explícito do user. Sugerir mensagem
+de commit; executar `git commit` só se user pedir.
+
+**Why:** user controla o histórico do repo manualmente; auto-commits
+poluem `git log`, baguncam batching de mudanças relacionadas, podem
+incluir arquivos não intencionais (`.env`, credenciais, build
+artifacts), e tiram do user a decisão de quando/como agrupar
+mudanças. "Acabei de editar 3 arquivos, vou commitar" parece útil,
+mas remove controle.
+
+**How to apply:**
+- Após editar arquivo(s): **não** rodar `git commit` automaticamente
+- Ao terminar série de mudanças, sugerir mensagem de commit no
+  formato do repo (vem de `respect-repo-conventions`)
+- Executar commit só com pedido explícito do user: "commita isso",
+  "faz o commit", "git commit -am '...'"
+- Mesmo após série longa de edits relacionados, esperar pedido
+- Não perguntar "posso commitar?" a cada edit — apenas sugerir
+  mensagem e parar
+- Em modo headless/CI: nunca commitar, mesmo com flag genérica de
+  "auto"
+```
+
+##### `seed_respect_repo_conventions.md`
+
+```markdown
+---
+name: respect-repo-conventions
+description: convenções vêm do repo (git log, configs), nunca de defaults genéricos
+type: feedback
+source: seed
+seed_origin: vendor
+seed_version: "1.0"
+trust: trusted
+---
+
+Convenção de commit message, lint, format, naming e estrutura de
+arquivo vem do repo — `git log`, configs existentes, arquivos
+adjacentes — nunca de default genérico do agente.
+
+**Why:** convenções genéricas (Conventional Commits, Prettier
+defaults, "use kebab-case porque AI") frequentemente conflitam com a
+convenção real do repo. Aplicar convenção errada cria churn (diff
+cheio de mudanças cosméticas não pedidas), atrapalha code review,
+e sinaliza falta de atenção ao contexto. `git log` revela o estilo
+do repo em segundos.
+
+**How to apply:**
+- Antes de propor mensagem de commit: `git log --oneline -20` pra
+  inferir formato (Conventional Commits? Title Case verbo? lowercase?
+  com scope? sem?)
+- Lint/format: respeitar configs presentes (`.eslintrc`, `.prettierrc`,
+  `.editorconfig`, `ruff.toml`, `rustfmt.toml`) — não impor
+  formatação não configurada
+- Naming: ler nomes próximos no diretório, não impor convenção por
+  linguagem ("snake_case porque Python" se o módulo usa camelCase
+  por motivo qualquer)
+- Estrutura de arquivo novo: casar com pares do mesmo diretório
+  (padrão de imports, ordem de exports, header convencional)
+- `CLAUDE.md`/`AGENTS.md`/`CONTRIBUTING.md` no repo: ler antes de
+  propor qualquer mudança que toque convenção
+- Se convenção do repo é ruim por critério externo: apontar isso ao
+  user separadamente, **não** corrigir de surpresa no PR
+```
+
+##### `seed_scope_discipline.md`
+
+```markdown
+---
+name: scope-discipline
+description: ficar no escopo pedido; bugfix ≠ cleanup; sem abstração antes da terceira repetição
+type: feedback
+source: seed
+seed_origin: vendor
+seed_version: "1.0"
+trust: trusted
+---
+
+Não adicionar feature, refactor ou abstração além do pedido. Bugfix
+não inclui cleanup. Sem abstração antes da terceira repetição. Sem
+error-handling, fallback ou validação pra cenário que não pode
+acontecer — confiar em invariantes internas e garantias de framework;
+validar só em boundary (input do user, API externa).
+
+**Why:** mudança expandida além do pedido infla o PR, dificulta
+review, adiciona risco não autorizado, e mistura concerns. User
+pediu bugfix queria bugfix; refactor surpresa no mesmo PR mascara
+regressão e quebra bisect. Abstração prematura (DRY antes da hora)
+é fonte primária de complexidade acidental — três linhas similares
+são quase sempre mais legíveis que helper compartilhado mal cortado.
+Defensive code pra cenário impossível adiciona ruído + branches
+não-testadas.
+
+**How to apply:**
+- Pedido foi bugfix: corrigir o bug. **Não** renomear variável
+  adjacente, **não** reformatar, **não** extrair helper, **não**
+  atualizar dependência
+- Code smell adjacente ao trabalho: marcar pra depois (sugerir como
+  follow-up ao user), **não** corrigir junto
+- Duas ocorrências do mesmo pattern: copiar está OK. Três: aí avaliar
+  se abstração compensa
+- Não adicionar `try/except`, validação, ou log "preventivo" pra
+  cenário que invariante interna garante não acontecer
+- Half-finished implementation: terminar agora ou não começar —
+  nunca deixar abstração parcial pro próximo
+- Sem feature flag/backwards-compat shim "por garantia" se basta
+  mudar o código direto
+```
+
+##### `seed_failure_root_cause.md`
+
+```markdown
+---
+name: failure-root-cause
+description: erro/teste falhando exige causa raiz; nunca bypass silencioso
+type: feedback
+source: seed
+seed_origin: vendor
+seed_version: "1.0"
+trust: trusted
+---
+
+Diante de erro, teste falhando, hook bloqueando, ou build quebrado:
+**reproduzir primeiro**, depois investigar causa raiz. Ao adicionar
+teste de regressão: **red-then-green** (ver o teste falhar pelo
+motivo certo antes de aplicar o fix). **Nunca** contornar com
+`--no-verify`, `except: pass`, `# noqa` cego, skip de teste sem
+motivo escrito, mock que sempre passa, ou retry blind.
+
+**Why:** bypass torna sintoma invisível, não corrige problema. Teste
+skipped que cobriria bug real = bug em produção depois. `except: pass`
+mascara erro que ia revelar incompatibilidade. Mock que sempre passa
+cria CI verde sobre sistema quebrado. Teste que você nunca viu
+falhar é suspeito — pode ser tautológico ou estar testando o mock,
+não o código. Cada bypass acumula débito invisível: a "rapidez" de
+hoje é o incidente de amanhã.
+
+**How to apply:**
+- **Reproduzir antes de propor fix**: rodar o comando que falhou,
+  ver a mensagem real (não a que o user citou — pode estar stale),
+  confirmar que falha de forma consistente. "Fix" sem repro é chute
+- Teste falhando: ler mensagem, reproduzir local, formar hipótese,
+  validar — nunca pular
+- **Red-then-green** ao adicionar regression test pra um bug:
+  1. Escrever o teste primeiro
+  2. Rodar e ver falhar **pelo motivo certo** (mensagem bate com o
+     bug, não com erro de setup)
+  3. Aplicar o fix
+  4. Rodar e ver passar
+  Test escrito depois do fix nunca viu falhar — não há garantia de
+  que captura o bug
+- Pre-commit hook falhando: investigar e corrigir. `--no-verify` só
+  se o user pediu explicitamente, com motivo
+- Exception em código: catch específico com handling real (log,
+  retry com critério, fallback documentado); nunca `except: pass`
+  ou `catch (e) {}` como atalho
+- Mock: se sempre passa, não está testando nada — mockar
+  comportamento real ou remover o teste
+- "Funciona local, falha em CI": investigar diferença de ambiente
+  (versões, env vars, ordem de teste, paralelismo), não desabilitar
+  o job
+- Lint warning: corrigir. Suprimir com `# noqa: <code>` ou equivalente
+  só com comentário explicando o porquê
+- Build intermitente: investigar como flaky (race, ordem de teste,
+  recurso externo); retry blind transforma em problema crônico
+- Se o root cause está fora do escopo da tarefa: apontar ao user e
+  pedir decisão, não esconder
+```
+
+##### `seed_secret_handling.md`
+
+```markdown
+---
+name: secret-handling
+description: nunca commitar/salvar credenciais; redact em output
+type: feedback
+source: seed
+seed_origin: vendor
+seed_version: "1.0"
+trust: trusted
+---
+
+Nunca propor commit de credencial (API key, token, password,
+private key, connection string com auth). Nunca salvar credencial
+em memória persistente. Redact em logs e output mostrado ao user.
+
+**Why:** credencial commitada fica pública até deletada — e mesmo
+depois persiste em `git history` sem rewrite (e em forks/clones e
+GitHub event cache). Salvar credential em memória persistente
+contamina todas as sessões futuras + pode vazar em exports/sync.
+Output sem redact aparece em transcripts compartilhados, screenshots,
+audit logs, suporte. É o vetor primário de incidente de segurança
+operacional.
+
+**How to apply:**
+- Antes de propor commit: scan dos staged files por padrões
+  (`AKIA[0-9A-Z]{16}`, `ghp_*`, `ghs_*`, `xoxb-*`, `-----BEGIN.*PRIVATE KEY-----`,
+  JWT 3-segmentos, `.env*`, `*.key`, `*.pem`, `credentials.json`,
+  `id_rsa*`) — avisar e bloquear
+- User pede "salva essa API key na memória" → **recusa explícita**
+  com sugestão de password manager / env file / secret manager
+- Credential aparece em output (response de curl, log file): redact
+  antes de exibir (`***REDACTED***` ou últimos 4 chars apenas);
+  nunca eco completo
+- Arquivos sensíveis (`.env`, `secrets/`, `credentials.json`,
+  `~/.aws/`, `~/.ssh/`): nunca em `git add`; warning se aparecem
+  em diff
+- Env var contendo secret: imprimir só o nome, nunca o valor
+- Em dúvida sobre se algo é secret: tratar como secret (fail safe)
+- Se already commited: orientar processo de rotation + history rewrite,
+  não fingir que `git rm` resolveu
+```
+
 ---
 
 ## 6. Lifecycle
@@ -482,109 +1037,6 @@ Promoção entre scopes nunca é silenciosa. Cada uma cria mudança que aparece 
 ### 6.4 Hook `PreCompact`
 
 Antes de compaction, hook opcional pode revisar memória ("alguma estale?"). Útil em sessão longa onde memória recém-escrita virou redundante.
-
-### 6.5 Integração com EVICTION — transições e tombstones
-
-Memory é um dos quatro substratos sob governance de [`EVICTION.md §2`](./EVICTION.md). Esta seção mapeia o lifecycle de memory para o contrato genérico de EVICTION.
-
-#### 6.5.1 Admission gate (escrita → `active`)
-
-Toda escrita normal (§5) entra como `state: active`. Dois casos produzem `state: proposed`:
-
-- **`inferred` write em diretório untrusted** ([`§7.2`](#71-mitigações-obrigatórias) regra 1): permanece `proposed` até user confirmar manualmente; sem confirmação, vira `evicted` no fim da sessão.
-- **Hook `MemoryWrite` (§7.2 regra 4) que retorna soft-block**: mesma janela de confirmação.
-
-`user_explicit` write é admitido direto como `active` (gate já passou via UI prompt §5.1).
-
-#### 6.5.2 `active` → `quarantined`
-
-Triggers herdados de [`EVICTION.md §5.1`](./EVICTION.md), aplicados a memory:
-
-| Trigger EVICTION | Detector em memory | Motivo emitido |
-|---|---|---|
-| `verify_failed` | §6.1 verify-before-act falhou (factual entry contradisse FS) | `shift` |
-| `user_override_repeated` | user editou/rejeitou ação derivada desta memory 3× em janela de 24h | `conflict` |
-| `conflict_detected` | duas entries do mesmo scope com fatos incompatíveis (resolver em [`EVICTION.md §6.3`](./EVICTION.md)) | `conflict` |
-| `trust_revoked` | trust prompt re-fires e user revoga (§7.2 regra 8) | `security` |
-
-Memory `quarantined` continua no índice **com flag visual** (`[memory: quarantined — verify failed 2026-05-12]`) e penalty de ranking ([`EVICTION.md §9.7`](./EVICTION.md)). Não é evictada automaticamente — TTL mínimo de 7d antes de qualquer transição terminal.
-
-#### 6.5.3 `quarantined` → `evicted`
-
-Caminhos:
-
-1. **TTL de quarentena estourou** sem restauração ([`EVICTION.md §4.1`](./EVICTION.md); default 7d em memory).
-2. **Loop frio** ([`FEEDBACK_ADAPTATION.md §3.2`](./FEEDBACK_ADAPTATION.md)) confirma `low_roi` com evidence sample suficiente.
-3. **User explícito**: `/memory delete <name>` ou `/memory evict <name>`.
-
-Em todos os casos: arquivo movido pra `.tombstones/<name>.<unix_ts>.md` preservando frontmatter original (`state` atualizado pra `evicted`, `details` em event registra motivo). Index entry removida.
-
-#### 6.5.4 `evicted` → `purged` (retention window)
-
-Retention default ([`EVICTION.md §7.1`](./EVICTION.md)):
-
-| Sub-scope | Window |
-|---|---|
-| User (`~/.config/agent/memory/.tombstones/`) | 30d |
-| Project shared (`./.agent/memory/shared/.tombstones/`) | 30d, mas tombstones **versionados em git** — restore via `git checkout` mesmo fora da window |
-| Project local (`./.agent/memory/local/.tombstones/`) | 30d, gitignored — fora da window é definitivo |
-| Invalidados (todos os scopes) | 7d (mais curto; re-promoção exige re-medição completa) |
-
-Window estourada ⇒ arquivo deletado de `.tombstones/`; metadata permanece em `eviction_events` para forensics.
-
-#### 6.5.5 Restore (`evicted` → `proposed`)
-
-`/memory restore <name>` copia conteúdo do tombstone mais recente, re-cria entry em `state: proposed` (não `active`). Razão: condição que causou eviction pode ainda valer; restore é **re-admissão**, não bypass. User passa pelo prompt de confirmação normal de §5.1.
-
-Restore de tombstone versionado em shared: `git checkout <commit> -- .agent/memory/shared/.tombstones/<name>.<ts>.md` resgata histórico arbitrário; o flow de restore então roda normal.
-
-#### 6.5.6 `invalidated` — caso especial
-
-Diferente de `evicted`, `invalidated` significa **invariante externo quebrado** (e.g., reference memory aponta pra Linear project removido; project memory cita symbol que não existe mais no codebase). Não há retention window útil; window default 7d antes de virar `evicted` automaticamente.
-
-Re-promoção **não reaproveita evidence antiga** ([`EVICTION.md §4.2`](./EVICTION.md)): restore re-entra como `proposed` e re-precisa passar gate. Reaproveitar contaminaria com dados de um contexto que não existe mais.
-
-#### 6.5.7 `purged` irreversível — flows especiais
-
-- `/memory purge <name> --force`: bypass da window, confirmação dupla, registrado em `eviction_events` com `motivo: user_purge`.
-- Hook `Eviction` com `reason=security` ([`AUDIT.md §10.3`](./AUDIT.md) reuso de hook): bypass da window com `--security-purge`. Útil quando memory entry contém secret detectado tarde.
-
-Metadata em `eviction_events` **nunca** é purgada — só conteúdo. Garante prova de despejo para compliance/forensics.
-
-### 6.6 Detectores LLM-judge — default ON, opt-out via slash + config
-
-Três detectores LLM-judge rodam por default ([`AGENTIC_CLI.md §5.4.1`](./AGENTIC_CLI.md) carrega a declaração do bloco `[memory]`):
-
-| Detector | Trigger fonte | Slice |
-|---|---|---|
-| `verify_failed` | exposure de memória factual (eager-load OR memory_read) | S11 |
-| `conflict_detected` | write de memória (memory_events action=created/edited) | S13 |
-| `user_override_repeated` | threshold counter (3 override events em 24h) sobre `memory_override_events` (sinais: modal reject de inferred-write, permission deny atribuído via provenance, edit_reverted reservado) | S3 |
-
-**Opt-out** (precedência first-match-wins):
-
-1. **CLI flag**: `--no-memory-verify-llm` / `--no-memory-conflict-llm` / `--no-memory-override-llm` (session-only). As variantes sem `no-` (`--memory-verify-llm` / `--memory-conflict-llm` / `--memory-override-llm`) continuam como override-ON para scripts que queiram forçar ativação mesmo com project config OFF.
-2. **Project config** `.agent/config.toml [memory] verify_semantic_llm = false` / `conflict_detect_llm = false` / `override_detect_llm = false` — persisted, committed.
-3. **User config** `~/.config/agent/config.toml [memory] ...` — per-user, cross-project.
-4. **Default ON** — hardcoded em `src/critique/config-loader.ts:DEFAULT_MEMORY_CONFIG`.
-
-**Slash:** `/memory governance disable verify | conflict | override | all` escreve no project config. `enable` reverte. `all` cobre os três detectores. Efeito vale a partir do próximo turn boundary (snapshot semantic, mesmo padrão de `/model` e `/critique mode`).
-
-**Substrate detalhe:**
-
-- Spawn isolado em subagent (definitions em `src/subagents/builtin/verify-semantic.md` + `verify-conflict.md` + `verify-override.md`). Todos protegidos pelo `PROTECTED_BUILTIN_NAMES` (shadows project/user surge loudly no loader).
-- Cost cap independente por detector (`MEMORY_VERIFY_SEMANTIC_MAX_COST_USD` + `MEMORY_VERIFY_CONFLICT_MAX_COST_USD` + `MEMORY_VERIFY_OVERRIDE_MAX_COST_USD`). Cada um $0.50/sess + 10 dispatches.
-- Propose-not-mutate — verdicts viram pending proposals via S8 governance substrate; operator decide via `/memory governance approve` ou `reject`.
-- Quarantine é a kind dominante; cada detector mapeia seu trigger:
-  - S11 `subagent:verify-semantic` → trigger `verify_failed`, motivo `shift` default.
-  - S13 `subagent:verify-conflict` → trigger `conflict_detected`, motivo `conflict` default; multi-memory proposal com `target_payload.target_key` designando o loser; resolver determinístico (provenance > recência > scope > body length > lexicographic) escolhe quem perde.
-  - S3 `subagent:verify-override` → trigger `user_override_repeated`, motivo herdado de `suggested_motivo` do verdict (`conflict | shift | low_roi`); single-memory proposal.
-
-**Threshold-first em S3 (zero LLM cost abaixo do gate):** o counter determinístico (`countOverridesInWindow >= 3` em 24h) precede QUALQUER dispatch. Quando crossa, o subagent decide se o pattern de overrides é causado pela memória (`misguiding=true|false`). Cooldown de 24h baseado em content_hash impede re-dispatch contra mesma snapshot.
-
-**Layers:** 2 (user + project) — mirror de `[critique]`. Enterprise layer fica adiada até regulated environment surfacar (mesmo trade-off de critique).
-
-Detalhes operacionais e cost caps em [`MEMORY.md`](../MEMORY.md) §11.4 (operator guide).
 
 ---
 
@@ -631,27 +1083,15 @@ command = "~/.config/agent/hooks/memory_audit.sh"
 
 10. **PR review é gate primário pra shared:** memória shared só entra no repo via commit; commit passa por code review do time. Defesa social, não automática — mas eficaz.
 
-### 7.3 Tripwire de phrases óbvias + secret detection
+### 7.3 Detecção heurística de injection
 
-Antes de propor write, scanner roda duas passes contra o body:
-
-**(a) Tripwire de phrases (limitado, não é defesa).** Lista pequena de phrases em **inglês** vindas de tutoriais públicos de jailbreak:
-
+Antes de propor write, scanner simples checa o body:
 - "ignore previous instructions"
 - "you are now"
 - "from now on, always"
-- "disregard prior", "forget previous"
+- secret patterns (chaves AWS, GitHub tokens, etc — não salvar nunca)
 
-Match: write **bloqueado**, audit row `refused` com motivo. **Não confundir com defesa contra prompt injection.** Trivialmente burlável por:
-- outro idioma ("ignore as instruções anteriores", "忽略之前的指令", …);
-- paráfrase ("the new rule is", "your role going forward", …);
-- injection estrutural (yaml/code-block/role-play wrappers).
-
-Lista fica **curta de propósito** — estender com traduções inflaciona false-positive contra memórias legítimas que citam falhas do modelo, sem mover a agulha de ameaça. Valor real do tripwire: (1) row de audit (`memory_events action=refused`) sinaliza tentativa óbvia; (2) defense-in-depth alongside o modal de §6, o trust boundary, e a atribuição de `source`. O modal É o gate carregando peso; o tripwire é layer 0.
-
-**(b) Secret patterns (honesto, agnostic-to-language).** Shape-stable regexes (chaves AWS `AKIA…`, GitHub PAT `ghp_…`, Anthropic `sk-ant-…`, OpenAI `sk-…40+`, Slack `xox[baprs]-…`). Match: write **bloqueado**. Credentials têm prefixo de alta entropia — não dependem de prosa em volta; false-positive rate é baixo.
-
-Ambas passes geram `memory_events action=refused` com `details.reason` distinguindo phrase vs secret pattern (operator distingue tentativa hostile vs vazamento acidental de credencial em prosa).
+Match: write **bloqueado**, não só warning. Vai pra `memory_events` como `refused` com motivo.
 
 ---
 

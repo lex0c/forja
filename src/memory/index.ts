@@ -9,6 +9,7 @@ export type {
   MemoryScope,
   MemorySource,
   MemoryState,
+  MemorySubdir,
   MemoryTrust,
   MemoryType,
 } from './types.ts';
@@ -43,6 +44,7 @@ export {
   resolveScopeRoots,
   rootForScope,
   scopeOfPath,
+  seedMemoryFilePath,
   tombstonePath,
   tombstonesDir,
   userScopeRoot,
@@ -88,7 +90,7 @@ export {
 } from './loader.ts';
 export type { MemoryFileResult, ScopeIndexResult } from './loader.ts';
 
-export { createMemoryRegistry } from './registry.ts';
+export { createMemoryRegistry, listingScopeOption } from './registry.ts';
 export type {
   AuditOverride,
   CreateMemoryRegistryInput,
@@ -107,6 +109,24 @@ export type {
 
 export { writeMemory } from './writer.ts';
 export type { WriteMemoryInput, WriteMemoryResult, WriteWarning } from './writer.ts';
+
+export { installVendorSeeds } from './seeds-installer.ts';
+export type {
+  InstallVendorSeedsOptions,
+  SeedAction,
+  SeedsInstallResult,
+} from './seeds-installer.ts';
+export {
+  isSeedDisabled,
+  loadDisabledSeeds,
+  writeDisabledSeeds,
+} from './seeds-disabled.ts';
+export type {
+  DisabledSeedEntry,
+  DisabledSeeds,
+} from './seeds-disabled.ts';
+export { loadSeedManifest, writeSeedManifest } from './seeds-manifest.ts';
+export type { SeedManifest, SeedManifestEntry } from './seeds-manifest.ts';
 
 export { detectMemoryDependents } from './dependents.ts';
 export type { MemoryDependent } from './dependents.ts';

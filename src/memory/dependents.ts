@@ -26,7 +26,7 @@
 // the dependent reference might point at the user-scope version
 // or the project-scope version; the detector flags both.
 
-import type { MemoryRegistry } from './registry.ts';
+import { type MemoryRegistry, listingScopeOption } from './registry.ts';
 import type { MemoryScope } from './types.ts';
 
 export interface MemoryDependent {
@@ -97,7 +97,7 @@ export const detectMemoryDependents = (
     // scan). A malformed / missing body silently contributes no
     // dependents — the operator-side fix is independent of
     // eviction.
-    const peek = registry.peek(listing.name, { scope: listing.scope });
+    const peek = registry.peek(listing.name, listingScopeOption(listing));
     if (peek.kind !== 'present') continue;
 
     const refs = collectRefsToTarget(peek.file.body, evictedName);

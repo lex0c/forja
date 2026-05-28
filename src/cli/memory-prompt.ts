@@ -5,6 +5,7 @@ import {
   type MemoryFile,
   type MemoryRegistry,
   type MemoryScope,
+  listingScopeOption,
   serializeMemoryFile,
   shouldEagerLoadByTriggers,
 } from '../memory/index.ts';
@@ -245,7 +246,14 @@ export const assembleMemorySection = (
     // (we don't know what's in the file system, so we must NOT
     // surface ANYTHING from that scope to the model).
     if (excludeScopes?.has(l.scope)) continue;
-    const peek = input.registry.peek(l.name, { scope: l.scope });
+    // Pass the full listing identity (scope + subdir) so a seed
+    // listing whose name collides with a user-top entry resolves
+    // to the seed body, not the shadowing top-level file. Without
+    // this, the trust / state / trigger filters below would drop
+    // both the shadow AND the seed, even when the seed itself
+    // satisfies the eager-load contract — defeating the filter-
+    // before-dedupe behavior the prompt assembly depends on.
+    const peek = input.registry.peek(l.name, listingScopeOption(l));
     if (peek.kind !== 'present') {
       eligible.push({ listing: l, file: null }); // uncertainty → include
       continue;
@@ -305,8 +313,17 @@ export const assembleMemorySection = (
     if (seen.has(listing.name)) continue;
     seen.add(listing.name);
     const state = file?.frontmatter.state;
-    const flag = state === 'quarantined' ? ' [memory: quarantined]' : '';
-    lines.push(`- [${listing.scope}] ${listing.name}${flag} — ${listing.entry.hook}`);
+    const stateFlag = state === 'quarantined' ? ' [memory: quarantined]' : '';
+    // Spec §5.7.3: "UI mostrar `[seed]` discreto na lista —
+    // transparência." The model should know which entries come
+    // from the vendor catalog vs operator-authored memories so it
+    // can weight their authority appropriately. The marker is
+    // visible per-listing without changing the scope tag (the
+    // body still lives in user scope per slice-7 design).
+    const seedFlag = listing.subdir === 'seeds' ? ' [seed]' : '';
+    lines.push(
+      `- [${listing.scope}] ${listing.name}${seedFlag}${stateFlag} — ${listing.entry.hook}`,
+    );
     included++;
     eagerLoaded.push(toEagerExposure(listing.scope, listing.name, file));
   }

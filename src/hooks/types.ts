@@ -253,7 +253,7 @@ export interface PreCheckpointData {
 export interface MemoryWriteData {
   scope: 'user' | 'project_local' | 'project_shared';
   name: string;
-  source: 'user_explicit' | 'inferred' | 'imported';
+  source: 'user_explicit' | 'seed' | 'inferred' | 'imported';
   body: string;
 }
 

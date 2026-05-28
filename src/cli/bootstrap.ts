@@ -921,6 +921,13 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // memory scope roots, and the trigger-probe section below.
     const repoRoot = projectConfigCwd;
     const memoryRoots = resolveScopeRoots(repoRoot);
+    // Vendor seeds are NOT installed at bootstrap — they ride along
+    // with `agent init` (spec MEMORY.md §5.7.4 + §5.7.8) so the
+    // operator's first explicit setup gesture is also where the
+    // catalog lands, mirroring how skills/playbooks scaffold. An
+    // operator who never runs `agent init` does NOT see seeds in
+    // their /memory list — that's a feature: nothing arrives in
+    // the user scope without an explicit operator action.
     memoryRegistry = createMemoryRegistry({ roots: memoryRoots, db, cwd });
     // Skill catalog (spec SKILLS.md §3-§4). Same repo-rooted scope
     // resolution as memory; the catalog scans every scope at

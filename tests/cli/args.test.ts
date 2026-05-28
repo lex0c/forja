@@ -851,6 +851,14 @@ describe('usage', () => {
     expect(u).toContain('--checkpoints');
     expect(u).toContain('--yes');
     expect(u).toContain('init');
+    expect(u).toContain('--no-seeds');
+    // The `--only=csv` description must enumerate every step the
+    // orchestrator runs. Pre-slice-5a it omitted 'seeds' (the slice-3
+    // add wasn't reflected in usage()), so an operator running
+    // `agent init --help` would see an outdated subset and think
+    // seeds wasn't `--only=`-selectable. This assertion pins the
+    // enumeration so a future step add can't silently regress.
+    expect(u).toContain('permissions,gitignore,config,playbooks,skills,seeds');
   });
 });
 
@@ -1030,6 +1038,67 @@ describe('parseArgs — init subcommand', () => {
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.args.init?.only).toEqual(['permissions', 'config']);
+  });
+
+  test('--no-seeds expands to every default step except seeds', async () => {
+    // Opt-out sugar (MEMORY.md §5.7.6). The parser resolves the flag
+    // against VALID_INIT_STEPS (the duplicated DEFAULT_STEPS), so a
+    // future step added to init.ts AND to VALID_INIT_STEPS is picked
+    // up automatically. The drift guard above ("parser accepts every
+    // step that the orchestrator runs") keeps the duplicated list
+    // honest; this assertion pins the resolved subset.
+    const { DEFAULT_STEPS } = await import('../../src/cli/init.ts');
+    const r = parseArgs(['init', '--no-seeds']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.init?.only).toEqual(DEFAULT_STEPS.filter((s) => s !== 'seeds'));
+  });
+
+  test('--no-seeds + --only=seeds is rejected as mutually exclusive', () => {
+    const r = parseArgs(['init', '--no-seeds', '--only=seeds']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--no-seeds');
+    expect(r.message).toContain('seeds');
+  });
+
+  test('--no-seeds + --only=...,seeds,... in any order is rejected', () => {
+    // Both orderings — flag-before-only and only-before-flag — must
+    // hit the same mutex branch. The resolution runs after the parse
+    // loop, so ordering is purely a coverage concern.
+    for (const argv of [
+      ['init', '--no-seeds', '--only=permissions,seeds'],
+      ['init', '--only=permissions,seeds', '--no-seeds'],
+    ]) {
+      const r = parseArgs(argv);
+      expect(r.ok).toBe(false);
+      if (r.ok) continue;
+      expect(r.message).toContain('--no-seeds');
+    }
+  });
+
+  test('--no-seeds with a seeds-free --only is a redundant no-op (both orderings)', () => {
+    // `--no-seeds` combined with an explicit `--only=` that already
+    // omits seeds is redundant intent, not contradictory intent. The
+    // parser accepts it and leaves `only` as the operator typed it
+    // (rather than re-expanding to DEFAULT_STEPS-minus-seeds, which
+    // would silently broaden the scope past what was requested).
+    //
+    // Both flag orderings are pinned to stay symmetric with the mutex
+    // test above: if a future refactor moved the resolution branch
+    // above the mutex check or introduced any ordering-dependent
+    // state, the flag-first form would still pin `['permissions']`
+    // but the only-first form might silently broaden. Pinning both
+    // catches the regression on either path.
+    for (const argv of [
+      ['init', '--no-seeds', '--only=permissions'],
+      ['init', '--only=permissions', '--no-seeds'],
+    ]) {
+      const r = parseArgs(argv);
+      expect(r.ok).toBe(true);
+      if (!r.ok) continue;
+      expect(r.args.init?.only).toEqual(['permissions']);
+    }
   });
 });
 

@@ -1,4 +1,5 @@
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
+import { countLines } from './scanner.ts';
 import {
   MEMORY_STATES,
   type MemoryFile,
@@ -7,6 +8,7 @@ import {
   type MemoryState,
   type MemoryTrust,
   type MemoryType,
+  type SeedOrigin,
 } from './types.ts';
 
 // Frontmatter parser/writer for memory .md files.
@@ -34,9 +36,48 @@ export class FrontmatterError extends Error {
 }
 
 const VALID_TYPES = new Set<MemoryType>(['user', 'feedback', 'project', 'reference']);
-const VALID_SOURCES = new Set<MemorySource>(['user_explicit', 'inferred', 'imported']);
+const VALID_SOURCES = new Set<MemorySource>(['user_explicit', 'seed', 'inferred', 'imported']);
+const VALID_SEED_ORIGINS = new Set<SeedOrigin>(['vendor', 'team', 'install']);
 const VALID_TRUSTS = new Set<MemoryTrust>(['trusted', 'untrusted']);
 const VALID_STATES = new Set<MemoryState>(MEMORY_STATES);
+
+// Allowlist of frontmatter keys for the unknown-field rejection
+// check (spec §3.1). Module-scope so `validateFrontmatter` doesn't
+// allocate a fresh Set on every call — boot eager-load + governance
+// + verify-conflict can drive thousands of validate calls per
+// session, and the Set was the only inner allocation in the
+// function. Same shape as VALID_TYPES / VALID_SOURCES above.
+const KNOWN_FRONTMATTER_FIELDS = new Set([
+  'name',
+  'description',
+  'type',
+  'source',
+  'expires',
+  'trust',
+  'triggers',
+  'state',
+  'seed_origin',
+  'seed_version',
+]);
+
+// Seed version shape (spec §5.7.2). Accepts `MAJOR.MINOR` or
+// `MAJOR.MINOR.PATCH` with unsigned integer components. We keep
+// the shape strict so the upgrade-comparison logic in slice 4
+// can split-and-compare numerically without re-validating.
+// Leading zeros are rejected to avoid ambiguous comparisons
+// (`01.0` vs `1.0`).
+const SEED_VERSION_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*))?$/;
+
+// Hard cap on body length for seed memories (spec §5.7.7: "Body <
+// 30 linhas. Maior que isso, é conhecimento estruturado, não
+// memória."). Counted as `\n`-separated lines on the LF-normalized
+// text; a trailing newline contributes an empty trailing line, so
+// the cap is interpreted as "at most SEED_BODY_MAX_LINES non-trivial
+// lines". The body still passes the standard memory parser; this
+// limit is layered on top, scoped to source=seed only — other
+// memories can have longer bodies (the cap is about seed's role
+// as agent meta-behavior, not memory size in general).
+export const SEED_BODY_MAX_LINES = 30;
 
 // Memory `name` is the canonical id within a scope. Kebab-case
 // per spec line 220 ("kebab-case, único no scope"). We allow
@@ -180,6 +221,38 @@ const validateTriggers = (triggers: string[]): void => {
   }
 };
 
+const validateSeedOrigin = (seedOrigin: string): SeedOrigin => {
+  if (!VALID_SEED_ORIGINS.has(seedOrigin as SeedOrigin)) {
+    throw new FrontmatterError(
+      `frontmatter.seed_origin: must be one of ${[...VALID_SEED_ORIGINS].join(', ')} (got ${JSON.stringify(seedOrigin)})`,
+    );
+  }
+  return seedOrigin as SeedOrigin;
+};
+
+const validateSeedVersion = (seedVersion: string): void => {
+  if (!SEED_VERSION_RE.test(seedVersion)) {
+    throw new FrontmatterError(
+      `frontmatter.seed_version: must match MAJOR.MINOR or MAJOR.MINOR.PATCH (got ${JSON.stringify(seedVersion)})`,
+    );
+  }
+};
+
+// Body line cap for seed memories. Counting reuses scanner.ts's
+// `countLines` (the same helper that gates the §5.4 shared-corpus
+// 200-line cap) so trailing-newline + CRLF normalization stays
+// uniform across every body-length gate in the subsystem. The cap
+// is inclusive: exactly SEED_BODY_MAX_LINES is allowed, one more
+// throws.
+export const validateSeedBody = (body: string): void => {
+  const lines = countLines(body);
+  if (lines > SEED_BODY_MAX_LINES) {
+    throw new FrontmatterError(
+      `seed body exceeds ${SEED_BODY_MAX_LINES} lines (got ${lines}); spec §5.7.7 — larger payloads belong in skills/PLAYBOOKS`,
+    );
+  }
+};
+
 // Validate a parsed YAML object and project it onto the strict
 // MemoryFrontmatter shape. Throws FrontmatterError on any
 // mismatch.
@@ -222,22 +295,71 @@ export const validateFrontmatter = (raw: unknown): MemoryFrontmatter => {
     fm.state = validateState(state);
   }
 
+  const seedOrigin = optionalString(obj, 'seed_origin');
+  if (seedOrigin !== undefined) {
+    fm.seed_origin = validateSeedOrigin(seedOrigin);
+  }
+
+  const seedVersion = optionalString(obj, 'seed_version');
+  if (seedVersion !== undefined) {
+    validateSeedVersion(seedVersion);
+    fm.seed_version = seedVersion;
+  }
+
+  // Cross-field constraints for seed memories (spec §5.7).
+  // Symmetric enforcement: source=seed REQUIRES the two seed
+  // fields; source≠seed FORBIDS them. The forbid direction stops
+  // an unrelated memory from smuggling vendor/team/install markers
+  // into its frontmatter (which would then bypass the seed
+  // lifecycle's source-tier gates downstream).
+  if (source === 'seed') {
+    if (fm.seed_origin === undefined) {
+      throw new FrontmatterError(
+        'frontmatter.seed_origin: required when source=seed (spec §5.7.2)',
+      );
+    }
+    if (fm.seed_version === undefined) {
+      throw new FrontmatterError(
+        'frontmatter.seed_version: required when source=seed (spec §5.7.2)',
+      );
+    }
+    // Spec §5.7.7: "Sem expires — seed é semântica estável; se
+    // envelheceu, sobe versão." Expiry is the wrong control
+    // plane for seed; version bumps + archive on removal are.
+    if (fm.expires !== undefined) {
+      throw new FrontmatterError(
+        'frontmatter.expires: forbidden when source=seed (spec §5.7.7 — bump seed_version instead of expiring)',
+      );
+    }
+    // Spec §5.7.7: "trust: trusted sempre. Seed untrusted é
+    // contradição." A seed by definition came from a trusted
+    // vendor/install/team flow; marking one untrusted is either
+    // operator confusion or an attempted bypass of the eager-load
+    // gate. Refuse loudly.
+    if (fm.trust === 'untrusted') {
+      throw new FrontmatterError(
+        'frontmatter.trust: seed memories cannot be untrusted (spec §5.7.7)',
+      );
+    }
+  } else {
+    if (fm.seed_origin !== undefined) {
+      throw new FrontmatterError(
+        `frontmatter.seed_origin: only valid when source=seed (got source=${source})`,
+      );
+    }
+    if (fm.seed_version !== undefined) {
+      throw new FrontmatterError(
+        `frontmatter.seed_version: only valid when source=seed (got source=${source})`,
+      );
+    }
+  }
+
   // Reject unknown fields. Future-proofing: a future spec
   // revision might add `tags`, `priority`, etc. — the operator
   // running an older binary against newer files should see a
   // loud error instead of silent data loss on round-trip.
-  const known = new Set([
-    'name',
-    'description',
-    'type',
-    'source',
-    'expires',
-    'trust',
-    'triggers',
-    'state',
-  ]);
   for (const key of Object.keys(obj)) {
-    if (!known.has(key)) {
+    if (!KNOWN_FRONTMATTER_FIELDS.has(key)) {
       throw new FrontmatterError(`frontmatter: unknown field ${JSON.stringify(key)}`);
     }
   }
@@ -290,6 +412,9 @@ export const parseMemoryFile = (raw: string): MemoryFile => {
   // single blank between fence and body).
   let body = afterClose < text.length ? text.slice(afterClose + 1) : '';
   if (body.startsWith('\n')) body = body.slice(1);
+  if (frontmatter.source === 'seed') {
+    validateSeedBody(body);
+  }
   return { frontmatter, body };
 };
 
@@ -304,13 +429,25 @@ export const serializeMemoryFile = (file: MemoryFile): string => {
   // the parser (e.g. constructing a MemoryFrontmatter object by
   // hand with an invalid name).
   validateFrontmatter(file.frontmatter);
+  if (file.frontmatter.source === 'seed') {
+    validateSeedBody(file.body);
+  }
 
+  // Field order: spec-required first (name → source), then seed
+  // pair (so the seed identity sits next to source for human
+  // readers), then optional metadata (expires/trust/triggers/state).
+  // The order is stable across round-trips so the writer's output
+  // is byte-identical to the parser's input modulo whitespace.
   const ordered: Record<string, unknown> = {
     name: file.frontmatter.name,
     description: file.frontmatter.description,
     type: file.frontmatter.type,
     source: file.frontmatter.source,
   };
+  if (file.frontmatter.seed_origin !== undefined)
+    ordered.seed_origin = file.frontmatter.seed_origin;
+  if (file.frontmatter.seed_version !== undefined)
+    ordered.seed_version = file.frontmatter.seed_version;
   if (file.frontmatter.expires !== undefined) ordered.expires = file.frontmatter.expires;
   if (file.frontmatter.trust !== undefined) ordered.trust = file.frontmatter.trust;
   if (file.frontmatter.triggers !== undefined) ordered.triggers = file.frontmatter.triggers;

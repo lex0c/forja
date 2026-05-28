@@ -2,6 +2,440 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-28] seed memory — strict `subdir` filter for re-peeks preserves filter-before-dedupe
+
+Bug surfaced post-slice-5b around the user/seeds snapshot's interaction with the prompt assembly. Seed listings carry `scope: 'user'` with `subdir: 'seeds'` as the discriminator; consumers iterating `registry.list()` re-peeked by `(name, scope)` only — so for a name collision where a user-top entry shadows a seed of the same canonical name, the seed listing's peek resolved back to the user-top body. When the user-top body was `trust: untrusted` (or trigger-mismatch, or any other filter target), the trust filter dropped it — and because the seed listing's peek had returned the SAME body, the seed was dropped too. The filter-before-dedupe contract that should let a trusted lower-precedence entry survive when the higher-precedence one is filtered was silently broken.
+
+**Branch:** continued on `feat/memory-seeds`.
+
+**Fix at the API boundary.** `ScopeOption` gains a strict `subdir?: MemorySubdir` filter. `findListing` honors it: when `opts.subdir` is set, only snapshots whose `snap.subdir === opts.subdir` are walked. Backward-compatible — omitting `subdir` preserves the existing precedence walk that callers passing `(name, scope)` depend on.
+
+**Centralized helper.** New exported `listingScopeOption(listing): ScopeOption` builds a strict option object from a listing (`{ scope: listing.scope, subdir: listing.subdir }` with conditional spread for `exactOptionalPropertyTypes`). Callers iterating `registry.list()` invoke it instead of building the option inline — one helper, one place to evolve when more subdirs land (slice-6 team seeds, future variants).
+
+**Consumers threaded through the helper:**
+
+- **`src/cli/memory-prompt.ts`** `assembleMemorySection` — the primary bug site. Each per-listing re-peek now hits the listing's own snapshot, so a seed survives an untrusted user-top shadow.
+- **`src/cli/slash/commands/memory.ts`** `handleList` — same fix path; `/memory list` state/expires inspection now lands on the right body for shadowed seeds.
+- **`src/memory/lifecycle.ts`** (two sites — `gcExpiredMemories` boot scan + a fallback peek in the cascade walker) — system-internal scans inspect the right body when names shadow.
+- **`src/memory/dependents.ts`** — eviction-cascade dependent scan.
+- **`src/memory/trust-corpus-probe.ts`** — shared-corpus revoke flow's pre-transition re-peek.
+- **`src/retrieval/views/memory.ts`** — BM25 corpus body load for retrieval ranking.
+
+**Shipped on this branch:**
+
+- **`src/memory/registry.ts`** — `ScopeOption.subdir` field with strict semantics; `findListing(name, scope?, subdir?)` signature widened with the new filter check; `lookup`/`peek`/`read` thread `opts.subdir`. New exported `listingScopeOption(listing)` helper. The subagent-child registry wrapper preserves `subdir` automatically through its existing `{ ...opts, scope: s }` spread.
+
+- **`src/memory/index.ts`** — barrel re-exports `listingScopeOption`.
+
+- **6 consumer files** updated to use `listingScopeOption(l)` where they re-peek by listing identity.
+
+- **`tests/memory/registry.test.ts`** — new test pinning the full fix at the registry boundary: a `my-rule` user-top entry shadowing a `my-rule` seed; the plain `peek(name, { scope: 'user' })` still returns user-top (backward-compat); `peek(name, { scope: 'user', subdir: 'seeds' })` targets the seed; `listingScopeOption` builds the right option for each side of the collision.
+
+- **`tests/cli/memory-prompt.test.ts`** — new integration test under "seeds end-to-end": an untrusted user-top shadowing a trusted seed → user-top dropped by trust filter, seed body survives in the assembled prompt with the `[seed]` marker. Pre-fix the test would have asserted an empty section because both listings shared the same untrusted body.
+
+**Tests + validation:** `bun run typecheck` clean, `bun run lint` clean. `bun test tests/memory/ tests/cli/slash/memory.test.ts tests/cli/memory-prompt.test.ts tests/cli/memory.test.ts tests/cli/init-seeds.test.ts` → 1035 pass, no regression across the 33-file scope (memory subsystem + slash + cli + prompt + init-seeds).
+
+**Deferred (not blockers):** non-listing-iterating peek call sites (e.g., `retrieval/runner.ts`, `retrieval/compression.ts`, the verify-* dispatchers/schedulers, `governance.ts`) work with name+scope from sources that don't carry `subdir` today and target memory types that exclude seeds in practice (`type: project`/`reference` for verify-semantic; pair-keyed conflict candidates from same-scope siblings; governance proposals targeting operator-authored memories). They can adopt `listingScopeOption` if/when their inputs gain subdir.
+
+## [2026-05-28] seed memory — `loadSeedManifest` filters invalid-name keys so `agent init` self-heals
+
+Bug fix on top of slice 5b's installer surface. A hand-edited or corrupt `<user>/seeds/.installed.json` key that fails `validateName` (e.g., `"../old"`, or any name outside the kebab-case domain) crashed `agent init --only=seeds`: the orphan-archive loop called `archiveSeed → seedMemoryFilePath → validateName`, which threw, aborting the install BEFORE the manifest could be rewritten. The loader's contract was "malformed rows are recoverable" but invalid-name keys violated that contract silently.
+
+**Branch:** continued on `feat/memory-seeds`.
+
+**Fix at the loader boundary** (primary). `loadSeedManifest` now runs `validateName(key)` FIRST in the per-entry validation chain — before the structural shape check, before the version/hash type check. Invalid-name keys emit the same stderr warn pattern as the other corruptions (`forja: seed manifest at <path>: dropping entry "<key>" (invalid seed name: <reason>)`) and are dropped from the in-memory load. The installer's end-of-pass `writeSeedManifest` rewrites the file without them — self-heal is complete in one pass.
+
+**Defense-in-depth at the orphan loop** (secondary). The archive loop wraps `archiveSeed` in a try/catch with a stderr warn pointing at the same self-heal outcome. The primary fix makes this branch unreachable today, but it stays in place against a future refactor that loosens the loader's validation or a different caller bypasses the loader entirely — the invariant "manifest writes always happen at the end of the pass" survives either way.
+
+**Shipped on this branch:**
+
+- **`src/memory/seeds-manifest.ts`** — new `validateName` import; per-entry try/catch around `validateName(key)` at the top of the load loop with the stderr warn naming the rejected key + the reason.
+
+- **`src/memory/seeds-installer.ts`** — try/catch around the `archiveSeed` call in the orphan loop with a stderr line naming the seed and pointing at the self-healing rewrite below.
+
+- **`tests/memory/seeds-installer.test.ts`** — new test under "manifest persistence" pinning the self-heal: a manifest with a `"../old"` key alongside a valid `alpha-rule` entry → install does NOT throw, the invalid key is gone from the rewritten manifest, the valid sibling survives, and no spurious archive landed on disk.
+
+**Tests + validation:** `bun run typecheck` clean, `bun run lint` clean. `bun test tests/memory/seeds-installer.test.ts` → 28 pass; adjacent (`tests/memory/seeds-disabled.test.ts tests/cli/slash/memory.test.ts tests/cli/init-seeds.test.ts`) → 252 pass, no regression.
+
+## [2026-05-28] seed memory — `/memory seeds list` distinguishes `absent` from `active`
+
+Bug fix on top of slice 5b. The `list` subcommand classified every non-disabled canonical seed as `active` based only on the `.disabled.json` sentinel — but a seed can be ABSENT from the loaded set without ever being in the sentinel. Three cases land in `absent`:
+
+1. Operator ran `agent init --no-seeds` (sixth scaffold step skipped → bodies never written).
+2. Operator never ran `agent init` at all (bootstrap by itself does not install — moved out in an earlier commit on this branch).
+3. Operator deleted a body manually post-install (installer routes through `user_kept` with the prior manifest preserved → body stays gone, registry doesn't see it).
+
+In all three the seed is NOT in the registry's user/seeds snapshot and NOT in the model's prompt assembly. Pre-fix the slash reported them as `active`, misleading both the header counts and the per-row state.
+
+**Branch:** continued on `feat/memory-seeds`.
+
+**Shipped on this branch:**
+
+- **`src/cli/slash/commands/memory.ts`** (`handleSeeds` list branch) — three-state classification derived from `(isSeedDisabled, existsSync(seedMemoryFilePath))` in priority order `disabled → absent → active`. Header totals carry the third counter only when non-zero (matches the `, K archived` suffix convention so the post-install steady-state output keeps the two-counter shape operators already memorized). When absent > 0 a recovery hint appends pointing at `agent init` (or `agent init --only=seeds` for catalog refreshes after an existing init).
+
+- **`tests/cli/slash/memory.test.ts`** — the existing `seeds list enumerates every canonical seed with active state by default` test was asserting the buggy behavior (no install + `active`). It is replaced by three tests that pin the three baselines:
+  - `seeds list reports every canonical seed as 'absent' when nothing is installed` (with the recovery hint asserted);
+  - `seeds list reports every canonical seed as 'active' post-install (no opt-outs)` (header omits the absent counter; recovery hint absent);
+  - `seeds list reports a body-deleted seed as 'absent', not 'active', even when no sentinel exists` (pins case 3 — operator manual delete after install).
+
+- **`docs/MEMORY.md` §7.5** — the operator workflow paragraph that introduces `/memory seeds list` now names the three states explicitly and notes the conditional `absent` counter + recovery hint.
+
+**Tests + validation:** `bun run typecheck` clean, `bun run lint` clean. `bun test tests/cli/slash/memory.test.ts` → 236 pass; adjacent (`tests/memory/seeds-*.test.ts tests/cli/init-seeds.test.ts tests/cli/memory.test.ts`) → 61 pass, no regression.
+
+## [2026-05-28] seed memory — `[seed]` marker on every operator-facing list surface (spec §5.7.3 parity fix)
+
+Visibility fix surfaced by the post-slice-5b audit. The eager-load surface (`assembleMemorySection` in `src/cli/memory-prompt.ts:315`) already attached a `[seed]` marker to vendor-curated entries since slice 7, but two operator-facing surfaces did not: the slash `/memory list` and the headless `agent --memory list` CLI (table + JSON). An operator inspecting their memory inventory via either surface had no way to tell vendor meta-behavior apart from their own user-scope writes without inspecting filesystem paths or running shell ad-hoc against `<user>/seeds/`.
+
+**Branch:** continued on `feat/memory-seeds`.
+
+**Shipped on this branch:**
+
+- **`src/cli/slash/commands/memory.ts`** (handleList) — derives `seedSuffix = l.subdir === 'seeds' ? ' [seed]' : ''` from the listing and inlines it into all three render branches (active, ORPHAN, MALFORMED). Suffix position matches the eager-load convention (after the name, before expires).
+
+- **`src/cli/memory.ts`** (parity fix added during review) — `ListEntryJson` gains an optional `subdir?: 'seeds'` field (present only on vendor seeds, omitted otherwise to keep the JSON payload additive — legacy script consumers parse identical bytes for the user/shared/local cases they already exercise). `renderListEntry` propagates `l.subdir`; `writeListTable` appends a ` [seed]` suffix on the name column for seed rows (table layout stays three-column; operators reading the suffix get the same signal as the slash form). The JSON surface gives script consumers a structured discriminator instead of forcing them to grep a marker out of free text.
+
+- **`tests/cli/slash/memory.test.ts`** — 3 new tests:
+  - operator-authored user-top memory renders without the marker AND every seed renders with `[user] <name> [seed]`;
+  - **collision case** (review fix coverage): an operator-authored memory shadowing a vendor seed of the SAME name renders exactly once with operator-supplied description and NO seed marker — pinned with a real `CANONICAL_SEEDS[0]` name so the dedupe-precedence code path is actually exercised (the earlier `not.toMatch` against `my-rule` was trivial because no collision happened);
+  - **ORPHAN-of-seed** (review fix coverage): a seeds index entry without a body file renders as `[ORPHAN] <name> [seed]` — pins the modified ORPHAN branch so a future refactor that drops `${seedSuffix}` from the template trips a test.
+
+- **`tests/cli/memory.test.ts`** — 1 new test exercising both JSON and table forms with a real vendor-catalog install: every JSON row carries `subdir:"seeds"`, and the table form renders ` [seed]` adjacent to each seed name. Also pins that non-seed JSON rows omit `subdir` (additive-payload contract).
+
+**Review findings deferred (not blockers, future "seeds observability" slice):**
+- `/memory audit --source seed` filter (memory_events.source already carries `'seed'`; only the slash filter is missing).
+- Persisting `subdir` in `memory_events` (today `scope+name+source` discriminate; the schema add is forensic polish).
+- Surfacing seed install/disable/enable events in `/recap` (recap projection currently only aggregates `proposed` events; seed lifecycle invisible).
+- Shared `renderSeedSuffix(listing)` helper (3 sites in slash + 1 in eager-load + 1 in CLI = 5 inlined copies, but trivial single-line each — abstraction earns its weight at N=6+ or first divergence).
+
+**Tests + validation:** `bun run typecheck` clean, `bun run lint` clean. `bun test tests/cli/memory.test.ts tests/cli/slash/memory.test.ts` → 252 pass (+4 vs pre-fix: 3 slash + 1 CLI).
+
+## [2026-05-28] seed memory — slice 5b: `/memory seeds disable|enable|list` per-seed opt-out
+
+Second half of slice 5 (`docs/spec/MEMORY.md §5.7.6`). Pairs with slice 5a's `--no-seeds` blanket bootstrap opt-out by giving the operator a per-seed opt-out that survives a vendor catalog bump (slice 5a is "I don't want any vendor seeds"; slice 5b is "I want most of them but `<name>` is wrong for my workflow"). Backed by a sentinel at `<user>/seeds/.disabled.json` that the installer's upgrade state machine honors BEFORE the existing fresh/unchanged/vendor_updated/user_kept branches — so disabling a seed is durable across `agent init`, binary upgrades, and catalog version bumps without the operator's intent regressing.
+
+**Branch:** continued on `feat/memory-seeds`.
+
+**Design.** Sentinel-based opt-out (not a frontmatter field on the body, not a tombstone). The sentinel lives at `<user>/seeds/.disabled.json` with the canonical-JSON shape `{ "<name>": { "disabled_at": "<ISO-8601>" }, ... }` — same convention as the install manifest, sorted keys for stable cross-boot diffs, atomic write semantics via `atomicWrite`. The sentinel was the right shape over the alternatives because:
+
+- **Body frontmatter** (`disabled: true`) would tangle the opt-out signal with the operator-edit invariant — the slice-4 state machine uses body hash divergence to detect operator edits, so flipping a frontmatter field would route the seed through `user_kept` and the disable would only stick until the next vendor bump.
+- **Tombstones** are evict-semantic (the body is GONE); disable preserves the body verbatim for a future `enable`.
+- **Separate sentinel** keeps the opt-out signal orthogonal to body content + manifest state, so the three sources of truth (catalog, body hash, sentinel) reconcile cleanly.
+
+**Honor points.** Two surfaces consult the sentinel:
+
+1. **`installVendorSeeds`** — checks `isSeedDisabled(disabledMap, name)` at the top of the per-seed loop, BEFORE the state-machine branches. Disabled seeds route through a new `disabled` action: the body on disk is NOT touched, the prior manifest entry is preserved verbatim (so a future `enable` resumes from the same baseline), and the entry is excluded from the regenerated `seeds/MEMORY.md` index. The sixth state joins the existing five-state union (`SeedAction = '... | 'disabled'`); the result shape gains a `disabled: string[]` bucket.
+
+2. **`createMemoryRegistry.refresh`** — filters disabled entries out of the user/seeds snapshot (defense-in-depth: the installer is the primary mechanism that drops disabled seeds from the index, but the registry filter catches the case where a slash command updated the sentinel without re-running the installer, or where an operator hand-edited the index). Loading inside `refresh` (not at construction) means `/memory seeds enable` followed by `registry.reload()` picks up the change without recreating the registry.
+
+**Slash command surface.**
+
+```
+/memory seeds list                      — enumerate every canonical seed with [active|disabled] state
+/memory seeds disable <name>            — write sentinel + re-run installer + reload registry
+/memory seeds enable <name>             — clear sentinel + re-run installer + reload registry
+```
+
+Both mutation subcommands validate the name against `CANONICAL_SEEDS` (a typo lands on a clear error naming the known set, instead of silently writing a sentinel for a non-existent seed that the installer would then ignore — making the disable "look like it did nothing"). Both are idempotent: repeating `disable` on an already-disabled seed is a no-op + info log; same for `enable`. The mutation handlers re-run `installVendorSeeds` synchronously and call `registry.reload()` so the on-disk index + the in-memory snapshot reflect the change immediately, without waiting for the next bootstrap or session.
+
+**Shipped on this branch:**
+
+- **`src/memory/paths.ts`** — new `disabledSeedsPath(roots)` returning `<user>/seeds/.disabled.json`. Dot-prefixed so the seeds-subdir orphan walker (slice 2) silently ignores it, matching the install manifest's convention.
+
+- **`src/memory/seeds-disabled.ts`** (new file, ~95 lines) — `DisabledSeedEntry` type, `DisabledSeeds` map, `loadDisabledSeeds(roots)` with per-entry corruption stderr warns (mirrors the install-manifest pattern: drop the malformed entry, keep the valid siblings, name the key in the warn so the operator can audit), `writeDisabledSeeds(roots, map)` with atomic-write + sorted keys, `isSeedDisabled(map, name)` using `Object.hasOwn` to reject prototype-chain lookups (defense-in-depth: a seed named `toString` cannot masquerade as disabled).
+
+- **`src/memory/seeds-installer.ts`** — `SeedAction` union widened to include `'disabled'`; `SeedsInstallResult` gains `disabled: string[]`; the per-seed loop now reads `loadDisabledSeeds(roots)` once (cached across the 10 seeds) and short-circuits to the disabled bucket before any state-machine work; the index-regen filter also excludes disabled entries so `seeds/MEMORY.md` reflects the active set.
+
+- **`src/memory/registry.ts`** — `refresh()` now loads the sentinel and filters the user/seeds snapshot before pushing it; malformed-href entries (operator-edited index) are preserved verbatim so the existing allListings/findListing try/catch handles them consistently across snapshots.
+
+- **`src/memory/index.ts`** — re-exports `isSeedDisabled` / `loadDisabledSeeds` / `writeDisabledSeeds` + `DisabledSeedEntry` / `DisabledSeeds` types + the newly-named `SeedAction` type from the installer.
+
+- **`src/cli/slash/commands/memory.ts`** — new `handleSeeds(registry, ctx, args)` dispatcher with subcommands `disable | enable | list`. Dispatched from `memoryCommand.exec` under the new `'seeds'` case (registered after `governance`). The handler imports `CANONICAL_SEEDS` for the catalog lookup and `installVendorSeeds` for the post-mutation re-install. Description string + unknown-subcommand error message updated to enumerate `seeds`.
+
+- **`src/cli/init.ts`** — `StepResult` gains `disabled?: number`; `scaffoldSeeds` logs each disabled seed with a slash-command pointer for re-enable; the aggregate summary appends a `, K disabled` suffix when non-zero (after the existing `, K archived` suffix, alphabetical order).
+
+- **`tests/memory/seeds-disabled.test.ts`** (new file) — round-trip, sorted keys, malformed-JSON-collapses-to-empty (with stderr warn), per-entry corruption preserves valid siblings, prototype-chain rejection (toString/hasOwnProperty/__proto__).
+
+- **`tests/memory/seeds-installer.test.ts`** — 5 new tests under "disabled-sentinel handling": fresh install with disabled seed routes through `disabled` action (no body on disk), pre-installed body is preserved on disable (reversibility), disable survives a vendor version bump (sentinel beats state machine), enable restores normal routing, disabled seed alongside enabled siblings affects only the named seed.
+
+- **`tests/memory/registry.test.ts`** — 1 new test pinning the registry's filter: a seed index with two entries + a sentinel naming one of them yields a `list()` result with only the un-disabled entry.
+
+- **`tests/cli/slash/memory.test.ts`** — 10 new tests under "/memory seeds — per-seed opt-out": `seeds list` shape with active/disabled totals + every name listed; `seeds disable <name>` writes sentinel + drops from registry; idempotent `disable` returns `already disabled` note; `seeds enable <name>` clears sentinel + restores; idempotent `enable`; unknown name errors with known set; missing name errors with usage hint; no-subcommand errors; unknown-subcommand errors; `seeds list` rejects extra args.
+
+**Review fixes (applied before commit).** Max-effort review surfaced two correctness findings + several UX/coverage gaps; the correctness pair was the biggest miss in the initial slice and reshaped the `enable` semantic:
+
+1. **`bodyRestored` was lying + recovery hint was unactionable.** The original `enable` handler computed `bodyRestored = result.userKept.includes(filename) === false` and, when false, told operators to `run agent init --only=seeds`. Two bugs in one branch:
+   - For an operator who had hand-edited the body BEFORE disabling, the installer routes through `user_kept` (hash diverges from prior.hash) but the body IS present on disk and the index regen DOES re-add the entry — the seed is in the loaded set. The handler incorrectly claimed "body missing on disk" and the operator-facing message contradicted reality.
+   - For an operator who deleted the body manually while disabled, the suggested `agent init --only=seeds` produces the same `user_kept` loop (no body + prior manifest → never reinstall), so the recovery hint led nowhere.
+
+   Fix: `enable` now reshapes the semantic to "I want this seed back to vendor baseline". When the body is absent at enable time, the handler drops the prior manifest entry before re-running the installer — the installer then routes through `fresh` and writes the canonical body. `bodyRestored` is now `existsSync(bodyPath)` after install, which is the actual source of truth for "is the seed in the loaded set?" Both operator-facing branches (success + post-failure check-the-path) now match disk reality.
+
+2. **`disable`'s "body preserved at <path>" was unconditional.** After `--no-seeds`-then-`disable`, the body never existed; the message sent operators chasing a file that wasn't there. Now branches on `existsSync` and emits "no body on disk yet (sentinel persisted so a future install honors the opt-out)" when the body is absent.
+
+3. **Stale "Slice 5+" future-tense comments** in `seeds-installer.ts` (lines 207, 217, 258) and `paths.ts` (line 201) — slice 5b just shipped the sentinel, but several comments still wrote about it in future tense. Updated to past tense where slice 5b applies; kept `Slice 5c` for the interactive modal which is genuinely future.
+
+4. **`require('node:fs')` inline** in `seeds-disabled.test.ts:35` replaced with a top-level `mkdirSync` import.
+
+5. **Misleading `registry.ts` filter comment** about "the audit surface" — the filter's malformed-href preservation doesn't feed any audit surface; the authoritative diagnostic lives in `loadSeedsIndex(...).index.malformedLines`. Comment rewritten to admit the entry travels uselessly through the snapshot but does so consistently with the other scope snapshots.
+
+6. **Coverage gaps:**
+   - `tests/cli/init-seeds.test.ts` gained a test pinning the `K disabled` summary suffix and the per-seed `forja: skip ... (disabled by ...)` log line.
+   - `tests/memory/seeds-installer.test.ts` gained a "disable → vendor bump → enable cycle" test pinning the resumption-from-baseline contract (BACKLOG promise: "prior manifest entry is preserved verbatim").
+   - `tests/cli/slash/memory.test.ts` gained 2 new tests: the body-absent disable note variant, and the post-fix `enable` after operator-delete (asserts the canonical body lands + the note language reflects success). The existing disable test gained note-content assertions on body-preservation + opt-out-persistence + re-enable-hint lines so future copy drift trips.
+
+**Deferred (review findings the slice intentionally does NOT address):**
+- **Shared keyed-JSON-store helper** between `seeds-disabled.ts` and `seeds-manifest.ts` (~50 lines of structurally identical code). Defensible as-is — each helper's warn copy is operator-facing and naming the file purpose ("disabled-seeds sentinel" vs "seed manifest") in the messages keeps diagnostics legible. When a third such store ships, the abstraction earns its weight.
+- **Altitude — move disable/enable primitives to `src/memory/seeds-disabled.ts`** as `disableSeed(roots, name, now)` / `enableSeed(roots, name)`. Defensible because today the slash handler is the single call site; when a headless `agent --memory seeds disable` CLI surface lands, this becomes the natural refactor.
+- **Plumb `ctx.now` to `installVendorSeeds`** so test-fixed clocks affect archive timestamps too. Pure test concern (no production caller observes the divergence today).
+- **Triplicate disk reads** of `.disabled.json` in the slash mutation path. Microsecond-scale sentinel on an interactive command; defensible until the sentinel surface grows.
+
+**Tests + validation:** `bun run typecheck` clean, `bun run lint` clean. `bun test tests/memory/ tests/cli/slash/memory.test.ts tests/cli/init.test.ts tests/cli/args.test.ts tests/cli/init-seeds.test.ts` → 551 pass (+4 vs pre-review); `bun test tests/cli/bootstrap.test.ts tests/cli/purge.test.ts` → 99 pass (no adjacent regression).
+
+**Slice 5c followup.** The interactive `[k]eep / [v]iew / [a]ccept / [m]erge` modal for `vendor_updated` conflicts (currently the state machine deterministically writes the new vendor body when the user hasn't edited, and the user_kept branch is reached only when the operator pre-edited the file). Slice 5b's opt-out covers "I don't want this seed at all"; slice 5c covers "I want to inspect the vendor's new body before accepting it" — orthogonal use cases, separate UX paths.
+
+## [2026-05-28] seed memory — slice 5a: `agent init --no-seeds` opt-out flag
+
+First half of slice 5 (`docs/spec/MEMORY.md §5.7.6`). Adds the `--no-seeds` opt-out flag so an operator who wants the full `agent init` scaffold MINUS the bundled vendor seed pack can express that in a single token, without typing the seeds-free `--only=...` csv by hand.
+
+**Branch:** continued on `feat/memory-seeds`.
+
+**Design.** Pure parser-layer sugar. `--no-seeds` is resolved in `parseInitSubcommand` before the descriptor is built, so the init handler stays oblivious — it sees a regular `only?: ReadonlyArray<InitStep>` like any other invocation. Three combinations are accepted, one is rejected:
+
+| Argv | Resolved `only` |
+|---|---|
+| `init --no-seeds` | `DEFAULT_STEPS.filter(s => s !== 'seeds')` |
+| `init --no-seeds --only=permissions` | `['permissions']` (redundant flag, accepted) |
+| `init --no-seeds --only=seeds` | **rejected** — mutually exclusive |
+| `init --no-seeds --only=permissions,seeds` | **rejected** — mutually exclusive |
+
+The redundant case is accepted (not rejected) because scripted callers may pass both for belt-and-suspenders intent; refusing it would break those scripts without surfacing any new bug. The mutex case rejects because the operator's intent is contradictory — the parser names both flags in the error so the operator can audit their argv.
+
+**Shipped on this branch:**
+
+- **`src/cli/args.ts`** — new `noSeeds` local in `parseInitSubcommand`; handler for `--no-seeds`; post-loop resolution block that either expands to `VALID_INIT_STEPS.filter(s => s !== 'seeds')` (sole flag) or rejects on mutex. The expansion uses the duplicated `VALID_INIT_STEPS` rather than importing `DEFAULT_STEPS` from `init.ts`, preserving the parser's side-effect-free posture on `--help` paths (see the pre-existing `VALID_INIT_STEPS` comment in `args.ts:397`).
+
+- **`tests/cli/args.test.ts`** — 4 new tests: (a) `--no-seeds` alone resolves to `DEFAULT_STEPS minus seeds` (asserted via dynamic import to stay drift-coupled to the canonical list); (b) `--no-seeds + --only=seeds` rejected; (c) both flag orderings of `--no-seeds + --only=permissions,seeds` rejected; (d) `--no-seeds + --only=permissions` is a redundant no-op that leaves `only` untouched.
+
+**Review fixes (applied before commit).** Two findings surfaced by the slice review:
+
+1. **Help-text discoverability.** The new `--no-seeds` flag wasn't listed in `usage()`'s `init` subcommand block, so an operator running `agent init --help` had no way to discover the flag. While auditing, also surfaced a slice-3 drift: the `--only=csv` description still enumerated `(permissions,gitignore,config,playbooks,skills)` without `seeds`. Both fixed: header gains `[--no-seeds]`, description lists seeds in the `--only` enumeration, a `--no-seeds` line is added with a spec pointer. The pre-existing "mentions every recognized flag" test in `args.test.ts` was extended with two toContain calls so a future drift is caught on the help path before shipping.
+
+2. **Test coverage symmetry.** The mutex test pinned both flag orderings (`--no-seeds --only=...,seeds` and `--only=...,seeds --no-seeds`) but the redundant-no-op test only pinned the flag-first ordering. A future refactor that moved the resolution branch above the mutex check would not regress the flag-first path but could silently broaden `only` on the only-first path. Extended the no-op test to walk both orderings via a for-loop, matching the mutex test's coverage shape.
+
+**Tests + validation:** `bun run typecheck` clean, `bun run lint` clean. `bun test tests/cli/args.test.ts` → 159 pass (442 expect calls; +4 expects vs pre-review pinning the help-text and dual-ordering assertions).
+
+**Followups (5b, 5c).** Slice 5b will add the `/memory seeds disable|enable <name>` sentinel-based opt-out (per-seed, after install) that survives a `vendor_updated` bump. Slice 5c will add the interactive `[k]eep / [v]iew / [a]ccept / [m]erge` modal for `vendor_updated` conflicts (currently the state machine deterministically writes the new vendor body and the user_kept branch is reached only when the operator pre-edited the file).
+
+## [2026-05-28] seed memory — install moves from bootstrap to `agent init`
+
+End-to-end review surfaced a design-shape question: should vendor seeds install at every bootstrap (current slice-3 behavior) or only when the operator opts into setup via `agent init` (parallel to how skills/playbooks scaffold)? After review, the latter is the right shape — nothing should arrive in the user-global scope without an explicit operator action. This commit moves the install.
+
+**Branch:** continued on `feat/memory-seeds`.
+
+**Shipped on this branch:**
+
+- **`src/cli/bootstrap.ts`** — removed the `installVendorSeeds` call + try/catch + import. Bootstrap is now agnostic to seed installation; it only consumes whatever is on disk via `createMemoryRegistry`.
+
+- **`src/cli/init.ts`** — added `seeds` to `InitStep` + `DEFAULT_STEPS` (sixth and last step). New `scaffoldSeeds(options)` wraps `installVendorSeeds` and maps the upgrade state machine's `SeedsInstallResult` into the init scaffold's `StepResult` shape:
+  - `fresh` → `wrote`
+  - `vendorUpdated` → `overwritten`
+  - `unchanged + userKept` → `skipped`
+  - `archived` gets its own log line (no fit in the wrote/skipped/overwritten triple).
+
+  `seeds` is excluded from `ForceEligibleStep` because the slice-4 upgrade state machine already owns the rewrite policy — a blanket `--force=seeds` would override the conservative-default `user_kept` preservation and silently wipe operator edits, defeating spec §5.7.5.
+
+  Added `seedSource?: ReadonlyArray<CanonicalSeed>` test seam mirroring `playbookSource`/`skillSource` so tests can pin a fixture without depending on the full canonical set.
+
+- **`src/cli/args.ts`** — added `'seeds'` to `VALID_INIT_STEPS` so `agent init --only=seeds` (and `--only=seeds,skills`) parses cleanly. The drift-guard test in `args.test.ts` walks `DEFAULT_STEPS` and parses each `--only=<step>` — now covers the new step.
+
+- **`tests/cli/purge.test.ts`** — extended the `STEP_TO_MARKER` drift-guard with an explicit `seeds: null` mapping. Seeds write to user scope (`<user>/seeds/<name>.md`), not the project scope where `purge` operates — so the step is intentionally markerless. The null mapping documents the omission and the two affected drift-guard tests skip the null-mapped step instead of failing.
+
+- **`tests/cli/init.test.ts`** — the "scaffolds all five artifacts on a clean cwd" test now pins `only` to the five project-scope steps. The seed step is exercised by the dedicated test below; mixing it in would either pollute the developer's real `~/.config/agent/` or force XDG isolation on every init test.
+
+- **`tests/cli/init-seeds.test.ts`** — 2 new integration tests under an isolated `XDG_CONFIG_HOME`: (a) `runInit({ only: ['seeds'] })` writes the 10 canonical bodies + index + manifest into `<XDG>/agent/memory/seeds/`; (b) a second run reports zero `wrote` + N `skipped` (idempotence).
+
+- **`tests/cli/bootstrap.test.ts`** — reverted the "memory registry is wired even when no memories exist" test to its pre-install assertions: empty list, no `[seed]` marker, no `[user]` lines. The post-slice-7 expectation of seeds-in-prompt is now incorrect because bootstrap doesn't install.
+
+**Behavioral consequence.** An operator who installs Forja and immediately runs `agent` (without `agent init`) sees the `# Memory` header with save-criteria guidance but ZERO entries — including no vendor seeds. This is intentional: the operator's first explicit setup gesture is where seeds arrive, mirroring how `agent init` is also where permissions, gitignore, config, playbooks, and skills land. Operators who skip `init` get a minimal-surface agent; operators who run `init` get the full curated experience.
+
+**Tests + validation:** `bun run typecheck` clean, `bun run lint` clean. `bun test tests/memory/ tests/cli/` → 2577 pass.
+
+## [2026-05-28] seed memory — slice 7: registry integration + [seed] visibility
+
+Closes the seed end-to-end loop (`docs/spec/MEMORY.md §5.7.3 + §5.7.4`). The bootstrap-installed vendor catalog now flows into the system prompt the model sees, into `memory_read` lookups, and into `/memory list` / `/memory search` results — with a discreet `[seed]` marker so the model knows which entries are vendor-curated meta-behavior vs operator-authored.
+
+**Branch:** continued on `feat/memory-seeds`.
+
+**Design.** Seeds remain a sub-location under user scope, not a fourth `MemoryScope` value (per spec §5.7.4 + the slice-2 BACKLOG entry's rationale). The discriminator lives on `MemoryListing.subdir?: 'seeds'`. Slice 7 added a fourth scope-snapshot to the registry (`scope: 'user', subdir: 'seeds'`) AFTER the three SCOPE_ORDER entries, so precedence resolves to:
+
+```
+project_local > project_shared > user (top) > user/seeds
+```
+
+An operator-authored `<user>/safe-edit-discipline.md` eclipses the vendor seed of the same name. Vendor-curated content is the fallback layer — matches slice-4's "preserve what the user touched" upgrade rule, applied here at the lookup boundary rather than at write time.
+
+**Shipped on this branch:**
+
+- **`src/memory/registry.ts` — `MemoryListing.subdir`.** New optional `MemorySubdir = 'seeds'` field. `ScopeSnapshot` gains the same field. `refresh()` builds 3 SCOPE_ORDER snapshots + 1 seeds snapshot via `loadSeedsIndex(roots)`. `allListings()` and `findListing()` propagate `subdir` on the returned listing.
+
+- **`findListing` scope-filter walk fix.** The prior loop bailed after the first snapshot matching `scope` — with seeds as a second user-scope snapshot, a `lookup('safe-edit-discipline', { scope: 'user' })` would miss the seed when the user-top didn't carry it. The loop now walks every matching snapshot in precedence order. Pinned with a regression test.
+
+- **`readForListing(listing)` dispatch helper.** Consolidates the six `readMemoryByName(roots, listing.scope, listing.name)` call sites in the registry into one helper that routes `listing.subdir === 'seeds'` through `readSeedByName(roots, name)` (slice 2) and everything else through `readMemoryByName`. Adding a future subdir (slice 6 team seeds, or any spec extension) touches one place.
+
+- **`src/cli/memory-prompt.ts` — `[seed]` marker.** The rendered line gains a `[seed]` flag between the scope tag and the `[memory: quarantined]` flag, only when `listing.subdir === 'seeds'`. Spec §5.7.3: "UI mostrar `[seed]` discreto na lista — transparência." When dedupe drops the seed in favor of an operator-authored memory of the same name, the surviving listing carries no marker — the model sees just `[user] foo — hook`, correctly attributing the source to the operator.
+
+**Bootstrap behavior.** Previously, with `installVendorSeeds` plumbed but no registry integration, the `# Memory` section on a fresh session was header-only (zero entries). Post-slice-7, fresh sessions ship the 10 canonical vendor seeds in the eager section — the model sees `safe-edit-discipline`, `no-fabrication`, `confirm-blast-radius`, etc. before its first response. The bootstrap test `memory registry is wired even when no memories exist` was rewritten to reflect this — seed-bearing prompts are the new fresh-session baseline.
+
+**Tests + validation:**
+- `tests/memory/registry.test.ts`: 5 new tests covering list/read end-to-end (seed entries land with `subdir='seeds'`; `read('safe-edit-discipline')` returns the seed body via `readSeedByName`; an operator-authored override eclipses the seed; `findListing(name, 'user')` falls through to seeds; `list({ states: ['active'] })` peek path dispatches correctly on subdir).
+- `tests/cli/memory-prompt.test.ts`: 3 new tests pinning the `[seed]` marker (renders for seeds; dropped when an operator override eclipses; mix of operator-mem + seed gets both rendered with only the seed marked).
+- `tests/cli/bootstrap.test.ts`: bootstrap "no operator memories" test rewritten to assert seeds DO show up in the rendered prompt.
+- `bun run typecheck` clean, `bun run lint` clean.
+- `bun test tests/memory/ tests/cli/` → 2573 pass (up from 2553 in slice 4; +20 net new tests; the bootstrap rewrite replaced one assertion-shape but added more).
+
+**The seed end-to-end loop is now closed.** Vendor catalog → `<user>/seeds/` install → registry merge → eager prompt section → `memory_read` lookup all work together. Slice 5 (interactive `[k/v/a/m]` modal for user_kept conflicts + `agent init --no-seeds`) and slice 6 (team seeds opt-in via `seed_origin: team`) remain as scoped follow-ups, but the model can read the vendor catalog without them.
+
+**Post-review tightening (same slice).** Four findings from the slice-7 code review applied:
+
+(1) **`/memory delete <seed-name>` now actually deletes the seed body.** Slice-7 closed the READ side via `readForListing`, but the mutation surface was flat: `removeMemory(roots, scope, name)` resolved via `memoryFilePath(roots, 'user', name)` regardless of where the body actually lived, so operator-driven deletes of a seed silently no-oped (top-level path didn't exist) while the seed body persisted at `<user>/seeds/<name>.md`. Fix: `MemorySubdir` lifted to `types.ts`; `RegistryReadResult` carries `subdir` from the underlying listing; `RemoveMemoryInput` accepts an optional `subdir` and dispatches `seedMemoryFilePath` + `seedIndexFilePath` when set. `confirmAndDelete` threads `peek.subdir` through to `removeMemory`.
+
+(2) **Seed deletes force the legacy route, never the state-machine.** The state-machine route's tombstone semantics resolve under `<scope-root>/.tombstones/`, but slice-2's `seedTombstonePath` expects `<user>/seeds/.tombstones/`. Until slice 5+ extends transitions for seed-specific tombstone routing, `confirmAndDelete` bypasses `deleteViaTransition` whenever `subdir === 'seeds'` so the subdir-aware `removeMemory` is the only writer for seeds.
+
+(3) **Malformed `<user>/seeds/MEMORY.md` now surfaces a stderr warn at refresh time.** Previously `loadSeedsIndex` returned `{kind:'malformed', error}` and the registry silently dropped every seed for that boot — operator never learned the cause. Slice-4's installer rewrites the file on every boot so the corruption window is small, but the diagnostic-drop is now observable.
+
+(4) **Bootstrap test regex replaced with a `toContain` of a specific canonical seed.** The old regex `[a-z-]+` would reject a future seed name with digits (e.g., `v2-edit-discipline`); the test was brittle to catalog naming changes. Pinning `safe-edit-discipline` keeps the test deterministic without depending on regex meta.
+
+**Tests:** 2 new regression tests in `tests/cli/slash/memory.test.ts` covering `/memory delete <seed-name>` (verifies the right file gets removed; index entry cleared) and the legacy-route-for-seeds invariant (verifies no `<user>/.tombstones/` artifact, no `quarantined`/`evicted` audit row for seed deletions). 2575 pass; typecheck + lint clean.
+
+**Deferred follow-ups (not blocking slice 7):**
+- **#3 fresh-install peek cost** — efficiency, fits a separate boot-perf sweep.
+- **#5 scope-pinning contract drift** — needs slash-command call-site audit; deliberate design choice in slice 7.
+- **#7 invariant assertion (`subdir==='seeds'` ⇒ `scope==='user'`)** — defensive; revisit with slice-6 team seeds.
+- **#9 flag render order for quarantined seeds** — UX, spec doesn't pin order.
+- **#10 provenance schema lacks subdir** — analyst-pain debt for slice 5+.
+
+## [2026-05-28] seed memory — slice 4: upgrade lifecycle + archive
+
+Slice 4 of seed memory (`docs/spec/MEMORY.md §5.7.5`). The installer now reconciles three sources of truth — bundled catalog, on-disk bodies, and a persistent manifest — so vendor catalog bumps land for clean operators and never overwrite operator-edited content.
+
+**Branch:** continued on `feat/memory-seeds`.
+
+**Design — state machine:**
+
+| State | Trigger | Action |
+|---|---|---|
+| `fresh` | body absent, no manifest entry | write canonical + record entry |
+| `unchanged` | body hash == manifest.hash AND canonical.version == manifest.version | no-op |
+| `vendor_updated` | body hash == manifest.hash, canonical.version > manifest.version | silent rewrite + manifest bump |
+| `user_kept` | body hash != manifest.hash (with or without vendor bump) | preserve body, manifest stays at OLD baseline |
+| `archived` | manifest entry has no matching canonical seed | rename body to `seeds/archived/<name>.md`, drop manifest row |
+
+The interactive `[k]eep / [v]iew diff / [a]ccept / [m]erge` modal from spec §5.7.5 lands in slice 5 alongside the disable surface; the slice-4 default is **conservative — keep mine, log nothing extra**, so operator customizations never silently regress on a vendor bump. The `user_kept` count in `SeedsInstallResult` lets a future REPL banner surface "N seeds have pending vendor updates" without ambiguity.
+
+**Shipped on this branch:**
+
+- **`src/memory/paths.ts` — manifest + archive paths.** `seedManifestPath(roots)` → `<user>/seeds/.installed.json`; `seedArchivedDir(roots)` → `<user>/seeds/archived/`. The manifest filename is dot-prefixed so the slice-2 seeds-subdir orphan walker ignores it (agent-owned state, not a memory body). Archive directory is kept separate from `.tombstones/` because seed archival is vendor-driven, not state-machine-driven — keeping the audit motivations distinct keeps the eventual `/memory audit` output legible.
+
+- **`src/memory/seeds-manifest.ts`.** Loads/writes JSON manifest of `{version, hash}` per seed name. SHA-256 via `node:crypto` matches the established pattern (`trust-corpus.ts`, `memory-provenance.ts`). Atomic-write via the slice-3 `atomic.ts`. Malformed JSON downgrades to an empty manifest with a stderr warning — refusing to install on corrupt manifest would surprise the operator at the worst moment; empty manifest just re-routes everything through `user_kept` and records on-disk hashes as the new baseline.
+
+- **`CanonicalSeed.version: string`.** New required field on the catalog entries (slice 3 pinned `{filename, name, description, content}`; slice 4 adds `version` so the installer doesn't have to re-parse each body just to read the frontmatter `seed_version`). Each canonical entry pins `version: '1.0'` matching the .md frontmatter. The catalog test (`tests/cli/init-seeds.test.ts`) already verifies name + description against the parsed frontmatter; version parity falls out of the existing pattern.
+
+- **`installVendorSeeds` rewrite.** Eight branches mapped to the five states above; manifest reload at start, rewrite at end. The `SeedsInstallResult` shape now exposes `fresh / unchanged / vendorUpdated / userKept / archived` counters in place of slice-3's `{wrote, skipped}` — semantically richer for the future banner surface. Bootstrap still ignores the result, but the slice-3 tests' assertions migrated from `.wrote/.skipped` to `.fresh/.unchanged` to track the new contract. The "operator-deleted body with manifest row preserved" path routes to `user_kept` and DROPS the entry from the regenerated `seeds/MEMORY.md` so `/memory list` (slice 7) won't advertise something the loader would return `missing` for.
+
+**Tests + validation:**
+- `tests/memory/seeds-installer.test.ts`: 10 new tests covering every state transition (fresh / unchanged / vendor_updated / user_kept on edited body / user_kept on pre-populated body / archived / operator-deleted preservation / manifest stable ordering / malformed manifest recovery / per-state counters on idempotent re-run).
+- `tests/memory/paths.test.ts`: existing 49 tests still pass; manifest + archive paths added behind the same sandbox contract.
+- `bun run typecheck` clean, `bun run lint` clean.
+- `bun test tests/memory/ tests/cli/init-seeds.test.ts tests/cli/bootstrap.test.ts` → 758 pass (vs 758 in slice 3 — net change: -1 idempotence test renamed + 10 new state-machine tests, math comes out the same because the renamed test split into multiple richer assertions).
+
+**Deferred to slice 5 (interactive prompts + disable surface).** When the installer detects a `user_kept` because the body diverges AND the canonical version bumped past the manifest baseline, an interactive prompt belongs at the next REPL boot — `[k]eep mine / [v]iew diff / [a]ccept new / [m]erge` per spec §5.7.5. Today the installer is silent on this case (conservative default). Slice 5 also wires `agent init --no-seeds` and `/memory seeds disable|enable` with a proper sentinel that supersedes the current "manifest row preserved on body deletion" heuristic.
+
+**Post-review tightening (same slice).** Four findings from the slice-4 code review applied: (1) archive destinations are now timestamped (`<archived>/<name>.<unix_ms>.md`) via the new `seedArchivedFilePath(roots, name, ts)` helper in `paths.ts` — slice 4's prior `<archived>/<name>.md` silently overwrote prior archives on the second drop of the same name, breaking spec §5.7.5's "reversível" promise. The installer accepts an optional `now: () => number` test seam; a new regression test archives the same name twice with different content and asserts both versions persist on disk. (2) `tests/cli/init-seeds.test.ts` now asserts `seed.version === file.frontmatter.seed_version` for every canonical entry, closing the drift hazard where a developer bumps the .md frontmatter version but forgets to update the `index.ts` pinned field. (3) The user_kept branch's natural-loop-tail invariant is now documented in a load-bearing comment (Biome's `noUnnecessaryContinue` rejects a defensive `continue;` there, so the invariant lives in prose — a future maintainer must read the comment before adding state-machine logic below). (4) `loadSeedManifest` now emits stderr when it drops a malformed per-entry row, naming the offending key — previously a hand-edited manifest with a corrupt entry silently dropped through to `user_kept` with no operator signal. 704 memory + init-seeds tests pass; typecheck + lint clean.
+
+## [2026-05-28] seed memory — slice 3: vendor catalog + bootstrap install
+
+Slice 3 of seed memory (`docs/spec/MEMORY.md §5.7.4 + §5.7.8`). Ships the 10 vendor-curated seeds as bundled assets and wires the bootstrap to auto-install them into the user scope's `seeds/` subdirectory.
+
+**Branch:** continued on `feat/memory-seeds`.
+
+**Shipped on this branch:**
+
+- **`src/cli/init-seeds/` — 10 vendor seeds.** Each `.md` carries `source: seed`, `seed_origin: vendor`, `seed_version: "1.0"`, `trust: trusted`, body within the 30-line cap. The 10 seeds (alphabetical): `confirm-blast-radius`, `failure-root-cause`, `git-first-orientation`, `no-auto-commit`, `no-fabrication`, `prefer-specialized-navigation`, `respect-repo-conventions`, `safe-edit-discipline`, `scope-discipline`, `secret-handling` — exactly the §5.7.8 catalog. Body counts range 20–27 lines; the lowest-effort change is now in markdown, not code.
+
+- **`src/cli/init-seeds/index.ts` — `CANONICAL_SEEDS` array.** Same shape as the existing `init-skills/index.ts` and `init-playbooks/index.ts` — bun's `with { type: 'text' }` embeds the file content at build time so the compiled binary carries the assets without a runtime filesystem dependency. Each entry pins `{filename, name, description, content}` so the installer can populate `seeds/MEMORY.md` without re-parsing the body. Hard-cap of 10 is documented at the module's header (§5.7.7: if a future seed would push the count to 11, that's the signal to move it into a skill or playbook).
+
+- **`src/memory/seeds-installer.ts` — `installVendorSeeds`.** Idempotent installer that writes the catalog into `<user>/seeds/` via the slice-2 path primitives. Skip-if-exists per body so operator edits between boots survive (the full hash-compare + diff-prompt upgrade flow from §5.7.5 lands in slice 4). Always regenerates `seeds/MEMORY.md` so the canonical index reflects the catalog — the body files are operator-owned, the index is agent-owned (same invariant as §3.2). Atomic-write via `writeFileSync` + `renameSync` mirrors the writer in `src/memory/writer.ts`. Returns `{wrote, skipped, indexPath}` for the boot log. A `source` seam lets tests pin against a subset of canonical entries.
+
+- **`src/cli/bootstrap.ts` wire-up.** The installer is invoked between `resolveScopeRoots(repoRoot)` and `createMemoryRegistry`. Failures are caught + logged to stderr (one corrupt user-scope subdir shouldn't gate the session); the boot continues with whatever seeds already exist on disk. A future `--no-seeds` flag and disable sentinel (slice 5) plug in here.
+
+**Deliberately deferred to slice 7 (UI + audit).** The installed seeds are NOT yet registered into the `MemoryRegistry` — `loadSeedsIndex` exists (slice 2) but nothing merges its entries into `allListings`/`findListing`. The merge needs a `MemoryLocation` discriminator (`{scope, subdir?}`) so a name lookup of `safe-edit-discipline` knows to read `<user>/seeds/safe-edit-discipline.md` instead of `<user>/safe-edit-discipline.md`. That discriminator is also what closes the slice-2 code-review #6 hazard (`memoryNameFromPath` ambiguity). Lands together in slice 7.
+
+**Post-review tightening (same slice).** Three findings from the slice-3 code review applied: (1) `seeds-installer.ts` now passes the canonical `INDEX_HEADER = '# Memory index'` to `serializeIndex`, matching the writer.ts / transitions.ts / lifecycle.ts pattern — `seeds/MEMORY.md` no longer ships headerless. (2) Extracted `src/memory/atomic.ts` with shared `tempPathFor` + `atomicWrite`; the new helpers use `crypto.randomUUID()` (slice-1's hardening already adopted in transitions.ts, but writer.ts and lifecycle.ts had stayed on the older `Math.random()`-with-pid pattern). The duplication of these helpers across writer.ts, transitions.ts, lifecycle.ts, and seeds-installer.ts is now eliminated — single source of truth. (3) Exported `INDEX_HEADER` from `index-file.ts` and removed three local copies (writer.ts, transitions.ts, lifecycle.ts), so an operator-facing rename flows uniformly across every MEMORY.md the agent produces. 688 memory tests + 55 bootstrap tests still pass; typecheck + lint clean.
+
+**Tests + validation:**
+- `tests/cli/init-seeds.test.ts`: 5 tests pinning every canonical seed parses cleanly via `parseMemoryFile` (full cross-field validation including seed-only rules), body within the cap, filenames unique + alphabetically ordered, names unique, count ≤ 10.
+- `tests/memory/seeds-installer.test.ts`: 10 tests covering first-install (10 bodies + index written, parseable round-trip), idempotence (re-run skips all; operator edits preserved), index regeneration on damage, custom-source seam, empty-source graceful no-op, parent-dir creation.
+- `bun run typecheck` clean, `bun run lint` clean.
+- `bun test tests/memory/` → 688 pass (+10 vs slice 2); `bun test tests/cli/bootstrap.test.ts` → 55 pass; `bun test tests/cli/init-seeds.test.ts` → 5 pass.
+
+## [2026-05-28] seed memory — slice 2: seeds/ subdir path + loader primitives
+
+Slice 2 of seed memory (`docs/spec/MEMORY.md §5.7.4`). Lays the filesystem layer the slice-3 vendor catalog installer will write through: a dedicated `<user>/seeds/` subdirectory with sandbox-aware path resolvers and loader entry points that mirror the top-level scope helpers.
+
+**Branch:** continued on `feat/memory-seeds`.
+
+**Design call.** Seeds are NOT a separate MemoryScope. The §5.7.4 spec is explicit: "Seeds vivem em user scope, sub-pasta dedicada." A subdir, not a scope. Treating them as a fourth scope value would have rippled through every consumer of `MemoryScope` (registry, lifecycle, governance, conflict resolver) for zero semantic benefit — seeds participate in the user-scope lifecycle (eager-load, audit attribution against the operator's machine, not a project). The slice instead introduces parallel primitives that resolve into the subdir while `scopeOfPath` continues to return `'user'` for any path under `<user>/seeds/`. The trade-off: a handful of `*Seed*` helpers in paths.ts + loader.ts, vs. a churning ripple across the subsystem.
+
+**Shipped on this branch:**
+
+- **`src/memory/paths.ts` primitives.** New `SEEDS_SUBDIR = 'seeds'` constant + helpers: `seedsRoot(roots)`, `seedMemoryFilePath(roots, name)`, `seedIndexFilePath(roots)`, `seedTombstonesDir(roots)`, `seedTombstonePath(roots, name, ts)`. Each path-building helper validates the name through `validateName` and re-applies the same `isUnderRoot` sandbox check the top-level helpers use; an attempt to traverse out of `<user>/seeds/` raises `ScopeError` with a `seed`-specific message. `scopeOfPath` needs no change — its `isUnderRoot(resolved, resolvedUser)` already swallows paths under `seeds/` as user-scope, which is the correct attribution. Pinned with a regression test.
+
+- **`src/memory/loader.ts` entry points.** New `loadSeedsIndex(roots)`, `readSeedByName(roots, name)`, `listSeedOrphanFiles(roots)`. To avoid duplicating the symlink/regular-file gates and the parse-error wrapping, the existing three top-level loaders were refactored to call private helpers (`loadIndexAt(path)`, `readMemoryAt(path)`, `listOrphansAt(dir, indexResult)`) that the seed variants reuse. Same S5-review symlink gates apply: a symlinked `seeds/MEMORY.md` or `seeds/<body>.md` returns `kind: 'malformed'` with the symlink-refuse message, mirroring the protection on the top-level user scope (trust-corpus fingerprint excludes symlinks; loader-side gate closes the asymmetry so the model can't be fed target bytes via a swapped symlink).
+
+- **Loader-walker scope correction documented.** `listOrphanFiles` only scans the top-level scope root and ignores subdirectories — the existing comment now explicitly carves out `seeds/` as the one exception, pointing at the new `listSeedOrphanFiles` walker. Operators won't see seed memories surface as user-scope orphans on a manual catalog edit.
+
+**Tests + validation:**
+- `tests/memory/paths.test.ts`: 11 new tests covering each seed primitive (path shape, traversal rejection, tombstone shape) plus the `scopeOfPath` regression pinning seed subpaths as user.
+- `tests/memory/loader.test.ts`: 11 new tests for `loadSeedsIndex` (absent / present / malformed / symlinked-index), `readSeedByName` (missing / present / malformed-bad-cross-field / sandboxed-name / symlinked-body), `listSeedOrphanFiles` (empty / all-indexed / orphan-detection / user-scope-isolation regression guard).
+- `bun run typecheck` clean, `bun run lint` clean.
+- `bun test tests/memory/` → 670 pass (vs 648 in slice 1; +22 new tests for slice 2).
+
+**Deferred to slice 3 (next on this branch).** The seed catalog itself (`src/cli/init-seeds/` with the 10 vendor `.md` templates + `CANONICAL_SEEDS` array) + the bootstrap step that installs `<user>/seeds/` on first invocation. The registry-level merging of user-scope + seeds indexes also lands then, once there's actually content to merge.
+
+**Post-review tightening (same slice).** Three findings from the slice-2 code review applied: (1) `listOrphansAt` now reads with `readdirSync(dir, { withFileTypes: true })` and filters on `dirent.isFile()` so a directory whose name ends in `.md` (operator typo, attacker plant) can't slip past the suffix filter as a phantom file path — downstream `readMemoryAt` would have rejected it as `non_regular`, but advertising a non-file as an "orphan" misled gc/audit consumers acting on the list. (2) Regression tests pin the seed primitives against non-canonical roots (trailing slash + `..` segments) matching slice 1's coverage for `memoryFilePath`, including a round-trip identity check on `seedIndexFilePath`. (3) Explicit test pinning `scopeOfPath`'s current "any subdir under `<user>/` resolves to user" behavior — slice 2 declined to add a subdir allowlist, so the promiscuous attribution is now a documented invariant any future tightening must consciously break. Eight new tests, all green.
+
+## [2026-05-28] seed memory — slice 1: types + parser + tier + migration
+
+Opened the seed-memory subsystem (`docs/spec/MEMORY.md §5.7`). The other 26 files in `src/memory/` already implement every other §1-§12 slice (paths, frontmatter, scanner, loader, writer, lifecycle, conflict-resolver, trust-corpus, governance, registry, verify dispatchers, eviction, tombstones, etc.); §5.7's vendor seed catalog is the remaining piece. Slice 1 lands the typed substrate every later slice depends on.
+
+**Branch:** new branch `feat/memory-seeds` off `develop`.
+
+**Shipped on this branch:**
+
+- **`MemorySource` extended.** `src/memory/types.ts` adds `'seed'` to the union; the four-value set is now `user_explicit | seed | inferred | imported`. New `SeedOrigin` type enumerates `vendor | team | install` (spec §5.7.2). `MemoryFrontmatter` gains optional `seed_origin: SeedOrigin` and `seed_version: string` fields — required cross-validation (below) enforces the symmetric "both present iff source=seed" contract at the parser layer, not at the type layer, so unrelated memories can't smuggle seed markers into their frontmatter even if a programmatic caller bypasses TS.
+
+- **`src/memory/frontmatter.ts` validation expanded.** `VALID_SOURCES` accepts `'seed'`; new `VALID_SEED_ORIGINS` set + `SEED_VERSION_RE` (`MAJOR.MINOR` or `MAJOR.MINOR.PATCH`, leading-zeros rejected for unambiguous slice-4 comparison). Four cross-field constraints when `source === 'seed'`: (a) requires `seed_origin`, (b) requires `seed_version`, (c) forbids `expires` (spec §5.7.7: "Sem expires — seed é semântica estável; se envelheceu, sobe versão."), (d) forbids `trust: untrusted` (spec §5.7.7: "trust: trusted sempre. Seed untrusted é contradição."). Inverse symmetry: when source is anything else, both seed fields are forbidden. `serializeMemoryFile` emits the two seed fields after `source` (spec ordering: identity + provenance metadata next to source line). New `validateSeedBody` enforces the §5.7.7 body cap (`SEED_BODY_MAX_LINES = 30`); called from both `parseMemoryFile` (when source=seed on read) and `serializeMemoryFile` (symmetric on write), so a caller can't construct a too-long body and dodge the round-trip check.
+
+- **`PROVENANCE_RANK` tier inserted.** `src/memory/conflict-resolver.ts` now ranks `user_explicit:0 > seed:1 > inferred:2 > imported:3`. Rationale (encoded in the header comment): operator customization always wins, vendor-curated seed beats model-proposed inferred, inferred still beats foreign imports. Anchors §5.7.5's "preserva o que o user mexeu" against future upgrade automation — a user-edited seed in slice 4 will keep its higher tier even after a vendor catalog refresh tries to land a competing entry.
+
+- **Migration 069 — `memory_events.source` CHECK rebuild.** SQLite can't ALTER CHECK in place; mirror the migration-048 and migration-063 shape (`memory_events_new` with the widened CHECK, INSERT-SELECT-DROP-RENAME, recreate indexes). The constraint now accepts `'seed'` so the audit table can persist created/edited/deleted/promoted/etc. rows for seed-lifecycle actions. Action CHECK list and scope CHECK list preserved verbatim from migration 063 — only the source CHECK changes. Registered in `src/storage/migrations/index.ts`.
+
+- **Consumer types updated.** `MemoryEventSource` (`storage/repos/memory-events.ts`), `MemoryWriteData.source` (`hooks/types.ts`), and `StaleInvalidatedMemory.source` (`memory/lifecycle.ts`) all gain `'seed'` so audit emit, hook payloads, and lifecycle GC carry seed provenance through their respective layers. The five `as 'user_explicit' | 'inferred' | 'imported'` casts in `src/cli/slash/commands/memory.ts` (slash audit-emit sites) were collapsed to `as MemoryEventSource` — eliminates a future-drift hazard and lets the next type-widening flow through automatically.
+
+**Tests + validation:**
+- `tests/memory/frontmatter.test.ts`: 17 new tests for seed (canonical parse, origin enum, version shape accept/reject matrices, required-when-seed, forbidden-when-seed, body cap, serializer symmetry, round-trip preservation).
+- `tests/memory/conflict-resolver.test.ts`: 3 new tier-1 tests (user_explicit > seed, seed > inferred, seed > imported).
+- `bun run typecheck` clean, `bun run lint` clean.
+- `bun test tests/memory/` → 645 pass; `bun test tests/cli/slash/memory.test.ts tests/cli/slash/memory-governance-toggle.test.ts` → 243 pass; `bun test tests/storage/migrations/` → 16 pass; `bun test tests/hooks/` → 173 pass.
+
+**Next slices (same branch):**
+
+- 2 — `seeds/` subdirectory in user scope; loader unifies index + seeds index; `scopeOfPath` maps both to `user`.
+- 3 — vendor catalog (`src/cli/init-seeds/` with the 10 .md from spec §5.7.8 + `CANONICAL_SEEDS`); bootstrap installs the catalog to `~/.config/agent/memory/seeds/` on first invocation.
+- 4 — upgrade lifecycle: hash compare on `seed_version` change, `[k]eep / [v]iew diff / [a]ccept / [m]erge` prompt, `seeds/archived/` for removed seeds.
+- 5 — opt-out: `agent init --no-seeds`, `/memory seeds disable|enable`, sentinel honored at load.
+- 6 — `seed_origin: team` opt-in via `--team-seeds=<repo>` + trust prompt on first load.
+- 7 — UI marker (`[seed]` in `/memory list`) + audit emit with `source: seed`.
+
 ## [2026-05-27] preserve FORJA_BROKER_WORKER through the sandbox kernel boundary
 
 The §13.7 spawn broker's compiled-binary self-exec was placing `FORJA_BROKER_WORKER=1` on the OUTER `Bun.spawn({env})` only. On any sandboxed broker call (profile = `cwd-rw` / `ro` / etc.), `sandboxRunner` then wrapped `process.execPath` with `bwrap --clearenv` on Linux or `/usr/bin/env -i` on macOS — both of which strip every env var not in the `SANDBOX_SAFE_ENV_VARS` allowlist. The flag died at the wrap boundary, the inner compiled binary started without it, `src/cli/index.ts` fell through to normal CLI parsing instead of `runWorkerProcess()`, and the call silently failed. Affected every sandbox-enforced broker call on a compiled install — exactly the path the default-broker flip was meant to enable.

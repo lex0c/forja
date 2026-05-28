@@ -1,7 +1,9 @@
-import { lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { atomicWrite } from './atomic.ts';
 import { FrontmatterError, serializeMemoryFile, validateFrontmatter } from './frontmatter.ts';
 import {
+  INDEX_HEADER,
   IndexError,
   type ParsedIndex,
   parseIndex,
@@ -99,13 +101,6 @@ export interface WriteMemoryInput {
 const isEnoent = (err: unknown): boolean =>
   typeof err === 'object' && err !== null && (err as NodeJS.ErrnoException).code === 'ENOENT';
 
-// Final on-disk index header. Kept short — operators are expected
-// to read individual entries, not the index prose. Matches the
-// canonical shape produced when the index is regenerated from
-// scratch (no header surfaces in tests today; this lands now so
-// future regenerators are consistent).
-const INDEX_HEADER = '# Memory index';
-
 // Read MEMORY.md if present; return an empty index when absent or
 // malformed. Malformed indexes are NOT fatal at write time — the
 // alternative is refusing to write any new memory until the
@@ -154,28 +149,6 @@ const buildIndexEntry = (input: WriteMemoryInput): IndexEntry => ({
   href: `${input.frontmatter.name}.md`,
   hook: input.indexHook ?? input.frontmatter.description,
 });
-
-// Best-effort temp filename next to the target. We use a short
-// random suffix so concurrent writers (even though spec §5.1's
-// confirm flow makes that rare) don't clobber each other's temp
-// file. The suffix is regenerated per call rather than seeded once;
-// the whole writer is sync so there's no cross-call state to seed.
-const tempPathFor = (finalPath: string): string => {
-  const rand = Math.random().toString(36).slice(2, 8);
-  return `${finalPath}.tmp-${process.pid}-${rand}`;
-};
-
-// Atomic write: serialize → write to temp → rename onto final.
-// Bun follows POSIX rename semantics on the same filesystem, so
-// the rename is atomic w.r.t. readers. Cross-fs renames degrade
-// to copy+unlink and lose atomicity; we don't guard against that
-// because the scope root is always under the user's home / repo
-// root — both single-fs in practice.
-const atomicWrite = (path: string, content: string): void => {
-  const tmp = tempPathFor(path);
-  writeFileSync(tmp, content);
-  renameSync(tmp, path);
-};
 
 export const writeMemory = (input: WriteMemoryInput): WriteMemoryResult => {
   const { roots, scope, frontmatter, body } = input;
