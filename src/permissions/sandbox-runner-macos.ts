@@ -104,6 +104,16 @@ export interface BuildSandboxExecArgvOptions {
   // inherits whatever env `Bun.spawn({env})` passed. Production
   // wiring via `maybeWrapSandboxArgv` always sets this.
   env?: NodeJS.ProcessEnv;
+  // Forja-internal control-plane env appended AFTER the
+  // `SANDBOX_SAFE_ENV_VARS` loop inside the `/usr/bin/env -i` wrap,
+  // so colliding keys win (last `KEY=VAL` to `env -i` wins). Mirrors
+  // the Linux runner's `passthroughEnv` plumbing — see
+  // `BuildBwrapArgvOptions.passthroughEnv` for the threat shape +
+  // membership rules. The env -i wrap fires when EITHER `env` or
+  // `passthroughEnv` is set, so a caller that wants ONLY the
+  // passthrough vars (no host env) can pass `env: {}` +
+  // `passthroughEnv`.
+  passthroughEnv?: Record<string, string>;
 }
 
 // SBPL string escaping. Apple's profile parser accepts double-quoted
@@ -499,16 +509,30 @@ export const buildSandboxExecArgv = (options: BuildSandboxExecArgvOptions): stri
   // via $PATH at exec time, exposing the shim attack.
   // `/usr/bin/env` is canonical on every supported macOS version.
   let effectiveInner: readonly string[] = innerArgv;
-  if (options.env !== undefined) {
+  // env -i wrap fires when EITHER the host-env allowlist OR the
+  // forja-internal passthrough is requested. Both paths build the
+  // same KEY=VAL list, with passthrough entries appended LAST so a
+  // colliding key wins (env -i applies the args in order, last wins).
+  if (options.env !== undefined || options.passthroughEnv !== undefined) {
     const envAssignments: string[] = [];
-    for (const key of SANDBOX_SAFE_ENV_VARS) {
-      const value = options.env[key];
-      if (value === undefined) continue;
-      // NUL bytes inside env values would silently truncate at the
-      // execve layer. Skip — same defense the Linux runner's
-      // appendEnvFlags applies for the bwrap --setenv path.
-      if (value.includes('\0')) continue;
-      envAssignments.push(`${key}=${value}`);
+    if (options.env !== undefined) {
+      for (const key of SANDBOX_SAFE_ENV_VARS) {
+        const value = options.env[key];
+        if (value === undefined) continue;
+        // NUL bytes inside env values would silently truncate at the
+        // execve layer. Skip — same defense the Linux runner's
+        // appendEnvFlags applies for the bwrap --setenv path.
+        if (value.includes('\0')) continue;
+        envAssignments.push(`${key}=${value}`);
+      }
+    }
+    if (options.passthroughEnv !== undefined) {
+      for (const [key, value] of Object.entries(options.passthroughEnv)) {
+        if (key.length === 0) continue;
+        if (key.includes('\0') || key.includes('=')) continue;
+        if (value.includes('\0')) continue;
+        envAssignments.push(`${key}=${value}`);
+      }
     }
     effectiveInner = ['/usr/bin/env', '-i', ...envAssignments, '--', ...innerArgv];
   }

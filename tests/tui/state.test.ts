@@ -1942,13 +1942,13 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
     }
   });
 
-  test('option 2 promotes the matched rule pattern when present', () => {
-    // The session-allow option's label carries the literal rule
-    // ("Yes, don't ask again for: rm -rf *") so the operator
-    // reads a policy promotion, not a vague runtime toggle. Falls
-    // back to the per-tool wording when neither rule nor
-    // sessionAllowTarget is present.
-    const withRule = applyEvent(createInitialState(), {
+  test('options are Yes / No (session-allow option removed)', () => {
+    // The previous option 2 ("Yes, don't ask again for: X") was
+    // removed. The modal now only offers Yes / No — operator who
+    // needs a persistent rule edits `.agent/permissions.yaml`
+    // directly (or future `/perms` slash commands), with the full
+    // layered policy view in front of them.
+    const r = applyEvent(createInitialState(), {
       type: 'permission:ask',
       ts: 1,
       promptId: 'p',
@@ -1957,159 +1957,8 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
       cwd: '/p',
       rule: 'rm -rf *',
     } as UIEvent);
-    const opt2WithRule = withRule.state.modal?.options[1];
-    expect(opt2WithRule?.label).toBe("Yes, don't ask again for: rm -rf *");
-
-    const noRule = applyEvent(createInitialState(), {
-      type: 'permission:ask',
-      ts: 2,
-      promptId: 'p2',
-      toolName: 'bash',
-      command: 'whoami',
-      cwd: '/p',
-    } as UIEvent);
-    const opt2NoRule = noRule.state.modal?.options[1];
-    expect(opt2NoRule?.label).toBe('Yes, allow all bash during this session');
-  });
-
-  test('option 2 uses sessionAllowTarget independently of rule (compound-confirm shape)', () => {
-    // Compound-command confirm: engine fires with no matched rule
-    // but the bridge derives a literal from args and forwards it
-    // as sessionAllowTarget. Option 2 must reflect that literal
-    // (so the operator's promise matches what addSessionAllow
-    // registers) and the matched-rule attribution line must NOT
-    // render (no real rule fired). Pins the decoupling between
-    // the two fields the bridge now produces.
-    const compound = applyEvent(createInitialState(), {
-      type: 'permission:ask',
-      ts: 1,
-      promptId: 'p',
-      toolName: 'bash',
-      command: 'git status; pwd',
-      cwd: '/p',
-      // No `rule` — this is a compound-confirm shape.
-      sessionAllowTarget: 'git status; pwd',
-      layer: 'project',
-    } as UIEvent);
-    const opt2 = compound.state.modal?.options[1];
-    expect(opt2?.label).toBe("Yes, don't ask again for: git status; pwd");
-    // Matched-rule attribution NOT rendered: the engine emitted no
-    // rule, so showing "matched rule: git status; pwd" would
-    // misattribute the modal — the rule was synthesized by the
-    // bridge for promotion only.
-    const preview = compound.state.modal?.preview ?? [];
-    const hasMatchedRule = preview.some((p) =>
-      (typeof p === 'string' ? p : p.text).startsWith('matched rule:'),
-    );
-    expect(hasMatchedRule).toBe(false);
-  });
-
-  test('option 2 label uses sessionAllowTarget literal when matched rule is catch-all "*"', () => {
-    // When the engine matched a catch-all rule (`confirm: ['*']`),
-    // the bridge's derivePromotionTarget falls through to the
-    // args-derived literal — and the modal label must show that
-    // literal, NOT the catch-all glob. Operator's option 2 promise
-    // ("Yes, don't ask again for: <X>") matches the scope of what
-    // addSessionAllow registers. The matched-rule attribution line
-    // still shows the engine's `*` because that IS what fired.
-    const catchAll = applyEvent(createInitialState(), {
-      type: 'permission:ask',
-      ts: 1,
-      promptId: 'p',
-      toolName: 'bash',
-      command: 'curl example.com',
-      cwd: '/p',
-      // Bridge sets BOTH (engine matched '*'; bridge derived literal).
-      rule: '*',
-      sessionAllowTarget: 'curl example.com',
-      layer: 'project',
-    } as UIEvent);
-    const opt2 = catchAll.state.modal?.options[1];
-    // Label promotes the literal; operator sees what they're authorizing.
-    expect(opt2?.label).toBe("Yes, don't ask again for: curl example.com");
-    // Matched-rule line still shows the engine's true match —
-    // attribution stays accurate.
-    const preview = catchAll.state.modal?.preview ?? [];
-    const matchedRuleLine = preview.find((p) =>
-      (typeof p === 'string' ? p : p.text).includes('matched rule:'),
-    );
-    expect(matchedRuleLine).toBeDefined();
-    if (matchedRuleLine !== undefined) {
-      const text = typeof matchedRuleLine === 'string' ? matchedRuleLine : matchedRuleLine.text;
-      expect(text).toBe('    matched rule: * (project policy)');
-    }
-  });
-
-  test('option 2 label sanitizes sessionAllowTarget against ANSI / newline injection', () => {
-    // sessionAllowTarget can carry raw tool args (e.g. args.command
-    // for compound confirms). The model can pack newlines or ANSI
-    // escapes that, interpolated verbatim into the option label,
-    // would split the modal across rows or paint fake colors. The
-    // option label sanitizes at the interpolation site so the
-    // engine still receives the RAW pattern via the bridge's
-    // separate addSessionAllow call (matching depends on the
-    // literal string).
-    const ansiLaden = applyEvent(createInitialState(), {
-      type: 'permission:ask',
-      ts: 1,
-      promptId: 'p',
-      toolName: 'bash',
-      command: 'rm',
-      cwd: '/p',
-      // ESC sequence + newline + literal text. Renders normally
-      // would inject color and split rows.
-      sessionAllowTarget: 'rm \x1b[31mFAKE WARN\x1b[0m\nrm -rf /',
-    } as UIEvent);
-    const opt2 = ansiLaden.state.modal?.options[1];
-    // Label MUST NOT contain ESC byte.
-    expect(opt2?.label).not.toContain('\x1b');
-    // Label MUST be a single line.
-    expect(opt2?.label).not.toContain('\n');
-    expect(opt2?.label).not.toContain('\r');
-    // Sanitized form: ANSI stripped, newline collapsed to space.
-    expect(opt2?.label).toBe("Yes, don't ask again for: rm FAKE WARN rm -rf /");
-  });
-
-  test('option 2 label caps absurdly long sessionAllowTarget with ellipsis', () => {
-    // 1KB-long pattern would push subsequent modal content off
-    // screen; sanitizer caps display at SAFE_ONE_LINE_MAX.
-    const long = 'a'.repeat(500);
-    const r = applyEvent(createInitialState(), {
-      type: 'permission:ask',
-      ts: 1,
-      promptId: 'p',
-      toolName: 'bash',
-      command: 'echo',
-      cwd: '/p',
-      sessionAllowTarget: long,
-    } as UIEvent);
-    const opt2 = r.state.modal?.options[1];
-    // Label fits in one row's worth of content. Don't pin exact
-    // length here (that's the sanitizer's contract) — just verify
-    // the prefix is intact and the suffix has the ellipsis.
-    expect(opt2?.label?.startsWith("Yes, don't ask again for: aaa")).toBe(true);
-    expect(opt2?.label?.endsWith('…')).toBe(true);
-  });
-
-  test('option 2 falls back to per-tool wording when sessionAllowTarget is absent (subagent path)', () => {
-    // Subagent confirms today have no sessionAllowTarget (the
-    // bridge skips derivation pending IPC source marshal +
-    // child-engine push-down). The vague fallback wording is the
-    // honest behavior here — no promotion will happen. Pins this
-    // until the subagent slice lands.
-    const subagent = applyEvent(createInitialState(), {
-      type: 'permission:ask',
-      ts: 1,
-      promptId: 'p',
-      toolName: 'bash',
-      command: 'rm -rf /tmp',
-      cwd: '/p',
-      // rule may or may not be set on subagent path; the fallback
-      // is driven by sessionAllowTarget absence regardless.
-      subagent: { sessionId: 'child', name: 'explore' },
-    } as UIEvent);
-    const opt2 = subagent.state.modal?.options[1];
-    expect(opt2?.label).toBe('Yes, allow all bash during this session');
+    expect(r.state.modal?.options.map((o) => o.value)).toEqual(['yes', 'no']);
+    expect(r.state.modal?.options.map((o) => o.label)).toEqual(['Yes', 'No']);
   });
 
   test('footer hints carry only `Esc to cancel` (no unsupported affordances)', () => {

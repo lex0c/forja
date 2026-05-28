@@ -1,9 +1,19 @@
 // In-process broker — PERMISSION_ENGINE.md §13.7 first
 // implementation. Degenerate case: the broker runs in the main
 // process and delegates execution to a caller-supplied `exec`
-// function. No process separation, no sandbox wrap of its own
-// (the supplied exec handles that, per the existing
-// sandbox-runner).
+// function. No process separation AND no sandbox wrap — the
+// production caller (`bootstrap.ts:constructBroker` in
+// `mode === 'in-process'`) passes `bashHandler.execute`, which
+// `Bun.spawn`s `bash -s` directly with scrubEnv only. The
+// previous wording here ("the supplied exec handles that, per
+// the existing sandbox-runner") was aspirational and factually
+// wrong against the live wire-up; sandbox wrap only happens in
+// the `'spawn'` broker mode (which closes `maybeWrapSandboxArgv`
+// over the worker spawn). Operators wanting enforcement must
+// set brokerMode to 'spawn' explicitly AND run from a source
+// checkout (compiled binaries can't address the worker.ts
+// path — bootstrap.ts:1532 surfaces this as a hard error rather
+// than silently degrading to in-process).
 //
 // Why ship this first: the security upgrade from the spec
 // (line 928, "CLI main não tem exec privilege") requires

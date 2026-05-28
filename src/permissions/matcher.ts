@@ -1,6 +1,7 @@
 import { realpathSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { Glob } from 'bun';
+import { createBoundedCache } from './bounded-cache.ts';
 
 // Hot-path memoization. The matcher runs in the per-tool-call hot
 // path; without these caches each fs check would (a) re-compile
@@ -21,7 +22,13 @@ import { Glob } from 'bun';
 //     a hot loop. Production fs decision paths in `engine.ts`
 //     route through `firstMatchingPath` directly.
 
-const globCache = new Map<string, Glob>();
+// Cache caps: realistic policies + session-allows produce ~10s of
+// distinct patterns each. 4096 is loose enough to absorb pathological
+// inputs (hostile or test-only) without rejecting them, tight enough
+// that memory stays bounded across a long-lived REPL.
+const MATCHER_CACHE_CAP = 4096;
+
+const globCache = createBoundedCache<string, Glob>(MATCHER_CACHE_CAP);
 const getGlob = (pattern: string): Glob => {
   let g = globCache.get(pattern);
   if (g === undefined) {
@@ -31,7 +38,7 @@ const getGlob = (pattern: string): Glob => {
   return g;
 };
 
-const commandRegexCache = new Map<string, RegExp>();
+const commandRegexCache = createBoundedCache<string, RegExp>(MATCHER_CACHE_CAP);
 const getCommandRegex = (pattern: string): RegExp => {
   let r = commandRegexCache.get(pattern);
   if (r === undefined) {
@@ -44,7 +51,7 @@ const getCommandRegex = (pattern: string): RegExp => {
 // Host regex cache. Hosts are lower-cased before compilation, so
 // the key is the lowered form; pattern and host string share the
 // same canonical key.
-const hostRegexCache = new Map<string, RegExp>();
+const hostRegexCache = createBoundedCache<string, RegExp>(MATCHER_CACHE_CAP);
 const getHostRegex = (pattern: string): RegExp => {
   const lowered = pattern.toLowerCase();
   let r = hostRegexCache.get(lowered);

@@ -35,6 +35,7 @@
 // `grep`) that bypass the bash AST entirely.
 
 import { resolve } from 'node:path';
+import { createBoundedCache } from './bounded-cache.ts';
 
 export type ProtectedTier = 'deny' | 'escalate';
 
@@ -280,7 +281,15 @@ interface ResolvedProtectedTargets {
   cwdEscalateDirs: readonly string[];
 }
 
-const targetCache = new Map<string, ResolvedProtectedTargets>();
+// Cap calibrated for the realistic (home, cwd) tuple churn —
+// production sessions typically see ONE tuple per process (operator's
+// home + project root); long-running test runs that bootstrap many
+// engines see tens. 256 is generous enough that the eviction path
+// never fires in practice, while preventing unbounded growth if a
+// future refactor starts feeding many distinct cwds (e.g. worktree
+// sweeps).
+const TARGET_CACHE_CAP = 256;
+const targetCache = createBoundedCache<string, ResolvedProtectedTargets>(TARGET_CACHE_CAP);
 
 const getResolvedTargets = (home: string, cwd: string): ResolvedProtectedTargets => {
   const key = `${home}\0${cwd}`;

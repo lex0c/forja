@@ -892,6 +892,74 @@ const PACKAGE_VERSION = ((): string => {
   }
 })();
 
+// §13.7 broker-mode honesty check. The earlier `sandbox` check
+// reports whether the sandbox BINARY is present on the host. This
+// check derives the next layer: given the binary's presence (or
+// absence), what does the broker default actually do at boot?
+//
+// As of the broker default-flip slice, `bootstrap.ts:constructBroker`
+// resolves `'spawn'` automatically when the host has a working
+// sandbox tool, and `'in-process'` only as the no-sandbox fallback.
+// Both source-checkout AND compiled-binary installs reach `'spawn'`
+// (the compiled-binary self-exec via `FORJA_BROKER_WORKER=1`).
+//
+//   - sandbox binary present  → default broker resolves to `spawn`
+//                               → bash spawns wrapped per the
+//                               engine planner → `ok`.
+//   - sandbox binary missing  → default falls back to `in-process`
+//                               → bash runs unwrapped, engine
+//                               permission floors are the only
+//                               defense → `warn` with the
+//                               actionable install hint.
+//   - non-linux/non-darwin    → no sandbox tool ceiling; default
+//                               `in-process` is the only option
+//                               → `ok` "not applicable".
+//
+// The operator can still force `--broker in-process` to opt out of
+// the spawn overhead; this check reports the DEFAULT path because
+// that's the dominant case and the one operators most often miss.
+// Forcing `--broker in-process` on a host with sandbox available
+// remains a deliberate operator action, not a hidden default.
+const sandboxEnforcementCheck = (
+  which: (cmd: string) => string | null,
+  exists?: (path: string) => boolean,
+  stat?: (path: string) => { uid: number; mode: number } | null,
+): DoctorCheck => {
+  const platform = nodePlatform();
+  if (platform !== 'linux' && platform !== 'darwin') {
+    return {
+      name: 'sandbox_enforcement',
+      status: 'ok',
+      detail: 'not applicable on this platform (no sandbox tool ceiling)',
+    };
+  }
+  // Re-probe availability directly so the verdict tracks the actual
+  // presence of the binary, not the `sandbox` check's status field
+  // (which is `warn` for BOTH binary-absent AND non-canonical-but-
+  // present cases — different enforcement implications).
+  const detectOpts: Parameters<typeof detectSandboxAvailability>[0] = { which };
+  if (exists !== undefined) detectOpts.exists = exists;
+  if (stat !== undefined) detectOpts.stat = stat;
+  const availability = detectSandboxAvailability(detectOpts);
+  if (!availability.available) {
+    return {
+      name: 'sandbox_enforcement',
+      status: 'warn',
+      detail:
+        'sandbox binary missing — broker default falls back to in-process; bash runs unwrapped',
+      remediation:
+        platform === 'linux'
+          ? 'install bubblewrap (`apt install bubblewrap` or distro equivalent) to enable spawn-broker enforcement'
+          : 'macOS ships sandbox-exec built-in; verify the binary is on $PATH',
+    };
+  }
+  return {
+    name: 'sandbox_enforcement',
+    status: 'ok',
+    detail: `${availability.tool ?? 'sandbox tool'} available; broker default resolves to spawn — bash spawns wrapped per engine planner`,
+  };
+};
+
 const gitCheck = (which: (cmd: string) => string | null): DoctorCheck => {
   const path = which('git');
   if (path !== null) {
@@ -972,6 +1040,14 @@ export const runDoctor = async (options: RunDoctorOptions = {}): Promise<number>
       ...(options.userPath !== undefined ? { userPath: options.userPath } : {}),
     }),
     chainCheck({ env, dbPath }),
+    // §13.7 enforcement honesty — re-probes sandbox availability
+    // locally (not derived from `sandboxResult`, see the check's
+    // header for the reasoning) and the compiled-binary signature.
+    // Critical (not cached): availability can change between runs
+    // (binary installed/removed, host trust posture). The
+    // compiled-binary flag is stable within a process but the
+    // probe is cheap so caching adds no value.
+    sandboxEnforcementCheck(which, options.exists, options.stat),
     sealingCheck({
       env,
       cwd,

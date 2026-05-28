@@ -74,6 +74,23 @@ export interface Capability {
 
 export const isCapabilityKind = (s: string): s is CapabilityKind => ALL_KINDS.has(s);
 
+// Sentinel scope emitted when a scoped capability is constructed
+// with `scope === null`. The pre-fix path emitted `<kind>:*`
+// (wildcard), which silently WIDENED authorization — exactly the
+// opposite of "fail-closed". `<invalid>` is intentionally chosen to
+// be (a) auditable: grepable in `capabilities_json` for postmortems
+// asking "did the bug ship?"; (b) refuse-by-construction:
+// `capabilityCovers` short-circuits to false when either side
+// carries the sentinel, so a buggy-emitted cap never covers a
+// requested action and a permissive `kind:**` policy never covers
+// the buggy cap either.
+//
+// Bug shape that produces this: a resolver builds
+// `{ kind: 'read-fs', scope: null }` instead of the correct
+// `readFs(path)`. Pre-fix wire form was `read-fs:*` (silent
+// widen); post-fix is `read-fs:<invalid>` (refuse + audit signal).
+export const INVALID_SCOPE_SENTINEL = '<invalid>';
+
 // Format a capability into its canonical wire form. Scope-less
 // kinds stand alone; scoped kinds use `kind:scope` with no whitespace
 // on either side. The colon is the first occurrence — scope values
@@ -83,9 +100,9 @@ export const formatCapability = (c: Capability): string => {
   if (KINDS_WITHOUT_SCOPE.has(c.kind)) return c.kind;
   if (c.scope === null) {
     // Programming bug: scoped kind constructed without a scope.
-    // Coerce to wildcard rather than emit a malformed string —
-    // wildcard is more conservative than guessing.
-    return `${c.kind}:*`;
+    // Emit the sentinel; downstream coverage checks refuse to
+    // match this on either side (see INVALID_SCOPE_SENTINEL doc).
+    return `${c.kind}:${INVALID_SCOPE_SENTINEL}`;
   }
   return `${c.kind}:${c.scope}`;
 };
@@ -173,6 +190,12 @@ export const capabilityCovers = (parent: Capability, child: Capability): boolean
   const pScope = parent.scope;
   const cScope = child.scope;
   if (pScope === null || cScope === null) return false;
+  // Invalid-scope sentinel: refuse on either side. A buggy-emitted
+  // child cap (scope=null → wire form `<kind>:<invalid>` → re-parsed
+  // here as scope='<invalid>') must not be covered by a permissive
+  // policy like `kind:**`, and a buggy parent cap must not cover a
+  // legitimate child. See INVALID_SCOPE_SENTINEL doc for the rationale.
+  if (pScope === INVALID_SCOPE_SENTINEL || cScope === INVALID_SCOPE_SENTINEL) return false;
 
   // exec hierarchy. `arbitrary` is the umbrella; everything else is
   // a literal class name.
@@ -242,6 +265,8 @@ export const capabilityCoversCwdAware = (
   const pScope = parent.scope;
   const cScope = child.scope;
   if (pScope === null || cScope === null) return false;
+  // Invalid-scope sentinel guard (mirror of capabilityCovers).
+  if (pScope === INVALID_SCOPE_SENTINEL || cScope === INVALID_SCOPE_SENTINEL) return false;
   // Universal wildcards short-circuit — `matchPath` would resolve
   // `**` against cwd and miss targets OUTSIDE cwd that the
   // universal form should cover (e.g. a system-wide `read-fs:**`

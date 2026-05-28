@@ -377,10 +377,12 @@ export interface PermissionEngine {
   // attributed to the built-in default.
   provenance(): SectionProvenance;
   // Append a pattern to the session-scoped allowlist for the
-  // given section. Used by the REPL's "Yes, don't ask again
-  // for: <rule>" modal answer — the bridge calls this BEFORE
-  // returning true so subsequent calls matching the pattern
-  // skip the modal entirely.
+  // given section. The permission modal no longer carries a
+  // "session-allow" option (removed alongside option 2); this API
+  // exists for non-modal promotion paths (future `/perms` slash
+  // commands, programmatic test setup, audit replay). Subsequent
+  // engine.check() calls matching the pattern short-circuit to
+  // allow.
   //
   // The pattern semantics depend on the section:
   //   - bash → matched against `args.command` (glob).
@@ -526,11 +528,21 @@ const grantRelevantForSection = (
 // First matching grant for the given target. Returns the full
 // snapshot (not just the pattern) so the caller can record the
 // grant id and expires_at on the Decision / audit row.
+//
+// `cwd` is optional because only path-based sections need it.
+// Pre-fix the bash + fetch_url callers passed `cwd=''` as a
+// placeholder — works today because the internal switch routes
+// to `matchCommand` / `matchHost` (neither reads cwd) but the
+// empty string would `resolve('', value)` against the process
+// cwd with arbitrary semantics if a future section refactor
+// dropped to the `matchPath` branch. Now the path branch
+// defensively returns null when cwd is missing, and the bash +
+// fetch_url callers omit the argument entirely.
 const firstMatchingGrant = (
   grants: readonly GrantSnapshot[] | undefined,
   section: keyof PolicyToolsSection,
   target: string,
-  cwd: string,
+  cwd?: string,
 ): GrantSnapshot | null => {
   if (grants === undefined || grants.length === 0) return null;
   for (const g of grants) {
@@ -541,6 +553,11 @@ const firstMatchingGrant = (
     } else if (section === 'fetch_url') {
       matches = matchHost(g.scope_value, target);
     } else {
+      // Path-based section requires cwd. A caller that omits it
+      // can't resolve relative grant scopes — drop the grant
+      // rather than fall back to a process-cwd resolve that the
+      // engine never intended.
+      if (cwd === undefined) return null;
       matches = matchPath(g.scope_value, target, cwd);
     }
     if (matches) return g;
@@ -599,7 +616,7 @@ const checkBash = (
   // Compound guard is intentionally bypassed — same rationale as
   // session-allow: the operator authorized this pattern explicitly
   // for the grant's TTL window.
-  const grantMatch = firstMatchingGrant(activeGrants, 'bash', command, '');
+  const grantMatch = firstMatchingGrant(activeGrants, 'bash', command);
   if (grantMatch !== null) {
     return {
       kind: 'allow',
@@ -953,7 +970,7 @@ const checkFetch = (
   }
   // Persisted grant check. Pattern grants targeting hosts use the
   // same matcher as `allow_hosts` (case-insensitive host glob).
-  const grantMatch = firstMatchingGrant(activeGrants, 'fetch_url', host, '');
+  const grantMatch = firstMatchingGrant(activeGrants, 'fetch_url', host);
   if (grantMatch !== null) {
     return {
       kind: 'allow',

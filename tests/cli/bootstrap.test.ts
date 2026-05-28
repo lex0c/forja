@@ -1087,7 +1087,17 @@ When the goal is to orient in a new repo.
   });
 
   describe('brokerMode (§13.7, slice 87)', () => {
-    test('omitted brokerMode → in-process broker is wired (default)', async () => {
+    test('omitted brokerMode → broker is wired; default depends on host sandbox availability', async () => {
+      // Default broker mode resolves dynamically: when the host has
+      // a working sandbox tool (bwrap/sandbox-exec), spawn-mode wins
+      // automatically so bash spawns get wrapped; otherwise in-process.
+      // This test asserts the broker exists and round-trips a bash
+      // command — both modes produce the same `ok:true + stdout`
+      // shape for an unwrapped echo (`sandboxProfile: null`), so
+      // the smoke test is host-mode-agnostic. The
+      // `brokerMode: 'in-process'` and `brokerMode: 'spawn'` tests
+      // below pin each mode explicitly; this one pins that the
+      // default path constructs SOMETHING usable regardless of host.
       const { config, db } = await bootstrap({
         prompt: 'hi',
         cwd: workdir,
@@ -1098,22 +1108,19 @@ When the goal is to orient in a new repo.
       });
       const broker = config.broker;
       if (broker === undefined) throw new Error('expected broker to be wired');
-      // Smoke-execute through the broker — in-process delegates
-      // straight to createBashHandler, so a simple echo should
-      // produce ok:true + stdout.
       const r = await broker.execute({
         toolName: 'bash',
-        args: { command: 'echo in-process-ok' },
+        args: { command: 'echo default-ok' },
         capabilities: [],
         sandboxProfile: null,
       });
       expect(r.ok).toBe(true);
-      expect(r.stdout).toBe('in-process-ok\n');
+      expect(r.stdout).toBe('default-ok\n');
       await broker.close();
       db.close();
     });
 
-    test('brokerMode "in-process" explicit → same as default (in-process)', async () => {
+    test('brokerMode "in-process" explicit → in-process broker wired regardless of host capability', async () => {
       const { config, db } = await bootstrap({
         prompt: 'hi',
         cwd: workdir,
@@ -1160,6 +1167,119 @@ When the goal is to orient in a new repo.
       expect(r.ok).toBe(true);
       expect(r.stdout).toBe('spawn-ok\n');
       await broker.close();
+      db.close();
+    });
+  });
+
+  describe('default broker resolver (§13.7 sandbox-availability gate)', () => {
+    // The default broker mode resolves dynamically per
+    // `sandboxAvail.available`. These tests pin both branches via
+    // the `sandboxAvailabilityOverride` test seam so the verdict
+    // doesn't depend on the runner host's actual sandbox state.
+
+    test('sandbox available + brokerMode omitted → spawn mode + active enforcement snapshot', async () => {
+      const { sandboxEnforcement, config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        sandboxAvailabilityOverride: {
+          available: true,
+          tool: 'bwrap',
+          path: '/usr/bin/bwrap',
+          trustLevel: 'canonical',
+          reason: '',
+          trustWarnings: [],
+        },
+      });
+      expect(sandboxEnforcement.active).toBe(true);
+      expect(sandboxEnforcement.reason).toBe('active');
+      expect(sandboxEnforcement.tool).toBe('bwrap');
+      // Broker is wired (spawn mode); smoke-execute a no-op to
+      // confirm the construction didn't refuse silently.
+      if (config.broker === undefined) throw new Error('expected broker');
+      await config.broker.close();
+      db.close();
+    });
+
+    test('sandbox absent + brokerMode omitted → in-process mode + no-tool snapshot', async () => {
+      const { sandboxEnforcement, config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        sandboxAvailabilityOverride: {
+          available: false,
+          tool: null,
+          path: null,
+          trustLevel: 'absent',
+          reason: 'no sandbox tool detected',
+          trustWarnings: [],
+        },
+      });
+      expect(sandboxEnforcement.active).toBe(false);
+      expect(sandboxEnforcement.reason).toBe('no-tool');
+      expect(sandboxEnforcement.tool).toBeNull();
+      if (config.broker === undefined) throw new Error('expected broker');
+      await config.broker.close();
+      db.close();
+    });
+
+    test('sandbox available + brokerMode=in-process → operator-override snapshot', async () => {
+      const { sandboxEnforcement, config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        brokerMode: 'in-process',
+        sandboxAvailabilityOverride: {
+          available: true,
+          tool: 'bwrap',
+          path: '/usr/bin/bwrap',
+          trustLevel: 'canonical',
+          reason: '',
+          trustWarnings: [],
+        },
+      });
+      expect(sandboxEnforcement.active).toBe(false);
+      expect(sandboxEnforcement.reason).toBe('operator-override');
+      // Tool is still reported as present even when override
+      // suppressed enforcement — operator wants to know they had
+      // the option to enable.
+      expect(sandboxEnforcement.tool).toBe('bwrap');
+      if (config.broker === undefined) throw new Error('expected broker');
+      await config.broker.close();
+      db.close();
+    });
+
+    test('sandbox absent + brokerMode=spawn → degraded-passthrough snapshot', async () => {
+      const { sandboxEnforcement, config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        brokerMode: 'spawn',
+        sandboxAvailabilityOverride: {
+          available: false,
+          tool: null,
+          path: null,
+          trustLevel: 'absent',
+          reason: 'no sandbox tool detected',
+          trustWarnings: [],
+        },
+      });
+      expect(sandboxEnforcement.active).toBe(false);
+      expect(sandboxEnforcement.reason).toBe('degraded-passthrough');
+      if (config.broker === undefined) throw new Error('expected broker');
+      await config.broker.close();
       db.close();
     });
   });

@@ -1214,6 +1214,145 @@ describe('buildBwrapArgv — slice 145 S2 env allowlist via --clearenv + --seten
   });
 });
 
+// Forja-internal control-plane env (e.g. `FORJA_BROKER_WORKER=1`)
+// has to survive `--clearenv` — without it the compiled-binary
+// self-exec path falls back to normal CLI parsing inside the
+// sandboxed inner. `passthroughEnv` plumbs the entries through as
+// additional `--setenv` flags AFTER the safe-list loop.
+describe('buildBwrapArgv — passthroughEnv (forja control plane)', () => {
+  test('passthroughEnv entries emit --setenv after the safe-list loop', () => {
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: { PATH: '/usr/bin' },
+      passthroughEnv: { FORJA_BROKER_WORKER: '1' },
+      realpath: (p) => p,
+    });
+    const setenvAt = (key: string, value: string): boolean => {
+      for (let i = 0; i < argv.length - 2; i++) {
+        if (argv[i] === '--setenv' && argv[i + 1] === key && argv[i + 2] === value) return true;
+      }
+      return false;
+    };
+    expect(setenvAt('PATH', '/usr/bin')).toBe(true);
+    expect(setenvAt('FORJA_BROKER_WORKER', '1')).toBe(true);
+    // The passthrough --setenv lands AFTER the safe-list loop, so
+    // bwrap's last-setenv-wins semantics let a colliding passthrough
+    // key override a safe-list value (see next test).
+    const pathIdx = argv.findIndex(
+      (v, i) => v === '--setenv' && argv[i + 1] === 'PATH' && argv[i + 2] === '/usr/bin',
+    );
+    const fbwIdx = argv.findIndex(
+      (v, i) => v === '--setenv' && argv[i + 1] === 'FORJA_BROKER_WORKER' && argv[i + 2] === '1',
+    );
+    expect(pathIdx).toBeGreaterThan(-1);
+    expect(fbwIdx).toBeGreaterThan(pathIdx);
+  });
+
+  test('passthroughEnv key colliding with safe-list wins (last --setenv wins)', () => {
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: { PATH: '/usr/bin' },
+      passthroughEnv: { PATH: '/forja/bin' },
+      realpath: (p) => p,
+    });
+    const pathSetenvs: string[] = [];
+    for (let i = 0; i < argv.length - 2; i++) {
+      if (argv[i] === '--setenv' && argv[i + 1] === 'PATH') pathSetenvs.push(argv[i + 2] as string);
+    }
+    expect(pathSetenvs).toEqual(['/usr/bin', '/forja/bin']);
+  });
+
+  test('passthroughEnv with NUL in value is skipped (same defense as safe-list)', () => {
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      passthroughEnv: { FORJA_BROKER_WORKER: '1', BAD: 'a\0b' },
+      realpath: (p) => p,
+    });
+    const setenvKeys: string[] = [];
+    for (let i = 0; i < argv.length - 1; i++) {
+      if (argv[i] === '--setenv') setenvKeys.push(argv[i + 1] as string);
+    }
+    expect(setenvKeys).toContain('FORJA_BROKER_WORKER');
+    expect(setenvKeys).not.toContain('BAD');
+  });
+
+  test('passthroughEnv with NUL or = in key is skipped (argv-injection defense)', () => {
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      passthroughEnv: {
+        GOOD: 'ok',
+        'BAD\0KEY': 'x',
+        'BAD=KEY': 'y',
+        '': 'empty',
+      },
+      realpath: (p) => p,
+    });
+    const setenvKeys: string[] = [];
+    for (let i = 0; i < argv.length - 1; i++) {
+      if (argv[i] === '--setenv') setenvKeys.push(argv[i + 1] as string);
+    }
+    expect(setenvKeys).toContain('GOOD');
+    expect(setenvKeys).not.toContain('BAD\0KEY');
+    expect(setenvKeys).not.toContain('BAD=KEY');
+    expect(setenvKeys).not.toContain('');
+  });
+
+  test('passthroughEnv omitted → no extra --setenv beyond safe-list', () => {
+    const baseline = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: { PATH: '/usr/bin' },
+      realpath: (p) => p,
+    });
+    const baselineSetenvKeys: string[] = [];
+    for (let i = 0; i < baseline.length - 1; i++) {
+      if (baseline[i] === '--setenv') baselineSetenvKeys.push(baseline[i + 1] as string);
+    }
+    expect(baselineSetenvKeys).not.toContain('FORJA_BROKER_WORKER');
+  });
+});
+
+describe('maybeWrapSandboxArgv — passthroughEnv plumbing', () => {
+  test('linux: forwards passthroughEnv into the bwrap --setenv tail', () => {
+    const argv = maybeWrapSandboxArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: ['/usr/bin/forja'],
+      env: { PATH: '/usr/bin' },
+      passthroughEnv: { FORJA_BROKER_WORKER: '1' },
+      platform: 'linux',
+      which: (name) => (name === 'bwrap' ? '/usr/bin/bwrap' : null),
+      exists: (p) => p === '/usr/bin/bwrap',
+      realpath: (p) => p,
+    });
+    const fbwIdx = argv.findIndex(
+      (v, i) => v === '--setenv' && argv[i + 1] === 'FORJA_BROKER_WORKER' && argv[i + 2] === '1',
+    );
+    expect(fbwIdx).toBeGreaterThan(-1);
+    // And it lands inside the bwrap arg section (before the `--`
+    // separator), not in the inner argv.
+    const sepIdx = argv.indexOf('--');
+    expect(fbwIdx).toBeLessThan(sepIdx);
+  });
+});
+
 // Slice 155 (review — symlink canonicalization for cwd guard).
 // The literal-string `cwd.startsWith(hiddenAbs)` check pre-slice
 // could be bypassed via a symlink like `/tmp/work → ~/.ssh/audit/`.

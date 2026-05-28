@@ -22,6 +22,7 @@
 //     The patterns are name-shape, not path-prefix.
 
 import { Glob } from 'bun';
+import { createBoundedCache } from './bounded-cache.ts';
 
 // Canonical patterns. Mirror the spec verbatim so a diff against
 // the doc reads cleanly.
@@ -99,12 +100,13 @@ export const SENSITIVE_PATH_DENY_LIST: readonly string[] = [
 //
 // Globs are memoized at module scope: the engine wire calls this
 // matcher in the hot path (every fs-tool call + every bash
-// bypass-mode capability), so the 23 patterns × 2 forms (~46 Glob
+// bypass-mode capability), so the 25 patterns × 2 forms (~50 Glob
 // constructions per fs check) would be a measurable tax otherwise.
-// Pattern strings are short and the cache stays bounded by the
-// union of all distinct patterns the process ever sees (under
-// ~50 entries for realistic workloads).
-const globCache = new Map<string, Glob>();
+// Cap 512 is a safety valve against a future surge in patterns or
+// session-injected variants, not a design constraint on the policy
+// size — realistic workloads stay well under 100 entries.
+const SENSITIVE_PATH_CACHE_CAP = 512;
+const globCache = createBoundedCache<string, Glob>(SENSITIVE_PATH_CACHE_CAP);
 const getGlob = (pattern: string): Glob => {
   let glob = globCache.get(pattern);
   if (glob === undefined) {

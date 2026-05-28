@@ -156,20 +156,33 @@ const NOOP_ROW: EmittedRow = { seq: 0, this_hash: '' };
 // rationale inline for the past-vs-future asymmetry.
 export const AUDIT_TS_FUTURE_SKEW_MS = 60 * 60 * 1000;
 
-// Symmetric past-side skew window: a forged row whose `ts` lands
-// BEFORE the previous row's wall clock is also a forgery shape
-// (drops a row "into the past" of the audit timeline, breaking
-// forensic ordering). Without this guard, an attacker with DB write
-// can insert a row with `ts = previous_row.ts - 86400000` and
+// Past-side skew window: a forged row whose `ts` lands BEFORE the
+// previous row's wall clock is also a forgery shape (drops a row
+// "into the past" of the audit timeline, breaking forensic
+// ordering). Without this guard, an attacker with DB write can
+// insert a row with `ts = previous_row.ts - 86400000` and
 // `verifyChain` accepts it because the hash chain stays intact. The
 // seal doesn't catch this either — sealing is per-decision-count
 // keyed on the hash chain, not on ts monotonic.
 //
-// Window matches the future side (1h) so legitimate NTP smear /
-// suspend-resume time jumps don't trip false positives, but a
-// crafted "back-date by 1 day" row is rejected at emit time AND
-// flagged by `verifyChain` post-hoc.
-export const AUDIT_TS_PAST_SKEW_MS = 60 * 60 * 1000;
+// Asymmetric with the future-side skew (1h): legitimate operator
+// workflows produce backward clock jumps that DWARF NTP smear —
+// closing a laptop overnight (8-12h) and resuming is the dominant
+// shape; a 1h window false-positives on every overnight wake-up,
+// transitioning the engine to `refusing` on the first emit after
+// resume for benign timekeeping. 24h covers wake-from-suspend +
+// post-DST NTP correction + virtual machine clock catch-up after a
+// host migration. Forgery shapes that matter (back-dating by days
+// or years to hide a row inside the "recent history" window of a
+// forensic query) still get caught.
+//
+// The future side stays tight (1h) because forward-dated forgery is
+// strictly more dangerous: a future ts makes a row look "newest" to
+// any tooling sorting by time, and there's no operator workflow
+// that legitimately produces a forward jump > 1h (NTP only smears
+// over short windows; an admin who reset the clock manually has
+// other audit signals to surface the disruption).
+export const AUDIT_TS_PAST_SKEW_MS = 24 * 60 * 60 * 1000;
 
 export const createNoopSink = (): AuditSink => ({
   emit: () => NOOP_ROW,
@@ -193,9 +206,24 @@ export const createNoopSink = (): AuditSink => ({
 // looping) walks `shared` cleanly the second time. This matches
 // JSON.stringify, which silently serializes DAGs and only throws
 // on real cycles.
+//
+// Asymmetry vs `canonical.ts:canonicalize`: canonicalize THROWS
+// on encountering undefined or a non-finite number; this strip
+// SWALLOWS undefined and silently substitutes cycles with null.
+// The choice is deliberate — audit.emit is a critical path
+// (every engine.check writes a row), so we prefer "stable hash
+// over weird input" to "mid-transaction throw". Side effect: two
+// distinct cyclic-args inputs hash to the same args_hash because
+// both collapse to a null stand-in at the cycle point. Model
+// emissions don't produce cyclic JSON in practice (the LLM emits
+// JSON-serializable args), so this is a defensive convergence,
+// not a forensic risk class operators should track. If a future
+// tool surfaces cycles, the right fix is to wire the tool to
+// detect + reject upstream rather than thread bigger semantics
+// through audit emit.
 const stripUndefined = (value: unknown, seen: WeakSet<object> = new WeakSet()): unknown => {
   if (value === null || typeof value !== 'object') return value;
-  if (seen.has(value as object)) return null; // true cycle → null stand-in (JSON.stringify would throw; the chain hash needs a stable payload, not a throw)
+  if (seen.has(value as object)) return null; // true cycle → null stand-in (see asymmetry note above)
   seen.add(value as object);
   let out: unknown;
   if (Array.isArray(value)) {

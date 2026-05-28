@@ -1127,17 +1127,18 @@ $ forja doctor
 
 Forja health check
 ──────────────────
-OS:                  Linux 6.18 Manjaro                       OK
-User namespaces:     enabled                                  OK
-Sandbox binary:      bwrap 0.10.0 (/usr/bin/bwrap)            OK
-Net filtering:       nftables 1.0.9                           OK
-SELinux/AppArmor:    apparmor (complain mode)                 WARN
-Capability profile:  cwd-rw-net selectable                    OK
-Policy load:         enterprise=none user=ok project=ok       OK
-Hash chain:          intact (seq 4821, last seal 4h ago)      OK
-External sealing:    rfc3161-tsa (last success 4h ago)        OK
-Classifier:          v0.3 (last response 142ms)               OK
-Engine state:        ready                                    OK
+OS:                   Linux 6.18 Manjaro                       OK
+User namespaces:      enabled                                  OK
+Sandbox binary:       bwrap 0.10.0 (/usr/bin/bwrap)            OK
+Net filtering:        nftables 1.0.9                           OK
+SELinux/AppArmor:     apparmor (complain mode)                 WARN
+Capability profile:   cwd-rw-net selectable                    OK
+Policy load:          enterprise=none user=ok project=ok       OK
+Hash chain:           intact (seq 4821, last seal 4h ago)      OK
+Sandbox enforcement:  bwrap available; broker resolves to spawn OK
+External sealing:     rfc3161-tsa (last success 4h ago)        OK
+Classifier:           v0.3 (last response 142ms)               OK
+Engine state:         ready                                    OK
 
 Capability ceiling: [ro, cwd-rw, cwd-rw-net, home-rw, host]
 Engine version: 2.0.1
@@ -1146,6 +1147,13 @@ Conformance suite:  142/142 passing (last run 2d ago)
 Warnings:
   - AppArmor in complain mode; consider enforce for stronger isolation
 ```
+
+**Check `sandbox_enforcement`** (slice review-broker-default). Distinto do `sandbox binary` check (que reporta apenas presença do binário). Esse check responde: "bash spawns ESTÃO sendo wrapped na boot atual?". Re-probe `detectSandboxAvailability` localmente — não confia no status do check anterior porque `sandbox binary` retorna `warn` tanto para binary-absent quanto para non-canonical-but-present (implicações de enforcement diferentes). Saída:
+
+- `ok` quando sandbox binary presente → broker default resolve pra spawn → bash wrapped.
+- `warn` quando sandbox binary ausente → broker default cai pra in-process → engine permission floors são a única defesa.
+
+Operador que força `--broker in-process` em host com sandbox disponível NÃO é detectado por esse check (doctor é standalone — não tem CLI args da sessão real). O REPL banner §UI 4.10.9 surfaceia esse override no boot via `SandboxEnforcementSnapshot` (próximo §13.7).
 
 `--json` para parse por hooks externos. Exit code != 0 se qualquer check `FAIL`; warnings não falham. Checks críticos sempre live; não-críticos (versões de kernel/pkg) com cache de 60s.
 
@@ -1265,6 +1273,57 @@ Justificativa:
 - **Worker killable.** Tool travado não trava main.
 
 Trade-off: latência (spawn de worker custa ~10ms em Linux). Aceitável; comparável ao que harness já gasta em IO/LLM.
+
+#### 13.7.1 Broker mode resolver (default dinâmico)
+
+O CLI suporta dois modos:
+
+- **`in-process`** — broker executa worker logic dentro do main process. Cheap (~0 spawn latency), mas worker NÃO está em processo separado wrapped por bwrap. Engine permission floors são a única defesa.
+- **`spawn`** — broker forka um worker child wrapped pelo sandbox tool (bwrap no Linux, sandbox-exec no macOS). Isolation real ao custo de ~10ms por call.
+
+**Default = `spawn` quando sandbox tool está disponível** (slice review-broker-default). Resolução em `bootstrap.ts`:
+
+```ts
+const sandboxAvail = detectSandboxAvailability();
+const resolvedBrokerMode =
+  input.brokerMode ?? (sandboxAvail.available ? 'spawn' : 'in-process');
+```
+
+Operator pode forçar `--broker in-process` em host com sandbox disponível (debugging / perf testing); nesse caso o REPL banner surfaceia warning `operator-override` (§13.7.3).
+
+**Compiled binary (`bun build --compile`).** O caminho `import.meta.dir` começa com `/$bunfs/` em runtime. Worker self-execa via `process.execPath` com env `FORJA_BROKER_WORKER=1`; `src/cli/index.ts` checa essa env no boot e despacha pra `runWorkerProcess()` antes de qualquer outra init — sem temp files, sem second binary, sem asset extraction.
+
+#### 13.7.2 `SandboxEnforcementSnapshot`
+
+Após resolver o broker mode, bootstrap calcula um snapshot:
+
+```ts
+type SandboxEnforcementSnapshot =
+  | { active: true;  tool: 'bwrap' | 'sandbox-exec'; reason: 'active' }
+  | { active: false; tool: null;                     reason: 'no-tool' }
+  | { active: false; tool: 'bwrap' | 'sandbox-exec'; reason: 'operator-override' }
+  | { active: false; tool: null;                     reason: 'degraded-passthrough' };
+```
+
+| `reason` | Quando |
+|---|---|
+| `active` | broker resolveu pra spawn + sandbox tool presente; bash spawns wrapped |
+| `no-tool` | sandbox tool ausente; broker caiu pra in-process |
+| `operator-override` | tool presente mas operator forçou `--broker in-process` |
+| `degraded-passthrough` | broker spawn mas tool sumiu/falhou; passthrough sem wrap |
+
+Snapshot é parte de `BootstrapResult`. REPL consome no boot pra emitir o status correto. Discriminator union com exhaustive `switch` (default `never`) garante coverage compile-time de novos estados.
+
+#### 13.7.3 Integração com REPL banner
+
+O banner (§UI 4.10.9) renderiza o snapshot diferenciado por estado:
+
+- **`active`** — terceira linha inline no `session-banner` (sem leading blank), paint `secondary`: `✓ sandbox enforcement active (<tool>)`. Posture afirmativa, parte do frame.
+- **`no-tool`** — evento separado `warn` (com leading blank), instrução pra rodar `forja sandbox setup`.
+- **`operator-override`** — `warn` separado, explicação de que `--broker in-process` desabilitou wrap.
+- **`degraded-passthrough`** — `error` separado, instrução pra rodar `forja doctor`.
+
+A linha afirmativa fica DENTRO do banner pra não competir com warnings que precisam de emphasis; os três estados degradados ficam FORA, com leading blank, pra ler como alerta.
 
 ### 13.8 Health re-check contínuo
 

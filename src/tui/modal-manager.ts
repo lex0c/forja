@@ -24,7 +24,6 @@
 // drains FIFO when a prior modal resolves.
 
 import type { PolicyLayer } from '../permissions/index.ts';
-import { sanitizeOneLineForDisplay } from '../sanitize/index.ts';
 import type { Bus } from './bus.ts';
 import type { UIEvent } from './events.ts';
 import type { FocusHandler, FocusStack } from './focus-stack.ts';
@@ -36,6 +35,12 @@ interface Pending<Answer extends string = string> {
   open: () => string; // emits the *:ask event with a fresh promptId, returns the id
   resolve: (answer: Answer) => void;
   options: readonly ConfirmOption[];
+  // Initial cursor position. Defaults to last option (D5/D65
+  // conservative-choice convention) when undefined. Permission
+  // flavor overrides to 0 (Yes) per operator UX call — the modal
+  // is short enough that the safety-default ergonomics weren't
+  // worth the extra keystroke for the dominant case.
+  defaultIndex?: number;
   // Optional timeout handle so we can clear it on early resolve.
   timeout: unknown;
   // Detach the producer-signal abort listener on early resolve.
@@ -77,12 +82,6 @@ export interface PermissionAskArgs {
   command: string;
   cwd: string;
   rule?: string;
-  // Pattern the bridge would promote on session-allow. Drives
-  // option 2's "Yes, don't ask again for: <X>" label. Distinct
-  // from `rule` so the matched-rule attribution line stays
-  // accurate (only renders when a real rule fired). See
-  // PermissionAskEvent.sessionAllowTarget for the full contract.
-  sessionAllowTarget?: string;
   reason?: string;
   // Layer that holds the matching rule (PolicyLayer). When set
   // alongside `rule`, the reducer renders "matched rule: <rule>
@@ -277,53 +276,38 @@ const CRITIQUE_OPTIONS: readonly ConfirmOption[] = [
 // moveSelection) and the reducer (renders the labels via state).
 // Exported so the reducer's `permission:ask` case calls the same
 // builder — without a single source, the manager's count and the
-// reducer's labels could drift on a future field addition (e.g.
-// adding a fourth option) and break the cursor's clamp.
+// reducer's labels could drift on a future field addition and
+// break the cursor's clamp.
 //
-// Option 2 promotes the matched policy rule into the label so the
-// operator reads a literal scope ("don't ask again for: rm -rf *")
-// instead of an ambiguous "all bash during this session" — that
-// older wording sounded like a runtime toggle, but the semantics
-// are an actual policy promotion. When `rule` is absent (synthesized
-// asks, subagent-proxied confirms before IPC marshals source) the
-// label falls back to the per-tool wording — same shape, less
-// information, never a crash.
-export const buildPermissionOptions = (
-  toolName: string,
-  sessionAllowTarget?: string,
-): ConfirmOption[] => {
-  // sessionAllowTarget can carry raw tool args (e.g. args.command
-  // for bash compound confirms or catch-all overrides). The model
-  // can pack newlines, ANSI escapes, or other control bytes that
-  // would corrupt the modal layout if interpolated verbatim into
-  // the option label — split across rows, paint fake colors,
-  // hide text, etc. Sanitize at the interpolation site so the
-  // engine still receives the RAW pattern via the bridge's
-  // separate addSessionAllow call (matching depends on the literal
-  // string — sanitizing for the engine would break future
-  // matches).
-  const sessionLabel =
-    sessionAllowTarget !== undefined && sessionAllowTarget.length > 0
-      ? `Yes, don't ask again for: ${sanitizeOneLineForDisplay(sessionAllowTarget)}`
-      : `Yes, allow all ${toolName} during this session`;
-  return [
-    { key: '1', label: 'Yes', value: 'yes' },
-    {
-      key: '2',
-      label: sessionLabel,
-      value: 'session-allow',
-      shortcut: 'shift+tab',
-    },
-    { key: '3', label: 'No', value: 'no' },
-  ];
-};
+// Two options today: Yes / No. The previous "session-allow"
+// option was removed — promoting a rule onto the engine's
+// in-memory allowlist mid-modal lets an operator widen authority
+// without a chance to revoke for the rest of the session, and
+// every operator who needs that workflow can edit
+// `.agent/permissions.yaml` (or run `/perms` slash commands when
+// they land) with the full layered policy view in front of them.
+// `engine.addSessionAllow` stays on the API surface for those
+// non-modal paths.
+export const buildPermissionOptions = (): ConfirmOption[] => [
+  { key: '1', label: 'Yes', value: 'yes' },
+  { key: '2', label: 'No', value: 'no' },
+];
+
+// Permission flavor's initial cursor position. Single source of
+// truth for BOTH (a) the manager's `drain()`, which determines what
+// Enter resolves to, and (b) the reducer's `permission:ask` case,
+// which determines where the cursor renders. Without this shared
+// constant the two sides could drift on a flip and the operator
+// would see the cursor on one option while Enter resolved the
+// other — silent but catastrophic on a security modal.
+export const PERMISSION_DEFAULT_SELECTED_INDEX = 0;
 
 export interface ModalManager {
   // Permission flavor. Returns the user's choice (or 'cancel' on Esc /
   // close / timeout). Callers translate semantics: yes → execute,
-  // session-allow → execute + promote the matched rule onto the
-  // engine's in-memory session-allowlist (so the next matching call
-  // skips the modal), no/cancel → deny.
+  // no/cancel → deny. Session-scoped promotion (was option 2)
+  // shipped via the engine's addSessionAllow API only — never from
+  // inside the modal flow.
   askPermission: (args: PermissionAskArgs, opts?: ConfirmAskOptions) => Promise<PermissionAnswer>;
   // Trust flavor. Returns the operator's choice (or 'cancel' on Esc /
   // close / timeout). Caller (REPL boot) translates: yes → persist
@@ -449,8 +433,14 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
     const next = queue.shift();
     if (next === undefined) return;
     const promptId = next.open();
-    // Default selectedIndex = last option (conservative choice).
-    active = { promptId, selectedIndex: next.options.length - 1, pending: next };
+    // Default selectedIndex = last option (D5/D65 conservative
+    // choice). Per-flavor override flows via `pending.defaultIndex`
+    // — permission flavor uses 0 (Yes) so the dominant accept-the-
+    // call workflow doesn't require an extra keystroke.
+    const max = next.options.length - 1;
+    const requested = next.defaultIndex ?? max;
+    const initialIndex = Math.max(0, Math.min(max, requested));
+    active = { promptId, selectedIndex: initialIndex, pending: next };
     // Initial queue-depth snapshot for the just-opened modal. The
     // event MUST fire AFTER `next.open()` so the reducer has
     // already created the modal slot before this update lands —
@@ -567,9 +557,9 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
     // Emit the answer event BEFORE resolving the promise so any
     // listener (audit, telemetry) sees the resolution before the
     // caller's `.then` runs. `decision` is a flavor-specific string
-    // — `permission` uses 'yes'/'session-allow'/'no'/'cancel',
-    // `plan-review` uses 'yes'/'edit'/'no'/'cancel', etc. Consumers
-    // narrow per-flavor by reading the original `*:ask` event.
+    // — `permission` uses 'yes'/'no'/'cancel', `plan-review` uses
+    // 'yes'/'edit'/'no'/'cancel', etc. Consumers narrow per-flavor
+    // by reading the original `*:ask` event.
     bus.emit({
       type: 'modal:answer',
       ts: now(),
@@ -586,6 +576,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
     optionsList: readonly ConfirmOption[],
     timeoutMs: number | undefined,
     signal: AbortSignal | undefined,
+    defaultIndex?: number,
   ): Promise<Answer> =>
     new Promise<Answer>((resolve) => {
       // Already-closed manager: resolve immediately as 'cancel' so
@@ -603,6 +594,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
         resolve,
         options: optionsList,
         timeout: null,
+        ...(defaultIndex !== undefined ? { defaultIndex } : {}),
       };
       queue.push(pending as Pending);
       // Live update for an existing modal: a new ask just landed
@@ -722,16 +714,19 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           command: args.command,
           cwd: args.cwd,
           ...(args.rule !== undefined ? { rule: args.rule } : {}),
-          ...(args.sessionAllowTarget !== undefined
-            ? { sessionAllowTarget: args.sessionAllowTarget }
-            : {}),
           ...(args.layer !== undefined ? { layer: args.layer } : {}),
           ...(args.reason !== undefined ? { reason: args.reason } : {}),
           ...(args.subagent !== undefined ? { subagent: args.subagent } : {}),
         }),
-        buildPermissionOptions(args.toolName, args.sessionAllowTarget),
+        buildPermissionOptions(),
         opts?.timeoutMs,
         opts?.signal,
+        // Permission flavor overrides D5/D65's "last = safe"
+        // default — accept-the-call is the dominant workflow on a
+        // small modal and operators don't want the extra keystroke.
+        // Other flavors keep the last-option default by omitting
+        // this argument.
+        PERMISSION_DEFAULT_SELECTED_INDEX,
       ),
     askTrust: (args, opts) =>
       enqueueConfirm<TrustAnswer>(

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -1543,5 +1543,62 @@ describe('preflightPermissionEngine — home parameter (slice 109, R8 #323)', ()
       now: () => 1,
     });
     expect(r.resolved.policy).toBeDefined();
+  });
+});
+
+// Code-review finding #1: cwd that prefixes a symlink (firmlinks on
+// macOS, /tmp/projlink → /actual/proj, managed-NFS layouts) leaked
+// the lexical form into matcher / resolver / protected-paths because
+// only the sandbox runner canonicalized cwd (slice 155). The engine-
+// side gap caused:
+//   - matcher.matchPathPrepared default-deny on rules that should
+//     match (lexical absCwd vs canonical realpath'd target → null
+//     relativize → fallback abs glob misses).
+//   - bash.detectCwdScopeEscape returning true on every call
+//     (lexical-inside vs canonical-outside) → confidence='low' →
+//     confirm-on-every-tool.
+// Fix: bootstrap canonicalizes cwd + home at entry; resolvers /
+// engine see the same physical path as the sandbox runner.
+describe('bootstrapPermissionEngine — cwd canonicalization (review #1)', () => {
+  test('symlinked cwd: allow_paths against cwd-relative pattern matches', async () => {
+    // Create a real dir + symlink under tmpRoot.
+    const realDir = mkdtempSync(join(tmpRoot, 'real-'));
+    mkdirSync(join(realDir, 'src'));
+    writeFileSync(join(realDir, 'src', 'auth.ts'), 'export {};');
+    const linkDir = join(tmpRoot, 'linkdir');
+    symlinkSync(realDir, linkDir);
+
+    // Pin a session policy whose allow_paths is cwd-relative. Pre-fix
+    // the matcher compiled the pattern against lexical linkDir while
+    // realpath of the target collapsed to realDir — relativize against
+    // the lexical cwd returned null and the fallback abs match failed.
+    // Result: default-deny on a path that should match.
+    const r = await bootstrapPermissionEngine(
+      baseInput({
+        cwd: linkDir,
+        sessionPolicy: {
+          defaults: { mode: 'strict' },
+          tools: { read_file: { allow_paths: ['src/**'] } },
+        },
+      }),
+    );
+    expect(r.state).toBe('ready');
+
+    // Engine should allow the read — pattern compiled against the
+    // canonical cwd, target realpath agrees.
+    const decision = r.engine.check('read_file', 'fs.read', {
+      path: join(linkDir, 'src', 'auth.ts'),
+    });
+    expect(decision.kind).toBe('allow');
+  });
+
+  test('non-existent cwd falls back to the lexical input (back-compat)', async () => {
+    // Tests that build engines against synthetic cwds (the project's
+    // historical baseInput passes `/work/proj` which doesn't exist
+    // on the runner FS) must keep working. realpathSync throws ENOENT;
+    // the bootstrap silently falls back to the lexical form so the
+    // engine still constructs and answers checks.
+    const r = await bootstrapPermissionEngine(baseInput({ cwd: '/work/proj' }));
+    expect(r.state).toBe('ready');
   });
 });
