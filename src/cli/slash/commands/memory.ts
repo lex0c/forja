@@ -1236,7 +1236,30 @@ const handleSeeds = (registry: MemoryRegistry, ctx: SlashContext, args: string[]
   // registry's user/seeds snapshot, so iterating registry listings
   // would hide exactly the entries this subcommand is supposed to
   // surface. The canonical catalog is the source of truth for "what
-  // could be installed"; the sentinel decides "what currently is".
+  // could be installed"; the sentinel + on-disk presence decide
+  // "what currently is".
+  //
+  // Three-state classification (active / disabled / absent), in
+  // priority order:
+  //
+  //   - disabled — sentinel names the seed; opt-out wins regardless
+  //                of body presence (operator could have deleted the
+  //                body while disabled; disable's contract is the
+  //                strongest signal).
+  //   - absent   — no sentinel AND no body on disk. Three sub-cases
+  //                land here: (a) operator ran `agent init
+  //                --no-seeds`, (b) operator never ran `agent init`
+  //                at all, (c) operator deleted the body manually
+  //                post-install (installer routes through user_kept
+  //                with the manifest preserved; the body never
+  //                returns until the operator re-runs `enable` or
+  //                hand-edits the manifest). In all three cases the
+  //                seed is NOT in the registry's user/seeds snapshot
+  //                and NOT in the model's prompt assembly — listing
+  //                them as `active` would mislead.
+  //   - active   — no sentinel AND body on disk. The seed is in the
+  //                loaded set and the model sees it on every prompt
+  //                assembly.
   if (sub === 'list') {
     if (args.length > 1) {
       return {
@@ -1248,16 +1271,38 @@ const handleSeeds = (registry: MemoryRegistry, ctx: SlashContext, args: string[]
     const notes: string[] = [];
     let activeCount = 0;
     let disabledCount = 0;
+    let absentCount = 0;
     for (const seed of CANONICAL_SEEDS) {
-      const isDisabled = isSeedDisabled(disabledMap, seed.name);
-      if (isDisabled) disabledCount += 1;
-      else activeCount += 1;
-      const stateMarker = isDisabled ? 'disabled' : 'active  ';
+      let stateMarker: string;
+      if (isSeedDisabled(disabledMap, seed.name)) {
+        disabledCount += 1;
+        stateMarker = 'disabled';
+      } else if (!existsSync(seedMemoryFilePath(registry.roots, seed.name))) {
+        absentCount += 1;
+        stateMarker = 'absent  ';
+      } else {
+        activeCount += 1;
+        stateMarker = 'active  ';
+      }
       notes.push(`  [${stateMarker}] ${seed.name} — ${seed.description}`);
     }
-    notes.unshift(
-      `vendor seeds: ${activeCount} active, ${disabledCount} disabled (of ${CANONICAL_SEEDS.length} canonical)`,
-    );
+    // The `absent` total appends only when non-zero — matches the
+    // `, K archived` suffix convention in the init summary so the
+    // post-install steady-state output keeps the two-counter shape
+    // operators already memorized.
+    const totals = [`${activeCount} active`, `${disabledCount} disabled`];
+    if (absentCount > 0) totals.push(`${absentCount} absent`);
+    notes.unshift(`vendor seeds: ${totals.join(', ')} (of ${CANONICAL_SEEDS.length} canonical)`);
+    if (absentCount > 0) {
+      // Recovery hint only fires when there's something to recover.
+      // Naming `agent init` rather than `agent init --only=seeds`
+      // because the operator's first install is the common path;
+      // the `--only=seeds` form is for post-init catalog refreshes
+      // already documented in the disable+delete recovery line.
+      notes.push(
+        '  absent = not installed yet; run `agent init` (or `agent init --only=seeds`) to land them',
+      );
+    }
     return { kind: 'ok', notes };
   }
 

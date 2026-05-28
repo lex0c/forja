@@ -2,6 +2,31 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-28] seed memory — `/memory seeds list` distinguishes `absent` from `active`
+
+Bug fix on top of slice 5b. The `list` subcommand classified every non-disabled canonical seed as `active` based only on the `.disabled.json` sentinel — but a seed can be ABSENT from the loaded set without ever being in the sentinel. Three cases land in `absent`:
+
+1. Operator ran `agent init --no-seeds` (sixth scaffold step skipped → bodies never written).
+2. Operator never ran `agent init` at all (bootstrap by itself does not install — moved out in an earlier commit on this branch).
+3. Operator deleted a body manually post-install (installer routes through `user_kept` with the prior manifest preserved → body stays gone, registry doesn't see it).
+
+In all three the seed is NOT in the registry's user/seeds snapshot and NOT in the model's prompt assembly. Pre-fix the slash reported them as `active`, misleading both the header counts and the per-row state.
+
+**Branch:** continued on `feat/memory-seeds`.
+
+**Shipped on this branch:**
+
+- **`src/cli/slash/commands/memory.ts`** (`handleSeeds` list branch) — three-state classification derived from `(isSeedDisabled, existsSync(seedMemoryFilePath))` in priority order `disabled → absent → active`. Header totals carry the third counter only when non-zero (matches the `, K archived` suffix convention so the post-install steady-state output keeps the two-counter shape operators already memorized). When absent > 0 a recovery hint appends pointing at `agent init` (or `agent init --only=seeds` for catalog refreshes after an existing init).
+
+- **`tests/cli/slash/memory.test.ts`** — the existing `seeds list enumerates every canonical seed with active state by default` test was asserting the buggy behavior (no install + `active`). It is replaced by three tests that pin the three baselines:
+  - `seeds list reports every canonical seed as 'absent' when nothing is installed` (with the recovery hint asserted);
+  - `seeds list reports every canonical seed as 'active' post-install (no opt-outs)` (header omits the absent counter; recovery hint absent);
+  - `seeds list reports a body-deleted seed as 'absent', not 'active', even when no sentinel exists` (pins case 3 — operator manual delete after install).
+
+- **`docs/MEMORY.md` §7.5** — the operator workflow paragraph that introduces `/memory seeds list` now names the three states explicitly and notes the conditional `absent` counter + recovery hint.
+
+**Tests + validation:** `bun run typecheck` clean, `bun run lint` clean. `bun test tests/cli/slash/memory.test.ts` → 236 pass; adjacent (`tests/memory/seeds-*.test.ts tests/cli/init-seeds.test.ts tests/cli/memory.test.ts`) → 61 pass, no regression.
+
 ## [2026-05-28] seed memory — `[seed]` marker on every operator-facing list surface (spec §5.7.3 parity fix)
 
 Visibility fix surfaced by the post-slice-5b audit. The eager-load surface (`assembleMemorySection` in `src/cli/memory-prompt.ts:315`) already attached a `[seed]` marker to vendor-curated entries since slice 7, but two operator-facing surfaces did not: the slash `/memory list` and the headless `agent --memory list` CLI (table + JSON). An operator inspecting their memory inventory via either surface had no way to tell vendor meta-behavior apart from their own user-scope writes without inspecting filesystem paths or running shell ad-hoc against `<user>/seeds/`.

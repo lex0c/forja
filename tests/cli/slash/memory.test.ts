@@ -4174,7 +4174,16 @@ describe('/memory delete — seed dispatch (slice-7 review fix #1)', () => {
 // sentinel and re-runs `installVendorSeeds` so the on-disk index +
 // the in-memory registry reflect the change immediately.
 describe('/memory seeds — per-seed opt-out (spec §5.7.6)', () => {
-  test('seeds list enumerates every canonical seed with active state by default', async () => {
+  test('seeds list reports every canonical seed as `absent` when nothing is installed', async () => {
+    // Pre-fix behavior was to label every non-disabled seed as
+    // `active` regardless of whether the body lived at <user>/seeds/.
+    // After `agent init --no-seeds` (or a session where init was
+    // never run), the canonical bodies do NOT exist on disk and the
+    // registry's user/seeds snapshot is empty — so the model never
+    // sees them in prompt assembly. Calling them "active" misled
+    // both the header counts and the per-row state. The fix
+    // classifies each seed as `active` / `disabled` / `absent` from
+    // the (sentinel, body-presence) pair.
     const repo = makeTmp();
     const { ctx } = makeCtx(repo);
     const { CANONICAL_SEEDS } = await import('../../../src/cli/init-seeds/index.ts');
@@ -4182,12 +4191,75 @@ describe('/memory seeds — per-seed opt-out (spec §5.7.6)', () => {
     expect(r.kind).toBe('ok');
     if (r.kind !== 'ok') return;
     const text = (r.notes ?? []).join('\n');
-    // Header line carries the active/disabled totals.
-    expect(text).toContain(`${CANONICAL_SEEDS.length} active, 0 disabled`);
-    // Every canonical seed is named in the body.
+    // Header: zero active, zero disabled, all absent.
+    expect(text).toContain(
+      `0 active, 0 disabled, ${CANONICAL_SEEDS.length} absent (of ${CANONICAL_SEEDS.length} canonical)`,
+    );
+    // Recovery hint fires when absent > 0.
+    expect(text).toContain('`agent init`');
+    // Every canonical seed is named in the body AND tagged `absent`.
     for (const seed of CANONICAL_SEEDS) {
-      expect(text).toContain(seed.name);
+      expect(text).toContain(`[absent  ] ${seed.name}`);
     }
+  });
+
+  test('seeds list reports every canonical seed as `active` post-install (no opt-outs)', async () => {
+    const repo = makeTmp();
+    const { ctx, registry } = makeCtx(repo);
+    const { CANONICAL_SEEDS } = await import('../../../src/cli/init-seeds/index.ts');
+    const { installVendorSeeds } = await import('../../../src/memory/seeds-installer.ts');
+    installVendorSeeds({ roots: registry.roots });
+    const r = await memoryCommand.exec(['seeds', 'list'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = (r.notes ?? []).join('\n');
+    // Post-install steady state: header omits the `absent` counter
+    // (matches the `, K archived` convention — counter appears only
+    // when non-zero so the post-install output keeps the two-counter
+    // shape operators already memorized).
+    expect(text).toContain(
+      `${CANONICAL_SEEDS.length} active, 0 disabled (of ${CANONICAL_SEEDS.length} canonical)`,
+    );
+    expect(text).not.toContain('absent');
+    // Recovery hint omitted (nothing absent to recover).
+    expect(text).not.toContain('`agent init`');
+    // Every seed tagged active.
+    for (const seed of CANONICAL_SEEDS) {
+      expect(text).toContain(`[active  ] ${seed.name}`);
+    }
+  });
+
+  test('seeds list reports a body-deleted seed as `absent`, not `active`, even when no sentinel exists', async () => {
+    // Operator installs the catalog, then manually deletes one body
+    // (e.g., tidying up <user>/seeds/ without going through `disable`).
+    // The installer routes that name through `user_kept` on the next
+    // pass (body absent + prior manifest preserved → no reinstall),
+    // so the body stays gone and the registry doesn't see it. The
+    // list MUST surface it as `absent` so the operator can tell the
+    // canonical seed is not currently loaded.
+    const repo = makeTmp();
+    const { ctx, registry } = makeCtx(repo);
+    const { CANONICAL_SEEDS } = await import('../../../src/cli/init-seeds/index.ts');
+    const { installVendorSeeds } = await import('../../../src/memory/seeds-installer.ts');
+    const { seedMemoryFilePath } = await import('../../../src/memory/paths.ts');
+    installVendorSeeds({ roots: registry.roots });
+    const target = CANONICAL_SEEDS[0];
+    if (target === undefined) throw new Error('CANONICAL_SEEDS unexpectedly empty');
+    const { unlinkSync } = await import('node:fs');
+    unlinkSync(seedMemoryFilePath(registry.roots, target.name));
+    const r = await memoryCommand.exec(['seeds', 'list'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = (r.notes ?? []).join('\n');
+    // One absent, rest active.
+    expect(text).toContain(
+      `${CANONICAL_SEEDS.length - 1} active, 0 disabled, 1 absent (of ${CANONICAL_SEEDS.length} canonical)`,
+    );
+    expect(text).toContain(`[absent  ] ${target.name}`);
+    // Other seeds still active.
+    const other = CANONICAL_SEEDS[1];
+    if (other === undefined) throw new Error('CANONICAL_SEEDS unexpectedly < 2');
+    expect(text).toContain(`[active  ] ${other.name}`);
   });
 
   test('seeds disable <name> writes sentinel + drops body from registry/list', async () => {

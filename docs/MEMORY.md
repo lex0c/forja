@@ -585,7 +585,7 @@ $ agent init --no-seeds          # scaffold everything except the seed step
 
 The `vendor_updated` path applies bumps silently for seeds the operator has not edited; the `user_kept` path preserves operator customizations across upgrades. The interactive `[k]eep / [v]iew / [a]ccept / [m]erge` modal for the divergence case is deferred to a follow-up slice — today the conservative `user_kept` default is applied and the operator can pull the new vendor body manually by deleting the local copy and re-running `agent init --only=seeds`.
 
-**Per-seed opt-out.** When a single seed conflicts with the operator's workflow, the sentinel-based opt-out keeps the rest of the pack active:
+**Per-seed opt-out.** When a single seed conflicts with the operator's workflow, the sentinel-based opt-out keeps the rest of the pack active. `/memory seeds list` classifies each canonical seed as `active` (no sentinel + body on disk), `disabled` (sentinel naming it), or `absent` (no sentinel + body NOT on disk — happens when the operator ran `agent init --no-seeds`, never ran init at all, or deleted the body manually). The `absent` counter and recovery hint appear only when at least one seed is absent.
 
 ```bash
 $ /memory seeds list
