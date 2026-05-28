@@ -977,4 +977,51 @@ describe('assembleMemorySection — seeds end-to-end (spec §5.7.3)', () => {
     expect(result.text).toMatch(/^- \[user\] no-fabrication \[seed\] — verify before claim$/m);
     expect(result.entryCount).toBe(2);
   });
+
+  test('untrusted user-top shadow does NOT drop the trusted seed (review fix: filter-before-dedupe)', async () => {
+    // Reported bug: assembleMemorySection iterates registry.list()
+    // and called peek(name, { scope }) — without subdir. When a
+    // user-top entry shadows a seed of the same name, peek for the
+    // seed listing resolved back to the user-top body. If the user-
+    // top body had trust: untrusted, the trust filter dropped it,
+    // and because the peek returned the SAME body for the seed
+    // listing, the seed was dropped too. The filter-before-dedupe
+    // contract that should let a trusted lower-precedence entry
+    // survive when the higher-precedence one is filtered was broken.
+    //
+    // Fix: assembleMemorySection now uses `listingScopeOption(l)` so
+    // each listing's re-peek lands on its own snapshot. The user-top
+    // untrusted body is dropped by the filter, but the seed's peek
+    // hits the user/seeds snapshot and the trusted seed body
+    // survives — ending up in the assembled prompt.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const { installVendorSeeds } = await import('../../src/memory/seeds-installer.ts');
+    installVendorSeeds({
+      roots,
+      source: [
+        {
+          filename: 'safe-edit-discipline.md',
+          name: 'safe-edit-discipline',
+          description: 'vendor hook',
+          version: '1.0',
+          content: seedContent('safe-edit-discipline'),
+        },
+      ],
+    });
+    // Operator-authored user-top of the same name, marked untrusted.
+    writeIndex(roots.user, '- [Shadow](safe-edit-discipline.md) — operator shadow\n');
+    writeBody(roots.user, 'safe-edit-discipline', { type: 'feedback', trust: 'untrusted' });
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    // The user-top untrusted body is filtered out (no scope tag for
+    // the shadow). The seed survives BECAUSE the re-peek now hits
+    // user/seeds via listingScopeOption — not the shadowing
+    // user-top body.
+    expect(result.text).not.toContain('operator shadow');
+    expect(result.text).toMatch(
+      /^- \[user\] safe-edit-discipline \[seed\] — vendor hook$/m,
+    );
+    expect(result.entryCount).toBe(1);
+  });
 });

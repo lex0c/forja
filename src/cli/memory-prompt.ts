@@ -5,6 +5,7 @@ import {
   type MemoryFile,
   type MemoryRegistry,
   type MemoryScope,
+  listingScopeOption,
   serializeMemoryFile,
   shouldEagerLoadByTriggers,
 } from '../memory/index.ts';
@@ -245,7 +246,14 @@ export const assembleMemorySection = (
     // (we don't know what's in the file system, so we must NOT
     // surface ANYTHING from that scope to the model).
     if (excludeScopes?.has(l.scope)) continue;
-    const peek = input.registry.peek(l.name, { scope: l.scope });
+    // Pass the full listing identity (scope + subdir) so a seed
+    // listing whose name collides with a user-top entry resolves
+    // to the seed body, not the shadowing top-level file. Without
+    // this, the trust / state / trigger filters below would drop
+    // both the shadow AND the seed, even when the seed itself
+    // satisfies the eager-load contract — defeating the filter-
+    // before-dedupe behavior the prompt assembly depends on.
+    const peek = input.registry.peek(l.name, listingScopeOption(l));
     if (peek.kind !== 'present') {
       eligible.push({ listing: l, file: null }); // uncertainty → include
       continue;

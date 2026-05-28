@@ -110,7 +110,7 @@
 import { sanitizeOneLineForDisplay } from '../sanitize/index.ts';
 import type { DB } from '../storage/db.ts';
 import type { ScopeRoots } from './paths.ts';
-import type { MemoryRegistry } from './registry.ts';
+import { type MemoryRegistry, listingScopeOption } from './registry.ts';
 import { transitionMemoryState } from './transitions.ts';
 import {
   type SharedTrustRow,
@@ -333,7 +333,7 @@ const bulkInvalidateShared = async (
     // it's no longer active, skip silently — the operator's revoke
     // intent is already satisfied for this memory by whoever
     // touched it.
-    const peek = input.registry.peek(listing.name, { scope: listing.scope });
+    const peek = input.registry.peek(listing.name, listingScopeOption(listing));
     if (peek.kind !== 'present') continue;
     const currentState = peek.file.frontmatter.state ?? 'active';
     if (currentState !== 'active') {

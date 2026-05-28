@@ -90,7 +90,7 @@ export {
 } from './loader.ts';
 export type { MemoryFileResult, ScopeIndexResult } from './loader.ts';
 
-export { createMemoryRegistry } from './registry.ts';
+export { createMemoryRegistry, listingScopeOption } from './registry.ts';
 export type {
   AuditOverride,
   CreateMemoryRegistryInput,

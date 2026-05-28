@@ -273,7 +273,33 @@ export interface ListOptions {
 
 export interface ScopeOption {
   scope?: MemoryScope;
+  // Strict subdir filter. When set, only snapshots whose
+  // `snap.subdir === opts.subdir` are considered by lookup / peek /
+  // read. When omitted, the precedence walk includes ALL snapshots
+  // matching the scope filter — which is what the current callers
+  // that pass only `name` (or `name + scope`) expect.
+  //
+  // Callers that iterate `registry.list()` and then re-peek by the
+  // listing's identity must pass this through, because the user
+  // scope carries TWO snapshots (top-level + `seeds`) and a user-
+  // top entry shadowing a seed of the same name would otherwise
+  // resolve the seed listing's peek back to the user-top body. The
+  // `listingScopeOption(listing)` helper below builds the right
+  // option object from a listing without any conditional spread
+  // gymnastics at call sites.
+  subdir?: MemorySubdir;
 }
+
+// Build a strict `ScopeOption` from a listing so re-peeks resolve
+// to the same snapshot the listing came from. Centralizes the
+// conditional spread needed under `exactOptionalPropertyTypes`
+// (passing `subdir: undefined` is not the same as omitting the
+// key, so callers can't just spread `listing` directly).
+export const listingScopeOption = (listing: MemoryListing): ScopeOption => {
+  const opt: ScopeOption = { scope: listing.scope };
+  if (listing.subdir !== undefined) opt.subdir = listing.subdir;
+  return opt;
+};
 
 // Audit attribution overrides. When these are set on a per-call
 // option object, they win over the registry's constructor-
@@ -610,7 +636,11 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
     return out;
   };
 
-  const findListing = (name: string, scope?: MemoryScope): MemoryListing | null => {
+  const findListing = (
+    name: string,
+    scope?: MemoryScope,
+    subdir?: MemorySubdir,
+  ): MemoryListing | null => {
     // Iterate every snapshot whose scope matches the filter (or all,
     // when scope is undefined). The user scope now contains TWO
     // snapshots (top-level + seeds subdir), so pinning the scope
@@ -618,8 +648,20 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
     // user-seeds when the top-level user snapshot doesn't carry
     // the name. Precedence is preserved because snapshots are in
     // precedence order (user-top precedes user-seeds).
+    //
+    // When `subdir` is set, the walk is strict: only snapshots
+    // with matching `snap.subdir` qualify. This lets a caller that
+    // holds a listing (and therefore knows the snapshot it came
+    // from) re-peek the same body even when a higher-precedence
+    // snapshot shadows the name. Without the filter, a seed listing
+    // whose name collides with a user-top entry would resolve back
+    // to the user-top body, defeating the filter-before-dedupe
+    // contract that lets a lower-precedence trusted entry survive
+    // when the higher-precedence one was filtered out (e.g., an
+    // untrusted user-top shadowing a trusted seed).
     for (const snap of snapshots) {
       if (scope !== undefined && snap.scope !== scope) continue;
+      if (subdir !== undefined && snap.subdir !== subdir) continue;
       for (const entry of snap.entries) {
         // We compare against the name derived from href (the
         // canonical id), NOT entry.title — title is human-facing
@@ -842,11 +884,11 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
     },
 
     lookup(name, opts: ScopeOption = {}): MemoryListing | null {
-      return findListing(name, opts.scope);
+      return findListing(name, opts.scope, opts.subdir);
     },
 
     read(name, opts: ReadOptions = {}): RegistryReadResult {
-      const listing = findListing(name, opts.scope);
+      const listing = findListing(name, opts.scope, opts.subdir);
       if (listing === null) return { kind: 'unknown' };
       const fileResult = readForListing(listing);
       if (fileResult.kind === 'present') {
@@ -882,9 +924,10 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
     peek(name, opts: ScopeOption = {}): RegistryReadResult {
       // Mirrors `read` but skips `auditRead`. Same lookup
       // semantics (precedence walk if `opts.scope` absent, strict
-      // single-scope when set). Same discriminated outcome shape
-      // so callers can branch identically.
-      const listing = findListing(name, opts.scope);
+      // single-scope when set, strict single-subdir when set).
+      // Same discriminated outcome shape so callers can branch
+      // identically.
+      const listing = findListing(name, opts.scope, opts.subdir);
       if (listing === null) return { kind: 'unknown' };
       const fileResult = readForListing(listing);
       if (fileResult.kind === 'present') {

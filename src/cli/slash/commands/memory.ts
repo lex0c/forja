@@ -40,6 +40,7 @@ import {
   isExpired,
   isSeedDisabled,
   listSharedCorpusFiles,
+  listingScopeOption,
   loadDisabledSeeds,
   loadSeedManifest,
   moveMemory,
@@ -365,7 +366,10 @@ const handleList = (registry: MemoryRegistry, ctx: SlashContext, args: string[])
     // the rendered list. Suffix order matches the eager-load
     // (after the name, before expires).
     const seedSuffix = l.subdir === 'seeds' ? ' [seed]' : '';
-    const peek = registry.peek(l.name, { scope: l.scope });
+    // Pass the full listing identity so a seed listing whose name
+    // collides with a user-top entry surfaces the seed body for
+    // state/expires inspection, not the shadowing top-level body.
+    const peek = registry.peek(l.name, listingScopeOption(l));
     if (peek.kind === 'unknown' || peek.kind === 'missing') {
       lines.push(`  [${l.scope}] [ORPHAN] ${l.name}${seedSuffix} — ${l.entry.hook}`);
       continue;

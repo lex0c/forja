@@ -119,6 +119,66 @@ describe('createMemoryRegistry — list', () => {
     // alpha disabled → only beta visible.
     expect(seedListings.map((l) => l.name)).toEqual(['beta']);
   });
+
+  test('strict subdir option targets user/seeds snapshot when name collides with user-top entry (review fix)', async () => {
+    // Reported bug: callers iterating `registry.list()` for shadowed
+    // names (user-top entry + seed of the same name) called
+    // `peek(name, { scope: 'user' })` and got the user-top body for
+    // BOTH listings. The trust-filter-before-dedupe contract was
+    // broken: an untrusted user-top shadowing a trusted seed would
+    // drop the seed too, even though the seed satisfied the eager-
+    // load gates on its own.
+    //
+    // Fix: ScopeOption gains a strict `subdir` filter, and the new
+    // `listingScopeOption(listing)` helper threads the listing's
+    // identity through every re-peek. This test pins both halves of
+    // the fix at the registry boundary.
+    const { listingScopeOption } = await import('../../src/memory/registry.ts');
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    // User-top entry shadowing a seed of the same canonical name.
+    writeIndex(roots.user, '- [Mine](my-rule.md) — user-top body\n');
+    writeMemory(roots.user, 'my-rule', fmUser('my-rule'), 'USER-TOP-BODY\n');
+    // Same name lives in user/seeds with a different body.
+    writeIndex(join(roots.user, 'seeds'), '- [Seed](my-rule.md) — seed body\n');
+    writeFileSync(
+      join(roots.user, 'seeds', 'my-rule.md'),
+      '---\nname: my-rule\ndescription: seed\ntype: feedback\nsource: seed\nseed_origin: vendor\nseed_version: "1.0"\n---\n\nSEED-BODY\n',
+    );
+    const reg = createMemoryRegistry({ roots });
+
+    // Listings carry the subdir signal: BOTH entries surface in the
+    // raw list (different snapshots, same name).
+    const all = reg.list();
+    const userTop = all.find((l) => l.name === 'my-rule' && l.subdir === undefined);
+    const seedListing = all.find((l) => l.name === 'my-rule' && l.subdir === 'seeds');
+    expect(userTop).toBeDefined();
+    expect(seedListing).toBeDefined();
+    if (userTop === undefined || seedListing === undefined) return;
+
+    // Pre-fix bug: peek by (name, scope) returns user-top for BOTH
+    // listings. The plain-scope peek still does (current behavior
+    // preserved for backward-compat).
+    const plain = reg.peek('my-rule', { scope: 'user' });
+    expect(plain.kind).toBe('present');
+    if (plain.kind !== 'present') return;
+    expect(plain.file.body).toContain('USER-TOP-BODY');
+
+    // Post-fix: passing subdir: 'seeds' targets the seed snapshot.
+    const seedPeek = reg.peek('my-rule', { scope: 'user', subdir: 'seeds' });
+    expect(seedPeek.kind).toBe('present');
+    if (seedPeek.kind !== 'present') return;
+    expect(seedPeek.file.body).toContain('SEED-BODY');
+    expect(seedPeek.subdir).toBe('seeds');
+
+    // The convenience helper builds the right option for each listing.
+    const userTopPeek = reg.peek(userTop.name, listingScopeOption(userTop));
+    expect(userTopPeek.kind).toBe('present');
+    if (userTopPeek.kind === 'present') expect(userTopPeek.file.body).toContain('USER-TOP-BODY');
+    const seedHelperPeek = reg.peek(seedListing.name, listingScopeOption(seedListing));
+    expect(seedHelperPeek.kind).toBe('present');
+    if (seedHelperPeek.kind === 'present') expect(seedHelperPeek.file.body).toContain('SEED-BODY');
+  });
 });
 
 describe('createMemoryRegistry — list states + expires filter (H1+H6)', () => {

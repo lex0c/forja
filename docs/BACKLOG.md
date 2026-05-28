@@ -2,6 +2,41 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-28] seed memory — strict `subdir` filter for re-peeks preserves filter-before-dedupe
+
+Bug surfaced post-slice-5b around the user/seeds snapshot's interaction with the prompt assembly. Seed listings carry `scope: 'user'` with `subdir: 'seeds'` as the discriminator; consumers iterating `registry.list()` re-peeked by `(name, scope)` only — so for a name collision where a user-top entry shadows a seed of the same canonical name, the seed listing's peek resolved back to the user-top body. When the user-top body was `trust: untrusted` (or trigger-mismatch, or any other filter target), the trust filter dropped it — and because the seed listing's peek had returned the SAME body, the seed was dropped too. The filter-before-dedupe contract that should let a trusted lower-precedence entry survive when the higher-precedence one is filtered was silently broken.
+
+**Branch:** continued on `feat/memory-seeds`.
+
+**Fix at the API boundary.** `ScopeOption` gains a strict `subdir?: MemorySubdir` filter. `findListing` honors it: when `opts.subdir` is set, only snapshots whose `snap.subdir === opts.subdir` are walked. Backward-compatible — omitting `subdir` preserves the existing precedence walk that callers passing `(name, scope)` depend on.
+
+**Centralized helper.** New exported `listingScopeOption(listing): ScopeOption` builds a strict option object from a listing (`{ scope: listing.scope, subdir: listing.subdir }` with conditional spread for `exactOptionalPropertyTypes`). Callers iterating `registry.list()` invoke it instead of building the option inline — one helper, one place to evolve when more subdirs land (slice-6 team seeds, future variants).
+
+**Consumers threaded through the helper:**
+
+- **`src/cli/memory-prompt.ts`** `assembleMemorySection` — the primary bug site. Each per-listing re-peek now hits the listing's own snapshot, so a seed survives an untrusted user-top shadow.
+- **`src/cli/slash/commands/memory.ts`** `handleList` — same fix path; `/memory list` state/expires inspection now lands on the right body for shadowed seeds.
+- **`src/memory/lifecycle.ts`** (two sites — `gcExpiredMemories` boot scan + a fallback peek in the cascade walker) — system-internal scans inspect the right body when names shadow.
+- **`src/memory/dependents.ts`** — eviction-cascade dependent scan.
+- **`src/memory/trust-corpus-probe.ts`** — shared-corpus revoke flow's pre-transition re-peek.
+- **`src/retrieval/views/memory.ts`** — BM25 corpus body load for retrieval ranking.
+
+**Shipped on this branch:**
+
+- **`src/memory/registry.ts`** — `ScopeOption.subdir` field with strict semantics; `findListing(name, scope?, subdir?)` signature widened with the new filter check; `lookup`/`peek`/`read` thread `opts.subdir`. New exported `listingScopeOption(listing)` helper. The subagent-child registry wrapper preserves `subdir` automatically through its existing `{ ...opts, scope: s }` spread.
+
+- **`src/memory/index.ts`** — barrel re-exports `listingScopeOption`.
+
+- **6 consumer files** updated to use `listingScopeOption(l)` where they re-peek by listing identity.
+
+- **`tests/memory/registry.test.ts`** — new test pinning the full fix at the registry boundary: a `my-rule` user-top entry shadowing a `my-rule` seed; the plain `peek(name, { scope: 'user' })` still returns user-top (backward-compat); `peek(name, { scope: 'user', subdir: 'seeds' })` targets the seed; `listingScopeOption` builds the right option for each side of the collision.
+
+- **`tests/cli/memory-prompt.test.ts`** — new integration test under "seeds end-to-end": an untrusted user-top shadowing a trusted seed → user-top dropped by trust filter, seed body survives in the assembled prompt with the `[seed]` marker. Pre-fix the test would have asserted an empty section because both listings shared the same untrusted body.
+
+**Tests + validation:** `bun run typecheck` clean, `bun run lint` clean. `bun test tests/memory/ tests/cli/slash/memory.test.ts tests/cli/memory-prompt.test.ts tests/cli/memory.test.ts tests/cli/init-seeds.test.ts` → 1035 pass, no regression across the 33-file scope (memory subsystem + slash + cli + prompt + init-seeds).
+
+**Deferred (not blockers):** non-listing-iterating peek call sites (e.g., `retrieval/runner.ts`, `retrieval/compression.ts`, the verify-* dispatchers/schedulers, `governance.ts`) work with name+scope from sources that don't carry `subdir` today and target memory types that exclude seeds in practice (`type: project`/`reference` for verify-semantic; pair-keyed conflict candidates from same-scope siblings; governance proposals targeting operator-authored memories). They can adopt `listingScopeOption` if/when their inputs gain subdir.
+
 ## [2026-05-28] seed memory — `loadSeedManifest` filters invalid-name keys so `agent init` self-heals
 
 Bug fix on top of slice 5b's installer surface. A hand-edited or corrupt `<user>/seeds/.installed.json` key that fails `validateName` (e.g., `"../old"`, or any name outside the kebab-case domain) crashed `agent init --only=seeds`: the orphan-archive loop called `archiveSeed → seedMemoryFilePath → validateName`, which threw, aborting the install BEFORE the manifest could be rewritten. The loader's contract was "malformed rows are recoverable" but invalid-name keys violated that contract silently.

@@ -26,7 +26,7 @@ import {
   seedMemoryFilePath,
 } from './paths.ts';
 import type { ScopeRoots } from './paths.ts';
-import type { MemoryRegistry } from './registry.ts';
+import { type MemoryRegistry, listingScopeOption } from './registry.ts';
 import { transitionMemoryState } from './transitions.ts';
 import type { MemoryFile, MemoryScope, MemorySource, MemorySubdir } from './types.ts';
 import { type WriteMemoryResult, writeMemory } from './writer.ts';
@@ -305,8 +305,11 @@ export const findExpiredMemories = (
   // even if the project_local scope of the same name is fresh.
   for (const listing of registry.list()) {
     // peek (no audit) to get frontmatter. Memory_events shouldn't
-    // grow `read` rows for system-internal GC scans.
-    const peek = registry.peek(listing.name, { scope: listing.scope });
+    // grow `read` rows for system-internal GC scans. Pass the full
+    // listing identity so a seed listing whose name collides with a
+    // user-top entry inspects the seed body's expires field, not
+    // the shadowing top-level body.
+    const peek = registry.peek(listing.name, listingScopeOption(listing));
     if (peek.kind !== 'present') continue;
     const expires = peek.file.frontmatter.expires;
     if (expires === undefined) continue;
@@ -1134,7 +1137,7 @@ export const gcStaleInvalidatedMemories = async (
     const fm =
       listing.file?.frontmatter ??
       (() => {
-        const p = registry.peek(listing.name, { scope: listing.scope });
+        const p = registry.peek(listing.name, listingScopeOption(listing));
         return p.kind === 'present' ? p.file.frontmatter : null;
       })();
     if (fm === null) continue;
