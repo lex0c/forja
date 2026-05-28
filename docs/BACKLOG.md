@@ -2,6 +2,33 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-28] seed memory — `[seed]` marker on every operator-facing list surface (spec §5.7.3 parity fix)
+
+Visibility fix surfaced by the post-slice-5b audit. The eager-load surface (`assembleMemorySection` in `src/cli/memory-prompt.ts:315`) already attached a `[seed]` marker to vendor-curated entries since slice 7, but two operator-facing surfaces did not: the slash `/memory list` and the headless `agent --memory list` CLI (table + JSON). An operator inspecting their memory inventory via either surface had no way to tell vendor meta-behavior apart from their own user-scope writes without inspecting filesystem paths or running shell ad-hoc against `<user>/seeds/`.
+
+**Branch:** continued on `feat/memory-seeds`.
+
+**Shipped on this branch:**
+
+- **`src/cli/slash/commands/memory.ts`** (handleList) — derives `seedSuffix = l.subdir === 'seeds' ? ' [seed]' : ''` from the listing and inlines it into all three render branches (active, ORPHAN, MALFORMED). Suffix position matches the eager-load convention (after the name, before expires).
+
+- **`src/cli/memory.ts`** (parity fix added during review) — `ListEntryJson` gains an optional `subdir?: 'seeds'` field (present only on vendor seeds, omitted otherwise to keep the JSON payload additive — legacy script consumers parse identical bytes for the user/shared/local cases they already exercise). `renderListEntry` propagates `l.subdir`; `writeListTable` appends a ` [seed]` suffix on the name column for seed rows (table layout stays three-column; operators reading the suffix get the same signal as the slash form). The JSON surface gives script consumers a structured discriminator instead of forcing them to grep a marker out of free text.
+
+- **`tests/cli/slash/memory.test.ts`** — 3 new tests:
+  - operator-authored user-top memory renders without the marker AND every seed renders with `[user] <name> [seed]`;
+  - **collision case** (review fix coverage): an operator-authored memory shadowing a vendor seed of the SAME name renders exactly once with operator-supplied description and NO seed marker — pinned with a real `CANONICAL_SEEDS[0]` name so the dedupe-precedence code path is actually exercised (the earlier `not.toMatch` against `my-rule` was trivial because no collision happened);
+  - **ORPHAN-of-seed** (review fix coverage): a seeds index entry without a body file renders as `[ORPHAN] <name> [seed]` — pins the modified ORPHAN branch so a future refactor that drops `${seedSuffix}` from the template trips a test.
+
+- **`tests/cli/memory.test.ts`** — 1 new test exercising both JSON and table forms with a real vendor-catalog install: every JSON row carries `subdir:"seeds"`, and the table form renders ` [seed]` adjacent to each seed name. Also pins that non-seed JSON rows omit `subdir` (additive-payload contract).
+
+**Review findings deferred (not blockers, future "seeds observability" slice):**
+- `/memory audit --source seed` filter (memory_events.source already carries `'seed'`; only the slash filter is missing).
+- Persisting `subdir` in `memory_events` (today `scope+name+source` discriminate; the schema add is forensic polish).
+- Surfacing seed install/disable/enable events in `/recap` (recap projection currently only aggregates `proposed` events; seed lifecycle invisible).
+- Shared `renderSeedSuffix(listing)` helper (3 sites in slash + 1 in eager-load + 1 in CLI = 5 inlined copies, but trivial single-line each — abstraction earns its weight at N=6+ or first divergence).
+
+**Tests + validation:** `bun run typecheck` clean, `bun run lint` clean. `bun test tests/cli/memory.test.ts tests/cli/slash/memory.test.ts` → 252 pass (+4 vs pre-fix: 3 slash + 1 CLI).
+
 ## [2026-05-28] seed memory — slice 5b: `/memory seeds disable|enable|list` per-seed opt-out
 
 Second half of slice 5 (`docs/spec/MEMORY.md §5.7.6`). Pairs with slice 5a's `--no-seeds` blanket bootstrap opt-out by giving the operator a per-seed opt-out that survives a vendor catalog bump (slice 5a is "I don't want any vendor seeds"; slice 5b is "I want most of them but `<name>` is wrong for my workflow"). Backed by a sentinel at `<user>/seeds/.disabled.json` that the installer's upgrade state machine honors BEFORE the existing fresh/unchanged/vendor_updated/user_kept branches — so disabling a seed is durable across `agent init`, binary upgrades, and catalog version bumps without the operator's intent regressing.

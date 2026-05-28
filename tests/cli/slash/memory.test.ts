@@ -198,6 +198,95 @@ describe('/memory list', () => {
     expect(matches.length).toBe(1);
   });
 
+  test('seeds get a `[seed]` suffix so the operator distinguishes them from user-top memories (spec §5.7.3)', async () => {
+    // Without this marker, vendor-curated meta-behavior at
+    // <user>/seeds/<name>.md is rendered with the same `[user]`
+    // scope prefix as operator-authored memories at <user>/<name>.md
+    // — visually indistinguishable in /memory list. The eager-load
+    // (assembleMemorySection) already attaches `[seed]` via the
+    // listing's `subdir === 'seeds'` discriminator (slice 7); this
+    // test pins the parallel signal on the operator-facing list.
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    // Operator-authored memory at user-top.
+    writeIndex(roots.user, '- [Mine](my-rule.md) — operator-written\n');
+    writeBody(roots.user, 'my-rule', { type: 'user' });
+    // One vendor seed via the real installer.
+    const { installVendorSeeds } = await import('../../../src/memory/seeds-installer.ts');
+    installVendorSeeds({ roots });
+    registry.reload();
+    const r = await memoryCommand.exec(['list'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    // Operator memory: NO seed marker.
+    expect(text).toMatch(/\[user\] my-rule —/);
+    expect(text).not.toMatch(/\[user\] my-rule \[seed\]/);
+    // Each vendor seed: WITH seed marker. Use the first canonical
+    // name to keep the assertion stable against catalog changes
+    // (the integration is symmetric across all seeds).
+    const { CANONICAL_SEEDS } = await import('../../../src/cli/init-seeds/index.ts');
+    const sample = CANONICAL_SEEDS[0];
+    if (sample === undefined) throw new Error('CANONICAL_SEEDS unexpectedly empty');
+    expect(text).toContain(`[user] ${sample.name} [seed]`);
+  });
+
+  test('collision case: user-top entry shadowing a vendor seed of the same name renders without the marker', async () => {
+    // The dedupe precedence is user-top > user/seeds (slice 7).
+    // When an operator authors `<user>/<name>.md` with the same
+    // name as a vendor seed, the seed is shadowed in the list and
+    // the surviving listing has `subdir = undefined` — so the
+    // marker MUST NOT attach. Without this test, a future change
+    // that propagates subdir from the shadowed listing (or fails
+    // to drop subdir on the survivor) would silently misrender
+    // the collision case. The earlier `not.toMatch` was trivial
+    // because `my-rule` is not a canonical seed name; this picks
+    // a real seed name so the collision exercises the actual
+    // dedupe code path.
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    const { CANONICAL_SEEDS } = await import('../../../src/cli/init-seeds/index.ts');
+    const sample = CANONICAL_SEEDS[0];
+    if (sample === undefined) throw new Error('CANONICAL_SEEDS unexpectedly empty');
+    // Install the vendor catalog first.
+    const { installVendorSeeds } = await import('../../../src/memory/seeds-installer.ts');
+    installVendorSeeds({ roots });
+    // Operator authors a user-top memory with the same name as a seed.
+    writeIndex(roots.user, `- [Mine](${sample.name}.md) — operator-shadow\n`);
+    writeBody(roots.user, sample.name, { type: 'user' });
+    registry.reload();
+    const r = await memoryCommand.exec(['list'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    // Exactly one rendered row for this name (dedupe collapsed the seed).
+    const occurrences = text.split('\n').filter((line) => line.includes(` ${sample.name} `));
+    expect(occurrences).toHaveLength(1);
+    // The surviving row is the user-top one — operator-authored
+    // description renders, NOT the vendor description, AND no seed
+    // marker attaches.
+    expect(occurrences[0]).toContain('operator-shadow');
+    expect(occurrences[0]).not.toContain('[seed]');
+  });
+
+  test('ORPHAN-of-seed (index entry without body) preserves the `[seed]` marker', async () => {
+    // The handleList ORPHAN branch was modified by this slice. A
+    // future refactor that drops `${seedSuffix}` from the ORPHAN
+    // template would not fail any existing test. Pin it: write a
+    // seeds/MEMORY.md index entry without a corresponding body
+    // file, then assert the rendered ORPHAN line carries `[seed]`.
+    const repo = makeTmp();
+    const { ctx, registry, roots } = makeCtx(repo);
+    const seedsDir = join(roots.user, 'seeds');
+    mkdirSync(seedsDir, { recursive: true });
+    writeFileSync(join(seedsDir, 'MEMORY.md'), '- [Phantom](phantom-seed.md) — hook\n');
+    // Deliberately no `phantom-seed.md` body — registry.peek will
+    // route to the missing branch and handleList renders [ORPHAN].
+    registry.reload();
+    const r = await memoryCommand.exec(['list'], ctx);
+    if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('[ORPHAN] phantom-seed [seed]');
+  });
+
   test('scope user filters to user only', async () => {
     const repo = makeTmp();
     const { ctx, registry, roots } = makeCtx(repo);

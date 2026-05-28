@@ -53,14 +53,24 @@ interface ListEntryJson {
   name: string;
   description: string;
   href: string;
+  // Present only for vendor seeds (spec §5.7.3 — operator surface
+  // must distinguish vendor-curated meta-behavior from operator-
+  // authored memories). Omitted on non-seed entries to keep the
+  // payload additive: existing JSON consumers parse identical bytes
+  // for the user/shared/local cases they already exercise.
+  subdir?: 'seeds';
 }
 
-const renderListEntry = (l: MemoryListing): ListEntryJson => ({
-  scope: l.scope,
-  name: l.name,
-  description: l.entry.hook,
-  href: l.entry.href,
-});
+const renderListEntry = (l: MemoryListing): ListEntryJson => {
+  const base: ListEntryJson = {
+    scope: l.scope,
+    name: l.name,
+    description: l.entry.hook,
+    href: l.entry.href,
+  };
+  if (l.subdir === 'seeds') base.subdir = 'seeds';
+  return base;
+};
 
 const writeListJson = (entries: ListEntryJson[], out: (s: string) => void): void => {
   for (const e of entries) out(`${JSON.stringify(e)}\n`);
@@ -73,7 +83,14 @@ const writeListTable = (entries: ListEntryJson[], out: (s: string) => void): voi
   }
   out(`${['scope', 'name', 'description'].join('  ')}\n`);
   for (const e of entries) {
-    out(`${e.scope}  ${e.name}  ${e.description}\n`);
+    // `[seed]` suffix matches the slash `/memory list` and the
+    // eager-load convention (after the name, ahead of the
+    // description). The table form omits any seed column to keep
+    // the historical three-column layout; operators scripting
+    // against table output read the suffix, JSON consumers read
+    // the `subdir` field.
+    const seedSuffix = e.subdir === 'seeds' ? ' [seed]' : '';
+    out(`${e.scope}  ${e.name}${seedSuffix}  ${e.description}\n`);
   }
 };
 

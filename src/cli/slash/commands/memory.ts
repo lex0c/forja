@@ -355,13 +355,25 @@ const handleList = (registry: MemoryRegistry, ctx: SlashContext, args: string[])
   // from test fixtures. Keep the explicit threading honest.
   const nowMs = ctx.now();
   for (const l of entries) {
+    // Spec §5.7.3 "UI mostrar `[seed]` discreto na lista" — the
+    // eager-load already marks seeds via assembleMemorySection
+    // (memory-prompt.ts:315), but the operator-facing /memory list
+    // surface needs the same signal so an operator inspecting their
+    // memories distinguishes vendor-curated meta-behavior from
+    // their own user-scope entries. Without this, a user-scope
+    // memory of the same scope letter looks identical to a seed in
+    // the rendered list. Suffix order matches the eager-load
+    // (after the name, before expires).
+    const seedSuffix = l.subdir === 'seeds' ? ' [seed]' : '';
     const peek = registry.peek(l.name, { scope: l.scope });
     if (peek.kind === 'unknown' || peek.kind === 'missing') {
-      lines.push(`  [${l.scope}] [ORPHAN] ${l.name} — ${l.entry.hook}`);
+      lines.push(`  [${l.scope}] [ORPHAN] ${l.name}${seedSuffix} — ${l.entry.hook}`);
       continue;
     }
     if (peek.kind === 'malformed') {
-      lines.push(`  [${l.scope}] [MALFORMED] ${l.name} — ${l.entry.hook} (${peek.error})`);
+      lines.push(
+        `  [${l.scope}] [MALFORMED] ${l.name}${seedSuffix} — ${l.entry.hook} (${peek.error})`,
+      );
       continue;
     }
     const fm = peek.file.frontmatter;
@@ -374,7 +386,7 @@ const handleList = (registry: MemoryRegistry, ctx: SlashContext, args: string[])
     const expiresSuffix =
       fm.expires !== undefined && !isExpired(fm.expires, nowMs) ? ` (expires ${fm.expires})` : '';
     const prefix = flag ?? '';
-    lines.push(`  [${l.scope}] ${prefix}${l.name} — ${l.entry.hook}${expiresSuffix}`);
+    lines.push(`  [${l.scope}] ${prefix}${l.name}${seedSuffix} — ${l.entry.hook}${expiresSuffix}`);
   }
   return { kind: 'ok', notes: lines };
 };
