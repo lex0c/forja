@@ -2,6 +2,39 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-28] seed memory — slice 5a: `agent init --no-seeds` opt-out flag
+
+First half of slice 5 (`docs/spec/MEMORY.md §5.7.6`). Adds the `--no-seeds` opt-out flag so an operator who wants the full `agent init` scaffold MINUS the bundled vendor seed pack can express that in a single token, without typing the seeds-free `--only=...` csv by hand.
+
+**Branch:** continued on `feat/memory-seeds`.
+
+**Design.** Pure parser-layer sugar. `--no-seeds` is resolved in `parseInitSubcommand` before the descriptor is built, so the init handler stays oblivious — it sees a regular `only?: ReadonlyArray<InitStep>` like any other invocation. Three combinations are accepted, one is rejected:
+
+| Argv | Resolved `only` |
+|---|---|
+| `init --no-seeds` | `DEFAULT_STEPS.filter(s => s !== 'seeds')` |
+| `init --no-seeds --only=permissions` | `['permissions']` (redundant flag, accepted) |
+| `init --no-seeds --only=seeds` | **rejected** — mutually exclusive |
+| `init --no-seeds --only=permissions,seeds` | **rejected** — mutually exclusive |
+
+The redundant case is accepted (not rejected) because scripted callers may pass both for belt-and-suspenders intent; refusing it would break those scripts without surfacing any new bug. The mutex case rejects because the operator's intent is contradictory — the parser names both flags in the error so the operator can audit their argv.
+
+**Shipped on this branch:**
+
+- **`src/cli/args.ts`** — new `noSeeds` local in `parseInitSubcommand`; handler for `--no-seeds`; post-loop resolution block that either expands to `VALID_INIT_STEPS.filter(s => s !== 'seeds')` (sole flag) or rejects on mutex. The expansion uses the duplicated `VALID_INIT_STEPS` rather than importing `DEFAULT_STEPS` from `init.ts`, preserving the parser's side-effect-free posture on `--help` paths (see the pre-existing `VALID_INIT_STEPS` comment in `args.ts:397`).
+
+- **`tests/cli/args.test.ts`** — 4 new tests: (a) `--no-seeds` alone resolves to `DEFAULT_STEPS minus seeds` (asserted via dynamic import to stay drift-coupled to the canonical list); (b) `--no-seeds + --only=seeds` rejected; (c) both flag orderings of `--no-seeds + --only=permissions,seeds` rejected; (d) `--no-seeds + --only=permissions` is a redundant no-op that leaves `only` untouched.
+
+**Review fixes (applied before commit).** Two findings surfaced by the slice review:
+
+1. **Help-text discoverability.** The new `--no-seeds` flag wasn't listed in `usage()`'s `init` subcommand block, so an operator running `agent init --help` had no way to discover the flag. While auditing, also surfaced a slice-3 drift: the `--only=csv` description still enumerated `(permissions,gitignore,config,playbooks,skills)` without `seeds`. Both fixed: header gains `[--no-seeds]`, description lists seeds in the `--only` enumeration, a `--no-seeds` line is added with a spec pointer. The pre-existing "mentions every recognized flag" test in `args.test.ts` was extended with two toContain calls so a future drift is caught on the help path before shipping.
+
+2. **Test coverage symmetry.** The mutex test pinned both flag orderings (`--no-seeds --only=...,seeds` and `--only=...,seeds --no-seeds`) but the redundant-no-op test only pinned the flag-first ordering. A future refactor that moved the resolution branch above the mutex check would not regress the flag-first path but could silently broaden `only` on the only-first path. Extended the no-op test to walk both orderings via a for-loop, matching the mutex test's coverage shape.
+
+**Tests + validation:** `bun run typecheck` clean, `bun run lint` clean. `bun test tests/cli/args.test.ts` → 159 pass (442 expect calls; +4 expects vs pre-review pinning the help-text and dual-ordering assertions).
+
+**Followups (5b, 5c).** Slice 5b will add the `/memory seeds disable|enable <name>` sentinel-based opt-out (per-seed, after install) that survives a `vendor_updated` bump. Slice 5c will add the interactive `[k]eep / [v]iew / [a]ccept / [m]erge` modal for `vendor_updated` conflicts (currently the state machine deterministically writes the new vendor body and the user_kept branch is reached only when the operator pre-edited the file).
+
 ## [2026-05-28] seed memory — install moves from bootstrap to `agent init`
 
 End-to-end review surfaced a design-shape question: should vendor seeds install at every bootstrap (current slice-3 behavior) or only when the operator opts into setup via `agent init` (parallel to how skills/playbooks scaffold)? After review, the latter is the right shape — nothing should arrive in the user-global scope without an explicit operator action. This commit moves the install.

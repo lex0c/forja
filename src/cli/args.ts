@@ -455,6 +455,13 @@ const parseInitSubcommand = (argv: readonly string[]): ParseResult | null => {
   let mode: 'strict' | 'acceptEdits' = 'strict';
   let only: InitStep[] | undefined;
   let force: 'all' | ForceEligibleStep[] | undefined;
+  // `--no-seeds` is opt-out sugar for "scaffold everything except the
+  // bundled vendor seeds." Tracked as a bool through the parse loop
+  // because the resolution depends on whether `--only=` is also set:
+  // if alone, it expands to DEFAULT_STEPS minus 'seeds'; if combined
+  // with `--only=...`, it's a redundant no-op unless that csv lists
+  // 'seeds' (then it's mutex — the operator gave contradictory intent).
+  let noSeeds = false;
   let i = 1;
   while (i < argv.length) {
     const token = argv[i];
@@ -517,6 +524,11 @@ const parseInitSubcommand = (argv: readonly string[]): ParseResult | null => {
       i += 1;
       continue;
     }
+    if (token === '--no-seeds') {
+      noSeeds = true;
+      i += 1;
+      continue;
+    }
     if (token === '--mode') {
       const value = argv[i + 1];
       if (value === undefined || value.startsWith('--')) {
@@ -552,6 +564,27 @@ const parseInitSubcommand = (argv: readonly string[]): ParseResult | null => {
       };
     }
     return { ok: false, message: `init: unknown argument '${token}'` };
+  }
+  // Resolve `--no-seeds` against `--only=...`. The operator's intent
+  // is unambiguous in three of the four combinations; only the fourth
+  // (explicit `--only=` that lists 'seeds' alongside `--no-seeds`) is
+  // contradictory and rejected with a pointer to both flags.
+  if (noSeeds) {
+    if (only?.includes('seeds')) {
+      return {
+        ok: false,
+        message:
+          "--no-seeds conflicts with --only=...,seeds,...: the operator can't both opt out of the seed pack and request it",
+      };
+    }
+    // Sole `--no-seeds`: expand to "every default step except seeds".
+    // Combined with a seeds-free `--only=...`: the flag is redundant
+    // (the requested subset already excludes seeds) but accepted —
+    // refusing it would surprise scripted callers that set both for
+    // belt-and-suspenders. The redundant path leaves `only` untouched.
+    if (only === undefined) {
+      only = VALID_INIT_STEPS.filter((step) => step !== 'seeds');
+    }
   }
   // Build init descriptor without explicit-undefined keys —
   // `exactOptionalPropertyTypes` rejects `only: undefined` against
@@ -2082,13 +2115,15 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
 export const usage = (): string =>
   [
     'Usage: agent [options] <prompt>',
-    '       agent init [--mode strict|acceptEdits] [--only=csv] [--force[=csv]]',
+    '       agent init [--mode strict|acceptEdits] [--only=csv] [--no-seeds] [--force[=csv]]',
     '',
     'Subcommands:',
     '  init                   Scaffold the .agent/ bootstrap bundle:',
-    '                           permissions.yaml, .gitignore, config.toml, agents/*.md, skills/shared/*.md',
+    '                           permissions.yaml, .gitignore, config.toml, agents/*.md, skills/shared/*.md,',
+    '                           <user>/seeds/*.md (vendor memory seed pack)',
     '                         Each step is idempotent (existing files skipped).',
-    '                         --only=csv    subset to run (permissions,gitignore,config,playbooks,skills)',
+    '                         --only=csv    subset to run (permissions,gitignore,config,playbooks,skills,seeds)',
+    '                         --no-seeds    opt out of the vendor seed pack (MEMORY.md §5.7.6)',
     '                         --force       overwrite all force-eligible steps',
     '                         --force=csv   overwrite subset (permissions,config,playbooks,skills);',
     '                                       .gitignore is operator-owned (MEMORY.md §2.5)',
