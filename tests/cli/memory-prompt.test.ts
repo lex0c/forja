@@ -1019,9 +1019,7 @@ describe('assembleMemorySection — seeds end-to-end (spec §5.7.3)', () => {
     // user/seeds via listingScopeOption — not the shadowing
     // user-top body.
     expect(result.text).not.toContain('operator shadow');
-    expect(result.text).toMatch(
-      /^- \[user\] safe-edit-discipline \[seed\] — vendor hook$/m,
-    );
+    expect(result.text).toMatch(/^- \[user\] safe-edit-discipline \[seed\] — vendor hook$/m);
     expect(result.entryCount).toBe(1);
   });
 });
