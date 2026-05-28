@@ -139,11 +139,25 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // blocks were dropped — model lives in the footer chips and
       // the env detail was low-signal at boot. `item.env` still
       // flows into the PermanentItem for NDJSON / audit consumers.
+      //
+      // §13.7 sandbox-enforcement: when `sandboxActive` is set,
+      // a third line sits inside the banner frame (secondary
+      // greyscale, no leading blank) so the affirmative posture
+      // reads as part of the banner — not as a separate alert.
+      // Non-active states (no-tool / operator-override / degraded
+      // passthrough) ride the warn/error event channels with the
+      // standard leading blank, since they ARE warnings.
       const versionDisplay = item.version.startsWith('v') ? item.version : `v${item.version}`;
-      return [
+      const lines = [
         `${paint(caps, 'bold', item.app)} ${paint(caps, 'secondary', versionDisplay)}`,
         paint(caps, 'secondary', item.cwd),
-      ].map(padFrame);
+      ];
+      if (item.sandboxActive !== undefined) {
+        lines.push(
+          paint(caps, 'secondary', `✓ sandbox enforcement active (${item.sandboxActive})`),
+        );
+      }
+      return lines.map(padFrame);
     }
     case 'user-submit': {
       // UI.md §4.10.8 — inverse bar acts as a structural divider in

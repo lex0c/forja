@@ -39,6 +39,7 @@ import type { ProbeSharedTrustResult } from '../memory/index.ts';
 import { createSqliteOutcomeSink } from '../outcomes/index.ts';
 import {
   type LockConflict,
+  type SandboxAvailability,
   type SandboxTmpdir,
   acquireSandboxTmpdir,
   bootstrapPermissionEngine,
@@ -162,6 +163,14 @@ export interface BootstrapInput {
   // covers. Without this flag, `host` is pruned from the candidate
   // set unconditionally.
   sandboxHost?: boolean;
+  // Test seam — pins the `detectSandboxAvailability` result instead
+  // of probing the host. Production callers never pass this; tests
+  // that exercise both branches of the default-broker resolver
+  // (sandbox-present → spawn, sandbox-absent → in-process) inject a
+  // synthetic SandboxAvailability so the verdict doesn't depend on
+  // the runner host's state. Same posture as `enterprisePolicyPath`/
+  // `userPolicyPath`: production omits, tests can pin.
+  sandboxAvailabilityOverride?: SandboxAvailability;
   // §13.7 broker mode (slice 87). Explicit override; when omitted,
   // bootstrap picks dynamically: `'spawn'` when the host has a
   // working sandbox tool (`detectSandboxAvailability().available`),
@@ -225,6 +234,32 @@ export interface BootstrapInput {
   }) => Promise<'yes' | 'no' | 'cancel'>;
 }
 
+// §13.7 sandbox-enforcement snapshot — captured at bootstrap time so
+// the REPL boot banner (and any future operator-facing surface) can
+// report "is bash actually being wrapped?" without re-running the
+// probe or duplicating the resolver. Mirrors the verdict that
+// `doctor`'s `sandbox_enforcement` check would compute from the
+// same `sandboxAvail` + `resolvedBrokerMode` state.
+//
+// `active` is true iff the broker is going to wrap bash spawns at
+// runtime — that requires BOTH a working sandbox tool AND
+// spawn-mode. Every other combination produces `active: false`
+// with a `reason` that distinguishes:
+//   - 'no-tool'             → sandbox binary absent; broker default
+//                             fell back to in-process.
+//   - 'operator-override'   → sandbox available, operator forced
+//                             `--broker in-process` explicitly.
+//   - 'degraded-passthrough'→ operator forced `--broker spawn` but
+//                             sandbox binary missing; spawn runs
+//                             unwrapped (the runner's degraded
+//                             passthrough path; see
+//                             sandbox-runner.ts:660-668).
+export interface SandboxEnforcementSnapshot {
+  active: boolean;
+  tool: 'bwrap' | 'sandbox-exec' | null;
+  reason: 'active' | 'no-tool' | 'operator-override' | 'degraded-passthrough';
+}
+
 export interface BootstrapResult {
   config: HarnessConfig;
   db: DB;
@@ -278,6 +313,11 @@ export interface BootstrapResult {
   // a hard abort.
   providersConfigWarnings: readonly string[];
   budgetConfigWarnings: readonly string[];
+  // §13.7 enforcement state at boot — surfaces "is bash being
+  // wrapped?" for the REPL banner + any future operator-facing
+  // surface that needs to mirror what doctor reports. See
+  // `SandboxEnforcementSnapshot` for the discriminator.
+  sandboxEnforcement: SandboxEnforcementSnapshot;
   // Warnings from the audit / retention config loader
   // (`.agent/config.toml [audit]` and `[audit.retention]`). Loader
   // degrades to defaults on bad values rather than aborting boot —
@@ -614,7 +654,10 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   //     `host` profile becomes selectable. Either path is enough;
   //     the planner still requires `host-passthrough` in resolved
   //     capabilities.
-  const sandboxAvail = detectSandboxAvailability();
+  // Test seam — `sandboxAvailabilityOverride` pins the verdict
+  // deterministically. Production passes nothing and the real probe
+  // runs against the live host.
+  const sandboxAvail = input.sandboxAvailabilityOverride ?? detectSandboxAvailability();
   const policySandbox = preflight.resolved.policy.sandbox;
   // Slice 157 (review — phase 2 of macOS /tmp isolation). Acquire a
   // per-CLI-run sandbox tmpdir right after we know the platform has
@@ -1518,6 +1561,23 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       : {}),
     permissionChain: permResult.chain,
     installIdentity: permResult.identity,
+    // §13.7 enforcement snapshot — derived from the same
+    // sandboxAvail probe + resolvedBrokerMode that drove broker
+    // construction. REPL boot banner reads this to surface the
+    // active vs disabled posture before the operator starts
+    // typing; doctor consults the same primitives independently.
+    sandboxEnforcement: {
+      active: resolvedBrokerMode === 'spawn' && sandboxAvail.available,
+      tool: sandboxAvail.tool,
+      reason:
+        resolvedBrokerMode === 'spawn' && sandboxAvail.available
+          ? 'active'
+          : resolvedBrokerMode === 'spawn'
+            ? 'degraded-passthrough'
+            : sandboxAvail.available
+              ? 'operator-override'
+              : 'no-tool',
+    } satisfies SandboxEnforcementSnapshot,
     ...(sharedTrustProbe !== undefined ? { sharedTrustProbe } : {}),
   };
 };

@@ -206,9 +206,24 @@ export const createNoopSink = (): AuditSink => ({
 // looping) walks `shared` cleanly the second time. This matches
 // JSON.stringify, which silently serializes DAGs and only throws
 // on real cycles.
+//
+// Asymmetry vs `canonical.ts:canonicalize`: canonicalize THROWS
+// on encountering undefined or a non-finite number; this strip
+// SWALLOWS undefined and silently substitutes cycles with null.
+// The choice is deliberate — audit.emit is a critical path
+// (every engine.check writes a row), so we prefer "stable hash
+// over weird input" to "mid-transaction throw". Side effect: two
+// distinct cyclic-args inputs hash to the same args_hash because
+// both collapse to a null stand-in at the cycle point. Model
+// emissions don't produce cyclic JSON in practice (the LLM emits
+// JSON-serializable args), so this is a defensive convergence,
+// not a forensic risk class operators should track. If a future
+// tool surfaces cycles, the right fix is to wire the tool to
+// detect + reject upstream rather than thread bigger semantics
+// through audit emit.
 const stripUndefined = (value: unknown, seen: WeakSet<object> = new WeakSet()): unknown => {
   if (value === null || typeof value !== 'object') return value;
-  if (seen.has(value as object)) return null; // true cycle → null stand-in (JSON.stringify would throw; the chain hash needs a stable payload, not a throw)
+  if (seen.has(value as object)) return null; // true cycle → null stand-in (see asymmetry note above)
   seen.add(value as object);
   let out: unknown;
   if (Array.isArray(value)) {

@@ -553,6 +553,11 @@ export type PermanentItem =
       // Mirror of SessionBannerEvent.env (UI.md §4.10.9). Renderer
       // discriminates on `kind` to pick the right palette per entry.
       env: SessionBannerEnvEntry[];
+      // Set when broker resolved to spawn mode + sandbox tool
+      // present. Renderer appends a secondary line inside the banner
+      // block ("✓ sandbox enforcement active (bwrap)"). The
+      // non-active states ride warn/error events outside the banner.
+      sandboxActive?: 'bwrap' | 'sandbox-exec';
     }
   | { kind: 'user-submit'; text: string }
   | {
@@ -945,6 +950,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             maxOutputTokens: event.maxOutputTokens,
             cwd: event.cwd,
             env: event.env,
+            ...(event.sandboxActive !== undefined ? { sandboxActive: event.sandboxActive } : {}),
           },
         ],
       };

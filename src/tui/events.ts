@@ -62,6 +62,13 @@ export type SessionStartEvent = BaseEvent & {
 export type SessionBannerEnvEntry =
   | { kind: 'flag'; name: string; count?: number }
   | { kind: 'meta'; key: string; value: string };
+// Active-sandbox indicator appended inline to the banner block when
+// the broker resolved to spawn mode + sandbox tool present. Rendered
+// as a secondary (greyscale) line directly under cwd — no leading
+// blank — so the affirmative posture reads as part of the banner
+// frame rather than a separate "alert". The non-active cases
+// (no-tool / operator-override / degraded-passthrough) ride the
+// standard warn/error event channels because they ARE warnings.
 export type SessionBannerEvent = BaseEvent & {
   type: 'session:banner';
   app: string;
@@ -71,6 +78,10 @@ export type SessionBannerEvent = BaseEvent & {
   maxOutputTokens: number;
   cwd: string;
   env: SessionBannerEnvEntry[];
+  // Tool name when sandbox enforcement is active (`bwrap` /
+  // `sandbox-exec`); omitted when enforcement is disabled (the
+  // warn/error event surfaces it explicitly instead).
+  sandboxActive?: 'bwrap' | 'sandbox-exec';
 };
 export type SessionEndEvent = BaseEvent & {
   type: 'session:end';

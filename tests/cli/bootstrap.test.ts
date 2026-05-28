@@ -1171,6 +1171,119 @@ When the goal is to orient in a new repo.
     });
   });
 
+  describe('default broker resolver (§13.7 sandbox-availability gate)', () => {
+    // The default broker mode resolves dynamically per
+    // `sandboxAvail.available`. These tests pin both branches via
+    // the `sandboxAvailabilityOverride` test seam so the verdict
+    // doesn't depend on the runner host's actual sandbox state.
+
+    test('sandbox available + brokerMode omitted → spawn mode + active enforcement snapshot', async () => {
+      const { sandboxEnforcement, config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        sandboxAvailabilityOverride: {
+          available: true,
+          tool: 'bwrap',
+          path: '/usr/bin/bwrap',
+          trustLevel: 'canonical',
+          reason: '',
+          trustWarnings: [],
+        },
+      });
+      expect(sandboxEnforcement.active).toBe(true);
+      expect(sandboxEnforcement.reason).toBe('active');
+      expect(sandboxEnforcement.tool).toBe('bwrap');
+      // Broker is wired (spawn mode); smoke-execute a no-op to
+      // confirm the construction didn't refuse silently.
+      if (config.broker === undefined) throw new Error('expected broker');
+      await config.broker.close();
+      db.close();
+    });
+
+    test('sandbox absent + brokerMode omitted → in-process mode + no-tool snapshot', async () => {
+      const { sandboxEnforcement, config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        sandboxAvailabilityOverride: {
+          available: false,
+          tool: null,
+          path: null,
+          trustLevel: 'absent',
+          reason: 'no sandbox tool detected',
+          trustWarnings: [],
+        },
+      });
+      expect(sandboxEnforcement.active).toBe(false);
+      expect(sandboxEnforcement.reason).toBe('no-tool');
+      expect(sandboxEnforcement.tool).toBeNull();
+      if (config.broker === undefined) throw new Error('expected broker');
+      await config.broker.close();
+      db.close();
+    });
+
+    test('sandbox available + brokerMode=in-process → operator-override snapshot', async () => {
+      const { sandboxEnforcement, config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        brokerMode: 'in-process',
+        sandboxAvailabilityOverride: {
+          available: true,
+          tool: 'bwrap',
+          path: '/usr/bin/bwrap',
+          trustLevel: 'canonical',
+          reason: '',
+          trustWarnings: [],
+        },
+      });
+      expect(sandboxEnforcement.active).toBe(false);
+      expect(sandboxEnforcement.reason).toBe('operator-override');
+      // Tool is still reported as present even when override
+      // suppressed enforcement — operator wants to know they had
+      // the option to enable.
+      expect(sandboxEnforcement.tool).toBe('bwrap');
+      if (config.broker === undefined) throw new Error('expected broker');
+      await config.broker.close();
+      db.close();
+    });
+
+    test('sandbox absent + brokerMode=spawn → degraded-passthrough snapshot', async () => {
+      const { sandboxEnforcement, config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        brokerMode: 'spawn',
+        sandboxAvailabilityOverride: {
+          available: false,
+          tool: null,
+          path: null,
+          trustLevel: 'absent',
+          reason: 'no sandbox tool detected',
+          trustWarnings: [],
+        },
+      });
+      expect(sandboxEnforcement.active).toBe(false);
+      expect(sandboxEnforcement.reason).toBe('degraded-passthrough');
+      if (config.broker === undefined) throw new Error('expected broker');
+      await config.broker.close();
+      db.close();
+    });
+  });
+
   describe('memory_provenance retention sweep at boot (S1/T1.7)', () => {
     test('prunes rows older than the retention window; keeps recent rows', async () => {
       // Seed the DB BEFORE bootstrap so the row pre-exists when

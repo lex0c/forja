@@ -550,6 +550,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     critiqueWarnings,
     memoryConfigWarnings,
     auditConfigWarnings,
+    sandboxEnforcement,
   } = bootstrapped;
 
   // Surface the same warnings the one-shot path does. Operators get
@@ -2494,12 +2495,79 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     maxOutputTokens: resolveMaxOutputTokens(effectiveBudget(baseConfig.budget), providerCaps),
     cwd: baseConfig.cwd,
     env,
+    // §13.7 — when sandbox enforcement is active, append the line
+    // inline inside the banner block (secondary, no leading blank).
+    // The non-active states ride warn/error events below.
+    ...(sandboxEnforcement.reason === 'active' && sandboxEnforcement.tool !== null
+      ? { sandboxActive: sandboxEnforcement.tool }
+      : {}),
   });
 
   // Trust prompt was already handled in the pre-bootstrap stack —
   // see "Trust prompt (AGENTIC_CLI §9.1)" earlier in this function.
   // Reaching this line means the operator either accepted or the
   // cwd was already trusted.
+
+  // §13.7 sandbox-enforcement banner. Surfaces "is bash being
+  // wrapped?" to operators who never run `agent doctor`. Four
+  // states from the bootstrap snapshot (see
+  // SandboxEnforcementSnapshot in bootstrap.ts):
+  //
+  //   - `active`               → rendered INLINE inside the
+  //                              session-banner block via
+  //                              `sandboxActive` field on the
+  //                              event above (secondary, no leading
+  //                              blank). The affirmative posture is
+  //                              part of the banner frame, not a
+  //                              separate alert.
+  //   - `no-tool`              → warn: actionable; engine permission
+  //                              floors still defend but spawn wrap
+  //                              is absent.
+  //   - `operator-override`    → warn: deliberate opt-out; banner
+  //                              acknowledges the operator's choice.
+  //   - `degraded-passthrough` → error: operator passed --broker
+  //                              spawn on a host without the binary;
+  //                              misleading if not surfaced loudly.
+  //
+  // Exhaustive switch (not if-else chain) so a future addition to
+  // `SandboxEnforcementSnapshot.reason` forces a compile error here
+  // via the `never` default — defense against silent fall-through
+  // when the discriminator grows underneath a stale consumer.
+  switch (sandboxEnforcement.reason) {
+    case 'active':
+      // Rendered inline inside the session-banner block above via
+      // the `sandboxActive` field. No event here — the affirmative
+      // path stays inside the banner frame.
+      break;
+    case 'no-tool':
+      bus.emit({
+        type: 'warn',
+        ts: now(),
+        message:
+          '⚠ sandbox enforcement disabled — install bubblewrap (linux) or verify sandbox-exec on $PATH (macOS) to enable wrap-on-spawn',
+      });
+      break;
+    case 'operator-override':
+      bus.emit({
+        type: 'warn',
+        ts: now(),
+        message:
+          '⚠ sandbox enforcement disabled (operator chose --broker in-process); bash spawns are not wrapped',
+      });
+      break;
+    case 'degraded-passthrough':
+      bus.emit({
+        type: 'error',
+        ts: now(),
+        message:
+          '⚠ sandbox enforcement degraded — --broker spawn requested but sandbox tool missing; bash spawns run unwrapped via passthrough',
+      });
+      break;
+    default: {
+      const _exhaustive: never = sandboxEnforcement.reason;
+      void _exhaustive;
+    }
+  }
 
   // Permission posture hint. When no project policy file
   // contributed, the operator runs under strict + empty rules

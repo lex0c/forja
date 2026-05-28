@@ -145,6 +145,11 @@ const makeBootstrapStub = (
     permissionState: 'ready',
     permissionChain: { ok: true, rows: 0, current_rotation_id: 0, quarantined: false },
     installIdentity: { install_id: 'test-fixture', created_at_ms: 0 },
+    sandboxEnforcement: {
+      active: false,
+      tool: null,
+      reason: 'no-tool' as const,
+    },
   };
 };
 

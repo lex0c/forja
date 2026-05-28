@@ -529,19 +529,23 @@ ASCII fallback: SGR `7` é universal em qualquer terminal — sem fallback neces
 
 #### 4.10.9 Welcome banner (scrollback)
 
-Emitido **uma vez** no boot do REPL, como `PermanentItem` kind `'session-banner'`. Duas linhas consecutivas, sem linha em branco entre elas.
+Emitido **uma vez** no boot do REPL, como `PermanentItem` kind `'session-banner'`. Duas (ou três) linhas consecutivas, sem linha em branco entre elas.
 
 ```
 Forja v0.0.0
 /run/media/lex/.../forja
+✓ sandbox enforcement active (bwrap)    ← linha opcional, §13.7
 ```
 
 | Linha | Estilo | Pergunta |
 |---|---|---|
 | 1 (title) | `<bold>app</bold> <secondary>version</secondary>` | Qual versão? |
 | 2 (cwd) | `secondary` | Em qual cwd? |
+| 3 (sandboxActive, opcional) | `secondary` | Bash spawns estão wrapped? |
 
 **Versão prefixada com `v`** (`Forja v0.0.0`, não `Forja 0.0.0`) — convenção semver, identifica a string como versão à primeira leitura. App e version têm **paint tokens distintos** — bold pra app (nome próprio), secondary pra version (metadata). Cor disabled (`NO_COLOR`), ambos renderizam sem SGR.
+
+**Linha sandboxActive (§13.7).** O campo `sandboxActive?: 'bwrap' | 'sandbox-exec'` no `SessionBannerEvent` carrega a tool ativa quando broker resolveu pra spawn-mode + sandbox tool presente — exatamente o estado `'active'` do `SandboxEnforcementSnapshot` em `bootstrap.ts`. Renderer renderiza inline (sem leading blank) usando paint `secondary` pra que a posture afirmativa leia como parte do banner frame, não como alerta separado. Os outros três estados (`'no-tool'` / `'operator-override'` / `'degraded-passthrough'`) ficam FORA do banner — viram `warn`/`error` events com leading blank, porque eles SÃO warnings que merecem emphasis. Operadores que rodam em host sem bwrap ou que forçam `--broker in-process` veem o aviso ao invés da linha afirmativa.
 
 **Removidos do design original** (esta forma supersede a anterior de 3 blocos com identity + env):
 

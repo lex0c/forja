@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import {
   type Capability,
+  INVALID_SCOPE_SENTINEL,
+  capabilityCovers,
   capabilityCoversCwdAware,
   capabilityEquals,
   effectiveCovers,
@@ -57,6 +59,51 @@ describe('formatCapability + parseCapability', () => {
     const cap = parseCapability('net-ingress:8080:9000');
     expect(cap.scope).toBe('8080:9000');
     expect(formatCapability(cap)).toBe('net-ingress:8080:9000');
+  });
+
+  test('scope=null on scoped kind emits the invalid sentinel (not wildcard)', () => {
+    // Programming-bug shape: resolver constructed
+    // `{ kind: 'read-fs', scope: null }` instead of using `readFs(p)`.
+    // Pre-fix the format coerced to `read-fs:*` (silent widen — a
+    // permissive policy would have happily covered this). Post-fix
+    // emits `<invalid>` sentinel: grepable in audit, refuse on
+    // coverage (see capabilityCovers tests).
+    const bug: Capability = { kind: 'read-fs', scope: null };
+    expect(formatCapability(bug)).toBe(`read-fs:${INVALID_SCOPE_SENTINEL}`);
+    const bugWrite: Capability = { kind: 'write-fs', scope: null };
+    expect(formatCapability(bugWrite)).toBe(`write-fs:${INVALID_SCOPE_SENTINEL}`);
+  });
+});
+
+describe('capabilityCovers — invalid-scope sentinel guard', () => {
+  // The sentinel emitted by formatCapability when scope=null reaches
+  // capabilityCovers via re-parsed audit rows / IPC marshaling.
+  // Coverage MUST refuse on either side: a permissive parent like
+  // `read-fs:**` must NOT cover the bug cap, and a bug parent must
+  // NOT cover a legitimate child.
+  const invalidCap = (kind: 'read-fs' | 'write-fs'): Capability => ({
+    kind,
+    scope: INVALID_SCOPE_SENTINEL,
+  });
+
+  test('permissive parent does NOT cover the invalid-scope child', () => {
+    const parent = readFs('**');
+    expect(capabilityCovers(parent, invalidCap('read-fs'))).toBe(false);
+  });
+
+  test('invalid-scope parent does NOT cover a legitimate child', () => {
+    expect(capabilityCovers(invalidCap('read-fs'), readFs('src/x.ts'))).toBe(false);
+  });
+
+  test('invalid-scope on both sides does NOT cover', () => {
+    expect(capabilityCovers(invalidCap('read-fs'), invalidCap('read-fs'))).toBe(false);
+  });
+
+  test('capabilityCoversCwdAware mirrors the guard for fs kinds', () => {
+    expect(capabilityCoversCwdAware(readFs('**'), invalidCap('read-fs'), '/work')).toBe(false);
+    expect(capabilityCoversCwdAware(invalidCap('read-fs'), readFs('src/x.ts'), '/work')).toBe(
+      false,
+    );
   });
 });
 
