@@ -1,13 +1,15 @@
-import { lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { DB } from '../storage/db.ts';
 import {
   OPERATOR_DRIVEN_EVIDENCE_MARKER,
   getLastInvalidationEventsBatch,
 } from '../storage/repos/eviction-events.ts';
+import { atomicWrite } from './atomic.ts';
 import { isExpired } from './expires.ts';
 import { FrontmatterError, serializeMemoryFile } from './frontmatter.ts';
 import {
+  INDEX_HEADER,
   IndexError,
   type ParsedIndex,
   parseIndex,
@@ -77,19 +79,6 @@ export interface RemoveMemoryInput {
 
 const isEnoent = (err: unknown): boolean =>
   typeof err === 'object' && err !== null && (err as NodeJS.ErrnoException).code === 'ENOENT';
-
-const INDEX_HEADER = '# Memory index';
-
-const tempPathFor = (finalPath: string): string => {
-  const rand = Math.random().toString(36).slice(2, 8);
-  return `${finalPath}.tmp-${process.pid}-${rand}`;
-};
-
-const atomicWrite = (path: string, content: string): void => {
-  const tmp = tempPathFor(path);
-  writeFileSync(tmp, content);
-  renameSync(tmp, path);
-};
 
 // Read MEMORY.md, returning empty when absent. Same forgiveness as
 // the writer's loader: malformed lines are dropped on re-serialize

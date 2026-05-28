@@ -2,6 +2,32 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-28] seed memory — slice 3: vendor catalog + bootstrap install
+
+Slice 3 of seed memory (`docs/spec/MEMORY.md §5.7.4 + §5.7.8`). Ships the 10 vendor-curated seeds as bundled assets and wires the bootstrap to auto-install them into the user scope's `seeds/` subdirectory.
+
+**Branch:** continued on `feat/memory-seeds`.
+
+**Shipped on this branch:**
+
+- **`src/cli/init-seeds/` — 10 vendor seeds.** Each `.md` carries `source: seed`, `seed_origin: vendor`, `seed_version: "1.0"`, `trust: trusted`, body within the 30-line cap. The 10 seeds (alphabetical): `confirm-blast-radius`, `failure-root-cause`, `git-first-orientation`, `no-auto-commit`, `no-fabrication`, `prefer-specialized-navigation`, `respect-repo-conventions`, `safe-edit-discipline`, `scope-discipline`, `secret-handling` — exactly the §5.7.8 catalog. Body counts range 20–27 lines; the lowest-effort change is now in markdown, not code.
+
+- **`src/cli/init-seeds/index.ts` — `CANONICAL_SEEDS` array.** Same shape as the existing `init-skills/index.ts` and `init-playbooks/index.ts` — bun's `with { type: 'text' }` embeds the file content at build time so the compiled binary carries the assets without a runtime filesystem dependency. Each entry pins `{filename, name, description, content}` so the installer can populate `seeds/MEMORY.md` without re-parsing the body. Hard-cap of 10 is documented at the module's header (§5.7.7: if a future seed would push the count to 11, that's the signal to move it into a skill or playbook).
+
+- **`src/memory/seeds-installer.ts` — `installVendorSeeds`.** Idempotent installer that writes the catalog into `<user>/seeds/` via the slice-2 path primitives. Skip-if-exists per body so operator edits between boots survive (the full hash-compare + diff-prompt upgrade flow from §5.7.5 lands in slice 4). Always regenerates `seeds/MEMORY.md` so the canonical index reflects the catalog — the body files are operator-owned, the index is agent-owned (same invariant as §3.2). Atomic-write via `writeFileSync` + `renameSync` mirrors the writer in `src/memory/writer.ts`. Returns `{wrote, skipped, indexPath}` for the boot log. A `source` seam lets tests pin against a subset of canonical entries.
+
+- **`src/cli/bootstrap.ts` wire-up.** The installer is invoked between `resolveScopeRoots(repoRoot)` and `createMemoryRegistry`. Failures are caught + logged to stderr (one corrupt user-scope subdir shouldn't gate the session); the boot continues with whatever seeds already exist on disk. A future `--no-seeds` flag and disable sentinel (slice 5) plug in here.
+
+**Deliberately deferred to slice 7 (UI + audit).** The installed seeds are NOT yet registered into the `MemoryRegistry` — `loadSeedsIndex` exists (slice 2) but nothing merges its entries into `allListings`/`findListing`. The merge needs a `MemoryLocation` discriminator (`{scope, subdir?}`) so a name lookup of `safe-edit-discipline` knows to read `<user>/seeds/safe-edit-discipline.md` instead of `<user>/safe-edit-discipline.md`. That discriminator is also what closes the slice-2 code-review #6 hazard (`memoryNameFromPath` ambiguity). Lands together in slice 7.
+
+**Post-review tightening (same slice).** Three findings from the slice-3 code review applied: (1) `seeds-installer.ts` now passes the canonical `INDEX_HEADER = '# Memory index'` to `serializeIndex`, matching the writer.ts / transitions.ts / lifecycle.ts pattern — `seeds/MEMORY.md` no longer ships headerless. (2) Extracted `src/memory/atomic.ts` with shared `tempPathFor` + `atomicWrite`; the new helpers use `crypto.randomUUID()` (slice-1's hardening already adopted in transitions.ts, but writer.ts and lifecycle.ts had stayed on the older `Math.random()`-with-pid pattern). The duplication of these helpers across writer.ts, transitions.ts, lifecycle.ts, and seeds-installer.ts is now eliminated — single source of truth. (3) Exported `INDEX_HEADER` from `index-file.ts` and removed three local copies (writer.ts, transitions.ts, lifecycle.ts), so an operator-facing rename flows uniformly across every MEMORY.md the agent produces. 688 memory tests + 55 bootstrap tests still pass; typecheck + lint clean.
+
+**Tests + validation:**
+- `tests/cli/init-seeds.test.ts`: 5 tests pinning every canonical seed parses cleanly via `parseMemoryFile` (full cross-field validation including seed-only rules), body within the cap, filenames unique + alphabetically ordered, names unique, count ≤ 10.
+- `tests/memory/seeds-installer.test.ts`: 10 tests covering first-install (10 bodies + index written, parseable round-trip), idempotence (re-run skips all; operator edits preserved), index regeneration on damage, custom-source seam, empty-source graceful no-op, parent-dir creation.
+- `bun run typecheck` clean, `bun run lint` clean.
+- `bun test tests/memory/` → 688 pass (+10 vs slice 2); `bun test tests/cli/bootstrap.test.ts` → 55 pass; `bun test tests/cli/init-seeds.test.ts` → 5 pass.
+
 ## [2026-05-28] seed memory — slice 2: seeds/ subdir path + loader primitives
 
 Slice 2 of seed memory (`docs/spec/MEMORY.md §5.7.4`). Lays the filesystem layer the slice-3 vendor catalog installer will write through: a dedicated `<user>/seeds/` subdirectory with sandbox-aware path resolvers and loader entry points that mirror the top-level scope helpers.

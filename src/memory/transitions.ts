@@ -21,15 +21,7 @@
 // (verify-before-act in 1.3.c2, /memory delete in 1.3.c3, restore
 // slash in 1.3.d) lands in subsequent slices.
 
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  renameSync,
-  unlinkSync,
-  writeFileSync,
-} from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 import type { HookChainResult, HookEventPayload } from '../hooks/types.ts';
 import type { DB } from '../storage/db.ts';
 import {
@@ -41,9 +33,11 @@ import {
   preflightValidateEvidence,
 } from '../storage/repos/eviction-events.ts';
 import { getEarliestMemoryCreatedAt } from '../storage/repos/memory-events.ts';
+import { atomicWrite } from './atomic.ts';
 import { detectMemoryDependents } from './dependents.ts';
 import { parseMemoryFile, serializeMemoryFile } from './frontmatter.ts';
 import {
+  INDEX_HEADER,
   type ParsedIndex,
   parseIndex,
   removeIndexEntry,
@@ -161,24 +155,8 @@ export type TransitionMemoryStateResult =
 
 // ─── helpers ─────────────────────────────────────────────────────────
 
-const INDEX_HEADER = '# Memory index';
-
 const isEnoent = (err: unknown): boolean =>
   typeof err === 'object' && err !== null && (err as NodeJS.ErrnoException).code === 'ENOENT';
-
-// Atomic file write — mirror of lifecycle.ts/writer.ts shape.
-// crypto.randomUUID() for tmp suffix (uniform with
-// appendEvictionEvent + memory_events id generation; the older
-// process.pid + Math.random() shape collides if two processes
-// share pid % 2^16 and produce the same Math.random() slice,
-// which is theoretical but Math.random() seeded the same on
-// process clone is real on some platforms).
-const atomicWrite = (path: string, content: string): void => {
-  const tmp = `${path}.tmp-${crypto.randomUUID()}`;
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(tmp, content);
-  renameSync(tmp, path);
-};
 
 const loadOrEmptyIndex = (path: string): ParsedIndex => {
   try {

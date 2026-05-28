@@ -47,6 +47,13 @@ export class IndexError extends Error {
   override readonly name = 'IndexError';
 }
 
+// Canonical header emitted by every index writer (writer.ts,
+// transitions.ts, lifecycle.ts, seeds-installer.ts). Centralized
+// here so an operator-facing rename (e.g. "# Memories") flows
+// uniformly across every MEMORY.md the agent produces. Callers
+// pass this verbatim through `serializeIndex`'s `header` option.
+export const INDEX_HEADER = '# Memory index';
+
 const INDEX_LINE_HARD_MAX = 200;
 
 // Per-line max from spec §3.2 ("< 150 caracteres"). Enforced as a
