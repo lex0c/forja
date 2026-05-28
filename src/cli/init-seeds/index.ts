@@ -51,6 +51,11 @@ export interface CanonicalSeed {
   // One-line description from the frontmatter; mirrored into the
   // seeds/MEMORY.md index entry's hook.
   description: string;
+  // The frontmatter `seed_version`. Mirrored into the install
+  // manifest so the upgrade lifecycle (slice 4) can detect a
+  // vendor bump without re-parsing each body on every boot. Kept
+  // in sync with the .md frontmatter via the catalog test.
+  version: string;
   // Raw frontmatter + body, written verbatim — the seed-aware parser
   // validates at install/read time, so we keep the source form and
   // let an operator edit it later.
@@ -65,24 +70,28 @@ export const CANONICAL_SEEDS: ReadonlyArray<CanonicalSeed> = [
     filename: 'confirm-blast-radius.md',
     name: 'confirm-blast-radius',
     description: 'ações irreversíveis ou de raio amplo exigem mapeamento de impacto + confirmação',
+    version: '1.0',
     content: confirmBlastRadiusMd,
   },
   {
     filename: 'failure-root-cause.md',
     name: 'failure-root-cause',
     description: 'erro/teste falhando exige causa raiz; nunca bypass silencioso',
+    version: '1.0',
     content: failureRootCauseMd,
   },
   {
     filename: 'git-first-orientation.md',
     name: 'git-first-orientation',
     description: 'sessão fresca em repo git começa por git status + git log -10',
+    version: '1.0',
     content: gitFirstOrientationMd,
   },
   {
     filename: 'no-auto-commit.md',
     name: 'no-auto-commit',
     description: 'nunca criar commit sem pedido explícito do user',
+    version: '1.0',
     content: noAutoCommitMd,
   },
   {
@@ -90,24 +99,28 @@ export const CANONICAL_SEEDS: ReadonlyArray<CanonicalSeed> = [
     name: 'no-fabrication',
     description:
       'não inventar fato/URL/path/símbolo; verificar antes de afirmar; declarar incerteza em limite semântico',
+    version: '1.0',
     content: noFabricationMd,
   },
   {
     filename: 'prefer-specialized-navigation.md',
     name: 'prefer-specialized-navigation',
     description: 'tool dedicada > Bash; grep + read targeted > read inteiro em arquivo grande',
+    version: '1.0',
     content: preferSpecializedNavigationMd,
   },
   {
     filename: 'respect-repo-conventions.md',
     name: 'respect-repo-conventions',
     description: 'convenções vêm do repo (git log, configs), nunca de defaults genéricos',
+    version: '1.0',
     content: respectRepoConventionsMd,
   },
   {
     filename: 'safe-edit-discipline.md',
     name: 'safe-edit-discipline',
     description: 'ler antes de Edit; Edit em existente, Write so para novo ou rewrite completo',
+    version: '1.0',
     content: safeEditDisciplineMd,
   },
   {
@@ -115,12 +128,14 @@ export const CANONICAL_SEEDS: ReadonlyArray<CanonicalSeed> = [
     name: 'scope-discipline',
     description:
       'ficar no escopo pedido; bugfix ≠ cleanup; sem abstração antes da terceira repetição',
+    version: '1.0',
     content: scopeDisciplineMd,
   },
   {
     filename: 'secret-handling.md',
     name: 'secret-handling',
     description: 'nunca commitar/salvar credenciais; redact em output',
+    version: '1.0',
     content: secretHandlingMd,
   },
 ];

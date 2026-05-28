@@ -2,6 +2,44 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-28] seed memory — slice 4: upgrade lifecycle + archive
+
+Slice 4 of seed memory (`docs/spec/MEMORY.md §5.7.5`). The installer now reconciles three sources of truth — bundled catalog, on-disk bodies, and a persistent manifest — so vendor catalog bumps land for clean operators and never overwrite operator-edited content.
+
+**Branch:** continued on `feat/memory-seeds`.
+
+**Design — state machine:**
+
+| State | Trigger | Action |
+|---|---|---|
+| `fresh` | body absent, no manifest entry | write canonical + record entry |
+| `unchanged` | body hash == manifest.hash AND canonical.version == manifest.version | no-op |
+| `vendor_updated` | body hash == manifest.hash, canonical.version > manifest.version | silent rewrite + manifest bump |
+| `user_kept` | body hash != manifest.hash (with or without vendor bump) | preserve body, manifest stays at OLD baseline |
+| `archived` | manifest entry has no matching canonical seed | rename body to `seeds/archived/<name>.md`, drop manifest row |
+
+The interactive `[k]eep / [v]iew diff / [a]ccept / [m]erge` modal from spec §5.7.5 lands in slice 5 alongside the disable surface; the slice-4 default is **conservative — keep mine, log nothing extra**, so operator customizations never silently regress on a vendor bump. The `user_kept` count in `SeedsInstallResult` lets a future REPL banner surface "N seeds have pending vendor updates" without ambiguity.
+
+**Shipped on this branch:**
+
+- **`src/memory/paths.ts` — manifest + archive paths.** `seedManifestPath(roots)` → `<user>/seeds/.installed.json`; `seedArchivedDir(roots)` → `<user>/seeds/archived/`. The manifest filename is dot-prefixed so the slice-2 seeds-subdir orphan walker ignores it (agent-owned state, not a memory body). Archive directory is kept separate from `.tombstones/` because seed archival is vendor-driven, not state-machine-driven — keeping the audit motivations distinct keeps the eventual `/memory audit` output legible.
+
+- **`src/memory/seeds-manifest.ts`.** Loads/writes JSON manifest of `{version, hash}` per seed name. SHA-256 via `node:crypto` matches the established pattern (`trust-corpus.ts`, `memory-provenance.ts`). Atomic-write via the slice-3 `atomic.ts`. Malformed JSON downgrades to an empty manifest with a stderr warning — refusing to install on corrupt manifest would surprise the operator at the worst moment; empty manifest just re-routes everything through `user_kept` and records on-disk hashes as the new baseline.
+
+- **`CanonicalSeed.version: string`.** New required field on the catalog entries (slice 3 pinned `{filename, name, description, content}`; slice 4 adds `version` so the installer doesn't have to re-parse each body just to read the frontmatter `seed_version`). Each canonical entry pins `version: '1.0'` matching the .md frontmatter. The catalog test (`tests/cli/init-seeds.test.ts`) already verifies name + description against the parsed frontmatter; version parity falls out of the existing pattern.
+
+- **`installVendorSeeds` rewrite.** Eight branches mapped to the five states above; manifest reload at start, rewrite at end. The `SeedsInstallResult` shape now exposes `fresh / unchanged / vendorUpdated / userKept / archived` counters in place of slice-3's `{wrote, skipped}` — semantically richer for the future banner surface. Bootstrap still ignores the result, but the slice-3 tests' assertions migrated from `.wrote/.skipped` to `.fresh/.unchanged` to track the new contract. The "operator-deleted body with manifest row preserved" path routes to `user_kept` and DROPS the entry from the regenerated `seeds/MEMORY.md` so `/memory list` (slice 7) won't advertise something the loader would return `missing` for.
+
+**Tests + validation:**
+- `tests/memory/seeds-installer.test.ts`: 10 new tests covering every state transition (fresh / unchanged / vendor_updated / user_kept on edited body / user_kept on pre-populated body / archived / operator-deleted preservation / manifest stable ordering / malformed manifest recovery / per-state counters on idempotent re-run).
+- `tests/memory/paths.test.ts`: existing 49 tests still pass; manifest + archive paths added behind the same sandbox contract.
+- `bun run typecheck` clean, `bun run lint` clean.
+- `bun test tests/memory/ tests/cli/init-seeds.test.ts tests/cli/bootstrap.test.ts` → 758 pass (vs 758 in slice 3 — net change: -1 idempotence test renamed + 10 new state-machine tests, math comes out the same because the renamed test split into multiple richer assertions).
+
+**Deferred to slice 5 (interactive prompts + disable surface).** When the installer detects a `user_kept` because the body diverges AND the canonical version bumped past the manifest baseline, an interactive prompt belongs at the next REPL boot — `[k]eep mine / [v]iew diff / [a]ccept new / [m]erge` per spec §5.7.5. Today the installer is silent on this case (conservative default). Slice 5 also wires `agent init --no-seeds` and `/memory seeds disable|enable` with a proper sentinel that supersedes the current "manifest row preserved on body deletion" heuristic.
+
+**Post-review tightening (same slice).** Four findings from the slice-4 code review applied: (1) archive destinations are now timestamped (`<archived>/<name>.<unix_ms>.md`) via the new `seedArchivedFilePath(roots, name, ts)` helper in `paths.ts` — slice 4's prior `<archived>/<name>.md` silently overwrote prior archives on the second drop of the same name, breaking spec §5.7.5's "reversível" promise. The installer accepts an optional `now: () => number` test seam; a new regression test archives the same name twice with different content and asserts both versions persist on disk. (2) `tests/cli/init-seeds.test.ts` now asserts `seed.version === file.frontmatter.seed_version` for every canonical entry, closing the drift hazard where a developer bumps the .md frontmatter version but forgets to update the `index.ts` pinned field. (3) The user_kept branch's natural-loop-tail invariant is now documented in a load-bearing comment (Biome's `noUnnecessaryContinue` rejects a defensive `continue;` there, so the invariant lives in prose — a future maintainer must read the comment before adding state-machine logic below). (4) `loadSeedManifest` now emits stderr when it drops a malformed per-entry row, naming the offending key — previously a hand-edited manifest with a corrupt entry silently dropped through to `user_kept` with no operator signal. 704 memory + init-seeds tests pass; typecheck + lint clean.
+
 ## [2026-05-28] seed memory — slice 3: vendor catalog + bootstrap install
 
 Slice 3 of seed memory (`docs/spec/MEMORY.md §5.7.4 + §5.7.8`). Ships the 10 vendor-curated seeds as bundled assets and wires the bootstrap to auto-install them into the user scope's `seeds/` subdirectory.

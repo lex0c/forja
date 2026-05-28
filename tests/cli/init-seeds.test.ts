@@ -26,11 +26,22 @@ describe('CANONICAL_SEEDS — bundled vendor seed catalog', () => {
       expect(file.frontmatter.seed_origin).toBe('vendor');
       expect(file.frontmatter.seed_version).toBe('1.0');
       expect(`${file.frontmatter.name}.md`).toBe(seed.filename);
-      // The index entry's pinned `name`/`description` must match
-      // the frontmatter — the installer copies them into
-      // seeds/MEMORY.md without re-parsing each body.
+      // The index entry's pinned `name`/`description`/`version`
+      // must match the frontmatter — the installer copies them into
+      // seeds/MEMORY.md and into the install manifest without
+      // re-parsing each body. A developer who bumps the .md
+      // frontmatter `seed_version` without updating the index.ts
+      // entry would otherwise ship a catalog whose manifest records
+      // the wrong version, silently misclassifying future upgrade
+      // boots (slice-4 review fix #3).
       expect(seed.name).toBe(file.frontmatter.name);
       expect(seed.description).toBe(file.frontmatter.description);
+      // seed_version is `string | undefined` on the MemoryFrontmatter
+      // type, but the parser's cross-field rule guarantees it's set
+      // when source=seed (which we just asserted above). Pin both
+      // halves so the assertion's contract is explicit.
+      expect(file.frontmatter.seed_version).toBeDefined();
+      expect(seed.version).toBe(file.frontmatter.seed_version ?? '');
     }
   });
 

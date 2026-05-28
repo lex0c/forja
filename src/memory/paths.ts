@@ -254,6 +254,47 @@ export const seedTombstonePath = (roots: ScopeRoots, name: string, ts: number): 
   return candidate;
 };
 
+// `<user>/seeds/.installed.json` — manifest of the last-installed
+// {version, hash} per canonical seed. Owned by the upgrade
+// lifecycle (spec §5.7.5): on each boot, the installer reads this
+// to decide which seeds need write (fresh / vendor-bumped /
+// user-edited) vs. skip (unchanged), and rewrites it at the end.
+// Dot-prefixed so the seeds-subdir orphan walker (slice 2)
+// silently ignores it — the manifest is agent-owned state, not a
+// memory body.
+export const seedManifestPath = (roots: ScopeRoots): string =>
+  join(seedsRoot(roots), '.installed.json');
+
+// `<user>/seeds/archived/` — destination for seeds the new vendor
+// catalog dropped but the previous manifest still listed (spec
+// §5.7.5: "Seeds removidas no novo catálogo viram
+// seeds/archived/, não delete (reversível)."). Distinct from
+// `.tombstones/` (which is the general memory-subsystem eviction
+// store) because seed archival is a vendor-driven removal, not a
+// state-machine eviction; keeping the two separate keeps the
+// audit trail of each motivation legible.
+export const seedArchivedDir = (roots: ScopeRoots): string => join(seedsRoot(roots), 'archived');
+
+// `<user>/seeds/archived/<name>.<unix_ms>.md` — timestamped archive
+// destination. The timestamp prevents the second archival of the
+// same name from overwriting the first (which would break the spec's
+// "reversível" promise: an operator's prior restore-and-edit cycle
+// would be lost on the second vendor-side removal). Same filename
+// shape as `tombstonePath` so `parseTombstoneFilename` can be reused
+// when a future `/memory seeds restore <name>` slash command lands
+// (slice 5+); the parser is shared across both eviction surfaces.
+export const seedArchivedFilePath = (roots: ScopeRoots, name: string, ts: number): string => {
+  validateName(name);
+  const resolvedRoot = resolve(seedArchivedDir(roots));
+  const candidate = resolve(join(resolvedRoot, `${name}.${ts}.md`));
+  if (!isUnderRoot(candidate, resolvedRoot)) {
+    throw new ScopeError(
+      `seed archive path escapes archived/ root: name=${JSON.stringify(name)} ts=${ts}`,
+    );
+  }
+  return candidate;
+};
+
 // `.tombstones/` directory inside a scope. Per MEMORY.md §6.5.3,
 // every eviction moves the body file here (preserving the
 // original frontmatter with `state: evicted`) so restore is a
