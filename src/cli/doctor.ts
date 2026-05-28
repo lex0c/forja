@@ -114,12 +114,6 @@ export interface RunDoctorOptions {
   // checks (sandbox binary, policy_load, hash_chain, fs writable,
   // sealing) bypass the cache regardless.
   cache?: DoctorCheckCache;
-  // §13.7 test seam — overrides the default compiled-binary
-  // detection inside `sandbox_enforcement`. Production reads
-  // `import.meta.dir.includes('/$bunfs/')`; tests pass `() => true`
-  // to exercise the compiled-binary warn path without standing up
-  // a Bun-compiled fixture.
-  isCompiledBinary?: () => boolean;
   out?: (s: string) => void;
   err?: (s: string) => void;
 }
@@ -898,49 +892,38 @@ const PACKAGE_VERSION = ((): string => {
   }
 })();
 
-// §13.7 broker mode honesty check. The earlier `sandbox` check
-// reports whether the sandbox BINARY is present on the host —
-// useful but misleading on its own, because the default broker
-// mode (`in-process`) does NOT wrap bash spawns with that binary.
-// Operators reading "sandbox: ok bwrap 0.10.0" come away thinking
-// they're protected when the actual wire-up runs bash directly
-// in the main process. This check surfaces the gap explicitly.
+// §13.7 broker-mode honesty check. The earlier `sandbox` check
+// reports whether the sandbox BINARY is present on the host. This
+// check derives the next layer: given the binary's presence (or
+// absence), what does the broker default actually do at boot?
 //
-// Two scenarios, both `warn` (the engine still bootstraps —
-// `fail` would block doctor exit code and a perfectly usable
-// default config):
+// As of the broker default-flip slice, `bootstrap.ts:constructBroker`
+// resolves `'spawn'` automatically when the host has a working
+// sandbox tool, and `'in-process'` only as the no-sandbox fallback.
+// Both source-checkout AND compiled-binary installs reach `'spawn'`
+// (the compiled-binary self-exec via `FORJA_BROKER_WORKER=1`).
 //
-//   1. Compiled binary install: `import.meta.dir` resolves under
-//      `/$bunfs/...` (Bun's embedded asset root). The `'spawn'`
-//      broker mode requires `bun run` against a real worker.ts
-//      file path (bootstrap.ts:1532-1535 surfaces this as a hard
-//      error). So a compiled binary CANNOT enable sandbox
-//      enforcement no matter what flag the operator passes;
-//      remediation points at source-checkout install.
+//   - sandbox binary present  → default broker resolves to `spawn`
+//                               → bash spawns wrapped per the
+//                               engine planner → `ok`.
+//   - sandbox binary missing  → default falls back to `in-process`
+//                               → bash runs unwrapped, engine
+//                               permission floors are the only
+//                               defense → `warn` with the
+//                               actionable install hint.
+//   - non-linux/non-darwin    → no sandbox tool ceiling; default
+//                               `in-process` is the only option
+//                               → `ok` "not applicable".
 //
-//   2. Source-checkout install with default (in-process) mode:
-//      the worker is available BUT the operator hasn't opted in
-//      via `--broker spawn`. Remediation surfaces the
-//      actionable flag.
-//
-// Non-Linux/non-Darwin platforms get `ok` "not applicable" —
-// the broker has nothing to wrap with even in `'spawn'` mode on
-// platforms without a sandbox tool (§13.2 capability ceiling
-// already collapses to `[host]`).
-//
-// The check is intentionally information-only (`warn`, not
-// `fail`): the engine still runs without sandbox enforcement,
-// powered by the permission policy + bash AST resolver + protected/
-// sensitive-paths floors as defense in depth. But the operator
-// deserves to know which line of defense is actually in play
-// before assuming "doctor said sandbox ok = I'm safe".
-const defaultIsCompiledBinary = (): boolean => import.meta.dir.includes('/$bunfs/');
-
+// The operator can still force `--broker in-process` to opt out of
+// the spawn overhead; this check reports the DEFAULT path because
+// that's the dominant case and the one operators most often miss.
+// Forcing `--broker in-process` on a host with sandbox available
+// remains a deliberate operator action, not a hidden default.
 const sandboxEnforcementCheck = (
   which: (cmd: string) => string | null,
   exists?: (path: string) => boolean,
   stat?: (path: string) => { uid: number; mode: number } | null,
-  isCompiledBinary: () => boolean = defaultIsCompiledBinary,
 ): DoctorCheck => {
   const platform = nodePlatform();
   if (platform !== 'linux' && platform !== 'darwin') {
@@ -962,33 +945,18 @@ const sandboxEnforcementCheck = (
     return {
       name: 'sandbox_enforcement',
       status: 'warn',
-      detail: 'sandbox binary missing — see `sandbox` check above; enforcement unreachable',
-    };
-  }
-  // Compiled-binary detection. Default probe: Bun's
-  // `bun build --compile` rewrites `import.meta.dir` to the embedded
-  // asset root, conventionally at `/$bunfs/root/`. The leading
-  // `/$bunfs/` substring is the stable signature across Bun
-  // versions; the `root` segment varies. A dev/source run resolves
-  // to a real on-disk dir. Tests inject `isCompiledBinary` to
-  // exercise this branch deterministically.
-  if (isCompiledBinary()) {
-    return {
-      name: 'sandbox_enforcement',
-      status: 'warn',
       detail:
-        'compiled binary cannot enable spawn broker (worker.ts path not addressable inside embedded asset root); bash runs unwrapped',
+        'sandbox binary missing — broker default falls back to in-process; bash runs unwrapped',
       remediation:
-        'run forja from a source checkout (`bun run src/cli/run.ts ...`) AND pass `--broker spawn` to enable real sandbox enforcement',
+        platform === 'linux'
+          ? 'install bubblewrap (`apt install bubblewrap` or distro equivalent) to enable spawn-broker enforcement'
+          : 'macOS ships sandbox-exec built-in; verify the binary is on $PATH',
     };
   }
   return {
     name: 'sandbox_enforcement',
-    status: 'warn',
-    detail:
-      'default broker is in-process; bash runs unwrapped despite sandbox binary being available',
-    remediation:
-      'pass `--broker spawn` to wrap bash spawns with bwrap/sandbox-exec per the engine planner',
+    status: 'ok',
+    detail: `${availability.tool ?? 'sandbox tool'} available; broker default resolves to spawn — bash spawns wrapped per engine planner`,
   };
 };
 
@@ -1079,7 +1047,7 @@ export const runDoctor = async (options: RunDoctorOptions = {}): Promise<number>
     // (binary installed/removed, host trust posture). The
     // compiled-binary flag is stable within a process but the
     // probe is cheap so caching adds no value.
-    sandboxEnforcementCheck(which, options.exists, options.stat, options.isCompiledBinary),
+    sandboxEnforcementCheck(which, options.exists, options.stat),
     sealingCheck({
       env,
       cwd,

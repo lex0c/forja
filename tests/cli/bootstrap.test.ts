@@ -1087,7 +1087,17 @@ When the goal is to orient in a new repo.
   });
 
   describe('brokerMode (§13.7, slice 87)', () => {
-    test('omitted brokerMode → in-process broker is wired (default)', async () => {
+    test('omitted brokerMode → broker is wired; default depends on host sandbox availability', async () => {
+      // Default broker mode resolves dynamically: when the host has
+      // a working sandbox tool (bwrap/sandbox-exec), spawn-mode wins
+      // automatically so bash spawns get wrapped; otherwise in-process.
+      // This test asserts the broker exists and round-trips a bash
+      // command — both modes produce the same `ok:true + stdout`
+      // shape for an unwrapped echo (`sandboxProfile: null`), so
+      // the smoke test is host-mode-agnostic. The
+      // `brokerMode: 'in-process'` and `brokerMode: 'spawn'` tests
+      // below pin each mode explicitly; this one pins that the
+      // default path constructs SOMETHING usable regardless of host.
       const { config, db } = await bootstrap({
         prompt: 'hi',
         cwd: workdir,
@@ -1098,22 +1108,19 @@ When the goal is to orient in a new repo.
       });
       const broker = config.broker;
       if (broker === undefined) throw new Error('expected broker to be wired');
-      // Smoke-execute through the broker — in-process delegates
-      // straight to createBashHandler, so a simple echo should
-      // produce ok:true + stdout.
       const r = await broker.execute({
         toolName: 'bash',
-        args: { command: 'echo in-process-ok' },
+        args: { command: 'echo default-ok' },
         capabilities: [],
         sandboxProfile: null,
       });
       expect(r.ok).toBe(true);
-      expect(r.stdout).toBe('in-process-ok\n');
+      expect(r.stdout).toBe('default-ok\n');
       await broker.close();
       db.close();
     });
 
-    test('brokerMode "in-process" explicit → same as default (in-process)', async () => {
+    test('brokerMode "in-process" explicit → in-process broker wired regardless of host capability', async () => {
       const { config, db } = await bootstrap({
         prompt: 'hi',
         cwd: workdir,

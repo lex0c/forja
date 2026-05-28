@@ -2,6 +2,38 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-27] broker spawn-mode in compiled binary — self-exec via env flag
+
+The §13.7 spawn broker was unreachable from `bun build --compile` artifacts because `import.meta.dir` inside a compiled binary resolves to `/$bunfs/...` (Bun's embedded asset root) which `bun run` can't address as a script path. `bootstrap.ts:1532` surfaced this as a hard error; the consequence was that the official distribution path (`bin: ./dist/agent-*` in `package.json`) had NO way to enable sandbox enforcement. Engine still ran under the default in-process broker; `bash -s` spawned directly in the main process without bwrap/sandbox-exec wrap.
+
+**Branch:** continued on `fix/permission-engine-review`.
+
+**Approach:** the compiled binary already contains the worker module via the normal import graph (any path that runs the binary loads `src/broker/worker.ts` transitively from `src/cli/index.ts`). The problem isn't missing code — it's the missing entry. Re-invoking `process.execPath` (the binary itself) WITH `FORJA_BROKER_WORKER=1` in the env solves the dispatch: same binary, env flag detected before parseArgs, routes to the worker's exported entry. No temp files, no asset extraction, no second binary.
+
+**Shipped on this branch:**
+
+- **`worker.ts` refactor.** Extracted the request/response lifecycle into an exported `runWorkerProcess()` function. Bottom-of-file `if (import.meta.main) await runWorkerProcess()` preserves the source-checkout entry (`bun run src/broker/worker.ts`); programmatic callers (the new self-exec path) invoke the function directly. The `SIGTERM` wiring + stdin cap stay inside the function — single source of truth for the worker lifecycle.
+
+- **`src/cli/index.ts` early dispatch.** Added a `process.env.FORJA_BROKER_WORKER === '1'` check BEFORE `parseArgs`. When set, dynamic-imports `runWorkerProcess` and exits. The worker process gets zero CLI args, so detecting BEFORE parseArgs is critical — otherwise the empty-prompt branch would route to the REPL TTY gate and reject with "interactive mode requires a TTY".
+
+- **`bootstrap.ts:constructBroker` branch.** Detects compiled binary via `import.meta.dir.includes('/$bunfs/')`. Compiled path: spawns `[process.execPath]` with no args + worker env flag. Source path: keeps the existing `bun run worker.ts` invocation (worker.ts via `import.meta.main`). The `FORJA_BROKER_WORKER=1` env var is set unconditionally — harmless on the source path (worker.ts entry doesn't read it), load-bearing on the compiled path. Hard-error gate (`worker source missing`) preserved on the source branch as a defensive guard against unexpected install layouts.
+
+- **`tests/broker/worker-env-entry.test.ts` (new file).** Two regression pins: (a) `process.execPath + FORJA_BROKER_WORKER=1` invocation routes through `runWorkerProcess` (verifies the env-driven dispatch end-to-end via real spawn broker); (b) without the env flag, `src/cli/index.ts` falls through to normal CLI (defensive — guards against an accidental "always dispatch to worker" inversion). Together with the existing source-path test (`tests/broker/cancellation.test.ts:'end-to-end ...'`) both invocation paths are covered.
+
+This closes the P0 follow-up listed in the prior `sandbox enforcement honesty` entry — the compiled-binary spawn-mode gap is no longer an architectural impossibility, just a default-flip decision pending latency calibration.
+
+**Follow-up shipped same branch — default broker flip.** With compiled-binary support landed, the previous "in-process by default" became indefensible: any host with a working sandbox tool was running unwrapped bash despite the engine planner choosing real sandbox profiles. `bootstrap.ts:1359` now resolves dynamically — operator override (`input.brokerMode`) wins when set, otherwise `sandboxAvail.available ? 'spawn' : 'in-process'`. The `sandboxAvail` probe already ran at line ~610; reusing it means doctor + bootstrap + engine planner all see the same availability verdict per invocation. Operators that need the lower per-call latency override with `--broker in-process` explicitly. The `bootstrap.test.ts:'omitted brokerMode'` smoke test was rewritten to acknowledge that the default mode is now host-dependent.
+
+**Follow-up shipped same branch — `doctor sandbox_enforcement` rewrite.** The previous check (added in the prior `sandbox enforcement honesty` entry) was now factually wrong: it claimed "compiled binary cannot enable spawn broker" and "default broker is in-process; bash runs unwrapped", neither true post-flip. The rewrite reports `ok` when the sandbox binary is present (default broker resolves to spawn → bash spawns wrapped) and `warn` only when the binary is absent (default falls back to in-process). Operator forcing `--broker in-process` explicitly is a deliberate opt-out, not surfaced here. The `defaultIsCompiledBinary` test seam is no longer needed and was removed alongside the obsolete `isCompiledBinary` option on `RunDoctorOptions`. Empirical: `./dist/agent-linux-x64 doctor` now ends with `summary: all checks passed` on a clean host.
+
+**Validation:** typecheck ✅, lint ✅, 291/291 tests pass (broker suite + bootstrap + doctor). Empirical: `FORJA_BROKER_WORKER=1 bun run src/cli/index.ts < request.json` produces the same response as `bun run src/broker/worker.ts < request.json`.
+
+**Top remaining follow-ups:**
+
+- **P1 — REPL banner surfacing sandbox enforcement state.** The `doctor` check (`sandbox_enforcement`, prior entry on this branch) flags whichever mode is active. A short banner in the REPL boot would surface "✓ sandbox enforcement active (spawn broker, profile=ro|cwd-rw|...)" so operators see the signal without running doctor. With the default now dynamic, the banner can also explain why in-process was chosen (host has no sandbox tool).
+- **P2 — Build/release verification.** Wire a release-time smoke test into `scripts/build-targets.ts`: build the binary, spawn it with the env flag, expect a `__echo__` roundtrip. Catches regressions before they ship.
+- **P2 — `detectSandboxAvailability` injection seam in BootstrapInput.** The new resolver depends on the host probe; tests that want to pin both branches (sandbox-available → spawn; absent → in-process) currently rely on the runner's actual sandbox state. Adding `sandboxAvailabilityOverride?: SandboxAvailability` to BootstrapInput would let tests pin both paths deterministically without dropping the production probe.
+
 ## [2026-05-27] sandbox enforcement honesty — `doctor` + in-process comment
 
 Investigation surfaced that the production default broker mode is `in-process` (`bootstrap.ts:1339`), which means bash spawns are NOT wrapped with bwrap/sandbox-exec — even when the sandbox binary is present on the host. The `sandbox` check in `agent doctor` reported "bwrap ok" regardless, leading operators to believe enforcement was active. Worse: `bootstrap.ts:1532-1535` makes the `'spawn'` mode unreachable from compiled binaries entirely (`import.meta.dir` inside a Bun-compiled binary resolves to `/$bunfs/...` which `bun run` can't address as a worker source path). Result: the official release artifact has no path to enable sandbox enforcement.

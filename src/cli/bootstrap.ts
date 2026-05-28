@@ -162,13 +162,20 @@ export interface BootstrapInput {
   // covers. Without this flag, `host` is pruned from the candidate
   // set unconditionally.
   sandboxHost?: boolean;
-  // §13.7 broker mode (slice 87). `'in-process'` (default) wires
-  // a degenerate in-process broker — bash exec stays in main, same
-  // behavior as pre-§13.7. `'spawn'` wires `createSpawnBroker`
-  // against `bun run src/broker/worker.ts`, moving exec into a
-  // worker subprocess per call (closes spec line 928). Compiled-
-  // binary mode is currently unsupported — bootstrap throws a
-  // clear error when the worker source isn't on disk.
+  // §13.7 broker mode (slice 87). Explicit override; when omitted,
+  // bootstrap picks dynamically: `'spawn'` when the host has a
+  // working sandbox tool (`detectSandboxAvailability().available`),
+  // `'in-process'` otherwise. Rationale: a host with bwrap/
+  // sandbox-exec installed should get enforcement by default —
+  // operators that need lower per-call latency override with
+  // `--broker in-process` explicitly. `'spawn'` wires
+  // `createSpawnBroker` (worker via `bun run worker.ts` on source
+  // checkouts, self-exec via `process.execPath + FORJA_BROKER_WORKER=1`
+  // on compiled binaries); `'in-process'` wires the degenerate
+  // in-process broker (bash exec stays in main, same behavior as
+  // pre-§13.7). Operator override always wins over the dynamic
+  // default — the value here is treated as load-bearing intent
+  // even when the resolved default would have differed.
   brokerMode?: 'in-process' | 'spawn';
   // S11 opt-in for the LLM-judge semantic verifier (MEMORY.md §11.x).
   // Default false; threaded straight through to HarnessConfig.
@@ -1328,15 +1335,31 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // honors the same flag (MEMORY.md §7.2.1) and the harness
   // surfaces it for downstream gates.)
 
-  // §13.7 broker for exec-tagged tools. Slice 87 added the
-  // operator-facing `--broker` flag — `'spawn'` flips bootstrap
-  // to construct `createSpawnBroker` against `bun run
-  // src/broker/worker.ts`, moving exec into a worker subprocess
-  // per call (closes spec line 928: "CLI main não tem exec
-  // privilege"). Default `'in-process'` keeps the bash exec in
-  // main via the degenerate in-process broker — bit-for-bit
-  // equivalent to the pre-§13.7 path.
-  const broker = constructBroker(input.brokerMode ?? 'in-process', cwd, sandboxTmpdirHandle.tmpdir);
+  // §13.7 broker for exec-tagged tools. Operator override at
+  // `input.brokerMode` is load-bearing intent — when set, it wins
+  // regardless of host capability. When omitted, the default
+  // resolves dynamically: hosts with a working sandbox tool get
+  // `'spawn'` (bash spawns wrapped in bwrap/sandbox-exec per the
+  // engine's planner); hosts without sandbox tooling fall back to
+  // `'in-process'` (degenerate broker; engine + bash AST resolver +
+  // protected/sensitive paths floors remain the only defense).
+  //
+  // `sandboxAvail` was probed at line ~610 (canonical-first
+  // resolver, trust check on path-resolved fallbacks); reusing
+  // the result here means doctor + bootstrap + the engine
+  // planner all see the same availability verdict per invocation.
+  //
+  // Latency tradeoff: spawn adds ~50-150ms per bash call (process
+  // fork + Bun startup + module load). Sessions with many bash
+  // calls feel the difference; the security gain is real
+  // enforcement of the engine's selected sandbox profile vs zero
+  // enforcement on the same bash invocation. Operators who need
+  // raw throughput pass `--broker in-process` explicitly.
+  const resolvedBrokerMode: 'in-process' | 'spawn' = (() => {
+    if (input.brokerMode !== undefined) return input.brokerMode;
+    return sandboxAvail.available ? 'spawn' : 'in-process';
+  })();
+  const broker = constructBroker(resolvedBrokerMode, cwd, sandboxTmpdirHandle.tmpdir);
 
   const config: HarnessConfig = {
     provider,
@@ -1507,16 +1530,27 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
 // in the same process. Bash exec stays in main — same behavior as
 // the pre-§13.7 path. Used by default.
 //
-// `spawn`: real process isolation. Spawns `bun run
-// src/broker/worker.ts` per call; the worker reads the
-// BrokerRequest on stdin, dispatches to its bash handler, and
-// returns a BrokerResponse on stdout. The sandboxRunner closes
-// over `maybeWrapSandboxArgv` so the worker spawn is wrapped with
-// bwrap when the engine's planner picked a non-host profile.
-// Compiled-binary mode isn't supported here — `import.meta.dir`
-// in a compiled binary returns an embedded path that `bun run`
-// can't address. We surface this as a clear error rather than
-// silently failing later via a spawn-fail response.
+// `spawn`: real process isolation. Per call, spawns a fresh process
+// that reads the BrokerRequest on stdin, dispatches to its bash
+// handler, and returns a BrokerResponse on stdout. The
+// sandboxRunner closes over `maybeWrapSandboxArgv` so the worker
+// spawn is wrapped with bwrap when the engine's planner picked a
+// non-host profile.
+//
+// Two paths converge on the same worker behavior:
+//
+//   - Source checkout: spawn `process.execPath run src/broker/worker.ts`.
+//     `bun run <path>` is the standard entry, `import.meta.main` in
+//     worker.ts drives execution.
+//
+//   - Compiled binary: `import.meta.dir` resolves to `/$bunfs/...`
+//     which `bun run` can't address as a script path. Instead we
+//     self-exec the same compiled binary (`process.execPath` is the
+//     binary itself) with no CLI args + `FORJA_BROKER_WORKER=1`
+//     env flag. `src/cli/index.ts` detects the flag BEFORE parseArgs
+//     and dispatches to the worker's exported entry. Same module,
+//     same lifecycle, same single binary — no temp files, no
+//     embedded asset extraction.
 //
 // Per-call timeoutMs (slice 85) is set by the bashTool; the
 // broker-construction `timeoutMs` is the fallback ceiling for
@@ -1528,12 +1562,6 @@ const constructBroker = (
   sandboxTmpdir: string | undefined,
 ): Broker => {
   if (mode === 'spawn') {
-    const workerPath = resolve(import.meta.dir, '../broker/worker.ts');
-    if (!existsSync(workerPath)) {
-      throw new Error(
-        `broker mode 'spawn' requires worker source at ${workerPath}; compiled-binary mode is not yet supported. Re-run with --broker in-process or from a source checkout.`,
-      );
-    }
     // Slice 103 (R6 #9): no `as SandboxProfile` cast. The TS
     // annotation upstream (`BrokerRequest.sandboxProfile: string |
     // null`) admits attacker-controlled strings; the cast would
@@ -1561,10 +1589,46 @@ const constructBroker = (
     // are required: without the wrap, the SBPL still allows blanket
     // /tmp; without the env, tools still pick /tmp/<random> and hit
     // the SBPL deny.
-    const workerEnv =
+    //
+    // FORJA_BROKER_WORKER=1 is added unconditionally — harmless on
+    // the source-checkout path (worker.ts is entered via
+    // `import.meta.main` regardless), load-bearing on the compiled-
+    // binary self-exec path (index.ts checks it before parseArgs).
+    const baseEnv =
       sandboxTmpdir !== undefined
         ? { ...scrubEnv(process.env), TMPDIR: sandboxTmpdir }
         : scrubEnv(process.env);
+    const workerEnv = { ...baseEnv, FORJA_BROKER_WORKER: '1' };
+
+    // Compiled-binary detection. Bun rewrites `import.meta.dir` to
+    // the embedded `/$bunfs/...` asset root when the file lives
+    // inside a compiled binary. The signature `/$bunfs/` is stable
+    // across Bun versions; the `root` segment varies.
+    const isCompiledBinary = import.meta.dir.includes('/$bunfs/');
+    if (isCompiledBinary) {
+      // Self-exec the same binary; index.ts entry detects the env
+      // flag and routes to runWorkerProcess. No CLI args needed
+      // (and none would help — worker mode is entirely env-driven).
+      return createSpawnBroker({
+        command: process.execPath,
+        args: [],
+        cwd,
+        timeoutMs: 60_000,
+        sandboxRunner,
+        env: workerEnv,
+      });
+    }
+
+    // Source checkout: spawn `bun run worker.ts`. The worker entry
+    // file MUST exist on disk; if a future build/install layout
+    // moves the file, surface a clear error rather than failing
+    // later via a spawn-fail response.
+    const workerPath = resolve(import.meta.dir, '../broker/worker.ts');
+    if (!existsSync(workerPath)) {
+      throw new Error(
+        `broker mode 'spawn' requires worker source at ${workerPath}; not found in this install layout.`,
+      );
+    }
     return createSpawnBroker({
       command: process.execPath,
       args: ['run', workerPath],

@@ -3,6 +3,26 @@ import { parseArgs, usage } from './args.ts';
 import type { InitOptions } from './init.ts';
 import { VERSION } from './version.ts';
 
+// §13.7 broker-worker self-exec. The spawn broker's only way to
+// reach the worker module in a compiled binary is to re-invoke the
+// same `process.execPath` (the binary itself can't address its own
+// embedded `/$bunfs/.../worker.ts` via `bun run`). The parent
+// process sets `FORJA_BROKER_WORKER=1` on the spawn env; we detect
+// the flag BEFORE parseArgs (the worker process gets zero CLI args
+// and would otherwise hit the empty-prompt REPL gate) and hand off
+// to the worker's exported entry point.
+//
+// In source checkout the parent uses `bun run src/broker/worker.ts`
+// directly, so this branch never fires there — `import.meta.main`
+// inside worker.ts handles top-level execution on that path. The
+// env-driven branch and the script-driven branch produce identical
+// behavior; the worker doesn't care how it was invoked.
+if (process.env.FORJA_BROKER_WORKER === '1') {
+  const { runWorkerProcess } = await import('../broker/worker.ts');
+  await runWorkerProcess();
+  process.exit(0);
+}
+
 const main = async (): Promise<number> => {
   const parsed = parseArgs(Bun.argv.slice(2));
   if (!parsed.ok) {
