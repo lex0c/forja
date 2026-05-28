@@ -561,10 +561,20 @@ describe('runInit — full bundle (default order)', () => {
     rmSync(cwd, { recursive: true, force: true });
   });
 
-  test('scaffolds all five artifacts on a clean cwd', () => {
+  test('scaffolds all five project artifacts on a clean cwd', () => {
+    // Pin to the five project-scope steps (permissions, gitignore,
+    // config, playbooks, skills) by `only=`. The full DEFAULT_STEPS
+    // list includes `seeds` (user-scope install), which the
+    // dedicated init-seeds.test.ts exercises under an isolated
+    // XDG_CONFIG_HOME. Mixing it in here would either pollute the
+    // developer's real ~/.config/agent or force a tmpdir XDG
+    // override on every test — both unnecessary because the seed
+    // step is unrelated to the project-artifact scaffold this test
+    // pins.
     const code = runInit({
       cwd,
       mode: 'strict',
+      only: ['permissions', 'gitignore', 'config', 'playbooks', 'skills'],
       playbookSource: FIXTURE_PLAYBOOKS,
       skillSource: FIXTURE_SKILLS,
       out,

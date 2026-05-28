@@ -769,39 +769,54 @@ describe('drift-guard — INIT_MARKERS ↔ init.DEFAULT_STEPS', () => {
   // that init can scaffold but purge refuses to recognize. This test
   // pairs the two so the failure surfaces in CI, not in operator
   // surprise.
+  //
+  // Exception: `seeds` step writes to the USER scope
+  // (`<user>/seeds/<name>.md`), not the project scope. Purge operates
+  // on `<cwd>/.agent/`, so seeds leave no project-level marker — the
+  // step is intentionally absent from STEP_TO_MARKER and from
+  // INIT_MARKERS. The `null` mapping documents the omission so a
+  // future contributor can't accidentally read "seeds was forgotten"
+  // when in fact it's deliberately scoped out.
   // Typed against the readonly INIT_MARKERS tuple so the Record's
   // VALUE union is exactly the five literal filenames purge knows.
   // A wider `string` here would let a typo ('permission.yaml')
   // pass the type check and only fail at runtime — defeats the
   // drift-guard intent.
-  const STEP_TO_MARKER: Record<InitStep, (typeof INIT_MARKERS)[number]> = {
+  const STEP_TO_MARKER: Record<InitStep, (typeof INIT_MARKERS)[number] | null> = {
     permissions: 'permissions.yaml',
     gitignore: '.gitignore',
     config: 'config.toml',
     playbooks: 'agents',
     skills: 'skills',
+    seeds: null, // user-scope, no project marker — see comment above
   };
 
-  test('every init step has a marker recognized by purge', () => {
+  test('every project-marker init step has a marker recognized by purge', () => {
     for (const step of DEFAULT_STEPS) {
       const marker = STEP_TO_MARKER[step];
+      if (marker === null) continue; // user-scope step, intentionally markerless
       expect(INIT_MARKERS).toContain(marker);
     }
   });
 
   test('every purge marker maps to an init step (no orphan markers)', () => {
-    const knownMarkers = new Set<string>(Object.values(STEP_TO_MARKER));
+    const knownMarkers = new Set<string>();
+    for (const m of Object.values(STEP_TO_MARKER)) {
+      if (m !== null) knownMarkers.add(m);
+    }
     for (const m of INIT_MARKERS) {
       expect(knownMarkers.has(m)).toBe(true);
     }
   });
 
-  test('STEP_TO_MARKER covers every InitStep enum value', () => {
+  test('STEP_TO_MARKER covers every InitStep enum value (including null-mapped user-scope steps)', () => {
     // Defense against init.ts adding a new InitStep variant without
     // updating this map — TS already enforces the Record key set, but
     // a runtime check makes the failure mode explicit on test run.
+    // Null is a valid value (see SEED_TO_MARKER comment above) so
+    // `hasOwnProperty` is the right check, not truthiness.
     for (const step of DEFAULT_STEPS) {
-      expect(STEP_TO_MARKER[step]).toBeDefined();
+      expect(Object.hasOwn(STEP_TO_MARKER, step)).toBe(true);
     }
   });
 });

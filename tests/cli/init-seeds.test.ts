@@ -3,8 +3,12 @@
 // memory frontmatter parser AND honors the seed-specific gates
 // (source=seed cross-fields, body ≤ 30 lines, trust trusted).
 
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { CANONICAL_SEEDS } from '../../src/cli/init-seeds/index.ts';
+import { runInit } from '../../src/cli/init.ts';
 import { SEED_BODY_MAX_LINES, parseMemoryFile } from '../../src/memory/frontmatter.ts';
 
 describe('CANONICAL_SEEDS — bundled vendor seed catalog', () => {
@@ -67,5 +71,97 @@ describe('CANONICAL_SEEDS — bundled vendor seed catalog', () => {
   test('names are unique', () => {
     const names = CANONICAL_SEEDS.map((s) => s.name);
     expect(new Set(names).size).toBe(names.length);
+  });
+});
+
+// Vendor seed catalog ships with `agent init`. The integration test
+// isolates XDG_CONFIG_HOME so the install lands in a tmp tree instead
+// of polluting the developer's real ~/.config/agent.
+describe('agent init seeds — installs vendor catalog under user scope', () => {
+  const cleanup: string[] = [];
+  let originalXdg: string | undefined;
+
+  afterEach(() => {
+    if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = originalXdg;
+    while (cleanup.length > 0) {
+      const dir = cleanup.pop();
+      if (dir !== undefined) rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('runInit with only=[seeds] writes the 10 canonical bodies + index + manifest', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'forja-init-seeds-'));
+    const userHome = mkdtempSync(join(tmpdir(), 'forja-init-seeds-xdg-'));
+    cleanup.push(cwd, userHome);
+    originalXdg = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = userHome;
+
+    const out: string[] = [];
+    const err: string[] = [];
+    const code = runInit({
+      cwd,
+      mode: 'strict',
+      only: ['seeds'],
+      out: (s) => out.push(s),
+      err: (s) => err.push(s),
+    });
+    expect(code).toBe(0);
+
+    // Bodies land at <XDG>/agent/memory/seeds/<name>.md.
+    const seedsDir = join(userHome, 'agent', 'memory', 'seeds');
+    expect(existsSync(seedsDir)).toBe(true);
+    for (const seed of CANONICAL_SEEDS) {
+      expect(existsSync(join(seedsDir, seed.filename))).toBe(true);
+    }
+
+    // Index regenerated from canonical entries (one line per seed).
+    const indexBody = readFileSync(join(seedsDir, 'MEMORY.md'), 'utf-8');
+    for (const seed of CANONICAL_SEEDS) {
+      expect(indexBody).toContain(seed.filename);
+    }
+
+    // Manifest persisted, one entry per canonical seed.
+    const manifestRaw = readFileSync(join(seedsDir, '.installed.json'), 'utf-8');
+    const manifest = JSON.parse(manifestRaw) as Record<string, { version: string; hash: string }>;
+    expect(Object.keys(manifest).length).toBe(CANONICAL_SEEDS.length);
+
+    // The `forja: wrote ...` lines reflect every canonical install.
+    const stdout = out.join('');
+    for (const seed of CANONICAL_SEEDS) {
+      expect(stdout).toContain(`wrote ${join(seedsDir, seed.filename)}`);
+    }
+  });
+
+  test('idempotent: a second run reports unchanged for every seed', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'forja-init-seeds-idem-'));
+    const userHome = mkdtempSync(join(tmpdir(), 'forja-init-seeds-idem-xdg-'));
+    cleanup.push(cwd, userHome);
+    originalXdg = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = userHome;
+
+    runInit({
+      cwd,
+      mode: 'strict',
+      only: ['seeds'],
+      out: () => {},
+      err: () => {},
+    });
+    const out: string[] = [];
+    const code = runInit({
+      cwd,
+      mode: 'strict',
+      only: ['seeds'],
+      out: (s) => out.push(s),
+      err: () => {},
+    });
+    expect(code).toBe(0);
+    // No `wrote ` lines on the second pass — the report shows
+    // "0 wrote" in the summary.
+    const stdout = out.join('');
+    expect(stdout).toContain('0 wrote');
+    // The skipped counter equals the catalog size (every seed routed
+    // through `unchanged`).
+    expect(stdout).toContain(`${CANONICAL_SEEDS.length} skipped`);
   });
 });

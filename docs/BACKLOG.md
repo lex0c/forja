@@ -2,6 +2,40 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-28] seed memory — install moves from bootstrap to `agent init`
+
+End-to-end review surfaced a design-shape question: should vendor seeds install at every bootstrap (current slice-3 behavior) or only when the operator opts into setup via `agent init` (parallel to how skills/playbooks scaffold)? After review, the latter is the right shape — nothing should arrive in the user-global scope without an explicit operator action. This commit moves the install.
+
+**Branch:** continued on `feat/memory-seeds`.
+
+**Shipped on this branch:**
+
+- **`src/cli/bootstrap.ts`** — removed the `installVendorSeeds` call + try/catch + import. Bootstrap is now agnostic to seed installation; it only consumes whatever is on disk via `createMemoryRegistry`.
+
+- **`src/cli/init.ts`** — added `seeds` to `InitStep` + `DEFAULT_STEPS` (sixth and last step). New `scaffoldSeeds(options)` wraps `installVendorSeeds` and maps the upgrade state machine's `SeedsInstallResult` into the init scaffold's `StepResult` shape:
+  - `fresh` → `wrote`
+  - `vendorUpdated` → `overwritten`
+  - `unchanged + userKept` → `skipped`
+  - `archived` gets its own log line (no fit in the wrote/skipped/overwritten triple).
+
+  `seeds` is excluded from `ForceEligibleStep` because the slice-4 upgrade state machine already owns the rewrite policy — a blanket `--force=seeds` would override the conservative-default `user_kept` preservation and silently wipe operator edits, defeating spec §5.7.5.
+
+  Added `seedSource?: ReadonlyArray<CanonicalSeed>` test seam mirroring `playbookSource`/`skillSource` so tests can pin a fixture without depending on the full canonical set.
+
+- **`src/cli/args.ts`** — added `'seeds'` to `VALID_INIT_STEPS` so `agent init --only=seeds` (and `--only=seeds,skills`) parses cleanly. The drift-guard test in `args.test.ts` walks `DEFAULT_STEPS` and parses each `--only=<step>` — now covers the new step.
+
+- **`tests/cli/purge.test.ts`** — extended the `STEP_TO_MARKER` drift-guard with an explicit `seeds: null` mapping. Seeds write to user scope (`<user>/seeds/<name>.md`), not the project scope where `purge` operates — so the step is intentionally markerless. The null mapping documents the omission and the two affected drift-guard tests skip the null-mapped step instead of failing.
+
+- **`tests/cli/init.test.ts`** — the "scaffolds all five artifacts on a clean cwd" test now pins `only` to the five project-scope steps. The seed step is exercised by the dedicated test below; mixing it in would either pollute the developer's real `~/.config/agent/` or force XDG isolation on every init test.
+
+- **`tests/cli/init-seeds.test.ts`** — 2 new integration tests under an isolated `XDG_CONFIG_HOME`: (a) `runInit({ only: ['seeds'] })` writes the 10 canonical bodies + index + manifest into `<XDG>/agent/memory/seeds/`; (b) a second run reports zero `wrote` + N `skipped` (idempotence).
+
+- **`tests/cli/bootstrap.test.ts`** — reverted the "memory registry is wired even when no memories exist" test to its pre-install assertions: empty list, no `[seed]` marker, no `[user]` lines. The post-slice-7 expectation of seeds-in-prompt is now incorrect because bootstrap doesn't install.
+
+**Behavioral consequence.** An operator who installs Forja and immediately runs `agent` (without `agent init`) sees the `# Memory` header with save-criteria guidance but ZERO entries — including no vendor seeds. This is intentional: the operator's first explicit setup gesture is where seeds arrive, mirroring how `agent init` is also where permissions, gitignore, config, playbooks, and skills land. Operators who skip `init` get a minimal-surface agent; operators who run `init` get the full curated experience.
+
+**Tests + validation:** `bun run typecheck` clean, `bun run lint` clean. `bun test tests/memory/ tests/cli/` → 2577 pass.
+
 ## [2026-05-28] seed memory — slice 7: registry integration + [seed] visibility
 
 Closes the seed end-to-end loop (`docs/spec/MEMORY.md §5.7.3 + §5.7.4`). The bootstrap-installed vendor catalog now flows into the system prompt the model sees, into `memory_read` lookups, and into `/memory list` / `/memory search` results — with a discreet `[seed]` marker so the model knows which entries are vendor-curated meta-behavior vs operator-authored.

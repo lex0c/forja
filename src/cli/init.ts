@@ -36,12 +36,15 @@ import { DEFAULT_MEMORY_CONFIG } from '../critique/config-loader.ts';
 import { DEFAULT_CRITIQUE_CONFIG } from '../critique/types.ts';
 import { DEFAULT_BUDGET } from '../harness/types.ts';
 import { ensureAgentGitignore } from '../memory/gitignore.ts';
+import { resolveScopeRoots as resolveMemoryScopeRoots } from '../memory/paths.ts';
+import { installVendorSeeds } from '../memory/seeds-installer.ts';
 import { projectPolicyPath } from '../permissions/index.ts';
 import { DEFAULT_MODEL } from '../providers/default-model.ts';
 import { projectScopeRoots } from '../skills/index.ts';
 import { projectAgentsDir } from '../subagents/paths.ts';
 import { renderInitConfigTemplate } from './init-config-template.ts';
 import { CANONICAL_PLAYBOOKS, type CanonicalPlaybook } from './init-playbooks/index.ts';
+import type { CanonicalSeed } from './init-seeds/index.ts';
 import { CANONICAL_SKILLS, type CanonicalSkill } from './init-skills/index.ts';
 import { type InitMode, renderInitTemplate } from './init-template.ts';
 
@@ -50,8 +53,12 @@ import { type InitMode, renderInitTemplate } from './init-template.ts';
 // (load-bearing — without it everything denies), gitignore next
 // (so subsequent writes don't pollute the operator's git status),
 // config third (depends only on .agent/ existing), then the
-// playbooks + skills catalogs (largest payloads, longest to walk).
-export type InitStep = 'permissions' | 'gitignore' | 'config' | 'playbooks' | 'skills';
+// playbooks + skills catalogs (largest payloads, longest to walk),
+// finally `seeds` which lands in the operator's USER scope
+// (`<user>/seeds/` per MEMORY.md §5.7.4) — last so the install
+// report's stdout order moves from project-local to user-global,
+// matching the operator's mental "outside-in" model.
+export type InitStep = 'permissions' | 'gitignore' | 'config' | 'playbooks' | 'skills' | 'seeds';
 
 export const DEFAULT_STEPS: ReadonlyArray<InitStep> = [
   'permissions',
@@ -59,12 +66,18 @@ export const DEFAULT_STEPS: ReadonlyArray<InitStep> = [
   'config',
   'playbooks',
   'skills',
+  'seeds',
 ];
 
 // `gitignore` is excluded — it is operator-owned after creation per
 // MEMORY.md §2.5. Forcing a re-write would defeat the spec promise
-// and surprise an operator who edited the file.
-export type ForceEligibleStep = Exclude<InitStep, 'gitignore'>;
+// and surprise an operator who edited the file. `seeds` is also
+// excluded: seeds have their own upgrade lifecycle (spec §5.7.5)
+// that decides per-body whether to rewrite (vendor_updated) or
+// preserve (user_kept) — a blanket `--force=seeds` would override
+// the conservative-default policy and silently wipe operator edits,
+// the opposite of what the spec promises.
+export type ForceEligibleStep = Exclude<InitStep, 'gitignore' | 'seeds'>;
 
 export interface InitOptions {
   cwd: string;
@@ -82,6 +95,10 @@ export interface InitOptions {
   playbookSource?: ReadonlyArray<CanonicalPlaybook>;
   // Test seam for the skills step — same role as `playbookSource`.
   skillSource?: ReadonlyArray<CanonicalSkill>;
+  // Test seam for the seeds step. Production omits → bundled
+  // CANONICAL_SEEDS; tests can pin a fixture so a future catalog
+  // bump doesn't break the regression set.
+  seedSource?: ReadonlyArray<CanonicalSeed>;
   // Sink for the success / error messages. Production wires to
   // stdout/stderr; tests inject collectors.
   out: (s: string) => void;
@@ -328,6 +345,57 @@ const scaffoldSkills = (options: InitOptions, force: boolean): StepResult | null
     forceLabel: 'skills',
   });
 
+// Vendor seed catalog (spec MEMORY.md §5.7.4 + §5.7.8). Unlike
+// playbooks / skills (which land at `<cwd>/.agent/...` per-project),
+// seeds install into the user-global scope at `<user>/seeds/` —
+// they are agent meta-behavior, not project content. Wiring through
+// `installVendorSeeds` reuses the slice-4 upgrade state machine
+// (fresh / unchanged / vendor_updated / user_kept / archived) so
+// running `agent init seeds` on a host that already has the catalog
+// silently no-ops the bodies the operator hasn't touched and
+// preserves the ones they have.
+//
+// Result-shape mapping into the init scaffold's StepResult:
+//   - wrote       = fresh         (bodies created for the first time)
+//   - overwritten = vendorUpdated (silent rewrite on a vendor bump)
+//   - skipped     = unchanged + userKept
+// `archived` (seeds dropped from the new catalog) gets its own log
+// line because it doesn't fit the wrote/skipped/overwritten triple.
+const scaffoldSeeds = (options: InitOptions): StepResult | null => {
+  const { out, err } = options;
+  const memoryRoots = resolveMemoryScopeRoots(options.cwd);
+  let result: ReturnType<typeof installVendorSeeds>;
+  try {
+    result = installVendorSeeds({
+      roots: memoryRoots,
+      ...(options.seedSource !== undefined ? { source: options.seedSource } : {}),
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    err(`forja: failed to install vendor seeds: ${msg}\n`);
+    return null;
+  }
+  for (const filename of result.fresh) {
+    out(`forja: wrote ${memoryRoots.user}/seeds/${filename}\n`);
+  }
+  for (const filename of result.vendorUpdated) {
+    out(`forja: upgraded ${memoryRoots.user}/seeds/${filename}\n`);
+  }
+  for (const filename of result.userKept) {
+    out(
+      `forja: skip ${memoryRoots.user}/seeds/${filename} (operator-edited; use /memory seeds revert to restore vendor body)\n`,
+    );
+  }
+  for (const filename of result.archived) {
+    out(`forja: archived ${memoryRoots.user}/seeds/archived/${filename}\n`);
+  }
+  return {
+    wrote: result.fresh.length,
+    overwritten: result.vendorUpdated.length,
+    skipped: result.unchanged.length + result.userKept.length,
+  };
+};
+
 export const runInit = (options: InitOptions): number => {
   const steps = options.only ?? DEFAULT_STEPS;
   const totals: StepResult = { wrote: 0, skipped: 0, overwritten: 0 };
@@ -341,8 +409,12 @@ export const runInit = (options: InitOptions): number => {
       result = scaffoldConfig(options, forcedFor(options.force, 'config'));
     } else if (step === 'playbooks') {
       result = scaffoldPlaybooks(options, forcedFor(options.force, 'playbooks'));
-    } else {
+    } else if (step === 'skills') {
       result = scaffoldSkills(options, forcedFor(options.force, 'skills'));
+    } else {
+      // 'seeds' — no `force` flag (excluded from ForceEligibleStep).
+      // The installer's upgrade state machine owns the rewrite policy.
+      result = scaffoldSeeds(options);
     }
     if (result === null) {
       // Exit early with the per-step output already printed.

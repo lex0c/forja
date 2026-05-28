@@ -404,6 +404,7 @@ const VALID_INIT_STEPS: ReadonlyArray<InitStep> = [
   'config',
   'playbooks',
   'skills',
+  'seeds',
 ];
 
 // Steps eligible for `--force` / `--force=csv`. `gitignore` is

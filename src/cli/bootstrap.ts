@@ -31,7 +31,6 @@ import {
   gcPurgeExpiredTombstones,
   gcStaleInvalidatedMemories,
   getSharedTrust,
-  installVendorSeeds,
   probeSharedTrust,
   resolveRepoRoot,
   resolveScopeRoots,
@@ -922,24 +921,13 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // memory scope roots, and the trigger-probe section below.
     const repoRoot = projectConfigCwd;
     const memoryRoots = resolveScopeRoots(repoRoot);
-    // Vendor seed catalog install (spec MEMORY.md §5.7.4 + §5.7.8).
-    // Idempotent — skip-if-exists per body so operator edits between
-    // boots survive (the full upgrade lifecycle with hash compare +
-    // diff prompts lands in slice 4). Failures here MUST NOT block
-    // the boot (one corrupt user-scope subdir shouldn't gate the
-    // session); we log to stderr and continue. Slice 5 will gate
-    // this on a --no-seeds flag and a disable sentinel.
-    //
-    // The installed seeds live at `<user>/seeds/` and are NOT yet
-    // registered into the memory registry — registry merging waits
-    // for slice 7 (UI + audit) which lands the MemoryLocation
-    // discriminator the seed/non-seed lookup needs.
-    try {
-      installVendorSeeds({ roots: memoryRoots });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      process.stderr.write(`forja: seed catalog install failed (continuing): ${msg}\n`);
-    }
+    // Vendor seeds are NOT installed at bootstrap — they ride along
+    // with `agent init` (spec MEMORY.md §5.7.4 + §5.7.8) so the
+    // operator's first explicit setup gesture is also where the
+    // catalog lands, mirroring how skills/playbooks scaffold. An
+    // operator who never runs `agent init` does NOT see seeds in
+    // their /memory list — that's a feature: nothing arrives in
+    // the user scope without an explicit operator action.
     memoryRegistry = createMemoryRegistry({ roots: memoryRoots, db, cwd });
     // Skill catalog (spec SKILLS.md §3-§4). Same repo-rooted scope
     // resolution as memory; the catalog scans every scope at
