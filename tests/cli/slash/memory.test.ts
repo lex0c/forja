@@ -4078,3 +4078,227 @@ describe('/memory delete — seed dispatch (slice-7 review fix #1)', () => {
     expect(events.find((e) => e.action === 'evicted')).toBeUndefined();
   });
 });
+
+// `/memory seeds disable|enable|list` (spec §5.7.6 — slice 5b).
+// Per-seed operator opt-out backed by a sentinel at
+// `<user>/seeds/.disabled.json`. The slash command writes the
+// sentinel and re-runs `installVendorSeeds` so the on-disk index +
+// the in-memory registry reflect the change immediately.
+describe('/memory seeds — per-seed opt-out (spec §5.7.6)', () => {
+  test('seeds list enumerates every canonical seed with active state by default', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const { CANONICAL_SEEDS } = await import('../../../src/cli/init-seeds/index.ts');
+    const r = await memoryCommand.exec(['seeds', 'list'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = (r.notes ?? []).join('\n');
+    // Header line carries the active/disabled totals.
+    expect(text).toContain(`${CANONICAL_SEEDS.length} active, 0 disabled`);
+    // Every canonical seed is named in the body.
+    for (const seed of CANONICAL_SEEDS) {
+      expect(text).toContain(seed.name);
+    }
+  });
+
+  test('seeds disable <name> writes sentinel + drops body from registry/list', async () => {
+    const repo = makeTmp();
+    const { ctx, registry } = makeCtx(repo);
+    const { CANONICAL_SEEDS } = await import('../../../src/cli/init-seeds/index.ts');
+    const { installVendorSeeds } = await import('../../../src/memory/seeds-installer.ts');
+    installVendorSeeds({ roots: registry.roots });
+    registry.reload();
+    const target = CANONICAL_SEEDS[0];
+    if (target === undefined) throw new Error('CANONICAL_SEEDS unexpectedly empty');
+    const before = registry.list().filter((l) => l.subdir === 'seeds');
+    expect(before.find((l) => l.name === target.name)).toBeDefined();
+
+    const r = await memoryCommand.exec(['seeds', 'disable', target.name], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    // Sentinel persisted at the canonical path.
+    const sentinelPath = join(registry.roots.user, 'seeds', '.disabled.json');
+    expect(existsSync(sentinelPath)).toBe(true);
+    const parsed = JSON.parse(readFileSync(sentinelPath, 'utf-8')) as Record<string, unknown>;
+    expect(Object.hasOwn(parsed, target.name)).toBe(true);
+    // Registry refreshed: the disabled seed is no longer listed.
+    const after = registry.list().filter((l) => l.subdir === 'seeds');
+    expect(after.find((l) => l.name === target.name)).toBeUndefined();
+    // Operator-facing notes pin the contract operators rely on:
+    // (a) body preservation messaging (slice-5b review fix made this
+    // conditional — when the body IS on disk, the path is named), and
+    // (b) the persistence-across-init+vendor-bump promise + a
+    // discoverable re-enable command. Without these assertions, copy
+    // drift in any of the three lines would ship silently.
+    const notes = r.notes ?? [];
+    expect(notes.some((n) => n.includes('body preserved at'))).toBe(true);
+    expect(notes.some((n) => n.includes('opt-out survives'))).toBe(true);
+    expect(notes.some((n) => n.includes(`/memory seeds enable ${target.name}`))).toBe(true);
+  });
+
+  test('seeds disable announces no-body-on-disk path when the body was never written', async () => {
+    // Operator who ran `agent init --no-seeds` (slice 5a) then runs
+    // `/memory seeds disable foo` — the body was never installed,
+    // so the disable message must NOT claim "body preserved at
+    // <path>". The handler branches on existsSync.
+    const repo = makeTmp();
+    const { ctx, registry } = makeCtx(repo);
+    const { CANONICAL_SEEDS } = await import('../../../src/cli/init-seeds/index.ts');
+    const target = CANONICAL_SEEDS[0];
+    if (target === undefined) throw new Error('CANONICAL_SEEDS unexpectedly empty');
+    // Skip the installer entirely — the user/seeds dir doesn't exist
+    // yet. The handler must create the dir for writeDisabledSeeds.
+    mkdirSync(join(registry.roots.user, 'seeds'), { recursive: true });
+    const r = await memoryCommand.exec(['seeds', 'disable', target.name], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const notes = r.notes ?? [];
+    expect(notes.some((n) => n.includes('no body on disk yet'))).toBe(true);
+    expect(notes.some((n) => n.includes('body preserved at'))).toBe(false);
+  });
+
+  test('seeds enable after operator-deleted body forces a fresh install (review fix)', async () => {
+    // Pre-review-fix bug: `enable` ran the installer which then
+    // routed an absent-body + prior-manifest seed through `user_kept`
+    // (honoring the operator-delete intent that predated the
+    // explicit sentinel). The post-enable index excluded the entry
+    // and the operator was told to run `agent init --only=seeds` —
+    // which produced the same user_kept loop, leaving them with no
+    // recovery path. Post-fix: `enable` drops the manifest entry
+    // when the body is absent, the installer then routes through
+    // `fresh`, and the canonical body lands.
+    const repo = makeTmp();
+    const { ctx, registry } = makeCtx(repo);
+    const { CANONICAL_SEEDS } = await import('../../../src/cli/init-seeds/index.ts');
+    const { installVendorSeeds } = await import('../../../src/memory/seeds-installer.ts');
+    const { seedMemoryFilePath } = await import('../../../src/memory/paths.ts');
+    installVendorSeeds({ roots: registry.roots });
+    const target = CANONICAL_SEEDS[0];
+    if (target === undefined) throw new Error('CANONICAL_SEEDS unexpectedly empty');
+    const bodyPath = seedMemoryFilePath(registry.roots, target.name);
+    await memoryCommand.exec(['seeds', 'disable', target.name], ctx);
+    // Operator manually deletes the body while disabled (e.g.,
+    // tidying up <user>/seeds/ before realizing they wanted it back).
+    const { unlinkSync } = await import('node:fs');
+    unlinkSync(bodyPath);
+    expect(existsSync(bodyPath)).toBe(false);
+    // Re-enable: handler should drop manifest entry → installer
+    // fresh-writes the body.
+    const r = await memoryCommand.exec(['seeds', 'enable', target.name], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    // Canonical body restored.
+    expect(existsSync(bodyPath)).toBe(true);
+    // Note language reflects success, not "missing on disk" or any
+    // dangling agent-init hint.
+    const notes = r.notes ?? [];
+    expect(notes.some((n) => n.includes('back in the loaded set'))).toBe(true);
+    expect(notes.some((n) => n.includes('missing on disk'))).toBe(false);
+    // Registry sees the seed.
+    const after = registry.list().filter((l) => l.subdir === 'seeds');
+    expect(after.find((l) => l.name === target.name)).toBeDefined();
+  });
+
+  test('seeds disable on an already-disabled seed is idempotent', async () => {
+    const repo = makeTmp();
+    const { ctx, registry } = makeCtx(repo);
+    const { CANONICAL_SEEDS } = await import('../../../src/cli/init-seeds/index.ts');
+    const { installVendorSeeds } = await import('../../../src/memory/seeds-installer.ts');
+    installVendorSeeds({ roots: registry.roots });
+    const target = CANONICAL_SEEDS[0];
+    if (target === undefined) throw new Error('CANONICAL_SEEDS unexpectedly empty');
+    await memoryCommand.exec(['seeds', 'disable', target.name], ctx);
+    const r = await memoryCommand.exec(['seeds', 'disable', target.name], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    expect((r.notes ?? []).some((n) => n.includes('already disabled'))).toBe(true);
+  });
+
+  test('seeds enable <name> clears sentinel + restores body to registry', async () => {
+    const repo = makeTmp();
+    const { ctx, registry } = makeCtx(repo);
+    const { CANONICAL_SEEDS } = await import('../../../src/cli/init-seeds/index.ts');
+    const { installVendorSeeds } = await import('../../../src/memory/seeds-installer.ts');
+    installVendorSeeds({ roots: registry.roots });
+    const target = CANONICAL_SEEDS[0];
+    if (target === undefined) throw new Error('CANONICAL_SEEDS unexpectedly empty');
+    await memoryCommand.exec(['seeds', 'disable', target.name], ctx);
+    const r = await memoryCommand.exec(['seeds', 'enable', target.name], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    // Sentinel cleared (or the entry dropped).
+    const sentinelPath = join(registry.roots.user, 'seeds', '.disabled.json');
+    if (existsSync(sentinelPath)) {
+      const parsed = JSON.parse(readFileSync(sentinelPath, 'utf-8')) as Record<string, unknown>;
+      expect(Object.hasOwn(parsed, target.name)).toBe(false);
+    }
+    // Registry has the seed back.
+    const after = registry.list().filter((l) => l.subdir === 'seeds');
+    expect(after.find((l) => l.name === target.name)).toBeDefined();
+  });
+
+  test('seeds enable on an already-enabled seed is idempotent', async () => {
+    const repo = makeTmp();
+    const { ctx, registry } = makeCtx(repo);
+    const { CANONICAL_SEEDS } = await import('../../../src/cli/init-seeds/index.ts');
+    const { installVendorSeeds } = await import('../../../src/memory/seeds-installer.ts');
+    installVendorSeeds({ roots: registry.roots });
+    const target = CANONICAL_SEEDS[0];
+    if (target === undefined) throw new Error('CANONICAL_SEEDS unexpectedly empty');
+    const r = await memoryCommand.exec(['seeds', 'enable', target.name], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    expect((r.notes ?? []).some((n) => n.includes('already enabled'))).toBe(true);
+  });
+
+  test('seeds disable <unknown-name> errors and names the known set', async () => {
+    const repo = makeTmp();
+    const { ctx, registry } = makeCtx(repo);
+    const { installVendorSeeds } = await import('../../../src/memory/seeds-installer.ts');
+    installVendorSeeds({ roots: registry.roots });
+    const r = await memoryCommand.exec(['seeds', 'disable', 'this-seed-does-not-exist'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind !== 'error') return;
+    expect(r.message).toContain("unknown seed 'this-seed-does-not-exist'");
+    expect(r.message).toContain('known:');
+  });
+
+  test('seeds disable without a name errors with usage hint', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['seeds', 'disable'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind !== 'error') return;
+    expect(r.message).toContain('missing seed name');
+  });
+
+  test('seeds with no subcommand errors and lists valid subs', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['seeds'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind !== 'error') return;
+    expect(r.message).toContain('missing subcommand');
+    expect(r.message).toContain('disable');
+    expect(r.message).toContain('enable');
+    expect(r.message).toContain('list');
+  });
+
+  test('seeds <unknown-sub> errors and lists valid subs', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['seeds', 'bogus'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind !== 'error') return;
+    expect(r.message).toContain("unknown subcommand 'bogus'");
+  });
+
+  test('seeds list rejects extra args', async () => {
+    const repo = makeTmp();
+    const { ctx } = makeCtx(repo);
+    const r = await memoryCommand.exec(['seeds', 'list', 'extra'], ctx);
+    expect(r.kind).toBe('error');
+    if (r.kind !== 'error') return;
+    expect(r.message).toContain('unexpected extra args');
+  });
+});

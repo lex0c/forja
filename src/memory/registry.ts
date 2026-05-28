@@ -24,6 +24,7 @@ import {
   readSeedByName,
 } from './loader.ts';
 import type { ScopeRoots } from './paths.ts';
+import { isSeedDisabled, loadDisabledSeeds } from './seeds-disabled.ts';
 import type {
   IndexEntry,
   MemoryFile,
@@ -535,10 +536,41 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
       );
     }
     const seedEntries = seedResult.kind === 'present' ? seedResult.index.entries : [];
+    // Filter disabled seeds out of the user/seeds snapshot (slice 5b,
+    // spec §5.7.6). Defense-in-depth: `installVendorSeeds` already
+    // excludes disabled entries from the regenerated `seeds/MEMORY.md`
+    // on every install pass, so this filter is usually a no-op — but
+    // if the sentinel was just updated by `/memory seeds disable` and
+    // the installer hasn't re-run yet (or an operator hand-edited the
+    // index, which the slice-7 malformed warn above handles for shape
+    // corruption but not for stale entries), this layer still honors
+    // the opt-out without waiting for the next install pass. Loading
+    // the sentinel inside `refresh` (not at registry construction)
+    // means `/memory seeds enable` followed by `registry.refresh()`
+    // picks up the change without recreating the registry.
+    const disabledSentinel = loadDisabledSeeds(roots);
+    const filteredSeedEntries = seedEntries.filter((entry) => {
+      try {
+        const name = memoryNameFromPath(entry.href);
+        return !isSeedDisabled(disabledSentinel, name);
+      } catch {
+        // Malformed href (e.g. operator-edited index with a non-`.md`
+        // url): keep the entry in the snapshot so the malformed
+        // shape stays observable on the same code path as the other
+        // scope snapshots (allListings/findListing skip it silently
+        // via their own try/catch). The authoritative malformed-
+        // entry diagnostic lives in `loadSeedsIndex(...).index
+        // .malformedLines`, not in the snapshot — filtering here
+        // would not change what the audit surface sees, but it
+        // would diverge the user/seeds snapshot from the other
+        // scope snapshots for no benefit.
+        return true;
+      }
+    });
     scopeSnapshots.push({
       scope: 'user',
       subdir: 'seeds',
-      entries: seedEntries,
+      entries: filteredSeedEntries,
       diagnostic: seedResult,
     });
     snapshots = scopeSnapshots;

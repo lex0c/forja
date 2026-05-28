@@ -44,6 +44,7 @@ export {
   resolveScopeRoots,
   rootForScope,
   scopeOfPath,
+  seedMemoryFilePath,
   tombstonePath,
   tombstonesDir,
   userScopeRoot,
@@ -112,8 +113,20 @@ export type { WriteMemoryInput, WriteMemoryResult, WriteWarning } from './writer
 export { installVendorSeeds } from './seeds-installer.ts';
 export type {
   InstallVendorSeedsOptions,
+  SeedAction,
   SeedsInstallResult,
 } from './seeds-installer.ts';
+export {
+  isSeedDisabled,
+  loadDisabledSeeds,
+  writeDisabledSeeds,
+} from './seeds-disabled.ts';
+export type {
+  DisabledSeedEntry,
+  DisabledSeeds,
+} from './seeds-disabled.ts';
+export { loadSeedManifest, writeSeedManifest } from './seeds-manifest.ts';
+export type { SeedManifest, SeedManifestEntry } from './seeds-manifest.ts';
 
 export { detectMemoryDependents } from './dependents.ts';
 export type { MemoryDependent } from './dependents.ts';

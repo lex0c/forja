@@ -2,6 +2,89 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-28] seed memory — slice 5b: `/memory seeds disable|enable|list` per-seed opt-out
+
+Second half of slice 5 (`docs/spec/MEMORY.md §5.7.6`). Pairs with slice 5a's `--no-seeds` blanket bootstrap opt-out by giving the operator a per-seed opt-out that survives a vendor catalog bump (slice 5a is "I don't want any vendor seeds"; slice 5b is "I want most of them but `<name>` is wrong for my workflow"). Backed by a sentinel at `<user>/seeds/.disabled.json` that the installer's upgrade state machine honors BEFORE the existing fresh/unchanged/vendor_updated/user_kept branches — so disabling a seed is durable across `agent init`, binary upgrades, and catalog version bumps without the operator's intent regressing.
+
+**Branch:** continued on `feat/memory-seeds`.
+
+**Design.** Sentinel-based opt-out (not a frontmatter field on the body, not a tombstone). The sentinel lives at `<user>/seeds/.disabled.json` with the canonical-JSON shape `{ "<name>": { "disabled_at": "<ISO-8601>" }, ... }` — same convention as the install manifest, sorted keys for stable cross-boot diffs, atomic write semantics via `atomicWrite`. The sentinel was the right shape over the alternatives because:
+
+- **Body frontmatter** (`disabled: true`) would tangle the opt-out signal with the operator-edit invariant — the slice-4 state machine uses body hash divergence to detect operator edits, so flipping a frontmatter field would route the seed through `user_kept` and the disable would only stick until the next vendor bump.
+- **Tombstones** are evict-semantic (the body is GONE); disable preserves the body verbatim for a future `enable`.
+- **Separate sentinel** keeps the opt-out signal orthogonal to body content + manifest state, so the three sources of truth (catalog, body hash, sentinel) reconcile cleanly.
+
+**Honor points.** Two surfaces consult the sentinel:
+
+1. **`installVendorSeeds`** — checks `isSeedDisabled(disabledMap, name)` at the top of the per-seed loop, BEFORE the state-machine branches. Disabled seeds route through a new `disabled` action: the body on disk is NOT touched, the prior manifest entry is preserved verbatim (so a future `enable` resumes from the same baseline), and the entry is excluded from the regenerated `seeds/MEMORY.md` index. The sixth state joins the existing five-state union (`SeedAction = '... | 'disabled'`); the result shape gains a `disabled: string[]` bucket.
+
+2. **`createMemoryRegistry.refresh`** — filters disabled entries out of the user/seeds snapshot (defense-in-depth: the installer is the primary mechanism that drops disabled seeds from the index, but the registry filter catches the case where a slash command updated the sentinel without re-running the installer, or where an operator hand-edited the index). Loading inside `refresh` (not at construction) means `/memory seeds enable` followed by `registry.reload()` picks up the change without recreating the registry.
+
+**Slash command surface.**
+
+```
+/memory seeds list                      — enumerate every canonical seed with [active|disabled] state
+/memory seeds disable <name>            — write sentinel + re-run installer + reload registry
+/memory seeds enable <name>             — clear sentinel + re-run installer + reload registry
+```
+
+Both mutation subcommands validate the name against `CANONICAL_SEEDS` (a typo lands on a clear error naming the known set, instead of silently writing a sentinel for a non-existent seed that the installer would then ignore — making the disable "look like it did nothing"). Both are idempotent: repeating `disable` on an already-disabled seed is a no-op + info log; same for `enable`. The mutation handlers re-run `installVendorSeeds` synchronously and call `registry.reload()` so the on-disk index + the in-memory snapshot reflect the change immediately, without waiting for the next bootstrap or session.
+
+**Shipped on this branch:**
+
+- **`src/memory/paths.ts`** — new `disabledSeedsPath(roots)` returning `<user>/seeds/.disabled.json`. Dot-prefixed so the seeds-subdir orphan walker (slice 2) silently ignores it, matching the install manifest's convention.
+
+- **`src/memory/seeds-disabled.ts`** (new file, ~95 lines) — `DisabledSeedEntry` type, `DisabledSeeds` map, `loadDisabledSeeds(roots)` with per-entry corruption stderr warns (mirrors the install-manifest pattern: drop the malformed entry, keep the valid siblings, name the key in the warn so the operator can audit), `writeDisabledSeeds(roots, map)` with atomic-write + sorted keys, `isSeedDisabled(map, name)` using `Object.hasOwn` to reject prototype-chain lookups (defense-in-depth: a seed named `toString` cannot masquerade as disabled).
+
+- **`src/memory/seeds-installer.ts`** — `SeedAction` union widened to include `'disabled'`; `SeedsInstallResult` gains `disabled: string[]`; the per-seed loop now reads `loadDisabledSeeds(roots)` once (cached across the 10 seeds) and short-circuits to the disabled bucket before any state-machine work; the index-regen filter also excludes disabled entries so `seeds/MEMORY.md` reflects the active set.
+
+- **`src/memory/registry.ts`** — `refresh()` now loads the sentinel and filters the user/seeds snapshot before pushing it; malformed-href entries (operator-edited index) are preserved verbatim so the existing allListings/findListing try/catch handles them consistently across snapshots.
+
+- **`src/memory/index.ts`** — re-exports `isSeedDisabled` / `loadDisabledSeeds` / `writeDisabledSeeds` + `DisabledSeedEntry` / `DisabledSeeds` types + the newly-named `SeedAction` type from the installer.
+
+- **`src/cli/slash/commands/memory.ts`** — new `handleSeeds(registry, ctx, args)` dispatcher with subcommands `disable | enable | list`. Dispatched from `memoryCommand.exec` under the new `'seeds'` case (registered after `governance`). The handler imports `CANONICAL_SEEDS` for the catalog lookup and `installVendorSeeds` for the post-mutation re-install. Description string + unknown-subcommand error message updated to enumerate `seeds`.
+
+- **`src/cli/init.ts`** — `StepResult` gains `disabled?: number`; `scaffoldSeeds` logs each disabled seed with a slash-command pointer for re-enable; the aggregate summary appends a `, K disabled` suffix when non-zero (after the existing `, K archived` suffix, alphabetical order).
+
+- **`tests/memory/seeds-disabled.test.ts`** (new file) — round-trip, sorted keys, malformed-JSON-collapses-to-empty (with stderr warn), per-entry corruption preserves valid siblings, prototype-chain rejection (toString/hasOwnProperty/__proto__).
+
+- **`tests/memory/seeds-installer.test.ts`** — 5 new tests under "disabled-sentinel handling": fresh install with disabled seed routes through `disabled` action (no body on disk), pre-installed body is preserved on disable (reversibility), disable survives a vendor version bump (sentinel beats state machine), enable restores normal routing, disabled seed alongside enabled siblings affects only the named seed.
+
+- **`tests/memory/registry.test.ts`** — 1 new test pinning the registry's filter: a seed index with two entries + a sentinel naming one of them yields a `list()` result with only the un-disabled entry.
+
+- **`tests/cli/slash/memory.test.ts`** — 10 new tests under "/memory seeds — per-seed opt-out": `seeds list` shape with active/disabled totals + every name listed; `seeds disable <name>` writes sentinel + drops from registry; idempotent `disable` returns `already disabled` note; `seeds enable <name>` clears sentinel + restores; idempotent `enable`; unknown name errors with known set; missing name errors with usage hint; no-subcommand errors; unknown-subcommand errors; `seeds list` rejects extra args.
+
+**Review fixes (applied before commit).** Max-effort review surfaced two correctness findings + several UX/coverage gaps; the correctness pair was the biggest miss in the initial slice and reshaped the `enable` semantic:
+
+1. **`bodyRestored` was lying + recovery hint was unactionable.** The original `enable` handler computed `bodyRestored = result.userKept.includes(filename) === false` and, when false, told operators to `run agent init --only=seeds`. Two bugs in one branch:
+   - For an operator who had hand-edited the body BEFORE disabling, the installer routes through `user_kept` (hash diverges from prior.hash) but the body IS present on disk and the index regen DOES re-add the entry — the seed is in the loaded set. The handler incorrectly claimed "body missing on disk" and the operator-facing message contradicted reality.
+   - For an operator who deleted the body manually while disabled, the suggested `agent init --only=seeds` produces the same `user_kept` loop (no body + prior manifest → never reinstall), so the recovery hint led nowhere.
+
+   Fix: `enable` now reshapes the semantic to "I want this seed back to vendor baseline". When the body is absent at enable time, the handler drops the prior manifest entry before re-running the installer — the installer then routes through `fresh` and writes the canonical body. `bodyRestored` is now `existsSync(bodyPath)` after install, which is the actual source of truth for "is the seed in the loaded set?" Both operator-facing branches (success + post-failure check-the-path) now match disk reality.
+
+2. **`disable`'s "body preserved at <path>" was unconditional.** After `--no-seeds`-then-`disable`, the body never existed; the message sent operators chasing a file that wasn't there. Now branches on `existsSync` and emits "no body on disk yet (sentinel persisted so a future install honors the opt-out)" when the body is absent.
+
+3. **Stale "Slice 5+" future-tense comments** in `seeds-installer.ts` (lines 207, 217, 258) and `paths.ts` (line 201) — slice 5b just shipped the sentinel, but several comments still wrote about it in future tense. Updated to past tense where slice 5b applies; kept `Slice 5c` for the interactive modal which is genuinely future.
+
+4. **`require('node:fs')` inline** in `seeds-disabled.test.ts:35` replaced with a top-level `mkdirSync` import.
+
+5. **Misleading `registry.ts` filter comment** about "the audit surface" — the filter's malformed-href preservation doesn't feed any audit surface; the authoritative diagnostic lives in `loadSeedsIndex(...).index.malformedLines`. Comment rewritten to admit the entry travels uselessly through the snapshot but does so consistently with the other scope snapshots.
+
+6. **Coverage gaps:**
+   - `tests/cli/init-seeds.test.ts` gained a test pinning the `K disabled` summary suffix and the per-seed `forja: skip ... (disabled by ...)` log line.
+   - `tests/memory/seeds-installer.test.ts` gained a "disable → vendor bump → enable cycle" test pinning the resumption-from-baseline contract (BACKLOG promise: "prior manifest entry is preserved verbatim").
+   - `tests/cli/slash/memory.test.ts` gained 2 new tests: the body-absent disable note variant, and the post-fix `enable` after operator-delete (asserts the canonical body lands + the note language reflects success). The existing disable test gained note-content assertions on body-preservation + opt-out-persistence + re-enable-hint lines so future copy drift trips.
+
+**Deferred (review findings the slice intentionally does NOT address):**
+- **Shared keyed-JSON-store helper** between `seeds-disabled.ts` and `seeds-manifest.ts` (~50 lines of structurally identical code). Defensible as-is — each helper's warn copy is operator-facing and naming the file purpose ("disabled-seeds sentinel" vs "seed manifest") in the messages keeps diagnostics legible. When a third such store ships, the abstraction earns its weight.
+- **Altitude — move disable/enable primitives to `src/memory/seeds-disabled.ts`** as `disableSeed(roots, name, now)` / `enableSeed(roots, name)`. Defensible because today the slash handler is the single call site; when a headless `agent --memory seeds disable` CLI surface lands, this becomes the natural refactor.
+- **Plumb `ctx.now` to `installVendorSeeds`** so test-fixed clocks affect archive timestamps too. Pure test concern (no production caller observes the divergence today).
+- **Triplicate disk reads** of `.disabled.json` in the slash mutation path. Microsecond-scale sentinel on an interactive command; defensible until the sentinel surface grows.
+
+**Tests + validation:** `bun run typecheck` clean, `bun run lint` clean. `bun test tests/memory/ tests/cli/slash/memory.test.ts tests/cli/init.test.ts tests/cli/args.test.ts tests/cli/init-seeds.test.ts` → 551 pass (+4 vs pre-review); `bun test tests/cli/bootstrap.test.ts tests/cli/purge.test.ts` → 99 pass (no adjacent regression).
+
+**Slice 5c followup.** The interactive `[k]eep / [v]iew / [a]ccept / [m]erge` modal for `vendor_updated` conflicts (currently the state machine deterministically writes the new vendor body when the user hasn't edited, and the user_kept branch is reached only when the operator pre-edited the file). Slice 5b's opt-out covers "I don't want this seed at all"; slice 5c covers "I want to inspect the vendor's new body before accepting it" — orthogonal use cases, separate UX paths.
+
 ## [2026-05-28] seed memory — slice 5a: `agent init --no-seeds` opt-out flag
 
 First half of slice 5 (`docs/spec/MEMORY.md §5.7.6`). Adds the `--no-seeds` opt-out flag so an operator who wants the full `agent init` scaffold MINUS the bundled vendor seed pack can express that in a single token, without typing the seeds-free `--only=...` csv by hand.

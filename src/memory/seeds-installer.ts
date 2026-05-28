@@ -10,6 +10,7 @@ import {
   seedsRoot,
 } from './paths.ts';
 import type { ScopeRoots } from './paths.ts';
+import { isSeedDisabled, loadDisabledSeeds } from './seeds-disabled.ts';
 import {
   type SeedManifest,
   type SeedManifestEntry,
@@ -46,10 +47,10 @@ import type { IndexEntry } from './types.ts';
 //   - `user_kept`       — body hash diverges from the manifest (user
 //                         hand-edited at some point). Whether or not
 //                         the canonical version bumped, the on-disk
-//                         body is preserved. Slice 5+ surfaces this
-//                         as an interactive prompt
+//                         body is preserved. Slice 5c will surface
+//                         this as an interactive prompt
 //                         (`[k]eep / [v]iew diff / [a]ccept / [m]erge`
-//                         per spec §5.7.5); this slice ships the
+//                         per spec §5.7.5); slice 4 shipped the
 //                         conservative default — keep mine, log
 //                         nothing extra — so operator customizations
 //                         never silently regress on a vendor bump.
@@ -90,7 +91,13 @@ export interface InstallVendorSeedsOptions {
   now?: () => number;
 }
 
-export type SeedAction = 'fresh' | 'unchanged' | 'vendor_updated' | 'user_kept' | 'archived';
+export type SeedAction =
+  | 'fresh'
+  | 'unchanged'
+  | 'vendor_updated'
+  | 'user_kept'
+  | 'archived'
+  | 'disabled';
 
 export interface SeedsInstallResult {
   // Bodies written for the first time (no prior manifest entry).
@@ -108,6 +115,15 @@ export interface SeedsInstallResult {
   // CANONICAL_SEEDS). Bodies, if present, moved to
   // `<user>/seeds/archived/<name>.md`.
   archived: string[];
+  // Names skipped because the operator added an opt-out sentinel
+  // (spec §5.7.6 — `<user>/seeds/.disabled.json`). Body on disk is
+  // untouched (preserved verbatim for a future `enable`), the prior
+  // manifest entry is preserved, and the entry is excluded from the
+  // regenerated index — so the model never sees these seeds in the
+  // assembled system prompt. Survives a vendor catalog bump (sentinel
+  // is honored BEFORE the state-machine branches, so the opt-out
+  // doesn't regress on an upgrade).
+  disabled: string[];
   // Absolute path to the regenerated `seeds/MEMORY.md`.
   indexPath: string;
 }
@@ -137,12 +153,17 @@ export const installVendorSeeds = (opts: InstallVendorSeedsOptions): SeedsInstal
 
   const oldManifest = loadSeedManifest(opts.roots);
   const newManifest: SeedManifest = {};
+  // Load the opt-out sentinel once per install pass. Reading inside
+  // the per-seed loop would re-parse + re-validate N times for no
+  // benefit; the sentinel is a single small JSON file.
+  const disabledSentinel = loadDisabledSeeds(opts.roots);
 
   const fresh: string[] = [];
   const unchanged: string[] = [];
   const vendorUpdated: string[] = [];
   const userKept: string[] = [];
   const archived: string[] = [];
+  const disabled: string[] = [];
 
   // Track which names the canonical catalog covers so we can
   // detect orphans in the prior manifest below.
@@ -164,12 +185,32 @@ export const installVendorSeeds = (opts: InstallVendorSeedsOptions): SeedsInstal
 
     const prior = oldManifest[seed.name];
 
+    // Opt-out sentinel takes precedence over every state-machine
+    // branch (spec §5.7.6). Disabled seeds do NOT have their body
+    // touched, do NOT get a manifest entry refresh (the prior row
+    // is preserved verbatim so a later `enable` resumes from the
+    // same baseline), and do NOT enter the regenerated index. This
+    // means the model never sees the body in the assembled prompt,
+    // and a future vendor bump can't silently override the opt-out
+    // by routing through `vendor_updated`.
+    if (isSeedDisabled(disabledSentinel, seed.name)) {
+      disabled.push(seed.filename);
+      if (prior !== undefined) {
+        newManifest[seed.name] = prior;
+      }
+      continue;
+    }
+
     if (!existsSync(target)) {
       // No body on disk. If a prior manifest entry exists the
-      // operator deleted the body manually; respect that as if
-      // they ran a future `/memory seeds disable`. Slice 5+ will
-      // wire an explicit sentinel; until then, `fresh` only fires
-      // when both the body AND the manifest say "absent".
+      // operator deleted the body manually; respect that as the
+      // implicit-suppression path — it predates the slice-5b
+      // explicit sentinel (above) but the conservative "don't
+      // reinstall" outcome stays the same. `fresh` only fires when
+      // both the body AND the manifest say "absent". The slash
+      // `enable` command intentionally clears the prior manifest
+      // entry when the body is absent at re-enable time, so this
+      // branch never silently overrides an `enable` intent.
       if (prior === undefined) {
         atomicWrite(target, seed.content);
         fresh.push(seed.filename);
@@ -177,9 +218,10 @@ export const installVendorSeeds = (opts: InstallVendorSeedsOptions): SeedsInstal
       } else {
         // Operator-deleted body. Don't reinstall (would fight the
         // operator); don't archive (no body to archive). Preserve
-        // the prior manifest row so a slice-5 `enable` can detect
-        // the suppression intent. The active index regenerated
-        // below SHOULD skip these — see filter at line 224.
+        // the prior manifest row so the slice-5b explicit-sentinel
+        // path (above) can detect the historic suppression. The
+        // active index regenerated below SHOULD skip these — see
+        // the existsSync filter in the regen loop.
         newManifest[seed.name] = prior;
         userKept.push(seed.filename);
       }
@@ -213,7 +255,7 @@ export const installVendorSeeds = (opts: InstallVendorSeedsOptions): SeedsInstal
 
     // User-modified body. Preserve verbatim. The manifest row keeps
     // the OLD {version, hash} so a future bump still sees the
-    // divergence and re-routes to user_kept (or, slice 5+, an
+    // divergence and re-routes to user_kept (or, slice 5c, an
     // interactive prompt). Refreshing the hash here would silently
     // bless the user's edit as the new baseline and lose the
     // conflict signal on the next vendor bump.
@@ -257,11 +299,15 @@ export const installVendorSeeds = (opts: InstallVendorSeedsOptions): SeedsInstal
   // seeds whose body the operator hasn't suppressed). Operator-
   // deleted seeds (manifest row preserved, body absent) drop out
   // of the index so /memory list doesn't advertise something the
-  // loader would return 'missing' for. The filter mirrors the
+  // loader would return 'missing' for. Disabled seeds also drop
+  // out — the opt-out semantic is "model doesn't see this body",
+  // so listing it would defeat the purpose. The filter mirrors the
   // newManifest membership for these names (we kept the row to
-  // signal suppression but the index gates on body presence).
+  // signal suppression but the index gates on body presence + not
+  // being in the disabled sentinel).
   const entries: IndexEntry[] = [];
   for (const seed of source) {
+    if (isSeedDisabled(disabledSentinel, seed.name)) continue;
     const target = seedMemoryFilePath(opts.roots, seed.name);
     if (!existsSync(target)) continue;
     entries.push({
@@ -274,5 +320,5 @@ export const installVendorSeeds = (opts: InstallVendorSeedsOptions): SeedsInstal
   const indexPath = seedIndexFilePath(opts.roots);
   atomicWrite(indexPath, serialized.text);
 
-  return { fresh, unchanged, vendorUpdated, userKept, archived, indexPath };
+  return { fresh, unchanged, vendorUpdated, userKept, archived, disabled, indexPath };
 };

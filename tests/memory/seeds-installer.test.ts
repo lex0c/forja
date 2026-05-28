@@ -27,6 +27,7 @@ import {
   seedsRoot,
 } from '../../src/memory/paths.ts';
 import type { ScopeRoots } from '../../src/memory/paths.ts';
+import { writeDisabledSeeds } from '../../src/memory/seeds-disabled.ts';
 import { installVendorSeeds } from '../../src/memory/seeds-installer.ts';
 import { hashSeedContent, loadSeedManifest } from '../../src/memory/seeds-manifest.ts';
 
@@ -397,5 +398,156 @@ describe('installVendorSeeds — manifest persistence', () => {
     // Manifest re-written with the on-disk hash.
     const manifest = loadSeedManifest(roots);
     expect(manifest[seed.name]).toBeDefined();
+  });
+});
+
+// Per-seed opt-out sentinel (spec §5.7.6). The installer honors
+// `<user>/seeds/.disabled.json` BEFORE the upgrade state machine,
+// so disabling a seed survives a vendor catalog bump that would
+// otherwise route the body through `vendor_updated` or `unchanged`.
+describe('installVendorSeeds — disabled-sentinel handling (spec §5.7.6)', () => {
+  test('first install: disabled seed routes through disabled action, body NOT written', () => {
+    const roots = makeRoots();
+    const seed = makeSeed({ name: 'alpha-rule' });
+    // mkdir + write the sentinel BEFORE the first install — the
+    // installer's mkdir({ recursive: true }) on seedsRoot also
+    // satisfies writeDisabledSeeds's parent-dir prereq, but the
+    // sentinel writer would race that on a fresh tree. Run the
+    // installer once with NO source to get the directory in place,
+    // then add the sentinel and install with the real source.
+    installVendorSeeds({ roots, source: [] });
+    writeDisabledSeeds(roots, { 'alpha-rule': { disabled_at: '2026-05-28T00:00:00Z' } });
+    const result = installVendorSeeds({ roots, source: [seed] });
+    expect(result.disabled).toEqual([seed.filename]);
+    expect(result.fresh).toEqual([]);
+    // Body must NOT have landed on disk — opt-out means the operator
+    // doesn't want even the inert copy at <user>/seeds/<name>.md.
+    expect(existsSync(seedMemoryFilePath(roots, seed.name))).toBe(false);
+    // Index regen MUST exclude disabled entries.
+    const indexEntries = parseIndex(readFileSync(seedIndexFilePath(roots), 'utf-8')).entries;
+    expect(indexEntries.find((e) => e.href === seed.filename)).toBeUndefined();
+  });
+
+  test('disabled seed with a prior install preserves the body on disk', () => {
+    const roots = makeRoots();
+    const seed = makeSeed({ name: 'alpha-rule' });
+    // First install lands the body normally.
+    installVendorSeeds({ roots, source: [seed] });
+    expect(existsSync(seedMemoryFilePath(roots, seed.name))).toBe(true);
+    // Operator disables the seed AFTER the install.
+    writeDisabledSeeds(roots, { 'alpha-rule': { disabled_at: '2026-05-28T00:00:00Z' } });
+    const result = installVendorSeeds({ roots, source: [seed] });
+    expect(result.disabled).toEqual([seed.filename]);
+    // Body preserved — `disable` is reversible. Without this, a
+    // future `enable` would have to reinstall from scratch instead
+    // of just dropping the sentinel.
+    expect(existsSync(seedMemoryFilePath(roots, seed.name))).toBe(true);
+    // Index excludes it.
+    const indexEntries = parseIndex(readFileSync(seedIndexFilePath(roots), 'utf-8')).entries;
+    expect(indexEntries.find((e) => e.href === seed.filename)).toBeUndefined();
+  });
+
+  test('disabled status survives a vendor version bump (sentinel beats state machine)', () => {
+    const roots = makeRoots();
+    const v1 = makeSeed({ name: 'alpha-rule', version: '1.0' });
+    installVendorSeeds({ roots, source: [v1] });
+    writeDisabledSeeds(roots, { 'alpha-rule': { disabled_at: '2026-05-28T00:00:00Z' } });
+    // Vendor catalog bumps to v2 (different body). Without the
+    // sentinel-first check, this would route through `vendor_updated`
+    // (hash matches the prior manifest, version bumped) and silently
+    // rewrite the body — defeating the opt-out.
+    const v2 = makeSeed({
+      name: 'alpha-rule',
+      version: '2.0',
+      content:
+        '---\nname: alpha-rule\ndescription: desc\ntype: feedback\nsource: seed\nseed_origin: vendor\nseed_version: "2.0"\n---\n\nv2 body.\n',
+    });
+    const result = installVendorSeeds({ roots, source: [v2] });
+    expect(result.disabled).toEqual([v2.filename]);
+    expect(result.vendorUpdated).toEqual([]);
+    // Manifest preserved at the v1 entry (the sentinel doesn't
+    // refresh the manifest — a future `enable` resumes from v1
+    // baseline, which then triggers vendor_updated on the next pass
+    // and the operator gets the v2 body if they want it).
+    const manifest = loadSeedManifest(roots);
+    expect(manifest[v2.name]?.version).toBe('1.0');
+  });
+
+  test('removing the sentinel (mimicking enable) restores normal state-machine routing', () => {
+    const roots = makeRoots();
+    const seed = makeSeed({ name: 'alpha-rule' });
+    installVendorSeeds({ roots, source: [seed] });
+    writeDisabledSeeds(roots, { 'alpha-rule': { disabled_at: '2026-05-28T00:00:00Z' } });
+    let result = installVendorSeeds({ roots, source: [seed] });
+    expect(result.disabled).toEqual([seed.filename]);
+    // Operator re-enables: clear the sentinel.
+    writeDisabledSeeds(roots, {});
+    result = installVendorSeeds({ roots, source: [seed] });
+    // Body present + manifest match the canonical version → unchanged.
+    expect(result.unchanged).toEqual([seed.filename]);
+    expect(result.disabled).toEqual([]);
+    // Index re-adds the entry.
+    const indexEntries = parseIndex(readFileSync(seedIndexFilePath(roots), 'utf-8')).entries;
+    expect(indexEntries.find((e) => e.href === seed.filename)).toBeDefined();
+  });
+
+  test('disabled seed alongside enabled siblings — only the named seed is suppressed', () => {
+    const roots = makeRoots();
+    const alpha = makeSeed({ name: 'alpha-rule' });
+    const beta = makeSeed({ name: 'beta-rule' });
+    installVendorSeeds({ roots, source: [alpha, beta] });
+    writeDisabledSeeds(roots, { 'alpha-rule': { disabled_at: '2026-05-28T00:00:00Z' } });
+    const result = installVendorSeeds({ roots, source: [alpha, beta] });
+    expect(result.disabled).toEqual([alpha.filename]);
+    expect(result.unchanged).toEqual([beta.filename]);
+    // Index keeps beta, drops alpha.
+    const indexEntries = parseIndex(readFileSync(seedIndexFilePath(roots), 'utf-8')).entries;
+    expect(indexEntries.map((e) => e.href)).toEqual([beta.filename]);
+  });
+
+  test('disable → vendor bump → enable cycle resumes from the preserved baseline (spec §5.7.6 + §5.7.5)', () => {
+    // BACKLOG promise (slice 5b): "prior manifest entry is preserved
+    // verbatim (so a future enable resumes from the same baseline)".
+    // This pins the resumption side of that contract: after a vendor
+    // bump landed during the disabled window, clearing the sentinel
+    // and re-running the installer routes through `vendor_updated`
+    // using the v1 manifest baseline — the operator gets the v2
+    // body for free, exactly as if the disable had never happened.
+    // Without the manifest preservation, the post-enable routing
+    // could mis-fire to `unchanged` (silently keeping v1) or to a
+    // user-modified path (claiming a divergence that doesn't exist).
+    const roots = makeRoots();
+    const v1 = makeSeed({ name: 'alpha-rule', version: '1.0' });
+    installVendorSeeds({ roots, source: [v1] });
+    // Operator disables the seed.
+    writeDisabledSeeds(roots, { 'alpha-rule': { disabled_at: '2026-05-28T00:00:00Z' } });
+    // Vendor bumps to v2 DURING the disabled window — installer
+    // routes through `disabled`, manifest preserves the v1 entry.
+    const v2 = makeSeed({
+      name: 'alpha-rule',
+      version: '2.0',
+      content:
+        '---\nname: alpha-rule\ndescription: desc\ntype: feedback\nsource: seed\nseed_origin: vendor\nseed_version: "2.0"\n---\n\nv2 body.\n',
+    });
+    let result = installVendorSeeds({ roots, source: [v2] });
+    expect(result.disabled).toEqual([v2.filename]);
+    // Manifest preserved at v1 — this is the resumption baseline.
+    let manifest = loadSeedManifest(roots);
+    expect(manifest['alpha-rule']?.version).toBe('1.0');
+    // Operator re-enables; v2 catalog is still the active vendor pack.
+    writeDisabledSeeds(roots, {});
+    result = installVendorSeeds({ roots, source: [v2] });
+    // Body present + manifest at v1 + canonical at v2 → vendor_updated:
+    // the silent-rewrite path delivers v2 to the operator. This is
+    // the spec's "User não editou (hash bate): atualiza silenciosamente"
+    // landing — operator gets the new vendor content on enable, not
+    // a stale v1.
+    expect(result.vendorUpdated).toEqual([v2.filename]);
+    expect(result.disabled).toEqual([]);
+    // Manifest now reflects v2 (resumption complete).
+    manifest = loadSeedManifest(roots);
+    expect(manifest['alpha-rule']?.version).toBe('2.0');
+    // On-disk body matches v2 canonical.
+    expect(readFileSync(seedMemoryFilePath(roots, 'alpha-rule'), 'utf-8')).toBe(v2.content);
   });
 });

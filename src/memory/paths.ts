@@ -196,9 +196,10 @@ export const indexFilePath = (roots: ScopeRoots, scope: MemoryScope): string =>
 //
 // The slice-2 primitives below mirror the top-level helpers
 // (memoryFilePath / indexFilePath / tombstonePath) so that callers
-// touching seeds don't reimplement the sandbox check; slice 3+ will
-// use these to install the vendor catalog, slice 4 to compute
-// upgrade hashes, slice 5 to honor the disable sentinel.
+// touching seeds don't reimplement the sandbox check. Slice 3 used
+// these to install the vendor catalog; slice 4 added the upgrade-
+// hash primitives; slice 5b added `disabledSeedsPath` for the per-
+// seed opt-out sentinel.
 export const SEEDS_SUBDIR = 'seeds';
 
 // Absolute path to `<user>/seeds/`. Callers that need to readdir or
@@ -264,6 +265,18 @@ export const seedTombstonePath = (roots: ScopeRoots, name: string, ts: number): 
 // memory body.
 export const seedManifestPath = (roots: ScopeRoots): string =>
   join(seedsRoot(roots), '.installed.json');
+
+// `<user>/seeds/.disabled.json` — operator opt-out sentinel (spec
+// §5.7.6). Persisted shape mirrors the install manifest's plain-JSON
+// object: { "<seed-name>": { "disabled_at": "<ISO-8601>" }, ... }.
+// Dot-prefixed so the seeds-subdir orphan walker silently ignores it
+// (same rationale as the install manifest). Survives a vendor catalog
+// bump (the installer honors the sentinel and routes the seed through
+// the new `disabled` action instead of `vendor_updated`), so an
+// operator's opt-out doesn't silently regress when the binary
+// upgrades.
+export const disabledSeedsPath = (roots: ScopeRoots): string =>
+  join(seedsRoot(roots), '.disabled.json');
 
 // `<user>/seeds/archived/` — destination for seeds the new vendor
 // catalog dropped but the previous manifest still listed (spec

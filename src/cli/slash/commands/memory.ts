@@ -36,16 +36,23 @@ import {
   computeSharedFingerprint,
   findLatestTombstone,
   getSharedTrust,
+  installVendorSeeds,
   isExpired,
+  isSeedDisabled,
   listSharedCorpusFiles,
+  loadDisabledSeeds,
+  loadSeedManifest,
   moveMemory,
   parseMemoryFile,
   removeMemory,
   resolveRepoRoot,
   scanForInjection,
   scanForPromotion,
+  seedMemoryFilePath,
   setSharedTrust,
   transitionMemoryState,
+  writeDisabledSeeds,
+  writeSeedManifest,
 } from '../../../memory/index.ts';
 import {
   MEMORY_VERIFY_CONFLICT_MAX_COST_USD,
@@ -106,6 +113,7 @@ import {
 } from '../../../storage/repos/memory-provenance.ts';
 import { listRecentAttempts } from '../../../storage/repos/memory-verify-attempts.ts';
 import { listRecentOverrideAttempts } from '../../../storage/repos/memory-verify-override-attempts.ts';
+import { CANONICAL_SEEDS } from '../../init-seeds/index.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 
 // ─── scope arg helpers ───────────────────────────────────────────────
@@ -1160,6 +1168,217 @@ const handleTrust = (registry: MemoryRegistry, ctx: SlashContext, args: string[]
   lines.push(`  inventory: ${fileCount} file${fileCount === 1 ? '' : 's'}, ${totalBytes} bytes`);
 
   return { kind: 'ok', notes: lines };
+};
+
+// ─── /memory seeds disable | enable | list (S5b/§5.7.6) ──────────────
+//
+// Per-seed operator opt-out. Sentinel lives at
+// `<user>/seeds/.disabled.json` and is consulted by both
+// `installVendorSeeds` (which routes disabled seeds through the new
+// `disabled` action — body untouched, manifest preserved, index
+// excluded) and `createMemoryRegistry.refresh` (which filters
+// disabled seeds out of the user/seeds snapshot so the model never
+// sees them in the assembled prompt).
+//
+// Subcommands:
+//   /memory seeds list                     — enumerate every canonical
+//                                            seed with its current
+//                                            [active|disabled] state
+//   /memory seeds disable <name>           — add the opt-out sentinel,
+//                                            re-run the installer (which
+//                                            drops the body from the
+//                                            index), and refresh the
+//                                            registry so the current
+//                                            session reflects the
+//                                            change without a restart
+//   /memory seeds enable <name>            — reverse: remove the
+//                                            sentinel, re-run the
+//                                            installer (which re-adds
+//                                            the body to the index if
+//                                            present), refresh the
+//                                            registry
+//
+// Both mutation subcommands validate the name against `CANONICAL_SEEDS`
+// — a typo lands on a clear error naming the known set instead of
+// silently writing a sentinel for a seed that doesn't exist (which
+// would later look like the disable "did nothing" when the installer
+// ignores the stale entry).
+const handleSeeds = (registry: MemoryRegistry, ctx: SlashContext, args: string[]): SlashResult => {
+  const sub = args[0];
+  if (sub === undefined) {
+    return {
+      kind: 'error',
+      message: '/memory seeds: missing subcommand (try: disable, enable, list)',
+    };
+  }
+  if (sub !== 'disable' && sub !== 'enable' && sub !== 'list') {
+    return {
+      kind: 'error',
+      message: `/memory seeds: unknown subcommand '${sub}' (try: disable, enable, list)`,
+    };
+  }
+
+  // `/memory seeds list` — enumerate canonical catalog with state.
+  // We list from CANONICAL_SEEDS (not from registry.list filtered to
+  // user/seeds) on purpose: a disabled seed is filtered OUT of the
+  // registry's user/seeds snapshot, so iterating registry listings
+  // would hide exactly the entries this subcommand is supposed to
+  // surface. The canonical catalog is the source of truth for "what
+  // could be installed"; the sentinel decides "what currently is".
+  if (sub === 'list') {
+    if (args.length > 1) {
+      return {
+        kind: 'error',
+        message: `/memory seeds list: unexpected extra args (${args.slice(1).join(' ')})`,
+      };
+    }
+    const disabledMap = loadDisabledSeeds(registry.roots);
+    const notes: string[] = [];
+    let activeCount = 0;
+    let disabledCount = 0;
+    for (const seed of CANONICAL_SEEDS) {
+      const isDisabled = isSeedDisabled(disabledMap, seed.name);
+      if (isDisabled) disabledCount += 1;
+      else activeCount += 1;
+      const stateMarker = isDisabled ? 'disabled' : 'active  ';
+      notes.push(`  [${stateMarker}] ${seed.name} — ${seed.description}`);
+    }
+    notes.unshift(
+      `vendor seeds: ${activeCount} active, ${disabledCount} disabled (of ${CANONICAL_SEEDS.length} canonical)`,
+    );
+    return { kind: 'ok', notes };
+  }
+
+  // disable / enable — both take a seed name.
+  const name = args[1];
+  if (name === undefined) {
+    return {
+      kind: 'error',
+      message: `/memory seeds ${sub}: missing seed name (try: /memory seeds list to see known names)`,
+    };
+  }
+  if (args.length > 2) {
+    return {
+      kind: 'error',
+      message: `/memory seeds ${sub}: unexpected extra args (${args.slice(2).join(' ')})`,
+    };
+  }
+  const knownSeed = CANONICAL_SEEDS.find((s) => s.name === name);
+  if (knownSeed === undefined) {
+    const known = CANONICAL_SEEDS.map((s) => s.name).join(', ');
+    return {
+      kind: 'error',
+      message: `/memory seeds ${sub}: unknown seed '${name}' (known: ${known})`,
+    };
+  }
+
+  const disabledMap = loadDisabledSeeds(registry.roots);
+  const alreadyDisabled = isSeedDisabled(disabledMap, name);
+
+  if (sub === 'disable') {
+    if (alreadyDisabled) {
+      // Idempotent — no sentinel write, no installer re-run. The
+      // operator's repeat invocation isn't an error, but signaling
+      // "no-op" lets them notice if they meant a different name.
+      return {
+        kind: 'ok',
+        notes: [`seed '${name}' already disabled (no-op)`],
+      };
+    }
+    disabledMap[name] = { disabled_at: new Date(ctx.now()).toISOString() };
+    writeDisabledSeeds(registry.roots, disabledMap);
+    // Re-run the installer so `seeds/MEMORY.md` drops the entry
+    // immediately — without this, the index would still advertise
+    // the seed until the next `agent init` pass, and `/memory list`
+    // would show it (the registry filter below catches that, but
+    // the on-disk index would still be stale and confusing for an
+    // operator who inspects the directory). The installer call is
+    // cheap (10 hashes + an atomic write); operator-triggered so
+    // latency is tolerable.
+    installVendorSeeds({ roots: registry.roots });
+    registry.reload();
+    // The "body preserved" line must reflect what actually happened
+    // on disk. After `--no-seeds` (or any path that disabled the
+    // seed before its body was ever written), the body does not
+    // exist — claiming preservation in that case sends operators
+    // chasing a file that isn't there. Branch on existsSync at the
+    // canonical path so the operator-facing copy matches reality.
+    const bodyPath = seedMemoryFilePath(registry.roots, name);
+    const bodyOnDisk = existsSync(bodyPath);
+    const persistenceLine = bodyOnDisk
+      ? `seed '${name}' disabled — body preserved at ${bodyPath}, excluded from the loaded set`
+      : `seed '${name}' disabled — no body on disk yet (sentinel persisted so a future install honors the opt-out)`;
+    return {
+      kind: 'ok',
+      notes: [
+        persistenceLine,
+        '  the opt-out survives `agent init` and a future vendor catalog bump',
+        `  re-enable with: /memory seeds enable ${name}`,
+      ],
+    };
+  }
+
+  // sub === 'enable'
+  if (!alreadyDisabled) {
+    return {
+      kind: 'ok',
+      notes: [`seed '${name}' already enabled (no-op)`],
+    };
+  }
+  delete disabledMap[name];
+  writeDisabledSeeds(registry.roots, disabledMap);
+  // `enable` semantic is "I want this seed back to vendor baseline".
+  // Three cases at this point (sentinel just cleared, installer not
+  // re-run yet):
+  //
+  //   1. Body present, hash matches the manifest → installer routes
+  //      through `unchanged` → index re-adds the entry → seed is
+  //      visible. No additional action needed.
+  //   2. Body present, hash diverges from the manifest (operator
+  //      hand-edited at some point) → installer routes through
+  //      `user_kept` → body preserved verbatim → index re-adds the
+  //      entry (existsSync skip passes) → seed IS visible. The
+  //      operator's edit is honored, not silently overridden.
+  //   3. Body absent, prior manifest entry exists (operator deleted
+  //      the body manually at some point) → installer routes through
+  //      `user_kept` → no write → index excludes (existsSync skip
+  //      fails) → seed NOT visible.
+  //
+  // Case 3 was the bug in the original handler: the installer's
+  // operator-delete-intent path is fundamentally the WRONG response
+  // to an explicit `enable`. The operator just typed the command
+  // that says "give me this seed back"; the historical delete intent
+  // is overridden by the newer enable intent. To make case 3 land
+  // on a fresh re-install, drop the manifest entry before running
+  // the installer — the installer then sees no body + no prior
+  // manifest, routes through `fresh`, and writes the canonical body.
+  const bodyPath = seedMemoryFilePath(registry.roots, name);
+  if (!existsSync(bodyPath)) {
+    const manifest = loadSeedManifest(registry.roots);
+    if (manifest[name] !== undefined) {
+      delete manifest[name];
+      writeSeedManifest(registry.roots, manifest);
+    }
+  }
+  installVendorSeeds({ roots: registry.roots });
+  registry.reload();
+  // Post-install body presence is the source of truth for "is the
+  // seed in the loaded set?" — the index regen excludes entries with
+  // no body on disk (a guarantee from the installer, pinned by the
+  // seeds-installer tests). `installVendorSeeds` is deterministic on
+  // the post-state, so if existsSync still fails here, something
+  // pathological happened (e.g., a write race outside our control)
+  // and the honest answer is "we tried, check the path".
+  const bodyRestored = existsSync(bodyPath);
+  return {
+    kind: 'ok',
+    notes: bodyRestored
+      ? [`seed '${name}' enabled — back in the loaded set on the next prompt assembly`]
+      : [
+          `seed '${name}' enabled — sentinel removed, but the body did not land at ${bodyPath}`,
+          '  check the path for permissions / disk-full errors and re-run',
+        ],
+  };
 };
 
 // ─── /memory summary (no subcommand) ─────────────────────────────────
@@ -3429,7 +3648,7 @@ const handleGovernance = async (
 export const memoryCommand: SlashCommand = {
   name: 'memory',
   description:
-    'manage cross-session memories (list/show/audit/provenance/governance/delete/quarantine/restore/promote/demote/trust)',
+    'manage cross-session memories (list/show/audit/provenance/governance/delete/quarantine/restore/promote/demote/trust/seeds)',
   exec: async (args, ctx) => {
     const registry = ctx.baseConfig.memoryRegistry;
     if (registry === undefined) {
@@ -3467,10 +3686,12 @@ export const memoryCommand: SlashCommand = {
         return handleTrust(registry, ctx, args.slice(1));
       case 'governance':
         return handleGovernance(registry, ctx, args.slice(1));
+      case 'seeds':
+        return handleSeeds(registry, ctx, args.slice(1));
       default:
         return {
           kind: 'error',
-          message: `/memory: unknown subcommand '${sub}' (try: list, show, audit, provenance, conflicts, metrics, delete, quarantine, restore, promote, demote, trust, governance)`,
+          message: `/memory: unknown subcommand '${sub}' (try: list, show, audit, provenance, conflicts, metrics, delete, quarantine, restore, promote, demote, trust, governance, seeds)`,
         };
     }
   },

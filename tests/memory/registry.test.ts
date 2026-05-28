@@ -93,6 +93,32 @@ describe('createMemoryRegistry — list', () => {
     expect(dedup[0]?.scope).toBe('project_local');
     expect(dedup[0]?.entry.hook).toBe('local-a');
   });
+
+  test('disabled-sentinel filters seeds out of the user/seeds snapshot (spec §5.7.6)', () => {
+    // Defense-in-depth pin: the installer is the primary mechanism
+    // that drops disabled seeds from `seeds/MEMORY.md`, but the
+    // registry's filter must also honor the sentinel — so a slash
+    // command that updates the sentinel without re-running the
+    // installer (or an operator who hand-edited the index file)
+    // still gets the opt-out semantic on the next refresh.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    // Write a seed index containing two entries directly (mimicking
+    // a state where the installer hasn't yet regenerated after a
+    // sentinel update).
+    writeIndex(
+      join(roots.user, 'seeds'),
+      '- [alpha](alpha.md) — alpha seed\n- [beta](beta.md) — beta seed\n',
+    );
+    writeFileSync(
+      join(roots.user, 'seeds', '.disabled.json'),
+      JSON.stringify({ alpha: { disabled_at: '2026-05-28T00:00:00Z' } }),
+    );
+    const reg = createMemoryRegistry({ roots });
+    const seedListings = reg.list().filter((l) => l.subdir === 'seeds');
+    // alpha disabled → only beta visible.
+    expect(seedListings.map((l) => l.name)).toEqual(['beta']);
+  });
 });
 
 describe('createMemoryRegistry — list states + expires filter (H1+H6)', () => {

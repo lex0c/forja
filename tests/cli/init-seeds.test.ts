@@ -174,4 +174,55 @@ describe('agent init seeds — installs vendor catalog under user scope', () => 
     // through `unchanged`).
     expect(stdout).toContain(`${CANONICAL_SEEDS.length} skipped`);
   });
+
+  test('summary surfaces `K disabled` suffix when sentinel is populated (spec §5.7.6)', async () => {
+    // Slice 5b: an operator who disabled some seeds (via slash, or
+    // by hand-editing the sentinel) should see the count in the
+    // init summary. Without this pin, a refactor of the totals
+    // aggregator could silently drop the suffix and the operator
+    // running `agent init` after a long pause would lose the
+    // signal that their opt-outs are still active.
+    const cwd = mkdtempSync(join(tmpdir(), 'forja-init-seeds-disabled-'));
+    const userHome = mkdtempSync(join(tmpdir(), 'forja-init-seeds-disabled-xdg-'));
+    cleanup.push(cwd, userHome);
+    process.env.XDG_CONFIG_HOME = userHome;
+
+    // First pass: install the full catalog so a disable has something
+    // to act against.
+    runInit({ cwd, mode: 'strict', only: ['seeds'], out: () => {}, err: () => {} });
+    // Hand-write the sentinel for two seeds. Going through the slash
+    // surface would require wiring a full SlashContext; the sentinel
+    // file is the contract the installer reads from, and this test
+    // pins the installer + summary behavior, not the slash dispatch
+    // (which has its own tests).
+    const { writeDisabledSeeds } = await import('../../src/memory/seeds-disabled.ts');
+    const { resolveScopeRoots, resolveRepoRoot } = await import('../../src/memory/paths.ts');
+    // `resolveScopeRoots` reads `XDG_CONFIG_HOME` for the user-scope
+    // root, which the test already set above to the isolated
+    // userHome — passing process.env honors that override.
+    const roots = resolveScopeRoots(resolveRepoRoot(cwd), process.env);
+    const targets = CANONICAL_SEEDS.slice(0, 2);
+    const sentinel: Record<string, { disabled_at: string }> = {};
+    for (const seed of targets) {
+      sentinel[seed.name] = { disabled_at: '2026-05-28T00:00:00Z' };
+    }
+    writeDisabledSeeds(roots, sentinel);
+
+    // Re-run init with the sentinel in place.
+    const out: string[] = [];
+    const code = runInit({
+      cwd,
+      mode: 'strict',
+      only: ['seeds'],
+      out: (s) => out.push(s),
+      err: () => {},
+    });
+    expect(code).toBe(0);
+    const stdout = out.join('');
+    expect(stdout).toContain(`${targets.length} disabled`);
+    // Per-seed log line names the file + the re-enable hint.
+    for (const seed of targets) {
+      expect(stdout).toContain(`/memory seeds enable ${seed.name}`);
+    }
+  });
 });

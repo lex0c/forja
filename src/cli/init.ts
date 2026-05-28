@@ -117,6 +117,15 @@ interface StepResult {
   // it as `... K archived` when non-zero; other scaffolds always
   // omit the field and the summary skips the suffix.
   archived?: number;
+  // Optional sixth bucket: the seeds step honors per-seed opt-out
+  // sentinels (spec §5.7.6 — `<user>/seeds/.disabled.json` populated
+  // via `/memory seeds disable <name>`). Distinct from `skipped`
+  // (which lumps `unchanged` and `userKept` together, both
+  // technical-pipeline outcomes) because `disabled` is operator-
+  // intent and warrants its own summary suffix so an operator running
+  // `agent init` sees "5 disabled" instead of "5 skipped" hiding the
+  // opt-out behind the same number that would mean "no work to do".
+  disabled?: number;
 }
 
 // Atomic write helper. Writes `content` to a temp file alongside
@@ -410,11 +419,23 @@ const scaffoldSeeds = (options: InitOptions): StepResult | null => {
   for (const filename of result.archived) {
     out(`forja: archived ${memoryRoots.user}/seeds/archived/${filename}\n`);
   }
+  for (const filename of result.disabled) {
+    // Disabled seeds are operator-intent opt-outs. Naming the file
+    // and pointing at the slash command that toggles state keeps the
+    // log self-explanatory — an operator reading the init output a
+    // month later (or in CI logs) doesn't have to remember why a
+    // seed was skipped without an "edited" hint.
+    const seedName = filename.endsWith('.md') ? filename.slice(0, -3) : filename;
+    out(
+      `forja: skip ${memoryRoots.user}/seeds/${filename} (disabled by /memory seeds disable; re-enable with \`/memory seeds enable ${seedName}\`)\n`,
+    );
+  }
   return {
     wrote: result.fresh.length,
     overwritten: result.vendorUpdated.length,
     skipped: result.unchanged.length + result.userKept.length,
     archived: result.archived.length,
+    disabled: result.disabled.length,
   };
 };
 
@@ -450,15 +471,23 @@ export const runInit = (options: InitOptions): number => {
     if (result.archived !== undefined) {
       totals.archived = (totals.archived ?? 0) + result.archived;
     }
+    if (result.disabled !== undefined) {
+      totals.disabled = (totals.disabled ?? 0) + result.disabled;
+    }
   }
   const stepWord = steps.length === 1 ? 'step' : 'steps';
-  // The archived suffix only appears when at least one seed was
-  // archived this run (vendor catalog dropped seeds). Operators who
-  // never trip that path see the same 3-counter summary as before.
+  // The archived / disabled suffixes only appear when the seeds step
+  // actually triggered the corresponding action this run. Operators
+  // who never trip those paths see the same 3-counter summary as
+  // before. Order: archived before disabled (alphabetical), which
+  // also matches the order they appear in the installer's state
+  // machine for consistency.
   const archivedSuffix =
     totals.archived !== undefined && totals.archived > 0 ? `, ${totals.archived} archived` : '';
+  const disabledSuffix =
+    totals.disabled !== undefined && totals.disabled > 0 ? `, ${totals.disabled} disabled` : '';
   options.out(
-    `forja: ${totals.wrote} wrote, ${totals.overwritten} overwritten, ${totals.skipped} skipped${archivedSuffix} (${steps.length} ${stepWord})\n`,
+    `forja: ${totals.wrote} wrote, ${totals.overwritten} overwritten, ${totals.skipped} skipped${archivedSuffix}${disabledSuffix} (${steps.length} ${stepWord})\n`,
   );
   if (totals.wrote + totals.overwritten > 0) {
     options.out("forja: review .agent/ and run 'agent' to start.\n");
