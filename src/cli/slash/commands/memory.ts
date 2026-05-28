@@ -83,6 +83,7 @@ import {
   SEMANTIC_CONFLICT_DEDUP_WINDOW_MS,
   listRecentConflictAttempts,
 } from '../../../storage/repos/memory-conflict-attempts.ts';
+import type { MemoryEventSource } from '../../../storage/repos/memory-events.ts';
 import {
   GOVERNANCE_PROPOSAL_STATUSES,
   MAX_GOVERNANCE_PROPOSAL_DEFER_DAYS,
@@ -1463,7 +1464,7 @@ const confirmAndDelete = async (
       action: 'refused',
       scope,
       memoryName: name,
-      source: source as 'user_explicit' | 'inferred' | 'imported',
+      source: source as MemoryEventSource,
       details: { stage: 'slash_delete', reason: result.reason },
       auditCwd: ctx.baseConfig.cwd,
       ...attribution(ctx),
@@ -1475,7 +1476,7 @@ const confirmAndDelete = async (
       action: 'refused',
       scope,
       memoryName: name,
-      source: source as 'user_explicit' | 'inferred' | 'imported',
+      source: source as MemoryEventSource,
       details: { stage: 'slash_delete', reason: result.reason },
       auditCwd: ctx.baseConfig.cwd,
       ...attribution(ctx),
@@ -1494,7 +1495,7 @@ const confirmAndDelete = async (
     action: 'deleted',
     scope,
     memoryName: name,
-    source: source as 'user_explicit' | 'inferred' | 'imported',
+    source: source as MemoryEventSource,
     details: { bodyPath: result.bodyPath },
     auditCwd: ctx.baseConfig.cwd,
     ...attribution(ctx),
@@ -2317,7 +2318,7 @@ const finalizeMove = (input: FinalizeMoveInput): SlashResult => {
       action: pastTense,
       scope: toScope,
       memoryName: name,
-      source: result.source as 'user_explicit' | 'inferred' | 'imported',
+      source: result.source as MemoryEventSource,
       details: {
         from_scope: fromScope,
         to_scope: toScope,
@@ -2359,7 +2360,7 @@ const finalizeMove = (input: FinalizeMoveInput): SlashResult => {
     action: 'refused',
     scope: fromScope,
     memoryName: name,
-    source: sourceFallback as 'user_explicit' | 'inferred' | 'imported',
+    source: sourceFallback as MemoryEventSource,
     details: { stage: `slash_${pastTense}`, kind: result.kind, reason },
     auditCwd,
     ...audit,

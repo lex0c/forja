@@ -20,7 +20,7 @@ import { ScopeError, indexFilePath, memoryFilePath } from './paths.ts';
 import type { ScopeRoots } from './paths.ts';
 import type { MemoryRegistry } from './registry.ts';
 import { transitionMemoryState } from './transitions.ts';
-import type { MemoryFile, MemoryScope } from './types.ts';
+import type { MemoryFile, MemoryScope, MemorySource } from './types.ts';
 import { type WriteMemoryResult, writeMemory } from './writer.ts';
 
 // Lifecycle primitives for the memory subsystem (spec MEMORY.md §5.5,
@@ -1060,7 +1060,7 @@ export interface StaleInvalidatedMemory {
   scope: MemoryScope;
   name: string;
   invalidatedAtMs: number;
-  source: 'user_explicit' | 'inferred' | 'imported';
+  source: MemorySource;
 }
 
 export interface GcStaleInvalidatedResult {

@@ -5,13 +5,22 @@
 // against "every interesting thing becomes a memory" rot.
 export type MemoryType = 'user' | 'feedback' | 'project' | 'reference';
 
-// Provenance of a memory entry per spec §5.2. `user_explicit`
-// means the human asked for it; `inferred` means the model
-// proposed it (highest injection-risk path, requires confirmation
-// + extra mitigations in 5.4); `imported` means it came from an
-// export of another tool or scope (e.g. promoted from local to
-// shared).
-export type MemorySource = 'user_explicit' | 'inferred' | 'imported';
+// Provenance of a memory entry per spec §5.2 + §5.7.2.
+// `user_explicit` means the human asked for it; `seed` means
+// the memory was installed by the vendor seed catalog (§5.7) and
+// represents agent-meta behavior shipped with the binary;
+// `inferred` means the model proposed it (highest injection-risk
+// path, requires confirmation + extra mitigations in 5.4);
+// `imported` means it came from an export of another tool or
+// scope (e.g. promoted from local to shared).
+export type MemorySource = 'user_explicit' | 'seed' | 'inferred' | 'imported';
+
+// Origin of a seed memory per spec §5.7.2. `vendor` shipped with
+// the binary (trusted by construction); `team` came from an
+// opt-in team-seeds repository (`agent init --team-seeds=<repo>`,
+// triggers the trust prompt on first load — §5.7.9); `install`
+// was opted into interactively during `agent init`.
+export type SeedOrigin = 'vendor' | 'team' | 'install';
 
 // Trust marker on a memory file. Default `trusted` when the
 // frontmatter omits the field — i.e. the memory was created in a
@@ -63,6 +72,16 @@ export interface MemoryFrontmatter {
   // Optional auto-injection tags (spec §4.3). 5.1 just preserves
   // these on round-trip; the eager-injection logic lives in 5.2.
   triggers?: string[];
+  // Origin of a seed memory (spec §5.7.2). Required when
+  // `source === 'seed'`; forbidden otherwise (the parser enforces
+  // the symmetry so unrelated memories can't smuggle a seed
+  // origin string into their frontmatter).
+  seed_origin?: SeedOrigin;
+  // Catalog version of a seed memory (spec §5.7.2 + §5.7.5).
+  // Required when `source === 'seed'`. Shape `MAJOR.MINOR` or
+  // `MAJOR.MINOR.PATCH` — the upgrade logic (slice 4) compares
+  // these strings to decide silent-update vs. divergence prompt.
+  seed_version?: string;
   // Optional lifecycle state per spec §3.1.1. Absence equates to
   // `active`; the parser/writer preserve absence on round-trip
   // (a memory written without `state` doesn't get a serialized

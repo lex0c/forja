@@ -2,6 +2,39 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-28] seed memory — slice 1: types + parser + tier + migration
+
+Opened the seed-memory subsystem (`docs/spec/MEMORY.md §5.7`). The other 26 files in `src/memory/` already implement every other §1-§12 slice (paths, frontmatter, scanner, loader, writer, lifecycle, conflict-resolver, trust-corpus, governance, registry, verify dispatchers, eviction, tombstones, etc.); §5.7's vendor seed catalog is the remaining piece. Slice 1 lands the typed substrate every later slice depends on.
+
+**Branch:** new branch `feat/memory-seeds` off `develop`.
+
+**Shipped on this branch:**
+
+- **`MemorySource` extended.** `src/memory/types.ts` adds `'seed'` to the union; the four-value set is now `user_explicit | seed | inferred | imported`. New `SeedOrigin` type enumerates `vendor | team | install` (spec §5.7.2). `MemoryFrontmatter` gains optional `seed_origin: SeedOrigin` and `seed_version: string` fields — required cross-validation (below) enforces the symmetric "both present iff source=seed" contract at the parser layer, not at the type layer, so unrelated memories can't smuggle seed markers into their frontmatter even if a programmatic caller bypasses TS.
+
+- **`src/memory/frontmatter.ts` validation expanded.** `VALID_SOURCES` accepts `'seed'`; new `VALID_SEED_ORIGINS` set + `SEED_VERSION_RE` (`MAJOR.MINOR` or `MAJOR.MINOR.PATCH`, leading-zeros rejected for unambiguous slice-4 comparison). Four cross-field constraints when `source === 'seed'`: (a) requires `seed_origin`, (b) requires `seed_version`, (c) forbids `expires` (spec §5.7.7: "Sem expires — seed é semântica estável; se envelheceu, sobe versão."), (d) forbids `trust: untrusted` (spec §5.7.7: "trust: trusted sempre. Seed untrusted é contradição."). Inverse symmetry: when source is anything else, both seed fields are forbidden. `serializeMemoryFile` emits the two seed fields after `source` (spec ordering: identity + provenance metadata next to source line). New `validateSeedBody` enforces the §5.7.7 body cap (`SEED_BODY_MAX_LINES = 30`); called from both `parseMemoryFile` (when source=seed on read) and `serializeMemoryFile` (symmetric on write), so a caller can't construct a too-long body and dodge the round-trip check.
+
+- **`PROVENANCE_RANK` tier inserted.** `src/memory/conflict-resolver.ts` now ranks `user_explicit:0 > seed:1 > inferred:2 > imported:3`. Rationale (encoded in the header comment): operator customization always wins, vendor-curated seed beats model-proposed inferred, inferred still beats foreign imports. Anchors §5.7.5's "preserva o que o user mexeu" against future upgrade automation — a user-edited seed in slice 4 will keep its higher tier even after a vendor catalog refresh tries to land a competing entry.
+
+- **Migration 069 — `memory_events.source` CHECK rebuild.** SQLite can't ALTER CHECK in place; mirror the migration-048 and migration-063 shape (`memory_events_new` with the widened CHECK, INSERT-SELECT-DROP-RENAME, recreate indexes). The constraint now accepts `'seed'` so the audit table can persist created/edited/deleted/promoted/etc. rows for seed-lifecycle actions. Action CHECK list and scope CHECK list preserved verbatim from migration 063 — only the source CHECK changes. Registered in `src/storage/migrations/index.ts`.
+
+- **Consumer types updated.** `MemoryEventSource` (`storage/repos/memory-events.ts`), `MemoryWriteData.source` (`hooks/types.ts`), and `StaleInvalidatedMemory.source` (`memory/lifecycle.ts`) all gain `'seed'` so audit emit, hook payloads, and lifecycle GC carry seed provenance through their respective layers. The five `as 'user_explicit' | 'inferred' | 'imported'` casts in `src/cli/slash/commands/memory.ts` (slash audit-emit sites) were collapsed to `as MemoryEventSource` — eliminates a future-drift hazard and lets the next type-widening flow through automatically.
+
+**Tests + validation:**
+- `tests/memory/frontmatter.test.ts`: 17 new tests for seed (canonical parse, origin enum, version shape accept/reject matrices, required-when-seed, forbidden-when-seed, body cap, serializer symmetry, round-trip preservation).
+- `tests/memory/conflict-resolver.test.ts`: 3 new tier-1 tests (user_explicit > seed, seed > inferred, seed > imported).
+- `bun run typecheck` clean, `bun run lint` clean.
+- `bun test tests/memory/` → 645 pass; `bun test tests/cli/slash/memory.test.ts tests/cli/slash/memory-governance-toggle.test.ts` → 243 pass; `bun test tests/storage/migrations/` → 16 pass; `bun test tests/hooks/` → 173 pass.
+
+**Next slices (same branch):**
+
+- 2 — `seeds/` subdirectory in user scope; loader unifies index + seeds index; `scopeOfPath` maps both to `user`.
+- 3 — vendor catalog (`src/cli/init-seeds/` with the 10 .md from spec §5.7.8 + `CANONICAL_SEEDS`); bootstrap installs the catalog to `~/.config/agent/memory/seeds/` on first invocation.
+- 4 — upgrade lifecycle: hash compare on `seed_version` change, `[k]eep / [v]iew diff / [a]ccept / [m]erge` prompt, `seeds/archived/` for removed seeds.
+- 5 — opt-out: `agent init --no-seeds`, `/memory seeds disable|enable`, sentinel honored at load.
+- 6 — `seed_origin: team` opt-in via `--team-seeds=<repo>` + trust prompt on first load.
+- 7 — UI marker (`[seed]` in `/memory list`) + audit emit with `source: seed`.
+
 ## [2026-05-27] preserve FORJA_BROKER_WORKER through the sandbox kernel boundary
 
 The §13.7 spawn broker's compiled-binary self-exec was placing `FORJA_BROKER_WORKER=1` on the OUTER `Bun.spawn({env})` only. On any sandboxed broker call (profile = `cwd-rw` / `ro` / etc.), `sandboxRunner` then wrapped `process.execPath` with `bwrap --clearenv` on Linux or `/usr/bin/env -i` on macOS — both of which strip every env var not in the `SANDBOX_SAFE_ENV_VARS` allowlist. The flag died at the wrap boundary, the inner compiled binary started without it, `src/cli/index.ts` fell through to normal CLI parsing instead of `runWorkerProcess()`, and the call silently failed. Affected every sandbox-enforced broker call on a compiled install — exactly the path the default-broker flip was meant to enable.

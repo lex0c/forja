@@ -35,6 +35,30 @@ describe('resolveConflictWinner — tier 1: provenance', () => {
     expect(r.winner).toBe(a);
   });
 
+  test('user_explicit beats seed (operator customization > vendor catalog)', () => {
+    const a = mk({ source: 'user_explicit', name: 'a' });
+    const b = mk({ source: 'seed', name: 'b' });
+    const r = resolveConflictWinner(a, b);
+    expect(r.tier).toBe('provenance');
+    expect(r.winner).toBe(a);
+  });
+
+  test('seed beats inferred (vendor curation > model proposal)', () => {
+    const a = mk({ source: 'seed', name: 'a' });
+    const b = mk({ source: 'inferred', name: 'b' });
+    const r = resolveConflictWinner(a, b);
+    expect(r.tier).toBe('provenance');
+    expect(r.winner).toBe(a);
+  });
+
+  test('seed beats imported', () => {
+    const a = mk({ source: 'seed', name: 'a' });
+    const b = mk({ source: 'imported', name: 'b' });
+    const r = resolveConflictWinner(a, b);
+    expect(r.tier).toBe('provenance');
+    expect(r.winner).toBe(a);
+  });
+
   test('order-independent — swapping arguments swaps winner', () => {
     const a = mk({ source: 'imported', name: 'a' });
     const b = mk({ source: 'user_explicit', name: 'b' });

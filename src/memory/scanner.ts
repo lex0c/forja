@@ -196,7 +196,7 @@ export const SHARED_BODY_LINE_CAP = 200;
 // `\r\n`. After slicing off the `\n`, a leftover `\r` becomes
 // trailing data on the prior line — counted correctly as part
 // of that line, not as a separator.
-const countLines = (body: string): number => {
+export const countLines = (body: string): number => {
   if (body.length === 0) return 0;
   const normalized = body.endsWith('\n') ? body.slice(0, -1) : body;
   return normalized.split('\n').length;

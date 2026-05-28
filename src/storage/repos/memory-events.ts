@@ -35,7 +35,7 @@ export type MemoryEventAction =
   // approve (target_key when multi-memory, else
   // sourceMemoryKeys[0]).
   | 'deferred';
-export type MemoryEventSource = 'user_explicit' | 'inferred' | 'imported';
+export type MemoryEventSource = 'user_explicit' | 'seed' | 'inferred' | 'imported';
 
 export interface MemoryEvent {
   id: string;
