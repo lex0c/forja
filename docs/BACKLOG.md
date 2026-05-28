@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-27] preserve FORJA_BROKER_WORKER through the sandbox kernel boundary
+
+The §13.7 spawn broker's compiled-binary self-exec was placing `FORJA_BROKER_WORKER=1` on the OUTER `Bun.spawn({env})` only. On any sandboxed broker call (profile = `cwd-rw` / `ro` / etc.), `sandboxRunner` then wrapped `process.execPath` with `bwrap --clearenv` on Linux or `/usr/bin/env -i` on macOS — both of which strip every env var not in the `SANDBOX_SAFE_ENV_VARS` allowlist. The flag died at the wrap boundary, the inner compiled binary started without it, `src/cli/index.ts` fell through to normal CLI parsing instead of `runWorkerProcess()`, and the call silently failed. Affected every sandbox-enforced broker call on a compiled install — exactly the path the default-broker flip was meant to enable.
+
+**Branch:** continued on `fix/permission-engine-review`.
+
+**Fix.** Added a `passthroughEnv?: Record<string, string>` plumbing layer through `MaybeWrapSandboxArgvOptions` → `BuildBwrapArgvOptions` → `appendEnvFlags` and `BuildSandboxExecArgvOptions` → `env -i` assignment builder. Forja-internal control-plane env (currently just `FORJA_BROKER_WORKER`) lands as additional `--setenv KEY VALUE` flags on Linux (after the `SAFE_ENV_VARS` loop, so last-setenv-wins on collisions) and as additional `KEY=VAL` entries inside the `env -i` wrap on macOS (same last-wins on env -i ordering). Membership rules deliberately stricter than `SAFE_ENV_VARS` — entries are forja's own control surface, NOT host/operator env. Caller is responsible for supplying only keys forja owns; the runner refuses NUL-byte values, NUL-or-`=` keys, and empty keys (argv-injection defense).
+
+`constructBroker`'s `sandboxRunner` closure now passes `passthroughEnv: { FORJA_BROKER_WORKER: '1' }` unconditionally. Harmless on the source-checkout path (worker.ts enters via `bun run <path>`'s `import.meta.main`, never reads FBW); load-bearing on the compiled-binary self-exec path.
+
+**Tests.** 5 new tests in `sandbox-runner.test.ts` (Linux): basic forward, collision-wins, NUL-value skip, NUL/`=`/empty-key skip, omit-default. 5 parallel tests in `sandbox-runner-macos.test.ts` for the `/usr/bin/env -i` wrap (including the case where `passthroughEnv` alone — no `env` — still triggers the wrap, so a caller wanting only the control-plane vars works). 1 new test in `maybeWrapSandboxArgv` describing the plumbing end-to-end with platform=linux + which seam.
+
+**Validation:** `bun run typecheck` (clean), `bun run lint` (clean), 203 tests across the three affected files (sandbox-runner + sandbox-runner-macos + bootstrap) green.
+
 ## [2026-05-27] broker spawn-mode in compiled binary — self-exec via env flag
 
 The §13.7 spawn broker was unreachable from `bun build --compile` artifacts because `import.meta.dir` inside a compiled binary resolves to `/$bunfs/...` (Bun's embedded asset root) which `bun run` can't address as a script path. `bootstrap.ts:1532` surfaced this as a hard error; the consequence was that the official distribution path (`bin: ./dist/agent-*` in `package.json`) had NO way to enable sandbox enforcement. Engine still ran under the default in-process broker; `bash -s` spawned directly in the main process without bwrap/sandbox-exec wrap.

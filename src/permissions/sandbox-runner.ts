@@ -182,6 +182,28 @@ export interface BuildBwrapArgvOptions {
   // the suite can pin a symlink-to-hidden-dir scenario without
   // creating real symlinks on the test runner's filesystem.
   realpath?: (p: string) => string;
+  // Forja-internal control-plane env that must survive the
+  // `--clearenv` kernel boundary alongside the canonical
+  // `SANDBOX_SAFE_ENV_VARS` allowlist. The runner emits one
+  // `--setenv KEY VALUE` per entry AFTER the safe-list loop, so an
+  // entry whose key collides with a safe-list var wins (bwrap's
+  // last-setenv-wins semantics).
+  //
+  // Use case: the broker self-execs the same compiled binary as
+  // the worker (`process.execPath` + `FORJA_BROKER_WORKER=1`); without
+  // this passthrough, the env flag dies at `--clearenv` and the inner
+  // binary falls through to normal CLI parsing instead of
+  // `runWorkerProcess()`, silently breaking sandbox-enforced broker
+  // calls on compiled installs.
+  //
+  // Membership rules deliberately stricter than `SAFE_ENV_VARS`:
+  // entries here are forja's own control surface, NOT operator/tool
+  // env. The runner verifies values do not contain NUL (same defense
+  // as `appendEnvFlags` for the safe-list path) and skips silently
+  // when violated. Caller is responsible for supplying only keys
+  // forja owns — not a place to relax the host-env allowlist by
+  // proxy.
+  passthroughEnv?: Record<string, string>;
 }
 
 // The env allowlist (`SAFE_ENV_VARS`) and the membership rules
@@ -196,13 +218,33 @@ export interface BuildBwrapArgvOptions {
 // NodeJS.ProcessEnv whose values are JS strings (no embedded NUL
 // in practice). Vars with empty-string values ARE forwarded —
 // `LC_ALL=""` has semantic meaning in glibc.
-const appendEnvFlags = (flags: string[], env: NodeJS.ProcessEnv): void => {
+//
+// `passthroughEnv` (optional) — forja-internal control-plane entries
+// appended AFTER the safe-list loop, so a colliding key wins
+// (bwrap applies `--setenv` in order, last wins). NUL-byte values
+// skipped same as the safe-list path. Empty keys / keys containing
+// NUL or `=` are also skipped — `=` would let a value smuggle a
+// second KEY=VAL pair into the argv encoding on some shells, and
+// `\0` would silently truncate at execve.
+const appendEnvFlags = (
+  flags: string[],
+  env: NodeJS.ProcessEnv,
+  passthroughEnv?: Record<string, string>,
+): void => {
   flags.push('--clearenv');
   for (const key of SAFE_ENV_VARS) {
     const value = env[key];
     if (value === undefined) continue;
     if (value.includes('\0')) continue;
     flags.push('--setenv', key, value);
+  }
+  if (passthroughEnv !== undefined) {
+    for (const [key, value] of Object.entries(passthroughEnv)) {
+      if (key.length === 0) continue;
+      if (key.includes('\0') || key.includes('=')) continue;
+      if (value.includes('\0')) continue;
+      flags.push('--setenv', key, value);
+    }
   }
 };
 
@@ -333,7 +375,7 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
   // Kernel-level env hygiene: `--clearenv` plus a narrow `--setenv`
   // allowlist replaces userspace-only scrubEnv as the authoritative
   // env shaper. See `appendEnvFlags` for the allowlist rationale.
-  appendEnvFlags(flags, options.env);
+  appendEnvFlags(flags, options.env, options.passthroughEnv);
   // Network policy.
   if (profile !== 'cwd-rw-net') {
     flags.push('--unshare-net');
@@ -529,6 +571,14 @@ export interface MaybeWrapSandboxArgvOptions {
   // Production callers default to the unrestricted /tmp allow;
   // session-scoped tmpdirs are wired in opt-in.
   tmpdir?: string;
+  // Forja-internal control-plane env to forward through the kernel-
+  // boundary clearenv. Forwarded verbatim to both the Linux runner
+  // (extra `--setenv` flags) and the macOS runner (extra
+  // `KEY=VAL` entries inside the `/usr/bin/env -i` wrap). Not for
+  // operator/tool env — that goes through `SAFE_ENV_VARS`. See the
+  // BuildBwrapArgvOptions.passthroughEnv docstring for the threat
+  // shape + membership rules.
+  passthroughEnv?: Record<string, string>;
 }
 
 // Resolve `innerArgv[0]` to an absolute path AT WRAP TIME using the
@@ -634,6 +684,7 @@ export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): stri
         bwrapPath: r.path,
       };
       if (realpath !== undefined) bwrapOpts.realpath = realpath;
+      if (options.passthroughEnv !== undefined) bwrapOpts.passthroughEnv = options.passthroughEnv;
       return buildBwrapArgv(bwrapOpts);
     }
   }
@@ -657,6 +708,7 @@ export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): stri
       // can wrap the inner argv with `/usr/bin/env -i KEY=VAL ... --`
       // and emulate Linux's `--clearenv` kernel boundary.
       macOpts.env = env;
+      if (options.passthroughEnv !== undefined) macOpts.passthroughEnv = options.passthroughEnv;
       return buildSandboxExecArgv(macOpts);
     }
   }

@@ -1635,12 +1635,25 @@ const constructBroker = (
     // Slice 157 (phase 2): forward the per-CLI-run sandbox tmpdir
     // into every wrap. The closure captures it from bootstrap so a
     // single broker handles many calls with the same scoped tmpdir.
+    //
+    // `passthroughEnv` (slice review-broker-default follow-up):
+    // forward `FORJA_BROKER_WORKER=1` through the kernel-boundary
+    // clearenv. On the compiled-binary self-exec path, the wrapped
+    // inner is `process.execPath` (the same forja binary); without
+    // this passthrough, bwrap's `--clearenv` (Linux) or
+    // sandbox-exec's `/usr/bin/env -i` wrap (macOS) drops the flag,
+    // `src/cli/index.ts` falls through to normal CLI parsing
+    // instead of `runWorkerProcess()`, and sandbox-enforced broker
+    // calls silently fail on compiled installs. Harmless on the
+    // source-checkout path (worker.ts enters via
+    // `bun run <path>`'s `import.meta.main`, which never reads FBW).
     const sandboxRunner: SandboxRunner = ({ profile, cwd: callCwd, innerArgv }) =>
       maybeWrapSandboxArgv({
         profile,
         cwd: callCwd,
         innerArgv,
         ...(sandboxTmpdir !== undefined ? { tmpdir: sandboxTmpdir } : {}),
+        passthroughEnv: { FORJA_BROKER_WORKER: '1' },
       });
     // Slice 157 (phase 2): also overlay TMPDIR on the worker spawn's
     // env. The wrap above scopes WHERE the sandbox lets writes land;

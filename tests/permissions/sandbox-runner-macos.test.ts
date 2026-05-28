@@ -250,6 +250,101 @@ describe('buildSandboxExecArgv', () => {
   });
 });
 
+// Forja-internal control-plane env (e.g. `FORJA_BROKER_WORKER=1`)
+// has to survive the `/usr/bin/env -i` userland clearenv on macOS —
+// without it the compiled-binary self-exec falls back to normal
+// CLI parsing inside the sandboxed inner. `passthroughEnv` appends
+// extra `KEY=VAL` assignments AFTER the safe-list loop so colliding
+// keys win (env -i applies args in order, last wins).
+describe('buildSandboxExecArgv — passthroughEnv (forja control plane)', () => {
+  test('passthroughEnv entries appear inside env -i after safe-list entries', () => {
+    const argv = buildSandboxExecArgv({
+      profile: 'cwd-rw',
+      cwd: '/work/proj',
+      home: '/home/op',
+      innerArgv: ['/usr/bin/forja'],
+      env: { PATH: '/usr/bin' },
+      passthroughEnv: { FORJA_BROKER_WORKER: '1' },
+      realpath: (p) => p,
+    });
+    // env -i wrap shape: [sandbox-exec, -p, profile, /usr/bin/env, -i, KEY=VAL, ..., --, inner]
+    const envIdx = argv.indexOf('/usr/bin/env');
+    expect(envIdx).toBeGreaterThan(-1);
+    expect(argv[envIdx + 1]).toBe('-i');
+    const sepIdx = argv.indexOf('--');
+    expect(sepIdx).toBeGreaterThan(envIdx);
+    const envAssignments = argv.slice(envIdx + 2, sepIdx);
+    expect(envAssignments).toContain('PATH=/usr/bin');
+    expect(envAssignments).toContain('FORJA_BROKER_WORKER=1');
+    // Passthrough lands after safe-list (env -i last-wins on collisions).
+    expect(envAssignments.indexOf('FORJA_BROKER_WORKER=1')).toBeGreaterThan(
+      envAssignments.indexOf('PATH=/usr/bin'),
+    );
+    // Inner argv preserved after the `--` separator.
+    expect(argv.slice(sepIdx + 1)).toEqual(['/usr/bin/forja']);
+  });
+
+  test('passthroughEnv alone (no env) still triggers the env -i wrap', () => {
+    const argv = buildSandboxExecArgv({
+      profile: 'ro',
+      cwd: '/work/proj',
+      home: '/home/op',
+      innerArgv: ['/usr/bin/forja'],
+      passthroughEnv: { FORJA_BROKER_WORKER: '1' },
+      realpath: (p) => p,
+    });
+    expect(argv).toContain('/usr/bin/env');
+    expect(argv).toContain('-i');
+    expect(argv).toContain('FORJA_BROKER_WORKER=1');
+  });
+
+  test('passthroughEnv NUL in value is skipped', () => {
+    const argv = buildSandboxExecArgv({
+      profile: 'ro',
+      cwd: '/work/proj',
+      home: '/home/op',
+      innerArgv: ['/usr/bin/forja'],
+      passthroughEnv: { FORJA_BROKER_WORKER: '1', BAD: 'a\0b' },
+      realpath: (p) => p,
+    });
+    expect(argv).toContain('FORJA_BROKER_WORKER=1');
+    expect(argv.some((v) => v.startsWith('BAD='))).toBe(false);
+  });
+
+  test('passthroughEnv NUL or = in key is skipped (argv-injection defense)', () => {
+    const argv = buildSandboxExecArgv({
+      profile: 'ro',
+      cwd: '/work/proj',
+      home: '/home/op',
+      innerArgv: ['/usr/bin/forja'],
+      passthroughEnv: {
+        GOOD: 'ok',
+        'BAD\0KEY': 'x',
+        'BAD=KEY': 'y',
+        '': 'empty',
+      },
+      realpath: (p) => p,
+    });
+    expect(argv).toContain('GOOD=ok');
+    expect(argv.some((v) => v.startsWith('BAD\0KEY='))).toBe(false);
+    expect(argv.some((v) => v.startsWith('BAD=KEY='))).toBe(false);
+    // Pure '=empty' would be an unsafe smuggled assignment — skipped.
+    expect(argv).not.toContain('=empty');
+  });
+
+  test('passthroughEnv omitted → env -i carries only the safe-list', () => {
+    const argv = buildSandboxExecArgv({
+      profile: 'cwd-rw',
+      cwd: '/work/proj',
+      home: '/home/op',
+      innerArgv: ['/usr/bin/forja'],
+      env: { PATH: '/usr/bin' },
+      realpath: (p) => p,
+    });
+    expect(argv.some((v) => v.startsWith('FORJA_BROKER_WORKER='))).toBe(false);
+  });
+});
+
 // Slice 119 — R4: §9 hide_paths defense in the macOS sandbox-exec
 // runner, parallel to slice 118 in the Linux bwrap runner.
 // Pre-slice the SBPL profile granted `(allow file-read*)` for
