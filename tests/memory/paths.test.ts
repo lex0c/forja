@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import {
+  SEEDS_SUBDIR,
   ScopeError,
   indexFilePath,
   memoryFilePath,
@@ -10,6 +11,11 @@ import {
   resolveRepoRoot,
   resolveScopeRoots,
   scopeOfPath,
+  seedIndexFilePath,
+  seedMemoryFilePath,
+  seedTombstonePath,
+  seedTombstonesDir,
+  seedsRoot,
   userScopeRoot,
 } from '../../src/memory/paths.ts';
 
@@ -248,5 +254,145 @@ describe('memoryFilePath sandbox - defense in depth', () => {
     // future regression where someone loosens validateName.
     expect(() => memoryFilePath(roots, 'user', 'ok')).not.toThrow();
     expect(ScopeError).toBeDefined();
+  });
+});
+
+describe('seed path primitives (spec §5.7.4)', () => {
+  const roots = {
+    user: '/home/u/.config/agent/memory',
+    projectShared: '/repo/.agent/memory/shared',
+    projectLocal: '/repo/.agent/memory/local',
+  };
+
+  test('SEEDS_SUBDIR is the literal "seeds"', () => {
+    expect(SEEDS_SUBDIR).toBe('seeds');
+  });
+
+  test('seedsRoot resolves to <user>/seeds', () => {
+    expect(seedsRoot(roots)).toBe('/home/u/.config/agent/memory/seeds');
+  });
+
+  test('seedMemoryFilePath builds <user>/seeds/<name>.md', () => {
+    expect(seedMemoryFilePath(roots, 'safe-edit')).toBe(
+      '/home/u/.config/agent/memory/seeds/safe-edit.md',
+    );
+  });
+
+  test('seedMemoryFilePath rejects path-traversal names (caught by validateName)', () => {
+    expect(() => seedMemoryFilePath(roots, '../escape')).toThrow();
+    expect(() => seedMemoryFilePath(roots, '..')).toThrow();
+    expect(() => seedMemoryFilePath(roots, '.hidden')).toThrow();
+  });
+
+  test('seedIndexFilePath points at <user>/seeds/MEMORY.md', () => {
+    expect(seedIndexFilePath(roots)).toBe('/home/u/.config/agent/memory/seeds/MEMORY.md');
+  });
+
+  test('seedTombstonesDir is <user>/seeds/.tombstones', () => {
+    expect(seedTombstonesDir(roots)).toBe('/home/u/.config/agent/memory/seeds/.tombstones');
+  });
+
+  test('seedTombstonePath embeds the timestamp', () => {
+    expect(seedTombstonePath(roots, 'safe-edit', 1714138800)).toBe(
+      '/home/u/.config/agent/memory/seeds/.tombstones/safe-edit.1714138800.md',
+    );
+  });
+
+  test('seedTombstonePath rejects path traversal names', () => {
+    expect(() => seedTombstonePath(roots, '../escape', 1)).toThrow();
+  });
+});
+
+describe('seed path primitives with non-canonical roots (regression: C1 parity)', () => {
+  // Slice 1 pinned the same shape for memoryFilePath at lines 197-219.
+  // The seed helpers do the same `resolve()` dance before the sandbox
+  // check, so they must accept the same non-canonical-root shapes a
+  // caller might construct (trailing slash, `..` segments left over
+  // from operator-supplied XDG_CONFIG_HOME or env-derived paths).
+  test('seedMemoryFilePath canonicalizes roots with `..` segments', () => {
+    const roots = {
+      user: '/home/u/.config/sub/../agent/memory',
+      projectShared: '/repo/.agent/memory/shared',
+      projectLocal: '/repo/.agent/memory/local',
+    };
+    expect(seedMemoryFilePath(roots, 'safe-edit')).toBe(
+      '/home/u/.config/agent/memory/seeds/safe-edit.md',
+    );
+  });
+
+  test('seedMemoryFilePath accepts a root with a trailing slash', () => {
+    const roots = {
+      user: '/home/u/.config/agent/memory/',
+      projectShared: '/repo/.agent/memory/shared',
+      projectLocal: '/repo/.agent/memory/local',
+    };
+    expect(seedMemoryFilePath(roots, 'safe-edit')).toBe(
+      '/home/u/.config/agent/memory/seeds/safe-edit.md',
+    );
+  });
+
+  test('seedIndexFilePath round-trips through resolve() identically to canonical roots', () => {
+    // seedIndexFilePath itself doesn't call resolve() (it has no name
+    // input to sandbox), but the resulting string must canonicalize to
+    // the same path regardless of root shape — otherwise downstream
+    // hash/compare keys diverge.
+    const canonical = {
+      user: '/home/u/.config/agent/memory',
+      projectShared: '/repo/.agent/memory/shared',
+      projectLocal: '/repo/.agent/memory/local',
+    };
+    const noisy = {
+      user: '/home/u/.config/agent/memory/',
+      projectShared: '/repo/.agent/memory/shared',
+      projectLocal: '/repo/.agent/memory/local',
+    };
+    const trickier = {
+      user: '/home/u/./.config/sub/../agent/memory',
+      projectShared: '/repo/.agent/memory/shared',
+      projectLocal: '/repo/.agent/memory/local',
+    };
+    const target = '/home/u/.config/agent/memory/seeds/MEMORY.md';
+    expect(resolve(seedIndexFilePath(canonical))).toBe(target);
+    expect(resolve(seedIndexFilePath(noisy))).toBe(target);
+    expect(resolve(seedIndexFilePath(trickier))).toBe(target);
+  });
+
+  test('seedTombstonePath canonicalizes roots with `..` segments', () => {
+    const roots = {
+      user: '/home/u/.config/sub/../agent/memory',
+      projectShared: '/repo/.agent/memory/shared',
+      projectLocal: '/repo/.agent/memory/local',
+    };
+    expect(seedTombstonePath(roots, 'safe-edit', 1714138800)).toBe(
+      '/home/u/.config/agent/memory/seeds/.tombstones/safe-edit.1714138800.md',
+    );
+  });
+});
+
+describe('scopeOfPath treats seeds/ as user scope (not a separate scope)', () => {
+  const roots = {
+    user: '/home/u/.config/agent/memory',
+    projectShared: '/repo/.agent/memory/shared',
+    projectLocal: '/repo/.agent/memory/local',
+  };
+
+  test('paths under <user>/seeds/ resolve to "user"', () => {
+    expect(scopeOfPath(roots, '/home/u/.config/agent/memory/seeds/safe-edit.md')).toBe('user');
+    expect(scopeOfPath(roots, '/home/u/.config/agent/memory/seeds/MEMORY.md')).toBe('user');
+    expect(scopeOfPath(roots, '/home/u/.config/agent/memory/seeds/.tombstones/x.1.md')).toBe(
+      'user',
+    );
+  });
+
+  test('ANY subdir under <user>/ resolves to "user" — current promiscuous behavior, pinned', () => {
+    // Slice 2 declined to add an explicit subdir allowlist; seeds is
+    // the only subdir today, but the prefix check is greedy. This
+    // test pins the current behavior so a future tightening (an
+    // explicit allowlist, or a per-scope subdir registry) is a
+    // visible test break, not a silent semantic shift. If you flip
+    // this test, do it in the same PR that lands the allowlist.
+    expect(scopeOfPath(roots, '/home/u/.config/agent/memory/cache/junk.txt')).toBe('user');
+    expect(scopeOfPath(roots, '/home/u/.config/agent/memory/archived/x.md')).toBe('user');
+    expect(scopeOfPath(roots, '/home/u/.config/agent/memory/scratch/note.md')).toBe('user');
   });
 });

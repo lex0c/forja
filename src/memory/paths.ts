@@ -184,6 +184,76 @@ export const memoryFilePath = (roots: ScopeRoots, scope: MemoryScope, name: stri
 export const indexFilePath = (roots: ScopeRoots, scope: MemoryScope): string =>
   join(rootForScope(roots, scope), 'MEMORY.md');
 
+// Seed layout (spec §5.7.4). Seeds live in a dedicated subdirectory
+// `seeds/` under the user-scope root. They are NOT a separate
+// MemoryScope value — `scopeOfPath` still returns 'user' for any
+// path under `<user>/seeds/`, because seeds participate in the
+// user scope's lifecycle (eager-load + UI listing + audit attribution
+// against the operator's machine, not against a project). The
+// subdir is purely a filesystem affordance so the vendor catalog
+// can be installed/upgraded as a unit without entangling with the
+// operator's hand-authored user memories.
+//
+// The slice-2 primitives below mirror the top-level helpers
+// (memoryFilePath / indexFilePath / tombstonePath) so that callers
+// touching seeds don't reimplement the sandbox check; slice 3+ will
+// use these to install the vendor catalog, slice 4 to compute
+// upgrade hashes, slice 5 to honor the disable sentinel.
+export const SEEDS_SUBDIR = 'seeds';
+
+// Absolute path to `<user>/seeds/`. Callers that need to readdir or
+// mkdir the directory itself (e.g. the catalog installer in slice
+// 3) hit this; everything else goes through the typed helpers below.
+export const seedsRoot = (roots: ScopeRoots): string => join(roots.user, SEEDS_SUBDIR);
+
+// `<user>/seeds/<name>.md` with the same sandbox contract as
+// `memoryFilePath`: validate the name first, then re-resolve to
+// catch any future regression that lets a traversal slip past the
+// name validator. The error type mirrors the parent (ScopeError)
+// so callers can catch uniformly across top-level + seeds paths.
+export const seedMemoryFilePath = (roots: ScopeRoots, name: string): string => {
+  validateName(name);
+  const resolvedRoot = resolve(seedsRoot(roots));
+  const candidate = resolve(join(resolvedRoot, `${name}.md`));
+  if (!isUnderRoot(candidate, resolvedRoot)) {
+    throw new ScopeError(`seed path escapes seeds/ root: name=${JSON.stringify(name)}`);
+  }
+  return candidate;
+};
+
+// `<user>/seeds/MEMORY.md` — the seed catalog's own index file,
+// kept separate from the user scope's MEMORY.md so the catalog can
+// be regenerated on upgrade without disturbing operator-authored
+// entries.
+export const seedIndexFilePath = (roots: ScopeRoots): string => join(seedsRoot(roots), 'MEMORY.md');
+
+// `<user>/seeds/.tombstones/` — eviction storage for seeds removed
+// from the vendor catalog on upgrade (spec §5.7.5: removed seeds
+// go to `seeds/archived/`, but the eviction lifecycle reuses the
+// same tombstone semantics as the top-level user scope, so we
+// land them under `.tombstones/` for parity with the rest of the
+// subsystem. Slice 4 will additionally mirror these into
+// `seeds/archived/` for the operator-visible archive surface
+// described by the spec).
+export const seedTombstonesDir = (roots: ScopeRoots): string =>
+  join(seedsRoot(roots), '.tombstones');
+
+// `<user>/seeds/.tombstones/<name>.<unix_ms>.md` — same shape as
+// `tombstonePath`. Re-validates the name and applies the sandbox
+// check; ts is trusted but parseTombstoneFilename rejects junk on
+// the read side (shared with the rest of the subsystem).
+export const seedTombstonePath = (roots: ScopeRoots, name: string, ts: number): string => {
+  validateName(name);
+  const resolvedRoot = resolve(seedTombstonesDir(roots));
+  const candidate = resolve(join(resolvedRoot, `${name}.${ts}.md`));
+  if (!isUnderRoot(candidate, resolvedRoot)) {
+    throw new ScopeError(
+      `seed tombstone path escapes seeds/ root: name=${JSON.stringify(name)} ts=${ts}`,
+    );
+  }
+  return candidate;
+};
+
 // `.tombstones/` directory inside a scope. Per MEMORY.md §6.5.3,
 // every eviction moves the body file here (preserving the
 // original frontmatter with `state: evicted`) so restore is a

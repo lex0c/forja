@@ -2,6 +2,32 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-28] seed memory — slice 2: seeds/ subdir path + loader primitives
+
+Slice 2 of seed memory (`docs/spec/MEMORY.md §5.7.4`). Lays the filesystem layer the slice-3 vendor catalog installer will write through: a dedicated `<user>/seeds/` subdirectory with sandbox-aware path resolvers and loader entry points that mirror the top-level scope helpers.
+
+**Branch:** continued on `feat/memory-seeds`.
+
+**Design call.** Seeds are NOT a separate MemoryScope. The §5.7.4 spec is explicit: "Seeds vivem em user scope, sub-pasta dedicada." A subdir, not a scope. Treating them as a fourth scope value would have rippled through every consumer of `MemoryScope` (registry, lifecycle, governance, conflict resolver) for zero semantic benefit — seeds participate in the user-scope lifecycle (eager-load, audit attribution against the operator's machine, not a project). The slice instead introduces parallel primitives that resolve into the subdir while `scopeOfPath` continues to return `'user'` for any path under `<user>/seeds/`. The trade-off: a handful of `*Seed*` helpers in paths.ts + loader.ts, vs. a churning ripple across the subsystem.
+
+**Shipped on this branch:**
+
+- **`src/memory/paths.ts` primitives.** New `SEEDS_SUBDIR = 'seeds'` constant + helpers: `seedsRoot(roots)`, `seedMemoryFilePath(roots, name)`, `seedIndexFilePath(roots)`, `seedTombstonesDir(roots)`, `seedTombstonePath(roots, name, ts)`. Each path-building helper validates the name through `validateName` and re-applies the same `isUnderRoot` sandbox check the top-level helpers use; an attempt to traverse out of `<user>/seeds/` raises `ScopeError` with a `seed`-specific message. `scopeOfPath` needs no change — its `isUnderRoot(resolved, resolvedUser)` already swallows paths under `seeds/` as user-scope, which is the correct attribution. Pinned with a regression test.
+
+- **`src/memory/loader.ts` entry points.** New `loadSeedsIndex(roots)`, `readSeedByName(roots, name)`, `listSeedOrphanFiles(roots)`. To avoid duplicating the symlink/regular-file gates and the parse-error wrapping, the existing three top-level loaders were refactored to call private helpers (`loadIndexAt(path)`, `readMemoryAt(path)`, `listOrphansAt(dir, indexResult)`) that the seed variants reuse. Same S5-review symlink gates apply: a symlinked `seeds/MEMORY.md` or `seeds/<body>.md` returns `kind: 'malformed'` with the symlink-refuse message, mirroring the protection on the top-level user scope (trust-corpus fingerprint excludes symlinks; loader-side gate closes the asymmetry so the model can't be fed target bytes via a swapped symlink).
+
+- **Loader-walker scope correction documented.** `listOrphanFiles` only scans the top-level scope root and ignores subdirectories — the existing comment now explicitly carves out `seeds/` as the one exception, pointing at the new `listSeedOrphanFiles` walker. Operators won't see seed memories surface as user-scope orphans on a manual catalog edit.
+
+**Tests + validation:**
+- `tests/memory/paths.test.ts`: 11 new tests covering each seed primitive (path shape, traversal rejection, tombstone shape) plus the `scopeOfPath` regression pinning seed subpaths as user.
+- `tests/memory/loader.test.ts`: 11 new tests for `loadSeedsIndex` (absent / present / malformed / symlinked-index), `readSeedByName` (missing / present / malformed-bad-cross-field / sandboxed-name / symlinked-body), `listSeedOrphanFiles` (empty / all-indexed / orphan-detection / user-scope-isolation regression guard).
+- `bun run typecheck` clean, `bun run lint` clean.
+- `bun test tests/memory/` → 670 pass (vs 648 in slice 1; +22 new tests for slice 2).
+
+**Deferred to slice 3 (next on this branch).** The seed catalog itself (`src/cli/init-seeds/` with the 10 vendor `.md` templates + `CANONICAL_SEEDS` array) + the bootstrap step that installs `<user>/seeds/` on first invocation. The registry-level merging of user-scope + seeds indexes also lands then, once there's actually content to merge.
+
+**Post-review tightening (same slice).** Three findings from the slice-2 code review applied: (1) `listOrphansAt` now reads with `readdirSync(dir, { withFileTypes: true })` and filters on `dirent.isFile()` so a directory whose name ends in `.md` (operator typo, attacker plant) can't slip past the suffix filter as a phantom file path — downstream `readMemoryAt` would have rejected it as `non_regular`, but advertising a non-file as an "orphan" misled gc/audit consumers acting on the list. (2) Regression tests pin the seed primitives against non-canonical roots (trailing slash + `..` segments) matching slice 1's coverage for `memoryFilePath`, including a round-trip identity check on `seedIndexFilePath`. (3) Explicit test pinning `scopeOfPath`'s current "any subdir under `<user>/` resolves to user" behavior — slice 2 declined to add a subdir allowlist, so the promiscuous attribution is now a documented invariant any future tightening must consciously break. Eight new tests, all green.
+
 ## [2026-05-28] seed memory — slice 1: types + parser + tier + migration
 
 Opened the seed-memory subsystem (`docs/spec/MEMORY.md §5.7`). The other 26 files in `src/memory/` already implement every other §1-§12 slice (paths, frontmatter, scanner, loader, writer, lifecycle, conflict-resolver, trust-corpus, governance, registry, verify dispatchers, eviction, tombstones, etc.); §5.7's vendor seed catalog is the remaining piece. Slice 1 lands the typed substrate every later slice depends on.
