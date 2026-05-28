@@ -109,6 +109,14 @@ interface StepResult {
   wrote: number;
   skipped: number;
   overwritten: number;
+  // Optional fifth bucket: the seeds step's upgrade lifecycle
+  // (spec §5.7.5) can ARCHIVE a body that the new vendor catalog
+  // dropped (moved to `<user>/seeds/archived/<name>.<ts>.md`).
+  // Distinct from `overwritten` because the body isn't replaced —
+  // it's preserved at a new location. Aggregate summary surfaces
+  // it as `... K archived` when non-zero; other scaffolds always
+  // omit the field and the summary skips the suffix.
+  archived?: number;
 }
 
 // Atomic write helper. Writes `content` to a temp file alongside
@@ -373,6 +381,14 @@ const scaffoldSeeds = (options: InitOptions): StepResult | null => {
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     err(`forja: failed to install vendor seeds: ${msg}\n`);
+    // Seeds is the last DEFAULT_STEPS step (init.ts:63-70), so a
+    // failure here means the five project-scope steps ALREADY wrote
+    // files under <cwd>/.agent/. Operator can fix the user-scope
+    // issue (permissions, disk space, XDG path) and resume without
+    // re-doing the project work via `agent init --only=seeds`.
+    err(
+      'forja: project artifacts already scaffolded; re-run with `agent init --only=seeds` after fixing the user-scope issue\n',
+    );
     return null;
   }
   for (const filename of result.fresh) {
@@ -382,8 +398,13 @@ const scaffoldSeeds = (options: InitOptions): StepResult | null => {
     out(`forja: upgraded ${memoryRoots.user}/seeds/${filename}\n`);
   }
   for (const filename of result.userKept) {
+    // Recovery path names the manual workaround. The phantom
+    // `/memory seeds revert` slash command was wishful UX — it's
+    // deferred to slice 5+ alongside the [k/v/a/m] interactive
+    // modal. Pointing operators at a command that doesn't exist
+    // would silently fail at the REPL.
     out(
-      `forja: skip ${memoryRoots.user}/seeds/${filename} (operator-edited; use /memory seeds revert to restore vendor body)\n`,
+      `forja: skip ${memoryRoots.user}/seeds/${filename} (operator-edited; delete the body and re-run \`agent init --only=seeds\` to restore vendor content)\n`,
     );
   }
   for (const filename of result.archived) {
@@ -393,6 +414,7 @@ const scaffoldSeeds = (options: InitOptions): StepResult | null => {
     wrote: result.fresh.length,
     overwritten: result.vendorUpdated.length,
     skipped: result.unchanged.length + result.userKept.length,
+    archived: result.archived.length,
   };
 };
 
@@ -425,10 +447,18 @@ export const runInit = (options: InitOptions): number => {
     totals.wrote += result.wrote;
     totals.skipped += result.skipped;
     totals.overwritten += result.overwritten;
+    if (result.archived !== undefined) {
+      totals.archived = (totals.archived ?? 0) + result.archived;
+    }
   }
   const stepWord = steps.length === 1 ? 'step' : 'steps';
+  // The archived suffix only appears when at least one seed was
+  // archived this run (vendor catalog dropped seeds). Operators who
+  // never trip that path see the same 3-counter summary as before.
+  const archivedSuffix =
+    totals.archived !== undefined && totals.archived > 0 ? `, ${totals.archived} archived` : '';
   options.out(
-    `forja: ${totals.wrote} wrote, ${totals.overwritten} overwritten, ${totals.skipped} skipped (${steps.length} ${stepWord})\n`,
+    `forja: ${totals.wrote} wrote, ${totals.overwritten} overwritten, ${totals.skipped} skipped${archivedSuffix} (${steps.length} ${stepWord})\n`,
   );
   if (totals.wrote + totals.overwritten > 0) {
     options.out("forja: review .agent/ and run 'agent' to start.\n");

@@ -3,7 +3,7 @@
 // memory frontmatter parser AND honors the seed-specific gates
 // (source=seed cross-fields, body ≤ 30 lines, trust trusted).
 
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -81,6 +81,18 @@ describe('agent init seeds — installs vendor catalog under user scope', () => 
   const cleanup: string[] = [];
   let originalXdg: string | undefined;
 
+  // Capture the original XDG BEFORE any test body runs. If we'd done
+  // this inside each test, a throw from mkdtempSync (or any setup
+  // call) before the capture line would leave originalXdg as
+  // `undefined` from the prior afterEach reset — afterEach would then
+  // `delete` the var even if it was set originally, leaking into
+  // every subsequent test in this process. Capturing in beforeEach
+  // ensures the value is locked in BEFORE the test body has a chance
+  // to throw.
+  beforeEach(() => {
+    originalXdg = process.env.XDG_CONFIG_HOME;
+  });
+
   afterEach(() => {
     if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME;
     else process.env.XDG_CONFIG_HOME = originalXdg;
@@ -94,7 +106,6 @@ describe('agent init seeds — installs vendor catalog under user scope', () => 
     const cwd = mkdtempSync(join(tmpdir(), 'forja-init-seeds-'));
     const userHome = mkdtempSync(join(tmpdir(), 'forja-init-seeds-xdg-'));
     cleanup.push(cwd, userHome);
-    originalXdg = process.env.XDG_CONFIG_HOME;
     process.env.XDG_CONFIG_HOME = userHome;
 
     const out: string[] = [];
@@ -137,7 +148,6 @@ describe('agent init seeds — installs vendor catalog under user scope', () => 
     const cwd = mkdtempSync(join(tmpdir(), 'forja-init-seeds-idem-'));
     const userHome = mkdtempSync(join(tmpdir(), 'forja-init-seeds-idem-xdg-'));
     cleanup.push(cwd, userHome);
-    originalXdg = process.env.XDG_CONFIG_HOME;
     process.env.XDG_CONFIG_HOME = userHome;
 
     runInit({
