@@ -1959,6 +1959,41 @@ describe('bash resolver — read-only registry expansion (A, §5.2)', () => {
   });
 });
 
+// Review regression: an UNKNOWN command (registry-miss → Conservative) that
+// targets an escalate-tier path must carry that operand as a write-fs cap,
+// or the engine's bypass §11 floor (the only check that fires under
+// mode:bypass) has nothing to upgrade and the write is silently allowed.
+describe('bash resolver — unknown commands ride escalate-tier operand caps (bypass §11 floor)', () => {
+  test('sed -i /etc/hosts (unknown cmd, escalate write) → Conservative carrying write-fs', () => {
+    const r = resolveCapabilities('bash', { command: 'sed -i /etc/hosts' }, CTX);
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/etc/hosts');
+    }
+  });
+
+  test('unknown cmd with a --flag=<protected> value also rides the cap', () => {
+    const r = resolveCapabilities('bash', { command: 'frobnicate --out=/etc/hosts' }, CTX);
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/etc/hosts');
+    }
+  });
+
+  test('unknown cmd targeting a deny-tier path still Refuses (short-circuits the loop)', () => {
+    const r = resolveCapabilities('bash', { command: 'sed -i /proc/sysrq-trigger' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('unknown cmd writing only cwd carries no spurious protected cap', () => {
+    const r = resolveCapabilities('bash', { command: 'sed -i ./local.txt' }, CTX);
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(capStrings(r.capabilities).some((c) => c.startsWith('write-fs:/etc'))).toBe(false);
+    }
+  });
+});
+
 // Review regression: read-only-classified filters that can WRITE a file
 // were misclassified — the write target surfaced as read-fs (or vanished
 // for `--output=`), so §11 escalation/denial + sandbox planning saw a

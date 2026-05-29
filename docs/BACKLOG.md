@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-29] permissions — unknown commands discarded escalate-tier operand caps under bypass
+
+The per-arg §11 loop in `analyzeCommand` classifies positional protected-path operands (deny → Refuse, escalate → mark `escalated`), but the registry-miss (Conservative) branch returned only the redirect caps — the escalate-tier operand paths were dropped. Under `mode: bypass` the resolver-driven confirm (low confidence) is intentionally NOT honored (the operator chose broad risk); the ONLY check that still fires is the engine's §11 protected-path floor, which scans the RESOLVED capabilities. With no `write-fs` cap emitted, an unknown command targeting the escalate tier — `sed -i /etc/hosts`, `frobnicate --out=/etc/x` — reached that floor with nothing to upgrade and was silently allowed.
+
+**Fix.** Accumulate the escalate-tier operands into an `argCaps` array (`write-fs`/`read-fs` per the loop's op; op is always write for an unknown command) and ride it onto the Conservative return alongside the redirect caps. Now the bypass floor sees `write-fs:/etc/hosts` and upgrades to confirm. Known commands ignore `argCaps` — their handler already emits the precise positional caps, so adding it there would only duplicate. Deny-tier operands still short-circuit to Refuse in the loop (unchanged); cwd-only writes emit no cap (no spurious protected caps).
+
+**Validated:** +4 regression tests (`sed -i /etc/hosts` / `--out=/etc/hosts` → Conservative carrying write-fs; deny-tier still Refuse; cwd-only carries no protected cap); full `tests/permissions/` (2056) + typecheck + biome clean. **Flagged, not fixed (same class):** `detectCwdScopeEscape` (a cwd symlink whose canonical target is outside the cwd, e.g. `./link → /etc/cron.d/x`) only marks `escalated` and the emitted cap is the LEXICAL cwd path — so under `mode: bypass` the §11 floor sees a safe cwd write and the kernel follows the symlink to the protected target. Affects both the known-handler and Conservative paths; closing it means emitting the CANONICAL target (`ctx.realpath`) as the cap when the escape fires. **Branch:** `chore/sec-fixes`.
+
 ## [2026-05-29] permissions — close the follow-ups (standalone xargs + parallel, sort -T)
 
 Closed the items the previous entry flagged as open, plus the command-runner sibling.

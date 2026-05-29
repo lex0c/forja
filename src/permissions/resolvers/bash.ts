@@ -3881,6 +3881,16 @@ const analyzeCommand = (
     return value.length > 0 ? value : null;
   };
   let escalated = false;
+  // Operand caps for the registry-miss (Conservative) branch. The per-arg
+  // loop classifies escalate-tier positional paths but the unknown-command
+  // branch returned only redirect caps — so under mode:bypass (where the
+  // §11 protected-path floor scans resolved caps and is the ONLY check
+  // that still fires) `sed -i /etc/hosts` / `frobnicate --out=/etc/x`
+  // reached the floor with no write-fs and were silently allowed despite
+  // the escalate-tier operand. Collect those operands here and ride them
+  // onto that branch. Known commands ignore this — their handler emits the
+  // precise positional caps (adding argCaps there would just duplicate).
+  const argCaps: Capability[] = [];
   if (!isPureOutputCommand(name)) {
     const targets = protectedTargets(ctx.home, ctx.cwd);
     for (const arg of shape.args) {
@@ -3942,7 +3952,12 @@ const analyzeCommand = (
             refuse: `bash: ${shape.name} target '${exp}' is in protected zone (deny tier, see PERMISSION_ENGINE.md §11)`,
           };
         }
-        if (tier === 'escalate') escalated = true;
+        if (tier === 'escalate') {
+          escalated = true;
+          // op is always 'write' for an unknown command (none are in
+          // isReadOnlyCommand); the ternary stays correct if that changes.
+          argCaps.push(op === 'write' ? writeFs(abs) : readFs(abs));
+        }
         // Slice 178: cwd-scope symlink escape. Lexical inside cwd
         // but canonical outside means a glob policy like
         // `<cwd>/**` would authorize lexically while the kernel
@@ -3970,9 +3985,10 @@ const analyzeCommand = (
     // Registry miss → Conservative, not Refuse (PERMISSION_ENGINE.md
     // §5.2 step 3c). Not in HARD_REFUSE_COMMANDS, so not categorically
     // dangerous — just unmodeled. Conservative forces a confirm; the
-    // redirect caps (above) ride along so the engine floors stay honest.
+    // redirect + escalate-tier operand caps (above) ride along so the
+    // engine's bypass §11 floor stays honest.
     return {
-      caps: redir.caps,
+      caps: [...redir.caps, ...argCaps],
       confidence: 'low',
       conservative: `unknown_command: ${shape.name}`,
     };
