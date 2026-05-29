@@ -2,6 +2,16 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-29] permissions — final branch review caught a deny-tier-redirect bypass on registry-miss / no-command shapes
+
+The branch's final code review found that `3050c3b`'s registry-miss → Conservative early-return in `analyzeCommand` sits BEFORE the redirect-classification loop. So a redirect to a deny-tier path (`/proc`, `/sys`, `/dev/sda`, …) on an UNMODELED command (`some_tool > /proc/sysrq-trigger`, `sed -n p < /proc/1/environ`, `nosuchcmd > /dev/sda`) — or a no-command soft shape (`[[ -e x ]] > /proc/sysrq-trigger`, `{ foocmd; } > /dev/mem`, `: > /proc/sysrq-trigger`) — never classified the redirect target and emitted no fs capability. The engine's bypass-mode §11 floor only scans resolved capabilities, so under `mode: bypass` these deny-tier writes/reads were ALLOWED instead of refused (and Conservative/confirm under strict). A regression introduced by the hard/soft split itself.
+
+**Fix.** Hoisted the redirect logic into a standalone `classifyRedirects(redirects, ctx)` and run it BEFORE the registry split, so a deny-tier target refuses for known AND registry-miss commands, and the read/write-fs cap rides onto the Conservative result (the engine floor sees it). `walkAst` now captures orphan redirects (a `redirected_statement` that consumed no command) into `WalkResult.orphanRedirects`; the resolver classifies those too. Known-command redirect behavior is unchanged (classifyRedirects is the same loop, just hoisted).
+
+**Validated** end-to-end: `some_tool > /proc/sysrq-trigger`, `sed -n p < /proc/1/environ`, `: > /proc/sysrq-trigger`, `[[ -e x ]] > /proc/sysrq-trigger`, `{ foocmd; } > /dev/mem`, `while read l; do :; done > /dev/mem` all Refuse; benign redirects (`echo > /dev/null`, `some_tool > out.txt` → conservative carrying `write-fs:<cwd>/out.txt`) unaffected. New regression describe in `resolvers.test.ts`; permissions (2005) + harness/tools (773) + typecheck + biome clean. **Branch:** `chore/sec-fixes`.
+
+Still open from the same review (not yet addressed): `ensureSandboxMaskFile` caches its path even on a creation error (transient failure → session-wide sandbox outage); the `SOFT_UNMODELED_NODES` comment + PERMISSION_ENGINE §5.2 still reference the deleted `scanForHardConstructs`; macOS masks credential files via `(deny file-read*)` which breaks git config readers the same way the Linux /dev/null bind did; `startsWithSegment` duplicated across the engine; production `ensureSandboxMaskFile` (no seam) untested.
+
 ## [2026-05-28] permissions/sandbox — `> /dev/null` un-refused + git works in the sandbox (two real-run blockers)
 
 Running the rebuilt binary surfaced two blockers the unit tests missed (both reproduced + fixed + verified end-to-end).

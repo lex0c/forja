@@ -2859,6 +2859,11 @@ interface WalkResult {
   // control flow not modeled`). Carried into the Conservative reason so
   // the modal/audit name the construct, not just "unmodeled shape".
   softReason?: string;
+  // Redirects on a `redirected_statement` that had NO command to attach
+  // to (`[[ -e x ]] > f`, bare `> f`). The resolver classifies these
+  // separately — a deny-tier target still refuses — because
+  // analyzeCommand never sees a redirect that isn't on a CommandShape.
+  orphanRedirects?: RedirectShape[];
 }
 
 // Recursion depth ceiling for `walkAst` (slice 98, R2 #198). A
@@ -2878,6 +2883,9 @@ const MAX_AST_DEPTH = 64;
 // `command` nodes into shapes.
 const walkAst = (root: Node): WalkResult => {
   const commands: CommandShape[] = [];
+  // Redirects on a redirected_statement that consumed no command (see
+  // WalkResult.orphanRedirects) — classified by the resolver, not here.
+  const orphanRedirects: RedirectShape[] = [];
   // Set when the walk passes through any soft-unmodeled shape (control
   // flow, grouping, value expansion, a dynamic command ARG). Unlike a
   // HARD refuse (which short-circuits the walk), soft shapes are
@@ -3048,6 +3056,17 @@ const walkAst = (root: Node): WalkResult => {
             }
           }
         }
+      } else {
+        // No command consumed this statement's redirect (`[[ -e x ]] > f`,
+        // bare `> f`). Collect the targets as orphans so the resolver
+        // still classifies them — a deny-tier redirect with no command
+        // must refuse, not slip through as a no-command Conservative.
+        for (const child of node.children) {
+          if (child !== null && child.type === 'file_redirect') {
+            const r = redirectShape(child);
+            if (r !== null) orphanRedirects.push(r);
+          }
+        }
       }
       return null;
     }
@@ -3063,7 +3082,12 @@ const walkAst = (root: Node): WalkResult => {
 
   const refuse = visit(root, 0, false);
   if (refuse !== null) return { refuse };
-  return { commands, soft: sawSoft, ...(softReason !== null ? { softReason } : {}) };
+  return {
+    commands,
+    soft: sawSoft,
+    ...(softReason !== null ? { softReason } : {}),
+    ...(orphanRedirects.length > 0 ? { orphanRedirects } : {}),
+  };
 };
 
 // Detect pipe-to-shell on a `pipeline` node. Returns the offending
@@ -3638,6 +3662,50 @@ const detectCwdScopeEscape = (lexicalAbs: string, ctx: ResolverContext): boolean
   return lexicalInside && !canonicalInside;
 };
 
+// Classify a set of redirect targets, independent of the command they
+// attach to (or no command at all). A redirect to a deny-tier path
+// (`/proc`, `/dev/sda`, ...) is refused for ANY command — known,
+// registry-miss, or none — and the read-fs/write-fs cap is emitted so
+// the engine's §11 / bypass-mode protected-path floors (which scan
+// resolved capabilities) can see it. Returns `{refuse}` or the caps plus
+// an `escalated` flag (escalate-tier target / cwd-scope escape → force
+// confirm). Hoisted out of analyzeCommand so the registry-miss and
+// no-command paths classify redirects too.
+const classifyRedirects = (
+  redirects: readonly RedirectShape[],
+  ctx: ResolverContext,
+): { refuse: string } | { caps: Capability[]; escalated: boolean } => {
+  const caps: Capability[] = [];
+  let escalated = false;
+  for (const r of redirects) {
+    if (r.kind === 'out' || r.kind === 'append' || r.kind === 'both' || r.kind === 'force-out') {
+      const tgtAbs = resolvePath(ctx.cwd, expandTilde(r.target, ctx.home));
+      const tier = classifyArgWithCanonical(tgtAbs, 'write', ctx);
+      if (tier === 'deny') {
+        return { refuse: `bash: redirect target '${r.target}' is in protected zone (deny tier)` };
+      }
+      if (tier === 'escalate') escalated = true;
+      if (detectCwdScopeEscape(tgtAbs, ctx)) escalated = true;
+      caps.push(writeFs(tgtAbs));
+    }
+    // Input redirects `<` ALSO pass through the classifier (op='read' →
+    // only SYSTEM_DENY_ROOTS catch; escalate doesn't apply to reads):
+    // `cat < /proc/self/environ` reads attacker-targeted credentials.
+    if (r.kind === 'in') {
+      const tgtAbs = resolvePath(ctx.cwd, expandTilde(r.target, ctx.home));
+      const tier = classifyArgWithCanonical(tgtAbs, 'read', ctx);
+      if (tier === 'deny') {
+        return {
+          refuse: `bash: input redirect source '${r.target}' is in protected zone (deny tier)`,
+        };
+      }
+      if (detectCwdScopeEscape(tgtAbs, ctx)) escalated = true;
+      caps.push(readFs(tgtAbs));
+    }
+  }
+  return { caps, escalated };
+};
+
 const analyzeCommand = (
   shape: CommandShape,
   ctx: ResolverContext,
@@ -3759,70 +3827,38 @@ const analyzeCommand = (
     }
   }
 
+  // Classify redirect targets BEFORE the registry split. Pre-fix the
+  // redirect loop lived AFTER the registry-miss early-return, so a
+  // redirect to a deny-tier path on an unmodeled command
+  // (`some_tool > /proc/sysrq-trigger`, `sed -n p < /proc/1/environ`)
+  // skipped the deny check and emitted no fs cap — and under
+  // `mode: bypass` the engine's §11 floor (which only scans resolved
+  // capabilities) had nothing to deny. Hoisting it refuses the deny-tier
+  // target for known AND registry-miss commands, and rides the read/write
+  // cap onto the conservative result so the floor stays honest.
+  const redir = classifyRedirects(shape.redirects, ctx);
+  if ('refuse' in redir) return { refuse: redir.refuse };
+
   const handler = COMMAND_TABLE.get(shape.name);
   if (handler === undefined) {
     // Registry miss → Conservative, not Refuse (PERMISSION_ENGINE.md
-    // §5.2 step 3c). The command isn't in HARD_REFUSE_COMMANDS (checked
-    // at the top of analyzeCommand) so it's not categorically dangerous
-    // — just unmodeled. Conservative forces a confirm; the operator (or
-    // a `bash.allow` rule) decides. The protected-path arg loop above
-    // already ran (and would have hard-refused a glob into a deny zone),
-    // so any `escalated` finding is subsumed by the forced confirm.
-    return { caps: [], confidence: 'low', conservative: `unknown_command: ${shape.name}` };
+    // §5.2 step 3c). Not in HARD_REFUSE_COMMANDS, so not categorically
+    // dangerous — just unmodeled. Conservative forces a confirm; the
+    // redirect caps (above) ride along so the engine floors stay honest.
+    return {
+      caps: redir.caps,
+      confidence: 'low',
+      conservative: `unknown_command: ${shape.name}`,
+    };
   }
   const positional = stripFlags(shape.args);
   const result = handler(positional, shape.args, ctx);
   if ('refuse' in result) return { refuse: result.refuse };
   let finalConf: 'high' | 'medium' | 'low' = result.confidence;
-  if (escalated) finalConf = 'low';
-
-  const redirectCaps: Capability[] = [];
-  for (const r of shape.redirects) {
-    if (r.kind === 'out' || r.kind === 'append' || r.kind === 'both' || r.kind === 'force-out') {
-      const tgtAbs = resolvePath(ctx.cwd, expandTilde(r.target, ctx.home));
-      // Slice 176: canonical-aware classification on redirect
-      // target — same symlink-bypass threat as command args.
-      const tier = classifyArgWithCanonical(tgtAbs, 'write', ctx);
-      if (tier === 'deny') {
-        return {
-          refuse: `bash: redirect target '${r.target}' is in protected zone (deny tier)`,
-        };
-      }
-      if (tier === 'escalate') finalConf = 'low';
-      // Slice 178: cwd-scope escape on write redirect.
-      if (detectCwdScopeEscape(tgtAbs, ctx)) finalConf = 'low';
-      redirectCaps.push(writeFs(tgtAbs));
-    }
-    // Slice 128 (R4 P0-Launder-3): input redirects `<` ALSO pass
-    // through the classifier. Pre-slice the `'in'` branch was
-    // commented "consume; no fs write" and skipped entirely — but
-    // `cat < /proc/self/environ` reads attacker-targeted
-    // credentials, and the /proc deny tier never fired because
-    // cmdRead emits `read-fs:cwd` from "no positional" branch and
-    // the redirect target was never classified. Symmetric to the
-    // write-redirect check above, but with op='read' so only
-    // SYSTEM_DENY_ROOTS (/proc, /sys, /boot, /dev) catch — the
-    // escalate tier doesn't apply to reads, by design.
-    if (r.kind === 'in') {
-      const tgtAbs = resolvePath(ctx.cwd, expandTilde(r.target, ctx.home));
-      // Slice 176: canonical-aware classification on read redirect
-      // source — same symlink-bypass threat.
-      const tier = classifyArgWithCanonical(tgtAbs, 'read', ctx);
-      if (tier === 'deny') {
-        return {
-          refuse: `bash: input redirect source '${r.target}' is in protected zone (deny tier)`,
-        };
-      }
-      // Slice 178: cwd-scope escape on read redirect.
-      if (detectCwdScopeEscape(tgtAbs, ctx)) finalConf = 'low';
-      // Add read-fs to capabilities — the shell will read from
-      // this path, the resolver should honestly admit so.
-      redirectCaps.push(readFs(tgtAbs));
-    }
-  }
+  if (escalated || redir.escalated) finalConf = 'low';
 
   return {
-    caps: [...result.capabilities, ...redirectCaps],
+    caps: [...result.capabilities, ...redir.caps],
     confidence: finalConf,
   };
 };
@@ -3878,6 +3914,16 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
     };
   }
 
+  // Orphan redirects: a redirect with NO command to attach to
+  // (`[[ -e x ]] > f`, bare `> f`). analyzeCommand never sees these
+  // (no CommandShape carries them), so classify them here — a deny-tier
+  // target refuses regardless of whether any command was resolved, and
+  // its cap rides onto the result so the engine floors stay honest.
+  const orphanRedir = classifyRedirects(walk.orphanRedirects ?? [], ctx);
+  if ('refuse' in orphanRedir) {
+    return { kind: 'refuse', reason: orphanRedir.refuse };
+  }
+
   if (commands.length === 0) {
     // A soft shape with no resolvable command (`[[ -e x ]]`, `( )`) is
     // unmodeled-but-benign → confirm. Not soft + no command → nothing
@@ -3885,7 +3931,7 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
     if (walk.soft === true) {
       return {
         kind: 'conservative',
-        capabilities: [exec('shell')],
+        capabilities: [exec('shell'), ...orphanRedir.caps],
         reason: `bash: ${walk.softReason ?? 'unmodeled shape'} (no resolvable command) → confirm`,
       };
     }
@@ -3901,7 +3947,7 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
   // `for i in 1; do echo x > /proc/...; done`, `for x in *; do cat
   // /etc/pass*; done`, and `'eval'`/`$()` inside a loop all stay denied
   // even though the wrapping shape is soft.
-  const allCaps: Capability[] = [exec('shell')];
+  const allCaps: Capability[] = [exec('shell'), ...orphanRedir.caps];
   let aggregateConf: 'high' | 'medium' | 'low' = 'high';
   let conservativeReason: string | null = null;
   for (const shape of commands) {

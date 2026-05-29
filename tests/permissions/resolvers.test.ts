@@ -2082,6 +2082,35 @@ describe('bash resolver — /dev/null (and safe pseudo-devices) redirects are al
   });
 });
 
+// Review regression: a redirect to a DENY-TIER path must refuse for ANY
+// command — known, registry-miss, or none (orphan). Pre-fix the redirect
+// loop lived after analyzeCommand's registry-miss early-return, so an
+// unmodeled command (or a no-command soft shape) with a deny-tier
+// redirect reached Conservative (and ALLOW under mode:bypass, since the
+// write/read-fs cap was never emitted for the §11 floor to see).
+describe('bash resolver — redirect-to-deny refuses regardless of the command', () => {
+  test.each([
+    'some_tool > /proc/sysrq-trigger', // registry-miss command, write
+    'sed -n p < /proc/1/environ', // registry-miss command, read
+    'nosuchcmd > /dev/sda', // registry-miss, block device
+    ': > /proc/sysrq-trigger', // `:` no-op is a registry miss
+    '[[ -e x ]] > /proc/sysrq-trigger', // orphan redirect (no command)
+    '{ foocmd; } > /dev/mem', // group with unknown inner command
+    'while read l; do :; done > /dev/mem', // soft loop, orphan redirect
+    'foo >> /sys/kernel/whatever', // append to deny tier
+  ])('%s → Refuse', (cmd) => {
+    expect(resolveCapabilities('bash', { command: cmd }, CTX).kind).toBe('refuse');
+  });
+
+  test('registry-miss command with a benign redirect → Conservative (not refuse), and carries the write-fs cap', () => {
+    const r = resolveCapabilities('bash', { command: 'some_tool > /work/proj/out.txt' }, CTX);
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/work/proj/out.txt');
+    }
+  });
+});
+
 describe('bash resolver — well-known compound shapes resolve to Ok', () => {
   test('logical chain (&&) of known commands aggregates capabilities', () => {
     const r = resolveCapabilities('bash', { command: 'ls && rm /tmp/x' }, CTX);
