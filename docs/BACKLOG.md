@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-29] permissions — track sort's file-reading flags (--files0-from, --random-source)
+
+Follow-up to modeling `sort` as a known command. `cmdSort` modeled `-o`/`-T` (writes) and refused `--compress-program` (exec), but missed the flags whose value is a FILE sort READS: `--files0-from=F` (NUL-separated input-name manifest) and `--random-source=F` (random bytes for `-R`). Both open F, so `sort --files0-from=.env` resolved to only the cwd baseline while sort opened `.env` (and can leak its lines through filename errors) — the §8.4 sensitive-path floor, which scans resolved caps, never saw the read.
+
+**Fix.** `cmdSort` now extracts `--files0-from` and `--random-source` (both getopt forms) and emits `read-fs` for each value (`-` = stdin, filtered); both added to the value-flag set so their operands don't double-count in the positional input split. Renamed `SORT_OUTPUT_VALUE_FLAGS` → `SORT_VALUE_FLAGS` (the set is every operand-taking sort flag, read/write/exec alike). `--random-source` handled alongside the reported `--files0-from` as the same read-file-flag class.
+
+**Validated:** +2 regression tests (`--files0-from=` and space forms → read-fs on the manifest; `--random-source=` → read-fs); existing sort write/exec/clean-read tests still pass; full `tests/permissions/` (2088) + typecheck + biome clean. **Branch:** `chore/sec-fixes`.
+
 ## [2026-05-29] permissions — tree -R/-H detection missed combined short-option clusters
 
 Follow-up to the `tree` write-modeling fix. The `-R -H` 00Tree.html dir-write gate keyed on the exact `-R` token (`tokens.includes('-R')`), so combined short-option clusters — `tree -RH …`, `tree -HR …` (bash bundles single-char flags) — never matched: the resolver emitted only read-fs caps, and under `mode: bypass` the §11 floor (caps-only) let a protected-dir write skip the confirm/deny path. Added `hasShortFlagChar(tokens, ch)` that matches a flag standalone (`-R`) OR bundled in a `-`-prefixed cluster (`-RH`/`-HR`), skipping long options and non-option tokens; the dir-write gate now uses it for both `R` and `H`. Conservative by design: a value char bundled after a value-taking short may over-match, which only widens write attribution.

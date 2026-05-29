@@ -2259,6 +2259,33 @@ describe('bash resolver — sort/uniq writes are not misclassified as reads', ()
     }
   });
 
+  test('sort --files0-from=FILE reads the manifest FILE (both getopt forms)', () => {
+    // GNU sort reads the NUL-separated input-name list from FILE; FILE
+    // itself is read, so the sensitive-path floor must see it.
+    for (const cmd of [
+      'sort --files0-from=/work/proj/.env',
+      'sort --files0-from /work/proj/.env',
+    ]) {
+      const r = resolveCapabilities('bash', { command: cmd }, CTX);
+      expect(r.kind).toBe('ok');
+      if (r.kind === 'ok') {
+        expect(capStrings(r.capabilities)).toContain('read-fs:/work/proj/.env');
+      }
+    }
+  });
+
+  test('sort --random-source=FILE reads FILE too (same class as --files0-from)', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'sort -R --random-source=/work/proj/.env data' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/work/proj/.env');
+    }
+  });
+
   test('uniq writes its second positional → write-fs, not read-fs', () => {
     const r = resolveCapabilities(
       'bash',

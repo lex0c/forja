@@ -574,11 +574,20 @@ const cmdReadWithSize: CommandResolver = (_positional, tokens, ctx) => {
 // compress-program exec vector. `sort` is also removed from
 // isReadOnlyCommand so the per-arg §11 loop treats its operands as
 // writes (defense in depth — see the loop in analyzeCommand).
-const SORT_OUTPUT_VALUE_FLAGS: ReadonlySet<string> = new Set([
+// sort also READS files via flags: `--files0-from=F` reads the NUL-
+// separated input-file list from F, and `--random-source=F` reads random
+// bytes from F (for `-R`). Each opens F — `sort --files0-from=.env` leaks
+// .env lines through filename errors — so emit read-fs for F too, not just
+// the cwd baseline (`-` = stdin, filtered). The set below is every sort
+// flag that takes an operand, stripped from the positional input split
+// regardless of its read/write/exec disposition.
+const SORT_VALUE_FLAGS: ReadonlySet<string> = new Set([
   '-o',
   '--output',
   '-T',
   '--temporary-directory',
+  '--files0-from',
+  '--random-source',
 ]);
 
 const cmdSort: CommandResolver = (_positional, tokens, ctx) => {
@@ -591,9 +600,16 @@ const cmdSort: CommandResolver = (_positional, tokens, ctx) => {
     ...extractValueFlag(tokens, { longForm: '--output', shortForm: '-o' }),
     ...extractValueFlag(tokens, { longForm: '--temporary-directory', shortForm: '-T' }),
   ].filter((v) => v !== '-');
-  const inputs = stripFlags(tokens, SORT_OUTPUT_VALUE_FLAGS).filter((v) => v !== '-');
+  // Flags whose value is a FILE sort READS (input-name manifest / random
+  // source) — distinct from the positional inputs, both forms of each.
+  const readTargets = [
+    ...extractValueFlag(tokens, { longForm: '--files0-from' }),
+    ...extractValueFlag(tokens, { longForm: '--random-source' }),
+  ].filter((v) => v !== '-');
+  const inputs = stripFlags(tokens, SORT_VALUE_FLAGS).filter((v) => v !== '-');
   const caps = [
     ...inputs.map((p) => readFs(resolveArg(p, ctx))),
+    ...readTargets.map((p) => readFs(resolveArg(p, ctx))),
     ...writeTargets.map((p) => writeFs(resolveArg(p, ctx))),
   ];
   // Pure stdin→stdout (`cat x | sort`): record a cwd read like cmdRead.
