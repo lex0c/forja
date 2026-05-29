@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-29] permissions — xargs/parallel refuse ANY wrapped command, not just interpreters
+
+The exec-runner scan added earlier only refused `xargs`/`parallel` when an INTERPRETER token appeared in the argv (`xargs sh -c …`). But a runner execs whatever command it wraps, so `xargs rm -rf /` laundered the rm system-root refuse exactly like `xargs sh -c …` laundered the shell refuse — analyzeCommand only saw the outer `xargs`, the inner `rm -rf /` never reached cmdRm's root-delete refusal, and the result was a registry-miss Conservative (exec:arbitrary) that `mode: bypass` auto-allows (no delete-fs cap for the §11 floor). Same for `xargs dd …`, `parallel sudo …`, etc.
+
+**Fix.** Broadened the analyzeCommand exec-runner check from "an interpreter token is present" to "any positional command is present" (`stripFlags(effectiveArgs).length > 0`) — a runner wrapping ANY command refuses, the same posture as the command launchers (cmdLauncher). A bare `xargs`/`parallel` with no wrapped command (e.g. `… | xargs` defaulting to echo) carries no exec and falls through. Chose hard-refuse (the finding's option 2) over recursively analyzing the inner command: complete (closes laundering of sh, rm-roots, dd, sudo, … uniformly), simple, and robust against per-runner argv-parsing mistakes. Cost: `find … | xargs grep`/`xargs rm` refuse too — use `grep -r` / `find -exec` / `find -delete` / explicit targets.
+
+**Validated:** updated the runner describe (interpreter AND non-interpreter wrapped commands → Refuse; bare `xargs` not refused; the old "benign xargs stays Conservative" expectation flipped to Refuse); full `tests/permissions/` (2112) + conformance (166) + typecheck + biome clean. **Branch:** `chore/sec-fixes`.
+
 ## [2026-05-29] permissions — track wc --files0-from (the third coreutils manifest reader)
 
 Proactive follow-up: `wc` is the third GNU coreutils command (after sort and du) that takes `--files0-from=F` (reads the NUL-separated path list from F), and it was still on plain cmdRead — verified with a probe that `wc --files0-from=.env` resolved to only the cwd baseline, the same §8.4-floor blind spot just fixed for sort/du. Dedicated `cmdWc`: emits read-fs for `--files0-from` (`-` = stdin filtered) and the path operands, strips `--total=WHEN` so its enum value can't pollute the path split. wc has no pattern-file flag and never writes, so it stays in isReadOnlyCommand.

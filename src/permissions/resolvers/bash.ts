@@ -3393,17 +3393,19 @@ const walkAst = (root: Node): WalkResult => {
 const resolvesToInterpreter = (token: string): boolean =>
   SHELL_INTERPRETERS.has(token) || SHELL_INTERPRETERS.has(basename(stripShellQuoting(token)));
 
-// Commands that EXECUTE another command supplied as arguments, reading
-// the operands from stdin / a file / `:::` lists. When that inner command
-// is a shell or interpreter every input line becomes an exec'd script,
-// and the resolver can't model it — the same uncontrollable shape as
-// pipe-to-shell. `xargs` runs its command via execvp; GNU `parallel`
-// wraps each job in a shell. Both Refuse when an interpreter token appears
-// in the argv (see analyzeCommand); benign runners (`xargs rm`, `parallel
-// gzip ::: *`) carry no interpreter token and stay Conservative. Residual
-// gap, documented in the backlog: an interpreter hidden inside a quoted
-// command STRING (`parallel ::: 'sh -c x'`) is runtime data the static
-// token scan can't crack — it falls to Conservative/confirm.
+// Commands that EXECUTE another command supplied in their argv, reading
+// more operands from stdin / a file / `:::` lists (`xargs [OPTS] COMMAND
+// [ARGS]`; GNU `parallel` similar, wrapping each job in a shell). The
+// resolver sees the runner, not the wrapped command, so that command's
+// per-command refuse checks (sh/bash hard-refuse, rm system-roots, dd,
+// sudo, …) never run on what actually executes. analyzeCommand refuses ANY
+// positional usage of these (a wrapped command is present), not just an
+// embedded interpreter — `xargs rm -rf /` laundered the rm system-root
+// refuse exactly like `xargs sh -c …` laundered the shell refuse: both
+// were a registry-miss Conservative (exec:arbitrary) that mode:bypass
+// auto-allows. Bare `xargs`/`parallel` with no command carries no exec and
+// falls through to the normal path. (detectPipeToShell still catches the
+// pipeline interpreter shape early with a pipe-to-shell reason.)
 const EXEC_RUNNER_COMMANDS: ReadonlySet<string> = new Set(['xargs', 'parallel']);
 
 // Bash runs a command name WITHOUT a slash via a PATH search (the
@@ -4092,19 +4094,19 @@ const analyzeCommand = (
           dynamicIdx.includes(i) ? expandKnownVars(stripShellQuoting(a), ctx) : a,
         );
 
-  // Command-runner spawning an interpreter (standalone shape too).
-  // `xargs sh -c …`, `parallel /usr/bin/python -c … ::: list`, etc. run
-  // the inner interpreter on every input. detectPipeToShell catches this
-  // only when the runner is a PIPELINE stage; a standalone `xargs -a file
-  // sh -c …` (no pipe) never reached that scan and stayed an unregistered
-  // Conservative command that mode:bypass auto-allows. Scan the argv (name
-  // is basename-normalized, so `/usr/bin/xargs` counts) and refuse on any
-  // embedded interpreter — same posture/reason class as the pipe case.
-  // Benign `xargs rm` / `parallel gzip ::: *` carry no interpreter token
-  // and fall through to the normal Conservative (registry-miss) path.
-  if (EXEC_RUNNER_COMMANDS.has(base) && effectiveArgs.some((a) => resolvesToInterpreter(a))) {
+  // Command runner wrapping another command (standalone shape too). xargs /
+  // parallel exec a COMMAND from their argv, so the wrapped command's
+  // per-command refuse checks (sh/bash hard-refuse, rm system-roots, dd,
+  // sudo, …) never run on what actually executes. Refuse ANY positional
+  // usage — not just an embedded interpreter — because `xargs rm -rf /`
+  // launders the rm root-delete refuse just as `xargs sh -c …` launders the
+  // shell refuse; both were a registry-miss Conservative (exec:arbitrary)
+  // that mode:bypass auto-allows. A bare `xargs` (no wrapped command, e.g.
+  // `… | xargs` defaulting to echo) carries no positional and falls
+  // through. name is basename-normalized, so `/usr/bin/xargs` counts.
+  if (EXEC_RUNNER_COMMANDS.has(base) && stripFlags(effectiveArgs).length > 0) {
     return {
-      refuse: `bash: ${base} spawning an interpreter has no safe capability resolution`,
+      refuse: `bash: ${base} runs a wrapped command from its argv — refusing to launder exec attribution past the per-command refuse checks (run the wrapped tool directly)`,
     };
   }
 

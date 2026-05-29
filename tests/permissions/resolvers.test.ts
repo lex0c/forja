@@ -1261,13 +1261,13 @@ describe('bash resolver — pipe-to-interpreter Refuse (slice 147 R1)', () => {
     expect(r.kind).toBe('refuse');
   });
 
-  test('xargs WITHOUT interpreter remains allowed (xargs ls / xargs rm — by other rules)', () => {
-    // xargs cat — last stage is xargs but no shell interpreter in
-    // args. Should NOT be caught by pipe-to-interpreter; falls to
-    // the unknown-command path (xargs not in COMMAND_TABLE → refuse
-    // for a different reason). We only assert the REFUSE doesn't
-    // attribute to pipe-to-shell.
+  test('xargs WITHOUT an interpreter is NOT mis-attributed to pipe-to-shell', () => {
+    // `xargs cat` has no shell interpreter, so it must not trip the
+    // pipe-to-interpreter detector. It still Refuses — xargs wraps a
+    // command, which launders exec attribution — but with the generic
+    // runner reason, NOT a `xargs sh`/`xargs python` attribution.
     const r = resolveCapabilities('bash', { command: 'echo x | xargs cat' }, CTX);
+    expect(r.kind).toBe('refuse');
     if (r.kind === 'refuse') {
       expect(r.reason).not.toContain('xargs sh');
       expect(r.reason).not.toContain('xargs python');
@@ -2465,14 +2465,16 @@ describe('bash resolver — path-qualified interpreter as pipe/xargs target stil
   });
 });
 
-// Review regression: a command-runner (xargs / GNU parallel) spawning an
-// interpreter must Refuse even with NO pipe — detectPipeToShell only scans
-// pipeline nodes, so a standalone `xargs -a file sh -c …` / `parallel sh
-// -c … ::: list` stayed an unregistered Conservative command that
-// mode:bypass auto-allows. analyzeCommand now scans any runner's argv (and
-// walkAst runs it per pipeline stage, so the pipe form is covered too).
-describe('bash resolver — command-runner spawning an interpreter still Refuse (xargs/parallel)', () => {
+// Review regression: a command runner (xargs / GNU parallel) execs a
+// COMMAND from its argv, so the wrapped command's per-command refuse checks
+// never run — `xargs rm -rf /` launders the rm root-delete refuse exactly
+// like `xargs sh -c …` launders the shell refuse. Both were a registry-miss
+// Conservative (exec:arbitrary) that mode:bypass auto-allows. analyzeCommand
+// refuses ANY positional usage of these runners (standalone + pipeline, via
+// walkAst's per-stage analyzeCommand).
+describe('bash resolver — command runners refuse any wrapped command (xargs/parallel)', () => {
   test.each([
+    // interpreter-wrapping shapes
     'xargs sh -c x',
     'xargs /bin/sh -c x',
     'xargs /usr/bin/python -c x',
@@ -2484,16 +2486,24 @@ describe('bash resolver — command-runner spawning an interpreter still Refuse 
     'parallel ::: sh', // no command before `:::` → the args ARE commands
     'cat list | parallel sh -c x', // pipeline form, caught per-stage
     '/usr/bin/parallel sh -c x ::: a', // path-qualified parallel
+    // non-interpreter wrapped commands that launder a per-command refuse
+    'xargs rm -rf /', // launders rm system-root refuse
+    'find . | xargs rm -rf /', // …pipeline form
+    'xargs dd if=/dev/zero of=/dev/sda', // launders dd hard-refuse
+    'parallel sudo whoami ::: a', // launders sudo hard-refuse
+    // benign wrapped commands ALSO refuse — the runner launders attribution
+    // regardless of what it wraps (run the wrapped tool directly).
+    'xargs rm',
+    'echo x | xargs cat',
+    'parallel gzip ::: a.txt b.txt',
   ])('%s → Refuse', (cmd) => {
     expect(resolveCapabilities('bash', { command: cmd }, CTX).kind).toBe('refuse');
   });
 
-  test.each(['xargs rm', 'parallel gzip ::: a.txt b.txt'])(
-    'benign runner %s with no interpreter stays Conservative, not Refuse',
-    (cmd) => {
-      expect(resolveCapabilities('bash', { command: cmd }, CTX).kind).toBe('conservative');
-    },
-  );
+  test('bare xargs with no wrapped command is not refused', () => {
+    // `… | xargs` with no command defaults to echo — no wrapped exec.
+    expect(resolveCapabilities('bash', { command: 'echo a | xargs' }, CTX).kind).not.toBe('refuse');
+  });
 });
 
 // Review regression: command launchers (nice/nohup/timeout/setsid/stdbuf/…)
