@@ -2288,6 +2288,37 @@ describe('bash resolver — sort/uniq writes are not misclassified as reads', ()
       expect(capStrings(r.capabilities)).toContain('write-fs:/etc');
     }
   });
+
+  test('tree -o FILE emits write-fs for the output file (not read-only)', () => {
+    const r = resolveCapabilities('bash', { command: 'tree -o /etc/cron.d/x .' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/etc/cron.d/x');
+    }
+  });
+
+  test('tree -o into a deny-tier path Refuses', () => {
+    const r = resolveCapabilities('bash', { command: 'tree -o /proc/sysrq-trigger .' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('tree -R -H writes 00Tree.html into each listed dir → write-fs for the dir', () => {
+    const r = resolveCapabilities('bash', { command: 'tree -R -H base /work/proj/sub' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/work/proj/sub');
+    }
+  });
+
+  test('plain tree listing stays a clean read (regression)', () => {
+    const r = resolveCapabilities('bash', { command: 'tree -L 2 /work/proj/src' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const caps = capStrings(r.capabilities);
+      expect(caps).toContain('read-fs:/work/proj/src');
+      expect(caps.some((c) => c.startsWith('write-fs:'))).toBe(false);
+    }
+  });
 });
 
 // Review regression: a PATH-QUALIFIED interpreter as a pipe/xargs target

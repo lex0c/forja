@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-29] permissions — `tree` output files modeled as writes
+
+Same class as the earlier sort/uniq fix. `tree` was registered to plain cmdRead and listed in isReadOnlyCommand, but `tree -o FILE` sends the listing to FILE (tree(1)), and `tree -R` with `-H` writes a 00Tree.html into each traversed directory. So `tree -o /etc/cron.d/x .` resolved only as a read — and isReadOnlyCommand made the §11 loop classify `/etc/cron.d/x` with op=read, skipping the write-escalate tier — so no write-fs cap reached the policy/bypass floors while tree wrote the file.
+
+**Fix.** Dedicated `cmdTree`: emit write-fs for the `-o` output file (all getopt shapes) and, under `-R -H`, for each listed directory; read-fs for the listed dirs. Operand-taking flags (`-L`/`-P`/`-I`/`-H`/`-T`/`-o`) are stripped so they don't pollute the listed-dir split. Removed `tree` from isReadOnlyCommand so the per-arg §11 loop treats its operands as writes (defense in depth), same posture as cmdSort/cmdUniq. A deny-tier `-o` target (`tree -o /proc/sysrq-trigger`) refuses in the loop; a plain `tree -L 2 dir` listing stays a clean read.
+
+**Validated:** +4 regression tests (`-o` → write-fs incl. escalate tier; deny-tier `-o` → Refuse; `-R -H` → write-fs on the dir; plain listing → read-only); existing `tree src` read test still passes; full `tests/permissions/` (2080) + typecheck + biome clean. **Branch:** `chore/sec-fixes`.
+
 ## [2026-05-29] permissions — basename normalization over-trusted untrusted slash-qualified commands
 
 Follow-up to the path-qualified launcher fix. That fix collapsed every command name to `basename(stripShellQuoting(name))` for ALL name-keyed classifications. But Bash runs a name CONTAINING a slash as that EXACT pathname (no PATH search), so `./cat`, `/tmp/ls`, `bin/x` are untrusted local executables — and `basename()` modeled them as the whitelisted system `cat`/`ls`, so the resolver returned read-only caps while an arbitrary repo/tmp binary actually ran.

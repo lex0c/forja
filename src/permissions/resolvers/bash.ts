@@ -628,6 +628,34 @@ const cmdUniq: CommandResolver = (_positional, tokens, ctx) => {
   return { capabilities: caps, confidence: 'high' };
 };
 
+// `tree` lists directories (read) EXCEPT it can WRITE its output: `-o FILE`
+// sends the listing to FILE (tree(1)), and `-R` together with `-H` writes
+// a 00Tree.html into each traversed directory. Registered to plain cmdRead,
+// the `-o` target was emitted as a READ and isReadOnlyCommand made the §11
+// loop classify it read too — `tree -o /etc/cron.d/x .` walked past the
+// write-escalate tier with no write-fs cap. Emit write-fs for the output
+// FILE (and, under `-R -H`, for each listed dir) and read-fs for the listed
+// dirs. Value flags that take an operand (`-L`/`-P`/`-I`/`-H`/`-T`/`-o`)
+// are stripped so they don't pollute the listed-dir split. `tree` is also
+// removed from isReadOnlyCommand so the per-arg §11 loop treats its
+// operands as writes (defense in depth), same posture as cmdSort.
+const TREE_VALUE_FLAGS: ReadonlySet<string> = new Set(['-o', '-L', '-P', '-I', '-H', '-T']);
+
+const cmdTree: CommandResolver = (_positional, tokens, ctx) => {
+  const writeTargets = extractValueFlag(tokens, { shortForm: '-o' }).filter((v) => v !== '-');
+  const dirs = stripFlags(tokens, TREE_VALUE_FLAGS);
+  const listed = dirs.length > 0 ? dirs : [ctx.cwd];
+  const caps: Capability[] = [
+    ...listed.map((p) => readFs(resolveArg(p, ctx))),
+    ...writeTargets.map((p) => writeFs(resolveArg(p, ctx))),
+  ];
+  // `-R` + `-H` writes a 00Tree.html into each traversed directory.
+  if (tokens.includes('-R') && tokens.some((t) => t === '-H' || t.startsWith('-H'))) {
+    caps.push(...listed.map((p) => writeFs(resolveArg(p, ctx))));
+  }
+  return { capabilities: caps, confidence: 'high' };
+};
+
 // Pure-output writers (echo / printf). They emit their arguments
 // verbatim to stdout — a string like "/etc/passwd" passed to echo
 // is NOT a filesystem read, it's text. No read-fs capability is
@@ -2686,7 +2714,7 @@ const COMMAND_TABLE: ReadonlyMap<string, CommandResolver> = new Map<string, Comm
   ['jq', cmdRead],
   ['du', cmdRead],
   ['df', cmdRead],
-  ['tree', cmdRead],
+  ['tree', cmdTree],
   ['basename', cmdRead],
   ['dirname', cmdRead],
   ['echo', cmdEcho],
@@ -3344,9 +3372,10 @@ const isReadOnlyCommand = (name: string): boolean => {
     // Read-only filters (registry expansion, PERMISSION_ENGINE.md §5.2).
     // Classified read-only so their path args resolve as `read` (not
     // `write`) in the protected-path loop — same posture as cat/wc.
-    // `sort` and `uniq` are deliberately EXCLUDED: both can write a file
-    // (`sort -o`, `uniq INPUT OUTPUT`), so they carry dedicated handlers
-    // and must let the per-arg loop treat their operands as writes.
+    // `sort`, `uniq`, and `tree` are deliberately EXCLUDED: each can write
+    // a file (`sort -o`, `uniq INPUT OUTPUT`, `tree -o` / `-R -H`), so they
+    // carry dedicated handlers and must let the per-arg loop treat their
+    // operands as writes.
     case 'cut':
     case 'comm':
     case 'paste':
@@ -3361,7 +3390,6 @@ const isReadOnlyCommand = (name: string): boolean => {
     case 'jq':
     case 'du':
     case 'df':
-    case 'tree':
     case 'basename':
     case 'dirname':
       return true;
