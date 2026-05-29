@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-29] permissions — track du's file-reading flags (--files0-from, --exclude-from/-X)
+
+Same class as the sort `--files0-from` fix. `du` was registered to plain cmdRead, but two flags take a FILE it reads: `--files0-from=F` (NUL-separated path manifest — du then reads the listed paths) and `--exclude-from=FILE` / `-X FILE` (a pattern file). Under cmdRead the combined `=` forms were dropped by stripFlags, so `du --files0-from=.env` resolved to only the cwd baseline — the §8.4 sensitive-path floor (caps-only) never saw the manifest read. Confirmed with a probe (the `-X FILE` space form accidentally worked via the positional split; the `=` forms leaked).
+
+**Fix.** Dedicated `cmdDu`: emits read-fs for `--files0-from` and `--exclude-from`/`-X` values (both getopt forms; `-` = stdin filtered) and for the path operands; strips du's operand-taking flags so their values don't pollute the path split. du STAYS in isReadOnlyCommand — it never writes, so the per-arg §11 loop's read classification is correct (unlike sort/uniq/tree, which were removed because they write). The paths listed INSIDE the manifest are runtime data the static scan can't enumerate (same residual as sort `--files0-from`); F itself is now visible.
+
+**Validated:** +3 regression tests (`--files0-from=` and `--exclude-from=`/`-X` → read-fs on the file; plain `du -sh` stays a clean read); existing du read-only test still passes; full `tests/permissions/` (2104) + typecheck + biome clean. **Branch:** `chore/sec-fixes`.
+
 ## [2026-05-29] permissions — hard-refuse command launchers that launder exec attribution
 
 Command launchers run a wrapped command from their argv, so the resolver sees the launcher, not what executes — the per-command refuse checks (sh/bash hard-refuse, rm system-roots, dd, sudo, …) never run on the real command. `env` already refused this (cmdEnv), but `nice`/`nohup`/`setsid`/`timeout`/`stdbuf`/`ionice`/`taskset`/`chrt`/`setarch`/`flock`/`watch` were unregistered → registry-miss Conservative (exec:arbitrary), which `mode: bypass` auto-allows. Verified with a resolver probe: `nice sh -c …`, `timeout 5 sh -c …`, `nohup rm -rf /`, `nice dd …`, `timeout 5 sudo …` all resolved Conservative (laundering a refuse the bare command hits) while `env sh -c …` already refused. (The reported example `env`/`/usr/bin/env` was already covered; the real gap was the other launchers.)

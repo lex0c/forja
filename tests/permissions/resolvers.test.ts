@@ -2392,6 +2392,43 @@ describe('bash resolver — sort/uniq writes are not misclassified as reads', ()
   });
 });
 
+// Review regression: du is read-only, but `--files0-from=F` reads a path
+// manifest and `--exclude-from=FILE` / `-X FILE` read a pattern file. Under
+// plain cmdRead the combined `=` forms were dropped, so the manifest read
+// never reached the §8.4 sensitive-path floor. cmdDu emits read-fs for them.
+describe('bash resolver — du file-reading flags surface the manifest read', () => {
+  test('du --files0-from=FILE reads the manifest FILE (combined form)', () => {
+    const r = resolveCapabilities('bash', { command: 'du --files0-from=/work/proj/.env' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/work/proj/.env');
+    }
+  });
+
+  test('du --exclude-from / -X read the pattern file (both forms)', () => {
+    for (const cmd of [
+      'du --exclude-from=/work/proj/.env /work/proj',
+      'du -X /work/proj/.env /work/proj',
+    ]) {
+      const r = resolveCapabilities('bash', { command: cmd }, CTX);
+      expect(r.kind).toBe('ok');
+      if (r.kind === 'ok') {
+        expect(capStrings(r.capabilities)).toContain('read-fs:/work/proj/.env');
+      }
+    }
+  });
+
+  test('plain du stays a clean read (regression)', () => {
+    const r = resolveCapabilities('bash', { command: 'du -sh /work/proj/src' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const caps = capStrings(r.capabilities);
+      expect(caps).toContain('read-fs:/work/proj/src');
+      expect(caps.some((c) => c.startsWith('write-fs:'))).toBe(false);
+    }
+  });
+});
+
 // Review regression: a PATH-QUALIFIED interpreter as a pipe/xargs target
 // (`| /bin/sh`, `| xargs /usr/bin/python -c`) must resolve like its bare
 // form. detectPipeToShell keyed on the raw token and missed the path —

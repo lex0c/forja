@@ -684,6 +684,43 @@ const cmdTree: CommandResolver = (_positional, tokens, ctx) => {
   return { capabilities: caps, confidence: 'high' };
 };
 
+// `du` summarizes disk usage (read-only) but two flags take a FILE it
+// READS: `--files0-from=F` (NUL-separated path list — du then reads the
+// paths in F) and `--exclude-from=FILE` / `-X FILE` (a pattern file).
+// Under plain cmdRead the combined `=` forms were dropped by stripFlags,
+// so `du --files0-from=.env` resolved to only the cwd baseline — the §8.4
+// sensitive-path floor never saw the manifest read. Emit read-fs for those
+// FILE values (both getopt forms; `-` = stdin, filtered) and for the path
+// operands; strip du's operand-taking flags so their values don't pollute
+// the path split. du stays in isReadOnlyCommand — it never writes, so the
+// per-arg §11 loop's read classification is correct.
+const DU_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  '--files0-from',
+  '--exclude-from',
+  '-X',
+  '--exclude',
+  '-d',
+  '--max-depth',
+  '-t',
+  '--threshold',
+  '-B',
+  '--block-size',
+]);
+
+const cmdDu: CommandResolver = (_positional, tokens, ctx) => {
+  const readTargets = [
+    ...extractValueFlag(tokens, { longForm: '--files0-from' }),
+    ...extractValueFlag(tokens, { longForm: '--exclude-from', shortForm: '-X' }),
+  ].filter((v) => v !== '-');
+  const inputs = stripFlags(tokens, DU_VALUE_FLAGS).filter((v) => v !== '-');
+  const caps = [
+    ...inputs.map((p) => readFs(resolveArg(p, ctx))),
+    ...readTargets.map((p) => readFs(resolveArg(p, ctx))),
+  ];
+  if (caps.length === 0) caps.push(readFs(ctx.cwd)); // bare `du` summarizes cwd
+  return { capabilities: caps, confidence: 'high' };
+};
+
 // Pure-output writers (echo / printf). They emit their arguments
 // verbatim to stdout — a string like "/etc/passwd" passed to echo
 // is NOT a filesystem read, it's text. No read-fs capability is
@@ -2764,7 +2801,7 @@ const COMMAND_TABLE: ReadonlyMap<string, CommandResolver> = new Map<string, Comm
   ['diff', cmdRead],
   ['cmp', cmdRead],
   ['jq', cmdRead],
-  ['du', cmdRead],
+  ['du', cmdDu],
   ['df', cmdRead],
   ['tree', cmdTree],
   ['basename', cmdRead],
