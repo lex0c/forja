@@ -45,7 +45,11 @@ import {
   readFs,
   writeFs,
 } from '../capabilities.ts';
-import { classifyProtectedPath, protectedTargets } from '../protected_paths.ts';
+import {
+  classifyProtectedPath,
+  isGlobSafeRunCarveout,
+  protectedTargets,
+} from '../protected_paths.ts';
 import {
   type Resolver,
   type ResolverContext,
@@ -81,6 +85,19 @@ const expandTilde = (path: string, home: string): string => {
 
 const resolveArg = (path: string, ctx: ResolverContext): string =>
   resolvePath(ctx.cwd, expandTilde(path, ctx.home));
+
+// Expand the handful of shell variables the resolver can know statically
+// — `$HOME`/`${HOME}` and `$PWD`/`${PWD}` — so a dynamic operand like
+// `$HOME/.ssh/id_rsa` resolves to the real protected/sensitive path
+// instead of a literal `$HOME` segment. Word-boundary guarded so `$HOMEX`
+// is left intact; a function replacer avoids `$`-in-replacement pitfalls
+// if home/cwd ever contain `$`. Other `$...` stay literal (the operand is
+// still dynamic; the emitted cap is a best-effort, and matchSensitivePath
+// spans segments so `.ssh/**` still trips even on the unresolved form).
+const expandKnownVars = (text: string, ctx: ResolverContext): string =>
+  text
+    .replace(/\$\{HOME\}|\$HOME(?![A-Za-z0-9_])/g, () => ctx.home)
+    .replace(/\$\{PWD\}|\$PWD(?![A-Za-z0-9_])/g, () => ctx.cwd);
 
 const EMPTY_FLAG_SET: ReadonlySet<string> = new Set();
 
@@ -295,6 +312,36 @@ const RED_FLAG_NODES: ReadonlyMap<string, string> = new Map([
   // version bump introduces.
 ]);
 
+// Soft-unmodeled subset of RED_FLAG_NODES (PERMISSION_ENGINE.md §5.2,
+// "Soft-unmodeled → Conservative"). These kinds aren't statically
+// resolvable but don't, by themselves, enable arbitrary exec/injection:
+// control flow, grouping, negation, conditionals, value expansion.
+// walkAst RECURSES through these (instead of short-circuiting), marks the
+// result `soft`, and collects the inner commands; the resolver then runs
+// analyzeCommand on EVERY collected command and returns Conservative
+// (→ confirm) only when `soft` is set and nothing hard-refused. So the
+// model can run `for f in *.ts; do cat "$f"; done` (operator approves)
+// while `for x in *; do eval "$x"; done` still hard-refuses (the inner
+// `eval` is a HARD_REFUSE command caught by analyzeCommand). Everything
+// in RED_FLAG_NODES NOT listed
+// here (command/process substitution, function defs, `VAR=val cmd`
+// prefix, arithmetic, heredoc/herestring, ansi-c, subscript) stays HARD:
+// it enables exec/injection the resolver can't bound, so it remains a
+// pre-policy Refuse that operator policy can't unlock.
+const SOFT_UNMODELED_NODES: ReadonlySet<string> = new Set([
+  'expansion', // ${var:-x} — value substitution
+  'simple_expansion', // $var — value not resolvable statically
+  'if_statement',
+  'while_statement',
+  'for_statement',
+  'case_statement',
+  'subshell', // ( cmd ) — inner commands still scanned for hard shapes
+  'compound_statement', // { cmd; }
+  'negated_command', // ! cmd
+  'test_command', // [[ ]] / [ ]
+  'test_operator',
+]);
+
 // Hard refuses by command name. §13 reject list from
 // TREE_SITTER_SHELL.md §7 + §13. mkfs.* matches every filesystem
 // variant via prefix.
@@ -507,6 +554,191 @@ const cmdReadWithSize: CommandResolver = (_positional, tokens, ctx) => {
     capabilities: positional.map((p) => readFs(resolveArg(p, ctx))),
     confidence: 'high',
   };
+};
+
+// `sort` is a read-only filter EXCEPT that it can WRITE and EXEC:
+//   - `-o FILE` / `--output=FILE` redirects the sorted result to FILE
+//     (GNU sort --help), across all four getopt shapes.
+//   - `-T DIR` / `--temporary-directory=DIR` writes transient temp files
+//     under DIR (`sort -T /etc big` writes into /etc).
+//   - `--compress-program=PROG` runs PROG to (de)compress temp files —
+//     arbitrary command execution, the same class as tar
+//     `--use-compress-program` / `--to-command`.
+// Registered to plain cmdRead, the `-o` target was emitted as a READ
+// (space/short forms) or vanished entirely (`--output=` combined form):
+// §11 write escalation/denial, sandbox planning, and operator policy
+// all saw a read-only command while the process wrote FILE —
+// `sort -o /etc/hosts in` walked past the /etc escalate tier, and
+// `sort --compress-program=/tmp/x big` was an unguarded exec. Emit
+// write-fs for the output target, read-fs for the inputs, and refuse the
+// compress-program exec vector. `sort` is also removed from
+// isReadOnlyCommand so the per-arg §11 loop treats its operands as
+// writes (defense in depth — see the loop in analyzeCommand).
+// sort also READS files via flags: `--files0-from=F` reads the NUL-
+// separated input-file list from F, and `--random-source=F` reads random
+// bytes from F (for `-R`). Each opens F — `sort --files0-from=.env` leaks
+// .env lines through filename errors — so emit read-fs for F too, not just
+// the cwd baseline (`-` = stdin, filtered). The set below is every sort
+// flag that takes an operand, stripped from the positional input split
+// regardless of its read/write/exec disposition.
+const SORT_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  '-o',
+  '--output',
+  '-T',
+  '--temporary-directory',
+  '--files0-from',
+  '--random-source',
+]);
+
+const cmdSort: CommandResolver = (_positional, tokens, ctx) => {
+  if (tokens.some((t) => t === '--compress-program' || t.startsWith('--compress-program='))) {
+    return {
+      refuse: 'sort: --compress-program runs an arbitrary program — refusing static analysis',
+    };
+  }
+  const writeTargets = [
+    ...extractValueFlag(tokens, { longForm: '--output', shortForm: '-o' }),
+    ...extractValueFlag(tokens, { longForm: '--temporary-directory', shortForm: '-T' }),
+  ].filter((v) => v !== '-');
+  // Flags whose value is a FILE sort READS (input-name manifest / random
+  // source) — distinct from the positional inputs, both forms of each.
+  const readTargets = [
+    ...extractValueFlag(tokens, { longForm: '--files0-from' }),
+    ...extractValueFlag(tokens, { longForm: '--random-source' }),
+  ].filter((v) => v !== '-');
+  const inputs = stripFlags(tokens, SORT_VALUE_FLAGS).filter((v) => v !== '-');
+  const caps = [
+    ...inputs.map((p) => readFs(resolveArg(p, ctx))),
+    ...readTargets.map((p) => readFs(resolveArg(p, ctx))),
+    ...writeTargets.map((p) => writeFs(resolveArg(p, ctx))),
+  ];
+  // Pure stdin→stdout (`cat x | sort`): record a cwd read like cmdRead.
+  if (caps.length === 0) caps.push(readFs(ctx.cwd));
+  return { capabilities: caps, confidence: 'high' };
+};
+
+// GNU `uniq [INPUT [OUTPUT]]`: the FIRST positional is read, the SECOND
+// is WRITTEN (uniq --help). Same misclassification as sort under plain
+// cmdRead — the output operand was emitted as a read, so `uniq in
+// /etc/cron.d/x` wrote a protected path while §11 saw only reads. Value
+// flags (`-f`/`-s`/`-w` = skip-fields/-chars/check-chars) are stripped
+// so their numeric operands don't pollute the positional split. Removed
+// from isReadOnlyCommand alongside sort.
+const UNIQ_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  '-f',
+  '--skip-fields',
+  '-s',
+  '--skip-chars',
+  '-w',
+  '--check-chars',
+]);
+
+const cmdUniq: CommandResolver = (_positional, tokens, ctx) => {
+  const operands = stripFlags(tokens, UNIQ_VALUE_FLAGS);
+  const input = operands[0];
+  const output = operands[1];
+  const caps: Capability[] = [];
+  if (input === undefined || input === '-') caps.push(readFs(ctx.cwd));
+  else caps.push(readFs(resolveArg(input, ctx)));
+  if (output !== undefined && output !== '-') caps.push(writeFs(resolveArg(output, ctx)));
+  return { capabilities: caps, confidence: 'high' };
+};
+
+// `tree` lists directories (read) EXCEPT it can WRITE its output: `-o FILE`
+// sends the listing to FILE (tree(1)), and `-R` together with `-H` writes
+// a 00Tree.html into each traversed directory. Registered to plain cmdRead,
+// the `-o` target was emitted as a READ and isReadOnlyCommand made the §11
+// loop classify it read too — `tree -o /etc/cron.d/x .` walked past the
+// write-escalate tier with no write-fs cap. Emit write-fs for the output
+// FILE (and, under `-R -H`, for each listed dir) and read-fs for the listed
+// dirs. Value flags that take an operand (`-L`/`-P`/`-I`/`-H`/`-T`/`-o`)
+// are stripped so they don't pollute the listed-dir split. `tree` is also
+// removed from isReadOnlyCommand so the per-arg §11 loop treats its
+// operands as writes (defense in depth), same posture as cmdSort.
+const TREE_VALUE_FLAGS: ReadonlySet<string> = new Set(['-o', '-L', '-P', '-I', '-H', '-T']);
+
+// True when a short flag char is present standalone (`-R`) OR bundled in a
+// combined short-option cluster (`-RH`, `-HR`). Long options (`--reverse`)
+// and non-option tokens are skipped. Conservative: a value char bundled
+// after a value-taking short (`-Hbase`) may over-match, which only widens
+// write attribution — the safe side.
+const hasShortFlagChar = (tokens: readonly string[], ch: string): boolean =>
+  tokens.some((t) => t.length >= 2 && t[0] === '-' && t[1] !== '-' && t.slice(1).includes(ch));
+
+const cmdTree: CommandResolver = (_positional, tokens, ctx) => {
+  const writeTargets = extractValueFlag(tokens, { shortForm: '-o' }).filter((v) => v !== '-');
+  const dirs = stripFlags(tokens, TREE_VALUE_FLAGS);
+  const listed = dirs.length > 0 ? dirs : [ctx.cwd];
+  const caps: Capability[] = [
+    ...listed.map((p) => readFs(resolveArg(p, ctx))),
+    ...writeTargets.map((p) => writeFs(resolveArg(p, ctx))),
+  ];
+  // `-R` + `-H` writes a 00Tree.html into each traversed directory. Detect
+  // both flags whether standalone (`-R -H`) or bundled in a combined
+  // short-option cluster (`tree -RH …`, `tree -HR …`) — keying on the exact
+  // `-R` token alone missed the combined forms, so a protected-dir write
+  // emitted only read caps and (under mode:bypass) skipped the §11 floor.
+  if (hasShortFlagChar(tokens, 'R') && hasShortFlagChar(tokens, 'H')) {
+    caps.push(...listed.map((p) => writeFs(resolveArg(p, ctx))));
+  }
+  return { capabilities: caps, confidence: 'high' };
+};
+
+// `du` summarizes disk usage (read-only) but two flags take a FILE it
+// READS: `--files0-from=F` (NUL-separated path list — du then reads the
+// paths in F) and `--exclude-from=FILE` / `-X FILE` (a pattern file).
+// Under plain cmdRead the combined `=` forms were dropped by stripFlags,
+// so `du --files0-from=.env` resolved to only the cwd baseline — the §8.4
+// sensitive-path floor never saw the manifest read. Emit read-fs for those
+// FILE values (both getopt forms; `-` = stdin, filtered) and for the path
+// operands; strip du's operand-taking flags so their values don't pollute
+// the path split. du stays in isReadOnlyCommand — it never writes, so the
+// per-arg §11 loop's read classification is correct.
+const DU_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  '--files0-from',
+  '--exclude-from',
+  '-X',
+  '--exclude',
+  '-d',
+  '--max-depth',
+  '-t',
+  '--threshold',
+  '-B',
+  '--block-size',
+]);
+
+const cmdDu: CommandResolver = (_positional, tokens, ctx) => {
+  const readTargets = [
+    ...extractValueFlag(tokens, { longForm: '--files0-from' }),
+    ...extractValueFlag(tokens, { longForm: '--exclude-from', shortForm: '-X' }),
+  ].filter((v) => v !== '-');
+  const inputs = stripFlags(tokens, DU_VALUE_FLAGS).filter((v) => v !== '-');
+  const caps = [
+    ...inputs.map((p) => readFs(resolveArg(p, ctx))),
+    ...readTargets.map((p) => readFs(resolveArg(p, ctx))),
+  ];
+  if (caps.length === 0) caps.push(readFs(ctx.cwd)); // bare `du` summarizes cwd
+  return { capabilities: caps, confidence: 'high' };
+};
+
+// `wc` is read-only too, with the same `--files0-from=F` manifest-read flag
+// as sort/du (GNU coreutils): F is read, so `wc --files0-from=.env` must
+// surface read-fs:F, not just the cwd baseline. (`--total=WHEN` takes an
+// enum value, stripped so it can't pollute the path split; wc has no
+// pattern-file flag.) Stays in isReadOnlyCommand — wc never writes.
+const WC_VALUE_FLAGS: ReadonlySet<string> = new Set(['--files0-from', '--total']);
+
+const cmdWc: CommandResolver = (_positional, tokens, ctx) => {
+  const readTargets = extractValueFlag(tokens, { longForm: '--files0-from' }).filter(
+    (v) => v !== '-',
+  );
+  const inputs = stripFlags(tokens, WC_VALUE_FLAGS).filter((v) => v !== '-');
+  const caps = [
+    ...inputs.map((p) => readFs(resolveArg(p, ctx))),
+    ...readTargets.map((p) => readFs(resolveArg(p, ctx))),
+  ];
+  if (caps.length === 0) caps.push(readFs(ctx.cwd)); // bare `wc` reads stdin
+  return { capabilities: caps, confidence: 'high' };
 };
 
 // Pure-output writers (echo / printf). They emit their arguments
@@ -1566,6 +1798,30 @@ const cmdEnv: CommandResolver = (positional) => {
   return { capabilities: [readFs('/etc')], confidence: 'high' };
 };
 
+// Command launchers (`nice`, `nohup`, `setsid`, `timeout`, `stdbuf`,
+// `ionice`, `taskset`, `chrt`, `setarch`, `flock`, `watch`): each runs a
+// COMMAND supplied in its argv. Same laundering posture as `env` — the
+// resolver sees the launcher, not the wrapped command, so the per-command
+// refuse checks (sh/bash hard-refuse, rm system-roots, dd, sudo, …) never
+// run on what actually executes. Without this they were a registry miss →
+// Conservative `exec:arbitrary`, which `mode: bypass` auto-allows: so
+// `nohup rm -rf /`, `nice dd …`, `timeout 5 sh -c …` all slipped a refuse
+// that the bare command hits. Refuse any positional usage (run the wrapped
+// tool directly); bare usage with no command (e.g. `nice` printing the
+// current niceness) carries no exec and passes. Curated list — an obscure
+// launcher not here still falls to the normal Conservative path; these
+// cover the common, well-known vectors. `env` keeps its own resolver
+// (it also reads /etc on the bare form).
+const cmdLauncher: CommandResolver = (positional) => {
+  if (positional.length > 0) {
+    return {
+      refuse:
+        'command launcher: positional usage execs the wrapped command, laundering exec attribution past the per-command refuse checks — run the wrapped tool directly',
+    };
+  }
+  return { capabilities: [], confidence: 'high' };
+};
+
 // Filesystem-mutating utilities that create or touch a target.
 // mkdir / touch / ln / mktemp: positional args are the targets.
 // Each takes its own set of value-flags whose operand is NOT a
@@ -2537,10 +2793,39 @@ const COMMAND_TABLE: ReadonlyMap<string, CommandResolver> = new Map<string, Comm
   ['cat', cmdRead],
   ['head', cmdReadWithSize],
   ['tail', cmdReadWithSize],
-  ['wc', cmdRead],
+  ['wc', cmdWc],
   ['file', cmdRead],
   ['stat', cmdRead],
   ['pwd', cmdRead],
+  // Read-only text / metadata filters (PERMISSION_ENGINE.md §5.2). Same
+  // class as cat/wc: read path args (if any), write stdout, no exec, no
+  // fs mutation. All map to `cmdRead` — which over-declares a read for
+  // every positional (conservative: a non-file arg like a `tr` set or a
+  // `jq` filter resolves to a harmless in-cwd read, never an
+  // under-declaration). Registered so they resolve cleanly instead of
+  // hitting the Conservative registry-miss path on every use. Excluded
+  // by design: `sed` (-i / w writes), `awk` (system()/redirect), `xargs`
+  // (exec), pagers `less`/`more` (!cmd shell-out) — those stay off the
+  // registry and route to Conservative → confirm.
+  ['sort', cmdSort],
+  ['uniq', cmdUniq],
+  ['cut', cmdRead],
+  ['comm', cmdRead],
+  ['paste', cmdRead],
+  ['tr', cmdRead],
+  ['nl', cmdRead],
+  ['tac', cmdRead],
+  ['rev', cmdRead],
+  ['fold', cmdRead],
+  ['column', cmdRead],
+  ['diff', cmdRead],
+  ['cmp', cmdRead],
+  ['jq', cmdRead],
+  ['du', cmdDu],
+  ['df', cmdRead],
+  ['tree', cmdTree],
+  ['basename', cmdRead],
+  ['dirname', cmdRead],
   ['echo', cmdEcho],
   ['printf', cmdEcho],
   ['grep', cmdGrep],
@@ -2606,6 +2891,21 @@ const COMMAND_TABLE: ReadonlyMap<string, CommandResolver> = new Map<string, Comm
   // cmdSysInfo, which laundered exec attribution for
   // `env <prog> [args]` shapes.
   ['env', cmdEnv],
+  // Command launchers — refuse positional usage so they can't launder a
+  // wrapped command (sh -c, rm -rf /, dd, sudo, …) past its per-command
+  // refuse, which under mode:bypass would otherwise auto-allow. See
+  // cmdLauncher.
+  ['nice', cmdLauncher],
+  ['nohup', cmdLauncher],
+  ['setsid', cmdLauncher],
+  ['timeout', cmdLauncher],
+  ['stdbuf', cmdLauncher],
+  ['ionice', cmdLauncher],
+  ['taskset', cmdLauncher],
+  ['chrt', cmdLauncher],
+  ['setarch', cmdLauncher],
+  ['flock', cmdLauncher],
+  ['watch', cmdLauncher],
   // printenv reads its own environ, not /etc — slice 152 moves
   // it to cmdSysInfoNoEtc to match its actual surface.
   ['printenv', cmdSysInfoNoEtc],
@@ -2633,6 +2933,13 @@ interface CommandShape {
   name: string;
   args: string[];
   redirects: RedirectShape[];
+  // Indices into `args` of operands the walk couldn't fold to a literal
+  // because they carry a shell expansion (`$HOME/.ssh/id_rsa`, `"$dir/x"`).
+  // The raw text is kept IN `args` at its original position so positional
+  // handlers (grep pattern/file, uniq in/out) slot the literals correctly;
+  // analyzeCommand expands the shell vars it knows for these indices before
+  // classifying and dispatching. Absent when there were no dynamic operands.
+  dynamicArgIndices?: number[];
 }
 
 interface RedirectShape {
@@ -2713,8 +3020,17 @@ const containsUnicodeBypass = (text: string): boolean => {
 // string arg` — same refuse semantics as embedded substitution.
 const literalText = (node: Node): string | null => {
   let raw: string;
-  if (node.type === 'word' || node.type === 'raw_string') {
+  if (node.type === 'word') {
     raw = node.text;
+  } else if (node.type === 'raw_string') {
+    // raw_string is always `'...'`; bash's quote removal yields the inner
+    // literal. Pre-fix we returned the bytes WITH the quotes, so `'eval'`
+    // resolved to the command name `'eval'` (≠ `eval`) and slipped past
+    // isHardRefuseCommand / SHELL_INTERPRETERS — a quote-laundering
+    // bypass once a registry miss stopped being a hard refuse. Strip the
+    // surrounding single-quotes to match bash (the `string` branch below
+    // already strips its quotes).
+    raw = node.text.replace(/^'/, '').replace(/'$/, '');
   } else if (node.type === 'number') {
     // Tree-sitter-bash tokenizes numeric literals as their own
     // node-kind (`-p 2222`, `-maxdepth 3`). Treating them as
@@ -2748,6 +3064,14 @@ const literalText = (node: Node): string | null => {
   return raw;
 };
 
+// Strip shell quoting/escaping (`'`, `"`, `\`) from a command/interpreter
+// NAME so the hard-refuse + pipe-to-shell checks see bash's effective
+// name: `'eval'` / `ev''al` / `\eval` / `s'h'` all reduce to the bare
+// token bash runs. Over-matches at worst (refuses an exotic literal),
+// never under-matches a laundered eval/dd/sudo/sh. One source of truth
+// shared by analyzeCommand + detectPipeToShell.
+const stripShellQuoting = (name: string): string => name.replace(/['"\\]/g, '');
+
 // Map a `file_redirect` node's operator + target into a RedirectShape.
 // Returns null on shapes the resolver can't normalize.
 const redirectShape = (node: Node): RedirectShape | null => {
@@ -2776,6 +3100,30 @@ interface WalkResult {
   // as one bash invocation.
   commands?: CommandShape[];
   refuse?: string;
+  // True when the walk passed through any soft-unmodeled shape (control
+  // flow, grouping, value expansion, a dynamic command ARG). Soft shapes
+  // are RECURSED (not short-circuited): the inner commands are still
+  // collected into `commands` and run through analyzeCommand, and the
+  // resolver routes the whole call to Conservative (confirm) when `soft`
+  // is set and no inner command hard-refused. A HARD construct or a
+  // dynamic command NAME anywhere still produces `refuse` regardless of
+  // `soft`. See `bashResolver`.
+  soft?: boolean;
+  // The first soft-unmodeled reason encountered (e.g. `for_statement:
+  // control flow not modeled`). Carried into the Conservative reason so
+  // the modal/audit name the construct, not just "unmodeled shape".
+  softReason?: string;
+  // Redirects on a `redirected_statement` that had NO command to attach
+  // to (`[[ -e x ]] > f`, bare `> f`). The resolver classifies these
+  // separately — a deny-tier target still refuses — because
+  // analyzeCommand never sees a redirect that isn't on a CommandShape.
+  orphanRedirects?: RedirectShape[];
+  // Raw text of the words in a `for VAR in <words>` list. These bind the
+  // loop variable, and the body's use of `$VAR` isn't tracked, so the
+  // words are the only place a deny/sensitive loop SOURCE is visible
+  // (`for f in /proc/1/environ; do cat "$f"; done`). bashResolver
+  // classifies them as read operands — deny refuses, sensitive rides a cap.
+  loopWords?: string[];
 }
 
 // Recursion depth ceiling for `walkAst` (slice 98, R2 #198). A
@@ -2795,7 +3143,29 @@ const MAX_AST_DEPTH = 64;
 // `command` nodes into shapes.
 const walkAst = (root: Node): WalkResult => {
   const commands: CommandShape[] = [];
-  const visit = (node: Node, depth: number): string | null => {
+  // Redirects on a redirected_statement that consumed no command (see
+  // WalkResult.orphanRedirects) — classified by the resolver, not here.
+  const orphanRedirects: RedirectShape[] = [];
+  // `for VAR in <words>` item list — classified by the resolver (it has
+  // ctx), since the body's `$VAR` use can't be tracked here.
+  const loopWords: string[] = [];
+  // Set when the walk passes through any soft-unmodeled shape (control
+  // flow, grouping, value expansion, a dynamic command ARG). Unlike a
+  // HARD refuse (which short-circuits the walk), soft shapes are
+  // RECURSED so the inner commands are still collected into `commands`
+  // and the resolver can run every one through analyzeCommand. The whole
+  // call then routes to Conservative (confirm) when `sawSoft` is set and
+  // nothing hard-refused.
+  let sawSoft = false;
+  // First soft-unmodeled reason seen — carried into the Conservative
+  // reason so the modal/audit name the construct.
+  let softReason: string | null = null;
+  // `softCtx` is true once we are INSIDE a soft-unmodeled node: there,
+  // non-whitelisted STRUCTURAL nodes (do_group, case_item, `[[ ]]`
+  // expression internals) are tolerated (recursed) rather than refused,
+  // so the walk can reach the inner commands. HARD red-flag nodes and
+  // dynamic command NAMES still refuse regardless of context.
+  const visit = (node: Node, depth: number, softCtx: boolean): string | null => {
     if (depth > MAX_AST_DEPTH) {
       return `bash_shape_not_recognized: ast_depth_exceeded (>${MAX_AST_DEPTH})`;
     }
@@ -2803,17 +3173,72 @@ const walkAst = (root: Node): WalkResult => {
     // (e.g. expansion that happens to be enumerated in whitelist).
     const redFlag = RED_FLAG_NODES.get(node.type);
     if (redFlag !== undefined) {
+      if (SOFT_UNMODELED_NODES.has(node.type)) {
+        // Soft (control flow, value expansion): not inherently
+        // dangerous. Mark soft and DESCEND (don't short-circuit) so the
+        // inner commands are collected + analyzed and any inner HARD
+        // construct is still caught. This is what lets
+        // `for f in *.ts; do cat "$f"; done` confirm while
+        // `for x in *; do rm -rf /; done` still denies (the inner rm
+        // hard-refuses in analyzeCommand).
+        sawSoft = true;
+        softReason ??= redFlag;
+        // Collect the `for VAR in <words>` item list. The words bind the
+        // loop variable; the body's `$VAR` use isn't tracked, so this is
+        // the only place a deny/sensitive loop source (`for f in
+        // /proc/1/environ`) is visible. Raw text — bashResolver expands +
+        // classifies. Tokens before `in` (the var) and the do-body are
+        // excluded; punctuation is skipped. A dynamic source (`for f in
+        // $LIST`) is collected too but resolves to a harmless cwd path.
+        if (node.type === 'for_statement') {
+          let afterIn = false;
+          for (const c of node.children) {
+            if (c === null) continue;
+            if (c.type === 'do_group') break;
+            if (c.type === 'in') {
+              afterIn = true;
+              continue;
+            }
+            if (afterIn && !isPunctuationType(c.type)) loopWords.push(c.text);
+          }
+        }
+        for (const child of node.children) {
+          if (child === null) continue;
+          const refuse = visit(child, depth + 1, true);
+          if (refuse !== null) return refuse;
+        }
+        return null;
+      }
+      // HARD red-flag (command/process substitution, function def,
+      // `VAR=val` prefix, arithmetic, heredoc/herestring, ansi-c,
+      // subscript) → pre-policy refuse, in any context.
       return `bash_shape_not_recognized: ${redFlag}`;
     }
     // Skip ERROR nodes — tree-sitter recovers from parse errors and
     // emits ERROR placeholders. Anything error-recovered is by
-    // definition outside the whitelist.
+    // definition outside the whitelist. Hard refuse regardless of
+    // context (adversarial breakage, §12.4).
     if (node.type === 'ERROR' || node.isError) {
       return `bash_shape_not_recognized: parse_error at ${node.startPosition.row}:${node.startPosition.column}`;
     }
     if (isPunctuationType(node.type)) return null;
     if (!WHITELIST_NODE_TYPES.has(node.type)) {
-      return `bash_shape_not_recognized: ${node.type}`;
+      // Top level (strict): an unknown shape is a hard refuse (closed
+      // whitelist). Inside a soft construct: tolerate the structural
+      // node (do_group, `[[ ]]` internals, case_item, …) and recurse —
+      // inner HARD nodes and commands are still validated/collected
+      // below. Mark soft so the whole call routes to Conservative.
+      if (!softCtx) {
+        return `bash_shape_not_recognized: ${node.type}`;
+      }
+      sawSoft = true;
+      softReason ??= `unsupported_shape: ${node.type}`;
+      for (const child of node.children) {
+        if (child === null) continue;
+        const refuse = visit(child, depth + 1, true);
+        if (refuse !== null) return refuse;
+      }
+      return null;
     }
     // Decompose `command` nodes into shapes.
     if (node.type === 'command') {
@@ -2828,6 +3253,10 @@ const walkAst = (root: Node): WalkResult => {
           }
           const text = literalText(inner);
           if (text === null) {
+            // Dynamic command NAME ($X, ${!ref}, $(...)-derived): the
+            // resolver cannot know which binary runs → HARD refuse, even
+            // inside a soft construct. This is the spec's HARD tier and
+            // the reason `for x in *; do $x; done` denies.
             return `bash_shape_not_recognized: dynamic command_name (${inner.type})`;
           }
           shape.name = text;
@@ -2840,18 +3269,45 @@ const walkAst = (root: Node): WalkResult => {
         ) {
           const text = literalText(child);
           if (text === null) {
-            return 'bash_shape_not_recognized: dynamic content inside string arg';
+            // A Unicode-disguise arg (RTL override, BOM, zero-width) is
+            // adversarial — keep it a HARD refuse; the resolver can't
+            // trust the visual form. Distinct from a benign dynamic value
+            // like "$f", which is soft → confirm.
+            if (containsUnicodeBypass(child.text)) {
+              return 'bash_shape_not_recognized: unicode bypass in arg';
+            }
+            // Dynamic ARG value (e.g. "$f"). Unlike a dynamic NAME this
+            // isn't categorically dangerous — the command is known. Mark
+            // soft, DESCEND to catch any HARD construct hiding inside the
+            // arg (e.g. "$(evil)"), then KEEP the raw text IN args at its
+            // position (recording the index) so analyzeCommand can resolve
+            // the shell vars it knows. Dropping it left `cat $HOME/.ssh/
+            // id_rsa` resolving to read-fs:<cwd>; pulling it out of args
+            // shifted positional handlers (grep pattern/file, uniq in/out)
+            // onto the wrong slots. Both slipped the bypass §8.4/§11 floor.
+            sawSoft = true;
+            softReason ??= 'dynamic value in arg';
+            const refuse = visit(child, depth + 1, softCtx);
+            if (refuse !== null) return refuse;
+            if (shape.dynamicArgIndices === undefined) shape.dynamicArgIndices = [];
+            shape.dynamicArgIndices.push(shape.args.length);
+            shape.args.push(child.text);
+            continue;
           }
           shape.args.push(text);
         } else if (child.type === 'file_redirect') {
           const r = redirectShape(child);
           if (r === null) {
+            // Non-literal redirect target: kept a HARD refuse (a
+            // runtime-computed write destination the resolver can't
+            // classify) — unchanged from prior behavior.
             return 'bash_shape_not_recognized: redirect target is non-literal';
           }
           shape.redirects.push(r);
         } else if (!isPunctuationType(child.type)) {
-          // Recurse into red-flag check / unknown.
-          const refuse = visit(child, depth + 1);
+          // Recurse into red-flag check / unknown (e.g. a bare
+          // `simple_expansion` arg → soft).
+          const refuse = visit(child, depth + 1, softCtx);
           if (refuse !== null) return refuse;
         }
       }
@@ -2870,7 +3326,7 @@ const walkAst = (root: Node): WalkResult => {
       const before = commands.length;
       for (const child of node.children) {
         if (child === null) continue;
-        const refuse = visit(child, depth + 1);
+        const refuse = visit(child, depth + 1, softCtx);
         if (refuse !== null) return refuse;
       }
       // Merge any file_redirects that appeared as siblings into the
@@ -2888,6 +3344,17 @@ const walkAst = (root: Node): WalkResult => {
             }
           }
         }
+      } else {
+        // No command consumed this statement's redirect (`[[ -e x ]] > f`,
+        // bare `> f`). Collect the targets as orphans so the resolver
+        // still classifies them — a deny-tier redirect with no command
+        // must refuse, not slip through as a no-command Conservative.
+        for (const child of node.children) {
+          if (child !== null && child.type === 'file_redirect') {
+            const r = redirectShape(child);
+            if (r !== null) orphanRedirects.push(r);
+          }
+        }
       }
       return null;
     }
@@ -2895,20 +3362,72 @@ const walkAst = (root: Node): WalkResult => {
     // recurse into children — the walk validates each level.
     for (const child of node.children) {
       if (child === null) continue;
-      const refuse = visit(child, depth + 1);
+      const refuse = visit(child, depth + 1, softCtx);
       if (refuse !== null) return refuse;
     }
     return null;
   };
 
-  const refuse = visit(root, 0);
+  const refuse = visit(root, 0, false);
   if (refuse !== null) return { refuse };
-  return { commands };
+  return {
+    commands,
+    soft: sawSoft,
+    ...(softReason !== null ? { softReason } : {}),
+    ...(orphanRedirects.length > 0 ? { orphanRedirects } : {}),
+    ...(loopWords.length > 0 ? { loopWords } : {}),
+  };
 };
 
 // Detect pipe-to-shell on a `pipeline` node. Returns the offending
 // stage name when found.
 //
+// A pipe/xargs target resolves to a shell or interpreter when its
+// BASENAME — after quote removal — is in SHELL_INTERPRETERS. Keying on
+// the raw token let path-qualified launchers slip through: `... | xargs
+// /bin/sh -c '<arg>'` and `... | xargs /usr/bin/python -c '<arg>'` left
+// xargs an unregistered Conservative command that `mode: bypass` then
+// auto-allows, executing the inner script. basename(stripShellQuoting())
+// folds `/bin/sh`, `'/bin/sh'`, `/bin/'sh'`, `\sh` all down to `sh` —
+// the same normalization analyzeCommand applies to command names.
+const resolvesToInterpreter = (token: string): boolean =>
+  SHELL_INTERPRETERS.has(token) || SHELL_INTERPRETERS.has(basename(stripShellQuoting(token)));
+
+// Commands that EXECUTE another command supplied in their argv, reading
+// more operands from stdin / a file / `:::` lists (`xargs [OPTS] COMMAND
+// [ARGS]`; GNU `parallel` similar, wrapping each job in a shell). The
+// resolver sees the runner, not the wrapped command, so that command's
+// per-command refuse checks (sh/bash hard-refuse, rm system-roots, dd,
+// sudo, …) never run on what actually executes. analyzeCommand refuses ANY
+// positional usage of these (a wrapped command is present), not just an
+// embedded interpreter — `xargs rm -rf /` laundered the rm system-root
+// refuse exactly like `xargs sh -c …` laundered the shell refuse: both
+// were a registry-miss Conservative (exec:arbitrary) that mode:bypass
+// auto-allows. Bare `xargs`/`parallel` with no command carries no exec and
+// falls through to the normal path. (detectPipeToShell still catches the
+// pipeline interpreter shape early with a pipe-to-shell reason.)
+const EXEC_RUNNER_COMMANDS: ReadonlySet<string> = new Set(['xargs', 'parallel']);
+
+// Bash runs a command name WITHOUT a slash via a PATH search (the
+// operator's trusted environment) and a name WITH a slash as that EXACT
+// pathname — no PATH lookup. So a slash-qualified name is the trusted
+// system binary ONLY when it sits directly in a canonical system bindir;
+// `./cat`, `/tmp/ls`, `bin/x`, and non-canonical `/bin/../tmp/x` (whose
+// dirname isn't a bindir) are untrusted local executables. Used to decide
+// whether collapsing a launcher to its basename is safe for the
+// TRUST-side classifications (handler / read-only / pure-output); the
+// REFUSE-side (hard-refuse, exec-runner) always uses the basename, since
+// over-refusing a local binary that shares a dangerous name is harmless.
+const TRUSTED_BINDIRS: ReadonlySet<string> = new Set([
+  '/bin',
+  '/usr/bin',
+  '/usr/local/bin',
+  '/sbin',
+  '/usr/sbin',
+]);
+const isTrustedCommandPath = (cmd: string): boolean =>
+  !cmd.includes('/') || TRUSTED_BINDIRS.has(dirname(cmd));
+
 // Slice 147 (review R1): added xargs-to-interpreter detection.
 // `... | xargs sh -c '<arg>'` is the canonical xargs-as-exec
 // pattern: xargs reads stdin lines and passes each as positional
@@ -2931,7 +3450,12 @@ const detectPipeToShell = (root: Node): string | null => {
 
     // Direct pipe-to-interpreter: last stage IS a known
     // stdin-reading interpreter (`sh`, `bash`, `python`, `node`, etc.).
-    if (SHELL_INTERPRETERS.has(text)) return text;
+    // Check the quote/escape-stripped form too (`s'h'` → sh, `\sh` → sh)
+    // to match bash's quote removal — literalText handles raw_string
+    // quotes; this covers backslash + residual laundering.
+    if (resolvesToInterpreter(text)) {
+      return text;
+    }
 
     // xargs-wrapped exec: `... | xargs sh -c '<arg>'`,
     // `... | xargs python -c '<arg>'`, etc. xargs's positional
@@ -2947,7 +3471,7 @@ const detectPipeToShell = (root: Node): string | null => {
       for (const child of argChildren) {
         if (child === null || child === undefined) continue;
         const argText = literalText(child) ?? child.text;
-        if (SHELL_INTERPRETERS.has(argText)) {
+        if (resolvesToInterpreter(argText)) {
           return `xargs ${argText}`;
         }
       }
@@ -2971,6 +3495,29 @@ const isReadOnlyCommand = (name: string): boolean => {
     case 'grep':
     case 'rg':
     case 'find':
+    // Read-only filters (registry expansion, PERMISSION_ENGINE.md §5.2).
+    // Classified read-only so their path args resolve as `read` (not
+    // `write`) in the protected-path loop — same posture as cat/wc.
+    // `sort`, `uniq`, and `tree` are deliberately EXCLUDED: each can write
+    // a file (`sort -o`, `uniq INPUT OUTPUT`, `tree -o` / `-R -H`), so they
+    // carry dedicated handlers and must let the per-arg loop treat their
+    // operands as writes.
+    case 'cut':
+    case 'comm':
+    case 'paste':
+    case 'tr':
+    case 'nl':
+    case 'tac':
+    case 'rev':
+    case 'fold':
+    case 'column':
+    case 'diff':
+    case 'cmp':
+    case 'jq':
+    case 'du':
+    case 'df':
+    case 'basename':
+    case 'dirname':
       return true;
     default:
       return false;
@@ -3171,11 +3718,28 @@ const couldGlobReachProtected = (
   absLiteralPrefix: string,
   targets: ReturnType<typeof protectedTargets>,
 ): boolean => {
+  // Removable-media carve-out (mirrors SYSTEM_DENY_EXCEPTIONS, glob
+  // subset). A literal prefix under `/run/media/<user>/<volume>` is a
+  // mounted user filesystem — no protected target is reachable by
+  // expansion from there. The `systemDeny` scan below consumes the RAW
+  // `/run` root, so without this guard every glob run from a repo on
+  // removable media is refused (the literal prefix resolves under
+  // `/run/`). `/run/user` is deliberately NOT carved out — see
+  // `isGlobSafeRunCarveout`: a glob there could expand into XDG IPC
+  // sockets, so it stays conservatively refused.
+  if (isGlobSafeRunCarveout(absLiteralPrefix)) return false;
   const all: string[] = [
     ...targets.systemDeny,
     ...targets.absoluteEscalate,
     ...targets.tildeEscalateFiles,
     ...targets.tildeEscalateDirs,
+    // cwd-escalate dirs (`.git` / `.agent` / `.claude`) were omitted, so a
+    // glob expanding into them (`rm .g*`, `for f in .*` from a repo cwd)
+    // slipped the protected-glob refuse. They are write-escalate targets
+    // like the tilde dirs; include them so a glob that could reach them is
+    // refused too (a literal read still passes — escalate is write-only —
+    // but a glob into the zone is held conservative, as for /etc and ~).
+    ...targets.cwdEscalateDirs,
   ];
   // Normalize: a literal-prefix that ends in `/` is "in a parent
   // directory; glob fills in the next segment". A literal-prefix
@@ -3219,6 +3783,20 @@ const couldGlobReachProtected = (
     }
   }
   return false;
+};
+
+// Resolve a glob's literal prefix to an absolute path for the
+// couldGlobReachProtected check. A bare leading dot right before the glob
+// (`.*` → literalPrefix `.`; `~/.* ` → `~/.`; `sub/.* ` → `sub/.`) matches
+// DOTFILES in the dir — but path.resolve treats a trailing `.` segment as
+// "current directory" and drops it, so `for f in .*` from $HOME resolved
+// to `$HOME` and couldGlobReachProtected saw `$HOME/.ssh` as an unreachable
+// SUBDIR (`rest` `/.ssh` starts with `/`). Reconstruct `<dir>/.` so the
+// existing filename-completion branch matches (`$HOME/.` + `ssh`), catching
+// dot-glob loop sources / args that expand into `~/.ssh`, `~/.aws`, etc.
+const resolveGlobPrefix = (literalPrefix: string, ctx: ResolverContext): string => {
+  const abs = resolvePath(ctx.cwd, expandTilde(literalPrefix, ctx.home));
+  return literalPrefix === '.' || literalPrefix.endsWith('/.') ? `${abs}/.` : abs;
 };
 
 // Slice 176 (review — command-bypass P0 #5). Lexical-only
@@ -3438,13 +4016,118 @@ const detectCwdScopeEscape = (lexicalAbs: string, ctx: ResolverContext): boolean
   return lexicalInside && !canonicalInside;
 };
 
+// Classify a set of redirect targets, independent of the command they
+// attach to (or no command at all). A redirect to a deny-tier path
+// (`/proc`, `/dev/sda`, ...) is refused for ANY command — known,
+// registry-miss, or none — and the read-fs/write-fs cap is emitted so
+// the engine's §11 / bypass-mode protected-path floors (which scan
+// resolved capabilities) can see it. Returns `{refuse}` or the caps plus
+// an `escalated` flag (escalate-tier target / cwd-scope escape → force
+// confirm). Hoisted out of analyzeCommand so the registry-miss and
+// no-command paths classify redirects too.
+const classifyRedirects = (
+  redirects: readonly RedirectShape[],
+  ctx: ResolverContext,
+): { refuse: string } | { caps: Capability[]; escalated: boolean } => {
+  const caps: Capability[] = [];
+  let escalated = false;
+  for (const r of redirects) {
+    if (r.kind === 'out' || r.kind === 'append' || r.kind === 'both' || r.kind === 'force-out') {
+      const tgtAbs = resolvePath(ctx.cwd, expandTilde(r.target, ctx.home));
+      const tier = classifyArgWithCanonical(tgtAbs, 'write', ctx);
+      if (tier === 'deny') {
+        return { refuse: `bash: redirect target '${r.target}' is in protected zone (deny tier)` };
+      }
+      if (tier === 'escalate') escalated = true;
+      if (detectCwdScopeEscape(tgtAbs, ctx)) escalated = true;
+      caps.push(writeFs(tgtAbs));
+    }
+    // Input redirects `<` ALSO pass through the classifier (op='read' →
+    // only SYSTEM_DENY_ROOTS catch; escalate doesn't apply to reads):
+    // `cat < /proc/self/environ` reads attacker-targeted credentials.
+    if (r.kind === 'in') {
+      const tgtAbs = resolvePath(ctx.cwd, expandTilde(r.target, ctx.home));
+      const tier = classifyArgWithCanonical(tgtAbs, 'read', ctx);
+      if (tier === 'deny') {
+        return {
+          refuse: `bash: input redirect source '${r.target}' is in protected zone (deny tier)`,
+        };
+      }
+      if (detectCwdScopeEscape(tgtAbs, ctx)) escalated = true;
+      caps.push(readFs(tgtAbs));
+    }
+  }
+  return { caps, escalated };
+};
+
 const analyzeCommand = (
   shape: CommandShape,
   ctx: ResolverContext,
-): { refuse: string } | { caps: Capability[]; confidence: 'high' | 'medium' | 'low' } => {
-  if (isHardRefuseCommand(shape.name)) {
+):
+  | { refuse: string }
+  | { caps: Capability[]; confidence: 'high' | 'medium' | 'low'; conservative?: string } => {
+  // Hard-refuse check on BOTH the literal name and a quote/escape-
+  // stripped "bare" form. literalText now strips raw_string quotes, but
+  // backslash escapes (`\eval`) and mixed forms can still mask a hard
+  // command; bash removes those at runtime. Stripping `'"\` before the
+  // check matches bash's effective command name — it can only over-match
+  // (safe-side, refuses an exotic literal), never under-match a laundered
+  // eval/dd/sudo. Without this, the soft→conservative split would let
+  // `'eval'`/`ev''al`/`\eval` reach an operator-approvable confirm.
+  const bareName = stripShellQuoting(shape.name);
+  // `base` (basename) drives the REFUSE-side classifications: the
+  // hard-refuse set and the exec-runner scan. A slash-qualified launcher
+  // (`/bin/sh`, `/tmp/dd`, `./sh`) must be caught exactly like the bare
+  // command — over-refusing a local binary that merely shares a dangerous
+  // name is the safe direction. (Closes the path-qualified launcher
+  // bypass: `/bin/sh -c …` is hard-refused like `sh -c …`.)
+  const base = basename(bareName);
+  // `name` drives the TRUST-side classifications: the COMMAND_TABLE
+  // handler lookup, read-only, and pure-output. Bash runs a slash-
+  // containing name as that EXACT pathname (no PATH search), so `./cat` /
+  // `/tmp/ls` are untrusted local executables — collapsing them to the
+  // whitelisted `cat`/`ls` would model an arbitrary binary as the trusted
+  // system command and emit read-only caps while it actually runs. Trust
+  // the basename only for a PATH-resolved (no slash) or canonical-system-
+  // bindir command; otherwise keep the full path so it misses the registry
+  // and routes to Conservative (the §11 loop still runs, op=write).
+  const name = isTrustedCommandPath(bareName) ? base : bareName;
+  if (isHardRefuseCommand(base)) {
     return {
       refuse: `bash: command '${shape.name}' has no safe capability resolution`,
+    };
+  }
+
+  // Dynamic operands ($HOME/.ssh/id_rsa, "$f") were parsed as non-literal
+  // and parked IN POSITION on shape.args, their indices in
+  // dynamicArgIndices. Expand the shell vars we can know statically for
+  // those slots so the per-arg §11 loop, the handler (whose semantics
+  // depend on positional order — grep pattern/file, uniq in/out), and the
+  // cap it emits all see the resolved target. Dropping these (or pulling
+  // them out of args) made positional handlers analyze the wrong slots and
+  // miss the real path. Non-dynamic args are untouched; other `$...` stay
+  // literal (still dynamic — matchSensitivePath spans segments downstream).
+  const dynamicIdx = shape.dynamicArgIndices;
+  const effectiveArgs =
+    dynamicIdx === undefined
+      ? shape.args
+      : shape.args.map((a, i) =>
+          dynamicIdx.includes(i) ? expandKnownVars(stripShellQuoting(a), ctx) : a,
+        );
+
+  // Command runner wrapping another command (standalone shape too). xargs /
+  // parallel exec a COMMAND from their argv, so the wrapped command's
+  // per-command refuse checks (sh/bash hard-refuse, rm system-roots, dd,
+  // sudo, …) never run on what actually executes. Refuse ANY positional
+  // usage — not just an embedded interpreter — because `xargs rm -rf /`
+  // launders the rm root-delete refuse just as `xargs sh -c …` launders the
+  // shell refuse; both were a registry-miss Conservative (exec:arbitrary)
+  // that mode:bypass auto-allows. A bare `xargs` (no wrapped command, e.g.
+  // `… | xargs` defaulting to echo) carries no positional and falls
+  // through. name is basename-normalized, so `/usr/bin/xargs` counts.
+  if (EXEC_RUNNER_COMMANDS.has(base) && stripFlags(effectiveArgs).length > 0) {
+    return {
+      refuse: `bash: ${base} runs a wrapped command from its argv — refusing to launder exec attribution past the per-command refuse checks (run the wrapped tool directly)`,
     };
   }
 
@@ -3476,13 +4159,23 @@ const analyzeCommand = (
     return value.length > 0 ? value : null;
   };
   let escalated = false;
-  if (!isPureOutputCommand(shape.name)) {
+  // Operand caps for the registry-miss (Conservative) branch. The per-arg
+  // loop classifies escalate-tier positional paths but the unknown-command
+  // branch returned only redirect caps — so under mode:bypass (where the
+  // §11 protected-path floor scans resolved caps and is the ONLY check
+  // that still fires) `sed -i /etc/hosts` / `frobnicate --out=/etc/x`
+  // reached the floor with no write-fs and were silently allowed despite
+  // the escalate-tier operand. Collect those operands here and ride them
+  // onto that branch. Known commands ignore this — their handler emits the
+  // precise positional caps (adding argCaps there would just duplicate).
+  const argCaps: Capability[] = [];
+  if (!isPureOutputCommand(name)) {
     const targets = protectedTargets(ctx.home, ctx.cwd);
-    for (const arg of shape.args) {
+    for (const arg of effectiveArgs) {
       if (arg.length === 0) continue;
       const candidate = extractFlagValue(arg);
       if (candidate === null) continue;
-      const op: 'read' | 'write' = isReadOnlyCommand(shape.name) ? 'read' : 'write';
+      const op: 'read' | 'write' = isReadOnlyCommand(name) ? 'read' : 'write';
 
       // Slice 125 (R2 P0-3): shell brace + glob expansion bypass.
       // `rm /e{tc}/passwd` parses as a single `word` in the tree-
@@ -3508,9 +4201,9 @@ const analyzeCommand = (
           // Slice 127 (R3): expand tilde BEFORE absolutizing so
           // `~/.s*` resolves to `/home/op/.s*` (matching protected
           // tilde-dirs) instead of `/work/proj/~/.s*` which never
-          // overlaps any classifier target.
-          const literalPrefix = globLiteralPrefix(exp);
-          const absLiteralPrefix = resolvePath(ctx.cwd, expandTilde(literalPrefix, ctx.home));
+          // overlaps any classifier target. resolveGlobPrefix also keeps a
+          // bare leading dot (`.*`) from collapsing to the dir itself.
+          const absLiteralPrefix = resolveGlobPrefix(globLiteralPrefix(exp), ctx);
           if (couldGlobReachProtected(absLiteralPrefix, targets)) {
             return {
               refuse: `bash: ${shape.name} target '${exp}' uses a shell glob (*/?/[) whose literal prefix could expand into a protected zone — refusing static analysis`,
@@ -3537,7 +4230,12 @@ const analyzeCommand = (
             refuse: `bash: ${shape.name} target '${exp}' is in protected zone (deny tier, see PERMISSION_ENGINE.md §11)`,
           };
         }
-        if (tier === 'escalate') escalated = true;
+        if (tier === 'escalate') {
+          escalated = true;
+          // op is always 'write' for an unknown command (none are in
+          // isReadOnlyCommand); the ternary stays correct if that changes.
+          argCaps.push(op === 'write' ? writeFs(abs) : readFs(abs));
+        }
         // Slice 178: cwd-scope symlink escape. Lexical inside cwd
         // but canonical outside means a glob policy like
         // `<cwd>/**` would authorize lexically while the kernel
@@ -3548,63 +4246,48 @@ const analyzeCommand = (
     }
   }
 
-  const handler = COMMAND_TABLE.get(shape.name);
+  // Classify redirect targets BEFORE the registry split. Pre-fix the
+  // redirect loop lived AFTER the registry-miss early-return, so a
+  // redirect to a deny-tier path on an unmodeled command
+  // (`some_tool > /proc/sysrq-trigger`, `sed -n p < /proc/1/environ`)
+  // skipped the deny check and emitted no fs cap — and under
+  // `mode: bypass` the engine's §11 floor (which only scans resolved
+  // capabilities) had nothing to deny. Hoisting it refuses the deny-tier
+  // target for known AND registry-miss commands, and rides the read/write
+  // cap onto the conservative result so the floor stays honest.
+  const redir = classifyRedirects(shape.redirects, ctx);
+  if ('refuse' in redir) return { refuse: redir.refuse };
+
+  const handler = COMMAND_TABLE.get(name);
   if (handler === undefined) {
-    return { refuse: `bash: unknown command '${shape.name}'` };
+    // Registry miss → Conservative, not Refuse (PERMISSION_ENGINE.md
+    // §5.2 step 3c). Not in HARD_REFUSE_COMMANDS, so not categorically
+    // dangerous — just unmodeled. Conservative forces a confirm; the
+    // redirect + escalate-tier operand caps (above) ride along so the
+    // engine's bypass §11 floor stays honest. (Dynamic operands are in
+    // effectiveArgs, so the loop above already classified them.)
+    //
+    // Attribute exec:arbitrary — an unmodeled binary runs whatever it is,
+    // which is exactly the umbrella exec class, NOT the aggregator's bare
+    // exec:shell. A subagent envelope that allows ordinary bash
+    // (exec:shell) but not arbitrary execution must NOT count `frobnicate`
+    // as covered, and the risk score must see the real effect. The result
+    // stays Conservative (confirm) for the normal case; the cap only
+    // changes what the §10.1 envelope gate and the score observe.
+    return {
+      caps: [exec('arbitrary'), ...redir.caps, ...argCaps],
+      confidence: 'low',
+      conservative: `unknown_command: ${shape.name}`,
+    };
   }
-  const positional = stripFlags(shape.args);
-  const result = handler(positional, shape.args, ctx);
+  const positional = stripFlags(effectiveArgs);
+  const result = handler(positional, effectiveArgs, ctx);
   if ('refuse' in result) return { refuse: result.refuse };
   let finalConf: 'high' | 'medium' | 'low' = result.confidence;
-  if (escalated) finalConf = 'low';
-
-  const redirectCaps: Capability[] = [];
-  for (const r of shape.redirects) {
-    if (r.kind === 'out' || r.kind === 'append' || r.kind === 'both' || r.kind === 'force-out') {
-      const tgtAbs = resolvePath(ctx.cwd, expandTilde(r.target, ctx.home));
-      // Slice 176: canonical-aware classification on redirect
-      // target — same symlink-bypass threat as command args.
-      const tier = classifyArgWithCanonical(tgtAbs, 'write', ctx);
-      if (tier === 'deny') {
-        return {
-          refuse: `bash: redirect target '${r.target}' is in protected zone (deny tier)`,
-        };
-      }
-      if (tier === 'escalate') finalConf = 'low';
-      // Slice 178: cwd-scope escape on write redirect.
-      if (detectCwdScopeEscape(tgtAbs, ctx)) finalConf = 'low';
-      redirectCaps.push(writeFs(tgtAbs));
-    }
-    // Slice 128 (R4 P0-Launder-3): input redirects `<` ALSO pass
-    // through the classifier. Pre-slice the `'in'` branch was
-    // commented "consume; no fs write" and skipped entirely — but
-    // `cat < /proc/self/environ` reads attacker-targeted
-    // credentials, and the /proc deny tier never fired because
-    // cmdRead emits `read-fs:cwd` from "no positional" branch and
-    // the redirect target was never classified. Symmetric to the
-    // write-redirect check above, but with op='read' so only
-    // SYSTEM_DENY_ROOTS (/proc, /sys, /boot, /dev) catch — the
-    // escalate tier doesn't apply to reads, by design.
-    if (r.kind === 'in') {
-      const tgtAbs = resolvePath(ctx.cwd, expandTilde(r.target, ctx.home));
-      // Slice 176: canonical-aware classification on read redirect
-      // source — same symlink-bypass threat.
-      const tier = classifyArgWithCanonical(tgtAbs, 'read', ctx);
-      if (tier === 'deny') {
-        return {
-          refuse: `bash: input redirect source '${r.target}' is in protected zone (deny tier)`,
-        };
-      }
-      // Slice 178: cwd-scope escape on read redirect.
-      if (detectCwdScopeEscape(tgtAbs, ctx)) finalConf = 'low';
-      // Add read-fs to capabilities — the shell will read from
-      // this path, the resolver should honestly admit so.
-      redirectCaps.push(readFs(tgtAbs));
-    }
-  }
+  if (escalated || redir.escalated) finalConf = 'low';
 
   return {
-    caps: [...result.capabilities, ...redirectCaps],
+    caps: [...result.capabilities, ...redir.caps],
     confidence: finalConf,
   };
 };
@@ -3637,15 +4320,21 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
   // single unsafe element can poison the rest.
   const walk = walkAst(root);
   if (walk.refuse !== undefined) {
+    // HARD refuse: a HARD red-flag node (command/process substitution,
+    // function def, `VAR=val` prefix, arithmetic, heredoc/herestring,
+    // ansi-c, subscript), a dynamic command NAME, a non-literal redirect
+    // target, a parse error, or an unmodeled TOP-LEVEL shape — pre-policy
+    // deny the operator can't unlock. Soft-unmodeled shapes do NOT reach
+    // here: walkAst RECURSES through them and returns {commands,
+    // soft:true}, so every command in a loop/conditional body is still
+    // run through analyzeCommand below.
     return { kind: 'refuse', reason: walk.refuse };
   }
   const commands = walk.commands ?? [];
-  if (commands.length === 0) {
-    return { kind: 'refuse', reason: 'bash: no commands recognized' };
-  }
 
-  // Pipe-to-shell detection. Pipeline whose last stage is sh/bash/...
-  // reads stdin as arbitrary script. Refuse.
+  // Pipe-to-shell detection (whole tree, incl. inside a soft loop body).
+  // A pipeline whose last stage is sh/bash/python/... reads stdin as an
+  // arbitrary script. Refuse.
   const pipeShell = detectPipeToShell(root);
   if (pipeShell !== null) {
     return {
@@ -3654,19 +4343,101 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
     };
   }
 
-  // Aggregate capabilities + minimum confidence across all commands.
-  const allCaps: Capability[] = [exec('shell')];
+  // Orphan redirects: a redirect with NO command to attach to
+  // (`[[ -e x ]] > f`, bare `> f`). analyzeCommand never sees these
+  // (no CommandShape carries them), so classify them here — a deny-tier
+  // target refuses regardless of whether any command was resolved, and
+  // its cap rides onto the result so the engine floors stay honest.
+  const orphanRedir = classifyRedirects(walk.orphanRedirects ?? [], ctx);
+  if ('refuse' in orphanRedir) {
+    return { kind: 'refuse', reason: orphanRedir.refuse };
+  }
+
+  // For-loop `in` item words bind the loop variable; the body's `$var`
+  // use isn't tracked, so a deny/sensitive loop SOURCE is only visible
+  // here. Classify each as a read operand: a system-deny source
+  // (`for f in /proc/1/environ; do cat "$f"; done`) refuses, and a
+  // sensitive/escalate source rides a read-fs cap onto the result so the
+  // bypass §8.4/§11 floor catches it — the body alone produced only a
+  // dynamic read-fs:<cwd>/$f. A glob that could reach a protected zone
+  // refuses too. A dynamic source (`for f in $LIST`) resolves to a
+  // harmless cwd path (the body-dataflow residual stays documented).
+  const loopWordCaps: Capability[] = [];
+  for (const w of walk.loopWords ?? []) {
+    const wResolved = expandKnownVars(stripShellQuoting(w), ctx);
+    if (wResolved.length === 0) continue;
+    for (const exp of expandBraces(wResolved)) {
+      if (containsGlobMetachar(exp)) {
+        const absPrefix = resolveGlobPrefix(globLiteralPrefix(exp), ctx);
+        if (couldGlobReachProtected(absPrefix, protectedTargets(ctx.home, ctx.cwd))) {
+          return {
+            kind: 'refuse',
+            reason: `bash: for-loop item '${exp}' could glob into a protected zone — refusing static analysis`,
+          };
+        }
+        continue;
+      }
+      const abs = resolvePath(ctx.cwd, expandTilde(exp, ctx.home));
+      if (classifyArgWithCanonical(abs, 'read', ctx) === 'deny') {
+        return {
+          kind: 'refuse',
+          reason: `bash: for-loop item '${exp}' is in protected zone (deny tier, see PERMISSION_ENGINE.md §11)`,
+        };
+      }
+      loopWordCaps.push(readFs(abs));
+    }
+  }
+
+  if (commands.length === 0) {
+    // A soft shape with no resolvable command (`[[ -e x ]]`, `( )`) is
+    // unmodeled-but-benign → confirm. Not soft + no command → nothing
+    // recognized → refuse (existing posture).
+    if (walk.soft === true) {
+      return {
+        kind: 'conservative',
+        capabilities: [exec('shell'), ...orphanRedir.caps, ...loopWordCaps],
+        reason: `bash: ${walk.softReason ?? 'unmodeled shape'} (no resolvable command) → confirm`,
+      };
+    }
+    return { kind: 'refuse', reason: 'bash: no commands recognized' };
+  }
+
+  // analyzeCommand applies the FULL per-command defense — HARD_REFUSE
+  // commands (incl. quote/escape-laundered names), rm system-roots,
+  // redirect-to-protected-path, protected-path globs, chmod
+  // permission-mutate, git -c RCE, etc. — to EVERY command, INCLUDING
+  // those collected from inside a soft control-flow body. This is the
+  // load-bearing safeguard: it is why `for x in *; do rm -rf /; done`,
+  // `for i in 1; do echo x > /proc/...; done`, `for x in *; do cat
+  // /etc/pass*; done`, and `'eval'`/`$()` inside a loop all stay denied
+  // even though the wrapping shape is soft.
+  const allCaps: Capability[] = [exec('shell'), ...orphanRedir.caps, ...loopWordCaps];
   let aggregateConf: 'high' | 'medium' | 'low' = 'high';
+  let conservativeReason: string | null = null;
   for (const shape of commands) {
     const result = analyzeCommand(shape, ctx);
     if ('refuse' in result) {
       return { kind: 'refuse', reason: result.refuse };
     }
     allCaps.push(...result.caps);
+    if (result.conservative !== undefined) conservativeReason ??= result.conservative;
     if (result.confidence === 'low') aggregateConf = 'low';
     else if (result.confidence === 'medium' && aggregateConf === 'high') aggregateConf = 'medium';
   }
 
+  // A soft-unmodeled wrapper (control flow / value expansion) OR a
+  // registry-miss command → Conservative (forces confirm), per
+  // PERMISSION_ENGINE.md §5.2. Caps are the honest aggregate of the
+  // resolved inner commands, so the engine's downstream §11 floors (and
+  // the bypass-mode protected-path check) still see real read/write/
+  // delete capabilities — not a blind `[exec('shell')]`.
+  if (walk.soft === true || conservativeReason !== null) {
+    const reason =
+      conservativeReason !== null
+        ? `bash: ${conservativeReason}`
+        : `bash: ${walk.softReason ?? 'unmodeled shape (control flow / value expansion)'} → confirm`;
+    return { kind: 'conservative', capabilities: allCaps, reason };
+  }
   return { kind: 'ok', capabilities: allCaps, confidence: aggregateConf };
 };
 

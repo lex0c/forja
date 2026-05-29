@@ -340,6 +340,19 @@ export const buildSbplProfile = (
     denyRules.push(`(deny file-read* (subpath "${escaped}"))`);
     denyRules.push(`(deny file-write* (subpath "${escaped}"))`);
   }
+  // KNOWN LIMITATION (parallel to the Linux /dev/null → empty-file fix):
+  // `(deny file-read*)` makes a config reader's open() fail with EPERM,
+  // which can break git/npm/pip inside the sandbox the same way binding a
+  // char device over `~/.gitconfig` broke them on Linux (git 2.54:
+  // `fatal: ... reading the configuration files`). The Linux remedy binds
+  // an empty REGULAR file so the tool sees an empty config — sandbox-exec
+  // has NO bind-mount / file-virtualization primitive, so there's no
+  // direct equivalent here (the only levers are allow/deny). Deferred:
+  // closing it means either allowing read of the config-shaped files
+  // (gitconfig/npmrc/pypirc) — losing PII read-protection — or a deeper
+  // copy-to-empty-then-chroot scheme. Untestable from a Linux host;
+  // tracked in BACKLOG. The write-deny (the RCE-plant vector) holds
+  // regardless.
   for (const file of HIDE_PATHS_FILES) {
     const absFile = joinPath(home, file);
     const escaped = escapeSbplLiteral(absFile);

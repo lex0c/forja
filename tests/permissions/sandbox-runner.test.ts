@@ -1,10 +1,20 @@
 import { describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { isSandboxProfile } from '../../src/permissions/sandbox-plan.ts';
-import { buildBwrapArgv, maybeWrapSandboxArgv } from '../../src/permissions/sandbox-runner.ts';
+import {
+  __resetSandboxMaskFileCacheForTest,
+  buildBwrapArgv,
+  maybeWrapSandboxArgv,
+} from '../../src/permissions/sandbox-runner.ts';
 
 const INNER = ['bash', '-c', 'echo hi'] as const;
 const CWD = '/work/proj';
 const HOME = '/home/op';
+// Deterministic stand-in for the empty-regular-file mask source (prod
+// uses a session-cached file via ensureSandboxMaskFile); pin it so the
+// argv assertions don't depend on the runner's data dir / create a file.
+const MASK = '/forja-mask-empty';
 
 describe('buildBwrapArgv — host profile (passthrough)', () => {
   test('host returns innerArgv unchanged', () => {
@@ -573,15 +583,16 @@ describe('buildBwrapArgv — hide_paths defense (slice 118, R4)', () => {
     // Slice 149 (review): rustup toolchain + subversion auth cache.
     expect(argvStr).toContain('--tmpfs /home/op/.rustup');
     expect(argvStr).toContain('--tmpfs /home/op/.subversion/auth');
-    // Canonical file list — masked via /dev/null overlay.
-    expect(argvStr).toContain('--ro-bind-try /dev/null /home/op/.netrc');
-    expect(argvStr).toContain('--ro-bind-try /dev/null /home/op/.docker/config.json');
-    expect(argvStr).toContain('--ro-bind-try /dev/null /home/op/.npmrc');
-    expect(argvStr).toContain('--ro-bind-try /dev/null /home/op/.pypirc');
+    // Canonical file list — masked via an empty-regular-file overlay
+    // (NOT /dev/null: a char device breaks git/npm config readers).
+    expect(argvStr).toContain(`--ro-bind ${MASK} /home/op/.netrc`);
+    expect(argvStr).toContain(`--ro-bind ${MASK} /home/op/.docker/config.json`);
+    expect(argvStr).toContain(`--ro-bind ${MASK} /home/op/.npmrc`);
+    expect(argvStr).toContain(`--ro-bind ${MASK} /home/op/.pypirc`);
     // Slice 149 (review): gitconfig (executable hooks) + cargo
     // credentials.toml (crates.io API token).
-    expect(argvStr).toContain('--ro-bind-try /dev/null /home/op/.gitconfig');
-    expect(argvStr).toContain('--ro-bind-try /dev/null /home/op/.cargo/credentials.toml');
+    expect(argvStr).toContain(`--ro-bind ${MASK} /home/op/.gitconfig`);
+    expect(argvStr).toContain(`--ro-bind ${MASK} /home/op/.cargo/credentials.toml`);
   };
 
   test('ro profile emits hide_paths flags', () => {
@@ -592,6 +603,11 @@ describe('buildBwrapArgv — hide_paths defense (slice 118, R4)', () => {
       innerArgv: INNER,
       env: {},
       realpath: (p) => p,
+      // Pin every credential path "present" so these tests assert the
+      // masking CONTRACT, decoupled from the runner's real home. The
+      // existence-gating behavior has its own describe below.
+      pathExists: () => true,
+      maskFileSource: MASK,
     });
     expectHidePaths(argv);
   });
@@ -604,6 +620,8 @@ describe('buildBwrapArgv — hide_paths defense (slice 118, R4)', () => {
       innerArgv: INNER,
       env: {},
       realpath: (p) => p,
+      pathExists: () => true,
+      maskFileSource: MASK,
     });
     expectHidePaths(argv);
   });
@@ -616,6 +634,8 @@ describe('buildBwrapArgv — hide_paths defense (slice 118, R4)', () => {
       innerArgv: INNER,
       env: {},
       realpath: (p) => p,
+      pathExists: () => true,
+      maskFileSource: MASK,
     });
     expectHidePaths(argv);
   });
@@ -633,6 +653,8 @@ describe('buildBwrapArgv — hide_paths defense (slice 118, R4)', () => {
       innerArgv: INNER,
       env: {},
       realpath: (p) => p,
+      pathExists: () => true,
+      maskFileSource: MASK,
     });
     expectHidePaths(argv);
     // Verify the order: --bind home home appears BEFORE --tmpfs
@@ -673,10 +695,135 @@ describe('buildBwrapArgv — hide_paths defense (slice 118, R4)', () => {
       innerArgv: INNER,
       env: {},
       realpath: (p) => p,
+      pathExists: () => true,
+      maskFileSource: MASK,
     });
     const argvStr = argv.join(' ');
     expect(argvStr).toContain('--tmpfs /Users/devloper/.ssh');
-    expect(argvStr).toContain('--ro-bind-try /dev/null /Users/devloper/.netrc');
+    expect(argvStr).toContain(`--ro-bind ${MASK} /Users/devloper/.netrc`);
+  });
+});
+
+// Regression — hide_paths mount-realizability gate. A `--tmpfs` /
+// `--ro-bind /dev/null` overlay mounts OVER its target; for an ABSENT
+// target under the read-only `--ro-bind / /` base, bwrap first tries
+// to `mkdir` the mountpoint and fails with EROFS ("Can't mkdir
+// <path>: Read-only file system"), aborting the ENTIRE spawn before
+// the inner command runs. Few hosts have every credential dir/file
+// present, so pre-gate this broke sandbox-enforced spawn-broker calls
+// almost everywhere (the build smoke only exercised the NON-bwrap
+// worker path, so it never surfaced). The runner now emits a mask
+// only when the target exists OR its parent is writable in-profile.
+describe('buildBwrapArgv — hide_paths existence gate (EROFS regression)', () => {
+  test('cwd-rw-net: absent credential dir is NOT masked (would EROFS)', () => {
+    // The common case: host has ~/.ssh but not ~/.aws.
+    const present = new Set(['/home/op/.ssh']);
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw-net',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: (p) => present.has(p),
+    });
+    const argvStr = argv.join(' ');
+    // Present → masked.
+    expect(argvStr).toContain('--tmpfs /home/op/.ssh');
+    // Absent + cwd (/work/proj) is NOT under home → home stays
+    // read-only → skip so bwrap never attempts the failing mkdir.
+    expect(argvStr).not.toContain('--tmpfs /home/op/.aws');
+    expect(argvStr).not.toContain('--tmpfs /home/op/.gnupg');
+  });
+
+  test('cwd-rw: absent credential FILE is NOT masked (would EROFS)', () => {
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: () => false,
+    });
+    const argvStr = argv.join(' ');
+    expect(argvStr).not.toContain('/home/op/.gitconfig');
+    expect(argvStr).not.toContain('/home/op/.cargo/credentials.toml');
+  });
+
+  test('ro: all-absent host emits NO hide_paths overlays but keeps base flags', () => {
+    const argv = buildBwrapArgv({
+      profile: 'ro',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: () => false,
+    });
+    const argvStr = argv.join(' ');
+    // No credential overlays at all.
+    expect(argvStr).not.toContain('/home/op/.ssh');
+    expect(argvStr).not.toContain('/home/op/.aws');
+    expect(argvStr).not.toContain('/dev/null /home/op/.netrc');
+    // Base sandbox shape untouched — common --tmpfs /tmp + inner cmd.
+    expect(argvStr).toContain('--tmpfs /tmp');
+    expect(argv.slice(argv.indexOf('--') + 1)).toEqual([...INNER]);
+  });
+
+  test('home-rw: absent paths STILL masked (writable parent → create-and-plant defense)', () => {
+    // home-rw binds $HOME read-WRITE, so bwrap CAN create the
+    // mountpoint for an absent target — AND the create-and-plant
+    // write-tampering vector (~/.gitconfig core.sshCommand RCE,
+    // ~/.config/agent/permissions.yaml policy tamper) is live. Mask
+    // regardless of host existence.
+    const argv = buildBwrapArgv({
+      profile: 'home-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: () => false,
+      maskFileSource: MASK,
+    });
+    const argvStr = argv.join(' ');
+    expect(argvStr).toContain('--tmpfs /home/op/.ssh');
+    expect(argvStr).toContain('--tmpfs /home/op/.config/agent');
+    expect(argvStr).toContain(`--ro-bind ${MASK} /home/op/.gitconfig`);
+  });
+
+  test('cwd-rw: absent target UNDER the writable cwd is masked', () => {
+    // Edge: operator launched from $HOME, so hide_paths land under
+    // the writable cwd bind. bwrap can create the mountpoint there
+    // even when absent, and cwd being writable makes create-and-plant
+    // applicable — so mask.
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: HOME,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: () => false,
+    });
+    const argvStr = argv.join(' ');
+    expect(argvStr).toContain('--tmpfs /home/op/.ssh');
+  });
+
+  test('omitting pathExists falls back to the real filesystem without throwing', () => {
+    // No seam → node:fs.existsSync. Just assert the wrap is still
+    // well-formed; absent host creds simply produce fewer overlays.
+    const argv = buildBwrapArgv({
+      profile: 'ro',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+    });
+    expect(argv[0]).toBe('bwrap');
+    expect(argv.slice(argv.indexOf('--') + 1)).toEqual([...INNER]);
   });
 });
 
@@ -825,6 +972,10 @@ describe('buildBwrapArgv — XDG_DATA_HOME unmask defense (slice 140 sec-1)', ()
         innerArgv: INNER,
         env: {},
         realpath: (p) => p,
+        // Relocated data dir exists on the host (the real
+        // protect-worthy case); were it absent the gate would skip it
+        // to avoid the read-only-parent mkdir EROFS.
+        pathExists: () => true,
       });
       const argvStr = argv.join(' ');
       // Both overlays present: the canonical home-relative one
@@ -832,6 +983,32 @@ describe('buildBwrapArgv — XDG_DATA_HOME unmask defense (slice 140 sec-1)', ()
       // one (added by the sec-1 fix).
       expect(argvStr).toContain('--tmpfs /home/op/.local/share/forja');
       expect(argvStr).toContain('--tmpfs /tmp/data/forja');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('XDG_DATA_HOME relocated but ABSENT: extra overlay SKIPPED (EROFS guard, review gap)', () => {
+    // The relocated data dir lives OUTSIDE home, so on home-rw it sits
+    // under the read-only base bind. When it does NOT exist on the host,
+    // emitting `--tmpfs /tmp/data/forja` would make bwrap mkdir the
+    // mountpoint under a read-only parent → EROFS, aborting the spawn. The
+    // gate (pathExists=false AND not under a writable root) skips it; the
+    // canonical home-relative overlay (under the writable home) stays.
+    process.env.XDG_DATA_HOME = '/tmp/data';
+    try {
+      const argv = buildBwrapArgv({
+        profile: 'home-rw',
+        cwd: '/work/proj',
+        home: '/home/op',
+        innerArgv: INNER,
+        env: {},
+        realpath: (p) => p,
+        pathExists: () => false,
+      });
+      const argvStr = argv.join(' ');
+      expect(argvStr).not.toContain('--tmpfs /tmp/data/forja');
+      expect(argvStr).toContain('--tmpfs /home/op/.local/share/forja');
     } finally {
       restoreEnv();
     }
@@ -961,6 +1138,10 @@ describe('buildBwrapArgv — XDG_CONFIG_HOME unmask defense (slice 146)', () => 
       innerArgv: INNER,
       env: { XDG_CONFIG_HOME: '/srv/conf' },
       realpath: (p) => p,
+      // Relocated config dirs exist on the host (the real case worth
+      // masking); absent they'd be skipped to avoid the EROFS mkdir.
+      pathExists: () => true,
+      maskFileSource: MASK,
     });
     const argvStr = argv.join(' ');
     // Canonical home-relative overlays still present (defense
@@ -1496,5 +1677,46 @@ describe('buildBwrapArgv — symlink canonicalization (slice 155)', () => {
         },
       }),
     ).toThrow(/cannot be canonicalized/);
+  });
+});
+
+describe('buildBwrapArgv — production credential-file mask source (no seam)', () => {
+  test('binds an empty REGULAR 0600 file (not /dev/null) under the data dir', () => {
+    // Closes the review gap: every file-mask test pins `maskFileSource`,
+    // so the real `ensureSandboxMaskFile` path — the actual git/npm fix —
+    // was untested (a revert to `/dev/null` would have passed). Drive it
+    // via a pinned $XDG_DATA_HOME temp dir so the real home is untouched.
+    const tmp = mkdtempSync(`${tmpdir()}/forja-mask-test-`);
+    const origXdg = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = tmp;
+    __resetSandboxMaskFileCacheForTest();
+    try {
+      const argv = buildBwrapArgv({
+        profile: 'cwd-rw',
+        cwd: CWD,
+        home: HOME,
+        innerArgv: INNER,
+        env: {},
+        realpath: (p) => p,
+        pathExists: () => true,
+        // NO maskFileSource — exercise the production ensureSandboxMaskFile.
+      });
+      const i = argv.findIndex(
+        (v, idx) => v === '--ro-bind' && argv[idx + 2] === '/home/op/.netrc',
+      );
+      expect(i).toBeGreaterThanOrEqual(0);
+      const src = argv[i + 1] as string;
+      expect(src).not.toBe('/dev/null');
+      expect(src.endsWith('/forja/sandbox-mask-empty')).toBe(true);
+      const st = statSync(src);
+      expect(st.isFile()).toBe(true);
+      expect(st.size).toBe(0);
+      expect(st.mode & 0o777).toBe(0o600);
+    } finally {
+      if (origXdg === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = origXdg;
+      __resetSandboxMaskFileCacheForTest();
+      rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });
