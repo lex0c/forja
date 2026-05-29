@@ -2,6 +2,12 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-29] permissions — tree -R/-H detection missed combined short-option clusters
+
+Follow-up to the `tree` write-modeling fix. The `-R -H` 00Tree.html dir-write gate keyed on the exact `-R` token (`tokens.includes('-R')`), so combined short-option clusters — `tree -RH …`, `tree -HR …` (bash bundles single-char flags) — never matched: the resolver emitted only read-fs caps, and under `mode: bypass` the §11 floor (caps-only) let a protected-dir write skip the confirm/deny path. Added `hasShortFlagChar(tokens, ch)` that matches a flag standalone (`-R`) OR bundled in a `-`-prefixed cluster (`-RH`/`-HR`), skipping long options and non-option tokens; the dir-write gate now uses it for both `R` and `H`. Conservative by design: a value char bundled after a value-taking short may over-match, which only widens write attribution.
+
+**Validated:** +3 regression tests (`-RH`/`-HR` clusters → write-fs on the listed dir; `tree -RH … /etc/d` → write-fs escalate); existing `tree -R -H` and plain-listing tests still pass; full `tests/permissions/` (2086) + typecheck + biome clean. **Branch:** `chore/sec-fixes`.
+
 ## [2026-05-29] permissions — attribute unknown bash commands as exec:arbitrary
 
 The registry-miss (Conservative) branch returned only redirect/escalate operand caps; the aggregator then prepended `exec:shell` (every bash call gets it). So an unmodeled command like `frobnicate` carried `exec:shell` but never `exec:arbitrary`. In a child engine whose effective envelope allows `exec:shell` (ordinary bash) but NOT arbitrary execution, the §10.1 envelope gate counted `frobnicate` as covered and let it proceed to policy/bypass handling — even though it runs any unmodeled binary. (`exec:arbitrary` is the umbrella class; `exec:shell` does NOT cover it — capabilities.ts coverage is one-directional.) The risk score also missed the arbitrary-exec signal.

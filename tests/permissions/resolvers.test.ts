@@ -2336,6 +2336,24 @@ describe('bash resolver — sort/uniq writes are not misclassified as reads', ()
     }
   });
 
+  test('tree combined -RH / -HR short-option clusters also surface the dir write', () => {
+    for (const cmd of ['tree -RH base /work/proj/sub', 'tree -HR /work/proj/sub']) {
+      const r = resolveCapabilities('bash', { command: cmd }, CTX);
+      expect(r.kind).toBe('ok');
+      if (r.kind === 'ok') {
+        expect(capStrings(r.capabilities)).toContain('write-fs:/work/proj/sub');
+      }
+    }
+  });
+
+  test('tree -RH into a protected dir surfaces the write (escalate), not read-only', () => {
+    const r = resolveCapabilities('bash', { command: 'tree -RH https://host /etc/d' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/etc/d');
+    }
+  });
+
   test('plain tree listing stays a clean read (regression)', () => {
     const r = resolveCapabilities('bash', { command: 'tree -L 2 /work/proj/src' }, CTX);
     expect(r.kind).toBe('ok');

@@ -641,6 +641,14 @@ const cmdUniq: CommandResolver = (_positional, tokens, ctx) => {
 // operands as writes (defense in depth), same posture as cmdSort.
 const TREE_VALUE_FLAGS: ReadonlySet<string> = new Set(['-o', '-L', '-P', '-I', '-H', '-T']);
 
+// True when a short flag char is present standalone (`-R`) OR bundled in a
+// combined short-option cluster (`-RH`, `-HR`). Long options (`--reverse`)
+// and non-option tokens are skipped. Conservative: a value char bundled
+// after a value-taking short (`-Hbase`) may over-match, which only widens
+// write attribution — the safe side.
+const hasShortFlagChar = (tokens: readonly string[], ch: string): boolean =>
+  tokens.some((t) => t.length >= 2 && t[0] === '-' && t[1] !== '-' && t.slice(1).includes(ch));
+
 const cmdTree: CommandResolver = (_positional, tokens, ctx) => {
   const writeTargets = extractValueFlag(tokens, { shortForm: '-o' }).filter((v) => v !== '-');
   const dirs = stripFlags(tokens, TREE_VALUE_FLAGS);
@@ -649,8 +657,12 @@ const cmdTree: CommandResolver = (_positional, tokens, ctx) => {
     ...listed.map((p) => readFs(resolveArg(p, ctx))),
     ...writeTargets.map((p) => writeFs(resolveArg(p, ctx))),
   ];
-  // `-R` + `-H` writes a 00Tree.html into each traversed directory.
-  if (tokens.includes('-R') && tokens.some((t) => t === '-H' || t.startsWith('-H'))) {
+  // `-R` + `-H` writes a 00Tree.html into each traversed directory. Detect
+  // both flags whether standalone (`-R -H`) or bundled in a combined
+  // short-option cluster (`tree -RH …`, `tree -HR …`) — keying on the exact
+  // `-R` token alone missed the combined forms, so a protected-dir write
+  // emitted only read caps and (under mode:bypass) skipped the §11 floor.
+  if (hasShortFlagChar(tokens, 'R') && hasShortFlagChar(tokens, 'H')) {
     caps.push(...listed.map((p) => writeFs(resolveArg(p, ctx))));
   }
   return { capabilities: caps, confidence: 'high' };
