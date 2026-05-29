@@ -1,23 +1,27 @@
-# Conformance: bash resolver adversarial refusals (PERMISSION_ENGINE.md §16.2,
-# TREE_SITTER_SHELL.md §7 + §9 + §13).
+# Conformance: bash resolver adversarial dispositions (PERMISSION_ENGINE.md
+# §16.2 + §5.2, TREE_SITTER_SHELL.md §7 + §9 + §13).
 #
-# The bash resolver (slice 6) refuses any command shape that can't be statically
-# decomposed into capabilities. This file pins each refusal contract so a
-# regression in the AST walk / whitelist / hard-refuse list / pipe-to-shell
-# detector is caught loudly.
+# The bash resolver (slice 6) never SILENTLY ALLOWS a command shape it can't
+# statically decompose. Categorically-dangerous shapes REFUSE pre-policy (a
+# hard floor the operator can't unlock); soft-unmodeled shapes (control flow,
+# value expansion) are CONSERVATIVE → confirm (PERMISSION_ENGINE.md §5.2). This
+# file pins each disposition so a regression in the AST walk / whitelist /
+# hard-refuse list / soft-vs-hard split / pipe-to-shell detector is caught loudly.
 #
-# Coverage groups (counts per §16.2 minimums):
-#   A. Hard-refuse commands              (8)   eval/exec/source/./trap/set/unset/mkfs.*
-#   B. Command substitution + expansions (5)   $(...), backticks, $((..)), $var, ${var}
-#   C. Process-subst + here-docs         (2)   <(..), <<<
-#   D. Control flow + grouping           (4)   if, for, subshell, compound_statement
-#   E. Variable assignment prefix        (1)   PATH=/tmp cmd
-#   F. Pipe-to-shell variants            (3)   |bash, |zsh, |dash
-#   G. Per-command resolver refuses      (2)   rm (no target), curl -x (proxy)
+# Coverage groups (disposition noted; counts per §16.2 minimums):
+#   A. Hard-refuse commands              (8) REFUSE  eval/exec/source/./trap/set/unset/mkfs.*
+#   B. Command subst + value expansion   (5) MIXED   $(...)/$((..))/backtick REFUSE; $var/${var} CONFIRM
+#   C. Process-subst + here-docs         (2) REFUSE  <(..), <<<
+#   D. Control flow + grouping           (4) CONFIRM if, for, subshell, compound_statement
+#   E. Variable assignment prefix        (1) REFUSE  PATH=/tmp cmd
+#   F. Pipe-to-shell variants            (3) REFUSE  |bash, |zsh, |dash
+#   G. Per-command resolver refuses      (2) REFUSE  rm (no target), curl -x (proxy)
 #
-# Every case uses a permissive policy (`bash.allow: ["*"]`) so the resolver's
-# refusal is what produces the deny — not a policy gate. `source_section:
-# resolver-refuse` confirms the §6.1 short-circuit.
+# Every case uses a permissive policy (`bash.allow: ["*"]`) so the disposition
+# comes from the resolver / engine floor, not a policy gate. REFUSE cases pin
+# `resolver_kind: refuse` + `source_section: resolver-refuse` (the §6.1
+# short-circuit); CONFIRM cases pin `resolver_kind: conservative` (a compound
+# `;`/`&&` may surface via the engine's policy-layer compound check instead).
 
 # ─────────────────────────────────────────────────────────────────────
 # Group A — Hard-refuse commands (§HARD_REFUSE_COMMANDS)
@@ -172,7 +176,8 @@
     reason_substring: "command 'mkfs.ext4'"
 
 # ─────────────────────────────────────────────────────────────────────
-# Group B — Command substitution + expansions (RED_FLAG_NODES)
+# Group B — Command substitution (RED_FLAG → refuse) + value expansion
+#           (SOFT_UNMODELED → confirm)
 # ─────────────────────────────────────────────────────────────────────
 
 - name: "bash adversarial: $() command substitution refuses"
@@ -229,7 +234,7 @@
     source_section: "resolver-refuse"
     reason_substring: "arithmetic_expansion"
 
-- name: "bash adversarial: bare variable expansion $var refuses"
+- name: "bash adversarial: bare variable expansion $var → Conservative (confirm)"
   setup:
     cwd: "/work/proj"
     project_policy: |
@@ -241,17 +246,20 @@
     category: "bash"
     args:
       # Bare `$HOME` (no concatenation) parses as a top-level
-      # `simple_expansion` child of the command, hitting RED_FLAG_NODES
-      # directly. Mixed shapes like `$HOME/.ssh/id_rsa` also refuse but
-      # via the concatenation path ("dynamic content inside string arg").
+      # `simple_expansion` child — a SOFT_UNMODELED node. No compound
+      # metachar, so the engine's compound check doesn't fire and the
+      # resolver's soft disposition drives the decision.
       command: "echo $HOME"
   expect:
-    kind: "deny"
-    resolver_kind: "refuse"
-    source_section: "resolver-refuse"
+    # Soft-unmodeled (PERMISSION_ENGINE.md §5.2): a bare `$var` is not
+    # resolvable statically but isn't categorically dangerous → Conservative
+    # (forces confirm), not a pre-policy refuse. The operator decides.
+    kind: "confirm"
+    resolver_kind: "conservative"
+    source_section: "bash"
     reason_substring: "variable_expansion"
 
-- name: "bash adversarial: parameter expansion ${var:-default} refuses"
+- name: "bash adversarial: parameter expansion ${var:-default} → Conservative (confirm)"
   setup:
     cwd: "/work/proj"
     project_policy: |
@@ -264,9 +272,11 @@
     args:
       command: "echo ${PATH:-/bin}"
   expect:
-    kind: "deny"
-    resolver_kind: "refuse"
-    source_section: "resolver-refuse"
+    # Soft-unmodeled (PERMISSION_ENGINE.md §5.2): `${var:-default}` is
+    # runtime substitution → Conservative (confirm), not refuse.
+    kind: "confirm"
+    resolver_kind: "conservative"
+    source_section: "bash"
     reason_substring: "parameter_expansion"
 
 # ─────────────────────────────────────────────────────────────────────
@@ -310,10 +320,10 @@
     reason_substring: "herestring_redirect"
 
 # ─────────────────────────────────────────────────────────────────────
-# Group D — Control flow + grouping (RED_FLAG_NODES)
+# Group D — Control flow + grouping (SOFT_UNMODELED_NODES → Conservative/confirm)
 # ─────────────────────────────────────────────────────────────────────
 
-- name: "bash adversarial: if statement refuses (control flow not modeled)"
+- name: "bash adversarial: if statement → Conservative (confirm)"
   setup:
     cwd: "/work/proj"
     project_policy: |
@@ -326,12 +336,17 @@
     args:
       command: "if true; then ls; fi"
   expect:
-    kind: "deny"
-    resolver_kind: "refuse"
-    source_section: "resolver-refuse"
-    reason_substring: "if_statement"
+    # Control flow → confirm, never auto-allowed. The `;` separators make
+    # this a compound shell command, so the engine forces confirm at the
+    # policy layer (surfacing the literal command). The resolver also treats
+    # the if_statement node as soft-unmodeled (PERMISSION_ENGINE.md §5.2; see
+    # resolvers.test.ts) — either way it is Conservative, not refuse.
+    kind: "confirm"
+    resolver_kind: "conservative"
+    source_section: "bash"
+    reason_substring: "compound shell command"
 
-- name: "bash adversarial: for loop refuses (control flow not modeled)"
+- name: "bash adversarial: for loop → Conservative (confirm)"
   setup:
     cwd: "/work/proj"
     project_policy: |
@@ -344,12 +359,18 @@
     args:
       command: "for f in a b c; do echo $f; done"
   expect:
-    kind: "deny"
-    resolver_kind: "refuse"
-    source_section: "resolver-refuse"
-    reason_substring: "for_statement"
+    # Control flow → confirm, never auto-allowed. The `;` separators make
+    # this a compound shell command, so the engine forces confirm at the
+    # policy layer. The resolver also treats the for_statement node as
+    # soft-unmodeled and classifies the `in` item words — a deny-tier loop
+    # source (`for f in /proc/1/environ`) refuses (see resolvers.test.ts);
+    # a benign `a b c` list stays Conservative, not refuse.
+    kind: "confirm"
+    resolver_kind: "conservative"
+    source_section: "bash"
+    reason_substring: "compound shell command"
 
-- name: "bash adversarial: subshell (cmd) refuses (nested execution context)"
+- name: "bash adversarial: subshell (cmd) → Conservative (confirm)"
   setup:
     cwd: "/work/proj"
     project_policy: |
@@ -360,14 +381,18 @@
     tool: "bash"
     category: "bash"
     args:
-      command: "(cd /tmp && ls)"
+      # `(ls)` — a pure subshell with no compound metachar, so it exercises
+      # the soft subshell NODE path (not the engine's `;`/`&&` compound
+      # check). Soft-unmodeled grouping (PERMISSION_ENGINE.md §5.2) →
+      # Conservative (confirm); inner commands are still recursed.
+      command: "(ls)"
   expect:
-    kind: "deny"
-    resolver_kind: "refuse"
-    source_section: "resolver-refuse"
+    kind: "confirm"
+    resolver_kind: "conservative"
+    source_section: "bash"
     reason_substring: "subshell"
 
-- name: "bash adversarial: compound { cmd; } refuses (block context)"
+- name: "bash adversarial: compound { cmd; } → Conservative (confirm)"
   setup:
     cwd: "/work/proj"
     project_policy: |
@@ -380,10 +405,15 @@
     args:
       command: "{ ls; pwd; }"
   expect:
-    kind: "deny"
-    resolver_kind: "refuse"
-    source_section: "resolver-refuse"
-    reason_substring: "compound_statement"
+    # The `;` command-separators make this a compound shell command, which
+    # the engine forces to confirm at the policy layer (surfacing the literal
+    # command) — softer than the old pre-policy refuse, but never
+    # auto-allowed. (The soft compound_statement NODE path is covered in
+    # resolvers.test.ts.)
+    kind: "confirm"
+    resolver_kind: "conservative"
+    source_section: "bash"
+    reason_substring: "compound shell command"
 
 # ─────────────────────────────────────────────────────────────────────
 # Group E — Variable assignment prefix (RED_FLAG_NODES)

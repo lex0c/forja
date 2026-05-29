@@ -2,6 +2,12 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-29] conformance — align bash_adversarial dispositions with the soft→conservative split
+
+6 conformance cases still asserted the pre-`§5.2` behavior (`kind: deny`, `resolver_kind: refuse`) for shapes that the soft-unmodeled split reclassified to Conservative → confirm: bare `$var`, `${var:-default}`, `if`, `for`, subshell, compound `{ ;}`. The behavior change was shipped + spec'd (PERMISSION_ENGINE.md §5.2) and covered at the resolver level (`resolvers.test.ts`), but the end-to-end conformance YAML was never updated, so it failed once run. No code change — only the conformance expectations.
+
+Corrected to the actual engine disposition: `$var`/`${}` (no compound metachar) take the resolver soft path (`resolver_kind: conservative`, reason `variable_expansion`/`parameter_expansion`); subshell uses `(ls)` to exercise the soft subshell node (reason `subshell`); `if`/`for`/compound contain `;`/`&&`, so the engine's policy-layer compound check forces confirm first (reason `compound shell command`, `source_section: bash`) — every case is now confirm, never auto-allowed. Updated the file's header/group comments (Group B is now mixed refuse+confirm; Group D is soft→confirm, not RED_FLAG). Full `tests/conformance/` (166) green. **Branch:** `chore/sec-fixes`.
+
 ## [2026-05-29] permissions — `/run/media` glob carve-out required a segment slash
 
 The removable-media glob carve-out (`isGlobSafeRunCarveout`, the SUBSET of the `/run` deny exception that lets a repo on an external drive glob freely) had an equality branch: `absPath === '/run/media' || absPath.startsWith('/run/media/')`. When the glob metachar is appended to the segment — `ls /run/media*` — `globLiteralPrefix` resolves to `/run/media`, so the equality branch marked the prefix safe and `couldGlobReachProtected` skipped the `/run` deny scan. But that glob expands to siblings like `/run/mediaevil` / `/run/mediator` that sit directly under the protected `/run` zone, not inside the `/run/media/` mount tree — so a protected-zone glob that was previously refused was now allowed.
