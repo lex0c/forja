@@ -3726,7 +3726,15 @@ const analyzeCommand = (
   // eval/dd/sudo. Without this, the soft→conservative split would let
   // `'eval'`/`ev''al`/`\eval` reach an operator-approvable confirm.
   const bareName = stripShellQuoting(shape.name);
-  if (isHardRefuseCommand(shape.name) || isHardRefuseCommand(bareName)) {
+  // Resolve a path-qualified launcher to its basename for EVERY name-keyed
+  // classification below. `/bin/sh`, `/usr/bin/env`, `/usr/bin/python`
+  // must be treated like bare `sh`/`env`/`python` — otherwise they miss
+  // the hard-refuse / cmdEnv / cmdInterpreter checks and fall to the
+  // registry-miss Conservative branch, which `mode: bypass` auto-allows:
+  // a shell/interpreter-as-command deny bypass. (Bonus: `/bin/cat foo`
+  // now resolves like `cat foo` instead of the unknown-command path.)
+  const name = basename(bareName);
+  if (isHardRefuseCommand(name)) {
     return {
       refuse: `bash: command '${shape.name}' has no safe capability resolution`,
     };
@@ -3760,13 +3768,13 @@ const analyzeCommand = (
     return value.length > 0 ? value : null;
   };
   let escalated = false;
-  if (!isPureOutputCommand(shape.name)) {
+  if (!isPureOutputCommand(name)) {
     const targets = protectedTargets(ctx.home, ctx.cwd);
     for (const arg of shape.args) {
       if (arg.length === 0) continue;
       const candidate = extractFlagValue(arg);
       if (candidate === null) continue;
-      const op: 'read' | 'write' = isReadOnlyCommand(shape.name) ? 'read' : 'write';
+      const op: 'read' | 'write' = isReadOnlyCommand(name) ? 'read' : 'write';
 
       // Slice 125 (R2 P0-3): shell brace + glob expansion bypass.
       // `rm /e{tc}/passwd` parses as a single `word` in the tree-
@@ -3844,7 +3852,7 @@ const analyzeCommand = (
   const redir = classifyRedirects(shape.redirects, ctx);
   if ('refuse' in redir) return { refuse: redir.refuse };
 
-  const handler = COMMAND_TABLE.get(shape.name);
+  const handler = COMMAND_TABLE.get(name);
   if (handler === undefined) {
     // Registry miss → Conservative, not Refuse (PERMISSION_ENGINE.md
     // §5.2 step 3c). Not in HARD_REFUSE_COMMANDS, so not categorically

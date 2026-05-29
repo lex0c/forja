@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-29] permissions — path-qualified shell/interpreter launchers bypassed the hard-refuse deny
+
+Another instance of the registry-miss → Conservative regression: `analyzeCommand` keyed every name classification (isHardRefuseCommand, isPureOutputCommand, isReadOnlyCommand, COMMAND_TABLE lookup) on the FULL command name. A path-qualified launcher — `/bin/sh -c '…'`, `/usr/bin/env sh -c …`, `/usr/bin/python -c …`, `/bin/bash -c …`, `/usr/bin/sudo …`, `/sbin/mkfs.ext4 …` — didn't match the bare-name hard-refuse set (`sh`/`bash`/`sudo`/…), the `env` cmdEnv refuse, or the `python` cmdInterpreter `-c` refuse, so it fell to the registry-miss Conservative branch — and `mode: bypass` auto-allows Conservative (caps only `exec:shell`, nothing for the §11 floor to catch). A shell/interpreter-as-command deny, unlockable.
+
+**Fix.** `analyzeCommand` now resolves the command to `basename(stripShellQuoting(shape.name))` and keys ALL name classifications on that, so `/bin/sh` is treated exactly like `sh`. Closes the bypass for hard-refuse commands, `env`, and the interpreter handlers in one place; as a bonus, path-qualified KNOWN commands (`/bin/cat foo`) now resolve to their handler (read caps) instead of the unknown-command path. Quote+path combos (`'/bin/sh'`, `/bin/'sh'`) and the in-loop form are covered too (stripShellQuoting runs before basename, and the soft path runs analyzeCommand per command). Error/audit messages still show the original `shape.name`.
+
+**Validated** end-to-end: all path-qualified launchers (incl. quoted, sudo, mkfs.*, inside a loop) Refuse; bare forms unchanged; `/bin/cat foo` → Ok with `read-fs`. New regression describe in `resolvers.test.ts`; full permissions + harness/tools (2797) + typecheck + biome clean. **Branch:** `chore/sec-fixes`.
+
 ## [2026-05-29] permissions/sandbox — close the rest of the final-review findings (robustness, docs, dedup, tests)
 
 Cleared the lower-severity findings the final review left open after the redirect-bypass fix:

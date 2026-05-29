@@ -2063,6 +2063,36 @@ describe('bash resolver — quote/escape-laundered hard commands still Refuse', 
   });
 });
 
+// Review regression: a PATH-QUALIFIED launcher (`/bin/sh`, `/usr/bin/env`,
+// `/usr/bin/python`) must resolve like its bare form. Pre-fix it missed
+// the hard-refuse / cmdEnv / cmdInterpreter checks (which key on the bare
+// name) and fell to registry-miss Conservative — auto-allowed under
+// mode:bypass, a shell/interpreter-as-command deny bypass. analyzeCommand
+// now keys every classification on basename(stripShellQuoting(name)).
+describe('bash resolver — path-qualified shell/interpreter launchers still Refuse', () => {
+  test.each([
+    "/bin/sh -c 'rm -rf /'",
+    '/usr/bin/env sh -c x', // env runs its arg as a command
+    "/usr/bin/python -c 'x'", // interpreter inline code
+    '/bin/bash -c x',
+    '/usr/bin/sudo rm -rf /var',
+    '/sbin/mkfs.ext4 /dev/sda', // mkfs.* prefix, path-qualified
+    "'/bin/sh' -c x", // whole launcher quoted
+    "/bin/'sh' -c x", // basename quoted
+    'for x in *; do /bin/sh -c "$x"; done', // inside a soft loop too
+  ])('%s → Refuse', (cmd) => {
+    expect(resolveCapabilities('bash', { command: cmd }, CTX).kind).toBe('refuse');
+  });
+
+  test('path-qualified KNOWN command resolves like its bare form (basename → cmdRead)', () => {
+    const r = resolveCapabilities('bash', { command: '/bin/cat /work/proj/f' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/work/proj/f');
+    }
+  });
+});
+
 // /dev pseudo-device redirect carve-out: `> /dev/null` etc. are the
 // most common shell idioms and must NOT be refused, while dangerous /dev
 // targets (block devices, /dev/tcp reverse shell) stay denied.
