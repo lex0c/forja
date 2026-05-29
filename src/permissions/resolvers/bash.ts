@@ -721,6 +721,26 @@ const cmdDu: CommandResolver = (_positional, tokens, ctx) => {
   return { capabilities: caps, confidence: 'high' };
 };
 
+// `wc` is read-only too, with the same `--files0-from=F` manifest-read flag
+// as sort/du (GNU coreutils): F is read, so `wc --files0-from=.env` must
+// surface read-fs:F, not just the cwd baseline. (`--total=WHEN` takes an
+// enum value, stripped so it can't pollute the path split; wc has no
+// pattern-file flag.) Stays in isReadOnlyCommand — wc never writes.
+const WC_VALUE_FLAGS: ReadonlySet<string> = new Set(['--files0-from', '--total']);
+
+const cmdWc: CommandResolver = (_positional, tokens, ctx) => {
+  const readTargets = extractValueFlag(tokens, { longForm: '--files0-from' }).filter(
+    (v) => v !== '-',
+  );
+  const inputs = stripFlags(tokens, WC_VALUE_FLAGS).filter((v) => v !== '-');
+  const caps = [
+    ...inputs.map((p) => readFs(resolveArg(p, ctx))),
+    ...readTargets.map((p) => readFs(resolveArg(p, ctx))),
+  ];
+  if (caps.length === 0) caps.push(readFs(ctx.cwd)); // bare `wc` reads stdin
+  return { capabilities: caps, confidence: 'high' };
+};
+
 // Pure-output writers (echo / printf). They emit their arguments
 // verbatim to stdout — a string like "/etc/passwd" passed to echo
 // is NOT a filesystem read, it's text. No read-fs capability is
@@ -2773,7 +2793,7 @@ const COMMAND_TABLE: ReadonlyMap<string, CommandResolver> = new Map<string, Comm
   ['cat', cmdRead],
   ['head', cmdReadWithSize],
   ['tail', cmdReadWithSize],
-  ['wc', cmdRead],
+  ['wc', cmdWc],
   ['file', cmdRead],
   ['stat', cmdRead],
   ['pwd', cmdRead],

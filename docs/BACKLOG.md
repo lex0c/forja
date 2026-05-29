@@ -2,6 +2,12 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-29] permissions — track wc --files0-from (the third coreutils manifest reader)
+
+Proactive follow-up: `wc` is the third GNU coreutils command (after sort and du) that takes `--files0-from=F` (reads the NUL-separated path list from F), and it was still on plain cmdRead — verified with a probe that `wc --files0-from=.env` resolved to only the cwd baseline, the same §8.4-floor blind spot just fixed for sort/du. Dedicated `cmdWc`: emits read-fs for `--files0-from` (`-` = stdin filtered) and the path operands, strips `--total=WHEN` so its enum value can't pollute the path split. wc has no pattern-file flag and never writes, so it stays in isReadOnlyCommand.
+
+**Validated:** +2 regression tests (`wc --files0-from=` → read-fs on the manifest; plain `wc -l` stays a clean read); full `tests/permissions/` (2106) + typecheck + biome clean. With this, the three `--files0-from` coreutils readers (sort, du, wc) are all covered. **Branch:** `chore/sec-fixes`.
+
 ## [2026-05-29] permissions — track du's file-reading flags (--files0-from, --exclude-from/-X)
 
 Same class as the sort `--files0-from` fix. `du` was registered to plain cmdRead, but two flags take a FILE it reads: `--files0-from=F` (NUL-separated path manifest — du then reads the listed paths) and `--exclude-from=FILE` / `-X FILE` (a pattern file). Under cmdRead the combined `=` forms were dropped by stripFlags, so `du --files0-from=.env` resolved to only the cwd baseline — the §8.4 sensitive-path floor (caps-only) never saw the manifest read. Confirmed with a probe (the `-X FILE` space form accidentally worked via the positional split; the `=` forms leaked).

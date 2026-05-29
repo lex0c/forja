@@ -2427,6 +2427,24 @@ describe('bash resolver — du file-reading flags surface the manifest read', ()
       expect(caps.some((c) => c.startsWith('write-fs:'))).toBe(false);
     }
   });
+
+  test('wc --files0-from=FILE reads the manifest FILE (same class as sort/du)', () => {
+    const r = resolveCapabilities('bash', { command: 'wc --files0-from=/work/proj/.env' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/work/proj/.env');
+    }
+  });
+
+  test('plain wc stays a clean read (regression)', () => {
+    const r = resolveCapabilities('bash', { command: 'wc -l /work/proj/data' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const caps = capStrings(r.capabilities);
+      expect(caps).toContain('read-fs:/work/proj/data');
+      expect(caps.some((c) => c.startsWith('write-fs:'))).toBe(false);
+    }
+  });
 });
 
 // Review regression: a PATH-QUALIFIED interpreter as a pipe/xargs target
