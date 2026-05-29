@@ -283,6 +283,7 @@ Resolver bash usa **AST parsing** (lib `tree-sitter-bash`), não regex. Pipeline
 | `git` | switch por subcomando: `commit`/`push` → `git-write(repo)`; `clean -f` → `delete-fs(repo) + git-write(repo)` |
 | `npm`, `yarn`, `bun`, `pip` | `exec:arbitrary + write-fs(node_modules \| venv) + net-egress(registry hosts)` |
 | `cat`, `ls`, `head`, `tail`, `wc`, `grep`, `find` (sem `-exec`) | `read-fs(args)` |
+| `sort`, `uniq`, `cut`, `comm`, `paste`, `tr`, `nl`, `tac`, `rev`, `fold`, `column`, `diff`, `cmp`, `jq`, `du`, `df`, `tree`, `basename`, `dirname` | filtros read-only: `read-fs(args)` (texto/metadata puro; sem exec, sem write). Mesma classe de `cat`/`wc` — registrados no `command_resolver_registry` pra não caírem no fallback Conservative à toa. Excluídos deliberadamente: `sed` (`-i`/`w` escrevem), `awk` (`system()`/redirect), `xargs` (exec), pagers `less`/`more` (`!cmd` shell-out) — esses seguem como comando desconhecido → Conservative |
 | `find` com `-exec` | `exec:arbitrary` + capabilities do comando exec |
 | `chmod`, `chown` | `write-fs(target)` + flag `permission-mutate` (escala score) |
 | `dd`, `mkfs.*`, `fdisk`, `parted`, `mkswap`, `shred` | sempre `Refuse` em v2 (não há resolver seguro) |
@@ -329,11 +330,25 @@ O contrato §5.1 do resolver é "emit capabilities OR Refuse". Por design, o res
 
 - **SSRF blocklist (slice 129 R5 P0)** em `fetch_url`: loopback, RFC1918, link-local (incluindo AWS/GCP metadata at 169.254.169.254), CGNAT, multicast, IPv6 loopback / link-local / unique-local, IPv4-mapped/-compatible IPv6 (slice 140 sec-4). Operator não pode `allow: 169.254.169.254` mesmo querendo — o resolver Refuse antes da policy entrar. Spec dependency: `SECURITY_GUIDELINE.md §9.1.6`.
 - **Bash hard-refuse commands**: `eval`, `exec`, `source`, `command`, `builtin`, `env <prog>` (slice 139 C1), `dd`, `fdisk`, etc. (lista canônica em `bash.ts:HARD_REFUSE_COMMANDS`). Operator não pode autorizar via `allow: "env *"` — o resolver Refuse antes.
-- **Bash RED_FLAG_NODES**: command substitution, process substitution, parameter expansion runtime, function definitions, etc. (lista em `bash.ts:RED_FLAG_NODES`). AST shapes que o resolver não consegue modelar staticamente.
+- **Bash hard AST shapes (`HARD_REFUSE_NODES`)**: command substitution `$(...)`, process substitution `<(...)`/`>(...)`, function definitions, prefixo `VAR=val cmd` (override de binary resolution), arithmetic expansion `$((...))`, heredoc/herestring com corpo, indirect `${!var}`, command_name dinâmico. Shapes que habilitam exec arbitrário ou injeção que o resolver não consegue modelar → Refuse pre-policy. (Lista canônica em `bash.ts:HARD_REFUSE_NODES`.)
 
 A semântica: resolver Refuse é uma **trava engine-level** que **operator policy não pode destravar**. A motivação é o threat model — esses shapes representam classes de comportamento que mesmo um operador "trusted" não deveria poder autorizar via policy YAML (separação operator vs platform). Diferente de `[[deny]]` em policy, que é override-able via layer mais alto: resolver Refuse é piso, policy é teto.
 
 Pre-amend, §5 falava genericamente de "Refuse" mas não documentava que Refuse vem ANTES das static rules. Slice 141 M3 amenda explicitamente.
+
+#### Soft-unmodeled → Conservative (não Refuse)
+
+Nem todo shape não-modelável é perigoso, e jogar todos no `Refuse` (deny duro, pre-policy, sem confirm) contradiz §5.2 step 3c ("miss → `conservative()`") e TREE_SITTER_SHELL §9.3 ("o resto vira confirm humano — exatamente onde deveria"). Uma fase do resolver lumpava control flow e comando-fora-do-registry no mesmo `Refuse` que `eval`/`$(...)`, o que matava até `for f in *.ts; do cat "$f"; done` e `sort foo` — o modelo não conseguia rodar script básico nem read no path do próprio repo.
+
+Disposição correta — estes shapes → **Conservative** (força `confirm`; operator decide), NÃO Refuse:
+
+- **Control flow / agrupamento**: `if`/`while`/`for`/`case`, subshell `( )`, grupo `{ ; }`, negação `! cmd`, condicional `[[ ]]`/`[ ]`.
+- **Expansão de valor**: `$var`, `${var:-x}`, arg com conteúdo runtime não-literal (command name continua tendo que ser literal — dinâmico → hard Refuse).
+- **Comando fora do `command_resolver_registry`** (table-miss), conforme o fallback Conservative já especificado acima.
+
+Salvaguarda (a parte load-bearing): antes de degradar pra Conservative, o resolver faz um scan de blocklist do **AST inteiro** (`scanForHardConstructs`) — se houver QUALQUER `HARD_REFUSE_NODES`, comando em `HARD_REFUSE_COMMANDS`, ou pipe-to-shell em qualquer ponto (inclusive dentro do corpo do loop/condicional), o resultado volta a ser Refuse. Assim `for x in *; do eval "$x"; done` continua deny (o `eval` no corpo é pego pelo scan), mas `for f in *.ts; do cat "$f"; done` vira confirm. A trava pre-policy de §5.2 (Refuse não-destravável) permanece intacta pro conjunto hard; só o conjunto soft-benigno migra pra Conservative.
+
+Headless / não-interativo: Conservative sem operador resolve como qualquer `confirm` não-respondível → deny. A postura de segurança não afrouxa; o que muda é parar de matar comando benigno quando existe humano (ou policy `allow`) pra aprovar.
 
 ### 5.3 Resolvers de MCP tools
 
@@ -944,7 +959,7 @@ scrub_env = [
 ```
 
 Implementação:
-- **hide_paths** → bwrap `--bind /dev/null <path>` (path some pro processo).
+- **hide_paths** → dirs: `--tmpfs <path>` (overlay vazio); files: `--ro-bind <empty-regular-file> <path>` (read-only sobre um arquivo regular vazio). Pré-fix os files usavam `--ro-bind /dev/null` (char device), mas ferramentas que leem esses paths como config (git 2.54 → `fatal: unknown error occurred while reading the configuration files`; npm; …) recusam um config não-regular — o masking QUEBRAVA git/npm dentro do sandbox. Arquivo regular vazio: a ferramenta vê config vazio (funciona), o conteúdo real fica escondido (sem vazar PII) e o bind read-only impede write-plant em `home-rw`. O source é um arquivo vazio session-cached criado host-side (lido pelo bwrap antes do namespace `--tmpfs /tmp`).
 - **scrub_env** → engine constrói env limpo antes do exec; glob match contra keys; matched keys removed.
 
 Reverter scrubbing exige capability `secret-access:<store>` autorizada, e tem TTL hardcoded `once` (não promovível).
@@ -995,6 +1010,8 @@ Pseudofs do kernel + sockets runtime de daemons privilegiados. Read e write ambo
 /proc/, /sys/, /boot/, /dev/
 /run/, /var/run/      (docker.sock, postgresql.sock, dbus — slice 180)
 ```
+
+**Carve-out `/dev` (pseudo-devices seguros).** O deny de `/dev/` exclui um conjunto fixo de pseudo-devices kernel-managed inofensivos pra read+write: `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`, `/dev/tty`, `/dev/std{in,out,err}`, e o prefixo `/dev/fd/` (fds do próprio processo). Sem o carve-out, `> /dev/null` / `2>/dev/null` (o alvo de redirect mais comum do shell) era recusado, bloqueando uma fatia enorme de comandos normais. Continuam deny: block devices (`/dev/sda*`), memória crua (`/dev/mem`, `/dev/kmem`, `/dev/port`) e as pseudo-paths bash-virtuais de rede (`/dev/tcp/<host>/<port>`, `/dev/udp/...` — reverse-shell-via-redirect, §5.2). Lista canônica em `protected_paths.ts:SYSTEM_DEV_SAFE_EXACT` + `isDevSafe`.
 
 ### 11.2 Tier `escalate` — write/delete escala pra confirm
 

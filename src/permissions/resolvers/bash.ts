@@ -45,7 +45,11 @@ import {
   readFs,
   writeFs,
 } from '../capabilities.ts';
-import { classifyProtectedPath, protectedTargets } from '../protected_paths.ts';
+import {
+  classifyProtectedPath,
+  isGlobSafeRunCarveout,
+  protectedTargets,
+} from '../protected_paths.ts';
 import {
   type Resolver,
   type ResolverContext,
@@ -293,6 +297,34 @@ const RED_FLAG_NODES: ReadonlyMap<string, string> = new Map([
   //     (caught by `detectPipeToShell` when the threat shape applies)
   // The grammar-drift snapshot suite surfaces any future kind a
   // version bump introduces.
+]);
+
+// Soft-unmodeled subset of RED_FLAG_NODES (PERMISSION_ENGINE.md §5.2,
+// "Soft-unmodeled → Conservative"). These kinds aren't statically
+// resolvable but don't, by themselves, enable arbitrary exec/injection:
+// control flow, grouping, negation, conditionals, value expansion. When
+// the FIRST node that stops the whitelist walk is one of these AND
+// `scanForHardConstructs` clears the whole tree, the resolver returns
+// Conservative (→ confirm) instead of a hard pre-policy Refuse — so the
+// model can run `for f in *.ts; do cat "$f"; done` (operator approves)
+// while `for x in *; do eval "$x"; done` still hard-refuses (the inner
+// `eval` is caught by the scan). Everything in RED_FLAG_NODES NOT listed
+// here (command/process substitution, function defs, `VAR=val cmd`
+// prefix, arithmetic, heredoc/herestring, ansi-c, subscript) stays HARD:
+// it enables exec/injection the resolver can't bound, so it remains a
+// pre-policy Refuse that operator policy can't unlock.
+const SOFT_UNMODELED_NODES: ReadonlySet<string> = new Set([
+  'expansion', // ${var:-x} — value substitution
+  'simple_expansion', // $var — value not resolvable statically
+  'if_statement',
+  'while_statement',
+  'for_statement',
+  'case_statement',
+  'subshell', // ( cmd ) — inner commands still scanned for hard shapes
+  'compound_statement', // { cmd; }
+  'negated_command', // ! cmd
+  'test_command', // [[ ]] / [ ]
+  'test_operator',
 ]);
 
 // Hard refuses by command name. §13 reject list from
@@ -2541,6 +2573,35 @@ const COMMAND_TABLE: ReadonlyMap<string, CommandResolver> = new Map<string, Comm
   ['file', cmdRead],
   ['stat', cmdRead],
   ['pwd', cmdRead],
+  // Read-only text / metadata filters (PERMISSION_ENGINE.md §5.2). Same
+  // class as cat/wc: read path args (if any), write stdout, no exec, no
+  // fs mutation. All map to `cmdRead` — which over-declares a read for
+  // every positional (conservative: a non-file arg like a `tr` set or a
+  // `jq` filter resolves to a harmless in-cwd read, never an
+  // under-declaration). Registered so they resolve cleanly instead of
+  // hitting the Conservative registry-miss path on every use. Excluded
+  // by design: `sed` (-i / w writes), `awk` (system()/redirect), `xargs`
+  // (exec), pagers `less`/`more` (!cmd shell-out) — those stay off the
+  // registry and route to Conservative → confirm.
+  ['sort', cmdRead],
+  ['uniq', cmdRead],
+  ['cut', cmdRead],
+  ['comm', cmdRead],
+  ['paste', cmdRead],
+  ['tr', cmdRead],
+  ['nl', cmdRead],
+  ['tac', cmdRead],
+  ['rev', cmdRead],
+  ['fold', cmdRead],
+  ['column', cmdRead],
+  ['diff', cmdRead],
+  ['cmp', cmdRead],
+  ['jq', cmdRead],
+  ['du', cmdRead],
+  ['df', cmdRead],
+  ['tree', cmdRead],
+  ['basename', cmdRead],
+  ['dirname', cmdRead],
   ['echo', cmdEcho],
   ['printf', cmdEcho],
   ['grep', cmdGrep],
@@ -2713,8 +2774,17 @@ const containsUnicodeBypass = (text: string): boolean => {
 // string arg` — same refuse semantics as embedded substitution.
 const literalText = (node: Node): string | null => {
   let raw: string;
-  if (node.type === 'word' || node.type === 'raw_string') {
+  if (node.type === 'word') {
     raw = node.text;
+  } else if (node.type === 'raw_string') {
+    // raw_string is always `'...'`; bash's quote removal yields the inner
+    // literal. Pre-fix we returned the bytes WITH the quotes, so `'eval'`
+    // resolved to the command name `'eval'` (≠ `eval`) and slipped past
+    // isHardRefuseCommand / SHELL_INTERPRETERS — a quote-laundering
+    // bypass once a registry miss stopped being a hard refuse. Strip the
+    // surrounding single-quotes to match bash (the `string` branch below
+    // already strips its quotes).
+    raw = node.text.replace(/^'/, '').replace(/'$/, '');
   } else if (node.type === 'number') {
     // Tree-sitter-bash tokenizes numeric literals as their own
     // node-kind (`-p 2222`, `-maxdepth 3`). Treating them as
@@ -2776,6 +2846,19 @@ interface WalkResult {
   // as one bash invocation.
   commands?: CommandShape[];
   refuse?: string;
+  // True when the walk passed through any soft-unmodeled shape (control
+  // flow, grouping, value expansion, a dynamic command ARG). Soft shapes
+  // are RECURSED (not short-circuited): the inner commands are still
+  // collected into `commands` and run through analyzeCommand, and the
+  // resolver routes the whole call to Conservative (confirm) when `soft`
+  // is set and no inner command hard-refused. A HARD construct or a
+  // dynamic command NAME anywhere still produces `refuse` regardless of
+  // `soft`. See `bashResolver`.
+  soft?: boolean;
+  // The first soft-unmodeled reason encountered (e.g. `for_statement:
+  // control flow not modeled`). Carried into the Conservative reason so
+  // the modal/audit name the construct, not just "unmodeled shape".
+  softReason?: string;
 }
 
 // Recursion depth ceiling for `walkAst` (slice 98, R2 #198). A
@@ -2795,7 +2878,25 @@ const MAX_AST_DEPTH = 64;
 // `command` nodes into shapes.
 const walkAst = (root: Node): WalkResult => {
   const commands: CommandShape[] = [];
-  const visit = (node: Node, depth: number): string | null => {
+  // Set when the walk passes through any soft-unmodeled shape (control
+  // flow, grouping, value expansion, a dynamic command ARG). Unlike a
+  // HARD refuse (which short-circuits the walk), soft shapes are
+  // RECURSED so the inner commands are still collected into `commands`
+  // and the resolver can run every one through analyzeCommand. The whole
+  // call then routes to Conservative (confirm) when `sawSoft` is set and
+  // nothing hard-refused.
+  let sawSoft = false;
+  // First soft-unmodeled reason seen — carried into the Conservative
+  // reason so the modal/audit name the construct.
+  let softReason: string | null = null;
+  // `softCtx` is true once we are INSIDE a soft-unmodeled node: there,
+  // non-whitelisted STRUCTURAL nodes (do_group, case_item, `[[ ]]`
+  // expression internals) are tolerated (recursed) rather than refused,
+  // non-whitelisted STRUCTURAL nodes (do_group, case_item, `[[ ]]`
+  // expression internals) are tolerated (recursed) rather than refused,
+  // so the walk can reach the inner commands. HARD red-flag nodes and
+  // dynamic command NAMES still refuse regardless of context.
+  const visit = (node: Node, depth: number, softCtx: boolean): string | null => {
     if (depth > MAX_AST_DEPTH) {
       return `bash_shape_not_recognized: ast_depth_exceeded (>${MAX_AST_DEPTH})`;
     }
@@ -2803,17 +2904,53 @@ const walkAst = (root: Node): WalkResult => {
     // (e.g. expansion that happens to be enumerated in whitelist).
     const redFlag = RED_FLAG_NODES.get(node.type);
     if (redFlag !== undefined) {
+      if (SOFT_UNMODELED_NODES.has(node.type)) {
+        // Soft (control flow, value expansion): not inherently
+        // dangerous. Mark soft and DESCEND (don't short-circuit) so the
+        // inner commands are collected + analyzed and any inner HARD
+        // construct is still caught. This is what lets
+        // `for f in *.ts; do cat "$f"; done` confirm while
+        // `for x in *; do rm -rf /; done` still denies (the inner rm
+        // hard-refuses in analyzeCommand).
+        sawSoft = true;
+        softReason ??= redFlag;
+        for (const child of node.children) {
+          if (child === null) continue;
+          const refuse = visit(child, depth + 1, true);
+          if (refuse !== null) return refuse;
+        }
+        return null;
+      }
+      // HARD red-flag (command/process substitution, function def,
+      // `VAR=val` prefix, arithmetic, heredoc/herestring, ansi-c,
+      // subscript) → pre-policy refuse, in any context.
       return `bash_shape_not_recognized: ${redFlag}`;
     }
     // Skip ERROR nodes — tree-sitter recovers from parse errors and
     // emits ERROR placeholders. Anything error-recovered is by
-    // definition outside the whitelist.
+    // definition outside the whitelist. Hard refuse regardless of
+    // context (adversarial breakage, §12.4).
     if (node.type === 'ERROR' || node.isError) {
       return `bash_shape_not_recognized: parse_error at ${node.startPosition.row}:${node.startPosition.column}`;
     }
     if (isPunctuationType(node.type)) return null;
     if (!WHITELIST_NODE_TYPES.has(node.type)) {
-      return `bash_shape_not_recognized: ${node.type}`;
+      // Top level (strict): an unknown shape is a hard refuse (closed
+      // whitelist). Inside a soft construct: tolerate the structural
+      // node (do_group, `[[ ]]` internals, case_item, …) and recurse —
+      // inner HARD nodes and commands are still validated/collected
+      // below. Mark soft so the whole call routes to Conservative.
+      if (!softCtx) {
+        return `bash_shape_not_recognized: ${node.type}`;
+      }
+      sawSoft = true;
+      softReason ??= `unsupported_shape: ${node.type}`;
+      for (const child of node.children) {
+        if (child === null) continue;
+        const refuse = visit(child, depth + 1, true);
+        if (refuse !== null) return refuse;
+      }
+      return null;
     }
     // Decompose `command` nodes into shapes.
     if (node.type === 'command') {
@@ -2828,6 +2965,10 @@ const walkAst = (root: Node): WalkResult => {
           }
           const text = literalText(inner);
           if (text === null) {
+            // Dynamic command NAME ($X, ${!ref}, $(...)-derived): the
+            // resolver cannot know which binary runs → HARD refuse, even
+            // inside a soft construct. This is the spec's HARD tier and
+            // the reason `for x in *; do $x; done` denies.
             return `bash_shape_not_recognized: dynamic command_name (${inner.type})`;
           }
           shape.name = text;
@@ -2840,18 +2981,37 @@ const walkAst = (root: Node): WalkResult => {
         ) {
           const text = literalText(child);
           if (text === null) {
-            return 'bash_shape_not_recognized: dynamic content inside string arg';
+            // A Unicode-disguise arg (RTL override, BOM, zero-width) is
+            // adversarial — keep it a HARD refuse; the resolver can't
+            // trust the visual form. Distinct from a benign dynamic value
+            // like "$f", which is soft → confirm.
+            if (containsUnicodeBypass(child.text)) {
+              return 'bash_shape_not_recognized: unicode bypass in arg';
+            }
+            // Dynamic ARG value (e.g. "$f"). Unlike a dynamic NAME this
+            // isn't categorically dangerous — the command is known. Mark
+            // soft, DESCEND to catch any HARD construct hiding inside the
+            // arg (e.g. "$(evil)"), then skip the unresolved literal.
+            sawSoft = true;
+            softReason ??= 'dynamic value in arg';
+            const refuse = visit(child, depth + 1, softCtx);
+            if (refuse !== null) return refuse;
+            continue;
           }
           shape.args.push(text);
         } else if (child.type === 'file_redirect') {
           const r = redirectShape(child);
           if (r === null) {
+            // Non-literal redirect target: kept a HARD refuse (a
+            // runtime-computed write destination the resolver can't
+            // classify) — unchanged from prior behavior.
             return 'bash_shape_not_recognized: redirect target is non-literal';
           }
           shape.redirects.push(r);
         } else if (!isPunctuationType(child.type)) {
-          // Recurse into red-flag check / unknown.
-          const refuse = visit(child, depth + 1);
+          // Recurse into red-flag check / unknown (e.g. a bare
+          // `simple_expansion` arg → soft).
+          const refuse = visit(child, depth + 1, softCtx);
           if (refuse !== null) return refuse;
         }
       }
@@ -2870,7 +3030,7 @@ const walkAst = (root: Node): WalkResult => {
       const before = commands.length;
       for (const child of node.children) {
         if (child === null) continue;
-        const refuse = visit(child, depth + 1);
+        const refuse = visit(child, depth + 1, softCtx);
         if (refuse !== null) return refuse;
       }
       // Merge any file_redirects that appeared as siblings into the
@@ -2895,15 +3055,15 @@ const walkAst = (root: Node): WalkResult => {
     // recurse into children — the walk validates each level.
     for (const child of node.children) {
       if (child === null) continue;
-      const refuse = visit(child, depth + 1);
+      const refuse = visit(child, depth + 1, softCtx);
       if (refuse !== null) return refuse;
     }
     return null;
   };
 
-  const refuse = visit(root, 0);
+  const refuse = visit(root, 0, false);
   if (refuse !== null) return { refuse };
-  return { commands };
+  return { commands, soft: sawSoft, ...(softReason !== null ? { softReason } : {}) };
 };
 
 // Detect pipe-to-shell on a `pipeline` node. Returns the offending
@@ -2931,7 +3091,12 @@ const detectPipeToShell = (root: Node): string | null => {
 
     // Direct pipe-to-interpreter: last stage IS a known
     // stdin-reading interpreter (`sh`, `bash`, `python`, `node`, etc.).
-    if (SHELL_INTERPRETERS.has(text)) return text;
+    // Check the quote/escape-stripped form too (`s'h'` → sh, `\sh` → sh)
+    // to match bash's quote removal — literalText handles raw_string
+    // quotes; this covers backslash + residual laundering.
+    if (SHELL_INTERPRETERS.has(text) || SHELL_INTERPRETERS.has(text.replace(/['"\\]/g, ''))) {
+      return text;
+    }
 
     // xargs-wrapped exec: `... | xargs sh -c '<arg>'`,
     // `... | xargs python -c '<arg>'`, etc. xargs's positional
@@ -2947,7 +3112,10 @@ const detectPipeToShell = (root: Node): string | null => {
       for (const child of argChildren) {
         if (child === null || child === undefined) continue;
         const argText = literalText(child) ?? child.text;
-        if (SHELL_INTERPRETERS.has(argText)) {
+        if (
+          SHELL_INTERPRETERS.has(argText) ||
+          SHELL_INTERPRETERS.has(argText.replace(/['"\\]/g, ''))
+        ) {
           return `xargs ${argText}`;
         }
       }
@@ -2971,6 +3139,28 @@ const isReadOnlyCommand = (name: string): boolean => {
     case 'grep':
     case 'rg':
     case 'find':
+    // Read-only filters (registry expansion, PERMISSION_ENGINE.md §5.2).
+    // Classified read-only so their path args resolve as `read` (not
+    // `write`) in the protected-path loop — same posture as cat/wc.
+    case 'sort':
+    case 'uniq':
+    case 'cut':
+    case 'comm':
+    case 'paste':
+    case 'tr':
+    case 'nl':
+    case 'tac':
+    case 'rev':
+    case 'fold':
+    case 'column':
+    case 'diff':
+    case 'cmp':
+    case 'jq':
+    case 'du':
+    case 'df':
+    case 'tree':
+    case 'basename':
+    case 'dirname':
       return true;
     default:
       return false;
@@ -3171,6 +3361,16 @@ const couldGlobReachProtected = (
   absLiteralPrefix: string,
   targets: ReturnType<typeof protectedTargets>,
 ): boolean => {
+  // Removable-media carve-out (mirrors SYSTEM_DENY_EXCEPTIONS, glob
+  // subset). A literal prefix under `/run/media/<user>/<volume>` is a
+  // mounted user filesystem — no protected target is reachable by
+  // expansion from there. The `systemDeny` scan below consumes the RAW
+  // `/run` root, so without this guard every glob run from a repo on
+  // removable media is refused (the literal prefix resolves under
+  // `/run/`). `/run/user` is deliberately NOT carved out — see
+  // `isGlobSafeRunCarveout`: a glob there could expand into XDG IPC
+  // sockets, so it stays conservatively refused.
+  if (isGlobSafeRunCarveout(absLiteralPrefix)) return false;
   const all: string[] = [
     ...targets.systemDeny,
     ...targets.absoluteEscalate,
@@ -3441,8 +3641,19 @@ const detectCwdScopeEscape = (lexicalAbs: string, ctx: ResolverContext): boolean
 const analyzeCommand = (
   shape: CommandShape,
   ctx: ResolverContext,
-): { refuse: string } | { caps: Capability[]; confidence: 'high' | 'medium' | 'low' } => {
-  if (isHardRefuseCommand(shape.name)) {
+):
+  | { refuse: string }
+  | { caps: Capability[]; confidence: 'high' | 'medium' | 'low'; conservative?: string } => {
+  // Hard-refuse check on BOTH the literal name and a quote/escape-
+  // stripped "bare" form. literalText now strips raw_string quotes, but
+  // backslash escapes (`\eval`) and mixed forms can still mask a hard
+  // command; bash removes those at runtime. Stripping `'"\` before the
+  // check matches bash's effective command name — it can only over-match
+  // (safe-side, refuses an exotic literal), never under-match a laundered
+  // eval/dd/sudo. Without this, the soft→conservative split would let
+  // `'eval'`/`ev''al`/`\eval` reach an operator-approvable confirm.
+  const bareName = shape.name.replace(/['"\\]/g, '');
+  if (isHardRefuseCommand(shape.name) || isHardRefuseCommand(bareName)) {
     return {
       refuse: `bash: command '${shape.name}' has no safe capability resolution`,
     };
@@ -3550,7 +3761,14 @@ const analyzeCommand = (
 
   const handler = COMMAND_TABLE.get(shape.name);
   if (handler === undefined) {
-    return { refuse: `bash: unknown command '${shape.name}'` };
+    // Registry miss → Conservative, not Refuse (PERMISSION_ENGINE.md
+    // §5.2 step 3c). The command isn't in HARD_REFUSE_COMMANDS (checked
+    // at the top of analyzeCommand) so it's not categorically dangerous
+    // — just unmodeled. Conservative forces a confirm; the operator (or
+    // a `bash.allow` rule) decides. The protected-path arg loop above
+    // already ran (and would have hard-refused a glob into a deny zone),
+    // so any `escalated` finding is subsumed by the forced confirm.
+    return { caps: [], confidence: 'low', conservative: `unknown_command: ${shape.name}` };
   }
   const positional = stripFlags(shape.args);
   const result = handler(positional, shape.args, ctx);
@@ -3637,15 +3855,21 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
   // single unsafe element can poison the rest.
   const walk = walkAst(root);
   if (walk.refuse !== undefined) {
+    // HARD refuse: a HARD red-flag node (command/process substitution,
+    // function def, `VAR=val` prefix, arithmetic, heredoc/herestring,
+    // ansi-c, subscript), a dynamic command NAME, a non-literal redirect
+    // target, a parse error, or an unmodeled TOP-LEVEL shape — pre-policy
+    // deny the operator can't unlock. Soft-unmodeled shapes do NOT reach
+    // here: walkAst RECURSES through them and returns {commands,
+    // soft:true}, so every command in a loop/conditional body is still
+    // run through analyzeCommand below.
     return { kind: 'refuse', reason: walk.refuse };
   }
   const commands = walk.commands ?? [];
-  if (commands.length === 0) {
-    return { kind: 'refuse', reason: 'bash: no commands recognized' };
-  }
 
-  // Pipe-to-shell detection. Pipeline whose last stage is sh/bash/...
-  // reads stdin as arbitrary script. Refuse.
+  // Pipe-to-shell detection (whole tree, incl. inside a soft loop body).
+  // A pipeline whose last stage is sh/bash/python/... reads stdin as an
+  // arbitrary script. Refuse.
   const pipeShell = detectPipeToShell(root);
   if (pipeShell !== null) {
     return {
@@ -3654,19 +3878,56 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
     };
   }
 
-  // Aggregate capabilities + minimum confidence across all commands.
+  if (commands.length === 0) {
+    // A soft shape with no resolvable command (`[[ -e x ]]`, `( )`) is
+    // unmodeled-but-benign → confirm. Not soft + no command → nothing
+    // recognized → refuse (existing posture).
+    if (walk.soft === true) {
+      return {
+        kind: 'conservative',
+        capabilities: [exec('shell')],
+        reason: `bash: ${walk.softReason ?? 'unmodeled shape'} (no resolvable command) → confirm`,
+      };
+    }
+    return { kind: 'refuse', reason: 'bash: no commands recognized' };
+  }
+
+  // analyzeCommand applies the FULL per-command defense — HARD_REFUSE
+  // commands (incl. quote/escape-laundered names), rm system-roots,
+  // redirect-to-protected-path, protected-path globs, chmod
+  // permission-mutate, git -c RCE, etc. — to EVERY command, INCLUDING
+  // those collected from inside a soft control-flow body. This is the
+  // load-bearing safeguard: it is why `for x in *; do rm -rf /; done`,
+  // `for i in 1; do echo x > /proc/...; done`, `for x in *; do cat
+  // /etc/pass*; done`, and `'eval'`/`$()` inside a loop all stay denied
+  // even though the wrapping shape is soft.
   const allCaps: Capability[] = [exec('shell')];
   let aggregateConf: 'high' | 'medium' | 'low' = 'high';
+  let conservativeReason: string | null = null;
   for (const shape of commands) {
     const result = analyzeCommand(shape, ctx);
     if ('refuse' in result) {
       return { kind: 'refuse', reason: result.refuse };
     }
     allCaps.push(...result.caps);
+    if (result.conservative !== undefined) conservativeReason ??= result.conservative;
     if (result.confidence === 'low') aggregateConf = 'low';
     else if (result.confidence === 'medium' && aggregateConf === 'high') aggregateConf = 'medium';
   }
 
+  // A soft-unmodeled wrapper (control flow / value expansion) OR a
+  // registry-miss command → Conservative (forces confirm), per
+  // PERMISSION_ENGINE.md §5.2. Caps are the honest aggregate of the
+  // resolved inner commands, so the engine's downstream §11 floors (and
+  // the bypass-mode protected-path check) still see real read/write/
+  // delete capabilities — not a blind `[exec('shell')]`.
+  if (walk.soft === true || conservativeReason !== null) {
+    const reason =
+      conservativeReason !== null
+        ? `bash: ${conservativeReason}`
+        : `bash: ${walk.softReason ?? 'unmodeled shape (control flow / value expansion)'} → confirm`;
+    return { kind: 'conservative', capabilities: allCaps, reason };
+  }
   return { kind: 'ok', capabilities: allCaps, confidence: aggregateConf };
 };
 

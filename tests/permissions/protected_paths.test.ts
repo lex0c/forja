@@ -2,6 +2,8 @@ import { describe, expect, test } from 'bun:test';
 import {
   allProtectedRoots,
   classifyProtectedPath,
+  isDevSafe,
+  isGlobSafeRunCarveout,
   protectedTargets,
 } from '../../src/permissions/protected_paths.ts';
 
@@ -520,5 +522,89 @@ describe('classifyProtectedPath — slice 180 additions', () => {
         cwd: CWD,
       }),
     ).toBe('escalate');
+  });
+});
+
+describe('isGlobSafeRunCarveout — removable-media glob carve-out', () => {
+  test.each([
+    '/run/media',
+    '/run/media/op',
+    '/run/media/op/extdrive',
+    '/run/media/op/extdrive/proj/src',
+  ])('%s is a glob-safe carve-out (true)', (p) => {
+    expect(isGlobSafeRunCarveout(p)).toBe(true);
+  });
+
+  test.each([
+    '/run', // the deny root itself
+    '/run/user', // XDG runtime — globs stay conservative (sockets)
+    '/run/user/1000',
+    '/run/user/1000/gnupg',
+    '/run/dbus', // privileged system socket dir
+    '/run/systemd',
+    '/run/mediafoo', // shares a byte-prefix with /run/media but NOT a path segment
+    '/home/op', // unrelated
+    '/etc',
+  ])('%s is NOT a glob-safe carve-out (false)', (p) => {
+    expect(isGlobSafeRunCarveout(p)).toBe(false);
+  });
+});
+
+describe('isDevSafe — /dev pseudo-device deny carve-out', () => {
+  const HOME = '/home/op';
+  const CWD = '/work/proj';
+
+  test.each([
+    '/dev/null',
+    '/dev/zero',
+    '/dev/full',
+    '/dev/random',
+    '/dev/urandom',
+    '/dev/tty',
+    '/dev/stdin',
+    '/dev/stdout',
+    '/dev/stderr',
+    '/dev/fd/3',
+  ])('%s is a safe pseudo-device (true)', (p) => {
+    expect(isDevSafe(p)).toBe(true);
+  });
+
+  test.each([
+    '/dev/sda', // block device
+    '/dev/sda1',
+    '/dev/mem', // raw memory
+    '/dev/kmem',
+    '/dev/port',
+    '/dev/tcp/evil.com/80', // bash-virtual network (reverse shell)
+    '/dev/udp/evil.com/53',
+    '/dev/nullfoo', // byte-prefix of /dev/null, NOT the device
+    '/dev', // the dir itself
+    '/dev/fd', // the dir, not an fd
+  ])('%s is NOT a safe pseudo-device (false)', (p) => {
+    expect(isDevSafe(p)).toBe(false);
+  });
+
+  test('classifyProtectedPath does NOT deny safe /dev pseudo-devices (read AND write)', () => {
+    for (const op of ['read', 'write'] as const) {
+      expect(classifyProtectedPath({ absPath: '/dev/null', op, home: HOME, cwd: CWD })).toBeNull();
+      expect(
+        classifyProtectedPath({ absPath: '/dev/urandom', op, home: HOME, cwd: CWD }),
+      ).toBeNull();
+      expect(classifyProtectedPath({ absPath: '/dev/fd/2', op, home: HOME, cwd: CWD })).toBeNull();
+    }
+  });
+
+  test('classifyProtectedPath STILL denies dangerous /dev nodes (block dev, mem, tcp/udp, dir)', () => {
+    for (const p of [
+      '/dev/sda',
+      '/dev/mem',
+      '/dev/tcp/evil/80',
+      '/dev/udp/evil/53',
+      '/dev/nullfoo',
+      '/dev',
+    ]) {
+      expect(classifyProtectedPath({ absPath: p, op: 'write', home: HOME, cwd: CWD })).toBe('deny');
+      expect(classifyProtectedPath({ absPath: p, op: 'read', home: HOME, cwd: CWD })).toBe('deny');
+    }
   });
 });

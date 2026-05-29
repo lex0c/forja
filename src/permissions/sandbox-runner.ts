@@ -54,7 +54,7 @@
 // `--chdir <cwd>` is added so the wrapped process starts in the
 // caller's expected working directory.
 
-import { realpathSync } from 'node:fs';
+import { existsSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { join as joinPath } from 'node:path';
 import { defaultDataDir } from '../storage/paths.ts';
 // Canonical env allowlist lives in a shared module so the macOS
@@ -67,6 +67,36 @@ import { resolveSandboxBinary } from './sandbox-availability.ts';
 import { HIDE_PATHS_DIRS, HIDE_PATHS_FILES } from './sandbox-hide-paths.ts';
 import { SANDBOX_PROFILE_ORDER, type SandboxProfile, isSandboxProfile } from './sandbox-plan.ts';
 import { buildSandboxExecArgv } from './sandbox-runner-macos.ts';
+
+// Session-cached empty regular file used to mask credential FILES (the
+// HIDE_PATHS_FILES loop binds it read-only over each path). Pre-fix the
+// mask bound `/dev/null` (a char device) — but tools that read those
+// paths as config (git 2.54: `fatal: unknown error occurred while reading
+// the configuration files`; npm; pip; …) refuse a non-regular config
+// file, so the mask BROKE git/npm/… inside the sandbox entirely. An empty
+// REGULAR file makes the tool see an empty config (it works) while still
+// hiding the real content (no PII leak) and staying read-only (no
+// write-plant on home-rw). Created once host-side (bwrap reads the bind
+// SOURCE before the namespace `--tmpfs /tmp` view), mode 0600 in our own
+// data dir so another local user can't plant content into the mask.
+let cachedSandboxMaskFile: string | null = null;
+const ensureSandboxMaskFile = (): string => {
+  if (cachedSandboxMaskFile !== null) return cachedSandboxMaskFile;
+  const dir = defaultDataDir();
+  const p = joinPath(dir, 'sandbox-mask-empty');
+  try {
+    if (!existsSync(p)) {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(p, '', { mode: 0o600 });
+    }
+  } catch {
+    // Best-effort. If creation fails, the `--ro-bind` below errors at
+    // spawn (fail-closed — a missing mask source refuses the call rather
+    // than silently leaving the credential file exposed).
+  }
+  cachedSandboxMaskFile = p;
+  return p;
+};
 
 // Resolve symlinks in the cwd path BEFORE the hide_paths check +
 // mount + chdir. Without this, a literal-string `cwd.startsWith(
@@ -182,6 +212,34 @@ export interface BuildBwrapArgvOptions {
   // the suite can pin a symlink-to-hidden-dir scenario without
   // creating real symlinks on the test runner's filesystem.
   realpath?: (p: string) => string;
+  // Existence probe for hide_paths targets. Production omits and
+  // uses `node:fs.existsSync`; tests inject a deterministic set so
+  // the suite can pin "host has ~/.ssh but not ~/.aws" without
+  // touching the runner's real filesystem.
+  //
+  // Load-bearing for correctness, not just testing. A hide_paths
+  // overlay (`--tmpfs <dir>` / `--ro-bind /dev/null <file>`) masks a
+  // credential path by mounting OVER it. bwrap can only mount over a
+  // mountpoint that exists — for an absent target it first tries to
+  // `mkdir` the mountpoint, which lands under the read-only
+  // `--ro-bind / /` base and fails with EROFS ("Can't mkdir <path>:
+  // Read-only file system"), aborting the ENTIRE spawn before the
+  // inner command runs. Since few operators have every entry of
+  // HIDE_PATHS_{DIRS,FILES} present, this broke sandbox-enforced
+  // spawn-broker calls on almost every host. `shouldMask` (below)
+  // gates emission on existence so absent targets under a read-only
+  // parent are skipped — they're unreadable (absent) and unwritable
+  // (read-only parent), so neither the credential-read nor the
+  // create-and-plant threat applies. Writable-parent profiles
+  // (home-rw) still mask absent targets: there bwrap CAN create the
+  // mountpoint, and the create-and-plant write-tampering vector is
+  // live (`~/.gitconfig` core.sshCommand RCE, policy tamper).
+  pathExists?: (p: string) => boolean;
+  // Test seam — the read-only bind SOURCE used to mask HIDE_PATHS_FILES.
+  // Production omits and uses a session-cached empty regular file
+  // (`ensureSandboxMaskFile`); tests pin a fixed path so the argv is
+  // deterministic without creating a real file on the runner.
+  maskFileSource?: string;
   // Forja-internal control-plane env that must survive the
   // `--clearenv` kernel boundary alongside the canonical
   // `SANDBOX_SAFE_ENV_VARS` allowlist. The runner emits one
@@ -371,6 +429,38 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
     }
   }
 
+  // hide_paths mount-realizability gate. See `pathExists` docstring
+  // for the full EROFS failure mode. A mask overlay (`--tmpfs` for
+  // dirs, `--ro-bind /dev/null` for files) mounts OVER its target;
+  // bwrap can realize that mount only when the target already exists
+  // (mount-over works on the read-only base bind) OR its parent is
+  // writable inside the sandbox so bwrap can create the mountpoint.
+  //
+  // Writable roots per profile mirror the `--bind` mounts emitted
+  // below: cwd-rw / cwd-rw-net bind `cwd`; home-rw binds `home`; ro
+  // binds nothing writable. A target under one of these roots can be
+  // created by bwrap; anything else must pre-exist.
+  //
+  // Skipping an absent target under a read-only parent is SAFE: the
+  // sandboxed process can neither read it (absent — the base
+  // `--ro-bind / /` exposes only what's on disk) nor write it (parent
+  // read-only). On home-rw the parent IS writable, so absent targets
+  // are STILL masked — there the create-and-plant vector is real.
+  const pathExists = options.pathExists ?? existsSync;
+  const writableRoots: readonly string[] =
+    profile === 'home-rw' ? [home] : profile === 'cwd-rw' || profile === 'cwd-rw-net' ? [cwd] : [];
+  const underWritableRoot = (p: string): boolean =>
+    writableRoots.some((root) =>
+      // `root === '/'` is the filesystem root (a cwd-rw profile launched
+      // from `/`): every absolute path is under it. The generic
+      // `${root}/` form would build `//` and match nothing — a
+      // segment-boundary pitfall that would skip credential masks on a
+      // writable-root profile and reopen the create-and-plant vector.
+      root === '/' ? p.startsWith('/') : p === root || p.startsWith(`${root}/`),
+    );
+  const shouldMask = (absPath: string): boolean =>
+    pathExists(absPath) || underWritableRoot(absPath);
+
   const flags: string[] = [...COMMON_PROFILE_FLAGS];
   // Kernel-level env hygiene: `--clearenv` plus a narrow `--setenv`
   // allowlist replaces userspace-only scrubEnv as the authoritative
@@ -419,7 +509,8 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
   // gets the same shape regardless of whether the operator
   // happens to have `~/.gnupg` set up.
   for (const dir of HIDE_PATHS_DIRS) {
-    flags.push('--tmpfs', joinPath(home, dir));
+    const abs = joinPath(home, dir);
+    if (shouldMask(abs)) flags.push('--tmpfs', abs);
   }
   // XDG_DATA_HOME unmask. `defaultDataDir()` honors $XDG_DATA_HOME
   // at runtime; when the operator sets it outside
@@ -441,7 +532,11 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
   // HIDE_PATHS_DIRS loop above — `.local/share/forja` covers it).
   const liveDataDir = defaultDataDir();
   const homeRelativeDataDir = joinPath(home, '.local', 'share', 'forja');
-  if (liveDataDir.startsWith('/') && liveDataDir !== homeRelativeDataDir) {
+  if (
+    liveDataDir.startsWith('/') &&
+    liveDataDir !== homeRelativeDataDir &&
+    shouldMask(liveDataDir)
+  ) {
     flags.push('--tmpfs', liveDataDir);
   }
   // XDG_CONFIG_HOME unmask. Analog of the XDG_DATA_HOME fix above.
@@ -466,17 +561,20 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
     for (const dir of HIDE_PATHS_DIRS) {
       if (!dir.startsWith('.config/')) continue;
       const sub = dir.slice('.config/'.length);
-      flags.push('--tmpfs', joinPath(xdgConfig, sub));
+      const abs = joinPath(xdgConfig, sub);
+      if (shouldMask(abs)) flags.push('--tmpfs', abs);
     }
   }
-  // For files we use `--ro-bind /dev/null <file>`. bwrap can
-  // bind char devices over regular files (the mount makes the
-  // file appear as /dev/null — reads return EOF, writes are
-  // discarded). `--ro-bind` keeps the overlay read-only even
-  // on home-rw, so the operator can't accidentally "create"
-  // a credential file by writing to the masked path.
+  // Mask credential FILES with a read-only bind of an empty REGULAR
+  // file (NOT `/dev/null` — a char device breaks git/npm/pip config
+  // readers; see `ensureSandboxMaskFile`). The tool sees an empty
+  // config (it works), the real content stays hidden (no PII leak), and
+  // `--ro-bind` keeps it read-only even on home-rw (no write-plant of
+  // `~/.gitconfig` core.sshCommand etc.).
+  const maskSrc = options.maskFileSource ?? ensureSandboxMaskFile();
   for (const file of HIDE_PATHS_FILES) {
-    flags.push('--ro-bind-try', '/dev/null', joinPath(home, file));
+    const abs = joinPath(home, file);
+    if (shouldMask(abs)) flags.push('--ro-bind', maskSrc, abs);
   }
   // Start the inner process in cwd.
   flags.push('--chdir', cwd);
@@ -555,6 +653,13 @@ export interface MaybeWrapSandboxArgvOptions {
   // canonicalization OR a custom mapping to exercise the symlink-
   // to-hidden-dir Refuse path.
   realpath?: (p: string) => string;
+  // Existence probe forwarded to `buildBwrapArgv` for the hide_paths
+  // mount-realizability gate (Linux only — see
+  // BuildBwrapArgvOptions.pathExists). macOS SBPL deny rules don't
+  // create mountpoints, so the EROFS failure mode doesn't exist there
+  // and the seam is ignored on darwin. Production omits (uses
+  // `node:fs.existsSync`).
+  pathExists?: (p: string) => boolean;
   // Per-sandbox tmpdir subpath. Only consumed on darwin (Linux's
   // `--tmpfs /tmp` already provides per-sandbox isolation; on
   // Linux this option is a no-op). When set, the macOS SBPL
@@ -684,6 +789,7 @@ export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): stri
         bwrapPath: r.path,
       };
       if (realpath !== undefined) bwrapOpts.realpath = realpath;
+      if (options.pathExists !== undefined) bwrapOpts.pathExists = options.pathExists;
       if (options.passthroughEnv !== undefined) bwrapOpts.passthroughEnv = options.passthroughEnv;
       return buildBwrapArgv(bwrapOpts);
     }

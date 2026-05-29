@@ -167,6 +167,25 @@ describe('engine modes', () => {
     expect(d.source?.section).toBe('protected');
   });
 
+  test('bypass mode cannot unlock a dangerous command hidden in control flow (resolver refuse is a floor)', () => {
+    // Review regression: pre-fix, `for x in *; do rm -rf /; done` resolved
+    // to Conservative (not refuse), which the bypass branch turned into
+    // ALLOW. Now the soft path runs analyzeCommand on the inner `rm`,
+    // which hard-Refuses the system-root delete BEFORE policy/bypass — and
+    // the resolver-refuse short-circuit precedes the bypass branch, so
+    // bypass can't cross it. Same for a quote-laundered eval.
+    const eng = createPermissionEngine(policy({ defaults: { mode: 'bypass' } }), {
+      cwd: CWD,
+      home: '/home/op',
+    });
+    expect(eng.check('bash', 'bash', { command: 'for x in *; do rm -rf /; done' }).kind).toBe(
+      'deny',
+    );
+    expect(eng.check('bash', 'bash', { command: 'for x in *; do \'eval\' "$x"; done' }).kind).toBe(
+      'deny',
+    );
+  });
+
   test('bypass mode UPGRADES write to /etc/hosts to confirm (§11 escalate tier)', () => {
     const eng = createPermissionEngine(policy({ defaults: { mode: 'bypass' } }), {
       cwd: CWD,
@@ -543,22 +562,35 @@ describe('compound command guard (shell injection defense)', () => {
     expect(d.kind).toBe('allow');
   });
 
-  test('compound with unknown commands lands as resolver-refuse (slice 6)', () => {
-    // Pre-slice-6: containsShellInjection saw `;` and forced
-    // confirm with bash-section attribution. Post-slice-6: AST
-    // resolver checks each command in the sequence against the
-    // COMMAND_TABLE. Two unknown names → refuse; attribution
-    // shifts to `resolver-refuse` because the failure is
-    // structural (closed whitelist), not policy-driven.
+  test('compound with unknown commands → Conservative confirm (registry miss, §5.2 step 3c)', () => {
+    // History: slice 6 made two unknown names a structural resolver
+    // hard-refuse (deny). That over-refused — a registry miss isn't
+    // categorically dangerous (no HARD_REFUSE_COMMANDS, no hard AST
+    // shape), and §5.2 step 3c specifies Conservative for it. The
+    // resolver now returns Conservative → forced confirm; the operator
+    // (or a `bash.allow` rule) decides. The `;` compound guard
+    // independently also forces confirm. Genuinely dangerous shapes
+    // (eval / `$(...)` / dd / pipe-to-shell) still hard-refuse — see
+    // the bash resolver's hard/soft split.
     const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['*'] } } }), {
       cwd: CWD,
       provenance: { defaults: 'project', bash: 'user' },
     });
     const d = eng.check('bash', 'bash', { command: 'a; b' });
-    expect(d.kind).toBe('deny');
-    if (d.kind === 'deny') {
-      expect(d.source?.section).toBe('resolver-refuse');
-    }
+    expect(d.kind).toBe('confirm');
+  });
+
+  test('single registry-miss command (no compound metachar) → confirm via resolver Conservative, not the compound guard', () => {
+    // Review regression: the `a; b` test above is confounded by the `;`
+    // compound guard. `frobnicate` has no metachar, so the ONLY thing that
+    // can force confirm is `resolverForcesConfirm` on the Conservative
+    // result. A regression dropping `conservative` from that gate would
+    // turn this into a silent allow (under `bash.allow:['*']`).
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['*'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'user' },
+    });
+    expect(eng.check('bash', 'bash', { command: 'frobnicate --wat' }).kind).toBe('confirm');
   });
 
   test('newline-injected command is NOT silently allowed by glob with dotAll', () => {
