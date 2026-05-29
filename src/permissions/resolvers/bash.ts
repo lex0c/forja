@@ -3254,6 +3254,26 @@ const resolvesToInterpreter = (token: string): boolean =>
 // token scan can't crack — it falls to Conservative/confirm.
 const EXEC_RUNNER_COMMANDS: ReadonlySet<string> = new Set(['xargs', 'parallel']);
 
+// Bash runs a command name WITHOUT a slash via a PATH search (the
+// operator's trusted environment) and a name WITH a slash as that EXACT
+// pathname — no PATH lookup. So a slash-qualified name is the trusted
+// system binary ONLY when it sits directly in a canonical system bindir;
+// `./cat`, `/tmp/ls`, `bin/x`, and non-canonical `/bin/../tmp/x` (whose
+// dirname isn't a bindir) are untrusted local executables. Used to decide
+// whether collapsing a launcher to its basename is safe for the
+// TRUST-side classifications (handler / read-only / pure-output); the
+// REFUSE-side (hard-refuse, exec-runner) always uses the basename, since
+// over-refusing a local binary that shares a dangerous name is harmless.
+const TRUSTED_BINDIRS: ReadonlySet<string> = new Set([
+  '/bin',
+  '/usr/bin',
+  '/usr/local/bin',
+  '/sbin',
+  '/usr/sbin',
+]);
+const isTrustedCommandPath = (cmd: string): boolean =>
+  !cmd.includes('/') || TRUSTED_BINDIRS.has(dirname(cmd));
+
 // Slice 147 (review R1): added xargs-to-interpreter detection.
 // `... | xargs sh -c '<arg>'` is the canonical xargs-as-exec
 // pattern: xargs reads stdin lines and passes each as positional
@@ -3880,15 +3900,24 @@ const analyzeCommand = (
   // eval/dd/sudo. Without this, the soft→conservative split would let
   // `'eval'`/`ev''al`/`\eval` reach an operator-approvable confirm.
   const bareName = stripShellQuoting(shape.name);
-  // Resolve a path-qualified launcher to its basename for EVERY name-keyed
-  // classification below. `/bin/sh`, `/usr/bin/env`, `/usr/bin/python`
-  // must be treated like bare `sh`/`env`/`python` — otherwise they miss
-  // the hard-refuse / cmdEnv / cmdInterpreter checks and fall to the
-  // registry-miss Conservative branch, which `mode: bypass` auto-allows:
-  // a shell/interpreter-as-command deny bypass. (Bonus: `/bin/cat foo`
-  // now resolves like `cat foo` instead of the unknown-command path.)
-  const name = basename(bareName);
-  if (isHardRefuseCommand(name)) {
+  // `base` (basename) drives the REFUSE-side classifications: the
+  // hard-refuse set and the exec-runner scan. A slash-qualified launcher
+  // (`/bin/sh`, `/tmp/dd`, `./sh`) must be caught exactly like the bare
+  // command — over-refusing a local binary that merely shares a dangerous
+  // name is the safe direction. (Closes the path-qualified launcher
+  // bypass: `/bin/sh -c …` is hard-refused like `sh -c …`.)
+  const base = basename(bareName);
+  // `name` drives the TRUST-side classifications: the COMMAND_TABLE
+  // handler lookup, read-only, and pure-output. Bash runs a slash-
+  // containing name as that EXACT pathname (no PATH search), so `./cat` /
+  // `/tmp/ls` are untrusted local executables — collapsing them to the
+  // whitelisted `cat`/`ls` would model an arbitrary binary as the trusted
+  // system command and emit read-only caps while it actually runs. Trust
+  // the basename only for a PATH-resolved (no slash) or canonical-system-
+  // bindir command; otherwise keep the full path so it misses the registry
+  // and routes to Conservative (the §11 loop still runs, op=write).
+  const name = isTrustedCommandPath(bareName) ? base : bareName;
+  if (isHardRefuseCommand(base)) {
     return {
       refuse: `bash: command '${shape.name}' has no safe capability resolution`,
     };
@@ -3921,9 +3950,9 @@ const analyzeCommand = (
   // embedded interpreter — same posture/reason class as the pipe case.
   // Benign `xargs rm` / `parallel gzip ::: *` carry no interpreter token
   // and fall through to the normal Conservative (registry-miss) path.
-  if (EXEC_RUNNER_COMMANDS.has(name) && effectiveArgs.some((a) => resolvesToInterpreter(a))) {
+  if (EXEC_RUNNER_COMMANDS.has(base) && effectiveArgs.some((a) => resolvesToInterpreter(a))) {
     return {
-      refuse: `bash: ${name} spawning an interpreter has no safe capability resolution`,
+      refuse: `bash: ${base} spawning an interpreter has no safe capability resolution`,
     };
   }
 

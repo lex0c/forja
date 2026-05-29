@@ -2,6 +2,18 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-29] permissions — basename normalization over-trusted untrusted slash-qualified commands
+
+Follow-up to the path-qualified launcher fix. That fix collapsed every command name to `basename(stripShellQuoting(name))` for ALL name-keyed classifications. But Bash runs a name CONTAINING a slash as that EXACT pathname (no PATH search), so `./cat`, `/tmp/ls`, `bin/x` are untrusted local executables — and `basename()` modeled them as the whitelisted system `cat`/`ls`, so the resolver returned read-only caps while an arbitrary repo/tmp binary actually ran.
+
+**Fix.** Split the normalization by what it feeds:
+- `base` (always `basename`) drives the REFUSE-side checks — the hard-refuse set and the exec-runner scan. Over-refusing a local binary that shares a dangerous name (`./sh`, `/tmp/dd`) is the safe direction, and this keeps the launcher-bypass fix (`/bin/sh -c …` hard-refuses like `sh -c …`).
+- `name` drives the TRUST-side checks — COMMAND_TABLE handler, read-only, pure-output. It is the basename ONLY when the command is PATH-resolved (no slash) or sits directly in a canonical system bindir (`isTrustedCommandPath`: dirname ∈ {/bin, /usr/bin, /usr/local/bin, /sbin, /usr/sbin}); otherwise it keeps the full slash path, which misses the registry → Conservative (the §11 loop still runs with op=write). A non-canonical `/bin/../tmp/cat` (dirname not a bindir) is untrusted too.
+
+So `/bin/cat` still → read-fs (trusted), `cat` (no slash) still PATH-resolves, but `./cat` / `/tmp/ls` → Conservative (not read-only), and `./sh` / `/tmp/dd` still Refuse.
+
+**Validated:** +7 regression tests (untrusted slash commands → Conservative not read-only; trusted `/bin/cat` + no-slash `cat` → read-fs; untrusted hard-refuse names still Refuse); full `tests/permissions/` (2076) + tools (460) + harness (314) + typecheck + biome clean. **Branch:** `chore/sec-fixes`.
+
 ## [2026-05-29] permissions — classify for-loop item words + preserve dynamic argv positions
 
 Two related follow-ups to the dynamic-operand handling.

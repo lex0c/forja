@@ -2130,6 +2130,51 @@ describe('bash resolver — dynamic operands keep positional order (positional h
   });
 });
 
+// Review regression: basename normalization (added to catch path-qualified
+// launchers) over-trusted. Bash runs a slash-containing name as that EXACT
+// pathname, so `./cat`/`/tmp/ls` are untrusted local binaries — collapsing
+// them to the whitelisted `cat`/`ls` returned read-only caps while an
+// arbitrary executable ran. Trust the basename only for PATH-resolved or
+// canonical-system-bindir commands; the REFUSE side stays on basename.
+describe('bash resolver — untrusted slash-qualified commands are not trusted as the builtin', () => {
+  test.each([
+    './cat /work/proj/f',
+    '/tmp/ls',
+    'bin/cat /work/proj/f',
+    '/bin/../tmp/cat /work/proj/f',
+  ])('%s → Conservative (untrusted local binary, not the read-only builtin)', (cmd) => {
+    const r = resolveCapabilities('bash', { command: cmd }, CTX);
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      // Must NOT have been modeled as the trusted read-only command.
+      expect(capStrings(r.capabilities)).not.toContain('read-fs:/work/proj/f');
+    }
+  });
+
+  test('trusted system path still resolves to the handler (/bin/cat → read-fs)', () => {
+    const r = resolveCapabilities('bash', { command: '/bin/cat /work/proj/f' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/work/proj/f');
+    }
+  });
+
+  test('no-slash command still PATH-resolves to its handler (cat → read-fs)', () => {
+    const r = resolveCapabilities('bash', { command: 'cat /work/proj/f' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/work/proj/f');
+    }
+  });
+
+  test('untrusted path-qualified hard-refuse name still Refuses (refuse side stays on basename)', () => {
+    expect(resolveCapabilities('bash', { command: './sh -c x' }, CTX).kind).toBe('refuse');
+    expect(
+      resolveCapabilities('bash', { command: '/tmp/dd if=/dev/zero of=/dev/sda' }, CTX).kind,
+    ).toBe('refuse');
+  });
+});
+
 // Review regression: read-only-classified filters that can WRITE a file
 // were misclassified — the write target surfaced as read-fs (or vanished
 // for `--output=`), so §11 escalation/denial + sandbox planning saw a
