@@ -1646,6 +1646,21 @@ describe('bash resolver — /run/media glob carve-out (removable-media repo)', (
     const r = resolveCapabilities('bash', { command: 'cat /etc/pass*' }, CTX_MEDIA);
     expect(r.kind).toBe('refuse');
   });
+
+  test('a glob on the bare `/run/media` segment is refused (escapes to /run siblings)', () => {
+    // `/run/media*` expands to siblings like /run/mediaevil / /run/mediator
+    // that sit directly under the /run deny zone, NOT inside /run/media/.
+    // (`/run/media/*` resolves to the same bare prefix and is refused too —
+    // the carve-out covers prefixes strictly INSIDE /run/media/<...>.)
+    for (const cmd of ['ls /run/media*', 'ls /run/media/*']) {
+      expect(resolveCapabilities('bash', { command: cmd }, CTX).kind).toBe('refuse');
+    }
+  });
+
+  test('a glob strictly inside /run/media/<volume> stays carved out (ok)', () => {
+    const r = resolveCapabilities('bash', { command: 'ls /run/media/op/extdrive/*' }, CTX);
+    expect(r.kind).toBe('ok');
+  });
 });
 
 // Home-relative credential / config dirs in RM_REFUSE_ROOTS-

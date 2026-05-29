@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-29] permissions — `/run/media` glob carve-out required a segment slash
+
+The removable-media glob carve-out (`isGlobSafeRunCarveout`, the SUBSET of the `/run` deny exception that lets a repo on an external drive glob freely) had an equality branch: `absPath === '/run/media' || absPath.startsWith('/run/media/')`. When the glob metachar is appended to the segment — `ls /run/media*` — `globLiteralPrefix` resolves to `/run/media`, so the equality branch marked the prefix safe and `couldGlobReachProtected` skipped the `/run` deny scan. But that glob expands to siblings like `/run/mediaevil` / `/run/mediator` that sit directly under the protected `/run` zone, not inside the `/run/media/` mount tree — so a protected-zone glob that was previously refused was now allowed.
+
+**Fix.** Drop the bare-segment equality; require a `/run/media/` boundary (`absPath.startsWith('/run/media/')`). `/run/media*` then falls through to the deny scan — its prefix is under `/run/`, so it refuses. The legit case (a repo deep under `/run/media/<user>/<volume>`) is unaffected: those globs resolve to `/run/media/<...>` and stay carved out. Note `path.resolve` strips a trailing slash, so `/run/media/*` resolves to the same bare `/run/media` and is conservatively refused too — only a prefix resolving to `/run/media/<x>` or deeper is safe, matching "the carve-out should only apply to prefixes truly inside `/run/media/...`".
+
+**Validated:** moved `/run/media` (exact) to the false-set in `isGlobSafeRunCarveout`'s unit tests; +resolver regression (`ls /run/media*` and `/run/media/*` → Refuse, `/run/media/op/extdrive/*` → ok); the existing removable-media repo glob tests (deep prefixes) still pass; full `tests/permissions/` (2082) + typecheck + biome clean. **Branch:** `chore/sec-fixes`.
+
 ## [2026-05-29] permissions — `tree` output files modeled as writes
 
 Same class as the earlier sort/uniq fix. `tree` was registered to plain cmdRead and listed in isReadOnlyCommand, but `tree -o FILE` sends the listing to FILE (tree(1)), and `tree -R` with `-H` writes a 00Tree.html into each traversed directory. So `tree -o /etc/cron.d/x .` resolved only as a read — and isReadOnlyCommand made the §11 loop classify `/etc/cron.d/x` with op=read, skipping the write-escalate tier — so no write-fs cap reached the policy/bypass floors while tree wrote the file.

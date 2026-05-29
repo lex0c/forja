@@ -526,17 +526,19 @@ describe('classifyProtectedPath — slice 180 additions', () => {
 });
 
 describe('isGlobSafeRunCarveout — removable-media glob carve-out', () => {
-  test.each([
-    '/run/media',
-    '/run/media/op',
-    '/run/media/op/extdrive',
-    '/run/media/op/extdrive/proj/src',
-  ])('%s is a glob-safe carve-out (true)', (p) => {
-    expect(isGlobSafeRunCarveout(p)).toBe(true);
-  });
+  test.each(['/run/media/op', '/run/media/op/extdrive', '/run/media/op/extdrive/proj/src'])(
+    '%s is a glob-safe carve-out (true)',
+    (p) => {
+      expect(isGlobSafeRunCarveout(p)).toBe(true);
+    },
+  );
 
   test.each([
     '/run', // the deny root itself
+    // The bare segment, NOT a glob-safe prefix: it comes from `/run/media*`,
+    // whose `*` extends the `media` segment to siblings (`/run/mediaevil`)
+    // directly under the /run deny zone. Must fall through to the deny scan.
+    '/run/media',
     '/run/user', // XDG runtime — globs stay conservative (sockets)
     '/run/user/1000',
     '/run/user/1000/gnupg',

@@ -138,14 +138,25 @@ export const isDevSafe = (absPath: string): boolean =>
 // case is held conservative here.
 const GLOB_SAFE_RUN_CARVEOUTS: readonly string[] = ['/run/media'];
 
-// True when a glob's literal prefix sits in a `/run` carve-out where
-// expansion cannot reach any protected target (see
-// GLOB_SAFE_RUN_CARVEOUTS). Used by the bash resolver to keep
-// `couldGlobReachProtected` consistent with `classifyProtectedPath`'s
-// `/run/media` exception — the two must not diverge on what counts as
-// protected, which is exactly the bug this closes.
+// True when a glob's (resolved) literal prefix sits STRICTLY INSIDE a
+// `/run` carve-out — `/run/media/<...>` — where expansion cannot reach any
+// protected target (see GLOB_SAFE_RUN_CARVEOUTS). Used by the bash
+// resolver to keep `couldGlobReachProtected` from refusing every glob run
+// from a repo deep under `/run/media/<user>/<volume>`.
+//
+// The `${c}/` boundary is load-bearing, and the bare segment is
+// deliberately NOT carved out: a prefix EQUAL to `/run/media` comes from a
+// glob like `/run/media*`, whose `*` extends the `media` SEGMENT and can
+// match siblings (`/run/mediaevil`, `/run/mediator`) that sit directly
+// under the `/run` deny zone — NOT inside the `/run/media/` mount tree.
+// (`/run/media/*` resolves to the same bare `/run/media` once `path.resolve`
+// strips the trailing slash, so it is conservatively refused too; only a
+// prefix that resolves to `/run/media/<x>` or deeper — the real repo case —
+// is safe.) Accepting the bare segment let `/run/media*` skip the `/run`
+// deny scan; now it falls through and is refused (its prefix is under
+// `/run/`).
 export const isGlobSafeRunCarveout = (absPath: string): boolean =>
-  GLOB_SAFE_RUN_CARVEOUTS.some((c) => absPath === c || absPath.startsWith(`${c}/`));
+  GLOB_SAFE_RUN_CARVEOUTS.some((c) => absPath.startsWith(`${c}/`));
 
 // Subpath names inside /run/user/<uid> that contain user-scoped IPC
 // sockets and credential-adjacent endpoints. The /run/user carve-out
