@@ -9,7 +9,7 @@
 //
 //   ─────────────────────────────────────────  ← `accent` color
 //     <title>           ← bold
-//     <subject>         ← dim, optional
+//     <subject>         ← dim (or secondary), optional
 //
 //     <preview[0]>      ← producer-formatted; default dim,
 //     ...                  per-line `secondary` for source
@@ -41,15 +41,27 @@ const rule = (caps: Capabilities): string =>
 const optionLine = (modal: ConfirmState, optIdx: number, caps: Capabilities): string => {
   const opt = modal.options[optIdx];
   if (opt === undefined) return '';
-  // Cursor `>` always (ASCII universal — no Unicode pretty variant).
-  // Cursor stays in default paint so the active-selection signal
-  // doesn't get muted by the per-element coloring.
-  const cursor = optIdx === modal.selectedIndex ? '>' : ' ';
+  const selected = optIdx === modal.selectedIndex;
+  // Cursor `>` marks the active row (ASCII universal — no Unicode
+  // pretty variant). On the selected row the cursor + label are
+  // painted `accent` (blue) to highlight the active choice, while the
+  // key digit keeps the `secondary` tone it has on every row so the
+  // hotkey reminder isn't swept into the highlight. Adjacent paint
+  // runs (each self-closes) — not nested — so no inner reset some
+  // terminals re-process as a flash.
+  const cursor = selected ? '>' : ' ';
+  if (selected) {
+    const shortcut = opt.shortcut !== undefined ? ` (${opt.shortcut})` : '';
+    const cursorTok = paint(caps, 'accent', cursor);
+    const keyTok = paint(caps, 'secondary', `${opt.key}.`);
+    const labelTok = paint(caps, 'accent', `${opt.label}${shortcut}`);
+    return `  ${cursorTok} ${keyTok} ${labelTok}`;
+  }
+  // Unselected rows: number + period painted `secondary` so the
+  // eye-attractor is the option label, not the digit. Operator's
+  // mental scan goes label-first ("Yes", "No", "Approve"); the
+  // number is the hotkey reminder, useful but subordinate.
   const shortcut = opt.shortcut !== undefined ? paint(caps, 'dim', ` (${opt.shortcut})`) : '';
-  // Number + period painted `secondary` so the eye-attractor is
-  // the option label, not the digit. Operator's mental scan goes
-  // label-first ("Yes", "Allow once", "Deny"); the number is the
-  // hotkey reminder, useful but subordinate.
   const keyToken = paint(caps, 'secondary', `${opt.key}.`);
   return `  ${cursor} ${keyToken} ${opt.label}${shortcut}`;
 };
@@ -85,7 +97,8 @@ export const renderModal = (modal: ConfirmState, caps: Capabilities): string[] =
   // (\x1b[94m\x1b[1m{title}\x1b[0m) — nested paint() would emit a
   // redundant inner reset that some terminals re-process as a flash.
   lines.push(`  ${paintMulti(caps, ['accent', 'bold'], `${modal.title}${queueSuffix}`)}`);
-  if (modal.subject !== null) lines.push(`  ${paint(caps, 'dim', modal.subject)}`);
+  if (modal.subject !== null)
+    lines.push(`  ${paint(caps, modal.subjectTone ?? 'dim', modal.subject)}`);
   // Preview — no leading rule. Producer's blank lines (empty
   // strings) carry the visual separation from the title above.
   if (modal.preview.length > 0) {

@@ -2,6 +2,22 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-29] tui — tool card shows "Awaiting approval" (no ticking timer) while a permission modal is open
+
+The live tool card is created at `tool:start`, which fires BEFORE the permission engine runs. While a permission modal sat open, the card above it kept rendering "Executing… [Ns]" with the elapsed counter advancing — misreading the operator's modal think-time as tool runtime, and claiming the tool was already running when it was actually parked waiting for approval. (The final duration was already correct: `tool:execution-started` rebases `startedAt` after approval; only the *live* head was wrong.)
+
+**Fix.** Added an optional `executing?: boolean` to `ActiveTool`. `tool:start` sets it `false`; `tool:execution-started` sets it `true` (alongside the existing clock rebase). `renderToolCardLive` renders an "Awaiting approval" head with NO `[elapsed]` metric while `executing === false`, falling back to the active verb + timer otherwise. The field is optional and the renderer keys only on an explicit `false`, so legacy `ActiveTool` fixtures (no field) keep the running render. On the auto-allow path `tool:execution-started` arrives within the same tick, so the awaiting head never visibly renders for non-gated calls — it only shows when a modal actually parks the call.
+
+**Validated:** new `tests/tui/render/tool-card.test.ts` (awaiting head + no timer, timer time-invariance while awaiting, executing head + timer, undefined=legacy-executing) — 4 pass; full `tests/tui/` suite + typecheck + Biome clean. **Branch:** `develop`.
+
+## [2026-05-29] tui — permission modal: framing line, generic title, blue selection
+
+Operator-requested polish on the permission confirm modal (flavor `permission`). Five changes: (1) a `subject` framing line under the title — "The agent is requesting permission for the action below."; (2) a `question` line above the options — "Approve this action?"; (3) on the selected option row the cursor + label paint `accent` (blue) while the key digit stays `secondary`, in `renderModal`; (4) the framing `subject` line is painted `secondary` via a new optional `subjectTone` field on `ConfirmState` (default `dim`) so it lifts out of the dim baseline — scoped to permission, other flavors' subjects (memory write/action/user-scope) stay dim; (5) the per-tool title labels (Bash command / Editing file / Searching workspace / Network access) were replaced by a single fixed title "Permission required" — the `(subagent: <name>)` anti-spoof suffix is retained, and the now-unused `PERMISSION_CONTEXT_LABEL_BY_TOOL` map + `contextLabelForTool` helper were removed (the specific tool/action still shows in the preview block). The redesign had deliberately dropped subject+question to avoid restating the action — reinstated here because the explicit framing + decision prompt read better above the action block. Option labels stay Yes / No (Approve/Reject was trialed mid-iteration and reverted).
+
+The blue-selected change lives in the shared `renderModal`, so the highlighted-selection cue now applies to every modal flavor (trust, memory, plan-review, critique, history-clear), not just permission — a consistent affordance across all of them. The permission default selection stays index 0 (Yes); the blue only makes the pre-existing default visible.
+
+**Validated:** updated the impacted tui suites — `render/modal` (selected-row cursor/label accent + key stays secondary, subject secondary tone), `modal-integration` (option/title text, cursor regexes), `state` (subject/question/subjectTone, generic title + tool-independence) — all green; full typecheck + Biome clean. **Branch:** `develop`.
+
 ## [2026-05-29] permissions — couldGlobReachProtected now scans cwd-escalate dirs too
 
 Closes the gap flagged in the previous entry. `couldGlobReachProtected`'s target set was `systemDeny + absoluteEscalate + tildeEscalate{Files,Dirs}` — it omitted the cwd-escalate dirs (`.git`/`.agent`/`.claude`), even though `protectedTargets` returns them. So a glob expanding into them (`rm .g*`, `cat .git/*`, `for f in .*` from a repo cwd) slipped the protected-glob refuse. Added `...targets.cwdEscalateDirs` to the scan, so such globs are held conservative→refuse like /etc and ~ (a literal read of those dirs still passes — escalate is write-only — but a glob into the zone is refused; this catches e.g. a glob-delete of `.git`).

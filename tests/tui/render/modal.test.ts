@@ -152,22 +152,46 @@ describe('renderModal (UI.md §4.10.13 layout)', () => {
     expect(out[1]).toContain(`${CSI}1m`); // bold
   });
 
-  test('option key (number + period) painted secondary', () => {
-    // The hotkey digit is subordinate to the label — operator's
-    // mental scan goes label-first ("Yes", "No"). Painting the
-    // digit `secondary` mutes it so it reads as a hotkey reminder,
-    // not as the primary content of the option row. Cursor `>`
-    // stays in default paint (active-selection signal).
+  test('selected row keeps its key digit secondary while label goes accent', () => {
+    // The hotkey digit on UNSELECTED rows is subordinate to the
+    // label — painting it `secondary` mutes it to a hotkey reminder.
+    // The SELECTED row is painted `accent` (blue) as a single run so
+    // the active choice reads as one highlighted unit (cursor + key +
+    // label together) instead of a row with a muted digit.
     const out = renderModal(baseModal(), colored);
-    // Option lines start at index 6 in the new layout.
-    expect(out[6]).toContain(`${CSI}90m`); // secondary on "1."
-    expect(out[7]).toContain(`${CSI}90m`); // secondary on "2."
+    // baseModal selects the last option → out[7] is selected, out[6]
+    // is the unselected option above it.
+    expect(out[6]).toContain(`${CSI}90m`); // secondary on unselected "1."
+    expect(out[7]).toContain(`${CSI}94m`); // accent on the selected row
+    expect(out[7]).toContain(`${CSI}90m`); // selected key digit still secondary
+  });
+
+  test('selected row tokenizes cursor/label accent + key secondary (digit not blue)', () => {
+    // Pin the tokenization so a regression that re-merges the digit
+    // into the accent run (turning "1." blue) shows up here.
+    const out = renderModal(baseModal({ selectedIndex: 0 }), colored);
+    // out[6] is now the selected row (option 1).
+    expect(out[6]).toContain(`${CSI}94m>`); // cursor accent
+    expect(out[6]).toContain(`${CSI}90m1.`); // key digit secondary (not blue)
+    expect(out[6]).toContain(`${CSI}94mYes`); // label accent
+    // The other option keeps the secondary-keyed style, no accent.
+    expect(out[7]).toContain(`${CSI}90m`);
+    expect(out[7]).not.toContain(`${CSI}94m`);
   });
 
   test('subject + preview wrapped in dim SGR when color enabled', () => {
     const out = renderModal(baseModal(), colored);
     expect(out[2]).toContain(`${CSI}2m`); // subject dim
     expect(out[4]).toContain(`${CSI}2m`); // preview line dim
+  });
+
+  test('subject painted secondary when subjectTone = "secondary"', () => {
+    // Permission flavor opts its framing line into `secondary` so it
+    // lifts out of the dim baseline. Default (no subjectTone) stays
+    // dim — pinned by the test above.
+    const out = renderModal(baseModal({ subjectTone: 'secondary' }), colored);
+    expect(out[2]).toContain(`${CSI}90m`); // subject secondary
+    expect(out[2]).not.toContain(`${CSI}2m`); // not dim
   });
 
   test('color disabled emits no SGR escapes', () => {
