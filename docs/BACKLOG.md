@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-29] permissions — hard-refuse command launchers that launder exec attribution
+
+Command launchers run a wrapped command from their argv, so the resolver sees the launcher, not what executes — the per-command refuse checks (sh/bash hard-refuse, rm system-roots, dd, sudo, …) never run on the real command. `env` already refused this (cmdEnv), but `nice`/`nohup`/`setsid`/`timeout`/`stdbuf`/`ionice`/`taskset`/`chrt`/`setarch`/`flock`/`watch` were unregistered → registry-miss Conservative (exec:arbitrary), which `mode: bypass` auto-allows. Verified with a resolver probe: `nice sh -c …`, `timeout 5 sh -c …`, `nohup rm -rf /`, `nice dd …`, `timeout 5 sudo …` all resolved Conservative (laundering a refuse the bare command hits) while `env sh -c …` already refused. (The reported example `env`/`/usr/bin/env` was already covered; the real gap was the other launchers.)
+
+**Fix.** A shared `cmdLauncher` (mirroring cmdEnv) refuses any positional usage and is registered for the common launchers; bare usage with no wrapped command (e.g. `nice` printing niceness) carries no exec and passes. This closes laundering of every wrapped refuse (sh, rm-roots, dd, sudo, …), not just shells — a resolver refuse is a pre-policy floor bypass can't override. Curated list (an obscure launcher still falls to the normal Conservative path). Chose the finding's option 1 (hard-refuse) over arg-scanning because it's complete and consistent with env; cost is that `nice make` / `timeout npm test` refuse too — run the wrapped tool directly.
+
+**Validated:** +13 regression tests (launcher + sh/rm/dd/sudo → Refuse; path-qualified `/usr/bin/timeout`; bare `nice` → ok; `env` precedent); full `tests/permissions/` (2101) + typecheck + biome clean. **Branch:** `chore/sec-fixes`.
+
 ## [2026-05-29] permissions — track sort's file-reading flags (--files0-from, --random-source)
 
 Follow-up to modeling `sort` as a known command. `cmdSort` modeled `-o`/`-T` (writes) and refused `--compress-program` (exec), but missed the flags whose value is a FILE sort READS: `--files0-from=F` (NUL-separated input-name manifest) and `--random-source=F` (random bytes for `-R`). Both open F, so `sort --files0-from=.env` resolved to only the cwd baseline while sort opened `.env` (and can leak its lines through filename errors) — the §8.4 sensitive-path floor, which scans resolved caps, never saw the read.

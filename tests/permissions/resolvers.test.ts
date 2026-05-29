@@ -2441,6 +2441,38 @@ describe('bash resolver — command-runner spawning an interpreter still Refuse 
   );
 });
 
+// Review regression: command launchers (nice/nohup/timeout/setsid/stdbuf/…)
+// run a wrapped command from their argv. As unregistered commands they were
+// a registry-miss Conservative (exec:arbitrary), which mode:bypass
+// auto-allows — laundering a wrapped sh -c / rm -rf / / dd / sudo past its
+// per-command refuse. cmdLauncher refuses positional usage (like env).
+describe('bash resolver — command launchers refuse positional usage (no exec laundering)', () => {
+  test.each([
+    'nice sh -c x',
+    'timeout 5 sh -c x',
+    'nohup sh -c x',
+    'setsid sh -c x',
+    'stdbuf -oL sh -c x',
+    'nohup rm -rf /', // launders rm system-root refuse
+    'nice dd if=/dev/zero of=/dev/sda', // launders dd hard-refuse
+    'timeout 5 sudo whoami', // launders sudo hard-refuse
+    '/usr/bin/timeout sh -c x', // path-qualified launcher → trusted basename
+    'flock /tmp/lock sh -c x',
+    'watch sh -c x',
+  ])('%s → Refuse (launcher launders exec attribution)', (cmd) => {
+    expect(resolveCapabilities('bash', { command: cmd }, CTX).kind).toBe('refuse');
+  });
+
+  test('bare launcher with no wrapped command is not refused (no exec launched)', () => {
+    // `nice` alone prints the current niceness — no command to launder.
+    expect(resolveCapabilities('bash', { command: 'nice' }, CTX).kind).toBe('ok');
+  });
+
+  test('env launcher still refuses (precedent unchanged)', () => {
+    expect(resolveCapabilities('bash', { command: 'env sh -c x' }, CTX).kind).toBe('refuse');
+  });
+});
+
 describe('bash resolver — control flow → Conservative with hard-construct guard (B, §5.2)', () => {
   test.each([
     'for f in *.ts; do cat "$f"; done',

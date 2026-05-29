@@ -1741,6 +1741,30 @@ const cmdEnv: CommandResolver = (positional) => {
   return { capabilities: [readFs('/etc')], confidence: 'high' };
 };
 
+// Command launchers (`nice`, `nohup`, `setsid`, `timeout`, `stdbuf`,
+// `ionice`, `taskset`, `chrt`, `setarch`, `flock`, `watch`): each runs a
+// COMMAND supplied in its argv. Same laundering posture as `env` — the
+// resolver sees the launcher, not the wrapped command, so the per-command
+// refuse checks (sh/bash hard-refuse, rm system-roots, dd, sudo, …) never
+// run on what actually executes. Without this they were a registry miss →
+// Conservative `exec:arbitrary`, which `mode: bypass` auto-allows: so
+// `nohup rm -rf /`, `nice dd …`, `timeout 5 sh -c …` all slipped a refuse
+// that the bare command hits. Refuse any positional usage (run the wrapped
+// tool directly); bare usage with no command (e.g. `nice` printing the
+// current niceness) carries no exec and passes. Curated list — an obscure
+// launcher not here still falls to the normal Conservative path; these
+// cover the common, well-known vectors. `env` keeps its own resolver
+// (it also reads /etc on the bare form).
+const cmdLauncher: CommandResolver = (positional) => {
+  if (positional.length > 0) {
+    return {
+      refuse:
+        'command launcher: positional usage execs the wrapped command, laundering exec attribution past the per-command refuse checks — run the wrapped tool directly',
+    };
+  }
+  return { capabilities: [], confidence: 'high' };
+};
+
 // Filesystem-mutating utilities that create or touch a target.
 // mkdir / touch / ln / mktemp: positional args are the targets.
 // Each takes its own set of value-flags whose operand is NOT a
@@ -2810,6 +2834,21 @@ const COMMAND_TABLE: ReadonlyMap<string, CommandResolver> = new Map<string, Comm
   // cmdSysInfo, which laundered exec attribution for
   // `env <prog> [args]` shapes.
   ['env', cmdEnv],
+  // Command launchers — refuse positional usage so they can't launder a
+  // wrapped command (sh -c, rm -rf /, dd, sudo, …) past its per-command
+  // refuse, which under mode:bypass would otherwise auto-allow. See
+  // cmdLauncher.
+  ['nice', cmdLauncher],
+  ['nohup', cmdLauncher],
+  ['setsid', cmdLauncher],
+  ['timeout', cmdLauncher],
+  ['stdbuf', cmdLauncher],
+  ['ionice', cmdLauncher],
+  ['taskset', cmdLauncher],
+  ['chrt', cmdLauncher],
+  ['setarch', cmdLauncher],
+  ['flock', cmdLauncher],
+  ['watch', cmdLauncher],
   // printenv reads its own environ, not /etc — slice 152 moves
   // it to cmdSysInfoNoEtc to match its actual surface.
   ['printenv', cmdSysInfoNoEtc],
