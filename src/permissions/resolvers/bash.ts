@@ -3733,6 +3733,13 @@ const couldGlobReachProtected = (
     ...targets.absoluteEscalate,
     ...targets.tildeEscalateFiles,
     ...targets.tildeEscalateDirs,
+    // cwd-escalate dirs (`.git` / `.agent` / `.claude`) were omitted, so a
+    // glob expanding into them (`rm .g*`, `for f in .*` from a repo cwd)
+    // slipped the protected-glob refuse. They are write-escalate targets
+    // like the tilde dirs; include them so a glob that could reach them is
+    // refused too (a literal read still passes — escalate is write-only —
+    // but a glob into the zone is held conservative, as for /etc and ~).
+    ...targets.cwdEscalateDirs,
   ];
   // Normalize: a literal-prefix that ends in `/` is "in a parent
   // directory; glob fills in the next segment". A literal-prefix

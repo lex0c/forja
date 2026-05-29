@@ -2166,6 +2166,18 @@ describe('bash resolver — for-loop item words are classified (loop source not 
       resolveCapabilities('bash', { command: 'for f in *; do cat "$f"; done' }, home).kind,
     ).toBe('conservative');
   });
+
+  test('glob reaching a cwd-escalate dir (.git/.agent/.claude) refuses', () => {
+    // couldGlobReachProtected now includes the cwd-escalate dirs, so a glob
+    // expanding into them is held conservative→refuse like /etc and ~.
+    for (const cmd of [
+      'for f in .*; do cat "$f"; done', // .* → .git in the repo cwd
+      'rm .g*', // glob completes to .git
+      'cat .git/*', // glob inside .git
+    ]) {
+      expect(resolveCapabilities('bash', { command: cmd }, CTX).kind).toBe('refuse');
+    }
+  });
 });
 
 // Review regression: dynamic operands were pulled out of shape.args, so

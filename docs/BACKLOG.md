@@ -2,6 +2,12 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-29] permissions — couldGlobReachProtected now scans cwd-escalate dirs too
+
+Closes the gap flagged in the previous entry. `couldGlobReachProtected`'s target set was `systemDeny + absoluteEscalate + tildeEscalate{Files,Dirs}` — it omitted the cwd-escalate dirs (`.git`/`.agent`/`.claude`), even though `protectedTargets` returns them. So a glob expanding into them (`rm .g*`, `cat .git/*`, `for f in .*` from a repo cwd) slipped the protected-glob refuse. Added `...targets.cwdEscalateDirs` to the scan, so such globs are held conservative→refuse like /etc and ~ (a literal read of those dirs still passes — escalate is write-only — but a glob into the zone is refused; this catches e.g. a glob-delete of `.git`).
+
+**Validated:** +1 regression test (`for f in .*` / `rm .g*` / `cat .git/*` from a repo cwd → Refuse); non-reaching globs (`*.ts`, `*`) still pass (their `rest` starts with `/`); full `tests/permissions/` (2116) + typecheck + biome clean. **Branch:** `chore/sec-fixes`.
+
 ## [2026-05-29] permissions — dot-glob (`.*`) prefixes collapsed before the protected-glob check
 
 A bare leading dot before a glob (`.*`) matches DOTFILES in the dir, but `globLiteralPrefix('.*')` is `.` and `path.resolve` treats a trailing `.` segment as "current directory" and drops it — so `for f in .*; do grep -R token "$f"; done` from $HOME resolved the prefix to `$HOME`, and `couldGlobReachProtected` saw `$HOME/.ssh` as an unreachable SUBDIR (its `rest` `/.ssh` starts with `/`). The loop-word/per-arg glob check then passed, the body only carried the dynamic `$f`, and under `mode: bypass` (which doesn't honor Conservative) the loop could read `~/.ssh`, `~/.aws`, … with no §8.4/§11 cap. Same root cause as the `/run/media` finding (a path-segment boundary lost in `path.resolve`).
