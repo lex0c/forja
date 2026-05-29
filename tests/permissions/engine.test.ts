@@ -3334,6 +3334,28 @@ describe('engine — effective capabilities envelope (§10.1, slice 95)', () => 
     expect(outside.reason).toContain('/etc/passwd');
   });
 
+  test('narrowed effective: unknown bash command (exec:arbitrary) is outside an exec:shell envelope', () => {
+    // Spec §10.1: a subagent whose envelope allows ordinary bash
+    // (exec:shell) but NOT arbitrary execution must not run an unmodeled
+    // binary. `frobnicate` is a registry miss → exec:arbitrary, which
+    // exec:shell does not cover (the umbrella is one-directional) → the
+    // envelope gate denies. A modeled read command stays covered.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['*'] } } }), {
+      cwd: CWD,
+      effectiveCapabilities: [
+        { kind: 'exec', scope: 'shell' },
+        { kind: 'read-fs', scope: '**' },
+      ],
+    });
+    const unknown = eng.check('bash', 'bash', { command: 'frobnicate --wat' });
+    expect(unknown.kind).toBe('deny');
+    expect(unknown.source?.section).toBe('subagent-effective');
+    expect(unknown.reason).toContain('exec:arbitrary');
+
+    const known = eng.check('bash', 'bash', { command: 'cat src/index.ts' });
+    expect(known.source?.section).not.toBe('subagent-effective');
+  });
+
   test('misc category (no resolver) passes regardless of effective', () => {
     // Misc-category tools (e.g. think, todo_write) emit no
     // resolved capabilities. Even a pure-LLM child with

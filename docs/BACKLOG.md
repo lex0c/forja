@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-29] permissions — attribute unknown bash commands as exec:arbitrary
+
+The registry-miss (Conservative) branch returned only redirect/escalate operand caps; the aggregator then prepended `exec:shell` (every bash call gets it). So an unmodeled command like `frobnicate` carried `exec:shell` but never `exec:arbitrary`. In a child engine whose effective envelope allows `exec:shell` (ordinary bash) but NOT arbitrary execution, the §10.1 envelope gate counted `frobnicate` as covered and let it proceed to policy/bypass handling — even though it runs any unmodeled binary. (`exec:arbitrary` is the umbrella class; `exec:shell` does NOT cover it — capabilities.ts coverage is one-directional.) The risk score also missed the arbitrary-exec signal.
+
+**Fix.** The registry-miss branch now emits `exec('arbitrary')` alongside the redirect/operand caps. A subagent envelope that allows only `exec:shell` no longer covers an unknown command → the envelope gate denies (`source.section: subagent-effective`), and the risk score weighs the real effect. The result stays Conservative (confirm) for the normal, un-narrowed engine — `frobnicate --wat` still confirms, not deny; only what the envelope/score observe changes.
+
+**Validated:** +2 regression tests (resolver: unknown cmd caps include `exec:arbitrary`; engine: `exec:shell`-only envelope denies `frobnicate` via `subagent-effective` while `cat` stays covered); existing `frobnicate --wat → confirm` (un-narrowed engine) still passes; full `tests/permissions/` (2084) + subagents (642) + typecheck + biome clean. **Branch:** `chore/sec-fixes`.
+
 ## [2026-05-29] conformance — align bash_adversarial dispositions with the soft→conservative split
 
 6 conformance cases still asserted the pre-`§5.2` behavior (`kind: deny`, `resolver_kind: refuse`) for shapes that the soft-unmodeled split reclassified to Conservative → confirm: bare `$var`, `${var:-default}`, `if`, `for`, subshell, compound `{ ;}`. The behavior change was shipped + spec'd (PERMISSION_ENGINE.md §5.2) and covered at the resolver level (`resolvers.test.ts`), but the end-to-end conformance YAML was never updated, so it failed once run. No code change — only the conformance expectations.

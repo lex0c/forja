@@ -4119,8 +4119,16 @@ const analyzeCommand = (
     // redirect + escalate-tier operand caps (above) ride along so the
     // engine's bypass §11 floor stays honest. (Dynamic operands are in
     // effectiveArgs, so the loop above already classified them.)
+    //
+    // Attribute exec:arbitrary — an unmodeled binary runs whatever it is,
+    // which is exactly the umbrella exec class, NOT the aggregator's bare
+    // exec:shell. A subagent envelope that allows ordinary bash
+    // (exec:shell) but not arbitrary execution must NOT count `frobnicate`
+    // as covered, and the risk score must see the real effect. The result
+    // stays Conservative (confirm) for the normal case; the cap only
+    // changes what the §10.1 envelope gate and the score observe.
     return {
-      caps: [...redir.caps, ...argCaps],
+      caps: [exec('arbitrary'), ...redir.caps, ...argCaps],
       confidence: 'low',
       conservative: `unknown_command: ${shape.name}`,
     };

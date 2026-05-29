@@ -1995,6 +1995,17 @@ describe('bash resolver — unknown commands ride escalate-tier operand caps (by
     }
   });
 
+  test('unknown cmd is attributed exec:arbitrary (not just the aggregator exec:shell)', () => {
+    // An unmodeled binary runs whatever it is → exec:arbitrary (the umbrella
+    // exec class), so a subagent envelope allowing only exec:shell sees it
+    // as uncovered and the risk score weighs the real effect.
+    const r = resolveCapabilities('bash', { command: 'frobnicate --wat' }, CTX);
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(capStrings(r.capabilities)).toContain('exec:arbitrary');
+    }
+  });
+
   test('unknown cmd targeting a deny-tier path still Refuses (short-circuits the loop)', () => {
     const r = resolveCapabilities('bash', { command: 'sed -i /proc/sysrq-trigger' }, CTX);
     expect(r.kind).toBe('refuse');
