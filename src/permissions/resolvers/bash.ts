@@ -2781,13 +2781,13 @@ interface CommandShape {
   name: string;
   args: string[];
   redirects: RedirectShape[];
-  // Raw text of operands the walk couldn't fold to a literal because they
-  // carry a shell expansion (`$HOME/.ssh/id_rsa`, `"$dir/x"`). Parked here
-  // instead of dropped so analyzeCommand can resolve the known vars and
-  // emit an fs cap — otherwise the soft→conservative result would carry
-  // only the cwd baseline and the bypass §8.4/§11 floor would miss the
-  // real target. Absent when the command had no dynamic operands.
-  dynamicArgs?: string[];
+  // Indices into `args` of operands the walk couldn't fold to a literal
+  // because they carry a shell expansion (`$HOME/.ssh/id_rsa`, `"$dir/x"`).
+  // The raw text is kept IN `args` at its original position so positional
+  // handlers (grep pattern/file, uniq in/out) slot the literals correctly;
+  // analyzeCommand expands the shell vars it knows for these indices before
+  // classifying and dispatching. Absent when there were no dynamic operands.
+  dynamicArgIndices?: number[];
 }
 
 interface RedirectShape {
@@ -2966,6 +2966,12 @@ interface WalkResult {
   // separately — a deny-tier target still refuses — because
   // analyzeCommand never sees a redirect that isn't on a CommandShape.
   orphanRedirects?: RedirectShape[];
+  // Raw text of the words in a `for VAR in <words>` list. These bind the
+  // loop variable, and the body's use of `$VAR` isn't tracked, so the
+  // words are the only place a deny/sensitive loop SOURCE is visible
+  // (`for f in /proc/1/environ; do cat "$f"; done`). bashResolver
+  // classifies them as read operands — deny refuses, sensitive rides a cap.
+  loopWords?: string[];
 }
 
 // Recursion depth ceiling for `walkAst` (slice 98, R2 #198). A
@@ -2988,6 +2994,9 @@ const walkAst = (root: Node): WalkResult => {
   // Redirects on a redirected_statement that consumed no command (see
   // WalkResult.orphanRedirects) — classified by the resolver, not here.
   const orphanRedirects: RedirectShape[] = [];
+  // `for VAR in <words>` item list — classified by the resolver (it has
+  // ctx), since the body's `$VAR` use can't be tracked here.
+  const loopWords: string[] = [];
   // Set when the walk passes through any soft-unmodeled shape (control
   // flow, grouping, value expansion, a dynamic command ARG). Unlike a
   // HARD refuse (which short-circuits the walk), soft shapes are
@@ -3022,6 +3031,25 @@ const walkAst = (root: Node): WalkResult => {
         // hard-refuses in analyzeCommand).
         sawSoft = true;
         softReason ??= redFlag;
+        // Collect the `for VAR in <words>` item list. The words bind the
+        // loop variable; the body's `$VAR` use isn't tracked, so this is
+        // the only place a deny/sensitive loop source (`for f in
+        // /proc/1/environ`) is visible. Raw text — bashResolver expands +
+        // classifies. Tokens before `in` (the var) and the do-body are
+        // excluded; punctuation is skipped. A dynamic source (`for f in
+        // $LIST`) is collected too but resolves to a harmless cwd path.
+        if (node.type === 'for_statement') {
+          let afterIn = false;
+          for (const c of node.children) {
+            if (c === null) continue;
+            if (c.type === 'do_group') break;
+            if (c.type === 'in') {
+              afterIn = true;
+              continue;
+            }
+            if (afterIn && !isPunctuationType(c.type)) loopWords.push(c.text);
+          }
+        }
         for (const child of node.children) {
           if (child === null) continue;
           const refuse = visit(child, depth + 1, true);
@@ -3099,17 +3127,19 @@ const walkAst = (root: Node): WalkResult => {
             // Dynamic ARG value (e.g. "$f"). Unlike a dynamic NAME this
             // isn't categorically dangerous — the command is known. Mark
             // soft, DESCEND to catch any HARD construct hiding inside the
-            // arg (e.g. "$(evil)"), then PARK the raw text (don't drop it)
-            // so analyzeCommand can resolve the shell vars it knows and
-            // emit an fs cap. Dropping it left `cat $HOME/.ssh/id_rsa`
-            // resolving to read-fs:<cwd>, slipping past the bypass §8.4/
-            // §11 floor which only scans the resolved capability set.
+            // arg (e.g. "$(evil)"), then KEEP the raw text IN args at its
+            // position (recording the index) so analyzeCommand can resolve
+            // the shell vars it knows. Dropping it left `cat $HOME/.ssh/
+            // id_rsa` resolving to read-fs:<cwd>; pulling it out of args
+            // shifted positional handlers (grep pattern/file, uniq in/out)
+            // onto the wrong slots. Both slipped the bypass §8.4/§11 floor.
             sawSoft = true;
             softReason ??= 'dynamic value in arg';
             const refuse = visit(child, depth + 1, softCtx);
             if (refuse !== null) return refuse;
-            if (shape.dynamicArgs === undefined) shape.dynamicArgs = [];
-            shape.dynamicArgs.push(child.text);
+            if (shape.dynamicArgIndices === undefined) shape.dynamicArgIndices = [];
+            shape.dynamicArgIndices.push(shape.args.length);
+            shape.args.push(child.text);
             continue;
           }
           shape.args.push(text);
@@ -3193,6 +3223,7 @@ const walkAst = (root: Node): WalkResult => {
     soft: sawSoft,
     ...(softReason !== null ? { softReason } : {}),
     ...(orphanRedirects.length > 0 ? { orphanRedirects } : {}),
+    ...(loopWords.length > 0 ? { loopWords } : {}),
   };
 };
 
@@ -3863,6 +3894,23 @@ const analyzeCommand = (
     };
   }
 
+  // Dynamic operands ($HOME/.ssh/id_rsa, "$f") were parsed as non-literal
+  // and parked IN POSITION on shape.args, their indices in
+  // dynamicArgIndices. Expand the shell vars we can know statically for
+  // those slots so the per-arg §11 loop, the handler (whose semantics
+  // depend on positional order — grep pattern/file, uniq in/out), and the
+  // cap it emits all see the resolved target. Dropping these (or pulling
+  // them out of args) made positional handlers analyze the wrong slots and
+  // miss the real path. Non-dynamic args are untouched; other `$...` stay
+  // literal (still dynamic — matchSensitivePath spans segments downstream).
+  const dynamicIdx = shape.dynamicArgIndices;
+  const effectiveArgs =
+    dynamicIdx === undefined
+      ? shape.args
+      : shape.args.map((a, i) =>
+          dynamicIdx.includes(i) ? expandKnownVars(stripShellQuoting(a), ctx) : a,
+        );
+
   // Command-runner spawning an interpreter (standalone shape too).
   // `xargs sh -c …`, `parallel /usr/bin/python -c … ::: list`, etc. run
   // the inner interpreter on every input. detectPipeToShell catches this
@@ -3873,7 +3921,7 @@ const analyzeCommand = (
   // embedded interpreter — same posture/reason class as the pipe case.
   // Benign `xargs rm` / `parallel gzip ::: *` carry no interpreter token
   // and fall through to the normal Conservative (registry-miss) path.
-  if (EXEC_RUNNER_COMMANDS.has(name) && shape.args.some((a) => resolvesToInterpreter(a))) {
+  if (EXEC_RUNNER_COMMANDS.has(name) && effectiveArgs.some((a) => resolvesToInterpreter(a))) {
     return {
       refuse: `bash: ${name} spawning an interpreter has no safe capability resolution`,
     };
@@ -3917,14 +3965,9 @@ const analyzeCommand = (
   // onto that branch. Known commands ignore this — their handler emits the
   // precise positional caps (adding argCaps there would just duplicate).
   const argCaps: Capability[] = [];
-  // Caps for dynamic operands (shape.dynamicArgs). Emitted for BOTH the
-  // known-handler and registry-miss branches — the handler never sees a
-  // dynamic operand (the walk parked it, didn't push it to args), so
-  // unlike argCaps this must ride onto both returns.
-  const dynCaps: Capability[] = [];
   if (!isPureOutputCommand(name)) {
     const targets = protectedTargets(ctx.home, ctx.cwd);
-    for (const arg of shape.args) {
+    for (const arg of effectiveArgs) {
       if (arg.length === 0) continue;
       const candidate = extractFlagValue(arg);
       if (candidate === null) continue;
@@ -3997,31 +4040,6 @@ const analyzeCommand = (
         if (detectCwdScopeEscape(abs, ctx)) escalated = true;
       }
     }
-
-    // Dynamic path operands the walk parked on shape.dynamicArgs (e.g.
-    // `cat $HOME/.ssh/id_rsa`, `tee "$dir/x"`). Resolve the shell vars we
-    // know and emit an fs cap per operand so the soft→conservative result
-    // carries the real target — under mode:bypass the §8.4/§11 floor scans
-    // only the resolved caps, so without this `cat $HOME/.ssh/id_rsa` ran
-    // with read-fs:<cwd> and slipped the sensitive-path floor. Deny-tier
-    // resolved targets still refuse. Fully-opaque operands (`$f`) resolve
-    // to a harmless cwd-relative path (residual documented in the backlog;
-    // matchSensitivePath still spans segments, so `$x/.ssh/id_rsa` trips).
-    for (const raw of shape.dynamicArgs ?? []) {
-      const candidate = expandKnownVars(stripShellQuoting(raw), ctx);
-      // Empty, or a dynamic FLAG (`$OPTS` → "-x"): no path content.
-      if (candidate.length === 0 || candidate.startsWith('-')) continue;
-      const op: 'read' | 'write' = isReadOnlyCommand(name) ? 'read' : 'write';
-      const abs = resolveArg(candidate, ctx);
-      const tier = classifyArgWithCanonical(abs, op, ctx);
-      if (tier === 'deny') {
-        return {
-          refuse: `bash: ${shape.name} dynamic target '${candidate}' is in protected zone (deny tier, see PERMISSION_ENGINE.md §11)`,
-        };
-      }
-      if (tier === 'escalate') escalated = true;
-      dynCaps.push(op === 'write' ? writeFs(abs) : readFs(abs));
-    }
   }
 
   // Classify redirect targets BEFORE the registry split. Pre-fix the
@@ -4042,21 +4060,22 @@ const analyzeCommand = (
     // §5.2 step 3c). Not in HARD_REFUSE_COMMANDS, so not categorically
     // dangerous — just unmodeled. Conservative forces a confirm; the
     // redirect + escalate-tier operand caps (above) ride along so the
-    // engine's bypass §11 floor stays honest.
+    // engine's bypass §11 floor stays honest. (Dynamic operands are in
+    // effectiveArgs, so the loop above already classified them.)
     return {
-      caps: [...redir.caps, ...argCaps, ...dynCaps],
+      caps: [...redir.caps, ...argCaps],
       confidence: 'low',
       conservative: `unknown_command: ${shape.name}`,
     };
   }
-  const positional = stripFlags(shape.args);
-  const result = handler(positional, shape.args, ctx);
+  const positional = stripFlags(effectiveArgs);
+  const result = handler(positional, effectiveArgs, ctx);
   if ('refuse' in result) return { refuse: result.refuse };
   let finalConf: 'high' | 'medium' | 'low' = result.confidence;
   if (escalated || redir.escalated) finalConf = 'low';
 
   return {
-    caps: [...result.capabilities, ...redir.caps, ...dynCaps],
+    caps: [...result.capabilities, ...redir.caps],
     confidence: finalConf,
   };
 };
@@ -4122,6 +4141,41 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
     return { kind: 'refuse', reason: orphanRedir.refuse };
   }
 
+  // For-loop `in` item words bind the loop variable; the body's `$var`
+  // use isn't tracked, so a deny/sensitive loop SOURCE is only visible
+  // here. Classify each as a read operand: a system-deny source
+  // (`for f in /proc/1/environ; do cat "$f"; done`) refuses, and a
+  // sensitive/escalate source rides a read-fs cap onto the result so the
+  // bypass §8.4/§11 floor catches it — the body alone produced only a
+  // dynamic read-fs:<cwd>/$f. A glob that could reach a protected zone
+  // refuses too. A dynamic source (`for f in $LIST`) resolves to a
+  // harmless cwd path (the body-dataflow residual stays documented).
+  const loopWordCaps: Capability[] = [];
+  for (const w of walk.loopWords ?? []) {
+    const wResolved = expandKnownVars(stripShellQuoting(w), ctx);
+    if (wResolved.length === 0) continue;
+    for (const exp of expandBraces(wResolved)) {
+      if (containsGlobMetachar(exp)) {
+        const absPrefix = resolvePath(ctx.cwd, expandTilde(globLiteralPrefix(exp), ctx.home));
+        if (couldGlobReachProtected(absPrefix, protectedTargets(ctx.home, ctx.cwd))) {
+          return {
+            kind: 'refuse',
+            reason: `bash: for-loop item '${exp}' could glob into a protected zone — refusing static analysis`,
+          };
+        }
+        continue;
+      }
+      const abs = resolvePath(ctx.cwd, expandTilde(exp, ctx.home));
+      if (classifyArgWithCanonical(abs, 'read', ctx) === 'deny') {
+        return {
+          kind: 'refuse',
+          reason: `bash: for-loop item '${exp}' is in protected zone (deny tier, see PERMISSION_ENGINE.md §11)`,
+        };
+      }
+      loopWordCaps.push(readFs(abs));
+    }
+  }
+
   if (commands.length === 0) {
     // A soft shape with no resolvable command (`[[ -e x ]]`, `( )`) is
     // unmodeled-but-benign → confirm. Not soft + no command → nothing
@@ -4129,7 +4183,7 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
     if (walk.soft === true) {
       return {
         kind: 'conservative',
-        capabilities: [exec('shell'), ...orphanRedir.caps],
+        capabilities: [exec('shell'), ...orphanRedir.caps, ...loopWordCaps],
         reason: `bash: ${walk.softReason ?? 'unmodeled shape'} (no resolvable command) → confirm`,
       };
     }
@@ -4145,7 +4199,7 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
   // `for i in 1; do echo x > /proc/...; done`, `for x in *; do cat
   // /etc/pass*; done`, and `'eval'`/`$()` inside a loop all stay denied
   // even though the wrapping shape is soft.
-  const allCaps: Capability[] = [exec('shell'), ...orphanRedir.caps];
+  const allCaps: Capability[] = [exec('shell'), ...orphanRedir.caps, ...loopWordCaps];
   let aggregateConf: 'high' | 'medium' | 'low' = 'high';
   let conservativeReason: string | null = null;
   for (const shape of commands) {

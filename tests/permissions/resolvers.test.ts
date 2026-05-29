@@ -2049,6 +2049,87 @@ describe('bash resolver — dynamic ($-expansion) path operands keep their targe
   });
 });
 
+// Review regression: a `for VAR in <words>` item list assigns the loop
+// variable, but the walk never classified the words — only the body
+// produced a dynamic read-fs:<cwd>/$f cap, so a deny-tier loop SOURCE
+// (`for f in /proc/1/environ; do cat "$f"; done`) was never refused.
+describe('bash resolver — for-loop item words are classified (loop source not a blind spot)', () => {
+  test('for f in /proc/1/environ; do cat "$f"; done → Refuse (deny-tier loop source)', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'for f in /proc/1/environ; do cat "$f"; done' },
+      CTX,
+    );
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('any deny-tier item in the list refuses', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'for f in ok.txt /dev/sda; do cat "$f"; done' },
+      CTX,
+    );
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('for f in /etc/*; do ... → Refuse (item globs into a protected zone)', () => {
+    const r = resolveCapabilities('bash', { command: 'for f in /etc/*; do cat "$f"; done' }, CTX);
+    expect(r.kind).toBe('refuse');
+  });
+
+  test('sensitive literal item rides a read-fs cap (bypass §8.4 floor sees it)', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'for f in ~/.ssh/id_rsa; do cat "$f"; done' },
+      CTX,
+    );
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/home/op/.ssh/id_rsa');
+    }
+  });
+
+  test('$HOME-prefixed loop item resolves and surfaces the sensitive read', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'for f in $HOME/.ssh/id_rsa; do cat "$f"; done' },
+      CTX,
+    );
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/home/op/.ssh/id_rsa');
+    }
+  });
+
+  test('benign cwd-glob loop stays Conservative', () => {
+    const r = resolveCapabilities('bash', { command: 'for f in *.ts; do cat "$f"; done' }, CTX);
+    expect(r.kind).toBe('conservative');
+  });
+});
+
+// Review regression: dynamic operands were pulled out of shape.args, so
+// positional handlers (grep pattern/file, uniq in/out) analyzed the
+// remaining literals in the wrong slots — `grep "$pat" /etc/shadow`
+// treated /etc/shadow as the PATTERN and emitted no read cap. Keeping the
+// dynamic operand IN args at its position fixes the slotting.
+describe('bash resolver — dynamic operands keep positional order (positional handlers)', () => {
+  test('grep "$pat" /etc/shadow emits read-fs for the FILE, not as the pattern', () => {
+    const r = resolveCapabilities('bash', { command: 'grep "$pat" /etc/shadow' }, CTX);
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/etc/shadow');
+    }
+  });
+
+  test('uniq "$in" /etc/out emits write-fs for the OUTPUT (second positional)', () => {
+    const r = resolveCapabilities('bash', { command: 'uniq "$in" /etc/out' }, CTX);
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/etc/out');
+    }
+  });
+});
+
 // Review regression: read-only-classified filters that can WRITE a file
 // were misclassified — the write target surfaced as read-fs (or vanished
 // for `--output=`), so §11 escalation/denial + sandbox planning saw a

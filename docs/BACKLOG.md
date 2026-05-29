@@ -2,6 +2,16 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-29] permissions — classify for-loop item words + preserve dynamic argv positions
+
+Two related follow-ups to the dynamic-operand handling.
+
+**For-loop item words were a blind spot.** Marking `for_statement` soft let the walk descend into the body, but it never modeled the `in <words>` list that BINDS the loop variable. The body's `$f` use isn't tracked (it resolves to a dynamic `read-fs:<cwd>/$f`), so `for f in /proc/1/environ; do cat "$f"; done` left the `/proc` deny-tier read unrefused — a system-deny source became an approvable/bypassable Conservative shell call. Fix: `walkAst` collects the item words (`WalkResult.loopWords`); `bashResolver` classifies each as a read operand — a deny-tier item refuses, a glob that could reach a protected zone refuses, and a sensitive/escalate item (`for f in ~/.ssh/id_rsa`, `$HOME`-prefixed) rides a `read-fs` cap onto the result so the bypass §8.4/§11 floor sees it. This closes the literal-source half of the dataflow residual the previous entry flagged.
+
+**Dynamic operands lost their positional slot.** The prior fix parked dynamic operands in a separate `dynamicArgs` list, REMOVING them from `shape.args` — so positional handlers analyzed the remaining literals in the wrong slots: `grep "$pat" /etc/shadow` passed only `/etc/shadow` to cmdGrep, which treated it as the PATTERN and emitted no read cap; `uniq "$in" /etc/out` shifted the output operand into the input slot (write seen as read). Fix: keep the dynamic operand IN `shape.args` at its original position, recording its index in `dynamicArgIndices`. analyzeCommand builds `effectiveArgs` (the same args with known shell vars expanded at those indices) and feeds it to the per-arg §11 loop, `stripFlags`, and the handler — so positions are preserved AND the handler emits the resolved cap. The separate `dynCaps` loop is gone (the handler now emits dynamic-operand caps in position).
+
+**Validated:** +8 regression tests (deny/glob/sensitive/`$HOME` loop items; benign cwd-glob loop; `grep "$pat" /etc/shadow` → read-fs on the file; `uniq "$in" /etc/out` → write-fs on the output); full `tests/permissions/` (2069) + tools (460) + harness (314) + fuzz (28) + typecheck + biome clean. **Residual:** a fully-opaque loop source (`for f in $LIST`) or a body that WRITES through `$f` still isn't tracked (needs loop-variable dataflow). **Branch:** `chore/sec-fixes`.
+
 ## [2026-05-29] permissions — dynamic ($-expansion) path operands were dropped, hiding the target under bypass
 
 `walkAst` can't fold an operand carrying a shell expansion (`cat $HOME/.ssh/id_rsa`, `tee "$dir/x"`) to a literal, so it marked the command soft and **dropped** the operand before `analyzeCommand` built capabilities. The soft→conservative result then carried only the baseline cwd read; under `mode: bypass` (conservative is allowed, and the §8.4 sensitive-path / §11 protected floor scans only `resolvedCapabilities`) `cat $HOME/.ssh/id_rsa` ran with `read-fs:<cwd>` and slipped past the credential floor entirely.
