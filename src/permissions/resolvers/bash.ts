@@ -546,6 +546,8 @@ const cmdReadWithSize: CommandResolver = (_positional, tokens, ctx) => {
 // `sort` is a read-only filter EXCEPT that it can WRITE and EXEC:
 //   - `-o FILE` / `--output=FILE` redirects the sorted result to FILE
 //     (GNU sort --help), across all four getopt shapes.
+//   - `-T DIR` / `--temporary-directory=DIR` writes transient temp files
+//     under DIR (`sort -T /etc big` writes into /etc).
 //   - `--compress-program=PROG` runs PROG to (de)compress temp files —
 //     arbitrary command execution, the same class as tar
 //     `--use-compress-program` / `--to-command`.
@@ -559,7 +561,12 @@ const cmdReadWithSize: CommandResolver = (_positional, tokens, ctx) => {
 // compress-program exec vector. `sort` is also removed from
 // isReadOnlyCommand so the per-arg §11 loop treats its operands as
 // writes (defense in depth — see the loop in analyzeCommand).
-const SORT_OUTPUT_VALUE_FLAGS: ReadonlySet<string> = new Set(['-o', '--output']);
+const SORT_OUTPUT_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  '-o',
+  '--output',
+  '-T',
+  '--temporary-directory',
+]);
 
 const cmdSort: CommandResolver = (_positional, tokens, ctx) => {
   if (tokens.some((t) => t === '--compress-program' || t.startsWith('--compress-program='))) {
@@ -567,9 +574,10 @@ const cmdSort: CommandResolver = (_positional, tokens, ctx) => {
       refuse: 'sort: --compress-program runs an arbitrary program — refusing static analysis',
     };
   }
-  const writeTargets = extractValueFlag(tokens, { longForm: '--output', shortForm: '-o' }).filter(
-    (v) => v !== '-',
-  );
+  const writeTargets = [
+    ...extractValueFlag(tokens, { longForm: '--output', shortForm: '-o' }),
+    ...extractValueFlag(tokens, { longForm: '--temporary-directory', shortForm: '-T' }),
+  ].filter((v) => v !== '-');
   const inputs = stripFlags(tokens, SORT_OUTPUT_VALUE_FLAGS).filter((v) => v !== '-');
   const caps = [
     ...inputs.map((p) => readFs(resolveArg(p, ctx))),
@@ -3176,6 +3184,19 @@ const walkAst = (root: Node): WalkResult => {
 const resolvesToInterpreter = (token: string): boolean =>
   SHELL_INTERPRETERS.has(token) || SHELL_INTERPRETERS.has(basename(stripShellQuoting(token)));
 
+// Commands that EXECUTE another command supplied as arguments, reading
+// the operands from stdin / a file / `:::` lists. When that inner command
+// is a shell or interpreter every input line becomes an exec'd script,
+// and the resolver can't model it — the same uncontrollable shape as
+// pipe-to-shell. `xargs` runs its command via execvp; GNU `parallel`
+// wraps each job in a shell. Both Refuse when an interpreter token appears
+// in the argv (see analyzeCommand); benign runners (`xargs rm`, `parallel
+// gzip ::: *`) carry no interpreter token and stay Conservative. Residual
+// gap, documented in the backlog: an interpreter hidden inside a quoted
+// command STRING (`parallel ::: 'sh -c x'`) is runtime data the static
+// token scan can't crack — it falls to Conservative/confirm.
+const EXEC_RUNNER_COMMANDS: ReadonlySet<string> = new Set(['xargs', 'parallel']);
+
 // Slice 147 (review R1): added xargs-to-interpreter detection.
 // `... | xargs sh -c '<arg>'` is the canonical xargs-as-exec
 // pattern: xargs reads stdin lines and passes each as positional
@@ -3813,6 +3834,22 @@ const analyzeCommand = (
   if (isHardRefuseCommand(name)) {
     return {
       refuse: `bash: command '${shape.name}' has no safe capability resolution`,
+    };
+  }
+
+  // Command-runner spawning an interpreter (standalone shape too).
+  // `xargs sh -c …`, `parallel /usr/bin/python -c … ::: list`, etc. run
+  // the inner interpreter on every input. detectPipeToShell catches this
+  // only when the runner is a PIPELINE stage; a standalone `xargs -a file
+  // sh -c …` (no pipe) never reached that scan and stayed an unregistered
+  // Conservative command that mode:bypass auto-allows. Scan the argv (name
+  // is basename-normalized, so `/usr/bin/xargs` counts) and refuse on any
+  // embedded interpreter — same posture/reason class as the pipe case.
+  // Benign `xargs rm` / `parallel gzip ::: *` carry no interpreter token
+  // and fall through to the normal Conservative (registry-miss) path.
+  if (EXEC_RUNNER_COMMANDS.has(name) && shape.args.some((a) => resolvesToInterpreter(a))) {
+    return {
+      refuse: `bash: ${name} spawning an interpreter has no safe capability resolution`,
     };
   }
 

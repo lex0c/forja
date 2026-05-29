@@ -2054,6 +2054,24 @@ describe('bash resolver — sort/uniq writes are not misclassified as reads', ()
       expect(caps).not.toContain('read-fs:/work/proj/1');
     }
   });
+
+  test('sort -T DIR writes temp files under DIR → write-fs for the temp dir', () => {
+    const r = resolveCapabilities('bash', { command: 'sort -T /work/proj/tmp /work/proj/in' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const caps = capStrings(r.capabilities);
+      expect(caps).toContain('write-fs:/work/proj/tmp');
+      expect(caps).toContain('read-fs:/work/proj/in');
+    }
+  });
+
+  test('sort --temporary-directory into a protected zone surfaces the write (escalate)', () => {
+    const r = resolveCapabilities('bash', { command: 'sort --temporary-directory=/etc big' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/etc');
+    }
+  });
 });
 
 // Review regression: a PATH-QUALIFIED interpreter as a pipe/xargs target
@@ -2072,6 +2090,37 @@ describe('bash resolver — path-qualified interpreter as pipe/xargs target stil
   ])('%s → Refuse', (cmd) => {
     expect(resolveCapabilities('bash', { command: cmd }, CTX).kind).toBe('refuse');
   });
+});
+
+// Review regression: a command-runner (xargs / GNU parallel) spawning an
+// interpreter must Refuse even with NO pipe — detectPipeToShell only scans
+// pipeline nodes, so a standalone `xargs -a file sh -c …` / `parallel sh
+// -c … ::: list` stayed an unregistered Conservative command that
+// mode:bypass auto-allows. analyzeCommand now scans any runner's argv (and
+// walkAst runs it per pipeline stage, so the pipe form is covered too).
+describe('bash resolver — command-runner spawning an interpreter still Refuse (xargs/parallel)', () => {
+  test.each([
+    'xargs sh -c x',
+    'xargs /bin/sh -c x',
+    'xargs /usr/bin/python -c x',
+    'xargs -a list.txt sh -c x',
+    "xargs '/bin/sh' -c x",
+    '/usr/bin/xargs sh -c x', // path-qualified xargs itself
+    'parallel sh -c x ::: a b',
+    'parallel /usr/bin/python -c x ::: a',
+    'parallel ::: sh', // no command before `:::` → the args ARE commands
+    'cat list | parallel sh -c x', // pipeline form, caught per-stage
+    '/usr/bin/parallel sh -c x ::: a', // path-qualified parallel
+  ])('%s → Refuse', (cmd) => {
+    expect(resolveCapabilities('bash', { command: cmd }, CTX).kind).toBe('refuse');
+  });
+
+  test.each(['xargs rm', 'parallel gzip ::: a.txt b.txt'])(
+    'benign runner %s with no interpreter stays Conservative, not Refuse',
+    (cmd) => {
+      expect(resolveCapabilities('bash', { command: cmd }, CTX).kind).toBe('conservative');
+    },
+  );
 });
 
 describe('bash resolver — control flow → Conservative with hard-construct guard (B, §5.2)', () => {

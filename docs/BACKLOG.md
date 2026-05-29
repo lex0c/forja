@@ -2,6 +2,16 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-29] permissions — close the follow-ups (standalone xargs + parallel, sort -T)
+
+Closed the items the previous entry flagged as open, plus the command-runner sibling.
+
+**Command-runner spawning an interpreter, standalone shape (`xargs`/`parallel`).** `detectPipeToShell` only scans `pipeline` nodes, so a standalone `xargs -a file sh -c …` or `parallel sh -c … ::: list` (no pipe) never reached the runner-as-exec scan and stayed an unregistered Conservative command that `mode: bypass` auto-allows. Added the scan to `analyzeCommand` itself: when the basename-normalized command is in `EXEC_RUNNER_COMMANDS` (`xargs`, `parallel`) and any argv token resolves to an interpreter (via the shared `resolvesToInterpreter`), Refuse — covering standalone AND pipelined runners (walkAst runs analyzeCommand per pipeline stage), path-qualified runners (`/usr/bin/xargs`), `parallel ::: sh` (the `:::`-args-are-commands form), and quote-laundered inner interpreters. Benign `xargs rm` / `parallel gzip ::: *` carry no interpreter token and stay Conservative (confirm). **Residual, accepted:** an interpreter hidden inside a quoted command STRING (`parallel ::: 'sh -c x'`) is runtime data the static token scan can't crack — it falls to Conservative/confirm (and is auto-allowed only under `mode: bypass`, which is the operator's explicit broad-risk choice).
+
+**`sort -T DIR` / `--temporary-directory`.** sort writes transient temp files under DIR; `cmdSort` now emits write-fs for the `-T`/`--temporary-directory` target across all getopt shapes (same as `-o`), so `sort -T /etc big` escalates instead of looking read-only.
+
+**Validated:** +15 regression tests (standalone/path-qualified/quoted xargs + parallel forms → Refuse; benign `xargs rm` / `parallel gzip` → Conservative; `sort -T` write-fs incl. protected escalate); full `tests/permissions/` (2052) + typecheck + biome clean. **Branch:** `chore/sec-fixes`.
+
 ## [2026-05-29] permissions — xargs interpreter path + sort/uniq write misclassification
 
 Two more resolver bypasses, both feeding the `mode: bypass` auto-allow of Conservative/read-only.
