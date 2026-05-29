@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-29] permissions — dynamic ($-expansion) path operands were dropped, hiding the target under bypass
+
+`walkAst` can't fold an operand carrying a shell expansion (`cat $HOME/.ssh/id_rsa`, `tee "$dir/x"`) to a literal, so it marked the command soft and **dropped** the operand before `analyzeCommand` built capabilities. The soft→conservative result then carried only the baseline cwd read; under `mode: bypass` (conservative is allowed, and the §8.4 sensitive-path / §11 protected floor scans only `resolvedCapabilities`) `cat $HOME/.ssh/id_rsa` ran with `read-fs:<cwd>` and slipped past the credential floor entirely.
+
+**Fix.** Park the raw operand text on a new `CommandShape.dynamicArgs` instead of dropping it. `analyzeCommand` then resolves the shell vars it knows (`$HOME`/`${HOME}`→home, `$PWD`/`${PWD}`→cwd, `~` downstream) and emits a `read-fs`/`write-fs` cap per operand, riding it onto BOTH the known-handler and registry-miss returns (the handler never sees a dynamic operand, so unlike the literal `argCaps` it must be added to both). A deny-tier resolved target still refuses. `cat $HOME/.ssh/id_rsa` now carries `read-fs:/home/op/.ssh/id_rsa` → the bypass §8.4 floor denies it; the loop case `for f in *.ts; do cat "$f"; done` stays Conservative (the opaque `$f` resolves to a harmless cwd path). `matchSensitivePath` spans path segments, so even an unresolved prefix (`$x/.ssh/id_rsa`) trips `.ssh/**`.
+
+**Validated:** +5 regression tests (`$HOME`/`${HOME}`/quoted/`$PWD` operands carry the resolved cap; dynamic write on an unknown cmd; loop var stays clean); full `tests/permissions/` (2061) + typecheck + biome clean. **Residual, documented:** a fully-opaque operand bound to a protected path by dataflow the resolver doesn't track (`for f in /etc/*; do cat "$f"; done`) resolves `$f` to a cwd path, not `/etc/*` — closing it needs loop-variable dataflow, out of scope for a static per-command resolver. **Branch:** `chore/sec-fixes`.
+
 ## [2026-05-29] permissions — unknown commands discarded escalate-tier operand caps under bypass
 
 The per-arg §11 loop in `analyzeCommand` classifies positional protected-path operands (deny → Refuse, escalate → mark `escalated`), but the registry-miss (Conservative) branch returned only the redirect caps — the escalate-tier operand paths were dropped. Under `mode: bypass` the resolver-driven confirm (low confidence) is intentionally NOT honored (the operator chose broad risk); the ONLY check that still fires is the engine's §11 protected-path floor, which scans the RESOLVED capabilities. With no `write-fs` cap emitted, an unknown command targeting the escalate tier — `sed -i /etc/hosts`, `frobnicate --out=/etc/x` — reached that floor with nothing to upgrade and was silently allowed.

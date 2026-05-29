@@ -1994,6 +1994,61 @@ describe('bash resolver — unknown commands ride escalate-tier operand caps (by
   });
 });
 
+// Review regression: a dynamic ($-expansion) path operand must keep its
+// target in the resolved caps. The walk can't fold `$HOME/.ssh/id_rsa` to
+// a literal, so it marked the command soft and DROPPED the operand — the
+// soft→conservative result carried only the cwd baseline, and under
+// mode:bypass (where the §8.4/§11 floor scans resolved caps) the
+// credential read slipped through. analyzeCommand now resolves known vars
+// and emits the cap.
+describe('bash resolver — dynamic ($-expansion) path operands keep their target in caps', () => {
+  test('cat $HOME/.ssh/id_rsa → Conservative carrying the resolved credential read', () => {
+    const r = resolveCapabilities('bash', { command: 'cat $HOME/.ssh/id_rsa' }, CTX);
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/home/op/.ssh/id_rsa');
+    }
+  });
+
+  test('${HOME} and double-quoted forms resolve too', () => {
+    for (const cmd of ['cat ${HOME}/.ssh/id_rsa', 'cat "$HOME/.ssh/id_rsa"']) {
+      const r = resolveCapabilities('bash', { command: cmd }, CTX);
+      expect(r.kind).toBe('conservative');
+      if (r.kind === 'conservative') {
+        expect(capStrings(r.capabilities)).toContain('read-fs:/home/op/.ssh/id_rsa');
+      }
+    }
+  });
+
+  test('dynamic WRITE operand on an unknown command surfaces a write cap', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'frobnicate $HOME/.ssh/authorized_keys' },
+      CTX,
+    );
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/home/op/.ssh/authorized_keys');
+    }
+  });
+
+  test('$PWD-relative dynamic operand resolves under cwd', () => {
+    const r = resolveCapabilities('bash', { command: 'cat $PWD/data.txt' }, CTX);
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(capStrings(r.capabilities)).toContain('read-fs:/work/proj/data.txt');
+    }
+  });
+
+  test('fully-opaque loop var stays conservative without a protected cap (loop UX preserved)', () => {
+    const r = resolveCapabilities('bash', { command: 'for f in *.ts; do cat "$f"; done' }, CTX);
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(capStrings(r.capabilities).some((c) => c.includes('/.ssh/'))).toBe(false);
+    }
+  });
+});
+
 // Review regression: read-only-classified filters that can WRITE a file
 // were misclassified — the write target surfaced as read-fs (or vanished
 // for `--output=`), so §11 escalation/denial + sandbox planning saw a

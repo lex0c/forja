@@ -86,6 +86,19 @@ const expandTilde = (path: string, home: string): string => {
 const resolveArg = (path: string, ctx: ResolverContext): string =>
   resolvePath(ctx.cwd, expandTilde(path, ctx.home));
 
+// Expand the handful of shell variables the resolver can know statically
+// — `$HOME`/`${HOME}` and `$PWD`/`${PWD}` — so a dynamic operand like
+// `$HOME/.ssh/id_rsa` resolves to the real protected/sensitive path
+// instead of a literal `$HOME` segment. Word-boundary guarded so `$HOMEX`
+// is left intact; a function replacer avoids `$`-in-replacement pitfalls
+// if home/cwd ever contain `$`. Other `$...` stay literal (the operand is
+// still dynamic; the emitted cap is a best-effort, and matchSensitivePath
+// spans segments so `.ssh/**` still trips even on the unresolved form).
+const expandKnownVars = (text: string, ctx: ResolverContext): string =>
+  text
+    .replace(/\$\{HOME\}|\$HOME(?![A-Za-z0-9_])/g, () => ctx.home)
+    .replace(/\$\{PWD\}|\$PWD(?![A-Za-z0-9_])/g, () => ctx.cwd);
+
 const EMPTY_FLAG_SET: ReadonlySet<string> = new Set();
 
 // POSIX-aware positional extraction: tokens before `--` get the
@@ -2768,6 +2781,13 @@ interface CommandShape {
   name: string;
   args: string[];
   redirects: RedirectShape[];
+  // Raw text of operands the walk couldn't fold to a literal because they
+  // carry a shell expansion (`$HOME/.ssh/id_rsa`, `"$dir/x"`). Parked here
+  // instead of dropped so analyzeCommand can resolve the known vars and
+  // emit an fs cap — otherwise the soft→conservative result would carry
+  // only the cwd baseline and the bypass §8.4/§11 floor would miss the
+  // real target. Absent when the command had no dynamic operands.
+  dynamicArgs?: string[];
 }
 
 interface RedirectShape {
@@ -3079,11 +3099,17 @@ const walkAst = (root: Node): WalkResult => {
             // Dynamic ARG value (e.g. "$f"). Unlike a dynamic NAME this
             // isn't categorically dangerous — the command is known. Mark
             // soft, DESCEND to catch any HARD construct hiding inside the
-            // arg (e.g. "$(evil)"), then skip the unresolved literal.
+            // arg (e.g. "$(evil)"), then PARK the raw text (don't drop it)
+            // so analyzeCommand can resolve the shell vars it knows and
+            // emit an fs cap. Dropping it left `cat $HOME/.ssh/id_rsa`
+            // resolving to read-fs:<cwd>, slipping past the bypass §8.4/
+            // §11 floor which only scans the resolved capability set.
             sawSoft = true;
             softReason ??= 'dynamic value in arg';
             const refuse = visit(child, depth + 1, softCtx);
             if (refuse !== null) return refuse;
+            if (shape.dynamicArgs === undefined) shape.dynamicArgs = [];
+            shape.dynamicArgs.push(child.text);
             continue;
           }
           shape.args.push(text);
@@ -3891,6 +3917,11 @@ const analyzeCommand = (
   // onto that branch. Known commands ignore this — their handler emits the
   // precise positional caps (adding argCaps there would just duplicate).
   const argCaps: Capability[] = [];
+  // Caps for dynamic operands (shape.dynamicArgs). Emitted for BOTH the
+  // known-handler and registry-miss branches — the handler never sees a
+  // dynamic operand (the walk parked it, didn't push it to args), so
+  // unlike argCaps this must ride onto both returns.
+  const dynCaps: Capability[] = [];
   if (!isPureOutputCommand(name)) {
     const targets = protectedTargets(ctx.home, ctx.cwd);
     for (const arg of shape.args) {
@@ -3966,6 +3997,31 @@ const analyzeCommand = (
         if (detectCwdScopeEscape(abs, ctx)) escalated = true;
       }
     }
+
+    // Dynamic path operands the walk parked on shape.dynamicArgs (e.g.
+    // `cat $HOME/.ssh/id_rsa`, `tee "$dir/x"`). Resolve the shell vars we
+    // know and emit an fs cap per operand so the soft→conservative result
+    // carries the real target — under mode:bypass the §8.4/§11 floor scans
+    // only the resolved caps, so without this `cat $HOME/.ssh/id_rsa` ran
+    // with read-fs:<cwd> and slipped the sensitive-path floor. Deny-tier
+    // resolved targets still refuse. Fully-opaque operands (`$f`) resolve
+    // to a harmless cwd-relative path (residual documented in the backlog;
+    // matchSensitivePath still spans segments, so `$x/.ssh/id_rsa` trips).
+    for (const raw of shape.dynamicArgs ?? []) {
+      const candidate = expandKnownVars(stripShellQuoting(raw), ctx);
+      // Empty, or a dynamic FLAG (`$OPTS` → "-x"): no path content.
+      if (candidate.length === 0 || candidate.startsWith('-')) continue;
+      const op: 'read' | 'write' = isReadOnlyCommand(name) ? 'read' : 'write';
+      const abs = resolveArg(candidate, ctx);
+      const tier = classifyArgWithCanonical(abs, op, ctx);
+      if (tier === 'deny') {
+        return {
+          refuse: `bash: ${shape.name} dynamic target '${candidate}' is in protected zone (deny tier, see PERMISSION_ENGINE.md §11)`,
+        };
+      }
+      if (tier === 'escalate') escalated = true;
+      dynCaps.push(op === 'write' ? writeFs(abs) : readFs(abs));
+    }
   }
 
   // Classify redirect targets BEFORE the registry split. Pre-fix the
@@ -3988,7 +4044,7 @@ const analyzeCommand = (
     // redirect + escalate-tier operand caps (above) ride along so the
     // engine's bypass §11 floor stays honest.
     return {
-      caps: [...redir.caps, ...argCaps],
+      caps: [...redir.caps, ...argCaps, ...dynCaps],
       confidence: 'low',
       conservative: `unknown_command: ${shape.name}`,
     };
@@ -4000,7 +4056,7 @@ const analyzeCommand = (
   if (escalated || redir.escalated) finalConf = 'low';
 
   return {
-    caps: [...result.capabilities, ...redir.caps],
+    caps: [...result.capabilities, ...redir.caps, ...dynCaps],
     confidence: finalConf,
   };
 };
