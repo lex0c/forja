@@ -2,6 +2,12 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-29] tui — memory-write modal: secondary subject + default cursor on Yes
+
+Two small alignments of the `memory-write` flavor with the permission modal: the `scope/name` subject now renders `secondary` (via the existing `subjectTone` field) so it lifts out of the dim baseline, and the default cursor moves from the last option (No) to the first (Yes) — writing memory is the expected outcome of the prompt, so Enter accepts. Note this breaks the D5/D65 conservative-default convention for this flavor specifically; it's a deliberate per-flavor choice, not a global one (trust / shared-trust / history-clear / memory-user-scope / plan-review / critique keep last-option-safe defaults).
+
+**Validated:** updated the `memory:write:ask` reducer test (name + `selectedIndex` 1→0, new `subjectTone` assertion); full `tests/tui/` (850) + typecheck + Biome clean. **Branch:** `develop`.
+
 ## [2026-05-29] tui — modal spacing is structural (every flavor gets the permission layout)
 
 `renderModal` now owns the inter-section spacing: one blank line above the preview block and one above the question/options block (plus the pre-existing blank before the hint footer). Previously only the `permission` flavor had this breathing room — and it got it by having its producer emit literal blank rows around the action. The other eight flavors (trust, shared-trust, history-clear, memory-write, memory-user-scope, memory-action, plan-review, critique) pushed preview and question directly under the title with no gap, so they read as one dense block. Moving the spacing into the shared renderer gives every flavor the same layout from a single source.

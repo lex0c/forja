@@ -1782,10 +1782,17 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             flavor: 'memory-write',
             title: 'Write memory',
             subject: `${event.scope}/${event.name}`,
+            // Secondary tone lifts the scope/name out of the dim
+            // baseline (matches the permission flavor's framing line).
+            subjectTone: 'secondary',
             preview: event.body.split('\n'),
             question: 'Save this memory entry?',
             options,
-            selectedIndex: options.length - 1,
+            // Default cursor on the first option (Yes) — writing memory
+            // is the expected outcome of this prompt, so Enter accepts
+            // (same convention as the permission modal; a deliberate
+            // break from the last-option-safe default for this flavor).
+            selectedIndex: 0,
             hints: ['Esc to cancel'],
             queueDepth: 0,
           },

@@ -302,7 +302,7 @@ describe('per-flavor reducer option lists', () => {
     ).toBe(true);
   });
 
-  test('memory:write:ask builds 2 options (yes / no), default = last; body is the preview', () => {
+  test('memory:write:ask builds 2 options (yes / no), default = first (yes); body is the preview', () => {
     const state = applyEvent(createInitialState(), {
       type: 'memory:write:ask',
       ts: 1,
@@ -315,9 +315,11 @@ describe('per-flavor reducer option lists', () => {
     expect(state.modal.flavor).toBe('memory-write');
     expect(state.modal.title).toBe('Write memory');
     expect(state.modal.subject).toBe('project_local/config-rule');
+    expect(state.modal.subjectTone).toBe('secondary');
     expect(state.modal.preview).toEqual(['line 1', 'line 2']);
     expect(state.modal.options.map((o) => o.value)).toEqual(['yes', 'no']);
-    expect(state.modal.selectedIndex).toBe(1);
+    // Default cursor on Yes — writing memory is the expected outcome.
+    expect(state.modal.selectedIndex).toBe(0);
   });
 
   test('memory:user-scope:ask builds 2 options + scope warning preview', () => {
