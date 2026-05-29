@@ -77,6 +77,25 @@ const previewRow = (line: PreviewLine, caps: Capabilities): string => {
   return line.text === '' ? '' : `  ${paint(caps, line.tone, line.text)}`;
 };
 
+// Strip blank entries from the START and END of a preview array.
+// renderModal owns the inter-section spacing (one blank line above the
+// preview block and above the decision block); producers that still
+// emit their own edge blanks (the permission flavor wraps its action in
+// leading/trailing blanks) would otherwise double the gap. Internal
+// blanks are preserved — they separate sub-blocks a producer
+// deliberately spaced (e.g. plan-review's steps vs. the cost estimate,
+// memory-user-scope's warning vs. the body).
+const isBlankLine = (line: PreviewLine | undefined): boolean =>
+  line === undefined ? false : typeof line === 'string' ? line === '' : line.text === '';
+
+const trimBlankEnds = (preview: readonly PreviewLine[]): readonly PreviewLine[] => {
+  let start = 0;
+  let end = preview.length;
+  while (start < end && isBlankLine(preview[start])) start++;
+  while (end > start && isBlankLine(preview[end - 1])) end--;
+  return preview.slice(start, end);
+};
+
 export const renderModal = (modal: ConfirmState, caps: Capabilities): string[] => {
   const lines: string[] = [];
   // Top rule — only structural divider in the modal. Painted with
@@ -99,21 +118,27 @@ export const renderModal = (modal: ConfirmState, caps: Capabilities): string[] =
   lines.push(`  ${paintMulti(caps, ['accent', 'bold'], `${modal.title}${queueSuffix}`)}`);
   if (modal.subject !== null)
     lines.push(`  ${paint(caps, modal.subjectTone ?? 'dim', modal.subject)}`);
-  // Preview — no leading rule. Producer's blank lines (empty
-  // strings) carry the visual separation from the title above.
-  if (modal.preview.length > 0) {
-    for (const p of modal.preview) {
+  // Preview block — one blank line of breathing room above it so the
+  // action/body detaches from the title block. Every flavor gets the
+  // same gap (the spacing is structural, owned here, not per-producer).
+  // Edge blanks are trimmed so producers that still emit their own
+  // don't double it; internal blanks survive.
+  const preview = trimBlankEnds(modal.preview);
+  if (preview.length > 0) {
+    lines.push('');
+    for (const p of preview) {
       lines.push(previewRow(p, caps));
     }
   }
-  // Question + options — no leading rule either. The producer can
-  // emit a trailing blank line in `preview` if they want extra
-  // breathing room before the options; today's default (permission
-  // flavor) lets the source-attribution row sit directly above
-  // option 1.
-  if (modal.question !== null) lines.push(`  ${modal.question}`);
-  for (let i = 0; i < modal.options.length; i++) {
-    lines.push(optionLine(modal, i, caps));
+  // Question + options — same breathing room above the decision block,
+  // so the prompt + numbered choices read as a distinct section rather
+  // than fusing with the preview above.
+  if (modal.question !== null || modal.options.length > 0) {
+    lines.push('');
+    if (modal.question !== null) lines.push(`  ${modal.question}`);
+    for (let i = 0; i < modal.options.length; i++) {
+      lines.push(optionLine(modal, i, caps));
+    }
   }
   // Footer hint — padded by one blank line so it visually detaches
   // from the last option (without padding the operator's eye reads

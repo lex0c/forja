@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-29] tui — modal spacing is structural (every flavor gets the permission layout)
+
+`renderModal` now owns the inter-section spacing: one blank line above the preview block and one above the question/options block (plus the pre-existing blank before the hint footer). Previously only the `permission` flavor had this breathing room — and it got it by having its producer emit literal blank rows around the action. The other eight flavors (trust, shared-trust, history-clear, memory-write, memory-user-scope, memory-action, plan-review, critique) pushed preview and question directly under the title with no gap, so they read as one dense block. Moving the spacing into the shared renderer gives every flavor the same layout from a single source.
+
+To avoid double gaps, `renderModal` trims blank entries from the START and END of `preview` before rendering (a `trimBlankEnds` helper) — producers that still emit their own edge blanks (permission's action wrap) collapse to the renderer's single gap, while INTERNAL blanks survive (plan-review's steps-vs-cost separator, memory-user-scope's warning-vs-body separator). The permission modal renders byte-identical to before; the others gain the gaps.
+
+**Validated:** updated `tests/tui/render/modal.test.ts` line-index assertions (+2 blank rows shift every downstream index; preview-empty and subject/question-null cases re-counted); full `tests/tui/` (850) + typecheck + Biome clean. **Branch:** `develop`.
+
 ## [2026-05-29] tui — tool card shows "Awaiting approval" (no ticking timer) while a permission modal is open
 
 The live tool card is created at `tool:start`, which fires BEFORE the permission engine runs. While a permission modal sat open, the card above it kept rendering "Executing… [Ns]" with the elapsed counter advancing — misreading the operator's modal think-time as tool runtime, and claiming the tool was already running when it was actually parked waiting for approval. (The final duration was already correct: `tool:execution-started` rebases `startedAt` after approval; only the *live* head was wrong.)

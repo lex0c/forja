@@ -39,20 +39,25 @@ describe('renderModal (UI.md §4.10.13 layout)', () => {
     // Hint footer gets a blank-line padding above it so it
     // detaches from the last option.
     //
-    // Lines: [rule, title, subject, preview×2, question,
-    //         option×2, blank-pad, hints] = 10.
+    // renderModal owns the inter-section spacing: a blank line above
+    // the preview block and above the question/options block (same gap
+    // every flavor gets), plus the blank-pad before the hint footer.
+    // Lines: [rule, title, subject, blank, preview×2, blank, question,
+    //         option×2, blank-pad, hints] = 12.
     const out = renderModal(baseModal(), unicode);
-    expect(out).toHaveLength(10);
+    expect(out).toHaveLength(12);
     expect(out[0]).toMatch(/^─+$/); // top rule
     expect(out[1]).toContain('Run command'); // title
     expect(out[2]).toContain('rm -rf ./build'); // subject
-    expect(out[3]).toContain('$ rm -rf ./build'); // preview 1
-    expect(out[4]).toContain('cwd: /home/lex/forja'); // preview 2
-    expect(out[5]).toContain('Do you want to run this bash command?'); // question
-    expect(out[6]).toContain('1. Yes');
-    expect(out[7]).toContain('2. No');
-    expect(out[8]).toBe(''); // blank padding before hint
-    expect(out[9]).toContain('Esc to cancel'); // hint footer
+    expect(out[3]).toBe(''); // blank above preview
+    expect(out[4]).toContain('$ rm -rf ./build'); // preview 1
+    expect(out[5]).toContain('cwd: /home/lex/forja'); // preview 2
+    expect(out[6]).toBe(''); // blank above question/options
+    expect(out[7]).toContain('Do you want to run this bash command?'); // question
+    expect(out[8]).toContain('1. Yes');
+    expect(out[9]).toContain('2. No');
+    expect(out[10]).toBe(''); // blank padding before hint
+    expect(out[11]).toContain('Esc to cancel'); // hint footer
     // Exactly one rule line in the whole output.
     expect(out.filter((l) => /^─+$/.test(l))).toHaveLength(1);
   });
@@ -64,50 +69,52 @@ describe('renderModal (UI.md §4.10.13 layout)', () => {
 
   test('cursor `>` marks the selectedIndex (default = last)', () => {
     const out = renderModal(baseModal(), unicode);
-    // No rules between question and options anymore — options sit
-    // at indices 6, 7 in the flow above.
-    expect(out[6]).toMatch(/^ {2} {2}1\. /); // '    1. ' (no cursor)
-    expect(out[7]).toMatch(/^ {2}> 2\. /); // '  > 2. ' (cursor on default)
+    // Options sit at indices 8, 9 (after the blank-above-preview, the
+    // two preview rows, the blank-above-options, and the question).
+    expect(out[8]).toMatch(/^ {2} {2}1\. /); // '    1. ' (no cursor)
+    expect(out[9]).toMatch(/^ {2}> 2\. /); // '  > 2. ' (cursor on default)
   });
 
   test('cursor moves with selectedIndex', () => {
     const out = renderModal(baseModal({ selectedIndex: 0 }), unicode);
-    expect(out[6]).toMatch(/^ {2}> 1\. /);
-    expect(out[7]).toMatch(/^ {2} {2}2\. /);
+    expect(out[8]).toMatch(/^ {2}> 1\. /);
+    expect(out[9]).toMatch(/^ {2} {2}2\. /);
   });
 
   test('preview block omitted entirely when preview array is empty', () => {
     const out = renderModal(baseModal({ preview: [] }), unicode);
-    // Lines: [rule, title, subject, question, option×2, blank-pad,
-    //         hints] = 8. No preview rows.
-    expect(out).toHaveLength(8);
+    // No preview block (no blank-above-preview either). Lines: [rule,
+    // title, subject, blank, question, option×2, blank-pad, hints] = 9.
+    expect(out).toHaveLength(9);
     expect(out.filter((l) => /^─+$/.test(l))).toHaveLength(1);
   });
 
   test('subject omitted when null', () => {
     const out = renderModal(baseModal({ subject: null }), unicode);
-    // Lines: [rule, title, preview×2, question, option×2,
-    //         blank-pad, hints] = 9.
-    expect(out).toHaveLength(9);
+    // Lines: [rule, title, blank, preview×2, blank, question,
+    //         option×2, blank-pad, hints] = 11.
+    expect(out).toHaveLength(11);
     expect(out[1]).toContain('Run command');
-    // Preview now sits directly under the title (no rule gap).
-    expect(out[2]).toContain('$ rm -rf ./build');
+    // Blank-above-preview, then the preview block under the title.
+    expect(out[2]).toBe('');
+    expect(out[3]).toContain('$ rm -rf ./build');
   });
 
   test('question omitted when null', () => {
     const out = renderModal(baseModal({ question: null }), unicode);
-    // Lines: [rule, title, subject, preview×2, option×2,
-    //         blank-pad, hints] = 9.
-    expect(out).toHaveLength(9);
+    // Question drops but the blank-above-options + options stay.
+    // Lines: [rule, title, subject, blank, preview×2, blank,
+    //         option×2, blank-pad, hints] = 11.
+    expect(out).toHaveLength(11);
   });
 
   test('hints omitted when array is empty (no padding line either)', () => {
     const out = renderModal(baseModal({ hints: [] }), unicode);
     // No hints → no padding line either: padding is gated on the
-    // hint footer. Total = 10 - 2 (padding + hints) = 8.
-    expect(out).toHaveLength(8);
+    // hint footer. Total = 12 - 2 (padding + hints) = 10.
+    expect(out).toHaveLength(10);
     // Last line is the second option, not a blank.
-    expect(out[7]).toContain('2. No');
+    expect(out[9]).toContain('2. No');
   });
 
   test('hint footer is preceded by a blank-line padding', () => {
@@ -159,29 +166,29 @@ describe('renderModal (UI.md §4.10.13 layout)', () => {
     // the active choice reads as one highlighted unit (cursor + key +
     // label together) instead of a row with a muted digit.
     const out = renderModal(baseModal(), colored);
-    // baseModal selects the last option → out[7] is selected, out[6]
+    // baseModal selects the last option → out[9] is selected, out[8]
     // is the unselected option above it.
-    expect(out[6]).toContain(`${CSI}90m`); // secondary on unselected "1."
-    expect(out[7]).toContain(`${CSI}94m`); // accent on the selected row
-    expect(out[7]).toContain(`${CSI}90m`); // selected key digit still secondary
+    expect(out[8]).toContain(`${CSI}90m`); // secondary on unselected "1."
+    expect(out[9]).toContain(`${CSI}94m`); // accent on the selected row
+    expect(out[9]).toContain(`${CSI}90m`); // selected key digit still secondary
   });
 
   test('selected row tokenizes cursor/label accent + key secondary (digit not blue)', () => {
     // Pin the tokenization so a regression that re-merges the digit
     // into the accent run (turning "1." blue) shows up here.
     const out = renderModal(baseModal({ selectedIndex: 0 }), colored);
-    // out[6] is now the selected row (option 1).
-    expect(out[6]).toContain(`${CSI}94m>`); // cursor accent
-    expect(out[6]).toContain(`${CSI}90m1.`); // key digit secondary (not blue)
-    expect(out[6]).toContain(`${CSI}94mYes`); // label accent
+    // out[8] is now the selected row (option 1); out[9] the other.
+    expect(out[8]).toContain(`${CSI}94m>`); // cursor accent
+    expect(out[8]).toContain(`${CSI}90m1.`); // key digit secondary (not blue)
+    expect(out[8]).toContain(`${CSI}94mYes`); // label accent
     // The other option keeps the secondary-keyed style, no accent.
-    expect(out[7]).toContain(`${CSI}90m`);
-    expect(out[7]).not.toContain(`${CSI}94m`);
+    expect(out[9]).toContain(`${CSI}90m`);
+    expect(out[9]).not.toContain(`${CSI}94m`);
   });
 
   test('subject + preview wrapped in dim SGR when color enabled', () => {
     const out = renderModal(baseModal(), colored);
-    expect(out[2]).toContain(`${CSI}2m`); // subject dim
+    expect(out[2]).toContain(`${CSI}2m`); // subject dim (out[3] is the blank above preview)
     expect(out[4]).toContain(`${CSI}2m`); // preview line dim
   });
 
