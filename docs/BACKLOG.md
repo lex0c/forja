@@ -2,6 +2,21 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-29] permissions/sandbox — close the rest of the final-review findings (robustness, docs, dedup, tests)
+
+Cleared the lower-severity findings the final review left open after the redirect-bypass fix:
+
+- **`ensureSandboxMaskFile` robustness** (`sandbox-runner.ts`): cache the path ONLY on successful creation — a transient failure (ENOSPC, momentary EACCES) was being memoized, which would wedge sandboxing for the whole session (`--ro-bind <missing>` aborts every spawn); now it retries next spawn and recovers. Also `resolveAbs(defaultDataDir())` so a relative `$XDG_DATA_HOME` can't produce a relative bind source that breaks when a later spawn runs from a different CWD.
+- **Stale `scanForHardConstructs` references** removed: the `SOFT_UNMODELED_NODES` comment + PERMISSION_ENGINE §5.2 "Salvaguarda" described a function deleted in the hard/soft rework; both now describe the real mechanism (walkAst recurses through soft nodes, analyzeCommand runs per inner command). Also de-duplicated a copy-pasted sentence in the `walkAst` preamble.
+- **Dedup**: `startsWithSegment` exported from `protected_paths.ts` (with the `/`-root edge handled centrally) and reused by `underWritableRoot` instead of a 5th hand-rolled copy of the segment idiom; the `['"\\]`-strip anti-laundering normalization extracted to one `stripShellQuoting` helper shared by `analyzeCommand` + `detectPipeToShell`.
+- **Tests**: production `ensureSandboxMaskFile` path now covered (pinned `$XDG_DATA_HOME` temp dir asserts the bind source is a real empty regular 0600 file, not `/dev/null` — a revert would now fail); engine-level `/dev/null`-allowed vs `/dev/sda`-denied bash redirect; `/dev/fd/N` / `/dev/stdout` / `/dev/stdin` redirects; quote-launder variants `"ev"al`, `command`/`builtin eval`, ansi-c `$'\145val'` pinned (all Refuse via their respective paths).
+
+**Documented (not fixed):** macOS masks credential files via SBPL `(deny file-read*)`, which can break git/npm config readers the same way the Linux `/dev/null` char-device bind did — but sandbox-exec has no bind-mount / file-virtualization primitive, so the empty-file remedy has no direct equivalent; untestable from a Linux host. Comment added at the macOS file-mask loop.
+
+**Deliberately deferred** (cleanup/altitude, not bugs): `cmdRead` over-declaring phantom `read-fs` for non-path operands of `tr`/`jq`/`cut` (over-declaration is safe-side; a flag-aware extractor like `cmdGrep` is the eventual cleanup); and unifying the three deny-tier exception mechanisms (`SYSTEM_DENY_EXCEPTIONS` subtree / `isDevSafe` exact-set / `isGlobSafeRunCarveout`) into one table — a refactor of the security-critical classifier, too risky to fold into this branch.
+
+permissions (2014) + harness/tools (773) + typecheck + biome clean. **Branch:** `chore/sec-fixes`.
+
 ## [2026-05-29] permissions — final branch review caught a deny-tier-redirect bypass on registry-miss / no-command shapes
 
 The branch's final code review found that `3050c3b`'s registry-miss → Conservative early-return in `analyzeCommand` sits BEFORE the redirect-classification loop. So a redirect to a deny-tier path (`/proc`, `/sys`, `/dev/sda`, …) on an UNMODELED command (`some_tool > /proc/sysrq-trigger`, `sed -n p < /proc/1/environ`, `nosuchcmd > /dev/sda`) — or a no-command soft shape (`[[ -e x ]] > /proc/sysrq-trigger`, `{ foocmd; } > /dev/mem`, `: > /proc/sysrq-trigger`) — never classified the redirect target and emitted no fs capability. The engine's bypass-mode §11 floor only scans resolved capabilities, so under `mode: bypass` these deny-tier writes/reads were ALLOWED instead of refused (and Conservative/confirm under strict). A regression introduced by the hard/soft split itself.

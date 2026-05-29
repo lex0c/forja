@@ -167,6 +167,23 @@ describe('engine modes', () => {
     expect(d.source?.section).toBe('protected');
   });
 
+  test('bash redirect to /dev/null is allowed but /dev/sda denied (the /dev carve-out, end-to-end)', () => {
+    // The safe-pseudo-device carve-out, exercised through the full engine
+    // (resolver → §11 floor → policy), not just the resolver layer.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['*'] } } }), {
+      cwd: CWD,
+      home: '/home/op',
+    });
+    // `> /dev/null` is the carve-out: NOT denied. (It lands on confirm via
+    // the pre-existing redirect/compound guard — a separate behavior; the
+    // point here is it is no longer the protected-zone DENY it was before
+    // the /dev carve-out.)
+    expect(eng.check('bash', 'bash', { command: 'echo hi > /dev/null' }).kind).not.toBe('deny');
+    // `> /dev/sda` is a block device → resolver refuses → deny even with
+    // `bash allow:['*']` (resolver refuse is a floor).
+    expect(eng.check('bash', 'bash', { command: 'echo hi > /dev/sda' }).kind).toBe('deny');
+  });
+
   test('bypass mode cannot unlock a dangerous command hidden in control flow (resolver refuse is a floor)', () => {
     // Review regression: pre-fix, `for x in *; do rm -rf /; done` resolved
     // to Conservative (not refuse), which the bypass branch turned into

@@ -2054,6 +2054,10 @@ describe('bash resolver — quote/escape-laundered hard commands still Refuse', 
     'for x in *; do \'eval\' "$x"; done',
     "echo hi | s'h'",
     'echo hi | \\sh',
+    '"ev"al x', // double-quote split → bareName strip catches it
+    'command eval x', // `command`/`builtin` run their arg as the command
+    'builtin eval x',
+    "$'\\145val' x", // ansi-c-quoted name → dynamic command_name (hard node)
   ])('%s → Refuse', (cmd) => {
     expect(resolveCapabilities('bash', { command: cmd }, CTX).kind).toBe('refuse');
   });
@@ -2069,6 +2073,9 @@ describe('bash resolver — /dev/null (and safe pseudo-devices) redirects are al
     'cat data | sort > /dev/null',
     'echo x > /dev/stderr',
     'cat /dev/urandom | head -c 16',
+    'echo x > /dev/fd/3', // the process's own fd (prefix carve-out)
+    'echo x > /dev/stdout',
+    'cat < /dev/stdin',
   ])('%s does NOT refuse on the /dev target', (cmd) => {
     expect(resolveCapabilities('bash', { command: cmd }, CTX).kind).not.toBe('refuse');
   });

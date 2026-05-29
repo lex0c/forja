@@ -307,11 +307,16 @@ const ABSOLUTE_ESCALATE_ROOTS: readonly string[] = ['/etc'];
 // archive); CI/operator state is under `.git/` and `.claude/`.
 const CWD_ESCALATE_DIRS: readonly string[] = ['.git', '.agent', '.claude'];
 
-// Posix-only. Path comparison uses textual prefix match after
-// normalization; `startsWith(prefix + '/')` plus equality avoids
-// false positives like `/procfoo` matching `/proc`.
-const startsWithSegment = (path: string, prefix: string): boolean =>
-  path === prefix || path.startsWith(`${prefix}/`);
+// Posix-only segment-boundary prefix match: avoids false positives like
+// `/procfoo` matching `/proc`. Exported as the one source of truth so
+// callers (the sandbox runner's writable-root check, etc.) don't re-roll
+// `p === x || p.startsWith(`${x}/`)` and trip the `${'/'}/` → `//` edge.
+// `prefix === '/'` is the filesystem root: every absolute path is under
+// it (the generic form would build `//` and match nothing).
+export const startsWithSegment = (path: string, prefix: string): boolean => {
+  if (prefix === '/') return path.startsWith('/');
+  return path === prefix || path.startsWith(`${prefix}/`);
+};
 
 // Resolve a tilde-or-relative entry to its absolute form. Used by both
 // the classifier and the policy validator (policy load must reject

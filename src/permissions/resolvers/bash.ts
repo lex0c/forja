@@ -302,13 +302,15 @@ const RED_FLAG_NODES: ReadonlyMap<string, string> = new Map([
 // Soft-unmodeled subset of RED_FLAG_NODES (PERMISSION_ENGINE.md §5.2,
 // "Soft-unmodeled → Conservative"). These kinds aren't statically
 // resolvable but don't, by themselves, enable arbitrary exec/injection:
-// control flow, grouping, negation, conditionals, value expansion. When
-// the FIRST node that stops the whitelist walk is one of these AND
-// `scanForHardConstructs` clears the whole tree, the resolver returns
-// Conservative (→ confirm) instead of a hard pre-policy Refuse — so the
+// control flow, grouping, negation, conditionals, value expansion.
+// walkAst RECURSES through these (instead of short-circuiting), marks the
+// result `soft`, and collects the inner commands; the resolver then runs
+// analyzeCommand on EVERY collected command and returns Conservative
+// (→ confirm) only when `soft` is set and nothing hard-refused. So the
 // model can run `for f in *.ts; do cat "$f"; done` (operator approves)
 // while `for x in *; do eval "$x"; done` still hard-refuses (the inner
-// `eval` is caught by the scan). Everything in RED_FLAG_NODES NOT listed
+// `eval` is a HARD_REFUSE command caught by analyzeCommand). Everything
+// in RED_FLAG_NODES NOT listed
 // here (command/process substitution, function defs, `VAR=val cmd`
 // prefix, arithmetic, heredoc/herestring, ansi-c, subscript) stays HARD:
 // it enables exec/injection the resolver can't bound, so it remains a
@@ -2818,6 +2820,14 @@ const literalText = (node: Node): string | null => {
   return raw;
 };
 
+// Strip shell quoting/escaping (`'`, `"`, `\`) from a command/interpreter
+// NAME so the hard-refuse + pipe-to-shell checks see bash's effective
+// name: `'eval'` / `ev''al` / `\eval` / `s'h'` all reduce to the bare
+// token bash runs. Over-matches at worst (refuses an exotic literal),
+// never under-matches a laundered eval/dd/sudo/sh. One source of truth
+// shared by analyzeCommand + detectPipeToShell.
+const stripShellQuoting = (name: string): string => name.replace(/['"\\]/g, '');
+
 // Map a `file_redirect` node's operator + target into a RedirectShape.
 // Returns null on shapes the resolver can't normalize.
 const redirectShape = (node: Node): RedirectShape | null => {
@@ -2898,8 +2908,6 @@ const walkAst = (root: Node): WalkResult => {
   // reason so the modal/audit name the construct.
   let softReason: string | null = null;
   // `softCtx` is true once we are INSIDE a soft-unmodeled node: there,
-  // non-whitelisted STRUCTURAL nodes (do_group, case_item, `[[ ]]`
-  // expression internals) are tolerated (recursed) rather than refused,
   // non-whitelisted STRUCTURAL nodes (do_group, case_item, `[[ ]]`
   // expression internals) are tolerated (recursed) rather than refused,
   // so the walk can reach the inner commands. HARD red-flag nodes and
@@ -3118,7 +3126,7 @@ const detectPipeToShell = (root: Node): string | null => {
     // Check the quote/escape-stripped form too (`s'h'` → sh, `\sh` → sh)
     // to match bash's quote removal — literalText handles raw_string
     // quotes; this covers backslash + residual laundering.
-    if (SHELL_INTERPRETERS.has(text) || SHELL_INTERPRETERS.has(text.replace(/['"\\]/g, ''))) {
+    if (SHELL_INTERPRETERS.has(text) || SHELL_INTERPRETERS.has(stripShellQuoting(text))) {
       return text;
     }
 
@@ -3136,10 +3144,7 @@ const detectPipeToShell = (root: Node): string | null => {
       for (const child of argChildren) {
         if (child === null || child === undefined) continue;
         const argText = literalText(child) ?? child.text;
-        if (
-          SHELL_INTERPRETERS.has(argText) ||
-          SHELL_INTERPRETERS.has(argText.replace(/['"\\]/g, ''))
-        ) {
+        if (SHELL_INTERPRETERS.has(argText) || SHELL_INTERPRETERS.has(stripShellQuoting(argText))) {
           return `xargs ${argText}`;
         }
       }
@@ -3720,7 +3725,7 @@ const analyzeCommand = (
   // (safe-side, refuses an exotic literal), never under-match a laundered
   // eval/dd/sudo. Without this, the soft→conservative split would let
   // `'eval'`/`ev''al`/`\eval` reach an operator-approvable confirm.
-  const bareName = shape.name.replace(/['"\\]/g, '');
+  const bareName = stripShellQuoting(shape.name);
   if (isHardRefuseCommand(shape.name) || isHardRefuseCommand(bareName)) {
     return {
       refuse: `bash: command '${shape.name}' has no safe capability resolution`,

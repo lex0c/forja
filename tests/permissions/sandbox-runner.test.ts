@@ -1,6 +1,12 @@
 import { describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { isSandboxProfile } from '../../src/permissions/sandbox-plan.ts';
-import { buildBwrapArgv, maybeWrapSandboxArgv } from '../../src/permissions/sandbox-runner.ts';
+import {
+  __resetSandboxMaskFileCacheForTest,
+  buildBwrapArgv,
+  maybeWrapSandboxArgv,
+} from '../../src/permissions/sandbox-runner.ts';
 
 const INNER = ['bash', '-c', 'echo hi'] as const;
 const CWD = '/work/proj';
@@ -1671,5 +1677,46 @@ describe('buildBwrapArgv — symlink canonicalization (slice 155)', () => {
         },
       }),
     ).toThrow(/cannot be canonicalized/);
+  });
+});
+
+describe('buildBwrapArgv — production credential-file mask source (no seam)', () => {
+  test('binds an empty REGULAR 0600 file (not /dev/null) under the data dir', () => {
+    // Closes the review gap: every file-mask test pins `maskFileSource`,
+    // so the real `ensureSandboxMaskFile` path — the actual git/npm fix —
+    // was untested (a revert to `/dev/null` would have passed). Drive it
+    // via a pinned $XDG_DATA_HOME temp dir so the real home is untouched.
+    const tmp = mkdtempSync(`${tmpdir()}/forja-mask-test-`);
+    const origXdg = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = tmp;
+    __resetSandboxMaskFileCacheForTest();
+    try {
+      const argv = buildBwrapArgv({
+        profile: 'cwd-rw',
+        cwd: CWD,
+        home: HOME,
+        innerArgv: INNER,
+        env: {},
+        realpath: (p) => p,
+        pathExists: () => true,
+        // NO maskFileSource — exercise the production ensureSandboxMaskFile.
+      });
+      const i = argv.findIndex(
+        (v, idx) => v === '--ro-bind' && argv[idx + 2] === '/home/op/.netrc',
+      );
+      expect(i).toBeGreaterThanOrEqual(0);
+      const src = argv[i + 1] as string;
+      expect(src).not.toBe('/dev/null');
+      expect(src.endsWith('/forja/sandbox-mask-empty')).toBe(true);
+      const st = statSync(src);
+      expect(st.isFile()).toBe(true);
+      expect(st.size).toBe(0);
+      expect(st.mode & 0o777).toBe(0o600);
+    } finally {
+      if (origXdg === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = origXdg;
+      __resetSandboxMaskFileCacheForTest();
+      rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });

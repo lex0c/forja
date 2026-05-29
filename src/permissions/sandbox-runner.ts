@@ -55,8 +55,9 @@
 // caller's expected working directory.
 
 import { existsSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
-import { join as joinPath } from 'node:path';
+import { join as joinPath, resolve as resolveAbs } from 'node:path';
 import { defaultDataDir } from '../storage/paths.ts';
+import { startsWithSegment } from './protected_paths.ts';
 // Canonical env allowlist lives in a shared module so the macOS
 // runner uses the same source of truth via `/usr/bin/env -i
 // KEY=VAL ...` wrap. Without this, 3rd-party credential vars off
@@ -82,20 +83,36 @@ import { buildSandboxExecArgv } from './sandbox-runner-macos.ts';
 let cachedSandboxMaskFile: string | null = null;
 const ensureSandboxMaskFile = (): string => {
   if (cachedSandboxMaskFile !== null) return cachedSandboxMaskFile;
-  const dir = defaultDataDir();
+  // Absolutize: bwrap resolves a bind SOURCE against its inherited CWD,
+  // so a relative `defaultDataDir()` (relative $XDG_DATA_HOME — spec says
+  // ignore, but be defensive) must not produce a relative `--ro-bind`
+  // source that breaks when a later spawn runs from a different CWD.
+  const dir = resolveAbs(defaultDataDir());
   const p = joinPath(dir, 'sandbox-mask-empty');
   try {
     if (!existsSync(p)) {
       mkdirSync(dir, { recursive: true });
       writeFileSync(p, '', { mode: 0o600 });
     }
+    // Cache ONLY on success. A transient failure (ENOSPC, momentary
+    // EACCES) must NOT be memoized: caching a path that doesn't exist
+    // would wedge sandboxing for the whole session (`--ro-bind <missing>`
+    // aborts every spawn). Leaving it uncached retries next spawn and
+    // recovers once the condition clears; until then the `--ro-bind`
+    // fails closed (refuses the call, never exposes the credential).
+    cachedSandboxMaskFile = p;
   } catch {
-    // Best-effort. If creation fails, the `--ro-bind` below errors at
-    // spawn (fail-closed — a missing mask source refuses the call rather
-    // than silently leaving the credential file exposed).
+    // fall through — return the path uncached (fail-closed at spawn).
   }
-  cachedSandboxMaskFile = p;
   return p;
+};
+
+// Test seam: clears the module-level mask-file cache so a test can
+// exercise the production `ensureSandboxMaskFile` path under a pinned
+// $XDG_DATA_HOME without the singleton from a prior call leaking in.
+// Production callers never invoke this.
+export const __resetSandboxMaskFileCacheForTest = (): void => {
+  cachedSandboxMaskFile = null;
 };
 
 // Resolve symlinks in the cwd path BEFORE the hide_paths check +
@@ -449,15 +466,12 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
   const pathExists = options.pathExists ?? existsSync;
   const writableRoots: readonly string[] =
     profile === 'home-rw' ? [home] : profile === 'cwd-rw' || profile === 'cwd-rw-net' ? [cwd] : [];
+  // `startsWithSegment` (shared with the protected-path classifier)
+  // handles the `root === '/'` edge centrally — a cwd-rw profile launched
+  // from `/` must treat every absolute path as under the writable root,
+  // not build `//` and match nothing (which would skip credential masks).
   const underWritableRoot = (p: string): boolean =>
-    writableRoots.some((root) =>
-      // `root === '/'` is the filesystem root (a cwd-rw profile launched
-      // from `/`): every absolute path is under it. The generic
-      // `${root}/` form would build `//` and match nothing — a
-      // segment-boundary pitfall that would skip credential masks on a
-      // writable-root profile and reopen the create-and-plant vector.
-      root === '/' ? p.startsWith('/') : p === root || p.startsWith(`${root}/`),
-    );
+    writableRoots.some((root) => startsWithSegment(p, root));
   const shouldMask = (absPath: string): boolean =>
     pathExists(absPath) || underWritableRoot(absPath);
 
