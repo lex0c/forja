@@ -3778,6 +3778,20 @@ const couldGlobReachProtected = (
   return false;
 };
 
+// Resolve a glob's literal prefix to an absolute path for the
+// couldGlobReachProtected check. A bare leading dot right before the glob
+// (`.*` → literalPrefix `.`; `~/.* ` → `~/.`; `sub/.* ` → `sub/.`) matches
+// DOTFILES in the dir — but path.resolve treats a trailing `.` segment as
+// "current directory" and drops it, so `for f in .*` from $HOME resolved
+// to `$HOME` and couldGlobReachProtected saw `$HOME/.ssh` as an unreachable
+// SUBDIR (`rest` `/.ssh` starts with `/`). Reconstruct `<dir>/.` so the
+// existing filename-completion branch matches (`$HOME/.` + `ssh`), catching
+// dot-glob loop sources / args that expand into `~/.ssh`, `~/.aws`, etc.
+const resolveGlobPrefix = (literalPrefix: string, ctx: ResolverContext): string => {
+  const abs = resolvePath(ctx.cwd, expandTilde(literalPrefix, ctx.home));
+  return literalPrefix === '.' || literalPrefix.endsWith('/.') ? `${abs}/.` : abs;
+};
+
 // Slice 176 (review — command-bypass P0 #5). Lexical-only
 // classification is unsound against symlinks. An attacker (or a
 // prior LLM-driven write) creates a symlink at a path that lexically
@@ -4180,9 +4194,9 @@ const analyzeCommand = (
           // Slice 127 (R3): expand tilde BEFORE absolutizing so
           // `~/.s*` resolves to `/home/op/.s*` (matching protected
           // tilde-dirs) instead of `/work/proj/~/.s*` which never
-          // overlaps any classifier target.
-          const literalPrefix = globLiteralPrefix(exp);
-          const absLiteralPrefix = resolvePath(ctx.cwd, expandTilde(literalPrefix, ctx.home));
+          // overlaps any classifier target. resolveGlobPrefix also keeps a
+          // bare leading dot (`.*`) from collapsing to the dir itself.
+          const absLiteralPrefix = resolveGlobPrefix(globLiteralPrefix(exp), ctx);
           if (couldGlobReachProtected(absLiteralPrefix, targets)) {
             return {
               refuse: `bash: ${shape.name} target '${exp}' uses a shell glob (*/?/[) whose literal prefix could expand into a protected zone — refusing static analysis`,
@@ -4347,7 +4361,7 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
     if (wResolved.length === 0) continue;
     for (const exp of expandBraces(wResolved)) {
       if (containsGlobMetachar(exp)) {
-        const absPrefix = resolvePath(ctx.cwd, expandTilde(globLiteralPrefix(exp), ctx.home));
+        const absPrefix = resolveGlobPrefix(globLiteralPrefix(exp), ctx);
         if (couldGlobReachProtected(absPrefix, protectedTargets(ctx.home, ctx.cwd))) {
           return {
             kind: 'refuse',

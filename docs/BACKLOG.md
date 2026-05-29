@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-29] permissions — dot-glob (`.*`) prefixes collapsed before the protected-glob check
+
+A bare leading dot before a glob (`.*`) matches DOTFILES in the dir, but `globLiteralPrefix('.*')` is `.` and `path.resolve` treats a trailing `.` segment as "current directory" and drops it — so `for f in .*; do grep -R token "$f"; done` from $HOME resolved the prefix to `$HOME`, and `couldGlobReachProtected` saw `$HOME/.ssh` as an unreachable SUBDIR (its `rest` `/.ssh` starts with `/`). The loop-word/per-arg glob check then passed, the body only carried the dynamic `$f`, and under `mode: bypass` (which doesn't honor Conservative) the loop could read `~/.ssh`, `~/.aws`, … with no §8.4/§11 cap. Same root cause as the `/run/media` finding (a path-segment boundary lost in `path.resolve`).
+
+**Fix.** `resolveGlobPrefix(literalPrefix, ctx)` reconstructs `<dir>/.` when the literal prefix is `.` or ends with `/.`, so the existing filename-completion branch matches (`$HOME/.` + `ssh`). Applied at both glob call sites (the analyzeCommand per-arg loop and the bashResolver loop-word classification). Non-dot globs (`*`, `*.ts`) are untouched — they don't match dotfiles by default, so `for f in *` from $HOME stays Conservative (no over-refusal).
+
+**Validated:** +3 regression tests (`for f in .*` and `grep token .*` from a $HOME cwd → Refuse; non-dot `for f in *` → Conservative); existing glob tests (`/run/media*`, `/etc/pass*`, `~/.s*`) still pass; full `tests/permissions/` (2115) + typecheck + biome clean. **Flagged, not fixed (separate gap):** `couldGlobReachProtected` scans systemDeny/absoluteEscalate/tilde-escalate targets but NOT the cwd-escalate dirs (`.git`/`.agent`/`.claude`), so a glob like `rm .g*` / `for f in .*` from a repo cwd doesn't trip on those — though reads of them pass anyway (escalate is write-only), and a write through such a glob is the residual. **Branch:** `chore/sec-fixes`.
+
 ## [2026-05-29] permissions — xargs/parallel refuse ANY wrapped command, not just interpreters
 
 The exec-runner scan added earlier only refused `xargs`/`parallel` when an INTERPRETER token appeared in the argv (`xargs sh -c …`). But a runner execs whatever command it wraps, so `xargs rm -rf /` laundered the rm system-root refuse exactly like `xargs sh -c …` laundered the shell refuse — analyzeCommand only saw the outer `xargs`, the inner `rm -rf /` never reached cmdRm's root-delete refusal, and the result was a registry-miss Conservative (exec:arbitrary) that `mode: bypass` auto-allows (no delete-fs cap for the §11 floor). Same for `xargs dd …`, `parallel sudo …`, etc.

@@ -2131,6 +2131,41 @@ describe('bash resolver — for-loop item words are classified (loop source not 
     const r = resolveCapabilities('bash', { command: 'for f in *.ts; do cat "$f"; done' }, CTX);
     expect(r.kind).toBe('conservative');
   });
+
+  test('dot-glob loop source from $HOME reaches ~/.ssh etc. (the `.*` blind spot)', () => {
+    // `for f in .*` matches dotfiles in cwd; from a $HOME cwd that includes
+    // the protected tilde-escalate dirs (~/.ssh, ~/.aws, …). The bare `.`
+    // literal prefix used to collapse to $HOME and miss them.
+    const home: ResolverContext = {
+      cwd: '/home/op',
+      home: '/home/op',
+      suppressDegradeWarnings: true,
+    };
+    expect(
+      resolveCapabilities('bash', { command: 'for f in .*; do grep -R token "$f"; done' }, home)
+        .kind,
+    ).toBe('refuse');
+  });
+
+  test('direct dot-glob arg reaches protected dot-dirs too (per-arg loop)', () => {
+    const home: ResolverContext = {
+      cwd: '/home/op',
+      home: '/home/op',
+      suppressDegradeWarnings: true,
+    };
+    expect(resolveCapabilities('bash', { command: 'grep token .*' }, home).kind).toBe('refuse');
+  });
+
+  test('non-dot cwd glob (`*`) is NOT over-refused (no default dotfile match)', () => {
+    const home: ResolverContext = {
+      cwd: '/home/op',
+      home: '/home/op',
+      suppressDegradeWarnings: true,
+    };
+    expect(
+      resolveCapabilities('bash', { command: 'for f in *; do cat "$f"; done' }, home).kind,
+    ).toBe('conservative');
+  });
 });
 
 // Review regression: dynamic operands were pulled out of shape.args, so
