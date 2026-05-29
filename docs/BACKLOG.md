@@ -2,6 +2,16 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-29] permissions — xargs interpreter path + sort/uniq write misclassification
+
+Two more resolver bypasses, both feeding the `mode: bypass` auto-allow of Conservative/read-only.
+
+**xargs interpreter path.** `detectPipeToShell` flags `... | xargs sh -c '<arg>'` by scanning the xargs argv for an interpreter token, but it keyed on the quote-stripped raw token without taking basename. `... | xargs /bin/sh -c '<arg>'` / `... | xargs /usr/bin/python -c '<arg>'` slipped past — xargs stayed an unregistered Conservative command. Same gap on the direct pipe-to-interpreter check (`... | /bin/sh`). Fix: a shared `resolvesToInterpreter` helper folds the token to `basename(stripShellQuoting(...))` before the SHELL_INTERPRETERS lookup, applied at both sites.
+
+**sort/uniq write-as-read.** `sort` and `uniq` were registered to `cmdRead` and marked read-only, but both write files: `sort -o FILE` / `--output=FILE` (GNU sort), and `uniq INPUT OUTPUT` (second positional). The write target surfaced as `read-fs` (space/short forms) or vanished entirely (`--output=` combined form), so §11 write escalation/denial, sandbox planning, and operator policy all saw a read-only command while the process wrote the file — `sort -o /etc/hosts in` walked past the /etc escalate tier. Also caught while writing the handler: `sort --compress-program=PROG` runs an arbitrary program (same class as tar `--use-compress-program`). Fix: dedicated `cmdSort` (write-fs for `-o`/`--output`, refuse `--compress-program`, read-fs for inputs) and `cmdUniq` (read first positional, write second; strip `-f`/`-s`/`-w` value flags), both removed from `isReadOnlyCommand` so the per-arg §11 loop treats their operands as writes (defense in depth).
+
+**Validated:** new regression describes in `resolvers.test.ts` (all four getopt shapes; protected escalate/deny targets; compress-program refuse; value-flag split; path-qualified pipe/xargs interpreters); full `tests/permissions/` (2037) + typecheck + biome clean. **Still open (flagged, not fixed):** standalone `xargs sh -c` with no pipe (detectPipeToShell only scans pipelines); `sort -T DIR` transient temp writes. **Branch:** `chore/sec-fixes`.
+
 ## [2026-05-29] permissions — path-qualified shell/interpreter launchers bypassed the hard-refuse deny
 
 Another instance of the registry-miss → Conservative regression: `analyzeCommand` keyed every name classification (isHardRefuseCommand, isPureOutputCommand, isReadOnlyCommand, COMMAND_TABLE lookup) on the FULL command name. A path-qualified launcher — `/bin/sh -c '…'`, `/usr/bin/env sh -c …`, `/usr/bin/python -c …`, `/bin/bash -c …`, `/usr/bin/sudo …`, `/sbin/mkfs.ext4 …` — didn't match the bare-name hard-refuse set (`sh`/`bash`/`sudo`/…), the `env` cmdEnv refuse, or the `python` cmdInterpreter `-c` refuse, so it fell to the registry-miss Conservative branch — and `mode: bypass` auto-allows Conservative (caps only `exec:shell`, nothing for the §11 floor to catch). A shell/interpreter-as-command deny, unlockable.

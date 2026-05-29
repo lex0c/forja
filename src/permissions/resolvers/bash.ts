@@ -543,6 +543,70 @@ const cmdReadWithSize: CommandResolver = (_positional, tokens, ctx) => {
   };
 };
 
+// `sort` is a read-only filter EXCEPT that it can WRITE and EXEC:
+//   - `-o FILE` / `--output=FILE` redirects the sorted result to FILE
+//     (GNU sort --help), across all four getopt shapes.
+//   - `--compress-program=PROG` runs PROG to (de)compress temp files —
+//     arbitrary command execution, the same class as tar
+//     `--use-compress-program` / `--to-command`.
+// Registered to plain cmdRead, the `-o` target was emitted as a READ
+// (space/short forms) or vanished entirely (`--output=` combined form):
+// §11 write escalation/denial, sandbox planning, and operator policy
+// all saw a read-only command while the process wrote FILE —
+// `sort -o /etc/hosts in` walked past the /etc escalate tier, and
+// `sort --compress-program=/tmp/x big` was an unguarded exec. Emit
+// write-fs for the output target, read-fs for the inputs, and refuse the
+// compress-program exec vector. `sort` is also removed from
+// isReadOnlyCommand so the per-arg §11 loop treats its operands as
+// writes (defense in depth — see the loop in analyzeCommand).
+const SORT_OUTPUT_VALUE_FLAGS: ReadonlySet<string> = new Set(['-o', '--output']);
+
+const cmdSort: CommandResolver = (_positional, tokens, ctx) => {
+  if (tokens.some((t) => t === '--compress-program' || t.startsWith('--compress-program='))) {
+    return {
+      refuse: 'sort: --compress-program runs an arbitrary program — refusing static analysis',
+    };
+  }
+  const writeTargets = extractValueFlag(tokens, { longForm: '--output', shortForm: '-o' }).filter(
+    (v) => v !== '-',
+  );
+  const inputs = stripFlags(tokens, SORT_OUTPUT_VALUE_FLAGS).filter((v) => v !== '-');
+  const caps = [
+    ...inputs.map((p) => readFs(resolveArg(p, ctx))),
+    ...writeTargets.map((p) => writeFs(resolveArg(p, ctx))),
+  ];
+  // Pure stdin→stdout (`cat x | sort`): record a cwd read like cmdRead.
+  if (caps.length === 0) caps.push(readFs(ctx.cwd));
+  return { capabilities: caps, confidence: 'high' };
+};
+
+// GNU `uniq [INPUT [OUTPUT]]`: the FIRST positional is read, the SECOND
+// is WRITTEN (uniq --help). Same misclassification as sort under plain
+// cmdRead — the output operand was emitted as a read, so `uniq in
+// /etc/cron.d/x` wrote a protected path while §11 saw only reads. Value
+// flags (`-f`/`-s`/`-w` = skip-fields/-chars/check-chars) are stripped
+// so their numeric operands don't pollute the positional split. Removed
+// from isReadOnlyCommand alongside sort.
+const UNIQ_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  '-f',
+  '--skip-fields',
+  '-s',
+  '--skip-chars',
+  '-w',
+  '--check-chars',
+]);
+
+const cmdUniq: CommandResolver = (_positional, tokens, ctx) => {
+  const operands = stripFlags(tokens, UNIQ_VALUE_FLAGS);
+  const input = operands[0];
+  const output = operands[1];
+  const caps: Capability[] = [];
+  if (input === undefined || input === '-') caps.push(readFs(ctx.cwd));
+  else caps.push(readFs(resolveArg(input, ctx)));
+  if (output !== undefined && output !== '-') caps.push(writeFs(resolveArg(output, ctx)));
+  return { capabilities: caps, confidence: 'high' };
+};
+
 // Pure-output writers (echo / printf). They emit their arguments
 // verbatim to stdout — a string like "/etc/passwd" passed to echo
 // is NOT a filesystem read, it's text. No read-fs capability is
@@ -2585,8 +2649,8 @@ const COMMAND_TABLE: ReadonlyMap<string, CommandResolver> = new Map<string, Comm
   // by design: `sed` (-i / w writes), `awk` (system()/redirect), `xargs`
   // (exec), pagers `less`/`more` (!cmd shell-out) — those stay off the
   // registry and route to Conservative → confirm.
-  ['sort', cmdRead],
-  ['uniq', cmdRead],
+  ['sort', cmdSort],
+  ['uniq', cmdUniq],
   ['cut', cmdRead],
   ['comm', cmdRead],
   ['paste', cmdRead],
@@ -3101,6 +3165,17 @@ const walkAst = (root: Node): WalkResult => {
 // Detect pipe-to-shell on a `pipeline` node. Returns the offending
 // stage name when found.
 //
+// A pipe/xargs target resolves to a shell or interpreter when its
+// BASENAME — after quote removal — is in SHELL_INTERPRETERS. Keying on
+// the raw token let path-qualified launchers slip through: `... | xargs
+// /bin/sh -c '<arg>'` and `... | xargs /usr/bin/python -c '<arg>'` left
+// xargs an unregistered Conservative command that `mode: bypass` then
+// auto-allows, executing the inner script. basename(stripShellQuoting())
+// folds `/bin/sh`, `'/bin/sh'`, `/bin/'sh'`, `\sh` all down to `sh` —
+// the same normalization analyzeCommand applies to command names.
+const resolvesToInterpreter = (token: string): boolean =>
+  SHELL_INTERPRETERS.has(token) || SHELL_INTERPRETERS.has(basename(stripShellQuoting(token)));
+
 // Slice 147 (review R1): added xargs-to-interpreter detection.
 // `... | xargs sh -c '<arg>'` is the canonical xargs-as-exec
 // pattern: xargs reads stdin lines and passes each as positional
@@ -3126,7 +3201,7 @@ const detectPipeToShell = (root: Node): string | null => {
     // Check the quote/escape-stripped form too (`s'h'` → sh, `\sh` → sh)
     // to match bash's quote removal — literalText handles raw_string
     // quotes; this covers backslash + residual laundering.
-    if (SHELL_INTERPRETERS.has(text) || SHELL_INTERPRETERS.has(stripShellQuoting(text))) {
+    if (resolvesToInterpreter(text)) {
       return text;
     }
 
@@ -3144,7 +3219,7 @@ const detectPipeToShell = (root: Node): string | null => {
       for (const child of argChildren) {
         if (child === null || child === undefined) continue;
         const argText = literalText(child) ?? child.text;
-        if (SHELL_INTERPRETERS.has(argText) || SHELL_INTERPRETERS.has(stripShellQuoting(argText))) {
+        if (resolvesToInterpreter(argText)) {
           return `xargs ${argText}`;
         }
       }
@@ -3171,8 +3246,9 @@ const isReadOnlyCommand = (name: string): boolean => {
     // Read-only filters (registry expansion, PERMISSION_ENGINE.md §5.2).
     // Classified read-only so their path args resolve as `read` (not
     // `write`) in the protected-path loop — same posture as cat/wc.
-    case 'sort':
-    case 'uniq':
+    // `sort` and `uniq` are deliberately EXCLUDED: both can write a file
+    // (`sort -o`, `uniq INPUT OUTPUT`), so they carry dedicated handlers
+    // and must let the per-arg loop treat their operands as writes.
     case 'cut':
     case 'comm':
     case 'paste':

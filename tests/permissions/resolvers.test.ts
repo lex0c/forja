@@ -1959,6 +1959,121 @@ describe('bash resolver — read-only registry expansion (A, §5.2)', () => {
   });
 });
 
+// Review regression: read-only-classified filters that can WRITE a file
+// were misclassified — the write target surfaced as read-fs (or vanished
+// for `--output=`), so §11 escalation/denial + sandbox planning saw a
+// read-only command while the process wrote the file. cmdSort/cmdUniq
+// now emit write-fs for the output target.
+describe('bash resolver — sort/uniq writes are not misclassified as reads', () => {
+  test('sort -o FILE emits write-fs for the output target (all four getopt shapes)', () => {
+    for (const cmd of [
+      'sort -o /work/proj/out.txt /work/proj/in.txt',
+      'sort --output /work/proj/out.txt /work/proj/in.txt',
+      'sort --output=/work/proj/out.txt /work/proj/in.txt',
+      'sort -o/work/proj/out.txt /work/proj/in.txt',
+    ]) {
+      const r = resolveCapabilities('bash', { command: cmd }, CTX);
+      expect(r.kind).toBe('ok');
+      if (r.kind === 'ok') {
+        const caps = capStrings(r.capabilities);
+        expect(caps).toContain('write-fs:/work/proj/out.txt');
+        expect(caps).toContain('read-fs:/work/proj/in.txt');
+      }
+    }
+  });
+
+  test('sort -o into a protected zone surfaces the write (escalate/deny), not a silent read', () => {
+    // escalate tier (/etc write): the write target is visible to §11.
+    const esc = resolveCapabilities('bash', { command: 'sort -o /etc/hosts /work/proj/in' }, CTX);
+    expect(esc.kind).toBe('ok');
+    if (esc.kind === 'ok') {
+      expect(capStrings(esc.capabilities)).toContain('write-fs:/etc/hosts');
+    }
+    // deny tier (/proc write): refused outright.
+    const deny = resolveCapabilities(
+      'bash',
+      { command: 'sort -o /proc/sysrq-trigger /work/proj/in' },
+      CTX,
+    );
+    expect(deny.kind).toBe('refuse');
+  });
+
+  test('sort --compress-program runs an arbitrary program → Refuse', () => {
+    expect(
+      resolveCapabilities('bash', { command: 'sort --compress-program=/tmp/x big' }, CTX).kind,
+    ).toBe('refuse');
+    expect(
+      resolveCapabilities('bash', { command: 'sort --compress-program gzip big' }, CTX).kind,
+    ).toBe('refuse');
+  });
+
+  test('sort with only inputs stays a clean read (regression)', () => {
+    const r = resolveCapabilities('bash', { command: 'sort -rn /work/proj/data.txt' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const caps = capStrings(r.capabilities);
+      expect(caps).toContain('read-fs:/work/proj/data.txt');
+      expect(caps.some((c) => c.startsWith('write-fs:'))).toBe(false);
+    }
+  });
+
+  test('uniq writes its second positional → write-fs, not read-fs', () => {
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'uniq /work/proj/in.txt /work/proj/out.txt' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const caps = capStrings(r.capabilities);
+      expect(caps).toContain('read-fs:/work/proj/in.txt');
+      expect(caps).toContain('write-fs:/work/proj/out.txt');
+    }
+  });
+
+  test('uniq output into a protected zone surfaces the write (escalate), not a read', () => {
+    const r = resolveCapabilities('bash', { command: 'uniq /work/proj/in /etc/hosts' }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/etc/hosts');
+    }
+  });
+
+  test('uniq value flags do not pollute the input/output split', () => {
+    // `-f 1` (skip-fields) consumes `1`; in.txt is input, out.txt output.
+    const r = resolveCapabilities(
+      'bash',
+      { command: 'uniq -f 1 /work/proj/in.txt /work/proj/out.txt' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const caps = capStrings(r.capabilities);
+      expect(caps).toContain('read-fs:/work/proj/in.txt');
+      expect(caps).toContain('write-fs:/work/proj/out.txt');
+      expect(caps).not.toContain('read-fs:/work/proj/1');
+    }
+  });
+});
+
+// Review regression: a PATH-QUALIFIED interpreter as a pipe/xargs target
+// (`| /bin/sh`, `| xargs /usr/bin/python -c`) must resolve like its bare
+// form. detectPipeToShell keyed on the raw token and missed the path —
+// xargs stayed an unregistered Conservative command that mode:bypass
+// auto-allows. resolvesToInterpreter now folds to basename.
+describe('bash resolver — path-qualified interpreter as pipe/xargs target still Refuse', () => {
+  test.each([
+    'cat x | /bin/sh',
+    'cat x | /usr/bin/python',
+    'find . | xargs /bin/sh -c x',
+    'find . | xargs /usr/bin/python -c x',
+    "find . | xargs '/bin/sh' -c x",
+    'find . | xargs sh -c x', // bare form regression
+  ])('%s → Refuse', (cmd) => {
+    expect(resolveCapabilities('bash', { command: cmd }, CTX).kind).toBe('refuse');
+  });
+});
+
 describe('bash resolver — control flow → Conservative with hard-construct guard (B, §5.2)', () => {
   test.each([
     'for f in *.ts; do cat "$f"; done',
