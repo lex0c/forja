@@ -38,23 +38,31 @@ import { type Capabilities, type SgrToken, paint, paintMulti } from '../term.ts'
 const rule = (caps: Capabilities): string =>
   (caps.unicode ? '─' : '-').repeat(Math.max(8, caps.cols));
 
-const optionLine = (modal: ConfirmState, optIdx: number, caps: Capabilities): string => {
+const optionLine = (
+  modal: ConfirmState,
+  optIdx: number,
+  caps: Capabilities,
+  anchorTone: SgrToken,
+): string => {
   const opt = modal.options[optIdx];
   if (opt === undefined) return '';
   const selected = optIdx === modal.selectedIndex;
   // Cursor `>` marks the active row (ASCII universal — no Unicode
   // pretty variant). On the selected row the cursor + label are
-  // painted `accent` (blue) to highlight the active choice, while the
+  // painted with the modal's anchor tone (`accent` blue, or `warn`
+  // yellow on trust gates) to highlight the active choice, while the
   // key digit keeps the `secondary` tone it has on every row so the
-  // hotkey reminder isn't swept into the highlight. Adjacent paint
-  // runs (each self-closes) — not nested — so no inner reset some
-  // terminals re-process as a flash.
+  // hotkey reminder isn't swept into the highlight. Passing the same
+  // anchorTone the rule + title use keeps a gate modal a single color
+  // language instead of a yellow frame around a blue selection.
+  // Adjacent paint runs (each self-closes) — not nested — so no inner
+  // reset some terminals re-process as a flash.
   const cursor = selected ? '>' : ' ';
   if (selected) {
     const shortcut = opt.shortcut !== undefined ? ` (${opt.shortcut})` : '';
-    const cursorTok = paint(caps, 'accent', cursor);
+    const cursorTok = paint(caps, anchorTone, cursor);
     const keyTok = paint(caps, 'secondary', `${opt.key}.`);
-    const labelTok = paint(caps, 'accent', `${opt.label}${shortcut}`);
+    const labelTok = paint(caps, anchorTone, `${opt.label}${shortcut}`);
     return `  ${cursorTok} ${keyTok} ${labelTok}`;
   }
   // Unselected rows: number + period painted `secondary` so the
@@ -103,7 +111,13 @@ const trimBlankEnds = (preview: readonly PreviewLine[]): readonly PreviewLine[] 
 // instead of the default `accent` (blue) so the warmer tone reads as
 // "stop and read" rather than the neutral structural-blue used by
 // routine confirms. Module-scope so it isn't re-allocated per frame.
-const TRUST_GATE_FLAVORS: ReadonlySet<ConfirmState['flavor']> = new Set(['trust', 'shared-trust']);
+// Exported so the render test iterates the SAME set the renderer keys
+// on — adding a flavor here automatically extends its coverage instead
+// of needing a parallel literal kept in sync by hand.
+export const TRUST_GATE_FLAVORS: ReadonlySet<ConfirmState['flavor']> = new Set([
+  'trust',
+  'shared-trust',
+]);
 
 export const renderModal = (modal: ConfirmState, caps: Capabilities): string[] => {
   const lines: string[] = [];
@@ -152,7 +166,7 @@ export const renderModal = (modal: ConfirmState, caps: Capabilities): string[] =
     lines.push('');
     if (modal.question !== null) lines.push(`  ${modal.question}`);
     for (let i = 0; i < modal.options.length; i++) {
-      lines.push(optionLine(modal, i, caps));
+      lines.push(optionLine(modal, i, caps, anchorTone));
     }
   }
   // Footer hint — padded by one blank line so it visually detaches

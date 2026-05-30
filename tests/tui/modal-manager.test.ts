@@ -862,13 +862,33 @@ describe('askMemoryWrite (memory:write:ask producer)', () => {
     expect(ask.body).toBe('Lorem ipsum.');
   });
 
-  test('default selectedIndex = last (No); plain Enter resolves "no"', async () => {
+  test('default selectedIndex = first (Yes); plain Enter resolves "yes"', async () => {
+    // Writing the proposed memory is the expected outcome, so the
+    // cursor defaults to Yes and Enter accepts — shared via
+    // MEMORY_WRITE_DEFAULT_SELECTED_INDEX, mirrored in the reducer.
+    // Regression guard: the reducer once moved its cursor to Yes
+    // while the manager kept the last-option default, so the modal
+    // showed Yes highlighted but Enter resolved No — the write
+    // silently never happened. The manager (what Enter resolves) and
+    // the reducer (where the cursor paints) MUST agree on the index.
     const s = make();
     const promise = s.manager.askMemoryWrite({
       scope: 'user',
       name: 'pref',
       body: 'b',
     });
+    s.fs.dispatch(key('enter'));
+    await expect(promise).resolves.toBe('yes');
+  });
+
+  test('down then Enter resolves "no" (the skip option stays reachable)', async () => {
+    const s = make();
+    const promise = s.manager.askMemoryWrite({
+      scope: 'user',
+      name: 'pref',
+      body: 'b',
+    });
+    s.fs.dispatch(key('down'));
     s.fs.dispatch(key('enter'));
     await expect(promise).resolves.toBe('no');
   });

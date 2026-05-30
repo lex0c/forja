@@ -231,15 +231,26 @@ const HISTORY_CLEAR_OPTIONS: readonly ConfirmOption[] = [
 ];
 
 // Memory-write flavor (MEMORY.md §5.1). Two options — persist the
-// proposed memory or skip. Default is the last (No), matching the
-// conservative-default convention used by every other confirm
-// flavor (D5/D65). Labels match what the reducer constructs in
-// `state.ts:869` so the manager's option list and the rendered
-// modal stay in sync.
+// proposed memory or skip. Labels match what the reducer constructs
+// in its `memory:write:ask` case so the manager's option list and the
+// rendered modal stay in sync.
 const MEMORY_WRITE_OPTIONS: readonly ConfirmOption[] = [
   { key: '1', label: 'Yes, write memory', value: 'yes' },
   { key: '2', label: 'No, skip', value: 'no' },
 ];
+
+// Memory-write flavor's initial cursor position. Single source of
+// truth shared with the reducer's `memory:write:ask` case (imported
+// there), exactly like PERMISSION_DEFAULT_SELECTED_INDEX. Writing the
+// proposed memory is the expected outcome of the prompt, so the cursor
+// defaults to the first option (Yes) and Enter accepts — a deliberate
+// break from the D5/D65 last-option-safe default for this flavor.
+// Without this shared constant the manager (which decides what Enter
+// resolves) and the reducer (which decides where the cursor paints)
+// drifted: the reducer moved its initial index to 0 (Yes) but the
+// manager kept the default last-option, so the cursor showed Yes while
+// Enter silently resolved No (skip) — the write never happened.
+export const MEMORY_WRITE_DEFAULT_SELECTED_INDEX = 0;
 
 // User-scope second-confirm options (MEMORY.md §7.2.5). Same
 // shape as memory-write but distinct labels so the operator
@@ -781,6 +792,10 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
         MEMORY_WRITE_OPTIONS,
         opts?.timeoutMs,
         opts?.signal,
+        // Cursor defaults to Yes (write) — break from the last-option
+        // default, shared with the reducer so the rendered cursor and
+        // what Enter resolves can't drift apart.
+        MEMORY_WRITE_DEFAULT_SELECTED_INDEX,
       ),
     askMemoryUserScope: (args, opts) =>
       enqueueConfirm<MemoryWriteAnswer>(

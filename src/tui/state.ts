@@ -17,7 +17,11 @@
 
 import { sanitizeOneLineForDisplay } from '../sanitize/ansi.ts';
 import type { SessionBannerEnvEntry, TodoItemForUI, UIEvent } from './events.ts';
-import { PERMISSION_DEFAULT_SELECTED_INDEX, buildPermissionOptions } from './modal-manager.ts';
+import {
+  MEMORY_WRITE_DEFAULT_SELECTED_INDEX,
+  PERMISSION_DEFAULT_SELECTED_INDEX,
+  buildPermissionOptions,
+} from './modal-manager.ts';
 
 export interface InputState {
   // Current value of the input box (multi-line allowed via `\n`).
@@ -1792,7 +1796,9 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             // is the expected outcome of this prompt, so Enter accepts
             // (same convention as the permission modal; a deliberate
             // break from the last-option-safe default for this flavor).
-            selectedIndex: 0,
+            // Shared constant with the manager (which decides what Enter
+            // resolves) so the cursor and the resolution can't drift.
+            selectedIndex: MEMORY_WRITE_DEFAULT_SELECTED_INDEX,
             hints: ['Esc to cancel'],
             queueDepth: 0,
           },

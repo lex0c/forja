@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { renderModal } from '../../../src/tui/render/modal.ts';
+import { TRUST_GATE_FLAVORS, renderModal } from '../../../src/tui/render/modal.ts';
 import type { ConfirmOption, ConfirmState } from '../../../src/tui/state.ts';
 import { CSI, type Capabilities } from '../../../src/tui/term.ts';
 
@@ -159,19 +159,35 @@ describe('renderModal (UI.md §4.10.13 layout)', () => {
     expect(out[1]).toContain(`${CSI}1m`); // bold
   });
 
-  // Both consent-gate flavors shift the anchor tone from the routine
+  // Consent-gate flavors shift the anchor tone from the routine
   // `accent` blue to `warn` yellow so the operator reads them as "stop
-  // and read". Every other confirm keeps accent (pinned by the two
-  // tests above). Parametrized so adding a future gate flavor to
-  // TRUST_GATE_FLAVORS without a test here is visible.
-  for (const flavor of ['trust', 'shared-trust'] as const) {
-    test(`${flavor} flavor paints rule + title with warn (yellow), not accent`, () => {
+  // and read" — and that warm tone covers the whole structural unit:
+  // top rule, title, AND the selected option row. Iterates the actual
+  // TRUST_GATE_FLAVORS set the renderer keys on, so a flavor added
+  // there is covered here automatically (no parallel literal to drift).
+  // baseModal selects the last option, so out[9] is the selected row.
+  for (const flavor of [...TRUST_GATE_FLAVORS]) {
+    test(`${flavor} flavor paints rule + title + selected row warn (yellow), not accent`, () => {
       const out = renderModal(baseModal({ flavor }), colored);
       expect(out[0]).toContain(`${CSI}33m`); // rule warn (yellow)
       expect(out[0]).not.toContain(`${CSI}94m`); // not accent
       expect(out[1]).toContain(`${CSI}33m`); // title warn
       expect(out[1]).toContain(`${CSI}1m`); // title still bold
       expect(out[1]).not.toContain(`${CSI}94m`); // not accent
+      expect(out[9]).toContain(`${CSI}33m`); // selected option row warn
+      expect(out[9]).not.toContain(`${CSI}94m`); // not accent
+    });
+  }
+
+  // The non-gate flavors keep the routine `accent` (blue) anchor.
+  // Pinned explicitly: the permission-only tests above don't cover
+  // these, so a regression that widened the warn branch to a routine
+  // confirm (or inverted the gate predicate) fails right here.
+  for (const flavor of ['permission', 'memory-write', 'critique', 'history-clear'] as const) {
+    test(`${flavor} (non-gate) keeps accent anchor, not warn`, () => {
+      const out = renderModal(baseModal({ flavor }), colored);
+      expect(out[0]).toContain(`${CSI}94m`); // rule accent (blue)
+      expect(out[0]).not.toContain(`${CSI}33m`); // not warn
     });
   }
 

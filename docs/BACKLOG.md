@@ -2,11 +2,25 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-30] tui — fix memory-write modal: Enter resolved No while the cursor showed Yes
+
+The `memory-write` confirm tracked its default cursor in two independent places — the manager (`modal-manager.ts`, which decides what Enter resolves via `active.selectedIndex`) and the reducer (`state.ts`, which decides where the cursor paints). The previous slice moved the reducer to index 0 (Yes) but left the manager on the last-option default and never emitted an initial `modal:select` to reconcile them, so the modal rendered "Yes, write memory" highlighted while plain Enter resolved `no` (skip) — the write silently never happened, the exact inversion of the feature that slice intended. Only navigating (↑/↓) first, or pressing the `1` hotkey, hit the right answer. Reproduced with a standalone manager+focus-stack harness (Enter → `no` pre-fix, `yes` post-fix).
+
+Root cause is the duplicated source of truth for the initial index; `permission` already avoided it via the shared `PERMISSION_DEFAULT_SELECTED_INDEX` constant. Applied the same pattern: new `MEMORY_WRITE_DEFAULT_SELECTED_INDEX = 0` exported from the manager, passed as the `enqueueConfirm` defaultIndex AND imported by the reducer's `memory:write:ask` case, so the cursor and the resolution can't drift again.
+
+The bug survived CI because the manager test pinned the OLD behavior (`default = last (No); Enter resolves "no"`) — coherent with the un-updated manager but blind to the reducer's new value. Converted that into a regression guard (Enter → `yes`) plus a navigation test (down → Enter → `no`).
+
+**Flagged, not fixed (follow-ups):** (1) the initial-index drift is structural — every flavor still duplicates the default across manager and reducer, reconciled only by convention; the durable fix is to have the manager emit the initial `modal:select` on open so it's the single source. (2) `plan-review` is half-wired — the flavor exists in `events.ts` / reducer / render but has no `askPlanReview` in the manager and no producer, so if `plan:review` is ever emitted the modal renders with no focus handler (keys dead, promise never resolves).
+
+**Validated:** `tests/tui/{modal-manager,state,modal-integration,render/modal}` (260) + full typecheck + Biome clean. **Branch:** `feat/modal-improves`.
+
 ## [2026-05-30] tui — trust-gate modals (trust / shared-trust) paint their anchor warn (yellow)
 
 Operator-requested. The two consent gates — `trust` (do I operate in this folder at all?) and `shared-trust` (do I load this shared-memory corpus?) — now paint their structural anchor (top rule + title) in `warn` (yellow) instead of the `accent` (blue) every routine confirm uses. A trust decision is a security gate, so the warmer tone gives a "stop and read" cue distinct from the everyday permission / memory / critique confirms. Implemented in the shared `renderModal`: a module-scope `TRUST_GATE_FLAVORS` set (`trust`, `shared-trust`) is consulted to derive `anchorTone`, so a future gate flavor opts in by name. The title keeps its `bold`; only the color anchor shifts.
 
 **Validated:** parametrized `tests/tui/render/modal.test.ts` case over both gate flavors (rule + title carry `33m`, not `94m`; title still bold); the pre-existing `permission` → `accent` (`94m`) assertions still pin the non-gate path. Ran `tests/tui/render/modal.test.ts` (25 pass) + full typecheck + Biome clean. **Branch:** `feat/modal-improves`.
+
+**Review follow-up (same day):** a max-effort code review found no correctness bugs but flagged a coherence gap — the selected option row in `optionLine` still painted `accent` (blue), so a gate modal read as a yellow frame around a blue selection. Threaded the shared `anchorTone` into `optionLine` so the selected row matches (cursor + label `warn` on gates, `accent` elsewhere; the key digit stays `secondary`). Also exported `TRUST_GATE_FLAVORS` so the render test iterates the same set the renderer keys on (no hand-synced literal to drift), added an explicit non-gate-keeps-accent guard (permission / memory-write / critique / history-clear), and corrected two test comments that overclaimed coverage. `tests/tui/{render/modal,modal-manager,state,modal-integration}` (264) + typecheck + Biome clean.
 
 ## [2026-05-29] tui — memory-write modal: secondary subject + default cursor on Yes
 
