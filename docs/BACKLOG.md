@@ -2,6 +2,12 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-30] tui — trust-gate modals (trust / shared-trust) paint their anchor warn (yellow)
+
+Operator-requested. The two consent gates — `trust` (do I operate in this folder at all?) and `shared-trust` (do I load this shared-memory corpus?) — now paint their structural anchor (top rule + title) in `warn` (yellow) instead of the `accent` (blue) every routine confirm uses. A trust decision is a security gate, so the warmer tone gives a "stop and read" cue distinct from the everyday permission / memory / critique confirms. Implemented in the shared `renderModal`: a module-scope `TRUST_GATE_FLAVORS` set (`trust`, `shared-trust`) is consulted to derive `anchorTone`, so a future gate flavor opts in by name. The title keeps its `bold`; only the color anchor shifts.
+
+**Validated:** parametrized `tests/tui/render/modal.test.ts` case over both gate flavors (rule + title carry `33m`, not `94m`; title still bold); the pre-existing `permission` → `accent` (`94m`) assertions still pin the non-gate path. Ran `tests/tui/render/modal.test.ts` (25 pass) + full typecheck + Biome clean. **Branch:** `feat/modal-improves`.
+
 ## [2026-05-29] tui — memory-write modal: secondary subject + default cursor on Yes
 
 Two small alignments of the `memory-write` flavor with the permission modal: the `scope/name` subject now renders `secondary` (via the existing `subjectTone` field) so it lifts out of the dim baseline, and the default cursor moves from the last option (No) to the first (Yes) — writing memory is the expected outcome of the prompt, so Enter accepts. Note this breaks the D5/D65 conservative-default convention for this flavor specifically; it's a deliberate per-flavor choice, not a global one (trust / shared-trust / history-clear / memory-user-scope / plan-review / critique keep last-option-safe defaults).

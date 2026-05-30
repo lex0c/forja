@@ -159,6 +159,22 @@ describe('renderModal (UI.md §4.10.13 layout)', () => {
     expect(out[1]).toContain(`${CSI}1m`); // bold
   });
 
+  // Both consent-gate flavors shift the anchor tone from the routine
+  // `accent` blue to `warn` yellow so the operator reads them as "stop
+  // and read". Every other confirm keeps accent (pinned by the two
+  // tests above). Parametrized so adding a future gate flavor to
+  // TRUST_GATE_FLAVORS without a test here is visible.
+  for (const flavor of ['trust', 'shared-trust'] as const) {
+    test(`${flavor} flavor paints rule + title with warn (yellow), not accent`, () => {
+      const out = renderModal(baseModal({ flavor }), colored);
+      expect(out[0]).toContain(`${CSI}33m`); // rule warn (yellow)
+      expect(out[0]).not.toContain(`${CSI}94m`); // not accent
+      expect(out[1]).toContain(`${CSI}33m`); // title warn
+      expect(out[1]).toContain(`${CSI}1m`); // title still bold
+      expect(out[1]).not.toContain(`${CSI}94m`); // not accent
+    });
+  }
+
   test('selected row keeps its key digit secondary while label goes accent', () => {
     // The hotkey digit on UNSELECTED rows is subordinate to the
     // label — painting it `secondary` mutes it to a hotkey reminder.

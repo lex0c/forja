@@ -7,8 +7,8 @@
 // layout had the boxes-in-boxes feel that the redesign explicitly
 // avoids.
 //
-//   ─────────────────────────────────────────  ← `accent` color
-//     <title>           ← bold
+//   ─────────────────────────────────────────  ← `accent` (trust gates: `warn`)
+//     <title>           ← bold (same anchor tone as the rule)
 //     <subject>         ← dim (or secondary), optional
 //
 //     <preview[0]>      ← producer-formatted; default dim,
@@ -30,7 +30,7 @@
 // (modal carries its own structure).
 
 import type { ConfirmState, PreviewLine } from '../state.ts';
-import { type Capabilities, paint, paintMulti } from '../term.ts';
+import { type Capabilities, type SgrToken, paint, paintMulti } from '../term.ts';
 
 // Modal rule width adapts to the live region: full caps.cols so the
 // modal feels structural. truncateToWidth in the renderer will clip
@@ -96,12 +96,26 @@ const trimBlankEnds = (preview: readonly PreviewLine[]): readonly PreviewLine[] 
   return preview.slice(start, end);
 };
 
+// Confirm flavors that are consent gates rather than routine
+// approvals: `trust` (do I operate in this folder at all?) and
+// `shared-trust` (do I load this shared-memory corpus?). Both paint
+// their structural anchor (top rule + title) in `warn` (yellow)
+// instead of the default `accent` (blue) so the warmer tone reads as
+// "stop and read" rather than the neutral structural-blue used by
+// routine confirms. Module-scope so it isn't re-allocated per frame.
+const TRUST_GATE_FLAVORS: ReadonlySet<ConfirmState['flavor']> = new Set(['trust', 'shared-trust']);
+
 export const renderModal = (modal: ConfirmState, caps: Capabilities): string[] => {
   const lines: string[] = [];
-  // Top rule — only structural divider in the modal. Painted with
-  // `accent` so the modal anchor stands out from surrounding dim
-  // chat / tool-card text.
-  lines.push(paint(caps, 'accent', rule(caps)));
+  // Anchor tone for the two structural elements that read as a single
+  // unit — the top rule and the title. Trust-gate flavors paint `warn`
+  // (yellow); every routine confirm keeps `accent` (blue). See
+  // TRUST_GATE_FLAVORS for the rationale.
+  const anchorTone: SgrToken = TRUST_GATE_FLAVORS.has(modal.flavor) ? 'warn' : 'accent';
+  // Top rule — only structural divider in the modal. Painted with the
+  // anchor tone so it stands out from surrounding dim chat / tool-card
+  // text.
+  lines.push(paint(caps, anchorTone, rule(caps)));
   // Queue suffix is the visible signal that more asks are waiting
   // behind the active one. Without it the operator answering a
   // modal would see another pop immediately afterward with no
@@ -110,12 +124,13 @@ export const renderModal = (modal: ConfirmState, caps: Capabilities): string[] =
   // manager keeps `queueDepth` live via `modal:queue-depth`
   // events; renderer only formats.
   const queueSuffix = modal.queueDepth > 0 ? ` (+${modal.queueDepth} waiting)` : '';
-  // Title takes the same `accent` color as the top rule so the two
+  // Title takes the same anchor tone as the top rule so the two
   // structural anchors read as a single visual unit. `bold` adds
   // weight on top. paintMulti emits a single trailing reset
-  // (\x1b[94m\x1b[1m{title}\x1b[0m) — nested paint() would emit a
-  // redundant inner reset that some terminals re-process as a flash.
-  lines.push(`  ${paintMulti(caps, ['accent', 'bold'], `${modal.title}${queueSuffix}`)}`);
+  // (\x1b[94m\x1b[1m{title}\x1b[0m for accent) — nested paint() would
+  // emit a redundant inner reset that some terminals re-process as a
+  // flash.
+  lines.push(`  ${paintMulti(caps, [anchorTone, 'bold'], `${modal.title}${queueSuffix}`)}`);
   if (modal.subject !== null)
     lines.push(`  ${paint(caps, modal.subjectTone ?? 'dim', modal.subject)}`);
   // Preview block — one blank line of breathing room above it so the
