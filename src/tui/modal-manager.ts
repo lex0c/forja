@@ -452,21 +452,16 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
     const requested = next.defaultIndex ?? max;
     const initialIndex = Math.max(0, Math.min(max, requested));
     active = { promptId, selectedIndex: initialIndex, pending: next };
-    // Initial queue-depth snapshot for the just-opened modal. The
-    // event MUST fire AFTER `next.open()` so the reducer has
-    // already created the modal slot before this update lands —
-    // otherwise the reducer's mismatched-promptId guard would
-    // drop it. `queue.length` reflects what's STILL waiting AFTER
-    // popping this one (see queue.shift above) — exactly the
-    // count the renderer's `(+N waiting)` suffix needs.
-    if (queue.length > 0) {
-      bus.emit({
-        type: 'modal:queue-depth',
-        ts: now(),
-        promptId,
-        depth: queue.length,
-      });
-    }
+    // Register the focus handler BEFORE the open-time bus emits below.
+    // bus.emit is synchronous and EventEmitter does NOT isolate listener
+    // exceptions, so a throwing `onAny` listener (renderer fold, NDJSON
+    // forwarder) during those emits would otherwise propagate out of
+    // drain() with `active` already set but no handler pushed — a modal
+    // the operator can't dismiss. Pushing first means the worst a
+    // throwing listener can do is skip a state-fold update, never strand
+    // the modal without input. The handler only fires on key dispatch
+    // (never during emit), so its earlier registration is inert until
+    // the operator types.
     activeHandler = (key) => {
       if (active === null) return false;
 
@@ -530,6 +525,38 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
       return true;
     };
     focusStack.push(activeHandler);
+    // Open-time state-fold events, emitted AFTER the handler is pushed
+    // (see above) and AFTER `next.open()` so the reducer has already
+    // created the modal slot (its mismatched-promptId guard would drop
+    // them otherwise). The manager doesn't subscribe to the bus, so
+    // these never re-enter drain().
+    //
+    // modal:select pushes the manager's initial cursor to the reducer so
+    // the RENDERED cursor is forced to match what Enter resolves
+    // (active.selectedIndex). The reducer's `*:ask` handler seeds a
+    // per-flavor default, but the manager owns the resolution index —
+    // this makes the manager the single source, so the two can never
+    // visually disagree (the class behind the memory-write "cursor on
+    // Yes but Enter resolved No" bug: a drifted reducer default is
+    // overwritten here on open instead of mismatching).
+    bus.emit({
+      type: 'modal:select',
+      ts: now(),
+      promptId,
+      selectedIndex: initialIndex,
+    });
+    // queue-depth snapshot for the just-opened modal. `queue.length`
+    // reflects what's STILL waiting AFTER popping this one (see
+    // queue.shift above) — exactly the count the renderer's
+    // `(+N waiting)` suffix needs.
+    if (queue.length > 0) {
+      bus.emit({
+        type: 'modal:queue-depth',
+        ts: now(),
+        promptId,
+        depth: queue.length,
+      });
+    }
   };
 
   const moveSelection = (delta: number): void => {
