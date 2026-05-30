@@ -34,13 +34,27 @@ export const spinnerGlyph = (caps: Capabilities, now: number): string => {
 
 export const renderToolCardLive = (tool: ActiveTool, caps: Capabilities, now: number): string[] => {
   const spinner = spinnerGlyph(caps, now);
-  const elapsed = formatChipDuration(now - tool.startedAt);
+  // Awaiting-approval phase: the card exists (created at `tool:start`)
+  // but the body hasn't run — it's parked at the permission modal
+  // below. Show a static "Awaiting approval" head with NO elapsed
+  // timer: the seconds spent reading the modal are human think-time,
+  // not tool runtime, and a ticking "Executing… [Ns]" here misreads
+  // as the tool already running. `executing === false` is the explicit
+  // awaiting marker; undefined (legacy fixtures) falls through to the
+  // running head. Spinner + shimmer stay so the card still reads as
+  // live-but-pending rather than finished.
+  const awaiting = tool.executing === false;
   // Spinner, shimmer-swept verb, and `[elapsed]` all in `secondary` —
   // the live tool card reads as one family with the awaiting /
   // assistant / thinking chips; the sweep, not a loud tone, is what
   // signals it is running.
-  const verb = renderShimmer(`${tool.activeVerb}…`, caps, now, 'secondary');
-  const metric = paint(caps, 'secondary', `  [${elapsed}]`);
+  const verbText = awaiting ? 'Awaiting approval' : `${tool.activeVerb}…`;
+  const verb = renderShimmer(verbText, caps, now, 'secondary');
+  // No timer while awaiting approval — only stamp `[elapsed]` once the
+  // execution clock (rebased at `tool:execution-started`) is running.
+  const metric = awaiting
+    ? ''
+    : paint(caps, 'secondary', `  [${formatChipDuration(now - tool.startedAt)}]`);
   const head = `${paint(caps, 'secondary', `${spinner} `)}${verb}${metric}`;
   const lines: string[] = [head];
 

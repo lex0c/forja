@@ -231,15 +231,26 @@ const HISTORY_CLEAR_OPTIONS: readonly ConfirmOption[] = [
 ];
 
 // Memory-write flavor (MEMORY.md §5.1). Two options — persist the
-// proposed memory or skip. Default is the last (No), matching the
-// conservative-default convention used by every other confirm
-// flavor (D5/D65). Labels match what the reducer constructs in
-// `state.ts:869` so the manager's option list and the rendered
-// modal stay in sync.
+// proposed memory or skip. Labels match what the reducer constructs
+// in its `memory:write:ask` case so the manager's option list and the
+// rendered modal stay in sync.
 const MEMORY_WRITE_OPTIONS: readonly ConfirmOption[] = [
   { key: '1', label: 'Yes, write memory', value: 'yes' },
   { key: '2', label: 'No, skip', value: 'no' },
 ];
+
+// Memory-write flavor's initial cursor position. Single source of
+// truth shared with the reducer's `memory:write:ask` case (imported
+// there), exactly like PERMISSION_DEFAULT_SELECTED_INDEX. Writing the
+// proposed memory is the expected outcome of the prompt, so the cursor
+// defaults to the first option (Yes) and Enter accepts — a deliberate
+// break from the D5/D65 last-option-safe default for this flavor.
+// Without this shared constant the manager (which decides what Enter
+// resolves) and the reducer (which decides where the cursor paints)
+// drifted: the reducer moved its initial index to 0 (Yes) but the
+// manager kept the default last-option, so the cursor showed Yes while
+// Enter silently resolved No (skip) — the write never happened.
+export const MEMORY_WRITE_DEFAULT_SELECTED_INDEX = 0;
 
 // User-scope second-confirm options (MEMORY.md §7.2.5). Same
 // shape as memory-write but distinct labels so the operator
@@ -441,21 +452,16 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
     const requested = next.defaultIndex ?? max;
     const initialIndex = Math.max(0, Math.min(max, requested));
     active = { promptId, selectedIndex: initialIndex, pending: next };
-    // Initial queue-depth snapshot for the just-opened modal. The
-    // event MUST fire AFTER `next.open()` so the reducer has
-    // already created the modal slot before this update lands —
-    // otherwise the reducer's mismatched-promptId guard would
-    // drop it. `queue.length` reflects what's STILL waiting AFTER
-    // popping this one (see queue.shift above) — exactly the
-    // count the renderer's `(+N waiting)` suffix needs.
-    if (queue.length > 0) {
-      bus.emit({
-        type: 'modal:queue-depth',
-        ts: now(),
-        promptId,
-        depth: queue.length,
-      });
-    }
+    // Register the focus handler BEFORE the open-time bus emits below.
+    // bus.emit is synchronous and EventEmitter does NOT isolate listener
+    // exceptions, so a throwing `onAny` listener (renderer fold, NDJSON
+    // forwarder) during those emits would otherwise propagate out of
+    // drain() with `active` already set but no handler pushed — a modal
+    // the operator can't dismiss. Pushing first means the worst a
+    // throwing listener can do is skip a state-fold update, never strand
+    // the modal without input. The handler only fires on key dispatch
+    // (never during emit), so its earlier registration is inert until
+    // the operator types.
     activeHandler = (key) => {
       if (active === null) return false;
 
@@ -519,6 +525,38 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
       return true;
     };
     focusStack.push(activeHandler);
+    // Open-time state-fold events, emitted AFTER the handler is pushed
+    // (see above) and AFTER `next.open()` so the reducer has already
+    // created the modal slot (its mismatched-promptId guard would drop
+    // them otherwise). The manager doesn't subscribe to the bus, so
+    // these never re-enter drain().
+    //
+    // modal:select pushes the manager's initial cursor to the reducer so
+    // the RENDERED cursor is forced to match what Enter resolves
+    // (active.selectedIndex). The reducer's `*:ask` handler seeds a
+    // per-flavor default, but the manager owns the resolution index —
+    // this makes the manager the single source, so the two can never
+    // visually disagree (the class behind the memory-write "cursor on
+    // Yes but Enter resolved No" bug: a drifted reducer default is
+    // overwritten here on open instead of mismatching).
+    bus.emit({
+      type: 'modal:select',
+      ts: now(),
+      promptId,
+      selectedIndex: initialIndex,
+    });
+    // queue-depth snapshot for the just-opened modal. `queue.length`
+    // reflects what's STILL waiting AFTER popping this one (see
+    // queue.shift above) — exactly the count the renderer's
+    // `(+N waiting)` suffix needs.
+    if (queue.length > 0) {
+      bus.emit({
+        type: 'modal:queue-depth',
+        ts: now(),
+        promptId,
+        depth: queue.length,
+      });
+    }
   };
 
   const moveSelection = (delta: number): void => {
@@ -781,6 +819,10 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
         MEMORY_WRITE_OPTIONS,
         opts?.timeoutMs,
         opts?.signal,
+        // Cursor defaults to Yes (write) — break from the last-option
+        // default, shared with the reducer so the rendered cursor and
+        // what Enter resolves can't drift apart.
+        MEMORY_WRITE_DEFAULT_SELECTED_INDEX,
       ),
     askMemoryUserScope: (args, opts) =>
       enqueueConfirm<MemoryWriteAnswer>(

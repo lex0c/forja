@@ -68,10 +68,9 @@ const make = () => {
 };
 
 describe('modal navigation preserves contents', () => {
-  test('initial ask renders context label, action, source attribution, options', () => {
-    // Modal redesign (design/permission-modal-redesign.md): title
-    // is now the per-tool context label ("Bash command"), the
-    // action lifts into its own block with breathing room.
+  test('initial ask renders title, action, source attribution, options', () => {
+    // Permission modal: a fixed "Permission required" title, with the
+    // action lifted into its own preview block with breathing room.
     const s = make();
     void s.manager.askPermission({
       toolName: 'bash',
@@ -81,8 +80,8 @@ describe('modal navigation preserves contents', () => {
     });
     const out = s.rendered();
     expect(out).not.toBeNull();
-    // Title is the context label.
-    expect(out).toContain('Bash command');
+    // Title is the fixed permission label.
+    expect(out).toContain('Permission required');
     // Action block.
     expect(out).toContain('rm -rf ./build');
     expect(out).toContain('matched rule: bash.rm.rf');
@@ -110,7 +109,7 @@ describe('modal navigation preserves contents', () => {
     s.fs.dispatch(key('down'));
     const after = s.rendered() ?? '';
     // All blocks survive the navigation.
-    expect(after).toContain('Bash command');
+    expect(after).toContain('Permission required');
     expect(after).toContain('rm -rf ./build');
     expect(after).toContain('1. Yes');
     expect(after).toContain('2. No');
@@ -130,7 +129,7 @@ describe('modal navigation preserves contents', () => {
     s.fs.dispatch(key('down')); // 0 → 1 ('No')
     s.fs.dispatch(key('up')); // 1 → 0 ('Yes')
     const out = s.rendered() ?? '';
-    expect(out).toContain('Editing file');
+    expect(out).toContain('Permission required');
     expect(out).toContain('src/foo.ts');
     expect(out).toMatch(/> 1\. Yes/);
     s.fs.dispatch(key('escape'));
@@ -303,7 +302,7 @@ describe('per-flavor reducer option lists', () => {
     ).toBe(true);
   });
 
-  test('memory:write:ask builds 2 options (yes / no), default = last; body is the preview', () => {
+  test('memory:write:ask builds 2 options (yes / no), default = first (yes); body is the preview', () => {
     const state = applyEvent(createInitialState(), {
       type: 'memory:write:ask',
       ts: 1,
@@ -316,9 +315,11 @@ describe('per-flavor reducer option lists', () => {
     expect(state.modal.flavor).toBe('memory-write');
     expect(state.modal.title).toBe('Write memory');
     expect(state.modal.subject).toBe('project_local/config-rule');
+    expect(state.modal.subjectTone).toBe('secondary');
     expect(state.modal.preview).toEqual(['line 1', 'line 2']);
     expect(state.modal.options.map((o) => o.value)).toEqual(['yes', 'no']);
-    expect(state.modal.selectedIndex).toBe(1);
+    // Default cursor on Yes — writing memory is the expected outcome.
+    expect(state.modal.selectedIndex).toBe(0);
   });
 
   test('memory:user-scope:ask builds 2 options + scope warning preview', () => {

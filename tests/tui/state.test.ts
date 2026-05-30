@@ -1828,12 +1828,12 @@ describe('subagent lifecycle', () => {
 });
 
 describe('permission:ask modal (UI.md §4.10.13)', () => {
-  test('parent confirm renders the per-tool context label', () => {
-    // Modal redesign (design/permission-modal-redesign.md): the
-    // title slot carries a per-tool context label instead of the
-    // generic "Run command". bash family → "Bash command".
-    // Subject is null (the context label IS the subject row);
-    // question is null (numbered options are self-evident).
+  test('parent confirm renders the fixed "Permission required" title', () => {
+    // The permission modal carries one fixed title for every tool;
+    // the specific action lives in the preview block. Subject (framing
+    // line) and question (decision prompt) are set; subagent
+    // attribution becomes a parenthesized suffix on the title
+    // (anti-spoof: only the agent's declared name reaches it).
     const r = applyEvent(createInitialState(), {
       type: 'permission:ask',
       ts: 1,
@@ -1844,9 +1844,12 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
     } as UIEvent);
     expect(r.state.modal).not.toBeNull();
     if (r.state.modal !== null) {
-      expect(r.state.modal.title).toBe('Bash command');
-      expect(r.state.modal.subject).toBeNull();
-      expect(r.state.modal.question).toBeNull();
+      expect(r.state.modal.title).toBe('Permission required');
+      expect(r.state.modal.subject).toBe(
+        'The agent is requesting permission for the action below.',
+      );
+      expect(r.state.modal.subjectTone).toBe('secondary');
+      expect(r.state.modal.question).toBe('Approve this action?');
       // Action block has blank-line-action-blank-line shape — the
       // breathing room is what sets the action apart visually. The
       // action line is a plain dim string.
@@ -1856,44 +1859,32 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
     }
   });
 
-  test('per-tool context labels (bash / fs.* / web.fetch / search)', () => {
-    // Pins the per-tool mapping. A drift here would surface as a
-    // generic "Tool call" label for a known tool, which loses the
-    // operator's category cue.
-    const cases: Array<{ tool: string; label: string }> = [
-      { tool: 'bash', label: 'Bash command' },
-      { tool: 'bash_background', label: 'Bash command' },
-      { tool: 'bash_kill', label: 'Bash command' },
-      { tool: 'read_file', label: 'Accessing workspace:' },
-      { tool: 'write_file', label: 'Editing file' },
-      { tool: 'edit_file', label: 'Editing file' },
-      { tool: 'glob', label: 'Searching workspace' },
-      { tool: 'grep', label: 'Searching workspace' },
-      { tool: 'fetch_url', label: 'Network access' },
+  test('title is the fixed "Permission required" label regardless of tool', () => {
+    // The per-tool category labels (Bash command / Editing file / …)
+    // were dropped for a single generic title; the command itself
+    // carries the specifics in the preview block. Unknown tools get
+    // the same title (no fallback branch anymore).
+    const tools = [
+      'bash',
+      'read_file',
+      'write_file',
+      'edit_file',
+      'glob',
+      'grep',
+      'fetch_url',
+      'totally_unknown_tool',
     ];
-    for (const c of cases) {
+    for (const tool of tools) {
       const r = applyEvent(createInitialState(), {
         type: 'permission:ask',
         ts: 1,
         promptId: 'p',
-        toolName: c.tool,
+        toolName: tool,
         command: 'x',
         cwd: '/p',
       } as UIEvent);
-      expect(r.state.modal?.title).toBe(c.label);
+      expect(r.state.modal?.title).toBe('Permission required');
     }
-  });
-
-  test('unknown tool falls back to generic "Tool call" label', () => {
-    const r = applyEvent(createInitialState(), {
-      type: 'permission:ask',
-      ts: 1,
-      promptId: 'p',
-      toolName: 'totally_unknown_tool',
-      command: 'x',
-      cwd: '/p',
-    } as UIEvent);
-    expect(r.state.modal?.title).toBe('Tool call');
   });
 
   test('non-bash tools omit the "$ " action prefix', () => {
@@ -1926,7 +1917,7 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
     } as UIEvent);
     expect(r.state.modal).not.toBeNull();
     if (r.state.modal !== null) {
-      expect(r.state.modal.title).toBe('Bash command (subagent: explore)');
+      expect(r.state.modal.title).toBe('Permission required (subagent: explore)');
       // Preview goes straight to the action block — no
       // "subagent: explore (12345678)" prefix line.
       expect(r.state.modal.preview[0]).toBe('');

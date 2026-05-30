@@ -17,29 +17,11 @@
 
 import { sanitizeOneLineForDisplay } from '../sanitize/ansi.ts';
 import type { SessionBannerEnvEntry, TodoItemForUI, UIEvent } from './events.ts';
-import { PERMISSION_DEFAULT_SELECTED_INDEX, buildPermissionOptions } from './modal-manager.ts';
-
-// Map a tool name to the modal's context label. Replaces the older
-// "Run command" / "Subagent permission — <name>" titles with
-// per-category framing that matches reference designs (see
-// design/permission-modal-redesign.md). Subagent attribution is a
-// suffix the reducer adds; this helper only handles the per-tool
-// portion.
-const PERMISSION_CONTEXT_LABEL_BY_TOOL: Readonly<Record<string, string>> = {
-  bash: 'Bash command',
-  bash_background: 'Bash command',
-  bash_output: 'Bash command',
-  bash_kill: 'Bash command',
-  read_file: 'Accessing workspace:',
-  write_file: 'Editing file',
-  edit_file: 'Editing file',
-  glob: 'Searching workspace',
-  grep: 'Searching workspace',
-  fetch_url: 'Network access',
-};
-
-const contextLabelForTool = (toolName: string): string =>
-  PERMISSION_CONTEXT_LABEL_BY_TOOL[toolName] ?? 'Tool call';
+import {
+  MEMORY_WRITE_DEFAULT_SELECTED_INDEX,
+  PERMISSION_DEFAULT_SELECTED_INDEX,
+  buildPermissionOptions,
+} from './modal-manager.ts';
 
 export interface InputState {
   // Current value of the input box (multi-line allowed via `\n`).
@@ -111,6 +93,16 @@ export interface ActiveTool {
   // valid without per-record null annotations.
   parentId?: string;
   startedAt: number;
+  // Whether the tool body has actually started running. False between
+  // `tool:start` (card created before the permission engine) and
+  // `tool:execution-started` (fires after approval + hooks). While
+  // false the tool is parked at the permission modal — the renderer
+  // shows an "awaiting approval" head with no elapsed timer instead of
+  // the misleading "Executing… [Ns]" that counts human think-time as
+  // runtime. Optional so pre-existing ActiveTool fixtures stay valid;
+  // the renderer treats only an explicit `false` as the awaiting state
+  // (undefined → behaves as executing, the legacy default).
+  executing?: boolean;
   // Last few lines of streaming output. Capped so a tool that emits
   // a megabyte of stdout doesn't bloat the live region — the full
   // content goes through the scrollback as `tool:delta` permanent
@@ -241,6 +233,10 @@ export interface ConfirmState {
   // critique modals).
   title: string;
   subject: string | null;
+  // Paint tone for the subject line. Defaults to `dim`; the
+  // permission flavor sets `secondary` so its framing sentence lifts
+  // out of the dim baseline (the action + cwd rows below stay dim).
+  subjectTone?: 'dim' | 'secondary';
   // Tool-aware preview lines (diff for edit_file, command for bash,
   // etc.). Producer formats them; renderer paints each line dim by
   // default. To paint a single line with a stronger token (e.g.,
@@ -1140,6 +1136,13 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         subject: event.subject,
         ...(event.parentId !== undefined ? { parentId: event.parentId } : {}),
         startedAt: event.ts,
+        // Not running yet — the card is created here, BEFORE the
+        // permission engine. It sits at "awaiting approval" until
+        // `tool:execution-started` flips this true after the modal +
+        // hooks. On the auto-allow path that follow-up event arrives
+        // within the same tick, so the awaiting head never visibly
+        // renders for non-gated calls.
+        executing: false,
         preview: [],
       };
       const next = cloneTools(state.activeTools);
@@ -1151,11 +1154,13 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // Rebase the tool's clock to when its body actually started —
       // execution begins after the permission engine, the modal, and
       // PreToolUse hooks. Without this the live card's `[Xs]` would
-      // count the human wait at the permission modal.
+      // count the human wait at the permission modal. Flipping
+      // `executing` true also swaps the card head from "Awaiting
+      // approval" (no timer) to the active verb + elapsed counter.
       const tool = state.activeTools.get(event.toolId);
       if (tool === undefined) return { state, permanent: [] };
       const next = cloneTools(state.activeTools);
-      next.set(event.toolId, { ...tool, startedAt: event.ts });
+      next.set(event.toolId, { ...tool, startedAt: event.ts, executing: true });
       return { state: { ...state, activeTools: next }, permanent: [] };
     }
 
@@ -1407,14 +1412,14 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       //      the footer.
       const options = buildPermissionOptions();
 
-      // Anti-spoof: only the agent's `name` (the definition's
-      // declared name from the agents/*.md frontmatter) reaches the
-      // label — never a string the child generated.
-      const baseLabel = contextLabelForTool(event.toolName);
+      // Fixed generic title; the specific action lives in the
+      // preview block below. Anti-spoof: only the agent's declared
+      // `name` (from the agents/*.md frontmatter) reaches the suffix
+      // — never a string the child generated.
       const titleStr =
         event.subagent !== undefined
-          ? `${baseLabel} (subagent: ${event.subagent.name})`
-          : baseLabel;
+          ? `Permission required (subagent: ${event.subagent.name})`
+          : 'Permission required';
 
       const previewLines: PreviewLine[] = [];
       // Action block: a blank line, then the command verbatim (no
@@ -1460,18 +1465,20 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             promptId: event.promptId,
             flavor: 'permission',
             title: titleStr,
-            // Subject dropped: the context label IS the subject row
-            // now. Keeping a separate subject would re-render the
-            // category and create the same triple-statement of the
-            // action that the redesign aims to remove.
-            subject: null,
+            // Subject sits directly under the context-label title: a
+            // single plain-language framing line for the ask.
+            // (Reinstated after the redesign had dropped it — the
+            // explicit framing reads better above the action block.)
+            subject: 'The agent is requesting permission for the action below.',
+            // Secondary tone lifts the framing line out of the dim
+            // baseline (the action + cwd rows below stay dim).
+            subjectTone: 'secondary',
             preview: previewLines,
-            // Question dropped: "Do you want to run this <tool>
-            // command?" is implicit from the context label + the
-            // numbered options. The engine's `event.reason` (if
-            // any) lives in the source-attribution preview line via
-            // the matched-rule path; no separate question row.
-            question: null,
+            // Question sits directly above the option list as the
+            // explicit decision prompt; the numbered Yes/No
+            // options answer it. The engine's `event.reason` (if any)
+            // still rides the source-attribution preview line.
+            question: 'Approve this action?',
             options,
             // Per-flavor cursor default. Sourced from the same
             // constant the manager's drain() reads so cursor (this
@@ -1779,10 +1786,19 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             flavor: 'memory-write',
             title: 'Write memory',
             subject: `${event.scope}/${event.name}`,
+            // Secondary tone lifts the scope/name out of the dim
+            // baseline (matches the permission flavor's framing line).
+            subjectTone: 'secondary',
             preview: event.body.split('\n'),
             question: 'Save this memory entry?',
             options,
-            selectedIndex: options.length - 1,
+            // Default cursor on the first option (Yes) — writing memory
+            // is the expected outcome of this prompt, so Enter accepts
+            // (same convention as the permission modal; a deliberate
+            // break from the last-option-safe default for this flavor).
+            // Shared constant with the manager (which decides what Enter
+            // resolves) so the cursor and the resolution can't drift.
+            selectedIndex: MEMORY_WRITE_DEFAULT_SELECTED_INDEX,
             hints: ['Esc to cancel'],
             queueDepth: 0,
           },

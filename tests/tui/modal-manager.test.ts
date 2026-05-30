@@ -342,6 +342,45 @@ describe('askPermission (2-option modal per UI.md §4.10.13)', () => {
   });
 });
 
+describe('open-time modal:select (manager is the single source for the cursor)', () => {
+  // The manager owns the resolution index (active.selectedIndex — what
+  // Enter resolves). Emitting modal:select on open forces the reducer's
+  // rendered cursor to that same index, so a reducer per-flavor default
+  // that ever drifts can't produce a cursor-vs-Enter mismatch — the
+  // class behind the memory-write "cursor on Yes but Enter resolved No".
+  test('permission: open emits exactly one modal:select carrying index 0', () => {
+    const s = make();
+    const p = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
+    const sel = s.events.filter((e) => e.type === 'modal:select');
+    expect(sel).toHaveLength(1);
+    expect(sel[0]).toMatchObject({ type: 'modal:select', selectedIndex: 0 });
+    s.fs.dispatch(key('escape'));
+    return p;
+  });
+
+  test('memory-write: the pushed open-time index (0) is the index plain Enter resolves (yes)', async () => {
+    const s = make();
+    const p = s.manager.askMemoryWrite({ scope: 'user', name: 'n', body: 'b' });
+    const sel = s.events.filter(
+      (e): e is Extract<UIEvent, { type: 'modal:select' }> => e.type === 'modal:select',
+    );
+    expect(sel).toHaveLength(1);
+    expect(sel[0]?.selectedIndex).toBe(0); // cursor pushed to Yes...
+    s.fs.dispatch(key('enter'));
+    await expect(p).resolves.toBe('yes'); // ...and Enter resolves Yes — same source
+  });
+
+  test('conservative flavors: open-time index is the last option (trust → No, index 1)', async () => {
+    const s = make();
+    const p = s.manager.askTrust({ path: '/x' });
+    const sel = s.events.filter((e) => e.type === 'modal:select');
+    expect(sel).toHaveLength(1);
+    expect(sel[0]).toMatchObject({ type: 'modal:select', selectedIndex: 1 });
+    s.fs.dispatch(key('escape'));
+    await p;
+  });
+});
+
 describe('queue', () => {
   test('two askPermission calls: first opens, second waits', async () => {
     const s = make();
@@ -862,13 +901,33 @@ describe('askMemoryWrite (memory:write:ask producer)', () => {
     expect(ask.body).toBe('Lorem ipsum.');
   });
 
-  test('default selectedIndex = last (No); plain Enter resolves "no"', async () => {
+  test('default selectedIndex = first (Yes); plain Enter resolves "yes"', async () => {
+    // Writing the proposed memory is the expected outcome, so the
+    // cursor defaults to Yes and Enter accepts — shared via
+    // MEMORY_WRITE_DEFAULT_SELECTED_INDEX, mirrored in the reducer.
+    // Regression guard: the reducer once moved its cursor to Yes
+    // while the manager kept the last-option default, so the modal
+    // showed Yes highlighted but Enter resolved No — the write
+    // silently never happened. The manager (what Enter resolves) and
+    // the reducer (where the cursor paints) MUST agree on the index.
     const s = make();
     const promise = s.manager.askMemoryWrite({
       scope: 'user',
       name: 'pref',
       body: 'b',
     });
+    s.fs.dispatch(key('enter'));
+    await expect(promise).resolves.toBe('yes');
+  });
+
+  test('down then Enter resolves "no" (the skip option stays reachable)', async () => {
+    const s = make();
+    const promise = s.manager.askMemoryWrite({
+      scope: 'user',
+      name: 'pref',
+      body: 'b',
+    });
+    s.fs.dispatch(key('down'));
     s.fs.dispatch(key('enter'));
     await expect(promise).resolves.toBe('no');
   });
