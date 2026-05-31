@@ -2,6 +2,12 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-30] fix(permissions) — autonomous auto-approval read a stale engine-state snapshot
+
+Review catch on the committed posture code (`dadb2d6c`). The auto-approval guard tested `currentState` — the engine-state snapshot taken at the top of `check()`. But a `classifierRequired` failure transitions the engine to degraded MID-check (the classifier block calls `stateController.transition('degraded', …)`). So in an autonomous session a low-risk `policy` confirm could be cleared to `allow` on the very check that degraded the engine: the snapshot still read `ready` while the live state was `degraded`, violating the fail-closed "degraded suspends auto-approval" invariant the comment promised. Narrow window (`classifierRequired` is off by default), but a real fail-open. Fixed: the guard now reads the LIVE state (`stateController.get()`) before clearing a policy confirm. Regression test: `classifierRequired` + a failing classifier + autonomous + a `confirm` rule → stays `confirm`, engine degraded.
+
+**Validated:** typecheck + Biome clean; `tests/permissions/` + `tests/evals/` 2247 pass / 0 fail. **Branch:** `feat/operation-mode`.
+
 ## [2026-05-30] evals — operation-mode approval posture
 
 Closes the "eval is load-bearing" gap for the posture feature. Threaded `approvalPosture` through the eval harness end to end (`EvalSetup` → loader → executor → `BootstrapInput.approvalPosture`) so an eval case can pin a posture; the loader validates the value (`supervised`/`autonomous`) and rejects anything else.

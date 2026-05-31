@@ -256,6 +256,23 @@ describe('approval posture (Supervised / Autonomous)', () => {
     expect(eng.check('bash', 'bash', { command: 'git status' }).kind).toBe('confirm');
   });
 
+  test('autonomous does NOT auto-approve when the classifier degrades the engine mid-check', () => {
+    // Regression: classifierRequired + a failing classifier transitions
+    // the engine to degraded DURING this check (not before it). The
+    // guard must read the LIVE state, not the start-of-check snapshot,
+    // and hold the confirm — otherwise it auto-approves on the very
+    // check that degraded.
+    const eng = createPermissionEngine(policy({ tools: { bash: { confirm: ['git status'] } } }), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+      classifier: () => null,
+      classifierRequired: true,
+    });
+    const d = eng.check('bash', 'bash', { command: 'git status' });
+    expect(d.kind).toBe('confirm');
+    expect(eng.state()).toBe('degraded');
+  });
+
   test('autonomous never relaxes a deny', () => {
     const eng = createPermissionEngine(policy({ tools: { bash: { deny: ['rm -rf *'] } } }), {
       cwd: CWD,

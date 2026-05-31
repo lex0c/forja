@@ -2210,15 +2210,22 @@ export const createPermissionEngine = (
     //     `confirm` rule got LESS protection than an `allow` rule.
     //   - suspended while degraded: a subsystem-health signal re-arms
     //     the modal for everything, posture included (the same reason
-    //     degraded upgrades allow→confirm above). Rejecting states
-    //     already returned far above, so `ready` is the only
-    //     non-degraded state reachable here.
+    //     degraded upgrades allow→confirm above). We read the LIVE
+    //     state here, NOT the `currentState` snapshot taken at the top
+    //     of check(): a `classifierRequired` failure transitions the
+    //     engine to degraded MID-check (in the classifier block above),
+    //     and the snapshot would still read `ready` — auto-approving on
+    //     the very check that degraded. The live read suspends
+    //     auto-approval on that check too. Rejecting states already
+    //     returned far above and the classifier path only transitions
+    //     to `degraded`, so `ready` is the only clearing value here.
+    const liveState = stateController.get();
     const policyConfirmIsRisky =
       score >= scoreConfirmThreshold || gateConfidence === 'low' || resolverForcesConfirm;
     let postureAutoApproved = false;
     if (
       posture === 'autonomous' &&
-      currentState === 'ready' &&
+      liveState === 'ready' &&
       decision.kind === 'confirm' &&
       decision.confirmCause === 'policy' &&
       !policyConfirmIsRisky
