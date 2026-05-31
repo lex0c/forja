@@ -2,6 +2,17 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-31] tui + docs + spec — operation-mode cue relabel and doc/spec sync
+
+Two things this pass. (1) The footer operation-mode cue was relabeled from a bare `Supervised`/`Autonomous` to `supervised mode on`/`autonomous mode on` (`f0c86923`) — reads as a status line and matches the footer's lowercase voice; colors (accent/warn) and the shift+tab affordance unchanged. (2) Synced the non-spec docs the posture feature had left behind:
+
+- **SECURITY.md** §5.5.12 — documented the autonomous posture as a deliberate, bounded human-in-the-loop bypass, with the guard-rails (only low-risk `policy` confirms auto-approve; compound/escalate/score/resolver confirms and any non-`ready` engine state re-arm the modal; hard denies stay unreachable; every auto-approval is audited and replay-reconstructable). SECURITY.md had framed the modal as the *sole* human-in-the-loop.
+- **TODO.md** — the matcher pull-in signal cited "autonomous-mode workloads" as hypothetical; reworded now that the posture ships, noting compound confirms still re-arm the modal (so the fatigue signal survives even under Autonomous).
+
+Spec sync (separate step — editing `docs/spec/` needs an explicit request): **UI.md** footer text + ASCII relabeled to match; **PERMISSION_ENGINE.md** added the `approval-posture` stage to the canonical `reason_chain` table and folded the posture into the reproducibility principle (replay reconstructs it from that stage); **AGENTIC_CLI.md §8.1** now states the suspend-while-not-`ready` guard reads the LIVE engine state (so a mid-check degrade still suspends) and that each auto-approval stamps `approval-posture` for forensic replay.
+
+Also verified there is no `shift+tab` keybinding conflict: the modal-manager focus handler is stacked above the REPL editor, so `shift+tab` routes to the modal ("Yes, don't ask again") when one is open and toggles the posture only in the bare editor — `SECURITY.md:688` stays correct.
+
 ## [2026-05-30] fix(permissions) — permission-replay fabricated drift on autonomous auto-approvals
 
 Review catch on the posture feature's forensic blind spot. `agent permission replay --against-current-policy` / `--against-archived-policy` build a disposable engine via `tryReExecute` WITHOUT `approvalPosture`, defaulting to supervised. So re-executing a row the autonomous posture had auto-approved (a low-risk policy `confirm` turned `allow`) returned `confirm` again — and the replay reported `changed_decision` (fabricated policy drift) for every autonomous auto-approved routine confirm, even when the policy never moved. The approvals_log has no posture column, but an autonomous auto-approval stamps an `approval-posture` stage into the row's reason chain; `rowApprovalPosture(row)` recovers it and `tryReExecute` re-runs under that posture, reproducing the `allow`. A caveat (`approval posture (autonomous) reconstructed from the reason chain…`) is appended ONLY when the engine actually re-ran under a reconstructed autonomous posture, keeping the "deterministic" verdict honest about HOW it reproduced (the eligibility re-check still runs without the classifier adjust). Tests: current-policy regression + supervised control + archived-policy regression.

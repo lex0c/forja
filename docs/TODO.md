@@ -1084,11 +1084,13 @@ AST is precision of POLICY EXPRESSION, not runtime defense.
 
 Pull when ANY of:
 
-- Autonomous-mode workloads (where the agent fires bash
-  commands faster than a human reviews) become routine and
-  the compound guard's "every compound = modal" creates
-  measurable fatigue. Visible in audit: many `confirm`
-  decisions on the same compound shape, all approved.
+- Autonomous-posture workloads become routine. Autonomous
+  auto-approves routine `policy` confirms, but compound commands
+  re-arm the modal by design (`confirmCause='compound'` is never
+  auto-approved), so the compound guard's "every compound = modal"
+  still creates measurable fatigue even for a delegated operator.
+  Visible in audit: many `confirm` decisions on the same compound
+  shape, all approved.
 - A real-world policy bypass via the current matcher's
   string-glob limits surfaces (operator reports
   "I had `allow: foo*` and got bitten by `foo$(...)`"). One

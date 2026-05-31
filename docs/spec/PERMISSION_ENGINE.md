@@ -36,7 +36,7 @@ V1 segue válido como **contrato externo** (Tool Registry ↔ Engine). V2 detalh
 5. **TTL obrigatório.** "Allow forever" não existe.
 6. **Subagent é subset, nunca expansão.** Permissão é interseção, não união.
 7. **Explicability first-class.** Toda decisão produz `reason_chain` legível.
-8. **Reprodutibilidade auditável.** Toda decisão é replay-able dado: inputs + policy hash + classifier hash.
+8. **Reprodutibilidade auditável.** Toda decisão é replay-able dado: inputs + policy hash + classifier hash + postura de aprovação (§8.1 `AGENTIC_CLI`). A postura não tem coluna no audit row; o replay a reconstrói do stage `approval-posture` no `reason_chain` — sem isso, um `allow` auto-aprovado em autonomous seria reportado como drift de policy.
 
 ---
 
@@ -392,6 +392,7 @@ Cada decisão emite um `reason_chain: ReasonChainEntry[]` no audit row, onde cad
 | `sandbox-plan` | Estágio 5 escolheu profile | engine | `note` carrega `profile=<name>`. Emitido sempre que sandbox foi configurado. |
 | `sandbox-refused` | Estágio 5 retornou no_viable_sandbox | engine | `note` carrega `uncovered=[...]`. |
 | `approval-gate` | Estágio 6 forçou confirm (score ≥ threshold ou confidence=low) | engine | Diferenciador entre auto-allow e human-confirm. |
+| `approval-posture` | Postura `autonomous` auto-aprovou um `policy` confirm de baixo risco (§8.1 `AGENTIC_CLI`) | engine | `note` carrega `autonomous: auto-approved policy confirm`. O replay forense reconstrói a postura a partir deste stage. |
 | `engine-state` | State != ready interceptou a decisão | engine | `note` carrega `state=<degraded\|refusing\|...>`. |
 | `subagent-effective` | Capability fora do envelope do subagent (§10.1) | engine | `note` carrega capability `uncovered`. |
 | `grant-match` | Session-grant matched (§8) | session (sempre) | `rule` carrega o grant id (ULID). |
@@ -1551,6 +1552,7 @@ Pra replay, audit row tem:
 - `resolver_version`
 - `classifier_hash`
 - `score_components_json`
+- `reason_chain_json` — entre seus stages, um `approval-posture` indica que a postura `autonomous` auto-aprovou um `policy` confirm. O replay reconstrói a postura a partir desse stage e re-executa sob ela; sem isso, o `allow` auto-aprovado seria re-executado como `confirm` e reportado como falso `changed_decision` (drift de policy que não houve).
 
 Args brutos vivem em SQLite de sessão (TTL = retenção de sessão, default 30d). Após TTL, replay perde args mas mantém capabilities.
 

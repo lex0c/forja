@@ -471,13 +471,13 @@ Sempre 1 linha, dim, **abaixo do input box** (com régua entre eles). Margens si
 
 | Estado | Esquerda | Direita |
 |---|---|---|
-| Idle | `<Supervised\|Autonomous> (shift+tab to change) · \+Enter newline` | `<model> · [<tokens>] · [<context%>] · [<cached%>]` |
+| Idle | `<supervised\|autonomous> mode on (shift+tab to change) · \+Enter newline` | `<model> · [<tokens>] · [<context%>] · [<cached%>]` |
 | Idle, exit armed (§5.4) | `Press Ctrl-C again to exit` (`warn`) | (mesmo) |
 | Running | `<mode cue> · \+Enter newline · esc to interrupt` | (mesmo) |
 | Soft-aborted (ainda processando) | `<mode cue> · \+Enter newline · esc again to force` | (mesmo) |
 | Modal up | (suprimido — modal cobre footer) | (suprimido) |
 
-Esquerda = **"em que modo estou e o que posso fazer agora?"**. O cue de **modo de operação** (postura de aprovação, §8.1 do `AGENTIC_CLI`) ocupa a posição que era do `? for help`: **`Supervised`** pintado `accent` (azul) ou **`Autonomous`** pintado `warn` (amarelo — um "heads up" deliberado), seguido de `(shift+tab to change)` em `secondary`. Shift+Tab alterna a postura; o cue some nos estados slash-popover-aberto e exit-armed (como o help fazia). Interrupt cue **só quando interruptable**.
+Esquerda = **"em que modo estou e o que posso fazer agora?"**. O cue de **modo de operação** (postura de aprovação, §8.1 do `AGENTIC_CLI`) ocupa a posição que era do `? for help`: **`supervised mode on`** pintado `accent` (azul) ou **`autonomous mode on`** pintado `warn` (amarelo — um "heads up" deliberado), seguido de `(shift+tab to change)` em `secondary`. Shift+Tab alterna a postura; o cue some nos estados slash-popover-aberto e exit-armed (como o help fazia). Interrupt cue **só quando interruptable**.
 
 Direita = **"o que está em vigor?"**. Três chips informacionais "sempre visíveis" assim que o `session:banner` chega (boot), permanecem durante o gap idle entre turns. Ordem fixa:
 
@@ -604,7 +604,7 @@ Banidos do vocabulário operacional:
 ─────────────────────────────────────────────────────────────────────  ← régua (full width, col 0)
 > ▌                                                                   ← input + cursor (col 0)
 ─────────────────────────────────────────────────────────────────────  ← régua (full width, col 0)
-  Supervised · \+Enter newline · esc to interrupt   anthropic/claude-sonnet-4-6 · 12k tokens · 45% context used  ← footer (padded, 2sp margins each side)
+  supervised mode on · \+Enter newline · esc to interrupt   anthropic/claude-sonnet-4-6 · 12k tokens · 45% context used  ← footer (padded, 2sp margins each side)
 ```
 
 Live region (entre as réguas e a inferior):
