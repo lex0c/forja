@@ -699,6 +699,10 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
 
     const permissionEngine = createPermissionEngine(audit.policySnapshot, {
       cwd: session.cwd,
+      // Inherit the parent's approval posture snapshotted at spawn
+      // (operation-mode). getSubagentRun already mapped a NULL legacy
+      // column to 'supervised', so this is always a concrete posture.
+      approvalPosture: audit.approvalPosture,
       ...(effectiveCapabilitiesParsed !== undefined
         ? { effectiveCapabilities: effectiveCapabilitiesParsed }
         : {}),

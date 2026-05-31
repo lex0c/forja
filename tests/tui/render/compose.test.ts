@@ -28,7 +28,6 @@ const startedSession = (): LiveState => {
     status: {
       ...s.status,
       sessionId: 's1',
-      profile: 'autonomous',
       project: 'forja',
       model: 'opus',
     },
@@ -69,7 +68,7 @@ describe('composeLive layout', () => {
     expect(out[1]).toBe(expectedRule(caps.cols, true));
     expect(out[2]).toBe('> ');
     expect(out[3]).toBe(expectedRule(caps.cols, true));
-    expect(out[4]).toContain('? for help');
+    expect(out[4]).toContain('supervised mode on');
   });
 
   test('after session start: BLANK + rule + input + rule + footer', () => {
@@ -159,7 +158,7 @@ describe('composeLive layout', () => {
     expect(out[9]).toBe(expectedRule(caps.cols, true));
     expect(out[10]).toBe('> ');
     expect(out[11]).toBe(expectedRule(caps.cols, true));
-    expect(out[12]).toContain('? for help');
+    expect(out[12]).toContain('supervised mode on');
     expect(out).toHaveLength(13);
   });
 
@@ -240,7 +239,7 @@ describe('composeLive layout', () => {
     expect(inputRow(out, 0)).toBe('> a');
     expect(inputRow(out, 1)).toBe('  b');
     expect(out[out.length - 2]).toBe(expectedRule(caps.cols, true));
-    expect(out[out.length - 1]).toContain('? for help');
+    expect(out[out.length - 1]).toContain('supervised mode on');
   });
 
   test('multiple tools appear in insertion order', () => {
@@ -312,7 +311,7 @@ describe('composeLive layout', () => {
     // (block separators) so we can't assert "no rules"; instead
     // check the specific signals that should be absent.
     expect(out.some((l) => l === '> ')).toBe(false); // input prompt
-    expect(out.some((l) => l.includes('? for help'))).toBe(false); // footer hint
+    expect(out.some((l) => l.includes('shift+tab to change'))).toBe(false); // footer mode cue
   });
 
   test('modal lines are NOT padded (renderModal already bakes the §6.3 frame margin)', () => {

@@ -58,7 +58,6 @@ const sessionStart: UIEvent = {
   type: 'session:start',
   ts: 1,
   sessionId: 's1',
-  profile: 'autonomous',
   project: 'forja',
   model: 'opus',
 };
@@ -433,7 +432,6 @@ describe('renderer wiring', () => {
     bus.emit(sessionStart);
     const s: LiveState = r.state();
     expect(s.status.sessionId).toBe('s1');
-    expect(s.status.profile).toBe('autonomous');
     r.close();
   });
 

@@ -1,4 +1,5 @@
 import { beforeAll, describe, expect, test } from 'bun:test';
+import type { AuditEmitInput } from '../../src/permissions/audit.ts';
 import { initBashParser } from '../../src/permissions/bash-parser.ts';
 import { createPermissionEngine } from '../../src/permissions/engine.ts';
 import type { Policy } from '../../src/permissions/types.ts';
@@ -106,6 +107,262 @@ describe('engine.check (paths)', () => {
   test('rejects write with no path argument', () => {
     const eng = createPermissionEngine(policy({}), { cwd: CWD });
     expect(eng.check('write_file', 'fs.write', {}).kind).toBe('deny');
+  });
+});
+
+describe('engine.check confirmCause (every confirm carries a typed cause)', () => {
+  // Slice 1 of operation-mode: the autonomous approval posture keys on
+  // this field to auto-approve ONLY routine policy confirms. These
+  // tests pin the cause stamped on each deterministic confirm path;
+  // the risk paths ('score', 'escalate') are pinned in the autonomous-
+  // posture suite where they double as "must NOT auto-approve" guards.
+  test('bash confirm rule → cause "policy"', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { confirm: ['git status'] } } }), {
+      cwd: CWD,
+    });
+    const d = eng.check('bash', 'bash', { command: 'git status' });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') expect(d.confirmCause).toBe('policy');
+  });
+
+  test('compound shell command → cause "compound"', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['echo *'] } } }), {
+      cwd: CWD,
+    });
+    const d = eng.check('bash', 'bash', { command: 'echo a && echo b' });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') expect(d.confirmCause).toBe('compound');
+  });
+
+  test('path confirm_paths rule → cause "policy"', () => {
+    const eng = createPermissionEngine(
+      policy({ tools: { write_file: { confirm_paths: ['package.json'] } } }),
+      { cwd: CWD },
+    );
+    const d = eng.check('write_file', 'fs.write', { path: 'package.json' });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') expect(d.confirmCause).toBe('policy');
+  });
+
+  test('degraded engine upgrades allow → confirm with cause "degraded"', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: CWD,
+    });
+    eng.degrade('test: subsystem offline');
+    const d = eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') expect(d.confirmCause).toBe('degraded');
+  });
+});
+
+describe('approval posture (Supervised / Autonomous)', () => {
+  test('defaults to supervised; view() and approvalPosture() agree', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    expect(eng.approvalPosture()).toBe('supervised');
+    expect(eng.view().posture).toBe('supervised');
+  });
+
+  test('options.approvalPosture seeds the initial posture', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    expect(eng.approvalPosture()).toBe('autonomous');
+    expect(eng.view().posture).toBe('autonomous');
+  });
+
+  test('supervised keeps a policy confirm as a confirm (today behavior)', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { confirm: ['git status'] } } }), {
+      cwd: CWD,
+    });
+    expect(eng.check('bash', 'bash', { command: 'git status' }).kind).toBe('confirm');
+  });
+
+  test('autonomous auto-approves a policy confirm (bash) to allow', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { confirm: ['git status'] } } }), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+    });
+    const d = eng.check('bash', 'bash', { command: 'git status' });
+    expect(d.kind).toBe('allow');
+    if (d.kind === 'allow') expect(d.reason).toContain('autonomous posture');
+  });
+
+  test('autonomous auto-approves a policy confirm (path confirm_paths)', () => {
+    const eng = createPermissionEngine(
+      policy({ tools: { write_file: { confirm_paths: ['package.json'] } } }),
+      { cwd: CWD, approvalPosture: 'autonomous' },
+    );
+    expect(eng.check('write_file', 'fs.write', { path: 'package.json' }).kind).toBe('allow');
+  });
+
+  test('autonomous does NOT auto-approve a compound-command confirm', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['echo *'] } } }), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+    });
+    const d = eng.check('bash', 'bash', { command: 'echo a && echo b' });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') expect(d.confirmCause).toBe('compound');
+  });
+
+  test('autonomous does NOT auto-approve a protected-escalate confirm', () => {
+    const eng = createPermissionEngine(
+      policy({ tools: { write_file: { allow_paths: ['/**'] } } }),
+      {
+        cwd: CWD,
+        approvalPosture: 'autonomous',
+      },
+    );
+    const d = eng.check('write_file', 'fs.write', { path: '/etc/hosts' });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') expect(d.confirmCause).toBe('escalate');
+  });
+
+  test('autonomous does NOT auto-approve a risk-score-gated confirm', () => {
+    // Near-zero threshold forces the score gate: a would-be allow
+    // upgrades to a confirm whose cause is not 'policy', so autonomous
+    // leaves it as a modal.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git push *'] } } }), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+      scoreConfirmThreshold: 0.0001,
+    });
+    const d = eng.check('bash', 'bash', { command: 'git push origin main' });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') expect(d.confirmCause).not.toBe('policy');
+  });
+
+  test('autonomous does NOT auto-approve a policy confirm that is itself high-risk', () => {
+    // Regression for the score-gate gap: a `confirm`-rule match whose
+    // risk score crosses the threshold must still open the modal — the
+    // same protection an `allow`-rule match gets via the score gate.
+    // degradeAllowToConfirm only upgrades `allow`s, so the cause stays
+    // 'policy'; the risk re-check in check() is what holds it.
+    const eng = createPermissionEngine(policy({ tools: { bash: { confirm: ['git push *'] } } }), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+      scoreConfirmThreshold: 0.0001,
+    });
+    const d = eng.check('bash', 'bash', { command: 'git push origin main' });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') expect(d.confirmCause).toBe('policy');
+  });
+
+  test('autonomous suspends auto-approval while the engine is degraded', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { confirm: ['git status'] } } }), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+    });
+    eng.degrade('test: subsystem offline');
+    // Would auto-approve when ready; degraded re-arms the modal.
+    expect(eng.check('bash', 'bash', { command: 'git status' }).kind).toBe('confirm');
+  });
+
+  test('autonomous does NOT auto-approve when the classifier degrades the engine mid-check', () => {
+    // Regression: classifierRequired + a failing classifier transitions
+    // the engine to degraded DURING this check (not before it). The
+    // guard must read the LIVE state, not the start-of-check snapshot,
+    // and hold the confirm — otherwise it auto-approves on the very
+    // check that degraded.
+    const eng = createPermissionEngine(policy({ tools: { bash: { confirm: ['git status'] } } }), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+      classifier: () => null,
+      classifierRequired: true,
+    });
+    const d = eng.check('bash', 'bash', { command: 'git status' });
+    expect(d.kind).toBe('confirm');
+    expect(eng.state()).toBe('degraded');
+  });
+
+  test('autonomous never relaxes a deny', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { deny: ['rm -rf *'] } } }), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+    });
+    expect(eng.check('bash', 'bash', { command: 'rm -rf /tmp/x' }).kind).toBe('deny');
+  });
+
+  test('setApprovalPosture flips the outcome of the next check', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { confirm: ['git status'] } } }), {
+      cwd: CWD,
+    });
+    expect(eng.check('bash', 'bash', { command: 'git status' }).kind).toBe('confirm');
+    eng.setApprovalPosture('autonomous', 'operator toggle');
+    expect(eng.check('bash', 'bash', { command: 'git status' }).kind).toBe('allow');
+    eng.setApprovalPosture('supervised', 'operator toggle back');
+    expect(eng.check('bash', 'bash', { command: 'git status' }).kind).toBe('confirm');
+  });
+
+  test('setApprovalPosture records transitions in postureLog; same-value is a no-op', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    eng.setApprovalPosture('supervised', 'no change');
+    expect(eng.postureLog()).toHaveLength(0);
+    eng.setApprovalPosture('autonomous', 'operator went hands-off');
+    eng.setApprovalPosture('supervised', 'operator took back control');
+    const log = eng.postureLog();
+    expect(log).toHaveLength(2);
+    expect(log[0]).toMatchObject({
+      from: 'supervised',
+      to: 'autonomous',
+      reason: 'operator went hands-off',
+    });
+    expect(log[1]).toMatchObject({
+      from: 'autonomous',
+      to: 'supervised',
+      reason: 'operator took back control',
+    });
+  });
+
+  test('setApprovalPosture emits a posture-change admin row to the audit sink', () => {
+    const captured: AuditEmitInput[] = [];
+    const eng = createPermissionEngine(policy({}), {
+      cwd: CWD,
+      sessionId: 'sess-1',
+      audit: {
+        emit: (input) => {
+          captured.push(input);
+          return { seq: captured.length, this_hash: 'h' };
+        },
+        verifyChain: () => ({
+          ok: true,
+          rows: captured.length,
+          current_rotation_id: 0,
+          quarantined: false,
+        }),
+      },
+    });
+    eng.setApprovalPosture('autonomous', 'operator went hands-off');
+    expect(captured).toHaveLength(1);
+    const row = captured[0];
+    // Same admin-row shape as chain-break-accepted / policy-reloaded:
+    // it rides the existing hash-chained ledger, not a side table.
+    expect(row?.tool_name).toBe('permission-engine');
+    expect(row?.decision).toBe('allow');
+    expect(row?.session_id).toBe('sess-1');
+    expect(row?.reason_chain[0]?.stage).toBe('posture-change');
+    expect(row?.reason_chain[0]?.note).toContain('from=supervised to=autonomous');
+    expect(row?.reason_chain[0]?.note).toContain('operator went hands-off');
+    expect(row?.args).toMatchObject({ posture_from: 'supervised', posture_to: 'autonomous' });
+  });
+
+  test('a no-op posture set (same value) emits no audit row', () => {
+    const captured: AuditEmitInput[] = [];
+    const eng = createPermissionEngine(policy({}), {
+      cwd: CWD,
+      audit: {
+        emit: (input) => {
+          captured.push(input);
+          return { seq: captured.length, this_hash: 'h' };
+        },
+        verifyChain: () => ({
+          ok: true,
+          rows: captured.length,
+          current_rotation_id: 0,
+          quarantined: false,
+        }),
+      },
+    });
+    eng.setApprovalPosture('supervised', 'no change');
+    expect(captured).toHaveLength(0);
   });
 });
 

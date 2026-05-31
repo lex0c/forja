@@ -197,6 +197,30 @@ describe('dispatchSemanticVerify — early gates', () => {
     if (second.kind === 'skipped') expect(second.reason).toBe('dedup_hit');
     expect(spawnCalled).toBe(false);
   });
+
+  test('verify subagent does NOT inherit autonomous posture (always Supervised)', async () => {
+    // Governance verify subagents are automatic + security-sensitive
+    // (they scan possibly-injected memory), so they must run Supervised
+    // regardless of the operator's posture — fail-closed.
+    let captured: { inheritApprovalPosture?: boolean } | undefined;
+    const captureSpawn = (async (inp: { inheritApprovalPosture?: boolean }) => {
+      captured = inp;
+      return makeResult();
+    }) as never;
+    const file = makeFile('A clean factual claim about src/x.ts with no injection.');
+    await dispatchSemanticVerify({
+      db,
+      definition: fakeDefinition,
+      parentSessionId: sessionId,
+      cwd: workdir,
+      provider: fakeProvider,
+      parentToolRegistry: fakeToolRegistry,
+      permissionEngine: fakePermissionEngine,
+      memory: { scope: 'project_local', name: 'foo', file },
+      spawnSubagentFn: captureSpawn,
+    });
+    expect(captured?.inheritApprovalPosture).toBe(false);
+  });
 });
 
 describe('dispatchSemanticVerify — output handling', () => {

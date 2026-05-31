@@ -689,6 +689,15 @@ The modal renderer itself implements several anti-confusion defenses (slice 125 
 
 The modal is the human-in-the-loop. Every prior layer's job is to ensure it's REACHED for high-uncertainty calls and BYPASSED for clearly-allow / clearly-deny ones — operator fatigue from too many confirmations is itself the failure mode.
 
+**Autonomous posture — operator-elected, bounded bypass.** The operator runs Supervised by default (every `confirm` reaches the modal). Toggling Autonomous (Shift+Tab, or `--autonomous` at boot) delegates routine approvals so the modal isn't shown for them. This relaxes the human-in-the-loop deliberately and narrowly:
+
+- **Only low-risk `policy` confirms auto-approve.** A `confirm` clears to `allow` only when its cause is `policy` (a plain `confirm:` rule match) AND it is low-risk — score below the score-confirm threshold, confidence not low, resolver not forcing. Compound, escalation, score-gate, and resolver-forced confirms always re-arm the modal.
+- **A non-`ready` engine re-arms everything.** Degraded / refusing / quarantined suspends auto-approval (fail-closed). The guard reads the LIVE engine state, so a degrade that happens mid-check still suspends.
+- **Hard denies stay unreachable.** Protected paths and policy `deny` rules resolve to `deny`, not `confirm` — the posture never sees them, so it can never auto-approve a deny.
+- **Every auto-approval is audited.** The `allow` carries an `approval-posture` stage in its reason chain; posture changes are admin rows on the `approvals_log` hash chain; forensic replay reconstructs the posture so the row reproduces honestly instead of looking like policy drift.
+
+Autonomous trades confirmation friction for the operator's standing consent to a bounded class of low-risk routine actions. It is not "bypass mode": it cannot reach anything the engine would have denied, and the audit trail stays complete.
+
 ### 5.5.13 On-disk permissions hardening
 
 Several Forja-owned files capture secret-shaped payloads (raw bash stdout/stderr, subagent stderr panics, git checkpoints). Default umask leaves them world-readable (0644) inside a 0755 dir — any cohabitant local user reads them via `cat`. Slices 163 + 172 close the gap:

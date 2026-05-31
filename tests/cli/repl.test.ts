@@ -8,6 +8,7 @@ import type { BootstrapResult } from '../../src/cli/bootstrap.ts';
 import { SUBAGENT_DISPLAY_MAX, runRepl, sanitizeForSubagentDisplay } from '../../src/cli/repl.ts';
 import type { HarnessConfig, HarnessEvent, HarnessResult } from '../../src/harness/index.ts';
 import { DEFAULT_BUDGET } from '../../src/harness/types.ts';
+import { type PermissionEngine, createPermissionEngine } from '../../src/permissions/index.ts';
 import { openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { recordCritiqueRun } from '../../src/storage/repos/critique-runs.ts';
@@ -104,6 +105,13 @@ interface MakeBootstrapStubOptions {
   // can be exercised. Production brokers own handles/timers; tests
   // pass a `close` spy to assert the drain actually happens.
   broker?: { close: () => Promise<void> };
+  // Permission engine attached to the stub config. Production bootstrap
+  // always wires one (HarnessConfig.permissionEngine is required); the
+  // stub historically omitted it because the TTY/exit tests never
+  // touched it. Tests exercising the Shift+Tab posture toggle inject an
+  // inspectable engine here; otherwise a default supervised engine is
+  // created so `baseConfig.permissionEngine` is never undefined.
+  permissionEngine?: PermissionEngine;
 }
 
 const makeBootstrapStub = (
@@ -127,6 +135,9 @@ const makeBootstrapStub = (
     },
     memoryRegistry: makeStubRegistry(memoryCount),
     skillCatalog: { count: () => skillCount },
+    permissionEngine:
+      opts.permissionEngine ??
+      createPermissionEngine({ defaults: { mode: 'strict' }, tools: {} }, { cwd }),
     ...(opts.broker !== undefined ? { broker: opts.broker } : {}),
   } as unknown as HarnessConfig;
   return {
@@ -387,6 +398,38 @@ describe('repl — boot + smoke', () => {
         configurable: true,
       });
     }
+  });
+
+  test('Shift+Tab toggles the approval posture (Supervised ↔ Autonomous)', async () => {
+    // The editor handler maps Shift+Tab (ESC[Z) to
+    // engine.setApprovalPosture. The engine is the source of truth, so
+    // we assert on it directly — the footer cue is covered by the
+    // render tests and the mode:change reducer test.
+    const engine = createPermissionEngine(
+      { defaults: { mode: 'strict' }, tools: {} },
+      { cwd: '/tmp/forja-repl-test' },
+    );
+    expect(engine.approvalPosture()).toBe('supervised');
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ permissionEngine: engine }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+    });
+    await tick();
+    stdin.feed('\x1b[Z'); // Shift+Tab
+    await tick();
+    expect(engine.approvalPosture()).toBe('autonomous');
+    stdin.feed('\x1b[Z'); // Shift+Tab again — back to supervised
+    await tick();
+    expect(engine.approvalPosture()).toBe('supervised');
+    // Both transitions recorded for introspection / audit.
+    expect(engine.postureLog()).toHaveLength(2);
+    // Exit cleanly (Ctrl+D / EOF on an empty buffer).
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
   });
 
   test('idle raw-mode Ctrl+C double-tap exits 130 (UI.md §5.4 gate)', async () => {

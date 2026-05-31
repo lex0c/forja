@@ -767,7 +767,6 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   const buildAdapterCtx = () => {
     const budget = effectiveBudget(baseConfig.budget);
     return {
-      profile: 'autonomous' as const,
       project,
       model: baseConfig.provider.id,
       maxSteps: budget.maxSteps,
@@ -1894,6 +1893,41 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // a new turn.
     if (exiting) return true;
 
+    // Operation-mode toggle (Shift+Tab): flip the approval posture
+    // (Supervised ↔ Autonomous). Guarded so it only fires in the
+    // normal edit state — a modal (modal-manager handler, pushed above
+    // this one) intercepts Shift+Tab for option navigation, while the
+    // reverse-search and slash sub-interactions own the keyboard while
+    // open. Ctrl+Tab is unreliable across terminals (often unreported);
+    // Shift+Tab is the de-facto mode-cycle key and is already parsed
+    // (keys.ts). The engine is the source of truth — it applies on the
+    // next check(); the bus event repaints the footer cue.
+    if (
+      key.kind === 'key' &&
+      key.name === 'tab' &&
+      key.shift === true &&
+      !isReverseSearchOpen() &&
+      !slashOpen
+    ) {
+      const engine = baseConfig.permissionEngine;
+      const target = engine.approvalPosture() === 'supervised' ? 'autonomous' : 'supervised';
+      try {
+        engine.setApprovalPosture(target, 'operator toggle (shift+tab)');
+      } catch (err) {
+        bus.emit({
+          type: 'warn',
+          ts: now(),
+          message: `could not change operation mode: ${(err as Error).message}`,
+        });
+      }
+      // Mirror whatever the engine actually settled on — a refused
+      // toggle (non-ready engine) or a failed audit leaves the posture
+      // unchanged, so reading it back keeps the footer honest.
+      bus.emit({ type: 'mode:change', ts: now(), posture: engine.approvalPosture() });
+      cancelExitArm();
+      return true;
+    }
+
     // Reverse-search overlay (HISTORY.md §2.2). When the overlay is
     // open it owns the keyboard absolutely — the operator's draft
     // buffer is preserved in `state.input` (rendered dim below the
@@ -2495,6 +2529,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     maxOutputTokens: resolveMaxOutputTokens(effectiveBudget(baseConfig.budget), providerCaps),
     cwd: baseConfig.cwd,
     env,
+    // Seed the footer's operation-mode cue from the engine's posture so
+    // a `--autonomous` boot shows Autonomous from the first frame.
+    operationMode: baseConfig.permissionEngine.approvalPosture(),
     // §13.7 — when sandbox enforcement is active, append the line
     // inline inside the banner block (secondary, no leading blank).
     // The non-active states ride warn/error events below.

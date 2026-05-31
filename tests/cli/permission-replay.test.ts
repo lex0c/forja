@@ -4,7 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs } from '../../src/cli/args.ts';
 import { runPermissionReplay } from '../../src/cli/permission-replay.ts';
-import { createSqliteSink, ensureInstallId } from '../../src/permissions/index.ts';
+import {
+  type ReasonChainEntry,
+  createSqliteSink,
+  ensureInstallId,
+} from '../../src/permissions/index.ts';
 import { MIGRATIONS, migrate, openDb } from '../../src/storage/index.ts';
 
 const captured = () => {
@@ -965,6 +969,10 @@ describe('runPermissionReplay — --against-current-policy decision coverage (sl
     decision: 'allow' | 'deny' | 'confirm';
     args: Record<string, unknown>;
     toolName?: string;
+    // Defaults to a lone engine-default stage. Tests exercising posture
+    // reconstruction pass a chain carrying an `approval-posture` stage —
+    // what an autonomous auto-approval stamps onto the row.
+    reasonChain?: ReasonChainEntry[];
   }): Promise<number> => {
     const identity = ensureInstallId({ env });
     const db = openDb(dbPath);
@@ -998,7 +1006,7 @@ describe('runPermissionReplay — --against-current-policy decision coverage (sl
       args: params.args,
       decision: params.decision,
       policy_hash: 'sha256:fixture',
-      reason_chain: [{ stage: 'engine-default' }],
+      reason_chain: params.reasonChain ?? [{ stage: 'engine-default' }],
       capabilities:
         toolName === 'bash'
           ? ['exec:shell', `read-fs:${tmp}`]
@@ -1190,6 +1198,93 @@ tools:
     expect(acp.caveats.length).toBeGreaterThan(0);
     expect(acp.caveats.some((c) => c.includes('classifier'))).toBe(true);
   });
+
+  // Regression (posture): a row the live engine autonomously
+  // auto-approved is recorded as `allow`, with an `approval-posture`
+  // stage in its reason chain. Re-execution must reconstruct that
+  // posture so the SAME low-risk policy `confirm` rule auto-approves
+  // again and reproduces the `allow`. Before the fix the disposable
+  // engine defaulted to supervised, returned `confirm`, and the replay
+  // cried `changed_decision` on a policy that never drifted.
+  test('autonomous auto-approved allow row reproduces → deterministic (no fabricated drift)', async () => {
+    const { mkdirSync } = await import('node:fs');
+    mkdirSync(join(tmp, '.agent'), { recursive: true });
+    writeFileSync(
+      join(tmp, '.agent', 'permissions.yaml'),
+      `defaults:
+  mode: strict
+tools:
+  bash:
+    confirm:
+      - "git status"
+`,
+    );
+    const seq = await seedRowWithDecision({
+      decision: 'allow',
+      args: { command: 'git status' },
+      reasonChain: [
+        { stage: 'engine-default' },
+        { stage: 'approval-posture', note: 'autonomous: auto-approved policy confirm' },
+      ],
+    });
+
+    const out = captured();
+    const code = await runPermissionReplay({
+      seq,
+      againstCurrentPolicy: true,
+      dbPath,
+      env,
+      cwd: tmp,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    const text = out.lines.join('');
+    expect(text).toContain('original decision:         allow');
+    expect(text).toContain('replayed decision:         allow');
+    expect(text).toContain('✓ deterministic');
+    expect(text).not.toContain('changed the decision');
+    // The reconstructed-posture caveat keeps the verdict honest.
+    expect(text).toContain('approval posture (autonomous) reconstructed from the reason chain');
+  });
+
+  // Control: a supervised row (no approval-posture stage) re-executes
+  // under the default supervised posture, so the same confirm rule
+  // stays `confirm` and the posture caveat is absent.
+  test('supervised confirm row keeps confirm and gains no posture caveat', async () => {
+    const { mkdirSync } = await import('node:fs');
+    mkdirSync(join(tmp, '.agent'), { recursive: true });
+    writeFileSync(
+      join(tmp, '.agent', 'permissions.yaml'),
+      `defaults:
+  mode: strict
+tools:
+  bash:
+    confirm:
+      - "git status"
+`,
+    );
+    const seq = await seedRowWithDecision({
+      decision: 'confirm',
+      args: { command: 'git status' },
+    });
+
+    const out = captured();
+    const code = await runPermissionReplay({
+      seq,
+      againstCurrentPolicy: true,
+      dbPath,
+      env,
+      cwd: tmp,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    const text = out.lines.join('');
+    expect(text).toContain('replayed decision:         confirm');
+    expect(text).toContain('✓ deterministic');
+    expect(text).not.toContain('approval posture (autonomous) reconstructed');
+  });
 });
 
 // Slice 96 — §17 canonical reproducibility mode. Re-runs the row
@@ -1220,6 +1315,7 @@ describe('runPermissionReplay — --against-archived-policy (slice 96, R11 #34)'
     decision: 'allow' | 'deny' | 'confirm';
     args: Record<string, unknown>;
     policyYaml: string;
+    reasonChain?: ReasonChainEntry[];
   }): Promise<{ seq: number; policyHash: string }> => {
     const identity = ensureInstallId({ env });
     const db = openDb(dbPath);
@@ -1270,7 +1366,7 @@ describe('runPermissionReplay — --against-archived-policy (slice 96, R11 #34)'
       args: params.args,
       decision: params.decision,
       policy_hash: policyHash,
-      reason_chain: [{ stage: 'engine-default' }],
+      reason_chain: params.reasonChain ?? [{ stage: 'engine-default' }],
       capabilities: ['exec:shell', `read-fs:${tmp}`],
       score: 0,
       score_components: {},
@@ -1509,5 +1605,44 @@ tools:
     });
     expect(code).toBe(0);
     expect(out.lines.join('')).not.toContain('Re-execution against ARCHIVED policy');
+  });
+
+  // Regression (posture): the same fix on the canonical archived-policy
+  // path. An autonomous auto-approved `allow`, re-executed against the
+  // EXACT archived bytes, must reconstruct the posture and reproduce
+  // `allow` — not regress to a fabricated divergence.
+  test('autonomous auto-approved allow row reproduces against archived policy → deterministic', async () => {
+    const { seq } = await seedRowWithArchivedPolicy({
+      decision: 'allow',
+      args: { command: 'git status' },
+      policyYaml: `defaults:
+  mode: strict
+tools:
+  bash:
+    confirm:
+      - "git status"
+`,
+      reasonChain: [
+        { stage: 'engine-default' },
+        { stage: 'approval-posture', note: 'autonomous: auto-approved policy confirm' },
+      ],
+    });
+    const out = captured();
+    const code = await runPermissionReplay({
+      seq,
+      againstArchivedPolicy: true,
+      dbPath,
+      env,
+      cwd: tmp,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    const text = out.lines.join('');
+    expect(text).toContain('original decision:         allow');
+    expect(text).toContain('replayed decision:         allow');
+    expect(text).toContain('✓ deterministic');
+    expect(text).not.toContain('diverges from row');
+    expect(text).toContain('approval posture (autonomous) reconstructed from the reason chain');
   });
 });

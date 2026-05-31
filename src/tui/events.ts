@@ -15,7 +15,7 @@
 // and HarnessEvent diverge in shape, an adapter sits between them
 // (introduced in a later step).
 
-import type { PolicyLayer } from '../permissions/index.ts';
+import type { ApprovalPosture, PolicyLayer } from '../permissions/index.ts';
 
 // Common metadata. `ts` is wall-clock ms since epoch — useful for
 // rendering "elapsed" without the renderer holding its own clock.
@@ -29,7 +29,6 @@ export type SessionStartEvent = BaseEvent & {
   sessionId: string;
   // Source-of-truth for status line render. Most fields stay
   // constant for the session; cost/steps update via step:budget.
-  profile: 'autonomous' | 'orchestrated' | 'hybrid';
   project: string;
   model: string;
   // Plan mode (read-only profile, harness refuses write tools).
@@ -82,6 +81,11 @@ export type SessionBannerEvent = BaseEvent & {
   // `sandbox-exec`); omitted when enforcement is disabled (the
   // warn/error event surfaces it explicitly instead).
   sandboxActive?: 'bwrap' | 'sandbox-exec';
+  // Initial approval posture (Supervised / Autonomous) at boot, so the
+  // footer cue is correct from the first frame (e.g. under
+  // `--autonomous`). Optional — absent keeps the reducer's current
+  // value (supervised default). Runtime flips ride `mode:change`.
+  operationMode?: ApprovalPosture;
 };
 export type SessionEndEvent = BaseEvent & {
   type: 'session:end';
@@ -743,8 +747,19 @@ export type InterruptExitCancelEvent = BaseEvent & {
 
 // Discriminated union — the renderer matches on `type` and the
 // compiler narrows the payload.
+// Operator flipped the approval posture (Supervised ↔ Autonomous),
+// shown in the footer in place of the help cue (UI.md §4.10.6). Emitted
+// by the REPL when the operator toggles (Shift+Tab). The permission
+// engine is the source of truth; this event mirrors the new posture
+// into live state so the footer repaints.
+export type OperationModeChangeEvent = BaseEvent & {
+  type: 'mode:change';
+  posture: ApprovalPosture;
+};
+
 export type UIEvent =
   | SessionStartEvent
+  | OperationModeChangeEvent
   | SessionBannerEvent
   | SessionEndEvent
   | UserSubmitEvent

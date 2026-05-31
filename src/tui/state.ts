@@ -15,6 +15,7 @@
 // todo events accept silently and land alongside their render
 // functions.
 
+import type { ApprovalPosture } from '../permissions/index.ts';
 import { sanitizeOneLineForDisplay } from '../sanitize/ansi.ts';
 import type { SessionBannerEnvEntry, TodoItemForUI, UIEvent } from './events.ts';
 import {
@@ -112,7 +113,6 @@ export interface ActiveTool {
 
 export interface StatusState {
   sessionId: string | null;
-  profile: string | null;
   project: string | null;
   model: string | null;
   steps: number;
@@ -125,6 +125,12 @@ export interface StatusState {
   // column as a `plan` token between model and budget. Default false
   // on createInitialState; flipped by `session:start.planMode`.
   planMode: boolean;
+  // Approval posture (Supervised / Autonomous) shown in the footer in
+  // place of the help cue. Default 'supervised' on createInitialState;
+  // seeded by `session:start.operationMode`, flipped at runtime by
+  // `mode:change`. The permission engine is the source of truth — this
+  // is the rendered mirror.
+  operationMode: ApprovalPosture;
   // Distinct-name memory count for the footer's `mem N` segment.
   // Snapshot at session:start; mid-session
   // memory_write success could bump the count, but we keep the
@@ -142,15 +148,6 @@ export interface StatusState {
   // inputTokens + cacheRead + cacheCreation of the latest turn —
   // what occupied the context window when the model generated.
   lastTurnContextTokens: number;
-  // Cache breakdown across the whole REPL session. Hit-rate chip
-  // reads `sessionCacheRead / (sessionCacheRead + sessionCacheCreation
-  // + sessionUncachedInput)` — fraction of input that arrived cached.
-  // The three categories are mutually exclusive on the Anthropic
-  // shape (input = paid full rate; cacheRead = paid 0.1×; cacheCreation
-  // = paid 1.25×), so their sum is the canonical "input billed" total.
-  sessionCacheRead: number;
-  sessionCacheCreation: number;
-  sessionUncachedInput: number;
 }
 
 export interface PendingAssistant {
@@ -480,7 +477,6 @@ export const createInitialState = (): LiveState => ({
   input: { value: '', cursor: 0 },
   status: {
     sessionId: null,
-    profile: null,
     project: null,
     model: null,
     steps: 0,
@@ -488,13 +484,11 @@ export const createInitialState = (): LiveState => ({
     costUsd: 0,
     maxCostUsd: null,
     planMode: false,
+    operationMode: 'supervised',
     memoryCount: 0,
     contextWindow: 0,
     sessionTotalTokens: 0,
     lastTurnContextTokens: 0,
-    sessionCacheRead: 0,
-    sessionCacheCreation: 0,
-    sessionUncachedInput: 0,
   },
   activeTools: new Map(),
   pendingToolEndBatch: null,
@@ -799,15 +793,26 @@ export const flushPendingToolEndBatch = (
 // case that emits permanent items.
 const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
   switch (event.type) {
+    case 'mode:change':
+      // Mirror the engine's new approval posture into status so the
+      // footer repaints. No scrollback line — the footer cue is the
+      // whole signal (UI.md §4.10.6).
+      return {
+        state: { ...state, status: { ...state.status, operationMode: event.posture } },
+        permanent: [],
+      };
     case 'session:start': {
       const status: StatusState = {
         ...state.status,
         sessionId: event.sessionId,
-        profile: event.profile,
         project: event.project,
         model: event.model,
         planMode: event.planMode === true,
         memoryCount: event.memoryCount ?? 0,
+        // operationMode is intentionally NOT touched here: it's seeded
+        // at boot by session:banner and flipped by mode:change. A bare
+        // session:start (each REPL submit) must preserve it via the
+        // `...state.status` spread, never reset it.
       };
       // Boundary cleanup: soft-interrupt state and bg processes are
       // both per-session. A fresh session starts clean even if the
@@ -934,6 +939,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             ...state.status,
             model: event.model,
             contextWindow: event.contextWindow,
+            operationMode: event.operationMode ?? state.status.operationMode,
           },
         },
         permanent: [
@@ -1061,9 +1067,6 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         // Fallback to the prior value when the turn yielded no usage
         // event (provider edge case) so the chip doesn't flicker to 0%.
         lastTurnContextTokens: turnContext > 0 ? turnContext : state.status.lastTurnContextTokens,
-        sessionUncachedInput: state.status.sessionUncachedInput + input,
-        sessionCacheRead: state.status.sessionCacheRead + cacheRead,
-        sessionCacheCreation: state.status.sessionCacheCreation + cacheCreation,
       };
       // Emit a permanent ONLY when there's prose to land in
       // scrollback. Tool-only turns (Anthropic emits tool_use

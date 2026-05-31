@@ -3,7 +3,7 @@ import type { Decision, PermissionsView } from '../../src/permissions/index.ts';
 import { scrubEnv } from '../../src/sanitize/index.ts';
 import type { ToolContext } from '../../src/tools/types.ts';
 
-const defaultView = (): PermissionsView => ({ mode: 'strict' });
+const defaultView = (): PermissionsView => ({ mode: 'strict', posture: 'supervised' });
 
 // Default permission predicate for tests: allow everything. Tests
 // that exercise leaf-gating (deny paths) override via the

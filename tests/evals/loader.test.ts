@@ -144,6 +144,33 @@ budget:
     expect(c.budget).toEqual({ maxSteps: 7, maxCostUsd: 0.05 });
   });
 
+  test('parses setup.approvalPosture (operation-mode)', () => {
+    const yaml = `
+name: x
+prompt: y
+setup:
+  approvalPosture: autonomous
+expect:
+  - status: done
+`;
+    const c = parseEvalCase(yaml, '/tmp/c.yaml');
+    expect(c.setup?.approvalPosture).toBe('autonomous');
+  });
+
+  test('rejects invalid setup.approvalPosture', () => {
+    const yaml = `
+name: x
+prompt: y
+setup:
+  approvalPosture: yolo
+expect:
+  - status: done
+`;
+    expect(() => parseEvalCase(yaml, '/tmp/c.yaml')).toThrow(
+      /approvalPosture must be 'supervised' or 'autonomous'/,
+    );
+  });
+
   test('parses compaction budget knobs', () => {
     const yaml = `
 name: x

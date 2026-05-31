@@ -111,7 +111,7 @@ describe('plain renderer', () => {
     renderer.onEvent({
       type: 'tool_decided',
       toolUseId: 'tu2',
-      decision: { kind: 'confirm', prompt: 'Run bash: rm -rf /' },
+      decision: { kind: 'confirm', confirmCause: 'policy', prompt: 'Run bash: rm -rf /' },
     });
     const all = cap.err.join('');
     expect(all).toContain('denied: no rule matched');

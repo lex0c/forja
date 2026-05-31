@@ -396,6 +396,9 @@ export const executeCase = async (
       // when stochasticity is the property under test.
       temperature: 0,
       ...(caseDef.plan === true ? { plan: true } : {}),
+      ...(caseDef.setup?.approvalPosture !== undefined
+        ? { approvalPosture: caseDef.setup.approvalPosture }
+        : {}),
       ...(caseDef.budget !== undefined
         ? {
             budget: {

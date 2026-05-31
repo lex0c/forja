@@ -321,6 +321,10 @@ export const dispatchSemanticVerify = async (
       provider: input.provider,
       parentToolRegistry: input.parentToolRegistry,
       permissionEngine: input.permissionEngine,
+      // Governance verify subagents never inherit autonomous — they
+      // scan possibly-injected memory and aren't the operator's
+      // delegated work. Always Supervised (fail-closed).
+      inheritApprovalPosture: false,
       db,
       cwd: input.cwd,
       // R1: open the IPC channel so softStopSignal can actually

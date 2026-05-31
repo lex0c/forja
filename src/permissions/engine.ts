@@ -59,7 +59,9 @@ import {
   isRejectingState,
 } from './state-machine.ts';
 import type {
+  ApprovalPosture,
   BashPolicy,
+  ConfirmCause,
   Decision,
   FetchPolicy,
   PathPolicy,
@@ -70,6 +72,7 @@ import type {
   PolicyMode,
   PolicySource,
   PolicyToolsSection,
+  PostureChange,
 } from './types.ts';
 
 export interface EngineOptions {
@@ -111,6 +114,13 @@ export interface EngineOptions {
   // for tests; production bootstrap passes the active session id
   // from the harness loop.
   sessionId?: string;
+  // Initial approval posture (Supervised / Autonomous). Default
+  // 'supervised' — the safe, ask-first stance. Production bootstrap
+  // passes the operator's choice (CLI flag); headless/non-TTY callers
+  // and tests fall through to supervised (fail-closed). Mutable at
+  // runtime via `setApprovalPosture` — this only seeds the initial
+  // value.
+  approvalPosture?: ApprovalPosture;
   // Initial state. Default `ready` for backward-compatible test
   // ergonomics — every existing test that builds an engine
   // directly keeps working. Production bootstrap injects a
@@ -289,6 +299,21 @@ export interface PermissionEngine {
   check(toolName: string, category: PolicyCategory, args: ToolArgs): Decision;
   view(): PermissionsView;
   mode(): PolicyMode;
+  // Current approval posture. Supervised (default) opens the modal for
+  // every confirmable decision; autonomous auto-approves routine
+  // `policy` confirms (see ApprovalPosture / ConfirmCause). Read by the
+  // TUI footer and by the harness when seeding live state.
+  approvalPosture(): ApprovalPosture;
+  // Flip the posture at runtime (operator toggle / CLI). No-op when
+  // `next` equals the current posture. `reason` is recorded on the
+  // transition (postureLog) for introspection + audit. Takes effect on
+  // the NEXT check() — single-threaded JS means no in-flight check is
+  // interrupted, same contract as reloadPolicy.
+  setApprovalPosture(next: ApprovalPosture, reason: string): void;
+  // Append-only log of posture transitions this session (oldest
+  // first). Backs `/perms`-style introspection and the durable audit
+  // (Slice 3). Returns a shallow copy.
+  postureLog(): readonly PostureChange[];
   // Atomic policy swap. The new policy MUST be a Policy object the
   // caller already resolved + validated (lock conflicts, hierarchy
   // merge, etc); the engine does minimal shape checks and
@@ -668,6 +693,9 @@ const checkBash = (
   if (containsShellInjection(command)) {
     return {
       kind: 'confirm',
+      // Risk signal (compound / shell-injection shape), not a routine
+      // policy rule — never auto-approved by autonomous posture.
+      confirmCause: 'compound',
       prompt: `Run bash: ${promptCommand}`,
       reason:
         'compound shell command (contains ; && || | $(...) or backticks) — confirming explicitly to surface the literal command',
@@ -687,6 +715,7 @@ const checkBash = (
   if (confirm !== null) {
     return {
       kind: 'confirm',
+      confirmCause: 'policy',
       prompt: `Run bash: ${promptCommand}`,
       reason: `matched confirm rule: ${confirm}`,
       source: { layer, rule: confirm, section: 'bash' },
@@ -852,6 +881,7 @@ const checkPath = (
     if (protectedTier === 'escalate') {
       return {
         kind: 'confirm',
+        confirmCause: 'escalate',
         prompt: `Write to ${path}? (protected path)`,
         reason: `path matched grant ${grantMatch.id} (${grantMatch.scope_value}) but is in protected zone; escalated to confirm per §11`,
         source: { layer: 'session', rule: grantMatch.id, section: 'grants' },
@@ -875,6 +905,7 @@ const checkPath = (
     if (protectedTier === 'escalate') {
       return {
         kind: 'confirm',
+        confirmCause: 'escalate',
         prompt: `Write to ${path}? (protected path)`,
         reason: `path matched session-allow '${sessionMatched}' but is in protected zone; escalated to confirm per §11`,
         source: { layer: 'session', rule: sessionMatched, section: sectionName },
@@ -891,6 +922,7 @@ const checkPath = (
     if (protectedTier === 'escalate') {
       return {
         kind: 'confirm',
+        confirmCause: 'escalate',
         prompt: `Write to ${path}? (protected path)`,
         reason: `path matched allow rule '${allowed}' but is in protected zone; escalated to confirm per §11`,
         source: { layer, rule: allowed, section: sectionName },
@@ -919,6 +951,9 @@ const checkPath = (
     }
     return {
       kind: 'confirm',
+      // Protected-tier escalate overrode an allow/confirm rule on a
+      // write — a safety floor, not a routine policy confirm.
+      confirmCause: protectedTier === 'escalate' ? 'escalate' : 'policy',
       prompt: `${isWrite ? 'Write to' : 'Read from'} ${path}?${protectedTier === 'escalate' ? ' (protected path)' : ''}`,
       reason: `matched confirm rule: ${confirm}`,
       source: { layer, rule: confirm, section: sectionName },
@@ -1064,21 +1099,25 @@ const decisionToAuditEnum = (kind: Decision['kind']): 'allow' | 'deny' | 'confir
 //
 // `detail` carries the metric for the audit row + modal preview
 // (e.g., `score=0.62 >= 0.40`, `confidence=low`, `conservative: <reason>`).
-type ConfirmCause = 'degraded' | 'score' | 'resolver';
+// The subset of ConfirmCause this helper can stamp. `Extract` keeps it
+// pinned to the public union: drop one of these three from ConfirmCause
+// and this type (and the Records below) fail to compile rather than
+// drift silently.
+type DegradeCause = Extract<ConfirmCause, 'degraded' | 'score' | 'resolver'>;
 
 const degradeAllowToConfirm = (
   decision: Decision,
-  cause: ConfirmCause,
+  cause: DegradeCause,
   detail: string,
 ): Decision => {
   if (decision.kind !== 'allow') return decision;
   const baseReason = decision.reason ?? 'allow';
-  const prompts: Record<ConfirmCause, string> = {
+  const prompts: Record<DegradeCause, string> = {
     degraded: 'Engine is in degraded mode — confirm before continuing.',
     score: `Risk score forced confirm (${detail}). Review before continuing.`,
     resolver: `Resolver forced confirm (${detail}). Review before continuing.`,
   };
-  const reasons: Record<ConfirmCause, string> = {
+  const reasons: Record<DegradeCause, string> = {
     degraded: `degraded state forced confirm (was: ${baseReason})`,
     score: `score gate forced confirm (${detail}; was: ${baseReason})`,
     resolver: `resolver gate forced confirm (${detail}; was: ${baseReason})`,
@@ -1086,9 +1125,33 @@ const degradeAllowToConfirm = (
   return {
     ...decision,
     kind: 'confirm',
+    // The upgrade cause IS the confirm cause — degraded/score/resolver
+    // are all risk signals, so none of them is auto-approvable.
+    confirmCause: cause,
     prompt: prompts[cause],
     reason: reasons[cause],
   };
+};
+
+// Inverse of degradeAllowToConfirm for the autonomous posture: a
+// routine `policy` confirm becomes an allow so it clears without a
+// modal. ONLY 'policy' is auto-approved — every other cause
+// (compound/escalate/score/resolver/degraded) is a risk/safety signal
+// and passes through unchanged (fail-closed: an unrecognized future
+// cause stays a confirm too). Preserves source attribution + carried
+// DecisionBase fields so the audit row still names the rule that
+// matched; the reason records that POSTURE, not the rule, cleared it.
+// Caller only invokes this when the engine is `ready` — degraded
+// suspends auto-approval.
+const autoApprovePolicyConfirm = (decision: Decision): Decision => {
+  if (decision.kind !== 'confirm' || decision.confirmCause !== 'policy') return decision;
+  const allow: Extract<Decision, { kind: 'allow' }> = {
+    kind: 'allow',
+    reason: `autonomous posture: auto-approved policy confirm (was: ${decision.reason ?? 'confirm'})`,
+  };
+  if (decision.source !== undefined) allow.source = decision.source;
+  if (decision.ttlExpiresAt !== undefined) allow.ttlExpiresAt = decision.ttlExpiresAt;
+  return allow;
 };
 
 // Optional reason-chain entry appended when the engine intercepts a
@@ -1282,6 +1345,10 @@ export const createPermissionEngine = (
   // but the engine needs a concrete value. Default to strict — same
   // policy as the empty-file fallback.
   let mode: PolicyMode = policy.defaults.mode ?? 'strict';
+  // Approval posture is a runtime axis orthogonal to `mode` (it comes
+  // from EngineOptions / the operator toggle, not from policy YAML).
+  // Seeds from options; defaults to the safe supervised stance.
+  let posture: ApprovalPosture = options.approvalPosture ?? 'supervised';
   const cwd = options.cwd;
   const home = options.home ?? process.env.HOME ?? cwd;
   // Mutable so reloadPolicy can swap. A const would make every
@@ -1356,6 +1423,11 @@ export const createPermissionEngine = (
   // now operator restarts the session to revoke trust).
   const sessionAllow = new Map<keyof PolicyToolsSection, string[]>();
 
+  // Posture transition log (append-only, oldest first). Slice 3 drains
+  // it into durable audit; until then it preserves each transition's
+  // reason and powers introspection + the setter tests.
+  const postureChanges: PostureChange[] = [];
+
   const emitAudit = (
     toolName: string,
     args: ToolArgs,
@@ -1427,6 +1499,44 @@ export const createPermissionEngine = (
       capabilityKinds: Array.from(kindSet),
     });
     return emitted;
+  };
+
+  // Posture-change admin row. Same shape as bootstrap's
+  // chain-break-accepted / policy-reloaded rows: tool_name=
+  // 'permission-engine', decision='allow' (the operator authorized the
+  // flip), every pipeline signal empty, the transition captured in
+  // `args` + `reason_chain`. This keeps Supervised↔Autonomous changes
+  // in the SAME tamper-evident ledger as the decisions they govern,
+  // rather than a side table outside the hash chain. Bypasses
+  // `emitAudit` on purpose — a posture change must not enter the
+  // classifier ring buffer (it's not a tool decision). No-op under the
+  // noop sink (tests/headless), where `audit.emit` returns the
+  // sentinel.
+  const emitPostureChangeRow = (
+    from: ApprovalPosture,
+    to: ApprovalPosture,
+    reason: string,
+  ): void => {
+    audit.emit({
+      session_id: sessionId,
+      tool_name: 'permission-engine',
+      args: { posture_from: from, posture_to: to, reason },
+      decision: 'allow',
+      policy_hash: policyHash,
+      reason_chain: [{ stage: 'posture-change', note: `from=${from} to=${to}: ${reason}` }],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
+      // No explicit `ts`: let the sink stamp Date.now, like every other
+      // emitAudit row. Injecting the engine's `now` seam here — while the
+      // sink validates timestamps against real wall-clock — was the only
+      // emit site that could trip the skew guard under a deterministic
+      // clock (replay / tests).
+    });
   };
 
   // Attach `approvalSeq` to a Decision so the harness can link the
@@ -1915,6 +2025,7 @@ export const createPermissionEngine = (
       if (bypassProtectedTier === 'escalate') {
         bypassDecision = {
           kind: 'confirm',
+          confirmCause: 'escalate',
           prompt: `${toolName} on protected path: ${bypassProtectedTarget}`,
           reason: `bypass mode still escalates §11 protected paths: ${bypassProtectedTarget}`,
           source: { layer: 'default', section: 'protected' },
@@ -2084,6 +2195,44 @@ export const createPermissionEngine = (
         approvalGateDetail(score, gateConfidence, scoreConfirmThreshold),
       );
     }
+    // Autonomous posture clears a routine `policy` confirm without the
+    // modal. Runs LAST — after every allow→confirm upgrade — and stays
+    // honest via three floors:
+    //   - autoApprovePolicyConfirm only touches confirmCause==='policy';
+    //     compound/escalate/score/resolver/degraded confirms pass
+    //     through as modals.
+    //   - the policy confirm must ITSELF be low-risk: a `confirm`-rule
+    //     match that also trips the score / resolver gate is held.
+    //     Required because `degradeAllowToConfirm` only upgrades
+    //     `allow`s — it returns an existing `confirm` unchanged — so a
+    //     high-risk confirm keeps cause 'policy' and would otherwise
+    //     slip through, the perverse asymmetry where a stricter
+    //     `confirm` rule got LESS protection than an `allow` rule.
+    //   - suspended while degraded: a subsystem-health signal re-arms
+    //     the modal for everything, posture included (the same reason
+    //     degraded upgrades allow→confirm above). We read the LIVE
+    //     state here, NOT the `currentState` snapshot taken at the top
+    //     of check(): a `classifierRequired` failure transitions the
+    //     engine to degraded MID-check (in the classifier block above),
+    //     and the snapshot would still read `ready` — auto-approving on
+    //     the very check that degraded. The live read suspends
+    //     auto-approval on that check too. Rejecting states already
+    //     returned far above and the classifier path only transitions
+    //     to `degraded`, so `ready` is the only clearing value here.
+    const liveState = stateController.get();
+    const policyConfirmIsRisky =
+      score >= scoreConfirmThreshold || gateConfidence === 'low' || resolverForcesConfirm;
+    let postureAutoApproved = false;
+    if (
+      posture === 'autonomous' &&
+      liveState === 'ready' &&
+      decision.kind === 'confirm' &&
+      decision.confirmCause === 'policy' &&
+      !policyConfirmIsRisky
+    ) {
+      decision = autoApprovePolicyConfirm(decision);
+      postureAutoApproved = true;
+    }
     const stages: ReasonChainEntry[] = [];
     if (classifierStage !== null) stages.push(classifierStage);
     if (sandboxStage !== null) stages.push(sandboxStage);
@@ -2101,6 +2250,11 @@ export const createPermissionEngine = (
       tailStage = approvalGateStageEntry(score, gateConfidence, scoreConfirmThreshold);
     }
     if (tailStage !== undefined) stages.push(tailStage);
+    // Trace the posture auto-approval so the audit row's `allow` is
+    // attributable to the autonomous toggle, not just the matched rule.
+    if (postureAutoApproved) {
+      stages.push({ stage: 'approval-posture', note: 'autonomous: auto-approved policy confirm' });
+    }
     const e = emitAudit(
       toolName,
       args,
@@ -2115,7 +2269,7 @@ export const createPermissionEngine = (
     return withSandboxProfile(withApprovalSeq(decision, e.seq), sandboxProfile);
   };
 
-  const view = (): PermissionsView => ({ mode });
+  const view = (): PermissionsView => ({ mode, posture });
 
   const addSessionAllow = (section: keyof PolicyToolsSection, pattern: string): void => {
     // Empty/whitespace-only pattern is a programming bug (the
@@ -2145,6 +2299,25 @@ export const createPermissionEngine = (
     check,
     view,
     mode: () => mode,
+    approvalPosture: () => posture,
+    setApprovalPosture: (next, reason) => {
+      if (next === posture) return;
+      // Refuse while the engine isn't ready to extend its own ledger
+      // (init / loading / validating / refusing) — mirrors
+      // reloadPolicy's refusal and avoids recording a posture change
+      // onto a chain the engine considers untrustworthy. Degraded is
+      // allowed: the toggle is inert there (auto-approval is suspended
+      // at check() time) but recording the operator's intent is fine.
+      if (isRejectingState(stateController.get())) return;
+      const from = posture;
+      // Audit FIRST, mutate SECOND. If the row can't be written (skew /
+      // DB error) `emitPostureChangeRow` throws and the posture does NOT
+      // change — live behavior never diverges from the ledger.
+      emitPostureChangeRow(from, next, reason);
+      postureChanges.push({ from, to: next, reason, at: telemetryNow() });
+      posture = next;
+    },
+    postureLog: () => postureChanges.slice(),
     state: () => stateController.get(),
     // Walks history backwards for the most recent transition INTO
     // degraded — that's the root cause until a `restore()` flips

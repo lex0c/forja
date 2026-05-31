@@ -10,6 +10,28 @@ export type PolicyCategory = 'fs.read' | 'fs.write' | 'bash' | 'web.fetch' | 'mi
 
 export type PolicyMode = 'strict' | 'acceptEdits' | 'bypass';
 
+// Operation mode the operator flips from the prompt (shown as
+// Supervised / Autonomous in the TUI). Orthogonal to PolicyMode: it
+// does not change how a decision is classified, only what happens to a
+// routine `policy` confirm — `supervised` opens the modal (today's
+// behavior), `autonomous` auto-approves it. Every risk-caused confirm
+// (compound/escalate/score/resolver/degraded) still opens the modal in
+// BOTH postures, and the engine suspends auto-approval entirely while
+// degraded. Disambiguated from the execution `profile`
+// (autonomous/orchestrated/hybrid, AGENTIC_CLI §5.2), which decides who
+// orchestrates and is unrelated to this approval axis.
+export type ApprovalPosture = 'supervised' | 'autonomous';
+
+// One recorded Supervised↔Autonomous transition. The engine keeps these
+// in-memory for introspection and (Slice 3) durable audit; `at` is
+// engine-clock millis from the same `now` seam the engine uses.
+export interface PostureChange {
+  from: ApprovalPosture;
+  to: ApprovalPosture;
+  reason: string;
+  at: number;
+}
+
 // Policy rules per category. Each section is optional; absence means "no
 // opinion at this layer" (engine falls through to defaults).
 //
@@ -291,6 +313,22 @@ interface DecisionBase {
   ttlExpiresAt?: number;
 }
 
+// Why a `confirm` decision fired. The approval-posture axis
+// (ApprovalPosture) keys on this: under `autonomous` posture the engine
+// auto-approves ONLY `policy` confirms — every other cause is a
+// risk/safety signal that keeps its modal regardless of posture
+// (fail-closed). It's a typed field rather than something parsed back
+// out of `reason` so the auto-approve rule can never drift on a
+// reworded reason string.
+//   - 'policy'   — matched an operator `confirm` rule (the routine,
+//                  auto-approvable case).
+//   - 'compound' — bash compound / shell-injection guard forced confirm.
+//   - 'escalate' — protected-path `escalate` tier forced confirm.
+//   - 'degraded' — engine degraded forced allow→confirm.
+//   - 'score'    — risk-score / approval-gate forced allow→confirm.
+//   - 'resolver' — resolver conservative / low-confidence forced confirm.
+export type ConfirmCause = 'policy' | 'compound' | 'escalate' | 'degraded' | 'score' | 'resolver';
+
 // What the engine returns from a check. The harness converts `confirm`
 // into a UI prompt at invocation time; without a confirmFn, the harness
 // must default to deny — silently auto-allowing a `confirm` decision is
@@ -298,14 +336,24 @@ interface DecisionBase {
 export type Decision =
   | (DecisionBase & { kind: 'allow'; reason?: string; source?: PolicySource })
   | (DecisionBase & { kind: 'deny'; reason: string; source?: PolicySource })
-  | (DecisionBase & { kind: 'confirm'; prompt: string; reason?: string; source?: PolicySource });
+  | (DecisionBase & {
+      kind: 'confirm';
+      prompt: string;
+      // Why this confirm fired — drives autonomous-posture auto-approval
+      // (only 'policy' is auto-approvable; all else stays a modal). See
+      // ConfirmCause.
+      confirmCause: ConfirmCause;
+      reason?: string;
+      source?: PolicySource;
+    });
 
 // Snapshot view of permissions handed to a tool's ToolContext.
-// Read-only — tools must not mutate. Currently exposes only the
-// active mode; tools that need to short-circuit a multi-step plan
+// Read-only — tools must not mutate. Exposes the active policy mode and
+// approval posture; tools that need to short-circuit a multi-step plan
 // should call back into the engine via the harness with the right
 // tool name (the view can't know which tool's per-tool rules to
 // consult by category alone).
 export interface PermissionsView {
   mode: PolicyMode;
+  posture: ApprovalPosture;
 }

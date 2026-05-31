@@ -1,5 +1,7 @@
 export type {
+  ApprovalPosture,
   BashPolicy,
+  ConfirmCause,
   Decision,
   FetchPolicy,
   PathPolicy,
@@ -11,6 +13,7 @@ export type {
   PolicyMode,
   PolicySource,
   PolicyToolsSection,
+  PostureChange,
   SealMode,
   SealOnFailure,
   SealPolicy,

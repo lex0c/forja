@@ -1,5 +1,5 @@
 import type { HookSpec } from '../../hooks/types.ts';
-import type { Policy } from '../../permissions/index.ts';
+import type { ApprovalPosture, Policy } from '../../permissions/index.ts';
 import type { ContextRecipe, SamplingOverride, ToolRestrictions } from '../../subagents/types.ts';
 import type { DB } from '../db.ts';
 
@@ -142,6 +142,11 @@ export interface SubagentRun {
   //     hop. ON DELETE SET NULL keeps the run row when the approval
   //     itself is retention-swept.
   parentApprovalId: string | null;
+  // Parent's approval posture (Supervised/Autonomous) at spawn time
+  // (operation-mode). Snapshotted like policy/hooks so the child runs
+  // under the posture the operator had when it spawned. Never null on
+  // the read side — getSubagentRun maps a NULL column to 'supervised'.
+  approvalPosture: ApprovalPosture;
   capturedAt: number;
 }
 
@@ -165,6 +170,7 @@ interface SubagentRunRow {
   context_recipe: string | null;
   effective_capabilities: string | null;
   parent_approval_id: string | null;
+  approval_posture: string | null;
   captured_at: number;
 }
 
@@ -391,6 +397,9 @@ const fromRow = (row: SubagentRunRow): SubagentRun => {
     contextRecipe,
     effectiveCapabilities,
     parentApprovalId: row.parent_approval_id,
+    // NULL (legacy / pre-column row) → supervised (fail-closed). The
+    // column CHECK guarantees any non-null value is one of the literals.
+    approvalPosture: row.approval_posture === 'autonomous' ? 'autonomous' : 'supervised',
     capturedAt: row.captured_at,
   };
 };
@@ -490,6 +499,11 @@ export interface InsertSubagentRunInput {
   // approval row exists; the verify-semantic scheduler supplies a
   // synthetic approval id (decided_by='system:semantic_verify').
   parentApprovalId?: string;
+  // Parent's approval posture at spawn. Omitted ⇒ column NULL ⇒ child
+  // reads 'supervised' (fail-closed). The subagent runtime supplies the
+  // parent engine's live posture so an autonomous parent's children
+  // inherit it (operation-mode).
+  approvalPosture?: ApprovalPosture;
   capturedAt?: number;
 }
 
@@ -552,6 +566,7 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
       ? JSON.stringify(input.effectiveCapabilities)
       : null;
   const parentApprovalId = input.parentApprovalId ?? null;
+  const approvalPostureValue = input.approvalPosture ?? null;
   db.query(
     `INSERT INTO subagent_runs
        (session_id, name, scope, source_path, source_sha256, system_prompt,
@@ -559,8 +574,8 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
         budget_max_wall_ms, policy_snapshot, hooks_snapshot,
         tool_restrictions, sampling, reference_paths, output_schema,
         context_recipe, effective_capabilities, parent_approval_id,
-        captured_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        approval_posture, captured_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     input.sessionId,
     input.name,
@@ -581,6 +596,7 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
     contextRecipeJson,
     effectiveCapsJson,
     parentApprovalId,
+    approvalPostureValue,
     capturedAt,
   );
   // Resolve the snapshot for the return value with the same
@@ -611,6 +627,7 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
     effectiveCapabilities:
       input.effectiveCapabilities === undefined ? null : [...input.effectiveCapabilities],
     parentApprovalId,
+    approvalPosture: input.approvalPosture ?? 'supervised',
     capturedAt,
   };
 };
@@ -632,7 +649,7 @@ export const getSubagentRun = (db: DB, sessionId: string): SubagentRun | null =>
               budget_max_wall_ms, policy_snapshot, hooks_snapshot,
               tool_restrictions, sampling, reference_paths, output_schema,
               context_recipe, effective_capabilities, parent_approval_id,
-              captured_at
+              approval_posture, captured_at
          FROM subagent_runs
         WHERE session_id = ?`,
     )

@@ -471,13 +471,13 @@ Sempre 1 linha, dim, **abaixo do input box** (com régua entre eles). Margens si
 
 | Estado | Esquerda | Direita |
 |---|---|---|
-| Idle | `? for help · \+Enter newline` | `<model> · [<tokens>] · [<context%>] · [<cached%>]` |
+| Idle | `<supervised\|autonomous> mode on (shift+tab to change) · \+Enter newline` | `<model> · [<tokens>] · [<context%>] · [<cached%>]` |
 | Idle, exit armed (§5.4) | `Press Ctrl-C again to exit` (`warn`) | (mesmo) |
-| Running | `? for help · \+Enter newline · esc to interrupt` | (mesmo) |
-| Soft-aborted (ainda processando) | `? for help · \+Enter newline · esc again to force` | (mesmo) |
+| Running | `<mode cue> · \+Enter newline · esc to interrupt` | (mesmo) |
+| Soft-aborted (ainda processando) | `<mode cue> · \+Enter newline · esc again to force` | (mesmo) |
 | Modal up | (suprimido — modal cobre footer) | (suprimido) |
 
-Esquerda = **"o que posso fazer agora?"**. Hint de help + interrupt **só quando interruptable**.
+Esquerda = **"em que modo estou e o que posso fazer agora?"**. O cue de **modo de operação** (postura de aprovação, §8.1 do `AGENTIC_CLI`) ocupa a posição que era do `? for help`: **`supervised mode on`** pintado `accent` (azul) ou **`autonomous mode on`** pintado `warn` (amarelo — um "heads up" deliberado), seguido de `(shift+tab to change)` em `secondary`. Shift+Tab alterna a postura; o cue some nos estados slash-popover-aberto e exit-armed (como o help fazia). Interrupt cue **só quando interruptable**.
 
 Direita = **"o que está em vigor?"**. Três chips informacionais "sempre visíveis" assim que o `session:banner` chega (boot), permanecem durante o gap idle entre turns. Ordem fixa:
 
@@ -499,7 +499,7 @@ Direita = **"o que está em vigor?"**. Três chips informacionais "sempre visív
 
 A simplificação é deliberada — footer ficou denso demais com 7+ chips concorrendo pela atenção do operator. Estado removido do footer continua live no audit (`sessions`, `cost_progress_events`, `subagent_runs`) e em modais quando relevante.
 
-Princípio mantido: footer é **status surface, não help surface**. Nada de atalhos ou menu options. Help fica atrás de `?`.
+Princípio mantido: footer é **status surface, não help surface**. Nada de atalhos ou menu options. O `?` (em buffer vazio) continua abrindo o help — perdeu só o cue dedicado no footer, cujo espaço foi pro indicador de modo (mais load-bearing: uma postura de segurança ativa, não um hint estático).
 
 #### 4.10.7 Sub-content connector
 
@@ -604,7 +604,7 @@ Banidos do vocabulário operacional:
 ─────────────────────────────────────────────────────────────────────  ← régua (full width, col 0)
 > ▌                                                                   ← input + cursor (col 0)
 ─────────────────────────────────────────────────────────────────────  ← régua (full width, col 0)
-  ? for help · \+Enter newline · esc to interrupt   anthropic/claude-sonnet-4-6 · 12k tokens · 45% context used  ← footer (padded, 2sp margins each side)
+  supervised mode on · \+Enter newline · esc to interrupt   anthropic/claude-sonnet-4-6 · 12k tokens · 45% context used  ← footer (padded, 2sp margins each side)
 ```
 
 Live region (entre as réguas e a inferior):

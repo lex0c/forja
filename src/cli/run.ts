@@ -735,6 +735,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       ...(resumeFromSessionId !== undefined ? { resumeFromSessionId } : {}),
       ...(args.acceptBrokenChain === true ? { acceptBrokenChain: true } : {}),
       ...(args.sandboxHost === true ? { sandboxHost: true } : {}),
+      ...(args.autonomous === true ? { approvalPosture: 'autonomous' as const } : {}),
       ...(args.brokerMode !== undefined ? { brokerMode: args.brokerMode } : {}),
       // Slice Q — propagate both true AND false (not just true).
       // `undefined` = no CLI override; bootstrap resolves from config
