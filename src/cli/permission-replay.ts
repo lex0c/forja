@@ -47,7 +47,7 @@ import { type Policy, canonicalHash, resolvePolicy } from '../permissions/index.
 // biome-ignore lint/suspicious/noControlCharactersInRegex: rule's purpose IS to match control chars
 const REPLAY_CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g;
 const stripControlChars = (s: string): string => s.replace(REPLAY_CONTROL_CHAR_RE, '');
-import type { ToolArgs } from '../permissions/index.ts';
+import type { ApprovalPosture, ToolArgs } from '../permissions/index.ts';
 import type { Decision, PolicyCategory } from '../permissions/types.ts';
 import { type DB, MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 import { getToolCallByApprovalSeq } from '../storage/repos/approval-call-links.ts';
@@ -264,6 +264,16 @@ const REPLAY_ENGINE_CAVEATS: readonly string[] = [
   'sandbox availability not preserved (replay engine omits the sandbox planner; row.sandbox_profile reflects the original plan)',
 ];
 
+// Caveat appended ONLY when the row was autonomously auto-approved and
+// the engine actually re-ran. The posture is reconstructed from the
+// reason chain (not a persisted column), and the auto-approval
+// eligibility re-check runs without the classifier adjust the live
+// decision saw — so a row whose auto-approval hinged on that adjust may
+// not reproduce. Surfacing it keeps a "deterministic" verdict on an
+// autonomous row honest about HOW it reproduced.
+const AUTONOMOUS_POSTURE_CAVEAT =
+  'approval posture (autonomous) reconstructed from the reason chain, not a persisted column; the auto-approval eligibility re-check runs without the classifier adjust';
+
 interface ReplayResult {
   row: ApprovalLogRow;
   drift: boolean;
@@ -272,6 +282,31 @@ interface ReplayResult {
   againstCurrentPolicy?: AgainstCurrentPolicyAnalysis;
   againstArchivedPolicy?: AgainstArchivedPolicyAnalysis;
 }
+
+// The approvals_log has no `approval_posture` column, but an autonomous
+// auto-approval stamps an `approval-posture` stage into the row's
+// reason chain (engine.ts). Recover the posture from that stage so
+// re-execution reproduces the `allow` the operator's autonomous session
+// produced; otherwise the disposable replay engine defaults to
+// supervised, returns `confirm` for the same low-risk policy rule, and
+// the replay falsely reports `changed_decision` with no policy drift.
+const rowApprovalPosture = (row: ApprovalLogRow): ApprovalPosture => {
+  let entries: unknown;
+  try {
+    entries = safeJsonParse(row.reason_chain_json);
+  } catch {
+    return 'supervised';
+  }
+  if (!Array.isArray(entries)) return 'supervised';
+  return entries.some(
+    (e) =>
+      typeof e === 'object' &&
+      e !== null &&
+      (e as { stage?: unknown }).stage === 'approval-posture',
+  )
+    ? 'autonomous'
+    : 'supervised';
+};
 
 // PERMISSION_ENGINE.md §17 re-execution helper. Pulls together the
 // inputs the engine needs from sibling tables — tool_calls.input
@@ -290,8 +325,13 @@ const tryReExecute = (params: {
   db: DB;
   cwd: string;
   home: string;
+  // Recovered from the row's reason chain (rowApprovalPosture). An
+  // autonomous posture re-runs the auto-approval, reproducing the
+  // `allow` the live session produced for a low-risk policy confirm;
+  // supervised (the default) would return `confirm` and fabricate drift.
+  approvalPosture: ApprovalPosture;
 }): { ok: true; decision: Decision } | { ok: false; reason: string } => {
-  const { row, policy, db, cwd, home } = params;
+  const { row, policy, db, cwd, home, approvalPosture } = params;
 
   const toolCallId = getToolCallByApprovalSeq(db, row.seq);
   if (toolCallId === null) {
@@ -323,6 +363,7 @@ const tryReExecute = (params: {
     cwd,
     home,
     audit: createNoopSink(),
+    approvalPosture,
   });
   try {
     const decision = engine.check(row.tool_name, category, toolCall.input as ToolArgs);
@@ -362,12 +403,18 @@ const analyzeAgainstCurrentPolicy = (params: {
       caveats: REPLAY_ENGINE_CAVEATS,
     };
   }
+  const posture = rowApprovalPosture(params.row);
+  const ranCaveats =
+    posture === 'autonomous'
+      ? [...REPLAY_ENGINE_CAVEATS, AUTONOMOUS_POSTURE_CAVEAT]
+      : REPLAY_ENGINE_CAVEATS;
   const result = tryReExecute({
     row: params.row,
     policy: params.activePolicy,
     db: params.db,
     cwd: session.cwd,
     home: params.home,
+    approvalPosture: posture,
   });
   if (!result.ok) {
     return {
@@ -388,7 +435,7 @@ const analyzeAgainstCurrentPolicy = (params: {
       original_decision,
       replayed_decision: replayedKind,
       replayed_reason: replayedReason,
-      caveats: REPLAY_ENGINE_CAVEATS,
+      caveats: ranCaveats,
     };
   }
   return {
@@ -396,7 +443,7 @@ const analyzeAgainstCurrentPolicy = (params: {
     original_decision,
     replayed_decision: replayedKind,
     replayed_reason: replayedReason,
-    caveats: REPLAY_ENGINE_CAVEATS,
+    caveats: ranCaveats,
   };
 };
 
@@ -462,12 +509,18 @@ const analyzeAgainstArchivedPolicy = (params: {
     };
   }
 
+  const posture = rowApprovalPosture(params.row);
+  const ranCaveats =
+    posture === 'autonomous'
+      ? [...REPLAY_ENGINE_CAVEATS, AUTONOMOUS_POSTURE_CAVEAT]
+      : REPLAY_ENGINE_CAVEATS;
   const result = tryReExecute({
     row: params.row,
     policy: archivedPolicy,
     db: params.db,
     cwd: session.cwd,
     home: params.home,
+    approvalPosture: posture,
   });
   if (!result.ok) {
     return {
@@ -490,7 +543,7 @@ const analyzeAgainstArchivedPolicy = (params: {
       archived_policy_hash,
       replayed_decision: replayedKind,
       replayed_reason: replayedReason,
-      caveats: REPLAY_ENGINE_CAVEATS,
+      caveats: ranCaveats,
     };
   }
   return {
@@ -499,7 +552,7 @@ const analyzeAgainstArchivedPolicy = (params: {
     archived_policy_hash,
     replayed_decision: replayedKind,
     replayed_reason: replayedReason,
-    caveats: REPLAY_ENGINE_CAVEATS,
+    caveats: ranCaveats,
   };
 };
 

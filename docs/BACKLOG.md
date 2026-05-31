@@ -2,6 +2,12 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-30] fix(permissions) — permission-replay fabricated drift on autonomous auto-approvals
+
+Review catch on the posture feature's forensic blind spot. `agent permission replay --against-current-policy` / `--against-archived-policy` build a disposable engine via `tryReExecute` WITHOUT `approvalPosture`, defaulting to supervised. So re-executing a row the autonomous posture had auto-approved (a low-risk policy `confirm` turned `allow`) returned `confirm` again — and the replay reported `changed_decision` (fabricated policy drift) for every autonomous auto-approved routine confirm, even when the policy never moved. The approvals_log has no posture column, but an autonomous auto-approval stamps an `approval-posture` stage into the row's reason chain; `rowApprovalPosture(row)` recovers it and `tryReExecute` re-runs under that posture, reproducing the `allow`. A caveat (`approval posture (autonomous) reconstructed from the reason chain…`) is appended ONLY when the engine actually re-ran under a reconstructed autonomous posture, keeping the "deterministic" verdict honest about HOW it reproduced (the eligibility re-check still runs without the classifier adjust). Tests: current-policy regression + supervised control + archived-policy regression.
+
+**Validated:** typecheck + Biome clean; `tests/cli/permission-replay.test.ts` 54 pass / 0 fail. **Branch:** `feat/operation-mode`.
+
 ## [2026-05-30] fix(permissions) — autonomous auto-approval read a stale engine-state snapshot
 
 Review catch on the committed posture code (`dadb2d6c`). The auto-approval guard tested `currentState` — the engine-state snapshot taken at the top of `check()`. But a `classifierRequired` failure transitions the engine to degraded MID-check (the classifier block calls `stateController.transition('degraded', …)`). So in an autonomous session a low-risk `policy` confirm could be cleared to `allow` on the very check that degraded the engine: the snapshot still read `ready` while the live state was `degraded`, violating the fail-closed "degraded suspends auto-approval" invariant the comment promised. Narrow window (`classifierRequired` is off by default), but a real fail-open. Fixed: the guard now reads the LIVE state (`stateController.get()`) before clearing a policy confirm. Regression test: `classifierRequired` + a failing classifier + autonomous + a `confirm` rule → stays `confirm`, engine degraded.
