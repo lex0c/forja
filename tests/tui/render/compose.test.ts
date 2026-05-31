@@ -28,7 +28,6 @@ const startedSession = (): LiveState => {
     status: {
       ...s.status,
       sessionId: 's1',
-      profile: 'autonomous',
       project: 'forja',
       model: 'opus',
     },

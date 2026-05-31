@@ -13,7 +13,6 @@ const start = (overrides: Partial<UIEvent> = {}): UIEvent =>
     type: 'session:start',
     ts: 1,
     sessionId: 's1',
-    profile: 'autonomous',
     project: 'forja',
     model: 'claude-opus-4-7',
     ...overrides,
@@ -49,7 +48,6 @@ describe('session lifecycle', () => {
     // / cost on the right column.
     const r = applyEvent(createInitialState(), start());
     expect(r.state.status.sessionId).toBe('s1');
-    expect(r.state.status.profile).toBe('autonomous');
     expect(r.state.status.project).toBe('forja');
     expect(r.state.status.model).toBe('claude-opus-4-7');
     expect(r.state.status.planMode).toBe(false);
@@ -398,41 +396,6 @@ describe('assistant streaming', () => {
     expect(result.state.status.sessionTotalTokens).toBe(1800);
     // lastTurnContextTokens = input + cacheRead + cacheCreation = 1600.
     expect(result.state.status.lastTurnContextTokens).toBe(1600);
-    // Cache breakdown — three mutually exclusive categories on the
-    // Anthropic shape. Hit-rate chip in the footer reads these.
-    expect(result.state.status.sessionUncachedInput).toBe(100);
-    expect(result.state.status.sessionCacheRead).toBe(1000);
-    expect(result.state.status.sessionCacheCreation).toBe(500);
-  });
-
-  test('cache breakdown accumulates across turns', () => {
-    const result = drive([
-      { type: 'assistant:start', ts: 1000, messageId: 'm1' },
-      {
-        type: 'assistant:usage',
-        ts: 1100,
-        messageId: 'm1',
-        inputTokens: 50,
-        outputTokens: 10,
-        cacheRead: 200,
-        cacheCreation: 100,
-      },
-      { type: 'assistant:end', ts: 1200, messageId: 'm1' },
-      { type: 'assistant:start', ts: 2000, messageId: 'm2' },
-      {
-        type: 'assistant:usage',
-        ts: 2100,
-        messageId: 'm2',
-        inputTokens: 30,
-        outputTokens: 10,
-        cacheRead: 800,
-        cacheCreation: 50,
-      },
-      { type: 'assistant:end', ts: 2200, messageId: 'm2' },
-    ]);
-    expect(result.state.status.sessionUncachedInput).toBe(80);
-    expect(result.state.status.sessionCacheRead).toBe(1000);
-    expect(result.state.status.sessionCacheCreation).toBe(150);
   });
 
   test('assistant:end accumulates session tokens across multiple turns', () => {
@@ -500,7 +463,6 @@ describe('assistant streaming', () => {
       type: 'session:start',
       ts: 100,
       sessionId: 's2',
-      profile: 'autonomous',
       project: 'forja',
       model: 'sonnet-4.6',
     });
@@ -620,7 +582,6 @@ describe('critique lifecycle (Slice D)', () => {
         type: 'session:start',
         ts: 0,
         sessionId: 's1',
-        profile: 'autonomous',
         project: 'p',
         model: 'mock/m',
       },
@@ -2203,7 +2164,6 @@ describe('parallel:status reducer (D234)', () => {
       type: 'session:start',
       ts: 2,
       sessionId: 's1',
-      profile: 'autonomous',
       project: 'p',
       model: 'm',
     });

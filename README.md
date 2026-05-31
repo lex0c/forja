@@ -30,9 +30,8 @@ context, more freedom, hope the answer is right. Forja's bet is different:
   memory corpora need attestation. Permissions are layered (enterprise →
   user → project → session) with attribution on every grant.
 - **Honest about token cost.** A per-tool summarization layer reduces output
-  before it enters context, the system prompt is split across cache
-  breakpoints to minimize re-cache cost, and the footer surfaces cache
-  hit-rate so optimizations are measurable instead of asserted.
+  before it enters context, and the system prompt is split across cache
+  breakpoints to minimize re-cache cost.
 
 ---
 
@@ -114,7 +113,7 @@ agent --json "what changed in the last commit?" > events.ndjson
 | **Hooks** | Operator-provided shell hooks at lifecycle events (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, etc.) with `additionalContext` injection | `.agent/hooks/` |
 | **Recap** | Session-end terse summary; structured PR / Slack / mini formats via the recap pipeline | `/recap`, session-end output |
 | **Resume** | Continue a prior session by id (or `last`) — replays scrollback and rebuilds context with auto-rehydrate | `agent --resume <id> "follow-up prompt"` |
-| **Token efficiency** | Cache breakpoints split across stable / memory segments; per-tool output summarization (bash / grep / glob); footer chip surfaces session-wide cache hit-rate | Footer chip, `[forja:output_summarized ...]` markers |
+| **Token efficiency** | Cache breakpoints split across stable / memory segments; per-tool output summarization (bash / grep / glob) | `[forja:output_summarized ...]` markers |
 
 ---
 

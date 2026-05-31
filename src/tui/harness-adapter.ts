@@ -45,10 +45,9 @@ const mapTodoItem = (item: TodoItem): TodoItemForUI => ({
 
 export interface HarnessAdapterCtx {
   // Status-line metadata. Not derivable from HarnessEvent: the harness
-  // doesn't carry profile/project/model in its event payloads (only the
+  // doesn't carry project/model in its event payloads (only the
   // sessionId), so the caller threads them in here. Read once, on
   // `session_start`, and forwarded into the `session:start` UIEvent.
-  profile: 'autonomous' | 'orchestrated' | 'hybrid';
   project: string;
   model: string;
   // Hard-cap for the run. Used to populate `step:budget` events so the
@@ -200,7 +199,6 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           type: 'session:start',
           ts,
           sessionId: event.sessionId,
-          profile: ctx.profile,
           project: ctx.project,
           model: ctx.model,
           ...(ctx.planMode === true ? { planMode: true } : {}),
