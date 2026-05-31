@@ -46,7 +46,7 @@ import { mergeTrustedHosts } from './risk-score.ts';
 import { type SealingScheduler, createSealingScheduler } from './sealing-scheduler.ts';
 import { type SealStore, factoryForSealMode } from './sealing.ts';
 import { type EngineState, type StateTransition, createStateController } from './state-machine.ts';
-import type { Policy, SealPolicy } from './types.ts';
+import type { ApprovalPosture, Policy, SealPolicy } from './types.ts';
 
 export interface BootstrapPermissionEngineInput {
   cwd: string;
@@ -62,6 +62,10 @@ export interface BootstrapPermissionEngineInput {
   // accepting new decisions, so retrospective audits see the
   // operator's authorization on the chain itself.
   acceptBrokenChain?: boolean;
+  // Initial approval posture (Supervised / Autonomous) seeded into
+  // EngineOptions.approvalPosture. CLI --autonomous flows here via
+  // bootstrap. Absent ⇒ supervised (fail-closed default).
+  approvalPosture?: ApprovalPosture;
   // Sandbox-plan inputs. When provided, the engine's check() runs
   // the planner and refuses on `no_viable_sandbox`; when omitted,
   // the stage is skipped. The bootstrap probes `bwrap` /
@@ -621,6 +625,7 @@ export const bootstrapPermissionEngine = async (
     sessionId: input.sessionId,
     stateController: controller,
     trustedHosts,
+    ...(input.approvalPosture !== undefined ? { approvalPosture: input.approvalPosture } : {}),
     ...(sandbox !== undefined ? { sandbox } : {}),
     ...(input.telemetry !== undefined ? { telemetry: input.telemetry } : {}),
     ...(input.now !== undefined ? { now: input.now } : {}),

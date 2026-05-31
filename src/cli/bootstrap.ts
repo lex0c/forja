@@ -38,6 +38,7 @@ import {
 import type { ProbeSharedTrustResult } from '../memory/index.ts';
 import { createSqliteOutcomeSink } from '../outcomes/index.ts';
 import {
+  type ApprovalPosture,
   type LockConflict,
   type SandboxAvailability,
   type SandboxTmpdir,
@@ -112,6 +113,11 @@ export interface BootstrapInput {
   // to the harness's planMode flag and triggers injection of a
   // plan-aware system prompt instructing structured output.
   plan?: boolean;
+  // Initial approval posture seed (AGENTIC_CLI §8). CLI `--autonomous`
+  // routes here; bootstrap forwards it to bootstrapPermissionEngine →
+  // EngineOptions.approvalPosture. Absent ⇒ supervised (the safe
+  // default). Distinct from the execution profile.
+  approvalPosture?: ApprovalPosture;
   // Caller-supplied system prompt. When `plan` is also set, the
   // plan-mode prompt is prepended (plan-mode is the operating
   // profile; user content is layered as extra context).
@@ -727,6 +733,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     preflight,
     failureSink,
     ...(input.acceptBrokenChain === true ? { acceptBrokenChain: true } : {}),
+    ...(input.approvalPosture !== undefined ? { approvalPosture: input.approvalPosture } : {}),
     sandbox: {
       available: sandboxAvail.available,
       hostExplicitlyAllowed: input.sandboxHost === true || policySandbox?.hostAllowed === true,

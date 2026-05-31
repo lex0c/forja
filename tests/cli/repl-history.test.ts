@@ -17,6 +17,7 @@ import type { BootstrapResult } from '../../src/cli/bootstrap.ts';
 import { runRepl } from '../../src/cli/repl.ts';
 import type { HarnessConfig, HarnessEvent, HarnessResult } from '../../src/harness/index.ts';
 import { DEFAULT_BUDGET } from '../../src/harness/types.ts';
+import { createPermissionEngine } from '../../src/permissions/index.ts';
 import type { DB } from '../../src/storage/db.ts';
 import { openMemoryDb } from '../../src/storage/db.ts';
 import { appendHistory, countHistory, loadHistory } from '../../src/storage/history.ts';
@@ -61,6 +62,13 @@ const makeBootstrapStubWithDb = (db: DB): BootstrapResult => {
       id: 'mock/m',
       capabilities: { context_window: 200000, output_max_tokens: 4096 },
     },
+    // permissionEngine is required on HarnessConfig and the REPL boot
+    // path (banner emit) reads its approval posture — give the stub a
+    // real supervised engine like the other required fields.
+    permissionEngine: createPermissionEngine(
+      { defaults: { mode: 'strict' }, tools: {} },
+      { cwd: PROJECT_CWD },
+    ),
   } as unknown as HarnessConfig;
   return {
     config,
@@ -855,6 +863,10 @@ describe('repl — /history on reload (boot disabled → re-enable)', () => {
             id: 'mock/m',
             capabilities: { context_window: 200000, output_max_tokens: 4096 },
           },
+          permissionEngine: createPermissionEngine(
+            { defaults: { mode: 'strict' }, tools: {} },
+            { cwd: realRoot },
+          ),
         } as unknown as HarnessConfig,
         db: dbForBoot,
         modelId: 'mock/m',

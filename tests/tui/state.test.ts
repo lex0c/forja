@@ -68,6 +68,52 @@ describe('session lifecycle', () => {
     expect(r.state.status.planMode).toBe(false);
   });
 
+  test('createInitialState defaults operationMode to supervised', () => {
+    expect(createInitialState().status.operationMode).toBe('supervised');
+  });
+
+  test('session:start preserves the current posture (never resets it)', () => {
+    // A new harness session per REPL submit must not silently reset the
+    // operator's posture back to supervised.
+    let state = applyEvent(createInitialState(), {
+      type: 'mode:change',
+      ts: 1,
+      posture: 'autonomous',
+    }).state;
+    state = applyEvent(state, start()).state;
+    expect(state.status.operationMode).toBe('autonomous');
+  });
+
+  test('mode:change updates status.operationMode and emits no permanent', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'mode:change',
+      ts: 5,
+      posture: 'autonomous',
+    });
+    expect(r.state.status.operationMode).toBe('autonomous');
+    expect(r.permanent).toEqual([]);
+    const back = applyEvent(r.state, { type: 'mode:change', ts: 6, posture: 'supervised' });
+    expect(back.state.status.operationMode).toBe('supervised');
+  });
+
+  test('session:banner seeds status.operationMode from the boot posture', () => {
+    // The footer cue must be correct from the first frame (e.g. under
+    // `--autonomous`), before any user submit / session:start.
+    const r = applyEvent(createInitialState(), {
+      type: 'session:banner',
+      ts: 1,
+      app: 'forja',
+      version: '0',
+      model: 'm',
+      contextWindow: 1000,
+      maxOutputTokens: 100,
+      cwd: '/x',
+      env: [],
+      operationMode: 'autonomous',
+    });
+    expect(r.state.status.operationMode).toBe('autonomous');
+  });
+
   test('session:end marks state ended and emits footer item', () => {
     const r = applyEvent(createInitialState(), {
       type: 'session:end',

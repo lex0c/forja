@@ -52,6 +52,21 @@ describe('parseArgs', () => {
     expect(r.args.plan).toBe(false);
   });
 
+  test('--autonomous flag seeds the autonomous approval posture', () => {
+    const r = parseArgs(['--autonomous', 'do the thing']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.autonomous).toBe(true);
+    expect(r.args.prompt).toBe('do the thing');
+  });
+
+  test('--autonomous absent leaves the posture unset (supervised default downstream)', () => {
+    const r = parseArgs(['hi']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.autonomous).toBeUndefined();
+  });
+
   test('--model with value', () => {
     const r = parseArgs(['--model', 'openai/gpt-4o', 'hi']);
     expect(r.ok).toBe(true);

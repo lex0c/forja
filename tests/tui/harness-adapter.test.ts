@@ -702,7 +702,12 @@ describe('harness-adapter — tool lifecycle', () => {
     a.translate({
       type: 'tool_decided',
       toolUseId: 't1',
-      decision: { kind: 'confirm', prompt: 'edit /foo?', reason: 'matched confirm rule: **' },
+      decision: {
+        kind: 'confirm',
+        confirmCause: 'policy',
+        prompt: 'edit /foo?',
+        reason: 'matched confirm rule: **',
+      },
     });
     const out = a.translate({
       type: 'tool_finished',
@@ -735,7 +740,7 @@ describe('harness-adapter — tool lifecycle', () => {
     a.translate({
       type: 'tool_decided',
       toolUseId: 't1',
-      decision: { kind: 'confirm', prompt: 'edit /foo?' },
+      decision: { kind: 'confirm', confirmCause: 'policy', prompt: 'edit /foo?' },
     });
     const out = a.translate({
       type: 'tool_finished',
@@ -765,7 +770,7 @@ describe('harness-adapter — tool lifecycle', () => {
     a.translate({
       type: 'tool_decided',
       toolUseId: 't1',
-      decision: { kind: 'confirm', prompt: 'run?' },
+      decision: { kind: 'confirm', confirmCause: 'policy', prompt: 'run?' },
     });
     const out = a.translate({
       type: 'tool_finished',

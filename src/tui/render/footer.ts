@@ -49,8 +49,19 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
     }
     left = leftParts.join(sep);
   } else {
+    // Operation mode replaces the old `? for help` cue (UI.md §4.10.6):
+    // Supervised in accent (blue), Autonomous in warn (yellow), each
+    // with a secondary "(shift+tab to change)" affordance. `?` still
+    // opens help (the editor maps it on an empty buffer); it just loses
+    // its dedicated footer hint.
+    const autonomous = state.status.operationMode === 'autonomous';
+    const modeLabel = paint(
+      caps,
+      autonomous ? 'warn' : 'accent',
+      autonomous ? 'Autonomous' : 'Supervised',
+    );
     const leftParts = [
-      paint(caps, 'accentDark', '? for help'),
+      `${modeLabel}${dim(caps, ' (shift+tab to change)')}`,
       // Discoverability cue for operators on terminals/WMs that
       // eat Shift+Enter — the input editor accepts `\` + Enter
       // as a multiline continuation (UI.md §5.4).

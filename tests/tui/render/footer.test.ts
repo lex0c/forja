@@ -31,14 +31,15 @@ const startedSession = (overrides: Partial<LiveState['status']> = {}): LiveState
 };
 
 describe('renderFooter', () => {
-  test('idle state: help hint left, model right (cost/steps chips removed)', () => {
+  test('idle state: operation-mode cue left, model right (cost/steps chips removed)', () => {
     const out = renderFooter(startedSession(), caps);
     expect(out).not.toBeNull();
-    expect(out).toContain('? for help');
+    // The operation-mode cue replaced the old `? for help` hint
+    // (UI.md §4.10.6). Default posture is supervised.
+    expect(out).toContain('Supervised (shift+tab to change)');
+    expect(out).not.toContain('? for help');
     // Newline hint pairs with the input editor's backslash
-    // continuation (UI.md §5.4). Visible alongside `? for help`
-    // in every non-armed state so operators on terminals/WMs that
-    // eat Shift+Enter can discover the alternative.
+    // continuation (UI.md §5.4).
     expect(out).toContain('\\+Enter newline');
     expect(out).toContain('sonnet-4.6');
     // Cost + step counter were removed from the footer — too
@@ -49,10 +50,22 @@ describe('renderFooter', () => {
     expect(out).not.toContain('esc to interrupt');
   });
 
-  test('the `? for help` hint is painted in accentDark when color is enabled', () => {
-    const out = renderFooter(startedSession(), { ...caps, color: 'basic' });
-    // accentDark = CSI 34 m — a distinct blue from the secondary (90m) cues.
-    expect(out).toContain(`${CSI}34m? for help${CSI}0m`);
+  test('autonomous posture renders the Autonomous label', () => {
+    const out = renderFooter(startedSession({ operationMode: 'autonomous' }), caps);
+    expect(out).toContain('Autonomous (shift+tab to change)');
+    expect(out).not.toContain('Supervised');
+  });
+
+  test('mode cue: Supervised painted accent (blue), Autonomous painted warn (yellow)', () => {
+    const colored: Capabilities = { ...caps, color: 'basic' };
+    // Supervised → accent = CSI 94 m (blue).
+    const sup = renderFooter(startedSession(), colored);
+    expect(sup).toContain(`${CSI}94mSupervised${CSI}0m`);
+    // Autonomous → warn = CSI 33 m (yellow) — a deliberate "heads up".
+    const auto = renderFooter(startedSession({ operationMode: 'autonomous' }), colored);
+    expect(auto).toContain(`${CSI}33mAutonomous${CSI}0m`);
+    // The "(shift+tab to change)" affordance is secondary (90m) in both.
+    expect(sup).toContain(`${CSI}90m (shift+tab to change)${CSI}0m`);
   });
 
   test('running state: adds esc to interrupt to the left column', () => {
@@ -68,7 +81,7 @@ describe('renderFooter', () => {
     };
     s.activeTools.set('t1', tool);
     const out = renderFooter(s, caps);
-    expect(out).toContain('? for help · \\+Enter newline · esc to interrupt');
+    expect(out).toContain('Supervised (shift+tab to change) · \\+Enter newline · esc to interrupt');
   });
 
   test('thinking state also triggers interrupt cue', () => {
@@ -397,9 +410,9 @@ describe('renderFooter', () => {
     expect(renderFooter(s, caps)).toBeNull();
   });
 
-  test('pre-session (no model) shows only the help hint, no right column', () => {
+  test('pre-session (no model) shows only the mode cue, no right column', () => {
     const out = renderFooter(createInitialState(), caps);
-    expect(out).toContain('? for help');
+    expect(out).toContain('Supervised (shift+tab to change)');
     expect(out).not.toContain('•');
   });
 
@@ -451,7 +464,7 @@ describe('renderFooter', () => {
         selectedIdx: 0,
       };
       const out = renderFooter(s, caps);
-      expect(out).not.toContain('? for help');
+      expect(out).not.toContain('shift+tab to change');
       expect(out).not.toContain('\\+Enter newline');
     });
 
@@ -477,7 +490,7 @@ describe('renderFooter', () => {
       s.activeTools.set('t1', tool);
       const out = renderFooter(s, caps);
       expect(out).toContain('esc to interrupt');
-      expect(out).not.toContain('? for help');
+      expect(out).not.toContain('shift+tab to change');
     });
 
     test('exitArmed beats slash (gate cue still wins)', () => {
@@ -500,7 +513,7 @@ describe('renderFooter', () => {
       expect(out).toContain('Press Ctrl-C again to exit');
       // Help hint and any interrupt cue are suppressed — the gate
       // is the only thing the operator should be reading.
-      expect(out).not.toContain('? for help');
+      expect(out).not.toContain('shift+tab to change');
       expect(out).not.toContain('esc to interrupt');
     });
 
@@ -539,11 +552,11 @@ describe('renderFooter', () => {
       expect(out).toContain('Press Ctrl-C again to exit');
     });
 
-    test('exitArmed null restores the help hint (no leftover cue)', () => {
+    test('exitArmed null restores the mode cue (no leftover cue)', () => {
       const s = startedSession();
       s.exitArmed = null;
       const out = renderFooter(s, caps);
-      expect(out).toContain('? for help');
+      expect(out).toContain('Supervised (shift+tab to change)');
       expect(out).not.toContain('Press Ctrl-C again to exit');
     });
 

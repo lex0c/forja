@@ -15,6 +15,7 @@
 // todo events accept silently and land alongside their render
 // functions.
 
+import type { ApprovalPosture } from '../permissions/index.ts';
 import { sanitizeOneLineForDisplay } from '../sanitize/ansi.ts';
 import type { SessionBannerEnvEntry, TodoItemForUI, UIEvent } from './events.ts';
 import {
@@ -125,6 +126,12 @@ export interface StatusState {
   // column as a `plan` token between model and budget. Default false
   // on createInitialState; flipped by `session:start.planMode`.
   planMode: boolean;
+  // Approval posture (Supervised / Autonomous) shown in the footer in
+  // place of the help cue. Default 'supervised' on createInitialState;
+  // seeded by `session:start.operationMode`, flipped at runtime by
+  // `mode:change`. The permission engine is the source of truth — this
+  // is the rendered mirror.
+  operationMode: ApprovalPosture;
   // Distinct-name memory count for the footer's `mem N` segment.
   // Snapshot at session:start; mid-session
   // memory_write success could bump the count, but we keep the
@@ -488,6 +495,7 @@ export const createInitialState = (): LiveState => ({
     costUsd: 0,
     maxCostUsd: null,
     planMode: false,
+    operationMode: 'supervised',
     memoryCount: 0,
     contextWindow: 0,
     sessionTotalTokens: 0,
@@ -799,6 +807,14 @@ export const flushPendingToolEndBatch = (
 // case that emits permanent items.
 const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
   switch (event.type) {
+    case 'mode:change':
+      // Mirror the engine's new approval posture into status so the
+      // footer repaints. No scrollback line — the footer cue is the
+      // whole signal (UI.md §4.10.6).
+      return {
+        state: { ...state, status: { ...state.status, operationMode: event.posture } },
+        permanent: [],
+      };
     case 'session:start': {
       const status: StatusState = {
         ...state.status,
@@ -808,6 +824,10 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         model: event.model,
         planMode: event.planMode === true,
         memoryCount: event.memoryCount ?? 0,
+        // operationMode is intentionally NOT touched here: it's seeded
+        // at boot by session:banner and flipped by mode:change. A bare
+        // session:start (each REPL submit) must preserve it via the
+        // `...state.status` spread, never reset it.
       };
       // Boundary cleanup: soft-interrupt state and bg processes are
       // both per-session. A fresh session starts clean even if the
@@ -934,6 +954,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             ...state.status,
             model: event.model,
             contextWindow: event.contextWindow,
+            operationMode: event.operationMode ?? state.status.operationMode,
           },
         },
         permanent: [

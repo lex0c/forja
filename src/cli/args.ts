@@ -21,6 +21,12 @@ export interface ParsedArgs {
   // regardless of policy; the model produces a structured plan and
   // exits without applying.
   plan: boolean;
+  // Initial approval posture (AGENTIC_CLI §8): start in Autonomous —
+  // auto-approve routine policy confirms — instead of the default
+  // Supervised. Risk confirms (compound / protected / score / degraded)
+  // still prompt; toggle at runtime with Shift+Tab. Distinct from the
+  // execution `profile` (autonomous/orchestrated/hybrid, §5.2).
+  autonomous?: boolean;
   // List-sessions mode (AGENTIC_CLI §2.1): print known sessions
   // (newest first) and exit. Honors --json for headless consumers.
   listSessions: boolean;
@@ -1563,6 +1569,10 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         args.plan = true;
         i += 1;
         break;
+      case '--autonomous':
+        args.autonomous = true;
+        i += 1;
+        break;
       case '--list-sessions':
         args.listSessions = true;
         i += 1;
@@ -2134,6 +2144,7 @@ export const usage = (): string =>
     '  --help, -h             Show this help and exit',
     '  --json                 Emit NDJSON events to stdout (headless)',
     '  --plan                 Read-only mode: produce a plan, do not apply changes',
+    '  --autonomous           Start in Autonomous mode: auto-approve routine confirms (Shift+Tab toggles)',
     '  --list-sessions        Print known sessions (newest first) and exit',
     '  --include-subagents    With --list-sessions, fan parents into their subagent children (requires --list-sessions)',
     '  --limit <n>            With --list-sessions, cap rows returned (default 20; requires --list-sessions)',
