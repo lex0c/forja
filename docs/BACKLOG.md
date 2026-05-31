@@ -2,12 +2,25 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-31] tui — remove the footer `% cached` chip
+
+Operator asked to drop the cache hit-rate chip from the footer. Removed the render block (`footer.ts`); since the three `StatusState` fields it read (`sessionCacheRead` / `sessionCacheCreation` / `sessionUncachedInput`) had no other consumer, removed the fields + their default + the usage-reducer accumulation too — the local `input` / `cacheRead` / `cacheCreation` stay, they still feed `turnContext` for the tokens / context% chips. Tests: dropped the `% cached chip` describe and the `cache breakdown accumulates` reducer test. README's two footer-hit-rate mentions updated. The recap's own `% cached` (a separate projection — not these fields) is untouched. NOTE: spec `UI.md` §4.10.6 still documents the chip (`[cached%]` in the footer table + the §4.10.6 item) — left pending an explicit call, since unlike the deferred execution-profile this is a feature being removed.
+
+**Validated:** typecheck + Biome clean; `tests/tui/` 860 pass / 0 fail. **Branch:** `chore/code-cleanup`.
+
+## [2026-05-31] tui — drop the dead execution-profile field + keep the interrupt cue on screen
+
+Two related TUI cleanups. (1) **Removed the write-only execution-`profile` field** (`'autonomous' | 'orchestrated' | 'hybrid'`): it was set (`repl` → adapter ctx), threaded through `session:start`, and stored in `StatusState`, but never read — no render, no branch. Since `orchestrated`/`hybrid` (AGENTIC_CLI §5.2/§5.3, the local-model path) won't be implemented, the placeholder was dead weight. The **spec is deliberately left intact** (still describes the profile as a design target) — this is code-behind-spec, not a divergence; the disambiguation comments in `permissions/types.ts` and `cli/args.ts` stay as the in-code reminder of the posture-vs-profile naming clash. (2) **Fixed the footer interrupt cue.** The cue relabel (`f0c86923`) made `supervised mode on` (+8 chars) push the load-bearing interrupt cue past 80 cols, truncating `esc again to force`. Fix part one: the `\+Enter newline` hint shows **only when idle**; during a turn the interrupt cue takes its slot. That alone flickered — the footer's `isRunning` predicate only saw instantaneous activity (tool / thinking / stream), so during the model's pre-token deliberation (`awaitingProvider`, often a turn's longest phase) it read false and the footer fell back to the newline hint. Fix part two: widened the predicate to span the whole turn (`+ awaitingProvider + critique`) so the cue stays stable. Regression tests cover both phases.
+
+**Validated:** typecheck + Biome clean; `tests/tui/` + `tests/cli/repl*` green (incl. interrupt-cue regression tests). **Branch:** `chore/code-cleanup`.
+
 ## [2026-05-31] tui + docs + spec — operation-mode cue relabel and doc/spec sync
 
 Two things this pass. (1) The footer operation-mode cue was relabeled from a bare `Supervised`/`Autonomous` to `supervised mode on`/`autonomous mode on` (`f0c86923`) — reads as a status line and matches the footer's lowercase voice; colors (accent/warn) and the shift+tab affordance unchanged. (2) Synced the non-spec docs the posture feature had left behind:
 
 - **SECURITY.md** §5.5.12 — documented the autonomous posture as a deliberate, bounded human-in-the-loop bypass, with the guard-rails (only low-risk `policy` confirms auto-approve; compound/escalate/score/resolver confirms and any non-`ready` engine state re-arm the modal; hard denies stay unreachable; every auto-approval is audited and replay-reconstructable). SECURITY.md had framed the modal as the *sole* human-in-the-loop.
 - **TODO.md** — the matcher pull-in signal cited "autonomous-mode workloads" as hypothetical; reworded now that the posture ships, noting compound confirms still re-arm the modal (so the fatigue signal survives even under Autonomous).
+- **README.md** — Safety-model gained an "Operation mode" bullet and the Permissions row now names the posture; the README had the same modal-as-absolute gap SECURITY.md did.
 
 Spec sync (separate step — editing `docs/spec/` needs an explicit request): **UI.md** footer text + ASCII relabeled to match; **PERMISSION_ENGINE.md** added the `approval-posture` stage to the canonical `reason_chain` table and folded the posture into the reproducibility principle (replay reconstructs it from that stage); **AGENTIC_CLI.md §8.1** now states the suspend-while-not-`ready` guard reads the LIVE engine state (so a mid-check degrade still suspends) and that each auto-approval stamps `approval-posture` for forensic replay.
 

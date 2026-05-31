@@ -44,7 +44,7 @@ export const ANTHROPIC_CAPS: Record<string, ProviderCapabilities> = {
     cost_per_1k_output: 15.0,
     cost_per_1k_cached_input: 0.3,
     cost_per_1k_cache_write: 3.75,
-    notes: ['default for autonomous profile; balanced quality/cost'],
+    notes: ['default model; balanced quality/cost'],
   },
   'claude-haiku-4-5': {
     ...ANTHROPIC_BASE,

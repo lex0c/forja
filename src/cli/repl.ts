@@ -767,7 +767,6 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   const buildAdapterCtx = () => {
     const budget = effectiveBudget(baseConfig.budget);
     return {
-      profile: 'autonomous' as const,
       project,
       model: baseConfig.provider.id,
       maxSteps: budget.maxSteps,

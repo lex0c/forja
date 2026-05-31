@@ -24,8 +24,19 @@ const formatTokens = (n: number): string => {
 
 const CONTEXT_WARN_THRESHOLD = 0.8;
 
+// "Can the operator interrupt right now?" — true across the WHOLE turn,
+// not just the instants a tool or stream is live. It must include
+// `awaitingProvider` (the model deliberating before the first token —
+// often the LONGEST phase of a turn) and `critique`; without them the
+// predicate flickers off during those waits and the footer falls back
+// to the idle `\+Enter newline` hint mid-turn, hiding the load-bearing
+// interrupt cue (the two segments are mutually exclusive on this).
 const isRunning = (state: LiveState): boolean =>
-  state.activeTools.size > 0 || state.thinking !== null || state.pendingAssistant !== null;
+  state.activeTools.size > 0 ||
+  state.thinking !== null ||
+  state.pendingAssistant !== null ||
+  state.awaitingProvider !== null ||
+  state.critique !== null;
 
 // `secondary` (SGR 90) rather than `dim` (SGR 2): xterm with default
 // config renders SGR 2 identical to the default foreground, so
@@ -60,15 +71,18 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
       autonomous ? 'warn' : 'accent',
       autonomous ? 'autonomous mode on' : 'supervised mode on',
     );
-    const leftParts = [
-      `${modeLabel}${dim(caps, ' (shift+tab to change)')}`,
-      // Discoverability cue for operators on terminals/WMs that
-      // eat Shift+Enter — the input editor accepts `\` + Enter
-      // as a multiline continuation (UI.md §5.4).
-      dim(caps, '\\+Enter newline'),
-    ];
+    const leftParts = [`${modeLabel}${dim(caps, ' (shift+tab to change)')}`];
     if (isRunning(state)) {
+      // During a turn the operator isn't composing input, so the
+      // newline affordance is noise — and it's the segment that pushes
+      // the load-bearing interrupt cue past the right edge on narrow
+      // (80-col) terminals. Surface the interrupt cue instead.
       leftParts.push(dim(caps, state.softInterrupted ? 'esc again to force' : 'esc to interrupt'));
+    } else {
+      // Idle: the operator can type, so surface the multiline
+      // continuation affordance for terminals/WMs that eat Shift+Enter
+      // — the input editor accepts `\` + Enter (UI.md §5.4).
+      leftParts.push(dim(caps, '\\+Enter newline'));
     }
     left = leftParts.join(sep);
   }
@@ -88,16 +102,6 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
     const pct = Math.min(100, Math.max(0, Math.round(ratio * 100)));
     const text = `${pct}% context used`;
     rightParts.push(ratio >= CONTEXT_WARN_THRESHOLD ? paint(caps, 'warn', text) : dim(caps, text));
-  }
-  // Cache hit-rate across the REPL session. Denominator is "input
-  // billed" (input + cacheRead + cacheCreation); numerator is what
-  // arrived cached. Suppressed until any usage event has landed so
-  // we don't show `0% cached` against zero traffic.
-  const inputBilled =
-    status.sessionUncachedInput + status.sessionCacheRead + status.sessionCacheCreation;
-  if (inputBilled > 0) {
-    const pct = Math.round((status.sessionCacheRead / inputBilled) * 100);
-    rightParts.push(dim(caps, `${pct}% cached`));
   }
   const right = rightParts.join(sep);
 

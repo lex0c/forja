@@ -6,7 +6,6 @@ import { type HarnessAdapterCtx, createHarnessAdapter } from '../../src/tui/harn
 const baseCtx = (): HarnessAdapterCtx => {
   let counter = 1000;
   return {
-    profile: 'autonomous',
     project: 'forja',
     model: 'anthropic/claude-sonnet-4-6',
     maxSteps: 50,
@@ -24,7 +23,6 @@ describe('harness-adapter — session lifecycle', () => {
     expect(types(out)).toEqual(['session:start', 'step:budget']);
     const start = out[0] as Extract<UIEvent, { type: 'session:start' }>;
     expect(start.sessionId).toBe('sess-1');
-    expect(start.profile).toBe('autonomous');
     expect(start.project).toBe('forja');
     expect(start.model).toBe('anthropic/claude-sonnet-4-6');
     const budget = out[1] as Extract<UIEvent, { type: 'step:budget' }>;

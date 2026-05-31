@@ -29,7 +29,6 @@ export type SessionStartEvent = BaseEvent & {
   sessionId: string;
   // Source-of-truth for status line render. Most fields stay
   // constant for the session; cost/steps update via step:budget.
-  profile: 'autonomous' | 'orchestrated' | 'hybrid';
   project: string;
   model: string;
   // Plan mode (read-only profile, harness refuses write tools).
