@@ -8,6 +8,7 @@ Two things this pass. (1) The footer operation-mode cue was relabeled from a bar
 
 - **SECURITY.md** §5.5.12 — documented the autonomous posture as a deliberate, bounded human-in-the-loop bypass, with the guard-rails (only low-risk `policy` confirms auto-approve; compound/escalate/score/resolver confirms and any non-`ready` engine state re-arm the modal; hard denies stay unreachable; every auto-approval is audited and replay-reconstructable). SECURITY.md had framed the modal as the *sole* human-in-the-loop.
 - **TODO.md** — the matcher pull-in signal cited "autonomous-mode workloads" as hypothetical; reworded now that the posture ships, noting compound confirms still re-arm the modal (so the fatigue signal survives even under Autonomous).
+- **README.md** — Safety-model gained an "Operation mode" bullet and the Permissions row now names the posture; the README had the same modal-as-absolute gap SECURITY.md did.
 
 Spec sync (separate step — editing `docs/spec/` needs an explicit request): **UI.md** footer text + ASCII relabeled to match; **PERMISSION_ENGINE.md** added the `approval-posture` stage to the canonical `reason_chain` table and folded the posture into the reproducibility principle (replay reconstructs it from that stage); **AGENTIC_CLI.md §8.1** now states the suspend-while-not-`ready` guard reads the LIVE engine state (so a mid-check degrade still suspends) and that each auto-approval stamps `approval-posture` for forensic replay.
 

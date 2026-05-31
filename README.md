@@ -105,7 +105,7 @@ agent --json "what changed in the last commit?" > events.ndjson
 | Subsystem | What it does | Surfaces |
 |---|---|---|
 | **Harness loop** | The agent runtime: step budget, max-cost cap, compaction at 70% context, retries with classified failure modes | `agent <prompt>`, `agent --plan` |
-| **Permissions** | Layered allow/deny policy with glob + prefix matching (no regex). Sandbox profiles per tool category | `agent --explain-permissions`, `.agent/permissions.yaml` |
+| **Permissions** | Layered allow/deny policy with glob + prefix matching (no regex). Sandbox profiles per tool category. Per-session approval posture (supervised / autonomous) | `agent --explain-permissions`, `--autonomous`, Shift+Tab, `.agent/permissions.yaml` |
 | **Memory** | Cross-session knowledge with three scopes (user / project_shared / project_local), explicit trust, lifecycle states (active / quarantined / invalidated), provenance tracking | `agent --memory list`, `agent --memory show <name>`, `/memory` slash |
 | **Skills** | Eager-loaded catalog of operator-authored procedures, body lazy | Skills auto-surface in system prompt; `/skill` slash |
 | **Subagents** | Worktree-isolated child runs (`task`), async handles (`task_async`), parallel dispatch with caps | `agents/*.md` playbooks |
@@ -193,8 +193,15 @@ agent init --mode strict    # locked-down default (no auto-allow on bash)
   for sensitive directories (`~/.ssh`, `~/.config/agent`, the audit DB).
   On macOS, the same defense via `sandbox-exec` SBPL.
 - **Permission engine.** Tool calls pass through a layered policy with
-  decision attribution. Confirms route through an interactive modal in
-  REPL mode; in headless mode, deny-by-default unless explicitly allowed.
+  decision attribution. By default, confirms route through an interactive
+  modal in REPL mode; in headless mode, deny-by-default unless explicitly
+  allowed.
+- **Operation mode.** Approval posture, per session. **Supervised** (default)
+  sends every `confirm` to the modal; **Autonomous** (`--autonomous` at boot,
+  or Shift+Tab in the REPL) auto-approves only routine low-risk policy
+  confirms — compound / high-risk confirms still prompt, a degraded engine
+  re-arms the modal, and hard denies stay unreachable. Not `bypass`: every
+  engine floor holds, and each auto-approval is audited.
 - **No auto-commit.** Forja never creates git commits without explicit
   operator action.
 
