@@ -1224,8 +1224,7 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     const ids = [...live.keys()];
     // Send SIGTERM to all in parallel, then wait for the grace cycle
     // collectively. Sequential kill would multiply wall-clock by N
-    // for a session with many long-running processes (rare today,
-    // common when the orchestrated profile lands in M6).
+    // for a session with many long-running processes (rare today).
     await Promise.allSettled(
       ids.map((id) => kill(id, { signal: 'SIGTERM', gracePeriodMs: CLEANUP_KILL_GRACE_MS })),
     );
