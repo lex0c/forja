@@ -14,7 +14,8 @@
 //
 // Mutation lands in baseConfig.budget; takes effect on the NEXT
 // turn (current turn already snapshot its budget at startTurn).
-// Note in the confirmation makes timing explicit, matching /plan.
+// Note in the confirmation makes timing explicit, matching the
+// next-turn mutation convention (/model).
 
 import {
   DEFAULT_BUDGET,
@@ -92,7 +93,7 @@ const writeBudget = (ctx: SlashContext, patch: Partial<RunBudget>): void => {
 };
 
 // Append the "current turn already snapshot" cue when a turn is
-// running. Mirrors /plan's behavior so an operator mutating mid-
+// running. Mirrors /model's behavior so an operator mutating mid-
 // turn doesn't assume the in-flight prompt sees the new value.
 const withRunningCue = (ctx: SlashContext, notes: string[]): string[] => {
   if (!ctx.isRunning()) return notes;
@@ -121,8 +122,8 @@ export const budgetCommand: SlashCommand = {
           message: `/budget steps: '${raw}' is not a positive integer`,
         };
       }
-      // Idempotency: matching /plan's behavior, a no-op mutation
-      // returns "already" without the next-turn cue. Avoids
+      // Idempotency: a no-op mutation returns "already" without
+      // the next-turn cue. Avoids
       // misleading the operator into thinking they changed something.
       const current = ctx.baseConfig.budget?.maxSteps;
       if (current === n) {

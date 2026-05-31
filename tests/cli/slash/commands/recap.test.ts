@@ -82,7 +82,6 @@ const stubProvider = (
 const baseConfig = {
   cwd: '/test/cwd',
   enableCheckpoints: false,
-  planMode: false,
   budget: { ...DEFAULT_BUDGET },
   // Default test provider has constrained=false, so /recap pr in
   // tests that don't override defaults stays on the deterministic

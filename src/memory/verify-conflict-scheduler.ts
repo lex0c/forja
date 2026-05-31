@@ -70,7 +70,6 @@ export interface ConflictDetectorSchedulerDeps {
   cwdTrusted?: boolean;
   hooksSnapshot?: readonly HookSpec[];
   effectiveCapabilities?: readonly string[];
-  planMode?: boolean;
   spawnChildProcess?: import('../subagents/runtime.ts').SpawnChildProcess;
   // Test seam — replaces runSubagent inside the dispatcher.
   spawnSubagentFn?: typeof import('../subagents/runtime.ts').runSubagent;
@@ -467,7 +466,6 @@ export const createConflictDetectorScheduler = (
             ...(deps.effectiveCapabilities !== undefined
               ? { effectiveCapabilities: deps.effectiveCapabilities }
               : {}),
-            ...(deps.planMode === true ? { planMode: true } : {}),
             ...(deps.spawnChildProcess !== undefined
               ? { spawnChildProcess: deps.spawnChildProcess }
               : {}),

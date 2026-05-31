@@ -72,7 +72,6 @@ export const memoryReadTool: Tool<MemoryReadInput, MemoryReadOutput> = {
     category: 'misc',
     writes: false,
     idempotent: true,
-    planSafe: true,
     parallel_safe: true,
     display: 'raw',
     cost: { latency_ms_typical: 5 },

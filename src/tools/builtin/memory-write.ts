@@ -140,10 +140,7 @@ export const memoryWriteTool: Tool<MemoryWriteInput, MemoryWriteOutput> = {
   },
   metadata: {
     category: 'misc',
-    // Persists to disk. Plan mode blocks writes by default
-    // (writes:true + omitted planSafe), which is correct — the
-    // model shouldn't be saving memories during a planning
-    // phase.
+    // Persists to disk.
     writes: true,
     // Body / index files live in `~/.config/agent/memory/` (user
     // scope) — outside the worktree. Even project_local writes

@@ -33,7 +33,6 @@ Inside `bootstrap.ts`, the assembly runs as **two phases**:
 
 ```text
 input.systemPrompt                                  ← base (typically empty)
-  ↑ composeWithUserPrompt           (if plan mode)
   ↑ composeWithPlaybookHint
   ↑ composeWithToolErgonomics
   ↑ composeWithParallelHint
@@ -56,11 +55,10 @@ input.systemPrompt                                  ← base (typically empty)
 6. **Parallel hint** — surfaces the harness's parallel-tool affordance
 7. **Tool ergonomics** — highest-payoff tool-usage patterns distilled from `TOOL_ERGONOMICS.md`
 8. **Playbook hint** — discovery table + delegation criteria for subagent routing (`PLAYBOOKS §1.4`)
-9. **(Plan-mode warning)** — only when `--plan`: lists which tools are blocked
-10. **Base systemPrompt** — caller-provided string (typically empty in production)
-11. **Project pointer** — `[project_context]` block (`CONTEXT_TUNING §2.0`)
-12. **Memory section** — auto-injected memories per `MEMORY.md`
-13. **Skill catalog** — eager-load surface of available skills (body lazy)
+9. **Base systemPrompt** — caller-provided string (typically empty in production)
+10. **Project pointer** — `[project_context]` block (`CONTEXT_TUNING §2.0`)
+11. **Memory section** — auto-injected memories per `MEMORY.md`
+12. **Skill catalog** — eager-load surface of available skills (body lazy)
 
 ### 2.2 Why this order
 
@@ -203,7 +201,6 @@ Each composer lives in its own file under `src/cli/`. The file owns the composer
 | `composeWithConstraints` | `constraints-prompt.ts` | `# Constraints` block (`§1.6`) — correctness + security + hard-to-reverse + goal-contradictory cancellation |
 | `composeWithToolErgonomics` | `tool-ergonomics-prompt.ts` | High-payoff tool patterns distilled from `TOOL_ERGONOMICS.md` |
 | `composeWithPlaybookHint` | `playbook-prompt.ts` | Subagent discovery table + delegation criteria (`PLAYBOOKS §1.4`) |
-| `composeWithUserPrompt` | `plan-prompt.ts` | `--plan` mode warning — names which tools are blocked |
 | `composeWithProjectPointer` | `project-pointer.ts` | `[project_context]` pointer (`§2.0`) — pointer eager, body lazy |
 | `composeSystemPrompt` | `memory-prompt.ts` | Generic tail-append helper (used for memory section + skill catalog) |
 

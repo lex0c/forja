@@ -31,11 +31,6 @@ export type SessionStartEvent = BaseEvent & {
   // constant for the session; cost/steps update via step:budget.
   project: string;
   model: string;
-  // Plan mode (read-only profile, harness refuses write tools).
-  // Surfaced in the footer's right column. Optional — absent is
-  // equivalent to false; producers that don't know plan-mode state
-  // can omit the field.
-  planMode?: boolean;
   // Distinct-name memory count surfaced in the footer's right
   // column as `mem N`. Dedupe-by-name matches what the operator
   // sees in the eager prompt section. Optional: producers that
@@ -237,7 +232,7 @@ export type ToolEndEvent = BaseEvent & {
   exitCode?: number;
 };
 
-// Permission/trust/memory write/plan review modals.
+// Permission/trust/memory write modals.
 // Payloads carry exactly what the modal needs to render. The
 // renderer's modal handler (UI.md §5.5) resolves a promise on the
 // other side; the producer awaits that promise.
@@ -265,7 +260,7 @@ export type PermissionAskEvent = BaseEvent & {
 };
 // Modal resolution event. Renamed from `permission:answer` because
 // the same event flows for every modal flavor (trust answers `yes`/
-// `no`, plan-review answers `yes`/`edit`/`no`, etc.) — naming it
+// `no`, memory-write answers `yes`/`no`, etc.) — naming it
 // after just the permission flavor was misleading. Decision is a
 // flavor-specific string; consumers that care about the union
 // narrow per-flavor by reading the original `*:ask` event.
@@ -421,14 +416,6 @@ export type MemoryActionAskEvent = BaseEvent & {
   // the operation's verb tense.
   question: string;
 };
-export type PlanReviewEvent = BaseEvent & {
-  type: 'plan:review';
-  promptId: string;
-  steps: string[];
-  estimatedCalls: number;
-  estimatedCostUsd: number;
-};
-
 // History wipe confirmation (HISTORY.md §2.3 `/history clear`). Three
 // options: Yes (clear) / Yes-and-disable (clear + write
 // `.agent/no-history`) / No. Default selection is the last (No),
@@ -744,7 +731,6 @@ export type UIEvent =
   | MemoryWriteAskEvent
   | MemoryUserScopeAskEvent
   | MemoryActionAskEvent
-  | PlanReviewEvent
   | HistoryClearAskEvent
   | TodoUpdateEvent
   | SubagentStartEvent

@@ -129,9 +129,7 @@ export const pinContextTool: Tool<PinContextInput, PinContextOutput> = {
   },
   metadata: {
     category: 'misc',
-    // Persists to SQLite (context_pins table). Plan mode blocks by
-    // default — pinning during planning is the wrong phase; the
-    // model should plan first, then pin once a constraint is real.
+    // Persists to SQLite (context_pins table).
     writes: true,
     // The persistence is in `sessions.db`, which sits outside the
     // worktree (in `~/.local/share/forja/` or per-project). Same

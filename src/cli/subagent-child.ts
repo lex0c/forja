@@ -76,8 +76,8 @@ import { composeWithReflectionBlock } from './reflection-block.ts';
 //   - The child's bootstrap is fundamentally different from the
 //     parent's (no prompt → no instruction parsing, no
 //     subagent registry → can't recursively spawn under the
-//     same wiring, no plan-mode prompt composition, no
-//     renderer / event observer — output flows through SQLite).
+//     same wiring, no renderer / event observer — output
+//     flows through SQLite).
 //   - Failures in the parent path must NOT touch this code;
 //     same shape, the reverse.
 //
@@ -137,16 +137,6 @@ export interface SubagentChildOptions {
   // silently ignore the parent's temperature override and run
   // non-deterministically.
   temperature?: number;
-  // Plan-mode flag from the parent. Carried across via
-  // `--subagent-plan-mode` (presence-only). When true, the
-  // child's harness loop refuses any tool whose metadata
-  // declares `writes:true` (or `planSafe:false`) BEFORE
-  // execution — defense in depth that doubles up with the
-  // top-level task tool's planSafe:false gate. Without this
-  // propagation, a programmatic caller invoking runSubagent
-  // with planMode:true would see writing tools execute in the
-  // child unchecked.
-  planMode?: boolean;
   // Trust verdict carried across via `--subagent-cwd-trusted`
   // (presence-only). The parent resolved trust at bootstrap
   // against `~/.config/agent/trust.json`; the child can't
@@ -1165,15 +1155,6 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       ...(audit.sampling?.seedInEval !== undefined
         ? { seedInEval: audit.sampling.seedInEval }
         : {}),
-      // Plan mode propagation. When the parent invoked
-      // runSubagent with planMode:true, the child's harness
-      // loop must reject every writing tool BEFORE execution —
-      // defense in depth that doubles up with the top-level
-      // `task` tool gate (planSafe:false). The conditional
-      // spread keeps the absent-by-default semantics: omitting
-      // the flag on the parent side leaves the child running
-      // with normal (non-plan) execution.
-      ...(opts.planMode === true ? { planMode: true } : {}),
       // Trust verdict from the parent's bootstrap. Without this
       // forward, `harness/loop.ts` would default `isCwdTrusted`
       // to false (fail-closed) for every subagent — so a tool

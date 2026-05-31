@@ -82,7 +82,6 @@ import { composeWithIdentity } from './identity-prompt.ts';
 import { localIsoDate } from './local-date.ts';
 import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
 import { composeWithParallelHint } from './parallel-prompt.ts';
-import { composeWithUserPrompt } from './plan-prompt.ts';
 import { composeWithPlaybookHint } from './playbook-prompt.ts';
 import { assembleProjectPointer, composeWithProjectPointer } from './project-pointer.ts';
 import { composeWithResponseFormat } from './response-format.ts';
@@ -104,18 +103,13 @@ export interface BootstrapInput {
   cwd?: string;
   budget?: Partial<RunBudget>;
   signal?: AbortSignal;
-  // Plan mode (AGENTIC_CLI §5): read-only profile. Plumbs through
-  // to the harness's planMode flag and triggers injection of a
-  // plan-aware system prompt instructing structured output.
-  plan?: boolean;
   // Initial approval posture seed (AGENTIC_CLI §8). CLI `--autonomous`
   // routes here; bootstrap forwards it to bootstrapPermissionEngine →
   // EngineOptions.approvalPosture. Absent ⇒ supervised (the safe
   // default). Distinct from the execution profile.
   approvalPosture?: ApprovalPosture;
-  // Caller-supplied system prompt. When `plan` is also set, the
-  // plan-mode prompt is prepended (plan-mode is the operating
-  // profile; user content is layered as extra context).
+  // Caller-supplied system prompt. Layered as the most-specific
+  // chunk beneath the playbook / ergonomics / parallelism stack.
   systemPrompt?: string;
   // Sampling temperature plumbed straight to HarnessConfig.
   // Evals set this to 0 for deterministic runs.
@@ -791,14 +785,12 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     //
     //    1. Caller's user prompt (input.systemPrompt) — most
     //       specific, the operator's own framing.
-    //    2. Plan mode prompt — operating-mode framing for
-    //       `--plan` invocations only.
-    //    3. Playbook discovery hint — table of available
+    //    2. Playbook discovery hint — table of available
     //       subagents + auto-delegation criteria (PLAYBOOKS.md
-    //       §1.4). Sits between parallel and plan/user because
-    //       the table assumes the model already knows the
+    //       §1.4). Sits between parallel and the user prompt
+    //       because the table assumes the model already knows the
     //       task_async family from the parallel layer.
-    //    4. Tool ergonomics — high-payoff usage rules distilled
+    //    3. Tool ergonomics — high-payoff usage rules distilled
     //       from `TOOL_ERGONOMICS.md` (slice before reading,
     //       filter before stdout, scope conservatively, prefer
     //       dedicated tools, do not re-read in session, diagnose
@@ -806,39 +798,37 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     //       playbook hint because it teaches "when you make
     //       tool calls, MAKE THEM WELL" — paired with the
     //       "you can make several at once" framing right above.
-    //    5. Parallelism hint — universal background that
+    //    4. Parallelism hint — universal background that
     //       surfaces the harness's concurrency affordances
     //       (multi-tool turns, task_async family) so the
     //       capability isn't dormant.
-    //    6. Constraints block — the canonical "constraints
+    //    5. Constraints block — the canonical "constraints
     //       negativas globais" section (CONTEXT_TUNING §1.1 /
     //       §1.6): the correctness floor (no inventing symbols,
     //       evidence over assumption, no silent semantic change)
     //       plus the security posture, the hard-to-reverse
     //       confirm rule, and the contradictory-goal rule.
-    //    7. Response-format hint — render-target rules
+    //    6. Response-format hint — render-target rules
     //       (CommonMark in monospace ANSI, file:line refs,
     //       no-emoji default, structural padding bans) per
     //       ANTI_PATTERNS.md §1.3.
-    //    8. Task discipline — behavioral norms (prefer editing,
+    //    7. Task discipline — behavioral norms (prefer editing,
     //       no premature abstractions, WHY-only comments, no
     //       half-finished work). Most-general operational
     //       framing; sits above response-format because it
     //       governs WHAT the model writes, while response-format
     //       governs HOW it formats output.
-    //    9. Environment block — situational anchor: cwd, OS,
+    //    8. Environment block — situational anchor: cwd, OS,
     //       model, today's date, git context. Date in this
     //       section invalidates cache once per UTC day
     //       (acceptable per CONTEXT_TUNING §3.2; the
     //       alternative — placeholder + post-cache substitution
     //       — is not supported by Anthropic's API).
-    //   10. Identity / role marker — sits OUTERMOST so it lands
+    //    9. Identity / role marker — sits OUTERMOST so it lands
     //       first (CONTEXT_TUNING §1.1: identity is the first
     //       canonical [system] section). Fully static, unlike
     //       the environment block's date below it.
-    const baseDownstream =
-      input.plan === true ? composeWithUserPrompt(input.systemPrompt) : input.systemPrompt;
-    const withPlaybook = composeWithPlaybookHint(baseDownstream, subagents);
+    const withPlaybook = composeWithPlaybookHint(input.systemPrompt, subagents);
     const withErgonomics = composeWithToolErgonomics(withPlaybook);
     const withParallel = composeWithParallelHint(withErgonomics);
     const withConstraints = composeWithConstraints(withParallel);
@@ -1084,15 +1074,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     //     downstream by computing the hash separately),
     //   - the cwd is trusted at boot (without cwd trust, the
     //     operator hasn't consented to operate in this directory,
-    //     so prompting them about its shared corpus is premature),
-    //   - we are NOT in `--plan` mode. Plan mode is the read-only
-    //     profile (AGENTIC_CLI §5); a 'no' answer would trigger
-    //     bulk-invalidate writes (.tombstones/, eviction_events,
-    //     memory_events, clearSharedTrust) that violate the no-
-    //     writes contract. We skip the probe in plan; the
-    //     downstream fail-closed gate still excludes the scope
-    //     when the stored hash diverges, so the model doesn't load
-    //     unattested content even when no modal fired.
+    //     so prompting them about its shared corpus is premature).
     //
     // Placement intent: AFTER the GC sweeps (an active shared
     // memory just auto-evicted by `gcExpiredMemories` would shift
@@ -1103,7 +1085,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // memories out of THIS session's system prompt (otherwise the
     // operator would need to restart for the revocation to take
     // effect).
-    if (input.askSharedTrust !== undefined && isCwdTrusted && input.plan !== true) {
+    if (input.askSharedTrust !== undefined && isCwdTrusted) {
       sharedTrustProbe = await probeSharedTrust({
         db,
         registry: memoryRegistry,
@@ -1200,8 +1182,6 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     //   - Untrusted cwd (operator declined cwd-trust): scope
     //     excluded; aligns with the spec's "trust is per-project"
     //     stance — no shared corpus without project trust.
-    //   - Plan mode (probe skipped per H4): same headless logic
-    //     applies; plan mode reads but doesn't bulk-invalidate.
     // Why `sharedScopeOffline` is a boolean while downstream callers
     // consume `excludeScopes: readonly MemoryScope[]`: the boolean
     // shape serializes cleanly across the subagent IPC boundary
@@ -1403,11 +1383,8 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     broker,
     userPrompt: input.prompt,
     // Checkpoints (M3 §12): enabled for every CLI run by default
-    // so users get `--undo` for free. Plan mode opts out — there's
-    // nothing to undo when no writes can land. Disabling here also
-    // saves one git probe per run, which matters when --plan is
-    // used inside non-git directories for read-only inspections.
-    enableCheckpoints: input.plan !== true,
+    // so users get `--undo` for free.
+    enableCheckpoints: true,
     // Wire the subagent set so the `task` tool can resolve names.
     // Always passed (even when empty) — the tool surfaces a clear
     // "no subagents defined" hint instead of "registry missing"
@@ -1456,7 +1433,6 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       return { budget: { ...budgetLoaded.config, ...(input.budget ?? {}) } };
     })(),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
-    ...(input.plan === true ? { planMode: true } : {}),
     // Slice Q — resolved state (always boolean, never undefined).
     // Precedence: CLI explicit > project config > user config > default ON.
     // memorySemanticVerifySource carries provenance for /memory

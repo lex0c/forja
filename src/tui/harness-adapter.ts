@@ -58,10 +58,6 @@ export interface HarnessAdapterCtx {
   // Optional spend cap. Mirrored into `step:budget.maxCostUsd`. Absent
   // means no cap — renderer shows steps/cost without budget shading.
   maxCostUsd?: number;
-  // Plan mode — read-only profile, harness refuses write tools.
-  // Forwarded into `session:start.planMode` so the footer can show
-  // the `plan` indicator. Defaults to false (full-write profile).
-  planMode?: boolean;
   // Distinct-name memory count at session boot. Forwarded into
   // `session:start.memoryCount` so the
   // footer can render the `mem N` segment. Caller (REPL) reads
@@ -199,7 +195,6 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           sessionId: event.sessionId,
           project: ctx.project,
           model: ctx.model,
-          ...(ctx.planMode === true ? { planMode: true } : {}),
           ...(ctx.memoryCount !== undefined ? { memoryCount: ctx.memoryCount } : {}),
         });
         // Initial step:budget so the status line shows "0/N · $0" from

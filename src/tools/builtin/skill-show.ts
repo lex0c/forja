@@ -48,7 +48,6 @@ export const skillShowTool: Tool<SkillShowInput, SkillShowOutput> = {
     category: 'misc',
     writes: false,
     idempotent: true,
-    planSafe: true,
     parallel_safe: true,
     display: 'raw',
     cost: { latency_ms_typical: 5 },

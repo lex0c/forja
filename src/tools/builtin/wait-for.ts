@@ -478,13 +478,11 @@ export const waitForTool: Tool<WaitForInput, WaitForOutput> = {
   },
   metadata: {
     // Pure observational primitive: no command, no path mutation,
-    // no policy decision worth gating beyond plan-mode (which
-    // doesn't fire for misc tools). The conditions are read-only
+    // no policy decision worth gating. The conditions are read-only
     // probes — file existence checks, TCP connect+close, HTTP HEAD.
     category: 'misc',
     writes: false,
     idempotent: false, // wall-clock dependent
-    planSafe: true, // observational; safe in plan mode
     display: 'raw',
     cost: { latency_ms_typical: 0 }, // dominated by wait, not LLM
   },

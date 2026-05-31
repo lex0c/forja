@@ -7,7 +7,7 @@
 // result for the model. All pipeline plumbing — views, ranking,
 // compression, trace persistence — happens inside the runner.
 //
-// Read-only and plan-safe (the trace insert is the only DB write
+// Read-only (the trace insert is the only DB write
 // and it's append-only audit, not state mutation the operator
 // would scope under "writes"). Parallel-safe — multiple retrieval
 // calls in one turn don't interfere; each lands its own trace row.
@@ -190,7 +190,6 @@ export const retrieveContextTool: Tool<RetrieveContextInput, RetrieveContextOutp
     category: 'misc',
     writes: false,
     idempotent: true,
-    planSafe: true,
     parallel_safe: true,
     display: 'raw',
     cost: { latency_ms_typical: 30 },

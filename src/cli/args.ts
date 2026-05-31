@@ -16,11 +16,6 @@ export interface ParsedArgs {
   json: boolean;
   version: boolean;
   help: boolean;
-  // Plan mode (AGENTIC_CLI §5): harness-level read-only profile.
-  // Tools that mutate (writes:true) are blocked before execution
-  // regardless of policy; the model produces a structured plan and
-  // exits without applying.
-  plan: boolean;
   // Initial approval posture (AGENTIC_CLI §8): start in Autonomous —
   // auto-approve routine policy confirms — instead of the default
   // Supervised. Risk confirms (compound / protected / score / degraded)
@@ -128,7 +123,7 @@ export interface ParsedArgs {
   // publishes the terminal payload to subagent_outputs, and
   // exits. The flag is internal — users never invoke it
   // directly. Mutually exclusive with every other CLI mode
-  // (resume, list-sessions, undo, checkpoints, plan).
+  // (resume, list-sessions, undo, checkpoints).
   subagentSessionId?: string;
   // Subagent recursion depth carried across the subprocess
   // boundary. The parent's `runSubagent` knows the depth this
@@ -149,18 +144,6 @@ export interface ParsedArgs {
   // --subagent-session-id. When omitted the child runs at the
   // provider's default — same semantics as the top-level harness.
   subagentTemperature?: number;
-  // Plan-mode flag carried across the subprocess boundary.
-  // Presence = true (no value); absence = false. The top-level
-  // `task` tool gate (planSafe:false) refuses spawning under
-  // plan mode TODAY, so the practical user-visible scenario is
-  // closed at a higher layer. But: programmatic callers that
-  // invoke `runSubagent({ planMode: true })` directly bypass
-  // the top-level gate, AND a future regression flipping the
-  // task tool's planSafe back to true would reopen the surface.
-  // Forwarding here is defense in depth — the child's harness
-  // gate also refuses writes under planMode, so a write tool
-  // in the whitelist is doubly blocked.
-  subagentPlanMode?: boolean;
   // Trust state carried across the subprocess boundary.
   // Presence = true (no value); absence = false. Spec §9 trust
   // is per-PROJECT, not per-instance: the parent already
@@ -561,7 +544,6 @@ const parseInitSubcommand = (argv: readonly string[]): ParseResult | null => {
           json: false,
           version: false,
           help: true,
-          plan: false,
           listSessions: false,
           includeSubagents: false,
           explainPermissions: false,
@@ -606,7 +588,6 @@ const parseInitSubcommand = (argv: readonly string[]): ParseResult | null => {
       json: false,
       version: false,
       help: false,
-      plan: false,
       listSessions: false,
       includeSubagents: false,
       explainPermissions: false,
@@ -647,7 +628,6 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
           json: false,
           version: false,
           help: true,
-          plan: false,
           listSessions: false,
           includeSubagents: false,
           explainPermissions: false,
@@ -705,7 +685,6 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
       json,
       version: false,
       help: false,
-      plan: false,
       listSessions: false,
       includeSubagents: false,
       explainPermissions: false,
@@ -758,7 +737,6 @@ const parseWelcomeSubcommand = (argv: readonly string[]): ParseResult | null => 
           json: false,
           version: false,
           help: true,
-          plan: false,
           listSessions: false,
           includeSubagents: false,
           explainPermissions: false,
@@ -782,7 +760,6 @@ const parseWelcomeSubcommand = (argv: readonly string[]): ParseResult | null => 
       json: false,
       version: false,
       help: false,
-      plan: false,
       listSessions: false,
       includeSubagents: false,
       explainPermissions: false,
@@ -828,7 +805,6 @@ const parseSandboxSubcommand = (argv: readonly string[]): ParseResult | null => 
           json: false,
           version: false,
           help: true,
-          plan: false,
           listSessions: false,
           includeSubagents: false,
           explainPermissions: false,
@@ -852,7 +828,6 @@ const parseSandboxSubcommand = (argv: readonly string[]): ParseResult | null => 
       json,
       version: false,
       help: false,
-      plan: false,
       listSessions: false,
       includeSubagents: false,
       explainPermissions: false,
@@ -879,7 +854,6 @@ const parseDoctorSubcommand = (argv: readonly string[]): ParseResult | null => {
           json: false,
           version: false,
           help: true,
-          plan: false,
           listSessions: false,
           includeSubagents: false,
           explainPermissions: false,
@@ -903,7 +877,6 @@ const parseDoctorSubcommand = (argv: readonly string[]): ParseResult | null => {
       json,
       version: false,
       help: false,
-      plan: false,
       listSessions: false,
       includeSubagents: false,
       explainPermissions: false,
@@ -1011,7 +984,6 @@ const parsePurgeSubcommand = (argv: readonly string[]): ParseResult | null => {
           json: false,
           version: false,
           help: true,
-          plan: false,
           listSessions: false,
           includeSubagents: false,
           explainPermissions: false,
@@ -1043,7 +1015,6 @@ const parsePurgeSubcommand = (argv: readonly string[]): ParseResult | null => {
       json,
       version: false,
       help: false,
-      plan: false,
       listSessions: false,
       includeSubagents: false,
       explainPermissions: false,
@@ -1087,7 +1058,6 @@ const parseGcSubcommand = (argv: readonly string[]): ParseResult | null => {
           json: false,
           version: false,
           help: true,
-          plan: false,
           listSessions: false,
           includeSubagents: false,
           explainPermissions: false,
@@ -1134,7 +1104,6 @@ const parseGcSubcommand = (argv: readonly string[]): ParseResult | null => {
       json,
       version: false,
       help: false,
-      plan: false,
       listSessions: false,
       includeSubagents: false,
       explainPermissions: false,
@@ -1185,7 +1154,6 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
           json: false,
           version: false,
           help: true,
-          plan: false,
           listSessions: false,
           includeSubagents: false,
           explainPermissions: false,
@@ -1496,7 +1464,6 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
       json,
       version: false,
       help: false,
-      plan: false,
       listSessions: false,
       includeSubagents: false,
       explainPermissions: false,
@@ -1541,7 +1508,6 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
     json: false,
     version: false,
     help: false,
-    plan: false,
     listSessions: false,
     includeSubagents: false,
     explainPermissions: false,
@@ -1563,10 +1529,6 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         break;
       case '--json':
         args.json = true;
-        i += 1;
-        break;
-      case '--plan':
-        args.plan = true;
         i += 1;
         break;
       case '--autonomous':
@@ -1852,17 +1814,9 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         i += 2;
         break;
       }
-      case '--subagent-plan-mode':
-        // Presence-only flag (no value), mirroring `--plan`.
-        // Setting to false would require the absence form; we
-        // never need to pass a literal "false" because the
-        // child defaults to non-plan-mode when the flag isn't
-        // supplied.
-        args.subagentPlanMode = true;
-        i += 1;
-        break;
       case '--subagent-cwd-trusted':
-        // Presence-only flag, same pattern as `--subagent-plan-mode`.
+        // Presence-only flag, same pattern as
+        // `--subagent-shared-scope-offline`.
         // Absence = false (fail-closed). Parent only emits this
         // when its OWN bootstrap resolved the cwd as trusted
         // against `~/.config/agent/trust.json`, so the child
@@ -2143,7 +2097,6 @@ export const usage = (): string =>
     '  --version, -v          Print version and exit',
     '  --help, -h             Show this help and exit',
     '  --json                 Emit NDJSON events to stdout (headless)',
-    '  --plan                 Read-only mode: produce a plan, do not apply changes',
     '  --autonomous           Start in Autonomous mode: auto-approve routine confirms (Shift+Tab toggles)',
     '  --list-sessions        Print known sessions (newest first) and exit',
     '  --include-subagents    With --list-sessions, fan parents into their subagent children (requires --list-sessions)',

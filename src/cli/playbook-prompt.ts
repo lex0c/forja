@@ -10,7 +10,7 @@
 // Composition order (see `bootstrap.ts`): the parallel hint goes
 // FIRST (it explains the harness's concurrency primitives, which
 // the playbook section then assumes); the playbook hint sits
-// between parallel and the user/plan layers.
+// between parallel and the user-prompt layer.
 //
 // Cap (`PLAYBOOKS.md` §1.4): the table holds at most 12 data rows
 // and the whole block stays under ~800 tokens. Twelve covers the

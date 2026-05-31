@@ -97,7 +97,6 @@ const makeCtx = (repo: string): CtxBundle => {
   const baseConfig = {
     cwd: repo,
     enableCheckpoints: false,
-    planMode: false,
     budget: { ...DEFAULT_BUDGET },
     provider: {
       id: 'test/m',

@@ -225,8 +225,4 @@ describe('pin_context tool: metadata', () => {
     expect(pinContextTool.metadata.requiresOperatorConfirm).toBe(true);
     expect(pinContextTool.metadata.idempotent).toBe(false);
   });
-
-  test('omits planSafe (default-block in plan mode)', () => {
-    expect(pinContextTool.metadata.planSafe).toBeUndefined();
-  });
 });

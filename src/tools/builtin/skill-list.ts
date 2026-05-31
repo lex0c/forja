@@ -41,7 +41,6 @@ export const skillListTool: Tool<SkillListInput, SkillListOutput> = {
     category: 'misc',
     writes: false,
     idempotent: true,
-    planSafe: true,
     parallel_safe: true,
     display: 'list',
     cost: { latency_ms_typical: 0 },

@@ -160,8 +160,8 @@ const buildBuiltinRegistry = (): ToolRegistry => {
 // stated audit purpose (AUDIT.md §1.7.2). Drop both as (flag,
 // value) pairs before hashing. Other forwarded flags
 // (`--subagent-depth`, `--subagent-temperature`,
-// `--subagent-plan-mode`, `--subagent-cwd-trusted`,
-// `--subagent-memory-cwd`, `--ipc=N`) ARE config and stay in.
+// `--subagent-cwd-trusted`, `--subagent-memory-cwd`, `--ipc=N`)
+// ARE config and stay in.
 const ARGV_HASH_DROP_PAIRS: readonly string[] = ['--subagent-session-id', '--subagent-bg-log-dir'];
 
 // SHA256 over a stable subset of the spawn argv. The hash is a
@@ -227,7 +227,6 @@ export interface RunSubagentInput {
   onEvent?: (event: unknown) => void;
   temperature?: number;
   subagentRegistry?: SubagentSet;
-  planMode?: boolean;
   // Trust verdict from the parent's bootstrap (spec §9). Forwarded
   // via `--subagent-cwd-trusted` to the child process so the
   // child's harness honors the SAME trust decision the parent
@@ -751,7 +750,6 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       // parent's: same shared, same local, same user scope.
       memoryCwd: input.cwd,
       ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
-      ...(input.planMode === true ? { planMode: true } : {}),
       ...(input.cwdTrusted === true ? { cwdTrusted: true } : {}),
       ...(input.sharedScopeOffline === true ? { sharedScopeOffline: true } : {}),
       // Forward the IPC opt-in. The default spawn factory

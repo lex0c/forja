@@ -501,7 +501,6 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         cwd,
         ...(args.model !== undefined ? { modelId: args.model } : {}),
         ...(args.maxSteps !== undefined ? { budget: { maxSteps: args.maxSteps } } : {}),
-        ...(args.plan === true ? { plan: true } : {}),
         // Forward the trust-list override so REPL and bootstrap
         // agree on which file is authoritative. Without this,
         // a test that pins `trustListPathOverride` for the boot
@@ -729,8 +728,8 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   const project = basename(baseConfig.cwd) || baseConfig.cwd;
 
   // Snapshot the adapter context fresh for every turn. Mutation slash
-  // commands (/model, /budget, /plan) edit baseConfig at runtime —
-  // capturing model/budget/planMode at boot would freeze the
+  // commands (/model, /budget) edit baseConfig at runtime —
+  // capturing model/budget at boot would freeze the
   // adapter's view, so subsequent session:start and step:budget
   // events would surface the OLD values while the harness executes
   // with the NEW ones. The footer / status indicators would then
@@ -763,7 +762,6 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       model: baseConfig.provider.id,
       maxSteps: budget.maxSteps,
       ...(budget.maxCostUsd !== undefined ? { maxCostUsd: budget.maxCostUsd } : {}),
-      ...(baseConfig.planMode === true ? { planMode: true } : {}),
       // Distinct-name memory count for the footer's `mem N` segment.
       // Snapshot at adapter-construction time (per-turn) — if a
       // memory_write succeeds mid-turn, the next turn's adapter
@@ -1678,16 +1676,6 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           // this forward the slash dispatch path opens that exact
           // drift hole; mirror the loop's wiring.
           ...(baseConfig.hooks !== undefined ? { hooksSnapshot: baseConfig.hooks } : {}),
-          // Plan mode propagation. When `/plan on` is active the
-          // foreground harness refuses every writing tool — the
-          // slash dispatcher must inherit the same gate, otherwise
-          // `/<playbook> ...` becomes a sandbox escape that runs
-          // mutating tools while the operator believes the session
-          // is read-only. Mirrors the harness's spawnSubagentImpl
-          // wiring (loop.ts) — read fresh from baseConfig per
-          // dispatch so a /plan toggle BETWEEN dispatches takes
-          // effect immediately.
-          ...(baseConfig.planMode === true ? { planMode: true } : {}),
           // Permission proxy (spec docs/spec/IPC.md §7). Without this
           // the runtime auto-denies every child `permission:ask`, so a
           // playbook that touches a confirm-gated tool (bash / write

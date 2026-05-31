@@ -170,23 +170,7 @@ describe('bootstrap', () => {
     db.close();
   });
 
-  test('plan: true sets harness planMode and injects plan-aware system prompt', async () => {
-    const { config, db } = await bootstrap({
-      prompt: 'refactor auth',
-      cwd: workdir,
-      providerOverride: mockProvider,
-      dbPath,
-      enterprisePolicyPath: null,
-      userPolicyPath: null,
-      plan: true,
-    });
-    expect(config.planMode).toBe(true);
-    expect(config.systemPrompt).toContain('PLAN MODE');
-    expect(config.systemPrompt).toContain('BLOCKED');
-    db.close();
-  });
-
-  test('plan omitted leaves planMode unset; system prompt carries the parallelism hint', async () => {
+  test('system prompt carries the parallelism hint as a base preamble', async () => {
     // Post-D227: every bootstrap surfaces the parallelism hint
     // as a base preamble so the model knows multi-tool turns
     // dispatch concurrently. Pre-D227 this test asserted
@@ -200,7 +184,6 @@ describe('bootstrap', () => {
       enterprisePolicyPath: null,
       userPolicyPath: null,
     });
-    expect(config.planMode).toBeUndefined();
     expect(config.systemPrompt).toBeDefined();
     expect(config.systemPrompt).toContain('# Parallelism');
     expect(config.systemPrompt).toContain('emit MULTIPLE tool calls in a SINGLE turn');
@@ -256,12 +239,11 @@ describe('bootstrap', () => {
     db.close();
   });
 
-  test('plan + caller systemPrompt composes (parallelism hint, then plan, then user)', async () => {
-    // Post-D227: three-layer composition. Parallelism hint is
-    // the universal background; plan-mode prompt is the
-    // operating mode; caller's prompt is the most specific
-    // context. Ordering must be hint → plan → user so the
-    // model reads them most-generic → most-specific.
+  test('caller systemPrompt composes under the parallelism hint (hint, then user)', async () => {
+    // Post-D227: two-layer composition. Parallelism hint is the
+    // universal background; caller's prompt is the most specific
+    // context. Ordering must be hint → user so the model reads
+    // them most-generic → most-specific.
     const { config, db } = await bootstrap({
       prompt: 'refactor',
       cwd: workdir,
@@ -269,18 +251,13 @@ describe('bootstrap', () => {
       dbPath,
       enterprisePolicyPath: null,
       userPolicyPath: null,
-      plan: true,
       systemPrompt: 'Project convention: prefer functional style.',
     });
-    expect(config.planMode).toBe(true);
     expect(config.systemPrompt).toContain('# Parallelism');
-    expect(config.systemPrompt).toContain('PLAN MODE');
     expect(config.systemPrompt).toContain('Project convention');
     const hintIdx = (config.systemPrompt ?? '').indexOf('# Parallelism');
-    const planIdx = (config.systemPrompt ?? '').indexOf('PLAN MODE');
     const userIdx = (config.systemPrompt ?? '').indexOf('Project convention');
-    expect(hintIdx).toBeLessThan(planIdx);
-    expect(planIdx).toBeLessThan(userIdx);
+    expect(hintIdx).toBeLessThan(userIdx);
     db.close();
   });
 
@@ -378,12 +355,12 @@ Body.`,
     db.close();
   });
 
-  test('playbook hint composes with plan-mode (parallel → playbook → plan → user)', async () => {
-    // Four-layer ordering: most-generic background first, then
-    // catalogue, then operating mode, then operator-specific
-    // framing. Anchors the bootstrap.ts comment and prevents a
-    // future refactor from reordering the layers without
-    // updating the model's mental hierarchy.
+  test('playbook hint composes with the user prompt (parallel → playbook → user)', async () => {
+    // Three-layer ordering: most-generic background first, then
+    // catalogue, then operator-specific framing. Anchors the
+    // bootstrap.ts comment and prevents a future refactor from
+    // reordering the layers without updating the model's mental
+    // hierarchy.
     writePlaybookDef('refactor', 'apply scope-bounded mutations');
     const { config, db } = await bootstrap({
       prompt: 'hi',
@@ -392,18 +369,15 @@ Body.`,
       dbPath,
       enterprisePolicyPath: null,
       userPolicyPath: null,
-      plan: true,
       systemPrompt: 'Project convention: prefer pure functions.',
     });
     expect(config.systemPrompt).toBeDefined();
     const parallelIdx = (config.systemPrompt ?? '').indexOf('# Parallelism');
     const playbookIdx = (config.systemPrompt ?? '').indexOf('# Playbook subagents');
-    const planIdx = (config.systemPrompt ?? '').indexOf('PLAN MODE');
     const userIdx = (config.systemPrompt ?? '').indexOf('Project convention');
     expect(parallelIdx).toBeGreaterThanOrEqual(0);
     expect(playbookIdx).toBeGreaterThan(parallelIdx);
-    expect(planIdx).toBeGreaterThan(playbookIdx);
-    expect(userIdx).toBeGreaterThan(planIdx);
+    expect(userIdx).toBeGreaterThan(playbookIdx);
     db.close();
   });
 
@@ -499,7 +473,7 @@ Body.`,
     //   4. # Response surface — render-target rules.
     //   5. # Constraints — global negative constraints (§1.6).
     //   6. # Parallelism — concurrency mechanics.
-    //   7. (caller / playbook hint / plan-mode wrap when applicable)
+    //   7. (caller / playbook hint wrap when applicable)
     //   8. # Memory — index of cross-session memories.
     const localDir = join(workdir, '.agent', 'memory', 'local');
     mkdirSync(localDir, { recursive: true });
@@ -738,7 +712,7 @@ When the goal is to orient in a new repo.
     db.close();
   });
 
-  test('caller systemPrompt is layered after identity / environment / discipline / response-format / constraints / parallelism without plan', async () => {
+  test('caller systemPrompt is layered after identity / environment / discipline / response-format / constraints / parallelism', async () => {
     // Caller prompt sits INNERMOST in the layered system prompt.
     // The outer wrappers (identity, environment, task discipline,
     // response-format, constraints, parallelism) all land before
@@ -753,7 +727,6 @@ When the goal is to orient in a new repo.
       userPolicyPath: null,
       systemPrompt: 'You are a senior engineer.',
     });
-    expect(config.planMode).toBeUndefined();
     expect(config.systemPrompt?.startsWith('You are the Hephaestus agent')).toBe(true);
     expect(config.systemPrompt).toContain('# Task discipline');
     expect(config.systemPrompt).toContain('# Response surface');
@@ -1751,45 +1724,6 @@ When the goal is to orient in a new repo.
       expect(result.sharedTrustProbe).toBeUndefined();
       expect(result.config.systemPrompt ?? '').not.toContain('UNTRUSTED_BODY');
       expect(result.config.memoryExcludeScopes).toEqual(['project_shared']);
-      result.db.close();
-    });
-
-    test('plan mode skips the probe entirely (CRIT/H4)', async () => {
-      // --plan is the read-only profile. A 'no' answer in plan mode
-      // would still run bulk-invalidate, writing tombstones,
-      // eviction_events, memory_events — violating the no-writes
-      // contract. The gate must skip the probe before any modal
-      // fires.
-      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
-      mkdirSync(sharedDir, { recursive: true });
-      writeFileSync(join(sharedDir, 'MEMORY.md'), '- [P](p.md) — h\n');
-      writeFileSync(
-        join(sharedDir, 'p.md'),
-        '---\nname: p\ndescription: h\ntype: feedback\nsource: user_explicit\n---\n\nbody\n',
-      );
-      const trustPath = join(workdir, 'trusted_dirs.json');
-      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
-
-      let modalCalls = 0;
-      const result = await bootstrap({
-        prompt: 'hi',
-        cwd: workdir,
-        providerOverride: mockProvider,
-        dbPath,
-        enterprisePolicyPath: null,
-        userPolicyPath: null,
-        trustListPathOverride: trustPath,
-        plan: true,
-        askSharedTrust: async () => {
-          modalCalls++;
-          return 'no';
-        },
-      });
-      // Probe was NOT called → no modal, no probe result.
-      expect(modalCalls).toBe(0);
-      expect(result.sharedTrustProbe).toBeUndefined();
-      // Plan mode → no checkpoint, no harness writes.
-      expect(result.config.enableCheckpoints).toBe(false);
       result.db.close();
     });
 

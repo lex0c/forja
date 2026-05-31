@@ -13,7 +13,6 @@ const baseArgs = (overrides: Partial<ParsedArgs> = {}): ParsedArgs => ({
   json: false,
   version: false,
   help: false,
-  plan: false,
   listSessions: false,
   includeSubagents: false,
   explainPermissions: false,
@@ -355,16 +354,15 @@ describe('run end-to-end with mock provider', () => {
     expect(flushed).toBe(true);
   });
 
-  test('plan mode respects --max-steps cap', async () => {
-    // Sanity: plan mode is just a profile flag — it doesn't bypass
-    // the budget. A small maxSteps caps exploration even in plan
-    // mode, returning exhausted/maxSteps as expected.
+  test('--max-steps cap is enforced (exhausted exit code)', async () => {
+    // Sanity: a small maxSteps caps exploration, returning
+    // exhausted/maxSteps as expected.
     const { renderer } = recordingRenderer();
     const stepFactory = (i: number): ScriptedStep => ({
       tool_uses: [{ id: `tu${i}`, name: 'unknown_tool', input: { i } }],
     });
     const code = await run({
-      args: baseArgs({ plan: true, maxSteps: 2 }),
+      args: baseArgs({ maxSteps: 2 }),
       bootstrapOverride: {
         providerOverride: mockProvider(Array.from({ length: 5 }, (_, i) => stepFactory(i))),
         dbPath,
@@ -374,23 +372,6 @@ describe('run end-to-end with mock provider', () => {
       rendererOverride: renderer,
     });
     expect(code).toBe(2); // exhausted exit code
-  });
-
-  test('plan mode prints the [plan mode] indicator on errSink', async () => {
-    const { renderer } = recordingRenderer();
-    const errLines: string[] = [];
-    await run({
-      args: baseArgs({ plan: true }),
-      bootstrapOverride: {
-        providerOverride: mockProvider([{ text: '# Plan\n\n## Goal\nrefactor' }]),
-        dbPath,
-        cwd: workdir,
-      },
-      signal: new AbortController().signal,
-      rendererOverride: renderer,
-      errSink: (s) => errLines.push(s),
-    });
-    expect(errLines.join('')).toContain('[plan mode]');
   });
 
   test('hook config warnings are surfaced to errSink before the run starts', async () => {

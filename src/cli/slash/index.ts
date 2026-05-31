@@ -17,7 +17,6 @@ import { memoryCommand } from './commands/memory.ts';
 import { modelCommand } from './commands/model.ts';
 import { permsCommand } from './commands/perms.ts';
 import { pinCommand } from './commands/pin.ts';
-import { planCommand } from './commands/plan.ts';
 import { buildPlaybookSlashCommands } from './commands/playbook.ts';
 import { quitCommand } from './commands/quit.ts';
 import { recapCommand } from './commands/recap.ts';
@@ -58,7 +57,6 @@ export const createBuiltinRegistry = (subagents?: SubagentSet): SlashRegistry =>
     recapCommand,
     subagentsCommand,
     modelCommand,
-    planCommand,
     budgetCommand,
     permsCommand,
     historyCommand,

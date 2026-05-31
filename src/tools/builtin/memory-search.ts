@@ -87,7 +87,6 @@ export const memorySearchTool: Tool<MemorySearchInput, MemorySearchOutput> = {
     category: 'misc',
     writes: false,
     idempotent: true,
-    planSafe: true,
     parallel_safe: true,
     display: 'list',
     // Body searches do disk reads; latency tracks roughly with the

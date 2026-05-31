@@ -65,12 +65,6 @@ export const taskAwaitTool: Tool<TaskAwaitInput, TaskAwaitOutput> = {
     // idempotent. The CHILD it observes is not, but that's
     // already captured in the spawn's own metadata.
     idempotent: true,
-    // Plan mode: same gate as `task` / `task_async`. The block
-    // doesn't write, but the run we're observing might. Refusing
-    // here keeps the global "no spawning during plan" rule
-    // simple — operator can still cancel a leftover handle via
-    // task_cancel.
-    planSafe: false,
     display: 'raw',
   },
   async execute(args, ctx): Promise<ToolResult<TaskAwaitOutput>> {

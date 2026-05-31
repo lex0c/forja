@@ -54,9 +54,6 @@ export const bashBackgroundTool: Tool<BashBackgroundInput, BashBackgroundOutput>
     category: 'bash',
     // Pessimistic: a background command typically writes (it's the
     // whole point of running a dev server, build, watcher, etc.).
-    // Plan mode therefore blocks it without a `planSafe` predicate
-    // — there's no read-only sense in which a long-running background
-    // process makes sense in plan mode anyway.
     writes: true,
     // See bash.ts — same rationale: bg commands typically spawn
     // processes and may touch filesystem outside cwd. Drives the

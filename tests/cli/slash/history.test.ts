@@ -54,7 +54,6 @@ const makeCtx = (
   const baseConfig = {
     cwd,
     enableCheckpoints: false,
-    planMode: false,
     budget: { ...DEFAULT_BUDGET },
     provider: {
       id: 'test/m',

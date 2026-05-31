@@ -2,6 +2,22 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-31] plan-mode — remove the read-only plan profile (code-only; spec kept)
+
+Operator's call: drop plan mode entirely from the code; it will return later as a playbook. `docs/spec/` is deliberately kept (plan mode stays a design target — code-behind-spec, same posture as the critique removal). Branched `chore/remove-plan-mode` off `develop`.
+
+Plan mode = `--plan` → `HarnessConfig.planMode` → a read-only execution profile, enforced in `invoke-tool.ts` via the `planSafe` tool-metadata predicate (declared on ~18 builtin tools). Removing it removes the read-only guarantee until the future playbook re-implements it via the capability/permission system. Removed (~70 files): the `planSafe` field on `ToolMetadata` + all tool declarations + the invoke-tool enforcement block; `HarnessConfig.planMode` + `InvokeToolDeps.planMode`; the `/plan` slash + deleted `plan-prompt.ts`; the `plan:review` TUI flow (event/reducer/adapter/`SessionStartEvent.planMode`); the loop's plan-mode suppression of the memory LLM-judge detectors (unwrapped so the three detector schedulers now always construct on their own enabled conditions) + its dedicated test; subagent planMode propagation (`--subagent-plan-mode` flag, runtime/spawn-factory); the `--plan` CLI flag + eval `plan` field (loader/executor/types) + the two plan eval scripts.
+
+Removed via the lead doing the harness contract (`ToolMetadata.planSafe`, `HarnessConfig.planMode`, the invoke-tool enforcement) then 5 parallel agents (harness loop+tests, tools, TUI, CLI, memory/subagents) typecheck-guided, plus a lead follow-up for the `src/evals/` plan threading the agents weren't scoped on (caught by the repo-wide grep). `src/permissions/engine.ts` was a false positive — its "plan" hits are the unrelated **sandbox-plan** subsystem, correctly left intact.
+
+Two follow-ups after the operator confirmed "remove completely": (1) bash's `read_only` arg — it was plan mode's `planSafe` predicate input and is now read by nothing — was removed (the `parallel_safe` doc comment that cited it was reworded). (2) The non-spec docs that still described `--plan` as live were updated to match the code: README (plan-mode paragraph + table cell + the stale `/plan` REPL-list entry), `SYSTEM_PROMPT.md` (the `composeWithUserPrompt` prepend-chain + the assembly "Plan-mode warning" step, renumbered), `MEMORY.md` (the two detector-suppression-in-plan-mode passages — the detectors themselves stay), `SECURITY.md` (the §5.5.5 `--plan` read-only section + `plan_mode_active` deny reason, subsequent subsections renumbered). `docs/spec/` stays untouched (plan mode kept there as the future-playbook design target).
+
+**Max-effort review (5 angles) caught 2 real bugs the typecheck/offline-suite masked, plus stale comments — all fixed.** (1) `src/evals/loader.ts` still listed `'plan'` in `TOP_LEVEL_KEYS`, so a `plan: true` eval YAML loaded silently instead of being rejected (defeating the loader's unknown-key contract). (2) FIVE plan-mode eval YAMLs survived (`evals/smoke/05`, `smoke/07-bash-readonly`, `regression/27/28/29`) — they'd run write-enabled if the eval tier ran, no longer testing what they pin. Both slipped my earlier "grep clean" because that grep was IDENTIFIER-scoped (`planMode`/`--plan`) and missed bare `plan: true` in YAML + case-variant comments; a broad case-insensitive grep is the lesson. Also reworded 7 stale comments (in untouched tool files) that still described plan mode as a live gate. Noted-not-fixed: the SessionStart hook `profile` field is now always `'default'` — a frozen constant, but it's a published hook-payload contract field, so left as-is.
+
+**Validation:** typecheck clean; Biome clean; broad case-insensitive repo-wide grep clean of all plan-mode survivors (only the unrelated **sandbox-plan** subsystem remains); full suite **10022 pass / 0 fail / 1 skip** (post-review-fixes).
+
+**Branch:** `chore/remove-plan-mode`.
+
 ## [2026-05-31] critique — remove the self-critique subsystem (code-only; spec kept as design target)
 
 Operator's deliberate call: drop self-critique entirely (the second-pass review of `AGENTIC_CLI §5.4` / `ORCHESTRATION §6`). Branched `chore/remove-critique` off `develop`. **Code + tests fully removed and green; `docs/spec/` is deliberately left UNTOUCHED** — critique stays documented as a design target (code-behind-spec, same posture as the execution-profile removal), not a spec divergence to reconcile now.

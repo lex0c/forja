@@ -6,7 +6,7 @@
 // from the registry's factory.
 //
 // Mutation lands in baseConfig and takes effect on the NEXT turn —
-// matches /plan and /budget. The current turn (if any) already
+// matches /budget. The current turn (if any) already
 // snapshot its provider when startTurn ran; live cancellation for a
 // model swap would surprise the operator.
 //

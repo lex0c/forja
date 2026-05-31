@@ -103,7 +103,7 @@ agent --json "what changed in the last commit?" > events.ndjson
 
 | Subsystem | What it does | Surfaces |
 |---|---|---|
-| **Harness loop** | The agent runtime: step budget, max-cost cap, compaction at 70% context, retries with classified failure modes | `agent <prompt>`, `agent --plan` |
+| **Harness loop** | The agent runtime: step budget, max-cost cap, compaction at 70% context, retries with classified failure modes | `agent <prompt>` |
 | **Permissions** | Layered allow/deny policy with glob + prefix matching (no regex). Sandbox profiles per tool category. Per-session approval posture (supervised / autonomous) | `agent --explain-permissions`, `--autonomous`, Shift+Tab, `.agent/permissions.yaml` |
 | **Memory** | Cross-session knowledge with three scopes (user / project_shared / project_local), explicit trust, lifecycle states (active / quarantined / invalidated), provenance tracking | `agent --memory list`, `agent --memory show <name>`, `/memory` slash |
 | **Skills** | Eager-loaded catalog of operator-authored procedures, body lazy | Skills auto-surface in system prompt; `/skill` slash |
@@ -120,7 +120,7 @@ agent --json "what changed in the last commit?" > events.ndjson
 ## Modes
 
 **Interactive REPL** (default). Persistent TUI with inline rendering, slash
-commands (`/memory`, `/budget`, `/plan`, `/history`, …), reverse search,
+commands (`/memory`, `/budget`, `/history`, …), reverse search,
 ctrl-c double-tap-to-exit gate.
 
 **One-shot.** Pass the prompt as a positional arg; Forja runs to completion
@@ -136,14 +136,6 @@ carries logs. Consumable by external tooling:
 
 ```bash
 agent --json "lint the src/ tree" | jq 'select(.type=="tool:end")'
-```
-
-**Plan mode.** `--plan` runs the agent in read-only mode — no writes, no
-mutating bash. Useful to preview what the agent would do before letting it
-loose:
-
-```bash
-agent --plan "what would you change to add pagination to /orders?"
 ```
 
 ---

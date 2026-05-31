@@ -46,7 +46,6 @@ const makeCtx = (opts: CtxOpts = {}): SlashContext => {
   const baseConfig = {
     cwd: '/test',
     enableCheckpoints: false,
-    planMode: false,
     budget: { ...DEFAULT_BUDGET },
     provider: { id: 'test/m', capabilities: { context_window: 1000, output_max_tokens: 100 } },
   } as unknown as HarnessConfig;
