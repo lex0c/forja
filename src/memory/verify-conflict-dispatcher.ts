@@ -318,6 +318,9 @@ export const dispatchConflictVerify = async (
       provider: input.provider,
       parentToolRegistry: input.parentToolRegistry,
       permissionEngine: input.permissionEngine,
+      // Governance verify subagents never inherit autonomous
+      // (security-sensitive, automatic). Always Supervised.
+      inheritApprovalPosture: false,
       db,
       cwd: input.cwd,
       ipc: true,

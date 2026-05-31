@@ -71,6 +71,39 @@ describe('subagent_runs repo', () => {
     expect(getSubagentRun(db, child.id)?.budgetMaxWallMs).toBeNull();
   });
 
+  test('approvalPosture round-trips (migration 070): child inherits autonomous', () => {
+    const child = seedSession(seedSession().id);
+    insertSubagentRun(db, {
+      sessionId: child.id,
+      name: 'review',
+      scope: 'user',
+      sourcePath: '/u/review.md',
+      sourceSha256: 'b'.repeat(64),
+      systemPrompt: 'review',
+      toolsWhitelist: [],
+      budgetMaxSteps: 5,
+      budgetMaxCostUsd: 0,
+      approvalPosture: 'autonomous',
+    });
+    expect(getSubagentRun(db, child.id)?.approvalPosture).toBe('autonomous');
+  });
+
+  test('approvalPosture defaults to supervised when omitted (fail-closed)', () => {
+    const child = seedSession(seedSession().id);
+    insertSubagentRun(db, {
+      sessionId: child.id,
+      name: 'review',
+      scope: 'user',
+      sourcePath: '/u/review.md',
+      sourceSha256: 'b'.repeat(64),
+      systemPrompt: 'review',
+      toolsWhitelist: [],
+      budgetMaxSteps: 5,
+      budgetMaxCostUsd: 0,
+    });
+    expect(getSubagentRun(db, child.id)?.approvalPosture).toBe('supervised');
+  });
+
   test('returns null for unknown session id', () => {
     expect(getSubagentRun(db, 'nope')).toBeNull();
   });

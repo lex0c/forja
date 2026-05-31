@@ -203,6 +203,14 @@ export interface RunSubagentInput {
   provider: Provider;
   parentToolRegistry: ToolRegistry;
   permissionEngine: PermissionEngine;
+  // Whether this spawn inherits the parent's approval posture
+  // (operation-mode). Default true — task subagents the operator
+  // dispatched run under the operator's posture. The memory-governance
+  // verify dispatchers pass `false`: they're automatic, security-
+  // sensitive (they scan possibly-injected memory), and NOT the
+  // operator's delegated work, so they always run Supervised regardless
+  // of the parent's posture (fail-closed).
+  inheritApprovalPosture?: boolean;
   db: DB;
   cwd: string;
   signal?: AbortSignal;
@@ -580,6 +588,18 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       // policy via `policy()`; that's the canonical source for
       // this snapshot.
       policySnapshot: input.permissionEngine.policy(),
+      // Inherit the parent's live approval posture so an autonomous
+      // parent's task subagents run autonomous too (operation-mode).
+      // Captured at spawn alongside policySnapshot — the child reads it
+      // from this row rather than re-deriving, so a mid-run parent
+      // toggle doesn't retroactively change an already-spawned child.
+      // `inheritApprovalPosture: false` (memory-governance verify
+      // spawns) pins Supervised: that machinery is automatic and
+      // security-sensitive, not the operator's delegated work.
+      approvalPosture:
+        input.inheritApprovalPosture === false
+          ? 'supervised'
+          : input.permissionEngine.approvalPosture(),
       // Mirror snapshot for the hook chain (migration 020). Same
       // drift defense: child reads from this on startup instead
       // of re-resolving hooks.toml from disk, so an edit between

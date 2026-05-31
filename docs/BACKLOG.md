@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-30] permissions+subagents — subagents inherit the parent's approval posture
+
+Follow-up to the operation-mode feature (entry below). Operator clarified the intent: "autonomous" means the operator delegates the WHOLE flow, subagents included — so a subagent spawned by an autonomous parent must run autonomous too, instead of booting Supervised (which, in a headless child with no confirmFn, turned every policy confirm into a denial and defeated the feature for any subagent-using run).
+
+The posture is an engine option, not part of the resolved Policy, so it couldn't ride the existing `policy_snapshot`. Added a dedicated `approval_posture` column to `subagent_runs` (migration 070 — plain `ADD COLUMN`, no table rebuild) following the same snapshot-at-spawn / read-on-startup drift-prevention pattern as policy / hooks / tool-restrictions: the parent's live posture (`engine.approvalPosture()`) is captured into the row at spawn (`runtime.ts`), and the child seeds `createPermissionEngine` from it (`subagent-child.ts`). Snapshot-at-spawn (not live) on purpose — a parent toggle mid-run must not retroactively flip an already-spawned child. NULL legacy rows read as `'supervised'` (fail-closed).
+
+**Validated:** new `tests/storage/subagent-runs.test.ts` round-trips (child inherits autonomous; omitted → supervised); `tests/storage/` + `tests/subagents/` green (1455 pass / 0 fail); typecheck + Biome clean. **Branch:** `feat/operation-mode`. Closes the subagent-inheritance gap the review flagged on the entry below — that entry's NOTE should now be read as resolved here.
+
 ## [2026-05-30] permissions+tui — operation mode (Supervised/Autonomous) as an orthogonal approval posture
 
 Operator-requested. Adds a session-level operation mode the operator flips from the prompt: **Supervised** (default) keeps today's behavior — confirmable decisions open the modal — and **Autonomous** pre-approves routine confirms so a long unattended run isn't death-by-modal. The mode replaces the `? for help` cue in the footer (Supervised painted `accent`/blue, Autonomous `warn`/yellow, both with a ` (shift+tab to change)` suffix in `secondary`) and toggles on Shift+Tab.
