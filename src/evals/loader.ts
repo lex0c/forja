@@ -24,7 +24,7 @@ const TOP_LEVEL_KEYS: ReadonlySet<string> = new Set([
   'budget',
 ]);
 
-const SETUP_KEYS: ReadonlySet<string> = new Set(['fixture', 'files']);
+const SETUP_KEYS: ReadonlySet<string> = new Set(['fixture', 'files', 'approvalPosture']);
 
 const BUDGET_KEYS: ReadonlySet<string> = new Set([
   'maxSteps',
@@ -140,6 +140,15 @@ const parseSetup = (raw: unknown): EvalSetup | undefined => {
       out[path] = body;
     }
     setup.files = out;
+  }
+  if (r.approvalPosture !== undefined) {
+    const p = requireString(r.approvalPosture, 'setup.approvalPosture');
+    if (p !== 'supervised' && p !== 'autonomous') {
+      throw new Error(
+        `eval: setup.approvalPosture must be 'supervised' or 'autonomous', got '${p}'`,
+      );
+    }
+    setup.approvalPosture = p;
   }
   return setup;
 };

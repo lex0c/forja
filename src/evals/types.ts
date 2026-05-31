@@ -1,4 +1,5 @@
 import type { ExitReason, HarnessResult } from '../harness/index.ts';
+import type { ApprovalPosture } from '../permissions/index.ts';
 
 // One declarative expectation evaluated against a finished run.
 // Each shape carries exactly the data needed for its assertion;
@@ -44,6 +45,12 @@ export interface EvalSetup {
   // Inline files: { 'src/x.ts': 'export const x = 1\n' }. Useful
   // for cases too small to deserve a fixture dir.
   files?: Record<string, string>;
+  // Initial approval posture (operation-mode, AGENTIC_CLI §8.1).
+  // Default 'supervised'. Evals run headless (no confirm bridge), so
+  // under 'supervised' a `confirm` verdict dead-ends as a deny; under
+  // 'autonomous' a routine `policy` confirm auto-approves while risk
+  // confirms still deny — the security invariant a posture eval pins.
+  approvalPosture?: ApprovalPosture;
 }
 
 export interface EvalBudget {

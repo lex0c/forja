@@ -543,3 +543,95 @@ describe('summarize', () => {
     expect(summary.p50CostUsd).toBeUndefined();
   });
 });
+
+describe('executeCase — approval posture (operation mode, AGENTIC_CLI §8.1)', () => {
+  // Evals run headless (no confirm bridge), so a `confirm` verdict
+  // resolves to deny. These pin the posture security invariant
+  // end-to-end through the eval machine, deterministically (mock
+  // provider, no live model / no $) — and exercise the full
+  // setup.approvalPosture → loader → executor → engine threading.
+  const policyYaml = (body: string) => `defaults:\n  mode: strict\ntools:\n${body}`;
+
+  test('autonomous auto-approves a routine policy confirm (write lands)', async () => {
+    const c = baseCase({
+      setup: {
+        approvalPosture: 'autonomous',
+        files: {
+          '.agent/permissions.yaml': policyYaml(
+            '  write_file:\n    confirm_paths:\n      - "out.txt"\n',
+          ),
+        },
+      },
+      expect: [
+        { kind: 'tool_called', tool: 'write_file' },
+        { kind: 'file_exists', path: 'out.txt' },
+      ],
+    });
+    const r = await executeCase(c, {
+      bootstrapOverride: {
+        providerOverride: mockProvider([
+          {
+            tool_uses: [
+              { id: 't1', name: 'write_file', input: { path: 'out.txt', content: 'hi' } },
+            ],
+          },
+          { text: 'wrote it' },
+        ]),
+      },
+    });
+    expect(r.passed).toBe(true);
+  });
+
+  test('supervised leaves the same confirm a deny in headless (no write)', async () => {
+    const c = baseCase({
+      setup: {
+        approvalPosture: 'supervised',
+        files: {
+          '.agent/permissions.yaml': policyYaml(
+            '  write_file:\n    confirm_paths:\n      - "out.txt"\n',
+          ),
+        },
+      },
+      expect: [
+        { kind: 'tool_called', tool: 'write_file' },
+        { kind: 'tool_denied', tool: 'write_file' },
+        { kind: 'file_not_exists', path: 'out.txt' },
+      ],
+    });
+    const r = await executeCase(c, {
+      bootstrapOverride: {
+        providerOverride: mockProvider([
+          {
+            tool_uses: [
+              { id: 't1', name: 'write_file', input: { path: 'out.txt', content: 'hi' } },
+            ],
+          },
+          { text: 'tried' },
+        ]),
+      },
+    });
+    expect(r.passed).toBe(true);
+  });
+
+  test('autonomous does NOT auto-approve a risk confirm (compound bash stays denied)', async () => {
+    const c = baseCase({
+      setup: {
+        approvalPosture: 'autonomous',
+        files: { '.agent/permissions.yaml': policyYaml('  bash:\n    allow:\n      - "echo *"\n') },
+      },
+      expect: [
+        { kind: 'tool_called', tool: 'bash' },
+        { kind: 'tool_denied', tool: 'bash' },
+      ],
+    });
+    const r = await executeCase(c, {
+      bootstrapOverride: {
+        providerOverride: mockProvider([
+          { tool_uses: [{ id: 't1', name: 'bash', input: { command: 'echo a && echo b' } }] },
+          { text: 'tried' },
+        ]),
+      },
+    });
+    expect(r.passed).toBe(true);
+  });
+});

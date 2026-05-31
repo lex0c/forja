@@ -2,6 +2,16 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-30] evals — operation-mode approval posture
+
+Closes the "eval is load-bearing" gap for the posture feature. Threaded `approvalPosture` through the eval harness end to end (`EvalSetup` → loader → executor → `BootstrapInput.approvalPosture`) so an eval case can pin a posture; the loader validates the value (`supervised`/`autonomous`) and rejects anything else.
+
+- **3 deterministic executor tests** (`tests/evals/executor.test.ts`) drive the FULL eval machine (engine + invoke-tool + harness + expectations) via the mock provider — no live model, no $: autonomous auto-approves a routine `policy` confirm (the write lands → `file_exists`); supervised leaves the same confirm a deny (no write); autonomous does NOT auto-approve a compound/risk confirm (`tool_denied`). The security invariant, proven end-to-end and headless.
+- **2 model-backed regression evals** (`evals/regression/46,47`) in the canonical YAML form for the CI eval run (Haiku). They load + parse clean; executing them is cost-gated (`bun run eval:regression`) and was NOT run here.
+- **2 loader tests** for the new `setup.approvalPosture` field (valid + invalid value).
+
+**Validated:** typecheck + Biome clean; `tests/evals/` 111 pass / 0 fail. **Branch:** `feat/operation-mode`.
+
 ## [2026-05-30] spec — document the operation-mode approval posture
 
 Slice 8 of the operation-mode feature: the UX stabilized (validated in `bun run dev`), so the spec now reflects what shipped — code-first, spec-after, the UX-first flow. Three docs (PT-BR, spec only, no code):
