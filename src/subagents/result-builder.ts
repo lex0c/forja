@@ -127,7 +127,6 @@ const VALID_REASON_MAP: Record<RunSubagentResult['reason'], true> = {
   internalError: true,
   scriptExhausted: true,
   userPromptBlocked: true,
-  critiqueAborted: true,
   // Parent-side synthesized — never appears in a child's
   // envelope, but listed for symmetry with the type union.
   worktree_create_failed: true,

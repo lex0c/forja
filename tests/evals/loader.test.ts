@@ -399,22 +399,6 @@ expect:
     expect(c.setup?.files?.['config.json']).toBe('{}');
   });
 
-  test('parses exit_reason: critiqueAborted (regression — was rejected before the loader allowlist read EXIT_REASONS)', () => {
-    // Regression: src/harness/types.ts grew critiqueAborted as part of
-    // the M4 critique work but the loader's inline allowlist drifted
-    // out of sync, blocking eval YAML from asserting the new exit
-    // shape. Now both consumers read EXIT_REASONS, so this stays
-    // covered automatically.
-    const yaml = `
-name: x
-prompt: y
-expect:
-  - exit_reason: critiqueAborted
-`;
-    const c = parseEvalCase(yaml, '/tmp/c.yaml');
-    expect(c.expect[0]).toEqual({ kind: 'exit_reason', reason: 'critiqueAborted' });
-  });
-
   test('parses exit_reason: stepStalled (same drift class — was also missing from the loader allowlist)', () => {
     const yaml = `
 name: x

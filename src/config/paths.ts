@@ -1,5 +1,5 @@
 // Per-project `.agent/config.toml` path resolvers (currently
-// consumed by critique, memory governance, providers, budget
+// consumed by memory governance, providers, budget
 // loaders). Path-resolution plumbing centralized in
 // `src/config/agent-paths.ts` so the XDG / HOME / Windows
 // APPDATA / USERPROFILE / PROGRAMDATA dance is shared across

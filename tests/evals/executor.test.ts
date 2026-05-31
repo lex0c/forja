@@ -59,14 +59,13 @@ const baseCase = (overrides: Partial<EvalCase> = {}): EvalCase => ({
 });
 
 let workdir: string;
-// Snapshot env vars that the bootstrap chain reads from disk
-// (memory loader, critique config loader). Tests under this suite
-// run real `bootstrap()` via `executeCase` → providerOverride; if a
-// dev's `~/.config/agent/config.toml` declares `[critique].mode =
-// "always"`, that config would activate the critique gate against
-// the mock provider and burn script entries unexpectedly. Pinning
-// XDG_CONFIG_HOME and HOME at the temp workdir guarantees the
-// loader sees empty layers regardless of the host env.
+// Snapshot env vars that the bootstrap chain reads from disk (the
+// memory / providers / budget config loaders). Tests under this
+// suite run real `bootstrap()` via `executeCase` → providerOverride;
+// a dev's `~/.config/agent/config.toml` declaring project config
+// could otherwise leak into the run and perturb the mock provider.
+// Pinning XDG_CONFIG_HOME and HOME at the temp workdir guarantees the
+// loaders see empty layers regardless of the host env.
 let originalXdg: string | undefined;
 let originalHome: string | undefined;
 

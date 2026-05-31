@@ -9,12 +9,7 @@ import {
   createInProcessBroker,
   createSpawnBroker,
 } from '../broker/index.ts';
-import {
-  loadBudgetConfig,
-  loadMemoryConfig,
-  loadProvidersConfig,
-} from '../critique/config-loader.ts';
-import { loadCritiqueConfig } from '../critique/index.ts';
+import { loadBudgetConfig, loadMemoryConfig, loadProvidersConfig } from '../config/loaders.ts';
 import { createSqliteFailureSink } from '../failures/index.ts';
 import type { HarnessConfig, RunBudget } from '../harness/index.ts';
 import {
@@ -298,12 +293,6 @@ export interface BootstrapResult {
   // happy path. CLI driver renders them on stderr alongside the
   // policy lockConflicts warnings.
   hookWarnings: readonly HookConfigWarning[];
-  // Warnings from the self-critique config loader (Slice C —
-  // AGENTIC_CLI.md §5.4): malformed `[critique]` block, invalid
-  // mode/threshold/max_overhead_ms, unknown model id. Non-fatal:
-  // a bad value degrades to defaults rather than aborting boot.
-  // Empty in the happy path.
-  critiqueWarnings: readonly string[];
   // Warnings from the memory governance config loader
   // (`.agent/config.toml [memory]` keys). Loader degrades to
   // defaults (currently default-ON) on bad values rather than
@@ -311,7 +300,7 @@ export interface BootstrapResult {
   // `verify_semantic_llm = "false"` (string instead of boolean)
   // would silently keep the default-on detector running and pay
   // the LLM-judge cost without diagnostic. CLI driver renders
-  // these on stderr alongside the hook + critique warnings.
+  // these on stderr alongside the hook warnings.
   memoryConfigWarnings: readonly string[];
   // Warnings from the providers + budget config loaders
   // (`.agent/config.toml [providers|budget]`). Same fail-soft
@@ -336,7 +325,7 @@ export interface BootstrapResult {
   // retention windows is operationally risky in a way that
   // demands the same diagnostic visibility as the other config
   // loaders. CLI driver renders these on stderr alongside the
-  // memory / hook / critique / providers / budget warnings.
+  // memory / hook / providers / budget warnings.
   auditConfigWarnings: readonly string[];
   // Final state of the permission engine after bootstrap walked
   // init → loading-policy → validating-chain → ready/refusing.
@@ -397,10 +386,9 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // policy YAML error or unknown model doesn't leak a SQLite handle
   // (and the WAL files that come with it).
   let provider: Provider;
-  // Build the registry once and share it across the executor, the
-  // critique-config loader, and the providers-config loader. Creating
-  // independent default registries would double the model-table
-  // import cost for no benefit.
+  // Build the registry once and share it across the executor and the
+  // providers-config loader. Creating independent default registries
+  // would double the model-table import cost for no benefit.
   const registry = createDefaultRegistry();
 
   // Resolve project config root EARLY (needed by the providers
@@ -411,8 +399,8 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // a subdirectory. Without this resolve, a `<repo>/.agent/
   // config.toml [providers] model = "..."` would be invisible when
   // the operator ran `agent` from a subdir, and the boot would
-  // silently use DEFAULT_MODEL. Reused below for [critique] /
-  // [memory] / [budget] loaders — same file, same path resolution.
+  // silently use DEFAULT_MODEL. Reused below for [memory] / [budget]
+  // loaders — same file, same path resolution.
   const projectConfigCwd = resolveRepoRoot(cwd);
 
   // [providers] model — pin per-project. Resolution chain:
@@ -440,44 +428,31 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     provider = entry.factory();
   }
 
-  // Self-critique config (AGENTIC_CLI.md §5.4). Loaded from
-  // `~/.config/agent/config.toml` + `<cwd>/.agent/config.toml`.
-  // When no [critique] section is declared (the common case), this
-  // returns the defaults (mode='off') and no provider — the harness
-  // skips the gate entirely with zero overhead. When the operator
-  // opts in, the resolved config + (optional) critique provider
-  // flow into HarnessConfig below.
-  //
-  // Warnings surface to stderr at boot via the caller; the loader
-  // is non-fatal by design (a malformed [critique] block degrades
-  // to defaults, not a hard exit). The warnings array is exposed
-  // on BootstrapResult for the CLI driver to print.
-  //
-  // `projectConfigCwd` was resolved above (early in this function —
-  // see the long comment near the providers loader). The same
-  // repo-rooted cwd is reused here so [critique] / [memory] /
-  // [budget] all read the SAME `.agent/config.toml` the providers
-  // loader already consumed. When `agent` is launched from a
-  // subdirectory, raw cwd would miss the repo-rooted file entirely
-  // — the operator would set `verify_semantic_llm = false` at
-  // `<repo>/.agent/config.toml` and bootstrap would still resolve
-  // detectors via default + spend LLM budget. resolveRepoRoot
-  // falls back to cwd when not in a git repo, matching the
-  // historical "config lives where the operator invoked from"
-  // behavior for non-repo workflows. Loader is non-fatal: malformed
-  // sections degrade to defaults, warnings surface on stderr via
-  // BootstrapResult.{critique,memory,providers,budget}Warnings.
-  const critiqueLoaded = loadCritiqueConfig({ cwd: projectConfigCwd, registry });
   // [budget] config — resolves before the harness builds its
   // RunBudget. Per-key merge: project [budget].max_steps wins
   // over user, both override DEFAULT_BUDGET in code. CLI flags
   // (input.budget) win over both layers. Loader degrades to
   // defaults on bad values rather than aborting boot.
+  //
+  // `projectConfigCwd` was resolved above (early in this function —
+  // see the long comment near the providers loader). The same
+  // repo-rooted cwd is reused here so [memory] / [budget] all read
+  // the SAME `.agent/config.toml` the providers loader already
+  // consumed. When `agent` is launched from a subdirectory, raw cwd
+  // would miss the repo-rooted file entirely — the operator would
+  // set `verify_semantic_llm = false` at `<repo>/.agent/config.toml`
+  // and bootstrap would still resolve detectors via default + spend
+  // LLM budget. resolveRepoRoot falls back to cwd when not in a git
+  // repo, matching the historical "config lives where the operator
+  // invoked from" behavior for non-repo workflows. Loaders are
+  // non-fatal: malformed sections degrade to defaults, warnings
+  // surface on stderr via
+  // BootstrapResult.{memory,providers,budget}Warnings.
   const budgetLoaded = loadBudgetConfig({ cwd: projectConfigCwd });
 
   // Slice Q — invert S11/S13 LLM-judge default to ON. The loader
   // walks the same `.agent/config.toml` + `~/.config/agent/config.toml`
-  // pair as [critique]; project field wins. `userHadField` /
+  // pair as [budget]; project field wins. `userHadField` /
   // `projectHadField` per-field provenance signals drive the
   // first-run banner emission below: banner fires ONLY when both
   // detectors resolved to ON via DEFAULT (no layer explicitly named
@@ -924,7 +899,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // tagged with those triggers got filtered out even though
     // the same session loaded the project memory containing them.
     // Single `repoRoot` value keeps the three consumers
-    // aligned: critique/memory config loader (hoisted above),
+    // aligned: memory config loader (hoisted above),
     // memory scope roots, and the trigger-probe section below.
     const repoRoot = projectConfigCwd;
     const memoryRoots = resolveScopeRoots(repoRoot);
@@ -1458,16 +1433,6 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // chain-filter is the no-op when there are no hooks for the
     // event.
     hooks: resolvedHooks.hooks,
-    // Self-critique config (AGENTIC_CLI.md §5.4). When mode='off'
-    // (default), the harness's gate short-circuits — no
-    // measurable cost beyond the partial-merge in
-    // effectiveBudget-style logic. When the operator opted in
-    // via [critique].mode, the harness runs the gate per
-    // ORCHESTRATION.md §6.
-    critique: critiqueLoaded.config,
-    ...(critiqueLoaded.critiqueProvider !== null
-      ? { critiqueProvider: critiqueLoaded.critiqueProvider }
-      : {}),
     // [audit] config thread-through. Empty `[audit]` block resolves
     // to DEFAULT_RETENTION (all defaults, runGcOnStop=false), which
     // is identical to NOT setting auditRetention at all — both
@@ -1564,7 +1529,6 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     lockConflicts: [...permResult.lockConflicts],
     subagents,
     hookWarnings: resolvedHooks.warnings,
-    critiqueWarnings: critiqueLoaded.warnings,
     memoryConfigWarnings: memoryLoaded.warnings,
     providersConfigWarnings: providersLoaded.warnings,
     budgetConfigWarnings: budgetLoaded.warnings,

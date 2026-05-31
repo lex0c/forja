@@ -1,8 +1,8 @@
 // Shared TOML-section reader for the per-project `.agent/config.toml`
-// loaders (critique, memory, providers, budget). Each loader used to
+// loaders (memory, providers, budget). Each loader used to
 // reimplement steps 1-7 of "open file, parse TOML, find section,
 // validate it's a table" — that boilerplate was ~30 lines per parser
-// duplicated 4× by the time the third consumer landed. Extracting
+// duplicated by the time the third consumer landed. Extracting
 // the common path here keeps field-level validation (which IS
 // section-specific) in the per-loader code while collapsing the
 // shared plumbing.

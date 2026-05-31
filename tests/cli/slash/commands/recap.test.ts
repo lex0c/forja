@@ -111,7 +111,7 @@ const makeCtx = (overrides: Partial<SlashContext> = {}): SlashContext => {
     db,
     bus,
     modalManager,
-    cumulative: { costUsd: 0, steps: 0, turns: 0, critiqueCostUsd: 0, critiqueRuns: 0 },
+    cumulative: { costUsd: 0, steps: 0, turns: 0 },
     now: () => 5_000,
     requestShutdown: () => undefined,
     isRunning: () => false,

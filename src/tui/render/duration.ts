@@ -1,7 +1,7 @@
 // Canonical duration formatter for operation chips. Spec: UI.md §4.10.5.
 //
 // One source of truth for the `[…]` metric every operation chip
-// carries — the live tool card, the assistant / thinking / critique /
+// carries — the live tool card, the assistant / thinking /
 // awaiting chips, the finalized tool-end card, and the subagent
 // summary all format elapsed time through this. Before, each chip
 // kept its own near-identical `formatElapsed`, and they had drifted

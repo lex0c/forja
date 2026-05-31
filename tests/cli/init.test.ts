@@ -290,12 +290,11 @@ describe('runInit — config step', () => {
     // them. Section/value-level pins live in the template's own test
     // (init-config-template.test.ts); here we just confirm the
     // orchestrator wired the right renderer and produced parseable
-    // TOML with all four expected sections.
+    // TOML with all three expected sections.
     const parsed = Bun.TOML.parse(body) as Record<string, unknown>;
     expect(parsed.providers).toBeDefined();
     expect(parsed.budget).toBeDefined();
     expect(parsed.memory).toBeDefined();
-    expect(parsed.critique).toBeDefined();
   });
 
   test('scaffolded config contains NO comments (slash round-trip would kill them)', () => {
@@ -340,7 +339,7 @@ describe('runInit — config step', () => {
     expect(code).toBe(0);
     // Force overwrites — operator's `# operator edit\n` is gone,
     // replaced by the rich scaffold's [providers] / [budget] /
-    // [memory] / [critique] sections.
+    // [memory] sections.
     const body = readFileSync(target, 'utf8');
     expect(body).not.toContain('operator edit');
     expect(body).toContain('[budget]');

@@ -3,8 +3,7 @@ import {
   type InitConfigDefaults,
   renderInitConfigTemplate,
 } from '../../src/cli/init-config-template.ts';
-import { DEFAULT_MEMORY_CONFIG } from '../../src/critique/config-loader.ts';
-import { DEFAULT_CRITIQUE_CONFIG } from '../../src/critique/types.ts';
+import { DEFAULT_MEMORY_CONFIG } from '../../src/config/loaders.ts';
 import { DEFAULT_BUDGET } from '../../src/harness/types.ts';
 import { DEFAULT_MODEL } from '../../src/providers/default-model.ts';
 
@@ -18,7 +17,6 @@ const defaults = (): InitConfigDefaults => ({
   model: DEFAULT_MODEL,
   budget: DEFAULT_BUDGET,
   memory: DEFAULT_MEMORY_CONFIG,
-  critique: DEFAULT_CRITIQUE_CONFIG,
 });
 
 describe('renderInitConfigTemplate', () => {
@@ -31,7 +29,7 @@ describe('renderInitConfigTemplate', () => {
     expect(() => Bun.TOML.parse(renderInitConfigTemplate(defaults()))).not.toThrow();
   });
 
-  test('parses to a populated config with all four sections', () => {
+  test('parses to a populated config with all three sections', () => {
     // Spec posture (AGENTIC_CLI.md §2.1.1, post-rich-scaffold): the
     // scaffolded file carries ACTIVE values for every operator-
     // tunable section so the operator opens it and sees the running
@@ -41,7 +39,6 @@ describe('renderInitConfigTemplate', () => {
     expect(parsed.providers).toBeDefined();
     expect(parsed.budget).toBeDefined();
     expect(parsed.memory).toBeDefined();
-    expect(parsed.critique).toBeDefined();
   });
 
   test('[providers].model matches DEFAULT_MODEL', () => {
@@ -70,15 +67,6 @@ describe('renderInitConfigTemplate', () => {
     expect(parsed.memory.verify_semantic_llm).toBe(DEFAULT_MEMORY_CONFIG.verifySemanticLlm);
     expect(parsed.memory.conflict_detect_llm).toBe(DEFAULT_MEMORY_CONFIG.conflictDetectLlm);
     expect(parsed.memory.override_detect_llm).toBe(DEFAULT_MEMORY_CONFIG.overrideDetectLlm);
-  });
-
-  test('[critique] values match DEFAULT_CRITIQUE_CONFIG', () => {
-    const parsed = Bun.TOML.parse(renderInitConfigTemplate(defaults())) as {
-      critique: Record<string, unknown>;
-    };
-    expect(parsed.critique.mode).toBe(DEFAULT_CRITIQUE_CONFIG.mode);
-    expect(parsed.critique.threshold).toBe(DEFAULT_CRITIQUE_CONFIG.threshold);
-    expect(parsed.critique.max_overhead_ms).toBe(DEFAULT_CRITIQUE_CONFIG.maxOverheadMs);
   });
 
   test('scaffold contains NO comments (slash round-trip would kill them)', () => {

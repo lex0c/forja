@@ -177,34 +177,6 @@ export type ThinkingDeltaEvent = BaseEvent & {
 };
 export type ThinkingEndEvent = BaseEvent & { type: 'thinking:end'; messageId: string };
 
-// Self-critique pass live indicator (AGENTIC_CLI.md §5.4,
-// ORCHESTRATION.md §6). Bracket events that fire around the critic
-// LLM call. The harness emits `critique_started` /
-// `critique_finished`; the adapter translates them into these
-// UIEvents so the live region renders a chip during the otherwise-
-// silent window (up to `maxOverheadMs`, default 3s) between the
-// executor's `assistant:end` and the modal opening.
-//
-// Without this, an operator who opted into critique sees the
-// generating spinner stop and then... nothing for several seconds.
-// Looks identical to a hang.
-export type CritiqueStartEvent = BaseEvent & {
-  type: 'critique:start';
-  // Step index from the harness loop. Lets renderers correlate the
-  // chip with the step it's reviewing (no current consumer; future
-  // /critique slash command may pair them).
-  stepN: number;
-  // True iff the proposed step would invoke at least one
-  // `writes:true` tool. Mirrors the modal's framing: a writes-step
-  // critique deserves a stronger chip color than an end-of-step
-  // text-only review.
-  toolPlanWrites: boolean;
-};
-export type CritiqueEndEvent = BaseEvent & {
-  type: 'critique:end';
-  stepN: number;
-};
-
 // Tool calls. The producer (adapter) resolves the tool's name into a
 // vocab pair (`activeVerb` shown while running, `finalVerb` after
 // completion) plus a `subject` line — typically the path / command /
@@ -265,7 +237,7 @@ export type ToolEndEvent = BaseEvent & {
   exitCode?: number;
 };
 
-// Permission/trust/memory write/plan review/critique modals.
+// Permission/trust/memory write/plan review modals.
 // Payloads carry exactly what the modal needs to render. The
 // renderer's modal handler (UI.md §5.5) resolves a promise on the
 // other side; the producer awaits that promise.
@@ -455,18 +427,6 @@ export type PlanReviewEvent = BaseEvent & {
   steps: string[];
   estimatedCalls: number;
   estimatedCostUsd: number;
-};
-export type CritiqueAskEvent = BaseEvent & {
-  type: 'critique:ask';
-  promptId: string;
-  issues: { severity: 'low' | 'medium' | 'high'; confidence: number; message: string }[];
-  // True iff the proposed step would invoke at least one
-  // `writes:true` tool. Drives the modal's framing — a writes-step
-  // critique deserves a stronger headline ("about to mutate files
-  // — review before continuing") than an end-of-step text-only
-  // critique. Optional for backward compat with producers that
-  // predate Slice C; absent ⇒ false (treated as text-only).
-  toolPlanWrites?: boolean;
 };
 
 // History wipe confirmation (HISTORY.md §2.3 `/history clear`). Three
@@ -771,8 +731,6 @@ export type UIEvent =
   | ThinkingStartEvent
   | ThinkingDeltaEvent
   | ThinkingEndEvent
-  | CritiqueStartEvent
-  | CritiqueEndEvent
   | ToolStartEvent
   | ToolExecutionStartedEvent
   | ToolDeltaEvent
@@ -787,7 +745,6 @@ export type UIEvent =
   | MemoryUserScopeAskEvent
   | MemoryActionAskEvent
   | PlanReviewEvent
-  | CritiqueAskEvent
   | HistoryClearAskEvent
   | TodoUpdateEvent
   | SubagentStartEvent

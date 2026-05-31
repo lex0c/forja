@@ -14,8 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { bootstrap } from '../../src/cli/bootstrap.ts';
 import { runInit } from '../../src/cli/init.ts';
-import { DEFAULT_MEMORY_CONFIG } from '../../src/critique/config-loader.ts';
-import { DEFAULT_CRITIQUE_CONFIG } from '../../src/critique/types.ts';
+import { DEFAULT_MEMORY_CONFIG } from '../../src/config/loaders.ts';
 import { DEFAULT_BUDGET } from '../../src/harness/types.ts';
 import { DEFAULT_MODEL } from '../../src/providers/default-model.ts';
 import type { Provider } from '../../src/providers/index.ts';
@@ -119,7 +118,6 @@ describe('init → bootstrap eval', () => {
       providersConfigWarnings,
       budgetConfigWarnings,
       memoryConfigWarnings,
-      critiqueWarnings,
       auditConfigWarnings,
       permissionState,
     } = await bootstrap({
@@ -155,14 +153,11 @@ describe('init → bootstrap eval', () => {
       expect(config.memorySemanticVerify).toBe(DEFAULT_MEMORY_CONFIG.verifySemanticLlm);
       expect(config.memoryConflictDetect).toBe(DEFAULT_MEMORY_CONFIG.conflictDetectLlm);
       expect(config.memoryOverrideDetect).toBe(DEFAULT_MEMORY_CONFIG.overrideDetectLlm);
-      // Critique scaffolded mode=off (default); should propagate.
-      expect(config.critique?.mode).toBe(DEFAULT_CRITIQUE_CONFIG.mode);
       // No loader complained about the scaffold values — the cross-
       // subsystem handshake is clean.
       expect(providersConfigWarnings).toEqual([]);
       expect(budgetConfigWarnings).toEqual([]);
       expect(memoryConfigWarnings).toEqual([]);
-      expect(critiqueWarnings).toEqual([]);
       // [audit] / [audit.retention] not scaffolded by init — loader
       // returns defaults silently with no warnings.
       expect(auditConfigWarnings).toEqual([]);

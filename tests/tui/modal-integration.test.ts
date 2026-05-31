@@ -369,46 +369,6 @@ describe('per-flavor reducer option lists', () => {
       state.modal.preview.some((l) => (typeof l === 'string' ? l : l.text).includes('$0.03')),
     ).toBe(true);
   });
-
-  test('critique:ask builds 3 options (ignore/redo/abort), default = last; issues are the preview', () => {
-    const state = applyEvent(createInitialState(), {
-      type: 'critique:ask',
-      ts: 1,
-      promptId: 'p1',
-      issues: [
-        { severity: 'high', confidence: 0.9, message: 'security risk' },
-        { severity: 'low', confidence: 0.5, message: 'style' },
-      ],
-    }).state;
-    if (state.modal === null) throw new Error('modal not set');
-    expect(state.modal.flavor).toBe('critique');
-    expect(state.modal.options.map((o) => o.value)).toEqual(['ignore', 'redo', 'abort']);
-    // Default selection is `abort` (last) — the most conservative
-    // answer when a proposal got flagged. Proceeding blind
-    // (ignore) and re-running (redo) both keep the run going;
-    // abort is the only outcome that stops without making
-    // forward progress on possibly-broken output.
-    expect(state.modal.selectedIndex).toBe(2);
-    expect(state.modal.preview).toHaveLength(2);
-    expect(state.modal.preview[0]).toContain('high');
-    expect(state.modal.preview[0]).toContain('security risk');
-    // Default headline (no writes-intent flagged).
-    expect(state.modal.title).toBe('Critique');
-  });
-
-  test('critique:ask with toolPlanWrites=true uses the stronger headline', () => {
-    const state = applyEvent(createInitialState(), {
-      type: 'critique:ask',
-      ts: 1,
-      promptId: 'p1',
-      issues: [{ severity: 'high', confidence: 0.9, message: 'unsafe rm' }],
-      toolPlanWrites: true,
-    }).state;
-    if (state.modal === null) throw new Error('modal not set');
-    expect(state.modal.title).toBe('Critique — about to mutate');
-    // Question copy reflects the writes framing too.
-    expect(state.modal.question).toContain('Proceed');
-  });
 });
 
 describe('modal:select reducer behavior', () => {

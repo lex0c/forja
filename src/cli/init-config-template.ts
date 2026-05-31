@@ -2,10 +2,9 @@
 // Spec: AGENTIC_CLI.md §2.1.1.
 //
 // Posture: the scaffolded file contains ACTIVE values for every
-// operator-tunable section ([providers], [budget], [memory],
-// [critique]) sourced from the canonical code defaults. Operator
-// opens the file, sees the running values literal in front of them,
-// edits in-place to override.
+// operator-tunable section ([providers], [budget], [memory]) sourced
+// from the canonical code defaults. Operator opens the file, sees the
+// running values literal in front of them, edits in-place to override.
 //
 // NO comments are written into the scaffold. Two reasons:
 //
@@ -21,23 +20,20 @@
 //      illustrative non-default values) lives in AGENTIC_CLI.md
 //      §2.1.1, where comments don't get rewritten.
 //
-// The code-side DEFAULT_BUDGET / DEFAULT_MEMORY_CONFIG /
-// DEFAULT_CRITIQUE_CONFIG remain authoritative as safety floors
-// (fresh install before init, programmatic test seams, subagent_run
-// contexts that don't carry config). When the operator edits a value
-// in config.toml, the per-key merge in the bootstrap layer overrides
-// the code default for that key only — other keys still inherit
-// the code-side floor.
+// The code-side DEFAULT_BUDGET / DEFAULT_MEMORY_CONFIG remain
+// authoritative as safety floors (fresh install before init,
+// programmatic test seams, subagent_run contexts that don't carry
+// config). When the operator edits a value in config.toml, the
+// per-key merge in the bootstrap layer overrides the code default
+// for that key only — other keys still inherit the code-side floor.
 
-import type { MemoryConfigKeys } from '../critique/config-loader.ts';
-import type { CritiqueConfig } from '../critique/types.ts';
+import type { MemoryConfigKeys } from '../config/loaders.ts';
 import type { RunBudget } from '../harness/types.ts';
 
 export interface InitConfigDefaults {
   model: string;
   budget: RunBudget;
   memory: MemoryConfigKeys;
-  critique: CritiqueConfig;
 }
 
 // Quote a TOML string value defensively — handles backslash and
@@ -48,7 +44,7 @@ export interface InitConfigDefaults {
 const tomlString = (s: string): string => `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 
 export const renderInitConfigTemplate = (defaults: InitConfigDefaults): string => {
-  const { model, budget: b, memory: m, critique: c } = defaults;
+  const { model, budget: b, memory: m } = defaults;
   // maxCostUsd is `number | undefined` — explicit-undefined is
   // operator opt-out semantics (RunBudget docstring at
   // harness/types.ts:484). DEFAULT_BUDGET ships it as 5, but
@@ -56,10 +52,6 @@ export const renderInitConfigTemplate = (defaults: InitConfigDefaults): string =
   // so the scaffold doesn't write `max_cost_usd = undefined` as
   // literal text.
   const maxCostLine = b.maxCostUsd !== undefined ? `max_cost_usd = ${b.maxCostUsd}\n` : '';
-  // prompt_version is optional in CritiqueConfig and not set by
-  // DEFAULT_CRITIQUE_CONFIG; only emit when populated.
-  const promptVersionLine =
-    c.promptVersion !== undefined ? `prompt_version = ${tomlString(c.promptVersion)}\n` : '';
   return `[providers]
 model = ${tomlString(model)}
 
@@ -74,10 +66,5 @@ compaction_preserve_tail = ${b.compactionPreserveTail}
 verify_semantic_llm = ${m.verifySemanticLlm}
 conflict_detect_llm = ${m.conflictDetectLlm}
 override_detect_llm = ${m.overrideDetectLlm}
-
-[critique]
-mode = ${tomlString(c.mode)}
-threshold = ${c.threshold}
-max_overhead_ms = ${c.maxOverheadMs}
-${promptVersionLine}`;
+`;
 };

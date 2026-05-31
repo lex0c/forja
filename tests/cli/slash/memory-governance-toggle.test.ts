@@ -2,7 +2,7 @@
 //
 // Writes `.agent/config.toml [memory]` keys. Verifies:
 //   - fresh repo: creates `.agent/` + file with `[memory]` block.
-//   - existing config with `[critique]` only: preserves verbatim,
+//   - existing config with `[providers]` only: preserves verbatim,
 //     appends `[memory]`.
 //   - round-trip: disable → loadMemoryConfig reads false.
 //   - target parsing: verify | conflict | all + invalid.
@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { memoryCommand } from '../../../src/cli/slash/commands/memory.ts';
 import type { SlashContext } from '../../../src/cli/slash/types.ts';
-import { loadMemoryConfig } from '../../../src/critique/config-loader.ts';
+import { loadMemoryConfig } from '../../../src/config/loaders.ts';
 import type { HarnessConfig } from '../../../src/harness/index.ts';
 import { DEFAULT_BUDGET } from '../../../src/harness/types.ts';
 import type { ScopeRoots } from '../../../src/memory/paths.ts';
@@ -59,7 +59,7 @@ beforeEach(() => {
     db,
     bus,
     modalManager,
-    cumulative: { costUsd: 0, steps: 0, turns: 0, critiqueCostUsd: 0, critiqueRuns: 0 },
+    cumulative: { costUsd: 0, steps: 0, turns: 0 },
     now: () => 1,
     requestShutdown: () => {},
     isRunning: () => false,
@@ -186,31 +186,30 @@ describe('/memory governance disable', () => {
     expect(after.memoryOverrideDetectSource).toBe('default');
   });
 
-  test('preserves [critique] section data through round-trip (comments lost)', async () => {
+  test('preserves unrelated section data through round-trip (comments lost)', async () => {
     // Round-trip semantics: parse → mutate → canonical emit. Table
     // *data* survives (keys + values are re-emitted from the parsed
     // object); comments and original whitespace are intentionally
     // dropped — the trade-off is documented in src/cli/slash/
-    // commands/memory.ts above `emitTomlDoc`.
+    // commands/memory.ts above `emitTomlDoc`. Uses [providers] as a
+    // stand-in for "any section the toggle must not clobber".
     mkdirSync(join(workdir, '.agent'), { recursive: true });
     const existing = `# operator-edited config
-[critique]
-mode = "on_writes"
-threshold = 0.85
-# threshold tuned post-eval
+[providers]
+model = "anthropic/claude-opus-4-7"
+# model pinned post-eval
 `;
     writeFileSync(join(workdir, '.agent', 'config.toml'), existing);
     const r = await memoryCommand.exec(['governance', 'disable', 'verify'], ctx);
     expect(r.kind).toBe('ok');
     const raw = readFileSync(join(workdir, '.agent', 'config.toml'), 'utf8');
-    expect(raw).toContain('[critique]');
-    expect(raw).toContain('mode = "on_writes"');
-    expect(raw).toContain('threshold = 0.85');
+    expect(raw).toContain('[providers]');
+    expect(raw).toContain('model = "anthropic/claude-opus-4-7"');
     expect(raw).toContain('[memory]');
     expect(raw).toContain('verify_semantic_llm = false');
     // Comments are dropped on rewrite (canonical emit).
     expect(raw).not.toContain('# operator-edited config');
-    expect(raw).not.toContain('# threshold tuned post-eval');
+    expect(raw).not.toContain('# model pinned post-eval');
   });
 
   test('replaces existing [memory] block in place (no duplicate)', async () => {
@@ -301,23 +300,23 @@ override_detect_llm = false
 // against shapes that defeat a regex-driven splice (A-H1/2/3 from
 // the post-Slice-Q code review).
 describe('/memory governance disable: round-trip robustness', () => {
-  test('multi-line basic string in [critique] survives', async () => {
+  test('multi-line basic string in an unrelated section survives', async () => {
     mkdirSync(join(workdir, '.agent'), { recursive: true });
     writeFileSync(
       join(workdir, '.agent', 'config.toml'),
-      `[critique]
-mode = "on_writes"
-prompt_version = "v1\\n[memory]\\nverify_semantic_llm = true"
+      `[providers]
+model = "anthropic/claude-opus-4-7"
+note = "line1\\n[memory]\\nverify_semantic_llm = true"
 `,
     );
     const r = await memoryCommand.exec(['governance', 'disable', 'verify'], ctx);
     expect(r.kind).toBe('ok');
     const loaded = loadMemoryConfig({ cwd: workdir });
     expect(loaded.config.verifySemanticLlm).toBe(false);
-    // Re-parsed: [critique].prompt_version retains its embedded payload.
+    // Re-parsed: [providers].note retains its embedded payload.
     const raw = readFileSync(join(workdir, '.agent', 'config.toml'), 'utf8');
-    expect(raw).toContain('[critique]');
-    expect(raw).toContain('mode = "on_writes"');
+    expect(raw).toContain('[providers]');
+    expect(raw).toContain('model = "anthropic/claude-opus-4-7"');
     // Embedded `[memory]` substring is inside a string, not a table.
     const tableHeaderCount = (raw.match(/^\[memory\]$/gm) ?? []).length;
     expect(tableHeaderCount).toBe(1);
@@ -345,7 +344,7 @@ conflict_detect_llm = true
     mkdirSync(join(workdir, '.agent'), { recursive: true });
     writeFileSync(
       join(workdir, '.agent', 'config.toml'),
-      '[critique]\r\nmode = "on_writes"\r\n\r\n[memory]\r\nverify_semantic_llm = true\r\nconflict_detect_llm = true\r\n',
+      '[providers]\r\nmodel = "anthropic/claude-opus-4-7"\r\n\r\n[memory]\r\nverify_semantic_llm = true\r\nconflict_detect_llm = true\r\n',
     );
     const r = await memoryCommand.exec(['governance', 'disable', 'conflict'], ctx);
     expect(r.kind).toBe('ok');

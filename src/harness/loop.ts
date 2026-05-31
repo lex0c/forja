@@ -6,19 +6,6 @@ import {
   createCheckpointManager,
   detectCheckpointSupport,
 } from '../checkpoints/index.ts';
-import {
-  type CritiqueAnswer,
-  type CritiqueConfig,
-  DEFAULT_CRITIQUE_CONFIG,
-  DEFAULT_CRITIQUE_PROMPT_VERSION,
-  buildCritiqueInput,
-  buildCritiqueToolPlan,
-  renderCritiqueHint,
-  resolveCritiquePromptVersion,
-  runCritique,
-  shouldCritique,
-  toolPlanHasWrites,
-} from '../critique/index.ts';
 import { maybeRewriteBashCommand } from '../feedback/dispatch-rewrite.ts';
 import { emitToolCallOutcome } from '../feedback/outcome-emitter.ts';
 import { buildScopeChain } from '../feedback/scope-detect.ts';
@@ -52,7 +39,6 @@ import { buildResumeContext, shouldSkipResumeContext } from '../recap/resume-con
 import { buildRetrievalRunner } from '../retrieval/index.ts';
 import { redactSecrets } from '../sanitize/secrets.ts';
 import {
-  type CritiqueRunCode,
   type SessionStatus,
   appendMessage,
   completeSession,
@@ -61,7 +47,6 @@ import {
   insertCostProgressEvent,
   insertSubagentGateDecision,
   listMessageTailBySession,
-  recordCritiqueRun,
   reopenSession,
 } from '../storage/index.ts';
 import { listApprovalsLogBySessionRecent } from '../storage/repos/approvals-log.ts';
@@ -179,11 +164,6 @@ const exitToStatus: Record<ExitReason, TerminalSessionStatus> = {
   // an error — interrupted matches the existing 'aborted' shape
   // (operator-initiated termination).
   userPromptBlocked: 'interrupted',
-  // Self-critique abort: operator chose `abort` from the
-  // critique modal. Same shape as a UserPromptSubmit refusal —
-  // the operator stopped this turn voluntarily, not a runtime
-  // failure.
-  critiqueAborted: 'interrupted',
 };
 
 const exitToHarnessStatus: Record<ExitReason, HarnessResult['status']> = {
@@ -200,7 +180,6 @@ const exitToHarnessStatus: Record<ExitReason, HarnessResult['status']> = {
   internalError: 'error',
   scriptExhausted: 'error',
   userPromptBlocked: 'interrupted',
-  critiqueAborted: 'interrupted',
 };
 
 const buildToolDefs = (config: HarnessConfig): ProviderToolDef[] =>
@@ -2522,340 +2501,6 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // accepted and processed. Flipping the flag tells the renderer
         // to mark aggregate cost as a lower bound.
         if (!collected.usageSeen) usageComplete = false;
-
-        // === Self-critique gate (ORCHESTRATION.md §6) ===
-        // Runs BEFORE the assistant turn is persisted so a `redo`
-        // decision can discard the buffer without polluting the
-        // audit log. Inactive when:
-        //   - critique mode === 'off' (default; zero cost)
-        //   - the stream errored (we don't critique broken output;
-        //     stream errors take precedence and exit via the
-        //     `providerError` path below)
-        //   - the step's tool plan is all read-only in `on_writes`
-        //     mode (no writes-intent to gate)
-        //   - the step has no text AND no tool_uses (nothing to
-        //     review)
-        if (collected.errors.length === 0) {
-          const critiqueCfg: CritiqueConfig = {
-            ...DEFAULT_CRITIQUE_CONFIG,
-            ...(config.critique ?? {}),
-          };
-          if (
-            shouldCritique(critiqueCfg, collected.tool_uses, collected.text, config.toolRegistry)
-          ) {
-            const critiqueProvider = config.critiqueProvider ?? config.provider;
-            const toolPlan = buildCritiqueToolPlan(collected.tool_uses, config.toolRegistry);
-            const critiqueInput = buildCritiqueInput(
-              config.userPrompt,
-              config.systemPrompt,
-              collected.text,
-              toolPlan,
-            );
-            const planHasWrites = toolPlanHasWrites(toolPlan);
-            safeEmit(config.onEvent, {
-              type: 'critique_started',
-              stepN: steps,
-              toolPlanWrites: planHasWrites,
-            });
-            // Pinned for the abort-path's `critique_finished`
-            // emission below — without our own start clock, we
-            // couldn't report a real durationMs when the engine's
-            // own timer never reaches its return-with-result
-            // path. Cheap to capture even on the happy path
-            // (engine reports its OWN durationMs in the result).
-            const critiqueStartMs = Date.now();
-
-            // The engine swallows watchdog / parse / stream
-            // errors into a CritiqueResult, but rethrows when the
-            // CALLER signal aborts (so the loop's existing
-            // aborted/maxWallClockMs handling fires). On rethrow,
-            // any partial usage the provider already reported is
-            // attached to the CollectStepError — same shape the
-            // executor recovers from at line 1510. Without
-            // mirroring that recovery here, billed critique tokens
-            // emitted before the abort would silently drop out of
-            // session totals (operator pays, audit doesn't see).
-            let critiqueResult: Awaited<ReturnType<typeof runCritique>>;
-            try {
-              critiqueResult = await runCritique(critiqueProvider, critiqueInput, {
-                threshold: critiqueCfg.threshold,
-                maxOverheadMs: critiqueCfg.maxOverheadMs,
-                ...(critiqueCfg.promptVersion !== undefined
-                  ? { promptVersion: critiqueCfg.promptVersion }
-                  : {}),
-                signal,
-              });
-            } catch (e) {
-              // Caller-aborted critique. Mirror the executor's
-              // catch at line 1510: flip usageComplete (totals are
-              // a lower bound from here on) and fold any partial
-              // usage into the running counters before letting the
-              // throw propagate. The outer guardedFinish(e) maps
-              // to `aborted` / `maxWallClockMs` based on which
-              // signal fired — the partial cost lands in the
-              // session row that finish() persists.
-              usageComplete = false;
-              let partialCost = 0;
-              if (e instanceof CollectStepError) {
-                const partial = e.partial;
-                if (partial.usageSeen) {
-                  partialCost = computeCost(critiqueProvider.capabilities, partial.usage);
-                  totalUsage = addUsage(totalUsage, partial.usage);
-                  totalCostUsd += partialCost;
-                  if (partialCost > 0) emitCostUpdate(partialCost);
-                }
-              }
-              // Emit `critique_finished` with the partial cost
-              // BEFORE rethrowing so REPL-side trackers
-              // (cumulative.critiqueCostUsd in cli/repl.ts) see
-              // the spend even on abort. Without this, the
-              // `/cost` breakdown shows the partial in the
-              // session total but NOT in the critique subtotal —
-              // operator hits Ctrl+C, sees inconsistent
-              // numbers. Strategy is `failed` (engine didn't
-              // produce a parsed result); reason discriminates
-              // abort from parse / stream / overhead failures so
-              // audit consumers can tell them apart.
-              const abortDurationMs = Date.now() - critiqueStartMs;
-              safeEmit(config.onEvent, {
-                type: 'critique_finished',
-                stepN: steps,
-                strategy: 'failed',
-                filteredCount: 0,
-                rawCount: 0,
-                overallConfidence: 0,
-                durationMs: abortDurationMs,
-                costUsd: partialCost,
-                decision: 'no_modal',
-                reason: 'caller_aborted',
-              });
-              // Persist the abort to `critique_runs` BEFORE the
-              // rethrow. Without this, the success path's
-              // recordCritiqueRun call below the rethrow never
-              // fires for aborted critiques, so the audit table
-              // loses rows precisely on the operator-driven
-              // termination cases — the lifecycle event flows
-              // through NDJSON external but the DB doesn't
-              // persist. Code is `critique.aborted` (distinct
-              // from `failed` so audit consumers can separate
-              // operator-driven aborts from critic-side
-              // breakage). Same try/catch fail-soft as the
-              // success path's recordCritiqueRun (line ~1750):
-              // a SQLite throw at audit time MUST NOT mask the
-              // run's actual outcome.
-              try {
-                recordCritiqueRun(config.db, {
-                  sessionId,
-                  stepN: steps,
-                  mode: critiqueCfg.mode === 'always' ? 'always' : 'on_writes',
-                  strategy: 'failed',
-                  decision: 'no_modal',
-                  code: 'critique.aborted',
-                  rawCount: 0,
-                  filteredCount: 0,
-                  overallConfidence: 0,
-                  durationMs: abortDurationMs,
-                  costUsd: partialCost,
-                  toolPlanWrites: planHasWrites,
-                  reason: 'caller_aborted',
-                  promptVersion: resolveCritiquePromptVersion(
-                    critiqueCfg.promptVersion ?? DEFAULT_CRITIQUE_PROMPT_VERSION,
-                  ),
-                  threshold: critiqueCfg.threshold,
-                });
-              } catch {
-                // Audit write failed; lifecycle event above still
-                // captured the data for live observers.
-              }
-              throw e;
-            }
-
-            // Fold critique cost into session totals as a separate
-            // line per ORCHESTRATION §6.3 — `usage` aggregates
-            // billed tokens across executor + critic + compaction;
-            // `step.cost_usd` is the executor turn alone, and
-            // `totalCostUsd` is the session-wide sum. The
-            // critique's billed tokens flow through even on
-            // strategy='failed' / 'skipped' so partial bills
-            // (provider charged us before the call broke) are
-            // never silently dropped.
-            if (critiqueResult.usageSeen) {
-              totalUsage = addUsage(totalUsage, critiqueResult.usage);
-            } else {
-              // The critique engine ALWAYS issues a provider.generate
-              // request — `skipped` (watchdog) and `failed` (parse /
-              // stream error) both happen AFTER the call has begun,
-              // unlike compaction's `skipped` which means "no call
-              // made". So a missing usage event here means the
-              // provider was billed (at least for input tokens) but
-              // didn't report telemetry; session totals become a
-              // lower bound. Mirrors the per-turn flip at line 1597
-              // and the compaction flip at line 2632.
-              usageComplete = false;
-            }
-            totalCostUsd += critiqueResult.costUsd;
-            if (critiqueResult.costUsd > 0) emitCostUpdate(critiqueResult.costUsd);
-
-            // Decide whether to surface to the operator. The modal
-            // opens only when the engine ran end-to-end AND at
-            // least one issue crossed the threshold. Skipped /
-            // failed runs fall through silently — the audit event
-            // (Slice C) captures the reason for later analysis,
-            // but the run is not blocked.
-            let decision: CritiqueAnswer | 'no_modal' = 'no_modal';
-            if (critiqueResult.strategy === 'llm' && critiqueResult.filteredIssues.length > 0) {
-              // Default-ignore when no hook is wired (headless
-              // mode, tests). The Slice A engine guarantees the
-              // critic is a soft check, never a hard gate; a
-              // headless run shouldn't block on a missing modal.
-              decision = 'ignore';
-              if (config.confirmCritique !== undefined) {
-                try {
-                  decision = await config.confirmCritique({
-                    issues: critiqueResult.filteredIssues,
-                    overallConfidence: critiqueResult.overallConfidence,
-                    toolPlanWrites: planHasWrites,
-                  });
-                } catch {
-                  // Hook threw — degrade to `ignore`. A buggy
-                  // bridge MUST NOT take down the run.
-                  decision = 'ignore';
-                }
-              }
-            }
-
-            safeEmit(config.onEvent, {
-              type: 'critique_finished',
-              stepN: steps,
-              strategy: critiqueResult.strategy,
-              filteredCount: critiqueResult.filteredIssues.length,
-              rawCount: critiqueResult.rawIssues.length,
-              overallConfidence: critiqueResult.overallConfidence,
-              durationMs: critiqueResult.durationMs,
-              costUsd: critiqueResult.costUsd,
-              decision,
-              ...(critiqueResult.reason !== undefined ? { reason: critiqueResult.reason } : {}),
-            });
-
-            // Audit row (migration 031). Spec §5.4 line 552 codes
-            // plus a few harness-specific ones to cover the full
-            // decision matrix the loop produces. The mapping is
-            // strategy + decision → code:
-            //   skipped        → critique.skipped
-            //   failed         → critique.failed
-            //   llm + no_modal → critique.clean (no issues over threshold)
-            //   llm + ignore   → critique.warning_ignored
-            //   llm + redo     → critique.warning_redo
-            //   llm + abort|cancel → critique.warning_abort
-            // critique.warning_shown is NOT used here — it's
-            // implied by any code that starts with `critique.warning_*`.
-            // Audit consumers that want "did we show a modal at
-            // all" filter on the prefix.
-            //
-            // Try/catch fail-soft: a DB write throw at audit time
-            // MUST NOT mask the run's actual outcome. The lifecycle
-            // event already fired; losing the persisted row is the
-            // lesser evil compared to crashing the loop on a
-            // transient SQLite error. Mirrors the recordGateDecision
-            // pattern at the subagent gate (loop.ts:1815).
-            try {
-              const code: CritiqueRunCode =
-                critiqueResult.strategy === 'skipped'
-                  ? 'critique.skipped'
-                  : critiqueResult.strategy === 'failed'
-                    ? 'critique.failed'
-                    : decision === 'no_modal'
-                      ? 'critique.clean'
-                      : decision === 'ignore'
-                        ? 'critique.warning_ignored'
-                        : decision === 'redo'
-                          ? 'critique.warning_redo'
-                          : 'critique.warning_abort';
-              recordCritiqueRun(config.db, {
-                sessionId,
-                stepN: steps,
-                mode: critiqueCfg.mode === 'always' ? 'always' : 'on_writes',
-                strategy: critiqueResult.strategy,
-                decision,
-                code,
-                rawCount: critiqueResult.rawIssues.length,
-                filteredCount: critiqueResult.filteredIssues.length,
-                overallConfidence: critiqueResult.overallConfidence,
-                durationMs: critiqueResult.durationMs,
-                costUsd: critiqueResult.costUsd,
-                toolPlanWrites: planHasWrites,
-                ...(critiqueResult.reason !== undefined ? { reason: critiqueResult.reason } : {}),
-                // Use the version the engine ACTUALLY ran with —
-                // not the one in the operator's config (which may
-                // be undefined and fall through to the engine's
-                // default). Without this read-from-result, the
-                // audit row's prompt_version drifts the moment
-                // DEFAULT_CRITIQUE_PROMPT_VERSION changes (which
-                // already happened once, V1 → V2: the loop kept
-                // recording 'v1' on every run that used V2).
-                promptVersion: critiqueResult.promptVersion,
-                threshold: critiqueCfg.threshold,
-              });
-            } catch {
-              // Audit row write failed; the lifecycle event still
-              // captured the same data for live observers.
-            }
-
-            if (decision === 'abort' || decision === 'cancel') {
-              return await finish(
-                'critiqueAborted',
-                `${critiqueResult.filteredIssues.length} issue(s) flagged`,
-              );
-            }
-            if (decision === 'redo') {
-              // Discard the rejected assistant buffer entirely
-              // (ORCHESTRATION §6.2 — "discard buffer; re-run
-              // step com hint do critic injetado"). Push the
-              // critic's hint so the model sees it on the next
-              // provider call.
-              //
-              // Merge into the trailing user message when the
-              // tail is user-role — pushing a separate user
-              // message would create user→user alternation that
-              // some providers reject. For tail = string content,
-              // append the hint with a blank-line separator. For
-              // tail = block array (typically tool_results from
-              // the prior step), append a text block. When the
-              // tail is assistant (only happens if a prior step
-              // already left an assistant turn unmatched —
-              // shouldn't occur in normal flow) push a fresh
-              // user message.
-              const hint = renderCritiqueHint(critiqueResult.filteredIssues);
-              const last = messages[messages.length - 1];
-              if (last === undefined) {
-                messages.push({ role: 'user', content: hint });
-              } else if (last.role === 'user') {
-                if (typeof last.content === 'string') {
-                  messages[messages.length - 1] = {
-                    role: 'user',
-                    content: `${last.content}\n\n${hint}`,
-                  };
-                } else {
-                  messages[messages.length - 1] = {
-                    role: 'user',
-                    content: [...last.content, { type: 'text', text: hint }],
-                  };
-                }
-              } else {
-                messages.push({ role: 'user', content: hint });
-              }
-              // Cost-cap check before continuing — the rejected
-              // turn AND the critique call both billed tokens; a
-              // redo loop should not be able to blow past the
-              // hard cap by accumulating uncommitted spend.
-              const overage = costCapDetailIfExceeded();
-              if (overage !== null) return await finish('maxCostUsd', overage);
-              continue;
-            }
-            // decision === 'ignore' | 'no_modal' → fall through
-            // to persist.
-          }
-        }
 
         // When the adapter never emitted a `usage` event, persist NULL on
         // the token/cost columns instead of zeroes. Future analytics can

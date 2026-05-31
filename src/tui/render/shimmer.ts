@@ -1,5 +1,5 @@
 // Shimmer — a highlight that slides left-to-right across a live
-// chip's verb (awaiting / assistant / thinking / critique). The
+// chip's verb (awaiting / assistant / thinking). The
 // centre char is `accent`, its two neighbours `default`, the rest
 // the chip's own base token (`secondary` / `warn` / `error`) — the
 // closest the 8-color palette gets to a gradient (no truecolor,

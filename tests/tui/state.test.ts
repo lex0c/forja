@@ -512,92 +512,6 @@ describe('thinking lifecycle', () => {
   });
 });
 
-describe('critique lifecycle (Slice D)', () => {
-  test('start sets startedAt + stepN + toolPlanWrites; end clears it', () => {
-    const result = drive([{ type: 'critique:start', ts: 1000, stepN: 3, toolPlanWrites: false }]);
-    expect(result.state.critique).toEqual({
-      startedAt: 1000,
-      stepN: 3,
-      toolPlanWrites: false,
-    });
-    const after = applyEvent(result.state, { type: 'critique:end', ts: 1500, stepN: 3 });
-    expect(after.state.critique).toBeNull();
-  });
-
-  test('toolPlanWrites=true is preserved (drives the chip color)', () => {
-    const result = drive([{ type: 'critique:start', ts: 1, stepN: 1, toolPlanWrites: true }]);
-    expect(result.state.critique?.toolPlanWrites).toBe(true);
-  });
-
-  test('critique:ask clears the chip — modal-open marks the critic call as done, wait shifts to operator', () => {
-    // Regression: the chip's `startedAt` is the critic LLM call's
-    // start. `critique_finished` (which maps to `critique:end`)
-    // fires AFTER the operator decides on the modal — so leaving
-    // the chip up past `critique:ask` would have its elapsed
-    // counter tick across human decision time. Clearing here
-    // keeps the live indicator honest about what's actually
-    // running.
-    const result = drive([{ type: 'critique:start', ts: 1_000, stepN: 2, toolPlanWrites: false }]);
-    expect(result.state.critique).not.toBeNull();
-    const after = applyEvent(result.state, {
-      type: 'critique:ask',
-      ts: 3_000,
-      promptId: 'p-crit-1',
-      issues: [{ message: 'something off', severity: 'medium', confidence: 0.9 }],
-    });
-    expect(after.state.critique).toBeNull();
-    // The modal still opens — the chip clear and the modal open
-    // are paired side effects of the same event, not alternatives.
-    expect(after.state.modal?.flavor).toBe('critique');
-  });
-
-  test('critique:end after critique:ask is a chip no-op (already cleared)', () => {
-    // The two clear sites (`ask` and `end`) converge on the same
-    // end state; the second clear must not throw / regress.
-    const afterAsk = drive([
-      { type: 'critique:start', ts: 1_000, stepN: 2, toolPlanWrites: false },
-      {
-        type: 'critique:ask',
-        ts: 3_000,
-        promptId: 'p-crit-2',
-        issues: [{ message: 'x', severity: 'low', confidence: 0.5 }],
-      },
-    ]);
-    expect(afterAsk.state.critique).toBeNull();
-    const afterEnd = applyEvent(afterAsk.state, {
-      type: 'critique:end',
-      ts: 9_000,
-      stepN: 2,
-    });
-    expect(afterEnd.state.critique).toBeNull();
-  });
-
-  test('session:end clears a dangling critique chip (mid-critique abort)', () => {
-    // Operator hits Ctrl+C while the critic call is still in
-    // flight: the harness signal aborts before `critique_finished`
-    // ever fires. Without the boundary cleanup the chip would
-    // outlive the session in the live region.
-    const result = drive([
-      {
-        type: 'session:start',
-        ts: 0,
-        sessionId: 's1',
-        project: 'p',
-        model: 'mock/m',
-      },
-      { type: 'critique:start', ts: 100, stepN: 1, toolPlanWrites: false },
-    ]);
-    expect(result.state.critique).not.toBeNull();
-    const after = applyEvent(result.state, {
-      type: 'session:end',
-      ts: 200,
-      sessionId: 's1',
-      reason: 'aborted',
-    });
-    expect(after.state.critique).toBeNull();
-  });
-});
-
 describe('tool lifecycle', () => {
   // Vocabulary fields are pre-resolved by the adapter; tests pass the
   // resolved verb/subject directly to the events.
@@ -2089,7 +2003,6 @@ describe('not-yet-wired events accept silently', () => {
         estimatedCostUsd: 0,
       },
     ],
-    ['critique:ask', { type: 'critique:ask', ts: 1, promptId: 'p1', issues: [] }],
     ['bg:start', { type: 'bg:start', ts: 1, processId: 'b1', command: 'sleep' }],
     ['bg:update', { type: 'bg:update', ts: 1, processId: 'b1', status: 'running' }],
     ['bg:end', { type: 'bg:end', ts: 1, processId: 'b1', cause: 'exited', exitCode: 0 }],
