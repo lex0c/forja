@@ -69,7 +69,7 @@ describe('composeLive layout', () => {
     expect(out[1]).toBe(expectedRule(caps.cols, true));
     expect(out[2]).toBe('> ');
     expect(out[3]).toBe(expectedRule(caps.cols, true));
-    expect(out[4]).toContain('Supervised');
+    expect(out[4]).toContain('supervised mode on');
   });
 
   test('after session start: BLANK + rule + input + rule + footer', () => {
@@ -159,7 +159,7 @@ describe('composeLive layout', () => {
     expect(out[9]).toBe(expectedRule(caps.cols, true));
     expect(out[10]).toBe('> ');
     expect(out[11]).toBe(expectedRule(caps.cols, true));
-    expect(out[12]).toContain('Supervised');
+    expect(out[12]).toContain('supervised mode on');
     expect(out).toHaveLength(13);
   });
 
@@ -240,7 +240,7 @@ describe('composeLive layout', () => {
     expect(inputRow(out, 0)).toBe('> a');
     expect(inputRow(out, 1)).toBe('  b');
     expect(out[out.length - 2]).toBe(expectedRule(caps.cols, true));
-    expect(out[out.length - 1]).toContain('Supervised');
+    expect(out[out.length - 1]).toContain('supervised mode on');
   });
 
   test('multiple tools appear in insertion order', () => {

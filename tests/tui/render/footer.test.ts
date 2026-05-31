@@ -36,7 +36,7 @@ describe('renderFooter', () => {
     expect(out).not.toBeNull();
     // The operation-mode cue replaced the old `? for help` hint
     // (UI.md §4.10.6). Default posture is supervised.
-    expect(out).toContain('Supervised (shift+tab to change)');
+    expect(out).toContain('supervised mode on (shift+tab to change)');
     expect(out).not.toContain('? for help');
     // Newline hint pairs with the input editor's backslash
     // continuation (UI.md §5.4).
@@ -50,20 +50,20 @@ describe('renderFooter', () => {
     expect(out).not.toContain('esc to interrupt');
   });
 
-  test('autonomous posture renders the Autonomous label', () => {
+  test('autonomous posture renders the autonomous mode-on label', () => {
     const out = renderFooter(startedSession({ operationMode: 'autonomous' }), caps);
-    expect(out).toContain('Autonomous (shift+tab to change)');
-    expect(out).not.toContain('Supervised');
+    expect(out).toContain('autonomous mode on (shift+tab to change)');
+    expect(out).not.toContain('supervised mode on');
   });
 
-  test('mode cue: Supervised painted accent (blue), Autonomous painted warn (yellow)', () => {
+  test('mode cue: supervised mode on painted accent (blue), autonomous mode on painted warn (yellow)', () => {
     const colored: Capabilities = { ...caps, color: 'basic' };
-    // Supervised → accent = CSI 94 m (blue).
+    // supervised mode on → accent = CSI 94 m (blue).
     const sup = renderFooter(startedSession(), colored);
-    expect(sup).toContain(`${CSI}94mSupervised${CSI}0m`);
-    // Autonomous → warn = CSI 33 m (yellow) — a deliberate "heads up".
+    expect(sup).toContain(`${CSI}94msupervised mode on${CSI}0m`);
+    // autonomous mode on → warn = CSI 33 m (yellow) — a deliberate "heads up".
     const auto = renderFooter(startedSession({ operationMode: 'autonomous' }), colored);
-    expect(auto).toContain(`${CSI}33mAutonomous${CSI}0m`);
+    expect(auto).toContain(`${CSI}33mautonomous mode on${CSI}0m`);
     // The "(shift+tab to change)" affordance is secondary (90m) in both.
     expect(sup).toContain(`${CSI}90m (shift+tab to change)${CSI}0m`);
   });
@@ -81,7 +81,9 @@ describe('renderFooter', () => {
     };
     s.activeTools.set('t1', tool);
     const out = renderFooter(s, caps);
-    expect(out).toContain('Supervised (shift+tab to change) · \\+Enter newline · esc to interrupt');
+    expect(out).toContain(
+      'supervised mode on (shift+tab to change) · \\+Enter newline · esc to interrupt',
+    );
   });
 
   test('thinking state also triggers interrupt cue', () => {
@@ -412,7 +414,7 @@ describe('renderFooter', () => {
 
   test('pre-session (no model) shows only the mode cue, no right column', () => {
     const out = renderFooter(createInitialState(), caps);
-    expect(out).toContain('Supervised (shift+tab to change)');
+    expect(out).toContain('supervised mode on (shift+tab to change)');
     expect(out).not.toContain('•');
   });
 
@@ -556,7 +558,7 @@ describe('renderFooter', () => {
       const s = startedSession();
       s.exitArmed = null;
       const out = renderFooter(s, caps);
-      expect(out).toContain('Supervised (shift+tab to change)');
+      expect(out).toContain('supervised mode on (shift+tab to change)');
       expect(out).not.toContain('Press Ctrl-C again to exit');
     });
 
