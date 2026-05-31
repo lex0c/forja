@@ -7,8 +7,8 @@ import type { EvalBudget, EvalCase, EvalExpectation, EvalSetup } from './types.t
 // Built once from the harness's source-of-truth tuple. Adding a new
 // `ExitReason` automatically widens this allowlist — no hand-rolled
 // mirror to keep in sync (the prior inline literal silently rejected
-// `stepStalled` and `critiqueAborted` for an entire milestone before
-// anyone tried to assert them in YAML).
+// `stepStalled` for a whole milestone before anyone tried to assert
+// it in YAML).
 const VALID_EXIT_REASONS: ReadonlySet<string> = new Set(EXIT_REASONS);
 
 // Fields tolerated at the top level. Unknown keys throw — the

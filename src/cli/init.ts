@@ -32,8 +32,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { DEFAULT_MEMORY_CONFIG } from '../critique/config-loader.ts';
-import { DEFAULT_CRITIQUE_CONFIG } from '../critique/types.ts';
+import { DEFAULT_MEMORY_CONFIG } from '../config/loaders.ts';
 import { DEFAULT_BUDGET } from '../harness/types.ts';
 import { ensureAgentGitignore } from '../memory/gitignore.ts';
 import { resolveScopeRoots as resolveMemoryScopeRoots } from '../memory/paths.ts';
@@ -268,7 +267,7 @@ const scaffoldConfig = (options: InitOptions, force: boolean): StepResult | null
   }
   try {
     mkdirSync(dirname(target), { recursive: true });
-    // Scaffold sources all four section values from the canonical
+    // Scaffold sources all three section values from the canonical
     // code defaults so a re-run with `--force=config` (or a fresh
     // init after a bump) re-syncs to the current values.
     atomicWrite(
@@ -277,7 +276,6 @@ const scaffoldConfig = (options: InitOptions, force: boolean): StepResult | null
         model: DEFAULT_MODEL,
         budget: DEFAULT_BUDGET,
         memory: DEFAULT_MEMORY_CONFIG,
-        critique: DEFAULT_CRITIQUE_CONFIG,
       }),
     );
   } catch (e) {

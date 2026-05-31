@@ -183,7 +183,7 @@ describe('renderModal (UI.md §4.10.13 layout)', () => {
   // Pinned explicitly: the permission-only tests above don't cover
   // these, so a regression that widened the warn branch to a routine
   // confirm (or inverted the gate predicate) fails right here.
-  for (const flavor of ['permission', 'memory-write', 'critique', 'history-clear'] as const) {
+  for (const flavor of ['permission', 'memory-write', 'history-clear'] as const) {
     test(`${flavor} (non-gate) keeps accent anchor, not warn`, () => {
       const out = renderModal(baseModal({ flavor }), colored);
       expect(out[0]).toContain(`${CSI}94m`); // rule accent (blue)

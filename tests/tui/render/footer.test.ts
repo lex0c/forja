@@ -119,14 +119,6 @@ describe('renderFooter', () => {
     expect(out).not.toContain('\\+Enter newline');
   });
 
-  test('critique pass also keeps the interrupt cue', () => {
-    const s = startedSession();
-    s.critique = { startedAt: 0, stepN: 1, toolPlanWrites: false };
-    const out = renderFooter(s, caps);
-    expect(out).toContain('esc to interrupt');
-    expect(out).not.toContain('\\+Enter newline');
-  });
-
   test('soft-aborted + running swaps cue to "esc again to force"', () => {
     // Spec UI.md §4.10.6: once the operator hit Esc once mid-turn,
     // the footer signals that the loop has acknowledged and is

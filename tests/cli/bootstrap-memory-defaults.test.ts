@@ -201,7 +201,7 @@ conflict_detect_llm = true
   test('user config disabling conflict suppresses banner + sets source', async () => {
     // XDG_CONFIG_HOME points at workdir -> user-layer file lives at
     // <workdir>/agent/config.toml (see userConfigPath in
-    // src/critique/config-loader.ts).
+    // src/config/loaders.ts).
     mkdirSync(join(workdir, 'agent'), { recursive: true });
     writeFileSync(
       join(workdir, 'agent', 'config.toml'),

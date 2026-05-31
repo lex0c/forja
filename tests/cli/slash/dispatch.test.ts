@@ -43,7 +43,7 @@ const makeCtx = (): {
       db,
       bus,
       modalManager,
-      cumulative: { costUsd: 0, steps: 0, turns: 0, critiqueCostUsd: 0, critiqueRuns: 0 },
+      cumulative: { costUsd: 0, steps: 0, turns: 0 },
       now: () => 1,
       requestShutdown: () => {
         shutdownFired = true;
@@ -153,7 +153,7 @@ describe('dispatch', () => {
 });
 
 describe('createBuiltinRegistry', () => {
-  test('contains all 18 builtins when no subagents provided', () => {
+  test('contains all 17 builtins when no subagents provided', () => {
     const r = createBuiltinRegistry();
     const names = r.list().map((c) => c.name);
     expect(names).toEqual([
@@ -161,7 +161,6 @@ describe('createBuiltinRegistry', () => {
       'quit',
       'clear',
       'cost',
-      'critique',
       'sessions',
       'recap',
       'subagents',
@@ -185,8 +184,8 @@ describe('createBuiltinRegistry', () => {
     if (help === undefined) return;
     const result = await help.exec([], makeCtx().ctx);
     if (result.kind !== 'ok') return;
-    // 18 commands → header + 18 rows + blank + emergency-exit footer = 21.
-    expect(result.notes?.length).toBe(21);
+    // 17 commands → header + 17 rows + blank + emergency-exit footer = 20.
+    expect(result.notes?.length).toBe(20);
   });
 
   test('appends playbook slash commands when a SubagentSet is provided', () => {

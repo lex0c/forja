@@ -184,24 +184,6 @@ export interface MemoryActionAskArgs {
   question: string;
 }
 
-// Self-critique flavor (AGENTIC_CLI.md §5.4, ORCHESTRATION.md §6).
-// Producer is the harness's `confirmCritique` bridge — called
-// after the engine returns issues that crossed the threshold.
-//
-// Severity at the modal layer is `low | medium | high` (matches the
-// pre-existing `critique:ask` event shape); the bridge translates
-// from the engine's `info | warn | error` so the modal contract
-// stays stable while the engine evolves.
-//
-// `toolPlanWrites` lets the reducer pick the stronger headline
-// when the proposal includes writes:true tool calls — operator
-// reads "about to mutate" instead of plain "Critique".
-export interface CritiqueAskArgs {
-  issues: { severity: 'low' | 'medium' | 'high'; confidence: number; message: string }[];
-  toolPlanWrites?: boolean;
-}
-export type CritiqueModalAnswer = 'ignore' | 'redo' | 'abort' | 'cancel';
-
 // Trust flavor's option list. Kept in sync with the reducer's
 // `trust:ask` ConfirmState construction in state.ts.
 const TRUST_OPTIONS: readonly ConfirmOption[] = [
@@ -267,19 +249,6 @@ const MEMORY_USER_SCOPE_OPTIONS: readonly ConfirmOption[] = [
 const MEMORY_ACTION_OPTIONS: readonly ConfirmOption[] = [
   { key: '1', label: 'Yes, proceed', value: 'yes' },
   { key: '2', label: 'No, cancel', value: 'no' },
-];
-
-// Self-critique options (AGENTIC_CLI.md §5.4 line 551). Three-way
-// decision — kept in sync with the reducer's `critique:ask`
-// ConfirmState construction in state.ts. `abort` lands last per
-// D5/D65 (last = conservative default), but the conservative
-// choice for a flagged proposal is to NOT proceed — abort
-// matches that better than ignore (proceed blind) or redo
-// (re-run, possibly loop).
-const CRITIQUE_OPTIONS: readonly ConfirmOption[] = [
-  { key: '1', label: 'Ignore', value: 'ignore' },
-  { key: '2', label: 'Redo with hint', value: 'redo' },
-  { key: '3', label: 'Abort step', value: 'abort' },
 ];
 
 // Permission flavor's option list. Source of truth for both the
@@ -370,14 +339,6 @@ export interface ModalManager {
     args: MemoryActionAskArgs,
     opts?: ConfirmAskOptions,
   ) => Promise<MemoryWriteAnswer>;
-  // Self-critique flavor (AGENTIC_CLI.md §5.4). Producer is the
-  // harness's `confirmCritique` bridge. Caller (REPL bootstrap)
-  // wires `confirmCritique = (req) => askCritique(translated)`
-  // so the harness loop's three-way decision flows through the
-  // modal layer. `cancel` (Esc / abort signal / timeout) collapses
-  // to the same loop semantic as `abort` — the loop's gate
-  // treats them identically (`finish('critiqueAborted')`).
-  askCritique: (args: CritiqueAskArgs, opts?: ConfirmAskOptions) => Promise<CritiqueModalAnswer>;
   // Number of pending modals (active + queued). Tests inspect.
   pendingCount: () => number;
   // Drop the queue and resolve any pending promise as `cancel`. Used
@@ -850,19 +811,6 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           question: args.question,
         }),
         MEMORY_ACTION_OPTIONS,
-        opts?.timeoutMs,
-        opts?.signal,
-      ),
-    askCritique: (args, opts) =>
-      enqueueConfirm<CritiqueModalAnswer>(
-        (promptId) => ({
-          type: 'critique:ask',
-          ts: now(),
-          promptId,
-          issues: args.issues,
-          ...(args.toolPlanWrites === true ? { toolPlanWrites: true } : {}),
-        }),
-        CRITIQUE_OPTIONS,
         opts?.timeoutMs,
         opts?.signal,
       ),

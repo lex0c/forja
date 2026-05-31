@@ -38,7 +38,6 @@ import {
 } from '../storage/history.ts';
 import { closeDb } from '../storage/index.ts';
 import { createContextPinsStore } from '../storage/repos/context-pins.ts';
-import { listCritiqueRunsBySession } from '../storage/repos/critique-runs.ts';
 import { completeSession, createSession } from '../storage/repos/sessions.ts';
 import { settleRunningSubagentHandles } from '../storage/repos/subagent-handles.ts';
 import { runSubagent } from '../subagents/index.ts';
@@ -547,7 +546,6 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     subagents,
     policyLayers,
     hookWarnings,
-    critiqueWarnings,
     memoryConfigWarnings,
     auditConfigWarnings,
     sandboxEnforcement,
@@ -578,12 +576,6 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   for (const w of hookWarnings) {
     const layerFrag = w.layer !== null ? `${w.layer} ` : '';
     errSink(`forja: ${layerFrag}hook ${w.sourcePath}: ${w.message}\n`);
-  }
-  // Self-critique config warnings (spec AGENTIC_CLI.md §5.4).
-  // Same surfacing as src/cli/run.ts. Operator gets one line per
-  // bad value at REPL boot.
-  for (const w of critiqueWarnings) {
-    errSink(`forja: critique config: ${w}\n`);
   }
   // Memory governance config warnings (`.agent/config.toml [memory]`).
   // Same surfacing as run.ts: loader degrades to defaults on bad
@@ -804,12 +796,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   let lastSessionId: string | null = resumedSessionId;
   // Append-only list of session ids tracked across this REPL
   // boot. Pushed on `session_finished` and on playbook subagent
-  // completion. /critique aggregates across this list so an
-  // operator running multiple turns sees critique data from all
-  // of them, not just the most recent. Synthetic-parent ids
-  // (audit anchors created by ensureParentSessionId before any
-  // real turn) are NOT pushed — those are subagent-flagged
-  // anchors with no critique runs of their own.
+  // completion. Slash commands that aggregate across the whole
+  // REPL read this list so an operator running multiple turns
+  // sees data from all of them, not just the most recent.
+  // Synthetic-parent ids (audit anchors created by
+  // ensureParentSessionId before any real turn) are NOT pushed —
+  // those are subagent-flagged anchors with no runs of their own.
   const replSessionIdSet = new Set<string>();
   const replSessionIdOrder: string[] = [];
   const trackReplSessionId = (id: string): void => {
@@ -817,11 +809,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     replSessionIdSet.add(id);
     replSessionIdOrder.push(id);
   };
-  // Seed the tracking list with the resumed id so /critique can
-  // aggregate across both the resumed chain AND new turns added in
-  // this boot. Without this seed, /critique would only see runs
-  // started in the current boot, hiding any prior critique data
-  // tied to the resumed session.
+  // Seed the tracking list with the resumed id so REPL-wide
+  // aggregation spans both the resumed chain AND new turns added in
+  // this boot. Without this seed, only runs started in the current
+  // boot would be visible, hiding any prior data tied to the
+  // resumed session.
   if (resumedSessionId !== null) trackReplSessionId(resumedSessionId);
 
   // Synthetic parent session id for slash playbook dispatches that
@@ -1110,24 +1102,6 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       cumulative.steps += event.result.steps;
       cumulative.turns += 1;
     }
-    // Track critique cost as it accrues (NOT at session_finished).
-    // Updating per-event keeps the tracker accurate even when a
-    // run aborts mid-step — the rejected turn's critic call still
-    // billed tokens, and `/cost` should reflect that. The session
-    // total in `costUsd` already includes critique cost per
-    // ORCHESTRATION §6.3, so this field is a SUBSET — operators
-    // read "cumulative: $X · critique: $Y" as "of $X total spend,
-    // $Y was the second-pass review".
-    //
-    // `critiqueRuns` advances unconditionally — even when the
-    // emitted `costUsd` is 0 (missing usage telemetry, or
-    // `strategy=skipped`). The count is what tells `/cost` that
-    // critique was actually invoked, separating "ran with no
-    // measurable cost" from "never ran".
-    if (event.type === 'critique_finished') {
-      cumulative.critiqueCostUsd += event.costUsd;
-      cumulative.critiqueRuns += 1;
-    }
   };
 
   // Bridge for the harness's confirm decisions: extracts a one-line
@@ -1255,41 +1229,6 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     body: string;
   }): Promise<'yes' | 'no' | 'cancel'> => modalManager.askMemoryUserScope(req);
 
-  // Self-critique bridge (AGENTIC_CLI.md §5.4, ORCHESTRATION.md §6).
-  // Translates the engine's severity vocabulary (`info | warn |
-  // error`, set by the spec at line 542) into the modal layer's
-  // (`low | medium | high`, set by the pre-existing `critique:ask`
-  // event shape). The two sets are kept distinct so each side can
-  // evolve without churning the other — the bridge is the single
-  // place that has to hold both vocabularies in mind. Mapping is
-  // 1:1 by intent: info=stylistic nit, warn=probable issue,
-  // error=would break intent → low, medium, high.
-  //
-  // `description` from the engine becomes `message` for the modal —
-  // the modal renders one line per issue and only needs the
-  // headline; the suggestion is delivered to the model in the
-  // redo hint, not shown in the modal preview.
-  const confirmCritique = async (req: {
-    issues: { severity: 'info' | 'warn' | 'error'; description: string; confidence: number }[];
-    overallConfidence: number;
-    toolPlanWrites: boolean;
-  }): Promise<'ignore' | 'redo' | 'abort' | 'cancel'> => {
-    const translated = req.issues.map((i) => ({
-      severity:
-        i.severity === 'error'
-          ? ('high' as const)
-          : i.severity === 'warn'
-            ? ('medium' as const)
-            : ('low' as const),
-      confidence: i.confidence,
-      message: i.description,
-    }));
-    return modalManager.askCritique({
-      issues: translated,
-      ...(req.toolPlanWrites === true ? { toolPlanWrites: true } : {}),
-    });
-  };
-
   const startTurn = (text: string): void => {
     if (isBusy() || exiting) return;
     running = true;
@@ -1311,7 +1250,6 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       confirmPermission,
       confirmMemoryWrite,
       confirmMemoryUserScope,
-      confirmCritique,
       contextPinsStore,
       ...(lastSessionId !== null ? { resumeFromSessionId: lastSessionId } : {}),
     };
@@ -1530,7 +1468,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // — no chance of a typed `/<conflict>` ambiguously routing
   // mid-session.
   const slashRegistry = createBuiltinRegistry(subagents);
-  const cumulative = { costUsd: 0, steps: 0, turns: 0, critiqueCostUsd: 0, critiqueRuns: 0 };
+  const cumulative = { costUsd: 0, steps: 0, turns: 0 };
   // Single registry instance for the REPL's lifetime. /model uses it
   // for the lookup + factory; bootstrap built its own at boot for
   // initial provider resolution. Both call sites are independent —
@@ -1784,42 +1722,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         }
         cumulative.steps += result.steps;
         cumulative.turns += 1;
-        // Track the playbook child session so `/critique` can
-        // aggregate critique runs from the playbook alongside the
-        // parent's. The child wrote its `critique_runs` rows into
-        // the same DB at execution time; we just need its session
-        // id to find them again.
+        // Track the playbook child session so REPL-wide aggregation
+        // (anything reading `replSessionIds`) sees the child's
+        // session alongside the parent's. The child wrote its rows
+        // into the same DB at execution time; we just need its
+        // session id to find them again.
         trackReplSessionId(result.sessionId);
-        // Roll the playbook child's critique spend into the REPL
-        // critique subtotal. The foreground accumulator at
-        // onHarnessEvent only sees `critique_finished` events from
-        // the parent harness; the child's events flow through IPC
-        // as `subagent_progress` and don't trigger that branch. So
-        // without this query, /cost shows the playbook's full cost
-        // in `cumulative.costUsd` (including the child's critique
-        // contribution) but ZERO of it in
-        // `cumulative.critiqueCostUsd` — the breakdown would
-        // underreport critique spend whenever a playbook ran.
-        // Same fail-soft try/catch as the rest of this finally:
-        // a SQLite read throw at audit-rollup time MUST NOT mask
-        // the dispatch result the operator is waiting for.
-        try {
-          for (const row of listCritiqueRunsBySession(db, result.sessionId)) {
-            if (Number.isFinite(row.costUsd)) {
-              cumulative.critiqueCostUsd += row.costUsd;
-            }
-            // Count every persisted run (the row's existence
-            // proves critique was invoked). Bad cost data
-            // shouldn't hide the fact that critique fired —
-            // `/cost` keys the breakdown line on the count, not
-            // the cost.
-            cumulative.critiqueRuns += 1;
-          }
-        } catch {
-          // Audit roll-up failed; the per-row data is still in DB
-          // for `/critique`, just not folded into the live
-          // subtotal. Subsequent dispatches still work.
-        }
         return result;
       } finally {
         // Drop the gate even on throw — a stuck `playbookRunning`

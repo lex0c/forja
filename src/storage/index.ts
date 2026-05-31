@@ -323,16 +323,3 @@ export type {
   InsertSubagentGateDecisionInput,
   SubagentGateDecision,
 } from './repos/subagent-gate-decisions.ts';
-
-export {
-  listCritiqueRunsBySession,
-  recordCritiqueRun,
-} from './repos/critique-runs.ts';
-export type {
-  CritiqueRun,
-  CritiqueRunCode,
-  CritiqueRunDecision,
-  CritiqueRunMode,
-  CritiqueRunStrategy,
-  RecordCritiqueRunInput,
-} from './repos/critique-runs.ts';

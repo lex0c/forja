@@ -3391,9 +3391,9 @@ const handleGovernanceStatus = (ctx: SlashContext, args: string[]): SlashResult 
 // Slash surface for the operator to opt OUT of the (default-ON since
 // Slice Q) LLM-judge detectors per-project. Writes `.agent/config.toml
 // [memory]` keys; effect applies at next turn boundary (same snapshot
-// semantic as /model and /critique mode). Creates `.agent/` + the
-// file if absent; preserves other sections (`[critique]`, etc.)
-// verbatim via a text-level edit of the `[memory]` block.
+// semantic as /model). Creates `.agent/` + the file if absent;
+// preserves other sections (`[providers]`, `[budget]`, etc.) verbatim
+// via a text-level edit of the `[memory]` block.
 
 const parseDetectorTarget = (
   arg: string | undefined,
@@ -3421,9 +3421,9 @@ const parseDetectorTarget = (
 // and section-header lookalikes nested inside string literals.
 //
 // Trade-off: round-trip loses comments and original whitespace —
-// `[critique]` and `[memory]` are re-emitted in a normalized
-// shape (snake_case keys, alphabetical-ish by insertion order,
-// blank line between tables). Operators editing the file by hand
+// `[providers]`, `[budget]`, and `[memory]` are re-emitted in a
+// normalized shape (snake_case keys, alphabetical-ish by insertion
+// order, blank line between tables). Operators editing the file by hand
 // should expect rewrites to normalize formatting on the next
 // `/memory governance enable|disable`. Forja's `.agent/config.
 // toml` schema is flat (no array-of-tables, no nested sub-tables),

@@ -27,16 +27,15 @@ const CONTEXT_WARN_THRESHOLD = 0.8;
 // "Can the operator interrupt right now?" — true across the WHOLE turn,
 // not just the instants a tool or stream is live. It must include
 // `awaitingProvider` (the model deliberating before the first token —
-// often the LONGEST phase of a turn) and `critique`; without them the
-// predicate flickers off during those waits and the footer falls back
+// often the LONGEST phase of a turn); without it the
+// predicate flickers off during that wait and the footer falls back
 // to the idle `\+Enter newline` hint mid-turn, hiding the load-bearing
 // interrupt cue (the two segments are mutually exclusive on this).
 const isRunning = (state: LiveState): boolean =>
   state.activeTools.size > 0 ||
   state.thinking !== null ||
   state.pendingAssistant !== null ||
-  state.awaitingProvider !== null ||
-  state.critique !== null;
+  state.awaitingProvider !== null;
 
 // `secondary` (SGR 90) rather than `dim` (SGR 2): xterm with default
 // config renders SGR 2 identical to the default foreground, so

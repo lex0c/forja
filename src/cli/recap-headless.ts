@@ -96,7 +96,7 @@ const buildHeadlessContext = (options: RunRecapHeadlessOptions, db: DB): SlashCo
     db,
     bus,
     modalManager: createModalManager({ bus, focusStack, now }),
-    cumulative: { costUsd: 0, steps: 0, turns: 0, critiqueCostUsd: 0, critiqueRuns: 0 },
+    cumulative: { costUsd: 0, steps: 0, turns: 0 },
     now,
     requestShutdown: () => undefined,
     isRunning: () => false,

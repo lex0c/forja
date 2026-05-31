@@ -1017,7 +1017,7 @@ Operators control opt-out at three layers; first-match wins:
 | **CLI flag** | `--memory-verify-llm` / `--no-memory-verify-llm` (same shape for `--memory-conflict-llm` and `--memory-override-llm`) | session-only | everything else |
 | **Project config** | `.agent/config.toml [memory] verify_semantic_llm = false` (same key shape for `conflict_detect_llm` and `override_detect_llm`) | per-project, committed (operators who keep `.agent/` under git ship the policy team-wide) | user config |
 | **User config** | `~/.config/agent/config.toml [memory] verify_semantic_llm = false` | per-user, cross-project | default |
-| **Default** | hardcoded in `src/critique/config-loader.ts:DEFAULT_MEMORY_CONFIG` (all three = `true`) | global | — |
+| **Default** | hardcoded in `src/config/loaders.ts:DEFAULT_MEMORY_CONFIG` (all three = `true`) | global | — |
 
 #### Config block shape
 
@@ -1028,7 +1028,7 @@ conflict_detect_llm = false    # disables S13 conflict_detected detector
 override_detect_llm = false    # disables S3 user_override_repeated detector
 ```
 
-Snake_case is canonical (matches the `[critique]` block precedent). camelCase aliases (`verifySemanticLlm`, `conflictDetectLlm`, `overrideDetectLlm`) are accepted for copy-paste tolerance from the HarnessConfig API surface; snake wins on tie. Layer precedence runs per-field — a project file that only sets `verify_semantic_llm` leaves `conflict_detect_llm` and `override_detect_llm` to inherit from user or default.
+Snake_case is canonical (matches the `[providers]` / `[budget]` block precedent). camelCase aliases (`verifySemanticLlm`, `conflictDetectLlm`, `overrideDetectLlm`) are accepted for copy-paste tolerance from the HarnessConfig API surface; snake wins on tie. Layer precedence runs per-field — a project file that only sets `verify_semantic_llm` leaves `conflict_detect_llm` and `override_detect_llm` to inherit from user or default.
 
 Spec backing: [`docs/spec/AGENTIC_CLI.md §5.4.1`](./spec/AGENTIC_CLI.md) (config.toml declaration) + [`docs/spec/MEMORY.md §6.6`](./spec/MEMORY.md) (detector contract).
 
@@ -1038,7 +1038,7 @@ Spec backing: [`docs/spec/AGENTIC_CLI.md §5.4.1`](./spec/AGENTIC_CLI.md) (confi
 - `/memory governance enable verify | conflict | override | all` — writes `true` to project config. `all` covers all three detectors.
 - `/memory governance status` — shows resolved state per detector with source label (`yes (default; disable: ...)`, `yes (.agent/config.toml)`, `yes (~/.config/agent/config.toml)`, `yes (--memory-verify-llm)`, `no (.agent/config.toml)`, `no (--no-memory-verify-llm)`, `no (default)`). Three blocks: `semantic-verify (S11)`, `verify-conflict (S13)`, `verify-override (S3)`. Each block renders enabled state + caps + recent attempts.
 
-Side effects: idempotent atomic write to `.agent/config.toml` (creates `.agent/` + file if absent; preserves other sections like `[critique]` verbatim via TOML round-trip; canonical re-emit so unknown comments are NOT preserved on touched blocks). The handler ALSO mutates the live `ctx.baseConfig.memory{Semantic,Conflict,Override}Detect` field + flips `*Source` to `'project-config'` — without this, the next `startTurn` snapshot would keep reading the pre-toggle value (process restart required for the effect to land). Effect applies at **next turn boundary** — not mid-session — matching the snapshot semantic of `/model` and `/critique mode`. Mid-flight turn already snapshotted its config; the new value applies on the next prompt.
+Side effects: idempotent atomic write to `.agent/config.toml` (creates `.agent/` + file if absent; preserves other sections like `[providers]` verbatim via TOML round-trip; canonical re-emit so unknown comments are NOT preserved on touched blocks). The handler ALSO mutates the live `ctx.baseConfig.memory{Semantic,Conflict,Override}Detect` field + flips `*Source` to `'project-config'` — without this, the next `startTurn` snapshot would keep reading the pre-toggle value (process restart required for the effect to land). Effect applies at **next turn boundary** — not mid-session — matching the snapshot semantic of `/model`. Mid-flight turn already snapshotted its config; the new value applies on the next prompt.
 
 #### Plan mode suppresses detectors entirely
 
