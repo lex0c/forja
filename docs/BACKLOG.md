@@ -2,6 +2,17 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-30] spec — document the operation-mode approval posture
+
+Slice 8 of the operation-mode feature: the UX stabilized (validated in `bun run dev`), so the spec now reflects what shipped — code-first, spec-after, the UX-first flow. Three docs (PT-BR, spec only, no code):
+- `AGENTIC_CLI §8.1` (new): the Supervised/Autonomous posture as an axis orthogonal to PolicyMode — the honest semantics (auto-approves only non-risky `policy` confirms; compound/escalate/score/resolver/degraded still prompt; degraded suspends it; hard denies are unreachable because they're never confirms), the typed `confirmCause`, ephemeral-per-session + Shift+Tab + audited-before-mutate, headless fail-closed, and the subagent snapshot inheritance + governance carve-out.
+- `UI §4.10.6`: the footer shows the mode (Supervised `accent`/blue, Autonomous `warn`/yellow, `(shift+tab to change)` in `secondary`) in place of the `? for help` cue.
+- `IPC §7`: carve-out of the "every child confirm is seen by a human" guarantee — an autonomous child auto-approves `policy` confirms locally (they never become a `permission:ask`); risk confirms still round-trip to the parent's modal; governance verify subagents never inherit.
+
+**Review (fidelity + consistency, two angles):** fixed five issues. `maxCostUsd` was mislisted as an engine deny (it's a harness budget cap, orthogonal — clarified). A broken `§11` cross-ref for protected-path escalate (§11 is Subagents; corrected to §9 Trust & Safety — the code's own `per §11` refs are a separate stale-ref cleanup, not touched here). A stale `? for help` in the §4.10.12 ASCII layout (→ `Supervised`, same width). Missing disambiguation from the execution `profile autonomous` (§5.2) — added inline. And `--autonomous` was absent from the FEATURE_FLAGS §3.1 inventory — added. Every other claim verified faithful to the shipped code.
+
+**Branch:** `feat/operation-mode`.
+
 ## [2026-05-30] permissions+subagents — subagents inherit the parent's approval posture
 
 Follow-up to the operation-mode feature (entry below). Operator clarified the intent: "autonomous" means the operator delegates the WHOLE flow, subagents included — so a subagent spawned by an autonomous parent must run autonomous too, instead of booting Supervised (which, in a headless child with no confirmFn, turned every policy confirm into a denial and defeated the feature for any subagent-using run).

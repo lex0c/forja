@@ -175,6 +175,7 @@ Qualquer outro throw é tratado como erro real: stderr structured line `subagent
 - **Filho roda com mesmo trust level que o pai** (mesmo cwd, mesma policy, mesmo signal). IPC não relaxa nada.
 - **Mensagens do filho NÃO são confiáveis em sentido de input-do-usuário** — são geradas pelo modelo dentro do filho. O pai não deve, por exemplo, executar conteúdo de uma mensagem `tool_invoking.args` como código no seu próprio contexto.
 - **`permission:ask` do filho exige same modal flow do pai**: o operator vê e aprova; resposta volta para o filho. O filho NUNCA recebe um auto-approve via IPC; o canal só transporta a decisão do humano.
+- **Carve-out da postura autonomous** (§8.1 do [`AGENTIC_CLI`](./AGENTIC_CLI.md)): um filho que herdou postura `autonomous` resolve os `confirm` de causa `policy` (rotina, não-risco) como `allow` **localmente na própria engine**, antes do bridge — então esses **nunca viram um `permission:ask`** no canal. O invariante acima continua intacto (toda resposta a um `permission:ask` ainda vem de um humano; auto-aprovados simplesmente não geram ask), mas a garantia "todo `confirm` do filho é visto por um humano" relaxa para o subset policy-de-rotina sob autonomous. Confirms de risco (compound, protected-escalate, score, resolver, degraded) continuam virando `permission:ask` e subindo pro modal do pai. Os subagentes de governança de memória (verify) **nunca herdam autonomous** — rodam sempre supervised, então pra eles a garantia original se mantém integralmente.
 
 ---
 

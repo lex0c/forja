@@ -165,6 +165,7 @@ Toda flag passa por estágios bem-definidos. Transições requerem critério, n�
 |---|---|---|---|---|
 | `--strict` | mode | stable | off | `CODE_GENERATION.md §2.2` |
 | `--plan` | mode | stable | off | `AGENTIC_CLI.md §2.1` |
+| `--autonomous` | approval posture | stable | off (supervised) | `AGENTIC_CLI.md §8.1` |
 | `--no-pipeline` | mode (escape hatch) | stable | off | `CODE_GENERATION.md §2.3` |
 | `--auto-approve-mcp <list>` | CI bypass | stable | (none) | `MCP.md §1.5` |
 | `--budget-enforce` | mode | stable | off | `PERFORMANCE.md §5.4` |
