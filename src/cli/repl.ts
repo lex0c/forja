@@ -2361,6 +2361,23 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
 
     const result = applyKey(current, key);
 
+    // Ctrl+C on a NON-EMPTY buffer clears it locally — input-editor
+    // returns the emptied buffer with no `cancelInput` (only the
+    // empty-buffer Ctrl+C surfaces 'interrupt', handled below). If a
+    // queued message was lifted for editing, that clear must also cancel
+    // the edit; otherwise editingId stays set, hiding the message's bar
+    // and holding it back at the next boundary until the operator
+    // stumbles onto ↓/Esc.
+    if (
+      editingQueued !== null &&
+      current.value !== '' &&
+      key.kind === 'char' &&
+      key.ctrl &&
+      key.char === 'c'
+    ) {
+      cancelQueuedEdit();
+    }
+
     // Disarm the exit gate on any keystroke that ISN'T a fresh Ctrl+C.
     // The interrupt branch below handles arm/exit itself; everything
     // else (typing, Enter, Esc, Ctrl+D, etc.) is "operator did

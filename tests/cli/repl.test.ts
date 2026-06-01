@@ -1088,6 +1088,41 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('Ctrl+C while editing a queued message cancels the edit (does not strand it)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    stdin.feed('queued msg\r');
+    await tick();
+    // Lift it for editing (input now holds 'queued msg').
+    stdin.feed('\x1b[A');
+    await tick();
+    // Ctrl+C on the non-empty buffer clears it (no 'interrupt' surfaced)
+    // and must also cancel the edit — otherwise the message stays hidden
+    // and held back.
+    stdin.feed('\x03');
+    await tick();
+    // Boundary: the message drains (edit cancelled, so it's not held).
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('queued msg');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('cancelling an edit after the turn ended drains the original (no stuck message)', async () => {
     const stdin = makeStdin();
     const ra = makeRunAgent((n) => `sess-${n}`);
