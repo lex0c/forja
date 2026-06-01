@@ -5622,13 +5622,26 @@ describe('bash resolver — effect-based git read verbs / find-exec / awk / sed 
     expect(s.some((x) => x.startsWith('read-fs'))).toBe(true);
     expect(s).not.toContain('exec:arbitrary');
   });
-  test('git config set-form (can plant a core.pager/sshCommand exec hook) → exec:arbitrary', () => {
-    for (const c of ["git config core.pager 'sh -c x'", 'git config user.name Bob']) {
+  test('git config set / edit / mutate / outside-scope (not a pure read) → exec:arbitrary', () => {
+    for (const c of [
+      "git config core.pager 'sh -c x'", // set (exec hook)
+      'git config user.name Bob', // set
+      'git config --edit', // opens editor (option-only — must not pass on positional count)
+      'git config -e', // editor short form
+      'git config --unset core.pager', // mutation, single positional
+      'git config --remove-section foo', // mutation, single positional
+      'git config --global --get user.name', // reads ~/.gitconfig (outside repo)
+    ]) {
       expect(caps(c)).toContain('exec:arbitrary');
     }
   });
-  test('git config read-form (--get / --list / bare key) stays read-only', () => {
-    for (const c of ['git config --get user.name', 'git config user.name', 'git config --list']) {
+  test('git config pure repo read (--get / --list / bare key / --worktree get) stays read-only', () => {
+    for (const c of [
+      'git config --get user.name',
+      'git config user.name',
+      'git config --list',
+      'git config --worktree --get core.foo',
+    ]) {
       expect(caps(c)).not.toContain('exec:arbitrary');
     }
   });

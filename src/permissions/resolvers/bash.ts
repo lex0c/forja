@@ -1732,26 +1732,56 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
       return { capabilities: [readFs(REPO)], confidence: 'high' };
     }
     case 'config': {
-      // `git config <key> <value>` WRITES config and can plant an exec hook
-      // (`core.pager` / `core.sshCommand` / `core.editor` / `*.cmd` /
-      // `alias.*`) that a later git command runs. Only explicit read forms
-      // (`--get*` / `--list` / `-l` / `--name-only`) or a bare single-key
-      // get (`git config <key>`) stay read-fs; any mutation →
-      // exec:arbitrary (fail-closed — no exec-key denylist to drift on).
-      const configRead =
-        tokens.some(
-          (t) =>
-            t === '-l' ||
-            t === '--list' ||
-            t === '--name-only' ||
-            t === '--get' ||
-            t === '--get-all' ||
-            t === '--get-regexp' ||
-            t === '--get-urlmatch' ||
-            t === '--get-color' ||
-            t === '--get-colorbool',
-        ) || positional.length <= 2; // ['config'] or ['config', <key>] — a get
-      if (configRead) {
+      // `git config` is read-fs ONLY for a pure REPO read. Option-only and
+      // mutating forms must NOT slip through on positional count alone
+      // (`git config --edit` strips to positional `['config']`):
+      //   - `-e`/`--edit` opens $EDITOR / core.editor → arbitrary exec.
+      //   - `-f`/`--file`, `--global`, `--system` select a config SOURCE
+      //     that can be outside the repo (read or write).
+      //   - `--add`/`--unset*`/`--remove-section`/`--rename-section`/
+      //     `--replace-all`, and the `<key> <value>` set form, WRITE config
+      //     and can plant a `core.pager`/`core.sshCommand`/`alias.*` exec
+      //     hook a later git command runs.
+      // All of those → exec:arbitrary (fail-closed; no exec-key denylist to
+      // drift on). `--worktree`/`--blob` are in-repo read sources and are
+      // left to the read check below; a `--worktree` write still falls to
+      // the set-form branch.
+      const notPureRead = tokens.some(
+        (t) =>
+          t === '-e' ||
+          t === '--edit' ||
+          t === '-f' ||
+          t.startsWith('-f') ||
+          t === '--file' ||
+          t.startsWith('--file=') ||
+          t === '--global' ||
+          t === '--system' ||
+          t === '--add' ||
+          t === '--unset' ||
+          t === '--unset-all' ||
+          t === '--remove-section' ||
+          t === '--rename-section' ||
+          t === '--replace-all',
+      );
+      if (notPureRead) {
+        return { capabilities: [exec('arbitrary'), readFs(REPO)], confidence: 'medium' };
+      }
+      const explicitRead = tokens.some(
+        (t) =>
+          t === '-l' ||
+          t === '--list' ||
+          t === '--name-only' ||
+          t === '--get' ||
+          t === '--get-all' ||
+          t === '--get-regexp' ||
+          t === '--get-urlmatch' ||
+          t === '--get-color' ||
+          t === '--get-colorbool',
+      );
+      // Bare-key get is EXACTLY `config <key>` (two positionals, no value);
+      // a `<key> <value>` set (length >= 3) or option-only-without-read
+      // (length 1) is not a pure read → exec:arbitrary.
+      if (explicitRead || positional.length === 2) {
         return { capabilities: [readFs(REPO)], confidence: 'high' };
       }
       return { capabilities: [exec('arbitrary'), readFs(REPO)], confidence: 'medium' };
