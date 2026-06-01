@@ -186,10 +186,14 @@ const makeRunAgent = (
   // cleanup completes — the moment the .finally() chain in
   // startTurn runs against shared state owned by a newer turn.
   settle: (idx: number, override?: Partial<HarnessResult>) => void;
+  // Reject the pending runAgent promise WITHOUT emitting session_finished
+  // — simulates a provider crash before any boundary event.
+  reject: (idx: number, err?: Error) => void;
 } => {
   const captured: CapturedRun[] = [];
   let nextN = 1;
   const pendingResolves: Array<(override: Partial<HarnessResult>) => void> = [];
+  const pendingRejects: Array<(err: Error) => void> = [];
 
   const buildResult = (sessionId: string, override: Partial<HarnessResult>): HarnessResult => {
     const base: HarnessResult = {
@@ -210,8 +214,9 @@ const makeRunAgent = (
       const n = nextN++;
       const sessionId = resolveSession(n);
       captured.push({ configs: [cfg], emit: (event) => cfg.onEvent?.(event) });
-      return new Promise<HarnessResult>((resolve) => {
+      return new Promise<HarnessResult>((resolve, reject) => {
         pendingResolves.push((override) => resolve(buildResult(sessionId, override)));
+        pendingRejects.push(reject);
       });
     },
     captured,
@@ -236,6 +241,11 @@ const makeRunAgent = (
       const r = pendingResolves[idx];
       if (r === undefined) throw new Error(`no pending run at ${idx}`);
       r(override ?? {});
+    },
+    reject: (idx, err) => {
+      const r = pendingRejects[idx];
+      if (r === undefined) throw new Error(`no pending run at ${idx}`);
+      r(err ?? new Error('runAgent rejected'));
     },
   };
 };
@@ -1151,6 +1161,38 @@ describe('repl — boot + smoke', () => {
     await tick();
     expect(ra.captured).toHaveLength(2);
     expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('original msg');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a message queued during a turn that REJECTS (no session_finished) still drains', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    // Queue a message while turn 1 is in flight.
+    stdin.feed('queued during failure\r');
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    // Turn 1's runAgent rejects BEFORE emitting session_finished (e.g. a
+    // provider crash). The finalizer must still drain the queue, not leave
+    // the message pending until some later boundary.
+    ra.reject(0);
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('queued during failure');
     ra.finish(1);
     await tick();
     stdin.feed('\x04');

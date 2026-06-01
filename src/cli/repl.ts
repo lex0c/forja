@@ -1064,6 +1064,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // `abortController`, etc., breaking interrupts and allowing
   // concurrent submits.
   let activeTurnToken: symbol | null = null;
+  // Whether the active turn emitted `session_finished` (the normal
+  // boundary that schedules the inbox drain). Reset per turn in startTurn;
+  // if a turn's runAgent rejects WITHOUT emitting it, the finalizer drains
+  // instead, so a message queued during a failed turn isn't left stranded
+  // until some later unrelated boundary.
+  let sawSessionFinished = false;
 
   // INBOX (docs/spec/INBOX.md — in-memory by design). Input committed
   // while a turn or playbook is in flight accumulates here instead of
@@ -1112,6 +1118,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // old timing.
     if (event.type === 'session_finished') {
       running = false;
+      sawSessionFinished = true;
       lastSessionId = event.result.sessionId;
       trackReplSessionId(event.result.sessionId);
       cumulative.costUsd += event.result.costUsd;
@@ -1261,6 +1268,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // mutations once a newer turn has taken over.
     const myToken = Symbol('turn');
     activeTurnToken = myToken;
+    sawSessionFinished = false;
     abortController = new AbortController();
     softStopController = new AbortController();
     const adapter = createHarnessAdapter(buildAdapterCtx());
@@ -1309,6 +1317,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         softStopController = null;
         runningPromise = null;
         activeTurnToken = null;
+        // Rejection boundary: if runAgent threw before emitting
+        // session_finished, that branch never scheduled the inbox drain —
+        // do it here so a message queued during the failed turn becomes
+        // the next turn instead of sitting pending. When session_finished
+        // DID fire it already scheduled the drain; skip to avoid a
+        // redundant pass.
+        if (!sawSessionFinished) queueMicrotask(() => drainInbox());
       });
   };
 
