@@ -470,6 +470,51 @@ describe('repl — reverse-search overlay (HISTORY.md §2.2)', () => {
     await promise;
   });
 
+  test('an edited queued message records only the final text in history (not the stale original)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStubWithDb(db),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    // Turn 1 — an idle submit records "go" in history.
+    stdin.feed('go\r');
+    await tick();
+    // Queue "rm tmp" while busy, then ↑-lift it and edit it to "ls".
+    stdin.feed('rm tmp\r');
+    await tick();
+    stdin.feed(ARROW_UP);
+    await tick();
+    stdin.feed('\x7f'.repeat('rm tmp'.length));
+    await tick();
+    stdin.feed('ls\r');
+    await tick();
+    // Boundary: the edited "ls" drains (turn 2) and is recorded.
+    ra.finish(0);
+    await tick();
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('ls');
+    ra.finish(1);
+    await tick();
+    // History now holds "go" and "ls" — NOT the never-sent "rm tmp". Walk
+    // ↑ to the second-newest entry and submit it: it must be "go".
+    stdin.feed(ARROW_UP);
+    stdin.feed(ARROW_UP);
+    await tick();
+    stdin.feed('\r');
+    await tick();
+    expect(ra.captured[2]?.configs[0]?.userPrompt).toBe('go');
+    ra.finish(2);
+    await tick();
+    stdin.feed('\x04');
+    await promise;
+  });
+
   test('Esc cancels overlay without changing the buffer', async () => {
     appendHistory(db, PROJECT_CWD, 'recallable', { ts: 1 });
 

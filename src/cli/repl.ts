@@ -1313,14 +1313,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   };
 
   // Enqueue a message into the in-memory inbox (INBOX §4.1): mint an id,
-  // append it, record it to history, and emit `inbox:queued` (which adds
-  // the pending bar and clears the input). Shared by the normal busy
-  // submit path and the busy reverse-search submit so both drain at the
-  // next boundary identically.
+  // append it, and emit `inbox:queued` (which adds the pending bar and
+  // clears the input). Shared by the normal busy submit path and the busy
+  // reverse-search submit so both drain at the next boundary identically.
+  // History is NOT recorded here — only the finalized text is recorded at
+  // drain time (drainInbox), so an edited-then-committed message doesn't
+  // leave its stale pre-edit draft in the ↑/Ctrl-R recall pool.
   const enqueueInbox = (text: string): void => {
     const id = String(inboxSeq++);
     inbox.push({ id, text });
-    recordHistorySubmit(text);
     bus.emit({ type: 'inbox:queued', ts: now(), id, text });
   };
 
@@ -1346,8 +1347,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // any) is NOT drained — it waits for the next boundary so the operator
   // isn't cut off mid-edit. Emits `inbox:drained` (freezes each drained
   // message into a scrollback bar, WITHOUT clearing the input — a draft
-  // survives), then runs the turn. History was recorded per-item at
-  // enqueue time; the concatenated body is not re-recorded.
+  // survives), then runs the turn. History is recorded per drained message
+  // HERE (final, post-edit text) — not at enqueue — so an edited message
+  // never leaves its stale original in the ↑/Ctrl-R recall pool. The
+  // concatenated body is not recorded; each message is recorded separately.
   drainInbox = (): void => {
     if (exiting || isBusy()) return;
     const editId = editingQueued?.id ?? null;
@@ -1357,6 +1360,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     inbox.length = 0;
     for (const m of kept) inbox.push(m);
     const texts = drained.map((m) => m.text);
+    for (const t of texts) recordHistorySubmit(t);
     bus.emit({ type: 'inbox:drained', ts: now(), texts });
     startTurn(concatQueuedBodies(texts));
   };
@@ -2432,7 +2436,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // place (FIFO position kept), end the edit, clear the input.
         const item = inbox.find((m) => m.id === editing.id);
         if (item !== undefined) item.text = result.submit.text;
-        recordHistorySubmit(result.submit.text);
+        // No recordHistorySubmit here — the finalized text is recorded
+        // when it drains (drainInbox), so the stale pre-edit text never
+        // enters the recall pool.
         bus.emit({
           type: 'inbox:edit-commit',
           ts: now(),
