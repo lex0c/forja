@@ -241,12 +241,34 @@ describe('approval posture (Supervised / Autonomous)', () => {
     expect(d.kind).toBe('allow');
   });
 
-  test('autonomous auto-approves regardless of command structure (control-flow loop)', () => {
-    // The `for` loop makes the resolver Conservative — structure no longer
-    // gates; only the (repo-confined) effect matters.
+  test('autonomous does NOT auto-approve a conservative/dynamic-dataflow loop (caps are best-effort)', () => {
+    // A `for` loop is Conservative — the resolver can't model the body's
+    // dynamic `$f`, so the caps are best-effort. Even reading in-repo
+    // `*.ts` it stays behind the modal: the `kind: ok` gate refuses to
+    // trust an incomplete capability set.
     const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
     const d = eng.check('bash', 'bash', { command: 'for f in *.ts; do cat "$f"; done' });
-    expect(d.kind).toBe('allow');
+    expect(d.kind).toBe('confirm');
+  });
+
+  test('autonomous does NOT auto-approve a loop whose dynamic body escapes the repo (hole closure)', () => {
+    // `for f in /tmp/*; do rm "$f"; done` resolves the body's `$f` as
+    // `<cwd>/$f` and emits NO cap for the non-protected `/tmp/*` loop
+    // source, so every cap looks repo-confined while the command deletes
+    // /tmp. Conservative (not `kind: ok`) → stays modal.
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('bash', 'bash', { command: 'for f in /tmp/*; do rm "$f"; done' });
+    expect(d.kind).toBe('confirm');
+  });
+
+  test('autonomous does NOT auto-approve a dynamic $var command (cause resolver, best-effort caps)', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['rm *'] } } }), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+    });
+    const d = eng.check('bash', 'bash', { command: 'rm "$VAR"' });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') expect(d.confirmCause).toBe('resolver');
   });
 
   test('autonomous auto-approves regardless of resolver confidence (** glob)', () => {

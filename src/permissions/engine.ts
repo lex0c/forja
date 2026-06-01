@@ -1223,9 +1223,13 @@ const capRepoConfined = (cap: Capability, cwd: string, home: string): boolean =>
 // matches an operator `deny` rule. This is what lets the agent work freely
 // INSIDE the repo under autonomous — read/write/delete repo files, local
 // git — while every dangerous effect (network, outside-repo, unknown
-// binary, protected/sensitive path) keeps its modal. The STRUCTURE of the
-// command (compound, loop, glob) and the resolver's confidence no longer
-// matter; only the EFFECT does. The per-segment deny re-check closes
+// binary, protected/sensitive path) keeps its modal. The caller gates this
+// on resolver `kind: ok` (the command is FULLY modeled, so the capability
+// set is COMPLETE): within that, command structure (compound, glob,
+// pipeline) doesn't gate — only the EFFECT does. A `conservative` result
+// (soft control flow, dynamic `$var`, unknown command) never reaches here,
+// because its caps are best-effort and can under-represent the runtime
+// targets. The per-segment deny re-check closes
 // checkBash's whole-string-glob gap (`deny: ['curl*']` misses `echo x &&
 // curl evil`); it runs only for the compound cause. That is SOUND because
 // of an invariant: the `resolver`/`score` causes arise only from an
@@ -2342,15 +2346,26 @@ export const createPermissionEngine = (
         if (decision.kind === 'allow') postureNote = 'autonomous: auto-approved policy confirm';
       } else if (
         category === 'bash' &&
+        resolverResult !== null &&
+        resolverResult.kind === 'ok' &&
         (decision.confirmCause === 'compound' ||
           decision.confirmCause === 'resolver' ||
           decision.confirmCause === 'score')
       ) {
         // Capability-confinement: a bash confirm whose every resolved
         // capability stays inside the repo and is non-dangerous clears
-        // without a modal, regardless of compound structure or resolver
-        // confidence. The cap predicate + per-segment deny re-check live
-        // in the helper.
+        // without a modal, regardless of compound structure. Gated on
+        // resolver `kind: ok` — i.e. the resolver FULLY modeled the command
+        // — because that is the only state where the capability set is a
+        // COMPLETE representation of the effect. A `conservative` result
+        // (soft control flow, a dynamic `$var`, an unknown command) emits
+        // BEST-EFFORT caps that can UNDER-represent the runtime targets:
+        // `for f in /tmp/*; do rm "$f"; done` models the body's `$f` as
+        // `<cwd>/$f` and emits no cap for the `/tmp/*` loop source, so the
+        // caps all look repo-confined while the command deletes `/tmp` —
+        // those stay behind the modal. (`refuse` already became a deny
+        // upstream.) The cap predicate + per-segment deny re-check live in
+        // the helper.
         const before = decision;
         decision = autoApproveRepoConfined(
           decision,
