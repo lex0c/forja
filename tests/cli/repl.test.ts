@@ -1236,6 +1236,70 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('emptying a lifted edit buffer with Backspace cancels the edit (no strand)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    stdin.feed('held\r');
+    await tick();
+    stdin.feed('\x1b[A');
+    await tick();
+    // Empty the lifted buffer with plain Backspaces (NOT Ctrl+C/Ctrl+D).
+    // The edit must cancel so "held" un-hides and drains — not strand
+    // (hidden + held, empty prompt, Enter a no-op).
+    stdin.feed('\x7f'.repeat('held'.length));
+    await tick();
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('held');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('Ctrl+U emptying a lifted edit buffer also cancels the edit', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    stdin.feed('held\r');
+    await tick();
+    stdin.feed('\x1b[A');
+    await tick();
+    // Ctrl+U kills the whole line → empty buffer → edit cancels.
+    stdin.feed('\x15');
+    await tick();
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('held');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('first Esc during a turn aborts the soft signal (cooperative), NOT the hard one', async () => {
     // Spec UI.md §3 + 1.g.1: first Esc is cooperative — softStopSignal
     // fires so the harness exits at the next step boundary, but the

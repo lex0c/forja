@@ -2416,20 +2416,17 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
 
     const result = applyKey(current, key);
 
-    // Ctrl+C on a NON-EMPTY buffer clears it locally — input-editor
-    // returns the emptied buffer with no `cancelInput` (only the
-    // empty-buffer Ctrl+C surfaces 'interrupt', handled below). If a
-    // queued message was lifted for editing, that clear must also cancel
-    // the edit; otherwise editingId stays set, hiding the message's bar
-    // and holding it back at the next boundary until the operator
-    // stumbles onto ↓/Esc.
-    if (
-      editingQueued !== null &&
-      current.value !== '' &&
-      key.kind === 'char' &&
-      key.ctrl &&
-      key.char === 'c'
-    ) {
+    // If an edit action empties a lifted queued-message buffer — Backspace
+    // to empty, Ctrl+U / Ctrl+W, or Ctrl+C's local clear — cancel the
+    // edit. Otherwise editingId stays set with an empty prompt and no
+    // visible bar: the message is hidden AND held out of drainInbox (a
+    // silent strand) until the operator stumbles onto ↓/Esc, and Enter is
+    // a no-op. Keying off the non-empty→empty transition covers every
+    // emptying operation, not just Ctrl+C — and subsumes the per-key edit
+    // cancel that the interrupt (Ctrl+C-empty) and EOF (Ctrl+D) branches
+    // would otherwise need, since the buffer must empty (and cancel here)
+    // before either of those can fire while editing.
+    if (editingQueued !== null && current.value !== '' && result.next.value === '') {
       cancelQueuedEdit();
     }
 
@@ -2505,13 +2502,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     //     (`exiting` set in requestShutdown) keeps a stray follow-up
     //     keystroke from racing past the check.
     if (result.cancelInput === 'interrupt') {
-      // Esc/Ctrl+C while editing an ↑-lifted message also cancels the
-      // edit (the message stays queued, unchanged) and clears the input,
-      // then the interrupt proceeds as usual.
-      if (editingQueued !== null) {
-        cancelQueuedEdit();
-        bus.emit({ type: 'input:update', ts: now(), value: '', cursor: 0 });
-      }
+      // (No edit handling needed: Ctrl+C here fires only on an already-
+      // empty buffer, and the empty-buffer check above already cancelled
+      // any in-progress edit the moment its buffer emptied.)
       if (isBusy()) {
         triggerInterrupt();
       } else {
@@ -2524,15 +2517,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // signal; making them press it twice would surprise. While running,
     // route to the interrupt ladder for consistency with `^C` + Esc.
     if (result.cancelInput === 'eof') {
-      // Ctrl+D on an emptied edit buffer cancels the in-progress edit
-      // first (same as the interrupt branch above) — otherwise, when this
-      // only interrupts the turn (running), editingQueued stays set and
-      // the message is stranded (hidden + held, ↑ wedged) since EOF here
-      // is reached with an empty buffer.
-      if (editingQueued !== null) {
-        cancelQueuedEdit();
-        bus.emit({ type: 'input:update', ts: now(), value: '', cursor: 0 });
-      }
+      // (No edit handling needed: EOF fires only on an already-empty
+      // buffer, and the empty-buffer check above already cancelled any
+      // in-progress edit the moment its buffer emptied.)
       if (running) {
         triggerInterrupt();
       } else {

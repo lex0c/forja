@@ -597,23 +597,23 @@ describe('repl — reverse-search overlay (HISTORY.md §2.2)', () => {
     // Turn 1 — an idle submit records "go" in history.
     stdin.feed('go\r');
     await tick();
-    // Queue "rm tmp" while busy, then ↑-lift it and edit it to "ls".
+    // Queue "rm tmp" while busy, then ↑-lift it and edit it IN PLACE by
+    // appending (emptying the buffer would cancel the edit, not rewrite
+    // it — so we modify without clearing).
     stdin.feed('rm tmp\r');
     await tick();
     stdin.feed(ARROW_UP);
     await tick();
-    stdin.feed('\x7f'.repeat('rm tmp'.length));
+    stdin.feed(' now\r');
     await tick();
-    stdin.feed('ls\r');
-    await tick();
-    // Boundary: the edited "ls" drains (turn 2) and is recorded.
+    // Boundary: the edited "rm tmp now" drains (turn 2) and is recorded.
     ra.finish(0);
     await tick();
-    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('ls');
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('rm tmp now');
     ra.finish(1);
     await tick();
-    // History now holds "go" and "ls" — NOT the never-sent "rm tmp". Walk
-    // ↑ to the second-newest entry and submit it: it must be "go".
+    // History now holds "go" and "rm tmp now" — NOT the un-sent pre-edit
+    // "rm tmp". Walk ↑ to the second-newest entry and submit it: "go".
     stdin.feed(ARROW_UP);
     stdin.feed(ARROW_UP);
     await tick();
