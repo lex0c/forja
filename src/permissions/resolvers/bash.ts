@@ -770,6 +770,65 @@ const FIND_EXEC_FLAGS: ReadonlySet<string> = new Set([
   '-okdir',
 ]);
 
+// `find -exec` classified by EFFECT of the inner command, not by the
+// blanket `exec:arbitrary` it used to get. The inner command runs once per
+// matched file UNDER the search roots, so its effect is scoped to those
+// roots. Read-only inner commands → `read-fs(roots)`; mutating inner →
+// `delete-fs`/`write-fs(roots)`; a shell, an interpreter (perl/python/awk/
+// sed — not statically analyzable when nested), an unknown name, or no
+// inner command at all → `exec:arbitrary` (fail-closed). Capability-
+// confinement + the score gate then decide auto-vs-modal by where the
+// roots land (in-repo vs outside). Names are matched on the basename so
+// `/usr/bin/grep` resolves like `grep`.
+const FIND_EXEC_READONLY: ReadonlySet<string> = new Set([
+  'grep',
+  'egrep',
+  'fgrep',
+  'rg',
+  'wc',
+  'cat',
+  'head',
+  'tail',
+  'file',
+  'stat',
+  'ls',
+  'sort',
+  'uniq',
+  'cut',
+  'nl',
+  'tac',
+  'rev',
+  'basename',
+  'dirname',
+  'cksum',
+  'md5sum',
+  'sha1sum',
+  'sha256sum',
+  'sha512sum',
+  'od',
+  'hexdump',
+  'strings',
+  'echo',
+  'true',
+  'printf',
+]);
+// Only inner commands whose effect is BOUNDED BY the search roots (they
+// act in-place on each matched file). `mv`/`cp`/`ln`/`tee` are deliberately
+// EXCLUDED — they take a DESTINATION operand that can leave the repo
+// (`find . -exec cp {} /tmp/exfil +`), which `write-fs(roots)` would not
+// capture; they fall through to `exec:arbitrary` (gated) instead.
+const FIND_EXEC_MUTATE: ReadonlyMap<string, 'delete' | 'write'> = new Map([
+  ['rm', 'delete'],
+  ['rmdir', 'delete'],
+  ['unlink', 'delete'],
+  ['shred', 'delete'],
+  ['chmod', 'write'],
+  ['chown', 'write'],
+  ['chgrp', 'write'],
+  ['touch', 'write'],
+  ['truncate', 'write'],
+]);
+
 // grep flags whose next space-separated token is a numeric value
 // (context window size, max-count, etc.). Without consuming them
 // in stripFlags, `grep -A 5 pattern file` would leave '5' in the
@@ -911,11 +970,67 @@ const FIND_VALUE_FLAGS: ReadonlySet<string> = new Set([
 ]);
 
 const cmdFind: CommandResolver = (_positional, tokens, ctx) => {
-  if (tokens.some((t) => FIND_EXEC_FLAGS.has(t))) {
-    return {
-      capabilities: [exec('arbitrary'), readFs(ctx.cwd)],
-      confidence: 'medium',
-    };
+  const execIdxs: number[] = [];
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i];
+    if (t !== undefined && FIND_EXEC_FLAGS.has(t)) execIdxs.push(i);
+  }
+  if (execIdxs.length > 0) {
+    // Roots via stripFlags (handles `-H`/`-L`/`-P` global options +
+    // `-maxdepth`/`-name`/… value flags). It ALSO folds the inner command
+    // and its args (`grep`, `{}`, `+`) into the list — harmless extra
+    // in-cwd read/mutate targets; the point is that REAL out-of-repo paths
+    // (a `-L /etc` root, or a fixed file the inner reads like `grep x
+    // /etc/passwd {}`) ARE captured and gate. The EFFECT comes from the
+    // inner command NAME(s), scoped to these roots. EVERY `-exec`/`-ok`/…
+    // clause (find allows several) and `-delete` are scanned together,
+    // worst effect wins — a read-only first clause must not hide a
+    // mutating second one.
+    const positional = stripFlags(tokens, FIND_VALUE_FLAGS);
+    const roots = positional.length === 0 ? [ctx.cwd] : positional.map((p) => resolveArg(p, ctx));
+    let arbitrary = false;
+    let del = tokens.some((t) => t === '-delete');
+    let wr = false;
+    for (const idx of execIdxs) {
+      const inner = tokens[idx + 1];
+      if (inner === undefined) {
+        arbitrary = true;
+        break;
+      }
+      const name = basename(stripShellQuoting(inner));
+      if (FIND_EXEC_READONLY.has(name)) continue;
+      const mutate = FIND_EXEC_MUTATE.get(name);
+      if (mutate === 'delete') del = true;
+      else if (mutate === 'write') wr = true;
+      else {
+        // Shell / interpreter / dest-bearing (mv/cp) / unknown / missing
+        // inner → fail-closed to arbitrary exec (not statically analyzable
+        // / can leave the repo).
+        arbitrary = true;
+        break;
+      }
+    }
+    // Hardcoded refuse for a mutating find on a system root (parity with
+    // cmdRm + the `-delete` branch below, which the early return skips).
+    if ((arbitrary || del || wr) && roots.some((p) => RM_REFUSE_ROOTS.has(p))) {
+      return {
+        refuse:
+          'find -exec/-delete: refuse to mutate under a system root (hardcoded blocklist; spec §5.2)',
+      };
+    }
+    if (arbitrary) {
+      return {
+        capabilities: [exec('arbitrary'), ...roots.map((p) => readFs(p))],
+        confidence: 'medium',
+      };
+    }
+    const caps = roots.flatMap((p) => {
+      const c = [readFs(p)];
+      if (del) c.push(deleteFs(p));
+      if (wr) c.push(writeFs(p));
+      return c;
+    });
+    return { capabilities: caps, confidence: 'medium' };
   }
   const positional = stripFlags(tokens, FIND_VALUE_FLAGS);
   const paths = positional.length === 0 ? [ctx.cwd] : positional.map((p) => resolveArg(p, ctx));
@@ -990,6 +1105,135 @@ const cmdFind: CommandResolver = (_positional, tokens, ctx) => {
       ...comparisonReadTargets.map((p) => readFs(p)),
     ],
     confidence: 'high',
+  };
+};
+
+// awk / gawk / mawk — a small language with side effects: command exec
+// (`system()`, `"cmd" | getline`, `print | "cmd"`), file write (`print >
+// "f"`), and an external program (`-f`). Classify by EFFECT, fail-closed:
+// a program with NO side-effect indicator reads its inputs and prints to
+// stdout → `read-fs`. ANY indicator → `exec:arbitrary`. The danger scan
+// runs over ALL raw tokens (not just the program) so a `system` in a `-v`
+// value or anywhere still gates. CONSERVATIVE on `>` and `|`: those are
+// flagged even when they are really a comparison (`$1 > 5`) or regex
+// alternation (`/a|b/`) — over-gating those is safe; missing a real
+// redirect/pipe would be a laundering hole. `-F'|'` (pipe field sep) also
+// over-gates. Spec §5.2.
+const AWK_EXTERNAL_FLAGS: ReadonlySet<string> = new Set([
+  '-i',
+  '--include',
+  '-l',
+  '--load',
+  '-E',
+  '--exec',
+  '-D',
+  '--debug',
+  '-p',
+  '--profile',
+  '--file',
+]);
+const cmdAwk: CommandResolver = (positional, tokens, ctx) => {
+  const externalScript = tokens.some(
+    (t) =>
+      AWK_EXTERNAL_FLAGS.has(t) ||
+      t.startsWith('-f') || // -f / -fSCRIPT (case-sensitive: not -F field-sep)
+      t.startsWith('--file=') ||
+      t.startsWith('--include=') ||
+      t.startsWith('--load='),
+  );
+  const sideEffect = /\bsystem\s*\(|\bgetline\b|[>|`]/.test(tokens.join(' '));
+  if (externalScript || sideEffect) {
+    return { capabilities: [exec('arbitrary'), readFs(ctx.cwd)], confidence: 'medium' };
+  }
+  // Read-only: prints to stdout; reads stdin and/or the file operands
+  // (positional[0] is the program). cwd floor covers stdin-pipeline use.
+  const files = positional
+    .slice(1)
+    .filter((p) => p !== '-')
+    .map((p) => readFs(resolveArg(p, ctx)));
+  return { capabilities: [readFs(ctx.cwd), ...files], confidence: 'medium' };
+};
+
+// True only when `script` is a provably read-only sed program: a single
+// substitution `s<d>..<d>..<d><flags>` whose flags are a subset of
+// {g,p,i,I,m,M,digits} (the `w`/`e` flags write/exec → excluded), or a
+// simple print/delete/quit command optionally with a numeric/`$`/`/regex/`
+// address. Delimiter-aware for `s` (honors backslash-escaped delimiters).
+// Anything it can't prove safe (multi-command via `;`, `w`/`W`/`e`/`r`/`R`
+// commands, `a`/`c`/`i` text, labels) → false; the caller then gates.
+const sedScriptReadOnly = (script: string): boolean => {
+  const s = script.trim();
+  if (s.length === 0) return true;
+  if (s[0] === 's') {
+    const d = s[1];
+    if (d === undefined || /[A-Za-z0-9\s\\]/.test(d)) return false;
+    let i = 2;
+    let seg = 0;
+    while (i < s.length && seg < 2) {
+      if (s[i] === '\\') {
+        i += 2;
+        continue;
+      }
+      if (s[i] === d) seg += 1;
+      i += 1;
+    }
+    if (seg < 2) return false;
+    return /^[gpiImM0-9]*$/.test(s.slice(i));
+  }
+  // Plain command (address + p/P/d/D/q/l/n/N/=), or /regex/ + print/delete.
+  return /^[0-9,$ ]*[pPdDqlnN=]$/.test(s) || /^\/(?:\\.|[^/\n])*\/[pPdD=]?$/.test(s);
+};
+
+// sed — read transform to stdout, OR in-place edit (`-i`), OR write/exec
+// via `w`/`e`/`-f`. Classify by EFFECT, fail-closed: an external script
+// (`-f`) or any script not provably read-only (`sedScriptReadOnly`) →
+// `exec:arbitrary`. A read-only script with `-i`/`--in-place` writes its
+// file operands (`write-fs`); without `-i` it's a stdout transform
+// (`read-fs`). Resolving the actual operands matters for `-i` so an
+// out-of-repo edit (`sed -i … /etc/x`) emits `write-fs:/etc/x` and gates.
+// Spec §5.2.
+const cmdSed: CommandResolver = (positional, tokens, ctx) => {
+  const externalScript = tokens.some(
+    (t) => t === '-f' || t.startsWith('-f') || t === '--file' || t.startsWith('--file='),
+  );
+  if (externalScript) {
+    return { capabilities: [exec('arbitrary'), readFs(ctx.cwd)], confidence: 'medium' };
+  }
+  const exprs = extractValueFlag(tokens, { longForm: '--expression', shortForm: '-e' });
+  // BSD/macOS `-i ''` / `-i .bak` (separate suffix operand) shifts the
+  // script to the NEXT positional, where our `positional[0]` heuristic
+  // would mis-read the empty/suffix token as a (read-only) script and miss
+  // the real one — fail-closed to exec:arbitrary. GNU's attached `-i.bak`
+  // and `-i` followed directly by the script are unaffected (the next
+  // token is the script, not an empty/`.`-suffix). `-e` callers carry the
+  // script explicitly, so they are exempt.
+  if (exprs.length === 0) {
+    const iIdx = tokens.findIndex((t) => t === '-i');
+    if (iIdx !== -1) {
+      const next = tokens[iIdx + 1];
+      if (next === '' || next?.startsWith('.')) {
+        return { capabilities: [exec('arbitrary'), readFs(ctx.cwd)], confidence: 'medium' };
+      }
+    }
+  }
+  const scripts = exprs.length > 0 ? exprs : positional[0] !== undefined ? [positional[0]] : [];
+  if (scripts.length === 0 || !scripts.every((sc) => sedScriptReadOnly(sc))) {
+    return { capabilities: [exec('arbitrary'), readFs(ctx.cwd)], confidence: 'medium' };
+  }
+  const inPlace = tokens.some(
+    (t) => t === '-i' || t.startsWith('-i') || t === '--in-place' || t.startsWith('--in-place='),
+  );
+  const fileArgs = (exprs.length > 0 ? positional : positional.slice(1)).filter((p) => p !== '-');
+  if (inPlace) {
+    const caps = fileArgs.flatMap((p) => [readFs(resolveArg(p, ctx)), writeFs(resolveArg(p, ctx))]);
+    return {
+      capabilities: caps.length > 0 ? caps : [writeFs(ctx.cwd), readFs(ctx.cwd)],
+      confidence: 'medium',
+    };
+  }
+  return {
+    capabilities: [readFs(ctx.cwd), ...fileArgs.map((p) => readFs(resolveArg(p, ctx)))],
+    confidence: 'medium',
   };
 };
 
@@ -1463,6 +1707,30 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
     case 'rev-parse':
     case 'config':
     case 'remote':
+    // Read-only, local (non-network) plumbing/porcelain verbs. Pre-slice
+    // these fell through to the `default` branch and got stamped
+    // gitWrite + netEgress + low confidence — so a routine `git shortlog`
+    // or `git ls-files` read was misclassified as a network write and
+    // gated even under autonomous. They touch only the repo, never the
+    // network. (`ls-remote`/`fetch`/`pull`/`push`/`clone` are network and
+    // stay out of this set; `branch`/`tag`/`reflog` can mutate and stay in
+    // the write/default branches.)
+    case 'shortlog':
+    case 'describe':
+    case 'ls-files':
+    case 'ls-tree':
+    case 'cat-file':
+    case 'rev-list':
+    case 'for-each-ref':
+    case 'name-rev':
+    case 'whatchanged':
+    case 'show-ref':
+    case 'merge-base':
+    case 'cherry':
+    case 'count-objects':
+    case 'grep':
+    case 'annotate':
+    case 'var':
       return { capabilities: [readFs(REPO)], confidence: 'high' };
     case 'commit':
     case 'add':
@@ -2831,6 +3099,12 @@ const COMMAND_TABLE: ReadonlyMap<string, CommandResolver> = new Map<string, Comm
   ['grep', cmdGrep],
   ['rg', cmdGrep],
   ['find', cmdFind],
+  // Programmable text tools — classified by EFFECT (read vs write vs
+  // exec), fail-closed to exec:arbitrary on any side-effect indicator.
+  ['awk', cmdAwk],
+  ['gawk', cmdAwk],
+  ['mawk', cmdAwk],
+  ['sed', cmdSed],
   ['rm', cmdRm],
   ['rmdir', cmdRm],
   ['mv', cmdMvCp],
@@ -4439,6 +4713,47 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
     return { kind: 'conservative', capabilities: allCaps, reason };
   }
   return { kind: 'ok', capabilities: allCaps, confidence: aggregateConf };
+};
+
+// Top-level simple-command texts of a bash command, for the engine's
+// autonomous-posture compound re-check (§8.1 `AGENTIC_CLI`). Returns the
+// literal source slice of each `command` node — `echo oi && curl x` →
+// `['echo oi', 'curl x']` — so the engine can re-run operator `deny`
+// rules per segment: `checkBash`'s deny matches the WHOLE command by
+// glob, so `curl*` misses `echo oi && curl x`. Returns null when the
+// parser is unavailable / produced no tree / recovered no `command`
+// node, or if the tree exceeds MAX_AST_DEPTH — the caller treats null as
+// "can't verify" and keeps the modal (fail-closed). Intended only after
+// `bashResolver` returned `kind: ok`, where the walk already proved
+// there are no soft shapes (no loop/subshell bodies), so every `command`
+// node is a flat pipeline/list segment and there is no command nesting
+// to flatten. A `command` node never contains another `command`, so the
+// walk does not descend past one.
+export const topLevelCommandTexts = (command: string): string[] | null => {
+  let parsed: ReturnType<typeof parseBash>;
+  try {
+    parsed = parseBash(command);
+  } catch {
+    return null;
+  }
+  if (parsed === null) return null;
+  const out: string[] = [];
+  let aborted = false;
+  const visit = (node: Node | null, depth: number): void => {
+    if (node === null || aborted) return;
+    if (depth > MAX_AST_DEPTH) {
+      aborted = true;
+      return;
+    }
+    if (node.type === 'command') {
+      out.push(node.text);
+      return;
+    }
+    for (const child of node.children) visit(child, depth + 1);
+  };
+  visit(parsed.root, 0);
+  if (aborted) return null;
+  return out.length > 0 ? out : null;
 };
 
 registerResolver('bash', bashResolver);

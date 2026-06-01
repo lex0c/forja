@@ -1,7 +1,10 @@
 import { beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { initBashParser } from '../../src/permissions/bash-parser.ts';
 import { type Capability, formatCapability } from '../../src/permissions/capabilities.ts';
-import { __resetRealpathWarnLatchForTest } from '../../src/permissions/resolvers/bash.ts';
+import {
+  __resetRealpathWarnLatchForTest,
+  topLevelCommandTexts,
+} from '../../src/permissions/resolvers/bash.ts';
 // Importing the index file loads every builtin resolver via its
 // side-effecting register calls.
 import {
@@ -1967,10 +1970,16 @@ describe('bash resolver — read-only registry expansion (A, §5.2)', () => {
     expect(r.kind).toBe('conservative');
   });
 
-  test('deliberately-excluded `sed` → Conservative (not added to the read set)', () => {
-    // sed -i / `w` write; kept off the registry so it routes to confirm.
-    const r = resolveCapabilities('bash', { command: 'sed -i s/a/b/ file.txt' }, CTX);
-    expect(r.kind).toBe('conservative');
+  test('sed classified by effect: read-only script → Ok read-fs (no write, no exec)', () => {
+    // Slice (effect-based): sed/awk are now in the registry, classified by
+    // EFFECT. A plain substitution to stdout reads only.
+    const r = resolveCapabilities('bash', { command: "sed 's/a/b/g' file.txt" }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s.some((c) => c.startsWith('read-fs'))).toBe(true);
+      expect(s.some((c) => c.startsWith('write-fs') || c === 'exec:arbitrary')).toBe(false);
+    }
   });
 });
 
@@ -1979,10 +1988,13 @@ describe('bash resolver — read-only registry expansion (A, §5.2)', () => {
 // or the engine's bypass §11 floor (the only check that fires under
 // mode:bypass) has nothing to upgrade and the write is silently allowed.
 describe('bash resolver — unknown commands ride escalate-tier operand caps (bypass §11 floor)', () => {
-  test('sed -i /etc/hosts (unknown cmd, escalate write) → Conservative carrying write-fs', () => {
-    const r = resolveCapabilities('bash', { command: 'sed -i /etc/hosts' }, CTX);
-    expect(r.kind).toBe('conservative');
-    if (r.kind === 'conservative') {
+  test('sed -i of an escalate-tier path emits write-fs (floor still catches it)', () => {
+    // sed is now resolved (Ok, not Conservative), but the in-place edit of
+    // an escalate path still rides a write-fs cap so the §11 floor + the
+    // autonomous capability-confinement gate it.
+    const r = resolveCapabilities('bash', { command: 'sed -i s/a/b/ /etc/hosts' }, CTX);
+    expect(r.kind).not.toBe('refuse');
+    if (r.kind !== 'refuse') {
       expect(capStrings(r.capabilities)).toContain('write-fs:/etc/hosts');
     }
   });
@@ -2011,11 +2023,13 @@ describe('bash resolver — unknown commands ride escalate-tier operand caps (by
     expect(r.kind).toBe('refuse');
   });
 
-  test('unknown cmd writing only cwd carries no spurious protected cap', () => {
-    const r = resolveCapabilities('bash', { command: 'sed -i ./local.txt' }, CTX);
-    expect(r.kind).toBe('conservative');
-    if (r.kind === 'conservative') {
-      expect(capStrings(r.capabilities).some((c) => c.startsWith('write-fs:/etc'))).toBe(false);
+  test('sed -i writing only cwd carries no spurious protected cap', () => {
+    const r = resolveCapabilities('bash', { command: 'sed -i s/a/b/ ./local.txt' }, CTX);
+    expect(r.kind).not.toBe('refuse');
+    if (r.kind !== 'refuse') {
+      const s = capStrings(r.capabilities);
+      expect(s.some((c) => c.startsWith('write-fs:/etc'))).toBe(false);
+      expect(s).toContain('write-fs:/work/proj/local.txt');
     }
   });
 });
@@ -2649,10 +2663,11 @@ describe('bash resolver — control flow does not bypass per-command defenses (r
     expect(resolveCapabilities('bash', { command: cmd }, CTX).kind).toBe('refuse');
   });
 
-  test('find -exec in a loop still EMITS exec:arbitrary (gated downstream), never a blind exec:shell', () => {
-    // find -exec is exec:arbitrary (a capability the engine gates), not a
-    // hard refuse — but the soft path must EMIT the real cap, not swallow
-    // it behind a blind [exec('shell')] the bypass floor can't see.
+  test('find -exec rm in a loop EMITS delete-fs (the real effect), never a blind exec:shell', () => {
+    // find -exec is now classified by its inner command: `rm` →
+    // delete-fs(roots), the honest effect the soft path must surface (not a
+    // blind [exec('shell')] the bypass floor can't see). A shell/unknown
+    // inner would instead emit exec:arbitrary (pinned below).
     const r = resolveCapabilities(
       'bash',
       { command: 'for x in *; do find . -exec rm -rf {} +; done' },
@@ -2660,7 +2675,7 @@ describe('bash resolver — control flow does not bypass per-command defenses (r
     );
     expect(r.kind === 'conservative' || r.kind === 'refuse').toBe(true);
     if (r.kind === 'conservative') {
-      expect(capStrings(r.capabilities)).toContain('exec:arbitrary');
+      expect(capStrings(r.capabilities).some((c) => c.startsWith('delete-fs'))).toBe(true);
     }
   });
 });
@@ -5541,6 +5556,144 @@ describe('bash resolver — slice 152 calibration', () => {
       if (r.kind === 'ok') {
         expect(capStrings(r.capabilities)).toContain('read-fs:/etc');
       }
+    }
+  });
+});
+
+describe('topLevelCommandTexts (autonomous compound re-check, §8.1)', () => {
+  // The engine's autonomous posture uses this to re-run operator `deny`
+  // rules per top-level segment of a resolver-`ok` compound — closing the
+  // gap where checkBash's deny matches only the whole command by glob.
+  test('single command → one segment', () => {
+    expect(topLevelCommandTexts('ls -la')).toEqual(['ls -la']);
+  });
+
+  test('pipeline → one segment per stage', () => {
+    expect(topLevelCommandTexts('ls -la | head -5')).toEqual(['ls -la', 'head -5']);
+  });
+
+  test('&&-sequence → one segment per command', () => {
+    expect(topLevelCommandTexts('echo a && echo b')).toEqual(['echo a', 'echo b']);
+  });
+
+  test('mixed pipe + && → flat list of every simple command', () => {
+    expect(topLevelCommandTexts('ls | grep x && echo done')).toEqual(['ls', 'grep x', 'echo done']);
+  });
+
+  test('no command recovered → null (fail-closed)', () => {
+    expect(topLevelCommandTexts('')).toBeNull();
+  });
+});
+
+describe('bash resolver — effect-based git read verbs / find-exec / awk / sed (§5.2)', () => {
+  const caps = (command: string): string[] => {
+    const r = resolveCapabilities('bash', { command }, CTX);
+    return r.kind === 'ok' ? capStrings(r.capabilities) : [];
+  };
+
+  // git: read-only local verbs no longer get the unknown-subcommand
+  // gitWrite + netEgress; network verbs still do.
+  test('git shortlog → read-fs, no net-egress / git-write', () => {
+    const r = resolveCapabilities('bash', { command: 'git shortlog -sn --all' }, CTX);
+    expect(r.kind).toBe('ok');
+    const s = caps('git shortlog -sn --all');
+    expect(s.some((c) => c.startsWith('read-fs'))).toBe(true);
+    expect(s.some((c) => c.startsWith('net-egress') || c.startsWith('git-write'))).toBe(false);
+  });
+  test('git ls-files / cat-file / rev-list → no net-egress', () => {
+    for (const c of ['git ls-files', 'git cat-file -p HEAD', 'git rev-list HEAD']) {
+      expect(caps(c).some((x) => x.startsWith('net-egress'))).toBe(false);
+    }
+  });
+  test('git push still carries net-egress', () => {
+    expect(caps('git push origin main').some((c) => c.startsWith('net-egress'))).toBe(true);
+  });
+
+  // find -exec classified by inner command.
+  test('find -exec wc → read-fs(roots), not exec:arbitrary', () => {
+    const s = caps('find src -name "*.ts" -exec wc -l {} +');
+    expect(s).toContain('read-fs:/work/proj/src');
+    expect(s).not.toContain('exec:arbitrary');
+  });
+  test('find -exec rm → delete-fs(roots)', () => {
+    expect(caps('find . -name "*.tmp" -exec rm {} +').some((c) => c.startsWith('delete-fs'))).toBe(
+      true,
+    );
+  });
+  test('find -exec chmod → write-fs(roots), not exec:arbitrary', () => {
+    const s = caps('find . -exec chmod 644 {} +');
+    expect(s.some((c) => c.startsWith('write-fs'))).toBe(true);
+    expect(s).not.toContain('exec:arbitrary');
+  });
+  test('find -exec mv/cp (dest can leave repo) → exec:arbitrary', () => {
+    for (const c of ['find . -exec mv {} /tmp/x +', 'find . -exec cp {} /tmp/x +']) {
+      expect(caps(c)).toContain('exec:arbitrary');
+    }
+  });
+  test('find -exec sh -c → exec:arbitrary', () => {
+    expect(caps('find . -exec sh -c "id" {} +')).toContain('exec:arbitrary');
+  });
+  test('find: a read-only -exec does NOT hide a mutating second -exec', () => {
+    expect(
+      caps('find . -exec cat {} + -exec rm -rf {} +').some((x) => x.startsWith('delete-fs')),
+    ).toBe(true);
+  });
+  test('find -delete combined with -exec on a system root → Refuse', () => {
+    expect(
+      resolveCapabilities('bash', { command: 'find / -exec cat {} + -delete' }, CTX).kind,
+    ).toBe('refuse');
+  });
+  test('find -L <outside root> -exec read → captures the real outside root (not cwd)', () => {
+    expect(caps('find -L /etc -exec cat {} +')).toContain('read-fs:/etc');
+  });
+  test('sed -i with a separate BSD suffix (-i / -i .bak) → exec:arbitrary (script position ambiguous)', () => {
+    for (const c of ["sed -i '' 's/a/b/e' file", "sed -i .bak 's/a/b/e' file"]) {
+      expect(caps(c)).toContain('exec:arbitrary');
+    }
+  });
+  test('sed -i GNU forms (-i, -i.bak) resolve the script + write the file', () => {
+    for (const c of ["sed -i 's/a/b/' file", "sed -i.bak 's/a/b/' file"]) {
+      expect(caps(c)).toContain('write-fs:/work/proj/file');
+    }
+  });
+
+  // awk: read-only print/filter vs side-effecting forms.
+  test('awk print / pattern → no exec:arbitrary, no write-fs', () => {
+    for (const c of ["awk '{print $1}' f.log", "awk '/ERROR/' app.log"]) {
+      const s = caps(c);
+      expect(s.some((x) => x === 'exec:arbitrary' || x.startsWith('write-fs'))).toBe(false);
+    }
+  });
+  test('awk system / getline-pipe / print-redirect / -f → exec:arbitrary', () => {
+    for (const c of [
+      'awk \'BEGIN{system("id")}\'',
+      'awk \'BEGIN{"id"|getline x}\'',
+      'awk \'{print > "/tmp/x"}\' f',
+      'awk -f /tmp/x.awk f',
+    ]) {
+      expect(caps(c)).toContain('exec:arbitrary');
+    }
+  });
+
+  // sed: read transform vs in-place write vs exec/write commands.
+  test('sed substitution / print → read-fs, no write/exec', () => {
+    for (const c of ["sed 's/a/b/g' f", "sed -n '1,5p' f"]) {
+      const s = caps(c);
+      expect(s.some((x) => x.startsWith('read-fs'))).toBe(true);
+      expect(s.some((x) => x === 'exec:arbitrary' || x.startsWith('write-fs'))).toBe(false);
+    }
+  });
+  test('sed -i → write-fs(operands)', () => {
+    expect(caps('sed -i s/a/b/ notes.txt')).toContain('write-fs:/work/proj/notes.txt');
+  });
+  test('sed exec/write commands (s///e, e, s///w, -f) → exec:arbitrary', () => {
+    for (const c of [
+      "sed 's/a/b/e' f",
+      "sed '1e cat /etc/passwd' f",
+      "sed 's/a/b/w /tmp/out' f",
+      'sed -f /tmp/x.sed f',
+    ]) {
+      expect(caps(c)).toContain('exec:arbitrary');
     }
   });
 });

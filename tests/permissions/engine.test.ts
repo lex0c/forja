@@ -134,6 +134,25 @@ describe('engine.check confirmCause (every confirm carries a typed cause)', () =
     if (d.kind === 'confirm') expect(d.confirmCause).toBe('compound');
   });
 
+  test('a compound that is ALSO risk-bearing keeps cause "compound" (never resolver/score)', () => {
+    // Invariant the autonomous per-segment deny re-check relies on: checkBash
+    // stamps `compound` BEFORE the allow rules, and degradeAllowToConfirm
+    // only upgrades `allow`s — so a compound never becomes `resolver`/`score`
+    // even when low-confidence (unknown git subcommand) or score-crossing
+    // (`git push` net-egress). Conversely `resolver`/`score` ⟹ a single
+    // (non-compound) command, whose whole string checkBash already
+    // deny-matched — which is why the re-check skips them.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git *'] } } }), {
+      cwd: CWD,
+      scoreConfirmThreshold: 0.0001,
+    });
+    for (const command of ['git frobnicate && echo x', 'git push origin main && echo x']) {
+      const d = eng.check('bash', 'bash', { command });
+      expect(d.kind).toBe('confirm');
+      if (d.kind === 'confirm') expect(d.confirmCause).toBe('compound');
+    }
+  });
+
   test('path confirm_paths rule → cause "policy"', () => {
     const eng = createPermissionEngine(
       policy({ tools: { write_file: { confirm_paths: ['package.json'] } } }),
@@ -193,14 +212,158 @@ describe('approval posture (Supervised / Autonomous)', () => {
     expect(eng.check('write_file', 'fs.write', { path: 'package.json' }).kind).toBe('allow');
   });
 
-  test('autonomous does NOT auto-approve a compound-command confirm', () => {
-    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['echo *'] } } }), {
+  // Autonomous auto-approves a bash confirm when EVERY resolved capability
+  // is repo-confined (reads/writes/deletes under cwd, local git-write,
+  // exec:shell); dangerous effects (network, outside-repo, unknown binary,
+  // protected/sensitive paths) keep the modal regardless of structure.
+  test('autonomous auto-approves a repo-confined compound read', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('bash', 'bash', { command: 'cat README.md && echo done' });
+    expect(d.kind).toBe('allow');
+    if (d.kind === 'allow') expect(d.reason).toContain('repo-confined operation');
+  });
+
+  test('autonomous auto-approves a repo-confined write', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('bash', 'bash', { command: 'echo hi > notes.txt && echo done' });
+    expect(d.kind).toBe('allow');
+  });
+
+  test('autonomous auto-approves a repo-confined delete (operator opted in)', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('bash', 'bash', { command: 'rm build.log && echo done' });
+    expect(d.kind).toBe('allow');
+  });
+
+  test('autonomous auto-approves a local git-write (operator opted in)', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('bash', 'bash', { command: 'git add -A && git commit -m wip' });
+    expect(d.kind).toBe('allow');
+  });
+
+  test('autonomous auto-approves regardless of command structure (control-flow loop)', () => {
+    // The `for` loop makes the resolver Conservative — structure no longer
+    // gates; only the (repo-confined) effect matters.
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('bash', 'bash', { command: 'for f in *.ts; do cat "$f"; done' });
+    expect(d.kind).toBe('allow');
+  });
+
+  test('autonomous auto-approves regardless of resolver confidence (** glob)', () => {
+    // `**` resolves ok/low — low confidence no longer gates a repo read.
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('bash', 'bash', { command: 'wc -l src/**/*.ts && echo done' });
+    expect(d.kind).toBe('allow');
+  });
+
+  test('autonomous auto-approves a confined op even when the score gate would fire (cause score)', () => {
+    // Non-compound allow-match whose score crosses a near-zero threshold →
+    // confirmCause 'score'; capability-confinement overrides the score gate.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['rm *'] } } }), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+      scoreConfirmThreshold: 0.0001,
+    });
+    const d = eng.check('bash', 'bash', { command: 'rm build.log' });
+    expect(d.kind).toBe('allow');
+  });
+
+  test('supervised keeps a repo-confined compound as a modal', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    const d = eng.check('bash', 'bash', { command: 'cat README.md && echo done' });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') expect(d.confirmCause).toBe('compound');
+  });
+
+  test('autonomous repo-confined auto-approval stamps an approval-posture audit stage', () => {
+    const captured: AuditEmitInput[] = [];
+    const eng = createPermissionEngine(policy({}), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+      audit: {
+        emit: (input) => {
+          captured.push(input);
+          return { seq: captured.length, this_hash: 'h' };
+        },
+        verifyChain: () => ({
+          ok: true,
+          rows: captured.length,
+          current_rotation_id: 0,
+          quarantined: false,
+        }),
+      },
+    });
+    const d = eng.check('bash', 'bash', { command: 'cat README.md && echo done' });
+    expect(d.kind).toBe('allow');
+    const row = captured.at(-1);
+    expect(row?.decision).toBe('allow');
+    expect(
+      row?.reason_chain.some(
+        (s) =>
+          s.stage === 'approval-posture' &&
+          s.note === 'autonomous: auto-approved repo-confined operation',
+      ),
+    ).toBe(true);
+  });
+
+  test('autonomous does NOT auto-approve network egress', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('bash', 'bash', { command: 'curl http://x.test && echo done' });
+    expect(d.kind).not.toBe('allow');
+  });
+
+  test('autonomous does NOT auto-approve git push (carries net-egress)', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git push *'] } } }), {
       cwd: CWD,
       approvalPosture: 'autonomous',
     });
-    const d = eng.check('bash', 'bash', { command: 'echo a && echo b' });
+    const d = eng.check('bash', 'bash', { command: 'git push origin main && echo done' });
+    expect(d.kind).not.toBe('allow');
+  });
+
+  test('autonomous does NOT auto-approve a read outside the repo', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('bash', 'bash', { command: 'cat /etc/passwd && echo x' });
+    expect(d.kind).not.toBe('allow');
+  });
+
+  test('autonomous does NOT auto-approve a sensitive path inside the repo (.env)', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('bash', 'bash', { command: 'cat .env && echo x' });
+    expect(d.kind).not.toBe('allow');
+  });
+
+  test('autonomous does NOT auto-approve a protected path inside the repo (.git)', () => {
+    // `.git` is write-escalate but git reads it freely; for the no-modal
+    // auto-approval we hold it off-limits for reads too (can carry tokens).
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('bash', 'bash', { command: 'cat .git/config && echo x' });
+    expect(d.kind).not.toBe('allow');
+  });
+
+  test('autonomous does NOT auto-approve an unknown binary (exec:arbitrary)', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('bash', 'bash', { command: 'frobnicate x && echo b' });
+    expect(d.kind).not.toBe('allow');
+  });
+
+  test('autonomous does NOT auto-approve a confined compound when a segment hits a deny rule', () => {
+    // `ls README.md` is repo-confined, but the operator denied `ls *`.
+    // checkBash's deny matches the WHOLE command by glob (misses the middle
+    // segment), so the per-segment re-check is what keeps the modal.
+    const eng = createPermissionEngine(policy({ tools: { bash: { deny: ['ls *'] } } }), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+    });
+    const d = eng.check('bash', 'bash', { command: 'echo ok && ls README.md' });
     expect(d.kind).toBe('confirm');
-    if (d.kind === 'confirm') expect(d.confirmCause).toBe('compound');
+  });
+
+  test('autonomous suspends repo-confined auto-approval while the engine is degraded', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    eng.degrade('test: subsystem offline');
+    const d = eng.check('bash', 'bash', { command: 'cat README.md && echo x' });
+    expect(d.kind).toBe('confirm');
   });
 
   test('autonomous does NOT auto-approve a protected-escalate confirm', () => {
