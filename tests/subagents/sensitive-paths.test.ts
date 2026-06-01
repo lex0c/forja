@@ -61,10 +61,12 @@ describe('matchSensitivePath — exact patterns from §8.4', () => {
     expect(matchSensitivePath('a/b/c/secrets.yaml')).toBe('**/secrets.yaml');
   });
 
-  test('matches `**/credentials*.json` (GCP service accounts)', () => {
-    expect(matchSensitivePath('credentials.json')).toBe('**/credentials*.json');
-    expect(matchSensitivePath('credentials-prod.json')).toBe('**/credentials*.json');
-    expect(matchSensitivePath('infra/credentials.json')).toBe('**/credentials*.json');
+  test('matches `*credentials*.json` (GCP service accounts; contains-match)', () => {
+    expect(matchSensitivePath('credentials.json')).toBe('*credentials*.json');
+    expect(matchSensitivePath('credentials-prod.json')).toBe('*credentials*.json');
+    expect(matchSensitivePath('infra/credentials.json')).toBe('*credentials*.json');
+    // contains-match (not just prefix) — catches suffix forms too.
+    expect(matchSensitivePath('infra/foo-credentials.json')).toBe('*credentials*.json');
   });
 
   test('matches `.aws/credentials` and `.aws/config` exactly', () => {
@@ -146,7 +148,9 @@ describe('SENSITIVE_PATH_DENY_LIST integrity', () => {
       '.npmrc',
       '.pypirc',
       '*.kdbx',
-      '**/credentials*.json',
+      '*credentials*.json',
+      '*service-account*.json',
+      '*-firebase-adminsdk-*.json',
       '**/secrets.yml',
       '**/secrets.yaml',
       '.git-credentials',
@@ -157,6 +161,20 @@ describe('SENSITIVE_PATH_DENY_LIST integrity', () => {
       '.my.cnf',
       '.mongorc.js',
       '**/.htpasswd',
+      // k8s / docker registry + mobile signing + tokens.
+      '.kube/config',
+      'kubeconfig',
+      '.docker/config.json',
+      '*.jks',
+      '*.keystore',
+      'keystore.properties',
+      'local.properties',
+      '*.p8',
+      '*.mobileprovision',
+      'google-services.json',
+      'GoogleService-Info.plist',
+      '*.jwt',
+      '*.ovpn',
     ]);
   });
 });
@@ -248,5 +266,50 @@ describe('matchSensitivePath — module-level Glob cache (slice 159 self-review)
       expect(matchSensitivePath('src/main.ts')).toBeNull();
       expect(matchSensitivePath('docs/readme.md')).toBeNull();
     }
+  });
+});
+
+describe('matchSensitivePath — mobile / k8s / service-account / token additions', () => {
+  test.each([
+    // Android signing
+    'release.keystore',
+    'app/signing.jks',
+    'upload-keystore.jks',
+    'keystore.properties',
+    'local.properties',
+    // iOS / Apple
+    'AuthKey_ABC123.p8',
+    'MyApp.mobileprovision',
+    // Firebase configs (carry API keys)
+    'android/app/google-services.json',
+    'ios/Runner/GoogleService-Info.plist',
+    // Kubernetes / Docker registry
+    '.kube/config',
+    'kubeconfig',
+    '.docker/config.json',
+    // Service-account / broadened credentials JSON (suffix forms)
+    'foo-credentials.json',
+    'svc-service-account.json',
+    'proj-firebase-adminsdk-x.json',
+    // Bearer tokens / VPN
+    'app.jwt',
+    'client.ovpn',
+  ])('blocks %s', (p) => {
+    expect(matchSensitivePath(p)).not.toBeNull();
+  });
+
+  test.each([
+    // Public-cert encodings — no private key (that lives in *.pem / *.key
+    // / *.p12 / *.pfx, which ARE blocked); intentionally NOT on the
+    // un-overridable floor so legitimate public-cert reads still work.
+    'cert.crt',
+    'dist.cer',
+    'ca.der',
+    // Guard against over-broad patterns: a non-Android `*.properties` and a
+    // `*token*`-shaped source file must NOT be blocked.
+    'gradle.properties',
+    'src/tokenizer.ts',
+  ])('does NOT block non-secret %s', (p) => {
+    expect(matchSensitivePath(p)).toBeNull();
   });
 });
