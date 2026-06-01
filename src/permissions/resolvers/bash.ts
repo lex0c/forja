@@ -1131,27 +1131,30 @@ const cmdFind: CommandResolver = (_positional, tokens, ctx) => {
 // alternation (`/a|b/`) — over-gating those is safe; missing a real
 // redirect/pipe would be a laundering hole. `-F'|'` (pipe field sep) also
 // over-gates. Spec §5.2.
-const AWK_EXTERNAL_FLAGS: ReadonlySet<string> = new Set([
-  '-i',
-  '--include',
-  '-l',
-  '--load',
-  '-E',
-  '--exec',
-  '-D',
-  '--debug',
-  '-p',
-  '--profile',
+// External-program / library / debugger flags: each loads or executes code
+// outside the inline awk program → exec:arbitrary. The SHORT forms take a
+// REQUIRED operand that GNU awk accepts ATTACHED (`-i/tmp/inc.awk`, `-lfoo`,
+// `-Efile`) or separate (`-i /tmp/inc.awk`), so they are matched by PREFIX —
+// an exact-only match missed `awk -i/tmp/payload.awk …` / `awk -lfoo …`,
+// which load and RUN that source/library. (`-f` program file, `-i` include,
+// `-l` load/dlopen a shared lib, `-E` exec, `-D` debug, `-p` profile.
+// Case-sensitive on purpose: `-F` field-sep and `-v` assignment are NOT
+// external and must not match a prefix.) Long forms take `--flag value` or
+// `--flag=value`.
+const AWK_EXTERNAL_SHORT: readonly string[] = ['-f', '-i', '-l', '-E', '-D', '-p'];
+const AWK_EXTERNAL_LONG: readonly string[] = [
   '--file',
-]);
+  '--include',
+  '--load',
+  '--exec',
+  '--debug',
+  '--profile',
+];
 const cmdAwk: CommandResolver = (positional, tokens, ctx) => {
   const externalScript = tokens.some(
     (t) =>
-      AWK_EXTERNAL_FLAGS.has(t) ||
-      t.startsWith('-f') || // -f / -fSCRIPT (case-sensitive: not -F field-sep)
-      t.startsWith('--file=') ||
-      t.startsWith('--include=') ||
-      t.startsWith('--load='),
+      AWK_EXTERNAL_SHORT.some((f) => t.startsWith(f)) ||
+      AWK_EXTERNAL_LONG.some((f) => t === f || t.startsWith(`${f}=`)),
   );
   const sideEffect = /\bsystem\s*\(|\bgetline\b|[>|`]/.test(tokens.join(' '));
   if (externalScript || sideEffect) {

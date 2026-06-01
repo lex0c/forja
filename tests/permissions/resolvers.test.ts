@@ -5862,6 +5862,27 @@ describe('bash resolver — effect-based git read verbs / find-exec / awk / sed 
       expect(caps(c)).toContain('exec:arbitrary');
     }
   });
+  test('awk ATTACHED external flags (`-i/tmp/x`, `-lfoo`, `-Efile`, `--exec=`) → exec:arbitrary', () => {
+    // GNU awk accepts the required operand of -i/-l/-E/-D/-p ATTACHED; an
+    // exact-only match let `awk -i/tmp/payload.awk …` / `awk -lfoo …` load
+    // and RUN that include source / shared library as a read-only program.
+    for (const c of [
+      "awk -i/tmp/payload.awk 'BEGIN{print}' input",
+      "awk -lfoo 'BEGIN{print}'",
+      "awk -E/tmp/prog.awk 'BEGIN{print}'",
+      "awk --include=/tmp/x.awk 'BEGIN{print}'",
+      "awk --exec=/tmp/x 'BEGIN{print}'",
+    ]) {
+      expect(caps(c)).toContain('exec:arbitrary');
+    }
+  });
+  test('awk -F field-sep / -v assignment are NOT external (case-sensitive, no false exec)', () => {
+    // The prefix match must not mistake `-F` (field separator) or `-v`
+    // (assignment) for `-f`/`-i`/`-l`; plain read-only programs stay read-fs.
+    for (const c of ["awk -F: '{print $1}' data.csv", "awk -v n=1 '{print n}' data.csv"]) {
+      expect(caps(c)).not.toContain('exec:arbitrary');
+    }
+  });
 
   // sed: read transform vs in-place write vs exec/write commands.
   test('sed substitution / print → read-fs, no write/exec', () => {

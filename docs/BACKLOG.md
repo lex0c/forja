@@ -2,6 +2,18 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-01] permissions — gate ATTACHED awk include/load/exec flags (`-i/tmp/x`, `-lfoo`)
+
+**Hole (operator review of the awk resolver).** GNU awk's external-program flags take a REQUIRED operand that can be ATTACHED: `awk -i/tmp/inc.awk …` (include + run a source file), `awk -lfoo …` (load/dlopen a shared library), `awk -E/tmp/prog.awk …` (exec). The `cmdAwk` predicate matched these flags by EXACT string (`AWK_EXTERNAL_FLAGS.has(t)`), so only the separate-operand form (`-i /tmp/inc.awk`) was caught; the attached form fell through as a side-effect-free awk program and emitted only `read-fs` — no `exec:arbitrary`. In any policy that allows `awk`, or any auto-approve path for repo-confined ops, that hid the real execution surface (the included source / loaded library runs arbitrary code).
+
+**Fix (`cmdAwk` in `resolvers/bash.ts`).** Split `AWK_EXTERNAL_FLAGS` into `AWK_EXTERNAL_SHORT` (`-f`, `-i`, `-l`, `-E`, `-D`, `-p`) matched by PREFIX (catches both `-i x` and `-i/tmp/x`/`-lfoo`/`-Efile`) and `AWK_EXTERNAL_LONG` (`--file`/`--include`/`--load`/`--exec`/`--debug`/`--profile`) matched as `--flag` or `--flag=value`. The prefix match is case-sensitive so `-F` (field separator) and `-v` (assignment) do NOT false-match `-f`/`-i`/`-l`. This is a strict superset of the old detection and additionally closes the `--exec=`/`--debug=`/`--profile=` long-`=` forms the exact-match set missed.
+
+**Verification.** Scratch: `awk -i/tmp/payload.awk …`, `awk -lfoo …`, `awk -Efile …`, `awk -Dcmds …`, `awk --include=… …`, `awk --exec=… …`, `awk -f prog.awk …` → exec:arbitrary; `awk '{print $1}' f.log`, `awk -F: '{print $1}' /etc/passwd`, `awk -v x=1 '{print x}'` → read-fs, NO exec (no over-gating; `-F`/`-v` not mistaken for external flags). All twelve cases matched the expected gate/no-gate.
+
+**Tests.** `resolvers.test.ts`: an attached-external-flags case (`-i/tmp/x`, `-lfoo`, `-E/tmp/prog`, `--include=`, `--exec=` → exec:arbitrary) and a `-F`/`-v` no-false-positive pin. typecheck + Biome clean; `tests/permissions/` **2197 pass / 0 fail**. `docs/SECURITY.md` §3.2 awk row synced (now lists the external flags + attached/separate + case-sensitivity). No commit (awaiting operator review).
+
+**Spec drift to sync (NOT yet edited — needs operator go-ahead).** `PERMISSION_ENGINE.md §291` (the awk effect row) lists the external flags (`-f`/`-i`/`--include`/`--load`/`--exec`/`--debug`/`--profile`) but does not note that the SHORT forms' operands may be attached. Should be updated to record the prefix (attached-or-separate) matching and the case-sensitivity carve-out for `-F`/`-v`.
+
 ## [2026-06-01] permissions — recognize BUNDLED sed -i suffixes (`-Ei.bak`) as in-place writes
 
 **Hole (operator review of the sed resolver, follow-on to the BSD-suffix fix).** `sed`'s `-i` short flag can be BUNDLED after other short flags with an attached suffix: `sed -Ei.bak 's/x/y/' /etc/hosts` (= `-E` extended-regex + `-i.bak` in-place) is a valid GNU invocation that edits the file in place. The in-place detection only treated tokens that START with `-i...` (or `--in-place...`) as in-place, so `-Ei.bak` fell through and the command was modeled as a read-only stdout transform — emitting only `read-fs:/etc/hosts`. Because the §11 protected-path floor escalates `/etc` for WRITE ops only (reads pass), the protected write was hidden from BOTH gating (bypass mode allowed it silently) AND the audit (recorded as a read, not a write).
