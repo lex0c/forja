@@ -1196,6 +1196,45 @@ const sedScriptReadOnly = (script: string): boolean => {
   return /^[0-9,$ ]*[pPdDqlnN=]$/.test(s) || /^\/(?:\\.|[^/\n])*\/[pPdD=]?$/.test(s);
 };
 
+// Locate the sed in-place flag (`-i`) in ANY spelling and report its form:
+//   'none'     — no `-i`.
+//   'attached' — the suffix is part of the token (`-i.bak`, `-Ei.bak`) or
+//                the GNU long form (`--in-place[=SUFFIX]`): the script stays
+//                at positional[0] (unambiguous on both GNU and BSD).
+//   'separate' — a bare `-i` at the END of a short bundle (`-i`, `-ni`,
+//                `-Ei`): on BSD/macOS `-i` then consumes the NEXT token as
+//                the suffix, shifting the script position (ambiguous).
+// Short bundles are walked left-to-right because `-e`/`-f` consume the REST
+// of the token as their argument — an `i` after them is part of that arg,
+// not the in-place flag (`-ei` is `-e` with the script `i`). Catching the
+// BUNDLED forms is load-bearing: `sed -Ei.bak 's/x/y/' /etc/hosts` (GNU
+// accepts `-E` + `-i.bak`) writes /etc/hosts in place; missing it emitted
+// only read-fs:/etc/hosts, hiding the WRITE from the bypass protected-path
+// floor (which escalates /etc on writes only) and from the audit.
+const sedInPlaceForm = (tokens: readonly string[]): 'none' | 'attached' | 'separate' => {
+  let best: 'none' | 'attached' = 'none';
+  for (const t of tokens) {
+    if (t === '--in-place' || t.startsWith('--in-place=')) {
+      best = 'attached';
+      continue;
+    }
+    if (t.length < 2 || t[0] !== '-' || t[1] === '-') continue;
+    for (let i = 1; i < t.length; i++) {
+      const c = t[i];
+      if (c === 'i') {
+        // Suffix = remainder of the token. None (i is last) → separate
+        // operand on BSD; non-empty → attached, script at positional[0].
+        if (i === t.length - 1) return 'separate';
+        best = 'attached';
+        break;
+      }
+      // `-e`/`-f` take the rest of the token as their argument.
+      if (c === 'e' || c === 'f') break;
+    }
+  }
+  return best;
+};
+
 // sed — read transform to stdout, OR in-place edit (`-i`), OR write/exec
 // via `w`/`e`/`-f`. Classify by EFFECT, fail-closed: an external script
 // (`-f`) or any script not provably read-only (`sedScriptReadOnly`) →
@@ -1212,29 +1251,24 @@ const cmdSed: CommandResolver = (positional, tokens, ctx) => {
     return { capabilities: [exec('arbitrary'), readFs(ctx.cwd)], confidence: 'medium' };
   }
   const exprs = extractValueFlag(tokens, { longForm: '--expression', shortForm: '-e' });
+  const inPlaceForm = sedInPlaceForm(tokens);
   // BSD/macOS `sed -i` takes the backup suffix as a SEPARATE operand
   // (`-i extension`), consuming the NEXT token — ANY token, not just `''`
-  // or a `.bak`-shaped one — as the suffix. That shifts the script one
-  // position to the right of where GNU puts it: `sed -i p 's/x/id/e' f`
-  // is GNU `{script:'p', files:['s/x/id/e','f']}` but BSD
+  // or a `.bak`-shaped one. That shifts the script one position to the
+  // right of where GNU puts it: `sed -i p 's/x/id/e' f` is GNU
+  // `{script:'p', files:['s/x/id/e','f']}` but BSD
   // `{suffix:'p', script:'s/x/id/e', file:'f'}`, and the BSD script execs
-  // `id` via the `s///e` flag. With no `-e`, the script is a positional
-  // whose index is platform-divergent, so `positional[0]` cannot be
-  // trusted as the script — fail-closed to exec:arbitrary.
+  // `id` via the `s///e` flag. So a `separate`-form `-i` (a bare `-i`/`-ni`
+  // at the token end — see `sedInPlaceForm`) with no `-e` has a
+  // platform-divergent script index: `positional[0]` cannot be trusted —
+  // fail-closed to exec:arbitrary.
   //
-  // Exempt (script position is unambiguous, so they stay modeled):
-  //   - `-e`/`--expression`: the script rides the flag value, which
-  //     coincides with the real script on BOTH platforms (BSD eats the
-  //     `-e` token as the suffix, but the next token then becomes
-  //     positional[0]=script == our extracted `-e` value).
-  //   - an ATTACHED suffix (`-i.bak`, `-in`): the suffix is part of the
-  //     `-i` token, so `positional[0]` is the script on both platforms.
-  //   - the GNU-only long form `--in-place[=SUFFIX]`: no BSD counterpart
-  //     that shifts (BSD errors on the long option), script at positional[0].
-  // The pattern matches a bare `-i` and short-flag bundles ending in `i`
-  // (`-ni`, `-Eni`) — exactly the forms where `-i` consumes a separate
-  // operand. `-i<suffix>` / `--in-place` do not match.
-  if (exprs.length === 0 && tokens.some((t) => /^-[A-Za-z]*i$/.test(t))) {
+  // Exempt (script position unambiguous → stay modeled): `-e`/`--expression`
+  // (the script rides the flag value, which coincides with the real script
+  // on BOTH platforms — BSD eats the `-e` token as the suffix, but the next
+  // token then becomes positional[0] == our extracted `-e` value); an
+  // ATTACHED suffix (`-i.bak`, `-Ei.bak`); and the GNU-only `--in-place`.
+  if (inPlaceForm === 'separate' && exprs.length === 0) {
     // exec:arbitrary gates the autonomous + score paths (the script may be a
     // dangerous positional we can't pin). The in-place edit still WRITES the
     // file operands, but we can't tell which positional is the suffix vs the
@@ -1256,9 +1290,11 @@ const cmdSed: CommandResolver = (positional, tokens, ctx) => {
   if (scripts.length === 0 || !scripts.every((sc) => sedScriptReadOnly(sc))) {
     return { capabilities: [exec('arbitrary'), readFs(ctx.cwd)], confidence: 'medium' };
   }
-  const inPlace = tokens.some(
-    (t) => t === '-i' || t.startsWith('-i') || t === '--in-place' || t.startsWith('--in-place='),
-  );
+  // `attached` (`-i.bak`, `-Ei.bak`, `--in-place`) is an in-place WRITE with
+  // the script at positional[0]; the `separate` form already returned above
+  // (exec:arbitrary) when no `-e`, and with `-e` it is still an in-place
+  // write. So any non-'none' form writes its operands.
+  const inPlace = inPlaceForm !== 'none';
   const fileArgs = (exprs.length > 0 ? positional : positional.slice(1)).filter((p) => p !== '-');
   if (inPlace) {
     const caps = fileArgs.flatMap((p) => [readFs(resolveArg(p, ctx)), writeFs(resolveArg(p, ctx))]);

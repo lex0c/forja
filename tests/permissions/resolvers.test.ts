@@ -5821,6 +5821,29 @@ describe('bash resolver — effect-based git read verbs / find-exec / awk / sed 
       expect(s).toContain('write-fs:/work/proj/file');
     }
   });
+  test('bundled in-place `-Ei.bak` / `-niE` is recognized as a WRITE (not a read-only transform)', () => {
+    // GNU accepts `-i` bundled after other short flags with an ATTACHED
+    // suffix (`-Ei.bak` = -E + -i.bak). The old detection only matched a
+    // token STARTING with `-i`, so `-Ei.bak` fell through as a read-only
+    // stdout transform and emitted only read-fs for the operand — hiding the
+    // in-place WRITE from the bypass §11 protected-path floor (which
+    // escalates /etc on writes only) and from the audit.
+    expect(caps("sed -Ei.bak 's/x/y/' /etc/hosts")).toContain('write-fs:/etc/hosts');
+    for (const c of ["sed -Ei.bak 's/x/y/' file", "sed -niE 's/x/y/' file"]) {
+      const s = caps(c);
+      expect(s).toContain('write-fs:/work/proj/file');
+      expect(s).not.toContain('exec:arbitrary');
+    }
+  });
+  test('a short bundle with `-e`/`-f` before any `i` is NOT in-place (`-ne` reads, no false write)', () => {
+    // `-ne` is `-n` + `-e SCRIPT`; `-e` consumes the rest of the token as the
+    // script, so there is no in-place `i`. The walk stops at `-e`/`-f` so an
+    // `i` inside the script arg can't be mistaken for the flag — stays a
+    // read-only transform, no spurious write-fs.
+    const s = caps("sed -ne 's/x/p/' f");
+    expect(s.some((x) => x.startsWith('read-fs'))).toBe(true);
+    expect(s.some((x) => x.startsWith('write-fs'))).toBe(false);
+  });
 
   // awk: read-only print/filter vs side-effecting forms.
   test('awk print / pattern → no exec:arbitrary, no write-fs', () => {

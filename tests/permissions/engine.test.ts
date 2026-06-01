@@ -746,6 +746,20 @@ describe('engine modes', () => {
     expect(d.reason).toContain('bypass mode still escalates §11');
   });
 
+  test('bypass mode escalates a bundled `sed -Ei.bak` in-place write to /etc (§11 floor sees the write)', () => {
+    // Regression: `-Ei.bak` (=-E + -i.bak) is an in-place edit, but the old
+    // detection only matched a token starting with `-i`, so the resolver
+    // emitted read-fs:/etc/hosts (a read passes the escalate tier) and bypass
+    // allowed the protected WRITE silently. The bundled-aware detection now
+    // emits write-fs:/etc/hosts, which the §11 floor escalates even in bypass.
+    const eng = createPermissionEngine(policy({ defaults: { mode: 'bypass' } }), {
+      cwd: CWD,
+      home: '/home/op',
+    });
+    const d = eng.check('bash', 'bash', { command: "sed -Ei.bak 's/x/y/' /etc/hosts" });
+    expect(d.kind).toBe('confirm');
+  });
+
   test('bypass mode REFUSES write to ~/.ssh/authorized_keys outright (SEC §8.4 — slice 159)', () => {
     // Pre-slice 159 this UPGRADED the bypass write to a confirm (§11
     // escalate tier). Post-slice the §8.4 deny-list fires before the
