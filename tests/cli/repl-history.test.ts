@@ -470,6 +470,47 @@ describe('repl — reverse-search overlay (HISTORY.md §2.2)', () => {
     await promise;
   });
 
+  test('Ctrl+R is blocked while editing a queued message (cannot strand it)', async () => {
+    appendHistory(db, PROJECT_CWD, 'some history entry', { ts: 1 });
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStubWithDb(db),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    // Queue "original" and lift it for editing.
+    stdin.feed('original\r');
+    await tick();
+    stdin.feed(ARROW_UP);
+    await tick();
+    // Ctrl+R must NOT open reverse search while editing (edit mode wins) —
+    // otherwise accepting a match would clear the edit buffer and strand
+    // "original" (hidden + held). It's a no-op; the edit stays intact.
+    stdin.feed(CTRL_R);
+    await tick();
+    // Enter commits the (unchanged) edit, not a reverse-search match.
+    stdin.feed('\r');
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('original');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    await promise;
+  });
+
   test('an edited queued message records only the final text in history (not the stale original)', async () => {
     const stdin = makeStdin();
     const ra = makeRunAgent();

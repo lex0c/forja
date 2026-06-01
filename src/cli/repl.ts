@@ -2063,7 +2063,17 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // popover would let Ctrl+R hijack a slash buffer that's still
     // mid-composition, which the §2.1 "slash mode wins" rule is
     // meant to forbid.
+    //
+    // Edit mode also wins (INBOX): while a queued message is lifted for
+    // editing (editingQueued set), Ctrl+R is blocked. Otherwise the
+    // operator could open search and accept a match — enqueueInbox(match)
+    // clears the input but leaves editingId set, so the message being
+    // edited stays hidden and held back at the next boundary with no edit
+    // buffer (stranded). They finish/cancel the edit (Enter / ↓ / Esc)
+    // first. Falls through to applyKey, where Ctrl+R is a NOOP, so the
+    // edit buffer is untouched.
     if (
+      editingQueued === null &&
       key.kind === 'char' &&
       key.ctrl &&
       key.char === 'r' &&
