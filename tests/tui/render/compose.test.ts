@@ -613,3 +613,53 @@ describe('composeCursor', () => {
     expect(cur).toEqual({ row: 6 - 2 - 2, col: 2 + 4 });
   });
 });
+
+describe('queued inbox messages (INBOX §6)', () => {
+  test('render above the input rule, in the `> `-prefixed bar style', () => {
+    const state: LiveState = {
+      ...startedSession(),
+      queued: [{ id: '0', text: 'queued msg' }],
+    };
+    const out = composeLive(state, caps, 0);
+    const barIdx = out.findIndex((l) => l.includes('> queued msg'));
+    const firstRuleIdx = out.findIndex((l) => l.startsWith('─') || l.startsWith('-'));
+    expect(barIdx).toBeGreaterThanOrEqual(0);
+    expect(firstRuleIdx).toBeGreaterThanOrEqual(0);
+    // queued stack sits in the upper slot, above the input block's rule
+    expect(barIdx).toBeLessThan(firstRuleIdx);
+  });
+
+  test('one bar per queued item, in FIFO order', () => {
+    const state: LiveState = {
+      ...startedSession(),
+      queued: [
+        { id: '0', text: 'first queued' },
+        { id: '1', text: 'second queued' },
+      ],
+    };
+    const out = composeLive(state, caps, 0);
+    const firstIdx = out.findIndex((l) => l.includes('> first queued'));
+    const secondIdx = out.findIndex((l) => l.includes('> second queued'));
+    expect(firstIdx).toBeGreaterThanOrEqual(0);
+    expect(secondIdx).toBeGreaterThan(firstIdx);
+  });
+
+  test('empty queue adds no bars', () => {
+    const out = composeLive(startedSession(), caps, 0);
+    expect(out.some((l) => l.includes('queued'))).toBe(false);
+  });
+
+  test('the message being edited is hidden from the queue block (it lifts into the input)', () => {
+    const state: LiveState = {
+      ...startedSession(),
+      queued: [
+        { id: '0', text: 'first queued' },
+        { id: '1', text: 'second queued' },
+      ],
+      editingId: '1',
+    };
+    const out = composeLive(state, caps, 0);
+    expect(out.some((l) => l.includes('> first queued'))).toBe(true);
+    expect(out.some((l) => l.includes('> second queued'))).toBe(false);
+  });
+});

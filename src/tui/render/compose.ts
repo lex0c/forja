@@ -27,6 +27,7 @@ import { renderAssistantChip } from './assistant-chip.ts';
 import { renderAwaitingChip } from './awaiting-chip.ts';
 import { renderFooter } from './footer.ts';
 import { padFrame } from './frame.ts';
+import { renderQueued } from './inbox.ts';
 import { renderInput } from './input.ts';
 import { renderModal } from './modal.ts';
 import { renderReverseSearch } from './reverse-search.ts';
@@ -305,6 +306,17 @@ export const composeLive: ComposeLive = (
   if (state.reverseSearch !== null) {
     appendBlock(renderReverseSearch(state.reverseSearch, caps));
   }
+  // Queued inbox messages (INBOX §6 — in-memory). Input committed while a
+  // turn/playbook is in flight stacks here, just above the typing zone,
+  // in the same inverse-bar style as a submitted message; the next turn
+  // boundary drains the queue. The message being edited (editingId) is
+  // hidden — it's shown in the input instead. Empty → renderQueued
+  // returns [] and the section collapses. Sits in the upper slot (above
+  // the input rule), so it does NOT enter `trailingBelowInput` /
+  // composeCursor math.
+  const visibleQueued =
+    state.editingId === null ? state.queued : state.queued.filter((q) => q.id !== state.editingId);
+  appendBlock(renderQueued(visibleQueued, caps));
   // Always 1 blank line above the input block (rule + input + rule),
   // regardless of whether the upper live region has content. This
   // line ALSO separates the top of the input rule from whatever
@@ -320,7 +332,15 @@ export const composeLive: ComposeLive = (
   // of the indented content's left edge. When the reverse-search
   // overlay is up, the input rows render dim (HISTORY.md §2.2) so
   // the operator's draft is visibly preserved-but-secondary.
-  lines.push(...renderInput(state.input, caps, { dimmed: state.reverseSearch !== null }));
+  lines.push(
+    ...renderInput(state.input, caps, {
+      dimmed: state.reverseSearch !== null,
+      // INBOX §6.1: hint the ↑-to-edit affordance while messages are
+      // queued. renderInput shows it only on an empty buffer, so it
+      // never hides a draft and vanishes the moment the operator types.
+      ...(visibleQueued.length > 0 ? { placeholder: 'Press up to edit queued messages' } : {}),
+    }),
+  );
   lines.push(horizontalRule(caps));
   // Slash autocomplete popover: rendered DIRECTLY below the input's
   // bottom rule, no `padFrame` (rows live at col 0 like the input

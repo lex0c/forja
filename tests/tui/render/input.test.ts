@@ -16,6 +16,28 @@ describe('renderInput', () => {
     expect(renderInput({ value: '', cursor: 0 }, caps)).toEqual(['> ']);
   });
 
+  test('placeholder shows after the prompt on an empty buffer (INBOX §6.1)', () => {
+    expect(
+      renderInput({ value: '', cursor: 0 }, caps, {
+        placeholder: 'Press up to edit queued messages',
+      }),
+    ).toEqual(['> Press up to edit queued messages']);
+  });
+
+  test('placeholder is suppressed once the buffer is non-empty', () => {
+    expect(
+      renderInput({ value: 'hi', cursor: 2 }, caps, { placeholder: 'Press up to edit' }),
+    ).toEqual(['> hi']);
+  });
+
+  test('placeholder is painted dim (affordance, not typed content)', () => {
+    const out = renderInput({ value: '', cursor: 0 }, colored, { placeholder: 'hint' });
+    expect(out).toHaveLength(1);
+    expect(out[0]?.startsWith('> ')).toBe(true);
+    expect(out[0]).toContain('hint');
+    expect(out[0]).toContain(CSI);
+  });
+
   test('single line gets prompt prefix', () => {
     expect(renderInput({ value: 'hello', cursor: 5 }, caps)).toEqual(['> hello']);
   });
