@@ -1319,6 +1319,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     if (editingQueued === null) return;
     editingQueued = null;
     bus.emit({ type: 'inbox:edit-cancel', ts: now() });
+    // If the turn already ended while this message was being edited, the
+    // boundary held it back (drainInbox excludes the edited item) and the
+    // REPL is now idle — no further boundary will fire. Drain now so the
+    // message isn't stranded in the queue forever.
+    if (!isBusy()) queueMicrotask(() => drainInbox());
   };
 
   // INBOX drain (docs/spec/INBOX.md §4.4 / §5.1). FIFO over everything
@@ -2404,6 +2409,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           text: result.submit.text,
         });
         bus.emit({ type: 'input:update', ts: now(), value: '', cursor: 0 });
+        // If the turn ended while editing (the boundary held this message
+        // back), the REPL is idle and no boundary will fire — drain the
+        // just-committed edit now so it's actually sent as the next turn.
+        if (!isBusy()) queueMicrotask(() => drainInbox());
       } else if (isBusy()) {
         const id = String(inboxSeq++);
         inbox.push({ id, text: result.submit.text });

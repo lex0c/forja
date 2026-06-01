@@ -1053,6 +1053,75 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('committing an edit after the turn already ended drains it (no stuck message)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    // Queue the ONLY message, then lift it for editing.
+    stdin.feed('only one\r');
+    await tick();
+    stdin.feed('\x1b[A');
+    await tick();
+    // Turn ends while editing: the boundary holds the edited message back
+    // (nothing else to drain), so the REPL goes idle with it still queued.
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    // Commit while idle — it must drain as a new turn, not sit stuck.
+    stdin.feed(' edited\r');
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('only one edited');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('cancelling an edit after the turn ended drains the original (no stuck message)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    stdin.feed('original msg\r');
+    await tick();
+    stdin.feed('\x1b[A');
+    await tick();
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    // Mangle the draft, then ↓ to cancel — the original drains (idle).
+    stdin.feed(' MANGLED');
+    await tick();
+    stdin.feed('\x1b[B');
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('original msg');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('first Esc during a turn aborts the soft signal (cooperative), NOT the hard one', async () => {
     // Spec UI.md §3 + 1.g.1: first Esc is cooperative — softStopSignal
     // fires so the harness exits at the next step boundary, but the
