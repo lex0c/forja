@@ -1819,13 +1819,38 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
     case 'var':
       return { capabilities: [readFs(REPO)], confidence: 'high' };
     case 'commit':
-    case 'add':
     case 'merge':
     case 'rebase':
     case 'cherry-pick':
+      // These verbs run repository hooks — scripts under `.git/hooks/`
+      // (or wherever `core.hooksPath` points) that execute arbitrary code:
+      //   commit      → pre-commit, prepare-commit-msg, commit-msg, post-commit
+      //   merge       → pre-merge-commit, commit-msg, post-merge
+      //   rebase      → pre-rebase, post-rewrite (and `--exec <cmd>` runs <cmd>)
+      //   cherry-pick → the commit hooks, per replayed commit
+      // A repo that ships an installed hook executes that code on a bare
+      // `git commit -m x`, so the honest capability is `exec:arbitrary`,
+      // NOT a repo-confined `git-write` — under autonomous this MUST keep
+      // the modal (exec:arbitrary is never repo-confined). The git-write +
+      // read-fs caps still ride along so the engine's §11 floors stay
+      // honest about the metadata write. `--no-verify` is NOT a safe
+      // downgrade: it bypasses ONLY pre-commit and commit-msg —
+      // prepare-commit-msg and post-commit still run — so honoring it would
+      // re-open the hole for a post-commit hook. (`git -c core.hooksPath=…`
+      // is refused upstream, so there is no "hooks proven absent" path to
+      // model here.)
+      return {
+        capabilities: [exec('arbitrary'), gitWrite(REPO), readFs(REPO)],
+        confidence: 'high',
+      };
+    case 'add':
     case 'stash':
     case 'tag':
     case 'reset':
+      // Pure git-writes with NO hook surface: git has no pre-add / tag /
+      // reset hook, and `git stash` writes its commits through plumbing
+      // (`commit-tree`/`update-ref`) that bypasses the commit hooks. These
+      // stay repo-confined `git-write` → auto-approvable under autonomous.
       return { capabilities: [gitWrite(REPO), readFs(REPO)], confidence: 'high' };
     case 'push':
     case 'pull':

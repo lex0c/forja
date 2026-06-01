@@ -239,9 +239,41 @@ describe('approval posture (Supervised / Autonomous)', () => {
   });
 
   test('autonomous auto-approves a local git-write (operator opted in)', () => {
+    // git-writes with NO hook surface (add / tag / stash / reset) — NOT
+    // `commit`, which runs repository hooks (see the hook-running test
+    // below). `git tag` writes a ref with no hook.
     const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
-    const d = eng.check('bash', 'bash', { command: 'git add -A && git commit -m wip' });
+    const d = eng.check('bash', 'bash', { command: 'git add -A && git tag wip' });
     expect(d.kind).toBe('allow');
+  });
+
+  test('autonomous does NOT auto-approve git commit/merge/rebase/cherry-pick (run repo hooks)', () => {
+    // `git commit` (and merge / rebase / cherry-pick) run repository hooks
+    // — scripts under `.git/hooks/` that execute arbitrary code (pre-commit,
+    // prepare-commit-msg, commit-msg, post-commit, …). A repo with an
+    // installed hook would run that code on a bare `git commit`, so the
+    // resolver models these as exec:arbitrary (not a repo-confined
+    // git-write) and the modal must stay. `--no-verify` is NOT a downgrade:
+    // it bypasses only pre-commit + commit-msg; post-commit still runs.
+    //
+    // Tested under an explicit `allow: git*` so the policy itself permits
+    // the command — this pins that the AUTONOMOUS capability-confinement
+    // (not just default-deny) is what withholds the auto-approval. add /
+    // tag stay auto-approved (the git-write test above).
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git*'] } } }), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+    });
+    for (const command of [
+      'git add -A && git commit -m wip',
+      'git commit --no-verify -m wip',
+      'git merge feature',
+      'git rebase main',
+      'git cherry-pick abc123',
+    ]) {
+      const d = eng.check('bash', 'bash', { command });
+      expect(d.kind).toBe('confirm');
+    }
   });
 
   test('autonomous does NOT auto-approve a conservative/dynamic-dataflow loop (caps are best-effort)', () => {

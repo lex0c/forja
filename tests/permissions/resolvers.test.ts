@@ -5705,6 +5705,34 @@ describe('bash resolver — effect-based git read verbs / find-exec / awk / sed 
       expect(caps(c)).not.toContain('exec:arbitrary');
     }
   });
+  test('git commit / merge / rebase / cherry-pick run repo hooks → exec:arbitrary', () => {
+    // Repository hooks under .git/hooks (pre-commit, prepare-commit-msg,
+    // commit-msg, post-commit, pre-merge-commit, pre-rebase, …) execute
+    // arbitrary code on these verbs. `--no-verify` is NOT a safe downgrade
+    // (it bypasses only pre-commit + commit-msg; post-commit still runs),
+    // so the exec:arbitrary cap stays. git-write + read-fs ride along.
+    for (const c of [
+      'git commit -m wip',
+      'git commit --no-verify -m wip',
+      'git merge feature',
+      'git rebase main',
+      'git cherry-pick abc123',
+    ]) {
+      const s = caps(c);
+      expect(s).toContain('exec:arbitrary');
+      expect(s.some((x) => x.startsWith('git-write'))).toBe(true);
+    }
+  });
+  test('git add / tag / stash / reset have no hook surface → git-write, not exec:arbitrary', () => {
+    // Pure git-writes: no pre-add/tag/reset hook, and stash writes via
+    // plumbing that bypasses commit hooks. These stay repo-confined so
+    // autonomous can still auto-approve them.
+    for (const c of ['git add -A', 'git tag v1', 'git stash', 'git reset --hard']) {
+      const s = caps(c);
+      expect(s.some((x) => x.startsWith('git-write'))).toBe(true);
+      expect(s).not.toContain('exec:arbitrary');
+    }
+  });
   test('find symlink-following (-L / -H / -follow) → exec:arbitrary (escapes lexical roots)', () => {
     for (const c of [
       'find -L . -type f -exec rm {} +',
