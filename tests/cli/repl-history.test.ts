@@ -470,6 +470,44 @@ describe('repl — reverse-search overlay (HISTORY.md §2.2)', () => {
     await promise;
   });
 
+  test('a recalled slash command accepted while busy is staged, not enqueued as model text', async () => {
+    appendHistory(db, PROJECT_CWD, '/help', { ts: 1 });
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStubWithDb(db),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    // Turn 1 running (busy).
+    stdin.feed('go\r');
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    // Reverse-search to the "/help" entry and accept it WHILE busy.
+    stdin.feed(CTRL_R);
+    await tick();
+    stdin.feed('help');
+    await tick();
+    stdin.feed('\r');
+    await tick();
+    // A slash command must NOT be enqueued (it would drain to the model as
+    // text). It's staged instead — the boundary yields no new turn.
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    // Clear the staged "/help" so Ctrl+D (EOF) exits cleanly.
+    stdin.feed('\x7f'.repeat('/help'.length));
+    await tick();
+    stdin.feed('\x04');
+    await promise;
+  });
+
   test('Ctrl+R is blocked while editing a queued message (cannot strand it)', async () => {
     appendHistory(db, PROJECT_CWD, 'some history entry', { ts: 1 });
 

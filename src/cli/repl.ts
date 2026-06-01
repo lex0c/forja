@@ -1951,11 +1951,19 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           const match = currentReverseSearchMatch();
           if (match === null) return true;
           if (isBusy()) {
-            // A turn/playbook is in flight — enqueue the recalled match
-            // into the inbox (same path as a normal busy submit) so it
-            // drains at the next boundary, instead of just staging it in
-            // the buffer and forcing the operator to press Enter again.
-            enqueueInbox(match);
+            // A turn/playbook is in flight. A plain match enqueues into the
+            // inbox (same path as a normal busy submit) so it drains at the
+            // next boundary. A slash-looking match (slash commands are in
+            // history too) is STAGED in the buffer instead — enqueuing it
+            // would drain the command to the model as plain text; staging
+            // lets the operator's next Enter route it through the slash
+            // dispatcher, preserving command semantics (the pre-inbox
+            // behavior for recalled slash commands).
+            if (parseSlashInput(match) !== null) {
+              bus.emit({ type: 'input:update', ts: now(), value: match, cursor: match.length });
+            } else {
+              enqueueInbox(match);
+            }
             closeReverseSearch();
             cancelExitArm();
             return true;
