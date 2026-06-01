@@ -970,6 +970,18 @@ const FIND_VALUE_FLAGS: ReadonlySet<string> = new Set([
 ]);
 
 const cmdFind: CommandResolver = (_positional, tokens, ctx) => {
+  // Symlink-following (`-L` / `-H` / `-follow`) makes find descend into
+  // symlinked directories (or follow a symlinked root), so ANY effect can
+  // resolve OUTSIDE the lexical roots: `find -L . -type f -exec rm {} +`
+  // (or `find -L . -delete`) deletes outside-repo files reached through a
+  // symlink while the root-scoped caps below would say only
+  // `delete-fs:<cwd>` and look repo-confined. The lexical roots can't bound
+  // a symlink-following walk, so treat it as a possible workspace escape:
+  // exec:arbitrary (fail-closed; never repo-confined). Default `-P` (no
+  // follow) keeps the precise root-scoped classification below.
+  if (tokens.some((t) => t === '-L' || t === '-H' || t === '-follow')) {
+    return { capabilities: [exec('arbitrary'), readFs(ctx.cwd)], confidence: 'medium' };
+  }
   const execIdxs: number[] = [];
   for (let i = 0; i < tokens.length; i += 1) {
     const t = tokens[i];
@@ -1699,13 +1711,57 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
     return { capabilities: [readFs(REPO)], confidence: 'high' };
   }
   switch (sub) {
+    case 'grep': {
+      // `git grep` is read-only EXCEPT for the pager-opening flags
+      // `-O[<pager>]` / `--open-files-in-pager[=<pager>]`: git runs the
+      // pager AS A COMMAND (`git grep --open-files-in-pager='sh -c …'`
+      // executes the shell; even the default pager `less` shells out via
+      // `!cmd`). Decode the flag → exec:arbitrary; otherwise read tracked
+      // files. Closes the bypass where a `git *` allow rule + the read-fs
+      // classification auto-approved arbitrary exec under autonomous.
+      if (
+        tokens.some(
+          (t) =>
+            t.startsWith('-O') ||
+            t === '--open-files-in-pager' ||
+            t.startsWith('--open-files-in-pager='),
+        )
+      ) {
+        return { capabilities: [exec('arbitrary'), readFs(REPO)], confidence: 'medium' };
+      }
+      return { capabilities: [readFs(REPO)], confidence: 'high' };
+    }
+    case 'config': {
+      // `git config <key> <value>` WRITES config and can plant an exec hook
+      // (`core.pager` / `core.sshCommand` / `core.editor` / `*.cmd` /
+      // `alias.*`) that a later git command runs. Only explicit read forms
+      // (`--get*` / `--list` / `-l` / `--name-only`) or a bare single-key
+      // get (`git config <key>`) stay read-fs; any mutation →
+      // exec:arbitrary (fail-closed — no exec-key denylist to drift on).
+      const configRead =
+        tokens.some(
+          (t) =>
+            t === '-l' ||
+            t === '--list' ||
+            t === '--name-only' ||
+            t === '--get' ||
+            t === '--get-all' ||
+            t === '--get-regexp' ||
+            t === '--get-urlmatch' ||
+            t === '--get-color' ||
+            t === '--get-colorbool',
+        ) || positional.length <= 2; // ['config'] or ['config', <key>] — a get
+      if (configRead) {
+        return { capabilities: [readFs(REPO)], confidence: 'high' };
+      }
+      return { capabilities: [exec('arbitrary'), readFs(REPO)], confidence: 'medium' };
+    }
     case 'status':
     case 'log':
     case 'diff':
     case 'show':
     case 'blame':
     case 'rev-parse':
-    case 'config':
     case 'remote':
     // Read-only, local (non-network) plumbing/porcelain verbs. Pre-slice
     // these fell through to the `default` branch and got stamped
@@ -1714,7 +1770,8 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
     // gated even under autonomous. They touch only the repo, never the
     // network. (`ls-remote`/`fetch`/`pull`/`push`/`clone` are network and
     // stay out of this set; `branch`/`tag`/`reflog` can mutate and stay in
-    // the write/default branches.)
+    // the write/default branches. `grep` and `config` have their own
+    // cases above — pager-exec / config-write escape hatches.)
     case 'shortlog':
     case 'describe':
     case 'ls-files':
@@ -1728,7 +1785,6 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
     case 'merge-base':
     case 'cherry':
     case 'count-objects':
-    case 'grep':
     case 'annotate':
     case 'var':
       return { capabilities: [readFs(REPO)], confidence: 'high' };

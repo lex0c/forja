@@ -5608,6 +5608,40 @@ describe('bash resolver — effect-based git read verbs / find-exec / awk / sed 
   test('git push still carries net-egress', () => {
     expect(caps('git push origin main').some((c) => c.startsWith('net-egress'))).toBe(true);
   });
+  test('git grep -O / --open-files-in-pager runs the pager → exec:arbitrary', () => {
+    for (const c of [
+      "git grep --open-files-in-pager='sh -c x' hi",
+      'git grep -Oless foo',
+      'git grep -O foo',
+    ]) {
+      expect(caps(c)).toContain('exec:arbitrary');
+    }
+  });
+  test('plain git grep stays read-only', () => {
+    const s = caps('git grep foo');
+    expect(s.some((x) => x.startsWith('read-fs'))).toBe(true);
+    expect(s).not.toContain('exec:arbitrary');
+  });
+  test('git config set-form (can plant a core.pager/sshCommand exec hook) → exec:arbitrary', () => {
+    for (const c of ["git config core.pager 'sh -c x'", 'git config user.name Bob']) {
+      expect(caps(c)).toContain('exec:arbitrary');
+    }
+  });
+  test('git config read-form (--get / --list / bare key) stays read-only', () => {
+    for (const c of ['git config --get user.name', 'git config user.name', 'git config --list']) {
+      expect(caps(c)).not.toContain('exec:arbitrary');
+    }
+  });
+  test('find symlink-following (-L / -H / -follow) → exec:arbitrary (escapes lexical roots)', () => {
+    for (const c of [
+      'find -L . -type f -exec rm {} +',
+      'find -L . -delete',
+      'find -H . -exec rm {} +',
+      'find -L . -name x',
+    ]) {
+      expect(caps(c)).toContain('exec:arbitrary');
+    }
+  });
 
   // find -exec classified by inner command.
   test('find -exec wc → read-fs(roots), not exec:arbitrary', () => {
@@ -5643,8 +5677,11 @@ describe('bash resolver — effect-based git read verbs / find-exec / awk / sed 
       resolveCapabilities('bash', { command: 'find / -exec cat {} + -delete' }, CTX).kind,
     ).toBe('refuse');
   });
-  test('find -L <outside root> -exec read → captures the real outside root (not cwd)', () => {
-    expect(caps('find -L /etc -exec cat {} +')).toContain('read-fs:/etc');
+  test('find -L (symlink-following) → exec:arbitrary, never repo-confined (escape guard)', () => {
+    // Superseded the earlier "captures /etc as a read root" assertion: any
+    // `-L`/`-H`/`-follow` find can resolve outside the lexical roots via a
+    // symlink, so it is treated as a workspace escape regardless of root.
+    expect(caps('find -L /etc -exec cat {} +')).toContain('exec:arbitrary');
   });
   test('sed -i with a separate BSD suffix (-i / -i .bak) → exec:arbitrary (script position ambiguous)', () => {
     for (const c of ["sed -i '' 's/a/b/e' file", "sed -i .bak 's/a/b/e' file"]) {

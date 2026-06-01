@@ -2,6 +2,16 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-01] permissions — close resolver exec-escape holes: git grep pager, git config write, find -L symlink
+
+Operator review of the effect-based resolver (the autonomous capability-confinement relies on the caps being a complete picture of the effect) found three GTFOBins-style escapes that were classified as read/repo-confined and thus auto-approvable under a `git *`/`find *` allow + autonomous:
+
+1. **`git grep -O`/`--open-files-in-pager[=<pager>]`** — git runs the pager AS A COMMAND (`git grep --open-files-in-pager='sh -c …'` execs the shell; even default `less` shells out via `!cmd`). The `grep` verb was classified `read-fs(repo)`. Fix: dedicated `case 'grep'` decodes the flag → `exec:arbitrary`; plain `git grep` stays read-fs.
+2. **`git config <key> <value>` (set form)** — adjacent finding (same class, pre-existing): `git config core.pager 'sh -c …'` (or `core.sshCommand`/`alias.*`) plants an exec hook a later git command runs; `config` was unconditionally `read-fs`. Fix: dedicated `case 'config'` — only read forms (`--get*`/`--list`/`-l`/`--name-only` or a bare-key get) stay read-fs; any mutation → `exec:arbitrary` (fail-closed, no exec-key denylist to drift on).
+3. **`find -L`/`-H`/`-follow` (symlink-following)** — GNU find descends into symlinked dirs, so the inner command runs on paths OUTSIDE the lexical roots (`find -L . -exec rm {} +` / `find -L . -delete` deletes an outside-repo file via a symlink) while the root-scoped caps said only `delete-fs:<cwd>`. Fix: a symlink-following flag → `exec:arbitrary` at the TOP of `cmdFind`, before root classification (a workspace escape the lexical roots can't bound). Default `-P` keeps the precise root-scoped classification.
+
+All three verified AUTO→GATE by scratch (and the legit forms — plain `git grep`, `git config --get`, `find . -exec wc` — stay AUTO). Tests: 5 new adversarial cases in `resolvers.test.ts`; the earlier "find -L captures /etc root" test (a prior-review edge) was superseded by the blanket symlink-follow gate and updated. Spec synced: `SECURITY_GUIDELINE`-adjacent rows in `SECURITY.md §3.2` + `PERMISSION_ENGINE.md §5.2` (git escape hatches + find symlink-follow). typecheck + Biome clean; `tests/permissions/resolvers.test.ts` 730 pass. No commit (awaiting operator review).
+
 ## [2026-06-01] permissions — extend the sensitive-path deny-list (mobile / k8s / SA / tokens)
 
 **Why.** Operator asked whether every secret file is excluded from the LLM's view. It is NOT exhaustive — `SENSITIVE_PATH_DENY_LIST` is a curated name-shape denylist (engine-floor, un-overridable, fires on fs-tool reads + subagent worktree filter + checkpoint tree). Verified the actual coverage with `matchSensitivePath`: strong for classic web/cloud/SSH secrets, but **mobile signing/config was entirely uncovered**, plus `.kube/config`, `.docker/config.json` (only legacy `.dockercfg` was listed), GCP/Firebase service-account JSON (the `**/credentials*.json` prefix missed suffix forms), and `*.jwt`/`*.ovpn`.
