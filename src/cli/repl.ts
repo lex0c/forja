@@ -1312,6 +1312,18 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       });
   };
 
+  // Enqueue a message into the in-memory inbox (INBOX §4.1): mint an id,
+  // append it, record it to history, and emit `inbox:queued` (which adds
+  // the pending bar and clears the input). Shared by the normal busy
+  // submit path and the busy reverse-search submit so both drain at the
+  // next boundary identically.
+  const enqueueInbox = (text: string): void => {
+    const id = String(inboxSeq++);
+    inbox.push({ id, text });
+    recordHistorySubmit(text);
+    bus.emit({ type: 'inbox:queued', ts: now(), id, text });
+  };
+
   // End an in-progress ↑ edit, leaving the queued message unchanged (it
   // never left the queue). Used by ↓, Esc, and when the operator pivots
   // into a slash command / the ? shortcut. No-op when not editing.
@@ -1920,11 +1932,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           const match = currentReverseSearchMatch();
           if (match === null) return true;
           if (isBusy()) {
-            // Mid-turn protection: same gate the normal Enter path
-            // honors (`!isBusy()`). Operator gets the recalled buffer
-            // staged but no submit until the turn OR playbook ends.
-            bus.emit({ type: 'input:update', ts: now(), value: match, cursor: match.length });
+            // A turn/playbook is in flight — enqueue the recalled match
+            // into the inbox (same path as a normal busy submit) so it
+            // drains at the next boundary, instead of just staging it in
+            // the buffer and forcing the operator to press Enter again.
+            enqueueInbox(match);
             closeReverseSearch();
+            cancelExitArm();
             return true;
           }
           bus.emit({ type: 'input:update', ts: now(), value: match, cursor: match.length });
@@ -2431,10 +2445,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // just-committed edit now so it's actually sent as the next turn.
         if (!isBusy()) queueMicrotask(() => drainInbox());
       } else if (isBusy()) {
-        const id = String(inboxSeq++);
-        inbox.push({ id, text: result.submit.text });
-        recordHistorySubmit(result.submit.text);
-        bus.emit({ type: 'inbox:queued', ts: now(), id, text: result.submit.text });
+        enqueueInbox(result.submit.text);
       } else {
         bus.emit({ type: 'user:submit', ts: now(), text: result.submit.text });
         recordHistorySubmit(result.submit.text);

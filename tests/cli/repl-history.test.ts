@@ -431,6 +431,45 @@ describe('repl — reverse-search overlay (HISTORY.md §2.2)', () => {
     await promise;
   });
 
+  test('Enter on a match while busy enqueues it into the inbox (drains at the boundary)', async () => {
+    appendHistory(db, PROJECT_CWD, 'recall this one', { ts: 1 });
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStubWithDb(db),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    // Start a turn so the REPL is busy.
+    stdin.feed('go\r');
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    // Reverse-search to a match and press Enter WHILE busy.
+    stdin.feed(CTRL_R);
+    await tick();
+    stdin.feed('recall');
+    await tick();
+    stdin.feed('\r');
+    await tick();
+    // Not a 2nd run — it's queued into the inbox, not just staged.
+    expect(ra.captured).toHaveLength(1);
+    // Boundary: the queued match drains as the next turn.
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('recall this one');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    await promise;
+  });
+
   test('Esc cancels overlay without changing the buffer', async () => {
     appendHistory(db, PROJECT_CWD, 'recallable', { ts: 1 });
 
