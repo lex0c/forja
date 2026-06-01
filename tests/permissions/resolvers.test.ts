@@ -3291,11 +3291,14 @@ describe('bash resolver — slice 176 symlink-bypass detection (command-bypass P
     }
   });
 
-  test('redirect target via symlink to /etc/passwd escalates (not refuses)', () => {
-    // /etc is the escalate tier for writes: confidence drops to low
-    // but the call still resolves to ok. Operator's modal sees the
-    // raw command and confirms. Documents the difference vs. /proc
-    // (deny → refuse).
+  test('redirect target via symlink to /etc/passwd routes to Conservative (not refuses)', () => {
+    // The redirect target `<cwd>/safe-output.txt` is lexically inside cwd
+    // but its realpath is /etc/passwd — both escalate-tier (a write to
+    // /etc) AND a cwd-scope escape. The emitted cap is the LEXICAL
+    // `write-fs:<cwd>/safe-output.txt`, which the engine's autonomous
+    // capability-confinement would read as repo-confined; only Conservative
+    // (not ok/low) keeps the modal there. Distinct from /proc (deny →
+    // refuse): /etc is confirmable, /proc is a hard deny.
     const ctxWithRealpath: ResolverContext = {
       cwd: '/work/proj',
       home: '/home/op',
@@ -3308,9 +3311,9 @@ describe('bash resolver — slice 176 symlink-bypass detection (command-bypass P
       { command: 'echo data > safe-output.txt' },
       ctxWithRealpath,
     );
-    expect(r.kind).toBe('ok');
-    if (r.kind === 'ok') {
-      expect(r.confidence).toBe('low');
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
     }
   });
 
@@ -3491,10 +3494,21 @@ describe('bash resolver — M3 realpath degrade visibility', () => {
 // protected-path classifier returns null for both ends, so slice 176
 // doesn't refuse or escalate. But a `<cwd>/**` glob policy authorizes
 // the lexical capability while the kernel follows the symlink to a
-// target the operator never scoped. Defense: degrade confidence to
-// low so the engine forces confirm.
+// target the operator never scoped.
+//
+// Defense (strengthened): route the result to Conservative, NOT merely
+// low confidence. The emitted cap is the lexical `<cwd>/link`, so the
+// engine's autonomous capability-confinement (lexical
+// `startsWithSegment`) reads it as repo-confined and would auto-approve
+// `ok/low` without a modal — the resolver's realpath escape signal was
+// being discarded at the engine layer. `kind: conservative` is the one
+// channel the autonomous auto-approval gate (keyed on `kind === 'ok'`)
+// respects: it keeps the modal. Supervised is unchanged — Conservative
+// and `ok/low` both force confirm there. The non-escape cases below
+// stay `ok` (high confidence) so legitimate in-cwd symlinks still
+// auto-approve.
 describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', () => {
-  test('read of /work/proj/data/x → /tmp/exfil drops confidence to low', () => {
+  test('read of /work/proj/data/x → /tmp/exfil routes to Conservative', () => {
     const ctxWithRealpath: ResolverContext = {
       cwd: '/work/proj',
       home: '/home/op',
@@ -3504,13 +3518,13 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
       },
     };
     const r = resolveCapabilities('bash', { command: 'cat data/x' }, ctxWithRealpath);
-    expect(r.kind).toBe('ok');
-    if (r.kind === 'ok') {
-      expect(r.confidence).toBe('low');
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
     }
   });
 
-  test('write redirect /work/proj/log → /tmp/leak drops confidence to low', () => {
+  test('write redirect /work/proj/log → /tmp/leak routes to Conservative', () => {
     const ctxWithRealpath: ResolverContext = {
       cwd: '/work/proj',
       home: '/home/op',
@@ -3520,13 +3534,13 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
       },
     };
     const r = resolveCapabilities('bash', { command: 'echo data > log' }, ctxWithRealpath);
-    expect(r.kind).toBe('ok');
-    if (r.kind === 'ok') {
-      expect(r.confidence).toBe('low');
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
     }
   });
 
-  test('input redirect via cwd-escape symlink drops confidence to low', () => {
+  test('input redirect via cwd-escape symlink routes to Conservative', () => {
     const ctxWithRealpath: ResolverContext = {
       cwd: '/work/proj',
       home: '/home/op',
@@ -3536,9 +3550,9 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
       },
     };
     const r = resolveCapabilities('bash', { command: 'cat < source' }, ctxWithRealpath);
-    expect(r.kind).toBe('ok');
-    if (r.kind === 'ok') {
-      expect(r.confidence).toBe('low');
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
     }
   });
 
@@ -3564,7 +3578,7 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
     }
   });
 
-  test('parent-dir symlink that escapes cwd via parent realpath fallback drops to low', () => {
+  test('parent-dir symlink that escapes cwd via parent realpath fallback routes to Conservative', () => {
     // Leaf doesn't exist, parent is a symlink to an external path.
     // Mirrors the slice-176 deny-tier fallback shape but the target
     // isn't a protected zone — it's just outside cwd.
@@ -3583,13 +3597,13 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
       { command: 'echo data > cwd_alias/new.txt' },
       ctxWithRealpath,
     );
-    expect(r.kind).toBe('ok');
-    if (r.kind === 'ok') {
-      expect(r.confidence).toBe('low');
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
     }
   });
 
-  test('dangling symlink leaf with absolute outside-cwd target drops to low', () => {
+  test('dangling symlink leaf with absolute outside-cwd target routes to Conservative', () => {
     // /work/proj/outlink → /tmp/exfil where /tmp/exfil was removed
     // (dangling symlink). Pre-fix the parent-realpath fallback
     // collapsed canonical to /work/proj/outlink === lexicalAbs and
@@ -3615,13 +3629,13 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
       },
     };
     const r = resolveCapabilities('bash', { command: 'cat outlink' }, ctxWithRealpath);
-    expect(r.kind).toBe('ok');
-    if (r.kind === 'ok') {
-      expect(r.confidence).toBe('low');
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
     }
   });
 
-  test('dangling symlink on write redirect with absolute target drops to low', () => {
+  test('dangling symlink on write redirect with absolute target routes to Conservative', () => {
     // Same shape but on a write redirect (`> outlink`). The kernel
     // creates the file at the symlink target /tmp/x even though
     // /tmp/x didn't exist when the symlink was made — defense must
@@ -3643,9 +3657,9 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
       },
     };
     const r = resolveCapabilities('bash', { command: 'echo data > outlink' }, ctxWithRealpath);
-    expect(r.kind).toBe('ok');
-    if (r.kind === 'ok') {
-      expect(r.confidence).toBe('low');
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
     }
   });
 
@@ -3676,7 +3690,7 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
     }
   });
 
-  test('dangling symlink with RELATIVE target that escapes cwd drops to low', () => {
+  test('dangling symlink with RELATIVE target that escapes cwd routes to Conservative', () => {
     // /work/proj/exfil-link → ../../../tmp/x — relative target
     // walks up past cwd. Resolved against the symlink's parent dir,
     // canonicalizes outside cwd; detector fires.
@@ -3697,9 +3711,9 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
       },
     };
     const r = resolveCapabilities('bash', { command: 'cat exfil-link' }, ctxWithRealpath);
-    expect(r.kind).toBe('ok');
-    if (r.kind === 'ok') {
-      expect(r.confidence).toBe('low');
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
     }
   });
 
@@ -3728,9 +3742,9 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
       },
     };
     const r = resolveCapabilities('bash', { command: 'cat out' }, ctxWithRealpath);
-    expect(r.kind).toBe('ok');
-    if (r.kind === 'ok') {
-      expect(r.confidence).toBe('low');
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
     }
   });
 
@@ -3790,9 +3804,9 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
       },
     };
     const r = resolveCapabilities('bash', { command: 'cat alias/out' }, ctxWithRealpath);
-    expect(r.kind).toBe('ok');
-    if (r.kind === 'ok') {
-      expect(r.confidence).toBe('low');
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
     }
   });
 
@@ -3850,9 +3864,9 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
       },
     };
     const r = resolveCapabilities('bash', { command: 'cat data/out' }, ctxWithRealpath);
-    expect(r.kind).toBe('ok');
-    if (r.kind === 'ok') {
-      expect(r.confidence).toBe('low');
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
     }
   });
 
@@ -3882,6 +3896,52 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
     if (r.kind === 'ok') {
       expect(r.confidence).toBe('high');
     }
+  });
+
+  // Orphan redirects: a standalone `> target` in a list, attached to NO
+  // command (`cat x; > escape`, `cmd && > escape`). analyzeCommand never
+  // sees these — classifyRedirects handles them in the resolver body — so
+  // the per-command cwd-escape guard does not cover them. With a real
+  // command present and a non-soft list, the result is `kind: ok`; without
+  // the orphan-path guard the lexical `write-fs:<cwd>/escape` cap reads as
+  // repo-confined and auto-approves under autonomous, writing through the
+  // symlink to the external target.
+  test('orphan redirect `cat x; > escape` via cwd-escape symlink routes to Conservative', () => {
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => (p === '/work/proj/escape' ? '/tmp/secret' : p),
+    };
+    const r = resolveCapabilities('bash', { command: 'cat x; > escape' }, ctxWithRealpath);
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
+    }
+  });
+
+  test('orphan redirect `cat x && > escape` via cwd-escape symlink routes to Conservative', () => {
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => (p === '/work/proj/escape' ? '/tmp/secret' : p),
+    };
+    const r = resolveCapabilities('bash', { command: 'cat x && > escape' }, ctxWithRealpath);
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
+    }
+  });
+
+  test('orphan redirect `cat x; > inrepo` with NO escape stays ok (no over-block)', () => {
+    // Same shape, in-cwd target (no symlink): the guard must fire ONLY on a
+    // genuine escape, never blanket-confirm every orphan redirect.
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => p,
+    };
+    const r = resolveCapabilities('bash', { command: 'cat x; > inrepo' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
   });
 });
 

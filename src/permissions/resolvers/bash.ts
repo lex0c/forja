@@ -4388,9 +4388,17 @@ const detectCwdScopeEscape = (lexicalAbs: string, ctx: ResolverContext): boolean
 const classifyRedirects = (
   redirects: readonly RedirectShape[],
   ctx: ResolverContext,
-): { refuse: string } | { caps: Capability[]; escalated: boolean } => {
+): { refuse: string } | { caps: Capability[]; escalated: boolean; cwdEscaped: boolean } => {
   const caps: Capability[] = [];
   let escalated = false;
+  // A cwd-scope escape (lexical-inside-cwd path whose canonical realpath
+  // lands OUTSIDE cwd) is tracked SEPARATELY from escalate-tier: it routes
+  // the result to Conservative, not just low confidence. The emitted cap is
+  // still the lexical `<cwd>/link`, so the engine's autonomous
+  // capability-confinement (lexical `startsWithSegment`) would otherwise
+  // read it as repo-confined and auto-approve a read/write that actually
+  // resolves outside the repo.
+  let cwdEscaped = false;
   for (const r of redirects) {
     if (r.kind === 'out' || r.kind === 'append' || r.kind === 'both' || r.kind === 'force-out') {
       const tgtAbs = resolvePath(ctx.cwd, expandTilde(r.target, ctx.home));
@@ -4399,7 +4407,7 @@ const classifyRedirects = (
         return { refuse: `bash: redirect target '${r.target}' is in protected zone (deny tier)` };
       }
       if (tier === 'escalate') escalated = true;
-      if (detectCwdScopeEscape(tgtAbs, ctx)) escalated = true;
+      if (detectCwdScopeEscape(tgtAbs, ctx)) cwdEscaped = true;
       caps.push(writeFs(tgtAbs));
     }
     // Input redirects `<` ALSO pass through the classifier (op='read' →
@@ -4413,11 +4421,11 @@ const classifyRedirects = (
           refuse: `bash: input redirect source '${r.target}' is in protected zone (deny tier)`,
         };
       }
-      if (detectCwdScopeEscape(tgtAbs, ctx)) escalated = true;
+      if (detectCwdScopeEscape(tgtAbs, ctx)) cwdEscaped = true;
       caps.push(readFs(tgtAbs));
     }
   }
-  return { caps, escalated };
+  return { caps, escalated, cwdEscaped };
 };
 
 const analyzeCommand = (
@@ -4519,6 +4527,9 @@ const analyzeCommand = (
     return value.length > 0 ? value : null;
   };
   let escalated = false;
+  // cwd-scope escape (symlink resolving outside cwd) — tracked separately
+  // from escalate-tier so it can route to Conservative (see the return).
+  let cwdEscaped = false;
   // Operand caps for the registry-miss (Conservative) branch. The per-arg
   // loop classifies escalate-tier positional paths but the unknown-command
   // branch returned only redirect caps — so under mode:bypass (where the
@@ -4600,8 +4611,11 @@ const analyzeCommand = (
         // but canonical outside means a glob policy like
         // `<cwd>/**` would authorize lexically while the kernel
         // follows the symlink to whatever target the operator
-        // never scoped. Degrade confidence to force confirm.
-        if (detectCwdScopeEscape(abs, ctx)) escalated = true;
+        // never scoped. Route to Conservative (see the return) — NOT
+        // merely low confidence — so the autonomous auto-approval gate
+        // (keyed on resolver `kind: ok`) keeps the modal; a lexical
+        // `<cwd>/link` cap alone reads as repo-confined at the engine.
+        if (detectCwdScopeEscape(abs, ctx)) cwdEscaped = true;
       }
     }
   }
@@ -4645,6 +4659,23 @@ const analyzeCommand = (
   if ('refuse' in result) return { refuse: result.refuse };
   let finalConf: 'high' | 'medium' | 'low' = result.confidence;
   if (escalated || redir.escalated) finalConf = 'low';
+
+  // A cwd-scope escape (a lexical-inside-cwd path whose canonical realpath
+  // lands outside cwd, via a symlink) routes to Conservative — NOT merely
+  // low confidence. The emitted cap is still the lexical `<cwd>/link`, so
+  // the engine's autonomous capability-confinement (lexical
+  // `startsWithSegment`) would read it as repo-confined; only the resolver
+  // `kind` distinguishes it. `conservative` flips the aggregate to
+  // `kind: conservative`, which the autonomous auto-approval gate (keyed on
+  // `kind === 'ok'`) rejects — re-arming the modal. Glob-low
+  // (`wc -l src/**/*.ts`) keeps `kind: ok` and still auto-approves.
+  if (cwdEscaped || redir.cwdEscaped) {
+    return {
+      caps: [...result.capabilities, ...redir.caps],
+      confidence: 'low',
+      conservative: 'cwd-scope escape: a path resolves outside the cwd via a symlink',
+    };
+  }
 
   return {
     caps: [...result.capabilities, ...redir.caps],
@@ -4785,6 +4816,25 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
     else if (result.confidence === 'medium' && aggregateConf === 'high') aggregateConf = 'medium';
   }
 
+  // An ORPHAN redirect — one not attached to any command, e.g. the
+  // `> escape` in `cat x; > escape`, `cmd && > escape`, `true; > escape`
+  // — is classified above (classifyRedirects) but its escape/escalate
+  // signal is NOT folded into any command's result. A cwd-scope symlink
+  // escape on such a redirect (`<cwd>/escape → /tmp/secret`) emits a
+  // LEXICAL `write-fs:<cwd>/escape` cap that the engine's autonomous
+  // capability-confinement reads as repo-confined — so it MUST route to
+  // Conservative HERE, exactly like the per-command path, or the modal is
+  // cleared on a write that lands outside the repo. (The per-command
+  // analyzeCommand path catches ATTACHED redirects; this is the only place
+  // an orphan redirect's escape is visible.)
+  if (orphanRedir.cwdEscaped) {
+    return {
+      kind: 'conservative',
+      capabilities: allCaps,
+      reason: 'bash: cwd-scope escape: a redirect target resolves outside the cwd via a symlink',
+    };
+  }
+
   // A soft-unmodeled wrapper (control flow / value expansion) OR a
   // registry-miss command → Conservative (forces confirm), per
   // PERMISSION_ENGINE.md §5.2. Caps are the honest aggregate of the
@@ -4798,7 +4848,13 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
         : `bash: ${walk.softReason ?? 'unmodeled shape (control flow / value expansion)'} → confirm`;
     return { kind: 'conservative', capabilities: allCaps, reason };
   }
-  return { kind: 'ok', capabilities: allCaps, confidence: aggregateConf };
+  // An escalate-tier orphan redirect target (`cat x; > /etc/foo`) degrades
+  // confidence like the per-command escalate path. The lexical cap already
+  // carries the protected zone (the engine floors catch it), so this only
+  // keeps the modal honest under supervised — but mirrors the per-command
+  // `escalated → low` so the two redirect paths don't diverge.
+  const finalAgg: 'high' | 'medium' | 'low' = orphanRedir.escalated ? 'low' : aggregateConf;
+  return { kind: 'ok', capabilities: allCaps, confidence: finalAgg };
 };
 
 // Top-level simple-command texts of a bash command, for the engine's

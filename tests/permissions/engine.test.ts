@@ -1,4 +1,7 @@
 import { beforeAll, describe, expect, test } from 'bun:test';
+import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { AuditEmitInput } from '../../src/permissions/audit.ts';
 import { initBashParser } from '../../src/permissions/bash-parser.ts';
 import { createPermissionEngine } from '../../src/permissions/engine.ts';
@@ -259,6 +262,46 @@ describe('approval posture (Supervised / Autonomous)', () => {
     const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
     const d = eng.check('bash', 'bash', { command: 'for f in /tmp/*; do rm "$f"; done' });
     expect(d.kind).toBe('confirm');
+  });
+
+  test('autonomous does NOT auto-approve a cwd-scope symlink escape (resolver routes to conservative)', () => {
+    // Reported hole: the autonomous capability-confinement keys on a
+    // LEXICAL `startsWithSegment(path, cwd)`, so a `<cwd>/link` read cap
+    // reads as repo-confined even when `link` is a symlink whose realpath
+    // escapes cwd — `autoApproveRepoConfined` then cleared the modal and
+    // read outside the repo. The resolver detects the escape via realpath
+    // and now routes to Conservative; the `kind: ok` gate keeps the modal.
+    //
+    // Needs a REAL on-disk symlink: the engine wires the real `realpathSync`
+    // into the resolver ctx (not injectable), so we build a temp cwd, an
+    // EXTERNAL target outside it, and an in-cwd relative symlink as control.
+    // cwd is realpath'd so an in-cwd symlink's canonical stays under it.
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'forja-cwdesc-')));
+    const ext = realpathSync(mkdtempSync(join(tmpdir(), 'forja-ext-')));
+    try {
+      writeFileSync(join(ext, 'secret.txt'), 'exfil');
+      writeFileSync(join(root, 'real.txt'), 'in-repo');
+      symlinkSync(join(ext, 'secret.txt'), join(root, 'escape')); // escapes cwd
+      symlinkSync('real.txt', join(root, 'inside')); // relative — stays inside cwd
+      const eng = createPermissionEngine(policy({}), { cwd: root, approvalPosture: 'autonomous' });
+      // Escape symlink → Conservative → modal stays (the hole would `allow`).
+      const escaped = eng.check('bash', 'bash', { command: 'cat escape && echo ok' });
+      expect(escaped.kind).toBe('confirm');
+      // Control: a symlink resolving INSIDE cwd is genuinely repo-confined →
+      // still auto-approves. Pins that the fix isn't a blanket symlink deny.
+      const inside = eng.check('bash', 'bash', { command: 'cat inside && echo ok' });
+      expect(inside.kind).toBe('allow');
+      // Distinct resolver path: an ORPHAN redirect (`> escape` attached to no
+      // command) to the escape symlink also stays modal. The hole is reachable
+      // here too — `cat real.txt; > escape` is a non-soft list, so without the
+      // orphan-path guard it would resolve ok and auto-approve a write through
+      // the symlink to the external target.
+      const orphan = eng.check('bash', 'bash', { command: 'cat real.txt; > escape' });
+      expect(orphan.kind).toBe('confirm');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(ext, { recursive: true, force: true });
+    }
   });
 
   test('autonomous does NOT auto-approve a dynamic $var command (cause resolver, best-effort caps)', () => {
