@@ -5789,9 +5789,36 @@ describe('bash resolver — effect-based git read verbs / find-exec / awk / sed 
       expect(caps(c)).toContain('exec:arbitrary');
     }
   });
-  test('sed -i GNU forms (-i, -i.bak) resolve the script + write the file', () => {
-    for (const c of ["sed -i 's/a/b/' file", "sed -i.bak 's/a/b/' file"]) {
-      expect(caps(c)).toContain('write-fs:/work/proj/file');
+  test('bare `sed -i` (separate-operand suffix) is script-position-ambiguous → exec:arbitrary', () => {
+    // The reported hole: on BSD/macOS `-i` consumes the NEXT token as the
+    // backup suffix (ANY token, not just `''`/`.bak`), shifting the script
+    // one position right. `sed -i p 's/x/id/e' file` → BSD suffix `p`,
+    // script `s/x/id/e` which execs `id` via the `e` flag; the GNU-shaped
+    // `positional[0]` heuristic would read `p` as a read-only print script
+    // and miss it. Any bare `-i` (or short-flag bundle ending in `i`)
+    // without `-e` → exec:arbitrary.
+    for (const c of [
+      "sed -i p 's/x/id/e' file", // the exploit (suffix `p`, real script execs id)
+      "sed -i 's/a/b/' file", // common GNU form — also ambiguous, gates
+      "sed -i bak 's/a/b/e' file", // arbitrary non-dot suffix
+      "sed -ni p 's/x/id/e' file", // bundled flags ending in i
+    ]) {
+      expect(caps(c)).toContain('exec:arbitrary');
+    }
+  });
+  test('script-position-UNambiguous `sed -i` forms stay modeled (no exec): -i.bak, -i -e, --in-place', () => {
+    // Escape hatches for autonomous auto-approval of an in-place edit. The
+    // suffix is attached to the -i token (`-i.bak`), or the script rides
+    // `-e` (coincides on both platforms), or it's the GNU-only long form —
+    // so positional[0] / the flag value is unambiguously the script.
+    for (const c of [
+      "sed -i.bak 's/a/b/' file",
+      "sed -i -e 's/a/b/' file",
+      "sed --in-place 's/a/b/' file",
+    ]) {
+      const s = caps(c);
+      expect(s).not.toContain('exec:arbitrary');
+      expect(s).toContain('write-fs:/work/proj/file');
     }
   });
 
@@ -5821,8 +5848,10 @@ describe('bash resolver — effect-based git read verbs / find-exec / awk / sed 
       expect(s.some((x) => x === 'exec:arbitrary' || x.startsWith('write-fs'))).toBe(false);
     }
   });
-  test('sed -i → write-fs(operands)', () => {
-    expect(caps('sed -i s/a/b/ notes.txt')).toContain('write-fs:/work/proj/notes.txt');
+  test('sed -i.bak → write-fs(operands), no exec (unambiguous in-place edit)', () => {
+    const s = caps('sed -i.bak s/a/b/ notes.txt');
+    expect(s).toContain('write-fs:/work/proj/notes.txt');
+    expect(s).not.toContain('exec:arbitrary');
   });
   test('sed exec/write commands (s///e, e, s///w, -f) → exec:arbitrary', () => {
     for (const c of [

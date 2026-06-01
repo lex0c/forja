@@ -444,6 +444,21 @@ describe('approval posture (Supervised / Autonomous)', () => {
     expect(d.kind).not.toBe('allow');
   });
 
+  test('autonomous does NOT auto-approve a bare `sed -i` (BSD suffix shifts the script)', () => {
+    // `sed -i p 's/x/id/e' file`: on BSD/macOS `-i` eats `p` as the backup
+    // suffix, so the real script is `s/x/id/e` — which execs `id` via the
+    // `e` flag. The resolver can't pin the script position without `-e`, so
+    // it models exec:arbitrary and the modal stays. (`sed -i.bak`/`-i -e`
+    // are unambiguous and still auto-approve as repo-confined writes.)
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['sed*'] } } }), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+    });
+    expect(eng.check('bash', 'bash', { command: "sed -i p 's/x/id/e' file" }).kind).not.toBe(
+      'allow',
+    );
+  });
+
   test('autonomous does NOT auto-approve a confined compound when a segment hits a deny rule', () => {
     // `ls README.md` is repo-confined, but the operator denied `ls *`.
     // checkBash's deny matches the WHOLE command by glob (misses the middle

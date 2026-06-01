@@ -1212,21 +1212,45 @@ const cmdSed: CommandResolver = (positional, tokens, ctx) => {
     return { capabilities: [exec('arbitrary'), readFs(ctx.cwd)], confidence: 'medium' };
   }
   const exprs = extractValueFlag(tokens, { longForm: '--expression', shortForm: '-e' });
-  // BSD/macOS `-i ''` / `-i .bak` (separate suffix operand) shifts the
-  // script to the NEXT positional, where our `positional[0]` heuristic
-  // would mis-read the empty/suffix token as a (read-only) script and miss
-  // the real one — fail-closed to exec:arbitrary. GNU's attached `-i.bak`
-  // and `-i` followed directly by the script are unaffected (the next
-  // token is the script, not an empty/`.`-suffix). `-e` callers carry the
-  // script explicitly, so they are exempt.
-  if (exprs.length === 0) {
-    const iIdx = tokens.findIndex((t) => t === '-i');
-    if (iIdx !== -1) {
-      const next = tokens[iIdx + 1];
-      if (next === '' || next?.startsWith('.')) {
-        return { capabilities: [exec('arbitrary'), readFs(ctx.cwd)], confidence: 'medium' };
-      }
-    }
+  // BSD/macOS `sed -i` takes the backup suffix as a SEPARATE operand
+  // (`-i extension`), consuming the NEXT token — ANY token, not just `''`
+  // or a `.bak`-shaped one — as the suffix. That shifts the script one
+  // position to the right of where GNU puts it: `sed -i p 's/x/id/e' f`
+  // is GNU `{script:'p', files:['s/x/id/e','f']}` but BSD
+  // `{suffix:'p', script:'s/x/id/e', file:'f'}`, and the BSD script execs
+  // `id` via the `s///e` flag. With no `-e`, the script is a positional
+  // whose index is platform-divergent, so `positional[0]` cannot be
+  // trusted as the script — fail-closed to exec:arbitrary.
+  //
+  // Exempt (script position is unambiguous, so they stay modeled):
+  //   - `-e`/`--expression`: the script rides the flag value, which
+  //     coincides with the real script on BOTH platforms (BSD eats the
+  //     `-e` token as the suffix, but the next token then becomes
+  //     positional[0]=script == our extracted `-e` value).
+  //   - an ATTACHED suffix (`-i.bak`, `-in`): the suffix is part of the
+  //     `-i` token, so `positional[0]` is the script on both platforms.
+  //   - the GNU-only long form `--in-place[=SUFFIX]`: no BSD counterpart
+  //     that shifts (BSD errors on the long option), script at positional[0].
+  // The pattern matches a bare `-i` and short-flag bundles ending in `i`
+  // (`-ni`, `-Eni`) — exactly the forms where `-i` consumes a separate
+  // operand. `-i<suffix>` / `--in-place` do not match.
+  if (exprs.length === 0 && tokens.some((t) => /^-[A-Za-z]*i$/.test(t))) {
+    // exec:arbitrary gates the autonomous + score paths (the script may be a
+    // dangerous positional we can't pin). The in-place edit still WRITES the
+    // file operands, but we can't tell which positional is the suffix vs the
+    // script vs a file — so conservatively emit write-fs for EVERY positional
+    // so the bypass §11 protected-path floor still catches an escalate/deny
+    // operand (`sed -i s/a/b/ /etc/hosts` → write-fs:/etc/hosts) that
+    // exec:arbitrary alone wouldn't surface to a path-based floor.
+    // Over-attributing a write to a script/suffix token is harmless
+    // (repo-confined) and never under-reports a real write.
+    const operandWrites = positional
+      .filter((p) => p !== '-')
+      .map((p) => writeFs(resolveArg(p, ctx)));
+    return {
+      capabilities: [exec('arbitrary'), readFs(ctx.cwd), ...operandWrites],
+      confidence: 'medium',
+    };
   }
   const scripts = exprs.length > 0 ? exprs : positional[0] !== undefined ? [positional[0]] : [];
   if (scripts.length === 0 || !scripts.every((sc) => sedScriptReadOnly(sc))) {
