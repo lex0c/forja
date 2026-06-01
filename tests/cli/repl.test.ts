@@ -186,10 +186,14 @@ const makeRunAgent = (
   // cleanup completes — the moment the .finally() chain in
   // startTurn runs against shared state owned by a newer turn.
   settle: (idx: number, override?: Partial<HarnessResult>) => void;
+  // Reject the pending runAgent promise WITHOUT emitting session_finished
+  // — simulates a provider crash before any boundary event.
+  reject: (idx: number, err?: Error) => void;
 } => {
   const captured: CapturedRun[] = [];
   let nextN = 1;
   const pendingResolves: Array<(override: Partial<HarnessResult>) => void> = [];
+  const pendingRejects: Array<(err: Error) => void> = [];
 
   const buildResult = (sessionId: string, override: Partial<HarnessResult>): HarnessResult => {
     const base: HarnessResult = {
@@ -210,8 +214,9 @@ const makeRunAgent = (
       const n = nextN++;
       const sessionId = resolveSession(n);
       captured.push({ configs: [cfg], emit: (event) => cfg.onEvent?.(event) });
-      return new Promise<HarnessResult>((resolve) => {
+      return new Promise<HarnessResult>((resolve, reject) => {
         pendingResolves.push((override) => resolve(buildResult(sessionId, override)));
+        pendingRejects.push(reject);
       });
     },
     captured,
@@ -236,6 +241,11 @@ const makeRunAgent = (
       const r = pendingResolves[idx];
       if (r === undefined) throw new Error(`no pending run at ${idx}`);
       r(override ?? {});
+    },
+    reject: (idx, err) => {
+      const r = pendingRejects[idx];
+      if (r === undefined) throw new Error(`no pending run at ${idx}`);
+      r(err ?? new Error('runAgent rejected'));
     },
   };
 };
@@ -828,7 +838,7 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
-  test('Enter is ignored while a turn is in flight (no double-run)', async () => {
+  test('Enter while a turn is in flight queues the input, drained at the boundary (INBOX)', async () => {
     const stdin = makeStdin();
     const ra = makeRunAgent((n) => `sess-${n}`);
     const promise = runRepl({
@@ -843,21 +853,484 @@ describe('repl — boot + smoke', () => {
     stdin.feed('a\r');
     await tick();
     expect(ra.captured).toHaveLength(1);
-    // Type more + Enter while still running. Should NOT spawn a 2nd run.
-    // The typed character DOES accumulate in the buffer (the editor is
-    // still live so the user can compose the next prompt while the
-    // current one runs); the in-flight Enter is just ignored.
+    // Enter while running no longer drops the input (the old behavior) —
+    // it queues. No 2nd run starts yet: the queue drains at the turn
+    // boundary, not mid-turn (INBOX §2.2).
     stdin.feed('b\r');
     await tick();
     expect(ra.captured).toHaveLength(1);
-    // Finish the first run; the next Enter then submits whatever was
-    // accumulated. With 'b' typed during the run, the buffer is 'b'.
+    // Boundary reached (session_finished): the queued 'b' drains as the
+    // next turn on its own — no manual re-submit needed.
     ra.finish(0);
-    await tick();
-    stdin.feed('\r');
     await tick();
     expect(ra.captured).toHaveLength(2);
     expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('b');
+    // The drained turn threads resume like any follow-up turn.
+    expect(ra.captured[1]?.configs[0]?.resumeFromSessionId).toBe('sess-1');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('multiple messages queued during a turn drain as ONE concatenated turn (INBOX §5.1)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('start\r');
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    // Queue two more while busy — they accumulate, no new run.
+    stdin.feed('one\r');
+    await tick();
+    stdin.feed('two\r');
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    // Drain: a SINGLE turn whose body is the two queued messages joined
+    // by the markdown-rule separator, in FIFO order (not two turns —
+    // the provider can't take consecutive user messages, INBOX §5.2).
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('one\n\n---\n\ntwo');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a draft typed after queueing survives the drain (INBOX — input preserved)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    // Queue 'b' (Enter clears the buffer), then start typing 'c' WITHOUT
+    // Enter — a live draft.
+    stdin.feed('b\r');
+    await tick();
+    stdin.feed('c');
+    await tick();
+    // Boundary: 'b' drains as turn 2; the 'c' draft must NOT be nuked by
+    // the drain (it does not clear the input).
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('b');
+    // Finish turn 2 (nothing left to drain), then Enter — the preserved
+    // 'c' draft submits as turn 3.
+    ra.finish(1);
+    await tick();
+    stdin.feed('\r');
+    await tick();
+    expect(ra.captured).toHaveLength(3);
+    expect(ra.captured[2]?.configs[0]?.userPrompt).toBe('c');
+    ra.finish(2);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('↑ lifts the most-recent queued message; Enter re-queues it edited (INBOX §4.2)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    // Queue two while busy.
+    stdin.feed('one\r');
+    await tick();
+    stdin.feed('two\r');
+    await tick();
+    // ↑ lifts 'two' (the tail) into the input, cursor at end.
+    stdin.feed('\x1b[A');
+    await tick();
+    // Edit + commit. No new turn from the commit (still busy).
+    stdin.feed(' edited\r');
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    // Boundary: the queue drains as ONE turn with the edit applied in
+    // place, FIFO order preserved.
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('one\n\n---\n\ntwo edited');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('↓ cancels an inbox edit, restoring the queued message unchanged', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    stdin.feed('keep this\r');
+    await tick();
+    // ↑ lifts it, then mangle the draft...
+    stdin.feed('\x1b[A');
+    await tick();
+    stdin.feed(' MANGLED');
+    await tick();
+    // ↓ cancels: original re-queued, edit discarded.
+    stdin.feed('\x1b[B');
+    await tick();
+    // Drain carries the ORIGINAL, not the mangled draft.
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('keep this');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a message being edited is held back from the drain, then commits in place (INBOX §4.2)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    // Queue two while busy.
+    stdin.feed('alpha\r');
+    await tick();
+    stdin.feed('beta\r');
+    await tick();
+    // ↑ lifts 'beta' (the tail) into the input to edit it.
+    stdin.feed('\x1b[A');
+    await tick();
+    // Boundary hits WHILE editing beta: only 'alpha' drains; 'beta' (being
+    // edited) is held back so the operator isn't cut off mid-edit.
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('alpha');
+    // Finish editing — commit writes the new text in place, no new turn.
+    stdin.feed(' edited\r');
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    // It drains at the NEXT boundary, carrying the edited text.
+    ra.finish(1);
+    await tick();
+    expect(ra.captured).toHaveLength(3);
+    expect(ra.captured[2]?.configs[0]?.userPrompt).toBe('beta edited');
+    ra.finish(2);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('committing an edit after the turn already ended drains it (no stuck message)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    // Queue the ONLY message, then lift it for editing.
+    stdin.feed('only one\r');
+    await tick();
+    stdin.feed('\x1b[A');
+    await tick();
+    // Turn ends while editing: the boundary holds the edited message back
+    // (nothing else to drain), so the REPL goes idle with it still queued.
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    // Commit while idle — it must drain as a new turn, not sit stuck.
+    stdin.feed(' edited\r');
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('only one edited');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('Ctrl+C while editing a queued message cancels the edit (does not strand it)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    stdin.feed('queued msg\r');
+    await tick();
+    // Lift it for editing (input now holds 'queued msg').
+    stdin.feed('\x1b[A');
+    await tick();
+    // Ctrl+C on the non-empty buffer clears it (no 'interrupt' surfaced)
+    // and must also cancel the edit — otherwise the message stays hidden
+    // and held back.
+    stdin.feed('\x03');
+    await tick();
+    // Boundary: the message drains (edit cancelled, so it's not held).
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('queued msg');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('cancelling an edit after the turn ended drains the original (no stuck message)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    stdin.feed('original msg\r');
+    await tick();
+    stdin.feed('\x1b[A');
+    await tick();
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    // Mangle the draft, then ↓ to cancel — the original drains (idle).
+    stdin.feed(' MANGLED');
+    await tick();
+    stdin.feed('\x1b[B');
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('original msg');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a message queued during a turn that REJECTS (no session_finished) still drains', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    // Queue a message while turn 1 is in flight.
+    stdin.feed('queued during failure\r');
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    // Turn 1's runAgent rejects BEFORE emitting session_finished (e.g. a
+    // provider crash). The finalizer must still drain the queue, not leave
+    // the message pending until some later boundary.
+    ra.reject(0);
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('queued during failure');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('Ctrl+D on an emptied edit buffer cancels the edit (does not strand the message)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    // Queue "held" and lift it for editing.
+    stdin.feed('held\r');
+    await tick();
+    stdin.feed('\x1b[A');
+    await tick();
+    // Empty the edit buffer, then Ctrl+D (EOF). While busy this interrupts
+    // the turn; it must ALSO cancel the edit, or "held" stays hidden + held
+    // and the prompt wedges (no ↑ lift / history recall) until discovered.
+    stdin.feed('\x7f'.repeat('held'.length));
+    await tick();
+    stdin.feed('\x04');
+    await tick();
+    // Turn ends → the un-held message drains as the next turn.
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('held');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('emptying a lifted edit buffer with Backspace cancels the edit (no strand)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    stdin.feed('held\r');
+    await tick();
+    stdin.feed('\x1b[A');
+    await tick();
+    // Empty the lifted buffer with plain Backspaces (NOT Ctrl+C/Ctrl+D).
+    // The edit must cancel so "held" un-hides and drains — not strand
+    // (hidden + held, empty prompt, Enter a no-op).
+    stdin.feed('\x7f'.repeat('held'.length));
+    await tick();
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('held');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('Ctrl+U emptying a lifted edit buffer also cancels the edit', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    stdin.feed('held\r');
+    await tick();
+    stdin.feed('\x1b[A');
+    await tick();
+    // Ctrl+U kills the whole line → empty buffer → edit cancels.
+    stdin.feed('\x15');
+    await tick();
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('held');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('Esc while editing a queued message cancels the edit (restores it, no interrupt)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    stdin.feed('keep me\r');
+    await tick();
+    stdin.feed('\x1b[A');
+    await tick();
+    // Edit in progress — non-empty buffer, so the empty-buffer cancel
+    // does NOT apply; Esc must be handled as a cancel key in its own right.
+    stdin.feed(' MANGLE');
+    await tick();
+    // Esc cancels the edit and restores "keep me" unchanged; it does NOT
+    // interrupt the running turn. (A lone Esc resolves after the parser's
+    // idle-drain timeout, hence flushFrame.)
+    stdin.feed('\x1b');
+    await flushFrame();
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('keep me');
     ra.finish(1);
     await tick();
     stdin.feed('\x04');

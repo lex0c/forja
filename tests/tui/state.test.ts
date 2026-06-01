@@ -199,6 +199,85 @@ describe('user input', () => {
   });
 });
 
+describe('inbox (INBOX §6 — queued input, slice 1)', () => {
+  test('inbox:queued appends to the queue AND clears the input buffer', () => {
+    let state = createInitialState();
+    state = { ...state, input: { value: 'draft', cursor: 5 } };
+    const r = applyEvent(state, { type: 'inbox:queued', ts: 1, id: '0', text: 'queued one' });
+    expect(r.state.queued).toEqual([{ id: '0', text: 'queued one' }]);
+    expect(r.state.input).toEqual({ value: '', cursor: 0 });
+    // No scrollback — the bar lives in the live region until drain.
+    expect(r.permanent).toEqual([]);
+  });
+
+  test('multiple inbox:queued accumulate in FIFO order', () => {
+    let state = createInitialState();
+    state = applyEvent(state, { type: 'inbox:queued', ts: 1, id: '0', text: 'a' }).state;
+    state = applyEvent(state, { type: 'inbox:queued', ts: 2, id: '1', text: 'b' }).state;
+    expect(state.queued).toEqual([
+      { id: '0', text: 'a' },
+      { id: '1', text: 'b' },
+    ]);
+  });
+
+  test('inbox:drained empties the queue and freezes each item into a user-submit bar', () => {
+    let state = createInitialState();
+    state = applyEvent(state, { type: 'inbox:queued', ts: 1, id: '0', text: 'a' }).state;
+    state = applyEvent(state, { type: 'inbox:queued', ts: 2, id: '1', text: 'b' }).state;
+    const r = applyEvent(state, { type: 'inbox:drained', ts: 3, texts: ['a', 'b'] });
+    expect(r.state.queued).toEqual([]);
+    expect(r.permanent).toEqual([
+      { kind: 'user-submit', text: 'a' },
+      { kind: 'user-submit', text: 'b' },
+    ]);
+  });
+
+  test('inbox:drained preserves an in-progress input draft (must not nuke it)', () => {
+    let state = createInitialState();
+    state = applyEvent(state, { type: 'inbox:queued', ts: 1, id: '0', text: 'a' }).state;
+    // operator started typing a fresh message after queueing
+    state = { ...state, input: { value: 'half-typed', cursor: 4 } };
+    const r = applyEvent(state, { type: 'inbox:drained', ts: 2, texts: ['a'] });
+    expect(r.state.input).toEqual({ value: 'half-typed', cursor: 4 });
+  });
+
+  test('inbox:edit-start marks the item as editing (it STAYS in the queue)', () => {
+    let state = createInitialState();
+    state = applyEvent(state, { type: 'inbox:queued', ts: 1, id: '0', text: 'a' }).state;
+    state = applyEvent(state, { type: 'inbox:queued', ts: 2, id: '1', text: 'b' }).state;
+    const r = applyEvent(state, { type: 'inbox:edit-start', ts: 3, id: '1' });
+    expect(r.state.editingId).toBe('1');
+    // queue unchanged — the message is never removed, so it can't be lost
+    expect(r.state.queued).toEqual([
+      { id: '0', text: 'a' },
+      { id: '1', text: 'b' },
+    ]);
+    expect(r.permanent).toEqual([]);
+  });
+
+  test('inbox:edit-commit rewrites the item text in place and clears editingId', () => {
+    let state = createInitialState();
+    state = applyEvent(state, { type: 'inbox:queued', ts: 1, id: '0', text: 'a' }).state;
+    state = applyEvent(state, { type: 'inbox:queued', ts: 2, id: '1', text: 'b' }).state;
+    state = applyEvent(state, { type: 'inbox:edit-start', ts: 3, id: '1' }).state;
+    const r = applyEvent(state, { type: 'inbox:edit-commit', ts: 4, id: '1', text: 'b edited' });
+    expect(r.state.queued).toEqual([
+      { id: '0', text: 'a' },
+      { id: '1', text: 'b edited' },
+    ]);
+    expect(r.state.editingId).toBeNull();
+  });
+
+  test('inbox:edit-cancel clears editingId, leaving the queue unchanged', () => {
+    let state = createInitialState();
+    state = applyEvent(state, { type: 'inbox:queued', ts: 1, id: '0', text: 'a' }).state;
+    state = applyEvent(state, { type: 'inbox:edit-start', ts: 2, id: '0' }).state;
+    const r = applyEvent(state, { type: 'inbox:edit-cancel', ts: 3 });
+    expect(r.state.editingId).toBeNull();
+    expect(r.state.queued).toEqual([{ id: '0', text: 'a' }]);
+  });
+});
+
 describe('assistant streaming', () => {
   test('start opens a buffer; deltas accumulate; end emits assistant item', () => {
     const result = drive([

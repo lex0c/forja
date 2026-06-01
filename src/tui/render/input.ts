@@ -35,6 +35,13 @@ export interface RenderInputOptions {
   // stays on the search line). Default false leaves the input in
   // its normal palette.
   dimmed?: boolean;
+  // Ghost hint shown after the prompt ONLY when the buffer is empty
+  // (INBOX §6.1 — "Press up to edit queued messages" while the queue
+  // is non-empty). Rendered dim so it reads as an affordance, not as
+  // typed content; it vanishes the moment the operator types. The
+  // cursor still lands at column 2 (composeCursor keys off the empty
+  // value), sitting at the head of the ghost text.
+  placeholder?: string;
 }
 
 export const renderInput = (
@@ -52,6 +59,12 @@ export const renderInput = (
   // color='none', so ASCII-only terminals stay unchanged.
   const finish = (line: string): string =>
     options.dimmed === true ? paint(caps, 'dim', line) : line;
+  // Empty buffer + a placeholder → show the dim ghost hint instead of a
+  // bare prompt. Only the hint is dimmed (the prompt keeps its normal
+  // tone unless reverse-search dims the whole input via `finish`).
+  if (input.value === '' && options.placeholder !== undefined && options.placeholder !== '') {
+    return [finish(PROMPT_PREFIX + paint(caps, 'dim', options.placeholder))];
+  }
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i] ?? '';
     const linePrefix = i === 0 ? PROMPT_PREFIX : CONT_PREFIX;

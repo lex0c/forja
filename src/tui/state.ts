@@ -301,6 +301,17 @@ export interface ReverseSearchState {
 
 export interface LiveState {
   input: InputState;
+  // INBOX (docs/spec/INBOX.md §6 — in-memory by design). Messages the
+  // operator committed while a turn/playbook was in flight, in FIFO
+  // order, awaiting the next boundary to drain as one user turn.
+  // Rendered as inverse bars above the typing zone (render/inbox.ts).
+  // Appended by the `inbox:queued` reducer, cleared by `inbox:drained`.
+  queued: QueuedInput[];
+  // INBOX edit (§4.2): id of the queued message currently being edited
+  // in the input (lifted via ↑), or null. The message STAYS in `queued`
+  // — `editingId` only tells the renderer to hide its bar while it's in
+  // the input, so an edit can never lose the message.
+  editingId: string | null;
   status: StatusState;
   // Keyed by toolId so updates are O(1). Insertion order is preserved
   // by `Map`, so the renderer can iterate and produce stable layout.
@@ -442,8 +453,18 @@ export interface LiveState {
   ended: boolean;
 }
 
+// A single queued inbox message (INBOX §6). `id` is a per-session
+// monotonic tag minted by the REPL — used to target a message for
+// in-place editing (↑ lifts it back into the input).
+export interface QueuedInput {
+  id: string;
+  text: string;
+}
+
 export const createInitialState = (): LiveState => ({
   input: { value: '', cursor: 0 },
+  queued: [],
+  editingId: null,
   status: {
     sessionId: null,
     project: null,
@@ -927,6 +948,60 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         // `ended` was a soft guard, not a contract.
         state: { ...state, input: { value: '', cursor: 0 }, ended: false },
         permanent: [{ kind: 'user-submit', text: event.text }],
+      };
+
+    case 'inbox:queued':
+      // Append to the FIFO queue AND clear the input (the operator hit
+      // Enter — their draft became the queued item, so the buffer
+      // should reset for the next message, exactly like user:submit).
+      // No scrollback yet — the bar lives in the live region until drain.
+      return {
+        state: {
+          ...state,
+          queued: [...state.queued, { id: event.id, text: event.text }],
+          input: { value: '', cursor: 0 },
+        },
+        permanent: [],
+      };
+
+    case 'inbox:drained':
+      // Boundary reached: freeze each drained message into its own
+      // user-submit scrollback bar (visual continuity with the pending
+      // stack). The message being edited (if any) is NOT drained — it
+      // stays queued (`q.id === editingId`) for the next boundary, so the
+      // operator isn't cut off mid-edit. Input is left UNTOUCHED — a
+      // draft typed after the last enqueue must survive the drain.
+      return {
+        state: { ...state, queued: state.queued.filter((q) => q.id === state.editingId) },
+        permanent: event.texts.map((text) => ({ kind: 'user-submit', text })),
+      };
+
+    case 'inbox:edit-start':
+      // Mark the message as being edited; it STAYS in the queue (never
+      // lost) — the renderer hides its bar via `editingId` while it sits
+      // in the input. Input is set separately by the REPL.
+      return {
+        state: { ...state, editingId: event.id },
+        permanent: [],
+      };
+
+    case 'inbox:edit-commit':
+      // Write the edited text in place, keeping the message's FIFO
+      // position, and end the edit (its bar reappears with the new text).
+      return {
+        state: {
+          ...state,
+          queued: state.queued.map((q) => (q.id === event.id ? { ...q, text: event.text } : q)),
+          editingId: null,
+        },
+        permanent: [],
+      };
+
+    case 'inbox:edit-cancel':
+      // End the edit with the message unchanged (its bar reappears).
+      return {
+        state: { ...state, editingId: null },
+        permanent: [],
       };
 
     case 'input:update':

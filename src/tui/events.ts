@@ -122,6 +122,44 @@ export type InputUpdateEvent = BaseEvent & {
   cursor: number;
 };
 
+// INBOX (docs/spec/INBOX.md §6 — in-memory by design). A message the
+// operator committed while a turn/playbook was in flight, queued
+// instead of dropped. The reducer appends it to `state.queued` (and
+// clears the input, like user:submit) so it renders as a pending bar.
+export type InboxQueuedEvent = BaseEvent & {
+  type: 'inbox:queued';
+  id: string;
+  text: string;
+};
+
+// INBOX edit (§4.2 / §6.1 "↑ edit"). The message is NEVER removed from
+// the queue while edited — it stays in `state.queued` (so it can't be
+// lost); `state.editingId` marks it so the renderer hides its bar while
+// it sits in the input. `edit-start` begins the edit, `edit-commit`
+// writes the new text in place (FIFO position kept), `edit-cancel` ends
+// the edit with the message unchanged.
+export type InboxEditStartEvent = BaseEvent & {
+  type: 'inbox:edit-start';
+  id: string;
+};
+export type InboxEditCommitEvent = BaseEvent & {
+  type: 'inbox:edit-commit';
+  id: string;
+  text: string;
+};
+export type InboxEditCancelEvent = BaseEvent & {
+  type: 'inbox:edit-cancel';
+};
+
+// The inbox drained at a turn boundary: the queue empties and each
+// queued item freezes into a `user-submit` scrollback bar. `texts`
+// carries the drained bodies in FIFO order. The reducer does NOT clear
+// the input — a draft typed after the last enqueue survives the drain.
+export type InboxDrainedEvent = BaseEvent & {
+  type: 'inbox:drained';
+  texts: string[];
+};
+
 // Streaming assistant text.
 export type AssistantStartEvent = BaseEvent & {
   type: 'assistant:start';
@@ -711,6 +749,11 @@ export type UIEvent =
   | SessionEndEvent
   | UserSubmitEvent
   | InputUpdateEvent
+  | InboxQueuedEvent
+  | InboxDrainedEvent
+  | InboxEditStartEvent
+  | InboxEditCommitEvent
+  | InboxEditCancelEvent
   | AssistantStartEvent
   | AssistantDeltaEvent
   | AssistantUsageEvent

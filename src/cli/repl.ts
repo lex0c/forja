@@ -61,6 +61,7 @@ import {
 import type { ParsedArgs } from './args.ts';
 import { type BootstrapInput, type BootstrapResult, bootstrap } from './bootstrap.ts';
 import { maybeEmitHistoryBanner } from './history-banner.ts';
+import { concatQueuedBodies } from './inbox-drain.ts';
 import { replaySessionMessages } from './resume-replay.ts';
 import { resolveResumeIdOnDb } from './run.ts';
 import {
@@ -1063,6 +1064,29 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // `abortController`, etc., breaking interrupts and allowing
   // concurrent submits.
   let activeTurnToken: symbol | null = null;
+  // Whether the active turn emitted `session_finished` (the normal
+  // boundary that schedules the inbox drain). Reset per turn in startTurn;
+  // if a turn's runAgent rejects WITHOUT emitting it, the finalizer drains
+  // instead, so a message queued during a failed turn isn't left stranded
+  // until some later unrelated boundary.
+  let sawSessionFinished = false;
+
+  // INBOX (docs/spec/INBOX.md — in-memory by design). Input committed
+  // while a turn or playbook is in flight accumulates here instead of
+  // being dropped; `drainInbox` flushes it as the next user turn at the
+  // boundary (session_finished / playbook end). In-memory is the final
+  // design — never persisted (deliberate, permanent divergence from
+  // §0.5/§13; operator's call). `drainInbox` is forward-declared so
+  // onHarnessEvent (above startTurn) can trigger it; its body, assigned
+  // after startTurn, calls startTurn.
+  const inbox: { id: string; text: string }[] = [];
+  let inboxSeq = 0;
+  let drainInbox: () => void = () => {};
+  // Id of the queued message currently lifted into the input via ↑ for
+  // editing, or null. The message STAYS in `inbox` the whole time (never
+  // removed), so an edit can never lose it; this only marks which one is
+  // being edited — commit updates it in place, the renderer hides its bar.
+  let editingQueued: { id: string } | null = null;
 
   const onHarnessEvent = (
     adapter: HarnessAdapter,
@@ -1094,11 +1118,19 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // old timing.
     if (event.type === 'session_finished') {
       running = false;
+      sawSessionFinished = true;
       lastSessionId = event.result.sessionId;
       trackReplSessionId(event.result.sessionId);
       cumulative.costUsd += event.result.costUsd;
       cumulative.steps += event.result.steps;
       cumulative.turns += 1;
+      // INBOX boundary (§2.1/§2.3): the turn ended — drain anything
+      // queued during it as the next user turn. Even degraded ends
+      // (error/timeout/abort) route through session_finished and drain
+      // here, per §2.3. Deferred to a microtask so it runs after this
+      // event finishes dispatching, mirroring the supported back-to-back
+      // submit timing; the token gate in startTurn handles re-entrancy.
+      queueMicrotask(() => drainInbox());
     }
   };
 
@@ -1236,6 +1268,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // mutations once a newer turn has taken over.
     const myToken = Symbol('turn');
     activeTurnToken = myToken;
+    sawSessionFinished = false;
     abortController = new AbortController();
     softStopController = new AbortController();
     const adapter = createHarnessAdapter(buildAdapterCtx());
@@ -1284,7 +1317,67 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         softStopController = null;
         runningPromise = null;
         activeTurnToken = null;
+        // Rejection boundary: if runAgent threw before emitting
+        // session_finished, that branch never scheduled the inbox drain —
+        // do it here so a message queued during the failed turn becomes
+        // the next turn instead of sitting pending. When session_finished
+        // DID fire it already scheduled the drain; skip to avoid a
+        // redundant pass.
+        if (!sawSessionFinished) queueMicrotask(() => drainInbox());
       });
+  };
+
+  // Enqueue a message into the in-memory inbox (INBOX §4.1): mint an id,
+  // append it, and emit `inbox:queued` (which adds the pending bar and
+  // clears the input). Shared by the normal busy submit path and the busy
+  // reverse-search submit so both drain at the next boundary identically.
+  // History is NOT recorded here — only the finalized text is recorded at
+  // drain time (drainInbox), so an edited-then-committed message doesn't
+  // leave its stale pre-edit draft in the ↑/Ctrl-R recall pool.
+  const enqueueInbox = (text: string): void => {
+    const id = String(inboxSeq++);
+    inbox.push({ id, text });
+    bus.emit({ type: 'inbox:queued', ts: now(), id, text });
+  };
+
+  // End an in-progress ↑ edit, leaving the queued message unchanged (it
+  // never left the queue). Used by ↓, Esc, and when the operator pivots
+  // into a slash command / the ? shortcut. No-op when not editing.
+  const cancelQueuedEdit = (): void => {
+    if (editingQueued === null) return;
+    editingQueued = null;
+    bus.emit({ type: 'inbox:edit-cancel', ts: now() });
+    // If the turn already ended while this message was being edited, the
+    // boundary held it back (drainInbox excludes the edited item) and the
+    // REPL is now idle — no further boundary will fire. Drain now so the
+    // message isn't stranded in the queue forever.
+    if (!isBusy()) queueMicrotask(() => drainInbox());
+  };
+
+  // INBOX drain (docs/spec/INBOX.md §4.4 / §5.1). FIFO over everything
+  // queued since the last boundary, concatenated into ONE user turn (the
+  // provider rejects consecutive same-role messages, so N queued items
+  // can't be N wire messages — see inbox-drain.ts). No-op when exiting,
+  // still busy, or with nothing drainable. The message being edited (if
+  // any) is NOT drained — it waits for the next boundary so the operator
+  // isn't cut off mid-edit. Emits `inbox:drained` (freezes each drained
+  // message into a scrollback bar, WITHOUT clearing the input — a draft
+  // survives), then runs the turn. History is recorded per drained message
+  // HERE (final, post-edit text) — not at enqueue — so an edited message
+  // never leaves its stale original in the ↑/Ctrl-R recall pool. The
+  // concatenated body is not recorded; each message is recorded separately.
+  drainInbox = (): void => {
+    if (exiting || isBusy()) return;
+    const editId = editingQueued?.id ?? null;
+    const drained = inbox.filter((m) => m.id !== editId);
+    if (drained.length === 0) return;
+    const kept = inbox.filter((m) => m.id === editId);
+    inbox.length = 0;
+    for (const m of kept) inbox.push(m);
+    const texts = drained.map((m) => m.text);
+    for (const t of texts) recordHistorySubmit(t);
+    bus.emit({ type: 'inbox:drained', ts: now(), texts });
+    startTurn(concatQueuedBodies(texts));
   };
 
   // Async cleanup. Only called via `requestShutdown` below — the
@@ -1729,6 +1822,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         playbookAbortController = null;
         playbookSoftStopController = null;
         playbookPromise = null;
+        // INBOX §9: the parent inbox drains after the subagent/playbook
+        // ends — same boundary semantics as a foreground turn. Deferred
+        // so it runs after this finally unwinds and `playbookRunning` is
+        // observably false to the drain's isBusy() guard.
+        queueMicrotask(() => drainInbox());
       }
     },
   };
@@ -1852,14 +1950,28 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         if (key.name === 'enter') {
           const match = currentReverseSearchMatch();
           if (match === null) return true;
-          if (isBusy()) {
-            // Mid-turn protection: same gate the normal Enter path
-            // honors (`!isBusy()`). Operator gets the recalled buffer
-            // staged but no submit until the turn OR playbook ends.
+          // A slash command recalled from history (slash commands are
+          // recorded in history too) is STAGED into the buffer rather than
+          // submitted or enqueued — either would send the command to the
+          // model as plain text. Staging lets the operator's next Enter
+          // route it through the slash dispatcher, preserving command
+          // semantics. Checked above the busy/idle split so it holds in
+          // both states.
+          if (parseSlashInput(match) !== null) {
             bus.emit({ type: 'input:update', ts: now(), value: match, cursor: match.length });
             closeReverseSearch();
+            cancelExitArm();
             return true;
           }
+          if (isBusy()) {
+            // Busy: enqueue the plain match into the inbox so it drains at
+            // the next boundary (same path as a normal busy submit).
+            enqueueInbox(match);
+            closeReverseSearch();
+            cancelExitArm();
+            return true;
+          }
+          // Idle: substitute the buffer with the match and submit it now.
           bus.emit({ type: 'input:update', ts: now(), value: match, cursor: match.length });
           bus.emit({ type: 'user:submit', ts: now(), text: match });
           recordHistorySubmit(match);
@@ -1978,7 +2090,17 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // popover would let Ctrl+R hijack a slash buffer that's still
     // mid-composition, which the §2.1 "slash mode wins" rule is
     // meant to forbid.
+    //
+    // Edit mode also wins (INBOX): while a queued message is lifted for
+    // editing (editingQueued set), Ctrl+R is blocked. Otherwise the
+    // operator could open search and accept a match — enqueueInbox(match)
+    // clears the input but leaves editingId set, so the message being
+    // edited stays hidden and held back at the next boundary with no edit
+    // buffer (stranded). They finish/cancel the edit (Enter / ↓ / Esc)
+    // first. Falls through to applyKey, where Ctrl+R is a NOOP, so the
+    // edit buffer is untouched.
     if (
+      editingQueued === null &&
       key.kind === 'char' &&
       key.ctrl &&
       key.char === 'r' &&
@@ -2060,6 +2182,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     const slashState = renderer.state().slash;
     const currentBuffer = renderer.state().input.value;
     const bufferIsSlash = parseSlashInput(currentBuffer) !== null;
+    // Pivoting an ↑ edit into a slash command ends the edit (the message
+    // stays queued, unchanged) — its bar reappears. Queued messages never
+    // start with `/` (slash input is dispatched, not queued), so this
+    // can't fire spuriously right after a lift.
+    if (bufferIsSlash) cancelQueuedEdit();
     if ((slashState !== null || bufferIsSlash) && key.kind === 'key') {
       const k = key.name;
       // Navigation keys require a live popover (matches present).
@@ -2170,6 +2297,51 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
 
     const current = renderer.state().input;
 
+    // INBOX edit (docs/spec/INBOX.md §4.2 / §6.1 "↑ edit"). When the
+    // queue is non-empty and the prompt is empty, ↑ lifts the most
+    // recent queued message into the input for editing — taking
+    // precedence over history recall (which only runs with an empty
+    // queue / no active edit, below). The message STAYS in the queue
+    // (its bar hidden); Enter writes the edit back in place, ↓ restores
+    // it unchanged. Gated on an empty buffer so ↑ inside a draft still
+    // recalls history / moves the cursor.
+    if (
+      editingQueued === null &&
+      inbox.length > 0 &&
+      current.value === '' &&
+      key.kind === 'key' &&
+      key.name === 'up'
+    ) {
+      const item = inbox[inbox.length - 1];
+      if (item !== undefined) {
+        // Mark it as being edited (it STAYS in the queue — never popped)
+        // and load its text into the input. The renderer hides its bar
+        // via editingId; commit writes the edit back in place.
+        editingQueued = { id: item.id };
+        bus.emit({ type: 'inbox:edit-start', ts: now(), id: item.id });
+        bus.emit({ type: 'input:update', ts: now(), value: item.text, cursor: item.text.length });
+        cancelExitArm();
+        return true;
+      }
+    }
+    // ↓ or Esc while editing cancels the edit: the message stays queued
+    // unchanged and the input clears (↓ mirrors history's ↓-restores; Esc
+    // is the documented cancel key, INBOX §6.1). Intercepted HERE, before
+    // applyKey turns Esc into an `interruptSoft` with an unchanged buffer:
+    // otherwise Esc would skip the empty-buffer cancel above (buffer not
+    // emptied) and fall to the soft-interrupt branch — interrupting the
+    // turn when busy, a no-op when idle — leaving the edit stranded.
+    if (
+      editingQueued !== null &&
+      key.kind === 'key' &&
+      (key.name === 'down' || key.name === 'escape')
+    ) {
+      cancelQueuedEdit();
+      bus.emit({ type: 'input:update', ts: now(), value: '', cursor: 0 });
+      cancelExitArm();
+      return true;
+    }
+
     // History navigation (HISTORY.md §2.1). Slash precedence is
     // governed by `state.slash !== null` (live popover) per spec §2.1
     // — handled in the slashState branch above. With slash mode off
@@ -2183,6 +2355,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // recalled multi-line buffer accidentally redirecting the keys
     // back into vertical cursor motion.
     if (
+      editingQueued === null &&
       historyEnabled &&
       historyEntries.length > 0 &&
       key.kind === 'key' &&
@@ -2236,6 +2409,8 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // buffer (operator started typing a question that begins with
     // `?`), `?` falls through as a literal character.
     if (current.value === '' && key.kind === 'char' && key.char === '?' && !key.ctrl && !key.alt) {
+      // The ? shortcut ends any in-progress ↑ edit (message stays queued).
+      cancelQueuedEdit();
       // Disarm the exit gate before returning. UI.md §5.4 says any
       // non-Ctrl+C key disarms; the `?` shortcut is one of those keys
       // and the early return below skips the cancelExitArm() call
@@ -2249,6 +2424,20 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     }
 
     const result = applyKey(current, key);
+
+    // If an edit action empties a lifted queued-message buffer — Backspace
+    // to empty, Ctrl+U / Ctrl+W, or Ctrl+C's local clear — cancel the
+    // edit. Otherwise editingId stays set with an empty prompt and no
+    // visible bar: the message is hidden AND held out of drainInbox (a
+    // silent strand) until the operator stumbles onto ↓/Esc, and Enter is
+    // a no-op. Keying off the non-empty→empty transition covers every
+    // emptying operation, not just Ctrl+C — and subsumes the per-key edit
+    // cancel that the interrupt (Ctrl+C-empty) and EOF (Ctrl+D) branches
+    // would otherwise need, since the buffer must empty (and cancel here)
+    // before either of those can fire while editing.
+    if (editingQueued !== null && current.value !== '' && result.next.value === '') {
+      cancelQueuedEdit();
+    }
 
     // Disarm the exit gate on any keystroke that ISN'T a fresh Ctrl+C.
     // The interrupt branch below handles arm/exit itself; everything
@@ -2273,15 +2462,44 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       updateSlashSuggestions(result.next.value);
     }
 
-    // Enter while a turn or playbook is in flight is ignored — no
-    // double-submit. The typed text stays in the buffer (applyKey
-    // doesn't clear; only the user:submit reducer would, which
-    // we're not emitting). The user can hit Enter again once the
-    // run ends.
-    if (result.submit !== undefined && !isBusy()) {
-      bus.emit({ type: 'user:submit', ts: now(), text: result.submit.text });
-      recordHistorySubmit(result.submit.text);
-      startTurn(result.submit.text);
+    // Enter routing (INBOX docs/spec/INBOX.md §4.1 / §4.2):
+    //   - editing an ↑-lifted message → commit the edit in place.
+    //   - idle   → submit now (echo + history + startTurn), as before.
+    //   - busy   → queue it instead of dropping it (the old behavior left
+    //     it lingering in the buffer). It renders as a pending bar and
+    //     drains as the next turn at the boundary; the `inbox:queued`
+    //     reducer clears the input so the operator can keep typing.
+    // Slash commands never reach here — the slash branch above consumes
+    // Enter when the buffer starts with `/`.
+    if (result.submit !== undefined) {
+      const editing = editingQueued;
+      editingQueued = null;
+      if (editing !== null) {
+        // Commit an ↑ edit: write the new text into the queued message in
+        // place (FIFO position kept), end the edit, clear the input.
+        const item = inbox.find((m) => m.id === editing.id);
+        if (item !== undefined) item.text = result.submit.text;
+        // No recordHistorySubmit here — the finalized text is recorded
+        // when it drains (drainInbox), so the stale pre-edit text never
+        // enters the recall pool.
+        bus.emit({
+          type: 'inbox:edit-commit',
+          ts: now(),
+          id: editing.id,
+          text: result.submit.text,
+        });
+        bus.emit({ type: 'input:update', ts: now(), value: '', cursor: 0 });
+        // If the turn ended while editing (the boundary held this message
+        // back), the REPL is idle and no boundary will fire — drain the
+        // just-committed edit now so it's actually sent as the next turn.
+        if (!isBusy()) queueMicrotask(() => drainInbox());
+      } else if (isBusy()) {
+        enqueueInbox(result.submit.text);
+      } else {
+        bus.emit({ type: 'user:submit', ts: now(), text: result.submit.text });
+        recordHistorySubmit(result.submit.text);
+        startTurn(result.submit.text);
+      }
     }
 
     // Ctrl+C with empty buffer:
@@ -2293,6 +2511,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     //     (`exiting` set in requestShutdown) keeps a stray follow-up
     //     keystroke from racing past the check.
     if (result.cancelInput === 'interrupt') {
+      // (No edit handling needed: Ctrl+C here fires only on an already-
+      // empty buffer, and the empty-buffer check above already cancelled
+      // any in-progress edit the moment its buffer emptied.)
       if (isBusy()) {
         triggerInterrupt();
       } else {
@@ -2305,6 +2526,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // signal; making them press it twice would surprise. While running,
     // route to the interrupt ladder for consistency with `^C` + Esc.
     if (result.cancelInput === 'eof') {
+      // (No edit handling needed: EOF fires only on an already-empty
+      // buffer, and the empty-buffer check above already cancelled any
+      // in-progress edit the moment its buffer emptied.)
       if (running) {
         triggerInterrupt();
       } else {

@@ -431,6 +431,201 @@ describe('repl — reverse-search overlay (HISTORY.md §2.2)', () => {
     await promise;
   });
 
+  test('Enter on a match while busy enqueues it into the inbox (drains at the boundary)', async () => {
+    appendHistory(db, PROJECT_CWD, 'recall this one', { ts: 1 });
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStubWithDb(db),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    // Start a turn so the REPL is busy.
+    stdin.feed('go\r');
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    // Reverse-search to a match and press Enter WHILE busy.
+    stdin.feed(CTRL_R);
+    await tick();
+    stdin.feed('recall');
+    await tick();
+    stdin.feed('\r');
+    await tick();
+    // Not a 2nd run — it's queued into the inbox, not just staged.
+    expect(ra.captured).toHaveLength(1);
+    // Boundary: the queued match drains as the next turn.
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('recall this one');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    await promise;
+  });
+
+  test('a recalled slash command accepted while busy is staged, not enqueued as model text', async () => {
+    appendHistory(db, PROJECT_CWD, '/help', { ts: 1 });
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStubWithDb(db),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    // Turn 1 running (busy).
+    stdin.feed('go\r');
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    // Reverse-search to the "/help" entry and accept it WHILE busy.
+    stdin.feed(CTRL_R);
+    await tick();
+    stdin.feed('help');
+    await tick();
+    stdin.feed('\r');
+    await tick();
+    // A slash command must NOT be enqueued (it would drain to the model as
+    // text). It's staged instead — the boundary yields no new turn.
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    // Clear the staged "/help" so Ctrl+D (EOF) exits cleanly.
+    stdin.feed('\x7f'.repeat('/help'.length));
+    await tick();
+    stdin.feed('\x04');
+    await promise;
+  });
+
+  test('a recalled slash command accepted while idle is staged, not sent as model text', async () => {
+    appendHistory(db, PROJECT_CWD, '/help', { ts: 1 });
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStubWithDb(db),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    // REPL is idle (no turn started). Reverse-search to "/help" and accept.
+    stdin.feed(CTRL_R);
+    await tick();
+    stdin.feed('help');
+    await tick();
+    stdin.feed('\r');
+    await tick();
+    // Staged for slash dispatch, NOT submitted — no turn starts with
+    // "/help" as a prompt.
+    expect(ra.captured).toHaveLength(0);
+    // Clear the staged "/help" and exit.
+    stdin.feed('\x7f'.repeat('/help'.length));
+    await tick();
+    stdin.feed('\x04');
+    await promise;
+  });
+
+  test('Ctrl+R is blocked while editing a queued message (cannot strand it)', async () => {
+    appendHistory(db, PROJECT_CWD, 'some history entry', { ts: 1 });
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStubWithDb(db),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    // Queue "original" and lift it for editing.
+    stdin.feed('original\r');
+    await tick();
+    stdin.feed(ARROW_UP);
+    await tick();
+    // Ctrl+R must NOT open reverse search while editing (edit mode wins) —
+    // otherwise accepting a match would clear the edit buffer and strand
+    // "original" (hidden + held). It's a no-op; the edit stays intact.
+    stdin.feed(CTRL_R);
+    await tick();
+    // Enter commits the (unchanged) edit, not a reverse-search match.
+    stdin.feed('\r');
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('original');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    await promise;
+  });
+
+  test('an edited queued message records only the final text in history (not the stale original)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStubWithDb(db),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    // Turn 1 — an idle submit records "go" in history.
+    stdin.feed('go\r');
+    await tick();
+    // Queue "rm tmp" while busy, then ↑-lift it and edit it IN PLACE by
+    // appending (emptying the buffer would cancel the edit, not rewrite
+    // it — so we modify without clearing).
+    stdin.feed('rm tmp\r');
+    await tick();
+    stdin.feed(ARROW_UP);
+    await tick();
+    stdin.feed(' now\r');
+    await tick();
+    // Boundary: the edited "rm tmp now" drains (turn 2) and is recorded.
+    ra.finish(0);
+    await tick();
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('rm tmp now');
+    ra.finish(1);
+    await tick();
+    // History now holds "go" and "rm tmp now" — NOT the un-sent pre-edit
+    // "rm tmp". Walk ↑ to the second-newest entry and submit it: "go".
+    stdin.feed(ARROW_UP);
+    stdin.feed(ARROW_UP);
+    await tick();
+    stdin.feed('\r');
+    await tick();
+    expect(ra.captured[2]?.configs[0]?.userPrompt).toBe('go');
+    ra.finish(2);
+    await tick();
+    stdin.feed('\x04');
+    await promise;
+  });
+
   test('Esc cancels overlay without changing the buffer', async () => {
     appendHistory(db, PROJECT_CWD, 'recallable', { ts: 1 });
 
