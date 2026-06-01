@@ -90,7 +90,7 @@ export type { WriteFileInput, WriteFileOutput } from './write-file.ts';
 // state, not external mutation. memory_list / read / search are
 // read-only (audit logs are internal); memory_write sits with the
 // other write tools because it persists to disk and is gated by
-// plan mode + operator confirm modal.
+// the operator confirm modal.
 //
 // pinContextTool is intentionally OMITTED from BUILTIN_TOOLS while
 // the `confirmPinContext` modal callback is not yet wired through

@@ -129,8 +129,8 @@ export const resolveResumeIdOnDb = (
     // prompt, diverging from how the subagent originally ran.
     // The audit snapshot from migration 012 enables future
     // re-hydration (O5b in BACKLOG) but the semantics need
-    // proper design (budget conflicts, plan mode, missing
-    // tools). For now we refuse and point at task().
+    // proper design (budget conflicts, missing tools). For now
+    // we refuse and point at task().
     return {
       ok: false,
       message: `cannot --resume a subagent session (id ${resume} is a subagent run; use the \`task\` tool to spawn a fresh subagent instead)`,
@@ -731,7 +731,6 @@ export const run = async (options: RunOptions): Promise<number> => {
       prompt: args.prompt,
       ...(args.model !== undefined ? { modelId: args.model } : {}),
       ...(args.maxSteps !== undefined ? { budget: { maxSteps: args.maxSteps } } : {}),
-      ...(args.plan === true ? { plan: true } : {}),
       ...(resumeFromSessionId !== undefined ? { resumeFromSessionId } : {}),
       ...(args.acceptBrokenChain === true ? { acceptBrokenChain: true } : {}),
       ...(args.sandboxHost === true ? { sandboxHost: true } : {}),
@@ -810,13 +809,6 @@ export const run = async (options: RunOptions): Promise<number> => {
           `forja: subagent '${shadow.name}' from ${shadow.shadowed.sourcePath} (${shadow.shadowed.scope}) is shadowed by ${shadow.winning.sourcePath} (${shadow.winning.scope})\n`,
         );
       }
-    }
-
-    // Plan mode indicator on stderr — stdout stays a clean
-    // transcript / NDJSON. Skip in JSON mode (per spec §2.2 stdout
-    // is NDJSON only; admin-style output goes to stderr regardless).
-    if (args.plan === true) {
-      errSink('[plan mode] read-only run; write tools are blocked at the harness\n');
     }
 
     // Surface lock-conflict warnings before the run starts. Each

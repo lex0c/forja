@@ -37,21 +37,6 @@ describe('parseArgs', () => {
     expect(r.args.prompt).toBe('do thing');
   });
 
-  test('--plan flag', () => {
-    const r = parseArgs(['--plan', 'refactor src/auth.ts']);
-    expect(r.ok).toBe(true);
-    if (!r.ok) return;
-    expect(r.args.plan).toBe(true);
-    expect(r.args.prompt).toBe('refactor src/auth.ts');
-  });
-
-  test('--plan defaults to false when omitted', () => {
-    const r = parseArgs(['hi']);
-    expect(r.ok).toBe(true);
-    if (!r.ok) return;
-    expect(r.args.plan).toBe(false);
-  });
-
   test('--autonomous flag seeds the autonomous approval posture', () => {
     const r = parseArgs(['--autonomous', 'do the thing']);
     expect(r.ok).toBe(true);
@@ -465,36 +450,15 @@ describe('--subagent-temperature', () => {
   });
 });
 
-describe('--subagent-plan-mode', () => {
-  test('presence-only flag sets args.subagentPlanMode = true', () => {
-    const r = parseArgs(['--subagent-plan-mode']);
-    expect(r.ok).toBe(true);
-    if (!r.ok) return;
-    expect(r.args.subagentPlanMode).toBe(true);
-  });
-
-  test('absent by default — child runs without plan-mode gate', () => {
-    const r = parseArgs(['hi']);
-    expect(r.ok).toBe(true);
-    if (!r.ok) return;
-    expect(r.args.subagentPlanMode).toBeUndefined();
-  });
-
-  test('coexists with --subagent-session-id and --subagent-depth', () => {
+describe('--subagent-session-id with --subagent-depth', () => {
+  test('coexists; the parser accepts any order', () => {
     // The internal flags arrive together in the spawn command;
     // the parser must accept any order.
-    const r = parseArgs([
-      '--subagent-session-id',
-      'abc',
-      '--subagent-depth',
-      '2',
-      '--subagent-plan-mode',
-    ]);
+    const r = parseArgs(['--subagent-session-id', 'abc', '--subagent-depth', '2']);
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.args.subagentSessionId).toBe('abc');
     expect(r.args.subagentDepth).toBe(2);
-    expect(r.args.subagentPlanMode).toBe(true);
   });
 });
 
@@ -545,17 +509,10 @@ describe('--subagent-cwd-trusted', () => {
   });
 
   test('coexists with other internal subagent flags', () => {
-    const r = parseArgs([
-      '--subagent-session-id',
-      'sess-x',
-      '--subagent-cwd-trusted',
-      '--subagent-plan-mode',
-      '--ipc=1',
-    ]);
+    const r = parseArgs(['--subagent-session-id', 'sess-x', '--subagent-cwd-trusted', '--ipc=1']);
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.args.subagentCwdTrusted).toBe(true);
-    expect(r.args.subagentPlanMode).toBe(true);
     expect(r.args.subagentIpcVersion).toBe(1);
   });
 });
@@ -857,7 +814,6 @@ describe('usage', () => {
     expect(u).toContain('--version');
     expect(u).toContain('--help');
     expect(u).toContain('--json');
-    expect(u).toContain('--plan');
     expect(u).toContain('--model');
     expect(u).toContain('--max-steps');
     expect(u).toContain('--list-sessions');

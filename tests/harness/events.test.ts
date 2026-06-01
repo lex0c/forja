@@ -389,47 +389,6 @@ describe('runAgent onEvent', () => {
     expect(updated.items[0]?.activeForm).toBe('Implementing payment flow');
   });
 
-  test('todo_write under planMode still emits todo_updated (planSafe path)', async () => {
-    // todo_write declares metadata.planSafe = true (todo-write.ts:122)
-    // so the harness's plan-mode write-tool gate must let it through.
-    // Regression: a future change that flips planSafe to false (or
-    // removes the flag) would silently break TodoList observability
-    // for plan-mode sessions, which are a primary use of the planning
-    // signal in the first place.
-    const events: HarnessEvent[] = [];
-    const r = createToolRegistry();
-    r.register(todoWriteTool as unknown as Tool);
-    await runAgent({
-      provider: mockProvider([
-        {
-          tool_uses: [
-            {
-              id: 'tu1',
-              name: 'todo_write',
-              input: {
-                items: [{ content: 'plan it', status: 'pending', active_form: 'Planning it' }],
-              },
-            },
-          ],
-          stop_reason: 'tool_use',
-        },
-        { text: 'done', stop_reason: 'end_turn' },
-      ]),
-      toolRegistry: r,
-      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
-      db,
-      cwd: '/p',
-      userPrompt: 'hi',
-      planMode: true,
-      onEvent: (e) => events.push(e),
-    });
-    const updated = events.find((e) => e.type === 'todo_updated');
-    expect(updated).toBeDefined();
-    if (updated === undefined || updated.type !== 'todo_updated') return;
-    expect(updated.items).toHaveLength(1);
-    expect(updated.items[0]?.content).toBe('plan it');
-  });
-
   test('observer mutating todo_updated.items does not corrupt the next emission', async () => {
     // Asserts the wrap reads back through baseStore.get() (deep
     // clone) instead of forwarding the input array directly. Without

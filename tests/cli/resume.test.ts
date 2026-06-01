@@ -22,7 +22,6 @@ const baseArgs = (overrides: Partial<ParsedArgs> = {}): ParsedArgs => ({
   json: false,
   version: false,
   help: false,
-  plan: false,
   listSessions: false,
   includeSubagents: false,
   explainPermissions: false,

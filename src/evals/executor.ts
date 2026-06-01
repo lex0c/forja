@@ -49,10 +49,9 @@ interface CompactionRecord {
 // Default project policy injected when the case (or its fixture)
 // doesn't ship one. Evals run autonomously — there's no operator
 // to confirm tool calls, so strict mode would dead-end every
-// `read_file`/`write_file`/`bash`. Plan-mode block stays
-// independent: it lives at the harness layer and fires regardless
-// of policy. Cases that want stricter rules drop their own
-// `.agent/permissions.yaml` via `setup.files` or `fixture`.
+// `read_file`/`write_file`/`bash`. Cases that want stricter rules
+// drop their own `.agent/permissions.yaml` via `setup.files` or
+// `fixture`.
 const DEFAULT_EVAL_POLICY_YAML = `defaults:
   mode: bypass
 `;
@@ -395,7 +394,6 @@ export const executeCase = async (
       // callers can override via `bootstrapOverride.temperature`
       // when stochasticity is the property under test.
       temperature: 0,
-      ...(caseDef.plan === true ? { plan: true } : {}),
       ...(caseDef.setup?.approvalPosture !== undefined
         ? { approvalPosture: caseDef.setup.approvalPosture }
         : {}),

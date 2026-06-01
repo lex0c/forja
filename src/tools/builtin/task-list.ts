@@ -88,12 +88,6 @@ export const taskListTool: Tool<TaskListInput, TaskListOutput> = {
     writes: false,
     idempotent: true,
     parallel_safe: true,
-    // Plan mode: safe. Pure snapshot of in-memory state, no
-    // shell-out, no FS mutation. The fact that some handles
-    // may belong to subagents that DECLARED `isolation:
-    // worktree` doesn't change here — task_list only reads
-    // their metadata, not their tree.
-    planSafe: true,
     display: 'raw',
   },
   async execute(args, ctx): Promise<ToolResult<TaskListOutput>> {

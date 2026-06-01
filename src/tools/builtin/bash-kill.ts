@@ -47,11 +47,9 @@ export const bashKillTool: Tool<BashKillInput, BashKillOutput> = {
     // checkBash requires `args.command` and denies when absent,
     // which would default-deny every kill under non-bypass mode.
     // The process being killed was previously approved at spawn
-    // time; killing it doesn't open new attack surface. Plan mode
-    // still blocks (writes=true + no planSafe) — operators in
-    // plan mode shouldn't be triggering kills.
+    // time; killing it doesn't open new attack surface.
     category: 'misc',
-    // Sends a signal — pessimistic write under plan mode.
+    // Sends a signal — declared as a pessimistic write.
     writes: true,
     // Slice 150 (review): the `escapesCwd` field is misnamed for
     // this tool's case — bash_kill doesn't touch the filesystem,

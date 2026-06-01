@@ -50,20 +50,8 @@ describe('session lifecycle', () => {
     expect(r.state.status.sessionId).toBe('s1');
     expect(r.state.status.project).toBe('forja');
     expect(r.state.status.model).toBe('claude-opus-4-7');
-    expect(r.state.status.planMode).toBe(false);
     expect(r.state.ended).toBe(false);
     expect(r.permanent).toEqual([]);
-  });
-
-  test('session:start with planMode=true flips status.planMode', () => {
-    const r = applyEvent(createInitialState(), start({ planMode: true }));
-    expect(r.state.status.planMode).toBe(true);
-  });
-
-  test('session:start without planMode field defaults planMode to false', () => {
-    // Producer omitted the optional field — reducer treats as false.
-    const r = applyEvent(createInitialState(), start());
-    expect(r.state.status.planMode).toBe(false);
   });
 
   test('createInitialState defaults operationMode to supervised', () => {
@@ -1990,17 +1978,6 @@ describe('not-yet-wired events accept silently', () => {
         promptId: 'p1',
         name: 'x',
         body: 'y',
-      },
-    ],
-    [
-      'plan:review',
-      {
-        type: 'plan:review',
-        ts: 1,
-        promptId: 'p1',
-        steps: [],
-        estimatedCalls: 0,
-        estimatedCostUsd: 0,
       },
     ],
     ['bg:start', { type: 'bg:start', ts: 1, processId: 'b1', command: 'sleep' }],

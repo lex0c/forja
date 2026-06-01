@@ -106,12 +106,6 @@ export interface DispatchSemanticVerifyInput {
   sharedScopeOffline?: boolean;
   hooksSnapshot?: readonly HookSpec[];
   effectiveCapabilities?: readonly string[];
-  // R6 — forward parent's plan-mode posture so a future
-  // verify-semantic.md edit that widens the tool whitelist
-  // (e.g., adding `bash` for repo inspection) doesn't bypass
-  // plan-mode write refusal via the verify path. Today's
-  // whitelist is all read-only; defense-in-depth.
-  planMode?: boolean;
   // R6 — forward the parent's spawnChildProcess test seam so
   // verify dispatches in test environments hit the same fake
   // subprocess as task-tool spawns. Without this, tests that
@@ -351,7 +345,6 @@ export const dispatchSemanticVerify = async (
       ...(input.effectiveCapabilities !== undefined
         ? { effectiveCapabilities: input.effectiveCapabilities }
         : {}),
-      ...(input.planMode === true ? { planMode: true } : {}),
       ...(input.spawnChildProcess !== undefined
         ? { spawnChildProcess: input.spawnChildProcess }
         : {}),

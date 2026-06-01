@@ -233,11 +233,10 @@ export const monitorTool: Tool<MonitorInput, MonitorOutput> = {
   },
   metadata: {
     // Pure observational — no command, no path mutation. Same
-    // category and plan-mode treatment as wait_for.
+    // category as wait_for.
     category: 'misc',
     writes: false,
     idempotent: false, // wall-clock dependent
-    planSafe: true, // observational; safe in plan mode
     display: 'raw',
     cost: { latency_ms_typical: 0 },
   },

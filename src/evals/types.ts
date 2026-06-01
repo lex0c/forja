@@ -74,9 +74,6 @@ export interface EvalCase {
   // resolve `setup.fixture` relative paths.
   sourcePath: string;
   prompt: string;
-  // When true, the harness runs in plan mode (writes blocked).
-  // Same flag the CLI exposes as `--plan`.
-  plan?: boolean;
   setup?: EvalSetup;
   expect: EvalExpectation[];
   budget?: EvalBudget;

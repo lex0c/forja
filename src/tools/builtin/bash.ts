@@ -26,7 +26,6 @@ export interface BashInput {
   command: string;
   timeout_ms?: number;
   cwd?: string;
-  read_only?: boolean;
 }
 
 export interface BashOutput {
@@ -91,11 +90,6 @@ export const bashTool: Tool<BashInput, BashOutput> = {
         description: 'Kill the command after this many ms. Default 30000.',
       },
       cwd: { type: 'string', description: 'Working directory. Defaults to session cwd.' },
-      read_only: {
-        type: 'boolean',
-        description:
-          'Hint that the command is read-only. The permission engine may use this to allow without confirmation.',
-      },
     },
     required: ['command'],
   },
@@ -103,10 +97,6 @@ export const bashTool: Tool<BashInput, BashOutput> = {
     category: 'bash',
     writes: true,
     escapesCwd: true,
-    // Plan mode allows bash ONLY when the model declares the call
-    // read-only via `args.read_only === true`. Strict equality —
-    // string "true", truthy values, missing field all fail closed.
-    planSafe: (args) => (args as { read_only?: unknown }).read_only === true,
     exec: true,
     idempotent: false,
     display: 'raw',

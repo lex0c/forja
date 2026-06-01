@@ -91,8 +91,7 @@ const previewRow = (line: PreviewLine, caps: Capabilities): string => {
 // emit their own edge blanks (the permission flavor wraps its action in
 // leading/trailing blanks) would otherwise double the gap. Internal
 // blanks are preserved — they separate sub-blocks a producer
-// deliberately spaced (e.g. plan-review's steps vs. the cost estimate,
-// memory-user-scope's warning vs. the body).
+// deliberately spaced (e.g. memory-user-scope's warning vs. the body).
 const isBlankLine = (line: PreviewLine | undefined): boolean =>
   line === undefined ? false : typeof line === 'string' ? line === '' : line.text === '';
 

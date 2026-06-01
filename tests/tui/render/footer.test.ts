@@ -173,12 +173,6 @@ describe('renderFooter', () => {
     expect(out).not.toContain('esc to interrupt');
   });
 
-  test('plan mode does NOT add a `plan` chip (chip removed at operator request)', () => {
-    const s = startedSession({ planMode: true });
-    const out = renderFooter(s, caps) ?? '';
-    expect(out).not.toContain('plan');
-  });
-
   test('cost does NOT surface in the footer (chip removed)', () => {
     const out = renderFooter(startedSession({ costUsd: 12.34 }), caps) ?? '';
     expect(out).not.toContain('$');

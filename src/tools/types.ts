@@ -47,32 +47,6 @@ export interface ToolMetadata {
   // Side effect declarations. `writes: true` triggers checkpoint creation
   // in the harness (Step 5+).
   writes: boolean;
-  // Plan-mode predicate. When the harness is in plan mode and
-  // the tool has `writes: true`, this decides per-invocation
-  // whether the call may proceed. Three forms:
-  //   - omitted: every invocation blocked in plan mode (default
-  //     for write_file/edit_file — they ALWAYS mutate, the gate
-  //     here IS bullet-proof).
-  //   - `true`: every invocation allowed regardless of args.
-  //     Equivalent to "plan mode trusts this tool unconditionally".
-  //   - function: per-call predicate that inspects args. The
-  //     canonical case is `bash` — it CAN write, but the model
-  //     declares intent via `args.read_only`. Boolean-only would
-  //     either block legitimate inspections (git status, ls, cat)
-  //     or silently allow `echo x > file`. The predicate lets the
-  //     tool author encode the rule that `read_only === true` is
-  //     the gate.
-  //
-  // IMPORTANT: the predicate form is best-effort, NOT a security
-  // boundary. It catches honest models that forget to declare
-  // intent. It does NOT catch confused or adversarial models that
-  // declare `read_only: true` while sending `echo x > file` —
-  // observed in practice. Real protection
-  // for adversarial inputs requires sandbox (spec §9.1, M3+).
-  // The `writes: true` + omitted-predicate combo IS bullet-proof
-  // because the harness never executes the tool. Use that for
-  // tools that should never run in plan mode period.
-  planSafe?: boolean | ((args: Record<string, unknown>) => boolean);
   network?: boolean;
   exec?: boolean;
   // Side effects of this tool may escape `ctx.cwd` — bash, network
@@ -124,11 +98,11 @@ export interface ToolMetadata {
   // require operator confirmation MUST NOT declare it (modal
   // serialization is per-modal-manager, not per-tool).
   //
-  // `bash` is intentionally NOT flagged even though `args.read_only`
-  // exists: the flag is a model declaration, not a static property,
-  // and spec §9.1 documents it's not a security boundary. Letting a
-  // runtime hint gate parallelism would let an adversarial model
-  // amplify a race.
+  // `bash` is intentionally NOT flagged: whether a given command is
+  // read-only is a runtime property of its args, not a static
+  // property of the tool, and spec §9.1 documents that such hints
+  // aren't a security boundary. Letting a runtime hint gate
+  // parallelism would let an adversarial model amplify a race.
   //
   // Default false is the safe choice — opt-in keeps every existing
   // tool serial until it's been audited for parallel safety.
@@ -325,8 +299,8 @@ export interface ToolContext {
   // sessionId so the link is captured automatically.
   spawnSubagent?: (args: SpawnSubagentArgs) => Promise<SpawnSubagentResult>;
   // Async subagent handle store (spec ORCHESTRATION.md §3). Set by
-  // the harness when a subagent registry is wired and the run is
-  // not in plan mode. `task_async` calls `store.spawn(args)` to
+  // the harness when a subagent registry is wired. `task_async`
+  // calls `store.spawn(args)` to
   // get a handle; `task_await` and `task_cancel` use the same
   // store instance. Run-scoped — the same store survives across
   // every step in a single `runAgent` call so a handle returned

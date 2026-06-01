@@ -29,7 +29,6 @@ const makeArgs = (overrides: Partial<ParsedArgs> = {}): ParsedArgs => ({
   help: false,
   version: false,
   yes: false,
-  plan: false,
   listSessions: false,
   includeSubagents: false,
   explainPermissions: false,
@@ -2102,44 +2101,6 @@ describe('repl — slash commands integration', () => {
     expect(await promise).toBe(130);
   });
 
-  test('/plan on propagates planMode to the next turn adapter ctx', async () => {
-    // Same regression class as /budget: pre-fix the planMode flag was
-    // captured from baseConfig at boot. /plan on mutated baseConfig
-    // but the adapter kept emitting session:start without planMode —
-    // footer's `plan` token never appeared. Post-fix the ctx is rebuilt
-    // per turn so the next session:start carries the new flag.
-    const stdin = makeStdin();
-    const writes: string[] = [];
-    const ra = makeRunAgent((n) => `sess-${n}`);
-    const promise = runRepl({
-      args: makeArgs(),
-      bootstrapOverride: makeBootstrapStub(),
-      stdin,
-      skipTtyCheck: true,
-      skipTrustPrompt: true,
-      runAgentOverride: ra.runAgent,
-      rendererWrite: (s) => {
-        writes.push(s);
-      },
-    });
-    await tick();
-    // Enable plan mode BEFORE any turn so we exercise the most likely
-    // operator flow (toggle + immediately prompt).
-    stdin.feed('/plan on\r');
-    await flushFrame();
-    stdin.feed('go\r');
-    await tick();
-    // Footer `plan` chip was removed; verify the contract directly
-    // by inspecting the HarnessConfig the stub received.
-    expect(ra.captured[0]?.configs[0]?.planMode).toBe(true);
-    ra.emitInto(0, { type: 'session_start', sessionId: 'sess-1' });
-    await flushFrame();
-    ra.finish(0);
-    await tick();
-    stdin.feed('\x04');
-    expect(await promise).toBe(130);
-  });
-
   test('unknown slash command + Enter does NOT call runAgent (regression)', async () => {
     // Pre-fix the slash mode gate keyed on state.slash !== null. The
     // reducer clears state.slash to null when the popover has zero
@@ -2836,95 +2797,6 @@ describe('repl — slash commands integration', () => {
 
     ra.finish(0);
     await tick();
-    stdin.feed('\x04');
-    expect(await promise).toBe(130);
-  });
-
-  test('slash playbook inherits plan mode when /plan on is active', async () => {
-    // Regression: runPlaybook ignored baseConfig.planMode, so a
-    // playbook dispatched via /<slash> while the operator had
-    // /plan on enabled would run with write-capable behavior —
-    // a sandbox escape vs. the foreground harness's read-only
-    // guard. The bridge now mirrors the harness's
-    // spawnSubagentImpl wiring (loop.ts) and forwards planMode
-    // verbatim from baseConfig.
-    const stub = makeBootstrapStub();
-    const fakeDef = {
-      name: 'fake',
-      description: 'fake subagent for tests',
-      tools: [],
-      budget: { maxSteps: 1, maxCostUsd: 0.01 },
-      systemPrompt: 'noop',
-      scope: 'project',
-      isolation: 'none',
-      sourcePath: '/dev/null',
-      sourceSha256: '0'.repeat(64),
-      slash: 'fake',
-    };
-    (stub.subagents.byName as Map<string, unknown>).set('fake', fakeDef);
-
-    let capturedPlanMode: boolean | undefined;
-    const fakeRunSubagent = async (
-      input: Parameters<typeof import('../../src/subagents/index.ts').runSubagent>[0],
-    ): ReturnType<typeof import('../../src/subagents/index.ts').runSubagent> => {
-      capturedPlanMode = input.planMode;
-      return {
-        output: '(no-op)',
-        sessionId: 'sess-fake-child',
-        status: 'done',
-        reason: 'done',
-        costUsd: 0,
-        steps: 0,
-        durationMs: 0,
-      };
-    };
-
-    const stdin = makeStdin();
-    const ra = makeRunAgent((n) => `sess-${n}`);
-    const promise = runRepl({
-      args: makeArgs(),
-      bootstrapOverride: stub,
-      stdin,
-      skipTtyCheck: true,
-      skipTrustPrompt: true,
-      runAgentOverride: ra.runAgent,
-      runSubagentOverride: fakeRunSubagent,
-    });
-    await tick();
-
-    // Toggle plan mode ON via the slash command — same surface
-    // the operator uses. baseConfig.planMode flips to true.
-    stdin.feed('/plan on\r');
-    await tick();
-    await flushFrame();
-
-    // Now dispatch the playbook. The bridge must read the
-    // freshly-toggled planMode and forward it.
-    stdin.feed('/fake go\r');
-    await tick();
-    await tick();
-    await flushFrame();
-
-    expect(capturedPlanMode).toBe(true);
-
-    // Toggle OFF and dispatch again to confirm the read is
-    // FRESH per dispatch (a stale capture at REPL boot would
-    // pin true forever even after /plan off).
-    stdin.feed('/plan off\r');
-    await tick();
-    await flushFrame();
-
-    capturedPlanMode = undefined;
-    stdin.feed('/fake go\r');
-    await tick();
-    await tick();
-    await flushFrame();
-
-    // After /plan off, planMode should NOT be forwarded
-    // (undefined / absent on the input — the conditional spread
-    // omits the field rather than passing `false`).
-    expect(capturedPlanMode).toBeUndefined();
-
     stdin.feed('\x04');
     expect(await promise).toBe(130);
   });

@@ -5,7 +5,6 @@ import { costCommand } from '../../../src/cli/slash/commands/cost.ts';
 import { buildHelpCommand } from '../../../src/cli/slash/commands/help.ts';
 import { modelCommand } from '../../../src/cli/slash/commands/model.ts';
 import { permsCommand, renderPolicy } from '../../../src/cli/slash/commands/perms.ts';
-import { planCommand } from '../../../src/cli/slash/commands/plan.ts';
 import { quitCommand } from '../../../src/cli/slash/commands/quit.ts';
 import { sessionsCommand } from '../../../src/cli/slash/commands/sessions.ts';
 import { subagentsCommand } from '../../../src/cli/slash/commands/subagents.ts';
@@ -41,7 +40,6 @@ const makeCtx = (overrides: Partial<SlashContext> = {}): SlashContext => {
   const baseConfig = {
     cwd: '/test/cwd',
     enableCheckpoints: false,
-    planMode: false,
     budget: { ...DEFAULT_BUDGET },
     provider: {
       id: 'test/m',
@@ -358,71 +356,6 @@ describe('/model', () => {
   test('/model with too many args returns error', async () => {
     const result = await modelCommand.exec(['a', 'b'], makeCtx());
     expect(result.kind).toBe('error');
-  });
-});
-
-describe('/plan', () => {
-  test('reports plan mode disabled by default', async () => {
-    const result = await planCommand.exec([], makeCtx());
-    if (result.kind !== 'ok') return;
-    expect(result.notes?.[0]).toContain('disabled');
-  });
-
-  test('reports plan mode enabled when set', async () => {
-    const ctx = makeCtx();
-    (ctx.baseConfig as { planMode: boolean }).planMode = true;
-    const result = await planCommand.exec([], ctx);
-    if (result.kind !== 'ok') return;
-    expect(result.notes?.[0]).toContain('enabled');
-  });
-
-  test('/plan on flips planMode true and notes next-turn pickup', async () => {
-    const ctx = makeCtx();
-    expect(ctx.baseConfig.planMode).toBeFalsy();
-    const result = await planCommand.exec(['on'], ctx);
-    if (result.kind !== 'ok') return;
-    expect(ctx.baseConfig.planMode).toBe(true);
-    expect(result.notes?.[0]).toContain('enabled');
-    expect(result.notes?.[0]).toContain('next turn');
-  });
-
-  test('/plan off flips planMode false', async () => {
-    const ctx = makeCtx();
-    (ctx.baseConfig as { planMode: boolean }).planMode = true;
-    const result = await planCommand.exec(['off'], ctx);
-    if (result.kind !== 'ok') return;
-    expect(ctx.baseConfig.planMode).toBe(false);
-    expect(result.notes?.[0]).toContain('disabled');
-  });
-
-  test('/plan on when already enabled is a no-op (idempotent note)', async () => {
-    const ctx = makeCtx();
-    (ctx.baseConfig as { planMode: boolean }).planMode = true;
-    const result = await planCommand.exec(['on'], ctx);
-    if (result.kind !== 'ok') return;
-    expect(result.notes?.[0]).toContain('already');
-    // No mutation note; the next-turn cue only appears on actual flips.
-    expect(result.notes?.[0]).not.toContain('next turn');
-  });
-
-  test('/plan with unknown arg returns error', async () => {
-    const result = await planCommand.exec(['maybe'], makeCtx());
-    expect(result.kind).toBe('error');
-    if (result.kind !== 'error') return;
-    expect(result.message).toContain('unknown arg');
-  });
-
-  test('/plan with too many args returns error', async () => {
-    const result = await planCommand.exec(['on', 'extra'], makeCtx());
-    expect(result.kind).toBe('error');
-  });
-
-  test('/plan on appends current-turn cue when a turn is running', async () => {
-    const ctx = makeCtx({ isRunning: () => true });
-    const result = await planCommand.exec(['on'], ctx);
-    if (result.kind !== 'ok') return;
-    expect(result.notes?.length).toBe(2);
-    expect(result.notes?.[1]).toContain('current turn');
   });
 });
 

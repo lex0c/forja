@@ -49,7 +49,6 @@ beforeEach(() => {
   const baseConfig = {
     cwd: workdir,
     enableCheckpoints: false,
-    planMode: false,
     budget: { ...DEFAULT_BUDGET },
     provider: { id: 'test/m', capabilities: { context_window: 1000, output_max_tokens: 100 } },
     memoryRegistry: registry,

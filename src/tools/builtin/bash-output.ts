@@ -81,10 +81,6 @@ export const bashOutputTool: Tool<BashOutputInput, BashOutputOutput> = {
     // Reading a fixed `since` window is idempotent. Reading without
     // `since` advances the cursor and is therefore not.
     idempotent: false,
-    // Plan mode: reading bg output is read-only. A predicate
-    // wouldn't add value (no flag to flip), so allow
-    // unconditionally — the spawn was already gated.
-    planSafe: true,
     display: 'raw',
     cost: { latency_ms_typical: 5 },
   },

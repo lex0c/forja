@@ -42,26 +42,6 @@ describe('harness-adapter — session lifecycle', () => {
     expect(budget.maxCostUsd).toBe(1.5);
   });
 
-  test('planMode in ctx surfaces on session:start.planMode', () => {
-    const a = createHarnessAdapter({ ...baseCtx(), planMode: true });
-    const out = a.translate({ type: 'session_start', sessionId: 's' });
-    const start = out.find((e) => e.type === 'session:start') as Extract<
-      UIEvent,
-      { type: 'session:start' }
-    >;
-    expect(start.planMode).toBe(true);
-  });
-
-  test('omitted planMode does not include the field on session:start', () => {
-    const a = createHarnessAdapter(baseCtx());
-    const out = a.translate({ type: 'session_start', sessionId: 's' });
-    const start = out.find((e) => e.type === 'session:start') as Extract<
-      UIEvent,
-      { type: 'session:start' }
-    >;
-    expect(start.planMode).toBeUndefined();
-  });
-
   test('memoryCount in ctx surfaces on session:start.memoryCount', () => {
     const a = createHarnessAdapter({ ...baseCtx(), memoryCount: 5 });
     const out = a.translate({ type: 'session_start', sessionId: 's' });

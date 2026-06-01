@@ -121,10 +121,6 @@ export interface StatusState {
   // null = no cap configured. Renderer shows steps/cost without budget
   // shading when cap absent.
   maxCostUsd: number | null;
-  // Plan mode (read-only profile). Surfaced in the footer's right
-  // column as a `plan` token between model and budget. Default false
-  // on createInitialState; flipped by `session:start.planMode`.
-  planMode: boolean;
   // Approval posture (Supervised / Autonomous) shown in the footer in
   // place of the help cue. Default 'supervised' on createInitialState;
   // seeded by `session:start.operationMode`, flipped at runtime by
@@ -213,7 +209,7 @@ export interface ConfirmState {
   promptId: string;
   // Flavor lets the renderer pick layout details and the reducer
   // route to the right answer shape. All confirm-shaped modals
-  // (permission, trust, memory write, plan review) share
+  // (permission, trust, memory write) share
   // this single state field — only one modal visible at a time.
   flavor:
     | 'permission'
@@ -222,7 +218,6 @@ export interface ConfirmState {
     | 'memory-write'
     | 'memory-user-scope'
     | 'memory-action'
-    | 'plan-review'
     | 'history-clear';
   // Title block: bold first line + dim subject. `subject` is
   // optional — null when the modal has no single target.
@@ -457,7 +452,6 @@ export const createInitialState = (): LiveState => ({
     maxSteps: 0,
     costUsd: 0,
     maxCostUsd: null,
-    planMode: false,
     operationMode: 'supervised',
     memoryCount: 0,
     contextWindow: 0,
@@ -780,7 +774,6 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         sessionId: event.sessionId,
         project: event.project,
         model: event.model,
-        planMode: event.planMode === true,
         memoryCount: event.memoryCount ?? 0,
         // operationMode is intentionally NOT touched here: it's seeded
         // at boot by session:banner and flipped by mode:change. A bare
@@ -1795,8 +1788,8 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // wrapped at fixed columns) — the renderer wraps via
       // wrap-ansi at terminal width, and pre-wrapping here would
       // either truncate in narrow terminals or produce a
-      // fragmented look in wide ones. Trust modal and plan-review
-      // follow the same convention.
+      // fragmented look in wide ones. The trust modal follows the
+      // same convention.
       const options: ConfirmOption[] = [
         { key: '1', label: 'Yes, persist to user scope', value: 'yes' },
         { key: '2', label: 'No, cancel write', value: 'no' },
@@ -1816,37 +1809,6 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
               ...event.body.split('\n'),
             ],
             question: 'Persist to user scope?',
-            options,
-            selectedIndex: options.length - 1,
-            hints: ['Esc to cancel'],
-            queueDepth: 0,
-          },
-        },
-        permanent: [],
-      };
-    }
-
-    case 'plan:review': {
-      const options: ConfirmOption[] = [
-        { key: '1', label: 'Approve', value: 'yes' },
-        { key: '2', label: 'Edit', value: 'edit' },
-        { key: '3', label: 'Reject', value: 'no' },
-      ];
-      const previewLines = [
-        ...event.steps.map((s, i) => `${i + 1}. ${s}`),
-        '',
-        `estimated: ${event.estimatedCalls} tool calls · $${event.estimatedCostUsd.toFixed(2)}`,
-      ];
-      return {
-        state: {
-          ...state,
-          modal: {
-            promptId: event.promptId,
-            flavor: 'plan-review',
-            title: 'Plan review',
-            subject: `${event.steps.length} steps`,
-            preview: previewLines,
-            question: 'Approve this plan?',
             options,
             selectedIndex: options.length - 1,
             hints: ['Esc to cancel'],

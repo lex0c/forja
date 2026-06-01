@@ -344,31 +344,6 @@ describe('per-flavor reducer option lists', () => {
     // Default = last (No), per D5 conservative-default convention.
     expect(state.modal.selectedIndex).toBe(1);
   });
-
-  test('plan:review builds 3 options (approve / edit / reject), default = last (reject)', () => {
-    const state = applyEvent(createInitialState(), {
-      type: 'plan:review',
-      ts: 1,
-      promptId: 'p1',
-      steps: ['read foo', 'edit bar', 'run tests'],
-      estimatedCalls: 5,
-      estimatedCostUsd: 0.034,
-    }).state;
-    if (state.modal === null) throw new Error('modal not set');
-    expect(state.modal.flavor).toBe('plan-review');
-    expect(state.modal.options.map((o) => o.value)).toEqual(['yes', 'edit', 'no']);
-    expect(state.modal.selectedIndex).toBe(2);
-    // Preview: numbered steps + estimate footer.
-    expect(state.modal.preview[0]).toBe('1. read foo');
-    expect(
-      state.modal.preview.some((l) =>
-        (typeof l === 'string' ? l : l.text).includes('5 tool calls'),
-      ),
-    ).toBe(true);
-    expect(
-      state.modal.preview.some((l) => (typeof l === 'string' ? l : l.text).includes('$0.03')),
-    ).toBe(true);
-  });
 });
 
 describe('modal:select reducer behavior', () => {

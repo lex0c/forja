@@ -150,24 +150,6 @@ describe('hooks Slice 2 — SessionStart', () => {
     expect(ss[0]?.exitCode).toBe(0);
     expect(ss[0]?.layer).toBe('project');
   });
-
-  test('plan profile threaded through payload', async () => {
-    const marker = join(scratch, 'profile.txt');
-    const hooks: HookSpec[] = [baseSpec({ event: 'SessionStart', command: `cat > ${marker}` })];
-    const config: HarnessConfig = {
-      provider: mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]),
-      toolRegistry: createToolRegistry(),
-      permissionEngine: createPermissionEngine(policy(), { cwd: scratch }),
-      db,
-      cwd: scratch,
-      userPrompt: 'hi',
-      planMode: true,
-      hooks,
-    };
-    await runAgent(config);
-    const parsed = JSON.parse(await readFile(marker, 'utf8'));
-    expect(parsed.data.profile).toBe('plan');
-  });
 });
 
 describe('hooks Slice 2 — Stop', () => {

@@ -127,7 +127,7 @@ const main = async (): Promise<number> => {
   // Subagent-child mode. The parent process
   // spawns the same binary with this flag set; the value is the
   // pre-created child session id. Short-circuits ALL other entry
-  // paths — no prompt, no list-sessions, no resume, no plan.
+  // paths — no prompt, no list-sessions, no resume.
   // Lazy import for the same reason as `./run.ts` below: keeps
   // the help/version branches above immune to provider/storage
   // wiring failures.
@@ -144,12 +144,6 @@ const main = async (): Promise<number> => {
       // "use provider default", explicit value pins the child's
       // sampling for determinism.
       ...(args.subagentTemperature !== undefined ? { temperature: args.subagentTemperature } : {}),
-      // Plan-mode flag (presence-only). Forwards the parent's
-      // run-wide read-only profile so the child's harness gate
-      // refuses writing tools too — defense in depth for any
-      // programmatic caller that invokes runSubagent with
-      // planMode:true.
-      ...(args.subagentPlanMode === true ? { planMode: true } : {}),
       // Trust verdict from the parent's bootstrap. Spec §9 trust
       // is per-project; the child runs under the parent's
       // resolved verdict instead of re-resolving from disk

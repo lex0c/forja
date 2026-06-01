@@ -45,7 +45,7 @@ export type PlaybookDispatcher = (input: PlaybookDispatchInput) => Promise<RunSu
 
 export interface SlashContext {
   // Shared mutable harness-config handle the REPL bootstrapped
-  // with. Commands read model id, plan flag, budget caps from
+  // with. Commands read model id and budget caps from
   // here. Mutation commands (`/model`, `/memory governance
   // enable|disable`) update fields IN PLACE; the next `startTurn`
   // reads the updated value via its spread copy. Current in-flight

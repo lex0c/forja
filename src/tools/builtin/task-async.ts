@@ -78,9 +78,6 @@ export const taskAsyncTool: Tool<TaskAsyncInput, TaskAsyncOutput> = {
     category: 'misc',
     writes: false,
     idempotent: false,
-    // Plan mode: blocked, same as `task`. A subagent with write
-    // tools could end-run plan mode even via the async surface.
-    planSafe: false,
     display: 'raw',
   },
   async execute(args, ctx): Promise<ToolResult<TaskAsyncOutput>> {

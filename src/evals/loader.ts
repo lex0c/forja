@@ -18,7 +18,6 @@ const VALID_EXIT_REASONS: ReadonlySet<string> = new Set(EXIT_REASONS);
 const TOP_LEVEL_KEYS: ReadonlySet<string> = new Set([
   'name',
   'prompt',
-  'plan',
   'setup',
   'expect',
   'budget',
@@ -304,9 +303,6 @@ export const parseEvalCase = (yamlText: string, sourcePath: string): EvalCase =>
   const name = requireString(r.name, `${sourcePath}: name`);
   const prompt = requireString(r.prompt, `${sourcePath}: prompt`);
 
-  if (r.plan !== undefined && typeof r.plan !== 'boolean') {
-    throw new Error(`eval: ${sourcePath}: plan must be boolean`);
-  }
   if (!Array.isArray(r.expect)) {
     throw new Error(`eval: ${sourcePath}: expect must be a list`);
   }
@@ -321,7 +317,6 @@ export const parseEvalCase = (yamlText: string, sourcePath: string): EvalCase =>
     prompt,
     expect,
   };
-  if (r.plan === true) out.plan = true;
   const setup = parseSetup(r.setup);
   if (setup !== undefined) out.setup = setup;
   const budget = parseBudget(r.budget);

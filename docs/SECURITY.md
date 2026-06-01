@@ -552,16 +552,7 @@ External processes Forja connects to via `@modelcontextprotocol/sdk` (M3+ work).
 
 Threat model: MCP servers are TRUSTED to the same degree as bundled tools, BUT their inputs flow through resolvers and sandbox planning just like native tools. A malicious MCP server can lie about its tool's capabilities (the spec calls this `mcp.spec.violation`) but cannot bypass the engine — the worst case is a `classifier-low` confidence that forces confirm.
 
-### 5.5.5 Plan mode
-
-`--plan` CLI flag. Disables every write-shaped tool globally for the session:
-
-- Engine returns `deny` for any decision whose capability set includes `write-fs`, `delete-fs`, `git-write`, `net-egress`, `net-ingress`, `env-mutate`, or `agent-mutate`.
-- `enableCheckpoints: false` — no git probe per spawn (nothing to undo when no writes can land).
-
-Used for "explore this codebase safely" workflows where the operator wants the model to read + reason but never modify. Audit rows in plan mode carry the deny reason `plan_mode_active` so replays can distinguish plan-deny from policy-deny.
-
-### 5.5.6 `memory_write` modal
+### 5.5.5 `memory_write` modal
 
 `src/tools/builtin/memory-write.ts`. Spec MEMORY.md §5.1.
 
@@ -569,7 +560,7 @@ Operator-facing memory writes (entries under `~/.config/agent/memory/`) require 
 
 Refused writes audit-log as `memory_events.action='refused'`. The modal-manager distinguishes 'no' from 'cancel' for telemetry — both deny the write but operators reading audit can tell explicit rejection from accidental dismissal.
 
-### 5.5.7 Budget gates
+### 5.5.6 Budget gates
 
 Three independent budgets bound the session against runaway behavior:
 
@@ -586,7 +577,7 @@ Budget-exhausted exits feed `failure_events` and `outcome_signals.session_aborte
 
 The budget gate is also a DoS defense: a prompt-injected LLM trying to "make N tool calls forever" hits `maxSteps` and stops; a runaway cost loop hits `maxCostUsd`.
 
-### 5.5.8 Broker subsystem (JSON IPC)
+### 5.5.7 Broker subsystem (JSON IPC)
 
 `src/broker/`. Spec §13.7.
 
@@ -625,7 +616,7 @@ The broker also calls `scrubEnv` on the worker's env so credentials don't leak t
 | worker crash / no response | n/a | `error: 'worker produced no response'`, `exitCode` set |
 | malformed worker response | n/a | `error: 'invalid response: ...'`, `exitCode` set; `worker.crashed` telemetry emitted |
 
-### 5.5.9 Env scrubbing
+### 5.5.8 Env scrubbing
 
 `src/sanitize/env.ts`. Applied at every spawn boundary (bash tool, bg/manager, broker worker, subagent spawn).
 
@@ -650,7 +641,7 @@ False positives (e.g., a legitimate `BUILD_TOKEN`) are acceptable cost — scrip
 - AUDIT DRIFT stderr lines from `hooks/dispatcher.ts`, `memory/registry.ts` (3 sites), `failures/sink.ts` dual-write, `bg/manager.ts` drainer-crash (5 sites total — slice 178).
 - The recap renderer (`src/recap/format.ts:redactSecretsInIntermediate`) — pre-slice 177 the patterns lived there; promoted to `sanitize/` to avoid a `permissions → recap` layering reversal.
 
-### 5.5.10 `sandbox_skip` marker
+### 5.5.9 `sandbox_skip` marker
 
 `~/.config/forja/sandbox_skip`. Slice 122.
 
@@ -658,7 +649,7 @@ Marker file that, when present, lets Forja boot without the sandbox-availability
 
 Slice 128 R4 P0-Sand-2 added `.config/forja` to `HIDE_PATHS_DIRS` to prevent a sandboxed process from forging the marker (which would silently disable sandbox on next session start). Slice 122 also added a symlink-escape check — the `sandbox_skip` file itself must not be a symlink (would let an attacker plant a symlink pointing into HIDE_PATHS to bypass the marker check on a fresh boot).
 
-### 5.5.11 Operator introspection
+### 5.5.10 Operator introspection
 
 Read-only CLI verbs that surface engine state for review. Designed to run without an API key (DB+git only, no provider call) so post-incident forensics doesn't depend on provider availability.
 
@@ -675,7 +666,7 @@ Read-only CLI verbs that surface engine state for review. Designed to run withou
 
 These surfaces are the operator's main path to understand what the engine decided + why. Pre-incident, they support routine review; post-incident, they're the forensic floor.
 
-### 5.5.12 TUI modal as a security surface
+### 5.5.11 TUI modal as a security surface
 
 The modal renderer itself implements several anti-confusion defenses (slice 125 R2 + slice 128 R4):
 
@@ -698,7 +689,7 @@ The modal is the human-in-the-loop. Every prior layer's job is to ensure it's RE
 
 Autonomous trades confirmation friction for the operator's standing consent to a bounded class of low-risk routine actions. It is not "bypass mode": it cannot reach anything the engine would have denied, and the audit trail stays complete.
 
-### 5.5.13 On-disk permissions hardening
+### 5.5.12 On-disk permissions hardening
 
 Several Forja-owned files capture secret-shaped payloads (raw bash stdout/stderr, subagent stderr panics, git checkpoints). Default umask leaves them world-readable (0644) inside a 0755 dir — any cohabitant local user reads them via `cat`. Slices 163 + 172 close the gap:
 

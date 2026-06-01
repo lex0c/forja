@@ -105,7 +105,7 @@ describe('askPermission (2-option modal per UI.md §4.10.13)', () => {
     // Permission flavor overrides D5/D65's "last = safe" default —
     // accept-the-call is the dominant workflow on a 2-option modal
     // and operators don't want the extra keystroke. Other flavors
-    // (trust / memory / plan-review) keep the
+    // (trust / memory) keep the
     // last-option default; their tests pin that separately.
     const s = make();
     const promise = s.manager.askPermission({

@@ -171,29 +171,6 @@ describe('executeCase', () => {
     expect(r.expectations[0]?.detail).toContain("'write_file' was called");
   });
 
-  test('plan mode blocks write_file: file_not_exists passes', async () => {
-    const c = baseCase({
-      plan: true,
-      expect: [
-        { kind: 'file_not_exists', path: 'leak.txt' },
-        { kind: 'output_contains', pattern: 'attempted' },
-      ],
-    });
-    const r = await executeCase(c, {
-      bootstrapOverride: {
-        providerOverride: mockProvider([
-          {
-            tool_uses: [
-              { id: 't1', name: 'write_file', input: { path: 'leak.txt', content: 'leak' } },
-            ],
-          },
-          { text: 'attempted but blocked' },
-        ]),
-      },
-    });
-    expect(r.passed).toBe(true);
-  });
-
   test('setup.files materializes inline files into cwd', async () => {
     const c = baseCase({
       setup: { files: { 'fixture.txt': 'preexisting\n' } },
@@ -238,36 +215,10 @@ describe('executeCase', () => {
     expect(r.passed).toBe(true);
   });
 
-  test('tool_denied passes when plan mode blocks a write tool', async () => {
-    // Plan mode unconditionally denies write_file (no planSafe).
-    // The mock emits a write_file tool_use; the gate fires with
-    // a deny decision; tool_denied: write_file matches.
-    const c = baseCase({
-      plan: true,
-      expect: [
-        { kind: 'tool_denied', tool: 'write_file' },
-        { kind: 'file_not_exists', path: 'leak.txt' },
-      ],
-    });
-    const r = await executeCase(c, {
-      bootstrapOverride: {
-        providerOverride: mockProvider([
-          {
-            tool_uses: [
-              { id: 't1', name: 'write_file', input: { path: 'leak.txt', content: 'leak' } },
-            ],
-          },
-          { text: 'attempted but blocked' },
-        ]),
-      },
-    });
-    expect(r.passed).toBe(true);
-  });
-
   test('tool_denied fails when the tool was invoked AND allowed', async () => {
     // Default eval policy is bypass — write_file would be allowed.
-    // Without plan mode, no deny fires; tool_denied must report
-    // "invoked but allowed" so the case author can spot the gap.
+    // No deny fires, so tool_denied must report "invoked but
+    // allowed" so the case author can spot the gap.
     const c = baseCase({
       expect: [{ kind: 'tool_denied', tool: 'write_file' }],
     });

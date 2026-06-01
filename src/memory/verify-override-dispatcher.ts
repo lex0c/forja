@@ -86,7 +86,6 @@ export interface DispatchOverrideVerifyInput {
   sharedScopeOffline?: boolean;
   hooksSnapshot?: readonly HookSpec[];
   effectiveCapabilities?: readonly string[];
-  planMode?: boolean;
   spawnChildProcess?: import('../subagents/runtime.ts').SpawnChildProcess;
   // Test seam — replaces runSubagent.
   spawnSubagentFn?: typeof runSubagent;
@@ -357,7 +356,6 @@ export const dispatchOverrideVerify = async (
       ...(input.effectiveCapabilities !== undefined
         ? { effectiveCapabilities: input.effectiveCapabilities }
         : {}),
-      ...(input.planMode === true ? { planMode: true } : {}),
       ...(input.spawnChildProcess !== undefined
         ? { spawnChildProcess: input.spawnChildProcess }
         : {}),

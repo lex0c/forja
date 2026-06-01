@@ -112,13 +112,6 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
     // (off in 4.1; revisited in 4.2 with worktree).
     writes: false,
     idempotent: false,
-    // Plan mode: blocked. A subagent with write tools could end-
-    // run plan mode by mutating files inside the child loop.
-    // Plan mode is supposed to be globally read-only, so we refuse
-    // task() entirely. The child harness DOES inherit plan mode
-    // separately when applicable, but the simplest correct rule is
-    // "no spawning during plan".
-    planSafe: false,
     display: 'raw',
   },
   async execute(args, ctx): Promise<ToolResult<TaskOutput>> {

@@ -69,12 +69,6 @@ export interface InvokeToolDeps {
   registry: ToolRegistry;
   engine: PermissionEngine;
   ctx: ToolContext;
-  // Plan mode flag — when true, tools whose metadata declares
-  // `writes: true` are blocked at the harness layer regardless of
-  // permission policy (AGENTIC_CLI §5). The block is independent of
-  // the engine so even a session-layer policy that allows writes
-  // can't subvert the read-only profile.
-  planMode?: boolean;
   // Async hook the harness calls when the engine returns a `confirm`
   // decision. The callback resolves with the user's answer:
   //   true  → execute the tool (recorded as confirm_yes)
@@ -270,114 +264,6 @@ export const invokeTool = async (
       failed: true,
       decision: null,
       errorMessage,
-    };
-  }
-
-  // Plan-mode write block. `writes: true` alone is too aggressive —
-  // tools like `bash` declare writes=true pessimistically (per
-  // CONTRACTS §2.6.3) but most invocations are read-only inspections.
-  // Tools opt out via `metadata.planSafe`:
-  //   - `true`: tool is unconditionally plan-safe (e.g., a future
-  //     read-only `db_query` that only accepts SELECTs).
-  //   - function: predicate inspects per-call args (e.g., bash
-  //     requires `args.read_only === true` so a mutating
-  //     `echo x > file` is still blocked even though bash itself
-  //     is plan-safe-capable).
-  //   - omitted: every plan-mode invocation blocked
-  //     (write_file, edit_file).
-  //
-  // The block runs BEFORE the permission engine but DOES persist a
-  // tool_call + approval row so `agent audit approvals` shows what
-  // the model attempted. Otherwise plan-mode denies would be
-  // forensically invisible.
-  const evalPlanSafe = (): boolean => {
-    const ps = tool.metadata.planSafe;
-    if (ps === undefined) return false;
-    if (typeof ps === 'boolean') return ps;
-    try {
-      return ps(input.args);
-    } catch {
-      // Predicate threw on malformed args — treat as unsafe.
-      // The downstream tool will produce its own validation
-      // error; here we just refuse to let the call through.
-      return false;
-    }
-  };
-  // Block in plan mode when EITHER:
-  //   - the tool declares `writes: true` and isn't plan-safe
-  //     (canonical case: write_file, edit_file, mutating bash)
-  //   - the tool declares `planSafe: false` explicitly
-  //
-  // The second branch covers tools whose own surface doesn't write
-  // (so `writes: false` is honest) but whose hidden side effects can
-  // bypass plan mode through an indirection. The canonical case is
-  // `task`: spawning a subagent doesn't itself touch the FS, but a
-  // subagent with `write_file` in its whitelist would mutate the
-  // tree from inside the child loop. Without this branch, `task`
-  // ran cleanly under `--plan` even with mutating subagents.
-  //
-  // We deliberately distinguish `planSafe === false` (literal,
-  // explicit refusal) from `undefined` (omitted). Read-only tools
-  // like grep/glob/read_file omit `planSafe` and are treated as
-  // safe-by-default-when-writes=false; only an explicit `false`
-  // opts a non-writing tool into the block.
-  const explicitlyPlanUnsafe = tool.metadata.planSafe === false;
-  const planBlocked =
-    deps.planMode === true &&
-    !evalPlanSafe() &&
-    (tool.metadata.writes === true || explicitlyPlanUnsafe);
-  if (planBlocked) {
-    // Tailor the deny reason: tools with a per-call predicate
-    // (e.g., bash) failed because the model didn't declare
-    // read-only intent; tools without any planSafe never have
-    // one. The distinction matters because the model can fix
-    // the former by retrying with `read_only: true`, but the
-    // latter is a hard architectural block.
-    const reason =
-      typeof tool.metadata.planSafe === 'function'
-        ? `plan mode: ${input.toolName} requires explicit read-only intent in args (e.g., read_only: true); call args did not satisfy the read-only predicate`
-        : explicitlyPlanUnsafe
-          ? `plan mode: ${input.toolName} is opted out of plan mode (planSafe: false) — its side effects bypass the read-only profile`
-          : `plan mode: ${input.toolName} mutates filesystem state and has no read-only path`;
-    const toolCall = withTransaction(deps.db, () => {
-      const tc = createToolCall(deps.db, {
-        messageId: input.messageId,
-        toolName: input.toolName,
-        input: input.args,
-        promptHash: deps.systemPromptHash ?? null,
-      });
-      recordApproval(deps.db, {
-        toolCallId: tc.id,
-        decision: 'deny',
-        decidedBy: 'policy',
-        reason,
-      });
-      finishToolCall(deps.db, {
-        id: tc.id,
-        status: 'denied',
-        durationMs: Date.now() - start,
-        error: reason,
-      });
-      return tc;
-    });
-    // Surface the actionable hint to the model. When the tool has
-    // a per-call planSafe predicate, the model can retry with the
-    // missing flag (e.g., bash with `read_only: true`). Without a
-    // predicate, the deny is structural — describe the change in
-    // the plan instead.
-    const modelMessage =
-      typeof tool.metadata.planSafe === 'function'
-        ? `denied: plan mode requires explicit read-only intent for ${input.toolName} (e.g., add \`read_only: true\` to args). Retry with the read-only declaration if the call really is read-only; otherwise describe the mutation in your plan instead of executing it.`
-        : explicitlyPlanUnsafe
-          ? `denied: plan mode is read-only — ${input.toolName} is not plan-safe. Continue your plan; describe what you would do instead of executing it.`
-          : `denied: plan mode is read-only — ${input.toolName} mutates filesystem state. Continue your plan; describe the change instead of applying it.`;
-    return {
-      toolResult: buildErrorBlock(input.toolUseId, input.toolName, modelMessage),
-      toolCallId: toolCall.id,
-      durationMs: Date.now() - start,
-      failed: true,
-      denied: true,
-      decision: { kind: 'deny', reason },
     };
   }
 

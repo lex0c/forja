@@ -150,8 +150,6 @@ loop iteration N
 
 Subagents are isolated child runs (separate session id, no parent state leak; see `docs/spec/IPC.md`) — the LLM-judge verdicts come back as a structured payload, never as in-band prose that could influence the parent's reasoning.
 
-The three step-boundary schedulers are **suppressed entirely in plan mode** (`--plan`). Plan mode declares a read-only session; LLM-judge dispatches write `memory_*_attempts` rows and (on negative verdicts) governance proposals — both governance-substrate writes that contradict the operator's framing. The schedulers never get constructed, no `poll()` runs, and the operator sees a single stderr line per enabled-but-suppressed detector (`memory: verify_*_disabled: plan mode active`). Detectors resume on the next non-plan run.
-
 System prompt header: the `# Memory` block (save-criteria, 4-type taxonomy, DO-NOT-save list, verify-before-act rule — see `src/cli/memory-prompt.ts:MEMORY_SECTION_HEADER`) **always renders when the memory subsystem is wired**, even on fresh repos with zero memories. The bullet list of memory inventory is what differs between empty + populated states; the guidance copy is unconditional so the model gets save criteria exactly when it's most likely to propose a bad inferred save (no precedent to imitate).
 
 ---
@@ -1039,10 +1037,6 @@ Spec backing: [`docs/spec/AGENTIC_CLI.md §5.4.1`](./spec/AGENTIC_CLI.md) (confi
 - `/memory governance status` — shows resolved state per detector with source label (`yes (default; disable: ...)`, `yes (.agent/config.toml)`, `yes (~/.config/agent/config.toml)`, `yes (--memory-verify-llm)`, `no (.agent/config.toml)`, `no (--no-memory-verify-llm)`, `no (default)`). Three blocks: `semantic-verify (S11)`, `verify-conflict (S13)`, `verify-override (S3)`. Each block renders enabled state + caps + recent attempts.
 
 Side effects: idempotent atomic write to `.agent/config.toml` (creates `.agent/` + file if absent; preserves other sections like `[providers]` verbatim via TOML round-trip; canonical re-emit so unknown comments are NOT preserved on touched blocks). The handler ALSO mutates the live `ctx.baseConfig.memory{Semantic,Conflict,Override}Detect` field + flips `*Source` to `'project-config'` — without this, the next `startTurn` snapshot would keep reading the pre-toggle value (process restart required for the effect to land). Effect applies at **next turn boundary** — not mid-session — matching the snapshot semantic of `/model`. Mid-flight turn already snapshotted its config; the new value applies on the next prompt.
-
-#### Plan mode suppresses detectors entirely
-
-A `--plan` session refuses scheduler construction for all three detectors regardless of `memory_*_llm` config. Plan mode is read-only by contract; LLM-judge dispatches write `memory_*_attempts` rows + (on negative verdicts) governance proposals, both governance-substrate writes. The boot emits a single stderr line per enabled-but-suppressed detector (`memory: verify_*_disabled: plan mode active — LLM-judge detectors skipped (no governance writes)`) so the operator sees what's NOT happening rather than wondering why proposals never land. Resume detectors by re-running without `--plan`.
 
 #### Config-loader warnings surface on stderr
 

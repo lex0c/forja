@@ -19,19 +19,6 @@ describe('parseEvalCase', () => {
     expect(c.prompt).toBe('hello');
     expect(c.expect.length).toBe(1);
     expect(c.expect[0]).toEqual({ kind: 'tool_called', tool: 'read_file' });
-    expect(c.plan).toBeUndefined();
-  });
-
-  test('parses plan flag', () => {
-    const yaml = `
-name: x
-prompt: y
-plan: true
-expect:
-  - status: done
-`;
-    const c = parseEvalCase(yaml, '/tmp/c.yaml');
-    expect(c.plan).toBe(true);
   });
 
   test('parses all expectation kinds', () => {

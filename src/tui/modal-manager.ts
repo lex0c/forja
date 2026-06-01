@@ -556,8 +556,8 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
     // Emit the answer event BEFORE resolving the promise so any
     // listener (audit, telemetry) sees the resolution before the
     // caller's `.then` runs. `decision` is a flavor-specific string
-    // — `permission` uses 'yes'/'no'/'cancel', `plan-review` uses
-    // 'yes'/'edit'/'no'/'cancel', etc. Consumers narrow per-flavor
+    // — `permission` uses 'yes'/'no'/'cancel', `trust` uses
+    // 'yes'/'no'/'cancel', etc. Consumers narrow per-flavor
     // by reading the original `*:ask` event.
     bus.emit({
       type: 'modal:answer',

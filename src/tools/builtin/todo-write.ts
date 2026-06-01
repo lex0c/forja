@@ -116,10 +116,6 @@ export const todoWriteTool: Tool<TodoWriteInput, TodoWriteOutput> = {
     writes: false,
     // Replacing the same items twice yields the same store state.
     idempotent: true,
-    // Plan mode: safe — no real-world side effect. The list is
-    // visible to the user as a checklist but there's nothing to
-    // undo or revert.
-    planSafe: true,
     display: 'raw',
     cost: { latency_ms_typical: 0 },
   },

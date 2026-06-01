@@ -68,9 +68,7 @@ const mockProvider = (script: ScriptedStep[]): Provider => {
 
 // Bash stub. `name: 'bash'` is what triggers the rewrite path in the
 // loop; the execute body is a no-op — we don't need real shell
-// behavior to verify the audit row landed. `planSafe: () => true`
-// keeps plan-mode tests (if any consume this stub) honest, though
-// the rewrite path doesn't depend on it.
+// behavior to verify the audit row landed.
 const bashStub: Tool = {
   name: 'bash',
   description: 'bash stub for rewrite audit tests',
@@ -78,7 +76,6 @@ const bashStub: Tool = {
   metadata: {
     category: 'bash',
     writes: true,
-    planSafe: true,
     idempotent: false,
   },
   async execute(args: unknown) {
