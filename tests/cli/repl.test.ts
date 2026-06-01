@@ -1300,6 +1300,43 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('Esc while editing a queued message cancels the edit (restores it, no interrupt)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    stdin.feed('keep me\r');
+    await tick();
+    stdin.feed('\x1b[A');
+    await tick();
+    // Edit in progress — non-empty buffer, so the empty-buffer cancel
+    // does NOT apply; Esc must be handled as a cancel key in its own right.
+    stdin.feed(' MANGLE');
+    await tick();
+    // Esc cancels the edit and restores "keep me" unchanged; it does NOT
+    // interrupt the running turn. (A lone Esc resolves after the parser's
+    // idle-drain timeout, hence flushFrame.)
+    stdin.feed('\x1b');
+    await flushFrame();
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('keep me');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('first Esc during a turn aborts the soft signal (cooperative), NOT the hard one', async () => {
     // Spec UI.md §3 + 1.g.1: first Esc is cooperative — softStopSignal
     // fires so the harness exits at the next step boundary, but the

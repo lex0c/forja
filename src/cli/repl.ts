@@ -2324,9 +2324,18 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         return true;
       }
     }
-    // ↓ while editing cancels the edit: the message stays queued
-    // unchanged and the input clears. Mirrors history's ↓-restores.
-    if (editingQueued !== null && key.kind === 'key' && key.name === 'down') {
+    // ↓ or Esc while editing cancels the edit: the message stays queued
+    // unchanged and the input clears (↓ mirrors history's ↓-restores; Esc
+    // is the documented cancel key, INBOX §6.1). Intercepted HERE, before
+    // applyKey turns Esc into an `interruptSoft` with an unchanged buffer:
+    // otherwise Esc would skip the empty-buffer cancel above (buffer not
+    // emptied) and fall to the soft-interrupt branch — interrupting the
+    // turn when busy, a no-op when idle — leaving the edit stranded.
+    if (
+      editingQueued !== null &&
+      key.kind === 'key' &&
+      (key.name === 'down' || key.name === 'escape')
+    ) {
       cancelQueuedEdit();
       bus.emit({ type: 'input:update', ts: now(), value: '', cursor: 0 });
       cancelExitArm();
