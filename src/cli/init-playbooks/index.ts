@@ -1,5 +1,5 @@
 // Bundled canonical playbooks (`PLAYBOOKS.md` §12 — distribution).
-// The 10 .md files in this directory are imported as text assets
+// The 11 .md files in this directory are imported as text assets
 // and exposed as a stable array. The playbooks step of `agent init`
 // writes each entry into `<cwd>/.agent/agents/`, where the loader
 // picks them up at the next REPL boot.
@@ -24,6 +24,7 @@ import explainMd from './explain.md' with { type: 'text' };
 import gapAuditMd from './gap-audit.md' with { type: 'text' };
 import gitHygieneMd from './git-hygiene.md' with { type: 'text' };
 import perfInvestigateMd from './perf-investigate.md' with { type: 'text' };
+import planMd from './plan.md' with { type: 'text' };
 import refactorMd from './refactor.md' with { type: 'text' };
 import securityAuditMd from './security-audit.md' with { type: 'text' };
 import threatModelMd from './threat-model.md' with { type: 'text' };
@@ -51,6 +52,7 @@ export const CANONICAL_PLAYBOOKS: ReadonlyArray<CanonicalPlaybook> = [
   { filename: 'gap-audit.md', content: gapAuditMd },
   { filename: 'git-hygiene.md', content: gitHygieneMd },
   { filename: 'perf-investigate.md', content: perfInvestigateMd },
+  { filename: 'plan.md', content: planMd },
   { filename: 'refactor.md', content: refactorMd },
   { filename: 'security-audit.md', content: securityAuditMd },
   { filename: 'threat-model.md', content: threatModelMd },

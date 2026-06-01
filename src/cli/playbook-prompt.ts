@@ -14,7 +14,7 @@
 //
 // Cap (`PLAYBOOKS.md` §1.4): the table holds at most 12 data rows
 // and the whole block stays under ~800 tokens. Twelve covers the
-// canonical 10 playbooks plus a small headroom; over the cap, the
+// canonical 11 playbooks plus a thin headroom; over the cap, the
 // table truncates with an "(... and N more)" footer and the
 // principal can still route by name (the full registry is always
 // authoritative — the table is a hint, not the registry itself).

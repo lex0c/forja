@@ -8,7 +8,7 @@ import { loadPolicyFromString } from '../../src/permissions/index.ts';
 // Synthetic playbook fixture used everywhere a test exercises the
 // playbooks step. Keeps test runtime stable and assertions surgical
 // (expected counts, expected filenames) without depending on the
-// full 10-entry canonical bundle. The orchestrator is agnostic to
+// full 11-entry canonical bundle. The orchestrator is agnostic to
 // which set it consumes.
 const FIXTURE_PLAYBOOKS = [
   {
@@ -529,7 +529,7 @@ describe('runInit — playbooks step', () => {
     // the same `loadSubagentFromString` that the runtime uses.
     const { CANONICAL_PLAYBOOKS } = await import('../../src/cli/init-playbooks/index.ts');
     const { loadSubagentFromString } = await import('../../src/subagents/index.ts');
-    expect(CANONICAL_PLAYBOOKS.length).toBe(10);
+    expect(CANONICAL_PLAYBOOKS.length).toBe(11);
     for (const playbook of CANONICAL_PLAYBOOKS) {
       const def = loadSubagentFromString(
         playbook.content,

@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-05-31] plan — recreate plan mode as a read-only `/plan` playbook
+
+The future-playbook the plan-mode removal entry promised. Plan mode returns not as a harness execution profile but as the **11th canonical playbook** (`src/cli/init-playbooks/plan.md`), so its read-only-ness comes from the capability/permission system (tool set + restrictions) instead of the deleted `planSafe` predicate. `tools: [read_file, grep, glob, bash]`, `isolation: worktree`, `slash: plan`; output schema is `summary` + `steps[{step,files,rationale,depends_on}]` + `risks[]` + `open_questions[]` + `not_planned[]` (the §1.2 `not_checked` slot) + `assumptions[]`. Body follows §1.3 (`# Plan` / purpose / `## DO NOT` / `## DO` / `## Quick search heuristics` / `## Output`). Registered alphabetically (between `perf-investigate` and `refactor`) in `init-playbooks/index.ts`; count comments + `init.test.ts` bumped 10→11; discovery-table cap (`playbook-prompt.ts`, 12) still covers 11 with headroom.
+
+The operator asked to "permita bash tool" — bash is restricted to a read-only allow-list (`git log/show/diff/status/blame/grep *`, `ls *`, `wc *`) in the git-hygiene/perf-investigate style.
+
+**Medium-effort review (2 finders + verify) caught real holes in the bash design I authored — all fixed.** (1) `find *` is NOT read-only: the matcher is prefix+`*`, so `find *` admits `find . -delete` / `find / -exec rm {} +` (arbitrary exec); removed (git-hygiene deliberately omits it too). (2) `tree *` admits `tree -o file` (write); removed. (3) The `## DO NOT` overclaimed containment ("throwaway worktree → never touches the operator's tree") — `isolation: worktree` only scopes the child's **cwd** (bash metadata is `escapesCwd: true`), so it contains relative writes but not absolute-path ones; reworded honest. (4) Stale `init.test.ts:11` comment ("10-entry") → 11. The standing lesson the review surfaced: a glob-prefix bash allow-list is a **soft filter, not a boundary** (chaining `;`/`&&`, redirects `>`, and absolute paths all bypass prefix globs) — the same caveat the removed `planSafe` carried; real adversarial read-only is the OS sandbox.
+
+**Validation:** typecheck clean; Biome clean; 55 tests (`init` + `playbook-prompt`) pass, including the loader loop that runs `loadSubagentFromString` over all 11 canonical playbooks (so the tightened frontmatter is validated).
+
+**Deferred (flagged, not done):** (1) no `evals/playbooks/plan/` stub — the fixtures test uses `>= 10` so it passes, but the "one stub per canonical playbook" contract is now 11-vs-10 and `/plan` has no regression coverage; (2) `docs/spec/PLAYBOOKS.md` catalogs each canonical in its own section and has no `plan` one — a spec edit, left for an explicit request. (3) `isolation: worktree` on a no-write-tool playbook costs a checkout per run; kept as defense-in-depth for the residual redirect vector, pending an explicit call.
+
+**Branch:** `feat/plan-playbook`.
+
 ## [2026-05-31] plan-mode — remove the read-only plan profile (code-only; spec kept)
 
 Operator's call: drop plan mode entirely from the code; it will return later as a playbook. `docs/spec/` is deliberately kept (plan mode stays a design target — code-behind-spec, same posture as the critique removal). Branched `chore/remove-plan-mode` off `develop`.
