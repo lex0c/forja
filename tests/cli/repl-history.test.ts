@@ -508,6 +508,38 @@ describe('repl — reverse-search overlay (HISTORY.md §2.2)', () => {
     await promise;
   });
 
+  test('a recalled slash command accepted while idle is staged, not sent as model text', async () => {
+    appendHistory(db, PROJECT_CWD, '/help', { ts: 1 });
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStubWithDb(db),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    // REPL is idle (no turn started). Reverse-search to "/help" and accept.
+    stdin.feed(CTRL_R);
+    await tick();
+    stdin.feed('help');
+    await tick();
+    stdin.feed('\r');
+    await tick();
+    // Staged for slash dispatch, NOT submitted — no turn starts with
+    // "/help" as a prompt.
+    expect(ra.captured).toHaveLength(0);
+    // Clear the staged "/help" and exit.
+    stdin.feed('\x7f'.repeat('/help'.length));
+    await tick();
+    stdin.feed('\x04');
+    await promise;
+  });
+
   test('Ctrl+R is blocked while editing a queued message (cannot strand it)', async () => {
     appendHistory(db, PROJECT_CWD, 'some history entry', { ts: 1 });
 

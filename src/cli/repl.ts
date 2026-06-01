@@ -1950,24 +1950,28 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         if (key.name === 'enter') {
           const match = currentReverseSearchMatch();
           if (match === null) return true;
-          if (isBusy()) {
-            // A turn/playbook is in flight. A plain match enqueues into the
-            // inbox (same path as a normal busy submit) so it drains at the
-            // next boundary. A slash-looking match (slash commands are in
-            // history too) is STAGED in the buffer instead — enqueuing it
-            // would drain the command to the model as plain text; staging
-            // lets the operator's next Enter route it through the slash
-            // dispatcher, preserving command semantics (the pre-inbox
-            // behavior for recalled slash commands).
-            if (parseSlashInput(match) !== null) {
-              bus.emit({ type: 'input:update', ts: now(), value: match, cursor: match.length });
-            } else {
-              enqueueInbox(match);
-            }
+          // A slash command recalled from history (slash commands are
+          // recorded in history too) is STAGED into the buffer rather than
+          // submitted or enqueued — either would send the command to the
+          // model as plain text. Staging lets the operator's next Enter
+          // route it through the slash dispatcher, preserving command
+          // semantics. Checked above the busy/idle split so it holds in
+          // both states.
+          if (parseSlashInput(match) !== null) {
+            bus.emit({ type: 'input:update', ts: now(), value: match, cursor: match.length });
             closeReverseSearch();
             cancelExitArm();
             return true;
           }
+          if (isBusy()) {
+            // Busy: enqueue the plain match into the inbox so it drains at
+            // the next boundary (same path as a normal busy submit).
+            enqueueInbox(match);
+            closeReverseSearch();
+            cancelExitArm();
+            return true;
+          }
+          // Idle: substitute the buffer with the match and submit it now.
           bus.emit({ type: 'input:update', ts: now(), value: match, cursor: match.length });
           bus.emit({ type: 'user:submit', ts: now(), text: match });
           recordHistorySubmit(match);
@@ -2520,6 +2524,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // signal; making them press it twice would surprise. While running,
     // route to the interrupt ladder for consistency with `^C` + Esc.
     if (result.cancelInput === 'eof') {
+      // Ctrl+D on an emptied edit buffer cancels the in-progress edit
+      // first (same as the interrupt branch above) — otherwise, when this
+      // only interrupts the turn (running), editingQueued stays set and
+      // the message is stranded (hidden + held, ↑ wedged) since EOF here
+      // is reached with an empty buffer.
+      if (editingQueued !== null) {
+        cancelQueuedEdit();
+        bus.emit({ type: 'input:update', ts: now(), value: '', cursor: 0 });
+      }
       if (running) {
         triggerInterrupt();
       } else {

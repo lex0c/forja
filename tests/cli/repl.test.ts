@@ -1199,6 +1199,43 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('Ctrl+D on an emptied edit buffer cancels the edit (does not strand the message)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    // Queue "held" and lift it for editing.
+    stdin.feed('held\r');
+    await tick();
+    stdin.feed('\x1b[A');
+    await tick();
+    // Empty the edit buffer, then Ctrl+D (EOF). While busy this interrupts
+    // the turn; it must ALSO cancel the edit, or "held" stays hidden + held
+    // and the prompt wedges (no ↑ lift / history recall) until discovered.
+    stdin.feed('\x7f'.repeat('held'.length));
+    await tick();
+    stdin.feed('\x04');
+    await tick();
+    // Turn ends → the un-held message drains as the next turn.
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('held');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('first Esc during a turn aborts the soft signal (cooperative), NOT the hard one', async () => {
     // Spec UI.md §3 + 1.g.1: first Esc is cooperative — softStopSignal
     // fires so the harness exits at the next step boundary, but the
