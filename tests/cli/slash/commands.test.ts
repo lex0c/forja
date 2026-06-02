@@ -592,6 +592,45 @@ describe('/budget', () => {
     expect(result.notes?.[0]).toContain('already');
     expect(result.notes?.[0]).not.toContain('next turn');
   });
+
+  test('/budget subagents overrides the effort preset (compares effective, not DEFAULT)', async () => {
+    // Regression: under /effort low the effective subagents cap is the
+    // preset (1), but the idempotency check used to fall back to
+    // DEFAULT_BUDGET (3), so `/budget subagents 3` reported "already 3"
+    // and never wrote — leaving the effective cap stuck at 1.
+    const ctx = makeCtx();
+    ctx.baseConfig.budget = {}; // no explicit override (realistic)
+    ctx.baseConfig.effort = 'low'; // preset subagents = 1
+    const result = await budgetCommand.exec(['subagents', '3'], ctx);
+    if (result.kind !== 'ok') throw new Error('expected ok');
+    expect(result.notes?.[0]).not.toContain('already');
+    expect(result.notes?.[0]).toContain('next turn');
+    expect(ctx.baseConfig.budget?.maxConcurrentSubagents).toBe(3);
+  });
+
+  test('/budget subagents pins an explicit override even when it equals the effort preset', async () => {
+    // Explicit-override surface: typing the value RECORDS it (pins), so
+    // it survives a later /effort change — not a silent "already" that
+    // leaves the value preset-derived and movable.
+    const ctx = makeCtx();
+    ctx.baseConfig.budget = {};
+    ctx.baseConfig.effort = 'low';
+    const n = EFFORT_PROFILES.low.maxConcurrentSubagents; // = 1 (== preset)
+    const result = await budgetCommand.exec(['subagents', String(n)], ctx);
+    if (result.kind !== 'ok') throw new Error('expected ok');
+    expect(result.notes?.[0]).not.toContain('already');
+    expect(result.notes?.[0]).toContain('next turn');
+    expect(ctx.baseConfig.budget?.maxConcurrentSubagents).toBe(n);
+  });
+
+  test('/budget subagents "already" only when the raw explicit override is already that value', async () => {
+    const ctx = makeCtx();
+    ctx.baseConfig.budget = { maxConcurrentSubagents: 2 };
+    ctx.baseConfig.effort = 'low'; // preset would be 1, but raw 2 is explicit
+    const result = await budgetCommand.exec(['subagents', '2'], ctx);
+    if (result.kind !== 'ok') throw new Error('expected ok');
+    expect(result.notes?.[0]).toContain('already 2');
+  });
 });
 
 describe('/subagents', () => {

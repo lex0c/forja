@@ -18,7 +18,6 @@
 // next-turn mutation convention (/model).
 
 import {
-  DEFAULT_BUDGET,
   MAX_CONCURRENT_SUBAGENTS_CAP,
   MAX_CONCURRENT_TOOL_CALLS_CAP,
   type RunBudget,
@@ -94,6 +93,16 @@ export const budgetCommand: SlashCommand = {
   exec: async (args, ctx) => {
     if (args.length === 0) return showAll(ctx);
     const sub = (args[0] ?? '').toLowerCase();
+    // `/budget` is the operator's EXPLICIT-override surface: a cap
+    // mutation always RECORDS the value (pinning it — explicit beats
+    // the `/effort` preset in `effectiveBudget`, so a later `/effort`
+    // can't silently move it), and the "already (no change)" note fires
+    // only when the RAW explicit override is already that value. So the
+    // idempotency check compares the raw field — NOT `?? DEFAULT_BUDGET`
+    // and NOT the effort-adjusted effective. Comparing against the
+    // raw-absent DEFAULT fallback was the bug: under `/effort low`
+    // (subagents preset 1) `/budget subagents 3` matched DEFAULT 3,
+    // reported "already 3", and never wrote — leaving the cap at 1.
 
     if (sub === 'steps') {
       if (args.length !== 2) {
@@ -107,9 +116,9 @@ export const budgetCommand: SlashCommand = {
           message: `/budget steps: '${raw}' is not a positive integer`,
         };
       }
-      // Idempotency: a no-op mutation returns "already" without
-      // the next-turn cue. Avoids
-      // misleading the operator into thinking they changed something.
+      // Idempotency: re-stating the existing explicit override is a
+      // no-op ("already"); any other value writes (pins). Compare the
+      // raw override field (see the dispatch-top note).
       const current = ctx.baseConfig.budget?.maxSteps;
       if (current === n) {
         return {
@@ -190,8 +199,7 @@ export const budgetCommand: SlashCommand = {
           message: `/budget parallel-tools: '${raw}' is not an integer in [1, ${MAX_CONCURRENT_TOOL_CALLS_CAP}]`,
         };
       }
-      const current =
-        ctx.baseConfig.budget?.maxConcurrentToolCalls ?? DEFAULT_BUDGET.maxConcurrentToolCalls;
+      const current = ctx.baseConfig.budget?.maxConcurrentToolCalls;
       if (current === n) {
         return { kind: 'ok', notes: [`max parallel tools already ${n} (no change)`] };
       }
@@ -217,8 +225,7 @@ export const budgetCommand: SlashCommand = {
           message: `/budget subagents: '${raw}' is not an integer in [1, ${MAX_CONCURRENT_SUBAGENTS_CAP}]`,
         };
       }
-      const current =
-        ctx.baseConfig.budget?.maxConcurrentSubagents ?? DEFAULT_BUDGET.maxConcurrentSubagents;
+      const current = ctx.baseConfig.budget?.maxConcurrentSubagents;
       if (current === n) {
         return { kind: 'ok', notes: [`max concurrent subagents already ${n} (no change)`] };
       }
