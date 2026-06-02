@@ -259,7 +259,7 @@ describe('approval posture (Supervised / Autonomous)', () => {
     // Tested under an explicit `allow: git*` so the policy itself permits
     // the command — this pins that the AUTONOMOUS capability-confinement
     // (not just default-deny) is what withholds the auto-approval. add /
-    // tag stay auto-approved (the git-write test above).
+    // lightweight tag stay auto-approved (the git-write test above).
     const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git*'] } } }), {
       cwd: CWD,
       approvalPosture: 'autonomous',
@@ -274,6 +274,21 @@ describe('approval posture (Supervised / Autonomous)', () => {
       const d = eng.check('bash', 'bash', { command });
       expect(d.kind).toBe('confirm');
     }
+  });
+
+  test('autonomous does NOT auto-approve annotated/signed git tag (editor / gpg), but does a lightweight one', () => {
+    // `git tag -a` (no -m) opens core.editor and `git tag -s` runs
+    // gpg.program — configurable commands, so exec:arbitrary keeps the modal.
+    // A lightweight tag and an annotated tag WITH a message are pure
+    // git-writes → still auto-approved.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git*'] } } }), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+    });
+    expect(eng.check('bash', 'bash', { command: 'git tag -a v1' }).kind).toBe('confirm');
+    expect(eng.check('bash', 'bash', { command: 'git tag -s v1' }).kind).toBe('confirm');
+    expect(eng.check('bash', 'bash', { command: 'git add -A && git tag v1' }).kind).toBe('allow');
+    expect(eng.check('bash', 'bash', { command: 'git tag -a v1 -m release' }).kind).toBe('allow');
   });
 
   test('autonomous does NOT auto-approve a conservative/dynamic-dataflow loop (caps are best-effort)', () => {

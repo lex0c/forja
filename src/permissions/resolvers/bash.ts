@@ -1906,14 +1906,63 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
         capabilities: [exec('arbitrary'), gitWrite(REPO), readFs(REPO)],
         confidence: 'high',
       };
+    case 'tag': {
+      // A lightweight tag is a pure ref write, but `git tag` invokes external
+      // CONFIGURABLE commands in two sub-modes — both arbitrary-local-exec
+      // surfaces an attacker-controlled `.git/config` (cloned repo) can
+      // hijack:
+      //   • annotated (`-a`) with NO `-m`/`-F` → opens `core.editor`
+      //   • signed/verified (`-s`/`-u`/`-v`)   → runs `gpg.program`
+      // (`git -c …` is refused upstream, but a repo/user gitconfig value
+      // still reaches them.) `-a` WITH `-m`/`-F` (message supplied, not
+      // signed) opens no editor → stays a repo-confined git-write, as do a
+      // lightweight `git tag v1` and `git tag -d v1`. git tag short flags
+      // bundle (`-am`, `-as`), so the relevant ones are found by walking each
+      // bundle; `-m`/`-F`/`-u`/`-n` consume the rest of their token as an arg.
+      let usesGpg = false;
+      let annotated = false;
+      let hasMessage = false;
+      for (const t of tokens) {
+        if (t === '--annotate') annotated = true;
+        else if (t === '--sign' || t === '--verify') usesGpg = true;
+        else if (t === '--local-user' || t.startsWith('--local-user=')) usesGpg = true;
+        else if (
+          t === '--message' ||
+          t.startsWith('--message=') ||
+          t === '--file' ||
+          t.startsWith('--file=')
+        )
+          hasMessage = true;
+        else if (t.length >= 2 && t[0] === '-' && t[1] !== '-') {
+          for (let i = 1; i < t.length; i++) {
+            const c = t[i];
+            if (c === 'a') annotated = true;
+            else if (c === 's' || c === 'v') usesGpg = true;
+            else if (c === 'u') {
+              usesGpg = true; // -u takes a key arg → rest of token
+              break;
+            } else if (c === 'm' || c === 'F') {
+              hasMessage = true; // -m/-F take the message arg → rest of token
+              break;
+            } else if (c === 'n') break; // -n[<num>]: optional attached arg
+          }
+        }
+      }
+      if (usesGpg || (annotated && !hasMessage)) {
+        return {
+          capabilities: [exec('arbitrary'), gitWrite(REPO), readFs(REPO)],
+          confidence: 'high',
+        };
+      }
+      return { capabilities: [gitWrite(REPO), readFs(REPO)], confidence: 'high' };
+    }
     case 'add':
     case 'stash':
-    case 'tag':
     case 'reset':
-      // Pure git-writes with NO hook surface: git has no pre-add / tag /
-      // reset hook, and `git stash` writes its commits through plumbing
-      // (`commit-tree`/`update-ref`) that bypasses the commit hooks. These
-      // stay repo-confined `git-write` → auto-approvable under autonomous.
+      // Pure git-writes with NO hook / editor / gpg surface: git has no
+      // pre-add / reset hook, and `git stash` writes its commits through
+      // plumbing (`commit-tree`/`update-ref`) that bypasses the commit hooks.
+      // These stay repo-confined `git-write` → auto-approvable under autonomous.
       return { capabilities: [gitWrite(REPO), readFs(REPO)], confidence: 'high' };
     case 'push':
     case 'pull':

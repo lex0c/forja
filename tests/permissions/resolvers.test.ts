@@ -5723,11 +5723,38 @@ describe('bash resolver — effect-based git read verbs / find-exec / awk / sed 
       expect(s.some((x) => x.startsWith('git-write'))).toBe(true);
     }
   });
-  test('git add / tag / stash / reset have no hook surface → git-write, not exec:arbitrary', () => {
-    // Pure git-writes: no pre-add/tag/reset hook, and stash writes via
-    // plumbing that bypasses commit hooks. These stay repo-confined so
-    // autonomous can still auto-approve them.
-    for (const c of ['git add -A', 'git tag v1', 'git stash', 'git reset --hard']) {
+  test('git add / stash / reset have no hook surface → git-write, not exec:arbitrary', () => {
+    // Pure git-writes: no pre-add/reset hook, and stash writes via plumbing
+    // that bypasses commit hooks. These stay repo-confined so autonomous can
+    // still auto-approve them. (`git tag` is nuanced — see the tag tests.)
+    for (const c of ['git add -A', 'git stash', 'git reset --hard']) {
+      const s = caps(c);
+      expect(s.some((x) => x.startsWith('git-write'))).toBe(true);
+      expect(s).not.toContain('exec:arbitrary');
+    }
+  });
+  test('git tag annotated-without-message / signed / verified → exec:arbitrary (editor or gpg)', () => {
+    // `git tag -a` with no -m/-F opens core.editor; `-s`/`-u`/`-v` run
+    // gpg.program — both configurable commands a cloned repo's .git/config
+    // can hijack. Short flags bundle (`-as`, `-af`), so the walk finds them;
+    // signing runs gpg even WITH a message.
+    for (const c of [
+      'git tag -a v1',
+      'git tag -s v1',
+      'git tag -u KEY v1',
+      'git tag -v v1',
+      'git tag -as v1',
+      'git tag -s v1 -m msg',
+      'git tag -af v1',
+    ]) {
+      const s = caps(c);
+      expect(s).toContain('exec:arbitrary');
+      expect(s.some((x) => x.startsWith('git-write'))).toBe(true);
+    }
+  });
+  test('git tag lightweight / annotated-WITH-message → git-write, no exec (auto-approvable)', () => {
+    // Message supplied (no editor) and not signed → no external command.
+    for (const c of ['git tag v1', 'git tag -d v1', 'git tag -a v1 -m msg', 'git tag -am msg v1']) {
       const s = caps(c);
       expect(s.some((x) => x.startsWith('git-write'))).toBe(true);
       expect(s).not.toContain('exec:arbitrary');
