@@ -149,6 +149,7 @@ const makeBootstrapStub = (
     memoryConfigWarnings: [] as readonly string[],
     providersConfigWarnings: [] as readonly string[],
     budgetConfigWarnings: [] as readonly string[],
+    effortConfigWarnings: [] as readonly string[],
     auditConfigWarnings: [] as readonly string[],
     permissionState: 'ready',
     permissionChain: { ok: true, rows: 0, current_rotation_id: 0, quarantined: false },

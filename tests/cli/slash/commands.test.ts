@@ -1173,13 +1173,16 @@ describe('/effort', () => {
     expect(r.kind).toBe('error');
   });
 
-  test('bare /effort shows the resolved provider effort + caps when set', async () => {
+  test('bare /effort shows the level + resolved caps when set', async () => {
     const ctx = makeCtx();
     await effortCommand.exec(['high'], ctx);
     const r = await effortCommand.exec([], ctx);
     if (r.kind !== 'ok') throw new Error('expected ok');
     expect(r.notes?.[0]).toContain('effort: high');
-    expect((r.notes ?? []).join('\n')).toContain('provider effort: high');
+    // The provider-effort line was dropped; caps remain.
+    const joined = (r.notes ?? []).join('\n');
+    expect(joined).not.toContain('provider effort');
+    expect(joined).toContain('max steps:');
   });
 
   test('a running turn appends the snapshot cue', async () => {

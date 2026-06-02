@@ -28,6 +28,13 @@ export type ForjaEffort = ProviderEffort;
 
 export const FORJA_EFFORT_LEVELS: readonly ForjaEffort[] = ['low', 'medium', 'high', 'max'];
 
+// Default effort for a top-level session when the operator set none
+// (no `[sampling].effort` in config.toml, no `/effort`). Applied at
+// bootstrap to the operator session only; subagents do NOT inherit it
+// (they carry only the parent's resolved provider-effort). Matches the
+// provider's own conventional default (Anthropic 'high').
+export const DEFAULT_EFFORT: ForjaEffort = 'high';
+
 export interface EffortProfile {
   // Reasoning-depth level handed to the provider adapter. Same
   // vocabulary as ForjaEffort today (1:1), kept as a distinct field

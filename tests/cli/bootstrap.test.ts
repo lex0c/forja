@@ -71,6 +71,8 @@ describe('bootstrap', () => {
     expect(config.provider).toBe(mockProvider);
     expect(config.userPrompt).toBe('hi');
     expect(config.cwd).toBe(workdir);
+    // No [sampling].effort in config → bootstrap applies DEFAULT_EFFORT.
+    expect(config.effort).toBe('high');
     expect(
       config.toolRegistry
         .list()

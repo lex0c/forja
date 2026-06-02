@@ -9,8 +9,14 @@ import {
   createInProcessBroker,
   createSpawnBroker,
 } from '../broker/index.ts';
-import { loadBudgetConfig, loadMemoryConfig, loadProvidersConfig } from '../config/loaders.ts';
+import {
+  loadBudgetConfig,
+  loadEffortConfig,
+  loadMemoryConfig,
+  loadProvidersConfig,
+} from '../config/loaders.ts';
 import { createSqliteFailureSink } from '../failures/index.ts';
+import { DEFAULT_EFFORT } from '../harness/effort.ts';
 import type { HarnessConfig, RunBudget } from '../harness/index.ts';
 import {
   type HookConfigWarning,
@@ -302,6 +308,9 @@ export interface BootstrapResult {
   // a hard abort.
   providersConfigWarnings: readonly string[];
   budgetConfigWarnings: readonly string[];
+  // Warnings from the `[effort].level` loader (unknown level →
+  // warn + fall back to DEFAULT_EFFORT). Same fail-soft posture.
+  effortConfigWarnings: readonly string[];
   // §13.7 enforcement state at boot — surfaces "is bash being
   // wrapped?" for the REPL banner + any future operator-facing
   // surface that needs to mirror what doctor reports. See
@@ -443,6 +452,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // surface on stderr via
   // BootstrapResult.{memory,providers,budget}Warnings.
   const budgetLoaded = loadBudgetConfig({ cwd: projectConfigCwd });
+  const effortLoaded = loadEffortConfig({ cwd: projectConfigCwd });
 
   // Slice Q — invert S11/S13 LLM-judge default to ON. The loader
   // walks the same `.agent/config.toml` + `~/.config/agent/config.toml`
@@ -1432,6 +1442,12 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       if (!haveConfig && !haveCli) return {};
       return { budget: { ...budgetLoaded.config, ...(input.budget ?? {}) } };
     })(),
+    // Operator effort default (TOKEN_TUNING.md §4): `[effort].level`
+    // from config.toml, else DEFAULT_EFFORT ('high'). Always set on the
+    // top-level session so the footer + provider effort have a concrete
+    // level from the first turn; `/effort` overrides it in-session.
+    // Subagents do NOT get this (they carry only inherited provider-effort).
+    effort: effortLoaded.effort ?? DEFAULT_EFFORT,
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
     // Slice Q — resolved state (always boolean, never undefined).
     // Precedence: CLI explicit > project config > user config > default ON.
@@ -1508,6 +1524,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     memoryConfigWarnings: memoryLoaded.warnings,
     providersConfigWarnings: providersLoaded.warnings,
     budgetConfigWarnings: budgetLoaded.warnings,
+    effortConfigWarnings: effortLoaded.warnings,
     auditConfigWarnings: auditLoaded.warnings,
     permissionState: permResult.state,
     ...(permResult.refusingReason !== undefined

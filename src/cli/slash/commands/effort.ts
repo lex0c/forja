@@ -29,11 +29,12 @@ const usage = `/effort [${FORJA_EFFORT_LEVELS.join('|')}]`;
 const isForjaEffort = (s: string): s is ForjaEffort =>
   (FORJA_EFFORT_LEVELS as readonly string[]).includes(s);
 
-// Render the profile's resolved knobs as indented detail lines.
+// Render the profile's resolved operational caps as an indented
+// detail line. (The provider-effort line was dropped as redundant —
+// the level is already shown in the header and the footer chip.)
 const profileDetail = (level: ForjaEffort): string[] => {
   const p = EFFORT_PROFILES[level];
   return [
-    `  provider effort: ${p.providerEffort} (Anthropic output_config.effort / OpenAI reasoning_effort / Gemini thinking budget)`,
     `  max steps: ${p.maxSteps} · parallel subagents: ${p.maxConcurrentSubagents} · tool errors: ${p.maxToolErrors}`,
   ];
 };
@@ -85,6 +86,9 @@ export const effortCommand: SlashCommand = {
     // mutation of `baseConfig.budget`, so an explicit `/budget`
     // override is never clobbered (order-independent precedence).
     ctx.baseConfig.effort = level;
+    // Repaint the footer's effort chip immediately (the level takes
+    // effect next turn, but the operator's selection shows at once).
+    ctx.bus.emit({ type: 'effort:change', ts: ctx.now(), effort: level });
     return {
       kind: 'ok',
       notes: withRunningCue(ctx, [

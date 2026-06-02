@@ -761,6 +761,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       memoryConfigWarnings,
       providersConfigWarnings,
       budgetConfigWarnings,
+      effortConfigWarnings,
       auditConfigWarnings,
       permissionState,
       permissionRefusingReason,
@@ -860,6 +861,11 @@ export const run = async (options: RunOptions): Promise<number> => {
       // or out-of-range value shouldn't disappear silently.
       for (const w of budgetConfigWarnings) {
         errSink(`forja: budget config: ${w}\n`);
+      }
+      // [effort].level config warnings — an unknown level silently
+      // defaulting to high would hide an operator typo.
+      for (const w of effortConfigWarnings) {
+        errSink(`forja: effort config: ${w}\n`);
       }
       // [audit] / [audit.retention] config warnings — deletion
       // policy is operationally riskier than the other config

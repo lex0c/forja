@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import {
   DEFAULT_MEMORY_CONFIG,
   loadBudgetConfig,
+  loadEffortConfig,
   loadMemoryConfig,
   loadProvidersConfig,
   projectConfigPath,
@@ -859,6 +860,75 @@ maxCostUsd = 1.5
       expect(result.warnings[0]).toContain('not a table');
     } finally {
       rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('loadEffortConfig', () => {
+  test('no [effort] → undefined effort (bootstrap applies DEFAULT_EFFORT)', () => {
+    const cwd = makeTempCwd();
+    try {
+      const result = loadEffortConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.effort).toBeUndefined();
+      expect(result.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('reads [effort].level from project config', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(join(cwd, '.agent', 'config.toml'), '[effort]\nlevel = "low"\n');
+      const result = loadEffortConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.effort).toBe('low');
+      expect(result.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('level is case-insensitive (matches /effort)', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(join(cwd, '.agent', 'config.toml'), '[effort]\nlevel = "High"\n');
+      const result = loadEffortConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.effort).toBe('high');
+      expect(result.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('unknown level warns and is ignored', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      // `xhigh` is a valid OpenAI level but NOT a ForjaEffort.
+      writeFileSync(join(cwd, '.agent', 'config.toml'), '[effort]\nlevel = "xhigh"\n');
+      const result = loadEffortConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.effort).toBeUndefined();
+      expect(result.warnings[0]).toContain('must be one of');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('project level overrides user', () => {
+    const cwd = makeTempCwd();
+    const home = mkdtempSync(join(tmpdir(), 'forja-effort-home-'));
+    try {
+      mkdirSync(join(home, '.config', 'agent'), { recursive: true });
+      writeFileSync(join(home, '.config', 'agent', 'config.toml'), '[effort]\nlevel = "low"\n');
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(join(cwd, '.agent', 'config.toml'), '[effort]\nlevel = "max"\n');
+      const result = loadEffortConfig({ cwd, env: { HOME: home } });
+      expect(result.effort).toBe('max');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
     }
   });
 });

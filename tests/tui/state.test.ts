@@ -100,6 +100,34 @@ describe('session lifecycle', () => {
     expect(r.state.status.operationMode).toBe('autonomous');
   });
 
+  test('createInitialState defaults effort to null (no chip until known)', () => {
+    expect(createInitialState().status.effort).toBeNull();
+  });
+
+  test('effort:change updates status.effort and emits no permanent', () => {
+    const r = applyEvent(createInitialState(), { type: 'effort:change', ts: 5, effort: 'low' });
+    expect(r.state.status.effort).toBe('low');
+    expect(r.permanent).toEqual([]);
+    const up = applyEvent(r.state, { type: 'effort:change', ts: 6, effort: 'max' });
+    expect(up.state.status.effort).toBe('max');
+  });
+
+  test('session:banner seeds status.effort from the boot level', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'session:banner',
+      ts: 1,
+      app: 'forja',
+      version: '0',
+      model: 'm',
+      contextWindow: 1000,
+      maxOutputTokens: 100,
+      cwd: '/x',
+      env: [],
+      effort: 'high',
+    });
+    expect(r.state.status.effort).toBe('high');
+  });
+
   test('session:end marks state ended and emits footer item', () => {
     const r = applyEvent(createInitialState(), {
       type: 'session:end',

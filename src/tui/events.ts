@@ -15,6 +15,7 @@
 // and HarnessEvent diverge in shape, an adapter sits between them
 // (introduced in a later step).
 
+import type { ForjaEffort } from '../harness/effort.ts';
 import type { ApprovalPosture, PolicyLayer } from '../permissions/index.ts';
 
 // Common metadata. `ts` is wall-clock ms since epoch — useful for
@@ -81,6 +82,11 @@ export type SessionBannerEvent = BaseEvent & {
   // `--autonomous`). Optional — absent keeps the reducer's current
   // value (supervised default). Runtime flips ride `mode:change`.
   operationMode?: ApprovalPosture;
+  // Initial effort level at boot (from `[sampling].effort` config or
+  // DEFAULT_EFFORT), so the footer's effort chip is correct from the
+  // first frame. Optional — absent keeps the reducer's current value.
+  // Runtime changes ride `effort:change`.
+  effort?: ForjaEffort;
 };
 export type SessionEndEvent = BaseEvent & {
   type: 'session:end';
@@ -742,9 +748,20 @@ export type OperationModeChangeEvent = BaseEvent & {
   posture: ApprovalPosture;
 };
 
+// Operator changed the effort level via `/effort`, shown in the footer
+// right cluster. Emitted by the slash command so the chip repaints
+// immediately (the level takes effect next turn, but the operator's
+// SELECTION is reflected at once). `baseConfig.effort` is the source of
+// truth; this mirrors it into live state.
+export type EffortChangeEvent = BaseEvent & {
+  type: 'effort:change';
+  effort: ForjaEffort;
+};
+
 export type UIEvent =
   | SessionStartEvent
   | OperationModeChangeEvent
+  | EffortChangeEvent
   | SessionBannerEvent
   | SessionEndEvent
   | UserSubmitEvent
