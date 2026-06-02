@@ -1689,6 +1689,43 @@ describe('runSubagent — orchestration', () => {
     expect(captured.temperature).toBe(0);
   });
 
+  test('parent forwards providerEffort to spawn opts when set (/effort inheritance)', async () => {
+    // The operator's resolved provider-effort rides to the subprocess
+    // child via spawn opts (→ `--subagent-effort`) so `/effort` applies
+    // task-wide. Operational caps are NOT forwarded (per-playbook).
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const captured: { providerEffort?: string } = {};
+    const recordingSpawn: SpawnChildProcess = (opts) => {
+      if (opts.providerEffort !== undefined) captured.providerEffort = opts.providerEffort;
+      insertSubagentOutput(db, { sessionId: opts.sessionId });
+      setSubagentPayload(db, opts.sessionId, {
+        status: 'done',
+        reason: 'done',
+        output: 'ok',
+        cost_usd: 0,
+        steps: 1,
+        duration_ms: 1,
+      });
+      return { exited: Promise.resolve({ exitCode: 0 }), kill: () => undefined };
+    };
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      providerEffort: 'high',
+      spawnChildProcess: recordingSpawn,
+    });
+    expect(captured.providerEffort).toBe('high');
+  });
+
   test('child that publishes payload then hangs gets SIGKILLed before parent returns', async () => {
     // Regression: the polling loop used to return on payload
     // without awaiting handle.exited. A child that publishes

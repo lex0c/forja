@@ -1,16 +1,51 @@
 import { GoogleGenAI } from '@google/genai';
+import { effortThinkingBudget } from '../effort.ts';
 import { deriveSeedFromRequest } from '../seed.ts';
 import type {
   ConstrainedRequest,
   ConstrainedResult,
   GenerateRequest,
   Provider,
+  ProviderCapabilities,
   ProviderContentBlock,
   ProviderMessage,
   ProviderToolDef,
   StreamEvent,
 } from '../types.ts';
 import { GOOGLE_CAPS } from './capabilities.ts';
+
+// Gemini thinking budget, gated by capability. Gemini 2.5's only
+// reasoning knob is the numeric `thinkingConfig.thinkingBudget`, so
+// the agnostic `effort` maps onto the canonical ladder
+// (`src/providers/effort.ts`), clamped below max_tokens. Precedence:
+// an EXPLICIT `thinking_budget: 0` (disable-via-zero, PLAYBOOKS.md
+// §1.1) wins and disables thinking — `effort` must not resurrect it.
+// Otherwise effort (when the model supports the surface) wins over a
+// legacy numeric `thinking_budget`. The resolved value is then clamped
+// to the model's `max_thinking_budget` ceiling (Gemini 2.5 400s above
+// it): the loader allows large legacy `thinking_budget` values for
+// provider-specific handling, so an over-cap 50000 is fitted, not
+// rejected. Returns undefined ⇒ omit the block. (A future Gemini 3+
+// uses named `thinkingLevel` instead and would need its own branch.)
+export const googleThinkingBudget = (
+  req: GenerateRequest,
+  caps: ProviderCapabilities,
+): number | undefined => {
+  if (req.thinking_budget === 0) return undefined;
+  let budget: number | undefined;
+  if (req.effort !== undefined && caps.supports_reasoning_effort === true) {
+    budget = effortThinkingBudget(req.effort, req.max_tokens);
+  } else if (req.thinking_budget !== undefined && req.thinking_budget > 0) {
+    budget = req.thinking_budget;
+  }
+  if (budget === undefined) return undefined;
+  // Clamp to the model's thinking-budget ceiling. Applies to both
+  // paths so it stays correct if the effort ladder ever rises above a
+  // model cap; the legacy raw value is the one that actually exceeds.
+  return caps.max_thinking_budget !== undefined
+    ? Math.min(budget, caps.max_thinking_budget)
+    : budget;
+};
 import { type RawGoogleChunk, normalizeGoogleStream } from './stream.ts';
 
 export interface CreateGoogleProviderOptions {
@@ -107,14 +142,12 @@ export const createGoogleProvider = (
     if (req.system !== undefined) config.systemInstruction = req.system;
     if (req.temperature !== undefined) config.temperature = req.temperature;
     if (req.top_p !== undefined) config.topP = req.top_p;
-    // Gemini 2.5+ exposes a thinking budget via
-    // `thinkingConfig.thinkingBudget` (token count). Mirror the
-    // Anthropic gating: 0 disables, which we encode by omitting
-    // the block. Models that don't support thinking (1.x) ignore
-    // the field; the SDK no-ops the unrecognized config key.
-    if (req.thinking_budget !== undefined && req.thinking_budget > 0) {
-      config.thinkingConfig = { thinkingBudget: req.thinking_budget };
-    }
+    // Reasoning effort / thinking budget via the numeric
+    // `thinkingConfig.thinkingBudget` knob — see `googleThinkingBudget`
+    // for the precedence (explicit disable-via-zero > effort > legacy
+    // budget). Models without thinking (1.x) ignore the key.
+    const thinkingBudget = googleThinkingBudget(req, caps);
+    if (thinkingBudget !== undefined) config.thinkingConfig = { thinkingBudget };
     // Determinism intent (`PLAYBOOKS.md` §1.1
     // `sampling.seed_in_eval`). Gemini accepts a seed in
     // `generationConfig.seed` (uint32-ish range) — derive a

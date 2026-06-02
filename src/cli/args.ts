@@ -9,6 +9,7 @@
 // lightweight commands fragile to unrelated runtime deps.
 // See src/audit/gc-tables.ts header for the rationale.
 import { GC_TABLES } from '../audit/gc-tables.ts';
+import { FORJA_EFFORT_LEVELS, type ForjaEffort } from '../harness/effort.ts';
 import type { ForceEligibleStep, InitStep } from './init.ts';
 
 export interface ParsedArgs {
@@ -144,6 +145,10 @@ export interface ParsedArgs {
   // --subagent-session-id. When omitted the child runs at the
   // provider's default — same semantics as the top-level harness.
   subagentTemperature?: number;
+  // Provider reasoning-effort carried across the subprocess boundary
+  // (internal flag `--subagent-effort`), so a subagent inherits the
+  // operator's `/effort` reasoning depth. Absent ⇒ provider default.
+  subagentProviderEffort?: ForjaEffort;
   // Trust state carried across the subprocess boundary.
   // Presence = true (no value); absence = false. Spec §9 trust
   // is per-PROJECT, not per-instance: the parent already
@@ -1907,6 +1912,24 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
           };
         }
         args.subagentTemperature = parsed;
+        i += 2;
+        break;
+      }
+      case '--subagent-effort': {
+        const value = argv[i + 1];
+        if (value === undefined) {
+          return {
+            ok: false,
+            message: `--subagent-effort requires a level (${FORJA_EFFORT_LEVELS.join('|')}) (internal flag)`,
+          };
+        }
+        if (!(FORJA_EFFORT_LEVELS as readonly string[]).includes(value)) {
+          return {
+            ok: false,
+            message: `--subagent-effort must be one of ${FORJA_EFFORT_LEVELS.join('|')}, got '${value}'`,
+          };
+        }
+        args.subagentProviderEffort = value as ForjaEffort;
         i += 2;
         break;
       }

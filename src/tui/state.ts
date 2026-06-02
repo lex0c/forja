@@ -15,6 +15,7 @@
 // todo events accept silently and land alongside their render
 // functions.
 
+import type { ForjaEffort } from '../harness/effort.ts';
 import type { ApprovalPosture } from '../permissions/index.ts';
 import { sanitizeOneLineForDisplay } from '../sanitize/ansi.ts';
 import type { SessionBannerEnvEntry, TodoItemForUI, UIEvent } from './events.ts';
@@ -127,6 +128,11 @@ export interface StatusState {
   // `mode:change`. The permission engine is the source of truth — this
   // is the rendered mirror.
   operationMode: ApprovalPosture;
+  // Effort level shown in the footer's right cluster. Seeded by
+  // `session:banner.effort` (config/DEFAULT_EFFORT at boot), updated by
+  // `effort:change` when the operator runs `/effort`. null = not yet
+  // known (pre-banner) → no chip rendered.
+  effort: ForjaEffort | null;
   // Distinct-name memory count for the footer's `mem N` segment.
   // Snapshot at session:start; mid-session
   // memory_write success could bump the count, but we keep the
@@ -474,6 +480,7 @@ export const createInitialState = (): LiveState => ({
     costUsd: 0,
     maxCostUsd: null,
     operationMode: 'supervised',
+    effort: null,
     memoryCount: 0,
     contextWindow: 0,
     sessionTotalTokens: 0,
@@ -789,6 +796,14 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         state: { ...state, status: { ...state.status, operationMode: event.posture } },
         permanent: [],
       };
+    case 'effort:change':
+      // Mirror the operator's new effort selection into status so the
+      // footer chip repaints at once. No scrollback line — the slash
+      // command already emits its own confirmation notes.
+      return {
+        state: { ...state, status: { ...state.status, effort: event.effort } },
+        permanent: [],
+      };
     case 'session:start': {
       const status: StatusState = {
         ...state.status,
@@ -922,6 +937,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             model: event.model,
             contextWindow: event.contextWindow,
             operationMode: event.operationMode ?? state.status.operationMode,
+            effort: event.effort ?? state.status.effort,
           },
         },
         permanent: [

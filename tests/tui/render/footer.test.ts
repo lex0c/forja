@@ -49,6 +49,18 @@ describe('renderFooter', () => {
     expect(out).not.toContain('esc to interrupt');
   });
 
+  test('renders the selected effort chip on the right when set', () => {
+    const out = renderFooter(startedSession({ effort: 'high' }), caps);
+    expect(out).toContain('effort: high');
+    // Both effort and model live in the right cluster.
+    expect(out).toContain('sonnet-4.6');
+  });
+
+  test('omits the effort chip when effort is null (pre-banner)', () => {
+    const out = renderFooter(startedSession(), caps);
+    expect(out).not.toContain('effort:');
+  });
+
   test('autonomous posture renders the autonomous mode-on label', () => {
     const out = renderFooter(startedSession({ operationMode: 'autonomous' }), caps);
     expect(out).toContain('autonomous mode on (shift+tab to change)');

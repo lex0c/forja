@@ -21,6 +21,7 @@
 
 import { existsSync } from 'node:fs';
 import { basename, join } from 'node:path';
+import { resolveProviderEffort } from '../harness/effort.ts';
 import { type HarnessConfig, type HarnessResult, runAgent } from '../harness/index.ts';
 import { effectiveBudget, resolveMaxOutputTokens } from '../harness/types.ts';
 import { dispatchChain } from '../hooks/dispatcher.ts';
@@ -547,6 +548,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     policyLayers,
     hookWarnings,
     memoryConfigWarnings,
+    providersConfigWarnings,
+    budgetConfigWarnings,
+    effortConfigWarnings,
     auditConfigWarnings,
     sandboxEnforcement,
   } = bootstrapped;
@@ -584,6 +588,23 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // "false"` and got default-on detectors billing LLM-judge work).
   for (const w of memoryConfigWarnings) {
     errSink(`forja: memory config: ${w}\n`);
+  }
+  // [providers] config warnings (`.agent/config.toml [providers]`) —
+  // same surfacing as run.ts: a bad model alias / route silently falls
+  // back to the default, so stderr visibility lets the operator catch
+  // it instead of running on a model they didn't intend.
+  for (const w of providersConfigWarnings) {
+    errSink(`forja: providers config: ${w}\n`);
+  }
+  // [budget] config warnings — a numeric typo or out-of-range value
+  // shouldn't disappear silently.
+  for (const w of budgetConfigWarnings) {
+    errSink(`forja: budget config: ${w}\n`);
+  }
+  // [effort].level config warnings — an unknown level silently
+  // defaulting to high would hide an operator typo (matches run.ts).
+  for (const w of effortConfigWarnings) {
+    errSink(`forja: effort config: ${w}\n`);
   }
   // [audit] / [audit.retention] config warnings — deletion policy
   // is operationally riskier than the other config surfaces.
@@ -757,7 +778,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // undefined, and the ctx omits the field — TUI then correctly
   // shows uncapped, matching the harness's skipped gate).
   const buildAdapterCtx = () => {
-    const budget = effectiveBudget(baseConfig.budget);
+    const budget = effectiveBudget(baseConfig.budget, baseConfig.effort);
     return {
       project,
       model: baseConfig.provider.id,
@@ -1733,6 +1754,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // before the runtime's `setSubagentPayload` /
         // `reclassifySessionStatus` writes land or have nothing
         // to wait on at all.
+        // Resolve once (the spread needs a narrowed const): explicit
+        // providerEffort wins — none on the main session — else derive
+        // from baseConfig.effort (the operator's /effort or default).
+        const childProviderEffort = resolveProviderEffort(baseConfig);
         const dispatchPromise = runSubagentImpl({
           definition,
           prompt,
@@ -1759,6 +1784,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           // object) is observed; reading temperature too keeps
           // the precedence ladder honest.
           ...(baseConfig.temperature !== undefined ? { temperature: baseConfig.temperature } : {}),
+          // Forward the resolved provider-effort so /<playbook>
+          // dispatch honors the operator's /effort (or configured
+          // default) — same as the foreground task_* spawn path
+          // (harness/loop.ts forwards resolveProviderEffort(config)).
+          // Without this the child runs at the provider default while
+          // the footer + /effort confirmation say a level is active.
+          // Carries ONLY the provider axis; operational caps stay
+          // per-playbook (child gets providerEffort, never effort).
+          ...(childProviderEffort !== undefined ? { providerEffort: childProviderEffort } : {}),
           // Hook chain snapshot. The foreground task_* spawn path
           // in harness/loop.ts forwards config.hooks as
           // hooksSnapshot so the child uses the parent's validated
@@ -2646,12 +2680,19 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     version: VERSION,
     model: modelId,
     contextWindow: providerCaps.context_window,
-    maxOutputTokens: resolveMaxOutputTokens(effectiveBudget(baseConfig.budget), providerCaps),
+    maxOutputTokens: resolveMaxOutputTokens(
+      effectiveBudget(baseConfig.budget, baseConfig.effort),
+      providerCaps,
+    ),
     cwd: baseConfig.cwd,
     env,
     // Seed the footer's operation-mode cue from the engine's posture so
     // a `--autonomous` boot shows Autonomous from the first frame.
     operationMode: baseConfig.permissionEngine.approvalPosture(),
+    // Seed the footer's effort chip from the resolved session effort
+    // (config/DEFAULT_EFFORT). Optional on the event; omitted only when
+    // unset, which after bootstrap doesn't happen on the main session.
+    ...(baseConfig.effort !== undefined ? { effort: baseConfig.effort } : {}),
     // §13.7 — when sandbox enforcement is active, append the line
     // inline inside the banner block (secondary, no leading blank).
     // The non-active states ride warn/error events below.

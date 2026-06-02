@@ -18,6 +18,7 @@
 //     error rather than crashing the REPL.
 
 import type { Provider } from '../../../providers/types.ts';
+import { withRunningCue } from '../format.ts';
 import type { SlashCommand } from '../types.ts';
 
 const usage = '/model [<id>]';
@@ -89,12 +90,9 @@ export const modelCommand: SlashCommand = {
     // updated provider via the spread copy. Current turn (if any) is
     // unaffected — its config was already snapshot.
     ctx.baseConfig.provider = provider;
-    const notes = [`model: ${id} — takes effect on the next turn`];
-    if (ctx.isRunning()) {
-      notes.push(
-        '(current turn already snapshot its config; new value applies starting next prompt)',
-      );
-    }
-    return { kind: 'ok', notes };
+    return {
+      kind: 'ok',
+      notes: withRunningCue(ctx, [`model: ${id} — takes effect on the next turn`]),
+    };
   },
 };

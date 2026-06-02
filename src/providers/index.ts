@@ -6,6 +6,7 @@ export type {
   Provider,
   ProviderCapabilities,
   ProviderContentBlock,
+  ProviderEffort,
   ProviderFamily,
   ProviderMessage,
   ProviderMessageRole,

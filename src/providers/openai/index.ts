@@ -2,6 +2,7 @@ import OpenAI from 'openai';
 // Shared chars/4 heuristic — see `src/providers/tokens.ts` for accuracy
 // bounds. OpenAI has no server-side countTokens endpoint until tiktoken
 // lands in M5.
+import { OPENAI_REASONING_EFFORT } from '../effort.ts';
 import { deriveSeedFromRequest } from '../seed.ts';
 import { estimateMessagesTokens } from '../tokens.ts';
 import type {
@@ -9,11 +10,27 @@ import type {
   ConstrainedResult,
   GenerateRequest,
   Provider,
+  ProviderCapabilities,
   ProviderMessage,
   ProviderToolDef,
   StreamEvent,
 } from '../types.ts';
 import { OPENAI_CAPS } from './capabilities.ts';
+
+// OpenAI reasoning effort, gated by capability. Chat Completions
+// takes a FLAT `reasoning_effort` field — the nested `reasoning`
+// object belongs to the Responses API, a DIFFERENT endpoint, and is
+// rejected here with HTTP 400. Only reasoning models accept the
+// param at all, so emit it strictly when the model declares support
+// (non-reasoning models like gpt-4o 400 on it); otherwise omit. The
+// agnostic level maps 1:1 except `max`→`xhigh` (the API's ceiling).
+export const openaiReasoningParam = (
+  req: GenerateRequest,
+  caps: ProviderCapabilities,
+): { reasoning_effort?: 'low' | 'medium' | 'high' | 'xhigh' } =>
+  req.effort !== undefined && caps.supports_reasoning_effort === true
+    ? { reasoning_effort: OPENAI_REASONING_EFFORT[req.effort] }
+    : {};
 import { type RawOpenAIChunk, normalizeOpenAIStream } from './stream.ts';
 
 export interface CreateOpenAIProviderOptions {
@@ -192,16 +209,12 @@ export const createOpenAIProvider = (
     // step N differs from step N+1 within a run (each step's
     // message history is longer / different).
     if (req.seed_in_eval === true) params.seed = deriveSeedFromRequest(req);
-    // `thinking_budget` is intentionally NOT forwarded here.
-    // OpenAI's reasoning surface (`reasoning.effort`:
-    // low|medium|high) takes a coarse string, not a token count
-    // — mapping a budget integer onto it would be a guess. The
-    // request stays silent on reasoning when the playbook
-    // declared a budget; the model uses its default. A future
-    // slice that adds a `reasoning.effort` override to
-    // `PLAYBOOKS.md` §1.1 sampling is the right place to wire
-    // this — until then, dropping the field preserves intent
-    // (no guess) over crude mapping.
+    // Reasoning effort (TOKEN_TUNING.md §4.2). Flat `reasoning_effort`,
+    // gated on capability — see `openaiReasoningParam`. The legacy
+    // numeric `thinking_budget` is still intentionally NOT forwarded:
+    // a token count doesn't map onto the coarse effort string, and
+    // `effort` is the canonical reasoning control now.
+    Object.assign(params, openaiReasoningParam(req, caps));
     if (req.stop_sequences !== undefined) params.stop = req.stop_sequences;
 
     const stream = (await client.chat.completions.create(

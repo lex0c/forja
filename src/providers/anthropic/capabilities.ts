@@ -36,6 +36,13 @@ export const ANTHROPIC_CAPS: Record<string, ProviderCapabilities> = {
     // TOKEN_TUNING §9's canonical sampling values still apply to
     // every other Claude 4.x model — only this entry opts out.
     supports_sampling: false,
+    // Opus 4.7 made adaptive thinking the ONLY thinking mode:
+    // manual `thinking:{type:'enabled',budget_tokens}` returns HTTP
+    // 400. Adapter routes thinking through `type:'adaptive'` and
+    // drops the budget when this is true (see `anthropicThinkingParam`).
+    supports_adaptive_thinking: true,
+    // Accepts `output_config.effort` (low|medium|high|xhigh|max).
+    supports_reasoning_effort: true,
     notes: ['frontier model; best for security-audit and deliberate reasoning workflows'],
   },
   'claude-sonnet-4-6': {
@@ -44,6 +51,11 @@ export const ANTHROPIC_CAPS: Record<string, ProviderCapabilities> = {
     cost_per_1k_output: 15.0,
     cost_per_1k_cached_input: 0.3,
     cost_per_1k_cache_write: 3.75,
+    // Sonnet 4.6 uses adaptive thinking (manual enabled+budget is
+    // deprecated). Route thinking through `type:'adaptive'`.
+    supports_adaptive_thinking: true,
+    // Accepts `output_config.effort` (low|medium|high|xhigh|max).
+    supports_reasoning_effort: true,
     notes: ['default model; balanced quality/cost'],
   },
   'claude-haiku-4-5': {

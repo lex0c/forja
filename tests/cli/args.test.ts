@@ -450,6 +450,36 @@ describe('--subagent-temperature', () => {
   });
 });
 
+describe('--subagent-effort', () => {
+  test('captures a valid level into args.subagentProviderEffort', () => {
+    for (const level of ['low', 'medium', 'high', 'max'] as const) {
+      const r = parseArgs(['--subagent-effort', level]);
+      expect(r.ok).toBe(true);
+      if (!r.ok) continue;
+      expect(r.args.subagentProviderEffort).toBe(level);
+    }
+  });
+
+  test('rejects when the value is missing', () => {
+    expect(parseArgs(['--subagent-effort']).ok).toBe(false);
+  });
+
+  test('rejects an unknown level (allowlist guards flag-shaped values too)', () => {
+    // `xhigh` is a valid OpenAI level but NOT a ForjaEffort; uppercase
+    // and flag-shaped values are rejected by the same allowlist.
+    for (const bad of ['xhigh', 'none', 'HIGH', '', '--subagent-depth']) {
+      expect(parseArgs(['--subagent-effort', bad]).ok).toBe(false);
+    }
+  });
+
+  test('absent by default', () => {
+    const r = parseArgs(['hi']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentProviderEffort).toBeUndefined();
+  });
+});
+
 describe('--subagent-session-id with --subagent-depth', () => {
   test('coexists; the parser accepts any order', () => {
     // The internal flags arrive together in the spawn command;

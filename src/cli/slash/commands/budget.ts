@@ -18,39 +18,34 @@
 // next-turn mutation convention (/model).
 
 import {
-  DEFAULT_BUDGET,
   MAX_CONCURRENT_SUBAGENTS_CAP,
   MAX_CONCURRENT_TOOL_CALLS_CAP,
   type RunBudget,
+  effectiveBudget,
 } from '../../../harness/types.ts';
-import { formatCost, formatMs } from '../format.ts';
+import { formatCost, formatMs, withRunningCue } from '../format.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 
 const usage = '/budget [steps <N> | cost <USD|none> | parallel-tools <N> | subagents <N>]';
 
 const showAll = (ctx: SlashContext): SlashResult => {
-  const b = ctx.baseConfig.budget ?? {};
-  // Cost has three states (see RunBudget docstring for the full
-  // contract): absent → fall back to DEFAULT_BUDGET; explicit
-  // undefined → operator opted out, render "no cap"; number →
-  // that value. `'maxCostUsd' in b` distinguishes "absent" from
-  // "present-as-undefined" since both read as undefined via `?.`.
-  const costLine = (() => {
-    if (!('maxCostUsd' in b)) {
-      const d = DEFAULT_BUDGET.maxCostUsd;
-      return `max cost: ${d !== undefined ? formatCost(d) : 'no cap'}`;
-    }
-    return `max cost: ${b.maxCostUsd !== undefined ? formatCost(b.maxCostUsd) : 'no cap'}`;
-  })();
+  // Resolve through the SAME layered helper the loop uses so `/budget`
+  // shows the EFFECTIVE caps — including any `/effort` preset — not
+  // just the raw explicit overrides (defaults < effort preset <
+  // explicit /budget). `effectiveBudget` also carries the cost
+  // opt-out: an explicit `maxCostUsd: undefined` (from `/budget cost
+  // off`) propagates through the spread and renders "no cap", while
+  // an absent key falls back to the DEFAULT_BUDGET cap.
+  const r = effectiveBudget(ctx.baseConfig.budget, ctx.baseConfig.effort);
   return {
     kind: 'ok',
     notes: [
-      `max steps: ${b.maxSteps ?? DEFAULT_BUDGET.maxSteps}`,
-      `max wall-clock: ${formatMs(b.maxWallClockMs ?? DEFAULT_BUDGET.maxWallClockMs)}`,
-      `max tool errors: ${b.maxToolErrors ?? DEFAULT_BUDGET.maxToolErrors}`,
-      costLine,
-      `max parallel tools: ${b.maxConcurrentToolCalls ?? DEFAULT_BUDGET.maxConcurrentToolCalls} (cap ${MAX_CONCURRENT_TOOL_CALLS_CAP})`,
-      `max concurrent subagents: ${b.maxConcurrentSubagents ?? DEFAULT_BUDGET.maxConcurrentSubagents} (cap ${MAX_CONCURRENT_SUBAGENTS_CAP})`,
+      `max steps: ${r.maxSteps}`,
+      `max wall-clock: ${formatMs(r.maxWallClockMs)}`,
+      `max tool errors: ${r.maxToolErrors}`,
+      `max cost: ${r.maxCostUsd !== undefined ? formatCost(r.maxCostUsd) : 'no cap'}`,
+      `max parallel tools: ${r.maxConcurrentToolCalls} (cap ${MAX_CONCURRENT_TOOL_CALLS_CAP})`,
+      `max concurrent subagents: ${r.maxConcurrentSubagents} (cap ${MAX_CONCURRENT_SUBAGENTS_CAP})`,
     ],
   };
 };
@@ -92,23 +87,22 @@ const writeBudget = (ctx: SlashContext, patch: Partial<RunBudget>): void => {
   ctx.baseConfig.budget = { ...current, ...patch };
 };
 
-// Append the "current turn already snapshot" cue when a turn is
-// running. Mirrors /model's behavior so an operator mutating mid-
-// turn doesn't assume the in-flight prompt sees the new value.
-const withRunningCue = (ctx: SlashContext, notes: string[]): string[] => {
-  if (!ctx.isRunning()) return notes;
-  return [
-    ...notes,
-    '(current turn already snapshot its config; new value applies starting next prompt)',
-  ];
-};
-
 export const budgetCommand: SlashCommand = {
   name: 'budget',
   description: 'show or set budget caps',
   exec: async (args, ctx) => {
     if (args.length === 0) return showAll(ctx);
     const sub = (args[0] ?? '').toLowerCase();
+    // `/budget` is the operator's EXPLICIT-override surface: a cap
+    // mutation always RECORDS the value (pinning it — explicit beats
+    // the `/effort` preset in `effectiveBudget`, so a later `/effort`
+    // can't silently move it), and the "already (no change)" note fires
+    // only when the RAW explicit override is already that value. So the
+    // idempotency check compares the raw field — NOT `?? DEFAULT_BUDGET`
+    // and NOT the effort-adjusted effective. Comparing against the
+    // raw-absent DEFAULT fallback was the bug: under `/effort low`
+    // (subagents preset 1) `/budget subagents 3` matched DEFAULT 3,
+    // reported "already 3", and never wrote — leaving the cap at 1.
 
     if (sub === 'steps') {
       if (args.length !== 2) {
@@ -122,9 +116,9 @@ export const budgetCommand: SlashCommand = {
           message: `/budget steps: '${raw}' is not a positive integer`,
         };
       }
-      // Idempotency: a no-op mutation returns "already" without
-      // the next-turn cue. Avoids
-      // misleading the operator into thinking they changed something.
+      // Idempotency: re-stating the existing explicit override is a
+      // no-op ("already"); any other value writes (pins). Compare the
+      // raw override field (see the dispatch-top note).
       const current = ctx.baseConfig.budget?.maxSteps;
       if (current === n) {
         return {
@@ -205,8 +199,7 @@ export const budgetCommand: SlashCommand = {
           message: `/budget parallel-tools: '${raw}' is not an integer in [1, ${MAX_CONCURRENT_TOOL_CALLS_CAP}]`,
         };
       }
-      const current =
-        ctx.baseConfig.budget?.maxConcurrentToolCalls ?? DEFAULT_BUDGET.maxConcurrentToolCalls;
+      const current = ctx.baseConfig.budget?.maxConcurrentToolCalls;
       if (current === n) {
         return { kind: 'ok', notes: [`max parallel tools already ${n} (no change)`] };
       }
@@ -232,8 +225,7 @@ export const budgetCommand: SlashCommand = {
           message: `/budget subagents: '${raw}' is not an integer in [1, ${MAX_CONCURRENT_SUBAGENTS_CAP}]`,
         };
       }
-      const current =
-        ctx.baseConfig.budget?.maxConcurrentSubagents ?? DEFAULT_BUDGET.maxConcurrentSubagents;
+      const current = ctx.baseConfig.budget?.maxConcurrentSubagents;
       if (current === n) {
         return { kind: 'ok', notes: [`max concurrent subagents already ${n} (no change)`] };
       }

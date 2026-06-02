@@ -88,6 +88,11 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
 
   const status = state.status;
   const rightParts: string[] = [];
+  // Selected effort level (leftmost of the right cluster). Seeded at
+  // boot from config/DEFAULT_EFFORT, updated live on `/effort`.
+  if (status.effort !== null) {
+    rightParts.push(dim(caps, `effort: ${status.effort}`));
+  }
   if (status.model !== null && status.model !== '') {
     rightParts.push(dim(caps, status.model));
   }

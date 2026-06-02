@@ -4,7 +4,7 @@ import type { HookSpec } from '../hooks/index.ts';
 import type { EagerExposure, MemoryRegistry } from '../memory/index.ts';
 import type { OutcomeSink } from '../outcomes/index.ts';
 import type { Decision, PermissionEngine, PolicySource } from '../permissions/index.ts';
-import type { Provider, StreamEvent, UsageInfo } from '../providers/index.ts';
+import type { Provider, ProviderEffort, StreamEvent, UsageInfo } from '../providers/index.ts';
 import type { SkillCatalog } from '../skills/index.ts';
 import type { DB } from '../storage/index.ts';
 import type { ContextPinsStore } from '../storage/repos/context-pins.ts';
@@ -13,6 +13,7 @@ import type { SubagentSet } from '../subagents/load.ts';
 import type { TelemetrySink } from '../telemetry/index.ts';
 import type { TodoItem } from '../todo/index.ts';
 import type { ToolRegistry } from '../tools/index.ts';
+import { type ForjaEffort, effortBudgetPatch } from './effort.ts';
 
 // Lifecycle events the harness emits during a run. Synchronous (fire and
 // forget) so renderers stay simple and the loop never waits on UI work.
@@ -570,8 +571,17 @@ export const resolveMaxOutputTokens = (
 // (operator opt-out for `maxCostUsd`), so the resulting
 // `RunBudget` may legitimately carry `maxCostUsd: undefined`
 // despite the type being `RunBudget`.
-export const effectiveBudget = (partial?: Partial<RunBudget>): RunBudget => ({
+// Three layers, lowest-to-highest precedence: code defaults < the
+// `/effort` profile preset (operational caps for the level) <
+// explicit operator overrides (`partial`, from `/budget` / playbook
+// frontmatter). The effort layer sits in the MIDDLE so an explicit
+// `/budget steps 50` always wins over a preset regardless of the
+// order the two commands ran — order-independent, inspectable
+// precedence. `effort` undefined ⇒ the middle layer is empty and
+// this collapses to the prior `{...DEFAULT, ...partial}` behavior.
+export const effectiveBudget = (partial?: Partial<RunBudget>, effort?: ForjaEffort): RunBudget => ({
   ...DEFAULT_BUDGET,
+  ...(effort !== undefined ? effortBudgetPatch(effort) : {}),
   ...(partial ?? {}),
 });
 
@@ -648,6 +658,23 @@ export interface HarnessConfig {
   systemPromptHash?: string;
   userPrompt: string;
   budget?: Partial<RunBudget>;
+  // Operational effort level (`src/harness/effort.ts`). Set via the
+  // `/effort` slash command. Drives BOTH axes by resolution, not by
+  // mutation: the operational caps are layered at read time by
+  // `effectiveBudget(budget, effort)` (defaults < preset < explicit
+  // `/budget`), and the provider reasoning-effort is resolved via
+  // `resolveProviderEffort` for the request. Session-scoped (in
+  // memory, next-turn); never persisted. Unset ⇒ provider default.
+  effort?: ForjaEffort;
+  // Request-level provider reasoning-effort, set DIRECTLY (not via a
+  // ForjaEffort profile). This is the channel a spawned subagent
+  // inherits the operator's `/effort` reasoning depth through: the
+  // parent forwards its resolved provider-effort here so the child
+  // reasons at the same level WITHOUT inheriting the operational
+  // budget caps (those stay per-playbook). Takes precedence over
+  // `effort` in `resolveProviderEffort`. On the main session this
+  // stays unset and the value derives from `effort`.
+  providerEffort?: ProviderEffort;
   signal?: AbortSignal;
   // Cooperative-stop signal (spec UI.md §3, soft interrupt). When
   // aborted, the harness completes the current step (provider call

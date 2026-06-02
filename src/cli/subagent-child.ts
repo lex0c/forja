@@ -10,7 +10,7 @@ import {
 import { mergeTrustedHosts } from '../permissions/bootstrap-engine.ts';
 import { parseCapability } from '../permissions/capabilities.ts';
 import { createPermissionEngine, createSqliteSink, ensureInstallId } from '../permissions/index.ts';
-import { type Provider, createDefaultRegistry } from '../providers/index.ts';
+import { type Provider, type ProviderEffort, createDefaultRegistry } from '../providers/index.ts';
 import type { SystemSegment } from '../providers/types.ts';
 import {
   type DB,
@@ -137,6 +137,11 @@ export interface SubagentChildOptions {
   // silently ignore the parent's temperature override and run
   // non-deterministically.
   temperature?: number;
+  // Provider reasoning-effort carried across via `--subagent-effort`,
+  // so the child inherits the operator's `/effort` reasoning depth.
+  // Applied as the request's provider-effort axis ONLY — the child's
+  // operational caps stay per-playbook. Undefined ⇒ provider default.
+  providerEffort?: ProviderEffort;
   // Trust verdict carried across via `--subagent-cwd-trusted`
   // (presence-only). The parent resolved trust at bootstrap
   // against `~/.config/agent/trust.json`; the child can't
@@ -1137,6 +1142,11 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
         : audit.sampling?.temperature !== undefined
           ? { temperature: audit.sampling.temperature }
           : {}),
+      // Provider reasoning-effort inherited from the parent's `/effort`
+      // (forwarded via `--subagent-effort`). No playbook frontmatter
+      // equivalent today, so it's purely the inherited value — sets the
+      // request's provider-effort axis without imposing operational caps.
+      ...(opts.providerEffort !== undefined ? { providerEffort: opts.providerEffort } : {}),
       // Nucleus sampling and extended-thinking budget. No
       // parent-forwarded equivalent today — argv carries only
       // temperature. When the spec adds further parent-forwarded

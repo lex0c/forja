@@ -46,6 +46,40 @@ export interface ProviderCapabilities {
   // model that still accepts the field.
   supports_sampling?: boolean;
 
+  // Whether the model uses Anthropic-style ADAPTIVE thinking
+  // (`thinking: { type: 'adaptive' }`) rather than the legacy
+  // manual budget (`type: 'enabled', budget_tokens`). Newer
+  // frontier models made adaptive the only mode and 400 on
+  // `enabled` (Opus 4.7/4.8); deprecated `enabled` on Sonnet 4.6.
+  // When true, the adapter engages thinking via adaptive and drops
+  // `budget_tokens` (the model decides depth; `effort` guides it).
+  // When false/omitted, the adapter keeps the manual budget path.
+  // Provider-specific today (Anthropic); other families ignore it.
+  supports_adaptive_thinking?: boolean;
+
+  // Whether the model accepts a reasoning-EFFORT control surface
+  // (the agnostic `GenerateRequest.effort`). Each adapter maps it to
+  // its native surface only when this is true: Anthropic
+  // `output_config.effort`, OpenAI flat `reasoning_effort`, Gemini
+  // numeric `thinkingConfig.thinkingBudget`. False/omitted ⇒ the
+  // adapter drops `effort` for that model — non-reasoning models
+  // (e.g. OpenAI gpt-4o) and models that don't expose the surface
+  // 400 on it, so emission must be gated. The operational-budget
+  // axis of `/effort` still applies regardless; only the
+  // provider-effort axis is gated here (best-effort per the
+  // "request expresses intent, per-provider follows" convention).
+  supports_reasoning_effort?: boolean;
+
+  // Ceiling for the numeric thinking budget (Gemini's
+  // `thinkingConfig.thinkingBudget`), in tokens. Gemini 2.5 caps it
+  // per model (Flash/Flash-Lite 24576, Pro 32768) and 400s above the
+  // cap. The adapter clamps the resolved budget to this before send,
+  // so a playbook's large legacy `sampling.thinking_budget` (the
+  // loader allows big values for provider-specific handling) is fitted
+  // rather than rejected. Omitted ⇒ no clamp (providers with no such
+  // ceiling, or where the budget surface isn't numeric).
+  max_thinking_budget?: number;
+
   // Operational
   max_rps?: number;
   notes: string[];
@@ -161,6 +195,13 @@ export const flattenSystemSegments = (segments: SystemSegment[]): string =>
     .filter((t) => t.length > 0)
     .join('\n\n');
 
+// Agnostic reasoning-effort level (TOKEN_TUNING.md §4). One
+// vocabulary the whole stack speaks; each adapter translates it to
+// its native surface (`src/providers/effort.ts`). `max` is the
+// Forja ceiling — providers without a distinct top level map it to
+// theirs (OpenAI `xhigh`; Anthropic has a native `max`).
+export type ProviderEffort = 'low' | 'medium' | 'high' | 'max';
+
 export interface GenerateRequest {
   model: string;
   system?: string;
@@ -193,6 +234,16 @@ export interface GenerateRequest {
   // here would force every playbook to declare per-provider
   // sampling overrides, which the spec deliberately does not.
   thinking_budget?: number;
+  // Agnostic reasoning-effort level (TOKEN_TUNING.md §4). Set from
+  // the `/effort` slash command via `HarnessConfig.effort`. Each
+  // adapter maps it to its native surface: Anthropic
+  // `output_config.effort` (1:1), OpenAI `reasoning.effort`
+  // (max→xhigh), numeric providers a thinking budget from the
+  // canonical ladder (`src/providers/effort.ts`). Orthogonal to
+  // `thinking_budget` (the legacy per-playbook numeric knob);
+  // adapters that read both give `effort` precedence. Unset ⇒ the
+  // provider applies its own default.
+  effort?: ProviderEffort;
   // Determinism intent flag (`PLAYBOOKS.md` §1.1
   // `sampling.seed_in_eval`). When true, the playbook author
   // declared this run wants seeded generation for reproducibility

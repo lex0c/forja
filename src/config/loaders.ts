@@ -11,6 +11,7 @@
 // Shared file/parse/section plumbing lives in `src/config/section.ts`
 // (`loadTomlSection`); path resolution in `src/config/paths.ts`.
 
+import { FORJA_EFFORT_LEVELS, type ForjaEffort } from '../harness/effort.ts';
 import type { ModelRegistry } from '../providers/registry.ts';
 import { projectConfigPath, userConfigPath } from './paths.ts';
 import { loadTomlSection } from './section.ts';
@@ -504,4 +505,77 @@ export const loadBudgetConfig = (input: LoadBudgetConfigInput): LoadedBudgetConf
   const config: BudgetConfigKeys = { ...userResult.layer, ...projectResult.layer };
 
   return { config, userPath, projectPath, warnings };
+};
+
+// ────────────────────────────────────────────────────────────────────
+// EFFORT CONFIG (TOKEN_TUNING.md §4)
+//
+// `[effort] level` is the operator's PERSISTENT default effort level,
+// mirroring how `[budget]` works: config sets the default; the
+// `/effort` slash command overrides it in-session (in memory).
+// Resolution:
+//
+//   project [effort].level > user [effort].level > DEFAULT_EFFORT
+//
+// A dedicated `[effort]` table on purpose — NOT `[sampling]`, which the
+// spec reserves for per-provider sub-tables (`[sampling.thinking]`,
+// `[sampling.openai_reasoning]`, …) where `effort` means the
+// OpenAI-specific reasoning level, not Forja's unified level.
+// DEFAULT_EFFORT ('high') is applied by bootstrap, not here — same as
+// the loader leaving the DEFAULT_BUDGET merge to bootstrap. Fail-soft +
+// case-insensitive (matches `/effort`): an unknown level warns and is
+// ignored (falls through to the next layer / default).
+
+export interface LoadedEffortConfig {
+  // Configured level, or undefined when neither layer set a valid one
+  // (bootstrap then applies DEFAULT_EFFORT).
+  effort?: ForjaEffort;
+  userPath: string | null;
+  projectPath: string;
+  warnings: string[];
+}
+
+const parseEffortLayer = (
+  path: string | null,
+  source: string,
+): { effort?: ForjaEffort; warnings: string[] } => {
+  const warnings: string[] = [];
+  const section = loadTomlSection(path, 'effort', source);
+  if (section.kind === 'absent' || section.kind === 'no-section') return { warnings };
+  if (section.kind === 'invalid') {
+    warnings.push(section.warning);
+    return { warnings };
+  }
+  const raw = section.section.level;
+  if (raw === undefined) return { warnings };
+  // Case-insensitive — mirror the `/effort` command's `.toLowerCase()`
+  // so config.toml and the slash command accept the same vocabulary.
+  const normalized = typeof raw === 'string' ? raw.toLowerCase() : raw;
+  if (
+    typeof normalized !== 'string' ||
+    !(FORJA_EFFORT_LEVELS as readonly string[]).includes(normalized)
+  ) {
+    warnings.push(
+      `${source} config (${path}): [effort].level=${JSON.stringify(raw)} must be one of ${FORJA_EFFORT_LEVELS.join('|')}; ignoring`,
+    );
+    return { warnings };
+  }
+  return { effort: normalized as ForjaEffort, warnings };
+};
+
+export interface LoadEffortConfigInput {
+  cwd: string;
+  env?: NodeJS.ProcessEnv;
+}
+
+export const loadEffortConfig = (input: LoadEffortConfigInput): LoadedEffortConfig => {
+  const env = input.env ?? process.env;
+  const userPath = userConfigPath(env);
+  const projectPath = projectConfigPath(input.cwd);
+  const userResult = parseEffortLayer(userPath, 'user');
+  const projectResult = parseEffortLayer(projectPath, 'project');
+  const warnings = [...userResult.warnings, ...projectResult.warnings];
+  // project wins; undefined leaves bootstrap to apply DEFAULT_EFFORT.
+  const effort = projectResult.effort ?? userResult.effort;
+  return { ...(effort !== undefined ? { effort } : {}), userPath, projectPath, warnings };
 };

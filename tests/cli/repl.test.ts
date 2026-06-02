@@ -149,6 +149,7 @@ const makeBootstrapStub = (
     memoryConfigWarnings: [] as readonly string[],
     providersConfigWarnings: [] as readonly string[],
     budgetConfigWarnings: [] as readonly string[],
+    effortConfigWarnings: [] as readonly string[],
     auditConfigWarnings: [] as readonly string[],
     permissionState: 'ready',
     permissionChain: { ok: true, rows: 0, current_rotation_id: 0, quarantined: false },
@@ -338,6 +339,44 @@ describe('repl — boot + smoke', () => {
     });
     expect(code).toBe(1);
     expect(stderr).toContain('TTY');
+  });
+
+  test('surfaces [effort]/[providers]/[budget] config warnings at REPL boot (matches run.ts)', async () => {
+    // Regression: BootstrapResult is consumed by BOTH run.ts (one-shot)
+    // and runRepl; these config warnings were only surfaced in run.ts,
+    // so an invalid [effort].level / [providers] / [budget] in an
+    // interactive session silently fell back to defaults with no
+    // diagnostic. runRepl now mirrors run.ts's warning block.
+    const stub = makeBootstrapStub();
+    (stub as { effortConfigWarnings: readonly string[] }).effortConfigWarnings = [
+      'bad effort level',
+    ];
+    (stub as { providersConfigWarnings: readonly string[] }).providersConfigWarnings = [
+      'bad provider route',
+    ];
+    (stub as { budgetConfigWarnings: readonly string[] }).budgetConfigWarnings = [
+      'bad budget value',
+    ];
+    let stderr = '';
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      errSink: (s) => {
+        stderr += s;
+      },
+    });
+    await tick();
+    stdin.feed('\x04'); // EOF → quit after boot
+    await promise;
+    expect(stderr).toContain('forja: effort config: bad effort level');
+    expect(stderr).toContain('forja: providers config: bad provider route');
+    expect(stderr).toContain('forja: budget config: bad budget value');
   });
 
   test('refuses to start when stdin is non-TTY even if stdout is TTY (regression)', async () => {
@@ -2988,6 +3027,70 @@ describe('repl — slash commands integration', () => {
     // runSubagent input, matching what the foreground task_*
     // spawn path does in harness/loop.ts.
     expect(capturedTemperature).toBe(0);
+
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('slash playbook forwards the resolved provider-effort to runSubagent', async () => {
+    // Companion to the temperature forward: /<playbook> dispatch must
+    // honor the operator's /effort (or configured default) like the
+    // foreground task_* path. Without it the child runs at the provider
+    // default while the footer + /effort confirmation say it is active.
+    const stub = makeBootstrapStub();
+    (stub.config as { effort?: string }).effort = 'max';
+
+    const fakeDef = {
+      name: 'fake',
+      description: 'fake subagent for tests',
+      tools: [],
+      budget: { maxSteps: 1, maxCostUsd: 0.01 },
+      systemPrompt: 'noop',
+      scope: 'project',
+      isolation: 'none',
+      sourcePath: '/dev/null',
+      sourceSha256: '0'.repeat(64),
+      slash: 'fake',
+    };
+    (stub.subagents.byName as Map<string, unknown>).set('fake', fakeDef);
+
+    let capturedProviderEffort: string | undefined;
+    const fakeRunSubagent = async (
+      input: Parameters<typeof import('../../src/subagents/index.ts').runSubagent>[0],
+    ): ReturnType<typeof import('../../src/subagents/index.ts').runSubagent> => {
+      capturedProviderEffort = input.providerEffort;
+      return {
+        output: '(no-op)',
+        sessionId: 'sess-fake-child',
+        status: 'done',
+        reason: 'done',
+        costUsd: 0,
+        steps: 0,
+        durationMs: 0,
+      };
+    };
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      runSubagentOverride: fakeRunSubagent,
+    });
+    await tick();
+
+    stdin.feed('/fake go\r');
+    await tick();
+    await tick();
+    await flushFrame();
+
+    // effort 'max' on the session config → resolveProviderEffort → 'max'
+    // flows to the child, matching the foreground task_* spawn path.
+    expect(capturedProviderEffort).toBe('max');
 
     stdin.feed('\x04');
     expect(await promise).toBe(130);
