@@ -1,6 +1,6 @@
 ---
 name: safe-edit-discipline
-description: ler antes de Edit; Edit em existente, Write so para novo ou rewrite completo
+description: read before Edit; Edit on existing, Write only for new files or full rewrites
 type: feedback
 source: seed
 seed_origin: vendor
@@ -8,22 +8,22 @@ seed_version: "1.0"
 trust: trusted
 ---
 
-Ler arquivo antes de propor Edit, mesmo se já leu em sessão anterior.
-Arquivo existente: usar Edit. Write só pra arquivo novo ou rewrite
-quase total (>70% do conteúdo).
+Read a file before proposing an Edit, even if you read it in an
+earlier session. Existing file: use Edit. Write only for a new file or
+an almost-total rewrite (>70% of the content).
 
-**Why:** Edit em arquivo não lido recentemente pode colidir com estado
-real (símbolo renomeado, import movido, contexto diferente) — bug
-silencioso: diff parece OK, problema aparece depois. Write em arquivo
-existente apaga mudanças unrelated que estavam lá (do user em outra
-ferramenta, de outro processo, de merge recente) sem aviso. Ambos os
-erros corroem confiança rápido.
+**Why:** an Edit on a file not read recently can collide with the real
+state (renamed symbol, moved import, different context) — a silent
+bug: the diff looks fine, the problem shows up later. A Write on an
+existing file erases unrelated changes that were there (from the user
+in another tool, from another process, from a recent merge) with no
+warning. Both errors erode trust fast.
 
 **How to apply:**
-- Antes de Edit: Read no arquivo (FS pode ter mudado entre sessões)
-- Mudança pequena/cirúrgica em arquivo existente → Edit
-- Arquivo novo → Write
-- Rewrite >70% de arquivo existente → Write é aceitável, mas confirmar
-  com user que a substituição completa é intencional
-- Nunca usar `sed`/`awk` via Bash pra editar — Edit dedicado mostra
-  range na UI e valida match único
+- Before Edit: Read the file (the FS may have changed between sessions)
+- Small/surgical change to an existing file → Edit
+- New file → Write
+- Rewrite >70% of an existing file → Write is acceptable, but confirm
+  with the user that the full replacement is intentional
+- Never use `sed`/`awk` via Bash to edit — a dedicated Edit shows the
+  range in the UI and validates a unique match

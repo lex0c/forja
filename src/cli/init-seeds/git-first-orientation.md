@@ -1,6 +1,6 @@
 ---
 name: git-first-orientation
-description: sessão fresca em repo git começa por git status + git log -10
+description: a fresh session in a git repo starts with git status + git log -10
 type: feedback
 source: seed
 seed_origin: vendor
@@ -8,26 +8,26 @@ seed_version: "1.0"
 trust: trusted
 ---
 
-Em sessão fresca em repo git, começar com `git status` +
-`git log --oneline -10` antes de explorar o FS. Tratar git como
-primitiva de navegação temporal/causal, não só de versionamento.
+In a fresh session in a git repo, start with `git status` +
+`git log --oneline -10` before exploring the FS. Treat git as a
+primitive for temporal/causal navigation, not just versioning.
 
-**Why:** `ls`/`glob` mostra estrutura mas não direção. `git status` +
-`git log -10` revelam em ~200ms: o que está em curso, o que mudou
-recentemente, qual o eixo de trabalho atual. Sem essa orientação, o
-agente gasta tokens explorando código que pode ter sido refatorado
-ou removido na semana passada. Bugs frequentemente vêm de mudança
-recente; `git log -S`, `git bisect`, `git blame -L` cortam espaço
-de busca exponencialmente vs. grep cego.
+**Why:** `ls`/`glob` shows structure but not direction. `git status` +
+`git log -10` reveal in ~200ms: what is in progress, what changed
+recently, the current axis of work. Without that orientation, the
+agent burns tokens exploring code that may have been refactored or
+removed last week. Bugs often come from a recent change; `git log -S`,
+`git bisect`, `git blame -L` cut the search space exponentially vs.
+blind grep.
 
 **How to apply:**
-- Sessão fresca em repo git: rodar `git status` + `git log --oneline -10`
-  antes de qualquer exploração de estrutura
-- "Onde está X?" muitas vezes é "X foi tocado recentemente —
+- Fresh session in a git repo: run `git status` + `git log --oneline -10`
+  before any structural exploration
+- "Where is X?" is often "X was touched recently —
   `git log -p --follow path/X`"
-- Investigação de bug: começar por `git log --since=<range>` ou
-  `git log -S "fragmento da mensagem de erro"`
-- "Por que essa linha existe?" → `git blame -L start,end file`
-- "Quem entende essa área?" → `git log --format=%an path/ | sort -u`
-- Fallback: repo sem história significativa (squash extremo, fresh
-  shallow clone) perde essa primitiva — cair pra navegação espacial
+- Bug investigation: start with `git log --since=<range>` or
+  `git log -S "fragment of the error message"`
+- "Why does this line exist?" → `git blame -L start,end file`
+- "Who knows this area?" → `git log --format=%an path/ | sort -u`
+- Fallback: a repo with no meaningful history (heavy squash, fresh
+  shallow clone) loses this primitive — fall back to spatial navigation

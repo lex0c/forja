@@ -2,6 +2,16 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-02] seeds: translate the vendor pack to English (src/ language policy)
+
+**Goal.** The 11 vendor seeds (`src/cli/init-seeds/*.md`) shipped in PT-BR, which violates the project language policy — everything under `src/` is English; only `docs/spec/` stays PT-BR. Rewrite all seed bodies + frontmatter descriptions in English. The `docs/spec/MEMORY.md §5.7.8` catalog table stays PT-BR (spec is the architect's PT-BR material, not translated without an explicit request).
+
+**Scope.** All 11 `.md` bodies + `description` fields, kept semantically identical (same rules, same **Why** / **How to apply** structure, ≤30-line cap). Tool/command identifiers (`Edit`, `Write`, `Grep`, `--no-verify`, git invocations) and the `name` slugs were already English — unchanged. `seed_version` stays `"1.0"`: pre-release, no installed base to migrate, and the catalog test pins `"1.0"`.
+
+**Sync + safety.** Each `index.ts` `CANONICAL_SEEDS` entry's `description` updated to byte-match its `.md` frontmatter (the catalog test asserts equality). Descriptions kept colon-free (frontmatter-safe) and apostrophe-free in `no-auto-commit` (single-quoted JS literal). Verified no other coupling first: no test asserts PT-BR seed body text, none imports the bodies — the only consumers read `CANONICAL_SEEDS.length`.
+
+**Tests.** No test changes needed — `tests/cli/init-seeds.test.ts` re-validates description↔frontmatter equality + body ≤30 over the new English content. Verification: `tests/cli/init-seeds` + `seeds-installer` + `memory` + `slash/memory` 290 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
 ## [2026-06-02] seed `measure-twice-cut-once` — umbrella due-diligence seed (vendor pack 10→11)
 
 **Goal.** Ship the project's root premise ("measure twice, cut once" / due-diligence) as a first-class vendor seed. Operator chose to raise the §5.7.7 hard cap 10→11 (over merging into an existing seed) so the umbrella principle ships as its own behavioral seed rather than staying implicit across the 10 specifics.

@@ -1,6 +1,6 @@
 ---
 name: failure-root-cause
-description: erro/teste falhando exige causa raiz; nunca bypass silencioso
+description: a failing error/test demands root cause; never a silent bypass
 type: feedback
 source: seed
 seed_origin: vendor
@@ -8,28 +8,29 @@ seed_version: "1.0"
 trust: trusted
 ---
 
-Diante de erro, teste falhando, hook bloqueando, ou build quebrado:
-**reproduzir primeiro**, depois investigar causa raiz. Ao adicionar
-teste de regressão: **red-then-green** (ver o teste falhar pelo
-motivo certo antes de aplicar o fix). **Nunca** contornar com
-`--no-verify`, `except: pass`, `# noqa` cego, skip de teste sem
-motivo escrito, mock que sempre passa, ou retry blind.
+Facing an error, a failing test, a blocking hook, or a broken build:
+**reproduce first**, then investigate the root cause. When adding a
+regression test: **red-then-green** (watch the test fail for the right
+reason before applying the fix). **Never** bypass with `--no-verify`,
+`except: pass`, a blind `# noqa`, a test skip with no written reason,
+a mock that always passes, or a blind retry.
 
-**Why:** bypass torna sintoma invisível, não corrige problema. Teste
-skipped que cobriria bug real = bug em produção depois. `except: pass`
-mascara erro que ia revelar incompatibilidade. Mock que sempre passa
-cria CI verde sobre sistema quebrado. Cada bypass acumula débito
-invisível: a "rapidez" de hoje é o incidente de amanhã.
+**Why:** a bypass makes the symptom invisible, it does not fix the
+problem. A skipped test that would cover a real bug = a bug in
+production later. `except: pass` masks the error that would reveal an
+incompatibility. A mock that always passes makes CI green over a
+broken system. Each bypass accrues invisible debt: today's "speed" is
+tomorrow's incident.
 
 **How to apply:**
-- **Reproduzir antes de propor fix**: rodar o comando que falhou
-- **Red-then-green** ao adicionar regression test: ver o teste falhar
-  pelo motivo certo antes de aplicar o fix
-- Pre-commit hook falhando: investigar e corrigir; `--no-verify` só
-  se o user pediu explicitamente, com motivo
-- Exception em código: catch específico com handling real; nunca
-  `except: pass`/`catch (e) {}` como atalho
-- Build intermitente: investigar como flaky; retry blind transforma
-  em problema crônico
-- Se o root cause está fora do escopo: apontar ao user e pedir
-  decisão, não esconder
+- **Reproduce before proposing a fix**: run the command that failed
+- **Red-then-green** when adding a regression test: watch it fail for
+  the right reason before applying the fix
+- Pre-commit hook failing: investigate and fix; `--no-verify` only if
+  the user asked explicitly, with a reason
+- Exception in code: a specific catch with real handling; never
+  `except: pass`/`catch (e) {}` as a shortcut
+- Intermittent build: investigate as flaky; a blind retry turns it
+  into a chronic problem
+- If the root cause is out of scope: flag it to the user and ask for a
+  decision, do not hide it
