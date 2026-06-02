@@ -74,17 +74,21 @@ export const anthropicThinkingParam = (
   caps: ProviderCapabilities,
 ): { thinking?: { type: 'adaptive' } | { type: 'enabled'; budget_tokens: number } } => {
   const budget = req.thinking_budget;
-  // Disable-via-zero (PLAYBOOKS.md §1.1) is an EXPLICIT "no thinking"
-  // and wins over everything, including a session `effort` — effort
-  // must never resurrect thinking a playbook deliberately turned off.
-  if (budget === 0) return {};
-  if (caps.supports_adaptive_thinking === true) {
-    const wantsThinking = (budget !== undefined && budget > 0) || req.effort !== undefined;
-    return wantsThinking ? { thinking: { type: 'adaptive' } } : {};
-  }
-  return budget !== undefined && budget > 0
-    ? { thinking: { type: 'enabled', budget_tokens: budget } }
-    : {};
+  // Thinking is engaged ONLY by an explicit thinking budget (> 0), NOT
+  // by `effort`. `effort` sets `output_config.effort` (token-eagerness
+  // over text + tool calls, and thinking depth WHEN thinking is on) but
+  // must not turn thinking ON by itself: with the default effort='high'
+  // that would force extended thinking onto every run, and on a pre-4.7
+  // ADAPTIVE model that still accepts sampling (Sonnet 4.6), thinking
+  // together with a temperature/top_p override is rejected with HTTP
+  // 400. Decoupling keeps deterministic runs valid — an eval pinning
+  // `temperature: 0`, or a builtin subagent with `sampling.temperature`
+  // — while `effort` still shapes those runs via `output_config`. A
+  // budget of 0 / absent ⇒ no thinking (disable-via-zero, PLAYBOOKS §1.1).
+  if (budget === undefined || budget <= 0) return {};
+  return caps.supports_adaptive_thinking === true
+    ? { thinking: { type: 'adaptive' } }
+    : { thinking: { type: 'enabled', budget_tokens: budget } };
 };
 
 export const createAnthropicProvider = (

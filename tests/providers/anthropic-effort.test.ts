@@ -24,10 +24,12 @@ describe('anthropicThinkingParam', () => {
     });
   });
 
-  test('adaptive model: effort alone engages adaptive', () => {
-    expect(anthropicThinkingParam(req({ effort: 'high' }), adaptiveCaps)).toEqual({
-      thinking: { type: 'adaptive' },
-    });
+  test('adaptive model: effort alone does NOT engage thinking (only an explicit budget does)', () => {
+    // Effort must not turn thinking on by itself — with the default
+    // effort='high' that would force extended thinking onto every run
+    // and 400 on Sonnet 4.6 when combined with a temperature/top_p
+    // override. effort still rides output_config.effort separately.
+    expect(anthropicThinkingParam(req({ effort: 'high' }), adaptiveCaps)).toEqual({});
   });
 
   test('adaptive model: neither budget nor effort → no thinking block', () => {
@@ -115,5 +117,22 @@ describe('anthropic adapter request assembly (effort + adaptive migration)', () 
     await drain(provider, req({ model: 'claude-opus-4-7', max_tokens: 8000 }));
     expect(cap.params?.output_config).toBeUndefined();
     expect(cap.params?.thinking).toBeUndefined();
+  });
+
+  test('sonnet-4-6: default effort + temperature does NOT engage thinking (sampling+thinking 400 guard)', async () => {
+    // Regression: bootstrap defaults effort='high'; Sonnet 4.6 is
+    // adaptive AND accepts sampling, so engaging thinking from effort
+    // would emit `thinking` alongside `temperature` → HTTP 400. effort
+    // must ride only output_config here, leaving thinking off so a
+    // deterministic (temperature:0) run stays valid.
+    const cap: { params?: Record<string, unknown> } = {};
+    const provider = createAnthropicProvider('claude-sonnet-4-6', { client: fakeClient(cap) });
+    await drain(
+      provider,
+      req({ model: 'claude-sonnet-4-6', effort: 'high', temperature: 0, max_tokens: 8000 }),
+    );
+    expect(cap.params?.thinking).toBeUndefined(); // no thinking from effort alone
+    expect(cap.params?.output_config).toEqual({ effort: 'high' }); // effort still applied
+    expect(cap.params?.temperature).toBe(0); // sampling preserved → no conflict
   });
 });
