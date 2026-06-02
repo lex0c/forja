@@ -548,6 +548,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     policyLayers,
     hookWarnings,
     memoryConfigWarnings,
+    providersConfigWarnings,
+    budgetConfigWarnings,
+    effortConfigWarnings,
     auditConfigWarnings,
     sandboxEnforcement,
   } = bootstrapped;
@@ -585,6 +588,23 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // "false"` and got default-on detectors billing LLM-judge work).
   for (const w of memoryConfigWarnings) {
     errSink(`forja: memory config: ${w}\n`);
+  }
+  // [providers] config warnings (`.agent/config.toml [providers]`) —
+  // same surfacing as run.ts: a bad model alias / route silently falls
+  // back to the default, so stderr visibility lets the operator catch
+  // it instead of running on a model they didn't intend.
+  for (const w of providersConfigWarnings) {
+    errSink(`forja: providers config: ${w}\n`);
+  }
+  // [budget] config warnings — a numeric typo or out-of-range value
+  // shouldn't disappear silently.
+  for (const w of budgetConfigWarnings) {
+    errSink(`forja: budget config: ${w}\n`);
+  }
+  // [effort].level config warnings — an unknown level silently
+  // defaulting to high would hide an operator typo (matches run.ts).
+  for (const w of effortConfigWarnings) {
+    errSink(`forja: effort config: ${w}\n`);
   }
   // [audit] / [audit.retention] config warnings — deletion policy
   // is operationally riskier than the other config surfaces.
