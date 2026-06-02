@@ -101,7 +101,9 @@ describe('sensitive-paths vs sandbox-hide-paths fence (slice 125)', () => {
       // KeePassXC DB - pattern, lives anywhere.
       '*.kdbx': { kind: 'unmappable' },
       // Glob patterns for project-level secrets — unmappable.
-      '**/credentials*.json': { kind: 'unmappable' },
+      '*credentials*.json': { kind: 'unmappable' },
+      '*service-account*.json': { kind: 'unmappable' },
+      '*-firebase-adminsdk-*.json': { kind: 'unmappable' },
       '**/secrets.yml': { kind: 'unmappable' },
       '**/secrets.yaml': { kind: 'unmappable' },
       // Slice 180 additions — tool-specific credential files. Mapping:
@@ -125,6 +127,24 @@ describe('sensitive-paths vs sandbox-hide-paths fence (slice 125)', () => {
       '.my.cnf': { kind: 'unmappable' },
       '.mongorc.js': { kind: 'unmappable' },
       '**/.htpasswd': { kind: 'unmappable' },
+      // k8s / docker-registry + mobile signing + tokens. All project-level
+      // / name-shape (match at any depth), so the sandbox can't fence them
+      // to a single mount — the sensitive-paths read-gate is their defense.
+      // (Home ~/.kube and ~/.docker ARE separately masked via HIDE_PATHS;
+      // these patterns also catch repo-local copies, hence unmappable.)
+      '.kube/config': { kind: 'unmappable' },
+      kubeconfig: { kind: 'unmappable' },
+      '.docker/config.json': { kind: 'unmappable' },
+      '*.jks': { kind: 'unmappable' },
+      '*.keystore': { kind: 'unmappable' },
+      'keystore.properties': { kind: 'unmappable' },
+      'local.properties': { kind: 'unmappable' },
+      '*.p8': { kind: 'unmappable' },
+      '*.mobileprovision': { kind: 'unmappable' },
+      'google-services.json': { kind: 'unmappable' },
+      'GoogleService-Info.plist': { kind: 'unmappable' },
+      '*.jwt': { kind: 'unmappable' },
+      '*.ovpn': { kind: 'unmappable' },
     };
 
   test('every sensitive-paths entry has an explicit fence mapping (catches new patterns without coverage)', () => {

@@ -61,7 +61,15 @@ export const SENSITIVE_PATH_DENY_LIST: readonly string[] = [
   '.npmrc',
   '.pypirc',
   '*.kdbx',
-  '**/credentials*.json',
+  // `*credentials*.json` (contains-match, not just a `credentials`-prefix)
+  // mirrors SECURITY_GUIDELINE §8.4 and catches suffix forms like
+  // `foo-credentials.json`; `*service-account*.json` /
+  // `*-firebase-adminsdk-*.json` cover the GCP / Firebase service-account
+  // key files that don't carry "credentials" in the name. The
+  // `**/<pattern>` probe in matchSensitivePath makes these fire at any depth.
+  '*credentials*.json',
+  '*service-account*.json',
+  '*-firebase-adminsdk-*.json',
   '**/secrets.yml',
   '**/secrets.yaml',
   '.git-credentials',
@@ -81,6 +89,37 @@ export const SENSITIVE_PATH_DENY_LIST: readonly string[] = [
   '.my.cnf',
   '.mongorc.js',
   '**/.htpasswd',
+  // Kubernetes / Docker-registry credentials (tokens, client certs/keys,
+  // base64'd registry auth). `.dockercfg` above is the legacy form;
+  // `.docker/config.json` is the modern one.
+  '.kube/config',
+  'kubeconfig',
+  '.docker/config.json',
+  // Mobile signing material + secret-bearing config:
+  //   `*.jks` / `*.keystore` — Android signing keystores (private keys).
+  //   `keystore.properties` — Android signing-store + key passwords.
+  //   `local.properties` — Android; commonly holds `storePassword` /
+  //       `keyPassword` (gitignored by convention for this reason).
+  //   `*.p8` — Apple APNs / sign-in auth key (PKCS#8 private key).
+  //   `*.mobileprovision` — iOS provisioning profile (signing identity).
+  //   `google-services.json` / `GoogleService-Info.plist` — Firebase
+  //       config carrying API keys.
+  // Public-cert encodings (`*.crt`/`*.cer`/`*.der`) are deliberately NOT
+  // here: they carry no private key (that lives in the `*.pem`/`*.key`/
+  // `*.p12`/`*.pfx` files already on this list), and this is a hard,
+  // un-overridable floor — blocking public certs would only break
+  // legitimate reads with no secret-exposure gain.
+  '*.jks',
+  '*.keystore',
+  'keystore.properties',
+  'local.properties',
+  '*.p8',
+  '*.mobileprovision',
+  'google-services.json',
+  'GoogleService-Info.plist',
+  // Bearer tokens / VPN profiles that embed key material:
+  '*.jwt',
+  '*.ovpn',
 ];
 
 // Match a relative path against the deny-list. Returns the

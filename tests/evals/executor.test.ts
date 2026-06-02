@@ -563,7 +563,13 @@ describe('executeCase — approval posture (operation mode, AGENTIC_CLI §8.1)',
     expect(r.passed).toBe(true);
   });
 
-  test('autonomous does NOT auto-approve a risk confirm (compound bash stays denied)', async () => {
+  test('autonomous does NOT auto-approve a compound with a non-repo-confined effect (headless → denied)', async () => {
+    // Autonomous auto-approves a bash compound only when EVERY resolved
+    // capability is repo-confined. `frobnicate` is an unknown binary →
+    // `exec:arbitrary`, which is never repo-confined, so the compound stays
+    // a modal; headless has no approver, so the confirm resolves to a deny.
+    // (A repo-confined compound like `echo a && echo b` WOULD auto-approve —
+    // pinned in tests/permissions/engine.test.ts.)
     const c = baseCase({
       setup: {
         approvalPosture: 'autonomous',
@@ -577,7 +583,7 @@ describe('executeCase — approval posture (operation mode, AGENTIC_CLI §8.1)',
     const r = await executeCase(c, {
       bootstrapOverride: {
         providerOverride: mockProvider([
-          { tool_uses: [{ id: 't1', name: 'bash', input: { command: 'echo a && echo b' } }] },
+          { tool_uses: [{ id: 't1', name: 'bash', input: { command: 'frobnicate a && echo b' } }] },
           { text: 'tried' },
         ]),
       },

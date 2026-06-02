@@ -1,4 +1,7 @@
 import { beforeAll, describe, expect, test } from 'bun:test';
+import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { AuditEmitInput } from '../../src/permissions/audit.ts';
 import { initBashParser } from '../../src/permissions/bash-parser.ts';
 import { createPermissionEngine } from '../../src/permissions/engine.ts';
@@ -134,6 +137,25 @@ describe('engine.check confirmCause (every confirm carries a typed cause)', () =
     if (d.kind === 'confirm') expect(d.confirmCause).toBe('compound');
   });
 
+  test('a compound that is ALSO risk-bearing keeps cause "compound" (never resolver/score)', () => {
+    // Invariant the autonomous per-segment deny re-check relies on: checkBash
+    // stamps `compound` BEFORE the allow rules, and degradeAllowToConfirm
+    // only upgrades `allow`s — so a compound never becomes `resolver`/`score`
+    // even when low-confidence (unknown git subcommand) or score-crossing
+    // (`git push` net-egress). Conversely `resolver`/`score` ⟹ a single
+    // (non-compound) command, whose whole string checkBash already
+    // deny-matched — which is why the re-check skips them.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git *'] } } }), {
+      cwd: CWD,
+      scoreConfirmThreshold: 0.0001,
+    });
+    for (const command of ['git frobnicate && echo x', 'git push origin main && echo x']) {
+      const d = eng.check('bash', 'bash', { command });
+      expect(d.kind).toBe('confirm');
+      if (d.kind === 'confirm') expect(d.confirmCause).toBe('compound');
+    }
+  });
+
   test('path confirm_paths rule → cause "policy"', () => {
     const eng = createPermissionEngine(
       policy({ tools: { write_file: { confirm_paths: ['package.json'] } } }),
@@ -193,14 +215,282 @@ describe('approval posture (Supervised / Autonomous)', () => {
     expect(eng.check('write_file', 'fs.write', { path: 'package.json' }).kind).toBe('allow');
   });
 
-  test('autonomous does NOT auto-approve a compound-command confirm', () => {
-    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['echo *'] } } }), {
+  // Autonomous auto-approves a bash confirm when EVERY resolved capability
+  // is repo-confined (reads/writes/deletes under cwd, local git-write,
+  // exec:shell); dangerous effects (network, outside-repo, unknown binary,
+  // protected/sensitive paths) keep the modal regardless of structure.
+  test('autonomous auto-approves a repo-confined compound read', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('bash', 'bash', { command: 'cat README.md && echo done' });
+    expect(d.kind).toBe('allow');
+    if (d.kind === 'allow') expect(d.reason).toContain('repo-confined operation');
+  });
+
+  test('autonomous auto-approves a repo-confined write', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('bash', 'bash', { command: 'echo hi > notes.txt && echo done' });
+    expect(d.kind).toBe('allow');
+  });
+
+  test('autonomous auto-approves a repo-confined delete (operator opted in)', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('bash', 'bash', { command: 'rm build.log && echo done' });
+    expect(d.kind).toBe('allow');
+  });
+
+  test('autonomous auto-approves a local git-write (operator opted in)', () => {
+    // git-writes with NO hook surface (add / tag / stash / reset) — NOT
+    // `commit`, which runs repository hooks (see the hook-running test
+    // below). `git tag` writes a ref with no hook.
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('bash', 'bash', { command: 'git add -A && git tag wip' });
+    expect(d.kind).toBe('allow');
+  });
+
+  test('autonomous does NOT auto-approve git commit/merge/rebase/cherry-pick (run repo hooks)', () => {
+    // `git commit` (and merge / rebase / cherry-pick) run repository hooks
+    // — scripts under `.git/hooks/` that execute arbitrary code (pre-commit,
+    // prepare-commit-msg, commit-msg, post-commit, …). A repo with an
+    // installed hook would run that code on a bare `git commit`, so the
+    // resolver models these as exec:arbitrary (not a repo-confined
+    // git-write) and the modal must stay. `--no-verify` is NOT a downgrade:
+    // it bypasses only pre-commit + commit-msg; post-commit still runs.
+    //
+    // Tested under an explicit `allow: git*` so the policy itself permits
+    // the command — this pins that the AUTONOMOUS capability-confinement
+    // (not just default-deny) is what withholds the auto-approval. add /
+    // lightweight tag stay auto-approved (the git-write test above).
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git*'] } } }), {
       cwd: CWD,
       approvalPosture: 'autonomous',
     });
-    const d = eng.check('bash', 'bash', { command: 'echo a && echo b' });
+    for (const command of [
+      'git add -A && git commit -m wip',
+      'git commit --no-verify -m wip',
+      'git merge feature',
+      'git rebase main',
+      'git cherry-pick abc123',
+    ]) {
+      const d = eng.check('bash', 'bash', { command });
+      expect(d.kind).toBe('confirm');
+    }
+  });
+
+  test('autonomous does NOT auto-approve annotated/signed git tag (editor / gpg), but does a lightweight one', () => {
+    // `git tag -a` (no -m) opens core.editor and `git tag -s` runs
+    // gpg.program — configurable commands, so exec:arbitrary keeps the modal.
+    // A lightweight tag and an annotated tag WITH a message are pure
+    // git-writes → still auto-approved.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git*'] } } }), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+    });
+    expect(eng.check('bash', 'bash', { command: 'git tag -a v1' }).kind).toBe('confirm');
+    expect(eng.check('bash', 'bash', { command: 'git tag -s v1' }).kind).toBe('confirm');
+    expect(eng.check('bash', 'bash', { command: 'git add -A && git tag v1' }).kind).toBe('allow');
+    expect(eng.check('bash', 'bash', { command: 'git tag -a v1 -m release' }).kind).toBe('allow');
+  });
+
+  test('autonomous does NOT auto-approve a conservative/dynamic-dataflow loop (caps are best-effort)', () => {
+    // A `for` loop is Conservative — the resolver can't model the body's
+    // dynamic `$f`, so the caps are best-effort. Even reading in-repo
+    // `*.ts` it stays behind the modal: the `kind: ok` gate refuses to
+    // trust an incomplete capability set.
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('bash', 'bash', { command: 'for f in *.ts; do cat "$f"; done' });
+    expect(d.kind).toBe('confirm');
+  });
+
+  test('autonomous does NOT auto-approve a loop whose dynamic body escapes the repo (hole closure)', () => {
+    // `for f in /tmp/*; do rm "$f"; done` resolves the body's `$f` as
+    // `<cwd>/$f` and emits NO cap for the non-protected `/tmp/*` loop
+    // source, so every cap looks repo-confined while the command deletes
+    // /tmp. Conservative (not `kind: ok`) → stays modal.
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('bash', 'bash', { command: 'for f in /tmp/*; do rm "$f"; done' });
+    expect(d.kind).toBe('confirm');
+  });
+
+  test('autonomous does NOT auto-approve a cwd-scope symlink escape (resolver routes to conservative)', () => {
+    // Reported hole: the autonomous capability-confinement keys on a
+    // LEXICAL `startsWithSegment(path, cwd)`, so a `<cwd>/link` read cap
+    // reads as repo-confined even when `link` is a symlink whose realpath
+    // escapes cwd — `autoApproveRepoConfined` then cleared the modal and
+    // read outside the repo. The resolver detects the escape via realpath
+    // and now routes to Conservative; the `kind: ok` gate keeps the modal.
+    //
+    // Needs a REAL on-disk symlink: the engine wires the real `realpathSync`
+    // into the resolver ctx (not injectable), so we build a temp cwd, an
+    // EXTERNAL target outside it, and an in-cwd relative symlink as control.
+    // cwd is realpath'd so an in-cwd symlink's canonical stays under it.
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'forja-cwdesc-')));
+    const ext = realpathSync(mkdtempSync(join(tmpdir(), 'forja-ext-')));
+    try {
+      writeFileSync(join(ext, 'secret.txt'), 'exfil');
+      writeFileSync(join(root, 'real.txt'), 'in-repo');
+      symlinkSync(join(ext, 'secret.txt'), join(root, 'escape')); // escapes cwd
+      symlinkSync('real.txt', join(root, 'inside')); // relative — stays inside cwd
+      const eng = createPermissionEngine(policy({}), { cwd: root, approvalPosture: 'autonomous' });
+      // Escape symlink → Conservative → modal stays (the hole would `allow`).
+      const escaped = eng.check('bash', 'bash', { command: 'cat escape && echo ok' });
+      expect(escaped.kind).toBe('confirm');
+      // Control: a symlink resolving INSIDE cwd is genuinely repo-confined →
+      // still auto-approves. Pins that the fix isn't a blanket symlink deny.
+      const inside = eng.check('bash', 'bash', { command: 'cat inside && echo ok' });
+      expect(inside.kind).toBe('allow');
+      // Distinct resolver path: an ORPHAN redirect (`> escape` attached to no
+      // command) to the escape symlink also stays modal. The hole is reachable
+      // here too — `cat real.txt; > escape` is a non-soft list, so without the
+      // orphan-path guard it would resolve ok and auto-approve a write through
+      // the symlink to the external target.
+      const orphan = eng.check('bash', 'bash', { command: 'cat real.txt; > escape' });
+      expect(orphan.kind).toBe('confirm');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(ext, { recursive: true, force: true });
+    }
+  });
+
+  test('autonomous does NOT auto-approve a dynamic $var command (cause resolver, best-effort caps)', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['rm *'] } } }), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+    });
+    const d = eng.check('bash', 'bash', { command: 'rm "$VAR"' });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') expect(d.confirmCause).toBe('resolver');
+  });
+
+  test('autonomous auto-approves regardless of resolver confidence (** glob)', () => {
+    // `**` resolves ok/low — low confidence no longer gates a repo read.
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('bash', 'bash', { command: 'wc -l src/**/*.ts && echo done' });
+    expect(d.kind).toBe('allow');
+  });
+
+  test('autonomous auto-approves a confined op even when the score gate would fire (cause score)', () => {
+    // Non-compound allow-match whose score crosses a near-zero threshold →
+    // confirmCause 'score'; capability-confinement overrides the score gate.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['rm *'] } } }), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+      scoreConfirmThreshold: 0.0001,
+    });
+    const d = eng.check('bash', 'bash', { command: 'rm build.log' });
+    expect(d.kind).toBe('allow');
+  });
+
+  test('supervised keeps a repo-confined compound as a modal', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    const d = eng.check('bash', 'bash', { command: 'cat README.md && echo done' });
     expect(d.kind).toBe('confirm');
     if (d.kind === 'confirm') expect(d.confirmCause).toBe('compound');
+  });
+
+  test('autonomous repo-confined auto-approval stamps an approval-posture audit stage', () => {
+    const captured: AuditEmitInput[] = [];
+    const eng = createPermissionEngine(policy({}), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+      audit: {
+        emit: (input) => {
+          captured.push(input);
+          return { seq: captured.length, this_hash: 'h' };
+        },
+        verifyChain: () => ({
+          ok: true,
+          rows: captured.length,
+          current_rotation_id: 0,
+          quarantined: false,
+        }),
+      },
+    });
+    const d = eng.check('bash', 'bash', { command: 'cat README.md && echo done' });
+    expect(d.kind).toBe('allow');
+    const row = captured.at(-1);
+    expect(row?.decision).toBe('allow');
+    expect(
+      row?.reason_chain.some(
+        (s) =>
+          s.stage === 'approval-posture' &&
+          s.note === 'autonomous: auto-approved repo-confined operation',
+      ),
+    ).toBe(true);
+  });
+
+  test('autonomous does NOT auto-approve network egress', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('bash', 'bash', { command: 'curl http://x.test && echo done' });
+    expect(d.kind).not.toBe('allow');
+  });
+
+  test('autonomous does NOT auto-approve git push (carries net-egress)', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git push *'] } } }), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+    });
+    const d = eng.check('bash', 'bash', { command: 'git push origin main && echo done' });
+    expect(d.kind).not.toBe('allow');
+  });
+
+  test('autonomous does NOT auto-approve a read outside the repo', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('bash', 'bash', { command: 'cat /etc/passwd && echo x' });
+    expect(d.kind).not.toBe('allow');
+  });
+
+  test('autonomous does NOT auto-approve a sensitive path inside the repo (.env)', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('bash', 'bash', { command: 'cat .env && echo x' });
+    expect(d.kind).not.toBe('allow');
+  });
+
+  test('autonomous does NOT auto-approve a protected path inside the repo (.git)', () => {
+    // `.git` is write-escalate but git reads it freely; for the no-modal
+    // auto-approval we hold it off-limits for reads too (can carry tokens).
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('bash', 'bash', { command: 'cat .git/config && echo x' });
+    expect(d.kind).not.toBe('allow');
+  });
+
+  test('autonomous does NOT auto-approve an unknown binary (exec:arbitrary)', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('bash', 'bash', { command: 'frobnicate x && echo b' });
+    expect(d.kind).not.toBe('allow');
+  });
+
+  test('autonomous does NOT auto-approve a bare `sed -i` (BSD suffix shifts the script)', () => {
+    // `sed -i p 's/x/id/e' file`: on BSD/macOS `-i` eats `p` as the backup
+    // suffix, so the real script is `s/x/id/e` — which execs `id` via the
+    // `e` flag. The resolver can't pin the script position without `-e`, so
+    // it models exec:arbitrary and the modal stays. (`sed -i.bak`/`-i -e`
+    // are unambiguous and still auto-approve as repo-confined writes.)
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['sed*'] } } }), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+    });
+    expect(eng.check('bash', 'bash', { command: "sed -i p 's/x/id/e' file" }).kind).not.toBe(
+      'allow',
+    );
+  });
+
+  test('autonomous does NOT auto-approve a confined compound when a segment hits a deny rule', () => {
+    // `ls README.md` is repo-confined, but the operator denied `ls *`.
+    // checkBash's deny matches the WHOLE command by glob (misses the middle
+    // segment), so the per-segment re-check is what keeps the modal.
+    const eng = createPermissionEngine(policy({ tools: { bash: { deny: ['ls *'] } } }), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+    });
+    const d = eng.check('bash', 'bash', { command: 'echo ok && ls README.md' });
+    expect(d.kind).toBe('confirm');
+  });
+
+  test('autonomous suspends repo-confined auto-approval while the engine is degraded', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    eng.degrade('test: subsystem offline');
+    const d = eng.check('bash', 'bash', { command: 'cat README.md && echo x' });
+    expect(d.kind).toBe('confirm');
   });
 
   test('autonomous does NOT auto-approve a protected-escalate confirm', () => {
@@ -469,6 +759,20 @@ describe('engine modes', () => {
     expect(d.kind).toBe('confirm');
     expect(d.source?.section).toBe('protected');
     expect(d.reason).toContain('bypass mode still escalates §11');
+  });
+
+  test('bypass mode escalates a bundled `sed -Ei.bak` in-place write to /etc (§11 floor sees the write)', () => {
+    // Regression: `-Ei.bak` (=-E + -i.bak) is an in-place edit, but the old
+    // detection only matched a token starting with `-i`, so the resolver
+    // emitted read-fs:/etc/hosts (a read passes the escalate tier) and bypass
+    // allowed the protected WRITE silently. The bundled-aware detection now
+    // emits write-fs:/etc/hosts, which the §11 floor escalates even in bypass.
+    const eng = createPermissionEngine(policy({ defaults: { mode: 'bypass' } }), {
+      cwd: CWD,
+      home: '/home/op',
+    });
+    const d = eng.check('bash', 'bash', { command: "sed -Ei.bak 's/x/y/' /etc/hosts" });
+    expect(d.kind).toBe('confirm');
   });
 
   test('bypass mode REFUSES write to ~/.ssh/authorized_keys outright (SEC §8.4 — slice 159)', () => {

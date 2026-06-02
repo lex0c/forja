@@ -1084,13 +1084,14 @@ AST is precision of POLICY EXPRESSION, not runtime defense.
 
 Pull when ANY of:
 
-- Autonomous-posture workloads become routine. Autonomous
-  auto-approves routine `policy` confirms, but compound commands
-  re-arm the modal by design (`confirmCause='compound'` is never
-  auto-approved), so the compound guard's "every compound = modal"
-  still creates measurable fatigue even for a delegated operator.
-  Visible in audit: many `confirm` decisions on the same compound
-  shape, all approved.
+- Autonomous-posture workloads become routine. (**Partly addressed
+  2026-06-01:** autonomous now auto-approves a compound whose every
+  resolved capability is repo-confined — by EFFECT, not structure — so
+  repo-local compound fatigue is gone without this AST-policy work. The
+  signal narrows to SUPERVISED operators, and to autonomous compounds
+  carrying a non-confined effect — network / outside-repo / unknown-binary
+  — which still modal by design.) Visible in audit: many `confirm`
+  decisions on the same compound shape, all approved.
 - A real-world policy bypass via the current matcher's
   string-glob limits surfaces (operator reports
   "I had `allow: foo*` and got bitten by `foo$(...)`"). One
@@ -1675,3 +1676,67 @@ new keybinding entries.
 token-efficiency). Multiplier on every future quality-driven
 optimization: without ground-truth labels, every A/B comparison
 relies on inference from negative proxies + heuristics.
+
+## Learned risk classifier (GBDT — LightGBM / XGBoost) behind the classifier-adjust seam
+
+**Status:** deferred. A gradient-boosted-decision-trees model that
+scores command risk from the capability feature vector — the
+classic-ML tool for tabular data (fraud / credit / ranking), near
+neural-net accuracy with far less operational weight. It is NOT a new
+pipeline: it drops into the existing **classifier-adjust seam**.
+
+**Where it plugs in (the seam already exists):**
+
+- **Features = the capability model.** A resolved call is already a
+  tabular row: `{has delete-fs, has exec:arbitrary, write-fs,
+  net-egress, git-write, path-outside-cwd, …}` plus the additive
+  `score_components` from `risk-score.ts`. No new feature plumbing —
+  the capabilities ARE the features.
+- **Output = a score adjustment**, consumed by the same stage the
+  current classifier feeds: `src/permissions/classifier.ts` → the
+  `classifier` reason-chain stage ("Estágio 4 ajustou score") →
+  versioned by `classifier_hash` in the audit row. A GBDT is an
+  ALTERNATIVE classifier implementation behind that seam, not a
+  rewrite.
+- **Training data = `approvals_log`.** The hash-chained ledger +
+  `reason_chain` + `score_components_json` + the operator's actual
+  approve/deny is labeled tabular history, already captured. That is
+  the "thousands–millions of historical decisions" corpus the model
+  needs.
+- **Inference-only in the binary.** Train offline; embed the model
+  (~100 KB–few MB) + an inference path — NOT the training lib. Avoids
+  the bundle-weight objection raised against tree-sitter (~5 MB) in
+  the AST-based bash matching item above.
+
+**Load-bearing guardrails (what makes this safe, not an oracle):**
+
+- **Advisory, never authority.** The model adjusts score/confidence
+  only; the deterministic floors stay hard — `deny`/`refuse`,
+  protected-path, sensitive-path (§8.4), the compound guard, and the
+  autonomous capability-confinement. A model can never auto-approve
+  what the engine would deny (fail-closed, principle 1).
+- **Eval-gated** (principle 4: a subsystem without eval doesn't ship)
+  — precision/recall per tier before it's wired on.
+- **Reproducible.** `classifier_hash` already enters the replay
+  inputs, so a versioned model artifact keeps forensic replay honest.
+- **No cargo cult** (principle 12 / `ANTI_PATTERNS`) — `RISK_SCORE_WEIGHTS`
+  + the capability resolver deliver ~95% today; the model earns its
+  keep only past the corpus threshold.
+
+**Why deferred:** heuristic weighted scoring (`risk-score.ts`) plus the
+AST capability resolver already cover the catastrophic and common
+shapes. A GBDT's operational cost (offline training pipeline, model
+versioning, drift monitoring, bundle) is not justified before there is
+both a large labeled corpus AND demonstrated mis-scoring the weights
+can't separate. Orthogonal to the AST-based bash matching item (that
+sharpens POLICY EXPRESSION; this sharpens the RISK SCORE) — either can
+land without the other.
+
+**Pull-in signal:** (a) `approvals_log` accumulates thousands+ decisions
+AND a measurable class of mis-scored commands surfaces (operator
+repeatedly overrides the score-driven verdict on shapes the additive
+weights can't separate); (b) demand for richer per-feature attribution
+than the current additive `score_components` already gives; (c) a
+concrete model wins a published eval against the tuned weights. Until
+then: tune `RISK_SCORE_WEIGHTS`. Preferred engine: **LightGBM**
+(smaller / faster / lower memory, fits the single-binary CLI).

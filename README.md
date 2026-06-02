@@ -189,10 +189,14 @@ agent init --mode strict    # locked-down default (no auto-allow on bash)
   allowed.
 - **Operation mode.** Approval posture, per session. **Supervised** (default)
   sends every `confirm` to the modal; **Autonomous** (`--autonomous` at boot,
-  or Shift+Tab in the REPL) auto-approves only routine low-risk policy
-  confirms — compound / high-risk confirms still prompt, a degraded engine
-  re-arms the modal, and hard denies stay unreachable. Not `bypass`: every
-  engine floor holds, and each auto-approval is audited.
+  or Shift+Tab in the REPL) auto-approves by EFFECT — routine low-risk
+  `policy` confirms, plus **fully-modeled** bash whose every resolved
+  capability is repo-confined (reads/writes/deletes under cwd, local git).
+  Anything dangerous still prompts: network, outside-repo, unknown binary,
+  protected/sensitive paths, and anything the resolver can't fully model
+  (loops / dynamic `$vars`, where the capabilities are best-effort); a
+  degraded engine re-arms the modal; hard denies stay unreachable. Not
+  `bypass`: every engine floor holds, and each auto-approval is audited.
 - **No auto-commit.** Forja never creates git commits without explicit
   operator action.
 

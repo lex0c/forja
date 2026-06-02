@@ -770,6 +770,65 @@ const FIND_EXEC_FLAGS: ReadonlySet<string> = new Set([
   '-okdir',
 ]);
 
+// `find -exec` classified by EFFECT of the inner command, not by the
+// blanket `exec:arbitrary` it used to get. The inner command runs once per
+// matched file UNDER the search roots, so its effect is scoped to those
+// roots. Read-only inner commands → `read-fs(roots)`; mutating inner →
+// `delete-fs`/`write-fs(roots)`; a shell, an interpreter (perl/python/awk/
+// sed — not statically analyzable when nested), an unknown name, or no
+// inner command at all → `exec:arbitrary` (fail-closed). Capability-
+// confinement + the score gate then decide auto-vs-modal by where the
+// roots land (in-repo vs outside). Names are matched on the basename so
+// `/usr/bin/grep` resolves like `grep`.
+const FIND_EXEC_READONLY: ReadonlySet<string> = new Set([
+  'grep',
+  'egrep',
+  'fgrep',
+  'rg',
+  'wc',
+  'cat',
+  'head',
+  'tail',
+  'file',
+  'stat',
+  'ls',
+  'sort',
+  'uniq',
+  'cut',
+  'nl',
+  'tac',
+  'rev',
+  'basename',
+  'dirname',
+  'cksum',
+  'md5sum',
+  'sha1sum',
+  'sha256sum',
+  'sha512sum',
+  'od',
+  'hexdump',
+  'strings',
+  'echo',
+  'true',
+  'printf',
+]);
+// Only inner commands whose effect is BOUNDED BY the search roots (they
+// act in-place on each matched file). `mv`/`cp`/`ln`/`tee` are deliberately
+// EXCLUDED — they take a DESTINATION operand that can leave the repo
+// (`find . -exec cp {} /tmp/exfil +`), which `write-fs(roots)` would not
+// capture; they fall through to `exec:arbitrary` (gated) instead.
+const FIND_EXEC_MUTATE: ReadonlyMap<string, 'delete' | 'write'> = new Map([
+  ['rm', 'delete'],
+  ['rmdir', 'delete'],
+  ['unlink', 'delete'],
+  ['shred', 'delete'],
+  ['chmod', 'write'],
+  ['chown', 'write'],
+  ['chgrp', 'write'],
+  ['touch', 'write'],
+  ['truncate', 'write'],
+]);
+
 // grep flags whose next space-separated token is a numeric value
 // (context window size, max-count, etc.). Without consuming them
 // in stripFlags, `grep -A 5 pattern file` would leave '5' in the
@@ -911,11 +970,79 @@ const FIND_VALUE_FLAGS: ReadonlySet<string> = new Set([
 ]);
 
 const cmdFind: CommandResolver = (_positional, tokens, ctx) => {
-  if (tokens.some((t) => FIND_EXEC_FLAGS.has(t))) {
-    return {
-      capabilities: [exec('arbitrary'), readFs(ctx.cwd)],
-      confidence: 'medium',
-    };
+  // Symlink-following (`-L` / `-H` / `-follow`) makes find descend into
+  // symlinked directories (or follow a symlinked root), so ANY effect can
+  // resolve OUTSIDE the lexical roots: `find -L . -type f -exec rm {} +`
+  // (or `find -L . -delete`) deletes outside-repo files reached through a
+  // symlink while the root-scoped caps below would say only
+  // `delete-fs:<cwd>` and look repo-confined. The lexical roots can't bound
+  // a symlink-following walk, so treat it as a possible workspace escape:
+  // exec:arbitrary (fail-closed; never repo-confined). Default `-P` (no
+  // follow) keeps the precise root-scoped classification below.
+  if (tokens.some((t) => t === '-L' || t === '-H' || t === '-follow')) {
+    return { capabilities: [exec('arbitrary'), readFs(ctx.cwd)], confidence: 'medium' };
+  }
+  const execIdxs: number[] = [];
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i];
+    if (t !== undefined && FIND_EXEC_FLAGS.has(t)) execIdxs.push(i);
+  }
+  if (execIdxs.length > 0) {
+    // Roots via stripFlags (handles `-H`/`-L`/`-P` global options +
+    // `-maxdepth`/`-name`/… value flags). It ALSO folds the inner command
+    // and its args (`grep`, `{}`, `+`) into the list — harmless extra
+    // in-cwd read/mutate targets; the point is that REAL out-of-repo paths
+    // (a `-L /etc` root, or a fixed file the inner reads like `grep x
+    // /etc/passwd {}`) ARE captured and gate. The EFFECT comes from the
+    // inner command NAME(s), scoped to these roots. EVERY `-exec`/`-ok`/…
+    // clause (find allows several) and `-delete` are scanned together,
+    // worst effect wins — a read-only first clause must not hide a
+    // mutating second one.
+    const positional = stripFlags(tokens, FIND_VALUE_FLAGS);
+    const roots = positional.length === 0 ? [ctx.cwd] : positional.map((p) => resolveArg(p, ctx));
+    let arbitrary = false;
+    let del = tokens.some((t) => t === '-delete');
+    let wr = false;
+    for (const idx of execIdxs) {
+      const inner = tokens[idx + 1];
+      if (inner === undefined) {
+        arbitrary = true;
+        break;
+      }
+      const name = basename(stripShellQuoting(inner));
+      if (FIND_EXEC_READONLY.has(name)) continue;
+      const mutate = FIND_EXEC_MUTATE.get(name);
+      if (mutate === 'delete') del = true;
+      else if (mutate === 'write') wr = true;
+      else {
+        // Shell / interpreter / dest-bearing (mv/cp) / unknown / missing
+        // inner → fail-closed to arbitrary exec (not statically analyzable
+        // / can leave the repo).
+        arbitrary = true;
+        break;
+      }
+    }
+    // Hardcoded refuse for a mutating find on a system root (parity with
+    // cmdRm + the `-delete` branch below, which the early return skips).
+    if ((arbitrary || del || wr) && roots.some((p) => RM_REFUSE_ROOTS.has(p))) {
+      return {
+        refuse:
+          'find -exec/-delete: refuse to mutate under a system root (hardcoded blocklist; spec §5.2)',
+      };
+    }
+    if (arbitrary) {
+      return {
+        capabilities: [exec('arbitrary'), ...roots.map((p) => readFs(p))],
+        confidence: 'medium',
+      };
+    }
+    const caps = roots.flatMap((p) => {
+      const c = [readFs(p)];
+      if (del) c.push(deleteFs(p));
+      if (wr) c.push(writeFs(p));
+      return c;
+    });
+    return { capabilities: caps, confidence: 'medium' };
   }
   const positional = stripFlags(tokens, FIND_VALUE_FLAGS);
   const paths = positional.length === 0 ? [ctx.cwd] : positional.map((p) => resolveArg(p, ctx));
@@ -990,6 +1117,198 @@ const cmdFind: CommandResolver = (_positional, tokens, ctx) => {
       ...comparisonReadTargets.map((p) => readFs(p)),
     ],
     confidence: 'high',
+  };
+};
+
+// awk / gawk / mawk — a small language with side effects: command exec
+// (`system()`, `"cmd" | getline`, `print | "cmd"`), file write (`print >
+// "f"`), and an external program (`-f`). Classify by EFFECT, fail-closed:
+// a program with NO side-effect indicator reads its inputs and prints to
+// stdout → `read-fs`. ANY indicator → `exec:arbitrary`. The danger scan
+// runs over ALL raw tokens (not just the program) so a `system` in a `-v`
+// value or anywhere still gates. CONSERVATIVE on `>` and `|`: those are
+// flagged even when they are really a comparison (`$1 > 5`) or regex
+// alternation (`/a|b/`) — over-gating those is safe; missing a real
+// redirect/pipe would be a laundering hole. `-F'|'` (pipe field sep) also
+// over-gates. Spec §5.2.
+// External-program / library / debugger flags: each loads or executes code
+// outside the inline awk program → exec:arbitrary. The SHORT forms take a
+// REQUIRED operand that GNU awk accepts ATTACHED (`-i/tmp/inc.awk`, `-lfoo`,
+// `-Efile`) or separate (`-i /tmp/inc.awk`), so they are matched by PREFIX —
+// an exact-only match missed `awk -i/tmp/payload.awk …` / `awk -lfoo …`,
+// which load and RUN that source/library. (`-f` program file, `-i` include,
+// `-l` load/dlopen a shared lib, `-E` exec, `-D` debug, `-p` profile.
+// Case-sensitive on purpose: `-F` field-sep and `-v` assignment are NOT
+// external and must not match a prefix.) Long forms take `--flag value` or
+// `--flag=value`.
+const AWK_EXTERNAL_SHORT: readonly string[] = ['-f', '-i', '-l', '-E', '-D', '-p'];
+const AWK_EXTERNAL_LONG: readonly string[] = [
+  '--file',
+  '--include',
+  '--load',
+  '--exec',
+  '--debug',
+  '--profile',
+];
+const cmdAwk: CommandResolver = (positional, tokens, ctx) => {
+  const externalScript = tokens.some(
+    (t) =>
+      AWK_EXTERNAL_SHORT.some((f) => t.startsWith(f)) ||
+      AWK_EXTERNAL_LONG.some((f) => t === f || t.startsWith(`${f}=`)),
+  );
+  const sideEffect = /\bsystem\s*\(|\bgetline\b|[>|`]/.test(tokens.join(' '));
+  if (externalScript || sideEffect) {
+    return { capabilities: [exec('arbitrary'), readFs(ctx.cwd)], confidence: 'medium' };
+  }
+  // Read-only: prints to stdout; reads stdin and/or the file operands
+  // (positional[0] is the program). cwd floor covers stdin-pipeline use.
+  const files = positional
+    .slice(1)
+    .filter((p) => p !== '-')
+    .map((p) => readFs(resolveArg(p, ctx)));
+  return { capabilities: [readFs(ctx.cwd), ...files], confidence: 'medium' };
+};
+
+// True only when `script` is a provably read-only sed program: a single
+// substitution `s<d>..<d>..<d><flags>` whose flags are a subset of
+// {g,p,i,I,m,M,digits} (the `w`/`e` flags write/exec → excluded), or a
+// simple print/delete/quit command optionally with a numeric/`$`/`/regex/`
+// address. Delimiter-aware for `s` (honors backslash-escaped delimiters).
+// Anything it can't prove safe (multi-command via `;`, `w`/`W`/`e`/`r`/`R`
+// commands, `a`/`c`/`i` text, labels) → false; the caller then gates.
+const sedScriptReadOnly = (script: string): boolean => {
+  const s = script.trim();
+  if (s.length === 0) return true;
+  if (s[0] === 's') {
+    const d = s[1];
+    if (d === undefined || /[A-Za-z0-9\s\\]/.test(d)) return false;
+    let i = 2;
+    let seg = 0;
+    while (i < s.length && seg < 2) {
+      if (s[i] === '\\') {
+        i += 2;
+        continue;
+      }
+      if (s[i] === d) seg += 1;
+      i += 1;
+    }
+    if (seg < 2) return false;
+    return /^[gpiImM0-9]*$/.test(s.slice(i));
+  }
+  // Plain command (address + p/P/d/D/q/l/n/N/=), or /regex/ + print/delete.
+  return /^[0-9,$ ]*[pPdDqlnN=]$/.test(s) || /^\/(?:\\.|[^/\n])*\/[pPdD=]?$/.test(s);
+};
+
+// Locate the sed in-place flag (`-i`) in ANY spelling and report its form:
+//   'none'     — no `-i`.
+//   'attached' — the suffix is part of the token (`-i.bak`, `-Ei.bak`) or
+//                the GNU long form (`--in-place[=SUFFIX]`): the script stays
+//                at positional[0] (unambiguous on both GNU and BSD).
+//   'separate' — a bare `-i` at the END of a short bundle (`-i`, `-ni`,
+//                `-Ei`): on BSD/macOS `-i` then consumes the NEXT token as
+//                the suffix, shifting the script position (ambiguous).
+// Short bundles are walked left-to-right because `-e`/`-f` consume the REST
+// of the token as their argument — an `i` after them is part of that arg,
+// not the in-place flag (`-ei` is `-e` with the script `i`). Catching the
+// BUNDLED forms is load-bearing: `sed -Ei.bak 's/x/y/' /etc/hosts` (GNU
+// accepts `-E` + `-i.bak`) writes /etc/hosts in place; missing it emitted
+// only read-fs:/etc/hosts, hiding the WRITE from the bypass protected-path
+// floor (which escalates /etc on writes only) and from the audit.
+const sedInPlaceForm = (tokens: readonly string[]): 'none' | 'attached' | 'separate' => {
+  let best: 'none' | 'attached' = 'none';
+  for (const t of tokens) {
+    if (t === '--in-place' || t.startsWith('--in-place=')) {
+      best = 'attached';
+      continue;
+    }
+    if (t.length < 2 || t[0] !== '-' || t[1] === '-') continue;
+    for (let i = 1; i < t.length; i++) {
+      const c = t[i];
+      if (c === 'i') {
+        // Suffix = remainder of the token. None (i is last) → separate
+        // operand on BSD; non-empty → attached, script at positional[0].
+        if (i === t.length - 1) return 'separate';
+        best = 'attached';
+        break;
+      }
+      // `-e`/`-f` take the rest of the token as their argument.
+      if (c === 'e' || c === 'f') break;
+    }
+  }
+  return best;
+};
+
+// sed — read transform to stdout, OR in-place edit (`-i`), OR write/exec
+// via `w`/`e`/`-f`. Classify by EFFECT, fail-closed: an external script
+// (`-f`) or any script not provably read-only (`sedScriptReadOnly`) →
+// `exec:arbitrary`. A read-only script with `-i`/`--in-place` writes its
+// file operands (`write-fs`); without `-i` it's a stdout transform
+// (`read-fs`). Resolving the actual operands matters for `-i` so an
+// out-of-repo edit (`sed -i … /etc/x`) emits `write-fs:/etc/x` and gates.
+// Spec §5.2.
+const cmdSed: CommandResolver = (positional, tokens, ctx) => {
+  const externalScript = tokens.some(
+    (t) => t === '-f' || t.startsWith('-f') || t === '--file' || t.startsWith('--file='),
+  );
+  if (externalScript) {
+    return { capabilities: [exec('arbitrary'), readFs(ctx.cwd)], confidence: 'medium' };
+  }
+  const exprs = extractValueFlag(tokens, { longForm: '--expression', shortForm: '-e' });
+  const inPlaceForm = sedInPlaceForm(tokens);
+  // BSD/macOS `sed -i` takes the backup suffix as a SEPARATE operand
+  // (`-i extension`), consuming the NEXT token — ANY token, not just `''`
+  // or a `.bak`-shaped one. That shifts the script one position to the
+  // right of where GNU puts it: `sed -i p 's/x/id/e' f` is GNU
+  // `{script:'p', files:['s/x/id/e','f']}` but BSD
+  // `{suffix:'p', script:'s/x/id/e', file:'f'}`, and the BSD script execs
+  // `id` via the `s///e` flag. So a `separate`-form `-i` (a bare `-i`/`-ni`
+  // at the token end — see `sedInPlaceForm`) with no `-e` has a
+  // platform-divergent script index: `positional[0]` cannot be trusted —
+  // fail-closed to exec:arbitrary.
+  //
+  // Exempt (script position unambiguous → stay modeled): `-e`/`--expression`
+  // (the script rides the flag value, which coincides with the real script
+  // on BOTH platforms — BSD eats the `-e` token as the suffix, but the next
+  // token then becomes positional[0] == our extracted `-e` value); an
+  // ATTACHED suffix (`-i.bak`, `-Ei.bak`); and the GNU-only `--in-place`.
+  if (inPlaceForm === 'separate' && exprs.length === 0) {
+    // exec:arbitrary gates the autonomous + score paths (the script may be a
+    // dangerous positional we can't pin). The in-place edit still WRITES the
+    // file operands, but we can't tell which positional is the suffix vs the
+    // script vs a file — so conservatively emit write-fs for EVERY positional
+    // so the bypass §11 protected-path floor still catches an escalate/deny
+    // operand (`sed -i s/a/b/ /etc/hosts` → write-fs:/etc/hosts) that
+    // exec:arbitrary alone wouldn't surface to a path-based floor.
+    // Over-attributing a write to a script/suffix token is harmless
+    // (repo-confined) and never under-reports a real write.
+    const operandWrites = positional
+      .filter((p) => p !== '-')
+      .map((p) => writeFs(resolveArg(p, ctx)));
+    return {
+      capabilities: [exec('arbitrary'), readFs(ctx.cwd), ...operandWrites],
+      confidence: 'medium',
+    };
+  }
+  const scripts = exprs.length > 0 ? exprs : positional[0] !== undefined ? [positional[0]] : [];
+  if (scripts.length === 0 || !scripts.every((sc) => sedScriptReadOnly(sc))) {
+    return { capabilities: [exec('arbitrary'), readFs(ctx.cwd)], confidence: 'medium' };
+  }
+  // `attached` (`-i.bak`, `-Ei.bak`, `--in-place`) is an in-place WRITE with
+  // the script at positional[0]; the `separate` form already returned above
+  // (exec:arbitrary) when no `-e`, and with `-e` it is still an in-place
+  // write. So any non-'none' form writes its operands.
+  const inPlace = inPlaceForm !== 'none';
+  const fileArgs = (exprs.length > 0 ? positional : positional.slice(1)).filter((p) => p !== '-');
+  if (inPlace) {
+    const caps = fileArgs.flatMap((p) => [readFs(resolveArg(p, ctx)), writeFs(resolveArg(p, ctx))]);
+    return {
+      capabilities: caps.length > 0 ? caps : [writeFs(ctx.cwd), readFs(ctx.cwd)],
+      confidence: 'medium',
+    };
+  }
+  return {
+    capabilities: [readFs(ctx.cwd), ...fileArgs.map((p) => readFs(resolveArg(p, ctx)))],
+    confidence: 'medium',
   };
 };
 
@@ -1455,23 +1774,195 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
     return { capabilities: [readFs(REPO)], confidence: 'high' };
   }
   switch (sub) {
+    case 'grep': {
+      // `git grep` is read-only EXCEPT for the pager-opening flags
+      // `-O[<pager>]` / `--open-files-in-pager[=<pager>]`: git runs the
+      // pager AS A COMMAND (`git grep --open-files-in-pager='sh -c …'`
+      // executes the shell; even the default pager `less` shells out via
+      // `!cmd`). Decode the flag → exec:arbitrary; otherwise read tracked
+      // files. Closes the bypass where a `git *` allow rule + the read-fs
+      // classification auto-approved arbitrary exec under autonomous.
+      if (
+        tokens.some(
+          (t) =>
+            t.startsWith('-O') ||
+            t === '--open-files-in-pager' ||
+            t.startsWith('--open-files-in-pager='),
+        )
+      ) {
+        return { capabilities: [exec('arbitrary'), readFs(REPO)], confidence: 'medium' };
+      }
+      return { capabilities: [readFs(REPO)], confidence: 'high' };
+    }
+    case 'config': {
+      // `git config` is read-fs ONLY for a pure REPO read. Option-only and
+      // mutating forms must NOT slip through on positional count alone
+      // (`git config --edit` strips to positional `['config']`):
+      //   - `-e`/`--edit` opens $EDITOR / core.editor → arbitrary exec.
+      //   - `-f`/`--file`, `--global`, `--system` select a config SOURCE
+      //     that can be outside the repo (read or write).
+      //   - `--add`/`--unset*`/`--remove-section`/`--rename-section`/
+      //     `--replace-all`, and the `<key> <value>` set form, WRITE config
+      //     and can plant a `core.pager`/`core.sshCommand`/`alias.*` exec
+      //     hook a later git command runs.
+      // All of those → exec:arbitrary (fail-closed; no exec-key denylist to
+      // drift on). `--worktree`/`--blob` are in-repo read sources and are
+      // left to the read check below; a `--worktree` write still falls to
+      // the set-form branch.
+      const notPureRead = tokens.some(
+        (t) =>
+          t === '-e' ||
+          t === '--edit' ||
+          t === '-f' ||
+          t.startsWith('-f') ||
+          t === '--file' ||
+          t.startsWith('--file=') ||
+          t === '--global' ||
+          t === '--system' ||
+          t === '--add' ||
+          t === '--unset' ||
+          t === '--unset-all' ||
+          t === '--remove-section' ||
+          t === '--rename-section' ||
+          t === '--replace-all',
+      );
+      if (notPureRead) {
+        return { capabilities: [exec('arbitrary'), readFs(REPO)], confidence: 'medium' };
+      }
+      const explicitRead = tokens.some(
+        (t) =>
+          t === '-l' ||
+          t === '--list' ||
+          t === '--name-only' ||
+          t === '--get' ||
+          t === '--get-all' ||
+          t === '--get-regexp' ||
+          t === '--get-urlmatch' ||
+          t === '--get-color' ||
+          t === '--get-colorbool',
+      );
+      // Bare-key get is EXACTLY `config <key>` (two positionals, no value);
+      // a `<key> <value>` set (length >= 3) or option-only-without-read
+      // (length 1) is not a pure read → exec:arbitrary.
+      if (explicitRead || positional.length === 2) {
+        return { capabilities: [readFs(REPO)], confidence: 'high' };
+      }
+      return { capabilities: [exec('arbitrary'), readFs(REPO)], confidence: 'medium' };
+    }
     case 'status':
     case 'log':
     case 'diff':
     case 'show':
     case 'blame':
     case 'rev-parse':
-    case 'config':
     case 'remote':
+    // Read-only, local (non-network) plumbing/porcelain verbs. Pre-slice
+    // these fell through to the `default` branch and got stamped
+    // gitWrite + netEgress + low confidence — so a routine `git shortlog`
+    // or `git ls-files` read was misclassified as a network write and
+    // gated even under autonomous. They touch only the repo, never the
+    // network. (`ls-remote`/`fetch`/`pull`/`push`/`clone` are network and
+    // stay out of this set; `branch`/`tag`/`reflog` can mutate and stay in
+    // the write/default branches. `grep` and `config` have their own
+    // cases above — pager-exec / config-write escape hatches.)
+    case 'shortlog':
+    case 'describe':
+    case 'ls-files':
+    case 'ls-tree':
+    case 'cat-file':
+    case 'rev-list':
+    case 'for-each-ref':
+    case 'name-rev':
+    case 'whatchanged':
+    case 'show-ref':
+    case 'merge-base':
+    case 'cherry':
+    case 'count-objects':
+    case 'annotate':
+    case 'var':
       return { capabilities: [readFs(REPO)], confidence: 'high' };
     case 'commit':
-    case 'add':
     case 'merge':
     case 'rebase':
     case 'cherry-pick':
+      // These verbs run repository hooks — scripts under `.git/hooks/`
+      // (or wherever `core.hooksPath` points) that execute arbitrary code:
+      //   commit      → pre-commit, prepare-commit-msg, commit-msg, post-commit
+      //   merge       → pre-merge-commit, commit-msg, post-merge
+      //   rebase      → pre-rebase, post-rewrite (and `--exec <cmd>` runs <cmd>)
+      //   cherry-pick → the commit hooks, per replayed commit
+      // A repo that ships an installed hook executes that code on a bare
+      // `git commit -m x`, so the honest capability is `exec:arbitrary`,
+      // NOT a repo-confined `git-write` — under autonomous this MUST keep
+      // the modal (exec:arbitrary is never repo-confined). The git-write +
+      // read-fs caps still ride along so the engine's §11 floors stay
+      // honest about the metadata write. `--no-verify` is NOT a safe
+      // downgrade: it bypasses ONLY pre-commit and commit-msg —
+      // prepare-commit-msg and post-commit still run — so honoring it would
+      // re-open the hole for a post-commit hook. (`git -c core.hooksPath=…`
+      // is refused upstream, so there is no "hooks proven absent" path to
+      // model here.)
+      return {
+        capabilities: [exec('arbitrary'), gitWrite(REPO), readFs(REPO)],
+        confidence: 'high',
+      };
+    case 'tag': {
+      // A lightweight tag is a pure ref write, but `git tag` invokes external
+      // CONFIGURABLE commands in two sub-modes — both arbitrary-local-exec
+      // surfaces an attacker-controlled `.git/config` (cloned repo) can
+      // hijack:
+      //   • annotated (`-a`) with NO `-m`/`-F` → opens `core.editor`
+      //   • signed/verified (`-s`/`-u`/`-v`)   → runs `gpg.program`
+      // (`git -c …` is refused upstream, but a repo/user gitconfig value
+      // still reaches them.) `-a` WITH `-m`/`-F` (message supplied, not
+      // signed) opens no editor → stays a repo-confined git-write, as do a
+      // lightweight `git tag v1` and `git tag -d v1`. git tag short flags
+      // bundle (`-am`, `-as`), so the relevant ones are found by walking each
+      // bundle; `-m`/`-F`/`-u`/`-n` consume the rest of their token as an arg.
+      let usesGpg = false;
+      let annotated = false;
+      let hasMessage = false;
+      for (const t of tokens) {
+        if (t === '--annotate') annotated = true;
+        else if (t === '--sign' || t === '--verify') usesGpg = true;
+        else if (t === '--local-user' || t.startsWith('--local-user=')) usesGpg = true;
+        else if (
+          t === '--message' ||
+          t.startsWith('--message=') ||
+          t === '--file' ||
+          t.startsWith('--file=')
+        )
+          hasMessage = true;
+        else if (t.length >= 2 && t[0] === '-' && t[1] !== '-') {
+          for (let i = 1; i < t.length; i++) {
+            const c = t[i];
+            if (c === 'a') annotated = true;
+            else if (c === 's' || c === 'v') usesGpg = true;
+            else if (c === 'u') {
+              usesGpg = true; // -u takes a key arg → rest of token
+              break;
+            } else if (c === 'm' || c === 'F') {
+              hasMessage = true; // -m/-F take the message arg → rest of token
+              break;
+            } else if (c === 'n') break; // -n[<num>]: optional attached arg
+          }
+        }
+      }
+      if (usesGpg || (annotated && !hasMessage)) {
+        return {
+          capabilities: [exec('arbitrary'), gitWrite(REPO), readFs(REPO)],
+          confidence: 'high',
+        };
+      }
+      return { capabilities: [gitWrite(REPO), readFs(REPO)], confidence: 'high' };
+    }
+    case 'add':
     case 'stash':
-    case 'tag':
     case 'reset':
+      // Pure git-writes with NO hook / editor / gpg surface: git has no
+      // pre-add / reset hook, and `git stash` writes its commits through
+      // plumbing (`commit-tree`/`update-ref`) that bypasses the commit hooks.
+      // These stay repo-confined `git-write` → auto-approvable under autonomous.
       return { capabilities: [gitWrite(REPO), readFs(REPO)], confidence: 'high' };
     case 'push':
     case 'pull':
@@ -2831,6 +3322,12 @@ const COMMAND_TABLE: ReadonlyMap<string, CommandResolver> = new Map<string, Comm
   ['grep', cmdGrep],
   ['rg', cmdGrep],
   ['find', cmdFind],
+  // Programmable text tools — classified by EFFECT (read vs write vs
+  // exec), fail-closed to exec:arbitrary on any side-effect indicator.
+  ['awk', cmdAwk],
+  ['gawk', cmdAwk],
+  ['mawk', cmdAwk],
+  ['sed', cmdSed],
   ['rm', cmdRm],
   ['rmdir', cmdRm],
   ['mv', cmdMvCp],
@@ -4028,9 +4525,17 @@ const detectCwdScopeEscape = (lexicalAbs: string, ctx: ResolverContext): boolean
 const classifyRedirects = (
   redirects: readonly RedirectShape[],
   ctx: ResolverContext,
-): { refuse: string } | { caps: Capability[]; escalated: boolean } => {
+): { refuse: string } | { caps: Capability[]; escalated: boolean; cwdEscaped: boolean } => {
   const caps: Capability[] = [];
   let escalated = false;
+  // A cwd-scope escape (lexical-inside-cwd path whose canonical realpath
+  // lands OUTSIDE cwd) is tracked SEPARATELY from escalate-tier: it routes
+  // the result to Conservative, not just low confidence. The emitted cap is
+  // still the lexical `<cwd>/link`, so the engine's autonomous
+  // capability-confinement (lexical `startsWithSegment`) would otherwise
+  // read it as repo-confined and auto-approve a read/write that actually
+  // resolves outside the repo.
+  let cwdEscaped = false;
   for (const r of redirects) {
     if (r.kind === 'out' || r.kind === 'append' || r.kind === 'both' || r.kind === 'force-out') {
       const tgtAbs = resolvePath(ctx.cwd, expandTilde(r.target, ctx.home));
@@ -4039,7 +4544,7 @@ const classifyRedirects = (
         return { refuse: `bash: redirect target '${r.target}' is in protected zone (deny tier)` };
       }
       if (tier === 'escalate') escalated = true;
-      if (detectCwdScopeEscape(tgtAbs, ctx)) escalated = true;
+      if (detectCwdScopeEscape(tgtAbs, ctx)) cwdEscaped = true;
       caps.push(writeFs(tgtAbs));
     }
     // Input redirects `<` ALSO pass through the classifier (op='read' →
@@ -4053,11 +4558,11 @@ const classifyRedirects = (
           refuse: `bash: input redirect source '${r.target}' is in protected zone (deny tier)`,
         };
       }
-      if (detectCwdScopeEscape(tgtAbs, ctx)) escalated = true;
+      if (detectCwdScopeEscape(tgtAbs, ctx)) cwdEscaped = true;
       caps.push(readFs(tgtAbs));
     }
   }
-  return { caps, escalated };
+  return { caps, escalated, cwdEscaped };
 };
 
 const analyzeCommand = (
@@ -4159,6 +4664,9 @@ const analyzeCommand = (
     return value.length > 0 ? value : null;
   };
   let escalated = false;
+  // cwd-scope escape (symlink resolving outside cwd) — tracked separately
+  // from escalate-tier so it can route to Conservative (see the return).
+  let cwdEscaped = false;
   // Operand caps for the registry-miss (Conservative) branch. The per-arg
   // loop classifies escalate-tier positional paths but the unknown-command
   // branch returned only redirect caps — so under mode:bypass (where the
@@ -4240,8 +4748,11 @@ const analyzeCommand = (
         // but canonical outside means a glob policy like
         // `<cwd>/**` would authorize lexically while the kernel
         // follows the symlink to whatever target the operator
-        // never scoped. Degrade confidence to force confirm.
-        if (detectCwdScopeEscape(abs, ctx)) escalated = true;
+        // never scoped. Route to Conservative (see the return) — NOT
+        // merely low confidence — so the autonomous auto-approval gate
+        // (keyed on resolver `kind: ok`) keeps the modal; a lexical
+        // `<cwd>/link` cap alone reads as repo-confined at the engine.
+        if (detectCwdScopeEscape(abs, ctx)) cwdEscaped = true;
       }
     }
   }
@@ -4285,6 +4796,23 @@ const analyzeCommand = (
   if ('refuse' in result) return { refuse: result.refuse };
   let finalConf: 'high' | 'medium' | 'low' = result.confidence;
   if (escalated || redir.escalated) finalConf = 'low';
+
+  // A cwd-scope escape (a lexical-inside-cwd path whose canonical realpath
+  // lands outside cwd, via a symlink) routes to Conservative — NOT merely
+  // low confidence. The emitted cap is still the lexical `<cwd>/link`, so
+  // the engine's autonomous capability-confinement (lexical
+  // `startsWithSegment`) would read it as repo-confined; only the resolver
+  // `kind` distinguishes it. `conservative` flips the aggregate to
+  // `kind: conservative`, which the autonomous auto-approval gate (keyed on
+  // `kind === 'ok'`) rejects — re-arming the modal. Glob-low
+  // (`wc -l src/**/*.ts`) keeps `kind: ok` and still auto-approves.
+  if (cwdEscaped || redir.cwdEscaped) {
+    return {
+      caps: [...result.capabilities, ...redir.caps],
+      confidence: 'low',
+      conservative: 'cwd-scope escape: a path resolves outside the cwd via a symlink',
+    };
+  }
 
   return {
     caps: [...result.capabilities, ...redir.caps],
@@ -4425,6 +4953,25 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
     else if (result.confidence === 'medium' && aggregateConf === 'high') aggregateConf = 'medium';
   }
 
+  // An ORPHAN redirect — one not attached to any command, e.g. the
+  // `> escape` in `cat x; > escape`, `cmd && > escape`, `true; > escape`
+  // — is classified above (classifyRedirects) but its escape/escalate
+  // signal is NOT folded into any command's result. A cwd-scope symlink
+  // escape on such a redirect (`<cwd>/escape → /tmp/secret`) emits a
+  // LEXICAL `write-fs:<cwd>/escape` cap that the engine's autonomous
+  // capability-confinement reads as repo-confined — so it MUST route to
+  // Conservative HERE, exactly like the per-command path, or the modal is
+  // cleared on a write that lands outside the repo. (The per-command
+  // analyzeCommand path catches ATTACHED redirects; this is the only place
+  // an orphan redirect's escape is visible.)
+  if (orphanRedir.cwdEscaped) {
+    return {
+      kind: 'conservative',
+      capabilities: allCaps,
+      reason: 'bash: cwd-scope escape: a redirect target resolves outside the cwd via a symlink',
+    };
+  }
+
   // A soft-unmodeled wrapper (control flow / value expansion) OR a
   // registry-miss command → Conservative (forces confirm), per
   // PERMISSION_ENGINE.md §5.2. Caps are the honest aggregate of the
@@ -4438,7 +4985,54 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
         : `bash: ${walk.softReason ?? 'unmodeled shape (control flow / value expansion)'} → confirm`;
     return { kind: 'conservative', capabilities: allCaps, reason };
   }
-  return { kind: 'ok', capabilities: allCaps, confidence: aggregateConf };
+  // An escalate-tier orphan redirect target (`cat x; > /etc/foo`) degrades
+  // confidence like the per-command escalate path. The lexical cap already
+  // carries the protected zone (the engine floors catch it), so this only
+  // keeps the modal honest under supervised — but mirrors the per-command
+  // `escalated → low` so the two redirect paths don't diverge.
+  const finalAgg: 'high' | 'medium' | 'low' = orphanRedir.escalated ? 'low' : aggregateConf;
+  return { kind: 'ok', capabilities: allCaps, confidence: finalAgg };
+};
+
+// Top-level simple-command texts of a bash command, for the engine's
+// autonomous-posture compound re-check (§8.1 `AGENTIC_CLI`). Returns the
+// literal source slice of each `command` node — `echo oi && curl x` →
+// `['echo oi', 'curl x']` — so the engine can re-run operator `deny`
+// rules per segment: `checkBash`'s deny matches the WHOLE command by
+// glob, so `curl*` misses `echo oi && curl x`. Returns null when the
+// parser is unavailable / produced no tree / recovered no `command`
+// node, or if the tree exceeds MAX_AST_DEPTH — the caller treats null as
+// "can't verify" and keeps the modal (fail-closed). Intended only after
+// `bashResolver` returned `kind: ok`, where the walk already proved
+// there are no soft shapes (no loop/subshell bodies), so every `command`
+// node is a flat pipeline/list segment and there is no command nesting
+// to flatten. A `command` node never contains another `command`, so the
+// walk does not descend past one.
+export const topLevelCommandTexts = (command: string): string[] | null => {
+  let parsed: ReturnType<typeof parseBash>;
+  try {
+    parsed = parseBash(command);
+  } catch {
+    return null;
+  }
+  if (parsed === null) return null;
+  const out: string[] = [];
+  let aborted = false;
+  const visit = (node: Node | null, depth: number): void => {
+    if (node === null || aborted) return;
+    if (depth > MAX_AST_DEPTH) {
+      aborted = true;
+      return;
+    }
+    if (node.type === 'command') {
+      out.push(node.text);
+      return;
+    }
+    for (const child of node.children) visit(child, depth + 1);
+  };
+  visit(parsed.root, 0);
+  if (aborted) return null;
+  return out.length > 0 ? out : null;
 };
 
 registerResolver('bash', bashResolver);

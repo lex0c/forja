@@ -391,7 +391,28 @@ id_ecdsa*
 .my.cnf                   # MySQL client [client] password=
 .mongorc.js               # Mongo shell init com conn strings
 **/.htpasswd              # Apache basic-auth
+# k8s / docker registry
+.kube/config              # kubeconfig: cluster tokens / client certs/keys
+kubeconfig                # standalone kubeconfig
+.docker/config.json       # Docker registry auth (moderno; .dockercfg é legado)
+# service-account keys (além de *credentials*.json)
+*service-account*.json    # GCP/Firebase service-account keys
+*-firebase-adminsdk-*.json
+# mobile signing + secret config
+*.jks                     # Android signing keystore (chave privada)
+*.keystore                # Android/Java keystore
+keystore.properties       # senhas de signing-store/key (Android)
+local.properties          # Android; storePassword/keyPassword (gitignored por convenção)
+*.p8                      # Apple APNs / sign-in key (PKCS#8 privada)
+*.mobileprovision         # iOS provisioning profile (signing identity)
+google-services.json      # Firebase config Android (API keys)
+GoogleService-Info.plist  # Firebase config iOS (API keys)
+# bearer tokens / VPN
+*.jwt                     # JWT bearer token
+*.ovpn                    # OpenVPN config (chaves/certs inline)
 ```
+
+Encodings de **cert público** (`*.crt`/`*.cer`/`*.der`) são deliberadamente **fora** da lista: não carregam chave privada (essa vive nos `*.pem`/`*.key`/`*.p12`/`*.pfx` já listados), e como este é um piso **duro e não-overridável**, bloqueá-los só quebraria leituras legítimas sem ganho de exposição de segredo.
 
 Match → tool retorna erro `path.deny_listed` com texto:
 

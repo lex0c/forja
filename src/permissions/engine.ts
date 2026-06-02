@@ -35,9 +35,16 @@ import {
   matchHost,
   matchPath,
 } from './matcher.ts';
-import { type ProtectedOp, type ProtectedTier, classifyProtectedPath } from './protected_paths.ts';
+import {
+  type ProtectedOp,
+  type ProtectedTier,
+  classifyProtectedPath,
+  isDevSafe,
+  startsWithSegment,
+} from './protected_paths.ts';
 // Importing the resolver index registers every builtin resolver at
 // module load. Engine consumers don't need a separate wire-up step.
+import { topLevelCommandTexts } from './resolvers/bash.ts';
 import { type ResolverResult, resolveCapabilities } from './resolvers/index.ts';
 import {
   DEFAULT_TRUSTED_HOSTS,
@@ -1135,19 +1142,130 @@ const degradeAllowToConfirm = (
 
 // Inverse of degradeAllowToConfirm for the autonomous posture: a
 // routine `policy` confirm becomes an allow so it clears without a
-// modal. ONLY 'policy' is auto-approved — every other cause
-// (compound/escalate/score/resolver/degraded) is a risk/safety signal
-// and passes through unchanged (fail-closed: an unrecognized future
-// cause stays a confirm too). Preserves source attribution + carried
-// DecisionBase fields so the audit row still names the rule that
-// matched; the reason records that POSTURE, not the rule, cleared it.
-// Caller only invokes this when the engine is `ready` — degraded
-// suspends auto-approval.
+// modal. Handles ONLY the 'policy' cause; the bash 'compound' / 'resolver'
+// / 'score' causes have a capability-confinement sibling
+// (`autoApproveRepoConfined`). Every OTHER cause (escalate/degraded) is a
+// risk/safety signal and passes through unchanged (fail-closed: an
+// unrecognized future cause stays a confirm too). Preserves source
+// attribution + carried DecisionBase fields so the audit row still names
+// the rule that matched; the reason records that POSTURE, not the rule,
+// cleared it. Caller only invokes this when the engine is `ready` —
+// degraded suspends auto-approval.
 const autoApprovePolicyConfirm = (decision: Decision): Decision => {
   if (decision.kind !== 'confirm' || decision.confirmCause !== 'policy') return decision;
   const allow: Extract<Decision, { kind: 'allow' }> = {
     kind: 'allow',
     reason: `autonomous posture: auto-approved policy confirm (was: ${decision.reason ?? 'confirm'})`,
+  };
+  if (decision.source !== undefined) allow.source = decision.source;
+  if (decision.ttlExpiresAt !== undefined) allow.ttlExpiresAt = decision.ttlExpiresAt;
+  return allow;
+};
+
+// Whether a single capability is "repo-confined and non-dangerous" for
+// the autonomous posture — an effect the operator opted to run without a
+// modal when hands-off (§8.1 `AGENTIC_CLI`). Safe = filesystem read /
+// write / delete UNDER the cwd subtree (and neither OS-protected nor a
+// content-secret), a LOCAL git write on this repo, the `/dev` safe
+// pseudo-devices (so `2>/dev/null` doesn't gate), and `exec:shell` (the
+// bash process itself). Everything else keeps its modal: network
+// (net-egress / net-ingress — `git push`/`pull`/`fetch` carry net-egress,
+// so they gate even though they also git-write), an unknown binary
+// (`exec:arbitrary`), python/node interpreters, secret-access, env/agent
+// mutation, and ANY path outside the repo or hitting a protected
+// (`.git`/`.agent`/system) or sensitive (`.env`/`*.pem`/`id_rsa`/
+// credentials) target. The sensitive/protected checks are
+// belt-and-suspenders — the engine's §8.4 sensitive floor already DENIES
+// most of these before this runs — so a future floor change can't
+// silently widen auto-approval. Fail-closed: an unrecognized kind, or a
+// scoped kind with a null scope, is not safe.
+const capRepoConfined = (cap: Capability, cwd: string, home: string): boolean => {
+  switch (cap.kind) {
+    case 'exec':
+      return cap.scope === 'shell';
+    case 'git-write':
+      // Resolver stamps git-write with repo == cwd; a network git op
+      // (push/pull/fetch/unknown subcommand) ALSO carries net-egress,
+      // which fails this predicate via the default branch.
+      return cap.scope === cwd;
+    case 'read-fs':
+    case 'write-fs':
+    case 'delete-fs': {
+      const path = cap.scope;
+      if (path === null) return false;
+      if (isDevSafe(path)) return true; // /dev/null, /dev/stdout, /dev/fd/*, ...
+      if (!startsWithSegment(path, cwd)) return false; // escapes the repo
+      // Gate if protected for EITHER op. `.git`/`.agent`/`.claude` are
+      // write-escalate but readable to git in general — for the no-modal
+      // auto-approval we treat them as off-limits for reads too (they can
+      // carry tokens / `core.sshCommand`), honoring the operator's
+      // ".git stays gated" intent. System-deny roots gate for both ops.
+      if (
+        classifyProtectedPath({ absPath: path, op: 'read', home, cwd }) !== null ||
+        classifyProtectedPath({ absPath: path, op: 'write', home, cwd }) !== null
+      ) {
+        return false;
+      }
+      if (matchSensitivePath(path) !== null) return false; // .env/*.pem/credentials
+      return true;
+    }
+    default:
+      // net-egress, net-ingress, secret-access, env-mutate, agent-mutate,
+      // host-passthrough → never repo-confined.
+      return false;
+  }
+};
+
+// Autonomous-posture sibling of autoApprovePolicyConfirm for the
+// capability-confined case: a bash `confirm` (compound / resolver-low-
+// confidence / score-gated) becomes an allow when EVERY resolved
+// capability is repo-confined (`capRepoConfined`) AND no top-level segment
+// matches an operator `deny` rule. This is what lets the agent work freely
+// INSIDE the repo under autonomous — read/write/delete repo files, local
+// git — while every dangerous effect (network, outside-repo, unknown
+// binary, protected/sensitive path) keeps its modal. The caller gates this
+// on resolver `kind: ok` (the command is FULLY modeled, so the capability
+// set is COMPLETE): within that, command structure (compound, glob,
+// pipeline) doesn't gate — only the EFFECT does. A `conservative` result
+// (soft control flow, dynamic `$var`, unknown command) never reaches here,
+// because its caps are best-effort and can under-represent the runtime
+// targets. The per-segment deny re-check closes
+// checkBash's whole-string-glob gap (`deny: ['curl*']` misses `echo x &&
+// curl evil`); it runs only for the compound cause. That is SOUND because
+// of an invariant: the `resolver`/`score` causes arise only from an
+// upgraded ALLOW (`degradeAllowToConfirm` rewrites `allow`→`confirm` and
+// returns an existing `confirm` untouched), and an allow is necessarily
+// NON-compound — checkBash stamps any shell-metachar command `compound`
+// BEFORE the allow rules. So a compound always carries cause `compound`
+// (even when also low-confidence or score-crossing), and a `resolver`/
+// `score` confirm is always a single command whose whole string checkBash
+// already deny-matched. Pinned by tests. Fail-closed: an empty capability
+// set, a command that can't be decomposed, or any non-confined cap keeps
+// the modal.
+const autoApproveRepoConfined = (
+  decision: Decision,
+  command: unknown,
+  caps: readonly Capability[],
+  cwd: string,
+  home: string,
+  denyRules: readonly string[] | undefined,
+): Decision => {
+  if (decision.kind !== 'confirm') return decision;
+  if (caps.length === 0) return decision;
+  for (const cap of caps) {
+    if (!capRepoConfined(cap, cwd, home)) return decision;
+  }
+  if (decision.confirmCause === 'compound') {
+    if (typeof command !== 'string') return decision;
+    const segments = topLevelCommandTexts(command);
+    if (segments === null) return decision;
+    for (const segment of segments) {
+      if (firstMatchingCommand(denyRules, segment) !== null) return decision;
+    }
+  }
+  const allow: Extract<Decision, { kind: 'allow' }> = {
+    kind: 'allow',
+    reason: `autonomous posture: auto-approved repo-confined operation (was: ${decision.reason ?? 'confirm'})`,
   };
   if (decision.source !== undefined) allow.source = decision.source;
   if (decision.ttlExpiresAt !== undefined) allow.ttlExpiresAt = decision.ttlExpiresAt;
@@ -2195,43 +2313,70 @@ export const createPermissionEngine = (
         approvalGateDetail(score, gateConfidence, scoreConfirmThreshold),
       );
     }
-    // Autonomous posture clears a routine `policy` confirm without the
-    // modal. Runs LAST — after every allow→confirm upgrade — and stays
-    // honest via three floors:
-    //   - autoApprovePolicyConfirm only touches confirmCause==='policy';
-    //     compound/escalate/score/resolver/degraded confirms pass
-    //     through as modals.
-    //   - the policy confirm must ITSELF be low-risk: a `confirm`-rule
-    //     match that also trips the score / resolver gate is held.
-    //     Required because `degradeAllowToConfirm` only upgrades
-    //     `allow`s — it returns an existing `confirm` unchanged — so a
-    //     high-risk confirm keeps cause 'policy' and would otherwise
-    //     slip through, the perverse asymmetry where a stricter
-    //     `confirm` rule got LESS protection than an `allow` rule.
-    //   - suspended while degraded: a subsystem-health signal re-arms
-    //     the modal for everything, posture included (the same reason
-    //     degraded upgrades allow→confirm above). We read the LIVE
-    //     state here, NOT the `currentState` snapshot taken at the top
-    //     of check(): a `classifierRequired` failure transitions the
-    //     engine to degraded MID-check (in the classifier block above),
-    //     and the snapshot would still read `ready` — auto-approving on
-    //     the very check that degraded. The live read suspends
-    //     auto-approval on that check too. Rejecting states already
-    //     returned far above and the classifier path only transitions
-    //     to `degraded`, so `ready` is the only clearing value here.
+    // Autonomous posture clears a confirm without the modal. Runs LAST —
+    // after every allow→confirm upgrade — and stays honest via these
+    // floors:
+    //   - Two auto-approvable shapes only. (1) a routine `policy` confirm
+    //     (operator `confirm` rule) that is ITSELF low-risk — one that
+    //     also trips the score / resolver gate is held, since
+    //     `degradeAllowToConfirm` only upgrades `allow`s and a high-risk
+    //     `confirm` rule must not get LESS protection than an `allow`.
+    //     (2) a bash compound / resolver / score confirm whose every
+    //     resolved capability is repo-confined (`autoApproveRepoConfined`):
+    //     network, outside-repo, unknown-binary, and protected/sensitive
+    //     effects all fail that predicate and keep the modal. `escalate`
+    //     (protected-path tier) and `degraded` are never auto-approved.
+    //   - suspended while degraded: a subsystem-health signal re-arms the
+    //     modal for everything, posture included. We read the LIVE state
+    //     here, NOT the `currentState` snapshot taken at the top of
+    //     check(): a `classifierRequired` failure transitions the engine
+    //     to degraded MID-check (in the classifier block above), and the
+    //     snapshot would still read `ready` — auto-approving on the very
+    //     check that degraded. The live read suspends auto-approval on
+    //     that check too. Rejecting states already returned far above and
+    //     the classifier path only transitions to `degraded`, so `ready`
+    //     is the only clearing value here.
     const liveState = stateController.get();
     const policyConfirmIsRisky =
       score >= scoreConfirmThreshold || gateConfidence === 'low' || resolverForcesConfirm;
-    let postureAutoApproved = false;
-    if (
-      posture === 'autonomous' &&
-      liveState === 'ready' &&
-      decision.kind === 'confirm' &&
-      decision.confirmCause === 'policy' &&
-      !policyConfirmIsRisky
-    ) {
-      decision = autoApprovePolicyConfirm(decision);
-      postureAutoApproved = true;
+    let postureNote: string | null = null;
+    if (posture === 'autonomous' && liveState === 'ready' && decision.kind === 'confirm') {
+      if (decision.confirmCause === 'policy' && !policyConfirmIsRisky) {
+        decision = autoApprovePolicyConfirm(decision);
+        if (decision.kind === 'allow') postureNote = 'autonomous: auto-approved policy confirm';
+      } else if (
+        category === 'bash' &&
+        resolverResult !== null &&
+        resolverResult.kind === 'ok' &&
+        (decision.confirmCause === 'compound' ||
+          decision.confirmCause === 'resolver' ||
+          decision.confirmCause === 'score')
+      ) {
+        // Capability-confinement: a bash confirm whose every resolved
+        // capability stays inside the repo and is non-dangerous clears
+        // without a modal, regardless of compound structure. Gated on
+        // resolver `kind: ok` — i.e. the resolver FULLY modeled the command
+        // — because that is the only state where the capability set is a
+        // COMPLETE representation of the effect. A `conservative` result
+        // (soft control flow, a dynamic `$var`, an unknown command) emits
+        // BEST-EFFORT caps that can UNDER-represent the runtime targets:
+        // `for f in /tmp/*; do rm "$f"; done` models the body's `$f` as
+        // `<cwd>/$f` and emits no cap for the `/tmp/*` loop source, so the
+        // caps all look repo-confined while the command deletes `/tmp` —
+        // those stay behind the modal. (`refuse` already became a deny
+        // upstream.) The cap predicate + per-segment deny re-check live in
+        // the helper.
+        const before = decision;
+        decision = autoApproveRepoConfined(
+          decision,
+          args.command,
+          resolvedCapabilities,
+          cwd,
+          home,
+          (sectionRules as BashPolicy | undefined)?.deny,
+        );
+        if (decision !== before) postureNote = 'autonomous: auto-approved repo-confined operation';
+      }
     }
     const stages: ReasonChainEntry[] = [];
     if (classifierStage !== null) stages.push(classifierStage);
@@ -2252,8 +2397,8 @@ export const createPermissionEngine = (
     if (tailStage !== undefined) stages.push(tailStage);
     // Trace the posture auto-approval so the audit row's `allow` is
     // attributable to the autonomous toggle, not just the matched rule.
-    if (postureAutoApproved) {
-      stages.push({ stage: 'approval-posture', note: 'autonomous: auto-approved policy confirm' });
+    if (postureNote !== null) {
+      stages.push({ stage: 'approval-posture', note: postureNote });
     }
     const e = emitAudit(
       toolName,

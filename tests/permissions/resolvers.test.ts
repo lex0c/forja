@@ -1,7 +1,10 @@
 import { beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { initBashParser } from '../../src/permissions/bash-parser.ts';
 import { type Capability, formatCapability } from '../../src/permissions/capabilities.ts';
-import { __resetRealpathWarnLatchForTest } from '../../src/permissions/resolvers/bash.ts';
+import {
+  __resetRealpathWarnLatchForTest,
+  topLevelCommandTexts,
+} from '../../src/permissions/resolvers/bash.ts';
 // Importing the index file loads every builtin resolver via its
 // side-effecting register calls.
 import {
@@ -1967,10 +1970,16 @@ describe('bash resolver — read-only registry expansion (A, §5.2)', () => {
     expect(r.kind).toBe('conservative');
   });
 
-  test('deliberately-excluded `sed` → Conservative (not added to the read set)', () => {
-    // sed -i / `w` write; kept off the registry so it routes to confirm.
-    const r = resolveCapabilities('bash', { command: 'sed -i s/a/b/ file.txt' }, CTX);
-    expect(r.kind).toBe('conservative');
+  test('sed classified by effect: read-only script → Ok read-fs (no write, no exec)', () => {
+    // Slice (effect-based): sed/awk are now in the registry, classified by
+    // EFFECT. A plain substitution to stdout reads only.
+    const r = resolveCapabilities('bash', { command: "sed 's/a/b/g' file.txt" }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s.some((c) => c.startsWith('read-fs'))).toBe(true);
+      expect(s.some((c) => c.startsWith('write-fs') || c === 'exec:arbitrary')).toBe(false);
+    }
   });
 });
 
@@ -1979,10 +1988,13 @@ describe('bash resolver — read-only registry expansion (A, §5.2)', () => {
 // or the engine's bypass §11 floor (the only check that fires under
 // mode:bypass) has nothing to upgrade and the write is silently allowed.
 describe('bash resolver — unknown commands ride escalate-tier operand caps (bypass §11 floor)', () => {
-  test('sed -i /etc/hosts (unknown cmd, escalate write) → Conservative carrying write-fs', () => {
-    const r = resolveCapabilities('bash', { command: 'sed -i /etc/hosts' }, CTX);
-    expect(r.kind).toBe('conservative');
-    if (r.kind === 'conservative') {
+  test('sed -i of an escalate-tier path emits write-fs (floor still catches it)', () => {
+    // sed is now resolved (Ok, not Conservative), but the in-place edit of
+    // an escalate path still rides a write-fs cap so the §11 floor + the
+    // autonomous capability-confinement gate it.
+    const r = resolveCapabilities('bash', { command: 'sed -i s/a/b/ /etc/hosts' }, CTX);
+    expect(r.kind).not.toBe('refuse');
+    if (r.kind !== 'refuse') {
       expect(capStrings(r.capabilities)).toContain('write-fs:/etc/hosts');
     }
   });
@@ -2011,11 +2023,13 @@ describe('bash resolver — unknown commands ride escalate-tier operand caps (by
     expect(r.kind).toBe('refuse');
   });
 
-  test('unknown cmd writing only cwd carries no spurious protected cap', () => {
-    const r = resolveCapabilities('bash', { command: 'sed -i ./local.txt' }, CTX);
-    expect(r.kind).toBe('conservative');
-    if (r.kind === 'conservative') {
-      expect(capStrings(r.capabilities).some((c) => c.startsWith('write-fs:/etc'))).toBe(false);
+  test('sed -i writing only cwd carries no spurious protected cap', () => {
+    const r = resolveCapabilities('bash', { command: 'sed -i s/a/b/ ./local.txt' }, CTX);
+    expect(r.kind).not.toBe('refuse');
+    if (r.kind !== 'refuse') {
+      const s = capStrings(r.capabilities);
+      expect(s.some((c) => c.startsWith('write-fs:/etc'))).toBe(false);
+      expect(s).toContain('write-fs:/work/proj/local.txt');
     }
   });
 });
@@ -2649,10 +2663,11 @@ describe('bash resolver — control flow does not bypass per-command defenses (r
     expect(resolveCapabilities('bash', { command: cmd }, CTX).kind).toBe('refuse');
   });
 
-  test('find -exec in a loop still EMITS exec:arbitrary (gated downstream), never a blind exec:shell', () => {
-    // find -exec is exec:arbitrary (a capability the engine gates), not a
-    // hard refuse — but the soft path must EMIT the real cap, not swallow
-    // it behind a blind [exec('shell')] the bypass floor can't see.
+  test('find -exec rm in a loop EMITS delete-fs (the real effect), never a blind exec:shell', () => {
+    // find -exec is now classified by its inner command: `rm` →
+    // delete-fs(roots), the honest effect the soft path must surface (not a
+    // blind [exec('shell')] the bypass floor can't see). A shell/unknown
+    // inner would instead emit exec:arbitrary (pinned below).
     const r = resolveCapabilities(
       'bash',
       { command: 'for x in *; do find . -exec rm -rf {} +; done' },
@@ -2660,7 +2675,7 @@ describe('bash resolver — control flow does not bypass per-command defenses (r
     );
     expect(r.kind === 'conservative' || r.kind === 'refuse').toBe(true);
     if (r.kind === 'conservative') {
-      expect(capStrings(r.capabilities)).toContain('exec:arbitrary');
+      expect(capStrings(r.capabilities).some((c) => c.startsWith('delete-fs'))).toBe(true);
     }
   });
 });
@@ -3276,11 +3291,14 @@ describe('bash resolver — slice 176 symlink-bypass detection (command-bypass P
     }
   });
 
-  test('redirect target via symlink to /etc/passwd escalates (not refuses)', () => {
-    // /etc is the escalate tier for writes: confidence drops to low
-    // but the call still resolves to ok. Operator's modal sees the
-    // raw command and confirms. Documents the difference vs. /proc
-    // (deny → refuse).
+  test('redirect target via symlink to /etc/passwd routes to Conservative (not refuses)', () => {
+    // The redirect target `<cwd>/safe-output.txt` is lexically inside cwd
+    // but its realpath is /etc/passwd — both escalate-tier (a write to
+    // /etc) AND a cwd-scope escape. The emitted cap is the LEXICAL
+    // `write-fs:<cwd>/safe-output.txt`, which the engine's autonomous
+    // capability-confinement would read as repo-confined; only Conservative
+    // (not ok/low) keeps the modal there. Distinct from /proc (deny →
+    // refuse): /etc is confirmable, /proc is a hard deny.
     const ctxWithRealpath: ResolverContext = {
       cwd: '/work/proj',
       home: '/home/op',
@@ -3293,9 +3311,9 @@ describe('bash resolver — slice 176 symlink-bypass detection (command-bypass P
       { command: 'echo data > safe-output.txt' },
       ctxWithRealpath,
     );
-    expect(r.kind).toBe('ok');
-    if (r.kind === 'ok') {
-      expect(r.confidence).toBe('low');
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
     }
   });
 
@@ -3476,10 +3494,21 @@ describe('bash resolver — M3 realpath degrade visibility', () => {
 // protected-path classifier returns null for both ends, so slice 176
 // doesn't refuse or escalate. But a `<cwd>/**` glob policy authorizes
 // the lexical capability while the kernel follows the symlink to a
-// target the operator never scoped. Defense: degrade confidence to
-// low so the engine forces confirm.
+// target the operator never scoped.
+//
+// Defense (strengthened): route the result to Conservative, NOT merely
+// low confidence. The emitted cap is the lexical `<cwd>/link`, so the
+// engine's autonomous capability-confinement (lexical
+// `startsWithSegment`) reads it as repo-confined and would auto-approve
+// `ok/low` without a modal — the resolver's realpath escape signal was
+// being discarded at the engine layer. `kind: conservative` is the one
+// channel the autonomous auto-approval gate (keyed on `kind === 'ok'`)
+// respects: it keeps the modal. Supervised is unchanged — Conservative
+// and `ok/low` both force confirm there. The non-escape cases below
+// stay `ok` (high confidence) so legitimate in-cwd symlinks still
+// auto-approve.
 describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', () => {
-  test('read of /work/proj/data/x → /tmp/exfil drops confidence to low', () => {
+  test('read of /work/proj/data/x → /tmp/exfil routes to Conservative', () => {
     const ctxWithRealpath: ResolverContext = {
       cwd: '/work/proj',
       home: '/home/op',
@@ -3489,13 +3518,13 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
       },
     };
     const r = resolveCapabilities('bash', { command: 'cat data/x' }, ctxWithRealpath);
-    expect(r.kind).toBe('ok');
-    if (r.kind === 'ok') {
-      expect(r.confidence).toBe('low');
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
     }
   });
 
-  test('write redirect /work/proj/log → /tmp/leak drops confidence to low', () => {
+  test('write redirect /work/proj/log → /tmp/leak routes to Conservative', () => {
     const ctxWithRealpath: ResolverContext = {
       cwd: '/work/proj',
       home: '/home/op',
@@ -3505,13 +3534,13 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
       },
     };
     const r = resolveCapabilities('bash', { command: 'echo data > log' }, ctxWithRealpath);
-    expect(r.kind).toBe('ok');
-    if (r.kind === 'ok') {
-      expect(r.confidence).toBe('low');
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
     }
   });
 
-  test('input redirect via cwd-escape symlink drops confidence to low', () => {
+  test('input redirect via cwd-escape symlink routes to Conservative', () => {
     const ctxWithRealpath: ResolverContext = {
       cwd: '/work/proj',
       home: '/home/op',
@@ -3521,9 +3550,9 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
       },
     };
     const r = resolveCapabilities('bash', { command: 'cat < source' }, ctxWithRealpath);
-    expect(r.kind).toBe('ok');
-    if (r.kind === 'ok') {
-      expect(r.confidence).toBe('low');
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
     }
   });
 
@@ -3549,7 +3578,7 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
     }
   });
 
-  test('parent-dir symlink that escapes cwd via parent realpath fallback drops to low', () => {
+  test('parent-dir symlink that escapes cwd via parent realpath fallback routes to Conservative', () => {
     // Leaf doesn't exist, parent is a symlink to an external path.
     // Mirrors the slice-176 deny-tier fallback shape but the target
     // isn't a protected zone — it's just outside cwd.
@@ -3568,13 +3597,13 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
       { command: 'echo data > cwd_alias/new.txt' },
       ctxWithRealpath,
     );
-    expect(r.kind).toBe('ok');
-    if (r.kind === 'ok') {
-      expect(r.confidence).toBe('low');
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
     }
   });
 
-  test('dangling symlink leaf with absolute outside-cwd target drops to low', () => {
+  test('dangling symlink leaf with absolute outside-cwd target routes to Conservative', () => {
     // /work/proj/outlink → /tmp/exfil where /tmp/exfil was removed
     // (dangling symlink). Pre-fix the parent-realpath fallback
     // collapsed canonical to /work/proj/outlink === lexicalAbs and
@@ -3600,13 +3629,13 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
       },
     };
     const r = resolveCapabilities('bash', { command: 'cat outlink' }, ctxWithRealpath);
-    expect(r.kind).toBe('ok');
-    if (r.kind === 'ok') {
-      expect(r.confidence).toBe('low');
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
     }
   });
 
-  test('dangling symlink on write redirect with absolute target drops to low', () => {
+  test('dangling symlink on write redirect with absolute target routes to Conservative', () => {
     // Same shape but on a write redirect (`> outlink`). The kernel
     // creates the file at the symlink target /tmp/x even though
     // /tmp/x didn't exist when the symlink was made — defense must
@@ -3628,9 +3657,9 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
       },
     };
     const r = resolveCapabilities('bash', { command: 'echo data > outlink' }, ctxWithRealpath);
-    expect(r.kind).toBe('ok');
-    if (r.kind === 'ok') {
-      expect(r.confidence).toBe('low');
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
     }
   });
 
@@ -3661,7 +3690,7 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
     }
   });
 
-  test('dangling symlink with RELATIVE target that escapes cwd drops to low', () => {
+  test('dangling symlink with RELATIVE target that escapes cwd routes to Conservative', () => {
     // /work/proj/exfil-link → ../../../tmp/x — relative target
     // walks up past cwd. Resolved against the symlink's parent dir,
     // canonicalizes outside cwd; detector fires.
@@ -3682,9 +3711,9 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
       },
     };
     const r = resolveCapabilities('bash', { command: 'cat exfil-link' }, ctxWithRealpath);
-    expect(r.kind).toBe('ok');
-    if (r.kind === 'ok') {
-      expect(r.confidence).toBe('low');
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
     }
   });
 
@@ -3713,9 +3742,9 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
       },
     };
     const r = resolveCapabilities('bash', { command: 'cat out' }, ctxWithRealpath);
-    expect(r.kind).toBe('ok');
-    if (r.kind === 'ok') {
-      expect(r.confidence).toBe('low');
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
     }
   });
 
@@ -3775,9 +3804,9 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
       },
     };
     const r = resolveCapabilities('bash', { command: 'cat alias/out' }, ctxWithRealpath);
-    expect(r.kind).toBe('ok');
-    if (r.kind === 'ok') {
-      expect(r.confidence).toBe('low');
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
     }
   });
 
@@ -3835,9 +3864,9 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
       },
     };
     const r = resolveCapabilities('bash', { command: 'cat data/out' }, ctxWithRealpath);
-    expect(r.kind).toBe('ok');
-    if (r.kind === 'ok') {
-      expect(r.confidence).toBe('low');
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
     }
   });
 
@@ -3867,6 +3896,52 @@ describe('bash resolver — slice 178 cwd-scope symlink escape (hardening A1)', 
     if (r.kind === 'ok') {
       expect(r.confidence).toBe('high');
     }
+  });
+
+  // Orphan redirects: a standalone `> target` in a list, attached to NO
+  // command (`cat x; > escape`, `cmd && > escape`). analyzeCommand never
+  // sees these — classifyRedirects handles them in the resolver body — so
+  // the per-command cwd-escape guard does not cover them. With a real
+  // command present and a non-soft list, the result is `kind: ok`; without
+  // the orphan-path guard the lexical `write-fs:<cwd>/escape` cap reads as
+  // repo-confined and auto-approves under autonomous, writing through the
+  // symlink to the external target.
+  test('orphan redirect `cat x; > escape` via cwd-escape symlink routes to Conservative', () => {
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => (p === '/work/proj/escape' ? '/tmp/secret' : p),
+    };
+    const r = resolveCapabilities('bash', { command: 'cat x; > escape' }, ctxWithRealpath);
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
+    }
+  });
+
+  test('orphan redirect `cat x && > escape` via cwd-escape symlink routes to Conservative', () => {
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => (p === '/work/proj/escape' ? '/tmp/secret' : p),
+    };
+    const r = resolveCapabilities('bash', { command: 'cat x && > escape' }, ctxWithRealpath);
+    expect(r.kind).toBe('conservative');
+    if (r.kind === 'conservative') {
+      expect(r.reason).toContain('cwd-scope escape');
+    }
+  });
+
+  test('orphan redirect `cat x; > inrepo` with NO escape stays ok (no over-block)', () => {
+    // Same shape, in-cwd target (no symlink): the guard must fire ONLY on a
+    // genuine escape, never blanket-confirm every orphan redirect.
+    const ctxWithRealpath: ResolverContext = {
+      cwd: '/work/proj',
+      home: '/home/op',
+      realpath: (p) => p,
+    };
+    const r = resolveCapabilities('bash', { command: 'cat x; > inrepo' }, ctxWithRealpath);
+    expect(r.kind).toBe('ok');
   });
 });
 
@@ -5541,6 +5616,322 @@ describe('bash resolver — slice 152 calibration', () => {
       if (r.kind === 'ok') {
         expect(capStrings(r.capabilities)).toContain('read-fs:/etc');
       }
+    }
+  });
+});
+
+describe('topLevelCommandTexts (autonomous compound re-check, §8.1)', () => {
+  // The engine's autonomous posture uses this to re-run operator `deny`
+  // rules per top-level segment of a resolver-`ok` compound — closing the
+  // gap where checkBash's deny matches only the whole command by glob.
+  test('single command → one segment', () => {
+    expect(topLevelCommandTexts('ls -la')).toEqual(['ls -la']);
+  });
+
+  test('pipeline → one segment per stage', () => {
+    expect(topLevelCommandTexts('ls -la | head -5')).toEqual(['ls -la', 'head -5']);
+  });
+
+  test('&&-sequence → one segment per command', () => {
+    expect(topLevelCommandTexts('echo a && echo b')).toEqual(['echo a', 'echo b']);
+  });
+
+  test('mixed pipe + && → flat list of every simple command', () => {
+    expect(topLevelCommandTexts('ls | grep x && echo done')).toEqual(['ls', 'grep x', 'echo done']);
+  });
+
+  test('no command recovered → null (fail-closed)', () => {
+    expect(topLevelCommandTexts('')).toBeNull();
+  });
+});
+
+describe('bash resolver — effect-based git read verbs / find-exec / awk / sed (§5.2)', () => {
+  const caps = (command: string): string[] => {
+    const r = resolveCapabilities('bash', { command }, CTX);
+    return r.kind === 'ok' ? capStrings(r.capabilities) : [];
+  };
+
+  // git: read-only local verbs no longer get the unknown-subcommand
+  // gitWrite + netEgress; network verbs still do.
+  test('git shortlog → read-fs, no net-egress / git-write', () => {
+    const r = resolveCapabilities('bash', { command: 'git shortlog -sn --all' }, CTX);
+    expect(r.kind).toBe('ok');
+    const s = caps('git shortlog -sn --all');
+    expect(s.some((c) => c.startsWith('read-fs'))).toBe(true);
+    expect(s.some((c) => c.startsWith('net-egress') || c.startsWith('git-write'))).toBe(false);
+  });
+  test('git ls-files / cat-file / rev-list → no net-egress', () => {
+    for (const c of ['git ls-files', 'git cat-file -p HEAD', 'git rev-list HEAD']) {
+      expect(caps(c).some((x) => x.startsWith('net-egress'))).toBe(false);
+    }
+  });
+  test('git push still carries net-egress', () => {
+    expect(caps('git push origin main').some((c) => c.startsWith('net-egress'))).toBe(true);
+  });
+  test('git grep -O / --open-files-in-pager runs the pager → exec:arbitrary', () => {
+    for (const c of [
+      "git grep --open-files-in-pager='sh -c x' hi",
+      'git grep -Oless foo',
+      'git grep -O foo',
+    ]) {
+      expect(caps(c)).toContain('exec:arbitrary');
+    }
+  });
+  test('plain git grep stays read-only', () => {
+    const s = caps('git grep foo');
+    expect(s.some((x) => x.startsWith('read-fs'))).toBe(true);
+    expect(s).not.toContain('exec:arbitrary');
+  });
+  test('git config set / edit / mutate / outside-scope (not a pure read) → exec:arbitrary', () => {
+    for (const c of [
+      "git config core.pager 'sh -c x'", // set (exec hook)
+      'git config user.name Bob', // set
+      'git config --edit', // opens editor (option-only — must not pass on positional count)
+      'git config -e', // editor short form
+      'git config --unset core.pager', // mutation, single positional
+      'git config --remove-section foo', // mutation, single positional
+      'git config --global --get user.name', // reads ~/.gitconfig (outside repo)
+    ]) {
+      expect(caps(c)).toContain('exec:arbitrary');
+    }
+  });
+  test('git config pure repo read (--get / --list / bare key / --worktree get) stays read-only', () => {
+    for (const c of [
+      'git config --get user.name',
+      'git config user.name',
+      'git config --list',
+      'git config --worktree --get core.foo',
+    ]) {
+      expect(caps(c)).not.toContain('exec:arbitrary');
+    }
+  });
+  test('git commit / merge / rebase / cherry-pick run repo hooks → exec:arbitrary', () => {
+    // Repository hooks under .git/hooks (pre-commit, prepare-commit-msg,
+    // commit-msg, post-commit, pre-merge-commit, pre-rebase, …) execute
+    // arbitrary code on these verbs. `--no-verify` is NOT a safe downgrade
+    // (it bypasses only pre-commit + commit-msg; post-commit still runs),
+    // so the exec:arbitrary cap stays. git-write + read-fs ride along.
+    for (const c of [
+      'git commit -m wip',
+      'git commit --no-verify -m wip',
+      'git merge feature',
+      'git rebase main',
+      'git cherry-pick abc123',
+    ]) {
+      const s = caps(c);
+      expect(s).toContain('exec:arbitrary');
+      expect(s.some((x) => x.startsWith('git-write'))).toBe(true);
+    }
+  });
+  test('git add / stash / reset have no hook surface → git-write, not exec:arbitrary', () => {
+    // Pure git-writes: no pre-add/reset hook, and stash writes via plumbing
+    // that bypasses commit hooks. These stay repo-confined so autonomous can
+    // still auto-approve them. (`git tag` is nuanced — see the tag tests.)
+    for (const c of ['git add -A', 'git stash', 'git reset --hard']) {
+      const s = caps(c);
+      expect(s.some((x) => x.startsWith('git-write'))).toBe(true);
+      expect(s).not.toContain('exec:arbitrary');
+    }
+  });
+  test('git tag annotated-without-message / signed / verified → exec:arbitrary (editor or gpg)', () => {
+    // `git tag -a` with no -m/-F opens core.editor; `-s`/`-u`/`-v` run
+    // gpg.program — both configurable commands a cloned repo's .git/config
+    // can hijack. Short flags bundle (`-as`, `-af`), so the walk finds them;
+    // signing runs gpg even WITH a message.
+    for (const c of [
+      'git tag -a v1',
+      'git tag -s v1',
+      'git tag -u KEY v1',
+      'git tag -v v1',
+      'git tag -as v1',
+      'git tag -s v1 -m msg',
+      'git tag -af v1',
+    ]) {
+      const s = caps(c);
+      expect(s).toContain('exec:arbitrary');
+      expect(s.some((x) => x.startsWith('git-write'))).toBe(true);
+    }
+  });
+  test('git tag lightweight / annotated-WITH-message → git-write, no exec (auto-approvable)', () => {
+    // Message supplied (no editor) and not signed → no external command.
+    for (const c of ['git tag v1', 'git tag -d v1', 'git tag -a v1 -m msg', 'git tag -am msg v1']) {
+      const s = caps(c);
+      expect(s.some((x) => x.startsWith('git-write'))).toBe(true);
+      expect(s).not.toContain('exec:arbitrary');
+    }
+  });
+  test('find symlink-following (-L / -H / -follow) → exec:arbitrary (escapes lexical roots)', () => {
+    for (const c of [
+      'find -L . -type f -exec rm {} +',
+      'find -L . -delete',
+      'find -H . -exec rm {} +',
+      'find -L . -name x',
+    ]) {
+      expect(caps(c)).toContain('exec:arbitrary');
+    }
+  });
+
+  // find -exec classified by inner command.
+  test('find -exec wc → read-fs(roots), not exec:arbitrary', () => {
+    const s = caps('find src -name "*.ts" -exec wc -l {} +');
+    expect(s).toContain('read-fs:/work/proj/src');
+    expect(s).not.toContain('exec:arbitrary');
+  });
+  test('find -exec rm → delete-fs(roots)', () => {
+    expect(caps('find . -name "*.tmp" -exec rm {} +').some((c) => c.startsWith('delete-fs'))).toBe(
+      true,
+    );
+  });
+  test('find -exec chmod → write-fs(roots), not exec:arbitrary', () => {
+    const s = caps('find . -exec chmod 644 {} +');
+    expect(s.some((c) => c.startsWith('write-fs'))).toBe(true);
+    expect(s).not.toContain('exec:arbitrary');
+  });
+  test('find -exec mv/cp (dest can leave repo) → exec:arbitrary', () => {
+    for (const c of ['find . -exec mv {} /tmp/x +', 'find . -exec cp {} /tmp/x +']) {
+      expect(caps(c)).toContain('exec:arbitrary');
+    }
+  });
+  test('find -exec sh -c → exec:arbitrary', () => {
+    expect(caps('find . -exec sh -c "id" {} +')).toContain('exec:arbitrary');
+  });
+  test('find: a read-only -exec does NOT hide a mutating second -exec', () => {
+    expect(
+      caps('find . -exec cat {} + -exec rm -rf {} +').some((x) => x.startsWith('delete-fs')),
+    ).toBe(true);
+  });
+  test('find -delete combined with -exec on a system root → Refuse', () => {
+    expect(
+      resolveCapabilities('bash', { command: 'find / -exec cat {} + -delete' }, CTX).kind,
+    ).toBe('refuse');
+  });
+  test('find -L (symlink-following) → exec:arbitrary, never repo-confined (escape guard)', () => {
+    // Superseded the earlier "captures /etc as a read root" assertion: any
+    // `-L`/`-H`/`-follow` find can resolve outside the lexical roots via a
+    // symlink, so it is treated as a workspace escape regardless of root.
+    expect(caps('find -L /etc -exec cat {} +')).toContain('exec:arbitrary');
+  });
+  test('sed -i with a separate BSD suffix (-i / -i .bak) → exec:arbitrary (script position ambiguous)', () => {
+    for (const c of ["sed -i '' 's/a/b/e' file", "sed -i .bak 's/a/b/e' file"]) {
+      expect(caps(c)).toContain('exec:arbitrary');
+    }
+  });
+  test('bare `sed -i` (separate-operand suffix) is script-position-ambiguous → exec:arbitrary', () => {
+    // The reported hole: on BSD/macOS `-i` consumes the NEXT token as the
+    // backup suffix (ANY token, not just `''`/`.bak`), shifting the script
+    // one position right. `sed -i p 's/x/id/e' file` → BSD suffix `p`,
+    // script `s/x/id/e` which execs `id` via the `e` flag; the GNU-shaped
+    // `positional[0]` heuristic would read `p` as a read-only print script
+    // and miss it. Any bare `-i` (or short-flag bundle ending in `i`)
+    // without `-e` → exec:arbitrary.
+    for (const c of [
+      "sed -i p 's/x/id/e' file", // the exploit (suffix `p`, real script execs id)
+      "sed -i 's/a/b/' file", // common GNU form — also ambiguous, gates
+      "sed -i bak 's/a/b/e' file", // arbitrary non-dot suffix
+      "sed -ni p 's/x/id/e' file", // bundled flags ending in i
+    ]) {
+      expect(caps(c)).toContain('exec:arbitrary');
+    }
+  });
+  test('script-position-UNambiguous `sed -i` forms stay modeled (no exec): -i.bak, -i -e, --in-place', () => {
+    // Escape hatches for autonomous auto-approval of an in-place edit. The
+    // suffix is attached to the -i token (`-i.bak`), or the script rides
+    // `-e` (coincides on both platforms), or it's the GNU-only long form —
+    // so positional[0] / the flag value is unambiguously the script.
+    for (const c of [
+      "sed -i.bak 's/a/b/' file",
+      "sed -i -e 's/a/b/' file",
+      "sed --in-place 's/a/b/' file",
+    ]) {
+      const s = caps(c);
+      expect(s).not.toContain('exec:arbitrary');
+      expect(s).toContain('write-fs:/work/proj/file');
+    }
+  });
+  test('bundled in-place `-Ei.bak` / `-niE` is recognized as a WRITE (not a read-only transform)', () => {
+    // GNU accepts `-i` bundled after other short flags with an ATTACHED
+    // suffix (`-Ei.bak` = -E + -i.bak). The old detection only matched a
+    // token STARTING with `-i`, so `-Ei.bak` fell through as a read-only
+    // stdout transform and emitted only read-fs for the operand — hiding the
+    // in-place WRITE from the bypass §11 protected-path floor (which
+    // escalates /etc on writes only) and from the audit.
+    expect(caps("sed -Ei.bak 's/x/y/' /etc/hosts")).toContain('write-fs:/etc/hosts');
+    for (const c of ["sed -Ei.bak 's/x/y/' file", "sed -niE 's/x/y/' file"]) {
+      const s = caps(c);
+      expect(s).toContain('write-fs:/work/proj/file');
+      expect(s).not.toContain('exec:arbitrary');
+    }
+  });
+  test('a short bundle with `-e`/`-f` before any `i` is NOT in-place (`-ne` reads, no false write)', () => {
+    // `-ne` is `-n` + `-e SCRIPT`; `-e` consumes the rest of the token as the
+    // script, so there is no in-place `i`. The walk stops at `-e`/`-f` so an
+    // `i` inside the script arg can't be mistaken for the flag — stays a
+    // read-only transform, no spurious write-fs.
+    const s = caps("sed -ne 's/x/p/' f");
+    expect(s.some((x) => x.startsWith('read-fs'))).toBe(true);
+    expect(s.some((x) => x.startsWith('write-fs'))).toBe(false);
+  });
+
+  // awk: read-only print/filter vs side-effecting forms.
+  test('awk print / pattern → no exec:arbitrary, no write-fs', () => {
+    for (const c of ["awk '{print $1}' f.log", "awk '/ERROR/' app.log"]) {
+      const s = caps(c);
+      expect(s.some((x) => x === 'exec:arbitrary' || x.startsWith('write-fs'))).toBe(false);
+    }
+  });
+  test('awk system / getline-pipe / print-redirect / -f → exec:arbitrary', () => {
+    for (const c of [
+      'awk \'BEGIN{system("id")}\'',
+      'awk \'BEGIN{"id"|getline x}\'',
+      'awk \'{print > "/tmp/x"}\' f',
+      'awk -f /tmp/x.awk f',
+    ]) {
+      expect(caps(c)).toContain('exec:arbitrary');
+    }
+  });
+  test('awk ATTACHED external flags (`-i/tmp/x`, `-lfoo`, `-Efile`, `--exec=`) → exec:arbitrary', () => {
+    // GNU awk accepts the required operand of -i/-l/-E/-D/-p ATTACHED; an
+    // exact-only match let `awk -i/tmp/payload.awk …` / `awk -lfoo …` load
+    // and RUN that include source / shared library as a read-only program.
+    for (const c of [
+      "awk -i/tmp/payload.awk 'BEGIN{print}' input",
+      "awk -lfoo 'BEGIN{print}'",
+      "awk -E/tmp/prog.awk 'BEGIN{print}'",
+      "awk --include=/tmp/x.awk 'BEGIN{print}'",
+      "awk --exec=/tmp/x 'BEGIN{print}'",
+    ]) {
+      expect(caps(c)).toContain('exec:arbitrary');
+    }
+  });
+  test('awk -F field-sep / -v assignment are NOT external (case-sensitive, no false exec)', () => {
+    // The prefix match must not mistake `-F` (field separator) or `-v`
+    // (assignment) for `-f`/`-i`/`-l`; plain read-only programs stay read-fs.
+    for (const c of ["awk -F: '{print $1}' data.csv", "awk -v n=1 '{print n}' data.csv"]) {
+      expect(caps(c)).not.toContain('exec:arbitrary');
+    }
+  });
+
+  // sed: read transform vs in-place write vs exec/write commands.
+  test('sed substitution / print → read-fs, no write/exec', () => {
+    for (const c of ["sed 's/a/b/g' f", "sed -n '1,5p' f"]) {
+      const s = caps(c);
+      expect(s.some((x) => x.startsWith('read-fs'))).toBe(true);
+      expect(s.some((x) => x === 'exec:arbitrary' || x.startsWith('write-fs'))).toBe(false);
+    }
+  });
+  test('sed -i.bak → write-fs(operands), no exec (unambiguous in-place edit)', () => {
+    const s = caps('sed -i.bak s/a/b/ notes.txt');
+    expect(s).toContain('write-fs:/work/proj/notes.txt');
+    expect(s).not.toContain('exec:arbitrary');
+  });
+  test('sed exec/write commands (s///e, e, s///w, -f) → exec:arbitrary', () => {
+    for (const c of [
+      "sed 's/a/b/e' f",
+      "sed '1e cat /etc/passwd' f",
+      "sed 's/a/b/w /tmp/out' f",
+      'sed -f /tmp/x.sed f',
+    ]) {
+      expect(caps(c)).toContain('exec:arbitrary');
     }
   });
 });
