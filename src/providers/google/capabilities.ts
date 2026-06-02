@@ -24,6 +24,8 @@ export const GOOGLE_CAPS: Record<string, ProviderCapabilities> = {
     ...GOOGLE_BASE,
     context_window: 2_000_000,
     output_max_tokens: 65_536,
+    // Gemini 2.5 Pro caps thinkingBudget at 32768; >cap → HTTP 400.
+    max_thinking_budget: 32_768,
     cost_per_1k_input: 1.25,
     cost_per_1k_output: 10.0,
     notes: ['frontier reasoning; very large context window'],
@@ -32,6 +34,8 @@ export const GOOGLE_CAPS: Record<string, ProviderCapabilities> = {
     ...GOOGLE_BASE,
     context_window: 1_000_000,
     output_max_tokens: 65_536,
+    // Gemini 2.5 Flash caps thinkingBudget at 24576; >cap → HTTP 400.
+    max_thinking_budget: 24_576,
     cost_per_1k_input: 0.3,
     cost_per_1k_output: 2.5,
     notes: ['default Google option; balanced quality/cost'],
@@ -40,6 +44,8 @@ export const GOOGLE_CAPS: Record<string, ProviderCapabilities> = {
     ...GOOGLE_BASE,
     context_window: 1_000_000,
     output_max_tokens: 65_536,
+    // Gemini 2.5 Flash-Lite caps thinkingBudget at 24576; >cap → 400.
+    max_thinking_budget: 24_576,
     cost_per_1k_input: 0.075,
     cost_per_1k_output: 0.3,
     notes: ['cheapest Gemini; high-throughput one-shots'],

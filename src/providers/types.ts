@@ -70,6 +70,16 @@ export interface ProviderCapabilities {
   // "request expresses intent, per-provider follows" convention).
   supports_reasoning_effort?: boolean;
 
+  // Ceiling for the numeric thinking budget (Gemini's
+  // `thinkingConfig.thinkingBudget`), in tokens. Gemini 2.5 caps it
+  // per model (Flash/Flash-Lite 24576, Pro 32768) and 400s above the
+  // cap. The adapter clamps the resolved budget to this before send,
+  // so a playbook's large legacy `sampling.thinking_budget` (the
+  // loader allows big values for provider-specific handling) is fitted
+  // rather than rejected. Omitted ⇒ no clamp (providers with no such
+  // ceiling, or where the budget surface isn't numeric).
+  max_thinking_budget?: number;
+
   // Operational
   max_rps?: number;
   notes: string[];

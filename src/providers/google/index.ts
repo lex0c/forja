@@ -21,19 +21,30 @@ import { GOOGLE_CAPS } from './capabilities.ts';
 // an EXPLICIT `thinking_budget: 0` (disable-via-zero, PLAYBOOKS.md
 // §1.1) wins and disables thinking — `effort` must not resurrect it.
 // Otherwise effort (when the model supports the surface) wins over a
-// legacy numeric `thinking_budget`. Returns undefined ⇒ omit the
-// block. (A future Gemini 3+ uses named `thinkingLevel` instead and
-// would need its own branch, not this numeric one.)
+// legacy numeric `thinking_budget`. The resolved value is then clamped
+// to the model's `max_thinking_budget` ceiling (Gemini 2.5 400s above
+// it): the loader allows large legacy `thinking_budget` values for
+// provider-specific handling, so an over-cap 50000 is fitted, not
+// rejected. Returns undefined ⇒ omit the block. (A future Gemini 3+
+// uses named `thinkingLevel` instead and would need its own branch.)
 export const googleThinkingBudget = (
   req: GenerateRequest,
   caps: ProviderCapabilities,
 ): number | undefined => {
   if (req.thinking_budget === 0) return undefined;
+  let budget: number | undefined;
   if (req.effort !== undefined && caps.supports_reasoning_effort === true) {
-    return effortThinkingBudget(req.effort, req.max_tokens);
+    budget = effortThinkingBudget(req.effort, req.max_tokens);
+  } else if (req.thinking_budget !== undefined && req.thinking_budget > 0) {
+    budget = req.thinking_budget;
   }
-  if (req.thinking_budget !== undefined && req.thinking_budget > 0) return req.thinking_budget;
-  return undefined;
+  if (budget === undefined) return undefined;
+  // Clamp to the model's thinking-budget ceiling. Applies to both
+  // paths so it stays correct if the effort ladder ever rises above a
+  // model cap; the legacy raw value is the one that actually exceeds.
+  return caps.max_thinking_budget !== undefined
+    ? Math.min(budget, caps.max_thinking_budget)
+    : budget;
 };
 import { type RawGoogleChunk, normalizeGoogleStream } from './stream.ts';
 
