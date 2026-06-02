@@ -2994,6 +2994,70 @@ describe('repl — slash commands integration', () => {
     expect(await promise).toBe(130);
   });
 
+  test('slash playbook forwards the resolved provider-effort to runSubagent', async () => {
+    // Companion to the temperature forward: /<playbook> dispatch must
+    // honor the operator's /effort (or configured default) like the
+    // foreground task_* path. Without it the child runs at the provider
+    // default while the footer + /effort confirmation say it is active.
+    const stub = makeBootstrapStub();
+    (stub.config as { effort?: string }).effort = 'max';
+
+    const fakeDef = {
+      name: 'fake',
+      description: 'fake subagent for tests',
+      tools: [],
+      budget: { maxSteps: 1, maxCostUsd: 0.01 },
+      systemPrompt: 'noop',
+      scope: 'project',
+      isolation: 'none',
+      sourcePath: '/dev/null',
+      sourceSha256: '0'.repeat(64),
+      slash: 'fake',
+    };
+    (stub.subagents.byName as Map<string, unknown>).set('fake', fakeDef);
+
+    let capturedProviderEffort: string | undefined;
+    const fakeRunSubagent = async (
+      input: Parameters<typeof import('../../src/subagents/index.ts').runSubagent>[0],
+    ): ReturnType<typeof import('../../src/subagents/index.ts').runSubagent> => {
+      capturedProviderEffort = input.providerEffort;
+      return {
+        output: '(no-op)',
+        sessionId: 'sess-fake-child',
+        status: 'done',
+        reason: 'done',
+        costUsd: 0,
+        steps: 0,
+        durationMs: 0,
+      };
+    };
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      runSubagentOverride: fakeRunSubagent,
+    });
+    await tick();
+
+    stdin.feed('/fake go\r');
+    await tick();
+    await tick();
+    await flushFrame();
+
+    // effort 'max' on the session config → resolveProviderEffort → 'max'
+    // flows to the child, matching the foreground task_* spawn path.
+    expect(capturedProviderEffort).toBe('max');
+
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('/quit during a slash playbook aborts and waits for the dispatch before db.close', async () => {
     // Regression: runPlaybook started a long-lived runSubagent
     // await that the shutdown path neither aborted nor awaited

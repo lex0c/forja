@@ -21,6 +21,7 @@
 
 import { existsSync } from 'node:fs';
 import { basename, join } from 'node:path';
+import { resolveProviderEffort } from '../harness/effort.ts';
 import { type HarnessConfig, type HarnessResult, runAgent } from '../harness/index.ts';
 import { effectiveBudget, resolveMaxOutputTokens } from '../harness/types.ts';
 import { dispatchChain } from '../hooks/dispatcher.ts';
@@ -1733,6 +1734,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // before the runtime's `setSubagentPayload` /
         // `reclassifySessionStatus` writes land or have nothing
         // to wait on at all.
+        // Resolve once (the spread needs a narrowed const): explicit
+        // providerEffort wins — none on the main session — else derive
+        // from baseConfig.effort (the operator's /effort or default).
+        const childProviderEffort = resolveProviderEffort(baseConfig);
         const dispatchPromise = runSubagentImpl({
           definition,
           prompt,
@@ -1759,6 +1764,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           // object) is observed; reading temperature too keeps
           // the precedence ladder honest.
           ...(baseConfig.temperature !== undefined ? { temperature: baseConfig.temperature } : {}),
+          // Forward the resolved provider-effort so /<playbook>
+          // dispatch honors the operator's /effort (or configured
+          // default) — same as the foreground task_* spawn path
+          // (harness/loop.ts forwards resolveProviderEffort(config)).
+          // Without this the child runs at the provider default while
+          // the footer + /effort confirmation say a level is active.
+          // Carries ONLY the provider axis; operational caps stay
+          // per-playbook (child gets providerEffort, never effort).
+          ...(childProviderEffort !== undefined ? { providerEffort: childProviderEffort } : {}),
           // Hook chain snapshot. The foreground task_* spawn path
           // in harness/loop.ts forwards config.hooks as
           // hooksSnapshot so the child uses the parent's validated
