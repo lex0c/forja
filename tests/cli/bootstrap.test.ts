@@ -707,7 +707,9 @@ When the goal is to orient in a new repo.
     expect(config.systemPrompt).not.toContain('- [project_local]');
     expect(config.systemPrompt).not.toContain('- [project_shared]');
     expect(config.systemPrompt).not.toContain('- [user]');
-    expect(config.systemPrompt).not.toContain('[seed]');
+    // The header explains the `[seed]` marker in prose, so match the
+    // rendered entry marker (` [seed] —`) rather than the bare token.
+    expect(config.systemPrompt).not.toContain(' [seed] —');
     // And the registry is still threaded through for tools.
     expect(config.memoryRegistry).toBeDefined();
     expect(config.memoryRegistry?.list()).toEqual([]);

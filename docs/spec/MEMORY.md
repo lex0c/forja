@@ -501,7 +501,7 @@ Seed nunca é mandatório.
 
 #### 5.7.7 Limites
 
-- **Hard cap: 10 entradas no pack default vendor.** Se crescer, virou doc — move pra skill ou playbook.
+- **Hard cap: 11 entradas no pack default vendor.** Se crescer, virou doc — move pra skill ou playbook.
 - Body < 30 linhas. Maior que isso, é conhecimento estruturado, não memória.
 - Sem `expires` — seed é semântica estável; se envelheceu, sobe versão.
 - `trust: trusted` sempre. Seed `untrusted` é contradição.
@@ -512,6 +512,7 @@ Esboço calibrado contra doctrine do KB do user (fontes na última coluna). Hard
 
 | Name | Conteúdo essencial | Fonte |
 |---|---|---|
+| `measure-twice-cut-once` | Due-diligence antes de efeito colateral persistente: medir o estado real do alvo antes de agir, manter a ação reversível (checkpoint/fallback), e declarar o não-medido (not_checked/assumptions/confidence). Guarda-chuva dos demais seeds — o teste geral pra quando nenhum específico cobre | core (`AGENTIC_CLI §1`) |
 | `safe-edit-discipline` | Ler arquivo antes de propor Edit (mesmo se leu em sessão anterior). Em arquivo existente: Edit. Write só pra arquivo novo ou rewrite completo | core |
 | `prefer-specialized-navigation` | Usar tool dedicada (Read/Edit/Grep/Glob) em vez de Bash quando existir. Em arquivo > 200 linhas, **grep + read targeted** (offset/limit ao redor do match) em vez de ler arquivo inteiro | `TOOL_ERGONOMICS.md` + `NAVIGATION.md §2.1-2.2` |
 | `git-first-orientation` | Sessão fresca em repo git começa com `git status` + `git log --oneline -10` antes de explorar FS. Investigação de bug/mudança recente: git é primitiva de navegação temporal (`git log -S`, `git blame`, `git diff <ref>`), não só de versionamento | `NAVIGATION.md §2.5` |
@@ -534,6 +535,7 @@ Cada um com `Why/How to apply` no formato da §1.2.
 - `scope-discipline` absorve "no refactor in bugfix" + "entropy budget" (mesma família)
 - `failure-root-cause` absorve "no test for fake coverage" (mesma raiz: não fingir que problema sumiu)
 - **Novo:** `git-first-orientation` (de `NAVIGATION.md §2.5`) — git como primitiva de orientação inicial, não só versionamento
+- **Novo:** `measure-twice-cut-once` (de `AGENTIC_CLI §1`, premissa-raiz "meça duas vezes, corte uma") — seed guarda-chuva: o teste geral de due-diligence pra quando nenhum dos específicos cobre o caso. Cap §5.7.7 subido 10→11 pra acomodar a premissa-raiz como seed de primeira classe
 
 **Notas do KB promovidas pra `skills/` ou `PLAYBOOKS.md` em vez de seed** (envelhecem ou são situacionais demais):
 - `PREMATURE_OPTIMIZATION.md` → playbook (não comportamental day-zero; vira útil sob trigger "performance")
@@ -554,7 +556,7 @@ Cada um com `Why/How to apply` no formato da §1.2.
 | Seed com convenção de projeto ("use kebab-case") | Não é universal; pertence a project memory |
 | Seed > 30 linhas | Virou playbook; move pra `PLAYBOOKS.md` ou `skills/` |
 | Seed pra "personalidade" do agente | Cargo cult; sem efeito comportamental concreto |
-| Pack default > 10 entradas | Bloat; cada seed custa contexto em toda sessão pra sempre |
+| Pack default > 11 entradas | Bloat; cada seed custa contexto em toda sessão pra sempre |
 | Seed que duplica conteúdo de AGENTIC_CLI.md | Redundância; doc já tá no contexto base |
 | Seed sem `seed_version` | Upgrade futuro vai stompar customizações silenciosamente |
 | Mandar inferred write virar seed ("isso é tão bom que vira default") | Quebra modelo de origem; promove ruído de sessão a default global |

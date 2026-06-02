@@ -1,6 +1,6 @@
 ---
 name: respect-repo-conventions
-description: convenções vêm do repo (git log, configs), nunca de defaults genéricos
+description: conventions come from the repo (git log, configs), never from generic defaults
 type: feedback
 source: seed
 seed_origin: vendor
@@ -8,28 +8,28 @@ seed_version: "1.0"
 trust: trusted
 ---
 
-Convenção de commit message, lint, format, naming e estrutura de
-arquivo vem do repo — `git log`, configs existentes, arquivos
-adjacentes — nunca de default genérico do agente.
+Commit message, lint, format, naming, and file-structure conventions
+come from the repo — `git log`, existing configs, adjacent files —
+never from the agent's generic default.
 
-**Why:** convenções genéricas (Conventional Commits, Prettier
-defaults, "use kebab-case porque AI") frequentemente conflitam com a
-convenção real do repo. Aplicar convenção errada cria churn (diff
-cheio de mudanças cosméticas não pedidas), atrapalha code review,
-e sinaliza falta de atenção ao contexto. `git log` revela o estilo
-do repo em segundos.
+**Why:** generic conventions (Conventional Commits, Prettier defaults,
+"use kebab-case because AI") often conflict with the repo's real
+convention. Applying the wrong one creates churn (a diff full of
+unrequested cosmetic changes), hampers code review, and signals a lack
+of attention to context. `git log` reveals the repo's style in
+seconds.
 
 **How to apply:**
-- Antes de propor mensagem de commit: `git log --oneline -20` pra
-  inferir formato (Conventional Commits? Title Case verbo? lowercase?
-  com scope? sem?)
-- Lint/format: respeitar configs presentes (`.eslintrc`, `.prettierrc`,
-  `.editorconfig`, `ruff.toml`, `rustfmt.toml`) — não impor
-  formatação não configurada
-- Naming: ler nomes próximos no diretório, não impor convenção por
-  linguagem
-- Estrutura de arquivo novo: casar com pares do mesmo diretório
-- `CLAUDE.md`/`AGENTS.md`/`CONTRIBUTING.md` no repo: ler antes de
-  propor mudança que toque convenção
-- Se convenção do repo é ruim por critério externo: apontar ao user
-  separadamente, **não** corrigir de surpresa no PR
+- Before proposing a commit message: `git log --oneline -20` to infer
+  the format (Conventional Commits? Title Case verb? lowercase? with
+  scope? without?)
+- Lint/format: respect present configs (`.eslintrc`, `.prettierrc`,
+  `.editorconfig`, `ruff.toml`, `rustfmt.toml`) — do not impose
+  unconfigured formatting
+- Naming: read nearby names in the directory, do not impose a
+  per-language convention
+- New file structure: match peers in the same directory
+- `CLAUDE.md`/`AGENTS.md`/`CONTRIBUTING.md` in the repo: read before
+  proposing a change that touches a convention
+- If the repo's convention is bad by an external standard: flag it to
+  the user separately, do **not** fix it by surprise in the PR

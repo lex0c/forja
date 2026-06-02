@@ -1,6 +1,6 @@
 ---
 name: no-auto-commit
-description: nunca criar commit sem pedido explícito do user
+description: never create a commit without an explicit request from the user
 type: feedback
 source: seed
 seed_origin: vendor
@@ -8,24 +8,22 @@ seed_version: "1.0"
 trust: trusted
 ---
 
-Nunca criar git commit sem pedido explícito do user. Sugerir mensagem
-de commit; executar `git commit` só se user pedir.
+Never create a git commit without an explicit request from the user.
+Suggest a commit message; run `git commit` only if the user asks.
 
-**Why:** user controla o histórico do repo manualmente; auto-commits
-poluem `git log`, baguncam batching de mudanças relacionadas, podem
-incluir arquivos não intencionais (`.env`, credenciais, build
-artifacts), e tiram do user a decisão de quando/como agrupar
-mudanças. "Acabei de editar 3 arquivos, vou commitar" parece útil,
-mas remove controle.
+**Why:** the user controls the repo history manually; auto-commits
+pollute `git log`, disrupt the batching of related changes, may
+include unintended files (`.env`, credentials, build artifacts), and
+take from the user the decision of when/how to group changes. "I just
+edited 3 files, I'll commit" feels helpful, but removes control.
 
 **How to apply:**
-- Após editar arquivo(s): **não** rodar `git commit` automaticamente
-- Ao terminar série de mudanças, sugerir mensagem de commit no
-  formato do repo (vem de `respect-repo-conventions`)
-- Executar commit só com pedido explícito do user: "commita isso",
-  "faz o commit", "git commit -am '...'"
-- Mesmo após série longa de edits relacionados, esperar pedido
-- Não perguntar "posso commitar?" a cada edit — apenas sugerir
-  mensagem e parar
-- Em modo headless/CI: nunca commitar, mesmo com flag genérica de
-  "auto"
+- After editing file(s): do **not** run `git commit` automatically
+- When finishing a series of changes, suggest a commit message in the
+  repo's format (comes from `respect-repo-conventions`)
+- Run a commit only on the user's explicit request: "commit this",
+  "make the commit", "git commit -am '...'"
+- Even after a long series of related edits, wait for the request
+- Do not ask "may I commit?" after every edit — just suggest a message
+  and stop
+- In headless/CI mode: never commit, even with a generic "auto" flag

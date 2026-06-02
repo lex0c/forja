@@ -2,6 +2,40 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-02] memory prompt: make `[seed]` entries operative (close the seed-incentive gap)
+
+**Motivation.** An audit of the system-prompt assembly (`src/cli/memory-prompt.ts`) found the eager `# Memory` section framed every entry — including vendor `[seed]` entries — as reference the model "can use", with save-guidance + a verify-before-act caution, but NO incentive to apply them. Seeds are behavioral meta-rules meant to be followed, yet (a) their bodies are lazy (only the one-line hook is eager; the Why/How-to-apply loads only via `memory_read`) and (b) the `[seed]` marker's only stated job was authority transparency (`memory-prompt.ts:317`). Net: a behavioral seed could sit in the index unread and unapplied. (Note: the root premise "measure twice, cut once" is exempt — it's hard-coded in `IDENTITY_PROMPT`, the always-first frame — but the other 10 seeds depend on being read.)
+
+**Change.** Add one directive paragraph to `MEMORY_SECTION_HEADER`: entries tagged `[seed]` are vendor-curated default disciplines; treat them as operative — when a seed's hook bears on the action at hand, `memory_read` its body and apply it — defaults an operator memory or explicit instruction can override. This keeps the content-lazy architecture (spec §4.1 "index eager, content lazy") and adds the missing "operative, consult them" framing + the precedence rule, at ~1 paragraph of prompt cost.
+
+**Rejected: eager-load seed bodies.** Inlining every seed body was rejected — it contradicts §4.1 and the §5.7.7 cap rationale ("each seed costs context every session forever"), multiplying the per-session seed cost ~25× (11 bodies × ~25 lines). Lazy-with-a-nudge preserves the budget.
+
+**Tests.** `memory-prompt.test.ts`: + a positive assertion that the directive renders; the "operator eclipses seed → no marker" assertion tightened from the bare `[seed]` token to the entry-specific marker (the header now mentions `[seed]` in prose). `bootstrap.test.ts`: the header-only assertion likewise matches the rendered entry marker (` [seed] —`) instead of the bare token. Verification: `memory-prompt` + `bootstrap` + `memory` + `provenance-trail` + `lifecycle` 174 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
+**Spec follow-up.** `[seed]` semantics live in MEMORY §5.7.3 (transparency marker) + §4.1 (index-eager) + the §1.2 prompt skeleton; documenting the "operative meta-behavior" framing there is a deferred reconciliation (prose iterated in code first, per the UX-before-spec convention).
+
+## [2026-06-02] seeds: translate the vendor pack to English (src/ language policy)
+
+**Goal.** The 11 vendor seeds (`src/cli/init-seeds/*.md`) shipped in PT-BR, which violates the project language policy — everything under `src/` is English; only `docs/spec/` stays PT-BR. Rewrite all seed bodies + frontmatter descriptions in English. The `docs/spec/MEMORY.md §5.7.8` catalog table stays PT-BR (spec is the architect's PT-BR material, not translated without an explicit request).
+
+**Scope.** All 11 `.md` bodies + `description` fields, kept semantically identical (same rules, same **Why** / **How to apply** structure, ≤30-line cap). Tool/command identifiers (`Edit`, `Write`, `Grep`, `--no-verify`, git invocations) and the `name` slugs were already English — unchanged. `seed_version` stays `"1.0"`: pre-release, no installed base to migrate, and the catalog test pins `"1.0"`.
+
+**Sync + safety.** Each `index.ts` `CANONICAL_SEEDS` entry's `description` updated to byte-match its `.md` frontmatter (the catalog test asserts equality). Descriptions kept colon-free (frontmatter-safe) and apostrophe-free in `no-auto-commit` (single-quoted JS literal). Verified no other coupling first: no test asserts PT-BR seed body text, none imports the bodies — the only consumers read `CANONICAL_SEEDS.length`.
+
+**Tests.** No test changes needed — `tests/cli/init-seeds.test.ts` re-validates description↔frontmatter equality + body ≤30 over the new English content. Verification: `tests/cli/init-seeds` + `seeds-installer` + `memory` + `slash/memory` 290 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
+## [2026-06-02] seed `measure-twice-cut-once` — umbrella due-diligence seed (vendor pack 10→11)
+
+**Goal.** Ship the project's root premise ("measure twice, cut once" / due-diligence) as a first-class vendor seed. Operator chose to raise the §5.7.7 hard cap 10→11 (over merging into an existing seed) so the umbrella principle ships as its own behavioral seed rather than staying implicit across the 10 specifics.
+
+**Why a seed, not a doctrinal echo.** The existing 10 seeds are each *instances* of measure-twice — `confirm-blast-radius` (map blast radius before the cut), `safe-edit-discipline` (read before edit), `no-fabrication` (verify before asserting), `failure-root-cause` (diagnose before fixing). What none states is the *general* test for ANY persistent side effect, plus the "declare the unmeasured" disclosure (`not_checked` / `assumptions` / `confidence`) and the reversible-with-fallback rule. The seed is written as that actionable general test — deliberately NOT a restatement of `AGENTIC_CLI §1` (which §5.7.10 flags as an anti-pattern: "seed que duplica AGENTIC_CLI.md").
+
+**Cap bump (spec change, operator-authorized).** `docs/spec/MEMORY.md`: §5.7.7 hard cap 10→11; §5.7.10 anti-pattern row "Pack default > 10" → "> 11"; §5.7.8 catalog table gains the `measure-twice-cut-once` lead/umbrella row + a "**Novo:**" note recording the 10→11 rationale. The cap's reasoning (each seed costs context every session) still holds at 11; the root premise earns the marginal slot.
+
+**Code.** New `src/cli/init-seeds/measure-twice-cut-once.md` (frontmatter `source: seed` / `vendor` / `"1.0"` / `trusted`; body within the 30-line cap; description uses an em-dash, not `:`, to stay frontmatter-safe). Registered in `src/cli/init-seeds/index.ts` (import + entry, alphabetical between `git-first-orientation` and `no-auto-commit`); cap comments bumped 10→11 / 11→12. `docs/MEMORY.md` §7.5 + the layout illustration refreshed 10→11 (incl. the derived `N more` / `N wrote` examples); the milestone-history note at the file's tail left as the point-in-time record it is.
+
+**Tests.** `tests/cli/init-seeds.test.ts`: length assertions + titles 10→11. The catalog's existing gates (seed cross-field frontmatter, body ≤30, name/description match the index entry, unique + alphabetically-ordered filenames) cover the new seed unchanged. No other consumer hardcoded the count — `seeds-installer` / `memory` / `slash/memory` tests all read `CANONICAL_SEEDS.length`. Verification: `tests/cli/init-seeds` 8 pass; `tests/memory/seeds-installer` + `tests/cli/memory` + `tests/cli/slash/memory` 282 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
 ## [2026-06-01] effort — agnostic reasoning + operational effort level (`/effort`)
 
 **Goal.** A single `effort` knob (`low | medium | high | max`) that drives TWO axes at once, per the operator design tenet "provider effort controls the model's internal depth; harness effort controls the amount of operational work." Session-scoped (in memory, next-turn — like `/model`/`/budget`); no config/DB persistence (operator decided in-memory only). Provider-agnostic by construction: one abstraction, a small per-adapter translation, so adding a provider is ~4 lines, not a special case.

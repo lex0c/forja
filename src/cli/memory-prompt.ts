@@ -119,6 +119,8 @@ Four types of memory exist; use the type that fits and resist saving anything th
 
 Do NOT save: code patterns, conventions, file paths, or architecture (re-read the code); git history or who-changed-what (\`git log\` is authoritative); fix recipes (the fix is in the code); ephemeral session state. These all rot or are reconstructible — saving them grows the index without adding signal.
 
+Entries tagged \`[seed]\` are vendor-curated default disciplines (how to work, not facts to verify). Treat them as operative: when a seed's one-line hook bears on the action at hand, \`memory_read\` its body and apply it — they are defaults an operator memory or explicit instruction can override.
+
 Before acting on a FACTUAL memory (file paths, exported names, schema shape), verify it against the current code with grep / read_file. If reality has drifted from the memory, update or discard the memory rather than acting on stale info. PREFERENCE memories (commit style, naming conventions) have no "current state" to verify against — proceed without re-checking.`;
 
 export interface AssembleMemorySectionInput {

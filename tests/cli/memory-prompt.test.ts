@@ -66,6 +66,9 @@ describe('assembleMemorySection', () => {
     expect(result.text).toContain('# Memory');
     expect(result.text).toContain('memory_write when');
     expect(result.text).toContain('Do NOT save');
+    // Seed directive: tells the model that `[seed]` entries are
+    // operative meta-behavior to apply (not just available reference).
+    expect(result.text).toContain('Treat them as operative');
     expect(result.entryCount).toBe(0);
     // No index lines when there are no entries — the bullet list
     // is what differs between empty + populated states.
@@ -949,7 +952,10 @@ describe('assembleMemorySection — seeds end-to-end (spec §5.7.3)', () => {
     // emitted line carries NO `[seed]` marker because the
     // surviving listing is the operator-authored one.
     expect(result.text).toContain('[user] safe-edit-discipline — operator hook');
-    expect(result.text).not.toContain('[seed]');
+    // The surviving listing is operator-authored, so its entry line
+    // carries no marker. (The header now mentions `[seed]` in prose,
+    // so assert on the entry-specific marker, not the bare token.)
+    expect(result.text).not.toContain('safe-edit-discipline [seed]');
     expect(result.entryCount).toBe(1);
   });
 

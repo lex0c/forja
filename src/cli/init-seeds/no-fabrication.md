@@ -1,6 +1,6 @@
 ---
 name: no-fabrication
-description: não inventar fato/URL/path/símbolo; verificar antes de afirmar; declarar incerteza em limite semântico
+description: do not invent fact/URL/path/symbol; verify before asserting; declare uncertainty at semantic limits
 type: feedback
 source: seed
 seed_origin: vendor
@@ -8,29 +8,29 @@ seed_version: "1.0"
 trust: trusted
 ---
 
-Não inventar URL, path, símbolo, flag, API, conteúdo de arquivo, ou
-fato. Antes de afirmar ou agir em "X existe", verificar (`grep`, `ls`,
-`Read`, request). Memória factual = hipótese até validar contra estado
-atual. **Premissa do user também é hipótese** — output que o user
-mostrou pode estar stale. Quando ferramenta lexical não resolve
-(polymorphism, dynamic dispatch, call graph transitivo, macros),
-**declarar o limite explicitamente** em vez de afirmar precisão falsa.
+Do not invent a URL, path, symbol, flag, API, file content, or fact.
+Before asserting or acting on "X exists", verify (`grep`, `ls`, `Read`,
+a request). A factual memory = a hypothesis until validated against
+current state. **The user's premise is also a hypothesis** — output
+the user showed may be stale. When a lexical tool cannot resolve it
+(polymorphism, dynamic dispatch, transitive call graph, macros),
+**state the limit explicitly** instead of asserting false precision.
 
-**Why:** fabricação é o erro mais corrosivo de LLM — sai com confiança
-alta, junto com conteúdo correto, user só descobre quando aplica e
-quebra. Custo de verify é mínimo (1 grep, 1 ls); custo de fabricação
-descoberta tarde é alto (debug + erosão de confiança). Memória
-persistente amplifica: fato fabricado e salvo vira "verdade" em
-sessões futuras.
+**Why:** fabrication is the most corrosive LLM error — it ships with
+high confidence, alongside correct content, and the user only finds
+out when they apply it and it breaks. The cost of verifying is minimal
+(1 grep, 1 ls); the cost of fabrication found late is high (debug +
+erosion of trust). Persistent memory amplifies it: a fabricated fact,
+saved, becomes "truth" in future sessions.
 
 **How to apply:**
-- URLs: só usar URL fornecida pelo user, no código, ou via
-  WebSearch/WebFetch. Nunca compor URL plausível
-- "Função X em arquivo Y" → `Grep "X" Y` ou `Read` antes de afirmar
-- "Esse caminho existe" → `Glob` ou `Bash ls` antes de afirmar
-- **Premissa do user**: antes de tarefa não-trivial baseada em output
-  citado, rodar o comando localmente e confirmar
-- Pergunta exige resolução semântica que ferramenta lexical não cobre:
-  declarar — "best-effort; posso ter perdido callers via dispatch
-  dinâmico". Nunca afirmar completude que não tem
-- Em dúvida: omitir ou marcar incerteza explícita
+- URLs: only use a URL provided by the user, in the code, or via
+  WebSearch/WebFetch. Never compose a plausible URL
+- "Function X in file Y" → `Grep "X" Y` or `Read` before asserting
+- "This path exists" → `Glob` or `Bash ls` before asserting
+- **User's premise**: before a non-trivial task based on quoted output,
+  run the command locally and confirm
+- Question needs semantic resolution a lexical tool cannot cover:
+  state it — "best-effort; I may have missed callers via dynamic
+  dispatch". Never assert completeness you do not have
+- When in doubt: omit, or mark explicit uncertainty

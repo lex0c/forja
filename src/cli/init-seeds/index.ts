@@ -1,5 +1,5 @@
 // Bundled canonical vendor seeds (MEMORY.md §5.7.8 — vendor seed
-// catalog). The 10 .md files in this directory are imported as text
+// catalog). The 11 .md files in this directory are imported as text
 // assets at build time and exposed as a stable array; the bootstrap
 // installer (`src/memory/seeds-installer.ts`) writes them into the
 // user scope's `<user>/seeds/` subdirectory on first invocation.
@@ -10,8 +10,8 @@
 // `*.md` declaration in `../init-playbooks/playbooks.d.ts` already
 // covers these imports project-wide — no separate declaration here.
 //
-// Hard cap (spec §5.7.7): MAX 10 entries in the default vendor pack.
-// If a future seed would push the count to 11, that's the moment to
+// Hard cap (spec §5.7.7): MAX 11 entries in the default vendor pack.
+// If a future seed would push the count to 12, that's the moment to
 // move it into a skill or playbook instead — the seed surface costs
 // context in every session and should not bloat.
 //
@@ -29,6 +29,7 @@
 import confirmBlastRadiusMd from './confirm-blast-radius.md' with { type: 'text' };
 import failureRootCauseMd from './failure-root-cause.md' with { type: 'text' };
 import gitFirstOrientationMd from './git-first-orientation.md' with { type: 'text' };
+import measureTwiceCutOnceMd from './measure-twice-cut-once.md' with { type: 'text' };
 import noAutoCommitMd from './no-auto-commit.md' with { type: 'text' };
 import noFabricationMd from './no-fabrication.md' with { type: 'text' };
 import preferSpecializedNavigationMd from './prefer-specialized-navigation.md' with {
@@ -69,28 +70,37 @@ export const CANONICAL_SEEDS: ReadonlyArray<CanonicalSeed> = [
   {
     filename: 'confirm-blast-radius.md',
     name: 'confirm-blast-radius',
-    description: 'ações irreversíveis ou de raio amplo exigem mapeamento de impacto + confirmação',
+    description:
+      'irreversible or wide-reaching actions require impact mapping + explicit confirmation',
     version: '1.0',
     content: confirmBlastRadiusMd,
   },
   {
     filename: 'failure-root-cause.md',
     name: 'failure-root-cause',
-    description: 'erro/teste falhando exige causa raiz; nunca bypass silencioso',
+    description: 'a failing error/test demands root cause; never a silent bypass',
     version: '1.0',
     content: failureRootCauseMd,
   },
   {
     filename: 'git-first-orientation.md',
     name: 'git-first-orientation',
-    description: 'sessão fresca em repo git começa por git status + git log -10',
+    description: 'a fresh session in a git repo starts with git status + git log -10',
     version: '1.0',
     content: gitFirstOrientationMd,
   },
   {
+    filename: 'measure-twice-cut-once.md',
+    name: 'measure-twice-cut-once',
+    description:
+      'due-diligence before any persistent side effect — measure the target, keep it reversible, declare the unmeasured (not_checked/assumptions/confidence)',
+    version: '1.0',
+    content: measureTwiceCutOnceMd,
+  },
+  {
     filename: 'no-auto-commit.md',
     name: 'no-auto-commit',
-    description: 'nunca criar commit sem pedido explícito do user',
+    description: 'never create a commit without an explicit request from the user',
     version: '1.0',
     content: noAutoCommitMd,
   },
@@ -98,28 +108,28 @@ export const CANONICAL_SEEDS: ReadonlyArray<CanonicalSeed> = [
     filename: 'no-fabrication.md',
     name: 'no-fabrication',
     description:
-      'não inventar fato/URL/path/símbolo; verificar antes de afirmar; declarar incerteza em limite semântico',
+      'do not invent fact/URL/path/symbol; verify before asserting; declare uncertainty at semantic limits',
     version: '1.0',
     content: noFabricationMd,
   },
   {
     filename: 'prefer-specialized-navigation.md',
     name: 'prefer-specialized-navigation',
-    description: 'tool dedicada > Bash; grep + read targeted > read inteiro em arquivo grande',
+    description: 'dedicated tool > Bash; grep + targeted read > whole-file read on large files',
     version: '1.0',
     content: preferSpecializedNavigationMd,
   },
   {
     filename: 'respect-repo-conventions.md',
     name: 'respect-repo-conventions',
-    description: 'convenções vêm do repo (git log, configs), nunca de defaults genéricos',
+    description: 'conventions come from the repo (git log, configs), never from generic defaults',
     version: '1.0',
     content: respectRepoConventionsMd,
   },
   {
     filename: 'safe-edit-discipline.md',
     name: 'safe-edit-discipline',
-    description: 'ler antes de Edit; Edit em existente, Write so para novo ou rewrite completo',
+    description: 'read before Edit; Edit on existing, Write only for new files or full rewrites',
     version: '1.0',
     content: safeEditDisciplineMd,
   },
@@ -127,14 +137,14 @@ export const CANONICAL_SEEDS: ReadonlyArray<CanonicalSeed> = [
     filename: 'scope-discipline.md',
     name: 'scope-discipline',
     description:
-      'ficar no escopo pedido; bugfix ≠ cleanup; sem abstração antes da terceira repetição',
+      'stay within the requested scope; bugfix ≠ cleanup; no abstraction before the third repetition',
     version: '1.0',
     content: scopeDisciplineMd,
   },
   {
     filename: 'secret-handling.md',
     name: 'secret-handling',
-    description: 'nunca commitar/salvar credenciais; redact em output',
+    description: 'never commit/save credentials; redact in output',
     version: '1.0',
     content: secretHandlingMd,
   },

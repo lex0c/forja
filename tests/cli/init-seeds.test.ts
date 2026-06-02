@@ -12,9 +12,9 @@ import { runInit } from '../../src/cli/init.ts';
 import { SEED_BODY_MAX_LINES, parseMemoryFile } from '../../src/memory/frontmatter.ts';
 
 describe('CANONICAL_SEEDS — bundled vendor seed catalog', () => {
-  test('ships exactly 10 seeds (spec §5.7.7 hard cap)', () => {
-    expect(CANONICAL_SEEDS.length).toBeLessThanOrEqual(10);
-    expect(CANONICAL_SEEDS).toHaveLength(10);
+  test('ships exactly 11 seeds (spec §5.7.7 hard cap)', () => {
+    expect(CANONICAL_SEEDS.length).toBeLessThanOrEqual(11);
+    expect(CANONICAL_SEEDS).toHaveLength(11);
   });
 
   test('each canonical seed parses cleanly with seed cross-field rules', () => {
@@ -102,7 +102,7 @@ describe('agent init seeds — installs vendor catalog under user scope', () => 
     }
   });
 
-  test('runInit with only=[seeds] writes the 10 canonical bodies + index + manifest', () => {
+  test('runInit with only=[seeds] writes the 11 canonical bodies + index + manifest', () => {
     const cwd = mkdtempSync(join(tmpdir(), 'forja-init-seeds-'));
     const userHome = mkdtempSync(join(tmpdir(), 'forja-init-seeds-xdg-'));
     cleanup.push(cwd, userHome);
