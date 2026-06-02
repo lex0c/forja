@@ -2,6 +2,18 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-02] memory prompt: make `[seed]` entries operative (close the seed-incentive gap)
+
+**Motivation.** An audit of the system-prompt assembly (`src/cli/memory-prompt.ts`) found the eager `# Memory` section framed every entry — including vendor `[seed]` entries — as reference the model "can use", with save-guidance + a verify-before-act caution, but NO incentive to apply them. Seeds are behavioral meta-rules meant to be followed, yet (a) their bodies are lazy (only the one-line hook is eager; the Why/How-to-apply loads only via `memory_read`) and (b) the `[seed]` marker's only stated job was authority transparency (`memory-prompt.ts:317`). Net: a behavioral seed could sit in the index unread and unapplied. (Note: the root premise "measure twice, cut once" is exempt — it's hard-coded in `IDENTITY_PROMPT`, the always-first frame — but the other 10 seeds depend on being read.)
+
+**Change.** Add one directive paragraph to `MEMORY_SECTION_HEADER`: entries tagged `[seed]` are vendor-curated default disciplines; treat them as operative — when a seed's hook bears on the action at hand, `memory_read` its body and apply it — defaults an operator memory or explicit instruction can override. This keeps the content-lazy architecture (spec §4.1 "index eager, content lazy") and adds the missing "operative, consult them" framing + the precedence rule, at ~1 paragraph of prompt cost.
+
+**Rejected: eager-load seed bodies.** Inlining every seed body was rejected — it contradicts §4.1 and the §5.7.7 cap rationale ("each seed costs context every session forever"), multiplying the per-session seed cost ~25× (11 bodies × ~25 lines). Lazy-with-a-nudge preserves the budget.
+
+**Tests.** `memory-prompt.test.ts`: + a positive assertion that the directive renders; the "operator eclipses seed → no marker" assertion tightened from the bare `[seed]` token to the entry-specific marker (the header now mentions `[seed]` in prose). `bootstrap.test.ts`: the header-only assertion likewise matches the rendered entry marker (` [seed] —`) instead of the bare token. Verification: `memory-prompt` + `bootstrap` + `memory` + `provenance-trail` + `lifecycle` 174 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
+**Spec follow-up.** `[seed]` semantics live in MEMORY §5.7.3 (transparency marker) + §4.1 (index-eager) + the §1.2 prompt skeleton; documenting the "operative meta-behavior" framing there is a deferred reconciliation (prose iterated in code first, per the UX-before-spec convention).
+
 ## [2026-06-02] seeds: translate the vendor pack to English (src/ language policy)
 
 **Goal.** The 11 vendor seeds (`src/cli/init-seeds/*.md`) shipped in PT-BR, which violates the project language policy — everything under `src/` is English; only `docs/spec/` stays PT-BR. Rewrite all seed bodies + frontmatter descriptions in English. The `docs/spec/MEMORY.md §5.7.8` catalog table stays PT-BR (spec is the architect's PT-BR material, not translated without an explicit request).
