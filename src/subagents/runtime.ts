@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import type { HarnessEvent } from '../harness/index.ts';
 import type { HookSpec } from '../hooks/types.ts';
 import type { PermissionEngine } from '../permissions/index.ts';
-import type { Provider } from '../providers/index.ts';
+import type { Provider, ProviderEffort } from '../providers/index.ts';
 import {
   type DB,
   type SubagentProcessExitReason,
@@ -226,6 +226,11 @@ export interface RunSubagentInput {
   // failure synthetic events.
   onEvent?: (event: unknown) => void;
   temperature?: number;
+  // Provider reasoning-effort the parent forwards so the child
+  // inherits the operator's `/effort` reasoning depth (carried to the
+  // subprocess via `--subagent-effort`). Operational caps are NOT
+  // forwarded — those stay per-playbook.
+  providerEffort?: ProviderEffort;
   subagentRegistry?: SubagentSet;
   // Trust verdict from the parent's bootstrap (spec §9). Forwarded
   // via `--subagent-cwd-trusted` to the child process so the
@@ -750,6 +755,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       // parent's: same shared, same local, same user scope.
       memoryCwd: input.cwd,
       ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
+      ...(input.providerEffort !== undefined ? { providerEffort: input.providerEffort } : {}),
       ...(input.cwdTrusted === true ? { cwdTrusted: true } : {}),
       ...(input.sharedScopeOffline === true ? { sharedScopeOffline: true } : {}),
       // Forward the IPC opt-in. The default spawn factory

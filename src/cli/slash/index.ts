@@ -10,6 +10,7 @@ import { agentPolicyCommand } from './commands/agent-policy.ts';
 import { budgetCommand } from './commands/budget.ts';
 import { clearCommand } from './commands/clear.ts';
 import { costCommand } from './commands/cost.ts';
+import { effortCommand } from './commands/effort.ts';
 import { buildHelpCommand } from './commands/help.ts';
 import { historyCommand } from './commands/history.ts';
 import { hooksCommand } from './commands/hooks.ts';
@@ -58,6 +59,7 @@ export const createBuiltinRegistry = (subagents?: SubagentSet): SlashRegistry =>
     subagentsCommand,
     modelCommand,
     budgetCommand,
+    effortCommand,
     permsCommand,
     historyCommand,
     memoryCommand,

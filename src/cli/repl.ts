@@ -757,7 +757,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // undefined, and the ctx omits the field — TUI then correctly
   // shows uncapped, matching the harness's skipped gate).
   const buildAdapterCtx = () => {
-    const budget = effectiveBudget(baseConfig.budget);
+    const budget = effectiveBudget(baseConfig.budget, baseConfig.effort);
     return {
       project,
       model: baseConfig.provider.id,
@@ -2646,7 +2646,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     version: VERSION,
     model: modelId,
     contextWindow: providerCaps.context_window,
-    maxOutputTokens: resolveMaxOutputTokens(effectiveBudget(baseConfig.budget), providerCaps),
+    maxOutputTokens: resolveMaxOutputTokens(
+      effectiveBudget(baseConfig.budget, baseConfig.effort),
+      providerCaps,
+    ),
     cwd: baseConfig.cwd,
     env,
     // Seed the footer's operation-mode cue from the engine's posture so

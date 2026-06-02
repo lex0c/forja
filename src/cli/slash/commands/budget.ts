@@ -22,35 +22,31 @@ import {
   MAX_CONCURRENT_SUBAGENTS_CAP,
   MAX_CONCURRENT_TOOL_CALLS_CAP,
   type RunBudget,
+  effectiveBudget,
 } from '../../../harness/types.ts';
-import { formatCost, formatMs } from '../format.ts';
+import { formatCost, formatMs, withRunningCue } from '../format.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 
 const usage = '/budget [steps <N> | cost <USD|none> | parallel-tools <N> | subagents <N>]';
 
 const showAll = (ctx: SlashContext): SlashResult => {
-  const b = ctx.baseConfig.budget ?? {};
-  // Cost has three states (see RunBudget docstring for the full
-  // contract): absent → fall back to DEFAULT_BUDGET; explicit
-  // undefined → operator opted out, render "no cap"; number →
-  // that value. `'maxCostUsd' in b` distinguishes "absent" from
-  // "present-as-undefined" since both read as undefined via `?.`.
-  const costLine = (() => {
-    if (!('maxCostUsd' in b)) {
-      const d = DEFAULT_BUDGET.maxCostUsd;
-      return `max cost: ${d !== undefined ? formatCost(d) : 'no cap'}`;
-    }
-    return `max cost: ${b.maxCostUsd !== undefined ? formatCost(b.maxCostUsd) : 'no cap'}`;
-  })();
+  // Resolve through the SAME layered helper the loop uses so `/budget`
+  // shows the EFFECTIVE caps — including any `/effort` preset — not
+  // just the raw explicit overrides (defaults < effort preset <
+  // explicit /budget). `effectiveBudget` also carries the cost
+  // opt-out: an explicit `maxCostUsd: undefined` (from `/budget cost
+  // off`) propagates through the spread and renders "no cap", while
+  // an absent key falls back to the DEFAULT_BUDGET cap.
+  const r = effectiveBudget(ctx.baseConfig.budget, ctx.baseConfig.effort);
   return {
     kind: 'ok',
     notes: [
-      `max steps: ${b.maxSteps ?? DEFAULT_BUDGET.maxSteps}`,
-      `max wall-clock: ${formatMs(b.maxWallClockMs ?? DEFAULT_BUDGET.maxWallClockMs)}`,
-      `max tool errors: ${b.maxToolErrors ?? DEFAULT_BUDGET.maxToolErrors}`,
-      costLine,
-      `max parallel tools: ${b.maxConcurrentToolCalls ?? DEFAULT_BUDGET.maxConcurrentToolCalls} (cap ${MAX_CONCURRENT_TOOL_CALLS_CAP})`,
-      `max concurrent subagents: ${b.maxConcurrentSubagents ?? DEFAULT_BUDGET.maxConcurrentSubagents} (cap ${MAX_CONCURRENT_SUBAGENTS_CAP})`,
+      `max steps: ${r.maxSteps}`,
+      `max wall-clock: ${formatMs(r.maxWallClockMs)}`,
+      `max tool errors: ${r.maxToolErrors}`,
+      `max cost: ${r.maxCostUsd !== undefined ? formatCost(r.maxCostUsd) : 'no cap'}`,
+      `max parallel tools: ${r.maxConcurrentToolCalls} (cap ${MAX_CONCURRENT_TOOL_CALLS_CAP})`,
+      `max concurrent subagents: ${r.maxConcurrentSubagents} (cap ${MAX_CONCURRENT_SUBAGENTS_CAP})`,
     ],
   };
 };
@@ -90,17 +86,6 @@ const parsePositiveDecimal = (raw: string): number | null => {
 const writeBudget = (ctx: SlashContext, patch: Partial<RunBudget>): void => {
   const current = ctx.baseConfig.budget ?? {};
   ctx.baseConfig.budget = { ...current, ...patch };
-};
-
-// Append the "current turn already snapshot" cue when a turn is
-// running. Mirrors /model's behavior so an operator mutating mid-
-// turn doesn't assume the in-flight prompt sees the new value.
-const withRunningCue = (ctx: SlashContext, notes: string[]): string[] => {
-  if (!ctx.isRunning()) return notes;
-  return [
-    ...notes,
-    '(current turn already snapshot its config; new value applies starting next prompt)',
-  ];
 };
 
 export const budgetCommand: SlashCommand = {

@@ -422,12 +422,15 @@ describe('createAnthropicProvider', () => {
     // for `max_tokens`, and a small-cap model can produce a pair
     // where budget >= cap. This adapter check is where that
     // runtime-resolved pair gets validated; the mock client must
-    // NOT be reached when the cross-check fires.
+    // NOT be reached when the cross-check fires. Uses a LEGACY
+    // (non-adaptive) model on purpose: adaptive models route
+    // thinking through `type:'adaptive'` and drop budget_tokens, so
+    // the cross-check is skipped there (see anthropic-effort.test.ts).
     const handle = mockClient([{ type: 'message_stop' }]);
-    const provider = createAnthropicProvider('claude-sonnet-4-6', { client: handle.client });
+    const provider = createAnthropicProvider('claude-haiku-4-5', { client: handle.client });
     const drain = async () => {
       for await (const _ of provider.generate({
-        model: 'claude-sonnet-4-6',
+        model: 'claude-haiku-4-5',
         messages: [{ role: 'user', content: 'hi' }],
         max_tokens: 4096,
         thinking_budget: 10_000,
@@ -449,10 +452,10 @@ describe('createAnthropicProvider', () => {
     // equal pass the check and surface as the same 400 we wanted
     // to prevent — pin the comparison.
     const handle = mockClient([{ type: 'message_stop' }]);
-    const provider = createAnthropicProvider('claude-sonnet-4-6', { client: handle.client });
+    const provider = createAnthropicProvider('claude-haiku-4-5', { client: handle.client });
     const drain = async () => {
       for await (const _ of provider.generate({
-        model: 'claude-sonnet-4-6',
+        model: 'claude-haiku-4-5',
         messages: [{ role: 'user', content: 'hi' }],
         max_tokens: 8000,
         thinking_budget: 8000,
@@ -472,9 +475,9 @@ describe('createAnthropicProvider', () => {
     // implicit coverage by not setting thinking_budget at all,
     // but transitive confidence is weaker than direct.
     const handle = mockClient([{ type: 'message_stop' }]);
-    const provider = createAnthropicProvider('claude-sonnet-4-6', { client: handle.client });
+    const provider = createAnthropicProvider('claude-haiku-4-5', { client: handle.client });
     for await (const _ of provider.generate({
-      model: 'claude-sonnet-4-6',
+      model: 'claude-haiku-4-5',
       messages: [{ role: 'user', content: 'hi' }],
       max_tokens: 8000,
       thinking_budget: 4000,
@@ -484,6 +487,7 @@ describe('createAnthropicProvider', () => {
     expect(handle.streamCalls).toHaveLength(1);
     const params = handle.streamCalls[0]?.params as Record<string, unknown>;
     const thinking = params.thinking as { type: string; budget_tokens: number };
+    // Legacy (non-adaptive) model keeps the manual enabled+budget path.
     expect(thinking).toEqual({ type: 'enabled', budget_tokens: 4000 });
     expect(params.max_tokens).toBe(8000);
   });

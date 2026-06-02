@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, test } from 'bun:test';
 import { budgetCommand } from '../../../src/cli/slash/commands/budget.ts';
 import { clearCommand } from '../../../src/cli/slash/commands/clear.ts';
 import { costCommand } from '../../../src/cli/slash/commands/cost.ts';
+import { effortCommand } from '../../../src/cli/slash/commands/effort.ts';
 import { buildHelpCommand } from '../../../src/cli/slash/commands/help.ts';
 import { modelCommand } from '../../../src/cli/slash/commands/model.ts';
 import { permsCommand, renderPolicy } from '../../../src/cli/slash/commands/perms.ts';
@@ -9,8 +10,9 @@ import { quitCommand } from '../../../src/cli/slash/commands/quit.ts';
 import { sessionsCommand } from '../../../src/cli/slash/commands/sessions.ts';
 import { subagentsCommand } from '../../../src/cli/slash/commands/subagents.ts';
 import type { SlashCommand, SlashContext } from '../../../src/cli/slash/types.ts';
+import { EFFORT_PROFILES } from '../../../src/harness/effort.ts';
 import type { HarnessConfig } from '../../../src/harness/index.ts';
-import { DEFAULT_BUDGET } from '../../../src/harness/types.ts';
+import { DEFAULT_BUDGET, effectiveBudget } from '../../../src/harness/types.ts';
 import { initBashParser } from '../../../src/permissions/bash-parser.ts';
 import { createPermissionEngine } from '../../../src/permissions/index.ts';
 import { createRegistry as createModelRegistry } from '../../../src/providers/registry.ts';
@@ -1098,5 +1100,92 @@ describe('/perms why', () => {
     expect(text).toContain('(locked by enterprise policy)');
     expect(text).not.toContain('required:');
     expect(text).not.toContain('host_allowed:');
+  });
+});
+
+describe('/effort', () => {
+  test('bare /effort shows "not set" + levels when unset', async () => {
+    const ctx = makeCtx();
+    const r = await effortCommand.exec([], ctx);
+    if (r.kind !== 'ok') throw new Error('expected ok');
+    expect(r.notes?.[0]).toContain('not set');
+    expect((r.notes ?? []).join('\n')).toContain('low | medium | high | max');
+  });
+
+  test('/effort <level> records the level only; caps resolve via effectiveBudget (next turn)', async () => {
+    const ctx = makeCtx();
+    // Realistic baseConfig.budget: only operator-declared overrides
+    // (bootstrap builds it as `{ ...config.toml[budget], ...CLI }`, an
+    // object — empty here, never a full DEFAULT_BUDGET).
+    ctx.baseConfig.budget = {};
+    const r = await effortCommand.exec(['high'], ctx);
+    if (r.kind !== 'ok') throw new Error('expected ok');
+    expect(ctx.baseConfig.effort).toBe('high');
+    // No in-place mutation of baseConfig.budget — the preset is layered
+    // at read time by effectiveBudget(budget, effort), not baked in.
+    expect(ctx.baseConfig.budget).toEqual({});
+    const eff = effectiveBudget(ctx.baseConfig.budget, ctx.baseConfig.effort);
+    expect(eff.maxSteps).toBe(EFFORT_PROFILES.high.maxSteps);
+    expect(eff.maxConcurrentSubagents).toBe(EFFORT_PROFILES.high.maxConcurrentSubagents);
+    expect(eff.maxToolErrors).toBe(EFFORT_PROFILES.high.maxToolErrors);
+    expect(r.notes?.[0]).toContain('next turn');
+  });
+
+  test('/effort is case-insensitive', async () => {
+    const ctx = makeCtx();
+    const r = await effortCommand.exec(['MAX'], ctx);
+    if (r.kind !== 'ok') throw new Error('expected ok');
+    expect(ctx.baseConfig.effort).toBe('max');
+  });
+
+  test('/effort never mutates baseConfig.budget; explicit caps win over the preset (order-independent)', async () => {
+    // Operator ran `/budget steps 50` FIRST (explicit override), then
+    // `/effort low`. The explicit step cap must survive — the bug the
+    // resolver fixes — and `/effort` must not touch baseConfig.budget.
+    const ctx = makeCtx();
+    ctx.baseConfig.budget = { maxSteps: 50, maxCostUsd: 42 };
+    await effortCommand.exec(['low'], ctx);
+    expect(ctx.baseConfig.budget).toEqual({ maxSteps: 50, maxCostUsd: 42 }); // untouched
+    const eff = effectiveBudget(ctx.baseConfig.budget, ctx.baseConfig.effort);
+    expect(eff.maxSteps).toBe(50); // explicit beats preset (low = 60)
+    expect(eff.maxToolErrors).toBe(EFFORT_PROFILES.low.maxToolErrors); // preset fills the rest
+  });
+
+  test('/effort idempotent when already at that level', async () => {
+    const ctx = makeCtx();
+    await effortCommand.exec(['medium'], ctx);
+    const r = await effortCommand.exec(['medium'], ctx);
+    if (r.kind !== 'ok') throw new Error('expected ok');
+    expect(r.notes?.[0]).toContain('already medium');
+  });
+
+  test('/effort rejects unknown level with a Known list', async () => {
+    const ctx = makeCtx();
+    const r = await effortCommand.exec(['ultra'], ctx);
+    if (r.kind !== 'error') throw new Error('expected error');
+    expect(r.message).toContain('unknown level');
+    expect(r.message).toContain('low, medium, high, max');
+  });
+
+  test('/effort rejects too many args', async () => {
+    const ctx = makeCtx();
+    const r = await effortCommand.exec(['high', 'extra'], ctx);
+    expect(r.kind).toBe('error');
+  });
+
+  test('bare /effort shows the resolved provider effort + caps when set', async () => {
+    const ctx = makeCtx();
+    await effortCommand.exec(['high'], ctx);
+    const r = await effortCommand.exec([], ctx);
+    if (r.kind !== 'ok') throw new Error('expected ok');
+    expect(r.notes?.[0]).toContain('effort: high');
+    expect((r.notes ?? []).join('\n')).toContain('provider effort: high');
+  });
+
+  test('a running turn appends the snapshot cue', async () => {
+    const ctx = makeCtx({ isRunning: () => true });
+    const r = await effortCommand.exec(['low'], ctx);
+    if (r.kind !== 'ok') throw new Error('expected ok');
+    expect(r.notes?.some((n) => n.includes('already snapshot'))).toBe(true);
   });
 });

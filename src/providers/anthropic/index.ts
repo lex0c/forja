@@ -4,6 +4,7 @@ import type {
   ConstrainedResult,
   GenerateRequest,
   Provider,
+  ProviderCapabilities,
   ProviderContentBlock,
   ProviderMessage,
   ProviderToolDef,
@@ -55,6 +56,36 @@ const toAnthropicTool = (t: ProviderToolDef): Anthropic.Tool => ({
   description: t.description,
   input_schema: t.input_schema as Anthropic.Tool.InputSchema,
 });
+
+// Anthropic thinking surface, gated by the model's capability.
+// ADAPTIVE models (Opus 4.7/4.8, Sonnet 4.6 — `supports_adaptive_
+// thinking`) only accept `thinking:{type:'adaptive'}`; manual
+// `type:'enabled'` is REJECTED with HTTP 400 on Opus 4.7/4.8 and
+// deprecated on Sonnet 4.6. In adaptive mode the model chooses its
+// own depth (guided by `output_config.effort`), so `budget_tokens`
+// is dropped. We engage adaptive when EITHER a legacy budget was
+// requested (> 0, the old "I want thinking" signal) OR an effort
+// level was set (high-level reasoning intent) — both mean the
+// operator cares about reasoning. LEGACY models keep the manual
+// `enabled + budget_tokens` surface; budget=0 omits the block
+// (disable-via-zero idiom, PLAYBOOKS.md §1.1).
+export const anthropicThinkingParam = (
+  req: GenerateRequest,
+  caps: ProviderCapabilities,
+): { thinking?: { type: 'adaptive' } | { type: 'enabled'; budget_tokens: number } } => {
+  const budget = req.thinking_budget;
+  // Disable-via-zero (PLAYBOOKS.md §1.1) is an EXPLICIT "no thinking"
+  // and wins over everything, including a session `effort` — effort
+  // must never resurrect thinking a playbook deliberately turned off.
+  if (budget === 0) return {};
+  if (caps.supports_adaptive_thinking === true) {
+    const wantsThinking = (budget !== undefined && budget > 0) || req.effort !== undefined;
+    return wantsThinking ? { thinking: { type: 'adaptive' } } : {};
+  }
+  return budget !== undefined && budget > 0
+    ? { thinking: { type: 'enabled', budget_tokens: budget } }
+    : {};
+};
 
 export const createAnthropicProvider = (
   modelName: string,
@@ -133,6 +164,10 @@ export const createAnthropicProvider = (
     // be rejected anyway, but for max_tokens=0, not for the
     // budget).
     if (
+      // Only the LEGACY enabled path sends `budget_tokens`; adaptive
+      // models drop it (`anthropicThinkingParam`), so the
+      // budget-vs-max_tokens cross-check is moot there — skip it.
+      caps.supports_adaptive_thinking !== true &&
       req.thinking_budget !== undefined &&
       req.thinking_budget > 0 &&
       req.thinking_budget >= req.max_tokens
@@ -156,16 +191,17 @@ export const createAnthropicProvider = (
       ...(cachedTools !== undefined ? { tools: cachedTools } : {}),
       ...(acceptsSampling && req.temperature !== undefined ? { temperature: req.temperature } : {}),
       ...(acceptsSampling && req.top_p !== undefined ? { top_p: req.top_p } : {}),
-      // Extended thinking (`PLAYBOOKS.md` §1.1
-      // `sampling.thinking_budget`). Anthropic's surface is
-      // `thinking: { type:'enabled', budget_tokens }`; budget=0
-      // disables, which the SDK shape encodes as omitting the
-      // block entirely. We mirror that by gating the spread on
-      // `> 0` — passing `budget_tokens: 0` would be rejected by
-      // the API, so the disable-via-zero idiom (PLAYBOOKS.md §1.1)
-      // collapses to "no `thinking` field on the request".
-      ...(req.thinking_budget !== undefined && req.thinking_budget > 0
-        ? { thinking: { type: 'enabled' as const, budget_tokens: req.thinking_budget } }
+      // Extended thinking — adaptive vs legacy manual budget, gated
+      // by the model capability. See `anthropicThinkingParam`.
+      ...anthropicThinkingParam(req, caps),
+      // Agnostic reasoning effort (TOKEN_TUNING.md §4). Anthropic's
+      // native `output_config.effort` accepts low|medium|high|max
+      // 1:1 with `ProviderEffort`. Affects text, tool calls, and —
+      // when adaptive thinking is engaged above — thinking depth.
+      // Gated on the model capability: not every model exposes the
+      // surface, so emit only where declared supported to avoid a 400.
+      ...(req.effort !== undefined && caps.supports_reasoning_effort === true
+        ? { output_config: { effort: req.effort } }
         : {}),
       ...(req.stop_sequences !== undefined ? { stop_sequences: req.stop_sequences } : {}),
       // `seed_in_eval` is intentionally NOT forwarded here. The

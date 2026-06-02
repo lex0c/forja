@@ -144,6 +144,12 @@ const main = async (): Promise<number> => {
       // "use provider default", explicit value pins the child's
       // sampling for determinism.
       ...(args.subagentTemperature !== undefined ? { temperature: args.subagentTemperature } : {}),
+      // Provider reasoning-effort inherited from the parent's `/effort`
+      // (internal flag `--subagent-effort`). Carries only the reasoning
+      // axis — operational caps stay per-playbook.
+      ...(args.subagentProviderEffort !== undefined
+        ? { providerEffort: args.subagentProviderEffort }
+        : {}),
       // Trust verdict from the parent's bootstrap. Spec §9 trust
       // is per-project; the child runs under the parent's
       // resolved verdict instead of re-resolving from disk

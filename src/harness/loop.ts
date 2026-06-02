@@ -61,6 +61,7 @@ import type { SpawnSubagentArgs, SpawnSubagentResult } from '../tools/types.ts';
 import { StepStallError, abortableIterable, stallWatchdog } from './abortable.ts';
 import { CollectStepError, type CollectedToolUse, collectStep } from './collect.ts';
 import { compactMessages } from './compaction.ts';
+import { resolveProviderEffort } from './effort.ts';
 import { invokeTool } from './invoke-tool.ts';
 import {
   ALIGNMENT_FETCH_MARGIN,
@@ -193,7 +194,7 @@ const buildToolDefs = (config: HarnessConfig): ProviderToolDef[] =>
 // expect their own format already constructed by the adapter.
 
 export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> => {
-  const budget: RunBudget = effectiveBudget(config.budget);
+  const budget: RunBudget = effectiveBudget(config.budget, config.effort);
   const startMs = Date.now();
 
   // Combine the caller's abort signal with a wall-clock timer so the cap
@@ -1761,6 +1762,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                 }
               : undefined;
 
+          // Subagents inherit the operator's reasoning-effort axis
+          // (the resolved provider-effort) so `/effort` applies
+          // task-wide — but NOT the operational caps, which stay
+          // per-playbook (the child gets `providerEffort`, not
+          // `effort`). Transitive: a child that is itself a parent
+          // forwards its own resolved value on the next hop.
+          const childProviderEffort = resolveProviderEffort(config);
           const child = await runSubagent({
             definition: def,
             prompt: args.prompt,
@@ -1807,6 +1815,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               ? { sharedScopeOffline: true }
               : {}),
             ...(config.temperature !== undefined ? { temperature: config.temperature } : {}),
+            ...(childProviderEffort !== undefined ? { providerEffort: childProviderEffort } : {}),
             depth: childDepth,
             // Forward the spawn factory test seam. Production
             // callers leave it unset; runSubagent falls back to
@@ -2304,6 +2313,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         safeEmit(config.onEvent, { type: 'step_start', stepN: steps });
 
         const resolvedMaxTokens = resolveMaxOutputTokens(budget, config.provider.capabilities);
+        // Provider reasoning-effort for this request: an explicit
+        // `providerEffort` (what an inherited subagent config carries)
+        // wins, else derive from the operator's `effort` level.
+        const reqEffort = resolveProviderEffort(config);
         const req: GenerateRequest = {
           model: config.provider.id,
           // Snapshot the running message list so post-call mutations (the next
@@ -2319,6 +2332,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           ...(config.thinkingBudget !== undefined
             ? { thinking_budget: config.thinkingBudget }
             : {}),
+          // Provider reasoning-effort axis (resolved above). Each
+          // adapter maps it to its native surface; the operational
+          // caps ride `budget` separately via effectiveBudget.
+          ...(reqEffort !== undefined ? { effort: reqEffort } : {}),
           ...(config.seedInEval !== undefined ? { seed_in_eval: config.seedInEval } : {}),
         };
 

@@ -9,6 +9,11 @@ const GOOGLE_BASE = {
   streaming: true,
   constrained: 'tools',
   recommended_max_tools_per_step: 12,
+  // All current Gemini 2.5 models accept the numeric thinking-budget
+  // surface that the agnostic `effort` maps onto (`thinkingConfig.
+  // thinkingBudget`). A future non-thinking Gemini would override
+  // this to false per-model.
+  supports_reasoning_effort: true,
 } as const satisfies Partial<ProviderCapabilities>;
 
 // Costs are illustrative; pricing should live in dynamic config (see

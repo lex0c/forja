@@ -1,5 +1,6 @@
 import { chmodSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import type { ProviderEffort } from '../providers/index.ts';
 import { scrubEnv } from '../sanitize/env.ts';
 import {
   IPC_PROTOCOL_VERSION,
@@ -81,6 +82,10 @@ export interface SpawnChildProcessOptions {
   // propagation, the subprocess child would silently fall back
   // to the provider default (~1.0) and break reproducibility.
   temperature?: number;
+  // Provider reasoning-effort carried across via `--subagent-effort`.
+  // Lets a subagent inherit the operator's `/effort` reasoning depth.
+  // Undefined ⇒ omit the flag (child uses the provider default).
+  providerEffort?: ProviderEffort;
   // Trust verdict carried across via `--subagent-cwd-trusted`.
   // Spec §9 trust is per-project; the child runs under the
   // parent's resolved verdict. Without forwarding, the child's
@@ -326,6 +331,9 @@ export const defaultSpawnChildProcess: SpawnChildProcess = (opts) => {
   ];
   if (opts.temperature !== undefined) {
     appendArgs.push('--subagent-temperature', String(opts.temperature));
+  }
+  if (opts.providerEffort !== undefined) {
+    appendArgs.push('--subagent-effort', opts.providerEffort);
   }
   if (opts.cwdTrusted === true) {
     appendArgs.push('--subagent-cwd-trusted');
