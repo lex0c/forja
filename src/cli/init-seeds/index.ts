@@ -1,5 +1,5 @@
 // Bundled canonical vendor seeds (MEMORY.md §5.7.8 — vendor seed
-// catalog). The 10 .md files in this directory are imported as text
+// catalog). The 11 .md files in this directory are imported as text
 // assets at build time and exposed as a stable array; the bootstrap
 // installer (`src/memory/seeds-installer.ts`) writes them into the
 // user scope's `<user>/seeds/` subdirectory on first invocation.
@@ -10,8 +10,8 @@
 // `*.md` declaration in `../init-playbooks/playbooks.d.ts` already
 // covers these imports project-wide — no separate declaration here.
 //
-// Hard cap (spec §5.7.7): MAX 10 entries in the default vendor pack.
-// If a future seed would push the count to 11, that's the moment to
+// Hard cap (spec §5.7.7): MAX 11 entries in the default vendor pack.
+// If a future seed would push the count to 12, that's the moment to
 // move it into a skill or playbook instead — the seed surface costs
 // context in every session and should not bloat.
 //
@@ -29,6 +29,7 @@
 import confirmBlastRadiusMd from './confirm-blast-radius.md' with { type: 'text' };
 import failureRootCauseMd from './failure-root-cause.md' with { type: 'text' };
 import gitFirstOrientationMd from './git-first-orientation.md' with { type: 'text' };
+import measureTwiceCutOnceMd from './measure-twice-cut-once.md' with { type: 'text' };
 import noAutoCommitMd from './no-auto-commit.md' with { type: 'text' };
 import noFabricationMd from './no-fabrication.md' with { type: 'text' };
 import preferSpecializedNavigationMd from './prefer-specialized-navigation.md' with {
@@ -86,6 +87,14 @@ export const CANONICAL_SEEDS: ReadonlyArray<CanonicalSeed> = [
     description: 'sessão fresca em repo git começa por git status + git log -10',
     version: '1.0',
     content: gitFirstOrientationMd,
+  },
+  {
+    filename: 'measure-twice-cut-once.md',
+    name: 'measure-twice-cut-once',
+    description:
+      'due-diligence antes de efeito colateral persistente — medir o alvo, manter reversível, declarar o não-medido (not_checked/assumptions/confidence)',
+    version: '1.0',
+    content: measureTwiceCutOnceMd,
   },
   {
     filename: 'no-auto-commit.md',
