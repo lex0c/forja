@@ -540,6 +540,38 @@ describe('harness-adapter — tool lifecycle', () => {
     expect(e.subject).toBe('/a');
   });
 
+  test('multi-line bash command is flattened to a single-line subject', () => {
+    // A raw `\n` in the subject would make the live card's `└─ <cmd>`
+    // line span two terminal rows, breaking the renderer's
+    // one-element-per-row erase math and leaking a stale card into
+    // scrollback. The adapter collapses line breaks (and the
+    // whitespace hugging them) to a single space.
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'tool_invoking',
+      toolUseId: 't1',
+      toolName: 'bash',
+      args: { command: 'echo start && for d in src/*/; do\n  count=$(find "$d")\ndone' },
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:start' }>;
+    expect(e.subject).not.toContain('\n');
+    expect(e.subject).toBe('echo start && for d in src/*/; do count=$(find "$d") done');
+  });
+
+  test('single-line subject is left untouched (no whitespace mangling)', () => {
+    // The flatten only triggers on a newline; intra-line spacing in a
+    // normal command must survive verbatim.
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'tool_invoking',
+      toolUseId: 't1',
+      toolName: 'bash',
+      args: { command: 'grep -n "foo  bar" file' },
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:start' }>;
+    expect(e.subject).toBe('grep -n "foo  bar" file');
+  });
+
   test('tool_execution_started → tool:execution-started', () => {
     const a = createHarnessAdapter(baseCtx());
     const out = a.translate({ type: 'tool_execution_started', toolUseId: 't1' });

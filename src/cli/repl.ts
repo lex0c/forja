@@ -114,6 +114,11 @@ export interface RunReplOptions {
   // place of process.stdout.write. Tests pass a string collector to
   // capture the banner / live frames without touching real stdio.
   rendererWrite?: (s: string) => void;
+  // Minimum on-screen time (ms) for a live tool card before its
+  // `tool:end` removes it (see RendererOptions.toolMinDisplayMs).
+  // Defaults to 0 (off) so REPL tests drive tool flows synchronously;
+  // the production entrypoint (cli/index.ts) passes the real value.
+  toolMinDisplayMs?: number;
   // Test seam: skip the first-run trust prompt (AGENTIC_CLI §9.1).
   // Production never sets this — operator always sees the prompt
   // on first cwd visit. Tests don't drive the trust modal (the
@@ -242,6 +247,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // keeps the cooked-mode SIGINT path live until we're ready
     // to take stdin.
     inputMode: 'manual',
+    // Keep fast tool cards (read / write / quick bash) on screen long
+    // enough to perceive — without this they complete inside one frame
+    // budget and never paint. See RendererOptions.toolMinDisplayMs.
+    // Default 0 (off) here so the REPL test-suite drives tool flows
+    // synchronously; the production entrypoint (cli/index.ts) wires the
+    // real value.
+    toolMinDisplayMs: options.toolMinDisplayMs ?? 0,
     ...(options.rendererWrite !== undefined ? { write: options.rendererWrite } : {}),
   });
   // Forward reference: triggerInterrupt is defined post-bootstrap

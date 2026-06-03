@@ -1297,3 +1297,182 @@ describe('renderer side effects', () => {
     r.close();
   });
 });
+
+describe('tool min-display hold (toolMinDisplayMs)', () => {
+  // Controllable clock — the hold computes remaining time from `now()`,
+  // so tests advance it to release a held tool:end deterministically.
+  const makeClock = (start = 1000) => {
+    let t = start;
+    return {
+      now: () => t,
+      set: (v: number) => {
+        t = v;
+      },
+    };
+  };
+
+  const toolStart: UIEvent = {
+    type: 'tool:start',
+    ts: 6,
+    toolId: 't1',
+    name: 'bash',
+    activeVerb: 'Executing',
+    finalVerb: 'Executed',
+    subject: 'ls',
+  };
+  const toolExec: UIEvent = { type: 'tool:execution-started', ts: 6, toolId: 't1' };
+  const toolEnd: UIEvent = { type: 'tool:end', ts: 7, toolId: 't1', status: 'done', durationMs: 5 };
+
+  test('holds a fast tool:end until the card has been shown for the min duration', () => {
+    const bus = createBus();
+    const sink = makeSink();
+    const sched = makeSchedulerOptions();
+    const clock = makeClock(1000);
+    const r = createRenderer({
+      bus,
+      caps,
+      write: sink.write,
+      schedulerOptions: sched.options,
+      bracketedPaste: false,
+      now: clock.now,
+      toolMinDisplayMs: 400,
+    });
+    bus.emit(sessionStart);
+    sched.flushAll();
+    // Tool starts and immediately finishes (same instant) — the
+    // fast-tool case. The card is now live.
+    bus.emit(toolStart);
+    bus.emit(toolExec);
+    expect(r.state().activeTools.has('t1')).toBe(true);
+    bus.emit(toolEnd);
+    // tool:end is HELD — not yet applied, so the card is still active.
+    expect(r.state().activeTools.has('t1')).toBe(true);
+    // A frame flush at the same instant does NOT release it (the hold
+    // timer re-arms while `now` hasn't advanced past the threshold).
+    sched.flushAll();
+    expect(r.state().activeTools.has('t1')).toBe(true);
+    // The live region still paints the running card.
+    expect(sink.joined()).toContain('Executing');
+    // Advance past the threshold and let the hold timer fire — the
+    // tool:end now applies and the card leaves the live region.
+    clock.set(1400);
+    sched.flushAll();
+    expect(r.state().activeTools.has('t1')).toBe(false);
+    r.close();
+  });
+
+  test('keystrokes (input:update) bypass the hold — typing stays responsive', () => {
+    const bus = createBus();
+    const sink = makeSink();
+    const sched = makeSchedulerOptions();
+    const clock = makeClock(1000);
+    const r = createRenderer({
+      bus,
+      caps,
+      write: sink.write,
+      schedulerOptions: sched.options,
+      bracketedPaste: false,
+      now: clock.now,
+      toolMinDisplayMs: 400,
+    });
+    bus.emit(sessionStart);
+    sched.flushAll();
+    bus.emit(toolStart);
+    bus.emit(toolEnd); // held
+    // While the tool:end is held, the operator types. The input event
+    // must apply immediately, without waiting out the hold.
+    bus.emit({ type: 'input:update', ts: 8, value: 'queued msg', cursor: 10 });
+    expect(r.state().input.value).toBe('queued msg');
+    // The tool:end is still held (bypass didn't release it).
+    expect(r.state().activeTools.has('t1')).toBe(true);
+    r.close();
+  });
+
+  test('disabled by default (toolMinDisplayMs 0) — tool:end applies immediately', () => {
+    const bus = createBus();
+    const sink = makeSink();
+    const sched = makeSchedulerOptions();
+    const r = createRenderer({
+      bus,
+      caps,
+      write: sink.write,
+      schedulerOptions: sched.options,
+      bracketedPaste: false,
+    });
+    bus.emit(sessionStart);
+    sched.flushAll();
+    bus.emit(toolStart);
+    expect(r.state().activeTools.has('t1')).toBe(true);
+    bus.emit(toolEnd);
+    // No hold — the card is removed from the live region right away.
+    expect(r.state().activeTools.has('t1')).toBe(false);
+    r.close();
+  });
+
+  test('released tool stays visible via the live batch preview (no vanish, no session:end needed)', () => {
+    // Mid-turn a fast `done` tool buffers into the coalescing batch and
+    // would otherwise be invisible (gone from activeTools, not yet in
+    // scrollback) until a later flush trigger. The live batch preview
+    // renders the buffer so the finalized tool STAYS on screen — and
+    // grouped — until it settles, instead of flashing and vanishing.
+    const bus = createBus();
+    const sink = makeSink();
+    const sched = makeSchedulerOptions();
+    const clock = makeClock(1000);
+    const r = createRenderer({
+      bus,
+      caps,
+      write: sink.write,
+      schedulerOptions: sched.options,
+      bracketedPaste: false,
+      now: clock.now,
+      toolMinDisplayMs: 400,
+    });
+    bus.emit(sessionStart);
+    sched.flushAll();
+    bus.emit(toolStart);
+    bus.emit(toolExec);
+    bus.emit(toolEnd); // held — no session:end, mid-turn
+    // Still running (held): the card shows the active verb, not the
+    // finalized one.
+    sched.flushAll();
+    expect(sink.joined()).toContain('Executing');
+    expect(sink.joined()).not.toContain('Executed');
+    // Release the hold, then render the follow-up frame. The tool has
+    // left activeTools but the finalized form is now in the live batch
+    // preview — visible WITHOUT any session:end or trailing permanent.
+    clock.set(1400);
+    sched.flushAll(); // hold timer fires → tool:end applied
+    sched.flushAll(); // batch-preview frame draws
+    expect(r.state().activeTools.has('t1')).toBe(false);
+    expect(sink.joined()).toContain('Executed');
+    expect(sink.joined()).toContain('ls'); // subject under the connector
+    r.close();
+  });
+
+  test('close() flushes a held tool:end so its scrollback is not dropped', () => {
+    const bus = createBus();
+    const sink = makeSink();
+    const sched = makeSchedulerOptions();
+    const clock = makeClock(1000);
+    const r = createRenderer({
+      bus,
+      caps,
+      write: sink.write,
+      schedulerOptions: sched.options,
+      bracketedPaste: false,
+      now: clock.now,
+      toolMinDisplayMs: 400,
+    });
+    bus.emit(sessionStart);
+    sched.flushAll();
+    bus.emit(toolStart);
+    bus.emit(toolEnd); // held, never released by a timer
+    expect(r.state().activeTools.has('t1')).toBe(true);
+    // Teardown must drain the held event so the tool finalization
+    // still lands (the final-verb chip survives in scrollback).
+    r.close();
+    expect(r.state().activeTools.has('t1')).toBe(false);
+    expect(sink.joined()).toContain('Executed');
+  });
+});

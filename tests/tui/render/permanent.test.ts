@@ -788,6 +788,46 @@ describe('formatPermanent', () => {
       ]);
     });
 
+    test('count is bold within the headline verb (when color enabled)', () => {
+      // The batch size is the one number that says how much the fold
+      // hides, so it gets weight (bold = SGR 1) while staying in the
+      // head tone (done → dim = SGR 2). paintMulti wraps tone+bold with
+      // a single reset; the surrounding verb text stays plain-dim.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'bash',
+          verb: 'Executed 6 commands',
+          count: 6,
+          totalDurationMs: 900,
+          subjects: ['a', 'b'],
+          status: 'done',
+        },
+        colored,
+      );
+      // Head row (out[1]; out[0] is the leading blank). The count `6`
+      // carries dim+bold; the words around it stay dim.
+      expect(out[1]).toContain('\x1b[2m\x1b[1m6\x1b[0m');
+      expect(out[1]).toContain('Executed');
+      expect(out[1]).toContain('commands');
+    });
+
+    test('count bolding leaves plain output untouched when color disabled', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'bash',
+          verb: 'Executed 6 commands',
+          count: 6,
+          totalDurationMs: 900,
+          subjects: ['a', 'b'],
+          status: 'done',
+        },
+        unicode,
+      );
+      expect(out[1]).toBe(pad('● Executed 6 commands  [900ms]'));
+    });
+
     test('outputTruncated appends one hint line under the batch body', () => {
       const out = formatPermanent(
         {

@@ -425,6 +425,20 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           // through with null subject.
           subject = null;
         }
+        // Flatten the subject to a single display line. A multi-line
+        // shell command (`a && \n for d in …; do …`, heredocs) carries
+        // literal newlines straight from the model's args; rendered as
+        // the live card's `└─ <subject>` line, a raw `\n` makes ONE
+        // live-region array element span TWO terminal rows, which
+        // breaks the renderer's one-element-per-row erase math and
+        // leaks the stale card into scrollback. Collapse each line
+        // break (and the whitespace hugging it) to a single space so
+        // the subject is always one row. Intra-line spacing is left
+        // intact; single-line subjects (file paths, patterns) are
+        // untouched.
+        if (subject?.includes('\n')) {
+          subject = subject.replace(/\s*\n\s*/g, ' ').trim();
+        }
         state.tools.set(event.toolUseId, {
           name: event.toolName,
           decision: null,

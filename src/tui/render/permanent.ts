@@ -302,13 +302,29 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
           : CHIP_FINAL_GLYPH.ascii;
       const indent = nested ? CHIP_NESTED_INDENT : '';
       const verb = finalVerbFor(item.status, item.verb);
-      const headRaw = `${indent}${glyph} ${verb}`;
       // `denied` takes the `error` tone too — a blocked call didn't
       // run, which reads as a failure; the verb ('Denied' vs 'Failed')
       // is what tells the two apart.
       const headTone = item.status === 'error' || item.status === 'denied' ? 'error' : 'dim';
       const metric = paint(caps, 'secondary', `  [${formatChipDuration(item.totalDurationMs)}]`);
-      const head = `${paint(caps, headTone, headRaw)}${metric}`;
+      // Bold the count inside the headline verb ("Executed **6**
+      // commands", "Read **6** files", …) so the batch size pops out of
+      // the dim head — it's the one number that tells the operator how
+      // much a fold is hiding. The count stays in the head tone (dim /
+      // error), just gains weight, via `paintMulti` so a single reset
+      // wraps tone+bold (nested `paint` would double-emit `\x1b[0m`).
+      // Only `done`-status headlines carry the count — `finalVerbFor`
+      // collapses error/denied to bare 'Failed' / 'Denied' (no number),
+      // so `indexOf` misses and the head paints whole, unbolded.
+      const countStr = String(item.count);
+      const countAt = verb.indexOf(countStr);
+      const head =
+        countAt < 0
+          ? `${paint(caps, headTone, `${indent}${glyph} ${verb}`)}${metric}`
+          : paint(caps, headTone, `${indent}${glyph} ${verb.slice(0, countAt)}`) +
+            paintMulti(caps, [headTone, 'bold'], countStr) +
+            paint(caps, headTone, verb.slice(countAt + countStr.length)) +
+            metric;
       // Same leading-blank rule as tool-end: top-level chips get a
       // separator, nested ones stay tight under their owner.
       const lines = nested ? [head] : ['', head];

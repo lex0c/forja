@@ -262,7 +262,10 @@ const main = async (): Promise<number> => {
       return 1;
     }
     const { runRepl } = await import('./repl.ts');
-    return runRepl({ args });
+    // Hold each fast tool card on screen ~400ms so read / write / quick
+    // bash are actually perceptible instead of flashing past inside a
+    // single frame budget (see RendererOptions.toolMinDisplayMs).
+    return runRepl({ args, toolMinDisplayMs: 400 });
   }
 
   // Lazy import: pulling `./run.ts` transitively loads provider SDKs,

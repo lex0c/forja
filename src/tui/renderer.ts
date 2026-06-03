@@ -45,6 +45,7 @@ import {
   type PermanentItem,
   applyEvent,
   createInitialState,
+  flushPendingToolEndBatch,
 } from './state.ts';
 import {
   type Capabilities,
@@ -73,6 +74,23 @@ import {
 // get the full public surface without reaching into `./render/`.
 export type { ComposeLive };
 export { defaultComposeLiveFn as defaultComposeLive, formatPermanent };
+
+// Interaction events that bypass the tool min-display hold queue
+// (RendererOptions.toolMinDisplayMs). These are keystroke-driven and
+// scrollback-neutral: they touch only the input / overlay slices of
+// LiveState, never emit a permanent (scrollback) item, and commute
+// with the held tool lifecycle. Processing them immediately keeps
+// typing latency at zero even while a fast tool's card is held on
+// screen. Anything NOT listed here goes through the FIFO queue so
+// scrollback ordering stays correct — the cost of a missing entry is
+// at most a `toolMinDisplayMs` delay, never a reordering bug, so the
+// list errs on the side of omission.
+const HOLD_BYPASS: ReadonlySet<UIEvent['type']> = new Set([
+  'input:update',
+  'slash:update',
+  'reverse-search:update',
+  'reverse-search:close',
+]);
 
 export interface RendererOptions {
   bus: Bus;
@@ -117,6 +135,23 @@ export interface RendererOptions {
   // `manual`, raw mode arms only at the moment a focus handler is
   // ready to receive keystrokes.
   inputMode?: 'eager' | 'manual';
+  // Minimum wall-clock time (ms) a live tool card stays on screen
+  // before its `tool:end` is allowed to remove it. Fast tools
+  // (read / write / quick bash) otherwise complete within a single
+  // frame budget (~33ms at 30fps) — by the time the coalesced frame
+  // draws, the reducer has already removed the tool from
+  // `activeTools`, so the card never paints. It "flashes and
+  // disappears". When this is > 0, the renderer HOLDS each `tool:end`
+  // (and the harness events queued behind it) until the card has been
+  // visible at least this long, keeping it on screen (and animating
+  // via the heartbeat). Keystroke / overlay events bypass the hold so
+  // typing stays responsive. 0 (default) disables the hold entirely —
+  // events process in arrival order with zero added latency, which is
+  // what the renderer test-suite assumes. Production wires a small
+  // positive value. Timer + clock injection reuse `schedulerOptions`
+  // (`setTimer` / `clearTimer`) and `now` so the hold is deterministic
+  // under test.
+  toolMinDisplayMs?: number;
 }
 
 export interface Renderer {
@@ -149,6 +184,23 @@ export const createRenderer = (options: RendererOptions): Renderer => {
     bracketedPaste = true,
     now = () => Date.now(),
   } = options;
+
+  // Tool min-display hold (see RendererOptions.toolMinDisplayMs).
+  // Reuse the scheduler's injectable timer hooks so the hold is
+  // deterministic under the same test seam that drives frames.
+  const toolMinDisplayMs = Math.max(0, options.toolMinDisplayMs ?? 0);
+  const holdSetTimer = schedulerOptions?.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
+  const holdClearTimer =
+    schedulerOptions?.clearTimer ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
+  // Wall-clock time each live tool card first appeared, keyed by
+  // toolId — the anchor for the min-display hold. Set on `tool:start`,
+  // cleared when its `tool:end` finally processes.
+  const toolShownAt = new Map<string, number>();
+  // FIFO buffer for events held behind a not-yet-elapsed tool card.
+  // Only non-bypass events land here (see HOLD_BYPASS).
+  const eventQueue: UIEvent[] = [];
+  // Active hold timer, or null when the queue is draining freely.
+  let holdTimer: unknown = null;
 
   // Mutable internal copy of caps. SIGWINCH/resize updates `cols`/`rows`
   // here so `drawLive` and `composeLive` see fresh dimensions on every
@@ -323,6 +375,22 @@ export const createRenderer = (options: RendererOptions): Renderer => {
   const wrapSync = (buf: string): string =>
     buf.length === 0 ? '' : `${beginSyncOutput}${buf}${endSyncOutput}`;
 
+  // Compose the live region as an array of SINGLE terminal rows.
+  // `composeLive` is contracted to return one string per row, but a
+  // render function that interpolates an unsanitized field (a tool
+  // subject with a literal `\n`, a multi-line error summary) can emit
+  // one element that spans several rows. That breaks the core invariant
+  // every count here relies on — `liveHeight`, `cursorRow`, the erase
+  // walk-back, and the differential diff all assume one element == one
+  // row — and the symptom is stale rows leaking into scrollback (an
+  // "Awaiting approval" card that never gets erased). Splitting embedded
+  // newlines here is the single chokepoint that restores the invariant
+  // for ALL sources; subjects are also flattened upstream
+  // (harness-adapter) for a cleaner one-line look, so this is the
+  // belt-and-suspenders guard for everything else.
+  const composeRows = (): string[] =>
+    composeLive(state, liveCaps, now()).flatMap((l) => l.split('\n'));
+
   // Compose a full erase + permanent + draw transition into one buffer
   // and emit it. Used by every path that prints permanent items
   // (regular event with `result.permanent`, reducer-error fallback,
@@ -342,7 +410,7 @@ export const createRenderer = (options: RendererOptions): Renderer => {
     // stays present; the next user prompt naturally lands on a
     // visible input box. The renderer's `closed` flag handles
     // teardown for one-shot mode (close() erases the live region).
-    const raw = composeLive(state, liveCaps, now());
+    const raw = composeRows();
     const truncated = raw.map((l) => truncateToWidth(l, liveCaps.cols));
     buf += cursorVisibilityEscape(state.modal !== null);
     buf += buildFullDraw(truncated);
@@ -363,7 +431,7 @@ export const createRenderer = (options: RendererOptions): Renderer => {
   // stay untouched and the terminal never repaints them.
   const redraw = (): void => {
     if (closed) return;
-    const raw = composeLive(state, liveCaps, now());
+    const raw = composeRows();
     const truncated = raw.map((l) => truncateToWidth(l, liveCaps.cols));
     // Cursor visibility transition: emit hide-on-modal /
     // show-on-no-modal at the SAME frame as the modal state
@@ -431,11 +499,22 @@ export const createRenderer = (options: RendererOptions): Renderer => {
           onTick: () => scheduler.request(),
         });
 
-  // Bus subscription: fold every event, emit permanent if any, then
+  // Process one event: fold it into state, emit permanent if any, then
   // request a frame. Permanent output requires erasing the live region
-  // first (otherwise the new permanent text would land below it).
-  const handleEvent = (event: UIEvent): void => {
+  // first (otherwise the new permanent text would land below it). This
+  // is the unconditional apply path — `handleEvent` (below) gates which
+  // events reach it immediately vs. wait out a tool's min-display hold.
+  const processEvent = (event: UIEvent): void => {
     if (closed) return;
+    // Anchor / release the min-display clock for tool cards. `tool:start`
+    // stamps when the card first appeared; `tool:end` (reaching here only
+    // after any hold elapsed) releases it. `session:start` drops any
+    // orphaned anchors (a tool whose `tool:end` never arrived because the
+    // turn was aborted mid-call) so the map can't accumulate across a
+    // long REPL session — no tool spans a turn boundary.
+    if (event.type === 'tool:start') toolShownAt.set(event.toolId, now());
+    else if (event.type === 'tool:end') toolShownAt.delete(event.toolId);
+    else if (event.type === 'session:start') toolShownAt.clear();
     // `screen:clear` is a renderer-side concern (writes ANSI escape,
     // forces redraw); the reducer is a no-op for it. Handle here so
     // the clear escape lands at the right moment in the I/O stream
@@ -471,7 +550,7 @@ export const createRenderer = (options: RendererOptions): Renderer => {
       liveHeight = 0;
       cursorRow = 0;
       prevLines = [];
-      const raw = composeLive(state, liveCaps, now());
+      const raw = composeRows();
       const truncated = raw.map((l) => truncateToWidth(l, liveCaps.cols));
       let buf = '\x1b[2J\x1b[H';
       if (truncated.length > 0) {
@@ -504,6 +583,53 @@ export const createRenderer = (options: RendererOptions): Renderer => {
     // it; `tool:end` (the last running tool) leaves the predicate
     // false, so the heartbeat stops on the next firing.
     heartbeat?.bump();
+  };
+
+  // Drain queued events in arrival order, pausing when the head is a
+  // `tool:end` whose card hasn't been on screen for `toolMinDisplayMs`
+  // yet. While paused, the tool is still in `activeTools` (its
+  // `tool:end` hasn't been applied), so the live region keeps showing
+  // and animating the card via the heartbeat. A one-shot timer resumes
+  // the drain once the remaining time elapses. With `toolMinDisplayMs`
+  // at 0 (default) this never pauses and the queue empties synchronously
+  // on every call — identical ordering to processing events inline.
+  const drainQueue = (): void => {
+    if (closed) return;
+    if (holdTimer !== null) return; // already waiting; the timer will resume us
+    while (eventQueue.length > 0) {
+      const head = eventQueue[0] as UIEvent;
+      if (toolMinDisplayMs > 0 && head.type === 'tool:end') {
+        const shownAt = toolShownAt.get(head.toolId);
+        if (shownAt !== undefined) {
+          const remaining = toolMinDisplayMs - (now() - shownAt);
+          if (remaining > 0) {
+            holdTimer = holdSetTimer(() => {
+              holdTimer = null;
+              drainQueue();
+            }, remaining);
+            return; // leave `head` queued — card stays live until we resume
+          }
+        }
+      }
+      eventQueue.shift();
+      processEvent(head);
+    }
+  };
+
+  // Bus subscription entry point. Keystroke / overlay events bypass the
+  // hold queue (HOLD_BYPASS) so typing stays responsive while a fast
+  // tool's card is held on screen; everything else goes through the
+  // FIFO queue so scrollback ordering is preserved. Bypass events touch
+  // only the input / overlay state and emit no permanent items, so
+  // applying them out of band relative to a held tool:end is safe.
+  const handleEvent = (event: UIEvent): void => {
+    if (closed) return;
+    if (HOLD_BYPASS.has(event.type)) {
+      processEvent(event);
+      return;
+    }
+    eventQueue.push(event);
+    drainQueue();
   };
 
   // Resize watcher: keep `liveCaps.cols`/`rows` in sync with the
@@ -553,6 +679,28 @@ export const createRenderer = (options: RendererOptions): Renderer => {
     enableInput,
     close: () => {
       if (closed) return;
+      // Flush anything held behind a min-display timer BEFORE marking
+      // closed — we're tearing down, so landing each event's scrollback
+      // beats dropping it. Cancel the pending hold and process the queue
+      // in order, ignoring the min-display gate (processEvent still runs
+      // because `closed` is not yet set). Bypass events never queue, so
+      // this is exactly the held tool lifecycle tail.
+      if (holdTimer !== null) {
+        holdClearTimer(holdTimer);
+        holdTimer = null;
+      }
+      const pending = eventQueue.splice(0);
+      for (const ev of pending) processEvent(ev);
+      // A drained `tool:end` for a successful tool only buffers into
+      // the coalescing batch; without a follow-up flush trigger its
+      // scrollback line would never land. Flush the batch explicitly so
+      // teardown preserves the final-verb chip (the reducer does the
+      // same at `session:end`).
+      const flushed = flushPendingToolEndBatch(state);
+      if (flushed.permanent.length > 0) {
+        state = flushed.state;
+        writeTransition(flushed.permanent);
+      }
       closed = true;
       unsubscribe();
       unsubscribeResize();
