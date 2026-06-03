@@ -391,9 +391,10 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // operator's own shell output; we don't recolor it), capped at
       // MAX_OPERATOR_BASH_LINES with a `… +N more lines` tail so a
       // `!cat hugefile` can't bury scrollback. The output arrives
-      // ALREADY ANSI-stripped (sanitized at intake in repl's
-      // runOperatorBash, per SECURITY_GUIDELINE §3.2), so rendering it
-      // verbatim can't hijack terminal state — only TAB/LF/CR survive.
+      // ALREADY sanitized at intake (repl's runOperatorBash, per
+      // SECURITY_GUIDELINE §3.2): ANSI + control bytes stripped and CR
+      // normalized to LF, so rendering it verbatim can't hijack terminal
+      // state or overwrite the frame margin — only TAB/LF survive.
       const failed = item.exitCode !== 0;
       // Flatten a multi-line command (the editor accepts `\`+Enter /
       // Shift+Enter newlines) to a single display line: a raw `\n` in

@@ -1456,6 +1456,18 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // `Promise.resolve().then(...)` so a synchronously-throwing `execBash`
   // (a malformed test seam) becomes a rejection the `.catch` handles,
   // instead of escaping past the `.finally` and leaving the flag stuck.
+  // Sanitize `!cmd` output before it enters the event stream
+  // (SECURITY_GUIDELINE §3.2). `stripAnsi` removes ANSI escapes + C0/C1/
+  // DEL control bytes (screen-clear, hide-cursor, OSC, …) but KEEPS the
+  // whitespace controls TAB/LF/CR. CR is the catch: a bare `\r` returns
+  // the terminal to column 0, so when the renderer writes an output row
+  // verbatim under the 2-space frame margin, the row overwrites the
+  // indentation / earlier content — a spoofing vector through e.g.
+  // `!cat untrusted-file`. Collapse `\r\n` and lone `\r` to `\n` so each
+  // overwrite becomes a fresh (safe) row, keeping the line structure.
+  // One intake point covers every consumer (renderer + `--json`).
+  const sanitizeBashOutput = (s: string): string => stripAnsi(s).replace(/\r\n?/g, '\n');
+
   const runOperatorBash = (command: string): void => {
     operatorBashRunning = true;
     operatorBashInterrupted = false;
@@ -1475,15 +1487,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           type: 'operator-bash:done',
           ts: now(),
           command,
-          // Strip ANSI + control bytes from the command's output before
-          // it enters the event stream (SECURITY_GUIDELINE §3.2): raw
-          // bytes from e.g. `!cat untrusted-file` could clear the screen,
-          // hide the cursor, or spoof TUI chrome when rendered to
-          // scrollback (or forwarded to NDJSON). stripAnsi keeps the
-          // safe whitespace controls (TAB/LF/CR) so multi-line text and
-          // the line split survive. Sanitizing at this single intake
-          // point covers every consumer (renderer + `--json` forwarder).
-          output: stripAnsi(output),
+          output: sanitizeBashOutput(output),
           exitCode,
           durationMs: now() - startedAt,
         });
@@ -1494,7 +1498,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           type: 'operator-bash:done',
           ts: now(),
           command,
-          output: stripAnsi(msg),
+          output: sanitizeBashOutput(msg),
           exitCode: -1,
           durationMs: now() - startedAt,
         });

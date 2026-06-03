@@ -807,6 +807,37 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('operator command output normalizes carriage returns (no column-0 overwrite)', async () => {
+    // A bare `\r` survives stripAnsi but would return the cursor to
+    // column 0 and overwrite the frame margin / earlier content of the
+    // rendered row. It's collapsed to `\n` so each overwrite becomes a
+    // fresh row instead.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      execBash: (async () => ({ output: 'KEEPME\rSPOOF', exitCode: 0 })) as NonNullable<
+        RunReplOptions['execBash']
+      >,
+    });
+    await tick();
+    stdin.feed('!cat evil\r');
+    await flushFrame();
+    const out = writes.join('');
+    expect(out).toContain('KEEPME'); // both texts survive...
+    expect(out).toContain('SPOOF');
+    expect(out).not.toContain('KEEPME\rSPOOF'); // ...but not as a column-0 overwrite
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('operator command output is ANSI-stripped before scrollback (no terminal hijack)', async () => {
     // A command like `!cat` on a file containing ESC[2J could clear the
     // screen / hide the cursor / spoof chrome. Output is sanitized at

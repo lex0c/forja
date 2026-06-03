@@ -14,6 +14,14 @@ All bypassed events emit no permanent and touch only live-region/overlay state, 
 
 **Tests.** `renderer.test.ts`: with a held `tool:end`, a `permission:ask` sets `state.modal` immediately (not queued); an `interrupt` flips `softInterrupted` immediately. Verification: `tests/tui` + `tests/cli/repl` 1026 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
 
+## [2026-06-03] TUI `!cmd`: normalize carriage returns in command output
+
+**Finding.** `stripAnsi` (the intake sanitizer) keeps the whitespace controls TAB/LF/CR — but a bare `\r` survives, and the operator-bash card renders output rows verbatim under a 2-space frame margin. A `\r` returns the cursor to column 0, so a row from e.g. `!cat untrusted-file` (or progress-style output) overwrites the indentation / earlier content of that row — the exact spoofing the sanitization is meant to prevent.
+
+**Fix.** A `sanitizeBashOutput` helper now wraps `stripAnsi` with `.replace(/\r\n?/g, '\n')` — `\r\n` and lone `\r` collapse to `\n`, so each would-be overwrite becomes a fresh (safe) row while the line structure is kept. Applied at the single intake point (both `operator-bash:done` emit paths). Only TAB/LF survive into the rendered output now.
+
+**Tests.** `repl.test.ts`: output `KEEPME\rSPOOF` renders with both texts on separate rows and never as the column-0-overwrite adjacency. Verification: `tests/tui` + `tests/cli/repl` 1027 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
 ## [2026-06-03] TUI `!cmd`: ANSI-sanitize command output (terminal-hijack guard)
 
 **Finding.** Operator command output was rendered VERBATIM to scrollback. A command like `!cat` on a file containing `ESC[2J` / OSC / hide-cursor would push raw control bytes to the terminal — clearing the screen, moving/hiding the cursor, or spoofing TUI chrome. The repo already treats this as terminal-state hijack (`src/sanitize/ansi.ts`, SECURITY_GUIDELINE §3.2).
