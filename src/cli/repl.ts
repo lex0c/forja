@@ -114,6 +114,33 @@ export interface RunReplOptions {
   // place of process.stdout.write. Tests pass a string collector to
   // capture the banner / live frames without touching real stdio.
   rendererWrite?: (s: string) => void;
+  // Minimum on-screen time (ms) for a live tool card before its
+  // `tool:end` removes it (see RendererOptions.toolMinDisplayMs).
+  // Defaults to 0 (off) so REPL tests drive tool flows synchronously;
+  // the production entrypoint (cli/index.ts) passes the real value.
+  toolMinDisplayMs?: number;
+  // Test seam: run an operator `!cmd` shell command. Defaults to a real
+  // `Bun.spawn` of `bash -c <command>` in the REPL cwd with the
+  // operator's full env (the shell-style `!` escape — operator's own
+  // shell, NOT the agent's permission engine / sandbox). Tests inject a
+  // fake to avoid spawning a real shell.
+  execBash?: (
+    command: string,
+    cwd: string,
+    // Called once with a kill switch for the spawned command's process
+    // group, so the interrupt path (Ctrl+C / Esc) can terminate it. The
+    // default impl wires it to a group kill; a test seam may ignore it
+    // or use it to resolve on demand.
+    onKillable?: (kill: (signal: NodeJS.Signals) => void) => void,
+  ) => Promise<{ output: string; exitCode: number }>;
+  // Test seam: override the operator `!cmd` timeout (default 120s) so a
+  // test can prove the kill path terminates a hung command without
+  // waiting two minutes.
+  operatorBashTimeoutMs?: number;
+  // Test seam: override the operator `!cmd` stdout byte cap (default
+  // 1 MiB) so a test can prove a flood is capped without buffering a
+  // megabyte.
+  operatorBashMaxOutputBytes?: number;
   // Test seam: skip the first-run trust prompt (AGENTIC_CLI §9.1).
   // Production never sets this — operator always sees the prompt
   // on first cwd visit. Tests don't drive the trust modal (the
@@ -242,6 +269,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // keeps the cooked-mode SIGINT path live until we're ready
     // to take stdin.
     inputMode: 'manual',
+    // Keep fast tool cards (read / write / quick bash) on screen long
+    // enough to perceive — without this they complete inside one frame
+    // budget and never paint. See RendererOptions.toolMinDisplayMs.
+    // Default 0 (off) here so the REPL test-suite drives tool flows
+    // synchronously; the production entrypoint (cli/index.ts) wires the
+    // real value.
+    toolMinDisplayMs: options.toolMinDisplayMs ?? 0,
     ...(options.rendererWrite !== undefined ? { write: options.rendererWrite } : {}),
   });
   // Forward reference: triggerInterrupt is defined post-bootstrap
@@ -279,6 +313,24 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // await) ensures a second slash dispatch fired in the same Enter
   // burst sees `isRunning() === true` and refuses cleanly.
   let playbookRunning = false;
+  // True while an operator `!cmd` shell command is in flight. Part of
+  // `isBusy` so it serializes against agent turns and playbooks (and
+  // against a second `!` command) — one operator action at a time.
+  let operatorBashRunning = false;
+  // Kill switch for the in-flight `!cmd`, handed up by the executor so
+  // the interrupt path (Ctrl+C / Esc) can terminate the command's
+  // process group instead of waiting out the timeout. Null when no
+  // command runs (or the test seam didn't expose one).
+  let operatorBashKill: ((signal: NodeJS.Signals) => void) | null = null;
+  // First-tap latch for the `!cmd` interrupt ladder: SIGINT on the
+  // first Ctrl+C/Esc, SIGKILL on a repeat if the command ignored it.
+  let operatorBashInterrupted = false;
+  // The in-flight `!cmd` promise, so shutdown can kill + await it (the
+  // same contract `runningPromise` / `playbookPromise` have). Without
+  // this, EOF / SIGINT mid-`!cmd` would close the REPL while the
+  // detached group kept running and its completion tried to emit on a
+  // torn-down bus. Null when no command runs.
+  let operatorBashPromise: Promise<void> | null = null;
   // Single busy predicate threaded through every submit gate
   // (foreground startTurn, Enter in the editor, Enter in
   // reverse-search) AND the slash dispatcher's `isRunning()`
@@ -286,7 +338,20 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // on `running` alone and let a normal turn start mid-playbook
   // — the exact serialization the playbookRunning flag was
   // supposed to enforce, defeated at every other entry point.
-  const isBusy = (): boolean => running || playbookRunning;
+  const isBusy = (): boolean => running || playbookRunning || operatorBashRunning;
+  // Mirror `isBusy()` into renderer state so the bash-mode visuals gate
+  // on the same condition the submit path uses (render/mode.ts). Call
+  // after EVERY mutation of `running` / `playbookRunning` /
+  // `operatorBashRunning` — the dedup makes spurious calls cheap, but a
+  // MISSED call leaves `state.busy` stale (a `!` would show shell UI for
+  // a command Enter refuses). Deduped so only real transitions emit.
+  let lastBusyEmitted = false;
+  const syncBusy = (): void => {
+    const b = isBusy();
+    if (b === lastBusyEmitted) return;
+    lastBusyEmitted = b;
+    bus.emit({ type: 'busy:change', ts: now(), busy: b });
+  };
 
   const ESC_DRAIN_MS = 30;
   let drainTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1139,6 +1204,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // old timing.
     if (event.type === 'session_finished') {
       running = false;
+      syncBusy();
       sawSessionFinished = true;
       lastSessionId = event.result.sessionId;
       trackReplSessionId(event.result.sessionId);
@@ -1280,9 +1346,260 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     body: string;
   }): Promise<'yes' | 'no' | 'cancel'> => modalManager.askMemoryUserScope(req);
 
+  // Operator `!cmd` execution. Runs as the operator's own shell — NOT
+  // through the agent permission engine or sandbox (the engine gates the
+  // agent, not the human at the keyboard; this is the shell-style `!`
+  // escape). `bash -c` in the REPL cwd with the operator's full env. A
+  // generous timeout is the guard, so a hung command can't wedge the
+  // REPL forever. The result lands in scrollback via `operator-bash:done`.
+  const OPERATOR_BASH_TIMEOUT_MS = options.operatorBashTimeoutMs ?? 120_000;
+  // Memory guard: stop draining stdout once this many bytes are buffered
+  // and SIGKILL the producer, so a flood (`!yes`, `!cat bigfile`) can't
+  // exhaust the CLI before the timeout. 1 MiB — far above any sane
+  // command's useful output, and the renderer only shows ~200 lines of it.
+  const OPERATOR_BASH_MAX_OUTPUT_BYTES = options.operatorBashMaxOutputBytes ?? 1_048_576;
+  const execBash =
+    options.execBash ??
+    (async (
+      command: string,
+      runCwd: string,
+      onKillable?: (kill: (signal: NodeJS.Signals) => void) => void,
+    ): Promise<{ output: string; exitCode: number }> => {
+      // `detached: true` puts the command in its own process group so a
+      // kill targets the WHOLE group, not just the `bash -c` leader. A
+      // bare `proc.kill()` (single signal to bash) leaves pipeline
+      // children / signal-ignoring procs holding the stdout pipe open,
+      // so `Response().text()` below would await EOF forever and
+      // `operatorBashRunning` would stick true — wedging the REPL.
+      // Killing the group (POSIX `process.kill(-pid, …)`, the bg-manager
+      // convention) closes the pipes and unblocks.
+      //
+      // `exec 2>&1` (first line of the script) redirects the shell's
+      // fd 2 onto fd 1 for the whole command, so stderr and stdout
+      // interleave on ONE pipe in the order the command emitted them —
+      // a separate-pipe read + concat would move every diagnostic after
+      // all normal output, misrepresenting a compiler/test transcript.
+      const proc = Bun.spawn({
+        cmd: ['bash', '-c', `exec 2>&1\n${command}`],
+        cwd: runCwd,
+        env: process.env,
+        stdout: 'pipe',
+        stderr: 'ignore',
+        detached: true,
+      });
+      const killGroup = (signal: NodeJS.Signals): void => {
+        const pid = proc.pid;
+        try {
+          if (pid !== undefined && pid > 0) process.kill(-pid, signal);
+          else proc.kill(signal);
+        } catch {
+          // group already gone, or no PID — fall back to the leader.
+          try {
+            proc.kill(signal);
+          } catch {
+            // also gone — nothing to kill.
+          }
+        }
+      };
+      // Hand the kill switch to the interrupt path (Ctrl+C / Esc).
+      onKillable?.(killGroup);
+      // Hard backstop: SIGKILL the group if the command overstays. The
+      // interrupt path uses SIGINT/SIGKILL before this ever fires.
+      const killer = setTimeout(() => killGroup('SIGKILL'), OPERATOR_BASH_TIMEOUT_MS);
+      try {
+        // Drain stdout with a BYTE cap, not `Response().text()` which
+        // buffers the whole stream first: a high-volume command (`!yes`,
+        // `!cat bigfile`) would exhaust memory long before the timeout.
+        // Read chunks, stop once the cap is crossed, and SIGKILL the
+        // group so the producer can't keep flooding. (The renderer's
+        // line cap is a separate DISPLAY guard; this is the MEMORY one.)
+        const reader = proc.stdout.getReader();
+        const decoder = new TextDecoder();
+        let output = '';
+        let bytes = 0;
+        let capped = false;
+        // Stop blocking on stream EOF once the FOREGROUND `bash -c` exits.
+        // A command that backgrounds a child (`!sleep 60 &`, `!npm run dev
+        // &`) leaves that child holding the inherited stdout pipe open, so
+        // the stream never reaches `done` until the child dies or the 120s
+        // timeout SIGKILLs the group — the REPL would stay busy the whole
+        // time even though the shell is done. Race each read against
+        // `proc.exited`; when the shell exits, switch to a bounded
+        // best-effort flush of whatever is already buffered, then return,
+        // leaving any detached child to live on like a real shell `&` job.
+        //
+        // INVARIANT: exactly one outstanding `reader.read()` at a time.
+        // We carry the SAME `pendingRead` promise across race iterations
+        // (re-issuing only after it resolves) — racing `read()` then
+        // issuing a fresh `read()` while the first is still pending would
+        // queue two reads and reorder/drop chunks into a promise we never
+        // await. `tagRead` wraps that single promise with a discriminant;
+        // it attaches a `.then` (cheap) and does NOT start a new read.
+        const exitedSignal = proc.exited.then(() => 'exit' as const);
+        const tagRead = (p: typeof pendingRead) =>
+          p.then((result) => ({ tag: 'read' as const, result }));
+        // Buffered output is already in the pipe when the shell exits, so
+        // it surfaces on the next read within a microtask; this grace is
+        // only the cutoff for an open-but-idle pipe (a `&` child not
+        // currently writing), so it can be short.
+        const POST_EXIT_DRAIN_MS = 50;
+        let pendingRead = reader.read();
+        let foregroundExited = false;
+        try {
+          for (;;) {
+            const winner = await Promise.race([tagRead(pendingRead), exitedSignal]);
+            if (winner === 'exit') {
+              foregroundExited = true;
+              break;
+            }
+            const { done, value } = winner.result;
+            if (done) break;
+            if (value !== undefined) {
+              bytes += value.byteLength;
+              output += decoder.decode(value, { stream: true });
+              if (bytes >= OPERATOR_BASH_MAX_OUTPUT_BYTES) {
+                capped = true;
+                killGroup('SIGKILL');
+                break;
+              }
+            }
+            pendingRead = reader.read();
+          }
+          // Foreground shell done but the pipe is still open (a `&` child):
+          // flush only what's already buffered, bounded by a short grace so
+          // an idle-but-open pipe can't reintroduce the hang.
+          if (foregroundExited && !capped) {
+            for (;;) {
+              let graceTimer: ReturnType<typeof setTimeout> | undefined;
+              const grace = new Promise<'grace'>((resolve) => {
+                graceTimer = setTimeout(() => resolve('grace'), POST_EXIT_DRAIN_MS);
+              });
+              const winner = await Promise.race([tagRead(pendingRead), grace]);
+              if (graceTimer !== undefined) clearTimeout(graceTimer);
+              if (winner === 'grace') break;
+              const { done, value } = winner.result;
+              if (done) break;
+              if (value !== undefined) {
+                bytes += value.byteLength;
+                output += decoder.decode(value, { stream: true });
+                if (bytes >= OPERATOR_BASH_MAX_OUTPUT_BYTES) {
+                  capped = true;
+                  killGroup('SIGKILL');
+                  break;
+                }
+              }
+              pendingRead = reader.read();
+            }
+          }
+          output += decoder.decode(); // flush any trailing partial codepoint
+        } finally {
+          try {
+            await reader.cancel();
+          } catch {
+            // stream already closed by the kill — nothing to release.
+          }
+        }
+        const exitCode = await proc.exited;
+        if (capped) {
+          output += `\n[output capped at ${OPERATOR_BASH_MAX_OUTPUT_BYTES} bytes — command terminated]`;
+        }
+        return { output, exitCode };
+      } finally {
+        clearTimeout(killer);
+      }
+    });
+
+  // Fire-and-forget: flip the busy flag, run the command, emit the
+  // result, clear the flag. Refusal-while-busy is handled by the
+  // caller (the Enter dispatch); by the time we get here the REPL is
+  // idle and owns the operator slot. The command runs inside a
+  // `Promise.resolve().then(...)` so a synchronously-throwing `execBash`
+  // (a malformed test seam) becomes a rejection the `.catch` handles,
+  // instead of escaping past the `.finally` and leaving the flag stuck.
+  // Sanitize `!cmd` output before it enters the event stream
+  // (SECURITY_GUIDELINE §3.2). `stripAnsi` removes ANSI escapes + C0/C1/
+  // DEL control bytes (screen-clear, hide-cursor, OSC, …) but KEEPS the
+  // whitespace controls TAB/LF/CR. CR is the catch: a bare `\r` returns
+  // the terminal to column 0, so when the renderer writes an output row
+  // verbatim under the 2-space frame margin, the row overwrites the
+  // indentation / earlier content — a spoofing vector through e.g.
+  // `!cat untrusted-file`. Collapse `\r\n` and lone `\r` to `\n` so each
+  // overwrite becomes a fresh (safe) row, keeping the line structure.
+  // One intake point covers every consumer (renderer + `--json`).
+  const sanitizeBashOutput = (s: string): string => stripAnsi(s).replace(/\r\n?/g, '\n');
+
+  const runOperatorBash = (command: string): void => {
+    operatorBashRunning = true;
+    operatorBashInterrupted = false;
+    syncBusy();
+    const startedAt = now();
+    // Captured (not `void`) so shutdown can kill + await it.
+    operatorBashPromise = Promise.resolve()
+      .then(() =>
+        execBash(command, cwd, (kill) => {
+          // Executor exposes its process-group kill switch; the
+          // interrupt path (triggerInterrupt) uses it.
+          operatorBashKill = kill;
+          // Replay a shutdown that landed BEFORE the hook was registered.
+          // requestShutdown sets `exiting` synchronously, then shutdown()
+          // runs to its first await — including `operatorBashKill?.(…)`,
+          // which no-ops while the kill switch is still null (the executor
+          // is a deferred microtask: `!sleep 600` + Ctrl+D in one stdin
+          // burst races the spawn). Without this replay only the interrupt
+          // latch below covers that window, so EOF/quit right after a
+          // `!cmd` would await the command to natural exit / the 120s
+          // timeout — a hung quit. SIGKILL, not the SIGINT ladder:
+          // shutdown wants it gone, and this supersedes any interrupt.
+          if (exiting) {
+            kill('SIGKILL');
+            return;
+          }
+          // Replay an interrupt that landed BEFORE the hook was
+          // registered: Ctrl+C/Esc can arrive in the same stdin chunk
+          // as the submitting Enter (or a seam may register the hook
+          // async), so triggerInterrupt set the latch but had no kill to
+          // call. Without this, that first interrupt is dropped and the
+          // command runs until a second press or the timeout. SIGINT —
+          // the first-tap signal; a later press still escalates.
+          if (operatorBashInterrupted) kill('SIGINT');
+        }),
+      )
+      .then(({ output, exitCode }) => {
+        bus.emit({
+          type: 'operator-bash:done',
+          ts: now(),
+          command,
+          output: sanitizeBashOutput(output),
+          exitCode,
+          durationMs: now() - startedAt,
+        });
+      })
+      .catch((e: unknown) => {
+        const msg = e instanceof Error ? e.message : String(e);
+        bus.emit({
+          type: 'operator-bash:done',
+          ts: now(),
+          command,
+          output: sanitizeBashOutput(msg),
+          exitCode: -1,
+          durationMs: now() - startedAt,
+        });
+      })
+      .finally(() => {
+        operatorBashRunning = false;
+        operatorBashKill = null;
+        operatorBashPromise = null;
+        syncBusy();
+        // The REPL was idle while the command ran; if messages queued
+        // meanwhile (operator typed ahead), drain them now.
+        if (!isBusy()) queueMicrotask(() => drainInbox());
+      });
+  };
+
   const startTurn = (text: string): void => {
     if (isBusy() || exiting) return;
     running = true;
+    syncBusy();
     // Mint a fresh token for this turn and claim ownership of the
     // shared state slots (running / abortController / runningPromise).
     // The finalizer below compares against `activeTurnToken` to refuse
@@ -1334,6 +1651,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // this turn IS still active, and the cleanup runs.
         if (activeTurnToken !== myToken) return;
         running = false;
+        syncBusy();
         abortController = null;
         softStopController = null;
         runningPromise = null;
@@ -1412,6 +1730,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // below blocks db.close() until the child's payload write
     // lands.
     if (playbookAbortController !== null) playbookAbortController.abort();
+    // SIGKILL an in-flight operator `!cmd`'s process group so it doesn't
+    // outlive the REPL (detached → would keep running for up to the
+    // timeout) and so its completion settles + emits BEFORE renderer.close
+    // below, not on a torn-down bus. The await is in the promise section.
+    if (operatorBashRunning) operatorBashKill?.('SIGKILL');
     // Cancel any pending idle-exit-gate timer so a 2s setTimeout
     // doesn't outlive the REPL and leak a node handle (visible in
     // tests as Bun's "open handles" warning, and in production as
@@ -1437,6 +1760,17 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // Swallow — runPlaybook's caller (slash exec) already
         // surfaces failures via the slash bus error channel; the
         // shutdown path only needs the wait, not the verdict.
+      }
+    }
+    // Same wait for an operator `!cmd` (SIGKILLed above): let its
+    // `operator-bash:done` emit land while the renderer is still open,
+    // and the read loop release, before teardown. The chain is already
+    // `.catch`ed, so the await never throws — but guard anyway.
+    if (operatorBashPromise !== null) {
+      try {
+        await operatorBashPromise;
+      } catch {
+        // settled with an error already surfaced as the bash card.
       }
     }
     modalManager.close();
@@ -1490,6 +1824,18 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // softInterrupted flag is the single source of truth for
   // distinguishing first tap from second.
   const triggerInterrupt = (): void => {
+    // An operator `!cmd` owns the interrupt while it runs: Ctrl+C / Esc
+    // kill its process group (like a terminal) rather than touching a
+    // turn. SIGINT on the first tap, SIGKILL on a repeat if it ignored
+    // SIGINT. We do NOT emit the turn-level `interrupt` event here —
+    // there's no turn, and it would leak `softInterrupted` into the next
+    // one. The kill closes the pipes → execBash resolves → the
+    // operator-bash card lands with the killed exit code.
+    if (operatorBashRunning) {
+      operatorBashKill?.(operatorBashInterrupted ? 'SIGKILL' : 'SIGINT');
+      operatorBashInterrupted = true;
+      return;
+    }
     const level: 'soft' | 'hard' = renderer.state().softInterrupted ? 'hard' : 'soft';
     bus.emit({ type: 'interrupt', ts: now(), level });
     if (level === 'hard') {
@@ -1734,6 +2080,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         throw new Error(`playbook '${name}' is not registered`);
       }
       playbookRunning = true;
+      syncBusy();
       // Fresh per-dispatch controllers. `triggerInterrupt`
       // (Esc / Ctrl+C / SIGINT / modal-cancel) reads these as a
       // mirror of the foreground per-turn controllers and
@@ -1853,6 +2200,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // call abort() on a settled signal or await a stale
         // promise.
         playbookRunning = false;
+        syncBusy();
         playbookAbortController = null;
         playbookSoftStopController = null;
         playbookPromise = null;
@@ -2527,6 +2875,29 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // back), the REPL is idle and no boundary will fire — drain the
         // just-committed edit now so it's actually sent as the next turn.
         if (!isBusy()) queueMicrotask(() => drainInbox());
+      } else if (result.submit.text.startsWith('!')) {
+        // Operator shell command (`!cmd`) — runs as the operator's own
+        // shell, not the agent (the engine gates the agent, not the
+        // human). No `user:submit` echo / inbox: the result lands as its
+        // own `operator-bash` scrollback card.
+        const command = result.submit.text.slice(1).trim();
+        if (command === '') {
+          // Bare `!` (or `!` + only blanks) — nothing to run; clear it.
+          bus.emit({ type: 'input:update', ts: now(), value: '', cursor: 0 });
+        } else if (isBusy()) {
+          // Serialize against turns / playbooks / another `!`. Leave the
+          // command in the buffer so it can be re-submitted once idle.
+          bus.emit({
+            type: 'warn',
+            ts: now(),
+            message:
+              'operator command refused: a turn is in flight — wait for it to finish, then re-run',
+          });
+        } else {
+          bus.emit({ type: 'input:update', ts: now(), value: '', cursor: 0 });
+          recordHistorySubmit(result.submit.text);
+          runOperatorBash(command);
+        }
       } else if (isBusy()) {
         enqueueInbox(result.submit.text);
       } else {
@@ -2584,7 +2955,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     //
     // Esc with no run in progress is a no-op (the editor's own
     // slash-mode Esc handler intercepted before reaching here).
-    if (result.interruptSoft === true && running) {
+    //
+    // Gate on `isBusy()` — NOT `running || operatorBashRunning`. It must
+    // match BOTH the Ctrl+C gate above AND the footer's interrupt cue
+    // (`state.busy`, the mirror of `isBusy()`): all three cover a turn, a
+    // playbook, OR an operator `!cmd`. Without the playbook arm here, a
+    // slash-playbook-only run would advertise "esc to interrupt" in the
+    // footer while Esc did nothing — `triggerInterrupt` already aborts the
+    // playbook controllers, so the only gap was this gate.
+    if (result.interruptSoft === true && isBusy()) {
       triggerInterrupt();
     }
 

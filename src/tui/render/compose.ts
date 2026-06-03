@@ -4,11 +4,17 @@
 //
 // Layout (top → bottom of live region):
 //   1. TodoList (1 + N lines — only when state.todos is non-empty).
-//   2. Live assistant chip ("Generating…") — only while
-//      pendingAssistant is set.
-//   3. Active tool cards (running form, with preview).
-//   4. Status line (1 line — only when session has started).
-//   5. Bottom anchor block:
+//   2. Subagent rows (one per concurrent child run).
+//   3. Live tool-end batch preview — the accumulating, grouped
+//      finalizations of consecutive same-name tools, rendered with the
+//      same formatter as scrollback so they stay visible (and grouped)
+//      until the batch settles into scrollback.
+//   4. Active tool cards (running form, with preview).
+//   5. Pinned turn-phase chip — the single live "what is the turn
+//      doing now" indicator (thinking / generating / tool-phase /
+//      awaiting), pinned at the bottom of the live region just above
+//      the input, with the tool stack (3–4) growing above it.
+//   6. Bottom anchor block:
 //      - rule above input
 //      - input box (1+ lines)
 //      - rule below input
@@ -16,12 +22,12 @@
 //      OR modal (when up), which owns the bottom slot entirely
 //      and carries its own structure.
 //
-// Order matches the spec: history above (scrollback), then todos,
-// then the live assistant chip, then live tool activity, then status,
+// Order: history above (scrollback), then todos, subagents, the
+// accumulating tool batch, live tool cards, the pinned phase chip,
 // then the bottom anchor (rule/input/rule/footer).
 
 import type { ComposeLive } from '../renderer-types.ts';
-import type { LiveState } from '../state.ts';
+import { type LiveState, flushPendingToolEndBatch } from '../state.ts';
 import { type Capabilities, paint } from '../term.ts';
 import { renderAssistantChip } from './assistant-chip.ts';
 import { renderAwaitingChip } from './awaiting-chip.ts';
@@ -30,12 +36,16 @@ import { padFrame } from './frame.ts';
 import { renderQueued } from './inbox.ts';
 import { renderInput } from './input.ts';
 import { renderModal } from './modal.ts';
+import { isBashMode } from './mode.ts';
+import { formatPermanent } from './permanent.ts';
 import { renderReverseSearch } from './reverse-search.ts';
 import { renderSlashPopover, slashPopoverLineCount } from './slash-popover.ts';
 import { renderSubagentRows } from './subagent-row.ts';
 import { renderThinkingChip } from './thinking-chip.ts';
 import { renderTodoList } from './todo-list.ts';
 import { renderToolCardLive } from './tool-card.ts';
+import { renderToolPhaseChip } from './tool-phase-chip.ts';
+import { visualWidth } from './width.ts';
 import { wrapInputLine } from './wrap.ts';
 
 // Horizontal rules around the input go edge-to-edge (UI.md §6.3
@@ -44,8 +54,11 @@ import { wrapInputLine } from './wrap.ts';
 // content above and the indented footer below — operator's eye reads
 // the block as "this is where you type" without the rules pretending
 // to belong to the padded frame.
-const horizontalRule = (caps: Capabilities): string =>
-  paint(caps, 'dim', (caps.unicode ? '─' : '-').repeat(caps.cols));
+// `bash` paints the rule `warn` (yellow) instead of `dim` — in bash
+// mode (`!cmd`) the whole input block, rules included, goes yellow so
+// the mode reads as one unmistakable unit.
+const horizontalRule = (caps: Capabilities, bash = false): string =>
+  paint(caps, bash ? 'warn' : 'dim', (caps.unicode ? '─' : '-').repeat(caps.cols));
 
 // Number of lines between the input's last row and the bottom of the
 // live region in the BASE case (rule below input + the footer line).
@@ -103,7 +116,15 @@ export const composeCursor = (
   lineCount: number,
 ): CursorPos | null => {
   if (state.modal !== null) return null;
-  const value = state.input.value;
+  // Bash mode (`render/input.ts`): an idle buffer starting with `!`
+  // renders the leading `!` as the prompt glyph, not content — so the
+  // drawn command is `value.slice(1)` and the caret is one column left
+  // of the raw offset. Mirror that here so the cursor lands on the right
+  // column; both sides consume the SAME `isBashMode` predicate
+  // (render/mode.ts) so they can't desync.
+  const bang = isBashMode(state);
+  const value = bang ? state.input.value.slice(1) : state.input.value;
+  const cursorAbs = bang ? Math.max(0, state.input.cursor - 1) : state.input.cursor;
   // Both '> ' (first line) and '  ' (continuation) are 2 chars wide;
   // soft-wrap chunks each `\n`-separated buffer line into chunks of
   // up to `caps.cols - prefixWidth` code units, with surrogate-pair
@@ -124,7 +145,6 @@ export const composeCursor = (
   const inputLineCount = lineChunks.reduce((acc, cs) => acc + rowsForChunks(cs.length), 0);
 
   // Find which buffer line + offset within it contains the cursor.
-  const cursorAbs = state.input.cursor;
   let charsBefore = 0;
   let bufferLineIdx = 0;
   let offsetInLine = 0;
@@ -144,7 +164,16 @@ export const composeCursor = (
     visualRowsBefore += rowsForChunks((lineChunks[i] ?? []).length);
   }
   const cursorChunks = lineChunks[bufferLineIdx] ?? [];
+  const cursorLine = lines[bufferLineIdx] ?? '';
   const numSubRows = rowsForChunks(cursorChunks.length);
+  // Column within a sub-row = the VISUAL width of the text from the
+  // chunk's start to the cursor (not its code-unit count), so a wide
+  // glyph (CJK / emoji = 2 cols) before the cursor advances the column
+  // by 2 — matching where the terminal actually puts the caret. Wraps
+  // are already wcwidth-aware (wrapInputLine), so this stays within the
+  // sub-row.
+  const colInChunk = (chunkStart: number): number =>
+    prefixWidth + visualWidth(cursorLine.slice(chunkStart, offsetInLine));
   // Locate the chunk whose code-unit range covers `offsetInLine`.
   // Linear walk is fine: typical input has < 30 chunks per line.
   // Cursor at the exact end of a chunk lands on that chunk's last
@@ -158,14 +187,14 @@ export const composeCursor = (
     if (chunk === undefined) continue;
     if (offsetInLine < chunk.end) {
       subRowInLine = c;
-      col = prefixWidth + (offsetInLine - chunk.start);
+      col = colInChunk(chunk.start);
       break;
     }
     // Past the last chunk's end — fall through; the clamp below
     // pins to the right edge of the last sub-row.
     if (c === cursorChunks.length - 1) {
       subRowInLine = c;
-      col = prefixWidth + (offsetInLine - chunk.start);
+      col = colInChunk(chunk.start);
     }
   }
 
@@ -229,7 +258,7 @@ export const composeLive: ComposeLive = (
   // returns [] when state.todos is empty — section drops entirely.
   appendBlock(renderTodoList(state.todos, caps));
 
-  // 1b. Active subagents (UI.md §4.2). One row per concurrent
+  // 2. Active subagents (UI.md §4.2). One row per concurrent
   // child run; section disappears when state.subagents is empty.
   // Rendered between TodoList and the assistant chip so the
   // operator's eye lands on "what's the AI doing on my behalf"
@@ -237,47 +266,86 @@ export const composeLive: ComposeLive = (
   // active turn (the AI's own thinking).
   appendBlock(renderSubagentRows(state.subagents, caps, now));
 
-  // 2. Live "Thinking…" or "Generating…" chip. Spec §4.10.5: the
-  // assistant turn is an operation chip just like a tool call.
-  // Renders above the tool cards because the assistant is the
-  // parent operation — tool calls it spawns sit beneath it
-  // visually.
+  // 3. Live preview of the accumulating tool-end batch. Consecutive
+  // same-name tools (read/read/read, or a run of bash) buffer into
+  // `pendingToolEndBatch` and only settle into scrollback when the
+  // group ends (a different-name tool, assistant text, or session
+  // end). Rendering that buffer here keeps the completed tools VISIBLE
+  // and GROUPED while they accumulate — without it a fast tool would
+  // flash, leave `activeTools`, and vanish into the invisible buffer
+  // until some later flush trigger (the "aparece mas some" report).
   //
-  // Mutual exclusion: harness-adapter.ts closes `thinking:end` the
-  // moment text starts streaming (within a turn the two states
-  // alternate but never overlap). When `state.thinking` is set we
-  // show the Thinking chip — more specific signal than the generic
-  // "Generating…", and explains the otherwise-confusing 5-30s
-  // gap with no token counter visible during extended thinking.
-  // When thinking has ended and only `pendingAssistant` is set, we
-  // show the Generating chip (existing behavior preserved). When
-  // both are null, the slot is empty.
-  if (state.thinking !== null) {
-    appendBlock(renderThinkingChip(state.thinking, caps, now));
-  } else if (state.pendingAssistant !== null) {
-    appendBlock(renderAssistantChip(state.pendingAssistant, caps, now));
-  } else if (state.awaitingProvider !== null) {
-    // Fallback chip when the harness has handed off to the
-    // provider but no streaming has started yet. The reducer
-    // clears `awaitingProvider` on assistant:start /
-    // thinking:start, so by the time either of those branches
-    // would fire, this fallback is already null.
-    appendBlock(renderAwaitingChip(state.awaitingProvider, caps, now));
+  // We render exactly what the batch WILL flush as, by formatting the
+  // would-be PermanentItem(s) with the same `formatPermanent` the
+  // scrollback path uses — so when the batch settles, the block simply
+  // moves from the live region into scrollback with no visual jump
+  // (single tool below the coalesce threshold → one `tool-end` line;
+  // at/above it → the coalesced `● Executed N commands` summary).
+  // `flushPendingToolEndBatch` is pure: we read its `.permanent` and
+  // discard the cleared state. `formatPermanent` already bakes the
+  // frame margin + leading blank, so these lines are pushed directly
+  // (not via `appendBlock`, which would double the margin).
+  for (const item of flushPendingToolEndBatch(state).permanent) {
+    lines.push(...formatPermanent(item, caps));
   }
 
-  // 3. Active tool cards (running). Map insertion order is preserved,
-  // so the visual order matches the order tools were started.
+  // 4. Active tool cards (running). Map insertion order is preserved,
+  // so the visual order matches the order tools were started. The
+  // cards STACK above the phase chip below — read, write, bash… pile
+  // upward as the harness fires them, while the pinned chip (next)
+  // holds the bottom of the live region just above the typing zone.
   for (const tool of state.activeTools.values()) {
     appendBlock(renderToolCardLive(tool, caps, now));
   }
 
-  // 4. (was status line) — removed (UI.md §4.4 absorbed into §4.10.6
-  // footer). Same info `model · [plan] · steps/max · cost · [bg N]`
-  // appears in the footer's right column, so a separate line above
-  // the input would just duplicate it. Position kept as a numbered
-  // step so future additions slot in without renumbering downstream.
+  // 5. Pinned turn-phase chip. The single live indicator for what the
+  // turn is doing right now — it sits at the BOTTOM of the live
+  // region (directly above the input block), with the tool cards
+  // (section 4) and the accumulating batch (section 3) stacking above
+  // it. This is the inverse of the older
+  // "chip as parent above its tool calls" layout: the operator's eye
+  // rests at the bottom near the typing zone, so the always-present
+  // status lands there and the volatile tool stack grows upward out
+  // of the way.
+  //
+  // One chip at a time, picked by a strict priority over four
+  // mutually-exclusive states so the slot never shows two verbs:
+  //
+  //   thinking      → Thinking chip (cognitive verb). More specific
+  //                   than "Generating…"; explains the 5-30s extended-
+  //                   thinking gap that has no token counter.
+  //   pendingAssistant → Generating chip (output verb). Text streaming.
+  //   activeTools   → tool-phase chip (orchestration verb). Model has
+  //                   gone idle; the harness is running the calls it
+  //                   emitted. Ranked below assistant (text can stream
+  //                   while a tool runs) and above awaitingProvider (an
+  //                   active tool means we're past that round-trip —
+  //                   in practice awaitingProvider is null here).
+  //   awaitingProvider → Awaiting chip. Request handed to the provider,
+  //                   nothing streaming yet. Cleared by assistant:start
+  //                   / thinking:start, so it only shows in the gap
+  //                   before the first provider event.
+  //
+  // Across a live turn at least one of these holds, so the chip stays
+  // visible the whole interaction; between turns all four are null and
+  // the slot collapses.
+  if (state.thinking !== null) {
+    appendBlock(renderThinkingChip(state.thinking, caps, now));
+  } else if (state.pendingAssistant !== null) {
+    appendBlock(renderAssistantChip(state.pendingAssistant, caps, now));
+  } else if (state.activeTools.size > 0) {
+    appendBlock(renderToolPhaseChip(state.currentTurnId, caps, now));
+  } else if (state.awaitingProvider !== null) {
+    appendBlock(renderAwaitingChip(state.awaitingProvider, caps, now));
+  }
 
-  // 5. Modal OR bottom anchor — never both. Bottom anchor is rule +
+  // (Status line — removed: UI.md §4.4 absorbed into the §4.10.6
+  // footer. Same info `model · [plan] · steps/max · cost · [bg N]`
+  // appears in the footer's right column, so a separate line above
+  // the input would just duplicate it. No section number — it renders
+  // nothing; noted here so the removal stays discoverable.)
+
+  // 6. Modal OR bottom anchor — never both. Bottom anchor is rule +
   // input + rule + footer (4-block stack); modal substitutes the
   // whole anchor and carries its own structure. Status line + tool
   // cards stay visible above so the user keeps context.
@@ -324,8 +392,14 @@ export const composeLive: ComposeLive = (
   // region: the bottom of the assistant text (or any other
   // permanent line) ends up adjacent to the rule otherwise, and
   // the typing zone visually fuses with the conversation.
+  // Bash mode (idle `!cmd`): the input box — both rules + the line
+  // itself — renders yellow. Single `isBashMode` predicate
+  // (render/mode.ts) shared with renderInput / composeCursor / footer
+  // so the whole block agrees; idle-gated so a `!` typed mid-turn stays
+  // a normal gray draft (it'd be refused on submit anyway).
+  const bashMode = isBashMode(state);
   lines.push(padFrame(''));
-  lines.push(horizontalRule(caps));
+  lines.push(horizontalRule(caps, bashMode));
   // Input is the single OUTDENTED element (UI.md §6.3 frame margin
   // exception). No padFrame here — the prompt `> ` lives at col 0
   // and the cursor lands at col 2, naturally anchored to the rest
@@ -335,13 +409,18 @@ export const composeLive: ComposeLive = (
   lines.push(
     ...renderInput(state.input, caps, {
       dimmed: state.reverseSearch !== null,
+      // Bash mode (idle `!cmd`) — flips the prompt to `! ` and paints
+      // the row yellow. Computed here (needs the full state for the
+      // idle gate) and passed in, so renderInput stays a pure function
+      // of InputState + flags rather than re-deriving the predicate.
+      bash: bashMode,
       // INBOX §6.1: hint the ↑-to-edit affordance while messages are
       // queued. renderInput shows it only on an empty buffer, so it
       // never hides a draft and vanishes the moment the operator types.
       ...(visibleQueued.length > 0 ? { placeholder: 'Press up to edit queued messages' } : {}),
     }),
   );
-  lines.push(horizontalRule(caps));
+  lines.push(horizontalRule(caps, bashMode));
   // Slash autocomplete popover: rendered DIRECTLY below the input's
   // bottom rule, no `padFrame` (rows live at col 0 like the input
   // block above), no blank separator (slash reads as an extension of

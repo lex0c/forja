@@ -691,6 +691,34 @@ export type InfoEvent = BaseEvent & {
   tone?: 'plain' | 'secondary';
 };
 
+// Operator-initiated shell command (`!cmd` typed in the input). Runs as
+// the operator's OWN shell — directly, not through the agent permission
+// engine or sandbox — and reports the result here for scrollback. The
+// engine gates the agent, not the human at the keyboard; this is the
+// shell-style `!` escape. `output` is the combined stdout+stderr; the
+// renderer caps very long output with a "+N more lines" tail.
+export type OperatorBashDoneEvent = BaseEvent & {
+  type: 'operator-bash:done';
+  command: string;
+  output: string;
+  exitCode: number;
+  durationMs: number;
+};
+
+// REPL busy-state transition. The REPL's `isBusy()` (a foreground turn
+// OR a playbook OR an operator `!cmd` in flight) is the gate the submit
+// path uses to refuse a new submission — but two of its three inputs
+// (`playbookRunning`, `operatorBashRunning`) have no other reflection in
+// LiveState. This event mirrors the combined predicate into the renderer
+// so the bash-mode visuals can gate on the SAME condition the submit
+// does (otherwise typing `!` during a playbook / another `!` shows the
+// shell UI for a command that Enter will refuse). Emitted only on actual
+// transitions (deduped at the producer).
+export type BusyChangeEvent = BaseEvent & {
+  type: 'busy:change';
+  busy: boolean;
+};
+
 // Recap terse line surfaced by RECAP §3.3 auto-display surfaces
 // (session-end + Alt+R). Distinct from `info` so the renderer can
 // style it specifically: bold "recap:" prefix, secondary
@@ -809,6 +837,8 @@ export type UIEvent =
   | ReverseSearchUpdateEvent
   | ReverseSearchCloseEvent
   | InfoEvent
+  | OperatorBashDoneEvent
+  | BusyChangeEvent
   | RecapTerseEvent
   | ErrorEvent
   | WarnEvent

@@ -5,7 +5,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ParsedArgs } from '../../src/cli/args.ts';
 import type { BootstrapResult } from '../../src/cli/bootstrap.ts';
-import { SUBAGENT_DISPLAY_MAX, runRepl, sanitizeForSubagentDisplay } from '../../src/cli/repl.ts';
+import {
+  type RunReplOptions,
+  SUBAGENT_DISPLAY_MAX,
+  runRepl,
+  sanitizeForSubagentDisplay,
+} from '../../src/cli/repl.ts';
 import type { HarnessConfig, HarnessEvent, HarnessResult } from '../../src/harness/index.ts';
 import { DEFAULT_BUDGET } from '../../src/harness/types.ts';
 import { type PermissionEngine, createPermissionEngine } from '../../src/permissions/index.ts';
@@ -559,6 +564,487 @@ describe('repl — boot + smoke', () => {
     // Cleanup via EOF.
     stdin.feed('\x04');
     expect(await promise).toBe(130);
+  });
+
+  test('`!cmd` runs an operator shell command and lands its output in scrollback', async () => {
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const calls: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      // Inject the executor so the test never spawns a real shell.
+      execBash: async (command) => {
+        calls.push(command);
+        return { output: `RAN:${command}\n`, exitCode: 0 };
+      },
+    });
+    await tick();
+    stdin.feed('!ls -la\r');
+    await flushFrame();
+    // Ran the operator's own shell with the leading `!` stripped — NOT
+    // routed to the agent.
+    expect(calls).toEqual(['ls -la']);
+    const out = writes.join('');
+    expect(out).toContain('! ls -la'); // card head
+    expect(out).toContain('RAN:ls -la'); // captured output landed in scrollback
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a bare `!` runs nothing', async () => {
+    const stdin = makeStdin();
+    const calls: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      execBash: async (command) => {
+        calls.push(command);
+        return { output: '', exitCode: 0 };
+      },
+    });
+    await tick();
+    stdin.feed('!\r');
+    await flushFrame();
+    expect(calls).toEqual([]);
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a synchronously-throwing execBash does not wedge the REPL (error card still lands)', async () => {
+    // Regression: runOperatorBash defers execBash into a
+    // `Promise.resolve().then(...)`, so a sync throw becomes a rejection
+    // the `.catch` handles — instead of escaping past the `.finally` and
+    // leaving operatorBashRunning stuck true (wedging isBusy forever).
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      // Throws synchronously (not a rejected promise).
+      execBash: (() => {
+        throw new Error('boom-sync');
+      }) as NonNullable<RunReplOptions['execBash']>,
+    });
+    await tick();
+    stdin.feed('!x\r');
+    await flushFrame();
+    const out = writes.join('');
+    expect(out).toContain('! x'); // card head rendered
+    expect(out).toContain('boom-sync'); // sync throw captured as output
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a hung `!cmd` is killed by the timeout instead of wedging the REPL (real spawn)', async () => {
+    // Regression: the default execBash spawns `detached` and SIGKILLs the
+    // process GROUP on timeout, so a long command can't hold the stdout
+    // pipe open and stall `Response().text()` forever. Uses a real shell
+    // with a tiny timeout to prove termination without a 120s wait.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      operatorBashTimeoutMs: 100, // kill well before sleep finishes
+    });
+    await tick();
+    stdin.feed('!sleep 5\r');
+    // Wait past the timeout + kill + emit + render — but far short of 5s.
+    await new Promise((r) => setTimeout(r, 700));
+    // The card landed → operator-bash:done fired → the command did NOT
+    // hang the REPL. (If it had wedged, this line would never appear.)
+    expect(writes.join('')).toContain('! sleep 5');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a `!cmd` that backgrounds a child returns when the foreground shell exits (real spawn)', async () => {
+    // Regression: the read loop awaited stdout EOF, but a `&`-backgrounded
+    // child inherits the stdout pipe and holds it open. `!sleep 3 &` has
+    // the foreground `bash -c` exit immediately, yet the loop would block
+    // on the pipe until the detached `sleep` dies (or the timeout SIGKILLs
+    // the group). The loop now races each read against `proc.exited` and
+    // returns once the shell is done. A generous timeout proves it's the
+    // foreground-exit detection — NOT the timeout — that frees the REPL.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      operatorBashTimeoutMs: 30_000, // far longer than the backgrounded sleep
+    });
+    await tick();
+    stdin.feed('!sleep 3 &\r');
+    // The card must land well before the 3s `sleep` (and the 30s timeout):
+    // proof the foreground shell's exit — not the pipe EOF — ended the run.
+    await new Promise((r) => setTimeout(r, 700));
+    expect(writes.join('')).toContain('sleep 3');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('an interrupt that lands before the kill hook is registered is replayed', async () => {
+    // Race: Ctrl+C can arrive (same stdin chunk as the submitting Enter,
+    // or before an async-registering seam) BEFORE execBash hands up its
+    // kill switch. triggerInterrupt sets the latch but has no kill to
+    // call; the hook registration must replay it, or the first interrupt
+    // is dropped until a second press / the timeout.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    // Holder (not bare `let`) so TS keeps the union type past the
+    // closure assignment instead of narrowing to `null`.
+    const seam: {
+      register: ((kill: (signal: NodeJS.Signals) => void) => void) | null;
+      resolve: ((r: { output: string; exitCode: number }) => void) | null;
+    } = { register: null, resolve: null };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      // Capture the hook instead of registering it — the test controls
+      // WHEN the kill switch becomes available (i.e. AFTER the Ctrl+C).
+      execBash: ((_cmd, _cwd, onKillable) =>
+        new Promise((resolve) => {
+          seam.register = onKillable ?? null;
+          seam.resolve = resolve;
+        })) as NonNullable<RunReplOptions['execBash']>,
+    });
+    await tick();
+    stdin.feed('!sleep\r'); // runs; execBash captures the hook but hasn't exposed a kill yet
+    await tick();
+    stdin.feed('\x03'); // Ctrl+C BEFORE the kill switch is registered → latch set, no kill called
+    await tick();
+    // Now the executor registers its kill switch — the pending interrupt
+    // must be replayed (SIGINT) instead of dropped.
+    seam.register?.((sig) => seam.resolve?.({ output: `killed:${sig}`, exitCode: 130 }));
+    await flushFrame();
+    expect(writes.join('')).toContain('killed:SIGINT');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a shutdown that lands before the kill hook is registered is replayed (no hung quit)', async () => {
+    // Race: EOF/quit (Ctrl+D) can arrive right after a `!cmd` submits but
+    // BEFORE execBash hands up its kill switch (the executor is a deferred
+    // microtask). requestShutdown sets `exiting` synchronously and
+    // shutdown()'s `operatorBashKill?.('SIGKILL')` no-ops while the switch
+    // is still null. Without a replay at hook registration, shutdown would
+    // await the command to natural exit / the 120s timeout — a hung quit.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const seam: {
+      register: ((kill: (signal: NodeJS.Signals) => void) => void) | null;
+      resolve: ((r: { output: string; exitCode: number }) => void) | null;
+    } = { register: null, resolve: null };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      // Capture the hook — the test controls WHEN the kill switch becomes
+      // available (i.e. AFTER the EOF that requested shutdown).
+      execBash: ((_cmd, _cwd, onKillable) =>
+        new Promise((resolve) => {
+          seam.register = onKillable ?? null;
+          seam.resolve = resolve;
+        })) as NonNullable<RunReplOptions['execBash']>,
+    });
+    await tick();
+    stdin.feed('!sleep\r'); // runs; execBash captures the hook but exposes no kill yet
+    await tick();
+    stdin.feed('\x04'); // EOF → requestShutdown sets `exiting`; SIGKILL no-ops (kill still null)
+    await tick();
+    // Now the executor registers its kill switch — the pending shutdown
+    // must be replayed (SIGKILL) so the awaited promise settles and quit
+    // completes instead of hanging on the command.
+    seam.register?.((sig) => seam.resolve?.({ output: `killed:${sig}`, exitCode: 137 }));
+    await flushFrame();
+    expect(writes.join('')).toContain('killed:SIGKILL');
+    expect(await promise).toBe(130);
+  });
+
+  test('Ctrl+C interrupts a running `!cmd` (kills its process group, does not wait the timeout)', async () => {
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      // Hangs until the interrupt path invokes the kill switch.
+      execBash: ((_cmd, _cwd, onKillable) =>
+        new Promise((resolve) => {
+          onKillable?.((sig) => resolve({ output: `killed:${sig}`, exitCode: 130 }));
+        })) as NonNullable<RunReplOptions['execBash']>,
+    });
+    await tick();
+    stdin.feed('!sleep\r'); // buffer clears, command "runs" (hangs)
+    await tick();
+    stdin.feed('\x03'); // Ctrl+C → triggerInterrupt → SIGINT the command
+    await flushFrame();
+    expect(writes.join('')).toContain('killed:SIGINT');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a `!cmd` ignoring SIGINT is SIGKILLed on the second Ctrl+C (interrupt ladder)', async () => {
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      // Only SIGKILL resolves it (mimics a SIGINT-ignoring command).
+      execBash: ((_cmd, _cwd, onKillable) =>
+        new Promise((resolve) => {
+          onKillable?.((sig) => {
+            if (sig === 'SIGKILL') resolve({ output: `killed:${sig}`, exitCode: 137 });
+          });
+        })) as NonNullable<RunReplOptions['execBash']>,
+    });
+    await tick();
+    stdin.feed('!hang\r');
+    await tick();
+    stdin.feed('\x03'); // first tap → SIGINT (ignored)
+    await tick();
+    stdin.feed('\x03'); // second tap → SIGKILL
+    await flushFrame();
+    expect(writes.join('')).toContain('killed:SIGKILL');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('shell output preserves stdout/stderr interleave order (real spawn)', async () => {
+    // `exec 2>&1` merges the streams on one pipe so a diagnostic emitted
+    // between two normal writes stays between them — not shoved after all
+    // stdout by a separate-pipe concat.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    stdin.feed('!printf OUTA; printf ERRB 1>&2; printf OUTC\r');
+    await new Promise((r) => setTimeout(r, 400));
+    const out = writes.join('');
+    const a = out.indexOf('OUTA');
+    const b = out.indexOf('ERRB');
+    const c = out.indexOf('OUTC');
+    expect(a).toBeGreaterThan(-1);
+    expect(b).toBeGreaterThan(a); // stderr stayed between the stdout writes
+    expect(c).toBeGreaterThan(b);
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('shell-mode visuals stay off while another `!cmd` is running (busy gate)', async () => {
+    // Regression for the busy-gate finding: `isTurnRunning` can't see
+    // `operatorBashRunning`, so without `state.busy` (busy:change) the
+    // second `!` would flip to yellow shell mode for a command Enter
+    // refuses. Type a `!` while a first `!cmd` hangs; the footer must
+    // NOT show the shell indicator.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      // First command hangs until killed → stays "running" (busy).
+      execBash: ((_cmd, _cwd, onKillable) =>
+        new Promise((resolve) => {
+          onKillable?.((sig) => resolve({ output: `killed:${sig}`, exitCode: 130 }));
+        })) as NonNullable<RunReplOptions['execBash']>,
+    });
+    await tick();
+    stdin.feed('!sleep\r'); // runs → busy:change(true); buffer clears
+    await tick();
+    writes.length = 0; // only inspect frames after we start typing the 2nd `!`
+    stdin.feed('!x'); // type a new `!` command while the first runs (no Enter)
+    await flushFrame();
+    expect(writes.join('')).not.toContain('! for shell mode');
+    // Cleanup: kill the running command, then EOF.
+    stdin.feed('\x03');
+    await flushFrame();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('operator command output normalizes carriage returns (no column-0 overwrite)', async () => {
+    // A bare `\r` survives stripAnsi but would return the cursor to
+    // column 0 and overwrite the frame margin / earlier content of the
+    // rendered row. It's collapsed to `\n` so each overwrite becomes a
+    // fresh row instead.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      execBash: (async () => ({ output: 'KEEPME\rSPOOF', exitCode: 0 })) as NonNullable<
+        RunReplOptions['execBash']
+      >,
+    });
+    await tick();
+    stdin.feed('!cat evil\r');
+    await flushFrame();
+    const out = writes.join('');
+    expect(out).toContain('KEEPME'); // both texts survive...
+    expect(out).toContain('SPOOF');
+    expect(out).not.toContain('KEEPME\rSPOOF'); // ...but not as a column-0 overwrite
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('operator command output is ANSI-stripped before scrollback (no terminal hijack)', async () => {
+    // A command like `!cat` on a file containing ESC[2J could clear the
+    // screen / hide the cursor / spoof chrome. Output is sanitized at
+    // intake, so the raw control bytes never reach the terminal.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      execBash: (async () => ({
+        output: '\x1b[2JEVILCLEAR\x1b[?25l',
+        exitCode: 0,
+      })) as NonNullable<RunReplOptions['execBash']>,
+    });
+    await tick();
+    stdin.feed('!cat evil\r');
+    await flushFrame();
+    const out = writes.join('');
+    expect(out).toContain('EVILCLEAR'); // visible text survives
+    expect(out).not.toContain('\x1b[2J'); // screen-clear stripped (renderer never emits it here)
+    expect(out).not.toContain('\x1b[?25l'); // hide-cursor stripped
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a high-volume `!cmd` is capped instead of buffering unbounded (real spawn)', async () => {
+    // Regression: stdout is drained with a byte cap, not buffered whole
+    // by Response().text(). `!yes` floods forever; the cap must stop it
+    // (and SIGKILL the producer) so the card lands fast — proving the
+    // cap fired, not the 3s timeout, and memory stayed bounded.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      operatorBashMaxOutputBytes: 1000,
+      operatorBashTimeoutMs: 3000, // backstop, far above the byte-cap path
+    });
+    await tick();
+    stdin.feed('!yes\r');
+    await new Promise((r) => setTimeout(r, 500)); // well under the 3s timeout
+    expect(writes.join('')).toContain('! yes'); // card landed → flood was capped + killed
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('shutdown while a `!cmd` runs kills + awaits it (no emit after teardown)', async () => {
+    // Regression: the operator promise is tracked, so EOF mid-`!cmd`
+    // SIGKILLs the group and awaits the promise — the command can't
+    // outlive the REPL, and its operator-bash:done emits while the
+    // renderer is still open.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      execBash: ((_cmd, _cwd, onKillable) =>
+        new Promise((resolve) => {
+          onKillable?.((sig) => resolve({ output: `killed:${sig}`, exitCode: 130 }));
+        })) as NonNullable<RunReplOptions['execBash']>,
+    });
+    await tick();
+    stdin.feed('!sleep\r'); // runs (hangs); buffer clears
+    await tick();
+    stdin.feed('\x04'); // EOF → requestShutdown → kill + await the command
+    const code = await promise;
+    expect(code).toBe(130);
+    // The card emitted before renderer.close (shutdown awaited the promise).
+    expect(writes.join('')).toContain('killed:SIGKILL');
   });
 
   test('idle Ctrl+D (EOF) exits 130 immediately, no gate (shell convention)', async () => {
@@ -3279,6 +3765,86 @@ describe('repl — slash commands integration', () => {
     expect(capturedSignal?.aborted).toBe(true);
     expect(signalAborted).toBe(true);
 
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('Esc during a slash playbook aborts the dispatch signal (matches the Ctrl+C / footer gate)', async () => {
+    // Regression: the editor's Esc (`interruptSoft`) gate used
+    // `running || operatorBashRunning`, excluding `playbookRunning`,
+    // while Ctrl+C and the footer's "esc to interrupt" cue both key off
+    // `isBusy()` (turn OR playbook OR `!cmd`). A playbook-only run thus
+    // advertised the cue while Esc did nothing. The gate now uses
+    // `isBusy()` too; triggerInterrupt already aborts the playbook
+    // controllers, so the soft controller must fire on the first Esc.
+    const stub = makeBootstrapStub();
+    const fakeDef = {
+      name: 'fake',
+      description: 'fake subagent for tests',
+      tools: [],
+      budget: { maxSteps: 1, maxCostUsd: 0.01 },
+      systemPrompt: 'noop',
+      scope: 'project',
+      isolation: 'none',
+      sourcePath: '/dev/null',
+      sourceSha256: '0'.repeat(64),
+      slash: 'fake',
+    };
+    (stub.subagents.byName as Map<string, unknown>).set('fake', fakeDef);
+
+    let capturedSignal: AbortSignal | undefined;
+    let capturedSoftSignal: AbortSignal | undefined;
+    const fakeRunSubagent = async (
+      input: Parameters<typeof import('../../src/subagents/index.ts').runSubagent>[0],
+    ): ReturnType<typeof import('../../src/subagents/index.ts').runSubagent> => {
+      capturedSignal = input.signal;
+      capturedSoftSignal = input.softStopSignal;
+      // Park until the hard signal aborts so the dispatch can settle
+      // without hanging the test (Ctrl+D escalates below).
+      await new Promise<void>((resolve) => {
+        capturedSignal?.addEventListener('abort', () => resolve(), { once: true });
+      });
+      return {
+        output: '',
+        sessionId: 'sess-fake-child',
+        status: 'interrupted',
+        reason: 'aborted',
+        costUsd: 0,
+        steps: 0,
+        durationMs: 0,
+        abortCause: 'hard',
+      };
+    };
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      runSubagentOverride: fakeRunSubagent,
+    });
+    await tick();
+
+    stdin.feed('/fake go\r');
+    await tick();
+    await tick();
+    expect(capturedSoftSignal).toBeDefined();
+    expect(capturedSoftSignal?.aborted).toBe(false);
+
+    // Lone Esc → drain resolves it as Escape after ~30ms (flushFrame's
+    // 50ms covers it). First Esc is cooperative → playbook SOFT
+    // controller aborts; the hard signal stays pending.
+    stdin.feed('\x1b');
+    await flushFrame();
+    expect(capturedSoftSignal?.aborted).toBe(true);
+    expect(capturedSignal?.aborted).toBe(false);
+
+    // Ctrl+D escalates to hard so the parked dispatch settles and quit
+    // completes (the soft abort alone leaves the subagent running here).
     stdin.feed('\x04');
     expect(await promise).toBe(130);
   });

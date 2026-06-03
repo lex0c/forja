@@ -2454,3 +2454,62 @@ describe('shared-trust:ask reducer (P0/F1 + P1/M2-rel)', () => {
     expect(previewText).toContain('(the corpus is currently empty)');
   });
 });
+
+describe('operator-bash:done (the `!cmd` shell escape)', () => {
+  test('emits an operator-bash permanent carrying command + output + exit + duration', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'operator-bash:done',
+      ts: 5,
+      command: 'git status',
+      output: 'On branch main\n',
+      exitCode: 0,
+      durationMs: 42,
+    });
+    expect(r.permanent).toEqual([
+      {
+        kind: 'operator-bash',
+        command: 'git status',
+        output: 'On branch main\n',
+        exitCode: 0,
+        durationMs: 42,
+      },
+    ]);
+  });
+
+  test('flushes a pending tool-end batch before the bash card (ordering)', () => {
+    // A buffered done-tool then an operator command: the tool finalizes
+    // into scrollback BEFORE the bash card, since the bash event emits a
+    // permanent and the applyEvent wrapper flushes the batch first.
+    const { permanent } = drive([
+      start(),
+      {
+        type: 'tool:start',
+        ts: 2,
+        toolId: 't1',
+        name: 'read_file',
+        activeVerb: 'Reading',
+        finalVerb: 'Read',
+        subject: 'a.ts',
+      },
+      { type: 'tool:end', ts: 3, toolId: 't1', status: 'done', durationMs: 10 },
+      { type: 'operator-bash:done', ts: 4, command: 'ls', output: '', exitCode: 0, durationMs: 5 },
+    ]);
+    const kinds = permanent.map((p) => p.kind);
+    const toolIdx = kinds.indexOf('tool-end');
+    const bashIdx = kinds.indexOf('operator-bash');
+    expect(toolIdx).toBeGreaterThan(-1);
+    expect(bashIdx).toBeGreaterThan(toolIdx);
+  });
+});
+
+describe('busy:change (REPL isBusy mirror for the bash-mode gate)', () => {
+  test('sets and clears state.busy', () => {
+    const initial = createInitialState();
+    expect(initial.busy).toBe(false);
+    const on = applyEvent(initial, { type: 'busy:change', ts: 1, busy: true });
+    expect(on.state.busy).toBe(true);
+    expect(on.permanent).toEqual([]);
+    const off = applyEvent(on.state, { type: 'busy:change', ts: 2, busy: false });
+    expect(off.state.busy).toBe(false);
+  });
+});

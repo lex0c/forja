@@ -1,10 +1,14 @@
 import { describe, expect, test } from 'bun:test';
 import { FOOTER_BLOCK_LINES, composeCursor, composeLive } from '../../../src/tui/render/compose.ts';
-import { COGNITIVE_VERB_POOL, OUTPUT_VERB_POOL } from '../../../src/tui/render/spinner-verbs.ts';
+import {
+  COGNITIVE_VERB_POOL,
+  OUTPUT_VERB_POOL,
+  TOOL_VERB_POOL,
+} from '../../../src/tui/render/spinner-verbs.ts';
 import { visualWidth } from '../../../src/tui/render/width.ts';
 import type { ActiveTool, LiveState } from '../../../src/tui/state.ts';
 import { createInitialState } from '../../../src/tui/state.ts';
-import type { Capabilities } from '../../../src/tui/term.ts';
+import { CSI, type Capabilities } from '../../../src/tui/term.ts';
 
 // Match a verb-shaped chip line: "<verb>… [..." — the chip's
 // rotating verb sits before the elapsed counter.
@@ -96,25 +100,32 @@ describe('composeLive layout', () => {
     };
     s.activeTools.set('t1', tool);
     const out = composeLive(s, caps, 1000);
-    // Each top-level block (here: tool card) gets a leading BLANK.
-    // Plus the forced BLANK above the input rule.
-    //   [BLANK, chip head, sub-content, BLANK, rule, input, rule, footer]
-    // Length = 8.
-    expect(out).toHaveLength(8);
+    // The tool card stacks ABOVE the pinned tool-phase chip, which
+    // sits at the bottom of the live region just above the input.
+    // Each top-level block gets a leading BLANK, plus the forced
+    // BLANK above the input rule:
+    //   [BLANK, card head, sub-content, BLANK, tool-phase chip,
+    //    BLANK, rule, input, rule, footer]
+    // Length = 10.
+    expect(out).toHaveLength(10);
     expect(out[0]).toBe('  '); // leading blank before tool card
     expect(out[1]).toContain('Executing');
     expect(out[2]).toContain('ls');
-    expect(out[3]).toBe('  '); // blank between content and input rule
-    expect(out[4]).toBe(expectedRule(caps.cols, true));
-    expect(out[5]).toBe('> ');
+    expect(out[3]).toBe('  '); // blank before the pinned chip
+    expect(TOOL_VERB_POOL).toContain(out[4]?.match(/(\w+)…\s*$/)?.[1] ?? '');
+    expect(out[5]).toBe('  '); // blank between chip and input rule
     expect(out[6]).toBe(expectedRule(caps.cols, true));
-    expect(out[7]).toContain('opus');
+    expect(out[7]).toBe('> ');
+    expect(out[8]).toBe(expectedRule(caps.cols, true));
+    expect(out[9]).toContain('opus');
   });
 
-  test('layered live region: TodoList → assistant chip → tool cards (top→bottom)', () => {
-    // Spec UI.md §4.10.6: TodoList sits above the operation chips,
-    // and the assistant turn is itself an operation chip rendered
-    // above tool cards (parent → child visual hierarchy).
+  test('layered live region: TodoList → tool cards → pinned chip (top→bottom)', () => {
+    // TodoList sits at the top of the live region; the tool cards
+    // stack below it; the turn-phase chip is pinned at the bottom of
+    // the live region, directly above the input. The volatile tool
+    // stack grows upward, the always-present status rests at the
+    // bottom near the typing zone.
     const s = startedSession();
     s.todos = [{ content: 'plan it', activeForm: 'Planning it', status: 'pending' }];
     s.pendingAssistant = {
@@ -142,18 +153,18 @@ describe('composeLive layout', () => {
     // both sides. Sub-content (rows under "Tasks", `└─` under chips)
     // stays tight — it's the parent's subsession.
     //   [BLANK, Tasks header, todo row,
-    //    BLANK, assistant chip,
     //    BLANK, tool head, sub-content,
+    //    BLANK, assistant chip,
     //    BLANK, rule, input, rule, footer]
     expect(out[0]).toBe('  '); // leading blank before TodoList
     expect(out[1]).toContain('Tasks');
     expect(out[2]).toContain('plan it');
-    expect(out[3]).toBe('  '); // before assistant chip
-    // Assistant chip carries a verb from the OUTPUT pool (spinner-verbs.ts).
-    expect(OUTPUT_VERB_POOL).toContain(verbInLine(out[4]) ?? '');
-    expect(out[5]).toBe('  '); // before tool card
-    expect(out[6]).toContain('Executing');
-    expect(out[7]).toContain('ls');
+    expect(out[3]).toBe('  '); // before tool card
+    expect(out[4]).toContain('Executing');
+    expect(out[5]).toContain('ls');
+    expect(out[6]).toBe('  '); // before the pinned chip
+    // Pinned chip carries a verb from the OUTPUT pool (spinner-verbs.ts).
+    expect(OUTPUT_VERB_POOL).toContain(verbInLine(out[7]) ?? '');
     expect(out[8]).toBe('  '); // before input rule
     expect(out[9]).toBe(expectedRule(caps.cols, true));
     expect(out[10]).toBe('> ');
@@ -242,6 +253,108 @@ describe('composeLive layout', () => {
     expect(out[out.length - 1]).toContain('supervised mode on');
   });
 
+  test('tool-phase chip is pinned below the tool cards when the model is idle', () => {
+    // The window where the model has gone idle and the harness is
+    // executing tool calls: thinking, pendingAssistant and
+    // awaitingProvider are all null. The pinned chip keeps a live
+    // verb (TOOL pool) at the bottom of the live region, with the
+    // tool cards stacking ABOVE it.
+    const s = startedSession();
+    s.currentTurnId = 'msg_01ABC';
+    s.activeTools.set('t1', {
+      toolId: 't1',
+      name: 'reader',
+      activeVerb: 'Reading',
+      finalVerb: 'Read',
+      subject: 'file.ts',
+      startedAt: 0,
+      preview: [],
+    });
+    const out = composeLive(s, caps, 0);
+    // The chip carries a bracket-less verb (no timer); the tool card
+    // head ends in `[Xs]`, so match the word before an ellipsis at
+    // END of line to isolate the chip from the card.
+    const chipIdx = out.findIndex((l) => TOOL_VERB_POOL.includes(l.match(/(\w+)…\s*$/)?.[1] ?? ''));
+    expect(chipIdx).toBeGreaterThan(-1);
+    // Pinned-below-the-stack: the chip follows the tool card.
+    const cardIdx = out.findIndex((l) => l.includes('file.ts'));
+    expect(chipIdx).toBeGreaterThan(cardIdx);
+  });
+
+  test('assistant chip wins over the tool-phase chip while text is still streaming', () => {
+    // Mutual exclusion: if pendingAssistant is set (text streaming)
+    // AND a tool is already active, the OUTPUT-pool chip holds the
+    // slot — the tool-phase chip only appears once the model has
+    // gone idle. Pins that the slot never shows two verbs.
+    const s = startedSession();
+    s.currentTurnId = 'msg_01ABC';
+    s.pendingAssistant = {
+      messageId: 'msg_01ABC',
+      text: 'partial',
+      startedAt: 0,
+      inputTokens: null,
+      outputTokens: null,
+      cacheRead: null,
+      cacheCreation: null,
+    };
+    s.activeTools.set('t1', {
+      toolId: 't1',
+      name: 'reader',
+      activeVerb: 'Reading',
+      finalVerb: 'Read',
+      subject: null,
+      startedAt: 0,
+      preview: [],
+    });
+    const out = composeLive(s, caps, 0);
+    // The pinned chip is an OUTPUT-pool verb (assistant), present
+    // somewhere in the frame...
+    const hasOutputChip = out.some((l) => OUTPUT_VERB_POOL.includes(verbInLine(l) ?? ''));
+    expect(hasOutputChip).toBe(true);
+    // ...and the tool-phase chip (a bracket-less TOOL verb at line
+    // end) is NOT rendered — only one verb holds the slot.
+    const hasToolPhaseChip = out.some((l) =>
+      TOOL_VERB_POOL.includes(l.match(/(\w+)…\s*$/)?.[1] ?? ''),
+    );
+    expect(hasToolPhaseChip).toBe(false);
+  });
+
+  test('live batch preview renders the accumulating tool group (grouped, same as scrollback)', () => {
+    // Consecutive same-name tools buffer into pendingToolEndBatch; the
+    // live region must render that buffer (grouped, ≥ threshold) so the
+    // finalized tools stay visible until the batch settles — not vanish
+    // into the invisible buffer. Uses the same formatter as scrollback,
+    // so the live preview matches the eventual coalesced block.
+    const s = startedSession();
+    s.pendingToolEndBatch = {
+      name: 'bash',
+      items: [
+        { verb: 'Executed', subject: 'git status', status: 'done', durationMs: 100 },
+        { verb: 'Executed', subject: 'ls -la', status: 'done', durationMs: 50 },
+        { verb: 'Executed', subject: 'cat package.json', status: 'done', durationMs: 30 },
+      ],
+    };
+    const joined = composeLive(s, caps, 0).join('\n');
+    // Coalesced headline (bash → "Executed N commands") + the subjects.
+    expect(joined).toContain('Executed 3 commands');
+    expect(joined).toContain('git status');
+    expect(joined).toContain('cat package.json');
+  });
+
+  test('live batch preview below the coalesce threshold renders a single tool-end line', () => {
+    // One buffered tool → no fold; the preview shows the individual
+    // finalization, matching what a sub-threshold flush emits.
+    const s = startedSession();
+    s.pendingToolEndBatch = {
+      name: 'bash',
+      items: [{ verb: 'Executed', subject: 'git status', status: 'done', durationMs: 100 }],
+    };
+    const joined = composeLive(s, caps, 0).join('\n');
+    expect(joined).toContain('Executed');
+    expect(joined).not.toContain('commands'); // not the grouped headline
+    expect(joined).toContain('git status');
+  });
+
   test('multiple tools appear in insertion order', () => {
     const s = startedSession();
     s.activeTools.set('t1', {
@@ -289,6 +402,36 @@ describe('composeLive layout', () => {
     const colored: Capabilities = { ...caps, cols: 30, color: 'basic' };
     const out = composeLive(createInitialState(), colored, 0);
     expect(visualWidth(out[1] ?? '')).toBe(30);
+  });
+
+  test('bash mode paints the input rules yellow (whole box reads as one mode)', () => {
+    const colored: Capabilities = { ...caps, color: 'basic' };
+    const s = startedSession();
+    s.input = { value: '!ls', cursor: 3 };
+    const out = composeLive(s, colored, 0);
+    // warn = SGR 33. Both rules around the input carry it; a normal
+    // buffer leaves them dim (SGR 2).
+    const rules = out.filter((l) => l.includes('─'));
+    expect(rules.length).toBeGreaterThanOrEqual(2);
+    for (const r of rules) expect(r).toContain(`${CSI}33m`);
+    // Sanity: a non-bash buffer keeps the rules dim, not yellow.
+    const plain = composeLive({ ...s, input: { value: 'ls', cursor: 2 } }, colored, 0);
+    for (const r of plain.filter((l) => l.includes('─'))) {
+      expect(r).not.toContain(`${CSI}33m`);
+    }
+  });
+
+  test('bash visuals are suppressed while busy (busy-gated, matches the submit gate)', () => {
+    // A `!` buffer while the REPL is busy (turn / playbook / another
+    // `!cmd`) stays a normal gray draft — Enter would refuse it, so the
+    // rules must not go yellow. `state.busy` is the gate (not turn
+    // activity), so a playbook gap with no tools is covered too.
+    const colored: Capabilities = { ...caps, color: 'basic' };
+    const s = startedSession();
+    const out = composeLive({ ...s, input: { value: '!ls', cursor: 3 }, busy: true }, colored, 0);
+    for (const r of out.filter((l) => l.includes('─'))) {
+      expect(r).not.toContain(`${CSI}33m`);
+    }
   });
 
   test('rule + footer suppressed when modal is up (modal owns its own structure)', () => {
@@ -466,6 +609,35 @@ describe('composeCursor', () => {
     s.input.value = 'abc';
     s.input.cursor = 3;
     expect(composeCursor(s, caps, 5)).toEqual({ row: 2, col: 5 }); // 2 prefix + 3
+  });
+
+  test('col counts VISUAL width of wide chars before the cursor (CJK = 2 cols)', () => {
+    // '中x' — cursor after both. Visual width before cursor = 2 (中) + 1
+    // (x) = 3, so col = prefix(2) + 3 = 5. A code-unit count would give
+    // col 4 (2 code units) and the caret would sit one column left of
+    // the real glyph.
+    const s = startedSession();
+    s.input.value = '中x';
+    s.input.cursor = 2;
+    expect(composeCursor(s, caps, 5)).toEqual({ row: 2, col: 5 });
+  });
+
+  test('bash mode: the leading `!` is the prompt glyph, so the caret skips it', () => {
+    // `!ls` — the `!` renders as the `! ` prompt, the command is `ls`.
+    // Caret after `ls` (raw cursor 3) → col = prefix(2) + width('ls') = 4,
+    // NOT 5 (which would count the `!` as content).
+    const s = startedSession();
+    s.input.value = '!ls';
+    s.input.cursor = 3;
+    expect(composeCursor(s, caps, 5)).toEqual({ row: 2, col: 4 });
+  });
+
+  test('col between a wide glyph and the next char', () => {
+    // Cursor right after '中' (offset 1): col = prefix(2) + 2 = 4.
+    const s = startedSession();
+    s.input.value = '中x';
+    s.input.cursor = 1;
+    expect(composeCursor(s, caps, 5)).toEqual({ row: 2, col: 4 });
   });
 
   test('multi-line input → cursor on the line containing the offset', () => {

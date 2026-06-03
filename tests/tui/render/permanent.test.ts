@@ -762,6 +762,74 @@ describe('formatPermanent', () => {
     ]);
   });
 
+  describe('operator-bash (the `!cmd` shell escape card)', () => {
+    test('success: blank + `! command  [dur]` head + verbatim output, no exit marker', () => {
+      const out = formatPermanent(
+        {
+          kind: 'operator-bash',
+          command: 'git status',
+          output: 'On branch main\nnothing to commit\n',
+          exitCode: 0,
+          durationMs: 12,
+        },
+        unicode,
+      );
+      expect(out).toEqual([
+        pad(''),
+        pad('! git status  [12ms]'),
+        pad('On branch main'),
+        pad('nothing to commit'),
+      ]);
+    });
+
+    test('a multi-line command is flattened to a single head row', () => {
+      // The editor accepts `\`+Enter / Shift+Enter, so the command can
+      // carry newlines. The head must stay ONE row (flattened) — else a
+      // raw `\n` spills onto an unprefixed scrollback row and pushes the
+      // `[dur]` below the command text.
+      const out = formatPermanent(
+        {
+          kind: 'operator-bash',
+          command: 'for f in x; do\necho $f\ndone',
+          output: '',
+          exitCode: 0,
+          durationMs: 5,
+        },
+        unicode,
+      );
+      expect(out).toEqual([pad(''), pad('! for f in x; do echo $f done  [5ms]')]);
+      expect(out[1]).not.toContain('\n');
+    });
+
+    test('empty output → head only', () => {
+      const out = formatPermanent(
+        { kind: 'operator-bash', command: 'true', output: '', exitCode: 0, durationMs: 3 },
+        unicode,
+      );
+      expect(out).toEqual([pad(''), pad('! true  [3ms]')]);
+    });
+
+    test('non-zero exit shows a warn `exit N` marker (color enabled)', () => {
+      const out = formatPermanent(
+        { kind: 'operator-bash', command: 'false', output: '', exitCode: 1, durationMs: 2 },
+        colored,
+      );
+      // warn = SGR 33. Head carries `exit 1` in warn.
+      expect(out[1]).toContain(`${CSI}33m  exit 1${CSI}0m`);
+    });
+
+    test('output beyond the cap folds into a `+N more lines` tail', () => {
+      const lines = Array.from({ length: 250 }, (_, i) => `line ${i}`).join('\n');
+      const out = formatPermanent(
+        { kind: 'operator-bash', command: 'seq', output: lines, exitCode: 0, durationMs: 9 },
+        unicode,
+      );
+      // blank + head + 199 output rows + 1 "more" row = 202.
+      expect(out).toHaveLength(202);
+      expect(out[out.length - 1]).toContain('+51 more lines');
+    });
+  });
+
   describe('tool-end-batch (coalesced card — UI.md §4.10.5/§4.10.7)', () => {
     test('top-level batch: blank + card head with count + tree continuations', () => {
       const out = formatPermanent(
@@ -786,6 +854,46 @@ describe('formatPermanent', () => {
         pad('├─ src/b.ts'),
         pad('└─ src/c.ts'),
       ]);
+    });
+
+    test('count is bold within the headline verb (when color enabled)', () => {
+      // The batch size is the one number that says how much the fold
+      // hides, so it gets weight (bold = SGR 1) while staying in the
+      // head tone (done → dim = SGR 2). paintMulti wraps tone+bold with
+      // a single reset; the surrounding verb text stays plain-dim.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'bash',
+          verb: 'Executed 6 commands',
+          count: 6,
+          totalDurationMs: 900,
+          subjects: ['a', 'b'],
+          status: 'done',
+        },
+        colored,
+      );
+      // Head row (out[1]; out[0] is the leading blank). The count `6`
+      // carries dim+bold; the words around it stay dim.
+      expect(out[1]).toContain('\x1b[2m\x1b[1m6\x1b[0m');
+      expect(out[1]).toContain('Executed');
+      expect(out[1]).toContain('commands');
+    });
+
+    test('count bolding leaves plain output untouched when color disabled', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'bash',
+          verb: 'Executed 6 commands',
+          count: 6,
+          totalDurationMs: 900,
+          subjects: ['a', 'b'],
+          status: 'done',
+        },
+        unicode,
+      );
+      expect(out[1]).toBe(pad('● Executed 6 commands  [900ms]'));
     });
 
     test('outputTruncated appends one hint line under the batch body', () => {

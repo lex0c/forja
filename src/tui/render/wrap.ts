@@ -1,28 +1,30 @@
 // Soft-wrap chunker for the input box. Spec: UI.md §4.5.
 //
-// Splits a buffer line into chunks of at most `innerWidth` UTF-16
-// code units, with one constraint: a chunk MUST NOT end in the
-// middle of a surrogate pair. JS strings are UTF-16, so a non-BMP
-// codepoint (most emoji, many symbols) occupies two code units;
-// `slice(pos, pos + N)` falling exactly between them produces a
-// malformed half that the terminal renders as the replacement
-// glyph (U+FFFD), and every column downstream drifts by one.
+// Splits a buffer line into chunks that each fit within `innerWidth`
+// TERMINAL COLUMNS (visual width), not code units. The distinction
+// matters for CJK and emoji, which occupy 2 columns: counting code
+// units would let a chunk of `innerWidth` codepoints render ~2×
+// wider than the terminal, the terminal would soft-wrap it onto a
+// second visual row, and the renderer — which counts one chunk as one
+// row — would undercount `liveHeight` / `cursorRow` and leak stale
+// rows into scrollback on the next erase.
 //
-// The fix: when the byte that would be at the chunk's last
-// position is a high surrogate, shrink the chunk by one code unit
-// so the pair stays together in the next chunk. This makes some
-// chunks slightly shorter than `innerWidth`, which is why both
-// `renderInput` (slicing to render) and `composeCursor` (locating
-// the cursor's sub-row + col) must consult the SAME chunk list —
-// their previous shared model of "chunk size = innerWidth" no
-// longer holds when surrogates span boundaries.
+// Iteration is per-CODEPOINT (codePointAt + a 1-or-2 code-unit step),
+// so a non-BMP codepoint (most emoji, many symbols — two UTF-16 code
+// units) is never split across a chunk boundary: a `slice` landing
+// mid-pair would emit the replacement glyph (U+FFFD) and drift every
+// column after it. Each chunk is still a code-unit range `[start, end)`
+// so `renderInput` (slicing to render) and `composeCursor` (locating
+// the cursor's sub-row + column) consume the SAME list — both must, or
+// the cursor desyncs from the drawn rows.
 //
-// What this DOES NOT fix: visual width. Emoji and CJK glyphs
-// typically render at 2 cols, so even with surrogate-safe
-// chunking a chunk of `innerWidth` codepoints can still overflow
-// the terminal's column budget. The existing comment in
-// `renderInput` acknowledges that — it's a separate problem
-// solved by a wcwidth-aware chunker (deferred).
+// A single codepoint whose visual width alone exceeds `innerWidth`
+// (e.g. a 2-col glyph at `innerWidth === 1`) gets its own over-budget
+// chunk — a glyph can't be split, so the terminal renders it with
+// whatever width the font assigns. Forward progress is guaranteed:
+// the walk always advances by the codepoint's code-unit length.
+
+import { visualWidth } from './width.ts';
 
 const isHighSurrogate = (code: number): boolean => code >= 0xd800 && code <= 0xdbff;
 
@@ -37,32 +39,28 @@ export interface WrapChunk {
 
 export const wrapInputLine = (line: string, innerWidth: number): readonly WrapChunk[] => {
   if (line.length === 0) return [];
-  const width = Math.max(1, innerWidth);
+  const budget = Math.max(1, innerWidth);
   const chunks: WrapChunk[] = [];
-  let pos = 0;
-  while (pos < line.length) {
-    let end = Math.min(pos + width, line.length);
-    // If the last code unit of the would-be chunk is a high
-    // surrogate, the matching low surrogate is at `end` (just
-    // past). Pull back so the pair lands wholly in the NEXT
-    // chunk. Skipping at most 1 unit per chunk; degenerate cases
-    // (innerWidth === 1, every char is non-BMP) still terminate
-    // because we always advance by `width` of the FOLLOWING
-    // chunk start which is `end` post-clamp; the clamp below
-    // protects against the pathological pos === end case.
-    if (end < line.length && isHighSurrogate(line.charCodeAt(end - 1))) {
-      end -= 1;
+  let start = 0;
+  let col = 0;
+  let i = 0;
+  while (i < line.length) {
+    // Step by whole codepoints so surrogate pairs stay intact. A high
+    // surrogate at `i` is the lead of a 2-code-unit pair.
+    const cpLen = isHighSurrogate(line.charCodeAt(i)) && i + 1 < line.length ? 2 : 1;
+    const w = visualWidth(line.slice(i, i + cpLen));
+    // This codepoint overflows the current chunk's column budget:
+    // close the chunk here and start a fresh one. Skip when the chunk
+    // is still empty (`i === start`) — a lone glyph wider than the
+    // budget can't be split, so it takes an over-budget chunk of one.
+    if (col + w > budget && i > start) {
+      chunks.push({ start, end: i });
+      start = i;
+      col = 0;
     }
-    // Forward progress guarantee: if width === 1 and pos sits
-    // exactly on a high surrogate, end - 1 === pos and we'd loop
-    // forever. Force at least the surrogate pair into this
-    // chunk in that case (over-budget by 1 code unit, but a
-    // surrogate pair is 1 grapheme — the terminal renders it
-    // with whatever width the font assigns, same as if it were
-    // at the start of any other chunk).
-    if (end <= pos) end = Math.min(pos + 2, line.length);
-    chunks.push({ start: pos, end });
-    pos = end;
+    col += w;
+    i += cpLen;
   }
+  chunks.push({ start, end: line.length });
   return chunks;
 };

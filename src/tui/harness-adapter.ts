@@ -142,6 +142,19 @@ const mapExitReason = (reason: ExitReason): SessionEndEvent['reason'] => {
   }
 };
 
+// Flatten a tool subject to a single display line. A multi-line shell
+// command (`a && \n for d in …; do …`, heredocs) carries literal
+// newlines straight from the model's args; rendered as the live card's
+// `└─ <subject>` line, a raw `\n` makes ONE live-region array element
+// span TWO terminal rows, breaking the renderer's one-element-per-row
+// erase math and leaking a stale card into scrollback. Collapse each
+// line break (and the whitespace hugging it) to a single space.
+// Intra-line spacing and single-line subjects (file paths, patterns)
+// are left untouched. Applied to BOTH the top-level and the
+// subagent-mirrored (nested, parentId-tagged) tool:start paths.
+const flattenSubject = (subject: string | null): string | null =>
+  subject?.includes('\n') ? subject.replace(/\s*\n\s*/g, ' ').trim() : subject;
+
 export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => {
   const now = ctx.now ?? (() => Date.now());
 
@@ -425,6 +438,7 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           // through with null subject.
           subject = null;
         }
+        subject = flattenSubject(subject);
         state.tools.set(event.toolUseId, {
           name: event.toolName,
           decision: null,
@@ -788,6 +802,7 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           } catch {
             subject = null;
           }
+          subject = flattenSubject(subject);
           state.tools.set(namespacedId, { name: inner.toolName, decision: null });
           out.push({
             type: 'tool:start',

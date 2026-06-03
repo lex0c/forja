@@ -363,6 +363,26 @@ export interface LiveState {
   // step-stall watchdog (90s default) would have caught a real
   // problem.
   awaitingProvider: { stepN: number; startedAt: number } | null;
+  // Id of the assistant message driving the current turn, or null
+  // between turns. Set by whichever of `thinking:start` /
+  // `assistant:start` opens the turn and held through the tool
+  // phase that follows (`pendingAssistant` and `thinking` both
+  // clear before tools run, so they can't seed a chip there). The
+  // tool-phase chip (`render/tool-phase-chip.ts`) hashes this into
+  // its orchestration verb so the top-slot verb stays stable while
+  // tool cards run beneath it — same per-turn-stable / per-pool-
+  // independent contract the thinking and output chips use. Cleared
+  // at session boundaries so a stale id from a crashed run can't
+  // seed the next session's first tool phase.
+  currentTurnId: string | null;
+  // Mirror of the REPL's `isBusy()` (foreground turn OR playbook OR an
+  // operator `!cmd` in flight), pushed via `busy:change`. The render
+  // layer can't call `isBusy()` (it lives in the REPL), and two of its
+  // inputs have no other LiveState reflection — so this is the single
+  // signal the bash-mode gate (`render/mode.ts`) keys off to match the
+  // submit gate. NOT touched by session boundaries (it tracks the REPL,
+  // not a turn).
+  busy: boolean;
   // Active modal, or null when no modal is up. Composer (compose.ts)
   // replaces the input box with `renderModal(modal, caps)` whenever
   // this is non-null. Status line + tool cards stay visible.
@@ -491,6 +511,8 @@ export const createInitialState = (): LiveState => ({
   pendingAssistant: null,
   thinking: null,
   awaitingProvider: null,
+  currentTurnId: null,
+  busy: false,
   modal: null,
   slash: null,
   reverseSearch: null,
@@ -628,6 +650,13 @@ export type PermanentItem =
   | { kind: 'error'; message: string }
   | { kind: 'warn'; message: string }
   | { kind: 'info'; message: string; tone?: 'plain' | 'secondary' }
+  | {
+      kind: 'operator-bash';
+      command: string;
+      output: string;
+      exitCode: number;
+      durationMs: number;
+    }
   | { kind: 'recap-terse'; message: string }
   | {
       // Subagent run terminal summary, emitted from the
@@ -855,6 +884,10 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           // crashed prior run (e.g., resume after parent crash mid-
           // step) shouldn't carry into a fresh turn.
           awaitingProvider: null,
+          // Same per-session rationale: a stale turn id from a
+          // crashed prior run must not seed the new session's first
+          // tool-phase verb.
+          currentTurnId: null,
           // Drop any unflushed tool-end batch from a prior session
           // that didn't reach `session:end` cleanly (process killed
           // mid-stream, harness crash, headless invocation that
@@ -911,6 +944,8 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           // — the footer would then show "Awaiting model" against a
           // run that's already terminated.
           awaitingProvider: null,
+          // Boundary cleanup: see session:start.
+          currentTurnId: null,
           ended: true,
         },
         permanent: [
@@ -1035,6 +1070,12 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         state: {
           ...state,
           awaitingProvider: null,
+          // Anchor the turn seed. `assistant:start` may fire after
+          // `thinking:start` in the same turn (same messageId), so
+          // this is a harmless re-set; on a no-thinking turn it's
+          // the first anchor. Held through the tool phase for the
+          // tool-phase chip's verb.
+          currentTurnId: event.messageId,
           pendingAssistant: {
             messageId: event.messageId,
             text: '',
@@ -1142,6 +1183,10 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         state: {
           ...state,
           awaitingProvider: null,
+          // Anchor the turn seed at the earliest signal of the turn
+          // (thinking precedes any text). `assistant:start` re-sets
+          // it to the same messageId later — see that case.
+          currentTurnId: event.messageId,
           thinking: { startedAt: event.ts, messageId: event.messageId },
         },
         permanent: [],
@@ -1383,6 +1428,26 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           },
         ],
       };
+
+    case 'operator-bash:done':
+      // Operator `!cmd` result → scrollback card. No state change; the
+      // applyEvent wrapper flushes any pending tool-end batch first
+      // (ordering stays correct).
+      return {
+        state,
+        permanent: [
+          {
+            kind: 'operator-bash',
+            command: event.command,
+            output: event.output,
+            exitCode: event.exitCode,
+            durationMs: event.durationMs,
+          },
+        ],
+      };
+
+    case 'busy:change':
+      return { state: { ...state, busy: event.busy }, permanent: [] };
 
     case 'recap:terse':
       return { state, permanent: [{ kind: 'recap-terse', message: event.message }] };

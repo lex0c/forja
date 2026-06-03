@@ -1,9 +1,9 @@
-// Spinner verb pools for the cognitive (thinking) and output
-// (generating) chips. Replaces the flat "Thinking…" /
-// "Generating…" labels with rotating, on-brand verbs that match
-// Forja's industrial / operational framing — the agent reads as
-// "system executing a cognitive pipeline" rather than "chatbot
-// doing stand-up".
+// Spinner verb pools for the cognitive (thinking), output
+// (generating) and tool-orchestration chips. Replaces the flat
+// "Thinking…" / "Generating…" labels with rotating, on-brand
+// verbs that match Forja's industrial / operational framing — the
+// agent reads as "system executing a cognitive pipeline" rather
+// than "chatbot doing stand-up".
 //
 // Selection is DETERMINISTIC, not random: each verb is chosen by
 // hashing a stable per-turn seed (the assistant message id) into
@@ -17,13 +17,15 @@
 //      different pool indices, giving the variety the brand
 //      asks for without sacrificing per-turn coherence.
 //
-// Why two separate pools instead of one merged list:
+// Why separate pools instead of one merged list:
 //
-//   - Thinking and generating are semantically distinct phases.
-//     Mixing pools would let a turn surface "Forging…" during
-//     the thinking pass (no output yet) or "Reasoning…" during
-//     text streaming (no inference happening) — verbs become
-//     decorative, no longer informative.
+//   - Thinking, generating and tool execution are semantically
+//     distinct phases. Mixing pools would let a turn surface
+//     "Forging…" during the thinking pass (no output yet),
+//     "Reasoning…" during text streaming (no inference happening)
+//     or either of those while a tool runs (the model is idle,
+//     the harness is executing) — verbs become decorative, no
+//     longer informative.
 //
 //   - Cognitive verbs (Reasoning, Analyzing, …) describe what
 //     the model is actually doing during extended thinking:
@@ -56,18 +58,24 @@
 //     Forging is the namesake verb; the rest extend the
 //     metaphor coherently.
 //
+//   - TOOL_VERBS — "agent infrastructure" cluster. The tool
+//     phase is the harness executing tool calls the model
+//     emitted: the activity IS coordination (running, dispatching,
+//     sequencing the calls), not cognition or text production.
+//     Orchestration verbs (Orchestrating, Dispatching, …) name
+//     that precisely. Surfaced by the tool-phase chip
+//     (`render/tool-phase-chip.ts`), pinned at the bottom of the
+//     live region while the tool cards stack above it — so the
+//     indicator never goes blank mid-turn.
+//
 // Other clusters in the brand vocabulary are NOT used here:
 //
 //   - "Minimalist technical" (Analyzing, Indexing, Verifying,
-//     Refining, Executing) — better fit for tool active verbs;
-//     each verb maps cleanly to a tool semantic (read_file
-//     → Indexing, run_tests → Verifying, etc.).
-//
-//   - "Agent infrastructure" (Orchestrating, Dispatching,
-//     Sequencing, Coordinating, Consolidating) — better fit
-//     for subagent rows and compaction surfaces, where the
-//     activity IS coordination. A future slice can route
-//     these into subagent-row.ts and compaction telemetry.
+//     Refining, Executing) — better fit for PER-TOOL active
+//     verbs (read_file → Indexing, run_tests → Verifying); the
+//     tool-phase chip above is a single turn-level indicator, not
+//     a per-card one, so it draws from the orchestration cluster
+//     instead.
 
 const COGNITIVE_VERBS = [
   'Modeling',
@@ -78,6 +86,14 @@ const COGNITIVE_VERBS = [
 ] as const;
 
 const OUTPUT_VERBS = ['Forging', 'Tempering', 'Hardening', 'Smelting', 'Shaping'] as const;
+
+const TOOL_VERBS = [
+  'Orchestrating',
+  'Dispatching',
+  'Sequencing',
+  'Coordinating',
+  'Consolidating',
+] as const;
 
 // Simple deterministic string hash → non-negative integer. Not
 // cryptographic — we only need stable distribution across the
@@ -124,6 +140,8 @@ const hashIndex = (seed: string, mod: number): number => {
 const COGNITIVE_SALT = 'cog';
 const OUTPUT_SALT = 'out';
 
+const TOOL_SALT = 'tool';
+
 // Pick a cognitive verb for the thinking chip. Stable for the
 // same `seed`, varies across different seeds, INDEPENDENT of the
 // output pool's choice for the same seed (per-pool salt). Falls
@@ -142,6 +160,16 @@ export const pickOutputVerb = (seed: string): string => {
   return OUTPUT_VERBS[i] ?? OUTPUT_VERBS[0];
 };
 
+// Pick a tool-orchestration verb for the tool-phase chip. Same
+// contract as the other pickers: stable for the same `seed`,
+// varies across seeds, independent of the cognitive/output pools
+// (per-pool salt) so a turn that thinks, generates AND runs tools
+// shows three uncoupled verbs rather than a learnable triple.
+export const pickToolVerb = (seed: string): string => {
+  const i = hashIndex(TOOL_SALT + seed, TOOL_VERBS.length);
+  return TOOL_VERBS[i] ?? TOOL_VERBS[0];
+};
+
 // Test seams. Exported so the test suite can pin the active
 // pools without brittleness — a contract change (new verb,
 // removed verb, reordered pool) lands with assertion changes
@@ -149,3 +177,4 @@ export const pickOutputVerb = (seed: string): string => {
 // these; use the picker functions above.
 export const COGNITIVE_VERB_POOL: ReadonlyArray<string> = COGNITIVE_VERBS;
 export const OUTPUT_VERB_POOL: ReadonlyArray<string> = OUTPUT_VERBS;
+export const TOOL_VERB_POOL: ReadonlyArray<string> = TOOL_VERBS;
