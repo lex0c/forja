@@ -1480,6 +1480,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           // Executor exposes its process-group kill switch; the
           // interrupt path (triggerInterrupt) uses it.
           operatorBashKill = kill;
+          // Replay an interrupt that landed BEFORE the hook was
+          // registered: Ctrl+C/Esc can arrive in the same stdin chunk
+          // as the submitting Enter (or a seam may register the hook
+          // async), so triggerInterrupt set the latch but had no kill to
+          // call. Without this, that first interrupt is dropped and the
+          // command runs until a second press or the timeout. SIGINT —
+          // the first-tap signal; a later press still escalates.
+          if (operatorBashInterrupted) kill('SIGINT');
         }),
       )
       .then(({ output, exitCode }) => {

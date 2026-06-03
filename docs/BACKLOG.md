@@ -14,6 +14,14 @@ All bypassed events emit no permanent and touch only live-region/overlay state, 
 
 **Tests.** `renderer.test.ts`: with a held `tool:end`, a `permission:ask` sets `state.modal` immediately (not queued); an `interrupt` flips `softInterrupted` immediately. Verification: `tests/tui` + `tests/cli/repl` 1026 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
 
+## [2026-06-03] TUI `!cmd`: replay an interrupt that beats the kill-hook registration
+
+**Finding.** `runOperatorBash` sets `operatorBashRunning` synchronously but exposes the kill switch one microtask later (inside `Promise.resolve().then(() => execBash(…, onKillable))`). If Ctrl+C/Esc lands in that window — Enter + Ctrl+C in the same stdin chunk, or an async-registering test seam — `triggerInterrupt` sets the `operatorBashInterrupted` latch but `operatorBashKill` is still null, so the kill is a no-op. The `onKillable` callback then stored the kill function without checking the latch, dropping that first interrupt: the command ran until a second press or the timeout.
+
+**Fix.** The `onKillable` callback now replays a pending interrupt — after storing the kill switch, `if (operatorBashInterrupted) kill('SIGINT')`. SIGINT is the first-tap signal; a later press still escalates to SIGKILL.
+
+**Tests.** `repl.test.ts`: a seam that registers the hook only after the operator's Ctrl+C still terminates the command (replayed `killed:SIGINT`). Verification: `tests/tui` + `tests/cli/repl` 1029 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
 ## [2026-06-03] TUI: flatten nested (subagent) tool subjects too
 
 **Finding.** The multi-line tool-subject flatten ran only on the top-level `tool_invoking` path; the subagent mirror (`subagent_progress` → `event.lastEvent.type === 'tool_invoking'`, emitting a parentId-tagged `tool:start`) forwarded `vocab.subject?.(inner.args)` raw. A subagent running a multi-line bash/heredoc command carried a literal `\n` into the nested card subject — the same one-element-spans-two-rows bug that leaks stale tool-card rows.

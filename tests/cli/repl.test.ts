@@ -680,6 +680,51 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('an interrupt that lands before the kill hook is registered is replayed', async () => {
+    // Race: Ctrl+C can arrive (same stdin chunk as the submitting Enter,
+    // or before an async-registering seam) BEFORE execBash hands up its
+    // kill switch. triggerInterrupt sets the latch but has no kill to
+    // call; the hook registration must replay it, or the first interrupt
+    // is dropped until a second press / the timeout.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    // Holder (not bare `let`) so TS keeps the union type past the
+    // closure assignment instead of narrowing to `null`.
+    const seam: {
+      register: ((kill: (signal: NodeJS.Signals) => void) => void) | null;
+      resolve: ((r: { output: string; exitCode: number }) => void) | null;
+    } = { register: null, resolve: null };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      // Capture the hook instead of registering it — the test controls
+      // WHEN the kill switch becomes available (i.e. AFTER the Ctrl+C).
+      execBash: ((_cmd, _cwd, onKillable) =>
+        new Promise((resolve) => {
+          seam.register = onKillable ?? null;
+          seam.resolve = resolve;
+        })) as NonNullable<RunReplOptions['execBash']>,
+    });
+    await tick();
+    stdin.feed('!sleep\r'); // runs; execBash captures the hook but hasn't exposed a kill yet
+    await tick();
+    stdin.feed('\x03'); // Ctrl+C BEFORE the kill switch is registered → latch set, no kill called
+    await tick();
+    // Now the executor registers its kill switch — the pending interrupt
+    // must be replayed (SIGINT) instead of dropped.
+    seam.register?.((sig) => seam.resolve?.({ output: `killed:${sig}`, exitCode: 130 }));
+    await flushFrame();
+    expect(writes.join('')).toContain('killed:SIGINT');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('Ctrl+C interrupts a running `!cmd` (kills its process group, does not wait the timeout)', async () => {
     const stdin = makeStdin();
     const writes: string[] = [];
