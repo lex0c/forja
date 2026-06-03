@@ -680,6 +680,96 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('Ctrl+C interrupts a running `!cmd` (kills its process group, does not wait the timeout)', async () => {
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      // Hangs until the interrupt path invokes the kill switch.
+      execBash: ((_cmd, _cwd, onKillable) =>
+        new Promise((resolve) => {
+          onKillable?.((sig) => resolve({ output: `killed:${sig}`, exitCode: 130 }));
+        })) as NonNullable<RunReplOptions['execBash']>,
+    });
+    await tick();
+    stdin.feed('!sleep\r'); // buffer clears, command "runs" (hangs)
+    await tick();
+    stdin.feed('\x03'); // Ctrl+C → triggerInterrupt → SIGINT the command
+    await flushFrame();
+    expect(writes.join('')).toContain('killed:SIGINT');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a `!cmd` ignoring SIGINT is SIGKILLed on the second Ctrl+C (interrupt ladder)', async () => {
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      // Only SIGKILL resolves it (mimics a SIGINT-ignoring command).
+      execBash: ((_cmd, _cwd, onKillable) =>
+        new Promise((resolve) => {
+          onKillable?.((sig) => {
+            if (sig === 'SIGKILL') resolve({ output: `killed:${sig}`, exitCode: 137 });
+          });
+        })) as NonNullable<RunReplOptions['execBash']>,
+    });
+    await tick();
+    stdin.feed('!hang\r');
+    await tick();
+    stdin.feed('\x03'); // first tap → SIGINT (ignored)
+    await tick();
+    stdin.feed('\x03'); // second tap → SIGKILL
+    await flushFrame();
+    expect(writes.join('')).toContain('killed:SIGKILL');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('shell output preserves stdout/stderr interleave order (real spawn)', async () => {
+    // `exec 2>&1` merges the streams on one pipe so a diagnostic emitted
+    // between two normal writes stays between them — not shoved after all
+    // stdout by a separate-pipe concat.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    stdin.feed('!printf OUTA; printf ERRB 1>&2; printf OUTC\r');
+    await new Promise((r) => setTimeout(r, 400));
+    const out = writes.join('');
+    const a = out.indexOf('OUTA');
+    const b = out.indexOf('ERRB');
+    const c = out.indexOf('OUTC');
+    expect(a).toBeGreaterThan(-1);
+    expect(b).toBeGreaterThan(a); // stderr stayed between the stdout writes
+    expect(c).toBeGreaterThan(b);
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('idle Ctrl+D (EOF) exits 130 immediately, no gate (shell convention)', async () => {
     // §5.4: Ctrl+D is the explicit "I'm done" signal at empty buffer
     // and bypasses the double-tap gate. Single press exits.

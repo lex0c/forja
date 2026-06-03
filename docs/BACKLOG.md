@@ -2,6 +2,18 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-03] TUI `!cmd` follow-up: interruptible, ordered output, single-line card
+
+Three review findings on the shipped operator shell escape (commit above), all fixed in `cli/repl.ts` + `render/permanent.ts`:
+
+**Interruptible (`cli/repl.ts`).** `operatorBashRunning` is in `isBusy()`, so Ctrl+C/Esc already routed to `triggerInterrupt()` — but that only aborted the turn/playbook controllers and had no handle on the spawned shell, so the interrupt was cosmetic and the REPL stayed blocked until the 120s timeout. The default `execBash` now hands its process-group kill switch up via an `onKillable` callback; `runOperatorBash` stores it and `triggerInterrupt` kills the command's group when one is running (SIGINT on the first tap, SIGKILL on a repeat if it ignores SIGINT — mirroring the turn soft/hard ladder), returning before the turn-level `interrupt` event (no turn to interrupt; emitting it would leak `softInterrupted` into the next turn). The Esc gate (`running`) widened to `running || operatorBashRunning`; Ctrl+C already covered via `isBusy`.
+
+**stdout/stderr order (`cli/repl.ts`).** Reading the two pipes independently and concatenating `out + err` shoved every diagnostic after all normal output, misrepresenting a compiler/test transcript. The default `execBash` now prefixes the script with `exec 2>&1` (redirects the shell's fd 2 onto fd 1 for the whole command) and reads only stdout, so stderr interleaves in emission order on one pipe.
+
+**Single-line card (`render/permanent.ts`).** A multi-line command (the editor accepts `\`+Enter / Shift+Enter) interpolated into the `! <command>` head spilled a raw `\n` onto an unprefixed scrollback row and pushed the `exit N` / `[dur]` metrics below the command text. The head now flattens the command's newlines to spaces for display; it still RAN with the real newlines.
+
+**Tests.** `repl.test.ts`: Ctrl+C kills a running `!cmd` via SIGINT (no timeout wait); a SIGINT-ignoring command is SIGKILLed on the second tap; real-spawn `printf OUTA; printf ERRB 1>&2; printf OUTC` preserves OUTA→ERRB→OUTC order. `permanent.test.ts`: a multi-line command renders as one flattened head row. Verification: `tests/tui` + `tests/cli/repl` 1018 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
 ## [2026-06-03] TUI: operator shell escape — `!cmd` runs a command from the input
 
 **Goal.** Operator request: type `!` in the input to run a shell command. `!` flips the prompt `> ` → `! ` and paints the line yellow; the output lands in scrollback. Operator chose the **direct shell** model (vs gating through the agent's permission engine / sandbox): the engine gates the agent, not the human at the keyboard, so `!` is a real shell escape.

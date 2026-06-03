@@ -124,7 +124,15 @@ export interface RunReplOptions {
   // operator's full env (the shell-style `!` escape — operator's own
   // shell, NOT the agent's permission engine / sandbox). Tests inject a
   // fake to avoid spawning a real shell.
-  execBash?: (command: string, cwd: string) => Promise<{ output: string; exitCode: number }>;
+  execBash?: (
+    command: string,
+    cwd: string,
+    // Called once with a kill switch for the spawned command's process
+    // group, so the interrupt path (Ctrl+C / Esc) can terminate it. The
+    // default impl wires it to a group kill; a test seam may ignore it
+    // or use it to resolve on demand.
+    onKillable?: (kill: (signal: NodeJS.Signals) => void) => void,
+  ) => Promise<{ output: string; exitCode: number }>;
   // Test seam: override the operator `!cmd` timeout (default 120s) so a
   // test can prove the kill path terminates a hung command without
   // waiting two minutes.
@@ -305,6 +313,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // `isBusy` so it serializes against agent turns and playbooks (and
   // against a second `!` command) — one operator action at a time.
   let operatorBashRunning = false;
+  // Kill switch for the in-flight `!cmd`, handed up by the executor so
+  // the interrupt path (Ctrl+C / Esc) can terminate the command's
+  // process group instead of waiting out the timeout. Null when no
+  // command runs (or the test seam didn't expose one).
+  let operatorBashKill: ((signal: NodeJS.Signals) => void) | null = null;
+  // First-tap latch for the `!cmd` interrupt ladder: SIGINT on the
+  // first Ctrl+C/Esc, SIGKILL on a repeat if the command ignored it.
+  let operatorBashInterrupted = false;
   // Single busy predicate threaded through every submit gate
   // (foreground startTurn, Enter in the editor, Enter in
   // reverse-search) AND the slash dispatcher's `isRunning()`
@@ -1315,45 +1331,56 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   const OPERATOR_BASH_TIMEOUT_MS = options.operatorBashTimeoutMs ?? 120_000;
   const execBash =
     options.execBash ??
-    (async (command: string, runCwd: string): Promise<{ output: string; exitCode: number }> => {
-      // `detached: true` puts the command in its own process group so the
-      // timeout can SIGKILL the WHOLE group, not just the `bash -c`
-      // leader. A bare `proc.kill()` (single SIGTERM to bash) leaves
-      // pipeline children / SIGTERM-ignoring procs holding the stdout
-      // pipe open, so `Response().text()` below would await EOF forever
-      // and `operatorBashRunning` would stick true — wedging the REPL.
+    (async (
+      command: string,
+      runCwd: string,
+      onKillable?: (kill: (signal: NodeJS.Signals) => void) => void,
+    ): Promise<{ output: string; exitCode: number }> => {
+      // `detached: true` puts the command in its own process group so a
+      // kill targets the WHOLE group, not just the `bash -c` leader. A
+      // bare `proc.kill()` (single signal to bash) leaves pipeline
+      // children / signal-ignoring procs holding the stdout pipe open,
+      // so `Response().text()` below would await EOF forever and
+      // `operatorBashRunning` would stick true — wedging the REPL.
       // Killing the group (POSIX `process.kill(-pid, …)`, the bg-manager
-      // convention) closes the pipes and unblocks. SIGKILL straight up:
-      // the command already had its full grace by timing out.
+      // convention) closes the pipes and unblocks.
+      //
+      // `exec 2>&1` (first line of the script) redirects the shell's
+      // fd 2 onto fd 1 for the whole command, so stderr and stdout
+      // interleave on ONE pipe in the order the command emitted them —
+      // a separate-pipe read + concat would move every diagnostic after
+      // all normal output, misrepresenting a compiler/test transcript.
       const proc = Bun.spawn({
-        cmd: ['bash', '-c', command],
+        cmd: ['bash', '-c', `exec 2>&1\n${command}`],
         cwd: runCwd,
         env: process.env,
         stdout: 'pipe',
-        stderr: 'pipe',
+        stderr: 'ignore',
         detached: true,
       });
-      const killer = setTimeout(() => {
+      const killGroup = (signal: NodeJS.Signals): void => {
         const pid = proc.pid;
         try {
-          if (pid !== undefined && pid > 0) process.kill(-pid, 'SIGKILL');
-          else proc.kill('SIGKILL');
+          if (pid !== undefined && pid > 0) process.kill(-pid, signal);
+          else proc.kill(signal);
         } catch {
           // group already gone, or no PID — fall back to the leader.
           try {
-            proc.kill('SIGKILL');
+            proc.kill(signal);
           } catch {
             // also gone — nothing to kill.
           }
         }
-      }, OPERATOR_BASH_TIMEOUT_MS);
+      };
+      // Hand the kill switch to the interrupt path (Ctrl+C / Esc).
+      onKillable?.(killGroup);
+      // Hard backstop: SIGKILL the group if the command overstays. The
+      // interrupt path uses SIGINT/SIGKILL before this ever fires.
+      const killer = setTimeout(() => killGroup('SIGKILL'), OPERATOR_BASH_TIMEOUT_MS);
       try {
-        const [out, err] = await Promise.all([
-          new Response(proc.stdout).text(),
-          new Response(proc.stderr).text(),
-        ]);
+        const output = await new Response(proc.stdout).text();
         const exitCode = await proc.exited;
-        return { output: out + err, exitCode };
+        return { output, exitCode };
       } finally {
         clearTimeout(killer);
       }
@@ -1368,9 +1395,16 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // instead of escaping past the `.finally` and leaving the flag stuck.
   const runOperatorBash = (command: string): void => {
     operatorBashRunning = true;
+    operatorBashInterrupted = false;
     const startedAt = now();
     void Promise.resolve()
-      .then(() => execBash(command, cwd))
+      .then(() =>
+        execBash(command, cwd, (kill) => {
+          // Executor exposes its process-group kill switch; the
+          // interrupt path (triggerInterrupt) uses it.
+          operatorBashKill = kill;
+        }),
+      )
       .then(({ output, exitCode }) => {
         bus.emit({
           type: 'operator-bash:done',
@@ -1394,6 +1428,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       })
       .finally(() => {
         operatorBashRunning = false;
+        operatorBashKill = null;
         // The REPL was idle while the command ran; if messages queued
         // meanwhile (operator typed ahead), drain them now.
         if (!isBusy()) queueMicrotask(() => drainInbox());
@@ -1610,6 +1645,18 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // softInterrupted flag is the single source of truth for
   // distinguishing first tap from second.
   const triggerInterrupt = (): void => {
+    // An operator `!cmd` owns the interrupt while it runs: Ctrl+C / Esc
+    // kill its process group (like a terminal) rather than touching a
+    // turn. SIGINT on the first tap, SIGKILL on a repeat if it ignored
+    // SIGINT. We do NOT emit the turn-level `interrupt` event here —
+    // there's no turn, and it would leak `softInterrupted` into the next
+    // one. The kill closes the pipes → execBash resolves → the
+    // operator-bash card lands with the killed exit code.
+    if (operatorBashRunning) {
+      operatorBashKill?.(operatorBashInterrupted ? 'SIGKILL' : 'SIGINT');
+      operatorBashInterrupted = true;
+      return;
+    }
     const level: 'soft' | 'hard' = renderer.state().softInterrupted ? 'hard' : 'soft';
     bus.emit({ type: 'interrupt', ts: now(), level });
     if (level === 'hard') {
@@ -2727,7 +2774,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     //
     // Esc with no run in progress is a no-op (the editor's own
     // slash-mode Esc handler intercepted before reaching here).
-    if (result.interruptSoft === true && running) {
+    if (result.interruptSoft === true && (running || operatorBashRunning)) {
       triggerInterrupt();
     }
 

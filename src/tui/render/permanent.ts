@@ -392,8 +392,15 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // MAX_OPERATOR_BASH_LINES with a `… +N more lines` tail so a
       // `!cat hugefile` can't bury scrollback.
       const failed = item.exitCode !== 0;
+      // Flatten a multi-line command (the editor accepts `\`+Enter /
+      // Shift+Enter newlines) to a single display line: a raw `\n` in
+      // the head would spill onto an unprefixed scrollback row and push
+      // the `exit N` / `[dur]` metrics below the command text. The
+      // command RAN with its real newlines; only the card label
+      // collapses them.
+      const commandLabel = item.command.replace(/\s*\n\s*/g, ' ');
       const head =
-        paint(caps, 'dim', `! ${item.command}`) +
+        paint(caps, 'dim', `! ${commandLabel}`) +
         (failed ? paint(caps, 'warn', `  exit ${item.exitCode}`) : '') +
         paint(caps, 'secondary', `  [${formatChipDuration(item.durationMs)}]`);
       const lines = ['', head];

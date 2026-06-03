@@ -782,6 +782,25 @@ describe('formatPermanent', () => {
       ]);
     });
 
+    test('a multi-line command is flattened to a single head row', () => {
+      // The editor accepts `\`+Enter / Shift+Enter, so the command can
+      // carry newlines. The head must stay ONE row (flattened) — else a
+      // raw `\n` spills onto an unprefixed scrollback row and pushes the
+      // `[dur]` below the command text.
+      const out = formatPermanent(
+        {
+          kind: 'operator-bash',
+          command: 'for f in x; do\necho $f\ndone',
+          output: '',
+          exitCode: 0,
+          durationMs: 5,
+        },
+        unicode,
+      );
+      expect(out).toEqual([pad(''), pad('! for f in x; do echo $f done  [5ms]')]);
+      expect(out[1]).not.toContain('\n');
+    });
+
     test('empty output → head only', () => {
       const out = formatPermanent(
         { kind: 'operator-bash', command: 'true', output: '', exitCode: 0, durationMs: 3 },
