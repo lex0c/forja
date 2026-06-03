@@ -2,6 +2,24 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-03] TUI `!cmd`: ANSI-sanitize command output (terminal-hijack guard)
+
+**Finding.** Operator command output was rendered VERBATIM to scrollback. A command like `!cat` on a file containing `ESC[2J` / OSC / hide-cursor would push raw control bytes to the terminal — clearing the screen, moving/hiding the cursor, or spoofing TUI chrome. The repo already treats this as terminal-state hijack (`src/sanitize/ansi.ts`, SECURITY_GUIDELINE §3.2).
+
+**Fix.** `runOperatorBash` runs the output through `stripAnsi` before emitting `operator-bash:done` — sanitizing at the single intake point so every consumer is covered (the scrollback renderer AND the `--json` NDJSON forwarder), per the repo's strip-at-intake doctrine. `stripAnsi` removes ANSI escapes + C0/C1/DEL while keeping the safe whitespace controls (TAB/LF/CR), so multi-line text and the line split survive; command colors are dropped (safe over an SGR allowlist for now). The render layer keeps rendering verbatim — the output is now clean by the time it arrives (comment added in permanent.ts).
+
+**Tests.** `repl.test.ts`: a command whose output contains `\x1b[2J…\x1b[?25l` lands with the visible text intact but the control sequences gone. Verification: `tests/tui` + `tests/cli/repl` 1024 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
+## [2026-06-03] TUI `!cmd`: byte-cap output + track the command through shutdown
+
+Two findings on the operator shell escape, both in `cli/repl.ts`.
+
+**Byte-cap output (memory guard).** `new Response(proc.stdout).text()` buffered the WHOLE stream before the renderer's 200-line display cap applied — a flood (`!yes`, `!cat bigfile`) could exhaust memory long before the 120s timeout. The default executor now drains stdout chunk-by-chunk with a byte cap (`OPERATOR_BASH_MAX_OUTPUT_BYTES`, default 1 MiB): once the cap is crossed it SIGKILLs the process group (stops the producer) and appends a `[output capped …]` marker. Bounded to ~one pipe-buffer beyond the cap. Injectable via `operatorBashMaxOutputBytes`.
+
+**Track through shutdown.** The operator promise was fire-and-forget, so EOF (Ctrl+D) / external SIGINT mid-`!cmd` closed the REPL while the detached group kept running (up to the timeout) and its completion tried to emit on a torn-down bus. `runOperatorBash` now stores the promise (`operatorBashPromise`); `shutdown` SIGKILLs the group (alongside the turn/playbook aborts) and awaits the promise (alongside `runningPromise` / `playbookPromise`), so the command dies with the REPL and its `operator-bash:done` lands before `renderer.close`. This also closes the earlier-noted Ctrl+D-orphan follow-up.
+
+**Tests.** `repl.test.ts`: a `!yes` flood with a tiny byte cap lands its card fast (capped + killed, not the timeout); EOF while a `!cmd` hangs kills + awaits it and the card emits before teardown (`exit 130`). Verification: `tests/tui` + `tests/cli/repl` 1023 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
 ## [2026-06-03] TUI `!cmd`: bash-mode gate must match the submit gate (busy, not turn-running)
 
 **Finding.** `isBashMode` gated on `!isTurnRunning(state)`, but `isTurnRunning` is a render-derived subset of the REPL's `isBusy()` — it only sees LiveState turn activity (activeTools / thinking / pendingAssistant / awaitingProvider) and can't see `playbookRunning` or `operatorBashRunning` (no LiveState reflection). So while another `!cmd` ran, or in a playbook gap, typing a leading `!` flipped the input/rules/footer to yellow shell mode even though Enter refuses the command as busy. The visual gate didn't match the submit gate.

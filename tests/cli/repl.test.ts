@@ -807,6 +807,95 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('operator command output is ANSI-stripped before scrollback (no terminal hijack)', async () => {
+    // A command like `!cat` on a file containing ESC[2J could clear the
+    // screen / hide the cursor / spoof chrome. Output is sanitized at
+    // intake, so the raw control bytes never reach the terminal.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      execBash: (async () => ({
+        output: '\x1b[2JEVILCLEAR\x1b[?25l',
+        exitCode: 0,
+      })) as NonNullable<RunReplOptions['execBash']>,
+    });
+    await tick();
+    stdin.feed('!cat evil\r');
+    await flushFrame();
+    const out = writes.join('');
+    expect(out).toContain('EVILCLEAR'); // visible text survives
+    expect(out).not.toContain('\x1b[2J'); // screen-clear stripped (renderer never emits it here)
+    expect(out).not.toContain('\x1b[?25l'); // hide-cursor stripped
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a high-volume `!cmd` is capped instead of buffering unbounded (real spawn)', async () => {
+    // Regression: stdout is drained with a byte cap, not buffered whole
+    // by Response().text(). `!yes` floods forever; the cap must stop it
+    // (and SIGKILL the producer) so the card lands fast — proving the
+    // cap fired, not the 3s timeout, and memory stayed bounded.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      operatorBashMaxOutputBytes: 1000,
+      operatorBashTimeoutMs: 3000, // backstop, far above the byte-cap path
+    });
+    await tick();
+    stdin.feed('!yes\r');
+    await new Promise((r) => setTimeout(r, 500)); // well under the 3s timeout
+    expect(writes.join('')).toContain('! yes'); // card landed → flood was capped + killed
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('shutdown while a `!cmd` runs kills + awaits it (no emit after teardown)', async () => {
+    // Regression: the operator promise is tracked, so EOF mid-`!cmd`
+    // SIGKILLs the group and awaits the promise — the command can't
+    // outlive the REPL, and its operator-bash:done emits while the
+    // renderer is still open.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      execBash: ((_cmd, _cwd, onKillable) =>
+        new Promise((resolve) => {
+          onKillable?.((sig) => resolve({ output: `killed:${sig}`, exitCode: 130 }));
+        })) as NonNullable<RunReplOptions['execBash']>,
+    });
+    await tick();
+    stdin.feed('!sleep\r'); // runs (hangs); buffer clears
+    await tick();
+    stdin.feed('\x04'); // EOF → requestShutdown → kill + await the command
+    const code = await promise;
+    expect(code).toBe(130);
+    // The card emitted before renderer.close (shutdown awaited the promise).
+    expect(writes.join('')).toContain('killed:SIGKILL');
+  });
+
   test('idle Ctrl+D (EOF) exits 130 immediately, no gate (shell convention)', async () => {
     // §5.4: Ctrl+D is the explicit "I'm done" signal at empty buffer
     // and bypasses the double-tap gate. Single press exits.

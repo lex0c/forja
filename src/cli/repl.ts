@@ -137,6 +137,10 @@ export interface RunReplOptions {
   // test can prove the kill path terminates a hung command without
   // waiting two minutes.
   operatorBashTimeoutMs?: number;
+  // Test seam: override the operator `!cmd` stdout byte cap (default
+  // 1 MiB) so a test can prove a flood is capped without buffering a
+  // megabyte.
+  operatorBashMaxOutputBytes?: number;
   // Test seam: skip the first-run trust prompt (AGENTIC_CLI §9.1).
   // Production never sets this — operator always sees the prompt
   // on first cwd visit. Tests don't drive the trust modal (the
@@ -321,6 +325,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // First-tap latch for the `!cmd` interrupt ladder: SIGINT on the
   // first Ctrl+C/Esc, SIGKILL on a repeat if the command ignored it.
   let operatorBashInterrupted = false;
+  // The in-flight `!cmd` promise, so shutdown can kill + await it (the
+  // same contract `runningPromise` / `playbookPromise` have). Without
+  // this, EOF / SIGINT mid-`!cmd` would close the REPL while the
+  // detached group kept running and its completion tried to emit on a
+  // torn-down bus. Null when no command runs.
+  let operatorBashPromise: Promise<void> | null = null;
   // Single busy predicate threaded through every submit gate
   // (foreground startTurn, Enter in the editor, Enter in
   // reverse-search) AND the slash dispatcher's `isRunning()`
@@ -1343,6 +1353,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // generous timeout is the guard, so a hung command can't wedge the
   // REPL forever. The result lands in scrollback via `operator-bash:done`.
   const OPERATOR_BASH_TIMEOUT_MS = options.operatorBashTimeoutMs ?? 120_000;
+  // Memory guard: stop draining stdout once this many bytes are buffered
+  // and SIGKILL the producer, so a flood (`!yes`, `!cat bigfile`) can't
+  // exhaust the CLI before the timeout. 1 MiB — far above any sane
+  // command's useful output, and the renderer only shows ~200 lines of it.
+  const OPERATOR_BASH_MAX_OUTPUT_BYTES = options.operatorBashMaxOutputBytes ?? 1_048_576;
   const execBash =
     options.execBash ??
     (async (
@@ -1392,8 +1407,42 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       // interrupt path uses SIGINT/SIGKILL before this ever fires.
       const killer = setTimeout(() => killGroup('SIGKILL'), OPERATOR_BASH_TIMEOUT_MS);
       try {
-        const output = await new Response(proc.stdout).text();
+        // Drain stdout with a BYTE cap, not `Response().text()` which
+        // buffers the whole stream first: a high-volume command (`!yes`,
+        // `!cat bigfile`) would exhaust memory long before the timeout.
+        // Read chunks, stop once the cap is crossed, and SIGKILL the
+        // group so the producer can't keep flooding. (The renderer's
+        // line cap is a separate DISPLAY guard; this is the MEMORY one.)
+        const reader = proc.stdout.getReader();
+        const decoder = new TextDecoder();
+        let output = '';
+        let bytes = 0;
+        let capped = false;
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value === undefined) continue;
+            bytes += value.byteLength;
+            output += decoder.decode(value, { stream: true });
+            if (bytes >= OPERATOR_BASH_MAX_OUTPUT_BYTES) {
+              capped = true;
+              killGroup('SIGKILL');
+              break;
+            }
+          }
+          output += decoder.decode(); // flush any trailing partial codepoint
+        } finally {
+          try {
+            await reader.cancel();
+          } catch {
+            // stream already closed by the kill — nothing to release.
+          }
+        }
         const exitCode = await proc.exited;
+        if (capped) {
+          output += `\n[output capped at ${OPERATOR_BASH_MAX_OUTPUT_BYTES} bytes — command terminated]`;
+        }
         return { output, exitCode };
       } finally {
         clearTimeout(killer);
@@ -1412,7 +1461,8 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     operatorBashInterrupted = false;
     syncBusy();
     const startedAt = now();
-    void Promise.resolve()
+    // Captured (not `void`) so shutdown can kill + await it.
+    operatorBashPromise = Promise.resolve()
       .then(() =>
         execBash(command, cwd, (kill) => {
           // Executor exposes its process-group kill switch; the
@@ -1425,7 +1475,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           type: 'operator-bash:done',
           ts: now(),
           command,
-          output,
+          // Strip ANSI + control bytes from the command's output before
+          // it enters the event stream (SECURITY_GUIDELINE §3.2): raw
+          // bytes from e.g. `!cat untrusted-file` could clear the screen,
+          // hide the cursor, or spoof TUI chrome when rendered to
+          // scrollback (or forwarded to NDJSON). stripAnsi keeps the
+          // safe whitespace controls (TAB/LF/CR) so multi-line text and
+          // the line split survive. Sanitizing at this single intake
+          // point covers every consumer (renderer + `--json` forwarder).
+          output: stripAnsi(output),
           exitCode,
           durationMs: now() - startedAt,
         });
@@ -1436,7 +1494,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           type: 'operator-bash:done',
           ts: now(),
           command,
-          output: msg,
+          output: stripAnsi(msg),
           exitCode: -1,
           durationMs: now() - startedAt,
         });
@@ -1444,6 +1502,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       .finally(() => {
         operatorBashRunning = false;
         operatorBashKill = null;
+        operatorBashPromise = null;
         syncBusy();
         // The REPL was idle while the command ran; if messages queued
         // meanwhile (operator typed ahead), drain them now.
@@ -1585,6 +1644,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // below blocks db.close() until the child's payload write
     // lands.
     if (playbookAbortController !== null) playbookAbortController.abort();
+    // SIGKILL an in-flight operator `!cmd`'s process group so it doesn't
+    // outlive the REPL (detached → would keep running for up to the
+    // timeout) and so its completion settles + emits BEFORE renderer.close
+    // below, not on a torn-down bus. The await is in the promise section.
+    if (operatorBashRunning) operatorBashKill?.('SIGKILL');
     // Cancel any pending idle-exit-gate timer so a 2s setTimeout
     // doesn't outlive the REPL and leak a node handle (visible in
     // tests as Bun's "open handles" warning, and in production as
@@ -1610,6 +1674,17 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // Swallow — runPlaybook's caller (slash exec) already
         // surfaces failures via the slash bus error channel; the
         // shutdown path only needs the wait, not the verdict.
+      }
+    }
+    // Same wait for an operator `!cmd` (SIGKILLed above): let its
+    // `operator-bash:done` emit land while the renderer is still open,
+    // and the read loop release, before teardown. The chain is already
+    // `.catch`ed, so the await never throws — but guard anyway.
+    if (operatorBashPromise !== null) {
+      try {
+        await operatorBashPromise;
+      } catch {
+        // settled with an error already surfaced as the bash card.
       }
     }
     modalManager.close();
