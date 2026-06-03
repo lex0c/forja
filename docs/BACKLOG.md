@@ -2,6 +2,18 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-03] TUI: modal + interrupt events must bypass the tool min-display hold
+
+Two findings on the `toolMinDisplayMs` hold queue (renderer.ts) — events queued behind a held `tool:end` broke synchronously-coupled REPL logic.
+
+**Modal-open (security).** `modal-manager.ts` installs a modal's focus handler synchronously on `bus.emit(open(...))`, so the keyboard is routed to the modal the instant it's emitted. But the `*:ask` events weren't in `HOLD_BYPASS`, so a fast tool ending just before a permission/memory confirm queued the `*:ask` behind the 400ms hold: the prompt didn't render yet, but Enter / a hotkey was already consumed by the hidden handler — and permission prompts default to Yes, so an operator could approve a tool without ever seeing its modal. Fix: bypass all modal open (`permission:ask`, `trust:ask`, `shared-trust:ask`, `history-clear:ask`, `memory:{write,action,user-scope}:ask`) and lifecycle (`modal:answer/select/queue-depth`) events, so the modal renders in lockstep with focus activation.
+
+**Interrupt escalation.** `triggerInterrupt()` reads `renderer.state().softInterrupted` to pick soft vs hard and emits `interrupt` to flip it. Behind the hold, the flip was queued, so a second Esc/Ctrl+C within the window re-read `false` → both presses took the soft branch, never the promised hard abort. Fix: bypass `interrupt` / `interrupt:exit-arm` / `interrupt:exit-cancel`. (Operator-`!cmd` interrupts already bypass this — they use a local latch, not the event.)
+
+All bypassed events emit no permanent and touch only live-region/overlay state, so processing them out of order with the held `tool:end` is scrollback-safe. The `HOLD_BYPASS` comment now documents the three categories (keystroke/overlay, modal, interrupt).
+
+**Tests.** `renderer.test.ts`: with a held `tool:end`, a `permission:ask` sets `state.modal` immediately (not queued); an `interrupt` flips `softInterrupted` immediately. Verification: `tests/tui` + `tests/cli/repl` 1026 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
 ## [2026-06-03] TUI `!cmd`: ANSI-sanitize command output (terminal-hijack guard)
 
 **Finding.** Operator command output was rendered VERBATIM to scrollback. A command like `!cat` on a file containing `ESC[2J` / OSC / hide-cursor would push raw control bytes to the terminal — clearing the screen, moving/hiding the cursor, or spoofing TUI chrome. The repo already treats this as terminal-state hijack (`src/sanitize/ansi.ts`, SECURITY_GUIDELINE §3.2).

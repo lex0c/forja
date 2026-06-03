@@ -1450,6 +1450,73 @@ describe('tool min-display hold (toolMinDisplayMs)', () => {
     r.close();
   });
 
+  test('a modal-open (permission:ask) is NOT delayed behind a held tool:end', () => {
+    // modal-manager installs the modal's focus handler synchronously on
+    // emit, so if the `*:ask` event were queued behind the hold, the
+    // keyboard would route to an unrendered modal — an operator could
+    // approve a permission prompt (default Yes) without seeing it. The
+    // modal must render the instant the event fires.
+    const bus = createBus();
+    const sink = makeSink();
+    const sched = makeSchedulerOptions();
+    const clock = makeClock(1000);
+    const r = createRenderer({
+      bus,
+      caps,
+      write: sink.write,
+      schedulerOptions: sched.options,
+      bracketedPaste: false,
+      now: clock.now,
+      toolMinDisplayMs: 400,
+    });
+    bus.emit(sessionStart);
+    sched.flushAll();
+    bus.emit(toolStart);
+    bus.emit(toolExec);
+    bus.emit(toolEnd); // held — NOT yet applied
+    expect(r.state().activeTools.has('t1')).toBe(true);
+    bus.emit({
+      type: 'permission:ask',
+      ts: 7,
+      promptId: 'p1',
+      toolName: 'bash',
+      command: 'rm -rf /tmp/x',
+      cwd: '/tmp',
+    });
+    // Processed immediately (bypass), NOT stuck behind the held tool:end.
+    expect(r.state().modal).not.toBeNull();
+    r.close();
+  });
+
+  test('an interrupt flips softInterrupted immediately even behind a held tool:end', () => {
+    // triggerInterrupt reads softInterrupted to pick soft vs hard. If the
+    // interrupt event were queued behind the hold, a second Esc/Ctrl+C in
+    // the window would re-take the soft branch instead of hard-aborting.
+    const bus = createBus();
+    const sink = makeSink();
+    const sched = makeSchedulerOptions();
+    const clock = makeClock(1000);
+    const r = createRenderer({
+      bus,
+      caps,
+      write: sink.write,
+      schedulerOptions: sched.options,
+      bracketedPaste: false,
+      now: clock.now,
+      toolMinDisplayMs: 400,
+    });
+    bus.emit(sessionStart);
+    sched.flushAll();
+    bus.emit(toolStart);
+    bus.emit(toolExec);
+    bus.emit(toolEnd); // held
+    expect(r.state().softInterrupted).toBe(false);
+    bus.emit({ type: 'interrupt', ts: 7, level: 'soft' });
+    // Flipped at once, so the next interrupt would read hard.
+    expect(r.state().softInterrupted).toBe(true);
+    r.close();
+  });
+
   test('close() flushes a held tool:end so its scrollback is not dropped', () => {
     const bus = createBus();
     const sink = makeSink();

@@ -75,21 +75,53 @@ import {
 export type { ComposeLive };
 export { defaultComposeLiveFn as defaultComposeLive, formatPermanent };
 
-// Interaction events that bypass the tool min-display hold queue
-// (RendererOptions.toolMinDisplayMs). These are keystroke-driven and
-// scrollback-neutral: they touch only the input / overlay slices of
-// LiveState, never emit a permanent (scrollback) item, and commute
-// with the held tool lifecycle. Processing them immediately keeps
-// typing latency at zero even while a fast tool's card is held on
-// screen. Anything NOT listed here goes through the FIFO queue so
-// scrollback ordering stays correct — the cost of a missing entry is
-// at most a `toolMinDisplayMs` delay, never a reordering bug, so the
-// list errs on the side of omission.
+// Events that bypass the tool min-display hold queue
+// (RendererOptions.toolMinDisplayMs). All of these touch only
+// live-region / overlay slices of LiveState, emit NO permanent
+// (scrollback) item, and commute with the held tool lifecycle — so
+// processing them immediately is scrollback-safe. They fall into three
+// groups, each of which would BREAK if delayed behind a held tool:end:
+//
+//   - Keystroke / overlay: typing must stay responsive while a fast
+//     tool's card is held.
+//   - Modal open + lifecycle: `modal-manager.ts` installs the modal's
+//     focus handler synchronously on emit, so the keyboard is already
+//     routed to the (unseen) modal. If the `*:ask` event were queued,
+//     the prompt wouldn't render yet but Enter / a hotkey would already
+//     resolve it — an operator could approve a permission prompt
+//     (default Yes) without ever seeing it. The modal MUST render in
+//     lockstep with focus activation.
+//   - Interrupt: `triggerInterrupt()` reads/writes `softInterrupted`
+//     through this event to drive the soft→hard ladder. Queued, the
+//     state never flips, so a second Esc/Ctrl+C within the hold window
+//     re-takes the soft branch instead of issuing the promised hard
+//     abort.
+//
+// Anything NOT listed here goes through the FIFO queue so scrollback
+// ordering stays correct.
 const HOLD_BYPASS: ReadonlySet<UIEvent['type']> = new Set([
+  // Keystroke / overlay.
   'input:update',
   'slash:update',
   'reverse-search:update',
   'reverse-search:close',
+  // Modal open (focus installed synchronously by modal-manager).
+  'permission:ask',
+  'trust:ask',
+  'shared-trust:ask',
+  'history-clear:ask',
+  'memory:write:ask',
+  'memory:action:ask',
+  'memory:user-scope:ask',
+  // Modal lifecycle (keep the rendered modal in sync with the focus
+  // stack / selection).
+  'modal:answer',
+  'modal:select',
+  'modal:queue-depth',
+  // Interrupt ladder (soft/hard decision reads the flipped state).
+  'interrupt',
+  'interrupt:exit-arm',
+  'interrupt:exit-cancel',
 ]);
 
 export interface RendererOptions {
