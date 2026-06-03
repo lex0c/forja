@@ -14,6 +14,14 @@ All bypassed events emit no permanent and touch only live-region/overlay state, 
 
 **Tests.** `renderer.test.ts`: with a held `tool:end`, a `permission:ask` sets `state.modal` immediately (not queued); an `interrupt` flips `softInterrupted` immediately. Verification: `tests/tui` + `tests/cli/repl` 1026 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
 
+## [2026-06-03] TUI: flatten nested (subagent) tool subjects too
+
+**Finding.** The multi-line tool-subject flatten ran only on the top-level `tool_invoking` path; the subagent mirror (`subagent_progress` → `event.lastEvent.type === 'tool_invoking'`, emitting a parentId-tagged `tool:start`) forwarded `vocab.subject?.(inner.args)` raw. A subagent running a multi-line bash/heredoc command carried a literal `\n` into the nested card subject — the same one-element-spans-two-rows bug that leaks stale tool-card rows.
+
+**Fix.** Extracted the collapse into a shared `flattenSubject` helper (harness-adapter.ts) and applied it on BOTH the top-level and the nested `tool:start` paths (deduping the regex). `\r`-free single-line subjects are untouched.
+
+**Tests.** `harness-adapter.test.ts`: a subagent-mirrored multi-line bash command emits a `tool:start` with `parentId` set and a newline-free single-line subject. Verification: `tests/tui` 910 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
 ## [2026-06-03] docs(tui): refresh TUI.md for the `!cmd` hardening + busy mirror
 
 Brought `docs/TUI.md` up to date with the work since it was first written: the `!command` input-prefix section now covers the full hardening (busy-gating via `state.busy`, output sanitization — ANSI strip + CR→LF — byte cap + display cap, detached/interruptible lifecycle, shutdown tracking); the `LiveState` field list gains `busy`; the hold (§6.3) documents the three `HOLD_BYPASS` categories (keystroke/overlay, modal, interrupt) and why each would break if delayed; the module map gains `render/mode.ts`; event count bumped to ~58. Docs-only — no code. `docs/spec/` (PT-BR) untouched; the spec PR for the `!` escape + its security posture is still owed.

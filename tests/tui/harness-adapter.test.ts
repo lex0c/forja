@@ -1186,6 +1186,31 @@ describe('harness-adapter — subagent observability', () => {
     expect(ev.progress).toBe('running echo');
   });
 
+  test('nested (subagent-mirrored) multi-line tool subject is flattened too', () => {
+    // The subagent mirror emits a parentId-tagged tool:start; a multi-line
+    // bash/heredoc command must be flattened to one line there too, or its
+    // raw `\n` leaks a stale nested card (same row-count bug as top-level).
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'subagent_progress',
+      subagentId: 'c',
+      lastEvent: {
+        type: 'tool_invoking',
+        toolUseId: 't1',
+        toolName: 'bash',
+        args: { command: 'echo a\n  for x in *; do\n  echo $x\n  done' },
+      },
+    });
+    const start = out.find((e) => e.type === 'tool:start') as Extract<
+      UIEvent,
+      { type: 'tool:start' }
+    >;
+    expect(start).toBeDefined();
+    expect(start.parentId).toBe('c');
+    expect(start.subject).not.toContain('\n');
+    expect(start.subject).toBe('echo a for x in *; do echo $x done');
+  });
+
   test('subagent_progress maps tool_finished failed/done correctly', () => {
     const a = createHarnessAdapter(baseCtx());
     const okOut = a.translate({
