@@ -680,6 +680,37 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('a `!cmd` that backgrounds a child returns when the foreground shell exits (real spawn)', async () => {
+    // Regression: the read loop awaited stdout EOF, but a `&`-backgrounded
+    // child inherits the stdout pipe and holds it open. `!sleep 3 &` has
+    // the foreground `bash -c` exit immediately, yet the loop would block
+    // on the pipe until the detached `sleep` dies (or the timeout SIGKILLs
+    // the group). The loop now races each read against `proc.exited` and
+    // returns once the shell is done. A generous timeout proves it's the
+    // foreground-exit detection — NOT the timeout — that frees the REPL.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      operatorBashTimeoutMs: 30_000, // far longer than the backgrounded sleep
+    });
+    await tick();
+    stdin.feed('!sleep 3 &\r');
+    // The card must land well before the 3s `sleep` (and the 30s timeout):
+    // proof the foreground shell's exit — not the pipe EOF — ended the run.
+    await new Promise((r) => setTimeout(r, 700));
+    expect(writes.join('')).toContain('sleep 3');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('an interrupt that lands before the kill hook is registered is replayed', async () => {
     // Race: Ctrl+C can arrive (same stdin chunk as the submitting Enter,
     // or before an async-registering seam) BEFORE execBash hands up its
@@ -3734,6 +3765,86 @@ describe('repl — slash commands integration', () => {
     expect(capturedSignal?.aborted).toBe(true);
     expect(signalAborted).toBe(true);
 
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('Esc during a slash playbook aborts the dispatch signal (matches the Ctrl+C / footer gate)', async () => {
+    // Regression: the editor's Esc (`interruptSoft`) gate used
+    // `running || operatorBashRunning`, excluding `playbookRunning`,
+    // while Ctrl+C and the footer's "esc to interrupt" cue both key off
+    // `isBusy()` (turn OR playbook OR `!cmd`). A playbook-only run thus
+    // advertised the cue while Esc did nothing. The gate now uses
+    // `isBusy()` too; triggerInterrupt already aborts the playbook
+    // controllers, so the soft controller must fire on the first Esc.
+    const stub = makeBootstrapStub();
+    const fakeDef = {
+      name: 'fake',
+      description: 'fake subagent for tests',
+      tools: [],
+      budget: { maxSteps: 1, maxCostUsd: 0.01 },
+      systemPrompt: 'noop',
+      scope: 'project',
+      isolation: 'none',
+      sourcePath: '/dev/null',
+      sourceSha256: '0'.repeat(64),
+      slash: 'fake',
+    };
+    (stub.subagents.byName as Map<string, unknown>).set('fake', fakeDef);
+
+    let capturedSignal: AbortSignal | undefined;
+    let capturedSoftSignal: AbortSignal | undefined;
+    const fakeRunSubagent = async (
+      input: Parameters<typeof import('../../src/subagents/index.ts').runSubagent>[0],
+    ): ReturnType<typeof import('../../src/subagents/index.ts').runSubagent> => {
+      capturedSignal = input.signal;
+      capturedSoftSignal = input.softStopSignal;
+      // Park until the hard signal aborts so the dispatch can settle
+      // without hanging the test (Ctrl+D escalates below).
+      await new Promise<void>((resolve) => {
+        capturedSignal?.addEventListener('abort', () => resolve(), { once: true });
+      });
+      return {
+        output: '',
+        sessionId: 'sess-fake-child',
+        status: 'interrupted',
+        reason: 'aborted',
+        costUsd: 0,
+        steps: 0,
+        durationMs: 0,
+        abortCause: 'hard',
+      };
+    };
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      runSubagentOverride: fakeRunSubagent,
+    });
+    await tick();
+
+    stdin.feed('/fake go\r');
+    await tick();
+    await tick();
+    expect(capturedSoftSignal).toBeDefined();
+    expect(capturedSoftSignal?.aborted).toBe(false);
+
+    // Lone Esc → drain resolves it as Escape after ~30ms (flushFrame's
+    // 50ms covers it). First Esc is cooperative → playbook SOFT
+    // controller aborts; the hard signal stays pending.
+    stdin.feed('\x1b');
+    await flushFrame();
+    expect(capturedSoftSignal?.aborted).toBe(true);
+    expect(capturedSignal?.aborted).toBe(false);
+
+    // Ctrl+D escalates to hard so the parked dispatch settles and quit
+    // completes (the soft abort alone leaves the subagent running here).
     stdin.feed('\x04');
     expect(await promise).toBe(130);
   });

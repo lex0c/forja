@@ -2,6 +2,22 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-03] TUI `!cmd`: stop reading when the foreground shell exits (background-child pipe)
+
+**Finding.** The `execBash` read loop awaited stdout EOF. A command that backgrounds a child while inheriting stdout/stderr (`!npm run dev &`, `!sleep 60 & echo ok`) has the foreground `bash -c` exit promptly, but the detached child keeps the inherited pipe open — so the stream never reaches `done`, and the REPL stayed busy until the child died or the 120s timeout SIGKILLed the whole group.
+
+**Fix.** Each read now races against `proc.exited`. When the foreground shell exits, the loop switches to a bounded best-effort flush (a short `POST_EXIT_DRAIN_MS` grace per read) of whatever is already buffered, then returns — leaving any detached child to live on like a real shell `&` job, instead of holding the REPL. Two correctness guards in the implementation: (1) a fast command's final chunk isn't truncated by the exit/read race (the post-exit drain captures buffered output, which surfaces within a microtask); (2) the INVARIANT of exactly one outstanding `reader.read()` is preserved — the same `pendingRead` promise is carried across race iterations and only wrapped with a discriminant (`tagRead`), never re-issued while pending, so chunks can't be reordered/dropped into an un-awaited read.
+
+**Tests.** `repl.test.ts` (real spawn): `!sleep 3 &` lands its card well within 700ms under a 30s timeout — proof the foreground-exit detection, not the timeout, freed the REPL. Verification: `tests/cli/repl` 122 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
+## [2026-06-03] TUI: Esc interrupt gate must match the footer cue (playbook arm)
+
+**Finding.** Once `syncBusy()` started mirroring a slash playbook into `state.busy`, the footer began advertising `esc to interrupt` during a playbook-only run (the cue keys off `state.busy` = `isBusy()`). But the editor's Esc path (`result.interruptSoft`) still gated on `running || operatorBashRunning`, excluding `playbookRunning` — only Ctrl+C used the full `isBusy()`. So in a playbook-only run the freshly displayed Esc cue did nothing.
+
+**Fix.** The Esc gate now uses `isBusy()`, matching the Ctrl+C gate AND the footer cue (all three cover turn / playbook / `!cmd`). `triggerInterrupt` already aborts the playbook controllers (`playbookSoftStopController` / `playbookAbortController`), so the gate was the only gap — no executor change needed.
+
+**Tests.** `repl.test.ts`: Esc during a slash playbook aborts the soft controller on the first tap (sibling to the existing Ctrl+C-during-playbook test). Verification: `tests/cli/repl` 121 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
 ## [2026-06-03] TUI `!cmd`: replay a shutdown that beats the kill-hook registration
 
 **Finding.** Sibling to the interrupt-replay race below, on the shutdown path. `runOperatorBash` sets `operatorBashRunning` synchronously but exposes the kill switch one microtask later (inside `Promise.resolve().then(() => execBash(…, onKillable))`). If EOF/quit (Ctrl+D) lands in that window — `!sleep 600` + Ctrl+D in the same stdin burst — `requestShutdown` sets `exiting` synchronously and `shutdown()` runs to its first await, but `operatorBashKill?.('SIGKILL')` no-ops because the switch is still null. Only the interrupt latch was replayed at hook registration, not a shutdown, so `shutdown` then awaited `operatorBashPromise` until the command exited naturally or hit the 120s timeout — EOF/quit looked hung.

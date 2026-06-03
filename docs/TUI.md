@@ -145,6 +145,12 @@ mode that the input render reflects and the REPL dispatch routes:
     quit landing in that window (same stdin burst) is **replayed** when the hook
     registers — `if (exiting) SIGKILL` else `if (interrupted) SIGINT` — otherwise
     the pre-registration `kill?.()` no-ops and the command runs to its timeout.
+    The read loop races each chunk against `proc.exited`: when the FOREGROUND
+    shell exits it stops blocking on stream EOF (a `&`-backgrounded child inherits
+    and holds the pipe open) and does a short bounded flush of buffered output,
+    then returns — the detached child lives on like a shell `&` job. Exactly one
+    `reader.read()` is ever outstanding (the pending promise is carried across
+    races, only wrapped with a discriminant) so chunks are never reordered/dropped.
   - The render and the cursor (`composeCursor`) both strip the leading `!` so the
     caret stays aligned — a shared contract, like the wrap chunker.
 

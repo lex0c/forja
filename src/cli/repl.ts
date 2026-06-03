@@ -1418,17 +1418,77 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         let output = '';
         let bytes = 0;
         let capped = false;
+        // Stop blocking on stream EOF once the FOREGROUND `bash -c` exits.
+        // A command that backgrounds a child (`!sleep 60 &`, `!npm run dev
+        // &`) leaves that child holding the inherited stdout pipe open, so
+        // the stream never reaches `done` until the child dies or the 120s
+        // timeout SIGKILLs the group — the REPL would stay busy the whole
+        // time even though the shell is done. Race each read against
+        // `proc.exited`; when the shell exits, switch to a bounded
+        // best-effort flush of whatever is already buffered, then return,
+        // leaving any detached child to live on like a real shell `&` job.
+        //
+        // INVARIANT: exactly one outstanding `reader.read()` at a time.
+        // We carry the SAME `pendingRead` promise across race iterations
+        // (re-issuing only after it resolves) — racing `read()` then
+        // issuing a fresh `read()` while the first is still pending would
+        // queue two reads and reorder/drop chunks into a promise we never
+        // await. `tagRead` wraps that single promise with a discriminant;
+        // it attaches a `.then` (cheap) and does NOT start a new read.
+        const exitedSignal = proc.exited.then(() => 'exit' as const);
+        const tagRead = (p: typeof pendingRead) =>
+          p.then((result) => ({ tag: 'read' as const, result }));
+        // Buffered output is already in the pipe when the shell exits, so
+        // it surfaces on the next read within a microtask; this grace is
+        // only the cutoff for an open-but-idle pipe (a `&` child not
+        // currently writing), so it can be short.
+        const POST_EXIT_DRAIN_MS = 50;
+        let pendingRead = reader.read();
+        let foregroundExited = false;
         try {
           for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (value === undefined) continue;
-            bytes += value.byteLength;
-            output += decoder.decode(value, { stream: true });
-            if (bytes >= OPERATOR_BASH_MAX_OUTPUT_BYTES) {
-              capped = true;
-              killGroup('SIGKILL');
+            const winner = await Promise.race([tagRead(pendingRead), exitedSignal]);
+            if (winner === 'exit') {
+              foregroundExited = true;
               break;
+            }
+            const { done, value } = winner.result;
+            if (done) break;
+            if (value !== undefined) {
+              bytes += value.byteLength;
+              output += decoder.decode(value, { stream: true });
+              if (bytes >= OPERATOR_BASH_MAX_OUTPUT_BYTES) {
+                capped = true;
+                killGroup('SIGKILL');
+                break;
+              }
+            }
+            pendingRead = reader.read();
+          }
+          // Foreground shell done but the pipe is still open (a `&` child):
+          // flush only what's already buffered, bounded by a short grace so
+          // an idle-but-open pipe can't reintroduce the hang.
+          if (foregroundExited && !capped) {
+            for (;;) {
+              let graceTimer: ReturnType<typeof setTimeout> | undefined;
+              const grace = new Promise<'grace'>((resolve) => {
+                graceTimer = setTimeout(() => resolve('grace'), POST_EXIT_DRAIN_MS);
+              });
+              const winner = await Promise.race([tagRead(pendingRead), grace]);
+              if (graceTimer !== undefined) clearTimeout(graceTimer);
+              if (winner === 'grace') break;
+              const { done, value } = winner.result;
+              if (done) break;
+              if (value !== undefined) {
+                bytes += value.byteLength;
+                output += decoder.decode(value, { stream: true });
+                if (bytes >= OPERATOR_BASH_MAX_OUTPUT_BYTES) {
+                  capped = true;
+                  killGroup('SIGKILL');
+                  break;
+                }
+              }
+              pendingRead = reader.read();
             }
           }
           output += decoder.decode(); // flush any trailing partial codepoint
@@ -2895,7 +2955,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     //
     // Esc with no run in progress is a no-op (the editor's own
     // slash-mode Esc handler intercepted before reaching here).
-    if (result.interruptSoft === true && (running || operatorBashRunning)) {
+    //
+    // Gate on `isBusy()` — NOT `running || operatorBashRunning`. It must
+    // match BOTH the Ctrl+C gate above AND the footer's interrupt cue
+    // (`state.busy`, the mirror of `isBusy()`): all three cover a turn, a
+    // playbook, OR an operator `!cmd`. Without the playbook arm here, a
+    // slash-playbook-only run would advertise "esc to interrupt" in the
+    // footer while Esc did nothing — `triggerInterrupt` already aborts the
+    // playbook controllers, so the only gap was this gate.
+    if (result.interruptSoft === true && isBusy()) {
       triggerInterrupt();
     }
 
