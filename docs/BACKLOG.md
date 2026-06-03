@@ -2,6 +2,12 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-03] Tier 2 (multi-file apply_patch): investigated, deferred
+
+**Finding.** Explored adding a structured `apply_patch` (multi-file edit + create/delete) reusing the Tier-1 edit engine. Blocker in the permission core: the engine gates **one fs path per tool call**. `checkPath` (`engine.ts:798`) extracts a single path via `resolveFsTarget(args)` and runs only that path through `classifyProtectedPath` + the policy chain; the resolver's multi-capability array is not iterated in strict/acceptEdits mode (only the bypass branch loops it, and only for the protected/sensitive floors). A multi-path tool's secondary paths would therefore escape protected-path escalate/deny and `allow_paths`/`deny_paths` — and `apply_patch` has no top-level `path` arg, so `checkPath` would deny it outright.
+
+**Decision.** Deferred (operator). Doing multi-file correctly requires FIRST a permission-engine change — the fs.write/fs.read branch must iterate every fs capability path and combine most-restrictive — with secondary-path security tests, then the tool. That is a security-core change, out of scope for now. Multi-file stays N single-file `edit_file` calls (hardened in the Tier-1 entry below). Recorded so the engine constraint isn't re-investigated. No code change.
+
 ## [2026-06-03] edit_file: whitespace-tolerant fallback + actionable match errors
 
 **Finding.** The dominant edit-failure cost for an LLM is `old_string` drifting from the file by whitespace (indentation typed from memory, trailing spaces) — every miss costs a re-read + retry, which dwarfs the token savings a multi-hunk `apply_patch` would bring. The tool failed those exactly (`edit.old_string_not_found`) with only a generic "read the file" hint, and `ambiguous_match` reported just a count — neither tells the model *where* to look, so it blind-retries.
