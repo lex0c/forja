@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-03] read_file: directory classification + total-output byte cap
+
+**Finding.** Two production gaps surfaced reviewing `read_file` for readiness. (1) `Bun.file(dir).exists()` returns false for a directory, so `read_file` on a directory path returned `fs.not_found` ("file not found") — misleading, and the dedicated `fs.is_directory` code (already in the taxonomy) sat unused. A model doing `read_file src/` was told the path is absent. (2) The per-line cap (2000 chars) and per-call cap (2000 lines) each bound one dimension but not their product: a single default read of a verbose 2000-line file could return multiple MB (~1M tokens) in one tool result — exactly what `OUTPUT_POLICY`'s "read_file is paginated/small" classification assumes away.
+
+**Fix.** (1) Stat the path up front (one syscall, reused for the size gate): a directory returns `fs.is_directory` with a pointer to glob/`ls`; a genuine ENOENT still returns `fs.not_found`. `stat` follows symlinks, matching how the byte read resolves a symlinked file. (2) Assemble the line window under a 256 KiB total-output cap — when it trims, the result reports `truncated` with a reduced `lines_returned`, so the model pages on via offset (the description already teaches this loop). At-least-one-line is always emitted. 256 KiB clears any normal source read (80-160 KiB at 2000 lines) and only bites verbose/generated files, bounding a result to ~64k tokens vs ~1M worst case.
+
+**Tests.** `read-file.test.ts`: a directory path returns `fs.is_directory`; a 1500×1000-char file (~1.5 MB) comes back trimmed (`lines_returned` < 1500 and > 50, `truncated`, content ≤ 256 KiB) while `total_lines` still reports 1500. All prior cases (small read, offset/limit, offset-past-EOF, empty, binary, BOM, late-NUL) unchanged. Verification: `tests/tools/read-file.test.ts` 20 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
 ## [2026-06-03] read_file: description teaches the pagination loop + output shape
 
 **Finding.** `read_file` was the only FS-read builtin whose description omitted a "Returns …" clause (`grep`/`glob` both state what they return). The model wasn't told the read is partial by default, nor that the result carries `total_lines`/`truncated`/`lines_returned` — the fields that drive pagination. A capable cloud model infers the loop from the result JSON; a local model (in scope per `LOCAL_MODELS`) may not. Second gap: nothing said the content is raw with no line-number prefixes, so a model could copy a hallucinated `123 | ` prefix into `edit_file`'s exact-substring `old_string` and miss the match.

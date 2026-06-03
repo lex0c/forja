@@ -1,3 +1,5 @@
+import type { Stats } from 'node:fs';
+import { stat } from 'node:fs/promises';
 import { isAbsolute, resolve } from 'node:path';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 
@@ -44,6 +46,18 @@ const MAX_FILE_BYTES = 10 * 1024 * 1024;
 // keeping the check cheap on large files. See the scan site for the
 // UTF-16 trade-off.
 const BINARY_SCAN_BYTES = 8000;
+
+// Total-output byte cap. The per-line (MAX_LINE_LENGTH) and per-call
+// (DEFAULT_LIMIT) caps each bound one dimension, not their product: a
+// 2000-line window of long lines is multiple MB, which would blow the
+// model's context budget in one tool result — exactly what
+// OUTPUT_POLICY's "read_file is paginated/small" classification assumes
+// away. Cap the assembled content; when the cap trims the window the
+// result still reports `truncated` with a reduced `lines_returned`, so
+// the caller pages on via offset. 256 KiB clears any normal source read
+// (2000 lines at ~40-80 chars is 80-160 KiB) and only bites
+// verbose/generated files, bounding a result to ~64k tokens vs ~1M.
+const MAX_OUTPUT_BYTES = 256 * 1024;
 
 export const readFileTool: Tool<ReadFileInput, ReadFileOutput> = {
   name: 'read_file',
@@ -101,12 +115,29 @@ export const readFileTool: Tool<ReadFileInput, ReadFileOutput> = {
     const limit = args.limit ?? DEFAULT_LIMIT;
     const abs = isAbsolute(args.path) ? args.path : resolve(ctx.cwd, args.path);
 
-    const file = Bun.file(abs);
-    if (!(await file.exists())) {
+    // Classify the path before reading. `Bun.file(...).exists()` returns
+    // false for a directory, so the previous single check reported a
+    // real directory as `fs.not_found` — misleading the model into
+    // thinking the path is absent (a common slip: `read_file src/`).
+    // Stat first: a directory gets the dedicated `fs.is_directory` with a
+    // pointer to the listing tools; a genuine ENOENT still maps to
+    // `fs.not_found`. `stat` (not `lstat`) follows symlinks, matching how
+    // the read below resolves a symlinked file.
+    let info: Stats;
+    try {
+      info = await stat(abs);
+    } catch {
       return toolError(ERROR_CODES.notFound, `file not found: ${args.path}`, {
         details: { resolved: abs },
       });
     }
+    if (info.isDirectory()) {
+      return toolError(ERROR_CODES.isDirectory, `path is a directory, not a file: ${args.path}`, {
+        hint: 'List a directory with glob (pattern like "<dir>/**") or bash `ls`.',
+        details: { resolved: abs },
+      });
+    }
+    const file = Bun.file(abs);
 
     // File-size gate. The `arrayBuffer()` read below loads the entire
     // file into memory regardless of offset/limit — a defensive cap
@@ -117,7 +148,7 @@ export const readFileTool: Tool<ReadFileInput, ReadFileOutput> = {
     // checkpoint, we can't honor a mid-read abort the way the old
     // streaming impl could; capping the input bounds the worst-case
     // wall-clock so an aborted operator at most waits the read out.
-    const size = file.size;
+    const size = info.size; // reuse the stat above — no second metadata syscall
     if (size > MAX_FILE_BYTES) {
       return toolError(
         ERROR_CODES.readFailed,
@@ -193,8 +224,29 @@ export const readFileTool: Tool<ReadFileInput, ReadFileOutput> = {
 
     const allLines = raw.split('\n');
     const total_lines = allLines.length;
-    const selected = allLines.slice(offset, offset + limit).map(truncateLine);
-    const truncated = offset + selected.length < total_lines;
+    const windowEnd = Math.min(offset + limit, total_lines);
+
+    // Assemble the requested window, stopping early if the UTF-8 size of
+    // the content would cross MAX_OUTPUT_BYTES (see the constant). At
+    // least one line is always emitted — a single per-line-capped line
+    // is ~8 KiB at most, well under the cap — so a giant first line
+    // can't produce an empty read.
+    const selected: string[] = [];
+    let outBytes = 0;
+    let byteCapped = false;
+    for (let i = offset; i < windowEnd; i++) {
+      const line = truncateLine(allLines[i] ?? '');
+      // +1 accounts for the '\n' that join inserts before every line but
+      // the first; an upper bound is all a byte cap needs.
+      const add = Buffer.byteLength(line, 'utf8') + (selected.length > 0 ? 1 : 0);
+      if (selected.length > 0 && outBytes + add > MAX_OUTPUT_BYTES) {
+        byteCapped = true;
+        break;
+      }
+      selected.push(line);
+      outBytes += add;
+    }
+    const truncated = byteCapped || offset + selected.length < total_lines;
     return {
       content: selected.join('\n'),
       total_lines,

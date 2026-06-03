@@ -213,4 +213,29 @@ describe('readFileTool', () => {
     if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
     expect(out.content.includes('\u0000')).toBe(true);
   });
+
+  test('returns fs.is_directory when the path is a directory', async () => {
+    // `dir` (from beforeEach) is a real directory; reading it must not
+    // masquerade as fs.not_found.
+    const out = await readFileTool.execute({ path: dir }, makeCtx({ cwd: dir }));
+    if (!isToolError(out)) throw new Error('expected directory refusal');
+    expect(out.error_code).toBe('fs.is_directory');
+  });
+
+  test('caps total output bytes — large window trims lines and marks truncated', async () => {
+    const path = join(dir, 'verbose.txt');
+    // 1500 lines of ~1000 chars (~1.5 MB): far above the output byte cap,
+    // but each line is under the per-line cap and the count is under the
+    // per-call cap, so only the byte cap can trim this.
+    const lines = Array.from({ length: 1500 }, () => 'x'.repeat(1000));
+    writeFileSync(path, lines.join('\n'));
+    const out = await readFileTool.execute({ path }, makeCtx({ cwd: dir }));
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.total_lines).toBe(1500);
+    expect(out.lines_returned).toBeLessThan(1500);
+    expect(out.lines_returned).toBeGreaterThan(50);
+    expect(out.truncated).toBe(true);
+    // Pins the current 256 KiB cap — content bytes never exceed it.
+    expect(Buffer.byteLength(out.content, 'utf8')).toBeLessThanOrEqual(256 * 1024);
+  });
 });
