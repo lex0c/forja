@@ -14,6 +14,14 @@ All bypassed events emit no permanent and touch only live-region/overlay state, 
 
 **Tests.** `renderer.test.ts`: with a held `tool:end`, a `permission:ask` sets `state.modal` immediately (not queued); an `interrupt` flips `softInterrupted` immediately. Verification: `tests/tui` + `tests/cli/repl` 1026 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
 
+## [2026-06-03] TUI: footer interrupt cue keys off `state.busy` (covers running `!cmd` / playbook)
+
+**Finding.** The footer's interrupt cue (`esc to interrupt`) used `isTurnRunning` — turn-local activity (activeTools / thinking / streaming / awaiting). A running `!cmd` (e.g. `!sleep 5`) mirrors the REPL as busy and Ctrl+C/Esc kill it, but sets no turn fields, so the footer fell through to the idle `\+Enter newline` hint — making a hung operator command look non-interruptible even though the key path works.
+
+**Fix.** The footer's `isRunning` now reads `state.busy` (the mirror of `isBusy()` = turn OR playbook OR operator `!cmd`), so the cue shows whenever any is interruptible. `busy` is set at startTurn (before `awaitingProvider`), so it still spans the whole turn — the awaiting-phase regression stays guarded. `isTurnRunning` had no remaining consumer once the bash gate moved to `state.busy`, so it's removed from `render/mode.ts`.
+
+**Tests.** `footer.test.ts`: busy with no turn activity (a running `!cmd`) shows the interrupt cue. The existing running-turn cue tests now set `busy: true` (production-accurate — a turn mirrors busy). Verification: `tests/tui` 911 pass + `tests/cli/repl` 119 pass / 0 fail; `tsc --noEmit` + Biome clean; `docs/TUI.md` module map updated. No commit (awaiting operator review).
+
 ## [2026-06-03] TUI `!cmd`: replay an interrupt that beats the kill-hook registration
 
 **Finding.** `runOperatorBash` sets `operatorBashRunning` synchronously but exposes the kill switch one microtask later (inside `Promise.resolve().then(() => execBash(…, onKillable))`). If Ctrl+C/Esc lands in that window — Enter + Ctrl+C in the same stdin chunk, or an async-registering test seam — `triggerInterrupt` sets the `operatorBashInterrupted` latch but `operatorBashKill` is still null, so the kill is a no-op. The `onKillable` callback then stored the kill function without checking the latch, dropping that first interrupt: the command ran until a second press or the timeout.

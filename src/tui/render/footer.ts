@@ -3,7 +3,7 @@
 import type { LiveState } from '../state.ts';
 import { type Capabilities, paint } from '../term.ts';
 import { FRAME_MARGIN, FRAME_MARGIN_WIDTH } from './frame.ts';
-import { isBashMode, isTurnRunning } from './mode.ts';
+import { isBashMode } from './mode.ts';
 import { visualWidth } from './width.ts';
 
 const formatTokens = (n: number): string => {
@@ -25,15 +25,17 @@ const formatTokens = (n: number): string => {
 
 const CONTEXT_WARN_THRESHOLD = 0.8;
 
-// "Can the operator interrupt right now?" — true across the WHOLE turn,
-// not just the instants a tool or stream is live. It must include
-// `awaitingProvider` (the model deliberating before the first token —
-// often the LONGEST phase of a turn); without it the
-// predicate flickers off during that wait and the footer falls back
-// to the idle `\+Enter newline` hint mid-turn, hiding the load-bearing
-// interrupt cue (the two segments are mutually exclusive on this).
-// Shared with the bash-mode predicate — see render/mode.ts.
-const isRunning = isTurnRunning;
+// "Can the operator interrupt right now?" — keyed off `state.busy`, the
+// renderer's mirror of the REPL's `isBusy()` (a foreground turn OR a
+// playbook OR an operator `!cmd` in flight). It must cover ALL of those:
+// Ctrl+C / Esc are wired to interrupt each (the turn abort, the playbook
+// abort, the `!cmd` process-group kill), so the cue has to show whenever
+// any is running — including a `!sleep 5` with no turn-local activity,
+// which a render-derived turn-activity check would miss and fall back to
+// the idle `\+Enter newline` hint, making a hung command look
+// non-interruptible. `busy` spans the whole turn (set at startTurn,
+// before `awaitingProvider`), so the cue never flickers off mid-turn.
+const isRunning = (state: LiveState): boolean => state.busy;
 
 // `secondary` (SGR 90) rather than `dim` (SGR 2): xterm with default
 // config renders SGR 2 identical to the default foreground, so

@@ -144,6 +144,7 @@ describe('renderFooter', () => {
       preview: [],
     };
     s.activeTools.set('t1', tool);
+    s.busy = true; // a running turn mirrors the REPL as busy
     const out = renderFooter(s, caps);
     // During a turn the operator isn't composing, so the newline hint
     // is dropped and the interrupt cue takes its slot — keeps the
@@ -155,6 +156,7 @@ describe('renderFooter', () => {
   test('thinking state also triggers interrupt cue', () => {
     const s = startedSession();
     s.thinking = { startedAt: 0, messageId: 'm1' };
+    s.busy = true;
     expect(renderFooter(s, caps)).toContain('esc to interrupt');
   });
 
@@ -169,7 +171,19 @@ describe('renderFooter', () => {
       cacheRead: null,
       cacheCreation: null,
     };
+    s.busy = true;
     expect(renderFooter(s, caps)).toContain('esc to interrupt');
+  });
+
+  test('busy with NO turn activity (a running `!cmd`) still shows the interrupt cue', () => {
+    // A `!sleep 5` mirrors the REPL as busy but sets no turn fields
+    // (activeTools/thinking/pending/awaiting). Ctrl+C/Esc kill it, so the
+    // cue must show — keying off `state.busy`, not turn-local activity.
+    const s = startedSession();
+    s.busy = true;
+    const out = renderFooter(s, caps);
+    expect(out).toContain('esc to interrupt');
+    expect(out).not.toContain('\\+Enter newline');
   });
 
   test('awaiting-provider (model deliberating) keeps the interrupt cue, not the newline hint', () => {
@@ -179,6 +193,7 @@ describe('renderFooter', () => {
     // reported "fica apenas \+Enter newline, pisca pra esc" bug).
     const s = startedSession();
     s.awaitingProvider = { stepN: 1, startedAt: 0 };
+    s.busy = true; // busy spans the awaiting-provider phase (set at startTurn)
     const out = renderFooter(s, caps);
     expect(out).toContain('esc to interrupt');
     expect(out).not.toContain('\\+Enter newline');
@@ -200,6 +215,7 @@ describe('renderFooter', () => {
     };
     s.activeTools.set('t1', tool);
     s.softInterrupted = true;
+    s.busy = true;
     const out = renderFooter(s, caps);
     expect(out).toContain('esc again to force');
     // Original "esc to interrupt" cue is replaced, not duplicated.
@@ -212,6 +228,7 @@ describe('renderFooter', () => {
     // path is covered above; this test locks the streaming-only path.
     const s = startedSession();
     s.softInterrupted = true;
+    s.busy = true;
     s.pendingAssistant = {
       messageId: 'm1',
       text: '',
@@ -502,6 +519,7 @@ describe('renderFooter', () => {
         preview: [],
       };
       s.activeTools.set('t1', tool);
+      s.busy = true;
       const out = renderFooter(s, caps);
       expect(out).toContain('esc to interrupt');
       expect(out).not.toContain('shift+tab to change');

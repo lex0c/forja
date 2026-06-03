@@ -389,7 +389,7 @@ coverage improvement would be a pty-backed test that compares a real framebuffer
 | `render/width.ts` | Visual width + `truncateToWidth` (wraps `string-width`). |
 | `render/wrap.ts` | `wrapInputLine` — visual-width-aware input soft-wrap chunker. |
 | `render/frame.ts` | `padFrame` — frame margin for live rows. |
-| `render/mode.ts` | `isBashMode` / `isTurnRunning` — shared input-mode predicates (single source of truth for every render site). |
+| `render/mode.ts` | `isBashMode` — shared bash-mode predicate (single source of truth for input / rules / cursor / footer; gated on `state.busy`). |
 | `render/glyphs.ts` | Unicode/ASCII glyph pairs (connectors, spinner, ellipsis). |
 | `render/shimmer.ts` | Highlight-sweep animation for live verbs. |
 | `render/spinner-verbs.ts` | Cognitive / output / tool verb pools + deterministic pickers. |
