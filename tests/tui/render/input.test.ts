@@ -38,6 +38,34 @@ describe('renderInput', () => {
     expect(out[0]).toContain(CSI);
   });
 
+  test('slash command token is painted accent (blue); args keep the normal tone', () => {
+    // accent = SGR 94. Only the `/effort` token is wrapped; ` high` is
+    // emitted plain.
+    const out = renderInput({ value: '/effort high', cursor: 12 }, colored);
+    expect(out).toEqual([`> ${CSI}94m/effort${CSI}0m high`]);
+  });
+
+  test('a bare slash turns blue immediately', () => {
+    const out = renderInput({ value: '/', cursor: 1 }, colored);
+    expect(out).toEqual([`> ${CSI}94m/${CSI}0m`]);
+  });
+
+  test('non-slash input is not colored', () => {
+    const out = renderInput({ value: 'hello world', cursor: 11 }, colored);
+    expect(out).toEqual(['> hello world']);
+  });
+
+  test('slash highlight no-ops under color=none', () => {
+    expect(renderInput({ value: '/effort high', cursor: 12 }, caps)).toEqual(['> /effort high']);
+  });
+
+  test('dimmed (reverse-search) slash line dims rather than coloring', () => {
+    const out = renderInput({ value: '/effort', cursor: 7 }, colored, { dimmed: true });
+    // Whole row dim (SGR 2), no accent (94).
+    expect(out[0]).toContain(`${CSI}2m`);
+    expect(out[0]).not.toContain(`${CSI}94m`);
+  });
+
   test('single line gets prompt prefix', () => {
     expect(renderInput({ value: 'hello', cursor: 5 }, caps)).toEqual(['> hello']);
   });

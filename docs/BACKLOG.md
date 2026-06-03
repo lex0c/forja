@@ -2,6 +2,16 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-03] TUI: blue slash-command token in the input
+
+**Goal.** Operator request — when the input buffer is a `/command`, color it so it reads as command mode, not a message being composed.
+
+**Change.** `render/input.ts` paints the leading command token (slash + word, up to the first whitespace) in `accent` (SGR 94, blue) when the buffer is a single line starting with `/`. Args after the token keep the normal tone (standard shell-style: highlight the command name, not its arguments). The token always lives in chunk 0; if a long command wraps, only the in-chunk slice of the token is colored. Skipped when `dimmed` (reverse-search owns the palette) and when the buffer spans lines (slash commands are single-line). `paint` no-ops under `color='none'`, and the SGR is zero-width so `composeCursor` / `truncateToWidth` are unaffected (verified — column math reads `input.value`, not the painted string).
+
+**Tests.** `input.test.ts`: token painted accent with args plain (`> \x1b[94m/effort\x1b[0m high`); bare `/` turns blue immediately; non-slash input uncolored; no-op under `color='none'`; dimmed slash line dims (SGR 2) rather than coloring. Verification: `tests/tui` 887 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
+**Spec follow-up.** This is a new use of `accent` for *content* — `term.ts` reserves accent/accentDark for layout chrome ("NOT for content") pending a `UI.md §6.4` palette amendment. Consistent with how accent/accentDark already shipped as operator-authorized deviations; the amendment now owes this case too (UX-before-spec convention).
+
 ## [2026-06-03] TUI: wcwidth-aware input wrapping + cursor column (close the last width-vs-reality gap)
 
 **Motivation.** A width-vs-reality audit of the live-region cursor/erase math found one remaining structural desync, explicitly deferred in `wrap.ts` ("solved by a wcwidth-aware chunker (deferred)"): the input editor wrapped by UTF-16 code units, not visual columns. A buffer line of wide glyphs (CJK / emoji = 2 cols) packed `innerWidth` *code units* per chunk, so the rendered row was ~2× the terminal width; the terminal soft-wrapped it onto a second visual row while `renderInput` + `composeCursor` counted it as one → `liveHeight` / `cursorRow` undercount → stale rows leak into scrollback (same class as the multi-line-subject bug, but input-only). A paired cosmetic gap: `composeCursor` computed the caret column from the code-unit offset, so the cursor sat one column left per wide glyph before it.

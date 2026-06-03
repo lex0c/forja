@@ -59,6 +59,21 @@ export const renderInput = (
   // color='none', so ASCII-only terminals stay unchanged.
   const finish = (line: string): string =>
     options.dimmed === true ? paint(caps, 'dim', line) : line;
+  // Slash-command highlight: when the buffer is a single-line `/command`
+  // the leading command token (slash + word, up to the first
+  // whitespace) is painted `accent` (blue) so the operator sees they're
+  // in command mode, not composing a message. Args after the token keep
+  // the normal tone. Skipped when dimmed (reverse-search owns the
+  // palette then) and when the buffer spans lines (slash commands are
+  // single-line). `paint` no-ops under color='none', and the SGR is
+  // zero-width so composeCursor / truncateToWidth are unaffected.
+  const slashTokenEnd =
+    options.dimmed !== true && input.value.startsWith('/') && !input.value.includes('\n')
+      ? (() => {
+          const ws = input.value.search(/\s/);
+          return ws === -1 ? input.value.length : ws;
+        })()
+      : -1;
   // Empty buffer + a placeholder → show the dim ghost hint instead of a
   // bare prompt. Only the hint is dimmed (the prompt keeps its normal
   // tone unless reverse-search dims the whole input via `finish`).
@@ -84,6 +99,18 @@ export const renderInput = (
       const chunk = chunks[c];
       if (chunk === undefined) continue;
       const prefix = c === 0 ? linePrefix : CONT_PREFIX;
+      // Paint the command token blue on the first row of a slash line.
+      // `slashTokenEnd` is a code-unit index into the (single) line; the
+      // token always lives in chunk 0, possibly split if the command is
+      // long enough to wrap (rare). Color only the part of the token
+      // inside this chunk; the remainder of the chunk stays default.
+      if (slashTokenEnd > chunk.start && i === 0) {
+        const cut = Math.min(slashTokenEnd, chunk.end);
+        const head = paint(caps, 'accent', line.slice(chunk.start, cut));
+        const tail = line.slice(cut, chunk.end);
+        out.push(prefix + head + tail);
+        continue;
+      }
       out.push(finish(prefix + line.slice(chunk.start, chunk.end)));
     }
   }
