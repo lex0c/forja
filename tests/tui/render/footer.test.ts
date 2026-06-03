@@ -30,6 +30,44 @@ const startedSession = (overrides: Partial<LiveState['status']> = {}): LiveState
 };
 
 describe('renderFooter', () => {
+  test('bash mode replaces the footer with the shell-mode indicator', () => {
+    const s = startedSession();
+    const out = renderFooter({ ...s, input: { value: '!ls', cursor: 3 } }, caps);
+    expect(out).not.toBeNull();
+    expect(out).toContain('! for shell mode');
+    // Normal cues are hidden while composing a shell command.
+    expect(out).not.toContain('supervised mode on');
+    expect(out).not.toContain('sonnet-4.6');
+  });
+
+  test('bash-mode footer is suppressed WHILE A TURN RUNS — interrupt cue stays', () => {
+    // A `!` typed mid-turn is refused on submit, so flipping to the
+    // shell indicator would advertise a dead mode AND hide the
+    // load-bearing interrupt cue. isBashMode is idle-gated.
+    const s = startedSession();
+    const out = renderFooter(
+      { ...s, input: { value: '!ls', cursor: 3 }, awaitingProvider: { stepN: 1, startedAt: 0 } },
+      caps,
+    );
+    expect(out).not.toContain('! for shell mode');
+    expect(out).toContain('esc to interrupt');
+  });
+
+  test('bash-mode footer is suppressed under reverse-search (dim owns the box)', () => {
+    const s = startedSession();
+    const out = renderFooter(
+      {
+        ...s,
+        input: { value: '!ls', cursor: 3 },
+        reverseSearch: { query: '', results: [], selectedIdx: -1 },
+      },
+      caps,
+    );
+    // Reverse-search active → normal footer, not the shell indicator.
+    expect(out).not.toContain('! for shell mode');
+    expect(out).toContain('supervised mode on');
+  });
+
   test('idle state: operation-mode cue left, model right (cost/steps chips removed)', () => {
     const out = renderFooter(startedSession(), caps);
     expect(out).not.toBeNull();

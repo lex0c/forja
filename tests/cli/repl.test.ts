@@ -5,7 +5,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ParsedArgs } from '../../src/cli/args.ts';
 import type { BootstrapResult } from '../../src/cli/bootstrap.ts';
-import { SUBAGENT_DISPLAY_MAX, runRepl, sanitizeForSubagentDisplay } from '../../src/cli/repl.ts';
+import {
+  type RunReplOptions,
+  SUBAGENT_DISPLAY_MAX,
+  runRepl,
+  sanitizeForSubagentDisplay,
+} from '../../src/cli/repl.ts';
 import type { HarnessConfig, HarnessEvent, HarnessResult } from '../../src/harness/index.ts';
 import { DEFAULT_BUDGET } from '../../src/harness/types.ts';
 import { type PermissionEngine, createPermissionEngine } from '../../src/permissions/index.ts';
@@ -557,6 +562,120 @@ describe('repl — boot + smoke', () => {
     const afterArm = writes.slice(beforeArm).join('');
     expect(afterArm).toContain('Press Ctrl-C again to exit');
     // Cleanup via EOF.
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('`!cmd` runs an operator shell command and lands its output in scrollback', async () => {
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const calls: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      // Inject the executor so the test never spawns a real shell.
+      execBash: async (command) => {
+        calls.push(command);
+        return { output: `RAN:${command}\n`, exitCode: 0 };
+      },
+    });
+    await tick();
+    stdin.feed('!ls -la\r');
+    await flushFrame();
+    // Ran the operator's own shell with the leading `!` stripped — NOT
+    // routed to the agent.
+    expect(calls).toEqual(['ls -la']);
+    const out = writes.join('');
+    expect(out).toContain('! ls -la'); // card head
+    expect(out).toContain('RAN:ls -la'); // captured output landed in scrollback
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a bare `!` runs nothing', async () => {
+    const stdin = makeStdin();
+    const calls: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      execBash: async (command) => {
+        calls.push(command);
+        return { output: '', exitCode: 0 };
+      },
+    });
+    await tick();
+    stdin.feed('!\r');
+    await flushFrame();
+    expect(calls).toEqual([]);
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a synchronously-throwing execBash does not wedge the REPL (error card still lands)', async () => {
+    // Regression: runOperatorBash defers execBash into a
+    // `Promise.resolve().then(...)`, so a sync throw becomes a rejection
+    // the `.catch` handles — instead of escaping past the `.finally` and
+    // leaving operatorBashRunning stuck true (wedging isBusy forever).
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      // Throws synchronously (not a rejected promise).
+      execBash: (() => {
+        throw new Error('boom-sync');
+      }) as NonNullable<RunReplOptions['execBash']>,
+    });
+    await tick();
+    stdin.feed('!x\r');
+    await flushFrame();
+    const out = writes.join('');
+    expect(out).toContain('! x'); // card head rendered
+    expect(out).toContain('boom-sync'); // sync throw captured as output
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a hung `!cmd` is killed by the timeout instead of wedging the REPL (real spawn)', async () => {
+    // Regression: the default execBash spawns `detached` and SIGKILLs the
+    // process GROUP on timeout, so a long command can't hold the stdout
+    // pipe open and stall `Response().text()` forever. Uses a real shell
+    // with a tiny timeout to prove termination without a 120s wait.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      operatorBashTimeoutMs: 100, // kill well before sleep finishes
+    });
+    await tick();
+    stdin.feed('!sleep 5\r');
+    // Wait past the timeout + kill + emit + render — but far short of 5s.
+    await new Promise((r) => setTimeout(r, 700));
+    // The card landed → operator-bash:done fired → the command did NOT
+    // hang the REPL. (If it had wedged, this line would never appear.)
+    expect(writes.join('')).toContain('! sleep 5');
     stdin.feed('\x04');
     expect(await promise).toBe(130);
   });

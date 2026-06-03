@@ -115,6 +115,21 @@ Key point for §4: input events (`input:update`, `slash:update`, reverse-search)
 flow through the **same bus** as harness events, so the renderer treats them
 uniformly.
 
+**Input prefixes (`/` and `!`).** The first character of the buffer selects a
+mode that the input render reflects and the REPL dispatch routes:
+
+- `/command` — slash command. `render/input.ts` paints the command token blue;
+  Enter dispatches it through the slash registry (not the agent).
+- `!command` — operator shell escape. The leading `!` becomes the prompt glyph
+  (`> ` → `! `) and the whole line renders yellow. Enter runs it as the
+  operator's **own shell** (`bash -c` in the cwd, full env) — NOT through the
+  agent's permission engine or sandbox; the engine gates the agent, not the
+  human. The result lands in scrollback as an `operator-bash` card
+  (`operator-bash:done` → reducer → `formatPermanent`). It serializes against
+  agent turns via `isBusy()` (refused while a turn is in flight). The render and
+  the cursor (`composeCursor`) both strip the leading `!` so the caret stays
+  aligned — a shared contract, like the wrap chunker.
+
 ---
 
 ## 4. State + reducer (`state.ts`)
@@ -151,7 +166,8 @@ This is the central distinction in the whole TUI:
 | **Scrollback** | permanent, append-only | `formatPermanent(item)` per `PermanentItem` | written once, scrolls up forever |
 
 `PermanentItem` kinds: `user-submit`, `assistant`, `tool-end`, `tool-end-batch`,
-`session-banner`, `session-footer`, `warn`, `error`, `info`, `recap-terse`. The
+`session-banner`, `session-footer`, `warn`, `error`, `info`, `operator-bash`,
+`recap-terse`. The
 reducer decides what is scrollback (by emitting it in `permanent[]`); the
 renderer never makes that call.
 

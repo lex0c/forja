@@ -36,6 +36,7 @@ import { padFrame } from './frame.ts';
 import { renderQueued } from './inbox.ts';
 import { renderInput } from './input.ts';
 import { renderModal } from './modal.ts';
+import { isBashMode } from './mode.ts';
 import { formatPermanent } from './permanent.ts';
 import { renderReverseSearch } from './reverse-search.ts';
 import { renderSlashPopover, slashPopoverLineCount } from './slash-popover.ts';
@@ -53,8 +54,11 @@ import { wrapInputLine } from './wrap.ts';
 // content above and the indented footer below — operator's eye reads
 // the block as "this is where you type" without the rules pretending
 // to belong to the padded frame.
-const horizontalRule = (caps: Capabilities): string =>
-  paint(caps, 'dim', (caps.unicode ? '─' : '-').repeat(caps.cols));
+// `bash` paints the rule `warn` (yellow) instead of `dim` — in bash
+// mode (`!cmd`) the whole input block, rules included, goes yellow so
+// the mode reads as one unmistakable unit.
+const horizontalRule = (caps: Capabilities, bash = false): string =>
+  paint(caps, bash ? 'warn' : 'dim', (caps.unicode ? '─' : '-').repeat(caps.cols));
 
 // Number of lines between the input's last row and the bottom of the
 // live region in the BASE case (rule below input + the footer line).
@@ -112,7 +116,15 @@ export const composeCursor = (
   lineCount: number,
 ): CursorPos | null => {
   if (state.modal !== null) return null;
-  const value = state.input.value;
+  // Bash mode (`render/input.ts`): an idle buffer starting with `!`
+  // renders the leading `!` as the prompt glyph, not content — so the
+  // drawn command is `value.slice(1)` and the caret is one column left
+  // of the raw offset. Mirror that here so the cursor lands on the right
+  // column; both sides consume the SAME `isBashMode` predicate
+  // (render/mode.ts) so they can't desync.
+  const bang = isBashMode(state);
+  const value = bang ? state.input.value.slice(1) : state.input.value;
+  const cursorAbs = bang ? Math.max(0, state.input.cursor - 1) : state.input.cursor;
   // Both '> ' (first line) and '  ' (continuation) are 2 chars wide;
   // soft-wrap chunks each `\n`-separated buffer line into chunks of
   // up to `caps.cols - prefixWidth` code units, with surrogate-pair
@@ -133,7 +145,6 @@ export const composeCursor = (
   const inputLineCount = lineChunks.reduce((acc, cs) => acc + rowsForChunks(cs.length), 0);
 
   // Find which buffer line + offset within it contains the cursor.
-  const cursorAbs = state.input.cursor;
   let charsBefore = 0;
   let bufferLineIdx = 0;
   let offsetInLine = 0;
@@ -381,8 +392,14 @@ export const composeLive: ComposeLive = (
   // region: the bottom of the assistant text (or any other
   // permanent line) ends up adjacent to the rule otherwise, and
   // the typing zone visually fuses with the conversation.
+  // Bash mode (idle `!cmd`): the input box — both rules + the line
+  // itself — renders yellow. Single `isBashMode` predicate
+  // (render/mode.ts) shared with renderInput / composeCursor / footer
+  // so the whole block agrees; idle-gated so a `!` typed mid-turn stays
+  // a normal gray draft (it'd be refused on submit anyway).
+  const bashMode = isBashMode(state);
   lines.push(padFrame(''));
-  lines.push(horizontalRule(caps));
+  lines.push(horizontalRule(caps, bashMode));
   // Input is the single OUTDENTED element (UI.md §6.3 frame margin
   // exception). No padFrame here — the prompt `> ` lives at col 0
   // and the cursor lands at col 2, naturally anchored to the rest
@@ -392,13 +409,18 @@ export const composeLive: ComposeLive = (
   lines.push(
     ...renderInput(state.input, caps, {
       dimmed: state.reverseSearch !== null,
+      // Bash mode (idle `!cmd`) — flips the prompt to `! ` and paints
+      // the row yellow. Computed here (needs the full state for the
+      // idle gate) and passed in, so renderInput stays a pure function
+      // of InputState + flags rather than re-deriving the predicate.
+      bash: bashMode,
       // INBOX §6.1: hint the ↑-to-edit affordance while messages are
       // queued. renderInput shows it only on an empty buffer, so it
       // never hides a draft and vanishes the moment the operator types.
       ...(visibleQueued.length > 0 ? { placeholder: 'Press up to edit queued messages' } : {}),
     }),
   );
-  lines.push(horizontalRule(caps));
+  lines.push(horizontalRule(caps, bashMode));
   // Slash autocomplete popover: rendered DIRECTLY below the input's
   // bottom rule, no `padFrame` (rows live at col 0 like the input
   // block above), no blank separator (slash reads as an extension of

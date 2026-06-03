@@ -42,6 +42,14 @@ export interface RenderInputOptions {
   // cursor still lands at column 2 (composeCursor keys off the empty
   // value), sitting at the head of the ghost text.
   placeholder?: string;
+  // Bash mode (operator `!cmd` shell escape). The caller (composeLive)
+  // decides this — it needs the full LiveState for the idle gate (a `!`
+  // typed mid-turn is refused, so it must NOT flip to bash mode then;
+  // see render/mode.ts `isBashMode`). When true, the leading `!` is
+  // consumed as the prompt glyph (`> ` → `! `) and the whole row is
+  // painted yellow. renderInput stays a pure function of the buffer +
+  // these flags rather than re-deriving the predicate itself.
+  bash?: boolean;
 }
 
 export const renderInput = (
@@ -50,15 +58,28 @@ export const renderInput = (
   options: RenderInputOptions = {},
 ): string[] => {
   const innerWidth = Math.max(1, caps.cols - PROMPT_PREFIX.length);
-  const lines = input.value === '' ? [''] : input.value.split('\n');
+  // Bash mode (operator `!cmd` — decided by the caller via `options.bash`,
+  // which is idle-gated; see render/mode.ts). The leading `!` is consumed
+  // as the MODE GLYPH, not shown as content: the prompt flips `> ` → `! `
+  // and the rest of the buffer is the command, with the WHOLE row painted
+  // `warn` (yellow). composeCursor strips the same `!` and shifts the
+  // cursor by one so the caret stays aligned (shared contract — both read
+  // `isBashMode`). Defensive `startsWith('!')` guard: never strip a
+  // non-`!` buffer even if a caller passes `bash` by mistake. Dimming
+  // (reverse-search) wins — but `isBashMode` is already false then, so
+  // `options.bash` won't be set under dimming in practice.
+  const bang = options.bash === true && options.dimmed !== true && input.value.startsWith('!');
+  const promptPrefix = bang ? '! ' : PROMPT_PREFIX;
+  // The text actually drawn after the prompt — the command (bang mode)
+  // or the raw buffer.
+  const shown = bang ? input.value.slice(1) : input.value;
+  const lines = shown === '' ? [''] : shown.split('\n');
   const out: string[] = [];
-  // When dimmed, every emitted row is wrapped with the dim SGR. We
-  // wrap the whole row (including the prompt prefix) so the prompt
-  // glyph fades along with the buffer — otherwise the bright `> `
-  // would still pull the operator's eye. paint() no-ops under
-  // color='none', so ASCII-only terminals stay unchanged.
+  // Per-row paint: dimmed (reverse-search) dims the whole row; bash mode
+  // paints it yellow; otherwise identity. Wraps the prompt prefix too so
+  // the glyph shares the row's tone. paint() no-ops under color='none'.
   const finish = (line: string): string =>
-    options.dimmed === true ? paint(caps, 'dim', line) : line;
+    options.dimmed === true ? paint(caps, 'dim', line) : bang ? paint(caps, 'warn', line) : line;
   // Slash-command highlight: when the buffer is a single-line `/command`
   // the leading command token (slash + word, up to the first
   // whitespace) is painted `accent` (blue) so the operator sees they're
@@ -82,7 +103,7 @@ export const renderInput = (
   }
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i] ?? '';
-    const linePrefix = i === 0 ? PROMPT_PREFIX : CONT_PREFIX;
+    const linePrefix = i === 0 ? promptPrefix : CONT_PREFIX;
     if (line.length === 0) {
       out.push(finish(linePrefix));
       continue;

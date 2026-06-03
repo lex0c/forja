@@ -691,6 +691,20 @@ export type InfoEvent = BaseEvent & {
   tone?: 'plain' | 'secondary';
 };
 
+// Operator-initiated shell command (`!cmd` typed in the input). Runs as
+// the operator's OWN shell — directly, not through the agent permission
+// engine or sandbox — and reports the result here for scrollback. The
+// engine gates the agent, not the human at the keyboard; this is the
+// shell-style `!` escape. `output` is the combined stdout+stderr; the
+// renderer caps very long output with a "+N more lines" tail.
+export type OperatorBashDoneEvent = BaseEvent & {
+  type: 'operator-bash:done';
+  command: string;
+  output: string;
+  exitCode: number;
+  durationMs: number;
+};
+
 // Recap terse line surfaced by RECAP §3.3 auto-display surfaces
 // (session-end + Alt+R). Distinct from `info` so the renderer can
 // style it specifically: bold "recap:" prefix, secondary
@@ -809,6 +823,7 @@ export type UIEvent =
   | ReverseSearchUpdateEvent
   | ReverseSearchCloseEvent
   | InfoEvent
+  | OperatorBashDoneEvent
   | RecapTerseEvent
   | ErrorEvent
   | WarnEvent

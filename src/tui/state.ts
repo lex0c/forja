@@ -641,6 +641,13 @@ export type PermanentItem =
   | { kind: 'error'; message: string }
   | { kind: 'warn'; message: string }
   | { kind: 'info'; message: string; tone?: 'plain' | 'secondary' }
+  | {
+      kind: 'operator-bash';
+      command: string;
+      output: string;
+      exitCode: number;
+      durationMs: number;
+    }
   | { kind: 'recap-terse'; message: string }
   | {
       // Subagent run terminal summary, emitted from the
@@ -1409,6 +1416,23 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             kind: 'info',
             message: event.message,
             ...(event.tone !== undefined ? { tone: event.tone } : {}),
+          },
+        ],
+      };
+
+    case 'operator-bash:done':
+      // Operator `!cmd` result → scrollback card. No state change; the
+      // applyEvent wrapper flushes any pending tool-end batch first
+      // (ordering stays correct).
+      return {
+        state,
+        permanent: [
+          {
+            kind: 'operator-bash',
+            command: event.command,
+            output: event.output,
+            exitCode: event.exitCode,
+            durationMs: event.durationMs,
           },
         ],
       };

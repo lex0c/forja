@@ -119,6 +119,16 @@ export interface RunReplOptions {
   // Defaults to 0 (off) so REPL tests drive tool flows synchronously;
   // the production entrypoint (cli/index.ts) passes the real value.
   toolMinDisplayMs?: number;
+  // Test seam: run an operator `!cmd` shell command. Defaults to a real
+  // `Bun.spawn` of `bash -c <command>` in the REPL cwd with the
+  // operator's full env (the shell-style `!` escape — operator's own
+  // shell, NOT the agent's permission engine / sandbox). Tests inject a
+  // fake to avoid spawning a real shell.
+  execBash?: (command: string, cwd: string) => Promise<{ output: string; exitCode: number }>;
+  // Test seam: override the operator `!cmd` timeout (default 120s) so a
+  // test can prove the kill path terminates a hung command without
+  // waiting two minutes.
+  operatorBashTimeoutMs?: number;
   // Test seam: skip the first-run trust prompt (AGENTIC_CLI §9.1).
   // Production never sets this — operator always sees the prompt
   // on first cwd visit. Tests don't drive the trust modal (the
@@ -291,6 +301,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // await) ensures a second slash dispatch fired in the same Enter
   // burst sees `isRunning() === true` and refuses cleanly.
   let playbookRunning = false;
+  // True while an operator `!cmd` shell command is in flight. Part of
+  // `isBusy` so it serializes against agent turns and playbooks (and
+  // against a second `!` command) — one operator action at a time.
+  let operatorBashRunning = false;
   // Single busy predicate threaded through every submit gate
   // (foreground startTurn, Enter in the editor, Enter in
   // reverse-search) AND the slash dispatcher's `isRunning()`
@@ -298,7 +312,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // on `running` alone and let a normal turn start mid-playbook
   // — the exact serialization the playbookRunning flag was
   // supposed to enforce, defeated at every other entry point.
-  const isBusy = (): boolean => running || playbookRunning;
+  const isBusy = (): boolean => running || playbookRunning || operatorBashRunning;
 
   const ESC_DRAIN_MS = 30;
   let drainTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1291,6 +1305,100 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     name: string;
     body: string;
   }): Promise<'yes' | 'no' | 'cancel'> => modalManager.askMemoryUserScope(req);
+
+  // Operator `!cmd` execution. Runs as the operator's own shell — NOT
+  // through the agent permission engine or sandbox (the engine gates the
+  // agent, not the human at the keyboard; this is the shell-style `!`
+  // escape). `bash -c` in the REPL cwd with the operator's full env. A
+  // generous timeout is the guard, so a hung command can't wedge the
+  // REPL forever. The result lands in scrollback via `operator-bash:done`.
+  const OPERATOR_BASH_TIMEOUT_MS = options.operatorBashTimeoutMs ?? 120_000;
+  const execBash =
+    options.execBash ??
+    (async (command: string, runCwd: string): Promise<{ output: string; exitCode: number }> => {
+      // `detached: true` puts the command in its own process group so the
+      // timeout can SIGKILL the WHOLE group, not just the `bash -c`
+      // leader. A bare `proc.kill()` (single SIGTERM to bash) leaves
+      // pipeline children / SIGTERM-ignoring procs holding the stdout
+      // pipe open, so `Response().text()` below would await EOF forever
+      // and `operatorBashRunning` would stick true — wedging the REPL.
+      // Killing the group (POSIX `process.kill(-pid, …)`, the bg-manager
+      // convention) closes the pipes and unblocks. SIGKILL straight up:
+      // the command already had its full grace by timing out.
+      const proc = Bun.spawn({
+        cmd: ['bash', '-c', command],
+        cwd: runCwd,
+        env: process.env,
+        stdout: 'pipe',
+        stderr: 'pipe',
+        detached: true,
+      });
+      const killer = setTimeout(() => {
+        const pid = proc.pid;
+        try {
+          if (pid !== undefined && pid > 0) process.kill(-pid, 'SIGKILL');
+          else proc.kill('SIGKILL');
+        } catch {
+          // group already gone, or no PID — fall back to the leader.
+          try {
+            proc.kill('SIGKILL');
+          } catch {
+            // also gone — nothing to kill.
+          }
+        }
+      }, OPERATOR_BASH_TIMEOUT_MS);
+      try {
+        const [out, err] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+        ]);
+        const exitCode = await proc.exited;
+        return { output: out + err, exitCode };
+      } finally {
+        clearTimeout(killer);
+      }
+    });
+
+  // Fire-and-forget: flip the busy flag, run the command, emit the
+  // result, clear the flag. Refusal-while-busy is handled by the
+  // caller (the Enter dispatch); by the time we get here the REPL is
+  // idle and owns the operator slot. The command runs inside a
+  // `Promise.resolve().then(...)` so a synchronously-throwing `execBash`
+  // (a malformed test seam) becomes a rejection the `.catch` handles,
+  // instead of escaping past the `.finally` and leaving the flag stuck.
+  const runOperatorBash = (command: string): void => {
+    operatorBashRunning = true;
+    const startedAt = now();
+    void Promise.resolve()
+      .then(() => execBash(command, cwd))
+      .then(({ output, exitCode }) => {
+        bus.emit({
+          type: 'operator-bash:done',
+          ts: now(),
+          command,
+          output,
+          exitCode,
+          durationMs: now() - startedAt,
+        });
+      })
+      .catch((e: unknown) => {
+        const msg = e instanceof Error ? e.message : String(e);
+        bus.emit({
+          type: 'operator-bash:done',
+          ts: now(),
+          command,
+          output: msg,
+          exitCode: -1,
+          durationMs: now() - startedAt,
+        });
+      })
+      .finally(() => {
+        operatorBashRunning = false;
+        // The REPL was idle while the command ran; if messages queued
+        // meanwhile (operator typed ahead), drain them now.
+        if (!isBusy()) queueMicrotask(() => drainInbox());
+      });
+  };
 
   const startTurn = (text: string): void => {
     if (isBusy() || exiting) return;
@@ -2539,6 +2647,29 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // back), the REPL is idle and no boundary will fire — drain the
         // just-committed edit now so it's actually sent as the next turn.
         if (!isBusy()) queueMicrotask(() => drainInbox());
+      } else if (result.submit.text.startsWith('!')) {
+        // Operator shell command (`!cmd`) — runs as the operator's own
+        // shell, not the agent (the engine gates the agent, not the
+        // human). No `user:submit` echo / inbox: the result lands as its
+        // own `operator-bash` scrollback card.
+        const command = result.submit.text.slice(1).trim();
+        if (command === '') {
+          // Bare `!` (or `!` + only blanks) — nothing to run; clear it.
+          bus.emit({ type: 'input:update', ts: now(), value: '', cursor: 0 });
+        } else if (isBusy()) {
+          // Serialize against turns / playbooks / another `!`. Leave the
+          // command in the buffer so it can be re-submitted once idle.
+          bus.emit({
+            type: 'warn',
+            ts: now(),
+            message:
+              'operator command refused: a turn is in flight — wait for it to finish, then re-run',
+          });
+        } else {
+          bus.emit({ type: 'input:update', ts: now(), value: '', cursor: 0 });
+          recordHistorySubmit(result.submit.text);
+          runOperatorBash(command);
+        }
       } else if (isBusy()) {
         enqueueInbox(result.submit.text);
       } else {

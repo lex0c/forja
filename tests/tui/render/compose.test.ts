@@ -8,7 +8,7 @@ import {
 import { visualWidth } from '../../../src/tui/render/width.ts';
 import type { ActiveTool, LiveState } from '../../../src/tui/state.ts';
 import { createInitialState } from '../../../src/tui/state.ts';
-import type { Capabilities } from '../../../src/tui/term.ts';
+import { CSI, type Capabilities } from '../../../src/tui/term.ts';
 
 // Match a verb-shaped chip line: "<verb>… [..." — the chip's
 // rotating verb sits before the elapsed counter.
@@ -404,6 +404,38 @@ describe('composeLive layout', () => {
     expect(visualWidth(out[1] ?? '')).toBe(30);
   });
 
+  test('bash mode paints the input rules yellow (whole box reads as one mode)', () => {
+    const colored: Capabilities = { ...caps, color: 'basic' };
+    const s = startedSession();
+    s.input = { value: '!ls', cursor: 3 };
+    const out = composeLive(s, colored, 0);
+    // warn = SGR 33. Both rules around the input carry it; a normal
+    // buffer leaves them dim (SGR 2).
+    const rules = out.filter((l) => l.includes('─'));
+    expect(rules.length).toBeGreaterThanOrEqual(2);
+    for (const r of rules) expect(r).toContain(`${CSI}33m`);
+    // Sanity: a non-bash buffer keeps the rules dim, not yellow.
+    const plain = composeLive({ ...s, input: { value: 'ls', cursor: 2 } }, colored, 0);
+    for (const r of plain.filter((l) => l.includes('─'))) {
+      expect(r).not.toContain(`${CSI}33m`);
+    }
+  });
+
+  test('bash visuals are suppressed while a turn runs (idle-gated)', () => {
+    // A `!` buffer mid-turn stays a normal gray draft — it would be
+    // refused on submit, so the rules must not go yellow.
+    const colored: Capabilities = { ...caps, color: 'basic' };
+    const s = startedSession();
+    const out = composeLive(
+      { ...s, input: { value: '!ls', cursor: 3 }, awaitingProvider: { stepN: 1, startedAt: 0 } },
+      colored,
+      0,
+    );
+    for (const r of out.filter((l) => l.includes('─'))) {
+      expect(r).not.toContain(`${CSI}33m`);
+    }
+  });
+
   test('rule + footer suppressed when modal is up (modal owns its own structure)', () => {
     const s = startedSession();
     s.modal = {
@@ -590,6 +622,16 @@ describe('composeCursor', () => {
     s.input.value = '中x';
     s.input.cursor = 2;
     expect(composeCursor(s, caps, 5)).toEqual({ row: 2, col: 5 });
+  });
+
+  test('bash mode: the leading `!` is the prompt glyph, so the caret skips it', () => {
+    // `!ls` — the `!` renders as the `! ` prompt, the command is `ls`.
+    // Caret after `ls` (raw cursor 3) → col = prefix(2) + width('ls') = 4,
+    // NOT 5 (which would count the `!` as content).
+    const s = startedSession();
+    s.input.value = '!ls';
+    s.input.cursor = 3;
+    expect(composeCursor(s, caps, 5)).toEqual({ row: 2, col: 4 });
   });
 
   test('col between a wide glyph and the next char', () => {

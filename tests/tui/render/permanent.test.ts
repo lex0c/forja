@@ -762,6 +762,55 @@ describe('formatPermanent', () => {
     ]);
   });
 
+  describe('operator-bash (the `!cmd` shell escape card)', () => {
+    test('success: blank + `! command  [dur]` head + verbatim output, no exit marker', () => {
+      const out = formatPermanent(
+        {
+          kind: 'operator-bash',
+          command: 'git status',
+          output: 'On branch main\nnothing to commit\n',
+          exitCode: 0,
+          durationMs: 12,
+        },
+        unicode,
+      );
+      expect(out).toEqual([
+        pad(''),
+        pad('! git status  [12ms]'),
+        pad('On branch main'),
+        pad('nothing to commit'),
+      ]);
+    });
+
+    test('empty output → head only', () => {
+      const out = formatPermanent(
+        { kind: 'operator-bash', command: 'true', output: '', exitCode: 0, durationMs: 3 },
+        unicode,
+      );
+      expect(out).toEqual([pad(''), pad('! true  [3ms]')]);
+    });
+
+    test('non-zero exit shows a warn `exit N` marker (color enabled)', () => {
+      const out = formatPermanent(
+        { kind: 'operator-bash', command: 'false', output: '', exitCode: 1, durationMs: 2 },
+        colored,
+      );
+      // warn = SGR 33. Head carries `exit 1` in warn.
+      expect(out[1]).toContain(`${CSI}33m  exit 1${CSI}0m`);
+    });
+
+    test('output beyond the cap folds into a `+N more lines` tail', () => {
+      const lines = Array.from({ length: 250 }, (_, i) => `line ${i}`).join('\n');
+      const out = formatPermanent(
+        { kind: 'operator-bash', command: 'seq', output: lines, exitCode: 0, durationMs: 9 },
+        unicode,
+      );
+      // blank + head + 199 output rows + 1 "more" row = 202.
+      expect(out).toHaveLength(202);
+      expect(out[out.length - 1]).toContain('+51 more lines');
+    });
+  });
+
   describe('tool-end-batch (coalesced card — UI.md §4.10.5/§4.10.7)', () => {
     test('top-level batch: blank + card head with count + tree continuations', () => {
       const out = formatPermanent(

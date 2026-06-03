@@ -66,6 +66,37 @@ describe('renderInput', () => {
     expect(out[0]).not.toContain(`${CSI}94m`);
   });
 
+  test('bash mode: `!` flips the prompt and paints the whole line yellow', () => {
+    // warn = SGR 33 (yellow). Prompt glyph becomes `! ` and the entire
+    // row (prompt + command) is wrapped. `bash` is decided by the caller
+    // (composeLive, idle-gated) and passed in.
+    const out = renderInput({ value: '!ls -la', cursor: 7 }, colored, { bash: true });
+    expect(out).toEqual([`${CSI}33m! ls -la${CSI}0m`]);
+  });
+
+  test('bash mode prompt under color=none keeps the `!` glyph, no SGR', () => {
+    expect(renderInput({ value: '!ls', cursor: 3 }, caps, { bash: true })).toEqual(['! ls']);
+  });
+
+  test('bash-mode continuation rows use the aligned indent and stay yellow', () => {
+    const out = renderInput({ value: '!a\nb', cursor: 4 }, colored, { bash: true });
+    expect(out).toEqual([`${CSI}33m! a${CSI}0m`, `${CSI}33m  b${CSI}0m`]);
+  });
+
+  test('dimming wins over bash mode (reverse-search owns the palette)', () => {
+    const out = renderInput({ value: '!ls', cursor: 3 }, colored, { bash: true, dimmed: true });
+    // Dim (SGR 2), not warn (33); prompt stays `> ` since dim shadows bash.
+    expect(out[0]).toContain(`${CSI}2m`);
+    expect(out[0]).not.toContain(`${CSI}33m`);
+    expect(out[0]).toContain('> ');
+  });
+
+  test('a `!` buffer without the bash flag is treated as plain content', () => {
+    // composeLive does not set `bash` mid-turn (idle gate) — the `!` then
+    // renders as a normal gray draft, no prompt flip, no yellow.
+    expect(renderInput({ value: '!ls', cursor: 3 }, colored)).toEqual(['> !ls']);
+  });
+
   test('single line gets prompt prefix', () => {
     expect(renderInput({ value: 'hello', cursor: 5 }, caps)).toEqual(['> hello']);
   });

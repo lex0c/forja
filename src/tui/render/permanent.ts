@@ -59,6 +59,12 @@ const finalVerbFor = (status: 'done' | 'error' | 'denied', vocabVerb: string): s
 // therefore never exceeds MAX_BATCH_SUBJECTS rows.
 const MAX_BATCH_SUBJECTS = 5;
 
+// Cap on output rows under an operator `!cmd` card before folding the
+// rest into a `… +N more lines` tail — keeps a `!cat hugefile` from
+// burying scrollback. Generous (it's the operator's own command, they
+// asked for the output) but bounded.
+const MAX_OPERATOR_BASH_LINES = 200;
+
 // `… output truncated` hint line (slice 2). A tool that capped its
 // own output gets one secondary line under the card body. The
 // `ctrl+o` key stays unwired — UI.md §4.10.5 defers the expansion
@@ -376,6 +382,39 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       const body =
         item.tone === 'secondary' ? paint(caps, 'secondary', item.message) : item.message;
       return ['', body].map(padFrame);
+    }
+    case 'operator-bash': {
+      // Operator `!cmd` result (shell-style escape — ran as the operator's
+      // own shell, not the agent). Head: `! <command>` dim, a warn
+      // `exit N` when it failed, and a secondary `[dur]` — same metric
+      // grammar as a tool-end chip. Output is shown VERBATIM below (the
+      // operator's own shell output; we don't recolor it), capped at
+      // MAX_OPERATOR_BASH_LINES with a `… +N more lines` tail so a
+      // `!cat hugefile` can't bury scrollback.
+      const failed = item.exitCode !== 0;
+      const head =
+        paint(caps, 'dim', `! ${item.command}`) +
+        (failed ? paint(caps, 'warn', `  exit ${item.exitCode}`) : '') +
+        paint(caps, 'secondary', `  [${formatChipDuration(item.durationMs)}]`);
+      const lines = ['', head];
+      const trimmed = item.output.replace(/\n+$/, '');
+      if (trimmed.length > 0) {
+        const outLines = trimmed.split('\n');
+        if (outLines.length > MAX_OPERATOR_BASH_LINES) {
+          const shown = outLines.slice(0, MAX_OPERATOR_BASH_LINES - 1);
+          lines.push(...shown);
+          lines.push(
+            paint(
+              caps,
+              'secondary',
+              `${ellipsisGlyph(caps)} +${outLines.length - shown.length} more lines`,
+            ),
+          );
+        } else {
+          lines.push(...outLines);
+        }
+      }
+      return lines.map(padFrame);
     }
     case 'recap-terse': {
       // RECAP §3.3 auto-display: bold "recap:" prefix + the line
