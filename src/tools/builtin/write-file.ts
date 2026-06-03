@@ -28,7 +28,7 @@ const MAX_CONTENT_BYTES = 10 * 1024 * 1024;
 export const writeFileTool: Tool<WriteFileInput, WriteFileOutput> = {
   name: 'write_file',
   description:
-    'Write text content to a file, creating it (and parent directories) if needed. Overwrites existing content.',
+    'Create a file or fully overwrite an existing one with the given content (parent directories are created as needed). Returns { created, bytes_written }. For a localized change to a file that already exists, use edit_file instead — overwriting re-emits the whole file (wasteful) and discards anything not in the provided content.',
   inputSchema: {
     type: 'object',
     properties: {

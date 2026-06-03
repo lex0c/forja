@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-03] write_file / edit_file: description fixes (Returns clause + steer write→edit)
+
+**Finding.** `write_file`'s description never stated what it returns and — unlike `edit_file`, which points to `write_file` for creation — never pointed back: a model could full-rewrite an existing file (token waste + clobber of anything not in `content`) where `edit_file` was the right call, contradicting the project's `safe-edit-discipline` seed memory. `edit_file`'s description omitted a "Returns…" clause (the house convention `read_file`/`grep`/`glob` follow).
+
+**Fix.** `write_file` now leads with create-or-fully-overwrite, states `Returns { created, bytes_written }`, and steers a localized change on an existing file to `edit_file` (with the why: overwriting re-emits the whole file and discards anything not in the content). `edit_file` gains a closing "Returns each edit's replacement count plus the total." Model-facing copy only — no behavior change. The Tier-1 whitespace fallback stays deliberately unadvertised so the model keeps aiming for exact matches.
+
+**Tests.** No test pins either description (grep). `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
 ## [2026-06-03] Tier 2 (multi-file apply_patch): investigated, deferred
 
 **Finding.** Explored adding a structured `apply_patch` (multi-file edit + create/delete) reusing the Tier-1 edit engine. Blocker in the permission core: the engine gates **one fs path per tool call**. `checkPath` (`engine.ts:798`) extracts a single path via `resolveFsTarget(args)` and runs only that path through `classifyProtectedPath` + the policy chain; the resolver's multi-capability array is not iterated in strict/acceptEdits mode (only the bypass branch loops it, and only for the protected/sensitive floors). A multi-path tool's secondary paths would therefore escape protected-path escalate/deny and `allow_paths`/`deny_paths` — and `apply_patch` has no top-level `path` arg, so `checkPath` would deny it outright.
