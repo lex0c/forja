@@ -48,13 +48,13 @@ const BINARY_SCAN_BYTES = 8000;
 export const readFileTool: Tool<ReadFileInput, ReadFileOutput> = {
   name: 'read_file',
   description:
-    'Read a file from the filesystem. Use offset/limit to read specific line ranges of large files. Binary files are refused (use bash — file/xxd/hexdump — for raw-byte inspection). Parallel-safe: emit multiple read_file calls in a single turn to batch reads — the harness dispatches them concurrently.',
+    'Read a text file. Returns its content (raw, no line-number prefixes) with total_lines and a truncated flag. Returns lines from offset (0-based) up to a default cap; if truncated is true, read again with offset advanced by lines_returned to continue, or raise limit. Binary files are refused — use bash (file/xxd/hexdump) for raw bytes. Parallel-safe: emit multiple read_file calls in a single turn to batch reads concurrently.',
   inputSchema: {
     type: 'object',
     properties: {
       path: { type: 'string', description: 'File path (absolute or relative to cwd).' },
       offset: { type: 'integer', minimum: 0, description: 'Line offset (0-based).' },
-      limit: { type: 'integer', minimum: 1, description: 'Max lines to return.' },
+      limit: { type: 'integer', minimum: 1, description: 'Max lines to return (default 2000).' },
     },
     required: ['path'],
   },

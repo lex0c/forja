@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-03] read_file: description teaches the pagination loop + output shape
+
+**Finding.** `read_file` was the only FS-read builtin whose description omitted a "Returns …" clause (`grep`/`glob` both state what they return). The model wasn't told the read is partial by default, nor that the result carries `total_lines`/`truncated`/`lines_returned` — the fields that drive pagination. A capable cloud model infers the loop from the result JSON; a local model (in scope per `LOCAL_MODELS`) may not. Second gap: nothing said the content is raw with no line-number prefixes, so a model could copy a hallucinated `123 | ` prefix into `edit_file`'s exact-substring `old_string` and miss the match.
+
+**Fix.** Rewrote the description to the house "what + returns + parallel-safe" shape: it now states the tool returns raw content (no line-number prefixes) with `total_lines` + `truncated`, and spells out the loop ("if truncated, read again with offset advanced by lines_returned, or raise limit"). Surfaced the 2000-line default in the `limit` schema field rather than hardcoding the number in prose (note: `grep` still hides its `max_results` default — a consistency call worth revisiting). No behavior or contract change — model-facing copy only.
+
+**Tests.** No test pins the description text (grep confirmed); `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
 ## [2026-06-03] read_file: refuse binary files (NUL-byte detection) — close spec gap
 
 **Finding.** `TOOL_ERGONOMICS §3` promises "Read tool detecta automaticamente" (binary), but `read-file.ts` decoded any file under the 10 MiB cap as UTF-8 via `file.text()`. A binary input (image, compiled artifact, archive) came back as mojibake / U+FFFD replacement chars — burning context budget on noise and confusing the model — instead of a clean refusal. Code was behind the spec, not diverging from it: closing the gap needs no spec PR.
