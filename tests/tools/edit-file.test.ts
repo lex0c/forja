@@ -345,3 +345,284 @@ describe('editFileTool — multi-edit batches', () => {
     expect(readFileSync(path, 'utf-8')).toBe(finalContent);
   });
 });
+
+describe('editFileTool — whitespace-tolerant fallback + actionable errors', () => {
+  test('unique uniform-indent near-match applies, re-indented to the file', async () => {
+    const path = join(dir, 'a.ts');
+    const file = ['class A {', '    foo() {', '        return 1;', '    }', '}', ''].join('\n');
+    writeFileSync(path, file);
+    // Model dropped the class indentation — old_string at top level.
+    const oldString = ['foo() {', '    return 1;', '}'].join('\n');
+    const newString = ['foo() {', '    return 2;', '}'].join('\n');
+    const out = await editFileTool.execute(
+      { path, edits: [{ old_string: oldString, new_string: newString }] },
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.edits).toEqual([{ replacements: 1, whitespace_tolerant: true }]);
+    // new_string re-indented by the file's +4 shift (not the model's).
+    expect(readFileSync(path, 'utf-8')).toBe(
+      ['class A {', '    foo() {', '        return 2;', '    }', '}', ''].join('\n'),
+    );
+  });
+
+  test('uniform strip (model over-indented) applies with the file indentation', async () => {
+    const path = join(dir, 'a.ts');
+    writeFileSync(path, ['foo() {', '    return 1;', '}', ''].join('\n'));
+    const oldString = ['    foo() {', '        return 1;', '    }'].join('\n'); // +4 vs file
+    const newString = ['    foo() {', '        return 2;', '    }'].join('\n');
+    const out = await editFileTool.execute(
+      { path, edits: [{ old_string: oldString, new_string: newString }] },
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.edits[0]?.whitespace_tolerant).toBe(true);
+    expect(readFileSync(path, 'utf-8')).toBe(['foo() {', '    return 2;', '}', ''].join('\n'));
+  });
+
+  test('trailing-whitespace-only near-match applies', async () => {
+    const path = join(dir, 'a.ts');
+    writeFileSync(path, ['if (x) {', '  doThing();   ', '}', ''].join('\n')); // trailing spaces
+    const oldString = ['if (x) {', '  doThing();', '}'].join('\n');
+    const newString = ['if (x) {', '  doThing2();', '}'].join('\n');
+    const out = await editFileTool.execute(
+      { path, edits: [{ old_string: oldString, new_string: newString }] },
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.edits[0]?.whitespace_tolerant).toBe(true);
+    expect(readFileSync(path, 'utf-8')).toBe(['if (x) {', '  doThing2();', '}', ''].join('\n'));
+  });
+
+  test('non-uniform indentation is NOT auto-applied; error names the near-match span', async () => {
+    const path = join(dir, 'a.ts');
+    const file = ['    a();', '        b();', '    c();'].join('\n');
+    writeFileSync(path, file);
+    // Indentation drifts non-uniformly vs the file (+4, +4, -4).
+    const oldString = ['a();', '    b();', '        c();'].join('\n');
+    const out = await editFileTool.execute(
+      { path, edits: [{ old_string: oldString, new_string: 'x();' }] },
+      makeCtx({ cwd: dir }),
+    );
+    if (!isToolError(out)) throw new Error('expected old_string_not_found');
+    expect(out.error_code).toBe('edit.old_string_not_found');
+    expect(out.details?.near_match).toEqual({ start_line: 1, end_line: 3, text: file });
+    expect(readFileSync(path, 'utf-8')).toBe(file); // untouched
+  });
+
+  test('tabs-vs-spaces indentation is treated as unsafe (not applied)', async () => {
+    const path = join(dir, 'a.ts');
+    const file = '\tfoo();'; // tab-indented
+    writeFileSync(path, file);
+    const out = await editFileTool.execute(
+      { path, edits: [{ old_string: '    foo();', new_string: '    bar();' }] }, // space-indented
+      makeCtx({ cwd: dir }),
+    );
+    if (!isToolError(out)) throw new Error('expected old_string_not_found');
+    expect(out.error_code).toBe('edit.old_string_not_found');
+    expect(out.details?.near_match).toBeDefined();
+    expect(readFileSync(path, 'utf-8')).toBe(file);
+  });
+
+  test('multiple whitespace near-matches report their line numbers', async () => {
+    const path = join(dir, 'a.ts');
+    // Two tab-indented lines trim-match the space-indented needle; neither
+    // matches exactly → no exact match, two near-matches.
+    const file = ['\t\tfoo();', '\tfoo();'].join('\n');
+    writeFileSync(path, file);
+    const out = await editFileTool.execute(
+      { path, edits: [{ old_string: '  foo();', new_string: '  bar();' }] },
+      makeCtx({ cwd: dir }),
+    );
+    if (!isToolError(out)) throw new Error('expected old_string_not_found');
+    expect(out.error_code).toBe('edit.old_string_not_found');
+    expect(out.details?.near_match_lines).toEqual([1, 2]);
+    expect(readFileSync(path, 'utf-8')).toBe(file);
+  });
+
+  test('ambiguous exact match reports occurrence line numbers (actionable)', async () => {
+    const path = join(dir, 'a.ts');
+    writeFileSync(path, 'foo\nfoo\nfoo\n');
+    const out = await editFileTool.execute(
+      { path, edits: [{ old_string: 'foo', new_string: 'bar' }] },
+      makeCtx({ cwd: dir }),
+    );
+    if (!isToolError(out)) throw new Error('expected ambiguous_match');
+    expect(out.error_code).toBe('edit.ambiguous_match');
+    expect(out.details?.occurrences).toBe(3);
+    expect(out.details?.lines).toEqual([1, 2, 3]);
+  });
+
+  test('exact match still applies with no whitespace_tolerant flag', async () => {
+    const path = join(dir, 'a.ts');
+    writeFileSync(path, '  const x = 1;\n'); // indented; exact substring still matches
+    const out = await editFileTool.execute(
+      { path, edits: [{ old_string: 'const x = 1;', new_string: 'const x = 2;' }] },
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.edits).toEqual([{ replacements: 1 }]); // no whitespace_tolerant key
+    expect(readFileSync(path, 'utf-8')).toBe('  const x = 2;\n');
+  });
+
+  test('CRLF file is not matched by an LF old_string (no line-ending corruption)', async () => {
+    const path = join(dir, 'a.ts');
+    const file = 'function foo() {\r\n  return 1;\r\n}\r\n'; // CRLF
+    writeFileSync(path, file);
+    const out = await editFileTool.execute(
+      {
+        path,
+        edits: [
+          {
+            old_string: 'function foo() {\n  return 1;\n}', // LF (what the model emits)
+            new_string: 'function foo() {\n  return 2;\n}',
+          },
+        ],
+      },
+      makeCtx({ cwd: dir }),
+    );
+    // Must NOT silently fall back — that would rewrite \r\n → \n.
+    if (!isToolError(out))
+      throw new Error('CRLF must not whitespace-fallback onto an LF old_string');
+    expect(out.error_code).toBe('edit.old_string_not_found');
+    expect(readFileSync(path, 'utf-8')).toBe(file); // line endings untouched
+  });
+
+  test('whitespace-only old_string does not fall back onto a blank line', async () => {
+    const path = join(dir, 'a.ts');
+    const file = 'a();\n\nb();\n'; // contains a blank line
+    writeFileSync(path, file);
+    const out = await editFileTool.execute(
+      { path, edits: [{ old_string: '   ', new_string: 'INSERTED' }] }, // whitespace-only
+      makeCtx({ cwd: dir }),
+    );
+    if (!isToolError(out)) throw new Error('expected old_string_not_found');
+    expect(out.error_code).toBe('edit.old_string_not_found');
+    expect(readFileSync(path, 'utf-8')).toBe(file);
+  });
+
+  test('fallback runs as a later batch edit, against the post-previous-edit content', async () => {
+    // edit 1 (exact) changes the file; edit 2 falls into the whitespace
+    // fallback against the RESULT of edit 1. Pins both: fallback at N>1
+    // operating on `working`, and the mixed per-edit flag array.
+    const path = join(dir, 'a.ts');
+    writeFileSync(
+      path,
+      ['let v = 1;', 'class C {', '    run() {', '        return v;', '    }', '}', ''].join('\n'),
+    );
+    const out = await editFileTool.execute(
+      {
+        path,
+        edits: [
+          { old_string: 'let v = 1;', new_string: 'let v = 2;' }, // exact
+          {
+            old_string: ['run() {', '    return v;', '}'].join('\n'), // dedented — fallback
+            new_string: ['run() {', '    return v * 2;', '}'].join('\n'),
+          },
+        ],
+      },
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.edits).toEqual([
+      { replacements: 1 },
+      { replacements: 1, whitespace_tolerant: true },
+    ]);
+    expect(readFileSync(path, 'utf-8')).toBe(
+      ['let v = 2;', 'class C {', '    run() {', '        return v * 2;', '    }', '}', ''].join(
+        '\n',
+      ),
+    );
+  });
+
+  test('fallback error line numbers are relative to the post-previous-edit content', async () => {
+    // edit 1 deletes the first line, shifting everything up; edit 2's
+    // unsafe near-match must report lines against the SHIFTED content.
+    const path = join(dir, 'a.ts');
+    const file = ['DELETE_ME', '    a();', '        b();', '    c();', ''].join('\n');
+    writeFileSync(path, file);
+    const out = await editFileTool.execute(
+      {
+        path,
+        edits: [
+          { old_string: 'DELETE_ME\n', new_string: '' }, // removes line 1
+          // non-uniform indent (+4/+4/-4) → unsafe near-match
+          { old_string: ['a();', '    b();', '        c();'].join('\n'), new_string: 'x();' },
+        ],
+      },
+      makeCtx({ cwd: dir }),
+    );
+    if (!isToolError(out)) throw new Error('expected old_string_not_found');
+    expect(out.error_code).toBe('edit.old_string_not_found');
+    // a();/b();/c(); sit at lines 1-3 AFTER edit 1 removed DELETE_ME
+    // (they'd be 2-4 in the original) — proves the search ran on `working`.
+    expect(out.details?.near_match).toMatchObject({ start_line: 1, end_line: 3 });
+    expect(readFileSync(path, 'utf-8')).toBe(file); // all-or-nothing: untouched
+  });
+
+  test('re-indent handles new_string with more lines than old_string', async () => {
+    const path = join(dir, 'a.ts');
+    writeFileSync(path, ['    if (x) {', '        a();', '    }', ''].join('\n'));
+    const out = await editFileTool.execute(
+      {
+        path,
+        edits: [
+          {
+            old_string: ['if (x) {', '    a();', '}'].join('\n'), // 3 lines, dedented
+            new_string: ['if (x) {', '    a();', '    b();', '}'].join('\n'), // 4 lines
+          },
+        ],
+      },
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(readFileSync(path, 'utf-8')).toBe(
+      ['    if (x) {', '        a();', '        b();', '    }', ''].join('\n'),
+    );
+  });
+
+  test('re-indent leaves a blank line in new_string empty (no stray indentation)', async () => {
+    const path = join(dir, 'a.ts');
+    writeFileSync(path, ['    foo() {', '        a();', '    }', ''].join('\n'));
+    const out = await editFileTool.execute(
+      {
+        path,
+        edits: [
+          {
+            old_string: ['foo() {', '    a();', '}'].join('\n'),
+            new_string: ['foo() {', '    a();', '', '    b();', '}'].join('\n'), // blank line
+          },
+        ],
+      },
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    // The blank line is truly empty, NOT indented to '        '.
+    expect(readFileSync(path, 'utf-8')).toBe(
+      ['    foo() {', '        a();', '', '        b();', '    }', ''].join('\n'),
+    );
+  });
+
+  test('re-indent (strip) leaves a too-shallow new line untouched rather than guessing', async () => {
+    const path = join(dir, 'a.ts');
+    writeFileSync(path, ['foo() {', '    a();', '}', ''].join('\n')); // top-level
+    const out = await editFileTool.execute(
+      {
+        path,
+        edits: [
+          {
+            old_string: ['    foo() {', '        a();', '    }'].join('\n'), // over-indented (+4)
+            // new line 'weird' has only 2-space indent, shallower than the 4-space strip
+            new_string: ['    foo() {', '        a();', '  weird();', '    }'].join('\n'),
+          },
+        ],
+      },
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    // strip '    ': aligned lines de-indent; the 2-space line can't strip 4 → left as-is.
+    expect(readFileSync(path, 'utf-8')).toBe(
+      ['foo() {', '    a();', '  weird();', '}', ''].join('\n'),
+    );
+  });
+});

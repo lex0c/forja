@@ -22,6 +22,12 @@ export interface EditOperationResult {
   // occurrences. Surfaces here so the caller can verify "did edit
   // 3 actually hit anything?" without re-reading the file.
   replacements: number;
+  // Present (true) only when the exact old_string did NOT match but a
+  // whitespace-tolerant fallback did (a unique near-match with one
+  // uniform indent shift; new_string re-indented to the file). Signals
+  // the model that its old_string drifted from the file's exact text —
+  // it should copy text verbatim next time, not lean on the fallback.
+  whitespace_tolerant?: boolean;
 }
 
 export interface EditFileOutput {
@@ -59,17 +65,173 @@ const countOccurrences = (haystack: string, needle: string): number => {
   return count;
 };
 
+// --- Whitespace-tolerant fallback + actionable-error helpers ---------------
+//
+// The dominant edit failure is `old_string` drifting from the file by
+// whitespace (indentation typed from memory, trailing spaces, a stray
+// blank line) — and each miss costs the model a re-read + retry. These
+// helpers (1) recover the safe case automatically and (2) make the rest
+// fixable in one shot by telling the model exactly where the near-match
+// is, instead of a generic "read the file" nudge.
+
+// 1-based line number of a character offset.
+const lineAt = (text: string, charIndex: number): number =>
+  text.slice(0, charIndex).split('\n').length;
+
+// 1-based start lines of up to `limit` exact occurrences of `needle`.
+// Stops early — callers only display a handful, and a pathological
+// many-occurrence ambiguous match shouldn't pay O(N·len) to list all.
+const occurrenceLines = (haystack: string, needle: string, limit: number): number[] => {
+  const out: number[] = [];
+  let idx = haystack.indexOf(needle);
+  while (idx !== -1 && out.length < limit) {
+    out.push(lineAt(haystack, idx));
+    idx = haystack.indexOf(needle, idx + needle.length);
+  }
+  return out;
+};
+
+// Leading-whitespace (indentation) prefix of a line.
+const leadingWhitespace = (line: string): string =>
+  line.slice(0, line.length - line.trimStart().length);
+
+// Trim ONLY spaces and tabs from both ends — deliberately NOT `\r`/`\n`.
+// The fallback matches lines modulo indentation/trailing spaces, but a
+// CRLF file's `\r` must stay significant: otherwise an LF old_string
+// would trim-match a CRLF line and the re-applied lines would silently
+// drop the `\r`, rewriting (or mixing) the file's line endings — a
+// corruption the exact-match path safely declined.
+const trimSpacesTabs = (s: string): string => {
+  let start = 0;
+  let end = s.length;
+  while (start < end && (s[start] === ' ' || s[start] === '\t')) start++;
+  while (end > start && (s[end - 1] === ' ' || s[end - 1] === '\t')) end--;
+  return s.slice(start, end);
+};
+
+// A single uniform indentation transform between two aligned line sets.
+type IndentShift =
+  | { type: 'none' }
+  | { type: 'add'; prefix: string }
+  | { type: 'strip'; prefix: string };
+
+const sameShift = (a: IndentShift, b: IndentShift): boolean => {
+  if (a.type === 'add' && b.type === 'add') return a.prefix === b.prefix;
+  if (a.type === 'strip' && b.type === 'strip') return a.prefix === b.prefix;
+  return a.type === 'none' && b.type === 'none';
+};
+
+// The ONE indentation shift that maps every needle line's indent onto the
+// corresponding file line's, or null if there isn't a single consistent
+// one (mixed tabs/spaces, per-line drift). Only a clean uniform shift is
+// safe to re-apply to new_string; null means "do not auto-apply". Blank
+// lines carry no indentation and are skipped.
+const uniformShift = (fileLines: string[], needleLines: string[]): IndentShift | null => {
+  let shift: IndentShift | null = null;
+  for (let i = 0; i < fileLines.length; i++) {
+    const nLine = needleLines[i] ?? '';
+    if (nLine.trim() === '') continue;
+    const f = leadingWhitespace(fileLines[i] ?? '');
+    const ndl = leadingWhitespace(nLine);
+    let here: IndentShift;
+    if (f === ndl) here = { type: 'none' };
+    else if (f.length > ndl.length && f.endsWith(ndl))
+      here = { type: 'add', prefix: f.slice(0, f.length - ndl.length) };
+    else if (ndl.length > f.length && ndl.endsWith(f))
+      here = { type: 'strip', prefix: ndl.slice(0, ndl.length - f.length) };
+    else return null; // incompatible indentation (e.g. tabs vs spaces)
+    if (shift === null) shift = here;
+    else if (!sameShift(shift, here)) return null;
+  }
+  return shift ?? { type: 'none' };
+};
+
+// Re-indent one new_string line by the shift. Blank lines normalize to
+// empty (no stray indentation); a 'strip' that wouldn't apply cleanly
+// leaves the line untouched rather than guessing.
+const applyShift = (line: string, shift: IndentShift): string => {
+  if (line.trim() === '') return '';
+  if (shift.type === 'none') return line;
+  if (shift.type === 'add') return shift.prefix + line;
+  return line.startsWith(shift.prefix) ? line.slice(shift.prefix.length) : line;
+};
+
+// Cap on near-match text echoed back in an error — keep the failure
+// payload bounded (a huge old_string shouldn't produce a huge error).
+const NEAR_MATCH_TEXT_CAP = 1600;
+
+interface NearMatch {
+  start_line: number;
+  end_line: number;
+  text?: string;
+}
+
+type FallbackResult =
+  | { kind: 'applied'; content: string }
+  | { kind: 'unsafe'; near: NearMatch }
+  | { kind: 'multiple'; lines: number[] }
+  | { kind: 'none' };
+
+// Try to recover an exact-match miss by aligning lines modulo
+// leading/trailing whitespace. Only a UNIQUE near-match with a single
+// uniform indent shift is auto-applied (new_string re-indented to the
+// file); ambiguity or non-uniform indentation returns location info so
+// the caller can fail with an actionable error instead of guessing.
+const whitespaceFallback = (current: string, oldStr: string, newStr: string): FallbackResult => {
+  const needleLines = oldStr.split('\n');
+  const hayLines = current.split('\n');
+  const n = needleLines.length;
+  if (n === 0 || n > hayLines.length) return { kind: 'none' };
+  // A whitespace-only old_string would otherwise match the first blank
+  // line in the file — refuse to fall back on it.
+  if (needleLines.every((l) => l.trim() === '')) return { kind: 'none' };
+  const needleTrim = needleLines.map((l) => trimSpacesTabs(l));
+  const starts: number[] = [];
+  for (let s = 0; s + n <= hayLines.length; s++) {
+    let match = true;
+    for (let k = 0; k < n; k++) {
+      if (trimSpacesTabs(hayLines[s + k] ?? '') !== needleTrim[k]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) starts.push(s);
+  }
+  if (starts.length === 0) return { kind: 'none' };
+  if (starts.length > 1) return { kind: 'multiple', lines: starts.slice(0, 8).map((s) => s + 1) };
+  const s = starts[0] ?? 0;
+  const span = hayLines.slice(s, s + n);
+  const shift = uniformShift(span, needleLines);
+  if (shift === null) {
+    const text = span.join('\n');
+    return {
+      kind: 'unsafe',
+      near: {
+        start_line: s + 1,
+        end_line: s + n,
+        ...(text.length <= NEAR_MATCH_TEXT_CAP ? { text } : {}),
+      },
+    };
+  }
+  const newLines = newStr.split('\n').map((l) => applyShift(l, shift));
+  const content = [...hayLines.slice(0, s), ...newLines, ...hayLines.slice(s + n)].join('\n');
+  return { kind: 'applied', content };
+};
+
 // Apply one edit to `current`. Returns the post-edit content + the
-// replacement count, or a tool error. Pure — no I/O, no mutation of
-// arguments beyond what String.replace produces. Sequential batch
-// semantics rely on this: each edit's `current` is the result of
-// the previous edit, NOT the original file.
+// replacement count (and whether a whitespace-tolerant fallback was
+// used), or a tool error. Pure — no I/O, no mutation of arguments beyond
+// what String.replace produces. Sequential batch semantics rely on this:
+// each edit's `current` is the result of the previous edit, NOT the
+// original file.
 const applyEdit = (
   current: string,
   edit: EditOperation,
   pathLabel: string,
   index: number,
-): { ok: true; content: string; replacements: number } | { ok: false; error: ToolError } => {
+):
+  | { ok: true; content: string; replacements: number; whitespace_tolerant?: boolean }
+  | { ok: false; error: ToolError } => {
   if (edit.old_string.length === 0) {
     return {
       ok: false,
@@ -89,6 +251,43 @@ const applyEdit = (
   }
   const occurrences = countOccurrences(current, edit.old_string);
   if (occurrences === 0) {
+    // Exact miss. For a single (non-replace_all) edit, try to recover via
+    // a whitespace-tolerant fallback before failing: a unique near-match
+    // with one uniform indent shift is re-indented to the file and
+    // applied; anything less certain returns location info so the error
+    // is actionable in one shot instead of triggering a blind retry.
+    if (edit.replace_all !== true) {
+      const fb = whitespaceFallback(current, edit.old_string, edit.new_string);
+      if (fb.kind === 'applied') {
+        return { ok: true, content: fb.content, replacements: 1, whitespace_tolerant: true };
+      }
+      if (fb.kind === 'unsafe') {
+        return {
+          ok: false,
+          error: toolError(
+            ERROR_CODES.oldStringNotFound,
+            `edits[${index}].old_string not found in ${pathLabel}`,
+            {
+              hint: `A near-match (differs only in whitespace, but not by a single uniform indent shift) is at lines ${fb.near.start_line}-${fb.near.end_line}. Copy that exact text into old_string.`,
+              details: { near_match: fb.near },
+            },
+          ),
+        };
+      }
+      if (fb.kind === 'multiple') {
+        return {
+          ok: false,
+          error: toolError(
+            ERROR_CODES.oldStringNotFound,
+            `edits[${index}].old_string not found in ${pathLabel}`,
+            {
+              hint: `Whitespace-insensitive near-matches start at lines ${fb.lines.join(', ')}. Add surrounding context and use the file's exact text.`,
+              details: { near_match_lines: fb.lines },
+            },
+          ),
+        };
+      }
+    }
     return {
       ok: false,
       error: toolError(
@@ -101,14 +300,15 @@ const applyEdit = (
     };
   }
   if (occurrences > 1 && edit.replace_all !== true) {
+    const lines = occurrenceLines(current, edit.old_string, 8);
     return {
       ok: false,
       error: toolError(
         ERROR_CODES.ambiguousMatch,
         `edits[${index}].old_string appears ${occurrences} times in ${pathLabel}`,
         {
-          hint: 'Add surrounding context to make it unique, or pass replace_all=true on this edit.',
-          details: { occurrences },
+          hint: `Matches start at lines ${lines.join(', ')}${occurrences > lines.length ? ', …' : ''}. Add surrounding context to target one, or pass replace_all=true on this edit.`,
+          details: { occurrences, lines },
         },
       ),
     };
@@ -223,7 +423,10 @@ export const editFileTool: Tool<EditFileInput, EditFileOutput> = {
       const outcome = applyEdit(working, edit, args.path, i);
       if (!outcome.ok) return outcome.error;
       working = outcome.content;
-      results.push({ replacements: outcome.replacements });
+      results.push({
+        replacements: outcome.replacements,
+        ...(outcome.whitespace_tolerant ? { whitespace_tolerant: true } : {}),
+      });
       totalReplacements += outcome.replacements;
     }
 

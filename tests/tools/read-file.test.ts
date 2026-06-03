@@ -57,13 +57,14 @@ describe('readFileTool', () => {
     expect(out.content).toBe('hello');
   });
 
-  test('streams large files without materializing the whole content', async () => {
-    // Build a ~6 MB file (200_000 lines of ~30 bytes) and request a tiny
-    // window. Previously, file.text() loaded all 6 MB into a string
-    // before slicing — pagination did nothing for memory. The streaming
-    // path keeps working memory proportional to `limit`. We verify by
-    // asserting the response is small AND total_lines is correct
-    // (proves the rest of the file was traversed only for counting).
+  test('paginates a large file: small window + correct total_lines (not a memory test)', async () => {
+    // A large file with a tiny requested window. This pins PAGINATION
+    // correctness — returned content is bounded by `limit` and
+    // `total_lines` reflects the whole file — and deliberately does NOT
+    // claim anything about memory: the tool loads the entire file via
+    // arrayBuffer (bounded by MAX_FILE_BYTES), so working memory is
+    // proportional to file size, not to `limit`. (The old name implied
+    // streaming; it never measured memory.)
     const path = join(dir, 'huge.txt');
     const lines = Array.from(
       { length: 200_000 },
