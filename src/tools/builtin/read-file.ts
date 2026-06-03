@@ -25,8 +25,8 @@ const DEFAULT_LIMIT = 2000;
 // suffix and know the line was clipped.
 const MAX_LINE_LENGTH = 2000;
 
-// File-size cap applied BEFORE `file.text()`. The whole file lands
-// in memory (`text()` doesn't honor offset/limit), so an unbounded
+// File-size cap applied BEFORE the read. The whole file lands in
+// memory (the read doesn't honor offset/limit), so an unbounded
 // read of a multi-GB log would either OOM the process or pin the
 // JS thread for seconds — operator perceives "frozen UI" even
 // though the tool is just reading. 10 MiB covers any realistic
@@ -36,10 +36,19 @@ const MAX_LINE_LENGTH = 2000;
 // loaded into the model context wholesale.
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
 
+// Binary-detection scan window. We look for a NUL byte (0x00) in the
+// first N bytes to classify a file as binary — git uses the same
+// FIRST_FEW_BYTES = 8000 cutoff. A NUL never occurs in valid UTF-8
+// text, so scanning only the head still catches every real binary
+// (images, object files, archives all carry NULs early) while
+// keeping the check cheap on large files. See the scan site for the
+// UTF-16 trade-off.
+const BINARY_SCAN_BYTES = 8000;
+
 export const readFileTool: Tool<ReadFileInput, ReadFileOutput> = {
   name: 'read_file',
   description:
-    'Read a file from the filesystem. Use offset/limit to read specific line ranges of large files. Parallel-safe: emit multiple read_file calls in a single turn to batch reads — the harness dispatches them concurrently.',
+    'Read a file from the filesystem. Use offset/limit to read specific line ranges of large files. Binary files are refused (use bash — file/xxd/hexdump — for raw-byte inspection). Parallel-safe: emit multiple read_file calls in a single turn to batch reads — the harness dispatches them concurrently.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -99,15 +108,15 @@ export const readFileTool: Tool<ReadFileInput, ReadFileOutput> = {
       });
     }
 
-    // File-size gate. `file.text()` below loads the entire file into
-    // memory regardless of offset/limit — a defensive cap here
-    // refuses absurd reads upfront with a clear error rather than
-    // letting the JS thread pin (or OOM) on a multi-GB log. The
-    // gate doubles as the abort path for `B`-axis interruptibility:
-    // since `text()` itself is a native single-syscall read with no
+    // File-size gate. The `arrayBuffer()` read below loads the entire
+    // file into memory regardless of offset/limit — a defensive cap
+    // here refuses absurd reads upfront with a clear error rather than
+    // letting the JS thread pin (or OOM) on a multi-GB log. The gate
+    // doubles as the abort path for `B`-axis interruptibility: since
+    // the read itself is a native single-syscall read with no
     // checkpoint, we can't honor a mid-read abort the way the old
     // streaming impl could; capping the input bounds the worst-case
-    // wall-clock so an aborted operator at most waits text() out.
+    // wall-clock so an aborted operator at most waits the read out.
     const size = file.size;
     if (size > MAX_FILE_BYTES) {
       return toolError(
@@ -117,7 +126,7 @@ export const readFileTool: Tool<ReadFileInput, ReadFileOutput> = {
       );
     }
 
-    // Read the whole file in one shot. Streaming via
+    // Read the whole file in one shot, as bytes. Streaming via
     // `file.stream().getReader()` to keep memory proportional to
     // the requested window is defensible in theory, but it freezes
     // on real .gitignore / package.json reads — the stream loop
@@ -126,15 +135,18 @@ export const readFileTool: Tool<ReadFileInput, ReadFileOutput> = {
     // the tool never returns, and the operator sees "input frozen"
     // while the harness awaits our promise.
     //
-    // `file.text()` is a single native read(2) loop, no JS-level
-    // async loop, no `done` handshake, no possibility of the stream
-    // library getting wedged. Trade-off: it loads the whole file
-    // even when offset/limit would only need a window — bounded by
-    // MAX_FILE_BYTES above so the worst case is predictable rather
-    // than open-ended.
-    let raw: string;
+    // `file.arrayBuffer()` is a single native read(2) loop, no
+    // JS-level async loop, no `done` handshake, no possibility of
+    // the stream library getting wedged — the same property the old
+    // `file.text()` path relied on. We take the raw bytes (not the
+    // decoded string) so the binary scan below can see NULs; the
+    // decode then runs once over the bytes already in hand. Trade-
+    // off: it loads the whole file even when offset/limit would only
+    // need a window — bounded by MAX_FILE_BYTES above so the worst
+    // case is predictable rather than open-ended.
+    let bytes: Uint8Array;
     try {
-      raw = await file.text();
+      bytes = new Uint8Array(await file.arrayBuffer());
     } catch (e) {
       return toolError(
         ERROR_CODES.readFailed,
@@ -145,6 +157,36 @@ export const readFileTool: Tool<ReadFileInput, ReadFileOutput> = {
     if (ctx.signal.aborted) {
       return toolError(ERROR_CODES.aborted, 'tool aborted during read', { retryable: true });
     }
+
+    // Binary detection — the spec's "Read tool detecta automaticamente"
+    // (TOOL_ERGONOMICS §3). Scan the leading window for a NUL (0x00):
+    // git's is-binary heuristic. A NUL never appears in valid UTF-8
+    // text, so its presence marks an image / object file / archive,
+    // which would otherwise decode to mojibake + U+FFFD noise that
+    // burns context budget and tells the model nothing. Refuse with a
+    // dedicated code and point at bash for the rare raw-bytes need.
+    // Known trade-off: UTF-16 text carries interleaved NULs in the
+    // ASCII range and is flagged binary — but the prior `text()` path
+    // already mis-decoded it to garbage, so this is an honest refusal,
+    // not a regression.
+    const scanLen = Math.min(bytes.length, BINARY_SCAN_BYTES);
+    for (let i = 0; i < scanLen; i++) {
+      if (bytes[i] === 0) {
+        return toolError(ERROR_CODES.binaryFile, `refusing to read binary file: ${args.path}`, {
+          hint: 'NUL byte detected. To inspect raw bytes, use bash (`file`, `xxd`, `hexdump`).',
+          details: { resolved: abs, size, nul_offset: i },
+        });
+      }
+    }
+
+    // Decode the bytes we already hold — TextDecoder decodes the view
+    // with no copy (vs. `Buffer.from(bytes)`, which would copy up to
+    // MAX_FILE_BYTES first). Its default strips a leading UTF-8 BOM,
+    // matching both the `file.text()` this replaced and the sibling
+    // `edit_file` (which still reads via `file.text()`): the two tools
+    // must decode a given file identically, or content read here would
+    // not line up with the bytes edit_file matches against.
+    const raw = new TextDecoder('utf-8').decode(bytes);
 
     const truncateLine = (line: string): string =>
       line.length > MAX_LINE_LENGTH ? `${line.slice(0, MAX_LINE_LENGTH)}…` : line;

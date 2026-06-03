@@ -563,6 +563,7 @@ export const ERROR_CODES = {
   readFailed: 'fs.read_failed',
   writeFailed: 'fs.write_failed',
   invalidPath: 'fs.invalid_path',
+  binaryFile: 'fs.binary',
   ambiguousMatch: 'edit.ambiguous_match',
   oldStringNotFound: 'edit.old_string_not_found',
   oldEqualsNew: 'edit.old_equals_new',

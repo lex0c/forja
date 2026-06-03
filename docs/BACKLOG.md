@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-03] read_file: refuse binary files (NUL-byte detection) — close spec gap
+
+**Finding.** `TOOL_ERGONOMICS §3` promises "Read tool detecta automaticamente" (binary), but `read-file.ts` decoded any file under the 10 MiB cap as UTF-8 via `file.text()`. A binary input (image, compiled artifact, archive) came back as mojibake / U+FFFD replacement chars — burning context budget on noise and confusing the model — instead of a clean refusal. Code was behind the spec, not diverging from it: closing the gap needs no spec PR.
+
+**Fix.** Read the bytes via `file.arrayBuffer()` (same single native-read property as `text()` — no `stream().getReader()`, so the freeze the old streaming path hit can't recur) and scan the first `BINARY_SCAN_BYTES` (8000, git's `FIRST_FEW_BYTES`) for a NUL (`0x00`) before decoding. NUL never occurs in valid UTF-8 text, so its presence is the canonical "this is binary" signal; on a hit, refuse with the new `fs.binary` code and a hint pointing at bash/`file` for byte inspection. Valid UTF-8 multibyte content (accents, emoji) has no NUL and passes untouched; the decode reuses the bytes already in hand, so it stays a single read. Trade-off documented in-code: UTF-16 text (interleaved NULs in the ASCII range) is flagged binary — but it was already mis-decoded by the prior `text()` path, so this is not a regression, just an honest refusal instead of silent garbage.
+
+**Tests.** `read-file.test.ts`: a NUL-bearing header refuses with `fs.binary` (+ `nul_offset`); UTF-8 multibyte text (`café ☕ 🚀`) reads with no false positive; a leading UTF-8 BOM is stripped, keeping the decode identical to the replaced `file.text()` and to `edit_file`'s reader; a NUL just past the 8000-byte window reads through (pins the bounded git-style scan). Verification: `tests/tools/read-file.test.ts` 18 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
 ## [2026-06-03] TUI `!cmd`: stop reading when the foreground shell exits (background-child pipe)
 
 **Finding.** The `execBash` read loop awaited stdout EOF. A command that backgrounds a child while inheriting stdout/stderr (`!npm run dev &`, `!sleep 60 & echo ok`) has the foreground `bash -c` exit promptly, but the detached child keeps the inherited pipe open — so the stream never reaches `done`, and the REPL stayed busy until the child died or the 120s timeout SIGKILLed the whole group.
