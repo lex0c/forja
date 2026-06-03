@@ -71,7 +71,7 @@ needed is tiny and the spec bans extra deps. One quirk handled: Node throws on
 emit for `error` events when nobody is on that channel (`onAny` still receives
 them).
 
-`UIEvent` is a discriminated union of ~56 variants (`events.ts`) —
+`UIEvent` is a discriminated union of ~58 variants (`events.ts`) —
 `session:start`, `assistant:start/delta/end`, `thinking:*`, `tool:start/
 execution-started/delta/end`, `provider:waiting:*`, `input:update`,
 `user:submit`, `slash:update`, `reverse-search:*`, `*:ask` (modals), etc.
@@ -121,14 +121,28 @@ mode that the input render reflects and the REPL dispatch routes:
 - `/command` — slash command. `render/input.ts` paints the command token blue;
   Enter dispatches it through the slash registry (not the agent).
 - `!command` — operator shell escape. The leading `!` becomes the prompt glyph
-  (`> ` → `! `) and the whole line renders yellow. Enter runs it as the
-  operator's **own shell** (`bash -c` in the cwd, full env) — NOT through the
-  agent's permission engine or sandbox; the engine gates the agent, not the
-  human. The result lands in scrollback as an `operator-bash` card
-  (`operator-bash:done` → reducer → `formatPermanent`). It serializes against
-  agent turns via `isBusy()` (refused while a turn is in flight). The render and
-  the cursor (`composeCursor`) both strip the leading `!` so the caret stays
-  aligned — a shared contract, like the wrap chunker.
+  (`> ` → `! `), the whole line + its rules render yellow, and the footer
+  collapses to `! for shell mode`. Enter runs it as the operator's **own shell**
+  (`bash -c` in the cwd, full env) — NOT through the agent's permission engine or
+  sandbox; the engine gates the agent, not the human. The result lands in
+  scrollback as an `operator-bash` card (`operator-bash:done` → reducer →
+  `formatPermanent`). Its hardening (all in `cli/repl.ts`):
+  - **Gating** — the bash-mode visuals key off `state.busy` (the renderer's
+    mirror of the REPL's `isBusy()`, pushed via `busy:change`), the *same*
+    predicate the submit path uses, so they never show for a `!` that Enter would
+    refuse (a turn / playbook / another `!cmd` in flight). `render/mode.ts`
+    centralizes the predicate so input / rules / cursor / footer can't desync.
+  - **Output safety** — sanitized at intake before `operator-bash:done`: ANSI +
+    C0/C1/DEL stripped and `\r` normalized to `\n` (else a `!cat untrusted-file`
+    could clear the screen, hide the cursor, or overwrite the frame margin).
+    Drained with a 1 MiB **byte cap** (memory guard against `!yes` / huge files)
+    and a 200-line **display cap**.
+  - **Lifecycle** — runs `detached` so the timeout / interrupt SIGKILLs the whole
+    process group. Ctrl+C / Esc interrupt it (SIGINT then SIGKILL on a repeat) via
+    a kill switch the executor hands up. The promise is tracked so shutdown kills
+    + awaits it (no orphan, no emit after teardown).
+  - The render and the cursor (`composeCursor`) both strip the leading `!` so the
+    caret stays aligned — a shared contract, like the wrap chunker.
 
 ---
 
@@ -136,9 +150,11 @@ mode that the input render reflects and the REPL dispatch routes:
 
 A single immutable `LiveState` snapshot holds everything the live region needs:
 the input buffer, `activeTools` (a `Map` keyed by toolId), `pendingAssistant`,
-`thinking`, `awaitingProvider`, `currentTurnId`, `todos`, `subagents`,
-`bgProcesses`, the modal, the slash popover, the reverse-search overlay, status
-fields, and `pendingToolEndBatch` (the tool coalescing buffer).
+`thinking`, `awaitingProvider`, `currentTurnId`, `busy` (a mirror of the REPL's
+`isBusy()`, pushed via `busy:change` — the render layer can't call `isBusy()`,
+so this is how the bash-mode gate matches the submit gate), `todos`,
+`subagents`, `bgProcesses`, the modal, the slash popover, the reverse-search
+overlay, status fields, and `pendingToolEndBatch` (the tool coalescing buffer).
 
 The heart is:
 
@@ -263,7 +279,14 @@ live region stable under 30fps key repeat across both modern and older emulators
   the tool, so the card never paints. The hold buffers a `tool:end` (and the
   harness events queued behind it) until the card has been on screen at least
   `toolMinDisplayMs`, keeping it visible (and animating via the heartbeat).
-  Keystroke / overlay events (`HOLD_BYPASS`) skip the queue so typing never lags.
+  Events in `HOLD_BYPASS` skip the queue — three categories that would BREAK if
+  delayed: **keystroke/overlay** (typing stays responsive), **modal open +
+  lifecycle** (`modal-manager` installs the focus handler synchronously, so the
+  modal must render in lockstep — else a hidden permission prompt, defaulting to
+  Yes, could be answered unseen), and **interrupt** (`triggerInterrupt` reads the
+  flipped `softInterrupted` for the soft→hard ladder). All bypassed events emit
+  no permanent, so processing them out of order with the held `tool:end` is
+  scrollback-safe.
 
 ### 6.4 Tool grouping (coalescing + live preview)
 
@@ -348,7 +371,7 @@ coverage improvement would be a pty-backed test that compares a real framebuffer
 | Module | Role |
 |---|---|
 | `bus.ts` | Typed event bus (single channel, `onAny`). |
-| `events.ts` | `UIEvent` discriminated union (~56 variants). |
+| `events.ts` | `UIEvent` discriminated union (~58 variants). |
 | `state.ts` | `LiveState`, the pure `applyEvent` reducer, `PermanentItem`, batch coalescing. |
 | `renderer.ts` | Redraw cycle: draw paths, erase, scheduler/heartbeat wiring, tool-display hold, scrollback handoff. |
 | `renderer-types.ts` | Shared `ComposeLive` type (breaks the renderer ↔ compose import cycle). |
@@ -366,6 +389,7 @@ coverage improvement would be a pty-backed test that compares a real framebuffer
 | `render/width.ts` | Visual width + `truncateToWidth` (wraps `string-width`). |
 | `render/wrap.ts` | `wrapInputLine` — visual-width-aware input soft-wrap chunker. |
 | `render/frame.ts` | `padFrame` — frame margin for live rows. |
+| `render/mode.ts` | `isBashMode` / `isTurnRunning` — shared input-mode predicates (single source of truth for every render site). |
 | `render/glyphs.ts` | Unicode/ASCII glyph pairs (connectors, spinner, ellipsis). |
 | `render/shimmer.ts` | Highlight-sweep animation for live verbs. |
 | `render/spinner-verbs.ts` | Cognitive / output / tool verb pools + deterministic pickers. |

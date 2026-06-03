@@ -14,6 +14,10 @@ All bypassed events emit no permanent and touch only live-region/overlay state, 
 
 **Tests.** `renderer.test.ts`: with a held `tool:end`, a `permission:ask` sets `state.modal` immediately (not queued); an `interrupt` flips `softInterrupted` immediately. Verification: `tests/tui` + `tests/cli/repl` 1026 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
 
+## [2026-06-03] docs(tui): refresh TUI.md for the `!cmd` hardening + busy mirror
+
+Brought `docs/TUI.md` up to date with the work since it was first written: the `!command` input-prefix section now covers the full hardening (busy-gating via `state.busy`, output sanitization — ANSI strip + CR→LF — byte cap + display cap, detached/interruptible lifecycle, shutdown tracking); the `LiveState` field list gains `busy`; the hold (§6.3) documents the three `HOLD_BYPASS` categories (keystroke/overlay, modal, interrupt) and why each would break if delayed; the module map gains `render/mode.ts`; event count bumped to ~58. Docs-only — no code. `docs/spec/` (PT-BR) untouched; the spec PR for the `!` escape + its security posture is still owed.
+
 ## [2026-06-03] TUI `!cmd`: normalize carriage returns in command output
 
 **Finding.** `stripAnsi` (the intake sanitizer) keeps the whitespace controls TAB/LF/CR — but a bare `\r` survives, and the operator-bash card renders output rows verbatim under a 2-space frame margin. A `\r` returns the cursor to column 0, so a row from e.g. `!cat untrusted-file` (or progress-style output) overwrites the indentation / earlier content of that row — the exact spoofing the sanitization is meant to prevent.
