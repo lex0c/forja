@@ -421,16 +421,14 @@ describe('composeLive layout', () => {
     }
   });
 
-  test('bash visuals are suppressed while a turn runs (idle-gated)', () => {
-    // A `!` buffer mid-turn stays a normal gray draft — it would be
-    // refused on submit, so the rules must not go yellow.
+  test('bash visuals are suppressed while busy (busy-gated, matches the submit gate)', () => {
+    // A `!` buffer while the REPL is busy (turn / playbook / another
+    // `!cmd`) stays a normal gray draft — Enter would refuse it, so the
+    // rules must not go yellow. `state.busy` is the gate (not turn
+    // activity), so a playbook gap with no tools is covered too.
     const colored: Capabilities = { ...caps, color: 'basic' };
     const s = startedSession();
-    const out = composeLive(
-      { ...s, input: { value: '!ls', cursor: 3 }, awaitingProvider: { stepN: 1, startedAt: 0 } },
-      colored,
-      0,
-    );
+    const out = composeLive({ ...s, input: { value: '!ls', cursor: 3 }, busy: true }, colored, 0);
     for (const r of out.filter((l) => l.includes('─'))) {
       expect(r).not.toContain(`${CSI}33m`);
     }

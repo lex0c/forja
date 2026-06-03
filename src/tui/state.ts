@@ -375,6 +375,14 @@ export interface LiveState {
   // at session boundaries so a stale id from a crashed run can't
   // seed the next session's first tool phase.
   currentTurnId: string | null;
+  // Mirror of the REPL's `isBusy()` (foreground turn OR playbook OR an
+  // operator `!cmd` in flight), pushed via `busy:change`. The render
+  // layer can't call `isBusy()` (it lives in the REPL), and two of its
+  // inputs have no other LiveState reflection — so this is the single
+  // signal the bash-mode gate (`render/mode.ts`) keys off to match the
+  // submit gate. NOT touched by session boundaries (it tracks the REPL,
+  // not a turn).
+  busy: boolean;
   // Active modal, or null when no modal is up. Composer (compose.ts)
   // replaces the input box with `renderModal(modal, caps)` whenever
   // this is non-null. Status line + tool cards stay visible.
@@ -504,6 +512,7 @@ export const createInitialState = (): LiveState => ({
   thinking: null,
   awaitingProvider: null,
   currentTurnId: null,
+  busy: false,
   modal: null,
   slash: null,
   reverseSearch: null,
@@ -1436,6 +1445,9 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           },
         ],
       };
+
+    case 'busy:change':
+      return { state: { ...state, busy: event.busy }, permanent: [] };
 
     case 'recap:terse':
       return { state, permanent: [{ kind: 'recap-terse', message: event.message }] };

@@ -329,6 +329,19 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // — the exact serialization the playbookRunning flag was
   // supposed to enforce, defeated at every other entry point.
   const isBusy = (): boolean => running || playbookRunning || operatorBashRunning;
+  // Mirror `isBusy()` into renderer state so the bash-mode visuals gate
+  // on the same condition the submit path uses (render/mode.ts). Call
+  // after EVERY mutation of `running` / `playbookRunning` /
+  // `operatorBashRunning` — the dedup makes spurious calls cheap, but a
+  // MISSED call leaves `state.busy` stale (a `!` would show shell UI for
+  // a command Enter refuses). Deduped so only real transitions emit.
+  let lastBusyEmitted = false;
+  const syncBusy = (): void => {
+    const b = isBusy();
+    if (b === lastBusyEmitted) return;
+    lastBusyEmitted = b;
+    bus.emit({ type: 'busy:change', ts: now(), busy: b });
+  };
 
   const ESC_DRAIN_MS = 30;
   let drainTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1181,6 +1194,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // old timing.
     if (event.type === 'session_finished') {
       running = false;
+      syncBusy();
       sawSessionFinished = true;
       lastSessionId = event.result.sessionId;
       trackReplSessionId(event.result.sessionId);
@@ -1396,6 +1410,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   const runOperatorBash = (command: string): void => {
     operatorBashRunning = true;
     operatorBashInterrupted = false;
+    syncBusy();
     const startedAt = now();
     void Promise.resolve()
       .then(() =>
@@ -1429,6 +1444,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       .finally(() => {
         operatorBashRunning = false;
         operatorBashKill = null;
+        syncBusy();
         // The REPL was idle while the command ran; if messages queued
         // meanwhile (operator typed ahead), drain them now.
         if (!isBusy()) queueMicrotask(() => drainInbox());
@@ -1438,6 +1454,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   const startTurn = (text: string): void => {
     if (isBusy() || exiting) return;
     running = true;
+    syncBusy();
     // Mint a fresh token for this turn and claim ownership of the
     // shared state slots (running / abortController / runningPromise).
     // The finalizer below compares against `activeTurnToken` to refuse
@@ -1489,6 +1506,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // this turn IS still active, and the cleanup runs.
         if (activeTurnToken !== myToken) return;
         running = false;
+        syncBusy();
         abortController = null;
         softStopController = null;
         runningPromise = null;
@@ -1901,6 +1919,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         throw new Error(`playbook '${name}' is not registered`);
       }
       playbookRunning = true;
+      syncBusy();
       // Fresh per-dispatch controllers. `triggerInterrupt`
       // (Esc / Ctrl+C / SIGINT / modal-cancel) reads these as a
       // mirror of the foreground per-turn controllers and
@@ -2020,6 +2039,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // call abort() on a settled signal or await a stale
         // promise.
         playbookRunning = false;
+        syncBusy();
         playbookAbortController = null;
         playbookSoftStopController = null;
         playbookPromise = null;

@@ -770,6 +770,43 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('shell-mode visuals stay off while another `!cmd` is running (busy gate)', async () => {
+    // Regression for the busy-gate finding: `isTurnRunning` can't see
+    // `operatorBashRunning`, so without `state.busy` (busy:change) the
+    // second `!` would flip to yellow shell mode for a command Enter
+    // refuses. Type a `!` while a first `!cmd` hangs; the footer must
+    // NOT show the shell indicator.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      // First command hangs until killed → stays "running" (busy).
+      execBash: ((_cmd, _cwd, onKillable) =>
+        new Promise((resolve) => {
+          onKillable?.((sig) => resolve({ output: `killed:${sig}`, exitCode: 130 }));
+        })) as NonNullable<RunReplOptions['execBash']>,
+    });
+    await tick();
+    stdin.feed('!sleep\r'); // runs → busy:change(true); buffer clears
+    await tick();
+    writes.length = 0; // only inspect frames after we start typing the 2nd `!`
+    stdin.feed('!x'); // type a new `!` command while the first runs (no Enter)
+    await flushFrame();
+    expect(writes.join('')).not.toContain('! for shell mode');
+    // Cleanup: kill the running command, then EOF.
+    stdin.feed('\x03');
+    await flushFrame();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('idle Ctrl+D (EOF) exits 130 immediately, no gate (shell convention)', async () => {
     // §5.4: Ctrl+D is the explicit "I'm done" signal at empty buffer
     // and bypasses the double-tap gate. Single press exits.

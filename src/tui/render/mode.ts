@@ -10,8 +10,10 @@ import type { LiveState } from '../state.ts';
 // just the instants a tool or stream is live. Includes `awaitingProvider`
 // (the model deliberating before the first token — often the LONGEST
 // phase of a turn); without it the predicate flickers off during that
-// wait. Used by the footer to choose the interrupt cue, and by
-// `isBashMode` to refuse the shell-escape visuals mid-turn.
+// wait. Used by the footer to choose the interrupt cue. NOTE: this is a
+// RENDER-derived subset of the REPL's `isBusy()` — it can't see a
+// playbook or an operator `!cmd` (no LiveState reflection), so the
+// bash-mode gate uses `state.busy` (below), not this.
 export const isTurnRunning = (state: LiveState): boolean =>
   state.activeTools.size > 0 ||
   state.thinking !== null ||
@@ -22,12 +24,14 @@ export const isTurnRunning = (state: LiveState): boolean =>
 // actually run RIGHT NOW. Three conditions:
 //   - buffer starts with `!` (the mode trigger),
 //   - not reverse-search-dimmed (that overlay owns the palette),
-//   - the REPL is idle.
-// The idle gate matters: a `!` typed mid-turn is REFUSED on submit
-// (`isBusy()` serialization in repl.ts), so flipping the input/rules
-// yellow + footer to "shell mode" then would advertise a mode that
-// can't run AND shadow the load-bearing "esc to interrupt" footer cue.
-// While a turn runs the buffer just reads as a normal (gray) draft; it
-// flips to bash mode the moment the turn ends, ready to submit.
+//   - the REPL is idle — gated on `state.busy`, the renderer's mirror of
+//     the REPL's `isBusy()` (`busy:change` events). This MUST match the
+//     submit gate: `isBusy()` refuses a `!` while a turn, a playbook, OR
+//     another `!cmd` is in flight. `isTurnRunning` is NOT enough — it
+//     can't see playbook / operator-bash busyness. Without the match,
+//     typing `!` during a playbook or a running `!cmd` would flip the
+//     input/rules/footer to shell mode for a command Enter then refuses,
+//     and shadow the interrupt cue. While busy the buffer reads as a
+//     normal gray draft; it flips to bash mode the moment the REPL idles.
 export const isBashMode = (state: LiveState): boolean =>
-  state.reverseSearch === null && !isTurnRunning(state) && state.input.value.startsWith('!');
+  state.reverseSearch === null && !state.busy && state.input.value.startsWith('!');

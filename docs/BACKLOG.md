@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-03] TUI `!cmd`: bash-mode gate must match the submit gate (busy, not turn-running)
+
+**Finding.** `isBashMode` gated on `!isTurnRunning(state)`, but `isTurnRunning` is a render-derived subset of the REPL's `isBusy()` — it only sees LiveState turn activity (activeTools / thinking / pendingAssistant / awaitingProvider) and can't see `playbookRunning` or `operatorBashRunning` (no LiveState reflection). So while another `!cmd` ran, or in a playbook gap, typing a leading `!` flipped the input/rules/footer to yellow shell mode even though Enter refuses the command as busy. The visual gate didn't match the submit gate.
+
+**Fix.** Mirror `isBusy()` into renderer state. New `busy:change` UIEvent → `LiveState.busy` (reducer). A deduped `syncBusy()` helper in the REPL emits it after every mutation of `running` / `playbookRunning` / `operatorBashRunning` (7 sites). `isBashMode` now gates on `!state.busy` — the exact predicate the submit path uses — so the shell visuals appear only when a `!` would actually run. `state.busy` isn't touched by session boundaries (it tracks the REPL, not a turn). The footer's interrupt cue keeps using `isTurnRunning` (its own concern); only the bash gate moved to `busy`.
+
+**Tests.** `state.test.ts`: `busy:change` sets/clears `state.busy`. `footer.test.ts` / `compose.test.ts`: shell visuals suppressed when `busy` with NO turn activity (the playbook / running-`!cmd` case `isTurnRunning` missed). `repl.test.ts`: typing `!` while a first `!cmd` hangs shows no shell indicator (end-to-end busy:change). Verification: `tests/tui` + `tests/cli/repl` 1021 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
 ## [2026-06-03] TUI `!cmd` follow-up: interruptible, ordered output, single-line card
 
 Three review findings on the shipped operator shell escape (commit above), all fixed in `cli/repl.ts` + `render/permanent.ts`:

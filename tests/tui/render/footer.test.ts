@@ -43,14 +43,29 @@ describe('renderFooter', () => {
   test('bash-mode footer is suppressed WHILE A TURN RUNS — interrupt cue stays', () => {
     // A `!` typed mid-turn is refused on submit, so flipping to the
     // shell indicator would advertise a dead mode AND hide the
-    // load-bearing interrupt cue. isBashMode is idle-gated.
+    // load-bearing interrupt cue. isBashMode is busy-gated.
     const s = startedSession();
     const out = renderFooter(
-      { ...s, input: { value: '!ls', cursor: 3 }, awaitingProvider: { stepN: 1, startedAt: 0 } },
+      {
+        ...s,
+        input: { value: '!ls', cursor: 3 },
+        busy: true,
+        awaitingProvider: { stepN: 1, startedAt: 0 },
+      },
       caps,
     );
     expect(out).not.toContain('! for shell mode');
     expect(out).toContain('esc to interrupt');
+  });
+
+  test('bash-mode footer is suppressed while busy with NO turn activity (playbook / another `!cmd`)', () => {
+    // The case isTurnRunning misses: `state.busy` is true but no
+    // activeTools/thinking/pending/awaiting (a playbook gap, or another
+    // operator `!cmd` running). Typing `!` must still NOT show shell
+    // mode, since Enter would refuse it.
+    const s = startedSession();
+    const out = renderFooter({ ...s, input: { value: '!ls', cursor: 3 }, busy: true }, caps);
+    expect(out).not.toContain('! for shell mode');
   });
 
   test('bash-mode footer is suppressed under reverse-search (dim owns the box)', () => {

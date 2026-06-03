@@ -2501,3 +2501,15 @@ describe('operator-bash:done (the `!cmd` shell escape)', () => {
     expect(bashIdx).toBeGreaterThan(toolIdx);
   });
 });
+
+describe('busy:change (REPL isBusy mirror for the bash-mode gate)', () => {
+  test('sets and clears state.busy', () => {
+    const initial = createInitialState();
+    expect(initial.busy).toBe(false);
+    const on = applyEvent(initial, { type: 'busy:change', ts: 1, busy: true });
+    expect(on.state.busy).toBe(true);
+    expect(on.permanent).toEqual([]);
+    const off = applyEvent(on.state, { type: 'busy:change', ts: 2, busy: false });
+    expect(off.state.busy).toBe(false);
+  });
+});
