@@ -44,6 +44,7 @@ import { renderThinkingChip } from './thinking-chip.ts';
 import { renderTodoList } from './todo-list.ts';
 import { renderToolCardLive } from './tool-card.ts';
 import { renderToolPhaseChip } from './tool-phase-chip.ts';
+import { visualWidth } from './width.ts';
 import { wrapInputLine } from './wrap.ts';
 
 // Horizontal rules around the input go edge-to-edge (UI.md §6.3
@@ -152,7 +153,16 @@ export const composeCursor = (
     visualRowsBefore += rowsForChunks((lineChunks[i] ?? []).length);
   }
   const cursorChunks = lineChunks[bufferLineIdx] ?? [];
+  const cursorLine = lines[bufferLineIdx] ?? '';
   const numSubRows = rowsForChunks(cursorChunks.length);
+  // Column within a sub-row = the VISUAL width of the text from the
+  // chunk's start to the cursor (not its code-unit count), so a wide
+  // glyph (CJK / emoji = 2 cols) before the cursor advances the column
+  // by 2 — matching where the terminal actually puts the caret. Wraps
+  // are already wcwidth-aware (wrapInputLine), so this stays within the
+  // sub-row.
+  const colInChunk = (chunkStart: number): number =>
+    prefixWidth + visualWidth(cursorLine.slice(chunkStart, offsetInLine));
   // Locate the chunk whose code-unit range covers `offsetInLine`.
   // Linear walk is fine: typical input has < 30 chunks per line.
   // Cursor at the exact end of a chunk lands on that chunk's last
@@ -166,14 +176,14 @@ export const composeCursor = (
     if (chunk === undefined) continue;
     if (offsetInLine < chunk.end) {
       subRowInLine = c;
-      col = prefixWidth + (offsetInLine - chunk.start);
+      col = colInChunk(chunk.start);
       break;
     }
     // Past the last chunk's end — fall through; the clamp below
     // pins to the right edge of the last sub-row.
     if (c === cursorChunks.length - 1) {
       subRowInLine = c;
-      col = prefixWidth + (offsetInLine - chunk.start);
+      col = colInChunk(chunk.start);
     }
   }
 

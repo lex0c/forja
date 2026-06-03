@@ -581,6 +581,25 @@ describe('composeCursor', () => {
     expect(composeCursor(s, caps, 5)).toEqual({ row: 2, col: 5 }); // 2 prefix + 3
   });
 
+  test('col counts VISUAL width of wide chars before the cursor (CJK = 2 cols)', () => {
+    // '中x' — cursor after both. Visual width before cursor = 2 (中) + 1
+    // (x) = 3, so col = prefix(2) + 3 = 5. A code-unit count would give
+    // col 4 (2 code units) and the caret would sit one column left of
+    // the real glyph.
+    const s = startedSession();
+    s.input.value = '中x';
+    s.input.cursor = 2;
+    expect(composeCursor(s, caps, 5)).toEqual({ row: 2, col: 5 });
+  });
+
+  test('col between a wide glyph and the next char', () => {
+    // Cursor right after '中' (offset 1): col = prefix(2) + 2 = 4.
+    const s = startedSession();
+    s.input.value = '中x';
+    s.input.cursor = 1;
+    expect(composeCursor(s, caps, 5)).toEqual({ row: 2, col: 4 });
+  });
+
   test('multi-line input → cursor on the line containing the offset', () => {
     const s = startedSession();
     s.input.value = 'first\nsecond\nthird';

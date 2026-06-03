@@ -2,6 +2,16 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-03] TUI: wcwidth-aware input wrapping + cursor column (close the last width-vs-reality gap)
+
+**Motivation.** A width-vs-reality audit of the live-region cursor/erase math found one remaining structural desync, explicitly deferred in `wrap.ts` ("solved by a wcwidth-aware chunker (deferred)"): the input editor wrapped by UTF-16 code units, not visual columns. A buffer line of wide glyphs (CJK / emoji = 2 cols) packed `innerWidth` *code units* per chunk, so the rendered row was ~2× the terminal width; the terminal soft-wrapped it onto a second visual row while `renderInput` + `composeCursor` counted it as one → `liveHeight` / `cursorRow` undercount → stale rows leak into scrollback (same class as the multi-line-subject bug, but input-only). A paired cosmetic gap: `composeCursor` computed the caret column from the code-unit offset, so the cursor sat one column left per wide glyph before it.
+
+**Fix.** `wrapInputLine` (`wrap.ts`) now accumulates `visualWidth` per codepoint up to `innerWidth` instead of counting code units; it still iterates per-codepoint (1-or-2 code-unit step) so surrogate pairs are never split, and still returns code-unit `[start,end)` ranges so `renderInput` and `composeCursor` consume one shared list. A lone glyph wider than the budget gets its own over-budget chunk (forward-progress guarantee). `composeCursor` (`compose.ts`) computes the sub-row column as `prefixWidth + visualWidth(line.slice(chunkStart, cursorOffset))`. Both row count (chunk count) and column are now visual-width-correct end to end; each emitted input row fits within `caps.cols`, so the terminal never soft-wraps it.
+
+**Audit result (rest is clean).** All non-input live content already routes through `truncateToWidth` (visual-width-aware), so it never overflows → no wrap-induced ghost rows; embedded newlines anywhere in the live region are split by `composeRows` (prior fix); scrollback isn't truncated but sits above the live region and is never erased. The input editor was the last place measuring by code units.
+
+**Tests.** `wrap.test.ts`: wraps by visual width (`'中'×6` at width 8 → 4 per row, not 8 code units), exact-fit wide chars, lone over-budget glyph, surrogate-pair integrity (comments updated — the property holds via codepoint-stepping, not the old pull-back). `compose.test.ts`: cursor column counts visual width of wide glyphs before the caret. Existing ASCII/surrogate cases unchanged (😀 is 2 units = 2 cols, so boundaries coincide). Verification: `tests/tui` 882 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
 ## [2026-06-03] TUI fix: multi-line tool subject leaked a stale card into scrollback
 
 **Symptom.** A live "Awaiting approval" card for a multi-line bash command (a `for` loop / heredoc) froze into scrollback mid-turn instead of being erased when the tool resolved. Surfaced once the min-display hold kept awaiting cards on screen longer, but it's a pre-existing invariant break.
