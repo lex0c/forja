@@ -725,6 +725,50 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('a shutdown that lands before the kill hook is registered is replayed (no hung quit)', async () => {
+    // Race: EOF/quit (Ctrl+D) can arrive right after a `!cmd` submits but
+    // BEFORE execBash hands up its kill switch (the executor is a deferred
+    // microtask). requestShutdown sets `exiting` synchronously and
+    // shutdown()'s `operatorBashKill?.('SIGKILL')` no-ops while the switch
+    // is still null. Without a replay at hook registration, shutdown would
+    // await the command to natural exit / the 120s timeout — a hung quit.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const seam: {
+      register: ((kill: (signal: NodeJS.Signals) => void) => void) | null;
+      resolve: ((r: { output: string; exitCode: number }) => void) | null;
+    } = { register: null, resolve: null };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+      // Capture the hook — the test controls WHEN the kill switch becomes
+      // available (i.e. AFTER the EOF that requested shutdown).
+      execBash: ((_cmd, _cwd, onKillable) =>
+        new Promise((resolve) => {
+          seam.register = onKillable ?? null;
+          seam.resolve = resolve;
+        })) as NonNullable<RunReplOptions['execBash']>,
+    });
+    await tick();
+    stdin.feed('!sleep\r'); // runs; execBash captures the hook but exposes no kill yet
+    await tick();
+    stdin.feed('\x04'); // EOF → requestShutdown sets `exiting`; SIGKILL no-ops (kill still null)
+    await tick();
+    // Now the executor registers its kill switch — the pending shutdown
+    // must be replayed (SIGKILL) so the awaited promise settles and quit
+    // completes instead of hanging on the command.
+    seam.register?.((sig) => seam.resolve?.({ output: `killed:${sig}`, exitCode: 137 }));
+    await flushFrame();
+    expect(writes.join('')).toContain('killed:SIGKILL');
+    expect(await promise).toBe(130);
+  });
+
   test('Ctrl+C interrupts a running `!cmd` (kills its process group, does not wait the timeout)', async () => {
     const stdin = makeStdin();
     const writes: string[] = [];

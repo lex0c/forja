@@ -1480,6 +1480,20 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           // Executor exposes its process-group kill switch; the
           // interrupt path (triggerInterrupt) uses it.
           operatorBashKill = kill;
+          // Replay a shutdown that landed BEFORE the hook was registered.
+          // requestShutdown sets `exiting` synchronously, then shutdown()
+          // runs to its first await — including `operatorBashKill?.(…)`,
+          // which no-ops while the kill switch is still null (the executor
+          // is a deferred microtask: `!sleep 600` + Ctrl+D in one stdin
+          // burst races the spawn). Without this replay only the interrupt
+          // latch below covers that window, so EOF/quit right after a
+          // `!cmd` would await the command to natural exit / the 120s
+          // timeout — a hung quit. SIGKILL, not the SIGINT ladder:
+          // shutdown wants it gone, and this supersedes any interrupt.
+          if (exiting) {
+            kill('SIGKILL');
+            return;
+          }
           // Replay an interrupt that landed BEFORE the hook was
           // registered: Ctrl+C/Esc can arrive in the same stdin chunk
           // as the submitting Enter (or a seam may register the hook

@@ -140,7 +140,11 @@ mode that the input render reflects and the REPL dispatch routes:
   - **Lifecycle** — runs `detached` so the timeout / interrupt SIGKILLs the whole
     process group. Ctrl+C / Esc interrupt it (SIGINT then SIGKILL on a repeat) via
     a kill switch the executor hands up. The promise is tracked so shutdown kills
-    + awaits it (no orphan, no emit after teardown).
+    + awaits it (no orphan, no emit after teardown). The executor exposes the kill
+    switch one microtask after `operatorBashRunning` flips, so an interrupt or a
+    quit landing in that window (same stdin burst) is **replayed** when the hook
+    registers — `if (exiting) SIGKILL` else `if (interrupted) SIGINT` — otherwise
+    the pre-registration `kill?.()` no-ops and the command runs to its timeout.
   - The render and the cursor (`composeCursor`) both strip the leading `!` so the
     caret stays aligned — a shared contract, like the wrap chunker.
 

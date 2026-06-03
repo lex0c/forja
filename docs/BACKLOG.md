@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-03] TUI `!cmd`: replay a shutdown that beats the kill-hook registration
+
+**Finding.** Sibling to the interrupt-replay race below, on the shutdown path. `runOperatorBash` sets `operatorBashRunning` synchronously but exposes the kill switch one microtask later (inside `Promise.resolve().then(() => execBash(…, onKillable))`). If EOF/quit (Ctrl+D) lands in that window — `!sleep 600` + Ctrl+D in the same stdin burst — `requestShutdown` sets `exiting` synchronously and `shutdown()` runs to its first await, but `operatorBashKill?.('SIGKILL')` no-ops because the switch is still null. Only the interrupt latch was replayed at hook registration, not a shutdown, so `shutdown` then awaited `operatorBashPromise` until the command exited naturally or hit the 120s timeout — EOF/quit looked hung.
+
+**Fix.** The `onKillable` callback now replays a pending shutdown first: after storing the kill switch, `if (exiting) { kill('SIGKILL'); return; }` (before the interrupt replay — SIGKILL supersedes the SIGINT ladder). `exiting` is the same synchronous flag `requestShutdown` sets, so the replay fires the moment the executor registers, settling the awaited promise.
+
+**Tests.** `repl.test.ts`: a `!cmd` whose kill hook registers AFTER an EOF still gets SIGKILLed and quit completes (no hang). Verification: `tests/cli/repl` 120 pass / 0 fail; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
 ## [2026-06-03] TUI: modal + interrupt events must bypass the tool min-display hold
 
 Two findings on the `toolMinDisplayMs` hold queue (renderer.ts) — events queued behind a held `tool:end` broke synchronously-coupled REPL logic.
