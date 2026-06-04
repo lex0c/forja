@@ -1,5 +1,7 @@
-import { mkdirSync } from 'node:fs';
-import { dirname, isAbsolute, resolve } from 'node:path';
+import { statSync } from 'node:fs';
+import { isAbsolute, resolve } from 'node:path';
+import { lineDiff } from '../../diff/line-diff.ts';
+import { atomicWrite } from '../../fs/atomic-write.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 
 export interface WriteFileInput {
@@ -28,7 +30,7 @@ const MAX_CONTENT_BYTES = 10 * 1024 * 1024;
 export const writeFileTool: Tool<WriteFileInput, WriteFileOutput> = {
   name: 'write_file',
   description:
-    'Write text content to a file, creating it (and parent directories) if needed. Overwrites existing content.',
+    'Create a file or fully overwrite an existing one with the given content (parent directories are created as needed). Returns { created, bytes_written }. For a localized change to a file that already exists, use edit_file instead — overwriting re-emits the whole file (wasteful) and discards anything not in the provided content.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -67,12 +69,37 @@ export const writeFileTool: Tool<WriteFileInput, WriteFileOutput> = {
       );
     }
     const abs = isAbsolute(args.path) ? args.path : resolve(ctx.cwd, args.path);
+    // Refuse a directory target with the dedicated code. `Bun.file(dir)
+    // .exists()` is false, so without this the write falls through to a
+    // generic EISDIR `write_failed`; `fs.is_directory` is the honest
+    // signal (mirrors read_file).
+    try {
+      if (statSync(abs).isDirectory()) {
+        return toolError(ERROR_CODES.isDirectory, `path is a directory, not a file: ${args.path}`, {
+          hint: 'Provide a file path, not a directory.',
+          details: { resolved: abs },
+        });
+      }
+    } catch {
+      // Doesn't exist yet — fine, write_file creates it.
+    }
     const file = Bun.file(abs);
     const created = !(await file.exists());
+    // Old content for the display diff (before→after), off the
+    // model-facing result. Read only for an existing target AND only
+    // when a TUI consumer is wired — a new file diffs against empty,
+    // and headless/SDK runs skip the read entirely.
+    const before = !created && ctx.emitDiff !== undefined ? await file.text().catch(() => '') : '';
 
     try {
-      mkdirSync(dirname(abs), { recursive: true });
-      const bytes = await Bun.write(abs, args.content);
+      // atomicWrite creates parent directories as needed.
+      const bytes = atomicWrite(abs, args.content);
+      if (ctx.emitDiff !== undefined) {
+        const fileDiff = lineDiff(before, args.content);
+        // Skip an empty diff (overwriting identical content) — it would
+        // render a `(+0 -0)` card and bypass batching for no real change.
+        if (fileDiff.added + fileDiff.removed > 0) ctx.emitDiff(fileDiff);
+      }
       return { path: args.path, bytes_written: bytes, created };
     } catch (e) {
       return toolError(

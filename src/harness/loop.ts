@@ -2811,6 +2811,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               toolName: tu.name,
               message,
             }),
+          // Display-only diff channel (sibling of emitWarn). The
+          // structured before→after goes to the TUI card; it never enters
+          // the model-facing tool_result.
+          emitDiff: (diff) =>
+            safeEmit(config.onEvent, {
+              type: 'tool_diff',
+              toolUseId: tu.id,
+              toolName: tu.name,
+              diff,
+            }),
           // Hook chain — bound to the same dispatcher invoke-tool
           // already uses. Tools fire blocking events (today only
           // memory_write fires MemoryWrite); chain failure is

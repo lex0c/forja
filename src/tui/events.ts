@@ -15,6 +15,7 @@
 // and HarnessEvent diverge in shape, an adapter sits between them
 // (introduced in a later step).
 
+import type { FileDiff } from '../diff/line-diff.ts';
 import type { ForjaEffort } from '../harness/effort.ts';
 import type { ApprovalPosture, PolicyLayer } from '../permissions/index.ts';
 
@@ -270,6 +271,10 @@ export type ToolEndEvent = BaseEvent & {
   // `… output truncated` hint on the finished card. Absent on
   // failure / denial and for tools with no truncation notion.
   outputTruncated?: boolean;
+  // Structured before→after diff for a write/edit tool (display only,
+  // off the model result). Renderer shows +N/−M on the head and a
+  // bounded colored snippet under the card.
+  diff?: FileDiff;
   // Non-zero exit code of a command tool (bash). Present only when
   // the command exited non-zero; drives the `exit N` marker on the
   // card. Absent for exit 0 and tools with no exit code.

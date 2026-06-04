@@ -16,6 +16,7 @@
 // Anything the renderer doesn't understand goes through as a `warn`
 // — better a one-line scrollback note than silent loss.
 
+import type { FileDiff } from '../diff/line-diff.ts';
 import type { ExitReason, HarnessEvent } from '../harness/types.ts';
 import type { Decision } from '../permissions/index.ts';
 import { stripAnsi } from '../sanitize/index.ts';
@@ -82,6 +83,9 @@ export interface HarnessAdapter {
 interface ToolTrack {
   name: string;
   decision: Decision | null;
+  // Display diff stashed from a `tool_diff` event; attached to the
+  // `tool:end` UIEvent when the tool finishes.
+  diff?: FileDiff;
 }
 
 interface AdapterState {
@@ -488,6 +492,14 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         return out;
       }
 
+      case 'tool_diff': {
+        // Display-only: stash the diff on the active tool record. It
+        // rides out on the tool's `tool:end` UIEvent; no UIEvent now.
+        const tool = state.tools.get(event.toolUseId);
+        if (tool !== undefined) tool.diff = event.diff;
+        return out;
+      }
+
       case 'tool_finished': {
         const tool = state.tools.get(event.toolUseId);
         const decisionKind = tool?.decision?.kind;
@@ -540,6 +552,7 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           durationMs: event.durationMs,
           ...(summary !== undefined ? { summary } : {}),
           ...(event.outputTruncated === true ? { outputTruncated: true } : {}),
+          ...(tool?.diff !== undefined ? { diff: tool.diff } : {}),
           ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
         });
         return out;

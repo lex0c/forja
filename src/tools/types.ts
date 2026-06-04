@@ -1,5 +1,6 @@
 import type { BgManager } from '../bg/index.ts';
 import type { Broker } from '../broker/index.ts';
+import type { FileDiff } from '../diff/line-diff.ts';
 import type { HookChainResult, HookEventPayload } from '../hooks/index.ts';
 import type { MemoryRegistry } from '../memory/index.ts';
 import type {
@@ -390,6 +391,12 @@ export interface ToolContext {
   // shot SDK without an event sink), the call is a no-op and the
   // tool's normal output remains the only carrier.
   emitWarn?: (message: string) => void;
+  // Display-only structured diff (before→after) for a write/edit tool.
+  // Routed to the TUI card via a `tool_diff` HarnessEvent; deliberately
+  // NOT in the model-facing tool_result. Optional like emitWarn — tools
+  // that produce no diff just don't call it; headless/SDK contexts omit
+  // it.
+  emitDiff?: (diff: FileDiff) => void;
   // Hook chain dispatch — generic per-event funnel built in the
   // harness loop. Tools fire blocking events (MemoryWrite, future
   // event-bearing tools) and inspect `blockedBy` on the result.
@@ -563,6 +570,7 @@ export const ERROR_CODES = {
   readFailed: 'fs.read_failed',
   writeFailed: 'fs.write_failed',
   invalidPath: 'fs.invalid_path',
+  binaryFile: 'fs.binary',
   ambiguousMatch: 'edit.ambiguous_match',
   oldStringNotFound: 'edit.old_string_not_found',
   oldEqualsNew: 'edit.old_equals_new',

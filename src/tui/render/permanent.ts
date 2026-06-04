@@ -10,6 +10,7 @@
 // The reducer in `state.ts` builds the `PermanentItem` records and
 // never sees `caps`.
 
+import { sanitizeOneLineForDisplay } from '../../sanitize/ansi.ts';
 import type { PermanentItem } from '../state.ts';
 import { type Capabilities, paint, paintMulti, reverse } from '../term.ts';
 import { formatChipDuration, formatCoarseDuration } from './duration.ts';
@@ -244,7 +245,14 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // match" of grep or a failed `test`, so it flags, not alarms.
       const exitMark =
         item.exitCode !== undefined ? paint(caps, 'warn', `  exit ${item.exitCode}`) : '';
-      const head = `${paint(caps, headTone, headRaw)}${exitMark}${metric}`;
+      // Diff counts (write/edit): +added in success tone, -removed in
+      // error tone, on the head — a GitHub-style summary. ASCII signs so
+      // they read on non-unicode terminals too.
+      const counts =
+        item.diff !== undefined
+          ? `  ${paint(caps, 'success', `+${item.diff.added}`)} ${paint(caps, 'error', `-${item.diff.removed}`)}`
+          : '';
+      const head = `${paint(caps, headTone, headRaw)}${counts}${exitMark}${metric}`;
       // Leading blank (UI.md §6.3) — each tool finalization is its
       // own "session" block; the operator scrolls and sees each tool
       // (chip + sub-content) as a self-contained unit instead of a
@@ -289,6 +297,22 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // glyph stay visually tied to the nested chip head.
       if (subText !== null) {
         lines.push(paint(caps, 'secondary', `${indent}${sub}${subText}`));
+      }
+      // Diff snippet (write/edit): the first changed region under the
+      // card — add in success tone, del in error tone, context dim. Each
+      // line is sanitized (file content is untrusted: strip ANSI/control
+      // and cap width) so it can't hijack the terminal.
+      if (item.diff !== undefined) {
+        for (const dl of item.diff.snippet) {
+          const tone = dl.type === 'add' ? 'success' : dl.type === 'del' ? 'error' : 'dim';
+          const mark = dl.type === 'add' ? '+' : dl.type === 'del' ? '-' : ' ';
+          lines.push(paint(caps, tone, `${indent}  ${mark} ${sanitizeOneLineForDisplay(dl.text)}`));
+        }
+        if (item.diff.hiddenChanges > 0) {
+          lines.push(
+            paint(caps, 'dim', `${indent}  … +${item.diff.hiddenChanges} more changed lines`),
+          );
+        }
       }
       if (item.outputTruncated === true) lines.push(truncationHint(caps, indent));
       return lines.map(padFrame);

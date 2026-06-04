@@ -57,13 +57,14 @@ describe('readFileTool', () => {
     expect(out.content).toBe('hello');
   });
 
-  test('streams large files without materializing the whole content', async () => {
-    // Build a ~6 MB file (200_000 lines of ~30 bytes) and request a tiny
-    // window. Previously, file.text() loaded all 6 MB into a string
-    // before slicing — pagination did nothing for memory. The streaming
-    // path keeps working memory proportional to `limit`. We verify by
-    // asserting the response is small AND total_lines is correct
-    // (proves the rest of the file was traversed only for counting).
+  test('paginates a large file: small window + correct total_lines (not a memory test)', async () => {
+    // A large file with a tiny requested window. This pins PAGINATION
+    // correctness — returned content is bounded by `limit` and
+    // `total_lines` reflects the whole file — and deliberately does NOT
+    // claim anything about memory: the tool loads the entire file via
+    // arrayBuffer (bounded by MAX_FILE_BYTES), so working memory is
+    // proportional to file size, not to `limit`. (The old name implied
+    // streaming; it never measured memory.)
     const path = join(dir, 'huge.txt');
     const lines = Array.from(
       { length: 200_000 },
@@ -166,5 +167,76 @@ describe('readFileTool', () => {
     const out = await readFileTool.execute({ path: 'a.txt', offset: 0 }, makeCtx({ cwd: dir }));
     if (isToolError(out)) throw new Error(`unexpected: ${out.error_message}`);
     expect(out.content).toContain('hello');
+  });
+
+  // Binary detection (TOOL_ERGONOMICS §3: "Read tool detecta
+  // automaticamente"). A NUL byte in the leading window is the
+  // is-binary signal — refuse instead of decoding to mojibake.
+  test('refuses a binary file (NUL byte) with fs.binary', async () => {
+    const path = join(dir, 'icon.bin');
+    // PNG-style header with a NUL at offset 4.
+    writeFileSync(path, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x1a, 0x0a, 0x00]));
+    const out = await readFileTool.execute({ path }, makeCtx({ cwd: dir }));
+    if (!isToolError(out)) throw new Error('expected binary refusal');
+    expect(out.error_code).toBe('fs.binary');
+    expect(out.details?.nul_offset).toBe(4);
+  });
+
+  test('reads UTF-8 text with multibyte chars (no binary false positive)', async () => {
+    const path = join(dir, 'unicode.txt');
+    writeFileSync(path, 'café ☕ 🚀\nsegunda linha');
+    const out = await readFileTool.execute({ path }, makeCtx({ cwd: dir }));
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.content).toBe('café ☕ 🚀\nsegunda linha');
+    expect(out.total_lines).toBe(2);
+  });
+
+  test('strips a leading UTF-8 BOM (decode parity with file.text/edit_file)', async () => {
+    const path = join(dir, 'bom.txt');
+    // EF BB BF = UTF-8 BOM, then "hi". No NUL, so not binary. The BOM
+    // is stripped (TextDecoder's default), matching the file.text()
+    // this replaced and edit_file's reader (which also strips it).
+    writeFileSync(path, Buffer.from([0xef, 0xbb, 0xbf, 0x68, 0x69]));
+    const out = await readFileTool.execute({ path }, makeCtx({ cwd: dir }));
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.content).toBe('hi');
+  });
+
+  test('NUL beyond the scan window is not flagged (bounded 8000-byte scan)', async () => {
+    const path = join(dir, 'late-nul.txt');
+    // 8000 bytes of short text lines (no NUL in the scan window), then
+    // a NUL at byte 8000 — just past the bound. Documents the
+    // deliberate git-style cutoff: the head is conclusive, we do not
+    // scan the whole file, so this reads through rather than refusing.
+    const head = `${'a'.repeat(79)}\n`.repeat(100); // exactly 8000 bytes
+    writeFileSync(path, Buffer.concat([Buffer.from(head, 'utf8'), Buffer.from([0x00])]));
+    const out = await readFileTool.execute({ path }, makeCtx({ cwd: dir }));
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.content.includes('\u0000')).toBe(true);
+  });
+
+  test('returns fs.is_directory when the path is a directory', async () => {
+    // `dir` (from beforeEach) is a real directory; reading it must not
+    // masquerade as fs.not_found.
+    const out = await readFileTool.execute({ path: dir }, makeCtx({ cwd: dir }));
+    if (!isToolError(out)) throw new Error('expected directory refusal');
+    expect(out.error_code).toBe('fs.is_directory');
+  });
+
+  test('caps total output bytes — large window trims lines and marks truncated', async () => {
+    const path = join(dir, 'verbose.txt');
+    // 1500 lines of ~1000 chars (~1.5 MB): far above the output byte cap,
+    // but each line is under the per-line cap and the count is under the
+    // per-call cap, so only the byte cap can trim this.
+    const lines = Array.from({ length: 1500 }, () => 'x'.repeat(1000));
+    writeFileSync(path, lines.join('\n'));
+    const out = await readFileTool.execute({ path }, makeCtx({ cwd: dir }));
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.total_lines).toBe(1500);
+    expect(out.lines_returned).toBeLessThan(1500);
+    expect(out.lines_returned).toBeGreaterThan(50);
+    expect(out.truncated).toBe(true);
+    // Pins the current 256 KiB cap — content bytes never exceed it.
+    expect(Buffer.byteLength(out.content, 'utf8')).toBeLessThanOrEqual(256 * 1024);
   });
 });

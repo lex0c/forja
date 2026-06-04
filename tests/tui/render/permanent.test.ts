@@ -1415,3 +1415,80 @@ describe('formatPermanent', () => {
     });
   });
 });
+
+describe('formatPermanent — diff snippet (write/edit cards)', () => {
+  test('renders +N/-N counts on the head and a colored snippet under the card', () => {
+    const out = formatPermanent(
+      {
+        kind: 'tool-end',
+        name: 'edit_file',
+        verb: 'Edited file',
+        subject: 'src/a.ts',
+        status: 'done',
+        durationMs: 10,
+        diff: {
+          added: 1,
+          removed: 1,
+          snippet: [
+            { type: 'ctx', text: 'a' },
+            { type: 'del', text: 'b' },
+            { type: 'add', text: 'B' },
+            { type: 'ctx', text: 'c' },
+          ],
+          hiddenChanges: 0,
+        },
+      },
+      ascii,
+    );
+    const joined = out.join('\n');
+    expect(joined).toContain('+1');
+    expect(joined).toContain('-1');
+    expect(out.some((l) => l.includes('- b'))).toBe(true);
+    expect(out.some((l) => l.includes('+ B'))).toBe(true);
+  });
+
+  test('summarizes changes beyond the snippet via the hidden-changes tail', () => {
+    const out = formatPermanent(
+      {
+        kind: 'tool-end',
+        name: 'write_file',
+        verb: 'Wrote file',
+        subject: 'src/b.ts',
+        status: 'done',
+        durationMs: 5,
+        diff: {
+          added: 10,
+          removed: 0,
+          snippet: [{ type: 'add', text: 'first' }],
+          hiddenChanges: 9,
+        },
+      },
+      ascii,
+    );
+    expect(out.join('\n')).toContain('+9 more changed lines');
+  });
+
+  test('sanitizes file-content lines (ANSI/control stripped) before render', () => {
+    const esc = String.fromCharCode(27); // build the raw ESC byte at runtime
+    const out = formatPermanent(
+      {
+        kind: 'tool-end',
+        name: 'edit_file',
+        verb: 'Edited file',
+        subject: 'src/c.ts',
+        status: 'done',
+        durationMs: 5,
+        diff: {
+          added: 1,
+          removed: 0,
+          snippet: [{ type: 'add', text: `${esc}[31mhack${esc}[0m` }],
+          hiddenChanges: 0,
+        },
+      },
+      ascii,
+    );
+    const joined = out.join('\n');
+    expect(joined).toContain('hack');
+    expect(joined.includes(esc)).toBe(false); // no escape sequence leaked through
+  });
+});
