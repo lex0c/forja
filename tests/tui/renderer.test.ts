@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { createBus } from '../../src/tui/bus.ts';
 import type { UIEvent } from '../../src/tui/events.ts';
-import { createRenderer } from '../../src/tui/renderer.ts';
+import { createRenderer, physicalCursorRowAfterRewrap } from '../../src/tui/renderer.ts';
 import type { LiveState } from '../../src/tui/state.ts';
 import { CSI, type Capabilities, type FrameSchedulerOptions } from '../../src/tui/term.ts';
 
@@ -654,6 +654,162 @@ describe('renderer wiring', () => {
     // synchronously — composeLive saw the new width.
     expect(lastCols).toBe(120);
     r.close();
+  });
+
+  test('shrink resize takes the full erase path (clearDown), not a differential redraw', () => {
+    // Regression: on resize the terminal RE-WRAPS the already-drawn rows
+    // to the new width. The buggy path stayed differential (same logical
+    // line count → per-line clearLine, NO clearDown), so the re-wrapped
+    // full-width rules/footer were left on screen — visibly duplicated.
+    // The fix forces the full erase+draw path on resize.
+    const bus = createBus();
+    const sink = makeSink();
+    const listenerRef: { current: (() => void) | null } = { current: null };
+    const stream = {
+      columns: 80,
+      rows: 24,
+      on(_event: 'resize', l: () => void) {
+        listenerRef.current = l;
+      },
+      off() {
+        listenerRef.current = null;
+      },
+    };
+    // Two full-width rules around a body — each rule wraps to 2 physical
+    // rows when the width halves, which is exactly what trips the erase.
+    const composeLive = (_s: LiveState, c: { cols: number }): string[] => [
+      '-'.repeat(c.cols),
+      'body',
+      '-'.repeat(c.cols),
+    ];
+    const r = createRenderer({
+      bus,
+      caps: { ...caps, cols: 80 },
+      write: sink.write,
+      composeLive,
+      resizeStream: stream,
+      schedulerOptions: makeSchedulerOptions().options,
+      bracketedPaste: false,
+    });
+    bus.emit(sessionStart);
+    r.redraw();
+    const before = sink.writes.length;
+    stream.columns = 40;
+    stream.rows = 24;
+    listenerRef.current?.();
+    const resizeOutput = sink.writes.slice(before).join('');
+    // clearDown (CSI J) is emitted ONLY by the full-erase path; the
+    // differential path uses per-line clearLine (CSI 2K). Its presence
+    // proves the resize repainted from scratch.
+    expect(resizeOutput).toContain(`${CSI}J`);
+    // ...and repainted at the new width.
+    expect(resizeOutput).toContain('-'.repeat(40));
+    r.close();
+  });
+
+  test('shrink resize erases the PHYSICAL row count, end-to-end (not the logical cursorRow)', () => {
+    // The test above proves the full-erase path runs; this proves the
+    // erase walks the PHYSICAL distance. A regression reverting buildErase
+    // to `cursorUp(cursorRow)` (the logical count) passes that test but
+    // FAILS here. Two renders with IDENTICAL layout except row 0 — one a
+    // full-width rule (wraps to 2 physical rows when the width halves),
+    // one short (stays 1) — with the cursor parked well below row 0. The
+    // wide case's erase must walk exactly ONE physical row deeper.
+    const eraseUpRows = (firstLine: (cols: number) => string): number => {
+      const bus = createBus();
+      const sink = makeSink();
+      const listenerRef: { current: (() => void) | null } = { current: null };
+      const stream = {
+        columns: 80,
+        rows: 24,
+        on(_event: 'resize', l: () => void) {
+          listenerRef.current = l;
+        },
+        off() {
+          listenerRef.current = null;
+        },
+      };
+      // 10 logical lines so composeCursor parks the input row well below
+      // row 0 (cursorRow > 0), making row 0 part of the erase walk.
+      const composeLive = (_s: LiveState, c: { cols: number }): string[] => [
+        firstLine(c.cols),
+        ...Array.from({ length: 9 }, (_v, i) => `line${i}`),
+      ];
+      const r = createRenderer({
+        bus,
+        caps: { ...caps, cols: 80 },
+        write: sink.write,
+        composeLive,
+        resizeStream: stream,
+        schedulerOptions: makeSchedulerOptions().options,
+        bracketedPaste: false,
+      });
+      bus.emit(sessionStart);
+      r.redraw();
+      const before = sink.writes.length;
+      stream.columns = 40;
+      stream.rows = 24;
+      listenerRef.current?.();
+      const frame = sink.writes.slice(before).join('');
+      r.close();
+      // The erase is `\r` + cursorUp(N) (`${CSI}${N}A`) + clearDown
+      // (`${CSI}J`); cursorUp is omitted when N is 0. Find the unique
+      // `A${CSI}J` boundary (the differential path never emits CSI J) and
+      // read the digits of N immediately before the `A`. (No ESC literal
+      // in a regex — uses the imported CSI constant.)
+      const at = frame.indexOf(`A${CSI}J`);
+      if (at === -1) return 0;
+      let j = at;
+      // Walk back over the ASCII digits of N (codes 48..57).
+      while (j > 0) {
+        const code = frame.charCodeAt(j - 1);
+        if (code < 48 || code > 57) break;
+        j -= 1;
+      }
+      return Number(frame.slice(j, at));
+    };
+    const wide = eraseUpRows((cols) => '-'.repeat(cols));
+    const short = eraseUpRows(() => 'x');
+    // Sanity: the cursor really is below row 0 (otherwise row 0 wouldn't
+    // be in the erase walk and the comparison would be vacuous).
+    expect(short).toBeGreaterThanOrEqual(1);
+    // The wide row 0 wraps to 2 physical rows at the halved width, the
+    // short stays 1; everything else identical → exactly one row deeper.
+    expect(wide).toBe(short + 1);
+  });
+
+  describe('physicalCursorRowAfterRewrap (resize re-wrap math)', () => {
+    test('counts wrapped physical rows above the cursor at the new width', () => {
+      // 3 logical lines, cursor on the last (row 2). Shrink 80 → 40:
+      //   row 0: 80-wide rule → ceil(80/40) = 2 physical rows
+      //   row 1: 5-wide       → 1
+      // physical rows above cursor = 3 (vs the LOGICAL cursorRow of 2).
+      const prev = ['A'.repeat(80), 'short', '> input'];
+      expect(physicalCursorRowAfterRewrap(prev, 2, 7, 40)).toBe(3);
+    });
+
+    test('adds the cursor sub-row within its own wrapped line', () => {
+      // cursor on row 1 at column 50; at width 40 that column sits on the
+      // line's 2nd physical sub-row (floor(50/40) = 1). Row 0 (60) → 2.
+      const prev = ['B'.repeat(60), 'C'.repeat(70)];
+      expect(physicalCursorRowAfterRewrap(prev, 1, 50, 40)).toBe(2 + 1);
+    });
+
+    test('degrades to cursorRow on a widen / no-wrap (no over-erase)', () => {
+      const prev = ['x'.repeat(30), 'y'.repeat(20), '> in'];
+      // newCols 80 > every line width and cursorCol < 80 → equals cursorRow.
+      expect(physicalCursorRowAfterRewrap(prev, 2, 4, 80)).toBe(2);
+    });
+
+    test('counts full-width (CJK) glyphs by visual width, not code units', () => {
+      // 30 double-width chars = 60 visual cols → ceil(60/40) = 2 at width 40.
+      const prev = ['漢'.repeat(30), '> in'];
+      expect(physicalCursorRowAfterRewrap(prev, 1, 0, 40)).toBe(2);
+    });
+
+    test('newCols <= 0 falls back to cursorRow (defensive)', () => {
+      expect(physicalCursorRowAfterRewrap(['a', 'b'], 1, 0, 0)).toBe(1);
+    });
   });
 
   test('resizeStream: false disables the watcher', () => {

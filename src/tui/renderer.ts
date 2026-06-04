@@ -37,7 +37,7 @@ import type { UIEvent } from './events.ts';
 import { type Heartbeat, type HeartbeatOptions, createHeartbeat } from './heartbeat.ts';
 import { composeCursor, composeLive as defaultComposeLiveFn } from './render/compose.ts';
 import { formatPermanent } from './render/permanent.ts';
-import { truncateToWidth } from './render/width.ts';
+import { truncateToWidth, visualWidth } from './render/width.ts';
 import type { ComposeLive } from './renderer-types.ts';
 import {
   type ApplyResult,
@@ -204,6 +204,34 @@ export interface Renderer {
   close: () => void;
 }
 
+// How many PHYSICAL rows the cursor sits below the live region's top
+// after the terminal re-wraps the last frame to `newCols`. The live
+// region was drawn with each line truncated to the OLD width (1 logical
+// == 1 physical), but on a resize the terminal re-wraps the already-
+// drawn rows to the new width — a full-width line (input rule, footer)
+// becomes `ceil(width / newCols)` physical rows. The erase must walk
+// the PHYSICAL distance, not `cursorRow`, or it leaves the old rows
+// behind (duplicated rules/footer). Pure + exported for testing.
+//
+// Degrades correctly: when `newCols >= every line's width` (a widen, or
+// no real change), every term is 1 and `cursorCol < newCols`, so the
+// result equals `cursorRow` — no over-erase.
+export const physicalCursorRowAfterRewrap = (
+  prevLines: readonly string[],
+  cursorRow: number,
+  cursorCol: number,
+  newCols: number,
+): number => {
+  if (newCols <= 0) return cursorRow;
+  let physUp = 0;
+  const upTo = Math.min(cursorRow, prevLines.length);
+  for (let i = 0; i < upTo; i++) {
+    physUp += Math.max(1, Math.ceil(visualWidth(prevLines[i] ?? '') / newCols));
+  }
+  // Sub-row of the cursor within its own (now-wrapped) logical line.
+  return physUp + Math.floor(Math.max(0, cursorCol) / newCols);
+};
+
 export const createRenderer = (options: RendererOptions): Renderer => {
   const {
     bus,
@@ -250,6 +278,16 @@ export const createRenderer = (options: RendererOptions): Renderer => {
   // inline positioning fires, this matches the cursor row so erase
   // walks the right number of lines back to row 0.
   let cursorRow = 0;
+  // Visual column the cursor landed on in the last frame (the input
+  // cursor's column, from composeCursor). Only read by the resize
+  // handler: when the terminal re-wraps, the cursor's logical line may
+  // wrap too, so its physical sub-row is `floor(cursorCol / newCols)`.
+  let cursorCol = 0;
+  // Set by the resize handler to the number of PHYSICAL rows the old
+  // live region's cursor sits below its top, computed at the NEW width.
+  // `buildErase` consumes it (once) instead of `cursorRow` so the erase
+  // walks the right number of re-wrapped rows. See the resize watcher.
+  let pendingResizeEraseRows: number | null = null;
   // Last frame's truncated lines, kept so the next redraw can diff
   // line-by-line and only emit what changed (UI.md §2.2). Without
   // this every keystroke under key repeat would repaint the static
@@ -302,12 +340,21 @@ export const createRenderer = (options: RendererOptions): Renderer => {
   // the terminal's POV.
 
   const buildErase = (): string => {
-    if (liveHeight === 0) return '';
-    // \r → col 0; cursorUp(cursorRow) → row 0 of live region;
-    // clearDown wipes everything below. cursorRow may be < liveHeight-1
-    // when inline cursor positioning moved the cursor into the input
-    // buffer mid-frame.
-    const s = `\r${cursorUp(cursorRow)}${clearDown}`;
+    if (liveHeight === 0) {
+      // Nothing drawn, but still drop a stale resize-erase request so it
+      // can't bleed into a later, unrelated frame.
+      pendingResizeEraseRows = null;
+      return '';
+    }
+    // \r → col 0; cursorUp(N) → row 0 of live region; clearDown wipes
+    // everything below. Normally N = cursorRow (logical == physical rows
+    // because each line is truncated to fit the width, so nothing wraps).
+    // After a resize the terminal RE-WRAPPED the already-drawn region to
+    // the new width, so logical != physical; the handler computed the
+    // real physical distance and parked it in `pendingResizeEraseRows`.
+    const upRows = pendingResizeEraseRows ?? cursorRow;
+    pendingResizeEraseRows = null;
+    const s = `\r${cursorUp(upRows)}${clearDown}`;
     liveHeight = 0;
     return s;
   };
@@ -333,6 +380,17 @@ export const createRenderer = (options: RendererOptions): Renderer => {
       const linesUp = truncated.length - 1 - cursor.row;
       s += `${cursorUp(linesUp)}\r${cursorForward(cursor.col)}`;
       cursorRow = cursor.row;
+      cursorCol = cursor.col;
+    } else {
+      // No inline target (modal): the cursor would drift to the END of
+      // the last line after the join. Park it at col 0 (it's hidden
+      // during a modal anyway) so the recorded `cursorCol` is
+      // deterministic and the resize-erase math — which reads cursorCol
+      // for the cursor's wrapped sub-row — matches reality. Both null
+      // branches (here and in buildDifferentialDraw) MUST agree, or a
+      // resize after a modal frame mis-counts the physical erase.
+      s += '\r';
+      cursorCol = 0;
     }
     return s;
   };
@@ -370,19 +428,21 @@ export const createRenderer = (options: RendererOptions): Renderer => {
       }
       buf += `\r${cursorForward(cursor.col)}`;
       cursorRow = cursor.row;
+      cursorCol = cursor.col;
     } else {
-      // No cursor target (modal up) → land at the bottom row of the
-      // live region. We don't bother positioning to end-of-line like
-      // the full-draw path does (where the join's natural drift puts
-      // the cursor at the last line's end column) — the next frame's
-      // erase only consumes `cursorRow`, and its leading `\r` resets
-      // col 0 before the cursor-up walk. So col 0 vs end-of-line is
-      // observationally identical.
+      // No cursor target (modal up) → land at col 0 of the bottom row of
+      // the live region. The trailing `\r` makes the recorded
+      // `cursorCol = 0` ACCURATE: the resize-erase math reads cursorCol
+      // for the cursor's wrapped sub-row, so the cursor must really be at
+      // col 0 (without the `\r` it keeps the last write's column and a
+      // modal resize mis-counts). Mirrors the full-draw null branch.
       const target = truncated.length - 1;
       if (curRow !== target) {
         buf += cursorDown(target - curRow);
       }
+      buf += '\r';
       cursorRow = target;
+      cursorCol = 0;
     }
     return buf;
   };
@@ -676,6 +736,29 @@ export const createRenderer = (options: RendererOptions): Renderer => {
     options.resizeStream === false ? null : createResizeWatcher(options.resizeStream ?? undefined);
   const unsubscribeResize = watcher
     ? watcher.onResize(({ cols, rows }) => {
+        // Re-wrap correction. The terminal re-wraps the ALREADY-DRAWN
+        // live region to the new width BEFORE we redraw. Our counters
+        // (`cursorRow`/`liveHeight`) are logical lines — 1 logical == 1
+        // physical only because each line was truncated to the OLD width.
+        // After a shrink, full-width rows (the input rules, the footer)
+        // wrap to 2+ physical rows, so the normal erase (`cursorUp(
+        // cursorRow)`) walks too few physical rows and leaves the old
+        // rules/footer on screen — the operator sees them duplicated.
+        //
+        // Compute how many PHYSICAL rows the cursor sits below the live
+        // region's top AT THE NEW WIDTH, from the last frame's content,
+        // and hand it to `buildErase` for the next frame. Reset
+        // `prevLines` so the redraw takes the full-draw (erase) path
+        // rather than the differential one (which never erases).
+        if (cols > 0 && liveHeight > 0 && prevLines.length > 0) {
+          pendingResizeEraseRows = physicalCursorRowAfterRewrap(
+            prevLines,
+            cursorRow,
+            cursorCol,
+            cols,
+          );
+          prevLines = [];
+        }
         liveCaps.cols = cols;
         liveCaps.rows = rows;
         scheduler.flush();
