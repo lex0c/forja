@@ -258,7 +258,10 @@ describe('writeMemory — atomicity', () => {
     const { readdirSync } = require('node:fs') as typeof import('node:fs');
     const files = readdirSync(roots.projectLocal);
     for (const f of files) {
-      expect(f).not.toContain('.tmp-');
+      // The shared atomic writer's temp is `.<slug>.<uuid>.tmp` — match
+      // the `.tmp` suffix, not the old memory-local `.tmp-` infix, or
+      // this guard passes vacuously and misses a real orphan.
+      expect(f.endsWith('.tmp')).toBe(false);
     }
   });
 });

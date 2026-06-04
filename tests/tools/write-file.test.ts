@@ -1,5 +1,15 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { writeFileTool } from '../../src/tools/builtin/write-file.ts';
@@ -77,5 +87,46 @@ describe('writeFileTool', () => {
     const out = await writeFileTool.execute({ path, content: exactCap }, makeCtx({ cwd: dir }));
     expect(isToolError(out)).toBe(false);
     if (!isToolError(out)) expect(out.bytes_written).toBe(10 * 1024 * 1024);
+  });
+
+  test('refuses a directory target with fs.is_directory', async () => {
+    const out = await writeFileTool.execute({ path: dir, content: 'x' }, makeCtx({ cwd: dir }));
+    if (!isToolError(out)) throw new Error('expected directory refusal');
+    expect(out.error_code).toBe('fs.is_directory');
+  });
+
+  test('atomic overwrite preserves the file mode (executable bit kept)', async () => {
+    const path = join(dir, 'script.sh');
+    await Bun.write(path, '#!/bin/sh\necho old\n');
+    chmodSync(path, 0o755);
+    const out = await writeFileTool.execute(
+      { path, content: '#!/bin/sh\necho new\n' },
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(readFileSync(path, 'utf-8')).toBe('#!/bin/sh\necho new\n');
+    // Mode survives the temp+rename (a naive new inode would reset it).
+    expect(statSync(path).mode & 0o777).toBe(0o755);
+  });
+
+  test('atomic overwrite leaves no temp file behind', async () => {
+    const path = join(dir, 'c.txt');
+    await Bun.write(path, 'old');
+    const out = await writeFileTool.execute({ path, content: 'new' }, makeCtx({ cwd: dir }));
+    if (isToolError(out)) throw new Error('unexpected error');
+    // Only the target remains — the temp was renamed away, not left.
+    expect(readdirSync(dir)).toEqual(['c.txt']);
+  });
+
+  test('writes through a symlink to its target (link preserved)', async () => {
+    const target = join(dir, 'real.txt');
+    const link = join(dir, 'link.txt');
+    await Bun.write(target, 'old');
+    symlinkSync(target, link);
+    const out = await writeFileTool.execute({ path: link, content: 'new' }, makeCtx({ cwd: dir }));
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    // Target content updated; link is still a symlink (not replaced).
+    expect(readFileSync(target, 'utf-8')).toBe('new');
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
   });
 });

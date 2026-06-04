@@ -1,4 +1,5 @@
 import { isAbsolute, resolve } from 'node:path';
+import { atomicWrite } from '../../fs/atomic-write.ts';
 import { ERROR_CODES, type Tool, type ToolError, type ToolResult, toolError } from '../types.ts';
 
 // Single replacement operation. Same shape the tool used to take at
@@ -451,7 +452,7 @@ export const editFileTool: Tool<EditFileInput, EditFileOutput> = {
     }
 
     try {
-      const bytes = await Bun.write(abs, working);
+      const bytes = atomicWrite(abs, working);
       return {
         path: args.path,
         edits: results,

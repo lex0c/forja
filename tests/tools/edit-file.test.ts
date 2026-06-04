@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { editFileTool } from '../../src/tools/builtin/edit-file.ts';
@@ -624,5 +624,21 @@ describe('editFileTool — whitespace-tolerant fallback + actionable errors', ()
     expect(readFileSync(path, 'utf-8')).toBe(
       ['foo() {', '    a();', '  weird();', '}', ''].join('\n'),
     );
+  });
+});
+
+describe('editFileTool — atomic write', () => {
+  test('preserves the executable bit on edit (atomic temp+rename keeps mode)', async () => {
+    const path = join(dir, 'run.sh');
+    writeFileSync(path, '#!/bin/sh\necho 1\n');
+    chmodSync(path, 0o755);
+    const out = await editFileTool.execute(
+      { path, edits: [{ old_string: 'echo 1', new_string: 'echo 2' }] },
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(readFileSync(path, 'utf-8')).toBe('#!/bin/sh\necho 2\n');
+    // A naive new-inode rename would reset this to the default mode.
+    expect(statSync(path).mode & 0o777).toBe(0o755);
   });
 });

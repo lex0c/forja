@@ -1,5 +1,6 @@
-import { mkdirSync } from 'node:fs';
-import { dirname, isAbsolute, resolve } from 'node:path';
+import { statSync } from 'node:fs';
+import { isAbsolute, resolve } from 'node:path';
+import { atomicWrite } from '../../fs/atomic-write.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 
 export interface WriteFileInput {
@@ -67,12 +68,26 @@ export const writeFileTool: Tool<WriteFileInput, WriteFileOutput> = {
       );
     }
     const abs = isAbsolute(args.path) ? args.path : resolve(ctx.cwd, args.path);
+    // Refuse a directory target with the dedicated code. `Bun.file(dir)
+    // .exists()` is false, so without this the write falls through to a
+    // generic EISDIR `write_failed`; `fs.is_directory` is the honest
+    // signal (mirrors read_file).
+    try {
+      if (statSync(abs).isDirectory()) {
+        return toolError(ERROR_CODES.isDirectory, `path is a directory, not a file: ${args.path}`, {
+          hint: 'Provide a file path, not a directory.',
+          details: { resolved: abs },
+        });
+      }
+    } catch {
+      // Doesn't exist yet — fine, write_file creates it.
+    }
     const file = Bun.file(abs);
     const created = !(await file.exists());
 
     try {
-      mkdirSync(dirname(abs), { recursive: true });
-      const bytes = await Bun.write(abs, args.content);
+      // atomicWrite creates parent directories as needed.
+      const bytes = atomicWrite(abs, args.content);
       return { path: args.path, bytes_written: bytes, created };
     } catch (e) {
       return toolError(
