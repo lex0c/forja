@@ -48,11 +48,31 @@ import { basename, dirname, join } from 'node:path';
 //     inode-keyed FS watcher sees a rename, not a modify. Standard
 //     atomic-save trade-off, acceptable for source-file editing.
 
-// Cap on the basename slice embedded in the temp name. NAME_MAX is 255
-// bytes on common filesystems and the suffix (`.` + uuid + `.tmp`) is
-// ~42 bytes, so 128 keeps the temp name well under the limit even for a
-// long filename while leaving orphans recognizable.
-const TEMP_BASENAME_CAP = 128;
+// Cap (in BYTES) on the basename slice embedded in the temp name.
+// NAME_MAX is 255 bytes on common filesystems but as low as ~143 on
+// some (eCryptfs); the fixed suffix (two dots + a uuid + `.tmp`) is
+// ~42 bytes, so 80 keeps the whole temp name well under any of these
+// while leaving an orphan recognizable. The cap is on ENCODED BYTES,
+// not JS string length — a 240-byte non-ASCII filename is only ~80
+// UTF-16 units, so a code-unit slice could still produce a temp name
+// over NAME_MAX (openSync → ENAMETOOLONG) for a file the direct write
+// path handled.
+const TEMP_BASENAME_BYTE_CAP = 80;
+
+// Truncate `s` to at most `maxBytes` of UTF-8 WITHOUT splitting a
+// multibyte character — back the cut point off any trailing UTF-8
+// continuation byte (0b10xxxxxx). Exported for unit testing.
+export const truncateUtf8 = (s: string, maxBytes: number): string => {
+  const buf = Buffer.from(s, 'utf8');
+  if (buf.length <= maxBytes) return s;
+  let end = maxBytes;
+  while (end > 0) {
+    const byte = buf[end];
+    if (byte === undefined || (byte & 0xc0) !== 0x80) break;
+    end -= 1;
+  }
+  return buf.toString('utf8', 0, end);
+};
 
 // Drive a partial-write-safe write loop: `write(offset)` performs one
 // write starting at `offset` and returns the bytes ACTUALLY written. A
@@ -79,7 +99,7 @@ export const atomicWrite = (absPath: string, content: string): number => {
   const buf = Buffer.from(content, 'utf8');
   const tmp = join(
     dirname(target),
-    `.${basename(target).slice(0, TEMP_BASENAME_CAP)}.${crypto.randomUUID()}.tmp`,
+    `.${truncateUtf8(basename(target), TEMP_BASENAME_BYTE_CAP)}.${crypto.randomUUID()}.tmp`,
   );
   mkdirSync(dirname(target), { recursive: true });
   let fd: number | undefined;
@@ -101,6 +121,25 @@ export const atomicWrite = (absPath: string, content: string): number => {
     closeSync(fd);
     fd = undefined;
     renameSync(tmp, target);
+    // fsync the PARENT DIRECTORY so the rename is itself crash-durable.
+    // Fsyncing the temp made its CONTENTS durable, but the directory
+    // entry that publishes the new name (and drops the temp) lives in
+    // the parent's metadata — without this, a power loss right after a
+    // successful rename can lose the new name or resurrect the old entry
+    // even though we returned success. Best-effort: the rename already
+    // succeeded, so a dir-fsync failure (a platform/filesystem that
+    // won't fsync a directory) must NOT fail a write that physically
+    // happened — it only forgoes the extra durability.
+    try {
+      const dirFd = openSync(dirname(target), 'r');
+      try {
+        fsyncSync(dirFd);
+      } finally {
+        closeSync(dirFd);
+      }
+    } catch {
+      // directory fsync unsupported here — the write still succeeded
+    }
     return buf.byteLength;
   } catch (e) {
     if (fd !== undefined) {

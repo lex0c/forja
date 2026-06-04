@@ -2,6 +2,22 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-03] atomic-write: cap temp basename by UTF-8 bytes, not UTF-16 units
+
+**Finding (review follow-up).** The NAME_MAX guard on the temp name used `basename.slice(0, 128)` — 128 UTF-16 CODE UNITS, not bytes. A valid long non-ASCII filename (e.g. 240 UTF-8 bytes ≈ 80 multibyte chars) passes a 128-unit slice untouched and the temp `.${name}.${uuid}.tmp` blows past NAME_MAX → `openSync` ENAMETOOLONG → write_file/edit_file can't modify a file the prior direct-write path handled. (A UTF-16 slice could also split a surrogate pair.)
+
+**Fix.** Enforce the cap on ENCODED bytes via `truncateUtf8(s, maxBytes)`, which truncates to a byte budget and backs the cut off any UTF-8 continuation byte so a multibyte char is never split. Budget set to 80 bytes (the fixed suffix is ~42; the whole temp name stays well under even the ~143-byte NAME_MAX of eCryptfs).
+
+**Tests.** `tests/fs/atomic-write.test.ts`: `truncateUtf8` leaves short strings, truncates ASCII to the byte budget, never splits a 3-byte (`中`) or 4-byte (`🚀`) char and stays within budget, and caps a 600-byte name to ≤ 80 bytes. Verification: `tests/fs/atomic-write.test.ts` 9 pass + write/edit/memory regression 55 pass; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
+## [2026-06-03] atomic-write: fsync the parent directory after rename
+
+**Finding (review follow-up).** `atomic-write` fsynced the temp file (durable contents) and renamed it over the target, but did NOT fsync the parent directory afterward. The rename updates a directory entry that lives in the parent dir's metadata; without fsyncing `dirname(target)`, a power loss right after a successful rename can lose the new name or resurrect the old entry — even though the tool returned success. The temp fsync covers contents, not the rename. Affects every durable-write caller (write_file, edit_file, memory) in exactly the crash scenario the helper targets.
+
+**Fix.** After the rename, open `dirname(target)` and fsync it (the POSIX recipe for a crash-durable rename). Best-effort: the rename already succeeded, so a dir-fsync failure (a platform/fs that won't fsync a directory) is swallowed rather than failing a write that physically happened — it only forgoes the extra durability. On Linux (the primary target) fsync of a directory fd flushes the entry.
+
+**Tests.** No dedicated test — directory-fsync durability can only be shown by simulating power loss; the behavior (an extra dir fsync, errors swallowed) is exercised by every write/edit/memory test on a real filesystem, which confirm it doesn't break normal operation. Verification: write/edit/memory-writer 55 + writeAll 4 pass; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
 ## [2026-06-03] atomic-write: handle short writes before the rename
 
 **Finding (review follow-up).** `src/fs/atomic-write.ts` called `writeSync(fd, buf)` once and ignored the return. `writeSync` issues a single `write(2)`, which can return a SHORT count — fewer bytes than requested, WITHOUT throwing — under disk/quota pressure or on a flaky/network filesystem. The helper would then fsync + rename a *truncated* temp over the target: exactly the partial-file corruption the atomic writer exists to prevent, triggered by the very conditions (disk pressure) it most needs to survive.

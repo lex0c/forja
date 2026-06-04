@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { writeAll } from '../../src/fs/atomic-write.ts';
+import { truncateUtf8, writeAll } from '../../src/fs/atomic-write.ts';
 
 // writeAll is the partial-write-safe loop atomicWrite uses. A real local
 // filesystem won't short-write a small buffer, so the loop is tested
@@ -59,5 +59,37 @@ describe('writeAll — partial-write-safe loop', () => {
       'empty',
     );
     expect(called).toBe(false);
+  });
+});
+
+describe('truncateUtf8 — byte-bounded, char-safe truncation', () => {
+  test('returns the string unchanged when within the byte budget', () => {
+    expect(truncateUtf8('hello', 10)).toBe('hello');
+    expect(truncateUtf8('hello', 5)).toBe('hello');
+  });
+
+  test('truncates ASCII to exactly the byte budget', () => {
+    expect(truncateUtf8('abcdefghij', 4)).toBe('abcd');
+  });
+
+  test('never splits a 3-byte char and stays within budget', () => {
+    // '中' is 3 UTF-8 bytes; a 4-byte budget keeps one whole char, not 1⅓.
+    const out = truncateUtf8('中中中', 4);
+    expect(out).toBe('中');
+    expect(Buffer.byteLength(out, 'utf8')).toBeLessThanOrEqual(4);
+  });
+
+  test('never splits a 4-byte char (emoji) at the boundary', () => {
+    // '🚀' is 4 UTF-8 bytes (2 UTF-16 units): a 3-byte budget can't fit it.
+    expect(truncateUtf8('🚀x', 3)).toBe('');
+    expect(truncateUtf8('🚀x', 4)).toBe('🚀');
+  });
+
+  test('caps a long non-ASCII name well under NAME_MAX (the bug this fixes)', () => {
+    // 200 × '中' = 600 UTF-8 bytes but only 200 UTF-16 units — a code-unit
+    // slice(0,128) would leave ~384 bytes. The byte cap keeps it ≤ 80.
+    const slice = truncateUtf8('中'.repeat(200), 80);
+    expect(Buffer.byteLength(slice, 'utf8')).toBeLessThanOrEqual(80);
+    expect(slice).toBe('中'.repeat(26)); // 26 × 3 = 78 bytes; a 27th would hit 81
   });
 });
