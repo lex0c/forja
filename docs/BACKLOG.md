@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-03] atomic-write: preserve dangling symlinks
+
+**Finding (review follow-up).** Symlink resolution used `existsSync(absPath) ? realpathSync(absPath) : absPath`. For a DANGLING symlink (a link created before its target exists), `existsSync` follows the link, finds the target missing, and returns false — so the helper treated the link path as a new regular-file target and the rename then replaced the SYMLINK inode with a regular file. That regresses Bun.write's behavior (follow the link, create its target) for the create-link-then-target workflow.
+
+**Fix.** Resolve with `lstatSync`, which does NOT follow the final component: a symlink (live or dangling) writes to its TARGET (realpathSync for a live chain; `resolve(dirname, readlinkSync)` for a dangling one, so relative targets resolve against the link's directory), preserving the link; a regular existing file or a not-yet-existing path writes directly (the kernel resolves any parent symlinks at open/rename).
+
+**Tests.** `write-file.test.ts`: writing through a dangling symlink (absolute target, and a relative target that resolves against the link dir) creates the target file and leaves the link a symlink; the live-symlink write-through test still passes. Verification: `write-file.test.ts` 12 pass + fs 9 + edit/memory regression; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
 ## [2026-06-03] atomic-write: cap temp basename by UTF-8 bytes, not UTF-16 units
 
 **Finding (review follow-up).** The NAME_MAX guard on the temp name used `basename.slice(0, 128)` — 128 UTF-16 CODE UNITS, not bytes. A valid long non-ASCII filename (e.g. 240 UTF-8 bytes ≈ 80 multibyte chars) passes a 128-unit slice untouched and the temp `.${name}.${uuid}.tmp` blows past NAME_MAX → `openSync` ENAMETOOLONG → write_file/edit_file can't modify a file the prior direct-write path handled. (A UTF-16 slice could also split a surrogate pair.)

@@ -129,4 +129,28 @@ describe('writeFileTool', () => {
     expect(readFileSync(target, 'utf-8')).toBe('new');
     expect(lstatSync(link).isSymbolicLink()).toBe(true);
   });
+
+  test('writes through a DANGLING symlink to create its target, link preserved', async () => {
+    const target = join(dir, 'not-yet.txt'); // does not exist yet
+    const link = join(dir, 'link.txt');
+    symlinkSync(target, link); // dangling — target missing
+    expect(existsSync(target)).toBe(false);
+    const out = await writeFileTool.execute(
+      { path: link, content: 'created' },
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    // The link's target was CREATED; the link is NOT replaced by a file.
+    expect(readFileSync(target, 'utf-8')).toBe('created');
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+  });
+
+  test('dangling symlink with a RELATIVE target resolves against the link dir', async () => {
+    const link = join(dir, 'link.txt');
+    symlinkSync('sub/later.txt', link); // relative + dangling (sub/ absent)
+    const out = await writeFileTool.execute({ path: link, content: 'rel' }, makeCtx({ cwd: dir }));
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(readFileSync(join(dir, 'sub', 'later.txt'), 'utf-8')).toBe('rel');
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+  });
 });

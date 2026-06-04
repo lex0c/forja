@@ -1,17 +1,18 @@
 import {
   closeSync,
-  existsSync,
   fchmodSync,
   fsyncSync,
+  lstatSync,
   mkdirSync,
   openSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   statSync,
   unlinkSync,
   writeSync,
 } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 
 // Canonical atomic, durable file write — the single implementation
 // shared by tools (write_file, edit_file) and the memory subsystem.
@@ -92,10 +93,31 @@ export const writeAll = (write: (offset: number) => number, total: number, label
 };
 
 export const atomicWrite = (absPath: string, content: string): number => {
-  // Follow a symlink to its real target so we replace the target's
-  // content (link preserved), not the link. A path that doesn't exist
-  // yet (new file) has no link to follow — use it as-is.
-  const target = existsSync(absPath) ? realpathSync(absPath) : absPath;
+  // Resolve where the bytes actually go, preserving Bun.write's symlink
+  // semantics. lstat does NOT follow the final component, so it tells a
+  // symlink apart from a regular file even when the link is DANGLING
+  // (existsSync would follow it, report "missing", and we'd then replace
+  // the link inode with a regular file — the bug this guards):
+  //   - symlink, live or dangling → write to its TARGET, link preserved.
+  //     realpathSync resolves a live chain; a dangling link makes it
+  //     throw, so fall back to the immediate target (relative targets
+  //     resolve against the link's directory).
+  //   - regular existing file, or a not-yet-existing path → write there
+  //     directly; the kernel resolves any parent symlinks at open/rename.
+  let target: string;
+  try {
+    if (lstatSync(absPath).isSymbolicLink()) {
+      try {
+        target = realpathSync(absPath);
+      } catch {
+        target = resolve(dirname(absPath), readlinkSync(absPath));
+      }
+    } else {
+      target = absPath;
+    }
+  } catch {
+    target = absPath; // ENOENT — a brand-new file
+  }
   const buf = Buffer.from(content, 'utf8');
   const tmp = join(
     dirname(target),
