@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-04] write/edit diff: skip the empty diff (no `(+0 -0)` card)
+
+**Finding (review of 2b9eb375).** `write_file` has no no-op guard, so overwriting a file with identical content emitted an empty `tool_diff` → the card showed `(+0 -0)` and bypassed tool-end batching for no real change. `edit_file` could hit the same on a change that `splitLines` normalizes away (e.g. only a trailing newline differs, so `working !== original` but the line diff is empty).
+
+**Fix.** Both tools compute the diff and emit only when `added + removed > 0`. Also added the first tool-level tests of the emit channel — `makeCtx` gained an `emitDiff` pass-through, and the tests assert a real change emits one diff with non-zero counts while an identical overwrite emits nothing.
+
+**Tests.** `edit-file.test.ts` + `write-file.test.ts` 49 pass (+2); `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
 ## [2026-06-04] TUI: inline diff on write_file / edit_file cards (counts + colored snippet)
 
 **Finding.** write/edit cards rendered as a generic verb+path chip; the `display: 'diff'` tool metadata was dead (no consumer) and the rich detail `edit_file` returns (replacement counts) was invisible — the operator couldn't see WHAT changed without re-reading.

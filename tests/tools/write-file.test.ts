@@ -12,6 +12,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { FileDiff } from '../../src/diff/line-diff.ts';
 import { writeFileTool } from '../../src/tools/builtin/write-file.ts';
 import { isToolError } from '../../src/tools/types.ts';
 import { makeCtx } from './_helpers.ts';
@@ -169,5 +170,23 @@ describe('writeFileTool', () => {
     expect(readFileSync(leaf, 'utf-8')).toBe('leaf!');
     expect(lstatSync(head).isSymbolicLink()).toBe(true);
     expect(lstatSync(mid).isSymbolicLink()).toBe(true);
+  });
+
+  test('emits a display diff for a real change, but not for a zero-change overwrite', async () => {
+    const path = join(dir, 'a.ts');
+    await Bun.write(path, 'const x = 1;\n');
+    const diffs: FileDiff[] = [];
+    const ctx = makeCtx({ cwd: dir, emitDiff: (d) => diffs.push(d) });
+    // Changed content → exactly one diff with non-zero counts.
+    let out = await writeFileTool.execute({ path, content: 'const x = 2;\n' }, ctx);
+    if (isToolError(out)) throw new Error('unexpected error');
+    expect(diffs).toHaveLength(1);
+    expect(diffs[0]?.added).toBeGreaterThan(0);
+    expect(diffs[0]?.removed).toBeGreaterThan(0);
+    // Overwrite with identical content → empty diff is NOT emitted
+    // (no `(+0 -0)` card, no batch bypass).
+    out = await writeFileTool.execute({ path, content: 'const x = 2;\n' }, ctx);
+    if (isToolError(out)) throw new Error('unexpected error');
+    expect(diffs).toHaveLength(1);
   });
 });

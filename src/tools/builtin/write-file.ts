@@ -94,7 +94,12 @@ export const writeFileTool: Tool<WriteFileInput, WriteFileOutput> = {
     try {
       // atomicWrite creates parent directories as needed.
       const bytes = atomicWrite(abs, args.content);
-      if (ctx.emitDiff !== undefined) ctx.emitDiff(lineDiff(before, args.content));
+      if (ctx.emitDiff !== undefined) {
+        const fileDiff = lineDiff(before, args.content);
+        // Skip an empty diff (overwriting identical content) — it would
+        // render a `(+0 -0)` card and bypass batching for no real change.
+        if (fileDiff.added + fileDiff.removed > 0) ctx.emitDiff(fileDiff);
+      }
       return { path: args.path, bytes_written: bytes, created };
     } catch (e) {
       return toolError(

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { FileDiff } from '../../src/diff/line-diff.ts';
 import { editFileTool } from '../../src/tools/builtin/edit-file.ts';
 import { isToolError } from '../../src/tools/types.ts';
 import { makeCtx } from './_helpers.ts';
@@ -640,5 +641,21 @@ describe('editFileTool — atomic write', () => {
     expect(readFileSync(path, 'utf-8')).toBe('#!/bin/sh\necho 2\n');
     // A naive new-inode rename would reset this to the default mode.
     expect(statSync(path).mode & 0o777).toBe(0o755);
+  });
+});
+
+describe('editFileTool — display diff', () => {
+  test('emits a display diff with the change counts', async () => {
+    const path = join(dir, 'a.ts');
+    writeFileSync(path, 'a\nb\nc\n');
+    const diffs: FileDiff[] = [];
+    const out = await editFileTool.execute(
+      { path, edits: [{ old_string: 'b', new_string: 'B' }] },
+      makeCtx({ cwd: dir, emitDiff: (d) => diffs.push(d) }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(diffs).toHaveLength(1);
+    expect(diffs[0]?.added).toBe(1);
+    expect(diffs[0]?.removed).toBe(1);
   });
 });

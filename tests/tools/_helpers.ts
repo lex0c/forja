@@ -77,6 +77,7 @@ export const makeCtx = (overrides: Partial<ToolContext> = {}): ToolContext => ({
     ? { confirmPinContext: overrides.confirmPinContext }
     : {}),
   ...(overrides.emitWarn !== undefined ? { emitWarn: overrides.emitWarn } : {}),
+  ...(overrides.emitDiff !== undefined ? { emitDiff: overrides.emitDiff } : {}),
   ...(overrides.fireHook !== undefined ? { fireHook: overrides.fireHook } : {}),
   ...(overrides.sandboxProfile !== undefined ? { sandboxProfile: overrides.sandboxProfile } : {}),
   ...(overrides.toolCallId !== undefined ? { toolCallId: overrides.toolCallId } : {}),

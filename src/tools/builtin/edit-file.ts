@@ -459,7 +459,13 @@ export const editFileTool: Tool<EditFileInput, EditFileOutput> = {
       // changed the file — the no-op guard returned earlier. Computed
       // only when a consumer is wired (the `?.` would still evaluate the
       // argument, so gate on the explicit check).
-      if (ctx.emitDiff !== undefined) ctx.emitDiff(lineDiff(original, working));
+      if (ctx.emitDiff !== undefined) {
+        const fileDiff = lineDiff(original, working);
+        // Skip an empty diff (e.g. a change that's only a trailing
+        // newline, which splitLines normalizes away) — it would render a
+        // `(+0 -0)` card and bypass batching for no visible change.
+        if (fileDiff.added + fileDiff.removed > 0) ctx.emitDiff(fileDiff);
+      }
       return {
         path: args.path,
         edits: results,
