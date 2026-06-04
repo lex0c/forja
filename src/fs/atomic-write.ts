@@ -54,6 +54,23 @@ import { basename, dirname, join } from 'node:path';
 // long filename while leaving orphans recognizable.
 const TEMP_BASENAME_CAP = 128;
 
+// Drive a partial-write-safe write loop: `write(offset)` performs one
+// write starting at `offset` and returns the bytes ACTUALLY written. A
+// single write(2) can return a SHORT count (fewer than requested,
+// WITHOUT throwing) under disk/quota pressure or on a network FS, so we
+// loop until `total` bytes are written. A non-positive return means no
+// forward progress (e.g. disk full) — throw rather than spin forever.
+// Exported so the loop is unit-testable without a short-writing FS.
+export const writeAll = (write: (offset: number) => number, total: number, label: string): void => {
+  for (let off = 0; off < total; ) {
+    const n = write(off);
+    if (n <= 0) {
+      throw new Error(`short write: only ${off} of ${total} bytes written to ${label}`);
+    }
+    off += n;
+  }
+};
+
 export const atomicWrite = (absPath: string, content: string): number => {
   // Follow a symlink to its real target so we replace the target's
   // content (link preserved), not the link. A path that doesn't exist
@@ -67,8 +84,13 @@ export const atomicWrite = (absPath: string, content: string): number => {
   mkdirSync(dirname(target), { recursive: true });
   let fd: number | undefined;
   try {
-    fd = openSync(tmp, 'wx'); // 'wx' — never clobber an unexpected temp
-    writeSync(fd, buf);
+    const openedFd = openSync(tmp, 'wx'); // 'wx' — never clobber an unexpected temp
+    fd = openedFd; // track for cleanup in the catch
+    // writeSync issues a single write(2) that can return a SHORT count
+    // (fewer bytes than requested, without throwing) under disk/quota
+    // pressure or on a network FS; writeAll loops until all bytes land,
+    // so a truncated temp is never fsync+renamed over the target.
+    writeAll((off) => writeSync(openedFd, buf, off), buf.length, tmp);
     // Match the target's permission bits if it already exists (keep +x).
     try {
       fchmodSync(fd, statSync(target).mode & 0o777);

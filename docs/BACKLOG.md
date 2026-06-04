@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-03] atomic-write: handle short writes before the rename
+
+**Finding (review follow-up).** `src/fs/atomic-write.ts` called `writeSync(fd, buf)` once and ignored the return. `writeSync` issues a single `write(2)`, which can return a SHORT count — fewer bytes than requested, WITHOUT throwing — under disk/quota pressure or on a flaky/network filesystem. The helper would then fsync + rename a *truncated* temp over the target: exactly the partial-file corruption the atomic writer exists to prevent, triggered by the very conditions (disk pressure) it most needs to survive.
+
+**Fix.** Extracted the write into `writeAll(write, total, label)` — a partial-write-safe loop that calls the writer at advancing offsets until all bytes land, and throws (rather than spinning) if a write makes no forward progress (a non-positive return, e.g. disk full), so the catch cleans up the temp and the original file stays intact. `atomicWrite` drives it via `writeAll((off) => writeSync(fd, buf, off), buf.length, tmp)`. Extracting the loop also makes it unit-testable without a short-writing filesystem (the earlier `mock.module` attempt hung Bun).
+
+**Tests.** New `tests/fs/atomic-write.test.ts`: `writeAll` completes a single full write; loops across repeated short (3-byte) writes until all 10 bytes land; throws `short write` on no-progress (one call, no spin); makes no call for zero-length content. Verification: `tests/fs/atomic-write.test.ts` 4 pass + write/edit/memory-writer regression 55 pass; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
 ## [2026-06-03] write_file / edit_file: atomic durable writes (shared fs helper) + directory guard
 
 **Finding.** Both write tools used `Bun.write` (a plain write(2)): an interrupted write — process death, disk-full, SIGKILL mid-write — can leave a PARTIAL file. The git checkpoint holds the pre-write content, but the on-disk file is truncated garbage until a rollback the crash itself may have prevented. Separately, `write_file` on a directory path returned a generic EISDIR `write_failed` (the dedicated `fs.is_directory` was unused on the write side — asymmetric with read_file).
