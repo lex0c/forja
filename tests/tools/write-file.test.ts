@@ -153,4 +153,21 @@ describe('writeFileTool', () => {
     expect(readFileSync(join(dir, 'sub', 'later.txt'), 'utf-8')).toBe('rel');
     expect(lstatSync(link).isSymbolicLink()).toBe(true);
   });
+
+  test('writes through a dangling symlink CHAIN to the final leaf, all links preserved', async () => {
+    const leaf = join(dir, 'leaf.txt'); // missing
+    const mid = join(dir, 'mid.txt');
+    const head = join(dir, 'head.txt');
+    symlinkSync(leaf, mid); // mid -> leaf (dangling)
+    symlinkSync(mid, head); // head -> mid -> leaf
+    const out = await writeFileTool.execute(
+      { path: head, content: 'leaf!' },
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    // The final leaf is created; the rename did NOT replace the intermediate link.
+    expect(readFileSync(leaf, 'utf-8')).toBe('leaf!');
+    expect(lstatSync(head).isSymbolicLink()).toBe(true);
+    expect(lstatSync(mid).isSymbolicLink()).toBe(true);
+  });
 });

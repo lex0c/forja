@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-03] atomic-write: preserve dangling symlink CHAINS
+
+**Finding (review follow-up).** The dangling-symlink fallback resolved only ONE hop: `resolve(dirname(absPath), readlinkSync(absPath))`. For a chain `a → b → leaf` with `leaf` missing, `realpathSync` throws and the fallback returns `…/b`, so the rename replaced the intermediate link `b` with a regular file instead of creating `leaf` — whereas `Bun.write('a', …)` follows the whole chain and preserves both links (the behavior the helper comment claims to match).
+
+**Fix.** `resolveDanglingTarget` walks the chain with `lstat`/`readlink` until it reaches a path that isn't a symlink (the missing leaf, or a real file), bounded by `MAX_SYMLINK_DEPTH` (40, the kernel's MAXSYMLINKS) so a symlink cycle fails rather than spins. The single-hop cases are subsumed unchanged.
+
+**Tests.** `write-file.test.ts`: writing through a two-hop dangling chain (`head → mid → leaf`, leaf missing) creates the leaf and leaves BOTH links symlinks. The single-hop dangling (absolute + relative) and live-symlink tests still pass. Verification: `write-file.test.ts` 13 pass + fs 9 + edit/memory regression; `tsc --noEmit` + Biome clean. No commit (awaiting operator review).
+
 ## [2026-06-03] atomic-write: preserve dangling symlinks
 
 **Finding (review follow-up).** Symlink resolution used `existsSync(absPath) ? realpathSync(absPath) : absPath`. For a DANGLING symlink (a link created before its target exists), `existsSync` follows the link, finds the target missing, and returns false — so the helper treated the link path as a new regular-file target and the rename then replaced the SYMLINK inode with a regular file. That regresses Bun.write's behavior (follow the link, create its target) for the create-link-then-target workflow.

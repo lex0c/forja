@@ -92,6 +92,33 @@ export const writeAll = (write: (offset: number) => number, total: number, label
   }
 };
 
+// Maximum symlink hops before giving up — matches the Linux kernel's
+// MAXSYMLINKS and bounds a symlink cycle so the dangling-chain walk
+// below can't loop forever.
+const MAX_SYMLINK_DEPTH = 40;
+
+// Walk a DANGLING symlink chain to the path that should actually be
+// written. realpathSync handles a fully-live chain but throws once any
+// hop is missing, and a single readlink would resolve only the FIRST
+// link — replacing an intermediate link with a regular file. Follow each
+// link's target until reaching a path that isn't a symlink (the missing
+// leaf, or a real file): that's where the bytes go, and it keeps every
+// link in the chain intact.
+const resolveDanglingTarget = (start: string): string => {
+  let current = start;
+  for (let depth = 0; depth < MAX_SYMLINK_DEPTH; depth++) {
+    let isLink: boolean;
+    try {
+      isLink = lstatSync(current).isSymbolicLink();
+    } catch {
+      return current; // missing — the dangling leaf; create it here
+    }
+    if (!isLink) return current; // a real file/dir — write here
+    current = resolve(dirname(current), readlinkSync(current));
+  }
+  throw new Error(`symlink chain too deep or cyclic at ${start}`);
+};
+
 export const atomicWrite = (absPath: string, content: string): number => {
   // Resolve where the bytes actually go, preserving Bun.write's symlink
   // semantics. lstat does NOT follow the final component, so it tells a
@@ -110,7 +137,7 @@ export const atomicWrite = (absPath: string, content: string): number => {
       try {
         target = realpathSync(absPath);
       } catch {
-        target = resolve(dirname(absPath), readlinkSync(absPath));
+        target = resolveDanglingTarget(absPath);
       }
     } else {
       target = absPath;
