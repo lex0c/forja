@@ -2,6 +2,18 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-04] TUI: inline diff on write_file / edit_file cards (counts + colored snippet)
+
+**Finding.** write/edit cards rendered as a generic verb+path chip; the `display: 'diff'` tool metadata was dead (no consumer) and the rich detail `edit_file` returns (replacement counts) was invisible — the operator couldn't see WHAT changed without re-reading.
+
+**Design — the diff is a DISPLAY artifact, not model context.** The tool result becomes a `tool_result` block sent to the model, so a rendered diff there would only burn the model's context (it already knows what it changed). The diff therefore travels a display side-channel parallel to the model-facing result, mirroring `ctx.emitWarn`:
+- `src/diff/line-diff.ts` — hand-rolled structured line diff (LCS over the differing middle after trimming the common prefix/suffix; block-replace fallback above 2000 differing lines). Returns accurate `+added`/`-removed` counts plus a bounded snippet of the FIRST changed region. No full-diff/expand view (deemed optional) and **no dependency** (stack stays locked; jsdiff would only re-emit text we'd re-parse).
+- `ctx.emitDiff(diff)` (ToolContext, optional like emitWarn) → loop closure emits a `tool_diff` HarnessEvent → adapter stashes it on the active tool and attaches it to the `tool:end` UIEvent → state carries it on the `tool-end` PermanentItem → `permanent.ts` renders `(+N -M)` on the head and the colored snippet (add = success/green, del = error/red, ctx = dim) under the card. Every diff line goes through `sanitizeOneLineForDisplay` (untrusted file content → strip ANSI/control, cap width) so it can't hijack the terminal.
+- `edit_file` diffs `original`→`working`; `write_file` reads old content (only when a consumer is wired) and diffs old→new. Both compute the diff only when `ctx.emitDiff` is present (no wasted work headless — the `?.` would still evaluate the argument, so the call is gated on an explicit check).
+- A diff-bearing tool **bypasses tool-end batching** (like a non-zero exit) so its per-file diff isn't coalesced into an "Edited N files" chip.
+
+**Tests.** `tests/diff/line-diff.test.ts` (9): counts/snippet across change/insert/delete/new-file/multi-change; bounded snippet + hiddenChanges; small-change-in-large-file (prefix/suffix trim); trailing-newline normalization. `permanent.test.ts` (+3): head counts + colored snippet, hidden-changes tail, ANSI/control sanitization. Verification: diff 9 + permanent 90 + full TUI suite 914 + edit 34 + write 13 / 0 fail; `tsc --noEmit` + Biome clean. The **visual** result (colors/layout) is validated by the operator via `bun run dev` per the UI-iterate rule; the spec PR (`UI.md` + formally wiring the `display: 'diff'` metadata) comes after the UX stabilizes. No commit.
+
 ## [2026-06-03] atomic-write: preserve dangling symlink CHAINS
 
 **Finding (review follow-up).** The dangling-symlink fallback resolved only ONE hop: `resolve(dirname(absPath), readlinkSync(absPath))`. For a chain `a → b → leaf` with `leaf` missing, `realpathSync` throws and the fallback returns `…/b`, so the rename replaced the intermediate link `b` with a regular file instead of creating `leaf` — whereas `Bun.write('a', …)` follows the whole chain and preserves both links (the behavior the helper comment claims to match).

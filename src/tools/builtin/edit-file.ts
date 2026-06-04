@@ -1,4 +1,5 @@
 import { isAbsolute, resolve } from 'node:path';
+import { lineDiff } from '../../diff/line-diff.ts';
 import { atomicWrite } from '../../fs/atomic-write.ts';
 import { ERROR_CODES, type Tool, type ToolError, type ToolResult, toolError } from '../types.ts';
 
@@ -453,6 +454,12 @@ export const editFileTool: Tool<EditFileInput, EditFileOutput> = {
 
     try {
       const bytes = atomicWrite(abs, working);
+      // Display-only: surface the cumulative before→after to the TUI
+      // card (off the model-facing result). Reached only when the batch
+      // changed the file — the no-op guard returned earlier. Computed
+      // only when a consumer is wired (the `?.` would still evaluate the
+      // argument, so gate on the explicit check).
+      if (ctx.emitDiff !== undefined) ctx.emitDiff(lineDiff(original, working));
       return {
         path: args.path,
         edits: results,

@@ -15,6 +15,7 @@
 // todo events accept silently and land alongside their render
 // functions.
 
+import type { FileDiff } from '../diff/line-diff.ts';
 import type { ForjaEffort } from '../harness/effort.ts';
 import type { ApprovalPosture } from '../permissions/index.ts';
 import { sanitizeOneLineForDisplay } from '../sanitize/ansi.ts';
@@ -602,6 +603,9 @@ export type PermanentItem =
       // True when the tool capped its own output — renderer adds a
       // `… output truncated (ctrl+o to expand)` line under the card.
       outputTruncated?: boolean;
+      // Display diff (write/edit) — renderer shows +N/−M on the head and
+      // a bounded colored snippet under the card. Display-only.
+      diff?: FileDiff;
       // Non-zero exit code of a command tool (bash). Renderer shows
       // `exit N` on the head so a failed command reads as a failure.
       exitCode?: number;
@@ -1277,7 +1281,10 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // A non-zero exit code joins the non-`done` bypass: the command
       // ran fine as a tool call but failed on its own terms, so it
       // must not vanish into a coalesced "Executed N commands" batch.
-      if (event.status !== 'done' || event.exitCode !== undefined) {
+      // A tool carrying a display diff (write/edit) bypasses batching
+      // too: its per-file diff is rich detail a coalesced "Edited N
+      // files" chip can't show, so it gets its own card.
+      if (event.status !== 'done' || event.exitCode !== undefined || event.diff !== undefined) {
         const flushed = flushPendingToolEndBatch(state);
         const item: PermanentItem = {
           kind: 'tool-end',
@@ -1290,6 +1297,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           ...(tool.parentId !== undefined ? { parentId: tool.parentId } : {}),
           ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
           ...(event.outputTruncated === true ? { outputTruncated: true } : {}),
+          ...(event.diff !== undefined ? { diff: event.diff } : {}),
         };
         return {
           state: { ...flushed.state, activeTools: nextTools },

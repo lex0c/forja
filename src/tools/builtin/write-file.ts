@@ -1,5 +1,6 @@
 import { statSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
+import { lineDiff } from '../../diff/line-diff.ts';
 import { atomicWrite } from '../../fs/atomic-write.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 
@@ -84,10 +85,16 @@ export const writeFileTool: Tool<WriteFileInput, WriteFileOutput> = {
     }
     const file = Bun.file(abs);
     const created = !(await file.exists());
+    // Old content for the display diff (before→after), off the
+    // model-facing result. Read only for an existing target AND only
+    // when a TUI consumer is wired — a new file diffs against empty,
+    // and headless/SDK runs skip the read entirely.
+    const before = !created && ctx.emitDiff !== undefined ? await file.text().catch(() => '') : '';
 
     try {
       // atomicWrite creates parent directories as needed.
       const bytes = atomicWrite(abs, args.content);
+      if (ctx.emitDiff !== undefined) ctx.emitDiff(lineDiff(before, args.content));
       return { path: args.path, bytes_written: bytes, created };
     } catch (e) {
       return toolError(

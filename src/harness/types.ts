@@ -1,4 +1,5 @@
 import type { Broker } from '../broker/index.ts';
+import type { FileDiff } from '../diff/line-diff.ts';
 import type { FailureEventSink } from '../failures/index.ts';
 import type { HookSpec } from '../hooks/index.ts';
 import type { EagerExposure, MemoryRegistry } from '../memory/index.ts';
@@ -86,6 +87,16 @@ export type HarnessEvent =
       toolUseId: string;
       toolName: string;
       message: string;
+    }
+  | {
+      // Display-only structured diff for a write/edit tool, emitted via
+      // `ctx.emitDiff`. Travels to the TUI card; deliberately NOT part of
+      // the model-facing tool_result — the model already knows what it
+      // changed, so a rendered diff there would only burn context.
+      type: 'tool_diff';
+      toolUseId: string;
+      toolName: string;
+      diff: FileDiff;
     }
   // Emitted the instant a tool's body starts executing — after the
   // permission engine, the modal, and PreToolUse hooks. Lets the TUI
