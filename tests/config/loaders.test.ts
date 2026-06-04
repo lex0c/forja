@@ -8,6 +8,7 @@ import {
   loadEffortConfig,
   loadMemoryConfig,
   loadProvidersConfig,
+  loadSandboxConfig,
   projectConfigPath,
   userConfigPath,
 } from '../../src/config/loaders.ts';
@@ -926,6 +927,107 @@ describe('loadEffortConfig', () => {
       writeFileSync(join(cwd, '.agent', 'config.toml'), '[effort]\nlevel = "max"\n');
       const result = loadEffortConfig({ cwd, env: { HOME: home } });
       expect(result.effort).toBe('max');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('loadSandboxConfig — [sandbox] writable_cache_dirs', () => {
+  const writeProject = (cwd: string, toml: string): void => {
+    mkdirSync(join(cwd, '.agent'), { recursive: true });
+    writeFileSync(join(cwd, '.agent', 'config.toml'), toml);
+  };
+
+  test('absent section → no override (undefined), no warnings', () => {
+    const cwd = makeTempCwd();
+    try {
+      const r = loadSandboxConfig({ cwd, env: { HOME: '/none' } });
+      expect(r.config.writableCacheDirs).toBeUndefined();
+      expect(r.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('valid list is kept verbatim', () => {
+    const cwd = makeTempCwd();
+    try {
+      writeProject(cwd, '[sandbox]\nwritable_cache_dirs = [".cache", "go/pkg/mod"]\n');
+      const r = loadSandboxConfig({ cwd, env: { HOME: '/none' } });
+      expect(r.config.writableCacheDirs).toEqual(['.cache', 'go/pkg/mod']);
+      expect(r.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('explicit empty array is preserved (disables the carve-out)', () => {
+    const cwd = makeTempCwd();
+    try {
+      writeProject(cwd, '[sandbox]\nwritable_cache_dirs = []\n');
+      const r = loadSandboxConfig({ cwd, env: { HOME: '/none' } });
+      expect(r.config.writableCacheDirs).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('unsafe entries (absolute / parent-escape) are dropped with warnings; valid kept', () => {
+    const cwd = makeTempCwd();
+    try {
+      writeProject(cwd, '[sandbox]\nwritable_cache_dirs = ["/etc", "../escape", ".cache"]\n');
+      const r = loadSandboxConfig({ cwd, env: { HOME: '/none' } });
+      expect(r.config.writableCacheDirs).toEqual(['.cache']);
+      expect(r.warnings.length).toBe(2);
+      // Warning carries the source/path prefix for operator triage.
+      expect(r.warnings.every((w) => w.includes('config ('))).toBe(true);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('non-array value → falls back to DEFAULT (undefined) + warning, NOT disabled', () => {
+    // A type error (string instead of array) must NOT collapse to the
+    // carve-out-disabled `[]` sentinel — that would silently break builds
+    // over a typo. Fail-soft contract: leave the field unset → DEFAULT.
+    const cwd = makeTempCwd();
+    try {
+      writeProject(cwd, '[sandbox]\nwritable_cache_dirs = ".cache"\n');
+      const r = loadSandboxConfig({ cwd, env: { HOME: '/none' } });
+      expect(r.config.writableCacheDirs).toBeUndefined();
+      expect(r.warnings.length).toBe(1);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('array with ALL entries invalid → falls back to DEFAULT (undefined), warns each', () => {
+    const cwd = makeTempCwd();
+    try {
+      writeProject(cwd, '[sandbox]\nwritable_cache_dirs = ["/usr", "../etc"]\n');
+      const r = loadSandboxConfig({ cwd, env: { HOME: '/none' } });
+      // Not `[]` (that's reserved for a LITERAL empty array = disable).
+      expect(r.config.writableCacheDirs).toBeUndefined();
+      expect(r.warnings.length).toBe(2);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('project layer overrides user layer', () => {
+    const home = mkdtempSync(join(tmpdir(), 'forja-sbx-home-'));
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(home, '.config', 'agent'), { recursive: true });
+      writeFileSync(
+        join(home, '.config', 'agent', 'config.toml'),
+        '[sandbox]\nwritable_cache_dirs = [".npm"]\n',
+      );
+      writeProject(cwd, '[sandbox]\nwritable_cache_dirs = [".cargo"]\n');
+      const r = loadSandboxConfig({ cwd, env: { HOME: home } });
+      expect(r.config.writableCacheDirs).toEqual(['.cargo']);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
       rmSync(home, { recursive: true, force: true });

@@ -1052,6 +1052,20 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         permanent: [],
       };
 
+    case 'inbox:remove':
+      // Drop the queued message entirely (INBOX §4.3). Terminal: unlike
+      // edit-cancel (which restores the message unchanged), the message
+      // leaves the queue for good — it never drains. editingId clears
+      // with it (the message had to be lifted for editing to be removed).
+      return {
+        state: {
+          ...state,
+          queued: state.queued.filter((q) => q.id !== event.id),
+          editingId: null,
+        },
+        permanent: [],
+      };
+
     case 'inbox:edit-cancel':
       // End the edit with the message unchanged (its bar reappears).
       return {

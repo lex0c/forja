@@ -763,6 +763,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       budgetConfigWarnings,
       effortConfigWarnings,
       auditConfigWarnings,
+      sandboxConfigWarnings,
       permissionState,
       permissionRefusingReason,
       permissionChain,
@@ -876,6 +877,9 @@ export const run = async (options: RunOptions): Promise<number> => {
       // gc deleting (or NOT deleting) rows they didn't intend.
       for (const w of auditConfigWarnings) {
         errSink(`forja: audit config: ${w}\n`);
+      }
+      for (const w of sandboxConfigWarnings) {
+        errSink(`forja: sandbox config: ${w}\n`);
       }
     }
 

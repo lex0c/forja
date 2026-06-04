@@ -1,7 +1,13 @@
 // Operator-facing config loaders for the per-project
-// `.agent/config.toml` sections that are NOT security-sensitive and
-// share the same fail-soft, two-layer (user + project) posture:
-// [memory], [providers], [budget]. AGENTIC_CLI.md §2.1.1.
+// `.agent/config.toml` sections that share the same fail-soft,
+// two-layer (user + project) posture: [memory], [providers], [budget],
+// [effort], [audit], [sandbox]. AGENTIC_CLI.md §2.1.1.
+//
+// Most sections here are NOT security-sensitive. The exception is
+// `[sandbox] writable_cache_dirs`, which feeds the bwrap argv — so its
+// loader SANITIZES every entry (`sanitizeWritableCacheDirs`: reject
+// absolute / `..` paths) before it can become a `--tmpfs` target. A
+// malformed value is dropped + warned, never trusted.
 //
 // Layering (for every section): project overrides user, both override
 // the code-side defaults. Per-field merge — a project file that tweaks
@@ -12,6 +18,7 @@
 // (`loadTomlSection`); path resolution in `src/config/paths.ts`.
 
 import { FORJA_EFFORT_LEVELS, type ForjaEffort } from '../harness/effort.ts';
+import { sanitizeWritableCacheDirs } from '../permissions/sandbox-cache-dirs.ts';
 import type { ModelRegistry } from '../providers/registry.ts';
 import { projectConfigPath, userConfigPath } from './paths.ts';
 import { loadTomlSection } from './section.ts';
@@ -578,4 +585,85 @@ export const loadEffortConfig = (input: LoadEffortConfigInput): LoadedEffortConf
   // project wins; undefined leaves bootstrap to apply DEFAULT_EFFORT.
   const effort = projectResult.effort ?? userResult.effort;
   return { ...(effort !== undefined ? { effort } : {}), userPath, projectPath, warnings };
+};
+
+// ────────────────────────────────────────────────────────────────────
+// SANDBOX CONFIG (SECURITY_GUIDELINE.md §8.1 — writable dev-cache)
+//
+// `[sandbox] writable_cache_dirs` overrides the $HOME-relative cache
+// dirs the cwd-rw / cwd-rw-net sandbox profiles expose as fresh
+// writable tmpfs mounts, so build toolchains can write their caches
+// (otherwise $HOME is read-only and `go build` / `cargo` / … fail with
+// EROFS). Unlike the other sections this one touches a SECURITY surface,
+// so values are SANITIZED (`sanitizeWritableCacheDirs`): every entry
+// must be a clean $HOME-relative path (no leading `/`, no `..`) or it's
+// dropped with a warning — a malformed entry can never `--tmpfs` an
+// arbitrary path. Absent → bootstrap leaves the runner to apply
+// DEFAULT_WRITABLE_CACHE_DIRS; an explicit empty array disables the
+// carve-out.
+
+export interface SandboxConfigKeys {
+  // Omitted when no layer declared `writable_cache_dirs` (→ runner
+  // default). An explicit `[]` is preserved (carve-out off).
+  writableCacheDirs?: string[];
+}
+
+export interface LoadedSandboxConfig {
+  config: SandboxConfigKeys;
+  userPath: string | null;
+  projectPath: string;
+  warnings: string[];
+}
+
+const parseSandboxLayer = (
+  path: string | null,
+  source: string,
+): { layer: SandboxConfigKeys; warnings: string[] } => {
+  const layer: SandboxConfigKeys = {};
+  const warnings: string[] = [];
+  const section = loadTomlSection(path, 'sandbox', source);
+  if (section.kind === 'absent' || section.kind === 'no-section') return { layer, warnings };
+  if (section.kind === 'invalid') {
+    warnings.push(section.warning);
+    return { layer, warnings };
+  }
+  const s = section.section;
+  if (s.writable_cache_dirs !== undefined) {
+    const raw = s.writable_cache_dirs;
+    const { dirs, warnings: w } = sanitizeWritableCacheDirs(raw);
+    for (const msg of w) warnings.push(`${source} config (${path}): ${msg}`);
+    // Tri-state, fail-soft. Only a LITERAL empty array disables the
+    // carve-out. A type error (not an array) or an array whose entries
+    // were ALL rejected falls back to DEFAULT (leave the field unset) per
+    // this loader's "malformed → default" contract — never silently
+    // disable the carve-out and break the operator's builds over a typo
+    // (`writable_cache_dirs = ".cache"` instead of `[".cache"]`).
+    if (Array.isArray(raw) && raw.length === 0) {
+      layer.writableCacheDirs = [];
+    } else if (dirs.length > 0) {
+      layer.writableCacheDirs = dirs;
+    }
+  }
+  return { layer, warnings };
+};
+
+export interface LoadSandboxConfigInput {
+  cwd: string;
+  env?: NodeJS.ProcessEnv;
+}
+
+export const loadSandboxConfig = (input: LoadSandboxConfigInput): LoadedSandboxConfig => {
+  const env = input.env ?? process.env;
+  const userPath = userConfigPath(env);
+  const projectPath = projectConfigPath(input.cwd);
+  const userResult = parseSandboxLayer(userPath, 'user');
+  const projectResult = parseSandboxLayer(projectPath, 'project');
+  const warnings = [...userResult.warnings, ...projectResult.warnings];
+  // project wins; undefined leaves bootstrap to apply the runner
+  // default. An explicit `[]` is a real value (carve-out disabled), so
+  // we check `!== undefined` rather than truthiness.
+  const resolved = projectResult.layer.writableCacheDirs ?? userResult.layer.writableCacheDirs;
+  const config: SandboxConfigKeys = {};
+  if (resolved !== undefined) config.writableCacheDirs = resolved;
+  return { config, userPath, projectPath, warnings };
 };

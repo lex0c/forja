@@ -1,3 +1,4 @@
+import { loadSandboxConfig } from '../config/loaders.ts';
 import { type HarnessEvent, type HarnessResult, runAgent } from '../harness/index.ts';
 import type { RunBudget } from '../harness/types.ts';
 import { resolveHookConfig, resolveHookPaths } from '../hooks/index.ts';
@@ -10,6 +11,7 @@ import {
 import { mergeTrustedHosts } from '../permissions/bootstrap-engine.ts';
 import { parseCapability } from '../permissions/capabilities.ts';
 import { createPermissionEngine, createSqliteSink, ensureInstallId } from '../permissions/index.ts';
+import { setWritableCacheDirsOverride } from '../permissions/sandbox-cache-dirs.ts';
 import { type Provider, type ProviderEffort, createDefaultRegistry } from '../providers/index.ts';
 import type { SystemSegment } from '../providers/types.ts';
 import {
@@ -513,6 +515,29 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       );
       return 1;
     }
+
+    // Mirror the parent bootstrap's `[sandbox] writable_cache_dirs`
+    // wiring (cli/bootstrap.ts). This child runs in a SEPARATE process,
+    // so the module-level cache-dir override starts UNSET here — without
+    // this it falls back to DEFAULT and ignores the operator's config,
+    // re-enabling a carve-out they disabled (`writable_cache_dirs = []`)
+    // or dropping a custom dir, on every sandboxed tool the subagent
+    // spawns (grep, bg bash, broker bash).
+    //
+    // Anchor at the REPO ROOT, exactly like the parent: bootstrap.ts
+    // resolves `projectConfigCwd = resolveRepoRoot(cwd)` BEFORE loading
+    // `.agent/config.toml`. `session.cwd` may be a repo subdirectory (an
+    // isolation:none child launched from a subdir), so loading config
+    // from it raw would miss a repo-root `.agent/config.toml` and
+    // silently fall back to defaults. Anchor via `memoryCwd` (the
+    // parent's invocation cwd, when forwarded) else `session.cwd`, then
+    // walk to the repo root — same shape as the hook re-resolution below.
+    // Warnings are intentionally NOT re-surfaced — the parent already
+    // emitted them at top-level boot.
+    const sandboxConfigAnchor = opts.memoryCwd !== undefined ? opts.memoryCwd : session.cwd;
+    setWritableCacheDirsOverride(
+      loadSandboxConfig({ cwd: resolveRepoRoot(sandboxConfigAnchor) }).config.writableCacheDirs,
+    );
 
     const audit = getSubagentRun(db, opts.sessionId);
     if (audit === null) {

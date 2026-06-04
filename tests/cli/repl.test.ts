@@ -156,6 +156,7 @@ const makeBootstrapStub = (
     budgetConfigWarnings: [] as readonly string[],
     effortConfigWarnings: [] as readonly string[],
     auditConfigWarnings: [] as readonly string[],
+    sandboxConfigWarnings: [] as readonly string[],
     permissionState: 'ready',
     permissionChain: { ok: true, rows: 0, current_rotation_id: 0, quarantined: false },
     installIdentity: { install_id: 'test-fixture', created_at_ms: 0 },
@@ -1623,7 +1624,7 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
-  test('Ctrl+C while editing a queued message cancels the edit (does not strand it)', async () => {
+  test('Ctrl+C while editing clears the buffer, which removes the message', async () => {
     const stdin = makeStdin();
     const ra = makeRunAgent((n) => `sess-${n}`);
     const promise = runRepl({
@@ -1642,18 +1643,18 @@ describe('repl — boot + smoke', () => {
     // Lift it for editing (input now holds 'queued msg').
     stdin.feed('\x1b[A');
     await tick();
-    // Ctrl+C on the non-empty buffer clears it (no 'interrupt' surfaced)
-    // and must also cancel the edit — otherwise the message stays hidden
-    // and held back.
+    // Ctrl+C clears the non-empty buffer → non-empty→empty transition →
+    // the message is REMOVED (erasing the buffer removes it). It does NOT
+    // interrupt the turn — Ctrl+C only surfaces 'interrupt' on an already-
+    // empty buffer.
     stdin.feed('\x03');
     await tick();
-    // Boundary: the message drains (edit cancelled, so it's not held).
+    // Boundary: nothing drains — the message is gone, the turn ran to its
+    // own end.
     ra.finish(0);
     await tick();
-    expect(ra.captured).toHaveLength(2);
-    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('queued msg');
-    ra.finish(1);
-    await tick();
+    expect(ra.captured).toHaveLength(1);
+    // Idle now (turn 0 done, queue empty) → Ctrl+D exits cleanly.
     stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
@@ -1724,7 +1725,7 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
-  test('Ctrl+D on an emptied edit buffer cancels the edit (does not strand the message)', async () => {
+  test('Ctrl+D after erasing a lifted edit (already removed) interrupts the turn, strands nothing', async () => {
     const stdin = makeStdin();
     const ra = makeRunAgent((n) => `sess-${n}`);
     const promise = runRepl({
@@ -1743,25 +1744,91 @@ describe('repl — boot + smoke', () => {
     await tick();
     stdin.feed('\x1b[A');
     await tick();
-    // Empty the edit buffer, then Ctrl+D (EOF). While busy this interrupts
-    // the turn; it must ALSO cancel the edit, or "held" stays hidden + held
-    // and the prompt wedges (no ↑ lift / history recall) until discovered.
+    // Erasing the edit buffer to empty already REMOVED the message — so no
+    // edit can be stranded. Ctrl+D on the now-empty buffer (busy) just
+    // routes to the interrupt ladder, exactly as it would with no edit in
+    // flight.
     stdin.feed('\x7f'.repeat('held'.length));
     await tick();
     stdin.feed('\x04');
     await tick();
-    // Turn ends → the un-held message drains as the next turn.
+    // Turn ends → nothing drains (the message is gone, not held).
     ra.finish(0);
     await tick();
-    expect(ra.captured).toHaveLength(2);
-    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('held');
-    ra.finish(1);
-    await tick();
+    expect(ra.captured).toHaveLength(1);
     stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
-  test('emptying a lifted edit buffer with Backspace cancels the edit (no strand)', async () => {
+  test('erasing a lifted message to empty removes it from the inbox — no confirm (INBOX §4.3)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    stdin.feed('held\r');
+    await tick();
+    // Lift the queued message, then erase it to empty with plain
+    // Backspaces. The non-empty→empty transition REMOVES it on the spot —
+    // no Enter, no extra keystroke.
+    stdin.feed('\x1b[A');
+    await tick();
+    stdin.feed('\x7f'.repeat('held'.length));
+    await tick();
+    // Boundary: nothing drains — the message is gone (not held, not
+    // re-queued). No second turn starts.
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    // Idle now (turn 0 done, queue empty) → Ctrl+D exits cleanly.
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('erasing REMOVES (not strands): a later ↓ has nothing to restore', async () => {
+    // Distinguishes "removed" from "held/stranded" — both would otherwise
+    // look identical (drainInbox excludes a held item, so neither drains a
+    // 2nd turn). If erasing had merely stranded the edit (editingQueued
+    // left set, "held" left queued), ↓ would cancel-and-restore it and it
+    // WOULD drain. Since it was truly removed, ↓ finds no edit and nothing
+    // drains. Regressing removeQueuedEdit to a no-op / restore fails here.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    stdin.feed('held\r');
+    await tick();
+    stdin.feed('\x1b[A'); // lift
+    await tick();
+    stdin.feed('\x7f'.repeat('held'.length)); // erase → remove
+    await tick();
+    stdin.feed('\x1b[B'); // ↓ — no edit to restore if truly removed
+    await tick();
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('Ctrl+U erasing a lifted message to empty removes it (any emptying gesture counts)', async () => {
     const stdin = makeStdin();
     const ra = makeRunAgent((n) => `sess-${n}`);
     const promise = runRepl({
@@ -1779,48 +1846,47 @@ describe('repl — boot + smoke', () => {
     await tick();
     stdin.feed('\x1b[A');
     await tick();
-    // Empty the lifted buffer with plain Backspaces (NOT Ctrl+C/Ctrl+D).
-    // The edit must cancel so "held" un-hides and drains — not strand
-    // (hidden + held, empty prompt, Enter a no-op).
-    stdin.feed('\x7f'.repeat('held'.length));
-    await tick();
-    ra.finish(0);
-    await tick();
-    expect(ra.captured).toHaveLength(2);
-    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('held');
-    ra.finish(1);
-    await tick();
-    stdin.feed('\x04');
-    expect(await promise).toBe(130);
-  });
-
-  test('Ctrl+U emptying a lifted edit buffer also cancels the edit', async () => {
-    const stdin = makeStdin();
-    const ra = makeRunAgent((n) => `sess-${n}`);
-    const promise = runRepl({
-      args: makeArgs(),
-      bootstrapOverride: makeBootstrapStub(),
-      stdin,
-      skipTtyCheck: true,
-      skipTrustPrompt: true,
-      runAgentOverride: ra.runAgent,
-    });
-    await tick();
-    stdin.feed('go\r');
-    await tick();
-    stdin.feed('held\r');
-    await tick();
-    stdin.feed('\x1b[A');
-    await tick();
-    // Ctrl+U kills the whole line → empty buffer → edit cancels.
+    // Ctrl+U kills the line → empty buffer → removed on the spot (same as
+    // Backspacing to empty; the remove keys off the transition, not the
+    // specific key). To KEEP a lifted message use ↓/Esc (see the ↓ test).
     stdin.feed('\x15');
     await tick();
+    // Boundary: nothing drains — the message is gone.
     ra.finish(0);
     await tick();
-    expect(ra.captured).toHaveLength(2);
-    expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('held');
-    ra.finish(1);
+    expect(ra.captured).toHaveLength(1);
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('removing an edit after the turn ended leaves nothing queued (no stuck message)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
     await tick();
+    stdin.feed('go\r');
+    await tick();
+    stdin.feed('doomed\r');
+    await tick();
+    // Lift it, then the turn ends WHILE editing — the boundary holds the
+    // edited message back (held messages are not drained).
+    stdin.feed('\x1b[A');
+    await tick();
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    // Erasing to empty removes it. REPL is idle and the queue is now empty:
+    // removal must not leave a stuck message and must not start a turn.
+    stdin.feed('\x7f'.repeat('doomed'.length));
+    await tick();
+    expect(ra.captured).toHaveLength(1);
     stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
@@ -1843,8 +1909,8 @@ describe('repl — boot + smoke', () => {
     await tick();
     stdin.feed('\x1b[A');
     await tick();
-    // Edit in progress — non-empty buffer, so the empty-buffer cancel
-    // does NOT apply; Esc must be handled as a cancel key in its own right.
+    // Edit in progress — non-empty buffer, so erasing-to-empty (which would
+    // REMOVE) does NOT apply; Esc is the deliberate "keep it" cancel key.
     stdin.feed(' MANGLE');
     await tick();
     // Esc cancels the edit and restores "keep me" unchanged; it does NOT

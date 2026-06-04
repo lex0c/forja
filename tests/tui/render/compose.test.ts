@@ -834,4 +834,13 @@ describe('queued inbox messages (INBOX §6)', () => {
     expect(out.some((l) => l.includes('> first queued'))).toBe(true);
     expect(out.some((l) => l.includes('> second queued'))).toBe(false);
   });
+
+  test('queued + empty buffer hints the ↑-to-edit affordance (INBOX §6.1)', () => {
+    const state: LiveState = {
+      ...startedSession(),
+      queued: [{ id: '0', text: 'queued msg' }],
+    };
+    const out = composeLive(state, caps, 0);
+    expect(out.some((l) => l.includes('Press up to edit queued messages'))).toBe(true);
+  });
 });

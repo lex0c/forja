@@ -1,8 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { computeSchemaRetryBudget, runSubagentChild } from '../../src/cli/subagent-child.ts';
+import {
+  getWritableCacheDirsOverride,
+  setWritableCacheDirsOverride,
+} from '../../src/permissions/sandbox-cache-dirs.ts';
 import type { Provider, StreamEvent } from '../../src/providers/index.ts';
 import { openDb } from '../../src/storage/db.ts';
 import {
@@ -33,6 +37,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // The child sets the process-global sandbox cache-dir override; reset
+  // it so it can't leak into another test (here or in another file).
+  setWritableCacheDirsOverride(undefined);
   try {
     unlinkSync(dbPath);
   } catch {}
@@ -150,6 +157,41 @@ describe('runSubagentChild', () => {
     expect(capturedSegments?.[0]?.cacheBreakpoint).toBe(true);
     // Round-trip invariant: flatten(segments) === systemPrompt.
     expect(flattenSystemSegments(capturedSegments ?? [])).toBe(capturedSystemPrompt ?? '');
+  });
+
+  test('resolves [sandbox] config from the repo ROOT when the child cwd is a subdir', async () => {
+    // Regression: an isolation:none child whose session.cwd is a repo
+    // SUBDIR must read `.agent/config.toml` from the repo ROOT — exactly
+    // where the parent (resolveRepoRoot(cwd)) read it. Loading from the
+    // raw subdir misses a root-level writable_cache_dirs and silently
+    // falls back to the defaults.
+    const repo = mkdtempSync(join(tmpdir(), 'forja-child-repo-'));
+    try {
+      // git repo so resolveRepoRoot (git rev-parse) finds the root.
+      Bun.spawnSync({ cmd: ['git', 'init', '-q', repo] });
+      mkdirSync(join(repo, '.agent'), { recursive: true });
+      writeFileSync(join(repo, '.agent', 'config.toml'), '[sandbox]\nwritable_cache_dirs = []\n');
+      const sub = join(repo, 'pkg', 'inner');
+      mkdirSync(sub, { recursive: true });
+      // Pre-seed a distinct value to prove the child actually re-resolves.
+      setWritableCacheDirsOverride(['stale-not-from-config']);
+      const { sessionId } = seedChildSession(sub);
+      const exitCode = await runSubagentChild({
+        sessionId,
+        dbPath,
+        providerOverride: stubProvider('ok'),
+        userAgentsDir: null,
+        projectAgentsDir: null,
+        errSink: () => {},
+      });
+      expect(exitCode).toBe(0);
+      // The root config sets an explicit empty array (carve-out disabled).
+      // The child must have read it — NOT `undefined`, which is what a raw
+      // `loadSandboxConfig({ cwd: subdir })` (no .agent there) would yield.
+      expect(getWritableCacheDirsOverride()).toEqual([]);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
 
   test('happy path: runs harness, publishes done payload, exits 0', async () => {
