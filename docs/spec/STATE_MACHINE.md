@@ -1086,11 +1086,12 @@ clarify(
 
 ### 12.2 Modos por playbook (`clarify_mode`)
 
+A tool `clarify` é **core e sempre exposta** ao modelo (como `read`/`write`/`edit`) — `clarify_mode` nunca a remove, só modula quando o modal interrompe vs quando a ambiguidade bufferiza:
+
 | Modo | Comportamento |
 |---|---|
 | `pre_execution` | modelo emite todas `clarify()` em fase exploratória; modal único batched antes da 1ª ação write. Falha em emitir clarification em fase write = drift detector flagga (`§11`). |
 | `on_high_blast` | só `high` interrompe; `medium`/`low` viram `assumptions[]` registradas. Default. |
-| `off` | tool `clarify` indisponível ao modelo; tudo vira `assumptions[]`. Workflows read-only e exploratórios (`explain`, `code-review`). |
 
 ### 12.3 Estado `[clarifying]`
 

@@ -13,7 +13,7 @@ import type { SessionStatus } from '../storage/repos/sessions.ts';
 import type { SubagentSet } from '../subagents/load.ts';
 import type { TelemetrySink } from '../telemetry/index.ts';
 import type { TodoItem } from '../todo/index.ts';
-import type { ToolRegistry } from '../tools/index.ts';
+import type { ClarifyBridgeRequest, ClarifyBridgeResponse, ToolRegistry } from '../tools/index.ts';
 import { type ForjaEffort, effortBudgetPatch } from './effort.ts';
 
 // Lifecycle events the harness emits during a run. Synchronous (fire and
@@ -964,6 +964,11 @@ export interface HarnessConfig {
   // operator a second look at the content before the
   // cross-session blast hits.
   confirmMemoryUserScope?: (req: ConfirmMemoryUserScopeRequest) => Promise<MemoryWriteAnswer>;
+  // Async hook for the clarify form-modal (STATE_MACHINE §12). The
+  // `clarify` tool fires this for medium/high blast radius. Caller
+  // (REPL) wires it to `modalManager.askClarify`; one-shot / headless
+  // leaves it unset and the tool returns `clarify.modal_unavailable`.
+  clarify?: (req: ClarifyBridgeRequest) => Promise<ClarifyBridgeResponse>;
   // Hook specs resolved at boot (spec AGENTIC_CLI.md §10). Already
   // ordered enterprise → user → project; the dispatcher iterates
   // in order and short-circuits on first block (for blocking

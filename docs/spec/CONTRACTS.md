@@ -294,13 +294,11 @@ UI integration: status line mostra tray de `bash_*` ativos (`bg N`); status line
 
 **Failure semantics:**
 - `clarify.options.invalid` — < 2 options, ou IDs duplicados
-- `clarify.disabled_by_playbook` — `clarify_mode: off` no frontmatter; modelo recebe erro estruturado e re-tenta com `assumptions[]` em vez
 - `clarify.budget_exceeded` — sessão emitiu mais de `clarification.max_per_session` (default 5); fallback para `auto_low` automático
 
-**Disponibilidade ao modelo:** controlada por `clarify_mode` do playbook ativo:
-- `pre_execution`: tool exposta; `medium`/`high` permitidos só em fase exploratória (drift detector flagga uso tardio)
-- `on_high_blast`: tool exposta; `low` auto-resolve, `medium` bufferiza, `high` interrompe
-- `off`: tool **não exposta** ao modelo; tudo vira `assumptions[]` retrospectivo
+**Disponibilidade ao modelo:** `clarify` é tool **core, sempre exposta** — disponível em toda sessão ao lado de `read`/`write`/`edit`, sem gate de playbook. O `clarify_mode` do playbook ativo modula apenas o **comportamento de interrupção**, nunca a disponibilidade:
+- `on_high_blast` (default): `low` auto-resolve, `medium` bufferiza, `high` interrompe
+- `pre_execution`: `medium`/`high` esperados só em fase exploratória (drift detector flagga uso tardio); modal único batched antes do 1º write
 
 ### 2.6.6 Justificativa do teto (22 vs 10)
 

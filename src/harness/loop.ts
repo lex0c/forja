@@ -2788,6 +2788,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           ...(config.confirmMemoryUserScope !== undefined
             ? { confirmMemoryUserScope: config.confirmMemoryUserScope }
             : {}),
+          ...(config.clarify !== undefined ? { clarify: config.clarify } : {}),
           ...(config.contextPinsStore !== undefined
             ? { contextPinsStore: config.contextPinsStore }
             : {}),

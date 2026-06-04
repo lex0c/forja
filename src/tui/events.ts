@@ -360,6 +360,20 @@ export type ModalQueueDepthEvent = BaseEvent & {
   // the only ask in flight.
   depth: number;
 };
+// Clarify form-modal raise (STATE_MACHINE §12). A NEW modal family,
+// separate from the confirm flavors — the reducer builds a
+// `clarifyModal` (its own LiveState slot), not a `modal`, from it.
+// Single question for now (on_high_blast); the pre_execution batching
+// slice will append questions to an open clarify modal. Navigation and
+// resolution reuse the generic modal:select / modal:answer machinery
+// (the form is a single-select while N=1).
+export type ClarifyAskEvent = BaseEvent & {
+  type: 'clarify:ask';
+  promptId: string;
+  question: string;
+  why: string | null;
+  options: ReadonlyArray<{ id: string; label: string }>;
+};
 export type TrustAskEvent = BaseEvent & {
   type: 'trust:ask';
   promptId: string;
@@ -831,6 +845,7 @@ export type UIEvent =
   | ModalAnswerEvent
   | ModalSelectEvent
   | ModalQueueDepthEvent
+  | ClarifyAskEvent
   | TrustAskEvent
   | SharedTrustAskEvent
   | MemoryWriteAskEvent

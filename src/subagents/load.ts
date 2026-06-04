@@ -641,7 +641,7 @@ const parseStringArray = (raw: unknown, sourcePath: string, fieldPath: string): 
 
 const INCLUDE_REPO_MAP_VALUES: ReadonlyArray<IncludeRepoMap> = ['eager', 'lazy', 'off'];
 const STEP_REFLECTION_VALUES: ReadonlyArray<StepReflection> = ['off', 'terse', 'full'];
-const CLARIFY_MODE_VALUES: ReadonlyArray<ClarifyMode> = ['off', 'on_high_blast', 'pre_execution'];
+const CLARIFY_MODE_VALUES: ReadonlyArray<ClarifyMode> = ['on_high_blast', 'pre_execution'];
 
 // Context recipe (`PLAYBOOKS.md` §1.1, canonical recipes in
 // `CONTEXT_TUNING.md` §13). Each field validates independently so an

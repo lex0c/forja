@@ -272,6 +272,36 @@ export interface ConfirmState {
 // own semantic union; this one's union is the most common.
 export type PermissionAnswer = 'yes' | 'no' | 'cancel';
 
+// Clarify form-modal state (STATE_MACHINE §12). A NEW modal family,
+// deliberately separate from ConfirmState: clarify asks the operator
+// up to 3 questions at once (a 2D form), each with its own options.
+// Rendered by render/clarify-modal.ts; raised by the modal-manager's
+// askClarify. Held in its OWN LiveState slot (`clarifyModal`) so the
+// five confirm flavors stay untouched. While N=1 (on_high_blast) it
+// behaves as a single-select and reuses the generic modal:select /
+// modal:answer machinery; the multi-question form (pre_execution
+// batching) lights up in a later slice.
+export interface ClarifyModalOption {
+  id: string;
+  label: string;
+}
+
+export interface ClarifyModalQuestion {
+  question: string;
+  why: string | null;
+  options: ClarifyModalOption[];
+  selectedIndex: number;
+}
+
+export interface ClarifyModalState {
+  promptId: string;
+  flavor: 'clarify';
+  questions: ClarifyModalQuestion[];
+  activeQuestion: number;
+  hints: string[];
+  queueDepth: number;
+}
+
 // Slash command autocomplete state. Spec UI.md §5.3. Set when the
 // input buffer starts with `/`; cleared when the user submits, Esc,
 // or types a non-slash character. Suggestions come pre-sorted from
@@ -388,6 +418,11 @@ export interface LiveState {
   // replaces the input box with `renderModal(modal, caps)` whenever
   // this is non-null. Status line + tool cards stay visible.
   modal: ConfirmState | null;
+  // Active clarify form-modal, or null. A separate slot from `modal`
+  // so the confirm flavors are untouched; compose.ts renders whichever
+  // is non-null (the manager's single FIFO queue keeps at most one of
+  // the two up at a time). STATE_MACHINE §12.
+  clarifyModal: ClarifyModalState | null;
   // Slash autocomplete popover, or null when not in slash mode.
   // Composer renders above the input box (between status and rule).
   slash: SlashAutocomplete | null;
@@ -515,6 +550,7 @@ export const createInitialState = (): LiveState => ({
   currentTurnId: null,
   busy: false,
   modal: null,
+  clarifyModal: null,
   slash: null,
   reverseSearch: null,
   todos: [],
@@ -1620,6 +1656,11 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
     }
 
     case 'modal:answer': {
+      // Clarify form-modal lives in its own slot — clear it on a
+      // matching answer (resolved / skipped both route here).
+      if (state.clarifyModal !== null && state.clarifyModal.promptId === event.promptId) {
+        return { state: { ...state, clarifyModal: null }, permanent: [] };
+      }
       // Only clear the modal when the answer matches the open prompt.
       // A late answer from a stale prompt (e.g. cancelled then a new
       // ask raised before the cancel propagated) shouldn't dismiss
@@ -1631,6 +1672,21 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
     }
 
     case 'modal:select': {
+      // Clarify form-modal: the cursor moves WITHIN the active
+      // question's options (2D nav between questions is the focus
+      // handler's job; while N=1 only this fires). Clamp to that
+      // question's option count.
+      if (state.clarifyModal !== null && state.clarifyModal.promptId === event.promptId) {
+        const cm = state.clarifyModal;
+        const active = cm.questions[cm.activeQuestion];
+        if (active === undefined) return { state, permanent: [] };
+        const max = active.options.length - 1;
+        const clamped = Math.max(0, Math.min(max, event.selectedIndex));
+        const questions = cm.questions.map((q, i) =>
+          i === cm.activeQuestion ? { ...q, selectedIndex: clamped } : q,
+        );
+        return { state: { ...state, clarifyModal: { ...cm, questions } }, permanent: [] };
+      }
       // In-modal navigation. Updates only `selectedIndex`; never
       // reconstructs contents. Stale events (mismatched promptId, or
       // arrived after the modal closed) are dropped silently. Out-of-
@@ -1655,12 +1711,48 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // or the modal already closed — a stale event that lost its
       // race with `modal:answer`. Negative depths clamp to 0 (a
       // buggy producer can't render a phantom "(-1 waiting)").
+      if (state.clarifyModal !== null && state.clarifyModal.promptId === event.promptId) {
+        const depth = Math.max(0, event.depth);
+        return {
+          state: { ...state, clarifyModal: { ...state.clarifyModal, queueDepth: depth } },
+          permanent: [],
+        };
+      }
       if (state.modal === null || state.modal.promptId !== event.promptId) {
         return { state, permanent: [] };
       }
       const depth = Math.max(0, event.depth);
       return {
         state: { ...state, modal: { ...state.modal, queueDepth: depth } },
+        permanent: [],
+      };
+    }
+
+    case 'clarify:ask': {
+      // Raise the clarify form-modal in its OWN slot. Single question
+      // for now (on_high_blast); pre_execution batching will append to
+      // an open one. selectedIndex starts at 0 — the safe default the
+      // tool also maps a skip to (options[0]); the manager's open-time
+      // modal:select re-asserts the cursor so render + resolution agree.
+      return {
+        state: {
+          ...state,
+          clarifyModal: {
+            promptId: event.promptId,
+            flavor: 'clarify',
+            questions: [
+              {
+                question: event.question,
+                why: event.why,
+                options: [...event.options],
+                selectedIndex: 0,
+              },
+            ],
+            activeQuestion: 0,
+            hints: ['↑/↓ choose', 'Enter confirm', 'Esc skip'],
+            queueDepth: 0,
+          },
+        },
         permanent: [],
       };
     }

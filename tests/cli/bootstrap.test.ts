@@ -84,6 +84,7 @@ describe('bootstrap', () => {
         'bash_background',
         'bash_kill',
         'bash_output',
+        'clarify',
         'edit_file',
         'glob',
         'grep',

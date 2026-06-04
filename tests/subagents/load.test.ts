@@ -1016,7 +1016,7 @@ describe('playbook surface — context_recipe', () => {
         'user',
         '/p',
       ),
-    ).toThrow(/'context_recipe\.clarify_mode' must be one of off, on_high_blast, pre_execution/);
+    ).toThrow(/'context_recipe\.clarify_mode' must be one of on_high_blast, pre_execution/);
   });
 
   test('include_diff / include_callers must be boolean', () => {

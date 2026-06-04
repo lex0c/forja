@@ -3,6 +3,7 @@ import { bashBackgroundTool } from './bash-background.ts';
 import { bashKillTool } from './bash-kill.ts';
 import { bashOutputTool } from './bash-output.ts';
 import { bashTool } from './bash.ts';
+import { clarifyTool } from './clarify.ts';
 import { editFileTool } from './edit-file.ts';
 import { globTool } from './glob.ts';
 import { grepTool } from './grep.ts';
@@ -57,6 +58,8 @@ export type { MemoryWriteInput, MemoryWriteOutput } from './memory-write.ts';
 export { monitorTool } from './monitor.ts';
 export { pinContextTool } from './pin-context.ts';
 export type { PinContextInput, PinContextOutput } from './pin-context.ts';
+export { clarifyTool } from './clarify.ts';
+export type { ClarifyInput, ClarifyOption, ClarifyOutput } from './clarify.ts';
 export type { MonitorInput, MonitorOutput } from './monitor.ts';
 export { readFileTool } from './read-file.ts';
 export type { ReadFileInput, ReadFileOutput } from './read-file.ts';
@@ -115,6 +118,9 @@ export const BUILTIN_TOOLS = [
   waitForTool,
   monitorTool,
   todoWriteTool,
+  // clarify — core anti-presumption tool (CONTRACTS §2.6.5e). Not a
+  // write/exec; its modal bridge (ctx.clarify) is wired in the REPL.
+  clarifyTool,
   taskTool,
   taskSyncTool,
   taskAsyncTool,

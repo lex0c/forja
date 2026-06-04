@@ -1,4 +1,6 @@
 export type {
+  ClarifyBridgeRequest,
+  ClarifyBridgeResponse,
   DisplayHint,
   SpawnSubagentArgs,
   SpawnSubagentResult,

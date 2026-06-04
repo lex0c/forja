@@ -128,10 +128,12 @@ export type IncludeRepoMap = 'eager' | 'lazy' | 'off';
 export type StepReflection = 'off' | 'terse' | 'full';
 
 // `context_recipe.clarify_mode` enum from `STATE_MACHINE.md` §12.
-// `on_high_blast` = clarify only before destructive/irreversible
-// steps; `pre_execution` = clarify before any execution begins;
-// `off` = never.
-export type ClarifyMode = 'off' | 'on_high_blast' | 'pre_execution';
+// `on_high_blast` = only `high` blast radius interrupts (default);
+// `pre_execution` = batch all clarifications before the first write.
+// There is no `off`: `clarify` is a core tool, always exposed to the
+// model alongside read/write/edit — `clarify_mode` modulates only the
+// interruption behavior, never the availability (CONTRACTS §2.6.5e).
+export type ClarifyMode = 'on_high_blast' | 'pre_execution';
 
 // Context shaping per playbook (`PLAYBOOKS.md` §1.1, canonical
 // recipes in `CONTEXT_TUNING.md` §13). Slice 9 consumes the fields

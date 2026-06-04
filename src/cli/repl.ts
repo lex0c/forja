@@ -42,6 +42,7 @@ import { createContextPinsStore } from '../storage/repos/context-pins.ts';
 import { completeSession, createSession } from '../storage/repos/sessions.ts';
 import { settleRunningSubagentHandles } from '../storage/repos/subagent-handles.ts';
 import { runSubagent } from '../subagents/index.ts';
+import type { ClarifyBridgeRequest } from '../tools/index.ts';
 import { addTrustedDir, isTrusted, trustListPath } from '../trust/index.ts';
 import {
   type FocusHandler,
@@ -1350,6 +1351,17 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     body: string;
   }): Promise<'yes' | 'no' | 'cancel'> => modalManager.askMemoryUserScope(req);
 
+  // Clarify form-modal bridge (STATE_MACHINE §12). The `clarify` tool
+  // forwards medium/high blast-radius asks here; the modal manager
+  // raises the form and resolves the operator's pick (or skipped on Esc
+  // / 60s timeout, §12.3). blast_radius isn't needed downstream —
+  // medium and high both open the modal; batching is a later slice.
+  const clarify = (req: ClarifyBridgeRequest) =>
+    modalManager.askClarify(
+      { question: req.question, why: req.why_it_matters ?? null, options: req.options },
+      { timeoutMs: 60_000 },
+    );
+
   // Operator `!cmd` execution. Runs as the operator's own shell — NOT
   // through the agent permission engine or sandbox (the engine gates the
   // agent, not the human at the keyboard; this is the shell-style `!`
@@ -1623,6 +1635,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       confirmPermission,
       confirmMemoryWrite,
       confirmMemoryUserScope,
+      clarify,
       contextPinsStore,
       ...(lastSessionId !== null ? { resumeFromSessionId: lastSessionId } : {}),
     };
