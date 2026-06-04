@@ -1693,6 +1693,22 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     if (!isBusy()) queueMicrotask(() => drainInbox());
   };
 
+  // Drop a lifted ↑-edit's message from the inbox entirely (INBOX §4.3
+  // "cancel"): the operator erased the buffer to empty, which is the
+  // gesture for "remove this queued message". Terminal — unlike
+  // cancelQueuedEdit, the message does NOT come back. No-op when not
+  // editing. Like cancel, it kicks an idle drain so any OTHER messages
+  // that were held back when the turn ended aren't stranded.
+  const removeQueuedEdit = (): void => {
+    if (editingQueued === null) return;
+    const id = editingQueued.id;
+    editingQueued = null;
+    const idx = inbox.findIndex((m) => m.id === id);
+    if (idx !== -1) inbox.splice(idx, 1);
+    bus.emit({ type: 'inbox:remove', ts: now(), id });
+    if (!isBusy()) queueMicrotask(() => drainInbox());
+  };
+
   // INBOX drain (docs/spec/INBOX.md §4.4 / §5.1). FIFO over everything
   // queued since the last boundary, concatenated into ONE user turn (the
   // provider rejects consecutive same-role messages, so N queued items
@@ -2706,13 +2722,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         return true;
       }
     }
-    // ↓ or Esc while editing cancels the edit: the message stays queued
-    // unchanged and the input clears (↓ mirrors history's ↓-restores; Esc
-    // is the documented cancel key, INBOX §6.1). Intercepted HERE, before
-    // applyKey turns Esc into an `interruptSoft` with an unchanged buffer:
-    // otherwise Esc would skip the empty-buffer cancel above (buffer not
-    // emptied) and fall to the soft-interrupt branch — interrupting the
-    // turn when busy, a no-op when idle — leaving the edit stranded.
+    // ↓ or Esc while editing KEEPS the message: cancel the edit, restore
+    // it unchanged to the queue, and clear the input (↓ mirrors history's
+    // ↓-restores; Esc is the documented keep key, INBOX §6.1). This is the
+    // deliberate "I changed my mind, leave it as it was" escape — distinct
+    // from erasing the buffer, which REMOVES (see the empty-transition
+    // branch below). Intercepted HERE, before applyKey turns Esc into an
+    // `interruptSoft` with an unchanged buffer: otherwise Esc would fall to
+    // the soft-interrupt branch — interrupting the turn when busy, a no-op
+    // when idle — leaving the edit stranded.
     if (
       editingQueued !== null &&
       key.kind === 'key' &&
@@ -2807,18 +2825,19 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
 
     const result = applyKey(current, key);
 
-    // If an edit action empties a lifted queued-message buffer — Backspace
-    // to empty, Ctrl+U / Ctrl+W, or Ctrl+C's local clear — cancel the
-    // edit. Otherwise editingId stays set with an empty prompt and no
-    // visible bar: the message is hidden AND held out of drainInbox (a
-    // silent strand) until the operator stumbles onto ↓/Esc, and Enter is
-    // a no-op. Keying off the non-empty→empty transition covers every
-    // emptying operation, not just Ctrl+C — and subsumes the per-key edit
-    // cancel that the interrupt (Ctrl+C-empty) and EOF (Ctrl+D) branches
-    // would otherwise need, since the buffer must empty (and cancel here)
-    // before either of those can fire while editing.
+    // Erasing a lifted edit buffer to empty REMOVES the message from the
+    // inbox (INBOX §4.3 "cancel"): "lift it via ↑, erase it, it's gone", no
+    // confirm keystroke. Keyed off the non-empty→empty transition so it
+    // fires once, exactly when the buffer empties — so ANY gesture that
+    // reaches '' counts: Backspace, Ctrl+W (both span '\n'), Ctrl+C's local
+    // clear, Ctrl+D deleting the last char. Caveat: Ctrl+U / Ctrl+K are
+    // line-scoped (lineStart/lineEnd stop at a '\n'), so on a MULTI-LINE
+    // queued message they can't empty the buffer by themselves — reach for
+    // Backspace/Ctrl+W or ↓/Esc there. The deliberate "keep it as it was"
+    // escape is ↓ / Esc (handled above, before applyKey): they restore
+    // instead of remove.
     if (editingQueued !== null && current.value !== '' && result.next.value === '') {
-      cancelQueuedEdit();
+      removeQueuedEdit();
     }
 
     // Disarm the exit gate on any keystroke that ISN'T a fresh Ctrl+C.
@@ -2916,9 +2935,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     //     (`exiting` set in requestShutdown) keeps a stray follow-up
     //     keystroke from racing past the check.
     if (result.cancelInput === 'interrupt') {
-      // (No edit handling needed: Ctrl+C here fires only on an already-
-      // empty buffer, and the empty-buffer check above already cancelled
-      // any in-progress edit the moment its buffer emptied.)
+      // (No edit handling needed: Ctrl+C surfaces 'interrupt' only on an
+      // already-empty buffer, and while editing the buffer can't be empty —
+      // erasing it removes the message, clearing editingQueued, in the
+      // empty-transition branch above.)
       if (isBusy()) {
         triggerInterrupt();
       } else {
@@ -2931,9 +2951,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // signal; making them press it twice would surprise. While running,
     // route to the interrupt ladder for consistency with `^C` + Esc.
     if (result.cancelInput === 'eof') {
-      // (No edit handling needed: EOF fires only on an already-empty
-      // buffer, and the empty-buffer check above already cancelled any
-      // in-progress edit the moment its buffer emptied.)
+      // (No edit handling needed: EOF surfaces only on an already-empty
+      // buffer, which can't coexist with an open edit — erasing to empty
+      // removes the message in the empty-transition branch above.)
       if (running) {
         triggerInterrupt();
       } else {

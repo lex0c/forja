@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-04] INBOX: remove a queued message (lift via ↑, erase to empty)
+
+**Finding (operator report).** Once a message was queued in the inbox there was NO way to drop it. The operator's instinct — lift it via ↑, erase the text — only restored it: the non-empty→empty transition fired `cancelQueuedEdit()` (an anti-strand guard), so "edita e apaga" → "volta pro inbox". The spec always wanted this (`INBOX §4.3` "cancel"; the §6 status-line mock reads `↑ edit · ESC cancel last`); the in-memory implementation just never grew the affordance.
+
+**Fix — erasing a lifted edit to empty REMOVES the message, no confirm.** The operator's own gesture IS the remove gesture (operator chose no-confirm over an Enter step):
+- The non-empty→empty transition while editing now calls a new `removeQueuedEdit()` instead of `cancelQueuedEdit()` — it drops the message from the in-memory `inbox` and emits a new `inbox:remove` event. ANY emptying gesture counts (Backspace to empty, Ctrl+U / Ctrl+W, Ctrl+D forward-delete of the last char, Ctrl+C's local clear), since they all hit the same transition.
+- **↓ / Esc** stay the deliberate "keep it as it was" escape (cancel the edit, restore the original) — the way to bail out without removing. Distinct from erasing.
+- `removeQueuedEdit()` mirrors `cancelQueuedEdit()`'s idle-drain kick, so other messages held back when a turn ended aren't stranded after a removal.
+- `inbox:remove` reducer (`state.ts`) drops the item from `state.queued` and clears `editingId` — TERMINAL, the counterpart to `edit-cancel`'s restore. The Ctrl+C/Ctrl+D interrupt/eof branches need no edit handling: while editing the buffer can't be empty (erasing it already removed the message + cleared `editingQueued`), so those branches are unchanged from baseline.
+
+**Tests.** `repl.test.ts`: rewrote the 3 tests that encoded the old "emptying cancels" rule (Backspace-to-empty removes / no second turn; Ctrl+U-to-empty removes; Ctrl+C clears → removes) and added "remove after the turn ended leaves nothing queued"; the existing ↓/Esc "keep" tests (mangle then ↓/Esc, non-empty) are unchanged and still pass. `state.test.ts`: `inbox:remove` drops the item + clears editingId, siblings keep FIFO. Validated in the real REPL via `bun run dev` per the UI-iterate rule; a spec PR (reconciling the §4.3 gesture — erase-to-empty remove vs. the mock's `ESC cancel last` — and that the inbox is in-memory) comes after the UX stabilizes. No commit (awaiting operator review).
+
+**Review follow-up (max-effort multi-agent).** Core logic, cross-file consumers (reducer/render/no-persistence), and the "buffer can't be empty while editing" claim all came back clean. Acted on three findings: (1) the remove tests proved removal only via `toHaveLength(1)`, which a *stranded* edit would also satisfy (drainInbox excludes a held item) — added "erasing REMOVES (not strands): a later ↓ has nothing to restore", which fails if `removeQueuedEdit` regresses to a no-op/restore; (2) the reducer test now removes a MIDDLE item from a 3-item queue, asserting survivor FIFO order; (3) documented a real but narrow limitation — Ctrl+U / Ctrl+K are line-scoped (`lineStart`/`lineEnd` stop at `\n`), so they can't empty a MULTI-LINE queued message on their own (Backspace/Ctrl+W span newlines and do; ↓/Esc bail). Known intentional trade-off (operator's no-confirm choice): erasing to retype from scratch removes the original instantly and a retype enqueues a new message at the FIFO tail. Verification after fixes: repl + tui state/compose/inbox 281+ / 0 fail; `tsc --noEmit` + Biome clean.
+
 ## [2026-06-04] write/edit diff: skip the empty diff (no `(+0 -0)` card)
 
 **Finding (review of 2b9eb375).** `write_file` has no no-op guard, so overwriting a file with identical content emitted an empty `tool_diff` → the card showed `(+0 -0)` and bypassed tool-end batching for no real change. `edit_file` could hit the same on a change that `splitLines` normalizes away (e.g. only a trailing newline differs, so `working !== original` but the line diff is empty).

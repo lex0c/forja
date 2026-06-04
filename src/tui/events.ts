@@ -158,6 +158,17 @@ export type InboxEditCancelEvent = BaseEvent & {
   type: 'inbox:edit-cancel';
 };
 
+// INBOX remove (§4.3 "cancel"). The operator lifted a queued message via
+// ↑ and erased the buffer to empty — the gesture for "drop this queued
+// message" (no confirm keystroke). The reducer removes it from
+// `state.queued` and clears editingId. TERMINAL: unlike edit-cancel
+// (which restores the message unchanged), the message leaves the queue
+// for good and never drains.
+export type InboxRemoveEvent = BaseEvent & {
+  type: 'inbox:remove';
+  id: string;
+};
+
 // The inbox drained at a turn boundary: the queue empties and each
 // queued item freezes into a `user-submit` scrollback bar. `texts`
 // carries the drained bodies in FIFO order. The reducer does NOT clear
@@ -804,6 +815,7 @@ export type UIEvent =
   | InboxEditStartEvent
   | InboxEditCommitEvent
   | InboxEditCancelEvent
+  | InboxRemoveEvent
   | AssistantStartEvent
   | AssistantDeltaEvent
   | AssistantUsageEvent

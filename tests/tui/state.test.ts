@@ -304,6 +304,24 @@ describe('inbox (INBOX §6 — queued input, slice 1)', () => {
     expect(r.state.editingId).toBeNull();
     expect(r.state.queued).toEqual([{ id: '0', text: 'a' }]);
   });
+
+  test('inbox:remove drops the message from the queue and clears editingId (terminal)', () => {
+    let state = createInitialState();
+    state = applyEvent(state, { type: 'inbox:queued', ts: 1, id: '0', text: 'a' }).state;
+    state = applyEvent(state, { type: 'inbox:queued', ts: 2, id: '1', text: 'b' }).state;
+    state = applyEvent(state, { type: 'inbox:queued', ts: 3, id: '2', text: 'c' }).state;
+    state = applyEvent(state, { type: 'inbox:edit-start', ts: 4, id: '1' }).state;
+    const r = applyEvent(state, { type: 'inbox:remove', ts: 5, id: '1' });
+    // Unlike edit-cancel (which restores), the message is gone for good;
+    // the surviving siblings keep their FIFO order (removing the MIDDLE one
+    // leaves [a, c], not a reorder).
+    expect(r.state.queued).toEqual([
+      { id: '0', text: 'a' },
+      { id: '2', text: 'c' },
+    ]);
+    expect(r.state.editingId).toBeNull();
+    expect(r.permanent).toEqual([]);
+  });
 });
 
 describe('assistant streaming', () => {
