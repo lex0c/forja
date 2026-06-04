@@ -1,6 +1,7 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { setWritableCacheDirsOverride } from '../../src/permissions/sandbox-cache-dirs.ts';
 import { isSandboxProfile } from '../../src/permissions/sandbox-plan.ts';
 import {
   __resetSandboxMaskFileCacheForTest,
@@ -111,6 +112,247 @@ describe('buildBwrapArgv — cwd-rw-net profile', () => {
     expect(argv).not.toContain('--unshare-net');
     // pid still unshared.
     expect(argv).toContain('--unshare-pid');
+  });
+});
+
+// True iff argv contains the adjacent pair `--tmpfs <target>`.
+const hasTmpfs = (argv: readonly string[], target: string): boolean => {
+  for (let i = 0; i < argv.length - 1; i++) {
+    if (argv[i] === '--tmpfs' && argv[i + 1] === target) return true;
+  }
+  return false;
+};
+
+describe('buildBwrapArgv — writable dev-cache carve-out', () => {
+  // The carve-out resolves explicit option > module-level override >
+  // DEFAULT. Reset the override around each test so the default-path
+  // cases aren't polluted by another test (here or in another file
+  // sharing the module) leaving an override set.
+  beforeEach(() => setWritableCacheDirsOverride(undefined));
+  afterEach(() => setWritableCacheDirsOverride(undefined));
+
+  // The runner only emits `--tmpfs` for cache dirs that EXIST on the
+  // host (bwrap can't mkdir a mountpoint under the read-only base). The
+  // builder defaults to real `existsSync`; these argv-shape tests pin a
+  // deterministic probe so they don't depend on the runner's home.
+  const EXISTS_ALL = (): boolean => true;
+
+  test('cwd-rw mounts a tmpfs over each default cache dir (under home)', () => {
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: EXISTS_ALL,
+    });
+    for (const target of [`${HOME}/.cache`, `${HOME}/go/pkg/mod`, `${HOME}/.npm`]) {
+      expect(hasTmpfs(argv, target)).toBe(true);
+    }
+    // `.cargo` is NOT in the default (it masks the rustup cargo binary).
+    expect(hasTmpfs(argv, `${HOME}/.cargo`)).toBe(false);
+  });
+
+  test('cwd-rw-net also gets the carve-out', () => {
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw-net',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: EXISTS_ALL,
+    });
+    expect(hasTmpfs(argv, `${HOME}/.cache`)).toBe(true);
+  });
+
+  test('ro and home-rw do NOT get the cache carve-out', () => {
+    for (const profile of ['ro', 'home-rw'] as const) {
+      const argv = buildBwrapArgv({
+        profile,
+        cwd: CWD,
+        home: HOME,
+        innerArgv: INNER,
+        env: {},
+        realpath: (p) => p,
+        pathExists: EXISTS_ALL,
+      });
+      // The only tmpfs on these profiles is the common `/tmp`; no
+      // home-relative cache mounts.
+      expect(hasTmpfs(argv, `${HOME}/.cache`)).toBe(false);
+      expect(hasTmpfs(argv, `${HOME}/.npm`)).toBe(false);
+    }
+  });
+
+  test('EXISTENCE GATE: an absent cache dir is skipped (no spawn-abort)', () => {
+    // Critical: bwrap aborts the WHOLE spawn if asked to --tmpfs an
+    // absent path under the read-only base. The runner must skip absent
+    // dirs, not emit them. With nothing existing, NO cache tmpfs appears.
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: () => false,
+    });
+    expect(hasTmpfs(argv, `${HOME}/.cache`)).toBe(false);
+    expect(hasTmpfs(argv, `${HOME}/go/pkg/mod`)).toBe(false);
+    expect(hasTmpfs(argv, `${HOME}/.npm`)).toBe(false);
+    // Only existing dirs are carved out — mix: ~/.cache exists, ~/.npm not.
+    const partial = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: (p) => p === `${HOME}/.cache`,
+    });
+    expect(hasTmpfs(partial, `${HOME}/.cache`)).toBe(true);
+    expect(hasTmpfs(partial, `${HOME}/.npm`)).toBe(false);
+  });
+
+  test('an entry of "." is rejected — never masks the entire $HOME', () => {
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: EXISTS_ALL,
+      writableCacheDirs: ['.', './', 'foo/..'],
+    });
+    // None of these normalize to a real subdir; the home itself must NOT
+    // become a tmpfs mountpoint.
+    expect(hasTmpfs(argv, HOME)).toBe(false);
+    expect(hasTmpfs(argv, `${HOME}/`)).toBe(false);
+  });
+
+  test('override list replaces the default set verbatim', () => {
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: EXISTS_ALL,
+      writableCacheDirs: ['.cache/custom'],
+    });
+    expect(hasTmpfs(argv, `${HOME}/.cache/custom`)).toBe(true);
+    // Defaults are NOT also mounted.
+    expect(hasTmpfs(argv, `${HOME}/go/pkg/mod`)).toBe(false);
+    expect(hasTmpfs(argv, `${HOME}/.npm`)).toBe(false);
+  });
+
+  test('empty override disables the carve-out entirely', () => {
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: EXISTS_ALL,
+      writableCacheDirs: [],
+    });
+    expect(hasTmpfs(argv, `${HOME}/.cache`)).toBe(false);
+  });
+
+  test('defensively skips absolute / parent-escape entries (no arbitrary tmpfs)', () => {
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: EXISTS_ALL,
+      writableCacheDirs: ['/etc', '../../etc', 'a/../../b', 'ok'],
+    });
+    // No tmpfs lands outside home; only the clean `ok` entry mounts.
+    expect(argv).not.toContain('/etc');
+    expect(hasTmpfs(argv, `${HOME}/ok`)).toBe(true);
+  });
+
+  test('cache tmpfs sits AFTER --ro-bind / / and BEFORE the cwd bind + credential overlay', () => {
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      writableCacheDirs: ['.cargo'],
+      // Both the .cargo cache dir AND its credential file "exist" so the
+      // cache tmpfs and the hide-file overlay both emit.
+      pathExists: (p) => p === `${HOME}/.cargo` || p === `${HOME}/.cargo/credentials.toml`,
+      maskFileSource: MASK,
+    });
+    const cargoTmpfs = argv.indexOf(`${HOME}/.cargo`);
+    const cwdBind = argv.indexOf('--bind');
+    const credOverlay = argv.indexOf(`${HOME}/.cargo/credentials.toml`);
+    // After the base ro-bind (so the cache dir is WRITABLE, not re-masked).
+    const baseRoBind = argv.indexOf('--ro-bind');
+    expect(baseRoBind).toBeGreaterThanOrEqual(0);
+    expect(cargoTmpfs).toBeGreaterThan(baseRoBind);
+    // Before the cwd bind (cwd stays writable even if a cache dir
+    // contained it) and before the credential overlay (a cache entry can
+    // never un-mask a hidden credential — last mount wins).
+    expect(cwdBind).toBeGreaterThan(cargoTmpfs);
+    expect(credOverlay).toBeGreaterThan(cargoTmpfs);
+    expect(argv[credOverlay - 1]).toBe(MASK);
+    expect(argv[credOverlay - 2]).toBe('--ro-bind');
+  });
+
+  test('the bootstrap override is consulted when no explicit option is passed', () => {
+    setWritableCacheDirsOverride(['.cache/onlythis']);
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: EXISTS_ALL,
+    });
+    expect(hasTmpfs(argv, `${HOME}/.cache/onlythis`)).toBe(true);
+    // The default set is NOT also applied — the override replaced it.
+    expect(hasTmpfs(argv, `${HOME}/go/pkg/mod`)).toBe(false);
+  });
+
+  test('an explicit empty override disables the carve-out (tri-state preserved)', () => {
+    setWritableCacheDirsOverride([]);
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: EXISTS_ALL,
+    });
+    expect(hasTmpfs(argv, `${HOME}/.cache`)).toBe(false);
+  });
+
+  test('explicit option wins over the override', () => {
+    setWritableCacheDirsOverride(['.cache/fromoverride']);
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: EXISTS_ALL,
+      writableCacheDirs: ['.cache/fromoption'],
+    });
+    expect(hasTmpfs(argv, `${HOME}/.cache/fromoption`)).toBe(true);
+    expect(hasTmpfs(argv, `${HOME}/.cache/fromoverride`)).toBe(false);
   });
 });
 

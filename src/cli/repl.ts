@@ -617,6 +617,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     budgetConfigWarnings,
     effortConfigWarnings,
     auditConfigWarnings,
+    sandboxConfigWarnings,
     sandboxEnforcement,
   } = bootstrapped;
 
@@ -680,6 +681,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // long-running interactive sessions aren't blind to misconfig.
   for (const w of auditConfigWarnings) {
     errSink(`forja: audit config: ${w}\n`);
+  }
+  for (const w of sandboxConfigWarnings) {
+    errSink(`forja: sandbox config: ${w}\n`);
   }
   // Shared-corpus trust probe outcome (S5/T5.2 + T5.3). Render a
   // single summary line so operators see what the modal decision

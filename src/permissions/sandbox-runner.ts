@@ -58,13 +58,18 @@ import { existsSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { join as joinPath, resolve as resolveAbs } from 'node:path';
 import { defaultDataDir } from '../storage/paths.ts';
 import { startsWithSegment } from './protected_paths.ts';
+import { SANDBOX_SAFE_ENV_VARS as SAFE_ENV_VARS } from './safe-env-vars.ts';
+import { resolveSandboxBinary } from './sandbox-availability.ts';
 // Canonical env allowlist lives in a shared module so the macOS
 // runner uses the same source of truth via `/usr/bin/env -i
 // KEY=VAL ...` wrap. Without this, 3rd-party credential vars off
 // the scrub denylist would leak into the sandboxed bash on darwin
 // (sandbox-exec has no kernel-boundary clearenv).
-import { SANDBOX_SAFE_ENV_VARS as SAFE_ENV_VARS } from './safe-env-vars.ts';
-import { resolveSandboxBinary } from './sandbox-availability.ts';
+import {
+  DEFAULT_WRITABLE_CACHE_DIRS,
+  getWritableCacheDirsOverride,
+  normalizeCacheDir,
+} from './sandbox-cache-dirs.ts';
 import { HIDE_PATHS_DIRS, HIDE_PATHS_FILES } from './sandbox-hide-paths.ts';
 import { SANDBOX_PROFILE_ORDER, type SandboxProfile, isSandboxProfile } from './sandbox-plan.ts';
 import { buildSandboxExecArgv } from './sandbox-runner-macos.ts';
@@ -279,6 +284,14 @@ export interface BuildBwrapArgvOptions {
   // forja owns — not a place to relax the host-env allowlist by
   // proxy.
   passthroughEnv?: Record<string, string>;
+  // Operator-configurable list of $HOME-relative cache dirs exposed as
+  // fresh writable tmpfs mounts inside cwd-rw / cwd-rw-net (build
+  // toolchains cache under $HOME, which those profiles otherwise leave
+  // read-only). Omitted → DEFAULT_WRITABLE_CACHE_DIRS; an empty array
+  // disables the carve-out. Entries must be clean home-relative paths
+  // (no leading `/`, no `..`); the runner skips anything else
+  // defensively. See `sandbox-cache-dirs.ts`.
+  writableCacheDirs?: readonly string[];
 }
 
 // The env allowlist (`SAFE_ENV_VARS`) and the membership rules
@@ -483,6 +496,46 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
   // Network policy.
   if (profile !== 'cwd-rw-net') {
     flags.push('--unshare-net');
+  }
+  // Writable dev-cache carve-out. cwd-rw / cwd-rw-net leave $HOME
+  // read-only, which breaks build toolchains that cache UNDER $HOME
+  // (go-build → ~/.cache/go-build, go modules → ~/go/pkg/mod, npm →
+  // ~/.npm): EROFS aborts the build. Mount a fresh tmpfs over each cache
+  // dir so the toolchain gets a writable, ephemeral, host-isolated
+  // scratch area. See `sandbox-cache-dirs.ts` for the rationale + the
+  // ordering invariant: emitted AFTER `--ro-bind / /` (so it's writable)
+  // but BEFORE the cwd `--bind` and the HIDE_PATHS_* overlays below, so
+  // the cwd bind wins over a cache dir that contains it AND every
+  // credential overlay wins over a cache dir (a cache entry can never
+  // un-mask a hidden credential — bwrap applies mounts in argv order,
+  // last wins). Only the cwd-* profiles need it: `home-rw` already has a
+  // writable $HOME (and a tmpfs would mask the real cache it could
+  // reuse), `ro` writes nothing, `host` isn't wrapped.
+  if (profile === 'cwd-rw' || profile === 'cwd-rw-net') {
+    // Resolution: explicit per-call option > bootstrap override (operator
+    // config) > DEFAULT. The `??` chain preserves the override's
+    // tri-state — an explicit `[]` (carve-out disabled) is kept, only a
+    // genuine `undefined` falls through to DEFAULT.
+    const cacheDirs =
+      options.writableCacheDirs ?? getWritableCacheDirsOverride() ?? DEFAULT_WRITABLE_CACHE_DIRS;
+    for (const raw of cacheDirs) {
+      // Shared normalizer (same one the config loader uses) — rejects
+      // absolute / `..` / `.`-only / empty, so a bad entry can't `--tmpfs`
+      // an arbitrary path NOR collapse to `$HOME` itself (`.` → masks the
+      // whole home). Single source of truth: no guard drift.
+      const dir = normalizeCacheDir(raw);
+      if (dir === null) continue;
+      const abs = joinPath(home, dir);
+      // EXISTENCE GATE — load-bearing, not an optimization. bwrap can
+      // mount a tmpfs only over a path that exists; for an absent target
+      // it `mkdir`s the mountpoint under the read-only base, hits EROFS,
+      // and aborts the ENTIRE spawn (every command, not just the build).
+      // Hosts without ~/go, ~/.npm, etc. are common, so skip absent dirs:
+      // the toolchain that wanted one still can't write it (as before the
+      // carve-out), but nothing else breaks. Same gate HIDE_PATHS uses.
+      if (!pathExists(abs)) continue;
+      flags.push('--tmpfs', abs);
+    }
   }
   // Writable mounts per profile.
   //
@@ -698,6 +751,10 @@ export interface MaybeWrapSandboxArgvOptions {
   // BuildBwrapArgvOptions.passthroughEnv docstring for the threat
   // shape + membership rules.
   passthroughEnv?: Record<string, string>;
+  // Forwarded to buildBwrapArgv (Linux). See
+  // BuildBwrapArgvOptions.writableCacheDirs. Linux-only for now — the
+  // macOS SBPL runner does not consume it yet (tracked for parity).
+  writableCacheDirs?: readonly string[];
 }
 
 // Resolve `innerArgv[0]` to an absolute path AT WRAP TIME using the
@@ -805,6 +862,8 @@ export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): stri
       if (realpath !== undefined) bwrapOpts.realpath = realpath;
       if (options.pathExists !== undefined) bwrapOpts.pathExists = options.pathExists;
       if (options.passthroughEnv !== undefined) bwrapOpts.passthroughEnv = options.passthroughEnv;
+      if (options.writableCacheDirs !== undefined)
+        bwrapOpts.writableCacheDirs = options.writableCacheDirs;
       return buildBwrapArgv(bwrapOpts);
     }
   }

@@ -14,6 +14,7 @@ import {
   loadEffortConfig,
   loadMemoryConfig,
   loadProvidersConfig,
+  loadSandboxConfig,
 } from '../config/loaders.ts';
 import { createSqliteFailureSink } from '../failures/index.ts';
 import { DEFAULT_EFFORT } from '../harness/effort.ts';
@@ -50,6 +51,7 @@ import {
   maybeWrapSandboxArgv,
   preflightPermissionEngine,
 } from '../permissions/index.ts';
+import { setWritableCacheDirsOverride } from '../permissions/sandbox-cache-dirs.ts';
 import { createDefaultRegistry } from '../providers/index.ts';
 import type { Provider } from '../providers/index.ts';
 import type { SystemSegment } from '../providers/types.ts';
@@ -330,6 +332,12 @@ export interface BootstrapResult {
   // loaders. CLI driver renders these on stderr alongside the
   // memory / hook / providers / budget warnings.
   auditConfigWarnings: readonly string[];
+  // Warnings from the `[sandbox] writable_cache_dirs` loader — an
+  // entry dropped for being non-string / absolute / containing `..`
+  // (sanitizeWritableCacheDirs). Surfaced so an operator whose entry
+  // was silently ignored (and is now wondering why their build still
+  // can't write its cache) sees why, on the same stderr banner.
+  sandboxConfigWarnings: readonly string[];
   // Final state of the permission engine after bootstrap walked
   // init → loading-policy → validating-chain → ready/refusing.
   // When this is `refusing`, the engine is a deny-everything stub
@@ -478,6 +486,18 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // Single-call wire here keeps the threading out of every cache
   // writer's call signature.
   setRecapCacheTtlOverride(auditLoaded.config.recap_cache_ttl_ms);
+
+  // [sandbox] writable_cache_dirs — the $HOME-relative cache dirs the
+  // cwd-rw / cwd-rw-net sandbox profiles expose as writable tmpfs so
+  // build toolchains (go/cargo/npm/…) don't hit EROFS on a read-only
+  // $HOME. Sanitized by the loader; wired into the runner via a single
+  // module-level override so every spawn site (broker bash, bg bash,
+  // grep) picks it up without threading. `undefined` (no config) leaves
+  // the runner on DEFAULT_WRITABLE_CACHE_DIRS; an explicit `[]` disables
+  // the carve-out. Warnings surface via the same stderr banner as the
+  // other config loaders.
+  const sandboxLoaded = loadSandboxConfig({ cwd: projectConfigCwd });
+  setWritableCacheDirsOverride(sandboxLoaded.config.writableCacheDirs);
 
   // First-run banner. Fires once per machine when:
   //   (a) both detectors resolve to ON,
@@ -1526,6 +1546,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     budgetConfigWarnings: budgetLoaded.warnings,
     effortConfigWarnings: effortLoaded.warnings,
     auditConfigWarnings: auditLoaded.warnings,
+    sandboxConfigWarnings: sandboxLoaded.warnings,
     permissionState: permResult.state,
     ...(permResult.refusingReason !== undefined
       ? { permissionRefusingReason: permResult.refusingReason }
