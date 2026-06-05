@@ -49,13 +49,13 @@ describe('composeWithTaskDiscipline', () => {
     // in `in_progress`, signaling abandoned work to the operator
     // even when the visible answer is complete.
     const out = composeWithTaskDiscipline(undefined);
-    expect(out).toMatch(/close any active todos/i);
-    expect(out).toContain('todo_write');
+    expect(out).toMatch(/close any todos/i);
+    expect(out).toContain('todo_update');
     // Vocabulary check: rule must use the actual TodoStatus
     // values (`done`, `pending`, `in_progress`), not invented
-    // synonyms like `completed` / `abandoned` that todo_write
+    // synonyms like `completed` / `abandoned` that todo_update
     // would reject. A drift here would teach the model to call
-    // todo_write with invalid args.
+    // todo_update with invalid args.
     expect(out).toContain('`done`');
     expect(out).toContain('`pending`');
     expect(out).toContain('`in_progress`');

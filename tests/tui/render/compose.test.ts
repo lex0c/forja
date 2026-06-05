@@ -120,12 +120,11 @@ describe('composeLive layout', () => {
     expect(out[9]).toContain('opus');
   });
 
-  test('layered live region: TodoList → tool cards → pinned chip (top→bottom)', () => {
-    // TodoList sits at the top of the live region; the tool cards
-    // stack below it; the turn-phase chip is pinned at the bottom of
-    // the live region, directly above the input. The volatile tool
-    // stack grows upward, the always-present status rests at the
-    // bottom near the typing zone.
+  test('layered live region: tool cards → TodoList → pinned chip (top→bottom)', () => {
+    // The volatile tool zone (running cards, settling batch) stacks at the
+    // TOP; the TodoList sits at the BOTTOM of that stack, just above the
+    // turn-phase chip pinned directly over the input. A completing tool
+    // moves entirely above the list, never crossing it.
     const s = startedSession();
     s.todos = [{ content: 'plan it', activeForm: 'Planning it', status: 'pending' }];
     s.pendingAssistant = {
@@ -152,16 +151,16 @@ describe('composeLive layout', () => {
     // gets a leading BLANK so each is bounded by breathing space on
     // both sides. Sub-content (rows under "Tasks", `└─` under chips)
     // stays tight — it's the parent's subsession.
-    //   [BLANK, Tasks header, todo row,
-    //    BLANK, tool head, sub-content,
+    //   [BLANK, tool head, sub-content,
+    //    BLANK, Tasks header, todo row,
     //    BLANK, assistant chip,
     //    BLANK, rule, input, rule, footer]
-    expect(out[0]).toBe('  '); // leading blank before TodoList
-    expect(out[1]).toContain('Tasks');
-    expect(out[2]).toContain('plan it');
-    expect(out[3]).toBe('  '); // before tool card
-    expect(out[4]).toContain('Executing');
-    expect(out[5]).toContain('ls');
+    expect(out[0]).toBe('  '); // leading blank before tool card
+    expect(out[1]).toContain('Executing');
+    expect(out[2]).toContain('ls');
+    expect(out[3]).toBe('  '); // before TodoList
+    expect(out[4]).toContain('Tasks');
+    expect(out[5]).toContain('plan it');
     expect(out[6]).toBe('  '); // before the pinned chip
     // Pinned chip carries a verb from the OUTPUT pool (spinner-verbs.ts).
     expect(OUTPUT_VERB_POOL).toContain(verbInLine(out[7]) ?? '');

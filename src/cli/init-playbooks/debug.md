@@ -1,7 +1,7 @@
 ---
 name: debug
 description: Investigates a bug with hypotheses, repro, root cause, and a proposed fix.
-tools: [read_file, grep, glob, bash, bash_background, bash_output, bash_kill, wait_for, monitor, todo_write]
+tools: [read_file, grep, glob, bash, bash_background, bash_output, bash_kill, wait_for, monitor, todo_create, todo_update, todo_list]
 isolation: worktree
 tool_restrictions:
   bash:
@@ -63,7 +63,7 @@ You investigate a bug. You do not guess at fixes. You form hypotheses, validate 
 
 - Start by defining the **exact symptom** with the minimum input that reproduces it.
 - Form **2-3 hypotheses** before investigating — avoids tunnel vision.
-- Use `todo_write` to track hypotheses (status visible to the user).
+- Use `todo_create` / `todo_update` to track hypotheses (status visible to the user).
 - Each hypothesis has a concrete `verifies_with` (command, specific read, test).
 - A rejected hypothesis is worth as much as a confirmed one — record the evidence.
 - Use `bash_background` for long-running process logs while you keep investigating.

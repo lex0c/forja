@@ -262,10 +262,12 @@ const main = async (): Promise<number> => {
       return 1;
     }
     const { runRepl } = await import('./repl.ts');
-    // Hold each fast tool card on screen ~400ms so read / write / quick
-    // bash are actually perceptible instead of flashing past inside a
-    // single frame budget (see RendererOptions.toolMinDisplayMs).
-    return runRepl({ args, toolMinDisplayMs: 400 });
+    // Min-display hold left off (0): tool:end applies on arrival, so events
+    // process in order with zero added latency. The hold (RendererOptions.
+    // toolMinDisplayMs) would trade that latency to keep sub-frame tool
+    // cards on screen instead of flashing past — set a positive value to
+    // re-enable if the flash ever proves distracting.
+    return runRepl({ args, toolMinDisplayMs: 0 });
   }
 
   // Lazy import: pulling `./run.ts` transitively loads provider SDKs,

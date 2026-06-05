@@ -300,7 +300,7 @@ export interface ToolContext {
   bgManager?: BgManager;
   // Session-bound TodoList store. Optional so existing tools that
   // don't need it aren't forced to declare a dependency. The
-  // todo_write tool surfaces a clean error when absent rather than
+  // todo tools surface a clean error when absent rather than
   // dereferencing undefined. Per spec §7.4, the list does NOT
   // persist across sessions; the harness creates a fresh store at
   // session start and clears it at session end.
@@ -620,6 +620,9 @@ export const ERROR_CODES = {
   // the harness-level deny (which short-circuits before tool.execute
   // runs and uses the model-facing `tool_decided` event).
   permissionDenied: 'permission.denied',
+  // Todo CRUD: a todo_update / todo_get referenced an id not in the
+  // session's list — a stale reference or a typo in the model's call.
+  todoNotFound: 'todo.not_found',
 } as const;
 
 export const toolError = (

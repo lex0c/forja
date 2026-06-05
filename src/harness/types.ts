@@ -12,7 +12,7 @@ import type { ContextPinsStore } from '../storage/repos/context-pins.ts';
 import type { SessionStatus } from '../storage/repos/sessions.ts';
 import type { SubagentSet } from '../subagents/load.ts';
 import type { TelemetrySink } from '../telemetry/index.ts';
-import type { TodoItem } from '../todo/index.ts';
+import type { TodoItem, TodoStore } from '../todo/index.ts';
 import type { ClarifyBridgeRequest, ClarifyBridgeResponse, ToolRegistry } from '../tools/index.ts';
 import { type ForjaEffort, effortBudgetPatch } from './effort.ts';
 
@@ -136,6 +136,12 @@ export type HarnessEvent =
       // The TUI shows `exit N` so a failed command doesn't read as a
       // success. Absent for exit 0 and tools with no exit code.
       exitCode?: number;
+      // Optional one-line display detail the tool surfaced for its
+      // finished card (sanitized + capped upstream in invoke-tool). The
+      // TUI routes it to the `└─` connector on a successful chip — today
+      // clarify's "<question> → <answer>". Absent for tools that don't
+      // set `result_detail` on their output.
+      resultDetail?: string;
     }
   | {
       type: 'compaction_started';
@@ -226,7 +232,7 @@ export type HarnessEvent =
     }
   | {
       // Emitted whenever the session-bound TodoStore is mutated via
-      // `set` — i.e. INSIDE the `todo_write` tool's execute(), right
+      // `set` — i.e. INSIDE a todo CRUD tool's execute(), right
       // after the list lands in the store and BEFORE the tool returns.
       // The harness sees `todo_updated` fire between `tool_invoking`
       // and `tool_finished` for the same toolUseId. Producer is the
@@ -895,6 +901,14 @@ export interface HarnessConfig {
   // SAME store instance via SlashContext.contextPinsStore — both
   // surfaces share the underlying table.
   contextPinsStore?: ContextPinsStore;
+  // Session-bound TodoList store. A multi-turn caller (the REPL) builds
+  // ONE store at boot and injects it here so the list survives across
+  // turns — each turn re-runs runAgent, and without injection the loop's
+  // own per-run store would start empty every turn (the CRUD todo tools
+  // need ids to persist; the old full-replace todo_write masked this).
+  // When absent (one-shot run), the loop creates a per-run store and
+  // clears it at session-end; the caller owns teardown of an injected one.
+  todoStore?: TodoStore;
   // Async hook the harness calls when the permission engine returns
   // a `confirm` decision. Caller resolves true to allow the call
   // (recorded as confirm_yes) or false to deny (confirm_no). When

@@ -48,6 +48,16 @@ const exitCodeTool: Tool = {
   },
 };
 
+const detailTool: Tool = {
+  name: 'detailer',
+  description: 'returns a configurable result_detail',
+  inputSchema: { type: 'object', properties: { detail: {} } },
+  metadata: { category: 'misc', writes: false, idempotent: true },
+  async execute(args: unknown) {
+    return { content: 'ok', result_detail: (args as { detail: unknown }).detail };
+  },
+};
+
 const errorReturningTool: Tool = {
   name: 'fails',
   description: 'always returns error',
@@ -213,6 +223,45 @@ describe('invokeTool', () => {
     );
     expect(inv.failed).toBe(false);
     expect(inv.outputTruncated).toBeUndefined();
+  });
+
+  test('resultDetail set + sanitized from a success result.result_detail', async () => {
+    const deps = buildDeps(detailTool);
+    const inv = await invokeTool(
+      {
+        toolUseId: 'tu1',
+        toolName: 'detailer',
+        args: { detail: 'which file?\n→ \x1b[31msrc/x.ts\x1b[0m' },
+        messageId,
+      },
+      deps,
+    );
+    expect(inv.failed).toBe(false);
+    // ANSI stripped, newline collapsed to a single space.
+    expect(inv.resultDetail).toBe('which file? → src/x.ts');
+  });
+
+  test('resultDetail capped so a long detail cannot overflow the card', async () => {
+    const deps = buildDeps(detailTool);
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'detailer', args: { detail: 'x'.repeat(500) }, messageId },
+      deps,
+    );
+    expect((inv.resultDetail ?? '').length).toBeLessThanOrEqual(200);
+    expect(inv.resultDetail?.endsWith('…')).toBe(true);
+  });
+
+  test('resultDetail absent for a non-string result_detail or a tool that omits it', async () => {
+    const nonStr = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'detailer', args: { detail: 42 }, messageId },
+      buildDeps(detailTool),
+    );
+    expect(nonStr.resultDetail).toBeUndefined();
+    const noField = await invokeTool(
+      { toolUseId: 'tu2', toolName: 'echo', args: { msg: 'hi' }, messageId },
+      buildDeps(okTool),
+    );
+    expect(noField.resultDetail).toBeUndefined();
   });
 
   describe('summarize hook', () => {

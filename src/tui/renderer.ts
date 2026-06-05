@@ -46,6 +46,7 @@ import {
   applyEvent,
   createInitialState,
   flushPendingToolEndBatch,
+  liveRegionActive,
 } from './state.ts';
 import {
   type Capabilities,
@@ -586,11 +587,9 @@ export const createRenderer = (options: RendererOptions): Renderer => {
       ? null
       : createHeartbeat({
           ...(options.heartbeat ?? {}),
-          isActive: () =>
-            state.activeTools.size > 0 ||
-            state.thinking !== null ||
-            state.pendingAssistant !== null ||
-            state.awaitingProvider !== null,
+          // Live-region animation gate (running tool / thinking / streaming
+          // assistant / awaiting provider / an in_progress task's shimmer).
+          isActive: () => liveRegionActive(state),
           onTick: () => scheduler.request(),
         });
 

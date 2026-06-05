@@ -49,6 +49,13 @@ export interface ClarifyOutput {
   outcome: ClarifyOutcome;
   chosen_option_id?: string;
   user_text?: string;
+  // One-line display detail for the finished tool card (TUI). The
+  // generic `result_detail` convention the harness plumbs to
+  // `tool_finished` (invoke-tool's readResultDetail → tool:end summary),
+  // so the scrollback chip reads `Called clarify  └─ <question> →
+  // <answer>` instead of a bare verb. Also informative to the model: it
+  // pairs the question with the resolved label in one field.
+  result_detail?: string;
 }
 
 export const clarifyTool: Tool<ClarifyInput, ClarifyOutput> = {
@@ -139,13 +146,28 @@ export const clarifyTool: Tool<ClarifyInput, ClarifyOutput> = {
       signal: ctx.signal,
     });
 
+    // Display line for the finished card: pair the question with the
+    // resolved answer (`→` reads as "answered with"). Built here because
+    // this is the only point with the question, the option labels, and
+    // the chosen id together; invoke-tool sanitizes + caps it downstream.
+    const labelFor = (id: string): string => args.options.find((o) => o.id === id)?.label ?? id;
+    // Cap each side independently so the assembled line stays under
+    // invoke-tool's 200-char display cap WITH the answer intact: capping
+    // the whole line downstream would truncate the tail — the answer, the
+    // part that matters most — whenever the question runs long.
+    const cap = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+    const detailLine = (answer: string): string =>
+      `${cap(args.question, 120)} → ${cap(answer, 70)}`;
+
     // skipped → proceed with the assumed default so the model has a
     // concrete choice to act on (§12.3 60s-timeout default =
     // skip-and-proceed-with-options[0]).
     if (resolution.outcome === 'skipped') {
+      const chosen = resolution.chosen_option_id ?? defaultOptionId;
       return {
         outcome: 'skipped',
-        chosen_option_id: resolution.chosen_option_id ?? defaultOptionId,
+        chosen_option_id: chosen,
+        result_detail: detailLine(`${labelFor(chosen)} (default)`),
       };
     }
     return {
@@ -154,6 +176,18 @@ export const clarifyTool: Tool<ClarifyInput, ClarifyOutput> = {
         ? { chosen_option_id: resolution.chosen_option_id }
         : {}),
       ...(resolution.user_text !== undefined ? { user_text: resolution.user_text } : {}),
+      result_detail:
+        resolution.outcome === 'escalated'
+          ? detailLine(
+              resolution.user_text !== undefined
+                ? `re-grounded: ${resolution.user_text}`
+                : 're-grounded',
+            )
+          : detailLine(
+              resolution.chosen_option_id !== undefined
+                ? labelFor(resolution.chosen_option_id)
+                : 'resolved',
+            ),
     };
   },
 };

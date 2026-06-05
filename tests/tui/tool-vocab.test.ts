@@ -10,6 +10,7 @@ describe('tool-vocab', () => {
       'bash_background',
       'bash_kill',
       'bash_output',
+      'clarify',
       'edit_file',
       'glob',
       'grep',
@@ -20,7 +21,11 @@ describe('tool-vocab', () => {
       'monitor',
       'read_file',
       'task',
-      'todo_write',
+      'todo_clear',
+      'todo_create',
+      'todo_get',
+      'todo_list',
+      'todo_update',
       'wait_for',
       'write_file',
     ];
@@ -33,6 +38,14 @@ describe('tool-vocab', () => {
     const v = lookupToolVocab('read_file');
     expect(v.activeVerb).toBe('Reading file');
     expect(v.finalVerb).toBe('Read file');
+  });
+
+  test('clarify settles as "Question answered" (not the generic Called verb)', () => {
+    const v = lookupToolVocab('clarify');
+    expect(v.activeVerb).toBe('Asking');
+    expect(v.finalVerb).toBe('Question answered');
+    // No subject — the question→answer rides the resultDetail connector.
+    expect(v.subject).toBeUndefined();
   });
 
   test('lookupToolVocab falls back to generic verbs for unknown names', () => {
@@ -82,8 +95,8 @@ describe('tool-vocab', () => {
     expect(TOOL_VOCAB.task?.subject?.({})).toBeNull();
   });
 
-  test('todo_write has no subject extractor (the count goes elsewhere)', () => {
-    expect(TOOL_VOCAB.todo_write?.subject).toBeUndefined();
+  test('todo_create has no subject extractor (the count goes elsewhere)', () => {
+    expect(TOOL_VOCAB.todo_create?.subject).toBeUndefined();
   });
 
   // Discriminated-union tools (monitor, wait_for) take a nested

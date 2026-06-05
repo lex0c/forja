@@ -175,11 +175,7 @@ export const buildResumeContext = (input: BuildResumeContextInput): ResumeContex
     );
     sections.push('');
     sections.push(
-      ...buildSection(
-        'Open todos (last todo_write):',
-        intermediate.notDone.map(formatNotDoneLine),
-        '  - (none)',
-      ),
+      ...buildSection('Open todos:', intermediate.notDone.map(formatNotDoneLine), '  - (none)'),
     );
     sections.push('');
     sections.push(

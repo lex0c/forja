@@ -40,8 +40,8 @@ describe('buildContextSummary — format', () => {
   });
 
   test('empty capability kinds render as `caps=-`', () => {
-    const r = buildContextSummary([entry('todo_write', 'allow', [])]);
-    expect(r).toBe('step 1: tool=todo_write decision=allow caps=-');
+    const r = buildContextSummary([entry('todo_create', 'allow', [])]);
+    expect(r).toBe('step 1: tool=todo_create decision=allow caps=-');
   });
 
   test('kinds are sorted alphabetically (replay determinism)', () => {

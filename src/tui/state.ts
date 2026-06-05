@@ -489,6 +489,19 @@ export interface QueuedInput {
   text: string;
 }
 
+// True when something in the live region is animating and the frame
+// scheduler must keep redrawing: a running tool's spinner, the thinking /
+// awaiting-provider duration counters, a streaming assistant chip — or a
+// task marked in_progress, whose `Tasks` header carries the live-verb
+// shimmer (render/todo-list.ts). Goes false (scheduler idles, zero wakeups)
+// once none of those hold. The renderer's heartbeat polls this each tick.
+export const liveRegionActive = (state: LiveState): boolean =>
+  state.activeTools.size > 0 ||
+  state.thinking !== null ||
+  state.pendingAssistant !== null ||
+  state.awaitingProvider !== null ||
+  state.todos.some((t) => t.status === 'in_progress');
+
 export const createInitialState = (): LiveState => ({
   input: { value: '', cursor: 0 },
   queued: [],
@@ -1298,8 +1311,16 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // must not vanish into a coalesced "Executed N commands" batch.
       // A tool carrying a display diff (write/edit) bypasses batching
       // too: its per-file diff is rich detail a coalesced "Edited N
-      // files" chip can't show, so it gets its own card.
-      if (event.status !== 'done' || event.exitCode !== undefined || event.diff !== undefined) {
+      // files" chip can't show, so it gets its own card. A done chip
+      // carrying a `summary` (a tool's one-line `result_detail`, e.g.
+      // clarify's question→answer) bypasses for the same reason — the
+      // coalesced "Called N" head has nowhere to show it.
+      if (
+        event.status !== 'done' ||
+        event.exitCode !== undefined ||
+        event.diff !== undefined ||
+        event.summary !== undefined
+      ) {
         const flushed = flushPendingToolEndBatch(state);
         const item: PermanentItem = {
           kind: 'tool-end',

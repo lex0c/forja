@@ -1,11 +1,12 @@
 import { describe, expect, test } from 'bun:test';
-import type { UIEvent } from '../../src/tui/events.ts';
+import type { TodoItemForUI, UIEvent } from '../../src/tui/events.ts';
 import {
   type LiveState,
   type PermanentItem,
   applyEvent,
   createInitialState,
   flushPendingToolEndBatch,
+  liveRegionActive,
 } from '../../src/tui/state.ts';
 
 const start = (overrides: Partial<UIEvent> = {}): UIEvent =>
@@ -17,6 +18,32 @@ const start = (overrides: Partial<UIEvent> = {}): UIEvent =>
     model: 'claude-opus-4-7',
     ...overrides,
   }) as UIEvent;
+
+const uiTodo = (status: TodoItemForUI['status']): TodoItemForUI => ({
+  content: 'x',
+  activeForm: 'X',
+  status,
+});
+
+describe('liveRegionActive', () => {
+  test('idle when nothing in the live region is running', () => {
+    expect(liveRegionActive(createInitialState())).toBe(false);
+  });
+
+  test('an in_progress task keeps it active (drives the Tasks header shimmer)', () => {
+    const base = createInitialState();
+    expect(liveRegionActive({ ...base, todos: [uiTodo('in_progress')] })).toBe(true);
+    // done / pending alone must NOT keep redrawing — only in_progress
+    // animates, so a finished list lets the scheduler idle (zero wakeups).
+    expect(liveRegionActive({ ...base, todos: [uiTodo('done'), uiTodo('pending')] })).toBe(false);
+  });
+
+  test('also active for thinking / awaiting-provider (extracted logic intact)', () => {
+    const base = createInitialState();
+    expect(liveRegionActive({ ...base, thinking: { startedAt: 0, messageId: 'm' } })).toBe(true);
+    expect(liveRegionActive({ ...base, awaitingProvider: { stepN: 1, startedAt: 0 } })).toBe(true);
+  });
+});
 
 const drive = (events: UIEvent[]): { state: LiveState; permanent: PermanentItem[] } => {
   let state = createInitialState();
@@ -729,6 +756,42 @@ describe('tool lifecycle', () => {
     ]);
   });
 
+  test('tool:end done with a summary bypasses the batch and carries the summary', () => {
+    // clarify's `result_detail` arrives as `summary` on a done chip; it
+    // must surface as its own card (a coalesced "Called N" head has
+    // nowhere to show it), so a done+summary chip bypasses batching.
+    const result = drive([
+      {
+        type: 'tool:start',
+        ts: 1,
+        toolId: 't1',
+        name: 'clarify',
+        activeVerb: 'Calling clarify',
+        finalVerb: 'Called clarify',
+        subject: null,
+      },
+      {
+        type: 'tool:end',
+        ts: 200,
+        toolId: 't1',
+        status: 'done',
+        durationMs: 50,
+        summary: 'which file? → src/checkout.ts',
+      },
+    ]);
+    expect(result.permanent).toEqual([
+      {
+        kind: 'tool-end',
+        name: 'clarify',
+        verb: 'Called clarify',
+        subject: null,
+        status: 'done',
+        durationMs: 50,
+        summary: 'which file? → src/checkout.ts',
+      },
+    ]);
+  });
+
   test('tool:end without summary emits item without summary field', () => {
     const result = drive([
       {
@@ -806,7 +869,7 @@ describe('tool lifecycle', () => {
         type: 'tool:start',
         ts: 1,
         toolId: 't1',
-        name: 'todo_write',
+        name: 'todo_create',
         activeVerb: 'Updating todos',
         finalVerb: 'Updated todos',
         subject: null,
@@ -1153,7 +1216,7 @@ describe('tool-end batch coalescing', () => {
   });
 
   test('null subjects are filtered out of the batch continuation list', () => {
-    // todo_write-style tools (no vocab subject) produce null
+    // todo_create-style tools (no vocab subject) produce null
     // subjects. They count toward `count` but don't surface as
     // `|_` continuation lines (a bare `|_ ` with no payload is
     // visual noise). Tested with a non-todo tool name so the

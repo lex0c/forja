@@ -283,7 +283,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // db.close() in cli/run.ts and hit a closed sqlite handle.
   let checkpointsPurgeInFlight: Promise<unknown> | undefined;
   // Per-session TodoList store. Created once per session here so the
-  // todo_write tool sees a fresh list, and torn down in the outer
+  // todo tools see a fresh list, and torn down in the outer
   // finally so accumulated state from a long-lived process doesn't
   // leak across sessions. Spec §7.4: not persisted, work-state only.
   //
@@ -293,7 +293,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // than mutating the store keeps test contexts that build a store
   // directly free of the emit dependency. `clear` is NOT wrapped —
   // session-end cleanup is not a planning event (D132).
-  const baseTodoStore = createTodoStore();
+  // Injected by a multi-turn caller (REPL) so the list persists across
+  // turns; a one-shot run gets a fresh per-run store (cleared below).
+  const baseTodoStore = config.todoStore ?? createTodoStore();
   // Wrap each method through a fresh closure rather than aliasing the
   // method reference. Today `createTodoStore` returns plain arrows
   // bound by closure (no `this`), so direct aliasing would work — but
@@ -314,6 +316,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         items: baseTodoStore.get(sid),
       });
     },
+    // nextId is not an observable mutation — it just hands out the next
+    // id; the row lands via a later set() that emits. Plain pass-through.
+    nextId: (sid) => baseTodoStore.nextId(sid),
     clear: (sid) => baseTodoStore.clear(sid),
   };
   // Per-run totals. Each completed provider turn adds its usage and
@@ -2976,6 +2981,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             ...(inv.errorMessage !== undefined ? { errorMessage: inv.errorMessage } : {}),
             ...(inv.outputTruncated === true ? { outputTruncated: true } : {}),
             ...(inv.exitCode !== undefined ? { exitCode: inv.exitCode } : {}),
+            ...(inv.resultDetail !== undefined ? { resultDetail: inv.resultDetail } : {}),
           });
           // Persist the dispatch-rewrite audit row now that invokeTool
           // created the tool_calls row that the FK points at. Skipped
@@ -3718,14 +3724,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // are visible via the background_processes audit table.
       }
     }
-    // Defensive: drop the in-memory TodoList for this session.
-    // The store is currently a function-local Map (created on
-    // line ~125) so GC reclaims it when runAgent returns — the
-    // clear is redundant in today's ownership model. Kept for
-    // forward compatibility: if the store is ever hoisted to a
-    // process-level singleton (e.g., daemon mode running multiple
-    // sessions in one process), this hook is what prevents
-    // accumulation. Idempotent on unknown / empty sessionId.
-    todoStore.clear(sessionId);
+    // Drop the in-memory TodoList for this session — but ONLY when the
+    // loop owns the store (one-shot run, store created above). When the
+    // store was INJECTED (the REPL, where it must survive across turns),
+    // the caller owns teardown; clearing here would wipe the list between
+    // every turn — the exact bug the injection fixes. Idempotent.
+    if (config.todoStore === undefined) {
+      todoStore.clear(sessionId);
+    }
   }
 };

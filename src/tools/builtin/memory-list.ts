@@ -68,7 +68,7 @@ export const memoryListTool: Tool<MemoryListInput, MemoryListOutput> = {
     },
   },
   metadata: {
-    // misc — same rationale as todo_write: the tool's only side
+    // misc — same rationale as the todo tools: the tool's only side
     // effect is reading the in-process registry snapshot. The
     // model's policy engine has no per-memory permission concept;
     // any future "deny memory access by scope" rule belongs in a

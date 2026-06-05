@@ -7,7 +7,8 @@ import type { Policy } from '../../src/permissions/index.ts';
 import type { Provider, StreamEvent } from '../../src/providers/index.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
-import { todoWriteTool } from '../../src/tools/builtin/todo-write.ts';
+import { createTodoStore } from '../../src/todo/index.ts';
+import { todoCreateTool } from '../../src/tools/builtin/todo-create.ts';
 import { createToolRegistry } from '../../src/tools/registry.ts';
 import type { Tool } from '../../src/tools/types.ts';
 
@@ -335,10 +336,10 @@ describe('runAgent onEvent', () => {
     expect(types).toContain('tool_finished');
   });
 
-  test('todo_write run emits todo_updated between tool_invoking and tool_finished', async () => {
+  test('todo_create run emits todo_updated between tool_invoking and tool_finished', async () => {
     const events: HarnessEvent[] = [];
     const r = createToolRegistry();
-    r.register(todoWriteTool as unknown as Tool);
+    r.register(todoCreateTool as unknown as Tool);
     const items = [
       {
         content: 'Implement payment flow',
@@ -350,13 +351,13 @@ describe('runAgent onEvent', () => {
     await runAgent({
       provider: mockProvider([
         {
-          tool_uses: [{ id: 'tu1', name: 'todo_write', input: { items } }],
+          tool_uses: [{ id: 'tu1', name: 'todo_create', input: { items } }],
           stop_reason: 'tool_use',
         },
         { text: 'done', stop_reason: 'end_turn' },
       ]),
       toolRegistry: r,
-      // todo_write is category 'misc' — engine allows it by default
+      // todo_create is category 'misc' — engine allows it by default
       // (no per-category gate). No policy override needed.
       permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
       db,
@@ -378,8 +379,8 @@ describe('runAgent onEvent', () => {
     // ctx.todoStore.set(), the wrapped set persists then emits, the
     // tool then returns and the harness emits tool_finished. This is
     // the natural flow for the renderer — the operator sees the list
-    // materialize while the chip is still in its "Updating todos..."
-    // form, then the chip resolves to "Updated N items".
+    // materialize while the chip is still in its "Adding todos..."
+    // form, then the chip resolves to "Added todos".
     expect(todoUpdatedIdx).toBeGreaterThan(toolInvokingIdx);
     expect(todoUpdatedIdx).toBeLessThan(toolFinishedIdx);
     const updated = events[todoUpdatedIdx] as Extract<HarnessEvent, { type: 'todo_updated' }>;
@@ -393,19 +394,19 @@ describe('runAgent onEvent', () => {
     // Asserts the wrap reads back through baseStore.get() (deep
     // clone) instead of forwarding the input array directly. Without
     // this, an observer mutation would poison the store and the next
-    // todo_write would surface the corrupted state. Regression cover
+    // todo_create would surface the corrupted state. Regression cover
     // for a future "optimization" that swaps the get() back to raw
     // items.
     const events: HarnessEvent[] = [];
     const r = createToolRegistry();
-    r.register(todoWriteTool as unknown as Tool);
+    r.register(todoCreateTool as unknown as Tool);
     await runAgent({
       provider: mockProvider([
         {
           tool_uses: [
             {
               id: 'tu1',
-              name: 'todo_write',
+              name: 'todo_create',
               input: {
                 items: [{ content: 'first', status: 'pending', active_form: 'Doing first' }],
               },
@@ -417,7 +418,7 @@ describe('runAgent onEvent', () => {
           tool_uses: [
             {
               id: 'tu2',
-              name: 'todo_write',
+              name: 'todo_create',
               input: {
                 items: [{ content: 'second', status: 'pending', active_form: 'Doing second' }],
               },
@@ -433,13 +434,16 @@ describe('runAgent onEvent', () => {
       cwd: '/p',
       userPrompt: 'hi',
       onEvent: (e) => {
-        // Mutate the FIRST event's items to try to poison whatever
-        // the store holds. The wrap's get()-readthrough means this
-        // mutation hits a deep clone and dies in the observer's
-        // local array.
-        if (e.type === 'todo_updated' && e.items[0]?.content === 'first') {
-          e.items[0].content = 'POISONED';
-          e.items.push({ content: 'INJECTED', status: 'done', activeForm: 'evil' });
+        // Try to poison the store by mutating the FIRST emission's items
+        // (the only one with a single row). The wrap reads back through
+        // baseStore.get() (deep clone), so this mutation dies in the
+        // observer's local array and the next emission stays clean. Guard
+        // on length 1: todo_create APPENDS, so `first` is still at index 0
+        // on the second emission — an unconditional mutation would poison
+        // that observed copy too and mask the regression.
+        if (e.type === 'todo_updated' && e.items.length === 1) {
+          if (e.items[0] !== undefined) e.items[0].content = 'POISONED';
+          e.items.push({ id: '99', content: 'INJECTED', status: 'done', activeForm: 'evil' });
         }
         events.push(e);
       },
@@ -448,10 +452,53 @@ describe('runAgent onEvent', () => {
       (e): e is Extract<HarnessEvent, { type: 'todo_updated' }> => e.type === 'todo_updated',
     );
     expect(updates).toHaveLength(2);
-    // Second emission reflects only the second tool's payload — no
-    // trace of the first observer's mutation.
-    expect(updates[1]?.items).toHaveLength(1);
-    expect(updates[1]?.items[0]?.content).toBe('second');
+    // todo_create appends, so the second emission is [first, second] read
+    // back from the store: `first` is intact (not POISONED) and there's
+    // no INJECTED row — the observer's mutation never reached the store.
+    expect(updates[1]?.items).toHaveLength(2);
+    expect(updates[1]?.items[0]?.content).toBe('first');
+    expect(updates[1]?.items[1]?.content).toBe('second');
+  });
+
+  test('an injected todoStore survives session-end (REPL cross-turn persistence)', async () => {
+    // The REPL injects ONE store and re-runs runAgent per turn; the store
+    // must survive session-end so a later turn's todo_update finds the ids
+    // an earlier turn created. A loop-owned per-run store gets cleared at
+    // session-end and the list would vanish between turns (the bug).
+    const store = createTodoStore();
+    const r = createToolRegistry();
+    r.register(todoCreateTool as unknown as Tool);
+    const events: HarnessEvent[] = [];
+    await runAgent({
+      provider: mockProvider([
+        {
+          tool_uses: [
+            {
+              id: 'tu1',
+              name: 'todo_create',
+              input: { items: [{ content: 'plan', status: 'pending', active_form: 'Planning' }] },
+            },
+          ],
+          stop_reason: 'tool_use',
+        },
+        { text: 'done', stop_reason: 'end_turn' },
+      ]),
+      toolRegistry: r,
+      todoStore: store,
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'hi',
+      onEvent: (e) => events.push(e),
+    });
+    const updated = events.find(
+      (e): e is Extract<HarnessEvent, { type: 'todo_updated' }> => e.type === 'todo_updated',
+    );
+    if (updated === undefined) throw new Error('expected a todo_updated event');
+    // After runAgent returns, the INJECTED store STILL holds the todo —
+    // a loop-owned store would have been cleared at session-end.
+    expect(store.get(updated.sessionId)).toHaveLength(1);
+    expect(store.get(updated.sessionId)[0]?.content).toBe('plan');
   });
 
   test('provider usage event surfaces verbatim in onEvent (consumed by adapter)', async () => {

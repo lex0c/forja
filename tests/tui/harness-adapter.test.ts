@@ -580,6 +580,47 @@ describe('harness-adapter — tool lifecycle', () => {
     expect(e.toolId).toBe('t1');
   });
 
+  test('silent tools (todos) are tracked but emit no chip; todo:update still flows', () => {
+    // The todo tools' effect is the live `Tasks` block (todo:update); the
+    // per-call chips would be scrollback noise, so the vocab marks them
+    // `silent` and the adapter suppresses tool:start / execution / end.
+    const a = createHarnessAdapter(baseCtx());
+    expect(
+      types(
+        a.translate({
+          type: 'tool_invoking',
+          toolUseId: 't1',
+          toolName: 'todo_create',
+          args: { items: [] },
+        }),
+      ),
+    ).toEqual([]);
+    // execution-started for the tracked silent tool is suppressed too.
+    expect(types(a.translate({ type: 'tool_execution_started', toolUseId: 't1' }))).toEqual([]);
+    // The store mutation's todo_updated STILL becomes the Tasks block.
+    expect(
+      types(
+        a.translate({
+          type: 'todo_updated',
+          sessionId: 's',
+          items: [{ id: '1', content: 'a', activeForm: 'A', status: 'pending' }],
+        }),
+      ),
+    ).toEqual(['todo:update']);
+    // tool_finished → no tool:end chip.
+    expect(
+      types(
+        a.translate({
+          type: 'tool_finished',
+          toolUseId: 't1',
+          toolName: 'todo_create',
+          failed: false,
+          durationMs: 1,
+        }),
+      ),
+    ).toEqual([]);
+  });
+
   test('unknown tool falls back to generic Calling/Called verbs and null subject', () => {
     const a = createHarnessAdapter(baseCtx());
     const out = a.translate({
@@ -779,6 +820,27 @@ describe('harness-adapter — tool lifecycle', () => {
     const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
     expect(e.status).toBe('error');
     expect(e.summary).toBe('ENOENT: no such file or directory');
+  });
+
+  test('resultDetail on a done tool_finished surfaces as summary on tool:end', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({
+      type: 'tool_invoking',
+      toolUseId: 't1',
+      toolName: 'clarify',
+      args: {},
+    });
+    const out = a.translate({
+      type: 'tool_finished',
+      toolUseId: 't1',
+      toolName: 'clarify',
+      failed: false,
+      durationMs: 5,
+      resultDetail: 'which file? → src/checkout.ts',
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(e.status).toBe('done');
+    expect(e.summary).toBe('which file? → src/checkout.ts');
   });
 
   test('outputTruncated on tool_finished carries onto tool:end', () => {
@@ -1119,8 +1181,8 @@ describe('harness-adapter — compaction & checkpoints', () => {
       type: 'todo_updated',
       sessionId: 'sess-1',
       items: [
-        { content: 'Implement', activeForm: 'Implementing', status: 'in_progress' },
-        { content: 'Test', activeForm: 'Testing', status: 'pending' },
+        { id: '1', content: 'Implement', activeForm: 'Implementing', status: 'in_progress' },
+        { id: '2', content: 'Test', activeForm: 'Testing', status: 'pending' },
       ],
     });
     expect(types(out)).toEqual(['todo:update']);
@@ -1139,6 +1201,21 @@ describe('harness-adapter — compaction & checkpoints', () => {
     const out = a.translate({ type: 'todo_updated', sessionId: 's', items: [] });
     expect(types(out)).toEqual(['todo:update']);
     expect((out[0] as Extract<UIEvent, { type: 'todo:update' }>).items).toEqual([]);
+  });
+
+  test('soft-deleted (removed) items are dropped from todo:update', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'todo_updated',
+      sessionId: 's',
+      items: [
+        { id: '1', content: 'kept', activeForm: 'Keeping', status: 'pending' },
+        { id: '2', content: 'gone', activeForm: 'Going', status: 'removed' },
+      ],
+    });
+    const ev = out[0] as Extract<UIEvent, { type: 'todo:update' }>;
+    expect(ev.items).toHaveLength(1);
+    expect(ev.items[0]?.content).toBe('kept');
   });
 });
 

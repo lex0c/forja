@@ -126,6 +126,66 @@ describe('clarify: every call routes through the modal bridge', () => {
   });
 });
 
+describe('clarify: result_detail (finished-card display line)', () => {
+  test('resolved — pairs the question with the chosen label', async () => {
+    const result = await clarifyTool.execute(
+      { question: 'which file?', options: OPTS },
+      makeCtx({ clarify: async () => ({ outcome: 'resolved' as const, chosen_option_id: 'b' }) }),
+    );
+    if (isToolError(result)) throw new Error(`unexpected: ${result.error_message}`);
+    expect(result.result_detail).toBe('which file? → src/checkout.ts');
+  });
+
+  test('skipped — shows the assumed default label, marked (default)', async () => {
+    const result = await clarifyTool.execute(
+      { question: 'which file?', options: OPTS },
+      makeCtx({ clarify: async () => ({ outcome: 'skipped' as const }) }),
+    );
+    if (isToolError(result)) throw new Error(`unexpected: ${result.error_message}`);
+    expect(result.result_detail).toBe('which file? → src/orders.ts (default)');
+  });
+
+  test('escalated — surfaces the re-grounding reason', async () => {
+    const result = await clarifyTool.execute(
+      { question: 'which file?', options: OPTS },
+      makeCtx({
+        clarify: async () => ({ outcome: 'escalated' as const, user_text: 'wrong goal' }),
+      }),
+    );
+    if (isToolError(result)) throw new Error(`unexpected: ${result.error_message}`);
+    expect(result.result_detail).toBe('which file? → re-grounded: wrong goal');
+  });
+
+  test('escalated without user_text — bare re-grounded', async () => {
+    const result = await clarifyTool.execute(
+      { question: 'which file?', options: OPTS },
+      makeCtx({ clarify: async () => ({ outcome: 'escalated' as const }) }),
+    );
+    if (isToolError(result)) throw new Error(`unexpected: ${result.error_message}`);
+    expect(result.result_detail).toBe('which file? → re-grounded');
+  });
+
+  test('falls back to the raw id when the chosen option is not in the list', async () => {
+    const result = await clarifyTool.execute(
+      { question: 'which file?', options: OPTS },
+      makeCtx({ clarify: async () => ({ outcome: 'resolved' as const, chosen_option_id: 'zzz' }) }),
+    );
+    if (isToolError(result)) throw new Error(`unexpected: ${result.error_message}`);
+    expect(result.result_detail).toBe('which file? → zzz');
+  });
+
+  test('caps a long question so the answer survives at the tail', async () => {
+    const result = await clarifyTool.execute(
+      { question: 'q'.repeat(300), options: OPTS },
+      makeCtx({ clarify: async () => ({ outcome: 'resolved' as const, chosen_option_id: 'b' }) }),
+    );
+    if (isToolError(result)) throw new Error(`unexpected: ${result.error_message}`);
+    // The question is capped (…) but the answer is never truncated away.
+    expect(result.result_detail?.endsWith('→ src/checkout.ts')).toBe(true);
+    expect(result.result_detail).toContain('…');
+  });
+});
+
 describe('clarify: abort', () => {
   test('returns tool.aborted when the signal is already aborted', async () => {
     const ac = new AbortController();

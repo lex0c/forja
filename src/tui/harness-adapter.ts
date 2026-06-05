@@ -20,29 +20,8 @@ import type { FileDiff } from '../diff/line-diff.ts';
 import type { ExitReason, HarnessEvent } from '../harness/types.ts';
 import type { Decision } from '../permissions/index.ts';
 import { stripAnsi } from '../sanitize/index.ts';
-import type { TodoItem, TodoStatus } from '../todo/index.ts';
-import type { SessionEndEvent, TodoItemForUI, TodoStatusForUI, UIEvent } from './events.ts';
+import type { SessionEndEvent, TodoItemForUI, UIEvent } from './events.ts';
 import { lookupToolVocab } from './tool-vocab.ts';
-
-// Compile-time fence: every TodoStore status must be representable as
-// a TodoItemForUI status. The `satisfies` makes the relationship
-// explicit — if `src/todo/index.ts` adds a new variant (e.g. 'blocked')
-// without also adding it to `TodoStatusForUI`, this constant fails to
-// type-check and the build breaks. The runtime value is unused; the
-// presence of the assertion is the contract.
-const _STATUS_FENCE: TodoStatus[] = ['pending', 'in_progress', 'done'] satisfies TodoStatus[];
-void (_STATUS_FENCE as TodoStatusForUI[]);
-
-// Explicit per-field map. The shapes happen to be structurally
-// identical today but pass-through assignment (`items: event.items`)
-// would silently accept a future store extension that adds a status
-// the renderer's GLYPHS table can't handle, producing `undefined`
-// glyph strings. Mapping per-field keeps the contract narrow.
-const mapTodoItem = (item: TodoItem): TodoItemForUI => ({
-  content: item.content,
-  activeForm: item.activeForm,
-  status: item.status,
-});
 
 export interface HarnessAdapterCtx {
   // Status-line metadata. Not derivable from HarnessEvent: the harness
@@ -447,20 +426,30 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           name: event.toolName,
           decision: null,
         });
-        out.push({
-          type: 'tool:start',
-          ts,
-          toolId: event.toolUseId,
-          name: event.toolName,
-          activeVerb: vocab.activeVerb,
-          finalVerb: vocab.finalVerb,
-          subject,
-        });
+        // `silent` vocab entries (the todo tools) are tracked in
+        // state.tools above but emit NO chip — the live `Tasks` block is
+        // the operator's view of todos, so the per-call chips are noise.
+        if (!vocab.silent) {
+          out.push({
+            type: 'tool:start',
+            ts,
+            toolId: event.toolUseId,
+            name: event.toolName,
+            activeVerb: vocab.activeVerb,
+            finalVerb: vocab.finalVerb,
+            subject,
+          });
+        }
         return out;
       }
 
       case 'tool_execution_started': {
-        out.push({ type: 'tool:execution-started', ts, toolId: event.toolUseId });
+        // No card was emitted for a silent tool, so there's nothing to
+        // rebase — skip its execution-started too.
+        const tracked = state.tools.get(event.toolUseId);
+        if (tracked === undefined || !lookupToolVocab(tracked.name).silent) {
+          out.push({ type: 'tool:execution-started', ts, toolId: event.toolUseId });
+        }
         return out;
       }
 
@@ -542,19 +531,32 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           }
         } else if (status === 'error' && event.errorMessage !== undefined) {
           summary = event.errorMessage;
+        } else if (status === 'done' && event.resultDetail !== undefined) {
+          // A successful tool surfaced a one-line display detail
+          // (clarify's question→answer). Route it through the same
+          // `summary` slot the failure reasons use: render/permanent
+          // shows `summary` on the `└─` connector of a done chip when
+          // the tool has no vocab subject, which clarify doesn't.
+          summary = event.resultDetail;
         }
         state.tools.delete(event.toolUseId);
-        out.push({
-          type: 'tool:end',
-          ts,
-          toolId: event.toolUseId,
-          status,
-          durationMs: event.durationMs,
-          ...(summary !== undefined ? { summary } : {}),
-          ...(event.outputTruncated === true ? { outputTruncated: true } : {}),
-          ...(tool?.diff !== undefined ? { diff: tool.diff } : {}),
-          ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
-        });
+        // Silent tools (todos) emit no chip — see the tool:start case. The
+        // result still reaches the model; only the scrollback chip (incl.
+        // failures) is hidden, since the model surfaces todo errors in its
+        // prose and the live `Tasks` block reflects the real state.
+        if (!lookupToolVocab(event.toolName).silent) {
+          out.push({
+            type: 'tool:end',
+            ts,
+            toolId: event.toolUseId,
+            status,
+            durationMs: event.durationMs,
+            ...(summary !== undefined ? { summary } : {}),
+            ...(event.outputTruncated === true ? { outputTruncated: true } : {}),
+            ...(tool?.diff !== undefined ? { diff: tool.diff } : {}),
+            ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
+          });
+        }
         return out;
       }
 
@@ -623,17 +625,22 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         });
         return out;
 
-      case 'todo_updated':
-        // Per-field map via mapTodoItem so a future TodoStore status
-        // variant fails to type-check rather than silently rendering
-        // `undefined` glyphs. Renderer's reducer handles full-replace
-        // semantics (spec §7.4).
-        out.push({
-          type: 'todo:update',
-          ts,
-          items: event.items.map(mapTodoItem),
-        });
+      case 'todo_updated': {
+        // Per-field map + drop soft-deleted rows: `removed` items stay in
+        // the store (id never recycled) but are invisible to the UI. The
+        // `=== 'removed'` guard also narrows the status to the
+        // TodoStatusForUI subset, so the inline build type-checks without
+        // `removed` leaking into the renderer's GLYPHS — and any OTHER new
+        // status that isn't representable in the UI fails to compile here.
+        // Reducer handles full-replace semantics (spec §7.4).
+        const items: TodoItemForUI[] = [];
+        for (const item of event.items) {
+          if (item.status === 'removed') continue;
+          items.push({ content: item.content, activeForm: item.activeForm, status: item.status });
+        }
+        out.push({ type: 'todo:update', ts, items });
         return out;
+      }
 
       case 'checkpoints_unavailable':
         out.push({
@@ -716,9 +723,13 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           case 'compaction_finished':
             progress = `compacted (${inner.foldedCount} folded)`;
             break;
-          case 'todo_updated':
-            progress = `${inner.items.length} todo${inner.items.length === 1 ? '' : 's'}`;
+          case 'todo_updated': {
+            // Count active rows only — soft-deleted (removed) items are
+            // invisible everywhere else; keep the heartbeat consistent.
+            const n = inner.items.filter((i) => i.status !== 'removed').length;
+            progress = `${n} todo${n === 1 ? '' : 's'}`;
             break;
+          }
           case 'tool_warning':
             progress = `warn: ${inner.message}`;
             break;
@@ -817,16 +828,20 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           }
           subject = flattenSubject(subject);
           state.tools.set(namespacedId, { name: inner.toolName, decision: null });
-          out.push({
-            type: 'tool:start',
-            ts,
-            toolId: namespacedId,
-            name: inner.toolName,
-            activeVerb: vocab.activeVerb,
-            finalVerb: vocab.finalVerb,
-            subject,
-            parentId: event.subagentId,
-          });
+          // Silent tools (todos) are tracked but emit no nested chip —
+          // mirrors the top-level suppression.
+          if (!vocab.silent) {
+            out.push({
+              type: 'tool:start',
+              ts,
+              toolId: namespacedId,
+              name: inner.toolName,
+              activeVerb: vocab.activeVerb,
+              finalVerb: vocab.finalVerb,
+              subject,
+              parentId: event.subagentId,
+            });
+          }
         }
         if (inner.type === 'tool_decided' && typeof inner.toolUseId === 'string') {
           // Mirror the top-level path: store the decision so
@@ -842,11 +857,11 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         // so nested and top-level durations exclude the permission-
         // modal wait the same way.
         if (inner.type === 'tool_execution_started' && typeof inner.toolUseId === 'string') {
-          out.push({
-            type: 'tool:execution-started',
-            ts,
-            toolId: `sub:${event.subagentId}:${inner.toolUseId}`,
-          });
+          const nestedId = `sub:${event.subagentId}:${inner.toolUseId}`;
+          const tracked = state.tools.get(nestedId);
+          if (tracked === undefined || !lookupToolVocab(tracked.name).silent) {
+            out.push({ type: 'tool:execution-started', ts, toolId: nestedId });
+          }
         }
         if (inner.type === 'tool_finished' && typeof inner.toolUseId === 'string') {
           const namespacedId = `sub:${event.subagentId}:${inner.toolUseId}`;
@@ -875,16 +890,18 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
             summary = inner.errorMessage;
           }
           state.tools.delete(namespacedId);
-          out.push({
-            type: 'tool:end',
-            ts,
-            toolId: namespacedId,
-            status,
-            durationMs: inner.durationMs,
-            ...(summary !== undefined ? { summary } : {}),
-            ...(inner.outputTruncated === true ? { outputTruncated: true } : {}),
-            ...(typeof inner.exitCode === 'number' ? { exitCode: inner.exitCode } : {}),
-          });
+          if (!lookupToolVocab(inner.toolName).silent) {
+            out.push({
+              type: 'tool:end',
+              ts,
+              toolId: namespacedId,
+              status,
+              durationMs: inner.durationMs,
+              ...(summary !== undefined ? { summary } : {}),
+              ...(inner.outputTruncated === true ? { outputTruncated: true } : {}),
+              ...(typeof inner.exitCode === 'number' ? { exitCode: inner.exitCode } : {}),
+            });
+          }
         }
         return out;
       }

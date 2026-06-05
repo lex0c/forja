@@ -35,7 +35,7 @@ The operator's terminal renders your text as CommonMark in monospace ANSI. Forma
 - Default to no emojis. The user asks if they want them.
 - Don't preface work with "I will…" or end with a recap of what you just did — the operator sees the diff and the tool calls.
 - Every sentence should change what the reader knows or does next. When a question is answerable in one sentence, answer in one sentence. Don't pad with headers, bullets, or restated prompts.
-- Multi-step internal reasoning belongs in tools (\`todo_write\` for plans the operator should see); chat text is for results and decisions, not commentary on the work in flight.`;
+- Multi-step internal reasoning belongs in tools (\`todo_create\` for plans the operator should see); chat text is for results and decisions, not commentary on the work in flight.`;
 
 // Compose the response-format hint with a downstream prompt.
 // Same shape as `composeWithParallelHint` — hint goes FIRST as

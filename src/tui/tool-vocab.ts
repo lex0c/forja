@@ -29,6 +29,12 @@ export interface ToolVocab {
   // it under `└─ `. Return `null` when args don't carry the field
   // (malformed args from a misbehaving model, etc.).
   subject?: (args: Record<string, unknown>) => string | null;
+  // When true, the adapter still TRACKS the call but emits NO operation
+  // chip (no tool:start / tool:execution-started / tool:end). Used by the
+  // todo tools: their effect is the live `Tasks` block, so the per-call
+  // chips are pure scrollback noise. The tool still runs and its result
+  // still reaches the model — only the chip is hidden.
+  silent?: boolean;
 }
 
 const str = (v: unknown): string | null => (typeof v === 'string' && v.length > 0 ? v : null);
@@ -43,6 +49,13 @@ const nestedStr = (parent: unknown, field: string): string | null => {
 };
 
 export const TOOL_VOCAB: Readonly<Record<string, ToolVocab>> = {
+  // clarify asks the operator one question and settles when answered. The
+  // question→answer text rides the `└─` connector via the tool's
+  // resultDetail (harness-adapter), so there's deliberately NO subject here.
+  clarify: {
+    activeVerb: 'Asking',
+    finalVerb: 'Question answered',
+  },
   read_file: {
     activeVerb: 'Reading file',
     finalVerb: 'Read file',
@@ -143,11 +156,36 @@ export const TOOL_VOCAB: Readonly<Record<string, ToolVocab>> = {
       return name ?? scope;
     },
   },
-  todo_write: {
-    activeVerb: 'Updating todos',
-    finalVerb: 'Updated todos',
-    // Todos don't have a single subject; let the count land in
-    // expansion. Renderer drops the connector when subject is null.
+  // The todo tools are `silent`: the adapter tracks each call but emits no
+  // chip. The operator's view of todos is the live `Tasks` block; the
+  // per-call chips ("Added todos", "Updated todo", …) are just noise. The
+  // verbs stay for the day someone flips silent off.
+  todo_clear: {
+    activeVerb: 'Clearing todos',
+    finalVerb: 'Cleared todos',
+    silent: true,
+  },
+  todo_create: {
+    activeVerb: 'Adding todos',
+    finalVerb: 'Added todos',
+    silent: true,
+  },
+  todo_update: {
+    activeVerb: 'Updating todo',
+    finalVerb: 'Updated todo',
+    subject: (a) => str(a.id),
+    silent: true,
+  },
+  todo_list: {
+    activeVerb: 'Listing todos',
+    finalVerb: 'Listed todos',
+    silent: true,
+  },
+  todo_get: {
+    activeVerb: 'Reading todo',
+    finalVerb: 'Read todo',
+    subject: (a) => str(a.id),
+    silent: true,
   },
   monitor: {
     activeVerb: 'Monitoring',
