@@ -49,6 +49,13 @@ const nestedStr = (parent: unknown, field: string): string | null => {
 };
 
 export const TOOL_VOCAB: Readonly<Record<string, ToolVocab>> = {
+  // clarify asks the operator one question and settles when answered. The
+  // question→answer text rides the `└─` connector via the tool's
+  // resultDetail (harness-adapter), so there's deliberately NO subject here.
+  clarify: {
+    activeVerb: 'Asking',
+    finalVerb: 'Question answered',
+  },
   read_file: {
     activeVerb: 'Reading file',
     finalVerb: 'Read file',

@@ -10,6 +10,7 @@ describe('tool-vocab', () => {
       'bash_background',
       'bash_kill',
       'bash_output',
+      'clarify',
       'edit_file',
       'glob',
       'grep',
@@ -37,6 +38,14 @@ describe('tool-vocab', () => {
     const v = lookupToolVocab('read_file');
     expect(v.activeVerb).toBe('Reading file');
     expect(v.finalVerb).toBe('Read file');
+  });
+
+  test('clarify settles as "Question answered" (not the generic Called verb)', () => {
+    const v = lookupToolVocab('clarify');
+    expect(v.activeVerb).toBe('Asking');
+    expect(v.finalVerb).toBe('Question answered');
+    // No subject — the question→answer rides the resultDetail connector.
+    expect(v.subject).toBeUndefined();
   });
 
   test('lookupToolVocab falls back to generic verbs for unknown names', () => {
