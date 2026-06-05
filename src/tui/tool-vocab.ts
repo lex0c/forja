@@ -29,6 +29,12 @@ export interface ToolVocab {
   // it under `└─ `. Return `null` when args don't carry the field
   // (malformed args from a misbehaving model, etc.).
   subject?: (args: Record<string, unknown>) => string | null;
+  // When true, the adapter still TRACKS the call but emits NO operation
+  // chip (no tool:start / tool:execution-started / tool:end). Used by the
+  // todo tools: their effect is the live `Tasks` block, so the per-call
+  // chips are pure scrollback noise. The tool still runs and its result
+  // still reaches the model — only the chip is hidden.
+  silent?: boolean;
 }
 
 const str = (v: unknown): string | null => (typeof v === 'string' && v.length > 0 ? v : null);
@@ -143,28 +149,36 @@ export const TOOL_VOCAB: Readonly<Record<string, ToolVocab>> = {
       return name ?? scope;
     },
   },
+  // The todo tools are `silent`: the adapter tracks each call but emits no
+  // chip. The operator's view of todos is the live `Tasks` block; the
+  // per-call chips ("Added todos", "Updated todo", …) are just noise. The
+  // verbs stay for the day someone flips silent off.
   todo_clear: {
     activeVerb: 'Clearing todos',
     finalVerb: 'Cleared todos',
+    silent: true,
   },
   todo_create: {
     activeVerb: 'Adding todos',
     finalVerb: 'Added todos',
-    // Multiple items, no single subject — renderer drops the connector.
+    silent: true,
   },
   todo_update: {
     activeVerb: 'Updating todo',
     finalVerb: 'Updated todo',
     subject: (a) => str(a.id),
+    silent: true,
   },
   todo_list: {
     activeVerb: 'Listing todos',
     finalVerb: 'Listed todos',
+    silent: true,
   },
   todo_get: {
     activeVerb: 'Reading todo',
     finalVerb: 'Read todo',
     subject: (a) => str(a.id),
+    silent: true,
   },
   monitor: {
     activeVerb: 'Monitoring',

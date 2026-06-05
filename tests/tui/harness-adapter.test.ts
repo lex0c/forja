@@ -580,6 +580,47 @@ describe('harness-adapter — tool lifecycle', () => {
     expect(e.toolId).toBe('t1');
   });
 
+  test('silent tools (todos) are tracked but emit no chip; todo:update still flows', () => {
+    // The todo tools' effect is the live `Tasks` block (todo:update); the
+    // per-call chips would be scrollback noise, so the vocab marks them
+    // `silent` and the adapter suppresses tool:start / execution / end.
+    const a = createHarnessAdapter(baseCtx());
+    expect(
+      types(
+        a.translate({
+          type: 'tool_invoking',
+          toolUseId: 't1',
+          toolName: 'todo_create',
+          args: { items: [] },
+        }),
+      ),
+    ).toEqual([]);
+    // execution-started for the tracked silent tool is suppressed too.
+    expect(types(a.translate({ type: 'tool_execution_started', toolUseId: 't1' }))).toEqual([]);
+    // The store mutation's todo_updated STILL becomes the Tasks block.
+    expect(
+      types(
+        a.translate({
+          type: 'todo_updated',
+          sessionId: 's',
+          items: [{ id: '1', content: 'a', activeForm: 'A', status: 'pending' }],
+        }),
+      ),
+    ).toEqual(['todo:update']);
+    // tool_finished → no tool:end chip.
+    expect(
+      types(
+        a.translate({
+          type: 'tool_finished',
+          toolUseId: 't1',
+          toolName: 'todo_create',
+          failed: false,
+          durationMs: 1,
+        }),
+      ),
+    ).toEqual([]);
+  });
+
   test('unknown tool falls back to generic Calling/Called verbs and null subject', () => {
     const a = createHarnessAdapter(baseCtx());
     const out = a.translate({

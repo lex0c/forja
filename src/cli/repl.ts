@@ -42,6 +42,7 @@ import { createContextPinsStore } from '../storage/repos/context-pins.ts';
 import { completeSession, createSession } from '../storage/repos/sessions.ts';
 import { settleRunningSubagentHandles } from '../storage/repos/subagent-handles.ts';
 import { runSubagent } from '../subagents/index.ts';
+import { createTodoStore } from '../todo/index.ts';
 import type { ClarifyBridgeRequest } from '../tools/index.ts';
 import { addTrustedDir, isTrusted, trustListPath } from '../trust/index.ts';
 import {
@@ -1639,6 +1640,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       confirmMemoryUserScope,
       clarify,
       contextPinsStore,
+      todoStore,
       ...(lastSessionId !== null ? { resumeFromSessionId: lastSessionId } : {}),
     };
     const runAgentImpl = options.runAgentOverride ?? runAgent;
@@ -1976,6 +1978,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // surfaces share the same store — the underlying table is the
   // single source of truth.
   const contextPinsStore = createContextPinsStore(db);
+
+  // One TodoList store for the whole REPL session — injected into every
+  // turn's HarnessConfig so the list survives across turns (each turn is a
+  // fresh runAgent that would otherwise start with an empty store). See
+  // HarnessConfig.todoStore.
+  const todoStore = createTodoStore();
 
   // Hook dispatcher for slash commands (EVICTION.md §10.3). Mirrors
   // the harness loop's wrapper at loop.ts:dispatchHooks but uses the

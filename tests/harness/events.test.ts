@@ -7,6 +7,7 @@ import type { Policy } from '../../src/permissions/index.ts';
 import type { Provider, StreamEvent } from '../../src/providers/index.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
+import { createTodoStore } from '../../src/todo/index.ts';
 import { todoCreateTool } from '../../src/tools/builtin/todo-create.ts';
 import { createToolRegistry } from '../../src/tools/registry.ts';
 import type { Tool } from '../../src/tools/types.ts';
@@ -457,6 +458,47 @@ describe('runAgent onEvent', () => {
     expect(updates[1]?.items).toHaveLength(2);
     expect(updates[1]?.items[0]?.content).toBe('first');
     expect(updates[1]?.items[1]?.content).toBe('second');
+  });
+
+  test('an injected todoStore survives session-end (REPL cross-turn persistence)', async () => {
+    // The REPL injects ONE store and re-runs runAgent per turn; the store
+    // must survive session-end so a later turn's todo_update finds the ids
+    // an earlier turn created. A loop-owned per-run store gets cleared at
+    // session-end and the list would vanish between turns (the bug).
+    const store = createTodoStore();
+    const r = createToolRegistry();
+    r.register(todoCreateTool as unknown as Tool);
+    const events: HarnessEvent[] = [];
+    await runAgent({
+      provider: mockProvider([
+        {
+          tool_uses: [
+            {
+              id: 'tu1',
+              name: 'todo_create',
+              input: { items: [{ content: 'plan', status: 'pending', active_form: 'Planning' }] },
+            },
+          ],
+          stop_reason: 'tool_use',
+        },
+        { text: 'done', stop_reason: 'end_turn' },
+      ]),
+      toolRegistry: r,
+      todoStore: store,
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'hi',
+      onEvent: (e) => events.push(e),
+    });
+    const updated = events.find(
+      (e): e is Extract<HarnessEvent, { type: 'todo_updated' }> => e.type === 'todo_updated',
+    );
+    if (updated === undefined) throw new Error('expected a todo_updated event');
+    // After runAgent returns, the INJECTED store STILL holds the todo —
+    // a loop-owned store would have been cleared at session-end.
+    expect(store.get(updated.sessionId)).toHaveLength(1);
+    expect(store.get(updated.sessionId)[0]?.content).toBe('plan');
   });
 
   test('provider usage event surfaces verbatim in onEvent (consumed by adapter)', async () => {

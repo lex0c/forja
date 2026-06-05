@@ -426,20 +426,30 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           name: event.toolName,
           decision: null,
         });
-        out.push({
-          type: 'tool:start',
-          ts,
-          toolId: event.toolUseId,
-          name: event.toolName,
-          activeVerb: vocab.activeVerb,
-          finalVerb: vocab.finalVerb,
-          subject,
-        });
+        // `silent` vocab entries (the todo tools) are tracked in
+        // state.tools above but emit NO chip — the live `Tasks` block is
+        // the operator's view of todos, so the per-call chips are noise.
+        if (!vocab.silent) {
+          out.push({
+            type: 'tool:start',
+            ts,
+            toolId: event.toolUseId,
+            name: event.toolName,
+            activeVerb: vocab.activeVerb,
+            finalVerb: vocab.finalVerb,
+            subject,
+          });
+        }
         return out;
       }
 
       case 'tool_execution_started': {
-        out.push({ type: 'tool:execution-started', ts, toolId: event.toolUseId });
+        // No card was emitted for a silent tool, so there's nothing to
+        // rebase — skip its execution-started too.
+        const tracked = state.tools.get(event.toolUseId);
+        if (tracked === undefined || !lookupToolVocab(tracked.name).silent) {
+          out.push({ type: 'tool:execution-started', ts, toolId: event.toolUseId });
+        }
         return out;
       }
 
@@ -530,17 +540,23 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           summary = event.resultDetail;
         }
         state.tools.delete(event.toolUseId);
-        out.push({
-          type: 'tool:end',
-          ts,
-          toolId: event.toolUseId,
-          status,
-          durationMs: event.durationMs,
-          ...(summary !== undefined ? { summary } : {}),
-          ...(event.outputTruncated === true ? { outputTruncated: true } : {}),
-          ...(tool?.diff !== undefined ? { diff: tool.diff } : {}),
-          ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
-        });
+        // Silent tools (todos) emit no chip — see the tool:start case. The
+        // result still reaches the model; only the scrollback chip (incl.
+        // failures) is hidden, since the model surfaces todo errors in its
+        // prose and the live `Tasks` block reflects the real state.
+        if (!lookupToolVocab(event.toolName).silent) {
+          out.push({
+            type: 'tool:end',
+            ts,
+            toolId: event.toolUseId,
+            status,
+            durationMs: event.durationMs,
+            ...(summary !== undefined ? { summary } : {}),
+            ...(event.outputTruncated === true ? { outputTruncated: true } : {}),
+            ...(tool?.diff !== undefined ? { diff: tool.diff } : {}),
+            ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
+          });
+        }
         return out;
       }
 
@@ -812,16 +828,20 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           }
           subject = flattenSubject(subject);
           state.tools.set(namespacedId, { name: inner.toolName, decision: null });
-          out.push({
-            type: 'tool:start',
-            ts,
-            toolId: namespacedId,
-            name: inner.toolName,
-            activeVerb: vocab.activeVerb,
-            finalVerb: vocab.finalVerb,
-            subject,
-            parentId: event.subagentId,
-          });
+          // Silent tools (todos) are tracked but emit no nested chip —
+          // mirrors the top-level suppression.
+          if (!vocab.silent) {
+            out.push({
+              type: 'tool:start',
+              ts,
+              toolId: namespacedId,
+              name: inner.toolName,
+              activeVerb: vocab.activeVerb,
+              finalVerb: vocab.finalVerb,
+              subject,
+              parentId: event.subagentId,
+            });
+          }
         }
         if (inner.type === 'tool_decided' && typeof inner.toolUseId === 'string') {
           // Mirror the top-level path: store the decision so
@@ -837,11 +857,11 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         // so nested and top-level durations exclude the permission-
         // modal wait the same way.
         if (inner.type === 'tool_execution_started' && typeof inner.toolUseId === 'string') {
-          out.push({
-            type: 'tool:execution-started',
-            ts,
-            toolId: `sub:${event.subagentId}:${inner.toolUseId}`,
-          });
+          const nestedId = `sub:${event.subagentId}:${inner.toolUseId}`;
+          const tracked = state.tools.get(nestedId);
+          if (tracked === undefined || !lookupToolVocab(tracked.name).silent) {
+            out.push({ type: 'tool:execution-started', ts, toolId: nestedId });
+          }
         }
         if (inner.type === 'tool_finished' && typeof inner.toolUseId === 'string') {
           const namespacedId = `sub:${event.subagentId}:${inner.toolUseId}`;
@@ -870,16 +890,18 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
             summary = inner.errorMessage;
           }
           state.tools.delete(namespacedId);
-          out.push({
-            type: 'tool:end',
-            ts,
-            toolId: namespacedId,
-            status,
-            durationMs: inner.durationMs,
-            ...(summary !== undefined ? { summary } : {}),
-            ...(inner.outputTruncated === true ? { outputTruncated: true } : {}),
-            ...(typeof inner.exitCode === 'number' ? { exitCode: inner.exitCode } : {}),
-          });
+          if (!lookupToolVocab(inner.toolName).silent) {
+            out.push({
+              type: 'tool:end',
+              ts,
+              toolId: namespacedId,
+              status,
+              durationMs: inner.durationMs,
+              ...(summary !== undefined ? { summary } : {}),
+              ...(inner.outputTruncated === true ? { outputTruncated: true } : {}),
+              ...(typeof inner.exitCode === 'number' ? { exitCode: inner.exitCode } : {}),
+            });
+          }
         }
         return out;
       }

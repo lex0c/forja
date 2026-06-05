@@ -12,7 +12,7 @@ import type { ContextPinsStore } from '../storage/repos/context-pins.ts';
 import type { SessionStatus } from '../storage/repos/sessions.ts';
 import type { SubagentSet } from '../subagents/load.ts';
 import type { TelemetrySink } from '../telemetry/index.ts';
-import type { TodoItem } from '../todo/index.ts';
+import type { TodoItem, TodoStore } from '../todo/index.ts';
 import type { ClarifyBridgeRequest, ClarifyBridgeResponse, ToolRegistry } from '../tools/index.ts';
 import { type ForjaEffort, effortBudgetPatch } from './effort.ts';
 
@@ -901,6 +901,14 @@ export interface HarnessConfig {
   // SAME store instance via SlashContext.contextPinsStore — both
   // surfaces share the underlying table.
   contextPinsStore?: ContextPinsStore;
+  // Session-bound TodoList store. A multi-turn caller (the REPL) builds
+  // ONE store at boot and injects it here so the list survives across
+  // turns — each turn re-runs runAgent, and without injection the loop's
+  // own per-run store would start empty every turn (the CRUD todo tools
+  // need ids to persist; the old full-replace todo_write masked this).
+  // When absent (one-shot run), the loop creates a per-run store and
+  // clears it at session-end; the caller owns teardown of an injected one.
+  todoStore?: TodoStore;
   // Async hook the harness calls when the permission engine returns
   // a `confirm` decision. Caller resolves true to allow the call
   // (recorded as confirm_yes) or false to deny (confirm_no). When
