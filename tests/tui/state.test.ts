@@ -729,6 +729,42 @@ describe('tool lifecycle', () => {
     ]);
   });
 
+  test('tool:end done with a summary bypasses the batch and carries the summary', () => {
+    // clarify's `result_detail` arrives as `summary` on a done chip; it
+    // must surface as its own card (a coalesced "Called N" head has
+    // nowhere to show it), so a done+summary chip bypasses batching.
+    const result = drive([
+      {
+        type: 'tool:start',
+        ts: 1,
+        toolId: 't1',
+        name: 'clarify',
+        activeVerb: 'Calling clarify',
+        finalVerb: 'Called clarify',
+        subject: null,
+      },
+      {
+        type: 'tool:end',
+        ts: 200,
+        toolId: 't1',
+        status: 'done',
+        durationMs: 50,
+        summary: 'which file? → src/checkout.ts',
+      },
+    ]);
+    expect(result.permanent).toEqual([
+      {
+        kind: 'tool-end',
+        name: 'clarify',
+        verb: 'Called clarify',
+        subject: null,
+        status: 'done',
+        durationMs: 50,
+        summary: 'which file? → src/checkout.ts',
+      },
+    ]);
+  });
+
   test('tool:end without summary emits item without summary field', () => {
     const result = drive([
       {

@@ -3,7 +3,7 @@ import { scanForInjection } from '../memory/index.ts';
 import { canonicalHash } from '../permissions/canonical.ts';
 import type { Decision, PermissionEngine, PolicySource, ToolArgs } from '../permissions/index.ts';
 import type { ProviderToolResultBlock } from '../providers/index.ts';
-import { sanitizeToolOutput, stripAnsi } from '../sanitize/index.ts';
+import { sanitizeOneLineForDisplay, sanitizeToolOutput, stripAnsi } from '../sanitize/index.ts';
 import {
   type DB,
   createToolCall,
@@ -155,6 +155,12 @@ export interface InvokeToolResult {
   // failed command does not read as a success. Absent for exit 0
   // and for tools with no exit code.
   exitCode?: number;
+  // Optional one-line display detail a successful tool surfaced for its
+  // finished card — read from `result.result_detail`, sanitized +
+  // capped. Plumbed to `tool_finished` so the TUI renders it on the
+  // `└─` connector (today: clarify's "<question> → <answer>"). Absent
+  // for tools that don't set it.
+  resultDetail?: string;
 }
 
 // A success result is "truncated" when the tool capped its own
@@ -178,6 +184,30 @@ const readNonZeroExit = (result: unknown): number | undefined => {
   }
   const code = (result as Record<string, unknown>).exit_code;
   return typeof code === 'number' && code !== 0 ? code : undefined;
+};
+
+// Optional one-line display detail a successful tool surfaces for its
+// finished card (today: `clarify`, which sets `result_detail` to
+// "<question> → <answer>"). Generic and opt-in: read structurally from
+// `result.result_detail`, then sanitize + cap (the one-line helper
+// strips ANSI/control, collapses newlines, and bounds length) so a tool
+// can't inject escapes or overflow the card. Returns undefined for
+// absent / empty / non-string so the field only travels when there's
+// something to show.
+//
+// Display caveat for adopters: on a DONE chip render/permanent shows the
+// tool's vocab `subject` when it has one and falls back to this detail
+// (routed via `summary`) only otherwise — so `result_detail` surfaces
+// only for tools WITHOUT a subject (clarify). A tool with both would
+// hide the detail behind its subject.
+const readResultDetail = (result: unknown): string | undefined => {
+  if (typeof result !== 'object' || result === null || !('result_detail' in result)) {
+    return undefined;
+  }
+  const raw = (result as Record<string, unknown>).result_detail;
+  if (typeof raw !== 'string' || raw.length === 0) return undefined;
+  const cleaned = sanitizeOneLineForDisplay(raw).trim();
+  return cleaned.length > 0 ? cleaned : undefined;
 };
 
 const buildErrorBlock = (
@@ -1016,6 +1046,7 @@ export const invokeTool = async (
     content = `${content}${contextParts.join('')}`;
   }
   const exitCode = readNonZeroExit(result);
+  const resultDetail = readResultDetail(result);
   return {
     toolResult: {
       type: 'tool_result',
@@ -1029,5 +1060,6 @@ export const invokeTool = async (
     decision,
     ...(readOutputTruncated(result) ? { outputTruncated: true } : {}),
     ...(exitCode !== undefined ? { exitCode } : {}),
+    ...(resultDetail !== undefined ? { resultDetail } : {}),
   };
 };

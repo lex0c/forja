@@ -542,6 +542,13 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           }
         } else if (status === 'error' && event.errorMessage !== undefined) {
           summary = event.errorMessage;
+        } else if (status === 'done' && event.resultDetail !== undefined) {
+          // A successful tool surfaced a one-line display detail
+          // (clarify's question→answer). Route it through the same
+          // `summary` slot the failure reasons use: render/permanent
+          // shows `summary` on the `└─` connector of a done chip when
+          // the tool has no vocab subject, which clarify doesn't.
+          summary = event.resultDetail;
         }
         state.tools.delete(event.toolUseId);
         out.push({

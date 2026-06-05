@@ -352,6 +352,27 @@ describe('formatPermanent', () => {
       expect(out[2]).toBe(pad('└─ /foo.ts'));
     });
 
+    test('done status with a summary but no subject renders the summary on the connector', () => {
+      // clarify's result_detail rides in as `summary` on a done chip
+      // (clarify has no vocab subject) — it must surface on the `└─`
+      // connector, the same fallback the no-subject error path uses.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'clarify',
+          verb: 'Called clarify',
+          subject: null,
+          status: 'done',
+          durationMs: 850,
+          summary: 'which file? → src/checkout.ts',
+        },
+        unicode,
+      );
+      expect(out).toHaveLength(3);
+      expect(out[1]).toBe(pad('● Called clarify  [850ms]'));
+      expect(out[2]).toBe(pad('└─ which file? → src/checkout.ts'));
+    });
+
     test('non-zero exitCode renders `exit N` on the head', () => {
       const out = formatPermanent(
         {

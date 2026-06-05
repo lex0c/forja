@@ -781,6 +781,27 @@ describe('harness-adapter — tool lifecycle', () => {
     expect(e.summary).toBe('ENOENT: no such file or directory');
   });
 
+  test('resultDetail on a done tool_finished surfaces as summary on tool:end', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({
+      type: 'tool_invoking',
+      toolUseId: 't1',
+      toolName: 'clarify',
+      args: {},
+    });
+    const out = a.translate({
+      type: 'tool_finished',
+      toolUseId: 't1',
+      toolName: 'clarify',
+      failed: false,
+      durationMs: 5,
+      resultDetail: 'which file? → src/checkout.ts',
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(e.status).toBe('done');
+    expect(e.summary).toBe('which file? → src/checkout.ts');
+  });
+
   test('outputTruncated on tool_finished carries onto tool:end', () => {
     const a = createHarnessAdapter(baseCtx());
     a.translate({ type: 'tool_invoking', toolUseId: 't1', toolName: 'bash', args: {} });

@@ -2,6 +2,18 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-05] TUI: clarify's finished card shows `question → answer`
+
+**Goal (operator).** The `Called clarify` scrollback chip was a bare verb — it recorded neither WHAT was asked nor WHICH option the operator picked, so a turn's clarifications were lost once the modal closed. It now carries a secondary sub-line `└─ <question> → <answer>`.
+
+**Mechanism — generic `result_detail`, plumbed like `outputTruncated`/`exitCode`.** A tool may set an optional one-line `result_detail` on its successful output; invoke-tool's `readResultDetail` reads it structurally, sanitizes (strip ANSI/control, collapse newlines) and caps it, and ships it on `tool_finished.resultDetail`. The adapter routes it to the `tool:end` `summary` slot for a DONE chip, and render/permanent already shows `summary` on the `└─` connector when the chip has no vocab subject — which clarify doesn't, so NO renderer change was needed. The reducer bypasses tool-end batch coalescing when a done chip carries a `summary` (a coalesced "Called N" head has nowhere to show the detail, so each clarify gets its own card). Generic + opt-in: the harness stays tool-agnostic; only clarify uses it today.
+
+**clarify side.** Builds the line where it has the question, the option labels, and the chosen id together: `<question> → <label>` (resolved), `… (default)` (skipped — the assumed `options[0]`), `→ re-grounded[: <user_text>]` (escalated; defensive — the modal doesn't produce escalate yet). Caps each side independently (question 120 / answer 70) so the assembled line stays under the 200-char display cap WITH the answer intact — capping the whole line downstream would truncate the tail, the part that matters most. The field also rides in the model-facing output (pairs question+answer in one place).
+
+**Review (self, adversarial).** Confirmed the load-bearing assumption (clarify has no vocab subject → the detail always surfaces, never hidden behind a subject) and that `result_detail` consumers are contained in the touched suites. Acted on the long-question truncation (the cap-per-side above); documented the subject-hides-detail caveat for future adopters at `readResultDetail`.
+
+**Verification.** tsc + Biome clean; new tests across all six layers (clarify outcomes + long-question cap, extractor sanitize/cap/absence, adapter done→summary, reducer batch-bypass, permanent render of the sub-line); the 5 touched suites green. Visual confirmation in `bun run dev` is the operator's per the UI-iterate rule; a `UI.md` spec note follows once confirmed.
+
 ## [2026-06-04] TUI: turn off the tool-card min-display hold in production
 
 **Decision (operator).** `runRepl` now wires `toolMinDisplayMs: 0` (was 400), so the renderer applies each fast tool's `tool:end` on arrival instead of holding the card on screen first. Chosen after comparing both in `bun run dev`.

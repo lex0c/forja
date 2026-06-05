@@ -136,6 +136,12 @@ export type HarnessEvent =
       // The TUI shows `exit N` so a failed command doesn't read as a
       // success. Absent for exit 0 and tools with no exit code.
       exitCode?: number;
+      // Optional one-line display detail the tool surfaced for its
+      // finished card (sanitized + capped upstream in invoke-tool). The
+      // TUI routes it to the `└─` connector on a successful chip — today
+      // clarify's "<question> → <answer>". Absent for tools that don't
+      // set `result_detail` on their output.
+      resultDetail?: string;
     }
   | {
       type: 'compaction_started';

@@ -1298,8 +1298,16 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // must not vanish into a coalesced "Executed N commands" batch.
       // A tool carrying a display diff (write/edit) bypasses batching
       // too: its per-file diff is rich detail a coalesced "Edited N
-      // files" chip can't show, so it gets its own card.
-      if (event.status !== 'done' || event.exitCode !== undefined || event.diff !== undefined) {
+      // files" chip can't show, so it gets its own card. A done chip
+      // carrying a `summary` (a tool's one-line `result_detail`, e.g.
+      // clarify's question→answer) bypasses for the same reason — the
+      // coalesced "Called N" head has nowhere to show it.
+      if (
+        event.status !== 'done' ||
+        event.exitCode !== undefined ||
+        event.diff !== undefined ||
+        event.summary !== undefined
+      ) {
         const flushed = flushPendingToolEndBatch(state);
         const item: PermanentItem = {
           kind: 'tool-end',
