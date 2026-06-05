@@ -489,6 +489,19 @@ export interface QueuedInput {
   text: string;
 }
 
+// True when something in the live region is animating and the frame
+// scheduler must keep redrawing: a running tool's spinner, the thinking /
+// awaiting-provider duration counters, a streaming assistant chip — or a
+// task marked in_progress, whose `Tasks` header carries the live-verb
+// shimmer (render/todo-list.ts). Goes false (scheduler idles, zero wakeups)
+// once none of those hold. The renderer's heartbeat polls this each tick.
+export const liveRegionActive = (state: LiveState): boolean =>
+  state.activeTools.size > 0 ||
+  state.thinking !== null ||
+  state.pendingAssistant !== null ||
+  state.awaitingProvider !== null ||
+  state.todos.some((t) => t.status === 'in_progress');
+
 export const createInitialState = (): LiveState => ({
   input: { value: '', cursor: 0 },
   queued: [],

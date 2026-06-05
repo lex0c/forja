@@ -1,11 +1,12 @@
 import { describe, expect, test } from 'bun:test';
-import type { UIEvent } from '../../src/tui/events.ts';
+import type { TodoItemForUI, UIEvent } from '../../src/tui/events.ts';
 import {
   type LiveState,
   type PermanentItem,
   applyEvent,
   createInitialState,
   flushPendingToolEndBatch,
+  liveRegionActive,
 } from '../../src/tui/state.ts';
 
 const start = (overrides: Partial<UIEvent> = {}): UIEvent =>
@@ -17,6 +18,32 @@ const start = (overrides: Partial<UIEvent> = {}): UIEvent =>
     model: 'claude-opus-4-7',
     ...overrides,
   }) as UIEvent;
+
+const uiTodo = (status: TodoItemForUI['status']): TodoItemForUI => ({
+  content: 'x',
+  activeForm: 'X',
+  status,
+});
+
+describe('liveRegionActive', () => {
+  test('idle when nothing in the live region is running', () => {
+    expect(liveRegionActive(createInitialState())).toBe(false);
+  });
+
+  test('an in_progress task keeps it active (drives the Tasks header shimmer)', () => {
+    const base = createInitialState();
+    expect(liveRegionActive({ ...base, todos: [uiTodo('in_progress')] })).toBe(true);
+    // done / pending alone must NOT keep redrawing — only in_progress
+    // animates, so a finished list lets the scheduler idle (zero wakeups).
+    expect(liveRegionActive({ ...base, todos: [uiTodo('done'), uiTodo('pending')] })).toBe(false);
+  });
+
+  test('also active for thinking / awaiting-provider (extracted logic intact)', () => {
+    const base = createInitialState();
+    expect(liveRegionActive({ ...base, thinking: { startedAt: 0, messageId: 'm' } })).toBe(true);
+    expect(liveRegionActive({ ...base, awaitingProvider: { stepN: 1, startedAt: 0 } })).toBe(true);
+  });
+});
 
 const drive = (events: UIEvent[]): { state: LiveState; permanent: PermanentItem[] } => {
   let state = createInitialState();

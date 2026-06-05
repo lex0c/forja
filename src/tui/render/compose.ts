@@ -256,7 +256,7 @@ export const composeLive: ComposeLive = (
   // 1. Live TodoList (above the operation chips per spec §4.10.6:
   // "Todo list (§4.3) acima dos chips, se houver"). renderTodoList
   // returns [] when state.todos is empty — section drops entirely.
-  appendBlock(renderTodoList(state.todos, caps));
+  appendBlock(renderTodoList(state.todos, caps, now));
 
   // 2. Active subagents (UI.md §4.2). One row per concurrent
   // child run; section disappears when state.subagents is empty.

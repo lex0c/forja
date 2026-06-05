@@ -24,7 +24,7 @@ const item = (
 
 describe('renderTodoList', () => {
   test('empty list returns []', () => {
-    expect(renderTodoList([], caps)).toEqual([]);
+    expect(renderTodoList([], caps, 0)).toEqual([]);
   });
 
   test('header + one row per item with the canonical glyphs', () => {
@@ -35,6 +35,7 @@ describe('renderTodoList', () => {
         item('pending', 'Add regression test'),
       ],
       caps,
+      0,
     );
     expect(out).toHaveLength(4);
     expect(out[0]).toContain('Tasks');
@@ -52,6 +53,7 @@ describe('renderTodoList', () => {
     const out = renderTodoList(
       [item('done', 'Ship it', 'Shipping it'), item('pending', 'Wait', 'Waiting')],
       caps,
+      0,
     );
     expect(out[1]).toContain('Ship it');
     expect(out[1]).not.toContain('Shipping it');
@@ -63,6 +65,7 @@ describe('renderTodoList', () => {
     const out = renderTodoList(
       [item('done', 'd'), item('in_progress', 'p', 'P'), item('pending', 'q')],
       ascii,
+      0,
     );
     expect(out[1]).toContain('[x]');
     expect(out[2]).toContain('[*]');
@@ -75,28 +78,40 @@ describe('renderTodoList', () => {
     }
   });
 
-  test('list of 8 items renders fully (no truncation)', () => {
-    const items = Array.from({ length: 8 }, (_, i) => item('pending', `task ${i}`));
-    const out = renderTodoList(items, caps);
-    // header + 8 rows; no `(+N more)` suffix.
-    expect(out).toHaveLength(9);
+  test('list of 5 items renders fully (no truncation)', () => {
+    const items = Array.from({ length: 5 }, (_, i) => item('pending', `task ${i}`));
+    const out = renderTodoList(items, caps, 0);
+    // header + 5 rows; no `(+N more)` suffix.
+    expect(out).toHaveLength(6);
     expect(out.some((l) => l.includes('more'))).toBe(false);
   });
 
-  test('over 8 items collapses to running + 2 pending + (+N more)', () => {
+  test('over 5 items collapses to running + pending lookahead + (+N more)', () => {
     // 1 in_progress, 12 pending — 13 total.
     const items: TodoItemForUI[] = [
       item('in_progress', 'running thing', 'Running thing'),
       ...Array.from({ length: 12 }, (_, i) => item('pending', `pending ${i}`)),
     ];
-    const out = renderTodoList(items, caps);
-    // header + running + first 2 pending + `(+N more)` = 5 lines.
-    expect(out).toHaveLength(5);
+    const out = renderTodoList(items, caps, 0);
+    // header + running + first 4 pending + `(+N more)` = 7 lines.
+    expect(out).toHaveLength(7);
     expect(out[1]).toContain('▶');
     expect(out[1]).toContain('Running thing');
     expect(out[2]).toContain('pending 0');
-    expect(out[3]).toContain('pending 1');
-    expect(out[4]).toContain('(+10 more)');
+    expect(out[5]).toContain('pending 3');
+    expect(out[6]).toContain('(+8 more)');
+  });
+
+  test('all-done list still shows rows (done backfills — block never empty)', () => {
+    // Regression: 6/6 done used to collapse to just the header + counter
+    // because done was never picked. Now done backfills the visible slice.
+    const items = Array.from({ length: 6 }, (_, i) => item('done', `done ${i}`));
+    const out = renderTodoList(items, caps, 0);
+    // header + 5 done rows + (+1 more) = 7 lines.
+    expect(out).toHaveLength(7);
+    expect(out[1]).toContain('done 0');
+    expect(out[5]).toContain('done 4');
+    expect(out[6]).toContain('(+1 more)');
   });
 
   test('embedded \\n / \\r in content is scrubbed (line-height contract)', () => {
@@ -109,6 +124,7 @@ describe('renderTodoList', () => {
     const out = renderTodoList(
       [item('done', 'first\nsecond\nthird'), item('in_progress', 'x', 'progress\rwith\r\nbreaks')],
       caps,
+      0,
     );
     // Header + 2 rows = 3 lines; no extra splits.
     expect(out).toHaveLength(3);
@@ -127,32 +143,56 @@ describe('renderTodoList', () => {
       item('in_progress', 'critical', 'Doing critical'),
       ...Array.from({ length: 5 }, (_, i) => item('pending', `pending ${i}`)),
     ];
-    const out = renderTodoList(items, caps);
-    // header + running + 2 pending + (+N more).
-    expect(out).toHaveLength(5);
+    const out = renderTodoList(items, caps, 0);
+    // header + running + 4 pending + (+N more) = 7 lines.
+    expect(out).toHaveLength(7);
     expect(out[1]).toContain('Doing critical');
     expect(out[2]).toContain('pending 0');
-    expect(out[3]).toContain('pending 1');
-    // 11 total - 3 visible items = 8 hidden.
-    expect(out[4]).toContain('(+8 more)');
+    expect(out[5]).toContain('pending 3');
+    // 11 total - 5 visible items = 6 hidden.
+    expect(out[6]).toContain('(+6 more)');
   });
 
   test('header shows progress as done/total', () => {
-    const out = renderTodoList([item('done', 'a'), item('done', 'b'), item('pending', 'c')], caps);
+    const out = renderTodoList(
+      [item('done', 'a'), item('done', 'b'), item('pending', 'c')],
+      caps,
+      0,
+    );
     expect(out[0]).toContain('Tasks 2/3');
   });
 
+  test('header breaks the total down by status', () => {
+    const out = renderTodoList(
+      [item('done', 'a'), item('in_progress', 'b', 'B'), item('pending', 'c'), item('failed', 'd')],
+      caps,
+      0,
+    );
+    expect(out[0]).toContain('Tasks 1/4 (1 pending · 1 in_progress · 1 done · 1 failed)');
+  });
+
+  test('"Tasks" shimmers while a task is in_progress, flat otherwise', () => {
+    const color: Capabilities = { ...caps, color: 'basic' };
+    // The shimmer paints one accent (SGR 94) char in "Tasks" while a task
+    // runs; with nothing in_progress the header is flat `secondary`.
+    const active = renderTodoList([item('in_progress', 'x', 'X')], color, 100)[0] ?? '';
+    const idle = renderTodoList([item('done', 'x')], color, 100)[0] ?? '';
+    expect(active).toContain('[94m');
+    expect(idle).not.toContain('[94m');
+  });
+
   test('failed status renders ✗ (unicode) / [!] (ascii) — reachable now', () => {
-    const u = renderTodoList([item('failed', 'broke it')], caps);
+    const u = renderTodoList([item('failed', 'broke it')], caps, 0);
     expect(u[1]).toContain('✗');
     expect(u[1]).toContain('broke it');
-    expect(renderTodoList([item('failed', 'broke it')], ascii)[1]).toContain('[!]');
+    expect(renderTodoList([item('failed', 'broke it')], ascii, 0)[1]).toContain('[!]');
   });
 
   test('failed counts toward the denominator but not the numerator', () => {
     const out = renderTodoList(
       [item('done', 'a'), item('failed', 'b'), item('pending', 'c')],
       caps,
+      0,
     );
     expect(out[0]).toContain('Tasks 1/3');
   });
@@ -163,7 +203,7 @@ describe('renderTodoList', () => {
       ...Array.from({ length: 8 }, (_, i) => item('pending', `pending ${i}`)),
       item('failed', 'broke'),
     ];
-    const out = renderTodoList(items, caps);
+    const out = renderTodoList(items, caps, 0);
     expect(out.some((l) => l.includes('✗') && l.includes('broke'))).toBe(true);
   });
 });
