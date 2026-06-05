@@ -31,7 +31,12 @@
 
 import type { ConfirmState, PreviewLine } from '../state.ts';
 import { type Capabilities, type SgrToken, paint, paintMulti } from '../term.ts';
-import { queueSuffix, rule } from './modal-chrome.ts';
+
+// Modal rule width adapts to the live region: full caps.cols so the
+// modal feels structural. truncateToWidth in the renderer will clip
+// if cols changes mid-render but normal redraw handles resize.
+const rule = (caps: Capabilities): string =>
+  (caps.unicode ? '─' : '-').repeat(Math.max(8, caps.cols));
 
 const optionLine = (
   modal: ConfirmState,
@@ -124,15 +129,16 @@ export const renderModal = (modal: ConfirmState, caps: Capabilities): string[] =
   // anchor tone so it stands out from surrounding dim chat / tool-card
   // text.
   lines.push(paint(caps, anchorTone, rule(caps)));
+  // Queue suffix: how many OTHER asks wait behind this one. Empty when
+  // none, so the operator only sees the count when a pop is pending.
+  const queueSuffix = modal.queueDepth > 0 ? ` (+${modal.queueDepth} waiting)` : '';
   // Title takes the same anchor tone as the top rule so the two
   // structural anchors read as a single visual unit. `bold` adds
   // weight on top. paintMulti emits a single trailing reset
   // (\x1b[94m\x1b[1m{title}\x1b[0m for accent) — nested paint() would
   // emit a redundant inner reset that some terminals re-process as a
   // flash.
-  lines.push(
-    `  ${paintMulti(caps, [anchorTone, 'bold'], `${modal.title}${queueSuffix(modal.queueDepth)}`)}`,
-  );
+  lines.push(`  ${paintMulti(caps, [anchorTone, 'bold'], `${modal.title}${queueSuffix}`)}`);
   if (modal.subject !== null)
     lines.push(`  ${paint(caps, modal.subjectTone ?? 'dim', modal.subject)}`);
   // Preview block — one blank line of breathing room above it so the

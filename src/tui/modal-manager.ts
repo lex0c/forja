@@ -283,11 +283,11 @@ export const buildPermissionOptions = (): ConfirmOption[] => [
 export const PERMISSION_DEFAULT_SELECTED_INDEX = 0;
 
 // Clarify flavor (STATE_MACHINE §12). Producer is the `clarify` tool's
-// modal bridge (ToolContext.clarify). Single question per ask while
-// N=1 (on_high_blast); the form reuses the generic select/answer
-// machinery. Resolves `resolved` + the chosen option id, or `skipped`
-// on Esc / timeout (the tool maps a skip to options[0]). `escalated`
-// (edit-goal) is a later affordance.
+// modal bridge (ToolContext.clarify). One question + options per ask,
+// raised as a ConfirmState (flavor 'clarify') and resolved through the
+// generic select/answer machinery. Resolves `resolved` + the chosen
+// option id, or `skipped` on Esc / timeout (the tool maps a skip to
+// options[0]). `escalated` (edit-goal) is a later affordance.
 export interface ClarifyAskArgs {
   question: string;
   why: string | null;

@@ -360,13 +360,11 @@ export type ModalQueueDepthEvent = BaseEvent & {
   // the only ask in flight.
   depth: number;
 };
-// Clarify form-modal raise (STATE_MACHINE §12). A NEW modal family,
-// separate from the confirm flavors — the reducer builds a
-// `clarifyModal` (its own LiveState slot), not a `modal`, from it.
-// Single question for now (on_high_blast); the pre_execution batching
-// slice will append questions to an open clarify modal. Navigation and
-// resolution reuse the generic modal:select / modal:answer machinery
-// (the form is a single-select while N=1).
+// Clarify raise (STATE_MACHINE §12). The reducer builds a `modal`
+// (ConfirmState, flavor 'clarify') from it — clarify is a confirm
+// flavor: one question + options. Navigation and resolution use the
+// generic modal:select / modal:answer machinery; multiple pending
+// clarifies stack in the FIFO queue like any other modal.
 export type ClarifyAskEvent = BaseEvent & {
   type: 'clarify:ask';
   promptId: string;

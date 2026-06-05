@@ -1104,7 +1104,7 @@ Estado transiente disparado por `clarify()` com `blast_radius: high` (ou batched
 - `active_goal` (`§2.3`) imutável durante clarification (mudança de goal só via `regrounding` ou explicit `/goal push`)
 
 **Ações ao entrar:**
-- UI mostra modal com até 3 perguntas batched, cada uma com opções + `why_it_matters`
+- UI mostra modal **single-question** (a pergunta + suas opções + `why_it_matters`), renderizado como um flavor do modal de confirm. Múltiplas `clarify()` pendentes **empilham na fila FIFO** de modais (como permission/trust) — uma de cada vez, com sufixo `(+N waiting)` — em vez de um form multi-pergunta
 - Default escolhido em 60s = `(skip and proceed with auto_assumed[0])` — registra em `assumptions[]` com `auto_chosen: true`
 
 **Transições:**

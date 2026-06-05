@@ -35,7 +35,6 @@ import { renderFooter } from './footer.ts';
 import { padFrame } from './frame.ts';
 import { renderQueued } from './inbox.ts';
 import { renderInput } from './input.ts';
-import { renderClarifyModal } from './clarify-modal.ts';
 import { renderModal } from './modal.ts';
 import { isBashMode } from './mode.ts';
 import { formatPermanent } from './permanent.ts';
@@ -116,7 +115,7 @@ export const composeCursor = (
   caps: Capabilities,
   lineCount: number,
 ): CursorPos | null => {
-  if (state.modal !== null || state.clarifyModal !== null) return null;
+  if (state.modal !== null) return null;
   // Bash mode (`render/input.ts`): an idle buffer starting with `!`
   // renders the leading `!` as the prompt glyph, not content — so the
   // drawn command is `value.slice(1)` and the caret is one column left
@@ -359,14 +358,6 @@ export const composeLive: ComposeLive = (
   // double-indent content AND push rules past caps.cols, which
   // truncateToWidth then clips on the right edge — visible as the
   // box losing its last 2 columns on every row of every modal.
-  // Clarify form-modal owns the bottom slot the same way a confirm
-  // modal does — its own slot, rendered before the confirm branch.
-  // The manager's single FIFO queue means at most one of the two is
-  // ever non-null, so branch order is for readability, not precedence.
-  if (state.clarifyModal !== null) {
-    lines.push(...renderClarifyModal(state.clarifyModal, caps));
-    return lines;
-  }
   if (state.modal !== null) {
     lines.push(...renderModal(state.modal, caps));
     return lines;

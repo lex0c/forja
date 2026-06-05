@@ -10,8 +10,9 @@ import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts'
 // Design intent: `clarify` is a CORE tool, always exposed alongside
 // read/write/edit — never gated by a playbook. The per-playbook
 // `clarify_mode` modulates only the interruption behavior, never the
-// availability. Staging note: it stays OUT of BUILTIN_TOOLS until the
-// form-modal bridge (`ctx.clarify`) is wired — see builtin/index.ts.
+// availability. It renders as a confirm-modal flavor (`flavor:'clarify'`,
+// one question + options); the REPL wires `ctx.clarify` to the
+// ModalManager. Multiple pending clarifies stack in the FIFO queue.
 //
 // blast_radius routing (§12.1):
 //   - low    — aesthetic / no real stakes. Auto-resolves to options[0]
