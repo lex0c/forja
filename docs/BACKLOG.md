@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-04] TUI: turn off the tool-card min-display hold in production
+
+**Decision (operator).** `runRepl` now wires `toolMinDisplayMs: 0` (was 400), so the renderer applies each fast tool's `tool:end` on arrival instead of holding the card on screen first. Chosen after comparing both in `bun run dev`.
+
+**Why.** The 400ms hold delayed every `tool:end` — and the harness events queued behind it in `drainQueue` — purely to keep sub-frame cards (read / write / quick bash, which finish inside one ~33ms frame) from flashing past before they paint. The operator preferred zero added latency: events now process in arrival order. Scrollback is unaffected — the permanent `Read …` / `Edited N files` line comes from the `tool:end` reducer branch (`state.ts`), not the live card, so nothing is lost when the card isn't held.
+
+**Scope.** Production wiring only (`cli/index.ts`). The hold mechanism stays in the renderer as a configurable knob (`toolMinDisplayMs`, gated `> 0`; `eventQueue` / `drainQueue` / `toolShownAt` / `HOLD_BYPASS`) with default 0 — `repl.ts` already defaulted to 0 and the `renderer.test.ts` hold suite still drives it with 400. Not spec-governed (the hold was code-behind-spec; the spec's 400ms entries are provider / drift latency, unrelated), so no spec PR. tsc + Biome clean.
+
 ## [2026-06-04] clarify: core always-available anti-presumption tool (spec-PR, before code)
 
 **Decision (operator).** `clarify` stops being a playbook/subagent feature and becomes a CORE builtin tool — always exposed to the model alongside `read`/`write`/`edit`. The `clarify_mode: off` concept is eliminated: nothing ever removes the tool.
