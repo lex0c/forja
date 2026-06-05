@@ -842,7 +842,7 @@ describe('tool lifecycle', () => {
         type: 'tool:start',
         ts: 1,
         toolId: 't1',
-        name: 'todo_write',
+        name: 'todo_create',
         activeVerb: 'Updating todos',
         finalVerb: 'Updated todos',
         subject: null,
@@ -1189,7 +1189,7 @@ describe('tool-end batch coalescing', () => {
   });
 
   test('null subjects are filtered out of the batch continuation list', () => {
-    // todo_write-style tools (no vocab subject) produce null
+    // todo_create-style tools (no vocab subject) produce null
     // subjects. They count toward `count` but don't surface as
     // `|_` continuation lines (a bare `|_ ` with no payload is
     // visual noise). Tested with a non-todo tool name so the

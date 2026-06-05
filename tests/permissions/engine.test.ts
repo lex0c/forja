@@ -1006,7 +1006,7 @@ describe('engine.check (search tools: glob/grep)', () => {
 describe('engine misc category', () => {
   test('misc tools auto-allow (no gate yet)', () => {
     const eng = createPermissionEngine(policy({}), { cwd: CWD });
-    expect(eng.check('todo_write', 'misc', {}).kind).toBe('allow');
+    expect(eng.check('todo_create', 'misc', {}).kind).toBe('allow');
   });
 });
 
@@ -1559,7 +1559,7 @@ describe('Decision.source provenance', () => {
       cwd: CWD,
       provenance: { defaults: 'user' },
     });
-    const d = eng.check('todo_write', 'misc', {});
+    const d = eng.check('todo_create', 'misc', {});
     expect(d.kind).toBe('allow');
     expect(d.source).toEqual({ layer: 'default' });
   });
@@ -2802,7 +2802,7 @@ describe('engine — classifier hint (§6.4 integration)', () => {
         return { score_adjust: 0.1, reason: 'hello' };
       },
     });
-    eng.check('todo_write', 'misc', {});
+    eng.check('todo_create', 'misc', {});
     expect(consultCount).toBe(0);
     expect(collected[0]?.classifier_adjust).toBeNull();
   });
@@ -3225,14 +3225,14 @@ describe('engine — classifier context summary (§6.4, slice 11)', () => {
       cwd: PROJ,
       classifier: recordingClassifier(seen),
     });
-    // todo_write is misc — would not call the classifier, but
+    // todo_create is misc — would not call the classifier, but
     // should still land in the buffer so a subsequent bash check
     // SEES the misc activity.
-    eng.check('todo_write', 'misc', {});
+    eng.check('todo_create', 'misc', {});
     eng.check('bash', 'bash', { command: 'ls' });
     // Misc doesn't invoke the classifier, so seen[0] is the bash call.
     expect(seen.length).toBe(1);
-    expect(seen[0]?.contextSummary).toContain('tool=todo_write');
+    expect(seen[0]?.contextSummary).toContain('tool=todo_create');
   });
 
   test('sanitization: scopes never appear in the summary even when capabilities have them', () => {
@@ -3346,7 +3346,7 @@ describe('engine — Decision.sandboxProfile (§6.5 runtime wire-up, slice 19)',
       cwd: '/work/proj',
       sandbox: { available: true, hostExplicitlyAllowed: false, required: false },
     });
-    const d = eng.check('todo_write', 'misc', {});
+    const d = eng.check('todo_create', 'misc', {});
     // Misc capabilities are empty; planner picks 'ro' (most
     // restrictive that covers ∅). Field IS populated — the engine
     // ran the planner because sandbox was configured.
@@ -3918,7 +3918,7 @@ describe('engine — effective capabilities envelope (§10.1, slice 95)', () => 
   });
 
   test('misc category (no resolver) passes regardless of effective', () => {
-    // Misc-category tools (e.g. think, todo_write) emit no
+    // Misc-category tools (e.g. think, todo_create) emit no
     // resolved capabilities. Even a pure-LLM child with
     // effective=[] uses them freely — `resolvedCapabilities`
     // is empty so the §10.1 stage short-circuits.

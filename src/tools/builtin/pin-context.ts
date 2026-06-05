@@ -104,7 +104,7 @@ const validateInput = (args: PinContextInput): ToolResult<PinContextOutput> | nu
 export const pinContextTool: Tool<PinContextInput, PinContextOutput> = {
   name: 'pin_context',
   description:
-    "Propose a session-scoped pinned constraint that survives compaction, is re-injected with the goal, and shows up in auto-rehydrate. ALWAYS opens an operator-confirmation modal — only persists on accept. Use for facts that must be remembered MULTIPLE TIMES in this session (e.g. 'API pública de X não pode mudar', 'rodar pnpm fmt antes de commitar'). NOT for: TODOs (use todo_write), one-shot decisions (already in decisions[]), cross-session facts (use memory_write). Cap of 10 pins per session; rejected with pin.cap_exceeded when exceeded. In headless mode the call is rejected with pin.headless_mode.",
+    "Propose a session-scoped pinned constraint that survives compaction, is re-injected with the goal, and shows up in auto-rehydrate. ALWAYS opens an operator-confirmation modal — only persists on accept. Use for facts that must be remembered MULTIPLE TIMES in this session (e.g. 'API pública de X não pode mudar', 'rodar pnpm fmt antes de commitar'). NOT for: TODOs (use todo_create), one-shot decisions (already in decisions[]), cross-session facts (use memory_write). Cap of 10 pins per session; rejected with pin.cap_exceeded when exceeded. In headless mode the call is rejected with pin.headless_mode.",
   inputSchema: {
     type: 'object',
     properties: {

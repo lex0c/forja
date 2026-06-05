@@ -20,7 +20,11 @@ describe('tool-vocab', () => {
       'monitor',
       'read_file',
       'task',
-      'todo_write',
+      'todo_clear',
+      'todo_create',
+      'todo_get',
+      'todo_list',
+      'todo_update',
       'wait_for',
       'write_file',
     ];
@@ -82,8 +86,8 @@ describe('tool-vocab', () => {
     expect(TOOL_VOCAB.task?.subject?.({})).toBeNull();
   });
 
-  test('todo_write has no subject extractor (the count goes elsewhere)', () => {
-    expect(TOOL_VOCAB.todo_write?.subject).toBeUndefined();
+  test('todo_create has no subject extractor (the count goes elsewhere)', () => {
+    expect(TOOL_VOCAB.todo_create?.subject).toBeUndefined();
   });
 
   // Discriminated-union tools (monitor, wait_for) take a nested

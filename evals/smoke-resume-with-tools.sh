@@ -5,12 +5,12 @@
 # by run 1 must round-trip through DB persistence and replay
 # back to the provider on run 2 with the original tool_use_ids
 # intact. Mocks didn't catch any tool-related bugs but neither
-# did they assert correctness; this smoke uses todo_write
+# did they assert correctness; this smoke uses todo_create
 # (category='misc', no filesystem access needed, no permission
 # config required) to exercise tool_use → tool_result pairing
 # across the resume boundary.
 #
-# Run 1 (Haiku): ask the model to use todo_write to plan tasks.
+# Run 1 (Haiku): ask the model to use todo_create to plan tasks.
 # Run 2 (Haiku, resumed): ask what was added to the todo list.
 #   The reply must reference what run 1 actually planned, proving
 #   the tool_use+tool_result pair survived persistence and replay
@@ -41,26 +41,26 @@ cd "$TMPDIR"
 mkdir -p workspace
 cd workspace
 
-# A specific phrase the model must include in a todo_write item;
+# A specific phrase the model must include in a todo_create item;
 # we'll grep run 2's response for evidence the model recalled it.
 MARKER="WIDGET_$(date +%s)"
 MODEL="anthropic/claude-haiku-4-5"
 
-echo "=== Run 1: plan a task via todo_write ===" >&2
+echo "=== Run 1: plan a task via todo_create ===" >&2
 bun run "$ROOT/src/cli/index.ts" \
   --model "$MODEL" \
   --json \
-  "Use the todo_write tool to add exactly one task with this exact content: 'Implement the $MARKER feature'. The status should be 'pending' and the active_form should be 'Implementing the $MARKER feature'. Reply with just 'planned'." \
+  "Use the todo_create tool to add exactly one task with this exact content: 'Implement the $MARKER feature'. The status should be 'pending' and the active_form should be 'Implementing the $MARKER feature'. Reply with just 'planned'." \
   > run1.ndjson 2> run1.err || {
     echo "Run 1 failed. stderr:" >&2
     cat run1.err >&2
     exit 1
   }
 
-# Confirm run 1 actually called todo_write (otherwise the test
+# Confirm run 1 actually called todo_create (otherwise the test
 # is verifying nothing).
-if ! jq -r 'select(.type == "tool_invoking") | .toolName' < run1.ndjson | grep -qx 'todo_write'; then
-  echo "Run 1 did NOT call todo_write — model ignored the prompt." >&2
+if ! jq -r 'select(.type == "tool_invoking") | .toolName' < run1.ndjson | grep -qx 'todo_create'; then
+  echo "Run 1 did NOT call todo_create — model ignored the prompt." >&2
   jq -r 'select(.type == "tool_invoking") | .toolName' < run1.ndjson >&2
   exit 1
 fi

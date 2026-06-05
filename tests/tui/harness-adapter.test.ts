@@ -1140,8 +1140,8 @@ describe('harness-adapter — compaction & checkpoints', () => {
       type: 'todo_updated',
       sessionId: 'sess-1',
       items: [
-        { content: 'Implement', activeForm: 'Implementing', status: 'in_progress' },
-        { content: 'Test', activeForm: 'Testing', status: 'pending' },
+        { id: '1', content: 'Implement', activeForm: 'Implementing', status: 'in_progress' },
+        { id: '2', content: 'Test', activeForm: 'Testing', status: 'pending' },
       ],
     });
     expect(types(out)).toEqual(['todo:update']);
@@ -1160,6 +1160,21 @@ describe('harness-adapter — compaction & checkpoints', () => {
     const out = a.translate({ type: 'todo_updated', sessionId: 's', items: [] });
     expect(types(out)).toEqual(['todo:update']);
     expect((out[0] as Extract<UIEvent, { type: 'todo:update' }>).items).toEqual([]);
+  });
+
+  test('soft-deleted (removed) items are dropped from todo:update', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'todo_updated',
+      sessionId: 's',
+      items: [
+        { id: '1', content: 'kept', activeForm: 'Keeping', status: 'pending' },
+        { id: '2', content: 'gone', activeForm: 'Going', status: 'removed' },
+      ],
+    });
+    const ev = out[0] as Extract<UIEvent, { type: 'todo:update' }>;
+    expect(ev.items).toHaveLength(1);
+    expect(ev.items[0]?.content).toBe('kept');
   });
 });
 

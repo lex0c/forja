@@ -17,17 +17,15 @@
 //   ○ pending         (ASCII fallback `[ ]`)
 //   ✗ failed          (ASCII fallback `[!]`)
 //
-// `failed` is wired but unreachable today — TodoStore enum doesn't
-// expose it (the tool rejects invalid lists at write time, not at
-// render time). The branch stays so a future store extension lights
-// it up automatically without renderer churn (D133).
+// `failed` is reachable: the TodoStore enum exposes it and
+// todo_update(status:'failed') sets it. The render branch (glyph +
+// truncation) was wired ahead of the enum (D133), so it lit up with no
+// renderer churn once the status landed.
 //
-// >8 items: collapses to "in_progress + next 2 pending + done count"
-// with a discreet `(+N more)` line, per spec §4.3 ("Mais de 8 todos:
-// trunca pra '▶ running + próximas 2 pending + ✗ failed', com
-// `(+12 more)` discreto"). The done-count placeholder replaces the
-// listed-items rule for failed in our case (no failed exist) — failed
-// items, when they land, would be appended verbatim.
+// >8 items: collapses to "in_progress + next 2 pending + failed" with a
+// discreet `(+N more)` line, per spec §4.3 ("Mais de 8 todos: trunca pra
+// '▶ running + próximas 2 pending + ✗ failed', com `(+12 more)`
+// discreto"). failed items ride in the visible slice verbatim.
 
 import type { TodoItemForUI, TodoStatusForUI } from '../events.ts';
 import { type Capabilities, paint } from '../term.ts';
@@ -62,17 +60,18 @@ const labelFor = (item: TodoItemForUI): string =>
 // per output line" contract: a `\n` or `\r` embedded in user content
 // would split into multiple terminal lines, but `composeLive` returns
 // one string, and the renderer's `liveHeight = truncated.length`
-// math would under-count by N. The todo_write tool's validateString
-// doesn't reject these (boundary-validation in that subsystem is
-// pending), so the renderer scrubs defensively. Tabs are
-// kept (harmless single-cell render in most terminals).
+// math would under-count by N. The todo tools now reject control chars
+// at the source (todo-shared.ts validateStringField), so this scrub is
+// residual defense for replay / NDJSON paths. Tabs are kept (harmless
+// single-cell render in most terminals).
 const scrubLineBreaks = (s: string): string => s.replace(/[\r\n]+/g, ' ');
 
 const renderRow = (item: TodoItemForUI, caps: Capabilities): string => {
   const glyph = glyphFor(item.status, caps);
-  // in_progress in `warn` color so the active task pops; others dim.
-  // Done rows stay dim — completed work is reference, not focus.
-  const token = item.status === 'in_progress' ? 'warn' : 'dim';
+  // in_progress in `warn` so the active task pops; failed in `error` so
+  // a failure reads as loud as the running task; done/pending stay dim
+  // (reference, not focus).
+  const token = item.status === 'in_progress' ? 'warn' : item.status === 'failed' ? 'error' : 'dim';
   return `  ${paint(caps, token, `${glyph} ${scrubLineBreaks(labelFor(item))}`)}`;
 };
 
@@ -105,7 +104,11 @@ const visibleRows = (items: TodoItemForUI[]): TodoItemForUI[] => {
 export const renderTodoList = (todos: TodoItemForUI[], caps: Capabilities): string[] => {
   if (todos.length === 0) return [];
   const visible = visibleRows(todos);
-  const lines: string[] = [paint(caps, 'dim', 'Tasks')];
+  // Header carries progress: `Tasks <done>/<total>`. Numerator is done
+  // only; the denominator counts every row (failed included), so a failed
+  // task visibly holds the fraction short of N/N instead of vanishing.
+  const done = todos.filter((t) => t.status === 'done').length;
+  const lines: string[] = [paint(caps, 'dim', `Tasks ${done}/${todos.length}`)];
   for (const item of visible) {
     lines.push(renderRow(item, caps));
   }

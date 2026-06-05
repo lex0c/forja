@@ -103,9 +103,9 @@ describe('renderTodoList', () => {
     // The renderer's caller (composeLive → renderer.ts) assumes one
     // input string == one terminal line for liveHeight bookkeeping.
     // Embedded newlines would make `liveHeight = truncated.length`
-    // under-count, leaving ghost rows after eraseLive. todo_write's
-    // validation doesn't reject these today, so the renderer scrubs
-    // defensively.
+    // under-count, leaving ghost rows after eraseLive. The todo tools
+    // now reject control chars at the source, so this scrub is residual
+    // defense — exercised here by calling the renderer directly.
     const out = renderTodoList(
       [item('done', 'first\nsecond\nthird'), item('in_progress', 'x', 'progress\rwith\r\nbreaks')],
       caps,
@@ -135,5 +135,35 @@ describe('renderTodoList', () => {
     expect(out[3]).toContain('pending 1');
     // 11 total - 3 visible items = 8 hidden.
     expect(out[4]).toContain('(+8 more)');
+  });
+
+  test('header shows progress as done/total', () => {
+    const out = renderTodoList([item('done', 'a'), item('done', 'b'), item('pending', 'c')], caps);
+    expect(out[0]).toContain('Tasks 2/3');
+  });
+
+  test('failed status renders ✗ (unicode) / [!] (ascii) — reachable now', () => {
+    const u = renderTodoList([item('failed', 'broke it')], caps);
+    expect(u[1]).toContain('✗');
+    expect(u[1]).toContain('broke it');
+    expect(renderTodoList([item('failed', 'broke it')], ascii)[1]).toContain('[!]');
+  });
+
+  test('failed counts toward the denominator but not the numerator', () => {
+    const out = renderTodoList(
+      [item('done', 'a'), item('failed', 'b'), item('pending', 'c')],
+      caps,
+    );
+    expect(out[0]).toContain('Tasks 1/3');
+  });
+
+  test('truncation surfaces failed rows in the visible slice', () => {
+    const items: TodoItemForUI[] = [
+      item('in_progress', 'running', 'Running'),
+      ...Array.from({ length: 8 }, (_, i) => item('pending', `pending ${i}`)),
+      item('failed', 'broke'),
+    ];
+    const out = renderTodoList(items, caps);
+    expect(out.some((l) => l.includes('✗') && l.includes('broke'))).toBe(true);
   });
 });

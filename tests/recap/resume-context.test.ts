@@ -231,7 +231,7 @@ describe('buildResumeContext — notDone (Open todos)', () => {
       previousStatus: 'interrupted',
       resumedAt: RESUMED_AT,
     });
-    expect(result.text).toContain('Open todos (last todo_write):\n  - (none)');
+    expect(result.text).toContain('Open todos:\n  - (none)');
     expect(result.todoCount).toBe(0);
   });
 

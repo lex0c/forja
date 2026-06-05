@@ -264,7 +264,7 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // affordance that `|_` already signals.
       const lines = nested ? [head] : ['', head];
       // Sub-content (subject) under the connector. Skipped when no
-      // subject (some tools have no obvious one — todo_write etc.).
+      // subject (some tools have no obvious one — todo_create / todo_list).
       // For denied, the subject is replaced by the policy reason if
       // surfaced via summary; absent that, drop the connector.
       // For error, the subject (path / command) is preserved AND
@@ -272,7 +272,7 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // summary` on the same line — operators get both the target
       // and the cause without scrolling. When only one of subject /
       // summary is present, the line falls back to that single
-      // value so a tool with no vocab subject (todo_write) still
+      // value so a tool with no vocab subject (todo_create) still
       // surfaces its error reason.
       // Treat empty-string subject as absent so a misbehaving producer
       // doesn't render a bare `└─ ` line.

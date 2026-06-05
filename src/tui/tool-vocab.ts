@@ -143,11 +143,28 @@ export const TOOL_VOCAB: Readonly<Record<string, ToolVocab>> = {
       return name ?? scope;
     },
   },
-  todo_write: {
-    activeVerb: 'Updating todos',
-    finalVerb: 'Updated todos',
-    // Todos don't have a single subject; let the count land in
-    // expansion. Renderer drops the connector when subject is null.
+  todo_clear: {
+    activeVerb: 'Clearing todos',
+    finalVerb: 'Cleared todos',
+  },
+  todo_create: {
+    activeVerb: 'Adding todos',
+    finalVerb: 'Added todos',
+    // Multiple items, no single subject — renderer drops the connector.
+  },
+  todo_update: {
+    activeVerb: 'Updating todo',
+    finalVerb: 'Updated todo',
+    subject: (a) => str(a.id),
+  },
+  todo_list: {
+    activeVerb: 'Listing todos',
+    finalVerb: 'Listed todos',
+  },
+  todo_get: {
+    activeVerb: 'Reading todo',
+    finalVerb: 'Read todo',
+    subject: (a) => str(a.id),
   },
   monitor: {
     activeVerb: 'Monitoring',

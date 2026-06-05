@@ -283,7 +283,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // db.close() in cli/run.ts and hit a closed sqlite handle.
   let checkpointsPurgeInFlight: Promise<unknown> | undefined;
   // Per-session TodoList store. Created once per session here so the
-  // todo_write tool sees a fresh list, and torn down in the outer
+  // todo tools see a fresh list, and torn down in the outer
   // finally so accumulated state from a long-lived process doesn't
   // leak across sessions. Spec §7.4: not persisted, work-state only.
   //
@@ -314,6 +314,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         items: baseTodoStore.get(sid),
       });
     },
+    // nextId is not an observable mutation — it just hands out the next
+    // id; the row lands via a later set() that emits. Plain pass-through.
+    nextId: (sid) => baseTodoStore.nextId(sid),
     clear: (sid) => baseTodoStore.clear(sid),
   };
   // Per-run totals. Each completed provider turn adds its usage and

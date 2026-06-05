@@ -25,7 +25,11 @@ import { taskAwaitTool } from './task-await.ts';
 import { taskCancelTool } from './task-cancel.ts';
 import { taskListTool } from './task-list.ts';
 import { taskSyncTool, taskTool } from './task.ts';
-import { todoWriteTool } from './todo-write.ts';
+import { todoClearTool } from './todo-clear.ts';
+import { todoCreateTool } from './todo-create.ts';
+import { todoGetTool } from './todo-get.ts';
+import { todoListTool } from './todo-list.ts';
+import { todoUpdateTool } from './todo-update.ts';
 import { waitForTool } from './wait-for.ts';
 import { writeFileTool } from './write-file.ts';
 
@@ -80,17 +84,27 @@ export { taskCancelTool } from './task-cancel.ts';
 export type { TaskCancelInput, TaskCancelOutput } from './task-cancel.ts';
 export { taskListTool } from './task-list.ts';
 export type { TaskListEntry, TaskListInput, TaskListOutput } from './task-list.ts';
-export { todoWriteTool } from './todo-write.ts';
-export type { TodoWriteInput, TodoWriteItem, TodoWriteOutput } from './todo-write.ts';
+export { todoClearTool } from './todo-clear.ts';
+export type { TodoClearInput, TodoClearOutput } from './todo-clear.ts';
+export { todoCreateTool } from './todo-create.ts';
+export type { TodoCreateInput, TodoCreateInputItem, TodoCreateOutput } from './todo-create.ts';
+export { todoGetTool } from './todo-get.ts';
+export type { TodoGetInput, TodoGetOutput } from './todo-get.ts';
+export { todoListTool } from './todo-list.ts';
+export type { TodoListInput, TodoListOutput } from './todo-list.ts';
+export { todoUpdateTool } from './todo-update.ts';
+export type { TodoUpdateInput, TodoUpdateOutput } from './todo-update.ts';
+export type { TodoWireItem } from './todo-shared.ts';
 export { waitForTool } from './wait-for.ts';
 export type { WaitForInput, WaitForOutput } from './wait-for.ts';
 export { writeFileTool } from './write-file.ts';
 export type { WriteFileInput, WriteFileOutput } from './write-file.ts';
 
 // Order is intentional: read-only tools first, then writes, then exec.
-// Useful when scanning a `agent --list-tools` output. todo_write
-// sits with the read-only group — its 'write' is harness-internal
-// state, not external mutation. memory_list / read / search are
+// Useful when scanning a `agent --list-tools` output. The todo tools
+// (todo_list / todo_get / todo_create / todo_update) sit with the
+// read-only group — their 'write' is harness-internal session state,
+// not external mutation. memory_list / read / search are
 // read-only (audit logs are internal); memory_write sits with the
 // other write tools because it persists to disk and is gated by
 // the operator confirm modal.
@@ -117,7 +131,11 @@ export const BUILTIN_TOOLS = [
   skillInvokeTool,
   waitForTool,
   monitorTool,
-  todoWriteTool,
+  todoListTool,
+  todoGetTool,
+  todoCreateTool,
+  todoUpdateTool,
+  todoClearTool,
   // clarify — core anti-presumption tool (CONTRACTS §2.6.5e). Not a
   // write/exec; its modal bridge (ctx.clarify) is wired in the REPL.
   clarifyTool,

@@ -441,7 +441,7 @@ describe('formatPermanent', () => {
       const out = formatPermanent(
         {
           kind: 'tool-end',
-          name: 'todo_write',
+          name: 'todo_create',
           verb: 'Updated todos',
           subject: null,
           status: 'done',
@@ -481,7 +481,7 @@ describe('formatPermanent', () => {
       const out = formatPermanent(
         {
           kind: 'tool-end',
-          name: 'todo_write',
+          name: 'todo_create',
           verb: 'Updated todos',
           subject: null,
           status: 'done',
@@ -528,12 +528,12 @@ describe('formatPermanent', () => {
     });
 
     test('error with summary but no subject falls back to summary alone', () => {
-      // todo_write has no vocab subject. An error there should still
+      // todo_create has no vocab subject. An error there should still
       // surface the cause on the connector instead of dropping it.
       const out = formatPermanent(
         {
           kind: 'tool-end',
-          name: 'todo_write',
+          name: 'todo_create',
           verb: 'Updated todos',
           subject: null,
           status: 'error',
@@ -583,7 +583,7 @@ describe('formatPermanent', () => {
       const out = formatPermanent(
         {
           kind: 'tool-end',
-          name: 'todo_write',
+          name: 'todo_create',
           verb: 'Updated todos',
           subject: null,
           status: 'done',

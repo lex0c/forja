@@ -232,7 +232,7 @@ export type HarnessEvent =
     }
   | {
       // Emitted whenever the session-bound TodoStore is mutated via
-      // `set` — i.e. INSIDE the `todo_write` tool's execute(), right
+      // `set` — i.e. INSIDE a todo CRUD tool's execute(), right
       // after the list lands in the store and BEFORE the tool returns.
       // The harness sees `todo_updated` fire between `tool_invoking`
       // and `tool_finished` for the same toolUseId. Producer is the

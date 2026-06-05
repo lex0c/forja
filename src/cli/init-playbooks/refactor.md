@@ -1,7 +1,7 @@
 ---
 name: refactor
 description: Refactors code preserving semantics. Scope-bounded, test-gated, incremental.
-tools: [read_file, write_file, edit_file, glob, grep, bash, todo_write]
+tools: [read_file, write_file, edit_file, glob, grep, bash, todo_create, todo_update, todo_list]
 isolation: worktree
 tool_restrictions:
   bash:
@@ -106,7 +106,7 @@ You refactor code preserving semantics. The output is a report of the executed p
 - **Pre-flight is mandatory**: identify the test command, run baseline, record `pre_flight`.
 - **Explicit scope before plan**: in-scope files + neighboring files that do NOT enter, with reason.
 - **Decomposed plan**: each step with id, short description, affected files, `semantic_preserving` flag.
-- Use `todo_write` to make the plan visible to the user **before** executing.
+- Use `todo_create` to make the plan visible to the user **before** executing.
 - After each step that changes code: run tests of the affected area (not the whole suite; efficiency).
 - If a test fails: **revert** via checkpoint, mark `reverted`, try an alternative step OR abort the plan.
 - In `summary`, lead with verdict: "all applied", "partial — N/M steps", "aborted — reason".
