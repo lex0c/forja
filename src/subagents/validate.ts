@@ -81,17 +81,6 @@ export const validateSubagentTools = (
         `subagent '${definition.name}' (${definition.sourcePath}): tool '${toolName}' declares metadata.requiresOperatorConfirm=true and cannot appear in subagent.tools[] — the tool needs a modal-confirmation pipe to the parent REPL, which subagents do not have today. Remove the tool from this subagent's whitelist.`,
       );
     }
-    // escapesCwd is checked before the generic writes gate: a tool that
-    // persists OUTSIDE the worktree (sessions.db — e.g. pin_context, and any
-    // future db-writer) is unsafe in a subagent even WITH `isolation:
-    // worktree`, because the worktree neither contains nor rolls back that
-    // write. The writes gate below would wrongly admit it once worktree
-    // isolation is set.
-    if (tool.metadata.escapesCwd === true) {
-      throw new Error(
-        `subagent '${definition.name}' (${definition.sourcePath}): tool '${toolName}' declares metadata.escapesCwd=true and cannot appear in subagent.tools[] — it persists outside the worktree (e.g. sessions.db), which 'isolation: worktree' neither contains nor rolls back. Remove the tool from this subagent's whitelist.`,
-      );
-    }
     if (tool.metadata.writes === true && !allowWrites) {
       throw new Error(
         `subagent '${definition.name}' (${definition.sourcePath}): tool '${toolName}' declares metadata.writes=true and cannot appear in subagent.tools[] without 'isolation: worktree' — write tools require worktree isolation so the parent's tree stays untouched. Add 'isolation: worktree' to the frontmatter or remove the tool.`,

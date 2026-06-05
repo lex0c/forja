@@ -66,6 +66,25 @@ const confirmTool = (name: string): Tool => ({
   },
 });
 
+// Tool factory mirroring `bash` (writes:true, escapesCwd:true, but NOT
+// requiresOperatorConfirm) — a tool that MAY touch outside the cwd yet
+// runs inside the worktree. Distinct from confirmTool, which adds the
+// operator-confirm gate on top.
+const escapesTool = (name: string): Tool => ({
+  name,
+  description: name,
+  inputSchema: { type: 'object' },
+  metadata: {
+    category: 'misc',
+    writes: true,
+    escapesCwd: true,
+    idempotent: false,
+  },
+  async execute() {
+    return { ok: true };
+  },
+});
+
 const buildRegistry = (...tools: Tool[]) => {
   const r = createToolRegistry();
   for (const t of tools) r.register(t);
@@ -143,6 +162,18 @@ describe('validateSubagentTools', () => {
       tools: ['read_file', 'write_file'],
       isolation: 'worktree',
     });
+    expect(() => validateSubagentTools(def, reg)).not.toThrow();
+  });
+
+  test('isolation: worktree accepts a writes+escapesCwd tool like bash', () => {
+    // Regression: a too-broad escapesCwd gate (added in the pin_context
+    // rework, then reverted) rejected bash (writes:true, escapesCwd:true)
+    // in worktree subagents, breaking the debug/refactor/git-hygiene SEED
+    // playbooks at first-run bootstrap. escapesCwd is the "may touch
+    // outside cwd" flag bash/write/edit all carry; worktree isolation is
+    // what contains them — it must NOT bar the tool on its own.
+    const reg = buildRegistry(escapesTool('bash'));
+    const def = definition({ tools: ['bash'], isolation: 'worktree' });
     expect(() => validateSubagentTools(def, reg)).not.toThrow();
   });
 
