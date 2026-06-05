@@ -153,6 +153,30 @@ export interface SummarizedOutput {
   policy: string;
 }
 
+// Modal bridge contract for the `clarify` tool (CONTRACTS §2.6.5e,
+// STATE_MACHINE §12). Shared by every hop of the chain
+// (ToolContext.clarify, HarnessConfig.clarify, the REPL bridge) so the
+// shape has ONE source of truth instead of being hand-synced across
+// files. The response keeps `escalated` (STATE_MACHINE §12 edit-goal)
+// even though the current ModalManager producer only emits
+// resolved/skipped — the narrower ClarifyManagerAnswer stays assignable.
+export interface ClarifyBridgeRequest {
+  question: string;
+  options: ReadonlyArray<{ id: string; label: string }>;
+  why_it_matters?: string;
+  // Producer-side cancellation (the tool's `ctx.signal`: wall-clock /
+  // user abort combined by the harness). Forwarded to the modal so a
+  // hard budget/cancel closes the prompt immediately instead of waiting
+  // on the operator or the 60s timeout. Mirrors confirmPermission's
+  // req.signal.
+  signal?: AbortSignal;
+}
+export interface ClarifyBridgeResponse {
+  outcome: 'resolved' | 'skipped' | 'escalated';
+  chosen_option_id?: string;
+  user_text?: string;
+}
+
 export interface ToolContext {
   signal: AbortSignal;
   cwd: string;
@@ -374,6 +398,14 @@ export interface ToolContext {
     kind: PinKind;
     expiresAt: number | null;
   }) => Promise<'yes' | 'no' | 'cancel'>;
+  // Modal bridge for the `clarify` tool (CONTRACTS §2.6.5e,
+  // STATE_MACHINE §12). The model emits `clarify(...)` to ask the
+  // operator instead of presuming; `medium`/`high` routes here for a
+  // form-modal answer (`low` auto-resolves inside the tool). The REPL
+  // wires it through the ModalManager; headless / subagent leave it
+  // unset and the tool returns `clarify.modal_unavailable`. Shape is
+  // the shared ClarifyBridge{Request,Response}.
+  clarify?: (req: ClarifyBridgeRequest) => Promise<ClarifyBridgeResponse>;
   // Trust state of `cwd` resolved at session start (AGENTIC_CLI.md
   // §9.1). Required so any future tool that needs trust info gets
   // an explicit value rather than an undefined fallback that could

@@ -183,12 +183,27 @@ const exitToHarnessStatus: Record<ExitReason, HarnessResult['status']> = {
   userPromptBlocked: 'interrupted',
 };
 
-const buildToolDefs = (config: HarnessConfig): ProviderToolDef[] =>
-  config.toolRegistry.list().map((t) => ({
-    name: t.name,
-    description: t.description,
-    input_schema: t.inputSchema,
-  }));
+// A `requiresOperatorConfirm` tool can only run where an operator
+// surface is wired: the REPL wires the confirm hooks (confirmPermission
+// + clarify + the memory confirms), while headless one-shot / SDK
+// callers leave them unset. Offering such a tool there is a lie — the
+// model would call it and get `*.modal_unavailable`, after being nudged
+// toward it by the "Ask, don't presume" constraint. `confirmPermission`
+// is the marker of an interactive operator session (always wired by the
+// REPL, never by `run.ts`), so gate on it: the model only sees these
+// tools when they can actually resolve, and otherwise falls back to
+// recording the assumption.
+export const buildToolDefs = (config: HarnessConfig): ProviderToolDef[] => {
+  const operatorPresent = config.confirmPermission !== undefined;
+  return config.toolRegistry
+    .list()
+    .filter((t) => operatorPresent || t.metadata.requiresOperatorConfirm !== true)
+    .map((t) => ({
+      name: t.name,
+      description: t.description,
+      input_schema: t.inputSchema,
+    }));
+};
 
 // Strip `name` from the tool model so it stays inside our domain — providers
 // expect their own format already constructed by the adapter.
@@ -2788,6 +2803,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           ...(config.confirmMemoryUserScope !== undefined
             ? { confirmMemoryUserScope: config.confirmMemoryUserScope }
             : {}),
+          ...(config.clarify !== undefined ? { clarify: config.clarify } : {}),
           ...(config.contextPinsStore !== undefined
             ? { contextPinsStore: config.contextPinsStore }
             : {}),

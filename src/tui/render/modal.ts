@@ -129,13 +129,8 @@ export const renderModal = (modal: ConfirmState, caps: Capabilities): string[] =
   // anchor tone so it stands out from surrounding dim chat / tool-card
   // text.
   lines.push(paint(caps, anchorTone, rule(caps)));
-  // Queue suffix is the visible signal that more asks are waiting
-  // behind the active one. Without it the operator answering a
-  // modal would see another pop immediately afterward with no
-  // warning — particularly confusing when the same subagent name
-  // queues multiple asks (looks like a regression / loop). Modal-
-  // manager keeps `queueDepth` live via `modal:queue-depth`
-  // events; renderer only formats.
+  // Queue suffix: how many OTHER asks wait behind this one. Empty when
+  // none, so the operator only sees the count when a pop is pending.
   const queueSuffix = modal.queueDepth > 0 ? ` (+${modal.queueDepth} waiting)` : '';
   // Title takes the same anchor tone as the top rule so the two
   // structural anchors read as a single visual unit. `bold` adds

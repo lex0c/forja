@@ -360,6 +360,22 @@ export type ModalQueueDepthEvent = BaseEvent & {
   // the only ask in flight.
   depth: number;
 };
+// Clarify raise (STATE_MACHINE §12). The reducer builds a `modal`
+// (ConfirmState, flavor 'clarify') from it — clarify is a confirm
+// flavor: one question + options. Navigation and resolution use the
+// generic modal:select / modal:answer machinery; multiple pending
+// clarifies stack in the FIFO queue like any other modal.
+export type ClarifyAskEvent = BaseEvent & {
+  type: 'clarify:ask';
+  promptId: string;
+  question: string;
+  why: string | null;
+  // `key` is a generated safe hotkey (a, b, c, …), NOT the model id — a
+  // named-key id ('down'/'escape') would hijack nav (the hotkey check
+  // precedes the nav handlers). `id` stays the resolved value; the
+  // manager generates both so render + resolution agree.
+  options: ReadonlyArray<{ id: string; label: string; key: string }>;
+};
 export type TrustAskEvent = BaseEvent & {
   type: 'trust:ask';
   promptId: string;
@@ -831,6 +847,7 @@ export type UIEvent =
   | ModalAnswerEvent
   | ModalSelectEvent
   | ModalQueueDepthEvent
+  | ClarifyAskEvent
   | TrustAskEvent
   | SharedTrustAskEvent
   | MemoryWriteAskEvent

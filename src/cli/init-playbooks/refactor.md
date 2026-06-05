@@ -54,8 +54,6 @@ slash: refactor
 when_to_use: "semantics-preserving change requested with declared scope; cleanup/rename/extract with existing tests that must keep passing"
 sampling:
   max_tokens: 4096
-context_recipe:
-  clarify_mode: pre_execution
 prompt_version: 1
 context_recipe_version: 1
 output_schema:

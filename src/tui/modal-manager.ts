@@ -282,6 +282,21 @@ export const buildPermissionOptions = (): ConfirmOption[] => [
 // other — silent but catastrophic on a security modal.
 export const PERMISSION_DEFAULT_SELECTED_INDEX = 0;
 
+// Clarify flavor (STATE_MACHINE §12). Producer is the `clarify` tool's
+// modal bridge (ToolContext.clarify). One question + options per ask,
+// raised as a ConfirmState (flavor 'clarify') and resolved through the
+// generic select/answer machinery. Resolves `resolved` + the chosen
+// option id, or `skipped` on Esc / timeout (the tool maps a skip to
+// options[0]). `escalated` (edit-goal) is a later affordance.
+export interface ClarifyAskArgs {
+  question: string;
+  why: string | null;
+  options: ReadonlyArray<{ id: string; label: string }>;
+}
+export type ClarifyManagerAnswer =
+  | { outcome: 'resolved'; chosen_option_id: string }
+  | { outcome: 'skipped' };
+
 export interface ModalManager {
   // Permission flavor. Returns the user's choice (or 'cancel' on Esc /
   // close / timeout). Callers translate semantics: yes → execute,
@@ -339,6 +354,9 @@ export interface ModalManager {
     args: MemoryActionAskArgs,
     opts?: ConfirmAskOptions,
   ) => Promise<MemoryWriteAnswer>;
+  // Clarify flavor (STATE_MACHINE §12). Producer is the clarify tool's
+  // modal bridge. Resolves with the operator's pick or `skipped`.
+  askClarify: (args: ClarifyAskArgs, opts?: ConfirmAskOptions) => Promise<ClarifyManagerAnswer>;
   // Number of pending modals (active + queued). Tests inspect.
   pendingCount: () => number;
   // Drop the queue and resolve any pending promise as `cancel`. Used
@@ -372,6 +390,25 @@ const defaultPromptId = (): string => {
   promptCounter++;
   return `modal-${Date.now()}-${promptCounter}`;
 };
+
+// askClarify routes through enqueueConfirm, whose Esc / timeout / Ctrl+C
+// paths all resolve the reserved string `cancel`. Option values are
+// model-supplied ids, so each is prefixed to stay disjoint from that
+// sentinel — an option literally id'd `cancel` must read as a pick, not
+// a skip, or the operator's explicit choice is silently dropped.
+const CLARIFY_OPTION_VALUE_PREFIX = 'opt:';
+
+// Option hotkeys are GENERATED, never the model-supplied id. matchesKey
+// compares a `kind:'key'` event by name, so an id like 'down' / 'up' /
+// 'escape' / 'enter' would match the arrow/Esc/Enter event — and the
+// hotkey check runs before the nav handlers (drain's activeHandler), so
+// such an id would hijack navigation or skip. Safe single chars (a, b,
+// c, …) are `kind:'char'` only, so named keys fall through to their
+// handlers. Past 26 options the hotkey is '' (matches nothing —
+// cursor-only); clarify prompts realistically have a handful. The id
+// stays the resolved value.
+const CLARIFY_HOTKEYS = 'abcdefghijklmnopqrstuvwxyz';
+const clarifyHotkey = (index: number): string => CLARIFY_HOTKEYS[index] ?? '';
 
 export const createModalManager = (options: ModalManagerOptions): ModalManager => {
   const { bus, focusStack } = options;
@@ -813,6 +850,42 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
         MEMORY_ACTION_OPTIONS,
         opts?.timeoutMs,
         opts?.signal,
+      ),
+    askClarify: (args, opts) =>
+      enqueueConfirm<string>(
+        (promptId) => ({
+          type: 'clarify:ask',
+          ts: now(),
+          promptId,
+          question: args.question,
+          why: args.why,
+          // Same generated hotkey (by index) the resolution list uses
+          // below — the reducer folds these into the rendered keys, so
+          // the key shown == the key that activates.
+          options: args.options.map((o, i) => ({
+            id: o.id,
+            label: o.label,
+            key: clarifyHotkey(i),
+          })),
+        }),
+        args.options.map((o, i) => ({
+          key: clarifyHotkey(i),
+          label: o.label,
+          value: `${CLARIFY_OPTION_VALUE_PREFIX}${o.id}`,
+        })),
+        opts?.timeoutMs,
+        opts?.signal,
+        // Cursor starts on the first option — also the skip default the
+        // tool assumes (options[0]).
+        0,
+      ).then(
+        (value): ClarifyManagerAnswer =>
+          value === 'cancel'
+            ? { outcome: 'skipped' }
+            : {
+                outcome: 'resolved',
+                chosen_option_id: value.slice(CLARIFY_OPTION_VALUE_PREFIX.length),
+              },
       ),
     pendingCount: () => (active !== null ? 1 : 0) + queue.length,
     close: () => {

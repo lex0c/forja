@@ -280,27 +280,19 @@ UI integration: status line mostra tray de `bash_*` ativos (`bg N`); status line
 
 ### 2.6.5e Interaction (anti-presumption)
 
-> **Cross-refs:** mecânica completa em `STATE_MACHINE.md §12`; estado `[clarifying]` em `STATE_MACHINE.md §2.2`; per-playbook config em `PLAYBOOKS.md §1.1` (`clarify_mode`).
+> **Cross-refs:** mecânica completa em `STATE_MACHINE.md §12`; estado `[clarifying]` em `STATE_MACHINE.md §2.2`.
 
 | Tool | Input | Output | Side effects | Idempotente | Custo típico |
 |---|---|---|---|---|---|
-| `clarify` | `{ question, options[≥2], why_it_matters?, blast_radius: low\|medium\|high }` | `{ outcome: resolved\|skipped\|escalated\|auto_low, chosen_option_id?, user_text? }` | nenhum (consulta humana) | sim (mesma question + options ⇒ mesmo modal recriado) | `low`: ~5ms (auto-resolve); `medium`/`high`: bound por timeout 60s |
+| `clarify` | `{ question, options[≥2], why_it_matters? }` | `{ outcome: resolved\|skipped\|escalated, chosen_option_id?, user_text? }` | nenhum (consulta humana) | sim (mesma question + options ⇒ mesmo modal recriado) | bound por timeout 60s (wall-clock do operador) |
 
-**Semantics distintos por `blast_radius`:**
-
-- `low` — auto-resolvido sem modal; output `outcome: auto_low`, `chosen_option_id: options[0].id`. Registra em `assumptions[]` do output do playbook.
-- `medium` — bufferizado; agrupado com outros `medium` pendentes; modal único antes do próximo write.
-- `high` — modal imediato (transição `running → clarifying`). Outras tools bloqueadas até resolver.
+**Comportamento:** toda chamada abre o modal imediatamente (transição `running → clarifying`); outras tool calls ficam bloqueadas até resolver. **Não há `blast_radius`** — nenhuma classificação de severidade que o modelo possa errar (auto-assumindo quando deveria perguntar). O modelo decide apenas *chamar ou não*: para uma escolha de baixo impacto, ele não chama `clarify` (escolhe um default e registra a suposição).
 
 **Failure semantics:**
 - `clarify.options.invalid` — < 2 options, ou IDs duplicados
-- `clarify.disabled_by_playbook` — `clarify_mode: off` no frontmatter; modelo recebe erro estruturado e re-tenta com `assumptions[]` em vez
-- `clarify.budget_exceeded` — sessão emitiu mais de `clarification.max_per_session` (default 5); fallback para `auto_low` automático
+- `clarify.budget_exceeded` — sessão emitiu mais de `clarification.max_per_session` (default 5); retorna erro estruturado e o modelo segue com a suposição
 
-**Disponibilidade ao modelo:** controlada por `clarify_mode` do playbook ativo:
-- `pre_execution`: tool exposta; `medium`/`high` permitidos só em fase exploratória (drift detector flagga uso tardio)
-- `on_high_blast`: tool exposta; `low` auto-resolve, `medium` bufferiza, `high` interrompe
-- `off`: tool **não exposta** ao modelo; tudo vira `assumptions[]` retrospectivo
+**Disponibilidade ao modelo:** `clarify` é tool **core, sempre exposta** — disponível em toda sessão ao lado de `read`/`write`/`edit`, sem gate de playbook e sem modo por playbook.
 
 ### 2.6.6 Justificativa do teto (22 vs 10)
 

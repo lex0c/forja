@@ -42,6 +42,7 @@ import { createContextPinsStore } from '../storage/repos/context-pins.ts';
 import { completeSession, createSession } from '../storage/repos/sessions.ts';
 import { settleRunningSubagentHandles } from '../storage/repos/subagent-handles.ts';
 import { runSubagent } from '../subagents/index.ts';
+import type { ClarifyBridgeRequest } from '../tools/index.ts';
 import { addTrustedDir, isTrusted, trustListPath } from '../trust/index.ts';
 import {
   type FocusHandler,
@@ -1350,6 +1351,19 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     body: string;
   }): Promise<'yes' | 'no' | 'cancel'> => modalManager.askMemoryUserScope(req);
 
+  // Clarify modal bridge (STATE_MACHINE §12). The `clarify` tool
+  // forwards every ask here; the modal manager raises the prompt and
+  // resolves the operator's pick (or `skipped` on Esc / 60s timeout,
+  // §12.3). `req.signal` is the run's abort (ctx.signal: wall-clock /
+  // user, combined by the harness) — forward it so a hard budget/cancel
+  // closes the modal now instead of after the operator answers or the
+  // timeout fires. Same posture as confirmPermission above.
+  const clarify = (req: ClarifyBridgeRequest) =>
+    modalManager.askClarify(
+      { question: req.question, why: req.why_it_matters ?? null, options: req.options },
+      { timeoutMs: 60_000, ...(req.signal !== undefined ? { signal: req.signal } : {}) },
+    );
+
   // Operator `!cmd` execution. Runs as the operator's own shell — NOT
   // through the agent permission engine or sandbox (the engine gates the
   // agent, not the human at the keyboard; this is the shell-style `!`
@@ -1623,6 +1637,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       confirmPermission,
       confirmMemoryWrite,
       confirmMemoryUserScope,
+      clarify,
       contextPinsStore,
       ...(lastSessionId !== null ? { resumeFromSessionId: lastSessionId } : {}),
     };

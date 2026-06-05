@@ -857,14 +857,12 @@ describe('subagent_runs repo', () => {
         contextRecipe: {
           memoryFilter: ['security', 'reference'],
           stepReflection: 'terse',
-          clarifyMode: 'on_high_blast',
           goalReinjectionEveryNSteps: 4,
         },
       });
       expect(getSubagentRun(db, child.id)?.contextRecipe).toEqual({
         memoryFilter: ['security', 'reference'],
         stepReflection: 'terse',
-        clarifyMode: 'on_high_blast',
         goalReinjectionEveryNSteps: 4,
       });
     });

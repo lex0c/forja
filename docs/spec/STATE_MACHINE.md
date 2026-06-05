@@ -89,7 +89,7 @@ Estados terminais marcados com `*`.
 
 **Estados transientes não ilustrados** (mesma classe de `awaiting_user`/`compacting` — pausam o loop e retomam):
 - `regrounding` — disparado por drift detector antes de side-effect (`§2.2`, `§11`); transita pra `tool_exec` (confirma), `running` (re-plan), ou `awaiting_user` (edit goal).
-- `clarifying` — disparado por `clarify()` com `blast_radius: high` ou batched em `pre_execution` mode (`§2.2`, `§12`); transita pra `running` (resolved/skipped) ou `awaiting_user` (escalated → goal edit).
+- `clarifying` — disparado por qualquer `clarify()` (`§2.2`, `§12`); transita pra `running` (resolved/skipped) ou `awaiting_user` (escalated → goal edit).
 
 Diagrama ASCII evita inflar branches; estados transientes são definidos em §2.2 com transições completas em §9.
 
@@ -230,7 +230,7 @@ Estado transiente disparado por drift detector (`§11`) antes de tool com side-e
 
 #### `[clarifying]`
 
-Estado transiente disparado por `clarify()` (`§12`) com `blast_radius: high`, ou batched em playbook com `clarify_mode: pre_execution`.
+Estado transiente disparado por qualquer `clarify()` (`§12`) — toda chamada abre o modal.
 
 **Invariantes:**
 - `sessions.status = 'clarifying'`
@@ -239,7 +239,7 @@ Estado transiente disparado por `clarify()` (`§12`) com `blast_radius: high`, o
 - `active_goal` (`§2.3`) imutável durante clarification
 
 **Ações ao entrar:**
-- UI mostra modal com até 3 perguntas batched (uma per `clarify()` pendente)
+- UI mostra modal single-question; múltiplas `clarify()` pendentes empilham na fila FIFO (uma de cada vez)
 - Default em 60s = `(skip and proceed with auto_assumed[0])` registrado em `assumptions[]`
 
 **Transições:**
@@ -872,11 +872,10 @@ Todo subsistema dispara um destes eventos quando força transição. Telemetria 
 | `goal_pushed` | (sem mudança de session state) | Goal Stack (`§2.3`) — user / model_proposed / playbook |
 | `goal_popped` | (sem mudança de session state) | Goal Stack (`§2.3`) — requer `decided_by` + `pop_reason` |
 | `goal_suspended` | (sem mudança de session state) | Goal Stack (`§2.3`) — pausa explícita de sub-task |
-| `clarification_requested` | running → clarifying | Modelo emite `clarify(...)` com `blast_radius: high` (`§12`) |
+| `clarification_requested` | running → clarifying | Modelo emite `clarify(...)` (`§12`) |
 | `clarification_resolved` | clarifying → running | UI (user respondeu; tool `clarify` retorna escolha) |
 | `clarification_skipped` | clarifying → running | UI/timeout (user pulou; assumptions[] registra auto-choice) |
 | `clarification_escalated` | clarifying → awaiting_user | UI (user indicou que goal está errado, não só ambíguo) |
-| `clarification_auto_low` | (sem mudança de session state) | Tool `clarify` com `blast_radius: low` — registra em `assumptions[]` sem modal |
 | `interrupt_signal` | * → interrupted | UI (Ctrl+C) |
 | `interrupt_complete` | interrupted → idle/done | Cleanup |
 | `budget_exhausted` | running/tool_exec → exhausted | Budget tracker |
@@ -1053,18 +1052,18 @@ PR-bloqueante: precision < 0.95 (fail-open mas raro), recall < 0.80 em "gradual"
 
 ## 12. Clarification gate (anti-presumption)
 
-> **Cross-refs:** tool spec em `CONTRACTS.md §2.6.5e`; per-playbook override em `PLAYBOOKS.md §1.1` (`clarify_mode`); estado relacionado `[regrounding]` em `§11.3` (mesma família: pause + ask + resume).
+> **Cross-refs:** tool spec em `CONTRACTS.md §2.6.5e`; estado relacionado `[regrounding]` em `§11.3` (mesma família: pause + ask + resume).
 
 Drift detector (`§11`) ataca *modelo focado em coisa errada*. Clarification gate ataca *modelo presumindo decisão ambígua sem perguntar*. São duas falhas distintas:
 
 - **Drift:** goal era X, modelo está fazendo Y.
 - **Presumption:** goal era ambíguo entre X1/X2; modelo escolheu X1 silenciosamente, sem sinalizar.
 
-Modelo default tende a presumir e prosseguir. Em workflow de side-effect, presumir errado custa uma sessão inteira. Gate força modelo a externalizar a ambiguidade quando blast radius for alto, e a registrar em `assumptions[]` quando for baixo.
+Modelo default tende a presumir e prosseguir. Em workflow de side-effect, presumir errado custa uma sessão inteira. Gate força o modelo a externalizar a ambiguidade load-bearing perguntando ao operador, em vez de escolher silenciosamente. Para baixo impacto, o modelo não chama `clarify` — escolhe um default e registra em `assumptions[]`.
 
 ### 12.1 Tool `clarify` (interface)
 
-Modelo emite `clarify(question, options, why_it_matters, blast_radius)` quando enfrenta decisão interpretativa. Schema completo em `CONTRACTS.md §2.6.5e`.
+Modelo emite `clarify(question, options, why_it_matters?)` quando enfrenta uma decisão interpretativa que muda o resultado. Schema completo em `CONTRACTS.md §2.6.5e`. **Toda chamada pergunta ao operador** — não há `blast_radius` que o modelo classifique (e possa errar, auto-assumindo quando deveria perguntar). Se não quer interromper, simplesmente não chama.
 
 ```
 clarify(
@@ -1074,27 +1073,15 @@ clarify(
     { id: "b", label: "src/checkout.ts:89 (paymentIntent flow)" },
     { id: "c", label: "ambos" }
   ],
-  why_it_matters: "blast radius diferente; (a) toca 3 arquivos, (b) toca 8",
-  blast_radius: "high"
+  why_it_matters: "blast radius diferente; (a) toca 3 arquivos, (b) toca 8"
 )
 ```
 
-`blast_radius: low | medium | high`:
-- **`low`** — decisão estética (nome de variável, ordem de import). Tool retorna *imediatamente* com `auto_assumed: <option[0]>`; registrado em `assumptions[]` do output schema do playbook. **Não interrompe.**
-- **`medium`** — afeta um arquivo / um caso de uso. Bufferizado — agrupado com outras `medium` pendentes; modal disparado **antes do próximo write** (batched).
-- **`high`** — afeta múltiplos arquivos / contrato externo / decisão irreversível. Modal **imediato** (transição → `[clarifying]`).
-
-### 12.2 Modos por playbook (`clarify_mode`)
-
-| Modo | Comportamento |
-|---|---|
-| `pre_execution` | modelo emite todas `clarify()` em fase exploratória; modal único batched antes da 1ª ação write. Falha em emitir clarification em fase write = drift detector flagga (`§11`). |
-| `on_high_blast` | só `high` interrompe; `medium`/`low` viram `assumptions[]` registradas. Default. |
-| `off` | tool `clarify` indisponível ao modelo; tudo vira `assumptions[]`. Workflows read-only e exploratórios (`explain`, `code-review`). |
+Toda chamada abre o modal imediatamente e transita para `[clarifying]`. Não há níveis de severidade nem batching / `clarify_mode` — a granularidade é só "chamar ou não". Múltiplas `clarify()` pendentes empilham na fila FIFO de modais (uma de cada vez, sufixo `(+N waiting)`).
 
 ### 12.3 Estado `[clarifying]`
 
-Estado transiente disparado por `clarify()` com `blast_radius: high` (ou batched em `pre_execution` mode).
+Estado transiente disparado por qualquer `clarify()` — toda chamada abre o modal.
 
 **Invariantes:**
 - `sessions.status = 'clarifying'`
@@ -1103,7 +1090,7 @@ Estado transiente disparado por `clarify()` com `blast_radius: high` (ou batched
 - `active_goal` (`§2.3`) imutável durante clarification (mudança de goal só via `regrounding` ou explicit `/goal push`)
 
 **Ações ao entrar:**
-- UI mostra modal com até 3 perguntas batched, cada uma com opções + `why_it_matters`
+- UI mostra modal **single-question** (a pergunta + suas opções + `why_it_matters`), renderizado como um flavor do modal de confirm. Múltiplas `clarify()` pendentes **empilham na fila FIFO** de modais (como permission/trust) — uma de cada vez, com sufixo `(+N waiting)` — em vez de um form multi-pergunta
 - Default escolhido em 60s = `(skip and proceed with auto_assumed[0])` — registra em `assumptions[]` com `auto_chosen: true`
 
 **Transições:**
@@ -1124,8 +1111,7 @@ clarification_events(
   question TEXT NOT NULL,
   options_json TEXT NOT NULL,          -- JSON array de options
   why_it_matters TEXT,
-  blast_radius TEXT NOT NULL,          -- low | medium | high
-  outcome TEXT NOT NULL,               -- resolved | skipped | escalated | auto_low
+  outcome TEXT NOT NULL,               -- resolved | skipped | escalated
   chosen_option_id TEXT,               -- NULL se skipped/escalated
   user_text TEXT,                      -- se user respondeu free-form em vez de option
   created_at INTEGER NOT NULL,
@@ -1141,7 +1127,7 @@ Ratio `resolved / total` é proxy de qualidade da feature: alto = perguntas vali
 `evals/clarification/` com 25 fixtures:
 - 10 sessões com **ambiguidade real semeada** (user prompt deliberadamente ambíguo): espera `clarification_recall ≥ 0.8` (modelo emite `clarify` na maioria)
 - 10 sessões **sem ambiguidade**: espera `clarification_precision ≥ 0.7` (≤ 30% das `clarify()` emitidas resultam em "user pula" — sinal de ruído)
-- 5 sessões **trivia-trap**: prompts onde modelo ingênuo perguntaria detalhe estilístico; espera **zero** `clarify()` com `blast_radius: low` chegando ao modal (todas viram assumptions[] silentemente)
+- 5 sessões **trivia-trap**: prompts onde um modelo ingênuo perguntaria um detalhe estilístico; espera **zero** `clarify()` emitido (o modelo escolhe o default e registra a suposição, sem incomodar o operador)
 
 Métricas:
 - `clarification_precision` = `outcome=resolved / (outcome=resolved + outcome=skipped)`
@@ -1152,21 +1138,20 @@ Threshold PR-bloqueante: `precision ≥ 0.7`, `recall ≥ 0.8` em fixture-com-am
 
 ### 12.6 Anti-patterns
 
-- **Clarification de trivia.** "Posso usar `let` ou `const`?" — vai pra `assumptions[]` automático; `clarify()` com low blast pra detalhe estético é ruído. Eval `noise_rate` pega.
+- **Clarification de trivia.** "Posso usar `let` ou `const`?" — escolhe o default e registra em `assumptions[]`; **chamar** `clarify()` pra detalhe estético é ruído. Eval `noise_rate` pega.
 - **Clarification que ignora opções óbvias.** Pergunta sem `options[]` (free-form) força user a digitar. Tool exige ≥ 2 options; free-form único = bug do prompt do modelo.
-- **Clarification em fase de execução** com `clarify_mode: pre_execution`. Modelo deveria ter perguntado na fase exploratória; emitir tarde viola contrato. Drift detector flagga.
 - **Pergunta retórica.** "Você tem certeza que quer fazer X?" — não é clarification, é confirmation; usa `awaiting_user` via permission engine (`§2.2`).
-- **Bypass de assumptions[].** Modelo emite `clarify()` com low blast pra **evitar** registrar em `assumptions[]` (parece mais zeloso). Eval pega via `outcome=auto_low rate`.
+- **Bypass de assumptions[].** Modelo emite `clarify()` por trivia pra **evitar** registrar em `assumptions[]` (parece mais zeloso). Eval pega via `noise_rate`.
 - **Multi-goal clarification.** Pergunta sobre 2 sub-goals diferentes ao mesmo tempo. Goal stack (`§2.3`) força um goal ativo; clarification opera no escopo do active_goal apenas.
 
 ### 12.7 Interação com outras primitivas
 
 | Primitiva | Relação |
 |---|---|
-| Drift detector (`§11`) | Disjuntos: drift compara intent vs goal (foco); clarification expõe ambiguidade *no próprio entendimento do goal*. Em sessão saudável, clarification roda na fase pre_execution e drift roda em writes. |
+| Drift detector (`§11`) | Disjuntos: drift compara intent vs goal (foco); clarification expõe ambiguidade *no próprio entendimento do goal*. Em sessão saudável, clarification roda cedo (ao bater a ambiguidade) e drift roda em writes. |
 | Goal stack (`§2.3`) | Clarification opera no `active_goal`. Clarification que termina em `escalated` pode levar a `goal_push` (sub-goal nasce da resposta do user). |
-| Self-critique (`ORCH §6`) | Critique pode flagga "modelo presumiu sem clarificar" — sugere voltar pra fase pre_execution. |
-| `assumptions[]` em playbook output | Clarification `low` + skipped/auto-choice viram `assumptions[]`. É a integração canônica. |
+| Self-critique (`ORCH §6`) | Critique pode flagga "modelo presumiu sem clarificar" — sugere perguntar antes de seguir. |
+| `assumptions[]` em playbook output | Clarification skipped (timeout/skip) vira `assumptions[]`; ambiguidade de baixo impacto que o modelo decide sem chamar `clarify` também. É a integração canônica. |
 | Permission engine (`awaiting_user`) | Distintos: permission é "pode executar essa tool?"; clarification é "qual interpretação do goal?". |
 
 ---

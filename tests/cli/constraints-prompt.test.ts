@@ -15,6 +15,15 @@ describe('constraints-prompt', () => {
     expect(CONSTRAINTS_PROMPT.toLowerCase()).toContain('semantic');
   });
 
+  test('CONSTRAINTS_PROMPT incentivizes asking via clarify over presuming', () => {
+    // The anti-presumption gate (STATE_MACHINE §12): the system prompt
+    // must point at `clarify` so the model treats asking the operator
+    // as a first-class alternative to guessing on a load-bearing
+    // ambiguity — not just discover the tool from its description.
+    expect(CONSTRAINTS_PROMPT.toLowerCase()).toContain('clarify');
+    expect(CONSTRAINTS_PROMPT.toLowerCase()).toContain('presume');
+  });
+
   test('CONSTRAINTS_PROMPT states both sides of the security posture', () => {
     // A refusal-only rule over-blocks authorized work; an
     // assist-only rule under-blocks. Both halves must be present.

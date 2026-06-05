@@ -225,7 +225,8 @@ export interface ConfirmState {
     | 'memory-write'
     | 'memory-user-scope'
     | 'memory-action'
-    | 'history-clear';
+    | 'history-clear'
+    | 'clarify';
   // Title block: bold first line + dim subject. `subject` is
   // optional — null when the modal has no single target.
   title: string;
@@ -1661,6 +1662,37 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       const depth = Math.max(0, event.depth);
       return {
         state: { ...state, modal: { ...state.modal, queueDepth: depth } },
+        permanent: [],
+      };
+    }
+
+    case 'clarify:ask': {
+      // Clarify is a confirm flavor: one question + options. Title is
+      // fixed ('Clarify'); why_it_matters rides the subject line; the
+      // question sits above the options. Each option's `key` is the
+      // generated safe hotkey from the event (the manager builds it, NOT
+      // the model id — a named-key id like 'down'/'escape' would hijack
+      // nav); enqueueConfirm holds the prefixed `value` used to resolve,
+      // so the `value` here is display-only. selectedIndex starts at 0
+      // (the skip default the tool also assumes); the manager's open-time
+      // modal:select re-asserts the cursor so render + resolution agree.
+      return {
+        state: {
+          ...state,
+          modal: {
+            promptId: event.promptId,
+            flavor: 'clarify',
+            title: 'Clarify',
+            subject: event.why,
+            subjectTone: 'secondary',
+            preview: [],
+            question: event.question,
+            options: event.options.map((o) => ({ key: o.key, label: o.label, value: o.id })),
+            selectedIndex: 0,
+            hints: ['↑/↓ choose', 'Enter confirm', 'Esc skip'],
+            queueDepth: 0,
+          },
+        },
         permanent: [],
       };
     }

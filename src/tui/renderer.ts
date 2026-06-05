@@ -113,6 +113,9 @@ const HOLD_BYPASS: ReadonlySet<UIEvent['type']> = new Set([
   'memory:write:ask',
   'memory:action:ask',
   'memory:user-scope:ask',
+  // Clarify form-modal open (STATE_MACHINE §12) — same synchronous-
+  // focus rationale as the confirm flavors above.
+  'clarify:ask',
   // Modal lifecycle (keep the rendered modal in sync with the focus
   // stack / selection).
   'modal:answer',
