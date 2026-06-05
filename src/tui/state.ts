@@ -1669,12 +1669,13 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
     case 'clarify:ask': {
       // Clarify is a confirm flavor: one question + options. Title is
       // fixed ('Clarify'); why_it_matters rides the subject line; the
-      // question sits above the options. Each option's model-supplied
-      // id is the `key` (also its hotkey); the manager's enqueueConfirm
-      // holds the prefixed `value` used to resolve, so the `value` here
-      // is display-only. selectedIndex starts at 0 (the skip default the
-      // tool also assumes); the manager's open-time modal:select
-      // re-asserts the cursor so render + resolution can't disagree.
+      // question sits above the options. Each option's `key` is the
+      // generated safe hotkey from the event (the manager builds it, NOT
+      // the model id — a named-key id like 'down'/'escape' would hijack
+      // nav); enqueueConfirm holds the prefixed `value` used to resolve,
+      // so the `value` here is display-only. selectedIndex starts at 0
+      // (the skip default the tool also assumes); the manager's open-time
+      // modal:select re-asserts the cursor so render + resolution agree.
       return {
         state: {
           ...state,
@@ -1686,7 +1687,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             subjectTone: 'secondary',
             preview: [],
             question: event.question,
-            options: event.options.map((o) => ({ key: o.id, label: o.label, value: o.id })),
+            options: event.options.map((o) => ({ key: o.key, label: o.label, value: o.id })),
             selectedIndex: 0,
             hints: ['↑/↓ choose', 'Enter confirm', 'Esc skip'],
             queueDepth: 0,

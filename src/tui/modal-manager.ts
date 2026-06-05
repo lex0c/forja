@@ -398,6 +398,18 @@ const defaultPromptId = (): string => {
 // a skip, or the operator's explicit choice is silently dropped.
 const CLARIFY_OPTION_VALUE_PREFIX = 'opt:';
 
+// Option hotkeys are GENERATED, never the model-supplied id. matchesKey
+// compares a `kind:'key'` event by name, so an id like 'down' / 'up' /
+// 'escape' / 'enter' would match the arrow/Esc/Enter event — and the
+// hotkey check runs before the nav handlers (drain's activeHandler), so
+// such an id would hijack navigation or skip. Safe single chars (a, b,
+// c, …) are `kind:'char'` only, so named keys fall through to their
+// handlers. Past 26 options the hotkey is '' (matches nothing —
+// cursor-only); clarify prompts realistically have a handful. The id
+// stays the resolved value.
+const CLARIFY_HOTKEYS = 'abcdefghijklmnopqrstuvwxyz';
+const clarifyHotkey = (index: number): string => CLARIFY_HOTKEYS[index] ?? '';
+
 export const createModalManager = (options: ModalManagerOptions): ModalManager => {
   const { bus, focusStack } = options;
   const now = options.now ?? (() => Date.now());
@@ -847,10 +859,17 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           promptId,
           question: args.question,
           why: args.why,
-          options: args.options,
+          // Same generated hotkey (by index) the resolution list uses
+          // below — the reducer folds these into the rendered keys, so
+          // the key shown == the key that activates.
+          options: args.options.map((o, i) => ({
+            id: o.id,
+            label: o.label,
+            key: clarifyHotkey(i),
+          })),
         }),
-        args.options.map((o) => ({
-          key: o.id,
+        args.options.map((o, i) => ({
+          key: clarifyHotkey(i),
           label: o.label,
           value: `${CLARIFY_OPTION_VALUE_PREFIX}${o.id}`,
         })),

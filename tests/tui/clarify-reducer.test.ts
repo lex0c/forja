@@ -9,8 +9,8 @@ const ask = (): ClarifyAskEvent => ({
   question: 'which validateOrder?',
   why: 'blast differs',
   options: [
-    { id: 'a', label: 'orders.ts' },
-    { id: 'b', label: 'checkout.ts' },
+    { id: 'orders', label: 'orders.ts', key: 'a' },
+    { id: 'checkout', label: 'checkout.ts', key: 'b' },
   ],
 });
 
@@ -25,7 +25,8 @@ describe('reducer: clarify as a confirm flavor', () => {
     expect(r.state.modal?.question).toBe('which validateOrder?');
     expect(r.state.modal?.subject).toBe('blast differs'); // why_it_matters
     expect(r.state.modal?.options).toHaveLength(2);
-    expect(r.state.modal?.options[0]?.key).toBe('a'); // model id is the key / hotkey
+    expect(r.state.modal?.options[0]?.key).toBe('a'); // generated hotkey from the event
+    expect(r.state.modal?.options[0]?.value).toBe('orders'); // model id rides the value
     expect(r.state.modal?.selectedIndex).toBe(0);
   });
 

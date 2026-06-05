@@ -50,11 +50,40 @@ describe('askClarify', () => {
     expect(await p).toEqual({ outcome: 'resolved', chosen_option_id: 'b' });
   });
 
-  test('a hotkey (the option id char) resolves that option directly', async () => {
+  test('the generated hotkey (not the id) resolves the option', async () => {
+    // Hotkeys are generated single chars by index (a → 0, b → 1), NOT
+    // the model id — so even descriptive multi-char ids get a usable
+    // hotkey, and the char resolves the id that rode through as value.
     const { fs, manager } = make();
-    const p = manager.askClarify({ question: 'q', why: null, options: OPTS });
+    const p = manager.askClarify({
+      question: 'q',
+      why: null,
+      options: [
+        { id: 'orders', label: 'orders.ts' },
+        { id: 'checkout', label: 'checkout.ts' },
+      ],
+    });
     fs.dispatch({ kind: 'char', char: 'b', ctrl: false, alt: false, raw: 'b' });
-    expect(await p).toEqual({ outcome: 'resolved', chosen_option_id: 'b' });
+    expect(await p).toEqual({ outcome: 'resolved', chosen_option_id: 'checkout' });
+  });
+
+  test('an option whose id is a reserved key name does not hijack navigation', async () => {
+    // Regression: an id like 'down' must NOT become the ↓ hotkey, or
+    // pressing ↓ to move the cursor would instantly select it. Generated
+    // hotkeys (a, b) are kind:'char', so ↓ (kind:'key') falls through to
+    // the nav handler.
+    const { fs, manager } = make();
+    const p = manager.askClarify({
+      question: 'q',
+      why: null,
+      options: [
+        { id: 'down', label: 'Scale down' },
+        { id: 'up', label: 'Scale up' },
+      ],
+    });
+    fs.dispatch(key('down')); // navigates to option 1 — does NOT select 'down'
+    fs.dispatch(key('enter'));
+    expect(await p).toEqual({ outcome: 'resolved', chosen_option_id: 'up' });
   });
 
   test('Esc resolves as skipped (the tool maps the skip to options[0])', async () => {
@@ -81,7 +110,7 @@ describe('askClarify', () => {
     expect(await p).toEqual({ outcome: 'resolved', chosen_option_id: 'cancel' });
   });
 
-  test('emits a clarify:ask event carrying the question + options', async () => {
+  test('emits a clarify:ask event carrying the question + generated-hotkey options', async () => {
     const { fs, manager, events } = make();
     const p = manager.askClarify({ question: 'which?', why: 'stakes', options: OPTS });
     const ask = events.find((e) => e.type === 'clarify:ask');
@@ -90,6 +119,10 @@ describe('askClarify', () => {
       expect(ask.question).toBe('which?');
       expect(ask.why).toBe('stakes');
       expect(ask.options).toHaveLength(2);
+      // The event carries the generated hotkeys (so the reducer renders
+      // the same key that resolves), with the model id preserved.
+      expect(ask.options[0]).toEqual({ id: 'a', label: 'orders.ts', key: 'a' });
+      expect(ask.options[1]).toEqual({ id: 'b', label: 'checkout.ts', key: 'b' });
     }
     fs.dispatch(key('escape'));
     await p;

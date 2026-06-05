@@ -370,7 +370,11 @@ export type ClarifyAskEvent = BaseEvent & {
   promptId: string;
   question: string;
   why: string | null;
-  options: ReadonlyArray<{ id: string; label: string }>;
+  // `key` is a generated safe hotkey (a, b, c, …), NOT the model id — a
+  // named-key id ('down'/'escape') would hijack nav (the hotkey check
+  // precedes the nav handlers). `id` stays the resolved value; the
+  // manager generates both so render + resolution agree.
+  options: ReadonlyArray<{ id: string; label: string; key: string }>;
 };
 export type TrustAskEvent = BaseEvent & {
   type: 'trust:ask';
