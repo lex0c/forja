@@ -68,6 +68,7 @@ import { migration067SkillEvents } from './067-skill-events.ts';
 import { migration068PromptVersions } from './068-prompt-versions.ts';
 import { migration069MemoryEventsSeedSource } from './069-memory-events-seed-source.ts';
 import { migration070SubagentRunsApprovalPosture } from './070-subagent-runs-approval-posture.ts';
+import { migration071ContextPinsModelCreatedBy } from './071-context-pins-model-created-by.ts';
 
 export interface Migration {
   id: number;
@@ -146,4 +147,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration068PromptVersions,
   migration069MemoryEventsSeedSource,
   migration070SubagentRunsApprovalPosture,
+  migration071ContextPinsModelCreatedBy,
 ];

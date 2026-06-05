@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-05] pin_context: modal-confirmed proposal → direct model tool (ring buffer)
+
+**Goal (operator).** Make `pin_context` always available to the model, like the todolist — no operator modal, the model pins directly. Treat the pin list as a bounded stack: fill to the 10-pin cap, evicting the oldest when full; no remove tool (the model only adds).
+
+**What changed.**
+- **No modal.** The tool dropped the `confirmPinContext` bridge, the headless rejection, and the `created`/`rejected` outcome — it now validates → injection-scans → persists directly, returning `{ pinId, text, kind }`. `requiresOperatorConfirm` removed (no longer operator-gated), and it joins `BUILTIN_TOOLS` (was deliberately omitted while the modal was unwired). `ToolContext.confirmPinContext` deleted.
+- **Ring buffer.** `createPin` evicts the oldest ACTIVE pin (FIFO) at the cap and inserts, holding at `PIN_CAP` (10), instead of throwing. Shared store, so `/pin` evicts too — and the operator-facing `/pin` *warns* ("dropped the oldest pin to make room") because silently losing a deliberately-set pin is worse than for a model pin. Id non-recycle (the counter) is a separate concern, unaffected.
+- **`created_by: 'model'`.** Migration 071 recreates `context_pins` to add `'model'` to the `created_by` CHECK (SQLite can't ALTER a CHECK; same recreate-with-FK shape as 058). Tool pins are `'model'` (no approval happened); `/pin` stays `'user'`; `'model_proposed_user_approved'` kept as a legacy value. The resume-context `(model)` provenance suffix gates on `createdBy !== 'user'` so it fires for the new value.
+- **Always wired.** The loop provides the store in any mode (`config.contextPinsStore ?? createContextPinsStore(config.db)`), so the tool works headless/one-shot too — matching the todolist. Vocab: `pin_context` → "Pinning context" / "Pinned context".
+
+**Review fixes (max-effort, 4 angles).** Caught and fixed: (1) the shared `createPin` change broke the `/pin` slash tests AND turned `/pin` into silent eviction — reworked `/pin` to warn, rewrote the 2 tests (a `bun test` break the first "green" claim missed by checking the wrong test path); (2) the resume `(model)` provenance suffix was gated on the legacy `created_by` value, so model pins lost their marker on resume — gated on `!== 'user'`, test now exercises `'model'`; (3) dropped the now-dead `PinCapExceededError` (class + `/pin` catch + import + test) instead of keeping it as debt; (4) a subagent could whitelist `pin_context` under `isolation: worktree` despite it writing outside the tree — `validate.ts` now rejects `escapesCwd` tools; (5) hoisted the store creation out of `buildCtx` (was allocated per tool-call); (6) refreshed stale comments (repo header, `/pin` doc, `sourceStepId`). Storage core (migration 071 + eviction) passed the review clean.
+
+**Verification.** tsc + Biome clean; 846 tests green across store, tool, `/pin` slash, resume-context, vocab, migration, bootstrap tool-list, loop, and subagent suites. No commit (awaiting operator review).
+
 ## [2026-06-05] todo: full-replace `todo_write` → CRUD (`todo_create` / `todo_update` / `todo_list` / `todo_get`) + `failed`
 
 **Goal (operator).** The TodoList had one tool, `todo_write`, that atomically replaced the whole list every call — no stable ids, no incremental update, no way to mark a task failed. Brought the CRUD model (granular ops + per-session stable ids) over from the reference harness, plus the `failed` status, render polish, and input robustness. **Decisions: code-first** (spec PR is a deferred follow-up — below) and **CRUD core only** (no dependencies — future phase; soft-delete + clear landed as a same-day follow-up, below).

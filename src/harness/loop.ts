@@ -50,6 +50,7 @@ import {
   reopenSession,
 } from '../storage/index.ts';
 import { listApprovalsLogBySessionRecent } from '../storage/repos/approvals-log.ts';
+import { createContextPinsStore } from '../storage/repos/context-pins.ts';
 import { createDispatchRewrite } from '../storage/repos/dispatch-rewrites.ts';
 import { getEagerProvenanceKeys, recordProvenance } from '../storage/repos/memory-provenance.ts';
 import { type SubagentHandleStore, createSubagentHandleStore } from '../subagents/handle-store.ts';
@@ -321,6 +322,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     nextId: (sid) => baseTodoStore.nextId(sid),
     clear: (sid) => baseTodoStore.clear(sid),
   };
+  // Like the todo store: the REPL injects a contextPinsStore so /pin and
+  // pin_context share one; a one-shot run gets a fresh wrapper over the same
+  // db. Built once per run (the store is stateless over the db) and reused in
+  // buildCtx, rather than re-wrapping on every tool call.
+  const contextPinsStore = config.contextPinsStore ?? createContextPinsStore(config.db);
   // Per-run totals. Each completed provider turn adds its usage and
   // its computed cost; HarnessResult.usage / costUsd report THIS
   // RUN's numbers — caller telemetry that has to stay self-
@@ -2809,9 +2815,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             ? { confirmMemoryUserScope: config.confirmMemoryUserScope }
             : {}),
           ...(config.clarify !== undefined ? { clarify: config.clarify } : {}),
-          ...(config.contextPinsStore !== undefined
-            ? { contextPinsStore: config.contextPinsStore }
-            : {}),
+          // Built once per run above (REPL-injected or a fresh wrapper over
+          // the db), so pin_context works in any mode (like the todolist),
+          // not just the interactive REPL.
+          contextPinsStore,
           ...(config.skillCatalog !== undefined ? { skillCatalog: config.skillCatalog } : {}),
           // Trust state — required on ToolContext, optional on
           // HarnessConfig. Default-false at the harness layer is

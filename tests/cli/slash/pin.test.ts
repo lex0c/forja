@@ -117,33 +117,29 @@ describe('/pin: create (happy path)', () => {
     expect(pin?.sourceStepId).toBeNull();
   });
 
-  test('expired pins do not block new --expires-in creates (regression)', async () => {
+  test('expired pins do not occupy the cap (active-only count)', async () => {
     // Plant 10 pins that expire 1 minute after nowMs (1m is the
-    // shortest unit /pin --expires-in admits). Advance the clock
-    // past their expiry. A new /pin call must succeed — the
-    // operator can't see or remove the expired pins via /pin --list
-    // (it filters to active), so the cap pre-check must agree.
+    // shortest unit /pin --expires-in admits). While active they fill
+    // the cap; after expiry they must NOT occupy it — the operator
+    // can't see or remove them via /pin --list (it filters to active),
+    // so the eviction's active count must agree.
     for (let i = 0; i < 10; i++) {
       const r = await pinCommand.exec([`short ${i}`, '--expires-in', '1m'], buildCtx());
       if (r.kind !== 'ok') throw new Error(`setup pin ${i} failed: ${JSON.stringify(r)}`);
     }
-    // 11th must refuse — all 10 are still active.
-    const before = await pinCommand.exec(['overflow'], buildCtx());
-    expect(before.kind).toBe('error');
-    if (before.kind === 'error') expect(before.message).toContain('cap reached');
-
     // Advance past expiry (1m = 60_000ms; bump by 2m to be safe).
     nowMs += 2 * 60_000;
     const listAfterExpiry = await pinCommand.exec(['--list'], buildCtx());
     if (listAfterExpiry.kind !== 'ok') throw new Error('expected ok');
     expect(listAfterExpiry.notes?.[0]).toContain('no pins active');
 
-    // And a fresh create succeeds — the expired rows don't occupy
-    // the cap anymore.
+    // A fresh create succeeds and does NOT evict — the expired rows
+    // don't count toward the cap, so nothing is dropped.
     const after = await pinCommand.exec(['fresh'], buildCtx());
     expect(after.kind).toBe('ok');
     if (after.kind === 'ok') {
       expect(after.notes?.[0]).toContain('(1/10 active)');
+      expect(after.notes?.some((n) => n.includes('dropped the oldest'))).toBe(false);
     }
   });
 });
@@ -459,20 +455,26 @@ describe('/pin: secret scanner', () => {
 });
 
 describe('/pin: cap + unwired surfaces', () => {
-  test('reports cap exceeded when 10 pins already exist', async () => {
+  test('evicts the oldest and warns when 10 pins already exist', async () => {
     for (let i = 0; i < PIN_CAP; i++) {
       store.createPin({
         sessionId,
         text: `existing ${i}`,
         kind: 'constraint',
         createdBy: 'user',
+        createdAt: 1000 + i, // ascending → existing 0 is the oldest
       });
     }
     const r = await pinCommand.exec(['overflow'], buildCtx());
-    expect(r.kind).toBe('error');
-    if (r.kind !== 'error') return;
-    expect(r.message).toContain('cap reached');
-    expect(r.message).toContain(`${PIN_CAP}/${PIN_CAP}`);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    // Still capped, the new pin landed, the oldest was dropped, and the
+    // operator is warned about the eviction.
+    expect(store.countActivePinsBySession(sessionId, nowMs)).toBe(PIN_CAP);
+    const texts = store.listPinsBySession(sessionId).map((p) => p.text);
+    expect(texts).toContain('overflow');
+    expect(texts).not.toContain('existing 0');
+    expect(r.notes?.some((n) => n.includes('dropped the oldest'))).toBe(true);
   });
 
   test('refuses when no current session yet', async () => {

@@ -13,7 +13,7 @@ import type {
 import type { ProviderToolInputSchema } from '../providers/index.ts';
 import type { RetrieveFn } from '../retrieval/index.ts';
 import type { SkillCatalog } from '../skills/index.ts';
-import type { ContextPinsStore, PinKind } from '../storage/repos/context-pins.ts';
+import type { ContextPinsStore } from '../storage/repos/context-pins.ts';
 import type { SubagentHandleStore } from '../subagents/handle-store.ts';
 import type { WorktreeOutcome } from '../subagents/types.ts';
 import type { TodoStore } from '../todo/index.ts';
@@ -386,18 +386,6 @@ export interface ToolContext {
   // undefined. Persistent — backed by SQLite, not an in-memory
   // map — so pins survive `/resume` per §12.4.4.
   contextPinsStore?: ContextPinsStore;
-  // Modal confirm hook for the `pin_context` tool (§12.4.1 —
-  // "modelo pode propor pin (vai a awaiting_user para confirmação
-  // modal, idêntico a memory writes)"). Same shape as
-  // `confirmMemoryWrite`: REPL wires it through the modal manager,
-  // headless leaves it unset. Absent ⇒ the pin_context tool
-  // refuses with `pin.headless_mode` (matches the memory_write
-  // headless path).
-  confirmPinContext?: (req: {
-    text: string;
-    kind: PinKind;
-    expiresAt: number | null;
-  }) => Promise<'yes' | 'no' | 'cancel'>;
   // Modal bridge for the `clarify` tool (CONTRACTS §2.6.5e,
   // STATE_MACHINE §12). The model emits `clarify(...)` to ask the
   // operator instead of presuming; `medium`/`high` routes here for a
