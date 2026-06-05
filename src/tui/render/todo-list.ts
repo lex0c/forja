@@ -70,10 +70,18 @@ const scrubLineBreaks = (s: string): string => s.replace(/[\r\n]+/g, ' ');
 
 const renderRow = (item: TodoItemForUI, caps: Capabilities): string => {
   const glyph = glyphFor(item.status, caps);
-  // in_progress in `bold` (default color, just heavier weight) so the
-  // active task pops without tinting it; failed in `error` so a failure
-  // reads loud; done/pending stay dim (reference, not focus).
-  const token = item.status === 'in_progress' ? 'bold' : item.status === 'failed' ? 'error' : 'dim';
+  // in_progress in `bold` (default color, heavier weight) so the active
+  // task pops without tinting; failed in `error` (loud); done in
+  // `secondary` (visible grey — completed work recedes); pending stays
+  // `dim` (the faint default, "not started yet").
+  const token =
+    item.status === 'in_progress'
+      ? 'bold'
+      : item.status === 'failed'
+        ? 'error'
+        : item.status === 'done'
+          ? 'secondary'
+          : 'dim';
   return `  ${paint(caps, token, `${glyph} ${scrubLineBreaks(labelFor(item))}`)}`;
 };
 
@@ -114,14 +122,13 @@ export const renderTodoList = (
 ): string[] => {
   if (todos.length === 0) return [];
   const visible = visibleRows(todos);
-  // Header: `Tasks <done>/<total> (<n> pending · …)`. The word "Tasks"
-  // carries the live-verb shimmer WHILE a task is in_progress — composeLive
-  // redraws this block every frame and the heartbeat stays awake while an
-  // in_progress task exists (renderer.ts `isActive`). With nothing running
-  // it renders flat `secondary`, so a parked list never freezes a stray
-  // highlighted char. The fraction stays default (the headline number;
-  // failed counts toward the denominator so it holds the bar short of N/N);
-  // the parenthetical breakdown is `secondary`, a quiet meta detail.
+  // Header: `Tasks (<n> pending · <n> in_progress · <n> done · <n> failed)`.
+  // The word "Tasks" carries the live-verb shimmer WHILE a task is
+  // in_progress — composeLive redraws this block every frame and the
+  // heartbeat stays awake while an in_progress task exists (renderer.ts
+  // `isActive`). With nothing running it renders flat `secondary`, so a
+  // parked list never freezes a stray highlighted char. The parenthetical
+  // status breakdown is `secondary` (a quiet meta detail).
   const counts = { pending: 0, in_progress: 0, done: 0, failed: 0 };
   for (const t of todos) counts[t.status] += 1;
   const breakdown =
@@ -131,9 +138,7 @@ export const renderTodoList = (
     counts.in_progress > 0
       ? renderShimmer('Tasks', caps, now, 'secondary')
       : paint(caps, 'secondary', 'Tasks');
-  const lines: string[] = [
-    `${head} ${counts.done}/${todos.length} ${paint(caps, 'secondary', `(${breakdown})`)}`,
-  ];
+  const lines: string[] = [`${head} ${paint(caps, 'secondary', `(${breakdown})`)}`];
   for (const item of visible) {
     lines.push(renderRow(item, caps));
   }

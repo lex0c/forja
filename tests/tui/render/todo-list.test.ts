@@ -153,22 +153,14 @@ describe('renderTodoList', () => {
     expect(out[6]).toContain('(+6 more)');
   });
 
-  test('header shows progress as done/total', () => {
-    const out = renderTodoList(
-      [item('done', 'a'), item('done', 'b'), item('pending', 'c')],
-      caps,
-      0,
-    );
-    expect(out[0]).toContain('Tasks 2/3');
-  });
-
-  test('header breaks the total down by status', () => {
+  test('header is just the status breakdown (no done/total fraction)', () => {
     const out = renderTodoList(
       [item('done', 'a'), item('in_progress', 'b', 'B'), item('pending', 'c'), item('failed', 'd')],
       caps,
       0,
     );
-    expect(out[0]).toContain('Tasks 1/4 (1 pending · 1 in_progress · 1 done · 1 failed)');
+    expect(out[0]).toContain('Tasks (1 pending · 1 in_progress · 1 done · 1 failed)');
+    expect(out[0]).not.toContain('1/4'); // the old done/total fraction was dropped
   });
 
   test('"Tasks" shimmers while a task is in_progress, flat otherwise', () => {
@@ -181,20 +173,21 @@ describe('renderTodoList', () => {
     expect(idle).not.toContain('[94m');
   });
 
+  test('done rows render in secondary (grey); pending stays dim', () => {
+    const color: Capabilities = { ...caps, color: 'basic' };
+    // done recedes to `secondary` (SGR 90, visible grey); pending is `dim`
+    // (SGR 2) — completed work reads quieter than the not-started ones.
+    const done = renderTodoList([item('done', 'finished')], color, 0)[1] ?? '';
+    expect(done).toContain('[90m');
+    const pending = renderTodoList([item('pending', 'todo')], color, 0)[1] ?? '';
+    expect(pending).not.toContain('[90m');
+  });
+
   test('failed status renders ✗ (unicode) / [!] (ascii) — reachable now', () => {
     const u = renderTodoList([item('failed', 'broke it')], caps, 0);
     expect(u[1]).toContain('✗');
     expect(u[1]).toContain('broke it');
     expect(renderTodoList([item('failed', 'broke it')], ascii, 0)[1]).toContain('[!]');
-  });
-
-  test('failed counts toward the denominator but not the numerator', () => {
-    const out = renderTodoList(
-      [item('done', 'a'), item('failed', 'b'), item('pending', 'c')],
-      caps,
-      0,
-    );
-    expect(out[0]).toContain('Tasks 1/3');
   });
 
   test('truncation surfaces failed rows in the visible slice', () => {

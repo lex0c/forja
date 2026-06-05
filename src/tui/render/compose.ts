@@ -253,20 +253,11 @@ export const composeLive: ComposeLive = (
     lines.push(...block.map(padFrame));
   };
 
-  // 1. Live TodoList (above the operation chips per spec §4.10.6:
-  // "Todo list (§4.3) acima dos chips, se houver"). renderTodoList
-  // returns [] when state.todos is empty — section drops entirely.
-  appendBlock(renderTodoList(state.todos, caps, now));
-
-  // 2. Active subagents (UI.md §4.2). One row per concurrent
-  // child run; section disappears when state.subagents is empty.
-  // Rendered between TodoList and the assistant chip so the
-  // operator's eye lands on "what's the AI doing on my behalf"
-  // — todos (planning), then subagents (delegation), then the
-  // active turn (the AI's own thinking).
+  // 1. Active subagents (UI.md §4.2). One row per concurrent child run;
+  // section disappears when state.subagents is empty.
   appendBlock(renderSubagentRows(state.subagents, caps, now));
 
-  // 3. Live preview of the accumulating tool-end batch. Consecutive
+  // 2. Live preview of the accumulating tool-end batch. Consecutive
   // same-name tools (read/read/read, or a run of bash) buffer into
   // `pendingToolEndBatch` and only settle into scrollback when the
   // group ends (a different-name tool, assistant text, or session
@@ -289,20 +280,30 @@ export const composeLive: ComposeLive = (
     lines.push(...formatPermanent(item, caps));
   }
 
-  // 4. Active tool cards (running). Map insertion order is preserved,
-  // so the visual order matches the order tools were started. The
-  // cards STACK above the phase chip below — read, write, bash… pile
-  // upward as the harness fires them, while the pinned chip (next)
-  // holds the bottom of the live region just above the typing zone.
+  // 3. Active tool cards (running). Map insertion order is preserved, so
+  // the visual order matches the order tools were started. The cards STACK
+  // above the TodoList + phase chip below — read, write, bash… pile upward
+  // as the harness fires them.
   for (const tool of state.activeTools.values()) {
     appendBlock(renderToolCardLive(tool, caps, now));
   }
 
+  // 4. Live TodoList, pinned at the BOTTOM of the volatile stack — just
+  // above the phase chip, near the typing zone. The WHOLE tool zone (the
+  // settling batch §2 and the running cards §3) renders ABOVE it, so a
+  // completing tool moves card→batch entirely above the list instead of
+  // crossing it (the "tool flashes below Tasks" report). Because the live
+  // region is anchored to the input, the list stays put while that stack
+  // grows/shrinks overhead. renderTodoList returns [] when empty — the
+  // section drops. Diverges from spec §4.10.6 ("Todo list acima dos
+  // chips") — folds into the pending todolist spec follow-up.
+  appendBlock(renderTodoList(state.todos, caps, now));
+
   // 5. Pinned turn-phase chip. The single live indicator for what the
-  // turn is doing right now — it sits at the BOTTOM of the live
-  // region (directly above the input block), with the tool cards
-  // (section 4) and the accumulating batch (section 3) stacking above
-  // it. This is the inverse of the older
+  // turn is doing right now — it sits at the BOTTOM of the live region
+  // (directly above the input block), with the TodoList (section 4), the
+  // tool cards (section 3), and the accumulating batch (section 2)
+  // stacking above it. This is the inverse of the older
   // "chip as parent above its tool calls" layout: the operator's eye
   // rests at the bottom near the typing zone, so the always-present
   // status lands there and the volatile tool stack grows upward out
