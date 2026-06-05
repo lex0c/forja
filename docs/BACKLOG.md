@@ -2,6 +2,10 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-05] task-discipline: nudge the model to use pin_context
+
+`pin_context` shipped available but unmentioned in the system prompt — the todolist is nudged in 3 places, the pin in 0 (a leftover from when it was omitted from the toolset, so the prompt never learned to incentivize it). Added one bullet to the task-discipline section: pin recurring constraints (an API that can't change shape, a step to always run before committing) so they survive compaction, instead of trusting they stay in context; not for one-shot facts; cross-session facts → `memory_write`. Trimmed the wording to keep the section under its ~3k-char budget (the cap is real — this section sits in cache breakpoint #1, read every turn). Net: the model now reaches for the pin proactively, not only when explicitly told.
+
 ## [2026-06-05] fix(subagents): revert the too-broad escapesCwd gate that bricked first-run
 
 The `pin_context` rework (below) added a `validate.ts` gate rejecting `escapesCwd` tools in subagents. But `bash` / `bash_background` / `bash_kill` / `write_file` / `edit_file` all declare `escapesCwd: true` — so it rejected `bash` in the `debug` / `refactor` / `git-hygiene` SEED playbooks, and `validateSubagentSet` fails the whole bootstrap on the first offending seed. **First-run bricked for every new user** (reproduced on a clean install). `escapesCwd` means "may touch outside cwd" (a flag `bash` carries); worktree isolation is what contains it, so it must not bar a tool on its own.
