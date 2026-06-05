@@ -164,6 +164,12 @@ export interface ClarifyBridgeRequest {
   question: string;
   options: ReadonlyArray<{ id: string; label: string }>;
   why_it_matters?: string;
+  // Producer-side cancellation (the tool's `ctx.signal`: wall-clock /
+  // user abort combined by the harness). Forwarded to the modal so a
+  // hard budget/cancel closes the prompt immediately instead of waiting
+  // on the operator or the 60s timeout. Mirrors confirmPermission's
+  // req.signal.
+  signal?: AbortSignal;
 }
 export interface ClarifyBridgeResponse {
   outcome: 'resolved' | 'skipped' | 'escalated';

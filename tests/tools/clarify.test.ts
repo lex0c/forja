@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { type ClarifyInput, clarifyTool } from '../../src/tools/builtin/clarify.ts';
-import { isToolError } from '../../src/tools/types.ts';
+import { type ClarifyBridgeRequest, isToolError } from '../../src/tools/types.ts';
 import { makeCtx } from './_helpers.ts';
 
 const OPTS = [
@@ -105,22 +105,24 @@ describe('clarify: every call routes through the modal bridge', () => {
     expect(result.chosen_option_id).toBeUndefined();
   });
 
-  test('forwards the request fields to the bridge', async () => {
-    let received: unknown;
+  test('forwards the request fields + the run abort signal to the bridge', async () => {
+    let received: ClarifyBridgeRequest | undefined;
+    const ctx = makeCtx({
+      clarify: async (req) => {
+        received = req;
+        return { outcome: 'resolved' as const, chosen_option_id: 'a' };
+      },
+    });
     await clarifyTool.execute(
       { question: 'which validateOrder?', options: OPTS, why_it_matters: 'stakes differ' },
-      makeCtx({
-        clarify: async (req) => {
-          received = req;
-          return { outcome: 'resolved' as const, chosen_option_id: 'a' };
-        },
-      }),
+      ctx,
     );
-    expect(received).toEqual({
-      question: 'which validateOrder?',
-      options: OPTS,
-      why_it_matters: 'stakes differ',
-    });
+    expect(received?.question).toBe('which validateOrder?');
+    expect(received?.options).toEqual(OPTS);
+    expect(received?.why_it_matters).toBe('stakes differ');
+    // ctx.signal forwarded so a producer / wall-clock abort can close the
+    // modal instead of waiting on the operator or the 60s timeout.
+    expect(received?.signal).toBe(ctx.signal);
   });
 });
 

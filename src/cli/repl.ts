@@ -1354,11 +1354,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // Clarify modal bridge (STATE_MACHINE §12). The `clarify` tool
   // forwards every ask here; the modal manager raises the prompt and
   // resolves the operator's pick (or `skipped` on Esc / 60s timeout,
-  // §12.3).
+  // §12.3). `req.signal` is the run's abort (ctx.signal: wall-clock /
+  // user, combined by the harness) — forward it so a hard budget/cancel
+  // closes the modal now instead of after the operator answers or the
+  // timeout fires. Same posture as confirmPermission above.
   const clarify = (req: ClarifyBridgeRequest) =>
     modalManager.askClarify(
       { question: req.question, why: req.why_it_matters ?? null, options: req.options },
-      { timeoutMs: 60_000 },
+      { timeoutMs: 60_000, ...(req.signal !== undefined ? { signal: req.signal } : {}) },
     );
 
   // Operator `!cmd` execution. Runs as the operator's own shell — NOT

@@ -133,6 +133,10 @@ export const clarifyTool: Tool<ClarifyInput, ClarifyOutput> = {
       question: args.question,
       options: args.options,
       ...(args.why_it_matters !== undefined ? { why_it_matters: args.why_it_matters } : {}),
+      // Forward the run's abort signal so a wall-clock / producer abort
+      // closes the modal immediately instead of stranding it until the
+      // operator answers or the 60s timeout fires.
+      signal: ctx.signal,
     });
 
     // skipped → proceed with the assumed default so the model has a
