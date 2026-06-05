@@ -7,7 +7,6 @@ import { EMBEDDED_BUILTINS, PROTECTED_BUILTIN_NAMES } from './builtin/index.ts';
 import { BUILTIN_AGENTS_DIR, projectAgentsDir, userAgentsDir } from './paths.ts';
 import { TOOL_RESTRICTION_SHAPE } from './restrictions.ts';
 import type {
-  ClarifyMode,
   ContextRecipe,
   IncludeRepoMap,
   PhaseDef,
@@ -641,7 +640,6 @@ const parseStringArray = (raw: unknown, sourcePath: string, fieldPath: string): 
 
 const INCLUDE_REPO_MAP_VALUES: ReadonlyArray<IncludeRepoMap> = ['eager', 'lazy', 'off'];
 const STEP_REFLECTION_VALUES: ReadonlyArray<StepReflection> = ['off', 'terse', 'full'];
-const CLARIFY_MODE_VALUES: ReadonlyArray<ClarifyMode> = ['on_high_blast', 'pre_execution'];
 
 // Context recipe (`PLAYBOOKS.md` §1.1, canonical recipes in
 // `CONTEXT_TUNING.md` §13). Each field validates independently so an
@@ -649,7 +647,7 @@ const CLARIFY_MODE_VALUES: ReadonlyArray<ClarifyMode> = ['on_high_blast', 'pre_e
 // `goal_reinjection_every_n_steps` in the same definition.
 //
 // Slice 9 wires the live fields (memory_filter, step_reflection,
-// clarify_mode, goal_reinjection); the repo-map / diff / callers
+// goal_reinjection); the repo-map / diff / callers
 // fields validate at load time but stay no-op at runtime until
 // CODE_INDEX lands. Validating today means an author can declare
 // the intent now and the consumer slice picks it up automatically.
@@ -667,7 +665,6 @@ const parseContextRecipe = (raw: unknown, sourcePath: string): ContextRecipe | u
     'fewshot_count',
     'memory_filter',
     'step_reflection',
-    'clarify_mode',
   ]);
   for (const key of Object.keys(r)) {
     if (!knownKeys.has(key)) {
@@ -745,17 +742,6 @@ const parseContextRecipe = (raw: unknown, sourcePath: string): ContextRecipe | u
       );
     }
     out.stepReflection = r.step_reflection as StepReflection;
-  }
-  if (r.clarify_mode !== undefined) {
-    if (
-      typeof r.clarify_mode !== 'string' ||
-      !(CLARIFY_MODE_VALUES as ReadonlyArray<string>).includes(r.clarify_mode)
-    ) {
-      throw new Error(
-        `subagent ${sourcePath}: 'context_recipe.clarify_mode' must be one of ${CLARIFY_MODE_VALUES.join(', ')} (got ${JSON.stringify(r.clarify_mode)})`,
-      );
-    }
-    out.clarifyMode = r.clarify_mode as ClarifyMode;
   }
   return out;
 };

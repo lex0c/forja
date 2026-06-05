@@ -157,16 +157,13 @@ export interface SummarizedOutput {
 // STATE_MACHINE §12). Shared by every hop of the chain
 // (ToolContext.clarify, HarnessConfig.clarify, the REPL bridge) so the
 // shape has ONE source of truth instead of being hand-synced across
-// files. `low` blast radius never reaches the bridge (the tool
-// auto-resolves it), so the request narrows to medium/high. The
-// response keeps `escalated` (STATE_MACHINE §12 edit-goal) even though
-// the current ModalManager producer only emits resolved/skipped — the
-// narrower ClarifyManagerAnswer stays assignable to it.
+// files. The response keeps `escalated` (STATE_MACHINE §12 edit-goal)
+// even though the current ModalManager producer only emits
+// resolved/skipped — the narrower ClarifyManagerAnswer stays assignable.
 export interface ClarifyBridgeRequest {
   question: string;
   options: ReadonlyArray<{ id: string; label: string }>;
   why_it_matters?: string;
-  blast_radius: 'medium' | 'high';
 }
 export interface ClarifyBridgeResponse {
   outcome: 'resolved' | 'skipped' | 'escalated';

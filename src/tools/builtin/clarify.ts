@@ -8,46 +8,37 @@ import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts'
 // before you cut (act).
 //
 // Design intent: `clarify` is a CORE tool, always exposed alongside
-// read/write/edit — never gated by a playbook. The per-playbook
-// `clarify_mode` modulates only the interruption behavior, never the
-// availability. It renders as a confirm-modal flavor (`flavor:'clarify'`,
-// one question + options); the REPL wires `ctx.clarify` to the
-// ModalManager. Multiple pending clarifies stack in the FIFO queue.
+// read/write/edit — never gated by a playbook. It renders as a confirm-
+// modal flavor (`flavor:'clarify'`, one question + options); the REPL
+// wires `ctx.clarify` to the ModalManager. Multiple pending clarifies
+// stack in the FIFO queue.
 //
-// blast_radius routing (§12.1):
-//   - low    — aesthetic / no real stakes. Auto-resolves to options[0]
-//              WITHOUT a modal; returns outcome:auto_low. Never
-//              interrupts the operator.
-//   - medium — bufferable; needs the operator. Routes to the modal
-//              bridge (ctx.clarify).
-//   - high   — multi-file / external contract / irreversible. Routes
-//              to the modal bridge for an immediate answer.
+// EVERY call asks the operator. There is no severity level the model
+// self-classifies — a `blast_radius` the model could mis-set, silently
+// auto-assuming when it should have asked. If the model doesn't want to
+// interrupt (a low-stakes choice), it simply doesn't call clarify and
+// records the assumption itself. Calling clarify == wanting an answer.
 //
 // Without the modal bridge (headless one-shot, subagent with no IPC
-// confirm pipe), medium/high return `clarify.modal_unavailable` — the
-// same fail-clean shape memory_write uses for its missing confirm
-// callback. low still resolves, since it needs no operator.
+// confirm pipe), it returns `clarify.modal_unavailable` — the same
+// fail-clean shape memory_write uses for its missing confirm callback.
 //
 // Deferred to a later slice: audit (clarification_events, §12.4) and
 // the per-session budget (clarify.budget_exceeded, §2.6.5e) — they
-// need a storage table / session counter not wired yet. This slice is
-// the tool contract + validation + low auto-resolve + modal handoff.
+// need a storage table / session counter not wired yet.
 
 export interface ClarifyOption {
   id: string;
   label: string;
 }
 
-export type BlastRadius = 'low' | 'medium' | 'high';
-
 export interface ClarifyInput {
   question: string;
   options: ClarifyOption[];
   why_it_matters?: string;
-  blast_radius: BlastRadius;
 }
 
-export type ClarifyOutcome = 'resolved' | 'skipped' | 'escalated' | 'auto_low';
+export type ClarifyOutcome = 'resolved' | 'skipped' | 'escalated';
 
 export interface ClarifyOutput {
   // resolved — operator picked an option (chosen_option_id set).
@@ -55,18 +46,15 @@ export interface ClarifyOutput {
   //   auto-assumed default (chosen_option_id = options[0]).
   // escalated — operator signaled the GOAL is wrong, not just
   //   ambiguous (user_text carries the reason); caller re-grounds.
-  // auto_low — low blast radius auto-resolved without a modal.
   outcome: ClarifyOutcome;
   chosen_option_id?: string;
   user_text?: string;
 }
 
-const BLAST_RADII: ReadonlySet<string> = new Set(['low', 'medium', 'high']);
-
 export const clarifyTool: Tool<ClarifyInput, ClarifyOutput> = {
   name: 'clarify',
   description:
-    'Ask the operator a question instead of presuming when you hit a load-bearing ambiguity (which file, which behavior, which of two readings of the request). Provide >=2 options for them to pick. blast_radius: low = aesthetic / no real stakes (auto-resolved to the first option, no interruption — use sparingly); medium = affects one file / use-case; high = multiple files / external contract / irreversible (interrupts immediately). Prefer this over guessing on anything expensive to get wrong; do NOT use it for trivia the operator would find noisy.',
+    'Ask the operator a question instead of presuming when you hit a load-bearing ambiguity (which file, which behavior, which of two readings of the request). Provide >=2 options for them to pick; the operator picks one, or skips (then you proceed with the FIRST option). EVERY call opens a prompt and waits — so use it only for ambiguity that is expensive to get wrong. For a low-stakes choice, do NOT call this: pick a sensible default and note the assumption. Never use it for trivia the operator would find noisy.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -90,32 +78,26 @@ export const clarifyTool: Tool<ClarifyInput, ClarifyOutput> = {
       why_it_matters: {
         type: 'string',
         description:
-          'Optional one-line stakes: what diverges between the options (blast radius, cost, deadline). Shown to the operator.',
-      },
-      blast_radius: {
-        type: 'string',
-        enum: ['low', 'medium', 'high'],
-        description:
-          'low = no real stakes, auto-resolved to options[0] with no modal; medium = needs the operator, bufferable; high = needs the operator, interrupts now.',
+          'Optional one-line stakes: what diverges between the options (cost, blast radius, deadline). Shown to the operator.',
       },
     },
-    required: ['question', 'options', 'blast_radius'],
+    required: ['question', 'options'],
   },
   metadata: {
     category: 'misc',
     // Pure human consultation — no filesystem / network / process
     // side effects (CONTRACTS §2.6.5e "Side effects: nenhum").
     writes: false,
-    // medium/high await the operator via the modal bridge. Headless
-    // and subagent contexts have no such surface, so the tool can't
-    // run there — same posture as memory_write. The subagent
-    // validator rejects whitelists that include it.
+    // Awaits the operator via the modal bridge. Headless and subagent
+    // contexts have no such surface, so the tool can't run there — same
+    // posture as memory_write. The subagent validator rejects whitelists
+    // that include it.
     requiresOperatorConfirm: true,
     // Same (question, options) recreates the same modal (§2.6.5e).
     idempotent: true,
     display: 'raw',
-    // low auto-resolves in ~ms; medium/high are bound by the 60s
-    // modal timeout but the cost is operator wall-clock, not compute.
+    // Bound by the 60s modal timeout, but the cost is operator
+    // wall-clock, not compute.
     cost: { latency_ms_typical: 5 },
   },
   async execute(args, ctx): Promise<ToolResult<ClarifyOutput>> {
@@ -135,19 +117,12 @@ export const clarifyTool: Tool<ClarifyInput, ClarifyOutput> = {
       return toolError('clarify.options_invalid', 'options must contain at least one valid choice');
     }
 
-    // low — auto-resolve to the first option, no operator, no modal.
-    // The model reads outcome:auto_low and proceeds knowing it assumed
-    // options[0] (§12.1).
-    if (args.blast_radius === 'low') {
-      return { outcome: 'auto_low', chosen_option_id: defaultOptionId };
-    }
-
-    // medium / high — needs the operator. Route to the modal bridge.
+    // Every clarify asks the operator — route to the modal bridge.
     const bridge = ctx.clarify;
     if (bridge === undefined) {
       return toolError(
         'clarify.modal_unavailable',
-        'clarify (medium/high) needs an interactive operator surface, but none is attached',
+        'clarify needs an interactive operator surface, but none is attached',
         {
           hint: 'Runs in an interactive REPL. In headless / subagent contexts, proceed and record the choice in assumptions[] instead.',
         },
@@ -158,12 +133,11 @@ export const clarifyTool: Tool<ClarifyInput, ClarifyOutput> = {
       question: args.question,
       options: args.options,
       ...(args.why_it_matters !== undefined ? { why_it_matters: args.why_it_matters } : {}),
-      blast_radius: args.blast_radius,
     });
 
     // skipped → proceed with the assumed default so the model has a
-    // concrete choice to act on, mirroring the low path (§12.3
-    // 60s-timeout default = skip-and-proceed-with-auto).
+    // concrete choice to act on (§12.3 60s-timeout default =
+    // skip-and-proceed-with-options[0]).
     if (resolution.outcome === 'skipped') {
       return {
         outcome: 'skipped',
@@ -187,12 +161,6 @@ export const clarifyTool: Tool<ClarifyInput, ClarifyOutput> = {
 const validateInputs = (args: ClarifyInput): ToolResult<ClarifyOutput> | null => {
   if (typeof args.question !== 'string' || args.question.length === 0) {
     return toolError(ERROR_CODES.invalidArg, 'question must be a non-empty string');
-  }
-  if (typeof args.blast_radius !== 'string' || !BLAST_RADII.has(args.blast_radius)) {
-    return toolError(
-      ERROR_CODES.invalidArg,
-      `blast_radius must be one of: low, medium, high (got ${JSON.stringify(args.blast_radius)})`,
-    );
   }
   if (args.why_it_matters !== undefined && typeof args.why_it_matters !== 'string') {
     return toolError(ERROR_CODES.invalidArg, 'why_it_matters must be a string when provided');

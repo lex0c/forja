@@ -1,5 +1,4 @@
 export type {
-  ClarifyMode,
   ContextRecipe,
   IncludeRepoMap,
   PhaseDef,

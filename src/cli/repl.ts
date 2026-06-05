@@ -1351,11 +1351,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     body: string;
   }): Promise<'yes' | 'no' | 'cancel'> => modalManager.askMemoryUserScope(req);
 
-  // Clarify form-modal bridge (STATE_MACHINE §12). The `clarify` tool
-  // forwards medium/high blast-radius asks here; the modal manager
-  // raises the form and resolves the operator's pick (or skipped on Esc
-  // / 60s timeout, §12.3). blast_radius isn't needed downstream —
-  // medium and high both open the modal; batching is a later slice.
+  // Clarify modal bridge (STATE_MACHINE §12). The `clarify` tool
+  // forwards every ask here; the modal manager raises the prompt and
+  // resolves the operator's pick (or `skipped` on Esc / 60s timeout,
+  // §12.3).
   const clarify = (req: ClarifyBridgeRequest) =>
     modalManager.askClarify(
       { question: req.question, why: req.why_it_matters ?? null, options: req.options },

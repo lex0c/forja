@@ -964,10 +964,10 @@ export interface HarnessConfig {
   // operator a second look at the content before the
   // cross-session blast hits.
   confirmMemoryUserScope?: (req: ConfirmMemoryUserScopeRequest) => Promise<MemoryWriteAnswer>;
-  // Async hook for the clarify form-modal (STATE_MACHINE §12). The
-  // `clarify` tool fires this for medium/high blast radius. Caller
-  // (REPL) wires it to `modalManager.askClarify`; one-shot / headless
-  // leaves it unset and the tool returns `clarify.modal_unavailable`.
+  // Async hook for the clarify modal (STATE_MACHINE §12). The `clarify`
+  // tool fires this for every ask. Caller (REPL) wires it to
+  // `modalManager.askClarify`; one-shot / headless leaves it unset and
+  // the tool returns `clarify.modal_unavailable`.
   clarify?: (req: ClarifyBridgeRequest) => Promise<ClarifyBridgeResponse>;
   // Hook specs resolved at boot (spec AGENTIC_CLI.md §10). Already
   // ordered enterprise → user → project; the dispatcher iterates

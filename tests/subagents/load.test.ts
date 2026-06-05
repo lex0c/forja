@@ -971,7 +971,7 @@ describe('playbook surface — context_recipe', () => {
   test('full valid recipe parses through with camelCase rename', () => {
     const def = loadSubagentFromString(
       withExtraFrontmatter(
-        'context_recipe:\n  include_repo_map: eager\n  include_diff: true\n  include_callers: false\n  goal_reinjection_every_n_steps: 4\n  fewshot_count: 1\n  memory_filter: ["security", "architecture"]\n  step_reflection: terse\n  clarify_mode: pre_execution',
+        'context_recipe:\n  include_repo_map: eager\n  include_diff: true\n  include_callers: false\n  goal_reinjection_every_n_steps: 4\n  fewshot_count: 1\n  memory_filter: ["security", "architecture"]\n  step_reflection: terse',
       ),
       'user',
       '/p',
@@ -984,7 +984,6 @@ describe('playbook surface — context_recipe', () => {
       fewshotCount: 1,
       memoryFilter: ['security', 'architecture'],
       stepReflection: 'terse',
-      clarifyMode: 'pre_execution',
     });
     expect(def.meta.context_recipe).toBeUndefined();
   });
@@ -1007,16 +1006,6 @@ describe('playbook surface — context_recipe', () => {
         '/p',
       ),
     ).toThrow(/'context_recipe\.step_reflection' must be one of off, terse, full/);
-  });
-
-  test('clarify_mode enum is enforced', () => {
-    expect(() =>
-      loadSubagentFromString(
-        withExtraFrontmatter('context_recipe:\n  clarify_mode: always'),
-        'user',
-        '/p',
-      ),
-    ).toThrow(/'context_recipe\.clarify_mode' must be one of on_high_blast, pre_execution/);
   });
 
   test('include_diff / include_callers must be boolean', () => {

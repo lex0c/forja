@@ -127,21 +127,13 @@ export type IncludeRepoMap = 'eager' | 'lazy' | 'off';
 // `off` = none.
 export type StepReflection = 'off' | 'terse' | 'full';
 
-// `context_recipe.clarify_mode` enum from `STATE_MACHINE.md` §12.
-// `on_high_blast` = only `high` blast radius interrupts (default);
-// `pre_execution` = batch all clarifications before the first write.
-// There is no `off`: `clarify` is a core tool, always exposed to the
-// model alongside read/write/edit — `clarify_mode` modulates only the
-// interruption behavior, never the availability (CONTRACTS §2.6.5e).
-export type ClarifyMode = 'on_high_blast' | 'pre_execution';
-
 // Context shaping per playbook (`PLAYBOOKS.md` §1.1, canonical
 // recipes in `CONTEXT_TUNING.md` §13). Slice 9 consumes the fields
 // that have downstream subsystems wired (memory_filter,
-// step_reflection, clarify_mode, goal_reinjection); the repo-map /
-// diff / callers fields stay frozen until CODE_INDEX lands. Slice 1
-// validates shape so authors can declare the intent today and the
-// definition is forward-compatible.
+// step_reflection, goal_reinjection); the repo-map / diff / callers
+// fields stay frozen until CODE_INDEX lands. Slice 1 validates shape so
+// authors can declare the intent today and the definition is
+// forward-compatible.
 export interface ContextRecipe {
   includeRepoMap?: IncludeRepoMap;
   includeDiff?: boolean;
@@ -150,7 +142,6 @@ export interface ContextRecipe {
   fewshotCount?: number;
   memoryFilter?: string[];
   stepReflection?: StepReflection;
-  clarifyMode?: ClarifyMode;
 }
 
 // Single phase declaration (`PLAYBOOKS.md` §1.1, lifecycle in
