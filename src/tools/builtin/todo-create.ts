@@ -94,8 +94,11 @@ export const todoCreateTool: Tool<TodoCreateInput, TodoCreateOutput> = {
 
     const { store, sid } = got;
     const existing = store.get(sid);
-    // Cap counts ACTIVE todos only — soft-deleted (removed) rows linger in
-    // the store to keep ids stable, but must not consume the budget.
+    // Cap on active rows. `removed` is purged at update time (not
+    // tombstoned), so `existing` only ever holds active todos — which means
+    // this also bounds the TOTAL stored: a create→remove loop can't grow the
+    // store (or the todo_updated payload) past MAX_ITEMS. The `activeItems`
+    // filter is residual defense (the store shouldn't contain a removed row).
     const activeCount = activeItems(existing).length;
     if (activeCount + args.items.length > MAX_ITEMS) {
       return toolError(

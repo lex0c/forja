@@ -253,21 +253,44 @@ describe('soft-delete (todo_update status removed)', () => {
     expect(r.created[0]?.id).toBe('2');
   });
 
-  test('removed rows do not consume the active cap', async () => {
-    const { ctx } = setup();
+  test('removing purges the row, freeing a cap slot and shrinking the store', async () => {
+    const { store, ctx } = setup();
     const items = Array.from({ length: 200 }, (_, i) => ({
       content: `t${i}`,
       active_form: `${i}`,
     }));
     await todoCreateTool.execute({ items }, ctx);
     await todoUpdateTool.execute({ id: '1', status: 'removed' }, ctx);
-    // 200 created, 1 removed → 199 active, so one more fits.
+    // Dropped, not tombstoned: 199 rows stored, so one more fits.
+    expect(store.get('s1')).toHaveLength(199);
     const r = await todoCreateTool.execute(
       { items: [{ content: 'extra', active_form: 'x' }] },
       ctx,
     );
     if (isToolError(r)) throw new Error(`expected fit, got ${r.error_message}`);
     expect(r.created).toHaveLength(1);
+  });
+
+  test('create→remove cycles do not grow the store (cap stays honest)', async () => {
+    const { store, ctx } = setup();
+    const batch = Array.from({ length: 200 }, (_, i) => ({
+      content: `t${i}`,
+      active_form: `${i}`,
+    }));
+    // Two full cycles: create 200, remove all 200. Without purge the store
+    // would reach 400 and a third create would still be wrongly accepted.
+    for (let cycle = 0; cycle < 2; cycle++) {
+      const base = cycle * 200;
+      await todoCreateTool.execute({ items: batch }, ctx);
+      for (let i = 1; i <= 200; i++) {
+        await todoUpdateTool.execute({ id: String(base + i), status: 'removed' }, ctx);
+      }
+      expect(store.get('s1')).toHaveLength(0); // purged, not accumulated
+    }
+    // ids never recycled across cycles: the next create starts at 401.
+    const r = await todoCreateTool.execute({ items: [{ content: 'x', active_form: 'x' }] }, ctx);
+    if (isToolError(r)) throw new Error(r.error_message);
+    expect(r.created[0]?.id).toBe('401');
   });
 
   test('todo_get on a removed id resolves to not_found', async () => {

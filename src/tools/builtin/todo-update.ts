@@ -116,8 +116,19 @@ export const todoUpdateTool: Tool<TodoUpdateInput, TodoUpdateOutput> = {
     }
 
     const updated: TodoItem = { id: current.id, content, status, activeForm };
-    const next = [...list];
-    next[idx] = updated;
+    let next: TodoItem[];
+    if (status === 'removed') {
+      // Purge the row, don't tombstone it. The monotonic id counter
+      // (store.nextId) already guarantees the id is never reused, so a
+      // lingering 'removed' row buys nothing — and because the create cap
+      // counts only ACTIVE rows, keeping tombstones let create→remove
+      // cycles grow the store (and every todo_updated payload) without
+      // bound, defeating MAX_ITEMS. Dropping it keeps the cap honest.
+      next = list.filter((_, i) => i !== idx);
+    } else {
+      next = [...list];
+      next[idx] = updated;
+    }
     const invalid = assertSingleInProgress(next);
     if (invalid !== null) return invalid;
 
