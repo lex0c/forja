@@ -10,10 +10,6 @@ and how that conversation is compacted, persisted, reused, and recovered.
 > model actually sees on the wire. They are intentionally different views.
 > Everything below follows from that split.
 
-Related spec: `docs/spec/AGENTIC_CLI.md` §5 (harness/loop), §6 (context engine),
-§13 (storage). This document describes the *implemented* model, which diverges
-from the spec on one point — see [Relationship to the spec](#relationship-to-the-spec).
-
 ## The two representations
 
 | | DB log (`messages` table) | `SessionContext` (in-memory) |
@@ -163,12 +159,3 @@ Because the log is complete and compaction never deletes a row:
 - **Audit / recap / replay / retrieval** read the **log**, not the live array —
   they want the full history, not the compacted view. That is why "single source
   of truth" means the live *context*; the log is a separate, complete record.
-
-## Relationship to the spec
-
-This "live in-memory context is the source of truth, DB is append-only log"
-model is **code-behind-spec**: it diverges from `AGENTIC_CLI.md` §6 (context
-engine) / §13 (storage), which a future spec PR will reconcile. Same deliberate
-posture as `inbox` and the (unbuilt) code-index — the code is the design target
-until the spec catches up. Do not "fix" the code to match the spec without that
-PR. See `docs/BACKLOG.md` for the dated decisions.
