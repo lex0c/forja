@@ -185,6 +185,41 @@ describe('SessionContext: ensureAlternation', () => {
       );
     expect(answered).toBe(true);
   });
+
+  test('repairs a partially-answered multi-tool_use turn (length unchanged)', () => {
+    const ctx = SessionContext.createFresh(db, sessionId);
+    ctx.appendUser('goal', null);
+    // Assistant emits TWO tool_use; the next user answers only tu1, leaving
+    // tu2 orphaned. repairAlternation rewrites that user message IN PLACE
+    // (synthetic tu2 result spliced in), so the array length does NOT change
+    // — the exact case the old length-only guard skipped, re-sending tu2
+    // unanswered on the next reused turn.
+    ctx.appendAssistant(
+      [
+        { type: 'tool_use', id: 'tu1', name: 'read', input: {} },
+        { type: 'tool_use', id: 'tu2', name: 'grep', input: {} },
+      ],
+      noUsage,
+      null,
+    );
+    ctx.appendToolResults(
+      [{ type: 'tool_result', tool_use_id: 'tu1', name: 'read', content: 'ok', is_error: false }],
+      null,
+    );
+    const lenBefore = ctx.length;
+    ctx.ensureAlternation(false);
+    expect(ctx.length).toBe(lenBefore); // repaired in place, same length
+    const answered = (id: string): boolean =>
+      ctx
+        .getMessages()
+        .some(
+          (m) =>
+            Array.isArray(m.content) &&
+            m.content.some((b) => b.type === 'tool_result' && b.tool_use_id === id),
+        );
+    expect(answered('tu1')).toBe(true);
+    expect(answered('tu2')).toBe(true); // the orphan — answered only with the fix
+  });
 });
 
 describe('SessionContext: compact (in-memory only, never persists)', () => {

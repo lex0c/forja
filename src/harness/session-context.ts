@@ -186,15 +186,22 @@ export class SessionContext {
   //      does NOT round-trip through hydrate's repair, so without this the
   //      next provider request 400s on the unanswered tool_use and wedges
   //      the live session (the bug the old resume-every-turn path masked).
-  //      Idempotent on a clean array (no orphan ⇒ same length ⇒ no swap).
+  //      Idempotent on a clean array (no orphan / no gap ⇒ repaired equals
+  //      the input). Copied back UNCONDITIONALLY — a partial answer repairs
+  //      in place without changing length, so a length guard would skip it.
   //   2. Stranded turn — if the (repaired) tail is a `user` and a new user
   //      prompt follows, insert a synthetic assistant so the wire alternates.
   ensureAlternation(willAppendUser: boolean): void {
+    // Copy back UNCONDITIONALLY: repairAlternation can fix the array
+    // WITHOUT changing its length. The partial-answer case — an assistant
+    // with N tool_use blocks where the next user answers only some —
+    // rewrites that user message in place with the missing synthetic
+    // results, same length. A length-only guard would skip exactly that
+    // repair and leave an unanswered tool_use for the next reused turn →
+    // provider 400 (the very wedge this is meant to prevent).
     const repaired = repairAlternation(this.messages);
-    if (repaired.length !== this.messages.length) {
-      this.messages.length = 0;
-      this.messages.push(...repaired);
-    }
+    this.messages.length = 0;
+    this.messages.push(...repaired);
     const tail = this.messages[this.messages.length - 1];
     if (willAppendUser && tail !== undefined && tail.role === 'user') {
       this.messages.push({ role: 'assistant', content: STRANDED_TURN_PLACEHOLDER });

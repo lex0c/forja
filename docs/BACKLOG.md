@@ -2,6 +2,10 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-06] Fix: ensureAlternation skipped same-length tool_use repairs
+
+`SessionContext.ensureAlternation` copied the repaired array back only when its LENGTH changed — but `repairAlternation`'s partial-answer branch (an assistant with N tool_use blocks, the next user answering only some) rewrites that user message IN PLACE with the missing synthetic results, same length. The repair was discarded, so the next reused REPL turn re-sent an unanswered tool_use → provider 400 (the very wedge the repair prevents). Now copies back unconditionally (idempotent when nothing changed). Regression test (2 tool_use, 1 answered) proven non-vacuous: fails without the fix, passes with. Reported externally; escaped because the orphan test + the after-abort smoke only exercised the single-tool_use branch, which DOES change length.
+
 ## [2026-06-06] Compaction prompt: reinforce factual fidelity
 
 The compaction summary's real failure mode isn't dropping a turn — it's the model "improving" an established fact until it's subtly wrong (paraphrasing a path, generalizing a decision, inferring a detail never stated), which the next turn then trusts. Added a fidelity paragraph to `COMPACTION_SYSTEM_PROMPT`: copy names/paths/line-numbers/error-strings verbatim, no rewrite/generalize/infer, keep-when-unsure (reconciled with the existing "every word costs tokens" so it doesn't inflate). Conservative — touches prose, not the structured block the tests assert. Caveat: no compaction-QUALITY eval exists (only structural tests), so the gain is reasoned, not measured — a real eval (do key facts survive the fold?) is the next worthwhile step.
