@@ -2,6 +2,12 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-06] Live "Compacting context…" chip during compaction
+
+Compaction (auto past the threshold, or manual `/compact`) gave no live feedback — the REPL went quiet for the seconds the summary call took, no spinner, indistinguishable from a hang.
+
+A "Compacting context…" chip now animates in the live region while a compaction runs, bracketed by `compacting:start`/`compacting:end` from BOTH surfaces: `/compact` emits them directly (try/finally), and the harness adapter translates the loop's `compaction_started`/`compaction_finished`. One `state.compacting` field + reducer, one chip-slot entry at LOWEST priority (a compaction runs between steps / with no turn, so a real turn chip always wins over a stray one), and — critically — registered in `liveRegionActive` so the frame scheduler keeps redrawing it (missing that froze the chip after one frame). The render (spinner + shimmer + elapsed) is extracted into a shared `renderTimedChip`; the awaiting AND thinking chips now delegate to it (byte-identical hand-rolls). The auto path reads pins BEFORE emitting `compaction_started`, so the started→finished pair can't be split by a throw — a DB read error would otherwise leave the chip stuck open until session end. Code-reviewed (4 finder angles): wiring-completeness + render-parity came back clean; the pin-read asymmetry, the half-applied extraction, and a trivial priority test were the findings, all fixed.
+
 ## [2026-06-06] SessionContext: central in-memory source of truth for the live conversation + `/compact`
 
 Until now every REPL turn re-derived the full message history from the DB (`resumeFromSessionId` each turn) and the loop re-compacted every turn — compaction is in-memory and never persists, so a session past the threshold paid a billed summary call PER TURN, and message manipulation was scattered across ~8 sites in the loop. Operator directive (`project_message_single_source`): message handling must be central — ONE source of truth, in-memory; the DB is append-only log.

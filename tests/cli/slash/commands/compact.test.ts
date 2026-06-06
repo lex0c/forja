@@ -195,4 +195,19 @@ describe('/compact', () => {
     expect(exclusiveCalled).toBe(true); // compaction held the busy lock
     expect(ctx.length).toBeLessThan(before); // and ran inside it
   });
+
+  test('brackets the compaction with compacting:start / compacting:end events', async () => {
+    const live = buildLiveCtx();
+    const slashCtx = makeCtx({ provider: makeProvider('GOAL: x\nDECISIONS: y'), live });
+    const eventTypes: string[] = [];
+    slashCtx.bus.onAny((e) => eventTypes.push(e.type));
+    const r = await compactCommand.exec([], slashCtx);
+    expect(r.kind).toBe('ok');
+    // The live "Compacting context…" chip opens then closes around the summary call.
+    expect(eventTypes).toContain('compacting:start');
+    expect(eventTypes).toContain('compacting:end');
+    expect(eventTypes.indexOf('compacting:start')).toBeLessThan(
+      eventTypes.indexOf('compacting:end'),
+    );
+  });
 });

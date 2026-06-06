@@ -2313,6 +2313,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         if (preCompact !== null && preCompact.blockedBy !== null) {
           return null;
         }
+        // Read pins BEFORE emitting compaction_started, so the
+        // started→finished pair has NO throwing statement between them: a DB
+        // error here would otherwise skip compaction_finished and leave the
+        // adapter-bracketed "Compacting context…" chip open until session:end.
+        // (CONTEXT_TUNING §12.4: pins preserved literally across the fold,
+        // else they elide with the middle and only reappear on resume.)
+        const pinnedBlock = formatPinnedBlock(getActivePinsBySession(config.db, sessionId));
         safeEmit(config.onEvent, {
           type: 'compaction_started',
           promptTokens,
@@ -2320,10 +2327,6 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           contextWindow,
         });
         const compactStart = Date.now();
-        // Preserve active pins literally across the fold (CONTEXT_TUNING
-        // §12.4) — otherwise the pin_context constraints get elided with
-        // the middle and only reappear on resume.
-        const pinnedBlock = formatPinnedBlock(getActivePinsBySession(config.db, sessionId));
         const compaction = await ctx.compact(config.provider, {
           preserveTail: budget.compactionPreserveTail,
           signal,

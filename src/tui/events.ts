@@ -654,6 +654,17 @@ export type ProviderWaitingStartEvent = BaseEvent & {
 export type ProviderWaitingEndEvent = BaseEvent & {
   type: 'provider:waiting:end';
 };
+// Live "Compacting context…" chip bracket. `compacting:start` is emitted when a
+// compaction begins — by /compact (operator-triggered) directly, and by
+// the harness adapter on the loop's `compaction_started` (auto). Cleared
+// by `compacting:end`. One bracket, both compaction surfaces, so the chip
+// renders identically whether the operator forced it or the threshold did.
+export type CompactingStartEvent = BaseEvent & {
+  type: 'compacting:start';
+};
+export type CompactingEndEvent = BaseEvent & {
+  type: 'compacting:end';
+};
 export type CheckpointCreateEvent = BaseEvent & {
   type: 'checkpoint:create';
   checkpointId: string;
@@ -865,6 +876,8 @@ export type UIEvent =
   | StepBudgetEvent
   | ProviderWaitingStartEvent
   | ProviderWaitingEndEvent
+  | CompactingStartEvent
+  | CompactingEndEvent
   | CheckpointCreateEvent
   | ScreenClearEvent
   | SlashUpdateEvent

@@ -43,6 +43,9 @@ export const compactCommand: SlashCommand = {
       // rewind vs a corrupted single source of truth.
       const snap = live.snapshot();
       try {
+        // Bracket the live "Compacting context…" chip around the summary call — the
+        // same chip the auto path shows. Paired with the :end in `finally`.
+        ctx.bus.emit({ type: 'compacting:start', ts: ctx.now() });
         const result = await live.compact(ctx.baseConfig.provider, {
           preserveTail: budget.compactionPreserveTail,
           // No turn in flight to abort against; a fresh, never-aborted
@@ -80,6 +83,8 @@ export const compactCommand: SlashCommand = {
           kind: 'error',
           message: `compaction failed (context unchanged): ${e instanceof Error ? e.message : String(e)}`,
         };
+      } finally {
+        ctx.bus.emit({ type: 'compacting:end', ts: ctx.now() });
       }
     };
 

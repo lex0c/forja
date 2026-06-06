@@ -44,6 +44,46 @@ const startedSession = (): LiveState => {
 // a coherent typing zone.
 const expectedRule = (cols: number, unicode: boolean): string => (unicode ? '─' : '-').repeat(cols);
 
+describe('compacting chip', () => {
+  test('renders the "Compacting context…" chip when state.compacting is set', () => {
+    const s: LiveState = { ...startedSession(), compacting: { startedAt: 0 } };
+    const out = composeLive(s, caps, 3000).join('\n');
+    expect(out).toContain('Compacting context…');
+  });
+
+  test('a live turn chip takes the slot over a stray compacting state', () => {
+    // compacting + a turn chip never coexist legitimately (a compaction
+    // runs between steps / with no turn). If a stray compacting state ever
+    // outlived its end event mid-turn, the real turn chip must still win —
+    // not a stale "Compacting context…" masking the live work.
+    const s: LiveState = {
+      ...startedSession(),
+      compacting: { startedAt: 0 },
+      thinking: { startedAt: 0, messageId: 'm1' },
+    };
+    const out = composeLive(s, caps, 3000).join('\n');
+    expect(out).not.toContain('Compacting context…');
+    const verbs = composeLive(s, caps, 3000)
+      .map(verbInLine)
+      .filter((v): v is string => v !== null);
+    expect(verbs.some((v) => COGNITIVE_VERB_POOL.includes(v))).toBe(true);
+  });
+
+  test('compacting loses the slot to its weakest neighbor, awaitingProvider', () => {
+    // compacting is LAST; awaitingProvider sits directly above it. This pins
+    // the exact position — a one-rank slip (compacting above awaiting) would
+    // surface here even though it'd sail through the thinking test above.
+    const s: LiveState = {
+      ...startedSession(),
+      compacting: { startedAt: 0 },
+      awaitingProvider: { stepN: 1, startedAt: 0 },
+    };
+    const out = composeLive(s, caps, 3000).join('\n');
+    expect(out).toContain('Awaiting model…');
+    expect(out).not.toContain('Compacting context…');
+  });
+});
+
 describe('composeLive layout', () => {
   // Bottom anchor (no modal): [..., rule_above, input(s), rule_below, footer].
   // Trailing 2 lines = rule + footer. Input occupies the N rows
