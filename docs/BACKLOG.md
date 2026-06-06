@@ -2,6 +2,19 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-05] compaction: robustness/reliability/efficiency audit + the two highest-severity fixes
+
+Full 4-angle audit of the compaction subsystem (not just the recent pin work). Happy-path is sound — tool-pair alignment can't split a `tool_use`/`tool_result`, re-compaction is bounded, post-compaction state/usage is correct. Fixed the two worst issues; the rest are recorded for a dedicated follow-up.
+
+**Fixed:**
+- **[P0] `messages` emptied on the `'skipped'` strategy** (`loop.ts`). `messages.length = 0; push(...compaction.messages)` aliased the input — `'skipped'` returns the SAME array, so clearing it first emptied the result and pushed nothing → `messages = []` → next provider call 400s the run. Reachable via `'cannot align tail'` / `'no middle'` (non-alternating history from resume/legacy DB). Guard: replace only when `compaction.messages !== messages`.
+- **[P1] Silent middle loss on a degenerate summary** (`compaction.ts`). The only gate was `text.length > 0`, so a markers-only / refusal / whitespace summary was accepted as an `'llm'` success and the entire middle dropped silently. Now rejects empty-after-marker-strip → falls back to deterministic elision (keeps the middle as pointers). Tests: markers-only + empty-text.
+
+**Pending (follow-up — NOT done this round):**
+- **Trigger gaps** (`loop.ts`): the threshold check runs only after tool_results, once per turn. A text-only turn (across runs), a resume's first call (up to 500 restored messages), and a huge tool_result that lands in the preserved tail can each overflow with no compaction chance. Fix = move the check to the top of the loop (before the provider call) — a loop refactor (PreCompact/`continue` semantics + timing) that deserves its own round with integration tests, not a rushed edit.
+- **`chars/4` token estimate under-counts CJK/dense text** → possible never-compact → overflow.
+- Tradeoffs/observability, documented not urgent: no hysteresis (thrash when goal+summary+pins+tail stays over threshold), prompt-cache invalidation on goal rewrite (largely inherent to merge-into-goal), uncapped summary input, replay non-determinism (LLM summary not persisted), `foldedCount` overstated on the fallback path.
+
 ## [2026-06-05] compaction: preserve active pins (pin_context survives mid-session, not just resume)
 
 Closing the gap found while answering "where does the model see the pins?": `pin_context` advertised "survives compaction", but `compaction.ts` was trimmed for M2 (*"No pinned context (M3+)"*) — so the first compaction elided the pin's tool_result and the constraint vanished until the next `--resume`. The description and the nudge I'd just added were aspirational.

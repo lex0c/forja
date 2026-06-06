@@ -3573,10 +3573,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               signal,
               ...(pinnedBlock !== undefined ? { pinnedBlock } : {}),
             });
-            // In-place replace so the caller's reference (none today,
-            // but defensive) sees the new history without reassignment.
-            messages.length = 0;
-            messages.push(...compaction.messages);
+            // In-place replace so the caller's reference (none today, but
+            // defensive) sees the new history without reassignment. Guard the
+            // identity: the 'skipped' strategy returns the SAME array, so
+            // clearing it first would empty the aliased result and push
+            // nothing — leaving messages = [] and 400ing the next call.
+            if (compaction.messages !== messages) {
+              messages.length = 0;
+              messages.push(...compaction.messages);
+            }
 
             // Compaction's LLM call (when it ran) is a billed provider
             // request — fold its usage into session totals. Skipping

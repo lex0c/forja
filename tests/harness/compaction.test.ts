@@ -696,7 +696,17 @@ describe('compactMessages — deterministic fallback', () => {
     });
     const result = await compactMessages(handle.provider, buildHistory(5), { preserveTail: 3 });
     expect(result.strategy).toBe('fallback');
-    expect(result.reason).toContain('empty summary');
+    expect(result.reason).toContain('empty or markers-only');
+  });
+
+  test('falls back when the summary is markers-only (silent-loss guard)', async () => {
+    // A model that emits only the markers (a refusal, or a degenerate
+    // response) must NOT be accepted as a successful summary that silently
+    // drops the whole middle — it falls back to deterministic elision.
+    const handle = mockProvider(() => replyText('[compacted_history]\n   \n[/compacted_history]'));
+    const result = await compactMessages(handle.provider, buildHistory(5), { preserveTail: 3 });
+    expect(result.strategy).toBe('fallback');
+    expect(result.reason).toContain('markers-only');
   });
 
   test('forwards abort signal through to the provider call', async () => {

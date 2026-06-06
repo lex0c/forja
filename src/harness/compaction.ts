@@ -443,8 +443,18 @@ export const compactMessages = async (
       const detail = attempt.errors.map((e) => `${e.code}: ${e.message}`).join('; ');
       throw new Error(`compaction stream errored: ${detail}`);
     }
-    if (attempt.text.length === 0) {
-      throw new Error('compaction produced empty summary');
+    // Reject an empty OR markers-only/whitespace summary. A length>0 gate
+    // alone accepts "[compacted_history]\n[/compacted_history]" (a refusal
+    // that emitted only the markers, or a degenerate response) as success and
+    // drops the whole middle silently. Strip our markers + trim; if nothing
+    // substantive remains, fall back to deterministic elision, which keeps the
+    // middle as pointers instead of losing it.
+    const summaryBody = stripAnsi(attempt.text)
+      .replaceAll(SUMMARY_MARKER_OPEN, '')
+      .replaceAll(SUMMARY_MARKER_CLOSE, '')
+      .trim();
+    if (summaryBody.length === 0) {
+      throw new Error('compaction summary is empty or markers-only');
     }
     return {
       messages: [wrapGoalWithSummary(goal, attempt.text, options.pinnedBlock), ...tailMessages],
