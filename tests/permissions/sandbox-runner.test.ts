@@ -2221,3 +2221,71 @@ describe('buildBwrapArgv — per-session /tmp (shared_tmp / sessionTmpDir)', () 
     expect(idxTmp).toBeGreaterThan(idxHost);
   });
 });
+
+describe('maybeWrapSandboxArgv — fail-closed on mid-session sandbox loss', () => {
+  test('failClosed + non-host profile + tool gone → throws (mid-session loss)', () => {
+    expect(() =>
+      maybeWrapSandboxArgv({
+        profile: 'cwd-rw',
+        cwd: CWD,
+        home: HOME,
+        innerArgv: INNER,
+        env: {},
+        platform: 'linux',
+        which: () => null, // bwrap vanished mid-session
+        exists: () => false, // canonical /usr/bin/bwrap gone too
+        realpath: (p) => p,
+        failClosed: true,
+      }),
+    ).toThrow(/unavailable mid-session/);
+  });
+
+  test('without failClosed → graceful passthrough (never-had host)', () => {
+    const argv = maybeWrapSandboxArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      platform: 'linux',
+      which: () => null,
+      exists: () => false,
+      realpath: (p) => p,
+      // failClosed omitted → default; keeps the degraded passthrough
+    });
+    expect(argv).toEqual([...INNER]);
+  });
+
+  test('failClosed but host profile → no throw (host returns early)', () => {
+    const argv = maybeWrapSandboxArgv({
+      profile: 'host',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      platform: 'linux',
+      which: () => null,
+      exists: () => false,
+      realpath: (p) => p,
+      failClosed: true,
+    });
+    expect(argv).toEqual([...INNER]);
+  });
+
+  test('failClosed but tool STILL available → wraps normally (no throw)', () => {
+    const argv = maybeWrapSandboxArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      platform: 'linux',
+      which: (n) => (n === 'bwrap' ? '/usr/bin/bwrap' : null),
+      exists: (p) => p === '/usr/bin/bwrap',
+      realpath: (p) => p,
+      pathExists: () => true,
+      failClosed: true,
+    });
+    expect(argv[0]).toBe('/usr/bin/bwrap');
+  });
+});

@@ -836,6 +836,16 @@ export interface MaybeWrapSandboxArgvOptions {
   // BuildBwrapArgvOptions.writableCacheDirs. Linux-only for now — the
   // macOS SBPL runner does not consume it yet (tracked for parity).
   writableCacheDirs?: readonly string[];
+  // Mid-session-loss posture (fail-closed). When `true`, a profile that
+  // requires a wrap (non-host) but finds NO resolvable sandbox tool is a
+  // LOSS (the tool was present at boot but vanished) and the helper THROWS
+  // instead of silently returning the unwrapped argv — so the degradation
+  // surfaces as a tool error (LLM + operator) rather than a quiet
+  // passthrough. Callers that never had the tool (boot in-process /
+  // unsupported platform) leave it false and keep the graceful passthrough.
+  // The broker passes `true` unconditionally (spawn mode ⟺ tool available
+  // at boot); bg/grep pass `true` only when a boot tool was recorded.
+  failClosed?: boolean;
 }
 
 // Resolve `innerArgv[0]` to an absolute path AT WRAP TIME using the
@@ -978,10 +988,22 @@ export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): stri
     }
   }
 
-  // No sandbox tool available — degraded passthrough. The engine's
-  // sandbox-plan stage is responsible for routing to host (or
-  // refusing) when sandboxing is required; this helper only
-  // enforces the wrap when both the profile AND the platform/
-  // tooling agree.
+  // No sandbox tool available. We only reach here with a non-host profile
+  // (host/undefined returned early above), so the planner DID want a wrap.
+  //
+  // fail-closed: when the caller knows a tool was available at boot
+  // (`failClosed`), this is a mid-session LOSS — refuse loudly so the
+  // degradation reaches the LLM/operator as a tool error, instead of
+  // silently running the command unsandboxed. The broker maps the throw to
+  // `sandbox wrap failed: …`; bg/grep surface it as their tool's error.
+  if (options.failClosed === true) {
+    throw new Error(
+      `sandbox: tool unavailable mid-session — profile '${profile}' requires isolation but no sandbox tool resolves now (it was available at boot); refusing to run unsandboxed`,
+    );
+  }
+  // Otherwise (tool never present / unsupported platform): degraded
+  // passthrough. The engine's sandbox-plan stage is responsible for
+  // refusing at boot when `[sandbox] required`; this helper only enforces
+  // the wrap when the profile AND the platform/tooling agree.
   return innerArgv.slice();
 };

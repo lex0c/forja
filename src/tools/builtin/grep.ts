@@ -144,6 +144,11 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
       // bootstrap mkdir failed (sandboxTmpdir is undefined; falls
       // back to pre-slice-156 blanket allow).
       ...(ctx.sandboxTmpdir !== undefined ? { tmpdir: ctx.sandboxTmpdir } : {}),
+      // fail-closed on mid-session loss when a tool was present at boot:
+      // refuse rather than run rg unsandboxed (which would read files
+      // without the credential HIDE_PATHS mask). The harness's invoke-tool
+      // catch turns the throw into this tool's error (LLM + operator).
+      failClosed: ctx.sandboxBootTool !== undefined,
     });
 
     let proc: ReturnType<typeof Bun.spawn>;

@@ -1426,7 +1426,12 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     if (input.brokerMode !== undefined) return input.brokerMode;
     return sandboxAvail.available ? 'spawn' : 'in-process';
   })();
-  const broker = constructBroker(resolvedBrokerMode, cwd, sandboxTmpdirHandle.tmpdir);
+  const broker = constructBroker(
+    resolvedBrokerMode,
+    cwd,
+    sandboxTmpdirHandle.tmpdir,
+    sandboxAvail.available,
+  );
 
   const config: HarnessConfig = {
     provider,
@@ -1637,6 +1642,13 @@ const constructBroker = (
   mode: 'in-process' | 'spawn',
   cwd: string,
   sandboxTmpdir: string | undefined,
+  // True iff a sandbox tool was available at boot. Drives the broker's
+  // fail-closed posture: in spawn mode with the tool present at boot, a
+  // non-host profile that can't resolve the tool now is a mid-session LOSS
+  // → throw (surfaces as a tool error) instead of silent passthrough. False
+  // when spawn was force-selected without a tool (`--broker spawn` on a host
+  // with no bwrap) — it never had one, so keep the graceful degrade.
+  sandboxAvailableAtBoot: boolean,
 ): Broker => {
   if (mode === 'spawn') {
     // Slice 103 (R6 #9): no `as SandboxProfile` cast. The TS
@@ -1671,6 +1683,11 @@ const constructBroker = (
         innerArgv,
         ...(sandboxTmpdir !== undefined ? { tmpdir: sandboxTmpdir } : {}),
         passthroughEnv: { FORJA_BROKER_WORKER: '1' },
+        // fail-closed on mid-session sandbox loss when the tool was present
+        // at boot. A non-host profile that can't wrap now → throw → broker
+        // maps to 'sandbox wrap failed' → tool error (LLM + operator see it)
+        // instead of a silent unsandboxed run.
+        failClosed: sandboxAvailableAtBoot,
       });
     // Slice 157 (phase 2): also overlay TMPDIR on the worker spawn's
     // env. The wrap above scopes WHERE the sandbox lets writes land;

@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-06] Sandbox: fail-closed em mid-session-loss (erro de tool, não passthrough silencioso)
+
+**Problema:** se o tool de sandbox (bwrap/sandbox-exec) sumisse DEPOIS do boot (modo spawn), `maybeWrapSandboxArgv` degradava pra passthrough **silencioso** — o comando rodava sem sandbox e o LLM não via nada (só o operador, via o `failure_event` `sandbox.mid_session_loss`, e mesmo esse só no bg path). Lacuna de observabilidade levantada na revisão (Opção A).
+
+**Decisão (operador):** fail-closed. Quando o tool ESTAVA disponível no boot mas não resolve agora (mid-session loss), `maybeWrapSandboxArgv` **lança** em vez de passthrough; o broker mapeia pra `sandbox wrap failed` → **erro de tool** (LLM + operador veem). Distingue "perdeu" de "nunca teve" (boot sem bwrap / `--broker spawn` forçado): só lança quando `failClosed` (= tool disponível no boot), senão mantém o passthrough degradado.
+
+Novo param `failClosed?` em `MaybeWrapSandboxArgvOptions` (throw no passthrough final, gated). Wiring nos 3 spawn paths: **broker** (`constructBroker(…, sandboxAvail.available)`; spawn-auto ⟺ available, mas respeita `--broker spawn` forçado sem tool), **bg** (`failClosed = sandboxBootTool !== undefined`; complementa o `probeSandboxLoss` que já auditava p/ o operador), **grep** (novo `ToolContext.sandboxBootTool` via `buildCtx` ← `config.sandboxBootTool`). Propagação reusa o que já existia: `invoke-tool` captura o throw do grep → toolError; o broker → `sandbox wrap failed`; `bash_background` já tem try/catch. Testes: cerne (loss→throw, never-had→passthrough, host→no-throw, still-available→wraps). typecheck + lint limpos; arquivos tocados verdes.
+
 ## [2026-06-06] Sandbox: caches persistentes (`~/.cache/forja`) + `/tmp` por sessão (default ON)
 
 **Problema:** todo exec-tagged tool call roda num worker sandboxed efêmero — `--tmpfs /tmp` + `--tmpfs` sobre os caches de build (`~/.cache`, `~/go/pkg/mod`, `~/.npm`). Logo: arquivos em `/tmp` somem entre tool-calls, e os caches de deps são zerados a cada call (`go build` recompila, npm/pip re-baixam). Sandbox 100% efêmero é seguro mas moe tempo/tokens em projeto real.

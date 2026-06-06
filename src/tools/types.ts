@@ -220,6 +220,12 @@ export interface ToolContext {
   // Plumbed by the harness from `HarnessConfig.sandboxTmpdir`. See
   // `PERMISSION_ENGINE.md §6.5` for the threat model.
   sandboxTmpdir?: string;
+  // Sandbox tool detected at boot ('bwrap'/'sandbox-exec'), or undefined if
+  // none was available. Plumbed from `HarnessConfig.sandboxBootTool`. Tools
+  // that spawn child processes use it to drive the wrap's `failClosed`: a
+  // tool present at boot but unresolvable now is a mid-session loss → fail
+  // closed (tool error) rather than a silent unsandboxed run.
+  sandboxBootTool?: 'bwrap' | 'sandbox-exec';
   // Recursion depth of the CURRENT run inside a subagent chain.
   // 0 (or unset) = top-level user session. The harness threads
   // this from `HarnessConfig.subagentDepth` so tools that spawn

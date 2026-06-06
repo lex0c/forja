@@ -2747,6 +2747,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // isolated by `bwrap --tmpfs /tmp`) or when bootstrap mkdir
           // failed (graceful fallback to pre-slice-156 behavior).
           ...(config.sandboxTmpdir !== undefined ? { sandboxTmpdir: config.sandboxTmpdir } : {}),
+          // Boot sandbox tool → drives the wrap's fail-closed posture in
+          // tools that spawn (grep): a tool present at boot but gone now is a
+          // mid-session loss → tool error, not a silent unsandboxed run.
+          ...(config.sandboxBootTool !== undefined
+            ? { sandboxBootTool: config.sandboxBootTool }
+            : {}),
           subagentDepth: config.subagentDepth ?? 0,
           // Cost budget tracker (spec ORCHESTRATION.md §3.5).
           // Returns the cumulative spend (parent self-cost +
