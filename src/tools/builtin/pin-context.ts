@@ -41,6 +41,20 @@ export interface PinContextOutput {
   kind: PinKind;
 }
 
+// True if `s` has a C0 control char or DEL, allowing only tab. Mirrors the
+// todolist guard (todo-shared.ts hasControlChar) — charCodeAt, not a regex,
+// so the source carries no literal control bytes. Rejected AT THE SOURCE
+// because a `\n` in pin text breaks the one-line-per-pin contract in BOTH
+// the resume block (resume-context.ts) and the compaction pin block.
+const hasControlChar = (s: string): boolean => {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 0x09) continue;
+    if (c < 0x20 || c === 0x7f) return true;
+  }
+  return false;
+};
+
 const validateInput = (args: PinContextInput): ToolResult<PinContextOutput> | null => {
   if (typeof args.text !== 'string' || args.text.length === 0) {
     return toolError(ERROR_CODES.invalidArg, 'text must be a non-empty string');
@@ -49,6 +63,12 @@ const validateInput = (args: PinContextInput): ToolResult<PinContextOutput> | nu
     return toolError(
       ERROR_CODES.invalidArg,
       `text must be ≤ ${PIN_TEXT_MAX_LENGTH} chars (got ${args.text.length})`,
+    );
+  }
+  if (hasControlChar(args.text)) {
+    return toolError(
+      ERROR_CODES.invalidArg,
+      'text must not contain control characters (newlines included) — a pin renders as one line',
     );
   }
   if (args.kind !== undefined) {

@@ -108,6 +108,15 @@ describe('pin_context tool: input validation', () => {
     expect(result.error_message).toContain('≤');
   });
 
+  test('rejects control characters (newline) in text', async () => {
+    // Same one-line-per-item contract the todolist enforces: a newline would
+    // break the pin block in both the resume and compaction paths.
+    const result = await pinContextTool.execute({ text: 'line one\nline two' }, newCtx());
+    if (!isToolError(result)) throw new Error('expected tool error');
+    expect(result.error_code).toBe('tool.invalid_arg');
+    expect(result.error_message).toContain('control character');
+  });
+
   test('rejects unknown kind', async () => {
     const result = await pinContextTool.execute(
       // biome-ignore lint/suspicious/noExplicitAny: invalid value test

@@ -2,6 +2,16 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-05] compaction: preserve active pins (pin_context survives mid-session, not just resume)
+
+Closing the gap found while answering "where does the model see the pins?": `pin_context` advertised "survives compaction", but `compaction.ts` was trimmed for M2 (*"No pinned context (M3+)"*) — so the first compaction elided the pin's tool_result and the constraint vanished until the next `--resume`. The description and the nudge I'd just added were aspirational.
+
+**Fix.** The loop reads active pins (`getActivePinsBySession`) before compacting and passes a pre-formatted block via `CompactionOptions.pinnedBlock`; `wrapGoalWithSummary` inserts it LITERALLY inside the `[compacted_history]` block, before the close marker. That placement buys two things: pins are never summarized (verbatim), and the next compaction's `stripPriorSummary` strips them as a unit with the summary — so re-compactions don't accumulate. The deterministic fallback (LLM failed) keeps the prior block without refreshing (degraded; pins return on the next LLM compaction or on resume).
+
+Now "survives compaction, re-injected with the goal, shows up in auto-rehydrate" holds on all three paths (compaction here; the wrapped goal message carries them; resume-context already did). Tests: pin preserved inside the markers, re-compaction strips OLD / keeps NEW, no-pins unchanged.
+
+**Review fixes (two corruption bugs the finders reproduced).** The first cut inserted the block with `String.replace(CLOSE, \`…${pinnedBlock}…\`)` — the string form interprets `$&` / `` $` `` in the model-authored pin text (a `$&` pin injected a spurious close marker; a `` $` `` pin deleted the summary), corrupting the goal and accumulating on re-compaction. And a pin whose text literally held `[/compacted_history]` closed the block early, breaking the strip. Fixed: insert via `slice`/`lastIndexOf` (no `$`-substitution; before the LAST close marker so a stray marker the summary LLM emitted can't misplace the pins), neutralize our markers in the pin text, and reject control chars in `pin_context` at the source (a `\n` breaks the one-line-per-pin contract in both the compaction and resume blocks — the guard the todolist already had). New tests: `$`-patterns, embedded markers, control-char rejection, fallback-with-pins, and that pins never reach the summary LLM. All green.
+
 ## [2026-06-05] task-discipline: nudge the model to use pin_context
 
 `pin_context` shipped available but unmentioned in the system prompt — the todolist is nudged in 3 places, the pin in 0 (a leftover from when it was omitted from the toolset, so the prompt never learned to incentivize it). Added one bullet to the task-discipline section: pin recurring constraints (an API that can't change shape, a step to always run before committing) so they survive compaction, instead of trusting they stay in context; not for one-shot facts; cross-session facts → `memory_write`. Trimmed the wording to keep the section under its ~3k-char budget (the cap is real — this section sits in cache breakpoint #1, read every turn). Net: the model now reaches for the pin proactively, not only when explicitly told.

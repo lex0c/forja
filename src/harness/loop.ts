@@ -50,7 +50,7 @@ import {
   reopenSession,
 } from '../storage/index.ts';
 import { listApprovalsLogBySessionRecent } from '../storage/repos/approvals-log.ts';
-import { createContextPinsStore } from '../storage/repos/context-pins.ts';
+import { createContextPinsStore, getActivePinsBySession } from '../storage/repos/context-pins.ts';
 import { createDispatchRewrite } from '../storage/repos/dispatch-rewrites.ts';
 import { getEagerProvenanceKeys, recordProvenance } from '../storage/repos/memory-provenance.ts';
 import { type SubagentHandleStore, createSubagentHandleStore } from '../subagents/handle-store.ts';
@@ -3554,9 +3554,24 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               contextWindow,
             });
             const compactStart = Date.now();
+            // Read active pins so compaction preserves them literally
+            // (CONTEXT_TUNING §12.4) — otherwise the pin_context tool's
+            // constraints get elided with the middle and only reappear on
+            // resume. Format mirrors the resume block (resume-context.ts):
+            // `[kind] text (model)`, with the marker for non-operator pins.
+            const activePins = getActivePinsBySession(config.db, sessionId);
+            const pinnedBlock =
+              activePins.length > 0
+                ? `Active pins (constraints still in force this session):\n${activePins
+                    .map(
+                      (p) => `  - [${p.kind}] ${p.text}${p.createdBy !== 'user' ? ' (model)' : ''}`,
+                    )
+                    .join('\n')}`
+                : undefined;
             const compaction = await compactMessages(config.provider, messages, {
               preserveTail: budget.compactionPreserveTail,
               signal,
+              ...(pinnedBlock !== undefined ? { pinnedBlock } : {}),
             });
             // In-place replace so the caller's reference (none today,
             // but defensive) sees the new history without reassignment.

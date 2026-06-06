@@ -23,7 +23,12 @@ import { CollectStepError, collectStep } from './collect.ts';
 //
 // Scope intentionally trimmed for M2 Step 3:
 //   - No PreCompact hook (hooks subsystem is M4).
-//   - No pinned context (M3+).
+//   - Active pins ARE preserved: the caller reads them from the store and
+//     passes a pre-formatted block (options.pinnedBlock) that is inserted
+//     literally into the [compacted_history] block. The deterministic
+//     fallback keeps whatever prior block the goal carried but does not
+//     refresh it (degraded path; pins reappear on the next LLM compaction
+//     or on resume).
 //   - No DB persistence of the synthetic summary message — replay
 //     re-reads the original messages from `messages` table and can
 //     re-compact if needed. Audit captures the event via the
@@ -46,6 +51,13 @@ export interface CompactionOptions {
   // Forwarded to the provider so a wall-clock timeout or user abort
   // interrupts the summary call mid-stream.
   signal?: AbortSignal;
+  // Pre-formatted block of active pins (CONTEXT_TUNING §12.4) the caller
+  // read from the store. Inserted LITERALLY inside the [compacted_history]
+  // block (never sent to the summary LLM), so pinned constraints survive
+  // compaction instead of being elided with the middle. Undefined ⇒ no
+  // active pins. Living inside the markers means the NEXT compaction
+  // strips it as a unit with the summary — no unbounded growth.
+  pinnedBlock?: string;
 }
 
 export type CompactionStrategy = 'llm' | 'fallback' | 'skipped';
@@ -289,7 +301,11 @@ const goalText = (goal: ProviderMessage): string => {
 //      preceding message to be `user`. Merging into the goal keeps
 //      `[user_goal+summary, assistant_first_tail, ...]` as a clean
 //      user→assistant→user→... sequence.
-const wrapGoalWithSummary = (goal: ProviderMessage, summary: string): ProviderMessage => {
+const wrapGoalWithSummary = (
+  goal: ProviderMessage,
+  summary: string,
+  pinnedBlock?: string,
+): ProviderMessage => {
   // Strip ANSI from the LLM-produced summary before it lands in the
   // model's context (and the audit log via the provider response
   // path). Compaction calls go through our trusted provider, but a
@@ -304,9 +320,29 @@ const wrapGoalWithSummary = (goal: ProviderMessage, summary: string): ProviderMe
   const hasMarkers =
     trimmed.includes(SUMMARY_MARKER_OPEN) && trimmed.includes(SUMMARY_MARKER_CLOSE);
   const body = hasMarkers ? trimmed : `${SUMMARY_MARKER_OPEN}\n${trimmed}\n${SUMMARY_MARKER_CLOSE}`;
+  // Active pins go INSIDE the block, before the close marker: preserved
+  // literally (never summarized), yet stripped as a unit by goalText on the
+  // next compaction, so they don't accumulate.
+  let withPins = body;
+  if (pinnedBlock !== undefined) {
+    // Neutralize our own markers in the (model- or untrusted-content-
+    // authored) pin text: a pin containing `[/compacted_history]` would
+    // prematurely close the block and break stripPriorSummary's OPEN..CLOSE
+    // match on the next compaction (corruption + unbounded accumulation).
+    const safePins = pinnedBlock
+      .replaceAll(SUMMARY_MARKER_OPEN, '(compacted_history)')
+      .replaceAll(SUMMARY_MARKER_CLOSE, '(/compacted_history)');
+    // Insert before the LAST close marker via slice — NOT String.replace,
+    // whose string form interprets $&/$`/$'/$$ in the pin text (a pin with
+    // "$&" would inject the matched marker; "$`" would delete the summary).
+    // Last (not first) so a stray marker the summary LLM emitted mid-text
+    // doesn't misplace the pins.
+    const close = body.lastIndexOf(SUMMARY_MARKER_CLOSE);
+    withPins = close >= 0 ? `${body.slice(0, close)}\n${safePins}\n${body.slice(close)}` : body;
+  }
   // goalText already strips any prior summary block, so this never
-  // accumulates: the wrap is always [original_goal]\n\n[latest summary].
-  return { role: 'user', content: `${goalText(goal)}\n\n${body}` };
+  // accumulates: the wrap is always [original_goal]\n\n[latest summary(+pins)].
+  return { role: 'user', content: `${goalText(goal)}\n\n${withPins}` };
 };
 
 export const compactMessages = async (
@@ -411,7 +447,7 @@ export const compactMessages = async (
       throw new Error('compaction produced empty summary');
     }
     return {
-      messages: [wrapGoalWithSummary(goal, attempt.text), ...tailMessages],
+      messages: [wrapGoalWithSummary(goal, attempt.text, options.pinnedBlock), ...tailMessages],
       strategy: 'llm',
       foldedCount: middle.length,
       usage: attemptUsage,
