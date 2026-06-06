@@ -556,10 +556,14 @@ describe('--resume flow', () => {
     // NOT mutate the DB — every appendMessage persists the
     // ORIGINAL turn. So a session that compacted heavily during
     // its run still has the full uncompacted log on disk; resume
-    // reloads it raw, gated only by MAX_RESUME_MESSAGES. Verify
-    // by simulating the post-compaction state (full DB log) and
-    // confirming resume runs the loop without crashing on the
-    // size discrepancy.
+    // reloads it raw, gated only by MAX_RESUME_MESSAGES. With the
+    // top-of-loop compaction trigger, resume then compacts that
+    // reloaded log BEFORE the first turn (context_window=1000, so the
+    // ~161-message history is over threshold) — the summary call is the
+    // mock's first script step, the real turn is the second — so the run
+    // stays under the window instead of shipping all ~161 messages.
+    // Verify it runs without crashing and the DB still grew by exactly
+    // the new turn (compaction is in-memory only, never persisted).
     const setupDb = openDb(dbPath);
     migrate(setupDb);
     const s = createSession(setupDb, { model: 'mock/m', cwd: workdir });
@@ -590,7 +594,9 @@ describe('--resume flow', () => {
     const code = await run({
       args: baseArgs({ prompt: 'final follow-up', resume: s.id }),
       bootstrapOverride: {
-        providerOverride: mockProvider([{ text: 'ack' }]),
+        // Two steps now: the top-of-loop trigger compacts the over-threshold
+        // resumed history first (summary call), then the real turn runs.
+        providerOverride: mockProvider([{ text: 'GOAL: compacted' }, { text: 'ack' }]),
         dbPath,
         cwd: workdir,
       },

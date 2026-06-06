@@ -2,6 +2,12 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-05] compaction trigger: hoisted to the top of the loop (the deferred audit follow-up)
+
+The audit (below) deferred the trigger fix as "a loop refactor that deserves its own round." Done. The compaction check now runs at the TOP of the loop (before every provider call) via an extracted `maybeCompact()` helper, instead of only after tool_results — closing the overflow gaps the audit found: a resumed session's first call (up to 500 restored messages), a turn that crosses the threshold without tool_results, and the start of each run are all covered now. One structural invariant ("every provider call is preceded by a compaction check") replaces two points that had to jointly cover everything. The PreCompact `continue` becomes return-and-proceed at the top; the overage `return finish` becomes a cost-cap detail the caller acts on.
+
+Lower risk than it looked: the trigger was already covered in integration (`hooks-blocking-events` Slice 4 forces it via `compactionThreshold: 0.01` and asserts `compaction_started` on allow / its absence on block — a PreCompact loop would hang that test). Added a resume test proving the new reach: an over-threshold resume emits `compaction_started` BEFORE the first `step_start`. A max-effort review (4 angles) confirmed the extraction is behavior-preserving and the test non-vacuous; for 100% rigor it surfaced one real behavior change — a blocked PreCompact no longer skips that turn's detector schedulers (intentional: they're independent of compaction; the old coupling was accidental) — now documented and pinned by tests (the blocked-PreCompact path doesn't short-circuit the turn; the resume actually shrinks the history, asserted on the post-compaction request, not just event ordering). Whole harness suite green (324). Still open: `chars/4` under-counting CJK (separate token-counter fix), and the documented tradeoffs (hysteresis, cache, replay).
+
 ## [2026-06-05] compaction: robustness/reliability/efficiency audit + the two highest-severity fixes
 
 Full 4-angle audit of the compaction subsystem (not just the recent pin work). Happy-path is sound — tool-pair alignment can't split a `tool_use`/`tool_result`, re-compaction is bounded, post-compaction state/usage is correct. Fixed the two worst issues; the rest are recorded for a dedicated follow-up.

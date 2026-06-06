@@ -338,6 +338,12 @@ describe('hooks Slice 4 — PreCompact', () => {
 
     expect(events.filter((e) => e.type === 'compaction_started')).toEqual([]);
     expect(events.filter((e) => e.type === 'compaction_finished')).toEqual([]);
+    // The `status === 'done'` assertion above IS the regression guard for the
+    // top-of-loop trigger: re-introducing a `continue` on a blocked PreCompact
+    // at the top would infinite-loop (steps never increments, so maxSteps never
+    // trips), the run would never reach 'done', and this test would hang. A
+    // separate step_start assert adds nothing — step_start already fires in
+    // iteration 1, before a block is even possible in iteration 2.
   });
 
   test('payload includes promptTokens + threshold', async () => {

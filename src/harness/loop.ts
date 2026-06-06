@@ -2305,6 +2305,104 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         }
       }
 
+      // Compaction check, factored out so it runs at the TOP of the loop —
+      // before EVERY provider call, not only after tool_results. That closes
+      // three overflow gaps the post-tool-result-only site left open: the
+      // first call of a resumed session (up to MAX_RESUME_MESSAGES restored),
+      // a turn that crosses the threshold without tool_results, and the start
+      // of each run. Returns a cost-cap detail when its own billed summary
+      // call pushed the cumulative total over the cap (caller must finish),
+      // else null. Mutates `messages` in place and folds usage into the run
+      // totals via closure.
+      const maybeCompact = async () => {
+        // Skip when aborted / budget exhausted / window unknown — don't burn
+        // a billed summary call whose result the loop is about to discard.
+        if (
+          signal.aborted ||
+          steps >= budget.maxSteps ||
+          config.provider.capabilities.context_window <= 0
+        ) {
+          return null;
+        }
+        const promptTokens = estimatePromptTokens(messages, {
+          ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
+          ...(tools.length > 0 ? { tools } : {}),
+        });
+        const contextWindow = config.provider.capabilities.context_window;
+        const triggerAt = budget.compactionThreshold * contextWindow;
+        // Need goal + something-to-fold + an assistant boundary for the tail;
+        // shorter histories make compactMessages skip (and emit noisy events).
+        if (!(promptTokens > triggerAt && messages.length >= budget.compactionPreserveTail + 3)) {
+          return null;
+        }
+        // PreCompact hook (blocking, spec §10.1) — fired before the
+        // compaction_started event so a refusing hook skips both the LLM call
+        // and the renderer's "compacting…" signal. Blocked ⇒ no compaction
+        // this turn; the loop proceeds with the un-compacted history and the
+        // next top-of-loop call re-checks (no continue — we're at the top, so
+        // returning simply falls through to the provider call). Deliberate vs
+        // the old post-tool-result site, whose `continue` ALSO skipped that
+        // turn's detector schedulers: the turn now runs normally, because the
+        // schedulers don't depend on compaction (that coupling was accidental).
+        const preCompact = await dispatchHooks({
+          schema: 'v1',
+          event: 'PreCompact',
+          sessionId,
+          data: { promptTokens, threshold: triggerAt },
+        });
+        if (preCompact !== null && preCompact.blockedBy !== null) {
+          return null;
+        }
+        safeEmit(config.onEvent, {
+          type: 'compaction_started',
+          promptTokens,
+          threshold: triggerAt,
+          contextWindow,
+        });
+        const compactStart = Date.now();
+        // Read active pins so compaction preserves them literally
+        // (CONTEXT_TUNING §12.4): otherwise the pin_context constraints get
+        // elided with the middle and only reappear on resume. Format mirrors
+        // the resume block (resume-context.ts): `[kind] text (model)`.
+        const activePins = getActivePinsBySession(config.db, sessionId);
+        const pinnedBlock =
+          activePins.length > 0
+            ? `Active pins (constraints still in force this session):\n${activePins
+                .map((p) => `  - [${p.kind}] ${p.text}${p.createdBy !== 'user' ? ' (model)' : ''}`)
+                .join('\n')}`
+            : undefined;
+        const compaction = await compactMessages(config.provider, messages, {
+          preserveTail: budget.compactionPreserveTail,
+          signal,
+          ...(pinnedBlock !== undefined ? { pinnedBlock } : {}),
+        });
+        // In-place replace; the 'skipped' strategy returns the SAME array, so
+        // only replace when it produced a new history (else length=0 empties
+        // the aliased result → messages=[] → next call 400s).
+        if (compaction.messages !== messages) {
+          messages.length = 0;
+          messages.push(...compaction.messages);
+        }
+        const compactionCost = computeCost(config.provider.capabilities, compaction.usage);
+        totalUsage = addUsage(totalUsage, compaction.usage);
+        totalCostUsd += compactionCost;
+        emitCostUpdate(compactionCost);
+        if (compaction.strategy !== 'skipped' && !compaction.usageSeen) {
+          usageComplete = false;
+        }
+        const finishedEvent: HarnessEvent = {
+          type: 'compaction_finished',
+          strategy: compaction.strategy,
+          foldedCount: compaction.foldedCount,
+          durationMs: Date.now() - compactStart,
+          usage: compaction.usage,
+          costUsd: compactionCost,
+          ...(compaction.reason !== undefined ? { reason: compaction.reason } : {}),
+        };
+        safeEmit(config.onEvent, finishedEvent);
+        return costCapDetailIfExceeded();
+      };
+
       while (true) {
         if (signal.aborted) {
           return isWallClockTimeout()
@@ -2333,6 +2431,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         {
           const overage = costCapDetailIfExceeded();
           if (overage !== null) return await finish('maxCostUsd', overage);
+        }
+
+        // Compact BEFORE the provider call when over threshold (see
+        // maybeCompact above). Runs every iteration, so it covers the first
+        // call of a resumed/long session — the post-tool-result-only site
+        // missed it, sending one over-window request that 400s.
+        {
+          const compactOverage = await maybeCompact();
+          if (compactOverage !== null) return await finish('maxCostUsd', compactOverage);
         }
 
         steps += 1;
@@ -3484,145 +3591,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         lastMessageId = resultMsg.id;
         messages.push({ role: 'user', content: toolResults });
 
-        // Compaction trigger check. Estimate the FULL outbound prompt
-        // — messages + system + tool schemas — against the threshold.
-        // Tool schemas alone run 2-4k tokens each per CONTEXT_TUNING.md
-        // §2.1; a long system prompt adds another 0.5-3k. Counting only
-        // `messages` undercounts the trigger and lets the next request
-        // sail over the cap when the surrounding overhead is what's
-        // pushing it close.
-        //
-        // estimatePromptTokens is the local chars/4 heuristic: free
-        // (no HTTP), conservative (overestimates by ~10-25% vs real
-        // tokenizers), good enough for a 70%-of-window threshold that
-        // already includes a buffer.
-        //
-        // DB messages stay untouched; only the in-memory `messages`
-        // array sent to the provider gets rewritten. Audit + replay can
-        // re-derive from the full history if they ever need a different
-        // compaction policy.
-        // Skip when the budget is exhausted: compaction would issue a
-        // billed summary call right before the loop's top-of-iteration
-        // check exits with `maxSteps` anyway. Same logic as the
-        // signal.aborted guard — don't burn tokens on work whose
-        // result will never be used.
-        if (
-          !signal.aborted &&
-          steps < budget.maxSteps &&
-          config.provider.capabilities.context_window > 0
-        ) {
-          const promptTokens = estimatePromptTokens(messages, {
-            ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
-            ...(tools.length > 0 ? { tools } : {}),
-          });
-          const contextWindow = config.provider.capabilities.context_window;
-          const triggerAt = budget.compactionThreshold * contextWindow;
-          // Guard: requires at least goal + something-to-fold + an
-          // assistant boundary for the tail. compactMessages will skip
-          // (and emit a noisy started/finished pair) for shorter
-          // histories; check here so we don't fire the events at all.
-          // `+ 2` accounts for the assistant-boundary alignment the
-          // module performs — naive `1 + tail` could pass even when
-          // the alignment shift collapses the middle to empty.
-          if (promptTokens > triggerAt && messages.length >= budget.compactionPreserveTail + 3) {
-            // PreCompact hook chain (spec AGENTIC_CLI.md §10.1,
-            // blocking). Fired BEFORE the compaction_started event
-            // so an operator hook that refuses compaction (e.g.,
-            // policy: preserve full transcript for audit) skips
-            // both the LLM call AND the renderer's "compacting…"
-            // signal — the operator's intent is the compaction
-            // never happened. block_silent / block_message both
-            // skip; failClosed error/timeout same. fail-open on
-            // dispatch error per spec line 1057.
-            const preCompact = await dispatchHooks({
-              schema: 'v1',
-              event: 'PreCompact',
-              sessionId,
-              data: { promptTokens, threshold: triggerAt },
-            });
-            if (preCompact !== null && preCompact.blockedBy !== null) {
-              // Skip compaction this turn. Loop continues with the
-              // un-compacted message list; if tokens still over
-              // threshold next turn, the hook fires again. The
-              // hook_runs row is the audit trail.
-              continue;
-            }
-            safeEmit(config.onEvent, {
-              type: 'compaction_started',
-              promptTokens,
-              threshold: triggerAt,
-              contextWindow,
-            });
-            const compactStart = Date.now();
-            // Read active pins so compaction preserves them literally
-            // (CONTEXT_TUNING §12.4) — otherwise the pin_context tool's
-            // constraints get elided with the middle and only reappear on
-            // resume. Format mirrors the resume block (resume-context.ts):
-            // `[kind] text (model)`, with the marker for non-operator pins.
-            const activePins = getActivePinsBySession(config.db, sessionId);
-            const pinnedBlock =
-              activePins.length > 0
-                ? `Active pins (constraints still in force this session):\n${activePins
-                    .map(
-                      (p) => `  - [${p.kind}] ${p.text}${p.createdBy !== 'user' ? ' (model)' : ''}`,
-                    )
-                    .join('\n')}`
-                : undefined;
-            const compaction = await compactMessages(config.provider, messages, {
-              preserveTail: budget.compactionPreserveTail,
-              signal,
-              ...(pinnedBlock !== undefined ? { pinnedBlock } : {}),
-            });
-            // In-place replace so the caller's reference (none today, but
-            // defensive) sees the new history without reassignment. Guard the
-            // identity: the 'skipped' strategy returns the SAME array, so
-            // clearing it first would empty the aliased result and push
-            // nothing — leaving messages = [] and 400ing the next call.
-            if (compaction.messages !== messages) {
-              messages.length = 0;
-              messages.push(...compaction.messages);
-            }
-
-            // Compaction's LLM call (when it ran) is a billed provider
-            // request — fold its usage into session totals. Skipping
-            // this would systematically underreport spend on every
-            // compacting session, defeating the whole point of the
-            // per-session cost tracking. The 'skipped' strategy never
-            // made a call so contributes zero (emptyUsage); 'fallback'
-            // contributes whatever partial usage arrived before the
-            // failure (some providers emit usage on stream errors).
-            const compactionCost = computeCost(config.provider.capabilities, compaction.usage);
-            totalUsage = addUsage(totalUsage, compaction.usage);
-            totalCostUsd += compactionCost;
-            emitCostUpdate(compactionCost);
-            // If the compaction call MADE a provider request (llm or
-            // fallback strategy) but didn't see usage telemetry, the
-            // session total is now a lower bound — same conservative
-            // logic as the per-turn check.
-            if (compaction.strategy !== 'skipped' && !compaction.usageSeen) {
-              usageComplete = false;
-            }
-
-            const finishedEvent: HarnessEvent = {
-              type: 'compaction_finished',
-              strategy: compaction.strategy,
-              foldedCount: compaction.foldedCount,
-              durationMs: Date.now() - compactStart,
-              usage: compaction.usage,
-              costUsd: compactionCost,
-              ...(compaction.reason !== undefined ? { reason: compaction.reason } : {}),
-            };
-            safeEmit(config.onEvent, finishedEvent);
-
-            // Compaction's billed call can push the cumulative
-            // total past the cap on its own. Check after the
-            // event is emitted (renderers should still see the
-            // compaction_finished event) but before the next
-            // top-of-loop iteration would issue a provider call.
-            const overage = costCapDetailIfExceeded();
-            if (overage !== null) return await finish('maxCostUsd', overage);
-          }
-        }
+        // Compaction now runs at the TOP of the loop (maybeCompact, before
+        // every provider call) — see above. No post-tool-result trigger here
+        // anymore: the next iteration's top-of-loop check folds whatever this
+        // turn's tool_results just added, and the single site keeps "every
+        // provider call is preceded by a compaction check" structural.
 
         // S11/S13/S3 — detector scheduler ticks at step boundary
         // (MEMORY.md §11.x / T11.9 + T13.x + S3.4). Each scheduler

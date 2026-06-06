@@ -704,6 +704,58 @@ describe('runAgent', () => {
     expect(session?.totalCostUsd).toBeCloseTo(0.0006, 9);
   });
 
+  test('resume over threshold compacts BEFORE the first turn (top-of-loop trigger)', async () => {
+    // Run #1 builds an 8-message history (userPrompt + 3 tool turns + a text
+    // turn). Run #2 resumes it with a tiny window + low threshold, so the
+    // RESTORED history is already over threshold: maybeCompact must fire at the
+    // top of the loop, before the first turn's provider call. The old
+    // post-tool-result-only trigger missed this — the first call shipped the
+    // full restored history and would 400 on a real provider.
+    const first = buildConfig([
+      { tool_uses: [{ id: 't1', name: 'echo', input: { msg: 'a' } }], stop_reason: 'tool_use' },
+      { tool_uses: [{ id: 't2', name: 'echo', input: { msg: 'b' } }], stop_reason: 'tool_use' },
+      { tool_uses: [{ id: 't3', name: 'echo', input: { msg: 'c' } }], stop_reason: 'tool_use' },
+      { text: 'done', stop_reason: 'end_turn' },
+    ]);
+    const r1 = await runAgent(first.config);
+    expect(r1.status).toBe('done');
+
+    const events: string[] = [];
+    const second = buildConfig(
+      [
+        { text: 'GOAL: x\nDECISIONS: y', stop_reason: 'end_turn' }, // consumed by the summary call
+        { text: 'ok', stop_reason: 'end_turn' }, // the actual turn
+      ],
+      // preserveTail pinned so the shrink assertion below is deterministic
+      // regardless of the default K (a large default would collapse the middle
+      // and make compactMessages 'skip', leaving the history un-shrunk).
+      {
+        capsOverride: { context_window: 100 },
+        budget: { compactionThreshold: 0.01, compactionPreserveTail: 2 },
+      },
+    );
+    const r2 = await runAgent({
+      ...second.config,
+      resumeFromSessionId: r1.sessionId,
+      onEvent: (e) => {
+        events.push(e.type);
+      },
+    });
+    expect(r2.status).toBe('done');
+    const startedAt = events.indexOf('compaction_started');
+    const firstStepAt = events.indexOf('step_start');
+    expect(startedAt).toBeGreaterThanOrEqual(0); // compaction happened on resume
+    expect(startedAt).toBeLessThan(firstStepAt); // and BEFORE the first turn
+    // Correctness, not just ordering: the compaction actually shrank the
+    // history the first real turn sees — the post-compaction request carries
+    // far fewer messages than the ~9 restored (8 persisted + the new prompt).
+    // This is also the "first call has no prior tool_result this run" case the
+    // old post-tool-result-only trigger could never reach.
+    const turnReq = second.handle.requests.at(-1);
+    if (turnReq === undefined) throw new Error('expected a post-compaction request');
+    expect(turnReq.messages.length).toBeLessThan(8);
+  });
+
   test('budget.maxCostUsd: cumulative across resume (prior cost counts)', async () => {
     // Resume contract: session row stores cumulative cost; cap
     // compares against priorCostUsd + totalCostUsd. A session that
