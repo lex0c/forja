@@ -114,6 +114,8 @@ const SUMMARY_MARKER_CLOSE = '[/compacted_history]';
 // it saves.
 const COMPACTION_SYSTEM_PROMPT = `You are summarizing a long conversation between a user and an autonomous coding agent. Your output replaces the middle turns of the transcript so the model can continue without losing critical context. The next agent turn reads this block in place of those messages — anything not preserved here will be re-investigated next turn (extra grep / read / test calls), so prefer concrete pointers (file:line, symbol names, exact error strings) over prose. Every word costs tokens the agent could use to keep working.
 
+Preserve facts exactly as established — copy names, paths, line numbers, and error strings verbatim from the transcript; do not rewrite, generalize, or infer beyond what was stated. When unsure whether a detail matters, keep it: a dropped fact costs a full re-investigation next turn, a kept one costs a few tokens.
+
 Output ONLY the following structured block, nothing else:
 
 ${SUMMARY_MARKER_OPEN}

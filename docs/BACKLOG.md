@@ -2,6 +2,10 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-06] Compaction prompt: reinforce factual fidelity
+
+The compaction summary's real failure mode isn't dropping a turn — it's the model "improving" an established fact until it's subtly wrong (paraphrasing a path, generalizing a decision, inferring a detail never stated), which the next turn then trusts. Added a fidelity paragraph to `COMPACTION_SYSTEM_PROMPT`: copy names/paths/line-numbers/error-strings verbatim, no rewrite/generalize/infer, keep-when-unsure (reconciled with the existing "every word costs tokens" so it doesn't inflate). Conservative — touches prose, not the structured block the tests assert. Caveat: no compaction-QUALITY eval exists (only structural tests), so the gain is reasoned, not measured — a real eval (do key facts survive the fold?) is the next worthwhile step.
+
 ## [2026-06-06] Live "Compacting context…" chip during compaction
 
 Compaction (auto past the threshold, or manual `/compact`) gave no live feedback — the REPL went quiet for the seconds the summary call took, no spinner, indistinguishable from a hang.
