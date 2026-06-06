@@ -12,9 +12,7 @@ import { memoryReadTool } from './memory-read.ts';
 import { memorySearchTool } from './memory-search.ts';
 import { memoryWriteTool } from './memory-write.ts';
 import { monitorTool } from './monitor.ts';
-// pinContextTool is re-exported (line ~52) but intentionally not
-// imported here — see the BUILTIN_TOOLS comment for why it is
-// omitted from the default registry.
+import { pinContextTool } from './pin-context.ts';
 import { readFileTool } from './read-file.ts';
 import { retrieveContextTool } from './retrieve-context.ts';
 import { skillInvokeTool } from './skill-invoke.ts';
@@ -109,15 +107,9 @@ export type { WriteFileInput, WriteFileOutput } from './write-file.ts';
 // other write tools because it persists to disk and is gated by
 // the operator confirm modal.
 //
-// pinContextTool is intentionally OMITTED from BUILTIN_TOOLS while
-// the `confirmPinContext` modal callback is not yet wired through
-// the REPL (ModalManager.askPinContext + bus event + renderer are
-// the deferred UI slice noted in the Phase 1.1.b/c BACKLOG entries).
-// Without the callback, every invocation returns `pin.headless_mode`
-// — surfacing the tool to the model would waste a turn proposing
-// something that always errors. The export below is preserved so the
-// tool test suite still exercises the contract and the harness can
-// re-add to BUILTIN_TOOLS in one line when the modal lands.
+// pinContextTool sits with the write tools — it persists to SQLite
+// (context_pins). No modal: the model pins directly and the store
+// ring-buffers at PIN_CAP (oldest evicted), same shape as the todolist.
 export const BUILTIN_TOOLS = [
   readFileTool,
   globTool,
@@ -148,6 +140,7 @@ export const BUILTIN_TOOLS = [
   writeFileTool,
   editFileTool,
   memoryWriteTool,
+  pinContextTool,
   bashTool,
   bashBackgroundTool,
   bashOutputTool,

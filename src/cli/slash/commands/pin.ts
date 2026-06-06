@@ -6,13 +6,13 @@
 //   /pin --remove <id>                              remove a pin
 //   /pin --help                                     show usage
 //
-// Direct-user action: /pin is operator-typed, so it persists WITHOUT
-// going through a confirmation modal. The model-facing equivalent
-// is the `pin_context` tool (1.1.b) which always opens a confirm
-// modal — that's the surface §12.4.1 names "idêntico a memory
-// writes." Splitting the two surfaces means `created_by` carries
-// who originated the pin (operator → `user` here; model → `model_
-// proposed_user_approved` from the tool).
+// Direct-user action: /pin is operator-typed. The model-facing
+// equivalent is the `pin_context` tool, which also pins directly (no
+// modal). Splitting the two surfaces means `created_by` carries who
+// originated the pin: operator → `user` here; model → `model` from
+// the tool. Both share one store, so both ring-buffer at PIN_CAP — a
+// create past the cap evicts the oldest active pin (we surface that
+// to the operator as a note below).
 //
 // Notes on parsing:
 //   - The shared slash parser (src/cli/slash/parse.ts) splits on
@@ -36,7 +36,6 @@ import {
   PIN_CAP,
   PIN_KINDS,
   PIN_TEXT_MAX_LENGTH,
-  PinCapExceededError,
   type PinKind,
   parseDuration,
 } from '../../../storage/repos/context-pins.ts';
@@ -342,6 +341,10 @@ const handleCreate = (
     }
   }
 
+  // The store ring-buffers at PIN_CAP: a create past the cap evicts the
+  // oldest active pin rather than refusing. Count BEFORE so we can tell the
+  // operator their oldest pin was dropped — createPin evicts silently.
+  const before = store.countActivePinsBySession(sessionId, nowMs);
   try {
     const pin = store.createPin({
       sessionId,
@@ -350,25 +353,24 @@ const handleCreate = (
       createdBy: 'user',
       ...(expiresAt !== null ? { expiresAt } : {}),
       createdAt: nowMs,
-      // Anchor the cap check at the same wall-clock the
-      // expiry math above used so the "expired pins don't
-      // count" semantics behave consistently in a single call.
+      // Anchor the cap check at the same wall-clock the expiry math
+      // above used so the "expired pins don't count" semantics behave
+      // consistently in a single call.
       now: nowMs,
     });
     const remaining = store.countActivePinsBySession(sessionId, nowMs);
+    const note = `pinned ${shortId(pin.id)} [${pin.kind}] (${remaining}/${PIN_CAP} active): ${pin.text}`;
     return {
       kind: 'ok',
-      notes: [
-        `pinned ${shortId(pin.id)} [${pin.kind}] (${remaining}/${PIN_CAP} active): ${pin.text}`,
-      ],
+      notes:
+        before >= PIN_CAP
+          ? [
+              note,
+              `cap ${PIN_CAP} reached — dropped the oldest pin to make room; use /pin --remove <id> to choose what to drop next time`,
+            ]
+          : [note],
     };
   } catch (err) {
-    if (err instanceof PinCapExceededError) {
-      return {
-        kind: 'error',
-        message: `/pin: cap reached (${err.currentCount}/${PIN_CAP}); remove one first via /pin --remove <id>`,
-      };
-    }
     if (err instanceof InvalidPinError) {
       return { kind: 'error', message: `/pin: ${err.message}` };
     }

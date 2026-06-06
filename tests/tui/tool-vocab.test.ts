@@ -19,6 +19,7 @@ describe('tool-vocab', () => {
       'memory_search',
       'memory_write',
       'monitor',
+      'pin_context',
       'read_file',
       'task',
       'todo_clear',

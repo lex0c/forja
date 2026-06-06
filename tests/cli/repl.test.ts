@@ -11,7 +11,12 @@ import {
   runRepl,
   sanitizeForSubagentDisplay,
 } from '../../src/cli/repl.ts';
-import type { HarnessConfig, HarnessEvent, HarnessResult } from '../../src/harness/index.ts';
+import type {
+  HarnessConfig,
+  HarnessEvent,
+  HarnessResult,
+  SessionContext,
+} from '../../src/harness/index.ts';
 import { DEFAULT_BUDGET } from '../../src/harness/types.ts';
 import { type PermissionEngine, createPermissionEngine } from '../../src/permissions/index.ts';
 import { openMemoryDb } from '../../src/storage/db.ts';
@@ -1358,6 +1363,101 @@ describe('repl — boot + smoke', () => {
     expect(ra.captured).toHaveLength(2);
     expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('second');
     expect(ra.captured[1]?.configs[0]?.resumeFromSessionId).toBe('sess-1');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('turn 2 reuses the live context from turn 1 (not resumeFromSessionId)', async () => {
+    // Compact-once-reuse end to end: when turn 1's result carries a live
+    // SessionContext, the REPL holds it and passes it as turn 2's
+    // sessionContext — NOT resumeFromSessionId. That's what stops the
+    // per-turn re-derive + re-compact.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    stdin.feed('first\r');
+    await tick();
+    // Turn 1 finishes carrying a live context.
+    const liveCtx = { sessionId: 'sess-1' } as unknown as SessionContext;
+    ra.finish(0, { sessionContext: liveCtx });
+    await tick();
+    stdin.feed('second\r');
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    const turn2Cfg = ra.captured[1]?.configs[0];
+    expect(turn2Cfg?.sessionContext).toBe(liveCtx); // reused, not re-derived
+    expect(turn2Cfg?.resumeFromSessionId).toBeUndefined(); // fallback NOT taken
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a message queued during /compact drains when it finishes (inbox not wedged)', async () => {
+    // Regression: /compact runs under runExclusive (compacting=true). A
+    // message typed while it runs queues in the inbox; when /compact
+    // finishes the finalizer must drain it — otherwise it sits queued
+    // forever (input wedged after /compact).
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    stdin.feed('first\r');
+    await tick();
+    // Turn 1 finishes with a live context whose compact() we can pause.
+    let resolveCompact!: () => void;
+    const compactGate = new Promise<void>((r) => {
+      resolveCompact = r;
+    });
+    const liveCtx = {
+      sessionId: 'sess-1',
+      length: 10,
+      snapshot: () => ({ sessionId: 'sess-1', messages: [], lastMessageId: '' }),
+      restore: () => {},
+      compact: async () => {
+        await compactGate;
+        return {
+          messages: [],
+          strategy: 'llm',
+          foldedCount: 5,
+          usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+          usageSeen: true,
+        };
+      },
+    } as unknown as SessionContext;
+    ra.finish(0, { sessionContext: liveCtx });
+    await tick();
+    // /compact holds the busy lock; the typed question queues.
+    stdin.feed('/compact\r');
+    await tick();
+    stdin.feed('a question while compacting\r');
+    await tick();
+    expect(ra.captured).toHaveLength(1); // queued, not started — still compacting
+    // Compaction finishes → finalizer drains the inbox → the question runs.
+    resolveCompact();
+    await tick();
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.userPrompt).toContain('a question while compacting');
     ra.finish(1);
     await tick();
     stdin.feed('\x04');

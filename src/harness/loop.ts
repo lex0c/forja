@@ -27,7 +27,6 @@ import { addUsage, computeCost, emptyUsage } from '../providers/cost.ts';
 import type {
   GenerateRequest,
   ProviderContentBlock,
-  ProviderMessage,
   ProviderToolDef,
   ProviderToolResultBlock,
   ProviderToolUseBlock,
@@ -40,16 +39,19 @@ import { buildRetrievalRunner } from '../retrieval/index.ts';
 import { redactSecrets } from '../sanitize/secrets.ts';
 import {
   type SessionStatus,
-  appendMessage,
   completeSession,
   createSession,
   getSession,
   insertCostProgressEvent,
   insertSubagentGateDecision,
-  listMessageTailBySession,
   reopenSession,
 } from '../storage/index.ts';
 import { listApprovalsLogBySessionRecent } from '../storage/repos/approvals-log.ts';
+import {
+  createContextPinsStore,
+  formatPinnedBlock,
+  getActivePinsBySession,
+} from '../storage/repos/context-pins.ts';
 import { createDispatchRewrite } from '../storage/repos/dispatch-rewrites.ts';
 import { getEagerProvenanceKeys, recordProvenance } from '../storage/repos/memory-provenance.ts';
 import { type SubagentHandleStore, createSubagentHandleStore } from '../subagents/handle-store.ts';
@@ -60,16 +62,12 @@ import type { ToolContext } from '../tools/index.ts';
 import type { SpawnSubagentArgs, SpawnSubagentResult } from '../tools/types.ts';
 import { StepStallError, abortableIterable, stallWatchdog } from './abortable.ts';
 import { CollectStepError, type CollectedToolUse, collectStep } from './collect.ts';
-import { compactMessages } from './compaction.ts';
+import { accountCompaction } from './compaction.ts';
 import { resolveProviderEffort } from './effort.ts';
 import { invokeTool } from './invoke-tool.ts';
-import {
-  ALIGNMENT_FETCH_MARGIN,
-  MAX_RESUME_MESSAGES,
-  STRANDED_TURN_PLACEHOLDER,
-  messagesToProviderMessages,
-} from './resume.ts';
+import { MAX_RESUME_MESSAGES } from './resume.ts';
 import { DEFAULT_RETRY, generateWithRetry } from './retry.ts';
+import { type HydrateInfo, SessionContext } from './session-context.ts';
 import {
   type ExitReason,
   type HarnessConfig,
@@ -221,7 +219,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   const callerSignal = config.signal ?? new AbortController().signal;
   const signal = AbortSignal.any([callerSignal, wallClockController.signal]);
 
-  const messages: ProviderMessage[] = [];
+  // Single in-memory source of truth for this run's conversation
+  // (project_message_single_source). Resolved in the session-decision
+  // block below — reused (REPL multi-turn), hydrated from the DB log
+  // (resume/preassigned), or fresh. `| undefined` only until that
+  // block runs; a guard right after it narrows the rest of the loop.
+  let ctx: SessionContext | undefined;
+  // Resume-truncation diagnostics captured by hydrateFromDb (resume path).
+  let hydrateInfo: HydrateInfo | null = null;
   const tools = buildToolDefs(config);
   const recentToolHashes: string[] = [];
   const HASH_WINDOW = 5;
@@ -241,7 +246,6 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // markers (package.json, Cargo.toml, etc.) live at the repo root,
   // not in arbitrary subdirectories.
   const repoRoot = resolveRepoRoot(config.cwd);
-  let lastMessageId = '';
   // Session-scoped bg manager. Created lazily after createSession
   // so the manager can record the right session_id on every spawn.
   // Stays undefined when no bgLogDir is configured — bg tools will
@@ -321,6 +325,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     nextId: (sid) => baseTodoStore.nextId(sid),
     clear: (sid) => baseTodoStore.clear(sid),
   };
+  // Like the todo store: the REPL injects a contextPinsStore so /pin and
+  // pin_context share one; a one-shot run gets a fresh wrapper over the same
+  // db. Built once per run (the store is stateless over the db) and reused in
+  // buildCtx, rather than re-wrapping on every tool call.
+  const contextPinsStore = config.contextPinsStore ?? createContextPinsStore(config.db);
   // Per-run totals. Each completed provider turn adds its usage and
   // its computed cost; HarnessResult.usage / costUsd report THIS
   // RUN's numbers — caller telemetry that has to stay self-
@@ -633,8 +642,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       usage: totalUsage,
       costUsd: totalCostUsd,
       usageComplete,
-      lastMessageId,
+      // ctx is undefined only if init failed before the session-
+      // decision block resolved it (early internalError) — keep the
+      // pre-ctx '' so that path's result shape is unchanged.
+      lastMessageId: ctx !== undefined ? ctx.getLastMessageId() : '',
     };
+    // Hand the live context back so a multi-turn caller (REPL) reuses
+    // it next turn instead of re-deriving from the DB log.
+    if (ctx !== undefined) result.sessionContext = ctx;
     if (detail !== undefined) result.detail = detail;
     if (reason === 'aborted' && abortCause !== undefined) {
       result.abortCause = abortCause;
@@ -868,16 +883,37 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // resume call is negligible.
       const resumeId = config.resumeFromSessionId;
       const preassignedId = config.preassignedSessionId;
-      if (resumeId !== undefined && preassignedId !== undefined) {
-        // Defense in depth: the two paths are mutually exclusive —
-        // resume reopens an existing finalized session, preassigned
-        // uses a freshly-created row the caller built. Setting both
-        // is a programmer bug, fail loud rather than guess intent.
+      const liveCtx = config.sessionContext;
+      // Mutually exclusive: a live context (REPL reuse) skips all DB
+      // derivation; resume reopens a finalized session; preassigned
+      // uses a caller-created row. More than one set is a programmer
+      // bug — fail loud rather than guess intent.
+      if ([liveCtx, resumeId, preassignedId].filter((x) => x !== undefined).length > 1) {
         throw new Error(
-          'HarnessConfig: resumeFromSessionId and preassignedSessionId are mutually exclusive',
+          'HarnessConfig: sessionContext, resumeFromSessionId, and preassignedSessionId are mutually exclusive',
         );
       }
-      if (resumeId !== undefined) {
+      if (liveCtx !== undefined) {
+        // Reuse path (REPL multi-turn): the caller owns a live,
+        // already-compacted context — NO hydrate. Still reopen + carry
+        // cumulative cost exactly like resume, so this turn's
+        // completeSession sees a 'running' row and the lifetime total
+        // stays correct across turns.
+        const existing = getSession(config.db, liveCtx.sessionId);
+        if (existing === null) {
+          throw new Error(`sessionContext refers to unknown session ${liveCtx.sessionId}`);
+        }
+        if (existing.cwd !== config.cwd) {
+          throw new Error(
+            `sessionContext session ${liveCtx.sessionId}: cwd '${existing.cwd}' != config cwd '${config.cwd}'`,
+          );
+        }
+        priorCostUsd = existing.totalCostUsd;
+        priorUsageComplete = existing.usageComplete;
+        reopenSession(config.db, liveCtx.sessionId);
+        sessionId = liveCtx.sessionId;
+        ctx = liveCtx;
+      } else if (resumeId !== undefined) {
         const existing = getSession(config.db, resumeId);
         if (existing === null) {
           throw new Error(`session ${resumeId} not found`);
@@ -907,6 +943,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         preResumeStatus = existing.status;
         reopenSession(config.db, resumeId);
         sessionId = resumeId;
+        const hydrated = SessionContext.hydrateFromDb(config.db, resumeId);
+        ctx = hydrated.ctx;
+        hydrateInfo = hydrated.info;
       } else if (preassignedId !== undefined) {
         // Caller-created row. Verify it exists and matches the
         // expected shape (cwd, status='running'). The cwd check
@@ -932,6 +971,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           );
         }
         sessionId = preassignedId;
+        // Preassigned (subagent first boot): hydrate from the single
+        // seed the parent wrote. No resume_truncated — not a resumed
+        // history; hydrateInfo stays null so the diagnostics block skips.
+        ctx = SessionContext.hydrateFromDb(config.db, preassignedId).ctx;
       } else {
         const session = createSession(config.db, {
           model: config.provider.id,
@@ -941,6 +984,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             : {}),
         });
         sessionId = session.id;
+        ctx = SessionContext.createFresh(config.db, sessionId);
+      }
+      // Every branch above set ctx; narrow it for the rest of the loop.
+      // The closures defined later (finish, maybeCompact) capture the
+      // wider `| undefined` and guard it themselves.
+      if (ctx === undefined) {
+        throw new Error('internal: session context not resolved');
       }
 
       // Eager-load provenance emit (MEMORY.md §11.2, S1/T1.4).
@@ -2028,127 +2078,54 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         }
       }
 
-      // Hydrate persisted messages BEFORE appending the new user
-      // prompt. Two paths converge here:
-      //   - Resume: the prior run's full transcript is on disk;
-      //     load it so the model sees [old turns, new prompt].
-      //   - Preassigned: the caller (subprocess parent) created
-      //     the row and inserted the seed user message before
-      //     spawning. We need to load that seed too — otherwise
-      //     the child sees an empty conversation and appends a
-      //     fresh prompt-from-config that would silently NOT match
-      //     what the parent committed.
-      // Both paths share the same fetch + alignment walk; only
-      // the trigger condition differs.
-      //
-      // Bounded fetch: SQL returns at most (MAX + alignment
-      // margin) rows, so a 50k-message session never materializes
-      // in JS memory. The earlier implementation read the full
-      // log into memory and sliced — defeating the cap and OOM-ing
-      // on long-running sessions.
-      //
-      // droppedFromHead reported on the resume_truncated event
-      // accounts for BOTH the rows that never left SQL (totalCount
-      // - fetchedCount) and the rows the alignment walk skipped
-      // inside the fetched slice. Kept count is what the model
-      // actually sees in context.
-      //
-      // Carry forward the parent_id chain across resume /
-      // preassigned. Without seeding lastMessageId from the prior
-      // tail, the new user turn appends with parent_id=null and
-      // starts a NEW root in the same session — the parent_id
-      // graph forks at the boundary, breaking traversal/replay/
-      // audit logic that walks parent links to reconstruct the
-      // conversation tree. The persisted tail is already ordered
-      // by seq (migration 007), so the tail is just the last
-      // element of what we fetched (which IS the absolute tail
-      // since the bounded fetch picks newest rows).
-      let priorTailId: string | null = null;
-      const preexistingId = resumeId ?? preassignedId;
-      if (preexistingId !== undefined) {
-        const tail = listMessageTailBySession(
-          config.db,
-          preexistingId,
-          MAX_RESUME_MESSAGES + ALIGNMENT_FETCH_MARGIN,
-        );
-        const restored = messagesToProviderMessages(tail.messages);
-        messages.push(...restored.messages);
-        const fetchedCount = tail.messages.length;
-        const droppedBeyondFetch = tail.totalCount - fetchedCount;
-        const totalDropped = droppedBeyondFetch + restored.droppedFromHead;
-        if (totalDropped > 0 && resumeId !== undefined) {
-          // resume_truncated emits only on the resume path. The
-          // preassigned path's seed is freshly inserted by the
-          // parent (typically a single user message) and
-          // truncation there would indicate something is off
-          // with the parent's flow — but it's not a "user
-          // resumed and lost context" event the renderer needs
-          // to surface.
-          safeEmit(config.onEvent, {
-            type: 'resume_truncated',
-            sessionId,
-            kept: restored.messages.length,
-            dropped: totalDropped,
-          });
-          // Slice 178 (hardening M1). The event above goes to the
-          // live renderer / NDJSON stream; this row in
-          // failure_events makes the truncation queryable
-          // post-hoc. Without it a forensic audit of a resumed
-          // run can't tell that the model worked from a subset of
-          // the persisted log — the gap shows up only as a
-          // surprising "model didn't remember that" report from
-          // the operator, with no DB-side evidence.
-          if (config.failureSink !== undefined) {
-            try {
-              config.failureSink.emit({
-                code: 'storage.resume_truncated',
-                classe: 'storage',
-                recovery_action: 'degraded',
-                user_visible: true,
-                session_id: sessionId,
-                payload: {
-                  kept: restored.messages.length,
-                  dropped: totalDropped,
-                  dropped_beyond_fetch: droppedBeyondFetch,
-                  dropped_by_alignment: restored.droppedFromHead,
-                  max_resume_messages: MAX_RESUME_MESSAGES,
-                },
-              });
-            } catch (e) {
-              // Best-effort: failure_events sink should not block
-              // the resume itself. Diagnostic to stderr so the
-              // sink-write failure has a trail of its own.
-              process.stderr.write(
-                `forja: failed to persist storage.resume_truncated event: ${e instanceof Error ? e.message : String(e)}\n`,
-              );
-            }
+      // Resume diagnostics + alternation. The context was already
+      // hydrated from the DB log in the session-decision block (which
+      // also seeded the parent_id anchor from the persisted tail);
+      // here we surface the truncation it reported (resume path only)
+      // and repair alternation before the new prompt is appended.
+      if (hydrateInfo !== null && resumeId !== undefined && hydrateInfo.totalDropped > 0) {
+        // resume_truncated is resume-only: a preassigned seed is freshly
+        // inserted by the parent, so truncation there is a parent-flow
+        // bug, not the "user resumed and lost context" the renderer shows.
+        safeEmit(config.onEvent, {
+          type: 'resume_truncated',
+          sessionId,
+          kept: hydrateInfo.kept,
+          dropped: hydrateInfo.totalDropped,
+        });
+        // Slice 178 (hardening M1): make the truncation queryable
+        // post-hoc so a forensic audit can tell the model worked from a
+        // subset of the log, not just infer it from a "didn't remember"
+        // report. Best-effort — never block the resume.
+        if (config.failureSink !== undefined) {
+          try {
+            config.failureSink.emit({
+              code: 'storage.resume_truncated',
+              classe: 'storage',
+              recovery_action: 'degraded',
+              user_visible: true,
+              session_id: sessionId,
+              payload: {
+                kept: hydrateInfo.kept,
+                dropped: hydrateInfo.totalDropped,
+                dropped_beyond_fetch: hydrateInfo.droppedBeyondFetch,
+                dropped_by_alignment: hydrateInfo.droppedByAlignment,
+                max_resume_messages: MAX_RESUME_MESSAGES,
+              },
+            });
+          } catch (e) {
+            process.stderr.write(
+              `forja: failed to persist storage.resume_truncated event: ${e instanceof Error ? e.message : String(e)}\n`,
+            );
           }
         }
-        // Stranded-turn handling. If the last restored message is
-        // `user` (either the original prompt that never got an
-        // assistant response, or a tool_result whose follow-up
-        // assistant turn never landed because the run aborted),
-        // appending the resume's new user prompt would create
-        // user→user on the wire — every provider 400s on that.
-        // Insert an in-memory-only synthetic assistant placeholder
-        // to satisfy alternation. Not persisted: each resume
-        // re-derives it on demand from whatever shape the log is
-        // in at that moment.
-        //
-        // The placeholder is ONLY needed when we're about to
-        // append a new user prompt. On the preassigned path with
-        // an empty userPrompt (the parent already seeded the
-        // user turn), the seed itself IS the conversation and
-        // we don't append again — so a trailing-user tail is
-        // correct, not stranded.
-        const inMemoryTail = messages[messages.length - 1];
-        const willAppendUserPrompt = config.userPrompt.length > 0;
-        if (willAppendUserPrompt && inMemoryTail !== undefined && inMemoryTail.role === 'user') {
-          messages.push({ role: 'assistant', content: STRANDED_TURN_PLACEHOLDER });
-        }
-        const lastFetched = tail.messages[tail.messages.length - 1];
-        if (lastFetched !== undefined) priorTailId = lastFetched.id;
       }
+      // Stranded-turn repair (in-memory only, not persisted): if the
+      // hydrated tail is a user and we're about to append a new prompt,
+      // a synthetic assistant keeps the wire alternating. No-op on the
+      // reuse path (a live turn ends on an assistant) and on the
+      // preassigned-empty-prompt path (the seed IS the conversation).
+      ctx.ensureAlternation(config.userPrompt.length > 0);
 
       // Auto-rehydrate on `--resume` (STATE_MACHINE §7.6 +
       // RECAP §3.2). Prepends a literal `[resume_context]` block
@@ -2219,25 +2196,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // userPrompt (CLI guards against missing prompt before
       // bootstrap).
       if (config.userPrompt.length > 0) {
-        const userMsg = appendMessage(config.db, {
-          sessionId,
-          role: 'user',
-          content: effectiveUserPrompt,
-          // null on first turn (new session); tail id on resume
-          // / preassigned so the chain stays connected.
-          // appendMessage validates the parent belongs to the
-          // same session.
-          ...(priorTailId !== null ? { parentId: priorTailId } : {}),
-          promptHash: config.systemPromptHash ?? null,
-        });
-        lastMessageId = userMsg.id;
-        messages.push({ role: 'user', content: effectiveUserPrompt });
-      } else if (priorTailId !== null) {
-        // No new user message to append; the prior tail id
-        // becomes the lastMessageId we report on the result and
-        // the chain anchor for the assistant turn that follows.
-        lastMessageId = priorTailId;
+        // The context's anchor (hydrated tail, or '' on a fresh run)
+        // becomes this message's parentId, keeping the DB chain
+        // connected; appendUser advances it.
+        ctx.appendUser(effectiveUserPrompt, config.systemPromptHash ?? null);
       }
+      // else: no new user message. The context's anchor is already the
+      // hydrated tail (or '' on a fresh/empty run), which the following
+      // assistant turn chains onto — no priorTailId bookkeeping needed.
 
       safeEmit(config.onEvent, { type: 'session_start', sessionId });
       // Emit the checkpoints-unavailable warning AFTER session_start
@@ -2299,6 +2265,94 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         }
       }
 
+      // Compaction check, factored out so it runs at the TOP of the loop —
+      // before EVERY provider call, not only after tool_results. That closes
+      // three overflow gaps the post-tool-result-only site left open: the
+      // first call of a resumed session (up to MAX_RESUME_MESSAGES restored),
+      // a turn that crosses the threshold without tool_results, and the start
+      // of each run. Returns a cost-cap detail when its own billed summary
+      // call pushed the cumulative total over the cap (caller must finish),
+      // else null. Mutates `messages` in place and folds usage into the run
+      // totals via closure.
+      const maybeCompact = async () => {
+        // Skip when aborted / budget exhausted / window unknown — don't burn
+        // a billed summary call whose result the loop is about to discard.
+        if (
+          ctx === undefined ||
+          signal.aborted ||
+          steps >= budget.maxSteps ||
+          config.provider.capabilities.context_window <= 0
+        ) {
+          return null;
+        }
+        const promptTokens = estimatePromptTokens([...ctx.getMessages()], {
+          ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
+          ...(tools.length > 0 ? { tools } : {}),
+        });
+        const contextWindow = config.provider.capabilities.context_window;
+        const triggerAt = budget.compactionThreshold * contextWindow;
+        // Need goal + something-to-fold + an assistant boundary for the tail;
+        // shorter histories make compactMessages skip (and emit noisy events).
+        if (!(promptTokens > triggerAt && ctx.length >= budget.compactionPreserveTail + 3)) {
+          return null;
+        }
+        // PreCompact hook (blocking, spec §10.1) — fired before the
+        // compaction_started event so a refusing hook skips both the LLM call
+        // and the renderer's "compacting…" signal. Blocked ⇒ no compaction
+        // this turn; the loop proceeds with the un-compacted history and the
+        // next top-of-loop call re-checks (no continue — we're at the top, so
+        // returning simply falls through to the provider call). Deliberate vs
+        // the old post-tool-result site, whose `continue` ALSO skipped that
+        // turn's detector schedulers: the turn now runs normally, because the
+        // schedulers don't depend on compaction (that coupling was accidental).
+        const preCompact = await dispatchHooks({
+          schema: 'v1',
+          event: 'PreCompact',
+          sessionId,
+          data: { promptTokens, threshold: triggerAt },
+        });
+        if (preCompact !== null && preCompact.blockedBy !== null) {
+          return null;
+        }
+        // Read pins BEFORE emitting compaction_started, so the
+        // started→finished pair has NO throwing statement between them: a DB
+        // error here would otherwise skip compaction_finished and leave the
+        // adapter-bracketed "Compacting context…" chip open until session:end.
+        // (CONTEXT_TUNING §12.4: pins preserved literally across the fold,
+        // else they elide with the middle and only reappear on resume.)
+        const pinnedBlock = formatPinnedBlock(getActivePinsBySession(config.db, sessionId));
+        safeEmit(config.onEvent, {
+          type: 'compaction_started',
+          promptTokens,
+          threshold: triggerAt,
+          contextWindow,
+        });
+        const compactStart = Date.now();
+        const compaction = await ctx.compact(config.provider, {
+          preserveTail: budget.compactionPreserveTail,
+          signal,
+          ...(pinnedBlock !== undefined ? { pinnedBlock } : {}),
+        });
+        const acct = accountCompaction(compaction, config.provider.capabilities);
+        totalUsage = addUsage(totalUsage, compaction.usage);
+        totalCostUsd += acct.costUsd;
+        emitCostUpdate(acct.costUsd);
+        if (acct.usageIncomplete) {
+          usageComplete = false;
+        }
+        const finishedEvent: HarnessEvent = {
+          type: 'compaction_finished',
+          strategy: compaction.strategy,
+          foldedCount: compaction.foldedCount,
+          durationMs: Date.now() - compactStart,
+          usage: compaction.usage,
+          costUsd: acct.costUsd,
+          ...(compaction.reason !== undefined ? { reason: compaction.reason } : {}),
+        };
+        safeEmit(config.onEvent, finishedEvent);
+        return costCapDetailIfExceeded();
+      };
+
       while (true) {
         if (signal.aborted) {
           return isWallClockTimeout()
@@ -2329,6 +2383,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           if (overage !== null) return await finish('maxCostUsd', overage);
         }
 
+        // Compact BEFORE the provider call when over threshold (see
+        // maybeCompact above). Runs every iteration, so it covers the first
+        // call of a resumed/long session — the post-tool-result-only site
+        // missed it, sending one over-window request that 400s.
+        {
+          const compactOverage = await maybeCompact();
+          if (compactOverage !== null) return await finish('maxCostUsd', compactOverage);
+        }
+
         steps += 1;
         safeEmit(config.onEvent, { type: 'step_start', stepN: steps });
 
@@ -2342,7 +2405,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // Snapshot the running message list so post-call mutations (the next
           // iteration appends assistant + tool_results) don't retroactively
           // change what the provider observed.
-          messages: [...messages],
+          messages: [...ctx.getMessages()],
           max_tokens: resolvedMaxTokens,
           ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
           ...(config.systemSegments !== undefined ? { systemSegments: config.systemSegments } : {}),
@@ -2482,22 +2545,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // then distinguish "no measurement" from "measured zero" — both
         // are legal but mean different things (e.g., a stream that aborted
         // before message_stop vs. a turn that genuinely produced nothing).
-        const assistantMsg = appendMessage(config.db, {
-          sessionId,
-          role: 'assistant',
-          parentId: lastMessageId,
-          content: assistantContent.length > 0 ? assistantContent : '',
-          tokensIn: collected.usageSeen ? collected.usage.input : null,
-          tokensOut: collected.usageSeen ? collected.usage.output : null,
-          cachedTokens: collected.usageSeen ? collected.usage.cache_read : null,
-          cacheCreationTokens: collected.usageSeen ? collected.usage.cache_creation : null,
-          costUsd: collected.usageSeen ? turnCostUsd : null,
-          promptHash: config.systemPromptHash ?? null,
-        });
-        lastMessageId = assistantMsg.id;
-        if (assistantContent.length > 0) {
-          messages.push({ role: 'assistant', content: assistantContent });
-        }
+        const assistantMsgId = ctx.appendAssistant(
+          assistantContent,
+          {
+            usageSeen: collected.usageSeen,
+            tokensIn: collected.usage.input,
+            tokensOut: collected.usage.output,
+            cacheRead: collected.usage.cache_read,
+            cacheCreation: collected.usage.cache_creation,
+            costUsd: turnCostUsd,
+          },
+          config.systemPromptHash ?? null,
+        );
 
         // Stream errors (normalizer-level: malformed tool_use args, orphan
         // tool_use_stop, etc.) mean the provider produced output we couldn't
@@ -2600,7 +2659,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             });
             try {
               const outcome = await checkpointManager.snapshot({
-                stepId: assistantMsg.id,
+                stepId: assistantMsgId,
                 hadBash,
                 stepN: steps,
               });
@@ -2609,7 +2668,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                   type: 'checkpoint_created',
                   checkpointId: outcome.checkpointId,
                   gitRef: outcome.gitRef,
-                  stepId: assistantMsg.id,
+                  stepId: assistantMsgId,
                   hadBash,
                 });
               }
@@ -2673,7 +2732,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           signal,
           cwd: config.cwd,
           sessionId,
-          stepId: assistantMsg.id,
+          stepId: assistantMsgId,
           permissions: config.permissionEngine.view(),
           permissionCheck: (toolName, category, args) =>
             config.permissionEngine.check(toolName, category, args),
@@ -2809,9 +2868,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             ? { confirmMemoryUserScope: config.confirmMemoryUserScope }
             : {}),
           ...(config.clarify !== undefined ? { clarify: config.clarify } : {}),
-          ...(config.contextPinsStore !== undefined
-            ? { contextPinsStore: config.contextPinsStore }
-            : {}),
+          // Built once per run above (REPL-injected or a fresh wrapper over
+          // the db), so pin_context works in any mode (like the todolist),
+          // not just the interactive REPL.
+          contextPinsStore,
           ...(config.skillCatalog !== undefined ? { skillCatalog: config.skillCatalog } : {}),
           // Trust state — required on ToolContext, optional on
           // HarnessConfig. Default-false at the harness layer is
@@ -2944,7 +3004,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               toolUseId: tu.id,
               toolName: tu.name,
               args: tu.input,
-              messageId: assistantMsg.id,
+              messageId: assistantMsgId,
             },
             {
               db: config.db,
@@ -3381,15 +3441,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             }
           }
           if (bailCounter !== -1) {
-            const partialMsg = appendMessage(config.db, {
-              sessionId,
-              role: 'user',
-              parentId: lastMessageId,
-              content: toolResults,
-              promptHash: config.systemPromptHash ?? null,
-            });
-            lastMessageId = partialMsg.id;
-            messages.push({ role: 'user', content: toolResults });
+            ctx.appendToolResults(toolResults, config.systemPromptHash ?? null);
             return await finish('maxToolErrors', `${bailCounter} consecutive tool errors`);
           }
         } else {
@@ -3451,15 +3503,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                   is_error: true,
                 });
               }
-              const partialMsg = appendMessage(config.db, {
-                sessionId,
-                role: 'user',
-                parentId: lastMessageId,
-                content: toolResults,
-                promptHash: config.systemPromptHash ?? null,
-              });
-              lastMessageId = partialMsg.id;
-              messages.push({ role: 'user', content: toolResults });
+              ctx.appendToolResults(toolResults, config.systemPromptHash ?? null);
               return await finish('maxToolErrors', `${consecutiveErrors} consecutive tool errors`);
             }
           }
@@ -3467,135 +3511,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
 
         // Persist tool_results back as a user message; mirror them in the
         // running provider message list for the next turn.
-        const resultMsg = appendMessage(config.db, {
-          sessionId,
-          role: 'user',
-          parentId: lastMessageId,
-          content: toolResults,
-          promptHash: config.systemPromptHash ?? null,
-        });
-        lastMessageId = resultMsg.id;
-        messages.push({ role: 'user', content: toolResults });
+        ctx.appendToolResults(toolResults, config.systemPromptHash ?? null);
 
-        // Compaction trigger check. Estimate the FULL outbound prompt
-        // — messages + system + tool schemas — against the threshold.
-        // Tool schemas alone run 2-4k tokens each per CONTEXT_TUNING.md
-        // §2.1; a long system prompt adds another 0.5-3k. Counting only
-        // `messages` undercounts the trigger and lets the next request
-        // sail over the cap when the surrounding overhead is what's
-        // pushing it close.
-        //
-        // estimatePromptTokens is the local chars/4 heuristic: free
-        // (no HTTP), conservative (overestimates by ~10-25% vs real
-        // tokenizers), good enough for a 70%-of-window threshold that
-        // already includes a buffer.
-        //
-        // DB messages stay untouched; only the in-memory `messages`
-        // array sent to the provider gets rewritten. Audit + replay can
-        // re-derive from the full history if they ever need a different
-        // compaction policy.
-        // Skip when the budget is exhausted: compaction would issue a
-        // billed summary call right before the loop's top-of-iteration
-        // check exits with `maxSteps` anyway. Same logic as the
-        // signal.aborted guard — don't burn tokens on work whose
-        // result will never be used.
-        if (
-          !signal.aborted &&
-          steps < budget.maxSteps &&
-          config.provider.capabilities.context_window > 0
-        ) {
-          const promptTokens = estimatePromptTokens(messages, {
-            ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
-            ...(tools.length > 0 ? { tools } : {}),
-          });
-          const contextWindow = config.provider.capabilities.context_window;
-          const triggerAt = budget.compactionThreshold * contextWindow;
-          // Guard: requires at least goal + something-to-fold + an
-          // assistant boundary for the tail. compactMessages will skip
-          // (and emit a noisy started/finished pair) for shorter
-          // histories; check here so we don't fire the events at all.
-          // `+ 2` accounts for the assistant-boundary alignment the
-          // module performs — naive `1 + tail` could pass even when
-          // the alignment shift collapses the middle to empty.
-          if (promptTokens > triggerAt && messages.length >= budget.compactionPreserveTail + 3) {
-            // PreCompact hook chain (spec AGENTIC_CLI.md §10.1,
-            // blocking). Fired BEFORE the compaction_started event
-            // so an operator hook that refuses compaction (e.g.,
-            // policy: preserve full transcript for audit) skips
-            // both the LLM call AND the renderer's "compacting…"
-            // signal — the operator's intent is the compaction
-            // never happened. block_silent / block_message both
-            // skip; failClosed error/timeout same. fail-open on
-            // dispatch error per spec line 1057.
-            const preCompact = await dispatchHooks({
-              schema: 'v1',
-              event: 'PreCompact',
-              sessionId,
-              data: { promptTokens, threshold: triggerAt },
-            });
-            if (preCompact !== null && preCompact.blockedBy !== null) {
-              // Skip compaction this turn. Loop continues with the
-              // un-compacted message list; if tokens still over
-              // threshold next turn, the hook fires again. The
-              // hook_runs row is the audit trail.
-              continue;
-            }
-            safeEmit(config.onEvent, {
-              type: 'compaction_started',
-              promptTokens,
-              threshold: triggerAt,
-              contextWindow,
-            });
-            const compactStart = Date.now();
-            const compaction = await compactMessages(config.provider, messages, {
-              preserveTail: budget.compactionPreserveTail,
-              signal,
-            });
-            // In-place replace so the caller's reference (none today,
-            // but defensive) sees the new history without reassignment.
-            messages.length = 0;
-            messages.push(...compaction.messages);
-
-            // Compaction's LLM call (when it ran) is a billed provider
-            // request — fold its usage into session totals. Skipping
-            // this would systematically underreport spend on every
-            // compacting session, defeating the whole point of the
-            // per-session cost tracking. The 'skipped' strategy never
-            // made a call so contributes zero (emptyUsage); 'fallback'
-            // contributes whatever partial usage arrived before the
-            // failure (some providers emit usage on stream errors).
-            const compactionCost = computeCost(config.provider.capabilities, compaction.usage);
-            totalUsage = addUsage(totalUsage, compaction.usage);
-            totalCostUsd += compactionCost;
-            emitCostUpdate(compactionCost);
-            // If the compaction call MADE a provider request (llm or
-            // fallback strategy) but didn't see usage telemetry, the
-            // session total is now a lower bound — same conservative
-            // logic as the per-turn check.
-            if (compaction.strategy !== 'skipped' && !compaction.usageSeen) {
-              usageComplete = false;
-            }
-
-            const finishedEvent: HarnessEvent = {
-              type: 'compaction_finished',
-              strategy: compaction.strategy,
-              foldedCount: compaction.foldedCount,
-              durationMs: Date.now() - compactStart,
-              usage: compaction.usage,
-              costUsd: compactionCost,
-              ...(compaction.reason !== undefined ? { reason: compaction.reason } : {}),
-            };
-            safeEmit(config.onEvent, finishedEvent);
-
-            // Compaction's billed call can push the cumulative
-            // total past the cap on its own. Check after the
-            // event is emitted (renderers should still see the
-            // compaction_finished event) but before the next
-            // top-of-loop iteration would issue a provider call.
-            const overage = costCapDetailIfExceeded();
-            if (overage !== null) return await finish('maxCostUsd', overage);
-          }
-        }
+        // Compaction now runs at the TOP of the loop (maybeCompact, before
+        // every provider call) — see above. No post-tool-result trigger here
+        // anymore: the next iteration's top-of-loop check folds whatever this
+        // turn's tool_results just added, and the single site keeps "every
+        // provider call is preceded by a compaction check" structural.
 
         // S11/S13/S3 — detector scheduler ticks at step boundary
         // (MEMORY.md §11.x / T11.9 + T13.x + S3.4). Each scheduler

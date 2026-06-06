@@ -22,7 +22,12 @@
 import { existsSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { resolveProviderEffort } from '../harness/effort.ts';
-import { type HarnessConfig, type HarnessResult, runAgent } from '../harness/index.ts';
+import {
+  type HarnessConfig,
+  type HarnessResult,
+  type SessionContext,
+  runAgent,
+} from '../harness/index.ts';
 import { effectiveBudget, resolveMaxOutputTokens } from '../harness/types.ts';
 import { dispatchChain } from '../hooks/dispatcher.ts';
 import type { HookChainResult, HookEventPayload } from '../hooks/types.ts';
@@ -319,6 +324,16 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // `isBusy` so it serializes against agent turns and playbooks (and
   // against a second `!` command) — one operator action at a time.
   let operatorBashRunning = false;
+  // True while a /compact summary call is in flight. Part of `isBusy` so a
+  // follow-up turn (or a second /compact) can't start while compaction is
+  // rewriting the live context's message array in place. Set SYNCHRONOUSLY
+  // (runExclusive below) before the await, same contract as playbookRunning.
+  let compacting = false;
+  // Aborts the in-flight /compact summary call on operator interrupt
+  // (triggerInterrupt fires it). runExclusive populates it for the fn's
+  // duration; the /compact body composes this with its own timeout. Without
+  // it, Ctrl+C during a stalled compaction does nothing.
+  let compactAbortController: AbortController | null = null;
   // Kill switch for the in-flight `!cmd`, handed up by the executor so
   // the interrupt path (Ctrl+C / Esc) can terminate the command's
   // process group instead of waiting out the timeout. Null when no
@@ -340,7 +355,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // on `running` alone and let a normal turn start mid-playbook
   // — the exact serialization the playbookRunning flag was
   // supposed to enforce, defeated at every other entry point.
-  const isBusy = (): boolean => running || playbookRunning || operatorBashRunning;
+  const isBusy = (): boolean => running || playbookRunning || operatorBashRunning || compacting;
   // Mirror `isBusy()` into renderer state so the bash-mode visuals gate
   // on the same condition the submit path uses (render/mode.ts). Call
   // after EVERY mutation of `running` / `playbookRunning` /
@@ -885,6 +900,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // conversation, and the shutdown hint prints the same id so the
   // chain can continue across boots.
   let lastSessionId: string | null = resumedSessionId;
+  // Live in-memory context, held across turns so the conversation is
+  // compacted once and reused — not re-derived from the DB log every
+  // turn (project_message_single_source). Captured from each turn's
+  // HarnessResult; null until the first turn finishes, and after a turn
+  // that errored before resolving a context (the resumeFromSessionId
+  // fallback in startTurn re-derives from the log in that case).
+  let liveContext: SessionContext | null = null;
   // Append-only list of session ids tracked across this REPL
   // boot. Pushed on `session_finished` and on playbook subagent
   // completion. Slash commands that aggregate across the whole
@@ -1213,6 +1235,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       syncBusy();
       sawSessionFinished = true;
       lastSessionId = event.result.sessionId;
+      // Hold the live context for the next turn's reuse. A turn that
+      // errored before resolving one leaves this null → the next turn
+      // falls back to resumeFromSessionId (re-derive from the log).
+      liveContext = event.result.sessionContext ?? null;
       trackReplSessionId(event.result.sessionId);
       cumulative.costUsd += event.result.costUsd;
       cumulative.steps += event.result.steps;
@@ -1641,7 +1667,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       clarify,
       contextPinsStore,
       todoStore,
-      ...(lastSessionId !== null ? { resumeFromSessionId: lastSessionId } : {}),
+      // Reuse the live context (compact-once-reuse). Fall back to
+      // resumeFromSessionId only when there's no live context — a turn
+      // that errored before resolving one — so the next turn re-derives
+      // from the DB log instead of starting a fresh session.
+      ...(liveContext !== null
+        ? { sessionContext: liveContext }
+        : lastSessionId !== null
+          ? { resumeFromSessionId: lastSessionId }
+          : {}),
     };
     const runAgentImpl = options.runAgentOverride ?? runAgent;
     // Cumulative totals + lastSessionId are rolled up in
@@ -1873,6 +1907,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       operatorBashInterrupted = true;
       return;
     }
+    // A /compact summary call aborts on the FIRST interrupt — it's an atomic
+    // operation, no soft/hard turn. compactMessages absorbs the abort into its
+    // deterministic fallback, so /compact still resolves and frees the REPL. No
+    // turn-level interrupt event (there's no turn; it'd leak softInterrupted).
+    if (compactAbortController !== null) {
+      compactAbortController.abort();
+      return;
+    }
     const level: 'soft' | 'hard' = renderer.state().softInterrupted ? 'hard' : 'soft';
     bus.emit({ type: 'interrupt', ts: now(), level });
     if (level === 'hard') {
@@ -2037,6 +2079,30 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // as auditSessionId so its read rows group with the operator's
     // current session.
     currentSessionId: () => lastSessionId,
+    // Live context for /compact (project_message_single_source). Getter
+    // so it reflects the most recent turn's captured context.
+    liveContext: () => liveContext,
+    // Exclusion for mutating slash actions (/compact): flip `compacting`
+    // synchronously before the await so isBusy() refuses a concurrent turn
+    // (or a second /compact) for the whole compaction.
+    runExclusive: async (fn) => {
+      const ctrl = new AbortController();
+      compactAbortController = ctrl;
+      compacting = true;
+      syncBusy();
+      try {
+        return await fn(ctrl.signal);
+      } finally {
+        compactAbortController = null;
+        compacting = false;
+        syncBusy();
+        // Drain anything the operator queued WHILE compaction held the busy
+        // lock — same as a turn's finalizer. Without this a message typed
+        // during /compact sits in the inbox forever (input wedged after
+        // /compact until the next unrelated event drains it).
+        if (!isBusy()) queueMicrotask(() => drainInbox());
+      }
+    },
     replSessionIds: () => replSessionIdOrder,
     modelRegistry,
     // History controls (HISTORY.md §2.3). `/history clear` calls

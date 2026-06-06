@@ -161,13 +161,16 @@ export const buildResumeContext = (input: BuildResumeContextInput): ResumeContex
         'Pinned context:',
         intermediate.pinnedContext.map((p) => {
           // `[kind]` is informational — same vocabulary the
-          // /pin --list view uses, so the operator who pinned
-          // it recognizes it immediately. `(model)` suffix
-          // appears ONLY when the pin came through the
-          // pin_context tool path (and was operator-approved
-          // via the modal); operator-direct pins via /pin omit
-          // the suffix to avoid visual noise on the common case.
-          const suffix = p.createdBy === 'model_proposed_user_approved' ? ' (model)' : '';
+          // /pin --list view uses, so the operator who pinned it
+          // recognizes it immediately. The `(model)` suffix marks
+          // pins the model created via the pin_context tool
+          // (createdBy 'model'; 'model_proposed_user_approved' is
+          // the legacy modal value, kept for old rows). On resume
+          // the operator can then tell their own /pin entries
+          // (createdBy 'user', no suffix) from constraints the
+          // model pinned itself. Gate on `!== 'user'` so any
+          // non-operator origin gets the marker.
+          const suffix = p.createdBy !== 'user' ? ' (model)' : '';
           return `  - [${p.kind}] ${p.text}${suffix}`;
         }),
         '  - (none)',

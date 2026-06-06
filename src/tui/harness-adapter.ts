@@ -561,6 +561,9 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
       }
 
       case 'compaction_started':
+        // Live chip (transient) + a scrollback warn (the record). The chip
+        // is the same one /compact shows — one bracket, both surfaces.
+        out.push({ type: 'compacting:start', ts });
         out.push({
           type: 'warn',
           ts,
@@ -569,6 +572,9 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         return out;
 
       case 'compaction_finished': {
+        // Close the chip first — even on 'skipped', which returns early
+        // below before pushing the warn.
+        out.push({ type: 'compacting:end', ts });
         if (event.strategy === 'skipped') return out;
         const detail = event.reason !== undefined ? ` — ${event.reason}` : '';
         out.push({

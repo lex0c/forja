@@ -21,7 +21,6 @@ const newCtx = (overrides: Parameters<typeof makeCtx>[0] = {}) =>
     sessionId,
     stepId: 'step-1',
     contextPinsStore: store,
-    confirmPinContext: async () => 'yes',
     ...overrides,
   });
 
@@ -33,21 +32,19 @@ beforeEach(() => {
 });
 
 describe('pin_context tool: happy path', () => {
-  test('creates a pin when operator confirms', async () => {
+  test('pins directly (no modal) with created_by model', async () => {
     const result = await pinContextTool.execute(
       { text: 'API pública de PaymentService não pode mudar', kind: 'constraint' },
       newCtx(),
     );
     if (isToolError(result)) throw new Error(`unexpected tool error: ${result.error_message}`);
-    expect(result.outcome).toBe('created');
     expect(result.text).toBe('API pública de PaymentService não pode mudar');
     expect(result.kind).toBe('constraint');
     expect(result.pinId).toBeString();
-    expect(result.reason).toBe('pinned');
-    // Pin really landed in the store.
+    // Pin really landed, attributed to the model (no operator approval).
     const pins = store.listPinsBySession(sessionId);
     expect(pins).toHaveLength(1);
-    expect(pins[0]?.createdBy).toBe('model_proposed_user_approved');
+    expect(pins[0]?.createdBy).toBe('model');
     expect(pins[0]?.sourceStepId).toBe('step-1');
   });
 
@@ -65,68 +62,32 @@ describe('pin_context tool: happy path', () => {
     );
     if (isToolError(result)) throw new Error('unexpected tool error');
     const after = Date.now();
-    const pin = store.getPin(result.pinId ?? '');
+    const pin = store.getPin(result.pinId);
     expect(pin).not.toBeNull();
-    // Lower bound: at least 30m past the call's "before" instant.
     expect(pin?.expiresAt).toBeGreaterThanOrEqual(before + 30 * 60_000);
-    // Upper bound: at most 30m past the call's "after" instant.
-    // (Date.now() ticked at least once between the two reads.)
     expect(pin?.expiresAt).toBeLessThanOrEqual(after + 30 * 60_000);
   });
 });
 
-describe('pin_context tool: operator decline / cancel', () => {
-  test('returns rejected when operator declines', async () => {
-    const result = await pinContextTool.execute(
-      { text: 'maybe' },
-      newCtx({ confirmPinContext: async () => 'no' }),
-    );
-    if (isToolError(result)) throw new Error('expected rejected outcome, got tool error');
-    expect(result.outcome).toBe('rejected');
-    expect(result.reason).toContain('declined');
-    expect(store.listPinsBySession(sessionId)).toHaveLength(0);
-  });
-
-  test('returns rejected with distinct reason on cancel', async () => {
-    const result = await pinContextTool.execute(
-      { text: 'maybe' },
-      newCtx({ confirmPinContext: async () => 'cancel' }),
-    );
-    if (isToolError(result)) throw new Error('expected rejected outcome');
-    expect(result.outcome).toBe('rejected');
-    expect(result.reason).toContain('cancelled');
-  });
-});
-
-describe('pin_context tool: headless / unwired', () => {
-  test('refuses when contextPinsStore is missing', async () => {
-    // exactOptionalPropertyTypes forbids passing { x: undefined } in
-    // Partial<ToolContext> — destructure to drop the key entirely.
-    const { contextPinsStore: _omit, ...ctx } = newCtx();
-    void _omit;
-    const result = await pinContextTool.execute({ text: 'something' }, ctx);
-    if (!isToolError(result)) throw new Error('expected tool error');
-    expect(result.error_code).toBe('pin.store_unavailable');
-  });
-
-  test('refuses when confirmPinContext is missing', async () => {
-    const { confirmPinContext: _omit, ...ctx } = newCtx();
-    void _omit;
-    const result = await pinContextTool.execute({ text: 'something' }, ctx);
-    if (!isToolError(result)) throw new Error('expected tool error');
-    expect(result.error_code).toBe('pin.headless_mode');
-  });
-
-  test('refuses when signal already aborted', async () => {
-    const ctrl = new AbortController();
-    ctrl.abort();
-    const result = await pinContextTool.execute(
-      { text: 'something' },
-      newCtx({ signal: ctrl.signal }),
-    );
-    if (!isToolError(result)) throw new Error('expected tool error');
-    expect(result.error_code).toBe('tool.aborted');
-    expect(result.retryable).toBe(true);
+describe('pin_context tool: ring buffer (cap PIN_CAP)', () => {
+  test('at the cap, a new pin evicts the oldest and stays at PIN_CAP', async () => {
+    // Fill to the cap with ascending created_at so eviction order is stable.
+    for (let i = 0; i < PIN_CAP; i++) {
+      store.createPin({
+        sessionId,
+        text: `existing ${i}`,
+        kind: 'constraint',
+        createdBy: 'user',
+        createdAt: 1000 + i, // pin 0 is the oldest
+      });
+    }
+    const result = await pinContextTool.execute({ text: 'newest' }, newCtx());
+    if (isToolError(result)) throw new Error(`unexpected: ${result.error_message}`);
+    const texts = store.listPinsBySession(sessionId).map((p) => p.text);
+    expect(texts).toHaveLength(PIN_CAP); // still capped — no overflow, no error
+    expect(texts).toContain('newest'); // the new pin landed
+    expect(texts).not.toContain('existing 0'); // the oldest was evicted
+    expect(texts).toContain('existing 1'); // the rest survive
   });
 });
 
@@ -147,6 +108,15 @@ describe('pin_context tool: input validation', () => {
     expect(result.error_message).toContain('≤');
   });
 
+  test('rejects control characters (newline) in text', async () => {
+    // Same one-line-per-item contract the todolist enforces: a newline would
+    // break the pin block in both the resume and compaction paths.
+    const result = await pinContextTool.execute({ text: 'line one\nline two' }, newCtx());
+    if (!isToolError(result)) throw new Error('expected tool error');
+    expect(result.error_code).toBe('tool.invalid_arg');
+    expect(result.error_message).toContain('control character');
+  });
+
   test('rejects unknown kind', async () => {
     const result = await pinContextTool.execute(
       // biome-ignore lint/suspicious/noExplicitAny: invalid value test
@@ -162,16 +132,6 @@ describe('pin_context tool: input validation', () => {
     if (!isToolError(result)) throw new Error('expected tool error');
     expect(result.error_code).toBe('tool.invalid_arg');
     expect(result.hint).toContain('30m');
-  });
-
-  test('rejects non-string expires_in', async () => {
-    const result = await pinContextTool.execute(
-      // biome-ignore lint/suspicious/noExplicitAny: invalid value test
-      { text: 'x', expires_in: 30 as any },
-      newCtx(),
-    );
-    if (!isToolError(result)) throw new Error('expected tool error');
-    expect(result.error_code).toBe('tool.invalid_arg');
   });
 });
 
@@ -195,34 +155,33 @@ describe('pin_context tool: injection scanner', () => {
   });
 });
 
-describe('pin_context tool: cap enforcement', () => {
-  test('returns pin.cap_exceeded when session already has 10 pins', async () => {
-    for (let i = 0; i < PIN_CAP; i++) {
-      store.createPin({
-        sessionId,
-        text: `existing pin ${i}`,
-        kind: 'constraint',
-        createdBy: 'user',
-      });
-    }
-    const result = await pinContextTool.execute({ text: 'overflow proposal' }, newCtx());
+describe('pin_context tool: plumbing', () => {
+  test('refuses when contextPinsStore is missing', async () => {
+    const { contextPinsStore: _omit, ...ctx } = newCtx();
+    void _omit;
+    const result = await pinContextTool.execute({ text: 'something' }, ctx);
     if (!isToolError(result)) throw new Error('expected tool error');
-    expect(result.error_code).toBe('pin.cap_exceeded');
-    expect(result.details).toEqual({
-      currentCount: PIN_CAP,
-      cap: PIN_CAP,
-      sessionId,
-    });
-    // The proposal itself never landed.
-    expect(store.listPinsBySession(sessionId)).toHaveLength(PIN_CAP);
+    expect(result.error_code).toBe('pin.store_unavailable');
+  });
+
+  test('refuses when signal already aborted', async () => {
+    const ctrl = new AbortController();
+    ctrl.abort();
+    const result = await pinContextTool.execute(
+      { text: 'something' },
+      newCtx({ signal: ctrl.signal }),
+    );
+    if (!isToolError(result)) throw new Error('expected tool error');
+    expect(result.error_code).toBe('tool.aborted');
+    expect(result.retryable).toBe(true);
   });
 });
 
 describe('pin_context tool: metadata', () => {
-  test('declares writes + escapesCwd + requiresOperatorConfirm', () => {
+  test('declares writes + escapesCwd, no operator confirm', () => {
     expect(pinContextTool.metadata.writes).toBe(true);
     expect(pinContextTool.metadata.escapesCwd).toBe(true);
-    expect(pinContextTool.metadata.requiresOperatorConfirm).toBe(true);
+    expect(pinContextTool.metadata.requiresOperatorConfirm).toBeUndefined();
     expect(pinContextTool.metadata.idempotent).toBe(false);
   });
 });

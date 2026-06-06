@@ -365,6 +365,13 @@ export interface LiveState {
   // step-stall watchdog (90s default) would have caught a real
   // problem.
   awaitingProvider: { stepN: number; startedAt: number } | null;
+  // "Compacting context…" indicator. Set by `compacting:start` (from /compact, or
+  // the adapter on the loop's auto compaction), cleared by `compacting:end`.
+  // Rendered by compose.ts's chip-slot at LOWEST priority — a compaction
+  // runs only between steps / with no turn, so the turn chips are null when
+  // it shows, and a stray one never masks live work. Like awaitingProvider
+  // it carries only `startedAt`, for the elapsed timer.
+  compacting: { startedAt: number } | null;
   // Id of the assistant message driving the current turn, or null
   // between turns. Set by whichever of `thinking:start` /
   // `assistant:start` opens the turn and held through the tool
@@ -491,15 +498,18 @@ export interface QueuedInput {
 
 // True when something in the live region is animating and the frame
 // scheduler must keep redrawing: a running tool's spinner, the thinking /
-// awaiting-provider duration counters, a streaming assistant chip — or a
-// task marked in_progress, whose `Tasks` header carries the live-verb
-// shimmer (render/todo-list.ts). Goes false (scheduler idles, zero wakeups)
-// once none of those hold. The renderer's heartbeat polls this each tick.
+// awaiting-provider / compacting duration counters, a streaming assistant
+// chip — or a task marked in_progress, whose `Tasks` header carries the
+// live-verb shimmer (render/todo-list.ts). Goes false (scheduler idles,
+// zero wakeups) once none of those hold. The renderer's heartbeat polls
+// this each tick. MISS one and that chip renders once then freezes — no
+// spinner motion, no ticking [elapsed] — until the next unrelated redraw.
 export const liveRegionActive = (state: LiveState): boolean =>
   state.activeTools.size > 0 ||
   state.thinking !== null ||
   state.pendingAssistant !== null ||
   state.awaitingProvider !== null ||
+  state.compacting !== null ||
   state.todos.some((t) => t.status === 'in_progress');
 
 export const createInitialState = (): LiveState => ({
@@ -526,6 +536,7 @@ export const createInitialState = (): LiveState => ({
   pendingAssistant: null,
   thinking: null,
   awaitingProvider: null,
+  compacting: null,
   currentTurnId: null,
   busy: false,
   modal: null,
@@ -902,6 +913,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           // crashed prior run (e.g., resume after parent crash mid-
           // step) shouldn't carry into a fresh turn.
           awaitingProvider: null,
+          compacting: null,
           // Same per-session rationale: a stale turn id from a
           // crashed prior run must not seed the new session's first
           // tool-phase verb.
@@ -962,6 +974,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           // — the footer would then show "Awaiting model" against a
           // run that's already terminated.
           awaitingProvider: null,
+          compacting: null,
           // Boundary cleanup: see session:start.
           currentTurnId: null,
           ended: true,
@@ -1410,6 +1423,19 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // throw.
       if (state.awaitingProvider === null) return { state, permanent: [] };
       return { state: { ...state, awaitingProvider: null }, permanent: [] };
+    }
+
+    case 'compacting:start': {
+      // Open the "Compacting context…" chip. Idempotent: a re-emit just refreshes
+      // startedAt. /compact and the auto path both bracket with :end, so
+      // this never lingers past the compaction.
+      return { state: { ...state, compacting: { startedAt: event.ts } }, permanent: [] };
+    }
+
+    case 'compacting:end': {
+      // Close it. Safe when nothing is open (duplicate / unmatched end).
+      if (state.compacting === null) return { state, permanent: [] };
+      return { state: { ...state, compacting: null }, permanent: [] };
     }
 
     case 'checkpoint:create':

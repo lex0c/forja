@@ -411,6 +411,20 @@ export const updateSessionCost = (db: DB, id: string, totalCostUsd: number): voi
   }
 };
 
+// Flip a session's usage_complete to false WITHOUT ending it: the recorded
+// cost became a lower bound because a usage event never arrived. Operator
+// /compact uses this when its summary call billed tokens but the provider
+// failed before reporting usage — the loop's auto-compaction does the
+// equivalent via the in-memory usageComplete flag that completeSession
+// persists, but /compact runs outside that finish path. Reuse turns carry
+// it forward: completeSession folds priorUsageComplete && usageComplete.
+export const markSessionUsageIncomplete = (db: DB, id: string): void => {
+  const result = db.query('UPDATE sessions SET usage_complete = 0 WHERE id = ?').run(id);
+  if (result.changes === 0) {
+    throw new Error(`session ${id} not found`);
+  }
+};
+
 // Flip a previously-finalized session back to 'running' so a resume
 // continuation can reuse the same id. Idempotent — calling on an
 // already-running session is a no-op. Without this, completeSession

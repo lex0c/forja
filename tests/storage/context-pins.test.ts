@@ -7,7 +7,6 @@ import {
   InvalidPinError,
   PIN_CAP,
   PIN_TEXT_MAX_LENGTH,
-  PinCapExceededError,
   countActivePinsBySession,
   createPin,
   getActivePinsBySession,
@@ -107,86 +106,59 @@ describe('context_pins repo: create + read', () => {
   });
 });
 
-describe('context_pins repo: cap enforcement', () => {
-  test('refuses an 11th pin in the same session', () => {
+describe('context_pins repo: ring buffer (cap PIN_CAP)', () => {
+  test('an 11th pin evicts the oldest, staying at PIN_CAP', () => {
     for (let i = 0; i < PIN_CAP; i++) {
-      createPin(db, validInput({ text: `pin ${i}` }));
+      createPin(db, validInput({ text: `pin ${i}`, createdAt: 1000 + i }));
     }
-    expect(() => createPin(db, validInput({ text: 'overflow' }))).toThrow(PinCapExceededError);
+    createPin(db, validInput({ text: 'overflow', createdAt: 9999 }));
+    const texts = listPinsBySession(db, sessionId).map((p) => p.text);
+    expect(texts).toHaveLength(PIN_CAP); // capped — no overflow row, no throw
+    expect(texts).toContain('overflow');
+    expect(texts).not.toContain('pin 0'); // oldest evicted
+    expect(texts).toContain('pin 1');
   });
 
-  test('cap is per-session, not global', () => {
+  test('eviction is per-session, not global', () => {
     const otherSession = createSession(db, { model: 'm', cwd: '/p' }).id;
     for (let i = 0; i < PIN_CAP; i++) {
-      createPin(db, validInput({ text: `mine ${i}` }));
+      createPin(db, validInput({ text: `mine ${i}`, createdAt: 1000 + i }));
     }
-    // Another session still has room.
-    expect(() => createPin(db, validInput({ sessionId: otherSession, text: 'ok' }))).not.toThrow();
+    // This session at the cap doesn't evict another session's pins.
+    createPin(db, validInput({ sessionId: otherSession, text: 'theirs' }));
+    expect(listPinsBySession(db, otherSession)).toHaveLength(1);
+    expect(listPinsBySession(db, sessionId)).toHaveLength(PIN_CAP);
   });
 
-  test('removed pin frees a slot', () => {
-    const ids: string[] = [];
-    for (let i = 0; i < PIN_CAP; i++) {
-      ids.push(createPin(db, validInput({ text: `pin ${i}` })).id);
-    }
-    expect(() => createPin(db, validInput({ text: 'overflow' }))).toThrow(PinCapExceededError);
-    const firstId = ids[0];
-    if (firstId === undefined) throw new Error('test setup: ids unexpectedly empty');
-    expect(removePin(db, firstId)).toBe(true);
-    expect(() => createPin(db, validInput({ text: 'now fits' }))).not.toThrow();
+  test('removePin frees a row (operator /pin --remove path)', () => {
+    const id = createPin(db, validInput({ text: 'pin' })).id;
+    expect(removePin(db, id)).toBe(true);
+    expect(listPinsBySession(db, sessionId)).toHaveLength(0);
   });
 
-  test('cap counts only ACTIVE pins — expired rows do not occupy capacity', () => {
-    // Regression: counting expired pins toward the cap produced a
-    // dead-end for operators who created 10 short-lived pins. After
-    // expiry, /pin --list showed nothing (it filters to active) but
-    // createPin still refused — and there were no listable IDs to
-    // remove. The cap is now the ACTIVE surface budget; expired
-    // rows linger as history but free their slot.
+  test('eviction counts only ACTIVE pins — expired rows do not occupy the budget', () => {
     const now = 1_000_000;
     const past = now - 60_000;
     for (let i = 0; i < PIN_CAP; i++) {
-      createPin(db, validInput({ text: `expired ${i}`, expiresAt: past }));
+      createPin(db, validInput({ text: `expired ${i}`, expiresAt: past, createdAt: i }));
     }
-    // The 10 rows are still on disk but every one of them is past
-    // expiry — a new create at `now` finds zero active pins.
-    expect(() => createPin(db, validInput({ text: 'fresh room', now }))).not.toThrow();
+    // All 10 are past expiry — a fresh active pin finds zero active and
+    // lands without evicting anything.
+    createPin(db, validInput({ text: 'fresh', now }));
+    expect(getActivePinsBySession(db, sessionId, now).map((p) => p.text)).toEqual(['fresh']);
   });
 
-  test('cap counts a mix of active + expired by the active subset only', () => {
+  test('at the ACTIVE cap, the oldest ACTIVE is evicted (expired ignored)', () => {
     const now = 2_000_000;
-    const past = now - 60_000;
     const future = now + 60_000;
-    // Six active (expires in the future) + four expired = 10 rows
-    // total but only 6 occupying the cap.
-    for (let i = 0; i < 6; i++) {
-      createPin(db, validInput({ text: `live ${i}`, expiresAt: future }));
+    for (let i = 0; i < PIN_CAP; i++) {
+      createPin(db, validInput({ text: `live ${i}`, expiresAt: future, createdAt: 1000 + i, now }));
     }
-    for (let i = 0; i < 4; i++) {
-      createPin(db, validInput({ text: `dead ${i}`, expiresAt: past }));
-    }
-    // Four more actives still fit (6 + 4 = 10).
-    for (let i = 0; i < 4; i++) {
-      createPin(db, validInput({ text: `additional ${i}`, expiresAt: future, now }));
-    }
-    // 11th active is refused.
-    expect(() => createPin(db, validInput({ text: 'overflow', expiresAt: future, now }))).toThrow(
-      PinCapExceededError,
-    );
-  });
-
-  test('PinCapExceededError carries diagnostic fields', () => {
-    for (let i = 0; i < PIN_CAP; i++) createPin(db, validInput({ text: `pin ${i}` }));
-    try {
-      createPin(db, validInput({ text: 'overflow' }));
-      throw new Error('should have thrown');
-    } catch (err) {
-      expect(err).toBeInstanceOf(PinCapExceededError);
-      const e = err as PinCapExceededError;
-      expect(e.sessionId).toBe(sessionId);
-      expect(e.currentCount).toBe(PIN_CAP);
-      expect(e.cap).toBe(PIN_CAP);
-    }
+    createPin(db, validInput({ text: 'newest', expiresAt: future, createdAt: 9999, now }));
+    const texts = getActivePinsBySession(db, sessionId, now).map((p) => p.text);
+    expect(texts).toHaveLength(PIN_CAP);
+    expect(texts).toContain('newest');
+    expect(texts).not.toContain('live 0'); // oldest active evicted
   });
 });
 

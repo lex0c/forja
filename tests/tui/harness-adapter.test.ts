@@ -1053,10 +1053,11 @@ describe('harness-adapter — compaction & checkpoints', () => {
       threshold: 70000,
       contextWindow: 100000,
     });
-    expect(types(out)).toEqual(['warn']);
+    // Live chip open + the scrollback record.
+    expect(types(out)).toEqual(['compacting:start', 'warn']);
   });
 
-  test('compaction_finished skipped → no event', () => {
+  test('compaction_finished skipped → closes the chip, no warn', () => {
     const a = createHarnessAdapter(baseCtx());
     const out = a.translate({
       type: 'compaction_finished',
@@ -1066,7 +1067,8 @@ describe('harness-adapter — compaction & checkpoints', () => {
       usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
       costUsd: 0,
     });
-    expect(out).toEqual([]);
+    // Chip closes even on skipped; the warn is suppressed (nothing folded).
+    expect(types(out)).toEqual(['compacting:end']);
   });
 
   test('compaction_finished llm → warn with details', () => {
@@ -1079,8 +1081,9 @@ describe('harness-adapter — compaction & checkpoints', () => {
       usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
       costUsd: 0.001,
     });
-    expect(types(out)).toEqual(['warn']);
-    const w = out[0] as Extract<UIEvent, { type: 'warn' }>;
+    // Chip closes, then the scrollback record.
+    expect(types(out)).toEqual(['compacting:end', 'warn']);
+    const w = out[1] as Extract<UIEvent, { type: 'warn' }>;
     expect(w.message).toContain('llm');
     expect(w.message).toContain('12');
     expect(w.message).toContain('850ms');

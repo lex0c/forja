@@ -56,6 +56,11 @@ export const TOOL_VOCAB: Readonly<Record<string, ToolVocab>> = {
     activeVerb: 'Asking',
     finalVerb: 'Question answered',
   },
+  pin_context: {
+    activeVerb: 'Pinning context',
+    finalVerb: 'Pinned context',
+    subject: (a) => str(a.text),
+  },
   read_file: {
     activeVerb: 'Reading file',
     finalVerb: 'Read file',

@@ -175,20 +175,17 @@ describe('buildResumeContext — pins', () => {
     expect(result.text).toContain('  - [reminder] tests live under tests/');
   });
 
-  test('pins from the pin_context tool get a (model) suffix', () => {
-    // createdBy === 'model_proposed_user_approved' marks pins that
-    // came through the tool path (operator approved a model
-    // proposal via the modal). Operator-direct pins (/pin) get
-    // no suffix to keep the common case quiet.
+  test('pins the model created get a (model) suffix; operator pins do not', () => {
+    // createdBy 'model' marks pins the model created via the pin_context
+    // tool; the legacy 'model_proposed_user_approved' value gets the same
+    // marker. Operator-direct pins (/pin, createdBy 'user') get no suffix
+    // to keep the common case quiet.
     const result = buildResumeContext({
       intermediate: baseIntermediate({
         pinnedContext: [
           { kind: 'constraint', text: 'operator pin', createdBy: 'user' },
-          {
-            kind: 'workflow',
-            text: 'model-proposed pin',
-            createdBy: 'model_proposed_user_approved',
-          },
+          { kind: 'workflow', text: 'model pin', createdBy: 'model' },
+          { kind: 'invariant', text: 'legacy pin', createdBy: 'model_proposed_user_approved' },
         ],
       }),
       previousStatus: 'interrupted',
@@ -196,7 +193,8 @@ describe('buildResumeContext — pins', () => {
     });
     expect(result.text).toContain('  - [constraint] operator pin');
     expect(result.text).not.toContain('  - [constraint] operator pin (model)');
-    expect(result.text).toContain('  - [workflow] model-proposed pin (model)');
+    expect(result.text).toContain('  - [workflow] model pin (model)');
+    expect(result.text).toContain('  - [invariant] legacy pin (model)');
   });
 
   test('pins survive an aggressive truncation budget', () => {

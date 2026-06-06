@@ -1,11 +1,12 @@
 // context_pins repo. Per CONTEXT_TUNING.md §12.4 — pinned context
-// primitive. Cap of 10 pins per session is enforced here via
-// withImmediateTransaction (read count, refuse if ≥ 10, insert
-// atomically) because SQLite CHECK can't reference COUNT subqueries.
+// primitive. Cap of 10 pins per session via withImmediateTransaction
+// (read count, evict the oldest active pin when already at the cap,
+// then insert — a ring buffer) because SQLite CHECK can't reference
+// COUNT subqueries.
 //
 // Surface:
 //
-//   createPin(db, input)              → ContextPin              throws PinCapExceededError, InvalidPinError
+//   createPin(db, input)              → ContextPin              ring buffer (PIN_CAP): evicts oldest; throws InvalidPinError
 //   getPin(db, id)                    → ContextPin | null
 //   listPinsBySession(db, sid)        → ContextPin[]            all pins (no expiry filter)
 //   getActivePinsBySession(db, sid)   → ContextPin[]            filters expired
@@ -28,7 +29,10 @@ export const PIN_TEXT_MAX_LENGTH = 500;
 export const PIN_KINDS = ['constraint', 'workflow', 'invariant', 'reminder'] as const;
 export type PinKind = (typeof PIN_KINDS)[number];
 
-export const PIN_CREATED_BY = ['user', 'model_proposed_user_approved'] as const;
+// 'model' = the pin_context tool created it directly (no modal). 'user' =
+// /pin slash command. 'model_proposed_user_approved' = legacy (the modal
+// proposal flow that never shipped; kept for CHECK/fixture compatibility).
+export const PIN_CREATED_BY = ['user', 'model_proposed_user_approved', 'model'] as const;
 export type PinCreatedBy = (typeof PIN_CREATED_BY)[number];
 
 export interface ContextPin {
@@ -41,7 +45,7 @@ export interface ContextPin {
   // NULL = lives until end of session (cascade reaps on purge).
   // Epoch ms otherwise.
   expiresAt: number | null;
-  // Step that originated a model-proposed pin; NULL for /pin slash.
+  // Step that originated a model-created pin; NULL for /pin slash.
   sourceStepId: string | null;
 }
 
@@ -94,28 +98,10 @@ const valuesForInsert = (row: ContextPinRow): SQLQueryBindings[] =>
     return (v ?? null) as SQLQueryBindings;
   });
 
-// Cap exceeded is a routine outcome (operator + model can both
-// trigger it under §12.4.2's 10-pin ceiling), not a programming
-// error. UI should render the message and suggest /pin --remove.
-export class PinCapExceededError extends Error {
-  readonly sessionId: string;
-  readonly currentCount: number;
-  readonly cap: number;
-  constructor(sessionId: string, currentCount: number, cap: number = PIN_CAP) {
-    super(
-      `context_pins: session ${sessionId} already has ${currentCount} pins (cap ${cap}); remove one first`,
-    );
-    this.name = 'PinCapExceededError';
-    this.sessionId = sessionId;
-    this.currentCount = currentCount;
-    this.cap = cap;
-  }
-}
-
-// Invalid input from the slash parser or the model-proposed tool
-// confirmation flow. The DB-level CHECK constraints catch the same
-// shapes but a TS-level throw gives the caller a structured field
-// hint without needing to parse a SQLite error string.
+// Invalid input from the slash parser or the pin_context tool. The
+// DB-level CHECK constraints catch the same shapes but a TS-level
+// throw gives the caller a structured field hint without needing to
+// parse a SQLite error string.
 export class InvalidPinError extends Error {
   readonly field: string;
   constructor(field: string, reason: string) {
@@ -198,7 +184,7 @@ export interface CreatePinInput {
   createdAt?: number;
   // Optional epoch ms — NULL means "lives until end of session".
   expiresAt?: number | null;
-  // Optional step_id for model-proposed pins; NULL for /pin slash.
+  // Optional step_id for model-created pins; NULL for /pin slash.
   sourceStepId?: string | null;
   // Optional wall-clock anchor for the cap check (expired pins
   // don't count toward the cap). Defaults to Date.now() in
@@ -275,7 +261,22 @@ export const createPin = (db: DB, input: CreatePinInput): ContextPin => {
       )
       .get(input.sessionId, nowMs) ?? { count: 0 };
     if (count >= PIN_CAP) {
-      throw new PinCapExceededError(input.sessionId, count);
+      // Ring buffer (cap PIN_CAP): the pin list is a bounded stack the model
+      // only ever pushes to (no remove tool). At the cap, a new pin evicts
+      // the OLDEST active one(s) instead of being rejected — the most recent
+      // pins win, the count stays honest, and the model never has to free a
+      // slot. Same writer lock as the count, so evict+insert is atomic.
+      const overflow = count - PIN_CAP + 1;
+      db.query(
+        `DELETE FROM context_pins
+          WHERE id IN (
+            SELECT id FROM context_pins
+              WHERE session_id = ?
+                AND (expires_at IS NULL OR expires_at > ?)
+              ORDER BY created_at ASC, id ASC
+              LIMIT ?
+          )`,
+      ).run(input.sessionId, nowMs, overflow);
     }
     db.query(INSERT_SQL).run(...valuesForInsert(row));
     return fromRow(row);
@@ -321,6 +322,19 @@ export const getActivePinsBySession = (
     .all(sessionId, now);
   return rows.map(fromRow);
 };
+
+// Format active pins as the literal block that compaction + resume
+// re-inject so the model keeps honoring them across folds
+// (CONTEXT_TUNING §12.4): `[kind] text`, with a `(model)` marker for
+// non-operator pins. undefined when there are none. Shared by the
+// harness loop's auto-compaction and the /compact slash command so the
+// two produce byte-identical pin blocks.
+export const formatPinnedBlock = (pins: ContextPin[]): string | undefined =>
+  pins.length > 0
+    ? `Active pins (constraints still in force this session):\n${pins
+        .map((p) => `  - [${p.kind}] ${p.text}${p.createdBy !== 'user' ? ' (model)' : ''}`)
+        .join('\n')}`
+    : undefined;
 
 // Cheap count used by `/pin --list` summary header ("3/10 pins
 // active"). Counting in SQL is faster than getActivePinsBySession

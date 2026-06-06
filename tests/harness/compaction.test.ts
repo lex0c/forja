@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { compactMessages } from '../../src/harness/compaction.ts';
+import {
+  type CompactionResult,
+  accountCompaction,
+  compactMessages,
+} from '../../src/harness/compaction.ts';
 import type {
   GenerateRequest,
   Provider,
@@ -88,6 +92,110 @@ const buildHistory = (turns: number): ProviderMessage[] => {
   }
   return out;
 };
+
+describe('compactMessages — pinned context', () => {
+  test('preserves pinnedBlock literally INSIDE the compacted_history block', async () => {
+    const handle = mockProvider(() => replyText('GOAL: x\nDECISIONS: y'));
+    const result = await compactMessages(handle.provider, buildHistory(5), {
+      preserveTail: 3,
+      pinnedBlock: 'Active pins:\n  - [constraint] API X cannot change (model)',
+    });
+    expect(result.strategy).toBe('llm');
+    const text = typeof result.messages[0]?.content === 'string' ? result.messages[0].content : '';
+    // Pin present, verbatim (never summarized).
+    expect(text).toContain('[constraint] API X cannot change (model)');
+    // Positioned INSIDE the markers, so the next compaction strips it as a
+    // unit with the summary (no unbounded growth).
+    const open = text.indexOf('[compacted_history]');
+    const close = text.indexOf('[/compacted_history]');
+    const pin = text.indexOf('API X cannot change');
+    expect(open).toBeGreaterThanOrEqual(0);
+    expect(open).toBeLessThan(pin);
+    expect(pin).toBeLessThan(close);
+  });
+
+  test('re-compaction does not accumulate pins (prior block stripped)', async () => {
+    const handle = mockProvider(() => replyText('GOAL: x'));
+    // A goal that already carries a prior compacted_history with an OLD pin.
+    const goalWithOld: ProviderMessage = {
+      role: 'user',
+      content:
+        'Original goal: refactor\n\n[compacted_history]\nprior summary\nActive pins:\n  - [constraint] OLD pin\n[/compacted_history]',
+    };
+    const history = [goalWithOld, ...buildHistory(5).slice(1)];
+    const result = await compactMessages(handle.provider, history, {
+      preserveTail: 3,
+      pinnedBlock: 'Active pins:\n  - [constraint] NEW pin',
+    });
+    const text = typeof result.messages[0]?.content === 'string' ? result.messages[0].content : '';
+    expect(text).toContain('Original goal: refactor'); // original goal kept
+    expect(text).toContain('NEW pin'); // current pins present
+    expect(text).not.toContain('OLD pin'); // prior pins stripped, not piled up
+    expect(text.split('[compacted_history]')).toHaveLength(2); // exactly one block, no dup
+  });
+
+  test('no pinnedBlock ⇒ summary block unchanged (pins are opt-in)', async () => {
+    const handle = mockProvider(() => replyText('GOAL: x'));
+    const result = await compactMessages(handle.provider, buildHistory(5), { preserveTail: 3 });
+    const text = typeof result.messages[0]?.content === 'string' ? result.messages[0].content : '';
+    expect(text).toContain('[compacted_history]');
+    expect(text).not.toContain('Active pins:');
+  });
+
+  test('pin text with $-substitution patterns is inserted literally', async () => {
+    // Regression: String.replace's string form interprets $&/$`/$'/$$ in the
+    // replacement. A pin with "$&" would inject the matched close marker; "$`"
+    // would delete the summary. We use slice, so the patterns stay verbatim.
+    const handle = mockProvider(() => replyText('GOAL: real summary here'));
+    const result = await compactMessages(handle.provider, buildHistory(5), {
+      preserveTail: 3,
+      pinnedBlock: 'Active pins:\n  - [constraint] use $& and $` carefully',
+    });
+    const text = typeof result.messages[0]?.content === 'string' ? result.messages[0].content : '';
+    expect(text).toContain('use $& and $` carefully'); // literal, not substituted
+    expect(text).toContain('real summary here'); // summary not deleted (a $` would)
+    expect(text.split('[/compacted_history]')).toHaveLength(2); // no spurious marker ($&)
+  });
+
+  test('pin text containing our own markers is neutralized (block not prematurely closed)', async () => {
+    const handle = mockProvider(() => replyText('GOAL: real summary'));
+    const result = await compactMessages(handle.provider, buildHistory(5), {
+      preserveTail: 3,
+      pinnedBlock: 'Active pins:\n  - [constraint] never emit [/compacted_history] please',
+    });
+    const text = typeof result.messages[0]?.content === 'string' ? result.messages[0].content : '';
+    // Exactly one REAL open + close marker: the pin's embedded close was
+    // defanged, so stripPriorSummary on the next compaction matches the whole
+    // block (no truncation/corruption/accumulation).
+    expect(text.split('[compacted_history]')).toHaveLength(2);
+    expect(text.split('[/compacted_history]')).toHaveLength(2);
+    expect(text).toContain('real summary'); // summary intact
+    expect(text).toContain('never emit'); // pin still present
+    expect(text).not.toContain('[/compacted_history] please'); // marker neutralized
+  });
+
+  test('pinnedBlock is never sent to the summary LLM (pins are not re-summarized)', async () => {
+    const handle = mockProvider(() => replyText('GOAL: x'));
+    await compactMessages(handle.provider, buildHistory(5), {
+      preserveTail: 3,
+      pinnedBlock: 'Active pins:\n  - [constraint] SENTINEL-PIN-TOKEN',
+    });
+    // The pin text must not appear in anything sent to the provider.
+    expect(JSON.stringify(handle.generateCalls)).not.toContain('SENTINEL-PIN-TOKEN');
+  });
+
+  test('fallback path (LLM error) does not crash with pins set', async () => {
+    const handle = mockProvider(new Error('provider down'));
+    const result = await compactMessages(handle.provider, buildHistory(5), {
+      preserveTail: 3,
+      pinnedBlock: 'Active pins:\n  - [constraint] x',
+    });
+    // Documented degradation: fallback keeps the prior block, doesn't inject
+    // the current pins — but it must not throw.
+    expect(result.strategy).toBe('fallback');
+    expect(result.messages.length).toBeGreaterThan(0);
+  });
+});
 
 describe('compactMessages — LLM path', () => {
   test('merges summary into the goal message and preserves trailing turn(s)', async () => {
@@ -592,7 +700,17 @@ describe('compactMessages — deterministic fallback', () => {
     });
     const result = await compactMessages(handle.provider, buildHistory(5), { preserveTail: 3 });
     expect(result.strategy).toBe('fallback');
-    expect(result.reason).toContain('empty summary');
+    expect(result.reason).toContain('empty or markers-only');
+  });
+
+  test('falls back when the summary is markers-only (silent-loss guard)', async () => {
+    // A model that emits only the markers (a refusal, or a degenerate
+    // response) must NOT be accepted as a successful summary that silently
+    // drops the whole middle — it falls back to deterministic elision.
+    const handle = mockProvider(() => replyText('[compacted_history]\n   \n[/compacted_history]'));
+    const result = await compactMessages(handle.provider, buildHistory(5), { preserveTail: 3 });
+    expect(result.strategy).toBe('fallback');
+    expect(result.reason).toContain('markers-only');
   });
 
   test('forwards abort signal through to the provider call', async () => {
@@ -605,5 +723,60 @@ describe('compactMessages — deterministic fallback', () => {
     });
     // abortableIterable surfaces the abort as a thrown error → fallback.
     expect(result.strategy).toBe('fallback');
+  });
+});
+
+// The shared cost + usage-completeness decision both fold surfaces apply
+// (loop's maybeCompact, operator /compact). Two parity bugs lived in
+// re-implementing this by hand; pinning the decision here guards the class.
+describe('accountCompaction (shared cost + usage decision)', () => {
+  const caps: Provider['capabilities'] = {
+    ...baseCaps,
+    cost_per_1k_input: 3,
+    cost_per_1k_output: 15,
+  };
+  const mk = (over: Partial<CompactionResult>): CompactionResult => ({
+    messages: [],
+    strategy: 'llm',
+    foldedCount: 0,
+    usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+    usageSeen: true,
+    ...over,
+  });
+
+  test('llm with usage seen → cost folded, usage complete', () => {
+    const a = accountCompaction(
+      mk({
+        strategy: 'llm',
+        usage: { input: 1000, output: 100, cache_read: 0, cache_creation: 0 },
+      }),
+      caps,
+    );
+    expect(a.costUsd).toBeGreaterThan(0);
+    expect(a.usageIncomplete).toBe(false);
+  });
+
+  test('fallback without usage seen → usage incomplete even at zero cost', () => {
+    const a = accountCompaction(mk({ strategy: 'fallback', usageSeen: false }), caps);
+    expect(a.costUsd).toBe(0);
+    expect(a.usageIncomplete).toBe(true);
+  });
+
+  test('skipped → never incomplete (no call was made)', () => {
+    const a = accountCompaction(mk({ strategy: 'skipped', usageSeen: false }), caps);
+    expect(a.usageIncomplete).toBe(false);
+  });
+
+  test('fallback WITH partial usage seen → cost folded, usage complete', () => {
+    const a = accountCompaction(
+      mk({
+        strategy: 'fallback',
+        usageSeen: true,
+        usage: { input: 500, output: 0, cache_read: 0, cache_creation: 0 },
+      }),
+      caps,
+    );
+    expect(a.costUsd).toBeGreaterThan(0);
+    expect(a.usageIncomplete).toBe(false);
   });
 });
