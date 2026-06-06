@@ -18,6 +18,18 @@ const HOME = '/home/op';
 // argv assertions don't depend on the runner's data dir / create a file.
 const MASK = '/forja-mask-empty';
 
+// Defensive isolation: the persistence toggles are PROCESS-GLOBAL modules
+// (sandbox-cache-env / sandbox-cache-dirs) and `bun test` shares modules
+// across files. Other files that run bootstrap() set them — with default-ON,
+// bootstrap sets cachePersistence=true — and a leaked override would corrupt
+// the argv-shape assertions here that assume the default (off). Reset both
+// before EVERY test; the persistent-cache / dev-cache describes set their own
+// values in their own hooks/bodies (which run after this top-level one).
+beforeEach(() => {
+  setCachePersistenceOverride(undefined);
+  setWritableCacheDirsOverride(undefined);
+});
+
 describe('buildBwrapArgv — host profile (passthrough)', () => {
   test('host returns innerArgv unchanged', () => {
     const argv = buildBwrapArgv({

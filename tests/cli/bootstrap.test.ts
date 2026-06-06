@@ -3,6 +3,8 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULT_MODEL, bootstrap } from '../../src/cli/bootstrap.ts';
+import { setWritableCacheDirsOverride } from '../../src/permissions/sandbox-cache-dirs.ts';
+import { setCachePersistenceOverride } from '../../src/permissions/sandbox-cache-env.ts';
 import type { Provider } from '../../src/providers/index.ts';
 import { flattenSystemSegments } from '../../src/providers/types.ts';
 
@@ -57,6 +59,11 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // The persistence toggles are process-global; bootstrap() sets them
+  // (default-ON → cachePersistence=true). Reset so they don't leak into
+  // other test files (bun shares modules across the run).
+  setCachePersistenceOverride(undefined);
+  setWritableCacheDirsOverride(undefined);
   rmSync(workdir, { recursive: true, force: true });
   if (originalKey === undefined) delete process.env.ANTHROPIC_API_KEY;
   else process.env.ANTHROPIC_API_KEY = originalKey;

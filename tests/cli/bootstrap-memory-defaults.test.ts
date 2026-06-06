@@ -19,6 +19,8 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { bootstrap } from '../../src/cli/bootstrap.ts';
+import { setWritableCacheDirsOverride } from '../../src/permissions/sandbox-cache-dirs.ts';
+import { setCachePersistenceOverride } from '../../src/permissions/sandbox-cache-env.ts';
 import type { Provider } from '../../src/providers/index.ts';
 
 let workdir: string;
@@ -89,6 +91,10 @@ beforeEach(() => {
 
 afterEach(() => {
   restoreStderr();
+  // Persistence toggles are process-global; bootstrap() sets them
+  // (default-ON). Reset so they don't leak into other test files.
+  setCachePersistenceOverride(undefined);
+  setWritableCacheDirsOverride(undefined);
   rmSync(workdir, { recursive: true, force: true });
   if (originalKey === undefined) delete process.env.ANTHROPIC_API_KEY;
   else process.env.ANTHROPIC_API_KEY = originalKey;
