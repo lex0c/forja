@@ -27,7 +27,6 @@ import { addUsage, computeCost, emptyUsage } from '../providers/cost.ts';
 import type {
   GenerateRequest,
   ProviderContentBlock,
-  ProviderMessage,
   ProviderToolDef,
   ProviderToolResultBlock,
   ProviderToolUseBlock,
@@ -40,17 +39,19 @@ import { buildRetrievalRunner } from '../retrieval/index.ts';
 import { redactSecrets } from '../sanitize/secrets.ts';
 import {
   type SessionStatus,
-  appendMessage,
   completeSession,
   createSession,
   getSession,
   insertCostProgressEvent,
   insertSubagentGateDecision,
-  listMessageTailBySession,
   reopenSession,
 } from '../storage/index.ts';
 import { listApprovalsLogBySessionRecent } from '../storage/repos/approvals-log.ts';
-import { createContextPinsStore, getActivePinsBySession } from '../storage/repos/context-pins.ts';
+import {
+  createContextPinsStore,
+  formatPinnedBlock,
+  getActivePinsBySession,
+} from '../storage/repos/context-pins.ts';
 import { createDispatchRewrite } from '../storage/repos/dispatch-rewrites.ts';
 import { getEagerProvenanceKeys, recordProvenance } from '../storage/repos/memory-provenance.ts';
 import { type SubagentHandleStore, createSubagentHandleStore } from '../subagents/handle-store.ts';
@@ -61,16 +62,11 @@ import type { ToolContext } from '../tools/index.ts';
 import type { SpawnSubagentArgs, SpawnSubagentResult } from '../tools/types.ts';
 import { StepStallError, abortableIterable, stallWatchdog } from './abortable.ts';
 import { CollectStepError, type CollectedToolUse, collectStep } from './collect.ts';
-import { compactMessages } from './compaction.ts';
 import { resolveProviderEffort } from './effort.ts';
 import { invokeTool } from './invoke-tool.ts';
-import {
-  ALIGNMENT_FETCH_MARGIN,
-  MAX_RESUME_MESSAGES,
-  STRANDED_TURN_PLACEHOLDER,
-  messagesToProviderMessages,
-} from './resume.ts';
+import { MAX_RESUME_MESSAGES } from './resume.ts';
 import { DEFAULT_RETRY, generateWithRetry } from './retry.ts';
+import { type HydrateInfo, SessionContext } from './session-context.ts';
 import {
   type ExitReason,
   type HarnessConfig,
@@ -222,7 +218,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   const callerSignal = config.signal ?? new AbortController().signal;
   const signal = AbortSignal.any([callerSignal, wallClockController.signal]);
 
-  const messages: ProviderMessage[] = [];
+  // Single in-memory source of truth for this run's conversation
+  // (project_message_single_source). Resolved in the session-decision
+  // block below — reused (REPL multi-turn), hydrated from the DB log
+  // (resume/preassigned), or fresh. `| undefined` only until that
+  // block runs; a guard right after it narrows the rest of the loop.
+  let ctx: SessionContext | undefined;
+  // Resume-truncation diagnostics captured by hydrateFromDb (resume path).
+  let hydrateInfo: HydrateInfo | null = null;
   const tools = buildToolDefs(config);
   const recentToolHashes: string[] = [];
   const HASH_WINDOW = 5;
@@ -242,7 +245,6 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // markers (package.json, Cargo.toml, etc.) live at the repo root,
   // not in arbitrary subdirectories.
   const repoRoot = resolveRepoRoot(config.cwd);
-  let lastMessageId = '';
   // Session-scoped bg manager. Created lazily after createSession
   // so the manager can record the right session_id on every spawn.
   // Stays undefined when no bgLogDir is configured — bg tools will
@@ -639,8 +641,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       usage: totalUsage,
       costUsd: totalCostUsd,
       usageComplete,
-      lastMessageId,
+      // ctx is undefined only if init failed before the session-
+      // decision block resolved it (early internalError) — keep the
+      // pre-ctx '' so that path's result shape is unchanged.
+      lastMessageId: ctx !== undefined ? ctx.getLastMessageId() : '',
     };
+    // Hand the live context back so a multi-turn caller (REPL) reuses
+    // it next turn instead of re-deriving from the DB log.
+    if (ctx !== undefined) result.sessionContext = ctx;
     if (detail !== undefined) result.detail = detail;
     if (reason === 'aborted' && abortCause !== undefined) {
       result.abortCause = abortCause;
@@ -874,16 +882,37 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // resume call is negligible.
       const resumeId = config.resumeFromSessionId;
       const preassignedId = config.preassignedSessionId;
-      if (resumeId !== undefined && preassignedId !== undefined) {
-        // Defense in depth: the two paths are mutually exclusive —
-        // resume reopens an existing finalized session, preassigned
-        // uses a freshly-created row the caller built. Setting both
-        // is a programmer bug, fail loud rather than guess intent.
+      const liveCtx = config.sessionContext;
+      // Mutually exclusive: a live context (REPL reuse) skips all DB
+      // derivation; resume reopens a finalized session; preassigned
+      // uses a caller-created row. More than one set is a programmer
+      // bug — fail loud rather than guess intent.
+      if ([liveCtx, resumeId, preassignedId].filter((x) => x !== undefined).length > 1) {
         throw new Error(
-          'HarnessConfig: resumeFromSessionId and preassignedSessionId are mutually exclusive',
+          'HarnessConfig: sessionContext, resumeFromSessionId, and preassignedSessionId are mutually exclusive',
         );
       }
-      if (resumeId !== undefined) {
+      if (liveCtx !== undefined) {
+        // Reuse path (REPL multi-turn): the caller owns a live,
+        // already-compacted context — NO hydrate. Still reopen + carry
+        // cumulative cost exactly like resume, so this turn's
+        // completeSession sees a 'running' row and the lifetime total
+        // stays correct across turns.
+        const existing = getSession(config.db, liveCtx.sessionId);
+        if (existing === null) {
+          throw new Error(`sessionContext refers to unknown session ${liveCtx.sessionId}`);
+        }
+        if (existing.cwd !== config.cwd) {
+          throw new Error(
+            `sessionContext session ${liveCtx.sessionId}: cwd '${existing.cwd}' != config cwd '${config.cwd}'`,
+          );
+        }
+        priorCostUsd = existing.totalCostUsd;
+        priorUsageComplete = existing.usageComplete;
+        reopenSession(config.db, liveCtx.sessionId);
+        sessionId = liveCtx.sessionId;
+        ctx = liveCtx;
+      } else if (resumeId !== undefined) {
         const existing = getSession(config.db, resumeId);
         if (existing === null) {
           throw new Error(`session ${resumeId} not found`);
@@ -913,6 +942,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         preResumeStatus = existing.status;
         reopenSession(config.db, resumeId);
         sessionId = resumeId;
+        const hydrated = SessionContext.hydrateFromDb(config.db, resumeId);
+        ctx = hydrated.ctx;
+        hydrateInfo = hydrated.info;
       } else if (preassignedId !== undefined) {
         // Caller-created row. Verify it exists and matches the
         // expected shape (cwd, status='running'). The cwd check
@@ -938,6 +970,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           );
         }
         sessionId = preassignedId;
+        // Preassigned (subagent first boot): hydrate from the single
+        // seed the parent wrote. No resume_truncated — not a resumed
+        // history; hydrateInfo stays null so the diagnostics block skips.
+        ctx = SessionContext.hydrateFromDb(config.db, preassignedId).ctx;
       } else {
         const session = createSession(config.db, {
           model: config.provider.id,
@@ -947,6 +983,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             : {}),
         });
         sessionId = session.id;
+        ctx = SessionContext.createFresh(config.db, sessionId);
+      }
+      // Every branch above set ctx; narrow it for the rest of the loop.
+      // The closures defined later (finish, maybeCompact) capture the
+      // wider `| undefined` and guard it themselves.
+      if (ctx === undefined) {
+        throw new Error('internal: session context not resolved');
       }
 
       // Eager-load provenance emit (MEMORY.md §11.2, S1/T1.4).
@@ -2034,127 +2077,54 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         }
       }
 
-      // Hydrate persisted messages BEFORE appending the new user
-      // prompt. Two paths converge here:
-      //   - Resume: the prior run's full transcript is on disk;
-      //     load it so the model sees [old turns, new prompt].
-      //   - Preassigned: the caller (subprocess parent) created
-      //     the row and inserted the seed user message before
-      //     spawning. We need to load that seed too — otherwise
-      //     the child sees an empty conversation and appends a
-      //     fresh prompt-from-config that would silently NOT match
-      //     what the parent committed.
-      // Both paths share the same fetch + alignment walk; only
-      // the trigger condition differs.
-      //
-      // Bounded fetch: SQL returns at most (MAX + alignment
-      // margin) rows, so a 50k-message session never materializes
-      // in JS memory. The earlier implementation read the full
-      // log into memory and sliced — defeating the cap and OOM-ing
-      // on long-running sessions.
-      //
-      // droppedFromHead reported on the resume_truncated event
-      // accounts for BOTH the rows that never left SQL (totalCount
-      // - fetchedCount) and the rows the alignment walk skipped
-      // inside the fetched slice. Kept count is what the model
-      // actually sees in context.
-      //
-      // Carry forward the parent_id chain across resume /
-      // preassigned. Without seeding lastMessageId from the prior
-      // tail, the new user turn appends with parent_id=null and
-      // starts a NEW root in the same session — the parent_id
-      // graph forks at the boundary, breaking traversal/replay/
-      // audit logic that walks parent links to reconstruct the
-      // conversation tree. The persisted tail is already ordered
-      // by seq (migration 007), so the tail is just the last
-      // element of what we fetched (which IS the absolute tail
-      // since the bounded fetch picks newest rows).
-      let priorTailId: string | null = null;
-      const preexistingId = resumeId ?? preassignedId;
-      if (preexistingId !== undefined) {
-        const tail = listMessageTailBySession(
-          config.db,
-          preexistingId,
-          MAX_RESUME_MESSAGES + ALIGNMENT_FETCH_MARGIN,
-        );
-        const restored = messagesToProviderMessages(tail.messages);
-        messages.push(...restored.messages);
-        const fetchedCount = tail.messages.length;
-        const droppedBeyondFetch = tail.totalCount - fetchedCount;
-        const totalDropped = droppedBeyondFetch + restored.droppedFromHead;
-        if (totalDropped > 0 && resumeId !== undefined) {
-          // resume_truncated emits only on the resume path. The
-          // preassigned path's seed is freshly inserted by the
-          // parent (typically a single user message) and
-          // truncation there would indicate something is off
-          // with the parent's flow — but it's not a "user
-          // resumed and lost context" event the renderer needs
-          // to surface.
-          safeEmit(config.onEvent, {
-            type: 'resume_truncated',
-            sessionId,
-            kept: restored.messages.length,
-            dropped: totalDropped,
-          });
-          // Slice 178 (hardening M1). The event above goes to the
-          // live renderer / NDJSON stream; this row in
-          // failure_events makes the truncation queryable
-          // post-hoc. Without it a forensic audit of a resumed
-          // run can't tell that the model worked from a subset of
-          // the persisted log — the gap shows up only as a
-          // surprising "model didn't remember that" report from
-          // the operator, with no DB-side evidence.
-          if (config.failureSink !== undefined) {
-            try {
-              config.failureSink.emit({
-                code: 'storage.resume_truncated',
-                classe: 'storage',
-                recovery_action: 'degraded',
-                user_visible: true,
-                session_id: sessionId,
-                payload: {
-                  kept: restored.messages.length,
-                  dropped: totalDropped,
-                  dropped_beyond_fetch: droppedBeyondFetch,
-                  dropped_by_alignment: restored.droppedFromHead,
-                  max_resume_messages: MAX_RESUME_MESSAGES,
-                },
-              });
-            } catch (e) {
-              // Best-effort: failure_events sink should not block
-              // the resume itself. Diagnostic to stderr so the
-              // sink-write failure has a trail of its own.
-              process.stderr.write(
-                `forja: failed to persist storage.resume_truncated event: ${e instanceof Error ? e.message : String(e)}\n`,
-              );
-            }
+      // Resume diagnostics + alternation. The context was already
+      // hydrated from the DB log in the session-decision block (which
+      // also seeded the parent_id anchor from the persisted tail);
+      // here we surface the truncation it reported (resume path only)
+      // and repair alternation before the new prompt is appended.
+      if (hydrateInfo !== null && resumeId !== undefined && hydrateInfo.totalDropped > 0) {
+        // resume_truncated is resume-only: a preassigned seed is freshly
+        // inserted by the parent, so truncation there is a parent-flow
+        // bug, not the "user resumed and lost context" the renderer shows.
+        safeEmit(config.onEvent, {
+          type: 'resume_truncated',
+          sessionId,
+          kept: hydrateInfo.kept,
+          dropped: hydrateInfo.totalDropped,
+        });
+        // Slice 178 (hardening M1): make the truncation queryable
+        // post-hoc so a forensic audit can tell the model worked from a
+        // subset of the log, not just infer it from a "didn't remember"
+        // report. Best-effort — never block the resume.
+        if (config.failureSink !== undefined) {
+          try {
+            config.failureSink.emit({
+              code: 'storage.resume_truncated',
+              classe: 'storage',
+              recovery_action: 'degraded',
+              user_visible: true,
+              session_id: sessionId,
+              payload: {
+                kept: hydrateInfo.kept,
+                dropped: hydrateInfo.totalDropped,
+                dropped_beyond_fetch: hydrateInfo.droppedBeyondFetch,
+                dropped_by_alignment: hydrateInfo.droppedByAlignment,
+                max_resume_messages: MAX_RESUME_MESSAGES,
+              },
+            });
+          } catch (e) {
+            process.stderr.write(
+              `forja: failed to persist storage.resume_truncated event: ${e instanceof Error ? e.message : String(e)}\n`,
+            );
           }
         }
-        // Stranded-turn handling. If the last restored message is
-        // `user` (either the original prompt that never got an
-        // assistant response, or a tool_result whose follow-up
-        // assistant turn never landed because the run aborted),
-        // appending the resume's new user prompt would create
-        // user→user on the wire — every provider 400s on that.
-        // Insert an in-memory-only synthetic assistant placeholder
-        // to satisfy alternation. Not persisted: each resume
-        // re-derives it on demand from whatever shape the log is
-        // in at that moment.
-        //
-        // The placeholder is ONLY needed when we're about to
-        // append a new user prompt. On the preassigned path with
-        // an empty userPrompt (the parent already seeded the
-        // user turn), the seed itself IS the conversation and
-        // we don't append again — so a trailing-user tail is
-        // correct, not stranded.
-        const inMemoryTail = messages[messages.length - 1];
-        const willAppendUserPrompt = config.userPrompt.length > 0;
-        if (willAppendUserPrompt && inMemoryTail !== undefined && inMemoryTail.role === 'user') {
-          messages.push({ role: 'assistant', content: STRANDED_TURN_PLACEHOLDER });
-        }
-        const lastFetched = tail.messages[tail.messages.length - 1];
-        if (lastFetched !== undefined) priorTailId = lastFetched.id;
       }
+      // Stranded-turn repair (in-memory only, not persisted): if the
+      // hydrated tail is a user and we're about to append a new prompt,
+      // a synthetic assistant keeps the wire alternating. No-op on the
+      // reuse path (a live turn ends on an assistant) and on the
+      // preassigned-empty-prompt path (the seed IS the conversation).
+      ctx.ensureAlternation(config.userPrompt.length > 0);
 
       // Auto-rehydrate on `--resume` (STATE_MACHINE §7.6 +
       // RECAP §3.2). Prepends a literal `[resume_context]` block
@@ -2225,25 +2195,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // userPrompt (CLI guards against missing prompt before
       // bootstrap).
       if (config.userPrompt.length > 0) {
-        const userMsg = appendMessage(config.db, {
-          sessionId,
-          role: 'user',
-          content: effectiveUserPrompt,
-          // null on first turn (new session); tail id on resume
-          // / preassigned so the chain stays connected.
-          // appendMessage validates the parent belongs to the
-          // same session.
-          ...(priorTailId !== null ? { parentId: priorTailId } : {}),
-          promptHash: config.systemPromptHash ?? null,
-        });
-        lastMessageId = userMsg.id;
-        messages.push({ role: 'user', content: effectiveUserPrompt });
-      } else if (priorTailId !== null) {
-        // No new user message to append; the prior tail id
-        // becomes the lastMessageId we report on the result and
-        // the chain anchor for the assistant turn that follows.
-        lastMessageId = priorTailId;
+        // The context's anchor (hydrated tail, or '' on a fresh run)
+        // becomes this message's parentId, keeping the DB chain
+        // connected; appendUser advances it.
+        ctx.appendUser(effectiveUserPrompt, config.systemPromptHash ?? null);
       }
+      // else: no new user message. The context's anchor is already the
+      // hydrated tail (or '' on a fresh/empty run), which the following
+      // assistant turn chains onto — no priorTailId bookkeeping needed.
 
       safeEmit(config.onEvent, { type: 'session_start', sessionId });
       // Emit the checkpoints-unavailable warning AFTER session_start
@@ -2318,13 +2277,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // Skip when aborted / budget exhausted / window unknown — don't burn
         // a billed summary call whose result the loop is about to discard.
         if (
+          ctx === undefined ||
           signal.aborted ||
           steps >= budget.maxSteps ||
           config.provider.capabilities.context_window <= 0
         ) {
           return null;
         }
-        const promptTokens = estimatePromptTokens(messages, {
+        const promptTokens = estimatePromptTokens([...ctx.getMessages()], {
           ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
           ...(tools.length > 0 ? { tools } : {}),
         });
@@ -2332,7 +2292,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         const triggerAt = budget.compactionThreshold * contextWindow;
         // Need goal + something-to-fold + an assistant boundary for the tail;
         // shorter histories make compactMessages skip (and emit noisy events).
-        if (!(promptTokens > triggerAt && messages.length >= budget.compactionPreserveTail + 3)) {
+        if (!(promptTokens > triggerAt && ctx.length >= budget.compactionPreserveTail + 3)) {
           return null;
         }
         // PreCompact hook (blocking, spec §10.1) — fired before the
@@ -2360,29 +2320,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           contextWindow,
         });
         const compactStart = Date.now();
-        // Read active pins so compaction preserves them literally
-        // (CONTEXT_TUNING §12.4): otherwise the pin_context constraints get
-        // elided with the middle and only reappear on resume. Format mirrors
-        // the resume block (resume-context.ts): `[kind] text (model)`.
-        const activePins = getActivePinsBySession(config.db, sessionId);
-        const pinnedBlock =
-          activePins.length > 0
-            ? `Active pins (constraints still in force this session):\n${activePins
-                .map((p) => `  - [${p.kind}] ${p.text}${p.createdBy !== 'user' ? ' (model)' : ''}`)
-                .join('\n')}`
-            : undefined;
-        const compaction = await compactMessages(config.provider, messages, {
+        // Preserve active pins literally across the fold (CONTEXT_TUNING
+        // §12.4) — otherwise the pin_context constraints get elided with
+        // the middle and only reappear on resume.
+        const pinnedBlock = formatPinnedBlock(getActivePinsBySession(config.db, sessionId));
+        const compaction = await ctx.compact(config.provider, {
           preserveTail: budget.compactionPreserveTail,
           signal,
           ...(pinnedBlock !== undefined ? { pinnedBlock } : {}),
         });
-        // In-place replace; the 'skipped' strategy returns the SAME array, so
-        // only replace when it produced a new history (else length=0 empties
-        // the aliased result → messages=[] → next call 400s).
-        if (compaction.messages !== messages) {
-          messages.length = 0;
-          messages.push(...compaction.messages);
-        }
         const compactionCost = computeCost(config.provider.capabilities, compaction.usage);
         totalUsage = addUsage(totalUsage, compaction.usage);
         totalCostUsd += compactionCost;
@@ -2455,7 +2401,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // Snapshot the running message list so post-call mutations (the next
           // iteration appends assistant + tool_results) don't retroactively
           // change what the provider observed.
-          messages: [...messages],
+          messages: [...ctx.getMessages()],
           max_tokens: resolvedMaxTokens,
           ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
           ...(config.systemSegments !== undefined ? { systemSegments: config.systemSegments } : {}),
@@ -2595,22 +2541,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // then distinguish "no measurement" from "measured zero" — both
         // are legal but mean different things (e.g., a stream that aborted
         // before message_stop vs. a turn that genuinely produced nothing).
-        const assistantMsg = appendMessage(config.db, {
-          sessionId,
-          role: 'assistant',
-          parentId: lastMessageId,
-          content: assistantContent.length > 0 ? assistantContent : '',
-          tokensIn: collected.usageSeen ? collected.usage.input : null,
-          tokensOut: collected.usageSeen ? collected.usage.output : null,
-          cachedTokens: collected.usageSeen ? collected.usage.cache_read : null,
-          cacheCreationTokens: collected.usageSeen ? collected.usage.cache_creation : null,
-          costUsd: collected.usageSeen ? turnCostUsd : null,
-          promptHash: config.systemPromptHash ?? null,
-        });
-        lastMessageId = assistantMsg.id;
-        if (assistantContent.length > 0) {
-          messages.push({ role: 'assistant', content: assistantContent });
-        }
+        const assistantMsgId = ctx.appendAssistant(
+          assistantContent,
+          {
+            usageSeen: collected.usageSeen,
+            tokensIn: collected.usage.input,
+            tokensOut: collected.usage.output,
+            cacheRead: collected.usage.cache_read,
+            cacheCreation: collected.usage.cache_creation,
+            costUsd: turnCostUsd,
+          },
+          config.systemPromptHash ?? null,
+        );
 
         // Stream errors (normalizer-level: malformed tool_use args, orphan
         // tool_use_stop, etc.) mean the provider produced output we couldn't
@@ -2713,7 +2655,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             });
             try {
               const outcome = await checkpointManager.snapshot({
-                stepId: assistantMsg.id,
+                stepId: assistantMsgId,
                 hadBash,
                 stepN: steps,
               });
@@ -2722,7 +2664,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                   type: 'checkpoint_created',
                   checkpointId: outcome.checkpointId,
                   gitRef: outcome.gitRef,
-                  stepId: assistantMsg.id,
+                  stepId: assistantMsgId,
                   hadBash,
                 });
               }
@@ -2786,7 +2728,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           signal,
           cwd: config.cwd,
           sessionId,
-          stepId: assistantMsg.id,
+          stepId: assistantMsgId,
           permissions: config.permissionEngine.view(),
           permissionCheck: (toolName, category, args) =>
             config.permissionEngine.check(toolName, category, args),
@@ -3058,7 +3000,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               toolUseId: tu.id,
               toolName: tu.name,
               args: tu.input,
-              messageId: assistantMsg.id,
+              messageId: assistantMsgId,
             },
             {
               db: config.db,
@@ -3495,15 +3437,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             }
           }
           if (bailCounter !== -1) {
-            const partialMsg = appendMessage(config.db, {
-              sessionId,
-              role: 'user',
-              parentId: lastMessageId,
-              content: toolResults,
-              promptHash: config.systemPromptHash ?? null,
-            });
-            lastMessageId = partialMsg.id;
-            messages.push({ role: 'user', content: toolResults });
+            ctx.appendToolResults(toolResults, config.systemPromptHash ?? null);
             return await finish('maxToolErrors', `${bailCounter} consecutive tool errors`);
           }
         } else {
@@ -3565,15 +3499,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                   is_error: true,
                 });
               }
-              const partialMsg = appendMessage(config.db, {
-                sessionId,
-                role: 'user',
-                parentId: lastMessageId,
-                content: toolResults,
-                promptHash: config.systemPromptHash ?? null,
-              });
-              lastMessageId = partialMsg.id;
-              messages.push({ role: 'user', content: toolResults });
+              ctx.appendToolResults(toolResults, config.systemPromptHash ?? null);
               return await finish('maxToolErrors', `${consecutiveErrors} consecutive tool errors`);
             }
           }
@@ -3581,15 +3507,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
 
         // Persist tool_results back as a user message; mirror them in the
         // running provider message list for the next turn.
-        const resultMsg = appendMessage(config.db, {
-          sessionId,
-          role: 'user',
-          parentId: lastMessageId,
-          content: toolResults,
-          promptHash: config.systemPromptHash ?? null,
-        });
-        lastMessageId = resultMsg.id;
-        messages.push({ role: 'user', content: toolResults });
+        ctx.appendToolResults(toolResults, config.systemPromptHash ?? null);
 
         // Compaction now runs at the TOP of the loop (maybeCompact, before
         // every provider call) — see above. No post-tool-result trigger here

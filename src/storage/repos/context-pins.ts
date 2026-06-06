@@ -323,6 +323,19 @@ export const getActivePinsBySession = (
   return rows.map(fromRow);
 };
 
+// Format active pins as the literal block that compaction + resume
+// re-inject so the model keeps honoring them across folds
+// (CONTEXT_TUNING §12.4): `[kind] text`, with a `(model)` marker for
+// non-operator pins. undefined when there are none. Shared by the
+// harness loop's auto-compaction and the /compact slash command so the
+// two produce byte-identical pin blocks.
+export const formatPinnedBlock = (pins: ContextPin[]): string | undefined =>
+  pins.length > 0
+    ? `Active pins (constraints still in force this session):\n${pins
+        .map((p) => `  - [${p.kind}] ${p.text}${p.createdBy !== 'user' ? ' (model)' : ''}`)
+        .join('\n')}`
+    : undefined;
+
 // Cheap count used by `/pin --list` summary header ("3/10 pins
 // active"). Counting in SQL is faster than getActivePinsBySession
 // + .length when callers only need the number.

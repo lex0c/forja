@@ -11,6 +11,12 @@ export {
   invokeTool,
 } from './invoke-tool.ts';
 export { runAgent } from './loop.ts';
+export {
+  type AssistantUsage,
+  type HydrateInfo,
+  SessionContext,
+  type SessionContextSnapshot,
+} from './session-context.ts';
 export { AbortError, abortableIterable } from './abortable.ts';
 export {
   DEFAULT_RETRY,
