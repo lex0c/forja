@@ -56,7 +56,7 @@
 
 import { existsSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { join as joinPath, resolve as resolveAbs } from 'node:path';
-import { defaultDataDir } from '../storage/paths.ts';
+import { defaultDataDir, forjaCachePersistBase } from '../storage/paths.ts';
 import { startsWithSegment } from './protected_paths.ts';
 import { SANDBOX_SAFE_ENV_VARS as SAFE_ENV_VARS } from './safe-env-vars.ts';
 import { resolveSandboxBinary } from './sandbox-availability.ts';
@@ -70,6 +70,7 @@ import {
   getWritableCacheDirsOverride,
   normalizeCacheDir,
 } from './sandbox-cache-dirs.ts';
+import { buildCacheRedirectEnv, getCachePersistenceOverride } from './sandbox-cache-env.ts';
 import { HIDE_PATHS_DIRS, HIDE_PATHS_FILES } from './sandbox-hide-paths.ts';
 import { SANDBOX_PROFILE_ORDER, type SandboxProfile, isSandboxProfile } from './sandbox-plan.ts';
 import { buildSandboxExecArgv } from './sandbox-runner-macos.ts';
@@ -292,6 +293,13 @@ export interface BuildBwrapArgvOptions {
   // (no leading `/`, no `..`); the runner skips anything else
   // defensively. See `sandbox-cache-dirs.ts`.
   writableCacheDirs?: readonly string[];
+  // Per-session persistent `/tmp` source (opt-in via `[sandbox] shared_tmp`).
+  // When set, the base-layer `--tmpfs /tmp` is swapped for `--bind
+  // <sessionTmpDir> /tmp`, so temp files survive across spawns within a
+  // session. Host-created + cleaned up by the bootstrap (see
+  // `acquireSandboxTmpdir`). Unset → `/tmp` stays a fresh per-spawn tmpfs
+  // (default). Linux only — macOS uses the SBPL tmpdir-subpath mechanism.
+  sessionTmpDir?: string;
 }
 
 // The env allowlist (`SAFE_ENV_VARS`) and the membership rules
@@ -444,6 +452,20 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
   // home (managed-NFS layout) leaves the canonical tree unexposed.
   const home = canonicalizeHome(options.home, realpath);
 
+  // Writable profiles (cwd-rw / cwd-rw-net) are the only ones that receive
+  // the persistent cache bind AND the per-session /tmp bind: `ro` writes
+  // nothing (a writable, session-shared dir there would breach its
+  // read-only contract — it keeps the fresh per-spawn tmpfs /tmp), and
+  // `home-rw` already has a writable persistent $HOME. Single source for
+  // both gates below.
+  const writableProfile = profile === 'cwd-rw' || profile === 'cwd-rw-net';
+
+  // Opt-in persistent cache gate. A non-null `persistBase` is the single
+  // switch for BOTH the redirect env (injected below) and the persistent
+  // bind (further down).
+  const persistBase =
+    getCachePersistenceOverride() === true && writableProfile ? forjaCachePersistBase() : null;
+
   // Cwd-inside-hidden-dir precondition. If the operator happens to
   // run Forja from `~/.ssh/audit/` (or any cwd nested under a
   // hide_paths root), the LATER `--tmpfs ~/.ssh` overlay would mask
@@ -489,10 +511,44 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
     pathExists(absPath) || underWritableRoot(absPath);
 
   const flags: string[] = [...COMMON_PROFILE_FLAGS];
+  // `/tmp` policy. Default = the fresh per-spawn tmpfs baked into
+  // COMMON_PROFILE_FLAGS. When `sessionTmpDir` is set (opt-in shared_tmp)
+  // AND the profile is writable, swap that exact `--tmpfs /tmp` pair for a
+  // bind of the session tmp dir, preserving its position + every other base
+  // flag (so the default argv stays byte-identical to before this feature).
+  // Gated to writable profiles for the same reason as the cache bind: `ro`
+  // keeps a fresh, isolated, per-spawn tmpfs /tmp rather than a writable dir
+  // shared across the whole session.
+  let tmpBound = false;
+  if (writableProfile && options.sessionTmpDir !== undefined) {
+    const i = flags.findIndex((f, idx) => f === '--tmpfs' && flags[idx + 1] === '/tmp');
+    if (i !== -1) {
+      flags.splice(i, 2, '--bind', options.sessionTmpDir, '/tmp');
+      tmpBound = true;
+    }
+  }
   // Kernel-level env hygiene: `--clearenv` plus a narrow `--setenv`
   // allowlist replaces userspace-only scrubEnv as the authoritative
   // env shaper. See `appendEnvFlags` for the allowlist rationale.
-  appendEnvFlags(flags, options.env, options.passthroughEnv);
+  //
+  // Passthrough env (emitted AFTER the safe-list, last-wins) carries:
+  //   - the cache redirect (GOCACHE, npm_config_cache, …) → `persistBase`,
+  //     when the persistent cache is on (writable profile);
+  //   - a forced `TMPDIR=/tmp` when the /tmp bind is active, so tools that
+  //     honor TMPDIR land in the persistent session dir (the mount POINT)
+  //     instead of whatever the host's TMPDIR (carried by the safe-list)
+  //     pointed at — which inside the sandbox may be read-only;
+  //   - the caller's own passthrough (e.g. FORJA_BROKER_WORKER) LAST so a
+  //     colliding key wins (the sets are disjoint in practice).
+  let effectivePassthrough = options.passthroughEnv;
+  if (persistBase !== null || tmpBound) {
+    effectivePassthrough = {
+      ...(persistBase !== null ? buildCacheRedirectEnv(persistBase) : {}),
+      ...(tmpBound ? { TMPDIR: '/tmp' } : {}),
+      ...options.passthroughEnv,
+    };
+  }
+  appendEnvFlags(flags, options.env, effectivePassthrough);
   // Network policy.
   if (profile !== 'cwd-rw-net') {
     flags.push('--unshare-net');
@@ -536,6 +592,17 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
       if (!pathExists(abs)) continue;
       flags.push('--tmpfs', abs);
     }
+  }
+  // Persistent dedicated cache bind (opt-in). Emitted AFTER the ephemeral
+  // `--tmpfs` carve-out (so it punches through the `~/.cache` tmpfs that
+  // nests it) and BEFORE the cwd bind + HIDE_PATHS overlays below (so a
+  // poisoned cache can never un-mask a credential — bwrap is last-wins).
+  // The redirect env vars steer each toolchain's cache HERE; this bind
+  // makes that subtree persist across spawns. Existence-gated: the
+  // bootstrap host-creates `persistBase`; if absent, the redirect still
+  // works (landing on the `~/.cache` tmpfs, ephemeral) instead of aborting.
+  if (persistBase !== null && pathExists(persistBase)) {
+    flags.push('--bind', persistBase, persistBase);
   }
   // Writable mounts per profile.
   //
@@ -617,6 +684,14 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
   // Idempotent: when XDG_CONFIG_HOME is unset (or set to exactly
   // `<home>/.config`), the effective path matches the home-relative
   // default and we skip.
+  // Mask credential FILES with a read-only bind of an empty REGULAR
+  // file (NOT `/dev/null` — a char device breaks git/npm/pip config
+  // readers; see `ensureSandboxMaskFile`). The tool sees an empty
+  // config (it works), the real content stays hidden (no PII leak), and
+  // `--ro-bind` keeps it read-only even on home-rw (no write-plant of
+  // `~/.gitconfig` core.sshCommand etc.). Hoisted above the XDG block so
+  // the relocated-FILES overlay below can reuse it.
+  const maskSrc = options.maskFileSource ?? ensureSandboxMaskFile();
   const xdgConfig = options.env.XDG_CONFIG_HOME;
   const homeRelativeConfig = joinPath(home, '.config');
   if (
@@ -625,20 +700,26 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
     xdgConfig.startsWith('/') &&
     xdgConfig !== homeRelativeConfig
   ) {
+    // DIRS: tmpfs overlay at the relocated `.config/*` dir.
     for (const dir of HIDE_PATHS_DIRS) {
       if (!dir.startsWith('.config/')) continue;
       const sub = dir.slice('.config/'.length);
       const abs = joinPath(xdgConfig, sub);
       if (shouldMask(abs)) flags.push('--tmpfs', abs);
     }
+    // FILES: ro-bind the empty mask over the relocated `.config/*` file.
+    // Without this, `.config/NuGet/NuGet.Config` / `.config/composer/auth.json`
+    // (the only `.config/`-prefixed HIDE_PATHS_FILES) are masked ONLY at
+    // `<home>/.config/...` by the home-relative loop below — so under an
+    // XDG_CONFIG_HOME relocation the real registry-token files stay readable
+    // via the base `--ro-bind / /`. Mirrors the DIRS overlay above.
+    for (const file of HIDE_PATHS_FILES) {
+      if (!file.startsWith('.config/')) continue;
+      const sub = file.slice('.config/'.length);
+      const abs = joinPath(xdgConfig, sub);
+      if (shouldMask(abs)) flags.push('--ro-bind', maskSrc, abs);
+    }
   }
-  // Mask credential FILES with a read-only bind of an empty REGULAR
-  // file (NOT `/dev/null` — a char device breaks git/npm/pip config
-  // readers; see `ensureSandboxMaskFile`). The tool sees an empty
-  // config (it works), the real content stays hidden (no PII leak), and
-  // `--ro-bind` keeps it read-only even on home-rw (no write-plant of
-  // `~/.gitconfig` core.sshCommand etc.).
-  const maskSrc = options.maskFileSource ?? ensureSandboxMaskFile();
   for (const file of HIDE_PATHS_FILES) {
     const abs = joinPath(home, file);
     if (shouldMask(abs)) flags.push('--ro-bind', maskSrc, abs);
@@ -864,6 +945,11 @@ export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): stri
       if (options.passthroughEnv !== undefined) bwrapOpts.passthroughEnv = options.passthroughEnv;
       if (options.writableCacheDirs !== undefined)
         bwrapOpts.writableCacheDirs = options.writableCacheDirs;
+      // On Linux the `tmpdir` option (a darwin-only SBPL knob until now)
+      // becomes the per-session `/tmp` bind source for shared_tmp. The
+      // bootstrap only sets it on Linux when shared_tmp is on (see
+      // `acquireSandboxTmpdir`), so an unset tmpdir leaves `/tmp` ephemeral.
+      if (options.tmpdir !== undefined) bwrapOpts.sessionTmpDir = options.tmpdir;
       return buildBwrapArgv(bwrapOpts);
     }
   }

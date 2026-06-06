@@ -606,7 +606,27 @@ export interface SandboxConfigKeys {
   // Omitted when no layer declared `writable_cache_dirs` (→ runner
   // default). An explicit `[]` is preserved (carve-out off).
   writableCacheDirs?: string[];
+  // Persistent build/dep cache in a Forja-dedicated dir
+  // (`~/.cache/forja/cache`, never the host's real cache). Tri-state:
+  // `undefined` → DEFAULT (see DEFAULT_CACHE_PERSISTENCE); `false` →
+  // explicit opt-out; `true` → on. See `sandbox-cache-env.ts`.
+  cachePersistence?: boolean;
+  // Per-session persistent `/tmp` (bind a session-scoped dir onto /tmp).
+  // Tri-state: `undefined` → DEFAULT (see DEFAULT_SHARED_TMP); `false` →
+  // explicit opt-out; `true` → on.
+  sharedTmp?: boolean;
 }
+
+// Default posture for the two persistence toggles when NO config layer
+// declares them. The operator set these ON as the baseline: with no
+// `[sandbox]` config, build/dep caches persist across spawns and `/tmp` is
+// per-session. An explicit `cache_persistence = false` / `shared_tmp =
+// false` opts out. The loader stays tri-state (returns `undefined` when
+// absent); these defaults are applied by the CONSUMERS that set the runtime
+// overrides (bootstrap + subagent-child), mirroring how
+// `writable_cache_dirs` resolves its DEFAULT at the runner, not the loader.
+export const DEFAULT_CACHE_PERSISTENCE = true;
+export const DEFAULT_SHARED_TMP = true;
 
 export interface LoadedSandboxConfig {
   config: SandboxConfigKeys;
@@ -644,6 +664,25 @@ const parseSandboxLayer = (
       layer.writableCacheDirs = dirs;
     }
   }
+  // Opt-in persistence toggles. Snake_case only (matches this section's
+  // `writable_cache_dirs`); non-boolean → warn + ignore (leaves the field
+  // unset → runner stays ephemeral). Default-off is the safe posture.
+  if (s.cache_persistence !== undefined) {
+    if (typeof s.cache_persistence !== 'boolean') {
+      warnings.push(
+        `${source} config (${path}): [sandbox].cache_persistence must be a boolean; ignoring`,
+      );
+    } else {
+      layer.cachePersistence = s.cache_persistence;
+    }
+  }
+  if (s.shared_tmp !== undefined) {
+    if (typeof s.shared_tmp !== 'boolean') {
+      warnings.push(`${source} config (${path}): [sandbox].shared_tmp must be a boolean; ignoring`);
+    } else {
+      layer.sharedTmp = s.shared_tmp;
+    }
+  }
   return { layer, warnings };
 };
 
@@ -665,5 +704,13 @@ export const loadSandboxConfig = (input: LoadSandboxConfigInput): LoadedSandboxC
   const resolved = projectResult.layer.writableCacheDirs ?? userResult.layer.writableCacheDirs;
   const config: SandboxConfigKeys = {};
   if (resolved !== undefined) config.writableCacheDirs = resolved;
+  // `??` preserves both the tri-state AND project-wins: an explicit
+  // project `false` beats a user `true` (false is not nullish), and an
+  // unset project falls through to the user layer.
+  const cachePersistence =
+    projectResult.layer.cachePersistence ?? userResult.layer.cachePersistence;
+  if (cachePersistence !== undefined) config.cachePersistence = cachePersistence;
+  const sharedTmp = projectResult.layer.sharedTmp ?? userResult.layer.sharedTmp;
+  if (sharedTmp !== undefined) config.sharedTmp = sharedTmp;
   return { config, userPath, projectPath, warnings };
 };

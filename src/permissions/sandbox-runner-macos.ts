@@ -35,8 +35,9 @@
 
 import { realpathSync } from 'node:fs';
 import { join as joinPath } from 'node:path';
-import { defaultDataDir } from '../storage/paths.ts';
+import { defaultDataDir, forjaCachePersistBase } from '../storage/paths.ts';
 import { SANDBOX_SAFE_ENV_VARS } from './safe-env-vars.ts';
+import { buildCacheRedirectEnv, getCachePersistenceOverride } from './sandbox-cache-env.ts';
 import { HIDE_PATHS_DIRS, HIDE_PATHS_FILES } from './sandbox-hide-paths.ts';
 import type { SandboxProfile } from './sandbox-plan.ts';
 
@@ -298,6 +299,21 @@ export const buildSbplProfile = (
   } else if (profile === 'home-rw') {
     writeRules.push(`(allow file-write* (subpath "${escapeSbplLiteral(home)}"))`);
   }
+  // Opt-in persistent cache (cache_persistence). Same gate as the Linux
+  // runner: only a writable profile gets a writable persistent cache dir.
+  // Pushed onto writeRules → emitted BEFORE denyRules, so credential denies
+  // still win (SBPL last-match-wins). The dir is the Forja-dedicated base
+  // (`forjaCachePersistBase()`), never the host's real cache. macOS has no
+  // bind primitive, so this allow + the redirect env (in
+  // `buildSandboxExecArgv`) are the whole persistence mechanism here.
+  if (
+    getCachePersistenceOverride() === true &&
+    (profile === 'cwd-rw' || profile === 'cwd-rw-net')
+  ) {
+    writeRules.push(
+      `(allow file-write* (subpath "${escapeSbplLiteral(forjaCachePersistBase())}"))`,
+    );
+  }
 
   // Network — granted only for cwd-rw-net. Other profiles inherit
   // the (deny default) header and stay locked. network* covers
@@ -405,6 +421,18 @@ export const buildSbplProfile = (
       const escaped = escapeSbplLiteral(absDir);
       denyRules.push(`(deny file-read* (subpath "${escaped}"))`);
       denyRules.push(`(deny file-write* (subpath "${escaped}"))`);
+    }
+    // FILES: the `.config/`-prefixed HIDE_PATHS_FILES (NuGet/Composer auth)
+    // are denied only at `<home>/.config/...` by the home-relative FILES
+    // loop above; under an XDG_CONFIG_HOME relocation the real token files
+    // would stay readable. Add the relocated literal deny. Mirrors Linux.
+    for (const file of HIDE_PATHS_FILES) {
+      if (!file.startsWith('.config/')) continue;
+      const sub = file.slice('.config/'.length);
+      const absFile = joinPath(xdgConfig, sub);
+      const escaped = escapeSbplLiteral(absFile);
+      denyRules.push(`(deny file-read* (literal "${escaped}"))`);
+      denyRules.push(`(deny file-write* (literal "${escaped}"))`);
     }
   }
 
@@ -535,6 +563,21 @@ export const buildSandboxExecArgv = (options: BuildSandboxExecArgvOptions): stri
         // NUL bytes inside env values would silently truncate at the
         // execve layer. Skip — same defense the Linux runner's
         // appendEnvFlags applies for the bwrap --setenv path.
+        if (value.includes('\0')) continue;
+        envAssignments.push(`${key}=${value}`);
+      }
+    }
+    // Opt-in persistent cache redirect (cache_persistence). Same gate as
+    // the SBPL write-allow: only a writable profile. Inserted BETWEEN the
+    // host-env allowlist and the caller passthrough so a colliding
+    // passthrough key wins (parity with the Linux runner; the sets are
+    // disjoint in practice). macOS has no bind — this redirect + the SBPL
+    // write-allow are the whole persistence mechanism.
+    if (
+      getCachePersistenceOverride() === true &&
+      (profile === 'cwd-rw' || profile === 'cwd-rw-net')
+    ) {
+      for (const [key, value] of Object.entries(buildCacheRedirectEnv(forjaCachePersistBase()))) {
         if (value.includes('\0')) continue;
         envAssignments.push(`${key}=${value}`);
       }

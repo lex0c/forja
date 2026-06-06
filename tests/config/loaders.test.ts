@@ -1034,3 +1034,92 @@ describe('loadSandboxConfig — [sandbox] writable_cache_dirs', () => {
     }
   });
 });
+
+describe('loadSandboxConfig — [sandbox] cache_persistence + shared_tmp', () => {
+  const writeProject = (cwd: string, toml: string): void => {
+    mkdirSync(join(cwd, '.agent'), { recursive: true });
+    writeFileSync(join(cwd, '.agent', 'config.toml'), toml);
+  };
+
+  test('absent → both undefined (default off), no warnings', () => {
+    const cwd = makeTempCwd();
+    try {
+      const r = loadSandboxConfig({ cwd, env: { HOME: '/none' } });
+      expect(r.config.cachePersistence).toBeUndefined();
+      expect(r.config.sharedTmp).toBeUndefined();
+      expect(r.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('cache_persistence=true / shared_tmp=true are parsed', () => {
+    const cwd = makeTempCwd();
+    try {
+      writeProject(cwd, '[sandbox]\ncache_persistence = true\nshared_tmp = true\n');
+      const r = loadSandboxConfig({ cwd, env: { HOME: '/none' } });
+      expect(r.config.cachePersistence).toBe(true);
+      expect(r.config.sharedTmp).toBe(true);
+      expect(r.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('explicit false is preserved (not collapsed to undefined)', () => {
+    const cwd = makeTempCwd();
+    try {
+      writeProject(cwd, '[sandbox]\ncache_persistence = false\nshared_tmp = false\n');
+      const r = loadSandboxConfig({ cwd, env: { HOME: '/none' } });
+      expect(r.config.cachePersistence).toBe(false);
+      expect(r.config.sharedTmp).toBe(false);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('non-boolean → ignored with warning (stays undefined → off)', () => {
+    const cwd = makeTempCwd();
+    try {
+      writeProject(cwd, '[sandbox]\ncache_persistence = "yes"\nshared_tmp = 1\n');
+      const r = loadSandboxConfig({ cwd, env: { HOME: '/none' } });
+      expect(r.config.cachePersistence).toBeUndefined();
+      expect(r.config.sharedTmp).toBeUndefined();
+      expect(r.warnings.length).toBe(2);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('coexists with writable_cache_dirs', () => {
+    const cwd = makeTempCwd();
+    try {
+      writeProject(cwd, '[sandbox]\nwritable_cache_dirs = [".npm"]\ncache_persistence = true\n');
+      const r = loadSandboxConfig({ cwd, env: { HOME: '/none' } });
+      expect(r.config.writableCacheDirs).toEqual(['.npm']);
+      expect(r.config.cachePersistence).toBe(true);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  // The `??` merge must let an explicit project `false` beat a user
+  // `true` (false is not nullish) — project-wins AND tri-state together.
+  test('project explicit false beats user true', () => {
+    const home = mkdtempSync(join(tmpdir(), 'forja-sbx2-home-'));
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(home, '.config', 'agent'), { recursive: true });
+      writeFileSync(
+        join(home, '.config', 'agent', 'config.toml'),
+        '[sandbox]\ncache_persistence = true\n',
+      );
+      writeProject(cwd, '[sandbox]\ncache_persistence = false\n');
+      const r = loadSandboxConfig({ cwd, env: { HOME: home } });
+      expect(r.config.cachePersistence).toBe(false);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});

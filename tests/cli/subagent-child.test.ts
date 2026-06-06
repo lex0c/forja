@@ -7,6 +7,10 @@ import {
   getWritableCacheDirsOverride,
   setWritableCacheDirsOverride,
 } from '../../src/permissions/sandbox-cache-dirs.ts';
+import {
+  getCachePersistenceOverride,
+  setCachePersistenceOverride,
+} from '../../src/permissions/sandbox-cache-env.ts';
 import type { Provider, StreamEvent } from '../../src/providers/index.ts';
 import { openDb } from '../../src/storage/db.ts';
 import {
@@ -40,6 +44,7 @@ afterEach(() => {
   // The child sets the process-global sandbox cache-dir override; reset
   // it so it can't leak into another test (here or in another file).
   setWritableCacheDirsOverride(undefined);
+  setCachePersistenceOverride(undefined);
   try {
     unlinkSync(dbPath);
   } catch {}
@@ -170,11 +175,15 @@ describe('runSubagentChild', () => {
       // git repo so resolveRepoRoot (git rev-parse) finds the root.
       Bun.spawnSync({ cmd: ['git', 'init', '-q', repo] });
       mkdirSync(join(repo, '.agent'), { recursive: true });
-      writeFileSync(join(repo, '.agent', 'config.toml'), '[sandbox]\nwritable_cache_dirs = []\n');
+      writeFileSync(
+        join(repo, '.agent', 'config.toml'),
+        '[sandbox]\nwritable_cache_dirs = []\ncache_persistence = true\n',
+      );
       const sub = join(repo, 'pkg', 'inner');
       mkdirSync(sub, { recursive: true });
-      // Pre-seed a distinct value to prove the child actually re-resolves.
+      // Pre-seed distinct values to prove the child actually re-resolves.
       setWritableCacheDirsOverride(['stale-not-from-config']);
+      setCachePersistenceOverride(false);
       const { sessionId } = seedChildSession(sub);
       const exitCode = await runSubagentChild({
         sessionId,
@@ -189,6 +198,9 @@ describe('runSubagentChild', () => {
       // The child must have read it — NOT `undefined`, which is what a raw
       // `loadSandboxConfig({ cwd: subdir })` (no .agent there) would yield.
       expect(getWritableCacheDirsOverride()).toEqual([]);
+      // PARITY: the child must also re-resolve cache_persistence (separate
+      // process → module global starts unset; pre-seeded false above).
+      expect(getCachePersistenceOverride()).toBe(true);
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }

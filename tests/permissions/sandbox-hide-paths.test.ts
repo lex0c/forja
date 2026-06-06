@@ -51,6 +51,13 @@ describe('sandbox-hide-paths content', () => {
     expect(HIDE_PATHS_FILES).toContain('.git-credentials');
   });
 
+  test('package-manager auth/config files masked (nuget/composer registry tokens)', () => {
+    expect(HIDE_PATHS_FILES).toContain('.nuget/NuGet/NuGet.Config');
+    expect(HIDE_PATHS_FILES).toContain('.config/NuGet/NuGet.Config');
+    expect(HIDE_PATHS_FILES).toContain('.config/composer/auth.json');
+    expect(HIDE_PATHS_FILES).toContain('.composer/auth.json');
+  });
+
   test('no path appears in both DIRS and FILES (a mount can be one or the other, not both)', () => {
     const dirsSet = new Set(HIDE_PATHS_DIRS);
     for (const f of HIDE_PATHS_FILES) {

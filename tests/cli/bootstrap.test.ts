@@ -10,6 +10,7 @@ let workdir: string;
 let dbPath: string;
 let originalKey: string | undefined;
 let originalXdg: string | undefined;
+let originalXdgCache: string | undefined;
 
 const mockProvider: Provider = {
   id: 'mock/m',
@@ -46,6 +47,13 @@ beforeEach(() => {
   // leak into "passes through unchanged" assertions.
   originalXdg = process.env.XDG_CONFIG_HOME;
   process.env.XDG_CONFIG_HOME = workdir;
+  // Isolate the sandbox cache + per-session /tmp under the workdir too:
+  // the persistence toggles default ON, so bootstrap host-creates
+  // `<cache>/forja/cache` and acquires a session tmpdir there. Pinning
+  // XDG_CACHE_HOME keeps those out of the dev's real ~/.cache; the
+  // afterEach rmSync of workdir sweeps them.
+  originalXdgCache = process.env.XDG_CACHE_HOME;
+  process.env.XDG_CACHE_HOME = workdir;
 });
 
 afterEach(() => {
@@ -54,6 +62,8 @@ afterEach(() => {
   else process.env.ANTHROPIC_API_KEY = originalKey;
   if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME;
   else process.env.XDG_CONFIG_HOME = originalXdg;
+  if (originalXdgCache === undefined) delete process.env.XDG_CACHE_HOME;
+  else process.env.XDG_CACHE_HOME = originalXdgCache;
 });
 
 describe('bootstrap', () => {

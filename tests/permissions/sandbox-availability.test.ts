@@ -4,6 +4,7 @@ import {
   detectSandboxAvailability,
   resolveSandboxBinary,
 } from '../../src/permissions/sandbox-availability.ts';
+import { forjaSessionTmpDir } from '../../src/storage/paths.ts';
 
 // Slice 154 (review — PATH-shim resistance): the detection +
 // resolution probe is hardened with a canonical-first lookup
@@ -325,6 +326,76 @@ describe('acquireSandboxTmpdir — slice 157 per-CLI-run scope', () => {
       platform: 'win32',
     });
     expect(result.tmpdir).toBeUndefined();
+  });
+
+  test('linux + shared_tmp ON: mkdir(0o700) at forjaSessionTmpDir, tmpdir set, cleanup rms it', () => {
+    const calls: { path: string; opts: { recursive: true; mode: number } }[] = [];
+    let rmPath: string | undefined;
+    const result = acquireSandboxTmpdir({
+      sessionId: 'sess-L1',
+      platform: 'linux',
+      sharedTmp: true,
+      mkdir: (path, opts) => {
+        calls.push({ path, opts });
+      },
+      rm: (p) => {
+        rmPath = p;
+      },
+    });
+    const expected = forjaSessionTmpDir('sess-L1');
+    expect(result.tmpdir).toBe(expected);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.path).toBe(expected);
+    expect(calls[0]?.opts.mode).toBe(0o700);
+    expect(calls[0]?.opts.recursive).toBe(true);
+    result.cleanup();
+    expect(rmPath).toBe(expected);
+  });
+
+  test('linux + shared_tmp OFF (explicit false): no-op (stays ephemeral --tmpfs /tmp)', () => {
+    let mkdirCalls = 0;
+    const result = acquireSandboxTmpdir({
+      sessionId: 'sess-L2',
+      platform: 'linux',
+      sharedTmp: false,
+      mkdir: () => {
+        mkdirCalls += 1;
+      },
+    });
+    expect(result.tmpdir).toBeUndefined();
+    expect(mkdirCalls).toBe(0);
+  });
+
+  test('linux + shared_tmp ON but mkdir fails: warn + undefined (degrades to ephemeral /tmp)', () => {
+    const warnings: string[] = [];
+    const result = acquireSandboxTmpdir({
+      sessionId: 'sess-L3',
+      platform: 'linux',
+      sharedTmp: true,
+      mkdir: () => {
+        const err = new Error('disk full') as NodeJS.ErrnoException;
+        err.code = 'ENOSPC';
+        throw err;
+      },
+      warn: (m) => {
+        warnings.push(m);
+      },
+    });
+    expect(result.tmpdir).toBeUndefined();
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain(forjaSessionTmpDir('sess-L3'));
+    expect(warnings[0]).toContain('ENOSPC');
+  });
+
+  test('darwin ignores shared_tmp=false (always acquires its tmpdir for SBPL isolation)', () => {
+    const result = acquireSandboxTmpdir({
+      sessionId: 'sess-D',
+      platform: 'darwin',
+      sharedTmp: false,
+      mkdir: () => {},
+      rm: () => {},
+    });
+    expect(result.tmpdir).toBe('/tmp/forja-sb-sess-D');
   });
 
   test('darwin happy path: mkdir(0o700, recursive) called with /tmp/forja-sb-<sessionId>', () => {

@@ -1,4 +1,4 @@
-import { loadSandboxConfig } from '../config/loaders.ts';
+import { DEFAULT_CACHE_PERSISTENCE, loadSandboxConfig } from '../config/loaders.ts';
 import { type HarnessEvent, type HarnessResult, runAgent } from '../harness/index.ts';
 import type { RunBudget } from '../harness/types.ts';
 import { resolveHookConfig, resolveHookPaths } from '../hooks/index.ts';
@@ -12,6 +12,7 @@ import { mergeTrustedHosts } from '../permissions/bootstrap-engine.ts';
 import { parseCapability } from '../permissions/capabilities.ts';
 import { createPermissionEngine, createSqliteSink, ensureInstallId } from '../permissions/index.ts';
 import { setWritableCacheDirsOverride } from '../permissions/sandbox-cache-dirs.ts';
+import { setCachePersistenceOverride } from '../permissions/sandbox-cache-env.ts';
 import { type Provider, type ProviderEffort, createDefaultRegistry } from '../providers/index.ts';
 import type { SystemSegment } from '../providers/types.ts';
 import {
@@ -535,9 +536,17 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     // Warnings are intentionally NOT re-surfaced — the parent already
     // emitted them at top-level boot.
     const sandboxConfigAnchor = opts.memoryCwd !== undefined ? opts.memoryCwd : session.cwd;
-    setWritableCacheDirsOverride(
-      loadSandboxConfig({ cwd: resolveRepoRoot(sandboxConfigAnchor) }).config.writableCacheDirs,
-    );
+    const childSandboxConfig = loadSandboxConfig({
+      cwd: resolveRepoRoot(sandboxConfigAnchor),
+    }).config;
+    setWritableCacheDirsOverride(childSandboxConfig.writableCacheDirs);
+    // PARITY (easy to miss): the subagent is a SEPARATE process — its
+    // module globals start unset. Mirror the parent's persistence override
+    // here, else subagents silently ignore `[sandbox] cache_persistence`
+    // and revert to ephemeral. The parent host-creates the cache base; the
+    // child reuses it (same user, same `forjaCachePersistBase()`), and the
+    // runner's existence gate degrades gracefully if it's somehow absent.
+    setCachePersistenceOverride(childSandboxConfig.cachePersistence ?? DEFAULT_CACHE_PERSISTENCE);
 
     const audit = getSubagentRun(db, opts.sessionId);
     if (audit === null) {

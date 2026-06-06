@@ -99,4 +99,13 @@ export const HIDE_PATHS_FILES: readonly string[] = [
   '.boto',
   '.gitconfig',
   '.cargo/credentials.toml',
+  // Package-manager auth/config that can carry registry tokens. Exposed
+  // read-only by the base `--ro-bind / /`, so without masking a sandboxed
+  // `cat` could read them. The opt-in persistent cache exposes only the
+  // package managers' CACHE subdirs (`~/.cache/forja/cache/{nuget,composer}`),
+  // NEVER these credential files — masked here to keep that boundary.
+  '.nuget/NuGet/NuGet.Config', // NuGet packageSourceCredentials (registry tokens)
+  '.config/NuGet/NuGet.Config', // NuGet config — canonical XDG location on Linux/macOS
+  '.config/composer/auth.json', // Composer auth (http-basic, github-oauth, gitlab-token)
+  '.composer/auth.json', // Composer auth — legacy COMPOSER_HOME location
 ];

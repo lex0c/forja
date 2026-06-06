@@ -26,6 +26,7 @@ let dbPath: string;
 let markerDir: string;
 let originalKey: string | undefined;
 let originalXdg: string | undefined;
+let originalXdgCache: string | undefined;
 let stderrChunks: string[];
 let originalStderrWrite: typeof process.stderr.write;
 
@@ -77,6 +78,12 @@ beforeEach(() => {
   // never create) instead of the developer's real ~/.config.
   originalXdg = process.env.XDG_CONFIG_HOME;
   process.env.XDG_CONFIG_HOME = workdir;
+  // Persistence toggles default ON → pin the cache home to the workdir so
+  // bootstrap's cache mkdir + session tmpdir land here (swept by the
+  // afterEach rmSync), not in the dev's real ~/.cache, and emit no stderr
+  // the banner assertions would see.
+  originalXdgCache = process.env.XDG_CACHE_HOME;
+  process.env.XDG_CACHE_HOME = workdir;
   captureStderr();
 });
 
@@ -87,6 +94,8 @@ afterEach(() => {
   else process.env.ANTHROPIC_API_KEY = originalKey;
   if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME;
   else process.env.XDG_CONFIG_HOME = originalXdg;
+  if (originalXdgCache === undefined) delete process.env.XDG_CACHE_HOME;
+  else process.env.XDG_CACHE_HOME = originalXdgCache;
 });
 
 describe('bootstrap: memory governance defaults', () => {

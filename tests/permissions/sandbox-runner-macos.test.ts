@@ -1,8 +1,10 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { setCachePersistenceOverride } from '../../src/permissions/sandbox-cache-env.ts';
 import {
   buildSandboxExecArgv,
   buildSbplProfile,
 } from '../../src/permissions/sandbox-runner-macos.ts';
+import { forjaCachePersistBase } from '../../src/storage/paths.ts';
 
 describe('buildSbplProfile — common header + base rules', () => {
   test('every sandboxed profile carries the SBPL version + deny default header', () => {
@@ -703,6 +705,11 @@ describe('buildSbplProfile — XDG_CONFIG_HOME unmask defense (slice 146)', () =
       expect(profile).toContain('(deny file-read* (subpath "/srv/conf/sops"))');
       expect(profile).toContain('(deny file-read* (subpath "/srv/conf/agent"))');
       expect(profile).toContain('(deny file-read* (subpath "/srv/conf/forja"))');
+      // FILES under .config/* (NuGet/Composer auth) must ALSO get a
+      // relocated literal deny, not only the home-relative one (#2 review fix).
+      expect(profile).toContain('(deny file-read* (literal "/srv/conf/NuGet/NuGet.Config"))');
+      expect(profile).toContain('(deny file-write* (literal "/srv/conf/NuGet/NuGet.Config"))');
+      expect(profile).toContain('(deny file-read* (literal "/srv/conf/composer/auth.json"))');
     } finally {
       restoreEnv();
     }
@@ -855,5 +862,77 @@ describe('defaultSandboxTmpdir', () => {
     const { defaultSandboxTmpdir } = await import('../../src/permissions/sandbox-availability.ts');
     expect(defaultSandboxTmpdir('abc-123')).toBe('/tmp/forja-sb-abc-123');
     expect(defaultSandboxTmpdir('SESSION_42')).toBe('/tmp/forja-sb-SESSION_42');
+  });
+});
+
+describe('macOS — opt-in persistent cache (cache_persistence)', () => {
+  // Pin XDG_CACHE_HOME so forjaCachePersistBase() is deterministic.
+  let origXdgCache: string | undefined;
+  beforeEach(() => {
+    origXdgCache = process.env.XDG_CACHE_HOME;
+    process.env.XDG_CACHE_HOME = '/xdgc';
+    setCachePersistenceOverride(undefined);
+  });
+  afterEach(() => {
+    setCachePersistenceOverride(undefined);
+    if (origXdgCache === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = origXdgCache;
+  });
+
+  const PERSIST_BASE = '/xdgc/forja/cache';
+  const ALLOW = `(allow file-write* (subpath "${PERSIST_BASE}"))`;
+
+  test('OFF by default — SBPL has no persistent cache write-allow', () => {
+    expect(buildSbplProfile('cwd-rw', '/work/proj', '/home/op')).not.toContain(ALLOW);
+  });
+
+  test('ON (cwd-rw) — SBPL grants write to the dedicated cache base', () => {
+    setCachePersistenceOverride(true);
+    const profile = buildSbplProfile('cwd-rw', '/work/proj', '/home/op');
+    expect(profile).toContain(ALLOW);
+    expect(PERSIST_BASE).toBe(forjaCachePersistBase()); // sanity: matches the runner helper
+  });
+
+  test('ON but ro / home-rw — no persistent cache write-allow (writable-only gate)', () => {
+    setCachePersistenceOverride(true);
+    for (const p of ['ro', 'home-rw'] as const) {
+      expect(buildSbplProfile(p, '/work/proj', '/home/op')).not.toContain(ALLOW);
+    }
+  });
+
+  test('ORDERING — the cache write-allow precedes the credential denies (last-match-wins)', () => {
+    setCachePersistenceOverride(true);
+    const profile = buildSbplProfile('cwd-rw', '/work/proj', '/home/op');
+    const allowIdx = profile.indexOf(ALLOW);
+    const denyIdx = profile.indexOf('(deny file-read* (subpath "/home/op/.ssh"))');
+    expect(allowIdx).toBeGreaterThanOrEqual(0);
+    expect(denyIdx).toBeGreaterThan(allowIdx);
+  });
+
+  test('buildSandboxExecArgv (ON) — env -i carries the redirect vars (incl. Maven flag form)', () => {
+    setCachePersistenceOverride(true);
+    const argv = buildSandboxExecArgv({
+      profile: 'cwd-rw',
+      cwd: '/work/proj',
+      home: '/home/op',
+      innerArgv: ['bash', '-s'],
+      env: { PATH: '/usr/bin' },
+      realpath: (p) => p,
+    });
+    expect(argv).toContain(`GOCACHE=${PERSIST_BASE}/go/build`);
+    expect(argv).toContain(`npm_config_cache=${PERSIST_BASE}/npm`);
+    expect(argv).toContain(`MAVEN_ARGS=-Dmaven.repo.local=${PERSIST_BASE}/maven`);
+  });
+
+  test('buildSandboxExecArgv (OFF) — no redirect vars in env -i', () => {
+    const argv = buildSandboxExecArgv({
+      profile: 'cwd-rw',
+      cwd: '/work/proj',
+      home: '/home/op',
+      innerArgv: ['bash', '-s'],
+      env: { PATH: '/usr/bin' },
+      realpath: (p) => p,
+    });
+    expect(argv.some((a) => a.startsWith('GOCACHE='))).toBe(false);
   });
 });

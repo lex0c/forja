@@ -329,11 +329,18 @@ Se scanner detecta secret **após** já ter sido persistido (eval offline pega):
 | macOS | `sandbox-exec` | opt-in | default |
 | Windows | (TBD — `AppContainer`?) | sem suporte | feature flag |
 
-Profile mínimo:
-- Mount: `cwd` read-write; `~/.config/agent` read; `/tmp` read-write isolado; resto read-only
+Profile base:
+- Mount: `cwd` read-write; `~/.config/agent` read; `/tmp` read-write isolado (**por sessão por default** — ver persistência abaixo; `shared_tmp = false` volta ao tmpfs fresco por spawn); resto read-only
 - Network: DENY por default (modo strict); ALLOW lista limitada (modo normal)
 - /etc, /root: read-only
 - /proc, /sys: minimal
+
+**Persistência (default ON, opt-out via `[sandbox]`).** Por decisão do operador o reuso é o baseline: sem `[sandbox]` config, os dois carve-outs abaixo já vêm **LIGADOS**, trocando efemeridade por reuso **sem nunca tocar o filesystem real do host** além do `cwd`. Cada um desliga explicitamente com `= false` (volta ao isolamento efêmero):
+
+- `cache_persistence` — cache de build/deps compartilhado por-usuário num diretório **dedicado ao Forja**, `~/.cache/forja/cache/<lang>/` (honra `$XDG_CACHE_HOME`), montado read-write persistente. As env vars de cada toolchain (`GOCACHE`/`GOMODCACHE`, `npm_config_cache`, `PIP_CACHE_DIR`, `UV_CACHE_DIR`, `BUN_INSTALL_CACHE_DIR`, `NUGET_PACKAGES`, `COMPOSER_CACHE_DIR`, `GRADLE_USER_HOME`, `MAVEN_ARGS=-Dmaven.repo.local=…`, …) são injetadas pelo **wrap** (`--setenv` no bwrap / `env -i` no sandbox-exec — nunca pelo modelo, que o resolver de bash recusa `VAR=val cmd`) apontando pra esse base. NUNCA se binda `~/.cache`, `~/go/pkg/mod`, `~/.npm` reais do host: o cache do Forja é separado, então um build comprometido dentro do sandbox não envenena builds que o operador roda fora dele. O cache real do host segue mascarado (tmpfs) como no default. Credenciais de package managers (`~/.npmrc`, `~/.nuget/NuGet/NuGet.Config`, `~/.config/composer/auth.json`, …) seguem mascaradas dentro do sandbox — só os subdirs de cache são expostos, nunca config/auth.
+- `shared_tmp` — `/tmp` persistente **por sessão**: `~/.cache/forja/tmp/sessions/<sessionId>` montado em `/tmp`, criado no boot e removido no exit. Reuso de arquivos temporários entre tool-calls da mesma sessão; isolado entre sessões e do `/tmp` real do host.
+
+Ordem de montagem (bwrap aplica em ordem, last-wins): tmpfs do cache-do-host → bind do cache-do-Forja → bind do `cwd` → overlays de credencial. Um cache (envenenado ou não) **nunca** pode desmascarar uma credencial. Trade-off aceito: o cache compartilhado por-usuário persiste cross-session (superfície intra-Forja) e cresce sem limite até um GC futuro. macOS: `sandbox-exec` não tem bind — a persistência de cache vira `(allow file-write* (subpath …))` + as mesmas env vars; o `/tmp` por sessão usa o mecanismo de tmpdir-subpath restrito.
 
 ### 8.2 Process isolation
 
