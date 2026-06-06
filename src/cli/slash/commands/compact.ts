@@ -35,7 +35,7 @@ export const compactCommand: SlashCommand = {
       return { kind: 'error', message: 'no live session to compact yet — run a turn first' };
     }
 
-    const run = async (): Promise<SlashResult> => {
+    const run = async (signal?: AbortSignal): Promise<SlashResult> => {
       const before = live.length;
       const budget = effectiveBudget(ctx.baseConfig.budget, ctx.baseConfig.effort);
       // Same pin block the auto-compaction injects, so /compact preserves
@@ -46,15 +46,21 @@ export const compactCommand: SlashCommand = {
       // only fires on an unexpected throw (a future regression) — a cheap
       // rewind vs a corrupted single source of truth.
       const snap = live.snapshot();
+      // Bound the summary call. Without this a stalled provider / hung network
+      // hangs `await live.compact` forever while runExclusive holds the REPL
+      // busy — no timeout, no interrupt. Time out at the step-stall budget, and
+      // compose the operator's interrupt signal (from runExclusive) so Ctrl+C
+      // aborts it too. compactMessages turns either abort into its deterministic
+      // fallback, so the run survives and the REPL frees.
+      const timeout = AbortSignal.timeout(budget.maxStepStallMs);
+      const compactSignal = signal !== undefined ? AbortSignal.any([signal, timeout]) : timeout;
       try {
-        // Bracket the live "Compacting context…" chip around the summary call — the
-        // same chip the auto path shows. Paired with the :end in `finally`.
+        // Bracket the live "Compacting context…" chip around the summary call —
+        // the same chip the auto path shows. Paired with the :end in `finally`.
         ctx.bus.emit({ type: 'compacting:start', ts: ctx.now() });
         const result = await live.compact(ctx.baseConfig.provider, {
           preserveTail: budget.compactionPreserveTail,
-          // No turn in flight to abort against; a fresh, never-aborted
-          // signal satisfies compactMessages' contract.
-          signal: new AbortController().signal,
+          signal: compactSignal,
           ...(pinnedBlock !== undefined ? { pinnedBlock } : {}),
         });
         // Apply the compaction's accounting — the SHARED decision (cost +
