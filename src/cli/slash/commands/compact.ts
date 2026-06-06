@@ -8,8 +8,8 @@
 // never decides to compact; the harness does it automatically and the
 // operator can force it here.
 
+import { accountCompaction } from '../../../harness/compaction.ts';
 import { effectiveBudget } from '../../../harness/types.ts';
-import { computeCost } from '../../../providers/cost.ts';
 import { formatPinnedBlock, getActivePinsBySession } from '../../../storage/repos/context-pins.ts';
 import {
   getSession,
@@ -57,23 +57,21 @@ export const compactCommand: SlashCommand = {
           signal: new AbortController().signal,
           ...(pinnedBlock !== undefined ? { pinnedBlock } : {}),
         });
-        // The summary call is a billed provider request — fold its usage
-        // into the session row + the REPL cumulative, exactly as the loop's
-        // maybeCompact does. Otherwise /compact spends tokens that appear in
-        // no cost total / audit and escape the maxCostUsd cap.
-        const cost = computeCost(ctx.baseConfig.provider.capabilities, result.usage);
-        if (cost > 0) {
-          ctx.cumulative.costUsd += cost;
+        // Apply the compaction's accounting — the SHARED decision (cost +
+        // whether usage is a lower bound) that the loop's maybeCompact
+        // applies too. Fold cost into the session row + the REPL cumulative
+        // (else the spend escapes /cost, audit, and the maxCostUsd cap), and
+        // downgrade usage_complete when it billed without reporting usage
+        // (independent of cost — even a zero-usage fallback flips it).
+        const acct = accountCompaction(result, ctx.baseConfig.provider.capabilities);
+        if (acct.costUsd > 0) {
+          ctx.cumulative.costUsd += acct.costUsd;
           const session = getSession(ctx.db, live.sessionId);
           if (session !== null) {
-            updateSessionCost(ctx.db, live.sessionId, session.totalCostUsd + cost);
+            updateSessionCost(ctx.db, live.sessionId, session.totalCostUsd + acct.costUsd);
           }
         }
-        // The summary call billed but its usage event never arrived (provider
-        // failed before reporting) → the recorded spend is a lower bound. Mark
-        // the session's usage incomplete, exactly as the loop's maybeCompact
-        // does. Independent of cost: even a zero-usage fallback flips it.
-        if (result.strategy !== 'skipped' && !result.usageSeen) {
+        if (acct.usageIncomplete) {
           markSessionUsageIncomplete(ctx.db, live.sessionId);
         }
         if (result.strategy === 'skipped') {

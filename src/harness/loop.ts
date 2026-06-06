@@ -62,6 +62,7 @@ import type { ToolContext } from '../tools/index.ts';
 import type { SpawnSubagentArgs, SpawnSubagentResult } from '../tools/types.ts';
 import { StepStallError, abortableIterable, stallWatchdog } from './abortable.ts';
 import { CollectStepError, type CollectedToolUse, collectStep } from './collect.ts';
+import { accountCompaction } from './compaction.ts';
 import { resolveProviderEffort } from './effort.ts';
 import { invokeTool } from './invoke-tool.ts';
 import { MAX_RESUME_MESSAGES } from './resume.ts';
@@ -2332,11 +2333,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           signal,
           ...(pinnedBlock !== undefined ? { pinnedBlock } : {}),
         });
-        const compactionCost = computeCost(config.provider.capabilities, compaction.usage);
+        const acct = accountCompaction(compaction, config.provider.capabilities);
         totalUsage = addUsage(totalUsage, compaction.usage);
-        totalCostUsd += compactionCost;
-        emitCostUpdate(compactionCost);
-        if (compaction.strategy !== 'skipped' && !compaction.usageSeen) {
+        totalCostUsd += acct.costUsd;
+        emitCostUpdate(acct.costUsd);
+        if (acct.usageIncomplete) {
           usageComplete = false;
         }
         const finishedEvent: HarnessEvent = {
@@ -2345,7 +2346,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           foldedCount: compaction.foldedCount,
           durationMs: Date.now() - compactStart,
           usage: compaction.usage,
-          costUsd: compactionCost,
+          costUsd: acct.costUsd,
           ...(compaction.reason !== undefined ? { reason: compaction.reason } : {}),
         };
         safeEmit(config.onEvent, finishedEvent);

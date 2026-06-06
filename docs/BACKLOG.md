@@ -2,6 +2,10 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-06] Refactor: accountCompaction — single source for the fold decision
+
+Two of the fixes below were `/compact` reimplementing `maybeCompact`'s "fold a `CompactionResult` into session totals" by hand and dropping a side effect (the cost, then `usage_complete`). Extracted the DECISION — `accountCompaction(result, caps) → { costUsd, usageIncomplete }` in `compaction.ts`; both surfaces now consume it. Destinations still differ legitimately (loop accumulates in-memory run totals → `completeSession`; `/compact` writes the session row directly), but the decision is single-sourced, so a caller can't silently disagree on cost or usage-completeness again. Behavior-preserving. Test pins the decision across llm/fallback/skipped × usage-seen. The orphan/`ensureAlternation` bug was a separate class (reuse path, not accounting) and stays covered by its own tests; the cosmetic `cost_update` parity is left out (unconfirmed).
+
 ## [2026-06-06] Fix: /compact didn't mark usage incomplete on fallback
 
 When an operator `/compact`'s summary call failed BEFORE its usage event arrived, it fell back (`strategy: 'fallback'`, `usageSeen: false`) but only updated cost when computable and never flipped the session's `usage_complete` — so the session stayed marked usage-complete over a spend that's only a lower bound. The auto path (`maybeCompact`) handles the same case via `usageComplete`. New `markSessionUsageIncomplete(db, id)` sets `usage_complete = 0` without ending the session; `/compact` calls it whenever `strategy !== 'skipped' && !usageSeen`, independent of cost. Reuse turns carry it forward (`completeSession` folds `priorUsageComplete && usageComplete`). Regression test proven non-vacuous. Both this and the earlier `ensureAlternation` fix are `/compact`-vs-`maybeCompact` parity gaps — a direct parity test would catch the class.

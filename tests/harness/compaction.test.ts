@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { compactMessages } from '../../src/harness/compaction.ts';
+import {
+  type CompactionResult,
+  accountCompaction,
+  compactMessages,
+} from '../../src/harness/compaction.ts';
 import type {
   GenerateRequest,
   Provider,
@@ -719,5 +723,60 @@ describe('compactMessages — deterministic fallback', () => {
     });
     // abortableIterable surfaces the abort as a thrown error → fallback.
     expect(result.strategy).toBe('fallback');
+  });
+});
+
+// The shared cost + usage-completeness decision both fold surfaces apply
+// (loop's maybeCompact, operator /compact). Two parity bugs lived in
+// re-implementing this by hand; pinning the decision here guards the class.
+describe('accountCompaction (shared cost + usage decision)', () => {
+  const caps: Provider['capabilities'] = {
+    ...baseCaps,
+    cost_per_1k_input: 3,
+    cost_per_1k_output: 15,
+  };
+  const mk = (over: Partial<CompactionResult>): CompactionResult => ({
+    messages: [],
+    strategy: 'llm',
+    foldedCount: 0,
+    usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+    usageSeen: true,
+    ...over,
+  });
+
+  test('llm with usage seen → cost folded, usage complete', () => {
+    const a = accountCompaction(
+      mk({
+        strategy: 'llm',
+        usage: { input: 1000, output: 100, cache_read: 0, cache_creation: 0 },
+      }),
+      caps,
+    );
+    expect(a.costUsd).toBeGreaterThan(0);
+    expect(a.usageIncomplete).toBe(false);
+  });
+
+  test('fallback without usage seen → usage incomplete even at zero cost', () => {
+    const a = accountCompaction(mk({ strategy: 'fallback', usageSeen: false }), caps);
+    expect(a.costUsd).toBe(0);
+    expect(a.usageIncomplete).toBe(true);
+  });
+
+  test('skipped → never incomplete (no call was made)', () => {
+    const a = accountCompaction(mk({ strategy: 'skipped', usageSeen: false }), caps);
+    expect(a.usageIncomplete).toBe(false);
+  });
+
+  test('fallback WITH partial usage seen → cost folded, usage complete', () => {
+    const a = accountCompaction(
+      mk({
+        strategy: 'fallback',
+        usageSeen: true,
+        usage: { input: 500, output: 0, cache_read: 0, cache_creation: 0 },
+      }),
+      caps,
+    );
+    expect(a.costUsd).toBeGreaterThan(0);
+    expect(a.usageIncomplete).toBe(false);
   });
 });

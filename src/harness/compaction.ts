@@ -1,4 +1,4 @@
-import { emptyUsage } from '../providers/cost.ts';
+import { computeCost, emptyUsage } from '../providers/cost.ts';
 import type {
   GenerateRequest,
   Provider,
@@ -85,6 +85,27 @@ export interface CompactionResult {
   // through the harness event for observability.
   reason?: string;
 }
+
+// The accounting consequences of folding a CompactionResult: what the
+// (billed) compaction call cost, and whether it leaves the session's usage a
+// lower bound. BOTH surfaces that fold a result must apply BOTH fields — the
+// loop's maybeCompact (in-memory run totals → completeSession) and operator
+// /compact (direct session-row writes). Decided here once because
+// hand-reimplementing it is exactly what drifted: /compact recomputed cost
+// but dropped the usageIncomplete half, leaving sessions marked complete over
+// a lower-bound spend. Destinations still differ (in-memory vs row); only the
+// DECISION is shared, so a caller can't silently disagree on it again.
+export interface CompactionAccounting {
+  costUsd: number;
+  usageIncomplete: boolean;
+}
+export const accountCompaction = (
+  result: CompactionResult,
+  capabilities: Provider['capabilities'],
+): CompactionAccounting => ({
+  costUsd: computeCost(capabilities, result.usage),
+  usageIncomplete: result.strategy !== 'skipped' && !result.usageSeen,
+});
 
 const SUMMARY_MARKER_OPEN = '[compacted_history]';
 const SUMMARY_MARKER_CLOSE = '[/compacted_history]';
