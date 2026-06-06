@@ -2,6 +2,10 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-06] Fix: /compact didn't mark usage incomplete on fallback
+
+When an operator `/compact`'s summary call failed BEFORE its usage event arrived, it fell back (`strategy: 'fallback'`, `usageSeen: false`) but only updated cost when computable and never flipped the session's `usage_complete` — so the session stayed marked usage-complete over a spend that's only a lower bound. The auto path (`maybeCompact`) handles the same case via `usageComplete`. New `markSessionUsageIncomplete(db, id)` sets `usage_complete = 0` without ending the session; `/compact` calls it whenever `strategy !== 'skipped' && !usageSeen`, independent of cost. Reuse turns carry it forward (`completeSession` folds `priorUsageComplete && usageComplete`). Regression test proven non-vacuous. Both this and the earlier `ensureAlternation` fix are `/compact`-vs-`maybeCompact` parity gaps — a direct parity test would catch the class.
+
 ## [2026-06-06] Fix: ensureAlternation skipped same-length tool_use repairs
 
 `SessionContext.ensureAlternation` copied the repaired array back only when its LENGTH changed — but `repairAlternation`'s partial-answer branch (an assistant with N tool_use blocks, the next user answering only some) rewrites that user message IN PLACE with the missing synthetic results, same length. The repair was discarded, so the next reused REPL turn re-sent an unanswered tool_use → provider 400 (the very wedge the repair prevents). Now copies back unconditionally (idempotent when nothing changed). Regression test (2 tool_use, 1 answered) proven non-vacuous: fails without the fix, passes with. Reported externally; escaped because the orphan test + the after-abort smoke only exercised the single-tool_use branch, which DOES change length.

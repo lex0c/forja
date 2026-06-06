@@ -11,7 +11,11 @@
 import { effectiveBudget } from '../../../harness/types.ts';
 import { computeCost } from '../../../providers/cost.ts';
 import { formatPinnedBlock, getActivePinsBySession } from '../../../storage/repos/context-pins.ts';
-import { getSession, updateSessionCost } from '../../../storage/repos/sessions.ts';
+import {
+  getSession,
+  markSessionUsageIncomplete,
+  updateSessionCost,
+} from '../../../storage/repos/sessions.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 
 export const compactCommand: SlashCommand = {
@@ -64,6 +68,13 @@ export const compactCommand: SlashCommand = {
           if (session !== null) {
             updateSessionCost(ctx.db, live.sessionId, session.totalCostUsd + cost);
           }
+        }
+        // The summary call billed but its usage event never arrived (provider
+        // failed before reporting) → the recorded spend is a lower bound. Mark
+        // the session's usage incomplete, exactly as the loop's maybeCompact
+        // does. Independent of cost: even a zero-usage fallback flips it.
+        if (result.strategy !== 'skipped' && !result.usageSeen) {
+          markSessionUsageIncomplete(ctx.db, live.sessionId);
         }
         if (result.strategy === 'skipped') {
           return {

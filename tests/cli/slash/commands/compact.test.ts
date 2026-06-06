@@ -210,4 +210,26 @@ describe('/compact', () => {
       eventTypes.indexOf('compacting:end'),
     );
   });
+
+  test('marks session usage incomplete when the summary call fails before reporting usage', async () => {
+    const live = buildLiveCtx();
+    // Provider throws mid-stream BEFORE emitting usage → compactMessages
+    // falls back (strategy 'fallback', usageSeen false). The auto path flips
+    // usageComplete here; /compact must too, or the spend stays a silent
+    // lower bound on a session still marked usage-complete.
+    const provider: Provider = {
+      id: 'test/c',
+      family: 'anthropic',
+      capabilities: baseCaps,
+      async *generate(): AsyncGenerator<StreamEvent> {
+        yield { kind: 'start', message_id: 'm' };
+        throw new Error('provider failed before usage');
+      },
+      generateConstrained: () => Promise.reject(new Error('n/a')),
+      countTokens: () => Promise.resolve(0),
+    };
+    const r = await compactCommand.exec([], makeCtx({ provider, live }));
+    expect(r.kind).toBe('ok'); // fallback keeps the run alive
+    expect(getSession(db, live.sessionId)?.usageComplete).toBe(false);
+  });
 });
