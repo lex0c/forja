@@ -1,4 +1,4 @@
-import { emptyUsage } from '../providers/cost.ts';
+import { computeCost, emptyUsage } from '../providers/cost.ts';
 import type {
   GenerateRequest,
   Provider,
@@ -86,6 +86,27 @@ export interface CompactionResult {
   reason?: string;
 }
 
+// The accounting consequences of folding a CompactionResult: what the
+// (billed) compaction call cost, and whether it leaves the session's usage a
+// lower bound. BOTH surfaces that fold a result must apply BOTH fields — the
+// loop's maybeCompact (in-memory run totals → completeSession) and operator
+// /compact (direct session-row writes). Decided here once because
+// hand-reimplementing it is exactly what drifted: /compact recomputed cost
+// but dropped the usageIncomplete half, leaving sessions marked complete over
+// a lower-bound spend. Destinations still differ (in-memory vs row); only the
+// DECISION is shared, so a caller can't silently disagree on it again.
+export interface CompactionAccounting {
+  costUsd: number;
+  usageIncomplete: boolean;
+}
+export const accountCompaction = (
+  result: CompactionResult,
+  capabilities: Provider['capabilities'],
+): CompactionAccounting => ({
+  costUsd: computeCost(capabilities, result.usage),
+  usageIncomplete: result.strategy !== 'skipped' && !result.usageSeen,
+});
+
 const SUMMARY_MARKER_OPEN = '[compacted_history]';
 const SUMMARY_MARKER_CLOSE = '[/compacted_history]';
 
@@ -113,6 +134,8 @@ const SUMMARY_MARKER_CLOSE = '[/compacted_history]';
 // floor where adding more granularity costs more attention than
 // it saves.
 const COMPACTION_SYSTEM_PROMPT = `You are summarizing a long conversation between a user and an autonomous coding agent. Your output replaces the middle turns of the transcript so the model can continue without losing critical context. The next agent turn reads this block in place of those messages — anything not preserved here will be re-investigated next turn (extra grep / read / test calls), so prefer concrete pointers (file:line, symbol names, exact error strings) over prose. Every word costs tokens the agent could use to keep working.
+
+Preserve facts exactly as established — copy names, paths, line numbers, and error strings verbatim from the transcript; do not rewrite, generalize, or infer beyond what was stated. When unsure whether a detail matters, keep it: a dropped fact costs a full re-investigation next turn, a kept one costs a few tokens.
 
 Output ONLY the following structured block, nothing else:
 

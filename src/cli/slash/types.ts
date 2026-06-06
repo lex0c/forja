@@ -11,7 +11,7 @@
 // (audit, error handling, future telemetry) instead of scattering
 // `bus.emit` calls across every command.
 
-import type { HarnessConfig } from '../../harness/index.ts';
+import type { HarnessConfig, SessionContext } from '../../harness/index.ts';
 import type { HookChainResult, HookEventPayload } from '../../hooks/types.ts';
 import type { ModelRegistry } from '../../providers/registry.ts';
 import type { DB } from '../../storage/index.ts';
@@ -149,6 +149,17 @@ export interface SlashContext {
   // empty-chain short-circuit). Null return mirrors that path so
   // call sites don't branch on the discriminator.
   dispatchHooks?: (payload: HookEventPayload) => Promise<HookChainResult | null>;
+  // Live in-memory session context (project_message_single_source).
+  // Getter because the REPL holds it and it only exists after the first
+  // turn. /compact uses it to compact the conversation the model sees,
+  // in place, for the live session. Absent in tests/headless that hold
+  // no context ⇒ /compact reports "no live session" cleanly.
+  liveContext?: () => SessionContext | null;
+  // Run a mutating slash action (today /compact) under the REPL's busy flag
+  // so a concurrent turn or a second invocation can't start mid-await and
+  // race the live context. The REPL holds `isBusy()` true for the whole fn.
+  // Absent in tests/headless — callers run fn directly without a lock.
+  runExclusive?: <T>(fn: () => Promise<T>) => Promise<T>;
 }
 
 // Outcome of executing a command. The dispatcher emits any messages

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
 import type { CollectedStep } from '../../src/harness/collect.ts';
+import { type AssistantUsage, SessionContext } from '../../src/harness/index.ts';
 import { runAgent } from '../../src/harness/loop.ts';
 import { createPermissionEngine } from '../../src/permissions/index.ts';
 import type { Policy } from '../../src/permissions/index.ts';
@@ -7,6 +8,7 @@ import type { GenerateRequest, Provider, StreamEvent } from '../../src/providers
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { listProvenanceForMemory } from '../../src/storage/repos/memory-provenance.ts';
+import { appendMessage } from '../../src/storage/repos/messages.ts';
 import { createSession, getSession, listSessions } from '../../src/storage/repos/sessions.ts';
 import type { SubagentSet } from '../../src/subagents/load.ts';
 import type { SubagentDefinition } from '../../src/subagents/types.ts';
@@ -754,6 +756,97 @@ describe('runAgent', () => {
     const turnReq = second.handle.requests.at(-1);
     if (turnReq === undefined) throw new Error('expected a post-compaction request');
     expect(turnReq.messages.length).toBeLessThan(8);
+  });
+
+  test('reuse: sessionContext is mutually exclusive with resumeFromSessionId', async () => {
+    const t1 = buildConfig([{ text: 'a', stop_reason: 'end_turn' }]);
+    const r1 = await runAgent(t1.config);
+    const ctx = r1.sessionContext;
+    if (ctx === undefined) throw new Error('expected a context');
+    const t2 = buildConfig([{ text: 'b', stop_reason: 'end_turn' }]);
+    const r2 = await runAgent({
+      ...t2.config,
+      sessionContext: ctx,
+      resumeFromSessionId: r1.sessionId,
+    });
+    expect(r2.status).toBe('error');
+    expect(r2.detail ?? '').toContain('mutually exclusive');
+  });
+
+  test('reuse: turn 2 keeps the SAME context object and appends onto it', async () => {
+    // The core of compact-once-reuse: turn 2 with sessionContext reuses the
+    // live array in place — it does NOT rebuild a new one from the DB.
+    const t1 = buildConfig([{ text: 'a', stop_reason: 'end_turn' }]);
+    const r1 = await runAgent(t1.config);
+    const ctx = r1.sessionContext;
+    expect(ctx).toBeDefined();
+    if (ctx === undefined) return;
+    const lenAfterT1 = ctx.length; // userPrompt 'hi' + assistant 'a' = 2
+
+    const t2 = buildConfig([{ text: 'b', stop_reason: 'end_turn' }]);
+    const r2 = await runAgent({ ...t2.config, sessionContext: ctx });
+    expect(r2.sessionContext).toBe(ctx); // same object — reused, not rebuilt
+    expect(ctx.length).toBe(lenAfterT1 + 2); // turn 2 appended user + assistant
+  });
+
+  test('reuse does NOT re-derive from the DB log', async () => {
+    const t1 = buildConfig([{ text: 'a', stop_reason: 'end_turn' }]);
+    const r1 = await runAgent(t1.config);
+    const ctx = r1.sessionContext;
+    if (ctx === undefined) throw new Error('expected a context');
+    // Inject a stray row the in-memory ctx cannot see. A resume would
+    // re-read it from the log; a reuse must not.
+    appendMessage(db, {
+      sessionId: r1.sessionId,
+      role: 'user',
+      content: 'STRAY-FROM-DB',
+      parentId: ctx.getLastMessageId(),
+    });
+
+    const t2 = buildConfig([{ text: 'b', stop_reason: 'end_turn' }]);
+    await runAgent({ ...t2.config, sessionContext: ctx });
+    const req2 = t2.handle.requests[0];
+    const hasStray = req2?.messages.some(
+      (m) => typeof m.content === 'string' && m.content.includes('STRAY-FROM-DB'),
+    );
+    expect(hasStray).toBe(false); // turn 2 saw the in-memory ctx, not the DB
+  });
+
+  test('reuse of a post-abort context (orphaned tool_use) is repaired before the next turn', async () => {
+    // The exact state an abort mid-tool leaves: tail is an assistant
+    // tool_use with no tool_result (the loop's abort paths exit before
+    // appendToolResults). Build that shape, then reuse it — without the
+    // repair the next turn's request carries an unanswered tool_use and 400s
+    // every turn until restart. End-to-end regression guard.
+    const sessionId = createSession(db, { model: 'mock/m', cwd: '/p' }).id;
+    const noUsage: AssistantUsage = {
+      usageSeen: false,
+      tokensIn: 0,
+      tokensOut: 0,
+      cacheRead: 0,
+      cacheCreation: 0,
+      costUsd: 0,
+    };
+    const ctx = SessionContext.createFresh(db, sessionId);
+    ctx.appendUser('hi', null);
+    ctx.appendAssistant(
+      [{ type: 'tool_use', id: 'tu1', name: 'echo', input: { msg: 'a' } }],
+      noUsage,
+      null,
+    );
+
+    const t = buildConfig([{ text: 'ok', stop_reason: 'end_turn' }]);
+    const r = await runAgent({ ...t.config, sessionContext: ctx });
+    expect(r.status).toBe('done'); // did not wedge
+
+    // The request the provider actually saw answers tu1 (orphan repaired).
+    const req = t.handle.requests[0];
+    const answered = req?.messages.some(
+      (m) =>
+        Array.isArray(m.content) &&
+        m.content.some((b) => b.type === 'tool_result' && b.tool_use_id === 'tu1'),
+    );
+    expect(answered).toBe(true);
   });
 
   test('budget.maxCostUsd: cumulative across resume (prior cost counts)', async () => {

@@ -42,6 +42,7 @@ import { renderReverseSearch } from './reverse-search.ts';
 import { renderSlashPopover, slashPopoverLineCount } from './slash-popover.ts';
 import { renderSubagentRows } from './subagent-row.ts';
 import { renderThinkingChip } from './thinking-chip.ts';
+import { renderTimedChip } from './timed-chip.ts';
 import { renderTodoList } from './todo-list.ts';
 import { renderToolCardLive } from './tool-card.ts';
 import { renderToolPhaseChip } from './tool-phase-chip.ts';
@@ -329,7 +330,12 @@ export const composeLive: ComposeLive = (
   //
   // Across a live turn at least one of these holds, so the chip stays
   // visible the whole interaction; between turns all four are null and
-  // the slot collapses.
+  // the slot collapses. `compacting` is LAST: a compaction runs only
+  // between steps (auto) or with no turn at all (/compact), so the turn
+  // chips are already null when it should show — and if a stray end event
+  // ever left it set mid-turn, a real turn chip correctly takes the slot
+  // instead of a stale "Compacting context…" masking the live work. No special
+  // priority, no need to clear it on chip transitions.
   if (state.thinking !== null) {
     appendBlock(renderThinkingChip(state.thinking, caps, now));
   } else if (state.pendingAssistant !== null) {
@@ -338,6 +344,8 @@ export const composeLive: ComposeLive = (
     appendBlock(renderToolPhaseChip(state.currentTurnId, caps, now));
   } else if (state.awaitingProvider !== null) {
     appendBlock(renderAwaitingChip(state.awaitingProvider, caps, now));
+  } else if (state.compacting !== null) {
+    appendBlock(renderTimedChip('Compacting context…', state.compacting.startedAt, caps, now));
   }
 
   // (Status line — removed: UI.md §4.4 absorbed into the §4.10.6

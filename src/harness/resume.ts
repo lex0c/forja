@@ -225,21 +225,21 @@ export const messagesToProviderMessages = (rows: Message[]): ReconstitutedMessag
   if (out[0]?.role === 'assistant') {
     out.unshift({ role: 'user', content: TRUNCATION_PLACEHOLDER });
   }
-  // Answer any orphaned tool_use blocks first — a mid-round abort can
-  // persist a tool_use with no tool_result, and one unanswered
-  // tool_use 400s the entire request. This can leave a user→user seam
-  // (a synthetic result message just before a real prompt); the pass
-  // below closes it.
-  const deOrphaned = repairOrphanedToolUses(out);
-  // Repair internal user→user gaps. A single stranded resume left
-  // a trailing user; the loop patched it once. But repeated
-  // aborted resumes accumulate INTERNAL user,user pairs in the
-  // log (each aborted resume appends its own user prompt without
-  // an assistant ever responding), and the single trailing patch
-  // misses them. Walk consecutive pairs and insert a synthetic
-  // assistant between any user→user. Same placeholder
-  // (STRANDED_TURN_PLACEHOLDER) — these are all "the model never
-  // got to reply" gaps.
+  return { messages: repairAlternation(out), droppedFromHead };
+};
+
+// Repair a ProviderMessage[] so a provider accepts it: (1) answer orphaned
+// tool_use blocks — a mid-tool abort persists a tool_use with no
+// tool_result, and one unanswered tool_use 400s the whole request; (2)
+// close internal user→user gaps — repeated aborted resumes accumulate them
+// — with a synthetic assistant (STRANDED_TURN_PLACEHOLDER, "the model never
+// got to reply"). Idempotent on a clean array (no orphan / no gap ⇒ same
+// length). Used by the hydrate path above AND, critically, by
+// SessionContext.ensureAlternation on the REPL reuse path: reuse does NOT
+// round-trip through hydrate, so without running this an abort-induced
+// orphan tool_use would wedge every subsequent live turn with a 400.
+export const repairAlternation = (msgs: ProviderMessage[]): ProviderMessage[] => {
+  const deOrphaned = repairOrphanedToolUses(msgs);
   const repaired: ProviderMessage[] = [];
   for (let i = 0; i < deOrphaned.length; i++) {
     const curr = deOrphaned[i];
@@ -250,5 +250,5 @@ export const messagesToProviderMessages = (rows: Message[]): ReconstitutedMessag
       repaired.push({ role: 'assistant', content: STRANDED_TURN_PLACEHOLDER });
     }
   }
-  return { messages: repaired, droppedFromHead };
+  return repaired;
 };

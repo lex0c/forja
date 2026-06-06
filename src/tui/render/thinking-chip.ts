@@ -7,9 +7,10 @@
 // generating chip with no progress for 5-30s and had no way to
 // tell whether the model was reasoning or the run was hung.
 //
-// This chip closes that gap. It mirrors the structure of
-// `assistant-chip.ts` (same spinner, same elapsed formatting) so
-// the operator's eye reads them as the same family of indicator.
+// This chip closes that gap. The render (spinner + shimmer label +
+// elapsed counter) is the shared `renderTimedChip`, so it reads as the
+// same family as the awaiting / compacting indicators; only the verb
+// (cognitive pool) differs.
 //
 // Verb is picked from the COGNITIVE pool by `pickCognitiveVerb`,
 // hashed off the assistant message id. Stable for the duration
@@ -35,20 +36,13 @@
 // picks one chip per turn based on which state is set.
 
 import type { LiveState } from '../state.ts';
-import { type Capabilities, paint } from '../term.ts';
-import { formatChipDuration } from './duration.ts';
-import { renderShimmer } from './shimmer.ts';
+import type { Capabilities } from '../term.ts';
 import { pickCognitiveVerb } from './spinner-verbs.ts';
-import { spinnerGlyph } from './tool-card.ts';
+import { renderTimedChip } from './timed-chip.ts';
 
 export const renderThinkingChip = (
   thinking: NonNullable<LiveState['thinking']>,
   caps: Capabilities,
   now: number,
-): string[] => {
-  const spinner = spinnerGlyph(caps, now);
-  const elapsed = formatChipDuration(now - thinking.startedAt);
-  const verb = renderShimmer(`${pickCognitiveVerb(thinking.messageId)}…`, caps, now, 'secondary');
-  const head = paint(caps, 'secondary', `${spinner} `);
-  return [`${head}${verb}${paint(caps, 'secondary', `  [${elapsed}]`)}`];
-};
+): string[] =>
+  renderTimedChip(`${pickCognitiveVerb(thinking.messageId)}…`, thinking.startedAt, caps, now);

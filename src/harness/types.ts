@@ -15,6 +15,7 @@ import type { TelemetrySink } from '../telemetry/index.ts';
 import type { TodoItem, TodoStore } from '../todo/index.ts';
 import type { ClarifyBridgeRequest, ClarifyBridgeResponse, ToolRegistry } from '../tools/index.ts';
 import { type ForjaEffort, effortBudgetPatch } from './effort.ts';
+import type { SessionContext } from './session-context.ts';
 
 // Lifecycle events the harness emits during a run. Synchronous (fire and
 // forget) so renderers stay simple and the loop never waits on UI work.
@@ -766,6 +767,15 @@ export interface HarnessConfig {
   // both is harmless (parentSessionId is ignored on the
   // preassigned path) but indicates a confused construction.
   preassignedSessionId?: string;
+  // Live, caller-owned conversation context for multi-turn reuse
+  // (REPL). When present, runAgent REUSES this in-memory context
+  // instead of re-deriving history from the DB — the compact-once-
+  // reuse path (project_message_single_source). Mutually exclusive
+  // with resumeFromSessionId AND preassignedSessionId (those rebuild
+  // from the log). Fresh sessions and `--resume` in a new process
+  // leave it undefined and take the derive path; the DB stays the
+  // full append-only log either way.
+  sessionContext?: SessionContext;
   // Checkpoint subsystem (M3 §12). When true, the harness probes
   // `cwd` once at startup and, if the directory is a git repo,
   // takes a snapshot before every step that runs a tool with
@@ -1137,6 +1147,12 @@ export interface HarnessResult {
   usageComplete: boolean;
   // Final assistant message id, if any was produced.
   lastMessageId?: string;
+  // The live in-memory context after this run. A multi-turn caller
+  // (REPL) holds it and passes it back as config.sessionContext next
+  // turn, so the conversation is compacted once and reused instead of
+  // re-derived + re-compacted every turn. Always set on a successful
+  // run; the same object the caller passed in when it supplied one.
+  sessionContext?: SessionContext;
   // Optional human-readable detail for diagnostics (e.g., the provider
   // error message, or which tool exhausted the error budget).
   detail?: string;

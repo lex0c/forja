@@ -42,6 +42,9 @@ describe('liveRegionActive', () => {
     const base = createInitialState();
     expect(liveRegionActive({ ...base, thinking: { startedAt: 0, messageId: 'm' } })).toBe(true);
     expect(liveRegionActive({ ...base, awaitingProvider: { stepN: 1, startedAt: 0 } })).toBe(true);
+    // Compaction chip animates its spinner + ticking [elapsed] — must keep
+    // the scheduler awake or the chip freezes after a single frame.
+    expect(liveRegionActive({ ...base, compacting: { startedAt: 0 } })).toBe(true);
   });
 });
 
@@ -1505,6 +1508,26 @@ describe('session boundary handling of pendingToolEndBatch', () => {
       reason: 'done',
     });
     expect(r.permanent.map((p) => p.kind)).toEqual(['session-footer']);
+  });
+});
+
+describe('compacting indicator (compacting:start/end bracket)', () => {
+  test('compacting:start sets compacting with ts', () => {
+    const r = applyEvent(createInitialState(), { type: 'compacting:start', ts: 100 });
+    expect(r.state.compacting).toEqual({ startedAt: 100 });
+    expect(r.permanent).toEqual([]);
+  });
+
+  test('compacting:end clears the indicator', () => {
+    let s = applyEvent(createInitialState(), { type: 'compacting:start', ts: 100 }).state;
+    s = applyEvent(s, { type: 'compacting:end', ts: 150 }).state;
+    expect(s.compacting).toBeNull();
+  });
+
+  test('compacting:end is a no-op when nothing is open (defensive double-close)', () => {
+    const r = applyEvent(createInitialState(), { type: 'compacting:end', ts: 1 });
+    expect(r.state.compacting).toBeNull();
+    expect(r.permanent).toEqual([]);
   });
 });
 
