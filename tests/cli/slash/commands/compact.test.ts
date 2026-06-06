@@ -188,12 +188,33 @@ describe('/compact', () => {
     const slashCtx = makeCtx({ provider: makeProvider('GOAL: x\nDECISIONS: y'), live: ctx });
     slashCtx.runExclusive = async (fn) => {
       exclusiveCalled = true;
-      return fn();
+      return fn(new AbortController().signal);
     };
     const r = await compactCommand.exec([], slashCtx);
     expect(r.kind).toBe('ok');
     expect(exclusiveCalled).toBe(true); // compaction held the busy lock
     expect(ctx.length).toBeLessThan(before); // and ran inside it
+  });
+
+  test('hands the summary call an interrupt-composed signal, not an inert one', async () => {
+    const ctx = buildLiveCtx();
+    let captured: AbortSignal | undefined;
+    // Capture the signal the /compact body composes and hands to compact().
+    const realCompact = ctx.compact.bind(ctx);
+    ctx.compact = ((provider, opts) => {
+      captured = opts.signal;
+      return realCompact(provider, opts);
+    }) as typeof ctx.compact;
+    const interrupt = new AbortController();
+    const slashCtx = makeCtx({ provider: makeProvider('GOAL: x'), live: ctx });
+    slashCtx.runExclusive = async (fn) => fn(interrupt.signal);
+    await compactCommand.exec([], slashCtx);
+    expect(captured).toBeDefined();
+    expect(captured?.aborted).toBe(false);
+    // Operator Ctrl+C → runExclusive aborts → the composed signal fires, so a
+    // stalled summary call unwinds (unlike the old never-aborted controller).
+    interrupt.abort();
+    expect(captured?.aborted).toBe(true);
   });
 
   test('brackets the compaction with compacting:start / compacting:end events', async () => {

@@ -2,6 +2,10 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-06] Fix: bound /compact's summary call with a cancellable + timeout signal
+
+`/compact` passed a never-aborted signal to its summary call — unlike auto-compaction, which uses the run signal composed with the wall-clock. A stalled provider / hung network left `await live.compact` pending forever while `runExclusive` held the REPL busy: no timeout, no interrupt. The `/compact` body now composes `AbortSignal.timeout(maxStepStallMs)` with an interrupt signal that `runExclusive` supplies (a per-call AbortController) and `triggerInterrupt` fires on the first Ctrl+C; either abort drops `compactMessages` into its fallback so `/compact` resolves and the REPL frees. Also closes the cosmetic "esc to interrupt" quirk (the footer offered it during `/compact` but it did nothing). Test captures the signal handed to `compact()` and proves it aborts on interrupt (was inert before).
+
 ## [2026-06-06] Refactor: accountCompaction — single source for the fold decision
 
 Two of the fixes below were `/compact` reimplementing `maybeCompact`'s "fold a `CompactionResult` into session totals" by hand and dropping a side effect (the cost, then `usage_complete`). Extracted the DECISION — `accountCompaction(result, caps) → { costUsd, usageIncomplete }` in `compaction.ts`; both surfaces now consume it. Destinations still differ legitimately (loop accumulates in-memory run totals → `completeSession`; `/compact` writes the session row directly), but the decision is single-sourced, so a caller can't silently disagree on cost or usage-completeness again. Behavior-preserving. Test pins the decision across llm/fallback/skipped × usage-seen. The orphan/`ensureAlternation` bug was a separate class (reuse path, not accounting) and stays covered by its own tests; the cosmetic `cost_update` parity is left out (unconfirmed).

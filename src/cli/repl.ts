@@ -329,6 +329,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // rewriting the live context's message array in place. Set SYNCHRONOUSLY
   // (runExclusive below) before the await, same contract as playbookRunning.
   let compacting = false;
+  // Aborts the in-flight /compact summary call on operator interrupt
+  // (triggerInterrupt fires it). runExclusive populates it for the fn's
+  // duration; the /compact body composes this with its own timeout. Without
+  // it, Ctrl+C during a stalled compaction does nothing.
+  let compactAbortController: AbortController | null = null;
   // Kill switch for the in-flight `!cmd`, handed up by the executor so
   // the interrupt path (Ctrl+C / Esc) can terminate the command's
   // process group instead of waiting out the timeout. Null when no
@@ -1902,6 +1907,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       operatorBashInterrupted = true;
       return;
     }
+    // A /compact summary call aborts on the FIRST interrupt — it's an atomic
+    // operation, no soft/hard turn. compactMessages absorbs the abort into its
+    // deterministic fallback, so /compact still resolves and frees the REPL. No
+    // turn-level interrupt event (there's no turn; it'd leak softInterrupted).
+    if (compactAbortController !== null) {
+      compactAbortController.abort();
+      return;
+    }
     const level: 'soft' | 'hard' = renderer.state().softInterrupted ? 'hard' : 'soft';
     bus.emit({ type: 'interrupt', ts: now(), level });
     if (level === 'hard') {
@@ -2073,11 +2086,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // synchronously before the await so isBusy() refuses a concurrent turn
     // (or a second /compact) for the whole compaction.
     runExclusive: async (fn) => {
+      const ctrl = new AbortController();
+      compactAbortController = ctrl;
       compacting = true;
       syncBusy();
       try {
-        return await fn();
+        return await fn(ctrl.signal);
       } finally {
+        compactAbortController = null;
         compacting = false;
         syncBusy();
         // Drain anything the operator queued WHILE compaction held the busy

@@ -157,9 +157,11 @@ export interface SlashContext {
   liveContext?: () => SessionContext | null;
   // Run a mutating slash action (today /compact) under the REPL's busy flag
   // so a concurrent turn or a second invocation can't start mid-await and
-  // race the live context. The REPL holds `isBusy()` true for the whole fn.
-  // Absent in tests/headless — callers run fn directly without a lock.
-  runExclusive?: <T>(fn: () => Promise<T>) => Promise<T>;
+  // race the live context. The REPL holds `isBusy()` true for the whole fn,
+  // and passes an AbortSignal that fires on operator interrupt (Ctrl+C); the
+  // fn composes it with its own timeout so a stalled call can't wedge the
+  // REPL. Absent in tests/headless — callers run fn directly (no signal).
+  runExclusive?: <T>(fn: (signal: AbortSignal) => Promise<T>) => Promise<T>;
 }
 
 // Outcome of executing a command. The dispatcher emits any messages
