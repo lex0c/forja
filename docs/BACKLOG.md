@@ -2,6 +2,16 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-06] Sandbox: shared_tmp no subagent-child (paridade com o bootstrap)
+
+**Gap (review):** o subagent roda num subprocess que re-bootstrapa o `[sandbox]`, mas só restaurava os module globals de cache (`writable_cache_dirs` + `cache_persistence`) — nunca adquiria um session tmpdir nem passava `sandboxTmpdir` no `HarnessConfig` do filho (não há `--subagent-*tmp*` forwarding). Com `shared_tmp = true` (default), um subagent com 2 chamadas bash/grep sandboxed caía no `--tmpfs /tmp` fresh por-spawn (Linux): arquivos em `/tmp` sumiam entre tool calls.
+
+**Fix:** espelhar o bootstrap — `acquireSandboxTmpdir({ sessionId: generateUlid(), sharedTmp: ?? DEFAULT_SHARED_TMP })` + `sandboxTmpdir` no config (flui via `runAgent → loop → buildCtx → ctx.sandboxTmpdir`, consumido por grep + bg manager). Tmpdir PRÓPRIO (ULID fresco), NÃO herdado do parent: subagents podem rodar concorrentes, então isolar > compartilhar uma árvore. Cleanup no **finally** do run (não `process.once('exit')` como o bootstrap): `runSubagentChild` retorna, então o finally é determinístico e não vaza exit-listeners quando N filhos rodam num processo (ex. a suíte). Cleanup só remove a folha `<ulid>`; ordem segura: o loop mata os bg processes no finally dele (`bgManager.cleanup`) ANTES de `runAgent` retornar, então o `rm` do tmpdir nunca puxa o `/tmp` debaixo de um bg vivo.
+
+**`sandboxBootTool` (fechado junto):** o filho roda `detectSandboxAvailability()` no boot e passa `sandboxBootTool` no config → o fail-closed do grep funciona dentro do subagent também (paridade total com o parent). Sem isso, um grep que perde o sandbox mid-session degradava em silêncio em vez de virar erro de tool.
+
+**Testes:** FS gated-linux (`sessions/` criado com default-on, ausente com `shared_tmp = false`) + um seam `runAgentFn` que captura o `HarnessConfig` montado e asserta `sandboxTmpdir` + `sandboxBootTool` — determinístico onde um e2e não dá (o finally remove o tmpdir antes de um check FS pós-hoc poder vê-lo). Limitação remanescente: SIGKILL do filho deixa o tmpdir órfão (mesma do bootstrap; GC de órfãos é o nice-to-have do cache).
+
 ## [2026-06-06] Sandbox: fail-closed em mid-session-loss (erro de tool, não passthrough silencioso)
 
 **Problema:** se o tool de sandbox (bwrap/sandbox-exec) sumisse DEPOIS do boot (modo spawn), `maybeWrapSandboxArgv` degradava pra passthrough **silencioso** — o comando rodava sem sandbox e o LLM não via nada (só o operador, via o `failure_event` `sandbox.mid_session_loss`, e mesmo esse só no bg path). Lacuna de observabilidade levantada na revisão (Opção A).

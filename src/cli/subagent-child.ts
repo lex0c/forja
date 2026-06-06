@@ -1,4 +1,8 @@
-import { DEFAULT_CACHE_PERSISTENCE, loadSandboxConfig } from '../config/loaders.ts';
+import {
+  DEFAULT_CACHE_PERSISTENCE,
+  DEFAULT_SHARED_TMP,
+  loadSandboxConfig,
+} from '../config/loaders.ts';
 import { type HarnessEvent, type HarnessResult, runAgent } from '../harness/index.ts';
 import type { RunBudget } from '../harness/types.ts';
 import { resolveHookConfig, resolveHookPaths } from '../hooks/index.ts';
@@ -10,7 +14,15 @@ import {
 } from '../memory/index.ts';
 import { mergeTrustedHosts } from '../permissions/bootstrap-engine.ts';
 import { parseCapability } from '../permissions/capabilities.ts';
-import { createPermissionEngine, createSqliteSink, ensureInstallId } from '../permissions/index.ts';
+import {
+  type SandboxTmpdir,
+  acquireSandboxTmpdir,
+  createPermissionEngine,
+  createSqliteSink,
+  detectSandboxAvailability,
+  ensureInstallId,
+  generateUlid,
+} from '../permissions/index.ts';
 import { setWritableCacheDirsOverride } from '../permissions/sandbox-cache-dirs.ts';
 import { setCachePersistenceOverride } from '../permissions/sandbox-cache-env.ts';
 import { type Provider, type ProviderEffort, createDefaultRegistry } from '../providers/index.ts';
@@ -103,6 +115,11 @@ export interface SubagentChildOptions {
   // Test seam: skip provider registry lookup. Production callers
   // pass nothing — the registry resolves from sessions.model.
   providerOverride?: Provider;
+  // Test seam: intercept the harness entry to assert the assembled
+  // HarnessConfig (sandbox wiring, budget, …) or stub the run. Production
+  // omits → the real `runAgent`. Applies to BOTH the initial call and the
+  // schema-retry call so the seam observes a consistent harness.
+  runAgentFn?: typeof runAgent;
   // Test seam: override the DB path. Production uses
   // defaultDbPath() so child + parent target the same file.
   dbPath?: string;
@@ -466,6 +483,14 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
   // we unref the SIGKILL escalation in waitForChild).
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 
+  // Per-run session /tmp handle (acquired inside the try, once [sandbox]
+  // config is loaded). Declared out here so the outer finally releases it
+  // deterministically when the run ends — NOT via `process.once('exit')`
+  // like the top-level bootstrap, because runSubagentChild RETURNS (the REPL
+  // does not), so an exit handler per child would leak listeners and defer
+  // cleanup when many children run in one process (e.g. the test suite).
+  let childSandboxTmpdir: SandboxTmpdir | undefined;
+
   // Finalize the child session as error before any pre-harness
   // exit path returns 1. Without this, the row stays in
   // 'running' and pollutes `--list-sessions` until something
@@ -547,6 +572,27 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     // child reuses it (same user, same `forjaCachePersistBase()`), and the
     // runner's existence gate degrades gracefully if it's somehow absent.
     setCachePersistenceOverride(childSandboxConfig.cachePersistence ?? DEFAULT_CACHE_PERSISTENCE);
+    // PARITY (the gap this closes): the parent bootstrap acquires a per-run
+    // session /tmp and threads it into `HarnessConfig.sandboxTmpdir`; the
+    // child is a SEPARATE process and previously did NEITHER, so a subagent's
+    // sandbox-wrapped grep / bg-bash calls fell back to Linux's fresh
+    // per-spawn `--tmpfs /tmp` — files written under /tmp in one tool call
+    // vanished before the next, even with the default `shared_tmp = true`.
+    // Mirror the parent: acquire our OWN per-run tmpdir (fresh ULID, NOT the
+    // parent's — subagents may run concurrently, so isolate rather than share
+    // one tree); released in the outer finally. Honors the same `shared_tmp`
+    // config; a no-op off-Linux or when `shared_tmp = false` (undefined).
+    childSandboxTmpdir = acquireSandboxTmpdir({
+      sessionId: generateUlid(),
+      sharedTmp: childSandboxConfig.sharedTmp ?? DEFAULT_SHARED_TMP,
+      warn: (m) => errSink(`forja: ${m}\n`),
+    });
+    // Detect the sandbox tool at the child's boot so the fail-closed path
+    // (ToolContext.sandboxBootTool → grep / bg) works inside subagents too:
+    // a tool present now but gone at spawn time is a mid-session LOSS → tool
+    // error, not a silent unsandboxed run. Same probe the parent runs; the
+    // child is a separate process, so its module state starts blank.
+    const childSandboxAvail = detectSandboxAvailability();
 
     const audit = getSubagentRun(db, opts.sessionId);
     if (audit === null) {
@@ -1101,6 +1147,16 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       ...(systemPromptHash !== undefined ? { systemPromptHash } : {}),
       userPrompt,
       preassignedSessionId: opts.sessionId,
+      // Per-run session /tmp acquired above → the harness threads it into
+      // buildCtx (`ctx.sandboxTmpdir`) for grep + the bg manager, the
+      // subagent's sandbox-wrapping spawn paths. Without it they degrade to
+      // ephemeral per-spawn /tmp. Undefined off-Linux / `shared_tmp = false`.
+      ...(childSandboxTmpdir?.tmpdir !== undefined
+        ? { sandboxTmpdir: childSandboxTmpdir.tmpdir }
+        : {}),
+      // Boot sandbox tool → drives the fail-closed posture for the
+      // subagent's grep / bg spawns (parity with the parent bootstrap).
+      ...(childSandboxAvail.tool !== null ? { sandboxBootTool: childSandboxAvail.tool } : {}),
       // Carry through budget caps from the audit row. Sampling's
       // `max_tokens` (`PLAYBOOKS.md` §1.1) overrides the
       // harness's `maxOutputTokensPerCall` when the playbook
@@ -1306,7 +1362,8 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       telemetry: childTelemetry,
     };
 
-    let result = await runAgent(config);
+    const run = opts.runAgentFn ?? runAgent;
+    let result = await run(config);
     let output = extractFinalOutput(db, result.lastMessageId);
     // Cumulative bookkeeping across the (possibly-retried) run.
     // `HarnessResult` reports cost/steps/duration PER-RUN — the
@@ -1364,7 +1421,7 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
             userPrompt: diagnostic,
             budget: retryBudgetVerdict.budget,
           };
-          result = await runAgent(retryConfig);
+          result = await run(retryConfig);
           output = extractFinalOutput(db, result.lastMessageId);
           totalCostUsd += result.costUsd;
           totalSteps += result.steps;
@@ -1469,6 +1526,9 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     // throw on the next tick — swallowed inside the timer body
     // anyway, but the explicit ordering is cleaner.
     if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer);
+    // Remove this run's per-session /tmp tree. No-op when shared_tmp was off
+    // / off-Linux (tmpdir undefined → cleanup is a noop closure).
+    childSandboxTmpdir?.cleanup();
     // Drain the permission bridge BEFORE closing the channel.
     // dispose() resolves any in-flight ask as denied so a
     // confirmPermission caller blocked at child-shutdown time
