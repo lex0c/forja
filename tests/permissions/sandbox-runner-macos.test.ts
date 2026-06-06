@@ -919,7 +919,7 @@ describe('macOS — opt-in persistent cache (cache_persistence)', () => {
       env: { PATH: '/usr/bin' },
       realpath: (p) => p,
     });
-    expect(argv).toContain(`GOCACHE=${PERSIST_BASE}/go/build`);
+    expect(argv).toContain(`XDG_CACHE_HOME=${PERSIST_BASE}/xdg`);
     expect(argv).toContain(`npm_config_cache=${PERSIST_BASE}/npm`);
     expect(argv).toContain(`MAVEN_ARGS=-Dmaven.repo.local=${PERSIST_BASE}/maven`);
   });
@@ -933,6 +933,6 @@ describe('macOS — opt-in persistent cache (cache_persistence)', () => {
       env: { PATH: '/usr/bin' },
       realpath: (p) => p,
     });
-    expect(argv.some((a) => a.startsWith('GOCACHE='))).toBe(false);
+    expect(argv.some((a) => a.startsWith('XDG_CACHE_HOME='))).toBe(false);
   });
 });

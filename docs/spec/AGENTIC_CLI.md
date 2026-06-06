@@ -1442,7 +1442,7 @@ Policy YAML é primeira linha. Segunda linha é sandbox **real**:
 
 Sandbox é opcional no v1 (flag `--sandbox`), default no v2.
 
-**Persistência (default ON).** Por decisão do operador, dois carve-outs vêm LIGADOS por default (opt-out via `[sandbox] … = false`), trocando efemeridade por reuso sem tocar o host: `cache_persistence` (cache de deps num diretório dedicado `~/.cache/forja/cache`, com redirect das env vars das toolchains pra lá) e `shared_tmp` (`/tmp` persistente por sessão). Detalhe + invariante de ordem em `SECURITY_GUIDELINE.md §8.1`.
+**Persistência (default ON).** Por decisão do operador, dois carve-outs vêm LIGADOS por default (opt-out via `[sandbox] … = false`), trocando efemeridade por reuso sem tocar o host: `cache_persistence` (cache de deps num diretório dedicado `~/.cache/forja/cache`, redirecionado via `XDG_CACHE_HOME` catch-all + env vars dos toolchains não-XDG; recuperável com `agent cache clear`) e `shared_tmp` (`/tmp` persistente por sessão). Detalhe + invariante de ordem em `SECURITY_GUIDELINE.md §8.1`.
 
 ### 9.3 Output sanitization
 

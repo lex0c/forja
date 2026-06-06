@@ -56,7 +56,8 @@ const main = async (): Promise<number> => {
     args.doctor !== undefined ||
     args.sandbox !== undefined ||
     args.purge !== undefined ||
-    args.gc !== undefined;
+    args.gc !== undefined ||
+    args.cache !== undefined;
   if (!inSetupFlow) {
     const { isFirstBoot } = await import('../permissions/install_id.ts');
     if (isFirstBoot()) {
@@ -122,6 +123,15 @@ const main = async (): Promise<number> => {
       out: (s) => process.stdout.write(s),
       err: (s) => process.stderr.write(s),
     });
+  }
+
+  // `agent cache clear [--force] [--json]` — reclaim the persistent sandbox
+  // cache (~/.cache/forja). Lifecycle mode: no prompt/provider/REPL. Pure FS
+  // (size walk + rm); lazy import keeps the help/version branches immune to
+  // its deps.
+  if (args.cache !== undefined) {
+    const { runCacheClear } = await import('./cache.ts');
+    return runCacheClear({ force: args.cache.force, json: args.cache.json });
   }
 
   // Subagent-child mode. The parent process
@@ -226,7 +236,10 @@ const main = async (): Promise<number> => {
     args.purge !== undefined ||
     // `agent gc` (§2.1.3) — retention sweep. Lifecycle mode; no
     // prompt, no provider, no REPL.
-    args.gc !== undefined;
+    args.gc !== undefined ||
+    // `agent cache clear` — reclaim the persistent sandbox cache.
+    // Lifecycle mode; no prompt/provider/REPL.
+    args.cache !== undefined;
   if (args.prompt.length === 0 && !promptOptional) {
     // JSON mode + REPL is meaningless (NDJSON consumers don't have
     // a TTY to type into) — refuse rather than open a TTY-only loop

@@ -305,6 +305,12 @@ export interface ParsedArgs {
   // Bare invocation is dry-run (prints counts); --force executes.
   // --table=X restricts to a single table; repeatable.
   gc?: { force: boolean; json: boolean; tables: string[] };
+  // `agent cache clear [--force] [--json]` — reclaim the opt-in persistent
+  // sandbox cache (`~/.cache/forja`). The per-language redirect only exists
+  // INSIDE the sandbox, so the operator's native `npm cache clean` etc. (run
+  // on the host) never reach this tree. Bare invocation is dry-run (reports
+  // size); --force removes. Mirrors the gc/purge two-phase shape.
+  cache?: { verb: 'clear'; force: boolean; json: boolean };
   // `agent permission <verb> [positionals]` — operator surface for
   // the v2 permission engine (PERMISSION_ENGINE.md). Verbs:
   //   - 'verify'       — walk the audit hash chain for the current
@@ -1118,6 +1124,70 @@ const parseGcSubcommand = (argv: readonly string[]): ParseResult | null => {
   };
 };
 
+// `agent cache clear [--force] [--json]` — reclaim the persistent sandbox
+// cache (~/.cache/forja). Two-phase like gc/purge: bare = dry-run (report
+// size), --force removes. Only verb is `clear`.
+const parseCacheSubcommand = (argv: readonly string[]): ParseResult | null => {
+  if (argv.length === 0 || argv[0] !== 'cache') return null;
+  const verb = argv[1];
+  if (verb !== 'clear') {
+    return {
+      ok: false,
+      message:
+        verb === undefined
+          ? 'usage: agent cache clear [--force] [--json]'
+          : `agent cache: unknown verb '${verb}' (expected: clear)`,
+    };
+  }
+  let force = false;
+  let json = false;
+  for (let i = 2; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === undefined) continue;
+    if (token === '--help' || token === '-h') {
+      return {
+        ok: true,
+        args: {
+          prompt: '',
+          json: false,
+          version: false,
+          help: true,
+          listSessions: false,
+          includeSubagents: false,
+          explainPermissions: false,
+          yes: false,
+        },
+      };
+    }
+    if (token === '--force') {
+      force = true;
+      continue;
+    }
+    if (token === '--json') {
+      json = true;
+      continue;
+    }
+    return {
+      ok: false,
+      message: `agent cache clear: unknown flag '${token}' (accepted: --force, --json, --help)`,
+    };
+  }
+  return {
+    ok: true,
+    args: {
+      prompt: '',
+      json,
+      version: false,
+      help: false,
+      listSessions: false,
+      includeSubagents: false,
+      explainPermissions: false,
+      yes: false,
+      cache: { verb: 'clear', force, json },
+    },
+  };
+};
+
 const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null => {
   if (argv.length === 0 || argv[0] !== 'permission') return null;
   if (argv.length === 1) {
@@ -1506,6 +1576,8 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
   if (purgeParsed !== null) return purgeParsed;
   const gcParsed = parseGcSubcommand(argv);
   if (gcParsed !== null) return gcParsed;
+  const cacheParsed = parseCacheSubcommand(argv);
+  if (cacheParsed !== null) return cacheParsed;
   const permissionParsed = parsePermissionSubcommand(argv);
   if (permissionParsed !== null) return permissionParsed;
   const args: ParsedArgs = {
@@ -2145,4 +2217,5 @@ export const usage = (): string =>
     '  agent doctor             Health check: platform, sandbox tools, config + data dirs, git',
     '  agent sandbox setup      Print the recommended sandbox install command for this platform',
     '  agent welcome            First-boot walkthrough: composes doctor + sandbox setup + next steps',
+    '  agent cache clear        Reclaim the persistent sandbox cache (~/.cache/forja); --force to remove',
   ].join('\n');

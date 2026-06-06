@@ -2032,7 +2032,7 @@ describe('buildBwrapArgv — persistent cache (cache_persistence; runner gate)',
       pathExists: () => true,
     });
     expect(bindPairIndex(argv, PERSIST_BASE, PERSIST_BASE)).toBe(-1);
-    expect(argv.includes('GOCACHE')).toBe(false);
+    expect(argv.includes('XDG_CACHE_HOME')).toBe(false);
     expect(argv.includes('MAVEN_ARGS')).toBe(false);
   });
 
@@ -2047,7 +2047,7 @@ describe('buildBwrapArgv — persistent cache (cache_persistence; runner gate)',
       realpath: (p) => p,
       pathExists: () => true,
     });
-    expect(hasSetenvFlag(argv, 'GOCACHE', `${PERSIST_BASE}/go/build`)).toBe(true);
+    expect(hasSetenvFlag(argv, 'XDG_CACHE_HOME', `${PERSIST_BASE}/xdg`)).toBe(true);
     expect(hasSetenvFlag(argv, 'GOMODCACHE', `${PERSIST_BASE}/go/mod`)).toBe(true);
     expect(hasSetenvFlag(argv, 'npm_config_cache', `${PERSIST_BASE}/npm`)).toBe(true);
     expect(hasSetenvFlag(argv, 'MAVEN_ARGS', `-Dmaven.repo.local=${PERSIST_BASE}/maven`)).toBe(
@@ -2069,7 +2069,7 @@ describe('buildBwrapArgv — persistent cache (cache_persistence; runner gate)',
         pathExists: () => true,
       });
       expect(bindPairIndex(argv, PERSIST_BASE, PERSIST_BASE)).toBe(-1);
-      expect(argv.includes('GOCACHE')).toBe(false);
+      expect(argv.includes('XDG_CACHE_HOME')).toBe(false);
     }
   });
 
@@ -2084,7 +2084,7 @@ describe('buildBwrapArgv — persistent cache (cache_persistence; runner gate)',
       realpath: (p) => p,
       pathExists: (p) => p !== PERSIST_BASE, // everything exists except the base
     });
-    expect(hasSetenvFlag(argv, 'GOCACHE', `${PERSIST_BASE}/go/build`)).toBe(true);
+    expect(hasSetenvFlag(argv, 'XDG_CACHE_HOME', `${PERSIST_BASE}/xdg`)).toBe(true);
     expect(bindPairIndex(argv, PERSIST_BASE, PERSIST_BASE)).toBe(-1);
   });
 
@@ -2123,7 +2123,7 @@ describe('buildBwrapArgv — persistent cache (cache_persistence; runner gate)',
       passthroughEnv: { FORJA_BROKER_WORKER: '1' },
     });
     expect(hasSetenvFlag(argv, 'FORJA_BROKER_WORKER', '1')).toBe(true);
-    expect(hasSetenvFlag(argv, 'GOCACHE', `${PERSIST_BASE}/go/build`)).toBe(true);
+    expect(hasSetenvFlag(argv, 'XDG_CACHE_HOME', `${PERSIST_BASE}/xdg`)).toBe(true);
   });
 });
 
