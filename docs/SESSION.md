@@ -139,8 +139,9 @@ back to an `assistant` boundary so tool pairs stay intact, via the
   as a `[compacted_history]` block (pins re-injected via `formatPinnedBlock`).
   An empty / markers-only summary is **rejected** → fallback.
 - **Fallback path** — deterministic elision: `tool_result` bodies and long text
-  become pointers (`[… elided — original in audit log]`). Never throws, so the
-  run always survives a flaky summary call.
+  become pointers (`[… elided — recover via retrieve_context (session view)]`):
+  the originals persist in the audit log and the pointer names the tool that
+  reads them back. Never throws, so the run always survives a flaky summary call.
 - **skipped** — history too short / no foldable middle: returns the same array.
 
 The `compaction_finished.strategy` is exactly which path ran: `relevance`

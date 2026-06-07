@@ -55,6 +55,10 @@ describe('relevanceElideMiddle', () => {
     expect(out.keptCount).toBe(1);
     expect(trAt(out.middle[0])).toBe(RELEVANT); // kept verbatim
     expect(isElided(trAt(out.middle[1]))).toBe(true);
+    // The pointer names the recovery path (retrieve_context), so the model
+    // reads the body back instead of assuming it is gone — the exact confusion
+    // a real session hit when the pointer said only "original in audit log".
+    expect(trAt(out.middle[1])).toContain('retrieve_context');
   });
 
   test('never elides an error result, even when irrelevant and over budget', () => {

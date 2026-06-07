@@ -179,7 +179,7 @@ export const relevanceElideMiddle = (
       touched = true;
       return {
         ...b,
-        content: `[tool_result elided: ${bytes} bytes — low goal-relevance, original in audit log]`,
+        content: `[tool_result elided: ${bytes} bytes — low goal-relevance; recover via retrieve_context (session view)]`,
       };
     });
     return touched ? { ...m, content } : m;

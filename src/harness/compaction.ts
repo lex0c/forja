@@ -183,7 +183,7 @@ const truncateLongText = (s: string): string => {
   const head = s.slice(0, TRUNCATE_HEAD);
   const tail = s.slice(-TRUNCATE_TAIL);
   const elided = s.length - TRUNCATE_HEAD - TRUNCATE_TAIL;
-  return `${head}\n[... ${elided} chars elided — compaction fallback, original in audit log ...]\n${tail}`;
+  return `${head}\n[... ${elided} chars elided — compaction fallback; recover via retrieve_context (session view) ...]\n${tail}`;
 };
 
 const fallbackElide = (block: ProviderContentBlock): ProviderContentBlock => {
@@ -195,7 +195,7 @@ const fallbackElide = (block: ProviderContentBlock): ProviderContentBlock => {
     // model knows whether the call succeeded.
     return {
       ...block,
-      content: `[tool_result elided: ${sizeBytes} bytes — compaction fallback, original in audit log]`,
+      content: `[tool_result elided: ${sizeBytes} bytes — compaction fallback; recover via retrieve_context (session view)]`,
     };
   }
   if (block.type === 'text') {
