@@ -58,6 +58,9 @@ describe('renderInitConfigTemplate', () => {
     expect(parsed.budget.max_step_stall_ms).toBe(DEFAULT_BUDGET.maxStepStallMs);
     expect(parsed.budget.compaction_threshold).toBe(DEFAULT_BUDGET.compactionThreshold);
     expect(parsed.budget.compaction_preserve_tail).toBe(DEFAULT_BUDGET.compactionPreserveTail);
+    // The relevance pre-pass is default-ON; the scaffold surfaces the opt-out
+    // knob so operators can find `compaction_relevance = false`.
+    expect(parsed.budget.compaction_relevance).toBe(DEFAULT_BUDGET.compactionRelevance);
   });
 
   test('[memory] values match DEFAULT_MEMORY_CONFIG (all three governance detectors)', () => {

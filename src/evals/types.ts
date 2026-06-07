@@ -1,11 +1,9 @@
-import type { ExitReason, HarnessResult } from '../harness/index.ts';
+import type { CompactionStrategy, ExitReason, HarnessResult } from '../harness/index.ts';
 import type { ApprovalPosture } from '../permissions/index.ts';
 
 // One declarative expectation evaluated against a finished run.
 // Each shape carries exactly the data needed for its assertion;
 // the executor switches on the `kind` discriminant.
-export type CompactionStrategy = 'llm' | 'fallback' | 'skipped';
-
 export type EvalExpectation =
   | { kind: 'tool_called'; tool: string }
   | { kind: 'tool_not_called'; tool: string }
@@ -66,6 +64,10 @@ export interface EvalBudget {
   // literally. Lower values let compaction fire more
   // aggressively in narrow tests.
   compactionPreserveTail?: number;
+  // Enable the relevance compaction pre-pass for this case (default ON,
+  // mirroring DEFAULT_BUDGET). Lets the eval measure relevance ON vs OFF on
+  // the same scenario by pinning `false`.
+  compactionRelevance?: boolean;
 }
 
 export interface EvalCase {

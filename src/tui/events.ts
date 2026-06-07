@@ -664,6 +664,10 @@ export type CompactingStartEvent = BaseEvent & {
 };
 export type CompactingEndEvent = BaseEvent & {
   type: 'compacting:end';
+  // Whether the compaction actually changed the live context. The reducer marks
+  // the context stale (suppressing the footer %) only when true — a no-op
+  // 'skipped' / "nothing to compact" leaves the displayed % accurate.
+  contextChanged?: boolean;
 };
 export type CheckpointCreateEvent = BaseEvent & {
   type: 'checkpoint:create';

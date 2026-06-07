@@ -976,12 +976,18 @@ Compaction só roda quando #1 não foi suficiente. As duas camadas são independ
 
 ### 12.1 Quando elidir
 
-Heurísticas em compaction:
+**Estratégia default — relevance-driven** (implementada; default-ON via `budget.compactionRelevance`, opt-out por budget). Antes do summary LLM, uma pré-passe barata (sem provider call) pontua cada `tool_result` body do meio por **relevância ao goal** (BM25) + **recência por posição** (clock-free → a partição é função pura, replay-safe sem gravar decisão), mantém os de maior score verbatim dentro de um byte-budget derivado do trigger (`relevanceVerbatimBudgetBytes`), e troca o corpo do resto por um ponteiro `[tool_result elided: …]`. Os ponteados continuam no audit log e recuperáveis via `retrieve_context` (view `session`) — elisão **reversível**, não destrutiva.
+
+A decisão é **token-driven**, no loop: pré-passe → re-estima tokens → só cai no summary LLM se ainda acima do `triggerAt` (sem spin: um re-trigger acha os bodies já-ponteados inelegíveis). Invariantes herdados de `OUTPUT_POLICY §0`: **erro nunca elidido** (§0.4), bodies sub-floor pulados, e estrutura intacta — toda mensagem + par `tool_use`↔`tool_result` fica no lugar, só o `content` encolhe (sem quebrar alternância/pairing). `/compact` roda a mesma pré-passe.
+
+Heurísticas determinísticas complementares (a relevância cobre ou refina; ex.: exploração não-referenciada ⇒ baixa relevância):
 
 - **Tool result já consolidado em `decisions[]`** → elidir o tool result, manter decisão
 - **Tool result de exploração** (read_file de arquivo não-tocado) → elidir após confirmação que não é referenced
 - **Erros recuperados** (failure_event marcado `recovered: true`) → elidir, manter audit em traces
 - **Memory bodies já lidas** → manter pointer apenas
+
+**Validação (eval A/B, haiku — `evals/regression/48` vs `23`):** sucesso da tarefa preservado em **7/7 runs** (braço relevance e braço LLM-puro sob default-ON). Custo: braço relevance **estável ~$0.039**; braço LLM-puro **$0.038–0.055** (variância maior — o summary LLM custa variável). ⚠️ Os dois cases diferem no threshold (0.02 vs 0.01), então é **sugestivo, não A/B controlado** — quantificar o ganho exige mesmo-threshold flag-on vs flag-off (follow-up). O default-ON se justifica pela **segurança medida** (tarefa sempre preservada) + ganhos qualitativos robustos (reversibilidade, pular o summary quando a relevância basta, custo de pior-caso menor), **não** por um % fixo.
 
 ### 12.2 Audit trail de elision
 
@@ -993,6 +999,8 @@ sessions.elided_tool_results_count INTEGER
 ```
 
 `/recap` mostra: "Compaction elided 12 tool results; full traces available via /forensics".
+
+A pré-passe relevance-driven (§12.1) emite no evento `compaction_finished` o campo `relevance: { elidedCount, keptCount, freedBytes, elidedIds }` — os `tool_use_id`s ponteados ficam endereçáveis ("por que isto saiu do contexto?"), satisfazendo ranking-auditável (princípio 7) sem black box; o raw segue no audit/`retrieve_context`.
 
 ### 12.3 Anti-patterns
 

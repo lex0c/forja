@@ -62,7 +62,14 @@ import type { ToolContext } from '../tools/index.ts';
 import type { SpawnSubagentArgs, SpawnSubagentResult } from '../tools/types.ts';
 import { StepStallError, abortableIterable, stallWatchdog } from './abortable.ts';
 import { CollectStepError, type CollectedToolUse, collectStep } from './collect.ts';
-import { accountCompaction } from './compaction.ts';
+import type { RelevanceAudit } from './compaction-relevance.ts';
+import {
+  accountCompaction,
+  compactionTriggerTokens,
+  hashContext,
+  recordCompactionEvent,
+  relevanceVerbatimBudgetBytes,
+} from './compaction.ts';
 import { resolveProviderEffort } from './effort.ts';
 import { invokeTool } from './invoke-tool.ts';
 import { MAX_RESUME_MESSAGES } from './resume.ts';
@@ -2290,7 +2297,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           ...(tools.length > 0 ? { tools } : {}),
         });
         const contextWindow = config.provider.capabilities.context_window;
-        const triggerAt = budget.compactionThreshold * contextWindow;
+        const triggerAt = compactionTriggerTokens(budget.compactionThreshold, contextWindow);
         // Need goal + something-to-fold + an assistant boundary for the tail;
         // shorter histories make compactMessages skip (and emit noisy events).
         if (!(promptTokens > triggerAt && ctx.length >= budget.compactionPreserveTail + 3)) {
@@ -2328,6 +2335,108 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           contextWindow,
         });
         const compactStart = Date.now();
+        // Audit/replay trail (compaction_events, AUDIT / CONTEXT_TUNING §12).
+        // beforeHash is the pre-compaction context; afterHash is computed at
+        // persist time (after the array was rewritten). estimateNow re-reads
+        // the live array. Persist is best-effort — never aborts the run.
+        // ctxRef pins the (guard-narrowed) context so the closures below don't
+        // re-widen `ctx` to `| undefined`.
+        const ctxRef = ctx;
+        const estimateNow = (): number =>
+          estimatePromptTokens([...ctxRef.getMessages()], {
+            ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
+            ...(tools.length > 0 ? { tools } : {}),
+          });
+        const beforeHash = hashContext(ctxRef.getMessages());
+        // Thin adapter over the shared recorder: supplies the loop's beforeHash
+        // + live array + trigger tokens. The skip-skipped / hashing /
+        // best-effort-with-stderr-log all live in recordCompactionEvent.
+        const persistCompaction = (e: {
+          strategy: string;
+          foldedCount: number;
+          tokensAfter?: number;
+          freedBytes?: number;
+          elidedIds?: readonly string[];
+          summary?: string;
+          reason?: string;
+        }): void =>
+          recordCompactionEvent(config.db, {
+            sessionId,
+            beforeHash,
+            messagesAfter: ctxRef.getMessages(),
+            tokensBefore: promptTokens,
+            recordedAt: Date.now(),
+            ...e,
+          });
+
+        // Relevance pre-pass (opt-in): cheaply pointer-elide low-goal-
+        // relevance tool_result bodies (NO provider call). If that alone
+        // drops the prompt back under the trigger, skip the billed LLM
+        // summary entirely. Token-driven — the gate is the real threshold,
+        // not a byte heuristic. No spin: a re-trigger finds the now-pointered
+        // bodies ineligible and falls through to the LLM.
+        //
+        // Gated on memoryRegistry: an elided body is recoverable ONLY via
+        // retrieve_context (session view), which the harness wires only when
+        // memoryRegistry is present (effectiveMemoryRegistry below). Without it
+        // (headless / SDK runs) the pointer's "recover via retrieve_context"
+        // promise is empty — so skip the pre-pass and let the LLM fold keep a
+        // summary in context instead of stranding the body unreachable.
+        let relevanceAudit: RelevanceAudit | undefined;
+        if (budget.compactionRelevance === true && config.memoryRegistry !== undefined) {
+          // Verbatim budget derived from the trigger (shared helper, not a
+          // magic constant) — see relevanceVerbatimBudgetBytes.
+          const elide = ctx.relevanceElide({
+            verbatimBudgetBytes: relevanceVerbatimBudgetBytes(triggerAt),
+            preserveTail: budget.compactionPreserveTail,
+          });
+          if (elide !== null && elide.elidedCount > 0) {
+            relevanceAudit = {
+              elidedCount: elide.elidedCount,
+              keptCount: elide.keptCount,
+              freedBytes: elide.freedBytes,
+              elidedIds: elide.elidedIds,
+            };
+            const tokensAfterElide = estimateNow();
+            // Short-circuit the billed LLM summary ONLY when relevance alone got
+            // us under the threshold AND no pins are active. Active pins are
+            // re-injected into the goal exclusively by ctx.compact's pinnedBlock
+            // path; taking this relevance-only return with pins active would
+            // bypass it, so a pin whose carrier (e.g. its pin_context
+            // tool_result) was just elided here would vanish from the next
+            // request — violating the "survives compaction" contract
+            // (CONTEXT_TUNING §12.4). With pins active, fall through to the LLM
+            // fold below; it runs on the already-gated history, so the pre-pass
+            // still pays off, and pinnedBlock re-injection is honored.
+            if (tokensAfterElide <= triggerAt && pinnedBlock === undefined) {
+              // Relevance alone got us under the threshold, no pins — done, no LLM.
+              const relevanceReason = `relevance-elide: ${elide.elidedCount} tool_results pointered, ${elide.freedBytes}B freed`;
+              persistCompaction({
+                strategy: 'relevance',
+                foldedCount: elide.elidedCount,
+                tokensAfter: tokensAfterElide,
+                freedBytes: elide.freedBytes,
+                elidedIds: elide.elidedIds,
+                reason: relevanceReason,
+              });
+              safeEmit(config.onEvent, {
+                type: 'compaction_finished',
+                strategy: 'relevance',
+                foldedCount: elide.elidedCount,
+                durationMs: Date.now() - compactStart,
+                usage: emptyUsage(),
+                costUsd: 0,
+                reason: relevanceReason,
+                relevance: relevanceAudit,
+              });
+              return costCapDetailIfExceeded();
+            }
+          }
+        }
+
+        // Still over the threshold (relevance disabled, freed nothing, or
+        // freed too little): run the billed LLM summary on the — possibly
+        // already gated — history.
         const compaction = await ctx.compact(config.provider, {
           preserveTail: budget.compactionPreserveTail,
           signal,
@@ -2340,6 +2449,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         if (acct.usageIncomplete) {
           usageComplete = false;
         }
+        persistCompaction({
+          strategy: compaction.strategy,
+          foldedCount: compaction.foldedCount,
+          tokensAfter: estimateNow(),
+          ...(relevanceAudit !== undefined
+            ? { freedBytes: relevanceAudit.freedBytes, elidedIds: relevanceAudit.elidedIds }
+            : {}),
+          ...(compaction.summary !== undefined ? { summary: compaction.summary } : {}),
+          ...(compaction.reason !== undefined ? { reason: compaction.reason } : {}),
+        });
         const finishedEvent: HarnessEvent = {
           type: 'compaction_finished',
           strategy: compaction.strategy,
@@ -2348,6 +2467,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           usage: compaction.usage,
           costUsd: acct.costUsd,
           ...(compaction.reason !== undefined ? { reason: compaction.reason } : {}),
+          ...(relevanceAudit !== undefined ? { relevance: relevanceAudit } : {}),
         };
         safeEmit(config.onEvent, finishedEvent);
         return costCapDetailIfExceeded();

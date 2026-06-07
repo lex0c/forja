@@ -486,7 +486,7 @@ Body.`,
     db.close();
   });
 
-  test('layered system prompt: identity → env → discipline → response → constraints → parallel → memory', async () => {
+  test('layered system prompt: identity → env → response → constraints → parallel → memory', async () => {
     // Layered prompt ordering (bootstrap.ts comment). The
     // outermost layer (which lands FIRST in the rendered string)
     // states the model's role; each inner layer narrows toward
@@ -494,12 +494,11 @@ Body.`,
     // sees:
     //   1. identity / role marker — what Forja is (CONTEXT_TUNING §1.2).
     //   2. # Environment — where am I, what date, git context.
-    //   3. # Task discipline — behavioral norms.
-    //   4. # Response surface — render-target rules.
-    //   5. # Constraints — global negative constraints (§1.6).
-    //   6. # Parallelism — concurrency mechanics.
-    //   7. (caller / playbook hint wrap when applicable)
-    //   8. # Memory — index of cross-session memories.
+    //   3. # Response surface — render-target rules.
+    //   4. # Constraints — global negative constraints (§1.6).
+    //   5. # Parallelism — concurrency mechanics.
+    //   6. (caller / playbook hint wrap when applicable)
+    //   7. # Memory — index of cross-session memories.
     const localDir = join(workdir, '.agent', 'memory', 'local');
     mkdirSync(localDir, { recursive: true });
     writeFileSync(join(localDir, 'MEMORY.md'), '- [Role](role.md) — TS dev\n');
@@ -515,22 +514,20 @@ Body.`,
     expect(config.systemPrompt?.startsWith('You are the Hephaestus agent')).toBe(true);
     const identityIdx = config.systemPrompt?.indexOf('You are the Hephaestus agent') ?? -1;
     const envIdx = config.systemPrompt?.indexOf('# Environment') ?? -1;
-    const disciplineIdx = config.systemPrompt?.indexOf('# Task discipline') ?? -1;
     const responseIdx = config.systemPrompt?.indexOf('# Response surface') ?? -1;
     const constraintsIdx = config.systemPrompt?.indexOf('# Constraints') ?? -1;
     const parallelIdx = config.systemPrompt?.indexOf('# Parallelism') ?? -1;
     const memoryIdx = config.systemPrompt?.indexOf('# Memory') ?? -1;
     expect(identityIdx).toBe(0);
     expect(envIdx).toBeGreaterThan(identityIdx);
-    expect(disciplineIdx).toBeGreaterThan(envIdx);
-    expect(responseIdx).toBeGreaterThan(disciplineIdx);
+    expect(responseIdx).toBeGreaterThan(envIdx);
     expect(constraintsIdx).toBeGreaterThan(responseIdx);
     expect(parallelIdx).toBeGreaterThan(constraintsIdx);
     expect(memoryIdx).toBeGreaterThan(parallelIdx);
     db.close();
   });
 
-  test('full layered system prompt: identity → env → discipline → response → constraints → parallel → tool-ergonomics → playbook → caller → project-pointer → memory → skills', async () => {
+  test('full layered system prompt: identity → env → response → constraints → parallel → tool-ergonomics → playbook → caller → project-pointer → memory → skills', async () => {
     // Extends the partial chain test above to assert ALL 13 final
     // layers in their canonical top-down position. Without this,
     // a refactor that drops or reorders tool-ergonomics, playbook
@@ -591,7 +588,6 @@ When the goal is to orient in a new repo.
     const idx = {
       identity: prompt.indexOf('You are the Hephaestus agent'),
       environment: prompt.indexOf('# Environment'),
-      discipline: prompt.indexOf('# Task discipline'),
       response: prompt.indexOf('# Response surface'),
       constraints: prompt.indexOf('# Constraints'),
       parallel: prompt.indexOf('# Parallelism'),
@@ -611,8 +607,7 @@ When the goal is to orient in a new repo.
     // Strict top-down order — each layer appears AFTER the previous.
     expect(idx.identity).toBe(0);
     expect(idx.environment).toBeGreaterThan(idx.identity);
-    expect(idx.discipline).toBeGreaterThan(idx.environment);
-    expect(idx.response).toBeGreaterThan(idx.discipline);
+    expect(idx.response).toBeGreaterThan(idx.environment);
     expect(idx.constraints).toBeGreaterThan(idx.response);
     expect(idx.parallel).toBeGreaterThan(idx.constraints);
     expect(idx.toolErgo).toBeGreaterThan(idx.parallel);
@@ -739,12 +734,12 @@ When the goal is to orient in a new repo.
     db.close();
   });
 
-  test('caller systemPrompt is layered after identity / environment / discipline / response-format / constraints / parallelism', async () => {
+  test('caller systemPrompt is layered after identity / environment / response-format / constraints / parallelism', async () => {
     // Caller prompt sits INNERMOST in the layered system prompt.
-    // The outer wrappers (identity, environment, task discipline,
-    // response-format, constraints, parallelism) all land before
-    // it; the caller's framing comes last so the operator's
-    // specific instructions read against the established context.
+    // The outer wrappers (identity, environment, response-format,
+    // constraints, parallelism) all land before it; the caller's
+    // framing comes last so the operator's specific instructions
+    // read against the established context.
     const { config, db } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
@@ -755,22 +750,19 @@ When the goal is to orient in a new repo.
       systemPrompt: 'You are a senior engineer.',
     });
     expect(config.systemPrompt?.startsWith('You are the Hephaestus agent')).toBe(true);
-    expect(config.systemPrompt).toContain('# Task discipline');
     expect(config.systemPrompt).toContain('# Response surface');
     expect(config.systemPrompt).toContain('# Constraints');
     expect(config.systemPrompt).toContain('# Parallelism');
     expect(config.systemPrompt).toContain('You are a senior engineer.');
     const identityIdx = config.systemPrompt?.indexOf('You are the Hephaestus agent') ?? -1;
     const envIdx = config.systemPrompt?.indexOf('# Environment') ?? -1;
-    const disciplineIdx = config.systemPrompt?.indexOf('# Task discipline') ?? -1;
     const responseIdx = config.systemPrompt?.indexOf('# Response surface') ?? -1;
     const constraintsIdx = config.systemPrompt?.indexOf('# Constraints') ?? -1;
     const parallelIdx = config.systemPrompt?.indexOf('# Parallelism') ?? -1;
     const callerIdx = config.systemPrompt?.indexOf('You are a senior engineer.') ?? -1;
     expect(identityIdx).toBe(0);
     expect(envIdx).toBeGreaterThan(identityIdx);
-    expect(disciplineIdx).toBeGreaterThan(envIdx);
-    expect(responseIdx).toBeGreaterThan(disciplineIdx);
+    expect(responseIdx).toBeGreaterThan(envIdx);
     expect(constraintsIdx).toBeGreaterThan(responseIdx);
     expect(parallelIdx).toBeGreaterThan(constraintsIdx);
     expect(callerIdx).toBeGreaterThan(parallelIdx);

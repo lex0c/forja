@@ -267,3 +267,60 @@ describe('SessionContext: snapshot / restore', () => {
     expect(ctx.getMessages()[0]).toEqual({ role: 'user', content: 'goal' });
   });
 });
+
+describe('SessionContext: relevanceElide', () => {
+  const toolUse = (id: string): ProviderContentBlock[] => [
+    { type: 'tool_use', id, name: 'read_file', input: {} },
+  ];
+  const toolResult = (id: string, content: string): ProviderContentBlock[] => [
+    { type: 'tool_result', tool_use_id: id, name: 'read_file', content },
+  ];
+  const big = (s: string): string => `${s} `.repeat(20); // ~740B → over the min-elide floor
+
+  // [goal, (assistant tool_use, user tool_result) × turns] with big,
+  // goal-irrelevant bodies so the budget — not relevance — drives elision.
+  const seed = (turns: number): SessionContext => {
+    const ctx = SessionContext.createFresh(db, sessionId);
+    ctx.appendUser('refactor the auth token validation', null);
+    for (let i = 0; i < turns; i++) {
+      ctx.appendAssistant(toolUse(`t${i}`), noUsage, null);
+      ctx.appendToolResults(toolResult(`t${i}`, big('lorem ipsum filler content unrelated')), null);
+    }
+    return ctx;
+  };
+  const trContent = (m: { content: string | ProviderContentBlock[] } | undefined): string => {
+    if (m === undefined || typeof m.content === 'string') throw new Error('expected blocks');
+    const b = m.content[0];
+    if (b === undefined || b.type !== 'tool_result') throw new Error('expected tool_result block');
+    return b.content;
+  };
+
+  test('elides middle bodies while preserving goal + tail verbatim and message count', () => {
+    const ctx = seed(6); // 13 messages
+    const before = ctx.length;
+    const res = ctx.relevanceElide({ verbatimBudgetBytes: 800, preserveTail: 3 });
+    expect(res).not.toBeNull();
+    expect(res?.elidedCount).toBeGreaterThan(0);
+    expect(res?.elidedIds.length).toBe(res?.elidedCount);
+    const msgs = ctx.getMessages();
+    expect(msgs.length).toBe(before); // structure intact — only bodies shrank
+    expect(msgs[0]).toEqual({ role: 'user', content: 'refactor the auth token validation' });
+    // The most recent tool_result sits in the preserved tail → verbatim.
+    expect(trContent(msgs[msgs.length - 1])).toBe(big('lorem ipsum filler content unrelated'));
+    const anyPointer = msgs.some(
+      (m) =>
+        typeof m.content !== 'string' &&
+        m.content.some(
+          (b) => b.type === 'tool_result' && b.content.startsWith('[tool_result elided:'),
+        ),
+    );
+    expect(anyPointer).toBe(true);
+  });
+
+  test('returns null when history is too short to have a middle', () => {
+    const ctx = SessionContext.createFresh(db, sessionId);
+    ctx.appendUser('goal', null);
+    ctx.appendAssistant(textBlock('ok'), noUsage, null);
+    expect(ctx.relevanceElide({ verbatimBudgetBytes: 0, preserveTail: 3 })).toBeNull();
+  });
+});

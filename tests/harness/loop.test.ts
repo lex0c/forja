@@ -7,6 +7,7 @@ import type { Policy } from '../../src/permissions/index.ts';
 import type { GenerateRequest, Provider, StreamEvent } from '../../src/providers/index.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
+import { createPin } from '../../src/storage/repos/context-pins.ts';
 import { listProvenanceForMemory } from '../../src/storage/repos/memory-provenance.ts';
 import { appendMessage } from '../../src/storage/repos/messages.ts';
 import { createSession, getSession, listSessions } from '../../src/storage/repos/sessions.ts';
@@ -113,6 +114,21 @@ const echoTool: Tool = {
   },
 };
 
+// Small input, BIG output — so the elidable weight lands in the tool_result
+// (which the relevance pre-pass can pointer) rather than the tool_use input
+// (an assistant-message block the pre-pass never touches). Used to build a
+// context the relevance pass alone can drop under the threshold.
+const bigOutputTool: Tool = {
+  name: 'big',
+  description: 'returns a large result regardless of input size',
+  inputSchema: { type: 'object', properties: { n: { type: 'number' } }, required: ['n'] },
+  metadata: { category: 'misc', writes: false, idempotent: true },
+  async execute(args: unknown) {
+    const { n } = args as { n: number };
+    return { chunk: n, data: 'y '.repeat(2000) };
+  },
+};
+
 const failingTool: Tool<unknown, unknown> = {
   name: 'always_fails',
   description: 'always fails',
@@ -143,6 +159,7 @@ const buildConfig = (
       maxRepeatedToolHash: number;
       compactionThreshold: number;
       compactionPreserveTail: number;
+      compactionRelevance: boolean;
       maxCostUsd: number;
     }>;
     capsOverride?: Partial<Provider['capabilities']>;
@@ -756,6 +773,102 @@ describe('runAgent', () => {
     const turnReq = second.handle.requests.at(-1);
     if (turnReq === undefined) throw new Error('expected a post-compaction request');
     expect(turnReq.messages.length).toBeLessThan(8);
+  });
+
+  // Build a resumable session whose restored history is big and over a
+  // crossable threshold, with elidable low-relevance tool_results — so the
+  // relevance pre-pass alone can drop it under the threshold.
+  const PIN_TEXT = 'CONSTRAINT: never change the public API of module X';
+  const buildBigPinnableSession = async (): Promise<string> => {
+    // Distinct `n` per call avoids the maxRepeatedToolHash degenerate-loop
+    // backstop; each `big` result is large + low-relevance to the goal.
+    const first = buildConfig(
+      [
+        { tool_uses: [{ id: 't1', name: 'big', input: { n: 1 } }], stop_reason: 'tool_use' },
+        { tool_uses: [{ id: 't2', name: 'big', input: { n: 2 } }], stop_reason: 'tool_use' },
+        { tool_uses: [{ id: 't3', name: 'big', input: { n: 3 } }], stop_reason: 'tool_use' },
+        { text: 'done', stop_reason: 'end_turn' },
+      ],
+      // Huge window so r1 just BUILDS the big context without compacting; r2's
+      // tiny window is what trips the threshold on resume.
+      { capsOverride: { context_window: 1_000_000 }, extraTools: [bigOutputTool] },
+    );
+    const r1 = await runAgent(first.config);
+    expect(r1.status).toBe('done');
+    return r1.sessionId;
+  };
+
+  // Minimal memoryRegistry so the relevance pre-pass's availability gate passes
+  // — the harness wires retrieve_context (the elided body's recovery path) only
+  // when memoryRegistry is present. The pre-pass never calls the registry; only
+  // its presence matters, so empty roots suffice.
+  const makeMemoryRegistry = async () => {
+    const { mkdirSync, mkdtempSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { createMemoryRegistry } = await import('../../src/memory/registry.ts');
+    const repo = mkdtempSync(join(tmpdir(), 'forja-relevance-mem-'));
+    const roots = {
+      user: join(repo, 'u'),
+      projectShared: join(repo, 's'),
+      projectLocal: join(repo, 'l'),
+    };
+    for (const d of Object.values(roots)) mkdirSync(d, { recursive: true });
+    return createMemoryRegistry({ roots });
+  };
+
+  test('relevance pre-pass short-circuits a pin-free compaction (baseline for the pin guard)', async () => {
+    const sessionId = await buildBigPinnableSession();
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const second = buildConfig([{ text: 'turn done', stop_reason: 'end_turn' }], {
+      capsOverride: { context_window: 8000 },
+      budget: { compactionThreshold: 0.3, compactionPreserveTail: 1, compactionRelevance: true },
+    });
+    const memoryRegistry = await makeMemoryRegistry();
+    await runAgent({
+      ...second.config,
+      resumeFromSessionId: sessionId,
+      memoryRegistry,
+      onEvent: (e) => events.push(e),
+    });
+    const fin = events.find((e) => e.type === 'compaction_finished');
+    if (fin?.type !== 'compaction_finished') throw new Error('expected compaction_finished');
+    // No pins → relevance alone drops under the threshold → no billed LLM fold.
+    expect(fin.strategy).toBe('relevance');
+  });
+
+  test('relevance compaction with an active pin falls through to the LLM fold so the pin survives', async () => {
+    const sessionId = await buildBigPinnableSession();
+    // The pin contract is "survives compaction" — re-injected into the goal
+    // only by ctx.compact's pinnedBlock path, which the relevance short-circuit
+    // would bypass (leaving the pin to vanish once its carrier is elided).
+    createPin(db, { sessionId, text: PIN_TEXT, kind: 'constraint', createdBy: 'model' });
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const second = buildConfig(
+      [
+        { text: '[compacted_history]\nprior work\n[/compacted_history]', stop_reason: 'end_turn' },
+        { text: 'turn done', stop_reason: 'end_turn' },
+      ],
+      {
+        capsOverride: { context_window: 8000 },
+        budget: { compactionThreshold: 0.3, compactionPreserveTail: 1, compactionRelevance: true },
+      },
+    );
+    const memoryRegistry = await makeMemoryRegistry();
+    await runAgent({
+      ...second.config,
+      resumeFromSessionId: sessionId,
+      memoryRegistry,
+      onEvent: (e) => events.push(e),
+    });
+    const fin = events.find((e) => e.type === 'compaction_finished');
+    if (fin?.type !== 'compaction_finished') throw new Error('expected compaction_finished');
+    // The pin forced the LLM fold instead of the relevance short-circuit...
+    expect(fin.strategy).not.toBe('relevance');
+    // ...so it is re-injected and survives into the post-compaction request.
+    const turnReq = second.handle.requests.at(-1);
+    if (turnReq === undefined) throw new Error('expected a post-compaction request');
+    expect(JSON.stringify(turnReq.messages)).toContain(PIN_TEXT);
   });
 
   test('reuse: sessionContext is mutually exclusive with resumeFromSessionId', async () => {

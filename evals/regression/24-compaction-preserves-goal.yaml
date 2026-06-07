@@ -25,3 +25,7 @@ budget:
   maxCostUsd: 0.15
   compactionThreshold: 0.02
   compactionPreserveTail: 1
+  # Pin the pure-LLM path: this case asserts strategy=llm (goal re-injection
+  # through the LLM summary). compactionRelevance now defaults ON, so opt out
+  # explicitly to keep the assertion deterministic.
+  compactionRelevance: false

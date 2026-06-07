@@ -1,7 +1,12 @@
 import { readFileSync, statSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
-import { EXIT_REASONS, type ExitReason } from '../harness/index.ts';
+import {
+  COMPACTION_STRATEGIES,
+  type CompactionStrategy,
+  EXIT_REASONS,
+  type ExitReason,
+} from '../harness/index.ts';
 import type { EvalBudget, EvalCase, EvalExpectation, EvalSetup } from './types.ts';
 
 // Built once from the harness's source-of-truth tuple. Adding a new
@@ -30,9 +35,13 @@ const BUDGET_KEYS: ReadonlySet<string> = new Set([
   'maxCostUsd',
   'compactionThreshold',
   'compactionPreserveTail',
+  'compactionRelevance',
 ]);
 
-const VALID_COMPACTION_STRATEGIES: ReadonlySet<string> = new Set(['llm', 'fallback', 'skipped']);
+// Driven off the harness's single-source tuple (same pattern as
+// VALID_EXIT_REASONS above) — a new strategy in COMPACTION_STRATEGIES is
+// assertable in YAML automatically, no hand-rolled mirror to drift.
+const VALID_COMPACTION_STRATEGIES: ReadonlySet<string> = new Set(COMPACTION_STRATEGIES);
 
 // Each expectation form has a tight schema — the parser rejects
 // unknown discriminants AND extra keys to keep the surface
@@ -189,6 +198,12 @@ const parseBudget = (raw: unknown): EvalBudget | undefined => {
     }
     out.compactionPreserveTail = r.compactionPreserveTail;
   }
+  if (r.compactionRelevance !== undefined) {
+    if (typeof r.compactionRelevance !== 'boolean') {
+      throw new Error('eval: budget.compactionRelevance must be a boolean');
+    }
+    out.compactionRelevance = r.compactionRelevance;
+  }
   return out;
 };
 
@@ -285,7 +300,7 @@ const parseExpectation = (raw: unknown, idx: number): EvalExpectation => {
               .join(', ')}`,
           );
         }
-        out.strategy = strategy as 'llm' | 'fallback' | 'skipped';
+        out.strategy = strategy as CompactionStrategy;
       }
       return out;
     }

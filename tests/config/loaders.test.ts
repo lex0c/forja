@@ -681,6 +681,90 @@ compaction_threshold = 1
     }
   });
 
+  test('compaction_relevance = false parses (production opt-out for the relevance pre-pass)', () => {
+    // The pre-pass is default-ON (DEFAULT_BUDGET.compactionRelevance); this is
+    // the CLI opt-out. Before this key was wired it was silently ignored —
+    // only eval YAML could disable it.
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[budget]
+compaction_relevance = false
+`,
+      );
+      const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.compactionRelevance).toBe(false);
+      expect(result.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('non-boolean compaction_relevance warns and is ignored (fail-soft)', () => {
+    // The common footgun is quoting the bool (`"false"`), which TOML parses as
+    // a string. Reject it loudly rather than silently treating it as truthy.
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[budget]
+compaction_relevance = "false"
+`,
+      );
+      const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.compactionRelevance).toBeUndefined();
+      expect(result.warnings.some((w) => w.includes('must be a boolean'))).toBe(true);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('camelCase compactionRelevance is accepted (no snake key present)', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[budget]
+compactionRelevance = false
+`,
+      );
+      const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.compactionRelevance).toBe(false);
+      expect(result.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('both compaction_relevance spellings: snake_case wins and the conflict warns', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[budget]
+compaction_relevance = false
+compactionRelevance = true
+`,
+      );
+      const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.compactionRelevance).toBe(false); // snake wins
+      expect(result.warnings.some((w) => w.includes('snake_case wins, camelCase ignored'))).toBe(
+        true,
+      );
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   test('max_step_stall_ms = 0 accepted (runtime opt-out for the per-step watchdog)', () => {
     // Runtime contract (`src/harness/abortable.ts:68`): `stallMs
     // <= 0` disables the per-step watchdog entirely — yields the

@@ -7,6 +7,12 @@ import type {
   UsageInfo,
 } from '../providers/index.ts';
 import { stripAnsi } from '../sanitize/index.ts';
+import type { DB } from '../storage/db.ts';
+import {
+  type AppendCompactionEventInput,
+  appendCompactionEvent,
+} from '../storage/repos/compaction-events.ts';
+import { hashPromptContent } from '../storage/repos/prompt-versions.ts';
 import { abortableIterable } from './abortable.ts';
 import { CollectStepError, collectStep } from './collect.ts';
 
@@ -60,7 +66,12 @@ export interface CompactionOptions {
   pinnedBlock?: string;
 }
 
-export type CompactionStrategy = 'llm' | 'fallback' | 'skipped';
+// Single source for the strategy names — the runtime array drives the
+// eval loader's allowlist (`evals/loader.ts`, mirroring its VALID_EXIT_REASONS
+// pattern) and the type is derived from it, so adding a strategy here
+// can't leave a hand-rolled mirror silently rejecting it.
+export const COMPACTION_STRATEGIES = ['llm', 'fallback', 'skipped', 'relevance'] as const;
+export type CompactionStrategy = (typeof COMPACTION_STRATEGIES)[number];
 
 export interface CompactionResult {
   messages: ProviderMessage[];
@@ -84,6 +95,11 @@ export interface CompactionResult {
   // Optional reason when strategy='fallback' or 'skipped' — surfaces
   // through the harness event for observability.
   reason?: string;
+  // The LLM summary text on the `llm` strategy (the non-deterministic content
+  // folded into the goal). Persisted to `compaction_events` for replay/audit —
+  // it is otherwise LOST (resume re-derives from the log and re-compacts → a
+  // different summary). Undefined on fallback / skipped / relevance.
+  summary?: string;
 }
 
 // The accounting consequences of folding a CompactionResult: what the
@@ -167,7 +183,7 @@ const truncateLongText = (s: string): string => {
   const head = s.slice(0, TRUNCATE_HEAD);
   const tail = s.slice(-TRUNCATE_TAIL);
   const elided = s.length - TRUNCATE_HEAD - TRUNCATE_TAIL;
-  return `${head}\n[... ${elided} chars elided — compaction fallback, original in audit log ...]\n${tail}`;
+  return `${head}\n[... ${elided} chars elided — compaction fallback; recover via retrieve_context (session view) ...]\n${tail}`;
 };
 
 const fallbackElide = (block: ProviderContentBlock): ProviderContentBlock => {
@@ -179,7 +195,7 @@ const fallbackElide = (block: ProviderContentBlock): ProviderContentBlock => {
     // model knows whether the call succeeded.
     return {
       ...block,
-      content: `[tool_result elided: ${sizeBytes} bytes — compaction fallback, original in audit log]`,
+      content: `[tool_result elided: ${sizeBytes} bytes — compaction fallback; recover via retrieve_context (session view)]`,
     };
   }
   if (block.type === 'text') {
@@ -299,7 +315,7 @@ const stripPriorSummary = (text: string): string => text.replace(SUMMARY_BLOCK_R
 // initial user prompt, but compaction may rewrite messages[0] into a
 // wrapped goal that already carries a summary; subsequent compactions
 // must see the ORIGINAL goal, not the prior summary.
-const goalText = (goal: ProviderMessage): string => {
+export const goalText = (goal: ProviderMessage): string => {
   const raw =
     typeof goal.content === 'string'
       ? goal.content
@@ -368,6 +384,75 @@ const wrapGoalWithSummary = (
   return { role: 'user', content: `${goalText(goal)}\n\n${withPins}` };
 };
 
+// The token count at which compaction fires: a fraction of the provider
+// context window (CONTEXT_TUNING §12). One source for the loop's trigger
+// check, the `/compact` command, and the relevance verbatim-budget
+// derivation below — so the trigger definition can't drift between
+// callers (e.g. if it ever gains a clamp or per-provider floor).
+export const compactionTriggerTokens = (threshold: number, contextWindow: number): number =>
+  threshold * contextWindow;
+
+// Verbatim byte budget for the relevance pre-pass, derived from the
+// compaction trigger (CONTEXT_TUNING §12) rather than a magic constant:
+// keep up to ~30% of the threshold as verbatim tool_result bytes
+// (~4 bytes/token is a coarse proxy). Shared by the loop's auto path and
+// the `/compact` command so the heuristic the eval tunes lives in ONE
+// place, not duplicated per caller.
+export const relevanceVerbatimBudgetBytes = (triggerAtTokens: number): number =>
+  Math.floor(triggerAtTokens * 0.3 * 4);
+
+// Walk the tail boundary back to the nearest assistant message so the
+// preserved tail starts at an assistant (keeps tool_use → tool_result
+// pairs intact; providers reject orphaned tool_results). Returns the
+// aligned tailStart, or null when no assistant sits between the goal and
+// the requested tail (pathological history). Shared by compactMessages
+// (the fold tail) and SessionContext.relevanceElide (the preserved tail)
+// so both paths agree on what "the last K turns" means.
+export const alignTailStartToAssistant = (
+  messages: ProviderMessage[],
+  safeTail: number,
+): number | null => {
+  let tailStart = messages.length - safeTail;
+  while (tailStart > 1 && messages[tailStart]?.role !== 'assistant') {
+    tailStart -= 1;
+  }
+  if (tailStart < 1 || messages[tailStart]?.role !== 'assistant') return null;
+  return tailStart;
+};
+
+// sha256 of the live message array — the before/after context hash on a
+// compaction_events row. One definition so every writer (loop + /compact)
+// hashes the SAME serialization; a divergent stringify would silently make
+// before/after non-comparable across paths (defeating the replay check).
+export const hashContext = (messages: readonly ProviderMessage[]): string =>
+  hashPromptContent(JSON.stringify(messages));
+
+// Persist one compaction_events audit row (CONTEXT_TUNING §12 / AUDIT.md).
+// Shared by the loop and `/compact` so the skip / hash / best-effort logic
+// lives in ONE place (no per-caller drift):
+//   - strategy 'skipped' ⇒ NO row — nothing happened (before === after); a
+//     no-op event is pure noise in an un-GC'd table.
+//   - afterHash is hashed from `messagesAfter` (the post-compaction array).
+//   - best-effort, but OBSERVABLE: a persist failure (CHECK / NOT NULL /
+//     binding drift) is logged to stderr, never silently swallowed — losing
+//     the audit row silently is the failure this table exists to prevent.
+export const recordCompactionEvent = (
+  db: DB,
+  input: Omit<AppendCompactionEventInput, 'afterHash'> & {
+    messagesAfter: readonly ProviderMessage[];
+  },
+): void => {
+  if (input.strategy === 'skipped') return;
+  const { messagesAfter, ...row } = input;
+  try {
+    appendCompactionEvent(db, { ...row, afterHash: hashContext(messagesAfter) });
+  } catch (err) {
+    console.error(
+      `forja: compaction_events persist failed — ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+};
+
 export const compactMessages = async (
   provider: Provider,
   messages: ProviderMessage[],
@@ -414,17 +499,13 @@ export const compactMessages = async (
   // we're merging into the goal), the next provider call sees an
   // orphan tool_result and rejects with 400.
   //
-  // Walk back from the requested boundary to the nearest assistant.
-  // The summary is merged into the goal (user-role), so the resulting
-  // [wrappedGoal_user, tail_starts_with_assistant, ...] sequence has
-  // clean user→assistant→user alternation regardless of preserveTail
-  // parity. Over-preserving by one position when the boundary lands
-  // on a user is the price of correctness.
-  let tailStart = messages.length - safeTail;
-  while (tailStart > 1 && messages[tailStart]?.role !== 'assistant') {
-    tailStart -= 1;
-  }
-  if (tailStart < 1 || messages[tailStart]?.role !== 'assistant') {
+  // Align the tail to an assistant boundary (shared helper): the summary
+  // is merged into the goal (user-role), so [wrappedGoal_user,
+  // tail_starts_with_assistant, ...] keeps clean user→assistant→user
+  // alternation regardless of preserveTail parity. Over-preserving by one
+  // position when the boundary lands on a user is the price of correctness.
+  const tailStart = alignTailStartToAssistant(messages, safeTail);
+  if (tailStart === null) {
     // Pathological history shape — no assistant message between the
     // goal and the requested tail. Refuse rather than emit a
     // malformed prompt.
@@ -485,6 +566,7 @@ export const compactMessages = async (
       foldedCount: middle.length,
       usage: attemptUsage,
       usageSeen: attemptUsageSeen,
+      summary: summaryBody,
     };
   } catch (e) {
     // If collectStep threw mid-iteration (CollectStepError), the

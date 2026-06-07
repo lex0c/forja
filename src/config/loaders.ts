@@ -350,6 +350,7 @@ export interface BudgetConfigKeys {
   maxStepStallMs?: number;
   compactionThreshold?: number;
   compactionPreserveTail?: number;
+  compactionRelevance?: boolean;
 }
 
 export interface LoadedBudgetConfig {
@@ -427,6 +428,16 @@ const BUDGET_FLOAT_KEYS: ReadonlyArray<{
   { snake: 'compaction_threshold', camel: 'compactionThreshold', min: 0, max: 1 },
 ];
 
+// Boolean-valued budget keys. The relevance compaction pre-pass is default-ON
+// (DEFAULT_BUDGET.compactionRelevance in src/harness/types.ts); this is the
+// operator's CLI opt-out — `[budget] compaction_relevance = false` disables the
+// BM25 pre-pass so it can never elide a tool_result the operator needs kept
+// verbatim. Without this key the default would be uncontrollable from config.
+const BUDGET_BOOL_KEYS: ReadonlyArray<{
+  snake: string;
+  camel: keyof BudgetConfigKeys;
+}> = [{ snake: 'compaction_relevance', camel: 'compactionRelevance' }];
+
 const parseBudgetLayer = (
   path: string | null,
   source: string,
@@ -483,10 +494,32 @@ const parseBudgetLayer = (
     (layer as Record<string, number>)[camel] = v;
   };
 
+  // Same snake/camel-conflict + fail-soft posture as readNumber, for booleans.
+  const readBoolean = (snake: string, camel: keyof BudgetConfigKeys): void => {
+    const snakeRaw = b[snake];
+    const camelRaw = b[camel];
+    if (snakeRaw !== undefined && camelRaw !== undefined) {
+      warnings.push(
+        `${source} config (${path}): [budget] declares both ${snake} and ${camel}; snake_case wins, camelCase ignored`,
+      );
+    }
+    const v = snakeRaw ?? camelRaw;
+    if (v === undefined) return;
+    const keyUsed = snakeRaw !== undefined ? snake : camel;
+    if (typeof v !== 'boolean') {
+      warnings.push(
+        `${source} config (${path}): [budget].${keyUsed}=${JSON.stringify(v)} must be a boolean; ignoring`,
+      );
+      return;
+    }
+    (layer as Record<string, boolean>)[camel] = v;
+  };
+
   for (const { snake, camel, min, max } of BUDGET_INT_KEYS)
     readNumber(snake, camel, min, max, true);
   for (const { snake, camel, min, max } of BUDGET_FLOAT_KEYS)
     readNumber(snake, camel, min, max, false);
+  for (const { snake, camel } of BUDGET_BOOL_KEYS) readBoolean(snake, camel);
 
   return { layer, warnings };
 };

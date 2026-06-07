@@ -8,7 +8,14 @@
 // never decides to compact; the harness does it automatically and the
 // operator can force it here.
 
-import { accountCompaction } from '../../../harness/compaction.ts';
+import type { RelevanceElideResult } from '../../../harness/compaction-relevance.ts';
+import {
+  accountCompaction,
+  compactionTriggerTokens,
+  hashContext,
+  recordCompactionEvent,
+  relevanceVerbatimBudgetBytes,
+} from '../../../harness/compaction.ts';
 import { effectiveBudget } from '../../../harness/types.ts';
 import { formatPinnedBlock, getActivePinsBySession } from '../../../storage/repos/context-pins.ts';
 import {
@@ -54,10 +61,38 @@ export const compactCommand: SlashCommand = {
       // fallback, so the run survives and the REPL frees.
       const timeout = AbortSignal.timeout(budget.maxStepStallMs);
       const compactSignal = signal !== undefined ? AbortSignal.any([signal, timeout]) : timeout;
+      // Whether this compaction changed the live context — drives the footer's
+      // staleness on the compacting:end below. Stays false for a no-op (the
+      // "nothing to compact" early return) and for the error path (restored).
+      let contextChanged = false;
       try {
         // Bracket the live "Compacting context…" chip around the summary call —
         // the same chip the auto path shows. Paired with the :end in `finally`.
         ctx.bus.emit({ type: 'compacting:start', ts: ctx.now() });
+        // Pre-compaction context hash for the audit row (computed before the
+        // relevance pre-pass mutates the array).
+        const beforeHash = hashContext(live.getMessages());
+        // Relevance pre-pass for parity with the auto path: when enabled,
+        // pointer-elide low-goal-relevance tool_result bodies first so the
+        // forced LLM fold below summarizes a lighter, gated history. Unlike
+        // the loop, /compact always proceeds to the fold — the operator
+        // forced it; there is no token threshold to short-circuit on. The
+        // snapshot above predates this, so a failure rewinds both.
+        let relevanceElided: RelevanceElideResult | null = null;
+        // Gated on memoryRegistry like the auto path: an elided body is
+        // recoverable only via retrieve_context, which the harness wires only
+        // when memoryRegistry is present. Without it, skip the pre-pass and let
+        // the forced LLM fold keep a summary instead of stranding the body.
+        if (budget.compactionRelevance === true && ctx.baseConfig.memoryRegistry !== undefined) {
+          const triggerAt = compactionTriggerTokens(
+            budget.compactionThreshold,
+            ctx.baseConfig.provider.capabilities.context_window,
+          );
+          relevanceElided = live.relevanceElide({
+            verbatimBudgetBytes: relevanceVerbatimBudgetBytes(triggerAt),
+            preserveTail: budget.compactionPreserveTail,
+          });
+        }
         const result = await live.compact(ctx.baseConfig.provider, {
           preserveTail: budget.compactionPreserveTail,
           signal: compactSignal,
@@ -80,16 +115,39 @@ export const compactCommand: SlashCommand = {
         if (acct.usageIncomplete) {
           markSessionUsageIncomplete(ctx.db, live.sessionId);
         }
-        if (result.strategy === 'skipped') {
+        // Audit row (compaction_events) for parity with the auto path. tokens
+        // omitted — a forced /compact has no trigger count. The shared recorder
+        // hashes afterHash, skips a no-op 'skipped', and logs (not swallows) a
+        // persist failure.
+        recordCompactionEvent(ctx.db, {
+          sessionId: live.sessionId,
+          beforeHash,
+          messagesAfter: live.getMessages(),
+          strategy: result.strategy,
+          foldedCount: result.foldedCount,
+          ...(relevanceElided !== null && relevanceElided.elidedCount > 0
+            ? { freedBytes: relevanceElided.freedBytes, elidedIds: relevanceElided.elidedIds }
+            : {}),
+          ...(result.summary !== undefined ? { summary: result.summary } : {}),
+          ...(result.reason !== undefined ? { reason: result.reason } : {}),
+          recordedAt: ctx.now(),
+        });
+        const relevanceNote =
+          relevanceElided !== null && relevanceElided.elidedCount > 0
+            ? ` Relevance pre-pass pointered ${relevanceElided.elidedCount} tool_result(s) (${relevanceElided.freedBytes}B freed, recoverable via retrieve_context).`
+            : '';
+        if (result.strategy === 'skipped' && relevanceNote === '') {
           return {
             kind: 'ok',
             notes: ['Nothing to compact — the conversation is already small.'],
           };
         }
+        // Past the no-op check ⇒ something changed (a fold and/or relevance elision).
+        contextChanged = true;
         return {
           kind: 'ok',
           notes: [
-            `Compacted ${before} → ${live.length} messages (${result.foldedCount} folded). In-memory only — the DB log is unchanged; a fresh --resume re-derives it.`,
+            `Compacted ${before} → ${live.length} messages (${result.foldedCount} folded).${relevanceNote} In-memory only — the DB log is unchanged; a fresh --resume re-derives it.`,
           ],
         };
       } catch (e) {
@@ -99,7 +157,7 @@ export const compactCommand: SlashCommand = {
           message: `compaction failed (context unchanged): ${e instanceof Error ? e.message : String(e)}`,
         };
       } finally {
-        ctx.bus.emit({ type: 'compacting:end', ts: ctx.now() });
+        ctx.bus.emit({ type: 'compacting:end', ts: ctx.now(), contextChanged });
       }
     };
 

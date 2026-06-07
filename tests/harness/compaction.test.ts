@@ -780,3 +780,13 @@ describe('accountCompaction (shared cost + usage decision)', () => {
     expect(a.usageIncomplete).toBe(false);
   });
 });
+
+describe('compactMessages — summary exposure (for compaction_events audit)', () => {
+  test('the llm path returns the summary text on the result', async () => {
+    const handle = mockProvider(() => replyText('GOAL: keep going\nDECISIONS: use bun'));
+    const result = await compactMessages(handle.provider, buildHistory(5), { preserveTail: 3 });
+    expect(result.strategy).toBe('llm');
+    // The non-deterministic summary the loop persists to compaction_events.
+    expect(result.summary).toContain('GOAL: keep going');
+  });
+});

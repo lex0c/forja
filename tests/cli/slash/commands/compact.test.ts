@@ -232,6 +232,20 @@ describe('/compact', () => {
     );
   });
 
+  test('compacting:end reports contextChanged=true after a real compaction', async () => {
+    const live = buildLiveCtx();
+    const slashCtx = makeCtx({ provider: makeProvider('GOAL: x\nDECISIONS: y'), live });
+    let endChanged: boolean | undefined;
+    slashCtx.bus.onAny((e) => {
+      if (e.type === 'compacting:end') endChanged = e.contextChanged;
+    });
+    const r = await compactCommand.exec([], slashCtx);
+    expect(r.kind).toBe('ok');
+    // Signals the footer to suppress the now-stale % until the next turn
+    // re-measures (a no-op 'skipped' would report false and keep it visible).
+    expect(endChanged).toBe(true);
+  });
+
   test('marks session usage incomplete when the summary call fails before reporting usage', async () => {
     const live = buildLiveCtx();
     // Provider throws mid-stream BEFORE emitting usage → compactMessages

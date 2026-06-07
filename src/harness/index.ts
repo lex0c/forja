@@ -11,6 +11,7 @@ export {
   invokeTool,
 } from './invoke-tool.ts';
 export { runAgent } from './loop.ts';
+export { COMPACTION_STRATEGIES, type CompactionStrategy } from './compaction.ts';
 export {
   type AssistantUsage,
   type HydrateInfo,

@@ -1529,6 +1529,59 @@ describe('compacting indicator (compacting:start/end bracket)', () => {
     expect(r.state.compacting).toBeNull();
     expect(r.permanent).toEqual([]);
   });
+
+  test('compacting:start alone does not mark the context stale', () => {
+    // Staleness is decided at :end (we don't yet know if the compaction will
+    // change anything), so a start that ends 'skipped' never suppresses the %.
+    const r = applyEvent(createInitialState(), { type: 'compacting:start', ts: 100 });
+    expect(r.state.status.contextStale).toBe(false);
+  });
+
+  test('compacting:end with contextChanged marks the context stale (footer suppresses the %)', () => {
+    let s = applyEvent(createInitialState(), { type: 'compacting:start', ts: 100 }).state;
+    s = applyEvent(s, { type: 'compacting:end', ts: 150, contextChanged: true }).state;
+    expect(s.compacting).toBeNull();
+    expect(s.status.contextStale).toBe(true);
+  });
+
+  test('compacting:end without contextChanged (no-op skipped) keeps the % visible', () => {
+    let s = applyEvent(createInitialState(), { type: 'compacting:start', ts: 100 }).state;
+    s = applyEvent(s, { type: 'compacting:end', ts: 150, contextChanged: false }).state;
+    // Nothing shrank → the displayed count is still accurate → no suppression.
+    expect(s.status.contextStale).toBe(false);
+  });
+
+  test('assistant:end with usage clears contextStale (footer % returns on provider truth)', () => {
+    const result = drive([
+      { type: 'compacting:start', ts: 100 },
+      { type: 'compacting:end', ts: 150, contextChanged: true },
+      { type: 'assistant:start', ts: 1000, messageId: 'm1' },
+      { type: 'assistant:delta', ts: 1100, messageId: 'm1', text: 'reply' },
+      {
+        type: 'assistant:usage',
+        ts: 1150,
+        messageId: 'm1',
+        inputTokens: 100,
+        outputTokens: 200,
+        cacheRead: 1000,
+        cacheCreation: 500,
+      },
+      { type: 'assistant:end', ts: 1200, messageId: 'm1' },
+    ]);
+    expect(result.state.status.contextStale).toBe(false);
+    expect(result.state.status.lastTurnContextTokens).toBe(1600);
+  });
+
+  test('assistant:end without usage keeps contextStale (no fresh measurement)', () => {
+    const result = drive([
+      { type: 'compacting:start', ts: 100 },
+      { type: 'compacting:end', ts: 150, contextChanged: true },
+      { type: 'assistant:start', ts: 1000, messageId: 'm1' },
+      { type: 'assistant:delta', ts: 1100, messageId: 'm1', text: 'reply' },
+      { type: 'assistant:end', ts: 1200, messageId: 'm1' },
+    ]);
+    expect(result.state.status.contextStale).toBe(true);
+  });
 });
 
 describe('awaitingProvider indicator (provider:waiting bracket)', () => {

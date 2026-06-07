@@ -574,7 +574,7 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
       case 'compaction_finished': {
         // Close the chip first — even on 'skipped', which returns early
         // below before pushing the warn.
-        out.push({ type: 'compacting:end', ts });
+        out.push({ type: 'compacting:end', ts, contextChanged: event.strategy !== 'skipped' });
         if (event.strategy === 'skipped') return out;
         const detail = event.reason !== undefined ? ` — ${event.reason}` : '';
         out.push({

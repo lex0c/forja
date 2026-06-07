@@ -61,6 +61,7 @@ ${maxCostLine}max_wall_clock_ms = ${b.maxWallClockMs}
 max_step_stall_ms = ${b.maxStepStallMs}
 compaction_threshold = ${b.compactionThreshold}
 compaction_preserve_tail = ${b.compactionPreserveTail}
+compaction_relevance = ${b.compactionRelevance}
 
 [memory]
 verify_semantic_llm = ${m.verifySemanticLlm}
