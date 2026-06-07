@@ -197,35 +197,50 @@ describe('session lifecycle', () => {
     }
   });
 
-  test('session:end folds the turn cost into the REPL-cumulative total and zeroes costUsd', () => {
-    // step:budget lands the turn's settled cost into status.costUsd
-    // just before session:end; the boundary aggregates it.
+  test('session:end does NOT fold cost into the footer total (now DB-derived)', () => {
+    // The footer's cumulative cost/token/cache totals are pushed via
+    // stats:refresh (DB-derived), not folded at the turn boundary. A
+    // step:budget + session:end must leave sessionTotalCostUsd untouched.
     let s = createInitialState();
-    s = applyEvent(s, {
-      type: 'step:budget',
-      ts: 1,
-      steps: 1,
-      maxSteps: 200,
-      costUsd: 0.4,
-    }).state;
+    s = applyEvent(s, { type: 'step:budget', ts: 1, steps: 1, maxSteps: 200, costUsd: 0.4 }).state;
     const r = applyEvent(s, { type: 'session:end', ts: 2, sessionId: 's1', reason: 'done' });
-    expect(r.state.status.sessionTotalCostUsd).toBe(0.4);
-    // Reset so a turn ending without a fresh step:budget can't re-add it.
-    expect(r.state.status.costUsd).toBe(0);
+    expect(r.state.status.sessionTotalCostUsd).toBe(0);
   });
 
-  test('cumulative cost survives session:start and sums across turns (REPL-scoped)', () => {
+  test('stats:refresh SETS the footer cost/token/cache totals (absolute, not summed)', () => {
     let s = createInitialState();
-    // Turn 1: $0.4
-    s = applyEvent(s, { type: 'step:budget', ts: 1, steps: 1, maxSteps: 200, costUsd: 0.4 }).state;
-    s = applyEvent(s, { type: 'session:end', ts: 2, sessionId: 's1', reason: 'done' }).state;
-    // New REPL turn must NOT reset the cumulative total.
-    s = applyEvent(s, start({ sessionId: 's2' })).state;
+    s = applyEvent(s, {
+      type: 'stats:refresh',
+      ts: 1,
+      costUsd: 0.4,
+      totalTokens: 1800,
+      cacheTokens: 500,
+    }).state;
     expect(s.status.sessionTotalCostUsd).toBe(0.4);
-    // Turn 2: $0.25 → cumulative $0.65
-    s = applyEvent(s, { type: 'step:budget', ts: 4, steps: 1, maxSteps: 200, costUsd: 0.25 }).state;
-    s = applyEvent(s, { type: 'session:end', ts: 5, sessionId: 's2', reason: 'done' }).state;
+    expect(s.status.sessionTotalTokens).toBe(1800);
+    expect(s.status.sessionCacheTokens).toBe(500);
+    // A second refresh OVERWRITES (SET semantics) — it does not add.
+    s = applyEvent(s, {
+      type: 'stats:refresh',
+      ts: 2,
+      costUsd: 0.65,
+      totalTokens: 2500,
+      cacheTokens: 700,
+    }).state;
     expect(s.status.sessionTotalCostUsd).toBeCloseTo(0.65, 10);
+    expect(s.status.sessionTotalTokens).toBe(2500);
+    expect(s.status.sessionCacheTokens).toBe(700);
+  });
+
+  test('stats:refresh emits no scrollback', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'stats:refresh',
+      ts: 1,
+      costUsd: 0.1,
+      totalTokens: 10,
+      cacheTokens: 0,
+    });
+    expect(r.permanent).toEqual([]);
   });
 
   test('session:banner stamps model + contextWindow onto status and emits the banner permanent', () => {
@@ -551,7 +566,7 @@ describe('assistant streaming', () => {
     ]);
   });
 
-  test('assistant:end rolls turn tokens into status (session total + last-turn context)', () => {
+  test('assistant:end sets last-turn context but does NOT fold the footer token totals', () => {
     const result = drive([
       { type: 'assistant:start', ts: 1000, messageId: 'm1' },
       { type: 'assistant:delta', ts: 1100, messageId: 'm1', text: 'reply' },
@@ -566,17 +581,16 @@ describe('assistant streaming', () => {
       },
       { type: 'assistant:end', ts: 9200, messageId: 'm1' },
     ]);
-    // sessionTotalTokens = input + cacheRead + cacheCreation + output
-    //                    = 100 + 1000 + 500 + 200 = 1800.
-    expect(result.state.status.sessionTotalTokens).toBe(1800);
-    // sessionCacheTokens = cacheRead + cacheCreation = 1500 (split out
-    // for its own footer chip; the non-cache part is 1800 - 1500 = 300).
-    expect(result.state.status.sessionCacheTokens).toBe(1500);
-    // lastTurnContextTokens = input + cacheRead + cacheCreation = 1600.
+    // lastTurnContextTokens = input + cacheRead + cacheCreation = 1600
+    // (per-turn snapshot for context occupancy — still derived here).
     expect(result.state.status.lastTurnContextTokens).toBe(1600);
+    // The footer's cumulative token/cache totals are DB-derived
+    // (stats:refresh), NOT folded at assistant:end — they stay untouched.
+    expect(result.state.status.sessionTotalTokens).toBe(0);
+    expect(result.state.status.sessionCacheTokens).toBe(0);
   });
 
-  test('assistant:end accumulates session tokens across multiple turns', () => {
+  test('assistant:end lastTurnContext REPLACES across turns (snapshot, not a running total)', () => {
     const result = drive([
       { type: 'assistant:start', ts: 1000, messageId: 'm1' },
       {
@@ -601,12 +615,12 @@ describe('assistant streaming', () => {
       },
       { type: 'assistant:end', ts: 2200, messageId: 'm2' },
     ]);
-    // 150 (turn 1: 50+100) + 500 (turn 2: 200+300) = 650.
-    expect(result.state.status.sessionTotalTokens).toBe(650);
     // Last-turn snapshot REPLACES (does not accumulate): only the
     // most recent turn's input-side tokens, so it reflects current
     // context occupancy, not lifetime usage.
     expect(result.state.status.lastTurnContextTokens).toBe(200);
+    // Footer total is not accumulated here.
+    expect(result.state.status.sessionTotalTokens).toBe(0);
   });
 
   test('assistant:end with no usage preserves prior lastTurnContextTokens (no zero flicker)', () => {
@@ -621,18 +635,19 @@ describe('assistant streaming', () => {
     expect(state.status.lastTurnContextTokens).toBe(5000);
   });
 
-  test('session:start does NOT reset session-total tokens (REPL-scoped accumulation)', () => {
+  test('session:start preserves the DB-derived footer totals (must not reset)', () => {
     // The operator thinks of the whole REPL as one session, even
     // though each user submit spawns its own harness `session:*`
-    // bracket. The cumulative chip must survive boundary events
-    // so the operator sees "I've burned X tokens in this REPL"
-    // rather than "I burned X in the last single turn".
+    // bracket. The footer totals (set by stats:refresh) must survive a
+    // bare session:start so they don't blink to 0 between turns.
     let state = createInitialState();
     state = {
       ...state,
       status: {
         ...state.status,
         sessionTotalTokens: 5000,
+        sessionCacheTokens: 1500,
+        sessionTotalCostUsd: 0.42,
         lastTurnContextTokens: 1200,
         contextWindow: 200000,
       },
@@ -645,41 +660,10 @@ describe('assistant streaming', () => {
       model: 'sonnet-4.6',
     });
     expect(result.state.status.sessionTotalTokens).toBe(5000);
+    expect(result.state.status.sessionCacheTokens).toBe(1500);
+    expect(result.state.status.sessionTotalCostUsd).toBe(0.42);
     expect(result.state.status.lastTurnContextTokens).toBe(1200);
     expect(result.state.status.contextWindow).toBe(200000);
-  });
-
-  test('cache tokens accumulate across turns and survive session:start', () => {
-    let state = createInitialState();
-    // Turn 1: cacheRead 800 + cacheCreation 200 = 1000 cache.
-    state = applyEvent(state, { type: 'assistant:start', ts: 1000, messageId: 'm1' }).state;
-    state = applyEvent(state, {
-      type: 'assistant:usage',
-      ts: 1100,
-      messageId: 'm1',
-      inputTokens: 50,
-      outputTokens: 100,
-      cacheRead: 800,
-      cacheCreation: 200,
-    }).state;
-    state = applyEvent(state, { type: 'assistant:end', ts: 1200, messageId: 'm1' }).state;
-    expect(state.status.sessionCacheTokens).toBe(1000);
-    // New REPL turn must not reset the cumulative cache count.
-    state = applyEvent(state, start({ sessionId: 's2' })).state;
-    expect(state.status.sessionCacheTokens).toBe(1000);
-    // Turn 2: +500 cache → 1500 cumulative.
-    state = applyEvent(state, { type: 'assistant:start', ts: 2000, messageId: 'm2' }).state;
-    state = applyEvent(state, {
-      type: 'assistant:usage',
-      ts: 2100,
-      messageId: 'm2',
-      inputTokens: 10,
-      outputTokens: 20,
-      cacheRead: 500,
-      cacheCreation: 0,
-    }).state;
-    state = applyEvent(state, { type: 'assistant:end', ts: 2200, messageId: 'm2' }).state;
-    expect(state.status.sessionCacheTokens).toBe(1500);
   });
 
   test('consecutive assistant:start events open a fresh turn (startedAt reset)', () => {

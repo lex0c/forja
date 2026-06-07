@@ -891,6 +891,25 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         state: { ...state, status: { ...state.status, effort: event.effort } },
         permanent: [],
       };
+    case 'stats:refresh':
+      // DB-derived usage totals (cost/tokens/cache) for the footer. The
+      // REPL recomputes these over its session tree at each turn boundary
+      // and on boot/resume, then emits this so we SET (not accumulate) —
+      // single source of truth is the persisted DB, so the chips are
+      // tree-wide (incl. subagents) and resume-correct. SET overrides any
+      // stale value; no scrollback.
+      return {
+        state: {
+          ...state,
+          status: {
+            ...state.status,
+            sessionTotalCostUsd: event.costUsd,
+            sessionTotalTokens: event.totalTokens,
+            sessionCacheTokens: event.cacheTokens,
+          },
+        },
+        permanent: [],
+      };
     case 'session:start': {
       const status: StatusState = {
         ...state.status,
@@ -989,23 +1008,15 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // harness already committed to killing — visually a zombie
       // tray. The late bg:end events still flow through (they're
       // dropped as no-ops by the unknown-processId branch).
-      // Fold this turn's spend into the REPL-cumulative total at the
-      // boundary (mirrors sessionTotalTokens' assistant:end aggregation).
-      // The final step:budget (carrying r.costUsd) is emitted right
-      // before this session:end in the same batch, so `status.costUsd`
-      // already holds the turn's settled cost here. Reset `costUsd` to 0
-      // so a turn that ends without a step:budget can't re-add a stale
-      // value on the next boundary.
-      const turnCostStatus: StatusState = {
-        ...flushed.state.status,
-        sessionTotalCostUsd:
-          flushed.state.status.sessionTotalCostUsd + flushed.state.status.costUsd,
-        costUsd: 0,
-      };
+      //
+      // The footer's cumulative cost/token/cache totals are NOT folded
+      // here anymore — they are DB-derived and pushed via `stats:refresh`
+      // (the REPL recomputes over its session tree at the turn boundary,
+      // which is tree-wide incl. subagents and resume-correct). This
+      // boundary only does the soft-interrupt / bg / subagent cleanup.
       return {
         state: {
           ...flushed.state,
-          status: turnCostStatus,
           softInterrupted: false,
           // Same boundary reset rationale as session:start (above).
           exitArmed: null,
@@ -1234,19 +1245,18 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       const text = buf?.text ?? '';
       const durationMs = buf !== null ? event.ts - buf.startedAt : null;
       const outputTokens = buf?.outputTokens ?? null;
-      // Aggregate at the turn boundary (not on `assistant:usage`):
-      // Anthropic streams cumulative counts, so reading the buffer's
-      // final snapshot avoids double-counting.
+      // Read the buffer's final usage snapshot (Anthropic streams
+      // cumulative counts). The REPL-cumulative token/cache totals are
+      // NOT folded here anymore — they're DB-derived via `stats:refresh`.
+      // We still derive `lastTurnContextTokens` (input + cache) for the
+      // context-occupancy field, which is a per-turn snapshot, not a
+      // running total.
       const input = buf?.inputTokens ?? 0;
       const cacheRead = buf?.cacheRead ?? 0;
       const cacheCreation = buf?.cacheCreation ?? 0;
-      const output = outputTokens ?? 0;
       const turnContext = input + cacheRead + cacheCreation;
       const status: StatusState = {
         ...state.status,
-        sessionTotalTokens: state.status.sessionTotalTokens + turnContext + output,
-        // Cache subset of the grand total, tracked for its own footer chip.
-        sessionCacheTokens: state.status.sessionCacheTokens + cacheRead + cacheCreation,
         // Fallback to the prior value when the turn yielded no usage
         // event (provider edge case) so the chip doesn't flicker to 0%.
         lastTurnContextTokens: turnContext > 0 ? turnContext : state.status.lastTurnContextTokens,

@@ -42,7 +42,7 @@ import {
   loadHistory,
   searchHistory,
 } from '../storage/history.ts';
-import { closeDb } from '../storage/index.ts';
+import { closeDb, computeUsageStats } from '../storage/index.ts';
 import { createContextPinsStore } from '../storage/repos/context-pins.ts';
 import { completeSession, createSession } from '../storage/repos/sessions.ts';
 import { settleRunningSubagentHandles } from '../storage/repos/subagent-handles.ts';
@@ -922,6 +922,33 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     replSessionIdSet.add(id);
     replSessionIdOrder.push(id);
   };
+  // Push DB-derived usage totals to the footer's cost/token/cache chips.
+  // Recomputed over the REPL's whole session tree (incl. subagents) at
+  // each turn boundary and on boot/resume, so the chips are consistent,
+  // tree-complete, and resume-correct — the reducer SETS, never sums.
+  // Cheap aggregate at turn cadence; never per-frame.
+  //
+  // Best-effort: this is display-only work invoked from the critical
+  // turn-completion / playbook-dispatch paths. A DB hiccup (closed-db
+  // shutdown race, transient read error) must NOT throw out of those
+  // handlers — that would skip the inbox drain or turn a successful
+  // playbook run into a dispatch error. Swallow like `safeEmit` does;
+  // the next boundary refreshes the chips anyway.
+  const emitStatsRefresh = (): void => {
+    if (replSessionIdOrder.length === 0) return;
+    try {
+      const s = computeUsageStats(db, replSessionIdOrder);
+      bus.emit({
+        type: 'stats:refresh',
+        ts: now(),
+        costUsd: s.costUsd,
+        totalTokens: s.tokensIn + s.tokensOut + s.cacheRead + s.cacheCreation,
+        cacheTokens: s.cacheRead + s.cacheCreation,
+      });
+    } catch {
+      // Display refresh is non-critical; never derail the caller.
+    }
+  };
   // Seed the tracking list with the resumed id so REPL-wide
   // aggregation spans both the resumed chain AND new turns added in
   // this boot. Without this seed, only runs started in the current
@@ -1243,6 +1270,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       cumulative.costUsd += event.result.costUsd;
       cumulative.steps += event.result.steps;
       cumulative.turns += 1;
+      // Footer totals: recompute from the DB now that this turn's
+      // messages + session cost (and any subagent rows) are persisted.
+      emitStatsRefresh();
       // INBOX boundary (§2.1/§2.3): the turn ended — drain anything
       // queued during it as the next user turn. Even degraded ends
       // (error/timeout/abort) route through session_finished and drain
@@ -2299,6 +2329,8 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // into the same DB at execution time; we just need its
         // session id to find them again.
         trackReplSessionId(result.sessionId);
+        // Footer totals: fold the playbook child's spend/tokens in.
+        emitStatsRefresh();
         return result;
       } finally {
         // Drop the gate even on throw — a stuck `playbookRunning`
@@ -3337,6 +3369,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         message: `(resumed session ${resumedSessionId.slice(0, 8)} — scrollback could not be rendered; LLM still has the context)`,
       });
     }
+    // Seed the footer's cost/token/cache chips from the resumed
+    // session's persisted totals so they show prior spend immediately,
+    // before any new turn runs. Fresh (non-resume) boots no-op here
+    // (empty tracking list) and start the chips at zero.
+    emitStatsRefresh();
   }
 
   // Initial frame: emit one input:update with the empty buffer so the

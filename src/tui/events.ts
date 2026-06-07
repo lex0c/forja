@@ -627,6 +627,21 @@ export type StepBudgetEvent = BaseEvent & {
   maxCostUsd?: number;
 };
 
+// DB-derived usage totals for the footer's cost/token/cache chips.
+// REPL-originated (not from the harness adapter): the REPL recomputes
+// `computeUsageStats` over its session tree at each turn boundary and on
+// boot/resume, then emits this so the reducer SETS the footer fields
+// (absolute values, not deltas). Single source of truth = the persisted
+// DB, so the chips are tree-wide (incl. subagents) and resume-correct.
+// `totalTokens` is the grand total (compute + cache); the footer renders
+// `totalTokens - cacheTokens` as the non-cache chip beside `cacheTokens`.
+export type StatsRefreshEvent = BaseEvent & {
+  type: 'stats:refresh';
+  costUsd: number;
+  totalTokens: number;
+  cacheTokens: number;
+};
+
 // Provider call lifecycle bracket — covers the gap between
 // `step_start` (harness asked the provider for the next turn) and
 // the first provider event landing on the renderer (text_delta /
@@ -878,6 +893,7 @@ export type UIEvent =
   | BgUpdateEvent
   | BgEndEvent
   | StepBudgetEvent
+  | StatsRefreshEvent
   | ProviderWaitingStartEvent
   | ProviderWaitingEndEvent
   | CompactingStartEvent
