@@ -4,6 +4,7 @@ import { migrate } from '../../src/storage/migrate.ts';
 import {
   appendCompactionEvent,
   listCompactionEventsBySession,
+  sumCompactionUsage,
 } from '../../src/storage/repos/compaction-events.ts';
 import { createSession } from '../../src/storage/repos/sessions.ts';
 
@@ -65,6 +66,63 @@ describe('compaction-events repo', () => {
     expect(r?.freed_bytes).toBeNull();
     expect(r?.elided_ids).toBeNull();
     expect(r?.tokens_before).toBeNull(); // forced compaction has no trigger count
+    db.close();
+  });
+
+  test('round-trips the billed call usage (migration 073 columns)', () => {
+    const { db, sid } = freshSession();
+    appendCompactionEvent(db, {
+      sessionId: sid,
+      strategy: 'llm',
+      foldedCount: 10,
+      beforeHash: 'a',
+      afterHash: 'b',
+      callUsage: { tokensIn: 1200, tokensOut: 300, cacheRead: 800, cacheCreation: 100 },
+      recordedAt: 1,
+    });
+    const r = listCompactionEventsBySession(db, sid)[0];
+    expect(r?.call_tokens_in).toBe(1200);
+    expect(r?.call_tokens_out).toBe(300);
+    expect(r?.call_cache_read).toBe(800);
+    expect(r?.call_cache_creation).toBe(100);
+    db.close();
+  });
+
+  test('sumCompactionUsage sums across rows; absent callUsage COALESCEs to 0', () => {
+    const { db, sid } = freshSession();
+    // LLM compaction with billed usage.
+    appendCompactionEvent(db, {
+      sessionId: sid,
+      strategy: 'llm',
+      foldedCount: 5,
+      beforeHash: 'a',
+      afterHash: 'b',
+      callUsage: { tokensIn: 1000, tokensOut: 200, cacheRead: 500, cacheCreation: 50 },
+      recordedAt: 1,
+    });
+    // Relevance-only compaction: no provider call → no callUsage → NULL cols.
+    appendCompactionEvent(db, {
+      sessionId: sid,
+      strategy: 'relevance',
+      foldedCount: 3,
+      beforeHash: 'b',
+      afterHash: 'c',
+      elidedIds: ['t1'],
+      recordedAt: 2,
+    });
+    const u = sumCompactionUsage(db, sid);
+    expect(u).toEqual({ tokensIn: 1000, tokensOut: 200, cacheRead: 500, cacheCreation: 50 });
+    db.close();
+  });
+
+  test('sumCompactionUsage returns zeros for a session with no compaction', () => {
+    const { db, sid } = freshSession();
+    expect(sumCompactionUsage(db, sid)).toEqual({
+      tokensIn: 0,
+      tokensOut: 0,
+      cacheRead: 0,
+      cacheCreation: 0,
+    });
     db.close();
   });
 

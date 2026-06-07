@@ -21,6 +21,7 @@
 // shared/repeat ids and defends against a corrupt self-referential row.
 
 import type { DB } from '../db.ts';
+import { sumCompactionUsage } from './compaction-events.ts';
 import { sumMessageUsage } from './messages.ts';
 import { getSession, listChildSessions } from './sessions.ts';
 
@@ -64,11 +65,18 @@ export const computeUsageStats = (db: DB, rootSessionIds: readonly string[]): Us
     stats.sessionCount += 1;
     stats.costUsd += session.totalCostUsd;
     if (!session.usageComplete) stats.usageComplete = false;
+    // Tokens come from TWO sources: the per-turn `messages` rows, plus the
+    // compaction provider calls. Compaction writes no `messages` row but
+    // bills tokens (folded into total_cost_usd), so summing only messages
+    // would report cost that includes compaction and tokens that omit it —
+    // inconsistent. Cost is NOT re-added from compaction_events: it already
+    // lives in total_cost_usd (double-counting it would inflate the cost).
     const usage = sumMessageUsage(db, id);
-    stats.tokensIn += usage.tokensIn;
-    stats.tokensOut += usage.tokensOut;
-    stats.cacheRead += usage.cacheRead;
-    stats.cacheCreation += usage.cacheCreation;
+    const compactionUsage = sumCompactionUsage(db, id);
+    stats.tokensIn += usage.tokensIn + compactionUsage.tokensIn;
+    stats.tokensOut += usage.tokensOut + compactionUsage.tokensOut;
+    stats.cacheRead += usage.cacheRead + compactionUsage.cacheRead;
+    stats.cacheCreation += usage.cacheCreation + compactionUsage.cacheCreation;
     for (const child of listChildSessions(db, id)) visit(child.id);
   };
 

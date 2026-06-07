@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, test } from 'bun:test';
 import { openMemoryDb } from '../../../src/storage/db.ts';
 import type { DB } from '../../../src/storage/db.ts';
 import { migrate } from '../../../src/storage/migrate.ts';
+import { appendCompactionEvent } from '../../../src/storage/repos/compaction-events.ts';
 import { appendMessage } from '../../../src/storage/repos/messages.ts';
 import {
   completeSession,
@@ -134,6 +135,48 @@ describe('computeUsageStats', () => {
     const s = computeUsageStats(db, [root.id, child.id]);
     expect(s.costUsd).toBeCloseTo(0.03, 9);
     expect(s.sessionCount).toBe(2);
+  });
+
+  test('includes compaction-call tokens (cost/token consistency across a compaction)', () => {
+    // The harness folds a compaction call's cost into total_cost_usd AND its
+    // tokens into usage, but writes no messages row for it. The aggregator
+    // must recover those tokens from compaction_events so the token totals
+    // line up with the cost (which already includes compaction).
+    const root = createSession(db, { model: 'm', cwd: '/p' });
+    updateSessionCost(db, root.id, 0.06); // includes the compaction call's cost
+    usage(root.id, { in: 100, out: 50, cacheRead: 0, cacheCreation: 0 }); // turn messages
+    // A compaction LLM call billed 2000 in / 400 out / 800 cache-read.
+    appendCompactionEvent(db, {
+      sessionId: root.id,
+      strategy: 'llm',
+      foldedCount: 8,
+      beforeHash: 'a',
+      afterHash: 'b',
+      callUsage: { tokensIn: 2000, tokensOut: 400, cacheRead: 800, cacheCreation: 0 },
+      recordedAt: 1,
+    });
+    const s = computeUsageStats(db, [root.id]);
+    // messages (100/50/0/0) + compaction (2000/400/800/0)
+    expect(s.tokensIn).toBe(2100);
+    expect(s.tokensOut).toBe(450);
+    expect(s.cacheRead).toBe(800);
+  });
+
+  test('relevance-only compaction contributes no tokens (no provider call)', () => {
+    const root = createSession(db, { model: 'm', cwd: '/p' });
+    usage(root.id, { in: 10, out: 5, cacheRead: 0, cacheCreation: 0 });
+    appendCompactionEvent(db, {
+      sessionId: root.id,
+      strategy: 'relevance',
+      foldedCount: 2,
+      beforeHash: 'a',
+      afterHash: 'b',
+      elidedIds: ['t1'],
+      recordedAt: 1,
+    });
+    const s = computeUsageStats(db, [root.id]);
+    expect(s.tokensIn).toBe(10);
+    expect(s.tokensOut).toBe(5);
   });
 
   test('completeSession-written cost is picked up (not just updateSessionCost)', () => {

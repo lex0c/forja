@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-07] Tokens de compaction sumiam dos totais (custo incluía, tokens não) — fix com persistência
+
+**Bug (review do agregador):** quando a sessão compacta (auto ou `/compact`), o harness folda a chamada de compaction no custo (`totalCostUsd` → `sessions.total_cost_usd`) E nos tokens (`totalUsage`, in-memory) — mas `compact()` não escreve message row (design, SESSION.md) e a `compaction_events` (072) só guardava `tokens_before`/`tokens_after` (estimativas de *contexto*, não a chamada). Logo os tokens da compaction não existiam em lugar consultável. O `computeUsageStats` puxava custo de `total_cost_usd` (com compaction) e tokens de `messages` (sem compaction) → `/stats`/footer mostravam custo e tokens **inconsistentes**, subcontando tokens em qualquer sessão que cruzou compaction, e `usageComplete` ficava `true` (não flagava).
+
+**Fix (persistir + somar):** migration **073** adiciona `call_tokens_in/out`, `call_cache_read/creation` na `compaction_events` (usage faturado da chamada de compaction; nomeadas `call_*` pra não confundir com `tokens_before/after`). Writer: `appendCompactionEvent`/`AppendCompactionEventInput` ganham `callUsage`; os dois callers passam — `loop.ts` (auto) e `compact.ts` (`/compact` manual). Relevance-only não tem provider call → `callUsage` ausente → NULL → COALESCE 0. Novo `sumCompactionUsage(db, sessionId)`; o `computeUsageStats` soma `messages` + `compaction_events` nos tokens. **Custo continua só de `total_cost_usd`** (não re-soma de compaction_events — evita double-count). Agora tokens e custo concordam através da compaction.
+
+**Provado:** `compaction-events.test.ts` (+3: round-trip de `callUsage`, `sumCompactionUsage` com COALESCE, zeros) + `stats.test.ts` (+2: tokens de compaction incluídos = invariante de consistência; relevance-only contribui 0). typecheck + lint limpos; `tests/storage/` 844/844, `compact.test.ts` 9/9, `harness/compaction.test.ts` 38/38.
+
 ## [2026-06-07] `/stats` + agregador de uso DB-derived (Estágio 1 de "footer confiável no resume")
 
 **Decisão de arquitetura (operador):** as infos de uso (custo/tokens/cache) precisam ser confiáveis e consistentes na sessão E no resume, contabilizando subagentes. Entre "continuar somando no REPL (in-memory)" e "derivar do DB", escolhido **DB-derive** — é tree-wide e resume-correto por construção (a sessão do REPL é UMA linha que cresce; turnos 2+ reusam via `liveContext`/`loop.ts:909-922`, então `total_cost_usd` já carrega o lifetime e os subagentes penduram via `parent_session_id`). O `cumulative` in-memory do `/cost` soma `result.costUsd` parent-self e **perde subagente** — o DB-walk não.

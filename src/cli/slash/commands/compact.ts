@@ -115,9 +115,13 @@ export const compactCommand: SlashCommand = {
         if (acct.usageIncomplete) {
           markSessionUsageIncomplete(ctx.db, live.sessionId);
         }
-        // Audit row (compaction_events) for parity with the auto path. tokens
-        // omitted — a forced /compact has no trigger count. The shared recorder
-        // hashes afterHash, skips a no-op 'skipped', and logs (not swallows) a
+        // Audit row (compaction_events) for parity with the auto path.
+        // tokens_before omitted — a forced /compact has no trigger count.
+        // callUsage records the billed summary-call usage so the usage
+        // aggregator's token totals account for this compaction (its cost is
+        // already folded into the session row above); zeroed on the
+        // relevance-only path (no provider call). The shared recorder hashes
+        // afterHash, skips a no-op 'skipped', and logs (not swallows) a
         // persist failure.
         recordCompactionEvent(ctx.db, {
           sessionId: live.sessionId,
@@ -125,6 +129,12 @@ export const compactCommand: SlashCommand = {
           messagesAfter: live.getMessages(),
           strategy: result.strategy,
           foldedCount: result.foldedCount,
+          callUsage: {
+            tokensIn: result.usage.input,
+            tokensOut: result.usage.output,
+            cacheRead: result.usage.cache_read,
+            cacheCreation: result.usage.cache_creation,
+          },
           ...(relevanceElided !== null && relevanceElided.elidedCount > 0
             ? { freedBytes: relevanceElided.freedBytes, elidedIds: relevanceElided.elidedIds }
             : {}),

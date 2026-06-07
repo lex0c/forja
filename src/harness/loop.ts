@@ -2359,6 +2359,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           elidedIds?: readonly string[];
           summary?: string;
           reason?: string;
+          callUsage?: {
+            tokensIn: number;
+            tokensOut: number;
+            cacheRead: number;
+            cacheCreation: number;
+          };
         }): void =>
           recordCompactionEvent(config.db, {
             sessionId,
@@ -2453,6 +2459,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           strategy: compaction.strategy,
           foldedCount: compaction.foldedCount,
           tokensAfter: estimateNow(),
+          // Billed usage of the summary call, so the aggregator's token
+          // totals account for compaction (cost already does, via
+          // sessions.total_cost_usd). compaction.usage is zeroed on the
+          // relevance-only path (no provider call).
+          callUsage: {
+            tokensIn: compaction.usage.input,
+            tokensOut: compaction.usage.output,
+            cacheRead: compaction.usage.cache_read,
+            cacheCreation: compaction.usage.cache_creation,
+          },
           ...(relevanceAudit !== undefined
             ? { freedBytes: relevanceAudit.freedBytes, elidedIds: relevanceAudit.elidedIds }
             : {}),

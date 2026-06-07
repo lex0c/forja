@@ -70,6 +70,7 @@ import { migration069MemoryEventsSeedSource } from './069-memory-events-seed-sou
 import { migration070SubagentRunsApprovalPosture } from './070-subagent-runs-approval-posture.ts';
 import { migration071ContextPinsModelCreatedBy } from './071-context-pins-model-created-by.ts';
 import { migration072CompactionEvents } from './072-compaction-events.ts';
+import { migration073CompactionEventsCallUsage } from './073-compaction-events-call-usage.ts';
 
 export interface Migration {
   id: number;
@@ -150,4 +151,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration070SubagentRunsApprovalPosture,
   migration071ContextPinsModelCreatedBy,
   migration072CompactionEvents,
+  migration073CompactionEventsCallUsage,
 ];
