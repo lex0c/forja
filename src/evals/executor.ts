@@ -10,7 +10,12 @@ import {
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
 import { type BootstrapInput, bootstrap } from '../cli/bootstrap.ts';
-import { type HarnessEvent, type HarnessResult, runAgent } from '../harness/index.ts';
+import {
+  type CompactionStrategy,
+  type HarnessEvent,
+  type HarnessResult,
+  runAgent,
+} from '../harness/index.ts';
 import { closeDb } from '../storage/db.ts';
 import type { EvalCase, EvalCaseResult, EvalSummary, ExpectationOutcome } from './types.ts';
 
@@ -43,7 +48,7 @@ interface ToolDecisionRecord {
 }
 
 interface CompactionRecord {
-  strategy: 'llm' | 'fallback' | 'skipped';
+  strategy: CompactionStrategy;
 }
 
 // Default project policy injected when the case (or its fixture)
@@ -408,6 +413,9 @@ export const executeCase = async (
                 : {}),
               ...(caseDef.budget.compactionPreserveTail !== undefined
                 ? { compactionPreserveTail: caseDef.budget.compactionPreserveTail }
+                : {}),
+              ...(caseDef.budget.compactionRelevance !== undefined
+                ? { compactionRelevance: caseDef.budget.compactionRelevance }
                 : {}),
             },
           }

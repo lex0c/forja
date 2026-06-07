@@ -14,6 +14,7 @@ import type { SubagentSet } from '../subagents/load.ts';
 import type { TelemetrySink } from '../telemetry/index.ts';
 import type { TodoItem, TodoStore } from '../todo/index.ts';
 import type { ClarifyBridgeRequest, ClarifyBridgeResponse, ToolRegistry } from '../tools/index.ts';
+import type { RelevanceAudit } from './compaction-relevance.ts';
 import { type ForjaEffort, effortBudgetPatch } from './effort.ts';
 import type { SessionContext } from './session-context.ts';
 
@@ -154,7 +155,7 @@ export type HarnessEvent =
     }
   | {
       type: 'compaction_finished';
-      strategy: 'llm' | 'fallback' | 'skipped';
+      strategy: 'llm' | 'fallback' | 'skipped' | 'relevance';
       foldedCount: number;
       durationMs: number;
       // Usage and cost the compaction call itself incurred. The
@@ -164,6 +165,12 @@ export type HarnessEvent =
       usage: UsageInfo;
       costUsd: number;
       reason?: string;
+      // Populated whenever the relevance pre-pass ran this compaction
+      // (CONTEXT_TUNING §6): which tool_results were pointered + counts,
+      // for "why did this drop out of context?" auditability (principle
+      // 7). Present on a 'relevance' finish AND on an 'llm' finish that
+      // followed a partial relevance pass.
+      relevance?: RelevanceAudit;
     }
   | {
       // Emitted ONCE per step, after the harness has decided that
@@ -462,6 +469,14 @@ export interface RunBudget {
   // module walks back one position. preserveTail=0 still preserves
   // the trailing assistant + its tool_result for the same reason.
   compactionPreserveTail: number;
+  // Opt-in: run the relevance pre-pass (`compaction-relevance.ts`)
+  // before the LLM summary — cheaply pointer-elide low-goal-relevance
+  // tool_result bodies, falling through to the LLM only when that frees
+  // too little. Default-off so existing budgets + the eval baseline keep
+  // verbatim behavior; this is the on-switch the eval toggles. Optional
+  // (unlike the required tuning knobs above) because it is a feature
+  // flag — absent ⇒ off.
+  compactionRelevance?: boolean;
   // Hard cap on total spend for this run, in USD. AGENTIC_CLI.md §5
   // declares a default of 5 — cost is the engagement gate; step
   // count (`maxSteps`) is the runaway-loop backstop. Three states:
@@ -544,6 +559,7 @@ export const DEFAULT_BUDGET: RunBudget = {
   // against the provider capability via `resolveMaxOutputTokens`.
   compactionThreshold: 0.7,
   compactionPreserveTail: 3,
+  compactionRelevance: false,
   // Spec-declared default cost cap (AGENTIC_CLI.md §5 line 333).
   // Operator opts out via `/budget cost off`, which writes an
   // explicit `undefined` so the spread-merge propagates the

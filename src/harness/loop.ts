@@ -62,7 +62,12 @@ import type { ToolContext } from '../tools/index.ts';
 import type { SpawnSubagentArgs, SpawnSubagentResult } from '../tools/types.ts';
 import { StepStallError, abortableIterable, stallWatchdog } from './abortable.ts';
 import { CollectStepError, type CollectedToolUse, collectStep } from './collect.ts';
-import { accountCompaction } from './compaction.ts';
+import type { RelevanceAudit } from './compaction-relevance.ts';
+import {
+  accountCompaction,
+  compactionTriggerTokens,
+  relevanceVerbatimBudgetBytes,
+} from './compaction.ts';
 import { resolveProviderEffort } from './effort.ts';
 import { invokeTool } from './invoke-tool.ts';
 import { MAX_RESUME_MESSAGES } from './resume.ts';
@@ -2290,7 +2295,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           ...(tools.length > 0 ? { tools } : {}),
         });
         const contextWindow = config.provider.capabilities.context_window;
-        const triggerAt = budget.compactionThreshold * contextWindow;
+        const triggerAt = compactionTriggerTokens(budget.compactionThreshold, contextWindow);
         // Need goal + something-to-fold + an assistant boundary for the tail;
         // shorter histories make compactMessages skip (and emit noisy events).
         if (!(promptTokens > triggerAt && ctx.length >= budget.compactionPreserveTail + 3)) {
@@ -2328,6 +2333,53 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           contextWindow,
         });
         const compactStart = Date.now();
+
+        // Relevance pre-pass (opt-in): cheaply pointer-elide low-goal-
+        // relevance tool_result bodies (NO provider call). If that alone
+        // drops the prompt back under the trigger, skip the billed LLM
+        // summary entirely. Token-driven — the gate is the real threshold,
+        // not a byte heuristic. Elided bodies stay retrievable via
+        // retrieve_context (session view). No spin: a re-trigger finds the
+        // now-pointered bodies ineligible and falls through to the LLM.
+        let relevanceAudit: RelevanceAudit | undefined;
+        if (budget.compactionRelevance === true) {
+          // Verbatim budget derived from the trigger (shared helper, not a
+          // magic constant) — see relevanceVerbatimBudgetBytes.
+          const elide = ctx.relevanceElide({
+            verbatimBudgetBytes: relevanceVerbatimBudgetBytes(triggerAt),
+            preserveTail: budget.compactionPreserveTail,
+          });
+          if (elide !== null && elide.elidedCount > 0) {
+            relevanceAudit = {
+              elidedCount: elide.elidedCount,
+              keptCount: elide.keptCount,
+              freedBytes: elide.freedBytes,
+              elidedIds: elide.elidedIds,
+            };
+            const tokensAfterElide = estimatePromptTokens([...ctx.getMessages()], {
+              ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
+              ...(tools.length > 0 ? { tools } : {}),
+            });
+            if (tokensAfterElide <= triggerAt) {
+              // Relevance alone got us under the threshold — done, no LLM.
+              safeEmit(config.onEvent, {
+                type: 'compaction_finished',
+                strategy: 'relevance',
+                foldedCount: elide.elidedCount,
+                durationMs: Date.now() - compactStart,
+                usage: emptyUsage(),
+                costUsd: 0,
+                reason: `relevance-elide: ${elide.elidedCount} tool_results pointered, ${elide.freedBytes}B freed`,
+                relevance: relevanceAudit,
+              });
+              return costCapDetailIfExceeded();
+            }
+          }
+        }
+
+        // Still over the threshold (relevance disabled, freed nothing, or
+        // freed too little): run the billed LLM summary on the — possibly
+        // already gated — history.
         const compaction = await ctx.compact(config.provider, {
           preserveTail: budget.compactionPreserveTail,
           signal,
@@ -2348,6 +2400,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           usage: compaction.usage,
           costUsd: acct.costUsd,
           ...(compaction.reason !== undefined ? { reason: compaction.reason } : {}),
+          ...(relevanceAudit !== undefined ? { relevance: relevanceAudit } : {}),
         };
         safeEmit(config.onEvent, finishedEvent);
         return costCapDetailIfExceeded();

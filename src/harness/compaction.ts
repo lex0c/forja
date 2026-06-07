@@ -60,7 +60,12 @@ export interface CompactionOptions {
   pinnedBlock?: string;
 }
 
-export type CompactionStrategy = 'llm' | 'fallback' | 'skipped';
+// Single source for the strategy names — the runtime array drives the
+// eval loader's allowlist (`evals/loader.ts`, mirroring its VALID_EXIT_REASONS
+// pattern) and the type is derived from it, so adding a strategy here
+// can't leave a hand-rolled mirror silently rejecting it.
+export const COMPACTION_STRATEGIES = ['llm', 'fallback', 'skipped', 'relevance'] as const;
+export type CompactionStrategy = (typeof COMPACTION_STRATEGIES)[number];
 
 export interface CompactionResult {
   messages: ProviderMessage[];
@@ -299,7 +304,7 @@ const stripPriorSummary = (text: string): string => text.replace(SUMMARY_BLOCK_R
 // initial user prompt, but compaction may rewrite messages[0] into a
 // wrapped goal that already carries a summary; subsequent compactions
 // must see the ORIGINAL goal, not the prior summary.
-const goalText = (goal: ProviderMessage): string => {
+export const goalText = (goal: ProviderMessage): string => {
   const raw =
     typeof goal.content === 'string'
       ? goal.content
@@ -368,6 +373,42 @@ const wrapGoalWithSummary = (
   return { role: 'user', content: `${goalText(goal)}\n\n${withPins}` };
 };
 
+// The token count at which compaction fires: a fraction of the provider
+// context window (CONTEXT_TUNING §6). One source for the loop's trigger
+// check, the `/compact` command, and the relevance verbatim-budget
+// derivation below — so the trigger definition can't drift between
+// callers (e.g. if it ever gains a clamp or per-provider floor).
+export const compactionTriggerTokens = (threshold: number, contextWindow: number): number =>
+  threshold * contextWindow;
+
+// Verbatim byte budget for the relevance pre-pass, derived from the
+// compaction trigger (CONTEXT_TUNING §6) rather than a magic constant:
+// keep up to ~30% of the threshold as verbatim tool_result bytes
+// (~4 bytes/token is a coarse proxy). Shared by the loop's auto path and
+// the `/compact` command so the heuristic the eval tunes lives in ONE
+// place, not duplicated per caller.
+export const relevanceVerbatimBudgetBytes = (triggerAtTokens: number): number =>
+  Math.floor(triggerAtTokens * 0.3 * 4);
+
+// Walk the tail boundary back to the nearest assistant message so the
+// preserved tail starts at an assistant (keeps tool_use → tool_result
+// pairs intact; providers reject orphaned tool_results). Returns the
+// aligned tailStart, or null when no assistant sits between the goal and
+// the requested tail (pathological history). Shared by compactMessages
+// (the fold tail) and SessionContext.relevanceElide (the preserved tail)
+// so both paths agree on what "the last K turns" means.
+export const alignTailStartToAssistant = (
+  messages: ProviderMessage[],
+  safeTail: number,
+): number | null => {
+  let tailStart = messages.length - safeTail;
+  while (tailStart > 1 && messages[tailStart]?.role !== 'assistant') {
+    tailStart -= 1;
+  }
+  if (tailStart < 1 || messages[tailStart]?.role !== 'assistant') return null;
+  return tailStart;
+};
+
 export const compactMessages = async (
   provider: Provider,
   messages: ProviderMessage[],
@@ -414,17 +455,13 @@ export const compactMessages = async (
   // we're merging into the goal), the next provider call sees an
   // orphan tool_result and rejects with 400.
   //
-  // Walk back from the requested boundary to the nearest assistant.
-  // The summary is merged into the goal (user-role), so the resulting
-  // [wrappedGoal_user, tail_starts_with_assistant, ...] sequence has
-  // clean user→assistant→user alternation regardless of preserveTail
-  // parity. Over-preserving by one position when the boundary lands
-  // on a user is the price of correctness.
-  let tailStart = messages.length - safeTail;
-  while (tailStart > 1 && messages[tailStart]?.role !== 'assistant') {
-    tailStart -= 1;
-  }
-  if (tailStart < 1 || messages[tailStart]?.role !== 'assistant') {
+  // Align the tail to an assistant boundary (shared helper): the summary
+  // is merged into the goal (user-role), so [wrappedGoal_user,
+  // tail_starts_with_assistant, ...] keeps clean user→assistant→user
+  // alternation regardless of preserveTail parity. Over-preserving by one
+  // position when the boundary lands on a user is the price of correctness.
+  const tailStart = alignTailStartToAssistant(messages, safeTail);
+  if (tailStart === null) {
     // Pathological history shape — no assistant message between the
     // goal and the requested tail. Refuse rather than emit a
     // malformed prompt.

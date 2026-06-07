@@ -1,7 +1,14 @@
 import type { Provider, ProviderContentBlock, ProviderMessage } from '../providers/index.ts';
 import type { DB } from '../storage/db.ts';
 import { appendMessage, listMessageTailBySession } from '../storage/repos/messages.ts';
-import { type CompactionOptions, type CompactionResult, compactMessages } from './compaction.ts';
+import { type RelevanceElideResult, relevanceElideMiddle } from './compaction-relevance.ts';
+import {
+  type CompactionOptions,
+  type CompactionResult,
+  alignTailStartToAssistant,
+  compactMessages,
+  goalText,
+} from './compaction.ts';
 import {
   ALIGNMENT_FETCH_MARGIN,
   MAX_RESUME_MESSAGES,
@@ -218,6 +225,42 @@ export class SessionContext {
     if (result.messages !== this.messages) {
       this.messages.length = 0;
       this.messages.push(...result.messages);
+    }
+    return result;
+  }
+
+  // Cheap relevance pre-pass — NO provider call. Pointer-elide
+  // low-goal-relevance tool_result bodies in the middle span (between
+  // the goal and the last `preserveTail` messages), keeping goal + tail
+  // verbatim. Rewrites the live array in place when anything was elided.
+  // The loop runs this BEFORE the billed LLM compaction and re-checks
+  // tokens (loop.ts maybeCompact); /compact runs it the same way. The
+  // decision is clock-free (recency by position), so replay reproduces
+  // the same partition. Returns null when there's nothing to elide
+  // (history too short, or no middle after the tail).
+  relevanceElide(opts: {
+    verbatimBudgetBytes: number;
+    preserveTail: number;
+  }): RelevanceElideResult | null {
+    const safeTail = Math.max(0, opts.preserveTail);
+    if (this.messages.length < safeTail + 2) return null;
+    const goal = this.messages[0];
+    if (goal === undefined) return null;
+    // Same assistant-aligned tail boundary compactMessages uses, so the
+    // preserved tail is identical whether this turn ends up on the
+    // relevance path or falls through to the LLM fold.
+    const tailStart = alignTailStartToAssistant(this.messages, safeTail);
+    if (tailStart === null) return null;
+    const middle = this.messages.slice(1, tailStart);
+    if (middle.length === 0) return null;
+    const result = relevanceElideMiddle(middle, {
+      goalText: goalText(goal),
+      verbatimBudgetBytes: opts.verbatimBudgetBytes,
+    });
+    if (result.elidedCount > 0) {
+      const tail = this.messages.slice(tailStart);
+      this.messages.length = 0;
+      this.messages.push(goal, ...result.middle, ...tail);
     }
     return result;
   }

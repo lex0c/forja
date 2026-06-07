@@ -434,8 +434,28 @@ expect:
       strategy: bogus
 `;
     expect(() => parseEvalCase(yaml, '/tmp/c.yaml')).toThrow(
-      /strategy must be one of: fallback, llm, skipped/,
+      /strategy must be one of: fallback, llm, relevance, skipped/,
     );
+  });
+
+  test('accepts compaction_triggered with strategy: relevance', () => {
+    // Regression for the review fix: the loader's allowlist is driven off
+    // the harness COMPACTION_STRATEGIES tuple, so the relevance strategy is
+    // assertable in YAML (the whole point of the eval-first feature).
+    const yaml = `
+name: x
+prompt: y
+expect:
+  - compaction_triggered:
+      min_count: 1
+      strategy: relevance
+`;
+    const parsed = parseEvalCase(yaml, '/tmp/c.yaml');
+    expect(parsed.expect).toContainEqual({
+      kind: 'compaction_triggered',
+      minCount: 1,
+      strategy: 'relevance',
+    });
   });
 });
 
