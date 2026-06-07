@@ -79,7 +79,11 @@ export const compactCommand: SlashCommand = {
         // forced it; there is no token threshold to short-circuit on. The
         // snapshot above predates this, so a failure rewinds both.
         let relevanceElided: RelevanceElideResult | null = null;
-        if (budget.compactionRelevance === true) {
+        // Gated on memoryRegistry like the auto path: an elided body is
+        // recoverable only via retrieve_context, which the harness wires only
+        // when memoryRegistry is present. Without it, skip the pre-pass and let
+        // the forced LLM fold keep a summary instead of stranding the body.
+        if (budget.compactionRelevance === true && ctx.baseConfig.memoryRegistry !== undefined) {
           const triggerAt = compactionTriggerTokens(
             budget.compactionThreshold,
             ctx.baseConfig.provider.capabilities.context_window,

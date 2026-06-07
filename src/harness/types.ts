@@ -166,7 +166,7 @@ export type HarnessEvent =
       costUsd: number;
       reason?: string;
       // Populated whenever the relevance pre-pass ran this compaction
-      // (CONTEXT_TUNING §6): which tool_results were pointered + counts,
+      // (CONTEXT_TUNING §12): which tool_results were pointered + counts,
       // for "why did this drop out of context?" auditability (principle
       // 7). Present on a 'relevance' finish AND on an 'llm' finish that
       // followed a partial relevance pass.
@@ -472,9 +472,11 @@ export interface RunBudget {
   // Run the relevance pre-pass (`compaction-relevance.ts`) before the LLM
   // summary — cheaply pointer-elide low-goal-relevance tool_result bodies,
   // falling through to the LLM only when that frees too little. Default-ON
-  // (DEFAULT_BUDGET) after the eval A/B showed ~28% cheaper compaction with
-  // task success preserved; set `false` to opt out (e.g. an eval case that
-  // pins the pure-LLM path). Optional because it is a feature flag —
+  // (DEFAULT_BUDGET): the eval A/B preserved task success on every run, so the
+  // default is ON for measured safety + reversibility, NOT a fixed % win — the
+  // A/B cases differ in threshold, so it's suggestive, not controlled (see
+  // docs/BACKLOG.md). Set `false` to opt out (e.g. an eval case that pins the
+  // pure-LLM path). Optional because it is a feature flag —
   // absent ⇒ inherits the DEFAULT_BUDGET value (on).
   compactionRelevance?: boolean;
   // Hard cap on total spend for this run, in USD. AGENTIC_CLI.md §5
@@ -559,9 +561,9 @@ export const DEFAULT_BUDGET: RunBudget = {
   // against the provider capability via `resolveMaxOutputTokens`.
   compactionThreshold: 0.7,
   compactionPreserveTail: 3,
-  // Default-ON: the relevance pre-pass runs before the (billed) LLM
-  // summary and skips it entirely when it frees enough. A/B (CONTEXT_TUNING
-  // §6) showed ~28% cheaper compaction with task success preserved.
+  // Default-ON: the relevance pre-pass runs before the (billed) LLM summary and
+  // skips it entirely when it frees enough. The A/B preserved task success on
+  // every run (CONTEXT_TUNING §12); ON for safety, not a fixed % (see BACKLOG).
   compactionRelevance: true,
   // Spec-declared default cost cap (AGENTIC_CLI.md §5 line 333).
   // Operator opts out via `/budget cost off`, which writes an

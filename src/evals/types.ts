@@ -64,9 +64,9 @@ export interface EvalBudget {
   // literally. Lower values let compaction fire more
   // aggressively in narrow tests.
   compactionPreserveTail?: number;
-  // Enable the relevance compaction pre-pass for this case (default
-  // off, mirroring DEFAULT_BUDGET). Lets the eval measure relevance ON
-  // vs OFF on the same scenario.
+  // Enable the relevance compaction pre-pass for this case (default ON,
+  // mirroring DEFAULT_BUDGET). Lets the eval measure relevance ON vs OFF on
+  // the same scenario by pinning `false`.
   compactionRelevance?: boolean;
 }
 

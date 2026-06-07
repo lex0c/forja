@@ -1446,6 +1446,10 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
     }
 
     case 'compacting:end': {
+      // Stray / duplicate end (nothing open): no-op. Guards against an orphan
+      // event — e.g. a session boundary cleared `compacting` between start and
+      // end — arming contextStale via contextChanged when no compaction ran.
+      if (state.compacting === null) return { state, permanent: [] };
       // Close the chip. Mark the context stale ONLY when the compaction actually
       // changed it (contextChanged) — a no-op 'skipped' / "nothing to compact"
       // leaves lastTurnContextTokens accurate, so the footer % keeps showing.

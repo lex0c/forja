@@ -385,7 +385,7 @@ const wrapGoalWithSummary = (
 };
 
 // The token count at which compaction fires: a fraction of the provider
-// context window (CONTEXT_TUNING §6). One source for the loop's trigger
+// context window (CONTEXT_TUNING §12). One source for the loop's trigger
 // check, the `/compact` command, and the relevance verbatim-budget
 // derivation below — so the trigger definition can't drift between
 // callers (e.g. if it ever gains a clamp or per-provider floor).
@@ -393,7 +393,7 @@ export const compactionTriggerTokens = (threshold: number, contextWindow: number
   threshold * contextWindow;
 
 // Verbatim byte budget for the relevance pre-pass, derived from the
-// compaction trigger (CONTEXT_TUNING §6) rather than a magic constant:
+// compaction trigger (CONTEXT_TUNING §12) rather than a magic constant:
 // keep up to ~30% of the threshold as verbatim tool_result bytes
 // (~4 bytes/token is a coarse proxy). Shared by the loop's auto path and
 // the `/compact` command so the heuristic the eval tunes lives in ONE

@@ -798,6 +798,25 @@ describe('runAgent', () => {
     return r1.sessionId;
   };
 
+  // Minimal memoryRegistry so the relevance pre-pass's availability gate passes
+  // — the harness wires retrieve_context (the elided body's recovery path) only
+  // when memoryRegistry is present. The pre-pass never calls the registry; only
+  // its presence matters, so empty roots suffice.
+  const makeMemoryRegistry = async () => {
+    const { mkdirSync, mkdtempSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { createMemoryRegistry } = await import('../../src/memory/registry.ts');
+    const repo = mkdtempSync(join(tmpdir(), 'forja-relevance-mem-'));
+    const roots = {
+      user: join(repo, 'u'),
+      projectShared: join(repo, 's'),
+      projectLocal: join(repo, 'l'),
+    };
+    for (const d of Object.values(roots)) mkdirSync(d, { recursive: true });
+    return createMemoryRegistry({ roots });
+  };
+
   test('relevance pre-pass short-circuits a pin-free compaction (baseline for the pin guard)', async () => {
     const sessionId = await buildBigPinnableSession();
     const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
@@ -805,9 +824,11 @@ describe('runAgent', () => {
       capsOverride: { context_window: 8000 },
       budget: { compactionThreshold: 0.3, compactionPreserveTail: 1, compactionRelevance: true },
     });
+    const memoryRegistry = await makeMemoryRegistry();
     await runAgent({
       ...second.config,
       resumeFromSessionId: sessionId,
+      memoryRegistry,
       onEvent: (e) => events.push(e),
     });
     const fin = events.find((e) => e.type === 'compaction_finished');
@@ -829,13 +850,15 @@ describe('runAgent', () => {
         { text: 'turn done', stop_reason: 'end_turn' },
       ],
       {
-        capsOverride: { context_window: 1000 },
-        budget: { compactionThreshold: 0.5, compactionPreserveTail: 1, compactionRelevance: true },
+        capsOverride: { context_window: 8000 },
+        budget: { compactionThreshold: 0.3, compactionPreserveTail: 1, compactionRelevance: true },
       },
     );
+    const memoryRegistry = await makeMemoryRegistry();
     await runAgent({
       ...second.config,
       resumeFromSessionId: sessionId,
+      memoryRegistry,
       onEvent: (e) => events.push(e),
     });
     const fin = events.find((e) => e.type === 'compaction_finished');

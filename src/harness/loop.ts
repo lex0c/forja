@@ -2373,11 +2373,17 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // relevance tool_result bodies (NO provider call). If that alone
         // drops the prompt back under the trigger, skip the billed LLM
         // summary entirely. Token-driven — the gate is the real threshold,
-        // not a byte heuristic. Elided bodies stay retrievable via
-        // retrieve_context (session view). No spin: a re-trigger finds the
-        // now-pointered bodies ineligible and falls through to the LLM.
+        // not a byte heuristic. No spin: a re-trigger finds the now-pointered
+        // bodies ineligible and falls through to the LLM.
+        //
+        // Gated on memoryRegistry: an elided body is recoverable ONLY via
+        // retrieve_context (session view), which the harness wires only when
+        // memoryRegistry is present (effectiveMemoryRegistry below). Without it
+        // (headless / SDK runs) the pointer's "recover via retrieve_context"
+        // promise is empty — so skip the pre-pass and let the LLM fold keep a
+        // summary in context instead of stranding the body unreachable.
         let relevanceAudit: RelevanceAudit | undefined;
-        if (budget.compactionRelevance === true) {
+        if (budget.compactionRelevance === true && config.memoryRegistry !== undefined) {
           // Verbatim budget derived from the trigger (shared helper, not a
           // magic constant) — see relevanceVerbatimBudgetBytes.
           const elide = ctx.relevanceElide({
