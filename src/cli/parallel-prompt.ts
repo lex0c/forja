@@ -15,12 +15,15 @@
 // concrete subagent surface (task_async/task_await) keeps it
 // actionable rather than abstract.
 //
-// Composition: this preamble is prepended to whatever
-// system prompt the caller supplied. The model sees parallelism
-// guidance FIRST so it has it as background; the user-supplied
-// prompt appears AFTER as the more specific instruction layer. A
-// separator makes the boundary visible to the model and to anyone
-// debugging the prompt.
+// Composition (principal): in the assembled prompt this hint
+// lands AFTER `# Constraints` and BEFORE `# Tool ergonomics` — it
+// is NOT the outermost layer (identity, environment, response
+// surface, and constraints precede it). The subagent path
+// (`subagent-child.ts`) also prepends this hint, there as the
+// outermost layer over the playbook body. The authoritative
+// top-down layer order for both pipelines lives in
+// `docs/SYSTEM_PROMPT.md §2.1`; consult it rather than a per-file
+// recap, which is what drifted stale here.
 export const PARALLEL_HINT_PROMPT = `# Parallelism
 
 When the work is independent, emit MULTIPLE tool calls in a SINGLE turn — the harness dispatches them concurrently:
@@ -29,7 +32,7 @@ When the work is independent, emit MULTIPLE tool calls in a SINGLE turn — the 
 - For independent subtasks that need a full subagent run, use \`task_async\` to spawn several subagents in parallel, then \`task_await\` each to collect their outputs. Use \`task_cancel\` to abort one mid-run if its results are no longer needed.
 - Use \`task_list\` to recover handle ids you may have lost track of (long context, post-compaction, after a resume) or to confirm what is still in flight before fanning out more work.
 
-Sequential dispatch is the right call when each step depends on the previous one's result; parallel dispatch is the right call when steps are independent. Default to parallel for read-heavy exploration ("explore these N files", "search for X across the tree") and for fan-out subagent work ("review these three modules in parallel").`;
+Sequential dispatch is the right call when each step depends on the previous one's result; parallel dispatch is the right call when steps are independent — default to parallel for read-heavy exploration ("explore these N files", "search for X across the tree").`;
 
 // Compose the parallelism hint with a downstream (caller-
 // supplied) prompt. The hint goes FIRST as the background

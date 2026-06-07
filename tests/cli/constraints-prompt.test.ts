@@ -38,6 +38,28 @@ describe('constraints-prompt', () => {
     expect(CONSTRAINTS_PROMPT.toLowerCase()).toContain('contradictory goal');
   });
 
+  test('CONSTRAINTS_PROMPT carries the build-discipline constraint absorbed from task-discipline', () => {
+    // The build-discipline floor (no premature abstraction, no
+    // error handling for impossible cases, no narrative comments,
+    // no back-compat shims, edit-over-rewrite / smallest diff) was
+    // folded in here when the standalone `# Task discipline`
+    // section was dissolved (2026-06-07). Anchored so a future
+    // edit cannot quietly soften or drop it.
+    expect(CONSTRAINTS_PROMPT.toLowerCase()).toContain("build only what's asked");
+    expect(CONSTRAINTS_PROMPT.toLowerCase()).toContain('premature abstraction');
+    expect(CONSTRAINTS_PROMPT.toLowerCase()).toContain('back-compat');
+    expect(CONSTRAINTS_PROMPT.toLowerCase()).toContain('smallest correct diff');
+  });
+
+  test('CONSTRAINTS_PROMPT re-arms pin_context so the shipped tool is not dormant', () => {
+    // Regression guard: the only pin_context nudge used to live in
+    // the dissolved `# Task discipline` section. Without a prompt
+    // mention the tool ships but goes dormant (BACKLOG 2026-06-05),
+    // so the re-armed bullet is anchored here.
+    expect(CONSTRAINTS_PROMPT).toContain('pin_context');
+    expect(CONSTRAINTS_PROMPT.toLowerCase()).toContain('compaction');
+  });
+
   test('composeWithConstraints returns the section alone when downstream is undefined', () => {
     expect(composeWithConstraints(undefined)).toBe(CONSTRAINTS_PROMPT);
   });

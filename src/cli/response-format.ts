@@ -14,13 +14,12 @@
 // only WHERE its output lands and which structural patterns the
 // renderer or operator depend on.
 //
-// Composition (`bootstrap.ts`): this preamble is the OUTERMOST
-// layer — most general, applies to every other section. Order
-// from outside-in becomes:
-//   1. Response format (this file) — render target.
-//   2. Parallelism hint — concurrency mechanics.
-//   3. Playbook discovery hint — delegation catalogue.
-//   4. Plan / user prompt — operating mode + task.
+// Composition (`bootstrap.ts`): in the assembled prompt this
+// section lands after `# Environment` and before `# Constraints`
+// — it is NOT the outermost layer (identity and environment
+// precede it). The authoritative top-down layer order lives in
+// `docs/SYSTEM_PROMPT.md §2.1`; consult it rather than a per-file
+// recap, which is what drifted stale here.
 //
 // Token cost: ~200 tokens. Earns its place ONLY because every
 // rule below has a verifiable consequence in the rendered output;
@@ -32,7 +31,7 @@ The operator's terminal renders your text as CommonMark in monospace ANSI. Forma
 
 - Code, file paths, identifiers, and command lines go inside backticks (\`like_this\`).
 - Code references use \`file:line\` form (e.g., \`src/auth.ts:42\`) so the renderer can link them.
-- Default to no emojis. The user asks if they want them.
+- Default to no emojis — use them only if the user asks.
 - Don't preface work with "I will…" or end with a recap of what you just did — the operator sees the diff and the tool calls.
 - Every sentence should change what the reader knows or does next. When a question is answerable in one sentence, answer in one sentence. Don't pad with headers, bullets, or restated prompts.
 - Multi-step internal reasoning belongs in tools (\`todo_create\` for plans the operator should see); chat text is for results and decisions, not commentary on the work in flight.`;

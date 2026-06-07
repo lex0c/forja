@@ -98,7 +98,6 @@ import { composeWithPlaybookHint } from './playbook-prompt.ts';
 import { assembleProjectPointer, composeWithProjectPointer } from './project-pointer.ts';
 import { composeWithResponseFormat } from './response-format.ts';
 import { assembleSkillCatalogSection } from './skills-prompt.ts';
-import { composeWithTaskDiscipline } from './task-discipline.ts';
 import { composeWithToolErgonomics } from './tool-ergonomics-prompt.ts';
 
 // Re-export from the dependency-free home so existing import sites
@@ -867,19 +866,13 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     //       (CommonMark in monospace ANSI, file:line refs,
     //       no-emoji default, structural padding bans) per
     //       ANTI_PATTERNS.md §1.3.
-    //    7. Task discipline — behavioral norms (prefer editing,
-    //       no premature abstractions, WHY-only comments, no
-    //       half-finished work). Most-general operational
-    //       framing; sits above response-format because it
-    //       governs WHAT the model writes, while response-format
-    //       governs HOW it formats output.
-    //    8. Environment block — situational anchor: cwd, OS,
+    //    7. Environment block — situational anchor: cwd, OS,
     //       model, today's date, git context. Date in this
     //       section invalidates cache once per UTC day
     //       (acceptable per CONTEXT_TUNING §3.2; the
     //       alternative — placeholder + post-cache substitution
     //       — is not supported by Anthropic's API).
-    //    9. Identity / role marker — sits OUTERMOST so it lands
+    //    8. Identity / role marker — sits OUTERMOST so it lands
     //       first (CONTEXT_TUNING §1.1: identity is the first
     //       canonical [system] section). Fully static, unlike
     //       the environment block's date below it.
@@ -888,8 +881,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     const withParallel = composeWithParallelHint(withErgonomics);
     const withConstraints = composeWithConstraints(withParallel);
     const withResponseFormat = composeWithResponseFormat(withConstraints);
-    const withDiscipline = composeWithTaskDiscipline(withResponseFormat);
-    const withEnvironment = composeWithEnvironment(withDiscipline, {
+    const withEnvironment = composeWithEnvironment(withResponseFormat, {
       cwd,
       platform: process.platform,
       modelId: provider.id,

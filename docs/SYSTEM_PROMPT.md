@@ -38,7 +38,6 @@ input.systemPrompt                                  ← base (typically empty)
   ↑ composeWithParallelHint
   ↑ composeWithConstraints
   ↑ composeWithResponseFormat
-  ↑ composeWithTaskDiscipline
   ↑ composeWithEnvironment
   ↑ composeWithIdentity                             ← outermost / appears FIRST
 ```
@@ -49,23 +48,22 @@ input.systemPrompt                                  ← base (typically empty)
 
 1. **Identity** — what Forja is, the declarative policy it runs under, verify-before-acting (`CONTEXT_TUNING §1.2`)
 2. **Environment** — cwd, profile, git branch, current date (`§1.3`, `§1.4`)
-3. **Task discipline** — behavioral norms that distinguish "ships clean work" from "ships plausible-looking work"
-4. **Response format** — output surface fixed (`§1.5`)
-5. **Constraints** — the `# Constraints` block: correctness rules + security posture + hard-to-reverse confirm + goal-contradictory cancellation (`§1.6` + `SECURITY_GUIDELINE §0.11`)
-6. **Parallel hint** — surfaces the harness's parallel-tool affordance
-7. **Tool ergonomics** — highest-payoff tool-usage patterns distilled from `TOOL_ERGONOMICS.md`
-8. **Playbook hint** — discovery table + delegation criteria for subagent routing (`PLAYBOOKS §1.4`)
-9. **Base systemPrompt** — caller-provided string (typically empty in production)
-10. **Project pointer** — `[project_context]` block (`CONTEXT_TUNING §2.0`)
-11. **Memory section** — auto-injected memories per `MEMORY.md`
-12. **Skill catalog** — eager-load surface of available skills (body lazy)
+3. **Response format** — output surface fixed (`§1.5`)
+4. **Constraints** — the `# Constraints` block: correctness rules + build discipline + security posture + hard-to-reverse confirm + goal-contradictory cancellation (`§1.6` + `SECURITY_GUIDELINE §0.11`)
+5. **Parallel hint** — surfaces the harness's parallel-tool affordance
+6. **Tool ergonomics** — highest-payoff tool-usage patterns distilled from `TOOL_ERGONOMICS.md`
+7. **Playbook hint** — discovery table + delegation criteria for subagent routing (`PLAYBOOKS §1.4`)
+8. **Base systemPrompt** — caller-provided string (typically empty in production)
+9. **Project pointer** — `[project_context]` block (`CONTEXT_TUNING §2.0`)
+10. **Memory section** — auto-injected memories per `MEMORY.md`
+11. **Skill catalog** — eager-load surface of available skills (body lazy)
 
 ### 2.2 Why this order
 
 The order is **not arbitrary** — it interacts with three things:
 
 - **Cache breakpoints** (`CONTEXT_TUNING §3`). Bootstrap emits TWO segments via `HarnessConfig.systemSegments` (a `string | SystemSegment[]` channel parallel to the canonical `systemPrompt` string):
-  - **`stable` segment** — identity + environment + task discipline + response format + constraints + tool ergonomics + base systemPrompt + project pointer. This is the most stable region across the REPL session; gets its own `cache_control` marker so it persists when memory rotates.
+  - **`stable` segment** — identity + environment + response format + constraints + tool ergonomics + base systemPrompt + project pointer. This is the most stable region across the REPL session; gets its own `cache_control` marker so it persists when memory rotates.
   - **`memory` segment** — memory section + skill catalog. The high-churn region (invalidates on `memory_write` and skill palette changes); gets its own `cache_control` marker so a memory write doesn't drop the entire prefix.
   
   `flattenSystemSegments(segments) === systemPrompt` is the invariant — audit hash + non-segment-aware adapters (OpenAI, Google) read the canonical string; Anthropic reads the array. Date stays in the environment block; the per-bootstrap re-evaluation means resume on day N+1 sees `today: N+1` correctly (semantic continuity wins over the marginal cache cost of one extra `cache_creation` per cross-day resume).
@@ -90,7 +88,7 @@ The `name: 'system.autonomous'` is hardcoded because the autonomous profile is t
 
 ### 3.1 Why subagents need their own chain
 
-A subagent's system prompt is the **playbook body** (`audit.systemPrompt`) wrapped in a narrower set of affordances. It is NOT the principal's full surface — playbooks declare their own tool whitelist, their own references, their own optional output schema, and their own reflection mode. Including the principal's full chain (identity, environment, task discipline, response format, constraints, tool ergonomics, project pointer, skill catalog) would (a) override the playbook author's intent, (b) blow the per-call token budget on content unrelated to the playbook's narrow job, and (c) defeat the purpose of having a playbook in the first place.
+A subagent's system prompt is the **playbook body** (`audit.systemPrompt`) wrapped in a narrower set of affordances. It is NOT the principal's full surface — playbooks declare their own tool whitelist, their own references, their own optional output schema, and their own reflection mode. Including the principal's full chain (identity, environment, response format, constraints, tool ergonomics, project pointer, skill catalog) would (a) override the playbook author's intent, (b) blow the per-call token budget on content unrelated to the playbook's narrow job, and (c) defeat the purpose of having a playbook in the first place.
 
 ### 3.2 The composer chain
 
@@ -196,9 +194,8 @@ Each composer lives in its own file under `src/cli/`. The file owns the composer
 |---|---|---|
 | `composeWithIdentity` | `identity-prompt.ts` | Role-as-tool marker; what Forja is + declarative policy + verify-before-acting (`§1.2`) |
 | `composeWithEnvironment` | `environment-prompt.ts` | Situational anchor: cwd, profile, git branch, current date (`§1.3`, `§1.4`) |
-| `composeWithTaskDiscipline` | `task-discipline.ts` | Behavioral norms (prefer editing, WHY-only comments, no narrative WHAT-comments) |
 | `composeWithResponseFormat` | `response-format.ts` | Output surface (`§1.5`, `ANTI_PATTERNS §1.3`) — no "be concise" tuning |
-| `composeWithConstraints` | `constraints-prompt.ts` | `# Constraints` block (`§1.6`) — correctness + security + hard-to-reverse + goal-contradictory cancellation |
+| `composeWithConstraints` | `constraints-prompt.ts` | `# Constraints` block (`§1.6`) — correctness + build discipline + security + hard-to-reverse + goal-contradictory cancellation |
 | `composeWithToolErgonomics` | `tool-ergonomics-prompt.ts` | High-payoff tool patterns distilled from `TOOL_ERGONOMICS.md` |
 | `composeWithPlaybookHint` | `playbook-prompt.ts` | Subagent discovery table + delegation criteria (`PLAYBOOKS §1.4`) |
 | `composeWithProjectPointer` | `project-pointer.ts` | `[project_context]` pointer (`§2.0`) — pointer eager, body lazy |
