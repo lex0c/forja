@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-07] §8.4 engine-floor: matching de sensitive-path era case-sensitive (bypass em FS case-insensitive)
+
+**Bug (review + verificação empírica):** o `matchSensitivePath` (`permissions/sensitive-paths.ts`) é o piso §8.4 — fires antes da policy lookup, nenhuma config de operador burla. O matcher era case-sensitive e dependia inteiramente do `realpath` (`engine.checkPath`) canonicalizar o case do input. Mas o `realpath` só normaliza quando o alvo **já existe**; em write-creates-new-file (ou dir-pai inexistente) o fallback preserva o case cru do agente. Em macOS APFS / Windows NTFS (case-insensitive default) `write_file('.ENV')` atinge o mesmo inode que `.env` → `matchSensitivePath('.ENV')` → null → sob `allow_paths: ['**']` a escrita era autorizada, sobrescrevendo segredos sem confirm.
+
+**Correção do patch proposto (que estava incompleto):** o patch inicial lowercava só o **input**, não os patterns. Isso matava silenciosamente a única entrada mixed-case da deny-list — `GoogleService-Info.plist` (config Firebase iOS) — virando um bypass §8.4 na direção oposta (verificado: `matchSensitivePath('GoogleService-Info.plist')` → null pós-patch). E a validação do relatório ("zero regressão") só rodou `tests/permissions/`, perdendo o segundo consumidor (`tests/subagents/sensitive-paths.test.ts`, que falhava). Fix correto: lowercar **os dois lados** (input E pattern), retornando o pattern original pra auditoria fiel.
+
+**Provado:** `tests/permissions/sensitive-paths-case.test.ts` (novo) cobre `.ENV`/`.Env`/`id_RSA`/`CREDENTIALS.json`/`.SSH/**`/`production.PEM` + o caso mixed-case (`GoogleService-Info.plist` em 3 casings). `tests/permissions/` 2274/2274, `tests/subagents/sensitive-paths.test.ts` verde de novo, typecheck + lint limpos. Invariante documentada em `SECURITY_GUIDELINE.md §8.4`.
+
 ## [2026-06-07] Relevance-driven compaction (token-driven, atrás de flag default-off)
 
 **Motivação (discussão de context engineering / Headroom):** a compaction dobra o `middle` inteiro num summary do LLM — lossy em tudo (relevante ou não) + custa uma chamada. Em code agent o grosso dos tokens do meio é corpo de tool_result (reads/greps/test output) que para de importar ao goal poucos turns depois. Solução: pontuar o meio por relevância ao goal e manter o relevante verbatim, ponteando o resto (recuperável via `retrieve_context` session view, que já lê `messages`/`tool_calls`/`failure_events` do audit). Direção do operador: eval-first, e **production-ready, não protótipo**.

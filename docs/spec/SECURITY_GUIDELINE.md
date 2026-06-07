@@ -421,6 +421,8 @@ GoogleService-Info.plist  # Firebase config iOS (API keys)
 
 Encodings de **cert público** (`*.crt`/`*.cer`/`*.der`) são deliberadamente **fora** da lista: não carregam chave privada (essa vive nos `*.pem`/`*.key`/`*.p12`/`*.pfx` já listados), e como este é um piso **duro e não-overridável**, bloqueá-los só quebraria leituras legítimas sem ganho de exposição de segredo.
 
+**Matching é case-insensitive.** O piso §8.4 precisa valer em **toda** plataforma que o binário suporta, e macOS (APFS) e Windows (NTFS) são case-insensitive por default — lá `write_file('.ENV')` atinge o mesmo inode que `.env`. Um matcher case-sensitive deixaria essa chamada passar como "não-sensível" sob policy permissiva (`allow_paths: ['**']`), abrindo bypass do engine-floor. A canonicalização de case via `realpath` só ocorre quando o alvo **já existe**; em write-creates-new-file o matcher vê o input cru, então o matcher em si tem que ser case-insensitive. A normalização lowerca **os dois lados** — input E pattern — porque nem todo pattern é lowercase (`GoogleService-Info.plist` é mixed-case): lowercar só o input mataria o match desses, reabrindo o bypass na direção oposta. O custo é over-match de nomes tipo `MyFile.PEM`, que é a direção segura pra uma deny de credencial.
+
 Match → tool retorna erro `path.deny_listed` com texto:
 
 ```
