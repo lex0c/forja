@@ -373,10 +373,10 @@ describe('/budget', () => {
   });
 
   test('shows the DEFAULT_BUDGET cost cap when operator has not overridden', async () => {
-    // DEFAULT_BUDGET ships a 5 USD cost cap (AGENTIC_CLI.md §5).
+    // DEFAULT_BUDGET ships a 100 USD cost cap (AGENTIC_CLI.md §5).
     // The slash UI falls back to the default when the operator
     // has not explicitly set or cleared the cap, so a fresh
-    // session shows "$5.00", not "no cap".
+    // session shows "$100.00", not "no cap".
     const ctx = makeCtx();
     const result = await budgetCommand.exec([], ctx);
     if (result.kind !== 'ok') return;
@@ -385,7 +385,7 @@ describe('/budget', () => {
     expect(costLine).not.toContain('no cap');
     // Pinning the formatted default keeps the contract change
     // visible if the spec bumps the value.
-    expect(costLine).toContain('$5.00');
+    expect(costLine).toContain('$100.00');
   });
 
   test('shows "no cap" only after the operator explicitly opts out', async () => {
