@@ -219,3 +219,37 @@ export const listMessageTailBySession = (db: DB, sessionId: string, limit: numbe
     .all(sessionId, limit) as MessageRow[];
   return { messages: rows.map(fromRow), totalCount };
 };
+
+// Provider-reported token totals for a single session, summed across
+// every message row. Used by the usage-stats aggregator (`/stats` and
+// the footer) to roll up a session's lifetime token throughput.
+//
+// COALESCE folds the nullable columns to 0 — a turn that reported no
+// usage (provider edge case / mid-stream abort) contributes nothing
+// rather than poisoning the SUM with NULL. That makes the total a
+// LOWER BOUND when any turn lacked usage; the caller pairs this with
+// `sessions.usage_complete` to flag the undercount.
+export interface MessageUsageTotals {
+  tokensIn: number;
+  tokensOut: number;
+  cacheRead: number;
+  cacheCreation: number;
+}
+
+export const sumMessageUsage = (db: DB, sessionId: string): MessageUsageTotals => {
+  const row = db
+    .query<{ ti: number; tout: number; cr: number; cc: number }, [string]>(
+      `SELECT COALESCE(SUM(tokens_in), 0)              AS ti,
+              COALESCE(SUM(tokens_out), 0)             AS tout,
+              COALESCE(SUM(cached_tokens), 0)          AS cr,
+              COALESCE(SUM(cache_creation_tokens), 0)  AS cc
+       FROM messages WHERE session_id = ?`,
+    )
+    .get(sessionId);
+  return {
+    tokensIn: row?.ti ?? 0,
+    tokensOut: row?.tout ?? 0,
+    cacheRead: row?.cr ?? 0,
+    cacheCreation: row?.cc ?? 0,
+  };
+};

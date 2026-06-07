@@ -8,6 +8,7 @@ import { modelCommand } from '../../../src/cli/slash/commands/model.ts';
 import { permsCommand, renderPolicy } from '../../../src/cli/slash/commands/perms.ts';
 import { quitCommand } from '../../../src/cli/slash/commands/quit.ts';
 import { sessionsCommand } from '../../../src/cli/slash/commands/sessions.ts';
+import { statsCommand } from '../../../src/cli/slash/commands/stats.ts';
 import { subagentsCommand } from '../../../src/cli/slash/commands/subagents.ts';
 import type { SlashCommand, SlashContext } from '../../../src/cli/slash/types.ts';
 import { EFFORT_PROFILES } from '../../../src/harness/effort.ts';
@@ -18,7 +19,7 @@ import { createPermissionEngine } from '../../../src/permissions/index.ts';
 import { createRegistry as createModelRegistry } from '../../../src/providers/registry.ts';
 import { openMemoryDb } from '../../../src/storage/db.ts';
 import { migrate } from '../../../src/storage/migrate.ts';
-import { createSession } from '../../../src/storage/repos/sessions.ts';
+import { createSession, updateSessionCost } from '../../../src/storage/repos/sessions.ts';
 import { createToolRegistry } from '../../../src/tools/registry.ts';
 import { createBus } from '../../../src/tui/bus.ts';
 import { createFocusStack } from '../../../src/tui/focus-stack.ts';
@@ -111,9 +112,19 @@ describe('/clear', () => {
 });
 
 describe('/cost', () => {
-  test('formats cumulative cost / steps / turns', async () => {
+  // Cost is DB-derived (same source as /stats), so the fixtures set a
+  // session's persisted total_cost_usd and point replSessionIds at it.
+  // steps/turns still come from the in-memory cumulative counter.
+  const ctxWithCost = (costUsd: number): SlashContext => {
     const ctx = makeCtx();
-    ctx.cumulative.costUsd = 0.0234;
+    const s = createSession(ctx.db, { model: 'm', cwd: '/test/cwd' });
+    updateSessionCost(ctx.db, s.id, costUsd);
+    ctx.replSessionIds = () => [s.id];
+    return ctx;
+  };
+
+  test('formats DB-derived cost / steps / turns', async () => {
+    const ctx = ctxWithCost(0.0234);
     ctx.cumulative.steps = 12;
     ctx.cumulative.turns = 3;
     const result = await costCommand.exec([], ctx);
@@ -125,17 +136,22 @@ describe('/cost', () => {
   });
 
   test('cost format degrades with magnitude', async () => {
-    const ctx = makeCtx();
-    ctx.cumulative.costUsd = 5.5;
-    ctx.cumulative.steps = 0;
-    ctx.cumulative.turns = 0;
-    const r1 = await costCommand.exec([], ctx);
+    const r1 = await costCommand.exec([], ctxWithCost(5.5));
     if (r1.kind !== 'ok') return;
     expect(r1.notes?.[0]).toContain('$5.500');
-    ctx.cumulative.costUsd = 100.5;
-    const r2 = await costCommand.exec([], ctx);
+    const r2 = await costCommand.exec([], ctxWithCost(100.5));
     if (r2.kind !== 'ok') return;
     expect(r2.notes?.[0]).toContain('$100.50');
+  });
+
+  test('cost agrees with /stats (same DB-derived source)', async () => {
+    const ctx = ctxWithCost(0.5);
+    const cost = await costCommand.exec([], ctx);
+    const stats = await statsCommand.exec([], ctx);
+    if (cost.kind !== 'ok' || stats.kind !== 'ok') return;
+    // Both surface $0.5000 from computeUsageStats over the same tree.
+    expect(cost.notes?.[0]).toContain('$0.5000');
+    expect((stats.notes ?? []).join('\n')).toContain('$0.5000');
   });
 });
 

@@ -40,9 +40,12 @@ export {
   getMessage,
   listMessageTailBySession,
   listMessagesBySession,
+  sumMessageUsage,
 } from './repos/messages.ts';
-export type { MessageTail } from './repos/messages.ts';
+export type { MessageTail, MessageUsageTotals } from './repos/messages.ts';
 export type { AppendMessageInput, Message, MessageRole } from './repos/messages.ts';
+export { computeUsageStats } from './repos/stats.ts';
+export type { UsageStats } from './repos/stats.ts';
 
 export {
   createToolCall,

@@ -24,6 +24,7 @@ import { quitCommand } from './commands/quit.ts';
 import { recapCommand } from './commands/recap.ts';
 import { sessionsCommand } from './commands/sessions.ts';
 import { skillCommand } from './commands/skill.ts';
+import { statsCommand } from './commands/stats.ts';
 import { subagentsCommand } from './commands/subagents.ts';
 import { parseSlashInput } from './parse.ts';
 import { type SlashRegistry, createRegistry } from './registry.ts';
@@ -56,6 +57,7 @@ export const createBuiltinRegistry = (subagents?: SubagentSet): SlashRegistry =>
     clearCommand,
     compactCommand,
     costCommand,
+    statsCommand,
     sessionsCommand,
     recapCommand,
     subagentsCommand,
