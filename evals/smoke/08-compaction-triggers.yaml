@@ -39,3 +39,6 @@ budget:
   maxCostUsd: 0.50
   compactionThreshold: 0.02
   compactionPreserveTail: 1
+  # Pin the pure-LLM path: asserts strategy=llm. compactionRelevance now
+  # defaults ON, so opt out explicitly to keep this smoke deterministic.
+  compactionRelevance: false

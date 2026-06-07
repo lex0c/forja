@@ -469,13 +469,13 @@ export interface RunBudget {
   // module walks back one position. preserveTail=0 still preserves
   // the trailing assistant + its tool_result for the same reason.
   compactionPreserveTail: number;
-  // Opt-in: run the relevance pre-pass (`compaction-relevance.ts`)
-  // before the LLM summary — cheaply pointer-elide low-goal-relevance
-  // tool_result bodies, falling through to the LLM only when that frees
-  // too little. Default-off so existing budgets + the eval baseline keep
-  // verbatim behavior; this is the on-switch the eval toggles. Optional
-  // (unlike the required tuning knobs above) because it is a feature
-  // flag — absent ⇒ off.
+  // Run the relevance pre-pass (`compaction-relevance.ts`) before the LLM
+  // summary — cheaply pointer-elide low-goal-relevance tool_result bodies,
+  // falling through to the LLM only when that frees too little. Default-ON
+  // (DEFAULT_BUDGET) after the eval A/B showed ~28% cheaper compaction with
+  // task success preserved; set `false` to opt out (e.g. an eval case that
+  // pins the pure-LLM path). Optional because it is a feature flag —
+  // absent ⇒ inherits the DEFAULT_BUDGET value (on).
   compactionRelevance?: boolean;
   // Hard cap on total spend for this run, in USD. AGENTIC_CLI.md §5
   // declares a default of 5 — cost is the engagement gate; step
@@ -559,7 +559,10 @@ export const DEFAULT_BUDGET: RunBudget = {
   // against the provider capability via `resolveMaxOutputTokens`.
   compactionThreshold: 0.7,
   compactionPreserveTail: 3,
-  compactionRelevance: false,
+  // Default-ON: the relevance pre-pass runs before the (billed) LLM
+  // summary and skips it entirely when it frees enough. A/B (CONTEXT_TUNING
+  // §6) showed ~28% cheaper compaction with task success preserved.
+  compactionRelevance: true,
   // Spec-declared default cost cap (AGENTIC_CLI.md §5 line 333).
   // Operator opts out via `/budget cost off`, which writes an
   // explicit `undefined` so the spread-merge propagates the
