@@ -172,10 +172,18 @@ const SCRUB_PATTERNS: readonly RegExp[] = [
 // its provider key to talk to the model it was assigned, or it dies
 // "API key required" before running a single step. The subagent spawn
 // passes these via `scrubEnv(env, { keep })`; every other credential stays
-// stripped. Safe because the child re-scrubs when it spawns its OWN bash
-// (broker scrubEnv) and tools (sandbox clearenv), so the key reaches only
-// the child's HTTP call to the provider, never its subprocesses.
-// Mirror the adapters in src/providers/*/index.ts.
+// stripped. The key stays on the child's `process.env` for the lifetime of
+// the run, so the invariant that protects it is: EVERY subprocess the child
+// spawns must receive an explicitly-shaped env, never raw `process.env`
+// inheritance. That holds across the surface —
+//   - bash broker / bg manager → `scrubEnv(process.env)`,
+//   - git (checkpoints, worktrees, memory) → `safeGitEnv()` allowlist,
+//   - hooks → `buildHookEnv` allowlist,
+//   - grep's ripgrep → `buildGrepSpawnEnv` → `scrubEnv(process.env)`,
+//   - sandboxed tools → bwrap `--clearenv` / macOS `env -i` at the boundary.
+// so the key reaches only the child's own HTTP call to the provider, never a
+// subprocess. A new spawn site that inherits the raw env would re-open the
+// leak — keep it on this list. Mirror the adapters in src/providers/*/index.ts.
 export const PROVIDER_API_KEY_VARS: readonly string[] = [
   'ANTHROPIC_API_KEY',
   'OPENAI_API_KEY',

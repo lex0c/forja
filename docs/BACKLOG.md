@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-07] grep vazava a provider API key do subagent child pro ripgrep (env cru)
+
+**Bug (review):** o `keep: PROVIDER_API_KEY_VARS` no `spawn-factory` mantém a provider key no `process.env` do child (pra ele alcançar o modelo). O comentário afirmava que era seguro porque "o child re-scruba bash (broker) e tools (sandbox clearenv)" — mas isso só vale no caminho **sandboxed**. O `grep` era o ÚNICO spawn de tool que herdava o `process.env` CRU (default do Bun; mantido até com `sandboxTmpdir` setado, via `...process.env`). Em modo **degradado/host** (sem `--clearenv` de bwrap/macOS pra moldar o env no kernel), o subprocesso `rg` — ou um shim de `rg` no PATH, ou qualquer leitor de `/proc/<pid>/environ` — recuperava `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`/… do child, além de todo outro segredo do operador. Mesma classe de leak afeta o processo PAI (grep herdava as keys reais do operador).
+
+**Fix:** `grep` agora SEMPRE passa um env scrubado (`buildGrepSpawnEnv` → `scrubEnv(process.env)`, com overlay de `TMPDIR` quando há sandbox tmpdir), nunca herança crua — alinhando com o bg manager e o broker, que já scrubam. Auditados os demais spawn sites: git (checkpoints/worktrees/memory) usam `safeGitEnv` (allowlist), hooks usam `buildHookEnv` (allowlist), bg/broker usam `scrubEnv` — grep era o outlier. Comentários de `sanitize/env.ts` e `spawn-factory.ts` reescritos pro invariante correto: TODO subprocesso do child recebe env explicitamente moldado, nunca `process.env` cru; novo spawn site que herde o cru reabre o leak. Helper exportado puro → contrato de higiene de credencial testável sem spawnar rg de verdade.
+
+**Provado:** teste TDD (red→green) em `tests/tools/grep.test.ts` — `buildGrepSpawnEnv` remove provider keys + segredos genéricos (AWS/GitHub), preserva PATH (rg resolve a si mesmo em modo degradado), e só sobrepõe `TMPDIR` quando fornecido. typecheck + lint limpos.
+
 ## [2026-06-06] home-rw fora da isolação de cache → builds envenenavam os host caches reais
 
 **Bug (review):** o gate `writableProfile` (e o carve-out) incluía só `cwd-rw`/`cwd-rw-net`, deixando `home-rw` de fora → `persistBase` null → sem redirect env e sem cache carve-out. Como `home-rw` binda o `$HOME` real read-write, package managers (npm/pip/go/Gradle) escreviam nos caches REAIS do operador (`~/.cache`, `~/.npm`, `~/go`) em vez do cache dedicado — minando a isolação default-on e permitindo que builds sandboxed envenenassem caches usados FORA do Forja.

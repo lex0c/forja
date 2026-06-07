@@ -382,10 +382,13 @@ export const defaultSpawnChildProcess: SpawnChildProcess = (opts) => {
     // Preserve the provider API key: this CHILD process must talk to the
     // model it was assigned, else it dies "API key required" before running
     // a single step (the generic scrub strips ANTHROPIC_*/OPENAI_*/… as a
-    // bash-exfiltration defense). Safe here — the child re-scrubs when it
-    // spawns its OWN bash (broker scrubEnv) and tools (sandbox clearenv),
-    // so the key reaches only the child's HTTP call to the provider, not its
-    // subprocesses. Every other credential stays stripped.
+    // bash-exfiltration defense). Every other credential stays stripped. Safe
+    // because the child never lets a subprocess inherit its raw env: each tool
+    // spawn passes an explicitly-shaped env (broker/bg scrubEnv, git
+    // safeGitEnv, hooks buildHookEnv, grep buildGrepSpawnEnv) and sandboxed
+    // tools clear the env at the kernel boundary — so the key reaches only the
+    // child's HTTP call to the provider. See PROVIDER_API_KEY_VARS for the
+    // full invariant; a new spawn site that inherits process.env re-opens it.
     env: scrubEnv(process.env, { keep: PROVIDER_API_KEY_VARS }),
     ...(opts.ipc === true ? { stdin: 'pipe', stdout: 'pipe' } : { stdout: 'ignore' }),
     stderr: 'pipe',

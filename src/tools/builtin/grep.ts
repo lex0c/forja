@@ -1,5 +1,6 @@
 import { isAbsolute, resolve } from 'node:path';
 import { maybeWrapSandboxArgv } from '../../permissions/index.ts';
+import { scrubEnv } from '../../sanitize/env.ts';
 import {
   ERROR_CODES,
   type SummarizedOutput,
@@ -31,6 +32,30 @@ export interface GrepOutput {
 }
 
 const DEFAULT_MAX = 200;
+
+// Env handed to the spawned ripgrep. ALWAYS scrubbed — rg needs none of the
+// operator's credentials, and the scrub is the only protection in degraded /
+// host mode, where there is no sandbox `--clearenv` to shape the env at the
+// kernel boundary. Pre-fix this tool inherited the raw `process.env` (Bun's
+// default, kept even when `sandboxTmpdir` was set: the old code spread
+// `...process.env`). Inside a subagent child that env carries the provider
+// API key — deliberately kept on the child's process env so it can reach the
+// model it was assigned (see `PROVIDER_API_KEY_VARS` / the subagent spawn) —
+// plus every other operator secret. A malicious `rg` PATH shim, or any local
+// reader of `/proc/<pid>/environ`, could then recover ANTHROPIC_API_KEY /
+// OPENAI_API_KEY / … from the rg subprocess even though the spawn factory's
+// `scrubEnv` had stripped them from sibling tools. Passing `scrubEnv(
+// process.env)` here brings grep in line with the bg manager and the bash
+// broker, which already scrub. `scrubEnv` keeps PATH (rg resolves itself
+// through it in degraded mode) and the locale vars rg honors. TMPDIR is
+// overlaid AFTER the scrub when a per-session sandbox tmpdir is set, since
+// scrubEnv only forwards allowlisted vars and TMPDIR isn't one — same pattern
+// the bg manager uses. Exported pure so the credential-hygiene contract can
+// be unit-tested without spawning a real ripgrep.
+export const buildGrepSpawnEnv = (sandboxTmpdir: string | undefined): Record<string, string> => ({
+  ...scrubEnv(process.env),
+  ...(sandboxTmpdir !== undefined ? { TMPDIR: sandboxTmpdir } : {}),
+});
 
 interface RipgrepBeginEvent {
   type: 'begin';
@@ -157,14 +182,12 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
         stdout: 'pipe',
         stderr: 'pipe',
         cwd: ctx.cwd,
-        // Slice 157 (phase 2): inherit parent env + overlay TMPDIR
-        // so the SBPL-scoped tmpdir is what rg sees. Bun's default
-        // is to inherit process.env; passing env explicitly lets us
-        // layer TMPDIR without dropping the rest of the env (which
-        // rg's PATH lookup for sub-binaries depends on).
-        ...(ctx.sandboxTmpdir !== undefined
-          ? { env: { ...process.env, TMPDIR: ctx.sandboxTmpdir } }
-          : {}),
+        // Always pass a scrubbed env (never raw `process.env` inheritance) so
+        // a credential — chiefly a subagent child's provider API key — can't
+        // leak into the rg subprocess in degraded / host mode. The optional
+        // sandbox TMPDIR (SBPL-scoped on darwin, the shared_tmp bind source
+        // on linux) is overlaid inside the helper. See `buildGrepSpawnEnv`.
+        env: buildGrepSpawnEnv(ctx.sandboxTmpdir),
         // biome-ignore lint/suspicious/noExplicitAny: Bun's spawn typing for `signal` is too narrow
         ...({ signal: ctx.signal } as any),
       });
