@@ -66,6 +66,8 @@ import type { RelevanceAudit } from './compaction-relevance.ts';
 import {
   accountCompaction,
   compactionTriggerTokens,
+  hashContext,
+  recordCompactionEvent,
   relevanceVerbatimBudgetBytes,
 } from './compaction.ts';
 import { resolveProviderEffort } from './effort.ts';
@@ -2333,6 +2335,39 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           contextWindow,
         });
         const compactStart = Date.now();
+        // Audit/replay trail (compaction_events, AUDIT / CONTEXT_TUNING §12).
+        // beforeHash is the pre-compaction context; afterHash is computed at
+        // persist time (after the array was rewritten). estimateNow re-reads
+        // the live array. Persist is best-effort — never aborts the run.
+        // ctxRef pins the (guard-narrowed) context so the closures below don't
+        // re-widen `ctx` to `| undefined`.
+        const ctxRef = ctx;
+        const estimateNow = (): number =>
+          estimatePromptTokens([...ctxRef.getMessages()], {
+            ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
+            ...(tools.length > 0 ? { tools } : {}),
+          });
+        const beforeHash = hashContext(ctxRef.getMessages());
+        // Thin adapter over the shared recorder: supplies the loop's beforeHash
+        // + live array + trigger tokens. The skip-skipped / hashing /
+        // best-effort-with-stderr-log all live in recordCompactionEvent.
+        const persistCompaction = (e: {
+          strategy: string;
+          foldedCount: number;
+          tokensAfter?: number;
+          freedBytes?: number;
+          elidedIds?: readonly string[];
+          summary?: string;
+          reason?: string;
+        }): void =>
+          recordCompactionEvent(config.db, {
+            sessionId,
+            beforeHash,
+            messagesAfter: ctxRef.getMessages(),
+            tokensBefore: promptTokens,
+            recordedAt: Date.now(),
+            ...e,
+          });
 
         // Relevance pre-pass (opt-in): cheaply pointer-elide low-goal-
         // relevance tool_result bodies (NO provider call). If that alone
@@ -2356,12 +2391,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               freedBytes: elide.freedBytes,
               elidedIds: elide.elidedIds,
             };
-            const tokensAfterElide = estimatePromptTokens([...ctx.getMessages()], {
-              ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
-              ...(tools.length > 0 ? { tools } : {}),
-            });
+            const tokensAfterElide = estimateNow();
             if (tokensAfterElide <= triggerAt) {
               // Relevance alone got us under the threshold — done, no LLM.
+              const relevanceReason = `relevance-elide: ${elide.elidedCount} tool_results pointered, ${elide.freedBytes}B freed`;
+              persistCompaction({
+                strategy: 'relevance',
+                foldedCount: elide.elidedCount,
+                tokensAfter: tokensAfterElide,
+                freedBytes: elide.freedBytes,
+                elidedIds: elide.elidedIds,
+                reason: relevanceReason,
+              });
               safeEmit(config.onEvent, {
                 type: 'compaction_finished',
                 strategy: 'relevance',
@@ -2369,7 +2410,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                 durationMs: Date.now() - compactStart,
                 usage: emptyUsage(),
                 costUsd: 0,
-                reason: `relevance-elide: ${elide.elidedCount} tool_results pointered, ${elide.freedBytes}B freed`,
+                reason: relevanceReason,
                 relevance: relevanceAudit,
               });
               return costCapDetailIfExceeded();
@@ -2392,6 +2433,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         if (acct.usageIncomplete) {
           usageComplete = false;
         }
+        persistCompaction({
+          strategy: compaction.strategy,
+          foldedCount: compaction.foldedCount,
+          tokensAfter: estimateNow(),
+          ...(relevanceAudit !== undefined
+            ? { freedBytes: relevanceAudit.freedBytes, elidedIds: relevanceAudit.elidedIds }
+            : {}),
+          ...(compaction.summary !== undefined ? { summary: compaction.summary } : {}),
+          ...(compaction.reason !== undefined ? { reason: compaction.reason } : {}),
+        });
         const finishedEvent: HarnessEvent = {
           type: 'compaction_finished',
           strategy: compaction.strategy,

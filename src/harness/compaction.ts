@@ -7,6 +7,12 @@ import type {
   UsageInfo,
 } from '../providers/index.ts';
 import { stripAnsi } from '../sanitize/index.ts';
+import type { DB } from '../storage/db.ts';
+import {
+  type AppendCompactionEventInput,
+  appendCompactionEvent,
+} from '../storage/repos/compaction-events.ts';
+import { hashPromptContent } from '../storage/repos/prompt-versions.ts';
 import { abortableIterable } from './abortable.ts';
 import { CollectStepError, collectStep } from './collect.ts';
 
@@ -89,6 +95,11 @@ export interface CompactionResult {
   // Optional reason when strategy='fallback' or 'skipped' — surfaces
   // through the harness event for observability.
   reason?: string;
+  // The LLM summary text on the `llm` strategy (the non-deterministic content
+  // folded into the goal). Persisted to `compaction_events` for replay/audit —
+  // it is otherwise LOST (resume re-derives from the log and re-compacts → a
+  // different summary). Undefined on fallback / skipped / relevance.
+  summary?: string;
 }
 
 // The accounting consequences of folding a CompactionResult: what the
@@ -409,6 +420,39 @@ export const alignTailStartToAssistant = (
   return tailStart;
 };
 
+// sha256 of the live message array — the before/after context hash on a
+// compaction_events row. One definition so every writer (loop + /compact)
+// hashes the SAME serialization; a divergent stringify would silently make
+// before/after non-comparable across paths (defeating the replay check).
+export const hashContext = (messages: readonly ProviderMessage[]): string =>
+  hashPromptContent(JSON.stringify(messages));
+
+// Persist one compaction_events audit row (CONTEXT_TUNING §12 / AUDIT.md).
+// Shared by the loop and `/compact` so the skip / hash / best-effort logic
+// lives in ONE place (no per-caller drift):
+//   - strategy 'skipped' ⇒ NO row — nothing happened (before === after); a
+//     no-op event is pure noise in an un-GC'd table.
+//   - afterHash is hashed from `messagesAfter` (the post-compaction array).
+//   - best-effort, but OBSERVABLE: a persist failure (CHECK / NOT NULL /
+//     binding drift) is logged to stderr, never silently swallowed — losing
+//     the audit row silently is the failure this table exists to prevent.
+export const recordCompactionEvent = (
+  db: DB,
+  input: Omit<AppendCompactionEventInput, 'afterHash'> & {
+    messagesAfter: readonly ProviderMessage[];
+  },
+): void => {
+  if (input.strategy === 'skipped') return;
+  const { messagesAfter, ...row } = input;
+  try {
+    appendCompactionEvent(db, { ...row, afterHash: hashContext(messagesAfter) });
+  } catch (err) {
+    console.error(
+      `forja: compaction_events persist failed — ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+};
+
 export const compactMessages = async (
   provider: Provider,
   messages: ProviderMessage[],
@@ -522,6 +566,7 @@ export const compactMessages = async (
       foldedCount: middle.length,
       usage: attemptUsage,
       usageSeen: attemptUsageSeen,
+      summary: summaryBody,
     };
   } catch (e) {
     // If collectStep threw mid-iteration (CollectStepError), the

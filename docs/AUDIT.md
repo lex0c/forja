@@ -22,8 +22,11 @@ Scope: what works today, what's spec'd but deferred, what the operator workflows
 | `chain_meta` | 35 | per-install | (lifecycle metadata) | forever |
 | `approvals_log_archived` | 35 | per-install | (pre-rotation tip preserved) | forever |
 | `tool_calls` | 1 | per-message | (no chain — v1 ledger) | 90d |
+| `compaction_events` | mig 072 | per-session | (no chain — event log) | 90d† |
 
-The first three are the **forensic floor**; the last three support lifecycle (rotation history, raw tool I/O the chain references via `args_hash`).
+`approvals_log` / `failure_events` / `outcome_signals` are the **forensic floor**; `chain_meta` / `approvals_log_archived` / `tool_calls` support lifecycle (rotation history, raw tool I/O the chain references via `args_hash`). `compaction_events` (migration 072) is the compaction decision log: one row per compaction (a no-op `skipped` writes none) with `strategy`, `freed_bytes`, `before_hash` / `after_hash` (sha256 of the message array), and — load-bearing — the LLM `summary` text, which is non-deterministic and otherwise **lost on replay** (resume re-derives from the message log and re-compacts → a different summary). The relevance pre-pass also records `elided_ids` (which `tool_result`s were pointered). Detail: `CONTEXT_TUNING §12` (spec) / `SESSION.md` (impl companion).
+
+† Retention is a **target, not yet enforced**: like `tool_calls`, no GC sweep for `compaction_events` is wired (`src/audit/gc.ts` has no case for it), so rows persist until one lands. Note `summary` is medium-sensitivity (may carry code / paths) — mind that in audit exports. ("Slice" column reads `mig 072` because this shipped via the migration, not a numbered slice.)
 
 ### 1.2 CLI verbs (implemented)
 

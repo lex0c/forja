@@ -24,7 +24,7 @@ The log is always a **complete superset** of the live array: every append
 writes a row; compaction writes *nothing*. So the live array can be thrown away
 at any time and rebuilt from the log (that is exactly what `--resume` does).
 
-## `SessionContext` — the single source of truth
+## `SessionContext` — the single source of truth for live context
 
 `src/harness/session-context.ts`. Owns the live `ProviderMessage[]` and the
 `lastMessageId` DB-chain anchor, and is the **only** place that mutates them.
@@ -145,7 +145,10 @@ back to an `assistant` boundary so tool pairs stay intact, via the
 
 The `compaction_finished.strategy` is exactly which path ran: `relevance`
 (stage 1 sufficed), or `llm` / `fallback` / `skipped` (stage 2). Compaction is
-**in-memory only** — the original bodies stay in the SQLite log. Canonical
+**in-memory only** — the original bodies stay in the SQLite log. Each
+compaction (except a no-op `skipped`) writes a `compaction_events` audit row —
+strategy, freed bytes, before/after context hash, and the LLM summary (the
+non-deterministic bit otherwise lost on replay); see `AUDIT.md`. Canonical
 what/why is `CONTEXT_TUNING §12` (spec, PT-BR); this section is the EN
 implementation companion (which files, what order).
 

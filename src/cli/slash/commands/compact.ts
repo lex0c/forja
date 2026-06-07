@@ -12,6 +12,8 @@ import type { RelevanceElideResult } from '../../../harness/compaction-relevance
 import {
   accountCompaction,
   compactionTriggerTokens,
+  hashContext,
+  recordCompactionEvent,
   relevanceVerbatimBudgetBytes,
 } from '../../../harness/compaction.ts';
 import { effectiveBudget } from '../../../harness/types.ts';
@@ -63,6 +65,9 @@ export const compactCommand: SlashCommand = {
         // Bracket the live "Compacting context…" chip around the summary call —
         // the same chip the auto path shows. Paired with the :end in `finally`.
         ctx.bus.emit({ type: 'compacting:start', ts: ctx.now() });
+        // Pre-compaction context hash for the audit row (computed before the
+        // relevance pre-pass mutates the array).
+        const beforeHash = hashContext(live.getMessages());
         // Relevance pre-pass for parity with the auto path: when enabled,
         // pointer-elide low-goal-relevance tool_result bodies first so the
         // forced LLM fold below summarizes a lighter, gated history. Unlike
@@ -102,6 +107,23 @@ export const compactCommand: SlashCommand = {
         if (acct.usageIncomplete) {
           markSessionUsageIncomplete(ctx.db, live.sessionId);
         }
+        // Audit row (compaction_events) for parity with the auto path. tokens
+        // omitted — a forced /compact has no trigger count. The shared recorder
+        // hashes afterHash, skips a no-op 'skipped', and logs (not swallows) a
+        // persist failure.
+        recordCompactionEvent(ctx.db, {
+          sessionId: live.sessionId,
+          beforeHash,
+          messagesAfter: live.getMessages(),
+          strategy: result.strategy,
+          foldedCount: result.foldedCount,
+          ...(relevanceElided !== null && relevanceElided.elidedCount > 0
+            ? { freedBytes: relevanceElided.freedBytes, elidedIds: relevanceElided.elidedIds }
+            : {}),
+          ...(result.summary !== undefined ? { summary: result.summary } : {}),
+          ...(result.reason !== undefined ? { reason: result.reason } : {}),
+          recordedAt: ctx.now(),
+        });
         const relevanceNote =
           relevanceElided !== null && relevanceElided.elidedCount > 0
             ? ` Relevance pre-pass pointered ${relevanceElided.elidedCount} tool_result(s) (${relevanceElided.freedBytes}B freed, recoverable via retrieve_context).`
