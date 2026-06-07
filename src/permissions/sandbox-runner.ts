@@ -452,13 +452,16 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
   // home (managed-NFS layout) leaves the canonical tree unexposed.
   const home = canonicalizeHome(options.home, realpath);
 
-  // Writable profiles (cwd-rw / cwd-rw-net) are the only ones that receive
-  // the persistent cache bind AND the per-session /tmp bind: `ro` writes
-  // nothing (a writable, session-shared dir there would breach its
-  // read-only contract — it keeps the fresh per-spawn tmpfs /tmp), and
-  // `home-rw` already has a writable persistent $HOME. Single source for
-  // both gates below.
-  const writableProfile = profile === 'cwd-rw' || profile === 'cwd-rw-net';
+  // Writable profiles (cwd-rw / cwd-rw-net / home-rw) receive the persistent
+  // cache redirect+bind AND the per-session /tmp bind. `ro` writes nothing (a
+  // writable session-shared dir there would breach its read-only contract —
+  // it keeps the fresh per-spawn tmpfs /tmp); `host` isn't wrapped. home-rw
+  // IS included: it binds the real $HOME read-write, so WITHOUT the
+  // redirect+carve-out its package managers would write the operator's REAL
+  // ~/.cache / ~/.npm / ~/go — exactly the host-cache poisoning the dedicated
+  // Forja cache exists to prevent. (The carve-out is emitted AFTER the $HOME
+  // bind for home-rw — see the call site.) Single source for both gates.
+  const writableProfile = profile === 'cwd-rw' || profile === 'cwd-rw-net' || profile === 'home-rw';
 
   // Opt-in persistent cache gate. A non-null `persistBase` is the single
   // switch for BOTH the redirect env (injected below) and the persistent
@@ -553,57 +556,43 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
   if (profile !== 'cwd-rw-net') {
     flags.push('--unshare-net');
   }
-  // Writable dev-cache carve-out. cwd-rw / cwd-rw-net leave $HOME
-  // read-only, which breaks build toolchains that cache UNDER $HOME
-  // (go-build → ~/.cache/go-build, go modules → ~/go/pkg/mod, npm →
-  // ~/.npm): EROFS aborts the build. Mount a fresh tmpfs over each cache
-  // dir so the toolchain gets a writable, ephemeral, host-isolated
-  // scratch area. See `sandbox-cache-dirs.ts` for the rationale + the
-  // ordering invariant: emitted AFTER `--ro-bind / /` (so it's writable)
-  // but BEFORE the cwd `--bind` and the HIDE_PATHS_* overlays below, so
-  // the cwd bind wins over a cache dir that contains it AND every
-  // credential overlay wins over a cache dir (a cache entry can never
-  // un-mask a hidden credential — bwrap applies mounts in argv order,
-  // last wins). Only the cwd-* profiles need it: `home-rw` already has a
-  // writable $HOME (and a tmpfs would mask the real cache it could
-  // reuse), `ro` writes nothing, `host` isn't wrapped.
-  if (profile === 'cwd-rw' || profile === 'cwd-rw-net') {
-    // Resolution: explicit per-call option > bootstrap override (operator
-    // config) > DEFAULT. The `??` chain preserves the override's
-    // tri-state — an explicit `[]` (carve-out disabled) is kept, only a
-    // genuine `undefined` falls through to DEFAULT.
+  // Writable dev-cache carve-out (host-cache tmpfs masks + the dedicated
+  // Forja cache bind), as a closure because the emit POSITION differs per
+  // profile (see the call sites in the writable-mount block below). Build
+  // toolchains cache UNDER $HOME (go-build → ~/.cache/go-build, go modules →
+  // ~/go/pkg/mod, npm → ~/.npm):
+  //   - cwd-* leave $HOME read-only → a fresh tmpfs gives the toolchain a
+  //     writable, ephemeral scratch (else EROFS aborts the build).
+  //   - home-rw binds the real $HOME read-write → the tmpfs MASKS the real
+  //     caches so a sandboxed build can't poison the operator's host caches
+  //     used outside Forja.
+  // The persistent bind then punches the dedicated `persistBase` through the
+  // `~/.cache` tmpfs that nests it, so the redirected cache survives across
+  // spawns. Existence-gated (bootstrap host-creates persistBase; absent →
+  // the redirect lands on the ephemeral tmpfs instead of aborting). HIDE_PATHS
+  // overlays follow at every call site — a cache can never un-mask a
+  // credential (bwrap applies mounts in argv order, last wins).
+  const pushCacheCarveOut = (): void => {
+    // Resolution: explicit per-call option > bootstrap override > DEFAULT.
+    // The `??` chain preserves the tri-state (explicit `[]` disables; only a
+    // genuine `undefined` falls through to DEFAULT).
     const cacheDirs =
       options.writableCacheDirs ?? getWritableCacheDirsOverride() ?? DEFAULT_WRITABLE_CACHE_DIRS;
     for (const raw of cacheDirs) {
-      // Shared normalizer (same one the config loader uses) — rejects
-      // absolute / `..` / `.`-only / empty, so a bad entry can't `--tmpfs`
-      // an arbitrary path NOR collapse to `$HOME` itself (`.` → masks the
-      // whole home). Single source of truth: no guard drift.
+      // Shared normalizer rejects absolute / `..` / `.`-only / empty, so a
+      // bad entry can't `--tmpfs` an arbitrary path nor collapse to `$HOME`.
       const dir = normalizeCacheDir(raw);
       if (dir === null) continue;
       const abs = joinPath(home, dir);
-      // EXISTENCE GATE — load-bearing, not an optimization. bwrap can
-      // mount a tmpfs only over a path that exists; for an absent target
-      // it `mkdir`s the mountpoint under the read-only base, hits EROFS,
-      // and aborts the ENTIRE spawn (every command, not just the build).
-      // Hosts without ~/go, ~/.npm, etc. are common, so skip absent dirs:
-      // the toolchain that wanted one still can't write it (as before the
-      // carve-out), but nothing else breaks. Same gate HIDE_PATHS uses.
+      // EXISTENCE GATE — load-bearing: bwrap aborts the WHOLE spawn if it
+      // must mkdir a tmpfs mountpoint under the read-only base. Skip absent.
       if (!pathExists(abs)) continue;
       flags.push('--tmpfs', abs);
     }
-  }
-  // Persistent dedicated cache bind (opt-in). Emitted AFTER the ephemeral
-  // `--tmpfs` carve-out (so it punches through the `~/.cache` tmpfs that
-  // nests it) and BEFORE the cwd bind + HIDE_PATHS overlays below (so a
-  // poisoned cache can never un-mask a credential — bwrap is last-wins).
-  // The redirect env vars steer each toolchain's cache HERE; this bind
-  // makes that subtree persist across spawns. Existence-gated: the
-  // bootstrap host-creates `persistBase`; if absent, the redirect still
-  // works (landing on the `~/.cache` tmpfs, ephemeral) instead of aborting.
-  if (persistBase !== null && pathExists(persistBase)) {
-    flags.push('--bind', persistBase, persistBase);
-  }
+    if (persistBase !== null && pathExists(persistBase)) {
+      flags.push('--bind', persistBase, persistBase);
+    }
+  };
   // Writable mounts per profile.
   //
   // Known limitation: bwrap's `--bind <src> <dst>` follows symlinks
@@ -627,9 +616,18 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
   // detected symlink targets, but the runtime sandbox layer does
   // not duplicate that check.
   if (profile === 'cwd-rw' || profile === 'cwd-rw-net') {
+    // Carve-out BEFORE the cwd bind so the cwd bind wins over a cache dir
+    // that contains it (e.g. cwd = ~/.cache/proj). cwd is outside ~ in the
+    // common case, so order is otherwise immaterial.
+    pushCacheCarveOut();
     flags.push('--bind', cwd, cwd);
   } else if (profile === 'home-rw') {
+    // Carve-out AFTER the $HOME bind: the bind covers ALL of ~ (incl.
+    // ~/.cache, ~/.npm, ~/go), so emitting before would let it re-expose the
+    // real host caches. Emitting after masks them and punches the dedicated
+    // Forja cache through. HIDE_PATHS below still win over both.
     flags.push('--bind', home, home);
+    pushCacheCarveOut();
   }
   // hide_paths — mask credential dirs + files. Applied AFTER the
   // writable mounts so that even on home-rw (which binds the full

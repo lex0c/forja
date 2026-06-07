@@ -300,15 +300,18 @@ export const buildSbplProfile = (
     writeRules.push(`(allow file-write* (subpath "${escapeSbplLiteral(home)}"))`);
   }
   // Opt-in persistent cache (cache_persistence). Same gate as the Linux
-  // runner: only a writable profile gets a writable persistent cache dir.
-  // Pushed onto writeRules → emitted BEFORE denyRules, so credential denies
-  // still win (SBPL last-match-wins). The dir is the Forja-dedicated base
-  // (`forjaCachePersistBase()`), never the host's real cache. macOS has no
-  // bind primitive, so this allow + the redirect env (in
+  // runner: every WRITABLE profile (cwd-rw / cwd-rw-net / home-rw) gets the
+  // dedicated persistent cache. Pushed onto writeRules → emitted BEFORE
+  // denyRules, so credential denies still win (SBPL last-match-wins). The dir
+  // is the Forja-dedicated base (`forjaCachePersistBase()`), never the host's
+  // real cache. home-rw IS included: its $HOME subpath-allow already covers
+  // this dir, but the matching redirect env (below) is what steers the
+  // toolchains HERE instead of the operator's real ~/.cache / ~/.npm. macOS
+  // has no bind primitive, so this allow + the redirect env (in
   // `buildSandboxExecArgv`) are the whole persistence mechanism here.
   if (
     getCachePersistenceOverride() === true &&
-    (profile === 'cwd-rw' || profile === 'cwd-rw-net')
+    (profile === 'cwd-rw' || profile === 'cwd-rw-net' || profile === 'home-rw')
   ) {
     writeRules.push(
       `(allow file-write* (subpath "${escapeSbplLiteral(forjaCachePersistBase())}"))`,
@@ -567,15 +570,17 @@ export const buildSandboxExecArgv = (options: BuildSandboxExecArgvOptions): stri
         envAssignments.push(`${key}=${value}`);
       }
     }
-    // Opt-in persistent cache redirect (cache_persistence). Same gate as
-    // the SBPL write-allow: only a writable profile. Inserted BETWEEN the
-    // host-env allowlist and the caller passthrough so a colliding
-    // passthrough key wins (parity with the Linux runner; the sets are
-    // disjoint in practice). macOS has no bind — this redirect + the SBPL
-    // write-allow are the whole persistence mechanism.
+    // Opt-in persistent cache redirect (cache_persistence). Same gate as the
+    // SBPL write-allow: every writable profile (cwd-rw / cwd-rw-net /
+    // home-rw). For home-rw this is the LOAD-BEARING half: $HOME is writable
+    // (no bind/tmpfs to mask the real caches as on Linux), so without the
+    // redirect the toolchains write the operator's real ~/.cache / ~/.npm /
+    // ~/go. Inserted BETWEEN the host-env allowlist and the caller passthrough
+    // so a colliding passthrough key wins (parity with the Linux runner; the
+    // sets are disjoint in practice).
     if (
       getCachePersistenceOverride() === true &&
-      (profile === 'cwd-rw' || profile === 'cwd-rw-net')
+      (profile === 'cwd-rw' || profile === 'cwd-rw-net' || profile === 'home-rw')
     ) {
       for (const [key, value] of Object.entries(buildCacheRedirectEnv(forjaCachePersistBase()))) {
         if (value.includes('\0')) continue;

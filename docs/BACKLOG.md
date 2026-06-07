@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-06] home-rw fora da isolação de cache → builds envenenavam os host caches reais
+
+**Bug (review):** o gate `writableProfile` (e o carve-out) incluía só `cwd-rw`/`cwd-rw-net`, deixando `home-rw` de fora → `persistBase` null → sem redirect env e sem cache carve-out. Como `home-rw` binda o `$HOME` real read-write, package managers (npm/pip/go/Gradle) escreviam nos caches REAIS do operador (`~/.cache`, `~/.npm`, `~/go`) em vez do cache dedicado — minando a isolação default-on e permitindo que builds sandboxed envenenassem caches usados FORA do Forja.
+
+**Fix (Linux):** `home-rw` entra no `writableProfile` (redirect env + persistBase). O carve-out (tmpfs masks dos host caches + bind do `persistBase`) foi extraído numa closure `pushCacheCarveOut` e emitido na posição certa por profile: ANTES do cwd bind (cwd-*, pra o cwd vencer sobre um cache dir que o contém) e DEPOIS do `$HOME` bind (home-rw, senão o bind re-exporia os host caches). HIDE_PATHS sempre depois — credenciais vencem. **macOS (paridade):** os dois gates (SBPL write-allow + redirect env) incluem `home-rw`; o redirect é o load-bearing lá (SBPL não tem tmpfs-mask).
+
+**Provado (bwrap real):** home-rw → `XDG_CACHE_HOME`/`npm_config_cache` apontam pro Forja cache, `~/.npm`/`~/.ssh` MASCARADOS, Forja cache persiste, e um `echo poison > ~/.npm` dentro do sandbox NÃO toca o host real. Testes: ro sem carve-out; home-rw COM (tmpfs masks + persistBase bind + redirect) emitido após o $HOME bind e antes das credential denies; macOS idem.
+
 ## [2026-06-06] Capability envelope §10.1 vazio em bypass mode → subagents escalavam
 
 **Bug (investigação do 2º bloqueador do `smoke-subagent-explore`):** `deriveParentCapabilities` deriva o envelope §10.1 SÓ das `allow rules` das tools (`hasAllowRule`: allow/allow_paths/allow_hosts) e **ignora `defaults.mode`**. Em **bypass mode** (que permite TUDO ao parent, sem allow rules) retorna `[]` → o §10.1 guard (`declared_caps ⊆ parent_caps`) trata qualquer cap declarada por um subagent como `excess` → `subagent_escalation`. Confirmado empírico: bypass → `[]`; child declara `read-fs:.` → excess `["read-fs:."]`. Resultado: em bypass, subagents que declaram caps escalam; só rodam com caps vazias (inúteis p/ fs). Afeta produção (qualquer operador em bypass), não só o smoke.

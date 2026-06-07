@@ -893,11 +893,17 @@ describe('macOS — opt-in persistent cache (cache_persistence)', () => {
     expect(PERSIST_BASE).toBe(forjaCachePersistBase()); // sanity: matches the runner helper
   });
 
-  test('ON but ro / home-rw — no persistent cache write-allow (writable-only gate)', () => {
+  test('ON but ro — no persistent cache write-allow (ro writes nothing)', () => {
     setCachePersistenceOverride(true);
-    for (const p of ['ro', 'home-rw'] as const) {
-      expect(buildSbplProfile(p, '/work/proj', '/home/op')).not.toContain(ALLOW);
-    }
+    expect(buildSbplProfile('ro', '/work/proj', '/home/op')).not.toContain(ALLOW);
+  });
+
+  test('ON + home-rw — SBPL grants write to the dedicated cache base', () => {
+    // home-rw is writable: it must get the dedicated cache too, else its PMs
+    // poison the operator's real ~/.cache / ~/.npm (its $HOME subpath allow
+    // exposes them; the redirect env steers PMs to the Forja base).
+    setCachePersistenceOverride(true);
+    expect(buildSbplProfile('home-rw', '/work/proj', '/home/op')).toContain(ALLOW);
   });
 
   test('ORDERING — the cache write-allow precedes the credential denies (last-match-wins)', () => {
@@ -922,6 +928,22 @@ describe('macOS — opt-in persistent cache (cache_persistence)', () => {
     expect(argv).toContain(`XDG_CACHE_HOME=${PERSIST_BASE}/xdg`);
     expect(argv).toContain(`npm_config_cache=${PERSIST_BASE}/npm`);
     expect(argv).toContain(`MAVEN_ARGS=-Dmaven.repo.local=${PERSIST_BASE}/maven`);
+  });
+
+  test('buildSandboxExecArgv (ON, home-rw) — env -i carries the redirect vars', () => {
+    // The load-bearing half for home-rw: without the redirect, PMs write the
+    // real host caches the writable $HOME exposes.
+    setCachePersistenceOverride(true);
+    const argv = buildSandboxExecArgv({
+      profile: 'home-rw',
+      cwd: '/work/proj',
+      home: '/home/op',
+      innerArgv: ['bash', '-s'],
+      env: { PATH: '/usr/bin' },
+      realpath: (p) => p,
+    });
+    expect(argv).toContain(`XDG_CACHE_HOME=${PERSIST_BASE}/xdg`);
+    expect(argv).toContain(`npm_config_cache=${PERSIST_BASE}/npm`);
   });
 
   test('buildSandboxExecArgv (OFF) — no redirect vars in env -i', () => {

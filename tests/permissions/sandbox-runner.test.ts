@@ -136,6 +136,13 @@ const hasTmpfs = (argv: readonly string[], target: string): boolean => {
   return false;
 };
 
+const tmpfsIndex = (argv: readonly string[], target: string): number => {
+  for (let i = 0; i < argv.length - 1; i++) {
+    if (argv[i] === '--tmpfs' && argv[i + 1] === target) return i;
+  }
+  return -1;
+};
+
 describe('buildBwrapArgv — writable dev-cache carve-out', () => {
   // The carve-out resolves explicit option > module-level override >
   // DEFAULT. Reset the override around each test so the default-path
@@ -180,22 +187,44 @@ describe('buildBwrapArgv — writable dev-cache carve-out', () => {
     expect(hasTmpfs(argv, `${HOME}/.cache`)).toBe(true);
   });
 
-  test('ro and home-rw do NOT get the cache carve-out', () => {
-    for (const profile of ['ro', 'home-rw'] as const) {
-      const argv = buildBwrapArgv({
-        profile,
-        cwd: CWD,
-        home: HOME,
-        innerArgv: INNER,
-        env: {},
-        realpath: (p) => p,
-        pathExists: EXISTS_ALL,
-      });
-      // The only tmpfs on these profiles is the common `/tmp`; no
-      // home-relative cache mounts.
-      expect(hasTmpfs(argv, `${HOME}/.cache`)).toBe(false);
-      expect(hasTmpfs(argv, `${HOME}/.npm`)).toBe(false);
-    }
+  test('ro does NOT get the cache carve-out (writes nothing)', () => {
+    const argv = buildBwrapArgv({
+      profile: 'ro',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: EXISTS_ALL,
+    });
+    // The only tmpfs on ro is the common `/tmp`; no home-relative caches.
+    expect(hasTmpfs(argv, `${HOME}/.cache`)).toBe(false);
+    expect(hasTmpfs(argv, `${HOME}/.npm`)).toBe(false);
+  });
+
+  test('home-rw DOES get the cache carve-out, AFTER the $HOME bind', () => {
+    // Bug fix: home-rw binds the real $HOME RW, so without the carve-out its
+    // package managers write the operator's REAL ~/.cache / ~/.npm. The tmpfs
+    // masks must come AFTER the $HOME bind (else the bind re-exposes them),
+    // and the credential overlays after that.
+    const argv = buildBwrapArgv({
+      profile: 'home-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: EXISTS_ALL,
+    });
+    expect(hasTmpfs(argv, `${HOME}/.cache`)).toBe(true);
+    expect(hasTmpfs(argv, `${HOME}/.npm`)).toBe(true);
+    // ordering: $HOME bind < cache tmpfs mask < credential overlay.
+    const homeBind = bindPairIndex(argv, HOME, HOME);
+    const cacheMask = tmpfsIndex(argv, `${HOME}/.cache`);
+    const credMask = tmpfsIndex(argv, `${HOME}/.ssh`);
+    expect(homeBind).toBeGreaterThanOrEqual(0);
+    expect(cacheMask).toBeGreaterThan(homeBind);
+    expect(credMask).toBeGreaterThan(cacheMask);
   });
 
   test('EXISTENCE GATE: an absent cache dir is skipped (no spawn-abort)', () => {
@@ -2056,21 +2085,39 @@ describe('buildBwrapArgv — persistent cache (cache_persistence; runner gate)',
     expect(bindPairIndex(argv, PERSIST_BASE, PERSIST_BASE)).toBeGreaterThanOrEqual(0);
   });
 
-  test('ON but profile=ro / home-rw — no persist (gate is cwd-rw* only)', () => {
+  test('ON but profile=ro — no persist (ro writes nothing)', () => {
     setCachePersistenceOverride(true);
-    for (const profile of ['ro', 'home-rw'] as const) {
-      const argv = buildBwrapArgv({
-        profile,
-        cwd: CWD,
-        home: HOME,
-        innerArgv: INNER,
-        env: {},
-        realpath: (p) => p,
-        pathExists: () => true,
-      });
-      expect(bindPairIndex(argv, PERSIST_BASE, PERSIST_BASE)).toBe(-1);
-      expect(argv.includes('XDG_CACHE_HOME')).toBe(false);
-    }
+    const argv = buildBwrapArgv({
+      profile: 'ro',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: () => true,
+    });
+    expect(bindPairIndex(argv, PERSIST_BASE, PERSIST_BASE)).toBe(-1);
+    expect(argv.includes('XDG_CACHE_HOME')).toBe(false);
+  });
+
+  test('ON + home-rw — persist bind + redirect, after the $HOME bind', () => {
+    // home-rw is a writable profile: it must get the dedicated cache too,
+    // else its PMs poison the real host caches the $HOME bind exposes.
+    setCachePersistenceOverride(true);
+    const argv = buildBwrapArgv({
+      profile: 'home-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: () => true,
+    });
+    const persistBind = bindPairIndex(argv, PERSIST_BASE, PERSIST_BASE);
+    const homeBind = bindPairIndex(argv, HOME, HOME);
+    expect(persistBind).toBeGreaterThanOrEqual(0);
+    expect(persistBind).toBeGreaterThan(homeBind); // bind punches through after $HOME
+    expect(argv.includes('XDG_CACHE_HOME')).toBe(true); // redirect env injected
   });
 
   test('ON but persistBase absent — redirect still injected, bind skipped (graceful degrade)', () => {
