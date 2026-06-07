@@ -47,6 +47,7 @@ import {
   statSync,
 } from 'node:fs';
 import { isAbsolute } from 'node:path';
+import { forjaSessionTmpDir } from '../storage/paths.ts';
 
 // Canonical system paths for each sandbox tool. Hard-coded because
 // these ARE the paths every mainstream distro installs to; deviating
@@ -374,10 +375,16 @@ export interface AcquireSandboxTmpdirOptions {
   // process invocation; tests pass a fixture string.
   sessionId: string;
   // Platform override for tests. Production omits and reads
-  // `process.platform`. Non-darwin paths return the no-op shape
-  // because Linux already isolates /tmp via bwrap's `--tmpfs /tmp`
-  // and Windows isn't supported.
+  // `process.platform`. On Linux a tmpdir is created ONLY when
+  // `sharedTmp` is on (else the `--tmpfs /tmp` default already
+  // isolates → no-op); darwin always creates one (SBPL tmpdir-subpath
+  // restriction + per-sandbox isolation); Windows isn't supported.
   platform?: NodeJS.Platform;
+  // Opt-in per-session persistent `/tmp` (`[sandbox] shared_tmp`). Linux
+  // only: when true, acquire `forjaSessionTmpDir(sessionId)` so the runner
+  // can bind it onto `/tmp`. Ignored on darwin (a tmpdir is always
+  // acquired there) and on unsupported platforms.
+  sharedTmp?: boolean;
   // mkdir seam. Production uses node:fs.mkdirSync; tests inject
   // a spy that records calls without touching the real /tmp.
   mkdir?: (path: string, opts: { recursive: true; mode: number }) => void;
@@ -406,13 +413,22 @@ export interface SandboxTmpdir {
 
 export const acquireSandboxTmpdir = (opts: AcquireSandboxTmpdirOptions): SandboxTmpdir => {
   const platform = opts.platform ?? process.platform;
-  if (platform !== 'darwin') {
-    // Linux: `bwrap --tmpfs /tmp` already isolates per sandbox.
-    // Windows: sandbox not supported in v2.
+  // Per-platform tmpdir decision:
+  //   darwin → ALWAYS `/tmp/forja-sb-<id>`. The SBPL tmpdir-subpath
+  //            restriction needs the `/tmp/` prefix (firmlink form), and it
+  //            provides per-sandbox isolation independent of shared_tmp.
+  //   linux  → `forjaSessionTmpDir(<id>)` ONLY when shared_tmp is on. Off,
+  //            the default `--tmpfs /tmp` already isolates per spawn, so
+  //            there's nothing to acquire (no-op → undefined).
+  //   other  → unsupported → no-op.
+  let tmpdir: string;
+  if (platform === 'darwin') {
+    tmpdir = defaultSandboxTmpdir(opts.sessionId);
+  } else if (platform === 'linux' && opts.sharedTmp === true) {
+    tmpdir = forjaSessionTmpDir(opts.sessionId);
+  } else {
     return { tmpdir: undefined, cleanup: () => {} };
   }
-
-  const tmpdir = defaultSandboxTmpdir(opts.sessionId);
   const mkdir =
     opts.mkdir ??
     ((p, o) => {
@@ -426,7 +442,7 @@ export const acquireSandboxTmpdir = (opts: AcquireSandboxTmpdirOptions): Sandbox
     const message = err.message ?? String(e);
     if (opts.warn !== undefined) {
       opts.warn(
-        `sandbox tmpdir mkdir failed for '${tmpdir}' (${code}: ${message}); falling back to shared /tmp (no per-sandbox isolation on macOS)`,
+        `sandbox tmpdir mkdir failed for '${tmpdir}' (${code}: ${message}); falling back to an ephemeral /tmp (no cross-spawn persistence this session)`,
       );
     }
     return { tmpdir: undefined, cleanup: () => {} };

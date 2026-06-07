@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { setWritableCacheDirsOverride } from '../../src/permissions/sandbox-cache-dirs.ts';
+import { setCachePersistenceOverride } from '../../src/permissions/sandbox-cache-env.ts';
 import { isSandboxProfile } from '../../src/permissions/sandbox-plan.ts';
 import {
   __resetSandboxMaskFileCacheForTest,
@@ -16,6 +17,18 @@ const HOME = '/home/op';
 // uses a session-cached file via ensureSandboxMaskFile); pin it so the
 // argv assertions don't depend on the runner's data dir / create a file.
 const MASK = '/forja-mask-empty';
+
+// Defensive isolation: the persistence toggles are PROCESS-GLOBAL modules
+// (sandbox-cache-env / sandbox-cache-dirs) and `bun test` shares modules
+// across files. Other files that run bootstrap() set them — with default-ON,
+// bootstrap sets cachePersistence=true — and a leaked override would corrupt
+// the argv-shape assertions here that assume the default (off). Reset both
+// before EVERY test; the persistent-cache / dev-cache describes set their own
+// values in their own hooks/bodies (which run after this top-level one).
+beforeEach(() => {
+  setCachePersistenceOverride(undefined);
+  setWritableCacheDirsOverride(undefined);
+});
 
 describe('buildBwrapArgv — host profile (passthrough)', () => {
   test('host returns innerArgv unchanged', () => {
@@ -123,6 +136,13 @@ const hasTmpfs = (argv: readonly string[], target: string): boolean => {
   return false;
 };
 
+const tmpfsIndex = (argv: readonly string[], target: string): number => {
+  for (let i = 0; i < argv.length - 1; i++) {
+    if (argv[i] === '--tmpfs' && argv[i + 1] === target) return i;
+  }
+  return -1;
+};
+
 describe('buildBwrapArgv — writable dev-cache carve-out', () => {
   // The carve-out resolves explicit option > module-level override >
   // DEFAULT. Reset the override around each test so the default-path
@@ -167,22 +187,44 @@ describe('buildBwrapArgv — writable dev-cache carve-out', () => {
     expect(hasTmpfs(argv, `${HOME}/.cache`)).toBe(true);
   });
 
-  test('ro and home-rw do NOT get the cache carve-out', () => {
-    for (const profile of ['ro', 'home-rw'] as const) {
-      const argv = buildBwrapArgv({
-        profile,
-        cwd: CWD,
-        home: HOME,
-        innerArgv: INNER,
-        env: {},
-        realpath: (p) => p,
-        pathExists: EXISTS_ALL,
-      });
-      // The only tmpfs on these profiles is the common `/tmp`; no
-      // home-relative cache mounts.
-      expect(hasTmpfs(argv, `${HOME}/.cache`)).toBe(false);
-      expect(hasTmpfs(argv, `${HOME}/.npm`)).toBe(false);
-    }
+  test('ro does NOT get the cache carve-out (writes nothing)', () => {
+    const argv = buildBwrapArgv({
+      profile: 'ro',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: EXISTS_ALL,
+    });
+    // The only tmpfs on ro is the common `/tmp`; no home-relative caches.
+    expect(hasTmpfs(argv, `${HOME}/.cache`)).toBe(false);
+    expect(hasTmpfs(argv, `${HOME}/.npm`)).toBe(false);
+  });
+
+  test('home-rw DOES get the cache carve-out, AFTER the $HOME bind', () => {
+    // Bug fix: home-rw binds the real $HOME RW, so without the carve-out its
+    // package managers write the operator's REAL ~/.cache / ~/.npm. The tmpfs
+    // masks must come AFTER the $HOME bind (else the bind re-exposes them),
+    // and the credential overlays after that.
+    const argv = buildBwrapArgv({
+      profile: 'home-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: EXISTS_ALL,
+    });
+    expect(hasTmpfs(argv, `${HOME}/.cache`)).toBe(true);
+    expect(hasTmpfs(argv, `${HOME}/.npm`)).toBe(true);
+    // ordering: $HOME bind < cache tmpfs mask < credential overlay.
+    const homeBind = bindPairIndex(argv, HOME, HOME);
+    const cacheMask = tmpfsIndex(argv, `${HOME}/.cache`);
+    const credMask = tmpfsIndex(argv, `${HOME}/.ssh`);
+    expect(homeBind).toBeGreaterThanOrEqual(0);
+    expect(cacheMask).toBeGreaterThan(homeBind);
+    expect(credMask).toBeGreaterThan(cacheMask);
   });
 
   test('EXISTENCE GATE: an absent cache dir is skipped (no spawn-abort)', () => {
@@ -1401,6 +1443,12 @@ describe('buildBwrapArgv — XDG_CONFIG_HOME unmask defense (slice 146)', () => 
     expect(argvStr).toContain('--tmpfs /srv/conf/sops');
     expect(argvStr).toContain('--tmpfs /srv/conf/agent');
     expect(argvStr).toContain('--tmpfs /srv/conf/forja');
+    // FILES under .config/* (NuGet/Composer auth) must ALSO be masked at the
+    // relocated path, not only home-relative (#2 review fix). Without it, a
+    // relocated XDG_CONFIG_HOME left the real registry-token files readable.
+    expect(argvStr).toContain(`--ro-bind ${MASK} /home/op/.config/NuGet/NuGet.Config`);
+    expect(argvStr).toContain(`--ro-bind ${MASK} /srv/conf/NuGet/NuGet.Config`);
+    expect(argvStr).toContain(`--ro-bind ${MASK} /srv/conf/composer/auth.json`);
   });
 
   test('XDG_CONFIG_HOME equal to home-relative default: no duplicate overlays', () => {
@@ -1960,5 +2008,331 @@ describe('buildBwrapArgv — production credential-file mask source (no seam)', 
       __resetSandboxMaskFileCacheForTest();
       rmSync(tmp, { recursive: true, force: true });
     }
+  });
+});
+
+// ── Opt-in persistence: cache_persistence + shared_tmp (this slice) ──
+
+const hasSetenvFlag = (argv: readonly string[], key: string, value: string): boolean => {
+  for (let i = 0; i < argv.length - 2; i++) {
+    if (argv[i] === '--setenv' && argv[i + 1] === key && argv[i + 2] === value) return true;
+  }
+  return false;
+};
+const bindPairIndex = (argv: readonly string[], src: string, dst: string): number => {
+  for (let i = 0; i < argv.length - 2; i++) {
+    if (argv[i] === '--bind' && argv[i + 1] === src && argv[i + 2] === dst) return i;
+  }
+  return -1;
+};
+
+describe('buildBwrapArgv — persistent cache (cache_persistence; runner gate)', () => {
+  // Pin XDG_CACHE_HOME to <HOME>/.cache so forjaCachePersistBase() lands at
+  // <HOME>/.cache/forja/cache — NESTED under the `.cache` tmpfs carve-out,
+  // exactly like production with XDG unset. Lets us assert the punch-through
+  // ordering for real. Reset BOTH module overrides around each test.
+  let origXdgCache: string | undefined;
+  beforeEach(() => {
+    origXdgCache = process.env.XDG_CACHE_HOME;
+    process.env.XDG_CACHE_HOME = `${HOME}/.cache`;
+    setCachePersistenceOverride(undefined);
+    setWritableCacheDirsOverride(undefined);
+  });
+  afterEach(() => {
+    setCachePersistenceOverride(undefined);
+    setWritableCacheDirsOverride(undefined);
+    if (origXdgCache === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = origXdgCache;
+  });
+
+  const PERSIST_BASE = `${HOME}/.cache/forja/cache`;
+
+  // The RUNNER is gated on the explicit override (undefined → off): a
+  // defensive posture so any path that forgot to set it stays ephemeral.
+  // Production resolves the default (ON) at bootstrap/subagent, NOT here.
+  test('no override set → runner stays ephemeral (no redirect env, no persistent bind)', () => {
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: () => true,
+    });
+    expect(bindPairIndex(argv, PERSIST_BASE, PERSIST_BASE)).toBe(-1);
+    expect(argv.includes('XDG_CACHE_HOME')).toBe(false);
+    expect(argv.includes('MAVEN_ARGS')).toBe(false);
+  });
+
+  test('ON (cwd-rw) — injects redirect env (incl. the Maven flag form) + persistent bind', () => {
+    setCachePersistenceOverride(true);
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: () => true,
+    });
+    expect(hasSetenvFlag(argv, 'XDG_CACHE_HOME', `${PERSIST_BASE}/xdg`)).toBe(true);
+    expect(hasSetenvFlag(argv, 'GOMODCACHE', `${PERSIST_BASE}/go/mod`)).toBe(true);
+    expect(hasSetenvFlag(argv, 'npm_config_cache', `${PERSIST_BASE}/npm`)).toBe(true);
+    expect(hasSetenvFlag(argv, 'MAVEN_ARGS', `-Dmaven.repo.local=${PERSIST_BASE}/maven`)).toBe(
+      true,
+    );
+    expect(bindPairIndex(argv, PERSIST_BASE, PERSIST_BASE)).toBeGreaterThanOrEqual(0);
+  });
+
+  test('ON but profile=ro — no persist (ro writes nothing)', () => {
+    setCachePersistenceOverride(true);
+    const argv = buildBwrapArgv({
+      profile: 'ro',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: () => true,
+    });
+    expect(bindPairIndex(argv, PERSIST_BASE, PERSIST_BASE)).toBe(-1);
+    expect(argv.includes('XDG_CACHE_HOME')).toBe(false);
+  });
+
+  test('ON + home-rw — persist bind + redirect, after the $HOME bind', () => {
+    // home-rw is a writable profile: it must get the dedicated cache too,
+    // else its PMs poison the real host caches the $HOME bind exposes.
+    setCachePersistenceOverride(true);
+    const argv = buildBwrapArgv({
+      profile: 'home-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: () => true,
+    });
+    const persistBind = bindPairIndex(argv, PERSIST_BASE, PERSIST_BASE);
+    const homeBind = bindPairIndex(argv, HOME, HOME);
+    expect(persistBind).toBeGreaterThanOrEqual(0);
+    expect(persistBind).toBeGreaterThan(homeBind); // bind punches through after $HOME
+    expect(argv.includes('XDG_CACHE_HOME')).toBe(true); // redirect env injected
+  });
+
+  test('ON but persistBase absent — redirect still injected, bind skipped (graceful degrade)', () => {
+    setCachePersistenceOverride(true);
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: (p) => p !== PERSIST_BASE, // everything exists except the base
+    });
+    expect(hasSetenvFlag(argv, 'XDG_CACHE_HOME', `${PERSIST_BASE}/xdg`)).toBe(true);
+    expect(bindPairIndex(argv, PERSIST_BASE, PERSIST_BASE)).toBe(-1);
+  });
+
+  test('ORDERING: persist bind AFTER the .cache tmpfs, BEFORE cwd bind + credential overlay', () => {
+    setCachePersistenceOverride(true);
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      maskFileSource: MASK,
+      pathExists: () => true, // .cache carve-out + persistBase + .netrc all present
+    });
+    const cacheTmpfs = argv.indexOf(`${HOME}/.cache`);
+    const persistBind = bindPairIndex(argv, PERSIST_BASE, PERSIST_BASE);
+    const cwdBind = bindPairIndex(argv, CWD, CWD);
+    const credOverlay = argv.indexOf(`${HOME}/.netrc`);
+    expect(cacheTmpfs).toBeGreaterThanOrEqual(0);
+    expect(persistBind).toBeGreaterThan(cacheTmpfs);
+    expect(cwdBind).toBeGreaterThan(persistBind);
+    expect(credOverlay).toBeGreaterThan(persistBind);
+  });
+
+  test('caller passthrough (FORJA_BROKER_WORKER) coexists with the redirect env', () => {
+    setCachePersistenceOverride(true);
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: () => true,
+      passthroughEnv: { FORJA_BROKER_WORKER: '1' },
+    });
+    expect(hasSetenvFlag(argv, 'FORJA_BROKER_WORKER', '1')).toBe(true);
+    expect(hasSetenvFlag(argv, 'XDG_CACHE_HOME', `${PERSIST_BASE}/xdg`)).toBe(true);
+  });
+});
+
+describe('buildBwrapArgv — per-session /tmp (shared_tmp / sessionTmpDir)', () => {
+  const SESSION_TMP = `${HOME}/.cache/forja/tmp/sessions/sess-1`;
+
+  test('default (no sessionTmpDir) — /tmp stays a fresh tmpfs', () => {
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: () => true,
+    });
+    expect(hasTmpfs(argv, '/tmp')).toBe(true);
+    expect(bindPairIndex(argv, SESSION_TMP, '/tmp')).toBe(-1);
+  });
+
+  test('sessionTmpDir set — /tmp becomes a bind of the session dir (tmpfs replaced in place)', () => {
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: () => true,
+      sessionTmpDir: SESSION_TMP,
+    });
+    expect(hasTmpfs(argv, '/tmp')).toBe(false);
+    expect(bindPairIndex(argv, SESSION_TMP, '/tmp')).toBeGreaterThanOrEqual(0);
+  });
+
+  test('maybeWrapSandboxArgv (linux) maps the tmpdir option to the /tmp bind', () => {
+    const argv = maybeWrapSandboxArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      platform: 'linux',
+      which: (name) => (name === 'bwrap' ? '/usr/bin/bwrap' : null),
+      exists: (p) => p === '/usr/bin/bwrap',
+      realpath: (p) => p,
+      pathExists: () => true,
+      tmpdir: SESSION_TMP,
+    });
+    expect(hasTmpfs(argv, '/tmp')).toBe(false);
+    expect(bindPairIndex(argv, SESSION_TMP, '/tmp')).toBeGreaterThanOrEqual(0);
+  });
+
+  test('non-writable profile (ro) ignores sessionTmpDir — /tmp stays a fresh tmpfs', () => {
+    const argv = buildBwrapArgv({
+      profile: 'ro',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: () => true,
+      sessionTmpDir: SESSION_TMP,
+    });
+    // ro keeps the ephemeral, isolated per-spawn tmpfs; no session bind,
+    // and no forced TMPDIR (the bind didn't happen).
+    expect(hasTmpfs(argv, '/tmp')).toBe(true);
+    expect(bindPairIndex(argv, SESSION_TMP, '/tmp')).toBe(-1);
+    expect(hasSetenvFlag(argv, 'TMPDIR', '/tmp')).toBe(false);
+  });
+
+  test('writable profile + /tmp bind forces TMPDIR=/tmp (passthrough overrides host TMPDIR)', () => {
+    const argv = buildBwrapArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      // Host TMPDIR points elsewhere; the forced TMPDIR=/tmp must win.
+      env: { TMPDIR: '/var/tmp' },
+      realpath: (p) => p,
+      pathExists: () => true,
+      sessionTmpDir: SESSION_TMP,
+    });
+    expect(bindPairIndex(argv, SESSION_TMP, '/tmp')).toBeGreaterThanOrEqual(0);
+    expect(hasSetenvFlag(argv, 'TMPDIR', '/tmp')).toBe(true);
+    // The safe-list emits the host TMPDIR (=/var/tmp) first; the forced
+    // /tmp is emitted later via passthrough, so bwrap last-wins → /tmp.
+    const idxHost = argv.findIndex(
+      (v, i) => v === '--setenv' && argv[i + 1] === 'TMPDIR' && argv[i + 2] === '/var/tmp',
+    );
+    const idxTmp = argv.findIndex(
+      (v, i) => v === '--setenv' && argv[i + 1] === 'TMPDIR' && argv[i + 2] === '/tmp',
+    );
+    expect(idxHost).toBeGreaterThanOrEqual(0);
+    expect(idxTmp).toBeGreaterThan(idxHost);
+  });
+});
+
+describe('maybeWrapSandboxArgv — fail-closed on mid-session sandbox loss', () => {
+  test('failClosed + non-host profile + tool gone → throws (mid-session loss)', () => {
+    expect(() =>
+      maybeWrapSandboxArgv({
+        profile: 'cwd-rw',
+        cwd: CWD,
+        home: HOME,
+        innerArgv: INNER,
+        env: {},
+        platform: 'linux',
+        which: () => null, // bwrap vanished mid-session
+        exists: () => false, // canonical /usr/bin/bwrap gone too
+        realpath: (p) => p,
+        failClosed: true,
+      }),
+    ).toThrow(/unavailable mid-session/);
+  });
+
+  test('without failClosed → graceful passthrough (never-had host)', () => {
+    const argv = maybeWrapSandboxArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      platform: 'linux',
+      which: () => null,
+      exists: () => false,
+      realpath: (p) => p,
+      // failClosed omitted → default; keeps the degraded passthrough
+    });
+    expect(argv).toEqual([...INNER]);
+  });
+
+  test('failClosed but host profile → no throw (host returns early)', () => {
+    const argv = maybeWrapSandboxArgv({
+      profile: 'host',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      platform: 'linux',
+      which: () => null,
+      exists: () => false,
+      realpath: (p) => p,
+      failClosed: true,
+    });
+    expect(argv).toEqual([...INNER]);
+  });
+
+  test('failClosed but tool STILL available → wraps normally (no throw)', () => {
+    const argv = maybeWrapSandboxArgv({
+      profile: 'cwd-rw',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      platform: 'linux',
+      which: (n) => (n === 'bwrap' ? '/usr/bin/bwrap' : null),
+      exists: (p) => p === '/usr/bin/bwrap',
+      realpath: (p) => p,
+      pathExists: () => true,
+      failClosed: true,
+    });
+    expect(argv[0]).toBe('/usr/bin/bwrap');
   });
 });

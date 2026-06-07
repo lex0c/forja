@@ -658,6 +658,12 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
       // bootstrap mkdir failed (sandboxTmpdir is undefined; the
       // wrap degrades to pre-slice-156 blanket allow).
       ...(sandboxTmpdir !== undefined ? { tmpdir: sandboxTmpdir } : {}),
+      // fail-closed on mid-session loss when a tool was present at boot
+      // (sandboxBootTool set). probeSandboxLoss above already audits the
+      // loss for the operator; this surfaces it to the LLM as the tool's
+      // error (caught by bash_background's try/catch) instead of a silent
+      // unsandboxed bg process.
+      failClosed: sandboxBootTool !== undefined,
     });
 
     // Slice 153 (review): switch to piped streams + drainer tasks.

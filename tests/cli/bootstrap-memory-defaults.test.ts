@@ -19,6 +19,8 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { bootstrap } from '../../src/cli/bootstrap.ts';
+import { setWritableCacheDirsOverride } from '../../src/permissions/sandbox-cache-dirs.ts';
+import { setCachePersistenceOverride } from '../../src/permissions/sandbox-cache-env.ts';
 import type { Provider } from '../../src/providers/index.ts';
 
 let workdir: string;
@@ -26,6 +28,7 @@ let dbPath: string;
 let markerDir: string;
 let originalKey: string | undefined;
 let originalXdg: string | undefined;
+let originalXdgCache: string | undefined;
 let stderrChunks: string[];
 let originalStderrWrite: typeof process.stderr.write;
 
@@ -77,16 +80,28 @@ beforeEach(() => {
   // never create) instead of the developer's real ~/.config.
   originalXdg = process.env.XDG_CONFIG_HOME;
   process.env.XDG_CONFIG_HOME = workdir;
+  // Persistence toggles default ON → pin the cache home to the workdir so
+  // bootstrap's cache mkdir + session tmpdir land here (swept by the
+  // afterEach rmSync), not in the dev's real ~/.cache, and emit no stderr
+  // the banner assertions would see.
+  originalXdgCache = process.env.XDG_CACHE_HOME;
+  process.env.XDG_CACHE_HOME = workdir;
   captureStderr();
 });
 
 afterEach(() => {
   restoreStderr();
+  // Persistence toggles are process-global; bootstrap() sets them
+  // (default-ON). Reset so they don't leak into other test files.
+  setCachePersistenceOverride(undefined);
+  setWritableCacheDirsOverride(undefined);
   rmSync(workdir, { recursive: true, force: true });
   if (originalKey === undefined) delete process.env.ANTHROPIC_API_KEY;
   else process.env.ANTHROPIC_API_KEY = originalKey;
   if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME;
   else process.env.XDG_CONFIG_HOME = originalXdg;
+  if (originalXdgCache === undefined) delete process.env.XDG_CACHE_HOME;
+  else process.env.XDG_CACHE_HOME = originalXdgCache;
 });
 
 describe('bootstrap: memory governance defaults', () => {

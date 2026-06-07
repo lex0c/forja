@@ -3,6 +3,8 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULT_MODEL, bootstrap } from '../../src/cli/bootstrap.ts';
+import { setWritableCacheDirsOverride } from '../../src/permissions/sandbox-cache-dirs.ts';
+import { setCachePersistenceOverride } from '../../src/permissions/sandbox-cache-env.ts';
 import type { Provider } from '../../src/providers/index.ts';
 import { flattenSystemSegments } from '../../src/providers/types.ts';
 
@@ -10,6 +12,7 @@ let workdir: string;
 let dbPath: string;
 let originalKey: string | undefined;
 let originalXdg: string | undefined;
+let originalXdgCache: string | undefined;
 
 const mockProvider: Provider = {
   id: 'mock/m',
@@ -46,14 +49,28 @@ beforeEach(() => {
   // leak into "passes through unchanged" assertions.
   originalXdg = process.env.XDG_CONFIG_HOME;
   process.env.XDG_CONFIG_HOME = workdir;
+  // Isolate the sandbox cache + per-session /tmp under the workdir too:
+  // the persistence toggles default ON, so bootstrap host-creates
+  // `<cache>/forja/cache` and acquires a session tmpdir there. Pinning
+  // XDG_CACHE_HOME keeps those out of the dev's real ~/.cache; the
+  // afterEach rmSync of workdir sweeps them.
+  originalXdgCache = process.env.XDG_CACHE_HOME;
+  process.env.XDG_CACHE_HOME = workdir;
 });
 
 afterEach(() => {
+  // The persistence toggles are process-global; bootstrap() sets them
+  // (default-ON → cachePersistence=true). Reset so they don't leak into
+  // other test files (bun shares modules across the run).
+  setCachePersistenceOverride(undefined);
+  setWritableCacheDirsOverride(undefined);
   rmSync(workdir, { recursive: true, force: true });
   if (originalKey === undefined) delete process.env.ANTHROPIC_API_KEY;
   else process.env.ANTHROPIC_API_KEY = originalKey;
   if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME;
   else process.env.XDG_CONFIG_HOME = originalXdg;
+  if (originalXdgCache === undefined) delete process.env.XDG_CACHE_HOME;
+  else process.env.XDG_CACHE_HOME = originalXdgCache;
 });
 
 describe('bootstrap', () => {

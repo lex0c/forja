@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { loadRetentionConfig } from '../audit/config-loader.ts';
@@ -10,6 +10,8 @@ import {
   createSpawnBroker,
 } from '../broker/index.ts';
 import {
+  DEFAULT_CACHE_PERSISTENCE,
+  DEFAULT_SHARED_TMP,
   loadBudgetConfig,
   loadEffortConfig,
   loadMemoryConfig,
@@ -52,6 +54,7 @@ import {
   preflightPermissionEngine,
 } from '../permissions/index.ts';
 import { setWritableCacheDirsOverride } from '../permissions/sandbox-cache-dirs.ts';
+import { setCachePersistenceOverride } from '../permissions/sandbox-cache-env.ts';
 import { createDefaultRegistry } from '../providers/index.ts';
 import type { Provider } from '../providers/index.ts';
 import type { SystemSegment } from '../providers/types.ts';
@@ -62,6 +65,7 @@ import {
   resolveScopeRoots as resolveSkillScopeRoots,
 } from '../skills/index.ts';
 import { type DB, closeDb, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import { forjaCachePersistBase } from '../storage/paths.ts';
 import {
   GOVERNANCE_PROPOSAL_TTL_MS,
   expirePendingProposals,
@@ -498,6 +502,23 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // other config loaders.
   const sandboxLoaded = loadSandboxConfig({ cwd: projectConfigCwd });
   setWritableCacheDirsOverride(sandboxLoaded.config.writableCacheDirs);
+  // Opt-in persistent dedicated cache (`[sandbox] cache_persistence`). Set
+  // the same module-level override the runner reads, so every spawn site
+  // (broker bash, bg bash, grep) picks it up without threading. When on,
+  // host-create the dedicated cache base so the runner's `--bind` source
+  // exists (an absent bind source aborts the spawn). Failure degrades to
+  // the ephemeral `~/.cache` tmpfs — warn, don't crash.
+  const cachePersist = sandboxLoaded.config.cachePersistence ?? DEFAULT_CACHE_PERSISTENCE;
+  setCachePersistenceOverride(cachePersist);
+  if (cachePersist) {
+    try {
+      mkdirSync(forjaCachePersistBase(), { recursive: true, mode: 0o700 });
+    } catch (e) {
+      process.stderr.write(
+        `forja: could not create persistent cache dir (${e instanceof Error ? e.message : String(e)}); caches will be ephemeral this session\n`,
+      );
+    }
+  }
 
   // First-run banner. Fires once per machine when:
   //   (a) both detectors resolve to ON,
@@ -700,6 +721,10 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   //     decided to exit.
   const sandboxTmpdirHandle: SandboxTmpdir = acquireSandboxTmpdir({
     sessionId: generateUlid(),
+    // Linux: only acquire a persistent session /tmp when shared_tmp is on
+    // (else the default `--tmpfs /tmp` already isolates per spawn). Darwin
+    // ignores this and always acquires its SBPL tmpdir.
+    sharedTmp: sandboxLoaded.config.sharedTmp ?? DEFAULT_SHARED_TMP,
     warn: (m) => {
       process.stderr.write(`forja: ${m}\n`);
     },
@@ -1401,7 +1426,12 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     if (input.brokerMode !== undefined) return input.brokerMode;
     return sandboxAvail.available ? 'spawn' : 'in-process';
   })();
-  const broker = constructBroker(resolvedBrokerMode, cwd, sandboxTmpdirHandle.tmpdir);
+  const broker = constructBroker(
+    resolvedBrokerMode,
+    cwd,
+    sandboxTmpdirHandle.tmpdir,
+    sandboxAvail.available,
+  );
 
   const config: HarnessConfig = {
     provider,
@@ -1612,6 +1642,13 @@ const constructBroker = (
   mode: 'in-process' | 'spawn',
   cwd: string,
   sandboxTmpdir: string | undefined,
+  // True iff a sandbox tool was available at boot. Drives the broker's
+  // fail-closed posture: in spawn mode with the tool present at boot, a
+  // non-host profile that can't resolve the tool now is a mid-session LOSS
+  // → throw (surfaces as a tool error) instead of silent passthrough. False
+  // when spawn was force-selected without a tool (`--broker spawn` on a host
+  // with no bwrap) — it never had one, so keep the graceful degrade.
+  sandboxAvailableAtBoot: boolean,
 ): Broker => {
   if (mode === 'spawn') {
     // Slice 103 (R6 #9): no `as SandboxProfile` cast. The TS
@@ -1646,6 +1683,11 @@ const constructBroker = (
         innerArgv,
         ...(sandboxTmpdir !== undefined ? { tmpdir: sandboxTmpdir } : {}),
         passthroughEnv: { FORJA_BROKER_WORKER: '1' },
+        // fail-closed on mid-session sandbox loss when the tool was present
+        // at boot. A non-host profile that can't wrap now → throw → broker
+        // maps to 'sandbox wrap failed' → tool error (LLM + operator see it)
+        // instead of a silent unsandboxed run.
+        failClosed: sandboxAvailableAtBoot,
       });
     // Slice 157 (phase 2): also overlay TMPDIR on the worker spawn's
     // env. The wrap above scopes WHERE the sandbox lets writes land;

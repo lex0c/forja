@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { grepTool } from '../../src/tools/builtin/grep.ts';
+import { buildGrepSpawnEnv, grepTool } from '../../src/tools/builtin/grep.ts';
 import { isToolError } from '../../src/tools/types.ts';
 import { makeCtx } from './_helpers.ts';
 
@@ -129,6 +129,53 @@ describe.if(RG_AVAILABLE)('grepTool (with ripgrep)', () => {
     );
     if (!isToolError(out)) throw new Error('expected error');
     expect(out.error_code).toBe('tool.invalid_arg');
+  });
+});
+
+// Credential hygiene for the spawned ripgrep. In degraded / host mode there
+// is no sandbox `--clearenv` to shape the env at the kernel boundary, so
+// whatever `Bun.spawn({ env })` passes is exactly what rg — or a PATH shim
+// impersonating rg — sees in `/proc/self/environ`. Pre-fix, grep inherited
+// the raw `process.env`, which inside a subagent child carries the provider
+// API key (kept so the child can reach its model) plus every other operator
+// secret. These tests pin the scrub so a regression that reverts to raw
+// inheritance fails loudly.
+describe('buildGrepSpawnEnv (credential scrub)', () => {
+  const saved = new Map<string, string | undefined>();
+  const stub = (key: string, value: string): void => {
+    if (!saved.has(key)) saved.set(key, process.env[key]);
+    process.env[key] = value;
+  };
+  afterEach(() => {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    saved.clear();
+  });
+
+  test('strips provider API keys so a ripgrep PATH shim cannot recover them', () => {
+    stub('ANTHROPIC_API_KEY', 'sk-ant-secret');
+    stub('OPENAI_API_KEY', 'sk-openai-secret');
+    stub('GEMINI_API_KEY', 'gemini-secret');
+    const env = buildGrepSpawnEnv(undefined);
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(env.OPENAI_API_KEY).toBeUndefined();
+    expect(env.GEMINI_API_KEY).toBeUndefined();
+  });
+
+  test('strips generic operator secrets but keeps PATH so rg still resolves', () => {
+    stub('AWS_SECRET_ACCESS_KEY', 'aws-secret');
+    stub('GITHUB_TOKEN', 'ghp_secret');
+    const env = buildGrepSpawnEnv(undefined);
+    expect(env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+    expect(env.GITHUB_TOKEN).toBeUndefined();
+    expect(env.PATH).toBe(process.env.PATH);
+  });
+
+  test('overlays a sandbox TMPDIR only when one is provided', () => {
+    expect(buildGrepSpawnEnv(undefined).TMPDIR).toBe(process.env.TMPDIR);
+    expect(buildGrepSpawnEnv('/run/forja/tmp/abc').TMPDIR).toBe('/run/forja/tmp/abc');
   });
 });
 

@@ -167,6 +167,30 @@ const SCRUB_PATTERNS: readonly RegExp[] = [
   /^XDG_RUNTIME_DIR$/,
 ];
 
+// Provider API-key env vars. They DO match SCRUB_PATTERNS (and must — a
+// sandboxed bash must never see them), but a subagent CHILD *process* needs
+// its provider key to talk to the model it was assigned, or it dies
+// "API key required" before running a single step. The subagent spawn
+// passes these via `scrubEnv(env, { keep })`; every other credential stays
+// stripped. The key stays on the child's `process.env` for the lifetime of
+// the run, so the invariant that protects it is: EVERY subprocess the child
+// spawns must receive an explicitly-shaped env, never raw `process.env`
+// inheritance. That holds across the surface —
+//   - bash broker / bg manager → `scrubEnv(process.env)`,
+//   - git (checkpoints, worktrees, memory) → `safeGitEnv()` allowlist,
+//   - hooks → `buildHookEnv` allowlist,
+//   - grep's ripgrep → `buildGrepSpawnEnv` → `scrubEnv(process.env)`,
+//   - sandboxed tools → bwrap `--clearenv` / macOS `env -i` at the boundary.
+// so the key reaches only the child's own HTTP call to the provider, never a
+// subprocess. A new spawn site that inherits the raw env would re-open the
+// leak — keep it on this list. Mirror the adapters in src/providers/*/index.ts.
+export const PROVIDER_API_KEY_VARS: readonly string[] = [
+  'ANTHROPIC_API_KEY',
+  'OPENAI_API_KEY',
+  'GOOGLE_API_KEY',
+  'GEMINI_API_KEY',
+];
+
 // Returns a defensive copy with credential-like vars removed. Undefined
 // values (NodeJS.ProcessEnv allows them) are dropped; the result is a
 // strict Record<string, string> ready for `Bun.spawn({ env })`.
@@ -175,11 +199,20 @@ const SCRUB_PATTERNS: readonly RegExp[] = [
 // Both reach this layer before kernel-level execve sees the env, so a
 // process spawned through either tool sees the sanitized environment
 // regardless of category — uniform protection at the boundary.
-export const scrubEnv = (env: NodeJS.ProcessEnv): Record<string, string> => {
+//
+// `opts.keep` is an allowlist of var names preserved even when they match a
+// scrub pattern — used ONLY by the subagent spawn for provider keys (see
+// PROVIDER_API_KEY_VARS). It never invents values: a kept var still has to
+// be present in `env`.
+export const scrubEnv = (
+  env: NodeJS.ProcessEnv,
+  opts?: { keep?: readonly string[] },
+): Record<string, string> => {
+  const keep = opts?.keep !== undefined ? new Set(opts.keep) : undefined;
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(env)) {
     if (v === undefined) continue;
-    if (SCRUB_PATTERNS.some((p) => p.test(k))) continue;
+    if (keep?.has(k) !== true && SCRUB_PATTERNS.some((p) => p.test(k))) continue;
     out[k] = v;
   }
   return out;

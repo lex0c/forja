@@ -1,12 +1,18 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { computeSchemaRetryBudget, runSubagentChild } from '../../src/cli/subagent-child.ts';
+import { runAgent } from '../../src/harness/index.ts';
+import { detectSandboxAvailability } from '../../src/permissions/index.ts';
 import {
   getWritableCacheDirsOverride,
   setWritableCacheDirsOverride,
 } from '../../src/permissions/sandbox-cache-dirs.ts';
+import {
+  getCachePersistenceOverride,
+  setCachePersistenceOverride,
+} from '../../src/permissions/sandbox-cache-env.ts';
 import type { Provider, StreamEvent } from '../../src/providers/index.ts';
 import { openDb } from '../../src/storage/db.ts';
 import {
@@ -40,6 +46,7 @@ afterEach(() => {
   // The child sets the process-global sandbox cache-dir override; reset
   // it so it can't leak into another test (here or in another file).
   setWritableCacheDirsOverride(undefined);
+  setCachePersistenceOverride(undefined);
   try {
     unlinkSync(dbPath);
   } catch {}
@@ -170,11 +177,15 @@ describe('runSubagentChild', () => {
       // git repo so resolveRepoRoot (git rev-parse) finds the root.
       Bun.spawnSync({ cmd: ['git', 'init', '-q', repo] });
       mkdirSync(join(repo, '.agent'), { recursive: true });
-      writeFileSync(join(repo, '.agent', 'config.toml'), '[sandbox]\nwritable_cache_dirs = []\n');
+      writeFileSync(
+        join(repo, '.agent', 'config.toml'),
+        '[sandbox]\nwritable_cache_dirs = []\ncache_persistence = true\n',
+      );
       const sub = join(repo, 'pkg', 'inner');
       mkdirSync(sub, { recursive: true });
-      // Pre-seed a distinct value to prove the child actually re-resolves.
+      // Pre-seed distinct values to prove the child actually re-resolves.
       setWritableCacheDirsOverride(['stale-not-from-config']);
+      setCachePersistenceOverride(false);
       const { sessionId } = seedChildSession(sub);
       const exitCode = await runSubagentChild({
         sessionId,
@@ -189,10 +200,138 @@ describe('runSubagentChild', () => {
       // The child must have read it — NOT `undefined`, which is what a raw
       // `loadSandboxConfig({ cwd: subdir })` (no .agent there) would yield.
       expect(getWritableCacheDirsOverride()).toEqual([]);
+      // PARITY: the child must also re-resolve cache_persistence (separate
+      // process → module global starts unset; pre-seeded false above).
+      expect(getCachePersistenceOverride()).toBe(true);
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
   });
+
+  // shared_tmp parity (the gap fixed here): a subagent must get the same
+  // per-session /tmp the parent bootstrap wires, else its sandboxed grep /
+  // bg-bash calls fall back to ephemeral per-spawn /tmp. The observable
+  // effect is Linux-specific (the XDG `sessions/` tree); darwin always uses
+  // /tmp/forja-sb-* regardless of shared_tmp, so gate these to linux.
+  test.skipIf(process.platform !== 'linux')(
+    'shared_tmp parity: child acquires a per-run session /tmp (default on)',
+    async () => {
+      const xdg = mkdtempSync(join(tmpdir(), 'forja-child-xdg-'));
+      const repo = mkdtempSync(join(tmpdir(), 'forja-child-repo-on-'));
+      const prevXdg = process.env.XDG_CACHE_HOME;
+      process.env.XDG_CACHE_HOME = xdg;
+      try {
+        // git repo with NO [sandbox] config → shared_tmp defaults on.
+        Bun.spawnSync({ cmd: ['git', 'init', '-q', repo] });
+        const { sessionId } = seedChildSession(repo);
+        const exitCode = await runSubagentChild({
+          sessionId,
+          dbPath,
+          providerOverride: stubProvider('ok'),
+          userAgentsDir: null,
+          projectAgentsDir: null,
+          errSink: () => {},
+        });
+        expect(exitCode).toBe(0);
+        // The per-run folha is removed in the run's finally, but the
+        // `sessions/` parent (mkdir -p) persists → proves the child wired
+        // shared_tmp instead of falling back to ephemeral /tmp.
+        expect(existsSync(join(xdg, 'forja', 'tmp', 'sessions'))).toBe(true);
+      } finally {
+        if (prevXdg === undefined) delete process.env.XDG_CACHE_HOME;
+        else process.env.XDG_CACHE_HOME = prevXdg;
+        rmSync(xdg, { recursive: true, force: true });
+        rmSync(repo, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.skipIf(process.platform !== 'linux')(
+    'shared_tmp = false: child acquires NO session /tmp (honors opt-out)',
+    async () => {
+      const xdg = mkdtempSync(join(tmpdir(), 'forja-child-xdg-off-'));
+      const repo = mkdtempSync(join(tmpdir(), 'forja-child-repo-off-'));
+      const prevXdg = process.env.XDG_CACHE_HOME;
+      process.env.XDG_CACHE_HOME = xdg;
+      try {
+        Bun.spawnSync({ cmd: ['git', 'init', '-q', repo] });
+        mkdirSync(join(repo, '.agent'), { recursive: true });
+        writeFileSync(join(repo, '.agent', 'config.toml'), '[sandbox]\nshared_tmp = false\n');
+        const { sessionId } = seedChildSession(repo);
+        const exitCode = await runSubagentChild({
+          sessionId,
+          dbPath,
+          providerOverride: stubProvider('ok'),
+          userAgentsDir: null,
+          projectAgentsDir: null,
+          errSink: () => {},
+        });
+        expect(exitCode).toBe(0);
+        // shared_tmp explicitly off → acquireSandboxTmpdir is a no-op on Linux
+        // → the sessions/ tree is never created.
+        expect(existsSync(join(xdg, 'forja', 'tmp', 'sessions'))).toBe(false);
+      } finally {
+        if (prevXdg === undefined) delete process.env.XDG_CACHE_HOME;
+        else process.env.XDG_CACHE_HOME = prevXdg;
+        rmSync(xdg, { recursive: true, force: true });
+        rmSync(repo, { recursive: true, force: true });
+      }
+    },
+  );
+
+  // Reinforcement: the FS tests prove acquire runs; this proves the acquired
+  // tmpdir AND the boot-detected sandbox tool actually reach the HarnessConfig
+  // the harness consumes (buildCtx → ctx.sandboxTmpdir for grep/bg, + the grep
+  // fail-closed path via ctx.sandboxBootTool). Capturing the config via the
+  // runAgentFn seam is the deterministic place to observe this: the run's
+  // finally removes the tmpdir before any post-hoc on-disk check could see it.
+  test.skipIf(process.platform !== 'linux')(
+    'threads sandboxTmpdir + sandboxBootTool into the child HarnessConfig',
+    async () => {
+      const xdg = mkdtempSync(join(tmpdir(), 'forja-child-xdg-cfg-'));
+      const repo = mkdtempSync(join(tmpdir(), 'forja-child-repo-cfg-'));
+      const prevXdg = process.env.XDG_CACHE_HOME;
+      process.env.XDG_CACHE_HOME = xdg;
+      try {
+        Bun.spawnSync({ cmd: ['git', 'init', '-q', repo] }); // no [sandbox] → defaults
+        const { sessionId } = seedChildSession(repo);
+        let captured:
+          | { sandboxTmpdir: string | undefined; sandboxBootTool: string | undefined }
+          | undefined;
+        const exitCode = await runSubagentChild({
+          sessionId,
+          dbPath,
+          providerOverride: stubProvider('ok'),
+          userAgentsDir: null,
+          projectAgentsDir: null,
+          errSink: () => {},
+          // Capture the assembled config, then delegate to the real harness so
+          // the run still completes normally.
+          runAgentFn: (cfg) => {
+            captured = {
+              sandboxTmpdir: cfg.sandboxTmpdir,
+              sandboxBootTool: cfg.sandboxBootTool,
+            };
+            return runAgent(cfg);
+          },
+        });
+        expect(exitCode).toBe(0);
+        // shared_tmp defaults on → tmpdir acquired AND threaded into the config
+        // the harness consumes (→ ctx.sandboxTmpdir for grep / bg).
+        expect(captured?.sandboxTmpdir?.startsWith(join(xdg, 'forja', 'tmp', 'sessions'))).toBe(
+          true,
+        );
+        // bootTool detected at the child's boot and threaded → the grep
+        // fail-closed path works inside subagents (matches the host probe).
+        expect(captured?.sandboxBootTool).toBe(detectSandboxAvailability().tool ?? undefined);
+      } finally {
+        if (prevXdg === undefined) delete process.env.XDG_CACHE_HOME;
+        else process.env.XDG_CACHE_HOME = prevXdg;
+        rmSync(xdg, { recursive: true, force: true });
+        rmSync(repo, { recursive: true, force: true });
+      }
+    },
+  );
 
   test('happy path: runs harness, publishes done payload, exits 0', async () => {
     const { sessionId } = seedChildSession(dbDir);

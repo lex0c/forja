@@ -476,14 +476,24 @@ const subsumeCovered = (caps: readonly Capability[]): Capability[] =>
 // redundant narrowings.
 export const deriveParentCapabilities = (policy: Policy): Capability[] => {
   const raw: Capability[] = [];
+  // Bypass mode permits every tool call without an explicit allow rule, so
+  // the parent's effective footprint is the UNIVERSAL footprint of every
+  // tool. §10.1 ("the subagent inherits the parent's effective set") must
+  // reflect that: without this branch a bypass-mode parent derives an EMPTY
+  // envelope (bypass never writes the allow rules the loop keys on) and every
+  // capability a subagent declares would escalate. Tool-derived kinds only —
+  // secret-access / host-passthrough / agent-mutate aren't in any tool
+  // footprint, so they stay opt-in even under bypass (they need a profile or
+  // sentinel that merely running tools doesn't imply).
+  const bypass = policy.defaults.mode === 'bypass';
   const sections = Object.keys(
     TOOL_CAPABILITY_FOOTPRINTS,
   ) as (keyof typeof TOOL_CAPABILITY_FOOTPRINTS)[];
   for (const key of sections) {
     const section = policy.tools[key];
-    if (!hasAllowRule(section)) continue;
+    if (!bypass && !hasAllowRule(section)) continue;
     for (const kind of TOOL_CAPABILITY_FOOTPRINTS[key]) {
-      const scopes = getSectionScopes(section, kind);
+      const scopes = bypass ? null : getSectionScopes(section, kind);
       if (scopes === null) {
         raw.push({ kind, scope: universalScopeFor(kind) });
       } else {

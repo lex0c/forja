@@ -37,7 +37,7 @@ Audit covers DECISIONS (permission engine) and FAILURES (`failure_events`) and O
 
 - The exact `bwrap` argv that ran (reconstructible deterministically from `(profile, cwd, home)` but not recorded per-call).
 - File-level operations inside the sandbox (no strace/eBPF instrumentation).
-- Mid-session sandbox loss for tool calls routed through the broker worker subprocess (the `bg/manager` site is covered via `sandbox.mid_session_loss`, but the broker bash handler runs in a worker without an IPC path for failure_events).
+- A failure_events audit ROW for broker-routed mid-session sandbox loss. The loss itself is no longer silent — it now FAILS CLOSED (the broker maps the wrap's throw to a `sandbox wrap failed` tool error; bg/grep surface it as their tool's error), so the LLM and operator see it. But the broker bash handler runs in a worker subprocess with no IPC path to `failure_events`, so for broker-routed calls the signal is the tool error itself, not an audit row. The `bg/manager` site records both (a `sandbox.mid_session_loss` event AND the fail-closed error). See §4.7.
 - The cryptographic identity of who sealed each chain entry (only available with RFC3161 TSA backend; worm-file and git-anchored backends rely on filesystem trust).
 
 These gaps are documented in `docs/spec/AGENTIC_CLI.md §1` ("declare what was NOT measured") and surface in the audit chain via `failure_events` codes or absence of expected signals — never as silent success.
@@ -303,6 +303,8 @@ Five profiles, ordered most-restrictive to least:
 | `home-rw` | full FS read (minus HIDE_PATHS) | `/tmp` + `$HOME` (HIDE_PATHS still masked) | blocked |
 | `host` | full host filesystem | full host filesystem | full host network |
 
+The Write column is the BASELINE. With the opt-in persistence toggles on (`[sandbox] cache_persistence` / `shared_tmp`, default ON — §4.9), the writable profiles (`cwd-rw` / `cwd-rw-net` / `home-rw`) additionally get a writable persistent dep-cache bind and a per-session `/tmp` bind, both inside a Forja-dedicated tree — never the host's real cache.
+
 **Selection algorithm** (`selectSandboxProfile` in `sandbox-plan.ts`):
 
 1. Build the set of capability KINDS the call requires (e.g., `{read-fs, write-fs, net-egress}`).
@@ -410,13 +412,19 @@ SBPL evaluates top-to-bottom and **last-matching-rule wins** for each operation.
 - `.ansible` — Ansible vault password file location
 - `.local/share/forja` — Forja's audit DB (prevents direct sqlite tampering bypassing the hash chain). The runners also overlay `defaultDataDir()` at runtime so a custom `XDG_DATA_HOME` outside `$HOME/.local/share` gets the same mask (slice 140 sec-1 on Linux; slice 146 on macOS).
 
-**Files** (replaced with `/dev/null` bind-mount):
+**Files** (masked with a read-only bind of an empty REGULAR file — NOT `/dev/null`: a char device breaks git/npm/pip config readers, so the tool sees an empty config while the real content stays hidden):
 - `.netrc` — HTTP basic-auth credentials
 - `.docker/config.json` — Docker registry auth
 - `.npmrc` — NPM auth tokens
 - `.pypirc` — PyPI auth
 - `.git-credentials` — Git HTTP credentials store
 - `.boto` — Legacy AWS Boto SDK credentials
+- `.gitconfig` — `core.sshCommand`/`core.pager`/`credential.helper` are executable hooks (write = RCE on the next git op); read leaks `[user] email` PII
+- `.cargo/credentials.toml` — crates.io API token
+- `.nuget/NuGet/NuGet.Config`, `.config/NuGet/NuGet.Config` — NuGet registry tokens
+- `.config/composer/auth.json`, `.composer/auth.json` — Composer auth (http-basic, github-oauth, gitlab-token)
+
+The `.config/*` credential files are ALSO masked at a relocated `$XDG_CONFIG_HOME` (the runner's XDG-unmask loop covers both dirs and files), so relocating `XDG_CONFIG_HOME` doesn't leave the NuGet/Composer tokens readable. Canonical lists in `sandbox-hide-paths.ts`.
 
 Inside the sandbox, `cat ~/.ssh/id_rsa` returns `EOF` (empty tmpfs); `cat ~/.netrc` returns `EOF` (`/dev/null` bind). `ls ~/.ssh` returns an empty directory.
 
@@ -455,7 +463,7 @@ maybeWrapSandboxArgv({
 //    '/bin/bash', '-s']         // innerArgv[0] canonicalized (slice 175)
 ```
 
-Three production call sites: `broker/handlers/bash.ts` (bash family — also writes the script to the child's stdin), `bg/manager.ts` (background processes — same stdin pattern), `tools/builtin/grep.ts` (grep). When `profile` is `host` or undefined, or the sandbox tool isn't on PATH, the function returns `innerArgv.slice()` unchanged (canonicalized but not wrapped).
+Three production call sites: `broker/handlers/bash.ts` (bash family — also writes the script to the child's stdin), `bg/manager.ts` (background processes — same stdin pattern), `tools/builtin/grep.ts` (grep). When `profile` is `host` or undefined the function returns `innerArgv.slice()` unchanged (canonicalized but not wrapped). When a non-host profile needs a sandbox tool that ISN'T resolvable, behavior depends on `failClosed` (§4.7): graceful passthrough when the tool was never available, THROW (tool error) when it was available at boot — a mid-session loss.
 
 **HOME-unset refuse** (slice 171): when neither `home` nor `env.HOME` resolves, the wrapper THROWS rather than fall back to `cwd`. Pre-slice the fallback silently put HIDE_PATHS overlays in the wrong tree (Docker `CMD` without `-e HOME` / systemd-run `--user` etc.); refusing surfaces the misconfiguration loudly.
 
@@ -468,7 +476,7 @@ When unavailable:
 - `policy.sandbox.required = false` → engine transitions to `degraded` (`maybeWrapSandboxArgv` falls back to direct passthrough; every would-be `allow` becomes `confirm` per spec §6.5).
 - `failure_events` row with `code: sandbox.tool_unavailable` lands at bootstrap (slice 130).
 
-**Mid-session loss:** If the sandbox binary is removed BETWEEN boot and a spawn (rare but possible — operator uninstalled the package, container rebuild), `bg/manager.ts` probes per-spawn and emits `sandbox.mid_session_loss` the first time the loss is detected (suppressed for subsequent spawns until the tool reappears). The broker bash handler runs in a worker subprocess without IPC plumbing to `failure_events` — that gap is documented as out-of-scope for slice 130.
+**Mid-session loss (fail-closed):** If the sandbox binary is removed BETWEEN boot and a spawn (operator uninstalled the package, container rebuild), the wrap now FAILS CLOSED instead of silently running unsandboxed. `maybeWrapSandboxArgv` is called with `failClosed` — true whenever a sandbox tool was available at boot, which distinguishes "lost" from "never had" (hosts that never had bwrap, or `--broker spawn` forced without one, keep the graceful degraded passthrough). On a loss it THROWS, and the throw surfaces as a tool error: the broker maps it to `sandbox wrap failed` (bash), grep via the harness's invoke-tool catch, bg via `bash_background`'s try/catch — so the LLM and operator both see it. `bg/manager.ts` ADDITIONALLY emits a `sandbox.mid_session_loss` failure_event (audit + stderr) the first time the loss is detected; broker-routed calls have no IPC path to `failure_events`, so there the signal is the tool error itself (see §1.3).
 
 ### 4.8 Limitations
 
@@ -481,6 +489,19 @@ When unavailable:
 4. **`host` profile is a passthrough.** Operator-authorized `--sandbox-host` runs unsandboxed. Audit records `sandbox_profile=host`; the bwrap argv is `innerArgv` unchanged.
 5. **No cgroup limits.** CPU/memory/pid-count are not constrained. Fork bombs are contained within the PID namespace (`--die-with-parent` kills children when the agent exits) but during the session they consume host CPU/RAM freely.
 6. **HIDE_PATHS is `$HOME`-rooted only.** Secrets outside the home (`/etc/ssl/private/`, `/var/lib/docker/`, custom credential stores) are not in the list. Operators with non-standard credential locations must add custom deny rules in their policy.
+
+### 4.9 Persistent caches + per-session /tmp (opt-in, default on)
+
+The baseline sandbox is ephemeral: `/tmp` is a fresh tmpfs per spawn and build/dep caches are masked. Two opt-in toggles (`[sandbox] cache_persistence` / `shared_tmp`, both DEFAULT ON by operator decision; opt out with `= false`) trade ephemerality for reuse WITHOUT touching the host's real filesystem beyond cwd.
+
+- **`cache_persistence`** — a Forja-dedicated cache tree at `~/.cache/forja/cache` (honors `$XDG_CACHE_HOME`, which must be absolute), bound read-write into every writable profile (`cwd-rw` / `cwd-rw-net` / `home-rw`). Toolchains are redirected there in two mostly language-AGNOSTIC layers: (1) `XDG_CACHE_HOME` as a catch-all — covers pip, uv, Go's build cache, composer, yarn, and any XDG-compliant tool, including ones not enumerated; (2) `CACHE_ENV_MAP` (`sandbox-cache-env.ts`) for the holdouts that ignore XDG — npm, Go's module cache (`GOMODCACHE`), NuGet, Maven (`MAVEN_ARGS=-Dmaven.repo.local=…`, 3.9+ only), Gradle, bun, pnpm. The env is injected by the WRAP (`--setenv` / `env -i`), never by the model (the bash resolver rejects `VAR=val cmd`). It NEVER binds the host's real `~/.cache`, `~/go/pkg/mod`, etc. — a poisoned build inside the sandbox can't affect builds the operator runs OUTSIDE Forja. The host's real cache stays masked (tmpfs). On home-rw — which binds the real `$HOME` read-write — the host-cache masks + the Forja bind are emitted AFTER the `$HOME` bind so the masking still wins: a build can't poison the real `~/.cache` / `~/.npm` / `~/go` the bind would otherwise expose (the credential overlays come after that, as always).
+- **`shared_tmp`** — `/tmp` bound to a per-session dir (`~/.cache/forja/tmp/sessions/<id>`), created at boot and removed at exit; temp files persist across tool-calls within a session, isolated from other sessions and the host `/tmp`. Gated to writable profiles (`ro` keeps its fresh per-spawn tmpfs); when active, `TMPDIR=/tmp` is forced inside the sandbox so TMPDIR-honoring tools land in the persistent dir.
+
+**Mount-order invariant** (bwrap, last-wins): host-cache tmpfs → Forja-cache bind → cwd bind → credential overlays. A cache (poisoned or not) can NEVER unmask a credential. macOS has no bind primitive — persistence is `(allow file-write* (subpath …))` + the same env redirect; `/tmp` uses the tmpdir-subpath mechanism.
+
+**Reclaim:** `agent cache clear [--force] [--json]` reports the size and removes the dependency-cache subtree `~/.cache/forja/cache` (dry-run without `--force`). It deliberately leaves `~/.cache/forja/tmp/sessions/` alone — those are live bwrap `/tmp` bind sources for ACTIVE sessions, and deleting one mid-session would break that session's sandboxed tools (the runner's `--bind <src> /tmp` fails on a missing source). So a clear from one terminal is safe while another session runs. The redirect only exists inside the sandbox, so the operator's native cleanup run on the host (`npm cache clean`, `go clean -cache`, …) never reaches this tree. Several package managers also self-GC the dir (Go build trim, Gradle 30-day, Composer cache-ttl), which operates normally on the redirected path.
+
+**Trade-off:** the cache is shared per-user across sessions (an intra-Forja surface, never the host's). Notably `GRADLE_USER_HOME` carries `init.d/` init scripts that run on every gradle build, so one build can plant a script that later executes in another project's build — contained to the dedicated cache and the cwd-rw sandbox (never the host `~/.gradle`, never the host itself), but a cross-build channel within Forja. Accepted; `agent cache clear` resets it.
 
 ---
 

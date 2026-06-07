@@ -92,8 +92,13 @@ export const SANDBOX_SAFE_ENV_VARS: readonly string[] = [
   // (no credential content; timezone is operator metadata, not
   // secret).
   'TZ',
-  // Temp dir hint. On darwin the per-sandbox TMPDIR is honored
-  // via this var. Linux: the bwrap `--tmpfs /tmp` mount already
-  // redirects; TMPDIR set here is harmless additional hint.
+  // Temp dir hint. Forwarded from the host so a tool that reads
+  // TMPDIR sees a sane value. On darwin the per-sandbox TMPDIR is
+  // honored via this var. On Linux the value carried here is the
+  // HOST's TMPDIR; when `shared_tmp` is on, the runner OVERRIDES it
+  // with `TMPDIR=/tmp` via the passthrough channel (last-wins) so
+  // tools land in the persistent per-session /tmp bind rather than
+  // the host path (which may be read-only inside the sandbox). See
+  // `sandbox-runner.ts` (effectivePassthrough).
   'TMPDIR',
 ];
