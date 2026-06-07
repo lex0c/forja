@@ -197,6 +197,37 @@ describe('session lifecycle', () => {
     }
   });
 
+  test('session:end folds the turn cost into the REPL-cumulative total and zeroes costUsd', () => {
+    // step:budget lands the turn's settled cost into status.costUsd
+    // just before session:end; the boundary aggregates it.
+    let s = createInitialState();
+    s = applyEvent(s, {
+      type: 'step:budget',
+      ts: 1,
+      steps: 1,
+      maxSteps: 200,
+      costUsd: 0.4,
+    }).state;
+    const r = applyEvent(s, { type: 'session:end', ts: 2, sessionId: 's1', reason: 'done' });
+    expect(r.state.status.sessionTotalCostUsd).toBe(0.4);
+    // Reset so a turn ending without a fresh step:budget can't re-add it.
+    expect(r.state.status.costUsd).toBe(0);
+  });
+
+  test('cumulative cost survives session:start and sums across turns (REPL-scoped)', () => {
+    let s = createInitialState();
+    // Turn 1: $0.4
+    s = applyEvent(s, { type: 'step:budget', ts: 1, steps: 1, maxSteps: 200, costUsd: 0.4 }).state;
+    s = applyEvent(s, { type: 'session:end', ts: 2, sessionId: 's1', reason: 'done' }).state;
+    // New REPL turn must NOT reset the cumulative total.
+    s = applyEvent(s, start({ sessionId: 's2' })).state;
+    expect(s.status.sessionTotalCostUsd).toBe(0.4);
+    // Turn 2: $0.25 → cumulative $0.65
+    s = applyEvent(s, { type: 'step:budget', ts: 4, steps: 1, maxSteps: 200, costUsd: 0.25 }).state;
+    s = applyEvent(s, { type: 'session:end', ts: 5, sessionId: 's2', reason: 'done' }).state;
+    expect(s.status.sessionTotalCostUsd).toBeCloseTo(0.65, 10);
+  });
+
   test('session:banner stamps model + contextWindow onto status and emits the banner permanent', () => {
     const initial = createInitialState();
     const r = applyEvent(initial, {

@@ -119,7 +119,17 @@ export interface StatusState {
   model: string | null;
   steps: number;
   maxSteps: number;
+  // Current-turn spend (this harness session only). Reset to 0 at each
+  // session:end after it folds into `sessionTotalCostUsd`. Driven by
+  // step:budget — internal accumulator now; the footer renders the
+  // REPL-cumulative field below.
   costUsd: number;
+  // REPL-cumulative spend across every turn. Mirrors
+  // `sessionTotalTokens`: REPL-scoped (does NOT reset on session:start),
+  // accumulated at the turn boundary (session:end). The footer's `$X.XX`
+  // chip reads THIS so cost and the token count both summarize the whole
+  // REPL run rather than disagreeing (tokens cumulative, cost per-turn).
+  sessionTotalCostUsd: number;
   // null = no cap configured. Renderer shows steps/cost without budget
   // shading when cap absent.
   maxCostUsd: number | null;
@@ -529,6 +539,7 @@ export const createInitialState = (): LiveState => ({
     steps: 0,
     maxSteps: 0,
     costUsd: 0,
+    sessionTotalCostUsd: 0,
     maxCostUsd: null,
     operationMode: 'supervised',
     effort: null,
@@ -967,9 +978,23 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // harness already committed to killing — visually a zombie
       // tray. The late bg:end events still flow through (they're
       // dropped as no-ops by the unknown-processId branch).
+      // Fold this turn's spend into the REPL-cumulative total at the
+      // boundary (mirrors sessionTotalTokens' assistant:end aggregation).
+      // The final step:budget (carrying r.costUsd) is emitted right
+      // before this session:end in the same batch, so `status.costUsd`
+      // already holds the turn's settled cost here. Reset `costUsd` to 0
+      // so a turn that ends without a step:budget can't re-add a stale
+      // value on the next boundary.
+      const turnCostStatus: StatusState = {
+        ...flushed.state.status,
+        sessionTotalCostUsd:
+          flushed.state.status.sessionTotalCostUsd + flushed.state.status.costUsd,
+        costUsd: 0,
+      };
       return {
         state: {
           ...flushed.state,
+          status: turnCostStatus,
           softInterrupted: false,
           // Same boundary reset rationale as session:start (above).
           exitArmed: null,

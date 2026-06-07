@@ -406,7 +406,7 @@ describe('runSubagent — orchestration', () => {
     // that's wedged inside a tool call (provider hung, sync
     // block) wouldn't pulse `last_heartbeat` even though the
     // process is still responsive to signals. The wall-clock
-    // would catch it eventually (10min), but heartbeat
+    // would catch it eventually (1h), but heartbeat
     // staleness fires in ~10s — operator-relevant timing.
     //
     // Fixture: spawn that inserts an outputs row with a stale

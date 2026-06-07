@@ -2,6 +2,16 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-07] Defaults de budget (wall-clock 1h, cost cap $100) + chip de custo cumulativo no footer
+
+**Direção do operador:** afrouxar os caps default pra sessões longas/caras de dev local e expor o gasto no rodapé. (1) `maxWallClockMs` 10min → **1h** (`DEFAULT_BUDGET` + `DEFAULT_WALL_CLOCK_MS` do subagente, espelhados); (2) `maxCostUsd` $5 → **$100**; (3) trazer de volta o chip de custo ao footer (removido no commit `54b168de` por ler `$0.0000` com 4 casas e por ruído em terminal estreito).
+
+**Footer — custo cumulativo do REPL, em paridade com tokens:** o chip de tokens (`sessionTotalTokens`) é REPL-scoped (não reseta em `session:start`), mas `costUsd` (de `step:budget`) é por-sessão-do-harness. Pra não exibir "tokens acumulados · custo do último turno" lado a lado, novo campo `sessionTotalCostUsd` espelha o padrão de `sessionTotalTokens`: REPL-scoped, acumulado no boundary `session:end` (onde o `step:budget` final com `r.costUsd` já chegou no mesmo batch). O `costUsd` por-turno é zerado nesse fold (protege contra re-somar valor velho num turno sem `step:budget`). Formato 2-casas (`$X.XX`) — resolve o motivo da remoção original; suprimido em exatamente $0.
+
+**Spec:** `AGENTIC_CLI §5` (bloco `[budget]`, tabela de config, `RunBudget`, postura cost-primary, matriz de interação) e `docs/BUDGET.md` atualizados pros novos defaults. O footer **não** entrou na spec (`UI.md §4.10.6`) — UX valida no `bun run dev` antes de specar (diretriz iterate-before-spec).
+
+**Provado:** `tests/harness/budget-defaults.test.ts` (defaults novos), `tests/tui/render/footer.test.ts` (chip lê cumulativo, ordem após tokens, sub-centavo, supressão em $0), `tests/tui/state.test.ts` (fold em `session:end` + zera `costUsd`; soma cross-turn sobrevive a `session:start`). typecheck + lint limpos.
+
 ## [2026-06-07] §8.4 engine-floor: matching de sensitive-path era case-sensitive (bypass em FS case-insensitive)
 
 **Bug (review + verificação empírica):** o `matchSensitivePath` (`permissions/sensitive-paths.ts`) é o piso §8.4 — fires antes da policy lookup, nenhuma config de operador burla. O matcher era case-sensitive e dependia inteiramente do `realpath` (`engine.checkPath`) canonicalizar o case do input. Mas o `realpath` só normaliza quando o alvo **já existe**; em write-creates-new-file (ou dir-pai inexistente) o fallback preserva o case cru do agente. Em macOS APFS / Windows NTFS (case-insensitive default) `write_file('.ENV')` atinge o mesmo inode que `.env` → `matchSensitivePath('.ENV')` → null → sob `allow_paths: ['**']` a escrita era autorizada, sobrescrevendo segredos sem confirm.

@@ -3,11 +3,11 @@ import { isExpectedIpcTeardown, makeInterruptHard, makeInterruptSoft } from './i
 import type { ChildProcessHandle } from './spawn-factory.ts';
 
 // Default wall-clock for a subagent run when the definition
-// doesn't specify `budget.maxWallClockMs`. 10 minutes is enough
+// doesn't specify `budget.maxWallClockMs`. 1 hour is enough
 // for substantive work (refactor, audit, multi-file edit) while
-// short enough that a hung child never burns more than that.
+// still bounding a hung child to that window.
 // Definitions that need longer override via budget.
-export const DEFAULT_WALL_CLOCK_MS = 10 * 60 * 1000;
+export const DEFAULT_WALL_CLOCK_MS = 60 * 60 * 1000;
 
 // Time the parent waits between SIGTERM and SIGKILL on either a
 // caller abort or wall-clock timeout. 5s matches FAILURE_MODES
@@ -29,7 +29,7 @@ const POLL_GROWTH = 2;
 // SIGTERM would still work) but is wedged inside a tool call
 // (provider request hung, sync block, infinite loop) and stops
 // updating `subagent_outputs.last_heartbeat`. Wall-clock alone
-// would catch this in DEFAULT_WALL_CLOCK_MS (10min) — the
+// would catch this in DEFAULT_WALL_CLOCK_MS (1h) — the
 // heartbeat path catches it in single-digit seconds.
 //
 // The child writes every HEARTBEAT_CADENCE_MS=2000ms (defined

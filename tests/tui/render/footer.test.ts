@@ -23,7 +23,7 @@ const startedSession = (overrides: Partial<LiveState['status']> = {}): LiveState
       model: 'sonnet-4.6',
       maxSteps: 50,
       steps: 3,
-      costUsd: 0.012,
+      sessionTotalCostUsd: 0.012,
       ...overrides,
     },
   };
@@ -83,7 +83,7 @@ describe('renderFooter', () => {
     expect(out).toContain('supervised mode on');
   });
 
-  test('idle state: operation-mode cue left, model right (cost/steps chips removed)', () => {
+  test('idle state: operation-mode cue left, model + cost right (step chip removed)', () => {
     const out = renderFooter(startedSession(), caps);
     expect(out).not.toBeNull();
     // The operation-mode cue replaced the old `? for help` hint
@@ -94,9 +94,10 @@ describe('renderFooter', () => {
     // continuation (UI.md §5.4).
     expect(out).toContain('\\+Enter newline');
     expect(out).toContain('sonnet-4.6');
-    // Cost + step counter were removed from the footer — too
-    // low-signal next to the tokens / context-used chips.
-    expect(out).not.toContain('$0.');
+    // Current-turn cost surfaces beside the token count (2-decimal).
+    expect(out).toContain('$0.01');
+    // The step counter stays out of the footer — low-signal next to
+    // the tokens / context-used chips.
     expect(out).not.toContain('3/50');
     // Interrupt cue absent when nothing is running.
     expect(out).not.toContain('esc to interrupt');
@@ -255,9 +256,30 @@ describe('renderFooter', () => {
     expect(out).not.toContain('esc to interrupt');
   });
 
-  test('cost does NOT surface in the footer (chip removed)', () => {
-    const out = renderFooter(startedSession({ costUsd: 12.34 }), caps) ?? '';
-    expect(out).not.toContain('$');
+  describe('REPL-cumulative cost chip', () => {
+    test('surfaces as a 2-decimal `$X.XX` chip', () => {
+      const out = renderFooter(startedSession({ sessionTotalCostUsd: 12.34 }), caps) ?? '';
+      expect(out).toContain('$12.34');
+    });
+
+    test('renders right after the token count', () => {
+      const out =
+        renderFooter(
+          startedSession({ sessionTotalTokens: 12_400, sessionTotalCostUsd: 0.5 }),
+          caps,
+        ) ?? '';
+      expect(out.indexOf('12k tokens')).toBeLessThan(out.indexOf('$0.50'));
+    });
+
+    test('zero cost drops the chip entirely', () => {
+      const out = renderFooter(startedSession({ sessionTotalCostUsd: 0 }), caps) ?? '';
+      expect(out).not.toContain('$');
+    });
+
+    test('sub-cent total still shows a `$0.00` chip (ran ≠ nothing ran)', () => {
+      const out = renderFooter(startedSession({ sessionTotalCostUsd: 0.002 }), caps) ?? '';
+      expect(out).toContain('$0.00');
+    });
   });
 
   test('bg processes do NOT surface in the footer (chip removed)', () => {

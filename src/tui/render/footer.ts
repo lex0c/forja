@@ -23,6 +23,13 @@ const formatTokens = (n: number): string => {
     : `${rounded.toFixed(1)}M tokens`;
 };
 
+// REPL-cumulative spend for the footer's `$X.XX` chip. Two decimals
+// match the session-end `formatDollars` (permanent.ts) so the cents
+// the operator sees agree with the final figure. Sub-cent totals floor
+// to `$0.00` — acceptable "negligible" signal; the chip is suppressed
+// entirely at exactly $0 (see renderFooter).
+const formatCost = (usd: number): string => `$${(Math.round(usd * 100) / 100).toFixed(2)}`;
+
 const CONTEXT_WARN_THRESHOLD = 0.8;
 
 // "Can the operator interrupt right now?" — keyed off `state.busy`, the
@@ -109,6 +116,13 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
   }
   if (status.sessionTotalTokens > 0) {
     rightParts.push(dim(caps, formatTokens(status.sessionTotalTokens)));
+  }
+  // REPL-cumulative spend, right beside the (also cumulative) token
+  // count. Suppressed at exactly $0 (pre-first-turn / cost not yet
+  // reported) so the chip doesn't render a meaningless `$0.00` on an
+  // idle session.
+  if (status.sessionTotalCostUsd > 0) {
+    rightParts.push(dim(caps, formatCost(status.sessionTotalCostUsd)));
   }
   // Both fields required: rendering `0% context used` against an
   // unknown window would mislead the operator. Also suppressed while
