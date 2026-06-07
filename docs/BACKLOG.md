@@ -2,6 +2,12 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-07] `/compact` deixava o footer stale + fix de regressão latente do `/cost`
+
+**Bug (review):** o footer agora é SET só via `stats:refresh` (Estágio 2). O `/compact` muta os totais persistidos (custo via `updateSessionCost` + tokens via `compaction_events`) mas não emitia `stats:refresh` → os chips do footer ficavam stale até o próximo turno/playbook, mesmo com `/stats` e `/cost` já reportando os novos totais do DB. **Fix:** novo `refreshStats?: () => void` na `SlashContext`, ligado no REPL ao `emitStatsRefresh` (mesma recomputação dos boundaries); o `/compact` chama `ctx.refreshStats?.()` após gravar custo+tokens. Teste com spy confirma a chamada após compaction faturada.
+
+**Regressão latente corrigida (do commit do `/cost` DB-derive):** ao rodar o `repl.test.ts` cheio (que eu não tinha rodado naquele commit), o teste "playbook spend rolls into /cost" falhava — o `/cost` passou a ler custo do DB, mas o `fakeRunSubagent` do teste retornava `costUsd` sem persistir sessão. Em produção o `runSubagent` real persiste a sessão-filha (e `trackReplSessionId` a registra), então o `/cost` pega certo; o stub é que era irrealista. Fix: o fake agora cria+completa uma sessão-filha única com custo por dispatch, espelhando o real. `tests/cli/repl.test.ts` 125/126 (resta só o fail pré-existente do `/compact`-inbox, confirmado no commit base).
+
 ## [2026-06-07] Tokens de compaction sumiam dos totais (custo incluía, tokens não) — fix com persistência
 
 **Bug (review do agregador):** quando a sessão compacta (auto ou `/compact`), o harness folda a chamada de compaction no custo (`totalCostUsd` → `sessions.total_cost_usd`) E nos tokens (`totalUsage`, in-memory) — mas `compact()` não escreve message row (design, SESSION.md) e a `compaction_events` (072) só guardava `tokens_before`/`tokens_after` (estimativas de *contexto*, não a chamada). Logo os tokens da compaction não existiam em lugar consultável. O `computeUsageStats` puxava custo de `total_cost_usd` (com compaction) e tokens de `messages` (sem compaction) → `/stats`/footer mostravam custo e tokens **inconsistentes**, subcontando tokens em qualquer sessão que cruzou compaction, e `usageComplete` ficava `true` (não flagava).

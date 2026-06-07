@@ -142,6 +142,12 @@ export const compactCommand: SlashCommand = {
           ...(result.reason !== undefined ? { reason: result.reason } : {}),
           recordedAt: ctx.now(),
         });
+        // The cost update + compaction_events row above changed the session's
+        // persisted totals; refresh the footer's DB-derived chips now so they
+        // don't stay stale until the next turn/playbook boundary (the footer
+        // is SET only from stats:refresh). Harmless no-op for a 'skipped'
+        // compaction that billed nothing.
+        ctx.refreshStats?.();
         const relevanceNote =
           relevanceElided !== null && relevanceElided.elidedCount > 0
             ? ` Relevance pre-pass pointered ${relevanceElided.elidedCount} tool_result(s) (${relevanceElided.freedBytes}B freed, recoverable via retrieve_context).`

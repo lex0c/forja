@@ -2134,6 +2134,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       }
     },
     replSessionIds: () => replSessionIdOrder,
+    // Let a mutating slash command (/compact) refresh the footer's
+    // DB-derived chips after it changes the persisted totals — same
+    // recompute the turn/playbook boundaries use.
+    refreshStats: emitStatsRefresh,
     modelRegistry,
     // History controls (HISTORY.md §2.3). `/history clear` calls
     // `clearLocal` AFTER `clearHistory` against the db so the in-

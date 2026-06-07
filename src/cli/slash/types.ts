@@ -162,6 +162,14 @@ export interface SlashContext {
   // fn composes it with its own timeout so a stalled call can't wedge the
   // REPL. Absent in tests/headless — callers run fn directly (no signal).
   runExclusive?: <T>(fn: (signal: AbortSignal) => Promise<T>) => Promise<T>;
+  // Recompute the footer's DB-derived usage chips (cost/token/cache) and
+  // push them to the renderer. A mutating slash command that changes the
+  // persisted totals (today /compact, which bills a summary call into
+  // sessions.total_cost_usd + compaction_events) must call this, otherwise
+  // the footer — which is SET only from stats:refresh — stays stale until a
+  // later turn/playbook boundary, disagreeing with /stats and /cost (which
+  // read the DB on demand). Absent in tests/headless (no live footer).
+  refreshStats?: () => void;
 }
 
 // Outcome of executing a command. The dispatcher emits any messages

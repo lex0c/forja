@@ -181,6 +181,37 @@ describe('/compact', () => {
     expect(getSession(db, ctx.sessionId)?.totalCostUsd).toBeGreaterThan(0); // persisted
   });
 
+  test('refreshes the footer stats after a billed compaction', async () => {
+    // /compact mutates the session's persisted cost + compaction_events
+    // tokens; the footer (SET only from stats:refresh) must be refreshed so
+    // it doesn't stay stale until a later turn boundary.
+    const ctx = buildLiveCtx();
+    const provider: Provider = {
+      id: 'test/c',
+      family: 'anthropic',
+      capabilities: { ...baseCaps, cost_per_1k_input: 3, cost_per_1k_output: 15 },
+      async *generate(): AsyncGenerator<StreamEvent> {
+        yield { kind: 'start', message_id: 'm' };
+        yield { kind: 'text_delta', text: 'GOAL: x\nDECISIONS: y' };
+        yield {
+          kind: 'usage',
+          usage: { input: 1000, output: 100, cache_read: 0, cache_creation: 0 },
+        };
+        yield { kind: 'stop', reason: 'end_turn' };
+      },
+      generateConstrained: () => Promise.reject(new Error('n/a')),
+      countTokens: () => Promise.resolve(0),
+    };
+    const slashCtx = makeCtx({ provider, live: ctx });
+    let refreshed = 0;
+    slashCtx.refreshStats = () => {
+      refreshed += 1;
+    };
+    const r = await compactCommand.exec([], slashCtx);
+    expect(r.kind).toBe('ok');
+    expect(refreshed).toBeGreaterThan(0);
+  });
+
   test('routes the compaction through runExclusive (the busy lock)', async () => {
     const ctx = buildLiveCtx();
     const before = ctx.length;

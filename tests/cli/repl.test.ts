@@ -4109,13 +4109,13 @@ describe('repl — slash commands integration', () => {
     expect(await promise).toBe(130);
   });
 
-  test('slash playbook spend rolls into /cost cumulative tracker', async () => {
-    // Regression: cumulative.costUsd / steps / turns are mutated
-    // ONLY on session_finished events from the foreground harness.
-    // Slash dispatches go through `runSubagent` directly — no
-    // session_finished fires for the parent — so /cost reported
-    // 0 even after several /<playbook> runs. The bridge now folds
-    // result.costUsd / steps into cumulative and bumps turns.
+  test('slash playbook spend rolls into /cost', async () => {
+    // /cost reads cost DB-derived (computeUsageStats over replSessionIds),
+    // and steps/turns from the in-memory cumulative tracker. A slash
+    // playbook dispatch bumps cumulative (steps/turns) AND persists a child
+    // session row (cost), and tracks the child id in replSessionIds — so the
+    // child's spend shows up in /cost via the DB. (Real runSubagent persists
+    // the child; the fake below mirrors that.)
     const stub = makeBootstrapStub();
     const fakeDef = {
       name: 'fake',
@@ -4131,20 +4131,25 @@ describe('repl — slash commands integration', () => {
     };
     (stub.subagents.byName as Map<string, unknown>).set('fake', fakeDef);
 
-    // Resolve immediately with known accounting numbers — the
-    // assertion below pins them through the cumulative tracker
-    // and into the /cost render.
+    // Resolve immediately with known accounting numbers. Mirror real
+    // runSubagent: persist a UNIQUE child session row carrying the dispatch's
+    // cost (so the DB-derived /cost picks it up). Real subagents never reuse
+    // a session id, so each call creates a fresh row.
     const fakeRunSubagent = async (): ReturnType<
       typeof import('../../src/subagents/index.ts').runSubagent
-    > => ({
-      output: '(no-op)',
-      sessionId: 'sess-fake-child',
-      status: 'done',
-      reason: 'done',
-      costUsd: 0.0123,
-      steps: 4,
-      durationMs: 0,
-    });
+    > => {
+      const child = createSession(stub.db, { model: 'mock/m', cwd: '/tmp/forja-repl-test' });
+      completeSession(stub.db, child.id, 'done', 0.0123, true);
+      return {
+        output: '(no-op)',
+        sessionId: child.id,
+        status: 'done',
+        reason: 'done',
+        costUsd: 0.0123,
+        steps: 4,
+        durationMs: 0,
+      };
+    };
 
     const stdin = makeStdin();
     const writes: string[] = [];
