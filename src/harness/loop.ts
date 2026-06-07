@@ -2392,8 +2392,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               elidedIds: elide.elidedIds,
             };
             const tokensAfterElide = estimateNow();
-            if (tokensAfterElide <= triggerAt) {
-              // Relevance alone got us under the threshold — done, no LLM.
+            // Short-circuit the billed LLM summary ONLY when relevance alone got
+            // us under the threshold AND no pins are active. Active pins are
+            // re-injected into the goal exclusively by ctx.compact's pinnedBlock
+            // path; taking this relevance-only return with pins active would
+            // bypass it, so a pin whose carrier (e.g. its pin_context
+            // tool_result) was just elided here would vanish from the next
+            // request — violating the "survives compaction" contract
+            // (CONTEXT_TUNING §12.4). With pins active, fall through to the LLM
+            // fold below; it runs on the already-gated history, so the pre-pass
+            // still pays off, and pinnedBlock re-injection is honored.
+            if (tokensAfterElide <= triggerAt && pinnedBlock === undefined) {
+              // Relevance alone got us under the threshold, no pins — done, no LLM.
               const relevanceReason = `relevance-elide: ${elide.elidedCount} tool_results pointered, ${elide.freedBytes}B freed`;
               persistCompaction({
                 strategy: 'relevance',
