@@ -2,6 +2,12 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-06] `cache clear` apagava o `/tmp` de sessões ativas
+
+**Bug (review):** `agent cache clear --force` removia `~/.cache/forja` INTEIRO, incluindo `tmp/sessions/<id>` — que, com `shared_tmp` (default), são os **bind sources `/tmp` de sessões ATIVAS**. Rodar o clear de outro terminal apagava o source ao vivo; o runner depois passa esse path pro bwrap como `--bind <src> /tmp`, e como source inexistente só é tolerado por `--bind-try` (não `--bind`), toda tool sandboxed da sessão ativa quebrava até reiniciar.
+
+**Fix:** o comando opera SÓ no subtree `cache/` (dependency caches) — `dir = join(root, relative(forjaCacheDir(), forjaCachePersistBase()))`, derivado de paths.ts pra não driftar. O sibling `tmp/` nunca é tocado, então um clear num terminal é seguro com outra sessão rodando. Size report + json `dir` agora refletem só o `cache/` subtree. Testes: `--force` remove `cache/` e PRESERVA `tmp/sessions/<id>`; dry-run conta só o `cache/`. Docs: `SECURITY.md §4.9` + `SECURITY_GUIDELINE §8.1`.
+
 ## [2026-06-06] Subagent child: provider API key scrubbed → subagent nunca rodava o modelo
 
 **Bug (investigação via `smoke-subagent-explore`):** subagents com modelo real (subprocess, não `providerOverride`) morriam com `Anthropic API key required` ANTES do primeiro step. Cadeia: o `spawn-factory` spawna o child com `scrubEnv(process.env)` (denylist anti-exfiltração, `sanitize/env.ts`) que remove `ANTHROPIC_*`/`OPENAI_*`/`GOOGLE_API_KEY`/`GEMINI_API_KEY`; o child cria o provider via `entry.factory()` que lê a key SÓ de `process.env` (sem fallback de config) → undefined → throw. O `session_start`/`session_finished` são enviados defensivamente (antes/depois de qualquer trabalho), então o bracket aparece e MASCARA a falha — o smoke via "1 start, 1 finished matched" mas `subagent_progress = 0` (o loop nunca rodou). Pré-existente desde que o scrubEnv foi adicionado ao subagent spawn (slice 128); testes unitários usam `stubProvider` e não pegavam.

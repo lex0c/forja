@@ -36,21 +36,27 @@ describe('runCacheClear', () => {
     expect(text).toContain('file(s)');
   });
 
-  test('--force removes the whole cache dir', () => {
+  test('--force removes the cache/ subtree but PRESERVES tmp/ (live session binds)', () => {
     seed();
     const code = runCacheClear({ force: true, json: false, out, cacheDir: dir });
     expect(code).toBe(0);
-    expect(existsSync(dir)).toBe(false);
+    // cache/ gone...
+    expect(existsSync(join(dir, 'cache'))).toBe(false);
+    // ...but the live session /tmp bind source survives — THIS is the fix:
+    // clearing the dependency cache must not delete an active session's
+    // bwrap /tmp source out from under it.
+    expect(existsSync(join(dir, 'tmp', 'sessions', 's1', 'x'))).toBe(true);
     expect(lines.join('\n')).toContain('removed');
   });
 
-  test('json dry-run emits one structured line (bytes + files, removed:false)', () => {
+  test('json dry-run reports the cache/ subtree only (tmp/ excluded), removed:false', () => {
     seed();
     runCacheClear({ force: false, json: true, out, cacheDir: dir });
     const obj = JSON.parse(lines[0] as string);
-    expect(obj.dir).toBe(dir);
-    expect(obj.bytes).toBeGreaterThanOrEqual(2048);
-    expect(obj.files).toBeGreaterThanOrEqual(2);
+    // the cache/ subtree, not the root — tmp/ is neither counted nor cleared
+    expect(obj.dir).toBe(join(dir, 'cache'));
+    expect(obj.bytes).toBeGreaterThanOrEqual(2048); // cache/npm/a.bin
+    expect(obj.files).toBe(1); // only a.bin; the tmp/ file is excluded
     expect(obj.removed).toBe(false);
   });
 
