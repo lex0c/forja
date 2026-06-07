@@ -356,3 +356,48 @@ describe('deriveParentCapabilities — §10 scope narrowing (slice 26)', () => {
     expect(kinds.has('net-egress')).toBe(false);
   });
 });
+
+describe('deriveParentCapabilities — bypass mode (subagent capability fix)', () => {
+  const bypassPolicy = (
+    tools: Record<string, unknown> = {},
+  ): Parameters<typeof deriveParentCapabilities>[0] =>
+    ({ defaults: { mode: 'bypass' }, tools }) as unknown as Parameters<
+      typeof deriveParentCapabilities
+    >[0];
+
+  test('bypass with NO allow rules → universal tool footprints (not empty)', () => {
+    // Bug fix: bypass permits every tool, so the parent envelope must be the
+    // universal footprint — the old empty set made every subagent capability
+    // escalate. secret-access / host-passthrough are NOT tool-derived, so
+    // they stay out even under bypass.
+    const got = deriveParentCapabilities(bypassPolicy()).map(formatCapability).sort();
+    expect(got).toEqual([
+      'delete-fs:**',
+      'exec:arbitrary',
+      'git-write:**',
+      'net-egress:**',
+      'read-fs:**',
+      'write-fs:**',
+    ]);
+  });
+
+  test('a subagent can declare read-fs under bypass without escalating', () => {
+    const parent = deriveParentCapabilities(bypassPolicy());
+    const { effective, excess } = intersectCapabilities(parent, caps('read-fs:.'));
+    expect(excess).toEqual([]);
+    expect(effective.map(formatCapability)).toEqual(['read-fs:.']);
+  });
+
+  test('bypass does NOT grant non-tool-derived caps (secret-access still escalates)', () => {
+    const parent = deriveParentCapabilities(bypassPolicy());
+    const { excess } = intersectCapabilities(parent, caps('secret-access:**'));
+    expect(excess.map(formatCapability)).toEqual(['secret-access:**']);
+  });
+
+  test('non-bypass mode unchanged: no allow rules → empty envelope', () => {
+    const strict = { defaults: { mode: 'strict' }, tools: {} } as unknown as Parameters<
+      typeof deriveParentCapabilities
+    >[0];
+    expect(deriveParentCapabilities(strict)).toEqual([]);
+  });
+});

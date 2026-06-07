@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-06] Capability envelope §10.1 vazio em bypass mode → subagents escalavam
+
+**Bug (investigação do 2º bloqueador do `smoke-subagent-explore`):** `deriveParentCapabilities` deriva o envelope §10.1 SÓ das `allow rules` das tools (`hasAllowRule`: allow/allow_paths/allow_hosts) e **ignora `defaults.mode`**. Em **bypass mode** (que permite TUDO ao parent, sem allow rules) retorna `[]` → o §10.1 guard (`declared_caps ⊆ parent_caps`) trata qualquer cap declarada por um subagent como `excess` → `subagent_escalation`. Confirmado empírico: bypass → `[]`; child declara `read-fs:.` → excess `["read-fs:."]`. Resultado: em bypass, subagents que declaram caps escalam; só rodam com caps vazias (inúteis p/ fs). Afeta produção (qualquer operador em bypass), não só o smoke.
+
+**Fix:** em `deriveParentCapabilities`, quando `mode === 'bypass'`, tratar todas as tools como allowed → emitir os **footprints universais** (`read-fs:**`, `write-fs:**`, `delete-fs:**`, `exec:arbitrary`, `net-egress:**`, `git-write:**`). Alinha com a spec §10.1 ("subagent herda o effective set do parent"; em bypass = tudo), não a muda. Tool-derived apenas — `secret-access`/`host-passthrough`/`agent-mutate` continuam opt-in (não estão em footprint de tool; exigem profile/sentinel). Seguro: o subagent segue limitado pela tool whitelist + sandbox profile. `strict`/allow-rules **inalterado**.
+
+**Prova canônica:** `smoke-subagent-explore` agora **PASSA end-to-end** (`IPC progress events: 26`, child lê os arquivos, audit cross-ref íntegro) — estava quebrado desde sempre, mascarado por este bug + o da provider key. Testes: `deriveParentCapabilities(bypass)` → universais; subagent declara `read-fs` sem escalar; `secret-access` ainda escala; non-bypass inalterado.
+
 ## [2026-06-06] `cache clear` apagava o `/tmp` de sessões ativas
 
 **Bug (review):** `agent cache clear --force` removia `~/.cache/forja` INTEIRO, incluindo `tmp/sessions/<id>` — que, com `shared_tmp` (default), são os **bind sources `/tmp` de sessões ATIVAS**. Rodar o clear de outro terminal apagava o source ao vivo; o runner depois passa esse path pro bwrap como `--bind <src> /tmp`, e como source inexistente só é tolerado por `--bind-try` (não `--bind`), toda tool sandboxed da sessão ativa quebrava até reiniciar.
