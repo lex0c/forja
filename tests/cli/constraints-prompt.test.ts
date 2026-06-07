@@ -60,6 +60,16 @@ describe('constraints-prompt', () => {
     expect(CONSTRAINTS_PROMPT.toLowerCase()).toContain('compaction');
   });
 
+  test('CONSTRAINTS_PROMPT tells the model to match existing code conventions', () => {
+    // Always-present floor against cross-file paradigm drift
+    // (functional here, OO there). Explicit project rules ride in
+    // AGENTS.md (surfaced lazily by the project pointer); this is
+    // the rule for repos that have none — the gap the frontier
+    // alignment does not close on its own.
+    expect(CONSTRAINTS_PROMPT.toLowerCase()).toContain('match the surrounding code');
+    expect(CONSTRAINTS_PROMPT.toLowerCase()).toContain('convention');
+  });
+
   test('composeWithConstraints returns the section alone when downstream is undefined', () => {
     expect(composeWithConstraints(undefined)).toBe(CONSTRAINTS_PROMPT);
   });
