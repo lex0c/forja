@@ -18,7 +18,7 @@ import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts'
 // and the most recent pins win.
 //
 // Use for facts that must be honored MULTIPLE TIMES this session (e.g.
-// "API pública de X não pode mudar", "rodar pnpm fmt antes de commitar").
+// "the public API of X must not change", "run pnpm fmt before committing").
 // NOT for: TODOs (todo_create), one-shot decisions (decisions[]),
 // cross-session facts (memory_write).
 //
@@ -88,7 +88,7 @@ const validateInput = (args: PinContextInput): ToolResult<PinContextOutput> | nu
 export const pinContextTool: Tool<PinContextInput, PinContextOutput> = {
   name: 'pin_context',
   description:
-    "Pin a session-scoped constraint that survives compaction, is re-injected with the goal, and shows up in auto-rehydrate. The model pins directly — no confirmation. The pin list keeps the 10 most recent: pinning past 10 silently drops the oldest, so you never need to remove one. Use for facts to honor MULTIPLE TIMES this session (e.g. 'API pública de X não pode mudar', 'rodar pnpm fmt antes de commitar'). NOT for: TODOs (use todo_create), one-shot decisions (already in decisions[]), cross-session facts (use memory_write).",
+    "Pin a session-scoped constraint that survives compaction, is re-injected with the goal, and shows up in auto-rehydrate. The model pins directly — no confirmation. The pin list keeps the 10 most recent: pinning past 10 silently drops the oldest, so you never need to remove one. Use for facts to honor MULTIPLE TIMES this session (e.g. 'the public API of X must not change', 'run pnpm fmt before committing'). NOT for: TODOs (use todo_create), one-shot decisions (already in decisions[]), cross-session facts (use memory_write).",
   inputSchema: {
     type: 'object',
     properties: {
@@ -106,7 +106,7 @@ export const pinContextTool: Tool<PinContextInput, PinContextOutput> = {
       expires_in: {
         type: 'string',
         description:
-          'Optional auto-expiry duration: "30m", "2h", "1d". Omitted ⇒ pin lives until end of session. Use for phase-bounded pins ("fase de refactor — não tocar em testes").',
+          'Optional auto-expiry duration: "30m", "2h", "1d". Omitted ⇒ pin lives until end of session. Use for phase-bounded pins ("refactor phase — leave tests untouched").',
       },
     },
     required: ['text'],
