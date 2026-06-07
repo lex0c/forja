@@ -2,7 +2,11 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
-## [2026-06-06] Sandbox: shared_tmp no subagent-child (paridade com o bootstrap)
+## [2026-06-06] Subagent child: provider API key scrubbed → subagent nunca rodava o modelo
+
+**Bug (investigação via `smoke-subagent-explore`):** subagents com modelo real (subprocess, não `providerOverride`) morriam com `Anthropic API key required` ANTES do primeiro step. Cadeia: o `spawn-factory` spawna o child com `scrubEnv(process.env)` (denylist anti-exfiltração, `sanitize/env.ts`) que remove `ANTHROPIC_*`/`OPENAI_*`/`GOOGLE_API_KEY`/`GEMINI_API_KEY`; o child cria o provider via `entry.factory()` que lê a key SÓ de `process.env` (sem fallback de config) → undefined → throw. O `session_start`/`session_finished` são enviados defensivamente (antes/depois de qualquer trabalho), então o bracket aparece e MASCARA a falha — o smoke via "1 start, 1 finished matched" mas `subagent_progress = 0` (o loop nunca rodou). Pré-existente desde que o scrubEnv foi adicionado ao subagent spawn (slice 128); testes unitários usam `stubProvider` e não pegavam.
+
+**Fix:** `scrubEnv(env, { keep })` — allowlist de vars preservadas mesmo casando o scrub pattern. O subagent spawn passa `keep: PROVIDER_API_KEY_VARS` (as 4 provider keys). Seguro: o child RE-scrubba quando spawna o próprio bash (broker `scrubEnv`) e tools (sandbox `clearenv`), então a key chega só à chamada HTTP do child ao provider, nunca aos subprocessos dele. Todo outro credential continua removido (broker/bg/bootstrap-worker NÃO passam `keep`). Provado E2E: `subagent_progress` 0 → 47, sem `API key required`. Testes: `scrubEnv` keep (preserva provider key, strip do resto; sem keep ainda strippa).
 
 **Gap (review):** o subagent roda num subprocess que re-bootstrapa o `[sandbox]`, mas só restaurava os module globals de cache (`writable_cache_dirs` + `cache_persistence`) — nunca adquiria um session tmpdir nem passava `sandboxTmpdir` no `HarnessConfig` do filho (não há `--subagent-*tmp*` forwarding). Com `shared_tmp = true` (default), um subagent com 2 chamadas bash/grep sandboxed caía no `--tmpfs /tmp` fresh por-spawn (Linux): arquivos em `/tmp` sumiam entre tool calls.
 

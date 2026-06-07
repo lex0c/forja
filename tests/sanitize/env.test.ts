@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { scrubEnv } from '../../src/sanitize/env.ts';
+import { PROVIDER_API_KEY_VARS, scrubEnv } from '../../src/sanitize/env.ts';
 
 describe('scrubEnv', () => {
   test('drops *_API_KEY by suffix', () => {
@@ -462,5 +462,51 @@ describe('scrubEnv — slice 162 expansion', () => {
     expect(out.JAVA_HOME).toBe('/usr/lib/jvm/openjdk');
     expect(out.MY_TOKENIZER_PATH).toBe('/opt/tok');
     expect(out.OAUTH_REDIRECT_URI).toBe('https://app/callback');
+  });
+});
+
+// Subagent child fix: the spawned subagent process needs its provider key
+// to talk to the assigned model, or it dies "API key required" before the
+// first step. scrubEnv({ keep }) preserves exactly the provider keys while
+// stripping every other credential; the child re-scrubs for its own bash /
+// tools so the key never reaches the child's subprocesses.
+describe('scrubEnv — keep allowlist (subagent provider keys)', () => {
+  test('keep preserves a var that would otherwise be scrubbed', () => {
+    const out = scrubEnv(
+      { ANTHROPIC_API_KEY: 'k', AWS_SECRET_ACCESS_KEY: 's', SAFE: 'v' },
+      { keep: ['ANTHROPIC_API_KEY'] },
+    );
+    expect(out.ANTHROPIC_API_KEY).toBe('k'); // kept
+    expect(out.AWS_SECRET_ACCESS_KEY).toBeUndefined(); // other secret still stripped
+    expect(out.SAFE).toBe('v');
+  });
+
+  test('PROVIDER_API_KEY_VARS keep preserves every provider key, strips the rest', () => {
+    const out = scrubEnv(
+      {
+        ANTHROPIC_API_KEY: 'a',
+        OPENAI_API_KEY: 'o',
+        GOOGLE_API_KEY: 'g',
+        GEMINI_API_KEY: 'm',
+        VAULT_TOKEN: 'secret',
+        AWS_ACCESS_KEY_ID: 'secret',
+        PATH: '/usr/bin',
+      },
+      { keep: PROVIDER_API_KEY_VARS },
+    );
+    expect(out.ANTHROPIC_API_KEY).toBe('a');
+    expect(out.OPENAI_API_KEY).toBe('o');
+    expect(out.GOOGLE_API_KEY).toBe('g');
+    expect(out.GEMINI_API_KEY).toBe('m');
+    // non-provider secrets stay stripped even with keep set
+    expect(out.VAULT_TOKEN).toBeUndefined();
+    expect(out.AWS_ACCESS_KEY_ID).toBeUndefined();
+    expect(out.PATH).toBe('/usr/bin');
+  });
+
+  test('without keep, provider keys are still scrubbed (broker / bash default)', () => {
+    const out = scrubEnv({ ANTHROPIC_API_KEY: 'k', PATH: '/usr/bin' });
+    expect(out.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(out.PATH).toBe('/usr/bin');
   });
 });
