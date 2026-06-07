@@ -61,6 +61,10 @@ export const compactCommand: SlashCommand = {
       // fallback, so the run survives and the REPL frees.
       const timeout = AbortSignal.timeout(budget.maxStepStallMs);
       const compactSignal = signal !== undefined ? AbortSignal.any([signal, timeout]) : timeout;
+      // Whether this compaction changed the live context — drives the footer's
+      // staleness on the compacting:end below. Stays false for a no-op (the
+      // "nothing to compact" early return) and for the error path (restored).
+      let contextChanged = false;
       try {
         // Bracket the live "Compacting context…" chip around the summary call —
         // the same chip the auto path shows. Paired with the :end in `finally`.
@@ -134,6 +138,8 @@ export const compactCommand: SlashCommand = {
             notes: ['Nothing to compact — the conversation is already small.'],
           };
         }
+        // Past the no-op check ⇒ something changed (a fold and/or relevance elision).
+        contextChanged = true;
         return {
           kind: 'ok',
           notes: [
@@ -147,7 +153,7 @@ export const compactCommand: SlashCommand = {
           message: `compaction failed (context unchanged): ${e instanceof Error ? e.message : String(e)}`,
         };
       } finally {
-        ctx.bus.emit({ type: 'compacting:end', ts: ctx.now() });
+        ctx.bus.emit({ type: 'compacting:end', ts: ctx.now(), contextChanged });
       }
     };
 

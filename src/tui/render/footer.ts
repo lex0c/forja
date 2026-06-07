@@ -111,8 +111,11 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
     rightParts.push(dim(caps, formatTokens(status.sessionTotalTokens)));
   }
   // Both fields required: rendering `0% context used` against an
-  // unknown window would mislead the operator.
-  if (status.contextWindow > 0 && status.lastTurnContextTokens > 0) {
+  // unknown window would mislead the operator. Also suppressed while
+  // contextStale — a compaction shrank the context but no fresh turn has
+  // re-measured it, so we show provider-truth or nothing (never a
+  // post-compaction estimate). Restored on the next assistant:end.
+  if (status.contextWindow > 0 && status.lastTurnContextTokens > 0 && !status.contextStale) {
     const ratio = status.lastTurnContextTokens / status.contextWindow;
     const pct = Math.min(100, Math.max(0, Math.round(ratio * 100)));
     const text = `${pct}% context used`;

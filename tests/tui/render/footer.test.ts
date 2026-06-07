@@ -343,6 +343,21 @@ describe('renderFooter', () => {
       expect(out).not.toContain('context used');
     });
 
+    test('suppressed while contextStale (a compaction ran, awaiting a fresh measurement)', () => {
+      // The pre-compaction count is now wrong; show provider-truth or nothing,
+      // never a post-compaction estimate. Restored on the next assistant:end.
+      const out =
+        renderFooter(
+          startedSession({
+            contextWindow: 200_000,
+            lastTurnContextTokens: 90_000,
+            contextStale: true,
+          }),
+          caps,
+        ) ?? '';
+      expect(out).not.toContain('context used');
+    });
+
     test('paints `warn` (yellow, SGR 33) when ratio crosses the 80% threshold', () => {
       const colored: Capabilities = { ...caps, color: 'basic' };
       const out =

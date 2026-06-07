@@ -151,6 +151,12 @@ export interface StatusState {
   // inputTokens + cacheRead + cacheCreation of the latest turn —
   // what occupied the context window when the model generated.
   lastTurnContextTokens: number;
+  // True between a compaction (compacting:start) and the next assistant:end.
+  // The compaction shrank the live context but lastTurnContextTokens still
+  // reflects the pre-compaction turn, so the footer suppresses the % until a
+  // real turn re-measures it from provider usage — we never show a stale or
+  // estimated number.
+  contextStale: boolean;
 }
 
 export interface PendingAssistant {
@@ -530,6 +536,7 @@ export const createInitialState = (): LiveState => ({
     contextWindow: 0,
     sessionTotalTokens: 0,
     lastTurnContextTokens: 0,
+    contextStale: false,
   },
   activeTools: new Map(),
   pendingToolEndBatch: null,
@@ -1205,6 +1212,10 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         // Fallback to the prior value when the turn yielded no usage
         // event (provider edge case) so the chip doesn't flicker to 0%.
         lastTurnContextTokens: turnContext > 0 ? turnContext : state.status.lastTurnContextTokens,
+        // A turn WITH usage re-measured the context from provider truth → clear
+        // post-compaction staleness so the footer % shows again. A turn without
+        // usage gave no fresh measurement, so keep it suppressed if it was stale.
+        contextStale: turnContext > 0 ? false : state.status.contextStale,
       };
       // Emit a permanent ONLY when there's prose to land in
       // scrollback. Tool-only turns (Anthropic emits tool_use
@@ -1427,15 +1438,21 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
 
     case 'compacting:start': {
       // Open the "Compacting context…" chip. Idempotent: a re-emit just refreshes
-      // startedAt. /compact and the auto path both bracket with :end, so
-      // this never lingers past the compaction.
+      // startedAt. /compact and the auto path both bracket with :end, so this
+      // never lingers past the compaction. The context is NOT marked stale here —
+      // we don't yet know whether the compaction will change anything (a 'skipped'
+      // no-op must not suppress the footer); compacting:end decides.
       return { state: { ...state, compacting: { startedAt: event.ts } }, permanent: [] };
     }
 
     case 'compacting:end': {
-      // Close it. Safe when nothing is open (duplicate / unmatched end).
-      if (state.compacting === null) return { state, permanent: [] };
-      return { state: { ...state, compacting: null }, permanent: [] };
+      // Close the chip. Mark the context stale ONLY when the compaction actually
+      // changed it (contextChanged) — a no-op 'skipped' / "nothing to compact"
+      // leaves lastTurnContextTokens accurate, so the footer % keeps showing.
+      // When stale, it's cleared later by the next assistant:end that re-measures
+      // from provider usage (never here, never by a later skipped compaction).
+      const status = event.contextChanged ? { ...state.status, contextStale: true } : state.status;
+      return { state: { ...state, status, compacting: null }, permanent: [] };
     }
 
     case 'checkpoint:create':
