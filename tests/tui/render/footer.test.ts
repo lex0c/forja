@@ -341,6 +341,43 @@ describe('renderFooter', () => {
     });
   });
 
+  describe('cache tokens chip', () => {
+    test('splits cache out: `N tokens` is non-cache, `N cached` is the cache subset', () => {
+      // Grand total 12.4k, of which 4k is cache → non-cache compute 8.4k.
+      const out =
+        renderFooter(
+          startedSession({ sessionTotalTokens: 12_400, sessionCacheTokens: 4000 }),
+          caps,
+        ) ?? '';
+      expect(out).toContain('8.4k tokens');
+      expect(out).toContain('4k cached');
+      // The two chips are disjoint and sum to the grand total; the
+      // grand-total figure itself is never printed.
+      expect(out).not.toContain('12k tokens');
+      // Cache chip sits right after the token chip.
+      expect(out.indexOf('8.4k tokens')).toBeLessThan(out.indexOf('4k cached'));
+    });
+
+    test('zero cache drops the cache chip but keeps the token chip', () => {
+      const out =
+        renderFooter(startedSession({ sessionTotalTokens: 5000, sessionCacheTokens: 0 }), caps) ??
+        '';
+      expect(out).toContain('5k tokens');
+      expect(out).not.toContain('cached');
+    });
+
+    test('all-cache turn drops the token chip and keeps only the cache chip', () => {
+      // sessionTotalTokens == sessionCacheTokens → non-cache is 0.
+      const out =
+        renderFooter(
+          startedSession({ sessionTotalTokens: 3000, sessionCacheTokens: 3000 }),
+          caps,
+        ) ?? '';
+      expect(out).toContain('3k cached');
+      expect(out).not.toContain('3k tokens');
+    });
+  });
+
   describe('% context used chip', () => {
     test('renders `X% context used` when contextWindow and lastTurnContextTokens are set', () => {
       const out =

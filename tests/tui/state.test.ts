@@ -568,6 +568,9 @@ describe('assistant streaming', () => {
     // sessionTotalTokens = input + cacheRead + cacheCreation + output
     //                    = 100 + 1000 + 500 + 200 = 1800.
     expect(result.state.status.sessionTotalTokens).toBe(1800);
+    // sessionCacheTokens = cacheRead + cacheCreation = 1500 (split out
+    // for its own footer chip; the non-cache part is 1800 - 1500 = 300).
+    expect(result.state.status.sessionCacheTokens).toBe(1500);
     // lastTurnContextTokens = input + cacheRead + cacheCreation = 1600.
     expect(result.state.status.lastTurnContextTokens).toBe(1600);
   });
@@ -643,6 +646,39 @@ describe('assistant streaming', () => {
     expect(result.state.status.sessionTotalTokens).toBe(5000);
     expect(result.state.status.lastTurnContextTokens).toBe(1200);
     expect(result.state.status.contextWindow).toBe(200000);
+  });
+
+  test('cache tokens accumulate across turns and survive session:start', () => {
+    let state = createInitialState();
+    // Turn 1: cacheRead 800 + cacheCreation 200 = 1000 cache.
+    state = applyEvent(state, { type: 'assistant:start', ts: 1000, messageId: 'm1' }).state;
+    state = applyEvent(state, {
+      type: 'assistant:usage',
+      ts: 1100,
+      messageId: 'm1',
+      inputTokens: 50,
+      outputTokens: 100,
+      cacheRead: 800,
+      cacheCreation: 200,
+    }).state;
+    state = applyEvent(state, { type: 'assistant:end', ts: 1200, messageId: 'm1' }).state;
+    expect(state.status.sessionCacheTokens).toBe(1000);
+    // New REPL turn must not reset the cumulative cache count.
+    state = applyEvent(state, start({ sessionId: 's2' })).state;
+    expect(state.status.sessionCacheTokens).toBe(1000);
+    // Turn 2: +500 cache → 1500 cumulative.
+    state = applyEvent(state, { type: 'assistant:start', ts: 2000, messageId: 'm2' }).state;
+    state = applyEvent(state, {
+      type: 'assistant:usage',
+      ts: 2100,
+      messageId: 'm2',
+      inputTokens: 10,
+      outputTokens: 20,
+      cacheRead: 500,
+      cacheCreation: 0,
+    }).state;
+    state = applyEvent(state, { type: 'assistant:end', ts: 2200, messageId: 'm2' }).state;
+    expect(state.status.sessionCacheTokens).toBe(1500);
   });
 
   test('consecutive assistant:start events open a fresh turn (startedAt reset)', () => {

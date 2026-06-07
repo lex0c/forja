@@ -156,8 +156,18 @@ export interface StatusState {
   // sees the REPL as one).
   contextWindow: number;
   // REPL-scoped (does NOT reset on session:start) so the chip
-  // accumulates across the operator's whole REPL run.
+  // accumulates across the operator's whole REPL run. GRAND total —
+  // input + output + cache_read + cache_creation. The footer renders
+  // the non-cache part (`sessionTotalTokens - sessionCacheTokens`)
+  // beside a dedicated cache chip, so the two displayed numbers are
+  // disjoint and sum back to this.
   sessionTotalTokens: number;
+  // REPL-scoped cumulative cache tokens (cache_read + cache_creation).
+  // Split out from sessionTotalTokens for its own `N cached` footer
+  // chip: cache is provider-reported and billed, but at a fraction of
+  // the input rate, so the operator wants it distinguishable from real
+  // compute (input + output).
+  sessionCacheTokens: number;
   // inputTokens + cacheRead + cacheCreation of the latest turn —
   // what occupied the context window when the model generated.
   lastTurnContextTokens: number;
@@ -546,6 +556,7 @@ export const createInitialState = (): LiveState => ({
     memoryCount: 0,
     contextWindow: 0,
     sessionTotalTokens: 0,
+    sessionCacheTokens: 0,
     lastTurnContextTokens: 0,
     contextStale: false,
   },
@@ -1234,6 +1245,8 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       const status: StatusState = {
         ...state.status,
         sessionTotalTokens: state.status.sessionTotalTokens + turnContext + output,
+        // Cache subset of the grand total, tracked for its own footer chip.
+        sessionCacheTokens: state.status.sessionCacheTokens + cacheRead + cacheCreation,
         // Fallback to the prior value when the turn yielded no usage
         // event (provider edge case) so the chip doesn't flicker to 0%.
         lastTurnContextTokens: turnContext > 0 ? turnContext : state.status.lastTurnContextTokens,

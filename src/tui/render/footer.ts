@@ -6,21 +6,24 @@ import { FRAME_MARGIN, FRAME_MARGIN_WIDTH } from './frame.ts';
 import { isBashMode } from './mode.ts';
 import { visualWidth } from './width.ts';
 
-const formatTokens = (n: number): string => {
-  if (n < 1000) return `${n} tokens`;
+// `unit` lets the same magnitude formatting drive both the `N tokens`
+// (non-cache compute) and `N cached` chips — they share the k/M
+// rounding rules, only the trailing label differs.
+const formatTokens = (n: number, unit = 'tokens'): string => {
+  if (n < 1000) return `${n} ${unit}`;
   if (n < 10_000) {
     const k = n / 1000;
     const rounded = Math.round(k * 10) / 10;
     return rounded === Math.floor(rounded)
-      ? `${rounded.toFixed(0)}k tokens`
-      : `${rounded.toFixed(1)}k tokens`;
+      ? `${rounded.toFixed(0)}k ${unit}`
+      : `${rounded.toFixed(1)}k ${unit}`;
   }
-  if (n < 1_000_000) return `${Math.round(n / 1000)}k tokens`;
+  if (n < 1_000_000) return `${Math.round(n / 1000)}k ${unit}`;
   const m = n / 1_000_000;
   const rounded = Math.round(m * 10) / 10;
   return rounded === Math.floor(rounded)
-    ? `${rounded.toFixed(0)}M tokens`
-    : `${rounded.toFixed(1)}M tokens`;
+    ? `${rounded.toFixed(0)}M ${unit}`
+    : `${rounded.toFixed(1)}M ${unit}`;
 };
 
 // REPL-cumulative spend for the footer's `$X.XX` chip. Two decimals
@@ -114,8 +117,17 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
   if (status.model !== null && status.model !== '') {
     rightParts.push(dim(caps, status.model));
   }
-  if (status.sessionTotalTokens > 0) {
-    rightParts.push(dim(caps, formatTokens(status.sessionTotalTokens)));
+  // Non-cache compute (input + output) and cache (read + creation) are
+  // shown as two disjoint chips that sum back to the grand total. Cache
+  // is provider-reported and billed, but far cheaper than input, so the
+  // operator wants it distinguishable from real compute.
+  const cacheTokens = status.sessionCacheTokens;
+  const nonCacheTokens = status.sessionTotalTokens - cacheTokens;
+  if (nonCacheTokens > 0) {
+    rightParts.push(dim(caps, formatTokens(nonCacheTokens)));
+  }
+  if (cacheTokens > 0) {
+    rightParts.push(dim(caps, formatTokens(cacheTokens, 'cached')));
   }
   // REPL-cumulative spend, right beside the (also cumulative) token
   // count. Suppressed at exactly $0 (pre-first-turn / cost not yet
