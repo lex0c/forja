@@ -53,6 +53,7 @@ All defaults are in `DEFAULT_BUDGET` (`src/harness/types.ts`).
 | `maxOutputTokensPerCall` | unset | clamps each request's `max_tokens` to `min(override, provider.output_max_tokens)`. Unset → use the provider capability ceiling (no silent 4096 truncation). A provider truncation at `max_tokens` surfaces as the `maxOutputTokens` exit. |
 | `compactionThreshold` | `0.7` | fraction of the context window at which compaction triggers. `1.0` ≈ disable. |
 | `compactionPreserveTail` | `3` | minimum trailing turns kept verbatim during compaction. |
+| `compactionRelevance` | `true` | run the BM25 relevance pre-pass before the LLM summary — cheaply pointer-elide low-goal-relevance `tool_result` bodies (recoverable via `retrieve_context`). `false` keeps every `tool_result` verbatim until the fold. |
 
 ---
 
@@ -79,10 +80,10 @@ Where each cap can be set:
 | Surface | Caps it can set | Scope |
 |---|---|---|
 | `DEFAULT_BUDGET` (code) | all | fallback |
-| `.agent/config.toml` `[budget]` | `max_steps`, `max_wall_clock_ms`, `max_step_stall_ms`, `compaction_preserve_tail`, `max_cost_usd`, `compaction_threshold` | persistent (project layer overrides user) |
+| `.agent/config.toml` `[budget]` | `max_steps`, `max_wall_clock_ms`, `max_step_stall_ms`, `compaction_preserve_tail`, `max_cost_usd`, `compaction_threshold`, `compaction_relevance` | persistent (project layer overrides user) |
 | CLI | `--max-steps` only | per-run |
 | `/effort <level>` preset | `maxSteps`, `maxConcurrentSubagents`, `maxToolErrors` | session (in memory, next turn) |
-| `/budget <sub> <val>` | `steps`, `cost`, `parallel-tools`, `subagents` | session (in memory, next turn) |
+| `/budget <sub> <val>` | `steps`, `cost`, `parallel-tools`, `subagents`, `relevance` | session (in memory, next turn) |
 | playbook frontmatter | `sampling.max_tokens` → `maxOutputTokensPerCall`; the subagent's own `budget` | per-subagent |
 
 Notes:
@@ -99,6 +100,7 @@ Notes:
 /budget cost <USD|none|off>      positive number, or none/off to remove the cap
 /budget parallel-tools <N>       1..16
 /budget subagents <N>            1..8
+/budget relevance <on|off>       toggle the compaction relevance pre-pass (default on)
 ```
 
 All mutations take effect on the **next** turn (the in-flight turn already snapshot its config).
@@ -111,6 +113,7 @@ max_steps = 400
 max_cost_usd = 20
 max_wall_clock_ms = 1800000   # 30 min
 compaction_threshold = 0.8
+compaction_relevance = false  # opt out of the relevance pre-pass (default on)
 ```
 
 ---

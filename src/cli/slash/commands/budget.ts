@@ -6,6 +6,11 @@
 //                                  or `none`/`off` to clear the cap)
 //   /budget parallel-tools <N>  — set maxConcurrentToolCalls (1..16)
 //   /budget subagents <N>       — set maxConcurrentSubagents (1..8)
+//   /budget relevance <on|off>  — toggle the compaction relevance pre-pass
+//                                  (default on; off keeps every tool_result
+//                                  verbatim until the billed LLM fold). The
+//                                  in-session twin of `[budget]
+//                                  compaction_relevance` in config.toml.
 //
 // Other caps (maxWallClockMs, maxToolErrors) aren't user-tunable
 // from the slash surface today — they're tied to the harness's
@@ -26,7 +31,8 @@ import {
 import { formatCost, formatMs, withRunningCue } from '../format.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 
-const usage = '/budget [steps <N> | cost <USD|none> | parallel-tools <N> | subagents <N>]';
+const usage =
+  '/budget [steps <N> | cost <USD|none> | parallel-tools <N> | subagents <N> | relevance <on|off>]';
 
 const showAll = (ctx: SlashContext): SlashResult => {
   // Resolve through the SAME layered helper the loop uses so `/budget`
@@ -46,6 +52,7 @@ const showAll = (ctx: SlashContext): SlashResult => {
       `max cost: ${r.maxCostUsd !== undefined ? formatCost(r.maxCostUsd) : 'no cap'}`,
       `max parallel tools: ${r.maxConcurrentToolCalls} (cap ${MAX_CONCURRENT_TOOL_CALLS_CAP})`,
       `max concurrent subagents: ${r.maxConcurrentSubagents} (cap ${MAX_CONCURRENT_SUBAGENTS_CAP})`,
+      `compaction relevance pre-pass: ${r.compactionRelevance ? 'on' : 'off'}`,
     ],
   };
 };
@@ -234,6 +241,34 @@ export const budgetCommand: SlashCommand = {
         kind: 'ok',
         notes: withRunningCue(ctx, [
           `max concurrent subagents: ${n} — takes effect on the next turn`,
+        ]),
+      };
+    }
+
+    if (sub === 'relevance') {
+      if (args.length !== 2) {
+        return { kind: 'error', message: `/budget relevance: expected on|off. usage: ${usage}` };
+      }
+      const raw = (args[1] ?? '').toLowerCase();
+      const value =
+        raw === 'on' || raw === 'true' ? true : raw === 'off' || raw === 'false' ? false : null;
+      if (value === null) {
+        return { kind: 'error', message: `/budget relevance: '${args[1]}' is not on|off` };
+      }
+      // Compare the raw override (see the dispatch-top note): default-ON is not
+      // an explicit override, so `relevance on` still pins it.
+      const current = ctx.baseConfig.budget?.compactionRelevance;
+      if (current === value) {
+        return {
+          kind: 'ok',
+          notes: [`compaction relevance pre-pass already ${value ? 'on' : 'off'} (no change)`],
+        };
+      }
+      writeBudget(ctx, { compactionRelevance: value });
+      return {
+        kind: 'ok',
+        notes: withRunningCue(ctx, [
+          `compaction relevance pre-pass: ${value ? 'on' : 'off'} — takes effect on the next turn`,
         ]),
       };
     }

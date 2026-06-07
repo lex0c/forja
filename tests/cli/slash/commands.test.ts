@@ -396,6 +396,58 @@ describe('/budget', () => {
     expect(result.notes?.some((l) => l.includes('no cap'))).toBe(true);
   });
 
+  test('shows the compaction relevance pre-pass state (default on)', async () => {
+    const ctx = makeCtx();
+    const result = await budgetCommand.exec([], ctx);
+    if (result.kind !== 'ok') return;
+    expect(result.notes?.some((l) => l.includes('compaction relevance pre-pass: on'))).toBe(true);
+  });
+
+  test('/budget relevance off disables the pre-pass and is reflected in the display', async () => {
+    const ctx = makeCtx();
+    const result = await budgetCommand.exec(['relevance', 'off'], ctx);
+    if (result.kind !== 'ok') return;
+    expect(ctx.baseConfig.budget?.compactionRelevance).toBe(false);
+    expect(result.notes?.[0]).toContain('off');
+    expect(result.notes?.[0]).toContain('next turn');
+    const shown = await budgetCommand.exec([], ctx);
+    if (shown.kind !== 'ok') return;
+    expect(shown.notes?.some((l) => l.includes('compaction relevance pre-pass: off'))).toBe(true);
+  });
+
+  test('/budget relevance rejects args that are not on|off', async () => {
+    expect((await budgetCommand.exec(['relevance', 'maybe'], makeCtx())).kind).toBe('error');
+    expect((await budgetCommand.exec(['relevance'], makeCtx())).kind).toBe('error');
+  });
+
+  test('/budget relevance accepts true/false aliases', async () => {
+    const offCtx = makeCtx();
+    await budgetCommand.exec(['relevance', 'false'], offCtx);
+    expect(offCtx.baseConfig.budget?.compactionRelevance).toBe(false);
+    const onCtx = makeCtx();
+    await budgetCommand.exec(['relevance', 'true'], onCtx);
+    expect(onCtx.baseConfig.budget?.compactionRelevance).toBe(true);
+  });
+
+  test('/budget relevance off twice is idempotent (already off)', async () => {
+    const ctx = makeCtx();
+    await budgetCommand.exec(['relevance', 'off'], ctx);
+    const again = await budgetCommand.exec(['relevance', 'off'], ctx);
+    if (again.kind !== 'ok') return;
+    expect(again.notes?.[0]).toContain('already off');
+  });
+
+  test('/budget relevance on re-enables after a config-set false (not a silent no-op)', async () => {
+    // The operator's real recovery path: `[budget] compaction_relevance = false`
+    // in config, then `/budget relevance on` to flip it back for this session.
+    const ctx = makeCtx();
+    ctx.baseConfig.budget = { ...ctx.baseConfig.budget, compactionRelevance: false };
+    const result = await budgetCommand.exec(['relevance', 'on'], ctx);
+    if (result.kind !== 'ok') return;
+    expect(ctx.baseConfig.budget?.compactionRelevance).toBe(true);
+    expect(result.notes?.[0]).toContain('on');
+  });
+
   test('/budget steps N updates maxSteps and notes next-turn pickup', async () => {
     const ctx = makeCtx();
     const result = await budgetCommand.exec(['steps', '120'], ctx);
