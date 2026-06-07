@@ -1433,6 +1433,14 @@ describe('repl — boot + smoke', () => {
       length: 10,
       snapshot: () => ({ sessionId: 'sess-1', messages: [], lastMessageId: '' }),
       restore: () => {},
+      // /compact calls getMessages() (for the before-hash) and the
+      // relevance pre-pass (memoryRegistry is set + compactionRelevance is
+      // default-on) BEFORE the gated compact(). Without these the stub
+      // throws synchronously, /compact aborts before awaiting compactGate,
+      // and `compacting` drops — so the queued message would wrongly start
+      // a turn instead of going to the inbox (the very thing under test).
+      getMessages: () => [],
+      relevanceElide: () => null,
       compact: async () => {
         await compactGate;
         return {
