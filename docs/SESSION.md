@@ -39,6 +39,11 @@ at any time and rebuilt from the log (that is exactly what `--resume` does).
   is non-empty, and writes NULL token columns when usage was unseen.
 - `compact(provider, opts)` — rewrites the array in place via `compactMessages`;
   **persists nothing**. Returns the `CompactionResult` so the caller folds cost.
+- `relevanceElide(opts)` — cheap, **no provider call**: pointer-elides
+  low-goal-relevance `tool_result` bodies in the middle (goal + tail kept),
+  rewriting the array in place. The auto path runs it BEFORE `compact` and
+  re-checks tokens (see [Compaction](#compaction)). Returns the elision stats
+  (`elidedCount` / `freedBytes` / `elidedIds`) or null.
 - `ensureAlternation(willAppendUser)` — heals the array before a turn reuses it:
   runs `repairAlternation` (answer orphaned `tool_use`, close `user→user` gaps —
   in-memory only) then the stranded-turn placeholder. This is what makes the
@@ -97,18 +102,37 @@ left unanswered.
 
 ## Compaction
 
-Two triggers, **one core** (`ctx.compact` → `compactMessages`, `compaction.ts`):
+Two triggers — automatic (`promptTokens > threshold` at loop top) and manual
+(`/compact`) — feed a **two-stage** pipeline: a cheap relevance pre-pass, then
+the billed LLM fold run only when the pre-pass isn't enough.
 
 | | automatic | `/compact` (manual) |
 |---|---|---|
 | Trigger | `promptTokens > threshold` at loop top | operator types `/compact` |
 | Exclusion | already inside the turn | `runExclusive` busy flag (refuses a concurrent turn) |
 | Cost | folded into the run's `totalCostUsd` | folded into the session row + REPL cumulative |
-| Surface | `compaction_started` / `_finished` events | a scrollback note |
+| Surface | `compaction_started` / `_finished` events | a scrollback note (+ relevance line) |
 
-`compactMessages` keeps `messages[0]` (the goal) and the last `preserveTail`
-messages (walked back to an `assistant` boundary so tool pairs stay intact),
-and folds the **middle**:
+**Stage 1 — relevance pre-pass** (`ctx.relevanceElide` → `compaction-relevance.ts`;
+default-ON via `budget.compactionRelevance`). No provider call: score the
+middle's `tool_result` bodies by BM25 relevance to the goal + position-recency,
+keep the highest verbatim within a byte budget derived from the trigger, and
+replace the rest with `[tool_result elided: …]` pointers. The elided raw stays
+in the SQLite log and is reachable via `retrieve_context` (session view) — the
+elision is reversible. **Token-driven** (in the loop): pre-pass → re-estimate
+`promptTokens` → if back under threshold, **done, no LLM call**; else fall
+through to stage 2. No spin (a re-trigger finds the pointered bodies
+ineligible). Replay-safe (recency is by message position, not wall-clock, so
+the partition is pure); errors are never elided (`OUTPUT_POLICY §0.4`).
+Auditable: `compaction_finished` carries `relevance: { elidedCount, keptCount,
+freedBytes, elidedIds }`. `/compact` runs the same pre-pass (then always folds —
+the operator forced it) and reports the elision in its note.
+
+**Stage 2 — LLM fold** (`ctx.compact` → `compactMessages`, `compaction.ts`).
+Keeps `messages[0]` (the goal) and the last `preserveTail` messages — walked
+back to an `assistant` boundary so tool pairs stay intact, via the
+`alignTailStartToAssistant` helper the pre-pass shares — and folds the
+**middle**:
 
 - **LLM path** — one billed summary call (`max_tokens` 1024, `temperature` 0)
   over a rendered transcript of the middle; the summary is merged into the goal
@@ -119,7 +143,11 @@ and folds the **middle**:
   run always survives a flaky summary call.
 - **skipped** — history too short / no foldable middle: returns the same array.
 
-Compaction is **in-memory only** — the original bodies stay in the SQLite log.
+The `compaction_finished.strategy` is exactly which path ran: `relevance`
+(stage 1 sufficed), or `llm` / `fallback` / `skipped` (stage 2). Compaction is
+**in-memory only** — the original bodies stay in the SQLite log. Canonical
+what/why is `CONTEXT_TUNING §12` (spec, PT-BR); this section is the EN
+implementation companion (which files, what order).
 
 ## Multi-turn in the REPL (compact-once-reuse)
 
