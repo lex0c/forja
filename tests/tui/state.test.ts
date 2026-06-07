@@ -245,9 +245,10 @@ describe('session lifecycle', () => {
       ],
     });
     // Banner is the earliest signal carrying provider capabilities;
-    // mirroring model + contextWindow onto status here lets the
-    // footer render `<model> · …% context used` during the idle
-    // boot window before the first `session:start`.
+    // mirror model + contextWindow onto status here (the footer renders
+    // the model chip from this during the idle boot window before the
+    // first `session:start`; contextWindow is retained for non-footer
+    // consumers).
     expect(r.state.status.model).toBe('anthropic/claude-sonnet-4-6');
     expect(r.state.status.contextWindow).toBe(200000);
     expect(r.permanent).toEqual([

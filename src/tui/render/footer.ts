@@ -33,8 +33,6 @@ const formatTokens = (n: number, unit = 'tokens'): string => {
 // entirely at exactly $0 (see renderFooter).
 const formatCost = (usd: number): string => `$${(Math.round(usd * 100) / 100).toFixed(2)}`;
 
-const CONTEXT_WARN_THRESHOLD = 0.8;
-
 // "Can the operator interrupt right now?" — keyed off `state.busy`, the
 // renderer's mirror of the REPL's `isBusy()` (a foreground turn OR a
 // playbook OR an operator `!cmd` in flight). It must cover ALL of those:
@@ -109,11 +107,6 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
 
   const status = state.status;
   const rightParts: string[] = [];
-  // Selected effort level (leftmost of the right cluster). Seeded at
-  // boot from config/DEFAULT_EFFORT, updated live on `/effort`.
-  if (status.effort !== null) {
-    rightParts.push(dim(caps, `effort: ${status.effort}`));
-  }
   if (status.model !== null && status.model !== '') {
     rightParts.push(dim(caps, status.model));
   }
@@ -135,17 +128,6 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
   // idle session.
   if (status.sessionTotalCostUsd > 0) {
     rightParts.push(dim(caps, formatCost(status.sessionTotalCostUsd)));
-  }
-  // Both fields required: rendering `0% context used` against an
-  // unknown window would mislead the operator. Also suppressed while
-  // contextStale — a compaction shrank the context but no fresh turn has
-  // re-measured it, so we show provider-truth or nothing (never a
-  // post-compaction estimate). Restored on the next assistant:end.
-  if (status.contextWindow > 0 && status.lastTurnContextTokens > 0 && !status.contextStale) {
-    const ratio = status.lastTurnContextTokens / status.contextWindow;
-    const pct = Math.min(100, Math.max(0, Math.round(ratio * 100)));
-    const text = `${pct}% context used`;
-    rightParts.push(ratio >= CONTEXT_WARN_THRESHOLD ? paint(caps, 'warn', text) : dim(caps, text));
   }
   const right = rightParts.join(sep);
 
