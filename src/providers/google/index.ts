@@ -134,14 +134,21 @@ export const createGoogleProvider = (
     client = new GoogleGenAI({ apiKey });
   }
 
+  // Sampling gate (mirrors the Anthropic adapter). A model that deprecates
+  // `temperature`/`top_p` at the API opts out via `supports_sampling: false`;
+  // the adapter then omits both rather than risk an HTTP 400. Current Gemini
+  // models accept sampling, so this is a no-op for them — but it keeps the
+  // three adapters uniform and ready for a future thinking-only Gemini.
+  const acceptsSampling = caps.supports_sampling !== false;
+
   const generate = async function* (req: GenerateRequest): AsyncIterable<StreamEvent> {
     const contents = req.messages.map(toGoogleContent);
     const config: Record<string, unknown> = {
       maxOutputTokens: req.max_tokens,
     };
     if (req.system !== undefined) config.systemInstruction = req.system;
-    if (req.temperature !== undefined) config.temperature = req.temperature;
-    if (req.top_p !== undefined) config.topP = req.top_p;
+    if (acceptsSampling && req.temperature !== undefined) config.temperature = req.temperature;
+    if (acceptsSampling && req.top_p !== undefined) config.topP = req.top_p;
     // Reasoning effort / thinking budget via the numeric
     // `thinkingConfig.thinkingBudget` knob — see `googleThinkingBudget`
     // for the precedence (explicit disable-via-zero > effort > legacy
@@ -201,8 +208,8 @@ export const createGoogleProvider = (
       },
     };
     if (req.system !== undefined) config.systemInstruction = req.system;
-    if (req.temperature !== undefined) config.temperature = req.temperature;
-    if (req.top_p !== undefined) config.topP = req.top_p;
+    if (acceptsSampling && req.temperature !== undefined) config.temperature = req.temperature;
+    if (acceptsSampling && req.top_p !== undefined) config.topP = req.top_p;
 
     const response = (await client.models.generateContent({
       model: modelName,

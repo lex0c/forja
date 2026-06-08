@@ -202,6 +202,65 @@ describe('createOpenAIProvider', () => {
     }
   };
 
+  test('uses max_tokens on a non-reasoning model (gpt-4o)', async () => {
+    const handle = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
+    const provider = createOpenAIProvider('gpt-4o', { client: handle.client });
+    await drain(provider, { model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }], max_tokens: 42 });
+    const params = handle.createCalls[0]?.params as {
+      max_tokens?: number;
+      max_completion_tokens?: number;
+    };
+    expect(params.max_tokens).toBe(42);
+    expect(params.max_completion_tokens).toBeUndefined();
+  });
+
+  test('uses max_completion_tokens on a reasoning model (gpt-5.4-mini)', async () => {
+    const handle = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
+    const provider = createOpenAIProvider('gpt-5.4-mini', { client: handle.client });
+    await drain(provider, {
+      model: 'gpt-5.4-mini',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 42,
+    });
+    const params = handle.createCalls[0]?.params as {
+      max_tokens?: number;
+      max_completion_tokens?: number;
+    };
+    // Reasoning models reject the legacy `max_tokens` — must send the renamed field.
+    expect(params.max_completion_tokens).toBe(42);
+    expect(params.max_tokens).toBeUndefined();
+  });
+
+  test('forwards temperature/top_p on a sampling model (gpt-4o)', async () => {
+    const handle = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
+    const provider = createOpenAIProvider('gpt-4o', { client: handle.client });
+    await drain(provider, {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 1,
+      temperature: 0.5,
+      top_p: 0.9,
+    });
+    const params = handle.createCalls[0]?.params as { temperature?: number; top_p?: number };
+    expect(params.temperature).toBe(0.5);
+    expect(params.top_p).toBe(0.9);
+  });
+
+  test('strips temperature/top_p on a reasoning model (gpt-5.4-mini, supports_sampling=false)', async () => {
+    const handle = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
+    const provider = createOpenAIProvider('gpt-5.4-mini', { client: handle.client });
+    await drain(provider, {
+      model: 'gpt-5.4-mini',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 1,
+      temperature: 0.5,
+      top_p: 0.9,
+    });
+    const params = handle.createCalls[0]?.params as { temperature?: number; top_p?: number };
+    expect(params.temperature).toBeUndefined();
+    expect(params.top_p).toBeUndefined();
+  });
+
   test('sets prompt_cache_key on the request (real OpenAI, no custom baseURL)', async () => {
     const handle = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
     const provider = createOpenAIProvider('gpt-4o', { client: handle.client });

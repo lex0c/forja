@@ -190,6 +190,17 @@ export const createOpenAIProvider = (
   }
 
   const includeUsage = options.includeUsage ?? includeUsageFromEnv();
+  // Sampling gate (mirrors the Anthropic adapter). Reasoning models —
+  // OpenAI's o-series and gpt-5.x — REJECT `temperature`/`top_p` with HTTP
+  // 400 ("Unsupported parameter"). The capability opts those models out
+  // (`supports_sampling: false`); every other model keeps the canonical
+  // sampling surface. Applies to both the streaming and constrained paths.
+  const acceptsSampling = caps.supports_sampling !== false;
+  // The output-cap field name. Reasoning models (o-series, gpt-5.x) REJECT
+  // the legacy `max_tokens` and require `max_completion_tokens`; non-reasoning
+  // models (gpt-4o) still accept `max_tokens`. The reasoning capability is the
+  // proxy — it's exactly the set that renamed the field.
+  const maxTokensField = caps.supports_reasoning_effort === true ? 'max_completion_tokens' : 'max_tokens';
 
   const generate = async function* (req: GenerateRequest): AsyncIterable<StreamEvent> {
     const messages: OpenAIMessage[] = [];
@@ -204,7 +215,7 @@ export const createOpenAIProvider = (
       model: modelName,
       messages,
       stream: true,
-      max_tokens: req.max_tokens,
+      [maxTokensField]: req.max_tokens,
     };
     if (includeUsage) {
       // Opt into the final-chunk usage payload so we can compute cost.
@@ -220,8 +231,8 @@ export const createOpenAIProvider = (
     if (options.baseURL === undefined) {
       params.prompt_cache_key = openaiPromptCacheKey(req);
     }
-    if (req.temperature !== undefined) params.temperature = req.temperature;
-    if (req.top_p !== undefined) params.top_p = req.top_p;
+    if (acceptsSampling && req.temperature !== undefined) params.temperature = req.temperature;
+    if (acceptsSampling && req.top_p !== undefined) params.top_p = req.top_p;
     // Determinism intent (`PLAYBOOKS.md` §1.1
     // `sampling.seed_in_eval`). OpenAI's `seed` param is
     // best-effort but documented as the canonical reproducibility
@@ -268,7 +279,7 @@ export const createOpenAIProvider = (
     const params: Record<string, unknown> = {
       model: modelName,
       messages,
-      max_tokens: req.max_tokens,
+      [maxTokensField]: req.max_tokens,
       tools: [
         {
           type: 'function',
@@ -285,8 +296,8 @@ export const createOpenAIProvider = (
     };
     // Cache-routing hint — real OpenAI only (a custom baseURL may 400 on it).
     if (options.baseURL === undefined) params.prompt_cache_key = openaiPromptCacheKey(req);
-    if (req.temperature !== undefined) params.temperature = req.temperature;
-    if (req.top_p !== undefined) params.top_p = req.top_p;
+    if (acceptsSampling && req.temperature !== undefined) params.temperature = req.temperature;
+    if (acceptsSampling && req.top_p !== undefined) params.top_p = req.top_p;
 
     const response = (await client.chat.completions.create(
       params as unknown as Parameters<typeof client.chat.completions.create>[0],

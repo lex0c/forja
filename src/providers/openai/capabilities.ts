@@ -24,37 +24,47 @@ export const OPENAI_CAPS: Record<string, ProviderCapabilities> = {
   // has no cache-WRITE premium (automatic prefix caching is free to write),
   // so only `cost_per_1k_cached_input` (the discounted read) is set; the
   // write rate is intentionally absent. These accept `reasoning_effort`, so
-  // `supports_reasoning_effort` is true (the adapter gates the param on it).
-  // Context/output ceilings are conservative placeholders pending PROVIDERS.md
-  // confirmation; the pricing is authoritative.
+  // `supports_reasoning_effort` is true (the adapter gates the param on it),
+  // and `supports_sampling: false` because reasoning models reject
+  // temperature/top_p. Model ids, the 1,050,000 context window, and the 128K
+  // output cap are verified against developers.openai.com/api/docs/models
+  // (gpt-5.5 / gpt-5.4; gpt-5.4-mini inherits the family context window).
+  // CAVEAT (live-verified 2026-06-08): on Chat Completions these reasoning
+  // models 400 on the tools+reasoning_effort COMBINATION ("use /v1/responses
+  // instead") — Forja's agentic loop always sends both, so gpt-5.x needs the
+  // Responses API path (task #19). gpt-4o (non-reasoning) is unaffected.
   'gpt-5.5': {
     ...OPENAI_BASE,
-    context_window: 400_000,
+    context_window: 1_050_000,
     output_max_tokens: 128_000,
     cost_per_1k_input: 5.0,
     cost_per_1k_output: 30.0,
     cost_per_1k_cached_input: 0.5,
     supports_reasoning_effort: true,
+    // Reasoning models reject temperature/top_p (HTTP 400) — adapter strips.
+    supports_sampling: false,
     notes: ['frontier reasoning model for coding and professional work'],
   },
   'gpt-5.4': {
     ...OPENAI_BASE,
-    context_window: 400_000,
+    context_window: 1_050_000,
     output_max_tokens: 128_000,
     cost_per_1k_input: 2.5,
     cost_per_1k_output: 15.0,
     cost_per_1k_cached_input: 0.25,
     supports_reasoning_effort: true,
+    supports_sampling: false,
     notes: ['cost-efficient reasoning model for coding and professional work'],
   },
   'gpt-5.4-mini': {
     ...OPENAI_BASE,
-    context_window: 400_000,
+    context_window: 1_050_000,
     output_max_tokens: 128_000,
     cost_per_1k_input: 0.75,
     cost_per_1k_output: 4.5,
     cost_per_1k_cached_input: 0.075,
     supports_reasoning_effort: true,
+    supports_sampling: false,
     notes: ['most capable mini; coding, computer use, and subagents'],
   },
   'gpt-4o': {

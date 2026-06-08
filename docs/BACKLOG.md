@@ -2,6 +2,28 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-08] #17: verificação dos gpt-5.x + fix max_completion_tokens
+
+**Verificado contra developers.openai.com/api/docs/models (WebSearch/WebFetch):**
+- ✅ model-ids `gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini` corretos.
+- ⚠️ **CORRIGIDO por teste ao vivo (probe gpt-5.4-mini):** a WebSearch dizia que rodam em Chat Completions, mas a combinação **tools + reasoning_effort 400a** lá ("use /v1/responses instead"). O loop agêntico sempre manda os dois → gpt-5.x **precisa da Responses API** (task #19). tools-sem-effort e effort-sem-tools funcionam isolados; gpt-4o (não-reasoning) é OK.
+- ✅ `reasoning_effort` flat (none/low/medium/high/xhigh) — bate com o adapter + `max→xhigh`.
+- ✅ context window **1,050,000** (corrigido de placeholder 400k) / output 128K.
+
+**Fix (achado da review do #13):** reasoning models REJEITAM `max_tokens` e exigem `max_completion_tokens`. Adicionado `maxTokensField = caps.supports_reasoning_effort ? 'max_completion_tokens' : 'max_tokens'` (capability-driven), aplicado em generate + generateConstrained. gpt-4o continua em `max_tokens` (legacy aceito).
+
+**Provado:** openai.test (+2: gpt-4o→max_tokens, gpt-5.4-mini→max_completion_tokens). providers 233/233, typecheck + lint limpos.
+
+**#16 (tokenizer) ADIADO:** investigação mostrou `provider.countTokens` sem nenhum call site vivo (stub →0 em run.ts; integração é slice 4.9 deferida). Adicionar tiktoken (2-4MB de ranks) por um método não-consumido é prematuro — entra junto com a slice 4.9. (Pendência menor do #17: context windows do Gemini 3.x ainda placeholders 1M — revisar na validação Gemini.)
+
+## [2026-06-08] #15: sampling gate no OpenAI + Gemini
+
+**Gap:** o Anthropic gateia temp/top_p em `supports_sampling` (strippa no Opus 4.7/4.8 que 400am); OpenAI e Gemini mandavam **incondicionalmente**. Os gpt-5.x reasoning **rejeitam** temperature → 400.
+
+**Fix:** `const acceptsSampling = caps.supports_sampling !== false` por factory, gateando os 4 sends (temp/top_p em generate + generateConstrained nos dois adapters). `supports_sampling: false` adicionado nos 3 gpt-5.x (reasoning). Gemini fica no-op (modelos atuais aceitam sampling), mas o código fica uniforme com os outros dois e pronto pra um futuro Gemini thinking-only.
+
+**Provado:** openai.test (+2: gpt-4o mantém temp/top_p; gpt-5.4-mini strippa). providers 231/231, typecheck + lint limpos.
+
 ## [2026-06-08] #18 (parcial): smokes provider-paramétricos + validação OpenAI ao vivo
 
 **Parametrização:** os 9 smokes `.sh` que hardcodavam `MODEL="anthropic/claude-haiku-4-5"` agora usam `MODEL="${SMOKE_MODEL:-anthropic/claude-haiku-4-5}"` — default inalterado (backward-compatible), overridável via env pra rodar em qualquer provider. (cross-provider mantido dual claude+openai de propósito.)
