@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-07] Atribuição de cache write por fonte + write amplification no `/stats`
+
+**Insight (operador):** cache write = 47% do custo; "qual fonte?" é o lever pra cortar. **Limite físico honesto:** o provider devolve UM `cache_creation` por resposta — não atribui a escrita a um content block, então sub-dividir uma sessão por seção de prompt (memory/project/session) NÃO é mensurável. **O que dá** (registros/sessões distintos já persistidos): **parent** (sessões `is_subagent=0`), **subagent** (`is_subagent=1`), **compaction** (`compaction_events.call_cache_creation`, persistido em `04e7ad25`). 3 buckets disjuntos que somam o `cacheCreation` total.
+
+**Fix:** `computeUsageStats` ganhou `cacheWriteParent/Subagent/Compaction` (bucketados no MESMO tree-walk por `session.isSubagent` — zero query extra) + `cacheWriteAmplification(stats)` = `write/(read+write)`. `/stats` renderiza `cache: N% hit · M% write amplification` e `writes: T (parent A · subagents B · compaction C)`. Footnote já existente cobre o caveat. (Nota: a sessão real do operador foi `scope:1` = sem subagentes → o split mostraria que os 819K vieram de parent+compaction, refutando a hipótese "subagentes" pra aquele caso — exatamente o valor do instrumento.)
+
+**Provado:** `stats.test.ts` storage (+2: split 3-way somando ao total, amplification + zero-traffic) + `stats.test.ts` slash (+1: render `writes:`/amplification). storage+slash 1474/1474, typecheck + lint limpos.
+
 ## [2026-06-07] Cost breakdown por eixo no `/stats` (onde o dinheiro foi)
 
 **Insight (sessão real):** numa sessão, **cache write foi ~47% do custo** (o eixo dominante), não inferência — mas o `cache_hit_ratio` (token-based, #6) lia ~92% (saudável). São lentes diferentes: write custa 12.5× read por token ($6.25 vs $0.50/MTok no Opus), então um read:write em tokens bom ainda vira custo write-dominado. O hit ratio mostra "o cache pega?"; faltava "pra onde o dinheiro foi?".

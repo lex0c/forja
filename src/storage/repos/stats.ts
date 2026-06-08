@@ -41,6 +41,19 @@ export interface UsageStats {
   usageComplete: boolean;
   // Sessions walked: the root(s) plus every subagent descendant.
   sessionCount: number;
+  // Cache-write (cache_creation) split by SOURCE — three DISJOINT buckets
+  // that sum to `cacheCreation`. Cache write is the expensive axis, so
+  // knowing which source drives it (vs the provider's single opaque
+  // cache_creation number) is the lever for cutting it. The provider does
+  // NOT attribute a write to a content block, so we can't sub-split the
+  // parent bucket by prompt section — but these three come from distinct
+  // persisted records and are exact:
+  //   - parent: main-conversation sessions (is_subagent = 0) message writes
+  //   - subagent: subagent sessions (is_subagent = 1) message writes
+  //   - compaction: the compaction calls (compaction_events), any session
+  cacheWriteParent: number;
+  cacheWriteSubagent: number;
+  cacheWriteCompaction: number;
 }
 
 const emptyStats = (): UsageStats => ({
@@ -51,7 +64,20 @@ const emptyStats = (): UsageStats => ({
   cacheCreation: 0,
   usageComplete: true,
   sessionCount: 0,
+  cacheWriteParent: 0,
+  cacheWriteSubagent: 0,
+  cacheWriteCompaction: 0,
 });
+
+// Cache-write amplification: cache writes over total cache traffic
+// (writes + reads). Low is good — a mature session reuses (reads) far more
+// than it writes. A climbing ratio between sessions means more of the
+// prefix is being re-written each turn (an invalidator, or 5-min expiry).
+// 0 when there is no cache traffic yet.
+export const cacheWriteAmplification = (stats: UsageStats): number => {
+  const cacheTotal = stats.cacheRead + stats.cacheCreation;
+  return cacheTotal === 0 ? 0 : stats.cacheCreation / cacheTotal;
+};
 
 // Fraction of the INPUT side served from prompt cache: cache reads over all
 // input tokens (non-cached input + cache reads + cache writes). Output is
@@ -88,6 +114,15 @@ export const computeUsageStats = (db: DB, rootSessionIds: readonly string[]): Us
     stats.tokensOut += usage.tokensOut + compactionUsage.tokensOut;
     stats.cacheRead += usage.cacheRead + compactionUsage.cacheRead;
     stats.cacheCreation += usage.cacheCreation + compactionUsage.cacheCreation;
+    // Same numbers, bucketed by source for the cache-write attribution.
+    // Message writes go to parent vs subagent by the session's identity
+    // flag; compaction writes are their own bucket regardless of session.
+    if (session.isSubagent) {
+      stats.cacheWriteSubagent += usage.cacheCreation;
+    } else {
+      stats.cacheWriteParent += usage.cacheCreation;
+    }
+    stats.cacheWriteCompaction += compactionUsage.cacheCreation;
     for (const child of listChildSessions(db, id)) visit(child.id);
   };
 

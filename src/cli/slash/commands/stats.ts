@@ -16,7 +16,11 @@
 // with a leading `~` and an explanatory footnote.
 
 import { computeCostBreakdown } from '../../../providers/cost.ts';
-import { cacheHitRatio, computeUsageStats } from '../../../storage/index.ts';
+import {
+  cacheHitRatio,
+  cacheWriteAmplification,
+  computeUsageStats,
+} from '../../../storage/index.ts';
 import { formatCost } from '../format.ts';
 import type { SlashCommand } from '../types.ts';
 
@@ -71,7 +75,11 @@ export const statsCommand: SlashCommand = {
       `  spend:  in ${formatCost(bd.inputCost)} (${pct(bd.inputCost)}%) · out ${formatCost(bd.outputCost)} (${pct(bd.outputCost)}%) · cache read ${formatCost(bd.cacheReadCost)} (${pct(bd.cacheReadCost)}%) · cache write ${formatCost(bd.cacheWriteCost)} (${pct(bd.cacheWriteCost)}%)`,
       `  tokens: ${lb}${groupThousands(total)} (compute ${groupThousands(compute)} · cache ${groupThousands(cache)})`,
       `          in ${groupThousands(s.tokensIn)} · out ${groupThousands(s.tokensOut)} · cache read ${groupThousands(s.cacheRead)} · write ${groupThousands(s.cacheCreation)}`,
-      `  cache:  ${hitPct}% hit`,
+      `  cache:  ${hitPct}% hit · ${Math.round(cacheWriteAmplification(s) * 100)}% write amplification`,
+      // Cache write split by source — find the culprit driving the expensive
+      // axis. The parent bucket can't be sub-split by prompt section (the
+      // provider doesn't attribute a write to a content block).
+      `  writes: ${lb}${groupThousands(s.cacheCreation)} (parent ${groupThousands(s.cacheWriteParent)} · subagents ${groupThousands(s.cacheWriteSubagent)} · compaction ${groupThousands(s.cacheWriteCompaction)})`,
       `  scope:  ${s.sessionCount} session${s.sessionCount === 1 ? '' : 's'}`,
       '  spend = est. from current model rates (tokens × rate); may differ from cost above',
     ];

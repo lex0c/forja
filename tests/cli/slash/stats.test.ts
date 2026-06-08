@@ -13,6 +13,7 @@ import { DEFAULT_BUDGET } from '../../../src/harness/types.ts';
 import { createRegistry as createModelRegistry } from '../../../src/providers/registry.ts';
 import { type DB, openMemoryDb } from '../../../src/storage/db.ts';
 import { migrate } from '../../../src/storage/migrate.ts';
+import { appendCompactionEvent } from '../../../src/storage/repos/compaction-events.ts';
 import { appendMessage } from '../../../src/storage/repos/messages.ts';
 import {
   createSession,
@@ -130,6 +131,32 @@ describe('/stats', () => {
     expect(text).toContain('2 sessions');
     // no lower-bound marker when usage is complete
     expect(text).not.toContain('~');
+  });
+
+  test('attributes cache write by source + write amplification', async () => {
+    // parent writes 1000, a subagent writes 400, compaction writes 100.
+    // total cache write 1500; reads 13,500 → amplification 1500/15000 = 10%.
+    const root = createSession(db, { model: 'm', cwd: '/p' });
+    usage(root.id, { in: 0, out: 0, cacheRead: 13500, cacheCreation: 1000 });
+    const child = createSession(db, { model: 'm', cwd: '/p', parentSessionId: root.id });
+    usage(child.id, { in: 0, out: 0, cacheRead: 0, cacheCreation: 400 });
+    appendCompactionEvent(db, {
+      sessionId: root.id,
+      strategy: 'llm',
+      foldedCount: 1,
+      beforeHash: 'a',
+      afterHash: 'b',
+      callUsage: { tokensIn: 0, tokensOut: 0, cacheRead: 0, cacheCreation: 100 },
+      recordedAt: 1,
+    });
+    replIds = [root.id];
+
+    const r = await statsCommand.exec([], buildCtx());
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('writes: 1,500 (parent 1,000 · subagents 400 · compaction 100)');
+    expect(text).toContain('10% write amplification');
   });
 
   test('breaks cost down by axis — surfaces cache-write dominance', async () => {

@@ -10,7 +10,11 @@ import {
   markSessionUsageIncomplete,
   updateSessionCost,
 } from '../../../src/storage/repos/sessions.ts';
-import { cacheHitRatio, computeUsageStats } from '../../../src/storage/repos/stats.ts';
+import {
+  cacheHitRatio,
+  cacheWriteAmplification,
+  computeUsageStats,
+} from '../../../src/storage/repos/stats.ts';
 
 let db: DB;
 
@@ -48,6 +52,9 @@ describe('computeUsageStats', () => {
       cacheCreation: 0,
       usageComplete: true,
       sessionCount: 0,
+      cacheWriteParent: 0,
+      cacheWriteSubagent: 0,
+      cacheWriteCompaction: 0,
     });
   });
 
@@ -162,6 +169,30 @@ describe('computeUsageStats', () => {
     expect(s.cacheRead).toBe(800);
   });
 
+  test('splits cache write by source (parent / subagent / compaction), summing to total', () => {
+    const root = createSession(db, { model: 'm', cwd: '/p' }); // is_subagent=0
+    usage(root.id, { in: 0, out: 0, cacheRead: 0, cacheCreation: 1000 }); // parent write
+    const child = createSession(db, { model: 'm', cwd: '/p', parentSessionId: root.id }); // is_subagent=1
+    usage(child.id, { in: 0, out: 0, cacheRead: 0, cacheCreation: 400 }); // subagent write
+    appendCompactionEvent(db, {
+      sessionId: root.id,
+      strategy: 'llm',
+      foldedCount: 1,
+      beforeHash: 'a',
+      afterHash: 'b',
+      callUsage: { tokensIn: 0, tokensOut: 0, cacheRead: 0, cacheCreation: 89 },
+      recordedAt: 1,
+    });
+    const s = computeUsageStats(db, [root.id]);
+    expect(s.cacheWriteParent).toBe(1000);
+    expect(s.cacheWriteSubagent).toBe(400);
+    expect(s.cacheWriteCompaction).toBe(89);
+    // The three buckets are disjoint and sum to the grand cache_creation.
+    expect(s.cacheWriteParent + s.cacheWriteSubagent + s.cacheWriteCompaction).toBe(
+      s.cacheCreation,
+    );
+  });
+
   test('relevance-only compaction contributes no tokens (no provider call)', () => {
     const root = createSession(db, { model: 'm', cwd: '/p' });
     usage(root.id, { in: 10, out: 5, cacheRead: 0, cacheCreation: 0 });
@@ -198,6 +229,9 @@ describe('cacheHitRatio', () => {
     cacheCreation: 0,
     usageComplete: true,
     sessionCount: 0,
+    cacheWriteParent: 0,
+    cacheWriteSubagent: 0,
+    cacheWriteCompaction: 0,
     ...over,
   });
 
@@ -221,5 +255,14 @@ describe('cacheHitRatio', () => {
 
   test('no input yet → 0 (no division by zero)', () => {
     expect(cacheHitRatio(stats({ tokensOut: 500 }))).toBe(0);
+  });
+
+  test('cacheWriteAmplification = write / (read + write); 0 with no cache traffic', () => {
+    // 1000 write / (9000 read + 1000 write) = 0.10 — a healthy low ratio.
+    expect(cacheWriteAmplification(stats({ cacheRead: 9000, cacheCreation: 1000 }))).toBeCloseTo(
+      0.1,
+      10,
+    );
+    expect(cacheWriteAmplification(stats({ cacheRead: 0, cacheCreation: 0 }))).toBe(0);
   });
 });
