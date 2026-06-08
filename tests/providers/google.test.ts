@@ -41,6 +41,21 @@ const mockClient = (
   return { client, streamCalls, countTokensCalls };
 };
 
+// Non-streaming mock for the constrained path: `generateContent` returns a
+// plain response object (candidates + usageMetadata).
+const mockConstrainedClient = (response: unknown): { client: GoogleGenAI; calls: StreamCall[] } => {
+  const calls: StreamCall[] = [];
+  const client = {
+    models: {
+      async generateContent(params: unknown) {
+        calls.push({ params });
+        return response;
+      },
+    },
+  } as unknown as GoogleGenAI;
+  return { client, calls };
+};
+
 describe('createGoogleProvider', () => {
   let originalApi: string | undefined;
   let originalGemini: string | undefined;
@@ -84,17 +99,67 @@ describe('createGoogleProvider', () => {
     expect(provider.capabilities.context_window).toBe(1_000_000);
   });
 
-  test('generateConstrained rejects (not implemented for Google in M4.2)', async () => {
-    const provider = createGoogleProvider('gemini-2.5-flash', { apiKey: 'k' });
+  test('generateConstrained forces the named function and returns its JSON args', async () => {
+    const handle = mockConstrainedClient({
+      candidates: [
+        { content: { parts: [{ functionCall: { name: 'render_output', args: { ok: true } } }] } },
+      ],
+      usageMetadata: {
+        promptTokenCount: 100,
+        candidatesTokenCount: 20,
+        cachedContentTokenCount: 30,
+      },
+    });
+    const provider = createGoogleProvider('gemini-2.5-flash', { client: handle.client });
+    const result = await provider.generateConstrained({
+      model: 'gemini-2.5-flash',
+      messages: [{ role: 'user', content: 'x' }],
+      max_tokens: 64,
+      system: 'be precise',
+      output_schema: { type: 'object', properties: { ok: { type: 'boolean' } } },
+      output_schema_name: 'render_output',
+    });
+    expect(result.output).toBe('{"ok":true}');
+    // input = prompt(100) − cached(30) = 70; cache_read = 30; no cache write.
+    expect(result.usage).toEqual({ input: 70, output: 20, cache_read: 30, cache_creation: 0 });
+    const params = handle.calls[0]?.params as { config?: { toolConfig?: unknown } };
+    expect(params.config?.toolConfig).toEqual({
+      functionCallingConfig: { mode: 'ANY', allowedFunctionNames: ['render_output'] },
+    });
+  });
+
+  test('generateConstrained throws with finishReason when no functionCall', async () => {
+    const handle = mockConstrainedClient({
+      candidates: [{ finishReason: 'MAX_TOKENS', content: { parts: [{ text: 'thought...' }] } }],
+      usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 1 },
+    });
+    const provider = createGoogleProvider('gemini-2.5-flash', { client: handle.client });
     await expect(
       provider.generateConstrained({
         model: 'gemini-2.5-flash',
-        messages: [{ role: 'user', content: 'hi' }],
-        max_tokens: 1,
+        messages: [{ role: 'user', content: 'x' }],
+        max_tokens: 64,
         output_schema: { type: 'object' },
         output_schema_name: 'render_output',
       }),
-    ).rejects.toThrow(/not implemented for Google/);
+      // Surfaces the cause (thinking spent the budget) — not a bare "no call".
+    ).rejects.toThrow(/no functionCall for forced tool 'render_output' \(finishReason=MAX_TOKENS\)/);
+  });
+
+  test('generateConstrained rejects when caller passes extra tools', async () => {
+    const handle = mockConstrainedClient({ candidates: [] });
+    const provider = createGoogleProvider('gemini-2.5-flash', { client: handle.client });
+    await expect(
+      provider.generateConstrained({
+        model: 'gemini-2.5-flash',
+        messages: [{ role: 'user', content: 'x' }],
+        max_tokens: 64,
+        output_schema: { type: 'object' },
+        output_schema_name: 'render_output',
+        tools: [{ name: 'extra', description: 'd', input_schema: { type: 'object' } }],
+      }),
+    ).rejects.toThrow(/'tools' must be empty/);
+    expect(handle.calls).toHaveLength(0);
   });
 
   test('generate pipes the SDK stream through the canonical normalizer', async () => {

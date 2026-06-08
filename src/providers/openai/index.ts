@@ -245,13 +245,101 @@ export const createOpenAIProvider = (
     yield* normalizeOpenAIStream(stream);
   };
 
+  // Structured output via FORCED tool calling, mirroring the Anthropic path
+  // (anthropic/index.ts generateConstrained): declare ONE function tool whose
+  // parameters are the desired JSON schema, force it with `tool_choice`, and
+  // read the model's tool-call arguments — already a JSON string. Forced tool
+  // calling, NOT strict `response_format: {type:'json_schema'}`, for leniency:
+  // strict json_schema rejects schemas that aren't fully strict (every field
+  // required, additionalProperties:false), which the recap schemas are not.
+  // Single round-trip (non-streaming), like the recap render path expects.
+  const generateConstrained = async (req: ConstrainedRequest): Promise<ConstrainedResult> => {
+    // Same guard as Anthropic: caller tools would let the model pick a
+    // different tool and defeat the schema binding. Reject up-front.
+    if (req.tools !== undefined && req.tools.length > 0) {
+      throw new Error(
+        "openai generateConstrained: 'tools' must be empty (forced schema tool only)",
+      );
+    }
+    const messages: OpenAIMessage[] = [];
+    if (req.system !== undefined) messages.push({ role: 'system', content: req.system });
+    for (const m of req.messages) messages.push(...toOpenAIMessages(m));
+
+    const params: Record<string, unknown> = {
+      model: modelName,
+      messages,
+      max_tokens: req.max_tokens,
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: req.output_schema_name,
+            description:
+              req.output_schema_description ??
+              'Emit the structured output for the constrained request.',
+            parameters: req.output_schema,
+          },
+        },
+      ],
+      tool_choice: { type: 'function', function: { name: req.output_schema_name } },
+    };
+    // Cache-routing hint — real OpenAI only (a custom baseURL may 400 on it).
+    if (options.baseURL === undefined) params.prompt_cache_key = openaiPromptCacheKey(req);
+    if (req.temperature !== undefined) params.temperature = req.temperature;
+    if (req.top_p !== undefined) params.top_p = req.top_p;
+
+    const response = (await client.chat.completions.create(
+      params as unknown as Parameters<typeof client.chat.completions.create>[0],
+    )) as {
+      choices?: Array<{
+        finish_reason?: string;
+        message?: { tool_calls?: Array<{ function?: { name?: string; arguments?: string } }> };
+      }>;
+      usage?: {
+        prompt_tokens?: number;
+        completion_tokens?: number;
+        prompt_tokens_details?: { cached_tokens?: number };
+      } | null;
+    };
+
+    // With a named-function `tool_choice`, OpenAI returns exactly one matching
+    // tool_call. Walk defensively (don't index [0]); a miss is a hard error —
+    // the caller (recap render) has no fallback at this layer. Surface the
+    // `finish_reason` so the common causes are diagnosable rather than hidden
+    // behind a generic message: `length` = ran out of max_tokens before the
+    // call, `content_filter` = the response was blocked.
+    const toolCall = response.choices?.[0]?.message?.tool_calls?.find(
+      (c) => c.function?.name === req.output_schema_name,
+    );
+    if (toolCall?.function?.arguments === undefined) {
+      const finish = response.choices?.[0]?.finish_reason ?? 'unknown';
+      throw new Error(
+        `openai constrained: model returned no tool_call for forced tool '${req.output_schema_name}' (finish_reason=${finish})`,
+      );
+    }
+    // Usage convention MATCHES the streaming path (openai/stream.ts): OpenAI's
+    // prompt_tokens INCLUDES cached, so input = prompt − cached; cache_read =
+    // cached; OpenAI reports no cache-write, so cache_creation = 0.
+    const u = response.usage;
+    const prompt = u?.prompt_tokens ?? 0;
+    const cached = u?.prompt_tokens_details?.cached_tokens ?? 0;
+    return {
+      output: toolCall.function.arguments,
+      usage: {
+        input: Math.max(0, prompt - cached),
+        output: u?.completion_tokens ?? 0,
+        cache_read: cached,
+        cache_creation: 0,
+      },
+    };
+  };
+
   return {
     id: `openai/${modelName}`,
     family: 'openai',
     capabilities: caps,
     generate,
-    generateConstrained: (_req: ConstrainedRequest): Promise<ConstrainedResult> =>
-      Promise.reject(new Error('generateConstrained not implemented for OpenAI in M4.2')),
+    generateConstrained,
     countTokens: (messages: ProviderMessage[]): Promise<number> =>
       Promise.resolve(estimateMessagesTokens(messages)),
   };

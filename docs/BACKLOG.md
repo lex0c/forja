@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-07] Paridade de providers #13–#14: generateConstrained OpenAI + Gemini
+
+**Contexto:** OpenAI e Gemini tinham `generateConstrained` como **stub que lança** ("not implemented in M4.2") → o **recap** (render de PR/resumo via output constrangido) **falhava** nos dois. Maior gap de paridade com o Claude. (Plano completo de paridade: tasks #13–#18 + #7.)
+
+**Fix (espelha o forced-tool do Anthropic nos dois):** uma função/tool única com `parameters = output_schema`, forçada — OpenAI via `tool_choice: {type:'function', function:{name}}`, Gemini via `toolConfig.functionCallingConfig {mode:'ANY', allowedFunctionNames:[name]}`. Single round-trip (non-streaming). Extrai os args (já JSON no OpenAI; objeto→stringify no Gemini). **Forced tool, não** `response_format`/`responseSchema` strict — esses rejeitam schemas não-estritos (todo campo required / subset OpenAPI) que os schemas de recap usam. Usage casa com o streaming de cada um (`input = prompt − cached`, `cache_read = cached`, `cache_creation = 0`). Guard `tools` não-vazio igual ao Anthropic.
+
+**Provado:** openai.test (+3) e google.test (+3): força a tool nomeada, erro quando não vem call, rejeita tools extra, mapeamento de usage. providers 227/227, recap 372/372 (601 no conjunto), typecheck + lint limpos.
+
 ## [2026-06-07] Catálogo de modelos: default Opus 4.8 + lineup GPT-5.x
 
 **Anthropic:** `DEFAULT_MODEL` → `anthropic/claude-opus-4-8` (era 4.7). Adicionada a entry `claude-opus-4-8` em ANTHROPIC_CAPS — mesma superfície/pricing do 4.7 (migration guide: 4.7→4.8 sem breaking changes): in $5 / out $25 / cache read $0.50 / 5m write $6.25 / 1h write $10 (confirmado pelo pricing do operador), adaptive-only, sampling deprecated, effort. 4.7 mantido (legacy válido). Help do CLI atualizado.
