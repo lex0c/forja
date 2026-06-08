@@ -2,6 +2,25 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-08] #21: smokes — guard model-aware + validação gpt-5.x
+
+**Guard model-aware:** novo `evals/smoke-lib.sh` (`smoke_model` + `smoke_require_key`); o guard de cada smoke (que checava ANTHROPIC_API_KEY independente do SMOKE_MODEL — passava só porque a chave estava presente) virou `smoke_require_key "$(smoke_model)"`, que deriva a chave do provider do modelo (anthropic→ANTHROPIC_API_KEY, openai→OPENAI_API_KEY, google→GOOGLE/GEMINI_API_KEY). Aplicado nos 9 smokes paramétricos via perl (cross-provider mantém seu guard dual). Sintaxe validada (`bash -n`), lógica verificada por provider, e `SMOKE_MODEL=openai/gpt-4o-mini bash smoke-resume.sh` passou (sem depender de chave anthropic).
+
+**Validação gpt-5.x via Responses (orquestração):** `smoke-resume-with-tools` (tool loop + resume) e `smoke-subagent-grandchild` (3 níveis aninhados, cada um no adapter Responses + IPC/resume) **PASS** no gpt-5.4-mini — confirma o path Responses end-to-end além dos evals estruturados (que já deram 7/10, fails comportamentais).
+
+## [2026-06-08] #20: OpenAI Responses API path para gpt-5.x reasoning
+
+**Por quê:** gpt-5.x 400am no Chat Completions na combinação tools+reasoning_effort ("use /v1/responses instead", confirmado ao vivo). A Responses API é a forma recomendada da OpenAI pra agentic/tool-heavy (melhor reasoning + cache). SDK suporta (`openai@6.34.0`, `client.responses`).
+
+**Impl:**
+- `responses-stream.ts` — normalizer dos eventos SSE da Responses → `StreamEvent` canônico (created→start, output_text.delta→text_delta, output_item.added/done(function_call)→tool_use_start/stop, function_call_arguments.delta→tool_use_delta com mapa item_id→call_id, completed/incomplete→usage+stop, failed/error→error). Turno com function_call → stop `tool_use`; usage `input = input_tokens − cached`.
+- `responses.ts` — request builder (`input` items, `instructions`, tools flat, `reasoning:{effort}`, `max_output_tokens`, `store:false` stateless) + converter msg→input items (tool_use→function_call, tool_result→function_call_output) + generate/constrained.
+- `index.ts` roteia por `caps.supports_reasoning_effort` (reasoning→Responses; gpt-4o fica no Chat Completions). Os ajustes #15/#17 no Chat Completions (sampling gate, max_completion_tokens) viram defensivos — nenhum modelo atual os alcança (reasoning→Responses). Removidos 2 testes que assertavam gpt-5.4-mini no Chat Completions (roteia pra Responses).
+
+**Validado AO VIVO no gpt-5.4-mini** (o probe que antes 400'ava): generate "PONG" ✅; suite estruturado 6-7/10 (não-determinístico) — wire-correto (tools/results/usage funcionam, parallel-reads passa, `errors:[]`). providers 238/238 (após review fix do args-fallback), typecheck + lint limpos.
+
+**RESSALVA (achado ao vivo → task #25):** o path é wire-correto mas **incompleto pra qualidade dos reasoning models**. Os fails read-file (não chamou tool) e grep (`degenerateLoop`) são sintoma de **continuidade de reasoning faltando**: em stateless (`store:false`), a doc da OpenAI exige `include:["reasoning.encrypted_content"]` + replay dos reasoning items no input dos próximos turnos pra manter o fio entre tool round-trips. A Forja dropa esses items → o gpt-5.x re-deriva/loopa. Logo gpt-5.x é **funcional, não paridade de qualidade** até a #25; gpt-4o-mini (não-reasoning) é 10/10 sem ressalva.
+
 ## [2026-06-08] #17: verificação dos gpt-5.x + fix max_completion_tokens
 
 **Verificado contra developers.openai.com/api/docs/models (WebSearch/WebFetch):**

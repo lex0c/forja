@@ -38,10 +38,9 @@ if [[ -f "$ROOT/.env" ]]; then
   set +a
 fi
 
-if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
-  echo "ANTHROPIC_API_KEY not set; cannot run real-model smoke." >&2
-  exit 1
-fi
+# shellcheck source=evals/smoke-lib.sh
+source "$ROOT/evals/smoke-lib.sh"
+smoke_require_key "$(smoke_model)"
 
 if ! command -v git >/dev/null 2>&1; then
   echo "git not found; worktree smoke needs git." >&2
