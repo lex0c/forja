@@ -2,6 +2,32 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-08] fix(openai): gpt-5.4-mini context window 1.05M → 400K
+
+`gpt-5.4-mini` was catalogued at the family's 1,050,000-token window, but the
+OpenAI model page lists it at **400,000** (it does NOT inherit the gpt-5.5 /
+gpt-5.4 window). The inflated value is a real long-session bug: compaction fires
+at `threshold × context_window` (~70%), so it would wait until ~735K — past the
+model's real 400K limit — and the Responses call 400s at the API boundary before
+the harness ever folds. Corrected to 400,000 + comment. Re-verified the rest on
+the model page: gpt-5.5 / gpt-5.4 are 1.05M, gpt-5.3-codex 400K, gpt-4o(/-mini)
+128K — all correct. NOTE: the Gemini 3.x windows are still unverified
+placeholders (all 1M) — same bug class if any real window is smaller; left as-is
+(Gemini descoped, key expired) but flagged.
+
+## [2026-06-08] docs/PROVIDERS.md — implementation-facing provider-layer guide
+
+New English companion to the PT-BR `docs/spec/PROVIDERS.md`, documenting the
+provider layer as actually implemented: the `Provider` interface, registry /
+model-id resolution, the capability fields and what they gate, the canonical
+`StreamEvent` contract, per-provider specifics (Anthropic explicit cache
+breakpoints; OpenAI's two paths routed by `supports_reasoning_effort` + the
+`prompt_cache_key` lever + sampling gate; Gemini forced function calling, cache
+not yet wired), and the cross-cutting conventions (uniform usage, per-million
+cost, agnostic effort, the SHARED harness-level retry, determinism seams). Style
+matches the other `docs/*.md` operator guides; all claims spot-verified against
+`src/`.
+
 ## [2026-06-08] gpt-5.3-codex in the catalog + #25 (reasoning replay) investigated and REVERTED + cache-key on Responses
 
 **Cache-key on the Responses path:** the Responses path (gpt-5.x) did not set `prompt_cache_key` (the routing lever Chat Completions already uses). Closed: the factory computes the key (gated on a real-OpenAI `baseURL`, like Chat) and passes it as a parameter to `generateViaResponses`/`generateConstrainedViaResponses` — avoids the import cycle with index.ts and keeps the gate in one place. Live-validated (accepted on `/v1/responses`, no 400) + tests (set without baseURL; omitted with a custom baseURL). Closes OpenAI's cache parity with Claude (to the extent the API exposes it — OpenAI auto-caches, with no explicit breakpoints like Anthropic).
