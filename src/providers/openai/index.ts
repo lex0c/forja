@@ -1,4 +1,6 @@
+import { createHash } from 'node:crypto';
 import OpenAI from 'openai';
+import { stableStringify } from '../canonical-json.ts';
 // Shared chars/4 heuristic — see `src/providers/tokens.ts` for accuracy
 // bounds. OpenAI has no server-side countTokens endpoint until tiktoken
 // lands in M5.
@@ -49,6 +51,19 @@ export interface CreateOpenAIProviderOptions {
   // with no options) can still opt out without code changes.
   includeUsage?: boolean;
 }
+
+// OpenAI `prompt_cache_key` (cache routing): requests sharing this key are
+// routed to the same backend, raising the automatic prefix-cache hit rate
+// (OpenAI's documented lever). Key off the STABLE prefix — system + tools —
+// so every turn of a session, and any other session with the same prefix,
+// routes together; that prefix is exactly what OpenAI caches. Stable across
+// turns (system/tools don't change within a session) and order-independent
+// (stableStringify on the tool list). One sha256 per request; cheap.
+export const openaiPromptCacheKey = (req: GenerateRequest): string =>
+  createHash('sha256')
+    .update(req.system ?? '')
+    .update(stableStringify(req.tools ?? []))
+    .digest('hex');
 
 // Resolve the `includeUsage` default from the environment for callers
 // who don't pass an explicit option (notably the registry factory used
@@ -198,6 +213,13 @@ export const createOpenAIProvider = (
       params.stream_options = { include_usage: true };
     }
     if (req.tools !== undefined) params.tools = toOpenAITools(req.tools);
+    // Cache-routing hint — only to real OpenAI. A custom baseURL signals an
+    // OpenAI-compatible endpoint (Azure / OpenRouter / proxy) that may reject
+    // the unknown param with HTTP 400 (same caution as stream_options above);
+    // those endpoints have their own caching, if any, and lose nothing here.
+    if (options.baseURL === undefined) {
+      params.prompt_cache_key = openaiPromptCacheKey(req);
+    }
     if (req.temperature !== undefined) params.temperature = req.temperature;
     if (req.top_p !== undefined) params.top_p = req.top_p;
     // Determinism intent (`PLAYBOOKS.md` §1.1

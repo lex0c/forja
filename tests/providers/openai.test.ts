@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import type OpenAI from 'openai';
-import { createOpenAIProvider } from '../../src/providers/openai/index.ts';
+import { createOpenAIProvider, openaiPromptCacheKey } from '../../src/providers/openai/index.ts';
 import type { RawOpenAIChunk } from '../../src/providers/openai/stream.ts';
+import type { GenerateRequest, ProviderToolDef } from '../../src/providers/types.ts';
 import type { StreamEvent } from '../../src/providers/types.ts';
 
 interface Call {
@@ -117,6 +118,74 @@ describe('createOpenAIProvider', () => {
     };
     expect(params.messages[0]).toEqual({ role: 'system', content: 'be brief' });
     expect(params.messages[1]).toEqual({ role: 'user', content: 'hi' });
+  });
+
+  const drain = async (
+    provider: ReturnType<typeof createOpenAIProvider>,
+    req: Parameters<typeof provider.generate>[0],
+  ) => {
+    for await (const _ of provider.generate(req)) {
+      // drain
+    }
+  };
+
+  test('sets prompt_cache_key on the request (real OpenAI, no custom baseURL)', async () => {
+    const handle = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
+    const provider = createOpenAIProvider('gpt-4o', { client: handle.client });
+    await drain(provider, {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 1,
+      system: 'be brief',
+    });
+    const params = handle.createCalls[0]?.params as { prompt_cache_key?: string };
+    expect(typeof params.prompt_cache_key).toBe('string');
+    expect(params.prompt_cache_key?.length).toBeGreaterThan(0);
+  });
+
+  test('omits prompt_cache_key when a custom baseURL is set (compat endpoint)', async () => {
+    const handle = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
+    const provider = createOpenAIProvider('gpt-4o', {
+      client: handle.client,
+      baseURL: 'https://compat.example/v1',
+    });
+    await drain(provider, {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 1,
+      system: 'be brief',
+    });
+    const params = handle.createCalls[0]?.params as { prompt_cache_key?: string };
+    expect(params.prompt_cache_key).toBeUndefined();
+  });
+
+  test('openaiPromptCacheKey is stable for the same prefix and order-independent on tools', () => {
+    const tools: ProviderToolDef[] = [
+      {
+        name: 'a',
+        description: 'A',
+        input_schema: { type: 'object', properties: { x: {}, y: {} } },
+      },
+    ];
+    const toolsReordered: ProviderToolDef[] = [
+      {
+        name: 'a',
+        description: 'A',
+        input_schema: { type: 'object', properties: { y: {}, x: {} } },
+      },
+    ];
+    const base: GenerateRequest = {
+      model: 'gpt-4o',
+      messages: [],
+      max_tokens: 1,
+      system: 's',
+      tools,
+    };
+    const k1 = openaiPromptCacheKey(base);
+    const k2 = openaiPromptCacheKey({ ...base, tools: toolsReordered });
+    expect(k1).toBe(k2); // same prefix, reordered tool-schema keys → same key
+    // A different system prompt yields a different key.
+    expect(openaiPromptCacheKey({ ...base, system: 'other' })).not.toBe(k1);
   });
 
   test('generate forwards tools, temperature, stop_sequences, and stream:true', async () => {
