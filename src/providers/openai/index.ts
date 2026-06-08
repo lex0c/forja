@@ -352,16 +352,24 @@ export const createOpenAIProvider = (
   // non-reasoning models stay on the Chat Completions path above. Decided per
   // model (the capability), not per request.
   const useResponses = caps.supports_reasoning_effort === true;
+  // Cache-routing hint for the Responses path — same lever the Chat Completions
+  // path uses, gated on a real-OpenAI baseURL (a custom endpoint may 400 on the
+  // unknown param). Computed here so responses.ts needn't import back into this
+  // module (cycle) and the baseURL gate stays in one place.
+  const responsesCacheKey = (req: GenerateRequest | ConstrainedRequest): string | undefined =>
+    options.baseURL === undefined ? openaiPromptCacheKey(req) : undefined;
 
   return {
     id: `openai/${modelName}`,
     family: 'openai',
     capabilities: caps,
     generate: useResponses
-      ? (req: GenerateRequest) => generateViaResponses(client, modelName, caps, req)
+      ? (req: GenerateRequest) =>
+          generateViaResponses(client, modelName, caps, req, responsesCacheKey(req))
       : generate,
     generateConstrained: useResponses
-      ? (req: ConstrainedRequest) => generateConstrainedViaResponses(client, modelName, caps, req)
+      ? (req: ConstrainedRequest) =>
+          generateConstrainedViaResponses(client, modelName, caps, req, responsesCacheKey(req))
       : generateConstrained,
     countTokens: (messages: ProviderMessage[]): Promise<number> =>
       Promise.resolve(estimateMessagesTokens(messages)),

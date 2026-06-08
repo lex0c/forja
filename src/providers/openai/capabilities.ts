@@ -67,6 +67,21 @@ export const OPENAI_CAPS: Record<string, ProviderCapabilities> = {
     supports_sampling: false,
     notes: ['most capable mini; coding, computer use, and subagents'],
   },
+  // Codex family — agentic-coding-optimized, Responses-API only (no Chat
+  // Completions surface). 400K context / 128K output, reasoning
+  // low/medium/high/xhigh. Verified against developers.openai.com/api/docs/
+  // models/gpt-5.3-codex (knowledge cutoff 2025-08-31).
+  'gpt-5.3-codex': {
+    ...OPENAI_BASE,
+    context_window: 400_000,
+    output_max_tokens: 128_000,
+    cost_per_1k_input: 1.75,
+    cost_per_1k_output: 14,
+    cost_per_1k_cached_input: 0.175,
+    supports_reasoning_effort: true,
+    supports_sampling: false,
+    notes: ['agentic coding; Responses API only'],
+  },
   'gpt-4o': {
     ...OPENAI_BASE,
     context_window: 128_000,

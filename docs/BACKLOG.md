@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-08] gpt-5.3-codex in the catalog + #25 (reasoning replay) investigated and REVERTED + cache-key on Responses
+
+**Cache-key on the Responses path:** the Responses path (gpt-5.x) did not set `prompt_cache_key` (the routing lever Chat Completions already uses). Closed: the factory computes the key (gated on a real-OpenAI `baseURL`, like Chat) and passes it as a parameter to `generateViaResponses`/`generateConstrainedViaResponses` — avoids the import cycle with index.ts and keeps the gate in one place. Live-validated (accepted on `/v1/responses`, no 400) + tests (set without baseURL; omitted with a custom baseURL). Closes OpenAI's cache parity with Claude (to the extent the API exposes it — OpenAI auto-caches, with no explicit breakpoints like Anthropic).
+
+**gpt-5.3-codex added** (`capabilities.ts`): agentic-coding model, Responses-API only, 400K ctx / 128K out, reasoning low/med/high/xhigh, $1.75/$0.175/$14 per 1M. Runs on the #20 path with no extra change. Structured suite **9/10** (only fail: compaction, which is eval design — an efficient model finishes in 2 steps and never crosses the threshold; fails the same on every reasoning model).
+
+**#25 (reasoning-item replay) — implemented, rigorous A/B, REVERTED.** Implemented the reasoning continuity OpenAI documents (stateless: `include:["reasoning.encrypted_content"]` + replaying the items via an opaque `providerMeta` on `ProviderMessage`, persisted in `messages.provider_meta` / migration 075, captured in collect and replayed in `toResponsesInput`). Wire-validated live (persisted, replay with no 400). **A/B on gpt-5.3-codex (with vs without replay): 9/10 = 9/10, same fail, cost within noise → ZERO measured marginal value.** Why: the evals are short (1-3 steps); continuity would only matter on long chains the suite doesn't have. By Forja's principles ("eval is load-bearing", "no cargo cult", "measure twice"), shipping unproven machinery (+ an immutable migration + a canonical-contract change) isn't justified → **reverted** (kept only the codex entry). Re-add **when** a long-horizon eval that proves the value exists. The `FORJA_OPENAI_REASONING_REPLAY` flag and all the plumbing were removed in the revert.
+
 ## [2026-06-08] #21: smokes — guard model-aware + validação gpt-5.x
 
 **Guard model-aware:** novo `evals/smoke-lib.sh` (`smoke_model` + `smoke_require_key`); o guard de cada smoke (que checava ANTHROPIC_API_KEY independente do SMOKE_MODEL — passava só porque a chave estava presente) virou `smoke_require_key "$(smoke_model)"`, que deriva a chave do provider do modelo (anthropic→ANTHROPIC_API_KEY, openai→OPENAI_API_KEY, google→GOOGLE/GEMINI_API_KEY). Aplicado nos 9 smokes paramétricos via perl (cross-provider mantém seu guard dual). Sintaxe validada (`bash -n`), lógica verificada por provider, e `SMOKE_MODEL=openai/gpt-4o-mini bash smoke-resume.sh` passou (sem depender de chave anthropic).
@@ -19,7 +27,7 @@ Forja progress diary. Entries in reverse chronological order (newest on top).
 
 **Validado AO VIVO no gpt-5.4-mini** (o probe que antes 400'ava): generate "PONG" ✅; suite estruturado 6-7/10 (não-determinístico) — wire-correto (tools/results/usage funcionam, parallel-reads passa, `errors:[]`). providers 238/238 (após review fix do args-fallback), typecheck + lint limpos.
 
-**RESSALVA (achado ao vivo → task #25):** o path é wire-correto mas **incompleto pra qualidade dos reasoning models**. Os fails read-file (não chamou tool) e grep (`degenerateLoop`) são sintoma de **continuidade de reasoning faltando**: em stateless (`store:false`), a doc da OpenAI exige `include:["reasoning.encrypted_content"]` + replay dos reasoning items no input dos próximos turnos pra manter o fio entre tool round-trips. A Forja dropa esses items → o gpt-5.x re-deriva/loopa. Logo gpt-5.x é **funcional, não paridade de qualidade** até a #25; gpt-4o-mini (não-reasoning) é 10/10 sem ressalva.
+**RESSALVA — hipótese investigada e REFUTADA (ver entrada gpt-5.3-codex acima):** levantei que os fails do gpt-5.4-mini (read-file sem tool, grep `degenerateLoop`) eram sintoma de continuidade de reasoning faltando. O A/B (#25) refutou: com vs sem o replay = mesmo resultado. Os fails eram **comportamentais do gpt-5.4-mini** (modelo fraco) — o gpt-5.3-codex no MESMO path dá 9/10. O path #20 é wire-correto e suficiente; gpt-4o-mini 10/10.
 
 ## [2026-06-08] #17: verificação dos gpt-5.x + fix max_completion_tokens
 

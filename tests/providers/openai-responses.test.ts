@@ -161,6 +161,7 @@ describe('createOpenAIProvider — Responses routing for reasoning models', () =
       instructions?: string;
       input?: unknown;
       temperature?: number;
+      prompt_cache_key?: unknown;
     };
     expect(p.reasoning).toEqual({ effort: 'high' });
     expect(p.max_output_tokens).toBe(8);
@@ -168,6 +169,31 @@ describe('createOpenAIProvider — Responses routing for reasoning models', () =
     expect(Array.isArray(p.input)).toBe(true);
     // sampling gate: reasoning models never get temperature.
     expect(p.temperature).toBeUndefined();
+    // cache-routing hint set on the Responses path (real OpenAI, no baseURL).
+    expect(typeof p.prompt_cache_key).toBe('string');
+    expect((p.prompt_cache_key as string).length).toBeGreaterThan(0);
+  });
+
+  test('omits prompt_cache_key on the Responses path when a custom baseURL is set', async () => {
+    const handle = mockResponsesClient([
+      { type: 'response.created', response: { id: 'r' } },
+      { type: 'response.completed', response: {} },
+    ]);
+    const provider = createOpenAIProvider('gpt-5.4-mini', {
+      client: handle.client,
+      baseURL: 'https://proxy.example/v1',
+    });
+    for await (const _ of provider.generate({
+      model: 'gpt-5.4-mini',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 8,
+      effort: 'high',
+    })) {
+      // drain
+    }
+    // A custom endpoint may 400 on the unknown param — gate it off (mirrors
+    // the Chat Completions path).
+    expect((handle.calls[0] as { prompt_cache_key?: unknown }).prompt_cache_key).toBeUndefined();
   });
 
   test('gpt-5.4-mini generateConstrained via Responses returns args + usage', async () => {
