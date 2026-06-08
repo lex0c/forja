@@ -143,7 +143,9 @@ describe('createGoogleProvider', () => {
         output_schema_name: 'render_output',
       }),
       // Surfaces the cause (thinking spent the budget) — not a bare "no call".
-    ).rejects.toThrow(/no functionCall for forced tool 'render_output' \(finishReason=MAX_TOKENS\)/);
+    ).rejects.toThrow(
+      /no functionCall for forced tool 'render_output' \(finishReason=MAX_TOKENS\)/,
+    );
   });
 
   test('generateConstrained rejects when caller passes extra tools', async () => {

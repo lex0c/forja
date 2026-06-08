@@ -205,7 +205,11 @@ describe('createOpenAIProvider', () => {
   test('uses max_tokens on a non-reasoning model (gpt-4o)', async () => {
     const handle = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
     const provider = createOpenAIProvider('gpt-4o', { client: handle.client });
-    await drain(provider, { model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }], max_tokens: 42 });
+    await drain(provider, {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 42,
+    });
     const params = handle.createCalls[0]?.params as {
       max_tokens?: number;
       max_completion_tokens?: number;
