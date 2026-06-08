@@ -298,7 +298,7 @@ export const composeLive: ComposeLive = (
   // grows/shrinks overhead. renderTodoList returns [] when empty — the
   // section drops. Diverges from spec §4.10.6 ("Todo list acima dos
   // chips") — folds into the pending todolist spec follow-up.
-  appendBlock(renderTodoList(state.todos, caps, now));
+  appendBlock(renderTodoList(state.todos, caps, now, !state.ended));
 
   // 5. Pinned turn-phase chip. The single live indicator for what the
   // turn is doing right now — it sits at the BOTTOM of the live region

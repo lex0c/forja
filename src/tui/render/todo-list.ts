@@ -119,6 +119,16 @@ export const renderTodoList = (
   todos: TodoItemForUI[],
   caps: Capabilities,
   now: number,
+  // Whether a turn is actively running. The shimmer is a "this task is
+  // executing RIGHT NOW" cue; once the turn stops (done / error / aborted /
+  // maxCostUsd / maxSteps) nothing is executing, so a task left in_progress
+  // must render flat even though its status is frozen at in_progress. Without
+  // this gate the header keeps shimmering forever after an abnormal stop (e.g.
+  // a max-cost cut mid-task), signalling "still working" against a dead turn.
+  // Mirrors the `!state.ended` gate on liveRegionActive's todo clause — the
+  // two MUST agree, else the heartbeat idles while the header still wants to
+  // animate (freezes a stray highlighted char) or vice-versa.
+  live = true,
 ): string[] => {
   if (todos.length === 0) return [];
   const visible = visibleRows(todos);
@@ -135,7 +145,7 @@ export const renderTodoList = (
     `${counts.pending} pending · ${counts.in_progress} in_progress · ` +
     `${counts.done} done · ${counts.failed} failed`;
   const head =
-    counts.in_progress > 0
+    live && counts.in_progress > 0
       ? renderShimmer('Tasks', caps, now, 'secondary')
       : paint(caps, 'secondary', 'Tasks');
   const lines: string[] = [`${head} ${paint(caps, 'secondary', `(${breakdown})`)}`];

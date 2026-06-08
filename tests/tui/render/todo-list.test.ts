@@ -163,6 +163,19 @@ describe('renderTodoList', () => {
     expect(out[0]).not.toContain('1/4'); // the old done/total fraction was dropped
   });
 
+  test('header is flat when the turn has stopped, even with a task in_progress', () => {
+    const color: Capabilities = { ...caps, color: 'basic' };
+    // live=false models a stopped turn (done / error / aborted / maxCostUsd).
+    // A task frozen at in_progress must NOT keep shimmering — that would
+    // signal "still working" against a dead turn (the reported bug: a max-cost
+    // cut stops the loop but the Tasks header keeps animating).
+    const stopped = renderTodoList([item('in_progress', 'x', 'X')], color, 100, false)[0] ?? '';
+    expect(stopped).not.toContain('\x1b[94m');
+    // The status breakdown still reports the frozen in_progress (faithful to
+    // the last todo:update) — only the animation stops.
+    expect(stopped).toContain('1 in_progress');
+  });
+
   test('"Tasks" shimmers while a task is in_progress, flat otherwise', () => {
     const color: Capabilities = { ...caps, color: 'basic' };
     // The shimmer paints one accent (SGR 94) char in "Tasks" while a task

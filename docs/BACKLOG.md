@@ -2,6 +2,22 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-08] fix(tui): stop the `Tasks` shimmer once the turn ends
+
+The `Tasks` header kept animating after a turn stopped — most visibly on an
+abnormal cut like `maxCostUsd`: the loop halts but the shimmer keeps signalling
+"still working", a false UX. Root cause: `state.todos` is a pure mirror of the
+last `todo:update` and persists across the turn boundary (neither
+`session:start` nor `session:end` clears it), so a task left at `in_progress`
+made `liveRegionActive` true forever, pinning the heartbeat awake and animating
+the shimmer against a dead turn. Gated both the heartbeat clause
+(`liveRegionActive`, `state.ts`) and the header's shimmer choice
+(`renderTodoList`, via a new `live` flag fed `!state.ended` from `compose.ts`)
+on the turn being live — they MUST agree, else the heartbeat idles while the
+header still wants to shimmer (freezes a stray highlighted char). The status
+breakdown still faithfully reports the frozen `in_progress` count; only the
+animation stops. Tests cover both the flat-header and idle-heartbeat paths.
+
 ## [2026-06-08] fix(google): gemini-2.5-pro context window 2M → 1M + verified Gemini 3.x
 
 Verified the Gemini context windows against ai.google.dev (the 3.x values were

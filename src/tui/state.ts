@@ -536,7 +536,16 @@ export const liveRegionActive = (state: LiveState): boolean =>
   state.pendingAssistant !== null ||
   state.awaitingProvider !== null ||
   state.compacting !== null ||
-  state.todos.some((t) => t.status === 'in_progress');
+  // Gated on `!state.ended`: todos persist across the turn boundary (neither
+  // session:start nor session:end clears them — they mirror the last
+  // todo:update), so a turn that stops with a task still in_progress (notably
+  // an abnormal cut like maxCostUsd) would otherwise keep this true forever,
+  // pinning the heartbeat awake and animating the `Tasks` shimmer against a
+  // dead turn. Once ended, the frozen in_progress status no longer drives the
+  // live region. renderTodoList applies the same `!ended` gate to the header
+  // so the two never disagree (heartbeat idle + header wanting to shimmer =
+  // a frozen highlighted char).
+  (!state.ended && state.todos.some((t) => t.status === 'in_progress'));
 
 export const createInitialState = (): LiveState => ({
   input: { value: '', cursor: 0 },
