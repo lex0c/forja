@@ -32,10 +32,9 @@ if [[ -f "$ROOT/.env" ]]; then
   set +a
 fi
 
-if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
-  echo "ANTHROPIC_API_KEY not set (checked env and $ROOT/.env); cannot run real-model smoke." >&2
-  exit 1
-fi
+# shellcheck source=evals/smoke-lib.sh
+source "$ROOT/evals/smoke-lib.sh"
+smoke_require_key "$(smoke_model)"
 TMPDIR="$(mktemp -d -t forja-smoke-resume-XXXXXX)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
@@ -55,7 +54,7 @@ cd workspace
 # back into the new request, the model recalls; if not, it
 # admits ignorance or hallucinates.
 TOKEN="HARNESS_SMOKE_RESUME_$(date +%s)"
-MODEL="anthropic/claude-haiku-4-5"
+MODEL="${SMOKE_MODEL:-anthropic/claude-haiku-4-5}"
 
 echo "=== Run 1: initial session ===" >&2
 bun run "$ROOT/src/cli/index.ts" \

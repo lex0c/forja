@@ -546,7 +546,7 @@ export const DEFAULT_BUDGET: RunBudget = {
   // honored. 200 leaves headroom while still bounding genuine loop
   // pathology (degenerate-loop tracker hits much earlier).
   maxSteps: 200,
-  maxWallClockMs: 10 * 60 * 1000,
+  maxWallClockMs: 60 * 60 * 1000,
   maxToolErrors: 5,
   maxRepeatedToolHash: 3,
   // 90s default step-stall watchdog. Long enough that legitimate
@@ -565,11 +565,10 @@ export const DEFAULT_BUDGET: RunBudget = {
   // skips it entirely when it frees enough. The A/B preserved task success on
   // every run (CONTEXT_TUNING §12); ON for safety, not a fixed % (see BACKLOG).
   compactionRelevance: true,
-  // Spec-declared default cost cap (AGENTIC_CLI.md §5 line 333).
-  // Operator opts out via `/budget cost off`, which writes an
-  // explicit `undefined` so the spread-merge propagates the
-  // disable signal instead of falling back to 5.
-  maxCostUsd: 5,
+  // Default cost cap. Operator opts out via `/budget cost off`,
+  // which writes an explicit `undefined` so the spread-merge
+  // propagates the disable signal instead of falling back to this.
+  maxCostUsd: 100,
   maxConcurrentToolCalls: 5,
   maxConcurrentSubagents: 3,
 };

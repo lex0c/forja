@@ -33,7 +33,13 @@ export interface ProviderCapabilities {
   cost_per_1k_input: number;
   cost_per_1k_output: number;
   cost_per_1k_cached_input?: number;
+  // Cache-write rate for the DEFAULT 5-minute ephemeral cache (~1.25× input
+  // on Anthropic). `cost_per_1k_cache_write_1h` is the 1-hour extended-cache
+  // rate (~2× input); the Anthropic adapter swaps it into the effective
+  // `cost_per_1k_cache_write` when the operator opts into the 1h TTL, so the
+  // cost stays exact. Only providers with a distinct 1h tier set it.
   cost_per_1k_cache_write?: number;
+  cost_per_1k_cache_write_1h?: number;
 
   // Whether the model accepts the `temperature` / `top_p` sampling
   // parameters at the API boundary. Vendors deprecate these on

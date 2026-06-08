@@ -12,7 +12,9 @@ import type {
   UsageInfo,
 } from '../types.ts';
 import {
+  type CacheTtl,
   MAX_CACHE_BREAKPOINTS_PER_REQUEST,
+  cacheMarker,
   countCacheBreakpoints,
   messagesWithTailCacheBreakpoint,
   systemSegmentsWithCacheBreakpoints,
@@ -26,7 +28,25 @@ export interface CreateAnthropicProviderOptions {
   apiKey?: string;
   // Inject a pre-built SDK client (test seam).
   client?: Anthropic;
+  // Prompt-cache TTL for ALL breakpoints: the default 5-minute ephemeral,
+  // or the 1-hour extended cache. 1h keeps the (large) context alive across
+  // >5min inter-turn gaps so it isn't re-written each lapse — paying a 2×
+  // write premium (vs 1.25×) on every write in exchange. Net win only when
+  // such gaps are common (a dev session with pauses); it can RAISE cost on
+  // rapid-turn sessions. Opt-in, all-or-nothing (mixed TTL would make the
+  // response's single cache_creation number un-attributable to a rate, so
+  // cost accounting couldn't stay exact). When omitted, falls back to the
+  // FORJA_ANTHROPIC_CACHE_TTL env var so the CLI path (registry factory
+  // invoked with no options) can A/B test by flipping one env var.
+  cacheTtl?: CacheTtl;
 }
+
+// Resolve the cache TTL default from the environment for callers who don't
+// pass an explicit option (the registry factory used by CLI bootstrap
+// forwards none today). Only the exact string '1h' opts in; everything
+// else — unset, empty, '5m', typos — keeps the safe 5-minute default.
+const cacheTtlFromEnv = (): CacheTtl =>
+  process.env.FORJA_ANTHROPIC_CACHE_TTL === '1h' ? '1h' : '5m';
 
 // Strip `name` from tool_result blocks. Our canonical
 // ProviderToolResultBlock keeps `name` as optional metadata for
@@ -100,6 +120,21 @@ export const createAnthropicProvider = (
     throw new Error(`unknown Anthropic model: ${modelName}`);
   }
 
+  const cacheTtl = options.cacheTtl ?? cacheTtlFromEnv();
+  // Engage 1h ONLY when we can also price it (a model with a declared 1h
+  // write rate). `oneHourRate` is the single source both the request marker
+  // and the effective cost rate key off — so we never tag a request 1h
+  // (billed 2× by Anthropic) while still costing it at the 5-min rate, or
+  // the reverse. When 1h is on, every cache write bills at it (2× input)
+  // vs the 5-min rate (1.25×); surface that as the effective
+  // `cost_per_1k_cache_write` so computeCost / the /stats breakdown stay
+  // exact — without mutating the shared ANTHROPIC_CAPS entry (a const
+  // reused by every instance of this model).
+  const oneHourRate = cacheTtl === '1h' ? caps.cost_per_1k_cache_write_1h : undefined;
+  const marker = cacheMarker(oneHourRate !== undefined ? '1h' : '5m');
+  const effectiveCaps: ProviderCapabilities =
+    oneHourRate !== undefined ? { ...caps, cost_per_1k_cache_write: oneHourRate } : caps;
+
   let client: Anthropic;
   if (options.client !== undefined) {
     client = options.client;
@@ -127,13 +162,16 @@ export const createAnthropicProvider = (
     // block as before.
     const cachedSystem =
       req.systemSegments !== undefined
-        ? systemSegmentsWithCacheBreakpoints(req.systemSegments)
-        : systemWithCacheBreakpoint(req.system);
+        ? systemSegmentsWithCacheBreakpoints(req.systemSegments, marker)
+        : systemWithCacheBreakpoint(req.system, marker);
     const cachedTools =
       req.tools !== undefined
-        ? toolsWithCacheBreakpoint(req.tools.map(toAnthropicTool))
+        ? toolsWithCacheBreakpoint(req.tools.map(toAnthropicTool), marker)
         : undefined;
-    const cachedMessages = messagesWithTailCacheBreakpoint(req.messages.map(toAnthropicMessage));
+    const cachedMessages = messagesWithTailCacheBreakpoint(
+      req.messages.map(toAnthropicMessage),
+      marker,
+    );
     // Anthropic 400s on > 4 cache_control markers per request.
     // Asserting here means a future composition change that adds a
     // fourth or fifth marker fails fast in unit/integration tests
@@ -226,7 +264,7 @@ export const createAnthropicProvider = (
   return {
     id: `anthropic/${modelName}`,
     family: 'anthropic',
-    capabilities: caps,
+    capabilities: effectiveCaps,
     generate,
     generateConstrained: async (req: ConstrainedRequest): Promise<ConstrainedResult> => {
       // Anthropic's structured-output surface is forced tool calling:
@@ -250,11 +288,19 @@ export const createAnthropicProvider = (
           "anthropic generateConstrained: 'tools' must be empty (forced schema tool only)",
         );
       }
+      // Thread the SAME `marker` as the streaming path so the constrained
+      // (recap) call's cache writes use the operator's chosen TTL — and are
+      // therefore billed at the rate `effectiveCaps` prices them with.
+      // Omitting it here would tag these writes 5-min while costing them at
+      // the 1h rate when the flag is on.
       const cachedSystem =
         req.systemSegments !== undefined
-          ? systemSegmentsWithCacheBreakpoints(req.systemSegments)
-          : systemWithCacheBreakpoint(req.system);
-      const cachedMessages = messagesWithTailCacheBreakpoint(req.messages.map(toAnthropicMessage));
+          ? systemSegmentsWithCacheBreakpoints(req.systemSegments, marker)
+          : systemWithCacheBreakpoint(req.system, marker);
+      const cachedMessages = messagesWithTailCacheBreakpoint(
+        req.messages.map(toAnthropicMessage),
+        marker,
+      );
       const schemaTool: Anthropic.Tool = {
         name: req.output_schema_name,
         description:
@@ -262,7 +308,7 @@ export const createAnthropicProvider = (
           'Emit the structured output for the constrained request.',
         input_schema: req.output_schema as Anthropic.Tool.InputSchema,
       };
-      const cachedTools = toolsWithCacheBreakpoint([schemaTool]);
+      const cachedTools = toolsWithCacheBreakpoint([schemaTool], marker);
       const breakpointCount = countCacheBreakpoints({
         system: cachedSystem,
         tools: cachedTools,

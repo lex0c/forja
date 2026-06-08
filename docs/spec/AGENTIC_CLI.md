@@ -228,8 +228,8 @@ model = "anthropic/claude-opus-4-7"
 
 [budget]
 max_steps = 200
-max_cost_usd = 5
-max_wall_clock_ms = 600000
+max_cost_usd = 100
+max_wall_clock_ms = 3600000
 max_step_stall_ms = 90000
 compaction_threshold = 0.7
 compaction_preserve_tail = 3
@@ -253,7 +253,7 @@ max_overhead_ms = 5000
 |---|---|---|---|
 | `[providers]` | `model` | string | Fully-qualified id da entry no `createDefaultRegistry()`. Pin per-project pra CI / team não esquecer `--model`. |
 | `[budget]` | `max_steps` | int | Runaway-loop backstop (cost é o engagement gate). |
-| `[budget]` | `max_cost_usd` | float `≥0` | Hard cap em USD; harness aborta logo após cruzar. **Opt-out persistente não-expressável em config.toml.** O runtime distingue 3 estados (`RunBudget.maxCostUsd` em `harness/types.ts:478`): chave ausente → default $5, valor `undefined` → opt-out (sem cap), valor número → esse cap. TOML não tem `null`/`undefined`, então config só consegue produzir os 2 primeiros via "absent" ou um número. Pra opt-out persistente, workaround é `max_cost_usd = 999999999` (functionally no-cap); pra session-only, `/budget cost off`. Não adicionamos `-1` sentinel ou `disable_cost_cap = true` porque o caso é niche + os workarounds funcionam. |
+| `[budget]` | `max_cost_usd` | float `≥0` | Hard cap em USD; harness aborta logo após cruzar. **Opt-out persistente não-expressável em config.toml.** O runtime distingue 3 estados (`RunBudget.maxCostUsd` em `harness/types.ts:478`): chave ausente → default $100, valor `undefined` → opt-out (sem cap), valor número → esse cap. TOML não tem `null`/`undefined`, então config só consegue produzir os 2 primeiros via "absent" ou um número. Pra opt-out persistente, workaround é `max_cost_usd = 999999999` (functionally no-cap); pra session-only, `/budget cost off`. Não adicionamos `-1` sentinel ou `disable_cost_cap = true` porque o caso é niche + os workarounds funcionam. |
 | `[budget]` | `max_wall_clock_ms` | int | Cap de wall-clock da sessão inteira. |
 | `[budget]` | `max_step_stall_ms` | int `≥0` | Watchdog per-step; aborta o step se o provider stream silenciar tantos ms. `0` desliga o watchdog inteiro (runtime: `stallMs <= 0` em `harness/abortable.ts:68` yields source verbatim sem timer) — útil pra providers steady-streaming de long-running steps. |
 | `[budget]` | `compaction_threshold` | float `[0,1]` | Fração do context-window onde compactação dispara. |
@@ -751,8 +751,8 @@ interface Step {
 
 interface RunBudget {
   maxSteps: number              // default 200 — backstop, não engagement gate
-  maxCostUsd?: number           // default 5; explicit `undefined` = operator opt-out
-  maxWallClockMs: number        // default 600_000 (10min)
+  maxCostUsd?: number           // default 100; explicit `undefined` = operator opt-out
+  maxWallClockMs: number        // default 3_600_000 (1h)
   maxToolErrors: number         // default 5 consecutivos
   maxRepeatedToolHash: number   // default 3 (mesma tool+input em 5 steps)
 }
@@ -762,7 +762,7 @@ interface RunBudget {
 
 `maxCostUsd` é o **engagement gate**: define até onde a sessão pode ir em valor real. `maxSteps` é **backstop** contra runaway loop, não o limite de ambição da sessão. Refactor multi-arquivo, audit profundo, ou debug iterativo legítimo precisam de muitos passos pequenos — cortar por contagem quando o custo está dentro do orçamento descarta trabalho válido. O `degenerate-loop tracker` (`maxRepeatedToolHash`) e o contador de erros (`maxToolErrors`) detectam patologia genuína bem antes do `maxSteps`; este último só dispara quando os outros sinais falham, e 200 dá margem pra sessões ambiciosas sem desabilitar a proteção.
 
-`maxCostUsd` é opcional **apenas pra suportar opt-out explícito** (CI runners, eval com enforcement próprio, sessões locais sem providers pagos). O shape `?: number | undefined` distingue três estados: campo ausente → merge com default 5; campo presente como `undefined` → operador opta out e o gate não dispara; campo numérico → esse cap. Operadores típicos não tocam — o default 5 cobre o uso comum, e `/budget cost <USD>` ajusta. `/budget cost off` escreve o `undefined` explícito.
+`maxCostUsd` é opcional **apenas pra suportar opt-out explícito** (CI runners, eval com enforcement próprio, sessões locais sem providers pagos). O shape `?: number | undefined` distingue três estados: campo ausente → merge com default 100; campo presente como `undefined` → operador opta out e o gate não dispara; campo numérico → esse cap. Operadores típicos não tocam — o default 100 cobre o uso comum, e `/budget cost <USD>` ajusta. `/budget cost off` escreve o `undefined` explícito.
 
 Loop com **três tipos de saída**:
 
@@ -777,7 +777,7 @@ Cada limite tem warning threshold (soft) e cap (hard). Hit qualquer hard cap = `
 | Limite | Soft warning | Hard cap action | Observação |
 |---|---|---|---|
 | `maxSteps` | 80% (160/200) — UI mostra `⚠ 160/200` | hit → step atual termina, sessão `exhausted` | step em andamento sempre conclui; backstop, não engagement gate |
-| `maxCostUsd` | 80% — UI mostra `$4.00/$5.00` em amarelo; 90% em vermelho | hit → step atual recebe sinal pra finalizar; novos spawns rejeitados; eventual `exhausted` | provider call em curso conclui (cost extra contado) |
+| `maxCostUsd` | 80% — UI mostra `$80.00/$100.00` em amarelo; 90% em vermelho | hit → step atual recebe sinal pra finalizar; novos spawns rejeitados; eventual `exhausted` | provider call em curso conclui (cost extra contado) |
 | `maxWallClockMs` | 80% — UI mostra clock no rodapé | hit → `interrupt_signal` paralelo (ORCHESTRATION §7); cleanup; sessão `interrupted` (não `exhausted`) | distinto: time-based é interrupt, não exhausted |
 | `maxToolErrors` | 4 erros consecutivos — warning no rodapé | 5 erros consecutivos → `exhausted_errors`; sessão `error` (recoverable via resume) | reset em step bem-sucedido |
 | `maxRepeatedToolHash` | 2× hash idêntico → warning | 3× hash idêntico em 5 steps → `degenerate_loop`; sessão `error` | hash = SHA256 de `JSON.stringify(args, sortedKeys)` |

@@ -38,10 +38,9 @@ if [[ -f "$ROOT/.env" ]]; then
   set +a
 fi
 
-if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
-  echo "ANTHROPIC_API_KEY not set (checked env and $ROOT/.env); cannot run real-model smoke." >&2
-  exit 1
-fi
+# shellcheck source=evals/smoke-lib.sh
+source "$ROOT/evals/smoke-lib.sh"
+smoke_require_key "$(smoke_model)"
 
 TMPDIR="$(mktemp -d -t forja-smoke-ckpt-XXXXXX)"
 trap 'rm -rf "$TMPDIR"' EXIT
@@ -95,7 +94,7 @@ COLOR_BEFORE=$(hash_file color.txt)
 FRUIT_BEFORE=$(hash_file fruit.txt)
 echo "before: greeting=$GREET_BEFORE color=$COLOR_BEFORE fruit=$FRUIT_BEFORE" >&2
 
-MODEL="anthropic/claude-haiku-4-5"
+MODEL="${SMOKE_MODEL:-anthropic/claude-haiku-4-5}"
 
 echo "=== Run agent: refactor 3 files ===" >&2
 bun run "$ROOT/src/cli/index.ts" \

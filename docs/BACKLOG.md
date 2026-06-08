@@ -2,6 +2,236 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-08] fix(google): gemini-2.5-pro context window 2M → 1M + verified Gemini 3.x
+
+Verified the Gemini context windows against ai.google.dev (the 3.x values were
+unverified placeholders). Found the same context-window bug class as
+gpt-5.4-mini: **gemini-2.5-pro was 2,000,000 but is 1,048,576** (2M was Gemini
+*1.5* Pro) — compaction would wait until ~1.4M, past the real limit, 400ing the
+request first. Corrected to 1_000_000. The rest check out: all Gemini 3.x
+(3.5-flash, 3.1-pro-preview, 3.1-flash-lite, 3-flash-preview) are 1M input / 64K
+output (the official Gemini 3 guide; a secondary source claiming 16K output for
+3.1-pro was wrong — it's 64K), and gemini-2.5-flash(/-lite) are 1M. No more
+placeholder windows in the catalog.
+
+## [2026-06-08] fix(openai): gpt-5.4-mini context window 1.05M → 400K
+
+`gpt-5.4-mini` was catalogued at the family's 1,050,000-token window, but the
+OpenAI model page lists it at **400,000** (it does NOT inherit the gpt-5.5 /
+gpt-5.4 window). The inflated value is a real long-session bug: compaction fires
+at `threshold × context_window` (~70%), so it would wait until ~735K — past the
+model's real 400K limit — and the Responses call 400s at the API boundary before
+the harness ever folds. Corrected to 400,000 + comment. Re-verified the rest on
+the model page: gpt-5.5 / gpt-5.4 are 1.05M, gpt-5.3-codex 400K, gpt-4o(/-mini)
+128K — all correct. NOTE: the Gemini 3.x windows are still unverified
+placeholders (all 1M) — same bug class if any real window is smaller; left as-is
+(Gemini descoped, key expired) but flagged.
+
+## [2026-06-08] docs/PROVIDERS.md — implementation-facing provider-layer guide
+
+New English companion to the PT-BR `docs/spec/PROVIDERS.md`, documenting the
+provider layer as actually implemented: the `Provider` interface, registry /
+model-id resolution, the capability fields and what they gate, the canonical
+`StreamEvent` contract, per-provider specifics (Anthropic explicit cache
+breakpoints; OpenAI's two paths routed by `supports_reasoning_effort` + the
+`prompt_cache_key` lever + sampling gate; Gemini forced function calling, cache
+not yet wired), and the cross-cutting conventions (uniform usage, per-million
+cost, agnostic effort, the SHARED harness-level retry, determinism seams). Style
+matches the other `docs/*.md` operator guides; all claims spot-verified against
+`src/`.
+
+## [2026-06-08] gpt-5.3-codex in the catalog + #25 (reasoning replay) investigated and REVERTED + cache-key on Responses
+
+**Cache-key on the Responses path:** the Responses path (gpt-5.x) did not set `prompt_cache_key` (the routing lever Chat Completions already uses). Closed: the factory computes the key (gated on a real-OpenAI `baseURL`, like Chat) and passes it as a parameter to `generateViaResponses`/`generateConstrainedViaResponses` — avoids the import cycle with index.ts and keeps the gate in one place. Live-validated (accepted on `/v1/responses`, no 400) + tests (set without baseURL; omitted with a custom baseURL). Closes OpenAI's cache parity with Claude (to the extent the API exposes it — OpenAI auto-caches, with no explicit breakpoints like Anthropic).
+
+**gpt-5.3-codex added** (`capabilities.ts`): agentic-coding model, Responses-API only, 400K ctx / 128K out, reasoning low/med/high/xhigh, $1.75/$0.175/$14 per 1M. Runs on the #20 path with no extra change. Structured suite **9/10** (only fail: compaction, which is eval design — an efficient model finishes in 2 steps and never crosses the threshold; fails the same on every reasoning model).
+
+**#25 (reasoning-item replay) — implemented, rigorous A/B, REVERTED.** Implemented the reasoning continuity OpenAI documents (stateless: `include:["reasoning.encrypted_content"]` + replaying the items via an opaque `providerMeta` on `ProviderMessage`, persisted in `messages.provider_meta` / migration 075, captured in collect and replayed in `toResponsesInput`). Wire-validated live (persisted, replay with no 400). **A/B on gpt-5.3-codex (with vs without replay): 9/10 = 9/10, same fail, cost within noise → ZERO measured marginal value.** Why: the evals are short (1-3 steps); continuity would only matter on long chains the suite doesn't have. By Forja's principles ("eval is load-bearing", "no cargo cult", "measure twice"), shipping unproven machinery (+ an immutable migration + a canonical-contract change) isn't justified → **reverted** (kept only the codex entry). Re-add **when** a long-horizon eval that proves the value exists. The `FORJA_OPENAI_REASONING_REPLAY` flag and all the plumbing were removed in the revert.
+
+## [2026-06-08] #21: smokes — guard model-aware + validação gpt-5.x
+
+**Guard model-aware:** novo `evals/smoke-lib.sh` (`smoke_model` + `smoke_require_key`); o guard de cada smoke (que checava ANTHROPIC_API_KEY independente do SMOKE_MODEL — passava só porque a chave estava presente) virou `smoke_require_key "$(smoke_model)"`, que deriva a chave do provider do modelo (anthropic→ANTHROPIC_API_KEY, openai→OPENAI_API_KEY, google→GOOGLE/GEMINI_API_KEY). Aplicado nos 9 smokes paramétricos via perl (cross-provider mantém seu guard dual). Sintaxe validada (`bash -n`), lógica verificada por provider, e `SMOKE_MODEL=openai/gpt-4o-mini bash smoke-resume.sh` passou (sem depender de chave anthropic).
+
+**Validação gpt-5.x via Responses (orquestração):** `smoke-resume-with-tools` (tool loop + resume) e `smoke-subagent-grandchild` (3 níveis aninhados, cada um no adapter Responses + IPC/resume) **PASS** no gpt-5.4-mini — confirma o path Responses end-to-end além dos evals estruturados (que já deram 7/10, fails comportamentais).
+
+## [2026-06-08] #20: OpenAI Responses API path para gpt-5.x reasoning
+
+**Por quê:** gpt-5.x 400am no Chat Completions na combinação tools+reasoning_effort ("use /v1/responses instead", confirmado ao vivo). A Responses API é a forma recomendada da OpenAI pra agentic/tool-heavy (melhor reasoning + cache). SDK suporta (`openai@6.34.0`, `client.responses`).
+
+**Impl:**
+- `responses-stream.ts` — normalizer dos eventos SSE da Responses → `StreamEvent` canônico (created→start, output_text.delta→text_delta, output_item.added/done(function_call)→tool_use_start/stop, function_call_arguments.delta→tool_use_delta com mapa item_id→call_id, completed/incomplete→usage+stop, failed/error→error). Turno com function_call → stop `tool_use`; usage `input = input_tokens − cached`.
+- `responses.ts` — request builder (`input` items, `instructions`, tools flat, `reasoning:{effort}`, `max_output_tokens`, `store:false` stateless) + converter msg→input items (tool_use→function_call, tool_result→function_call_output) + generate/constrained.
+- `index.ts` roteia por `caps.supports_reasoning_effort` (reasoning→Responses; gpt-4o fica no Chat Completions). Os ajustes #15/#17 no Chat Completions (sampling gate, max_completion_tokens) viram defensivos — nenhum modelo atual os alcança (reasoning→Responses). Removidos 2 testes que assertavam gpt-5.4-mini no Chat Completions (roteia pra Responses).
+
+**Validado AO VIVO no gpt-5.4-mini** (o probe que antes 400'ava): generate "PONG" ✅; suite estruturado 6-7/10 (não-determinístico) — wire-correto (tools/results/usage funcionam, parallel-reads passa, `errors:[]`). providers 238/238 (após review fix do args-fallback), typecheck + lint limpos.
+
+**RESSALVA — hipótese investigada e REFUTADA (ver entrada gpt-5.3-codex acima):** levantei que os fails do gpt-5.4-mini (read-file sem tool, grep `degenerateLoop`) eram sintoma de continuidade de reasoning faltando. O A/B (#25) refutou: com vs sem o replay = mesmo resultado. Os fails eram **comportamentais do gpt-5.4-mini** (modelo fraco) — o gpt-5.3-codex no MESMO path dá 9/10. O path #20 é wire-correto e suficiente; gpt-4o-mini 10/10.
+
+## [2026-06-08] #17: verificação dos gpt-5.x + fix max_completion_tokens
+
+**Verificado contra developers.openai.com/api/docs/models (WebSearch/WebFetch):**
+- ✅ model-ids `gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini` corretos.
+- ⚠️ **CORRIGIDO por teste ao vivo (probe gpt-5.4-mini):** a WebSearch dizia que rodam em Chat Completions, mas a combinação **tools + reasoning_effort 400a** lá ("use /v1/responses instead"). O loop agêntico sempre manda os dois → gpt-5.x **precisa da Responses API** (task #19). tools-sem-effort e effort-sem-tools funcionam isolados; gpt-4o (não-reasoning) é OK.
+- ✅ `reasoning_effort` flat (none/low/medium/high/xhigh) — bate com o adapter + `max→xhigh`.
+- ✅ context window **1,050,000** (corrigido de placeholder 400k) / output 128K.
+
+**Fix (achado da review do #13):** reasoning models REJEITAM `max_tokens` e exigem `max_completion_tokens`. Adicionado `maxTokensField = caps.supports_reasoning_effort ? 'max_completion_tokens' : 'max_tokens'` (capability-driven), aplicado em generate + generateConstrained. gpt-4o continua em `max_tokens` (legacy aceito).
+
+**Provado:** openai.test (+2: gpt-4o→max_tokens, gpt-5.4-mini→max_completion_tokens). providers 233/233, typecheck + lint limpos.
+
+**#16 (tokenizer) ADIADO:** investigação mostrou `provider.countTokens` sem nenhum call site vivo (stub →0 em run.ts; integração é slice 4.9 deferida). Adicionar tiktoken (2-4MB de ranks) por um método não-consumido é prematuro — entra junto com a slice 4.9. (Pendência menor do #17: context windows do Gemini 3.x ainda placeholders 1M — revisar na validação Gemini.)
+
+## [2026-06-08] #15: sampling gate no OpenAI + Gemini
+
+**Gap:** o Anthropic gateia temp/top_p em `supports_sampling` (strippa no Opus 4.7/4.8 que 400am); OpenAI e Gemini mandavam **incondicionalmente**. Os gpt-5.x reasoning **rejeitam** temperature → 400.
+
+**Fix:** `const acceptsSampling = caps.supports_sampling !== false` por factory, gateando os 4 sends (temp/top_p em generate + generateConstrained nos dois adapters). `supports_sampling: false` adicionado nos 3 gpt-5.x (reasoning). Gemini fica no-op (modelos atuais aceitam sampling), mas o código fica uniforme com os outros dois e pronto pra um futuro Gemini thinking-only.
+
+**Provado:** openai.test (+2: gpt-4o mantém temp/top_p; gpt-5.4-mini strippa). providers 231/231, typecheck + lint limpos.
+
+## [2026-06-08] #18 (parcial): smokes provider-paramétricos + validação OpenAI ao vivo
+
+**Parametrização:** os 9 smokes `.sh` que hardcodavam `MODEL="anthropic/claude-haiku-4-5"` agora usam `MODEL="${SMOKE_MODEL:-anthropic/claude-haiku-4-5}"` — default inalterado (backward-compatible), overridável via env pra rodar em qualquer provider. (cross-provider mantido dual claude+openai de propósito.)
+
+**Validação ao vivo no `openai/gpt-4o-mini`** (custo ~$0.04):
+- Suite estruturado `evals/smoke/`: **10/10 PASS** ($0.033) — read/create/edit, grep/glob, compaction, parallel reads, skills.
+- Smokes `.sh`: **10/12 PASS** — resume(+abort), resume-with-tools, checkpoint-undo, subagent interrupt/grandchild/worktree-ipc, playbook kitchen-sink/fixtures, worktree-gc.
+- 2 fails **comportamentais (não adapter)**: subagent-explore (gpt-4o-mini desistiu de listar .txt sob capability; spawn+capabilities OK) e cross-provider (threadou contexto certo mas o modelo recusou ecoar um token "sensível").
+- `generateConstrained` validado ao vivo num probe direto (OpenAI retorna JSON válido, usage correto).
+
+**Veredito:** todo path de adapter do OpenAI validado na API real (generate, tool-loops, parallel, compaction, skills, resume, subagentes, checkpoints, cross-provider threading, constrained). #13 efetivamente provado end-to-end.
+
+**Falta pra fechar #18:** guard model-aware (hoje checa ANTHROPIC_API_KEY mesmo rodando openai — passou só porque a chave está presente); validação Gemini (bloqueada por GEMINI_API_KEY expirada).
+
+## [2026-06-07] Paridade de providers #13–#14: generateConstrained OpenAI + Gemini
+
+**Contexto:** OpenAI e Gemini tinham `generateConstrained` como **stub que lança** ("not implemented in M4.2") → o **recap** (render de PR/resumo via output constrangido) **falhava** nos dois. Maior gap de paridade com o Claude. (Plano completo de paridade: tasks #13–#18 + #7.)
+
+**Fix (espelha o forced-tool do Anthropic nos dois):** uma função/tool única com `parameters = output_schema`, forçada — OpenAI via `tool_choice: {type:'function', function:{name}}`, Gemini via `toolConfig.functionCallingConfig {mode:'ANY', allowedFunctionNames:[name]}`. Single round-trip (non-streaming). Extrai os args (já JSON no OpenAI; objeto→stringify no Gemini). **Forced tool, não** `response_format`/`responseSchema` strict — esses rejeitam schemas não-estritos (todo campo required / subset OpenAPI) que os schemas de recap usam. Usage casa com o streaming de cada um (`input = prompt − cached`, `cache_read = cached`, `cache_creation = 0`). Guard `tools` não-vazio igual ao Anthropic.
+
+**Provado:** openai.test (+3) e google.test (+3): força a tool nomeada, erro quando não vem call, rejeita tools extra, mapeamento de usage. providers 227/227, recap 372/372 (601 no conjunto), typecheck + lint limpos.
+
+## [2026-06-07] Catálogo de modelos: default Opus 4.8 + lineup GPT-5.x
+
+**Anthropic:** `DEFAULT_MODEL` → `anthropic/claude-opus-4-8` (era 4.7). Adicionada a entry `claude-opus-4-8` em ANTHROPIC_CAPS — mesma superfície/pricing do 4.7 (migration guide: 4.7→4.8 sem breaking changes): in $5 / out $25 / cache read $0.50 / 5m write $6.25 / 1h write $10 (confirmado pelo pricing do operador), adaptive-only, sampling deprecated, effort. 4.7 mantido (legacy válido). Help do CLI atualizado.
+
+**OpenAI:** adicionados `gpt-5.5` (in $5 / cached $0.50 / out $30), `gpt-5.4` (in $2.50 / cached $0.25 / out $15), `gpt-5.4-mini` (in $0.75 / cached $0.075 / out $4.50) — reasoning models (`supports_reasoning_effort: true`). OpenAI não tem cache-WRITE premium (caching automático), então só `cost_per_1k_cached_input` setado. gpt-4o/4o-mini mantidos. **A confirmar:** os model-id strings (usei convenção pontilhada `gpt-5.5`/`gpt-5.4`/`gpt-5.4-mini` tipo `gpt-4.1`) e os context/output ceilings (placeholders 400k/128k — pricing é autoritativo, janela não).
+
+**Google/Gemini:** adicionados modelos de TEXTO 3.x — `gemini-3.5-flash` (1.50/9.00/cache 0.15), `gemini-3.1-pro-preview` (2.00/12.00/0.20, tier ≤200k), `gemini-3.1-flash-lite` (0.25/1.50/0.025), `gemini-3-flash-preview` (0.50/3.00/0.05). Os 2.5 (pro/flash/flash-lite) tiveram o pricing **corrigido pro real** (eram ilustrativos; flash-lite estava 0.075/0.3 → agora 0.10/0.40) + `cost_per_1k_cached_input` adicionado. Modelos image/TTS/audio-live ignorados (não são chat). Tiered (Pro ≤200k vs >200k) encodado na tier base (single-rate; >200k sub-conta levemente, anotado). `max_thinking_budget` dos 3.x espelha os 2.5 (24576 flash / 32768 pro; o ladder de effort topa em 24576 mesmo). **A confirmar:** context windows dos 3.x (placeholders 1M).
+
+**Provado:** providers 302/302, config + cli + tui 2935/2935 — nenhum teste quebrou (default novo registrado; 4.7/4o/2.5 continuam fixtures válidos). typecheck + lint limpos.
+
+## [2026-06-07] Persistir `effort` por message (atribuição de regressão)
+
+**Contexto:** numa discussão de tuning, a única lacuna real era atribuição de regressão — "piorou porque o effort mudou ou porque o contexto mudou?". `prompt_hash` (migration 068) já fixa a dimensão do prompt; `effort` não tinha casa. É a ÚNICA dimensão **mutável mid-sessão** (operador roda `/effort` entre turnos) e **não-recuperável** de outra linha (model vem da session, sampling-stripped deriva de capabilities, thinking_budget deriva de effort+model). As outras duas propostas do operador já estavam feitas: separar providerEffort de harnessEffort já existe em `harness/effort.ts` (EFFORT_PROFILES dirige maxSteps/maxConcurrentSubagents/maxToolErrors + providerEffort); calibrar a ladder do Gemini é só-Gemini (Anthropic/OpenAI usam nível nativo) e já marcada como eval-pending.
+
+**Fix:** migration 074 adiciona coluna `messages.effort TEXT` (nullable). `appendAssistant` ganha um 4º arg `effort` (default null → callers/rows user/tool intocados); o loop passa o `reqEffort` resolvido por request. Tipado `string` no storage pra não acoplar ao enum do harness.
+
+**Provado:** `messages.test.ts` (+2: persiste+round-trip nos 3 SELECTs, default null) + `session-context.test.ts` (+1: appendAssistant grava effort, default null). storage 843/843, harness 360/360, typecheck + lint limpos.
+
+## [2026-06-07] Output-density default no segmento stable do system prompt
+
+**Motivação:** output é ~10% do custo direto, mas Opus 4.8 narra mais por default (migration guidance da Anthropic) e turnos verbosos acretam no contexto re-lido a cada turno. Seção estática de densidade (signal per token, findings before evidence, silence between tool calls) com cláusula "never trade information for brevity" pra não perder contexto em arquitetura/debug.
+
+**Design:** ESTÁTICA de propósito — o segmento `stable` é o cache breakpoint #1, então editar o system prompt por-modo invalidaria o prefixo a cada troca (eixo dominante de custo). Isso é o piso; verbosidade por-tarefa é o `effort` (request param, fora do prefixo). Composer `output-style-prompt.ts` adjacente ao response-format; `flattenSystemSegments` continua round-trip pro systemPrompt canônico. Subagentes (composição própria) ficam como follow-up.
+
+**Provado:** `output-style-prompt.test.ts` + assertion no `bootstrap.test.ts` (presença + invariante do round-trip). 74/74 composers irmãos. Commit `b092e99b`.
+
+## [2026-06-07] Flag opt-in: cache Anthropic de 1 hora (all-1h, default-off)
+
+**Motivação:** cache write = ~47% do custo de uma sessão real (100% parent, prefixo estável de 9M tokens). O write caro vem de **expiry de 5min** nas pausas de dev — que o cache de 1h elimina (prefixo sobrevive → re-write vira read). Trade-off: write de 1h custa **2× input** vs 1.25× do 5min, então só ganha com pausas >5min frequentes; pode **piorar** sessão de turnos rápidos. Logo: **opt-in, default-off**.
+
+**Design — all-1h, não misto:** TTL misto tornaria o `cache_creation` único do response **inatribuível a um rate** → cost accounting quebraria. all-1h mantém rate único (2×) → cost exato, e mantém o **contexto inteiro** vivo (é ele que você quer preservar, não só o system).
+
+**Impl:**
+- `cache.ts`: `cacheMarker(ttl)` + os 4 helpers de breakpoint aceitam `marker` (default 5m, back-compat).
+- `anthropic/index.ts`: option `cacheTtl` + fallback env `FORJA_ANTHROPIC_CACHE_TTL` (só `'1h'` opta; resto = 5m). Quando 1h, **clona** as capabilities com `cost_per_1k_cache_write = cost_per_1k_cache_write_1h` (NÃO muta o const compartilhado) → `computeCost`/breakdown do `/stats` ficam exatos.
+- `types.ts` + `capabilities.ts`: campo `cost_per_1k_cache_write_1h` (Opus 10, Sonnet 6, Haiku 2 = 2× input).
+
+**A/B (o payoff do #11/#12):** roda sessão típica com `FORJA_ANTHROPIC_CACHE_TTL` unset, depois `=1h`, e compara `cache write` no `/stats`. Decide no dado.
+
+**Provado:** `anthropic-cache.test.ts` (+3: cacheMarker 5m/1h, propagação aos 4 helpers) + `anthropic.test.ts` (+5: rate efetivo 1h vs 5m, const intocado, env opt-in, markers do request com/sem ttl). providers 224/224, harness 359/359, typecheck + lint limpos. (Follow-up: documentar a env em PROVIDERS.md — spec edit precisa de pedido explícito.)
+
+## [2026-06-07] Atribuição de cache write por fonte + write amplification no `/stats`
+
+**Insight (operador):** cache write = 47% do custo; "qual fonte?" é o lever pra cortar. **Limite físico honesto:** o provider devolve UM `cache_creation` por resposta — não atribui a escrita a um content block, então sub-dividir uma sessão por seção de prompt (memory/project/session) NÃO é mensurável. **O que dá** (registros/sessões distintos já persistidos): **parent** (sessões `is_subagent=0`), **subagent** (`is_subagent=1`), **compaction** (`compaction_events.call_cache_creation`, persistido em `04e7ad25`). 3 buckets disjuntos que somam o `cacheCreation` total.
+
+**Fix:** `computeUsageStats` ganhou `cacheWriteParent/Subagent/Compaction` (bucketados no MESMO tree-walk por `session.isSubagent` — zero query extra) + `cacheWriteAmplification(stats)` = `write/(read+write)`. `/stats` renderiza `cache: N% hit · M% write amplification` e `writes: T (parent A · subagents B · compaction C)`. Footnote já existente cobre o caveat. (Nota: a sessão real do operador foi `scope:1` = sem subagentes → o split mostraria que os 819K vieram de parent+compaction, refutando a hipótese "subagentes" pra aquele caso — exatamente o valor do instrumento.)
+
+**Provado:** `stats.test.ts` storage (+2: split 3-way somando ao total, amplification + zero-traffic) + `stats.test.ts` slash (+1: render `writes:`/amplification). storage+slash 1474/1474, typecheck + lint limpos.
+
+## [2026-06-07] Cost breakdown por eixo no `/stats` (onde o dinheiro foi)
+
+**Insight (sessão real):** numa sessão, **cache write foi ~47% do custo** (o eixo dominante), não inferência — mas o `cache_hit_ratio` (token-based, #6) lia ~92% (saudável). São lentes diferentes: write custa 12.5× read por token ($6.25 vs $0.50/MTok no Opus), então um read:write em tokens bom ainda vira custo write-dominado. O hit ratio mostra "o cache pega?"; faltava "pra onde o dinheiro foi?".
+
+**Fix:** `computeCostBreakdown(caps, usage)` em `providers/cost.ts` retorna `{inputCost, outputCost, cacheReadCost, cacheWriteCost, total}` (o `computeCost` foi refatorado pra **delegar** ao breakdown — rate math numa fonte só, componentes e total nunca driftam). O `/stats` renderiza a linha `spend:` ($ + % por eixo) aplicando os rates do modelo atual (`ctx.baseConfig.provider.capabilities`) sobre os tokens agregados. É o **instrumento pra verificar** as defesas de silent-invalidator (#8 canonical JSON, data-no-boot, ordenação determinística): um pico de cache_write % = invalidator novo reescrevendo o prefixo. Caveat marcado: estimativa via rates-at-display-time sobre tokens agregados → pode divergir do `total_cost_usd` persistido (snapshot/multi-modelo).
+
+**Provado:** `cost.test.ts` (+2: breakdown por eixo, total === computeCost, fallback de cache-write rate) + `stats.test.ts` (+1: cenário cache-write-dominado 1/6/13/80%). providers+slash 848/848, harness 359/359, typecheck + lint limpos.
+
+## [2026-06-07] OpenAI `prompt_cache_key` (lever de cache-routing por provider)
+
+**Gap (auditoria per-provider):** os três providers seguem a prática-núcleo (prefixo estável primeiro + o mecanismo de cada um), mas o OpenAI não setava `prompt_cache_key` — o lever documentado da OpenAI: requests com a mesma chave roteiam pro mesmo backend, subindo o hit do prefix-cache automático. **Fix:** `openaiPromptCacheKey(req)` = `sha256(system + stableStringify(tools))` — chaveado no **prefixo estável** (system+tools), então todo turno de uma sessão (e qualquer sessão com o mesmo prefixo) roteia junto; estável na sessão e order-independent (reusa o `stableStringify` da #8). Enviado **só pro OpenAI real** (`options.baseURL === undefined`) — endpoint compat (Azure/OpenRouter/proxy) com `baseURL` custom pode rejeitar param desconhecido com 400, mesma cautela do `stream_options`/`includeUsage`. Testes: chave setada sem baseURL, omitida com baseURL, estável+order-independent. providers 214/214, typecheck + lint limpos.
+
+**Outros levers per-provider:** Anthropic já forte (4 breakpoints `cache_control` + guard + incremental tail) — pendente avaliar o **extended cache de 1h** no breakpoint estável (task #10, exige validar trade-off de custo de write 2× vs frequência de pausas >5min). Gemini: implícito OK, explicit `CachedContent` adiado (task #7).
+
+## [2026-06-07] Canonical JSON pros bytes prompt-bound (fecha risco latente de cache)
+
+**Risco (auditoria de cache, estratégia #5):** os bytes do prefixo dependiam de insertion-order do JS, não de JSON canônico — o próprio `seed.ts:37-43` avisava ("works today... switch to canonical if a call site spreads partials"). Args de tool_use são objetos (`ProviderToolUseBlock.input`) ecoados em todo request seguinte; se a ordem das chaves driftasse (refactor com spread, hydrate-from-DB que reconstrói), os bytes mudavam e invalidavam o prefixo cacheado.
+
+**Fix:** novo `src/providers/canonical-json.ts` (`sortKeysDeep`/`stableStringify`/`canonicalizeObject` — ordena chaves de objeto recursivamente, preserva ordem de array, passthrough de primitivos). Aplicado em **dois** pontos: (1) `seed.ts` (o TODO documentado — seed agora order-independent); (2) **ponto único de captura** `loop.ts:2660` — canonicaliza o `input` do tool_use quando entra no histórico, então serializa byte-estável em todo request posterior (todos os providers + resume + subagentes, que passam pelo mesmo loop) sem espalhar por adapter. Key order é semanticamente irrelevante → nunca muda o que o modelo/tool vê. (`:315` é output de structured-gen e `google/stream:149` é evento de stream — não são prefixo, deixados.)
+
+**Provado:** `tests/providers/canonical-json.test.ts` (order-independence, nested, array preserva ordem, primitivos, paridade de duas ordenações dos mesmos args). typecheck + lint limpos; harness 359/359, providers 211/211, storage 839/839 (canonicalização do args persistido não quebrou nada — toEqual ignora ordem de chave).
+
+## [2026-06-07] Auditoria de prompt-cache + `cache_hit_ratio` no `/stats`
+
+**Auditoria (10 estratégias de cache hit por prefixo estável):** a Forja já está acima da baseline — `cache_control` breakpoints explícitos na Anthropic (`anthropic/cache.ts`, 4 breakpoints com guard de máx), ordem determinística (tools array fixo, memory por SCOPE_ORDER+dedup, skills sorted-by-name), data calculada 1× no boot (e cache efêmero de 5min torna a invalidação diária irrelevante), e compaction de tool output (`output-summarizer.ts`, raw no audit). Gaps reais: (1) `cache_hit_ratio` não computado; (2) Gemini explicit caching não implementado; (3) sem JSON canônico (latente, documentado em `seed.ts:37-43`).
+
+**Fechado o gap (1):** novo `cacheHitRatio(stats)` em `storage/repos/stats.ts` = `cache_read / (cache_read + input + cache_creation)` (output excluído; denominador inclui cache_creation → turno 1 lê 0% e sobe conforme reusa o prefixo; 0 quando não há input). Exibido no `/stats` como `cache: N% hit`. Derivado de `UsageStats`, não armazenado. Testes: razão (output não afeta, turno-1 = 0%, sem divisão-por-zero) + asserção no `/stats`. Gaps (2)/(3) viram tasks #7/#8.
+
+**Bug (review):** o footer agora é SET só via `stats:refresh` (Estágio 2). O `/compact` muta os totais persistidos (custo via `updateSessionCost` + tokens via `compaction_events`) mas não emitia `stats:refresh` → os chips do footer ficavam stale até o próximo turno/playbook, mesmo com `/stats` e `/cost` já reportando os novos totais do DB. **Fix:** novo `refreshStats?: () => void` na `SlashContext`, ligado no REPL ao `emitStatsRefresh` (mesma recomputação dos boundaries); o `/compact` chama `ctx.refreshStats?.()` após gravar custo+tokens. Teste com spy confirma a chamada após compaction faturada.
+
+**Regressão latente corrigida (do commit do `/cost` DB-derive):** ao rodar o `repl.test.ts` cheio (que eu não tinha rodado naquele commit), o teste "playbook spend rolls into /cost" falhava — o `/cost` passou a ler custo do DB, mas o `fakeRunSubagent` do teste retornava `costUsd` sem persistir sessão. Em produção o `runSubagent` real persiste a sessão-filha (e `trackReplSessionId` a registra), então o `/cost` pega certo; o stub é que era irrealista. Fix: o fake agora cria+completa uma sessão-filha única com custo por dispatch, espelhando o real. `tests/cli/repl.test.ts` 125/126 (resta só o fail pré-existente do `/compact`-inbox, confirmado no commit base).
+
+## [2026-06-07] Tokens de compaction sumiam dos totais (custo incluía, tokens não) — fix com persistência
+
+**Bug (review do agregador):** quando a sessão compacta (auto ou `/compact`), o harness folda a chamada de compaction no custo (`totalCostUsd` → `sessions.total_cost_usd`) E nos tokens (`totalUsage`, in-memory) — mas `compact()` não escreve message row (design, SESSION.md) e a `compaction_events` (072) só guardava `tokens_before`/`tokens_after` (estimativas de *contexto*, não a chamada). Logo os tokens da compaction não existiam em lugar consultável. O `computeUsageStats` puxava custo de `total_cost_usd` (com compaction) e tokens de `messages` (sem compaction) → `/stats`/footer mostravam custo e tokens **inconsistentes**, subcontando tokens em qualquer sessão que cruzou compaction, e `usageComplete` ficava `true` (não flagava).
+
+**Fix (persistir + somar):** migration **073** adiciona `call_tokens_in/out`, `call_cache_read/creation` na `compaction_events` (usage faturado da chamada de compaction; nomeadas `call_*` pra não confundir com `tokens_before/after`). Writer: `appendCompactionEvent`/`AppendCompactionEventInput` ganham `callUsage`; os dois callers passam — `loop.ts` (auto) e `compact.ts` (`/compact` manual). Relevance-only não tem provider call → `callUsage` ausente → NULL → COALESCE 0. Novo `sumCompactionUsage(db, sessionId)`; o `computeUsageStats` soma `messages` + `compaction_events` nos tokens. **Custo continua só de `total_cost_usd`** (não re-soma de compaction_events — evita double-count). Agora tokens e custo concordam através da compaction.
+
+**Provado:** `compaction-events.test.ts` (+3: round-trip de `callUsage`, `sumCompactionUsage` com COALESCE, zeros) + `stats.test.ts` (+2: tokens de compaction incluídos = invariante de consistência; relevance-only contribui 0). typecheck + lint limpos; `tests/storage/` 844/844, `compact.test.ts` 9/9, `harness/compaction.test.ts` 38/38.
+
+## [2026-06-07] `/stats` + agregador de uso DB-derived (Estágio 1 de "footer confiável no resume")
+
+**Decisão de arquitetura (operador):** as infos de uso (custo/tokens/cache) precisam ser confiáveis e consistentes na sessão E no resume, contabilizando subagentes. Entre "continuar somando no REPL (in-memory)" e "derivar do DB", escolhido **DB-derive** — é tree-wide e resume-correto por construção (a sessão do REPL é UMA linha que cresce; turnos 2+ reusam via `liveContext`/`loop.ts:909-922`, então `total_cost_usd` já carrega o lifetime e os subagentes penduram via `parent_session_id`). O `cumulative` in-memory do `/cost` soma `result.costUsd` parent-self e **perde subagente** — o DB-walk não.
+
+**Estágio 1 (aditivo, sem tocar o footer):** novo agregador `computeUsageStats(db, rootSessionIds)` (`storage/repos/stats.ts`) que faz DFS na árvore de sessões (espelha `cumulativeCostUsd`) somando custo (`sessions.total_cost_usd` — rollup canônico, captura até custo de compaction que não vira message) + tokens (`sumMessageUsage`, novo SUM com COALESCE no `messages`), com `usageComplete` (AND da árvore → marca lower-bound quando algum turno não reportou usage) e `sessionCount`. Novo slash `/stats` exibe custo + tokens (split compute=input+output / cache=read+creation, igual o footer) + escopo, sobre `replSessionIds()`. Marca `~` quando lower-bound. Escopo decidido por descoberta no código: cada REPL = 1 linha (não 1-por-turno — a primeira investigação errou citando o branch `createSession` que só dispara no 1º turno).
+
+**Provado:** `tests/storage/repos/stats.test.ts` (8: árvore/subagentes, multi-root, usageComplete AND, COALESCE de null, dedup) + `tests/cli/slash/stats.test.ts` (4: arg-reject, sem-sessão, formatação, marca de lower-bound). Ajustadas as contagens de `/help` (18→19 comandos) em `dispatch.test.ts`. typecheck + lint limpos; suítes de slash + storage verdes.
+
+**Estágio 2 (footer → DB-derive):** novo UIEvent `stats:refresh` (REPL-originated, `events.ts`) carrega os totais DB-derived; o reducer SETA `sessionTotalCostUsd`/`sessionTotalTokens`/`sessionCacheTokens` (não soma). Removida a acumulação in-memory: o fold de custo no `session:end` e o de tokens/cache no `assistant:end` saíram (o `assistant:end` ainda deriva `lastTurnContextTokens`, que é snapshot per-turn pro context%, não total). O REPL emite `emitStatsRefresh()` (recomputa `computeUsageStats` sobre `replSessionIdOrder`) em 3 sites: `session_finished`, dispatch de playbook, e no boot/resume (seed imediato dos totais persistidos — `--resume` mostra o gasto anterior na hora). Agora footer e `/stats` leem a MESMA fonte (DB), tree-wide e resume-correto; some o risco de drift in-memory. Testes de state reescritos (accumulation → SET via `stats:refresh` + preservação no `session:start`); `tests/tui/` 965/965, typecheck + lint limpos. (O fail do `/compact`-inbox em `tests/cli/repl.test.ts` é pré-existente, confirmado no commit base — não relacionado.)
+
+**Convergência do `/cost` (fonte única):** o `/cost` lia `ctx.cumulative.costUsd` (in-memory, parent-self, zerava no resume) — divergia do `/stats`/footer quando havia subagentes. Migrado pro `computeUsageStats` (mesmo DB-derive); custo agora bate entre `/cost`, `/stats` e footer. `steps`/`turns` seguem do contador in-memory (não estão no agregador). Marca `~` de lower-bound adicionada ao `/cost`. (Resíduo: `cumulative.costUsd` e `status.costUsd` viram write-only — limpeza adiada, inofensivos.) Testes do `/cost` reescritos pra fixtures de DB + um teste de paridade `/cost`↔`/stats`.
+
+**Próximo (Estágio 3):** `/stats` ganha nº de msgs, MB da sessão, tools executadas, subagentes, skills, memórias lidas.
+
+## [2026-06-07] Defaults de budget (wall-clock 1h, cost cap $100) + chip de custo cumulativo no footer
+
+**Direção do operador:** afrouxar os caps default pra sessões longas/caras de dev local e expor o gasto no rodapé. (1) `maxWallClockMs` 10min → **1h** (`DEFAULT_BUDGET` + `DEFAULT_WALL_CLOCK_MS` do subagente, espelhados); (2) `maxCostUsd` $5 → **$100**; (3) trazer de volta o chip de custo ao footer (removido no commit `54b168de` por ler `$0.0000` com 4 casas e por ruído em terminal estreito).
+
+**Footer — custo cumulativo do REPL, em paridade com tokens:** o chip de tokens (`sessionTotalTokens`) é REPL-scoped (não reseta em `session:start`), mas `costUsd` (de `step:budget`) é por-sessão-do-harness. Pra não exibir "tokens acumulados · custo do último turno" lado a lado, novo campo `sessionTotalCostUsd` espelha o padrão de `sessionTotalTokens`: REPL-scoped, acumulado no boundary `session:end` (onde o `step:budget` final com `r.costUsd` já chegou no mesmo batch). O `costUsd` por-turno é zerado nesse fold (protege contra re-somar valor velho num turno sem `step:budget`). Formato 2-casas (`$X.XX`) — resolve o motivo da remoção original; suprimido em exatamente $0.
+
+**Spec:** `AGENTIC_CLI §5` (bloco `[budget]`, tabela de config, `RunBudget`, postura cost-primary, matriz de interação) e `docs/BUDGET.md` atualizados pros novos defaults. O footer **não** entrou na spec (`UI.md §4.10.6`) — UX valida no `bun run dev` antes de specar (diretriz iterate-before-spec).
+
+**Provado:** `tests/harness/budget-defaults.test.ts` (defaults novos), `tests/tui/render/footer.test.ts` (chip lê cumulativo, ordem após tokens, sub-centavo, supressão em $0), `tests/tui/state.test.ts` (fold em `session:end` + zera `costUsd`; soma cross-turn sobrevive a `session:start`). typecheck + lint limpos.
+
+## [2026-06-07] §8.4 engine-floor: matching de sensitive-path era case-sensitive (bypass em FS case-insensitive)
+
+**Bug (review + verificação empírica):** o `matchSensitivePath` (`permissions/sensitive-paths.ts`) é o piso §8.4 — fires antes da policy lookup, nenhuma config de operador burla. O matcher era case-sensitive e dependia inteiramente do `realpath` (`engine.checkPath`) canonicalizar o case do input. Mas o `realpath` só normaliza quando o alvo **já existe**; em write-creates-new-file (ou dir-pai inexistente) o fallback preserva o case cru do agente. Em macOS APFS / Windows NTFS (case-insensitive default) `write_file('.ENV')` atinge o mesmo inode que `.env` → `matchSensitivePath('.ENV')` → null → sob `allow_paths: ['**']` a escrita era autorizada, sobrescrevendo segredos sem confirm.
+
+**Correção do patch proposto (que estava incompleto):** o patch inicial lowercava só o **input**, não os patterns. Isso matava silenciosamente a única entrada mixed-case da deny-list — `GoogleService-Info.plist` (config Firebase iOS) — virando um bypass §8.4 na direção oposta (verificado: `matchSensitivePath('GoogleService-Info.plist')` → null pós-patch). E a validação do relatório ("zero regressão") só rodou `tests/permissions/`, perdendo o segundo consumidor (`tests/subagents/sensitive-paths.test.ts`, que falhava). Fix correto: lowercar **os dois lados** (input E pattern), retornando o pattern original pra auditoria fiel.
+
+**Provado:** `tests/permissions/sensitive-paths-case.test.ts` (novo) cobre `.ENV`/`.Env`/`id_RSA`/`CREDENTIALS.json`/`.SSH/**`/`production.PEM` + o caso mixed-case (`GoogleService-Info.plist` em 3 casings). `tests/permissions/` 2274/2274, `tests/subagents/sensitive-paths.test.ts` verde de novo, typecheck + lint limpos. Invariante documentada em `SECURITY_GUIDELINE.md §8.4`.
+
 ## [2026-06-07] Relevance-driven compaction (token-driven, atrás de flag default-off)
 
 **Motivação (discussão de context engineering / Headroom):** a compaction dobra o `middle` inteiro num summary do LLM — lossy em tudo (relevante ou não) + custa uma chamada. Em code agent o grosso dos tokens do meio é corpo de tool_result (reads/greps/test output) que para de importar ao goal poucos turns depois. Solução: pontuar o meio por relevância ao goal e manter o relevante verbatim, ponteando o resto (recuperável via `retrieve_context` session view, que já lê `messages`/`tool_calls`/`failure_events` do audit). Direção do operador: eval-first, e **production-ready, não protótipo**.

@@ -20,6 +20,14 @@ export interface Message {
   // Null for rows persisted before migration 068 and for paths not
   // yet wired (subagent seed in `subagents/runtime.ts`).
   promptHash: string | null;
+  // Resolved provider reasoning-effort that produced this message
+  // ('low' | 'medium' | 'high' | 'max') — migration 074. The mutable,
+  // not-otherwise-recoverable dimension for regression attribution (did
+  // quality shift because effort changed or because context did?). Set on
+  // ASSISTANT rows; NULL on user/tool rows, pre-migration rows, and turns
+  // with no resolved effort. Typed `string` (not the harness enum) to keep
+  // storage decoupled from the harness/provider layer.
+  effort: string | null;
 }
 
 interface MessageRow {
@@ -35,6 +43,7 @@ interface MessageRow {
   cost_usd: number | null;
   created_at: number;
   prompt_hash: string | null;
+  effort: string | null;
 }
 
 const fromRow = (row: MessageRow): Message => ({
@@ -50,6 +59,7 @@ const fromRow = (row: MessageRow): Message => ({
   costUsd: row.cost_usd,
   createdAt: row.created_at,
   promptHash: row.prompt_hash,
+  effort: row.effort,
 });
 
 export interface AppendMessageInput {
@@ -70,6 +80,10 @@ export interface AppendMessageInput {
   // because messages persisted before migration 068 carry no hash and
   // because subagent paths haven't been wired yet.
   promptHash?: string | null;
+  // Resolved provider reasoning-effort for this message (migration 074).
+  // The harness loop sources it from the per-request resolved effort.
+  // Nullable: non-assistant rows and turns with no resolved effort.
+  effort?: string | null;
 }
 
 export const appendMessage = (db: DB, input: AppendMessageInput): Message => {
@@ -110,12 +124,13 @@ export const appendMessage = (db: DB, input: AppendMessageInput): Message => {
   // sees committed state at INSERT time; concurrent writers are
   // serialized by SQLite, so MAX(seq) is always current.
   const promptHash = input.promptHash ?? null;
+  const effort = input.effort ?? null;
   db.query(
     `INSERT INTO messages
      (id, session_id, parent_id, role, content,
-      tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, seq)
+      tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, seq)
      VALUES (
-       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
        (SELECT COALESCE(MAX(seq), -1) + 1 FROM messages WHERE session_id = ?)
      )`,
   ).run(
@@ -131,6 +146,7 @@ export const appendMessage = (db: DB, input: AppendMessageInput): Message => {
     costUsd,
     createdAt,
     promptHash,
+    effort,
     input.sessionId,
   );
   return {
@@ -146,6 +162,7 @@ export const appendMessage = (db: DB, input: AppendMessageInput): Message => {
     costUsd,
     createdAt,
     promptHash,
+    effort,
   };
 };
 
@@ -153,7 +170,7 @@ export const getMessage = (db: DB, id: string): Message | null => {
   const row = db
     .query(
       `SELECT id, session_id, parent_id, role, content,
-              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash
+              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort
        FROM messages WHERE id = ?`,
     )
     .get(id) as MessageRow | null;
@@ -170,7 +187,7 @@ export const listMessagesBySession = (db: DB, sessionId: string): Message[] => {
   const rows = db
     .query(
       `SELECT id, session_id, parent_id, role, content,
-              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash
+              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort
        FROM messages
        WHERE session_id = ?
        ORDER BY seq ASC`,
@@ -207,7 +224,7 @@ export const listMessageTailBySession = (db: DB, sessionId: string, limit: numbe
   const rows = db
     .query(
       `SELECT id, session_id, parent_id, role, content,
-              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash
+              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort
        FROM (
          SELECT * FROM messages
          WHERE session_id = ?
@@ -218,4 +235,38 @@ export const listMessageTailBySession = (db: DB, sessionId: string, limit: numbe
     )
     .all(sessionId, limit) as MessageRow[];
   return { messages: rows.map(fromRow), totalCount };
+};
+
+// Provider-reported token totals for a single session, summed across
+// every message row. Used by the usage-stats aggregator (`/stats` and
+// the footer) to roll up a session's lifetime token throughput.
+//
+// COALESCE folds the nullable columns to 0 — a turn that reported no
+// usage (provider edge case / mid-stream abort) contributes nothing
+// rather than poisoning the SUM with NULL. That makes the total a
+// LOWER BOUND when any turn lacked usage; the caller pairs this with
+// `sessions.usage_complete` to flag the undercount.
+export interface MessageUsageTotals {
+  tokensIn: number;
+  tokensOut: number;
+  cacheRead: number;
+  cacheCreation: number;
+}
+
+export const sumMessageUsage = (db: DB, sessionId: string): MessageUsageTotals => {
+  const row = db
+    .query<{ ti: number; tout: number; cr: number; cc: number }, [string]>(
+      `SELECT COALESCE(SUM(tokens_in), 0)              AS ti,
+              COALESCE(SUM(tokens_out), 0)             AS tout,
+              COALESCE(SUM(cached_tokens), 0)          AS cr,
+              COALESCE(SUM(cache_creation_tokens), 0)  AS cc
+       FROM messages WHERE session_id = ?`,
+    )
+    .get(sessionId);
+  return {
+    tokensIn: row?.ti ?? 0,
+    tokensOut: row?.tout ?? 0,
+    cacheRead: row?.cr ?? 0,
+    cacheCreation: row?.cc ?? 0,
+  };
 };

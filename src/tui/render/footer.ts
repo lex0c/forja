@@ -6,24 +6,32 @@ import { FRAME_MARGIN, FRAME_MARGIN_WIDTH } from './frame.ts';
 import { isBashMode } from './mode.ts';
 import { visualWidth } from './width.ts';
 
-const formatTokens = (n: number): string => {
-  if (n < 1000) return `${n} tokens`;
+// `unit` lets the same magnitude formatting drive both the `N tokens`
+// (non-cache compute) and `N cached` chips — they share the k/M
+// rounding rules, only the trailing label differs.
+const formatTokens = (n: number, unit = 'tokens'): string => {
+  if (n < 1000) return `${n} ${unit}`;
   if (n < 10_000) {
     const k = n / 1000;
     const rounded = Math.round(k * 10) / 10;
     return rounded === Math.floor(rounded)
-      ? `${rounded.toFixed(0)}k tokens`
-      : `${rounded.toFixed(1)}k tokens`;
+      ? `${rounded.toFixed(0)}k ${unit}`
+      : `${rounded.toFixed(1)}k ${unit}`;
   }
-  if (n < 1_000_000) return `${Math.round(n / 1000)}k tokens`;
+  if (n < 1_000_000) return `${Math.round(n / 1000)}k ${unit}`;
   const m = n / 1_000_000;
   const rounded = Math.round(m * 10) / 10;
   return rounded === Math.floor(rounded)
-    ? `${rounded.toFixed(0)}M tokens`
-    : `${rounded.toFixed(1)}M tokens`;
+    ? `${rounded.toFixed(0)}M ${unit}`
+    : `${rounded.toFixed(1)}M ${unit}`;
 };
 
-const CONTEXT_WARN_THRESHOLD = 0.8;
+// REPL-cumulative spend for the footer's `$X.XX` chip. Two decimals
+// match the session-end `formatDollars` (permanent.ts) so the cents
+// the operator sees agree with the final figure. Sub-cent totals floor
+// to `$0.00` — acceptable "negligible" signal; the chip is suppressed
+// entirely at exactly $0 (see renderFooter).
+const formatCost = (usd: number): string => `$${(Math.round(usd * 100) / 100).toFixed(2)}`;
 
 // "Can the operator interrupt right now?" — keyed off `state.busy`, the
 // renderer's mirror of the REPL's `isBusy()` (a foreground turn OR a
@@ -99,27 +107,27 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
 
   const status = state.status;
   const rightParts: string[] = [];
-  // Selected effort level (leftmost of the right cluster). Seeded at
-  // boot from config/DEFAULT_EFFORT, updated live on `/effort`.
-  if (status.effort !== null) {
-    rightParts.push(dim(caps, `effort: ${status.effort}`));
-  }
   if (status.model !== null && status.model !== '') {
     rightParts.push(dim(caps, status.model));
   }
-  if (status.sessionTotalTokens > 0) {
-    rightParts.push(dim(caps, formatTokens(status.sessionTotalTokens)));
+  // Non-cache compute (input + output) and cache (read + creation) are
+  // shown as two disjoint chips that sum back to the grand total. Cache
+  // is provider-reported and billed, but far cheaper than input, so the
+  // operator wants it distinguishable from real compute.
+  const cacheTokens = status.sessionCacheTokens;
+  const nonCacheTokens = status.sessionTotalTokens - cacheTokens;
+  if (nonCacheTokens > 0) {
+    rightParts.push(dim(caps, formatTokens(nonCacheTokens)));
   }
-  // Both fields required: rendering `0% context used` against an
-  // unknown window would mislead the operator. Also suppressed while
-  // contextStale — a compaction shrank the context but no fresh turn has
-  // re-measured it, so we show provider-truth or nothing (never a
-  // post-compaction estimate). Restored on the next assistant:end.
-  if (status.contextWindow > 0 && status.lastTurnContextTokens > 0 && !status.contextStale) {
-    const ratio = status.lastTurnContextTokens / status.contextWindow;
-    const pct = Math.min(100, Math.max(0, Math.round(ratio * 100)));
-    const text = `${pct}% context used`;
-    rightParts.push(ratio >= CONTEXT_WARN_THRESHOLD ? paint(caps, 'warn', text) : dim(caps, text));
+  if (cacheTokens > 0) {
+    rightParts.push(dim(caps, formatTokens(cacheTokens, 'cached')));
+  }
+  // REPL-cumulative spend, right beside the (also cumulative) token
+  // count. Suppressed at exactly $0 (pre-first-turn / cost not yet
+  // reported) so the chip doesn't render a meaningless `$0.00` on an
+  // idle session.
+  if (status.sessionTotalCostUsd > 0) {
+    rightParts.push(dim(caps, formatCost(status.sessionTotalCostUsd)));
   }
   const right = rightParts.join(sep);
 

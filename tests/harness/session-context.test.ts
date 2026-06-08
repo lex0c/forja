@@ -73,6 +73,15 @@ describe('SessionContext: append (array + row + anchor in one place)', () => {
     expect(rows[0]?.parentId).toBeNull(); // fresh → root
   });
 
+  test('appendAssistant records the resolved effort (default null)', () => {
+    const ctx = SessionContext.createFresh(db, sessionId);
+    const withEffort = ctx.appendAssistant(textBlock('ok'), noUsage, null, 'high');
+    expect(getMessage(db, withEffort)?.effort).toBe('high');
+    // Default arg keeps existing call sites (and user/tool rows) at null.
+    const noEffort = ctx.appendAssistant(textBlock('ok2'), noUsage, null);
+    expect(getMessage(db, noEffort)?.effort).toBeNull();
+  });
+
   test('chain: assistant.parentId points at the prior user row', () => {
     const ctx = SessionContext.createFresh(db, sessionId);
     const uId = ctx.appendUser('goal', null);

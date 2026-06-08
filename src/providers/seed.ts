@@ -28,20 +28,19 @@
 // would have been silently rejected or coerced.)
 
 import { createHash } from 'node:crypto';
+import { stableStringify } from './canonical-json.ts';
 import type { GenerateRequest } from './types.ts';
 
 export const deriveSeedFromRequest = (req: GenerateRequest): number => {
   const hash = createHash('sha256');
   if (req.system !== undefined) hash.update(req.system);
   for (const msg of req.messages) {
-    // JSON.stringify ordering depends on insertion order at the
-    // construction site. The harness's ProviderMessage builder
-    // uses a fixed key order today, so the same conversation
-    // value-equally hashes to the same bytes; if a future
-    // call site spreads partials or builds via JSON.parse the
-    // hash silently drifts. If/when this becomes load-bearing,
-    // switch to a canonical-JSON serializer here.
-    hash.update(JSON.stringify(msg));
+    // Canonical (sorted-key) serialization so the same conversation
+    // hashes to the same bytes regardless of object key order — a
+    // call site that spreads partials or rebuilds via JSON.parse can't
+    // silently drift the seed. (Plain JSON.stringify would only "happen
+    // to" be stable via insertion order.)
+    hash.update(stableStringify(msg));
   }
   const digest = hash.digest();
   return digest.readInt32BE(0);

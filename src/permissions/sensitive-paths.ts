@@ -155,14 +155,34 @@ const getGlob = (pattern: string): Glob => {
   return glob;
 };
 
+// Case-insensitive match. The §8.4 deny-list is an engine-floor: it must
+// hold on every platform the binary supports, and macOS APFS and Windows
+// NTFS are case-insensitive by default. On those FSes `write_file('.ENV')`
+// hits the same inode as `.env`; a case-sensitive matcher would have
+// classified the call as non-sensitive and let it through under a
+// permissive policy (`allow_paths: ['**']`). The realpath fallback in
+// engine.checkPath canonicalizes the case ONLY when the target exists
+// — for write-creates-new-file the matcher sees the raw input, so the
+// matcher itself has to be case-insensitive.
+//
+// Both sides are lowercased: the input AND the pattern. Most patterns are
+// authored lowercase, but not all (`GoogleService-Info.plist` is mixed
+// case, the canonical iOS Firebase config name) — lowercasing only the
+// input would silently kill the match for those, re-opening the very
+// §8.4 bypass this is meant to close (and dropping the real-cased file's
+// own protection in the bargain). The reported value is the ORIGINAL
+// pattern string so callers/audit see the spec-faithful form. The cost
+// is over-matching `MyFile.PEM` style names, the safe direction for a
+// credential-shaped deny.
 export const matchSensitivePath = (
   relPath: string,
   patterns: readonly string[] = SENSITIVE_PATH_DENY_LIST,
 ): string | null => {
-  const normalized = relPath.replace(/\\/g, '/').replace(/^\.\//, '');
+  const normalized = relPath.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
   for (const pattern of patterns) {
-    if (getGlob(pattern).match(normalized)) return pattern;
-    if (!pattern.startsWith('**/') && getGlob(`**/${pattern}`).match(normalized)) {
+    const lowered = pattern.toLowerCase();
+    if (getGlob(lowered).match(normalized)) return pattern;
+    if (!lowered.startsWith('**/') && getGlob(`**/${lowered}`).match(normalized)) {
       return pattern;
     }
   }

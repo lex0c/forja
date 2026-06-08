@@ -23,7 +23,7 @@ const startedSession = (overrides: Partial<LiveState['status']> = {}): LiveState
       model: 'sonnet-4.6',
       maxSteps: 50,
       steps: 3,
-      costUsd: 0.012,
+      sessionTotalCostUsd: 0.012,
       ...overrides,
     },
   };
@@ -83,7 +83,7 @@ describe('renderFooter', () => {
     expect(out).toContain('supervised mode on');
   });
 
-  test('idle state: operation-mode cue left, model right (cost/steps chips removed)', () => {
+  test('idle state: operation-mode cue left, model + cost right (step chip removed)', () => {
     const out = renderFooter(startedSession(), caps);
     expect(out).not.toBeNull();
     // The operation-mode cue replaced the old `? for help` hint
@@ -94,23 +94,17 @@ describe('renderFooter', () => {
     // continuation (UI.md §5.4).
     expect(out).toContain('\\+Enter newline');
     expect(out).toContain('sonnet-4.6');
-    // Cost + step counter were removed from the footer — too
-    // low-signal next to the tokens / context-used chips.
-    expect(out).not.toContain('$0.');
+    // Current-turn cost surfaces beside the token count (2-decimal).
+    expect(out).toContain('$0.01');
+    // The step counter stays out of the footer — low-signal next to
+    // the tokens / context-used chips.
     expect(out).not.toContain('3/50');
     // Interrupt cue absent when nothing is running.
     expect(out).not.toContain('esc to interrupt');
   });
 
-  test('renders the selected effort chip on the right when set', () => {
-    const out = renderFooter(startedSession({ effort: 'high' }), caps);
-    expect(out).toContain('effort: high');
-    // Both effort and model live in the right cluster.
-    expect(out).toContain('sonnet-4.6');
-  });
-
-  test('omits the effort chip when effort is null (pre-banner)', () => {
-    const out = renderFooter(startedSession(), caps);
+  test('the effort level is NOT surfaced in the footer (chip removed)', () => {
+    const out = renderFooter(startedSession({ effort: 'high' }), caps) ?? '';
     expect(out).not.toContain('effort:');
   });
 
@@ -255,9 +249,30 @@ describe('renderFooter', () => {
     expect(out).not.toContain('esc to interrupt');
   });
 
-  test('cost does NOT surface in the footer (chip removed)', () => {
-    const out = renderFooter(startedSession({ costUsd: 12.34 }), caps) ?? '';
-    expect(out).not.toContain('$');
+  describe('REPL-cumulative cost chip', () => {
+    test('surfaces as a 2-decimal `$X.XX` chip', () => {
+      const out = renderFooter(startedSession({ sessionTotalCostUsd: 12.34 }), caps) ?? '';
+      expect(out).toContain('$12.34');
+    });
+
+    test('renders right after the token count', () => {
+      const out =
+        renderFooter(
+          startedSession({ sessionTotalTokens: 12_400, sessionTotalCostUsd: 0.5 }),
+          caps,
+        ) ?? '';
+      expect(out.indexOf('12k tokens')).toBeLessThan(out.indexOf('$0.50'));
+    });
+
+    test('zero cost drops the chip entirely', () => {
+      const out = renderFooter(startedSession({ sessionTotalCostUsd: 0 }), caps) ?? '';
+      expect(out).not.toContain('$');
+    });
+
+    test('sub-cent total still shows a `$0.00` chip (ran ≠ nothing ran)', () => {
+      const out = renderFooter(startedSession({ sessionTotalCostUsd: 0.002 }), caps) ?? '';
+      expect(out).toContain('$0.00');
+    });
   });
 
   test('bg processes do NOT surface in the footer (chip removed)', () => {
@@ -275,21 +290,11 @@ describe('renderFooter', () => {
 
   describe('session-total tokens chip', () => {
     test('renders compact `Nk tokens` right after the model chip', () => {
-      const out =
-        renderFooter(
-          startedSession({
-            sessionTotalTokens: 12_400,
-            lastTurnContextTokens: 90_000,
-            contextWindow: 200_000,
-          }),
-          caps,
-        ) ?? '';
+      const out = renderFooter(startedSession({ sessionTotalTokens: 12_400 }), caps) ?? '';
       expect(out).toContain('12k tokens');
-      // Order: model · tokens · context%. Tokens come right after
-      // model so the operator's load cluster reads
-      // identity → weight → saturation.
+      // Order: model · tokens. Tokens come right after model so the
+      // operator's load cluster reads identity → weight.
       expect(out.indexOf('sonnet-4.6')).toBeLessThan(out.indexOf('12k tokens'));
-      expect(out.indexOf('12k tokens')).toBeLessThan(out.indexOf('45% context used'));
     });
 
     test('zero tokens drops the chip entirely', () => {
@@ -319,95 +324,57 @@ describe('renderFooter', () => {
     });
   });
 
-  describe('% context used chip', () => {
-    test('renders `X% context used` when contextWindow and lastTurnContextTokens are set', () => {
+  describe('cache tokens chip', () => {
+    test('splits cache out: `N tokens` is non-cache, `N cached` is the cache subset', () => {
+      // Grand total 12.4k, of which 4k is cache → non-cache compute 8.4k.
       const out =
         renderFooter(
-          startedSession({ contextWindow: 200_000, lastTurnContextTokens: 90_000 }),
+          startedSession({ sessionTotalTokens: 12_400, sessionCacheTokens: 4000 }),
           caps,
         ) ?? '';
-      expect(out).toContain('45% context used');
+      expect(out).toContain('8.4k tokens');
+      expect(out).toContain('4k cached');
+      // The two chips are disjoint and sum to the grand total; the
+      // grand-total figure itself is never printed.
+      expect(out).not.toContain('12k tokens');
+      // Cache chip sits right after the token chip.
+      expect(out.indexOf('8.4k tokens')).toBeLessThan(out.indexOf('4k cached'));
     });
 
-    test('suppressed when contextWindow is 0 (banner not seen yet)', () => {
+    test('zero cache drops the cache chip but keeps the token chip', () => {
       const out =
-        renderFooter(startedSession({ contextWindow: 0, lastTurnContextTokens: 90_000 }), caps) ??
+        renderFooter(startedSession({ sessionTotalTokens: 5000, sessionCacheTokens: 0 }), caps) ??
         '';
-      expect(out).not.toContain('context used');
+      expect(out).toContain('5k tokens');
+      expect(out).not.toContain('cached');
     });
 
-    test('suppressed when no turn has landed yet', () => {
-      const out =
-        renderFooter(startedSession({ contextWindow: 200_000, lastTurnContextTokens: 0 }), caps) ??
-        '';
-      expect(out).not.toContain('context used');
-    });
-
-    test('suppressed while contextStale (a compaction ran, awaiting a fresh measurement)', () => {
-      // The pre-compaction count is now wrong; show provider-truth or nothing,
-      // never a post-compaction estimate. Restored on the next assistant:end.
+    test('all-cache turn drops the token chip and keeps only the cache chip', () => {
+      // sessionTotalTokens == sessionCacheTokens → non-cache is 0.
       const out =
         renderFooter(
-          startedSession({
-            contextWindow: 200_000,
-            lastTurnContextTokens: 90_000,
-            contextStale: true,
-          }),
+          startedSession({ sessionTotalTokens: 3000, sessionCacheTokens: 3000 }),
           caps,
         ) ?? '';
-      expect(out).not.toContain('context used');
-    });
-
-    test('paints `warn` (yellow, SGR 33) when ratio crosses the 80% threshold', () => {
-      const colored: Capabilities = { ...caps, color: 'basic' };
-      const out =
-        renderFooter(
-          startedSession({ contextWindow: 200_000, lastTurnContextTokens: 170_000 }),
-          colored,
-        ) ?? '';
-      // 170k / 200k = 85% → past the 80% gate, painted warn.
-      expect(out).toContain('85% context used');
-      expect(out).toContain(`${CSI}33m85% context used${CSI}0m`);
-    });
-
-    test('stays `secondary` (grey, SGR 90) below the 80% threshold', () => {
-      const colored: Capabilities = { ...caps, color: 'basic' };
-      const out =
-        renderFooter(
-          startedSession({ contextWindow: 200_000, lastTurnContextTokens: 100_000 }),
-          colored,
-        ) ?? '';
-      expect(out).toContain('50% context used');
-      expect(out).toContain(`${CSI}90m50% context used${CSI}0m`);
-    });
-
-    test('clamps to 100% when usage exceeds the window (provider edge case)', () => {
-      const out =
-        renderFooter(
-          startedSession({ contextWindow: 100_000, lastTurnContextTokens: 250_000 }),
-          caps,
-        ) ?? '';
-      expect(out).toContain('100% context used');
+      expect(out).toContain('3k cached');
+      expect(out).not.toContain('3k tokens');
     });
   });
 
   describe('"always visible" lead chips before session:start', () => {
-    test('model + tokens + ctx render even with sessionId null', () => {
-      // Simulates the boot window: banner landed (model + window
-      // stamped), tokens accumulated via assistant:end, but the
-      // user hasn't submitted yet so sessionId is still null.
+    test('model + tokens render even with sessionId null', () => {
+      // Simulates the boot window: banner landed (model stamped),
+      // tokens accumulated via assistant:end, but the user hasn't
+      // submitted yet so sessionId is still null.
       const s = createInitialState();
       s.status = {
         ...s.status,
         model: 'anthropic/claude-opus-4-7',
-        contextWindow: 200_000,
         sessionTotalTokens: 12_400,
-        lastTurnContextTokens: 90_000,
       };
       const out = renderFooter(s, caps) ?? '';
       expect(out).toContain('anthropic/claude-opus-4-7');
       expect(out).toContain('12k tokens');
-      expect(out).toContain('45% context used');
     });
   });
 

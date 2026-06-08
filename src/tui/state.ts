@@ -119,7 +119,17 @@ export interface StatusState {
   model: string | null;
   steps: number;
   maxSteps: number;
+  // Current-turn spend (this harness session only). Reset to 0 at each
+  // session:end after it folds into `sessionTotalCostUsd`. Driven by
+  // step:budget — internal accumulator now; the footer renders the
+  // REPL-cumulative field below.
   costUsd: number;
+  // REPL-cumulative spend across every turn. Mirrors
+  // `sessionTotalTokens`: REPL-scoped (does NOT reset on session:start),
+  // accumulated at the turn boundary (session:end). The footer's `$X.XX`
+  // chip reads THIS so cost and the token count both summarize the whole
+  // REPL run rather than disagreeing (tokens cumulative, cost per-turn).
+  sessionTotalCostUsd: number;
   // null = no cap configured. Renderer shows steps/cost without budget
   // shading when cap absent.
   maxCostUsd: number | null;
@@ -146,8 +156,18 @@ export interface StatusState {
   // sees the REPL as one).
   contextWindow: number;
   // REPL-scoped (does NOT reset on session:start) so the chip
-  // accumulates across the operator's whole REPL run.
+  // accumulates across the operator's whole REPL run. GRAND total —
+  // input + output + cache_read + cache_creation. The footer renders
+  // the non-cache part (`sessionTotalTokens - sessionCacheTokens`)
+  // beside a dedicated cache chip, so the two displayed numbers are
+  // disjoint and sum back to this.
   sessionTotalTokens: number;
+  // REPL-scoped cumulative cache tokens (cache_read + cache_creation).
+  // Split out from sessionTotalTokens for its own `N cached` footer
+  // chip: cache is provider-reported and billed, but at a fraction of
+  // the input rate, so the operator wants it distinguishable from real
+  // compute (input + output).
+  sessionCacheTokens: number;
   // inputTokens + cacheRead + cacheCreation of the latest turn —
   // what occupied the context window when the model generated.
   lastTurnContextTokens: number;
@@ -529,12 +549,14 @@ export const createInitialState = (): LiveState => ({
     steps: 0,
     maxSteps: 0,
     costUsd: 0,
+    sessionTotalCostUsd: 0,
     maxCostUsd: null,
     operationMode: 'supervised',
     effort: null,
     memoryCount: 0,
     contextWindow: 0,
     sessionTotalTokens: 0,
+    sessionCacheTokens: 0,
     lastTurnContextTokens: 0,
     contextStale: false,
   },
@@ -869,6 +891,25 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         state: { ...state, status: { ...state.status, effort: event.effort } },
         permanent: [],
       };
+    case 'stats:refresh':
+      // DB-derived usage totals (cost/tokens/cache) for the footer. The
+      // REPL recomputes these over its session tree at each turn boundary
+      // and on boot/resume, then emits this so we SET (not accumulate) —
+      // single source of truth is the persisted DB, so the chips are
+      // tree-wide (incl. subagents) and resume-correct. SET overrides any
+      // stale value; no scrollback.
+      return {
+        state: {
+          ...state,
+          status: {
+            ...state.status,
+            sessionTotalCostUsd: event.costUsd,
+            sessionTotalTokens: event.totalTokens,
+            sessionCacheTokens: event.cacheTokens,
+          },
+        },
+        permanent: [],
+      };
     case 'session:start': {
       const status: StatusState = {
         ...state.status,
@@ -967,6 +1008,12 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // harness already committed to killing — visually a zombie
       // tray. The late bg:end events still flow through (they're
       // dropped as no-ops by the unknown-processId branch).
+      //
+      // The footer's cumulative cost/token/cache totals are NOT folded
+      // here anymore — they are DB-derived and pushed via `stats:refresh`
+      // (the REPL recomputes over its session tree at the turn boundary,
+      // which is tree-wide incl. subagents and resume-correct). This
+      // boundary only does the soft-interrupt / bg / subagent cleanup.
       return {
         state: {
           ...flushed.state,
@@ -1198,17 +1245,18 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       const text = buf?.text ?? '';
       const durationMs = buf !== null ? event.ts - buf.startedAt : null;
       const outputTokens = buf?.outputTokens ?? null;
-      // Aggregate at the turn boundary (not on `assistant:usage`):
-      // Anthropic streams cumulative counts, so reading the buffer's
-      // final snapshot avoids double-counting.
+      // Read the buffer's final usage snapshot (Anthropic streams
+      // cumulative counts). The REPL-cumulative token/cache totals are
+      // NOT folded here anymore — they're DB-derived via `stats:refresh`.
+      // We still derive `lastTurnContextTokens` (input + cache) for the
+      // context-occupancy field, which is a per-turn snapshot, not a
+      // running total.
       const input = buf?.inputTokens ?? 0;
       const cacheRead = buf?.cacheRead ?? 0;
       const cacheCreation = buf?.cacheCreation ?? 0;
-      const output = outputTokens ?? 0;
       const turnContext = input + cacheRead + cacheCreation;
       const status: StatusState = {
         ...state.status,
-        sessionTotalTokens: state.status.sessionTotalTokens + turnContext + output,
         // Fallback to the prior value when the turn yielded no usage
         // event (provider edge case) so the chip doesn't flicker to 0%.
         lastTurnContextTokens: turnContext > 0 ? turnContext : state.status.lastTurnContextTokens,

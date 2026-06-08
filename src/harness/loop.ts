@@ -23,6 +23,7 @@ import {
   parseCapability,
 } from '../permissions/capabilities.ts';
 import { createDegradedBannerEmitter } from '../permissions/degraded-banner.ts';
+import { canonicalizeObject } from '../providers/canonical-json.ts';
 import { addUsage, computeCost, emptyUsage } from '../providers/cost.ts';
 import type {
   GenerateRequest,
@@ -2359,6 +2360,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           elidedIds?: readonly string[];
           summary?: string;
           reason?: string;
+          callUsage?: {
+            tokensIn: number;
+            tokensOut: number;
+            cacheRead: number;
+            cacheCreation: number;
+          };
         }): void =>
           recordCompactionEvent(config.db, {
             sessionId,
@@ -2453,6 +2460,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           strategy: compaction.strategy,
           foldedCount: compaction.foldedCount,
           tokensAfter: estimateNow(),
+          // Billed usage of the summary call, so the aggregator's token
+          // totals account for compaction (cost already does, via
+          // sessions.total_cost_usd). compaction.usage is zeroed on the
+          // relevance-only path (no provider call).
+          callUsage: {
+            tokensIn: compaction.usage.input,
+            tokensOut: compaction.usage.output,
+            cacheRead: compaction.usage.cache_read,
+            cacheCreation: compaction.usage.cache_creation,
+          },
           ...(relevanceAudit !== undefined
             ? { freedBytes: relevanceAudit.freedBytes, elidedIds: relevanceAudit.elidedIds }
             : {}),
@@ -2641,7 +2658,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             type: 'tool_use',
             id: tu.id,
             name: tu.name,
-            input: tu.input,
+            // Canonicalize the arg keys at the single point they enter
+            // history, so this block serializes to byte-stable bytes in
+            // every later request (all providers + resume) — a stable
+            // cache prefix. Key order is semantically irrelevant, so this
+            // never changes what the model or the tool sees.
+            input: canonicalizeObject(tu.input),
           };
           assistantContent.push(block);
         }
@@ -2676,6 +2698,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             costUsd: turnCostUsd,
           },
           config.systemPromptHash ?? null,
+          // The provider reasoning-effort resolved for THIS request
+          // (migration 074) — records the effort that produced the turn.
+          reqEffort ?? null,
         );
 
         // Stream errors (normalizer-level: malformed tool_use args, orphan

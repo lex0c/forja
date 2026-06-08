@@ -42,6 +42,26 @@ describe('messages repo', () => {
     expect(getMessage(db, m.id)?.content).toEqual(content);
   });
 
+  test('persists and reads back effort (regression-attribution column)', () => {
+    const m = appendMessage(db, {
+      sessionId,
+      role: 'assistant',
+      content: 'reply',
+      effort: 'high',
+    });
+    expect(m.effort).toBe('high');
+    // Round-trips through every read path (each SELECT lists the column).
+    expect(getMessage(db, m.id)?.effort).toBe('high');
+    expect(listMessagesBySession(db, sessionId)[0]?.effort).toBe('high');
+    expect(listMessageTailBySession(db, sessionId, 10).messages[0]?.effort).toBe('high');
+  });
+
+  test('effort defaults to null when omitted (e.g. user/tool rows)', () => {
+    const m = appendMessage(db, { sessionId, role: 'user', content: 'hi' });
+    expect(m.effort).toBeNull();
+    expect(getMessage(db, m.id)?.effort).toBeNull();
+  });
+
   test('preserves token counts when supplied', () => {
     const m = appendMessage(db, {
       sessionId,

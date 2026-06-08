@@ -134,14 +134,21 @@ export const createGoogleProvider = (
     client = new GoogleGenAI({ apiKey });
   }
 
+  // Sampling gate (mirrors the Anthropic adapter). A model that deprecates
+  // `temperature`/`top_p` at the API opts out via `supports_sampling: false`;
+  // the adapter then omits both rather than risk an HTTP 400. Current Gemini
+  // models accept sampling, so this is a no-op for them — but it keeps the
+  // three adapters uniform and ready for a future thinking-only Gemini.
+  const acceptsSampling = caps.supports_sampling !== false;
+
   const generate = async function* (req: GenerateRequest): AsyncIterable<StreamEvent> {
     const contents = req.messages.map(toGoogleContent);
     const config: Record<string, unknown> = {
       maxOutputTokens: req.max_tokens,
     };
     if (req.system !== undefined) config.systemInstruction = req.system;
-    if (req.temperature !== undefined) config.temperature = req.temperature;
-    if (req.top_p !== undefined) config.topP = req.top_p;
+    if (acceptsSampling && req.temperature !== undefined) config.temperature = req.temperature;
+    if (acceptsSampling && req.top_p !== undefined) config.topP = req.top_p;
     // Reasoning effort / thinking budget via the numeric
     // `thinkingConfig.thinkingBudget` knob — see `googleThinkingBudget`
     // for the precedence (explicit disable-via-zero > effort > legacy
@@ -166,13 +173,101 @@ export const createGoogleProvider = (
     yield* normalizeGoogleStream(stream as AsyncIterable<RawGoogleChunk>);
   };
 
+  // Structured output via FORCED function calling, mirroring the Anthropic /
+  // OpenAI paths: declare ONE function whose parameters are the desired JSON
+  // schema and pin `functionCallingConfig.mode = 'ANY'` with an allowlist of
+  // the one name, so the model MUST emit exactly that functionCall. Forced
+  // function calling, NOT `responseSchema` + `responseMimeType`, for leniency:
+  // responseSchema accepts only an OpenAPI subset and rejects some JSON Schema
+  // keywords the recap schemas use. Single round-trip (non-streaming).
+  const generateConstrained = async (req: ConstrainedRequest): Promise<ConstrainedResult> => {
+    if (req.tools !== undefined && req.tools.length > 0) {
+      throw new Error(
+        "google generateConstrained: 'tools' must be empty (forced schema tool only)",
+      );
+    }
+    const contents = req.messages.map(toGoogleContent);
+    const config: Record<string, unknown> = {
+      maxOutputTokens: req.max_tokens,
+      tools: [
+        {
+          functionDeclarations: [
+            {
+              name: req.output_schema_name,
+              description:
+                req.output_schema_description ??
+                'Emit the structured output for the constrained request.',
+              parameters: req.output_schema,
+            },
+          ],
+        },
+      ],
+      // Force exactly the schema function (no free-text, no other tool).
+      toolConfig: {
+        functionCallingConfig: { mode: 'ANY', allowedFunctionNames: [req.output_schema_name] },
+      },
+    };
+    if (req.system !== undefined) config.systemInstruction = req.system;
+    if (acceptsSampling && req.temperature !== undefined) config.temperature = req.temperature;
+    if (acceptsSampling && req.top_p !== undefined) config.topP = req.top_p;
+
+    const response = (await client.models.generateContent({
+      model: modelName,
+      contents,
+      config,
+    })) as {
+      candidates?: Array<{
+        finishReason?: string;
+        content?: { parts?: Array<{ functionCall?: { name?: string; args?: unknown } }> };
+      }>;
+      promptFeedback?: { blockReason?: string };
+      usageMetadata?: {
+        promptTokenCount?: number;
+        candidatesTokenCount?: number;
+        cachedContentTokenCount?: number;
+      };
+    };
+
+    // Forced mode returns exactly one matching functionCall. Walk defensively;
+    // a miss is a hard error — the caller (recap render) has no fallback here.
+    // Surface finishReason / blockReason so the likely causes are diagnosable
+    // rather than hidden behind a generic message: MAX_TOKENS = the budget was
+    // spent (thinking is ON by default on current Gemini models and counts
+    // toward maxOutputTokens), SAFETY / a blockReason = the response was
+    // filtered.
+    const call = response.candidates?.[0]?.content?.parts
+      ?.map((p) => p.functionCall)
+      .find((fc) => fc?.name === req.output_schema_name);
+    if (call?.args === undefined) {
+      const finish = response.candidates?.[0]?.finishReason ?? 'unknown';
+      const blocked = response.promptFeedback?.blockReason;
+      throw new Error(
+        `google constrained: model returned no functionCall for forced tool '${req.output_schema_name}' (finishReason=${finish}${blocked !== undefined ? `, blockReason=${blocked}` : ''})`,
+      );
+    }
+    // Usage convention MATCHES the streaming path (google/stream.ts):
+    // promptTokenCount INCLUDES cached, so input = prompt − cached; cache_read
+    // = cached; Gemini reports no cache-write, so cache_creation = 0.
+    const u = response.usageMetadata;
+    const prompt = u?.promptTokenCount ?? 0;
+    const cached = u?.cachedContentTokenCount ?? 0;
+    return {
+      output: JSON.stringify(call.args),
+      usage: {
+        input: Math.max(0, prompt - cached),
+        output: u?.candidatesTokenCount ?? 0,
+        cache_read: cached,
+        cache_creation: 0,
+      },
+    };
+  };
+
   return {
     id: `google/${modelName}`,
     family: 'google',
     capabilities: caps,
     generate,
-    generateConstrained: (_req: ConstrainedRequest): Promise<ConstrainedResult> =>
-      Promise.reject(new Error('generateConstrained not implemented for Google in M4.2')),
+    generateConstrained,
     countTokens: async (messages: ProviderMessage[]): Promise<number> => {
       const response = await client.models.countTokens({
         model: modelName,

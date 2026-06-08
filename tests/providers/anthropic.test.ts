@@ -525,3 +525,89 @@ describe('createAnthropicProvider', () => {
     expect(params.messages).toEqual([{ role: 'user', content: 'hello' }]);
   });
 });
+
+describe('createAnthropicProvider — 1h extended cache flag', () => {
+  let original: string | undefined;
+  beforeEach(() => {
+    original = process.env.FORJA_ANTHROPIC_CACHE_TTL;
+    delete process.env.FORJA_ANTHROPIC_CACHE_TTL;
+  });
+  afterEach(() => {
+    if (original === undefined) delete process.env.FORJA_ANTHROPIC_CACHE_TTL;
+    else process.env.FORJA_ANTHROPIC_CACHE_TTL = original;
+  });
+
+  test('default (5m): cache-write rate is the 5-minute tier', () => {
+    const p = createAnthropicProvider('claude-opus-4-7', { apiKey: 'sk-test' });
+    expect(p.capabilities.cost_per_1k_cache_write).toBe(6.25);
+  });
+
+  test('cacheTtl 1h swaps in the 1-hour write rate (so cost stays exact)', () => {
+    const p = createAnthropicProvider('claude-opus-4-7', { apiKey: 'sk-test', cacheTtl: '1h' });
+    expect(p.capabilities.cost_per_1k_cache_write).toBe(10);
+    // The shared ANTHROPIC_CAPS const must stay untouched — a default
+    // instance still reports the 5-minute rate.
+    const d = createAnthropicProvider('claude-opus-4-7', { apiKey: 'sk-test' });
+    expect(d.capabilities.cost_per_1k_cache_write).toBe(6.25);
+  });
+
+  test('FORJA_ANTHROPIC_CACHE_TTL=1h opts in without an explicit option', () => {
+    process.env.FORJA_ANTHROPIC_CACHE_TTL = '1h';
+    const p = createAnthropicProvider('claude-opus-4-7', { apiKey: 'sk-test' });
+    expect(p.capabilities.cost_per_1k_cache_write).toBe(10);
+  });
+
+  test('1h tags the request cache_control markers with ttl:1h', async () => {
+    const handle = mockClient([{ type: 'message_stop' }]);
+    const provider = createAnthropicProvider('claude-opus-4-7', {
+      client: handle.client,
+      cacheTtl: '1h',
+    });
+    for await (const _ of provider.generate({
+      model: 'claude-opus-4-7',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 8,
+      system: 'concise',
+    })) {
+      // drain
+    }
+    const params = handle.streamCalls[0]?.params as { system?: Array<{ cache_control?: unknown }> };
+    expect(params.system?.[0]?.cache_control).toEqual({ type: 'ephemeral', ttl: '1h' });
+  });
+
+  test('default request markers carry no ttl (5-minute)', async () => {
+    const handle = mockClient([{ type: 'message_stop' }]);
+    const provider = createAnthropicProvider('claude-opus-4-7', { client: handle.client });
+    for await (const _ of provider.generate({
+      model: 'claude-opus-4-7',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 8,
+      system: 'concise',
+    })) {
+      // drain
+    }
+    const params = handle.streamCalls[0]?.params as { system?: Array<{ cache_control?: unknown }> };
+    expect(params.system?.[0]?.cache_control).toEqual({ type: 'ephemeral' });
+  });
+
+  test('1h also tags the generateConstrained request markers (priced TTL == request TTL)', async () => {
+    const handle = mockClient([], undefined, {
+      content: [{ type: 'tool_use', id: 't1', name: 'render_recap_pr', input: {} }],
+      usage: { input_tokens: 5, output_tokens: 1 },
+    });
+    const provider = createAnthropicProvider('claude-opus-4-7', {
+      client: handle.client,
+      cacheTtl: '1h',
+    });
+    await provider.generateConstrained({
+      model: 'claude-opus-4-7',
+      messages: [{ role: 'user', content: 'x' }],
+      max_tokens: 64,
+      system: 'concise',
+      output_schema: { type: 'object' },
+      output_schema_name: 'render_recap_pr',
+    });
+    const params = handle.createCalls[0]?.params as { system?: Array<{ cache_control?: unknown }> };
+    expect(params.system?.[0]?.cache_control).toEqual({ type: 'ephemeral', ttl: '1h' });
+  });
+});

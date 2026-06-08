@@ -27,19 +27,46 @@ import type { ProviderCapabilities, UsageInfo } from './types.ts';
 //    explicitly. The fallback exists so undeclared / non-Anthropic
 //    providers (whose cache writes may not have a separate tier) don't
 //    crash, not as a substitute for declaring the real number.
-export const computeCost = (caps: ProviderCapabilities, usage: UsageInfo): number => {
+// Per-axis cost, so a caller can see WHERE the money went — not just the
+// total. Cache write (cache_creation) is the expensive axis: on Anthropic it
+// bills ~1.25× input (5-min) or 2× (1-hour), and read bills ~0.1×, so a
+// session with a healthy token hit-ratio can still be cost-dominated by cache
+// writes. `/stats` renders this to flag a cache-write spike — the symptom of
+// a prefix invalidator (reordered tools, a timestamp in the prefix, churned
+// memory) silently re-writing the cache every turn.
+export interface CostBreakdown {
+  inputCost: number;
+  outputCost: number;
+  cacheReadCost: number;
+  cacheWriteCost: number;
+  total: number;
+}
+
+export const computeCostBreakdown = (
+  caps: ProviderCapabilities,
+  usage: UsageInfo,
+): CostBreakdown => {
   const inputRate = caps.cost_per_1k_input;
   const outputRate = caps.cost_per_1k_output;
   const cacheReadRate = caps.cost_per_1k_cached_input ?? inputRate;
   const cacheWriteRate = caps.cost_per_1k_cache_write ?? inputRate;
-  return (
-    (usage.input * inputRate +
-      usage.output * outputRate +
-      usage.cache_read * cacheReadRate +
-      usage.cache_creation * cacheWriteRate) /
-    1_000_000
-  );
+  const inputCost = (usage.input * inputRate) / 1_000_000;
+  const outputCost = (usage.output * outputRate) / 1_000_000;
+  const cacheReadCost = (usage.cache_read * cacheReadRate) / 1_000_000;
+  const cacheWriteCost = (usage.cache_creation * cacheWriteRate) / 1_000_000;
+  return {
+    inputCost,
+    outputCost,
+    cacheReadCost,
+    cacheWriteCost,
+    total: inputCost + outputCost + cacheReadCost + cacheWriteCost,
+  };
 };
+
+// Total turn cost. Delegates to the breakdown so the rate math lives in ONE
+// place — the components and the total can never drift apart.
+export const computeCost = (caps: ProviderCapabilities, usage: UsageInfo): number =>
+  computeCostBreakdown(caps, usage).total;
 
 export const emptyUsage = (): UsageInfo => ({
   input: 0,

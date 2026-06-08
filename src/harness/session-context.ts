@@ -152,6 +152,10 @@ export class SessionContext {
     content: ProviderContentBlock[],
     usage: AssistantUsage,
     promptHash: string | null,
+    // Resolved provider reasoning-effort for the request that produced this
+    // turn (migration 074) — the per-call dimension for regression
+    // attribution. Null when no effort was resolved.
+    effort: string | null = null,
   ): string {
     const hasContent = content.length > 0;
     const msg = appendMessage(this.db, {
@@ -165,6 +169,7 @@ export class SessionContext {
       cacheCreationTokens: usage.usageSeen ? usage.cacheCreation : null,
       costUsd: usage.usageSeen ? usage.costUsd : null,
       promptHash,
+      effort,
     });
     this.lastMessageId = msg.id;
     if (hasContent) {

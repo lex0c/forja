@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import type OpenAI from 'openai';
-import { createOpenAIProvider } from '../../src/providers/openai/index.ts';
+import { createOpenAIProvider, openaiPromptCacheKey } from '../../src/providers/openai/index.ts';
 import type { RawOpenAIChunk } from '../../src/providers/openai/stream.ts';
+import type { GenerateRequest, ProviderToolDef } from '../../src/providers/types.ts';
 import type { StreamEvent } from '../../src/providers/types.ts';
 
 interface Call {
@@ -23,6 +24,23 @@ const mockClient = (chunks: RawOpenAIChunk[]): MockClientHandle => {
           return (async function* () {
             for (const c of chunks) yield c;
           })();
+        },
+      },
+    },
+  } as unknown as OpenAI;
+  return { client, createCalls };
+};
+
+// Non-streaming mock for the constrained path: `create` returns a plain
+// response object (choices + usage) instead of a chunk stream.
+const mockConstrainedClient = (response: unknown): MockClientHandle => {
+  const createCalls: Call[] = [];
+  const client = {
+    chat: {
+      completions: {
+        async create(params: unknown) {
+          createCalls.push({ params });
+          return response;
         },
       },
     },
@@ -67,17 +85,73 @@ describe('createOpenAIProvider', () => {
     expect(provider.capabilities.context_window).toBe(128_000);
   });
 
-  test('generateConstrained rejects (not implemented for OpenAI in M4.2)', async () => {
-    const provider = createOpenAIProvider('gpt-4o', { apiKey: 'sk-test' });
+  test('generateConstrained forces the named tool and returns its JSON arguments', async () => {
+    const handle = mockConstrainedClient({
+      choices: [
+        {
+          message: {
+            tool_calls: [{ function: { name: 'render_output', arguments: '{"ok":true}' } }],
+          },
+        },
+      ],
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 20,
+        prompt_tokens_details: { cached_tokens: 30 },
+      },
+    });
+    const provider = createOpenAIProvider('gpt-4o', { client: handle.client });
+    const result = await provider.generateConstrained({
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'x' }],
+      max_tokens: 64,
+      system: 'be precise',
+      output_schema: { type: 'object', properties: { ok: { type: 'boolean' } } },
+      output_schema_name: 'render_output',
+    });
+    expect(result.output).toBe('{"ok":true}');
+    // input = prompt(100) − cached(30) = 70; cache_read = 30; no cache write.
+    expect(result.usage).toEqual({ input: 70, output: 20, cache_read: 30, cache_creation: 0 });
+    const params = handle.createCalls[0]?.params as {
+      tool_choice?: unknown;
+      tools?: Array<{ function?: { name?: string } }>;
+    };
+    expect(params.tool_choice).toEqual({ type: 'function', function: { name: 'render_output' } });
+    expect(params.tools?.[0]?.function?.name).toBe('render_output');
+  });
+
+  test('generateConstrained throws with finish_reason when no matching tool_call', async () => {
+    const handle = mockConstrainedClient({
+      choices: [{ finish_reason: 'length', message: { tool_calls: [] } }],
+      usage: { prompt_tokens: 5, completion_tokens: 1 },
+    });
+    const provider = createOpenAIProvider('gpt-4o', { client: handle.client });
     await expect(
       provider.generateConstrained({
         model: 'gpt-4o',
-        messages: [{ role: 'user', content: 'hi' }],
-        max_tokens: 1,
+        messages: [{ role: 'user', content: 'x' }],
+        max_tokens: 64,
         output_schema: { type: 'object' },
         output_schema_name: 'render_output',
       }),
-    ).rejects.toThrow(/not implemented for OpenAI/);
+      // Surfaces the cause (ran out of max_tokens) — not a bare "no tool_call".
+    ).rejects.toThrow(/no tool_call for forced tool 'render_output' \(finish_reason=length\)/);
+  });
+
+  test('generateConstrained rejects when caller passes extra tools', async () => {
+    const handle = mockConstrainedClient({ choices: [], usage: {} });
+    const provider = createOpenAIProvider('gpt-4o', { client: handle.client });
+    await expect(
+      provider.generateConstrained({
+        model: 'gpt-4o',
+        messages: [{ role: 'user', content: 'x' }],
+        max_tokens: 64,
+        output_schema: { type: 'object' },
+        output_schema_name: 'render_output',
+        tools: [{ name: 'extra', description: 'd', input_schema: { type: 'object' } }],
+      }),
+    ).rejects.toThrow(/'tools' must be empty/);
+    expect(handle.createCalls).toHaveLength(0);
   });
 
   test('generate pipes the SDK stream through the canonical normalizer', async () => {
@@ -117,6 +191,108 @@ describe('createOpenAIProvider', () => {
     };
     expect(params.messages[0]).toEqual({ role: 'system', content: 'be brief' });
     expect(params.messages[1]).toEqual({ role: 'user', content: 'hi' });
+  });
+
+  const drain = async (
+    provider: ReturnType<typeof createOpenAIProvider>,
+    req: Parameters<typeof provider.generate>[0],
+  ) => {
+    for await (const _ of provider.generate(req)) {
+      // drain
+    }
+  };
+
+  test('uses max_tokens on a non-reasoning model (gpt-4o)', async () => {
+    const handle = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
+    const provider = createOpenAIProvider('gpt-4o', { client: handle.client });
+    await drain(provider, { model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }], max_tokens: 42 });
+    const params = handle.createCalls[0]?.params as {
+      max_tokens?: number;
+      max_completion_tokens?: number;
+    };
+    expect(params.max_tokens).toBe(42);
+    expect(params.max_completion_tokens).toBeUndefined();
+  });
+
+  // NB: the reasoning-model paths (max_completion_tokens, temperature/top_p
+  // stripping) are now exercised via the Responses API, not Chat Completions —
+  // gpt-5.x routes to client.responses (see openai-responses.test.ts). The
+  // Chat Completions sampling gate / max_completion_tokens handling remains as
+  // defensive code but no current model reaches it (reasoning → Responses,
+  // gpt-4o → Chat Completions with max_tokens + sampling).
+
+  test('forwards temperature/top_p on a sampling model (gpt-4o)', async () => {
+    const handle = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
+    const provider = createOpenAIProvider('gpt-4o', { client: handle.client });
+    await drain(provider, {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 1,
+      temperature: 0.5,
+      top_p: 0.9,
+    });
+    const params = handle.createCalls[0]?.params as { temperature?: number; top_p?: number };
+    expect(params.temperature).toBe(0.5);
+    expect(params.top_p).toBe(0.9);
+  });
+
+  test('sets prompt_cache_key on the request (real OpenAI, no custom baseURL)', async () => {
+    const handle = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
+    const provider = createOpenAIProvider('gpt-4o', { client: handle.client });
+    await drain(provider, {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 1,
+      system: 'be brief',
+    });
+    const params = handle.createCalls[0]?.params as { prompt_cache_key?: string };
+    expect(typeof params.prompt_cache_key).toBe('string');
+    expect(params.prompt_cache_key?.length).toBeGreaterThan(0);
+  });
+
+  test('omits prompt_cache_key when a custom baseURL is set (compat endpoint)', async () => {
+    const handle = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
+    const provider = createOpenAIProvider('gpt-4o', {
+      client: handle.client,
+      baseURL: 'https://compat.example/v1',
+    });
+    await drain(provider, {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 1,
+      system: 'be brief',
+    });
+    const params = handle.createCalls[0]?.params as { prompt_cache_key?: string };
+    expect(params.prompt_cache_key).toBeUndefined();
+  });
+
+  test('openaiPromptCacheKey is stable for the same prefix and order-independent on tools', () => {
+    const tools: ProviderToolDef[] = [
+      {
+        name: 'a',
+        description: 'A',
+        input_schema: { type: 'object', properties: { x: {}, y: {} } },
+      },
+    ];
+    const toolsReordered: ProviderToolDef[] = [
+      {
+        name: 'a',
+        description: 'A',
+        input_schema: { type: 'object', properties: { y: {}, x: {} } },
+      },
+    ];
+    const base: GenerateRequest = {
+      model: 'gpt-4o',
+      messages: [],
+      max_tokens: 1,
+      system: 's',
+      tools,
+    };
+    const k1 = openaiPromptCacheKey(base);
+    const k2 = openaiPromptCacheKey({ ...base, tools: toolsReordered });
+    expect(k1).toBe(k2); // same prefix, reordered tool-schema keys → same key
+    // A different system prompt yields a different key.
+    expect(openaiPromptCacheKey({ ...base, system: 'other' })).not.toBe(k1);
   });
 
   test('generate forwards tools, temperature, stop_sequences, and stream:true', async () => {

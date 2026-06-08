@@ -38,6 +38,17 @@ import type { ProviderContentBlock, ProviderMessage, SystemSegment } from '../ty
 
 const EPHEMERAL: Anthropic.CacheControlEphemeral = { type: 'ephemeral' };
 
+// Cache TTL: the default 5-minute ephemeral, or the 1-hour extended cache.
+// 1h survives longer inter-turn gaps (a dev session with pauses) so the
+// stable prefix isn't re-written on every >5min lapse — at the cost of a
+// 2× write premium (vs 1.25× for 5min). Opt-in; see anthropic/index.ts.
+export type CacheTtl = '5m' | '1h';
+
+// The cache_control marker for a TTL. 5m = the bare ephemeral marker
+// (Anthropic's default); 1h = the same with an explicit `ttl: '1h'`.
+export const cacheMarker = (ttl: CacheTtl): Anthropic.CacheControlEphemeral =>
+  ttl === '1h' ? { type: 'ephemeral', ttl: '1h' } : EPHEMERAL;
+
 // Convert `system: string | undefined` into Anthropic's TextBlockParam
 // array form with a cache_control marker on the (single) block.
 // Returns undefined when the system is empty/absent so the request
@@ -45,9 +56,10 @@ const EPHEMERAL: Anthropic.CacheControlEphemeral = { type: 'ephemeral' };
 // prompt persists "no prompt" rather than an empty one).
 export const systemWithCacheBreakpoint = (
   system: string | undefined,
+  marker: Anthropic.CacheControlEphemeral = EPHEMERAL,
 ): Anthropic.TextBlockParam[] | undefined => {
   if (system === undefined || system.length === 0) return undefined;
-  return [{ type: 'text', text: system, cache_control: EPHEMERAL }];
+  return [{ type: 'text', text: system, cache_control: marker }];
 };
 
 // Multi-segment variant. Each `SystemSegment` becomes its own
@@ -59,13 +71,14 @@ export const systemWithCacheBreakpoint = (
 // filter so callers fall back to the request's `system` string.
 export const systemSegmentsWithCacheBreakpoints = (
   segments: SystemSegment[],
+  marker: Anthropic.CacheControlEphemeral = EPHEMERAL,
 ): Anthropic.TextBlockParam[] | undefined => {
   const blocks: Anthropic.TextBlockParam[] = [];
   for (const seg of segments) {
     if (seg.text.length === 0) continue;
     blocks.push(
       seg.cacheBreakpoint
-        ? { type: 'text', text: seg.text, cache_control: EPHEMERAL }
+        ? { type: 'text', text: seg.text, cache_control: marker }
         : { type: 'text', text: seg.text },
     );
   }
@@ -79,10 +92,13 @@ export const systemSegmentsWithCacheBreakpoints = (
 // behavior; marking only the last one is intentional (one
 // breakpoint == one cache "level"; the request gets four total
 // across system/tools/messages).
-export const toolsWithCacheBreakpoint = (tools: Anthropic.Tool[]): Anthropic.Tool[] => {
+export const toolsWithCacheBreakpoint = (
+  tools: Anthropic.Tool[],
+  marker: Anthropic.CacheControlEphemeral = EPHEMERAL,
+): Anthropic.Tool[] => {
   if (tools.length === 0) return tools;
   const last = tools.length - 1;
-  return tools.map((t, i) => (i === last ? { ...t, cache_control: EPHEMERAL } : t));
+  return tools.map((t, i) => (i === last ? { ...t, cache_control: marker } : t));
 };
 
 // Conversation-tail cache anchor. Walks to the last message's last
@@ -99,6 +115,7 @@ export const toolsWithCacheBreakpoint = (tools: Anthropic.Tool[]): Anthropic.Too
 // the next read's cache.
 export const messagesWithTailCacheBreakpoint = (
   messages: { role: ProviderMessage['role']; content: string | ProviderContentBlock[] }[],
+  marker: Anthropic.CacheControlEphemeral = EPHEMERAL,
 ): Anthropic.MessageParam[] => {
   if (messages.length === 0) return messages as unknown as Anthropic.MessageParam[];
   const tailIdx = messages.length - 1;
@@ -119,7 +136,7 @@ export const messagesWithTailCacheBreakpoint = (
       }
       return {
         role: m.role,
-        content: [{ type: 'text', text: content, cache_control: EPHEMERAL }],
+        content: [{ type: 'text', text: content, cache_control: marker }],
       };
     }
     if (content.length === 0) return m as Anthropic.MessageParam;
@@ -130,7 +147,7 @@ export const messagesWithTailCacheBreakpoint = (
       // Anthropic SDK side. The cast spreads the ephemeral marker
       // without per-type branching; the SDK accepts cache_control
       // on text, tool_use, and tool_result blocks alike.
-      return { ...block, cache_control: EPHEMERAL };
+      return { ...block, cache_control: marker };
     });
     return { role: m.role, content: blocks } as Anthropic.MessageParam;
   });

@@ -1,4 +1,6 @@
+import { createHash } from 'node:crypto';
 import OpenAI from 'openai';
+import { stableStringify } from '../canonical-json.ts';
 // Shared chars/4 heuristic — see `src/providers/tokens.ts` for accuracy
 // bounds. OpenAI has no server-side countTokens endpoint until tiktoken
 // lands in M5.
@@ -31,6 +33,7 @@ export const openaiReasoningParam = (
   req.effort !== undefined && caps.supports_reasoning_effort === true
     ? { reasoning_effort: OPENAI_REASONING_EFFORT[req.effort] }
     : {};
+import { generateConstrainedViaResponses, generateViaResponses } from './responses.ts';
 import { type RawOpenAIChunk, normalizeOpenAIStream } from './stream.ts';
 
 export interface CreateOpenAIProviderOptions {
@@ -49,6 +52,19 @@ export interface CreateOpenAIProviderOptions {
   // with no options) can still opt out without code changes.
   includeUsage?: boolean;
 }
+
+// OpenAI `prompt_cache_key` (cache routing): requests sharing this key are
+// routed to the same backend, raising the automatic prefix-cache hit rate
+// (OpenAI's documented lever). Key off the STABLE prefix — system + tools —
+// so every turn of a session, and any other session with the same prefix,
+// routes together; that prefix is exactly what OpenAI caches. Stable across
+// turns (system/tools don't change within a session) and order-independent
+// (stableStringify on the tool list). One sha256 per request; cheap.
+export const openaiPromptCacheKey = (req: GenerateRequest): string =>
+  createHash('sha256')
+    .update(req.system ?? '')
+    .update(stableStringify(req.tools ?? []))
+    .digest('hex');
 
 // Resolve the `includeUsage` default from the environment for callers
 // who don't pass an explicit option (notably the registry factory used
@@ -175,6 +191,18 @@ export const createOpenAIProvider = (
   }
 
   const includeUsage = options.includeUsage ?? includeUsageFromEnv();
+  // Sampling gate (mirrors the Anthropic adapter). Reasoning models —
+  // OpenAI's o-series and gpt-5.x — REJECT `temperature`/`top_p` with HTTP
+  // 400 ("Unsupported parameter"). The capability opts those models out
+  // (`supports_sampling: false`); every other model keeps the canonical
+  // sampling surface. Applies to both the streaming and constrained paths.
+  const acceptsSampling = caps.supports_sampling !== false;
+  // The output-cap field name. Reasoning models (o-series, gpt-5.x) REJECT
+  // the legacy `max_tokens` and require `max_completion_tokens`; non-reasoning
+  // models (gpt-4o) still accept `max_tokens`. The reasoning capability is the
+  // proxy — it's exactly the set that renamed the field.
+  const maxTokensField =
+    caps.supports_reasoning_effort === true ? 'max_completion_tokens' : 'max_tokens';
 
   const generate = async function* (req: GenerateRequest): AsyncIterable<StreamEvent> {
     const messages: OpenAIMessage[] = [];
@@ -189,7 +217,7 @@ export const createOpenAIProvider = (
       model: modelName,
       messages,
       stream: true,
-      max_tokens: req.max_tokens,
+      [maxTokensField]: req.max_tokens,
     };
     if (includeUsage) {
       // Opt into the final-chunk usage payload so we can compute cost.
@@ -198,8 +226,15 @@ export const createOpenAIProvider = (
       params.stream_options = { include_usage: true };
     }
     if (req.tools !== undefined) params.tools = toOpenAITools(req.tools);
-    if (req.temperature !== undefined) params.temperature = req.temperature;
-    if (req.top_p !== undefined) params.top_p = req.top_p;
+    // Cache-routing hint — only to real OpenAI. A custom baseURL signals an
+    // OpenAI-compatible endpoint (Azure / OpenRouter / proxy) that may reject
+    // the unknown param with HTTP 400 (same caution as stream_options above);
+    // those endpoints have their own caching, if any, and lose nothing here.
+    if (options.baseURL === undefined) {
+      params.prompt_cache_key = openaiPromptCacheKey(req);
+    }
+    if (acceptsSampling && req.temperature !== undefined) params.temperature = req.temperature;
+    if (acceptsSampling && req.top_p !== undefined) params.top_p = req.top_p;
     // Determinism intent (`PLAYBOOKS.md` §1.1
     // `sampling.seed_in_eval`). OpenAI's `seed` param is
     // best-effort but documented as the canonical reproducibility
@@ -223,13 +258,119 @@ export const createOpenAIProvider = (
     yield* normalizeOpenAIStream(stream);
   };
 
+  // Structured output via FORCED tool calling, mirroring the Anthropic path
+  // (anthropic/index.ts generateConstrained): declare ONE function tool whose
+  // parameters are the desired JSON schema, force it with `tool_choice`, and
+  // read the model's tool-call arguments — already a JSON string. Forced tool
+  // calling, NOT strict `response_format: {type:'json_schema'}`, for leniency:
+  // strict json_schema rejects schemas that aren't fully strict (every field
+  // required, additionalProperties:false), which the recap schemas are not.
+  // Single round-trip (non-streaming), like the recap render path expects.
+  const generateConstrained = async (req: ConstrainedRequest): Promise<ConstrainedResult> => {
+    // Same guard as Anthropic: caller tools would let the model pick a
+    // different tool and defeat the schema binding. Reject up-front.
+    if (req.tools !== undefined && req.tools.length > 0) {
+      throw new Error(
+        "openai generateConstrained: 'tools' must be empty (forced schema tool only)",
+      );
+    }
+    const messages: OpenAIMessage[] = [];
+    if (req.system !== undefined) messages.push({ role: 'system', content: req.system });
+    for (const m of req.messages) messages.push(...toOpenAIMessages(m));
+
+    const params: Record<string, unknown> = {
+      model: modelName,
+      messages,
+      [maxTokensField]: req.max_tokens,
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: req.output_schema_name,
+            description:
+              req.output_schema_description ??
+              'Emit the structured output for the constrained request.',
+            parameters: req.output_schema,
+          },
+        },
+      ],
+      tool_choice: { type: 'function', function: { name: req.output_schema_name } },
+    };
+    // Cache-routing hint — real OpenAI only (a custom baseURL may 400 on it).
+    if (options.baseURL === undefined) params.prompt_cache_key = openaiPromptCacheKey(req);
+    if (acceptsSampling && req.temperature !== undefined) params.temperature = req.temperature;
+    if (acceptsSampling && req.top_p !== undefined) params.top_p = req.top_p;
+
+    const response = (await client.chat.completions.create(
+      params as unknown as Parameters<typeof client.chat.completions.create>[0],
+    )) as {
+      choices?: Array<{
+        finish_reason?: string;
+        message?: { tool_calls?: Array<{ function?: { name?: string; arguments?: string } }> };
+      }>;
+      usage?: {
+        prompt_tokens?: number;
+        completion_tokens?: number;
+        prompt_tokens_details?: { cached_tokens?: number };
+      } | null;
+    };
+
+    // With a named-function `tool_choice`, OpenAI returns exactly one matching
+    // tool_call. Walk defensively (don't index [0]); a miss is a hard error —
+    // the caller (recap render) has no fallback at this layer. Surface the
+    // `finish_reason` so the common causes are diagnosable rather than hidden
+    // behind a generic message: `length` = ran out of max_tokens before the
+    // call, `content_filter` = the response was blocked.
+    const toolCall = response.choices?.[0]?.message?.tool_calls?.find(
+      (c) => c.function?.name === req.output_schema_name,
+    );
+    if (toolCall?.function?.arguments === undefined) {
+      const finish = response.choices?.[0]?.finish_reason ?? 'unknown';
+      throw new Error(
+        `openai constrained: model returned no tool_call for forced tool '${req.output_schema_name}' (finish_reason=${finish})`,
+      );
+    }
+    // Usage convention MATCHES the streaming path (openai/stream.ts): OpenAI's
+    // prompt_tokens INCLUDES cached, so input = prompt − cached; cache_read =
+    // cached; OpenAI reports no cache-write, so cache_creation = 0.
+    const u = response.usage;
+    const prompt = u?.prompt_tokens ?? 0;
+    const cached = u?.prompt_tokens_details?.cached_tokens ?? 0;
+    return {
+      output: toolCall.function.arguments,
+      usage: {
+        input: Math.max(0, prompt - cached),
+        output: u?.completion_tokens ?? 0,
+        cache_read: cached,
+        cache_creation: 0,
+      },
+    };
+  };
+
+  // Reasoning models (gpt-5.x) route through the Responses API: Chat
+  // Completions 400s on tools+reasoning_effort for them. gpt-4o and other
+  // non-reasoning models stay on the Chat Completions path above. Decided per
+  // model (the capability), not per request.
+  const useResponses = caps.supports_reasoning_effort === true;
+  // Cache-routing hint for the Responses path — same lever the Chat Completions
+  // path uses, gated on a real-OpenAI baseURL (a custom endpoint may 400 on the
+  // unknown param). Computed here so responses.ts needn't import back into this
+  // module (cycle) and the baseURL gate stays in one place.
+  const responsesCacheKey = (req: GenerateRequest | ConstrainedRequest): string | undefined =>
+    options.baseURL === undefined ? openaiPromptCacheKey(req) : undefined;
+
   return {
     id: `openai/${modelName}`,
     family: 'openai',
     capabilities: caps,
-    generate,
-    generateConstrained: (_req: ConstrainedRequest): Promise<ConstrainedResult> =>
-      Promise.reject(new Error('generateConstrained not implemented for OpenAI in M4.2')),
+    generate: useResponses
+      ? (req: GenerateRequest) =>
+          generateViaResponses(client, modelName, caps, req, responsesCacheKey(req))
+      : generate,
+    generateConstrained: useResponses
+      ? (req: ConstrainedRequest) =>
+          generateConstrainedViaResponses(client, modelName, caps, req, responsesCacheKey(req))
+      : generateConstrained,
     countTokens: (messages: ProviderMessage[]): Promise<number> =>
       Promise.resolve(estimateMessagesTokens(messages)),
   };

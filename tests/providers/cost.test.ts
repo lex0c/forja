@@ -1,5 +1,10 @@
 import { describe, expect, test } from 'bun:test';
-import { addUsage, computeCost, emptyUsage } from '../../src/providers/cost.ts';
+import {
+  addUsage,
+  computeCost,
+  computeCostBreakdown,
+  emptyUsage,
+} from '../../src/providers/cost.ts';
 import type { ProviderCapabilities } from '../../src/providers/types.ts';
 
 const baseCaps = (overrides: Partial<ProviderCapabilities> = {}): ProviderCapabilities => ({
@@ -111,5 +116,30 @@ describe('addUsage', () => {
     const u = { input: 7, output: 3, cache_read: 1, cache_creation: 0 };
     expect(addUsage(u, emptyUsage())).toEqual(u);
     expect(addUsage(emptyUsage(), u)).toEqual(u);
+  });
+});
+
+describe('computeCostBreakdown', () => {
+  test('splits cost by axis; total equals computeCost (no drift)', () => {
+    const caps = baseCaps({ cost_per_1k_cache_write: 3.75 });
+    const usage = { input: 1000, output: 100, cache_read: 2000, cache_creation: 500 };
+    const bd = computeCostBreakdown(caps, usage);
+    expect(bd.inputCost).toBeCloseTo(0.003, 10); // 1000 * 3 / 1e6
+    expect(bd.outputCost).toBeCloseTo(0.0015, 10); // 100 * 15 / 1e6
+    expect(bd.cacheReadCost).toBeCloseTo(0.0006, 10); // 2000 * 0.3 / 1e6
+    expect(bd.cacheWriteCost).toBeCloseTo(0.001875, 10); // 500 * 3.75 / 1e6
+    // The total must match computeCost exactly — they share the rate math.
+    expect(bd.total).toBeCloseTo(computeCost(caps, usage), 12);
+  });
+
+  test('cache write falls back to the input rate when no write rate is declared', () => {
+    const caps = baseCaps(); // no cost_per_1k_cache_write → uses input rate 3
+    const bd = computeCostBreakdown(caps, {
+      input: 0,
+      output: 0,
+      cache_read: 0,
+      cache_creation: 1000,
+    });
+    expect(bd.cacheWriteCost).toBeCloseTo(0.003, 10); // 1000 * 3 / 1e6
   });
 });

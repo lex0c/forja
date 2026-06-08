@@ -14,7 +14,7 @@ The root stance (`AGENTIC_CLI.md §5`):
 
 > **Cost is the engagement gate; step count is the runaway-loop backstop.**
 
-So `maxCostUsd` (default **$5**) is the knob that says "how much work is this run worth"; `maxSteps` (default **200**) and the degenerate-loop / stall / wall-clock guards exist to stop pathology, not to size the task.
+So `maxCostUsd` (default **$100**) is the knob that says "how much work is this run worth"; `maxSteps` (default **200**) and the degenerate-loop / stall / wall-clock guards exist to stop pathology, not to size the task.
 
 ---
 
@@ -26,7 +26,7 @@ All defaults are in `DEFAULT_BUDGET` (`src/harness/types.ts`).
 
 | Cap | Default | Trigger → exit |
 |---|---|---|
-| `maxCostUsd` | `$5` | cumulative cost crosses the cap (checked per cost-increasing event: provider turn + compaction) → `maxCostUsd`. Compared with `>`, so `0` = no spend allowed. Cumulative **across resumes** (counts prior session cost). Three states — see §6. |
+| `maxCostUsd` | `$100` | cumulative cost crosses the cap (checked per cost-increasing event: provider turn + compaction) → `maxCostUsd`. Compared with `>`, so `0` = no spend allowed. Cumulative **across resumes** (counts prior session cost). Three states — see §6. |
 | `softCostUsd` | unset | cumulative cost crosses it → emits `cost_soft_cap_warn` **once**; does **not** terminate. Mainly a subagent regression signal (§7). |
 
 ### Runaway backstops
@@ -36,7 +36,7 @@ All defaults are in `DEFAULT_BUDGET` (`src/harness/types.ts`).
 | `maxSteps` | `200` | `steps >= maxSteps` → `maxSteps`. Backstop, not a task sizer. |
 | `maxRepeatedToolHash` | `3` | N identical tool-call hashes within the last-5 sliding window → `degenerateLoop`. |
 | `maxToolErrors` | `5` | that many **consecutive** tool errors → `maxToolErrors`. |
-| `maxWallClockMs` | `600000` (10 min) | session-wide timer (`setTimeout` → abort) → `maxWallClockMs`. |
+| `maxWallClockMs` | `3600000` (1 h) | session-wide timer (`setTimeout` → abort) → `maxWallClockMs`. |
 | `maxStepStallMs` | `90000` (90 s) | a single step's provider stream is silent (no text/thinking/tool/stop delta) for this long → `stepStalled`. `0` disables the watchdog. |
 
 ### Concurrency (throttle, not exit)
@@ -143,7 +143,7 @@ Concurrency caps (`maxConcurrentToolCalls`, `maxConcurrentSubagents`) and per-ca
 
 `maxCostUsd` has **three states**, distinguished so a partial override can carry an explicit opt-out through the spread merge:
 
-- **absent** → merge picks up `DEFAULT_BUDGET.maxCostUsd` (`$5`).
+- **absent** → merge picks up `DEFAULT_BUDGET.maxCostUsd` (`$100`).
 - **`undefined`** → operator opted out (`/budget cost off`); the loop skips the cost gate entirely.
 - **a number** → that exact cap (`0` means no spend permitted).
 

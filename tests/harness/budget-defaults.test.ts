@@ -9,8 +9,8 @@ import { DEFAULT_BUDGET } from '../../src/harness/types.ts';
 // surfacing as a soft regression in cost or session length.
 
 describe('DEFAULT_BUDGET (slice C — cost-primary posture)', () => {
-  test('maxCostUsd is 5 USD (AGENTIC_CLI.md §5 line 333)', () => {
-    expect(DEFAULT_BUDGET.maxCostUsd).toBe(5);
+  test('maxCostUsd is 100 USD', () => {
+    expect(DEFAULT_BUDGET.maxCostUsd).toBe(100);
   });
 
   test('maxSteps is the 200 backstop, not the old 50 engagement gate', () => {
@@ -30,7 +30,7 @@ describe('DEFAULT_BUDGET (slice C — cost-primary posture)', () => {
     // budget across multiple objects doesn't silently drop the
     // default.
     const merged = { ...DEFAULT_BUDGET, maxSteps: 10 };
-    expect(merged.maxCostUsd).toBe(5);
+    expect(merged.maxCostUsd).toBe(100);
     expect(merged.maxSteps).toBe(10);
   });
 
@@ -39,7 +39,7 @@ describe('DEFAULT_BUDGET (slice C — cost-primary posture)', () => {
     // must propagate the explicit undefined so the loop's
     // `=== undefined` check skips the gate. If this regresses, an
     // operator who clears the cap silently still gets billed
-    // against the 5 USD default.
+    // against the default cap.
     const merged = { ...DEFAULT_BUDGET, maxCostUsd: undefined };
     expect(merged.maxCostUsd).toBeUndefined();
   });
@@ -48,7 +48,7 @@ describe('DEFAULT_BUDGET (slice C — cost-primary posture)', () => {
     // Cost being the primary gate doesn't disable the runaway
     // safeguards — wall clock, tool errors, and the degenerate
     // loop hash window still defend against pathological runs.
-    expect(DEFAULT_BUDGET.maxWallClockMs).toBe(10 * 60 * 1000);
+    expect(DEFAULT_BUDGET.maxWallClockMs).toBe(60 * 60 * 1000);
     expect(DEFAULT_BUDGET.maxToolErrors).toBe(5);
     expect(DEFAULT_BUDGET.maxRepeatedToolHash).toBe(3);
   });

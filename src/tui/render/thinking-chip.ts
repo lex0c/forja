@@ -26,8 +26,8 @@
 // our adapter layer; the cumulative `usage` event arrives once at
 // message_stop with the total. Showing a fake count during the
 // thinking pass would mislead the operator about progress.
-// Cost is shown in the footer's right column (status.costUsd) and
-// updates per step:budget — not duplicated here.
+// Cost is shown in the footer's right column (status.sessionTotalCostUsd,
+// DB-derived via stats:refresh) — not duplicated here.
 //
 // Mutual exclusion with the assistant chip: harness-adapter.ts
 // closes `thinking:end` when text starts streaming
