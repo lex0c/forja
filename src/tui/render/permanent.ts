@@ -14,7 +14,7 @@ import { sanitizeOneLineForDisplay } from '../../sanitize/ansi.ts';
 import type { PermanentItem } from '../state.ts';
 import { type Capabilities, paint, paintMulti, reverse } from '../term.ts';
 import { formatChipDuration, formatCoarseDuration } from './duration.ts';
-import { FRAME_MARGIN, frameWidth, padFrame } from './frame.ts';
+import { padFrame } from './frame.ts';
 import { ellipsisGlyph, subContentConnector, treeBranchConnector } from './glyphs.ts';
 import { renderMarkdown } from './markdown.ts';
 import { visualWidth } from './width.ts';
@@ -169,10 +169,11 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
     case 'user-submit': {
       // UI.md §4.10.8 — inverse bar acts as a structural divider in
       // scrollback (rolling back, the bars locate turns without
-      // inventing headings). The frame margin (§6.3) sits OUTSIDE the
-      // SGR 7 wrap: 2sp of normal-bg space, then the inverse bar
-      // from col 2 to col cols-1. The bar is padded internally to
-      // `cols - 2` so the inverse extends to the right edge.
+      // inventing headings). Unlike the rest of the frame (§6.3), this
+      // bar goes edge-to-edge from col 0: no FRAME_MARGIN outside the
+      // SGR 7 wrap, padded internally to the full `cols` so the inverse
+      // spans the whole width — like the input box, it's a focal band,
+      // not indented content.
       //
       // Leading blank line per UI.md §6.3 ("1 blank line entre blocos
       // permanentes") — separates the new turn from whatever came
@@ -181,14 +182,14 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // turn rhythm becomes `Done. → blank → > prompt → content`,
       // which scans cleanly when the operator scrolls.
       const prefixed = item.text.split('\n').map((l, i) => (i === 0 ? `> ${l}` : `  ${l}`));
-      const innerWidth = frameWidth(caps);
+      const innerWidth = caps.cols;
       const bars = prefixed.map((line) => {
         // padEnd pads code units; for plain ASCII text that matches
         // visual columns. CJK / emoji content would over-pad —
         // accept the small inconsistency until visualWidth-aware
         // padding lands (no producer emits multi-col text today).
         const padded = line + ' '.repeat(Math.max(0, innerWidth - visualWidth(line)));
-        return `${FRAME_MARGIN}${reverse(padded)}`;
+        return reverse(padded);
       });
       return [padFrame(''), ...bars];
     }

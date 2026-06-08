@@ -206,30 +206,28 @@ describe('formatPermanent', () => {
 
   describe('user-submit (inverse bar, UI.md §4.10.8)', () => {
     // SGR 7 (reverse) emits unconditionally — it's an attribute, not
-    // a color (works under NO_COLOR). Each line is padded internally
-    // to `cols - 2` (frame margin §6.3) before reversal so the bar
-    // runs from col 2 to col cols-1. The 2sp prefix is OUTSIDE the
-    // SGR 7 wrap (normal-bg space, not inverse) so the bar starts
-    // visibly at col 2, aligned with the rest of the padded content.
+    // a color (works under NO_COLOR). Unlike the rest of the frame, the
+    // bar goes edge-to-edge from col 0: NO frame margin outside the SGR
+    // 7 wrap, and each line is padded internally to the full `cols` so
+    // the inverse spans the whole width (like the input box).
     //
     // Leading blank line per UI.md §6.3 — separates each turn from
     // the previous one (Done. → blank → > prompt). out[0] is the
     // blank (just the frame margin); out[1..] are the inverse bars.
     const REVERSE_OPEN = '\x1b[7m';
     const RESET = '\x1b[0m';
-    // Line shape: '  ' (frame margin) + REVERSE_OPEN + content + RESET.
+    // Line shape: REVERSE_OPEN + content + RESET (no frame margin).
     // Helper strips the wrap to inspect the inner padded content.
-    const innerOf = (line: string): string =>
-      line.slice('  '.length + REVERSE_OPEN.length, -RESET.length);
+    const innerOf = (line: string): string => line.slice(REVERSE_OPEN.length, -RESET.length);
 
-    test('emits leading blank + reversed (cols-2)-padded content', () => {
+    test('emits leading blank + reversed full-width-padded content', () => {
       const out = formatPermanent({ kind: 'user-submit', text: 'hi' }, ascii);
       expect(out).toHaveLength(2);
       expect(out[0]).toBe(pad(''));
       const line = out[1] ?? '';
-      expect(line.startsWith(`  ${REVERSE_OPEN}`)).toBe(true);
+      expect(line.startsWith(REVERSE_OPEN)).toBe(true);
       expect(line.endsWith(RESET)).toBe(true);
-      expect(innerOf(line)).toBe('> hi'.padEnd(ascii.cols - 2));
+      expect(innerOf(line)).toBe('> hi'.padEnd(ascii.cols));
     });
 
     test('multi-line submit: blank + first line with `>`, continuations with `  `', () => {
@@ -238,13 +236,13 @@ describe('formatPermanent', () => {
       expect(out[0]).toBe(pad(''));
       const inners = out.slice(1).map(innerOf);
       expect(inners).toEqual([
-        '> first'.padEnd(ascii.cols - 2),
-        '  second'.padEnd(ascii.cols - 2),
-        '  third'.padEnd(ascii.cols - 2),
+        '> first'.padEnd(ascii.cols),
+        '  second'.padEnd(ascii.cols),
+        '  third'.padEnd(ascii.cols),
       ]);
-      // Each bar line independently wrapped in frame margin + SGR 7 + reset.
+      // Each bar line independently wrapped in SGR 7 + reset, edge-to-edge.
       for (const l of out.slice(1)) {
-        expect(l.startsWith(`  ${REVERSE_OPEN}`)).toBe(true);
+        expect(l.startsWith(REVERSE_OPEN)).toBe(true);
         expect(l.endsWith(RESET)).toBe(true);
       }
     });
