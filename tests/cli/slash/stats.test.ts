@@ -113,6 +113,8 @@ describe('/stats', () => {
     expect(text).toContain('out 2,500');
     expect(text).toContain('cache read 3,500');
     expect(text).toContain('write 500');
+    // cache hit = read 3,500 / (in 6,000 + read 3,500 + write 500) = 35%.
+    expect(text).toContain('35% hit');
     // scope counts root + subagent
     expect(text).toContain('2 sessions');
     // no lower-bound marker when usage is complete

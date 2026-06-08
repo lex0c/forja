@@ -10,7 +10,7 @@ import {
   markSessionUsageIncomplete,
   updateSessionCost,
 } from '../../../src/storage/repos/sessions.ts';
-import { computeUsageStats } from '../../../src/storage/repos/stats.ts';
+import { cacheHitRatio, computeUsageStats } from '../../../src/storage/repos/stats.ts';
 
 let db: DB;
 
@@ -186,5 +186,40 @@ describe('computeUsageStats', () => {
     const s = computeUsageStats(db, [root.id]);
     expect(s.costUsd).toBeCloseTo(0.123, 9);
     expect(s.usageComplete).toBe(true);
+  });
+});
+
+describe('cacheHitRatio', () => {
+  const stats = (over: Partial<Parameters<typeof cacheHitRatio>[0]>) => ({
+    costUsd: 0,
+    tokensIn: 0,
+    tokensOut: 0,
+    cacheRead: 0,
+    cacheCreation: 0,
+    usageComplete: true,
+    sessionCount: 0,
+    ...over,
+  });
+
+  test('cache reads over total input (output excluded)', () => {
+    // cacheRead 3500 / (input 6000 + read 3500 + creation 500) = 0.35
+    expect(
+      cacheHitRatio(stats({ tokensIn: 6000, cacheRead: 3500, cacheCreation: 500 })),
+    ).toBeCloseTo(0.35, 10);
+  });
+
+  test('output does not affect the ratio', () => {
+    const a = cacheHitRatio(stats({ tokensIn: 100, cacheRead: 100 }));
+    const b = cacheHitRatio(stats({ tokensIn: 100, cacheRead: 100, tokensOut: 9999 }));
+    expect(a).toBe(b);
+    expect(a).toBeCloseTo(0.5, 10);
+  });
+
+  test('first turn (all cache_creation, no reads) is 0%', () => {
+    expect(cacheHitRatio(stats({ tokensIn: 1000, cacheCreation: 2000 }))).toBe(0);
+  });
+
+  test('no input yet → 0 (no division by zero)', () => {
+    expect(cacheHitRatio(stats({ tokensOut: 500 }))).toBe(0);
   });
 });

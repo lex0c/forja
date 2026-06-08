@@ -15,7 +15,7 @@
 // usage report on some turn, so the totals are a lower bound — marked
 // with a leading `~` and an explanatory footnote.
 
-import { computeUsageStats } from '../../../storage/index.ts';
+import { cacheHitRatio, computeUsageStats } from '../../../storage/index.ts';
 import { formatCost } from '../format.ts';
 import type { SlashCommand } from '../types.ts';
 
@@ -47,11 +47,16 @@ export const statsCommand: SlashCommand = {
     const total = compute + cache;
     // Lower-bound marker when any turn in scope reported no usage.
     const lb = s.usageComplete ? '' : '~';
+    // Cache effectiveness: cache reads over all input tokens (see
+    // cacheHitRatio). A higher % = more of the prompt prefix is being served
+    // from cache instead of reprocessed at full input cost.
+    const hitPct = Math.round(cacheHitRatio(s) * 100);
     const notes: string[] = [
       'session stats (this REPL, incl. subagents):',
       `  cost:   ${lb}${formatCost(s.costUsd)}`,
       `  tokens: ${lb}${groupThousands(total)} (compute ${groupThousands(compute)} · cache ${groupThousands(cache)})`,
       `          in ${groupThousands(s.tokensIn)} · out ${groupThousands(s.tokensOut)} · cache read ${groupThousands(s.cacheRead)} · write ${groupThousands(s.cacheCreation)}`,
+      `  cache:  ${hitPct}% hit`,
       `  scope:  ${s.sessionCount} session${s.sessionCount === 1 ? '' : 's'}`,
     ];
     if (!s.usageComplete) {

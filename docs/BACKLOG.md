@@ -2,7 +2,11 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
-## [2026-06-07] `/compact` deixava o footer stale + fix de regressão latente do `/cost`
+## [2026-06-07] Auditoria de prompt-cache + `cache_hit_ratio` no `/stats`
+
+**Auditoria (10 estratégias de cache hit por prefixo estável):** a Forja já está acima da baseline — `cache_control` breakpoints explícitos na Anthropic (`anthropic/cache.ts`, 4 breakpoints com guard de máx), ordem determinística (tools array fixo, memory por SCOPE_ORDER+dedup, skills sorted-by-name), data calculada 1× no boot (e cache efêmero de 5min torna a invalidação diária irrelevante), e compaction de tool output (`output-summarizer.ts`, raw no audit). Gaps reais: (1) `cache_hit_ratio` não computado; (2) Gemini explicit caching não implementado; (3) sem JSON canônico (latente, documentado em `seed.ts:37-43`).
+
+**Fechado o gap (1):** novo `cacheHitRatio(stats)` em `storage/repos/stats.ts` = `cache_read / (cache_read + input + cache_creation)` (output excluído; denominador inclui cache_creation → turno 1 lê 0% e sobe conforme reusa o prefixo; 0 quando não há input). Exibido no `/stats` como `cache: N% hit`. Derivado de `UsageStats`, não armazenado. Testes: razão (output não afeta, turno-1 = 0%, sem divisão-por-zero) + asserção no `/stats`. Gaps (2)/(3) viram tasks #7/#8.
 
 **Bug (review):** o footer agora é SET só via `stats:refresh` (Estágio 2). O `/compact` muta os totais persistidos (custo via `updateSessionCost` + tokens via `compaction_events`) mas não emitia `stats:refresh` → os chips do footer ficavam stale até o próximo turno/playbook, mesmo com `/stats` e `/cost` já reportando os novos totais do DB. **Fix:** novo `refreshStats?: () => void` na `SlashContext`, ligado no REPL ao `emitStatsRefresh` (mesma recomputação dos boundaries); o `/compact` chama `ctx.refreshStats?.()` após gravar custo+tokens. Teste com spy confirma a chamada após compaction faturada.
 

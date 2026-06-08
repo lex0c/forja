@@ -53,6 +53,17 @@ const emptyStats = (): UsageStats => ({
   sessionCount: 0,
 });
 
+// Fraction of the INPUT side served from prompt cache: cache reads over all
+// input tokens (non-cached input + cache reads + cache writes). Output is
+// excluded — it isn't cached. Denominator includes cache_creation so the
+// first turn (which writes the cache but reads nothing) reads as 0% and the
+// ratio climbs as later turns reuse the prefix. Returns 0 when there is no
+// input yet (avoids 0/0). Derived from UsageStats, not stored — a pure view.
+export const cacheHitRatio = (stats: UsageStats): number => {
+  const inputTotal = stats.tokensIn + stats.cacheRead + stats.cacheCreation;
+  return inputTotal === 0 ? 0 : stats.cacheRead / inputTotal;
+};
+
 export const computeUsageStats = (db: DB, rootSessionIds: readonly string[]): UsageStats => {
   const stats = emptyStats();
   const seen = new Set<string>();
