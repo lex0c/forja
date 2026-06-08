@@ -2,6 +2,21 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-07] Flag opt-in: cache Anthropic de 1 hora (all-1h, default-off)
+
+**Motivação:** cache write = ~47% do custo de uma sessão real (100% parent, prefixo estável de 9M tokens). O write caro vem de **expiry de 5min** nas pausas de dev — que o cache de 1h elimina (prefixo sobrevive → re-write vira read). Trade-off: write de 1h custa **2× input** vs 1.25× do 5min, então só ganha com pausas >5min frequentes; pode **piorar** sessão de turnos rápidos. Logo: **opt-in, default-off**.
+
+**Design — all-1h, não misto:** TTL misto tornaria o `cache_creation` único do response **inatribuível a um rate** → cost accounting quebraria. all-1h mantém rate único (2×) → cost exato, e mantém o **contexto inteiro** vivo (é ele que você quer preservar, não só o system).
+
+**Impl:**
+- `cache.ts`: `cacheMarker(ttl)` + os 4 helpers de breakpoint aceitam `marker` (default 5m, back-compat).
+- `anthropic/index.ts`: option `cacheTtl` + fallback env `FORJA_ANTHROPIC_CACHE_TTL` (só `'1h'` opta; resto = 5m). Quando 1h, **clona** as capabilities com `cost_per_1k_cache_write = cost_per_1k_cache_write_1h` (NÃO muta o const compartilhado) → `computeCost`/breakdown do `/stats` ficam exatos.
+- `types.ts` + `capabilities.ts`: campo `cost_per_1k_cache_write_1h` (Opus 10, Sonnet 6, Haiku 2 = 2× input).
+
+**A/B (o payoff do #11/#12):** roda sessão típica com `FORJA_ANTHROPIC_CACHE_TTL` unset, depois `=1h`, e compara `cache write` no `/stats`. Decide no dado.
+
+**Provado:** `anthropic-cache.test.ts` (+3: cacheMarker 5m/1h, propagação aos 4 helpers) + `anthropic.test.ts` (+5: rate efetivo 1h vs 5m, const intocado, env opt-in, markers do request com/sem ttl). providers 224/224, harness 359/359, typecheck + lint limpos. (Follow-up: documentar a env em PROVIDERS.md — spec edit precisa de pedido explícito.)
+
 ## [2026-06-07] Atribuição de cache write por fonte + write amplification no `/stats`
 
 **Insight (operador):** cache write = 47% do custo; "qual fonte?" é o lever pra cortar. **Limite físico honesto:** o provider devolve UM `cache_creation` por resposta — não atribui a escrita a um content block, então sub-dividir uma sessão por seção de prompt (memory/project/session) NÃO é mensurável. **O que dá** (registros/sessões distintos já persistidos): **parent** (sessões `is_subagent=0`), **subagent** (`is_subagent=1`), **compaction** (`compaction_events.call_cache_creation`, persistido em `04e7ad25`). 3 buckets disjuntos que somam o `cacheCreation` total.

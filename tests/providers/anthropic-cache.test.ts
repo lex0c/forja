@@ -3,6 +3,7 @@ import type Anthropic from '@anthropic-ai/sdk';
 import {
   ANTHROPIC_CACHE_EPHEMERAL,
   MAX_CACHE_BREAKPOINTS_PER_REQUEST,
+  cacheMarker,
   countCacheBreakpoints,
   messagesWithTailCacheBreakpoint,
   systemSegmentsWithCacheBreakpoints,
@@ -27,6 +28,37 @@ const userMsg = (
 ): { role: ProviderMessage['role']; content: string | ProviderContentBlock[] } => ({
   role: 'user',
   content,
+});
+
+describe('cacheMarker', () => {
+  test('5m is the bare ephemeral marker (no ttl)', () => {
+    expect(cacheMarker('5m')).toEqual({ type: 'ephemeral' });
+  });
+
+  test('1h carries an explicit ttl', () => {
+    expect(cacheMarker('1h')).toEqual({ type: 'ephemeral', ttl: '1h' });
+  });
+
+  test('the marker propagates to every breakpoint helper', () => {
+    const m = cacheMarker('1h');
+    const sys = systemWithCacheBreakpoint('SYS', m);
+    expect(sys?.[0]?.cache_control).toEqual({ type: 'ephemeral', ttl: '1h' });
+    const tools = toolsWithCacheBreakpoint([tool('grep')], m);
+    expect(tools[0]?.cache_control).toEqual({ type: 'ephemeral', ttl: '1h' });
+    const segs = systemSegmentsWithCacheBreakpoints(
+      [{ id: 'stable', text: 'stable', cacheBreakpoint: true }],
+      m,
+    );
+    expect(segs?.[0]?.cache_control).toEqual({ type: 'ephemeral', ttl: '1h' });
+    const tail = messagesWithTailCacheBreakpoint([userMsg('hi')], m);
+    const block = tail[0]?.content;
+    if (Array.isArray(block)) {
+      expect((block[0] as { cache_control?: unknown }).cache_control).toEqual({
+        type: 'ephemeral',
+        ttl: '1h',
+      });
+    }
+  });
 });
 
 describe('systemWithCacheBreakpoint', () => {
