@@ -23,6 +23,7 @@ import {
   parseCapability,
 } from '../permissions/capabilities.ts';
 import { createDegradedBannerEmitter } from '../permissions/degraded-banner.ts';
+import { canonicalizeObject } from '../providers/canonical-json.ts';
 import { addUsage, computeCost, emptyUsage } from '../providers/cost.ts';
 import type {
   GenerateRequest,
@@ -2657,7 +2658,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             type: 'tool_use',
             id: tu.id,
             name: tu.name,
-            input: tu.input,
+            // Canonicalize the arg keys at the single point they enter
+            // history, so this block serializes to byte-stable bytes in
+            // every later request (all providers + resume) — a stable
+            // cache prefix. Key order is semantically irrelevant, so this
+            // never changes what the model or the tool sees.
+            input: canonicalizeObject(tu.input),
           };
           assistantContent.push(block);
         }

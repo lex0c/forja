@@ -2,6 +2,14 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-07] Canonical JSON pros bytes prompt-bound (fecha risco latente de cache)
+
+**Risco (auditoria de cache, estratégia #5):** os bytes do prefixo dependiam de insertion-order do JS, não de JSON canônico — o próprio `seed.ts:37-43` avisava ("works today... switch to canonical if a call site spreads partials"). Args de tool_use são objetos (`ProviderToolUseBlock.input`) ecoados em todo request seguinte; se a ordem das chaves driftasse (refactor com spread, hydrate-from-DB que reconstrói), os bytes mudavam e invalidavam o prefixo cacheado.
+
+**Fix:** novo `src/providers/canonical-json.ts` (`sortKeysDeep`/`stableStringify`/`canonicalizeObject` — ordena chaves de objeto recursivamente, preserva ordem de array, passthrough de primitivos). Aplicado em **dois** pontos: (1) `seed.ts` (o TODO documentado — seed agora order-independent); (2) **ponto único de captura** `loop.ts:2660` — canonicaliza o `input` do tool_use quando entra no histórico, então serializa byte-estável em todo request posterior (todos os providers + resume + subagentes, que passam pelo mesmo loop) sem espalhar por adapter. Key order é semanticamente irrelevante → nunca muda o que o modelo/tool vê. (`:315` é output de structured-gen e `google/stream:149` é evento de stream — não são prefixo, deixados.)
+
+**Provado:** `tests/providers/canonical-json.test.ts` (order-independence, nested, array preserva ordem, primitivos, paridade de duas ordenações dos mesmos args). typecheck + lint limpos; harness 359/359, providers 211/211, storage 839/839 (canonicalização do args persistido não quebrou nada — toEqual ignora ordem de chave).
+
 ## [2026-06-07] Auditoria de prompt-cache + `cache_hit_ratio` no `/stats`
 
 **Auditoria (10 estratégias de cache hit por prefixo estável):** a Forja já está acima da baseline — `cache_control` breakpoints explícitos na Anthropic (`anthropic/cache.ts`, 4 breakpoints com guard de máx), ordem determinística (tools array fixo, memory por SCOPE_ORDER+dedup, skills sorted-by-name), data calculada 1× no boot (e cache efêmero de 5min torna a invalidação diária irrelevante), e compaction de tool output (`output-summarizer.ts`, raw no audit). Gaps reais: (1) `cache_hit_ratio` não computado; (2) Gemini explicit caching não implementado; (3) sem JSON canônico (latente, documentado em `seed.ts:37-43`).
