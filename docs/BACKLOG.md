@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-07] Cost breakdown por eixo no `/stats` (onde o dinheiro foi)
+
+**Insight (sessão real):** numa sessão, **cache write foi ~47% do custo** (o eixo dominante), não inferência — mas o `cache_hit_ratio` (token-based, #6) lia ~92% (saudável). São lentes diferentes: write custa 12.5× read por token ($6.25 vs $0.50/MTok no Opus), então um read:write em tokens bom ainda vira custo write-dominado. O hit ratio mostra "o cache pega?"; faltava "pra onde o dinheiro foi?".
+
+**Fix:** `computeCostBreakdown(caps, usage)` em `providers/cost.ts` retorna `{inputCost, outputCost, cacheReadCost, cacheWriteCost, total}` (o `computeCost` foi refatorado pra **delegar** ao breakdown — rate math numa fonte só, componentes e total nunca driftam). O `/stats` renderiza a linha `spend:` ($ + % por eixo) aplicando os rates do modelo atual (`ctx.baseConfig.provider.capabilities`) sobre os tokens agregados. É o **instrumento pra verificar** as defesas de silent-invalidator (#8 canonical JSON, data-no-boot, ordenação determinística): um pico de cache_write % = invalidator novo reescrevendo o prefixo. Caveat marcado: estimativa via rates-at-display-time sobre tokens agregados → pode divergir do `total_cost_usd` persistido (snapshot/multi-modelo).
+
+**Provado:** `cost.test.ts` (+2: breakdown por eixo, total === computeCost, fallback de cache-write rate) + `stats.test.ts` (+1: cenário cache-write-dominado 1/6/13/80%). providers+slash 848/848, harness 359/359, typecheck + lint limpos.
+
+## [2026-06-07] OpenAI `prompt_cache_key` (lever de cache-routing por provider)
+
+**Gap (auditoria per-provider):** os três providers seguem a prática-núcleo (prefixo estável primeiro + o mecanismo de cada um), mas o OpenAI não setava `prompt_cache_key` — o lever documentado da OpenAI: requests com a mesma chave roteiam pro mesmo backend, subindo o hit do prefix-cache automático. **Fix:** `openaiPromptCacheKey(req)` = `sha256(system + stableStringify(tools))` — chaveado no **prefixo estável** (system+tools), então todo turno de uma sessão (e qualquer sessão com o mesmo prefixo) roteia junto; estável na sessão e order-independent (reusa o `stableStringify` da #8). Enviado **só pro OpenAI real** (`options.baseURL === undefined`) — endpoint compat (Azure/OpenRouter/proxy) com `baseURL` custom pode rejeitar param desconhecido com 400, mesma cautela do `stream_options`/`includeUsage`. Testes: chave setada sem baseURL, omitida com baseURL, estável+order-independent. providers 214/214, typecheck + lint limpos.
+
+**Outros levers per-provider:** Anthropic já forte (4 breakpoints `cache_control` + guard + incremental tail) — pendente avaliar o **extended cache de 1h** no breakpoint estável (task #10, exige validar trade-off de custo de write 2× vs frequência de pausas >5min). Gemini: implícito OK, explicit `CachedContent` adiado (task #7).
+
 ## [2026-06-07] Canonical JSON pros bytes prompt-bound (fecha risco latente de cache)
 
 **Risco (auditoria de cache, estratégia #5):** os bytes do prefixo dependiam de insertion-order do JS, não de JSON canônico — o próprio `seed.ts:37-43` avisava ("works today... switch to canonical if a call site spreads partials"). Args de tool_use são objetos (`ProviderToolUseBlock.input`) ecoados em todo request seguinte; se a ordem das chaves driftasse (refactor com spread, hydrate-from-DB que reconstrói), os bytes mudavam e invalidavam o prefixo cacheado.

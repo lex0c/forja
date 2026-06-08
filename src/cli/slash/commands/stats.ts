@@ -15,6 +15,7 @@
 // usage report on some turn, so the totals are a lower bound — marked
 // with a leading `~` and an explanatory footnote.
 
+import { computeCostBreakdown } from '../../../providers/cost.ts';
 import { cacheHitRatio, computeUsageStats } from '../../../storage/index.ts';
 import { formatCost } from '../format.ts';
 import type { SlashCommand } from '../types.ts';
@@ -51,13 +52,28 @@ export const statsCommand: SlashCommand = {
     // cacheHitRatio). A higher % = more of the prompt prefix is being served
     // from cache instead of reprocessed at full input cost.
     const hitPct = Math.round(cacheHitRatio(s) * 100);
+    // Cost by axis — WHERE the money went. Cache write is the expensive axis,
+    // so a session with a high token hit-ratio can still be cache-write-cost-
+    // dominated; this surfaces that. Estimated from the CURRENT model's rates
+    // applied to the aggregated tokens, so it may diverge from the persisted
+    // total above (rate snapshot drift, or subagents on a different model).
+    const bd = computeCostBreakdown(ctx.baseConfig.provider.capabilities, {
+      input: s.tokensIn,
+      output: s.tokensOut,
+      cache_read: s.cacheRead,
+      cache_creation: s.cacheCreation,
+    });
+    const pct = (part: number): number =>
+      bd.total === 0 ? 0 : Math.round((part / bd.total) * 100);
     const notes: string[] = [
       'session stats (this REPL, incl. subagents):',
       `  cost:   ${lb}${formatCost(s.costUsd)}`,
+      `  spend:  in ${formatCost(bd.inputCost)} (${pct(bd.inputCost)}%) · out ${formatCost(bd.outputCost)} (${pct(bd.outputCost)}%) · cache read ${formatCost(bd.cacheReadCost)} (${pct(bd.cacheReadCost)}%) · cache write ${formatCost(bd.cacheWriteCost)} (${pct(bd.cacheWriteCost)}%)`,
       `  tokens: ${lb}${groupThousands(total)} (compute ${groupThousands(compute)} · cache ${groupThousands(cache)})`,
       `          in ${groupThousands(s.tokensIn)} · out ${groupThousands(s.tokensOut)} · cache read ${groupThousands(s.cacheRead)} · write ${groupThousands(s.cacheCreation)}`,
       `  cache:  ${hitPct}% hit`,
       `  scope:  ${s.sessionCount} session${s.sessionCount === 1 ? '' : 's'}`,
+      '  spend = est. from current model rates (tokens × rate); may differ from cost above',
     ];
     if (!s.usageComplete) {
       notes.push('  ~ = lower bound: some turns reported no token usage');

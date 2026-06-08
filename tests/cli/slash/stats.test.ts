@@ -34,7 +34,18 @@ const buildCtx = (overrides: Partial<SlashContext> = {}): SlashContext => {
     cwd: '/p',
     enableCheckpoints: false,
     budget: { ...DEFAULT_BUDGET },
-    provider: { id: 'test/m', capabilities: { context_window: 1000, output_max_tokens: 100 } },
+    provider: {
+      id: 'test/m',
+      capabilities: {
+        context_window: 1000,
+        output_max_tokens: 100,
+        // Opus-like rates ($/MTok) so the cost breakdown has real numbers.
+        cost_per_1k_input: 5,
+        cost_per_1k_output: 25,
+        cost_per_1k_cached_input: 0.5,
+        cost_per_1k_cache_write: 6.25,
+      },
+    },
   } as unknown as HarnessConfig;
   return {
     baseConfig,
@@ -119,6 +130,30 @@ describe('/stats', () => {
     expect(text).toContain('2 sessions');
     // no lower-bound marker when usage is complete
     expect(text).not.toContain('~');
+  });
+
+  test('breaks cost down by axis — surfaces cache-write dominance', async () => {
+    // A healthy token hit-ratio can still be cache-write-cost-dominated:
+    // write bills 12.5x read per token. in 100 / out 100 / read 10k / write 5k
+    // at rates 5/25/0.5/6.25 → in $0.0005 (1%), out $0.0025 (6%),
+    // read $0.005 (13%), write $0.03125 (80%).
+    const root = createSession(db, { model: 'm', cwd: '/p' });
+    updateSessionCost(db, root.id, 0.039);
+    usage(root.id, { in: 100, out: 100, cacheRead: 10000, cacheCreation: 5000 });
+    replIds = [root.id];
+
+    const r = await statsCommand.exec([], buildCtx());
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('spend:');
+    // cache write is the dominant axis
+    expect(text).toContain('cache write $0.0313 (80%)');
+    expect(text).toContain('cache read $0.0050 (13%)');
+    expect(text).toContain('out $0.0025 (6%)');
+    expect(text).toContain('in $0.0005 (1%)');
+    // the breakdown is flagged as an estimate
+    expect(text).toContain('est. from current model rates');
   });
 
   test('marks totals as a lower bound when a session reported no usage', async () => {
