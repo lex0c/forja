@@ -19,6 +19,7 @@ const msg = (role: 'user' | 'assistant' | 'tool', content: unknown): Message => 
   costUsd: null,
   createdAt: 0,
   promptHash: null,
+  effort: null,
 });
 
 describe('messagesToProviderMessages', () => {

@@ -2698,6 +2698,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             costUsd: turnCostUsd,
           },
           config.systemPromptHash ?? null,
+          // The provider reasoning-effort resolved for THIS request
+          // (migration 074) — records the effort that produced the turn.
+          reqEffort ?? null,
         );
 
         // Stream errors (normalizer-level: malformed tool_use args, orphan

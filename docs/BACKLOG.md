@@ -2,6 +2,22 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-07] Persistir `effort` por message (atribuição de regressão)
+
+**Contexto:** numa discussão de tuning, a única lacuna real era atribuição de regressão — "piorou porque o effort mudou ou porque o contexto mudou?". `prompt_hash` (migration 068) já fixa a dimensão do prompt; `effort` não tinha casa. É a ÚNICA dimensão **mutável mid-sessão** (operador roda `/effort` entre turnos) e **não-recuperável** de outra linha (model vem da session, sampling-stripped deriva de capabilities, thinking_budget deriva de effort+model). As outras duas propostas do operador já estavam feitas: separar providerEffort de harnessEffort já existe em `harness/effort.ts` (EFFORT_PROFILES dirige maxSteps/maxConcurrentSubagents/maxToolErrors + providerEffort); calibrar a ladder do Gemini é só-Gemini (Anthropic/OpenAI usam nível nativo) e já marcada como eval-pending.
+
+**Fix:** migration 074 adiciona coluna `messages.effort TEXT` (nullable). `appendAssistant` ganha um 4º arg `effort` (default null → callers/rows user/tool intocados); o loop passa o `reqEffort` resolvido por request. Tipado `string` no storage pra não acoplar ao enum do harness.
+
+**Provado:** `messages.test.ts` (+2: persiste+round-trip nos 3 SELECTs, default null) + `session-context.test.ts` (+1: appendAssistant grava effort, default null). storage 843/843, harness 360/360, typecheck + lint limpos.
+
+## [2026-06-07] Output-density default no segmento stable do system prompt
+
+**Motivação:** output é ~10% do custo direto, mas Opus 4.8 narra mais por default (migration guidance da Anthropic) e turnos verbosos acretam no contexto re-lido a cada turno. Seção estática de densidade (signal per token, findings before evidence, silence between tool calls) com cláusula "never trade information for brevity" pra não perder contexto em arquitetura/debug.
+
+**Design:** ESTÁTICA de propósito — o segmento `stable` é o cache breakpoint #1, então editar o system prompt por-modo invalidaria o prefixo a cada troca (eixo dominante de custo). Isso é o piso; verbosidade por-tarefa é o `effort` (request param, fora do prefixo). Composer `output-style-prompt.ts` adjacente ao response-format; `flattenSystemSegments` continua round-trip pro systemPrompt canônico. Subagentes (composição própria) ficam como follow-up.
+
+**Provado:** `output-style-prompt.test.ts` + assertion no `bootstrap.test.ts` (presença + invariante do round-trip). 74/74 composers irmãos. Commit `b092e99b`.
+
 ## [2026-06-07] Flag opt-in: cache Anthropic de 1 hora (all-1h, default-off)
 
 **Motivação:** cache write = ~47% do custo de uma sessão real (100% parent, prefixo estável de 9M tokens). O write caro vem de **expiry de 5min** nas pausas de dev — que o cache de 1h elimina (prefixo sobrevive → re-write vira read). Trade-off: write de 1h custa **2× input** vs 1.25× do 5min, então só ganha com pausas >5min frequentes; pode **piorar** sessão de turnos rápidos. Logo: **opt-in, default-off**.

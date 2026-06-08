@@ -71,6 +71,7 @@ import { migration070SubagentRunsApprovalPosture } from './070-subagent-runs-app
 import { migration071ContextPinsModelCreatedBy } from './071-context-pins-model-created-by.ts';
 import { migration072CompactionEvents } from './072-compaction-events.ts';
 import { migration073CompactionEventsCallUsage } from './073-compaction-events-call-usage.ts';
+import { migration074MessagesEffort } from './074-messages-effort.ts';
 
 export interface Migration {
   id: number;
@@ -152,4 +153,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration071ContextPinsModelCreatedBy,
   migration072CompactionEvents,
   migration073CompactionEventsCallUsage,
+  migration074MessagesEffort,
 ];
