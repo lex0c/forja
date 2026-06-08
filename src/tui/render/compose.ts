@@ -286,7 +286,16 @@ export const composeLive: ComposeLive = (
   // above the TodoList + phase chip below — read, write, bash… pile upward
   // as the harness fires them.
   for (const tool of state.activeTools.values()) {
-    appendBlock(renderToolCardLive(tool, caps, now));
+    // Only the card head hangs in the gutter (glyph at col 0, verb at col 2),
+    // matching the settled `tool-end` chip (permanent.ts) so the card doesn't
+    // shift when it moves live → scrollback. Sub-content (subject / preview)
+    // keeps the frame margin. The leading blank separator (appendBlock's
+    // contract) is kept for the same vertical rhythm as every other block.
+    const block = renderToolCardLive(tool, caps, now);
+    if (block.length === 0) continue;
+    lines.push(padFrame(''));
+    lines.push(block[0] as string);
+    for (let i = 1; i < block.length; i++) lines.push(padFrame(block[i] as string));
   }
 
   // 4. Live TodoList, pinned at the BOTTOM of the volatile stack — just

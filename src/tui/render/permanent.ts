@@ -316,7 +316,14 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
         }
       }
       if (item.outputTruncated === true) lines.push(truncationHint(caps, indent));
-      return lines.map(padFrame);
+      // Top-level chip: only the head hangs in the gutter — the `● ` prefix
+      // is exactly the frame-margin width, so dropping the margin on the head
+      // lands the verb back at col 2, with the glyph poking out at col 0 as a
+      // structural anchor (like the user-submit bar). Sub-content keeps the
+      // margin so subjects/diffs stay indented under the verb. Nested chips
+      // keep the margin throughout — their indent is the attribution signal.
+      // Head is at index 1 (after the leading blank).
+      return nested ? lines.map(padFrame) : lines.map((l, i) => (i === 1 ? l : padFrame(l)));
     }
     case 'tool-end-batch': {
       // Coalesced summary of N consecutive same-tool tool-end items.
@@ -385,7 +392,10 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
         lines.push(paint(caps, 'secondary', `${indent}${last}${ellipsis} +${moreN} more`));
       }
       if (item.outputTruncated === true) lines.push(truncationHint(caps, indent));
-      return lines.map(padFrame);
+      // Same gutter-glyph rule as the single tool-end chip: only the head
+      // (index 1, after the leading blank) drops the margin so the glyph hangs
+      // at col 0; the subject tree stays indented. See that case for why.
+      return nested ? lines.map(padFrame) : lines.map((l, i) => (i === 1 ? l : padFrame(l)));
     }
     case 'error':
       // Leading blank — alerts are top-level "session" blocks and

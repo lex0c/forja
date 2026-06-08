@@ -346,7 +346,9 @@ describe('formatPermanent', () => {
       );
       expect(out).toHaveLength(3);
       expect(out[0]).toBe(pad(''));
-      expect(out[1]).toBe(pad('● Read file  [850ms]'));
+      // Top-level chip head hangs in the gutter: the glyph sits at col 0,
+      // the `● ` prefix lands the verb at col 2. Sub-content keeps the margin.
+      expect(out[1]).toBe('● Read file  [850ms]');
       expect(out[2]).toBe(pad('└─ /foo.ts'));
     });
 
@@ -367,7 +369,7 @@ describe('formatPermanent', () => {
         unicode,
       );
       expect(out).toHaveLength(3);
-      expect(out[1]).toBe(pad('● Called clarify  [850ms]'));
+      expect(out[1]).toBe('● Called clarify  [850ms]');
       expect(out[2]).toBe(pad('└─ which file? → src/checkout.ts'));
     });
 
@@ -384,7 +386,7 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out[1]).toBe(pad('● Executed  exit 1  [30ms]'));
+      expect(out[1]).toBe('● Executed  exit 1  [30ms]');
     });
 
     test('nested (parentId set): no leading blank + |_ glyph + indented sub-content', () => {
@@ -487,7 +489,7 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out).toEqual([pad(''), pad('● Updated todos  [50ms]')]);
+      expect(out).toEqual([pad(''), '● Updated todos  [50ms]']);
     });
 
     test('error status overrides verb to "Failed" regardless of vocab', () => {
@@ -594,7 +596,7 @@ describe('formatPermanent', () => {
       expect(out[2]).toBe(pad('└─ 3 items added'));
     });
 
-    test('chip glyph is `●` under Unicode, `*` under ASCII (after frame margin)', () => {
+    test('chip glyph is `●` under Unicode, `*` under ASCII (hangs at col 0)', () => {
       const u = formatPermanent(
         {
           kind: 'tool-end',
@@ -617,10 +619,11 @@ describe('formatPermanent', () => {
         },
         ascii,
       );
-      // Glyph sits at column 2 (after the 2sp frame margin) on the
-      // chip head row (out[1] — out[0] is the leading blank).
-      expect(u[1]?.charAt(2)).toBe('●');
-      expect(a[1]?.charAt(2)).toBe('*');
+      // Top-level chip head hangs in the gutter: the glyph sits at column 0
+      // (no frame margin) on the chip head row (out[1] — out[0] is the
+      // leading blank). The `<glyph> ` prefix lands the verb at col 2.
+      expect(u[1]?.charAt(0)).toBe('●');
+      expect(a[1]?.charAt(0)).toBe('*');
     });
 
     test('connector is `└─ ` under Unicode, `\\- ` under ASCII', () => {
@@ -868,7 +871,7 @@ describe('formatPermanent', () => {
       // align at the head glyph column — no extra indent top-level.
       expect(out).toEqual([
         pad(''),
-        pad('● Read 3 files  [4.5s]'),
+        '● Read 3 files  [4.5s]',
         pad('├─ src/a.ts'),
         pad('├─ src/b.ts'),
         pad('└─ src/c.ts'),
@@ -912,7 +915,7 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out[1]).toBe(pad('● Executed 6 commands  [900ms]'));
+      expect(out[1]).toBe('● Executed 6 commands  [900ms]');
     });
 
     test('outputTruncated appends one hint line under the batch body', () => {
@@ -950,7 +953,7 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out).toEqual([pad(''), pad('● Read 2 files  [80ms]'), pad('└─ only.ts')]);
+      expect(out).toEqual([pad(''), '● Read 2 files  [80ms]', pad('└─ only.ts')]);
     });
 
     test('nested batch: no leading blank + |_ head + single-indent tree', () => {
@@ -1018,7 +1021,7 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out).toEqual([pad(''), pad('● Echoed ×3  [30ms]')]);
+      expect(out).toEqual([pad(''), '● Echoed ×3  [30ms]']);
     });
 
     test('long subject list caps at MAX_BATCH_SUBJECTS with a +N more tail', () => {
@@ -1039,7 +1042,7 @@ describe('formatPermanent', () => {
       );
       expect(out).toEqual([
         pad(''),
-        pad('● Read 9 files  [90ms]'),
+        '● Read 9 files  [90ms]',
         pad('├─ a'),
         pad('├─ b'),
         pad('├─ c'),
@@ -1066,7 +1069,7 @@ describe('formatPermanent', () => {
       );
       expect(out).toEqual([
         pad(''),
-        pad('● Read 5 files  [50ms]'),
+        '● Read 5 files  [50ms]',
         pad('├─ a'),
         pad('├─ b'),
         pad('├─ c'),
@@ -1093,7 +1096,7 @@ describe('formatPermanent', () => {
       );
       expect(out).toEqual([
         pad(''),
-        pad('● Read 6 files  [60ms]'),
+        '● Read 6 files  [60ms]',
         pad('├─ a'),
         pad('├─ b'),
         pad('├─ c'),
@@ -1118,7 +1121,7 @@ describe('formatPermanent', () => {
         },
         ascii,
       );
-      expect(out[1]).toBe(pad('* Read 2 files  [200ms]'));
+      expect(out[1]).toBe('* Read 2 files  [200ms]');
       expect(out[2]).toBe(pad('+- a.ts'));
       expect(out[3]).toBe(pad('\\- b.ts'));
     });
