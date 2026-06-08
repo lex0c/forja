@@ -10,4 +10,4 @@
 // operators with a scaffolded config.toml keep their pinned value
 // until they re-run `agent init --force=config`.
 
-export const DEFAULT_MODEL = 'anthropic/claude-opus-4-7';
+export const DEFAULT_MODEL = 'anthropic/claude-opus-4-8';

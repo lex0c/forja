@@ -2,6 +2,16 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-07] Catálogo de modelos: default Opus 4.8 + lineup GPT-5.x
+
+**Anthropic:** `DEFAULT_MODEL` → `anthropic/claude-opus-4-8` (era 4.7). Adicionada a entry `claude-opus-4-8` em ANTHROPIC_CAPS — mesma superfície/pricing do 4.7 (migration guide: 4.7→4.8 sem breaking changes): in $5 / out $25 / cache read $0.50 / 5m write $6.25 / 1h write $10 (confirmado pelo pricing do operador), adaptive-only, sampling deprecated, effort. 4.7 mantido (legacy válido). Help do CLI atualizado.
+
+**OpenAI:** adicionados `gpt-5.5` (in $5 / cached $0.50 / out $30), `gpt-5.4` (in $2.50 / cached $0.25 / out $15), `gpt-5.4-mini` (in $0.75 / cached $0.075 / out $4.50) — reasoning models (`supports_reasoning_effort: true`). OpenAI não tem cache-WRITE premium (caching automático), então só `cost_per_1k_cached_input` setado. gpt-4o/4o-mini mantidos. **A confirmar:** os model-id strings (usei convenção pontilhada `gpt-5.5`/`gpt-5.4`/`gpt-5.4-mini` tipo `gpt-4.1`) e os context/output ceilings (placeholders 400k/128k — pricing é autoritativo, janela não).
+
+**Google/Gemini:** adicionados modelos de TEXTO 3.x — `gemini-3.5-flash` (1.50/9.00/cache 0.15), `gemini-3.1-pro-preview` (2.00/12.00/0.20, tier ≤200k), `gemini-3.1-flash-lite` (0.25/1.50/0.025), `gemini-3-flash-preview` (0.50/3.00/0.05). Os 2.5 (pro/flash/flash-lite) tiveram o pricing **corrigido pro real** (eram ilustrativos; flash-lite estava 0.075/0.3 → agora 0.10/0.40) + `cost_per_1k_cached_input` adicionado. Modelos image/TTS/audio-live ignorados (não são chat). Tiered (Pro ≤200k vs >200k) encodado na tier base (single-rate; >200k sub-conta levemente, anotado). `max_thinking_budget` dos 3.x espelha os 2.5 (24576 flash / 32768 pro; o ladder de effort topa em 24576 mesmo). **A confirmar:** context windows dos 3.x (placeholders 1M).
+
+**Provado:** providers 302/302, config + cli + tui 2935/2935 — nenhum teste quebrou (default novo registrado; 4.7/4o/2.5 continuam fixtures válidos). typecheck + lint limpos.
+
 ## [2026-06-07] Persistir `effort` por message (atribuição de regressão)
 
 **Contexto:** numa discussão de tuning, a única lacuna real era atribuição de regressão — "piorou porque o effort mudou ou porque o contexto mudou?". `prompt_hash` (migration 068) já fixa a dimensão do prompt; `effort` não tinha casa. É a ÚNICA dimensão **mutável mid-sessão** (operador roda `/effort` entre turnos) e **não-recuperável** de outra linha (model vem da session, sampling-stripped deriva de capabilities, thinking_budget deriva de effort+model). As outras duas propostas do operador já estavam feitas: separar providerEffort de harnessEffort já existe em `harness/effort.ts` (EFFORT_PROFILES dirige maxSteps/maxConcurrentSubagents/maxToolErrors + providerEffort); calibrar a ladder do Gemini é só-Gemini (Anthropic/OpenAI usam nível nativo) e já marcada como eval-pending.

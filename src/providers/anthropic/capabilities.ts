@@ -27,6 +27,22 @@ const ANTHROPIC_BASE = {
 // only billed when the operator opts into the 1-hour TTL (FORJA_ANTHROPIC_
 // CACHE_TTL=1h); the adapter swaps it into the effective write rate then.
 export const ANTHROPIC_CAPS: Record<string, ProviderCapabilities> = {
+  'claude-opus-4-8': {
+    ...ANTHROPIC_BASE,
+    // Opus 4.8 keeps the SAME request surface and pricing as 4.7 (no new
+    // breaking changes): adaptive thinking only, sampling deprecated, same
+    // $5/$25 in/out and cache tiering. Mirror of the 4.7 entry; the default
+    // executor model (`DEFAULT_MODEL`).
+    cost_per_1k_input: 5.0,
+    cost_per_1k_output: 25.0,
+    cost_per_1k_cached_input: 0.5,
+    cost_per_1k_cache_write: 6.25,
+    cost_per_1k_cache_write_1h: 10.0,
+    supports_sampling: false,
+    supports_adaptive_thinking: true,
+    supports_reasoning_effort: true,
+    notes: ['most capable model; default executor for coding and agentic work'],
+  },
   'claude-opus-4-7': {
     ...ANTHROPIC_BASE,
     cost_per_1k_input: 5.0,
