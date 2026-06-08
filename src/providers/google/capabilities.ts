@@ -69,7 +69,10 @@ export const GOOGLE_CAPS: Record<string, ProviderCapabilities> = {
   },
   'gemini-2.5-pro': {
     ...GOOGLE_BASE,
-    context_window: 2_000_000,
+    // 1M (1,048,576), NOT 2M — that was Gemini 1.5 Pro. Verified on
+    // ai.google.dev. An inflated window makes compaction trigger past the
+    // real limit and the request 400s before the harness can fold.
+    context_window: 1_000_000,
     output_max_tokens: 65_536,
     // Gemini 2.5 Pro caps thinkingBudget at 32768; >cap → HTTP 400.
     max_thinking_budget: 32_768,
@@ -77,7 +80,7 @@ export const GOOGLE_CAPS: Record<string, ProviderCapabilities> = {
     cost_per_1k_input: 1.25,
     cost_per_1k_output: 10.0,
     cost_per_1k_cached_input: 0.125,
-    notes: ['frontier reasoning; very large context window'],
+    notes: ['frontier reasoning; 1M context'],
   },
   'gemini-2.5-flash': {
     ...GOOGLE_BASE,

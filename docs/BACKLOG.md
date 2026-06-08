@@ -2,6 +2,18 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-08] fix(google): gemini-2.5-pro context window 2M → 1M + verified Gemini 3.x
+
+Verified the Gemini context windows against ai.google.dev (the 3.x values were
+unverified placeholders). Found the same context-window bug class as
+gpt-5.4-mini: **gemini-2.5-pro was 2,000,000 but is 1,048,576** (2M was Gemini
+*1.5* Pro) — compaction would wait until ~1.4M, past the real limit, 400ing the
+request first. Corrected to 1_000_000. The rest check out: all Gemini 3.x
+(3.5-flash, 3.1-pro-preview, 3.1-flash-lite, 3-flash-preview) are 1M input / 64K
+output (the official Gemini 3 guide; a secondary source claiming 16K output for
+3.1-pro was wrong — it's 64K), and gemini-2.5-flash(/-lite) are 1M. No more
+placeholder windows in the catalog.
+
 ## [2026-06-08] fix(openai): gpt-5.4-mini context window 1.05M → 400K
 
 `gpt-5.4-mini` was catalogued at the family's 1,050,000-token window, but the
