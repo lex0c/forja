@@ -96,6 +96,7 @@ import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
 import { composeWithParallelHint } from './parallel-prompt.ts';
 import { composeWithPlaybookHint } from './playbook-prompt.ts';
 import { assembleProjectPointer, composeWithProjectPointer } from './project-pointer.ts';
+import { composeWithOutputStyle } from './output-style-prompt.ts';
 import { composeWithResponseFormat } from './response-format.ts';
 import { assembleSkillCatalogSection } from './skills-prompt.ts';
 import { composeWithToolErgonomics } from './tool-ergonomics-prompt.ts';
@@ -866,6 +867,12 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     //       (CommonMark in monospace ANSI, file:line refs,
     //       no-emoji default, structural padding bans) per
     //       ANTI_PATTERNS.md §1.3.
+    //    6b. Output-style hint — the output-density default
+    //       (signal per token, findings before evidence, silence
+    //       between tool calls). Sibling to the response-format
+    //       block (both govern how output is written); static, so
+    //       it stays in cache breakpoint #1. Per-task verbosity is
+    //       the `effort` knob, not this section.
     //    7. Environment block — situational anchor: cwd, OS,
     //       model, today's date, git context. Date in this
     //       section invalidates cache once per UTC day
@@ -881,7 +888,13 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     const withParallel = composeWithParallelHint(withErgonomics);
     const withConstraints = composeWithConstraints(withParallel);
     const withResponseFormat = composeWithResponseFormat(withConstraints);
-    const withEnvironment = composeWithEnvironment(withResponseFormat, {
+    // Output-density default (signal per token, not word count) —
+    // sibling to the response-format block: both govern HOW the model
+    // writes its output. Static in the stable segment, so it never
+    // invalidates the cache prefix; per-task verbosity is the `effort`
+    // request param, not a prompt edit. See `output-style-prompt.ts`.
+    const withOutputStyle = composeWithOutputStyle(withResponseFormat);
+    const withEnvironment = composeWithEnvironment(withOutputStyle, {
       cwd,
       platform: process.platform,
       modelId: provider.id,

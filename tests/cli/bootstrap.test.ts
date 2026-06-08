@@ -212,6 +212,9 @@ describe('bootstrap', () => {
     expect(config.systemPrompt).toBeDefined();
     expect(config.systemPrompt).toContain('# Parallelism');
     expect(config.systemPrompt).toContain('emit MULTIPLE tool calls in a SINGLE turn');
+    // Output-density default is wired into the stable segment.
+    expect(config.systemPrompt).toContain('# Output');
+    expect(config.systemPrompt).toContain('signal per token');
     db.close();
   });
 
