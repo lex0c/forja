@@ -95,7 +95,7 @@ COLOR_BEFORE=$(hash_file color.txt)
 FRUIT_BEFORE=$(hash_file fruit.txt)
 echo "before: greeting=$GREET_BEFORE color=$COLOR_BEFORE fruit=$FRUIT_BEFORE" >&2
 
-MODEL="anthropic/claude-haiku-4-5"
+MODEL="${SMOKE_MODEL:-anthropic/claude-haiku-4-5}"
 
 echo "=== Run agent: refactor 3 files ===" >&2
 bun run "$ROOT/src/cli/index.ts" \

@@ -44,7 +44,7 @@ cd workspace
 # A specific phrase the model must include in a todo_create item;
 # we'll grep run 2's response for evidence the model recalled it.
 MARKER="WIDGET_$(date +%s)"
-MODEL="anthropic/claude-haiku-4-5"
+MODEL="${SMOKE_MODEL:-anthropic/claude-haiku-4-5}"
 
 echo "=== Run 1: plan a task via todo_create ===" >&2
 bun run "$ROOT/src/cli/index.ts" \

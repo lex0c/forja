@@ -91,7 +91,7 @@ defaults:
   mode: bypass
 YAML
 
-MODEL="anthropic/claude-haiku-4-5"
+MODEL="${SMOKE_MODEL:-anthropic/claude-haiku-4-5}"
 
 echo "=== Run parent: spawn worktree-isolated scribe ===" >&2
 bun run "$ROOT/src/cli/index.ts" \

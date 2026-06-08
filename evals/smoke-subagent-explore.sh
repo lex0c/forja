@@ -107,7 +107,7 @@ defaults:
   mode: bypass
 YAML
 
-MODEL="anthropic/claude-haiku-4-5"
+MODEL="${SMOKE_MODEL:-anthropic/claude-haiku-4-5}"
 
 echo "=== Run parent agent: ask it to spawn explore ===" >&2
 bun run "$ROOT/src/cli/index.ts" \

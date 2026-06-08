@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-08] #18 (parcial): smokes provider-paramétricos + validação OpenAI ao vivo
+
+**Parametrização:** os 9 smokes `.sh` que hardcodavam `MODEL="anthropic/claude-haiku-4-5"` agora usam `MODEL="${SMOKE_MODEL:-anthropic/claude-haiku-4-5}"` — default inalterado (backward-compatible), overridável via env pra rodar em qualquer provider. (cross-provider mantido dual claude+openai de propósito.)
+
+**Validação ao vivo no `openai/gpt-4o-mini`** (custo ~$0.04):
+- Suite estruturado `evals/smoke/`: **10/10 PASS** ($0.033) — read/create/edit, grep/glob, compaction, parallel reads, skills.
+- Smokes `.sh`: **10/12 PASS** — resume(+abort), resume-with-tools, checkpoint-undo, subagent interrupt/grandchild/worktree-ipc, playbook kitchen-sink/fixtures, worktree-gc.
+- 2 fails **comportamentais (não adapter)**: subagent-explore (gpt-4o-mini desistiu de listar .txt sob capability; spawn+capabilities OK) e cross-provider (threadou contexto certo mas o modelo recusou ecoar um token "sensível").
+- `generateConstrained` validado ao vivo num probe direto (OpenAI retorna JSON válido, usage correto).
+
+**Veredito:** todo path de adapter do OpenAI validado na API real (generate, tool-loops, parallel, compaction, skills, resume, subagentes, checkpoints, cross-provider threading, constrained). #13 efetivamente provado end-to-end.
+
+**Falta pra fechar #18:** guard model-aware (hoje checa ANTHROPIC_API_KEY mesmo rodando openai — passou só porque a chave está presente); validação Gemini (bloqueada por GEMINI_API_KEY expirada).
+
 ## [2026-06-07] Paridade de providers #13–#14: generateConstrained OpenAI + Gemini
 
 **Contexto:** OpenAI e Gemini tinham `generateConstrained` como **stub que lança** ("not implemented in M4.2") → o **recap** (render de PR/resumo via output constrangido) **falhava** nos dois. Maior gap de paridade com o Claude. (Plano completo de paridade: tasks #13–#18 + #7.)

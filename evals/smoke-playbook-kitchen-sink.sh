@@ -174,7 +174,7 @@ defaults:
   mode: bypass
 YAML
 
-MODEL="anthropic/claude-haiku-4-5"
+MODEL="${SMOKE_MODEL:-anthropic/claude-haiku-4-5}"
 
 echo "=== Run parent agent: dispatch kitchen-sink via task tool ===" >&2
 # The child prompt explicitly asks the playbook to consult

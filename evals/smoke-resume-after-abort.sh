@@ -41,7 +41,7 @@ cd "$TMPDIR"
 mkdir -p workspace
 cd workspace
 
-MODEL="anthropic/claude-haiku-4-5"
+MODEL="${SMOKE_MODEL:-anthropic/claude-haiku-4-5}"
 
 echo "=== Run 1: start a long-ish stream and abort mid-flight ===" >&2
 # Long prompt to keep the model emitting tokens for a few seconds.

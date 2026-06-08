@@ -78,7 +78,7 @@ defaults:
   mode: bypass
 YAML
 
-MODEL="anthropic/claude-haiku-4-5"
+MODEL="${SMOKE_MODEL:-anthropic/claude-haiku-4-5}"
 
 # Run the parent in the background. The prompt asks for an
 # elaborate task so the subagent has plenty of work to interrupt.

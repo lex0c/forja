@@ -55,7 +55,7 @@ cd workspace
 # back into the new request, the model recalls; if not, it
 # admits ignorance or hallucinates.
 TOKEN="HARNESS_SMOKE_RESUME_$(date +%s)"
-MODEL="anthropic/claude-haiku-4-5"
+MODEL="${SMOKE_MODEL:-anthropic/claude-haiku-4-5}"
 
 echo "=== Run 1: initial session ===" >&2
 bun run "$ROOT/src/cli/index.ts" \
