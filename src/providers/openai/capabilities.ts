@@ -26,9 +26,11 @@ export const OPENAI_CAPS: Record<string, ProviderCapabilities> = {
   // write rate is intentionally absent. These accept `reasoning_effort`, so
   // `supports_reasoning_effort` is true (the adapter gates the param on it),
   // and `supports_sampling: false` because reasoning models reject
-  // temperature/top_p. Model ids, the 1,050,000 context window, and the 128K
-  // output cap are verified against developers.openai.com/api/docs/models
-  // (gpt-5.5 / gpt-5.4; gpt-5.4-mini inherits the family context window).
+  // temperature/top_p. Model ids, context windows, and the 128K output cap are
+  // verified against developers.openai.com/api/docs/models: gpt-5.5 and gpt-5.4
+  // are 1,050,000, but gpt-5.4-mini is 400,000 (it does NOT inherit the family
+  // window — an inflated window makes compaction trigger past the real limit
+  // and the request 400s at the API boundary before the harness can fold).
   // CAVEAT (live-verified 2026-06-08): on Chat Completions these reasoning
   // models 400 on the tools+reasoning_effort COMBINATION ("use /v1/responses
   // instead") — Forja's agentic loop always sends both, so gpt-5.x needs the
@@ -58,7 +60,8 @@ export const OPENAI_CAPS: Record<string, ProviderCapabilities> = {
   },
   'gpt-5.4-mini': {
     ...OPENAI_BASE,
-    context_window: 1_050_000,
+    // 400K, NOT the family's 1.05M — verified on the OpenAI model page.
+    context_window: 400_000,
     output_max_tokens: 128_000,
     cost_per_1k_input: 0.75,
     cost_per_1k_output: 4.5,
