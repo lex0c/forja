@@ -176,6 +176,15 @@ describe('formatPermanent', () => {
       expect(out[0]).toContain('\x1b[90mv0.1.0\x1b[0m');
     });
 
+    test('sandboxActive does NOT render the affirmative enforcement line', () => {
+      // The "✓ sandbox enforcement active" greenlight was dropped from the
+      // banner (boot noise the operator doesn't act on). The field still
+      // rides on the PermanentItem for NDJSON / audit, but must not surface.
+      const out = formatPermanent({ ...baseBanner, sandboxActive: 'bwrap' }, unicode);
+      expect(out).toHaveLength(2);
+      expect(out.join('\n')).not.toContain('sandbox enforcement active');
+    });
+
     test('env contents do NOT leak into the rendered banner', () => {
       // env still rides on the PermanentItem for NDJSON / audit,
       // but the TUI renderer must not surface flag names or meta

@@ -147,23 +147,17 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // the env detail was low-signal at boot. `item.env` still
       // flows into the PermanentItem for NDJSON / audit consumers.
       //
-      // §13.7 sandbox-enforcement: when `sandboxActive` is set,
-      // a third line sits inside the banner frame (secondary
-      // greyscale, no leading blank) so the affirmative posture
-      // reads as part of the banner — not as a separate alert.
-      // Non-active states (no-tool / operator-override / degraded
-      // passthrough) ride the warn/error event channels with the
-      // standard leading blank, since they ARE warnings.
+      // The affirmative "✓ sandbox enforcement active" line was dropped
+      // from the banner — boot greenlight noise the operator doesn't act
+      // on. `item.sandboxActive` still flows into the PermanentItem for
+      // NDJSON / audit consumers; the NON-active sandbox states (no-tool /
+      // operator-override / degraded passthrough) still surface on the
+      // warn/error channels, since those ARE warnings.
       const versionDisplay = item.version.startsWith('v') ? item.version : `v${item.version}`;
       const lines = [
         `${paint(caps, 'bold', item.app)} ${paint(caps, 'secondary', versionDisplay)}`,
         paint(caps, 'secondary', item.cwd),
       ];
-      if (item.sandboxActive !== undefined) {
-        lines.push(
-          paint(caps, 'secondary', `✓ sandbox enforcement active (${item.sandboxActive})`),
-        );
-      }
       return lines.map(padFrame);
     }
     case 'user-submit': {
