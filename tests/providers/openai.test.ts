@@ -214,22 +214,12 @@ describe('createOpenAIProvider', () => {
     expect(params.max_completion_tokens).toBeUndefined();
   });
 
-  test('uses max_completion_tokens on a reasoning model (gpt-5.4-mini)', async () => {
-    const handle = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
-    const provider = createOpenAIProvider('gpt-5.4-mini', { client: handle.client });
-    await drain(provider, {
-      model: 'gpt-5.4-mini',
-      messages: [{ role: 'user', content: 'hi' }],
-      max_tokens: 42,
-    });
-    const params = handle.createCalls[0]?.params as {
-      max_tokens?: number;
-      max_completion_tokens?: number;
-    };
-    // Reasoning models reject the legacy `max_tokens` — must send the renamed field.
-    expect(params.max_completion_tokens).toBe(42);
-    expect(params.max_tokens).toBeUndefined();
-  });
+  // NB: the reasoning-model paths (max_completion_tokens, temperature/top_p
+  // stripping) are now exercised via the Responses API, not Chat Completions —
+  // gpt-5.x routes to client.responses (see openai-responses.test.ts). The
+  // Chat Completions sampling gate / max_completion_tokens handling remains as
+  // defensive code but no current model reaches it (reasoning → Responses,
+  // gpt-4o → Chat Completions with max_tokens + sampling).
 
   test('forwards temperature/top_p on a sampling model (gpt-4o)', async () => {
     const handle = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
@@ -244,21 +234,6 @@ describe('createOpenAIProvider', () => {
     const params = handle.createCalls[0]?.params as { temperature?: number; top_p?: number };
     expect(params.temperature).toBe(0.5);
     expect(params.top_p).toBe(0.9);
-  });
-
-  test('strips temperature/top_p on a reasoning model (gpt-5.4-mini, supports_sampling=false)', async () => {
-    const handle = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
-    const provider = createOpenAIProvider('gpt-5.4-mini', { client: handle.client });
-    await drain(provider, {
-      model: 'gpt-5.4-mini',
-      messages: [{ role: 'user', content: 'hi' }],
-      max_tokens: 1,
-      temperature: 0.5,
-      top_p: 0.9,
-    });
-    const params = handle.createCalls[0]?.params as { temperature?: number; top_p?: number };
-    expect(params.temperature).toBeUndefined();
-    expect(params.top_p).toBeUndefined();
   });
 
   test('sets prompt_cache_key on the request (real OpenAI, no custom baseURL)', async () => {

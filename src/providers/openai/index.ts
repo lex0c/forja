@@ -33,6 +33,7 @@ export const openaiReasoningParam = (
   req.effort !== undefined && caps.supports_reasoning_effort === true
     ? { reasoning_effort: OPENAI_REASONING_EFFORT[req.effort] }
     : {};
+import { generateConstrainedViaResponses, generateViaResponses } from './responses.ts';
 import { type RawOpenAIChunk, normalizeOpenAIStream } from './stream.ts';
 
 export interface CreateOpenAIProviderOptions {
@@ -200,7 +201,8 @@ export const createOpenAIProvider = (
   // the legacy `max_tokens` and require `max_completion_tokens`; non-reasoning
   // models (gpt-4o) still accept `max_tokens`. The reasoning capability is the
   // proxy — it's exactly the set that renamed the field.
-  const maxTokensField = caps.supports_reasoning_effort === true ? 'max_completion_tokens' : 'max_tokens';
+  const maxTokensField =
+    caps.supports_reasoning_effort === true ? 'max_completion_tokens' : 'max_tokens';
 
   const generate = async function* (req: GenerateRequest): AsyncIterable<StreamEvent> {
     const messages: OpenAIMessage[] = [];
@@ -345,12 +347,22 @@ export const createOpenAIProvider = (
     };
   };
 
+  // Reasoning models (gpt-5.x) route through the Responses API: Chat
+  // Completions 400s on tools+reasoning_effort for them. gpt-4o and other
+  // non-reasoning models stay on the Chat Completions path above. Decided per
+  // model (the capability), not per request.
+  const useResponses = caps.supports_reasoning_effort === true;
+
   return {
     id: `openai/${modelName}`,
     family: 'openai',
     capabilities: caps,
-    generate,
-    generateConstrained,
+    generate: useResponses
+      ? (req: GenerateRequest) => generateViaResponses(client, modelName, caps, req)
+      : generate,
+    generateConstrained: useResponses
+      ? (req: ConstrainedRequest) => generateConstrainedViaResponses(client, modelName, caps, req)
+      : generateConstrained,
     countTokens: (messages: ProviderMessage[]): Promise<number> =>
       Promise.resolve(estimateMessagesTokens(messages)),
   };
