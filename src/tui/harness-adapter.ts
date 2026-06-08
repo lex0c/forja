@@ -593,9 +593,14 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           stepN: state.steps,
         });
         if (event.hadBash) {
+          // Not the yellow warn channel: this is a passive caveat about the
+          // checkpoint's reversibility, not an actionable alert. It rides the
+          // info channel in `secondary` (greyscale) so it recedes rather than
+          // reading as an alarm the operator must act on.
           out.push({
-            type: 'warn',
+            type: 'info',
             ts,
+            tone: 'secondary',
             message: `checkpoint ${event.checkpointId.slice(0, 8)} includes bash side effects (--undo won't reverse them)`,
           });
         }
