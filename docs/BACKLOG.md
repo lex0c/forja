@@ -2,6 +2,49 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-09] perf(context): trim always-on tool-defs; re-align playbook when_to_use to spec
+
+System-context audit (cost/benefit). Measured the always-on payload: tool-defs are
+the single biggest consumer (~7.8k tokens, ~64% of system context, ~2x all prompt
+text combined). Confirmed a structural fact while measuring: `task_sync` is a
+byte-identical alias of `task` at the wire (`task.ts:350` = `{...taskTool, name,
+description}`), so code-level "dedup" saves zero request tokens — only denser schemas
+or lazy exposure move that number.
+
+Two no-trade-off cuts applied:
+- **Tool-defs densified** (`retrieve_context`, `wait_for`, `monitor`, `memory_write`):
+  removed redundancy ONLY — the `kind` enum listed 3x (description + condition.description
+  + the enum itself), the "session reads compacted-out history" concept stated 3x in
+  retrieve_context, array-edge-cases the model doesn't need in the schema. desc+schema
+  for 32 tools 31053 → 29790 bytes (~316 tokens). `clarify` / `pin_context` / `edit_file`
+  were inspected and LEFT untouched — their length is load-bearing signal (sequential /
+  all-or-nothing edit semantics, every-call-asks), and cutting it would raise the
+  tool-use error rate (more retries = more tokens, net loss).
+- **Playbook `when_to_use` re-aligned to spec** (`gap-audit`, `security-audit`,
+  `code-review`, `git-hygiene`): the `.md` files had drifted into multi-sentence
+  NOT-lists; `PLAYBOOKS.md §1` mandates one line and already ships the short forms
+  (spec:220/352/1419/1553). Shortened to the spec form (in English); the detailed
+  disambiguation stays in each playbook body, where the spec puts it. ~200 tokens off
+  the always-on discovery table. `challenge-assumptions` was already one line — untouched.
+
+Deferred, deliberately:
+- **Memory-seed pruning** — `MEMORY.md §5.7.8` prescribes each seed by name + body +
+  source; cutting diverges from spec (would need a spec-PR first) and the gain is tiny
+  (seed bodies are lazy — only the one-line index entry is always-on). The
+  seed↔`constraints-prompt` overlap is layered-by-design (hard-coded always-on floor vs
+  operator-editable/versioned memory), not accidental duplication. Left for an operator
+  decision rather than cut.
+- **Dynamic tool pruning / lazy exposure** — the real lever (~5k tokens) but it trades a
+  cheap recurring cache-READ for an expensive cache-WRITE on each group-load: the cache
+  prefix is tools→system→messages, so a mid-session tool-set change invalidates system +
+  memory + the whole conversation tail for that turn. Net payoff is eval-dependent.
+  Design captured (core set + 5 on-demand groups + `request_tools` + sticky load +
+  feature-flag), spec-first (new AGENTIC_CLI §7 + CONTEXT_TUNING §3). Deferred until
+  window pressure justifies the cache cost.
+
+Tests: tools + playbook-prompt + playbook-fixtures suites pass (573 pass / 0 fail);
+typecheck + biome clean. No `docs/spec/` changes.
+
 ## [2026-06-09] fix(sandbox): preserve ro cache access when the cache root is under /tmp
 
 Follow-up to the cross-profile cache-coherence fix (review catch). `forjaCacheDir()`

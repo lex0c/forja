@@ -145,7 +145,7 @@ const validate = (raw: unknown): ValidatedArgs | { error: string } => {
 export const retrieveContextTool: Tool<RetrieveContextInput, RetrieveContextOutput> = {
   name: 'retrieve_context',
   description:
-    'Retrieve relevant context that is NOT in your live window — ranked and budget-constrained — for the active query. This is how you read back conversation history that compaction moved out of context: the `session` view searches THIS conversation\'s own messages + tool_results, including ones folded into a `[compacted_history]` summary or replaced by an `… elided …` pointer (the originals persist in the audit log). Use it whenever you need an earlier message, tool output, or decision that is no longer literally in context — do not assume it is gone. Also spans `workspace` (repo files) and `memory` (cross-session memories). Returns per-candidate levels (full / outline / summary / ref) + a skipped trail of what did not fit. Read-only and parallel-safe. Scope with `views` (e.g. `["session"]` to search only this conversation); `workflow` (review / refactor / explain / debug / precedent_lookup) shapes ranking weights; `loadBodies: true` gives deeper coverage at I/O cost.',
+    "Retrieve ranked, budget-constrained context that is NOT in your live window. Primary use: read back THIS conversation's earlier messages + tool_results that compaction folded into a `[compacted_history]` summary or elided to a pointer — the originals persist in the audit log, so don't assume they're gone (`session` view). Also spans repo files (`workspace`) and cross-session memories (`memory`). Returns per-candidate levels (full / outline / summary / ref) + a trail of what was skipped. Read-only and parallel-safe. `workflow` shapes ranking weights; `loadBodies: true` deepens coverage at I/O cost.",
   inputSchema: {
     type: 'object',
     properties: {
@@ -176,7 +176,7 @@ export const retrieveContextTool: Tool<RetrieveContextInput, RetrieveContextOutp
         type: 'array',
         items: { type: 'string', enum: [...RETRIEVAL_VIEWS] },
         description:
-          'Which views to search (omit = all wired). `session`: THIS conversation\'s messages + tool_results, INCLUDING ones outside your live window — compaction folded them into `[compacted_history]` or elided them to a pointer, but the originals stay in the audit log and are retrievable here. `workspace`: repository files. `memory`: cross-session memories. Pass `["session"]` to read back compacted-out conversation history.',
+          "Which views to search (omit = all wired). `session`: this conversation's messages + tool_results, including compacted-out ones; `workspace`: repository files; `memory`: cross-session memories.",
       },
       loadBodies: {
         type: 'boolean',

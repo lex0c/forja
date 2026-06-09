@@ -385,8 +385,7 @@ export const waitForTool: Tool<WaitForInput, WaitForOutput> = {
     properties: {
       condition: {
         type: 'object',
-        description:
-          'The condition to wait for. Discriminated by `kind`: sleep | file_exists | file_change | port_open | http_response | process_exit | process_output | all_of | any_of (composition).',
+        description: 'The condition to wait for, discriminated by `kind` (see enum).',
         properties: {
           kind: {
             type: 'string',
@@ -456,7 +455,7 @@ export const waitForTool: Tool<WaitForInput, WaitForOutput> = {
           conditions: {
             type: 'array',
             description:
-              'For kind=all_of | any_of: nested WaitForCondition array. all_of waits for ALL to match (AND, short-circuits on first failure); any_of races for the first match (OR, cancels siblings on success). Empty all_of([]) matches immediately; empty any_of([]) waits out the timeout. Composition depth is capped (5).',
+              'For kind=all_of | any_of: nested conditions. all_of = AND (all must match); any_of = OR (first match wins). Depth capped at 5.',
             items: { type: 'object' },
           },
         },
