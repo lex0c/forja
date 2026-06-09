@@ -546,7 +546,12 @@ export const DEFAULT_BUDGET: RunBudget = {
   // honored. 200 leaves headroom while still bounding genuine loop
   // pathology (degenerate-loop tracker hits much earlier).
   maxSteps: 200,
-  maxWallClockMs: 60 * 60 * 1000,
+  // 24h — the schema max (`config/loaders.ts`). Cost is the primary gate;
+  // the wall-clock cap exists for what cost can't see (a hung provider call
+  // spends nothing, LLM-free tools like monitor/wait_for, ~0-cost local
+  // models). At 24h it never cuts a legitimate interactive/overnight session
+  // while still bounding a true hang. An operator can lower it per-config.
+  maxWallClockMs: 24 * 60 * 60 * 1000,
   maxToolErrors: 5,
   maxRepeatedToolHash: 3,
   // 90s default step-stall watchdog. Long enough that legitimate

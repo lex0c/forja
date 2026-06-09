@@ -48,7 +48,7 @@ describe('DEFAULT_BUDGET (slice C — cost-primary posture)', () => {
     // Cost being the primary gate doesn't disable the runaway
     // safeguards — wall clock, tool errors, and the degenerate
     // loop hash window still defend against pathological runs.
-    expect(DEFAULT_BUDGET.maxWallClockMs).toBe(60 * 60 * 1000);
+    expect(DEFAULT_BUDGET.maxWallClockMs).toBe(24 * 60 * 60 * 1000);
     expect(DEFAULT_BUDGET.maxToolErrors).toBe(5);
     expect(DEFAULT_BUDGET.maxRepeatedToolHash).toBe(3);
   });

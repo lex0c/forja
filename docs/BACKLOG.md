@@ -2,6 +2,92 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-09] fix(sandbox): preserve ro cache access when the cache root is under /tmp
+
+Follow-up to the cross-profile cache-coherence fix (review catch). `forjaCacheDir()`
+honors an absolute `$XDG_CACHE_HOME`, so `persistBase` can land under `/tmp`. The
+coherence fix made `ro` receive the cache redirect env unconditionally, but `ro`
+still replaces `/tmp` with a fresh tmpfs (or the shared_tmp session bind) and never
+calls `pushCacheCarveOut()` to re-expose the real cache. So with the cache under
+`/tmp`, a prior cwd-rw command wrote the real Forja tree (through ITS carve-out
+bind) while the following `ro` command looked inside its isolated `/tmp` and saw an
+empty path — the exact split the redirect was meant to close still failed for that
+configuration.
+
+Fix: `ro` now emits an explicit `--ro-bind <persistBase> <persistBase>`
+(existence-gated, after the `/tmp` mount, before HIDE_PATHS so a credential overlay
+still wins) — re-exposing the real cache READ-ONLY through whatever re-mount nests
+it, without granting `ro` a persistent write. macOS unaffected: `sandbox-exec`
+allows reads by default and doesn't re-mount `/tmp`, so the cache under `/tmp` is
+already readable in `ro`.
+
+Tests: argv-shape (`ro` gets the `--ro-bind` re-bind, ordered after `/tmp` / before
+the credential overlay; absent persistBase → no re-bind, graceful) + a real-bwrap
+E2E regression that pins `$XDG_CACHE_HOME` UNDER `/tmp` and proves cwd-rw write →
+ro read now succeeds. Doc: `docs/SECURITY.md §4.9`.
+
+## [2026-06-09] chore(budget): raise the default wall-clock cap 1h → 24h
+
+`DEFAULT_BUDGET.maxWallClockMs` was 1h — short enough to cut legitimate long
+interactive / overnight sessions. Cost is the primary gate; the wall-clock cap
+is the backstop for what cost can't see (a hung provider call spends nothing,
+LLM-free tools like `monitor`/`wait_for`, ~0-cost local models). 24h (the schema
+max in `config/loaders.ts`) keeps that backstop against a true hang while never
+cutting a real session. Operators still lower it per-config.
+
+`effortBudgetPatch` doesn't touch the wall-clock, so the single `DEFAULT_BUDGET`
+constant is the only knob. Updated the one test pinning the value
+(`budget-defaults.test.ts`) and two stale "default 10 min" comments
+(`loop.ts`, `wait-for.ts`). Subagents keep their own `DEFAULT_WALL_CLOCK_MS`
+(1h, `subagents/wait-loop.ts`) — unchanged here.
+
+## [2026-06-09] fix(sandbox): make the cache redirect coherent across profiles (ro reads the Forja cache)
+
+Follow-up to the `/tmp` coherence fix — the SAME per-profile split existed for `cache_persistence`,
+in the opposite direction. The cache redirect env (`XDG_CACHE_HOME`, `GOMODCACHE`, `npm_config_cache`,
+…) was gated to **writable** profiles. So a `go build` (cwd-rw) wrote the dedicated Forja cache while a
+read-only command (ro) — redirect absent — fell back to the host's real `~/.cache`: two different
+caches depending on the per-command profile the planner picked. "Um grava num local, outro lê de
+outro."
+
+Fix: drop the `&& writableProfile` gate on `persistBase` (Linux `sandbox-runner.ts`) and the matching
+profile check on the macOS redirect (`sandbox-runner-macos.ts`), so the redirect env applies to EVERY
+profile. The WRITABLE mount stays writable-only — Linux: the `--bind persistBase` + host-cache tmpfs
+masks ride inside `pushCacheCarveOut()`, called only from the cwd-rw/cwd-rw-net/home-rw branches (the
+gate is now structural, not a boolean — removed the dead `writableProfile` var); macOS: the SBPL
+`file-write*` allow is unchanged. Net: `ro` resolves the SAME Forja cache a writable command writes,
+reading it RO through the `--ro-bind / /` base (Linux) / default read-allow (macOS), and never gains
+persistent write. Bonus: better anti-poison isolation — `ro` no longer reads the host cache a build
+outside Forja may have poisoned. Spec has no per-profile carve-out for the redirect → no spec change.
+
+Tests: inverted the `ro → no redirect` cases on both runners to assert `ro` now carries the redirect
+env (XDG + GOMODCACHE) while keeping NO writable bind / NO SBPL write-allow / NO host-cache mask.
+Verified end-to-end against real `bwrap`: write/cwd-rw → read/ro reads the same Forja cache entry;
+write/ro → `Read-only file system` (ro stays read-only).
+
+## [2026-06-09] fix(sandbox): make shared_tmp /tmp coherent across profiles (read-only too)
+
+`shared_tmp` (default ON) promises temp-file reuse between tool-calls of the same session
+(`SECURITY_GUIDELINE §8.1`). But the `/tmp` session-dir bind in `buildBwrapArgv` was gated to
+**writable** profiles (`writableProfile && sessionTmpDir`). Since the planner picks the *minimum*
+profile per command, a `touch /tmp/x` / `printf > /tmp/x` write ran under `cwd-rw` (bind → persistent
+session dir) while a following `cat /tmp/x` read ran under `ro` (no bind → fresh empty tmpfs). The
+read saw nothing and failed — shared_tmp silently broken for the read side. Reproduced exactly from an
+operator session log (write ok, separate read `exit 1`, same-call write+read ok).
+
+Fix: drop the `writableProfile &&` gate on the `/tmp` bind (`sandbox-runner.ts`) so the session
+`/tmp` binds for **every** profile, `ro` included, with `TMPDIR=/tmp` forced. Grants no new access —
+`ro` already had a writable baseline tmpfs `/tmp`; this only changes WHERE writes land (the
+session-scoped scratch dir) so `/tmp` is coherent across the whole session. The cache carve-out stays
+writable-only (cache is a host/project surface; `/tmp` is scratch). Code now matches the spec promise,
+which has no per-profile carve-out → no spec change. macOS runner unaffected: its tmpdir SBPL allow was
+already profile-independent.
+
+Tests: inverted the stale `ro ignores sessionTmpDir` case to assert `ro` now binds the session `/tmp` +
+forces `TMPDIR`, plus a new case that `ro` WITHOUT sessionTmpDir (shared_tmp off) keeps the fresh
+per-spawn tmpfs. Verified end-to-end against real `bwrap`: write/cwd-rw → read/ro now reads the file;
+delete/cwd-rw → read/ro confirms it's gone.
+
 ## [2026-06-08] feat(resume): resume-mode selection (full / summary / capped)
 
 `forja --resume <id>` ganha escolha de como o contexto é carregado: **capped** (default,

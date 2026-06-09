@@ -831,7 +831,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // Init writes (createSession + initial appendMessage) live INSIDE the
   // try so a SQLite failure here routes through guardedFinish — that
   // clears the wall-clock timer instead of leaking it for the full
-  // maxWallClockMs window (default 10 min).
+  // maxWallClockMs window (default 24h).
   //
   // The outer try/finally is the session-end cleanup hook for any bg
   // processes (`bash_background` & co, M3 §7.3). Spawned processes

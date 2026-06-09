@@ -71,7 +71,7 @@ const isObject = (v: unknown): v is Record<string, unknown> =>
 const MAX_COMPOSITION_DEPTH = 5;
 
 // Hard cap on wait wall-clock budget. The harness has its own
-// `maxWallClockMs` (default 10min) that aborts any tool past that
+// `maxWallClockMs` (default 24h) that aborts any tool past that
 // window — but operators that bump the harness cap for long-running
 // builds re-open the gap. A model declaring `timeout_ms: 86400000`
 // (24h) under a generous harness cap pins a tool slot for a day.
