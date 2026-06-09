@@ -1017,6 +1017,22 @@ describe('replayProviderMessages — compacted-array replay (resume "from summar
     expect(result.turns).toBe(1);
   });
 
+  test('preserved tail starting at an assistant (prompt folded) still emits a footer', () => {
+    // Compaction aligns the preserved tail to start at an ASSISTANT — the user
+    // prompt that opened that run was folded into the summary. The summary head
+    // is the user-side anchor, so the assistant run boundary must still close
+    // (session:end + turn count); otherwise the latest response shows with no
+    // footer until a later real prompt.
+    const { bus, events } = recordEvents();
+    const messages: ProviderMessage[] = [
+      { role: 'user', content: 'goal\n\n[compacted_history]\nfolded\n[/compacted_history]' },
+      { role: 'assistant', content: [{ type: 'text', text: 'latest answer' }] },
+    ];
+    const result = replayProviderMessages(messages, 's1', bus, 0);
+    expect(events.some((e) => e.type === 'session:end')).toBe(true);
+    expect(result.turns).toBe(1);
+  });
+
   test('the synthetic summary head is NOT replayed as a user:submit', () => {
     const { bus, events } = recordEvents();
     const messages: ProviderMessage[] = [

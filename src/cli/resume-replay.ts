@@ -495,7 +495,14 @@ export const replayProviderMessages = (
     rest.map((m) => ({ role: m.role, content: m.content, createdAt: now })),
   );
 
-  let runActive = false;
+  // Seed active when a summary head was skipped (start === 1): the folded
+  // summary IS the user-side anchor for the first preserved run. Compaction
+  // aligns the preserved tail to start at an ASSISTANT message, so without this
+  // the first assistant/tool sequence has no preceding user:submit and its run
+  // boundary never emits session:end — the operator loses that run's footer /
+  // turn until a later real user prompt appears. With no summary (start === 0)
+  // the tail carries its own user prompts, so it starts inactive.
+  let runActive = start === 1;
   let turns = 0;
   for (let i = 0; i < rest.length; i++) {
     const msg = rest[i];
