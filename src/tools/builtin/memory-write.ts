@@ -95,7 +95,7 @@ const isoDateForOffset = (offsetDays: number, now: Date = new Date()): string =>
 export const memoryWriteTool: Tool<MemoryWriteInput, MemoryWriteOutput> = {
   name: 'memory_write',
   description:
-    'Propose a new memory entry. Always opens an operator-confirmation modal — only persists on explicit accept. Reject scopes: project_shared (use /memory promote), name collisions in same scope (no overwrite), bodies matching injection / secret heuristics. Source must be user_explicit (operator asked to save) or inferred (you decided). For inferred + project scope, expires defaults to +90 days when omitted. In headless mode the call is rejected per spec §5.1.6.',
+    'Propose a new memory entry. Always opens an operator-confirmation modal — only persists on explicit accept. Rejected: project_shared scope (use /memory promote), name collisions (no overwrite), bodies matching injection / secret heuristics. Headless mode rejects the call (spec §5.1.6).',
   inputSchema: {
     type: 'object',
     properties: {

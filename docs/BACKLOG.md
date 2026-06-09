@@ -2,6 +2,85 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-09] chore(seeds): drop 4 vendor seeds redundant with the always-on system prompt
+
+The vendor seed pack carried 4 seeds whose doctrine is already hard-coded, always-on, in the
+system prompt: `prefer-specialized-navigation` (= `tool-ergonomics-prompt`), `no-fabrication`
+(= constraints "Don't invent" / "Evidence over assumption"), `scope-discipline` (= "Build only
+what's asked"), `safe-edit-discipline` (= "Investigate before editing" + edit-craft). Each cost
+an always-on index line plus a body the model could load for guidance it already has every turn.
+Cut them: 11 → 7. `respect-repo-conventions` kept — only its code-convention half duplicates
+constraints; the commit-convention half isn't in the always-on prompt. `measure-twice-cut-once`'s
+"concrete instances" list pruned to the surviving seeds.
+
+`§5.7.8` is the "catálogo default sugerido / esboço" — descriptive, not normative (the normative
+part is the `§5.7.7` cap of 11, still honored), so trimming the catalog is within spec; operator
+asked to leave `docs/spec/` untouched (code-behind-spec). Tests: count 11→7, the seeds-installer
+operator-edit fixture retargeted to a surviving seed; full seed/memory suite green (551 pass),
+typecheck + biome clean. The token win is tiny (seed bodies are lazy — only the index line is
+always-on); the point is hygiene, removing doctrine duplicated in the always-on floor.
+
+## [2026-06-09] eval(compaction): controlled A/B for "compact/elide earlier" — keep threshold 0.7
+
+Closes the open follow-up in `CONTEXT_TUNING §990` / BACKLOG 404-416: a same-relevance,
+threshold-only A/B. The existing 23-vs-48 "~28%" figure is a confound — those cases vary BOTH
+`compactionRelevance` and `compactionThreshold`. New cases 49 (threshold 0.5 → no compaction)
+and 50 (threshold 0.02 → elide early) are byte-identical except the threshold, with
+`compactionRelevance` fixed ON in both.
+
+Result (haiku, `--repeat 3`): compacting early cost **+31%** (avg $0.040 vs $0.030) and was 2.5x
+slower; both 3/3 pass (quality preserved). The micro scenario collapsed to 4 steps (parallel
+reads), so the long-session regime where early compaction saves cache-read was never reached.
+Structural takeaway: a micro-eval **disfavors early compaction by construction** — the
+fold/re-cache overhead is ~fixed and dominates at short scale, while the benefit only amortizes
+over a long session. The eval is the wrong instrument here; the real lever (cache-read was 58%
+of cost in a real session where compaction ran 0x) is only measurable by instrumenting
+production. Verdict: `DEFAULT_BUDGET.compactionThreshold` stays 0.7 — it remains a per-config
+`[0,1]` knob (no spec change). No production code changed.
+
+## [2026-06-09] perf(context): trim always-on tool-defs; re-align playbook when_to_use to spec
+
+System-context audit (cost/benefit). Measured the always-on payload: tool-defs are
+the single biggest consumer (~7.8k tokens, ~64% of system context, ~2x all prompt
+text combined). Confirmed a structural fact while measuring: `task_sync` is a
+byte-identical alias of `task` at the wire (`task.ts:350` = `{...taskTool, name,
+description}`), so code-level "dedup" saves zero request tokens — only denser schemas
+or lazy exposure move that number.
+
+Two no-trade-off cuts applied:
+- **Tool-defs densified** (`retrieve_context`, `wait_for`, `monitor`, `memory_write`):
+  removed redundancy ONLY — the `kind` enum listed 3x (description + condition.description
+  + the enum itself), the "session reads compacted-out history" concept stated 3x in
+  retrieve_context, array-edge-cases the model doesn't need in the schema. desc+schema
+  for 32 tools 31053 → 29790 bytes (~316 tokens). `clarify` / `pin_context` / `edit_file`
+  were inspected and LEFT untouched — their length is load-bearing signal (sequential /
+  all-or-nothing edit semantics, every-call-asks), and cutting it would raise the
+  tool-use error rate (more retries = more tokens, net loss).
+- **Playbook `when_to_use` re-aligned to spec** (`gap-audit`, `security-audit`,
+  `code-review`, `git-hygiene`): the `.md` files had drifted into multi-sentence
+  NOT-lists; `PLAYBOOKS.md §1` mandates one line and already ships the short forms
+  (spec:220/352/1419/1553). Shortened to the spec form (in English); the detailed
+  disambiguation stays in each playbook body, where the spec puts it. ~200 tokens off
+  the always-on discovery table. `challenge-assumptions` was already one line — untouched.
+
+Deferred, deliberately:
+- **Memory-seed pruning** — `MEMORY.md §5.7.8` prescribes each seed by name + body +
+  source; cutting diverges from spec (would need a spec-PR first) and the gain is tiny
+  (seed bodies are lazy — only the one-line index entry is always-on). The
+  seed↔`constraints-prompt` overlap is layered-by-design (hard-coded always-on floor vs
+  operator-editable/versioned memory), not accidental duplication. Left for an operator
+  decision rather than cut.
+- **Dynamic tool pruning / lazy exposure** — the real lever (~5k tokens) but it trades a
+  cheap recurring cache-READ for an expensive cache-WRITE on each group-load: the cache
+  prefix is tools→system→messages, so a mid-session tool-set change invalidates system +
+  memory + the whole conversation tail for that turn. Net payoff is eval-dependent.
+  Design captured (core set + 5 on-demand groups + `request_tools` + sticky load +
+  feature-flag), spec-first (new AGENTIC_CLI §7 + CONTEXT_TUNING §3). Deferred until
+  window pressure justifies the cache cost.
+
+Tests: tools + playbook-prompt + playbook-fixtures suites pass (573 pass / 0 fail);
+typecheck + biome clean. No `docs/spec/` changes.
+
 ## [2026-06-09] fix(sandbox): preserve ro cache access when the cache root is under /tmp
 
 Follow-up to the cross-profile cache-coherence fix (review catch). `forjaCacheDir()`

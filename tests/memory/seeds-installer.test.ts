@@ -105,13 +105,13 @@ describe('installVendorSeeds — idempotence (spec §5.7.5 conservative baseline
     installVendorSeeds({ roots });
     // Operator edits one seed body — change is detectable but stays
     // a valid seed file (we don't rewrite cross-field constraints).
-    const target = seedMemoryFilePath(roots, 'safe-edit-discipline');
+    const target = seedMemoryFilePath(roots, 'measure-twice-cut-once');
     const original = readFileSync(target, 'utf-8');
     const edited = `${original}\n<!-- operator note -->\n`;
     writeFileSync(target, edited);
     const result = installVendorSeeds({ roots });
     expect(result.fresh).toEqual([]);
-    expect(result.userKept).toContain('safe-edit-discipline.md');
+    expect(result.userKept).toContain('measure-twice-cut-once.md');
     expect(readFileSync(target, 'utf-8')).toBe(edited);
   });
 

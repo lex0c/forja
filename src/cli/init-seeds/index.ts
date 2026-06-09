@@ -31,13 +31,7 @@ import failureRootCauseMd from './failure-root-cause.md' with { type: 'text' };
 import gitFirstOrientationMd from './git-first-orientation.md' with { type: 'text' };
 import measureTwiceCutOnceMd from './measure-twice-cut-once.md' with { type: 'text' };
 import noAutoCommitMd from './no-auto-commit.md' with { type: 'text' };
-import noFabricationMd from './no-fabrication.md' with { type: 'text' };
-import preferSpecializedNavigationMd from './prefer-specialized-navigation.md' with {
-  type: 'text',
-};
 import respectRepoConventionsMd from './respect-repo-conventions.md' with { type: 'text' };
-import safeEditDisciplineMd from './safe-edit-discipline.md' with { type: 'text' };
-import scopeDisciplineMd from './scope-discipline.md' with { type: 'text' };
 import secretHandlingMd from './secret-handling.md' with { type: 'text' };
 
 export interface CanonicalSeed {
@@ -105,41 +99,11 @@ export const CANONICAL_SEEDS: ReadonlyArray<CanonicalSeed> = [
     content: noAutoCommitMd,
   },
   {
-    filename: 'no-fabrication.md',
-    name: 'no-fabrication',
-    description:
-      'do not invent fact/URL/path/symbol; verify before asserting; declare uncertainty at semantic limits',
-    version: '1.0',
-    content: noFabricationMd,
-  },
-  {
-    filename: 'prefer-specialized-navigation.md',
-    name: 'prefer-specialized-navigation',
-    description: 'dedicated tool > Bash; grep + targeted read > whole-file read on large files',
-    version: '1.0',
-    content: preferSpecializedNavigationMd,
-  },
-  {
     filename: 'respect-repo-conventions.md',
     name: 'respect-repo-conventions',
     description: 'conventions come from the repo (git log, configs), never from generic defaults',
     version: '1.0',
     content: respectRepoConventionsMd,
-  },
-  {
-    filename: 'safe-edit-discipline.md',
-    name: 'safe-edit-discipline',
-    description: 'read before Edit; Edit on existing, Write only for new files or full rewrites',
-    version: '1.0',
-    content: safeEditDisciplineMd,
-  },
-  {
-    filename: 'scope-discipline.md',
-    name: 'scope-discipline',
-    description:
-      'stay within the requested scope; bugfix ≠ cleanup; no abstraction before the third repetition',
-    version: '1.0',
-    content: scopeDisciplineMd,
   },
   {
     filename: 'secret-handling.md',

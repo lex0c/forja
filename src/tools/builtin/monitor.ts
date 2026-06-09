@@ -183,8 +183,7 @@ export const monitorTool: Tool<MonitorInput, MonitorOutput> = {
     properties: {
       condition: {
         type: 'object',
-        description:
-          'The source to monitor. Discriminated by `kind`: process_output_lines | process_output_pattern | file_changes.',
+        description: 'The source to monitor, discriminated by `kind` (see enum).',
         properties: {
           kind: {
             type: 'string',
@@ -197,12 +196,11 @@ export const monitorTool: Tool<MonitorInput, MonitorOutput> = {
           pattern: {
             type: 'string',
             description:
-              'For kind=process_output_pattern: text to match. Literal by default; set is_regex=true to interpret as a regex. The compiled regex always carries /g — every match in a chunk becomes an event.',
+              'For kind=process_output_pattern: text to match (literal; set is_regex=true for regex). Each match in a chunk is one event.',
           },
           is_regex: {
             type: 'boolean',
-            description:
-              'For kind=process_output_pattern: when true, `pattern` compiles as a regex (with /g added). Default false (literal).',
+            description: 'Compile `pattern` as a regex. Default false (literal).',
           },
           path: {
             type: 'string',

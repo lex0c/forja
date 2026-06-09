@@ -6,7 +6,7 @@ budget:
   max_steps: 25
   max_cost_usd: 0.75
 slash: review
-when_to_use: "diff or PR ready for review with a request for a quality gate before merge. NOT for exploratory questions about a change ('what does this do?' → /explain); NOT for unfinished work where the author is still iterating; NOT for changes the user already merged (post-hoc commentary is not a review)."
+when_to_use: "diff/PR ready for review; code change that needs a quality gate before merge"
 sampling:
   max_tokens: 4096
 prompt_version: 1
