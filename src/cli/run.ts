@@ -681,12 +681,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       // here, not after that work — same "guard before any work" reasoning the
       // REPL relies on for its early scrollback replay. Capped (no mode, no
       // pre-work) stays permissive: runAgent's guard catches it before work.
-      const resolved = resolveResumeId(
-        args.resume,
-        dbPath,
-        cwd,
-        args.resumeMode !== undefined,
-      );
+      const resolved = resolveResumeId(args.resume, dbPath, cwd, args.resumeMode !== undefined);
       if (!resolved.ok) {
         errSink(`forja: ${resolved.message}\n`);
         return 1;
@@ -911,7 +906,7 @@ export const run = async (options: RunOptions): Promise<number> => {
         // Same hydrate(+compact) core as the interactive path
         // (prepareResumeContext); headless surfaces warnings via stderr and
         // skips the chip/cumulative (no scrollback / REPL cumulative).
-        const { ctx, info, compaction } = await prepareResumeContext({
+        const { ctx, info, compaction, costCapped } = await prepareResumeContext({
           db,
           sessionId: resumeFromSessionId,
           mode: args.resumeMode,
@@ -927,7 +922,11 @@ export const run = async (options: RunOptions): Promise<number> => {
             `forja: --resume-mode ${args.resumeMode} loaded ${info.totalCount} messages (full history)\n`,
           );
         }
-        if (compaction?.kind === 'error') {
+        if (costCapped) {
+          errSink(
+            'forja: --resume-mode summary skipped — session already at the cost cap; the run will stop for the cap\n',
+          );
+        } else if (compaction?.kind === 'error') {
           errSink(
             `forja: --resume-mode summary compaction failed: ${compaction.message} (resuming with full history)\n`,
           );

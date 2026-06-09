@@ -3387,7 +3387,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           // headless path via prepareResumeContext. The prepared ctx is handed
           // to the first turn via the reuse path (liveContext → sessionContext),
           // so the harness never re-hydrates the capped window.
-          const { ctx, info, compaction } = await prepareResumeContext({
+          const { ctx, info, compaction, costCapped } = await prepareResumeContext({
             db,
             sessionId: resumedSessionId,
             mode,
@@ -3408,7 +3408,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
             });
           }
           if (mode === 'summary') {
-            if (compaction?.kind === 'error') {
+            if (costCapped) {
+              bus.emit({
+                type: 'info',
+                ts: now(),
+                tone: 'secondary',
+                message:
+                  '(already at the cost cap — skipped summary compaction; the run will stop for the cap)',
+              });
+            } else if (compaction?.kind === 'error') {
               bus.emit({
                 type: 'info',
                 ts: now(),
