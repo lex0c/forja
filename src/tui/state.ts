@@ -252,6 +252,7 @@ export interface ConfirmState {
     | 'memory-user-scope'
     | 'memory-action'
     | 'history-clear'
+    | 'resume-mode'
     | 'clarify';
   // Title block: bold first line + dim subject. `subject` is
   // optional — null when the modal has no single target.
@@ -2039,6 +2040,42 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             // Enter without reading shouldn't lose history.
             selectedIndex: options.length - 1,
             hints: ['Enter to confirm', 'Esc to cancel'],
+            queueDepth: 0,
+          },
+        },
+        permanent: [],
+      };
+    }
+
+    case 'resumemode:ask': {
+      // Two options: compact older turns first (recommended), or load the full
+      // (uncapped) session. From-summary is FIRST and the default cursor — it's
+      // the recommended resume (keeps context lean); full is the deliberate
+      // opt-out. Neither is destructive (Esc → capped default in the caller).
+      // The selectedIndex + option ORDER here MUST match the manager
+      // (modal-manager RESUME_MODE_OPTIONS + cursor 0) so the painted cursor
+      // and what Enter resolves can't drift.
+      const options: ConfirmOption[] = [
+        { key: '1', label: 'From summary (recommended)', value: 'summary' },
+        { key: '2', label: 'Full session', value: 'full' },
+      ];
+      const blast =
+        event.totalCount === 1
+          ? '1 message in this session.'
+          : `${event.totalCount} messages in this session.`;
+      return {
+        state: {
+          ...state,
+          modal: {
+            promptId: event.promptId,
+            flavor: 'resume-mode',
+            title: 'Resume session',
+            subject: null,
+            preview: [blast, '', 'From summary: compact older turns first. Full: load everything.'],
+            question: 'How do you want to load this session?',
+            options,
+            selectedIndex: 0,
+            hints: ['Enter to confirm', 'Esc for recent-only'],
             queueDepth: 0,
           },
         },

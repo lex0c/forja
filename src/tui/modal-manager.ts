@@ -297,6 +297,23 @@ export type ClarifyManagerAnswer =
   | { outcome: 'resolved'; chosen_option_id: string }
   | { outcome: 'skipped' };
 
+// Resume-mode flavor (resume "from summary" feature). Raised at boot for an
+// interactive `--resume` without a `--resume-mode` flag.
+export interface ResumeModeAskArgs {
+  // Full persisted message count — surfaced in the modal preview.
+  totalCount: number;
+}
+// 'capped' is the Esc/cancel fallback (the bounded default resume window).
+export type ResumeModeAnswer = 'full' | 'summary' | 'capped';
+
+// Summary is FIRST and the default cursor (index 0): compacting older turns is
+// the recommended resume — it keeps the model's context lean and is what most
+// resumes want. Full (load everything) is the deliberate opt-out below it.
+const RESUME_MODE_OPTIONS: readonly ConfirmOption[] = [
+  { key: '1', label: 'From summary (recommended)', value: 'summary' },
+  { key: '2', label: 'Full session', value: 'full' },
+];
+
 export interface ModalManager {
   // Permission flavor. Returns the user's choice (or 'cancel' on Esc /
   // close / timeout). Callers translate semantics: yes → execute,
@@ -357,6 +374,9 @@ export interface ModalManager {
   // Clarify flavor (STATE_MACHINE §12). Producer is the clarify tool's
   // modal bridge. Resolves with the operator's pick or `skipped`.
   askClarify: (args: ClarifyAskArgs, opts?: ConfirmAskOptions) => Promise<ClarifyManagerAnswer>;
+  // Resume-mode selection. Resolves 'full' / 'summary', or 'capped' on
+  // Esc / close / timeout (the safe bounded-window fallback).
+  askResumeMode: (args: ResumeModeAskArgs, opts?: ConfirmAskOptions) => Promise<ResumeModeAnswer>;
   // Number of pending modals (active + queued). Tests inspect.
   pendingCount: () => number;
   // Drop the queue and resolve any pending promise as `cancel`. Used
@@ -887,6 +907,22 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
                 chosen_option_id: value.slice(CLARIFY_OPTION_VALUE_PREFIX.length),
               },
       ),
+    askResumeMode: (args, opts) =>
+      enqueueConfirm<'full' | 'summary' | 'cancel'>(
+        (promptId) => ({
+          type: 'resumemode:ask',
+          ts: now(),
+          promptId,
+          totalCount: args.totalCount,
+        }),
+        RESUME_MODE_OPTIONS,
+        opts?.timeoutMs,
+        opts?.signal,
+        // Cursor on the first option (From summary — the recommended default).
+        // Matches the reducer's resumemode:ask selectedIndex so paint and Enter
+        // agree.
+        0,
+      ).then((value): ResumeModeAnswer => (value === 'cancel' ? 'capped' : value)),
     pendingCount: () => (active !== null ? 1 : 0) + queue.length,
     close: () => {
       closed = true;

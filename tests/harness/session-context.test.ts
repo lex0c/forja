@@ -146,6 +146,27 @@ describe('SessionContext: hydrateFromDb', () => {
     expect(info.totalDropped).toBe(0);
   });
 
+  test('uncapped option loads all rows and reports totalCount', () => {
+    const seed = SessionContext.createFresh(db, sessionId);
+    seed.appendUser('goal', null);
+    seed.appendAssistant(textBlock('a1'), noUsage, null);
+    seed.appendUser('q2', null);
+    seed.appendAssistant(textBlock('a2'), noUsage, null);
+
+    const { ctx, info } = SessionContext.hydrateFromDb(db, sessionId, { uncapped: true });
+    expect(ctx.getMessages()).toHaveLength(4);
+    expect(info.kept).toBe(4);
+    expect(info.totalCount).toBe(4);
+  });
+
+  test('capped (default) populates totalCount for the warn threshold', () => {
+    const seed = SessionContext.createFresh(db, sessionId);
+    seed.appendUser('goal', null);
+    seed.appendAssistant(textBlock('ok'), noUsage, null);
+    const { info } = SessionContext.hydrateFromDb(db, sessionId);
+    expect(info.totalCount).toBe(2);
+  });
+
   test('a turn appended onto a hydrated context chains off the persisted tail', () => {
     const seed = SessionContext.createFresh(db, sessionId);
     seed.appendUser('goal', null);
