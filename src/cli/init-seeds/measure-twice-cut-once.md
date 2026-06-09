@@ -20,9 +20,9 @@ certainty that was not verified.
 fabrication, an unforeseen blast radius, a blind
 Edit — come from cutting before measuring. Verifying costs seconds;
 undoing a wrong cut costs from hours to impossible. The other seeds
-(confirm-blast-radius, safe-edit-discipline, no-fabrication,
-failure-root-cause) are concrete instances of this; this is the
-general test for when none of the specific ones covers the case.
+(confirm-blast-radius, failure-root-cause) are concrete instances of
+this; this is the general test for when none of the specific ones
+covers the case.
 
 **How to apply:**
 - Measure: read/grep/ls/`git status` to confirm the real target before

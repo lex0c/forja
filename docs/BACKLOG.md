@@ -2,6 +2,24 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-09] chore(seeds): drop 4 vendor seeds redundant with the always-on system prompt
+
+The vendor seed pack carried 4 seeds whose doctrine is already hard-coded, always-on, in the
+system prompt: `prefer-specialized-navigation` (= `tool-ergonomics-prompt`), `no-fabrication`
+(= constraints "Don't invent" / "Evidence over assumption"), `scope-discipline` (= "Build only
+what's asked"), `safe-edit-discipline` (= "Investigate before editing" + edit-craft). Each cost
+an always-on index line plus a body the model could load for guidance it already has every turn.
+Cut them: 11 → 7. `respect-repo-conventions` kept — only its code-convention half duplicates
+constraints; the commit-convention half isn't in the always-on prompt. `measure-twice-cut-once`'s
+"concrete instances" list pruned to the surviving seeds.
+
+`§5.7.8` is the "catálogo default sugerido / esboço" — descriptive, not normative (the normative
+part is the `§5.7.7` cap of 11, still honored), so trimming the catalog is within spec; operator
+asked to leave `docs/spec/` untouched (code-behind-spec). Tests: count 11→7, the seeds-installer
+operator-edit fixture retargeted to a surviving seed; full seed/memory suite green (551 pass),
+typecheck + biome clean. The token win is tiny (seed bodies are lazy — only the index line is
+always-on); the point is hygiene, removing doctrine duplicated in the always-on floor.
+
 ## [2026-06-09] eval(compaction): controlled A/B for "compact/elide earlier" — keep threshold 0.7
 
 Closes the open follow-up in `CONTEXT_TUNING §990` / BACKLOG 404-416: a same-relevance,
