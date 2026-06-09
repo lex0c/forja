@@ -860,6 +860,25 @@ describe('queued inbox messages (INBOX §6)', () => {
     expect(out.some((l) => l.includes('queued'))).toBe(false);
   });
 
+  test('the last queued bar HUGS the input rule — no blank line between them', () => {
+    const state: LiveState = {
+      ...startedSession(),
+      queued: [{ id: '0', text: 'queued msg' }],
+    };
+    const out = composeLive(state, caps, 0);
+    const ruleIdx = out.findIndex((l) => l.startsWith('─') || l.startsWith('-'));
+    // The line directly above the input's top rule is the queued bar itself,
+    // not a blank — so a pending message reads as attached to the input box.
+    expect(out[ruleIdx - 1]).toContain('> queued msg');
+  });
+
+  test('with no queue, a blank line still sits above the input rule (unchanged)', () => {
+    const out = composeLive(startedSession(), caps, 0);
+    const ruleIdx = out.findIndex((l) => l.startsWith('─') || l.startsWith('-'));
+    // padFrame('') is 2 spaces, no other content.
+    expect((out[ruleIdx - 1] ?? '').trim()).toBe('');
+  });
+
   test('the message being edited is hidden from the queue block (it lifts into the input)', () => {
     const state: LiveState = {
       ...startedSession(),

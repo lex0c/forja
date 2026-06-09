@@ -403,20 +403,22 @@ export const composeLive: ComposeLive = (
   const visibleQueued =
     state.editingId === null ? state.queued : state.queued.filter((q) => q.id !== state.editingId);
   appendBlock(renderQueued(visibleQueued, caps));
-  // Always 1 blank line above the input block (rule + input + rule),
-  // regardless of whether the upper live region has content. This
-  // line ALSO separates the top of the input rule from whatever
-  // permanent content sits in scrollback right above the live
-  // region: the bottom of the assistant text (or any other
-  // permanent line) ends up adjacent to the rule otherwise, and
-  // the typing zone visually fuses with the conversation.
-  // Bash mode (idle `!cmd`): the input box — both rules + the line
-  // itself — renders yellow. Single `isBashMode` predicate
-  // (render/mode.ts) shared with renderInput / composeCursor / footer
-  // so the whole block agrees; idle-gated so a `!` typed mid-turn stays
-  // a normal gray draft (it'd be refused on submit anyway).
+  // 1 blank line above the input block (rule + input + rule) to keep the
+  // typing zone from fusing with whatever permanent content sits in scrollback
+  // right above it. EXCEPT when queued inbox bars sit directly above: those
+  // should HUG the input box (read as "pending, attached to where I type")
+  // rather than float a line above it — and they already carry their own
+  // leading blank (appendBlock) separating them from scrollback. So drop the
+  // gap when the queue is non-empty. Cursor math is unaffected: composeCursor
+  // anchors the input row from the BOTTOM (lineCount − trailingBelowInput −
+  // inputLineCount), so a blank removed ABOVE the input shifts nothing.
+  // Bash mode (idle `!cmd`): the input box — both rules + the line itself —
+  // renders yellow. Single `isBashMode` predicate (render/mode.ts) shared with
+  // renderInput / composeCursor / footer so the whole block agrees.
   const bashMode = isBashMode(state);
-  lines.push(padFrame(''));
+  if (visibleQueued.length === 0) {
+    lines.push(padFrame(''));
+  }
   lines.push(horizontalRule(caps, bashMode));
   // Input is the single OUTDENTED element (UI.md §6.3 frame margin
   // exception). No padFrame here — the prompt `> ` lives at col 0

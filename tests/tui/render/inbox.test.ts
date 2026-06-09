@@ -24,14 +24,16 @@ describe('renderQueued (INBOX §6 — queued bars)', () => {
     expect(out[0]?.startsWith('  ')).toBe(false);
   });
 
-  test('padded to frame width (cols - 2)', () => {
+  test('padded to cols - 4 (inset both sides: left margin via padFrame, right via the shorter band)', () => {
     const out = renderQueued([{ id: '0', text: 'hi' }], caps);
     // reverse() wraps as `${CSI}7m<padded>${SGR.reset}`; strip the
     // known prefix/suffix (no regex — avoids a control char in source).
     const bar = out[0] ?? '';
     const visible = bar.slice(`${CSI}7m`.length, bar.length - SGR.reset.length);
-    expect(visible).toBe(`> hi${' '.repeat(caps.cols - 2 - '> hi'.length)}`);
-    expect(visible).toHaveLength(caps.cols - 2);
+    // cols - 4 (not cols - 2) so the band leaves a 2-col right margin — the
+    // left 2 cols are appendBlock's padFrame. A sent bar is full-width.
+    expect(visible).toBe(`> hi${' '.repeat(caps.cols - 4 - '> hi'.length)}`);
+    expect(visible).toHaveLength(caps.cols - 4);
   });
 
   test('accumulates one bar per item, FIFO', () => {
