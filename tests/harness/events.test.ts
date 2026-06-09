@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
 import type { CollectedStep } from '../../src/harness/collect.ts';
 import { runAgent } from '../../src/harness/loop.ts';
+import { SessionContext } from '../../src/harness/session-context.ts';
 import type { HarnessEvent } from '../../src/harness/types.ts';
 import { createPermissionEngine } from '../../src/permissions/index.ts';
 import type { Policy } from '../../src/permissions/index.ts';
@@ -214,6 +215,67 @@ describe('runAgent onEvent', () => {
     expect(rehydrate).toBeDefined();
     if (rehydrate?.type !== 'resume_rehydrated') throw new Error('expected resume_rehydrated');
     expect(rehydrate.previousStatus).toBe('interrupted');
+  });
+
+  test('reuse + resumeWithSessionContext rehydrates (full/summary resume path)', async () => {
+    // full/summary resume pre-hydrates the context in the CLI and passes it as
+    // sessionContext (reuse path) instead of resumeFromSessionId. With the
+    // resumeWithSessionContext flag, the FIRST such turn must still run the
+    // [resume_context] rehydrate — otherwise it silently loses the crash-
+    // recovery recap the capped --resume path provides.
+    const r1 = await runAgent({
+      provider: mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]),
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'first',
+    });
+    db.query('UPDATE sessions SET status = ? WHERE id = ?').run('interrupted', r1.sessionId);
+    // Simulate the CLI prehydration (uncapped) of a fresh-process resume.
+    const hydrated = SessionContext.hydrateFromDb(db, r1.sessionId, { uncapped: true });
+
+    const events: HarnessEvent[] = [];
+    await runAgent({
+      provider: mockProvider([{ text: 'follow-up', stop_reason: 'end_turn' }]),
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'follow up',
+      sessionContext: hydrated.ctx,
+      resumeWithSessionContext: true,
+      onEvent: (e) => events.push(e),
+    });
+    expect(events.some((e) => e.type === 'resume_rehydrated')).toBe(true);
+  });
+
+  test('reuse WITHOUT resumeWithSessionContext does NOT rehydrate (plain multi-turn)', async () => {
+    // The REPL's follow-up turns reuse the live context with no flag — they
+    // must NOT re-run the recap (the first turn already saw it).
+    const r1 = await runAgent({
+      provider: mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]),
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'first',
+    });
+    db.query('UPDATE sessions SET status = ? WHERE id = ?').run('interrupted', r1.sessionId);
+    const hydrated = SessionContext.hydrateFromDb(db, r1.sessionId, { uncapped: true });
+
+    const events: HarnessEvent[] = [];
+    await runAgent({
+      provider: mockProvider([{ text: 'follow-up', stop_reason: 'end_turn' }]),
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'follow up',
+      sessionContext: hydrated.ctx,
+      onEvent: (e) => events.push(e),
+    });
+    expect(events.some((e) => e.type === 'resume_rehydrated')).toBe(false);
   });
 
   test('skips recap_terse_ready when buildAutoTerse fails — session_finished still emits', async () => {

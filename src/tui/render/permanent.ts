@@ -14,7 +14,7 @@ import { sanitizeOneLineForDisplay } from '../../sanitize/ansi.ts';
 import type { PermanentItem } from '../state.ts';
 import { type Capabilities, paint, paintMulti, reverse } from '../term.ts';
 import { formatChipDuration, formatCoarseDuration } from './duration.ts';
-import { FRAME_MARGIN, frameWidth, padFrame } from './frame.ts';
+import { padFrame } from './frame.ts';
 import { ellipsisGlyph, subContentConnector, treeBranchConnector } from './glyphs.ts';
 import { renderMarkdown } from './markdown.ts';
 import { visualWidth } from './width.ts';
@@ -147,32 +147,27 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // the env detail was low-signal at boot. `item.env` still
       // flows into the PermanentItem for NDJSON / audit consumers.
       //
-      // §13.7 sandbox-enforcement: when `sandboxActive` is set,
-      // a third line sits inside the banner frame (secondary
-      // greyscale, no leading blank) so the affirmative posture
-      // reads as part of the banner — not as a separate alert.
-      // Non-active states (no-tool / operator-override / degraded
-      // passthrough) ride the warn/error event channels with the
-      // standard leading blank, since they ARE warnings.
+      // The affirmative "✓ sandbox enforcement active" line was dropped
+      // from the banner — boot greenlight noise the operator doesn't act
+      // on. `item.sandboxActive` still flows into the PermanentItem for
+      // NDJSON / audit consumers; the NON-active sandbox states (no-tool /
+      // operator-override / degraded passthrough) still surface on the
+      // warn/error channels, since those ARE warnings.
       const versionDisplay = item.version.startsWith('v') ? item.version : `v${item.version}`;
       const lines = [
         `${paint(caps, 'bold', item.app)} ${paint(caps, 'secondary', versionDisplay)}`,
         paint(caps, 'secondary', item.cwd),
       ];
-      if (item.sandboxActive !== undefined) {
-        lines.push(
-          paint(caps, 'secondary', `✓ sandbox enforcement active (${item.sandboxActive})`),
-        );
-      }
       return lines.map(padFrame);
     }
     case 'user-submit': {
       // UI.md §4.10.8 — inverse bar acts as a structural divider in
       // scrollback (rolling back, the bars locate turns without
-      // inventing headings). The frame margin (§6.3) sits OUTSIDE the
-      // SGR 7 wrap: 2sp of normal-bg space, then the inverse bar
-      // from col 2 to col cols-1. The bar is padded internally to
-      // `cols - 2` so the inverse extends to the right edge.
+      // inventing headings). Unlike the rest of the frame (§6.3), this
+      // bar goes edge-to-edge from col 0: no FRAME_MARGIN outside the
+      // SGR 7 wrap, padded internally to the full `cols` so the inverse
+      // spans the whole width — like the input box, it's a focal band,
+      // not indented content.
       //
       // Leading blank line per UI.md §6.3 ("1 blank line entre blocos
       // permanentes") — separates the new turn from whatever came
@@ -181,14 +176,14 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // turn rhythm becomes `Done. → blank → > prompt → content`,
       // which scans cleanly when the operator scrolls.
       const prefixed = item.text.split('\n').map((l, i) => (i === 0 ? `> ${l}` : `  ${l}`));
-      const innerWidth = frameWidth(caps);
+      const innerWidth = caps.cols;
       const bars = prefixed.map((line) => {
         // padEnd pads code units; for plain ASCII text that matches
         // visual columns. CJK / emoji content would over-pad —
         // accept the small inconsistency until visualWidth-aware
         // padding lands (no producer emits multi-col text today).
         const padded = line + ' '.repeat(Math.max(0, innerWidth - visualWidth(line)));
-        return `${FRAME_MARGIN}${reverse(padded)}`;
+        return reverse(padded);
       });
       return [padFrame(''), ...bars];
     }
@@ -315,7 +310,14 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
         }
       }
       if (item.outputTruncated === true) lines.push(truncationHint(caps, indent));
-      return lines.map(padFrame);
+      // Top-level chip: only the head hangs in the gutter — the `● ` prefix
+      // is exactly the frame-margin width, so dropping the margin on the head
+      // lands the verb back at col 2, with the glyph poking out at col 0 as a
+      // structural anchor (like the user-submit bar). Sub-content keeps the
+      // margin so subjects/diffs stay indented under the verb. Nested chips
+      // keep the margin throughout — their indent is the attribution signal.
+      // Head is at index 1 (after the leading blank).
+      return nested ? lines.map(padFrame) : lines.map((l, i) => (i === 1 ? l : padFrame(l)));
     }
     case 'tool-end-batch': {
       // Coalesced summary of N consecutive same-tool tool-end items.
@@ -384,7 +386,10 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
         lines.push(paint(caps, 'secondary', `${indent}${last}${ellipsis} +${moreN} more`));
       }
       if (item.outputTruncated === true) lines.push(truncationHint(caps, indent));
-      return lines.map(padFrame);
+      // Same gutter-glyph rule as the single tool-end chip: only the head
+      // (index 1, after the leading blank) drops the margin so the glyph hangs
+      // at col 0; the subject tree stays indented. See that case for why.
+      return nested ? lines.map(padFrame) : lines.map((l, i) => (i === 1 ? l : padFrame(l)));
     }
     case 'error':
       // Leading blank — alerts are top-level "session" blocks and

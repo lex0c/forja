@@ -509,6 +509,19 @@ export type HistoryClearAskEvent = BaseEvent & {
   projectRoot: string;
 };
 
+// Resume-mode selection (resume "from summary" feature). Raised at boot when
+// the operator runs `--resume <id>` interactively WITHOUT a `--resume-mode`
+// flag: a confirm-flavor modal (flavor 'resume-mode') asking whether to load
+// the full session or compact it first. Two options (Full session / From
+// summary); Esc/cancel falls back to the capped default in the caller.
+export type ResumeModeAskEvent = BaseEvent & {
+  type: 'resumemode:ask';
+  promptId: string;
+  // Full persisted message count for the session — surfaced in the modal so
+  // the operator can weigh "load all N" vs "compact".
+  totalCount: number;
+};
+
 // Todo list (live region above the operation chips, spec §4.3 / §4.10.6).
 // The full list is sent on every update — small enough that delta
 // tracking buys nothing, and the producer (TodoStore.set wrapper in
@@ -881,6 +894,7 @@ export type UIEvent =
   | TrustAskEvent
   | SharedTrustAskEvent
   | MemoryWriteAskEvent
+  | ResumeModeAskEvent
   | MemoryUserScopeAskEvent
   | MemoryActionAskEvent
   | HistoryClearAskEvent

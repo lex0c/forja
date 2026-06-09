@@ -2,6 +2,46 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-08] feat(resume): resume-mode selection (full / summary / capped)
+
+`forja --resume <id>` ganha escolha de como o contexto é carregado: **capped** (default,
+comportamento atual, tail ~500), **full** (uncapped — carrega tudo, avisa acima de
+`RESUME_FULL_WARN_THRESHOLD`) e **summary** (uncapped + compacta JÁ no boot, antes do replay, para não
+renderizar mensagens que serão dobradas). Seleção via modal `resume-mode` no interativo (TUI) e flag
+`--resume-mode full|summary` no headless; Esc/cancel → capped.
+
+Arquitetura CLI-centric, harness **intocado**: full/summary hidratam (`hydrateFromDb({uncapped})`) e,
+no summary, compactam no boot via `compactContextNow` (helper extraído do corpo do `/compact` — reusa
+eventos `compacting:*`, audit `compaction_events`, accounting de custo). O `SessionContext` pronto é
+passado ao 1º turn via `HarnessConfig.sessionContext` (reuse path); só capped segue em
+`resumeFromSessionId`. O modo só vale o 1º turn (depois é reuse normal).
+
+Peças: `resume.ts` (`resumeWindowCut(rows, cap)` + `messagesToProviderMessages(.,{uncapped})`),
+`messages` repo (`listMessageTailBySession(.,-1)` = sem cap + `countMessagesBySession`),
+`session-context.hydrateFromDb({uncapped})` (+ `HydrateInfo.totalCount`), `cli/compact-now.ts`
+(helper), `resume-replay.ts` (`replaySessionMessages(.,{uncapped})` + nova `replayProviderMessages`
+que renderiza o bloco-resumo em secondary), `args.ts` (`--resume-mode`), modal `resume-mode`
+(events/state/modal-manager), wiring em `repl.ts` (modal no boot, busy lock durante o prep) e `run.ts`
+(headless). Replay do summary roda sobre o array compactado (durações sintéticas — sem `createdAt`);
+full usa o replay de DB-rows uncapped. Coberto por testes em args/resume/session-context/resume-replay/
+modal-manager/state/repl (incl. modal "full" → sessionContext). spec PR depois da validação de UX.
+
+## [2026-06-08] fix(tui): stop the `Tasks` shimmer once the turn ends
+
+The `Tasks` header kept animating after a turn stopped — most visibly on an
+abnormal cut like `maxCostUsd`: the loop halts but the shimmer keeps signalling
+"still working", a false UX. Root cause: `state.todos` is a pure mirror of the
+last `todo:update` and persists across the turn boundary (neither
+`session:start` nor `session:end` clears it), so a task left at `in_progress`
+made `liveRegionActive` true forever, pinning the heartbeat awake and animating
+the shimmer against a dead turn. Gated both the heartbeat clause
+(`liveRegionActive`, `state.ts`) and the header's shimmer choice
+(`renderTodoList`, via a new `live` flag fed `!state.ended` from `compose.ts`)
+on the turn being live — they MUST agree, else the heartbeat idles while the
+header still wants to shimmer (freezes a stray highlighted char). The status
+breakdown still faithfully reports the frozen `in_progress` count; only the
+animation stops. Tests cover both the flat-header and idle-heartbeat paths.
+
 ## [2026-06-08] fix(google): gemini-2.5-pro context window 2M → 1M + verified Gemini 3.x
 
 Verified the Gemini context windows against ai.google.dev (the 3.x values were

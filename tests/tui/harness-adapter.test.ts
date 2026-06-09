@@ -1105,7 +1105,7 @@ describe('harness-adapter — compaction & checkpoints', () => {
     expect(e.stepN).toBe(4);
   });
 
-  test('checkpoint_created with hadBash=true emits a follow-up warn', () => {
+  test('checkpoint_created with hadBash=true emits a follow-up secondary info note', () => {
     const a = createHarnessAdapter(baseCtx());
     const out = a.translate({
       type: 'checkpoint_created',
@@ -1114,8 +1114,11 @@ describe('harness-adapter — compaction & checkpoints', () => {
       stepId: 's',
       hadBash: true,
     });
-    expect(types(out)).toEqual(['checkpoint:create', 'warn']);
-    const w = out[1] as Extract<UIEvent, { type: 'warn' }>;
+    // The bash-side-effects caveat rides the info channel in `secondary`
+    // (greyscale) — a passive note, not the yellow warn alarm.
+    expect(types(out)).toEqual(['checkpoint:create', 'info']);
+    const w = out[1] as Extract<UIEvent, { type: 'info' }>;
+    expect(w.tone).toBe('secondary');
     expect(w.message).toContain('bash');
   });
 

@@ -918,6 +918,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         }
         priorCostUsd = existing.totalCostUsd;
         priorUsageComplete = existing.usageComplete;
+        // Fresh-process resume that pre-hydrated its own context (the
+        // `--resume-mode full|summary` paths): snapshot the pre-resume status
+        // BEFORE reopenSession flips it to 'running', so the auto-rehydrate
+        // block below runs for this first turn exactly as the
+        // resumeFromSessionId path does. Plain REPL reuse leaves this null →
+        // no rehydrate (the live context already saw the recap).
+        if (config.resumeWithSessionContext === true) {
+          preResumeStatus = existing.status;
+        }
         reopenSession(config.db, liveCtx.sessionId);
         sessionId = liveCtx.sessionId;
         ctx = liveCtx;
@@ -2145,8 +2154,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // an unrehydrated prompt — the operator gets a working
       // resume instead of a hard failure.
       let effectiveUserPrompt = config.userPrompt;
+      // Gate on `preResumeStatus !== null`, which is set ONLY by the two
+      // resume entries: the resumeFromSessionId path, and the reuse path when
+      // `resumeWithSessionContext` is set (full/summary). So this one condition
+      // covers both — plain REPL reuse and fresh/preassigned leave it null.
       if (
-        resumeId !== undefined &&
         config.userPrompt.length > 0 &&
         preResumeStatus !== null &&
         !shouldSkipResumeContext(preResumeStatus)
@@ -2159,7 +2171,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // and reports the true prior status in the emitted event.
         try {
           const intermediate = projectRecap(config.db, {
-            scope: { kind: 'session_specific', sessionId: resumeId },
+            // `sessionId` (not `resumeId`): equals resumeId on the resume path
+            // and liveCtx.sessionId on the full/summary reuse path.
+            scope: { kind: 'session_specific', sessionId },
             now: Date.now(),
           });
           const block = buildResumeContext({

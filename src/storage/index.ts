@@ -37,6 +37,7 @@ export type {
 
 export {
   appendMessage,
+  countMessagesBySession,
   getMessage,
   listMessageTailBySession,
   listMessagesBySession,

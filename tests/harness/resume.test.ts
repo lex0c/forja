@@ -3,6 +3,7 @@ import {
   MAX_RESUME_MESSAGES,
   TRUNCATION_PLACEHOLDER,
   messagesToProviderMessages,
+  resumeWindowCut,
 } from '../../src/harness/resume.ts';
 import type { Message } from '../../src/storage/repos/messages.ts';
 
@@ -191,6 +192,30 @@ describe('messagesToProviderMessages', () => {
     expect(r.messages[0]?.content).toBe('msg-200');
     // Last kept is the (699)th original.
     expect(r.messages[r.messages.length - 1]?.content).toBe(`msg-${total - 1}`);
+  });
+
+  test('uncapped option keeps the entire log past the cap', () => {
+    // The "full"/"summary" resume modes: no MAX_RESUME_MESSAGES cap.
+    const total = MAX_RESUME_MESSAGES + 200;
+    const rows = alternating(total);
+    const r = messagesToProviderMessages(rows, { uncapped: true });
+    expect(r.messages).toHaveLength(total);
+    expect(r.droppedFromHead).toBe(0);
+    expect(r.messages[0]?.content).toBe('msg-0');
+  });
+
+  test('resumeWindowCut(rows, Infinity) drops 0 but still runs the safe-head walk', () => {
+    // Uncapped must NOT orphan a leading user_tool_result: its matching
+    // tool_use sat in an earlier assistant, so the walk skips it.
+    const rows: Message[] = [
+      msg('user', [{ type: 'tool_result', tool_use_id: 'x', content: 'r' }]),
+      msg('assistant', [{ type: 'text', text: 'a' }]),
+      msg('user', 'prompt'),
+    ];
+    expect(resumeWindowCut(rows, Number.POSITIVE_INFINITY)).toBe(1);
+    // And with the default cap on a short list, identical (cut driven by the
+    // walk, not the cap).
+    expect(resumeWindowCut(rows)).toBe(1);
   });
 });
 

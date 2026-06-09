@@ -286,7 +286,16 @@ export const composeLive: ComposeLive = (
   // above the TodoList + phase chip below — read, write, bash… pile upward
   // as the harness fires them.
   for (const tool of state.activeTools.values()) {
-    appendBlock(renderToolCardLive(tool, caps, now));
+    // Only the card head hangs in the gutter (glyph at col 0, verb at col 2),
+    // matching the settled `tool-end` chip (permanent.ts) so the card doesn't
+    // shift when it moves live → scrollback. Sub-content (subject / preview)
+    // keeps the frame margin. The leading blank separator (appendBlock's
+    // contract) is kept for the same vertical rhythm as every other block.
+    const block = renderToolCardLive(tool, caps, now);
+    if (block.length === 0) continue;
+    lines.push(padFrame(''));
+    lines.push(block[0] as string);
+    for (let i = 1; i < block.length; i++) lines.push(padFrame(block[i] as string));
   }
 
   // 4. Live TodoList, pinned at the BOTTOM of the volatile stack — just
@@ -298,7 +307,7 @@ export const composeLive: ComposeLive = (
   // grows/shrinks overhead. renderTodoList returns [] when empty — the
   // section drops. Diverges from spec §4.10.6 ("Todo list acima dos
   // chips") — folds into the pending todolist spec follow-up.
-  appendBlock(renderTodoList(state.todos, caps, now));
+  appendBlock(renderTodoList(state.todos, caps, now, !state.ended));
 
   // 5. Pinned turn-phase chip. The single live indicator for what the
   // turn is doing right now — it sits at the BOTTOM of the live region
@@ -394,20 +403,22 @@ export const composeLive: ComposeLive = (
   const visibleQueued =
     state.editingId === null ? state.queued : state.queued.filter((q) => q.id !== state.editingId);
   appendBlock(renderQueued(visibleQueued, caps));
-  // Always 1 blank line above the input block (rule + input + rule),
-  // regardless of whether the upper live region has content. This
-  // line ALSO separates the top of the input rule from whatever
-  // permanent content sits in scrollback right above the live
-  // region: the bottom of the assistant text (or any other
-  // permanent line) ends up adjacent to the rule otherwise, and
-  // the typing zone visually fuses with the conversation.
-  // Bash mode (idle `!cmd`): the input box — both rules + the line
-  // itself — renders yellow. Single `isBashMode` predicate
-  // (render/mode.ts) shared with renderInput / composeCursor / footer
-  // so the whole block agrees; idle-gated so a `!` typed mid-turn stays
-  // a normal gray draft (it'd be refused on submit anyway).
+  // 1 blank line above the input block (rule + input + rule) to keep the
+  // typing zone from fusing with whatever permanent content sits in scrollback
+  // right above it. EXCEPT when queued inbox bars sit directly above: those
+  // should HUG the input box (read as "pending, attached to where I type")
+  // rather than float a line above it — and they already carry their own
+  // leading blank (appendBlock) separating them from scrollback. So drop the
+  // gap when the queue is non-empty. Cursor math is unaffected: composeCursor
+  // anchors the input row from the BOTTOM (lineCount − trailingBelowInput −
+  // inputLineCount), so a blank removed ABOVE the input shifts nothing.
+  // Bash mode (idle `!cmd`): the input box — both rules + the line itself —
+  // renders yellow. Single `isBashMode` predicate (render/mode.ts) shared with
+  // renderInput / composeCursor / footer so the whole block agrees.
   const bashMode = isBashMode(state);
-  lines.push(padFrame(''));
+  if (visibleQueued.length === 0) {
+    lines.push(padFrame(''));
+  }
   lines.push(horizontalRule(caps, bashMode));
   // Input is the single OUTDENTED element (UI.md §6.3 frame margin
   // exception). No padFrame here — the prompt `> ` lives at col 0

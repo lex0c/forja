@@ -1,8 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import {
-  OUTPUT_STYLE_PROMPT,
-  composeWithOutputStyle,
-} from '../../src/cli/output-style-prompt.ts';
+import { OUTPUT_STYLE_PROMPT, composeWithOutputStyle } from '../../src/cli/output-style-prompt.ts';
 
 describe('output-style-prompt', () => {
   test('anchors the density default — signal per token, not brevity', () => {

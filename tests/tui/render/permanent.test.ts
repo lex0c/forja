@@ -176,6 +176,15 @@ describe('formatPermanent', () => {
       expect(out[0]).toContain('\x1b[90mv0.1.0\x1b[0m');
     });
 
+    test('sandboxActive does NOT render the affirmative enforcement line', () => {
+      // The "✓ sandbox enforcement active" greenlight was dropped from the
+      // banner (boot noise the operator doesn't act on). The field still
+      // rides on the PermanentItem for NDJSON / audit, but must not surface.
+      const out = formatPermanent({ ...baseBanner, sandboxActive: 'bwrap' }, unicode);
+      expect(out).toHaveLength(2);
+      expect(out.join('\n')).not.toContain('sandbox enforcement active');
+    });
+
     test('env contents do NOT leak into the rendered banner', () => {
       // env still rides on the PermanentItem for NDJSON / audit,
       // but the TUI renderer must not surface flag names or meta
@@ -206,30 +215,28 @@ describe('formatPermanent', () => {
 
   describe('user-submit (inverse bar, UI.md §4.10.8)', () => {
     // SGR 7 (reverse) emits unconditionally — it's an attribute, not
-    // a color (works under NO_COLOR). Each line is padded internally
-    // to `cols - 2` (frame margin §6.3) before reversal so the bar
-    // runs from col 2 to col cols-1. The 2sp prefix is OUTSIDE the
-    // SGR 7 wrap (normal-bg space, not inverse) so the bar starts
-    // visibly at col 2, aligned with the rest of the padded content.
+    // a color (works under NO_COLOR). Unlike the rest of the frame, the
+    // bar goes edge-to-edge from col 0: NO frame margin outside the SGR
+    // 7 wrap, and each line is padded internally to the full `cols` so
+    // the inverse spans the whole width (like the input box).
     //
     // Leading blank line per UI.md §6.3 — separates each turn from
     // the previous one (Done. → blank → > prompt). out[0] is the
     // blank (just the frame margin); out[1..] are the inverse bars.
     const REVERSE_OPEN = '\x1b[7m';
     const RESET = '\x1b[0m';
-    // Line shape: '  ' (frame margin) + REVERSE_OPEN + content + RESET.
+    // Line shape: REVERSE_OPEN + content + RESET (no frame margin).
     // Helper strips the wrap to inspect the inner padded content.
-    const innerOf = (line: string): string =>
-      line.slice('  '.length + REVERSE_OPEN.length, -RESET.length);
+    const innerOf = (line: string): string => line.slice(REVERSE_OPEN.length, -RESET.length);
 
-    test('emits leading blank + reversed (cols-2)-padded content', () => {
+    test('emits leading blank + reversed full-width-padded content', () => {
       const out = formatPermanent({ kind: 'user-submit', text: 'hi' }, ascii);
       expect(out).toHaveLength(2);
       expect(out[0]).toBe(pad(''));
       const line = out[1] ?? '';
-      expect(line.startsWith(`  ${REVERSE_OPEN}`)).toBe(true);
+      expect(line.startsWith(REVERSE_OPEN)).toBe(true);
       expect(line.endsWith(RESET)).toBe(true);
-      expect(innerOf(line)).toBe('> hi'.padEnd(ascii.cols - 2));
+      expect(innerOf(line)).toBe('> hi'.padEnd(ascii.cols));
     });
 
     test('multi-line submit: blank + first line with `>`, continuations with `  `', () => {
@@ -238,13 +245,13 @@ describe('formatPermanent', () => {
       expect(out[0]).toBe(pad(''));
       const inners = out.slice(1).map(innerOf);
       expect(inners).toEqual([
-        '> first'.padEnd(ascii.cols - 2),
-        '  second'.padEnd(ascii.cols - 2),
-        '  third'.padEnd(ascii.cols - 2),
+        '> first'.padEnd(ascii.cols),
+        '  second'.padEnd(ascii.cols),
+        '  third'.padEnd(ascii.cols),
       ]);
-      // Each bar line independently wrapped in frame margin + SGR 7 + reset.
+      // Each bar line independently wrapped in SGR 7 + reset, edge-to-edge.
       for (const l of out.slice(1)) {
-        expect(l.startsWith(`  ${REVERSE_OPEN}`)).toBe(true);
+        expect(l.startsWith(REVERSE_OPEN)).toBe(true);
         expect(l.endsWith(RESET)).toBe(true);
       }
     });
@@ -348,7 +355,9 @@ describe('formatPermanent', () => {
       );
       expect(out).toHaveLength(3);
       expect(out[0]).toBe(pad(''));
-      expect(out[1]).toBe(pad('● Read file  [850ms]'));
+      // Top-level chip head hangs in the gutter: the glyph sits at col 0,
+      // the `● ` prefix lands the verb at col 2. Sub-content keeps the margin.
+      expect(out[1]).toBe('● Read file  [850ms]');
       expect(out[2]).toBe(pad('└─ /foo.ts'));
     });
 
@@ -369,7 +378,7 @@ describe('formatPermanent', () => {
         unicode,
       );
       expect(out).toHaveLength(3);
-      expect(out[1]).toBe(pad('● Called clarify  [850ms]'));
+      expect(out[1]).toBe('● Called clarify  [850ms]');
       expect(out[2]).toBe(pad('└─ which file? → src/checkout.ts'));
     });
 
@@ -386,7 +395,7 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out[1]).toBe(pad('● Executed  exit 1  [30ms]'));
+      expect(out[1]).toBe('● Executed  exit 1  [30ms]');
     });
 
     test('nested (parentId set): no leading blank + |_ glyph + indented sub-content', () => {
@@ -489,7 +498,7 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out).toEqual([pad(''), pad('● Updated todos  [50ms]')]);
+      expect(out).toEqual([pad(''), '● Updated todos  [50ms]']);
     });
 
     test('error status overrides verb to "Failed" regardless of vocab', () => {
@@ -596,7 +605,7 @@ describe('formatPermanent', () => {
       expect(out[2]).toBe(pad('└─ 3 items added'));
     });
 
-    test('chip glyph is `●` under Unicode, `*` under ASCII (after frame margin)', () => {
+    test('chip glyph is `●` under Unicode, `*` under ASCII (hangs at col 0)', () => {
       const u = formatPermanent(
         {
           kind: 'tool-end',
@@ -619,10 +628,11 @@ describe('formatPermanent', () => {
         },
         ascii,
       );
-      // Glyph sits at column 2 (after the 2sp frame margin) on the
-      // chip head row (out[1] — out[0] is the leading blank).
-      expect(u[1]?.charAt(2)).toBe('●');
-      expect(a[1]?.charAt(2)).toBe('*');
+      // Top-level chip head hangs in the gutter: the glyph sits at column 0
+      // (no frame margin) on the chip head row (out[1] — out[0] is the
+      // leading blank). The `<glyph> ` prefix lands the verb at col 2.
+      expect(u[1]?.charAt(0)).toBe('●');
+      expect(a[1]?.charAt(0)).toBe('*');
     });
 
     test('connector is `└─ ` under Unicode, `\\- ` under ASCII', () => {
@@ -870,7 +880,7 @@ describe('formatPermanent', () => {
       // align at the head glyph column — no extra indent top-level.
       expect(out).toEqual([
         pad(''),
-        pad('● Read 3 files  [4.5s]'),
+        '● Read 3 files  [4.5s]',
         pad('├─ src/a.ts'),
         pad('├─ src/b.ts'),
         pad('└─ src/c.ts'),
@@ -914,7 +924,7 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out[1]).toBe(pad('● Executed 6 commands  [900ms]'));
+      expect(out[1]).toBe('● Executed 6 commands  [900ms]');
     });
 
     test('outputTruncated appends one hint line under the batch body', () => {
@@ -952,7 +962,7 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out).toEqual([pad(''), pad('● Read 2 files  [80ms]'), pad('└─ only.ts')]);
+      expect(out).toEqual([pad(''), '● Read 2 files  [80ms]', pad('└─ only.ts')]);
     });
 
     test('nested batch: no leading blank + |_ head + single-indent tree', () => {
@@ -1020,7 +1030,7 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out).toEqual([pad(''), pad('● Echoed ×3  [30ms]')]);
+      expect(out).toEqual([pad(''), '● Echoed ×3  [30ms]']);
     });
 
     test('long subject list caps at MAX_BATCH_SUBJECTS with a +N more tail', () => {
@@ -1041,7 +1051,7 @@ describe('formatPermanent', () => {
       );
       expect(out).toEqual([
         pad(''),
-        pad('● Read 9 files  [90ms]'),
+        '● Read 9 files  [90ms]',
         pad('├─ a'),
         pad('├─ b'),
         pad('├─ c'),
@@ -1068,7 +1078,7 @@ describe('formatPermanent', () => {
       );
       expect(out).toEqual([
         pad(''),
-        pad('● Read 5 files  [50ms]'),
+        '● Read 5 files  [50ms]',
         pad('├─ a'),
         pad('├─ b'),
         pad('├─ c'),
@@ -1095,7 +1105,7 @@ describe('formatPermanent', () => {
       );
       expect(out).toEqual([
         pad(''),
-        pad('● Read 6 files  [60ms]'),
+        '● Read 6 files  [60ms]',
         pad('├─ a'),
         pad('├─ b'),
         pad('├─ c'),
@@ -1120,7 +1130,7 @@ describe('formatPermanent', () => {
         },
         ascii,
       );
-      expect(out[1]).toBe(pad('* Read 2 files  [200ms]'));
+      expect(out[1]).toBe('* Read 2 files  [200ms]');
       expect(out[2]).toBe(pad('+- a.ts'));
       expect(out[3]).toBe(pad('\\- b.ts'));
     });

@@ -1,4 +1,6 @@
-import { type HarnessResult, runAgent } from '../harness/index.ts';
+import { type HarnessResult, type SessionContext, runAgent } from '../harness/index.ts';
+import { RESUME_FULL_WARN_THRESHOLD } from '../harness/resume.ts';
+import { effectiveBudget } from '../harness/types.ts';
 import {
   type DB,
   closeDb,
@@ -16,6 +18,7 @@ import { runListSessions } from './list-sessions.ts';
 import { createJsonRenderer } from './output/json.ts';
 import { createPlainRenderer } from './output/plain.ts';
 import type { OutputRenderer } from './output/types.ts';
+import { prepareResumeContext } from './resume-prepare.ts';
 import { installSignalHandler } from './signal.ts';
 
 export interface RunOptions {
@@ -152,11 +155,12 @@ const resolveResumeId = (
   resume: string,
   dbPath: string,
   cwd: string,
+  enforceCwd = false,
 ): { ok: true; id: string } | { ok: false; message: string } => {
   const db = openDb(dbPath);
   try {
     migrate(db);
-    return resolveResumeIdOnDb(db, resume, cwd);
+    return resolveResumeIdOnDb(db, resume, cwd, enforceCwd);
   } finally {
     closeDb(db);
   }
@@ -670,7 +674,14 @@ export const run = async (options: RunOptions): Promise<number> => {
       // the resume resolution and the harness's cwd guard might
       // disagree on which directory is "current".
       const cwd = options.bootstrapOverride?.cwd ?? process.cwd();
-      const resolved = resolveResumeId(args.resume, dbPath, cwd);
+      // Enforce cwd at resolution when a resume MODE is set: full/summary
+      // pre-hydrate (and summary compacts — sending history to the provider +
+      // writing cost/audit rows) BEFORE runAgent's cwd guard runs. A literal
+      // cross-cwd id (mistyped / copied from another project) must be rejected
+      // here, not after that work — same "guard before any work" reasoning the
+      // REPL relies on for its early scrollback replay. Capped (no mode, no
+      // pre-work) stays permissive: runAgent's guard catches it before work.
+      const resolved = resolveResumeId(args.resume, dbPath, cwd, args.resumeMode !== undefined);
       if (!resolved.ok) {
         errSink(`forja: ${resolved.message}\n`);
         return 1;
@@ -883,10 +894,88 @@ export const run = async (options: RunOptions): Promise<number> => {
       }
     }
 
-    const cfg = {
-      ...config,
-      onEvent: (e: Parameters<OutputRenderer['onEvent']>[0]) => renderer.onEvent(e),
+    // Resume-mode (headless): full/summary hydrate the WHOLE log (and summary
+    // compacts it) at boot, then hand the first turn a ready SessionContext via
+    // the reuse path instead of the harness's capped resumeFromSessionId
+    // hydration. No scrollback here, so the "render-then-discard" concern
+    // doesn't apply — this just honors --resume-mode for headless runs. Capped
+    // (no flag) keeps the existing resumeFromSessionId path untouched.
+    let resumeSessionContext: SessionContext | undefined;
+    // Billed cost of a boot-time summary compaction (if any). Headless has no
+    // cumulative tracker and runAgent's per-run result.costUsd excludes work
+    // that billed BEFORE the run, so we fold it into the reported cost below.
+    let bootCompactionCostUsd = 0;
+    if (resumeFromSessionId !== undefined && args.resumeMode !== undefined) {
+      try {
+        // Same hydrate(+compact) core as the interactive path
+        // (prepareResumeContext); headless surfaces warnings via stderr and
+        // skips the chip/cumulative (no scrollback / REPL cumulative).
+        const { ctx, info, compaction, costCapped } = await prepareResumeContext({
+          db,
+          sessionId: resumeFromSessionId,
+          mode: args.resumeMode,
+          provider: config.provider,
+          budget: effectiveBudget(config.budget, config.effort),
+          memoryRegistryPresent: config.memoryRegistry !== undefined,
+          now: Date.now,
+          signal,
+        });
+        resumeSessionContext = ctx;
+        if (compaction?.kind === 'ok') bootCompactionCostUsd = compaction.costUsd;
+        if (info.totalCount > RESUME_FULL_WARN_THRESHOLD) {
+          errSink(
+            `forja: --resume-mode ${args.resumeMode} loaded ${info.totalCount} messages (full history)\n`,
+          );
+        }
+        if (costCapped) {
+          errSink(
+            'forja: --resume-mode summary skipped — session already at the cost cap; the run will stop for the cap\n',
+          );
+        } else if (compaction?.kind === 'error') {
+          errSink(
+            `forja: --resume-mode summary compaction failed: ${compaction.message} (resuming with full history)\n`,
+          );
+        }
+      } catch (e) {
+        errSink(
+          `forja: --resume-mode hydration failed: ${e instanceof Error ? e.message : String(e)} (falling back to capped resume)\n`,
+        );
+        resumeSessionContext = undefined;
+      }
+    }
+
+    // Fold the boot-time summary compaction cost into the reported
+    // session_finished cost: headless has no cumulative tracker, and runAgent's
+    // per-run result.costUsd excludes a compaction that billed before the run,
+    // so one-shot consumers (plain footer / JSON) would otherwise under-report
+    // the actual billed cost. The session row is already correct
+    // (compactContextNow updated it) — this only patches the emitted event.
+    const onEvent = (e: Parameters<OutputRenderer['onEvent']>[0]) => {
+      if (e.type === 'session_finished' && bootCompactionCostUsd > 0) {
+        renderer.onEvent({
+          ...e,
+          result: { ...e.result, costUsd: e.result.costUsd + bootCompactionCostUsd },
+        });
+        return;
+      }
+      renderer.onEvent(e);
     };
+    // Switch onto the reuse path when full/summary prepared a context. Omit
+    // resumeFromSessionId entirely (not set to undefined — exactOptional) so
+    // sessionContext / resumeFromSessionId stay mutually exclusive.
+    const { resumeFromSessionId: _omitResumeId, ...configWithoutResume } = config;
+    const cfg =
+      resumeSessionContext !== undefined
+        ? {
+            ...configWithoutResume,
+            sessionContext: resumeSessionContext,
+            // Headless is single-turn: this prehydrated context IS the first
+            // turn after a resume, so run the [resume_context] rehydrate (the
+            // capped --resume path gets it via resumeFromSessionId).
+            resumeWithSessionContext: true,
+            onEvent,
+          }
+        : { ...config, onEvent };
     try {
       const result = await runAgent(cfg);
       renderer.flush();

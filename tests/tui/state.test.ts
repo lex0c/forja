@@ -38,6 +38,18 @@ describe('liveRegionActive', () => {
     expect(liveRegionActive({ ...base, todos: [uiTodo('done'), uiTodo('pending')] })).toBe(false);
   });
 
+  test('a stopped turn (ended) idles even with a task frozen in_progress', () => {
+    const base = createInitialState();
+    // todos persist across the turn boundary (session:end never clears them),
+    // so a turn that stops mid-task — notably an abnormal cut like maxCostUsd —
+    // leaves a task at in_progress. Once ended, that must NOT keep the
+    // scheduler awake, or the Tasks header shimmers forever against a dead
+    // turn. Matches renderTodoList's `!live` flat-header path.
+    expect(liveRegionActive({ ...base, ended: true, todos: [uiTodo('in_progress')] })).toBe(false);
+    // Sanity: the same state while the turn is live (ended:false) stays active.
+    expect(liveRegionActive({ ...base, ended: false, todos: [uiTodo('in_progress')] })).toBe(true);
+  });
+
   test('also active for thinking / awaiting-provider (extracted logic intact)', () => {
     const base = createInitialState();
     expect(liveRegionActive({ ...base, thinking: { startedAt: 0, messageId: 'm' } })).toBe(true);
@@ -2720,5 +2732,40 @@ describe('busy:change (REPL isBusy mirror for the bash-mode gate)', () => {
     expect(on.permanent).toEqual([]);
     const off = applyEvent(on.state, { type: 'busy:change', ts: 2, busy: false });
     expect(off.state.busy).toBe(false);
+  });
+});
+
+describe('resumemode:ask reducer', () => {
+  test('builds a resume-mode modal with full/summary options, cursor on full', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'resumemode:ask',
+      ts: 1,
+      promptId: 'p1',
+      totalCount: 1234,
+    });
+    expect(r.state.modal).not.toBeNull();
+    expect(r.state.modal?.flavor).toBe('resume-mode');
+    // From-summary is first (recommended) and the default cursor.
+    expect(r.state.modal?.options.map((o) => o.value)).toEqual(['summary', 'full']);
+    expect(r.state.modal?.selectedIndex).toBe(0);
+    expect(r.state.modal?.options[0]?.label).toContain('recommended');
+    // totalCount surfaced in the preview so the operator sees the blast radius.
+    expect(String(r.state.modal?.preview[0])).toContain('1234');
+  });
+
+  test('modal:answer clears the resume-mode modal', () => {
+    const opened = applyEvent(createInitialState(), {
+      type: 'resumemode:ask',
+      ts: 1,
+      promptId: 'p1',
+      totalCount: 3,
+    });
+    const closed = applyEvent(opened.state, {
+      type: 'modal:answer',
+      ts: 2,
+      promptId: 'p1',
+      decision: 'full',
+    });
+    expect(closed.state.modal).toBeNull();
   });
 });
