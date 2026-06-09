@@ -946,6 +946,24 @@ describe('macOS — opt-in persistent cache (cache_persistence)', () => {
     expect(argv).toContain(`npm_config_cache=${PERSIST_BASE}/npm`);
   });
 
+  test('buildSandboxExecArgv (ON, ro) — redirect vars present (reads Forja cache RO), but SBPL has no write-allow', () => {
+    // Coherence parity with the Linux runner: ro resolves the SAME Forja
+    // cache a writable command writes (no host-vs-Forja split by profile),
+    // reading it RO (sandbox allows reads by default). It still gets NO SBPL
+    // write-allow (asserted above) — read-only, no persistent write.
+    setCachePersistenceOverride(true);
+    const argv = buildSandboxExecArgv({
+      profile: 'ro',
+      cwd: '/work/proj',
+      home: '/home/op',
+      innerArgv: ['bash', '-s'],
+      env: { PATH: '/usr/bin' },
+      realpath: (p) => p,
+    });
+    expect(argv).toContain(`XDG_CACHE_HOME=${PERSIST_BASE}/xdg`);
+    expect(argv).toContain(`GOMODCACHE=${PERSIST_BASE}/go/mod`);
+  });
+
   test('buildSandboxExecArgv (OFF) — no redirect vars in env -i', () => {
     const argv = buildSandboxExecArgv({
       profile: 'cwd-rw',

@@ -570,18 +570,20 @@ export const buildSandboxExecArgv = (options: BuildSandboxExecArgvOptions): stri
         envAssignments.push(`${key}=${value}`);
       }
     }
-    // Opt-in persistent cache redirect (cache_persistence). Same gate as the
-    // SBPL write-allow: every writable profile (cwd-rw / cwd-rw-net /
-    // home-rw). For home-rw this is the LOAD-BEARING half: $HOME is writable
-    // (no bind/tmpfs to mask the real caches as on Linux), so without the
-    // redirect the toolchains write the operator's real ~/.cache / ~/.npm /
-    // ~/go. Inserted BETWEEN the host-env allowlist and the caller passthrough
-    // so a colliding passthrough key wins (parity with the Linux runner; the
-    // sets are disjoint in practice).
-    if (
-      getCachePersistenceOverride() === true &&
-      (profile === 'cwd-rw' || profile === 'cwd-rw-net' || profile === 'home-rw')
-    ) {
+    // Opt-in persistent cache redirect (cache_persistence). Applied to EVERY
+    // profile, NOT just writable ones (parity with the Linux runner's
+    // persistBase): the cache a command resolves must be the same regardless
+    // of the per-command profile, else a writable build (cwd-rw) writes the
+    // Forja cache while a read-only command (ro) reads the host's real
+    // ~/.cache — two different caches. `ro` reads the Forja cache RO (sandbox
+    // allows reads by default); it never gains write because the SBPL
+    // write-allow above stays gated to writable profiles. For home-rw the
+    // redirect is also LOAD-BEARING: $HOME is writable (no bind/tmpfs to mask
+    // the real caches as on Linux), so without it the toolchains write the
+    // operator's real ~/.cache / ~/.npm / ~/go. Inserted BETWEEN the host-env
+    // allowlist and the caller passthrough so a colliding passthrough key wins
+    // (parity with the Linux runner; the sets are disjoint in practice).
+    if (getCachePersistenceOverride() === true) {
       for (const [key, value] of Object.entries(buildCacheRedirectEnv(forjaCachePersistBase()))) {
         if (value.includes('\0')) continue;
         envAssignments.push(`${key}=${value}`);

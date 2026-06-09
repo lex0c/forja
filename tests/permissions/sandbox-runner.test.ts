@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, statSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { setWritableCacheDirsOverride } from '../../src/permissions/sandbox-cache-dirs.ts';
 import { setCachePersistenceOverride } from '../../src/permissions/sandbox-cache-env.ts';
 import { isSandboxProfile } from '../../src/permissions/sandbox-plan.ts';
@@ -9,6 +10,7 @@ import {
   buildBwrapArgv,
   maybeWrapSandboxArgv,
 } from '../../src/permissions/sandbox-runner.ts';
+import { forjaCachePersistBase } from '../../src/storage/paths.ts';
 
 const INNER = ['bash', '-c', 'echo hi'] as const;
 const CWD = '/work/proj';
@@ -2085,7 +2087,7 @@ describe('buildBwrapArgv — persistent cache (cache_persistence; runner gate)',
     expect(bindPairIndex(argv, PERSIST_BASE, PERSIST_BASE)).toBeGreaterThanOrEqual(0);
   });
 
-  test('ON but profile=ro — no persist (ro writes nothing)', () => {
+  test('ON + profile=ro — redirect env injected, but NO writable bind (reads Forja cache RO via the / base)', () => {
     setCachePersistenceOverride(true);
     const argv = buildBwrapArgv({
       profile: 'ro',
@@ -2096,8 +2098,16 @@ describe('buildBwrapArgv — persistent cache (cache_persistence; runner gate)',
       realpath: (p) => p,
       pathExists: () => true,
     });
+    // ro resolves the SAME Forja cache a writable command writes (coherence:
+    // no more host-cache-vs-Forja-cache split by profile) — via the redirect
+    // env, readable through `--ro-bind / /`. But it gets NO writable `--bind`
+    // and NO host-cache tmpfs mask (pushCacheCarveOut runs only for writable
+    // profiles), so `ro` never gains persistent write.
+    expect(hasSetenvFlag(argv, 'XDG_CACHE_HOME', `${PERSIST_BASE}/xdg`)).toBe(true);
+    expect(hasSetenvFlag(argv, 'GOMODCACHE', `${PERSIST_BASE}/go/mod`)).toBe(true);
     expect(bindPairIndex(argv, PERSIST_BASE, PERSIST_BASE)).toBe(-1);
-    expect(argv.includes('XDG_CACHE_HOME')).toBe(false);
+    // no host-cache tmpfs mask either (that lives in pushCacheCarveOut)
+    expect(argv.indexOf(`${HOME}/.cache`)).toBe(-1);
   });
 
   test('ON + home-rw — persist bind + redirect, after the $HOME bind', () => {
@@ -2224,7 +2234,7 @@ describe('buildBwrapArgv — per-session /tmp (shared_tmp / sessionTmpDir)', () 
     expect(bindPairIndex(argv, SESSION_TMP, '/tmp')).toBeGreaterThanOrEqual(0);
   });
 
-  test('non-writable profile (ro) ignores sessionTmpDir — /tmp stays a fresh tmpfs', () => {
+  test('read-only profile (ro) ALSO binds sessionTmpDir — /tmp coherent across the session', () => {
     const argv = buildBwrapArgv({
       profile: 'ro',
       cwd: CWD,
@@ -2235,8 +2245,27 @@ describe('buildBwrapArgv — per-session /tmp (shared_tmp / sessionTmpDir)', () 
       pathExists: () => true,
       sessionTmpDir: SESSION_TMP,
     });
-    // ro keeps the ephemeral, isolated per-spawn tmpfs; no session bind,
-    // and no forced TMPDIR (the bind didn't happen).
+    // shared_tmp is per-session, not per-profile: a read-only `cat /tmp/x`
+    // (which resolves to `ro`) must see what a prior writable `touch
+    // /tmp/x` wrote. The bind applies to every profile, and TMPDIR=/tmp is
+    // forced so mktemp/tempfile land in the session dir. `ro` already had a
+    // writable baseline tmpfs /tmp, so this grants no new access — only
+    // coherence.
+    expect(hasTmpfs(argv, '/tmp')).toBe(false);
+    expect(bindPairIndex(argv, SESSION_TMP, '/tmp')).toBeGreaterThanOrEqual(0);
+    expect(hasSetenvFlag(argv, 'TMPDIR', '/tmp')).toBe(true);
+  });
+
+  test('ro WITHOUT sessionTmpDir (shared_tmp off) keeps the fresh per-spawn tmpfs', () => {
+    const argv = buildBwrapArgv({
+      profile: 'ro',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: () => true,
+    });
     expect(hasTmpfs(argv, '/tmp')).toBe(true);
     expect(bindPairIndex(argv, SESSION_TMP, '/tmp')).toBe(-1);
     expect(hasSetenvFlag(argv, 'TMPDIR', '/tmp')).toBe(false);
@@ -2336,3 +2365,103 @@ describe('maybeWrapSandboxArgv — fail-closed on mid-session sandbox loss', () 
     expect(argv[0]).toBe('/usr/bin/bwrap');
   });
 });
+
+// End-to-end cross-profile coherence against REAL bwrap. The argv-shape tests
+// above prove the flags; these prove the OBSERVABLE behavior the flags buy: a
+// writable command (cwd-rw) and a read-only command (ro) in the same session
+// see the SAME /tmp and the SAME persistent cache — the exact bug the gate
+// removal fixed (write under one profile, read under another). Linux-only and
+// gated on a real `bwrap`; the shape tests cover macOS + non-bwrap hosts.
+//
+// `/var/tmp` (FHS-mandated, NOT masked by the sandbox) hosts the scratch dirs:
+// `/tmp` is replaced by the session bind (splice) so a sessTmp there is fine,
+// but the cache base must live OUTSIDE `/tmp` — under `--tmpfs /tmp` (no
+// shared_tmp) a cache base in `/tmp` is masked and the write never reaches the
+// host (verified: that exact arrangement silently loses the write).
+const E2E_UNAVAILABLE =
+  process.platform !== 'linux' || Bun.which('bwrap') === null || !existsSync('/var/tmp');
+
+describe.skipIf(E2E_UNAVAILABLE)(
+  'buildBwrapArgv — E2E cross-profile coherence (real bwrap)',
+  () => {
+    const E2E_HOME = homedir();
+    const E2E_CWD = process.cwd();
+    let cacheRoot: string;
+    let sessTmp: string;
+    let origXdgCache: string | undefined;
+
+    const run = async (
+      profile: 'ro' | 'cwd-rw',
+      inner: string[],
+      sessionTmpDir?: string,
+    ): Promise<{ code: number; out: string; err: string }> => {
+      const argv = buildBwrapArgv({
+        profile,
+        cwd: E2E_CWD,
+        home: E2E_HOME,
+        innerArgv: inner,
+        env: {},
+        realpath: (p) => p,
+        pathExists: (p) => existsSync(p),
+        ...(sessionTmpDir !== undefined ? { sessionTmpDir } : {}),
+      });
+      const proc = Bun.spawn(argv, { stdout: 'pipe', stderr: 'pipe' });
+      const code = await proc.exited;
+      const out = (await new Response(proc.stdout).text()).trim();
+      const err = (await new Response(proc.stderr).text()).trim();
+      return { code, out, err };
+    };
+
+    beforeEach(() => {
+      origXdgCache = process.env.XDG_CACHE_HOME;
+      cacheRoot = mkdtempSync('/var/tmp/forja-e2e-xdg-');
+      // forjaCachePersistBase() honors XDG_CACHE_HOME → <cacheRoot>/forja/cache.
+      process.env.XDG_CACHE_HOME = cacheRoot;
+      sessTmp = mkdtempSync('/var/tmp/forja-e2e-tmp-');
+      setCachePersistenceOverride(true);
+      setWritableCacheDirsOverride(undefined);
+      // Pre-create the Forja cache base so the cwd-rw `--bind` passes the
+      // existence gate (bootstrap host-creates it in production).
+      mkdirSync(join(forjaCachePersistBase(), 'xdg'), { recursive: true });
+    });
+
+    afterEach(() => {
+      setCachePersistenceOverride(undefined);
+      setWritableCacheDirsOverride(undefined);
+      if (origXdgCache === undefined) delete process.env.XDG_CACHE_HOME;
+      else process.env.XDG_CACHE_HOME = origXdgCache;
+      rmSync(cacheRoot, { recursive: true, force: true });
+      rmSync(sessTmp, { recursive: true, force: true });
+    });
+
+    test('shared /tmp: a file written under cwd-rw is read back under ro (same session dir)', async () => {
+      const w = await run(
+        'cwd-rw',
+        ['bash', '-c', 'printf hi > /tmp/probe.txt && echo ok'],
+        sessTmp,
+      );
+      expect(w.code).toBe(0);
+      const r = await run('ro', ['bash', '-c', 'cat /tmp/probe.txt'], sessTmp);
+      expect(r.code).toBe(0);
+      expect(r.out).toBe('hi');
+    });
+
+    test('persistent cache: a file written under cwd-rw is read back under ro (same Forja cache)', async () => {
+      const w = await run('cwd-rw', [
+        'bash',
+        '-c',
+        'printf v1 > "$XDG_CACHE_HOME/dep.txt" && echo ok',
+      ]);
+      expect(w.code).toBe(0);
+      const r = await run('ro', ['bash', '-c', 'cat "$XDG_CACHE_HOME/dep.txt"']);
+      expect(r.code).toBe(0);
+      expect(r.out).toBe('v1');
+    });
+
+    test('ro keeps the cache read-only: writing the redirected cache fails (EROFS)', async () => {
+      const r = await run('ro', ['bash', '-c', 'echo x > "$XDG_CACHE_HOME/dep.txt"']);
+      expect(r.code).not.toBe(0);
+      expect(r.err).toContain('Read-only file system');
+    });
+  },
+);

@@ -452,22 +452,32 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
   // home (managed-NFS layout) leaves the canonical tree unexposed.
   const home = canonicalizeHome(options.home, realpath);
 
-  // Writable profiles (cwd-rw / cwd-rw-net / home-rw) receive the persistent
-  // cache redirect+bind AND the per-session /tmp bind. `ro` writes nothing (a
-  // writable session-shared dir there would breach its read-only contract —
-  // it keeps the fresh per-spawn tmpfs /tmp); `host` isn't wrapped. home-rw
-  // IS included: it binds the real $HOME read-write, so WITHOUT the
-  // redirect+carve-out its package managers would write the operator's REAL
-  // ~/.cache / ~/.npm / ~/go — exactly the host-cache poisoning the dedicated
-  // Forja cache exists to prevent. (The carve-out is emitted AFTER the $HOME
-  // bind for home-rw — see the call site.) Single source for both gates.
-  const writableProfile = profile === 'cwd-rw' || profile === 'cwd-rw-net' || profile === 'home-rw';
+  // Writable-only mounts (the persistent cache `--bind` and the host-cache
+  // tmpfs masks) are NOT gated by a flag here — they ride INSIDE
+  // `pushCacheCarveOut()`, which is called only from the cwd-rw / cwd-rw-net /
+  // home-rw branches below. So `ro` / `host` never get a writable cache bind:
+  // the gate is structural (the call site), not a boolean. home-rw binds the
+  // real $HOME read-write, so its carve-out (emitted AFTER the $HOME bind)
+  // masks the operator's REAL ~/.cache / ~/.npm / ~/go and punches the
+  // dedicated Forja cache through — the host-cache poisoning the dedicated
+  // cache exists to prevent. The redirect ENV and the per-session /tmp bind,
+  // by contrast, apply to every profile (see persistBase + the /tmp policy).
 
-  // Opt-in persistent cache gate. A non-null `persistBase` is the single
-  // switch for BOTH the redirect env (injected below) and the persistent
-  // bind (further down).
-  const persistBase =
-    getCachePersistenceOverride() === true && writableProfile ? forjaCachePersistBase() : null;
+  // Opt-in persistent cache gate. A non-null `persistBase` enables the cache
+  // redirect env (`XDG_CACHE_HOME`, `GOMODCACHE`, … → the Forja cache),
+  // injected below for EVERY profile so the cache a command resolves is the
+  // same regardless of the profile it was assigned. Without this, a writable
+  // `go build` (cwd-rw) wrote to the Forja cache while a read-only command
+  // (ro) — redirect absent — fell back to the host's real ~/.cache: two
+  // different caches depending on the per-command profile. Coherence + better
+  // anti-poison isolation (ro no longer reads the host cache a build outside
+  // Forja may have poisoned).
+  //
+  // The WRITABLE `--bind` of `persistBase` (further down) stays gated to
+  // writable profiles via `pushCacheCarveOut` — `ro` reads the Forja cache
+  // read-only through the `--ro-bind / /` base, never gaining persistent
+  // write. So the redirect is universal; the writable mount is not.
+  const persistBase = getCachePersistenceOverride() === true ? forjaCachePersistBase() : null;
 
   // Cwd-inside-hidden-dir precondition. If the operator happens to
   // run Forja from `~/.ssh/audit/` (or any cwd nested under a
@@ -515,15 +525,26 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
 
   const flags: string[] = [...COMMON_PROFILE_FLAGS];
   // `/tmp` policy. Default = the fresh per-spawn tmpfs baked into
-  // COMMON_PROFILE_FLAGS. When `sessionTmpDir` is set (opt-in shared_tmp)
-  // AND the profile is writable, swap that exact `--tmpfs /tmp` pair for a
-  // bind of the session tmp dir, preserving its position + every other base
-  // flag (so the default argv stays byte-identical to before this feature).
-  // Gated to writable profiles for the same reason as the cache bind: `ro`
-  // keeps a fresh, isolated, per-spawn tmpfs /tmp rather than a writable dir
-  // shared across the whole session.
+  // COMMON_PROFILE_FLAGS. When `sessionTmpDir` is set (shared_tmp, default
+  // ON) swap that exact `--tmpfs /tmp` pair for a bind of the session tmp
+  // dir, preserving its position + every other base flag (so the default
+  // argv stays byte-identical when shared_tmp is off).
+  //
+  // Applies to EVERY profile, including `ro`. The spec promise
+  // (SECURITY_GUIDELINE §8.1: "reuso de arquivos temporários entre
+  // tool-calls da mesma sessão") is per-session, not per-profile — and the
+  // profile a command gets is the minimum it needs (a `cat /tmp/x` read is
+  // `ro`, a `touch /tmp/x` write is `cwd-rw`). Gating the bind to writable
+  // profiles meant writes landed in the persistent session dir while a
+  // following read-only call saw a fresh empty tmpfs and couldn't find
+  // them — silently breaking shared_tmp for the read side. Binding it for
+  // `ro` too grants no NEW access: `ro` already had a writable /tmp (the
+  // baseline tmpfs); this only changes WHERE those writes land (the
+  // session-scoped scratch dir) so /tmp is coherent across the session.
+  // Unlike the cache carve-out (which DOES stay writable-only), /tmp is
+  // scratch by definition, not a host/project surface.
   let tmpBound = false;
-  if (writableProfile && options.sessionTmpDir !== undefined) {
+  if (options.sessionTmpDir !== undefined) {
     const i = flags.findIndex((f, idx) => f === '--tmpfs' && flags[idx + 1] === '/tmp');
     if (i !== -1) {
       flags.splice(i, 2, '--bind', options.sessionTmpDir, '/tmp');

@@ -2,6 +2,53 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-09] fix(sandbox): make the cache redirect coherent across profiles (ro reads the Forja cache)
+
+Follow-up to the `/tmp` coherence fix — the SAME per-profile split existed for `cache_persistence`,
+in the opposite direction. The cache redirect env (`XDG_CACHE_HOME`, `GOMODCACHE`, `npm_config_cache`,
+…) was gated to **writable** profiles. So a `go build` (cwd-rw) wrote the dedicated Forja cache while a
+read-only command (ro) — redirect absent — fell back to the host's real `~/.cache`: two different
+caches depending on the per-command profile the planner picked. "Um grava num local, outro lê de
+outro."
+
+Fix: drop the `&& writableProfile` gate on `persistBase` (Linux `sandbox-runner.ts`) and the matching
+profile check on the macOS redirect (`sandbox-runner-macos.ts`), so the redirect env applies to EVERY
+profile. The WRITABLE mount stays writable-only — Linux: the `--bind persistBase` + host-cache tmpfs
+masks ride inside `pushCacheCarveOut()`, called only from the cwd-rw/cwd-rw-net/home-rw branches (the
+gate is now structural, not a boolean — removed the dead `writableProfile` var); macOS: the SBPL
+`file-write*` allow is unchanged. Net: `ro` resolves the SAME Forja cache a writable command writes,
+reading it RO through the `--ro-bind / /` base (Linux) / default read-allow (macOS), and never gains
+persistent write. Bonus: better anti-poison isolation — `ro` no longer reads the host cache a build
+outside Forja may have poisoned. Spec has no per-profile carve-out for the redirect → no spec change.
+
+Tests: inverted the `ro → no redirect` cases on both runners to assert `ro` now carries the redirect
+env (XDG + GOMODCACHE) while keeping NO writable bind / NO SBPL write-allow / NO host-cache mask.
+Verified end-to-end against real `bwrap`: write/cwd-rw → read/ro reads the same Forja cache entry;
+write/ro → `Read-only file system` (ro stays read-only).
+
+## [2026-06-09] fix(sandbox): make shared_tmp /tmp coherent across profiles (read-only too)
+
+`shared_tmp` (default ON) promises temp-file reuse between tool-calls of the same session
+(`SECURITY_GUIDELINE §8.1`). But the `/tmp` session-dir bind in `buildBwrapArgv` was gated to
+**writable** profiles (`writableProfile && sessionTmpDir`). Since the planner picks the *minimum*
+profile per command, a `touch /tmp/x` / `printf > /tmp/x` write ran under `cwd-rw` (bind → persistent
+session dir) while a following `cat /tmp/x` read ran under `ro` (no bind → fresh empty tmpfs). The
+read saw nothing and failed — shared_tmp silently broken for the read side. Reproduced exactly from an
+operator session log (write ok, separate read `exit 1`, same-call write+read ok).
+
+Fix: drop the `writableProfile &&` gate on the `/tmp` bind (`sandbox-runner.ts`) so the session
+`/tmp` binds for **every** profile, `ro` included, with `TMPDIR=/tmp` forced. Grants no new access —
+`ro` already had a writable baseline tmpfs `/tmp`; this only changes WHERE writes land (the
+session-scoped scratch dir) so `/tmp` is coherent across the whole session. The cache carve-out stays
+writable-only (cache is a host/project surface; `/tmp` is scratch). Code now matches the spec promise,
+which has no per-profile carve-out → no spec change. macOS runner unaffected: its tmpdir SBPL allow was
+already profile-independent.
+
+Tests: inverted the stale `ro ignores sessionTmpDir` case to assert `ro` now binds the session `/tmp` +
+forces `TMPDIR`, plus a new case that `ro` WITHOUT sessionTmpDir (shared_tmp off) keeps the fresh
+per-spawn tmpfs. Verified end-to-end against real `bwrap`: write/cwd-rw → read/ro now reads the file;
+delete/cwd-rw → read/ro confirms it's gone.
+
 ## [2026-06-08] feat(resume): resume-mode selection (full / summary / capped)
 
 `forja --resume <id>` ganha escolha de como o contexto é carregado: **capped** (default,
