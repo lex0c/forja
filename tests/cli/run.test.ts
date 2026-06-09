@@ -7,6 +7,8 @@ import type { OutputRenderer } from '../../src/cli/output/types.ts';
 import { exitCodeFor, run } from '../../src/cli/run.ts';
 import type { HarnessEvent, HarnessResult } from '../../src/harness/index.ts';
 import type { Provider, StreamEvent } from '../../src/providers/index.ts';
+import { closeDb, migrate, openDb } from '../../src/storage/index.ts';
+import { createSession } from '../../src/storage/repos/sessions.ts';
 
 const baseArgs = (overrides: Partial<ParsedArgs> = {}): ParsedArgs => ({
   prompt: 'hi',
@@ -211,6 +213,37 @@ describe('run end-to-end with mock provider', () => {
       result: HarnessResult;
     };
     expect(finished.result.status).toBe('done');
+  });
+
+  test('cross-cwd literal --resume + --resume-mode summary is rejected BEFORE any work', async () => {
+    // Regression: full/summary pre-hydrate (summary compacts → sends history to
+    // the provider + writes cost/audit) BEFORE runAgent's cwd guard. A literal
+    // id from ANOTHER project must be rejected at resolution, not after that
+    // work leaked. Seed a session owned by a different cwd, then resume it from
+    // `workdir` with summary mode.
+    const seed = openDb(dbPath);
+    migrate(seed);
+    createSession(seed, { id: 'foreign-sess', model: 'mock/m', cwd: '/some/other/project' });
+    closeDb(seed);
+
+    const { renderer, events } = recordingRenderer();
+    const errLines: string[] = [];
+    const code = await run({
+      args: baseArgs({ resume: 'foreign-sess', resumeMode: 'summary', prompt: 'go' }),
+      bootstrapOverride: {
+        // If this provider were ever reached, the leak already happened.
+        providerOverride: mockProvider([{ text: 'must never run' }]),
+        dbPath,
+        cwd: workdir,
+      },
+      signal: new AbortController().signal,
+      rendererOverride: renderer,
+      errSink: (s) => errLines.push(s),
+    });
+    expect(code).toBe(1);
+    expect(errLines.join('')).toContain('belongs to a different project');
+    // Rejected before bootstrap → no harness work, no compaction, no provider.
+    expect(events).toHaveLength(0);
   });
 
   test('budget exhaustion returns exit code 2', async () => {

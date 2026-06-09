@@ -155,11 +155,12 @@ const resolveResumeId = (
   resume: string,
   dbPath: string,
   cwd: string,
+  enforceCwd = false,
 ): { ok: true; id: string } | { ok: false; message: string } => {
   const db = openDb(dbPath);
   try {
     migrate(db);
-    return resolveResumeIdOnDb(db, resume, cwd);
+    return resolveResumeIdOnDb(db, resume, cwd, enforceCwd);
   } finally {
     closeDb(db);
   }
@@ -673,7 +674,19 @@ export const run = async (options: RunOptions): Promise<number> => {
       // the resume resolution and the harness's cwd guard might
       // disagree on which directory is "current".
       const cwd = options.bootstrapOverride?.cwd ?? process.cwd();
-      const resolved = resolveResumeId(args.resume, dbPath, cwd);
+      // Enforce cwd at resolution when a resume MODE is set: full/summary
+      // pre-hydrate (and summary compacts — sending history to the provider +
+      // writing cost/audit rows) BEFORE runAgent's cwd guard runs. A literal
+      // cross-cwd id (mistyped / copied from another project) must be rejected
+      // here, not after that work — same "guard before any work" reasoning the
+      // REPL relies on for its early scrollback replay. Capped (no mode, no
+      // pre-work) stays permissive: runAgent's guard catches it before work.
+      const resolved = resolveResumeId(
+        args.resume,
+        dbPath,
+        cwd,
+        args.resumeMode !== undefined,
+      );
       if (!resolved.ok) {
         errSink(`forja: ${resolved.message}\n`);
         return 1;
