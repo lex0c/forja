@@ -2,6 +2,21 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-09] chore(budget): raise the default wall-clock cap 1h → 24h
+
+`DEFAULT_BUDGET.maxWallClockMs` was 1h — short enough to cut legitimate long
+interactive / overnight sessions. Cost is the primary gate; the wall-clock cap
+is the backstop for what cost can't see (a hung provider call spends nothing,
+LLM-free tools like `monitor`/`wait_for`, ~0-cost local models). 24h (the schema
+max in `config/loaders.ts`) keeps that backstop against a true hang while never
+cutting a real session. Operators still lower it per-config.
+
+`effortBudgetPatch` doesn't touch the wall-clock, so the single `DEFAULT_BUDGET`
+constant is the only knob. Updated the one test pinning the value
+(`budget-defaults.test.ts`) and two stale "default 10 min" comments
+(`loop.ts`, `wait-for.ts`). Subagents keep their own `DEFAULT_WALL_CLOCK_MS`
+(1h, `subagents/wait-loop.ts`) — unchanged here.
+
 ## [2026-06-09] fix(sandbox): make the cache redirect coherent across profiles (ro reads the Forja cache)
 
 Follow-up to the `/tmp` coherence fix — the SAME per-profile split existed for `cache_persistence`,
