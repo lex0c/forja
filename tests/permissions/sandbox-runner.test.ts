@@ -2028,6 +2028,13 @@ const bindPairIndex = (argv: readonly string[], src: string, dst: string): numbe
   return -1;
 };
 
+const roBindPairIndex = (argv: readonly string[], src: string, dst: string): number => {
+  for (let i = 0; i < argv.length - 2; i++) {
+    if (argv[i] === '--ro-bind' && argv[i + 1] === src && argv[i + 2] === dst) return i;
+  }
+  return -1;
+};
+
 describe('buildBwrapArgv — persistent cache (cache_persistence; runner gate)', () => {
   // Pin XDG_CACHE_HOME to <HOME>/.cache so forjaCachePersistBase() lands at
   // <HOME>/.cache/forja/cache — NESTED under the `.cache` tmpfs carve-out,
@@ -2087,7 +2094,7 @@ describe('buildBwrapArgv — persistent cache (cache_persistence; runner gate)',
     expect(bindPairIndex(argv, PERSIST_BASE, PERSIST_BASE)).toBeGreaterThanOrEqual(0);
   });
 
-  test('ON + profile=ro — redirect env injected, but NO writable bind (reads Forja cache RO via the / base)', () => {
+  test('ON + profile=ro — redirect env + READ-ONLY cache re-bind, but NO writable bind/mask', () => {
     setCachePersistenceOverride(true);
     const argv = buildBwrapArgv({
       profile: 'ro',
@@ -2099,15 +2106,54 @@ describe('buildBwrapArgv — persistent cache (cache_persistence; runner gate)',
       pathExists: () => true,
     });
     // ro resolves the SAME Forja cache a writable command writes (coherence:
-    // no more host-cache-vs-Forja-cache split by profile) — via the redirect
-    // env, readable through `--ro-bind / /`. But it gets NO writable `--bind`
-    // and NO host-cache tmpfs mask (pushCacheCarveOut runs only for writable
-    // profiles), so `ro` never gains persistent write.
+    // no more host-cache-vs-Forja-cache split by profile) via the redirect env.
+    // It gets a READ-ONLY re-bind of persistBase so the cache stays reachable
+    // even when it nests under a re-mounted path (e.g. $XDG_CACHE_HOME under
+    // /tmp) — but NO writable `--bind` and NO host-cache tmpfs mask, so `ro`
+    // never gains persistent write.
     expect(hasSetenvFlag(argv, 'XDG_CACHE_HOME', `${PERSIST_BASE}/xdg`)).toBe(true);
     expect(hasSetenvFlag(argv, 'GOMODCACHE', `${PERSIST_BASE}/go/mod`)).toBe(true);
-    expect(bindPairIndex(argv, PERSIST_BASE, PERSIST_BASE)).toBe(-1);
+    expect(roBindPairIndex(argv, PERSIST_BASE, PERSIST_BASE)).toBeGreaterThanOrEqual(0);
+    expect(bindPairIndex(argv, PERSIST_BASE, PERSIST_BASE)).toBe(-1); // not WRITABLE
     // no host-cache tmpfs mask either (that lives in pushCacheCarveOut)
     expect(argv.indexOf(`${HOME}/.cache`)).toBe(-1);
+  });
+
+  test('ON + profile=ro, persistBase absent — no cache re-bind (graceful, redirect still set)', () => {
+    setCachePersistenceOverride(true);
+    const argv = buildBwrapArgv({
+      profile: 'ro',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      pathExists: (p) => p !== PERSIST_BASE, // everything exists except the base
+    });
+    // Existence-gated like the writable bind: absent base → no re-bind (bwrap
+    // would otherwise abort on a missing source), redirect env still injected.
+    expect(hasSetenvFlag(argv, 'XDG_CACHE_HOME', `${PERSIST_BASE}/xdg`)).toBe(true);
+    expect(roBindPairIndex(argv, PERSIST_BASE, PERSIST_BASE)).toBe(-1);
+  });
+
+  test('ON + profile=ro — cache re-bind sits AFTER the /tmp mount, BEFORE the credential overlay', () => {
+    setCachePersistenceOverride(true);
+    const argv = buildBwrapArgv({
+      profile: 'ro',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+      maskFileSource: MASK,
+      pathExists: () => true, // /tmp mount (base) + persistBase + .netrc all present
+    });
+    const tmpMount = argv.indexOf('/tmp'); // the `--tmpfs /tmp` baseline pair
+    const roBind = roBindPairIndex(argv, PERSIST_BASE, PERSIST_BASE);
+    const credOverlay = argv.indexOf(`${HOME}/.netrc`);
+    expect(tmpMount).toBeGreaterThanOrEqual(0);
+    expect(roBind).toBeGreaterThan(tmpMount); // re-bind punches through the /tmp re-mount
+    expect(credOverlay).toBeGreaterThan(roBind); // credential overlay still wins
   });
 
   test('ON + home-rw — persist bind + redirect, after the $HOME bind', () => {
@@ -2462,6 +2508,30 @@ describe.skipIf(E2E_UNAVAILABLE)(
       const r = await run('ro', ['bash', '-c', 'echo x > "$XDG_CACHE_HOME/dep.txt"']);
       expect(r.code).not.toBe(0);
       expect(r.err).toContain('Read-only file system');
+    });
+
+    test('REGRESSION: $XDG_CACHE_HOME UNDER /tmp — cwd-rw write still read back under ro', async () => {
+      // The config the review caught: `forjaCacheDir()` honors an absolute
+      // $XDG_CACHE_HOME, so the cache base can sit UNDER /tmp — which the
+      // sandbox re-mounts (fresh tmpfs here, no shared_tmp). Without ro's
+      // read-only re-bind, ro sees an empty /tmp and the cwd-rw write is
+      // invisible (the exact cross-profile split the redirect should close).
+      const tmpXdg = mkdtempSync('/tmp/forja-e2e-xdgtmp-');
+      try {
+        process.env.XDG_CACHE_HOME = tmpXdg; // forjaCachePersistBase() → tmpXdg/forja/cache
+        mkdirSync(join(forjaCachePersistBase(), 'xdg'), { recursive: true });
+        const w = await run('cwd-rw', [
+          'bash',
+          '-c',
+          'printf vT > "$XDG_CACHE_HOME/dep.txt" && echo ok',
+        ]);
+        expect(w.code).toBe(0);
+        const r = await run('ro', ['bash', '-c', 'cat "$XDG_CACHE_HOME/dep.txt"']);
+        expect(r.code).toBe(0);
+        expect(r.out).toBe('vT');
+      } finally {
+        rmSync(tmpXdg, { recursive: true, force: true });
+      }
     });
   },
 );

@@ -2,6 +2,30 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-09] fix(sandbox): preserve ro cache access when the cache root is under /tmp
+
+Follow-up to the cross-profile cache-coherence fix (review catch). `forjaCacheDir()`
+honors an absolute `$XDG_CACHE_HOME`, so `persistBase` can land under `/tmp`. The
+coherence fix made `ro` receive the cache redirect env unconditionally, but `ro`
+still replaces `/tmp` with a fresh tmpfs (or the shared_tmp session bind) and never
+calls `pushCacheCarveOut()` to re-expose the real cache. So with the cache under
+`/tmp`, a prior cwd-rw command wrote the real Forja tree (through ITS carve-out
+bind) while the following `ro` command looked inside its isolated `/tmp` and saw an
+empty path — the exact split the redirect was meant to close still failed for that
+configuration.
+
+Fix: `ro` now emits an explicit `--ro-bind <persistBase> <persistBase>`
+(existence-gated, after the `/tmp` mount, before HIDE_PATHS so a credential overlay
+still wins) — re-exposing the real cache READ-ONLY through whatever re-mount nests
+it, without granting `ro` a persistent write. macOS unaffected: `sandbox-exec`
+allows reads by default and doesn't re-mount `/tmp`, so the cache under `/tmp` is
+already readable in `ro`.
+
+Tests: argv-shape (`ro` gets the `--ro-bind` re-bind, ordered after `/tmp` / before
+the credential overlay; absent persistBase → no re-bind, graceful) + a real-bwrap
+E2E regression that pins `$XDG_CACHE_HOME` UNDER `/tmp` and proves cwd-rw write →
+ro read now succeeds. Doc: `docs/SECURITY.md §4.9`.
+
 ## [2026-06-09] chore(budget): raise the default wall-clock cap 1h → 24h
 
 `DEFAULT_BUDGET.maxWallClockMs` was 1h — short enough to cut legitimate long

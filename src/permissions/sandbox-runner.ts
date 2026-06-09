@@ -474,9 +474,11 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
   // Forja may have poisoned).
   //
   // The WRITABLE `--bind` of `persistBase` (further down) stays gated to
-  // writable profiles via `pushCacheCarveOut` — `ro` reads the Forja cache
-  // read-only through the `--ro-bind / /` base, never gaining persistent
-  // write. So the redirect is universal; the writable mount is not.
+  // writable profiles via `pushCacheCarveOut`. `ro` reads the Forja cache
+  // read-only — through the `--ro-bind / /` base, or via an explicit
+  // `--ro-bind persistBase` when the cache nests under a re-mounted path like
+  // `/tmp` (see the `ro` branch below) — never gaining persistent write. So
+  // the redirect is universal; the writable mount is not.
   const persistBase = getCachePersistenceOverride() === true ? forjaCachePersistBase() : null;
 
   // Cwd-inside-hidden-dir precondition. If the operator happens to
@@ -649,6 +651,23 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
     // Forja cache through. HIDE_PATHS below still win over both.
     flags.push('--bind', home, home);
     pushCacheCarveOut();
+  } else if (profile === 'ro') {
+    // `ro` gets the cache redirect ENV (coherence with the writable profiles)
+    // but NOT the writable carve-out. Usually the Forja cache is reachable via
+    // the `--ro-bind / /` base, so no extra mount is needed — EXCEPT when
+    // `persistBase` nests under a path the sandbox RE-MOUNTS. `forjaCacheDir()`
+    // honors an absolute `$XDG_CACHE_HOME`, so the cache can land under `/tmp`,
+    // which COMMON_PROFILE_FLAGS replaces (a fresh tmpfs, or the shared_tmp
+    // session bind). That re-mount hides the real cache: a `cat
+    // $XDG_CACHE_HOME/...` in `ro` then reads an empty path while a prior
+    // cwd-rw command wrote the real tree through ITS carve-out bind — the exact
+    // cross-profile split the redirect is meant to close. Re-bind it READ-ONLY
+    // (after the /tmp mount, before HIDE_PATHS so a credential overlay still
+    // wins) so the cache is coherent wherever it resides, without granting `ro`
+    // a persistent write. Existence-gated like the writable bind.
+    if (persistBase !== null && pathExists(persistBase)) {
+      flags.push('--ro-bind', persistBase, persistBase);
+    }
   }
   // hide_paths — mask credential dirs + files. Applied AFTER the
   // writable mounts so that even on home-rw (which binds the full
