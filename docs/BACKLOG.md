@@ -2,6 +2,24 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-09] eval(compaction): controlled A/B for "compact/elide earlier" — keep threshold 0.7
+
+Closes the open follow-up in `CONTEXT_TUNING §990` / BACKLOG 404-416: a same-relevance,
+threshold-only A/B. The existing 23-vs-48 "~28%" figure is a confound — those cases vary BOTH
+`compactionRelevance` and `compactionThreshold`. New cases 49 (threshold 0.5 → no compaction)
+and 50 (threshold 0.02 → elide early) are byte-identical except the threshold, with
+`compactionRelevance` fixed ON in both.
+
+Result (haiku, `--repeat 3`): compacting early cost **+31%** (avg $0.040 vs $0.030) and was 2.5x
+slower; both 3/3 pass (quality preserved). The micro scenario collapsed to 4 steps (parallel
+reads), so the long-session regime where early compaction saves cache-read was never reached.
+Structural takeaway: a micro-eval **disfavors early compaction by construction** — the
+fold/re-cache overhead is ~fixed and dominates at short scale, while the benefit only amortizes
+over a long session. The eval is the wrong instrument here; the real lever (cache-read was 58%
+of cost in a real session where compaction ran 0x) is only measurable by instrumenting
+production. Verdict: `DEFAULT_BUDGET.compactionThreshold` stays 0.7 — it remains a per-config
+`[0,1]` knob (no spec change). No production code changed.
+
 ## [2026-06-09] perf(context): trim always-on tool-defs; re-align playbook when_to_use to spec
 
 System-context audit (cost/benefit). Measured the always-on payload: tool-defs are
