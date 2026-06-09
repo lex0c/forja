@@ -60,6 +60,12 @@ export type CompactContextResult =
       foldedCount: number;
       relevanceElidedCount: number;
       relevanceFreedBytes: number;
+      // The billed cost of THIS compaction (accountCompaction). Already folded
+      // into the session row (updateSessionCost) and the optional `cumulative`;
+      // returned so a caller WITHOUT a cumulative accumulator (headless resume)
+      // can still surface it — the per-run runAgent result.costUsd doesn't
+      // include a boot-time compaction that ran before the run.
+      costUsd: number;
     }
   | { kind: 'noop' }
   | { kind: 'error'; message: string };
@@ -155,6 +161,7 @@ export const compactContextNow = async (
       foldedCount: result.foldedCount,
       relevanceElidedCount,
       relevanceFreedBytes,
+      costUsd: acct.costUsd,
     };
   } catch (e) {
     live.restore(snap);

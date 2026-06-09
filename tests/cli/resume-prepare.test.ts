@@ -32,6 +32,51 @@ const throwingProvider = (): Provider => ({
   countTokens: () => Promise.resolve(0),
 });
 
+// A provider that bills: its generate() yields a real summary + non-zero usage,
+// and capabilities carry a non-zero per-1k cost so accountCompaction > 0.
+const costingProvider = (): Provider => ({
+  id: 'mock/m',
+  family: 'anthropic',
+  capabilities: {
+    tools: 'native',
+    cache: false,
+    vision: false,
+    streaming: true,
+    constrained: 'tools',
+    context_window: 1000,
+    output_max_tokens: 100,
+    cost_per_1k_input: 1,
+    cost_per_1k_output: 1,
+    notes: [],
+  },
+  async *generate() {
+    yield { kind: 'start', message_id: 'm' };
+    yield { kind: 'text_delta', text: 'condensed summary of earlier turns' };
+    yield { kind: 'usage', usage: { input: 100, output: 50, cache_read: 0, cache_creation: 0 } };
+    yield { kind: 'stop', reason: 'end_turn' };
+  },
+  generateConstrained: () => Promise.reject(new Error('n/a')),
+  countTokens: () => Promise.resolve(0),
+});
+
+// Foldable session: goal + 8 alternating turns (> preserveTail(3) + 3) so the
+// compaction has a middle to fold and actually calls the provider.
+const seedFoldableSession = () => {
+  const db = openMemoryDb();
+  migrate(db);
+  createSession(db, { id: 's', model: 'mock/m', cwd: '/proj' });
+  appendMessage(db, { sessionId: 's', role: 'user', content: 'goal', createdAt: 1 });
+  for (let i = 0; i < 8; i++) {
+    appendMessage(db, {
+      sessionId: 's',
+      role: i % 2 === 0 ? 'assistant' : 'user',
+      content: i % 2 === 0 ? [{ type: 'text', text: `a${i}` }] : `u${i}`,
+      createdAt: i + 2,
+    });
+  }
+  return db;
+};
+
 const seedSession = (cost: number) => {
   const db = openMemoryDb();
   migrate(db);
@@ -97,5 +142,25 @@ describe('prepareResumeContext — cost cap', () => {
       now: () => 0,
     });
     expect(res.costCapped).toBeUndefined();
+  });
+
+  test('summary exposes the billed compaction cost so headless can report it', async () => {
+    // The headless under-report fix: compactContextNow must surface the cost it
+    // billed (run.ts folds it into session_finished.result.costUsd — runAgent's
+    // per-run total excludes a compaction that ran before the run).
+    const db = seedFoldableSession();
+    const res = await prepareResumeContext({
+      db,
+      sessionId: 's',
+      mode: 'summary',
+      provider: costingProvider(),
+      budget: effectiveBudget({ maxCostUsd: 100 }),
+      memoryRegistryPresent: false,
+      now: () => 0,
+    });
+    expect(res.compaction?.kind).toBe('ok');
+    if (res.compaction?.kind === 'ok') {
+      expect(res.compaction.costUsd).toBeGreaterThan(0);
+    }
   });
 });

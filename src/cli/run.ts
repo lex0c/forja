@@ -901,6 +901,10 @@ export const run = async (options: RunOptions): Promise<number> => {
     // doesn't apply — this just honors --resume-mode for headless runs. Capped
     // (no flag) keeps the existing resumeFromSessionId path untouched.
     let resumeSessionContext: SessionContext | undefined;
+    // Billed cost of a boot-time summary compaction (if any). Headless has no
+    // cumulative tracker and runAgent's per-run result.costUsd excludes work
+    // that billed BEFORE the run, so we fold it into the reported cost below.
+    let bootCompactionCostUsd = 0;
     if (resumeFromSessionId !== undefined && args.resumeMode !== undefined) {
       try {
         // Same hydrate(+compact) core as the interactive path
@@ -917,6 +921,7 @@ export const run = async (options: RunOptions): Promise<number> => {
           signal,
         });
         resumeSessionContext = ctx;
+        if (compaction?.kind === 'ok') bootCompactionCostUsd = compaction.costUsd;
         if (info.totalCount > RESUME_FULL_WARN_THRESHOLD) {
           errSink(
             `forja: --resume-mode ${args.resumeMode} loaded ${info.totalCount} messages (full history)\n`,
@@ -939,7 +944,22 @@ export const run = async (options: RunOptions): Promise<number> => {
       }
     }
 
-    const onEvent = (e: Parameters<OutputRenderer['onEvent']>[0]) => renderer.onEvent(e);
+    // Fold the boot-time summary compaction cost into the reported
+    // session_finished cost: headless has no cumulative tracker, and runAgent's
+    // per-run result.costUsd excludes a compaction that billed before the run,
+    // so one-shot consumers (plain footer / JSON) would otherwise under-report
+    // the actual billed cost. The session row is already correct
+    // (compactContextNow updated it) — this only patches the emitted event.
+    const onEvent = (e: Parameters<OutputRenderer['onEvent']>[0]) => {
+      if (e.type === 'session_finished' && bootCompactionCostUsd > 0) {
+        renderer.onEvent({
+          ...e,
+          result: { ...e.result, costUsd: e.result.costUsd + bootCompactionCostUsd },
+        });
+        return;
+      }
+      renderer.onEvent(e);
+    };
     // Switch onto the reuse path when full/summary prepared a context. Omit
     // resumeFromSessionId entirely (not set to undefined — exactOptional) so
     // sessionContext / resumeFromSessionId stay mutually exclusive.
