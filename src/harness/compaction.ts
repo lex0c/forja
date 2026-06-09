@@ -123,7 +123,10 @@ export const accountCompaction = (
   usageIncomplete: result.strategy !== 'skipped' && !result.usageSeen,
 });
 
-const SUMMARY_MARKER_OPEN = '[compacted_history]';
+// Exported so the resume "from summary" replay (cli/resume-replay.ts) can
+// detect a compacted summary message by the SAME marker the fold writes —
+// one source of truth, no silent drift if the marker ever changes.
+export const SUMMARY_MARKER_OPEN = '[compacted_history]';
 const SUMMARY_MARKER_CLOSE = '[/compacted_history]';
 
 // Structured compaction prompt. The shape matters: the next agent

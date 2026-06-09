@@ -2734,3 +2734,38 @@ describe('busy:change (REPL isBusy mirror for the bash-mode gate)', () => {
     expect(off.state.busy).toBe(false);
   });
 });
+
+describe('resumemode:ask reducer', () => {
+  test('builds a resume-mode modal with full/summary options, cursor on full', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'resumemode:ask',
+      ts: 1,
+      promptId: 'p1',
+      totalCount: 1234,
+    });
+    expect(r.state.modal).not.toBeNull();
+    expect(r.state.modal?.flavor).toBe('resume-mode');
+    // From-summary is first (recommended) and the default cursor.
+    expect(r.state.modal?.options.map((o) => o.value)).toEqual(['summary', 'full']);
+    expect(r.state.modal?.selectedIndex).toBe(0);
+    expect(r.state.modal?.options[0]?.label).toContain('recommended');
+    // totalCount surfaced in the preview so the operator sees the blast radius.
+    expect(String(r.state.modal?.preview[0])).toContain('1234');
+  });
+
+  test('modal:answer clears the resume-mode modal', () => {
+    const opened = applyEvent(createInitialState(), {
+      type: 'resumemode:ask',
+      ts: 1,
+      promptId: 'p1',
+      totalCount: 3,
+    });
+    const closed = applyEvent(opened.state, {
+      type: 'modal:answer',
+      ts: 2,
+      promptId: 'p1',
+      decision: 'full',
+    });
+    expect(closed.state.modal).toBeNull();
+  });
+});

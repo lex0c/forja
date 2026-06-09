@@ -262,6 +262,36 @@ describe('parseArgs', () => {
     const r = parseArgs(['--resume', '--json']);
     expect(r.ok).toBe(false);
   });
+
+  test('--resume-mode full / summary parse with --resume', () => {
+    for (const mode of ['full', 'summary'] as const) {
+      const r = parseArgs(['--resume', 'abc', '--resume-mode', mode, 'go']);
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      expect(r.args.resumeMode).toBe(mode);
+    }
+  });
+
+  test('--resume-mode rejects an unknown value', () => {
+    const r = parseArgs(['--resume', 'abc', '--resume-mode', 'capped', 'go']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--resume-mode');
+  });
+
+  test('--resume-mode requires --resume', () => {
+    const r = parseArgs(['--resume-mode', 'full', 'go']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--resume');
+  });
+
+  test('without --resume-mode the field is undefined (capped default)', () => {
+    const r = parseArgs(['--resume', 'abc', 'go']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.resumeMode).toBeUndefined();
+  });
 });
 
 describe('--undo flag', () => {

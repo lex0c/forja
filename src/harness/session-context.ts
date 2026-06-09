@@ -44,6 +44,11 @@ export interface HydrateInfo {
   totalDropped: number;
   droppedBeyondFetch: number;
   droppedByAlignment: number;
+  // Full persisted message count for the session (= the SQL COUNT(*),
+  // independent of the fetch window). Lets the uncapped "full"/"summary"
+  // resume modes decide whether to warn the operator that a very large
+  // history was loaded into memory.
+  totalCount: number;
 }
 
 // Usage/cost columns for an assistant turn. `usageSeen=false` means the
@@ -100,13 +105,21 @@ export class SessionContext {
   // answering, user→user gap fill, truncation placeholder) the inline
   // resume path used, so behavior is identical. The anchor is the
   // persisted tail's id (the new turn chains onto it).
+  // `opts.uncapped` (the "full"/"summary" resume modes) loads the ENTIRE
+  // persisted log instead of the bounded tail — no MAX_RESUME_MESSAGES cap.
+  // Default (capped) keeps the historical bounded fetch + window cut.
   static hydrateFromDb(
     db: DB,
     sessionId: string,
-    limit: number = MAX_RESUME_MESSAGES + ALIGNMENT_FETCH_MARGIN,
+    opts?: { uncapped?: boolean },
   ): { ctx: SessionContext; info: HydrateInfo } {
-    const tail = listMessageTailBySession(db, sessionId, limit);
-    const restored = messagesToProviderMessages(tail.messages);
+    const uncapped = opts?.uncapped === true;
+    const tail = listMessageTailBySession(
+      db,
+      sessionId,
+      uncapped ? -1 : MAX_RESUME_MESSAGES + ALIGNMENT_FETCH_MARGIN,
+    );
+    const restored = messagesToProviderMessages(tail.messages, { uncapped });
     const lastFetched = tail.messages[tail.messages.length - 1];
     const anchor = lastFetched !== undefined ? lastFetched.id : '';
     // Copy the repaired array — it must be the mutable instance the
@@ -120,6 +133,7 @@ export class SessionContext {
         totalDropped: droppedBeyondFetch + restored.droppedFromHead,
         droppedBeyondFetch,
         droppedByAlignment: restored.droppedFromHead,
+        totalCount: tail.totalCount,
       },
     };
   }

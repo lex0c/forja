@@ -45,6 +45,13 @@ export interface ParsedArgs {
   // there's nothing for the model to do (the picker form `--resume`
   // without a value waits for an interactive TUI).
   resume?: string;
+  // How the resumed session's context is loaded (only valid with --resume):
+  //   'full'    — uncapped: load the ENTIRE persisted log (no ~500 cap).
+  //   'summary' — uncapped + compact at boot so the model starts summarized.
+  // Absent → 'capped' (the default bounded ~500-msg tail). In the interactive
+  // TUI an absent flag triggers a modal asking the operator; this flag is the
+  // headless lever and a modal-suppressor when set interactively.
+  resumeMode?: 'full' | 'summary';
   // Confirm-bypass for had_bash warning on `--undo` /
   // `--checkpoints restore`. Without `--yes`, the handler refuses
   // a destructive restore on a step that ran bash (because bash
@@ -1639,6 +1646,18 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         i += 2;
         break;
       }
+      case '--resume-mode': {
+        const value = argv[i + 1];
+        if (value !== 'full' && value !== 'summary') {
+          return {
+            ok: false,
+            message: "--resume-mode requires 'full' or 'summary'",
+          };
+        }
+        args.resumeMode = value;
+        i += 2;
+        break;
+      }
       case '--yes':
       case '-y':
         args.yes = true;
@@ -2168,6 +2187,12 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         '--memory-override-llm / --no-memory-override-llm are top-level flags and conflict with --subagent-session-id (subagent children do not run the override scheduler)',
     };
   }
+  if (args.resumeMode !== undefined && args.resume === undefined) {
+    return {
+      ok: false,
+      message: '--resume-mode is only valid together with --resume',
+    };
+  }
   return { ok: true, args };
 };
 
@@ -2197,6 +2222,7 @@ export const usage = (): string =>
     '  --include-subagents    With --list-sessions, fan parents into their subagent children (requires --list-sessions)',
     '  --limit <n>            With --list-sessions, cap rows returned (default 20; requires --list-sessions)',
     '  --resume <id|last>     Continue a prior session; positional prompt is the follow-up',
+    '  --resume-mode <m>      full | summary (with --resume): load all history, or compact it at boot',
     '  --undo <session>       Restore the latest checkpoint of a session',
     '  --worktrees <verb>     Inspect / gc subagent worktrees (verb: list, gc)',
     '  --memory <verb>        Inspect cross-session memory (verb: list [scope] | show <name> [scope])',

@@ -215,12 +215,21 @@ export interface MessageTail {
   totalCount: number;
 }
 
-export const listMessageTailBySession = (db: DB, sessionId: string, limit: number): MessageTail => {
-  const totalCount = (
+// Cheap COUNT(*) of persisted rows for a session — no row materialization.
+// The resume-mode modal surfaces this so the operator can weigh "load all N"
+// vs "compact" before any history is hydrated into memory.
+export const countMessagesBySession = (db: DB, sessionId: string): number =>
+  (
     db.query('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?').get(sessionId) as {
       n: number;
     }
   ).n;
+
+// `limit < 0` (canonically -1) means "no limit" — SQLite treats `LIMIT -1`
+// as unbounded, so it returns every row for the session. Used by the
+// uncapped "full"/"summary" resume modes; the capped path passes a positive
+// limit as before.
+export const listMessageTailBySession = (db: DB, sessionId: string, limit: number): MessageTail => {
   const rows = db
     .query(
       `SELECT id, session_id, parent_id, role, content,
@@ -234,6 +243,17 @@ export const listMessageTailBySession = (db: DB, sessionId: string, limit: numbe
        ORDER BY seq ASC`,
     )
     .all(sessionId, limit) as MessageRow[];
+  // Uncapped (limit < 0) fetched the whole log already, so rows.length IS the
+  // total — skip the redundant COUNT(*). The capped path still needs it to
+  // report how many older rows fell outside the window.
+  const totalCount =
+    limit < 0
+      ? rows.length
+      : (
+          db.query('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?').get(sessionId) as {
+            n: number;
+          }
+        ).n;
   return { messages: rows.map(fromRow), totalCount };
 };
 

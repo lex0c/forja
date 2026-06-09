@@ -22,6 +22,11 @@ import type { Message, MessageRole } from '../storage/repos/messages.ts';
 // new follow-up.
 export const MAX_RESUME_MESSAGES = 500;
 
+// Above this many loaded rows, the uncapped "full"/"summary" resume modes warn
+// the operator that a large history was pulled into memory (the capped default
+// exists precisely to avoid this). Advisory only — not a hard limit.
+export const RESUME_FULL_WARN_THRESHOLD = 2000;
+
 // Extra rows fetched beyond MAX_RESUME_MESSAGES so the alignment
 // walk in messagesToProviderMessages has room to skip past
 // user_tool_result rows when looking for a safe head. Without the
@@ -130,8 +135,13 @@ const isSafeHead = (row: Message): boolean => {
 // context uses. If the two diverge, the operator sees turns in
 // scrollback that the model can't actually reference — a silent
 // mislead. Sharing this function keeps them in lockstep.
-export const resumeWindowCut = (rows: Message[]): number => {
-  let cut = rows.length > MAX_RESUME_MESSAGES ? rows.length - MAX_RESUME_MESSAGES : 0;
+// `cap` is the max number of recent rows to keep. Default = MAX_RESUME_MESSAGES
+// (the capped resume window). Pass `Number.POSITIVE_INFINITY` for the
+// uncapped "full"/"summary" resume modes: the head-of-window drop is then 0
+// (keep everything), but the safe-head walk STILL runs — uncapped must not
+// orphan a leading user_tool_result any more than capped does.
+export const resumeWindowCut = (rows: Message[], cap: number = MAX_RESUME_MESSAGES): number => {
+  let cut = rows.length > cap ? rows.length - cap : 0;
   // Walk forward past unsafe heads (user_tool_result without its
   // matching assistant). If no safe boundary exists in the kept
   // window, cut walks to rows.length and the kept slice is empty —
@@ -197,8 +207,16 @@ const repairOrphanedToolUses = (msgs: ProviderMessage[]): ProviderMessage[] => {
   return out;
 };
 
-export const messagesToProviderMessages = (rows: Message[]): ReconstitutedMessages => {
-  const droppedFromHead = resumeWindowCut(rows);
+// `opts.uncapped` selects the full-resume path: no MAX_RESUME_MESSAGES cap, so
+// the kept slice is the entire log (still safe-head-aligned + orphan-repaired).
+export const messagesToProviderMessages = (
+  rows: Message[],
+  opts?: { uncapped?: boolean },
+): ReconstitutedMessages => {
+  const droppedFromHead = resumeWindowCut(
+    rows,
+    opts?.uncapped === true ? Number.POSITIVE_INFINITY : MAX_RESUME_MESSAGES,
+  );
 
   const sliced = droppedFromHead > 0 ? rows.slice(droppedFromHead) : rows;
   const out: ProviderMessage[] = [];

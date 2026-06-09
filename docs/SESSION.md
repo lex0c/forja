@@ -30,9 +30,12 @@ at any time and rebuilt from the log (that is exactly what `--resume` does).
 `lastMessageId` DB-chain anchor, and is the **only** place that mutates them.
 
 - `createFresh(db, sessionId)` — empty array, no anchor (first append is a root).
-- `hydrateFromDb(db, sessionId, {limit})` — rebuild from the log: `listMessageTailBySession`
-  (bounded to `MAX_RESUME_MESSAGES` = 500 + alignment margin) → `messagesToProviderMessages`
-  (the repair walk). Returns `HydrateInfo` for the truncation events.
+- `hydrateFromDb(db, sessionId, {uncapped?})` — rebuild from the log:
+  `listMessageTailBySession` → `messagesToProviderMessages` (the repair walk).
+  Default (capped) is bounded to `MAX_RESUME_MESSAGES` = 500 + alignment margin;
+  `{uncapped: true}` loads the **entire** log (the full/summary resume modes —
+  see [Resume modes](#resume-modes)). Returns `HydrateInfo` (incl. `totalCount`)
+  for the truncation / large-load events.
 - `appendUser / appendAssistant / appendToolResults` — each does **array push +
   `appendMessage` row + anchor update together**, so the three never drift. The
   assistant append persists always but mirrors into the array only when content
@@ -69,6 +72,28 @@ Status flow of the row: `createSession` → `running`; `finish` → `completeSes
 (`done`/`error`/`exhausted`/`interrupted`); a later resume/reuse → `reopenSession`
 back to `running`. `total_cost_usd` is cumulative across the session's lifetime;
 each run reports its per-run delta.
+
+## Resume modes
+
+`forja --resume <id>` picks HOW the prior context loads. The choice is made in
+the **CLI layer** — a resume-mode modal in the TUI (From summary is the
+recommended default; Full is the opt-out; Esc → capped), or `--resume-mode
+full|summary` headless. The harness is untouched.
+
+| Mode | Loads | Entry path |
+|---|---|---|
+| **capped** (default) | bounded ~500-msg tail | harness **resume** (`resumeFromSessionId` → `hydrateFromDb`) |
+| **full** | the entire log, uncapped | CLI hydrates (`{uncapped}`) → **reuse** (`sessionContext`) |
+| **summary** | entire log, then compacted at boot | CLI hydrates + compacts → **reuse** |
+
+Only **capped** uses the harness resume path. **full/summary** are prepared at
+boot by `prepareResumeContext` (`src/cli/resume-prepare.ts`): hydrate uncapped
+and, for summary, compact **before** the scrollback is replayed — so the operator
+sees only what survives the fold, not the history it just discarded. The prepared
+`SessionContext` is then handed to the first turn through the **reuse** path
+(`sessionContext`), so the harness never re-hydrates. A large uncapped load warns
+past `RESUME_FULL_WARN_THRESHOLD`. Summary's boot compaction runs through the same
+`compactContextNow` helper `/compact` uses (see [Compaction](#compaction)).
 
 ## A turn (the `runAgent` loop)
 
@@ -143,6 +168,12 @@ back to an `assistant` boundary so tool pairs stay intact, via the
   the originals persist in the audit log and the pointer names the tool that
   reads them back. Never throws, so the run always survives a flaky summary call.
 - **skipped** — history too short / no foldable middle: returns the same array.
+
+`/compact` and the summary-resume boot compaction share one body —
+`compactContextNow` (`src/cli/compact-now.ts`): the same relevance pre-pass + LLM
+fold + cost accounting + `compaction_events` row, with the TUI chip / REPL
+cumulative optional (headless skips them). Only the auto path (in the loop) keeps
+its own threshold-gated call site.
 
 The `compaction_finished.strategy` is exactly which path ran: `relevance`
 (stage 1 sufficed), or `llm` / `fallback` / `skipped` (stage 2). Compaction is

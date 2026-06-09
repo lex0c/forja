@@ -4227,6 +4227,7 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
       stdin,
       skipTtyCheck: true,
       skipTrustPrompt: true,
+      skipResumeModePrompt: true,
       errSink: (s) => {
         errs.push(s);
       },
@@ -4254,6 +4255,7 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
       stdin: makeStdin(),
       skipTtyCheck: true,
       skipTrustPrompt: true,
+      skipResumeModePrompt: true,
       errSink: (s) => {
         errs.push(s);
       },
@@ -4283,6 +4285,7 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
       stdin: makeStdin(),
       skipTtyCheck: true,
       skipTrustPrompt: true,
+      skipResumeModePrompt: true,
       errSink: (s) => {
         errs.push(s);
       },
@@ -4312,6 +4315,7 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
       stdin: makeStdin(),
       skipTtyCheck: true,
       skipTrustPrompt: true,
+      skipResumeModePrompt: true,
       errSink: (s) => {
         errs.push(s);
       },
@@ -4351,6 +4355,7 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
       stdin: makeStdin(),
       skipTtyCheck: true,
       skipTrustPrompt: true,
+      skipResumeModePrompt: true,
       errSink: (s) => {
         errs.push(s);
       },
@@ -4401,6 +4406,7 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
       stdin,
       skipTtyCheck: true,
       skipTrustPrompt: true,
+      skipResumeModePrompt: true,
       errSink: (s) => {
         errs.push(s);
       },
@@ -4437,6 +4443,7 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
       stdin,
       skipTtyCheck: true,
       skipTrustPrompt: true,
+      skipResumeModePrompt: true,
       runAgentOverride: ra.runAgent,
     });
     await tick();
@@ -4447,6 +4454,64 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
     expect(ra.captured).toHaveLength(1);
     expect(ra.captured[0]?.configs[0]?.resumeFromSessionId).toBe(resumedId);
     // Wrap up cleanly.
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('resume-mode modal "full" (hotkey 2) switches the first turn to sessionContext', async () => {
+    // No skipResumeModePrompt → the modal shows. Answering "full" (hotkey 2 —
+    // summary is the recommended option 1) hydrates the whole log into a live
+    // context handed to the first turn via sessionContext (reuse path), so
+    // resumeFromSessionId is NOT threaded.
+    const stub = makeBootstrapStub();
+    const resumedId = 'sess-full-mode';
+    createSession(stub.db, {
+      id: resumedId,
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+    });
+    // A complete prior turn (user + assistant) so the replay reports turns > 0
+    // and the history/new-turns anchor fires (parity with the capped path).
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'user',
+      content: 'earlier prompt',
+      createdAt: 1_000_000,
+    });
+    appendMessage(stub.db, {
+      sessionId: resumedId,
+      role: 'assistant',
+      content: [{ type: 'text', text: 'earlier answer' }],
+      createdAt: 1_001_000,
+    });
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs({ resume: resumedId }),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    // Answer the resume-mode modal: "2" = Full session ("1" is summary).
+    stdin.feed('2');
+    await tick();
+    // Full mode emits the same history/new-turns anchor the capped path does.
+    expect(writes.join('')).toContain('resumed 1 prior turn');
+    stdin.feed('continue\r');
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    // Reuse path: sessionContext set, resumeFromSessionId omitted.
+    expect(ra.captured[0]?.configs[0]?.sessionContext).toBeDefined();
+    expect(ra.captured[0]?.configs[0]?.resumeFromSessionId).toBeUndefined();
     ra.finish(0);
     await tick();
     stdin.feed('\x04');
@@ -4473,6 +4538,7 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
       stdin,
       skipTtyCheck: true,
       skipTrustPrompt: true,
+      skipResumeModePrompt: true,
       rendererWrite: (s) => {
         writes.push(s);
       },
@@ -4531,6 +4597,7 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
       stdin,
       skipTtyCheck: true,
       skipTrustPrompt: true,
+      skipResumeModePrompt: true,
       rendererWrite: (s) => {
         writes.push(s);
       },
@@ -4591,6 +4658,7 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
       stdin,
       skipTtyCheck: true,
       skipTrustPrompt: true,
+      skipResumeModePrompt: true,
       rendererWrite: (s) => {
         writes.push(s);
       },
@@ -4640,6 +4708,7 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
       stdin,
       skipTtyCheck: true,
       skipTrustPrompt: true,
+      skipResumeModePrompt: true,
       rendererWrite: (s) => {
         writes.push(s);
       },
@@ -4707,6 +4776,7 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
       stdin,
       skipTtyCheck: true,
       skipTrustPrompt: true,
+      skipResumeModePrompt: true,
       rendererWrite: (s) => {
         writes.push(s);
       },
@@ -4756,6 +4826,7 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
       stdin,
       skipTtyCheck: true,
       skipTrustPrompt: true,
+      skipResumeModePrompt: true,
       errSink: (s) => {
         errs.push(s);
       },
@@ -4802,6 +4873,7 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
       stdin,
       skipTtyCheck: true,
       skipTrustPrompt: true,
+      skipResumeModePrompt: true,
       rendererWrite: (s) => {
         writes.push(s);
       },
@@ -4837,6 +4909,7 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
       stdin,
       skipTtyCheck: true,
       skipTrustPrompt: true,
+      skipResumeModePrompt: true,
       errSink: (s) => {
         errs.push(s);
       },

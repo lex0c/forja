@@ -58,6 +58,7 @@
 // array of tool_result blocks (continuation of the prior run).
 
 import { ALIGNMENT_FETCH_MARGIN, MAX_RESUME_MESSAGES, resumeWindowCut } from '../harness/resume.ts';
+import type { ProviderMessage } from '../providers/index.ts';
 import { type DB, listMessageTailBySession } from '../storage/index.ts';
 import type { Bus } from '../tui/bus.ts';
 import { lookupToolVocab } from '../tui/tool-vocab.ts';
@@ -214,11 +215,91 @@ const indexToolPairs = (
 // model's.
 const DEFAULT_FETCH_LIMIT = MAX_RESUME_MESSAGES + ALIGNMENT_FETCH_MARGIN;
 
+// Emit one assistant message's content as scrollback events: `assistant:start`
+// (lazy, on the first text block — skipped entirely for tool-only assistants),
+// `assistant:delta` per text block, `tool:start` per tool_use (in block order),
+// `assistant:end`, then a synthetic error `tool:end` for each tool_use with no
+// matching result (orphan → the run died before the tool returned; a frozen
+// "running…" card would read as a bug). Shared by the DB-row replay (real
+// per-message timestamps) and the compacted-array replay (synthetic `now`):
+// the two differ ONLY in messageId + timestamps + that durations are unknown
+// for the latter, so those are passed in. `results` is the tool_use→result
+// index used to detect orphans. Returns the orphan ids so the caller can mark
+// an interrupted run boundary.
+const emitAssistantBlocks = (
+  bus: Bus,
+  content: unknown,
+  results: Map<string, ToolResultRef>,
+  opts: { messageId: string; startTs: number; bodyTs: number },
+): string[] => {
+  const { messageId, startTs, bodyTs } = opts;
+  let started = false;
+  const ensureStart = (): void => {
+    if (!started) {
+      bus.emit({ type: 'assistant:start', ts: startTs, messageId });
+      started = true;
+    }
+  };
+  const orphanToolIds: string[] = [];
+  if (typeof content === 'string') {
+    if (content.length > 0) {
+      ensureStart();
+      bus.emit({ type: 'assistant:delta', ts: bodyTs, messageId, text: content });
+    }
+  } else if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block === null || typeof block !== 'object') continue;
+      const b = block as {
+        type?: unknown;
+        text?: unknown;
+        id?: unknown;
+        name?: unknown;
+        input?: unknown;
+      };
+      if (b.type === 'text' && typeof b.text === 'string' && b.text.length > 0) {
+        ensureStart();
+        bus.emit({ type: 'assistant:delta', ts: bodyTs, messageId, text: b.text });
+      } else if (b.type === 'tool_use' && typeof b.id === 'string' && typeof b.name === 'string') {
+        const vocab = lookupToolVocab(b.name);
+        bus.emit({
+          type: 'tool:start',
+          ts: bodyTs,
+          toolId: b.id,
+          name: b.name,
+          activeVerb: vocab.activeVerb,
+          finalVerb: vocab.finalVerb,
+          subject: subjectFromInput(b.input, vocab),
+        });
+        if (!results.has(b.id)) orphanToolIds.push(b.id);
+      }
+      // Other block kinds (thinking, image, etc.) are skipped silently.
+    }
+  }
+  if (started) {
+    bus.emit({ type: 'assistant:end', ts: bodyTs, messageId });
+  }
+  for (const orphanId of orphanToolIds) {
+    bus.emit({
+      type: 'tool:end',
+      ts: bodyTs,
+      toolId: orphanId,
+      status: 'error',
+      durationMs: 0,
+      summary: '(no result recorded — run interrupted)',
+    });
+  }
+  return orphanToolIds;
+};
+
 export const replaySessionMessages = (
   db: DB,
   sessionId: string,
   bus: Bus,
   fetchLimit: number = DEFAULT_FETCH_LIMIT,
+  // `opts.uncapped` (the "full" resume mode) replays the ENTIRE log: pass
+  // fetchLimit = -1 and skip the MAX_RESUME_MESSAGES window cut so visual
+  // history matches the uncapped model context. The safe-head walk still runs.
+  opts?: { uncapped?: boolean },
 ): ReplayResult => {
   // Fetch the bounded tail, not the whole log — same call shape the
   // harness uses to build the model's resume context. `totalCount`
@@ -227,7 +308,10 @@ export const replaySessionMessages = (
   const tail = listMessageTailBySession(db, sessionId, fetchLimit);
   // Apply the SAME head cut the model's context uses, so visual
   // history and model context are the identical window.
-  const cut = resumeWindowCut(tail.messages);
+  const cut = resumeWindowCut(
+    tail.messages,
+    opts?.uncapped === true ? Number.POSITIVE_INFINITY : MAX_RESUME_MESSAGES,
+  );
   const messages = cut > 0 ? tail.messages.slice(cut) : tail.messages;
   // Messages outside the window = rows older than the fetched tail
   // (totalCount minus what the tail query returned) PLUS rows the
@@ -307,107 +391,16 @@ export const replaySessionMessages = (
       const next = messages[i + 1];
       const isMidRun = next !== undefined && next.role === 'user' && Array.isArray(next.content);
 
-      // Walk content blocks: emit `assistant:start` lazily on the
-      // first text block (skip the bracket entirely for tool-only
-      // assistants), then interleave `assistant:delta` and
-      // `tool:start` in block order. Live behavior: when an LLM
-      // streams text → tool_use → text within one completion, the
-      // operator sees the assistant chip + a tool card spawn
-      // beneath it, then more text continues. The reducer accepts
-      // tool:start while pendingAssistant is open; this preserves
-      // the same shape from persisted data.
-      let assistantStarted = false;
-      const startTs = prevCreatedAt ?? msg.createdAt;
-      const ensureAssistantStart = (): void => {
-        if (!assistantStarted) {
-          bus.emit({ type: 'assistant:start', ts: startTs, messageId: msg.id });
-          assistantStarted = true;
-        }
-      };
-      // tool_use ids emitted from THIS message that have no matching
-      // tool_result anywhere in the session — the run was interrupted
-      // (hard kill, crash) before the tool returned. We still emit
-      // tool:start so the operator sees the tool was attempted, then
-      // a synthetic tool:end below so the card doesn't freeze as
-      // "running…" in the live region forever.
-      const orphanToolIds: string[] = [];
-
-      const content = msg.content;
-      if (typeof content === 'string') {
-        if (content.length > 0) {
-          ensureAssistantStart();
-          bus.emit({
-            type: 'assistant:delta',
-            ts: msg.createdAt,
-            messageId: msg.id,
-            text: content,
-          });
-        }
-      } else if (Array.isArray(content)) {
-        for (const block of content) {
-          if (block === null || typeof block !== 'object') continue;
-          const b = block as {
-            type?: unknown;
-            text?: unknown;
-            id?: unknown;
-            name?: unknown;
-            input?: unknown;
-          };
-          if (b.type === 'text' && typeof b.text === 'string' && b.text.length > 0) {
-            ensureAssistantStart();
-            bus.emit({
-              type: 'assistant:delta',
-              ts: msg.createdAt,
-              messageId: msg.id,
-              text: b.text,
-            });
-          } else if (
-            b.type === 'tool_use' &&
-            typeof b.id === 'string' &&
-            typeof b.name === 'string'
-          ) {
-            const vocab = lookupToolVocab(b.name);
-            bus.emit({
-              type: 'tool:start',
-              ts: msg.createdAt,
-              toolId: b.id,
-              name: b.name,
-              activeVerb: vocab.activeVerb,
-              finalVerb: vocab.finalVerb,
-              subject: subjectFromInput(b.input, vocab),
-            });
-            // Orphan tool_use: no tool_result anywhere. Defer a
-            // synthetic tool:end until after assistant:end below —
-            // emitting it inline would close the card before the
-            // surrounding text finished rendering.
-            if (!results.has(b.id)) orphanToolIds.push(b.id);
-          }
-          // Other block kinds (thinking, image, etc.) are skipped
-          // silently — no scrollback representation in this slice.
-        }
-      }
-
-      if (assistantStarted) {
-        bus.emit({ type: 'assistant:end', ts: msg.createdAt, messageId: msg.id });
-      }
-
-      // Close any orphan tool cards with a synthetic error tool:end.
-      // The live operator saw the tool spawn and then the run die;
-      // replaying a frozen "running…" card against a historical
-      // session reads as a bug. status='error' + an explanatory
-      // summary tells the truth: the tool was attempted, no result
-      // was recorded. durationMs=0 — we have no end timestamp, and
-      // a fabricated one would be a worse lie than zero.
-      for (const orphanId of orphanToolIds) {
-        bus.emit({
-          type: 'tool:end',
-          ts: msg.createdAt,
-          toolId: orphanId,
-          status: 'error',
-          durationMs: 0,
-          summary: '(no result recorded — run interrupted)',
-        });
-      }
+      // Walk content blocks: assistant:start (lazy) → deltas / tool:start in
+      // block order → assistant:end → synthetic tool:end for orphans. Shared
+      // with the compacted-array replay; here the timestamps are the persisted
+      // createdAt (start anchors to the previous row so per-completion duration
+      // is real). Returns orphan ids → an interrupted run boundary below.
+      const orphanToolIds = emitAssistantBlocks(bus, msg.content, results, {
+        messageId: msg.id,
+        startTs: prevCreatedAt ?? msg.createdAt,
+        bodyTs: msg.createdAt,
+      });
 
       // session:end fires only at the real run boundary AND only
       // when this run had a user-facing start (runStartTs !==
@@ -452,4 +445,125 @@ export const replaySessionMessages = (
     prevCreatedAt = msg.createdAt;
   }
   return { turns, messagesWalked: messages.length, droppedFromHead };
+};
+
+// Marker that identifies the synthetic compaction summary message (the head of
+// a compacted array). Mirrors SUMMARY_MARKER_OPEN in harness/compaction.ts.
+const SUMMARY_MARKER = '[compacted_history]';
+
+// Replay a COMPACTED ProviderMessage[] (the "from summary" resume mode) into
+// the scrollback. Unlike replaySessionMessages (DB rows with real createdAt),
+// this renders an in-memory array whose head is the synthetic compaction
+// summary — there are no per-message timestamps, so turn/tool durations render
+// as 0 / "Cogitated." (acceptable for a resumed-compacted view). The summary
+// head is painted in the secondary (scaffold) channel, NEVER as an operator
+// inverse bar. Compacting BEFORE replay is the whole point: the scrollback
+// shows only what survives (summary + preserved tail), not the folded history.
+export const replayProviderMessages = (
+  messages: readonly ProviderMessage[],
+  sessionId: string,
+  bus: Bus,
+  now = 0,
+): ReplayResult => {
+  let start = 0;
+  const head = messages[0];
+  if (
+    head !== undefined &&
+    head.role === 'user' &&
+    typeof head.content === 'string' &&
+    head.content.includes(SUMMARY_MARKER)
+  ) {
+    bus.emit({
+      type: 'info',
+      ts: now,
+      tone: 'secondary',
+      message: '— resumed from a compacted summary — older turns folded into the block below —',
+    });
+    // info renders one line per event (single-line, padFrame'd), so split the
+    // multi-line summary body into one secondary line each.
+    for (const line of head.content.split('\n')) {
+      bus.emit({ type: 'info', ts: now, tone: 'secondary', message: line.length > 0 ? line : ' ' });
+    }
+    start = 1;
+  }
+
+  // Preserved tail (the verbatim recent turns kept by compaction). Pair
+  // tool_use ↔ tool_result by id (timestamps are all `now`); orphans get a
+  // synthetic error close so a card never freezes as "running…".
+  const rest = messages.slice(start);
+  const { uses, results } = indexToolPairs(
+    rest.map((m) => ({ role: m.role, content: m.content, createdAt: now })),
+  );
+
+  let runActive = false;
+  let turns = 0;
+  for (let i = 0; i < rest.length; i++) {
+    const msg = rest[i];
+    if (msg === undefined) continue;
+
+    if (msg.role === 'user') {
+      if (typeof msg.content === 'string') {
+        if (msg.content.length > 0) {
+          bus.emit({ type: 'user:submit', ts: now, text: msg.content });
+          runActive = true;
+        }
+      } else if (Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (block === null || typeof block !== 'object') continue;
+          const b = block as { type?: unknown; tool_use_id?: unknown };
+          if (b.type !== 'tool_result' || typeof b.tool_use_id !== 'string') continue;
+          if (!uses.has(b.tool_use_id)) continue;
+          const resultRef = results.get(b.tool_use_id);
+          if (resultRef === undefined) continue;
+          bus.emit({
+            type: 'tool:end',
+            ts: now,
+            toolId: b.tool_use_id,
+            status: resultRef.isError ? 'error' : 'done',
+            durationMs: 0,
+            ...(resultRef.summary !== null ? { summary: resultRef.summary } : {}),
+          });
+        }
+      }
+      continue;
+    }
+
+    if (msg.role === 'assistant') {
+      const next = rest[i + 1];
+      const isMidRun = next !== undefined && next.role === 'user' && Array.isArray(next.content);
+      // Same block walk as the DB-row replay, but with a synthetic id (no DB
+      // row backs an in-memory ProviderMessage) and a single `now` for all
+      // timestamps (durations don't survive into the compacted array).
+      const orphanToolIds = emitAssistantBlocks(bus, msg.content, results, {
+        messageId: `resume-compact-${i}`,
+        startTs: now,
+        bodyTs: now,
+      });
+      // Run boundary: close the footer (no durationMs → "Cogitated." without a
+      // bogus "0s" — timestamps don't survive into the compacted array).
+      if (!isMidRun && runActive) {
+        bus.emit({
+          type: 'session:end',
+          ts: now,
+          sessionId,
+          reason: orphanToolIds.length > 0 ? 'interrupted' : 'done',
+        });
+        turns++;
+        runActive = false;
+      }
+    }
+  }
+  // No summary block was emitted (compaction was a no-op — e.g. summary mode on
+  // a session too small to fold): fall back to the same history/new-turns anchor
+  // the capped and full paths emit, so summary mode is never left without a
+  // separator before the prompt. `start === 0` ⇒ no summary head was shown.
+  if (start === 0 && turns > 0) {
+    bus.emit({
+      type: 'info',
+      ts: now,
+      tone: 'secondary',
+      message: `— resumed ${turns} prior ${turns === 1 ? 'turn' : 'turns'} (history above; new turns below) —`,
+    });
+  }
+  return { turns, messagesWalked: messages.length, droppedFromHead: 0 };
 };

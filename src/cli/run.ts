@@ -1,4 +1,6 @@
-import { type HarnessResult, runAgent } from '../harness/index.ts';
+import { type HarnessResult, type SessionContext, runAgent } from '../harness/index.ts';
+import { RESUME_FULL_WARN_THRESHOLD } from '../harness/resume.ts';
+import { effectiveBudget } from '../harness/types.ts';
 import {
   type DB,
   closeDb,
@@ -16,6 +18,7 @@ import { runListSessions } from './list-sessions.ts';
 import { createJsonRenderer } from './output/json.ts';
 import { createPlainRenderer } from './output/plain.ts';
 import type { OutputRenderer } from './output/types.ts';
+import { prepareResumeContext } from './resume-prepare.ts';
 import { installSignalHandler } from './signal.ts';
 
 export interface RunOptions {
@@ -883,10 +886,56 @@ export const run = async (options: RunOptions): Promise<number> => {
       }
     }
 
-    const cfg = {
-      ...config,
-      onEvent: (e: Parameters<OutputRenderer['onEvent']>[0]) => renderer.onEvent(e),
-    };
+    // Resume-mode (headless): full/summary hydrate the WHOLE log (and summary
+    // compacts it) at boot, then hand the first turn a ready SessionContext via
+    // the reuse path instead of the harness's capped resumeFromSessionId
+    // hydration. No scrollback here, so the "render-then-discard" concern
+    // doesn't apply — this just honors --resume-mode for headless runs. Capped
+    // (no flag) keeps the existing resumeFromSessionId path untouched.
+    let resumeSessionContext: SessionContext | undefined;
+    if (resumeFromSessionId !== undefined && args.resumeMode !== undefined) {
+      try {
+        // Same hydrate(+compact) core as the interactive path
+        // (prepareResumeContext); headless surfaces warnings via stderr and
+        // skips the chip/cumulative (no scrollback / REPL cumulative).
+        const { ctx, info, compaction } = await prepareResumeContext({
+          db,
+          sessionId: resumeFromSessionId,
+          mode: args.resumeMode,
+          provider: config.provider,
+          budget: effectiveBudget(config.budget, config.effort),
+          memoryRegistryPresent: config.memoryRegistry !== undefined,
+          now: Date.now,
+          signal,
+        });
+        resumeSessionContext = ctx;
+        if (info.totalCount > RESUME_FULL_WARN_THRESHOLD) {
+          errSink(
+            `forja: --resume-mode ${args.resumeMode} loaded ${info.totalCount} messages (full history)\n`,
+          );
+        }
+        if (compaction?.kind === 'error') {
+          errSink(
+            `forja: --resume-mode summary compaction failed: ${compaction.message} (resuming with full history)\n`,
+          );
+        }
+      } catch (e) {
+        errSink(
+          `forja: --resume-mode hydration failed: ${e instanceof Error ? e.message : String(e)} (falling back to capped resume)\n`,
+        );
+        resumeSessionContext = undefined;
+      }
+    }
+
+    const onEvent = (e: Parameters<OutputRenderer['onEvent']>[0]) => renderer.onEvent(e);
+    // Switch onto the reuse path when full/summary prepared a context. Omit
+    // resumeFromSessionId entirely (not set to undefined — exactOptional) so
+    // sessionContext / resumeFromSessionId stay mutually exclusive.
+    const { resumeFromSessionId: _omitResumeId, ...configWithoutResume } = config;
+    const cfg =
+      resumeSessionContext !== undefined
+        ? { ...configWithoutResume, sessionContext: resumeSessionContext, onEvent }
+        : { ...config, onEvent };
     try {
       const result = await runAgent(cfg);
       renderer.flush();

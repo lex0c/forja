@@ -28,6 +28,7 @@ import {
   type SessionContext,
   runAgent,
 } from '../harness/index.ts';
+import { RESUME_FULL_WARN_THRESHOLD } from '../harness/resume.ts';
 import { effectiveBudget, resolveMaxOutputTokens } from '../harness/types.ts';
 import { dispatchChain } from '../hooks/dispatcher.ts';
 import type { HookChainResult, HookEventPayload } from '../hooks/types.ts';
@@ -42,7 +43,7 @@ import {
   loadHistory,
   searchHistory,
 } from '../storage/history.ts';
-import { closeDb, computeUsageStats } from '../storage/index.ts';
+import { closeDb, computeUsageStats, countMessagesBySession } from '../storage/index.ts';
 import { createContextPinsStore } from '../storage/repos/context-pins.ts';
 import { completeSession, createSession } from '../storage/repos/sessions.ts';
 import { settleRunningSubagentHandles } from '../storage/repos/subagent-handles.ts';
@@ -70,7 +71,8 @@ import type { ParsedArgs } from './args.ts';
 import { type BootstrapInput, type BootstrapResult, bootstrap } from './bootstrap.ts';
 import { maybeEmitHistoryBanner } from './history-banner.ts';
 import { concatQueuedBodies } from './inbox-drain.ts';
-import { replaySessionMessages } from './resume-replay.ts';
+import { prepareResumeContext } from './resume-prepare.ts';
+import { replayProviderMessages, replaySessionMessages } from './resume-replay.ts';
 import { resolveResumeIdOnDb } from './run.ts';
 import {
   type SlashContext,
@@ -154,6 +156,13 @@ export interface RunReplOptions {
   // existing fixtures predate it), so leaving the gate active
   // would block every REPL test on an unanswered modal.
   skipTrustPrompt?: boolean;
+  // Test seam: skip the resume-mode prompt (full / from-summary) on an
+  // interactive `--resume` and fall back to the capped default. Production
+  // never sets this — the operator always sees the modal when resuming
+  // without an explicit --resume-mode flag. Tests that exercise the
+  // (capped) resume flow set this so they don't block on an unanswered
+  // modal; the dedicated resume-mode tests drive the modal directly.
+  skipResumeModePrompt?: boolean;
   // Test seam: override the trust list file path. Without this,
   // the trust-prompt tests would persist across runs in the dev
   // machine's real `~/.config/agent/trusted_dirs.json` and
@@ -329,6 +338,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // rewriting the live context's message array in place. Set SYNCHRONOUSLY
   // (runExclusive below) before the await, same contract as playbookRunning.
   let compacting = false;
+  // True while the boot-time resume prep (full/summary hydrate, and the
+  // summary compaction) is in flight. Distinct from `compacting` so the flag's
+  // name doesn't lie for the full mode (which hydrates but never compacts).
+  // Part of `isBusy` so a prompt typed after the resume-mode modal resolves —
+  // but before the prepared context is wired — is queued, not run.
+  let resumePrepping = false;
   // Aborts the in-flight /compact summary call on operator interrupt
   // (triggerInterrupt fires it). runExclusive populates it for the fn's
   // duration; the /compact body composes this with its own timeout. Without
@@ -355,7 +370,8 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // on `running` alone and let a normal turn start mid-playbook
   // — the exact serialization the playbookRunning flag was
   // supposed to enforce, defeated at every other entry point.
-  const isBusy = (): boolean => running || playbookRunning || operatorBashRunning || compacting;
+  const isBusy = (): boolean =>
+    running || playbookRunning || operatorBashRunning || compacting || resumePrepping;
   // Mirror `isBusy()` into renderer state so the bash-mode visuals gate
   // on the same condition the submit path uses (render/mode.ts). Call
   // after EVERY mutation of `running` / `playbookRunning` /
@@ -3347,22 +3363,98 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // them out of a half-drawn REPL.
   if (resumedSessionId !== null) {
     try {
-      const replay = replaySessionMessages(db, resumedSessionId, bus);
-      // Anchor between historical scrollback and the empty prompt:
-      // an info line attributing the rows above to the resume and
-      // marking "everything below is new". Without this, an
-      // operator opening a deep history can mistake the last
-      // assistant text for a turn they already typed today.
-      if (replay.turns > 0) {
-        bus.emit({
-          type: 'info',
-          ts: now(),
-          // `secondary` (grey) — the anchor is visual scaffolding
-          // separating history from new turns, not content; it
-          // should recede next to the replayed conversation.
-          tone: 'secondary',
-          message: `— resumed ${replay.turns} prior ${replay.turns === 1 ? 'turn' : 'turns'} (history above; new turns below) —`,
-        });
+      // Resume-mode selection. The --resume-mode flag wins; otherwise ask the
+      // operator (stdin is already subscribed from bootstrap, so the modal
+      // receives input even though we await it before the event loop's
+      // exitPromise). Esc/cancel → 'capped' (the bounded default).
+      const mode =
+        args.resumeMode ??
+        (options.skipResumeModePrompt === true
+          ? 'capped'
+          : await modalManager.askResumeMode({
+              totalCount: countMessagesBySession(db, resumedSessionId),
+            }));
+
+      if (mode === 'full' || mode === 'summary') {
+        // Hold the busy lock across the prep so a prompt typed after the modal
+        // resolves — but while hydration / compaction is still in flight — is
+        // QUEUED, not run against a not-yet-set live context.
+        resumePrepping = true;
+        syncBusy();
+        try {
+          // Hydrate the WHOLE log (uncapped) and, for summary, compact BEFORE
+          // replay (so the scrollback shows only what survives). Shared with the
+          // headless path via prepareResumeContext. The prepared ctx is handed
+          // to the first turn via the reuse path (liveContext → sessionContext),
+          // so the harness never re-hydrates the capped window.
+          const { ctx, info, compaction } = await prepareResumeContext({
+            db,
+            sessionId: resumedSessionId,
+            mode,
+            provider: baseConfig.provider,
+            budget: effectiveBudget(baseConfig.budget, baseConfig.effort),
+            memoryRegistryPresent: baseConfig.memoryRegistry !== undefined,
+            now,
+            bus,
+            cumulative,
+            refreshStats: emitStatsRefresh,
+          });
+          if (info.totalCount > RESUME_FULL_WARN_THRESHOLD) {
+            bus.emit({
+              type: 'info',
+              ts: now(),
+              tone: 'secondary',
+              message: `— loaded ${info.totalCount} messages (full history) into context —`,
+            });
+          }
+          if (mode === 'summary') {
+            if (compaction?.kind === 'error') {
+              bus.emit({
+                type: 'info',
+                ts: now(),
+                tone: 'secondary',
+                message: `(summary compaction failed: ${compaction.message} — resuming with full history)`,
+              });
+            }
+            replayProviderMessages(ctx.getMessages(), resumedSessionId, bus, now());
+          } else {
+            // full: replay the entire log (uncapped) so visual history matches
+            // the uncapped model context, then the same history/new-turns anchor
+            // the capped path emits.
+            const replay = replaySessionMessages(db, resumedSessionId, bus, -1, {
+              uncapped: true,
+            });
+            if (replay.turns > 0) {
+              bus.emit({
+                type: 'info',
+                ts: now(),
+                tone: 'secondary',
+                message: `— resumed ${replay.turns} prior ${replay.turns === 1 ? 'turn' : 'turns'} (history above; new turns below) —`,
+              });
+            }
+          }
+          // Switch the first turn onto the reuse path (no harness re-hydrate).
+          liveContext = ctx;
+        } finally {
+          resumePrepping = false;
+          syncBusy();
+        }
+      } else {
+        // capped (Esc / default): the historical bounded replay + the harness
+        // resumeFromSessionId path (liveContext stays null).
+        const replay = replaySessionMessages(db, resumedSessionId, bus);
+        // Anchor between historical scrollback and the empty prompt: an info
+        // line attributing the rows above to the resume and marking
+        // "everything below is new". `secondary` (grey) — visual scaffolding,
+        // not content.
+        if (replay.turns > 0) {
+          bus.emit({
+            type: 'info',
+            ts: now(),
+            tone: 'secondary',
+            message: `— resumed ${replay.turns} prior ${replay.turns === 1 ? 'turn' : 'turns'} (history above; new turns below) —`,
+          });
+        }
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message || e.name || String(e) : String(e);

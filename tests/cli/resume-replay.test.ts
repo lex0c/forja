@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
-import { replaySessionMessages } from '../../src/cli/resume-replay.ts';
+import { replayProviderMessages, replaySessionMessages } from '../../src/cli/resume-replay.ts';
+import type { ProviderMessage } from '../../src/providers/index.ts';
 import { openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { appendMessage } from '../../src/storage/repos/messages.ts';
@@ -990,5 +991,63 @@ describe('replaySessionMessages — text + tool replay (Phase 3)', () => {
     const result = replaySessionMessages(db, 's1', bus, 4);
     expect(result.droppedFromHead + result.messagesWalked).toBe(10);
     expect(result.droppedFromHead).toBe(10 - result.messagesWalked);
+  });
+});
+
+describe('replayProviderMessages — compacted-array replay (resume "from summary")', () => {
+  test('renders the summary head as secondary info, then replays the preserved tail', () => {
+    const { bus, events } = recordEvents();
+    const messages: ProviderMessage[] = [
+      { role: 'user', content: 'goal\n\n[compacted_history]\nfolded stuff\n[/compacted_history]' },
+      { role: 'user', content: 'recent prompt' },
+      { role: 'assistant', content: [{ type: 'text', text: 'recent answer' }] },
+    ];
+    const result = replayProviderMessages(messages, 's1', bus, 0);
+    // Summary head → info channel, all secondary tone (scaffold, not content).
+    const infos = events.filter((e) => e.type === 'info');
+    expect(infos.length).toBeGreaterThan(0);
+    expect(infos.every((e) => (e as { tone?: string }).tone === 'secondary')).toBe(true);
+    // Preserved prompt replays as a real user:submit (inverse bar).
+    expect(
+      events.some(
+        (e) => e.type === 'user:submit' && (e as { text: string }).text === 'recent prompt',
+      ),
+    ).toBe(true);
+    expect(events.some((e) => e.type === 'assistant:delta')).toBe(true);
+    expect(result.turns).toBe(1);
+  });
+
+  test('the synthetic summary head is NOT replayed as a user:submit', () => {
+    const { bus, events } = recordEvents();
+    const messages: ProviderMessage[] = [
+      { role: 'user', content: 'goal\n\n[compacted_history]\nx\n[/compacted_history]' },
+      { role: 'user', content: 'hi' },
+    ];
+    replayProviderMessages(messages, 's1', bus, 0);
+    const submits = events.filter((e) => e.type === 'user:submit');
+    expect(submits).toHaveLength(1);
+    expect((submits[0] as { text: string }).text).toBe('hi');
+  });
+
+  test('no summary marker (noop compaction) → head replays as a turn + fallback anchor', () => {
+    // summary mode on a session too small to fold: no [compacted_history] head.
+    // The head replays as a real turn, and a history/new-turns anchor still
+    // fires (parity with capped/full) — never left without a separator.
+    const { bus, events } = recordEvents();
+    const messages: ProviderMessage[] = [
+      { role: 'user', content: 'just a prompt' },
+      { role: 'assistant', content: [{ type: 'text', text: 'reply' }] },
+    ];
+    const result = replayProviderMessages(messages, 's1', bus, 0);
+    expect(
+      events.some(
+        (e) => e.type === 'user:submit' && (e as { text: string }).text === 'just a prompt',
+      ),
+    ).toBe(true);
+    // No summary block, but the fallback anchor for the one replayed turn.
+    expect(result.turns).toBe(1);
+    const infos = events.filter((e) => e.type === 'info');
+    expect(infos).toHaveLength(1);
+    expect((infos[0] as { message: string }).message).toContain('resumed 1 prior turn');
   });
 });

@@ -1118,3 +1118,27 @@ describe('askTrust (trust:ask producer, spec §9.1) — slice 135 P1 ops-3', () 
     await expect(promise).resolves.toBe('cancel');
   });
 });
+
+describe('askResumeMode (resume "from summary" feature)', () => {
+  test('emits resumemode:ask and resolves "summary" on default Enter (recommended, cursor on option 0)', async () => {
+    const s = make();
+    const promise = s.manager.askResumeMode({ totalCount: 42 });
+    expect(s.events.some((e) => e.type === 'resumemode:ask')).toBe(true);
+    s.fs.dispatch(key('enter'));
+    await expect(promise).resolves.toBe('summary');
+  });
+
+  test('hotkey "2" resolves "full"', async () => {
+    const s = make();
+    const promise = s.manager.askResumeMode({ totalCount: 1 });
+    s.fs.dispatch(charKey('2'));
+    await expect(promise).resolves.toBe('full');
+  });
+
+  test('Esc resolves "capped" (the safe bounded-window fallback)', async () => {
+    const s = make();
+    const promise = s.manager.askResumeMode({ totalCount: 1 });
+    s.fs.dispatch(key('escape'));
+    await expect(promise).resolves.toBe('capped');
+  });
+});
