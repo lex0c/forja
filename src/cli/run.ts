@@ -946,7 +946,15 @@ export const run = async (options: RunOptions): Promise<number> => {
     const { resumeFromSessionId: _omitResumeId, ...configWithoutResume } = config;
     const cfg =
       resumeSessionContext !== undefined
-        ? { ...configWithoutResume, sessionContext: resumeSessionContext, onEvent }
+        ? {
+            ...configWithoutResume,
+            sessionContext: resumeSessionContext,
+            // Headless is single-turn: this prehydrated context IS the first
+            // turn after a resume, so run the [resume_context] rehydrate (the
+            // capped --resume path gets it via resumeFromSessionId).
+            resumeWithSessionContext: true,
+            onEvent,
+          }
         : { ...config, onEvent };
     try {
       const result = await runAgent(cfg);

@@ -796,6 +796,17 @@ export interface HarnessConfig {
   // leave it undefined and take the derive path; the DB stays the
   // full append-only log either way.
   sessionContext?: SessionContext;
+  // Set ONLY with `sessionContext`, and only when that context is a
+  // fresh-process resume (the `--resume-mode full|summary` paths, which
+  // pre-hydrate the uncapped context in the CLI instead of going through
+  // `resumeFromSessionId`). It tells the harness "treat this reuse turn as the
+  // FIRST turn after a resume": capture the pre-resume status and run the
+  // `[resume_context]` auto-rehydrate (decisions / pins / open todos) +
+  // `resume_rehydrated` event, exactly as the `resumeFromSessionId` path does.
+  // Plain REPL multi-turn reuse leaves it undefined → no rehydrate (the live
+  // context already saw the recap on its first turn). One-shot: the caller must
+  // set it only on the first turn after the resume, never on follow-ups.
+  resumeWithSessionContext?: boolean;
   // Checkpoint subsystem (M3 §12). When true, the harness probes
   // `cwd` once at startup and, if the directory is a git repo,
   // takes a snapshot before every step that runs a tool with

@@ -4512,6 +4512,9 @@ describe('repl — --resume gating + session seed (Phase 1)', () => {
     // Reuse path: sessionContext set, resumeFromSessionId omitted.
     expect(ra.captured[0]?.configs[0]?.sessionContext).toBeDefined();
     expect(ra.captured[0]?.configs[0]?.resumeFromSessionId).toBeUndefined();
+    // First turn runs the [resume_context] rehydrate despite being on the reuse
+    // path (the flag is one-shot, cleared at config build → follow-ups won't).
+    expect(ra.captured[0]?.configs[0]?.resumeWithSessionContext).toBe(true);
     ra.finish(0);
     await tick();
     stdin.feed('\x04');

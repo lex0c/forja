@@ -923,6 +923,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // that errored before resolving a context (the resumeFromSessionId
   // fallback in startTurn re-derives from the log in that case).
   let liveContext: SessionContext | null = null;
+  // One-shot: set when a full/summary resume pre-hydrates liveContext at boot,
+  // so the FIRST turn tells the harness to run the [resume_context] rehydrate
+  // (resumeWithSessionContext). Cleared as soon as that first turn's config is
+  // built — follow-ups are plain reuse and must not re-run the recap. Capped
+  // resume doesn't need it (its first turn goes through resumeFromSessionId,
+  // which auto-rehydrates).
+  let resumeRecapPending = false;
   // Append-only list of session ids tracked across this REPL
   // boot. Pushed on `session_finished` and on playbook subagent
   // completion. Slash commands that aggregate across the whole
@@ -1701,6 +1708,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     abortController = new AbortController();
     softStopController = new AbortController();
     const adapter = createHarnessAdapter(buildAdapterCtx());
+    // Consume the one-shot full/summary-resume recap flag: only the first turn
+    // after a prehydrated resume runs the [resume_context] rehydrate, and only
+    // when actually on the reuse path (liveContext set).
+    const includeResumeRecap = liveContext !== null && resumeRecapPending;
+    resumeRecapPending = false;
     const cfg: HarnessConfig = {
       ...baseConfig,
       userPrompt: text,
@@ -1718,7 +1730,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       // that errored before resolving one — so the next turn re-derives
       // from the DB log instead of starting a fresh session.
       ...(liveContext !== null
-        ? { sessionContext: liveContext }
+        ? {
+            sessionContext: liveContext,
+            ...(includeResumeRecap ? { resumeWithSessionContext: true } : {}),
+          }
         : lastSessionId !== null
           ? { resumeFromSessionId: lastSessionId }
           : {}),
@@ -3441,8 +3456,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
               });
             }
           }
-          // Switch the first turn onto the reuse path (no harness re-hydrate).
+          // Switch the first turn onto the reuse path (no harness re-hydrate),
+          // and flag that first turn to still run the [resume_context] recap —
+          // the prehydrated reuse path bypasses the resumeFromSessionId
+          // auto-rehydrate the capped path gets.
           liveContext = ctx;
+          resumeRecapPending = true;
         } finally {
           resumePrepping = false;
           syncBusy();
