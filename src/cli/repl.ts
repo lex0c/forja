@@ -3396,6 +3396,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // QUEUED, not run against a not-yet-set live context.
         resumePrepping = true;
         syncBusy();
+        // Make the boot-time summary compaction interruptible. Reuse the
+        // compactAbortController triggerInterrupt already aborts for /compact —
+        // resumePrepping routes Ctrl+C/Esc into triggerInterrupt, but without a
+        // controller it has nothing to cancel, so a slow/hung summary call
+        // would block until maxStepStallMs. compactMessages absorbs the abort
+        // into its deterministic fallback, so the prep still completes.
+        const prepAbort = new AbortController();
+        compactAbortController = prepAbort;
         try {
           // Hydrate the WHOLE log (uncapped) and, for summary, compact BEFORE
           // replay (so the scrollback shows only what survives). Shared with the
@@ -3410,6 +3418,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
             budget: effectiveBudget(baseConfig.budget, baseConfig.effort),
             memoryRegistryPresent: baseConfig.memoryRegistry !== undefined,
             now,
+            signal: prepAbort.signal,
             bus,
             cumulative,
             refreshStats: emitStatsRefresh,
@@ -3463,6 +3472,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           liveContext = ctx;
           resumeRecapPending = true;
         } finally {
+          compactAbortController = null;
           resumePrepping = false;
           syncBusy();
         }
