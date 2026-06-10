@@ -2,6 +2,50 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-10] fix(anthropic): honest `model_context_window_exceeded` exit + suppress thinking on tool turns
+
+Two correctness gaps surfaced auditing the Anthropic context-window contract:
+
+- **`model_context_window_exceeded` reported as success.** On 4.5+ models the API can stop a turn
+  with `stop_reason: "model_context_window_exceeded"` (input + generated output hit the window). The
+  adapter's `KNOWN_STOP_REASONS` didn't list it, so `mapStopReason` defaulted it to `end_turn`; with
+  no tool_uses the loop then returned `finish('done')` — a truncated answer reported as success with
+  exit code 0. Now the reason is in the canonical `StopReason`, and the loop maps it (in the
+  no-tool-use branch, mirroring the existing `max_tokens` handling) to a new exit reason
+  **`maxContextTokens`** → terminal status `exhausted` → exit code 2. Distinct from `maxOutputTokens`
+  on purpose: the remediation differs (compact / shrink input vs. raise the output cap). With
+  tool_uses present the turn proceeds as before (consistent with `max_tokens`); compaction at 70% of
+  the window normally keeps a run away from the wall.
+
+- **Extended thinking + tools is a latent landmine.** When a playbook sets `sampling.thinking_budget`
+  and the step has tools, the model emits a `thinking` block (with a cryptographic `signature`) before
+  its `tool_use`. The Anthropic contract requires that unmodified block + signature to be replayed
+  with the next turn's `tool_result`, or the follow-up request breaks reasoning continuity / 400s.
+  Forja drops `signature_delta` at the stream layer and never stores thinking blocks in
+  `ProviderMessage`, so it cannot round-trip them yet (full fix deferred — gated behind a long-horizon
+  eval; reasoning-continuity machinery showed zero benefit on short evals before). Cheap defensive
+  gate landed instead: `anthropicThinkingParam` now suppresses thinking (`{}`) whenever `req.tools` is
+  non-empty, so thinking engages only on no-tool turns — preserving the one case where it plausibly
+  helps (reasoning before action) while making a tool-bearing turn safe. The `generate` closure emits
+  a one-time stderr warning the first time it suppresses, so the operator learns why their
+  `thinking_budget` had no effect on a tool-bearing agent. Anthropic-adapter-only by design: the
+  signature contract is Anthropic-specific (OpenAI reasoning handles tools fine), so the gate lives in
+  the adapter, not the agnostic loop.
+
+Kept as-is: Opus 4.8 `context_window` stays 200k (1M on the API needs the `context-1m` beta and
+context rot usually makes a huge window worse — only raise with a long-horizon eval).
+
+A self-review caught one regression the gate introduced: the legacy `thinking_budget >= max_tokens`
+pre-flight throw (which pre-empts a real HTTP 400) fired even when tools were present — but with
+tools the budget is now suppressed and never sent, so the throw rejected a valid request with a
+no-longer-true "Anthropic rejects" reason. Fixed by gating the cross-check on tools being absent
+(it only matters where `budget_tokens` actually leaves the binary).
+
+Tests: stream maps the new stop reason (no longer falls back to `end_turn`); loop returns
+`maxContextTokens` on a no-tool-use turn that stops on the window limit; `anthropicThinkingParam` /
+`generate` drop thinking when tools are present and keep it when they're absent; the budget-vs-
+max_tokens throw stays silent when tools suppress thinking.
+
 ## [2026-06-10] feat(recap): `--model` render override, `[recap]` config, and `--no-recap` master switch
 
 Three operator knobs the spec advertised (§1/§8.2) or implied but the code never wired:

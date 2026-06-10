@@ -53,6 +53,9 @@ const KNOWN_STOP_REASONS: ReadonlySet<string> = new Set([
   'max_tokens',
   'stop_sequence',
   'refusal',
+  // Window overflow (4.5+). Must be recognized, not defaulted to
+  // `end_turn` — otherwise the loop reports a truncated turn as success.
+  'model_context_window_exceeded',
 ]);
 
 const mapStopReason = (raw: string): StopReason =>

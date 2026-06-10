@@ -106,6 +106,19 @@ export const anthropicThinkingParam = (
   // — while `effort` still shapes those runs via `output_config`. A
   // budget of 0 / absent ⇒ no thinking (disable-via-zero, PLAYBOOKS §1.1).
   if (budget === undefined || budget <= 0) return {};
+  // Defensive gate: thinking is allowed only on NO-TOOL turns. When the model
+  // emits a `thinking` block before a `tool_use`, the Anthropic contract
+  // requires that unmodified block (including its cryptographic `signature`)
+  // to be replayed with the next turn's `tool_result`, or the follow-up
+  // request breaks reasoning continuity / returns HTTP 400. Forja drops
+  // `signature_delta` at the stream layer and does not store thinking blocks
+  // in `ProviderMessage`, so it cannot round-trip them yet. Until that lands
+  // (deferred behind a long-horizon eval), suppress thinking whenever tools
+  // are present — preserving the one case where it plausibly helps (reasoning
+  // before a tool-less action) while keeping every tool-bearing turn safe.
+  // The `generate` closure surfaces a one-time warning when this fires so the
+  // operator learns why a configured `thinking_budget` had no effect.
+  if (req.tools !== undefined && req.tools.length > 0) return {};
   return caps.supports_adaptive_thinking === true
     ? { thinking: { type: 'adaptive' } }
     : { thinking: { type: 'enabled', budget_tokens: budget } };
@@ -156,6 +169,12 @@ export const createAnthropicProvider = (
   const marker = cacheMarker(oneHourRate !== undefined ? '1h' : '5m');
   const effectiveCaps: ProviderCapabilities =
     oneHourRate !== undefined ? { ...caps, cost_per_1k_cache_write: oneHourRate } : caps;
+
+  // Warn once per provider instance when extended thinking is suppressed
+  // because tools are present (see `anthropicThinkingParam`). A per-request
+  // warning would spam an agentic loop; a config-level mismatch only needs
+  // to be said once. stderr, never stdout (stdout stays pure for --json).
+  let warnedThinkingSuppressedByTools = false;
 
   let client: Anthropic;
   if (options.client !== undefined) {
@@ -232,12 +251,34 @@ export const createAnthropicProvider = (
       // models drop it (`anthropicThinkingParam`), so the
       // budget-vs-max_tokens cross-check is moot there — skip it.
       caps.supports_adaptive_thinking !== true &&
+      // Tools present ⇒ thinking is suppressed entirely (`anthropicThinkingParam`),
+      // so no `budget_tokens` leaves the binary and the API never sees the
+      // budget-vs-max_tokens pair. Validating it here would reject a request
+      // that is actually valid, with a now-false "Anthropic rejects" reason.
+      (req.tools === undefined || req.tools.length === 0) &&
       req.thinking_budget !== undefined &&
       req.thinking_budget > 0 &&
       req.thinking_budget >= req.max_tokens
     ) {
       throw new Error(
         `anthropic request: 'thinking_budget' (${req.thinking_budget}) must be strictly less than 'max_tokens' (${req.max_tokens}) — Anthropic API rejects equal or greater with HTTP 400. The runtime resolved max_tokens against the provider capability ceiling (capabilities.output_max_tokens=${caps.output_max_tokens}); raise the playbook's 'sampling.max_tokens' or lower 'sampling.thinking_budget'.`,
+      );
+    }
+    // Extended thinking is suppressed on tool-bearing turns
+    // (`anthropicThinkingParam`). Tell the operator once why a configured
+    // `thinking_budget` produced no thinking, so it doesn't read as a silent
+    // no-op — the budget is honored only on no-tool turns until the
+    // thinking-block signature round-trip lands.
+    if (
+      !warnedThinkingSuppressedByTools &&
+      req.thinking_budget !== undefined &&
+      req.thinking_budget > 0 &&
+      req.tools !== undefined &&
+      req.tools.length > 0
+    ) {
+      warnedThinkingSuppressedByTools = true;
+      process.stderr.write(
+        `forja: extended thinking suppressed on tool-bearing turns (thinking_budget=${req.thinking_budget}); Anthropic requires replaying the thinking-block signature with tool_results, which Forja does not yet round-trip. Scope thinking_budget to a tool-less playbook for it to take effect.\n`,
       );
     }
     // Some frontier models (e.g. Opus 4.7) deprecated `temperature`
