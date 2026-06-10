@@ -111,6 +111,28 @@ export const anthropicThinkingParam = (
     : { thinking: { type: 'enabled', budget_tokens: budget } };
 };
 
+// Anthropic rejects `temperature` and `top_p` sent TOGETHER on
+// current models (HTTP 400: "`temperature` and `top_p` cannot both
+// be specified for this model"). This is distinct from the
+// `supports_sampling` gate above (Opus 4.7 deprecated BOTH knobs
+// entirely): Haiku 4.5 and the rest of the 4.x family accept
+// sampling, they just reject the pair. Anthropic's own guidance is
+// to tune one OR the other, never both — so when a caller provides
+// both (recap's TOKEN_TUNING §9 sampling sets `temperature: 0.2`
+// AND `top_p: 0.95`), the adapter sends only `temperature`, the
+// primary determinism knob. Sending at most one is always valid,
+// so this needs no per-model capability flag. When sampling is
+// stripped wholesale (`acceptsSampling === false`), neither goes.
+const samplingParams = (
+  req: { temperature?: number; top_p?: number },
+  acceptsSampling: boolean,
+): { temperature?: number } | { top_p?: number } | Record<string, never> => {
+  if (!acceptsSampling) return {};
+  if (req.temperature !== undefined) return { temperature: req.temperature };
+  if (req.top_p !== undefined) return { top_p: req.top_p };
+  return {};
+};
+
 export const createAnthropicProvider = (
   modelName: string,
   options: CreateAnthropicProviderOptions = {},
@@ -231,8 +253,7 @@ export const createAnthropicProvider = (
       messages: cachedMessages,
       ...(cachedSystem !== undefined ? { system: cachedSystem } : {}),
       ...(cachedTools !== undefined ? { tools: cachedTools } : {}),
-      ...(acceptsSampling && req.temperature !== undefined ? { temperature: req.temperature } : {}),
-      ...(acceptsSampling && req.top_p !== undefined ? { top_p: req.top_p } : {}),
+      ...samplingParams(req, acceptsSampling),
       // Extended thinking — adaptive vs legacy manual budget, gated
       // by the model capability. See `anthropicThinkingParam`.
       ...anthropicThinkingParam(req, caps),
@@ -326,14 +347,10 @@ export const createAnthropicProvider = (
         tools: cachedTools,
         tool_choice: { type: 'tool', name: req.output_schema_name },
         ...(cachedSystem !== undefined ? { system: cachedSystem } : {}),
-        // Same sampling-deprecation gate as the streaming path —
-        // see comment there for rationale.
-        ...(caps.supports_sampling !== false && req.temperature !== undefined
-          ? { temperature: req.temperature }
-          : {}),
-        ...(caps.supports_sampling !== false && req.top_p !== undefined
-          ? { top_p: req.top_p }
-          : {}),
+        // Same sampling handling as the streaming path — strip
+        // wholesale when unsupported, and never send temperature +
+        // top_p together (see `samplingParams`).
+        ...samplingParams(req, caps.supports_sampling !== false),
         ...(req.stop_sequences !== undefined ? { stop_sequences: req.stop_sequences } : {}),
       });
       // Find the forced tool_use block. With `tool_choice` set to a

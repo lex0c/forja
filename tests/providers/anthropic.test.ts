@@ -395,6 +395,76 @@ describe('createAnthropicProvider', () => {
     expect('top_p' in sent).toBe(false);
   });
 
+  test('generate sends only temperature when BOTH temperature and top_p are set', async () => {
+    // Regression (found via real Haiku eval of recap LLM render):
+    // current Anthropic models accept sampling but reject
+    // `temperature` and `top_p` TOGETHER — HTTP 400 "`temperature`
+    // and `top_p` cannot both be specified for this model". recap's
+    // TOKEN_TUNING §9 sampling sets both, so every recap LLM render
+    // 400'd and silently fell back to deterministic. The adapter now
+    // forwards temperature only (Anthropic's recommended single
+    // knob); top_p is dropped.
+    const handle = mockClient([{ type: 'message_stop' }]);
+    const provider = createAnthropicProvider('claude-haiku-4-5', { client: handle.client });
+    for await (const _ of provider.generate({
+      model: 'claude-haiku-4-5',
+      messages: [{ role: 'user', content: 'do thing' }],
+      max_tokens: 16,
+      temperature: 0.2,
+      top_p: 0.95,
+    })) {
+      // drain
+    }
+    const params = handle.streamCalls[0]?.params as Record<string, unknown>;
+    expect(params.temperature).toBe(0.2);
+    expect('top_p' in params).toBe(false);
+  });
+
+  test('generateConstrained sends only temperature when BOTH are set', async () => {
+    const handle = mockClient([], undefined, {
+      content: [
+        {
+          type: 'tool_use',
+          id: 'toolu_01',
+          name: 'render_recap_pr',
+          input: { schemaVersion: 'pr-v1', summary: ['x'], changes: [] },
+        },
+      ],
+      usage: { input_tokens: 10, output_tokens: 5 },
+    });
+    const provider = createAnthropicProvider('claude-haiku-4-5', { client: handle.client });
+    await provider.generateConstrained({
+      model: 'claude-haiku-4-5',
+      messages: [{ role: 'user', content: 'render' }],
+      max_tokens: 64,
+      temperature: 0.2,
+      top_p: 0.95,
+      output_schema: { type: 'object' },
+      output_schema_name: 'render_recap_pr',
+    });
+    const sent = handle.createCalls[0]?.params as Record<string, unknown>;
+    expect(sent.temperature).toBe(0.2);
+    expect('top_p' in sent).toBe(false);
+  });
+
+  test('generate forwards top_p alone when temperature is absent', async () => {
+    // The drop rule is "at most one"; a caller that sets only top_p
+    // still gets it through.
+    const handle = mockClient([{ type: 'message_stop' }]);
+    const provider = createAnthropicProvider('claude-haiku-4-5', { client: handle.client });
+    for await (const _ of provider.generate({
+      model: 'claude-haiku-4-5',
+      messages: [{ role: 'user', content: 'do thing' }],
+      max_tokens: 16,
+      top_p: 0.9,
+    })) {
+      // drain
+    }
+    const params = handle.streamCalls[0]?.params as Record<string, unknown>;
+    expect(params.top_p).toBe(0.9);
+    expect('temperature' in params).toBe(false);
+  });
+
   test('generate omits optional fields that were not provided', async () => {
     const handle = mockClient([{ type: 'message_stop' }]);
     const provider = createAnthropicProvider('claude-sonnet-4-6', { client: handle.client });

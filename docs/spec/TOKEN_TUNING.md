@@ -438,6 +438,8 @@ Tabela canônica de tuning per workflow. Aplicada em playbook frontmatter.
 
 **Nota — modelos que deprecaram `temperature`/`top_p`:** alguns frontier models (ex.: Anthropic Opus 4.7) rejeitam a passagem de `temperature` ou `top_p` no Messages API com HTTP 400. O adapter respeita uma flag opcional `capabilities.supports_sampling` (default `true`); quando declarada `false`, ambos os parâmetros são strippados antes do request. A tabela canonical acima continua valendo para todos os modelos restantes — o opt-out é por-modelo e observável via `ProviderCapabilities`, não uma exceção workflow-level. Determinismo nos modelos que opt-out fica reduzido (provider default), mas o cache de output (RECAP §8.3 / outros workflows com cache content-hashed) absorve a deriva entre runs idênticos.
 
+**Nota — `temperature` + `top_p` na mesma request:** distinto do caso acima — modelos Anthropic atuais (Haiku 4.5 e a família 4.x) **aceitam** sampling, mas rejeitam os **dois** parâmetros juntos numa request com HTTP 400 (`temperature and top_p cannot both be specified for this model`). Como **toda** linha da tabela fixa ambos, isso atinge todos os workflows, não só `recap`. O adapter Anthropic envia **apenas `temperature`** quando os dois vêm (knob primário; a própria Anthropic recomenda ajustar um OU outro), `top_p` sozinho quando `temperature` está ausente, e nada quando `supports_sampling=false`. A tradução é per-adapter (§10.1): a tabela mantém os dois valores como **intenção canônica**, e cada adapter resolve a restrição do seu provider — OpenAI/Google, que aceitam o par, continuam recebendo ambos. Sem isso, todo render constrained (recap inclusive) caía em HTTP 400 → fallback silencioso.
+
 ### 9.1 Justificativas
 
 - **`code-review` temp 0.1**: factual; queremos consistência; mesma lógica em re-runs
@@ -491,6 +493,7 @@ Provider adapter normaliza:
 - `repetition_penalty` em Anthropic/OpenAI: ignored com warning
 - `frequency_penalty` em Ollama/llama.cpp: aproximado via `repetition_penalty`
 - `top_k` em Anthropic/OpenAI: ignored
+- `temperature` + `top_p` juntos em Anthropic (modelos atuais): envia só `temperature` (§9, nota)
 
 Sem error em parâmetro não-suportado; warning em audit.
 
