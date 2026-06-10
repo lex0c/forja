@@ -19,8 +19,15 @@ model-facing copy shrinks, with the `[forja:output_summarized policy=head_tail �
 error path (status≠done) can't use `summarize` — the harness routes ToolError around it (§0.4) —
 so `details.output` is head-tailed inline at the call site. The full child run stays recoverable
 via `session_id` in both cases. This required correcting OUTPUT_POLICY §6, which wrongly listed
-`task_*` wholesale as "output per-design pequeno" — true for `task_async/await/cancel/list`, false
-for the sync variants that carry the child's text.
+`task_*` wholesale as "output per-design pequeno" — true for `task_async/cancel/list`, false
+for the sync variants AND for `task_await`, which carry the child's text. The async collection
+path (`task_async` + `task_await`) has the identical shape: `TaskAwaitOutput` mirrors `TaskOutput`,
+returning `output` on success and a raw `details.output` on failure, so a verbose child collected
+asynchronously re-entered the parent context exactly as the sync path did. The summarizer + the
+error-path trim now live in a shared `task-shared.ts` (`summarizeChildEnvelope` / `childOutputHeadTail`,
+following the `todo-shared.ts` precedent) so `task`/`task_sync` and `task_await` stay byte-identical
+in policy and can't drift; OUTPUT_POLICY §6 lists `task_await` in the exception alongside the sync
+tools, with `task_async` (handle-only) explicitly excluded.
 
 **Reliability — a child wedged during boot waited out the full wall-clock.** Heartbeat-staleness
 (`wait-loop.ts`) only fires once `last_heartbeat` is non-null, but the child stamps its first beat

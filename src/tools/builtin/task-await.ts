@@ -1,5 +1,6 @@
 import type { WorktreeOutcome } from '../../subagents/types.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
+import { childOutputHeadTail, summarizeChildEnvelope } from './task-shared.ts';
 
 // `task_await` collects the output of a subagent previously spawned
 // via `task_async`. Blocks until the child finishes, the optional
@@ -66,6 +67,12 @@ export const taskAwaitTool: Tool<TaskAwaitInput, TaskAwaitOutput> = {
     // already captured in the spawn's own metadata.
     idempotent: true,
     display: 'raw',
+    // Head-tail the collected child `output` before it re-enters the
+    // parent context — the async collection path mirrors `TaskOutput`,
+    // so it needs the same OUTPUT_POLICY §6 exception as sync `task`
+    // (shared helper). Raw stays in the parent's audit row; full text
+    // recoverable via session_id. The error path trims inline below.
+    summarize: summarizeChildEnvelope,
   },
   async execute(args, ctx): Promise<ToolResult<TaskAwaitOutput>> {
     if (ctx.signal.aborted) {
@@ -240,6 +247,13 @@ export const taskAwaitTool: Tool<TaskAwaitInput, TaskAwaitOutput> = {
       const causeSuffix =
         result.detail !== undefined && result.detail.length > 0 ? `: ${result.detail}` : '';
       const detail = `subagent exited with status='${result.status}', reason='${result.reason}'${causeSuffix}`;
+      // Head-tail the child's partial output: the error path returns a
+      // ToolError, which the harness routes around `metadata.summarize`
+      // (OUTPUT_POLICY §0.4), so a verbose failed child would otherwise
+      // dump its full transcript into `details.output` uncapped — the
+      // same weight the success path now caps. Full text recoverable
+      // via `session_id`; mirrors `task.ts`'s error-path trim.
+      const errorOutput = childOutputHeadTail(result.output).text;
       return toolError('subagent.run_failed', detail, {
         retryable: result.status === 'exhausted',
         details: {
@@ -250,7 +264,7 @@ export const taskAwaitTool: Tool<TaskAwaitInput, TaskAwaitOutput> = {
           cost_usd: result.costUsd,
           steps: result.steps,
           duration_ms: result.durationMs,
-          output: result.output,
+          output: errorOutput,
           ...(result.auditFailure !== undefined ? { audit_failure: result.auditFailure } : {}),
           ...(result.worktree !== undefined ? { worktree: result.worktree } : {}),
           ...(result.worktreeError !== undefined ? { worktree_error: result.worktreeError } : {}),
