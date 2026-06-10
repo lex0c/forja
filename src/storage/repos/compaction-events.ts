@@ -117,6 +117,37 @@ export const sumCompactionUsage = (db: DB, sessionId: string): MessageUsageTotal
   };
 };
 
+// Compaction ROI for a session: how many times compaction ran, and how many
+// CONTEXT tokens it freed in total. Reclaim is `tokens_before - tokens_after`
+// summed over rows where BOTH estimates are present and before > after — so a
+// forced `/compact` (NULL tokens_before, AGENTIC_CLI §12) and any degenerate
+// row that didn't shrink contribute 0 reclaim while still counting as a run.
+// These are context estimates (CONTEXT_TUNING §12), distinct from the billed
+// `call_*` usage that `sumCompactionUsage` returns. The aggregator surfaces
+// this so /stats can frame compaction as ROI (freed context) rather than only
+// as the cost it already shows under `writes: … compaction`.
+export interface CompactionReclaim {
+  count: number;
+  reclaimedTokens: number;
+}
+
+export const sumCompactionContextReclaim = (db: DB, sessionId: string): CompactionReclaim => {
+  const row = db
+    .query<{ n: number; reclaimed: number }, [string]>(
+      `SELECT COUNT(*) AS n,
+              COALESCE(SUM(
+                CASE WHEN tokens_before IS NOT NULL
+                      AND tokens_after  IS NOT NULL
+                      AND tokens_before > tokens_after
+                     THEN tokens_before - tokens_after
+                     ELSE 0 END
+              ), 0) AS reclaimed
+       FROM compaction_events WHERE session_id = ?`,
+    )
+    .get(sessionId);
+  return { count: row?.n ?? 0, reclaimedTokens: row?.reclaimed ?? 0 };
+};
+
 // Forensic list in append order. Bounded by per-session retention.
 export const listCompactionEventsBySession = (db: DB, sessionId: string): CompactionEventRow[] =>
   db

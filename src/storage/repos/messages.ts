@@ -225,6 +225,18 @@ export const countMessagesBySession = (db: DB, sessionId: string): number =>
     }
   ).n;
 
+// Count of assistant message rows for a session — one per billed provider
+// call, so this is the session's TURN count (the denominator for /stats'
+// per-turn averages). Tool-result and user rows are excluded: they aren't
+// separate provider calls and would inflate the count. Cheap COUNT(*), no
+// row materialization.
+export const countAssistantMessagesBySession = (db: DB, sessionId: string): number =>
+  (
+    db
+      .query("SELECT COUNT(*) AS n FROM messages WHERE session_id = ? AND role = 'assistant'")
+      .get(sessionId) as { n: number }
+  ).n;
+
 // `limit < 0` (canonically -1) means "no limit" — SQLite treats `LIMIT -1`
 // as unbounded, so it returns every row for the session. Used by the
 // uncapped "full"/"summary" resume modes; the capped path passes a positive

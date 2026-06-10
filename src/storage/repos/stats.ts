@@ -21,8 +21,8 @@
 // shared/repeat ids and defends against a corrupt self-referential row.
 
 import type { DB } from '../db.ts';
-import { sumCompactionUsage } from './compaction-events.ts';
-import { sumMessageUsage } from './messages.ts';
+import { sumCompactionContextReclaim, sumCompactionUsage } from './compaction-events.ts';
+import { countAssistantMessagesBySession, sumMessageUsage } from './messages.ts';
 import { getSession, listChildSessions } from './sessions.ts';
 
 export interface UsageStats {
@@ -54,6 +54,17 @@ export interface UsageStats {
   cacheWriteParent: number;
   cacheWriteSubagent: number;
   cacheWriteCompaction: number;
+  // Billed provider calls across the tree: count of `role='assistant'` message
+  // rows. The denominator for /stats' per-turn economics (cost/turn, out/turn,
+  // avg window/turn). Compaction calls are NOT counted here — they live in
+  // `compactionCount` so the conversational-turn denominator stays clean.
+  turns: number;
+  // Compaction ROI rolled up across the tree. `compactionCount` is the number
+  // of runs; `reclaimedTokens` the context tokens they freed (see
+  // sumCompactionContextReclaim). Pairs with `cacheWriteCompaction` (the cost)
+  // to read compaction as a trade rather than a pure expense.
+  compactionCount: number;
+  reclaimedTokens: number;
 }
 
 const emptyStats = (): UsageStats => ({
@@ -67,6 +78,9 @@ const emptyStats = (): UsageStats => ({
   cacheWriteParent: 0,
   cacheWriteSubagent: 0,
   cacheWriteCompaction: 0,
+  turns: 0,
+  compactionCount: 0,
+  reclaimedTokens: 0,
 });
 
 // Cache-write amplification: cache writes over total cache traffic
@@ -123,6 +137,12 @@ export const computeUsageStats = (db: DB, rootSessionIds: readonly string[]): Us
       stats.cacheWriteParent += usage.cacheCreation;
     }
     stats.cacheWriteCompaction += compactionUsage.cacheCreation;
+    // Per-turn denominator + compaction ROI, same tree-walk so they stay
+    // resume-correct and subagent-inclusive like the token/cost totals.
+    stats.turns += countAssistantMessagesBySession(db, id);
+    const reclaim = sumCompactionContextReclaim(db, id);
+    stats.compactionCount += reclaim.count;
+    stats.reclaimedTokens += reclaim.reclaimedTokens;
     for (const child of listChildSessions(db, id)) visit(child.id);
   };
 
