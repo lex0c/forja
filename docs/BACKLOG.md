@@ -2,6 +2,61 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-09] feat(stats): efficiency diagnostics — turns, avg window/turn, compaction reclaim
+
+`/stats` reported WHERE the money went (per-axis cost split, write-by-source, hit %, write
+amplification) but not WHY the dominant axis — cache read — is large. Cache-read cost is
+`avg_resident_window × turns`, and neither number was visible: an operator staring at "cache
+read 67%" couldn't tell whether that is irreducible necessary context or fat that earlier
+compaction / tighter tool caps could trim. This slice adds the missing denominators, all
+DB-derived (resume-correct, subagent-inclusive) so they agree with the existing figures.
+
+Three new `UsageStats` fields, summed across the session tree in `computeUsageStats`:
+
+- **`turns`** — count of `role='assistant'` message rows (one per billed provider call; the
+  denominator for per-turn averages). New `countAssistantMessagesBySession` repo fn.
+- **`compactionCount`** / **`reclaimedTokens`** — compaction runs and the context tokens they
+  freed (`SUM(tokens_before - tokens_after)` over rows where both are present and before >
+  after). New `sumCompactionContextReclaim` repo fn. Turns compaction from a pure cost line
+  (it was only visible as `writes: … compaction Y`) into an ROI line: reclaimed context is the
+  numerator, the existing write cost the denominator.
+
+A `saved:` line reports cache savings against the no-cache counterfactual: caching changes
+the rate, not the volume (the whole prefix is re-sent every turn regardless), so without a
+cache every input-side token (`in + read + write`) would bill at the full input rate.
+`saved = no_cache_total − estimated_actual`, both priced from the current model's rates so
+the delta is apples-to-apples; output cancels. Skipped for zero-rate providers (local models).
+Two metrics proposed alongside it were deliberately NOT added: a compaction-ROI ratio
+(`reclaimed / compaction_writes`) mixes units — reclaimed is an estimated context-token count,
+the writes are billed cache-creation — and is anti-compounding (it ignores that reclaimed
+context lowers EVERY subsequent turn's read), so it reads as "negative economics" when
+compaction is doing window governance, not saving money; and a "context churn" ratio
+(`writes / total_context`) collapses into the write-amplification figure already shown.
+
+`/stats` rendering gains, all derived from the above (no new cost math):
+
+- `turns: N · ~$X/turn · ~T tok out/turn` — the per-turn economics.
+- `window: ~W tok/turn avg (P% of ctx)` — average input prompt per turn
+  (`(in+read+write)/turns`) as a fraction of `context_window`. THE diagnostic: near the 0.7
+  trigger ⇒ session runs hot, room to trim; well below ⇒ the cap isn't the lever. Derived from
+  BILLED tokens (what the provider actually received after the top-of-loop compaction caps it),
+  NOT the in-memory buffer: a raw `estimatePromptTokens(getMessages())` reads the full restored
+  history on a freshly-resumed session and would render as >100% of the window — a measurement
+  artifact, since the loop compacts before the first send. An early draft showed that buffer as
+  `now …%` and was cut for exactly that reason (it induced a false "context overflow" reading).
+- `reuse:  Nx (read/write)` — cache reads per cache-write token; the intuitive companion to
+  write-amplification (≈36x in a mature session).
+- compaction line: `compact: N runs · reclaimed R ctx tok (est.)`. Run count is exact (a row
+  COUNT); reclaimed is a context ESTIMATE (`tokens_before − tokens_after`, both chars/4
+  `estimatePromptTokens` snapshots, NOT provider-billed), so it carries an explicit `(est.)`
+  mark + `ctx` qualifier to set the one estimate apart from the billed token lines. Every other
+  number on the surface is either billed-exact (cost/tokens/cache/turns/window) or a
+  rate-priced estimate already flagged `est.` (spend split, saved).
+
+Tests: repo fns (assistant-only count, reclaim sum skipping NULL/forced-`/compact` rows and
+non-shrinking rows, tree walk), aggregator (new fields across subagent tree + dedupe), command
+(new lines render; per-turn math; zero-turn guard). Impacted suites + typecheck + biome.
+
 ## [2026-06-09] feat(tui): footer usage chips refresh per model response
 
 The footer chips (tokens / cache / cost) only refreshed at turn boundaries: the REPL emitted

@@ -55,6 +55,9 @@ describe('computeUsageStats', () => {
       cacheWriteParent: 0,
       cacheWriteSubagent: 0,
       cacheWriteCompaction: 0,
+      turns: 0,
+      compactionCount: 0,
+      reclaimedTokens: 0,
     });
   });
 
@@ -210,6 +213,57 @@ describe('computeUsageStats', () => {
     expect(s.tokensOut).toBe(5);
   });
 
+  test('turns counts assistant rows only (tool/user excluded), summed across tree', () => {
+    const root = createSession(db, { model: 'm', cwd: '/p' });
+    usage(root.id, { in: 1, out: 1, cacheRead: 0, cacheCreation: 0 }); // assistant
+    usage(root.id, { in: 1, out: 1, cacheRead: 0, cacheCreation: 0 }); // assistant
+    appendMessage(db, { sessionId: root.id, role: 'tool', content: 'r' }); // not a turn
+    appendMessage(db, { sessionId: root.id, role: 'user', content: 'q' }); // not a turn
+    const child = createSession(db, { model: 'm', cwd: '/p', parentSessionId: root.id });
+    usage(child.id, { in: 1, out: 1, cacheRead: 0, cacheCreation: 0 }); // assistant (subagent)
+    const s = computeUsageStats(db, [root.id]);
+    expect(s.turns).toBe(3); // 2 parent + 1 subagent
+  });
+
+  test('compaction reclaim sums before-after; skips forced /compact and non-shrinking rows', () => {
+    const root = createSession(db, { model: 'm', cwd: '/p' });
+    usage(root.id, { in: 1, out: 1, cacheRead: 0, cacheCreation: 0 });
+    // A normal trigger compaction: 5000 -> 2000 context tokens.
+    appendCompactionEvent(db, {
+      sessionId: root.id,
+      strategy: 'llm',
+      foldedCount: 4,
+      beforeHash: 'a',
+      afterHash: 'b',
+      tokensBefore: 5000,
+      tokensAfter: 2000,
+      recordedAt: 1,
+    });
+    // A forced /compact: no tokens_before (NULL) — counts as a run, 0 reclaim.
+    appendCompactionEvent(db, {
+      sessionId: root.id,
+      strategy: 'llm',
+      foldedCount: 2,
+      beforeHash: 'c',
+      afterHash: 'd',
+      recordedAt: 2,
+    });
+    // A degenerate row that didn't shrink (after >= before): counts, 0 reclaim.
+    appendCompactionEvent(db, {
+      sessionId: root.id,
+      strategy: 'relevance',
+      foldedCount: 1,
+      beforeHash: 'e',
+      afterHash: 'f',
+      tokensBefore: 1000,
+      tokensAfter: 1200,
+      recordedAt: 3,
+    });
+    const s = computeUsageStats(db, [root.id]);
+    expect(s.compactionCount).toBe(3);
+    expect(s.reclaimedTokens).toBe(3000); // only the 5000->2000 row
+  });
+
   test('completeSession-written cost is picked up (not just updateSessionCost)', () => {
     const root = createSession(db, { model: 'm', cwd: '/p' });
     usage(root.id, { in: 100, out: 100, cacheRead: 0, cacheCreation: 0 });
@@ -232,6 +286,9 @@ describe('cacheHitRatio', () => {
     cacheWriteParent: 0,
     cacheWriteSubagent: 0,
     cacheWriteCompaction: 0,
+    turns: 0,
+    compactionCount: 0,
+    reclaimedTokens: 0,
     ...over,
   });
 

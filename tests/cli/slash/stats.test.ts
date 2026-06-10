@@ -183,6 +183,104 @@ describe('/stats', () => {
     expect(text).toContain('est. from current model rates');
   });
 
+  test('renders per-turn economics, avg window/turn, and reuse factor', async () => {
+    // 4 assistant turns. in 0 / out 800 / read 9000 / write 1000.
+    // avg window = (0 + 9000 + 1000) / 4 = 2,500 tok/turn; ctx 1000 → 250%.
+    // out/turn = 800 / 4 = 200. cost 0.08 / 4 = $0.0200/turn.
+    // reuse = read 9000 / write 1000 = 9.0x.
+    const root = createSession(db, { model: 'm', cwd: '/p' });
+    updateSessionCost(db, root.id, 0.08);
+    for (let i = 0; i < 4; i++) {
+      usage(root.id, { in: 0, out: 200, cacheRead: 2250, cacheCreation: 250 });
+    }
+    replIds = [root.id];
+
+    const r = await statsCommand.exec([], buildCtx());
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('turns:  4 · $0.0200/turn · 200 tok out/turn');
+    expect(text).toContain('window: 2,500 tok/turn avg (250% of ctx)');
+    expect(text).toContain('9.0x reuse');
+  });
+
+  test('window line reports billed avg only (no raw-buffer "now" estimate)', async () => {
+    // The window gauge must come from billed tokens, never the in-memory
+    // buffer (which on resume holds the full restored history and would read
+    // as >100% of ctx — a measurement artifact, not a real overflow).
+    const root = createSession(db, { model: 'm', cwd: '/p' });
+    usage(root.id, { in: 0, out: 10, cacheRead: 690, cacheCreation: 0 });
+    replIds = [root.id];
+    // A wired live context with a buffer far larger than the window must NOT
+    // leak into the output.
+    const liveCtx = {
+      getMessages: () => [{ role: 'user', content: 'x'.repeat(40000) }],
+    } as unknown as ReturnType<NonNullable<SlashContext['liveContext']>>;
+
+    const r = await statsCommand.exec([], buildCtx({ liveContext: () => liveCtx }));
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = (r.notes ?? []).join('\n');
+    // avg window = (0 + 690 + 0) / 1 = 690 tok; ctx 1000 → 69%.
+    expect(text).toContain('window: 690 tok/turn avg (69% of ctx)');
+    expect(text).not.toContain('now ');
+  });
+
+  test('surfaces compaction ROI: run count + reclaimed context tokens', async () => {
+    const root = createSession(db, { model: 'm', cwd: '/p' });
+    usage(root.id, { in: 0, out: 10, cacheRead: 100, cacheCreation: 0 });
+    appendCompactionEvent(db, {
+      sessionId: root.id,
+      strategy: 'llm',
+      foldedCount: 6,
+      beforeHash: 'a',
+      afterHash: 'b',
+      tokensBefore: 7000,
+      tokensAfter: 2500,
+      recordedAt: 1,
+    });
+    replIds = [root.id];
+
+    const r = await statsCommand.exec([], buildCtx());
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('compact: 1 run · reclaimed 4,500 ctx tok (est.)');
+  });
+
+  test('reports cache savings vs the no-cache counterfactual', async () => {
+    // 1M tokens served from cache: actual read cost 1M × 0.5/MTok = $0.50.
+    // No cache, those bill as input: 1M × 5/MTok = $5.00. Saved $4.50 = 90%.
+    const root = createSession(db, { model: 'm', cwd: '/p' });
+    usage(root.id, { in: 0, out: 0, cacheRead: 1_000_000, cacheCreation: 0 });
+    replIds = [root.id];
+
+    const r = await statsCommand.exec([], buildCtx());
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('saved:  $4.500 (90% vs no-cache est. $5.000)');
+  });
+
+  test('omits the savings line for zero-rate providers (nothing to save)', async () => {
+    const root = createSession(db, { model: 'm', cwd: '/p' });
+    usage(root.id, { in: 0, out: 0, cacheRead: 1_000_000, cacheCreation: 0 });
+    replIds = [root.id];
+    // A local model: all rates zero → no-cache cost is 0, savings undefined.
+    const ctx = buildCtx();
+    (ctx.baseConfig.provider.capabilities as unknown as Record<string, number>).cost_per_1k_input =
+      0;
+    (
+      ctx.baseConfig.provider.capabilities as unknown as Record<string, number>
+    ).cost_per_1k_cached_input = 0;
+
+    const r = await statsCommand.exec([], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = (r.notes ?? []).join('\n');
+    expect(text).not.toContain('saved:');
+  });
+
   test('marks totals as a lower bound when a session reported no usage', async () => {
     const root = createSession(db, { model: 'm', cwd: '/p' });
     updateSessionCost(db, root.id, 0.01);
