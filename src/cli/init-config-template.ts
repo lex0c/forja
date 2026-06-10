@@ -2,7 +2,7 @@
 // Spec: AGENTIC_CLI.md §2.1.1.
 //
 // Posture: the scaffolded file contains ACTIVE values for every
-// operator-tunable section ([providers], [budget], [memory]) sourced
+// operator-tunable section ([providers], [budget], [memory], [recap]) sourced
 // from the canonical code defaults. Operator opens the file, sees the
 // running values literal in front of them, edits in-place to override.
 //
@@ -67,5 +67,8 @@ compaction_relevance = ${b.compactionRelevance}
 verify_semantic_llm = ${m.verifySemanticLlm}
 conflict_detect_llm = ${m.conflictDetectLlm}
 override_detect_llm = ${m.overrideDetectLlm}
+
+[recap]
+enabled = true
 `;
 };

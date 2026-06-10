@@ -16,6 +16,7 @@ import {
   loadEffortConfig,
   loadMemoryConfig,
   loadProvidersConfig,
+  loadRecapConfig,
   loadSandboxConfig,
 } from '../config/loaders.ts';
 import { createSqliteFailureSink } from '../failures/index.ts';
@@ -57,6 +58,7 @@ import { setWritableCacheDirsOverride } from '../permissions/sandbox-cache-dirs.
 import { setCachePersistenceOverride } from '../permissions/sandbox-cache-env.ts';
 import { createDefaultRegistry } from '../providers/index.ts';
 import type { Provider } from '../providers/index.ts';
+import { resolveProviderFromId } from '../providers/resolve.ts';
 import type { SystemSegment } from '../providers/types.ts';
 import { scrubEnv } from '../sanitize/index.ts';
 import { redactSecrets } from '../sanitize/secrets.ts';
@@ -112,6 +114,9 @@ import { DEFAULT_MODEL } from '../providers/default-model.ts';
 export interface BootstrapInput {
   prompt: string;
   modelId?: string;
+  // `--no-recap` global flag: forces `recapEnabled=false` regardless
+  // of `[recap].enabled` config.
+  noRecap?: boolean;
   cwd?: string;
   budget?: Partial<RunBudget>;
   signal?: AbortSignal;
@@ -314,6 +319,9 @@ export interface BootstrapResult {
   // a hard abort.
   providersConfigWarnings: readonly string[];
   budgetConfigWarnings: readonly string[];
+  // Warnings from the `[recap]` loader (unknown render_model, bad
+  // enabled type → warning + ignore).
+  recapConfigWarnings: readonly string[];
   // Warnings from the `[effort].level` loader (unknown level →
   // warn + fall back to DEFAULT_EFFORT). Same fail-soft posture.
   effortConfigWarnings: readonly string[];
@@ -431,16 +439,20 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   if (input.providerOverride !== undefined) {
     provider = input.providerOverride;
   } else {
-    const entry = registry.get(modelId);
-    if (entry === null) {
+    const resolved = resolveProviderFromId(registry, modelId);
+    if (!resolved.ok) {
+      // Strict here (unlike the config-file degrade-to-default path):
+      // a CLI override or resolved config model that can't be built is
+      // a hard boot error. `unknown` lists the registry; `factory-error`
+      // (e.g. missing API key) propagates the SDK message — the headless
+      // recap path keys its deterministic-fallback whitelist on it.
       throw new Error(
-        `unknown model: ${modelId}. Known: ${registry
-          .list()
-          .map((e) => e.id)
-          .join(', ')}`,
+        resolved.kind === 'unknown'
+          ? `unknown model: ${modelId}. Known: ${resolved.knownIds.join(', ')}`
+          : resolved.message,
       );
     }
-    provider = entry.factory();
+    provider = resolved.provider;
   }
 
   // [budget] config — resolves before the harness builds its
@@ -465,6 +477,10 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // BootstrapResult.{memory,providers,budget}Warnings.
   const budgetLoaded = loadBudgetConfig({ cwd: projectConfigCwd });
   const effortLoaded = loadEffortConfig({ cwd: projectConfigCwd });
+  // [recap] config — `render_model` (validated against the registry)
+  // + `enabled` master switch. CLI `--no-recap` overrides config to
+  // off; otherwise project [recap] wins over user, then default-on.
+  const recapLoaded = loadRecapConfig({ cwd: projectConfigCwd, registry });
 
   // Slice Q — invert S11/S13 LLM-judge default to ON. The loader
   // walks the same `.agent/config.toml` + `~/.config/agent/config.toml`
@@ -1503,6 +1519,18 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // level from the first turn; `/effort` overrides it in-session.
     // Subagents do NOT get this (they carry only inherited provider-effort).
     effort: effortLoaded.effort ?? DEFAULT_EFFORT,
+    // Recap master switch + render-model default (RECAP §3.2/§3.3/§8.2).
+    // `--no-recap` forces off; else the config value, else absent —
+    // the `isRecapEnabled` predicate owns the default-on policy, so we
+    // don't re-encode `true` here (single source of the default).
+    ...(input.noRecap === true
+      ? { recapEnabled: false }
+      : recapLoaded.config.enabled !== undefined
+        ? { recapEnabled: recapLoaded.config.enabled }
+        : {}),
+    ...(recapLoaded.config.renderModel !== undefined
+      ? { recapRenderModel: recapLoaded.config.renderModel }
+      : {}),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
     // Slice Q — resolved state (always boolean, never undefined).
     // Precedence: CLI explicit > project config > user config > default ON.
@@ -1578,6 +1606,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     hookWarnings: resolvedHooks.warnings,
     memoryConfigWarnings: memoryLoaded.warnings,
     providersConfigWarnings: providersLoaded.warnings,
+    recapConfigWarnings: recapLoaded.warnings,
     budgetConfigWarnings: budgetLoaded.warnings,
     effortConfigWarnings: effortLoaded.warnings,
     auditConfigWarnings: auditLoaded.warnings,

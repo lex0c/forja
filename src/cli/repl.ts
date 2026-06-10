@@ -601,6 +601,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // makes the invariant load-bearing rather than coincidental.
         cwd,
         ...(args.model !== undefined ? { modelId: args.model } : {}),
+        ...(args.noRecap === true ? { noRecap: true } : {}),
         ...(args.maxSteps !== undefined ? { budget: { maxSteps: args.maxSteps } } : {}),
         // Forward the trust-list override so REPL and bootstrap
         // agree on which file is authoritative. Without this,
@@ -648,6 +649,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     hookWarnings,
     memoryConfigWarnings,
     providersConfigWarnings,
+    recapConfigWarnings,
     budgetConfigWarnings,
     effortConfigWarnings,
     auditConfigWarnings,
@@ -695,6 +697,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // it instead of running on a model they didn't intend.
   for (const w of providersConfigWarnings) {
     errSink(`forja: providers config: ${w}\n`);
+  }
+  // [recap] config warnings — unknown render_model / bad enabled type.
+  for (const w of recapConfigWarnings) {
+    errSink(`forja: recap config: ${w}\n`);
   }
   // [budget] config warnings — a numeric typo or out-of-range value
   // shouldn't disappear silently.

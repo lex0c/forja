@@ -86,6 +86,7 @@ import {
   MAX_CONCURRENT_TOOL_CALLS_CAP,
   type RunBudget,
   effectiveBudget,
+  isRecapEnabled,
   resolveMaxOutputTokens,
 } from './types.ts';
 
@@ -812,8 +813,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     // so the TUI surfaces it above session:end. Skipped silently
     // on any failure — operator's exit footer comes through
     // regardless. Init-fail paths where `sessionId === ''` are
-    // also skipped (no real session to project).
-    if (sessionId.length > 0) {
+    // also skipped (no real session to project). Suppressed
+    // entirely when the recap master switch is off
+    // (`[recap].enabled=false` / `--no-recap`).
+    if (isRecapEnabled(config) && sessionId.length > 0) {
       const auto = buildAutoTerse({ db: config.db, sessionId, now: Date.now() });
       if (auto.ok) {
         safeEmit(config.onEvent, {
@@ -2190,6 +2193,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // `resumeWithSessionContext` is set (full/summary). So this one condition
       // covers both — plain REPL reuse and fresh/preassigned leave it null.
       if (
+        isRecapEnabled(config) &&
         config.userPrompt.length > 0 &&
         preResumeStatus !== null &&
         !shouldSkipResumeContext(preResumeStatus)

@@ -1139,6 +1139,13 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
 
     const config = {
       provider,
+      // Subagents are non-interactive: no operator watches their
+      // session-end, they cannot be `--resume`d (run.ts rejects it),
+      // and they never run `/recap`. Disable the recap master switch
+      // so the loop skips the pointless child-session auto-display
+      // projection — and so the principal's `--no-recap` is honored
+      // for children by construction (RECAP §3.3).
+      recapEnabled: false,
       toolRegistry: childRegistry,
       // The grandchild's whitelist (when this child task()s a
       // worker) validates against `rootToolRegistry`, NOT

@@ -23,6 +23,10 @@ export interface ParsedArgs {
   // still prompt; toggle at runtime with Shift+Tab. Distinct from the
   // execution `profile` (autonomous/orchestrated/hybrid, §5.2).
   autonomous?: boolean;
+  // `--no-recap`: disable the recap master switch for this run
+  // (suppresses session-end/Alt+R auto-display, resume
+  // auto-rehydrate, and forces deterministic `/recap` render).
+  noRecap?: boolean;
   // List-sessions mode (AGENTIC_CLI §2.1): print known sessions
   // (newest first) and exit. Honors --json for headless consumers.
   listSessions: boolean;
@@ -1619,6 +1623,10 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         args.autonomous = true;
         i += 1;
         break;
+      case '--no-recap':
+        args.noRecap = true;
+        i += 1;
+        break;
       case '--list-sessions':
         args.listSessions = true;
         i += 1;
@@ -2218,6 +2226,7 @@ export const usage = (): string =>
     '  --help, -h             Show this help and exit',
     '  --json                 Emit NDJSON events to stdout (headless)',
     '  --autonomous           Start in Autonomous mode: auto-approve routine confirms (Shift+Tab toggles)',
+    '  --no-recap             Disable recap for this run: no session-end/Alt+R auto-display, no resume rehydrate, deterministic /recap render',
     '  --list-sessions        Print known sessions (newest first) and exit',
     '  --include-subagents    With --list-sessions, fan parents into their subagent children (requires --list-sessions)',
     '  --limit <n>            With --list-sessions, cap rows returned (default 20; requires --list-sessions)',

@@ -18,7 +18,7 @@
 // (the multi-row shape doesn't match the §9 schema).
 
 import type { HarnessConfig } from '../harness/index.ts';
-import { createRegistry } from '../providers/registry.ts';
+import { createDefaultRegistry } from '../providers/registry.ts';
 import type { Provider } from '../providers/types.ts';
 import { redactSecretsInIntermediate } from '../recap/format.ts';
 import type { DB } from '../storage/db.ts';
@@ -69,6 +69,13 @@ export interface RunRecapHeadlessOptions {
   // out cross-project even though the operator did not pass
   // `--all-projects`.
   cwd?: string;
+  // Recap master switch (RECAP §3.2/§3.3) and render-model default
+  // (§8.2), threaded from the bootstrap-resolved HarnessConfig.
+  // Without these the headless surface would ignore
+  // `[recap].enabled=false` / `--no-recap` (still LLM-render) and
+  // `[recap].render_model` — the REPL honors them, headless must too.
+  recapEnabled?: boolean;
+  recapRenderModel?: string;
 }
 
 const buildHeadlessContext = (options: RunRecapHeadlessOptions, db: DB): SlashContext => {
@@ -90,7 +97,17 @@ const buildHeadlessContext = (options: RunRecapHeadlessOptions, db: DB): SlashCo
   // would silently drop the filter and fan out cross-project,
   // bypassing the `--all-projects` opt-in guard).
   const cwd = options.cwd ?? process.cwd();
-  const baseConfig = { provider: options.provider, cwd } as unknown as HarnessConfig;
+  const baseConfig = {
+    provider: options.provider,
+    cwd,
+    // Carry the recap knobs so `/recap --model` / `[recap].enabled`
+    // behave identically to the REPL (omitted → loop/render apply the
+    // `!== false` default-on and session-provider fallback).
+    ...(options.recapEnabled !== undefined ? { recapEnabled: options.recapEnabled } : {}),
+    ...(options.recapRenderModel !== undefined
+      ? { recapRenderModel: options.recapRenderModel }
+      : {}),
+  } as unknown as HarnessConfig;
   return {
     baseConfig,
     db,
@@ -102,7 +119,9 @@ const buildHeadlessContext = (options: RunRecapHeadlessOptions, db: DB): SlashCo
     isRunning: () => false,
     currentSessionId: options.currentSessionId ?? (() => null),
     replSessionIds: () => [],
-    modelRegistry: createRegistry(),
+    // Populated registry (not the empty createRegistry()) so a
+    // `[recap].render_model` override resolves headless too.
+    modelRegistry: createDefaultRegistry(),
   };
 };
 

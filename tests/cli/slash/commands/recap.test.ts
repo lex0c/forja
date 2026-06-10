@@ -744,6 +744,92 @@ describe('/recap', () => {
     expect(runs[0]?.promptVersion).toBeNull();
   });
 
+  test('/recap --model without a value is a parse error', async () => {
+    currentSessionId = 'unused';
+    const result = await recapCommand.exec(['pr', '--model'], makeCtx());
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('--model requires a model id');
+  });
+
+  test('/recap pr --model <unknown> warns and renders with the session model', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, { sessionId: s.id, role: 'user', content: 'do thing', createdAt: 1_100 });
+    currentSessionId = s.id;
+    const intermediate = projectRecap(db, {
+      scope: { kind: 'session_current', sessionId: s.id, limit: 10 },
+      now: 5_000,
+    });
+    const structured = projectPrDeterministic(intermediate);
+    // Session provider is constrained-capable so the LLM path runs; the
+    // ctx registry is empty so any --model id resolves to unknown.
+    const handle = stubProvider(JSON.stringify(structured));
+    const ctx = makeCtx({ baseConfig: cfgWithProvider(handle.provider) });
+    const events: { type: string; message?: string }[] = [];
+    ctx.bus.on('warn', (e) => events.push({ type: 'warn', message: e.message }));
+
+    const result = await recapCommand.exec(['pr', '--model', 'anthropic/does-not-exist'], ctx);
+    expect(result.kind).toBe('ok');
+    // Rendered with the session provider despite the bad override.
+    expect(handle.calls).toHaveLength(1);
+    expect(
+      events.some(
+        (w) =>
+          w.message?.includes("--model 'anthropic/does-not-exist'") &&
+          w.message?.includes('unknown model'),
+      ),
+    ).toBe(true);
+  });
+
+  test('/recap pr --model <known> renders with the override provider, not the session one', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, { sessionId: s.id, role: 'user', content: 'do thing', createdAt: 1_100 });
+    currentSessionId = s.id;
+    const intermediate = projectRecap(db, {
+      scope: { kind: 'session_current', sessionId: s.id, limit: 10 },
+      now: 5_000,
+    });
+    const structured = projectPrDeterministic(intermediate);
+    const sessionHandle = stubProvider(JSON.stringify(structured));
+    const overrideHandle = stubProvider(JSON.stringify(structured));
+    const reg = createModelRegistry();
+    reg.register({
+      id: 'anthropic/claude-opus-4-8',
+      family: 'anthropic',
+      modelName: 'claude-opus-4-8',
+      capabilities: overrideHandle.provider.capabilities,
+      factory: () => overrideHandle.provider,
+    });
+    const ctx = makeCtx({
+      baseConfig: cfgWithProvider(sessionHandle.provider),
+      modelRegistry: reg,
+    });
+
+    const result = await recapCommand.exec(['pr', '--model', 'anthropic/claude-opus-4-8'], ctx);
+    expect(result.kind).toBe('ok');
+    expect(overrideHandle.calls).toHaveLength(1);
+    expect(sessionHandle.calls).toHaveLength(0);
+  });
+
+  test('recapEnabled=false forces deterministic render (no provider call, no LLM spend)', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, { sessionId: s.id, role: 'user', content: 'do thing', createdAt: 1_100 });
+    currentSessionId = s.id;
+    // constrained provider that MUST NOT be called when recap is off.
+    const handle = stubProvider('{}');
+    const disabledCfg = {
+      ...cfgWithProvider(handle.provider),
+      recapEnabled: false,
+    } as unknown as HarnessConfig;
+    const ctx = makeCtx({ baseConfig: disabledCfg });
+
+    const result = await recapCommand.exec(['pr'], ctx);
+    expect(result.kind).toBe('ok');
+    expect(handle.calls).toHaveLength(0);
+    const runs = listRecentRecapRuns(db);
+    expect(runs[0]?.usedLlm).toBe(false);
+  });
+
   test('/recap pr --no-llm-render bypasses provider entirely', async () => {
     const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
     currentSessionId = s.id;

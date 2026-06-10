@@ -2,6 +2,42 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-10] feat(recap): `--model` render override, `[recap]` config, and `--no-recap` master switch
+
+Three operator knobs the spec advertised (§1/§8.2) or implied but the code never wired:
+
+- **`/recap --model <id>`** — override the LLM render model per call. Precedence: flag >
+  `[recap].render_model` config > the session's own provider (the runtime default was already the
+  session model, NOT Haiku as §8.2's cost note suggests — left as-is per operator decision). Unknown
+  id / factory failure (missing API key) warns and falls back to the session provider — recap never
+  breaks on a bad model id. The resolved model id is now part of the `recap_cache` key
+  (`canonicalScopeHash`) so a render by model A can't be served to a model-B request — a real
+  correctness leg `--model` introduces.
+- **`[recap]` config section** (`render_model`, `enabled`) — new loader `loadRecapConfig` mirroring
+  `[providers]` (project > user > default, registry-validated render_model, fail-soft warnings surfaced
+  on stderr). Threaded through bootstrap → `HarnessConfig`. Added to the scaffolded config template.
+- **`--no-recap` flag + `[recap].enabled=false` master switch** — disables the three automatic/cost
+  surfaces (session-end + Alt+R auto-display §3.3, resume auto-rehydrate §3.2, and LLM render — every
+  `/recap` stays deterministic) while keeping `/recap` usable. Gated in the loop on
+  `config.recapEnabled !== false` (optional field so the many HarnessConfig test fixtures keep
+  default-on).
+
+Spec updated: RECAP §1 (`--model` flag), §8.3 (`render_model` in the scope_hash), new §8.4
+(`[recap]` config + master switch + disable contract). Tests: loader (valid/unknown/non-bool),
+slash (`--model` parse error / unknown→fallback / known→override / `enabled=false`→deterministic),
+and the cache-key model leg.
+
+A self-review (10 findings, all fixed) hardened it: the real bug was the **headless `agent recap`**
+surface rebuilding its `SlashContext` from scratch — it dropped the bootstrap-resolved `recapEnabled`
+/ `recapRenderModel` (so `[recap].enabled=false` / `--no-recap` still LLM-rendered in CI) and used an
+empty model registry. Now `run.ts` threads both from `result.config` into `runRecapHeadless`, and the
+headless ctx uses `createDefaultRegistry()` (regression test added). Cleanups: extracted
+`resolveProviderFromId` (`src/providers/resolve.ts`, adopted in recap + bootstrap) and
+`validateModelIdField` (shared by the `[providers]` / `[recap]` loaders); a single `isRecapEnabled`
+predicate replaces three scattered `!== false` gates and owns the default-on policy (dropped the
+`DEFAULT_RECAP_CONFIG` double-default); `renderModel` sentinel unified to `undefined`; subagents pin
+`recapEnabled: false` (non-interactive, can't resume / run /recap); `--no-recap` added to `--help`.
+
 ## [2026-06-10] fix(providers/anthropic): never send temperature + top_p together (current models 400)
 
 Found by running the recap LLM render against a real Haiku (the `errors[]` work below prompted a

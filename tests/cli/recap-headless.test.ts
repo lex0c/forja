@@ -89,6 +89,42 @@ describe('runRecapHeadless — plain text mode', () => {
     expect(stderr).toBe('');
   });
 
+  test('recapEnabled=false forces deterministic render headless (master switch)', async () => {
+    // Regression: the headless surface used to drop the
+    // bootstrap-resolved recapEnabled, so `[recap].enabled=false` /
+    // `--no-recap` did not force the deterministic path for
+    // `agent recap` — it still spent on the LLM render. A
+    // constrained-capable provider here would be used if the switch
+    // leaked; assert it is never called.
+    const { id } = seedSession();
+    let constrainedCalls = 0;
+    const constrainedProvider: Provider = {
+      id: 'anthropic/claude-haiku-4-5',
+      family: 'anthropic',
+      capabilities: stubCaps('tools'),
+      generate: async function* (): AsyncIterable<StreamEvent> {},
+      generateConstrained: async () => {
+        constrainedCalls += 1;
+        throw new Error('must not be called when recap is disabled');
+      },
+      countTokens: async () => 0,
+    };
+    const code = await runRecapHeadless({
+      args: ['pr'],
+      json: false,
+      dbOverride: db,
+      provider: constrainedProvider,
+      recapEnabled: false,
+      currentSessionId: () => id,
+      out,
+      err,
+      now: () => 5_000,
+    });
+    expect(code).toBe(0);
+    expect(constrainedCalls).toBe(0);
+    expect(stdout).toContain('## Summary');
+  });
+
   test('returns non-zero and writes to stderr on parse error', async () => {
     const code = await runRecapHeadless({
       args: ['mystery'],

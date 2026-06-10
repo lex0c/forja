@@ -266,6 +266,33 @@ interface PartialProvidersLayer {
   model?: string;
 }
 
+// Validate a `[section].field = "<model-id>"` value against the
+// registry. Returns the id when valid; otherwise returns a fail-soft
+// warning (string-type / empty / not-in-registry) and no value. The
+// shared ladder behind both `[providers].model` and
+// `[recap].render_model` — `label` is the `[section].field` prefix
+// the message names (e.g. `[providers].model`).
+const validateModelIdField = (
+  raw: unknown,
+  opts: { label: string; source: string; path: string | null; registry: ModelRegistry },
+): { value?: string; warning?: string } => {
+  const prefix = `${opts.source} config (${opts.path}): ${opts.label}`;
+  if (typeof raw !== 'string') {
+    return { warning: `${prefix} must be a string (got ${typeof raw}); ignoring` };
+  }
+  if (raw.length === 0) {
+    return { warning: `${prefix} is empty; ignoring` };
+  }
+  if (opts.registry.get(raw) === null) {
+    const known = opts.registry
+      .list()
+      .map((e) => e.id)
+      .join(', ');
+    return { warning: `${prefix}='${raw}' is not a known model; ignoring. Known: ${known}` };
+  }
+  return { value: raw };
+};
+
 const parseProvidersLayer = (
   path: string | null,
   source: string,
@@ -281,22 +308,9 @@ const parseProvidersLayer = (
   }
   const p = section.section;
   if (p.model !== undefined) {
-    if (typeof p.model !== 'string') {
-      warnings.push(
-        `${source} config (${path}): [providers].model must be a string (got ${typeof p.model}); ignoring`,
-      );
-    } else if (p.model.length === 0) {
-      warnings.push(`${source} config (${path}): [providers].model is empty; ignoring`);
-    } else if (registry.get(p.model) === null) {
-      warnings.push(
-        `${source} config (${path}): [providers].model='${p.model}' is not a known model; ignoring. Known: ${registry
-          .list()
-          .map((e) => e.id)
-          .join(', ')}`,
-      );
-    } else {
-      layer.model = p.model;
-    }
+    const r = validateModelIdField(p.model, { label: '[providers].model', source, path, registry });
+    if (r.warning !== undefined) warnings.push(r.warning);
+    if (r.value !== undefined) layer.model = r.value;
   }
   return { layer, warnings };
 };
@@ -324,6 +338,102 @@ export const loadProvidersConfig = (input: LoadProvidersConfigInput): LoadedProv
   const config: ProvidersConfigKeys = {};
   const resolvedModel = projectResult.layer.model ?? userResult.layer.model;
   if (resolvedModel !== undefined) config.model = resolvedModel;
+
+  return { config, userPath, projectPath, warnings };
+};
+
+// ────────────────────────────────────────────────────────────────────
+// RECAP CONFIG (RECAP.md §8.2 render model + §3.2/§3.3 master switch)
+//
+// `[recap]` exposes two operator knobs:
+//   - `render_model` — model id for the LLM render of `/recap`
+//     (pr/changelog/slack/terse/human). Default stays the session's
+//     own provider; a `--model` slash flag overrides per-call.
+//     Validated against the registry so a bad id warns at boot and
+//     is ignored (render falls back to the session provider) rather
+//     than failing silently at render time.
+//   - `enabled` — master switch (default `true`). When `false`, the
+//     three automatic / cost surfaces are suppressed: session-end +
+//     Alt+R auto-display (§3.3), resume auto-rehydrate (§3.2), and
+//     LLM render (every `/recap` stays deterministic). The `/recap`
+//     command itself stays usable.
+//
+// Resolution mirrors [providers]: CLI flag (`--no-recap`) > project
+// [recap] > user [recap] > default. Per-key merge.
+
+export interface RecapConfigKeys {
+  renderModel?: string;
+  enabled?: boolean;
+}
+
+export interface LoadedRecapConfig {
+  config: RecapConfigKeys;
+  userPath: string | null;
+  projectPath: string;
+  warnings: string[];
+}
+
+interface PartialRecapLayer {
+  renderModel?: string;
+  enabled?: boolean;
+}
+
+const parseRecapLayer = (
+  path: string | null,
+  source: string,
+  registry: ModelRegistry,
+): { layer: PartialRecapLayer; warnings: string[] } => {
+  const layer: PartialRecapLayer = {};
+  const warnings: string[] = [];
+  const section = loadTomlSection(path, 'recap', source);
+  if (section.kind === 'absent' || section.kind === 'no-section') return { layer, warnings };
+  if (section.kind === 'invalid') {
+    warnings.push(section.warning);
+    return { layer, warnings };
+  }
+  const r = section.section;
+  if (r.render_model !== undefined) {
+    const v = validateModelIdField(r.render_model, {
+      label: '[recap].render_model',
+      source,
+      path,
+      registry,
+    });
+    if (v.warning !== undefined) warnings.push(v.warning);
+    if (v.value !== undefined) layer.renderModel = v.value;
+  }
+  if (r.enabled !== undefined) {
+    if (typeof r.enabled !== 'boolean') {
+      warnings.push(
+        `${source} config (${path}): [recap].enabled must be a boolean (got ${typeof r.enabled}); ignoring`,
+      );
+    } else {
+      layer.enabled = r.enabled;
+    }
+  }
+  return { layer, warnings };
+};
+
+export interface LoadRecapConfigInput {
+  cwd: string;
+  registry: ModelRegistry;
+  env?: NodeJS.ProcessEnv;
+}
+
+export const loadRecapConfig = (input: LoadRecapConfigInput): LoadedRecapConfig => {
+  const env = input.env ?? process.env;
+  const userPath = userConfigPath(env);
+  const projectPath = projectConfigPath(input.cwd);
+  const userResult = parseRecapLayer(userPath, 'user', input.registry);
+  const projectResult = parseRecapLayer(projectPath, 'project', input.registry);
+  const warnings = [...userResult.warnings, ...projectResult.warnings];
+
+  // Per-key merge — project overrides user.
+  const config: RecapConfigKeys = {};
+  const resolvedModel = projectResult.layer.renderModel ?? userResult.layer.renderModel;
+  if (resolvedModel !== undefined) config.renderModel = resolvedModel;
+  const resolvedEnabled = projectResult.layer.enabled ?? userResult.layer.enabled;
+  if (resolvedEnabled !== undefined) config.enabled = resolvedEnabled;
 
   return { config, userPath, projectPath, warnings };
 };
