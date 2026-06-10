@@ -670,6 +670,7 @@ export const EXIT_REASONS = [
   'maxSteps',
   'maxWallClockMs',
   'maxOutputTokens', // provider truncated the response at max_tokens
+  'maxContextTokens', // provider hit the context window (model_context_window_exceeded); compact / shrink input
   'maxCostUsd', // running cumulative cost crossed budget.maxCostUsd
   'maxToolErrors',
   'degenerateLoop',

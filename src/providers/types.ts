@@ -11,7 +11,20 @@ export type CacheMode = 'server_5min' | 'server_persistent' | 'client_only';
 export type ConstrainedKind = 'gbnf' | 'json_mode' | 'tools' | 'regex';
 export type PromptDialect = 'claude' | 'openai_chat' | 'llama3' | 'qwen' | 'deepseek';
 
-export type StopReason = 'end_turn' | 'tool_use' | 'max_tokens' | 'stop_sequence' | 'refusal';
+// `model_context_window_exceeded`: on Claude 4.5+ models the API accepts a
+// request whose input + max_tokens overflows the context window and, if
+// generation then reaches the limit, stops with this reason instead of a
+// validation error (earlier models need the `model-context-window-exceeded`
+// beta header). Distinct from `max_tokens` (the per-call OUTPUT cap): here
+// the whole window — input included — is exhausted, so the honest
+// remediation is compaction / shorter input, not a bigger output cap.
+export type StopReason =
+  | 'end_turn'
+  | 'tool_use'
+  | 'max_tokens'
+  | 'stop_sequence'
+  | 'refusal'
+  | 'model_context_window_exceeded';
 
 export interface ProviderCapabilities {
   // Core features

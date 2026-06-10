@@ -1397,6 +1397,19 @@ describe('runAgent', () => {
     expect(result.detail).toContain('max_tokens');
   });
 
+  test('model_context_window_exceeded exits as exhausted/maxContextTokens (not done)', async () => {
+    // Provider stopped because input + output exhausted the context window.
+    // Like max_tokens this is a truncated turn, but a distinct exit reason:
+    // the fix is to shrink input / compact, not raise the output cap.
+    const { config } = buildConfig([
+      { text: 'partial answer', stop_reason: 'model_context_window_exceeded' },
+    ]);
+    const result = await runAgent(config);
+    expect(result.status).toBe('exhausted');
+    expect(result.reason).toBe('maxContextTokens');
+    expect(result.detail).toContain('model_context_window_exceeded');
+  });
+
   test('refusal stop_reason exits as done (the refusal IS the response)', async () => {
     // Model said "no" — that's a valid completion. Should NOT be
     // surfaced as an error; the user gets the refusal text in the

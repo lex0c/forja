@@ -584,6 +584,67 @@ describe('createAnthropicProvider', () => {
     expect('thinking' in params).toBe(false);
   });
 
+  test('thinking is suppressed when tools are present (signature round-trip not implemented)', async () => {
+    // Anthropic requires the thinking-block signature to be replayed with the
+    // next turn's tool_result; Forja can't round-trip it yet, so a
+    // tool-bearing turn must NOT engage thinking — even with a budget set.
+    const handle = mockClient([{ type: 'message_stop' }]);
+    const provider = createAnthropicProvider('claude-sonnet-4-6', { client: handle.client });
+    for await (const _ of provider.generate({
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 8000,
+      thinking_budget: 4000,
+      tools: [{ name: 'grep', description: 'g', input_schema: { type: 'object', properties: {} } }],
+    })) {
+      // drain
+    }
+    expect(handle.streamCalls).toHaveLength(1);
+    const params = handle.streamCalls[0]?.params as Record<string, unknown>;
+    expect('thinking' in params).toBe(false);
+  });
+
+  test('thinking_budget >= max_tokens does NOT throw when tools are present (budget never sent)', async () => {
+    // The budget-vs-max_tokens cross-check pre-empts a real HTTP 400 only on
+    // the legacy path that actually SENDS budget_tokens. With tools present
+    // thinking is suppressed entirely, so no budget leaves the binary and the
+    // pair is never seen by the API — throwing here would reject a valid
+    // request. Haiku 4.5 is legacy (no adaptive thinking).
+    const handle = mockClient([{ type: 'message_stop' }]);
+    const provider = createAnthropicProvider('claude-haiku-4-5', { client: handle.client });
+    for await (const _ of provider.generate({
+      model: 'claude-haiku-4-5',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 4096,
+      thinking_budget: 10_000, // >= max_tokens: would throw without the tools guard
+      tools: [{ name: 'grep', description: 'g', input_schema: { type: 'object', properties: {} } }],
+    })) {
+      // drain — must not throw
+    }
+    expect(handle.streamCalls).toHaveLength(1);
+    const params = handle.streamCalls[0]?.params as Record<string, unknown>;
+    // Thinking suppressed (tools present); budget never sent.
+    expect('thinking' in params).toBe(false);
+  });
+
+  test('thinking is engaged on a no-tool turn with the same budget', async () => {
+    // Counterpart to the suppression test: with no tools, the identical
+    // budget must still turn thinking on — the gate keys on tools, not on
+    // disabling thinking outright.
+    const handle = mockClient([{ type: 'message_stop' }]);
+    const provider = createAnthropicProvider('claude-haiku-4-5', { client: handle.client });
+    for await (const _ of provider.generate({
+      model: 'claude-haiku-4-5',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 8000,
+      thinking_budget: 4000,
+    })) {
+      // drain
+    }
+    const params = handle.streamCalls[0]?.params as Record<string, unknown>;
+    expect(params.thinking).toEqual({ type: 'enabled', budget_tokens: 4000 });
+  });
+
   test('countTokens returns the SDK input_tokens value', async () => {
     const handle = mockClient([], { input_tokens: 137 });
     const provider = createAnthropicProvider('claude-haiku-4-5', { client: handle.client });

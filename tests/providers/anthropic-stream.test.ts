@@ -247,6 +247,20 @@ describe('normalizeAnthropicStream', () => {
     expect(events).toContainEqual({ kind: 'stop', reason: 'end_turn' });
   });
 
+  test('model_context_window_exceeded maps through (not defaulted to end_turn)', async () => {
+    // 4.5+ window overflow. Must survive as its own reason so the loop can
+    // surface a truncated turn honestly instead of reporting success.
+    const events = await collectNonUsage(
+      normalizeAnthropicStream(
+        fromEvents([
+          { type: 'message_delta', delta: { stop_reason: 'model_context_window_exceeded' } },
+          { type: 'message_stop' },
+        ]),
+      ),
+    );
+    expect(events).toContainEqual({ kind: 'stop', reason: 'model_context_window_exceeded' });
+  });
+
   test('defaults to end_turn when no stop_reason is ever set', async () => {
     const events = await collectNonUsage(
       normalizeAnthropicStream(fromEvents([{ type: 'message_stop' }])),

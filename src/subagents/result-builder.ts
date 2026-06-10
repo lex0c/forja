@@ -119,6 +119,7 @@ const VALID_REASON_MAP: Record<RunSubagentResult['reason'], true> = {
   maxSteps: true,
   maxWallClockMs: true,
   maxOutputTokens: true,
+  maxContextTokens: true,
   maxCostUsd: true,
   maxToolErrors: true,
   degenerateLoop: true,

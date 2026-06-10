@@ -156,6 +156,7 @@ const exitToStatus: Record<ExitReason, TerminalSessionStatus> = {
   maxSteps: 'exhausted',
   maxWallClockMs: 'interrupted',
   maxOutputTokens: 'exhausted',
+  maxContextTokens: 'exhausted',
   maxCostUsd: 'exhausted',
   maxToolErrors: 'error',
   degenerateLoop: 'error',
@@ -180,6 +181,7 @@ const exitToHarnessStatus: Record<ExitReason, HarnessResult['status']> = {
   maxSteps: 'exhausted',
   maxWallClockMs: 'interrupted',
   maxOutputTokens: 'exhausted',
+  maxContextTokens: 'exhausted',
   maxCostUsd: 'exhausted',
   maxToolErrors: 'error',
   degenerateLoop: 'error',
@@ -2810,6 +2812,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             return await finish(
               'maxOutputTokens',
               `provider truncated at max_tokens (cap=${resolvedMaxTokens})`,
+            );
+          }
+          // Window overflow (input + output exhausted the context window).
+          // Same honesty leg as max_tokens — a truncated answer must not exit
+          // as `done`. Distinct reason because the fix differs: compact /
+          // shrink the input, not raise the per-call output cap.
+          if (collected.stop_reason === 'model_context_window_exceeded') {
+            return await finish(
+              'maxContextTokens',
+              'provider stopped at the context window limit (model_context_window_exceeded); reduce input or rely on compaction',
             );
           }
           return await finish('done');
