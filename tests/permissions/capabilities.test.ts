@@ -8,6 +8,7 @@ import {
   effectiveCovers,
   exec,
   formatCapability,
+  intersectCapabilities,
   isCapabilityKind,
   netEgress,
   parseCapability,
@@ -107,6 +108,76 @@ describe('capabilityCovers — invalid-scope sentinel guard', () => {
   });
 });
 
+describe('capabilityCovers — traversal guard (spawn-gate escape)', () => {
+  // R5 P0-Bypass-3. The spawn-time intersection runs the string-only
+  // `capabilityCovers` against the model-declared scope VERBATIM — no
+  // canonicalization. Pre-fix, a child declaring `read-fs:src/../../x`
+  // textually started with the parent prefix `src/`, so the `<prefix>/**`
+  // rule admitted it into `effective`; the child engine then
+  // canonicalized the sealed scope to `<cwd>/../x` and granted reads
+  // OUTSIDE the parent's `src/**` grant — privilege escalation across the
+  // spawn boundary. The guard refuses coverage when either fs scope
+  // carries a `..` segment, so the declared scope lands in `excess` and
+  // the spawn is refused.
+
+  test('BASELINE: clean prefix glob still covers a child under it', () => {
+    expect(capabilityCovers(readFs('src/**'), readFs('src/index.ts'))).toBe(true);
+  });
+
+  test('relative `..` in child scope is NOT covered by a clean parent prefix', () => {
+    expect(capabilityCovers(readFs('src/**'), readFs('src/../etc/passwd'))).toBe(false);
+    expect(capabilityCovers(readFs('src/**'), readFs('src/../../secret/key'))).toBe(false);
+  });
+
+  test('absolute `..` in child scope is NOT covered', () => {
+    expect(capabilityCovers(readFs('/work/src/**'), readFs('/work/src/../secret'))).toBe(false);
+  });
+
+  test('`..` in the PARENT scope also refuses (symmetric, fail-closed)', () => {
+    expect(capabilityCovers(readFs('src/../**'), readFs('src/index.ts'))).toBe(false);
+  });
+
+  test('bare `..`, leading, trailing, and backslash forms all refuse', () => {
+    expect(capabilityCovers(readFs('**'), readFs('..'))).toBe(false);
+    expect(capabilityCovers(readFs('**'), readFs('../escape'))).toBe(false);
+    expect(capabilityCovers(readFs('**'), readFs('a/b/..'))).toBe(false);
+    expect(capabilityCovers(readFs('**'), readFs('a\\..\\b'))).toBe(false);
+  });
+
+  test('MIXED separators refuse (Windows collapses `..` regardless of bounding slash)', () => {
+    // `src/..\secret` starts with `src/` so the prefix rule would admit
+    // it, but on Windows `node:path` resolves the `..` to a sibling of
+    // src — the same escape the same-separator forms cover. Both
+    // delimiters must be treated equally.
+    expect(capabilityCovers(readFs('src/**'), readFs('src/..\\secret'))).toBe(false);
+    expect(capabilityCovers(readFs('src/**'), readFs('src\\../secret'))).toBe(false);
+    expect(capabilityCovers(readFs('src/**'), readFs('src\\..\\secret'))).toBe(false);
+    // Trailing/leading mixed forms too.
+    expect(capabilityCovers(readFs('**'), readFs('a/b\\..'))).toBe(false);
+    expect(capabilityCovers(readFs('**'), readFs('..\\escape'))).toBe(false);
+  });
+
+  test('a literal `..` substring inside a segment is NOT a traversal (no false refuse)', () => {
+    expect(capabilityCovers(readFs('src/**'), readFs('src/a..b/x'))).toBe(true);
+    expect(capabilityCovers(readFs('src/**'), readFs('src/..hidden'))).toBe(true);
+  });
+
+  test('intersectCapabilities routes the traversal scope into excess → spawn refused', () => {
+    const parent = [readFs('src/**')];
+    const declared = [readFs('src/../../secret/key')];
+    const { effective, excess } = intersectCapabilities(parent, declared);
+    expect(effective).toEqual([]);
+    expect(excess.map(formatCapability)).toEqual(['read-fs:src/../../secret/key']);
+  });
+
+  test('exec / net-egress scopes are unaffected by the fs traversal guard', () => {
+    // `..` is meaningless in exec class names / host strings — the guard
+    // is fs-kind-scoped, so these still behave normally.
+    expect(capabilityCovers(exec('arbitrary'), exec('shell'))).toBe(true);
+    expect(capabilityCovers(netEgress('**'), netEgress('api.example.com'))).toBe(true);
+  });
+});
+
 describe('parseCapability — errors', () => {
   test('rejects empty input', () => {
     expect(() => parseCapability('')).toThrow();
@@ -191,6 +262,29 @@ describe('capabilityCoversCwdAware (slice 95)', () => {
     const parent: Capability = { kind: 'read-fs', scope: 'src/**' };
     const child: Capability = { kind: 'read-fs', scope: '/work/proj/src/auth/login.ts' };
     expect(capabilityCoversCwdAware(parent, child, CWD)).toBe(true);
+  });
+
+  // Bare-prefix-dir parity with the string-based `capabilityCovers`
+  // (rule 4.c: `<prefix>/**` covers the bare `<prefix>` dir). Without
+  // this, a subagent granted `read-fs:src/**` was DENIED any op on
+  // `src` itself (`ls src`, a dir-resolving read) because the resolver
+  // emits `read-fs:<cwd>/src` (no trailing slash) and glob `**`
+  // matches only paths strictly under `src/`. The spawn gate covered
+  // it but the enforce side did not — a gate/enforce divergence.
+  test('prefix glob covers the bare prefix dir (cwd-aware), matching capabilityCovers', () => {
+    const parent: Capability = { kind: 'read-fs', scope: 'src/**' };
+    // resolver-emitted absolute form of the dir root, no trailing slash
+    const bareDir: Capability = { kind: 'read-fs', scope: '/work/proj/src' };
+    expect(capabilityCoversCwdAware(parent, bareDir, CWD)).toBe(true);
+    // parity: string-based capabilityCovers already covers the relative bare dir
+    expect(capabilityCovers(parent, { kind: 'read-fs', scope: 'src' })).toBe(true);
+  });
+
+  test('bare-prefix shortcut stays traversal-safe (resolved `..` escaping cwd is NOT covered)', () => {
+    const parent: Capability = { kind: 'read-fs', scope: 'src/**' };
+    // `<cwd>/src/../../secret` canonicalizes to `/work/secret` ≠ `<cwd>/src`
+    const escape: Capability = { kind: 'read-fs', scope: '/work/proj/src/../../secret' };
+    expect(capabilityCoversCwdAware(parent, escape, CWD)).toBe(false);
   });
 
   test('relative prefix glob does NOT cover absolute target outside cwd', () => {

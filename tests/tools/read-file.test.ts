@@ -30,6 +30,23 @@ describe('readFileTool', () => {
     }
   });
 
+  // Engine/tool path-arg parity: the permission engine gates on
+  // `file_path > path`; the tool must read the SAME field. Pre-fix a
+  // `{file_path}`-only call crashed with `isAbsolute(undefined)` TypeError.
+  test('accepts file_path alias (engine/tool parity)', async () => {
+    const path = join(dir, 'fp.txt');
+    writeFileSync(path, 'aliased\n');
+    const out = await readFileTool.execute({ file_path: path } as never, makeCtx({ cwd: dir }));
+    expect(isToolError(out)).toBe(false);
+    if (!isToolError(out)) expect(out.content).toBe('aliased\n');
+  });
+
+  test('missing both path and file_path → clean invalid_arg (no crash)', async () => {
+    const out = await readFileTool.execute({} as never, makeCtx({ cwd: dir }));
+    expect(isToolError(out)).toBe(true);
+    if (isToolError(out)) expect(out.error_message).toContain('path');
+  });
+
   test('respects offset and limit', async () => {
     const path = join(dir, 'big.txt');
     const lines = Array.from({ length: 100 }, (_, i) => `line${i}`);

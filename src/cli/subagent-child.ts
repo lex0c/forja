@@ -503,7 +503,16 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
   // the authoritative signal.
   const finalizeAsError = (): void => {
     try {
-      completeSession(db, opts.sessionId, 'error', 0, true);
+      // Preserve any spend the run already persisted into the row
+      // (per-response rollup, loop.ts emitCostUpdate): besides the
+      // pre-harness refusal paths (zero spend), this also fires from
+      // the outer catch when a throw escapes runAgent past its own
+      // finish() — AFTER billed steps. Writing a literal 0 there
+      // would destroy the recorded floor. usage_complete follows:
+      // a zero row means nothing billed (measured zero, complete);
+      // a nonzero floor is a lower bound (incomplete).
+      const persisted = getSession(db, opts.sessionId)?.totalCostUsd ?? 0;
+      completeSession(db, opts.sessionId, 'error', persisted, persisted === 0);
     } catch {
       // ignore — row may be missing, already finalized, or
       // the DB handle may be unhealthy (the outer finally

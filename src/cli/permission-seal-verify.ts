@@ -135,7 +135,21 @@ export const runPermissionSealVerify = async (
   const result: VerifySealResult = verifySealAgainstChain(store, db, identity.install_id);
 
   if (json) {
-    out(`${JSON.stringify({ install_id: identity.install_id, ...result })}\n`);
+    // Scope hint, machine-readable mirror of the intact-path note
+    // below: a clean seal-verify proves seal-vs-stored-hash ONLY, not
+    // that each stored hash matches its row payload (the recompute
+    // lives in `permission verify`). Without this an automated gate
+    // keying on `ok` would read a tampered row whose stored hash was
+    // left stale as fully intact. `ok` is deliberately left untouched —
+    // the two checks are orthogonal forensic signals; this advertises
+    // the gap rather than folding the other check's verdict in. Emitted
+    // only when there are entries to caveat (mirrors the human guard).
+    const payload: Record<string, unknown> = { install_id: identity.install_id, ...result };
+    if (result.ok && result.entriesChecked > 0) {
+      payload.scope = 'seal-vs-stored-hash';
+      payload.fullIntegrityRequires = 'permission verify';
+    }
+    out(`${JSON.stringify(payload)}\n`);
     return result.ok ? 0 : 1;
   }
 
@@ -148,6 +162,24 @@ export const runPermissionSealVerify = async (
     if (sealConfig.path !== undefined) {
       const label = sealConfig.mode === 'git-anchored' ? 'repo' : 'file';
       out(`  ${label}: ${sealConfig.path}\n`);
+    }
+    // seal-verify proves the seal file matches the STORED row hashes
+    // (seal unedited ∧ stored hashes unchanged). It does NOT recompute
+    // each row's hash from its payload — a row edited with a stale
+    // this_hash that still matches the seal passes here. The recompute
+    // (this_hash_mismatch + prev_hash linkage) lives in `permission
+    // verify`. A complete §7.3 integrity proof requires BOTH; surface
+    // that on the intact path so a clean seal-verify isn't mistaken for
+    // full chain integrity.
+    if (result.entriesChecked > 0) {
+      out(
+        '  note: this confirms the seal matches the stored chain hashes only.\n',
+      );
+      out(
+        '  for full integrity, also run `agent permission verify` (recomputes\n',
+      );
+      out('  each row hash from its payload — catches a tampered row whose\n');
+      out('  stored hash was left stale).\n');
     }
     if (result.entriesChecked === 0) {
       out('  note: no seal entries yet — the file is empty\n');

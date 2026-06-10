@@ -31,6 +31,27 @@ describe('editFileTool — single-edit batches', () => {
     expect(readFileSync(path, 'utf-8')).toBe('const x = 42;\nconst y = 2;\n');
   });
 
+  // Engine/tool path-arg parity (see _path-arg.ts).
+  test('accepts file_path alias (engine/tool parity)', async () => {
+    const path = join(dir, 'fp.ts');
+    writeFileSync(path, 'const a = 1;\n');
+    const out = await editFileTool.execute(
+      { file_path: path, edits: [{ old_string: 'a = 1', new_string: 'a = 9' }] } as never,
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(readFileSync(path, 'utf-8')).toBe('const a = 9;\n');
+  });
+
+  test('missing both path and file_path → clean invalid_arg (no crash)', async () => {
+    const out = await editFileTool.execute(
+      { edits: [{ old_string: 'a', new_string: 'b' }] } as never,
+      makeCtx({ cwd: dir }),
+    );
+    expect(isToolError(out)).toBe(true);
+    if (isToolError(out)) expect(out.error_message).toContain('path');
+  });
+
   test('refuses ambiguous match without replace_all', async () => {
     const path = join(dir, 'a.ts');
     writeFileSync(path, 'foo\nfoo\nfoo');

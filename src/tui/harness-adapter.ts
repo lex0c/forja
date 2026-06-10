@@ -711,6 +711,12 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         // not "what just happened" — present tense, present
         // detail.
         const inner = event.lastEvent;
+        // Quiet inner: the child's per-response display cue is for
+        // the parent REPL's stats refresh (handled before the
+        // adapter), not for the heartbeat text — the default arm
+        // below would print a noisy literal 'usage_persisted' after
+        // every child response.
+        if (inner.type === 'usage_persisted') return out;
         let progress: string;
         // Optional live-cost piggyback (D232). When the inner
         // event is `cost_update`, the cumulative figure flows
@@ -948,6 +954,13 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         // line. Returning `out` (likely empty since no other
         // case fired) makes the adapter ignore the event without
         // breaking the exhaustive switch contract.
+        return out;
+
+      case 'usage_persisted':
+        // Display-refresh cue consumed by the REPL directly (it
+        // recomputes the footer's DB-derived chips and emits
+        // `stats:refresh` itself) — nothing for the adapter to
+        // translate.
         return out;
 
       case 'cap_watchdog_fired':

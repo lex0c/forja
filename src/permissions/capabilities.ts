@@ -62,6 +62,33 @@ const ALL_KINDS: ReadonlySet<string> = new Set<CapabilityKind>([
   'host-passthrough',
 ]);
 
+// Path-shaped fs kinds whose scope is a filesystem path/glob. A `..`
+// segment in these scopes is a directory-traversal escape; the
+// string-prefix coverage check in `capabilityCovers` is blind to
+// it, so the traversal guard there refuses coverage for any such
+// scope. Mirrors `FS_KINDS` used on the enforcement side.
+const PATH_SCOPED_KINDS: ReadonlySet<CapabilityKind> = new Set<CapabilityKind>([
+  'read-fs',
+  'write-fs',
+  'delete-fs',
+]);
+
+// True when a path scope contains a `..` traversal segment in any
+// position: bare `..`, leading `../`, embedded `/../`, or trailing
+// `/..`. Used only by the spawn-time string-coverage guard; the
+// enforcement side canonicalizes instead.
+const hasTraversalSegment = (scope: string): boolean => {
+  // Treat both separators as delimiters so MIXED forms
+  // (`src/..\secret`, `src\..//secret`) are caught: on Windows
+  // `node:path` collapses `..` regardless of which slash bounds it,
+  // so enumerating only same-separator forms (`/../`, `\..\`) would
+  // miss `/..\` and re-open the very escape this guards. Normalize
+  // every backslash to a forward slash first, then one set of
+  // forward-slash checks covers all combinations.
+  const s = scope.replace(/\\/g, '/');
+  return s === '..' || s.startsWith('../') || s.includes('/../') || s.endsWith('/..');
+};
+
 export interface Capability {
   kind: CapabilityKind;
   // Scope value verbatim. `null` for the scope-less kinds.
@@ -197,6 +224,25 @@ export const capabilityCovers = (parent: Capability, child: Capability): boolean
   // legitimate child. See INVALID_SCOPE_SENTINEL doc for the rationale.
   if (pScope === INVALID_SCOPE_SENTINEL || cScope === INVALID_SCOPE_SENTINEL) return false;
 
+  // Traversal guard (R5 P0-Bypass-3): a `..` segment in a
+  // path-shaped scope makes string-prefix coverage UNSOUND. The
+  // spawn-time intersection runs this string-only check against
+  // the declared scope verbatim — no canonicalization — so a child
+  // declaring `read-fs:src/../../secret` textually starts with the
+  // parent prefix `src/` and slips into `effective`, then the
+  // child engine's `capabilityCoversCwdAware` canonicalizes it to
+  // `<cwd>/../secret` and grants a read OUTSIDE the parent's
+  // `src/**` grant — privilege escalation across the spawn
+  // boundary. The asymmetry: enforcement canonicalizes, the spawn
+  // gate did not. Fail closed here — a scope with `..` cannot be
+  // proven covered by string matching, so it lands in `excess` and
+  // refuses the spawn. Policy-derived parent scopes never carry
+  // `..` (authored globs); a declared child scope that wants a
+  // sibling tree must name it without traversal.
+  if (PATH_SCOPED_KINDS.has(parent.kind)) {
+    if (hasTraversalSegment(pScope) || hasTraversalSegment(cScope)) return false;
+  }
+
   // exec hierarchy. `arbitrary` is the umbrella; everything else is
   // a literal class name.
   if (parent.kind === 'exec') {
@@ -248,6 +294,7 @@ export const capabilityCovers = (parent: Capability, child: Capability): boolean
 // This helper is the evaluation-side check for the child-envelope
 // constraint. No flag / config / prompt can override.
 import { matchPath } from './matcher.ts';
+import { resolve as resolvePath } from 'node:path';
 
 const FS_KINDS: ReadonlySet<CapabilityKind> = new Set<CapabilityKind>([
   'read-fs',
@@ -279,6 +326,30 @@ export const capabilityCoversCwdAware = (
   // resolved `read-fs:src/index.ts` without absolutization).
   // Cheap pre-check.
   if (pScope === cScope) return true;
+  // Bare-prefix-dir parity with `capabilityCovers` rule 4.c
+  // (`<prefix>/**` covers the bare `<prefix>` dir, not just paths
+  // under it). `matchPath('src/**', '<cwd>/src', cwd)` is FALSE —
+  // glob `**` matches only paths strictly under `src/`, so the dir
+  // root itself is excluded. Without this, a subagent granted
+  // `read-fs:src/**` is DENIED any op on `src` itself (`ls src`,
+  // a `read_file src` that resolves to the dir, a write that
+  // creates `src`), because the resolver emits `read-fs:<cwd>/src`
+  // (no trailing slash) and the enforce side wouldn't cover it —
+  // while the spawn gate (string-based `capabilityCovers`) DOES.
+  // That divergence is the same gate-vs-enforce asymmetry class as
+  // the R1 spawn-gate P0; close it here so the two coverage
+  // functions agree. Resolve the prefix against cwd so the
+  // comparison is in the same absolute space as the resolver-
+  // emitted child scope. Sound: covering the root of a granted
+  // subtree is exactly what `<prefix>/**` intends.
+  if (pScope.endsWith('/**')) {
+    const prefix = pScope.slice(0, -3);
+    if (prefix.length > 0) {
+      const absPrefix = resolvePath(cwd, prefix);
+      const absChild = resolvePath(cwd, cScope);
+      if (absChild === absPrefix) return true;
+    }
+  }
   return matchPath(pScope, cScope, cwd);
 };
 

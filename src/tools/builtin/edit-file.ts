@@ -2,6 +2,7 @@ import { isAbsolute, resolve } from 'node:path';
 import { lineDiff } from '../../diff/line-diff.ts';
 import { atomicWrite } from '../../fs/atomic-write.ts';
 import { ERROR_CODES, type Tool, type ToolError, type ToolResult, toolError } from '../types.ts';
+import { pathArgOf } from './_path-arg.ts';
 
 // Single replacement operation. Same shape the tool used to take at
 // the top level — kept verbatim so the per-edit semantics (unique
@@ -387,10 +388,17 @@ export const editFileTool: Tool<EditFileInput, EditFileOutput> = {
         `edits exceeds maximum (${MAX_EDITS}, got ${args.edits.length})`,
       );
     }
-    const abs = isAbsolute(args.path) ? args.path : resolve(ctx.cwd, args.path);
+    // Resolve with the SAME `file_path > path` precedence the engine gated
+    // on (see `_path-arg.ts`); the edit lands on exactly the authorized
+    // file. Null ⇒ clean invalid-arg, not a TypeError crash.
+    const pathArg = pathArgOf(args);
+    if (pathArg === null) {
+      return toolError(ERROR_CODES.invalidArg, "missing or non-string 'path' argument");
+    }
+    const abs = isAbsolute(pathArg) ? pathArg : resolve(ctx.cwd, pathArg);
     const file = Bun.file(abs);
     if (!(await file.exists())) {
-      return toolError(ERROR_CODES.notFound, `file not found: ${args.path}`, {
+      return toolError(ERROR_CODES.notFound, `file not found: ${pathArg}`, {
         details: { resolved: abs },
       });
     }
@@ -401,7 +409,7 @@ export const editFileTool: Tool<EditFileInput, EditFileOutput> = {
     } catch (e) {
       return toolError(
         ERROR_CODES.readFailed,
-        `failed to read ${args.path}: ${(e as Error).message}`,
+        `failed to read ${pathArg}: ${(e as Error).message}`,
         { details: { resolved: abs } },
       );
     }
@@ -422,7 +430,7 @@ export const editFileTool: Tool<EditFileInput, EditFileOutput> = {
       if (edit === undefined) {
         return toolError(ERROR_CODES.invalidArg, `edits[${i}] is missing`);
       }
-      const outcome = applyEdit(working, edit, args.path, i);
+      const outcome = applyEdit(working, edit, pathArg, i);
       if (!outcome.ok) return outcome.error;
       working = outcome.content;
       results.push({
@@ -445,7 +453,7 @@ export const editFileTool: Tool<EditFileInput, EditFileOutput> = {
     // display (which would otherwise show an empty diff).
     if (working === original) {
       return {
-        path: args.path,
+        path: pathArg,
         edits: results,
         total_replacements: totalReplacements,
         bytes_written: 0,
@@ -467,7 +475,7 @@ export const editFileTool: Tool<EditFileInput, EditFileOutput> = {
         if (fileDiff.added + fileDiff.removed > 0) ctx.emitDiff(fileDiff);
       }
       return {
-        path: args.path,
+        path: pathArg,
         edits: results,
         total_replacements: totalReplacements,
         bytes_written: bytes,
@@ -475,7 +483,7 @@ export const editFileTool: Tool<EditFileInput, EditFileOutput> = {
     } catch (e) {
       return toolError(
         ERROR_CODES.writeFailed,
-        `failed to write ${args.path}: ${(e as Error).message}`,
+        `failed to write ${pathArg}: ${(e as Error).message}`,
         { details: { resolved: abs } },
       );
     }

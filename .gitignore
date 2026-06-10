@@ -27,3 +27,6 @@ dist/
 .bun/
 .agent/
 .claude/
+
+# Scratch probe dirs from security-audit / debug sessions
+*-probe/

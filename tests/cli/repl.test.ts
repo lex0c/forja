@@ -23,7 +23,11 @@ import { openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { appendMessage } from '../../src/storage/repos/messages.ts';
 import { listRecentRecapRuns } from '../../src/storage/repos/recap-runs.ts';
-import { completeSession, createSession } from '../../src/storage/repos/sessions.ts';
+import {
+  completeSession,
+  createSession,
+  updateSessionCost,
+} from '../../src/storage/repos/sessions.ts';
 import {
   getSubagentHandle,
   insertSubagentHandle,
@@ -5271,5 +5275,150 @@ describe('REPL — subagent shadow render uses actual scopes (post-review)', () 
     expect(stderr).toContain('/home/op/.config/agent/agents/helper.md (user)');
     expect(stderr).toContain('/repo/.agent/agents/helper.md (project)');
     expect(stderr).not.toContain('(builtin)');
+  });
+});
+
+describe('repl — per-response footer stats refresh', () => {
+  // The footer is a single line clipped at caps.cols; at the default
+  // test width the running-state left part pushes the trailing cost
+  // chip past the right edge. Pin a wide terminal so the assertion
+  // sees the chip — width behavior is the renderer's concern, not
+  // this wiring's.
+  const originalColumns = Object.getOwnPropertyDescriptor(process.stdout, 'columns');
+  beforeEach(() => {
+    Object.defineProperty(process.stdout, 'columns', { value: 200, configurable: true });
+  });
+  afterEach(() => {
+    if (originalColumns !== undefined) {
+      Object.defineProperty(process.stdout, 'columns', originalColumns);
+    } else {
+      Object.defineProperty(process.stdout, 'columns', {
+        value: undefined,
+        configurable: true,
+      });
+    }
+    process.removeAllListeners('SIGINT');
+  });
+
+  // The harness emits one `usage_persisted` per model response, AFTER
+  // persisting the charge (message row + session cost rollup — see
+  // emitCostUpdate / the display-cue emits in harness/loop.ts). The
+  // REPL must refresh the footer's DB-derived chips on each one,
+  // mid-turn — pre-fix the chips only moved at `session_finished`, so
+  // a long multi-step turn showed stale counters until it ended.
+  test('usage_persisted mid-turn repaints the footer cost chip per model response', async () => {
+    const stub = makeBootstrapStub();
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    stdin.feed('hello\r'); // start turn 0 (stays running throughout)
+    await tick();
+
+    // Simulate the harness's persist-then-emit contract: the session
+    // row and the first response's billed message land in the DB
+    // BEFORE the events fire.
+    const session = createSession(stub.db, { model: 'mock/m', cwd: '/tmp/forja-repl-test' });
+    appendMessage(stub.db, {
+      sessionId: session.id,
+      role: 'assistant',
+      content: [{ type: 'text', text: 'r1' }],
+      tokensIn: 100,
+      tokensOut: 50,
+      costUsd: 0.25,
+    });
+    updateSessionCost(stub.db, session.id, 0.25);
+    // session_start (not session_finished) must be enough for the
+    // refresh to see the session — first-turn regression guard.
+    ra.emitInto(0, { type: 'session_start', sessionId: session.id });
+    const before1 = writes.length;
+    ra.emitInto(0, { type: 'usage_persisted' });
+    await flushFrame();
+    expect(writes.slice(before1).join('')).toContain('$0.25');
+
+    // Second response settles — still mid-turn, chip advances again.
+    appendMessage(stub.db, {
+      sessionId: session.id,
+      role: 'assistant',
+      content: [{ type: 'text', text: 'r2' }],
+      tokensIn: 100,
+      tokensOut: 50,
+      costUsd: 0.25,
+    });
+    updateSessionCost(stub.db, session.id, 0.5);
+    const before2 = writes.length;
+    ra.emitInto(0, { type: 'usage_persisted' });
+    await flushFrame();
+    expect(writes.slice(before2).join('')).toContain('$0.50');
+
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a subagent usage_persisted forward refreshes the chips and tracks the child session', async () => {
+    const stub = makeBootstrapStub();
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    stdin.feed('hello\r');
+    await tick();
+
+    // A task_* child persisted its own billed rows in ITS session,
+    // then its usage_persisted cue crossed IPC and the parent loop
+    // forwarded it as subagent_progress. The parent session never
+    // spent a cent — the chips must still move, via the tracked
+    // child id.
+    const child = createSession(stub.db, {
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+      isSubagent: true,
+    });
+    appendMessage(stub.db, {
+      sessionId: child.id,
+      role: 'assistant',
+      content: [{ type: 'text', text: 'child r1' }],
+      tokensIn: 200,
+      tokensOut: 30,
+      costUsd: 0.4,
+    });
+    updateSessionCost(stub.db, child.id, 0.4);
+    const before = writes.length;
+    ra.emitInto(0, {
+      type: 'subagent_progress',
+      subagentId: child.id,
+      lastEvent: { type: 'usage_persisted' },
+    });
+    await flushFrame();
+    expect(writes.slice(before).join('')).toContain('$0.40');
+
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
   });
 });

@@ -11,6 +11,7 @@ import {
   appendMessage,
   completeSession,
   createSession,
+  getSession,
   insertSubagentRun,
   insertSubagentWorktree,
   listBgProcessesBySession,
@@ -1560,24 +1561,41 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
   // an authoritative cost (the child's harness measured it
   // before publishing). For 'crashed' / 'aborted' / 'wall_clock'
   // the synthesized `result.costUsd === 0` is a lower bound —
-  // the child may well have made expensive provider calls
-  // before dying, but we have no way to read its in-flight
-  // accumulator across the IPC boundary. Marking the row
-  // `usage_complete = false` tells consumers (cost rollups,
-  // budget reconciliation, billing audits) "this total is a
-  // floor, not authoritative" — same semantics the harness
-  // uses for its own incomplete-measurement paths.
+  // but the row itself usually holds a BETTER floor: the child's
+  // harness persists its running spend into `total_cost_usd`
+  // per response (loop.ts emitCostUpdate rollup), so a child
+  // killed mid-run leaves its last persisted figure behind.
+  // Read it back and keep the larger value — writing the
+  // synthesized zero over it would destroy real recorded spend
+  // (footer totals visibly DROP, billing audits lose the run).
+  // Marking the row `usage_complete = false` still tells
+  // consumers "this total is a floor, not authoritative".
   //
   // Wrapped in try/catch because the function throws when the
   // row already finalized (concurrent purge, child raced to
   // it) — that's a non-event, not an error to surface. On
-  // that no-op path the value of `usageComplete` we pass is
-  // irrelevant; the child's own finalize already set the row.
+  // that no-op path the values we pass are irrelevant; the
+  // child's own finalize already set the row.
   const usageComplete = outcome.kind === 'payload';
+  // Reconcile the synthesized cost against any per-response spend the
+  // child already persisted into its session row (loop.ts
+  // emitCostUpdate rollup). A non-payload exit synthesizes
+  // costUsd=0, but the row may hold a real floor from billed
+  // responses before the kill. Recover it ONCE and carry the same
+  // figure into the row, the returned result, AND the
+  // subagent_finished event: the SYNC `task` path has no live handle
+  // tracker (loop.ts ~1990 falls through to the terminal
+  // result.costUsd), so a stale 0 here undercounts
+  // cumulativeChildCostUsd, the task error detail, and every later
+  // maxCostUsd spawn gate even though the DB row carries the floor.
+  let reconciledCostUsd = result.costUsd;
   try {
-    completeSession(input.db, childSession.id, result.status, result.costUsd, usageComplete);
+    const persistedFloor = getSession(input.db, childSession.id)?.totalCostUsd ?? 0;
+    reconciledCostUsd = Math.max(result.costUsd, persistedFloor);
+    completeSession(input.db, childSession.id, result.status, reconciledCostUsd, usageComplete);
   } catch {
-    // ignore — the row is already in a terminal state
+    // ignore — the row is already in a terminal state, or the DB
+    // read/write failed; fall back to the synthesized result.costUsd.
   }
 
   // Bracket close: fire `subagent_finished` for the typed
@@ -1601,12 +1619,16 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
     reason: result.reason,
     summary,
     durationMs: result.durationMs,
-    costUsd: result.costUsd,
+    costUsd: reconciledCostUsd,
   });
 
   // Attach worktree shape and any audit failure side-channel.
+  // `costUsd` overrides the spread so the parent's sync reconciliation
+  // (and any caller reading the result) sees the floor-preserved figure,
+  // not the synthesized 0 — same value written to the row above.
   return {
     ...result,
+    costUsd: reconciledCostUsd,
     ...(auditFailure !== undefined ? { auditFailure } : {}),
     ...(worktreeHandle !== undefined && cleanup !== undefined
       ? {

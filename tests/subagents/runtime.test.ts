@@ -24,6 +24,7 @@ import {
   insertSubagentOutput,
   listChildSessions,
   setSubagentPayload,
+  updateSessionCost,
   updateSubagentHeartbeat,
 } from '../../src/storage/index.ts';
 import { migrate } from '../../src/storage/migrate.ts';
@@ -360,6 +361,57 @@ describe('runSubagent — orchestration', () => {
     // flag to detect incomplete totals.
     expect(session?.usageComplete).toBe(false);
     expect(getSubagentRun(db, result.sessionId)).not.toBeNull();
+  });
+
+  test('subprocess crash preserves the child-persisted cost rollup (no zero overwrite)', async () => {
+    // The child harness persists its running spend into the session
+    // row per response (loop.ts emitCostUpdate rollup). When the
+    // child dies WITHOUT a payload, the parent's finalize used to
+    // write the synthesized costUsd=0 over that floor — destroying
+    // real recorded spend. Simulate the child's mid-run write inside
+    // the spawn fake, crash without payload, and assert the figure
+    // survives as a lower bound.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const spawn: SpawnChildProcess = (opts) => {
+      updateSessionCost(db, opts.sessionId, 0.7);
+      return {
+        exited: Promise.resolve({ exitCode: 2 }),
+        kill: () => undefined,
+      };
+    };
+    const events: import('../../src/harness/index.ts').HarnessEvent[] = [];
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      onChildEvent: (e) => events.push(e),
+      spawnChildProcess: spawn,
+    });
+    expect(result.status).toBe('error');
+    expect(result.reason).toBe('subprocess_crashed');
+    const session = getSession(db, result.sessionId);
+    expect(session?.status).toBe('error');
+    expect(session?.totalCostUsd).toBeCloseTo(0.7, 10);
+    expect(session?.usageComplete).toBe(false);
+    // The recovered floor must also reach the RETURNED result and the
+    // subagent_finished event, not just the DB row — the sync `task`
+    // parent path reconciles cumulativeChildCostUsd + maxCostUsd gates
+    // straight from result.costUsd (no live handle tracker), so a
+    // synthesized 0 here would undercount the child's real spend.
+    expect(result.costUsd).toBeCloseTo(0.7, 10);
+    const fin = events[events.length - 1];
+    expect(fin?.type).toBe('subagent_finished');
+    if (fin?.type === 'subagent_finished') {
+      expect(fin.costUsd).toBeCloseTo(0.7, 10);
+    }
   });
 
   test('wall-clock timeout → status=interrupted, reason=maxWallClockMs, SIGTERM then SIGKILL', async () => {
