@@ -1577,17 +1577,25 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
   // that no-op path the values we pass are irrelevant; the
   // child's own finalize already set the row.
   const usageComplete = outcome.kind === 'payload';
+  // Reconcile the synthesized cost against any per-response spend the
+  // child already persisted into its session row (loop.ts
+  // emitCostUpdate rollup). A non-payload exit synthesizes
+  // costUsd=0, but the row may hold a real floor from billed
+  // responses before the kill. Recover it ONCE and carry the same
+  // figure into the row, the returned result, AND the
+  // subagent_finished event: the SYNC `task` path has no live handle
+  // tracker (loop.ts ~1990 falls through to the terminal
+  // result.costUsd), so a stale 0 here undercounts
+  // cumulativeChildCostUsd, the task error detail, and every later
+  // maxCostUsd spawn gate even though the DB row carries the floor.
+  let reconciledCostUsd = result.costUsd;
   try {
     const persistedFloor = getSession(input.db, childSession.id)?.totalCostUsd ?? 0;
-    completeSession(
-      input.db,
-      childSession.id,
-      result.status,
-      Math.max(result.costUsd, persistedFloor),
-      usageComplete,
-    );
+    reconciledCostUsd = Math.max(result.costUsd, persistedFloor);
+    completeSession(input.db, childSession.id, result.status, reconciledCostUsd, usageComplete);
   } catch {
-    // ignore — the row is already in a terminal state
+    // ignore — the row is already in a terminal state, or the DB
+    // read/write failed; fall back to the synthesized result.costUsd.
   }
 
   // Bracket close: fire `subagent_finished` for the typed
@@ -1611,12 +1619,16 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
     reason: result.reason,
     summary,
     durationMs: result.durationMs,
-    costUsd: result.costUsd,
+    costUsd: reconciledCostUsd,
   });
 
   // Attach worktree shape and any audit failure side-channel.
+  // `costUsd` overrides the spread so the parent's sync reconciliation
+  // (and any caller reading the result) sees the floor-preserved figure,
+  // not the synthesized 0 — same value written to the row above.
   return {
     ...result,
+    costUsd: reconciledCostUsd,
     ...(auditFailure !== undefined ? { auditFailure } : {}),
     ...(worktreeHandle !== undefined && cleanup !== undefined
       ? {

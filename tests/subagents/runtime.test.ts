@@ -382,6 +382,7 @@ describe('runSubagent — orchestration', () => {
         kill: () => undefined,
       };
     };
+    const events: import('../../src/harness/index.ts').HarnessEvent[] = [];
     const result = await runSubagent({
       definition: definition(),
       prompt: 'go',
@@ -391,6 +392,7 @@ describe('runSubagent — orchestration', () => {
       permissionEngine: buildEngine(),
       db,
       cwd: '/p',
+      onChildEvent: (e) => events.push(e),
       spawnChildProcess: spawn,
     });
     expect(result.status).toBe('error');
@@ -399,6 +401,17 @@ describe('runSubagent — orchestration', () => {
     expect(session?.status).toBe('error');
     expect(session?.totalCostUsd).toBeCloseTo(0.7, 10);
     expect(session?.usageComplete).toBe(false);
+    // The recovered floor must also reach the RETURNED result and the
+    // subagent_finished event, not just the DB row — the sync `task`
+    // parent path reconciles cumulativeChildCostUsd + maxCostUsd gates
+    // straight from result.costUsd (no live handle tracker), so a
+    // synthesized 0 here would undercount the child's real spend.
+    expect(result.costUsd).toBeCloseTo(0.7, 10);
+    const fin = events[events.length - 1];
+    expect(fin?.type).toBe('subagent_finished');
+    if (fin?.type === 'subagent_finished') {
+      expect(fin.costUsd).toBeCloseTo(0.7, 10);
+    }
   });
 
   test('wall-clock timeout → status=interrupted, reason=maxWallClockMs, SIGTERM then SIGKILL', async () => {
