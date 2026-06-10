@@ -266,6 +266,8 @@ export const capabilityCovers = (parent: Capability, child: Capability): boolean
   return false;
 };
 
+import { resolve as resolvePath } from 'node:path';
+import { matchPath } from './matcher.ts';
 // Cwd-aware coverage variant for child-side enforcement. The
 // spawn-time intersection (`capabilityCovers` above) is string-
 // symmetric — both `parent_caps` and `declared_caps` arrive in the
@@ -293,8 +295,6 @@ export const capabilityCovers = (parent: Capability, child: Capability): boolean
 //
 // This helper is the evaluation-side check for the child-envelope
 // constraint. No flag / config / prompt can override.
-import { matchPath } from './matcher.ts';
-import { resolve as resolvePath } from 'node:path';
 
 const FS_KINDS: ReadonlySet<CapabilityKind> = new Set<CapabilityKind>([
   'read-fs',
