@@ -2,6 +2,7 @@ import type { Stats } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { isAbsolute, resolve } from 'node:path';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
+import { pathArgOf } from './_path-arg.ts';
 
 export interface ReadFileInput {
   path: string;
@@ -113,7 +114,16 @@ export const readFileTool: Tool<ReadFileInput, ReadFileOutput> = {
     }
     const offset = args.offset ?? 0;
     const limit = args.limit ?? DEFAULT_LIMIT;
-    const abs = isAbsolute(args.path) ? args.path : resolve(ctx.cwd, args.path);
+    // Resolve the path with the SAME `file_path > path` precedence the
+    // permission engine used to gate this call (see `_path-arg.ts`), so the
+    // tool reads exactly the file the engine authorized — not a divergent
+    // arg. Null ⇒ neither field is a usable string: clean invalid-arg error
+    // instead of an `isAbsolute(undefined)` TypeError crash.
+    const pathArg = pathArgOf(args);
+    if (pathArg === null) {
+      return toolError(ERROR_CODES.invalidArg, "missing or non-string 'path' argument");
+    }
+    const abs = isAbsolute(pathArg) ? pathArg : resolve(ctx.cwd, pathArg);
 
     // Classify the path before reading. `Bun.file(...).exists()` returns
     // false for a directory, so the previous single check reported a
@@ -127,12 +137,12 @@ export const readFileTool: Tool<ReadFileInput, ReadFileOutput> = {
     try {
       info = await stat(abs);
     } catch {
-      return toolError(ERROR_CODES.notFound, `file not found: ${args.path}`, {
+      return toolError(ERROR_CODES.notFound, `file not found: ${pathArg}`, {
         details: { resolved: abs },
       });
     }
     if (info.isDirectory()) {
-      return toolError(ERROR_CODES.isDirectory, `path is a directory, not a file: ${args.path}`, {
+      return toolError(ERROR_CODES.isDirectory, `path is a directory, not a file: ${pathArg}`, {
         hint: 'List a directory with glob (pattern like "<dir>/**") or bash `ls`.',
         details: { resolved: abs },
       });
@@ -181,7 +191,7 @@ export const readFileTool: Tool<ReadFileInput, ReadFileOutput> = {
     } catch (e) {
       return toolError(
         ERROR_CODES.readFailed,
-        `failed to read ${args.path}: ${(e as Error).message}`,
+        `failed to read ${pathArg}: ${(e as Error).message}`,
         { details: { resolved: abs } },
       );
     }
@@ -203,7 +213,7 @@ export const readFileTool: Tool<ReadFileInput, ReadFileOutput> = {
     const scanLen = Math.min(bytes.length, BINARY_SCAN_BYTES);
     for (let i = 0; i < scanLen; i++) {
       if (bytes[i] === 0) {
-        return toolError(ERROR_CODES.binaryFile, `refusing to read binary file: ${args.path}`, {
+        return toolError(ERROR_CODES.binaryFile, `refusing to read binary file: ${pathArg}`, {
           hint: 'NUL byte detected. To inspect raw bytes, use bash (`file`, `xxd`, `hexdump`).',
           details: { resolved: abs, size, nul_offset: i },
         });

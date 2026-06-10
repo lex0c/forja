@@ -3,6 +3,7 @@ import { isAbsolute, resolve } from 'node:path';
 import { lineDiff } from '../../diff/line-diff.ts';
 import { atomicWrite } from '../../fs/atomic-write.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
+import { pathArgOf } from './_path-arg.ts';
 
 export interface WriteFileInput {
   path: string;
@@ -68,14 +69,22 @@ export const writeFileTool: Tool<WriteFileInput, WriteFileOutput> = {
         },
       );
     }
-    const abs = isAbsolute(args.path) ? args.path : resolve(ctx.cwd, args.path);
+    // Resolve the path with the SAME `file_path > path` precedence the
+    // engine gated on (see `_path-arg.ts`), so the write lands on exactly
+    // the file the engine authorized. Null ⇒ clean invalid-arg, not a
+    // TypeError crash on `isAbsolute(undefined)`.
+    const pathArg = pathArgOf(args);
+    if (pathArg === null) {
+      return toolError(ERROR_CODES.invalidArg, "missing or non-string 'path' argument");
+    }
+    const abs = isAbsolute(pathArg) ? pathArg : resolve(ctx.cwd, pathArg);
     // Refuse a directory target with the dedicated code. `Bun.file(dir)
     // .exists()` is false, so without this the write falls through to a
     // generic EISDIR `write_failed`; `fs.is_directory` is the honest
     // signal (mirrors read_file).
     try {
       if (statSync(abs).isDirectory()) {
-        return toolError(ERROR_CODES.isDirectory, `path is a directory, not a file: ${args.path}`, {
+        return toolError(ERROR_CODES.isDirectory, `path is a directory, not a file: ${pathArg}`, {
           hint: 'Provide a file path, not a directory.',
           details: { resolved: abs },
         });
@@ -100,11 +109,11 @@ export const writeFileTool: Tool<WriteFileInput, WriteFileOutput> = {
         // render a `(+0 -0)` card and bypass batching for no real change.
         if (fileDiff.added + fileDiff.removed > 0) ctx.emitDiff(fileDiff);
       }
-      return { path: args.path, bytes_written: bytes, created };
+      return { path: pathArg, bytes_written: bytes, created };
     } catch (e) {
       return toolError(
         ERROR_CODES.writeFailed,
-        `failed to write ${args.path}: ${(e as Error).message}`,
+        `failed to write ${pathArg}: ${(e as Error).message}`,
         {
           details: { resolved: abs },
         },

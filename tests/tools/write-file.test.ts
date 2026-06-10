@@ -37,6 +37,23 @@ describe('writeFileTool', () => {
     expect(readFileSync(path, 'utf-8')).toBe('hello');
   });
 
+  // Engine/tool path-arg parity (see _path-arg.ts).
+  test('accepts file_path alias (engine/tool parity)', async () => {
+    const path = join(dir, 'fp.txt');
+    const out = await writeFileTool.execute(
+      { file_path: path, content: 'aliased' } as never,
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(readFileSync(path, 'utf-8')).toBe('aliased');
+  });
+
+  test('missing both path and file_path → clean invalid_arg (no crash)', async () => {
+    const out = await writeFileTool.execute({ content: 'x' } as never, makeCtx({ cwd: dir }));
+    expect(isToolError(out)).toBe(true);
+    if (isToolError(out)) expect(out.error_message).toContain('path');
+  });
+
   test('overwrites existing file and reports created=false', async () => {
     const path = join(dir, 'b.txt');
     await Bun.write(path, 'old');
