@@ -481,10 +481,15 @@ export const run = async (options: RunOptions): Promise<number> => {
     }
 
     if (args.recap !== undefined) {
-      const { runRecapHeadless } = await import('./recap-headless.ts');
+      const { runRecapHeadless, headlessRecapRenderModel } = await import('./recap-headless.ts');
       let provider: import('../providers/types.ts').Provider;
       let dbOverride: import('../storage/index.ts').DB | undefined;
       let bootstrappedDbCloser: (() => void) | undefined;
+      // Recap knobs resolved by bootstrap ([recap].enabled / --no-recap,
+      // [recap].render_model). Left undefined on the stub path (bootstrap
+      // failed) → headless defaults on with the session provider.
+      let recapEnabled: boolean | undefined;
+      let recapRenderModel: string | undefined;
       try {
         // Empty prompt is safe — bootstrap doesn't append a user
         // message at construction time (that happens inside
@@ -495,6 +500,7 @@ export const run = async (options: RunOptions): Promise<number> => {
         const bootstrapInput: BootstrapInput = {
           prompt: '',
           ...(args.model !== undefined ? { modelId: args.model } : {}),
+          ...(args.noRecap === true ? { noRecap: true } : {}),
           signal: options.signal ?? new AbortController().signal,
           // Pipe --json through so bootstrap's first-boot governance
           // banner suppresses correctly for `agent recap --json`
@@ -506,6 +512,10 @@ export const run = async (options: RunOptions): Promise<number> => {
         };
         const result = await bootstrap(bootstrapInput);
         provider = result.config.provider;
+        recapEnabled = result.config.recapEnabled;
+        // `--model` (folded into the session provider above) wins over
+        // `[recap].render_model` — see `headlessRecapRenderModel`.
+        recapRenderModel = headlessRecapRenderModel(args.model, result.config.recapRenderModel);
         dbOverride = result.db;
         bootstrappedDbCloser = () => closeDb(result.db);
       } catch (e) {
@@ -568,6 +578,8 @@ export const run = async (options: RunOptions): Promise<number> => {
           // production.
           cwd: options.bootstrapOverride?.cwd ?? process.cwd(),
           provider,
+          ...(recapEnabled !== undefined ? { recapEnabled } : {}),
+          ...(recapRenderModel !== undefined ? { recapRenderModel } : {}),
           out: (s) => process.stdout.write(s),
           err: errSink,
         });
@@ -741,6 +753,7 @@ export const run = async (options: RunOptions): Promise<number> => {
     const bootstrapInput: BootstrapInput = {
       prompt: args.prompt,
       ...(args.model !== undefined ? { modelId: args.model } : {}),
+      ...(args.noRecap === true ? { noRecap: true } : {}),
       ...(args.maxSteps !== undefined ? { budget: { maxSteps: args.maxSteps } } : {}),
       ...(resumeFromSessionId !== undefined ? { resumeFromSessionId } : {}),
       ...(args.acceptBrokenChain === true ? { acceptBrokenChain: true } : {}),
@@ -771,6 +784,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       hookWarnings,
       memoryConfigWarnings,
       providersConfigWarnings,
+      recapConfigWarnings,
       budgetConfigWarnings,
       effortConfigWarnings,
       auditConfigWarnings,
@@ -868,6 +882,11 @@ export const run = async (options: RunOptions): Promise<number> => {
       // model didn't take effect.
       for (const w of providersConfigWarnings) {
         errSink(`forja: providers config: ${w}\n`);
+      }
+      // [recap] config warnings — an unknown render_model or bad
+      // enabled type shouldn't disappear silently.
+      for (const w of recapConfigWarnings) {
+        errSink(`forja: recap config: ${w}\n`);
       }
       // [budget] config warnings — same rationale: a numeric typo
       // or out-of-range value shouldn't disappear silently.

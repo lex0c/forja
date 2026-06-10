@@ -2,6 +2,165 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-10] feat(recap): `--model` render override, `[recap]` config, and `--no-recap` master switch
+
+Three operator knobs the spec advertised (§1/§8.2) or implied but the code never wired:
+
+- **`/recap --model <id>`** — override the LLM render model per call. Precedence: flag >
+  `[recap].render_model` config > the session's own provider (the runtime default was already the
+  session model, NOT Haiku as §8.2's cost note suggests — left as-is per operator decision). Unknown
+  id / factory failure (missing API key) warns and falls back to the session provider — recap never
+  breaks on a bad model id. The resolved model id is now part of the `recap_cache` key
+  (`canonicalScopeHash`) so a render by model A can't be served to a model-B request — a real
+  correctness leg `--model` introduces.
+- **`[recap]` config section** (`render_model`, `enabled`) — new loader `loadRecapConfig` mirroring
+  `[providers]` (project > user > default, registry-validated render_model, fail-soft warnings surfaced
+  on stderr). Threaded through bootstrap → `HarnessConfig`. Added to the scaffolded config template.
+- **`--no-recap` flag + `[recap].enabled=false` master switch** — disables the three automatic/cost
+  surfaces (session-end + Alt+R auto-display §3.3, resume auto-rehydrate §3.2, and LLM render — every
+  `/recap` stays deterministic) while keeping `/recap` usable. Gated in the loop on
+  `config.recapEnabled !== false` (optional field so the many HarnessConfig test fixtures keep
+  default-on).
+
+Spec updated: RECAP §1 (`--model` flag), §8.3 (`render_model` in the scope_hash), new §8.4
+(`[recap]` config + master switch + disable contract). Tests: loader (valid/unknown/non-bool),
+slash (`--model` parse error / unknown→fallback / known→override / `enabled=false`→deterministic),
+and the cache-key model leg.
+
+A self-review (10 findings, all fixed) hardened it: the real bug was the **headless `agent recap`**
+surface rebuilding its `SlashContext` from scratch — it dropped the bootstrap-resolved `recapEnabled`
+/ `recapRenderModel` (so `[recap].enabled=false` / `--no-recap` still LLM-rendered in CI) and used an
+empty model registry. Now `run.ts` threads both from `result.config` into `runRecapHeadless`, and the
+headless ctx uses `createDefaultRegistry()` (regression test added). Cleanups: extracted
+`resolveProviderFromId` (`src/providers/resolve.ts`, adopted in recap + bootstrap) and
+`validateModelIdField` (shared by the `[providers]` / `[recap]` loaders); a single `isRecapEnabled`
+predicate replaces three scattered `!== false` gates and owns the default-on policy (dropped the
+`DEFAULT_RECAP_CONFIG` double-default); `renderModel` sentinel unified to `undefined`; subagents pin
+`recapEnabled: false` (non-interactive, can't resume / run /recap); `--no-recap` added to `--help`.
+
+Follow-up: `agent recap pr --no-recap` was still broken — routing into the `recap` subcommand returns
+before the global `--no-recap` switch, and `parseRecapSubcommand` only consumed `--json`/`--model`,
+so the flag reached the slash parser as an unknown flag (error) instead of setting `args.noRecap`. The
+subcommand parser now consumes `--no-recap` at its boundary (like `--json`/`--model`), so the
+advertised headless deterministic-render switch actually works for `agent recap`.
+
+Follow-up 2: the REPL `Alt+R` idle handler still called `buildAutoTerse` unconditionally — the
+session-end and resume paths were gated on `isRecapEnabled` but Alt+R was not, so with recap disabled
+an operator could still press Alt+R and get a terse line (§3.3 lists Alt+R as part of the disabled
+auto-display surface). The handler now checks `isRecapEnabled(baseConfig)` first and warns ("recap
+terse: disabled") so the explicit keypress reports why nothing rendered.
+
+Follow-up 3: headless precedence inversion. `agent recap --model A` with `[recap].render_model = B`
+rendered with B, not A — `--model` is consumed top-level and folded into the session provider, so
+run.ts then threaded the config render model (B) on top, and the resolver chose B over the session
+provider (A), reversing the documented `--model > config > session` order. Extracted
+`headlessRecapRenderModel(argsModel, configRenderModel)` (pure, unit-tested): when `--model` was
+passed the config render model is suppressed, so the render falls back to the session provider (= the
+`--model` model).
+
+## [2026-06-10] fix(providers/anthropic): never send temperature + top_p together (current models 400)
+
+Found by running the recap LLM render against a real Haiku (the `errors[]` work below prompted a
+real-provider spot-check): EVERY recap LLM render (`pr`/`changelog`/`slack`/`terse`/`human`) was
+failing against current Anthropic models with HTTP 400 — "`temperature` and `top_p` cannot both be
+specified for this model. Please use only one." — and silently falling back to the deterministic
+path. The mocked provider in the unit tests accepts both params, so the whole LLM render surface was
+dead-on-arrival in production and no test caught it.
+
+Distinct from the existing `supports_sampling=false` gate (Opus 4.7 deprecated BOTH knobs entirely):
+Haiku 4.5 and the 4.x family accept sampling, they just reject the pair. recap's TOKEN_TUNING §9
+sampling sets `temperature: 0.2` AND `top_p: 0.95`, tripping it on every call.
+
+Fix lives in the Anthropic adapter (the translation layer — not in recap, which legitimately follows
+the spec's sampling values): a `samplingParams` helper forwards `temperature` only when both are
+present (Anthropic's recommended single knob), forwards `top_p` alone when temperature is absent, and
+strips both when `supports_sampling` is false. Applied to both the streaming and constrained paths.
+Three adapter tests (both-set→temperature-only on stream + constrained, top_p-alone preserved); the
+prior `supports_sampling=false` and temperature-only tests still pass. Spec updated: TOKEN_TUNING §9
+gains a note on the temperature+top_p-together rejection (the canonical table fixes both on every
+workflow, so this is table-wide, not recap-specific) and §10.1 lists the adapter's normalization.
+
+Verified end to end against real Haiku: after the fix, `/recap pr` and `/recap changelog` render
+successfully and FAITHFULLY over the error fixtures — the LLM pulls the real `errors[]` summaries
+(recovered + unrecovered) and hallucinates no files (empty `filesWritten` → no fabricated paths),
+which is also the validation for the `errors[]` work below.
+
+## [2026-06-10] feat(recap): wire errors[] from failure_events (projection + human + mini + 3 eval fixtures)
+
+The recap projection hardcoded `errors: []` with a comment claiming the `failure_events` table had
+not landed. It HAS — migration `041-failure-events.ts` plus a full repo (`listFailureEventsBySession`)
+have been present; the projection was simply never connected. So the entire error-recovered eval
+category (RECAP §11.3, 3 fixtures) was wrongly treated as upstream-blocked, and the §3 schema's
+`errors[]` and §3.1 `recap_mini.hasErrors` shipped permanently empty/false.
+
+Wired end to end:
+- **Projection** (`src/recap/projection.ts`): `errors[]` populated from `failure_events` filtered to
+  `user_visible = 1` (the forensic stream carries internal failures the operator never saw; recap is
+  narrative, not the forensic log — §0.7). Each row maps to `{ code, recovered, summary }`.
+  `recovered = recovery_action ∉ {fatal, pending_repair}` — every other action (`ignored`, `degraded`,
+  `retried_Nx`, `fallback_to_X`) left the session able to continue; unseen parameterized actions
+  default to recovered. `summary` is best-effort: the first conventional prose key
+  (`message`/`summary`/`reason`/`detail`) in the already-scrubbed `payload_json`, else empty (renderers
+  fall back to `code`). Windowed by `windowStart` for `/recap last N`, identical to subagents. Failures
+  also land on the timeline.
+- **human renderer**: new conditional `## Issues` section — the full retrospective shows BOTH recovered
+  and unrecovered failures with explicit state tags, so a fatal failure that ended the session is not
+  hidden. `pr`/`changelog` already curate to recovered-only for their audiences and were left as-is:
+  the projection is the complete source of truth, each renderer is a curated view (the subsystem's
+  whole philosophy).
+- **terse / slack renderers**: surface UNRECOVERED failures (recovered stay omitted for concision). A
+  self-review caught that the error fixtures exposed a latent honesty bug — over a fatally-failed
+  session both renderers read like success ("run the migration… 1s, $0.01" / "No actions recorded"),
+  because failed tool calls are excluded from the action counts and neither renderer read `errors[]`.
+  An unrecovered failure changes the meaning of the one-line/team-update summary, so it now appears
+  ("1 unresolved error(s)"); recovered-only sessions are unchanged (they succeeded).
+- **mini renderer**: `hasErrors` now a single indexed COUNT over `user_visible=1` failures (was
+  hardcoded `false`), honouring the <50ms list budget. Terminal `error` status alone does NOT flip it —
+  the signal is a user-visible failure row.
+
+**Spec alignment:** §3 is labelled "(canonical)" and carries `recovered: bool`, so both states are
+surfaceable; §5's parenthetical "(apenas user-visible, recovered)" contradicted that. With the
+operator's go-ahead the spec was clarified: §5's row now reads "recovered **e** não-recovered… o flag
+distingue, o renderer cura", §3's `errors` comment updated, and a new §4.7 documents the per-renderer
+curation policy (human/json = all, pr/changelog = recovered, terse/slack = unrecovered) that until now
+lived only in code.
+
+Tests: 5 projection cases (user-visible filter, recovered mapping across all six actions, empty-summary
+fallback, `last N` windowing), 2 human-renderer cases (Issues tags + omitted-when-empty), 3 mini cases
+(visible→true, non-visible→false, none→false, replacing the obsolete "always false" test), and 3 new
+eval fixtures (08 retry / 09 degraded+fallback / 10 recovered+fatal) with regenerated goldens reviewed
+by hand. Eval catalog now 10/15. Remaining recap debts: line deltas (`linesAdded/Removed`,
+`filesAffected`), `goalStack`/`notDone`/`webFetches`/`artifacts` projection, and a harness-driven
+integration test.
+
+## [2026-06-10] fix(recap): `--out` write failure no longer drops the `recap_runs` audit row
+
+A review of the recap subsystem surfaced an audit-completeness gap in the `/recap` slash command.
+The order was: render → write `--out` → return-on-error → record `recap_runs`. So when an `--out`
+write failed (EACCES / ENOSPC / ENOTDIR), the early return skipped `recordRecapRun`. On a cache-miss
+LLM render the tokens were already billed, so the spend vanished from `recap_runs` — precisely the
+under-reporting the audit table (RECAP §6.3) exists to catch.
+
+The write is now attempted first but its failure is **deferred** into `outWriteError`; the audit row
+is recorded unconditionally, then the deferred error is surfaced. `output_path` is threaded from the
+real write outcome — set to the path only when the bytes actually landed, NULL on failure — so the
+column never claims an artifact that does not exist (§6.3: "preenchido quando --out"). The pre-existing
+"record fails → warn and keep output" path is untouched (output integrity > audit integrity stays the
+deliberate trade-off).
+
+Two new slash-level tests close coverage gaps the review also flagged:
+- `--out` to an unwritable path (parent forced to a regular file → ENOTDIR, no permission dependency
+  so it holds under `/run/media`) → returns error AND audits the run with `output_path` NULL.
+- Provider error (offline / rate-limit) on the LLM path → the operationally dominant failure, until
+  now only unit-tested in the orchestrator. Asserts deterministic fallback (recap never breaks), the
+  `provider-error` warn, and an audit row with zero spend (`used_llm=0`, `prompt_version` NULL) — a
+  pre-call failure bills nothing.
+
+Scope note: the wider review also flagged the eval catalog at 7/15 fixtures (the error-recovered
+category blocked on `failure_events` landing), no harness-driven integration test, and several
+schema §3 fields still projected as stubs (`goalStack`/`errors`/`notDone`/`webFetches`/`artifacts`,
+line deltas, `filesAffected`). Those are tracked debts, not addressed here.
+
 ## [2026-06-10] fix(skills): skill_list re-scans disk so a mid-session hand-edit is visible
 
 The skill catalog is an in-memory snapshot built once at bootstrap; `read` re-reads bodies from

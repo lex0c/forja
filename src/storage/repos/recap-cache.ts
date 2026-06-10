@@ -59,6 +59,12 @@ export interface RecapCacheKeyInput {
   // to the same key (insertion-order independence is required:
   // SQLite row order is not stable).
   intermediate: unknown;
+  // Render model id. Part of the key because `/recap --model <id>`
+  // (and `[recap].render_model`) let the same scope+renderer+prompt
+  // be rendered by different models — without it, a render produced
+  // by model A would be served to a model-B request. Empty string
+  // for the deterministic/legacy path keeps old keys stable.
+  modelId?: string;
 }
 
 const sha256Hex = (input: string): string =>
@@ -111,6 +117,7 @@ export const canonicalScopeHash = (input: RecapCacheKeyInput): string => {
     sortedIds.join(NUL),
     input.renderer,
     input.promptVersion,
+    input.modelId ?? '',
     intermediateHash,
   ].join(NUL);
   return sha256Hex(composed);

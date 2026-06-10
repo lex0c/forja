@@ -35,6 +35,8 @@
 
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { isRecapEnabled } from '../../../harness/types.ts';
+import { resolveProviderFromId } from '../../../providers/resolve.ts';
 import type { Provider } from '../../../providers/types.ts';
 import { renderChangelogDeterministic } from '../../../recap/changelog/index.ts';
 import { renderChangelogViaLlm } from '../../../recap/changelog/llm.ts';
@@ -111,6 +113,10 @@ interface ParsedRecap {
   // `range` scopes; emitted as a parse error on every other form
   // (single-session recaps have nothing to fan out across).
   allProjects: boolean;
+  // `--model <id>` override for the LLM render (RECAP §8.2).
+  // undefined → render uses `[recap].render_model` config, else the
+  // session provider. Ignored on deterministic / `--no-llm-render`.
+  renderModel: string | undefined;
 }
 
 const positiveInt = (raw: string): number | null => {
@@ -146,6 +152,7 @@ interface FlagSplit {
   noLlmRender: boolean;
   outPath: string | null;
   allProjects: boolean;
+  renderModel: string | undefined;
   flagError: string | null;
 }
 
@@ -157,12 +164,14 @@ const splitFlags = (args: string[]): FlagSplit => {
   let noLlmRender = false;
   let outPath: string | null = null;
   let allProjects = false;
+  let renderModel: string | undefined;
   const flagError: string | null = null;
   const fail = (msg: string): FlagSplit => ({
     positional,
     noLlmRender,
     outPath,
     allProjects,
+    renderModel,
     flagError: msg,
   });
   for (let i = 0; i < args.length; i++) {
@@ -207,12 +216,27 @@ const splitFlags = (args: string[]): FlagSplit => {
       outPath = value;
       continue;
     }
+    if (arg === '--model') {
+      const next = args[i + 1];
+      if (next === undefined || next.length === 0 || next.startsWith('-')) {
+        return fail('/recap: --model requires a model id (e.g. anthropic/claude-haiku-4-5)');
+      }
+      renderModel = next;
+      i += 1;
+      continue;
+    }
+    if (arg?.startsWith('--model=') === true) {
+      const value = arg.slice('--model='.length);
+      if (value.length === 0) return fail('/recap: --model= requires a model id');
+      renderModel = value;
+      continue;
+    }
     if (arg?.startsWith('--') === true) {
       return fail(`/recap: unknown flag '${arg}'`);
     }
     if (arg !== undefined) positional.push(arg);
   }
-  return { positional, noLlmRender, outPath, allProjects, flagError };
+  return { positional, noLlmRender, outPath, allProjects, renderModel, flagError };
 };
 
 // YYYY-MM-DD strict parse → epoch ms at UTC midnight. Mirrors the
@@ -257,6 +281,7 @@ const parseRecapArgs = (
     noLlmRender: split.noLlmRender,
     outPath: split.outPath,
     allProjects: split.allProjects,
+    renderModel: split.renderModel,
   };
   if (positional.length === 0) {
     if (split.allProjects) {
@@ -629,15 +654,18 @@ export const runRecapSession = async (
 
   const renderResult = await renderWithLlmOrFallback(parsed, intermediate, ctx);
 
+  // Attempt the `--out` write first, but DEFER surfacing its
+  // failure until after the audit row is recorded. The render has
+  // already executed and — on a cache-miss LLM path — already
+  // billed tokens; returning early on an `--out` write error
+  // without recording would drop that spend from `recap_runs`,
+  // the exact under-reporting the audit table exists to prevent.
+  let outWriteError: string | null = null;
   if (parsed.outPath !== null) {
     try {
       await writeOutFile(parsed.outPath, renderResult.output);
     } catch (e) {
-      const reason = e instanceof Error ? e.message : String(e);
-      return {
-        kind: 'error',
-        message: `/recap: failed to write --out '${parsed.outPath}': ${reason}`,
-      };
+      outWriteError = e instanceof Error ? e.message : String(e);
     }
   }
 
@@ -647,7 +675,12 @@ export const runRecapSession = async (
       sessionIds: intermediate.scope.sessionIds,
       renderer: parsed.format,
       usedLlm: renderResult.usedLlm,
-      outputPath: parsed.outPath,
+      // Record the path only when the bytes actually landed. A
+      // failed `--out` produced no file, so reporting it under
+      // `output_path` (RECAP §6.3: "preenchido quando --out")
+      // would make the audit row claim an artifact that does not
+      // exist.
+      outputPath: outWriteError === null ? parsed.outPath : null,
       createdAt: ctx.now(),
       costUsd: renderResult.costUsd,
       tokensIn: renderResult.tokensIn,
@@ -662,6 +695,14 @@ export const runRecapSession = async (
       ts: ctx.now(),
       message: `/recap: audit row not written (${reason}); output is intact`,
     });
+  }
+
+  // Now that spend is recorded, surface the `--out` failure.
+  if (outWriteError !== null) {
+    return {
+      kind: 'error',
+      message: `/recap: failed to write --out '${parsed.outPath}': ${outWriteError}`,
+    };
   }
 
   return {
@@ -731,13 +772,42 @@ const renderWithLlmOrFallback = async (
   ctx: SlashContext,
 ): Promise<RenderOutcome> => {
   const renderOptions = buildRenderOptions(intermediate);
-  // Non-LLM renderers (human, json) and explicit opt-out always
-  // take the deterministic template path.
-  if (!isLlmRenderer(parsed.format) || parsed.noLlmRender) {
+  // Non-LLM renderers (human, json), explicit opt-out, and the
+  // `[recap].enabled=false` / `--no-recap` master switch all take
+  // the deterministic template path. The master switch makes every
+  // `/recap` deterministic (no Haiku/model cost) while keeping the
+  // command usable (RECAP §3.2/§3.3 disable contract).
+  if (!isLlmRenderer(parsed.format) || parsed.noLlmRender || !isRecapEnabled(ctx.baseConfig)) {
     return deterministicOutcome(renderForFormat(parsed.format, intermediate, renderOptions));
   }
 
-  const provider = ctx.baseConfig.provider;
+  // Render model: `--model` flag > `[recap].render_model` config >
+  // the session's own provider. An unknown id or a factory failure
+  // (e.g. missing API key for the override's family) warns and
+  // falls back to the session provider — recap never breaks on a
+  // bad model id.
+  let provider = ctx.baseConfig.provider;
+  const overrideId = parsed.renderModel ?? ctx.baseConfig.recapRenderModel;
+  if (overrideId !== undefined && overrideId !== provider.id) {
+    const resolved = resolveProviderFromId(ctx.modelRegistry, overrideId);
+    if (resolved.ok) {
+      provider = resolved.provider;
+    } else {
+      // Unknown id or factory failure (e.g. missing API key for the
+      // override's family) → warn and keep the session provider.
+      // recap never breaks on a bad model id.
+      const why =
+        resolved.kind === 'unknown'
+          ? 'unknown model'
+          : `could not be initialized (${resolved.message})`;
+      ctx.bus.emit({
+        type: 'warn',
+        ts: ctx.now(),
+        message: `/recap: --model '${overrideId}' ${why}; rendering with the session model ${provider.id}`,
+      });
+    }
+  }
+
   // Provider can't constrain output natively → straight to the
   // renderer's deterministic fallback. No warn — the operator did
   // not opt into the LLM path explicitly; they just chose
@@ -755,6 +825,10 @@ const renderWithLlmOrFallback = async (
     renderer: parsed.format,
     promptVersion: dispatch.promptVersion,
     intermediate,
+    // The resolved render model is part of the cache identity —
+    // a render produced by model A must not be served to a
+    // model-B request.
+    modelId: provider.id,
   });
 
   // Cache check. A hit short-circuits the LLM call entirely.

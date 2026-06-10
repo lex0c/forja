@@ -6,6 +6,7 @@ import { migrate } from '../../src/storage/migrate.ts';
 import { recordApproval } from '../../src/storage/repos/approvals.ts';
 import { insertCheckpoint } from '../../src/storage/repos/checkpoints.ts';
 import { createPin } from '../../src/storage/repos/context-pins.ts';
+import { appendFailureEvent } from '../../src/storage/repos/failure-events.ts';
 import { createMemoryEvent } from '../../src/storage/repos/memory-events.ts';
 import { appendMessage } from '../../src/storage/repos/messages.ts';
 import { type Session, completeSession, createSession } from '../../src/storage/repos/sessions.ts';
@@ -82,6 +83,38 @@ const addToolCall = (
     error: status === 'error' ? 'boom' : null,
   });
   return tc.id;
+};
+
+// Seed a failure_events row. The projection reads code /
+// recovery_action / user_visible / payload_json / created_at and
+// never walks the chain, so fixed placeholder chain hashes are
+// fine here.
+let failureSeq = 0;
+const addFailure = (
+  sessionId: string,
+  opts: {
+    code?: string;
+    classe?: string;
+    recoveryAction?: string;
+    userVisible?: 0 | 1;
+    payload?: Record<string, unknown> | null;
+    createdAt?: number;
+  } = {},
+): void => {
+  failureSeq += 1;
+  appendFailureEvent(db, {
+    id: `fail${String(failureSeq).padStart(4, '0')}-0000-0000-0000-000000000000`,
+    session_id: sessionId,
+    step_id: null,
+    code: opts.code ?? 'provider.timeout',
+    classe: opts.classe ?? 'provider',
+    recovery_action: opts.recoveryAction ?? 'retried_3x',
+    user_visible: opts.userVisible ?? 1,
+    payload_json: opts.payload === undefined ? null : JSON.stringify(opts.payload),
+    created_at: opts.createdAt ?? 1_400,
+    prev_chain_hash: 'seed-prev',
+    this_chain_hash: `seed-this-${failureSeq}`,
+  });
 };
 
 describe('projectRecap', () => {
@@ -1528,5 +1561,102 @@ describe('projectRecap', () => {
         }),
       ).not.toThrow();
     }
+  });
+});
+
+describe('projectRecap — errors[] from failure_events', () => {
+  test('surfaces user-visible failures with code, recovered flag, and summary', () => {
+    const s = seedSession();
+    addUserTurn(s.id, 'deploy the thing');
+    addFailure(s.id, {
+      code: 'provider.rate_limit',
+      recoveryAction: 'retried_3x',
+      payload: { message: 'rate limited by upstream; backed off' },
+      createdAt: 1_400,
+    });
+    const out = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+      now: 5_000,
+    });
+    expect(out.errors).toEqual([
+      {
+        code: 'provider.rate_limit',
+        recovered: true,
+        summary: 'rate limited by upstream; backed off',
+      },
+    ]);
+    // The failure also lands on the timeline for narrative ordering.
+    expect(
+      out.timeline.some((e) => e.event === 'failure' && e.detail === 'provider.rate_limit'),
+    ).toBe(true);
+  });
+
+  test('excludes non-user-visible failures (forensic-only stream)', () => {
+    const s = seedSession();
+    addUserTurn(s.id, 'do thing');
+    addFailure(s.id, { code: 'storage.lock_contention', userVisible: 0 });
+    const out = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+    });
+    expect(out.errors).toEqual([]);
+  });
+
+  test('recovered flag: fatal and pending_repair are unrecovered, the rest recovered', () => {
+    const s = seedSession();
+    addUserTurn(s.id, 'do thing');
+    addFailure(s.id, { code: 'a.fatal', recoveryAction: 'fatal', createdAt: 1_401 });
+    addFailure(s.id, { code: 'b.pending', recoveryAction: 'pending_repair', createdAt: 1_402 });
+    addFailure(s.id, { code: 'c.ignored', recoveryAction: 'ignored', createdAt: 1_403 });
+    addFailure(s.id, { code: 'd.degraded', recoveryAction: 'degraded', createdAt: 1_404 });
+    addFailure(s.id, { code: 'e.retried', recoveryAction: 'retried_5x', createdAt: 1_405 });
+    addFailure(s.id, {
+      code: 'f.fallback',
+      recoveryAction: 'fallback_to_anthropic_haiku',
+      createdAt: 1_406,
+    });
+    const out = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+    });
+    const byCode = new Map(out.errors.map((e) => [e.code, e.recovered]));
+    expect(byCode.get('a.fatal')).toBe(false);
+    expect(byCode.get('b.pending')).toBe(false);
+    expect(byCode.get('c.ignored')).toBe(true);
+    expect(byCode.get('d.degraded')).toBe(true);
+    expect(byCode.get('e.retried')).toBe(true);
+    expect(byCode.get('f.fallback')).toBe(true);
+  });
+
+  test('summary falls back to empty when payload has no conventional prose key', () => {
+    const s = seedSession();
+    addUserTurn(s.id, 'do thing');
+    addFailure(s.id, { code: 'x.nodetail', payload: { approval_seq: 7 } });
+    addFailure(s.id, { code: 'y.nopayload', payload: null });
+    const out = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+    });
+    expect(out.errors.every((e) => e.summary === '')).toBe(true);
+  });
+
+  test('/recap last N windows failures by the kept slice, like subagents', () => {
+    const s = seedSession();
+    // Two real prompts; the failure on the first step must drop
+    // out of a `last 1` window.
+    const u1 = addUserTurn(s.id, 'first step', 1_100);
+    addAssistantTurn(s.id, u1, 'working on first', { ts: 1_150 });
+    addFailure(s.id, { code: 'old.failure', createdAt: 1_160 });
+    const u2 = addUserTurn(s.id, 'second step', 2_100);
+    addAssistantTurn(s.id, u2, 'working on second', { ts: 2_150 });
+    addFailure(s.id, { code: 'recent.failure', createdAt: 2_160 });
+
+    const windowed = projectRecap(db, {
+      scope: { kind: 'session_current', sessionId: s.id, limit: 1 },
+    });
+    expect(windowed.errors.map((e) => e.code)).toEqual(['recent.failure']);
+
+    // Full scope sees both.
+    const full = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+    });
+    expect(full.errors.map((e) => e.code).sort()).toEqual(['old.failure', 'recent.failure']);
   });
 });

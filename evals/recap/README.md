@@ -31,14 +31,19 @@ evals/recap/
 | 05 | `05-incomplete-session.ts` | non-terminal session callout |
 | 06 | `06-cross-day-single.ts` | scope=day; two same-cwd same-day sessions aggregated |
 | 07 | `07-cross-day-range.ts` | scope=range; 3 days × 1 session, half-open window excludes day 4 |
+| 08 | `08-error-recovered-retry.ts` | errors[]: single recovered failure (retried_Nx) with payload summary |
+| 09 | `09-error-recovered-fallback.ts` | errors[]: two recovered failures (degraded + fallback); one empty-summary fallback |
+| 10 | `10-error-fatal-mixed.ts` | errors[]: recovered + fatal in one session; human shows both, changelog/pr curate to recovered-only, terse/slack surface the unrecovered one |
 
 §11.3 target is 15 fixtures (5 read-only + 5 write + 3 error-
-recovered + 2 cross-day). The current 7 cover read-only (01),
-write (02 / 03 / 04), incomplete (05), and both cross-day shapes
-(06 / 07). The 3 error-recovered category is blocked on
-`failure_events` table landing upstream — the projection's
-`errors[]` field stays `[]` until then. Padding fixtures for read-
-only / write categories (to reach 5 each) are deferred as
+recovered + 2 cross-day). The current 10 cover read-only (01),
+write (02 / 03 / 04), incomplete (05), both cross-day shapes
+(06 / 07), and the full error-recovered category (08 / 09 / 10).
+The error fixtures exercise every `recovery_action` shape
+(`retried_Nx`, `degraded`, `fallback_to_X`, `fatal`,
+`pending_repair` is unit-covered in `projection.test.ts`) and both
+`recovered` states. Padding fixtures for read-only / write
+categories (to reach 5 each) are deferred as
 "add-a-shape-when-the-shape-changes"; they would be useful when a
 new categorization (pure-add vs pure-delete file writes, etc.)
 needs explicit eval coverage.

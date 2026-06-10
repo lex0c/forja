@@ -137,6 +137,30 @@ describe('projectTerseDeterministic', () => {
     expect(result.sentence).toContain('4m32s');
     expect(result.sentence).toContain('$0.04');
   });
+
+  test('surfaces unrecovered failures but omits recovered ones', () => {
+    const result = projectTerseDeterministic(
+      baseIntermediate({
+        goal: { text: 'run the migration', sourceStepId: 'st' },
+        errors: [
+          { code: 'storage.reset', recovered: true, summary: 'retried' },
+          { code: 'storage.migration_failed', recovered: false, summary: 'aborted' },
+        ],
+      }),
+    );
+    // Only the unrecovered one changes the headline.
+    expect(result.sentence).toContain('1 unresolved error(s)');
+  });
+
+  test('a session with only recovered failures reads as success (no error clause)', () => {
+    const result = projectTerseDeterministic(
+      baseIntermediate({
+        goal: { text: 'tighten backoff', sourceStepId: 'st' },
+        errors: [{ code: 'provider.rate_limit', recovered: true, summary: 'backed off' }],
+      }),
+    );
+    expect(result.sentence).not.toContain('unresolved error');
+  });
 });
 
 describe('renderTerseFromStructured', () => {

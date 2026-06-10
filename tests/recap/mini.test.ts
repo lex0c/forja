@@ -8,6 +8,7 @@ import {
 } from '../../src/recap/mini/index.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
+import { appendFailureEvent } from '../../src/storage/repos/failure-events.ts';
 import { appendMessage } from '../../src/storage/repos/messages.ts';
 import { completeSession, createSession } from '../../src/storage/repos/sessions.ts';
 import { createToolCall, finishToolCall } from '../../src/storage/repos/tool-calls.ts';
@@ -190,11 +191,45 @@ describe('projectRecapMini', () => {
     expect(result.filesChanged).toBe(0);
   });
 
-  test('hasErrors is false today (failure_events upstream not wired)', () => {
+  const seedFailure = (sessionId: string, userVisible: 0 | 1, n: number): void => {
+    appendFailureEvent(db, {
+      id: `mfail${String(n).padStart(3, '0')}-0000-0000-0000-000000000000`,
+      session_id: sessionId,
+      step_id: null,
+      code: 'provider.timeout',
+      classe: 'provider',
+      recovery_action: 'retried_3x',
+      user_visible: userVisible,
+      payload_json: null,
+      created_at: 1_400,
+      prev_chain_hash: 'seed-prev',
+      this_chain_hash: `seed-this-${n}`,
+    });
+  };
+
+  test('hasErrors true when the session has a user-visible failure', () => {
     const s = createSession(db, { model: 'sonnet', cwd: '/p', startedAt: 1_000 });
+    seedFailure(s.id, 1, 1);
     completeSession(db, s.id, 'error', 0, true, 1_500);
     const result = projectRecapMini(db, { sessionId: s.id });
+    expect(result.hasErrors).toBe(true);
+  });
+
+  test('hasErrors false when failures exist but none are user-visible', () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/p', startedAt: 1_000 });
+    seedFailure(s.id, 0, 2);
+    completeSession(db, s.id, 'error', 0, true, 1_500);
+    const result = projectRecapMini(db, { sessionId: s.id });
+    // `error` status alone does not flip hasErrors — the signal is
+    // a user-visible failure_events row, not the terminal status.
     expect(result.status).toBe('error');
+    expect(result.hasErrors).toBe(false);
+  });
+
+  test('hasErrors false when the session has no failure_events', () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/p', startedAt: 1_000 });
+    completeSession(db, s.id, 'done', 0, true, 1_500);
+    const result = projectRecapMini(db, { sessionId: s.id });
     expect(result.hasErrors).toBe(false);
   });
 

@@ -162,6 +162,7 @@ const makeBootstrapStub = (
     hookWarnings: [],
     memoryConfigWarnings: [] as readonly string[],
     providersConfigWarnings: [] as readonly string[],
+    recapConfigWarnings: [] as readonly string[],
     budgetConfigWarnings: [] as readonly string[],
     effortConfigWarnings: [] as readonly string[],
     auditConfigWarnings: [] as readonly string[],
@@ -4959,6 +4960,38 @@ describe('repl — Alt+R recap terse (RECAP §3.3)', () => {
     await flushFrame();
     const after = writes.slice(before).join('');
     expect(after).toContain('no session yet');
+    expect(listRecentRecapRuns(stub.db, 10)).toHaveLength(0);
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('Alt+R with recap disabled warns and renders nothing (master switch)', async () => {
+    // RECAP §3.3: Alt+R is part of auto-display, one of the three
+    // surfaces the recap master switch disables. With recapEnabled
+    // false the keypress must not project a terse line — the disable
+    // check precedes the no-session check, so the operator gets the
+    // "disabled" warn even before any turn finishes.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const stub = makeBootstrapStub();
+    (stub.config as { recapEnabled?: boolean }).recapEnabled = false;
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    const before = writes.length;
+    stdin.feed('\x1br'); // Alt+R
+    await flushFrame();
+    const after = writes.slice(before).join('');
+    expect(after).toContain('disabled');
+    expect(after).not.toContain('no session yet');
     expect(listRecentRecapRuns(stub.db, 10)).toHaveLength(0);
     stdin.feed('\x04');
     expect(await promise).toBe(130);

@@ -85,6 +85,44 @@ describe('canonicalScopeHash', () => {
     expect(base).not.toBe(mutated);
   });
 
+  test('changing the render model produces a different hash (no cross-model serve)', () => {
+    const base = canonicalScopeHash({
+      scopeKind: 'session_specific',
+      sessionIds: ['s-1'],
+      renderer: 'pr',
+      promptVersion: 'pr-v1',
+      intermediate: SAMPLE_INTERMEDIATE,
+      modelId: 'anthropic/claude-haiku-4-5',
+    });
+    const other = canonicalScopeHash({
+      scopeKind: 'session_specific',
+      sessionIds: ['s-1'],
+      renderer: 'pr',
+      promptVersion: 'pr-v1',
+      intermediate: SAMPLE_INTERMEDIATE,
+      modelId: 'anthropic/claude-opus-4-8',
+    });
+    expect(base).not.toBe(other);
+    // Omitting modelId stays stable with the legacy/deterministic
+    // empty-string default (no spurious miss for existing entries).
+    const legacy1 = canonicalScopeHash({
+      scopeKind: 'session_specific',
+      sessionIds: ['s-1'],
+      renderer: 'pr',
+      promptVersion: 'pr-v1',
+      intermediate: SAMPLE_INTERMEDIATE,
+    });
+    const legacy2 = canonicalScopeHash({
+      scopeKind: 'session_specific',
+      sessionIds: ['s-1'],
+      renderer: 'pr',
+      promptVersion: 'pr-v1',
+      intermediate: SAMPLE_INTERMEDIATE,
+      modelId: '',
+    });
+    expect(legacy1).toBe(legacy2);
+  });
+
   test('changing the renderer produces a different hash', () => {
     const a = canonicalScopeHash({
       scopeKind: 'session_specific',

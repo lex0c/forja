@@ -110,6 +110,32 @@ describe('projectSlackDeterministic', () => {
     expect(projectSlackDeterministic(baseIntermediate()).title).toBe('Recap');
   });
 
+  test('unrecovered failure surfaces instead of the "No actions" sentinel', () => {
+    const result = projectSlackDeterministic(
+      baseIntermediate({
+        errors: [{ code: 'storage.migration_failed', recovered: false, summary: 'aborted' }],
+      }),
+    );
+    expect(result.achievements).toContain('1 unresolved error(s)');
+    expect(result.achievements).not.toContain('No actions recorded for this scope');
+  });
+
+  test('a recovered-only failure does not surface (run continued)', () => {
+    const result = projectSlackDeterministic(
+      baseIntermediate({
+        actions: {
+          filesRead: [],
+          filesWritten: [{ path: '/p/x.ts', linesAdded: 1, linesRemoved: 0, semanticSummary: '' }],
+          commandsRun: [],
+          webFetches: [],
+          subagentsSpawned: [],
+        },
+        errors: [{ code: 'provider.rate_limit', recovered: true, summary: 'backed off' }],
+      }),
+    );
+    expect(result.achievements.join(' ')).not.toContain('unresolved error');
+  });
+
   test('title takes the first line of the goal', () => {
     const result = projectSlackDeterministic(
       baseIntermediate({

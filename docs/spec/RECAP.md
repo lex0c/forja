@@ -43,6 +43,7 @@ Filtros de `/recap list` (mesmos de `agent --list-sessions`):
 Flags universais:
 - `--out <path>` — escreve em arquivo (default: stdout)
 - `--no-llm-render` — força modo determinístico (sem LLM)
+- `--model <id>` — modelo do render LLM (override por-call; precede `[recap].render_model` e o modelo da sessão; id desconhecido avisa e cai no modelo da sessão — §8.2)
 - `--include-tool-output` — inclui output completo de tools (default: omite, só metadata)
 - `--limit <N>` — corta a N steps mais relevantes
 - `--lang pt|en` — idioma de renderização
@@ -131,7 +132,7 @@ recap_intermediate:
     duration_ms: int
     model: string
     cache_hit_ratio: float
-  errors:                            # falhas tratadas que valem mencionar
+  errors:                            # falhas user-visible (failure_events); recovered E não-recovered, distinguidas pelo flag
     - { code: string, recovered: bool, summary: string }
   not_done:                          # honestidade epistêmica (de subagent_outputs.not_done, schema de playbooks, etc)
     - { what: string, reason: string }
@@ -329,6 +330,18 @@ Refactored queue retry logic — extracted `computeBackoff` to pure function wit
 
 Útil pra footer / status line / commit body.
 
+### 4.7 Curadoria de `errors[]` por renderer
+
+A projeção popula `errors[]` **completo** — toda falha `user_visible=1`, recovered e não-recovered. Cada renderer decide o que é relevante pro seu público: a projeção é source of truth, o renderer é vista (§0.1). A regra é uniforme em §0.6 — **nenhuma surface pode ler como sucesso sobre uma sessão que terminou em falha não-recuperada**.
+
+| Renderer | Mostra | Por quê |
+|---|---|---|
+| `human` / `json` | **todas** (com flag `recovered`) | retrospecto completo; esconder uma falha fatal que encerrou a sessão engana o operador |
+| `pr` / `changelog` | apenas **recovered** | descrição de mudança / entry user-facing fala do que foi feito — uma falha fatal não é um `Fixed` nem uma nota de PR |
+| `terse` / `slack` | apenas **não-recovered** | a linha-resumo muda de sentido se a sessão falhou; uma falha recuperada não alterou o desfecho, então é omitida por concisão |
+
+Falhas tratadas pelo harness mas **não** user-visible (stream forense de `failure_events`, `FAILURE_MODES.md §19`) nunca entram em `errors[]` — recap é narrativa, não o log forense (§0.7).
+
 ---
 
 ## 5. Source of truth (o que é carregado de onde)
@@ -346,7 +359,7 @@ Refactored queue retry logic — extracted `computeBackoff` to pure function wit
 | `outcomes.tests_run` | heurística sobre `bash` commands matching test runners |
 | `outcomes.checkpoints` | tabela `checkpoints` |
 | `costs` | agregado de `messages.tokens_*` + custo por modelo |
-| `errors` | `failure_events` (apenas user-visible, recovered) |
+| `errors` | `failure_events` com `user_visible=1` — recovered **e** não-recovered (`recovered = recovery_action ∉ {fatal, pending_repair}`); o flag distingue, o renderer cura (§4.7) |
 | `not_done` | extraído de subagent outputs + playbook reports + assistant messages com explicit "not done" markers |
 | `memory_proposed` | tabela `memory_events` (action='proposed') |
 
@@ -503,9 +516,12 @@ CREATE INDEX recap_cache_expires ON recap_cache(expires_at);
 scope_hash = sha256(
   scope_kind || \0 || sorted(session_ids).join(\0) || \0 ||
   renderer   || \0 || prompt_version          || \0 ||
+  render_model || \0 ||
   sha256(canonicalize(intermediate))
 )
 ```
+
+`render_model` na chave é correctness, não cosmético: `--model` / `[recap].render_model` deixam o mesmo escopo+renderer+prompt ser renderizado por modelos diferentes — sem isso, um render do modelo A seria servido a um request do modelo B. String vazia no path determinístico/legado mantém chaves antigas estáveis.
 
 `canonicalize(intermediate)` é `JSON.stringify` com chaves ordenadas lexicograficamente (helper único em `src/storage/json-safe.ts`). Hash de conteúdo é necessário, não cosmético: sem ele, `/recap pr` no step 5 cacheia um render que continuaria sendo servido após o usuário rodar mais 3 steps na mesma sessão, e o cache devolveria um render obsoleto. Com ele, qualquer mudança no audit log que afete a projeção produz miss novo. TTL de 1h vira **eviction** (limita o tamanho da tabela), não mecanismo de correctness.
 
@@ -514,6 +530,24 @@ scope_hash = sha256(
 Custos: o sha256 do intermediate é O(tamanho-do-intermediate); ~5–10ms num intermediate típico (~50 KB JSON). Re-executar `/recap` em sessão ativa nos últimos 1h sem mudança intermediária: hit do cache, ~10ms total. Com mudança: miss, render LLM completo, escrita.
 
 Re-executar `/recap` em sessão ativa nos últimos 1h sem alterações no audit log: hit do cache, ~10ms.
+
+### 8.4 Configuração & master switch (`[recap]` / `--no-recap`)
+
+Seção `[recap]` no `config.toml` (camadas project > user > default, mesma mecânica de `[providers]`/`[budget]`):
+
+```toml
+[recap]
+render_model = "anthropic/claude-haiku-4-5"   # modelo default do render LLM; validado contra o registry
+enabled = true                                 # master switch; default true
+```
+
+- **`render_model`** — default do render LLM (`pr`/`changelog`/`slack`/`terse`/`human`). Precedência: `--model` (por-call) > `[recap].render_model` > **modelo da sessão**. Id desconhecido **avisa no boot** e é ignorado (fallback ao modelo da sessão); o runtime não força Haiku — §8.2 cita Haiku como recomendação de custo, mas o default é o modelo da sessão.
+- **`enabled = false`** (ou a flag global **`--no-recap`**, que precede a config) é um **master switch** que desliga as **três** superfícies automáticas/de custo, mantendo `/recap` explícito usável:
+  1. **auto-display** (linha terse no fim da sessão + `Alt+R`, §3.3) — não emitida;
+  2. **resume auto-rehydrate** (bloco `[resume_context]`, §3.2) — não injetado;
+  3. **render LLM** — todo `/recap` cai no determinístico (sem custo de modelo).
+
+Valores inválidos (`render_model` desconhecido, `enabled` não-booleano) **degradam com warning** no stderr (mesma postura fail-soft dos outros loaders), nunca abortam o boot.
 
 ---
 

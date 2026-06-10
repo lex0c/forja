@@ -8,6 +8,7 @@ import {
   loadEffortConfig,
   loadMemoryConfig,
   loadProvidersConfig,
+  loadRecapConfig,
   loadSandboxConfig,
   projectConfigPath,
   userConfigPath,
@@ -420,6 +421,67 @@ verify_semantic_llm = false
     } finally {
       rmSync(cwd, { recursive: true, force: true });
       rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('loadRecapConfig', () => {
+  const writeProjectRecap = (cwd: string, body: string): void => {
+    mkdirSync(join(cwd, '.agent'), { recursive: true });
+    writeFileSync(join(cwd, '.agent', 'config.toml'), body);
+  };
+
+  test('returns empty config + no warnings when no [recap] section', () => {
+    const cwd = makeTempCwd();
+    try {
+      const result = loadRecapConfig({ cwd, registry: stubRegistry([]), env: { HOME: '/none' } });
+      expect(result.config.renderModel).toBeUndefined();
+      expect(result.config.enabled).toBeUndefined();
+      expect(result.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('reads render_model + enabled and validates render_model against the registry', () => {
+    const cwd = makeTempCwd();
+    try {
+      writeProjectRecap(
+        cwd,
+        '[recap]\nrender_model = "anthropic/claude-haiku-4-5"\nenabled = false\n',
+      );
+      const reg = stubRegistry(['anthropic/claude-haiku-4-5']);
+      const result = loadRecapConfig({ cwd, registry: reg, env: { HOME: '/none' } });
+      expect(result.config.renderModel).toBe('anthropic/claude-haiku-4-5');
+      expect(result.config.enabled).toBe(false);
+      expect(result.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('unknown render_model warns and is ignored', () => {
+    const cwd = makeTempCwd();
+    try {
+      writeProjectRecap(cwd, '[recap]\nrender_model = "anthropic/typo"\n');
+      const reg = stubRegistry(['anthropic/claude-haiku-4-5']);
+      const result = loadRecapConfig({ cwd, registry: reg, env: { HOME: '/none' } });
+      expect(result.config.renderModel).toBeUndefined();
+      expect(result.warnings[0]).toContain('not a known model');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('non-boolean enabled warns and is ignored', () => {
+    const cwd = makeTempCwd();
+    try {
+      writeProjectRecap(cwd, '[recap]\nenabled = "yes"\n');
+      const result = loadRecapConfig({ cwd, registry: stubRegistry([]), env: { HOME: '/none' } });
+      expect(result.config.enabled).toBeUndefined();
+      expect(result.warnings[0]).toContain('must be a boolean');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
     }
   });
 });

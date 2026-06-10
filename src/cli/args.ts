@@ -23,6 +23,10 @@ export interface ParsedArgs {
   // still prompt; toggle at runtime with Shift+Tab. Distinct from the
   // execution `profile` (autonomous/orchestrated/hybrid, §5.2).
   autonomous?: boolean;
+  // `--no-recap`: disable the recap master switch for this run
+  // (suppresses session-end/Alt+R auto-display, resume
+  // auto-rehydrate, and forces deterministic `/recap` render).
+  noRecap?: boolean;
   // List-sessions mode (AGENTIC_CLI §2.1): print known sessions
   // (newest first) and exit. Honors --json for headless consumers.
   listSessions: boolean;
@@ -630,6 +634,7 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
   if (argv.length === 0 || argv[0] !== 'recap') return null;
   let json = false;
   let model: string | undefined;
+  let noRecap = false;
   const recapArgs: string[] = [];
   let i = 1;
   while (i < argv.length) {
@@ -687,6 +692,19 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
       i += 1;
       continue;
     }
+    if (token === '--no-recap') {
+      // Master switch (RECAP §3.2/§3.3). The global `--no-recap`
+      // case in the main parser is unreachable here — routing into
+      // `recap` returns before it — so consume it at the subcommand
+      // boundary like `--json`/`--model`. bootstrap reads
+      // `args.noRecap` and forces `recapEnabled=false`, which
+      // run.ts threads into the headless render → deterministic.
+      // Leaving it in `recapArgs` would surface it as an unknown
+      // flag in the slash-side parser.
+      noRecap = true;
+      i += 1;
+      continue;
+    }
     // Every other token — including recap-specific flags
     // (`--no-llm-render`, `--out`, `--limit`, `--project`, etc.)
     // and positional subcommand verbs (`pr`, `last`, `session`,
@@ -709,6 +727,7 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
       yes: false,
       recap: { args: recapArgs },
       ...(model !== undefined ? { model } : {}),
+      ...(noRecap ? { noRecap: true } : {}),
     },
   };
 };
@@ -1619,6 +1638,10 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         args.autonomous = true;
         i += 1;
         break;
+      case '--no-recap':
+        args.noRecap = true;
+        i += 1;
+        break;
       case '--list-sessions':
         args.listSessions = true;
         i += 1;
@@ -2218,6 +2241,7 @@ export const usage = (): string =>
     '  --help, -h             Show this help and exit',
     '  --json                 Emit NDJSON events to stdout (headless)',
     '  --autonomous           Start in Autonomous mode: auto-approve routine confirms (Shift+Tab toggles)',
+    '  --no-recap             Disable recap for this run: no session-end/Alt+R auto-display, no resume rehydrate, deterministic /recap render',
     '  --list-sessions        Print known sessions (newest first) and exit',
     '  --include-subagents    With --list-sessions, fan parents into their subagent children (requires --list-sessions)',
     '  --limit <n>            With --list-sessions, cap rows returned (default 20; requires --list-sessions)',

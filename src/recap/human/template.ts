@@ -159,6 +159,23 @@ export const renderHumanFromStructured = (
     lines.push('');
   }
 
+  // ## Issues — user-visible failures surfaced from failure_events
+  // (RECAP §5). Both recovered and unrecovered are shown with an
+  // explicit state tag; the human view is the full retrospective,
+  // so a fatal failure that ended the session must not be hidden
+  // here (changelog/pr curate to recovered-only for their
+  // audiences). Omitted entirely when the session had none.
+  if (intermediate.errors.length > 0) {
+    lines.push('## Issues');
+    lines.push('');
+    for (const e of intermediate.errors) {
+      const state = e.recovered ? 'recovered' : 'unrecovered';
+      const detail = e.summary.length > 0 ? ` — ${text(oneLine(e.summary))}` : '';
+      lines.push(`- \`${e.code}\` (${state})${detail}`);
+    }
+    lines.push('');
+  }
+
   if (intermediate.notDone.length > 0) {
     lines.push('## Not done');
     lines.push('');

@@ -2,6 +2,7 @@ import type { DB } from '../storage/db.ts';
 import { listApprovalsByToolCall } from '../storage/repos/approvals.ts';
 import { listCheckpointsBySession } from '../storage/repos/checkpoints.ts';
 import { getActivePinsBySession } from '../storage/repos/context-pins.ts';
+import { listFailureEventsBySession } from '../storage/repos/failure-events.ts';
 import { listMemoryEventsBySession } from '../storage/repos/memory-events.ts';
 import { type Message, listMessagesBySession } from '../storage/repos/messages.ts';
 import {
@@ -16,6 +17,7 @@ import {
   RECAP_SCHEMA_VERSION,
   type RecapCommandRun,
   type RecapDecision,
+  type RecapError,
   type RecapFileRead,
   type RecapFileWrite,
   type RecapIntermediate,
@@ -191,6 +193,50 @@ const summarizeToolInputForDecision = (toolName: string, input: unknown): string
     if (typeof obj.url === 'string') return `${toolName}: ${truncateForDecisionWhat(obj.url)}`;
   }
   return toolName;
+};
+
+// `recovery_action` is a fixed vocabulary (src/failures/codes.ts):
+// `fatal`, `ignored`, `degraded`, `pending_repair`, `retried_<N>x`,
+// `fallback_to_<name>`. A failure counts as "recovered" unless the
+// agent gave up (`fatal`) or the repair is still outstanding at
+// recap time (`pending_repair`). Everything else — ignored,
+// degraded, retried-to-success, fell-back — left the session able
+// to continue, which is the operator-facing meaning of recovered.
+// New parameterized prefixes default to recovered (they describe an
+// action that was taken), so an unseen `recovery_action` does not
+// silently flip to "unrecovered".
+const UNRECOVERED_ACTIONS: ReadonlySet<string> = new Set(['fatal', 'pending_repair']);
+
+const isRecoveredFailure = (recoveryAction: string): boolean =>
+  !UNRECOVERED_ACTIONS.has(recoveryAction);
+
+// `failure_events.payload_json` is an operator-controlled free-form
+// bag (no schema), already telemetry-scrubbed + 8 KiB-capped at
+// write time (src/failures/scrub.ts). There is no canonical text
+// field, so the summary is best-effort: pull the first conventional
+// prose key if one is present, else leave empty and let the
+// renderer fall back to `code` (changelog/pr already do
+// `summary || code`). Bounded so a long scrubbed message cannot
+// blow the schema-bound surface.
+const FAILURE_SUMMARY_KEYS: readonly string[] = ['message', 'summary', 'reason', 'detail'];
+
+const extractFailureSummary = (payloadJson: string | null): string => {
+  if (payloadJson === null) return '';
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payloadJson);
+  } catch {
+    return '';
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return '';
+  const obj = parsed as Record<string, unknown>;
+  for (const key of FAILURE_SUMMARY_KEYS) {
+    const v = obj[key];
+    if (typeof v === 'string' && v.trim().length > 0) {
+      return truncateForDecisionWhat(v.trim(), 160);
+    }
+  }
+  return '';
 };
 
 export type RecapScopeOption =
@@ -509,6 +555,7 @@ export const projectRecap = (db: DB, options: ProjectRecapOptions): RecapInterme
   const checkpointsRefs: { id: string; stepId: string; filesAffected: number }[] = [];
   const testsRun: RecapTestRun[] = [];
   const decisions: RecapDecision[] = [];
+  const errors: RecapError[] = [];
   const memoryProposed: RecapMemoryProposed[] = [];
   const timeline: RecapTimelineEvent[] = [];
   const unresolvedQuestions: string[] = [];
@@ -751,6 +798,30 @@ export const projectRecap = (db: DB, options: ProjectRecapOptions): RecapInterme
         accepted: false,
       });
     }
+
+    // errors[] — classified failures worth surfacing in the
+    // retrospective. RECAP §5 maps this to `failure_events`,
+    // filtered to `user_visible=1`: the forensic stream
+    // (FAILURE_MODES.md §19) carries internal failures the operator
+    // never saw, and recap is narrative, not the forensic log
+    // (§0.7). Both recovered and unrecovered user-visible failures
+    // are surfaced with the `recovered` flag (schema §3) — hiding a
+    // fatal failure from the "what happened" view would mislead the
+    // operator about why the session ended; renderers curate per
+    // audience (changelog/pr only echo recovered ones). Windowed by
+    // `windowStart` for `/recap last <N>` exactly like subagents:
+    // failure rows carry `created_at`, so a failure older than the
+    // kept slice belongs to a step outside the requested window.
+    for (const fe of listFailureEventsBySession(db, b.session.id)) {
+      if (fe.user_visible !== 1) continue;
+      if (windowStart !== null && fe.created_at < windowStart) continue;
+      errors.push({
+        code: fe.code,
+        recovered: isRecoveredFailure(fe.recovery_action),
+        summary: extractFailureSummary(fe.payload_json),
+      });
+      timeline.push({ ts: fe.created_at, event: 'failure', detail: fe.code });
+    }
   }
 
   // Three-key total order: ts → event → detail. Returning 0 for
@@ -836,7 +907,7 @@ export const projectRecap = (db: DB, options: ProjectRecapOptions): RecapInterme
       model,
       cacheHitRatio,
     },
-    errors: [],
+    errors,
     notDone: [],
     unresolvedQuestions,
     memoryProposed,

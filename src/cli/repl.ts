@@ -30,7 +30,7 @@ import {
   runAgent,
 } from '../harness/index.ts';
 import { RESUME_FULL_WARN_THRESHOLD } from '../harness/resume.ts';
-import { effectiveBudget, resolveMaxOutputTokens } from '../harness/types.ts';
+import { effectiveBudget, isRecapEnabled, resolveMaxOutputTokens } from '../harness/types.ts';
 import { dispatchChain } from '../hooks/dispatcher.ts';
 import type { HookChainResult, HookEventPayload } from '../hooks/types.ts';
 import type { PolicySource } from '../permissions/index.ts';
@@ -601,6 +601,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // makes the invariant load-bearing rather than coincidental.
         cwd,
         ...(args.model !== undefined ? { modelId: args.model } : {}),
+        ...(args.noRecap === true ? { noRecap: true } : {}),
         ...(args.maxSteps !== undefined ? { budget: { maxSteps: args.maxSteps } } : {}),
         // Forward the trust-list override so REPL and bootstrap
         // agree on which file is authoritative. Without this,
@@ -648,6 +649,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     hookWarnings,
     memoryConfigWarnings,
     providersConfigWarnings,
+    recapConfigWarnings,
     budgetConfigWarnings,
     effortConfigWarnings,
     auditConfigWarnings,
@@ -695,6 +697,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // it instead of running on a model they didn't intend.
   for (const w of providersConfigWarnings) {
     errSink(`forja: providers config: ${w}\n`);
+  }
+  // [recap] config warnings — unknown render_model / bad enabled type.
+  for (const w of recapConfigWarnings) {
+    errSink(`forja: recap config: ${w}\n`);
   }
   // [budget] config warnings — a numeric typo or out-of-range value
   // shouldn't disappear silently.
@@ -2756,6 +2762,18 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       parseSlashInput(renderer.state().input.value) === null
     ) {
       cancelExitArm();
+      if (!isRecapEnabled(baseConfig)) {
+        // RECAP §3.3: auto-display (session-end terse AND Alt+R) is
+        // one of the three surfaces the recap master switch disables.
+        // Warn so the operator who pressed Alt+R learns why nothing
+        // rendered instead of the keypress silently no-op'ing.
+        bus.emit({
+          type: 'warn',
+          ts: now(),
+          message: 'recap terse: disabled (--no-recap / [recap].enabled=false)',
+        });
+        return true;
+      }
       const sessionId = lastSessionId;
       if (sessionId === null) {
         bus.emit({

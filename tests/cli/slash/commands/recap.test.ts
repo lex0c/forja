@@ -455,6 +455,46 @@ describe('/recap', () => {
     expect(runs[0]?.outputPath).toBe(outPath);
   });
 
+  test('/recap pr --out to an unwritable path: errors but STILL audits the run (output_path NULL)', async () => {
+    // Regression guard: an `--out` write failure must not skip the
+    // `recap_runs` row. On a cache-miss LLM render the spend was
+    // already billed; dropping the audit row on the write error
+    // (the pre-fix order: write → return-on-error → record) would
+    // under-report cost in exactly the case the audit table exists
+    // to catch.
+    //
+    // Force the failure deterministically WITHOUT relying on
+    // permission semantics — the working copy can live under
+    // /run/media where sandbox/path assumptions differ. Making the
+    // parent a regular FILE makes writeOutFile's recursive mkdir
+    // throw ENOTDIR.
+    const base = `${process.env.TMPDIR ?? '/tmp'}/forja-recap-out-${crypto.randomUUID()}`;
+    const blocker = `${base}/blocker`;
+    await Bun.write(blocker, 'x');
+    const outPath = `${blocker}/pr.md`;
+
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'do thing',
+      createdAt: 1_100,
+    });
+    currentSessionId = s.id;
+
+    const result = await recapCommand.exec(['pr', '--out', outPath], makeCtx());
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('failed to write --out');
+
+    // The render executed; the run is audited regardless. output_path
+    // is NULL because no bytes landed — the column must not claim an
+    // artifact that does not exist.
+    const runs = listRecentRecapRuns(db);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.outputPath).toBeNull();
+  });
+
   test('/recap --out without a value is a parse error', async () => {
     currentSessionId = 'unused';
     const result = await recapCommand.exec(['--out'], makeCtx());
@@ -652,6 +692,142 @@ describe('/recap', () => {
     expect(runs[0]?.usedLlm).toBe(true);
     expect(runs[0]?.costUsd).toBeGreaterThan(0);
     expect(runs[0]?.promptVersion).toBe('pr-v1');
+  });
+
+  test('/recap pr LLM path: provider error (offline/rate-limit) falls back and still audits', async () => {
+    // The operationally dominant failure — provider down or rate
+    // limited — must honour "recap never breaks" (RECAP §2). It was
+    // covered at the orchestrator unit level but not end-to-end at
+    // the slash surface. Distinct from schema/fidelity: this is a
+    // PRE-call failure, so no tokens were billed and the audit row
+    // records zero spend.
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'do thing',
+      createdAt: 1_100,
+    });
+    currentSessionId = s.id;
+
+    // constrained-capable so the LLM path is actually entered, but
+    // the call rejects.
+    const provider: Provider = {
+      id: 'anthropic/claude-haiku-4-5',
+      family: 'anthropic',
+      capabilities: stubCaps('tools'),
+      generate: async function* () {},
+      generateConstrained: () => Promise.reject(new Error('connection refused')),
+      countTokens: async () => 0,
+    };
+    const ctx = makeCtx({ baseConfig: cfgWithProvider(provider) });
+    const events: { type: string; message?: string }[] = [];
+    ctx.bus.on('warn', (e) => events.push({ type: 'warn', message: e.message }));
+
+    const result = await recapCommand.exec(['pr'], ctx);
+    // Deterministic markdown still comes back — recap never breaks.
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    expect(result.notes?.join('\n')).toContain('## Summary');
+
+    const warns = events.filter((e) => e.type === 'warn');
+    expect(warns).toHaveLength(1);
+    expect(warns[0]?.message).toContain('provider-error');
+    expect(warns[0]?.message).toContain('using deterministic fallback');
+
+    // Pre-call failure: no spend, but the invocation is still
+    // audited.
+    const runs = listRecentRecapRuns(db);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.usedLlm).toBe(false);
+    expect(runs[0]?.costUsd).toBe(0);
+    expect(runs[0]?.promptVersion).toBeNull();
+  });
+
+  test('/recap --model without a value is a parse error', async () => {
+    currentSessionId = 'unused';
+    const result = await recapCommand.exec(['pr', '--model'], makeCtx());
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('--model requires a model id');
+  });
+
+  test('/recap pr --model <unknown> warns and renders with the session model', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, { sessionId: s.id, role: 'user', content: 'do thing', createdAt: 1_100 });
+    currentSessionId = s.id;
+    const intermediate = projectRecap(db, {
+      scope: { kind: 'session_current', sessionId: s.id, limit: 10 },
+      now: 5_000,
+    });
+    const structured = projectPrDeterministic(intermediate);
+    // Session provider is constrained-capable so the LLM path runs; the
+    // ctx registry is empty so any --model id resolves to unknown.
+    const handle = stubProvider(JSON.stringify(structured));
+    const ctx = makeCtx({ baseConfig: cfgWithProvider(handle.provider) });
+    const events: { type: string; message?: string }[] = [];
+    ctx.bus.on('warn', (e) => events.push({ type: 'warn', message: e.message }));
+
+    const result = await recapCommand.exec(['pr', '--model', 'anthropic/does-not-exist'], ctx);
+    expect(result.kind).toBe('ok');
+    // Rendered with the session provider despite the bad override.
+    expect(handle.calls).toHaveLength(1);
+    expect(
+      events.some(
+        (w) =>
+          w.message?.includes("--model 'anthropic/does-not-exist'") &&
+          w.message?.includes('unknown model'),
+      ),
+    ).toBe(true);
+  });
+
+  test('/recap pr --model <known> renders with the override provider, not the session one', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, { sessionId: s.id, role: 'user', content: 'do thing', createdAt: 1_100 });
+    currentSessionId = s.id;
+    const intermediate = projectRecap(db, {
+      scope: { kind: 'session_current', sessionId: s.id, limit: 10 },
+      now: 5_000,
+    });
+    const structured = projectPrDeterministic(intermediate);
+    const sessionHandle = stubProvider(JSON.stringify(structured));
+    const overrideHandle = stubProvider(JSON.stringify(structured));
+    const reg = createModelRegistry();
+    reg.register({
+      id: 'anthropic/claude-opus-4-8',
+      family: 'anthropic',
+      modelName: 'claude-opus-4-8',
+      capabilities: overrideHandle.provider.capabilities,
+      factory: () => overrideHandle.provider,
+    });
+    const ctx = makeCtx({
+      baseConfig: cfgWithProvider(sessionHandle.provider),
+      modelRegistry: reg,
+    });
+
+    const result = await recapCommand.exec(['pr', '--model', 'anthropic/claude-opus-4-8'], ctx);
+    expect(result.kind).toBe('ok');
+    expect(overrideHandle.calls).toHaveLength(1);
+    expect(sessionHandle.calls).toHaveLength(0);
+  });
+
+  test('recapEnabled=false forces deterministic render (no provider call, no LLM spend)', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, { sessionId: s.id, role: 'user', content: 'do thing', createdAt: 1_100 });
+    currentSessionId = s.id;
+    // constrained provider that MUST NOT be called when recap is off.
+    const handle = stubProvider('{}');
+    const disabledCfg = {
+      ...cfgWithProvider(handle.provider),
+      recapEnabled: false,
+    } as unknown as HarnessConfig;
+    const ctx = makeCtx({ baseConfig: disabledCfg });
+
+    const result = await recapCommand.exec(['pr'], ctx);
+    expect(result.kind).toBe('ok');
+    expect(handle.calls).toHaveLength(0);
+    const runs = listRecentRecapRuns(db);
+    expect(runs[0]?.usedLlm).toBe(false);
   });
 
   test('/recap pr --no-llm-render bypasses provider entirely', async () => {

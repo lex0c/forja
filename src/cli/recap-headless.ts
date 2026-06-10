@@ -18,7 +18,7 @@
 // (the multi-row shape doesn't match the §9 schema).
 
 import type { HarnessConfig } from '../harness/index.ts';
-import { createRegistry } from '../providers/registry.ts';
+import { createDefaultRegistry } from '../providers/registry.ts';
 import type { Provider } from '../providers/types.ts';
 import { redactSecretsInIntermediate } from '../recap/format.ts';
 import type { DB } from '../storage/db.ts';
@@ -30,6 +30,20 @@ import { createFocusStack } from '../tui/focus-stack.ts';
 import { createModalManager } from '../tui/modal-manager.ts';
 import { runRecapList, runRecapSession } from './slash/commands/recap.ts';
 import type { SlashContext } from './slash/types.ts';
+
+// Headless render-model precedence (RECAP §8.2: `--model` > config >
+// session). On `agent recap`, `--model` is consumed top-level and
+// folded into the SESSION provider by bootstrap, so it already IS the
+// render model — threading `[recap].render_model` on top would
+// override the operator's explicit CLI choice. Suppress the config
+// value when `--model` was passed; the render then falls back to the
+// session provider (= the `--model` model). Pure + exported so the
+// precedence rule is unit-tested in one place rather than buried in
+// run.ts wiring.
+export const headlessRecapRenderModel = (
+  argsModel: string | undefined,
+  configRenderModel: string | undefined,
+): string | undefined => (argsModel !== undefined ? undefined : configRenderModel);
 
 export interface RunRecapHeadlessOptions {
   // Args after `recap` in the CLI, e.g. ['pr', '--no-llm-render'].
@@ -69,6 +83,13 @@ export interface RunRecapHeadlessOptions {
   // out cross-project even though the operator did not pass
   // `--all-projects`.
   cwd?: string;
+  // Recap master switch (RECAP §3.2/§3.3) and render-model default
+  // (§8.2), threaded from the bootstrap-resolved HarnessConfig.
+  // Without these the headless surface would ignore
+  // `[recap].enabled=false` / `--no-recap` (still LLM-render) and
+  // `[recap].render_model` — the REPL honors them, headless must too.
+  recapEnabled?: boolean;
+  recapRenderModel?: string;
 }
 
 const buildHeadlessContext = (options: RunRecapHeadlessOptions, db: DB): SlashContext => {
@@ -90,7 +111,17 @@ const buildHeadlessContext = (options: RunRecapHeadlessOptions, db: DB): SlashCo
   // would silently drop the filter and fan out cross-project,
   // bypassing the `--all-projects` opt-in guard).
   const cwd = options.cwd ?? process.cwd();
-  const baseConfig = { provider: options.provider, cwd } as unknown as HarnessConfig;
+  const baseConfig = {
+    provider: options.provider,
+    cwd,
+    // Carry the recap knobs so `/recap --model` / `[recap].enabled`
+    // behave identically to the REPL (omitted → loop/render apply the
+    // `!== false` default-on and session-provider fallback).
+    ...(options.recapEnabled !== undefined ? { recapEnabled: options.recapEnabled } : {}),
+    ...(options.recapRenderModel !== undefined
+      ? { recapRenderModel: options.recapRenderModel }
+      : {}),
+  } as unknown as HarnessConfig;
   return {
     baseConfig,
     db,
@@ -102,7 +133,9 @@ const buildHeadlessContext = (options: RunRecapHeadlessOptions, db: DB): SlashCo
     isRunning: () => false,
     currentSessionId: options.currentSessionId ?? (() => null),
     replSessionIds: () => [],
-    modelRegistry: createRegistry(),
+    // Populated registry (not the empty createRegistry()) so a
+    // `[recap].render_model` override resolves headless too.
+    modelRegistry: createDefaultRegistry(),
   };
 };
 

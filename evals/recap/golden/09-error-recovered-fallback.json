@@ -1,0 +1,91 @@
+{
+  "schemaVersion": "v1",
+  "generatedAt": 900000,
+  "scope": {
+    "kind": "session_specific",
+    "sessionIds": [
+      "a9000001-0000-0000-0000-000000000000"
+    ],
+    "range": {
+      "start": 0,
+      "end": 0
+    }
+  },
+  "completeness": {
+    "incomplete": false,
+    "incompleteSessions": [],
+    "incompleteReason": ""
+  },
+  "goal": {
+    "text": "summarize the open issues from the tracker",
+    "sourceStepId": "a9000100-0000-0000-0000-000000000000"
+  },
+  "goalStack": [],
+  "decisions": [],
+  "pinnedContext": [],
+  "actions": {
+    "filesRead": [
+      {
+        "path": "/home/lex/proj/ISSUES.md",
+        "count": 1
+      }
+    ],
+    "filesWritten": [],
+    "commandsRun": [],
+    "webFetches": [],
+    "subagentsSpawned": []
+  },
+  "outcomes": {
+    "testsRun": [],
+    "checkpoints": [],
+    "artifacts": []
+  },
+  "timeline": [
+    {
+      "ts": 800000,
+      "event": "session_start",
+      "detail": "a9000001-0000-0000-0000-000000000000"
+    },
+    {
+      "ts": 800240,
+      "event": "failure",
+      "detail": "mcp.tool_unavailable"
+    },
+    {
+      "ts": 800260,
+      "event": "failure",
+      "detail": "provider.overloaded"
+    },
+    {
+      "ts": 801800,
+      "event": "session_end",
+      "detail": "a9000001-0000-0000-0000-000000000000 (done)"
+    }
+  ],
+  "costs": {
+    "tokens": {
+      "in": 5100,
+      "out": 410,
+      "cached": 4000
+    },
+    "usd": 0.026,
+    "durationMs": 1800,
+    "model": "sonnet-4-6",
+    "cacheHitRatio": 0.43956043956043955
+  },
+  "errors": [
+    {
+      "code": "mcp.tool_unavailable",
+      "recovered": true,
+      "summary": "tracker MCP offline; used cached issue list"
+    },
+    {
+      "code": "provider.overloaded",
+      "recovered": true,
+      "summary": ""
+    }
+  ],
+  "notDone": [],
+  "unresolvedQuestions": [],
+  "memoryProposed": []
+}

@@ -683,11 +683,32 @@ export const EXIT_REASONS = [
 
 export type ExitReason = (typeof EXIT_REASONS)[number];
 
+// Single source of the recap master-switch default-on policy
+// (RECAP.md §3.2/§3.3). `recapEnabled` is optional so test fixtures,
+// the headless/stub paths, and bootstrap-with-no-config can omit it;
+// absent or `true` → enabled, only an explicit `false` disables. Use
+// this everywhere instead of a bare `!== false` so the contract is
+// one greppable unit (the three automatic surfaces — auto-display,
+// resume rehydrate, LLM render — all gate through it).
+export const isRecapEnabled = (config: { recapEnabled?: boolean }): boolean =>
+  config.recapEnabled !== false;
+
 export interface HarnessConfig {
   provider: Provider;
   toolRegistry: ToolRegistry;
   permissionEngine: PermissionEngine;
   db: DB;
+  // Recap master switch (RECAP.md §3.2/§3.3, `[recap].enabled` /
+  // `--no-recap`). Optional so the many test fixtures that build a
+  // HarnessConfig without it keep the default-on behaviour; every
+  // read gates on `!== false`. When explicitly false, the loop
+  // suppresses session-end/Alt+R auto-display and resume
+  // auto-rehydrate, and `/recap` renders deterministically.
+  recapEnabled?: boolean;
+  // Default model id for the `/recap` LLM render (RECAP.md §8.2,
+  // `[recap].render_model`). Undefined → render uses the session's
+  // own provider; a `/recap --model <id>` flag overrides per-call.
+  recapRenderModel?: string;
   // Directory where bg-aware tools' stdout/stderr log files are
   // written. When set, the harness creates a session-scoped
   // BgManager after createSession and threads it through

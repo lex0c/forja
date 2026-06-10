@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
-import { runRecapHeadless } from '../../src/cli/recap-headless.ts';
+import { headlessRecapRenderModel, runRecapHeadless } from '../../src/cli/recap-headless.ts';
 import type {
   ConstrainedResult,
   Provider,
@@ -70,6 +70,25 @@ const seedSession = (id?: string): { id: string } => {
   return { id: id ?? s.id };
 };
 
+describe('headlessRecapRenderModel — precedence', () => {
+  test('explicit --model suppresses [recap].render_model (--model wins)', () => {
+    // Regression: headless `--model A` is folded into the session
+    // provider, so threading config `render_model = B` on top would
+    // render with B, reversing the documented `--model > config`
+    // precedence. With --model present the config is dropped → render
+    // falls back to the session provider (the --model model).
+    expect(headlessRecapRenderModel('anthropic/A', 'anthropic/B')).toBeUndefined();
+  });
+
+  test('no --model → config render_model is honored', () => {
+    expect(headlessRecapRenderModel(undefined, 'anthropic/B')).toBe('anthropic/B');
+  });
+
+  test('neither set → undefined (render uses session provider)', () => {
+    expect(headlessRecapRenderModel(undefined, undefined)).toBeUndefined();
+  });
+});
+
 describe('runRecapHeadless — plain text mode', () => {
   test('renders deterministic human output for `recap session <id>`', async () => {
     const { id } = seedSession();
@@ -87,6 +106,42 @@ describe('runRecapHeadless — plain text mode', () => {
     expect(stdout).toContain('do thing');
     expect(stdout).toContain('## Cost');
     expect(stderr).toBe('');
+  });
+
+  test('recapEnabled=false forces deterministic render headless (master switch)', async () => {
+    // Regression: the headless surface used to drop the
+    // bootstrap-resolved recapEnabled, so `[recap].enabled=false` /
+    // `--no-recap` did not force the deterministic path for
+    // `agent recap` — it still spent on the LLM render. A
+    // constrained-capable provider here would be used if the switch
+    // leaked; assert it is never called.
+    const { id } = seedSession();
+    let constrainedCalls = 0;
+    const constrainedProvider: Provider = {
+      id: 'anthropic/claude-haiku-4-5',
+      family: 'anthropic',
+      capabilities: stubCaps('tools'),
+      generate: async function* (): AsyncIterable<StreamEvent> {},
+      generateConstrained: async () => {
+        constrainedCalls += 1;
+        throw new Error('must not be called when recap is disabled');
+      },
+      countTokens: async () => 0,
+    };
+    const code = await runRecapHeadless({
+      args: ['pr'],
+      json: false,
+      dbOverride: db,
+      provider: constrainedProvider,
+      recapEnabled: false,
+      currentSessionId: () => id,
+      out,
+      err,
+      now: () => 5_000,
+    });
+    expect(code).toBe(0);
+    expect(constrainedCalls).toBe(0);
+    expect(stdout).toContain('## Summary');
   });
 
   test('returns non-zero and writes to stderr on parse error', async () => {

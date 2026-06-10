@@ -183,4 +183,29 @@ describe('renderHumanFromStructured', () => {
     expect(md.endsWith('\n')).toBe(true);
     expect(md.endsWith('\n\n')).toBe(false);
   });
+
+  test('emits ## Issues with recovered/unrecovered state tags', () => {
+    const md = renderHumanFromStructured(
+      { schemaVersion: HUMAN_SCHEMA_VERSION, summary: ['x'] },
+      baseIntermediate({
+        errors: [
+          { code: 'provider.rate_limit', recovered: true, summary: 'backed off and retried' },
+          { code: 'sandbox.denied', recovered: false, summary: '' },
+        ],
+      }),
+    );
+    expect(md).toContain('## Issues');
+    expect(md).toContain('- `provider.rate_limit` (recovered) — backed off and retried');
+    // Empty summary → no trailing dash clause.
+    expect(md).toContain('- `sandbox.denied` (unrecovered)');
+    expect(md).not.toContain('(unrecovered) —');
+  });
+
+  test('omits ## Issues entirely when there are no errors', () => {
+    const md = renderHumanFromStructured(
+      { schemaVersion: HUMAN_SCHEMA_VERSION, summary: ['x'] },
+      baseIntermediate(),
+    );
+    expect(md).not.toContain('## Issues');
+  });
 });

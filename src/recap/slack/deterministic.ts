@@ -39,8 +39,17 @@ const buildAchievements = (intermediate: RecapIntermediate): string[] => {
   if (intermediate.outcomes.checkpoints.length > 0) {
     items.push(`Created ${intermediate.outcomes.checkpoints.length} checkpoint(s)`);
   }
-  // Schema requires ≥ 1 achievement. Sentinel for read-only or
-  // failed scopes — never empty.
+  // Unrecovered failures must surface before the "No actions"
+  // sentinel — a team-update that hides a fatal failure behind
+  // "No actions recorded" is actively misleading (RECAP §0.6).
+  // Recovered failures stay omitted (the run continued); the human
+  // surface carries the full list.
+  const unrecovered = intermediate.errors.filter((e) => !e.recovered).length;
+  if (unrecovered > 0) {
+    items.push(`${unrecovered} unresolved error(s)`);
+  }
+  // Schema requires ≥ 1 achievement. Sentinel for read-only scopes
+  // with no failures — never empty.
   if (items.length === 0) items.push('No actions recorded for this scope');
   return items
     .slice(0, SLACK_LIMITS.achievementsMaxItems)
