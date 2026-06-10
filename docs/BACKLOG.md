@@ -2,6 +2,25 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-10] fix(skills): skill_list re-scans disk so a mid-session hand-edit is visible
+
+The skill catalog is an in-memory snapshot built once at bootstrap; `read` re-reads bodies from
+disk on every call, but the resolved set (`byName` / `entries`) only rebuilds on `reload()`, which
+until now only the `/skill` command (on its own mutations) called. So a skill the operator added,
+edited, or removed by hand mid-session — outside `/skill` — stayed invisible to the model: absent
+from `skill_list`, and (for a new name) unresolvable by a no-scope `skill_invoke`.
+
+`skill_list` now calls `catalog.reload()` before listing. It is the "what is available right now"
+surface, so it must reflect disk, not the boot snapshot; and because `reload()` rebuilds `byName`,
+a `skill_invoke` issued after the model has listed resolves the freshly-seen skill too. The reload
+is scoped deliberately to this discovery path: it rebuilds only the in-memory snapshot and does NOT
+re-assemble the eager catalog section in the system prompt — that stays fixed for the session by
+design, to keep the prompt prefix cache-stable (the dominant cost axis) and the `prompt_versions`
+hash / `recordSurface` audit one-per-boot. The disk re-scan is a flat glob of a few small files;
+a mid-scan fs error is swallowed (refresh reassigns its outputs atomically at the end, so the prior
+snapshot survives) — a stale list beats a thrown turn. Two tests cover add / edit / remove
+mid-session against a live catalog handle.
+
 ## [2026-06-10] test(skills): behavioral eval suite for the description-driven invocation gate
 
 A review of the skills subsystem found its eval coverage shallow on the one property that

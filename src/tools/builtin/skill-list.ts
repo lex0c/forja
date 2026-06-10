@@ -62,6 +62,26 @@ export const skillListTool: Tool<SkillListInput, SkillListOutput> = {
       return toolError(ERROR_CODES.invalidArg, scopeCheck.error);
     }
 
+    // Re-scan disk before listing. skill_list is the "what is
+    // available right now" surface, so it must reflect a skill the
+    // operator added, edited, or removed mid-session by hand — not
+    // just the boot-time snapshot. The `/skill` command reloads on its
+    // own mutations; this closes the out-of-band hand-edit gap for the
+    // model's discovery path (and, since reload() rebuilds byName, a
+    // subsequent skill_invoke resolves the freshly-seen skill too).
+    // reload() rebuilds only the in-memory snapshot — it does NOT touch
+    // the cached system-prompt eager surface (that stays fixed for the
+    // session by design, to keep the prompt prefix cache-stable) and
+    // emits no audit, so it is cheap and side-effect-free here.
+    // refresh() reassigns its outputs atomically at the end, so a
+    // mid-scan fs error leaves the prior snapshot intact; we still
+    // swallow the throw — a stale list beats a thrown turn.
+    try {
+      ctx.skillCatalog.reload();
+    } catch {
+      // Keep the existing snapshot; a disk error must not fail the list.
+    }
+
     const entries = ctx.skillCatalog.list(scopeCheck ?? undefined);
     const skills: SkillListEntry[] = entries.map((entry) => ({
       scope: entry.scope,
