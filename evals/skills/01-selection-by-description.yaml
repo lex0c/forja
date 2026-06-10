@@ -1,0 +1,43 @@
+name: model invokes a skill from its description alone, unprompted
+# The load-bearing gate (SKILLS.md §0.2, §4): the eager catalog surfaces
+# only name + description, and the model must DECIDE to invoke from the
+# description matching the task. Unlike smoke/11, the prompt never says
+# "skill", never names a tool, and never says "use it" — it just states
+# the task in the skill's own terms. A model that free-summarizes instead
+# of invoking fails: the body's verbatim labels won't appear.
+prompt: |
+  Summarize widget.ts for me, following our team's standard procedure
+  for file summaries. Carry the procedure out and give me the result.
+setup:
+  files:
+    '.agent/skills/shared/file-summary.md': |
+      ---
+      name: file-summary
+      description: Summarize a source file in the team's required two-part format.
+      ---
+      When asked to summarize a file in the team format, follow this exactly:
+
+      1. Read the file with read_file.
+      2. Reply with these two lines, the labels written verbatim:
+         PURPOSE: <one sentence on what the file does>
+         LINECOUNT: <number of lines in the file>
+    '.agent/skills/shared/changelog-entry.md': |
+      ---
+      name: changelog-entry
+      description: Draft a changelog entry from a diff in the Keep a Changelog style.
+      ---
+      Draft one changelog line under the correct heading — Added,
+      Changed, Fixed, or Removed. One user-facing sentence.
+    'widget.ts': |
+      export const widget = (label: string): string => {
+        return `[${label}]`;
+      };
+expect:
+  - tool_called: skill_invoke
+  - tool_called: read_file
+  - output_contains: 'PURPOSE:'
+  - output_contains: 'LINECOUNT:'
+  - status: done
+budget:
+  maxSteps: 6
+  maxCostUsd: 0.15
