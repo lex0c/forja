@@ -2,6 +2,49 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-10] fix(permission-replay): surface a caveat when re-executing non-builtin tools
+
+Audit of the replay subsystems (resume-replay + permission-replay) found one
+honesty gap in `permission-replay`'s re-execution modes
+(`--against-current-policy` / `--against-archived-policy`). `tryReExecute`
+resolves a tool's PolicyCategory via the builtin registry only; an MCP or
+extension tool isn't there, so it falls through to `category='misc'` (the
+auto-allow path). But the LIVE decision for an MCP tool ran the tool's own
+manifest resolver — or the conservative confirm-forcing default
+(PERMISSION_ENGINE §5.3) — AND carried the +0.10 supply-chain score weight (§6),
+none of which the replay models. So a `changed_decision` verdict on such a row
+was silently misattributed to policy drift, and a `deterministic` verdict was
+false confidence — on exactly the surface (MCP, the supply-chain attack surface)
+an operator is most likely to audit. The caveat existed only as a source comment;
+it never reached the operator-facing `caveats` list.
+
+Fix: `tryReExecute` now returns `categoryFallback` (true when `registry.get`
+returns null), and both `analyze*` builders append a tool-named caveat —
+parallel to the existing conditional `AUTONOMOUS_POSTURE_CAVEAT` — when the
+re-executed tool wasn't a builtin. The `ranCaveats` list moved below the
+re-execution call so it can key off the result. No decision-path logic changed;
+this only widens the honesty surface, consistent with the existing
+classifier/grants/sandbox caveats. +3 tests (MCP tool surfaces the caveat in
+text + JSON; builtin tool does not). No spec change — the caveat list is an
+implementation property, not a §17 contract.
+
+Review of that fix surfaced a control-char gap and closed it in the same change.
+The new caveat interpolates `row.tool_name`, which for the non-builtin case
+originates from an untrusted MCP/extension manifest — the exact audit-row→stdout
+injection surface slice 128 hardens. Worse, `renderText`'s `tool:` line already
+printed `tool_name`/`tool_version` raw (a pre-existing gap slice 128 missed),
+*before* the caveat, so sanitizing only the caveat would have been moot — the
+terminal escape would already have fired. Both sites now `stripControlChars` at
+the interpolation point; the JSON path was already safe (JSON.stringify escapes
+CC0/CC1). Latent today (MCP is M3+, so every current `tool_name` is a
+charset-safe builtin), but the caveat exists precisely for that future surface.
++1 test (poisoned MCP name → ESC/BEL stripped from header + caveat, printable
+remainder kept). 87 replay-suite tests pass; typecheck + biome clean.
+
+resume-replay was reviewed and found solid (UI-only scrollback reconstruction;
+window matches the model's resume window; uncapped `LIMIT -1` path confirmed
+correct; orphan tool_use → synthetic close). No changes there.
+
 ## [2026-06-10] fix(checkpoints): anchor snapshot/restore at the worktree root
 
 Closes edge #1 catalogued in the prior entry (supersedes its "left open"
