@@ -2106,6 +2106,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           cwd: config.cwd,
           sessionId,
           available: support.available,
+          // Anchor git ops at the worktree root so snapshot/restore
+          // cover the whole worktree even when config.cwd is a
+          // subdirectory of the repo (CHECKPOINTS §2.6). null on the
+          // unavailable path; the manager's `?? cwd` fallback handles it.
+          ...(support.gitRoot !== null ? { gitRoot: support.gitRoot } : {}),
         });
         if (!support.available && support.reason !== null) {
           checkpointsUnavailableReason = support.reason;

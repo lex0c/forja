@@ -148,6 +148,10 @@ const buildManager = async (db: DB, cwd: string, sessionId: string): Promise<Che
     cwd,
     sessionId,
     available: support.available,
+    // Worktree-root anchoring (CHECKPOINTS §2.6): a `--undo` issued
+    // from a subdirectory must reset the same worktree the snapshot
+    // captured. null when unavailable; manager falls back to cwd.
+    ...(support.gitRoot !== null ? { gitRoot: support.gitRoot } : {}),
   });
 };
 
@@ -224,9 +228,9 @@ const runRestoreImpl = async (
     input.err(
       [
         'WARNING: this step ran bash. --undo / --checkpoints restore reverts',
-        '  filesystem changes within the cwd, but cannot reverse:',
+        '  filesystem changes within the git worktree, but cannot reverse:',
         '    - Database / HTTP / network state changes',
-        '    - Filesystem changes outside cwd',
+        '    - Filesystem changes outside the worktree (/tmp, $HOME, other repos)',
         '    - Process spawns',
         '  Re-run with --yes to confirm.\n',
       ].join('\n'),

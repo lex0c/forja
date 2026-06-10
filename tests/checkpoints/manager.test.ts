@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resolveRef, sessionRef } from '../../src/checkpoints/git.ts';
@@ -444,5 +444,59 @@ describe('CheckpointManager — available mode', () => {
     await mgr.purge({ olderThanDays: 0.0000001 });
 
     expect(await resolveRef(repo, weirdRef)).not.toBeNull();
+  });
+});
+
+describe('CheckpointManager — worktree-root anchoring (CHECKPOINTS §2.6)', () => {
+  // Edge #1: snapshot was cwd-scoped (`add -A .`) while restore is
+  // worktree-wide (`read-tree --reset -u`). Running from a subdir made
+  // them disagree — paths outside the subdir entered the checkpoint at
+  // HEAD, not their real state. Anchoring git ops at gitRoot makes a
+  // subdir run indistinguishable from a repo-root run.
+  test('snapshot from a subdir captures a change made outside the subdir', async () => {
+    await initRepoWithSeed(repo);
+    const sub = join(repo, 'sub');
+    await mkdir(sub, { recursive: true });
+    // Manager mimics the agent invoked from repo/sub: cwd is the subdir,
+    // gitRoot is the worktree root (what detectCheckpointSupport
+    // resolves in production).
+    const mgr = createCheckpointManager({
+      db,
+      cwd: sub,
+      sessionId,
+      gitRoot: repo,
+      available: true,
+    });
+    await writeFile(join(repo, 'root.txt'), 'pre\n');
+    await writeFile(join(sub, 'inner.txt'), 'inner-pre\n');
+    const ckpt = await mgr.snapshot({ stepId: 'm', hadBash: false });
+    expect(ckpt.checkpointId).not.toBeNull();
+    // Both the out-of-subdir file AND the in-subdir file land in the
+    // checkpoint tree — worktree-wide capture.
+    const ls = await runGit(repo, ['ls-tree', '-r', '--name-only', ckpt.gitRef as string]);
+    expect(ls).toContain('root.txt');
+    expect(ls).toContain('sub/inner.txt');
+  });
+
+  test('restore from a subdir reverts a change outside the subdir', async () => {
+    await initRepoWithSeed(repo);
+    const sub = join(repo, 'sub');
+    await mkdir(sub, { recursive: true });
+    const mgr = createCheckpointManager({
+      db,
+      cwd: sub,
+      sessionId,
+      gitRoot: repo,
+      available: true,
+    });
+    await writeFile(join(repo, 'root.txt'), 'pre\n');
+    const ckpt = await mgr.snapshot({ stepId: 'm', hadBash: false });
+    expect(ckpt.checkpointId).not.toBeNull();
+    // A later edit to a file OUTSIDE the invocation subdir.
+    await writeFile(join(repo, 'root.txt'), 'post\n');
+    await mgr.restore(ckpt.checkpointId as string);
+    // Pre-fix this stayed 'post' (the cwd-scoped snapshot never captured
+    // root.txt at 'pre', so there was nothing to revert it to).
+    expect(await Bun.file(join(repo, 'root.txt')).text()).toBe('pre\n');
   });
 });

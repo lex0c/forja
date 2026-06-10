@@ -728,12 +728,16 @@ describe('runPermissionReplay — --against-current-policy re-execution (slice 1
   // Seeds the full chain a replay would consume: sessions, message,
   // tool_calls (with raw args), approvals_log (emitted via SQLite
   // sink), approval_call_links. Returns the emitted approval seq.
-  const seedFullReplayable = async (args: Record<string, unknown>): Promise<number> => {
+  const seedFullReplayable = async (
+    args: Record<string, unknown>,
+    toolName = 'bash',
+  ): Promise<number> => {
     const identity = ensureInstallId({ env });
     const db = openDb(dbPath);
     migrate(db, MIGRATIONS);
     // Make sure the bash AST resolver is ready — engine.check on
     // `bash` category fires the resolver, which throws without init.
+    // (Harmless for non-builtin tool seeds, which resolve to 'misc'.)
     const { initBashParser } = await import('../../src/permissions/bash-parser.ts');
     await initBashParser();
 
@@ -752,13 +756,13 @@ describe('runPermissionReplay — --against-current-policy re-execution (slice 1
     });
     const toolCall = createToolCall(db, {
       messageId: message.id,
-      toolName: 'bash',
+      toolName,
       input: args,
     });
     const sink = createSqliteSink({ db, identity });
     const emitted = sink.emit({
       session_id: session.id,
-      tool_name: 'bash',
+      tool_name: toolName,
       args,
       decision: 'allow',
       policy_hash: 'sha256:fixture',
@@ -840,6 +844,107 @@ tools:
     const text = out.lines.join('');
     expect(text).toContain('policy drift changed the decision');
     expect(text).toContain('(allow → deny)');
+  });
+
+  test('non-builtin (MCP) tool surfaces the misc-category caveat', async () => {
+    // An MCP tool isn't in the builtin registry, so tryReExecute resolves
+    // its category to 'misc'. The live decision would have used the
+    // tool's own resolver + the +0.10 supply-chain weight; the replay
+    // models neither, so the verdict MUST carry an explicit caveat naming
+    // the tool. Without it, a changed_decision verdict here is silently
+    // misattributed to policy drift, and a deterministic verdict is
+    // false confidence — exactly on the surface an operator audits most.
+    const seq = await seedFullReplayable({ q: 'select 1' }, 'mcp__db__query');
+
+    const out = captured();
+    const code = await runPermissionReplay({
+      seq,
+      againstCurrentPolicy: true,
+      dbPath,
+      env,
+      cwd: tmp,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    const text = out.lines.join('');
+    expect(text).toContain("tool 'mcp__db__query' is not in the builtin registry");
+    expect(text).toContain("category='misc'");
+  });
+
+  test('builtin tool does NOT carry the misc-category caveat', async () => {
+    // Contrast with the MCP case: a builtin (`bash`) resolves to its real
+    // category, so the caveat must be absent. Guards against the caveat
+    // leaking onto every re-execution.
+    const seq = await seedFullReplayable({ command: 'ls -la' });
+
+    const out = captured();
+    const code = await runPermissionReplay({
+      seq,
+      againstCurrentPolicy: true,
+      dbPath,
+      env,
+      cwd: tmp,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    const text = out.lines.join('');
+    expect(text).not.toContain('not in the builtin registry');
+  });
+
+  test('JSON mode includes the misc-category caveat for non-builtin tools', async () => {
+    // The caveat must reach JSON consumers too — audit tooling filters on
+    // against_current_policy.caveats, so the non-builtin signal has to be
+    // in the structured output, not only the text render.
+    const seq = await seedFullReplayable({ q: 'select 1' }, 'mcp__db__query');
+
+    const out = captured();
+    const code = await runPermissionReplay({
+      seq,
+      againstCurrentPolicy: true,
+      json: true,
+      dbPath,
+      env,
+      cwd: tmp,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    const obj = JSON.parse(out.lines.join('')) as {
+      against_current_policy: { caveats: string[] };
+    };
+    expect(
+      obj.against_current_policy.caveats.some((c) => c.includes('not in the builtin registry')),
+    ).toBe(true);
+  });
+
+  test('control chars in a non-builtin tool name are stripped from text output', async () => {
+    // Threat model (slice 128): a poisoned MCP manifest registers a tool
+    // whose name carries terminal escapes. The name reaches stdout via
+    // both the `tool:` header AND the non-builtin caveat; both must strip
+    // CC0/CC1 or a replay corrupts the operator's terminal. (Latent until
+    // MCP ships, but the caveat exists precisely for that surface.)
+    const seq = await seedFullReplayable({ q: 'x' }, 'mcp__evil\x1b]0;pwned\x07__t');
+
+    const out = captured();
+    const code = await runPermissionReplay({
+      seq,
+      againstCurrentPolicy: true,
+      dbPath,
+      env,
+      cwd: tmp,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    const text = out.lines.join('');
+    // The dangerous control bytes (ESC, BEL) are gone from the whole
+    // render (header + caveat); the printable bytes around them survive
+    // (stripControlChars only drops CC0/CC1, not `]0;`).
+    expect(text).not.toContain('\x1b');
+    expect(text).not.toContain('\x07');
+    expect(text).toContain('mcp__evil]0;pwned__t');
   });
 
   test('skipped: no approval_call_link for the seq', async () => {

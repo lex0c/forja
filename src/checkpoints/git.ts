@@ -151,6 +151,26 @@ export const isGitRepo = async (cwd: string): Promise<boolean> => {
   }
 };
 
+// Absolute path of the worktree root for `cwd`, or null when `cwd`
+// isn't inside a git work-tree. `--show-toplevel` is the canonical
+// probe; it prints the worktree root (resolving the `.git` pointer of
+// a linked worktree). The checkpoint manager anchors every git
+// invocation here instead of the invocation cwd so snapshot (`add -A`)
+// and restore (`read-tree --reset -u`) both operate on the whole
+// worktree — a snapshot taken from a subdirectory must capture the
+// same tree the worktree-wide restore will later reset (CHECKPOINTS
+// §2.6). We swallow the error and report null rather than surfacing a
+// raw `git rev-parse exited 128`.
+export const getWorktreeRoot = async (cwd: string): Promise<string | null> => {
+  try {
+    const { stdout } = await runGit(['rev-parse', '--show-toplevel'], { cwd });
+    const root = stdout.trim();
+    return root.length > 0 ? root : null;
+  } catch {
+    return null;
+  }
+};
+
 // Returns the SHA of the current HEAD commit, or null when the repo is
 // freshly initialized and HEAD points at an unborn branch. The unborn
 // case is legitimate (user just `git init`-ed and edited a file) so we
@@ -298,6 +318,22 @@ export const snapshot = async (input: SnapshotInput): Promise<SnapshotResult> =>
     if (headSha !== null) {
       await runGit(['read-tree', headSha], { cwd, env });
     }
+    // Capture the set of paths already tracked at HEAD *before* `add -A`
+    // mutates the temp index. The sensitive-path filter below uses it to
+    // narrow itself to UNTRACKED secrets only (see rationale there). We
+    // read it with the same `ls-files` against the same temp index that
+    // the post-`add` listing uses, so both sets share one path
+    // convention and `.has(p)` matches per-path. (The manager anchors
+    // `cwd` at the worktree root, so both listings are toplevel-relative
+    // anyway; the same-listing invariant holds even in the defensive
+    // subdir fallback.) On an unborn HEAD there is nothing tracked, so
+    // every secret is untracked and the filter degrades to its prior
+    // all-removing behavior.
+    let trackedAtHead: Set<string> | null = null;
+    if (headSha !== null) {
+      const headFiles = await runGit(['ls-files', '-z'], { cwd, env });
+      trackedAtHead = new Set(headFiles.stdout.split('\0').filter((s) => s.length > 0));
+    }
     // `add -A` records the full working-tree state into the temp index:
     // tracked modifications, untracked files, deletions. The user's
     // real index stays untouched because GIT_INDEX_FILE points
@@ -315,13 +351,38 @@ export const snapshot = async (input: SnapshotInput): Promise<SnapshotResult> =>
     // SEC §8.4 sensitive-paths patterns identify the canonical
     // secret-shaped files. Walk the temp index, drop any matched
     // entries via `update-index --force-remove --` before the
-    // write-tree. Paths kept in tree-only form for the audit
-    // checkpoint trail; operators who genuinely need to checkpoint
-    // a secret-bearing file move it OUT of the sensitive-name
-    // pattern (rare).
+    // write-tree.
+    //
+    // BUT only for paths that are NOT already tracked at HEAD. SEC §8.4
+    // is explicit that the checkpoint "precisa preservar conteúdo
+    // literal pra /undo funcionar". Stripping a *tracked* secret breaks
+    // restore: `read-tree --reset -u` would delete it from the working
+    // tree (it's in HEAD but absent from the checkpoint tree), and an
+    // unmodified tracked file isn't dirty so it was never stashed →
+    // silent local loss. So tracked secrets must stay in the tree.
+    //
+    // Leak-lifetime caveat (honest accounting): the *unmodified* tracked
+    // blob is already reachable from HEAD, so keeping it costs nothing.
+    // But if the step MODIFIED a tracked secret, the new blob is genuinely
+    // novel and the checkpoint ref now pins it (it survives a HEAD-history
+    // scrub — filter-repo/BFG + gc — until the ref expires or is purged).
+    // We accept this: it is the same property every modified file in the
+    // checkpoint has, and the file is one the user chose to version. The
+    // mitigation is retention (CHECKPOINTS §2.5) plus
+    // `--checkpoints purge <session>`, which operators scrubbing a
+    // committed secret must run alongside the history rewrite. Stripping
+    // the modified case instead is NOT a fix — it reintroduces the
+    // restore data-loss above and also loses the user's edit on /undo.
+    //
+    // The leak this filter actually guards against is the operator's
+    // UNTRACKED secrets sitting in cwd (`.aws/credentials`, `id_rsa`) —
+    // exactly the paths not in `trackedAtHead`. Scoping here closes the
+    // restore data-loss edge without weakening that guard.
     const lsRes = await runGit(['ls-files', '-z'], { cwd, env });
     const indexed = lsRes.stdout.split('\0').filter((s) => s.length > 0);
-    const sensitiveEntries = indexed.filter((p) => matchSensitivePath(p) !== null);
+    const sensitiveEntries = indexed.filter(
+      (p) => matchSensitivePath(p) !== null && !(trackedAtHead?.has(p) ?? false),
+    );
     if (sensitiveEntries.length > 0) {
       // `update-index --force-remove --` takes paths as positionals.
       // Batch in chunks of 512 to stay under argv limits on

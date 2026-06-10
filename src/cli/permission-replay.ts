@@ -274,6 +274,30 @@ const REPLAY_ENGINE_CAVEATS: readonly string[] = [
 const AUTONOMOUS_POSTURE_CAVEAT =
   'approval posture (autonomous) reconstructed from the reason chain, not a persisted column; the auto-approval eligibility re-check runs without the classifier adjust';
 
+// Caveat appended ONLY when the row's tool is NOT in the builtin
+// registry (an MCP or extension tool) and the engine re-ran anyway.
+// tryReExecute resolves the PolicyCategory via the builtin registry;
+// a non-builtin tool falls through to 'misc', whose default path is
+// auto-allow. But the LIVE decision for an MCP tool ran its own
+// manifest resolver (or the conservative confirm-forcing default,
+// PERMISSION_ENGINE.md §5.3) AND carried the +0.10 supply-chain score
+// weight (§6 risk table) — none of which the replay models. So a
+// `changed_decision` verdict here may be an artifact of the wrong
+// category rather than real policy drift, and a `deterministic`
+// verdict is not trustworthy for these tools. Surfacing this keeps the
+// verdict honest for exactly the surface an operator is most likely to
+// audit. Parameterized by tool name (unlike the static caveats) so the
+// operator sees which tool was mis-categorized.
+//
+// `tool_name` is strip-sanitized: it is an audit-row-derived string that
+// lands in operator stdout via the text renderer (renderCaveats → out),
+// and for the non-builtin case it originates from an MCP/extension
+// manifest — the exact untrusted source slice 128 hardens against. The
+// JSON path is already safe (JSON.stringify escapes control chars), but
+// the text path is not, so we strip here at the interpolation site.
+const nonBuiltinCategoryCaveat = (toolName: string): string =>
+  `tool '${stripControlChars(toolName)}' is not in the builtin registry (MCP / extension tool); re-executed as category='misc' (default-allow). The live decision used the tool's own resolver (or the confirm-forcing MCP default) plus the +0.10 supply-chain score weight, none of which are modeled here — the verdict may not reflect the tool's real category`;
+
 interface ReplayResult {
   row: ApprovalLogRow;
   drift: boolean;
@@ -330,7 +354,7 @@ const tryReExecute = (params: {
   // `allow` the live session produced for a low-risk policy confirm;
   // supervised (the default) would return `confirm` and fabricate drift.
   approvalPosture: ApprovalPosture;
-}): { ok: true; decision: Decision } | { ok: false; reason: string } => {
+}): { ok: true; decision: Decision; categoryFallback: boolean } | { ok: false; reason: string } => {
   const { row, policy, db, cwd, home, approvalPosture } = params;
 
   const toolCallId = getToolCallByApprovalSeq(db, row.seq);
@@ -357,6 +381,11 @@ const tryReExecute = (params: {
   const registry = createToolRegistry();
   registerBuiltinTools(registry);
   const tool = registry.get(row.tool_name);
+  // null ⇒ the tool isn't a builtin (MCP / extension). We still
+  // re-execute (as 'misc'), but the caller surfaces a caveat because
+  // the category — and the MCP resolver + supply-chain weight — diverge
+  // from the live decision (see nonBuiltinCategoryCaveat).
+  const categoryFallback = tool === null;
   const category: PolicyCategory = tool?.metadata.category ?? 'misc';
 
   const engine = createPermissionEngine(policy, {
@@ -367,7 +396,7 @@ const tryReExecute = (params: {
   });
   try {
     const decision = engine.check(row.tool_name, category, toolCall.input as ToolArgs);
-    return { ok: true, decision };
+    return { ok: true, decision, categoryFallback };
   } catch (e) {
     return {
       ok: false,
@@ -404,10 +433,6 @@ const analyzeAgainstCurrentPolicy = (params: {
     };
   }
   const posture = rowApprovalPosture(params.row);
-  const ranCaveats =
-    posture === 'autonomous'
-      ? [...REPLAY_ENGINE_CAVEATS, AUTONOMOUS_POSTURE_CAVEAT]
-      : REPLAY_ENGINE_CAVEATS;
   const result = tryReExecute({
     row: params.row,
     policy: params.activePolicy,
@@ -424,6 +449,14 @@ const analyzeAgainstCurrentPolicy = (params: {
       caveats: REPLAY_ENGINE_CAVEATS,
     };
   }
+  // Built after re-execution so the non-builtin caveat can key off
+  // result.categoryFallback. Order: base engine caveats, then the
+  // conditional posture + category caveats.
+  const ranCaveats = [
+    ...REPLAY_ENGINE_CAVEATS,
+    ...(posture === 'autonomous' ? [AUTONOMOUS_POSTURE_CAVEAT] : []),
+    ...(result.categoryFallback ? [nonBuiltinCategoryCaveat(params.row.tool_name)] : []),
+  ];
   const replayedKind = result.decision.kind;
   const replayedReason =
     result.decision.kind === 'confirm'
@@ -510,10 +543,6 @@ const analyzeAgainstArchivedPolicy = (params: {
   }
 
   const posture = rowApprovalPosture(params.row);
-  const ranCaveats =
-    posture === 'autonomous'
-      ? [...REPLAY_ENGINE_CAVEATS, AUTONOMOUS_POSTURE_CAVEAT]
-      : REPLAY_ENGINE_CAVEATS;
   const result = tryReExecute({
     row: params.row,
     policy: archivedPolicy,
@@ -531,6 +560,13 @@ const analyzeAgainstArchivedPolicy = (params: {
       caveats: REPLAY_ENGINE_CAVEATS,
     };
   }
+  // Built after re-execution so the non-builtin caveat can key off
+  // result.categoryFallback (see analyzeAgainstCurrentPolicy).
+  const ranCaveats = [
+    ...REPLAY_ENGINE_CAVEATS,
+    ...(posture === 'autonomous' ? [AUTONOMOUS_POSTURE_CAVEAT] : []),
+    ...(result.categoryFallback ? [nonBuiltinCategoryCaveat(params.row.tool_name)] : []),
+  ];
   const replayedKind = result.decision.kind;
   const replayedReason =
     result.decision.kind === 'confirm'
@@ -641,7 +677,15 @@ const renderText = (result: ReplayResult, out: (s: string) => void): void => {
   const r = result.row;
   out(`Replay approval seq=${r.seq} (install_id=${r.install_id}):\n`);
   out(`  ts:                 ${r.ts}\n`);
-  out(`  tool:               ${r.tool_name} (version=${r.tool_version})\n`);
+  // tool_name + tool_version are audit-row-derived strings printed
+  // straight to operator stdout; for an MCP/extension row tool_name
+  // comes from an untrusted manifest. Strip CC0/CC1 here (slice 128
+  // posture) — otherwise a poisoned name corrupts the terminal before
+  // the non-builtin caveat below even renders, making that caveat's own
+  // sanitize moot. JSON output is already safe via JSON.stringify.
+  out(
+    `  tool:               ${stripControlChars(r.tool_name)} (version=${stripControlChars(r.tool_version)})\n`,
+  );
   out(`  resolver_version:   ${r.resolver_version}\n`);
   out(`  session_id:         ${r.session_id}\n`);
   if (r.parent_approval_id !== null) {

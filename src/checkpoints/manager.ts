@@ -115,6 +115,16 @@ export interface CreateManagerInput {
   cwd: string;
   sessionId: string;
   available: boolean;
+  // Worktree root (`git rev-parse --show-toplevel`) from
+  // detectCheckpointSupport. Every git invocation anchors here so
+  // snapshot/restore cover the whole worktree regardless of which
+  // subdirectory the agent runs from (CHECKPOINTS §2.6). Optional for
+  // backward compat: when omitted, falls back to `cwd` — which is
+  // correct whenever the agent runs from the repo root (the common
+  // case and what the tests exercise). `cwd` itself stays the
+  // invocation directory because retention scoping joins against
+  // `sessions.cwd`, which records the invocation cwd, not the root.
+  gitRoot?: string;
 }
 
 const sessionGetter = (mgr: CheckpointManagerImpl) => mgr.sessionId;
@@ -122,12 +132,18 @@ const sessionGetter = (mgr: CheckpointManagerImpl) => mgr.sessionId;
 class CheckpointManagerImpl implements CheckpointManager {
   readonly db: DB;
   readonly cwd: string;
+  // Worktree root for git invocations. Distinct from `cwd` (the
+  // invocation directory used for DB/session scoping): see
+  // CreateManagerInput.gitRoot. `cwd` fallback keeps repo-root runs and
+  // tests unchanged.
+  readonly gitRoot: string;
   readonly sessionId: string;
   readonly available: boolean;
 
   constructor(input: CreateManagerInput) {
     this.db = input.db;
     this.cwd = input.cwd;
+    this.gitRoot = input.gitRoot ?? input.cwd;
     this.sessionId = input.sessionId;
     this.available = input.available;
   }
@@ -138,7 +154,7 @@ class CheckpointManagerImpl implements CheckpointManager {
     }
     const iso = new Date().toISOString();
     const result = await gitSnapshot({
-      cwd: this.cwd,
+      cwd: this.gitRoot,
       sessionId: this.sessionId,
       stepId: input.stepId,
       iso,
@@ -180,7 +196,7 @@ class CheckpointManagerImpl implements CheckpointManager {
     if (row === null) {
       throw new Error(`checkpoint ${id} not found`);
     }
-    return gitRestore(this.cwd, row.gitRef);
+    return gitRestore(this.gitRoot, row.gitRef);
   }
 
   async diff(id: string): Promise<string> {
@@ -191,7 +207,7 @@ class CheckpointManagerImpl implements CheckpointManager {
     if (row === null) {
       throw new Error(`checkpoint ${id} not found`);
     }
-    return gitDiff(this.cwd, row.gitRef);
+    return gitDiff(this.gitRoot, row.gitRef);
   }
 
   async purge(opts: PurgeOptions = {}): Promise<number> {
@@ -205,7 +221,7 @@ class CheckpointManagerImpl implements CheckpointManager {
         // user can re-run `--checkpoints purge` and the next pass is
         // a no-op on the DB side and retries the ref.
         try {
-          await deleteSessionRef(this.cwd, sid);
+          await deleteSessionRef(this.gitRoot, sid);
         } catch {
           // ignored
         }
@@ -265,7 +281,7 @@ class CheckpointManagerImpl implements CheckpointManager {
             continue;
           }
           try {
-            await deleteSessionRef(this.cwd, sessionId);
+            await deleteSessionRef(this.gitRoot, sessionId);
           } catch {
             // ignored
           }
@@ -296,15 +312,20 @@ class CheckpointManagerImpl implements CheckpointManager {
         // trigger was lost forever on transient failure — aged
         // commits stayed reachable indefinitely.
         const chronological = [...remaining].reverse();
-        const headSha = await getHeadSha(this.cwd).catch(() => null);
+        const headSha = await getHeadSha(this.gitRoot).catch(() => null);
         const rewrites: { id: string; newSha: string }[] = [];
         let priorParent: string | null = headSha;
         let rewriteOk = true;
         for (const ckpt of chronological) {
           try {
-            const treeSha = await getCommitTree(this.cwd, ckpt.gitRef);
-            const message = await getCommitMessage(this.cwd, ckpt.gitRef);
-            const newSha = await rewriteCheckpointCommit(this.cwd, treeSha, priorParent, message);
+            const treeSha = await getCommitTree(this.gitRoot, ckpt.gitRef);
+            const message = await getCommitMessage(this.gitRoot, ckpt.gitRef);
+            const newSha = await rewriteCheckpointCommit(
+              this.gitRoot,
+              treeSha,
+              priorParent,
+              message,
+            );
             rewrites.push({ id: ckpt.id, newSha });
             priorParent = newSha;
           } catch {
@@ -344,7 +365,7 @@ class CheckpointManagerImpl implements CheckpointManager {
           const finalSha = rewrites[rewrites.length - 1]?.newSha;
           if (finalSha !== undefined) {
             try {
-              await setSessionRef(this.cwd, sessionId, finalSha);
+              await setSessionRef(this.gitRoot, sessionId, finalSha);
             } catch {
               // self-heal sweep below detects + retries
             }
@@ -372,7 +393,7 @@ class CheckpointManagerImpl implements CheckpointManager {
     //    at --checkpoints purge for that session).
     if (this.available) {
       try {
-        const refs = await listSessionRefs(this.cwd);
+        const refs = await listSessionRefs(this.gitRoot);
         // Pull every session_id that still has at least one row in a
         // single query, then walk the refs against that set. The
         // earlier per-ref `listCheckpointsBySession` call was O(N×M)
@@ -388,7 +409,7 @@ class CheckpointManagerImpl implements CheckpointManager {
         for (const { sessionId, sha: refSha } of refs) {
           if (!liveSessions.has(sessionId)) {
             try {
-              await deleteSessionRef(this.cwd, sessionId);
+              await deleteSessionRef(this.gitRoot, sessionId);
             } catch {
               // ignored
             }
@@ -401,7 +422,7 @@ class CheckpointManagerImpl implements CheckpointManager {
           if (latest === null) continue;
           if (latest.gitRef === refSha) continue;
           try {
-            await setSessionRef(this.cwd, sessionId, latest.gitRef);
+            await setSessionRef(this.gitRoot, sessionId, latest.gitRef);
           } catch {
             // Move failed again — could be the new commit was gc'd
             // (extremely rare; the rewrite would have been very
@@ -420,7 +441,7 @@ class CheckpointManagerImpl implements CheckpointManager {
     // above so users get one consistent retention window.
     if (this.available) {
       try {
-        const restoreRefs = await listRestoreSavedRefs(this.cwd);
+        const restoreRefs = await listRestoreSavedRefs(this.gitRoot);
         for (const { ref, timestampMs } of restoreRefs) {
           // Skip refs whose name doesn't follow the timestamped format
           // (manual creations, format from a future / past iteration).
@@ -429,7 +450,7 @@ class CheckpointManagerImpl implements CheckpointManager {
           if (timestampMs === null) continue;
           if (timestampMs < cutoffMs) {
             try {
-              await deleteRestoreSavedRef(this.cwd, ref);
+              await deleteRestoreSavedRef(this.gitRoot, ref);
             } catch {
               // ignored
             }
