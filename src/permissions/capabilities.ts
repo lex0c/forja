@@ -62,6 +62,34 @@ const ALL_KINDS: ReadonlySet<string> = new Set<CapabilityKind>([
   'host-passthrough',
 ]);
 
+// Path-shaped fs kinds whose scope is a filesystem path/glob. A `..`
+// segment in these scopes is a directory-traversal escape; the
+// string-prefix coverage check in `capabilityCovers` is blind to
+// it, so the traversal guard there refuses coverage for any such
+// scope. Mirrors `FS_KINDS` used on the enforcement side.
+const PATH_SCOPED_KINDS: ReadonlySet<CapabilityKind> = new Set<CapabilityKind>([
+  'read-fs',
+  'write-fs',
+  'delete-fs',
+]);
+
+// True when a path scope contains a `..` traversal segment in any
+// position: bare `..`, leading `../`, embedded `/../`, or trailing
+// `/..`. Backslash form is covered too — a Windows-style `..\\` is
+// equally a traversal. Used only by the spawn-time string-coverage
+// guard; the enforcement side canonicalizes instead.
+const hasTraversalSegment = (scope: string): boolean => {
+  if (scope === '..') return true;
+  return (
+    scope.startsWith('../') ||
+    scope.startsWith('..\\') ||
+    scope.includes('/../') ||
+    scope.includes('\\..\\') ||
+    scope.endsWith('/..') ||
+    scope.endsWith('\\..')
+  );
+};
+
 export interface Capability {
   kind: CapabilityKind;
   // Scope value verbatim. `null` for the scope-less kinds.
@@ -196,6 +224,25 @@ export const capabilityCovers = (parent: Capability, child: Capability): boolean
   // policy like `kind:**`, and a buggy parent cap must not cover a
   // legitimate child. See INVALID_SCOPE_SENTINEL doc for the rationale.
   if (pScope === INVALID_SCOPE_SENTINEL || cScope === INVALID_SCOPE_SENTINEL) return false;
+
+  // Traversal guard (R5 P0-Bypass-3): a `..` segment in a
+  // path-shaped scope makes string-prefix coverage UNSOUND. The
+  // spawn-time intersection runs this string-only check against
+  // the declared scope verbatim — no canonicalization — so a child
+  // declaring `read-fs:src/../../secret` textually starts with the
+  // parent prefix `src/` and slips into `effective`, then the
+  // child engine's `capabilityCoversCwdAware` canonicalizes it to
+  // `<cwd>/../secret` and grants a read OUTSIDE the parent's
+  // `src/**` grant — privilege escalation across the spawn
+  // boundary. The asymmetry: enforcement canonicalizes, the spawn
+  // gate did not. Fail closed here — a scope with `..` cannot be
+  // proven covered by string matching, so it lands in `excess` and
+  // refuses the spawn. Policy-derived parent scopes never carry
+  // `..` (authored globs); a declared child scope that wants a
+  // sibling tree must name it without traversal.
+  if (PATH_SCOPED_KINDS.has(parent.kind)) {
+    if (hasTraversalSegment(pScope) || hasTraversalSegment(cScope)) return false;
+  }
 
   // exec hierarchy. `arbitrary` is the umbrella; everything else is
   // a literal class name.
