@@ -2,6 +2,81 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-10] fix(providers/anthropic): never send temperature + top_p together (current models 400)
+
+Found by running the recap LLM render against a real Haiku (the `errors[]` work below prompted a
+real-provider spot-check): EVERY recap LLM render (`pr`/`changelog`/`slack`/`terse`/`human`) was
+failing against current Anthropic models with HTTP 400 — "`temperature` and `top_p` cannot both be
+specified for this model. Please use only one." — and silently falling back to the deterministic
+path. The mocked provider in the unit tests accepts both params, so the whole LLM render surface was
+dead-on-arrival in production and no test caught it.
+
+Distinct from the existing `supports_sampling=false` gate (Opus 4.7 deprecated BOTH knobs entirely):
+Haiku 4.5 and the 4.x family accept sampling, they just reject the pair. recap's TOKEN_TUNING §9
+sampling sets `temperature: 0.2` AND `top_p: 0.95`, tripping it on every call.
+
+Fix lives in the Anthropic adapter (the translation layer — not in recap, which legitimately follows
+the spec's sampling values): a `samplingParams` helper forwards `temperature` only when both are
+present (Anthropic's recommended single knob), forwards `top_p` alone when temperature is absent, and
+strips both when `supports_sampling` is false. Applied to both the streaming and constrained paths.
+Three adapter tests (both-set→temperature-only on stream + constrained, top_p-alone preserved); the
+prior `supports_sampling=false` and temperature-only tests still pass. Spec updated: TOKEN_TUNING §9
+gains a note on the temperature+top_p-together rejection (the canonical table fixes both on every
+workflow, so this is table-wide, not recap-specific) and §10.1 lists the adapter's normalization.
+
+Verified end to end against real Haiku: after the fix, `/recap pr` and `/recap changelog` render
+successfully and FAITHFULLY over the error fixtures — the LLM pulls the real `errors[]` summaries
+(recovered + unrecovered) and hallucinates no files (empty `filesWritten` → no fabricated paths),
+which is also the validation for the `errors[]` work below.
+
+## [2026-06-10] feat(recap): wire errors[] from failure_events (projection + human + mini + 3 eval fixtures)
+
+The recap projection hardcoded `errors: []` with a comment claiming the `failure_events` table had
+not landed. It HAS — migration `041-failure-events.ts` plus a full repo (`listFailureEventsBySession`)
+have been present; the projection was simply never connected. So the entire error-recovered eval
+category (RECAP §11.3, 3 fixtures) was wrongly treated as upstream-blocked, and the §3 schema's
+`errors[]` and §3.1 `recap_mini.hasErrors` shipped permanently empty/false.
+
+Wired end to end:
+- **Projection** (`src/recap/projection.ts`): `errors[]` populated from `failure_events` filtered to
+  `user_visible = 1` (the forensic stream carries internal failures the operator never saw; recap is
+  narrative, not the forensic log — §0.7). Each row maps to `{ code, recovered, summary }`.
+  `recovered = recovery_action ∉ {fatal, pending_repair}` — every other action (`ignored`, `degraded`,
+  `retried_Nx`, `fallback_to_X`) left the session able to continue; unseen parameterized actions
+  default to recovered. `summary` is best-effort: the first conventional prose key
+  (`message`/`summary`/`reason`/`detail`) in the already-scrubbed `payload_json`, else empty (renderers
+  fall back to `code`). Windowed by `windowStart` for `/recap last N`, identical to subagents. Failures
+  also land on the timeline.
+- **human renderer**: new conditional `## Issues` section — the full retrospective shows BOTH recovered
+  and unrecovered failures with explicit state tags, so a fatal failure that ended the session is not
+  hidden. `pr`/`changelog` already curate to recovered-only for their audiences and were left as-is:
+  the projection is the complete source of truth, each renderer is a curated view (the subsystem's
+  whole philosophy).
+- **terse / slack renderers**: surface UNRECOVERED failures (recovered stay omitted for concision). A
+  self-review caught that the error fixtures exposed a latent honesty bug — over a fatally-failed
+  session both renderers read like success ("run the migration… 1s, $0.01" / "No actions recorded"),
+  because failed tool calls are excluded from the action counts and neither renderer read `errors[]`.
+  An unrecovered failure changes the meaning of the one-line/team-update summary, so it now appears
+  ("1 unresolved error(s)"); recovered-only sessions are unchanged (they succeeded).
+- **mini renderer**: `hasErrors` now a single indexed COUNT over `user_visible=1` failures (was
+  hardcoded `false`), honouring the <50ms list budget. Terminal `error` status alone does NOT flip it —
+  the signal is a user-visible failure row.
+
+**Spec alignment:** §3 is labelled "(canonical)" and carries `recovered: bool`, so both states are
+surfaceable; §5's parenthetical "(apenas user-visible, recovered)" contradicted that. With the
+operator's go-ahead the spec was clarified: §5's row now reads "recovered **e** não-recovered… o flag
+distingue, o renderer cura", §3's `errors` comment updated, and a new §4.7 documents the per-renderer
+curation policy (human/json = all, pr/changelog = recovered, terse/slack = unrecovered) that until now
+lived only in code.
+
+Tests: 5 projection cases (user-visible filter, recovered mapping across all six actions, empty-summary
+fallback, `last N` windowing), 2 human-renderer cases (Issues tags + omitted-when-empty), 3 mini cases
+(visible→true, non-visible→false, none→false, replacing the obsolete "always false" test), and 3 new
+eval fixtures (08 retry / 09 degraded+fallback / 10 recovered+fatal) with regenerated goldens reviewed
+by hand. Eval catalog now 10/15. Remaining recap debts: line deltas (`linesAdded/Removed`,
+`filesAffected`), `goalStack`/`notDone`/`webFetches`/`artifacts` projection, and a harness-driven
+integration test.
+
 ## [2026-06-10] fix(recap): `--out` write failure no longer drops the `recap_runs` audit row
 
 A review of the recap subsystem surfaced an audit-completeness gap in the `/recap` slash command.

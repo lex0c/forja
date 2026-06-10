@@ -1,0 +1,95 @@
+{
+  "schemaVersion": "v1",
+  "generatedAt": 800000,
+  "scope": {
+    "kind": "session_specific",
+    "sessionIds": [
+      "a8000001-0000-0000-0000-000000000000"
+    ],
+    "range": {
+      "start": 0,
+      "end": 0
+    }
+  },
+  "completeness": {
+    "incomplete": false,
+    "incompleteSessions": [],
+    "incompleteReason": ""
+  },
+  "goal": {
+    "text": "tighten the retry backoff in src/queue.ts",
+    "sourceStepId": "a8000100-0000-0000-0000-000000000000"
+  },
+  "goalStack": [],
+  "decisions": [],
+  "pinnedContext": [],
+  "actions": {
+    "filesRead": [],
+    "filesWritten": [
+      {
+        "path": "/home/lex/proj/src/queue.ts",
+        "linesAdded": 0,
+        "linesRemoved": 0,
+        "semanticSummary": ""
+      }
+    ],
+    "commandsRun": [
+      {
+        "command": "bun test tests/queue/",
+        "exitCode": 0,
+        "durationMs": 1320
+      }
+    ],
+    "webFetches": [],
+    "subagentsSpawned": []
+  },
+  "outcomes": {
+    "testsRun": [
+      {
+        "command": "bun test tests/queue/",
+        "passed": true,
+        "durationMs": 1320
+      }
+    ],
+    "checkpoints": [],
+    "artifacts": []
+  },
+  "timeline": [
+    {
+      "ts": 700000,
+      "event": "session_start",
+      "detail": "a8000001-0000-0000-0000-000000000000"
+    },
+    {
+      "ts": 700250,
+      "event": "failure",
+      "detail": "provider.rate_limit"
+    },
+    {
+      "ts": 701500,
+      "event": "session_end",
+      "detail": "a8000001-0000-0000-0000-000000000000 (done)"
+    }
+  ],
+  "costs": {
+    "tokens": {
+      "in": 3900,
+      "out": 280,
+      "cached": 3100
+    },
+    "usd": 0.018,
+    "durationMs": 1500,
+    "model": "sonnet-4-6",
+    "cacheHitRatio": 0.44285714285714284
+  },
+  "errors": [
+    {
+      "code": "provider.rate_limit",
+      "recovered": true,
+      "summary": "upstream 429; backed off and retried twice"
+    }
+  ],
+  "notDone": [],
+  "unresolvedQuestions": [],
+  "memoryProposed": []
+}

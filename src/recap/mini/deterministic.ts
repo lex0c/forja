@@ -11,9 +11,10 @@
 //   - first user message: drives `goal` and the deterministic
 //     `oneLineSummary` template
 //
-// `hasErrors` stays false until `failure_events` is wired (RECAP
-// §3 schema-fields-blocked tracking). `incomplete` is `status ===
-// 'running'`.
+// `hasErrors` is a single COUNT over `failure_events` filtered to
+// `user_visible = 1` (RECAP §3.1: "true se sessão tem
+// failure_events visíveis") — kept cheap to honour the <50ms list
+// budget. `incomplete` is `status === 'running'`.
 
 import { basename } from 'node:path';
 import type { DB } from '../../storage/db.ts';
@@ -78,6 +79,18 @@ const countFileWrites = (db: DB, sessionId: string, toolNames: readonly string[]
            AND tool_name IN (${placeholders})`,
     )
     .get(sessionId, ...toolNames) as { count: number } | null;
+  return row?.count ?? 0;
+};
+
+// User-visible failure count drives `hasErrors`. Indexed on
+// session_id (migration 041), so this is a single cheap lookup —
+// no row materialization, matching the projection's read budget.
+const countUserVisibleFailures = (db: DB, sessionId: string): number => {
+  const row = db
+    .query<{ count: number }, [string]>(
+      'SELECT COUNT(*) AS count FROM failure_events WHERE session_id = ? AND user_visible = 1',
+    )
+    .get(sessionId);
   return row?.count ?? 0;
 };
 
@@ -152,9 +165,7 @@ export const projectRecapMini = (db: DB, input: ProjectRecapMiniInput): RecapMin
     cwdLabel,
     oneLineSummary: buildDeterministicOneLine(session.status, steps, filesChanged, goal),
     filesChanged,
-    // `hasErrors` is wired to `failure_events` once it lands;
-    // until then, default to false (the projection has no signal).
-    hasErrors: false,
+    hasErrors: countUserVisibleFailures(db, session.id) > 0,
     incomplete,
   };
 };

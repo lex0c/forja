@@ -27,6 +27,9 @@ const buildSummary = (intermediate: RecapIntermediate): string[] => {
   if (intermediate.outcomes.checkpoints.length > 0) {
     counts.push(`${intermediate.outcomes.checkpoints.length} checkpoint(s)`);
   }
+  if (intermediate.errors.length > 0) {
+    counts.push(`${intermediate.errors.length} issue(s)`);
+  }
   if (counts.length > 0) {
     parts.push(counts.join(', ').slice(0, HUMAN_LIMITS.summaryMaxChars));
   }

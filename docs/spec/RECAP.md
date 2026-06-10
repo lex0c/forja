@@ -131,7 +131,7 @@ recap_intermediate:
     duration_ms: int
     model: string
     cache_hit_ratio: float
-  errors:                            # falhas tratadas que valem mencionar
+  errors:                            # falhas user-visible (failure_events); recovered E não-recovered, distinguidas pelo flag
     - { code: string, recovered: bool, summary: string }
   not_done:                          # honestidade epistêmica (de subagent_outputs.not_done, schema de playbooks, etc)
     - { what: string, reason: string }
@@ -329,6 +329,18 @@ Refactored queue retry logic — extracted `computeBackoff` to pure function wit
 
 Útil pra footer / status line / commit body.
 
+### 4.7 Curadoria de `errors[]` por renderer
+
+A projeção popula `errors[]` **completo** — toda falha `user_visible=1`, recovered e não-recovered. Cada renderer decide o que é relevante pro seu público: a projeção é source of truth, o renderer é vista (§0.1). A regra é uniforme em §0.6 — **nenhuma surface pode ler como sucesso sobre uma sessão que terminou em falha não-recuperada**.
+
+| Renderer | Mostra | Por quê |
+|---|---|---|
+| `human` / `json` | **todas** (com flag `recovered`) | retrospecto completo; esconder uma falha fatal que encerrou a sessão engana o operador |
+| `pr` / `changelog` | apenas **recovered** | descrição de mudança / entry user-facing fala do que foi feito — uma falha fatal não é um `Fixed` nem uma nota de PR |
+| `terse` / `slack` | apenas **não-recovered** | a linha-resumo muda de sentido se a sessão falhou; uma falha recuperada não alterou o desfecho, então é omitida por concisão |
+
+Falhas tratadas pelo harness mas **não** user-visible (stream forense de `failure_events`, `FAILURE_MODES.md §19`) nunca entram em `errors[]` — recap é narrativa, não o log forense (§0.7).
+
 ---
 
 ## 5. Source of truth (o que é carregado de onde)
@@ -346,7 +358,7 @@ Refactored queue retry logic — extracted `computeBackoff` to pure function wit
 | `outcomes.tests_run` | heurística sobre `bash` commands matching test runners |
 | `outcomes.checkpoints` | tabela `checkpoints` |
 | `costs` | agregado de `messages.tokens_*` + custo por modelo |
-| `errors` | `failure_events` (apenas user-visible, recovered) |
+| `errors` | `failure_events` com `user_visible=1` — recovered **e** não-recovered (`recovered = recovery_action ∉ {fatal, pending_repair}`); o flag distingue, o renderer cura (§4.7) |
 | `not_done` | extraído de subagent outputs + playbook reports + assistant messages com explicit "not done" markers |
 | `memory_proposed` | tabela `memory_events` (action='proposed') |
 

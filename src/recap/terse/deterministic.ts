@@ -44,6 +44,14 @@ const buildSentence = (
   if (a.subagentsSpawned.length > 0) {
     counts.push(`${a.subagentsSpawned.length} subagent(s) spawned`);
   }
+  // Unrecovered failures change the meaning of the whole sentence —
+  // a terse line that reads like success over a session that ended
+  // on a fatal error misleads the operator (RECAP §0.6). Recovered
+  // failures are omitted here: they did not change the outcome, and
+  // the one-sentence budget is for what mattered. The full list
+  // (recovered + unrecovered) lives in the human/json surfaces.
+  const unrecovered = intermediate.errors.filter((e) => !e.recovered).length;
+  if (unrecovered > 0) counts.push(`${unrecovered} unresolved error(s)`);
 
   let body: string;
   if (segments.length === 0 && counts.length === 0) {

@@ -1,0 +1,86 @@
+{
+  "schemaVersion": "v1",
+  "generatedAt": 1000000,
+  "scope": {
+    "kind": "session_specific",
+    "sessionIds": [
+      "b1000001-0000-0000-0000-000000000000"
+    ],
+    "range": {
+      "start": 0,
+      "end": 0
+    }
+  },
+  "completeness": {
+    "incomplete": false,
+    "incompleteSessions": [],
+    "incompleteReason": ""
+  },
+  "goal": {
+    "text": "run the migration against staging",
+    "sourceStepId": "b1000100-0000-0000-0000-000000000000"
+  },
+  "goalStack": [],
+  "decisions": [],
+  "pinnedContext": [],
+  "actions": {
+    "filesRead": [],
+    "filesWritten": [],
+    "commandsRun": [],
+    "webFetches": [],
+    "subagentsSpawned": []
+  },
+  "outcomes": {
+    "testsRun": [],
+    "checkpoints": [],
+    "artifacts": []
+  },
+  "timeline": [
+    {
+      "ts": 900000,
+      "event": "session_start",
+      "detail": "b1000001-0000-0000-0000-000000000000"
+    },
+    {
+      "ts": 900240,
+      "event": "failure",
+      "detail": "storage.connection_reset"
+    },
+    {
+      "ts": 900260,
+      "event": "failure",
+      "detail": "storage.migration_failed"
+    },
+    {
+      "ts": 901400,
+      "event": "session_end",
+      "detail": "b1000001-0000-0000-0000-000000000000 (error)"
+    }
+  ],
+  "costs": {
+    "tokens": {
+      "in": 2800,
+      "out": 150,
+      "cached": 2200
+    },
+    "usd": 0.011,
+    "durationMs": 1400,
+    "model": "sonnet-4-6",
+    "cacheHitRatio": 0.44
+  },
+  "errors": [
+    {
+      "code": "storage.connection_reset",
+      "recovered": true,
+      "summary": "staging db dropped the connection; retried once"
+    },
+    {
+      "code": "storage.migration_failed",
+      "recovered": false,
+      "summary": "migration aborted; staging left unchanged"
+    }
+  ],
+  "notDone": [],
+  "unresolvedQuestions": [],
+  "memoryProposed": []
+}
