@@ -30,7 +30,7 @@ import {
   runAgent,
 } from '../harness/index.ts';
 import { RESUME_FULL_WARN_THRESHOLD } from '../harness/resume.ts';
-import { effectiveBudget, resolveMaxOutputTokens } from '../harness/types.ts';
+import { effectiveBudget, isRecapEnabled, resolveMaxOutputTokens } from '../harness/types.ts';
 import { dispatchChain } from '../hooks/dispatcher.ts';
 import type { HookChainResult, HookEventPayload } from '../hooks/types.ts';
 import type { PolicySource } from '../permissions/index.ts';
@@ -2762,6 +2762,18 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       parseSlashInput(renderer.state().input.value) === null
     ) {
       cancelExitArm();
+      if (!isRecapEnabled(baseConfig)) {
+        // RECAP §3.3: auto-display (session-end terse AND Alt+R) is
+        // one of the three surfaces the recap master switch disables.
+        // Warn so the operator who pressed Alt+R learns why nothing
+        // rendered instead of the keypress silently no-op'ing.
+        bus.emit({
+          type: 'warn',
+          ts: now(),
+          message: 'recap terse: disabled (--no-recap / [recap].enabled=false)',
+        });
+        return true;
+      }
       const sessionId = lastSessionId;
       if (sessionId === null) {
         bus.emit({

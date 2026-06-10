@@ -44,6 +44,12 @@ so the flag reached the slash parser as an unknown flag (error) instead of setti
 subcommand parser now consumes `--no-recap` at its boundary (like `--json`/`--model`), so the
 advertised headless deterministic-render switch actually works for `agent recap`.
 
+Follow-up 2: the REPL `Alt+R` idle handler still called `buildAutoTerse` unconditionally — the
+session-end and resume paths were gated on `isRecapEnabled` but Alt+R was not, so with recap disabled
+an operator could still press Alt+R and get a terse line (§3.3 lists Alt+R as part of the disabled
+auto-display surface). The handler now checks `isRecapEnabled(baseConfig)` first and warns ("recap
+terse: disabled") so the explicit keypress reports why nothing rendered.
+
 ## [2026-06-10] fix(providers/anthropic): never send temperature + top_p together (current models 400)
 
 Found by running the recap LLM render against a real Haiku (the `errors[]` work below prompted a
