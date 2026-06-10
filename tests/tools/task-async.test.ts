@@ -660,3 +660,82 @@ describe('task_async / task_await / task_cancel tools', () => {
     expect(recorded3[0]?.details).toEqual({ depth: 5, max_depth: 4 });
   });
 });
+
+describe('task_await — output summarization (OUTPUT_POLICY §3.1/§6)', () => {
+  // > 16 KB across many short lines → many-lines head/tail path.
+  const bigOutput = Array.from({ length: 4000 }, (_, i) => `line ${i}`).join('\n');
+
+  test('declares the shared head_tail summarize policy (mirrors sync task)', () => {
+    expect(typeof taskAwaitTool.metadata.summarize).toBe('function');
+  });
+
+  test('passthrough: a small collected output is not reduced', () => {
+    const out = taskAwaitTool.metadata.summarize?.(
+      {
+        output: 'short conclusion',
+        session_id: 's',
+        status: 'done',
+        reason: 'done',
+        cost_usd: 0,
+        steps: 1,
+        duration_ms: 1,
+      },
+      {},
+    );
+    expect(out?.reduced).toBe(false);
+    expect(out?.policy).toBe('noop');
+  });
+
+  test('reduction: a large collected output is head-tailed, scalars preserved', () => {
+    const raw = {
+      output: bigOutput,
+      session_id: 'child-x',
+      status: 'done' as const,
+      reason: 'done',
+      cost_usd: 0.5,
+      steps: 9,
+      duration_ms: 1234,
+    };
+    const out = taskAwaitTool.metadata.summarize?.(raw, {});
+    expect(out?.reduced).toBe(true);
+    expect(out?.policy).toBe('head_tail');
+    expect(out?.originalBytes).toBe(Buffer.byteLength(bigOutput, 'utf8'));
+    const reduced = out?.result as typeof raw;
+    expect(reduced.output.length).toBeLessThan(bigOutput.length);
+    expect(reduced.output).toContain('elided');
+    // Pure: the raw object the harness persisted is not mutated.
+    expect(raw.output).toBe(bigOutput);
+    expect(reduced.session_id).toBe('child-x');
+    expect(reduced.cost_usd).toBe(0.5);
+  });
+
+  test('error path: a verbose failed child has details.output trimmed inline (summarize skips errors)', async () => {
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => ({
+        kind: 'ran',
+        output: bigOutput,
+        sessionId: `child-${args.name}`,
+        status: 'exhausted',
+        reason: 'maxSteps',
+        costUsd: 0.1,
+        steps: 50,
+        durationMs: 10,
+      }),
+    });
+    const ctx = makeCtx({ subagentHandleStore: store });
+    const spawn = await taskAsyncTool.execute(
+      { subagent: 'explore', prompt: 'p', capabilities: [] },
+      ctx,
+    );
+    if (isToolError(spawn)) throw new Error('spawn should succeed');
+    const awaitRes = await taskAwaitTool.execute({ handle_id: spawn.handle_id }, ctx);
+    expect(isToolError(awaitRes)).toBe(true);
+    if (!isToolError(awaitRes)) return;
+    const detailsOutput = awaitRes.details?.output;
+    expect(typeof detailsOutput).toBe('string');
+    expect((detailsOutput as string).length).toBeLessThan(bigOutput.length);
+    expect(detailsOutput as string).toContain('elided');
+    expect(awaitRes.details?.session_id).toBe('child-explore');
+  });
+});

@@ -66,6 +66,7 @@ Per-tool tuning:
 | `bash` (stdout) | 16 KB | 80 + 80 linhas | Aplicado independente do stderr |
 | `bash` (stderr) | 16 KB | 80 + 80 linhas | Não concatenar; operadores leem streams separados |
 | `glob` (matches array) | 200 items | 50 head + 50 tail | Ordem alfabética torna head/tail informativos |
+| `task_sync` / `task` / `task_await` (`output`) | 16 KB | 80 + 80 linhas | Texto final do child; raw completo permanece no audit do parent e é recuperável via `session_id`. Vale para a coleta síncrona E assíncrona — `task_await` espelha `TaskOutput`. O path de erro (status≠done) trunca `details.output` inline (summarize não roda em erro, §0.4) |
 
 ### 3.2 `group_by_file` — grep
 
@@ -106,7 +107,8 @@ Não-determinismo no summarizer (clock, I/O, random) é **proibido pela invarian
 
 ## 6. Quando NÃO usar summarize
 
-- Tools cujo output é per-design pequeno (read_file paginated, memory_*, skill_*, todo_write, task_*): adicionar summarize seria overhead em vazio. Não declarar.
+- Tools cujo output é per-design pequeno (read_file paginated, memory_*, skill_*, todo_write, task_async / task_cancel / task_list): adicionar summarize seria overhead em vazio. Não declarar.
+- **Exceção: `task_sync` / `task` / `task_await`.** O envelope é pequeno em escalares (session_id, status, cost, steps), mas o campo `output` carrega o texto final do child — que pode chegar ao teto de output-tokens do child e é re-enviado a cada turno do parent (write cost). Vale tanto para a coleta síncrona (`task` / `task_sync`) quanto para a assíncrona (`task_await`, que espelha `TaskOutput`): um child verboso coletado via `task_async` + `task_await` reentraria no contexto exatamente como o sync. Declaram `summarize` (head_tail sobre `output`, helper compartilhado em `task-shared.ts`); o raw completo permanece no `tool_calls.output` do parent (§0.1) E no run do child (recuperável via `session_id`). O path de erro (status≠done) trunca `details.output` inline, porque o harness não roteia erros por `summarize` (§0.4) — mantém o shape do erro pequeno por construção sem perder o ponteiro `session_id`. `task_async` em si fica de fora: devolve só o handle + metadata pequenos.
 - Outputs estruturados onde TODO campo é load-bearing (e.g., `task_async` retorna handle + metadata pequenos). Reduzir corromperia o contrato.
 - ToolError, como já dito — o harness roteia separado.
 

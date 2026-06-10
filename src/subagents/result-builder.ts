@@ -21,6 +21,7 @@ export interface RunSubagentResult {
     | 'subprocess_crashed'
     | 'subprocess_spawn_failed'
     | 'heartbeat_stale'
+    | 'startup_stalled'
     | 'ipc_version_mismatch'
     // Child-emitted (subagent-child.ts startup-refusal paths).
     // The child publishes these in `setSubagentPayload` BEFORE
@@ -133,6 +134,7 @@ const VALID_REASON_MAP: Record<RunSubagentResult['reason'], true> = {
   subprocess_crashed: true,
   subprocess_spawn_failed: true,
   heartbeat_stale: true,
+  startup_stalled: true,
   ipc_version_mismatch: true,
   // Child-emitted startup-refusal reasons (subagent-child.ts).
   // The child publishes these in `setSubagentPayload` BEFORE
@@ -215,6 +217,7 @@ export interface SubagentEnvelope {
     | 'subprocess_crashed'
     | 'subprocess_spawn_failed'
     | 'heartbeat_stale'
+    | 'startup_stalled'
     | 'ipc_version_mismatch'
     | 'unknown_model'
     | 'unknown_tool'

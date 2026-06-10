@@ -1,6 +1,7 @@
 import { parseCapability } from '../../permissions/capabilities.ts';
 import type { WorktreeOutcome } from '../../subagents/types.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
+import { childOutputHeadTail, summarizeChildEnvelope } from './task-shared.ts';
 
 // `task` invokes a subagent (spec §11). The model passes a subagent
 // name (resolved against the harness-level registry) and a prompt;
@@ -113,6 +114,12 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
     writes: false,
     idempotent: false,
     display: 'raw',
+    // Head-tail the child's `output` before it re-enters the parent
+    // context (OUTPUT_POLICY §3.1 / §6 exception). Raw stays in the
+    // parent's audit row; full text recoverable via session_id.
+    // `taskSyncTool` inherits this via the spread below; `task_await`
+    // shares the same `summarizeChildEnvelope` helper.
+    summarize: summarizeChildEnvelope,
   },
   async execute(args, ctx): Promise<ToolResult<TaskOutput>> {
     if (ctx.signal.aborted) {
@@ -309,6 +316,15 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
       const causeSuffix =
         result.detail !== undefined && result.detail.length > 0 ? `: ${result.detail}` : '';
       const detail = `subagent '${args.subagent}' exited with status='${result.status}', reason='${result.reason}'${causeSuffix}`;
+      // Head-tail the child's partial output here: the error path
+      // returns a ToolError, which the harness routes around
+      // `metadata.summarize` (OUTPUT_POLICY §0.4). Without this trim a
+      // failed-but-verbose child (exhausted / maxSteps with a long
+      // transcript) would dump its full output into `details.output`
+      // uncapped — the same context weight the success path now caps.
+      // The marker headTailSummary inserts signals the elision; the
+      // full text stays recoverable via `session_id`.
+      const errorOutput = childOutputHeadTail(result.output).text;
       return toolError('subagent.run_failed', detail, {
         retryable: result.status === 'exhausted',
         details: {
@@ -319,7 +335,7 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
           cost_usd: result.costUsd,
           steps: result.steps,
           duration_ms: result.durationMs,
-          output: result.output,
+          output: errorOutput,
           ...(result.auditFailure !== undefined ? { audit_failure: result.auditFailure } : {}),
           ...(result.worktree !== undefined ? { worktree: result.worktree } : {}),
           ...(result.worktreeError !== undefined ? { worktree_error: result.worktreeError } : {}),

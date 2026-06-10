@@ -38,6 +38,27 @@ const POLL_GROWTH = 2;
 // pauses without false-positive killing of healthy children.
 export const HEARTBEAT_STALE_THRESHOLD_MS = 10_000;
 
+// Startup deadline for the child's FIRST pulse. The heartbeat-stale
+// path above only fires once `last_heartbeat` is non-null — but the
+// child stamps its first beat only AFTER `insertSubagentOutput`, and
+// everything before that (open DB, run migrations, detect the
+// sandbox, load the audit row, assemble the system prompt, construct
+// the provider) runs with no heartbeat coverage. A child wedged in
+// that window (SQLite lock on open, a hung sandbox probe, slow cold
+// start of the compiled binary) would otherwise be caught only by
+// the wall-clock ceiling — DEFAULT_WALL_CLOCK_MS (1h).
+//
+// This bounds the boot-hang to single-digit-times-ten seconds. The
+// child does only LOCAL work before its first beat (no provider
+// request — that happens inside the harness loop, after the beat is
+// running), so 30s is a generous ceiling: a healthy boot is
+// sub-second even on a loaded machine, and the cushion absorbs cold
+// binary start + migration replay + SQLite contention without a
+// false-positive kill. The child writes its first beat at
+// HEARTBEAT_CADENCE_MS (2s) after the outputs row lands, so a healthy
+// child clears this gate with ~28s to spare.
+export const STARTUP_STALE_THRESHOLD_MS = 30_000;
+
 // Wait for the subprocess to publish its terminal payload, OR
 // exit without one (child crashed), OR be killed by signal /
 // wall-clock. Returns the resolved state; the runtime's caller
@@ -47,7 +68,8 @@ export type WaitOutcome =
   | { kind: 'crashed'; exitCode: number }
   | { kind: 'aborted'; cause: 'soft' | 'hard' }
   | { kind: 'wall_clock' }
-  | { kind: 'heartbeat_stale' };
+  | { kind: 'heartbeat_stale' }
+  | { kind: 'startup_stalled' };
 
 interface WaitForChildArgs {
   db: DB;
@@ -63,6 +85,12 @@ interface WaitForChildArgs {
   wallClockMs: number;
   graceMs: number;
   heartbeatStaleMs: number;
+  // Deadline for the child's FIRST heartbeat, measured from
+  // `startTs`. While the child has never pulsed (no outputs row, or
+  // the row exists but `last_heartbeat` is still null), the
+  // heartbeat-stale path can't fire; this catches a boot-time wedge
+  // that would otherwise wait out the full wall-clock.
+  startupStaleMs: number;
   startTs: number;
 }
 
@@ -128,6 +156,7 @@ export const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome>
     wallClockMs,
     graceMs,
     heartbeatStaleMs,
+    startupStaleMs,
     startTs,
   } = args;
 
@@ -136,7 +165,7 @@ export const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome>
   // heartbeat_stale). The abort path uses `interruptCause`
   // separately so its soft/hard discriminator survives into
   // the outcome.
-  let killed: 'wall_clock' | 'heartbeat_stale' | undefined;
+  let killed: 'wall_clock' | 'heartbeat_stale' | 'startup_stalled' | undefined;
   let killedAt = 0;
   // Tri-state tracking the parent's cooperative-vs-preemptive
   // escalation against the child.
@@ -225,8 +254,8 @@ export const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome>
       }
       // Verdict precedence on no-payload exit:
       //
-      //   1. `killed` (wall_clock / heartbeat_stale): system
-      //      constraint terminations win over operator intent.
+      //   1. `killed` (wall_clock / heartbeat_stale / startup_stalled):
+      //      system constraint terminations win over operator intent.
       //      Both fired SIGTERM at the child, and the budget
       //      cap (or hung-tool detection) is what actually
       //      caused the death — the soft signal in flight
@@ -350,6 +379,26 @@ export const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome>
     const elapsed = Date.now() - startTs;
     if (elapsed >= wallClockMs && killed === undefined) {
       killed = 'wall_clock';
+      killedAt = Date.now();
+      handle.kill('SIGTERM');
+      scheduleKill();
+    }
+
+    // Startup deadline — the child has never pulsed (outputs row
+    // absent, OR present but `last_heartbeat` still null) and the
+    // first-pulse window has elapsed since spawn. Mutually exclusive
+    // with the heartbeat-stale check below, which structurally
+    // requires a non-null `last_heartbeat`: a child that wedges
+    // BEFORE its first beat (boot-time hang) is invisible to that
+    // path and would otherwise sit until the wall-clock ceiling.
+    // Same escalation shape: SIGTERM now, SIGKILL after grace.
+    if (
+      killed === undefined &&
+      interruptCause === undefined &&
+      (out === null || out.lastHeartbeat === null) &&
+      Date.now() - startTs > startupStaleMs
+    ) {
+      killed = 'startup_stalled';
       killedAt = Date.now();
       handle.kill('SIGTERM');
       scheduleKill();
