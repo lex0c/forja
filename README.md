@@ -120,8 +120,8 @@ agent --json "what changed in the last commit?" > events.ndjson
 ## Modes
 
 **Interactive REPL** (default). Persistent TUI with inline rendering, slash
-commands (`/memory`, `/budget`, `/history`, …), reverse search,
-ctrl-c double-tap-to-exit gate.
+commands (`/model`, `/effort`, `/memory`, `/budget`, `/history`, …), reverse
+search, ctrl-c double-tap-to-exit gate.
 
 **One-shot.** Pass the prompt as a positional arg; Forja runs to completion
 and exits. Useful in scripts:
@@ -149,8 +149,57 @@ agent --json "lint the src/ tree" | jq 'select(.type=="tool:end")'
 | Google | gemini-2.x families | — | ✓ | Same compat path as OpenAI. |
 | Local models | Planned (`ollama`, `llama.cpp`) | varies | varies | Specs in `docs/spec/LOCAL_MODELS.md`; not yet shipped. |
 
-Switch with `--model <id>`. Cost is computed per-turn from declared per-1M
-pricing in `src/providers/<family>/capabilities.ts`.
+Cost is computed per-turn from declared per-1M pricing in
+`src/providers/<family>/capabilities.ts`.
+
+---
+
+## Model & effort
+
+Two independent knobs control how a run thinks. Both can be set at boot
+(flag or config) and changed in-session (slash command, effective next turn).
+
+### Model
+
+Which provider/model answers. Resolution order (first wins):
+
+1. `--model <id>` flag — `agent --model openai/gpt-4o "..."`
+2. Project config — `.agent/config.toml` → `[providers].model`
+3. User config — `~/.config/forja/config.toml` → `[providers].model`
+4. Built-in default — `anthropic/claude-opus-4-8`
+
+In the REPL, `/model` shows the active model and its capabilities (context
+window, max output); `/model <id>` switches it from the next turn. The swap is
+session-scoped and in memory — it is not written to config or the session row.
+
+```toml
+# .agent/config.toml
+[providers]
+model = "anthropic/claude-opus-4-8"
+```
+
+### Effort
+
+One knob, two axes: it sets the provider's **reasoning depth** *and* a set of
+**operational budget caps** (max steps, parallel subagents, tolerated tool
+errors). Levels: `low | medium | high | max` (default `high`).
+
+Resolution order (first wins):
+
+1. Project config — `.agent/config.toml` → `[effort].level`
+2. User config — `~/.config/forja/config.toml` → `[effort].level`
+3. Built-in default — `high`
+
+In the REPL, `/effort` shows the active level with its resolved caps and the
+per-provider mapping; `/effort <level>` sets it from the next turn (in memory,
+not persisted). Subagents inherit the operator's level. An explicit `/budget`
+override always wins over the level's preset caps.
+
+```toml
+# .agent/config.toml
+[effort]
+level = "high"
+```
 
 ---
 
