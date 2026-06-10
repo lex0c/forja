@@ -132,6 +132,58 @@ describe('createSpawnBroker — real subprocess happy path', () => {
     expect(r.error).toBe('response missing required fields');
     await broker.close();
   });
+
+  test('contradictory ok=false + exitCode 0 + no error is rejected (not trusted as success)', async () => {
+    // The bash consumer reconstructs its verdict from exitCode/error and
+    // never reads `ok`, so a worker emitting this self-contradictory
+    // shape (ok=false yet a clean exit-0 with no error) would otherwise
+    // be reconstructed downstream as a SUCCESS carrying the worker's
+    // stdout. Fail closed at the gate: the contract says ok=false must
+    // carry an error or a non-zero exitCode.
+    const broker = createSpawnBroker({
+      command: '/bin/sh',
+      args: [
+        '-c',
+        'IFS= read -r _; printf \'{"ok":false,"stdout":"PWNED","stderr":"","exitCode":0}\\n\'',
+      ],
+    });
+    const r = await broker.execute(baseRequest());
+    expect(r.ok).toBe(false);
+    expect(r.error).toBe('response missing required fields');
+    await broker.close();
+  });
+
+  test('contradictory ok=true + non-zero exitCode is rejected', async () => {
+    const broker = createSpawnBroker({
+      command: '/bin/sh',
+      args: [
+        '-c',
+        'IFS= read -r _; printf \'{"ok":true,"stdout":"","stderr":"","exitCode":3}\\n\'',
+      ],
+    });
+    const r = await broker.execute(baseRequest());
+    expect(r.ok).toBe(false);
+    expect(r.error).toBe('response missing required fields');
+    await broker.close();
+  });
+
+  test('legitimate ok=false with non-zero exitCode still passes the gate', async () => {
+    // The guard must not over-reject the common failure shape: a tool
+    // that exited non-zero is ok=false with exitCode set and no error.
+    const broker = createSpawnBroker({
+      command: '/bin/sh',
+      args: [
+        '-c',
+        'IFS= read -r _; printf \'{"ok":false,"stdout":"","stderr":"boom","exitCode":1}\\n\'',
+      ],
+    });
+    const r = await broker.execute(baseRequest());
+    expect(r.ok).toBe(false);
+    expect(r.error).toBeUndefined();
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toBe('boom');
+    await broker.close();
+  });
 });
 
 // ─── timeout (real subprocess) ─────────────────────────────────────────────

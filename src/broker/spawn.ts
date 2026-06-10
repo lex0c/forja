@@ -172,6 +172,22 @@ const isBrokerResponse = (v: unknown): v is BrokerResponse => {
   if (o.error !== undefined && typeof o.error !== 'string') return false;
   if (o.stdoutTruncated !== undefined && typeof o.stdoutTruncated !== 'boolean') return false;
   if (o.stderrTruncated !== undefined && typeof o.stderrTruncated !== 'boolean') return false;
+  // Contract invariant (BrokerResponse doc): `ok` is the authoritative
+  // success signal — ok=true IFF the tool exited 0; ok=false carries
+  // EITHER a broker-side `error` (exitCode undefined) OR a non-zero
+  // exitCode. The bash consumer reconstructs its verdict from
+  // exitCode/error and never reads `ok`, so the two only agree by the
+  // producer's discipline (handlers/bash.ts binds `ok: exitCode===0`).
+  // Reject contradictory shapes at the single parsing perimeter so a
+  // drifted or future handler that emits e.g. {ok:false, exitCode:0,
+  // no error} can't be reconstructed as a success — fail closed rather
+  // than trust the cross-field consistency downstream. Verified against
+  // every current producer (framework short-circuits always carry
+  // `error`; the bash handler always satisfies ok≡exitCode===0).
+  const ok = o.ok === true; // narrowed: the typeof check above guarantees boolean
+  const exitZero = o.exitCode === 0;
+  if (ok && o.exitCode !== undefined && !exitZero) return false; // ok=true but exited non-zero
+  if (!ok && o.error === undefined && exitZero) return false; // ok=false, exit 0, no error
   return true;
 };
 
