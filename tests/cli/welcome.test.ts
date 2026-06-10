@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs } from '../../src/cli/args.ts';
+import { resetSharedDoctorCache } from '../../src/cli/doctor-cache.ts';
 import { runWelcome } from '../../src/cli/welcome.ts';
 
 const captured = () => {
@@ -12,6 +13,20 @@ const captured = () => {
 
 const ALWAYS_WHICH = (cmd: string): string | null => `/usr/bin/${cmd}`;
 const NEVER_WHICH = (_cmd: string): string | null => null;
+
+// runWelcome embeds runDoctor, whose checks memoize into a shared
+// module-level cache keyed by check NAME only (net_filtering /
+// mac_lsm / user_namespaces). That cache persists across tests AND
+// across test files in the same bun process. Without a reset, an
+// earlier test (here or in doctor.test.ts) that computed
+// net_filtering=warn on a runner without nft poisons the cache, so a
+// later test reading runWelcome's output sees the stale "nft ...
+// version probe failed" line regardless of its own runCmd seam —
+// which trips this suite's `not.toContain('version ')` assertion.
+// Reset before every test so each computes fresh from its own seams.
+beforeEach(() => {
+  resetSharedDoctorCache();
+});
 
 describe('parseArgs — agent welcome', () => {
   test('verb is recognized', () => {
@@ -292,6 +307,14 @@ describe('runWelcome — §13.5 sandbox_skip', () => {
       env: { PATH: process.env.PATH },
       which: ALWAYS_WHICH,
       exists: (p) => p.startsWith('/usr/bin/'),
+      // Pin the embedded doctor's host probes so its output (which
+      // welcome prints inline, sharing this `out`) stays deterministic
+      // and doesn't leak "nft ... version probe failed" into the
+      // not.toContain('version ') assertion below on a runner without
+      // nftables/bwrap.
+      isExecutable: (p) => p.startsWith('/usr/bin/'),
+      runCmd: (cmd) => (cmd === 'nft' ? 'nftables v1.0.9 (Old Doc Yak)\n' : null),
+      readFile: (path) => (path === '/proc/sys/user/max_user_namespaces' ? '15000\n' : null),
       hasSkipMarker: () => true,
       readSkipMarker: () => ({
         path: '/cfg/forja/sandbox_skip',

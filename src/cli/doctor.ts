@@ -69,6 +69,13 @@ export interface RunDoctorOptions {
   // detectSandboxAvailability.
   exists?: (path: string) => boolean;
   stat?: (path: string) => { uid: number; mode: number } | null;
+  // Execute-access (X_OK) probe for the canonical-first resolver.
+  // Production uses `accessSync(path, X_OK)`. Without this seam the
+  // resolver falls back to the real kernel check, so the `sandbox` /
+  // `sandbox_enforcement` checks depend on whether the runner
+  // actually has an *executable* /usr/bin/bwrap — flaky on CI hosts
+  // that mock `which`/`exists` but lack the real binary.
+  isExecutable?: (path: string) => boolean;
   // Working directory used by the sealing check's policy resolution.
   // Defaults to process.cwd() in production; tests pin a specific
   // directory containing the relevant `.agent/permissions.yaml`.
@@ -161,11 +168,13 @@ const sandboxCheck = (
   which: (cmd: string) => string | null,
   exists?: (path: string) => boolean,
   stat?: (path: string) => { uid: number; mode: number } | null,
+  isExecutable?: (path: string) => boolean,
 ): DoctorCheck => {
   // Slice 154 (review): forward canonical-first resolver seams.
   const detectOpts: Parameters<typeof detectSandboxAvailability>[0] = { which };
   if (exists !== undefined) detectOpts.exists = exists;
   if (stat !== undefined) detectOpts.stat = stat;
+  if (isExecutable !== undefined) detectOpts.isExecutable = isExecutable;
   const availability = detectSandboxAvailability(detectOpts);
   if (availability.available) {
     // Slice 165 (review — Batch C sandbox observability). The
@@ -924,6 +933,7 @@ const sandboxEnforcementCheck = (
   which: (cmd: string) => string | null,
   exists?: (path: string) => boolean,
   stat?: (path: string) => { uid: number; mode: number } | null,
+  isExecutable?: (path: string) => boolean,
 ): DoctorCheck => {
   const platform = nodePlatform();
   if (platform !== 'linux' && platform !== 'darwin') {
@@ -940,6 +950,7 @@ const sandboxEnforcementCheck = (
   const detectOpts: Parameters<typeof detectSandboxAvailability>[0] = { which };
   if (exists !== undefined) detectOpts.exists = exists;
   if (stat !== undefined) detectOpts.stat = stat;
+  if (isExecutable !== undefined) detectOpts.isExecutable = isExecutable;
   const availability = detectSandboxAvailability(detectOpts);
   if (!availability.available) {
     return {
@@ -1018,7 +1029,7 @@ export const runDoctor = async (options: RunDoctorOptions = {}): Promise<number>
   // hash_chain, sealing) bypass the cache and ALWAYS run live.
   // Non-critical (platform, user_namespaces, net_filtering,
   // mac_lsm, git) get the 60s cache treatment per §13.8.
-  const sandboxResult = sandboxCheck(which, options.exists, options.stat); // critical
+  const sandboxResult = sandboxCheck(which, options.exists, options.stat, options.isExecutable); // critical
   const userNsResult = withDoctorCache(
     'user_namespaces',
     () => userNamespacesCheck(readFile),
@@ -1047,7 +1058,7 @@ export const runDoctor = async (options: RunDoctorOptions = {}): Promise<number>
     // (binary installed/removed, host trust posture). The
     // compiled-binary flag is stable within a process but the
     // probe is cheap so caching adds no value.
-    sandboxEnforcementCheck(which, options.exists, options.stat),
+    sandboxEnforcementCheck(which, options.exists, options.stat, options.isExecutable),
     sealingCheck({
       env,
       cwd,

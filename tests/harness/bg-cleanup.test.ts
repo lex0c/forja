@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runAgent } from '../../src/harness/loop.ts';
 import type { HarnessConfig } from '../../src/harness/types.ts';
+import { initBashParser } from '../../src/permissions/bash-parser.ts';
 import { createPermissionEngine } from '../../src/permissions/index.ts';
 import type { GenerateRequest, Provider, StreamEvent } from '../../src/providers/index.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
@@ -84,7 +85,17 @@ const buildConfig = (script: ScriptedStep[], opts: { bgLogDir?: string } = {}): 
   };
 };
 
-beforeEach(() => {
+beforeEach(async () => {
+  // The permission engine's bash resolver refuses every bash /
+  // bash_background command until the bash parser is initialized
+  // (production does this in bootstrap()). These tests build the
+  // HarnessConfig by hand, so without an explicit init the resolver
+  // DENIES the spawn and no bg row is written — `procs.length` is 0.
+  // It only passed in the full suite because some earlier test
+  // happened to init the parser first (it's global module state);
+  // run isolated, or with a different file order on CI, it failed.
+  // Init here so the test is order-independent.
+  await initBashParser();
   db = openMemoryDb();
   migrate(db);
   logDir = mkdtempSync(join(tmpdir(), 'forja-harness-bg-'));

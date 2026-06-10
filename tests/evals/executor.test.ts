@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { executeCase, resolveEvalCacheRoot, summarize } from '../../src/evals/executor.ts';
 import type { EvalCase } from '../../src/evals/types.ts';
+import type { SandboxAvailability } from '../../src/permissions/sandbox-availability.ts';
 import type { Provider, StreamEvent } from '../../src/providers/index.ts';
 
 interface ScriptedStep {
@@ -57,6 +58,24 @@ const baseCase = (overrides: Partial<EvalCase> = {}): EvalCase => ({
   expect: [{ kind: 'status', status: 'done' }],
   ...overrides,
 });
+
+// Hermetic sandbox verdict. executeCase runs the real bootstrap(),
+// whose detectSandboxAvailability() probes Bun.which('bwrap'). On a
+// runner without bubblewrap (CI ubuntu-latest), the engine boots
+// `degraded`, which downgrades automatic `allow` to `confirm` — that
+// flips every approval-sensitive case (a bypass write that should
+// land, a tool_denied that should report "invoked but allowed", an
+// autonomous confirm that should auto-approve). Pinning the verdict
+// keeps those cases testing the approval logic, not whether the host
+// has bwrap installed.
+const HERMETIC_SANDBOX: SandboxAvailability = {
+  available: true,
+  tool: 'bwrap',
+  path: '/usr/bin/bwrap',
+  trustLevel: 'canonical',
+  reason: '',
+  trustWarnings: [],
+};
 
 let workdir: string;
 // Snapshot env vars that the bootstrap chain reads from disk (the
@@ -148,6 +167,7 @@ describe('executeCase', () => {
           },
           { text: 'wrote the file' },
         ]),
+        sandboxAvailabilityOverride: HERMETIC_SANDBOX,
       },
     });
     expect(r.passed).toBe(true);
@@ -232,6 +252,7 @@ describe('executeCase', () => {
           },
           { text: 'wrote' },
         ]),
+        sandboxAvailabilityOverride: HERMETIC_SANDBOX,
       },
     });
     expect(r.passed).toBe(false);
@@ -527,6 +548,7 @@ describe('executeCase — approval posture (operation mode, AGENTIC_CLI §8.1)',
           },
           { text: 'wrote it' },
         ]),
+        sandboxAvailabilityOverride: HERMETIC_SANDBOX,
       },
     });
     expect(r.passed).toBe(true);

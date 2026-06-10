@@ -398,6 +398,17 @@ export interface CreateBgManagerOptions {
   // `Bun.which`; tests pin a fake that flips the return value
   // between calls to simulate boot-vs-spawn-time divergence.
   sandboxWhich?: (name: string) => string | null;
+  // Test seam for the §6.5 sandbox wrap. Production uses
+  // `maybeWrapSandboxArgv` (resolves bwrap/sandbox-exec, fail-closes
+  // when a boot tool was present at boot but vanished). Tests that
+  // exercise the spawn path WITHOUT depending on a real bwrap on the
+  // host's $PATH pin a passthrough (`(o) => o.innerArgv.slice()`), so
+  // the spawn runs the inner argv directly. Without this seam a
+  // `cwd-rw` spawn on a host lacking bwrap throws "tool unavailable
+  // mid-session" (fail-closed, since sandboxBootTool is set), which
+  // made the probe tests pass or fail by whether the runner had
+  // bubblewrap installed.
+  wrapArgv?: typeof maybeWrapSandboxArgv;
   // Slice 157 (review — phase 2 of macOS /tmp isolation). Per-CLI-run
   // tmpdir, plumbed from `HarnessConfig.sandboxTmpdir`. When set, the
   // bg spawn passes it to `maybeWrapSandboxArgv.tmpdir` AND merges
@@ -554,8 +565,10 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     sandboxBootTool,
     sandboxWhich,
     sandboxTmpdir,
+    wrapArgv,
   } = options;
   const whichFn = sandboxWhich ?? ((name: string) => Bun.which(name));
+  const wrapFn = wrapArgv ?? maybeWrapSandboxArgv;
   // In-memory map of live handles, keyed by internal process id. The
   // DB is the source of truth for status across restarts; this map
   // is the in-flight reference we need to actually call .kill() on
@@ -648,7 +661,7 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     // bwrap (Linux) and sandbox-exec (macOS) forward stdin from
     // their own stdin to the wrapped child by default, so the
     // script reaches bash even when wrapped.
-    const cmd = maybeWrapSandboxArgv({
+    const cmd = wrapFn({
       ...(input.sandboxProfile !== undefined ? { profile: input.sandboxProfile } : {}),
       cwd,
       innerArgv: ['bash', '-s'],
