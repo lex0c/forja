@@ -50,6 +50,14 @@ an operator could still press Alt+R and get a terse line (§3.3 lists Alt+R as p
 auto-display surface). The handler now checks `isRecapEnabled(baseConfig)` first and warns ("recap
 terse: disabled") so the explicit keypress reports why nothing rendered.
 
+Follow-up 3: headless precedence inversion. `agent recap --model A` with `[recap].render_model = B`
+rendered with B, not A — `--model` is consumed top-level and folded into the session provider, so
+run.ts then threaded the config render model (B) on top, and the resolver chose B over the session
+provider (A), reversing the documented `--model > config > session` order. Extracted
+`headlessRecapRenderModel(argsModel, configRenderModel)` (pure, unit-tested): when `--model` was
+passed the config render model is suppressed, so the render falls back to the session provider (= the
+`--model` model).
+
 ## [2026-06-10] fix(providers/anthropic): never send temperature + top_p together (current models 400)
 
 Found by running the recap LLM render against a real Haiku (the `errors[]` work below prompted a

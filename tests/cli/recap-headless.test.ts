@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
-import { runRecapHeadless } from '../../src/cli/recap-headless.ts';
+import { headlessRecapRenderModel, runRecapHeadless } from '../../src/cli/recap-headless.ts';
 import type {
   ConstrainedResult,
   Provider,
@@ -69,6 +69,25 @@ const seedSession = (id?: string): { id: string } => {
   completeSession(db, s.id, 'done', 0.04, true, 2_000);
   return { id: id ?? s.id };
 };
+
+describe('headlessRecapRenderModel — precedence', () => {
+  test('explicit --model suppresses [recap].render_model (--model wins)', () => {
+    // Regression: headless `--model A` is folded into the session
+    // provider, so threading config `render_model = B` on top would
+    // render with B, reversing the documented `--model > config`
+    // precedence. With --model present the config is dropped → render
+    // falls back to the session provider (the --model model).
+    expect(headlessRecapRenderModel('anthropic/A', 'anthropic/B')).toBeUndefined();
+  });
+
+  test('no --model → config render_model is honored', () => {
+    expect(headlessRecapRenderModel(undefined, 'anthropic/B')).toBe('anthropic/B');
+  });
+
+  test('neither set → undefined (render uses session provider)', () => {
+    expect(headlessRecapRenderModel(undefined, undefined)).toBeUndefined();
+  });
+});
 
 describe('runRecapHeadless — plain text mode', () => {
   test('renders deterministic human output for `recap session <id>`', async () => {

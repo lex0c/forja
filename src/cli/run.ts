@@ -481,7 +481,7 @@ export const run = async (options: RunOptions): Promise<number> => {
     }
 
     if (args.recap !== undefined) {
-      const { runRecapHeadless } = await import('./recap-headless.ts');
+      const { runRecapHeadless, headlessRecapRenderModel } = await import('./recap-headless.ts');
       let provider: import('../providers/types.ts').Provider;
       let dbOverride: import('../storage/index.ts').DB | undefined;
       let bootstrappedDbCloser: (() => void) | undefined;
@@ -513,7 +513,9 @@ export const run = async (options: RunOptions): Promise<number> => {
         const result = await bootstrap(bootstrapInput);
         provider = result.config.provider;
         recapEnabled = result.config.recapEnabled;
-        recapRenderModel = result.config.recapRenderModel;
+        // `--model` (folded into the session provider above) wins over
+        // `[recap].render_model` — see `headlessRecapRenderModel`.
+        recapRenderModel = headlessRecapRenderModel(args.model, result.config.recapRenderModel);
         dbOverride = result.db;
         bootstrappedDbCloser = () => closeDb(result.db);
       } catch (e) {

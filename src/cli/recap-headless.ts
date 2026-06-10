@@ -31,6 +31,20 @@ import { createModalManager } from '../tui/modal-manager.ts';
 import { runRecapList, runRecapSession } from './slash/commands/recap.ts';
 import type { SlashContext } from './slash/types.ts';
 
+// Headless render-model precedence (RECAP §8.2: `--model` > config >
+// session). On `agent recap`, `--model` is consumed top-level and
+// folded into the SESSION provider by bootstrap, so it already IS the
+// render model — threading `[recap].render_model` on top would
+// override the operator's explicit CLI choice. Suppress the config
+// value when `--model` was passed; the render then falls back to the
+// session provider (= the `--model` model). Pure + exported so the
+// precedence rule is unit-tested in one place rather than buried in
+// run.ts wiring.
+export const headlessRecapRenderModel = (
+  argsModel: string | undefined,
+  configRenderModel: string | undefined,
+): string | undefined => (argsModel !== undefined ? undefined : configRenderModel);
+
 export interface RunRecapHeadlessOptions {
   // Args after `recap` in the CLI, e.g. ['pr', '--no-llm-render'].
   args: string[];
