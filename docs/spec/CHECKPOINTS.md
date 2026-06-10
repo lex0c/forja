@@ -12,8 +12,13 @@ spec promete `/undo` mas o código não tem nada equivalente.
 - Snapshot referencia o estado pré-step. `/undo` restaura para o
   snapshot anterior.
 - Mecanismo invisível ao git normal do usuário.
+- **Escopo = worktree inteiro.** Snapshot e restore operam ancorados
+  no `git rev-parse --show-toplevel`, não no diretório de invocação.
+  Rodar o agente de um subdiretório do repo NÃO encolhe o snapshot
+  para aquela subárvore — captura/restaura o worktree todo. Ver §2.6.
 - Side effects fora do filesystem (DB, network, processos) **não**
-  são revertidos — limite explícito, não bug.
+  são revertidos — limite explícito, não bug. Idem arquivos fora do
+  worktree (outro repo, `/tmp`, `$HOME`).
 
 ## 2. Decisões abertas
 
@@ -102,27 +107,50 @@ de M3 já roda CLI.
 (<50 steps), uma stash gira em torno de KB-MB; em monorepo
 grande, pode crescer. Documentar.
 
-### 2.6 Cross-cwd writes
+### 2.6 Escopo do snapshot/restore — worktree inteiro
 
-**Pergunta:** step que edita dentro do cwd E roda bash que escreve
-em `/tmp` — checkpoint cobre só o cwd. `/undo` deixa `/tmp` sujo.
+**Pergunta original:** o checkpoint cobre só o diretório de invocação
+(cwd) ou o worktree inteiro? Um step que edita dentro do cwd E roda
+bash que escreve em `/tmp` — o que `/undo` reverte?
 
-**Proposta:** **não cobrir**. Adicionar warning visível antes de
-qualquer `/undo` se o step tinha bash:
+**Decisão (revisada):** **worktree inteiro, ancorado no toplevel.**
+A proposta inicial era cwd-only, mas a implementação convergiu para
+worktree-wide pela seguinte razão de consistência: o restore usa
+`git read-tree --reset -u <commit>`, que é **sempre** worktree-wide
+(reescreve o índice + working tree inteiros, não há forma barata e
+segura de escopá-lo a uma subárvore com deleção de arquivos novos).
+Um snapshot cwd-scoped (`git add -A .` a partir de um subdiretório
+captura só aquela subárvore) contra um restore worktree-wide produz
+uma **assimetria com perda silenciosa**: paths fora do cwd entram no
+checkpoint no estado de HEAD (não no estado real do momento), e o
+`/undo` os reseta para esse HEAD descartando mudanças intermediárias
+(recuperáveis na stash, mas surpresa).
+
+Para fechar isso, snapshot, diff e restore resolvem o worktree root
+via `git rev-parse --show-toplevel` uma vez (no probe de
+`detectCheckpointSupport`) e operam a partir dele. Rodar de um
+subdiretório passa a ser indistinguível de rodar da raiz.
+
+O que continua **fora** de escopo (o `had_bash` warning cobre):
 
 ```
 WARNING: this step ran bash. /undo reverts filesystem changes
-within <cwd>, but cannot reverse:
+within the git worktree, but cannot reverse:
   - Database / HTTP / network state changes
-  - Filesystem changes outside <cwd>
+  - Filesystem changes outside the worktree (/tmp, $HOME, other repos)
   - Process spawns
 Type 'undo' to confirm.
 ```
 
 `had_bash` na tabela checkpoints serve esse warning.
 
-**Trade-off:** prompt extra atrasa um pouco. Aceitável: melhor que
-falsa segurança.
+**Trade-off:** (a) o snapshot é sempre worktree-wide, então em
+monorepo o `git add -A` cobre tudo — mitigado pelo skip-on-noop
+(§2.8) e dentro do SLO para repos < 10k arquivos. (b) `/undo` toca
+arquivos fora do cwd de invocação (mas dentro do worktree); como o
+restore já era worktree-wide em runtime, isto descreve o
+comportamento real, não o expande. Prompt extra atrasa um pouco;
+aceitável: melhor que falsa segurança.
 
 ### 2.7 Conflito com git do usuário
 
@@ -150,7 +178,9 @@ the changes if you need them.
 
 - Snapshot usa `git add -A && git commit-tree` (não `git stash`)
   — reusa index existente, é o caminho mais rápido pra criar
-  commit no git.
+  commit no git. As invocações git rodam ancoradas no worktree
+  root (§2.6), então o `add -A` cobre o repo inteiro de forma
+  determinística independente do subdiretório de invocação.
 - Skip se não houve writes desde o último checkpoint
   (verificado via `git diff --quiet`).
 - Métrica `checkpoint_create_ms` no telemetry (`PERFORMANCE.md`).

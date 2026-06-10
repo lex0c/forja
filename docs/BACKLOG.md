@@ -2,6 +2,69 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-10] fix(checkpoints): anchor snapshot/restore at the worktree root
+
+Closes edge #1 catalogued in the prior entry (supersedes its "left open"
+note). The subsystem had a scope asymmetry: `snapshot()` built its tree with
+`git add -A .`, whose `.` pathspec scopes to the invocation cwd's subtree, while
+`restore()` uses `git read-tree --reset -u`, which is **always** worktree-wide.
+Running the agent from a repo subdirectory made them disagree — paths outside
+the subdir entered the checkpoint at their HEAD state (not their real
+working-tree state), and `/undo` then reset them to that HEAD, discarding
+intermediate changes (recoverable via the stash, but a silent surprise). Proven
+empirically before the fix.
+
+Decision (operator-confirmed): converge on **worktree-wide**, since the restore
+primitive already was. `detectCheckpointSupport` now resolves the worktree root
+once via `git rev-parse --show-toplevel` and returns it as `gitRoot`; the
+manager carries `gitRoot` separately from `cwd` and anchors every git invocation
+(snapshot, restore, diff, all purge/retention ref ops) there. `cwd` stays the
+invocation directory because retention scoping joins against `sessions.cwd`,
+which records the invocation cwd, not the root. `gitRoot` is optional on
+`CreateManagerInput` with a `?? cwd` fallback, so repo-root runs and existing
+tests are unchanged; only subdir runs change behavior. This does NOT expand the
+runtime blast radius of restore (already worktree-wide) — it makes snapshot
+faithful to it and removes the silent-loss window.
+
+Spec: updated `CHECKPOINTS.md` §1, §2.6 (rewritten from "cwd-only, não cobrir"
+to "worktree inteiro, ancorado no toplevel"), §2.8, and the `had_bash` warning
+text (here and in `cli/checkpoints.ts`) from "within the cwd" to "within the git
+worktree". Tests: +1 in `detect.test.ts` (gitRoot = toplevel from a subdir; null
+when unavailable), +2 in `manager.test.ts` (snapshot from a subdir captures a
+change outside it; restore from a subdir reverts it). 116 checkpoint-suite tests
+pass; typecheck + biome clean.
+
+## [2026-06-10] fix(checkpoints): scope sensitive-path filter to untracked secrets
+
+Audit of the checkpoint subsystem surfaced a narrow data-loss edge in
+`snapshot()`'s slice-172 sensitive-path filter. The filter dropped **every**
+path matching SEC §8.4 (`.env`, `id_rsa`, `*.pem`, …) from the checkpoint tree
+via `update-index --force-remove`. For a secret that is **already tracked at
+HEAD** (e.g. a project that deliberately commits a public `.env` template), this
+was both useless and harmful: useless because the object already lives in the
+user's git history (no leak prevented), harmful because `restore()`'s
+`read-tree --reset -u` then deletes the file from the working tree — it's in HEAD
+but absent from the checkpoint tree — and an unmodified tracked file isn't dirty,
+so it was never stashed → silent local loss on `/undo`.
+
+Fix: capture the tracked-at-HEAD set with `ls-files` against the temp index
+**before** `add -A` mutates it (same `ls-files` convention on both sides, so the
+match is cwd-agnostic), and narrow the filter to paths NOT in that set. The leak
+guard the slice actually targets — the operator's *untracked* secrets sitting in
+cwd — is unchanged; only tracked secrets are now preserved literally, which is
+what SEC §8.4 mandates ("checkpoint precisa preservar conteúdo literal pra /undo
+funcionar"). On unborn HEAD nothing is tracked, so the filter degrades to its
+prior all-removing behavior. No spec change (refines implementation toward the
+existing §8.4 intent). +3 tests in `git.test.ts` (untracked secret still dropped;
+tracked secret preserved; end-to-end restore no longer deletes an untouched
+tracked secret).
+
+Known checkpoint edges deliberately left open (catalogued, not in this slice):
+snapshot is cwd-subtree-scoped via `add -A .` while restore is repo-wide via
+`read-tree --reset` (asymmetry only bites when forja runs from a subdir); and
+synchronous snapshot latency on very large monorepos (out of scope per
+CHECKPOINTS §2.8).
+
 ## [2026-06-10] docs: implementation companion for tool output reduction
 
 Added `docs/OUTPUT_POLICY.md` — the non-normative impl companion for the three

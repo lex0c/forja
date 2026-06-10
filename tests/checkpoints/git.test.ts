@@ -229,6 +229,78 @@ describe('snapshot', () => {
   });
 });
 
+describe('snapshot — sensitive path filter', () => {
+  // The filter exists to keep the operator's UNTRACKED secrets out of
+  // checkpoint git objects (slice 172). It must NOT touch secrets that
+  // are already tracked at HEAD — those are in the user's history
+  // already, so dropping them buys no leak-prevention and breaks
+  // restore (SEC §8.4: checkpoint must preserve literal content).
+  test('drops an untracked secret from the checkpoint tree', async () => {
+    await initRepoWithCommit(repo);
+    await writeFile(join(repo, '.env'), 'API_KEY=super-secret\n');
+    // A non-sensitive change so the snapshot has a diff to record (a
+    // tree containing only the dropped secret would equal HEAD's tree
+    // and snapshot would correctly skip with sha=null).
+    await writeFile(join(repo, 'change.txt'), 'work\n');
+    const result = await snapshot({
+      cwd: repo,
+      sessionId: 's',
+      stepId: 'm',
+      iso: 'iso',
+    });
+    expect(result.sha).not.toBeNull();
+    const ls = await runGit(repo, ['ls-tree', '-r', '--name-only', result.sha as string]);
+    expect(ls).toContain('change.txt');
+    expect(ls).not.toContain('.env');
+  });
+
+  test('preserves a secret that is already tracked at HEAD', async () => {
+    await initRepoWithCommit(repo);
+    // A `.env` that the project deliberately commits (public template,
+    // example values). It lives in HEAD, so the filter must leave it in
+    // the checkpoint tree.
+    await writeFile(join(repo, '.env'), 'EXAMPLE=value\n');
+    await runGit(repo, ['add', '.env']);
+    await runGit(repo, ['commit', '-m', 'add tracked .env']);
+    // Some unrelated working-tree change to give the snapshot a diff.
+    await writeFile(join(repo, 'change.txt'), 'work\n');
+    const result = await snapshot({
+      cwd: repo,
+      sessionId: 's',
+      stepId: 'm',
+      iso: 'iso',
+    });
+    expect(result.sha).not.toBeNull();
+    const ls = await runGit(repo, ['ls-tree', '-r', '--name-only', result.sha as string]);
+    expect(ls).toContain('.env');
+  });
+
+  test('restore does not delete a tracked secret left untouched by the step', async () => {
+    // End-to-end of the data-loss edge #3: a tracked secret that the
+    // step never modified must survive an /undo. Pre-fix, snapshot
+    // dropped it from the tree and `read-tree --reset -u` deleted it
+    // from the working tree (it was clean, so never stashed).
+    await initRepoWithCommit(repo);
+    await writeFile(join(repo, '.env'), 'EXAMPLE=value\n');
+    await runGit(repo, ['add', '.env']);
+    await runGit(repo, ['commit', '-m', 'add tracked .env']);
+    // Step edits an unrelated file; .env is untouched and stays clean.
+    await writeFile(join(repo, 'change.txt'), 'work\n');
+    const snap = await snapshot({
+      cwd: repo,
+      sessionId: 's',
+      stepId: 'm',
+      iso: 'iso',
+    });
+    expect(snap.sha).not.toBeNull();
+    // Further edit, then undo back to the checkpoint.
+    await writeFile(join(repo, 'change.txt'), 'more work\n');
+    await restore(repo, snap.sha as string);
+    const env = await Bun.file(join(repo, '.env')).text();
+    expect(env).toBe('EXAMPLE=value\n');
+  });
+});
+
 describe('isWorkingTreeDirty', () => {
   test('false on clean tree', async () => {
     await initRepoWithCommit(repo);

@@ -22,6 +22,7 @@ export {
   getCommitTree,
   getHeadSha,
   getInProgressOperation,
+  getWorktreeRoot,
   isGitRepo,
   isWorkingTreeDirty,
   listRestoreSavedRefs,

@@ -1,4 +1,4 @@
-import { isGitRepo } from './git.ts';
+import { getWorktreeRoot, isGitRepo } from './git.ts';
 
 export interface CheckpointAvailability {
   // True iff the cwd is inside a git work-tree AND we successfully
@@ -9,6 +9,14 @@ export interface CheckpointAvailability {
   // a one-line warning at startup so the user knows `/undo` won't be
   // there. Null when available.
   reason: string | null;
+  // Absolute worktree root (`git rev-parse --show-toplevel`) when
+  // available. The manager anchors every git invocation here rather
+  // than the invocation cwd so snapshot/restore cover the whole
+  // worktree regardless of which subdirectory the agent runs from
+  // (CHECKPOINTS §2.6). Null when unavailable. Falls back to the
+  // invocation cwd if the toplevel probe fails inside a real repo
+  // (defensive — should not happen once isGitRepo returned true).
+  gitRoot: string | null;
 }
 
 // Light-weight startup probe. Calls `git rev-parse` once; that is
@@ -25,7 +33,15 @@ export const detectCheckpointSupport = async (cwd: string): Promise<CheckpointAv
     return {
       available: false,
       reason: `checkpoints disabled: ${cwd} is not a git repository`,
+      gitRoot: null,
     };
   }
-  return { available: true, reason: null };
+  // Resolve the worktree root once here (the probe already paid for a
+  // git fork on isGitRepo; this is one more, at startup only). The
+  // manager uses it to anchor snapshot/restore worktree-wide. Fall
+  // back to cwd if `--show-toplevel` somehow fails despite the repo
+  // check passing — worktree-wide behavior degrades to the invocation
+  // cwd, which is exactly the pre-fix behavior.
+  const gitRoot = (await getWorktreeRoot(cwd)) ?? cwd;
+  return { available: true, reason: null, gitRoot };
 };

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { detectCheckpointSupport } from '../../src/checkpoints/detect.ts';
@@ -36,5 +36,18 @@ describe('detectCheckpointSupport', () => {
     expect(result.available).toBe(false);
     expect(result.reason).toContain('not a git repository');
     expect(result.reason).toContain(dir);
+    expect(result.gitRoot).toBeNull();
+  });
+
+  test('gitRoot resolves to the worktree root, even when probed from a subdir', async () => {
+    await initRepo(dir);
+    const sub = join(dir, 'nested', 'deep');
+    await mkdir(sub, { recursive: true });
+    const result = await detectCheckpointSupport(sub);
+    expect(result.available).toBe(true);
+    // `git rev-parse --show-toplevel` returns the canonical (symlink-
+    // resolved) path; tmpdir on macOS is a symlink, so compare against
+    // the realpath of the repo root rather than `dir` literally.
+    expect(result.gitRoot).toBe(await realpath(dir));
   });
 });
