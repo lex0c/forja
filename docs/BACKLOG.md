@@ -38,6 +38,12 @@ predicate replaces three scattered `!== false` gates and owns the default-on pol
 `DEFAULT_RECAP_CONFIG` double-default); `renderModel` sentinel unified to `undefined`; subagents pin
 `recapEnabled: false` (non-interactive, can't resume / run /recap); `--no-recap` added to `--help`.
 
+Follow-up: `agent recap pr --no-recap` was still broken — routing into the `recap` subcommand returns
+before the global `--no-recap` switch, and `parseRecapSubcommand` only consumed `--json`/`--model`,
+so the flag reached the slash parser as an unknown flag (error) instead of setting `args.noRecap`. The
+subcommand parser now consumes `--no-recap` at its boundary (like `--json`/`--model`), so the
+advertised headless deterministic-render switch actually works for `agent recap`.
+
 ## [2026-06-10] fix(providers/anthropic): never send temperature + top_p together (current models 400)
 
 Found by running the recap LLM render against a real Haiku (the `errors[]` work below prompted a

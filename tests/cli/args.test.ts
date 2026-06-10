@@ -1194,6 +1194,19 @@ describe('parseArgs — recap subcommand', () => {
     expect(r.args.recap?.args).toEqual(['pr']);
   });
 
+  test('--no-recap is consumed at the subcommand boundary, not forwarded', () => {
+    // Regression: routing into `recap` returns before the global
+    // --no-recap switch, and the slash-side parser does not know the
+    // flag — so without consuming it here, `agent recap pr --no-recap`
+    // errored as "unknown flag" instead of forcing deterministic
+    // render. bootstrap reads args.noRecap → recapEnabled=false.
+    const r = parseArgs(['recap', 'pr', '--no-recap']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.noRecap).toBe(true);
+    expect(r.args.recap?.args).toEqual(['pr']);
+  });
+
   test('--model without a value is a parse error', () => {
     const r = parseArgs(['recap', '--model']);
     expect(r.ok).toBe(false);

@@ -634,6 +634,7 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
   if (argv.length === 0 || argv[0] !== 'recap') return null;
   let json = false;
   let model: string | undefined;
+  let noRecap = false;
   const recapArgs: string[] = [];
   let i = 1;
   while (i < argv.length) {
@@ -691,6 +692,19 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
       i += 1;
       continue;
     }
+    if (token === '--no-recap') {
+      // Master switch (RECAP §3.2/§3.3). The global `--no-recap`
+      // case in the main parser is unreachable here — routing into
+      // `recap` returns before it — so consume it at the subcommand
+      // boundary like `--json`/`--model`. bootstrap reads
+      // `args.noRecap` and forces `recapEnabled=false`, which
+      // run.ts threads into the headless render → deterministic.
+      // Leaving it in `recapArgs` would surface it as an unknown
+      // flag in the slash-side parser.
+      noRecap = true;
+      i += 1;
+      continue;
+    }
     // Every other token — including recap-specific flags
     // (`--no-llm-render`, `--out`, `--limit`, `--project`, etc.)
     // and positional subcommand verbs (`pr`, `last`, `session`,
@@ -713,6 +727,7 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
       yes: false,
       recap: { args: recapArgs },
       ...(model !== undefined ? { model } : {}),
+      ...(noRecap ? { noRecap: true } : {}),
     },
   };
 };
