@@ -113,6 +113,42 @@ describe('migrate', () => {
     db.close();
   });
 
+  // Registry self-validation: the array must be internally
+  // consistent (positive integer ids, strictly ascending) BEFORE
+  // anything touches the DB, so a dev mistake fails loud instead of
+  // as a cryptic downstream SQLite error or silent mis-ordering.
+  test('rejects a registry with a duplicate id', () => {
+    const db = openMemoryDb();
+    const dup: Migration[] = [
+      { id: 1, name: '001-a', sql: 'CREATE TABLE a (id TEXT);' },
+      { id: 1, name: '001-b', sql: 'CREATE TABLE b (id TEXT);' },
+    ];
+    expect(() => migrate(db, dup)).toThrow(/strictly ascending/);
+    // Nothing should have been applied — validation runs first.
+    const tbl = db
+      .query("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('a','b')")
+      .all();
+    expect(tbl).toEqual([]);
+    db.close();
+  });
+
+  test('rejects a registry registered out of id order', () => {
+    const db = openMemoryDb();
+    const unordered: Migration[] = [
+      { id: 2, name: '002-second', sql: 'CREATE TABLE a (id TEXT);' },
+      { id: 1, name: '001-first', sql: 'CREATE TABLE b (id TEXT);' },
+    ];
+    expect(() => migrate(db, unordered)).toThrow(/strictly ascending/);
+    db.close();
+  });
+
+  test('rejects a non-integer migration id', () => {
+    const db = openMemoryDb();
+    const bad: Migration[] = [{ id: 1.5, name: 'x', sql: 'CREATE TABLE a (id TEXT);' }];
+    expect(() => migrate(db, bad)).toThrow(/positive integers/);
+    db.close();
+  });
+
   // Slice 134 P0-6: forward-compat check. A DB written by a newer
   // Forja (with a higher-id migration) must NOT be silently opened
   // by an older binary — the older binary doesn't know the row

@@ -33,6 +33,43 @@ export interface MigrateResult {
   skipped: string[];
 }
 
+// Validate the registry itself BEFORE touching the DB. The runner
+// applies `migrations` in array order and tracks applied state by
+// `id`, so the array must be internally consistent or the apply
+// loop misbehaves in confusing ways:
+//   - a duplicate id only surfaces as a cryptic PRIMARY KEY
+//     violation, and only on a fresh DB (on an already-migrated DB
+//     the first occurrence is in `_migrations` and masks the dup);
+//   - an out-of-order array (075 before 074) applies migrations out
+//     of id order with no error at all.
+// Both are dev-time footguns the append-only discipline makes
+// expensive to recover from. A strictly-ascending check catches
+// duplicates AND mis-ordering in one pass and guarantees
+// apply-order == id-order.
+//
+// Deliberately NOT enforced: contiguity (gaps like 1,2,4 are
+// harmless — the loop applies whatever ids are present) and
+// name format (test fixtures legitimately use ad-hoc names like
+// `id=99 name=test`).
+const validateRegistry = (migrations: readonly Migration[]): void => {
+  let prevId = Number.NEGATIVE_INFINITY;
+  let prevName = '<start>';
+  for (const m of migrations) {
+    if (!Number.isInteger(m.id) || m.id <= 0) {
+      throw new Error(
+        `migrate: migration ${m.name} has an invalid id=${m.id}; ids must be positive integers.`,
+      );
+    }
+    if (m.id <= prevId) {
+      throw new Error(
+        `migrate: registry is not strictly ascending by id — ${m.name} (id=${m.id}) follows ${prevName} (id=${prevId}). Migration ids must be unique and registered in ascending order (apply-order must equal id-order).`,
+      );
+    }
+    prevId = m.id;
+    prevName = m.name;
+  }
+};
+
 // Read-only check: how many registered migrations have NOT been
 // applied to this DB? Used by code paths that want to know about
 // pending migrations WITHOUT applying them (e.g., `agent gc`
@@ -63,6 +100,7 @@ export const countPendingMigrations = (
 };
 
 export const migrate = (db: DB, migrations: readonly Migration[] = MIGRATIONS): MigrateResult => {
+  validateRegistry(migrations);
   ensureMigrationsTable(db);
   const appliedRows = db
     .query('SELECT id, name, hash, applied_at FROM _migrations ORDER BY id ASC')

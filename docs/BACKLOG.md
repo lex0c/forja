@@ -2,6 +2,24 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-10] fix(migrate): validate the migration registry before applying
+
+The runner applied `MIGRATIONS` in *array order*, never checking that the array
+itself is well-formed. A duplicate `id` only surfaced incidentally as a cryptic
+PRIMARY KEY violation (and only on a fresh DB); an out-of-order array (e.g. 075
+registered before 074) would apply migrations out of id order with no error at
+all. Both are dev-time footguns that the append-only discipline makes expensive
+to recover from once shipped.
+
+Fix: `migrate()` now runs `validateRegistry()` once at the top, before touching
+the DB. It asserts every `id` is a positive integer and that ids are strictly
+ascending across the array — which catches duplicates and out-of-order
+registration in a single pass, and guarantees apply-order == id-order. Loud,
+named error instead of a silent SQLite failure downstream. Contiguity and
+name-format are deliberately NOT enforced (gaps are harmless; test fixtures use
+ad-hoc names like `id=99 name=test`). New tests cover duplicate id, descending
+order, and a non-integer id.
+
 ## [2026-06-10] docs: implementation companion for the checkpoint subsystem
 
 Added `docs/CHECKPOINT.md` — the non-normative impl companion for checkpoints,
