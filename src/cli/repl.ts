@@ -69,6 +69,7 @@ import {
   lookupToolVocab,
 } from '../tui/index.ts';
 import type { ParsedArgs } from './args.ts';
+import { operatorBootstrapFlags, reportRefusingEngine } from './boot-parity.ts';
 import { type BootstrapInput, type BootstrapResult, bootstrap } from './bootstrap.ts';
 import { maybeEmitHistoryBanner } from './history-banner.ts';
 import { concatQueuedBodies } from './inbox-drain.ts';
@@ -600,9 +601,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // independently and stay coherent in practice, but pinning
         // makes the invariant load-bearing rather than coincidental.
         cwd,
-        ...(args.model !== undefined ? { modelId: args.model } : {}),
-        ...(args.noRecap === true ? { noRecap: true } : {}),
-        ...(args.maxSteps !== undefined ? { budget: { maxSteps: args.maxSteps } } : {}),
+        // Operator-intent flags (model / posture / sandbox / broker /
+        // memory toggles) shared verbatim with the one-shot path. The
+        // REPL is reached by `agent <flags>` with no prompt on a TTY,
+        // so these globals must take effect here too — see
+        // `operatorBootstrapFlags` (boot-parity.ts).
+        ...operatorBootstrapFlags(args),
         // Forward the trust-list override so REPL and bootstrap
         // agree on which file is authoritative. Without this,
         // a test that pins `trustListPathOverride` for the boot
@@ -655,7 +659,32 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     auditConfigWarnings,
     sandboxConfigWarnings,
     sandboxEnforcement,
+    permissionState,
+    permissionRefusingReason,
+    permissionChain,
   } = bootstrapped;
+
+  // Permission engine refused to come up (PERMISSION_ENGINE.md §7.2):
+  // broken audit chain, invalid policy, install_id I/O failure, or a
+  // sandbox required-but-unavailable. `refusing` is terminal — every
+  // subsequent check denies until restart — so booting the live TUI
+  // here would drop the operator into a session where every tool call
+  // silently denies, with no explanation. The diagnostic + recovery
+  // hint are shared with the one-shot path via `reportRefusingEngine`;
+  // the teardown stays here because the REPL also unwinds its live
+  // renderer/stdin stack. Reuse the resume-id reject path's order
+  // (§13.7: drain the broker BEFORE closing storage; tearDownPreBootstrap
+  // covers the renderer/stdin side that's already live).
+  if (
+    reportRefusingEngine({ permissionState, permissionRefusingReason, permissionChain }, errSink)
+  ) {
+    tearDownPreBootstrap();
+    if (baseConfig.broker !== undefined) {
+      await baseConfig.broker.close();
+    }
+    closeDb(db);
+    return 2;
+  }
 
   // Surface the same warnings the one-shot path does. Operators get
   // them once at REPL boot rather than per turn.

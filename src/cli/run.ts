@@ -12,6 +12,7 @@ import {
 } from '../storage/index.ts';
 import { settleRunningSubagentHandles } from '../storage/repos/subagent-handles.ts';
 import type { ParsedArgs } from './args.ts';
+import { operatorBootstrapFlags, reportRefusingEngine } from './boot-parity.ts';
 import { type BootstrapInput, bootstrap } from './bootstrap.ts';
 import { runCheckpointsCli } from './checkpoints.ts';
 import { runListSessions } from './list-sessions.ts';
@@ -752,24 +753,10 @@ export const run = async (options: RunOptions): Promise<number> => {
 
     const bootstrapInput: BootstrapInput = {
       prompt: args.prompt,
-      ...(args.model !== undefined ? { modelId: args.model } : {}),
-      ...(args.noRecap === true ? { noRecap: true } : {}),
-      ...(args.maxSteps !== undefined ? { budget: { maxSteps: args.maxSteps } } : {}),
+      // Operator-intent flags shared verbatim with the REPL path —
+      // see `operatorBootstrapFlags` (boot-parity.ts).
+      ...operatorBootstrapFlags(args),
       ...(resumeFromSessionId !== undefined ? { resumeFromSessionId } : {}),
-      ...(args.acceptBrokenChain === true ? { acceptBrokenChain: true } : {}),
-      ...(args.sandboxHost === true ? { sandboxHost: true } : {}),
-      ...(args.autonomous === true ? { approvalPosture: 'autonomous' as const } : {}),
-      ...(args.brokerMode !== undefined ? { brokerMode: args.brokerMode } : {}),
-      // Slice Q — propagate both true AND false (not just true).
-      // `undefined` = no CLI override; bootstrap resolves from config
-      // or default. `true` / `false` = explicit operator opt-in/out.
-      ...(args.memoryVerifyLlm !== undefined ? { memorySemanticVerify: args.memoryVerifyLlm } : {}),
-      ...(args.memoryConflictLlm !== undefined
-        ? { memoryConflictDetect: args.memoryConflictLlm }
-        : {}),
-      ...(args.memoryOverrideLlm !== undefined
-        ? { memoryOverrideDetect: args.memoryOverrideLlm }
-        : {}),
       // Slice Q — pipe --json through so bootstrap's first-boot
       // governance banner can suppress for NDJSON consumers.
       json: args.json,
@@ -795,20 +782,14 @@ export const run = async (options: RunOptions): Promise<number> => {
     } = await bootstrap(bootstrapInput);
 
     // Permission engine refused to come up — typically a broken
-    // audit chain (PERMISSION_ENGINE.md §7.2). Surface the cause
-    // to stderr with the recovery flag, then exit 2 (boot-blocking
-    // configuration error). We close the DB explicitly so the WAL
-    // doesn't linger across the failed boot.
-    if (permissionState === 'refusing') {
-      const reason = permissionRefusingReason ?? 'unknown';
-      errSink(`forja: permission engine refused to start — ${reason}\n`);
-      if (!permissionChain.ok) {
-        errSink(`  chain broken at seq ${permissionChain.brokenAt} (${permissionChain.reason})\n`);
-        errSink('  to continue under the known break, re-run with --accept-broken-chain\n');
-        errSink(
-          '  (the override is itself audited — a `chain-break-accepted` row lands before any new decisions)\n',
-        );
-      }
+    // audit chain (PERMISSION_ENGINE.md §7.2). The diagnostic + the
+    // recovery hint are shared with the REPL path via
+    // `reportRefusingEngine`. Exit 2 (boot-blocking configuration
+    // error); close the DB explicitly so the WAL doesn't linger
+    // across the failed boot.
+    if (
+      reportRefusingEngine({ permissionState, permissionRefusingReason, permissionChain }, errSink)
+    ) {
       closeDb(db);
       return 2;
     }
