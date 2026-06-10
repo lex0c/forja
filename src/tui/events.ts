@@ -642,8 +642,10 @@ export type StepBudgetEvent = BaseEvent & {
 
 // DB-derived usage totals for the footer's cost/token/cache chips.
 // REPL-originated (not from the harness adapter): the REPL recomputes
-// `computeUsageStats` over its session tree at each turn boundary and on
-// boot/resume, then emits this so the reducer SETS the footer fields
+// `computeUsageStats` over its session tree on every `usage_persisted`
+// (one per model response — the harness's post-persist display cue),
+// at each turn boundary, and on boot/resume, then emits
+// this so the reducer SETS the footer fields
 // (absolute values, not deltas). Single source of truth = the persisted
 // DB, so the chips are tree-wide (incl. subagents) and resume-correct.
 // `totalTokens` is the grand total (compute + cache); the footer renders

@@ -11,6 +11,7 @@ import {
   appendMessage,
   completeSession,
   createSession,
+  getSession,
   insertSubagentRun,
   insertSubagentWorktree,
   listBgProcessesBySession,
@@ -1560,22 +1561,31 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
   // an authoritative cost (the child's harness measured it
   // before publishing). For 'crashed' / 'aborted' / 'wall_clock'
   // the synthesized `result.costUsd === 0` is a lower bound —
-  // the child may well have made expensive provider calls
-  // before dying, but we have no way to read its in-flight
-  // accumulator across the IPC boundary. Marking the row
-  // `usage_complete = false` tells consumers (cost rollups,
-  // budget reconciliation, billing audits) "this total is a
-  // floor, not authoritative" — same semantics the harness
-  // uses for its own incomplete-measurement paths.
+  // but the row itself usually holds a BETTER floor: the child's
+  // harness persists its running spend into `total_cost_usd`
+  // per response (loop.ts emitCostUpdate rollup), so a child
+  // killed mid-run leaves its last persisted figure behind.
+  // Read it back and keep the larger value — writing the
+  // synthesized zero over it would destroy real recorded spend
+  // (footer totals visibly DROP, billing audits lose the run).
+  // Marking the row `usage_complete = false` still tells
+  // consumers "this total is a floor, not authoritative".
   //
   // Wrapped in try/catch because the function throws when the
   // row already finalized (concurrent purge, child raced to
   // it) — that's a non-event, not an error to surface. On
-  // that no-op path the value of `usageComplete` we pass is
-  // irrelevant; the child's own finalize already set the row.
+  // that no-op path the values we pass are irrelevant; the
+  // child's own finalize already set the row.
   const usageComplete = outcome.kind === 'payload';
   try {
-    completeSession(input.db, childSession.id, result.status, result.costUsd, usageComplete);
+    const persistedFloor = getSession(input.db, childSession.id)?.totalCostUsd ?? 0;
+    completeSession(
+      input.db,
+      childSession.id,
+      result.status,
+      Math.max(result.costUsd, persistedFloor),
+      usageComplete,
+    );
   } catch {
     // ignore — the row is already in a terminal state
   }

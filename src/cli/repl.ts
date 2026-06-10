@@ -24,6 +24,7 @@ import { basename, join } from 'node:path';
 import { resolveProviderEffort } from '../harness/effort.ts';
 import {
   type HarnessConfig,
+  type HarnessEvent,
   type HarnessResult,
   type SessionContext,
   runAgent,
@@ -931,13 +932,16 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // which auto-rehydrates).
   let resumeRecapPending = false;
   // Append-only list of session ids tracked across this REPL
-  // boot. Pushed on `session_finished` and on playbook subagent
-  // completion. Slash commands that aggregate across the whole
-  // REPL read this list so an operator running multiple turns
-  // sees data from all of them, not just the most recent.
-  // Synthetic-parent ids (audit anchors created by
-  // ensureParentSessionId before any real turn) are NOT pushed —
-  // those are subagent-flagged anchors with no runs of their own.
+  // boot. Invariant: any session id observed from a real run is
+  // pushed at first observation (dedup'd — birth, progress, and
+  // completion events may all carry the same id); synthetic-parent
+  // ids (audit anchors created by ensureParentSessionId before any
+  // real turn) are NEVER pushed — those are subagent-flagged
+  // anchors with no runs of their own, and slash-dispatched
+  // children become reachable via their own id instead. Slash
+  // commands that aggregate across the whole REPL read this list
+  // so an operator running multiple turns sees data from all of
+  // them, not just the most recent.
   const replSessionIdSet = new Set<string>();
   const replSessionIdOrder: string[] = [];
   const trackReplSessionId = (id: string): void => {
@@ -946,10 +950,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     replSessionIdOrder.push(id);
   };
   // Push DB-derived usage totals to the footer's cost/token/cache chips.
-  // Recomputed over the REPL's whole session tree (incl. subagents) at
-  // each turn boundary and on boot/resume, so the chips are consistent,
-  // tree-complete, and resume-correct — the reducer SETS, never sums.
-  // Cheap aggregate at turn cadence; never per-frame.
+  // Recomputed over the REPL's whole session tree (incl. subagents) on
+  // every `usage_persisted` (one per model response — the harness's
+  // post-persist display cue, see loop.ts), at each turn boundary, and
+  // on boot/resume, so the chips are consistent, tree-complete, and
+  // resume-correct — the reducer SETS, never sums. Cheap aggregate at
+  // response cadence; never per-frame or per-delta. If parallel-child
+  // bursts ever make the walk measurable, the lever is a dirty-flag
+  // coalesce per frame, not skipping the cue.
   //
   // Best-effort: this is display-only work invoked from the critical
   // turn-completion / playbook-dispatch paths. A DB hiccup (closed-db
@@ -970,6 +978,25 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       });
     } catch {
       // Display refresh is non-critical; never derail the caller.
+    }
+  };
+  // Shared per-child refresh handler — ONE body for both subagent
+  // spawn seams, so the refresh semantics can't drift between them
+  // (the documented repl.ts parallel-consumer trap):
+  //   - foreground task_* children: the loop forwards child events
+  //     to config.onEvent and onHarnessEvent delegates here;
+  //   - /<playbook> slash dispatches: bypass the loop entirely, so
+  //     the dispatch installs this directly as `onChildEvent`.
+  // `usage_persisted` is the child's post-persist display cue — its
+  // rows landed in the shared DB before the event crossed IPC.
+  // Tracking the child id matters on the SLASH seam, where the
+  // parent is a never-tracked synthetic anchor; on the task_* seam
+  // it's a dedup'd no-op (the child hangs off the tracked foreground
+  // session and the aggregate walk reaches it through the tree).
+  const refreshOnSubagentUsage = (e: HarnessEvent): void => {
+    if (e.type === 'subagent_progress' && e.lastEvent.type === 'usage_persisted') {
+      trackReplSessionId(e.subagentId);
+      emitStatsRefresh();
     }
   };
   // Seed the tracking list with the resumed id so REPL-wide
@@ -1263,6 +1290,28 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       bus.emit({ type: 'warn', ts: now(), message: `adapter error: ${msg}` });
+    }
+    // Track the session the moment it exists. Pre-fix the id only
+    // landed on `session_finished`, so every mid-turn footer refresh
+    // of the FIRST turn hit the empty-list early return in
+    // emitStatsRefresh and the chips stayed frozen until the turn
+    // ended. Dedup'd — reuse turns re-emit the same id.
+    if (event.type === 'session_start') {
+      trackReplSessionId(event.sessionId);
+    }
+    // Per-response footer refresh. `usage_persisted` is the harness's
+    // post-persist display cue (loop.ts): when it fires, the DB
+    // already reflects every usage/cost record the run produced —
+    // so a DB-derived refresh here is current, not one response
+    // behind. Cued on usage_persisted rather than cost_update
+    // because the latter is a billing event that skips zero deltas
+    // (a zero-priced local model would never refresh). The
+    // subagent_progress variant (task_* forwards) goes through the
+    // same shared handler the /<playbook> dispatch installs.
+    if (event.type === 'usage_persisted') {
+      emitStatsRefresh();
+    } else {
+      refreshOnSubagentUsage(event);
     }
     // Flip user-facing turn state on session_finished, NOT on the
     // runAgent Promise resolve. The harness's outer finally awaits
@@ -2342,6 +2391,23 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
             });
             return allowed ? 'allow' : 'deny';
           },
+          // Per-response footer refresh during the dispatch — the
+          // foreground task_* spawn path gets this via the loop's
+          // forwarder → onHarnessEvent, but a slash dispatch
+          // bypasses the loop entirely; this is the second seam the
+          // shared handler covers (see refreshOnSubagentUsage).
+          //
+          // DELIBERATE side effect: setting the observer force-
+          // enables the IPC wire (runtime's implicit opt-in,
+          // runtime.ts `effectiveIpc`). Slash dispatches previously
+          // ran channel-less, which silently made the permission
+          // proxy above DEAD CODE — the child auto-denied every
+          // confirm verdict because no permission:ask could cross.
+          // With the wire on, confirm-gated tools in a playbook now
+          // prompt the operator as the proxy's comment always
+          // claimed. It also arms the IPC version-mismatch exit-code
+          // mapping for these children.
+          onChildEvent: refreshOnSubagentUsage,
         });
         playbookPromise = dispatchPromise;
         const result = await dispatchPromise;

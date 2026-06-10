@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
 import type { CollectedStep } from '../../src/harness/collect.ts';
-import { type AssistantUsage, SessionContext } from '../../src/harness/index.ts';
+import { type AssistantUsage, type HarnessEvent, SessionContext } from '../../src/harness/index.ts';
 import { runAgent } from '../../src/harness/loop.ts';
 import { createPermissionEngine } from '../../src/permissions/index.ts';
 import type { Policy } from '../../src/permissions/index.ts';
@@ -9,7 +9,7 @@ import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { createPin } from '../../src/storage/repos/context-pins.ts';
 import { listProvenanceForMemory } from '../../src/storage/repos/memory-provenance.ts';
-import { appendMessage } from '../../src/storage/repos/messages.ts';
+import { appendMessage, sumMessageUsage } from '../../src/storage/repos/messages.ts';
 import { createSession, getSession, listSessions } from '../../src/storage/repos/sessions.ts';
 import type { SubagentSet } from '../../src/subagents/load.ts';
 import type { SubagentDefinition } from '../../src/subagents/types.ts';
@@ -3065,5 +3065,94 @@ describe('runAgent', () => {
       // Reference equality: no wrapping when exclusion is omitted.
       expect(captured).toBe(memoryRegistry);
     });
+  });
+});
+
+describe('post-persist contract (per-response footer refresh)', () => {
+  // The REPL refreshes the footer's DB-derived usage chips on every
+  // `usage_persisted` (the harness's display cue), so both it and the
+  // billing event `cost_update` carry an ordering contract (see
+  // emitCostUpdate in loop.ts): when they fire, the DB must already
+  // hold the rows the charge came from — the assistant message row
+  // (token side) and the session's total_cost_usd rollup (cost side).
+  // Pre-fix the emit happened BEFORE appendAssistant, so a DB read
+  // triggered by the event ran one response behind for the whole turn.
+  const SCRIPT: ScriptedStep[] = [
+    {
+      tool_uses: [{ id: 'tu1', name: 'echo', input: { msg: 'a' } }],
+      stop_reason: 'tool_use',
+      usage: { input: 100, output: 10 },
+    },
+    { text: 'done', stop_reason: 'end_turn', usage: { input: 100, output: 10 } },
+  ];
+
+  test('billed run: both events fire after the row and rollup are persisted, once per response', async () => {
+    const { config } = buildConfig(SCRIPT, {
+      capsOverride: { cost_per_1k_input: 1, cost_per_1k_output: 1 },
+    });
+    let sessionId = '';
+    const costObserved: { cumulative: number; rolledUpCost: number; tokensOut: number }[] = [];
+    const cueObserved: { rolledUpCost: number; tokensOut: number }[] = [];
+    const result = await runAgent({
+      ...config,
+      onEvent: (e: HarnessEvent) => {
+        if (e.type === 'session_start') sessionId = e.sessionId;
+        // Read the DB the way the REPL's footer refresh does — at the
+        // moment each event is delivered (the bus is synchronous).
+        if (e.type === 'cost_update') {
+          costObserved.push({
+            cumulative: e.cumulative,
+            rolledUpCost: getSession(db, sessionId)?.totalCostUsd ?? -1,
+            tokensOut: sumMessageUsage(db, sessionId).tokensOut,
+          });
+        }
+        if (e.type === 'usage_persisted') {
+          cueObserved.push({
+            rolledUpCost: getSession(db, sessionId)?.totalCostUsd ?? -1,
+            tokensOut: sumMessageUsage(db, sessionId).tokensOut,
+          });
+        }
+      },
+    });
+    expect(result.status).toBe('done');
+    // One of each per model response — that's the footer cadence.
+    expect(costObserved.length).toBe(2);
+    expect(cueObserved.length).toBe(2);
+    // First response: its own tokens are already queryable at emit time.
+    expect(costObserved[0]?.tokensOut).toBe(10);
+    expect(cueObserved[0]?.tokensOut).toBe(10);
+    expect(costObserved[0]?.rolledUpCost).toBeCloseTo(costObserved[0]?.cumulative ?? -1, 10);
+    // Second response: both rows visible, rollup tracks cumulative.
+    expect(costObserved[1]?.tokensOut).toBe(20);
+    expect(cueObserved[1]?.tokensOut).toBe(20);
+    expect(costObserved[1]?.rolledUpCost).toBeCloseTo(costObserved[1]?.cumulative ?? -1, 10);
+    // The mid-run rollup converged on the same figure finish() persists.
+    const final = getSession(db, sessionId);
+    expect(final?.totalCostUsd).toBeCloseTo(costObserved[1]?.cumulative ?? -1, 10);
+  });
+
+  test('zero-priced provider: cost_update stays silent but the display cue still fires per response', async () => {
+    // Local/free models have cost_per_1k_* = 0, so every delta is 0 and
+    // the billing event is (deliberately) skipped. The footer must not
+    // fall back to turn cadence for that provider class — that's the
+    // point of the separate usage_persisted cue.
+    const { config } = buildConfig(SCRIPT); // default caps: zero pricing
+    let sessionId = '';
+    let costUpdates = 0;
+    const cueObserved: number[] = [];
+    const result = await runAgent({
+      ...config,
+      onEvent: (e: HarnessEvent) => {
+        if (e.type === 'session_start') sessionId = e.sessionId;
+        if (e.type === 'cost_update') costUpdates += 1;
+        if (e.type === 'usage_persisted') {
+          cueObserved.push(sumMessageUsage(db, sessionId).tokensOut);
+        }
+      },
+    });
+    expect(result.status).toBe('done');
+    expect(costUpdates).toBe(0);
+    // Still one cue per response, with the response's row queryable.
+    expect(cueObserved).toEqual([10, 20]);
   });
 });

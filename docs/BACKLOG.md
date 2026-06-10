@@ -2,6 +2,59 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-09] feat(tui): footer usage chips refresh per model response
+
+The footer chips (tokens / cache / cost) only refreshed at turn boundaries: the REPL emitted
+`stats:refresh` after `session_finished`, on boot/resume, and post-`/compact`, so a turn with
+many steps showed stale counters until it ended. The per-response data was already there —
+every assistant message persists its usage row the moment it completes (`appendAssistant`),
+and the harness emits `cost_update` per response.
+
+`cost_update` now carries an ordering contract: emitters persist before announcing. The two
+call sites that fired pre-persist moved after their persists (turn settle → after
+`appendAssistant`; compaction → after `persistCompaction`), and `emitCostUpdate` itself writes
+the session's `total_cost_usd` rollup (same incremental `updateSessionCost` the operator
+`/compact` uses; `finish()` re-writes the identical prior+run figure). Without the rollup
+write, mid-turn refreshes would show live tokens but a cost frozen at the last `finish()` —
+`computeUsageStats` sources cost from `sessions.total_cost_usd`, not message rows. The REPL
+then refreshes on every `cost_update` and on `subagent_progress` cost forwards, tracks the
+session at `session_start` (pre-fix the FIRST turn's id was only tracked at `session_finished`,
+so mid-turn refreshes early-returned for the whole first turn), and tracks a subagent's id at
+first spend so the aggregate walk reaches slash-dispatched children whose synthetic parent is
+never tracked. The `/​<playbook>` dispatch gained the same `onChildEvent` observer the loop's
+task_* path already had (the repl.ts parallel-consumer pattern again). Reducer contract
+untouched: `stats:refresh` still SETS DB-derived totals; only the cadence changed
+(turn → response).
+
+Tests: loop-level ordering (cost_update finds the message row + rollup already queryable, one
+event per response, mid-run rollup converges on finish()'s figure) and REPL wiring (mid-turn
+cost chip repaint per response without `session_finished`; subagent forward repaints via the
+tracked child id). Impacted suites (599), typecheck, biome all green.
+
+**Post-review hardening** (same slice, after a 7-angle review of the diff):
+
+- **`usage_persisted` display cue.** Cueing the refresh on `cost_update` silently excluded
+  zero-priced providers (local models): every delta is 0 and the billing event deliberately
+  skips zero deltas, so the footer fell back to turn cadence for exactly that provider class.
+  New `usage_persisted` HarnessEvent — emitted post-persist at all three charge sites,
+  unconditionally — is now the display cue; `cost_update` returns to pure billing semantics
+  (keeps the incremental rollup write). The REPL refreshes on it via ONE shared handler
+  installed at both subagent seams (loop `task_*` forwards + `/<playbook>` `onChildEvent`), so
+  the two paths can't drift.
+- **Kill/error finalize paths no longer destroy persisted spend.** The incremental rollup
+  turned two previously-lossless "write 0 over 0" finalizes into data destruction: the parent's
+  no-payload finalize (`runtime.ts`, crashed/aborted/wall_clock/heartbeat_stale children) and
+  the child's `finalizeAsError` (throw escaping `runAgent` after billed steps) both overwrote
+  the child-persisted floor with a synthesized 0 — footer totals visibly DROPPED when a child
+  was killed. Both now read the row back and preserve the floor (`usage_complete` stays a
+  lower-bound marker). Regression tests for both.
+- **Deliberate side effect, documented:** passing `onChildEvent` on the slash dispatch
+  force-enables the IPC wire (`effectiveIpc`), which makes the previously-DEAD permission proxy
+  live — slash playbooks hitting confirm-gated tools now prompt the operator instead of
+  silently auto-denying in the child (what the dispatch's own comment always claimed happened).
+  Also arms the IPC version-mismatch exit-code mapping for these children. Accepted as a
+  bug-fix alignment; noted in the dispatch comment.
+
 ## [2026-06-09] chore(seeds): drop 4 vendor seeds redundant with the always-on system prompt
 
 The vendor seed pack carried 4 seeds whose doctrine is already hard-coded, always-on, in the

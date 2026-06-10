@@ -2311,6 +2311,65 @@ You are the worker.`,
     }
   });
 
+  test('finalizeAsError preserves spend already persisted on the row (no zero overwrite)', async () => {
+    // The harness persists the session cost rollup per response
+    // (loop.ts emitCostUpdate). finalizeAsError also fires from the
+    // outer catch when a throw escapes runAgent AFTER billed steps —
+    // writing a literal 0 there would destroy the recorded floor.
+    // Simulate the mid-run rollup, then drive a finalizeAsError path
+    // (unknown model refusal) and assert the figure survives with
+    // usage_complete = 0 (lower bound, not authoritative).
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const subagentRunsRepo = await import('../../src/storage/repos/subagent-runs.ts');
+    const db = openDb(dbPath);
+    let childId: string;
+    try {
+      migrate(db);
+      const parent = sessionsRepo.createSession(db, {
+        model: 'anthropic/claude-sonnet-4-6',
+        cwd: dbDir,
+      });
+      const child = sessionsRepo.createSession(db, {
+        model: 'fictional/never-registered',
+        cwd: dbDir,
+        parentSessionId: parent.id,
+      });
+      childId = child.id;
+      subagentRunsRepo.insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'explore',
+        scope: 'project',
+        sourcePath: '/fake/explore.md',
+        sourceSha256: 'a'.repeat(64),
+        systemPrompt: 'You are explore.',
+        toolsWhitelist: [],
+        budgetMaxSteps: 5,
+        budgetMaxCostUsd: 0.1,
+      });
+      sessionsRepo.updateSessionCost(db, child.id, 0.85);
+    } finally {
+      db.close();
+    }
+    const exitCode = await runSubagentChild({
+      sessionId: childId,
+      dbPath,
+      errSink: () => undefined,
+    });
+    expect(exitCode).toBe(1);
+    const db2 = openDb(dbPath);
+    try {
+      const session = (await import('../../src/storage/repos/sessions.ts')).getSession(
+        db2,
+        childId,
+      );
+      expect(session?.status).toBe('error');
+      expect(session?.totalCostUsd).toBeCloseTo(0.85, 10);
+      expect(session?.usageComplete).toBe(false);
+    } finally {
+      db2.close();
+    }
+  });
+
   test('missing audit row refused with explicit diagnostic', async () => {
     // Create a child session WITHOUT the subagent_runs row — the
     // child has no way to discover its definition (system prompt,

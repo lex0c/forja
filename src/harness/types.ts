@@ -337,6 +337,20 @@ export type HarnessEvent =
       cumulative: number;
     }
   | {
+      // Display-refresh cue: the DB now reflects every usage/cost
+      // record the run has produced so far — emitted right AFTER a
+      // persist advanced that state (assistant message row at turn
+      // settle, compaction_events row, or the partial-charge cost
+      // rollup on a provider error). Fires once per model response
+      // REGARDLESS of price, unlike `cost_update` (a billing event
+      // that deliberately skips zero deltas — a zero-priced local
+      // model would otherwise never cue the consumer). The REPL
+      // uses it to recompute the footer's DB-derived usage chips
+      // per response; carries no payload because consumers read
+      // the DB, the single source of truth, not the event.
+      type: 'usage_persisted';
+    }
+  | {
       // Parallelism observability snapshot (spec
       // ORCHESTRATION.md §1.3 / §3.3). Emitted by the harness
       // whenever the in-flight or queued counts change — the

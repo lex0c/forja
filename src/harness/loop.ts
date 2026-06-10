@@ -46,6 +46,7 @@ import {
   insertCostProgressEvent,
   insertSubagentGateDecision,
   reopenSession,
+  updateSessionCost,
 } from '../storage/index.ts';
 import { listApprovalsLogBySessionRecent } from '../storage/repos/approvals-log.ts';
 import {
@@ -403,10 +404,22 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // provider-error charge. Carries `delta` (the latest charge
   // alone) and `cumulative` (this session's running self-cost).
   // For a subagent run, the parent's IPC observer reads these
-  // events and tracks live in-flight spend; for a top-level run
-  // the event is harmless (TUI ignores it). Skipped on zero
+  // events and tracks live in-flight spend. Skipped on zero
   // deltas so a misbehaving provider that emitted a usage event
-  // with all zeros doesn't generate noise.
+  // with all zeros doesn't generate noise — which is why this is
+  // a BILLING event, not the display cue: `usage_persisted`
+  // (emitted by the same call sites right after) is the
+  // unconditional per-response signal the REPL refreshes on.
+  //
+  // Post-persist contract: callers emit AFTER persisting the rows
+  // the charge came from (message / compaction_events; the partial
+  // provider-error site has no row — the turn died — so only the
+  // rollup below lands there), and the emitter persists the
+  // session cost rollup first — by the time a consumer reads the
+  // DB, it reflects the charge. NOTE the memory-verify scheduler
+  // (chargeSchedulerThenCheckCap below) hand-rolls a cost_update
+  // for CHILD spend, which lives in the children's own session
+  // rows, not this rollup.
   // Sticky flag — set true the first time the soft cap is
   // crossed and never reset. Idempotent emission per run.
   // Declared ahead of `emitCostUpdate` so the closure reads a
@@ -423,6 +436,24 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   let softCapWarned = false;
   const emitCostUpdate = (delta: number): void => {
     if (!Number.isFinite(delta) || delta <= 0) return;
+    // Persist the lifetime cost rollup BEFORE announcing the charge.
+    // `cost_update` is the REPL's cue to recompute the footer's
+    // DB-derived usage chips per model response (not per turn), so
+    // the event carries an ordering contract: when it fires, the DB
+    // already reflects this charge — both the rows the charge came
+    // from (callers persist message / compaction rows first) and the
+    // session's cost rollup written here. Same incremental write the
+    // operator `/compact` does; `finish()` remains the canonical
+    // final writeback with the identical prior+run figure.
+    // Best-effort like the finish() write: a DB hiccup must not turn
+    // a billed, otherwise-healthy step into a run failure.
+    if (sessionId.length > 0) {
+      try {
+        updateSessionCost(config.db, sessionId, priorCostUsd + totalCostUsd);
+      } catch {
+        // Display-cadence bookkeeping only; finish() re-writes it.
+      }
+    }
     safeEmit(config.onEvent, {
       type: 'cost_update',
       delta,
@@ -2466,7 +2497,6 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         const acct = accountCompaction(compaction, config.provider.capabilities);
         totalUsage = addUsage(totalUsage, compaction.usage);
         totalCostUsd += acct.costUsd;
-        emitCostUpdate(acct.costUsd);
         if (acct.usageIncomplete) {
           usageComplete = false;
         }
@@ -2490,6 +2520,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           ...(compaction.summary !== undefined ? { summary: compaction.summary } : {}),
           ...(compaction.reason !== undefined ? { reason: compaction.reason } : {}),
         });
+        // After persistCompaction so the post-persist contract holds:
+        // the compaction_events row (token side of the charge) is
+        // queryable when these fire.
+        emitCostUpdate(acct.costUsd);
+        safeEmit(config.onEvent, { type: 'usage_persisted' });
         const finishedEvent: HarnessEvent = {
           type: 'compaction_finished',
           strategy: compaction.strategy,
@@ -2623,6 +2658,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               totalUsage = addUsage(totalUsage, partial.usage);
               totalCostUsd += partialCost;
               emitCostUpdate(partialCost);
+              // Display cue AFTER the rollup write above. This site
+              // never persists a message row (the turn died before
+              // settling), so the cue only surfaces the cost side —
+              // token chips legitimately stay put; usage_complete
+              // marks the totals as a lower bound.
+              safeEmit(config.onEvent, { type: 'usage_persisted' });
               // Note: we deliberately do NOT check budget.maxCostUsd here.
               // The provider error path is about to call finish('providerError')
               // unconditionally — surfacing maxCostUsd instead when the partial
@@ -2685,7 +2726,6 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         const turnCostUsd = computeCost(config.provider.capabilities, collected.usage);
         totalUsage = addUsage(totalUsage, collected.usage);
         totalCostUsd += turnCostUsd;
-        emitCostUpdate(turnCostUsd);
         // ANY assistant turn that completes without a usage event is
         // unmeasured — every successful provider call bills input tokens
         // for the prompt, even when the model emits no text, no
@@ -2716,6 +2756,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // (migration 074) — records the effort that produced the turn.
           reqEffort ?? null,
         );
+
+        // After appendAssistant so the post-persist contract holds:
+        // the message row carrying this response's tokens is
+        // queryable when these fire. Before the stream-errors check
+        // below — a turn that errored still billed, and its
+        // providerError finish path must not swallow the
+        // announcements. `usage_persisted` is the display cue and
+        // fires for EVERY settled response; `cost_update` is the
+        // billing event and skips zero deltas (zero-priced local
+        // models never emit it).
+        emitCostUpdate(turnCostUsd);
+        safeEmit(config.onEvent, { type: 'usage_persisted' });
 
         // Stream errors (normalizer-level: malformed tool_use args, orphan
         // tool_use_stop, etc.) mean the provider produced output we couldn't

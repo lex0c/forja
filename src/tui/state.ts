@@ -903,8 +903,9 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       };
     case 'stats:refresh':
       // DB-derived usage totals (cost/tokens/cache) for the footer. The
-      // REPL recomputes these over its session tree at each turn boundary
-      // and on boot/resume, then emits this so we SET (not accumulate) —
+      // REPL recomputes these over its session tree per model response
+      // (each usage_persisted), at turn boundaries, and on boot/resume,
+      // then emits this so we SET (not accumulate) —
       // single source of truth is the persisted DB, so the chips are
       // tree-wide (incl. subagents) and resume-correct. SET overrides any
       // stale value; no scrollback.
