@@ -2,6 +2,21 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-10] docs: implementation companion for tool output reduction
+
+Added `docs/OUTPUT_POLICY.md` — the non-normative impl companion for the three
+tool-output-reduction layers (summarize hook in `invoke-tool.ts`, the per-tool
+deterministic compressors in `output-summarizer.ts`, and the relevance pre-pass
+in `compaction-relevance.ts`), mirroring the role `SESSION.md` plays for the
+compaction pipeline. Closes an asymmetry: the relevance pre-pass already had
+human-facing coverage (`SESSION.md` impl, `BUDGET.md` knobs, `AUDIT.md`
+forensics), but the summarize hook's mechanics — the chokepoint ordering (raw to
+audit first, digest to the model second), the marker, the error-path bypass, the
+replay-safety / determinism requirement, and why all three layers leave the
+cached prefix intact — lived only in the spec and the code. No behavior change;
+documentation only. Thresholds quoted from source (bash 16 KB/80+80 per stream,
+grep ≥50 group-by-file, glob >200 head/tail 50).
+
 ## [2026-06-10] fix(anthropic): honest `model_context_window_exceeded` exit + suppress thinking on tool turns
 
 Two correctness gaps surfaced auditing the Anthropic context-window contract:
