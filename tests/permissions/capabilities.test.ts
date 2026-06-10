@@ -264,6 +264,29 @@ describe('capabilityCoversCwdAware (slice 95)', () => {
     expect(capabilityCoversCwdAware(parent, child, CWD)).toBe(true);
   });
 
+  // Bare-prefix-dir parity with the string-based `capabilityCovers`
+  // (rule 4.c: `<prefix>/**` covers the bare `<prefix>` dir). Without
+  // this, a subagent granted `read-fs:src/**` was DENIED any op on
+  // `src` itself (`ls src`, a dir-resolving read) because the resolver
+  // emits `read-fs:<cwd>/src` (no trailing slash) and glob `**`
+  // matches only paths strictly under `src/`. The spawn gate covered
+  // it but the enforce side did not — a gate/enforce divergence.
+  test('prefix glob covers the bare prefix dir (cwd-aware), matching capabilityCovers', () => {
+    const parent: Capability = { kind: 'read-fs', scope: 'src/**' };
+    // resolver-emitted absolute form of the dir root, no trailing slash
+    const bareDir: Capability = { kind: 'read-fs', scope: '/work/proj/src' };
+    expect(capabilityCoversCwdAware(parent, bareDir, CWD)).toBe(true);
+    // parity: string-based capabilityCovers already covers the relative bare dir
+    expect(capabilityCovers(parent, { kind: 'read-fs', scope: 'src' })).toBe(true);
+  });
+
+  test('bare-prefix shortcut stays traversal-safe (resolved `..` escaping cwd is NOT covered)', () => {
+    const parent: Capability = { kind: 'read-fs', scope: 'src/**' };
+    // `<cwd>/src/../../secret` canonicalizes to `/work/secret` ≠ `<cwd>/src`
+    const escape: Capability = { kind: 'read-fs', scope: '/work/proj/src/../../secret' };
+    expect(capabilityCoversCwdAware(parent, escape, CWD)).toBe(false);
+  });
+
   test('relative prefix glob does NOT cover absolute target outside cwd', () => {
     const parent: Capability = { kind: 'read-fs', scope: 'src/**' };
     const child: Capability = { kind: 'read-fs', scope: '/etc/passwd' };

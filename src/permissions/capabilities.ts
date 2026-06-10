@@ -294,6 +294,7 @@ export const capabilityCovers = (parent: Capability, child: Capability): boolean
 // This helper is the evaluation-side check for the child-envelope
 // constraint. No flag / config / prompt can override.
 import { matchPath } from './matcher.ts';
+import { resolve as resolvePath } from 'node:path';
 
 const FS_KINDS: ReadonlySet<CapabilityKind> = new Set<CapabilityKind>([
   'read-fs',
@@ -325,6 +326,30 @@ export const capabilityCoversCwdAware = (
   // resolved `read-fs:src/index.ts` without absolutization).
   // Cheap pre-check.
   if (pScope === cScope) return true;
+  // Bare-prefix-dir parity with `capabilityCovers` rule 4.c
+  // (`<prefix>/**` covers the bare `<prefix>` dir, not just paths
+  // under it). `matchPath('src/**', '<cwd>/src', cwd)` is FALSE —
+  // glob `**` matches only paths strictly under `src/`, so the dir
+  // root itself is excluded. Without this, a subagent granted
+  // `read-fs:src/**` is DENIED any op on `src` itself (`ls src`,
+  // a `read_file src` that resolves to the dir, a write that
+  // creates `src`), because the resolver emits `read-fs:<cwd>/src`
+  // (no trailing slash) and the enforce side wouldn't cover it —
+  // while the spawn gate (string-based `capabilityCovers`) DOES.
+  // That divergence is the same gate-vs-enforce asymmetry class as
+  // the R1 spawn-gate P0; close it here so the two coverage
+  // functions agree. Resolve the prefix against cwd so the
+  // comparison is in the same absolute space as the resolver-
+  // emitted child scope. Sound: covering the root of a granted
+  // subtree is exactly what `<prefix>/**` intends.
+  if (pScope.endsWith('/**')) {
+    const prefix = pScope.slice(0, -3);
+    if (prefix.length > 0) {
+      const absPrefix = resolvePath(cwd, prefix);
+      const absChild = resolvePath(cwd, cScope);
+      if (absChild === absPrefix) return true;
+    }
+  }
   return matchPath(pScope, cScope, cwd);
 };
 
