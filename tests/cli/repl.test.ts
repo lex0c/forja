@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ParsedArgs } from '../../src/cli/args.ts';
-import type { BootstrapResult } from '../../src/cli/bootstrap.ts';
+import type { BootstrapInput, BootstrapResult } from '../../src/cli/bootstrap.ts';
 import {
   type RunReplOptions,
   SUBAGENT_DISPLAY_MAX,
@@ -393,6 +393,78 @@ describe('repl — boot + smoke', () => {
     expect(stderr).toContain('forja: effort config: bad effort level');
     expect(stderr).toContain('forja: providers config: bad provider route');
     expect(stderr).toContain('forja: budget config: bad budget value');
+  });
+
+  test('aborts boot with exit 2 when the permission engine is refusing (matches run.ts)', async () => {
+    // Regression: BootstrapResult is consumed by BOTH run.ts and runRepl,
+    // but only run.ts honored `permissionState === 'refusing'`. The REPL
+    // ignored it and booted a live session where every permission check
+    // denies (`refusing` is terminal) with no diagnostic. runRepl now
+    // mirrors run.ts: surface the cause + recovery hint, drain the broker,
+    // close storage, and exit 2 before the TUI takes over.
+    let brokerClosed = false;
+    const stub = makeBootstrapStub({
+      broker: {
+        close: async () => {
+          brokerClosed = true;
+        },
+      },
+    });
+    (stub as { permissionState: string }).permissionState = 'refusing';
+    (stub as { permissionRefusingReason?: string }).permissionRefusingReason =
+      'chain_broken: seq=3 reason=hash_mismatch';
+    (stub as { permissionChain: unknown }).permissionChain = {
+      ok: false,
+      brokenAt: 3,
+      reason: 'hash_mismatch',
+      expected: 'aaaa',
+      actual: 'bbbb',
+    };
+    let stderr = '';
+    const code = await runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin: makeStdin(),
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: (s) => {
+        stderr += s;
+      },
+    });
+    expect(code).toBe(2);
+    expect(stderr).toContain('permission engine refused to start');
+    expect(stderr).toContain('chain broken at seq 3');
+    expect(stderr).toContain('--accept-broken-chain');
+    // §13.7 teardown order: the broker drains before storage closes,
+    // even on this pre-loop abort path.
+    expect(brokerClosed).toBe(true);
+  });
+
+  test('forwards --autonomous to bootstrap as autonomous posture (matches run.ts)', async () => {
+    // Regression: run.ts forwarded `--autonomous` into BootstrapInput
+    // (approvalPosture); the REPL dropped it, so `agent --autonomous`
+    // entering the REPL silently booted supervised — the flag has no
+    // config fallback. runRepl now forwards it.
+    let captured: BootstrapInput | undefined;
+    const stub = makeBootstrapStub();
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs({ autonomous: true }),
+      bootstrapFn: (input) => {
+        captured = input;
+        return stub;
+      },
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      errSink: () => {},
+    });
+    await tick();
+    stdin.feed('\x04'); // EOF → quit after boot
+    await promise;
+    expect(captured?.approvalPosture).toBe('autonomous');
   });
 
   test('refuses to start when stdin is non-TTY even if stdout is TTY (regression)', async () => {

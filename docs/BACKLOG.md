@@ -2,6 +2,47 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-10] fix(repl): boot parity with the one-shot harness
+
+`BootstrapResult` is consumed by BOTH `cli/run.ts` (one-shot) and `cli/repl.ts`
+(interactive), but the REPL had drifted into a subset of the boot contract.
+Audit of the two paths surfaced three incoherences, all the same class — the
+REPL forwarding fewer operator-intent fields / honoring fewer boot guards than
+the headless path:
+
+1. **`permissionState === 'refusing'` was not handled** (most serious). When the
+   engine refuses to start (broken audit chain, invalid policy, sandbox
+   required-but-unavailable), `run.ts` prints the reason + chain-break detail +
+   the `--accept-broken-chain` recovery hint and exits 2. The REPL ignored
+   `permissionState`/`permissionRefusingReason`/`permissionChain` entirely and
+   booted into a live session where every permission check denies
+   (`refusing` is terminal — "every check returns deny until restart"), with no
+   boot diagnostic and no recovery path. Added the same guard before the loop,
+   reusing the existing post-bootstrap teardown order (drain broker → close db).
+
+2. **Operator-intent flags were dropped.** `run.ts` forwards `--autonomous`,
+   `--accept-broken-chain`, `--sandbox-host`, `--broker-mode`, and the three
+   `--memory-*-llm` toggles into `BootstrapInput`; the REPL forwarded none. For
+   `--autonomous` and `--accept-broken-chain` there is NO config fallback, so the
+   flags silently no-op'd (and the comment seeding `operationMode` from the
+   engine posture was effectively dead for a `--autonomous` boot). The other
+   flags have a config fallback, so only the CLI override was lost. The REPL now
+   forwards the same set.
+
+Root-cause fix (not just the two instances): extracted the shared boot contract
+into `src/cli/boot-parity.ts` — `operatorBootstrapFlags(args)` (the operator-flag
+→ `BootstrapInput` mapping) and `reportRefusingEngine(fields, errSink)` (the
+refusing diagnostic + recovery hint). Both `run.ts` and `repl.ts` now consume
+the same functions, so a new operator flag or a change to the refusing message
+can't drift between the two entrypoints again. The teardown after a refusing
+exit stays in each caller (the REPL also unwinds its live renderer/stdin stack).
+
+Tests: `boot-parity.test.ts` unit-covers both helpers (flag mapping incl. the
+Slice Q true/false propagation; refusing with intact vs broken chain; the
+"unknown" reason fallback). Integration: refusing-engine REPL boot aborts with
+exit 2 + diagnostics + recovery hint and drains the broker; `--autonomous` seeds
+the engine to autonomous posture at boot.
+
 ## [2026-06-10] fix(tests): make 16 host-dependent tests hermetic (green on CI)
 
 Sixteen tests passed locally (Manjaro/Arch) but failed on GitHub Actions
