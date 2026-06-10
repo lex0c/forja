@@ -85,6 +85,41 @@ describe('read_file resolver', () => {
     const r = resolveCapabilities('read_file', { file_path: 123 }, CTX);
     expect(r.kind).toBe('refuse');
   });
+
+  // Parser-differential (confused-deputy): the engine classifies on
+  // `file_path` but the read_file/write_file/edit_file TOOLS read only
+  // `args.path`. Conflicting values must REFUSE so an attacker can't
+  // get a benign `file_path` classified while the tool reads a secret
+  // `path` (e.g. `{file_path:'./README.md', path:'~/.ssh/id_rsa'}`).
+  test('conflicting file_path + path refuses (differential guard)', () => {
+    const r = resolveCapabilities(
+      'read_file',
+      { file_path: 'src/index.ts', path: '/etc/shadow' },
+      CTX,
+    );
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') expect(r.reason).toContain('conflicting');
+  });
+
+  test('equal file_path + path passes (no false refuse)', () => {
+    const r = resolveCapabilities(
+      'read_file',
+      { file_path: 'src/index.ts', path: 'src/index.ts' },
+      CTX,
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toEqual(['read-fs:/work/proj/src/index.ts']);
+    }
+  });
+
+  test('write_file + edit_file also refuse conflicting path args', () => {
+    for (const tool of ['write_file', 'edit_file']) {
+      const r = resolveCapabilities(tool, { file_path: 'a.txt', path: '/etc/passwd' }, CTX);
+      expect(r.kind).toBe('refuse');
+      if (r.kind === 'refuse') expect(r.reason).toContain('conflicting');
+    }
+  });
 });
 
 describe('write_file / edit_file resolvers', () => {

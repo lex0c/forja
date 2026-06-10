@@ -27,6 +27,37 @@ const filePathOf = (args: Record<string, unknown>): string | null => {
   return null;
 };
 
+// Parser-differential guard (confused-deputy). The engine classifies
+// on `file_path` (preferred by `filePathOf` above), but the
+// read_file / write_file / edit_file TOOLS read ONLY `args.path` —
+// their inputSchema doesn't even declare `file_path`. When BOTH keys
+// are present and DIFFER, the engine would gate `file_path` while the
+// tool touches `path`: e.g. `{file_path:'./README.md',
+// path:'/home/op/.ssh/id_rsa'}` classifies as a benign read but the
+// tool reads the key — bypassing deny_paths, allow_paths scoping, and
+// the sensitive-path engine-floor. The two sides disagree on which
+// arg is authoritative, so refuse outright rather than silently pick
+// one. Equal values (or only one key present) are unambiguous and
+// pass through unchanged.
+const conflictingPathArgsRefuse = (
+  args: Record<string, unknown>,
+  tool: string,
+): ResolverResult | null => {
+  if (
+    isNonEmptyString(args.file_path) &&
+    isNonEmptyString(args.path) &&
+    args.file_path !== args.path
+  ) {
+    return {
+      kind: 'refuse',
+      reason: `${tool}: conflicting 'file_path' and 'path' arguments (${JSON.stringify(
+        args.file_path,
+      )} vs ${JSON.stringify(args.path)}); the engine and tool would resolve different files`,
+    };
+  }
+  return null;
+};
+
 // Resolve a path arg into a lexically-normalized textual absolute
 // form. Always calls `path.resolve(cwd, ...)` even on absolute
 // inputs so `..`/`./` components are normalized lexically; without
@@ -64,6 +95,8 @@ const resolveAbs = (path: string, ctx: ResolverContext): string =>
   resolve(ctx.cwd, expandTilde(path, ctx.home));
 
 const readFileResolver: Resolver = (args, ctx): ResolverResult => {
+  const conflict = conflictingPathArgsRefuse(args, 'read_file');
+  if (conflict !== null) return conflict;
   const path = filePathOf(args);
   if (path === null) {
     return { kind: 'refuse', reason: "read_file: missing or non-string 'file_path' argument" };
@@ -76,6 +109,8 @@ const readFileResolver: Resolver = (args, ctx): ResolverResult => {
 };
 
 const writeFileResolver: Resolver = (args, ctx): ResolverResult => {
+  const conflict = conflictingPathArgsRefuse(args, 'write_file');
+  if (conflict !== null) return conflict;
   const path = filePathOf(args);
   if (path === null) {
     return {
@@ -93,6 +128,8 @@ const writeFileResolver: Resolver = (args, ctx): ResolverResult => {
 };
 
 const editFileResolver: Resolver = (args, ctx): ResolverResult => {
+  const conflict = conflictingPathArgsRefuse(args, 'edit_file');
+  if (conflict !== null) return conflict;
   const path = filePathOf(args);
   if (path === null) {
     return { kind: 'refuse', reason: "edit_file: missing or non-string 'file_path' argument" };
