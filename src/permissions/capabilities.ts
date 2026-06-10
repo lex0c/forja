@@ -75,19 +75,18 @@ const PATH_SCOPED_KINDS: ReadonlySet<CapabilityKind> = new Set<CapabilityKind>([
 
 // True when a path scope contains a `..` traversal segment in any
 // position: bare `..`, leading `../`, embedded `/../`, or trailing
-// `/..`. Backslash form is covered too — a Windows-style `..\\` is
-// equally a traversal. Used only by the spawn-time string-coverage
-// guard; the enforcement side canonicalizes instead.
+// `/..`. Used only by the spawn-time string-coverage guard; the
+// enforcement side canonicalizes instead.
 const hasTraversalSegment = (scope: string): boolean => {
-  if (scope === '..') return true;
-  return (
-    scope.startsWith('../') ||
-    scope.startsWith('..\\') ||
-    scope.includes('/../') ||
-    scope.includes('\\..\\') ||
-    scope.endsWith('/..') ||
-    scope.endsWith('\\..')
-  );
+  // Treat both separators as delimiters so MIXED forms
+  // (`src/..\secret`, `src\..//secret`) are caught: on Windows
+  // `node:path` collapses `..` regardless of which slash bounds it,
+  // so enumerating only same-separator forms (`/../`, `\..\`) would
+  // miss `/..\` and re-open the very escape this guards. Normalize
+  // every backslash to a forward slash first, then one set of
+  // forward-slash checks covers all combinations.
+  const s = scope.replace(/\\/g, '/');
+  return s === '..' || s.startsWith('../') || s.includes('/../') || s.endsWith('/..');
 };
 
 export interface Capability {

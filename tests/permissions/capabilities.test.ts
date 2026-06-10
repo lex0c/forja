@@ -144,6 +144,19 @@ describe('capabilityCovers — traversal guard (spawn-gate escape)', () => {
     expect(capabilityCovers(readFs('**'), readFs('a\\..\\b'))).toBe(false);
   });
 
+  test('MIXED separators refuse (Windows collapses `..` regardless of bounding slash)', () => {
+    // `src/..\secret` starts with `src/` so the prefix rule would admit
+    // it, but on Windows `node:path` resolves the `..` to a sibling of
+    // src — the same escape the same-separator forms cover. Both
+    // delimiters must be treated equally.
+    expect(capabilityCovers(readFs('src/**'), readFs('src/..\\secret'))).toBe(false);
+    expect(capabilityCovers(readFs('src/**'), readFs('src\\../secret'))).toBe(false);
+    expect(capabilityCovers(readFs('src/**'), readFs('src\\..\\secret'))).toBe(false);
+    // Trailing/leading mixed forms too.
+    expect(capabilityCovers(readFs('**'), readFs('a/b\\..'))).toBe(false);
+    expect(capabilityCovers(readFs('**'), readFs('..\\escape'))).toBe(false);
+  });
+
   test('a literal `..` substring inside a segment is NOT a traversal (no false refuse)', () => {
     expect(capabilityCovers(readFs('src/**'), readFs('src/a..b/x'))).toBe(true);
     expect(capabilityCovers(readFs('src/**'), readFs('src/..hidden'))).toBe(true);
