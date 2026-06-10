@@ -400,3 +400,78 @@ describe('task tool', () => {
     });
   });
 });
+
+describe('task tool — output summarization (OUTPUT_POLICY §3.1/§6)', () => {
+  // > 16 KB across many short lines → many-lines head/tail path.
+  const bigOutput = Array.from({ length: 4000 }, (_, i) => `line ${i}`).join('\n');
+
+  test('declares a head_tail summarize policy (inherited by task_sync via spread)', () => {
+    expect(typeof taskTool.metadata.summarize).toBe('function');
+  });
+
+  test('passthrough: a small child output is not reduced', () => {
+    const out = taskTool.metadata.summarize?.(
+      {
+        output: 'short conclusion',
+        session_id: 's',
+        status: 'done',
+        reason: 'done',
+        cost_usd: 0,
+        steps: 1,
+        duration_ms: 1,
+      },
+      {},
+    );
+    expect(out?.reduced).toBe(false);
+    expect(out?.policy).toBe('noop');
+    expect((out?.result as { output: string }).output).toBe('short conclusion');
+  });
+
+  test('reduction: a large child output is head-tailed, scalars preserved, audit raw untouched', () => {
+    const raw = {
+      output: bigOutput,
+      session_id: 'child-x',
+      status: 'done' as const,
+      reason: 'done',
+      cost_usd: 0.5,
+      steps: 9,
+      duration_ms: 1234,
+    };
+    const out = taskTool.metadata.summarize?.(raw, {});
+    expect(out?.reduced).toBe(true);
+    expect(out?.policy).toBe('head_tail');
+    expect(out?.originalBytes).toBe(Buffer.byteLength(bigOutput, 'utf8'));
+    const reduced = out?.result as typeof raw;
+    // Output shrank and carries the elision marker the harness
+    // surfaces as the digest signal.
+    expect(reduced.output.length).toBeLessThan(bigOutput.length);
+    expect(reduced.output).toContain('elided');
+    // The function is pure — it returns a reduced COPY and never
+    // mutates the input the harness already persisted to the audit
+    // row (OUTPUT_POLICY §0.1).
+    expect(raw.output).toBe(bigOutput);
+    // Load-bearing scalars are passed through verbatim.
+    expect(reduced.session_id).toBe('child-x');
+    expect(reduced.cost_usd).toBe(0.5);
+    expect(reduced.steps).toBe(9);
+  });
+
+  test('error path: a verbose failed child has details.output trimmed inline (summarize skips errors)', async () => {
+    const ctx = makeCtx({
+      spawnSubagent: async () =>
+        ranEnvelope({ status: 'exhausted', reason: 'maxSteps', output: bigOutput }),
+    });
+    const result = await taskTool.execute(
+      { subagent: 'explore', prompt: 'go', capabilities: [] },
+      ctx,
+    );
+    expect(isToolError(result)).toBe(true);
+    if (!isToolError(result)) return;
+    const detailsOutput = result.details?.output;
+    expect(typeof detailsOutput).toBe('string');
+    expect((detailsOutput as string).length).toBeLessThan(bigOutput.length);
+    expect(detailsOutput as string).toContain('elided');
+    // session_id stays as the pointer to the full child run.
+    expect(result.details?.session_id).toBe('child-session');
+  });
+});

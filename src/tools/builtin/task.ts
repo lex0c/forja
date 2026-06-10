@@ -1,6 +1,13 @@
 import { parseCapability } from '../../permissions/capabilities.ts';
 import type { WorktreeOutcome } from '../../subagents/types.ts';
-import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
+import { HEAD_TAIL_DEFAULT_LINES, headTailSummary } from '../output-summarizer.ts';
+import {
+  ERROR_CODES,
+  type SummarizedOutput,
+  type Tool,
+  type ToolResult,
+  toolError,
+} from '../types.ts';
 
 // `task` invokes a subagent (spec §11). The model passes a subagent
 // name (resolved against the harness-level registry) and a prompt;
@@ -71,6 +78,56 @@ export interface TaskOutput {
 // model can react without a guess-and-check retry.
 const PROMPT_MAX_BYTES = 32 * 1024;
 
+// Byte threshold above which the child's terminal `output` is
+// head-tailed before the parent sees it. Asymmetric counterpart to
+// PROMPT_MAX_BYTES: the prompt INTO the child is capped by rejection
+// (the work hasn't run yet), but the output BACK is capped by
+// reduction (the work already ran — we can't reject it, only trim
+// what re-enters the parent's context every subsequent turn).
+//
+// 16 KB matches bash's threshold (OUTPUT_POLICY §3.1): a child's
+// conclusion that crosses 16 KB is carrying detail the parent
+// re-pays for on every turn, while the full text stays recoverable
+// via the audit row (`session_id`). 80 + 80 lines (HEAD_TAIL_DEFAULT)
+// keeps the opening framing and the closing verdict — the two ends a
+// subagent report concentrates signal in.
+const OUTPUT_SUMMARIZE_THRESHOLD = 16 * 1024;
+
+const childOutputHeadTail = (output: string) =>
+  headTailSummary(output, {
+    maxBytes: OUTPUT_SUMMARIZE_THRESHOLD,
+    headLines: HEAD_TAIL_DEFAULT_LINES,
+    tailLines: HEAD_TAIL_DEFAULT_LINES,
+  });
+
+// Summarizer for the success envelope (status='done'). The harness
+// calls this AFTER persisting the raw TaskOutput to `tool_calls.output`
+// (OUTPUT_POLICY §0.1, §2), so the audit keeps the child's full text;
+// only the model-facing copy is reduced, with the harness prepending
+// the `[forja:output_summarized policy=head_tail …]` marker. Every
+// scalar field (session_id, status, cost, steps, …) is load-bearing
+// and tiny — only `output` is head-tailed.
+//
+// Contract: invoked only on success results. The status≠done path
+// returns a ToolError, which the harness routes around `summarize`
+// (§0.4) — that path trims `details.output` inline at the call site.
+const summarizeTaskOutput = (result: unknown): SummarizedOutput => {
+  const out = result as TaskOutput;
+  if (typeof out.output !== 'string' || out.output.length === 0) {
+    return { result, reduced: false, originalBytes: 0, policy: 'noop' };
+  }
+  const summary = childOutputHeadTail(out.output);
+  if (!summary.reduced) {
+    return { result, reduced: false, originalBytes: summary.originalBytes, policy: 'noop' };
+  }
+  return {
+    result: { ...out, output: summary.text },
+    reduced: true,
+    originalBytes: summary.originalBytes,
+    policy: 'head_tail',
+  };
+};
+
 export const taskTool: Tool<TaskInput, TaskOutput> = {
   name: 'task',
   description:
@@ -113,6 +170,11 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
     writes: false,
     idempotent: false,
     display: 'raw',
+    // Head-tail the child's `output` before it re-enters the parent
+    // context (OUTPUT_POLICY §3.1 / §6 exception). Raw stays in the
+    // parent's audit row; full text recoverable via session_id.
+    // `taskSyncTool` inherits this via the spread below.
+    summarize: summarizeTaskOutput,
   },
   async execute(args, ctx): Promise<ToolResult<TaskOutput>> {
     if (ctx.signal.aborted) {
@@ -309,6 +371,15 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
       const causeSuffix =
         result.detail !== undefined && result.detail.length > 0 ? `: ${result.detail}` : '';
       const detail = `subagent '${args.subagent}' exited with status='${result.status}', reason='${result.reason}'${causeSuffix}`;
+      // Head-tail the child's partial output here: the error path
+      // returns a ToolError, which the harness routes around
+      // `metadata.summarize` (OUTPUT_POLICY §0.4). Without this trim a
+      // failed-but-verbose child (exhausted / maxSteps with a long
+      // transcript) would dump its full output into `details.output`
+      // uncapped — the same context weight the success path now caps.
+      // The marker headTailSummary inserts signals the elision; the
+      // full text stays recoverable via `session_id`.
+      const errorOutput = childOutputHeadTail(result.output).text;
       return toolError('subagent.run_failed', detail, {
         retryable: result.status === 'exhausted',
         details: {
@@ -319,7 +390,7 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
           cost_usd: result.costUsd,
           steps: result.steps,
           duration_ms: result.durationMs,
-          output: result.output,
+          output: errorOutput,
           ...(result.auditFailure !== undefined ? { audit_failure: result.auditFailure } : {}),
           ...(result.worktree !== undefined ? { worktree: result.worktree } : {}),
           ...(result.worktreeError !== undefined ? { worktree_error: result.worktreeError } : {}),

@@ -2,6 +2,43 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-10] fix(subagents): cap child output re-entering parent context + startup deadline
+
+Two subagent-reliability gaps surfaced by a review of `runtime` / `wait-loop` / the `task`
+tool, on the token-efficiency and boot-liveness axes.
+
+**Token efficiency — child output entered the parent context uncapped.** `task` / `task_sync`
+returns the child's terminal assistant text as `TaskOutput.output`; that becomes a `tool_result`
+the parent re-sends every subsequent turn (the dominant write-cost axis per the session cost
+profile). The prompt INTO the child was capped (`PROMPT_MAX_BYTES`, 32 KB, by rejection) but the
+output BACK was bounded only by the child's provider output-token ceiling — a verbose `explore` /
+`review` conclusion lodged in context for the rest of the session. The tool now declares
+`metadata.summarize` (head_tail over `output`, 16 KB / 80+80 lines, matching bash): the harness
+keeps the RAW in the parent's `tool_calls.output` audit row (OUTPUT_POLICY §0.1) and only the
+model-facing copy shrinks, with the `[forja:output_summarized policy=head_tail …]` marker. The
+error path (status≠done) can't use `summarize` — the harness routes ToolError around it (§0.4) —
+so `details.output` is head-tailed inline at the call site. The full child run stays recoverable
+via `session_id` in both cases. This required correcting OUTPUT_POLICY §6, which wrongly listed
+`task_*` wholesale as "output per-design pequeno" — true for `task_async/await/cancel/list`, false
+for the sync variants that carry the child's text.
+
+**Reliability — a child wedged during boot waited out the full wall-clock.** Heartbeat-staleness
+(`wait-loop.ts`) only fires once `last_heartbeat` is non-null, but the child stamps its first beat
+only after `insertSubagentOutput`; everything before (open DB, migrate, sandbox probe, load audit,
+assemble system prompt, construct provider) ran with no liveness coverage. A boot-time wedge there
+was caught only by `DEFAULT_WALL_CLOCK_MS` (1h). Added `STARTUP_STALE_THRESHOLD_MS` (30 s): while
+the child has never pulsed (no outputs row, or a null `last_heartbeat`), exceeding it since spawn
+escalates SIGTERM → grace → SIGKILL with a dedicated `startup_stalled` reason — distinct from
+`heartbeat_stale` so operators can tell "hung before it started" from "hung mid-run". The two
+checks are mutually exclusive by construction (one requires null, the other non-null). Threshold
+is generous: pre-pulse work is purely local (the first provider call happens inside the loop,
+after the beat is running), so a healthy boot clears it with ~28 s to spare.
+
+Tests: `task.test.ts` (passthrough/reduction/scalar-preservation + error-path inline trim);
+`runtime.test.ts` (startup_stalled fires on a never-pulsing child; no false positive once a pulse
+landed). `startupStaleMs` is a `RunSubagentInput` knob so tests exercise the path without waiting
+30 s, mirroring the existing `heartbeatStaleMs` seam.
+
 ## [2026-06-09] feat(stats): efficiency diagnostics — turns, avg window/turn, compaction reclaim
 
 `/stats` reported WHERE the money went (per-axis cost split, write-by-source, hit %, write

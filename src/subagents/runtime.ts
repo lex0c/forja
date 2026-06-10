@@ -42,6 +42,7 @@ import { MAX_SUBAGENT_DEPTH, type SubagentDefinition } from './types.ts';
 import {
   DEFAULT_WALL_CLOCK_MS,
   HEARTBEAT_STALE_THRESHOLD_MS,
+  STARTUP_STALE_THRESHOLD_MS,
   WALL_CLOCK_GRACE_MS,
   waitForChild,
 } from './wait-loop.ts';
@@ -278,6 +279,14 @@ export interface RunSubagentInput {
   // wedged and escalates SIGTERM → grace → SIGKILL. Tests pass
   // small values to exercise the path without waiting 10s.
   heartbeatStaleMs?: number;
+  // First-pulse startup deadline, in ms. Defaults to
+  // `STARTUP_STALE_THRESHOLD_MS` (30_000). While the child has never
+  // pulsed (no outputs row or a null `last_heartbeat`), exceeding
+  // this since spawn means the child wedged during boot, before the
+  // heartbeat writer started — the parent escalates SIGTERM → grace
+  // → SIGKILL. Tests pass small values to exercise the path without
+  // waiting 30s.
+  startupStaleMs?: number;
   // Open the live IPC channel (spec docs/spec/IPC.md). Forwards
   // to the spawn factory; default factory uses pipe shells +
   // `--ipc=<n>` argv. When omitted the child runs in legacy
@@ -1287,6 +1296,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
   const graceMs = input.graceMs ?? WALL_CLOCK_GRACE_MS;
   const wallClockMs = input.wallClockMs ?? childWallClockMs + graceMs * 2;
   const heartbeatStaleMs = input.heartbeatStaleMs ?? HEARTBEAT_STALE_THRESHOLD_MS;
+  const startupStaleMs = input.startupStaleMs ?? STARTUP_STALE_THRESHOLD_MS;
   const outcome = await waitForChild({
     db: input.db,
     sessionId: childSession.id,
@@ -1296,6 +1306,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
     wallClockMs,
     graceMs,
     heartbeatStaleMs,
+    startupStaleMs,
     startTs,
   });
 
@@ -1515,6 +1526,24 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
         sessionId: childSession.id,
         status: 'interrupted',
         reason: 'heartbeat_stale',
+        costUsd: 0,
+        steps: 0,
+        durationMs: Date.now() - startTs,
+      };
+      break;
+    }
+    case 'startup_stalled': {
+      // Child wedged during boot — never published its first
+      // heartbeat, so it never reached the harness loop. Same
+      // 'interrupted' shape as heartbeat_stale / wall_clock; cost is
+      // a hard 0 (no provider call could have billed before the
+      // first pulse). Distinct reason so operators can tell "hung
+      // before it even started" from "hung mid-run".
+      result = {
+        output: '',
+        sessionId: childSession.id,
+        status: 'interrupted',
+        reason: 'startup_stalled',
         costUsd: 0,
         steps: 0,
         durationMs: Date.now() - startTs,

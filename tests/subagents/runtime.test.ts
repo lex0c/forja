@@ -525,6 +525,112 @@ describe('runSubagent — orchestration', () => {
     expect(session?.usageComplete).toBe(false);
   });
 
+  test('child never pulses (boot wedge) → status=interrupted, reason=startup_stalled, SIGTERM/SIGKILL', async () => {
+    // Regression for the startup-deadline path. A child that
+    // wedges DURING boot — before `insertSubagentOutput` and the
+    // first heartbeat — leaves `last_heartbeat` forever null, so
+    // the heartbeat-stale path (which requires a non-null pulse)
+    // structurally can't fire. Without the startup deadline the
+    // only backstop is the wall-clock ceiling (1h). The fixture
+    // never inserts an outputs row and never exits until SIGKILL;
+    // with a small `startupStaleMs` and a large wall-clock /
+    // heartbeat threshold, ONLY the startup path can be what
+    // fires.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const { spawn, killed } = fakeSpawnHang();
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      spawnChildProcess: spawn,
+      // Wall-clock + heartbeat thresholds far above the test
+      // runtime so neither preempts the startup deadline.
+      wallClockMs: 60_000,
+      heartbeatStaleMs: 60_000,
+      startupStaleMs: 100,
+      graceMs: 50,
+    });
+    expect(result.status).toBe('interrupted');
+    expect(result.reason).toBe('startup_stalled');
+    const signals = killed.map((k) => k.signal);
+    expect(signals).toContain('SIGTERM');
+    expect(signals).toContain('SIGKILL');
+    // Same finalization invariants as the other kill paths: row
+    // landed 'interrupted', usage_complete=false (no provider call
+    // could have billed before the first pulse, so cost is a hard
+    // 0 but still a lower bound by contract).
+    const session = getSession(db, result.sessionId);
+    expect(session?.status).toBe('interrupted');
+    expect(session?.usageComplete).toBe(false);
+  });
+
+  test('once the child has pulsed, the startup deadline never fires (no false positive)', async () => {
+    // The startup branch is gated on `last_heartbeat === null`. A
+    // child that inserted its outputs row and pulsed at least once
+    // must be immune to the startup deadline even when that
+    // deadline is tiny — past first pulse, liveness is the
+    // heartbeat path's job. Fixture inserts a fresh heartbeat
+    // immediately, then publishes 'done' after a delay LONGER than
+    // `startupStaleMs`; if the gate leaked, the run would come back
+    // 'startup_stalled' instead of 'done'.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const killed: { signal: string }[] = [];
+    const pulsedThenDone: SpawnChildProcess = (opts) => {
+      insertSubagentOutput(db, {
+        sessionId: opts.sessionId,
+        lastHeartbeat: Date.now(),
+      });
+      const exited = new Promise<{ exitCode: number }>((resolve) => {
+        setTimeout(() => {
+          setSubagentPayload(db, opts.sessionId, {
+            status: 'done',
+            reason: 'done',
+            output: 'booted fine',
+            cost_usd: 0.001,
+            steps: 1,
+            duration_ms: 80,
+          });
+          resolve({ exitCode: 0 });
+        }, 80);
+      });
+      return {
+        exited,
+        kill: (signal) => killed.push({ signal }),
+      };
+    };
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      spawnChildProcess: pulsedThenDone,
+      // Startup deadline already elapsed by the time the payload
+      // lands; the non-null heartbeat must keep the run alive.
+      startupStaleMs: 10,
+      heartbeatStaleMs: 60_000,
+      wallClockMs: 60_000,
+      graceMs: 50,
+    });
+    expect(result.status).toBe('done');
+    expect(result.reason).toBe('done');
+    expect(killed).toHaveLength(0);
+  });
+
   test('healthy heartbeat (refreshed periodically) keeps run alive past threshold', async () => {
     // The actual property the heartbeat path is supposed to
     // protect: a child that pulses faster than the staleness
