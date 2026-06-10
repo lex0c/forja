@@ -189,6 +189,13 @@ describe('runPermissionSealVerify', () => {
     expect(code).toBe(0);
     expect(io.stdout).toContain('seal file: intact');
     expect(io.stdout).toContain('2 entries cross-checked');
+    // The intact path must steer the operator to also run chain-verify:
+    // seal-verify proves seal-vs-stored-hash only, NOT that each stored
+    // hash matches its row payload (that recompute lives in `permission
+    // verify`). Without this directive a clean seal-verify is mistaken
+    // for full chain integrity.
+    expect(io.stdout).toContain('agent permission verify');
+    expect(io.stdout).toContain('stored chain hashes only');
   });
 
   test('hash mismatch → returns 1 with firstMismatchAt in stdout', async () => {
@@ -312,6 +319,12 @@ describe('runPermissionSealVerify', () => {
     expect(parsed.ok).toBe(true);
     expect(parsed.entriesChecked).toBe(1);
     expect(parsed.install_id).toBe(identity.install_id);
+    // Scope hint mirrors the human-path note: an automated gate keying
+    // on `ok` must be able to discover that seal-verify proves
+    // seal-vs-stored-hash ONLY, not payload integrity. `ok` stays the
+    // bare seal verdict; the gap is advertised in dedicated fields.
+    expect(parsed.scope).toBe('seal-vs-stored-hash');
+    expect(parsed.fullIntegrityRequires).toBe('permission verify');
   });
 
   test('JSON mode emits structured error on broken', async () => {
