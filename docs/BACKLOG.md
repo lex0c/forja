@@ -2,6 +2,34 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-10] fix(recap): `--out` write failure no longer drops the `recap_runs` audit row
+
+A review of the recap subsystem surfaced an audit-completeness gap in the `/recap` slash command.
+The order was: render → write `--out` → return-on-error → record `recap_runs`. So when an `--out`
+write failed (EACCES / ENOSPC / ENOTDIR), the early return skipped `recordRecapRun`. On a cache-miss
+LLM render the tokens were already billed, so the spend vanished from `recap_runs` — precisely the
+under-reporting the audit table (RECAP §6.3) exists to catch.
+
+The write is now attempted first but its failure is **deferred** into `outWriteError`; the audit row
+is recorded unconditionally, then the deferred error is surfaced. `output_path` is threaded from the
+real write outcome — set to the path only when the bytes actually landed, NULL on failure — so the
+column never claims an artifact that does not exist (§6.3: "preenchido quando --out"). The pre-existing
+"record fails → warn and keep output" path is untouched (output integrity > audit integrity stays the
+deliberate trade-off).
+
+Two new slash-level tests close coverage gaps the review also flagged:
+- `--out` to an unwritable path (parent forced to a regular file → ENOTDIR, no permission dependency
+  so it holds under `/run/media`) → returns error AND audits the run with `output_path` NULL.
+- Provider error (offline / rate-limit) on the LLM path → the operationally dominant failure, until
+  now only unit-tested in the orchestrator. Asserts deterministic fallback (recap never breaks), the
+  `provider-error` warn, and an audit row with zero spend (`used_llm=0`, `prompt_version` NULL) — a
+  pre-call failure bills nothing.
+
+Scope note: the wider review also flagged the eval catalog at 7/15 fixtures (the error-recovered
+category blocked on `failure_events` landing), no harness-driven integration test, and several
+schema §3 fields still projected as stubs (`goalStack`/`errors`/`notDone`/`webFetches`/`artifacts`,
+line deltas, `filesAffected`). Those are tracked debts, not addressed here.
+
 ## [2026-06-10] fix(skills): skill_list re-scans disk so a mid-session hand-edit is visible
 
 The skill catalog is an in-memory snapshot built once at bootstrap; `read` re-reads bodies from

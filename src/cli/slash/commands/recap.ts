@@ -629,15 +629,18 @@ export const runRecapSession = async (
 
   const renderResult = await renderWithLlmOrFallback(parsed, intermediate, ctx);
 
+  // Attempt the `--out` write first, but DEFER surfacing its
+  // failure until after the audit row is recorded. The render has
+  // already executed and — on a cache-miss LLM path — already
+  // billed tokens; returning early on an `--out` write error
+  // without recording would drop that spend from `recap_runs`,
+  // the exact under-reporting the audit table exists to prevent.
+  let outWriteError: string | null = null;
   if (parsed.outPath !== null) {
     try {
       await writeOutFile(parsed.outPath, renderResult.output);
     } catch (e) {
-      const reason = e instanceof Error ? e.message : String(e);
-      return {
-        kind: 'error',
-        message: `/recap: failed to write --out '${parsed.outPath}': ${reason}`,
-      };
+      outWriteError = e instanceof Error ? e.message : String(e);
     }
   }
 
@@ -647,7 +650,12 @@ export const runRecapSession = async (
       sessionIds: intermediate.scope.sessionIds,
       renderer: parsed.format,
       usedLlm: renderResult.usedLlm,
-      outputPath: parsed.outPath,
+      // Record the path only when the bytes actually landed. A
+      // failed `--out` produced no file, so reporting it under
+      // `output_path` (RECAP §6.3: "preenchido quando --out")
+      // would make the audit row claim an artifact that does not
+      // exist.
+      outputPath: outWriteError === null ? parsed.outPath : null,
       createdAt: ctx.now(),
       costUsd: renderResult.costUsd,
       tokensIn: renderResult.tokensIn,
@@ -662,6 +670,14 @@ export const runRecapSession = async (
       ts: ctx.now(),
       message: `/recap: audit row not written (${reason}); output is intact`,
     });
+  }
+
+  // Now that spend is recorded, surface the `--out` failure.
+  if (outWriteError !== null) {
+    return {
+      kind: 'error',
+      message: `/recap: failed to write --out '${parsed.outPath}': ${outWriteError}`,
+    };
   }
 
   return {

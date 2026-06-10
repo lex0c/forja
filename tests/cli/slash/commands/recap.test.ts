@@ -455,6 +455,46 @@ describe('/recap', () => {
     expect(runs[0]?.outputPath).toBe(outPath);
   });
 
+  test('/recap pr --out to an unwritable path: errors but STILL audits the run (output_path NULL)', async () => {
+    // Regression guard: an `--out` write failure must not skip the
+    // `recap_runs` row. On a cache-miss LLM render the spend was
+    // already billed; dropping the audit row on the write error
+    // (the pre-fix order: write → return-on-error → record) would
+    // under-report cost in exactly the case the audit table exists
+    // to catch.
+    //
+    // Force the failure deterministically WITHOUT relying on
+    // permission semantics — the working copy can live under
+    // /run/media where sandbox/path assumptions differ. Making the
+    // parent a regular FILE makes writeOutFile's recursive mkdir
+    // throw ENOTDIR.
+    const base = `${process.env.TMPDIR ?? '/tmp'}/forja-recap-out-${crypto.randomUUID()}`;
+    const blocker = `${base}/blocker`;
+    await Bun.write(blocker, 'x');
+    const outPath = `${blocker}/pr.md`;
+
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'do thing',
+      createdAt: 1_100,
+    });
+    currentSessionId = s.id;
+
+    const result = await recapCommand.exec(['pr', '--out', outPath], makeCtx());
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('failed to write --out');
+
+    // The render executed; the run is audited regardless. output_path
+    // is NULL because no bytes landed — the column must not claim an
+    // artifact that does not exist.
+    const runs = listRecentRecapRuns(db);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.outputPath).toBeNull();
+  });
+
   test('/recap --out without a value is a parse error', async () => {
     currentSessionId = 'unused';
     const result = await recapCommand.exec(['--out'], makeCtx());
@@ -652,6 +692,56 @@ describe('/recap', () => {
     expect(runs[0]?.usedLlm).toBe(true);
     expect(runs[0]?.costUsd).toBeGreaterThan(0);
     expect(runs[0]?.promptVersion).toBe('pr-v1');
+  });
+
+  test('/recap pr LLM path: provider error (offline/rate-limit) falls back and still audits', async () => {
+    // The operationally dominant failure — provider down or rate
+    // limited — must honour "recap never breaks" (RECAP §2). It was
+    // covered at the orchestrator unit level but not end-to-end at
+    // the slash surface. Distinct from schema/fidelity: this is a
+    // PRE-call failure, so no tokens were billed and the audit row
+    // records zero spend.
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'do thing',
+      createdAt: 1_100,
+    });
+    currentSessionId = s.id;
+
+    // constrained-capable so the LLM path is actually entered, but
+    // the call rejects.
+    const provider: Provider = {
+      id: 'anthropic/claude-haiku-4-5',
+      family: 'anthropic',
+      capabilities: stubCaps('tools'),
+      generate: async function* () {},
+      generateConstrained: () => Promise.reject(new Error('connection refused')),
+      countTokens: async () => 0,
+    };
+    const ctx = makeCtx({ baseConfig: cfgWithProvider(provider) });
+    const events: { type: string; message?: string }[] = [];
+    ctx.bus.on('warn', (e) => events.push({ type: 'warn', message: e.message }));
+
+    const result = await recapCommand.exec(['pr'], ctx);
+    // Deterministic markdown still comes back — recap never breaks.
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    expect(result.notes?.join('\n')).toContain('## Summary');
+
+    const warns = events.filter((e) => e.type === 'warn');
+    expect(warns).toHaveLength(1);
+    expect(warns[0]?.message).toContain('provider-error');
+    expect(warns[0]?.message).toContain('using deterministic fallback');
+
+    // Pre-call failure: no spend, but the invocation is still
+    // audited.
+    const runs = listRecentRecapRuns(db);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.usedLlm).toBe(false);
+    expect(runs[0]?.costUsd).toBe(0);
+    expect(runs[0]?.promptVersion).toBeNull();
   });
 
   test('/recap pr --no-llm-render bypasses provider entirely', async () => {
