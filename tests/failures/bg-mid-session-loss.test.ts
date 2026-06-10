@@ -15,6 +15,18 @@ import { migrate } from '../../src/storage/index.ts';
 import { listFailureEventsByCode } from '../../src/storage/repos/failure-events.ts';
 import { createSession } from '../../src/storage/repos/sessions.ts';
 
+// Passthrough sandbox wrap. These tests assert the mid-session-loss
+// PROBE, which runs in `spawn()` BEFORE the sandbox wrap. The real
+// wrap (`maybeWrapSandboxArgv`) fail-closes when a boot tool was
+// present but no longer resolves — exactly the state these tests set
+// up (`sandboxWhich: () => null` + `sandboxBootTool: 'bwrap'`). On a
+// host WITH bwrap the wrap succeeded (canonical /usr/bin/bwrap) and
+// the spawn ran; on a host WITHOUT it (CI ubuntu-latest) the wrap
+// threw and `mgr.spawn()` rejected before the assertions. Pinning a
+// passthrough runs the inner argv directly, so the probe assertions
+// stand independent of whether the runner has bubblewrap.
+const PASSTHROUGH_WRAP = (o: { innerArgv: readonly string[] }): string[] => [...o.innerArgv];
+
 let db: DB;
 let sessionId: string;
 let logDir: string;
@@ -39,6 +51,7 @@ describe('bg manager — sandbox.mid_session_loss probe', () => {
       sessionId,
       logDir,
       failureSink,
+      wrapArgv: PASSTHROUGH_WRAP,
       sandboxBootTool: 'bwrap',
       sandboxWhich: () => {
         whichCallCount++;
@@ -72,6 +85,7 @@ describe('bg manager — sandbox.mid_session_loss probe', () => {
       sessionId,
       logDir,
       failureSink,
+      wrapArgv: PASSTHROUGH_WRAP,
       sandboxBootTool: 'bwrap',
       sandboxWhich: () => null,
     });
@@ -96,6 +110,7 @@ describe('bg manager — sandbox.mid_session_loss probe', () => {
       sessionId,
       logDir,
       failureSink,
+      wrapArgv: PASSTHROUGH_WRAP,
       sandboxBootTool: 'bwrap',
       sandboxWhich: () => responses[i++] ?? null,
     });
@@ -117,6 +132,7 @@ describe('bg manager — sandbox.mid_session_loss probe', () => {
       sessionId,
       logDir,
       failureSink,
+      wrapArgv: PASSTHROUGH_WRAP,
       sandboxBootTool: 'bwrap',
       sandboxWhich: () => null,
     });
@@ -139,6 +155,7 @@ describe('bg manager — sandbox.mid_session_loss probe', () => {
       sessionId,
       logDir,
       failureSink,
+      wrapArgv: PASSTHROUGH_WRAP,
       // sandboxBootTool omitted — pre-slice-130 behavior.
       sandboxWhich: () => null,
     });
@@ -158,6 +175,7 @@ describe('bg manager — sandbox.mid_session_loss probe', () => {
       sessionId,
       logDir,
       failureSink,
+      wrapArgv: PASSTHROUGH_WRAP,
       sandboxBootTool: 'bwrap',
       sandboxWhich: () => '/usr/bin/bwrap',
     });

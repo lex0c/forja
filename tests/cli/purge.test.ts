@@ -859,16 +859,24 @@ describe('verifySamePostReaddir — TOCTOU race detector', () => {
   });
 
   test('returns false when path was replaced by a different directory (inode change)', () => {
+    // Forge a pre-stat with a DIFFERENT ino than the real dir, rather
+    // than deleting + recreating and hoping the FS hands out a fresh
+    // inode. Inode reuse is filesystem-dependent — tmpfs / ext4 on a
+    // CI runner readily recycle the just-freed ino, so the old
+    // recreate-and-assert sanity check (`postStat.ino !== preStat.ino`)
+    // failed by environment. Forging keeps this about the verifier's
+    // dev+ino comparison, not the allocator (mirrors the dev-mismatch
+    // case below).
     const realDir = join(workdir, 'real');
     mkdirSync(realDir);
-    const preStat = lstatSync(realDir);
-    // Recreate at same path with a different inode.
-    rmSync(realDir, { recursive: true, force: true });
-    mkdirSync(realDir);
-    const postStat = lstatSync(realDir);
-    // Sanity: inodes must differ for the test to be meaningful.
-    expect(postStat.ino).not.toBe(preStat.ino);
-    expect(verifySamePostReaddir(realDir, preStat)).toBe(false);
+    const realStat = lstatSync(realDir);
+    const forgedPreStat = {
+      ...realStat,
+      ino: realStat.ino + 1, // different inode, same device
+    } as Stats;
+    expect(forgedPreStat.ino).not.toBe(realStat.ino);
+    expect(forgedPreStat.dev).toBe(realStat.dev);
+    expect(verifySamePostReaddir(realDir, forgedPreStat)).toBe(false);
   });
 
   test('returns false when path vanished entirely', () => {

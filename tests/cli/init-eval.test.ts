@@ -16,8 +16,26 @@ import { bootstrap } from '../../src/cli/bootstrap.ts';
 import { runInit } from '../../src/cli/init.ts';
 import { DEFAULT_MEMORY_CONFIG } from '../../src/config/loaders.ts';
 import { DEFAULT_BUDGET } from '../../src/harness/types.ts';
+import type { SandboxAvailability } from '../../src/permissions/sandbox-availability.ts';
 import { DEFAULT_MODEL } from '../../src/providers/default-model.ts';
 import type { Provider } from '../../src/providers/index.ts';
+
+// Hermetic sandbox verdict. `bootstrap()` otherwise calls the real
+// `detectSandboxAvailability()` (a live `Bun.which('bwrap')` probe),
+// so the init↔bootstrap handshake under test would depend on whether
+// the host has bubblewrap installed. On a runner without bwrap (e.g.
+// GitHub Actions ubuntu-latest), the engine reaches `degraded`
+// instead of `ready` and the `permissionState` assertion fails by
+// environment. Pinning the verdict keeps this eval about the
+// scaffold-read handshake, not host capabilities.
+const HERMETIC_SANDBOX: SandboxAvailability = {
+  available: true,
+  tool: 'bwrap',
+  path: '/usr/bin/bwrap',
+  trustLevel: 'canonical',
+  reason: '',
+  trustWarnings: [],
+};
 
 // Mock provider: bootstrap walks the model lookup but we never
 // dispatch a real call, so the capabilities only need to be
@@ -124,6 +142,7 @@ describe('init → bootstrap eval', () => {
       prompt: 'eval probe',
       cwd: workdir,
       providerOverride: mockProvider,
+      sandboxAvailabilityOverride: HERMETIC_SANDBOX,
       dbPath,
       enterprisePolicyPath: null,
       userPolicyPath: null,
@@ -183,6 +202,7 @@ describe('init → bootstrap eval', () => {
       prompt: 'eval probe',
       cwd: workdir,
       providerOverride: mockProvider,
+      sandboxAvailabilityOverride: HERMETIC_SANDBOX,
       dbPath,
       enterprisePolicyPath: null,
       userPolicyPath: null,
@@ -238,6 +258,7 @@ describe('init → bootstrap eval', () => {
       prompt: 'eval probe',
       cwd: workdir,
       providerOverride: mockProvider,
+      sandboxAvailabilityOverride: HERMETIC_SANDBOX,
       dbPath,
       enterprisePolicyPath: null,
       userPolicyPath: null,

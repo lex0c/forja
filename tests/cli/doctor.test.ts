@@ -94,6 +94,19 @@ describe('runDoctor', () => {
       env,
       which: (cmd) => `/usr/bin/${cmd}`,
       exists: (p) => p.startsWith('/usr/bin/'),
+      // Hermetic doctor: the canonical-first resolver's X_OK probe and
+      // the net_filtering / user_namespaces probes are real syscalls
+      // otherwise. On a runner without bwrap/nft (CI ubuntu-latest)
+      // they flip `sandbox` / `net_filtering` to warn and break the
+      // all-passed footer. Pin every probe so this test asserts the
+      // all-clear rendering, not host capabilities.
+      isExecutable: (p) => p.startsWith('/usr/bin/'),
+      readFile: (path) => (path === '/proc/sys/user/max_user_namespaces' ? '15000\n' : null),
+      runCmd: (cmd) => {
+        if (cmd === 'nft') return 'nftables v1.0.9 (Old Doc Yak)\n';
+        if (cmd === 'getenforce') return 'Enforcing\n';
+        return null;
+      },
       out: out.write,
       err: captured().write,
     });
@@ -278,6 +291,11 @@ describe('runDoctor', () => {
       env,
       which: (cmd) => `/usr/bin/${cmd}`,
       exists: (p) => p.startsWith('/usr/bin/'),
+      // Canonical-first resolver's X_OK probe — without this seam the
+      // `sandbox` check runs accessSync(/usr/bin/bwrap, X_OK), which
+      // fails on a runner that lacks the real binary (CI), flipping
+      // the check to warn and breaking the 12-ok count below.
+      isExecutable: (p) => p.startsWith('/usr/bin/'),
       // Slice 90 seams: stub the new probe sites so every check
       // lands OK on a runner that may not have nft / SELinux /
       // AppArmor / /proc/sys/user/max_user_namespaces.

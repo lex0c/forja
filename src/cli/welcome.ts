@@ -59,6 +59,16 @@ export interface RunWelcomeOptions {
   // Slice 154 (review): forward canonical-first resolver seams.
   exists?: (path: string) => boolean;
   stat?: (path: string) => { uid: number; mode: number } | null;
+  isExecutable?: (path: string) => boolean;
+  // Forwarded to the embedded `runDoctor` (the env-health section).
+  // Without these, the doctor's net_filtering / mac_lsm /
+  // user_namespaces probes hit the real host (nft --version,
+  // getenforce, /proc), and that output leaks into welcome's own
+  // assertions — e.g. a runner without nftables renders "nft ...
+  // version probe failed", which trips a `not.toContain('version ')`
+  // check. Stubbable so welcome's output is host-independent.
+  readFile?: (path: string) => string | null;
+  runCmd?: (cmd: string, args: readonly string[]) => string | null;
   readOsRelease?: () => string | null;
   platform?: NodeJS.Platform;
   arch?: string;
@@ -133,6 +143,9 @@ export const runWelcome = async (options: RunWelcomeOptions = {}): Promise<numbe
     ...(options.which !== undefined ? { which: options.which } : {}),
     ...(options.exists !== undefined ? { exists: options.exists } : {}),
     ...(options.stat !== undefined ? { stat: options.stat } : {}),
+    ...(options.isExecutable !== undefined ? { isExecutable: options.isExecutable } : {}),
+    ...(options.readFile !== undefined ? { readFile: options.readFile } : {}),
+    ...(options.runCmd !== undefined ? { runCmd: options.runCmd } : {}),
     out,
     err,
   });

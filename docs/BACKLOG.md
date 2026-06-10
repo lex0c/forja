@@ -2,6 +2,62 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-10] fix(tests): make 16 host-dependent tests hermetic (green on CI)
+
+Sixteen tests passed locally (Manjaro/Arch) but failed on GitHub Actions
+(ubuntu-latest). Root cause across the board: the tests depended on host state
+the CI runner doesn't share, and the suite happened to mask it locally. The
+`ci.yml` installs only ripgrep — not bubblewrap (`bwrap`) nor nftables (`nft`).
+Reproduced every failure locally by running the suite inside a user+mount
+namespace that bind-mounts a non-executable file over `/usr/bin/bwrap` and
+`/usr/bin/nft` (the canonical-first resolver checks `/usr/bin/<tool>` directly,
+so a bare `$PATH` edit isn't enough — the binary must be genuinely absent).
+
+Four distinct mechanisms, each fixed by closing the seam rather than installing
+tooling on CI (a test that needs a real `bwrap` isn't deterministic):
+
+1. **bwrap fail-closed throw** (`bg-mid-session-loss` ×4). `bg/manager.spawn`
+   calls `maybeWrapSandboxArgv({ failClosed: sandboxBootTool !== undefined })`;
+   with the boot tool set and no resolvable bwrap, the wrap throws and
+   `spawn()` rejects before the probe assertions. The probe — what these tests
+   actually exercise — runs *before* the wrap. Added a `wrapArgv` test seam to
+   the bg manager (defaults to `maybeWrapSandboxArgv`); the tests pin a
+   passthrough so the spawn runs the inner argv directly.
+
+2. **engine `degraded`** (`init-eval` ×3, `executor` ×3). `bootstrap()` probes
+   the real `detectSandboxAvailability()`; without bwrap the engine boots
+   `degraded` instead of `ready` (init-eval's first assertion) and `degraded`
+   downgrades automatic `allow`→`confirm` (flipping executor's approval cases).
+   Fixed by injecting `sandboxAvailabilityOverride` in both suites.
+
+3. **non-mocked doctor probes** (`doctor` ×2, `welcome` ×1). The `sandbox`
+   check resolved bwrap via a real `accessSync(X_OK)` — `RunDoctorOptions`
+   exposed `which`/`exists`/`stat` but not the execute-access probe. Added an
+   `isExecutable` seam to `runDoctor` (propagated to `sandboxCheck` +
+   `sandboxEnforcementCheck`). `net_filtering` ran `nft --version` for real;
+   the "all checks pass" test wasn't stubbing `runCmd`/`readFile` at all.
+   `welcome` embeds `runDoctor` sharing the same `out`, but `RunWelcomeOptions`
+   had no `runCmd`/`readFile`/`isExecutable` to forward — so the doctor's "nft
+   ... version probe failed" line leaked into a `not.toContain('version ')`
+   assertion. Added the three seams to welcome and forwarded them; pinned them
+   in the affected tests. Also added a `resetSharedDoctorCache()` to welcome's
+   `beforeEach`: the doctor memoizes checks in a process-global cache keyed by
+   check name, which leaks across test files — a prior test computing
+   `net_filtering=warn` poisoned the cache regardless of a later test's seams.
+
+4. **bash-parser test pollution** (`bg-cleanup` ×2). NOT a sandbox issue — the
+   permission engine's bash resolver refuses every bash command until
+   `initBashParser()` completes (normally in bootstrap). These tests build the
+   HarnessConfig by hand, so isolated they DENY the spawn (0 bg rows); they
+   only passed when another test in the suite happened to init the global
+   parser first. Fixed with `await initBashParser()` in `beforeEach`.
+
+Net: hermetic via existing/added seams, not by mutating CI. New src seams
+(`doctor.isExecutable`, `welcome.{runCmd,readFile,isExecutable}`,
+`bgManager.wrapArgv`) all default to production behavior. typecheck + lint
+clean; the affected files are 152/152 green both normally and under the
+bwrap/nft-absent namespace.
+
 ## [2026-06-10] fix(migrate): validate the migration registry before applying
 
 The runner applied `MIGRATIONS` in *array order*, never checking that the array
