@@ -2,6 +2,22 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-10] docs: implementation companion for the checkpoint subsystem
+
+Added `docs/CHECKPOINT.md` — the non-normative impl companion for checkpoints,
+mirroring the role `OUTPUT_POLICY.md` / `MEMORY.md` play for their subsystems
+(maps `docs/spec/CHECKPOINTS.md` + `AGENTIC_CLI §12` onto the code, explains the
+*why*). Covers the component map (detect / git / manager / repo / migration /
+CLI / loop wiring), the write-step snapshot flow, the load-bearing invariants
+(per-step granularity, private ref vs stash, worktree-root anchoring, index
+isolation, no-op skip, untracked-only sensitive filter), restore semantics +
+the `had_bash` "cannot reverse" warning, the CLI surface, the `checkpoints`
+schema, the retention rewrite + self-heal sweep, the synchronous-snapshot
+performance limit, and the security posture. Facts verified against source
+(enableCheckpoints true in bootstrap / false for subagents, retention default,
+ref namespaces, commit identity, test locations). Documentation only; no code
+change.
+
 ## [2026-06-10] fix(permission-replay): surface a caveat when re-executing non-builtin tools
 
 Audit of the replay subsystems (resume-replay + permission-replay) found one
