@@ -1,0 +1,38 @@
+name: model does not invoke a skill for a task no description matches
+# The negative gate (SKILLS.md §11 over-invocation anti-pattern). A
+# catalog is present, but the task — read a config value — is orthogonal
+# to every skill's description. The model must reach for the ordinary
+# tool (read_file), NOT pattern-match a skill onto an unrelated job.
+# `tool_not_called` would pass vacuously if the model also skipped
+# read_file, so we pin the positive read_file + the value to prove the
+# task actually ran the normal way.
+prompt: |
+  Read config.json and tell me the value of the "port" field.
+setup:
+  files:
+    '.agent/skills/shared/changelog-entry.md': |
+      ---
+      name: changelog-entry
+      description: Draft a changelog entry from a diff in the Keep a Changelog style.
+      ---
+      Draft one changelog line under the correct heading — Added,
+      Changed, Fixed, or Removed. One user-facing sentence.
+    '.agent/skills/shared/git-bisect-regression.md': |
+      ---
+      name: git-bisect-regression
+      description: Find the commit that introduced a regression with git bisect.
+      ---
+      Run git bisect start, mark good/bad, and narrow to the first bad commit.
+    'config.json': |
+      {
+        "host": "localhost",
+        "port": 8473
+      }
+expect:
+  - tool_called: read_file
+  - tool_not_called: skill_invoke
+  - output_contains: '8473'
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.12

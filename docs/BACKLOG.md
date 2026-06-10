@@ -2,6 +2,69 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-10] fix(skills): skill_list re-scans disk so a mid-session hand-edit is visible
+
+The skill catalog is an in-memory snapshot built once at bootstrap; `read` re-reads bodies from
+disk on every call, but the resolved set (`byName` / `entries`) only rebuilds on `reload()`, which
+until now only the `/skill` command (on its own mutations) called. So a skill the operator added,
+edited, or removed by hand mid-session — outside `/skill` — stayed invisible to the model: absent
+from `skill_list`, and (for a new name) unresolvable by a no-scope `skill_invoke`.
+
+`skill_list` now calls `catalog.reload()` before listing. It is the "what is available right now"
+surface, so it must reflect disk, not the boot snapshot; and because `reload()` rebuilds `byName`,
+a `skill_invoke` issued after the model has listed resolves the freshly-seen skill too. The reload
+is scoped deliberately to this discovery path: it rebuilds only the in-memory snapshot and does NOT
+re-assemble the eager catalog section in the system prompt — that stays fixed for the session by
+design, to keep the prompt prefix cache-stable (the dominant cost axis) and the `prompt_versions`
+hash / `recordSurface` audit one-per-boot. The disk re-scan is a flat glob of a few small files;
+a mid-scan fs error is swallowed (refresh reassigns its outputs atomically at the end, so the prior
+snapshot survives) — a stale list beats a thrown turn. Two tests cover add / edit / remove
+mid-session against a live catalog handle.
+
+## [2026-06-10] test(skills): behavioral eval suite for the description-driven invocation gate
+
+A review of the skills subsystem found its eval coverage shallow on the one property that
+*is* the subsystem's thesis: that the one-line `description` (SKILLS.md §0.2 — "description is
+load-bearing") drives the model's decision to invoke. The two pre-existing smoke cases
+(`evals/smoke/11-skill-invoke`, `12-skill-list`) both spoon-feed the action in the prompt
+("…use it", "Call the skill_list tool"), so they exercise the tool plumbing — body loads, catalog
+enumerates — but never the eager-surface → autonomous-selection path. Unit tests cover the
+mechanics (parse, precedence, lifecycle, sandbox) in isolation; neither tier puts the *model* in
+the loop deciding.
+
+New dedicated `evals/skills/` dir (parity with `evals/memory/`, `evals/recap/`), five model-driven
+YAML cases against the existing smoke/regression harness — the runner discovers any dir of YAML, so
+no framework change:
+
+- `01-selection-by-description` — POSITIVE gate: prompt describes the task in the catalog skill's
+  own terms but never says "skill" or names a tool; asserts `skill_invoke` fires and the body's
+  verbatim output markers (`PURPOSE:`/`LINECOUNT:`) appear. The load-bearing case.
+- `02-no-false-invoke` — NEGATIVE gate: a tool-shaped task orthogonal to every catalog description;
+  asserts the model reaches for the normal tool (`read_file`) and `tool_not_called: skill_invoke`.
+  Pins the §11 over-invocation anti-pattern.
+- `03-precedence-local-over-shadowed` — same `name` in project_local and project_shared with a
+  distinguishing sentinel per body; no-scope invoke must resolve to the local winner (§3.5) — the
+  end-to-end model→tool path the unit test only covers structurally.
+- `04-show-does-not-invoke` — `skill_show` is read-only inspection; asserts `skill_show` fires and
+  `skill_invoke` does NOT, so inspecting a body never records an `invoked` audit row.
+- `05-expired-still-invokes` — a skill past its `expires` date is invoked anyway (§5.4); the body
+  sentinel proves it ran. (The operator warn goes to the operator channel, not model output, so it
+  is asserted in the unit layer, not here.)
+
+`eval:skills` script added. Suite runs green 5/5 on `claude-opus-4-8` (~$0.27) and on
+`claude-sonnet-4-6` (~$0.10). These cost real tokens — not in `bun test`; run on demand.
+
+Running the suite surfaced a model-capability finding worth recording: at temperature 0,
+`claude-haiku-4-5` deterministically fails `01` — it reaches for `skill_show` + a manual
+`read_file` instead of `skill_invoke`, peeking at the body and running the procedure by hand,
+which bypasses the `invoked` audit row and the `<skill>` trust marker. The identical case passes
+on `claude-sonnet-4-6` and `claude-opus-4-8`, so the description→invoke gate is correctly built;
+the haiku behavior is weak-model preference, not a subsystem bug (same shape as the reasoning-replay
+revert: behavioral fail, not adapter fail). Because the runner has no per-case model override,
+`eval:skills` defaults to `claude-opus-4-8` rather than the cheap regression model — autonomous
+skill *selection* is capability-sensitive and the suite is small. The other four cases (negative
+gate, precedence, show-not-invoke, expired) pass on haiku too.
+
 ## [2026-06-10] fix(subagents): cap child output re-entering parent context + startup deadline
 
 Two subagent-reliability gaps surfaced by a review of `runtime` / `wait-loop` / the `task`

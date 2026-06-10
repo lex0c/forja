@@ -1,0 +1,30 @@
+name: inspecting a skill body uses skill_show and does not invoke it
+# skill_show is read-only inspection (SKILLS.md §5): it returns the body
+# WITHOUT the <skill> trust marker and WITHOUT recording an `invoked`
+# audit row. The operator asks to read the procedure, not run it, so the
+# model must pick skill_show and leave skill_invoke untouched — otherwise
+# a "just show me" turn pollutes the surfaced-vs-invoked audit ratio.
+#
+# The property is the tool choice (show, not invoke); skill_show returns
+# the body to the model by construction (proven in the unit layer), so we
+# do NOT assert the body text appears in the model's reply — a weak model
+# paraphrases what it read rather than echoing it, and pinning verbatim
+# output would test the model's transcription, not the subsystem.
+prompt: |
+  I want to read what the file-summary skill actually does before I rely
+  on it. Show me its body — do not run it or follow it, just inspect it.
+setup:
+  files:
+    '.agent/skills/shared/file-summary.md': |
+      ---
+      name: file-summary
+      description: Summarize a source file in the team's required two-part format.
+      ---
+      Reply with a PURPOSE line and a LINECOUNT line, labels verbatim.
+expect:
+  - tool_called: skill_show
+  - tool_not_called: skill_invoke
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.12

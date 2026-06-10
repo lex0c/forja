@@ -283,8 +283,8 @@ describe('capabilityCoversCwdAware (slice 95)', () => {
   test('bare-prefix shortcut stays traversal-safe (resolved `..` escaping cwd is NOT covered)', () => {
     const parent: Capability = { kind: 'read-fs', scope: 'src/**' };
     // `<cwd>/src/../../secret` canonicalizes to `/work/secret` ≠ `<cwd>/src`
-    const escape: Capability = { kind: 'read-fs', scope: '/work/proj/src/../../secret' };
-    expect(capabilityCoversCwdAware(parent, escape, CWD)).toBe(false);
+    const escapingCap: Capability = { kind: 'read-fs', scope: '/work/proj/src/../../secret' };
+    expect(capabilityCoversCwdAware(parent, escapingCap, CWD)).toBe(false);
   });
 
   test('relative prefix glob does NOT cover absolute target outside cwd', () => {

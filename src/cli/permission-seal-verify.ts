@@ -172,12 +172,8 @@ export const runPermissionSealVerify = async (
     // that on the intact path so a clean seal-verify isn't mistaken for
     // full chain integrity.
     if (result.entriesChecked > 0) {
-      out(
-        '  note: this confirms the seal matches the stored chain hashes only.\n',
-      );
-      out(
-        '  for full integrity, also run `agent permission verify` (recomputes\n',
-      );
+      out('  note: this confirms the seal matches the stored chain hashes only.\n');
+      out('  for full integrity, also run `agent permission verify` (recomputes\n');
       out('  each row hash from its payload — catches a tampered row whose\n');
       out('  stored hash was left stale).\n');
     }

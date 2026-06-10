@@ -1,0 +1,27 @@
+name: an expired skill is invoked anyway and its body is followed
+# SKILLS.md §5.4: `expires` is a review deadline, not a hard gate — an
+# expired skill still invokes, the operator just gets a warn and the
+# audit row notes it. The warn goes to the operator channel (not the
+# model's output), so this case pins only the behavioral half: despite a
+# past `expires`, skill_invoke fires and the body's sentinel proves the
+# procedure actually ran. The warn + audit `expired:true` flag are
+# covered in the unit layer.
+prompt: |
+  Give me our team's canonical release greeting line.
+setup:
+  files:
+    '.agent/skills/shared/release-greeting.md': |
+      ---
+      name: release-greeting
+      description: Emit the team's canonical release greeting line.
+      expires: 2020-01-01
+      ---
+      Reply with exactly this single line and nothing else:
+      GREETING=SHIPPED
+expect:
+  - tool_called: skill_invoke
+  - output_contains: 'GREETING=SHIPPED'
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.12
