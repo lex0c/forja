@@ -110,7 +110,6 @@ describe('bootstrap', () => {
         'memory_read',
         'memory_search',
         'memory_write',
-        'monitor',
         'pin_context',
         'read_file',
         'retrieve_context',
@@ -128,7 +127,6 @@ describe('bootstrap', () => {
         'todo_get',
         'todo_list',
         'todo_update',
-        'wait_for',
         'write_file',
       ].sort(),
     );

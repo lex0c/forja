@@ -110,6 +110,44 @@ This supersedes the abandoned `spec/detached-subagents-wake` branch (which
 modeled this as a `task_detach` SUBAGENT mode — wrong target; the operator wants
 detached bash COMMANDS, and bash_background already exists as the base).
 
+## [2026-06-10] chore(tools): withdraw monitor / wait_for from the model surface
+
+The model should no longer see or call `monitor` and `wait_for`. Rather than
+delete them, withdraw only the model-facing surface: dropped both from
+`BUILTIN_TOOLS` (so `buildToolDefs` never advertises them to any provider) while
+keeping the tool modules, their `index.ts` re-exports, and the underlying
+`src/wait/` subsystem intact — still importable internally and by tests, and the
+display vocab stays so historical audit rows that reference these calls still
+render. Removed them from the two playbooks that declared them (`debug`,
+`perf-investigate`); `perf-investigate`'s body said "you wait via `wait_for`" —
+now "poll its completion with `bash_output`" (bash_background stays). Net effect:
+the bash_background workflow loses event-driven waiting and falls back to polling
+via `bash_output`. Updated the bootstrap toolset assertion to match.
+
+## [2026-06-10] feat(tui): in-flight async chip in the footer
+
+The footer reserved a `bg N` token (UI.md §4.10.6) for background processes
+but then dropped it as low signal-to-noise on 80-col. The data
+(`state.bgProcesses`, fed by the `bg:start`/`bg:end` event chain — BgManager
+→ `bg_started` HarnessEvent → adapter → reducer) was tracked but never drawn.
+Restored it scoped to *active* async only: a `N async` chip leading the
+footer's right cluster, painted `success` (green) so the one "running now"
+signal stands apart from the dim cumulative chips
+(model/tokens/cost). Suppressed at size 0, so it's never idle-session
+decoration — it appears only while a `bash_background` process is alive and
+collapses the instant the last one ends. Verified end-to-end (bg_started →
+adapter → applyEvent → footer renders the chip); the earlier "not showing"
+was a short-lived process, not a wiring bug.
+
+Drive-by, from an audit of the touched function: extracted `interruptCue()` —
+the `softInterrupted ? 'esc again to force' : 'esc to interrupt'` flip was
+duplicated inline in the slash and mode-cue branches (drift risk). Strengthened
+the "exit cue beats interrupt cue" test (it set `activeTools` but not `busy`, so
+`isRunning` was false and the assertion passed vacuously — now sets `busy`, drops
+the dead `activeTools`). Added the missing slash-open + `softInterrupted` case.
+(Note: the `N async` chip described here was relabeled to `N bg process` when
+this branch merged — see the 2026-06-11 entry; the `interruptCue` refactor stays.)
+
 ## [2026-06-10] fix(repl): boot parity with the one-shot harness
 
 `BootstrapResult` is consumed by BOTH `cli/run.ts` (one-shot) and `cli/repl.ts`

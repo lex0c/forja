@@ -12,7 +12,6 @@ import { memoryListTool } from './memory-list.ts';
 import { memoryReadTool } from './memory-read.ts';
 import { memorySearchTool } from './memory-search.ts';
 import { memoryWriteTool } from './memory-write.ts';
-import { monitorTool } from './monitor.ts';
 import { pinContextTool } from './pin-context.ts';
 import { readFileTool } from './read-file.ts';
 import { retrieveContextTool } from './retrieve-context.ts';
@@ -29,7 +28,6 @@ import { todoCreateTool } from './todo-create.ts';
 import { todoGetTool } from './todo-get.ts';
 import { todoListTool } from './todo-list.ts';
 import { todoUpdateTool } from './todo-update.ts';
-import { waitForTool } from './wait-for.ts';
 import { writeFileTool } from './write-file.ts';
 
 export { bashTool } from './bash.ts';
@@ -124,8 +122,11 @@ export const BUILTIN_TOOLS = [
   skillListTool,
   skillShowTool,
   skillInvokeTool,
-  waitForTool,
-  monitorTool,
+  // wait_for / monitor are intentionally NOT registered: the model
+  // should not see or call them. The tool modules, their re-exports
+  // below, and the underlying `src/wait/` subsystem stay intact —
+  // they remain importable for internal use and tests; only the
+  // model-facing surface is withdrawn.
   todoListTool,
   todoGetTool,
   todoCreateTool,

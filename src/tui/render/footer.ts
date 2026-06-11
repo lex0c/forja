@@ -45,6 +45,14 @@ const formatCost = (usd: number): string => `$${(Math.round(usd * 100) / 100).to
 // before `awaitingProvider`), so the cue never flickers off mid-turn.
 const isRunning = (state: LiveState): boolean => state.busy;
 
+// Single source for the mid-run interrupt cue, shared by the slash and
+// mode-cue branches so they can't drift. Once the operator soft-aborts
+// (one Esc), the loop has acknowledged and is winding down, so the cue
+// flips from "esc to interrupt" to "esc again to force" — both branches
+// must make that flip identically.
+const interruptCue = (state: LiveState, caps: Capabilities): string =>
+  dim(caps, state.softInterrupted ? 'esc again to force' : 'esc to interrupt');
+
 // `secondary` (SGR 90) rather than `dim` (SGR 2): xterm with default
 // config renders SGR 2 identical to the default foreground, so
 // faint-painted cues become invisible.
@@ -74,7 +82,7 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
     // because esc is still load-bearing if a run is in flight.
     const leftParts: string[] = [];
     if (isRunning(state)) {
-      leftParts.push(dim(caps, state.softInterrupted ? 'esc again to force' : 'esc to interrupt'));
+      leftParts.push(interruptCue(state, caps));
     }
     left = leftParts.join(sep);
   } else {
@@ -95,7 +103,7 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
       // newline affordance is noise — and it's the segment that pushes
       // the load-bearing interrupt cue past the right edge on narrow
       // (80-col) terminals. Surface the interrupt cue instead.
-      leftParts.push(dim(caps, state.softInterrupted ? 'esc again to force' : 'esc to interrupt'));
+      leftParts.push(interruptCue(state, caps));
     } else {
       // Idle: the operator can type, so surface the multiline
       // continuation affordance for terminals/WMs that eat Shift+Enter
@@ -114,7 +122,9 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
   // running *now*, not cumulative session state. Now that bg processes
   // survive the turn boundary, this is also the operator's cue that a
   // launched command is still alive between turns. Suppressed at size 0
-  // so the slot collapses the instant the last process ends.
+  // so the slot collapses the instant the last process ends. (Supersedes
+  // the `N async` label merged from feat/tui-async-footer-chip — same
+  // bgProcesses source, kept one chip.)
   const bgCount = state.bgProcesses.size;
   if (bgCount > 0) {
     rightParts.push(paint(caps, 'success', `${bgCount} bg process`));
