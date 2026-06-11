@@ -2,6 +2,24 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-11] tui: N reminders footer chip
+
+Operator-requested follow-up to the reminder tool: surface pending
+reminders as a live footer chip, BEFORE `bash bg` (a scheduled wake is
+the earliest cue the session will re-engage on its own). Same treatment
+as the bash-bg / subagents chips — green, suppressed at 0, survives the
+turn boundary.
+
+Plumbing: the ReminderScheduler gained `onChange(pendingCount)` (fires on
+set/cancel/fire/cleanup); the REPL routes it to a `reminders:update` bus
+event; `LiveState.reminderCount` stores the absolute count (a plain
+number, not a Map — the chip only needs the size; the scheduler is the
+source of truth so the reducer never derives it). Verified the cleanup's
+post-`renderer.close()` emit is safe (the renderer unsubscribes + the
+`closed` flag no-ops render — same as bg cleanup's `bg:end`). Spec
+follow-up still pending: §3B.7 / UI.md §4.10.6 say "two chips" — bump to
+three after the chip is validated in `bun run dev`.
+
 ## [2026-06-11] reminder tool — spec PR + implementation
 
 New branch `feat/reminder-tool`. Adds the second producer to the
