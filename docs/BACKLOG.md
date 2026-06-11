@@ -2,6 +2,42 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-11] security: sanitize notification fields before scrollback render
+
+Review flagged the reminder `note` (model-authored, can quote untrusted
+content) reaching the operator's scrollback verbatim via the `● ` info
+echo — ANSI could repaint the terminal, an embedded newline could forge a
+fake system row. Verified it was broader than the review assumed: the bg
+`command` and `summary` shared the gap (the channel never sanitized them,
+contrary to the review's "bg is sanitized" claim — only the synchronous
+bash tool's output was). Now aligned with the project's render-time
+sanitization discipline (`SECURITY_GUIDELINE`; cf. `permanent.ts` cards).
+
+Two helpers lifted into `src/sanitize`: `flattenControlToLine` (note /
+command → one line, no width cap so the wake-turn input isn't truncated)
+and `stripControlKeepLines` (bg summary → drop CR, keep LF/TAB for the
+per-line indent). Learned mid-fix that `stripAnsi` already drops every
+bare C0 byte except TAB/LF/CR, so the helpers only neutralize those three
+survivors. Open follow-up (pre-existing, out of scope): `flattenSubject`
+in harness-adapter flattens newlines but does NOT stripAnsi the
+model-authored tool `subject` — same ANSI gap on a different path.
+
+## [2026-06-11] reminders: REPL-only availability (hide off-REPL + reject in subagents)
+
+Closed a gap (surfaced in review): the reminder family was advertised in
+one-shot run.ts and subagents — which have no session-scoped scheduler —
+so every invocation there returned `scheduler_unavailable`, and a
+subagent whitelist listing `reminder` passed validation while the tool
+was dead. Two layers now: `buildToolDefs` hides `requiresReminderScheduler`
+tools when `config.reminderScheduler` is undefined (same shape as the
+`requiresOperatorConfirm` gate), so the model never sees them off-REPL;
+`validateSubagentTools` gains a 4th check rejecting them regardless of
+isolation (a run-to-completion subagent has no idle state to wake —
+worktree doesn't lift it, unlike `writes`). Clarified the bash_background
+contrast: it IS already barred in default-isolation subagents (writes:true)
+and only allowed in worktree ones, where it actually runs. Spec:
+ORCHESTRATION §3B.9 + CONTRACTS §2.6.5f.
+
 ## [2026-06-11] tui: N reminders footer chip
 
 Operator-requested follow-up to the reminder tool: surface pending
