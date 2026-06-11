@@ -2,6 +2,26 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-11] repl: byte cursors for the bg_done summary tail
+
+Bug surfaced reviewing the bg summary path. `readBgSummary` computed each
+stream's total as `stdout.length + stdoutPending` — mixing units. The bg
+manager speaks BYTES (`stdoutPending`, the `since*` offsets), but
+`stdout.length` is JS UTF-16 code units. A head holding multibyte UTF-8
+undercounts the total, so the follow-up tail read anchors too early and
+`maxBytes: BG_SUMMARY_TAIL` can stop before EOF — dropping the final
+failure lines the wake notification exists to surface (a regression of the
+real-tail fix two entries down, for the multibyte case).
+
+Fix: totals from the returned byte cursors, `stdoutCursor + stdoutPending`
+(cursor is the byte offset just past the head slice). Extracted the
+head-tail builder out of the repl closure into `src/cli/bg-summary.ts`
+(`buildBgSummary`, narrowed to `Pick<BgManager,'readOutput'>`) so the
+byte-offset math — which has now bitten us twice — is unit-testable
+against a stub. Regression test front-loads a multibyte head (400 `€` =
+1200 bytes / 400 code units) past HEAD+TAIL and asserts the unique EOF
+marker survives; under the old code the ~333-byte undercount cut it off.
+
 ## [2026-06-11] bg: stdin-reading commands no longer eat the script
 
 Bug surfaced reviewing the bg spawn path. Keeping the command body off
