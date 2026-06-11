@@ -2,6 +2,34 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-11] bg: stdin-reading commands no longer eat the script
+
+Bug surfaced reviewing the bg spawn path. Keeping the command body off
+argv (a `/proc/<pid>/cmdline` info leak) was done by piping it to
+`bash -s`, which reads the program from fd 0 — but `-s` makes fd 0 do
+double duty: program source AND inherited stdin of every command the
+script runs. A `cat`, `read x`, etc. mid-script then swallows the
+remaining script lines (or EOF), so the commands after it silently
+never run (`cat; echo done` → `done` lost).
+
+Fix: run the script through a constant bootstrap,
+`__forja_script="$(cat)"; eval "$__forja_script" </dev/null`. `cat`
+drains the entire script off fd 0 into a variable in one shot (before
+any of it executes), then `eval … </dev/null` runs it with a clean
+stdin — a body-level `cat`/`read` sees EOF, not the program. Body
+still lives only in shell memory, never in argv.
+
+Rejected the temp-file and extra-fd alternatives the review suggested:
+`--tmpfs /tmp` masks a temp script (logDir lands in /tmp under sandbox
+and in tests) and bwrap closes extra fds (no `--keep-fd`), whereas
+fd 0 is already forwarded by both bwrap and sandbox-exec — so the
+bootstrap needs neither. Verified empirically that exit codes, `set
+-e` abort/propagation, explicit `exit N`, `pipefail`, `trap EXIT`, and
+in-script heredocs all behave identically to direct execution; the
+only behavioral change is the script's stdin is now /dev/null instead
+of the residual pipe, which is the fix. Regression test: `echo
+before\ncat\necho after` must emit both `before` and `after`.
+
 ## [2026-06-11] audit: harness-injected input is `system`, not `operator`
 
 Closing gap in the bash_background work. Wake-turn notifications and subagent
