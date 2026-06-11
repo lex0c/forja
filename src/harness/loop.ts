@@ -1152,58 +1152,81 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // Documented as an explicit boundary — resume restores
       // conversational context, not running children.
       if (config.bgLogDir !== undefined) {
-        bgManager = createBgManager({
-          db: config.db,
-          sessionId,
-          logDir: config.bgLogDir,
-          // Propagate the harness's combined signal (caller abort +
-          // wall-clock). A Ctrl+C mid-stream kills bg processes
-          // immediately instead of waiting for runAgent's outer
-          // finally to fire — matters when the loop is mid-provider-
-          // request, where finally can be seconds away.
-          abortSignal: signal,
-          // Slice 130 fixup #1: thread failure_events sink +
-          // boot-time sandbox tool so the `sandbox.mid_session_loss`
-          // probe in bg/manager actually fires in production.
-          // Pre-fixup the manager was constructed without either,
-          // so the entire probe path was dead code at runtime
-          // (tests wired the seams directly, masking the gap).
-          // Both fields are optional on CreateBgManagerOptions, so
-          // headless/SDK callers that don't supply them keep
-          // pre-slice-130 behavior.
-          ...(config.failureSink !== undefined ? { failureSink: config.failureSink } : {}),
-          ...(config.sandboxBootTool !== undefined
-            ? { sandboxBootTool: config.sandboxBootTool }
-            : {}),
-          // Slice 157 (phase 2): bg manager threads the per-CLI-run
-          // sandbox tmpdir into every bg spawn so long-running bg
-          // processes get the same scoped /tmp on darwin as
-          // foreground tools.
-          ...(config.sandboxTmpdir !== undefined ? { sandboxTmpdir: config.sandboxTmpdir } : {}),
-          // Lifecycle observer: translate bg manager events into
-          // HarnessEvents so the renderer can update its `bg N`
-          // footer counter (spec UI.md §4.10.6) and audit captures
-          // the same lifecycle the user sees. Event shape mirrors
-          // BgManagerEvent's `kind` discriminant onto distinct
-          // HarnessEvent types so the adapter's switch stays flat.
-          onEvent: (event) => {
-            if (event.kind === 'started') {
-              safeEmit(config.onEvent, {
-                type: 'bg_started',
-                processId: event.processId,
-                command: event.command,
-                label: event.label,
-              });
-            } else {
-              safeEmit(config.onEvent, {
-                type: 'bg_ended',
-                processId: event.processId,
-                status: event.status,
-                exitCode: event.exitCode,
-              });
-            }
-          },
-        });
+        const bgHolder = config.bgManagerHolder;
+        if (bgHolder?.manager !== undefined) {
+          // Session-scoped reuse (spec ORCHESTRATION.md §3B.1): a prior
+          // turn already built the manager and stored it in the holder.
+          // Reuse it so background processes survive the turn boundary
+          // instead of being torn down + rebuilt empty each turn. The
+          // cross-turn event sink is already wired into it.
+          //
+          // The reused manager keeps the sessionId it was BUILT with
+          // (the first turn's), not this turn's. In the REPL that's the
+          // same id (sessionContext reuse reopens the same row), but
+          // even if a later turn resolved a different id, the manager
+          // stays self-consistent: it writes bg rows and answers
+          // bash_list/bash_output under its own stable id. That's the
+          // desired scope — "this REPL's bg processes" under one id.
+          bgManager = bgHolder.manager;
+        } else {
+          bgManager = createBgManager({
+            db: config.db,
+            sessionId,
+            logDir: config.bgLogDir,
+            // One-shot run (no holder): propagate the harness's combined
+            // signal (caller abort + wall-clock) so a Ctrl+C mid-stream
+            // kills bg processes immediately instead of waiting for the
+            // outer finally. Session-scoped (holder present): do NOT wire
+            // it — the manager OUTLIVES the turn (§3B.1); a per-turn
+            // signal would SIGKILL surviving processes the moment the
+            // spawning turn ends. The REPL owns teardown via
+            // `manager.cleanup()` at session exit.
+            ...(bgHolder === undefined ? { abortSignal: signal } : {}),
+            // Slice 130 fixup #1: thread failure_events sink +
+            // boot-time sandbox tool so the `sandbox.mid_session_loss`
+            // probe in bg/manager actually fires in production.
+            // Both fields are optional on CreateBgManagerOptions, so
+            // headless/SDK callers that don't supply them keep
+            // pre-slice-130 behavior.
+            ...(config.failureSink !== undefined ? { failureSink: config.failureSink } : {}),
+            ...(config.sandboxBootTool !== undefined
+              ? { sandboxBootTool: config.sandboxBootTool }
+              : {}),
+            // Slice 157 (phase 2): bg manager threads the per-CLI-run
+            // sandbox tmpdir into every bg spawn so long-running bg
+            // processes get the same scoped /tmp on darwin as
+            // foreground tools.
+            ...(config.sandboxTmpdir !== undefined ? { sandboxTmpdir: config.sandboxTmpdir } : {}),
+            // Lifecycle observer: translate bg manager events into
+            // HarnessEvents so the renderer can update its `bg N`
+            // footer counter (spec UI.md §4.10.6) and audit captures
+            // the same lifecycle the user sees.
+            onEvent: (event) => {
+              const harnessEvent: HarnessEvent =
+                event.kind === 'started'
+                  ? {
+                      type: 'bg_started',
+                      processId: event.processId,
+                      command: event.command,
+                      label: event.label,
+                    }
+                  : {
+                      type: 'bg_ended',
+                      processId: event.processId,
+                      status: event.status,
+                      exitCode: event.exitCode,
+                    };
+              // Cross-turn sink (REPL holder) routes to the current
+              // turn's observer or, when idle, the notification channel
+              // (§3B.3, later slice). One-shot: the per-run onEvent —
+              // single turn, no holder.
+              if (bgHolder !== undefined) bgHolder.onEvent(harnessEvent);
+              else safeEmit(config.onEvent, harnessEvent);
+            },
+          });
+          // Store the freshly-built manager so later turns reuse it.
+          if (bgHolder !== undefined) bgHolder.manager = bgManager;
+        }
       }
 
       // S11 — semantic-verify scheduler (MEMORY.md §11.x). Created
@@ -3875,7 +3898,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // synchronously throws before the await.
       }
     }
-    if (bgManager !== undefined) {
+    // Tear the bg manager down — but ONLY when the loop owns it (no
+    // holder = one-shot run). When a holder was INJECTED (the REPL,
+    // spec ORCHESTRATION.md §3B.1), the manager is session-scoped and
+    // its processes must SURVIVE the turn; killing them here would
+    // reintroduce the exact "background dies at turn end" bug the holder
+    // fixes. The REPL owns teardown via `manager.cleanup()` at session
+    // exit. Mirrors the `todoStore` ownership check below.
+    if (bgManager !== undefined && config.bgManagerHolder === undefined) {
       try {
         await bgManager.cleanup();
       } catch {

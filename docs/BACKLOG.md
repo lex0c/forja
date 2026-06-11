@@ -2,6 +2,29 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-11] feat(harness): session-scoped BgManager holder (loop side)
+
+Second slice of ORCHESTRATION §3B — the loop half of making bg processes survive
+the turn. The BgManager can't be built at boot like `todoStore` (it needs the
+sessionId, which only resolves on the first turn), so `HarnessConfig` gains a
+mutable `bgManagerHolder` (`BgManagerHolder`): the loop builds the manager on the
+first turn and stores it; later turns reuse it. Three behavior changes when a
+holder is injected: (1) the manager is NOT rebuilt per turn; (2) the per-turn
+`abortSignal` is NOT wired into it — a session-scoped manager must outlive the
+turn, and a turn signal would SIGKILL surviving processes the moment the spawning
+turn ends; (3) the outer-finally cleanup runs ONLY when the loop owns the manager
+(no holder = one-shot), mirroring the `todoStore` ownership check — the holder
+owner (the REPL) calls `cleanup()` at session exit. The manager's `onEvent` is
+rewired to route through `holder.onEvent` (cross-turn sink) instead of the dead
+turn's `config.onEvent`.
+
+One-shot runs and subagents pass no holder, so their behavior is unchanged
+(signal wired, killed at run end). Tests: with a holder the bg process survives
+the turn (status `running`, not `killed`) and dies on manual `cleanup()`; events
+route through the holder sink not `config.onEvent`; a second turn reuses the same
+manager instance. The REPL side (create/inject the holder, route events, cleanup
+at exit) is the next slice; until then the infra is tested but has no consumer.
+
 ## [2026-06-11] feat(tools): bash_list — snapshot of session bg processes
 
 First implementation slice of `ORCHESTRATION.md §3B` (the bash_background-as-real-
