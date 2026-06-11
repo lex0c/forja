@@ -1946,12 +1946,33 @@ describe('bg lifecycle', () => {
     expect(state.bgProcesses.size).toBe(1);
   });
 
-  test('session:start clears bgProcesses (fresh session boundary)', () => {
+  test('session:start PRESERVES bgProcesses across the turn boundary (ORCHESTRATION §3B.1)', () => {
+    // bash_background processes survive the turn now, so the renderer
+    // map must NOT be zeroed at the boundary — else the `bash bg` chip
+    // would vanish on the next turn while the process is still running.
     const { state } = drive([
       { type: 'bg:start', ts: 1, processId: 'p1', command: 'x' },
       start({ ts: 2, sessionId: 's2' }),
     ]);
-    expect(state.bgProcesses.size).toBe(0);
+    expect(state.bgProcesses.size).toBe(1);
+    expect(state.bgProcesses.get('p1')?.command).toBe('x');
+    // bg:end still removes it once it actually settles.
+    const after = applyEvent(state, {
+      type: 'bg:end',
+      ts: 3,
+      processId: 'p1',
+      cause: 'exited',
+      exitCode: 0,
+    });
+    expect(after.state.bgProcesses.size).toBe(0);
+  });
+
+  test('session:end PRESERVES bgProcesses (cleanup only at session exit now)', () => {
+    const { state } = drive([
+      { type: 'bg:start', ts: 1, processId: 'p1', command: 'x' },
+      { type: 'session:end', ts: 2, sessionId: 's1', reason: 'done' },
+    ]);
+    expect(state.bgProcesses.size).toBe(1);
   });
 });
 

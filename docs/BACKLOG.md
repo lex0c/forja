@@ -2,6 +2,33 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-11] bg notification head-tail, tool descriptions, + chip-persistence fix
+
+Three threads of the bash_background-as-real-background work.
+
+(1) Fix — the footer chip vanished on the turn AFTER spawning. The renderer reset
+`state.bgProcesses` at both turn boundaries (`session:start`/`session:end`),
+which was correct when bg processes died at turn end but is now a regression:
+they survive across turns, so zeroing the map drops the `bash bg` chip while the
+process is still running. The original comment literally predicted this under
+"--keep-bg". Removed both resets (only `createInitialState` resets now);
+`subagents` still resets (within-turn). Inverted the test that asserted the old
+reset; added one for `session:end`.
+
+(2) Head-tail inline (Slice B2 of §3B.3) — the bg_done notification now reads the
+process output OBSERVATIONALLY at completion (since:0 doesn't advance the cursor,
+so bash_output still sees everything) and inlines a compact head-tail
+(stdout + labeled stderr, head 1200 + tail 1200, elided middle). The model acts
+on the result in the wake-turn without a bash_output round-trip; the scrollback
+shows the `● ` headline + the head-tail indented beneath it.
+
+(3) Tool descriptions — `bash_background` and `bash_output` described the old
+within-turn/poll model. Rewritten: bash_background now says it persists across
+turns and that you're notified on completion ("do NOT poll"); bash_output is
+repositioned as inspection, not completion-detection. The real win is steering
+the model off the poll loop, which would inflate the tool-result history (the
+dominant cost), not the description's own token count (it's cached).
+
 ## [2026-06-11] spec: realign §3B with the bash_background implementation
 
 The §3B proposal was written before the code; the implementation diverged in

@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { BgManager } from '../../src/bg/index.ts';
 import type { ParsedArgs } from '../../src/cli/args.ts';
 import type { BootstrapInput, BootstrapResult } from '../../src/cli/bootstrap.ts';
 import {
@@ -1553,6 +1554,59 @@ describe('repl — boot + smoke', () => {
     const prompt = ra.captured[1]?.configs[0]?.userPrompt ?? '';
     expect(prompt).toContain('[background]');
     expect(prompt).toContain('npm test');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('the bg_done notification inlines a head-tail of the output (§3B.3)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('first\r');
+    await tick();
+    const holder = ra.captured[0]?.configs[0]?.bgManagerHolder;
+    expect(holder).toBeDefined();
+    if (holder === undefined) return;
+    // The loop normally builds the manager and stores it; the mock
+    // runAgent doesn't, so inject a fake whose readOutput returns the
+    // process output the notification should head-tail.
+    holder.manager = {
+      readOutput: () =>
+        Promise.resolve({
+          status: 'exited',
+          exitCode: 0,
+          stdout: 'Tests: 12 passed, 0 failed\n',
+          stderr: '',
+          stdoutCursor: 0,
+          stderrCursor: 0,
+          stdoutPending: 0,
+          stderrPending: 0,
+        }),
+    } as unknown as BgManager;
+    holder.onEvent({ type: 'bg_started', processId: 'p1', command: 'npm test', label: null });
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(1); // idle
+
+    // Finish while idle → async readOutput → enqueue → wake.
+    holder.onEvent({ type: 'bg_ended', processId: 'p1', status: 'exited', exitCode: 0 });
+    await tick();
+    await tick(); // extra: the readOutput promise + microtask drain
+    expect(ra.captured).toHaveLength(2);
+    const prompt = ra.captured[1]?.configs[0]?.userPrompt ?? '';
+    expect(prompt).toContain('[background]');
+    expect(prompt).toContain('read complete output with bash_output');
+    expect(prompt).toContain('Tests: 12 passed'); // the inlined head-tail
     ra.finish(1);
     await tick();
     stdin.feed('\x04');

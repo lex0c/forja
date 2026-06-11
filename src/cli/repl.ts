@@ -708,13 +708,39 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         const command = bgCommands.get(e.processId) ?? '(background command)';
         bgCommands.delete(e.processId);
         if (!exiting) {
-          enqueueNotification({
-            kind: 'bg_done',
-            command,
-            status: e.status,
-            exitCode: e.exitCode,
-            processId: e.processId,
-          });
+          const processId = e.processId;
+          const status = e.status;
+          const exitCode = e.exitCode;
+          // Read the output OBSERVATIONALLY (since:0 does not advance the
+          // persisted cursor, so a later bash_output still sees
+          // everything) to build the inline head-tail, THEN enqueue.
+          // Async — the wake/boundary drain picks it up after.
+          void (async () => {
+            let summary: string | undefined;
+            try {
+              const mgr = bgManagerHolder.manager;
+              if (mgr !== undefined) {
+                const out = await mgr.readOutput(processId, {
+                  sinceStdout: 0,
+                  sinceStderr: 0,
+                  maxBytes: BG_SUMMARY_READ_BYTES,
+                });
+                summary = bgOutputSummary(out.stdout, out.stderr);
+              }
+            } catch {
+              // Best-effort: a read failure just drops the inline summary;
+              // the notification still fires and bash_output still works.
+            }
+            if (exiting) return; // re-check after the async gap
+            enqueueNotification({
+              kind: 'bg_done',
+              command,
+              status,
+              exitCode,
+              processId,
+              ...(summary !== undefined ? { summary } : {}),
+            });
+          })();
         }
       }
     },
@@ -1383,6 +1409,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     status: 'exited' | 'killed' | 'failed';
     exitCode: number | null;
     processId: string;
+    // Head-tail of the process output (OUTPUT_POLICY), read
+    // observationally at completion so the model sees the result in the
+    // wake-turn without a bash_output round-trip. Undefined when the
+    // process was silent or the read failed; the full output is always
+    // recoverable via bash_output(processId).
+    summary?: string;
   };
   const notifications: Notification[] = [];
   let notifSeq = 0;
@@ -1393,12 +1425,44 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // bg work could ping-pong the session awake forever.
   let consecutiveWakes = 0;
   const MAX_CONSECUTIVE_WAKES = 3;
-  const formatNotification = (n: Notification): string => {
+  // The headline line — the `● `-able status sentence, no body.
+  const formatNotificationHeadline = (n: Notification): string => {
     // One `kind` today; this grows a switch as producers are added.
     const code = n.exitCode === null ? '' : ` (exit ${n.exitCode})`;
     return (
       `[background] \`${n.command}\` ${n.status}${code}. ` +
-      `process_id=${n.processId} — read its output with bash_output.`
+      `process_id=${n.processId} — read complete output with bash_output.`
+    );
+  };
+  // Full text fed to the model as the wake-turn input: headline + the
+  // output head-tail when present.
+  const formatNotification = (n: Notification): string =>
+    n.summary === undefined
+      ? formatNotificationHeadline(n)
+      : `${formatNotificationHeadline(n)}\n${n.summary}`;
+  // Bytes read per stream when building the inline head-tail. Covers the
+  // common case whole; for an output larger than this the head-tail is
+  // taken over the leading window (full output via bash_output).
+  const BG_SUMMARY_READ_BYTES = 64 * 1024;
+  const BG_SUMMARY_HEAD = 1200;
+  const BG_SUMMARY_TAIL = 1200;
+  // Compact head-tail of a finished process's output for the inline
+  // notification summary. Combines stdout + labeled stderr, then caps
+  // with a head+tail window. Undefined when the process was silent.
+  const bgOutputSummary = (stdout: string, stderr: string): string | undefined => {
+    const parts: string[] = [];
+    const out = stdout.trim();
+    const err = stderr.trim();
+    if (out.length > 0) parts.push(out);
+    if (err.length > 0) parts.push(`[stderr]\n${err}`);
+    if (parts.length === 0) return undefined;
+    const combined = parts.join('\n');
+    if (combined.length <= BG_SUMMARY_HEAD + BG_SUMMARY_TAIL + 64) return combined;
+    const elided = combined.length - BG_SUMMARY_HEAD - BG_SUMMARY_TAIL;
+    return (
+      `${combined.slice(0, BG_SUMMARY_HEAD)}\n` +
+      `… [${elided} bytes elided — bash_output for full] …\n` +
+      `${combined.slice(-BG_SUMMARY_TAIL)}`
     );
   };
   const enqueueNotification = (n: Omit<Notification, 'id'>): void => {
@@ -2068,17 +2132,28 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // burst of completions doesn't fire a turn each.
     const drained = notifications.splice(0);
     consecutiveWakes += 1;
-    const texts = drained.map(formatNotification);
     // Surface each notification in the scrollback as a system `info`
-    // line (distinct from an operator-submit bar — that's the point of a
+    // entry (distinct from an operator-submit bar — the point of a
     // separate channel) so the operator sees WHY the session woke and
-    // what the turn is about. Without this the wake-turn would run with
-    // no visible trace of its trigger. Applies to the semi-push path too
+    // what the turn is about: the `● ` headline, then the output
+    // head-tail indented beneath it. Applies to the semi-push path too
     // (this drain also runs at the boundary).
-    for (const t of texts) {
-      bus.emit({ type: 'info', ts: now(), tone: 'secondary', message: `● ${t}` });
+    for (const n of drained) {
+      const headline = `● ${formatNotificationHeadline(n)}`;
+      // One info event per notification (info emits a single leading
+      // blank — separate events would blank-separate every line). The
+      // head-tail rides in the same message, each row indented 4sp so it
+      // sits under the headline text (frame 2sp + the `● ` prefix).
+      const message =
+        n.summary === undefined
+          ? headline
+          : `${headline}\n${n.summary
+              .split('\n')
+              .map((l) => `    ${l}`)
+              .join('\n')}`;
+      bus.emit({ type: 'info', ts: now(), tone: 'secondary', message });
     }
-    startTurn(texts.join('\n'));
+    startTurn(drained.map(formatNotification).join('\n\n'));
   };
 
   // Async cleanup. Only called via `requestShutdown` below — the

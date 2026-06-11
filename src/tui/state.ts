@@ -933,20 +933,16 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         // session:start (each REPL submit) must preserve it via the
         // `...state.status` spread, never reset it.
       };
-      // Boundary cleanup: soft-interrupt state and bg processes are
-      // both per-session. A fresh session starts clean even if the
-      // prior one ended mid-soft (operator hit Esc, then the run
-      // terminated for another reason) or if the prior bg manager
-      // somehow left dangling entries.
-      //
-      // When daemon mode / `--keep-bg` lands and bg
-      // processes survive across turn/session boundaries, this reset
-      // becomes a regression — the operator would lose the counter
-      // for processes still running in the background. Replace the
-      // unconditional reset with a producer-driven repopulation (the
-      // bg manager would re-emit `bg:start` for surviving processes
-      // on the new session_start). Today no path keeps bg alive
-      // across sessions, so the reset is correct.
+      // Boundary cleanup: soft-interrupt state is per-session and
+      // resets. bg processes are NOT reset here — bash_background now
+      // keeps them alive across turn boundaries (ORCHESTRATION §3B.1),
+      // so zeroing the renderer map every new turn would drop the
+      // `bash bg` chip for processes still running (the exact regression
+      // this comment used to predict under "--keep-bg" — it landed). The
+      // map carries across turns; `bg:end` removes each process on
+      // settle; a fresh PROCESS (resume) starts from createInitialState's
+      // empty map. Subagents DO reset — they're within-turn (drained at
+      // turn end), so a fresh turn legitimately starts with none.
       // No permanent emission (UI.md §3.2). The user-submit inverse
       // bar (§4.10.8) already marks turn boundaries; emitting a
       // session-header line per turn just clutters scrollback with
@@ -965,7 +961,8 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           // start via paths that bypass the editor (resume, headless
           // bridge), so the boundary reset closes the gap.
           exitArmed: null,
-          bgProcesses: new Map(),
+          // bgProcesses intentionally NOT reset (see boundary comment
+          // above) — bash_background processes survive the turn.
           subagents: new Map(),
           parallelStatus: null,
           // Per-session: a stale "Awaiting model" indicator from a
@@ -1011,14 +1008,12 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // footer's "esc again to force" cue stops surfacing once the
       // run actually terminates (regardless of WHY it ended — could
       // be the soft-abort succeeding, could be done/error/maxSteps).
-      // Also zero the bg counter: the harness emits `session_finished`
-      // BEFORE its outer finally runs `bgManager.cleanup()`, so the
-      // bg_ended events from cleanup land AFTER the operator has
-      // already seen `session:end` in the footer. Without zeroing
-      // here, the cue would briefly show `bg N` for processes the
-      // harness already committed to killing — visually a zombie
-      // tray. The late bg:end events still flow through (they're
-      // dropped as no-ops by the unknown-processId branch).
+      // bg processes are NOT zeroed here anymore: the old "zombie tray"
+      // rationale (cleanup() killing every process at turn end, so the
+      // counter had to be cleared before the late bg:end events landed)
+      // no longer holds — bash_background processes survive the turn
+      // (ORCHESTRATION §3B.1) and cleanup() runs only at session exit.
+      // Zeroing here would hide processes that are still alive.
       //
       // The footer's cumulative cost/token/cache totals are NOT folded
       // here anymore — they are DB-derived and pushed via `stats:refresh`
@@ -1031,7 +1026,8 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           softInterrupted: false,
           // Same boundary reset rationale as session:start (above).
           exitArmed: null,
-          bgProcesses: new Map(),
+          // bgProcesses intentionally NOT reset — processes survive the
+          // turn (see the boundary comment above).
           subagents: new Map(),
           parallelStatus: null,
           // Same rationale as session:start: a session ending mid-

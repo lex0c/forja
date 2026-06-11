@@ -33,7 +33,7 @@ export interface BashOutputOutput {
 export const bashOutputTool: Tool<BashOutputInput, BashOutputOutput> = {
   name: 'bash_output',
   description:
-    'Read incremental stdout/stderr from a background process started by bash_background. Advances a server-side cursor so each call returns only new bytes since the last read. Use status/exit_code to detect termination.',
+    'Read incremental stdout/stderr from a background process (bash_background). Advances a server-side cursor so each call returns only new bytes since the last read. Use it to inspect a running process — you are notified separately when one finishes, so polling for completion is unnecessary.',
   inputSchema: {
     type: 'object',
     properties: {
