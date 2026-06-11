@@ -1578,35 +1578,44 @@ describe('repl — boot + smoke', () => {
     expect(holder).toBeDefined();
     if (holder === undefined) return;
     // The loop normally builds the manager and stores it; the mock
-    // runAgent doesn't, so inject a fake whose readOutput returns the
-    // process output the notification should head-tail.
+    // runAgent doesn't, so inject a fake. Simulate a LARGE output (100KB)
+    // whose head is all "pass" and whose REAL tail has the failure — the
+    // bug was that the summary showed the end of the leading window
+    // (still passing) instead of the true end. The head read returns
+    // pending = total-len; the tail read (since > 0) returns the failure.
     holder.manager = {
-      readOutput: () =>
-        Promise.resolve({
+      readOutput: (_id: string, opts?: { sinceStdout?: number }) => {
+        const total = 100_000;
+        const isHead = (opts?.sinceStdout ?? 0) === 0;
+        const stdout = isHead ? 'starting tests…\n' : 'FAIL: 3 tests failed\n';
+        return Promise.resolve({
           status: 'exited',
-          exitCode: 0,
-          stdout: 'Tests: 12 passed, 0 failed\n',
+          exitCode: 1,
+          stdout,
           stderr: '',
           stdoutCursor: 0,
           stderrCursor: 0,
-          stdoutPending: 0,
+          stdoutPending: isHead ? total - stdout.length : 0,
           stderrPending: 0,
-        }),
+        });
+      },
     } as unknown as BgManager;
     holder.onEvent({ type: 'bg_started', processId: 'p1', command: 'npm test', label: null });
     ra.finish(0);
     await tick();
     expect(ra.captured).toHaveLength(1); // idle
 
-    // Finish while idle → async readOutput → enqueue → wake.
-    holder.onEvent({ type: 'bg_ended', processId: 'p1', status: 'exited', exitCode: 0 });
+    // Finish while idle → async readBgSummary (head + real tail) → wake.
+    holder.onEvent({ type: 'bg_ended', processId: 'p1', status: 'exited', exitCode: 1 });
     await tick();
-    await tick(); // extra: the readOutput promise + microtask drain
+    await tick(); // extra: the two readOutput promises + microtask drain
     expect(ra.captured).toHaveLength(2);
     const prompt = ra.captured[1]?.configs[0]?.userPrompt ?? '';
     expect(prompt).toContain('[background]');
     expect(prompt).toContain('read complete output with bash_output');
-    expect(prompt).toContain('Tests: 12 passed'); // the inlined head-tail
+    expect(prompt).toContain('starting tests'); // head
+    expect(prompt).toContain('FAIL: 3 tests failed'); // the REAL tail — the fix
+    expect(prompt).toContain('elided'); // the head-tail elision marker
     ra.finish(1);
     await tick();
     stdin.feed('\x04');

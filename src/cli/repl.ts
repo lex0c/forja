@@ -21,6 +21,7 @@
 
 import { existsSync } from 'node:fs';
 import { basename, join } from 'node:path';
+import type { BgManager } from '../bg/index.ts';
 import { resolveProviderEffort } from '../harness/effort.ts';
 import {
   type BgManagerHolder,
@@ -720,12 +721,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
             try {
               const mgr = bgManagerHolder.manager;
               if (mgr !== undefined) {
-                const out = await mgr.readOutput(processId, {
-                  sinceStdout: 0,
-                  sinceStderr: 0,
-                  maxBytes: BG_SUMMARY_READ_BYTES,
-                });
-                summary = bgOutputSummary(out.stdout, out.stderr);
+                summary = await readBgSummary(mgr, processId);
               }
             } catch {
               // Best-effort: a read failure just drops the inline summary;
@@ -1440,30 +1436,53 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     n.summary === undefined
       ? formatNotificationHeadline(n)
       : `${formatNotificationHeadline(n)}\n${n.summary}`;
-  // Bytes read per stream when building the inline head-tail. Covers the
-  // common case whole; for an output larger than this the head-tail is
-  // taken over the leading window (full output via bash_output).
-  const BG_SUMMARY_READ_BYTES = 64 * 1024;
-  const BG_SUMMARY_HEAD = 1200;
-  const BG_SUMMARY_TAIL = 1200;
-  // Compact head-tail of a finished process's output for the inline
-  // notification summary. Combines stdout + labeled stderr, then caps
-  // with a head+tail window. Undefined when the process was silent.
-  const bgOutputSummary = (stdout: string, stderr: string): string | undefined => {
+  // Head + tail caps for the inline summary. The tail is bigger: for a
+  // build/test, the RESULT (pass/fail counts, errors) lives at the END.
+  const BG_SUMMARY_HEAD = 500;
+  const BG_SUMMARY_TAIL = 2000;
+  // Build a compact head-tail of a finished process's output for the
+  // inline notification. The TAIL is the REAL end of the stream (not the
+  // end of a leading window) — so a multi-MB run still surfaces the
+  // failures at the bottom. First read gets the heads + `pending` counts
+  // (→ totals); a second read fetches the true tail of each stream when
+  // there is one. Two small reads, observational (since:* does not
+  // advance the persisted cursor). Undefined when the process was silent.
+  const readBgSummary = async (mgr: BgManager, processId: string): Promise<string | undefined> => {
+    const lead = await mgr.readOutput(processId, {
+      sinceStdout: 0,
+      sinceStderr: 0,
+      maxBytes: BG_SUMMARY_HEAD,
+    });
+    const stdoutTotal = lead.stdout.length + lead.stdoutPending;
+    const stderrTotal = lead.stderr.length + lead.stderrPending;
+    let tailStdout = '';
+    let tailStderr = '';
+    if (stdoutTotal > BG_SUMMARY_HEAD || stderrTotal > BG_SUMMARY_HEAD) {
+      const tail = await mgr.readOutput(processId, {
+        sinceStdout: Math.max(0, stdoutTotal - BG_SUMMARY_TAIL),
+        sinceStderr: Math.max(0, stderrTotal - BG_SUMMARY_TAIL),
+        maxBytes: BG_SUMMARY_TAIL,
+      });
+      tailStdout = tail.stdout;
+      tailStderr = tail.stderr;
+    }
+    // Per-stream: head is everything (small); the tail read at since:0 is
+    // everything (total <= TAIL); else head + tail, with an elision
+    // marker (large) or a bare "…" when the two nearly meet — never drop
+    // the start.
+    const combine = (head: string, total: number, tail: string): string => {
+      if (total <= BG_SUMMARY_HEAD) return head.trim();
+      if (total <= BG_SUMMARY_TAIL) return tail.trim(); // tail (since:0) is the whole stream
+      const elided = total - BG_SUMMARY_HEAD - BG_SUMMARY_TAIL;
+      const marker = elided > 0 ? `… [${elided} bytes elided — bash_output for full] …` : '…';
+      return `${head.trim()}\n${marker}\n${tail.trim()}`;
+    };
     const parts: string[] = [];
-    const out = stdout.trim();
-    const err = stderr.trim();
+    const out = combine(lead.stdout, stdoutTotal, tailStdout);
+    const err = combine(lead.stderr, stderrTotal, tailStderr);
     if (out.length > 0) parts.push(out);
     if (err.length > 0) parts.push(`[stderr]\n${err}`);
-    if (parts.length === 0) return undefined;
-    const combined = parts.join('\n');
-    if (combined.length <= BG_SUMMARY_HEAD + BG_SUMMARY_TAIL + 64) return combined;
-    const elided = combined.length - BG_SUMMARY_HEAD - BG_SUMMARY_TAIL;
-    return (
-      `${combined.slice(0, BG_SUMMARY_HEAD)}\n` +
-      `… [${elided} bytes elided — bash_output for full] …\n` +
-      `${combined.slice(-BG_SUMMARY_TAIL)}`
-    );
+    return parts.length > 0 ? parts.join('\n') : undefined;
   };
   const enqueueNotification = (n: Omit<Notification, 'id'>): void => {
     notifications.push({ ...n, id: String(notifSeq++) });

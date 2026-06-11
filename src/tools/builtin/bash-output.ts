@@ -11,12 +11,21 @@ export interface BashOutputInput {
   // Cap on bytes returned per stream. Defaults to 64 KB to keep a
   // single tool result inside the model's context budget.
   max_bytes?: number;
+  // GREP MODE. When set, scan the WHOLE log (both streams) and return
+  // only lines containing this literal substring — instead of the cursor
+  // window. The cheap way to pull the failures out of a huge output
+  // without paging. Does NOT advance the cursor.
+  grep?: string;
+  // Case-insensitive grep match. Default false. Only meaningful with `grep`.
+  grep_ignore_case?: boolean;
 }
 
 export interface BashOutputOutput {
   process_id: string;
   status: 'running' | 'exited' | 'killed' | 'failed';
   exit_code: number | null;
+  // In grep mode, stdout/stderr hold the MATCHING lines (joined by \n),
+  // not the cursor window; cursors/pending are 0 (grep doesn't advance).
   stdout: string;
   stderr: string;
   // Byte offsets for the NEXT call. Persisted server-side; mirrored
@@ -28,12 +37,17 @@ export interface BashOutputOutput {
   // model should call again to fetch the remainder.
   stdout_pending: number;
   stderr_pending: number;
+  // Present only in grep mode: number of matching lines returned across
+  // both streams, and whether the per-stream match cap was hit (more
+  // matches exist than returned).
+  grep_matches?: number;
+  grep_truncated?: boolean;
 }
 
 export const bashOutputTool: Tool<BashOutputInput, BashOutputOutput> = {
   name: 'bash_output',
   description:
-    'Read incremental stdout/stderr from a background process (bash_background). Advances a server-side cursor so each call returns only new bytes since the last read. Use it to inspect a running process — you are notified separately when one finishes, so polling for completion is unnecessary.',
+    'Read stdout/stderr from a background process (bash_background). Default mode reads the incremental window since a server-side cursor (inspect a running process; you are notified separately when one finishes, so polling for completion is unnecessary). Pass `grep` to instead scan the WHOLE log and return only matching lines — the cheap way to pull failures out of a huge output without paging the cursor.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -57,6 +71,15 @@ export const bashOutputTool: Tool<BashOutputInput, BashOutputOutput> = {
         type: 'integer',
         minimum: 1,
         description: 'Cap on bytes returned per stream. Defaults to 65536 (64 KB).',
+      },
+      grep: {
+        type: 'string',
+        description:
+          'Grep mode: return only lines of the full log containing this literal substring (not a regex). Ignores cursor/max_bytes; does not advance the cursor.',
+      },
+      grep_ignore_case: {
+        type: 'boolean',
+        description: 'Case-insensitive grep match. Only meaningful with `grep`.',
       },
     },
     required: ['process_id'],
@@ -132,7 +155,31 @@ export const bashOutputTool: Tool<BashOutputInput, BashOutputOutput> = {
         return toolError(ERROR_CODES.invalidArg, 'max_bytes must be a positive integer (>=1)');
       }
     }
+    if (args.grep !== undefined && (typeof args.grep !== 'string' || args.grep.length === 0)) {
+      return toolError(ERROR_CODES.invalidArg, 'grep must be a non-empty string');
+    }
     try {
+      // Grep mode: scan the whole log, return only matching lines. No
+      // cursor window, no advance — the cheap path for huge outputs.
+      if (args.grep !== undefined) {
+        const g = await ctx.bgManager.grepOutput(args.process_id, {
+          pattern: args.grep,
+          ...(args.grep_ignore_case === true ? { ignoreCase: true } : {}),
+        });
+        return {
+          process_id: args.process_id,
+          status: g.status,
+          exit_code: g.exitCode,
+          stdout: g.stdoutMatches.join('\n'),
+          stderr: g.stderrMatches.join('\n'),
+          stdout_cursor: 0,
+          stderr_cursor: 0,
+          stdout_pending: 0,
+          stderr_pending: 0,
+          grep_matches: g.stdoutMatches.length + g.stderrMatches.length,
+          grep_truncated: g.truncated,
+        };
+      }
       const opts: { sinceStdout?: number; sinceStderr?: number; maxBytes?: number } = {};
       if (args.since_stdout !== undefined) opts.sinceStdout = args.since_stdout;
       if (args.since_stderr !== undefined) opts.sinceStderr = args.since_stderr;

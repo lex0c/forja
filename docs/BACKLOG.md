@@ -2,6 +2,28 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-11] bg: real output tail in the notification + streaming grep
+
+Two threads, both about pulling signal out of a large bg output.
+
+(1) Real tail — the notification head-tail was taking the tail of the LEADING
+64KB window, not the real end of the stream. For a `bun test` with 1.3MB of
+output and the failures at the bottom, the inline summary showed only `(pass)` —
+useless exactly when it matters (exit 1). `readBgSummary` now does two small
+observational reads: a head read whose `pending` gives the true total, then a
+tail read at `since: total - TAIL` — the real last bytes, where a build/test puts
+its result. `combine` shows head only / tail only / head + elision + tail, never
+dropping the start.
+
+(2) Streaming grep — `bash_output({ grep, grep_ignore_case? })` scans the WHOLE
+log and returns only matching lines (literal substring, no regex → no ReDoS),
+instead of paging the cursor window into context. Backed by a new
+`BgManager.grepOutput` that STREAMS each log file line-by-line (never loads a
+multi-MB log whole) and stops early at the match cap (the for-await break cancels
+the stream). The cheap, permission-engine-free path for "find the failures in a
+huge output" — which is what the model could not do in a live test (it tried to
+grep the log via bash and hit the protected-zone deny on /run).
+
 ## [2026-06-11] bg notification head-tail, tool descriptions, + chip-persistence fix
 
 Three threads of the bash_background-as-real-background work.

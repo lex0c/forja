@@ -295,9 +295,33 @@ export interface StatusSnapshot {
   exitedAt: number | null;
 }
 
+export interface GrepOutputInput {
+  // Literal substring to match (NOT a regex — avoids ReDoS from
+  // model-supplied patterns). A line matches if it contains this.
+  pattern: string;
+  // Cap on matching lines returned per stream. Default 200.
+  maxMatches?: number;
+  // Case-insensitive substring match. Default false.
+  ignoreCase?: boolean;
+}
+
+export interface GrepOutputResult {
+  status: BgProcess['status'];
+  exitCode: number | null;
+  stdoutMatches: string[];
+  stderrMatches: string[];
+  // True if either stream had more matches than `maxMatches`.
+  truncated: boolean;
+}
+
 export interface BgManager {
   spawn(input: SpawnInput): Promise<SpawnResult>;
   readOutput(id: string, opts?: ReadOutputInput): Promise<ReadOutputResult>;
+  // Scan the WHOLE log of a process for lines containing `pattern` and
+  // return just those — the cheap path for "find the failures in a huge
+  // output" without paging the cursor window. Reads the log files
+  // directly server-side; does NOT advance the readOutput cursor.
+  grepOutput(id: string, opts: GrepOutputInput): Promise<GrepOutputResult>;
   kill(id: string, opts?: KillInput): Promise<KillResult>;
   // Thin status accessor — returns null when the id is unknown.
   // Used by the wait subsystem's `process_exit` polling loop and
@@ -1291,6 +1315,65 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
   // `bash_list` (recover a lost process_id).
   const list = (): BgProcess[] => listBgProcessesBySession(db, sessionId);
 
+  // Server-side grep over a process's whole log (both streams). Streams
+  // each log file line-by-line and returns only matching lines — the
+  // cheap path for "find the failures in a multi-MB output" without
+  // paging the cursor window into the model's context. Substring match
+  // (no regex). Streaming (not a whole-file read) keeps a huge log out of
+  // memory, and the match cap stops the read early.
+  const grepOutput = async (id: string, opts: GrepOutputInput): Promise<GrepOutputResult> => {
+    const row = getBgProcess(db, id);
+    if (row === null) throw new Error(`bg process not found: ${id}`);
+    if (row.sessionId !== sessionId) throw new Error(`bg process not in this session: ${id}`);
+    const maxMatches = opts.maxMatches !== undefined && opts.maxMatches > 0 ? opts.maxMatches : 200;
+    const ignoreCase = opts.ignoreCase === true;
+    const needle = ignoreCase ? opts.pattern.toLowerCase() : opts.pattern;
+    const matches = (line: string): boolean =>
+      (ignoreCase ? line.toLowerCase() : line).includes(needle);
+    const grepFile = async (path: string): Promise<{ lines: string[]; hitCap: boolean }> => {
+      const lines: string[] = [];
+      const decoder = new TextDecoder();
+      let buf = '';
+      try {
+        for await (const chunk of Bun.file(path).stream()) {
+          buf += decoder.decode(chunk, { stream: true });
+          const parts = buf.split('\n');
+          // Last part is an incomplete line (no trailing newline yet) —
+          // carry it to the next chunk; `buf` never holds more than one
+          // pending line, so a multi-MB log stays out of memory.
+          buf = parts.pop() ?? '';
+          for (const line of parts) {
+            if (matches(line)) {
+              lines.push(line);
+              // Reaching the cap returns early; the for-await break
+              // cancels the underlying stream (no further read).
+              if (lines.length >= maxMatches) return { lines, hitCap: true };
+            }
+          }
+        }
+        buf += decoder.decode(); // flush any trailing multibyte remainder
+        if (buf.length > 0 && matches(buf)) {
+          lines.push(buf);
+          if (lines.length >= maxMatches) return { lines, hitCap: true };
+        }
+      } catch {
+        // Log missing/unreadable (never spawned, cleaned up, mid-read
+        // truncation) — return whatever matched; the row still gives
+        // status. No error rather than failing the whole grep.
+      }
+      return { lines, hitCap: false };
+    };
+    const out = await grepFile(row.stdoutLogPath);
+    const err = await grepFile(row.stderrLogPath);
+    return {
+      status: row.status,
+      exitCode: row.exitCode,
+      stdoutMatches: out.lines,
+      stderrMatches: err.lines,
+      truncated: out.hitCap || err.hitCap,
+    };
+  };
+
   // Wire the abort signal AFTER cleanup is defined so the listener
   // can reference it. `once: true` means the listener runs at most
   // once even if the signal fires multiple times. The catch swallows
@@ -1313,5 +1396,5 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     }
   }
 
-  return { spawn, readOutput, kill, getStatus, cleanup, liveCount, list };
+  return { spawn, readOutput, kill, getStatus, cleanup, liveCount, list, grepOutput };
 };

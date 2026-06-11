@@ -182,4 +182,58 @@ describe('bash_output tool', () => {
     if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
     expect(r.stdout).toContain('hello');
   });
+
+  describe('grep mode', () => {
+    test('returns only matching lines from the whole log', async () => {
+      const spawned = await mgr.spawn({
+        command: 'echo "line FAIL one"; echo "line ok"; echo "another FAIL here"',
+      });
+      await waitForExit(spawned.id);
+      const ctx = makeCtx({ sessionId, bgManager: mgr });
+      const r = await bashOutputTool.execute({ process_id: spawned.id, grep: 'FAIL' }, ctx);
+      if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
+      expect(r.grep_matches).toBe(2);
+      expect(r.stdout).toContain('line FAIL one');
+      expect(r.stdout).toContain('another FAIL here');
+      expect(r.stdout).not.toContain('line ok');
+      expect(r.stdout_cursor).toBe(0); // grep does not advance the cursor
+      expect(r.grep_truncated).toBe(false);
+    });
+
+    test('ignore_case matches regardless of case', async () => {
+      const spawned = await mgr.spawn({ command: 'echo "ERROR: boom"; echo "fine"' });
+      await waitForExit(spawned.id);
+      const ctx = makeCtx({ sessionId, bgManager: mgr });
+      const r = await bashOutputTool.execute(
+        { process_id: spawned.id, grep: 'error', grep_ignore_case: true },
+        ctx,
+      );
+      if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
+      expect(r.grep_matches).toBe(1);
+      expect(r.stdout).toContain('ERROR: boom');
+    });
+
+    test('case-sensitive by default misses a different-case match', async () => {
+      const spawned = await mgr.spawn({ command: 'echo "ERROR: boom"' });
+      await waitForExit(spawned.id);
+      const ctx = makeCtx({ sessionId, bgManager: mgr });
+      const r = await bashOutputTool.execute({ process_id: spawned.id, grep: 'error' }, ctx);
+      if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
+      expect(r.grep_matches).toBe(0);
+    });
+
+    test('empty grep string is rejected', async () => {
+      const ctx = makeCtx({ sessionId, bgManager: mgr });
+      const r = await bashOutputTool.execute({ process_id: 'whatever', grep: '' }, ctx);
+      expect(isToolError(r)).toBe(true);
+    });
+
+    test('caps matches and flags truncation (manager-level, exercises the streaming early-stop)', async () => {
+      const spawned = await mgr.spawn({ command: 'echo "FAIL a"; echo "FAIL b"; echo "FAIL c"' });
+      await waitForExit(spawned.id);
+      const r = await mgr.grepOutput(spawned.id, { pattern: 'FAIL', maxMatches: 2 });
+      expect(r.stdoutMatches.length).toBe(2);
+      expect(r.truncated).toBe(true);
+    });
+  });
 });
