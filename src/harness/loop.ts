@@ -2997,6 +2997,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             config.permissionEngine.check(toolName, category, args),
           todoStore,
           ...(bgManager !== undefined ? { bgManager } : {}),
+          // Session-scoped reminder scheduler (ORCHESTRATION.md §3B.9).
+          // Owned by the REPL (like the bgManagerHolder); the loop just
+          // forwards it to the reminder tools. Absent in one-shot runs.
+          ...(config.reminderScheduler !== undefined
+            ? { reminderScheduler: config.reminderScheduler }
+            : {}),
           ...(spawnSubagentClosure !== undefined ? { spawnSubagent: spawnSubagentClosure } : {}),
           ...(subagentHandleStore !== undefined ? { subagentHandleStore } : {}),
           // Slice 157 (review — phase 2 of macOS /tmp isolation). Per-

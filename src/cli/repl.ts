@@ -37,6 +37,7 @@ import type { HookChainResult, HookEventPayload } from '../hooks/types.ts';
 import type { PolicySource } from '../permissions/index.ts';
 import { createDefaultRegistry } from '../providers/registry.ts';
 import { buildAutoTerse } from '../recap/auto-display.ts';
+import { createReminderScheduler } from '../reminders/index.ts';
 import { stripAnsi } from '../sanitize/index.ts';
 import {
   HISTORY_CAP,
@@ -748,6 +749,23 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   };
   baseConfig.bgManagerHolder = bgManagerHolder;
 
+  // Session-scoped reminder scheduler (ORCHESTRATION.md §3B.9) — the
+  // notification channel's second producer. No holder needed (unlike the
+  // BgManager it doesn't depend on a sessionId): built once here, injected
+  // per turn via baseConfig, torn down in shutdown(). On fire it pushes a
+  // `reminder` notification into the SAME channel as bg_done, driving the
+  // same wake-when-idle path. `onFire` forward-references `enqueueNotification`
+  // (defined ~700 lines down) — safe for the same reason as the holder's
+  // onEvent: a timer only fires at runtime, long after setup (TDZ note on
+  // the holder above applies identically).
+  const reminderScheduler = createReminderScheduler({
+    onFire: (r) => {
+      if (exiting) return; // teardown clears timers; ignore any last fire
+      enqueueNotification({ kind: 'reminder', note: r.note, scheduledAt: r.scheduledAt });
+    },
+  });
+  baseConfig.reminderScheduler = reminderScheduler;
+
   // Permission engine refused to come up (PERMISSION_ENGINE.md §7.2):
   // broken audit chain, invalid policy, install_id I/O failure, or a
   // sandbox required-but-unavailable. `refusing` is terminal — every
@@ -1399,12 +1417,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // above: that's operator intent, this is system events. Each producer
   // enqueues its own `kind`; the channel formats + drains. Idle →
   // auto-drains (wake-when-idle, §3B.4, fires a turn); during a turn →
-  // drains at the next boundary (semi-push). A future reminder tool just
-  // adds a `kind` here — nothing else in the channel changes.
+  // drains at the next boundary (semi-push). The channel is generic over
+  // `kind` — `bg_done` (BgManager, observes exits) and `reminder`
+  // (ReminderScheduler, observes the clock, §3B.9); a new producer just
+  // adds a variant to the union and a `case` to the formatter.
   // `drainNotifications` is forward-declared like `drainInbox` (body
   // assigned after startTurn, since the wake calls startTurn).
-  type Notification = {
-    id: string;
+  type BgDoneNotification = {
     kind: 'bg_done';
     command: string;
     status: 'exited' | 'killed' | 'failed';
@@ -1417,6 +1436,18 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // recoverable via bash_output(processId).
     summary?: string;
   };
+  type ReminderNotification = {
+    kind: 'reminder';
+    // The model-authored context that becomes the wake-turn input — the
+    // reminder's headline IS the note (no separate body/summary).
+    note: string;
+    scheduledAt: number;
+  };
+  // Producer payload (no id yet); `enqueueNotification` stamps the id.
+  type NotificationPayload = BgDoneNotification | ReminderNotification;
+  type Notification =
+    | (BgDoneNotification & { id: string })
+    | (ReminderNotification & { id: string });
   const notifications: Notification[] = [];
   let notifSeq = 0;
   let drainNotifications: () => void = () => {};
@@ -1426,25 +1457,35 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // bg work could ping-pong the session awake forever.
   let consecutiveWakes = 0;
   const MAX_CONSECUTIVE_WAKES = 3;
-  // The headline line — the `● `-able status sentence, no body.
+  // The headline line — the `● `-able status sentence, no body. One
+  // `case` per producer `kind`.
   const formatNotificationHeadline = (n: Notification): string => {
-    // One `kind` today; this grows a switch as producers are added.
-    const code = n.exitCode === null ? '' : ` (exit ${n.exitCode})`;
-    return (
-      `[background] \`${n.command}\` ${n.status}${code}. ` +
-      `process_id=${n.processId} — read complete output with bash_output.`
-    );
+    switch (n.kind) {
+      case 'bg_done': {
+        const code = n.exitCode === null ? '' : ` (exit ${n.exitCode})`;
+        return (
+          `[background] \`${n.command}\` ${n.status}${code}. ` +
+          `process_id=${n.processId} — read complete output with bash_output.`
+        );
+      }
+      case 'reminder':
+        return `[reminder] ${n.note}`;
+    }
   };
-  // Full text fed to the model as the wake-turn input: headline + the
-  // output head-tail when present.
+  // Full text fed to the model as the wake-turn input: headline + any
+  // attached body. Only bg_done carries a body (the output head-tail);
+  // reminder's headline is complete on its own.
   const formatNotification = (n: Notification): string =>
-    n.summary === undefined
-      ? formatNotificationHeadline(n)
-      : `${formatNotificationHeadline(n)}\n${n.summary}`;
+    n.kind === 'bg_done' && n.summary !== undefined
+      ? `${formatNotificationHeadline(n)}\n${n.summary}`
+      : formatNotificationHeadline(n);
   // Head + tail caps for the inline summary. The tail is bigger: for a
   // build/test, the RESULT (pass/fail counts, errors) lives at the END.
-  const enqueueNotification = (n: Omit<Notification, 'id'>): void => {
-    notifications.push({ ...n, id: String(notifSeq++) });
+  const enqueueNotification = (n: NotificationPayload): void => {
+    // Spreading a discriminated union widens `kind` (a known TS quirk),
+    // so cast back to the union after stamping the id — the spread only
+    // adds `id`, the variant fields are untouched.
+    notifications.push({ ...n, id: String(notifSeq++) } as Notification);
     // Wake-when-idle: nothing running → drain now (fires a turn). During
     // a turn, the boundary drain (drainInbox → drainNotifications) gets
     // it instead.
@@ -2126,13 +2167,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     for (const n of drained) {
       const headline = `● ${formatNotificationHeadline(n)}`;
       // One info event per notification (info emits a single leading
-      // blank — separate events would blank-separate every line). The
-      // head-tail rides in the same message, each row indented 4sp so it
-      // sits under the headline text (frame 2sp + the `● ` prefix).
+      // blank — separate events would blank-separate every line). A
+      // bg_done body (output head-tail) rides in the same message, each
+      // row indented 4sp so it sits under the headline text (frame 2sp +
+      // the `● ` prefix). A reminder has no body — headline only.
+      const body = n.kind === 'bg_done' ? n.summary : undefined;
       const message =
-        n.summary === undefined
+        body === undefined
           ? headline
-          : `${headline}\n${n.summary
+          : `${headline}\n${body
               .split('\n')
               .map((l) => `    ${l}`)
               .join('\n')}`;
@@ -2223,6 +2266,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // row stays 'running' and `agent doctor` can surface it.
       }
     }
+    // Session-scoped reminders (ORCHESTRATION.md §3B.9): clear every
+    // pending timer so a fired callback can't run after teardown. Pure
+    // in-memory (no DB write), synchronous, can't throw.
+    reminderScheduler.cleanup();
     closeDb(db);
     // Resume hint. Printed AFTER renderer.close() (no live region to
     // fight) and AFTER db.close() (any teardown diagnostics that
