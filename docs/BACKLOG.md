@@ -2,6 +2,24 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-11] spec: realign §3B with the bash_background implementation
+
+The §3B proposal was written before the code; the implementation diverged in
+three deliberate ways, now folded back into the spec. (1) §3B.3: the completion
+notification goes into a dedicated, generic NOTIFICATION CHANNEL discriminated by
+`kind`, NOT the inbox — operator intent vs system events, and the channel a
+future reminder tool plugs into as another `kind`. (2) §3B.4: dropped the 1500ms
+debounce timer — coalescing is natural (drain all pending into one turn) and the
+consecutive-wake cap backstops turn count; responsiveness for the common single-
+process case beats grouping a rare spaced-out burst. Also dropped the auto-wake
+feature flag: auto-wake is the default, guarded by the five §3B.4 gates, which
+are the real protection (a toggle would just duplicate them). (3) §3B.7: the
+footer shows TWO chips by source (`N bash bg` / `N subagents`), and the wake-turn
+echoes each notification as a `● ` system info line in the scrollback (distinct
+from an operator-submit bar). Anchors updated: STATE_MACHINE §2.2/§9 (channel not
+inbox, no flag) and CONTRACTS §2.6.5d.1 (`BgDoneNotification` not `BgDoneInbox`,
+summary head-tail demoted to a non-normative refinement).
+
 ## [2026-06-11] feat(repl): generic notification channel + wake-when-idle (Slice C)
 
 Replaces the inbox-as-notification hack (Slice B) with a dedicated, generic

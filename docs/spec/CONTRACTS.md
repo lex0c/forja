@@ -245,18 +245,19 @@ Família para processos de longa duração e coordenação não-blocking. Tools 
 
 #### 2.6.5d.1 Lifecycle persistente e o envelope `bg_done`
 
-`bash_background` roda o processo **genuinamente em background** (`ORCHESTRATION.md §3B`): sobrevive ao fim do turn, vive até término natural / `bash_kill` / exit da sessão (cross-turn, **não** cross-process), e **notifica** o modelo na conclusão em vez de exigir poll. Na conclusão, o `BgManager` empurra um item no INBOX in-memory (`MEMORY.md`):
+`bash_background` roda o processo **genuinamente em background** (`ORCHESTRATION.md §3B`): sobrevive ao fim do turn, vive até término natural / `bash_kill` / exit da sessão (cross-turn, **não** cross-process), e **notifica** o modelo na conclusão em vez de exigir poll. Na conclusão, o REPL empurra um item no **canal de notifications** in-memory — distinto do inbox, genérico e discriminado por `kind` (`ORCHESTRATION.md §3B.3`; uma futura tool de reminder adiciona outro `kind`):
 
 ```ts
-interface BgDoneInbox {
+interface BgDoneNotification {
   kind: 'bg_done';
   processId: string;
   command: string;
   status: 'exited' | 'killed' | 'failed';
   exitCode: number | null;
-  summary: string;   // head-tail do output por OUTPUT_POLICY.md §6; full via bash_output(processId)
 }
 ```
+
+O output completo fica recuperável via `bash_output(processId)`; inline de um head-tail na notificação é refinamento, não normativo.
 
 - Output é durável (logs em disco + row em `background_processes`); `bash_output` o recupera **mesmo após o término**, cross-turn e pós-compaction, enquanto o modelo tiver o `process_id`.
 - `bash_list` recupera o `process_id` perdido (turns depois, compaction) — snapshot read-only dos bg da sessão; análogo de `task_list`.
