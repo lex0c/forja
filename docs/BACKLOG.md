@@ -2,6 +2,31 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-11] bg: bound grep output by bytes + memory, not just matches
+
+Robustness review of the branch (against develop) flagged grep mode as
+the one read path with no byte ceiling. It exists for multi-MB logs but
+capped only the line COUNT (200), and lines have no intrinsic length: a
+minified one-liner or a `\r`-only progress stream could return megabytes
+straight into the model's context, bypassing the 64 KB cap the cursor
+path enforces; a stream with no newline at all could grow the
+pending-line carry to the whole file in heap.
+
+Three streaming guards (a huge log is never read whole): a 2 KB per-line
+clip centered on the FIRST match (a head cut could hide the needle
+itself), a 64 KB per-stream byte budget mirroring the cursor read cap
+(stops early, sets `truncated`), and a 64 KB pending-carry cap that
+synthesizes a line break for newline-less streams — match + clip what we
+have, keep a `needle-1` overlap so an occurrence straddling the cut still
+matches without double-counting a whole one. Verified the overlap math
+(a complete match can't survive in needle-1 chars, so no duplicates; a
+split needle's prefix is preserved) and that the clip window always keeps
+the match visible. Also documented the bgManagerHolder TDZ (its onEvent
+closes over bindings declared ~800 lines later — safe only because the
+manager is built on the first turn, after setup). F4 (budget/wake-cap
+defer to semi-push) and F5 (SIGKILL skips cleanup → orphaned detached
+children, pre-existing) were reviewed and left as-is.
+
 ## [2026-06-11] repl: byte cursors for the bg_done summary tail
 
 Bug surfaced reviewing the bg summary path. `readBgSummary` computed each
