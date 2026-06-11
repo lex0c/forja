@@ -2,6 +2,19 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-11] feat(tui): split the live footer chip into `bash bg` + `subagents`
+
+Two distinct in-flight signals were collapsing into one. Renamed the bg-process
+chip `N bg process` → `N bash bg`, and added a second chip `N subagents` for
+child runs in flight (`state.subagents`) — a DIFFERENT source than
+`state.bgProcesses`. Both green, both leading the right cluster, both suppressed
+at 0. The operator can now tell "a shell command is running" from "a subagent is
+running" at a glance. Label note: the chip reads `subagents`, not `async`,
+because `subagent_start` carries no sync/async kind — it counts every in-flight
+subagent (task_sync + task_async), so `async` would be imprecise. Reworked the
+old "subagents do not surface" footer test into coverage of the new chip
+(count, suppression, the two sources being independent, green paint).
+
 ## [2026-06-11] feat(tui): `N bg process` footer chip
 
 Surfaces in-flight bash_background processes in the footer (ORCHESTRATION §3B.7).

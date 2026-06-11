@@ -276,24 +276,24 @@ describe('renderFooter', () => {
   });
 
   describe('in-flight bg processes chip (ORCHESTRATION §3B)', () => {
-    test('surfaces a `N bg process` chip counting running bg processes', () => {
+    test('surfaces a `N bash bg` chip counting running bg processes', () => {
       const s = startedSession();
       s.bgProcesses.set('p1', { processId: 'p1', command: 'npm run dev' });
       s.bgProcesses.set('p2', { processId: 'p2', command: 'pytest' });
       const out = renderFooter(s, caps) ?? '';
-      expect(out).toContain('2 bg process');
+      expect(out).toContain('2 bash bg');
     });
 
     test('no bg processes drops the chip entirely', () => {
       const out = renderFooter(startedSession(), caps) ?? '';
-      expect(out).not.toContain('bg process');
+      expect(out).not.toContain('bash bg');
     });
 
     test('leads the right cluster — bg reads before the static model chip', () => {
       const s = startedSession();
       s.bgProcesses.set('p1', { processId: 'p1', command: 'npm run dev' });
       const out = renderFooter(s, caps) ?? '';
-      expect(out.indexOf('1 bg process')).toBeLessThan(out.indexOf('sonnet-4.6'));
+      expect(out.indexOf('1 bash bg')).toBeLessThan(out.indexOf('sonnet-4.6'));
     });
 
     test('painted success (green) — distinct from the dim cumulative chips', () => {
@@ -301,7 +301,7 @@ describe('renderFooter', () => {
       const s = startedSession();
       s.bgProcesses.set('p1', { processId: 'p1', command: 'npm run dev' });
       const out = renderFooter(s, colored) ?? '';
-      expect(out).toContain(`${CSI}32m1 bg process${CSI}0m`);
+      expect(out).toContain(`${CSI}32m1 bash bg${CSI}0m`);
     });
   });
 
@@ -400,18 +400,47 @@ describe('renderFooter', () => {
     });
   });
 
-  test('subagents counter does NOT surface in the footer (chip removed)', () => {
-    const s = startedSession();
-    s.subagents.set('child-1', {
-      subagentId: 'child-1',
-      name: 'explore',
-      goal: 'find auth',
-      progress: '',
-      startedAt: 0,
-      liveCostUsd: 0,
+  describe('in-flight subagents chip (`N subagents`)', () => {
+    const addSubagent = (s: LiveState, id: string): void => {
+      s.subagents.set(id, {
+        subagentId: id,
+        name: 'explore',
+        goal: 'find auth',
+        progress: '',
+        startedAt: 0,
+        liveCostUsd: 0,
+      });
+    };
+
+    test('surfaces a `N subagents` chip counting in-flight subagents (distinct from bg)', () => {
+      const s = startedSession();
+      addSubagent(s, 'child-1');
+      addSubagent(s, 'child-2');
+      const out = renderFooter(s, caps) ?? '';
+      expect(out).toContain('2 subagents');
     });
-    const out = renderFooter(s, caps) ?? '';
-    expect(out).not.toContain('subagents ');
+
+    test('no subagents drops the subagents chip', () => {
+      const out = renderFooter(startedSession(), caps) ?? '';
+      expect(out).not.toContain('subagents');
+    });
+
+    test('bg and subagents chips are independent sources (both can show)', () => {
+      const s = startedSession();
+      s.bgProcesses.set('p1', { processId: 'p1', command: 'npm run dev' });
+      addSubagent(s, 'child-1');
+      const out = renderFooter(s, caps) ?? '';
+      expect(out).toContain('1 bash bg');
+      expect(out).toContain('1 subagents');
+    });
+
+    test('painted success (green)', () => {
+      const colored: Capabilities = { ...caps, color: 'basic' };
+      const s = startedSession();
+      addSubagent(s, 'child-1');
+      const out = renderFooter(s, colored) ?? '';
+      expect(out).toContain(`${CSI}32m1 subagents${CSI}0m`);
+    });
   });
 
   test('parallelStatus does NOT surface subagents/tools chips (chips removed)', () => {

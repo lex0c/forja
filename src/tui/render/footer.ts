@@ -127,7 +127,17 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
   // bgProcesses source, kept one chip.)
   const bgCount = state.bgProcesses.size;
   if (bgCount > 0) {
-    rightParts.push(paint(caps, 'success', `${bgCount} bg process`));
+    rightParts.push(paint(caps, 'success', `${bgCount} bash bg`));
+  }
+  // Subagents in flight (task_sync + task_async — a DIFFERENT source
+  // than bg processes: these are child LLM runs in `state.subagents`,
+  // not shell processes in `state.bgProcesses`). Counts every in-flight
+  // subagent; the start event carries no sync/async kind, so the label
+  // is the precise `subagents`, not `async`. Same live-signal treatment
+  // — leads the right cluster, painted `success`, suppressed at 0.
+  const subagentCount = state.subagents.size;
+  if (subagentCount > 0) {
+    rightParts.push(paint(caps, 'success', `${subagentCount} subagents`));
   }
   if (status.model !== null && status.model !== '') {
     rightParts.push(dim(caps, status.model));
