@@ -121,11 +121,12 @@ Aguardando input do usuário (prompt) ou comando (slash).
 **Invariantes:**
 - `sessions.status = 'idle'`
 - Nenhum step em andamento
-- Nenhum tool call pending
+- Nenhum tool call pending **no escopo do turn**. Processos `bash_background` (`ORCHESTRATION.md §3B`) PODEM seguir rodando durante `idle` — vivem no escopo sessão, não no turn; sua conclusão dispara o wake abaixo.
 - Histórico em SQLite é coerente (último message tem role correto pra próximo input)
 
 **Transições:**
 - `→ running` em `user_prompt` (input enviado)
+- `→ running` em `bg_done` (wake-when-idle, `ORCHESTRATION.md §3B.4`) — um `bash_background` terminou e as guardas passaram (budget disponível, operador não digitando, cap de wakes não atingido). O "input" do turn é a notificação drenada do **canal de notifications** (distinto do inbox), não um prompt do operador. Sem flag de gate; se uma guarda falha, a notificação espera o próximo boundary/`user_prompt` (semi-push), sem esta transição.
 - `→ initializing` em `/clear` (re-entra config)
 - `→ done*` em `Ctrl+D` ou `/exit`
 - `→ paused` em `/pause` (raro)
@@ -852,6 +853,7 @@ Todo subsistema dispara um destes eventos quando força transição. Telemetria 
 | `session_init_ok` | initializing → idle | Session Manager |
 | `session_init_failed` | initializing → error_fatal | Session Manager |
 | `user_prompt` | idle → running | UI |
+| `bg_done` | idle → running | notification channel (wake-when-idle; um `bash_background` terminou + guardas passaram — `ORCHESTRATION.md §3B.4`; sem flag de gate) |
 | `model_done` | running → idle | Provider stream |
 | `model_tool_use` | running → tool_exec (via permission check) | Provider stream |
 | `permission_allow` | running → tool_exec | Permission Engine |

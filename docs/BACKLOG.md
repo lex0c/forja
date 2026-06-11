@@ -2,6 +2,369 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-11] bg: bound grep output by bytes + memory, not just matches
+
+Robustness review of the branch (against develop) flagged grep mode as
+the one read path with no byte ceiling. It exists for multi-MB logs but
+capped only the line COUNT (200), and lines have no intrinsic length: a
+minified one-liner or a `\r`-only progress stream could return megabytes
+straight into the model's context, bypassing the 64 KB cap the cursor
+path enforces; a stream with no newline at all could grow the
+pending-line carry to the whole file in heap.
+
+Three streaming guards (a huge log is never read whole): a 2 KB per-line
+clip centered on the FIRST match (a head cut could hide the needle
+itself), a 64 KB per-stream byte budget mirroring the cursor read cap
+(stops early, sets `truncated`), and a 64 KB pending-carry cap that
+synthesizes a line break for newline-less streams — match + clip what we
+have, keep a `needle-1` overlap so an occurrence straddling the cut still
+matches without double-counting a whole one. Verified the overlap math
+(a complete match can't survive in needle-1 chars, so no duplicates; a
+split needle's prefix is preserved) and that the clip window always keeps
+the match visible. Also documented the bgManagerHolder TDZ (its onEvent
+closes over bindings declared ~800 lines later — safe only because the
+manager is built on the first turn, after setup). F4 (budget/wake-cap
+defer to semi-push) and F5 (SIGKILL skips cleanup → orphaned detached
+children, pre-existing) were reviewed and left as-is.
+
+## [2026-06-11] repl: byte cursors for the bg_done summary tail
+
+Bug surfaced reviewing the bg summary path. `readBgSummary` computed each
+stream's total as `stdout.length + stdoutPending` — mixing units. The bg
+manager speaks BYTES (`stdoutPending`, the `since*` offsets), but
+`stdout.length` is JS UTF-16 code units. A head holding multibyte UTF-8
+undercounts the total, so the follow-up tail read anchors too early and
+`maxBytes: BG_SUMMARY_TAIL` can stop before EOF — dropping the final
+failure lines the wake notification exists to surface (a regression of the
+real-tail fix two entries down, for the multibyte case).
+
+Fix: totals from the returned byte cursors, `stdoutCursor + stdoutPending`
+(cursor is the byte offset just past the head slice). Extracted the
+head-tail builder out of the repl closure into `src/cli/bg-summary.ts`
+(`buildBgSummary`, narrowed to `Pick<BgManager,'readOutput'>`) so the
+byte-offset math — which has now bitten us twice — is unit-testable
+against a stub. Regression test front-loads a multibyte head (400 `€` =
+1200 bytes / 400 code units) past HEAD+TAIL and asserts the unique EOF
+marker survives; under the old code the ~333-byte undercount cut it off.
+
+## [2026-06-11] bg: stdin-reading commands no longer eat the script
+
+Bug surfaced reviewing the bg spawn path. Keeping the command body off
+argv (a `/proc/<pid>/cmdline` info leak) was done by piping it to
+`bash -s`, which reads the program from fd 0 — but `-s` makes fd 0 do
+double duty: program source AND inherited stdin of every command the
+script runs. A `cat`, `read x`, etc. mid-script then swallows the
+remaining script lines (or EOF), so the commands after it silently
+never run (`cat; echo done` → `done` lost).
+
+Fix: run the script through a constant bootstrap,
+`__forja_script="$(cat)"; eval "$__forja_script" </dev/null`. `cat`
+drains the entire script off fd 0 into a variable in one shot (before
+any of it executes), then `eval … </dev/null` runs it with a clean
+stdin — a body-level `cat`/`read` sees EOF, not the program. Body
+still lives only in shell memory, never in argv.
+
+Rejected the temp-file and extra-fd alternatives the review suggested:
+`--tmpfs /tmp` masks a temp script (logDir lands in /tmp under sandbox
+and in tests) and bwrap closes extra fds (no `--keep-fd`), whereas
+fd 0 is already forwarded by both bwrap and sandbox-exec — so the
+bootstrap needs neither. Verified empirically that exit codes, `set
+-e` abort/propagation, explicit `exit N`, `pipefail`, `trap EXIT`, and
+in-script heredocs all behave identically to direct execution; the
+only behavioral change is the script's stdin is now /dev/null instead
+of the residual pipe, which is the fix. Regression test: `echo
+before\ncat\necho after` must emit both `before` and `after`.
+
+## [2026-06-11] audit: harness-injected input is `system`, not `operator`
+
+Closing gap in the bash_background work. Wake-turn notifications and subagent
+seed prompts both carry the provider `user` role but are never typed by a human —
+the harness injects them. Persisting them with the implicit operator attribution
+corrupted `--resume` (a wake notification replayed as if the operator had typed
+it) and misattributed the subagent seed in the child's audit log.
+
+New `messages.source` column (migration 075, `DEFAULT 'operator'` so existing
+rows and real operator turns are byte-identical). An explicit `'system'` source
+is threaded through the wake-turn path (repl `drainNotifications` → `startTurn` →
+loop → `appendUser`) and the subagent seed. `resume-replay` emits a secondary
+info line for `system` rows instead of a `user:submit` event. No CHECK constraint
+on the column — SQLite can't `ADD CONSTRAINT` and `MessageSource` is a closed TS
+union guarding every call site, so a table rebuild wasn't worth it.
+
+## [2026-06-11] bg: real output tail in the notification + streaming grep
+
+Two threads, both about pulling signal out of a large bg output.
+
+(1) Real tail — the notification head-tail was taking the tail of the LEADING
+64KB window, not the real end of the stream. For a `bun test` with 1.3MB of
+output and the failures at the bottom, the inline summary showed only `(pass)` —
+useless exactly when it matters (exit 1). `readBgSummary` now does two small
+observational reads: a head read whose `pending` gives the true total, then a
+tail read at `since: total - TAIL` — the real last bytes, where a build/test puts
+its result. `combine` shows head only / tail only / head + elision + tail, never
+dropping the start.
+
+(2) Streaming grep — `bash_output({ grep, grep_ignore_case? })` scans the WHOLE
+log and returns only matching lines (literal substring, no regex → no ReDoS),
+instead of paging the cursor window into context. Backed by a new
+`BgManager.grepOutput` that STREAMS each log file line-by-line (never loads a
+multi-MB log whole) and stops early at the match cap (the for-await break cancels
+the stream). The cheap, permission-engine-free path for "find the failures in a
+huge output" — which is what the model could not do in a live test (it tried to
+grep the log via bash and hit the protected-zone deny on /run).
+
+## [2026-06-11] bg notification head-tail, tool descriptions, + chip-persistence fix
+
+Three threads of the bash_background-as-real-background work.
+
+(1) Fix — the footer chip vanished on the turn AFTER spawning. The renderer reset
+`state.bgProcesses` at both turn boundaries (`session:start`/`session:end`),
+which was correct when bg processes died at turn end but is now a regression:
+they survive across turns, so zeroing the map drops the `bash bg` chip while the
+process is still running. The original comment literally predicted this under
+"--keep-bg". Removed both resets (only `createInitialState` resets now);
+`subagents` still resets (within-turn). Inverted the test that asserted the old
+reset; added one for `session:end`.
+
+(2) Head-tail inline (Slice B2 of §3B.3) — the bg_done notification now reads the
+process output OBSERVATIONALLY at completion (since:0 doesn't advance the cursor,
+so bash_output still sees everything) and inlines a compact head-tail
+(stdout + labeled stderr, head 1200 + tail 1200, elided middle). The model acts
+on the result in the wake-turn without a bash_output round-trip; the scrollback
+shows the `● ` headline + the head-tail indented beneath it.
+
+(3) Tool descriptions — `bash_background` and `bash_output` described the old
+within-turn/poll model. Rewritten: bash_background now says it persists across
+turns and that you're notified on completion ("do NOT poll"); bash_output is
+repositioned as inspection, not completion-detection. The real win is steering
+the model off the poll loop, which would inflate the tool-result history (the
+dominant cost), not the description's own token count (it's cached).
+
+## [2026-06-11] spec: realign §3B with the bash_background implementation
+
+The §3B proposal was written before the code; the implementation diverged in
+three deliberate ways, now folded back into the spec. (1) §3B.3: the completion
+notification goes into a dedicated, generic NOTIFICATION CHANNEL discriminated by
+`kind`, NOT the inbox — operator intent vs system events, and the channel a
+future reminder tool plugs into as another `kind`. (2) §3B.4: dropped the 1500ms
+debounce timer — coalescing is natural (drain all pending into one turn) and the
+consecutive-wake cap backstops turn count; responsiveness for the common single-
+process case beats grouping a rare spaced-out burst. Also dropped the auto-wake
+feature flag: auto-wake is the default, guarded by the five §3B.4 gates, which
+are the real protection (a toggle would just duplicate them). (3) §3B.7: the
+footer shows TWO chips by source (`N bash bg` / `N subagents`), and the wake-turn
+echoes each notification as a `● ` system info line in the scrollback (distinct
+from an operator-submit bar). Anchors updated: STATE_MACHINE §2.2/§9 (channel not
+inbox, no flag) and CONTRACTS §2.6.5d.1 (`BgDoneNotification` not `BgDoneInbox`,
+summary head-tail demoted to a non-normative refinement).
+
+## [2026-06-11] feat(repl): generic notification channel + wake-when-idle (Slice C)
+
+Replaces the inbox-as-notification hack (Slice B) with a dedicated, generic
+notification channel and the automatic wake (ORCHESTRATION §3B.4). A future
+reminder tool plugs in as another `kind`, nothing else changes.
+
+The channel (`notifications`, discriminated by `kind`, `bg_done` first) is
+DISTINCT from the operator inbox: operator intent vs system events. Behavior:
+idle → `drainNotifications` fires a turn on its own (wake-when-idle); during a
+turn → drains at the boundary (`drainInbox` falls through to it when the inbox is
+empty — operator input has priority, semi-push). The five §3B.4 guards: exiting,
+busy, operator-typing (`input.value` non-empty), consecutive-wake cap (3, reset
+by `startOperatorTurn` on any operator submit — anti-loop), and budget
+(`cumulative.costUsd >= maxCostUsd` → semi-push). Coalescing is natural
+(`splice(0)` drains all pending into one turn); the spec's 1500ms debounce timer
+is deliberately dropped — responsiveness for the common single-process case beats
+grouping a rare spaced-out burst, and the cap already backstops turn count.
+
+Each drained notification is also emitted as a `● `-prefixed system `info` line so
+the wake-turn isn't a ghost: the operator sees in the scrollback WHY the session
+woke (distinct from an operator-submit bar — the whole point of a separate
+channel). The three operator startTurn sites now go through `startOperatorTurn`
+(resets the wake counter). Tests: busy→boundary (semi-push) and idle→wake (a turn
+fired with no operator input). Spec §3B.3/§3B.4/§3B.7 to be realigned next
+(channel-not-inbox, no debounce timer, the bash bg/subagents chips).
+
+## [2026-06-11] feat(repl): bg_done notification on process completion (semi-push)
+
+Slice B of ORCHESTRATION §3B.3. When a bash_background process finishes, the
+holder's `bg_ended` branch enqueues a `bg_done` item into the in-memory inbox —
+`[background] \`<cmd>\` exited (exit N). process_id=… — read its output with
+bash_output.` — which becomes the next turn's input. Without the auto-wake
+(Slice C) this is SEMI-PUSH: it lands on the next turn boundary (drainInbox) or
+the operator's next submit, not a turn fired on its own. Gated on `!exiting` so
+the session-exit cleanup()'s mass SIGKILL doesn't enqueue notifications nobody
+will consume. A per-process `bgCommands` map names the command (bg_ended carries
+only processId/status/exitCode); full output stays recoverable via bash_output.
+
+Test: a bg process finishing mid-turn enqueues the notification, which becomes
+turn 2's input (command + exit + process_id asserted). Adjusted the A2 holder
+smoke test — `bg_ended` now has the enqueue side effect, so the smoke only
+exercises `bg_started`.
+
+Known follow-ups (flagged, not done): the notification renders as an
+operator-style queued bar (origin-distinct, non-editable rendering is a refine),
+and the output head-tail isn't inlined yet (Slice B2). Auto-wake-when-idle is
+Slice C.
+
+## [2026-06-11] feat(tui): split the live footer chip into `bash bg` + `subagents`
+
+Two distinct in-flight signals were collapsing into one. Renamed the bg-process
+chip `N bg process` → `N bash bg`, and added a second chip `N subagents` for
+child runs in flight (`state.subagents`) — a DIFFERENT source than
+`state.bgProcesses`. Both green, both leading the right cluster, both suppressed
+at 0. The operator can now tell "a shell command is running" from "a subagent is
+running" at a glance. Label note: the chip reads `subagents`, not `async`,
+because `subagent_start` carries no sync/async kind — it counts every in-flight
+subagent (task_sync + task_async), so `async` would be imprecise. Reworked the
+old "subagents do not surface" footer test into coverage of the new chip
+(count, suppression, the two sources being independent, green paint).
+
+## [2026-06-11] feat(tui): `N bg process` footer chip
+
+Surfaces in-flight bash_background processes in the footer (ORCHESTRATION §3B.7).
+A green `N bg process` chip leads the footer's right cluster — painted `success`,
+not `dim`, since it's the one chip there that reflects work running *now*, not
+cumulative session state. Now that bg processes survive the turn boundary, it's
+also the operator's cue that a launched command is still alive between turns.
+Reads `state.bgProcesses.size` (fed by the REPL holder's onEvent → bus → reducer),
+suppressed at 0. Replaces the old "bg do not surface" footer test with coverage
+of the chip (count, suppression, lead position, green paint).
+
+Note: this overlaps the `N async` chip on branch feat/tui-async-footer-chip (same
+`bgProcesses` source, same slot). On merge, keep one — `N bg process` is the
+chosen label.
+
+## [2026-06-11] feat(repl): wire the session-scoped BgManager holder
+
+The REPL half of ORCHESTRATION §3B (the loop half landed in the prior commit).
+The REPL builds one `BgManagerHolder` at boot and injects it into `baseConfig`,
+so every turn shares it and bash_background processes survive the turn boundary.
+The holder's `onEvent` is a pass-through sink that turns the loop's bg
+HarnessEvents into the bus UIEvents (bg:start/bg:end) the renderer's bgProcesses
+reducer consumes — emitted on the bus directly, not via a per-turn adapter, so a
+process exiting while the REPL is idle still updates that state. `shutdown()`
+calls `manager.cleanup()` at session exit (after renderer.close, before closeDb),
+which is now the only place bg processes are torn down. `harness/index.ts`
+re-exports `BgManagerHolder`. Tests: the holder is injected into every turn and
+is the SAME instance across turns (session-scoped); the onEvent sink is a
+function and routing it doesn't throw. The bg_done notification + wake-when-idle
+is the next slice — its hook is already marked in the onEvent body.
+
+## [2026-06-11] feat(harness): session-scoped BgManager holder (loop side)
+
+Second slice of ORCHESTRATION §3B — the loop half of making bg processes survive
+the turn. The BgManager can't be built at boot like `todoStore` (it needs the
+sessionId, which only resolves on the first turn), so `HarnessConfig` gains a
+mutable `bgManagerHolder` (`BgManagerHolder`): the loop builds the manager on the
+first turn and stores it; later turns reuse it. Three behavior changes when a
+holder is injected: (1) the manager is NOT rebuilt per turn; (2) the per-turn
+`abortSignal` is NOT wired into it — a session-scoped manager must outlive the
+turn, and a turn signal would SIGKILL surviving processes the moment the spawning
+turn ends; (3) the outer-finally cleanup runs ONLY when the loop owns the manager
+(no holder = one-shot), mirroring the `todoStore` ownership check — the holder
+owner (the REPL) calls `cleanup()` at session exit. The manager's `onEvent` is
+rewired to route through `holder.onEvent` (cross-turn sink) instead of the dead
+turn's `config.onEvent`.
+
+One-shot runs and subagents pass no holder, so their behavior is unchanged
+(signal wired, killed at run end). Tests: with a holder the bg process survives
+the turn (status `running`, not `killed`) and dies on manual `cleanup()`; events
+route through the holder sink not `config.onEvent`; a second turn reuses the same
+manager instance. The REPL side (create/inject the holder, route events, cleanup
+at exit) is the next slice; until then the infra is tested but has no consumer.
+
+## [2026-06-11] feat(tools): bash_list — snapshot of session bg processes
+
+First implementation slice of `ORCHESTRATION.md §3B` (the bash_background-as-real-
+background rewrite). `bash_list` is the model's recovery path for a lost
+`process_id` (across turns / after compaction) — the bg analogue of `task_list`.
+Chosen as the opening slice because it's read-only, isolated (no loop/repl/
+lifecycle changes), and testable on its own.
+
+`BgManager` gains a `list()` that reads the durable `background_processes` rows
+(not the in-memory `live` map), so it surfaces processes that already exited. The
+tool returns a subset row (`process_id`, command, label, status, exit_code,
+spawned_at) plus full-set `running`/`total` counts, with an optional status
+filter applied in-process. Category `misc` (like bash_output/bash_kill — no
+`args.command` to pass the bash gate), `requiresBgManager: true`.
+
+Remaining slices: BgManager session-scoped (survive the turn) → notify channel
+(bg_done → inbox) → wake-when-idle + guards → UI/flags.
+
+## [2026-06-11] spec: bash_background genuinely persistent + notify + wake
+
+Spec-only PR (code follows, spec-first). `bash_background` is a "background" tool
+that doesn't actually run in the background: the BgManager is per-`runAgent` and
+its `cleanup()` SIGKILLs every process in the outer finally of every turn, so a
+process launched "in the background" dies the moment the turn closes — the tool's
+purpose is nullified. This rewrites its operational semantics so it runs
+genuinely in the background.
+
+New `ORCHESTRATION.md §3B` is the normative core: (1) cross-turn lifecycle —
+BgManager becomes session-scoped (injected by the REPL, like `todoStore`),
+`cleanup()` runs only at session exit; a process lives until natural exit /
+`bash_kill` / session exit; cross-turn, NOT cross-process (dies with the agent,
+no daemon — the §0 "no cross-session background" rule holds). (2) durable output
+— no new storage; logs on disk + the `background_processes` row already make
+output recoverable cross-turn and post-compaction via `bash_output` (reads any
+status); a new `bash_list` recovers a lost `process_id`. (3) completion
+notification — on settle the BgManager pushes a `bg_done` item into the in-memory
+inbox (head-tailed per OUTPUT_POLICY) through a session-scoped sink, not the dead
+turn's onEvent. (4) automatic wake-when-idle — a process finishing while idle
+fires a turn, gated by measured guards (coalescing/debounce, budget→semi-push,
+operator-typing, consecutive-wake cap, user-submit precedence). Default posture:
+persistence+notify is the new baseline (the fix), behind a deprecated
+`bash.background_kill_at_turn_end` escape hatch; auto-wake ships opt-in behind
+experimental `bash.background_auto_wake`.
+
+Coherence anchors: `CONTRACTS.md §2.6.5d` — `bash_background` row updated, new
+`bash_list` row, and §2.6.5d.1 (the `bg_done` envelope + recovery); `AGENTIC_CLI`
+§0 invariant (cross-turn-not-cross-session) + tool list; `STATE_MACHINE.md §2.2
+[idle]` transition on `bg_done` + in-flight-during-idle invariant, and §9 event
+table.
+
+This supersedes the abandoned `spec/detached-subagents-wake` branch (which
+modeled this as a `task_detach` SUBAGENT mode — wrong target; the operator wants
+detached bash COMMANDS, and bash_background already exists as the base).
+
+## [2026-06-10] chore(tools): withdraw monitor / wait_for from the model surface
+
+The model should no longer see or call `monitor` and `wait_for`. Rather than
+delete them, withdraw only the model-facing surface: dropped both from
+`BUILTIN_TOOLS` (so `buildToolDefs` never advertises them to any provider) while
+keeping the tool modules, their `index.ts` re-exports, and the underlying
+`src/wait/` subsystem intact — still importable internally and by tests, and the
+display vocab stays so historical audit rows that reference these calls still
+render. Removed them from the two playbooks that declared them (`debug`,
+`perf-investigate`); `perf-investigate`'s body said "you wait via `wait_for`" —
+now "poll its completion with `bash_output`" (bash_background stays). Net effect:
+the bash_background workflow loses event-driven waiting and falls back to polling
+via `bash_output`. Updated the bootstrap toolset assertion to match.
+
+## [2026-06-10] feat(tui): in-flight async chip in the footer
+
+The footer reserved a `bg N` token (UI.md §4.10.6) for background processes
+but then dropped it as low signal-to-noise on 80-col. The data
+(`state.bgProcesses`, fed by the `bg:start`/`bg:end` event chain — BgManager
+→ `bg_started` HarnessEvent → adapter → reducer) was tracked but never drawn.
+Restored it scoped to *active* async only: a `N async` chip leading the
+footer's right cluster, painted `success` (green) so the one "running now"
+signal stands apart from the dim cumulative chips
+(model/tokens/cost). Suppressed at size 0, so it's never idle-session
+decoration — it appears only while a `bash_background` process is alive and
+collapses the instant the last one ends. Verified end-to-end (bg_started →
+adapter → applyEvent → footer renders the chip); the earlier "not showing"
+was a short-lived process, not a wiring bug.
+
+Drive-by, from an audit of the touched function: extracted `interruptCue()` —
+the `softInterrupted ? 'esc again to force' : 'esc to interrupt'` flip was
+duplicated inline in the slash and mode-cue branches (drift risk). Strengthened
+the "exit cue beats interrupt cue" test (it set `activeTools` but not `busy`, so
+`isRunning` was false and the assertion passed vacuously — now sets `busy`, drops
+the dead `activeTools`). Added the missing slash-open + `softInterrupted` case.
+(Note: the `N async` chip described here was relabeled to `N bg process` when
+this branch merged — see the 2026-06-11 entry; the `interruptCue` refactor stays.)
+
 ## [2026-06-10] fix(repl): boot parity with the one-shot harness
 
 `BootstrapResult` is consumed by BOTH `cli/run.ts` (one-shot) and `cli/repl.ts`

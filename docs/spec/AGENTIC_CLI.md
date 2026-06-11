@@ -123,6 +123,7 @@ Pilha de verificação por custo (latência típica, custo USD por chamada):
 - Sweeps de retenção (eviction tombstone purge, provenance prune, governance proposal expire) rodam **at boot**, com janela documentada (90d / 30d) — não em timer/cron interno.
 - Detectores e governance que precisam de "monitoramento contínuo" devem ser reformulados como "verificação at boot" ou "verificação at step boundary" dentro da sessão.
 - Subagents existem e correm async, mas dentro do escopo de **uma sessão** (`task_async` handle store é drenado no outer finally do `runAgent`).
+- `bash_background` roda processos que sobrevivem ao **turn** mas **não** à sessão (`ORCHESTRATION.md §3B`): o `BgManager` é session-scoped e seu `cleanup()` mata tudo no exit. Cross-turn dentro de um processo, não cross-session — a regra acima permanece (nada sobrevive ao exit do agente; não há daemon).
 - Cron / scheduled work cross-session é responsabilidade do operator (cron + `agent` invocation), não do binário.
 
 **Por que:** processo background introduz classe inteira de bugs (zombie processes, db lock contention, signal handling em ambientes restritivos, recovery após crash) que a infra atual não modela. Inverter essa decisão requer projetar lifecycle de processo separado, IPC entre instâncias, lock files, etc. — escopo de subsistema novo.
@@ -1113,9 +1114,10 @@ interface Tool<I, O> {
 
 **Execução**
 - `bash` — com timeout, abort, env limpo, sandbox opcional
-- `bash_background` — spawna processo, retorna `process_id`
-- `bash_output` — lê stdout/stderr novo desde último read
+- `bash_background` — spawna processo que roda genuinamente em background: sobrevive ao turn, notifica na conclusão (`ORCHESTRATION.md §3B`)
+- `bash_output` — lê stdout/stderr novo desde último read (de processo em qualquer status)
 - `bash_kill` — SIGTERM com fallback SIGKILL
+- `bash_list` — snapshot dos bg processes da sessão (recupera `process_id` perdido)
 
 **Monitoring & wait**
 - `wait_for(condition, options)` — bloqueia até condition met OR timeout; **zero LLM calls durante o wait**

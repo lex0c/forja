@@ -21,6 +21,7 @@ const msg = (role: 'user' | 'assistant' | 'tool', content: unknown): Message => 
   createdAt: 0,
   promptHash: null,
   effort: null,
+  source: 'operator',
 });
 
 describe('messagesToProviderMessages', () => {

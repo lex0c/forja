@@ -182,4 +182,104 @@ describe('bash_output tool', () => {
     if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
     expect(r.stdout).toContain('hello');
   });
+
+  describe('grep mode', () => {
+    test('returns only matching lines from the whole log', async () => {
+      const spawned = await mgr.spawn({
+        command: 'echo "line FAIL one"; echo "line ok"; echo "another FAIL here"',
+      });
+      await waitForExit(spawned.id);
+      const ctx = makeCtx({ sessionId, bgManager: mgr });
+      const r = await bashOutputTool.execute({ process_id: spawned.id, grep: 'FAIL' }, ctx);
+      if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
+      expect(r.grep_matches).toBe(2);
+      expect(r.stdout).toContain('line FAIL one');
+      expect(r.stdout).toContain('another FAIL here');
+      expect(r.stdout).not.toContain('line ok');
+      expect(r.stdout_cursor).toBe(0); // grep does not advance the cursor
+      expect(r.grep_truncated).toBe(false);
+    });
+
+    test('ignore_case matches regardless of case', async () => {
+      const spawned = await mgr.spawn({ command: 'echo "ERROR: boom"; echo "fine"' });
+      await waitForExit(spawned.id);
+      const ctx = makeCtx({ sessionId, bgManager: mgr });
+      const r = await bashOutputTool.execute(
+        { process_id: spawned.id, grep: 'error', grep_ignore_case: true },
+        ctx,
+      );
+      if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
+      expect(r.grep_matches).toBe(1);
+      expect(r.stdout).toContain('ERROR: boom');
+    });
+
+    test('case-sensitive by default misses a different-case match', async () => {
+      const spawned = await mgr.spawn({ command: 'echo "ERROR: boom"' });
+      await waitForExit(spawned.id);
+      const ctx = makeCtx({ sessionId, bgManager: mgr });
+      const r = await bashOutputTool.execute({ process_id: spawned.id, grep: 'error' }, ctx);
+      if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
+      expect(r.grep_matches).toBe(0);
+    });
+
+    test('empty grep string is rejected', async () => {
+      const ctx = makeCtx({ sessionId, bgManager: mgr });
+      const r = await bashOutputTool.execute({ process_id: 'whatever', grep: '' }, ctx);
+      expect(isToolError(r)).toBe(true);
+    });
+
+    test('caps matches and flags truncation (manager-level, exercises the streaming early-stop)', async () => {
+      const spawned = await mgr.spawn({ command: 'echo "FAIL a"; echo "FAIL b"; echo "FAIL c"' });
+      await waitForExit(spawned.id);
+      const r = await mgr.grepOutput(spawned.id, { pattern: 'FAIL', maxMatches: 2 });
+      expect(r.stdoutMatches.length).toBe(2);
+      expect(r.truncated).toBe(true);
+    });
+
+    test('clips an overlong matched line around the match instead of returning it whole', async () => {
+      // Regression: matched lines were returned at full length — a single
+      // minified multi-KB line containing the needle would land whole in
+      // the tool result, bypassing the byte discipline the cursor path
+      // enforces. The clip is match-centered: a head-anchored cut could
+      // hide the needle itself when it sits deep in the line.
+      const spawned = await mgr.spawn({
+        command: `printf 'x%.0s' {1..6000}; printf 'NEEDLE'; printf 'y%.0s' {1..6000}; echo`,
+      });
+      await waitForExit(spawned.id);
+      const r = await mgr.grepOutput(spawned.id, { pattern: 'NEEDLE' });
+      expect(r.stdoutMatches.length).toBe(1);
+      const line = r.stdoutMatches[0] ?? '';
+      expect(line).toContain('NEEDLE'); // the match survives the clip
+      expect(line.length).toBeLessThan(2500); // ~GREP_LINE_CLIP + markers
+      expect(line).toContain('line clipped');
+    });
+
+    test('per-stream byte budget stops the read early and flags truncation', async () => {
+      // 100 matching lines of ~1KB each = ~100KB of matches; the 64KB
+      // stream budget must stop the return well short of all of them.
+      const spawned = await mgr.spawn({
+        command: `for i in $(seq 1 100); do printf 'FAIL '; printf 'z%.0s' {1..1000}; echo; done`,
+      });
+      await waitForExit(spawned.id);
+      const r = await mgr.grepOutput(spawned.id, { pattern: 'FAIL' });
+      expect(r.truncated).toBe(true);
+      expect(r.stdoutMatches.length).toBeLessThan(100);
+      const total = r.stdoutMatches.reduce((n, l) => n + l.length, 0);
+      expect(total).toBeLessThanOrEqual(66 * 1024); // budget + one line of slack
+    });
+
+    test('finds a needle deep in a giant newline-less line (bounded memory path)', async () => {
+      // A stream with no newline (progress bars, minified one-liners) used
+      // to grow the pending carry without bound. The synthetic break at
+      // the pending cap must keep scanning — a needle past the cap still
+      // matches (the overlap carry preserves cut-straddling occurrences).
+      const spawned = await mgr.spawn({
+        command: `printf 'x%.0s' {1..80000}; printf 'DEEP-NEEDLE'; printf 'y%.0s' {1..2000}`,
+      });
+      await waitForExit(spawned.id);
+      const r = await mgr.grepOutput(spawned.id, { pattern: 'DEEP-NEEDLE' });
+      expect(r.stdoutMatches.length).toBeGreaterThanOrEqual(1);
+      expect(r.stdoutMatches.some((l) => l.includes('DEEP-NEEDLE'))).toBe(true);
+    });
+  });
 });

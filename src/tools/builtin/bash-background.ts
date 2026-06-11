@@ -24,7 +24,7 @@ export interface BashBackgroundOutput {
 export const bashBackgroundTool: Tool<BashBackgroundInput, BashBackgroundOutput> = {
   name: 'bash_background',
   description:
-    'Spawn a long-running shell command in the background. Returns immediately with a process_id. Use bash_output to read incremental stdout/stderr and bash_kill to terminate. For short, blocking commands, use the bash tool instead.',
+    'Run a long-running shell command in the background. Returns a process_id immediately and keeps running across turns; you are notified automatically when it finishes — do NOT poll for completion. Use bash_output to inspect output mid-run, bash_kill to stop it, bash_list to recover a lost process_id. For short blocking commands, use bash.',
   inputSchema: {
     type: 'object',
     properties: {

@@ -79,6 +79,23 @@ describe('bg manager: spawn', () => {
     await waitForExit(r.id);
   });
 
+  test('a stdin-reading command does not cannibalize the rest of the script', async () => {
+    // Regression: the script is delivered over fd 0. If the runner
+    // aliases the program source to the command's stdin (the `bash -s`
+    // trap), a `cat` mid-script drains the remaining lines and the
+    // commands after it silently never run. The bootstrap drains the
+    // whole script first and runs it with stdin redirected to
+    // /dev/null, so `cat` here sees EOF and `echo after` still fires.
+    const r = await mgr.spawn({ command: 'echo before\ncat\necho after' });
+    await waitForExit(r.id);
+    const row = getBgProcess(db, r.id);
+    expect(row?.status).toBe('exited');
+    expect(row?.exitCode).toBe(0);
+    const out = await mgr.readOutput(r.id);
+    expect(out.stdout).toContain('before');
+    expect(out.stdout).toContain('after');
+  });
+
   test('spawned subprocess does not keep parent runtime alive (unref)', async () => {
     // Regression: without proc.unref(), a referenced bg subprocess
     // holds the parent event loop active even after the last

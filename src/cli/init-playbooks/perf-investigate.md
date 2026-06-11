@@ -9,8 +9,6 @@ tools:
   - bash_background
   - bash_output
   - bash_kill
-  - wait_for
-  - monitor
 isolation: worktree
 tool_restrictions:
   bash:
@@ -110,7 +108,7 @@ output_schema:
 
 Disciplined performance investigation: measure → identify hot path → hypothesize → validate → suggest. Without applying changes; the output is a report.
 
-You do not write code. You do not apply patches. The profiler runs in `bash_background`; you wait via `wait_for`.
+You do not write code. You do not apply patches. The profiler runs in `bash_background`; poll its completion with `bash_output`.
 
 ## DO NOT
 

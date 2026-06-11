@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { BgManager } from '../../src/bg/index.ts';
 import type { ParsedArgs } from '../../src/cli/args.ts';
 import type { BootstrapInput, BootstrapResult } from '../../src/cli/bootstrap.ts';
 import {
@@ -1440,6 +1441,184 @@ describe('repl — boot + smoke', () => {
     expect(ra.captured).toHaveLength(2);
     expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('second');
     expect(ra.captured[1]?.configs[0]?.resumeFromSessionId).toBe('sess-1');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('injects a stable bg manager holder into every turn (spec §3B)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    // Turn 1.
+    stdin.feed('first\r');
+    await tick();
+    const holder1 = ra.captured[0]?.configs[0]?.bgManagerHolder;
+    expect(holder1).toBeDefined();
+    expect(typeof holder1?.onEvent).toBe('function');
+    // The loop owns `manager`; the mock runAgent never builds one, so it
+    // stays undefined here.
+    expect(holder1?.manager).toBeUndefined();
+    // onEvent is a pass-through sink to the bus — exercising it must not
+    // throw and must not depend on a live turn. Only `bg_started` here:
+    // `bg_ended` has the additional bg_done-notification side effect,
+    // covered by its own semi-push test below.
+    expect(() =>
+      holder1?.onEvent({ type: 'bg_started', processId: 'p1', command: 'sleep 1', label: null }),
+    ).not.toThrow();
+    // Turn 2 must receive the SAME holder instance — it's session-scoped,
+    // so the loop reuses the manager it stored there on turn 1.
+    ra.finish(0);
+    await tick();
+    stdin.feed('second\r');
+    await tick();
+    expect(ra.captured[1]?.configs[0]?.bgManagerHolder).toBe(holder1);
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('bg completion enqueues a bg_done notification that becomes the next turn (semi-push, §3B.3)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    // Turn 1.
+    stdin.feed('first\r');
+    await tick();
+    const holder = ra.captured[0]?.configs[0]?.bgManagerHolder;
+    expect(holder).toBeDefined();
+    // A bg process starts then finishes while the turn is IN FLIGHT —
+    // the busy path: no wake; the notification waits for the boundary.
+    holder?.onEvent({ type: 'bg_started', processId: 'p1', command: 'npm run build', label: null });
+    holder?.onEvent({ type: 'bg_ended', processId: 'p1', status: 'exited', exitCode: 0 });
+    // End turn 1 → boundary drain → the queued bg_done notification
+    // becomes turn 2's input (semi-push).
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    const prompt = ra.captured[1]?.configs[0]?.userPrompt ?? '';
+    expect(prompt).toContain('[background]');
+    expect(prompt).toContain('npm run build');
+    expect(prompt).toContain('exit 0');
+    expect(prompt).toContain('p1');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a bg process finishing while IDLE auto-wakes a turn (wake-when-idle, §3B.4)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    // Turn 1, then let it finish so the session is idle.
+    stdin.feed('first\r');
+    await tick();
+    const holder = ra.captured[0]?.configs[0]?.bgManagerHolder;
+    holder?.onEvent({ type: 'bg_started', processId: 'p1', command: 'npm test', label: null });
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(1); // idle — no turn pending
+
+    // The bg process finishes while IDLE → wake-when-idle fires a turn on
+    // its own, with no operator input.
+    holder?.onEvent({ type: 'bg_ended', processId: 'p1', status: 'exited', exitCode: 0 });
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    const prompt = ra.captured[1]?.configs[0]?.userPrompt ?? '';
+    expect(prompt).toContain('[background]');
+    expect(prompt).toContain('npm test');
+    // The wake-turn input is persisted as a SYSTEM message (migration 075)
+    // so audit/--resume don't treat it as operator input.
+    expect(ra.captured[1]?.configs[0]?.userPromptSource).toBe('system');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('the bg_done notification inlines a head-tail of the output (§3B.3)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('first\r');
+    await tick();
+    const holder = ra.captured[0]?.configs[0]?.bgManagerHolder;
+    expect(holder).toBeDefined();
+    if (holder === undefined) return;
+    // The loop normally builds the manager and stores it; the mock
+    // runAgent doesn't, so inject a fake. Simulate a LARGE output (100KB)
+    // whose head is all "pass" and whose REAL tail has the failure — the
+    // bug was that the summary showed the end of the leading window
+    // (still passing) instead of the true end. The head read returns
+    // pending = total-len; the tail read (since > 0) returns the failure.
+    holder.manager = {
+      readOutput: (_id: string, opts?: { sinceStdout?: number }) => {
+        const total = 100_000;
+        const isHead = (opts?.sinceStdout ?? 0) === 0;
+        const stdout = isHead ? 'starting tests…\n' : 'FAIL: 3 tests failed\n';
+        return Promise.resolve({
+          status: 'exited',
+          exitCode: 1,
+          stdout,
+          stderr: '',
+          stdoutCursor: 0,
+          stderrCursor: 0,
+          stdoutPending: isHead ? total - stdout.length : 0,
+          stderrPending: 0,
+        });
+      },
+    } as unknown as BgManager;
+    holder.onEvent({ type: 'bg_started', processId: 'p1', command: 'npm test', label: null });
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(1); // idle
+
+    // Finish while idle → async readBgSummary (head + real tail) → wake.
+    holder.onEvent({ type: 'bg_ended', processId: 'p1', status: 'exited', exitCode: 1 });
+    await tick();
+    await tick(); // extra: the two readOutput promises + microtask drain
+    expect(ra.captured).toHaveLength(2);
+    const prompt = ra.captured[1]?.configs[0]?.userPrompt ?? '';
+    expect(prompt).toContain('[background]');
+    expect(prompt).toContain('read complete output with bash_output');
+    expect(prompt).toContain('starting tests'); // head
+    expect(prompt).toContain('FAIL: 3 tests failed'); // the REAL tail — the fix
+    expect(prompt).toContain('elided'); // the head-tail elision marker
     ra.finish(1);
     await tick();
     stdin.feed('\x04');

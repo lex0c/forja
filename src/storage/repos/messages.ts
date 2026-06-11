@@ -3,6 +3,13 @@ import { parseJsonSafe } from '../json-safe.ts';
 
 export type MessageRole = 'user' | 'assistant' | 'tool';
 
+// Who/what produced a message's INPUT (migration 075). 'operator' = the
+// human typed it (the default and normal case); 'system' = the harness/
+// REPL injected it (a bg_done wake notification today, reminders later).
+// Distinguishes audit/resume rendering of an injected user-role turn from
+// real operator input — the provider sees both as user context.
+export type MessageSource = 'operator' | 'system';
+
 export interface Message {
   id: string;
   sessionId: string;
@@ -28,6 +35,10 @@ export interface Message {
   // with no resolved effort. Typed `string` (not the harness enum) to keep
   // storage decoupled from the harness/provider layer.
   effort: string | null;
+  // Who produced this message's input — migration 075. 'operator' for
+  // every pre-migration row and the normal case; 'system' for
+  // harness-injected turns (bg_done wake notifications). See MessageSource.
+  source: MessageSource;
 }
 
 interface MessageRow {
@@ -44,6 +55,7 @@ interface MessageRow {
   created_at: number;
   prompt_hash: string | null;
   effort: string | null;
+  source: MessageSource;
 }
 
 const fromRow = (row: MessageRow): Message => ({
@@ -60,6 +72,7 @@ const fromRow = (row: MessageRow): Message => ({
   createdAt: row.created_at,
   promptHash: row.prompt_hash,
   effort: row.effort,
+  source: row.source,
 });
 
 export interface AppendMessageInput {
@@ -84,6 +97,10 @@ export interface AppendMessageInput {
   // The harness loop sources it from the per-request resolved effort.
   // Nullable: non-assistant rows and turns with no resolved effort.
   effort?: string | null;
+  // Input origin (migration 075). Defaults to 'operator'; the wake-turn
+  // path passes 'system' so the notification isn't audited/resumed as
+  // operator input. See MessageSource.
+  source?: MessageSource;
 }
 
 export const appendMessage = (db: DB, input: AppendMessageInput): Message => {
@@ -125,12 +142,13 @@ export const appendMessage = (db: DB, input: AppendMessageInput): Message => {
   // serialized by SQLite, so MAX(seq) is always current.
   const promptHash = input.promptHash ?? null;
   const effort = input.effort ?? null;
+  const source: MessageSource = input.source ?? 'operator';
   db.query(
     `INSERT INTO messages
      (id, session_id, parent_id, role, content,
-      tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, seq)
+      tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source, seq)
      VALUES (
-       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
        (SELECT COALESCE(MAX(seq), -1) + 1 FROM messages WHERE session_id = ?)
      )`,
   ).run(
@@ -147,6 +165,7 @@ export const appendMessage = (db: DB, input: AppendMessageInput): Message => {
     createdAt,
     promptHash,
     effort,
+    source,
     input.sessionId,
   );
   return {
@@ -163,6 +182,7 @@ export const appendMessage = (db: DB, input: AppendMessageInput): Message => {
     createdAt,
     promptHash,
     effort,
+    source,
   };
 };
 
@@ -170,7 +190,7 @@ export const getMessage = (db: DB, id: string): Message | null => {
   const row = db
     .query(
       `SELECT id, session_id, parent_id, role, content,
-              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort
+              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source
        FROM messages WHERE id = ?`,
     )
     .get(id) as MessageRow | null;
@@ -187,7 +207,7 @@ export const listMessagesBySession = (db: DB, sessionId: string): Message[] => {
   const rows = db
     .query(
       `SELECT id, session_id, parent_id, role, content,
-              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort
+              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source
        FROM messages
        WHERE session_id = ?
        ORDER BY seq ASC`,
@@ -245,7 +265,7 @@ export const listMessageTailBySession = (db: DB, sessionId: string, limit: numbe
   const rows = db
     .query(
       `SELECT id, session_id, parent_id, role, content,
-              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort
+              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source
        FROM (
          SELECT * FROM messages
          WHERE session_id = ?

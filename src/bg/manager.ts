@@ -26,6 +26,29 @@ import {
 // a single read but bounded.
 const DEFAULT_OUTPUT_READ_LIMIT_BYTES = 64 * 1024;
 
+// Bootstrap that delivers the bg script without putting its body in
+// argv AND without letting a stdin-reading command inside the script
+// cannibalize the rest of the script.
+//
+// Background: keeping the body out of `/proc/<pid>/cmdline` (a local
+// info-leak: `ps aux` would expose interpolated secrets) means it
+// can't ride on argv. The previous fix piped the script to `bash -s`,
+// which reads the program from fd 0 — but `-s` makes fd 0 do double
+// duty: it's both the program source AND the inherited stdin of every
+// command the script runs. A script like `cat; echo done` or
+// `read x; ...` then has its `cat`/`read` swallow the remaining
+// script lines (or EOF), so later commands silently vanish.
+//
+// This wrapper severs the two roles. `cat` drains the ENTIRE script
+// off fd 0 into a variable in one shot (before any of it executes),
+// then `eval … </dev/null` runs it with a clean, empty stdin — so a
+// `read`/`cat` in the body sees EOF immediately instead of eating the
+// program. The argv is this constant string; the body lives only in
+// the shell's memory (the variable), never in cmdline. bwrap/
+// sandbox-exec forward fd 0 already, so this needs no temp file (which
+// `--tmpfs /tmp` would mask) and no extra fd (which bwrap would close).
+const BG_SCRIPT_BOOTSTRAP = '__forja_script="$(cat)"; eval "$__forja_script" </dev/null';
+
 // Default grace period for SIGTERM → SIGKILL escalation on per-call
 // kill. Long enough for a well-behaved process to flush state and
 // exit cleanly; short enough that an operator killing a hung server
@@ -295,9 +318,36 @@ export interface StatusSnapshot {
   exitedAt: number | null;
 }
 
+export interface GrepOutputInput {
+  // Literal substring to match (NOT a regex — avoids ReDoS from
+  // model-supplied patterns). A line matches if it contains this.
+  pattern: string;
+  // Cap on matching lines returned per stream. Default 200.
+  maxMatches?: number;
+  // Case-insensitive substring match. Default false.
+  ignoreCase?: boolean;
+}
+
+export interface GrepOutputResult {
+  status: BgProcess['status'];
+  exitCode: number | null;
+  stdoutMatches: string[];
+  stderrMatches: string[];
+  // True when either stream stopped early — more matches than
+  // `maxMatches`, or the per-stream byte budget was exhausted. Overlong
+  // matched lines are additionally clipped in place (elision markers in
+  // the line itself), which does NOT set this flag.
+  truncated: boolean;
+}
+
 export interface BgManager {
   spawn(input: SpawnInput): Promise<SpawnResult>;
   readOutput(id: string, opts?: ReadOutputInput): Promise<ReadOutputResult>;
+  // Scan the WHOLE log of a process for lines containing `pattern` and
+  // return just those — the cheap path for "find the failures in a huge
+  // output" without paging the cursor window. Reads the log files
+  // directly server-side; does NOT advance the readOutput cursor.
+  grepOutput(id: string, opts: GrepOutputInput): Promise<GrepOutputResult>;
   kill(id: string, opts?: KillInput): Promise<KillResult>;
   // Thin status accessor — returns null when the id is unknown.
   // Used by the wait subsystem's `process_exit` polling loop and
@@ -313,6 +363,15 @@ export interface BgManager {
   // Useful for tests and for `agent doctor` to spot leaks. Not
   // intended to be called during normal session flow.
   liveCount(): number;
+  // Snapshot of every bg process in THIS session (running and
+  // terminated), read straight from the durable `background_processes`
+  // rows — independent of the in-memory `live` map, so it surfaces
+  // processes that already exited. Backs the `bash_list` tool
+  // (`CONTRACTS.md §2.6.5d`): lets the model recover a `process_id` it
+  // lost across turns / compaction. Returns the full session set; the
+  // tool filters by status in-process (it needs the full set for the
+  // running/total counts anyway).
+  list(): BgProcess[];
 }
 
 interface LiveHandle {
@@ -652,19 +711,22 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
       input.sandboxProfile,
       whichFn,
     );
-    // Slice 173 — info-leak fix mirrors the broker bash handler.
-    // Pre-slice `['bash', '-c', input.command]` leaked the full
-    // command body (including any interpolated secrets) into
-    // `/proc/<pid>/cmdline`, readable by any local user via
-    // `ps aux`. Switching to `['bash', '-s']` and piping the
-    // script over stdin removes the body from argv entirely. Both
-    // bwrap (Linux) and sandbox-exec (macOS) forward stdin from
-    // their own stdin to the wrapped child by default, so the
+    // Info-leak fix mirrors the broker bash handler.
+    // `['bash', '-c', input.command]` would leak the full command
+    // body (including any interpolated secrets) into
+    // `/proc/<pid>/cmdline`, readable by any local user via `ps aux`.
+    // We keep the body off argv by piping the script over stdin, but
+    // run it through BG_SCRIPT_BOOTSTRAP rather than `bash -s`: the
+    // latter aliases the program source to the inherited stdin, so a
+    // `cat`/`read` in the script eats its own remaining lines. The
+    // bootstrap drains the script into a variable, then evals it with
+    // stdin redirected to /dev/null. Both bwrap (Linux) and
+    // sandbox-exec (macOS) forward fd 0 to the wrapped child, so the
     // script reaches bash even when wrapped.
     const cmd = wrapFn({
       ...(input.sandboxProfile !== undefined ? { profile: input.sandboxProfile } : {}),
       cwd,
-      innerArgv: ['bash', '-s'],
+      innerArgv: ['bash', '-c', BG_SCRIPT_BOOTSTRAP],
       // Slice 157 (phase 2): forward per-CLI-run sandbox tmpdir so
       // the SBPL profile on darwin scopes write access. No-op on
       // linux (the option is ignored by the bwrap path) and when
@@ -718,10 +780,10 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
           ...scrubEnv(process.env),
           ...(sandboxTmpdir !== undefined ? { TMPDIR: sandboxTmpdir } : {}),
         },
-        // Slice 173 — `bash -s` reads the script from stdin. We
-        // pipe `input.command` into the child and close stdin so
-        // bash sees EOF and processes the script. The body never
-        // appears in `/proc/<pid>/cmdline`.
+        // BG_SCRIPT_BOOTSTRAP reads the script from stdin (`cat`).
+        // We pipe `input.command` into the child and close stdin so
+        // the bootstrap's `cat` sees EOF and the script runs. The
+        // body never appears in `/proc/<pid>/cmdline`.
         stdin: 'pipe',
         // Slice 153 (review): pipes instead of Bun.file(path). The
         // manager drains each pipe into the corresponding log file
@@ -755,9 +817,9 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
       // resolves on detached children — no reaping regression.
       proc.unref();
 
-      // Slice 173 — feed the bash script over stdin and close so
-      // the child sees EOF and runs the script. Best-effort: if
-      // the pipe broke before we could write (child crashed on
+      // Feed the bash script over stdin and close so the
+      // bootstrap's `cat` sees EOF and runs the script. Best-effort:
+      // if the pipe broke before we could write (child crashed on
       // exec), the child exits non-zero and `proc.exited`
       // surfaces it through the normal lifecycle. We do NOT want
       // a failed stdin write to mask a `proc spawn ok` row.
@@ -1276,6 +1338,112 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     };
   };
 
+  // Durable snapshot of this session's bg processes (running +
+  // terminated). Reads the DB rows, not the in-memory `live` map, so
+  // it includes processes that already exited — the whole point of
+  // `bash_list` (recover a lost process_id).
+  const list = (): BgProcess[] => listBgProcessesBySession(db, sessionId);
+
+  // Server-side grep over a process's whole log (both streams). Streams
+  // each log file line-by-line and returns only matching lines — the
+  // cheap path for "find the failures in a multi-MB output" without
+  // paging the cursor window into the model's context. Substring match
+  // (no regex). Streaming (not a whole-file read) keeps a huge log out of
+  // memory; three caps stop the read early: the match cap, a per-line
+  // clip, and a per-stream byte budget (below).
+  const grepOutput = async (id: string, opts: GrepOutputInput): Promise<GrepOutputResult> => {
+    const row = getBgProcess(db, id);
+    if (row === null) throw new Error(`bg process not found: ${id}`);
+    if (row.sessionId !== sessionId) throw new Error(`bg process not in this session: ${id}`);
+    const maxMatches = opts.maxMatches !== undefined && opts.maxMatches > 0 ? opts.maxMatches : 200;
+    const ignoreCase = opts.ignoreCase === true;
+    const needle = ignoreCase ? opts.pattern.toLowerCase() : opts.pattern;
+    const findIdx = (line: string): number =>
+      (ignoreCase ? line.toLowerCase() : line).indexOf(needle);
+    const matches = (line: string): boolean => findIdx(line) !== -1;
+    // The match cap alone does not bound the RETURN: lines have no
+    // intrinsic length (minified output, progress bars that only emit
+    // `\r`), so 200 matched "lines" could be megabytes — straight into
+    // the model's context, bypassing the 64 KB cap the cursor path
+    // enforces. Nor does it bound MEMORY: a log with no newline at all
+    // makes the pending-line carry `buf` grow to the whole file. Three
+    // guards (all in UTF-16 code units — close enough to bytes for
+    // budget purposes, and what JS strings natively count):
+    //  - GREP_LINE_CLIP: a matched line longer than this is clipped to a
+    //    window AROUND THE FIRST MATCH (a head-anchored cut could hide
+    //    the very needle that matched), with elision markers.
+    //  - GREP_STREAM_BUDGET: total returned text per stream; mirrors the
+    //    cursor path's 64 KB read cap. Hitting it sets `truncated`.
+    //  - GREP_PENDING_CAP: when the pending (newline-less) carry exceeds
+    //    this, treat the cap as a synthetic line break: match + clip what
+    //    we have, then keep only a needle-sized overlap so an occurrence
+    //    straddling the cut still matches. One physical giant line can
+    //    thus yield several clipped fragments — bounded and honest,
+    //    where the alternative was unbounded heap.
+    const GREP_LINE_CLIP = 2048;
+    const GREP_STREAM_BUDGET = DEFAULT_OUTPUT_READ_LIMIT_BYTES;
+    const GREP_PENDING_CAP = 64 * 1024;
+    const clip = (line: string): string => {
+      if (line.length <= GREP_LINE_CLIP) return line;
+      const idx = findIdx(line);
+      const start = Math.max(0, idx - 256);
+      const end = Math.min(line.length, start + GREP_LINE_CLIP);
+      const head = start > 0 ? '… ' : '';
+      const tail = end < line.length ? ` … [line clipped; ${line.length} chars total]` : '';
+      return `${head}${line.slice(start, end)}${tail}`;
+    };
+    const grepFile = async (path: string): Promise<{ lines: string[]; hitCap: boolean }> => {
+      const lines: string[] = [];
+      let budget = GREP_STREAM_BUDGET;
+      const push = (line: string): boolean => {
+        const clipped = clip(line);
+        lines.push(clipped);
+        budget -= clipped.length;
+        // Reaching either cap returns early; the for-await break
+        // cancels the underlying stream (no further read).
+        return lines.length >= maxMatches || budget <= 0;
+      };
+      const decoder = new TextDecoder();
+      let buf = '';
+      try {
+        for await (const chunk of Bun.file(path).stream()) {
+          buf += decoder.decode(chunk, { stream: true });
+          const parts = buf.split('\n');
+          // Last part is an incomplete line (no trailing newline yet) —
+          // carry it to the next chunk.
+          buf = parts.pop() ?? '';
+          for (const line of parts) {
+            if (matches(line) && push(line)) return { lines, hitCap: true };
+          }
+          // Memory guard: a newline-less stream (\r progress, minified
+          // single-line output) would otherwise grow the carry without
+          // bound. Synthetic break at the cap — see GREP_PENDING_CAP.
+          if (buf.length > GREP_PENDING_CAP) {
+            if (matches(buf) && push(buf)) return { lines, hitCap: true };
+            const overlap = Math.max(0, needle.length - 1);
+            buf = overlap > 0 ? buf.slice(-overlap) : '';
+          }
+        }
+        buf += decoder.decode(); // flush any trailing multibyte remainder
+        if (buf.length > 0 && matches(buf) && push(buf)) return { lines, hitCap: true };
+      } catch {
+        // Log missing/unreadable (never spawned, cleaned up, mid-read
+        // truncation) — return whatever matched; the row still gives
+        // status. No error rather than failing the whole grep.
+      }
+      return { lines, hitCap: false };
+    };
+    const out = await grepFile(row.stdoutLogPath);
+    const err = await grepFile(row.stderrLogPath);
+    return {
+      status: row.status,
+      exitCode: row.exitCode,
+      stdoutMatches: out.lines,
+      stderrMatches: err.lines,
+      truncated: out.hitCap || err.hitCap,
+    };
+  };
+
   // Wire the abort signal AFTER cleanup is defined so the listener
   // can reference it. `once: true` means the listener runs at most
   // once even if the signal fires multiple times. The catch swallows
@@ -1298,5 +1466,5 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     }
   }
 
-  return { spawn, readOutput, kill, getStatus, cleanup, liveCount };
+  return { spawn, readOutput, kill, getStatus, cleanup, liveCount, list, grepOutput };
 };

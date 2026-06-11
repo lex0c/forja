@@ -23,6 +23,7 @@ import { existsSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { resolveProviderEffort } from '../harness/effort.ts';
 import {
+  type BgManagerHolder,
   type HarnessConfig,
   type HarnessEvent,
   type HarnessResult,
@@ -46,6 +47,7 @@ import {
 } from '../storage/history.ts';
 import { closeDb, computeUsageStats, countMessagesBySession } from '../storage/index.ts';
 import { createContextPinsStore } from '../storage/repos/context-pins.ts';
+import type { MessageSource } from '../storage/repos/messages.ts';
 import { completeSession, createSession } from '../storage/repos/sessions.ts';
 import { settleRunningSubagentHandles } from '../storage/repos/subagent-handles.ts';
 import { runSubagent } from '../subagents/index.ts';
@@ -69,6 +71,7 @@ import {
   lookupToolVocab,
 } from '../tui/index.ts';
 import type { ParsedArgs } from './args.ts';
+import { buildBgSummary } from './bg-summary.ts';
 import { operatorBootstrapFlags, reportRefusingEngine } from './boot-parity.ts';
 import { type BootstrapInput, type BootstrapResult, bootstrap } from './bootstrap.ts';
 import { maybeEmitHistoryBanner } from './history-banner.ts';
@@ -663,6 +666,87 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     permissionRefusingReason,
     permissionChain,
   } = bootstrapped;
+
+  // Session-scoped bg process manager (spec ORCHESTRATION.md §3B). The
+  // loop builds the BgManager on the first turn and stores it in this
+  // holder; later turns reuse it, so bash_background processes survive
+  // the turn boundary instead of being SIGKILLed at turn end. The
+  // holder's onEvent is the cross-turn sink: it turns the loop's bg
+  // HarnessEvents into the bus UIEvents (bg:start/bg:end) that the
+  // renderer's bgProcesses reducer consumes — emitted on the bus
+  // directly, independent of any turn's adapter, so a process that
+  // exits while the REPL is idle still updates that state (and any
+  // async-in-flight UI built on it). The bg_ended branch below also
+  // enqueues a bg_done notification into the inbox (§3B.3); automatic
+  // wake-when-idle on top of that is still a later slice. The REPL owns
+  // teardown: `shutdown()` calls `manager.cleanup()` at session exit.
+  // Per-process command text, kept so a completion notification can name
+  // the command — bg_ended carries only processId/status/exitCode.
+  const bgCommands = new Map<string, string>();
+  // NOTE: this closure references bindings declared further down
+  // (`exiting`, `enqueueNotification`) — safe ONLY because the loop
+  // builds the manager on the first turn, after the whole setup ran.
+  // Building/firing it earlier (e.g. at boot) would hit the TDZ.
+  const bgManagerHolder: BgManagerHolder = {
+    manager: undefined,
+    onEvent: (e: HarnessEvent): void => {
+      if (e.type === 'bg_started') {
+        bgCommands.set(e.processId, e.command);
+        bus.emit({ type: 'bg:start', ts: now(), processId: e.processId, command: e.command });
+      } else if (e.type === 'bg_ended') {
+        bus.emit({
+          type: 'bg:end',
+          ts: now(),
+          processId: e.processId,
+          cause: e.status,
+          exitCode: e.exitCode,
+        });
+        // Notify the model that a background process finished (spec
+        // ORCHESTRATION.md §3B.3): enqueue a bg_done into the generic
+        // notification channel. When idle it wakes a turn (§3B.4); during
+        // a turn it drains at the next boundary (semi-push).
+        //
+        // Gated on `!exiting`: the session-exit cleanup() SIGKILLs every
+        // surviving process, each firing bg_ended; enqueuing during
+        // teardown is pointless (no turn will consume it) and would dirty
+        // the final state. The full output stays recoverable via
+        // bash_output (process_id in the notification).
+        const command = bgCommands.get(e.processId) ?? '(background command)';
+        bgCommands.delete(e.processId);
+        if (!exiting) {
+          const processId = e.processId;
+          const status = e.status;
+          const exitCode = e.exitCode;
+          // Read the output OBSERVATIONALLY (since:0 does not advance the
+          // persisted cursor, so a later bash_output still sees
+          // everything) to build the inline head-tail, THEN enqueue.
+          // Async — the wake/boundary drain picks it up after.
+          void (async () => {
+            let summary: string | undefined;
+            try {
+              const mgr = bgManagerHolder.manager;
+              if (mgr !== undefined) {
+                summary = await buildBgSummary(mgr, processId);
+              }
+            } catch {
+              // Best-effort: a read failure just drops the inline summary;
+              // the notification still fires and bash_output still works.
+            }
+            if (exiting) return; // re-check after the async gap
+            enqueueNotification({
+              kind: 'bg_done',
+              command,
+              status,
+              exitCode,
+              processId,
+              ...(summary !== undefined ? { summary } : {}),
+            });
+          })();
+        }
+      }
+    },
+  };
+  baseConfig.bgManagerHolder = bgManagerHolder;
 
   // Permission engine refused to come up (PERMISSION_ENGINE.md §7.2):
   // broken audit chain, invalid policy, install_id I/O failure, or a
@@ -1308,6 +1392,64 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   const inbox: { id: string; text: string }[] = [];
   let inboxSeq = 0;
   let drainInbox: () => void = () => {};
+
+  // NOTIFICATIONS (spec ORCHESTRATION.md §3B). A generic channel for
+  // SYSTEM events that should reach the model — a bg process finished
+  // (now), a reminder fired (later). DISTINCT from the operator inbox
+  // above: that's operator intent, this is system events. Each producer
+  // enqueues its own `kind`; the channel formats + drains. Idle →
+  // auto-drains (wake-when-idle, §3B.4, fires a turn); during a turn →
+  // drains at the next boundary (semi-push). A future reminder tool just
+  // adds a `kind` here — nothing else in the channel changes.
+  // `drainNotifications` is forward-declared like `drainInbox` (body
+  // assigned after startTurn, since the wake calls startTurn).
+  type Notification = {
+    id: string;
+    kind: 'bg_done';
+    command: string;
+    status: 'exited' | 'killed' | 'failed';
+    exitCode: number | null;
+    processId: string;
+    // Head-tail of the process output (OUTPUT_POLICY), read
+    // observationally at completion so the model sees the result in the
+    // wake-turn without a bash_output round-trip. Undefined when the
+    // process was silent or the read failed; the full output is always
+    // recoverable via bash_output(processId).
+    summary?: string;
+  };
+  const notifications: Notification[] = [];
+  let notifSeq = 0;
+  let drainNotifications: () => void = () => {};
+  // Anti-loop backstop (§3B.4): max auto-wake turns fired with NO
+  // operator input between them. Reset on every operator submit
+  // (startOperatorTurn). Without it, a wake-turn that itself spawns more
+  // bg work could ping-pong the session awake forever.
+  let consecutiveWakes = 0;
+  const MAX_CONSECUTIVE_WAKES = 3;
+  // The headline line — the `● `-able status sentence, no body.
+  const formatNotificationHeadline = (n: Notification): string => {
+    // One `kind` today; this grows a switch as producers are added.
+    const code = n.exitCode === null ? '' : ` (exit ${n.exitCode})`;
+    return (
+      `[background] \`${n.command}\` ${n.status}${code}. ` +
+      `process_id=${n.processId} — read complete output with bash_output.`
+    );
+  };
+  // Full text fed to the model as the wake-turn input: headline + the
+  // output head-tail when present.
+  const formatNotification = (n: Notification): string =>
+    n.summary === undefined
+      ? formatNotificationHeadline(n)
+      : `${formatNotificationHeadline(n)}\n${n.summary}`;
+  // Head + tail caps for the inline summary. The tail is bigger: for a
+  // build/test, the RESULT (pass/fail counts, errors) lives at the END.
+  const enqueueNotification = (n: Omit<Notification, 'id'>): void => {
+    notifications.push({ ...n, id: String(notifSeq++) });
+    // Wake-when-idle: nothing running → drain now (fires a turn). During
+    // a turn, the boundary drain (drainInbox → drainNotifications) gets
+    // it instead.
+    if (!isBusy()) queueMicrotask(() => drainNotifications());
+  };
   // Id of the queued message currently lifted into the input via ↑ for
   // editing, or null. The message STAYS in `inbox` the whole time (never
   // removed), so an edit can never lose it; this only marks which one is
@@ -1778,7 +1920,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       });
   };
 
-  const startTurn = (text: string): void => {
+  // `source` (migration 075) marks WHO produced this turn's input:
+  // 'operator' (the human typed/queued it — the default) or 'system' (the
+  // REPL injected it — a bg_done wake-turn). It only changes how the
+  // userPrompt persists for audit/resume, never what the provider sees.
+  const startTurn = (text: string, source: MessageSource = 'operator'): void => {
     if (isBusy() || exiting) return;
     running = true;
     syncBusy();
@@ -1800,6 +1946,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     const cfg: HarnessConfig = {
       ...baseConfig,
       userPrompt: text,
+      // Only thread a non-default source so 'operator' turns stay byte-
+      // identical to before (and the harness default applies).
+      ...(source !== 'operator' ? { userPromptSource: source } : {}),
       signal: abortController.signal,
       softStopSignal: softStopController.signal,
       onEvent: (e) => onHarnessEvent(adapter, e),
@@ -1921,18 +2070,77 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // HERE (final, post-edit text) — not at enqueue — so an edited message
   // never leaves its stale original in the ↑/Ctrl-R recall pool. The
   // concatenated body is not recorded; each message is recorded separately.
+  // Operator-submitted turn (inbox drain / editor submit / reverse-search
+  // accept). Resets the consecutive-wake counter: operator input breaks
+  // the auto-wake chain (§3B.4 — the cap only counts wakes with no
+  // operator turn between them).
+  const startOperatorTurn = (text: string): void => {
+    consecutiveWakes = 0;
+    startTurn(text);
+  };
+
   drainInbox = (): void => {
     if (exiting || isBusy()) return;
     const editId = editingQueued?.id ?? null;
     const drained = inbox.filter((m) => m.id !== editId);
-    if (drained.length === 0) return;
+    if (drained.length === 0) {
+      // Inbox empty → let the notification channel try. Operator input
+      // has priority (§3B.4): notifications only wake when nothing the
+      // operator queued is waiting.
+      drainNotifications();
+      return;
+    }
     const kept = inbox.filter((m) => m.id === editId);
     inbox.length = 0;
     for (const m of kept) inbox.push(m);
     const texts = drained.map((m) => m.text);
     for (const t of texts) recordHistorySubmit(t);
     bus.emit({ type: 'inbox:drained', ts: now(), texts });
-    startTurn(concatQueuedBodies(texts));
+    startOperatorTurn(concatQueuedBodies(texts));
+  };
+
+  // Wake-when-idle (spec ORCHESTRATION.md §3B.4). Fires a turn from the
+  // pending notifications when the session is idle. Each guard is a §3B.4
+  // gate; failing any leaves the notifications queued (semi-push) for a
+  // later boundary or the operator's next submit.
+  drainNotifications = (): void => {
+    if (exiting || isBusy()) return;
+    if (notifications.length === 0) return;
+    // Operator-typing gate: don't steal the turn while they compose.
+    if (renderer.state().input.value.length > 0) return;
+    // Consecutive-wake cap: anti-loop backstop.
+    if (consecutiveWakes >= MAX_CONSECUTIVE_WAKES) return;
+    // Budget gate → degrade to semi-push when the cap is already spent.
+    const cap = baseConfig.budget?.maxCostUsd;
+    if (cap !== undefined && cumulative.costUsd >= cap) return;
+    // Coalesce: every pending notification goes into ONE wake-turn, so a
+    // burst of completions doesn't fire a turn each.
+    const drained = notifications.splice(0);
+    consecutiveWakes += 1;
+    // Surface each notification in the scrollback as a system `info`
+    // entry (distinct from an operator-submit bar — the point of a
+    // separate channel) so the operator sees WHY the session woke and
+    // what the turn is about: the `● ` headline, then the output
+    // head-tail indented beneath it. Applies to the semi-push path too
+    // (this drain also runs at the boundary).
+    for (const n of drained) {
+      const headline = `● ${formatNotificationHeadline(n)}`;
+      // One info event per notification (info emits a single leading
+      // blank — separate events would blank-separate every line). The
+      // head-tail rides in the same message, each row indented 4sp so it
+      // sits under the headline text (frame 2sp + the `● ` prefix).
+      const message =
+        n.summary === undefined
+          ? headline
+          : `${headline}\n${n.summary
+              .split('\n')
+              .map((l) => `    ${l}`)
+              .join('\n')}`;
+      bus.emit({ type: 'info', ts: now(), tone: 'secondary', message });
+    }
+    // 'system' source: the wake input persists as a system message, so
+    // audit and --resume don't render it as operator input (migration 075).
+    startTurn(drained.map(formatNotification).join('\n\n'), 'system');
   };
 
   // Async cleanup. Only called via `requestShutdown` below — the
@@ -2001,6 +2209,19 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // src/cli/run.ts. Awaits in-flight exec; closes idempotently.
     if (baseConfig.broker !== undefined) {
       await baseConfig.broker.close();
+    }
+    // Session-scoped bg processes (spec ORCHESTRATION.md §3B.1): the
+    // REPL owns the holder, so teardown runs HERE at session exit, not
+    // per-turn. Before closeDb — cleanup() flips surviving rows to
+    // 'killed', which is a DB write. Best-effort: a kill failure must
+    // not block exit (zombies stay visible in background_processes).
+    if (bgManagerHolder.manager !== undefined) {
+      try {
+        await bgManagerHolder.manager.cleanup();
+      } catch {
+        // Swallow — exit must not hang on a stubborn child; the audit
+        // row stays 'running' and `agent doctor` can surface it.
+      }
     }
     closeDb(db);
     // Resume hint. Printed AFTER renderer.close() (no live region to
@@ -2635,7 +2856,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           bus.emit({ type: 'user:submit', ts: now(), text: match });
           recordHistorySubmit(match);
           closeReverseSearch();
-          startTurn(match);
+          startOperatorTurn(match);
           cancelExitArm();
           return true;
         }
@@ -3195,7 +3416,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       } else {
         bus.emit({ type: 'user:submit', ts: now(), text: result.submit.text });
         recordHistorySubmit(result.submit.text);
-        startTurn(result.submit.text);
+        startOperatorTurn(result.submit.text);
       }
     }
 

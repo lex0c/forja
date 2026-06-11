@@ -26,6 +26,7 @@ export {
   type RetryOptions,
 } from './retry.ts';
 export {
+  type BgManagerHolder,
   DEFAULT_BUDGET,
   EXIT_REASONS,
   type ExitReason,

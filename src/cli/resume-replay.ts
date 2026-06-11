@@ -351,8 +351,15 @@ export const replaySessionMessages = (
 
     if (msg.role === 'user') {
       if (typeof msg.content === 'string' && msg.content.length > 0) {
-        // Operator prompt: opens a new run.
-        bus.emit({ type: 'user:submit', ts: msg.createdAt, text: msg.content });
+        if (msg.source === 'system') {
+          // Harness-injected input (a bg_done wake notification, migration
+          // 075) — render as a system info line, NOT an operator-submit
+          // bar, so the replayed history matches what actually happened.
+          bus.emit({ type: 'info', ts: msg.createdAt, tone: 'secondary', message: msg.content });
+        } else {
+          // Operator prompt: opens a new run.
+          bus.emit({ type: 'user:submit', ts: msg.createdAt, text: msg.content });
+        }
         runStartTs = msg.createdAt;
       } else if (Array.isArray(msg.content)) {
         // tool_result continuation. Emit `tool:end` for each block

@@ -100,6 +100,7 @@ describe('bootstrap', () => {
         'bash',
         'bash_background',
         'bash_kill',
+        'bash_list',
         'bash_output',
         'clarify',
         'edit_file',
@@ -109,7 +110,6 @@ describe('bootstrap', () => {
         'memory_read',
         'memory_search',
         'memory_write',
-        'monitor',
         'pin_context',
         'read_file',
         'retrieve_context',
@@ -127,7 +127,6 @@ describe('bootstrap', () => {
         'todo_get',
         'todo_list',
         'todo_update',
-        'wait_for',
         'write_file',
       ].sort(),
     );

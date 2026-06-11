@@ -1,6 +1,10 @@
 import type { Provider, ProviderContentBlock, ProviderMessage } from '../providers/index.ts';
 import type { DB } from '../storage/db.ts';
-import { appendMessage, listMessageTailBySession } from '../storage/repos/messages.ts';
+import {
+  type MessageSource,
+  appendMessage,
+  listMessageTailBySession,
+} from '../storage/repos/messages.ts';
 import { type RelevanceElideResult, relevanceElideMiddle } from './compaction-relevance.ts';
 import {
   type CompactionOptions,
@@ -145,13 +149,22 @@ export class SessionContext {
     return this.lastMessageId !== '' ? this.lastMessageId : null;
   }
 
-  appendUser(content: string, promptHash: string | null): string {
+  // `source` (migration 075) distinguishes operator input from a
+  // harness-injected turn (a bg_done wake notification → 'system'); it
+  // only affects the persisted row's audit/resume rendering, not the
+  // in-memory message the provider sees. Defaults to 'operator'.
+  appendUser(
+    content: string,
+    promptHash: string | null,
+    source: MessageSource = 'operator',
+  ): string {
     const msg = appendMessage(this.db, {
       sessionId: this.sessionId,
       role: 'user',
       content,
       parentId: this.nextParentId(),
       promptHash,
+      source,
     });
     this.lastMessageId = msg.id;
     this.messages.push({ role: 'user', content });

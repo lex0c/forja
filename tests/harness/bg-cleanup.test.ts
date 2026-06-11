@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runAgent } from '../../src/harness/loop.ts';
-import type { HarnessConfig } from '../../src/harness/types.ts';
+import type { BgManagerHolder, HarnessConfig, HarnessEvent } from '../../src/harness/types.ts';
 import { initBashParser } from '../../src/permissions/bash-parser.ts';
 import { createPermissionEngine } from '../../src/permissions/index.ts';
 import type { GenerateRequest, Provider, StreamEvent } from '../../src/providers/index.ts';
@@ -215,5 +215,76 @@ describe('harness bg cleanup hook', () => {
     // No bg row was written
     const procs = listBgProcessesBySession(db, result.sessionId);
     expect(procs.length).toBe(0);
+  });
+});
+
+describe('harness bg session-scoped holder (spec ORCHESTRATION.md §3B)', () => {
+  const spawnThenDone: ScriptedStep[] = [
+    {
+      tool_uses: [{ id: 'tu-1', name: 'bash_background', input: { command: 'sleep 30' } }],
+      stop_reason: 'tool_use',
+    },
+    { text: 'spawned, finishing', stop_reason: 'end_turn' },
+  ];
+
+  test('with an injected holder the bg process SURVIVES the turn (not killed)', async () => {
+    const holder: BgManagerHolder = { manager: undefined, onEvent: () => {} };
+    const result = await runAgent({
+      ...buildConfig(spawnThenDone, { bgLogDir: logDir }),
+      bgManagerHolder: holder,
+    });
+    expect(result.status).toBe('done');
+
+    // The per-turn cleanup must NOT have killed it — the holder owner
+    // (the REPL) owns teardown at session exit.
+    const procs = listBgProcessesBySession(db, result.sessionId);
+    expect(procs.length).toBe(1);
+    expect(procs[0]?.status).toBe('running');
+    // The loop populated the holder with the session-scoped manager.
+    expect(holder.manager).toBeDefined();
+
+    // Teardown (what the REPL does on session exit): now it dies.
+    await holder.manager?.cleanup();
+    expect(listBgProcessesBySession(db, result.sessionId)[0]?.status).toBe('killed');
+  });
+
+  test('bg lifecycle events route through the holder onEvent sink, not config.onEvent', async () => {
+    const holderEvents: HarnessEvent[] = [];
+    const configEvents: HarnessEvent[] = [];
+    const holder: BgManagerHolder = {
+      manager: undefined,
+      onEvent: (e) => holderEvents.push(e),
+    };
+    const result = await runAgent({
+      ...buildConfig(spawnThenDone, { bgLogDir: logDir }),
+      bgManagerHolder: holder,
+      onEvent: (e) => configEvents.push(e),
+    });
+    expect(result.status).toBe('done');
+    // bg_started routed to the cross-turn sink…
+    expect(holderEvents.some((e) => e.type === 'bg_started')).toBe(true);
+    // …and NOT to the per-turn config.onEvent (which would die with the turn).
+    expect(configEvents.some((e) => e.type === 'bg_started')).toBe(false);
+    await holder.manager?.cleanup();
+  });
+
+  test('a second turn with the same holder reuses the manager (not rebuilt)', async () => {
+    const holder: BgManagerHolder = { manager: undefined, onEvent: () => {} };
+    await runAgent({
+      ...buildConfig(spawnThenDone, { bgLogDir: logDir }),
+      bgManagerHolder: holder,
+    });
+    const firstManager = holder.manager;
+    expect(firstManager).toBeDefined();
+
+    // Second turn, same holder, no spawn — the reuse path must hand back
+    // the SAME manager instance instead of building a fresh one.
+    await runAgent({
+      ...buildConfig([{ text: 'noop', stop_reason: 'end_turn' }], { bgLogDir: logDir }),
+      bgManagerHolder: holder,
+    });
+    expect(holder.manager).toBe(firstManager);
+
+    await holder.manager?.cleanup();
   });
 });

@@ -288,8 +288,8 @@ describe('runSubagent — orchestration', () => {
       spawnChildProcess: fakeSpawnDone(),
     });
     const messages = db
-      .query<{ role: string; content: string }, [string]>(
-        'SELECT role, content FROM messages WHERE session_id = ? ORDER BY seq ASC',
+      .query<{ role: string; content: string; source: string }, [string]>(
+        'SELECT role, content, source FROM messages WHERE session_id = ? ORDER BY seq ASC',
       )
       .all(result.sessionId);
     expect(messages.length).toBeGreaterThan(0);
@@ -298,6 +298,9 @@ describe('runSubagent — orchestration', () => {
     // content is JSON-serialized; the seed text is the string
     // payload of that JSON.
     expect(first?.content).toContain('specific seed text');
+    // Harness-injected, not operator-typed: the child's audit/resume
+    // must not attribute the seed to a human (migration 075).
+    expect(first?.source).toBe('system');
   });
 
   test('payload status forwards to result (exhausted)', async () => {

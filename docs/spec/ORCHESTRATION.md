@@ -374,6 +374,95 @@ Cancel é paralelo (§7).
 
 ---
 
+## 3B. Background process lifecycle (persistente + notify + wake)
+
+> **Status:** proposta. Reescreve a semântica operacional de `bash_background` (`AGENTIC_CLI.md §7.3`, `CONTRACTS.md §2.6.5d`). **Cross-refs:** `BgManager` injetável espelha o padrão `todoStore` (`AGENTIC_CLI.md §11` injeção session-scoped); envelope de notificação em `CONTRACTS.md §2.6.5d`; transição `idle → running` por wake em `STATE_MACHINE.md §2.2`/§9; inbox in-memory em `MEMORY.md`; cancellation em §7; limites em §11; flag em `FEATURE_FLAGS.md`.
+
+**Problema.** `bash_background` é uma tool de background que, hoje, **não roda em background de verdade**: o `BgManager` é criado por `runAgent` (por-turn) e seu `cleanup()` mata todos os processos no outer finally de **cada turn**. Um processo "em background" morre quando o turn fecha — o propósito da tool é anulado. Esta seção corrige isso: o processo roda genuinamente em background, sobrevive ao turn, e **notifica o modelo** quando termina, em vez de exigir que ele lembre de pollar com `bash_output`.
+
+Diferença de escopo vs `task_async` (§3): aquilo é paralelismo de **subagents** (LLM filhos) dentro de um turn; isto é o lifecycle de **processos de shell** que atravessam turns. Não há tool nova nem flag de modo — é a `bash_background` cumprindo o que o nome promete.
+
+### 3B.1 Lifecycle cross-turn
+
+O `BgManager` passa de **per-`runAgent`** a **session-scoped**: o REPL constrói um no boot e o injeta em cada turn (mesmo padrão de `todoStore`/`contextPinsStore`). `cleanup()` deixa de rodar no fim do turn — roda só no **exit da sessão**. Um processo vive até um destes:
+
+| Gatilho | Efeito |
+|---|---|
+| Fim **normal** do turn | **sobrevive** — segue rodando |
+| Término natural do processo | settla → notificação (§3B.3) |
+| `bash_kill(process_id)` | SIGTERM → 5s → SIGKILL; settla com `status: killed` |
+| Ctrl+C no turn (interrupt) | **sobrevive** — interrupt do turn não recebe AbortSignal (§7.1, comportamento já existente) |
+| Ctrl+C 3× / exit do agente | `cleanup()` mata os sobreviventes — fim da **sessão/processo** |
+
+Escopo é **cross-turn, não cross-process**: o processo morre com o agente (não é daemon). Isto preserva a filosofia "nada de background cross-session" (`AGENTIC_CLI.md §0`) — a sessão REPL é um único processo; nada sobrevive ao seu exit. Em **one-shot** (`run.ts`, não-REPL) não há próximo turn: o `BgManager` é per-run e `cleanup()` roda no fim, como hoje.
+
+### 3B.2 Output durável e recuperação
+
+Nenhum storage novo: stdout/stderr já vão para **arquivos de log** em disco, com a linha em `background_processes` (SQLite, durável) apontando para eles. `bash_output` lê **direto dos logs**, independente do status — funciona em processo `running`, `exited` ou `killed`. Logo o output é recuperável **cross-turn** e **pós-compaction**, enquanto o modelo tiver o `process_id`.
+
+Para o caso em que o modelo perde o `process_id` (turns depois, compaction), uma tool de listagem `bash_list` (`CONTRACTS.md §2.6.5d`) snapshota os bg da sessão (id, comando, status, exit code, spawn time, label) — o análogo de `task_list` para processos. Read-only.
+
+Caveat herdado: logs muito grandes têm o head descartado (truncate-head); para um processo verboso o início pode se perder, sobra o tail. Não é regressão — é o cap de tamanho atual.
+
+### 3B.3 Notificação na conclusão (canal de notifications)
+
+Quando um processo settla (`exited`/`killed`/`failed`), o REPL empurra **um item num canal de NOTIFICATIONS in-memory — distinto do inbox**. O inbox carrega *intenção do operador* (input enfileirado durante um turn); o canal de notifications carrega *eventos de sistema* que devem alcançar o modelo. Separar os dois mantém responsabilidades distintas e habilita render próprio (§3B.7). O canal é **genérico, discriminado por `kind`**: `bg_done` é o primeiro produtor; uma futura tool de reminder adiciona outro `kind` (`reminder`) sem alterar o canal — o produtor traz sua própria lógica (o `BgManager` observa exits; o reminder observa o relógio), o canal só armazena, formata e drena.
+
+Shape do item `bg_done` (`CONTRACTS.md §2.6.5d`):
+
+```
+{ kind: 'bg_done', processId, command, status, exitCode }
+```
+
+- A detecção (`proc.exited`) já existe; o que muda é o **sink**: o evento ia pelo `onEvent` do turn que spawnou (que morre com o turn). Passa pelo canal **session-scoped** que o REPL detém (via o holder do `BgManager`, §3B.1) — vive entre turns.
+- O output completo é recuperável via `bash_output` (`process_id` no item). Inline de um head-tail do output é refinamento, não normativo.
+- O drain faz duas coisas: injeta as notificações como input do turn (§3B.4) **e** as ecoa no scrollback como linha de sistema (`● …`), distinta de uma barra de operador — o operador vê *por que* a sessão acordou.
+
+### 3B.4 Wake-when-idle
+
+Onde a notificação é processada depende do estado da sessão no settle:
+
+- **Turn em curso** → o item fica no canal e drena no **próximo boundary** (o boundary drena o inbox primeiro — precedência do operador — e cai no canal de notifications quando o inbox está vazio). Sem wake.
+- **Sessão `idle`** → **wake**: dispara um turn automático cujo input são as notificações drenadas. Transição em `STATE_MACHINE.md §2.2`: `[idle] --(bg_done ∧ guards)--> [running]`, gatilho `bg_done` (não `user_prompt`).
+
+O auto-wake é o **comportamento default**, protegido por guardas medidas **antes** de disparar (premissa raiz — meça duas vezes); não há flag de gate (as guardas são a proteção):
+
+| Guarda | Regra |
+|---|---|
+| **Coalescing** | o drain esvazia **todas** as notificações pendentes num único wake-turn. Sem timer de debounce: responsividade no caso comum (1 processo) > agrupar um burst espaçado raro, e o cap abaixo já limita a contagem de turns. Um micro-debounce (~100-200ms) é otimização opcional se o burst espaçado virar problema real. |
+| **Budget gate** | wake só com budget remanescente (§8): `cumulative.costUsd ≥ maxCostUsd` → degrada para **semi-push** (notificação espera o próximo input). Nunca estoura cap para avisar. |
+| **Operator-typing gate** | input buffer não-vazio no instante do drain → segura até submit/clear. Não rouba o turno do humano. |
+| **Consecutive-wake cap** | no máximo `max_consecutive_wakes` (default 3) wake-turns sem input do operador entre eles. Atingido → para, aguarda o operador. Resetado em qualquer submit do operador. Backstop anti-loop (complementa §1.6). |
+| **User-submit precedence** | o boundary drena o inbox antes do canal; um submit do operador reseta a cadeia de wakes. O operador sempre vence. |
+
+### 3B.5 Concurrency & cancel
+
+- Limites na matriz §11 (background processes default/cap já existem; o wake-turn herda os limites de turn normais).
+- `bash_kill` reusa o cascade SIGTERM → 5s → SIGKILL.
+- Cancellation (§7.1) inalterada: bg processes não recebem o AbortSignal do interrupt do turn — agora isso é consistente com sobreviverem ao turn (antes a inconsistência era: não recebiam o sinal, mas eram mortos pelo cleanup do finally mesmo assim).
+
+### 3B.6 Comportamento default (sem flags)
+
+- **Persistência + notificação + auto-wake são o comportamento default** — é o conserto do propósito da tool, não um opt-in. Não há flag de gate: o auto-wake é protegido pelas guardas de §3B.4 (typing, budget, cap, precedência do operador), que são a proteção real; um toggle adicional só seria duplicação.
+- Um toggle de transição (reverter ao kill-at-turn-end antigo, ou forçar semi-push em vez de auto-wake) fica **deferido** — adicionável como flag se demanda real aparecer, mas não normativo. O backstop de `max_consecutive_wakes` cobre o medo principal (turns disparando sozinhos sem fim).
+
+### 3B.7 UI
+
+- Async em vôo aparece em **dois chips distintos** do footer (`UI.md §4.10.6`), por fonte: `N bash bg` (processos `bash_background`, `state.bgProcesses`) e `N subagents` (subagentes em vôo, `state.subagents`). Ambos verdes, suprimidos em 0.
+- O **wake-turn** ecoa cada notificação drenada como uma **linha de sistema** no scrollback (`● <texto da notificação>`, tom secundário), distinta de uma barra de submit do operador — o operador vê *por que* a sessão acordou e sobre o que é o turn. (Um head-tail do output inline na notificação é refinamento.)
+
+### 3B.8 Anti-patterns
+
+| Anti-pattern | Por quê ruim |
+|---|---|
+| Tratar `bash_background` como within-turn (esperar que morra no fim do turn) | Agora persiste; um processo esquecido vive até o exit da sessão. Use `bash_kill` quando não precisar mais. |
+| Auto-wake sem budget gate | Queima cap só para avisar; wake degrada para semi-push quando exausto (§3B.4). |
+| Pollar `bash_output` em loop quando a notificação resolveria | A notificação na conclusão é o mecanismo push; o poll é para inspeção mid-run. |
+
+**Eval acoplado:** `evals/bg/persistent_notify_wake/` — lança um bg de duração conhecida, fecha o turn, verifica que (a) o processo sobrevive ao boundary, (b) `bash_output` recupera o output depois, (c) a notificação aterrissa no inbox, (d) o wake dispara quando idle, (e) as guardas seguram (budget exausto → semi-push; burst → coalescing; cap de wakes para o loop).
+
+---
+
 ## 4. Compaction timing
 
 ### 4.1 Quando dispara

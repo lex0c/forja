@@ -1,3 +1,4 @@
+import type { BgManager } from '../bg/index.ts';
 import type { Broker } from '../broker/index.ts';
 import type { FileDiff } from '../diff/line-diff.ts';
 import type { FailureEventSink } from '../failures/index.ts';
@@ -9,6 +10,7 @@ import type { Provider, ProviderEffort, StreamEvent, UsageInfo } from '../provid
 import type { SkillCatalog } from '../skills/index.ts';
 import type { DB } from '../storage/index.ts';
 import type { ContextPinsStore } from '../storage/repos/context-pins.ts';
+import type { MessageSource } from '../storage/repos/messages.ts';
 import type { SessionStatus } from '../storage/repos/sessions.ts';
 import type { SubagentSet } from '../subagents/load.ts';
 import type { TelemetrySink } from '../telemetry/index.ts';
@@ -694,6 +696,22 @@ export type ExitReason = (typeof EXIT_REASONS)[number];
 export const isRecapEnabled = (config: { recapEnabled?: boolean }): boolean =>
   config.recapEnabled !== false;
 
+// Mutable cross-turn holder for the session-scoped BgManager (spec
+// ORCHESTRATION.md §3B). Built once by the loop on the first turn (the
+// manager needs the sessionId), reused on later turns so background
+// processes survive the turn boundary. Owned by the REPL, which calls
+// `manager.cleanup()` at session exit. See `HarnessConfig.bgManagerHolder`.
+export interface BgManagerHolder {
+  // Filled by the loop on the first turn; reused thereafter. Undefined
+  // until the first turn's createSession resolves.
+  manager: BgManager | undefined;
+  // Cross-turn event sink. The manager is built once, so its onEvent is
+  // wired (by the loop) to call this — routing bg_started/bg_ended to
+  // the current turn's observer, or to the notification channel when
+  // idle (§3B.3, wired in a later slice).
+  onEvent: (event: HarnessEvent) => void;
+}
+
 export interface HarnessConfig {
   provider: Provider;
   toolRegistry: ToolRegistry;
@@ -720,6 +738,21 @@ export interface HarnessConfig {
   // createBgManager. When absent, bg-aware tools surface a clean
   // tool-error.
   bgLogDir?: string;
+  // Session-scoped BgManager holder (spec ORCHESTRATION.md §3B). The
+  // BgManager can't be built at boot like `todoStore` — it needs the
+  // sessionId, which only resolves on the first turn. So a multi-turn
+  // caller (the REPL) passes a mutable holder instead: the loop builds
+  // the manager on the first turn (after createSession) and stores it
+  // here; later turns REUSE it, so background processes survive the
+  // turn boundary instead of being SIGKILLed by the per-turn cleanup.
+  // The loop drains the manager in its outer finally ONLY when it owns
+  // it (no holder = one-shot run); an injected holder means the caller
+  // owns teardown (REPL calls `manager.cleanup()` at session exit).
+  // `onEvent` is the cross-turn sink: the manager is built once but its
+  // bg_started/bg_ended events must reach the CURRENT turn's observer
+  // (or, when idle, the notification channel — §3B.3); the loop wires
+  // the manager's onEvent to call this, and the caller routes.
+  bgManagerHolder?: BgManagerHolder;
   cwd: string;
   systemPrompt?: string;
   // Per-segment view of the same prompt for adapters that support
@@ -736,6 +769,12 @@ export interface HarnessConfig {
   // composition.
   systemPromptHash?: string;
   userPrompt: string;
+  // Origin of `userPrompt` (migration 075). Default 'operator' (the human
+  // typed it). The REPL passes 'system' for a wake-turn whose input is a
+  // bg_done notification, so it persists as a system message — not audited
+  // or resumed as operator input. The provider still sees it as user
+  // context either way.
+  userPromptSource?: MessageSource;
   budget?: Partial<RunBudget>;
   // Operational effort level (`src/harness/effort.ts`). Set via the
   // `/effort` slash command. Drives BOTH axes by resolution, not by

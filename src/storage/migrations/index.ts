@@ -72,6 +72,7 @@ import { migration071ContextPinsModelCreatedBy } from './071-context-pins-model-
 import { migration072CompactionEvents } from './072-compaction-events.ts';
 import { migration073CompactionEventsCallUsage } from './073-compaction-events-call-usage.ts';
 import { migration074MessagesEffort } from './074-messages-effort.ts';
+import { migration075MessagesSource } from './075-messages-source.ts';
 
 export interface Migration {
   id: number;
@@ -154,4 +155,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration072CompactionEvents,
   migration073CompactionEventsCallUsage,
   migration074MessagesEffort,
+  migration075MessagesSource,
 ];

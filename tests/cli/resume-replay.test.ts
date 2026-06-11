@@ -86,6 +86,32 @@ describe('replaySessionMessages — text + tool replay (Phase 3)', () => {
     });
   });
 
+  test('a system-source user message replays as info, not an operator-submit bar (migration 075)', () => {
+    const db = setupSession('s2');
+    appendMessage(db, {
+      id: 'u1',
+      sessionId: 's2',
+      role: 'user',
+      content: '[background] `npm test` exited (exit 1). process_id=p1 — read complete output…',
+      source: 'system',
+      createdAt: 1_000_000,
+    });
+    appendMessage(db, {
+      id: 'a1',
+      sessionId: 's2',
+      parentId: 'u1',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'noted' }],
+      createdAt: 1_001_000,
+    });
+    const { bus, events } = recordEvents();
+    replaySessionMessages(db, 's2', bus);
+    // The harness-injected input must NOT replay as an operator bar.
+    expect(events.map((e) => e.type)).not.toContain('user:submit');
+    expect(events[0]?.type).toBe('info');
+    expect((events[0] as { message?: string }).message).toContain('[background]');
+  });
+
   test('interleaved text blocks emit as separate deltas in block order (no \\n join)', () => {
     // Walker emits one assistant:delta per text block, not a joined
     // concat. The reducer's pendingAssistant accumulates the deltas
