@@ -2,6 +2,32 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-11] feat(repl): generic notification channel + wake-when-idle (Slice C)
+
+Replaces the inbox-as-notification hack (Slice B) with a dedicated, generic
+notification channel and the automatic wake (ORCHESTRATION §3B.4). A future
+reminder tool plugs in as another `kind`, nothing else changes.
+
+The channel (`notifications`, discriminated by `kind`, `bg_done` first) is
+DISTINCT from the operator inbox: operator intent vs system events. Behavior:
+idle → `drainNotifications` fires a turn on its own (wake-when-idle); during a
+turn → drains at the boundary (`drainInbox` falls through to it when the inbox is
+empty — operator input has priority, semi-push). The five §3B.4 guards: exiting,
+busy, operator-typing (`input.value` non-empty), consecutive-wake cap (3, reset
+by `startOperatorTurn` on any operator submit — anti-loop), and budget
+(`cumulative.costUsd >= maxCostUsd` → semi-push). Coalescing is natural
+(`splice(0)` drains all pending into one turn); the spec's 1500ms debounce timer
+is deliberately dropped — responsiveness for the common single-process case beats
+grouping a rare spaced-out burst, and the cap already backstops turn count.
+
+Each drained notification is also emitted as a `● `-prefixed system `info` line so
+the wake-turn isn't a ghost: the operator sees in the scrollback WHY the session
+woke (distinct from an operator-submit bar — the whole point of a separate
+channel). The three operator startTurn sites now go through `startOperatorTurn`
+(resets the wake counter). Tests: busy→boundary (semi-push) and idle→wake (a turn
+fired with no operator input). Spec §3B.3/§3B.4/§3B.7 to be realigned next
+(channel-not-inbox, no debounce timer, the bash bg/subagents chips).
+
 ## [2026-06-11] feat(repl): bg_done notification on process completion (semi-push)
 
 Slice B of ORCHESTRATION §3B.3. When a bash_background process finishes, the

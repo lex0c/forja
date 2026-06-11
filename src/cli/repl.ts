@@ -695,26 +695,26 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           cause: e.status,
           exitCode: e.exitCode,
         });
-        // Slice B (spec ORCHESTRATION.md §3B.3): notify the model that a
-        // background process finished by enqueuing a bg_done item into
-        // the inbox — it becomes the next turn's input. Without an
-        // auto-wake (Slice C) this is SEMI-PUSH: it lands on the next
-        // turn boundary (drainInbox) or the operator's next submit.
+        // Notify the model that a background process finished (spec
+        // ORCHESTRATION.md §3B.3): enqueue a bg_done into the generic
+        // notification channel. When idle it wakes a turn (§3B.4); during
+        // a turn it drains at the next boundary (semi-push).
         //
         // Gated on `!exiting`: the session-exit cleanup() SIGKILLs every
         // surviving process, each firing bg_ended; enqueuing during
         // teardown is pointless (no turn will consume it) and would dirty
         // the final state. The full output stays recoverable via
-        // bash_output (process_id below); inlining a head-tail of it is a
-        // follow-up refinement.
+        // bash_output (process_id in the notification).
         const command = bgCommands.get(e.processId) ?? '(background command)';
         bgCommands.delete(e.processId);
         if (!exiting) {
-          const code = e.exitCode === null ? '' : ` (exit ${e.exitCode})`;
-          enqueueInbox(
-            `[background] \`${command}\` ${e.status}${code}. ` +
-              `process_id=${e.processId} — read its output with bash_output.`,
-          );
+          enqueueNotification({
+            kind: 'bg_done',
+            command,
+            status: e.status,
+            exitCode: e.exitCode,
+            processId: e.processId,
+          });
         }
       }
     },
@@ -1365,6 +1365,49 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   const inbox: { id: string; text: string }[] = [];
   let inboxSeq = 0;
   let drainInbox: () => void = () => {};
+
+  // NOTIFICATIONS (spec ORCHESTRATION.md §3B). A generic channel for
+  // SYSTEM events that should reach the model — a bg process finished
+  // (now), a reminder fired (later). DISTINCT from the operator inbox
+  // above: that's operator intent, this is system events. Each producer
+  // enqueues its own `kind`; the channel formats + drains. Idle →
+  // auto-drains (wake-when-idle, §3B.4, fires a turn); during a turn →
+  // drains at the next boundary (semi-push). A future reminder tool just
+  // adds a `kind` here — nothing else in the channel changes.
+  // `drainNotifications` is forward-declared like `drainInbox` (body
+  // assigned after startTurn, since the wake calls startTurn).
+  type Notification = {
+    id: string;
+    kind: 'bg_done';
+    command: string;
+    status: 'exited' | 'killed' | 'failed';
+    exitCode: number | null;
+    processId: string;
+  };
+  const notifications: Notification[] = [];
+  let notifSeq = 0;
+  let drainNotifications: () => void = () => {};
+  // Anti-loop backstop (§3B.4): max auto-wake turns fired with NO
+  // operator input between them. Reset on every operator submit
+  // (startOperatorTurn). Without it, a wake-turn that itself spawns more
+  // bg work could ping-pong the session awake forever.
+  let consecutiveWakes = 0;
+  const MAX_CONSECUTIVE_WAKES = 3;
+  const formatNotification = (n: Notification): string => {
+    // One `kind` today; this grows a switch as producers are added.
+    const code = n.exitCode === null ? '' : ` (exit ${n.exitCode})`;
+    return (
+      `[background] \`${n.command}\` ${n.status}${code}. ` +
+      `process_id=${n.processId} — read its output with bash_output.`
+    );
+  };
+  const enqueueNotification = (n: Omit<Notification, 'id'>): void => {
+    notifications.push({ ...n, id: String(notifSeq++) });
+    // Wake-when-idle: nothing running → drain now (fires a turn). During
+    // a turn, the boundary drain (drainInbox → drainNotifications) gets
+    // it instead.
+    if (!isBusy()) queueMicrotask(() => drainNotifications());
+  };
   // Id of the queued message currently lifted into the input via ↑ for
   // editing, or null. The message STAYS in `inbox` the whole time (never
   // removed), so an edit can never lose it; this only marks which one is
@@ -1978,18 +2021,64 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // HERE (final, post-edit text) — not at enqueue — so an edited message
   // never leaves its stale original in the ↑/Ctrl-R recall pool. The
   // concatenated body is not recorded; each message is recorded separately.
+  // Operator-submitted turn (inbox drain / editor submit / reverse-search
+  // accept). Resets the consecutive-wake counter: operator input breaks
+  // the auto-wake chain (§3B.4 — the cap only counts wakes with no
+  // operator turn between them).
+  const startOperatorTurn = (text: string): void => {
+    consecutiveWakes = 0;
+    startTurn(text);
+  };
+
   drainInbox = (): void => {
     if (exiting || isBusy()) return;
     const editId = editingQueued?.id ?? null;
     const drained = inbox.filter((m) => m.id !== editId);
-    if (drained.length === 0) return;
+    if (drained.length === 0) {
+      // Inbox empty → let the notification channel try. Operator input
+      // has priority (§3B.4): notifications only wake when nothing the
+      // operator queued is waiting.
+      drainNotifications();
+      return;
+    }
     const kept = inbox.filter((m) => m.id === editId);
     inbox.length = 0;
     for (const m of kept) inbox.push(m);
     const texts = drained.map((m) => m.text);
     for (const t of texts) recordHistorySubmit(t);
     bus.emit({ type: 'inbox:drained', ts: now(), texts });
-    startTurn(concatQueuedBodies(texts));
+    startOperatorTurn(concatQueuedBodies(texts));
+  };
+
+  // Wake-when-idle (spec ORCHESTRATION.md §3B.4). Fires a turn from the
+  // pending notifications when the session is idle. Each guard is a §3B.4
+  // gate; failing any leaves the notifications queued (semi-push) for a
+  // later boundary or the operator's next submit.
+  drainNotifications = (): void => {
+    if (exiting || isBusy()) return;
+    if (notifications.length === 0) return;
+    // Operator-typing gate: don't steal the turn while they compose.
+    if (renderer.state().input.value.length > 0) return;
+    // Consecutive-wake cap: anti-loop backstop.
+    if (consecutiveWakes >= MAX_CONSECUTIVE_WAKES) return;
+    // Budget gate → degrade to semi-push when the cap is already spent.
+    const cap = baseConfig.budget?.maxCostUsd;
+    if (cap !== undefined && cumulative.costUsd >= cap) return;
+    // Coalesce: every pending notification goes into ONE wake-turn, so a
+    // burst of completions doesn't fire a turn each.
+    const drained = notifications.splice(0);
+    consecutiveWakes += 1;
+    const texts = drained.map(formatNotification);
+    // Surface each notification in the scrollback as a system `info`
+    // line (distinct from an operator-submit bar — that's the point of a
+    // separate channel) so the operator sees WHY the session woke and
+    // what the turn is about. Without this the wake-turn would run with
+    // no visible trace of its trigger. Applies to the semi-push path too
+    // (this drain also runs at the boundary).
+    for (const t of texts) {
+      bus.emit({ type: 'info', ts: now(), tone: 'secondary', message: `● ${t}` });
+    }
+    startTurn(texts.join('\n'));
   };
 
   // Async cleanup. Only called via `requestShutdown` below — the
@@ -2705,7 +2794,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           bus.emit({ type: 'user:submit', ts: now(), text: match });
           recordHistorySubmit(match);
           closeReverseSearch();
-          startTurn(match);
+          startOperatorTurn(match);
           cancelExitArm();
           return true;
         }
@@ -3265,7 +3354,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       } else {
         bus.emit({ type: 'user:submit', ts: now(), text: result.submit.text });
         recordHistorySubmit(result.submit.text);
-        startTurn(result.submit.text);
+        startOperatorTurn(result.submit.text);
       }
     }
 

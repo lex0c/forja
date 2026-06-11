@@ -1504,11 +1504,12 @@ describe('repl — boot + smoke', () => {
     await tick();
     const holder = ra.captured[0]?.configs[0]?.bgManagerHolder;
     expect(holder).toBeDefined();
-    // A bg process starts then finishes while the turn is in flight.
+    // A bg process starts then finishes while the turn is IN FLIGHT —
+    // the busy path: no wake; the notification waits for the boundary.
     holder?.onEvent({ type: 'bg_started', processId: 'p1', command: 'npm run build', label: null });
     holder?.onEvent({ type: 'bg_ended', processId: 'p1', status: 'exited', exitCode: 0 });
-    // End turn 1 → drainInbox runs at the boundary → the queued bg_done
-    // notification becomes turn 2's input (semi-push; no auto-wake yet).
+    // End turn 1 → boundary drain → the queued bg_done notification
+    // becomes turn 2's input (semi-push).
     ra.finish(0);
     await tick();
     expect(ra.captured).toHaveLength(2);
@@ -1517,6 +1518,41 @@ describe('repl — boot + smoke', () => {
     expect(prompt).toContain('npm run build');
     expect(prompt).toContain('exit 0');
     expect(prompt).toContain('p1');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a bg process finishing while IDLE auto-wakes a turn (wake-when-idle, §3B.4)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    // Turn 1, then let it finish so the session is idle.
+    stdin.feed('first\r');
+    await tick();
+    const holder = ra.captured[0]?.configs[0]?.bgManagerHolder;
+    holder?.onEvent({ type: 'bg_started', processId: 'p1', command: 'npm test', label: null });
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(1); // idle — no turn pending
+
+    // The bg process finishes while IDLE → wake-when-idle fires a turn on
+    // its own, with no operator input.
+    holder?.onEvent({ type: 'bg_ended', processId: 'p1', status: 'exited', exitCode: 0 });
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    const prompt = ra.captured[1]?.configs[0]?.userPrompt ?? '';
+    expect(prompt).toContain('[background]');
+    expect(prompt).toContain('npm test');
     ra.finish(1);
     await tick();
     stdin.feed('\x04');
