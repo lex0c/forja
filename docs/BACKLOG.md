@@ -2,6 +2,47 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-11] reminder tool — spec PR + implementation
+
+New branch `feat/reminder-tool`. Adds the second producer to the
+notification channel that ORCHESTRATION §3B.3 reserved: a `reminder`
+family that observes the CLOCK (vs `bg_done` observing process exits).
+Reuses the channel, wake-when-idle, the five §3B.4 guards, the `● …`
+scrollback echo, and the `source: 'system'` wake-turn input (migration
+075) untouched — the new part is the time producer.
+
+Decisions (operator): in-memory session-scoped (dies at exit like
+bash_background §3B.1 and the inbox — no migration, preserves §0
+"nothing cross-session"); three tools `reminder` / `reminder_list` /
+`reminder_cancel` (palette symmetric to bash_*/task_*); relative delay
+only (`in: "10m"`), absolute time the model converts to a delta.
+
+Spec PR (before code): CONTRACTS §2.6.10 new ADR reconciling the
+"meta-cognition is not a tool" principle (§2.6.8) — scheduling a
+temporal event is an action in the world (at(1)/cron-like), distinct
+from recall-of-fact (memory) or plan management (todo_write);
+CONTRACTS §2.6.5d catalog + `ReminderNotification` envelope;
+ORCHESTRATION §3B.9 (time producer, in-memory scheduler, cleanup);
+STATE_MACHINE §2.2 wake fires on `bg_done ∨ reminder_fired`.
+
+Code shipped: `src/reminders/` scheduler (injectable clock/timer →
+deterministic tests) + duration parser; the three tools; the repl
+`Notification` type generalized to a `kind`-union with a switch
+formatter; REPL wiring (boot-created scheduler — no holder, no
+sessionId dependency — onFire → enqueueNotification, cleanup in
+shutdown); `ToolContext.reminderScheduler` + `HarnessConfig` forward +
+loop injection; `requiresReminderScheduler` metadata threaded through
+the side-effect oracle (bootstrap + subagent-child) like
+`requiresBgManager`. One-shot `run.ts` passes no scheduler → the tools
+surface a clean error.
+
+Eval: followed the bg precedent (no `evals/bg/` shell eval exists — it
+was aspirational in the spec). Coverage is the deterministic scheduler
+tests (fake clock: fire/list/cancel/cleanup/horizon-cap) + tool tests
++ a repl-level integration test proving a reminder firing while idle
+auto-wakes a turn whose input is `[reminder] <note>`, persisted as a
+system message — the same wake path bg_done already exercises.
+
 ## [2026-06-11] bg: bound grep output by bytes + memory, not just matches
 
 Robustness review of the branch (against develop) flagged grep mode as
