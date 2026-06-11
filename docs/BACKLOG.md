@@ -2,6 +2,42 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-11] spec: bash_background genuinely persistent + notify + wake
+
+Spec-only PR (code follows, spec-first). `bash_background` is a "background" tool
+that doesn't actually run in the background: the BgManager is per-`runAgent` and
+its `cleanup()` SIGKILLs every process in the outer finally of every turn, so a
+process launched "in the background" dies the moment the turn closes — the tool's
+purpose is nullified. This rewrites its operational semantics so it runs
+genuinely in the background.
+
+New `ORCHESTRATION.md §3B` is the normative core: (1) cross-turn lifecycle —
+BgManager becomes session-scoped (injected by the REPL, like `todoStore`),
+`cleanup()` runs only at session exit; a process lives until natural exit /
+`bash_kill` / session exit; cross-turn, NOT cross-process (dies with the agent,
+no daemon — the §0 "no cross-session background" rule holds). (2) durable output
+— no new storage; logs on disk + the `background_processes` row already make
+output recoverable cross-turn and post-compaction via `bash_output` (reads any
+status); a new `bash_list` recovers a lost `process_id`. (3) completion
+notification — on settle the BgManager pushes a `bg_done` item into the in-memory
+inbox (head-tailed per OUTPUT_POLICY) through a session-scoped sink, not the dead
+turn's onEvent. (4) automatic wake-when-idle — a process finishing while idle
+fires a turn, gated by measured guards (coalescing/debounce, budget→semi-push,
+operator-typing, consecutive-wake cap, user-submit precedence). Default posture:
+persistence+notify is the new baseline (the fix), behind a deprecated
+`bash.background_kill_at_turn_end` escape hatch; auto-wake ships opt-in behind
+experimental `bash.background_auto_wake`.
+
+Coherence anchors: `CONTRACTS.md §2.6.5d` — `bash_background` row updated, new
+`bash_list` row, and §2.6.5d.1 (the `bg_done` envelope + recovery); `AGENTIC_CLI`
+§0 invariant (cross-turn-not-cross-session) + tool list; `STATE_MACHINE.md §2.2
+[idle]` transition on `bg_done` + in-flight-during-idle invariant, and §9 event
+table.
+
+This supersedes the abandoned `spec/detached-subagents-wake` branch (which
+modeled this as a `task_detach` SUBAGENT mode — wrong target; the operator wants
+detached bash COMMANDS, and bash_background already exists as the base).
+
 ## [2026-06-10] fix(repl): boot parity with the one-shot harness
 
 `BootstrapResult` is consumed by BOTH `cli/run.ts` (one-shot) and `cli/repl.ts`

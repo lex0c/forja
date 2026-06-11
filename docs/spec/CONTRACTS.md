@@ -236,11 +236,31 @@ Família para processos de longa duração e coordenação não-blocking. Tools 
 
 | Tool | Input | Output | Side effects | Idempotente | Custo típico |
 |---|---|---|---|---|---|
-| `bash_background` | `{ cmd, label }` | `{ process_id, started_at }` | `writes: true`, `exec: true`, spawna processo | não | ~10ms (spawn) |
-| `bash_output` | `{ process_id, since? }` | `{ stdout, stderr, cursor, exit_code? }` | nenhum (leitura) | sim (cursor avança) | ~5ms |
+| `bash_background` | `{ cmd, label }` | `{ process_id, started_at }` | `writes: true`, `exec: true`, spawna processo que **sobrevive ao turn** e **notifica na conclusão** (`ORCHESTRATION.md §3B`) | não | ~10ms (spawn) |
+| `bash_output` | `{ process_id, since? }` | `{ stdout, stderr, cursor, exit_code? }` | nenhum (leitura); lê de processo `running`/`exited`/`killed` | sim (cursor avança) | ~5ms |
 | `bash_kill` | `{ process_id, signal? }` | `{ killed: bool, exit_code }` | mata subprocess | sim (idempotente em pid morto) | ~10ms graceful, +5s SIGKILL |
+| `bash_list` | `{ status? }` | `{ processes: [{ process_id, command, label, status, exit_code, spawned_at }], running, total }` | nenhum (snapshot) | sim | ~5ms |
 | `wait_for` | `{ condition, timeout_ms, poll_interval_ms? }` | `{ matched, condition_met, elapsed_ms, payload? }` | bloqueia loop (sem LLM call); cancellable | sim | varia; bound por `timeout_ms` |
 | `monitor` | `{ condition, duration_ms?, max_events? }` | `{ events[], reason: 'duration'|'max_events'|'cancelled' }` | streama eventos durante duração | sim | varia; bound por args |
+
+#### 2.6.5d.1 Lifecycle persistente e o envelope `bg_done`
+
+`bash_background` roda o processo **genuinamente em background** (`ORCHESTRATION.md §3B`): sobrevive ao fim do turn, vive até término natural / `bash_kill` / exit da sessão (cross-turn, **não** cross-process), e **notifica** o modelo na conclusão em vez de exigir poll. Na conclusão, o `BgManager` empurra um item no INBOX in-memory (`MEMORY.md`):
+
+```ts
+interface BgDoneInbox {
+  kind: 'bg_done';
+  processId: string;
+  command: string;
+  status: 'exited' | 'killed' | 'failed';
+  exitCode: number | null;
+  summary: string;   // head-tail do output por OUTPUT_POLICY.md §6; full via bash_output(processId)
+}
+```
+
+- Output é durável (logs em disco + row em `background_processes`); `bash_output` o recupera **mesmo após o término**, cross-turn e pós-compaction, enquanto o modelo tiver o `process_id`.
+- `bash_list` recupera o `process_id` perdido (turns depois, compaction) — snapshot read-only dos bg da sessão; análogo de `task_list`.
+- O wake-when-idle que pode disparar um turn a partir do `bg_done` é timing puro: `ORCHESTRATION.md §3B.4` + `STATE_MACHINE.md §2.2`/§9.
 
 **Razão da família:**
 
