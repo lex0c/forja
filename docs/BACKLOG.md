@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-10] chore(tools): withdraw monitor / wait_for from the model surface
+
+The model should no longer see or call `monitor` and `wait_for`. Rather than
+delete them, withdraw only the model-facing surface: dropped both from
+`BUILTIN_TOOLS` (so `buildToolDefs` never advertises them to any provider) while
+keeping the tool modules, their `index.ts` re-exports, and the underlying
+`src/wait/` subsystem intact — still importable internally and by tests, and the
+display vocab stays so historical audit rows that reference these calls still
+render. Removed them from the two playbooks that declared them (`debug`,
+`perf-investigate`); `perf-investigate`'s body said "you wait via `wait_for`" —
+now "poll its completion with `bash_output`" (bash_background stays). Net effect:
+the bash_background workflow loses event-driven waiting and falls back to polling
+via `bash_output`. Updated the bootstrap toolset assertion to match.
+
 ## [2026-06-10] feat(tui): in-flight async chip in the footer
 
 The footer reserved a `bg N` token (UI.md §4.10.6) for background processes
