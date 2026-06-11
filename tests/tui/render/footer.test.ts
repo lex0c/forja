@@ -275,12 +275,34 @@ describe('renderFooter', () => {
     });
   });
 
-  test('bg processes do NOT surface in the footer (chip removed)', () => {
-    const s = startedSession();
-    s.bgProcesses.set('p1', { processId: 'p1', command: 'npm run dev' });
-    s.bgProcesses.set('p2', { processId: 'p2', command: 'pytest' });
-    const out = renderFooter(s, caps) ?? '';
-    expect(out).not.toContain('bg ');
+  describe('in-flight bg processes chip (ORCHESTRATION §3B)', () => {
+    test('surfaces a `N bg process` chip counting running bg processes', () => {
+      const s = startedSession();
+      s.bgProcesses.set('p1', { processId: 'p1', command: 'npm run dev' });
+      s.bgProcesses.set('p2', { processId: 'p2', command: 'pytest' });
+      const out = renderFooter(s, caps) ?? '';
+      expect(out).toContain('2 bg process');
+    });
+
+    test('no bg processes drops the chip entirely', () => {
+      const out = renderFooter(startedSession(), caps) ?? '';
+      expect(out).not.toContain('bg process');
+    });
+
+    test('leads the right cluster — bg reads before the static model chip', () => {
+      const s = startedSession();
+      s.bgProcesses.set('p1', { processId: 'p1', command: 'npm run dev' });
+      const out = renderFooter(s, caps) ?? '';
+      expect(out.indexOf('1 bg process')).toBeLessThan(out.indexOf('sonnet-4.6'));
+    });
+
+    test('painted success (green) — distinct from the dim cumulative chips', () => {
+      const colored: Capabilities = { ...caps, color: 'basic' };
+      const s = startedSession();
+      s.bgProcesses.set('p1', { processId: 'p1', command: 'npm run dev' });
+      const out = renderFooter(s, colored) ?? '';
+      expect(out).toContain(`${CSI}32m1 bg process${CSI}0m`);
+    });
   });
 
   test('memoryCount does NOT surface in the footer (chip removed)', () => {

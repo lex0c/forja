@@ -2,6 +2,21 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-11] feat(tui): `N bg process` footer chip
+
+Surfaces in-flight bash_background processes in the footer (ORCHESTRATION §3B.7).
+A green `N bg process` chip leads the footer's right cluster — painted `success`,
+not `dim`, since it's the one chip there that reflects work running *now*, not
+cumulative session state. Now that bg processes survive the turn boundary, it's
+also the operator's cue that a launched command is still alive between turns.
+Reads `state.bgProcesses.size` (fed by the REPL holder's onEvent → bus → reducer),
+suppressed at 0. Replaces the old "bg do not surface" footer test with coverage
+of the chip (count, suppression, lead position, green paint).
+
+Note: this overlaps the `N async` chip on branch feat/tui-async-footer-chip (same
+`bgProcesses` source, same slot). On merge, keep one — `N bg process` is the
+chosen label.
+
 ## [2026-06-11] feat(repl): wire the session-scoped BgManager holder
 
 The REPL half of ORCHESTRATION §3B (the loop half landed in the prior commit).

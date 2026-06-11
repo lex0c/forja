@@ -107,6 +107,18 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
 
   const status = state.status;
   const rightParts: string[] = [];
+  // Background processes in flight (bash_background — ORCHESTRATION.md
+  // §3B). Leads the right cluster so this live signal reads before the
+  // static model/token chips, and is painted `success` (green) — not
+  // `dim` — to stand apart: it's the one chip here that reflects work
+  // running *now*, not cumulative session state. Now that bg processes
+  // survive the turn boundary, this is also the operator's cue that a
+  // launched command is still alive between turns. Suppressed at size 0
+  // so the slot collapses the instant the last process ends.
+  const bgCount = state.bgProcesses.size;
+  if (bgCount > 0) {
+    rightParts.push(paint(caps, 'success', `${bgCount} bg process`));
+  }
   if (status.model !== null && status.model !== '') {
     rightParts.push(dim(caps, status.model));
   }
