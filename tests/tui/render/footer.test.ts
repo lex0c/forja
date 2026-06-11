@@ -275,12 +275,34 @@ describe('renderFooter', () => {
     });
   });
 
-  test('bg processes do NOT surface in the footer (chip removed)', () => {
-    const s = startedSession();
-    s.bgProcesses.set('p1', { processId: 'p1', command: 'npm run dev' });
-    s.bgProcesses.set('p2', { processId: 'p2', command: 'pytest' });
-    const out = renderFooter(s, caps) ?? '';
-    expect(out).not.toContain('bg ');
+  describe('in-flight async chip (bash_background processes)', () => {
+    test('surfaces a `N async` chip counting running bg processes', () => {
+      const s = startedSession();
+      s.bgProcesses.set('p1', { processId: 'p1', command: 'npm run dev' });
+      s.bgProcesses.set('p2', { processId: 'p2', command: 'pytest' });
+      const out = renderFooter(s, caps) ?? '';
+      expect(out).toContain('2 async');
+    });
+
+    test('no running processes drops the chip entirely', () => {
+      const out = renderFooter(startedSession(), caps) ?? '';
+      expect(out).not.toContain('async');
+    });
+
+    test('leads the right cluster — async reads before the static model chip', () => {
+      const s = startedSession();
+      s.bgProcesses.set('p1', { processId: 'p1', command: 'npm run dev' });
+      const out = renderFooter(s, caps) ?? '';
+      expect(out.indexOf('async')).toBeLessThan(out.indexOf('sonnet-4.6'));
+    });
+
+    test('painted success (green) — distinct from the dim cumulative chips', () => {
+      const colored: Capabilities = { ...caps, color: 'basic' };
+      const s = startedSession();
+      s.bgProcesses.set('p1', { processId: 'p1', command: 'npm run dev' });
+      const out = renderFooter(s, colored) ?? '';
+      expect(out).toContain(`${CSI}32m1 async${CSI}0m`);
+    });
   });
 
   test('memoryCount does NOT surface in the footer (chip removed)', () => {
@@ -507,6 +529,20 @@ describe('renderFooter', () => {
       expect(out).not.toContain('shift+tab to change');
     });
 
+    test('slash + soft-aborted run swaps the cue to "esc again to force"', () => {
+      // The slash branch has its own copy of the interrupt-cue logic;
+      // this locks that it makes the softInterrupted flip identically
+      // to the mode-cue branch (the shared interruptCue helper). No
+      // prior test covered slash open AND softInterrupted together.
+      const s = startedSession();
+      s.slash = { suggestions: [{ name: 'a', description: '' }], selectedIdx: 0 };
+      s.busy = true;
+      s.softInterrupted = true;
+      const out = renderFooter(s, caps);
+      expect(out).toContain('esc again to force');
+      expect(out).not.toContain('esc to interrupt');
+    });
+
     test('exitArmed beats slash (gate cue still wins)', () => {
       // Defense in depth: if the operator somehow has the popover
       // open AND the exit gate armed (unlikely — typing during slash
@@ -532,24 +568,18 @@ describe('renderFooter', () => {
     });
 
     test('exit cue takes precedence over running interrupt cue (operator priority)', () => {
-      // Edge case: gate armed AND a tool is running. Producer
+      // Edge case: gate armed AND a turn is running. Producer
       // shouldn't normally arm during a run (handleIdleInterrupt
       // gates on `running`), but defense in depth — if both flags
       // are true, the exit cue wins because it's a 1-tap-to-exit
       // hazard and the operator's next keystroke is the most
-      // load-bearing.
+      // load-bearing. `busy` is what makes this a REAL precedence
+      // test: without it isRunning is false and the interrupt cue
+      // would never show regardless of exitArmed, so the assertion
+      // below would pass vacuously.
       const s = startedSession();
       s.exitArmed = { at: 1000 };
-      const tool: ActiveTool = {
-        toolId: 't1',
-        name: 'bash',
-        activeVerb: 'Executing',
-        finalVerb: 'Executed',
-        subject: null,
-        startedAt: 0,
-        preview: [],
-      };
-      s.activeTools.set('t1', tool);
+      s.busy = true;
       const out = renderFooter(s, caps);
       expect(out).toContain('Press Ctrl-C again to exit');
       expect(out).not.toContain('esc to interrupt');

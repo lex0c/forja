@@ -45,6 +45,14 @@ const formatCost = (usd: number): string => `$${(Math.round(usd * 100) / 100).to
 // before `awaitingProvider`), so the cue never flickers off mid-turn.
 const isRunning = (state: LiveState): boolean => state.busy;
 
+// Single source for the mid-run interrupt cue, shared by the slash and
+// mode-cue branches so they can't drift. Once the operator soft-aborts
+// (one Esc), the loop has acknowledged and is winding down, so the cue
+// flips from "esc to interrupt" to "esc again to force" — both branches
+// must make that flip identically.
+const interruptCue = (state: LiveState, caps: Capabilities): string =>
+  dim(caps, state.softInterrupted ? 'esc again to force' : 'esc to interrupt');
+
 // `secondary` (SGR 90) rather than `dim` (SGR 2): xterm with default
 // config renders SGR 2 identical to the default foreground, so
 // faint-painted cues become invisible.
@@ -74,7 +82,7 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
     // because esc is still load-bearing if a run is in flight.
     const leftParts: string[] = [];
     if (isRunning(state)) {
-      leftParts.push(dim(caps, state.softInterrupted ? 'esc again to force' : 'esc to interrupt'));
+      leftParts.push(interruptCue(state, caps));
     }
     left = leftParts.join(sep);
   } else {
@@ -95,7 +103,7 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
       // newline affordance is noise — and it's the segment that pushes
       // the load-bearing interrupt cue past the right edge on narrow
       // (80-col) terminals. Surface the interrupt cue instead.
-      leftParts.push(dim(caps, state.softInterrupted ? 'esc again to force' : 'esc to interrupt'));
+      leftParts.push(interruptCue(state, caps));
     } else {
       // Idle: the operator can type, so surface the multiline
       // continuation affordance for terminals/WMs that eat Shift+Enter
@@ -107,6 +115,19 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
 
   const status = state.status;
   const rightParts: string[] = [];
+  // In-flight async work (bash_background processes). Leads the right
+  // cluster so the live signal reads before the static model/token
+  // chips, and is painted `success` (green) — not `dim` — to stand
+  // apart from them: this is the one chip here that reflects something
+  // running *now*, not cumulative session state, and green reads as
+  // "live/healthy activity". Suppressed at size 0 so the slot collapses
+  // the instant the last process ends. Restores the `bg N` token
+  // UI.md §4.10.6 reserved (then dropped) — scoped to active async
+  // only, never an idle-session decoration.
+  const asyncCount = state.bgProcesses.size;
+  if (asyncCount > 0) {
+    rightParts.push(paint(caps, 'success', `${asyncCount} async`));
+  }
   if (status.model !== null && status.model !== '') {
     rightParts.push(dim(caps, status.model));
   }

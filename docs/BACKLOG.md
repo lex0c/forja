@@ -2,6 +2,28 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-10] feat(tui): in-flight async chip in the footer
+
+The footer reserved a `bg N` token (UI.md §4.10.6) for background processes
+but then dropped it as low signal-to-noise on 80-col. The data
+(`state.bgProcesses`, fed by the `bg:start`/`bg:end` event chain — BgManager
+→ `bg_started` HarnessEvent → adapter → reducer) was tracked but never drawn.
+Restored it scoped to *active* async only: a `N async` chip leading the
+footer's right cluster, painted `success` (green) so the one "running now"
+signal stands apart from the dim cumulative chips
+(model/tokens/cost). Suppressed at size 0, so it's never idle-session
+decoration — it appears only while a `bash_background` process is alive and
+collapses the instant the last one ends. Verified end-to-end (bg_started →
+adapter → applyEvent → footer renders the chip); the earlier "not showing"
+was a short-lived process, not a wiring bug.
+
+Drive-by, from an audit of the touched function: extracted `interruptCue()` —
+the `softInterrupted ? 'esc again to force' : 'esc to interrupt'` flip was
+duplicated inline in the slash and mode-cue branches (drift risk). Strengthened
+the "exit cue beats interrupt cue" test (it set `activeTools` but not `busy`, so
+`isRunning` was false and the assertion passed vacuously — now sets `busy`, drops
+the dead `activeTools`). Added the missing slash-open + `softInterrupted` case.
+
 ## [2026-06-10] fix(repl): boot parity with the one-shot harness
 
 `BootstrapResult` is consumed by BOTH `cli/run.ts` (one-shot) and `cli/repl.ts`
