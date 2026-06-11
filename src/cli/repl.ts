@@ -674,13 +674,18 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // renderer's bgProcesses reducer consumes — emitted on the bus
   // directly, independent of any turn's adapter, so a process that
   // exits while the REPL is idle still updates that state (and any
-  // async-in-flight UI built on it). (A later slice also enqueues a
-  // bg_done notification + wake-when-idle here.) The REPL owns
+  // async-in-flight UI built on it). The bg_ended branch below also
+  // enqueues a bg_done notification into the inbox (§3B.3); automatic
+  // wake-when-idle on top of that is still a later slice. The REPL owns
   // teardown: `shutdown()` calls `manager.cleanup()` at session exit.
+  // Per-process command text, kept so a completion notification can name
+  // the command — bg_ended carries only processId/status/exitCode.
+  const bgCommands = new Map<string, string>();
   const bgManagerHolder: BgManagerHolder = {
     manager: undefined,
     onEvent: (e: HarnessEvent): void => {
       if (e.type === 'bg_started') {
+        bgCommands.set(e.processId, e.command);
         bus.emit({ type: 'bg:start', ts: now(), processId: e.processId, command: e.command });
       } else if (e.type === 'bg_ended') {
         bus.emit({
@@ -690,6 +695,27 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           cause: e.status,
           exitCode: e.exitCode,
         });
+        // Slice B (spec ORCHESTRATION.md §3B.3): notify the model that a
+        // background process finished by enqueuing a bg_done item into
+        // the inbox — it becomes the next turn's input. Without an
+        // auto-wake (Slice C) this is SEMI-PUSH: it lands on the next
+        // turn boundary (drainInbox) or the operator's next submit.
+        //
+        // Gated on `!exiting`: the session-exit cleanup() SIGKILLs every
+        // surviving process, each firing bg_ended; enqueuing during
+        // teardown is pointless (no turn will consume it) and would dirty
+        // the final state. The full output stays recoverable via
+        // bash_output (process_id below); inlining a head-tail of it is a
+        // follow-up refinement.
+        const command = bgCommands.get(e.processId) ?? '(background command)';
+        bgCommands.delete(e.processId);
+        if (!exiting) {
+          const code = e.exitCode === null ? '' : ` (exit ${e.exitCode})`;
+          enqueueInbox(
+            `[background] \`${command}\` ${e.status}${code}. ` +
+              `process_id=${e.processId} — read its output with bash_output.`,
+          );
+        }
       }
     },
   };

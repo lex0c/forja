@@ -1468,12 +1468,11 @@ describe('repl — boot + smoke', () => {
     // stays undefined here.
     expect(holder1?.manager).toBeUndefined();
     // onEvent is a pass-through sink to the bus — exercising it must not
-    // throw and must not depend on a live turn (it's the idle path too).
+    // throw and must not depend on a live turn. Only `bg_started` here:
+    // `bg_ended` has the additional bg_done-notification side effect,
+    // covered by its own semi-push test below.
     expect(() =>
       holder1?.onEvent({ type: 'bg_started', processId: 'p1', command: 'sleep 1', label: null }),
-    ).not.toThrow();
-    expect(() =>
-      holder1?.onEvent({ type: 'bg_ended', processId: 'p1', status: 'exited', exitCode: 0 }),
     ).not.toThrow();
     // Turn 2 must receive the SAME holder instance — it's session-scoped,
     // so the loop reuses the manager it stored there on turn 1.
@@ -1482,6 +1481,42 @@ describe('repl — boot + smoke', () => {
     stdin.feed('second\r');
     await tick();
     expect(ra.captured[1]?.configs[0]?.bgManagerHolder).toBe(holder1);
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('bg completion enqueues a bg_done notification that becomes the next turn (semi-push, §3B.3)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    // Turn 1.
+    stdin.feed('first\r');
+    await tick();
+    const holder = ra.captured[0]?.configs[0]?.bgManagerHolder;
+    expect(holder).toBeDefined();
+    // A bg process starts then finishes while the turn is in flight.
+    holder?.onEvent({ type: 'bg_started', processId: 'p1', command: 'npm run build', label: null });
+    holder?.onEvent({ type: 'bg_ended', processId: 'p1', status: 'exited', exitCode: 0 });
+    // End turn 1 → drainInbox runs at the boundary → the queued bg_done
+    // notification becomes turn 2's input (semi-push; no auto-wake yet).
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    const prompt = ra.captured[1]?.configs[0]?.userPrompt ?? '';
+    expect(prompt).toContain('[background]');
+    expect(prompt).toContain('npm run build');
+    expect(prompt).toContain('exit 0');
+    expect(prompt).toContain('p1');
     ra.finish(1);
     await tick();
     stdin.feed('\x04');

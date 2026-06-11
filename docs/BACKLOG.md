@@ -2,6 +2,28 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-11] feat(repl): bg_done notification on process completion (semi-push)
+
+Slice B of ORCHESTRATION §3B.3. When a bash_background process finishes, the
+holder's `bg_ended` branch enqueues a `bg_done` item into the in-memory inbox —
+`[background] \`<cmd>\` exited (exit N). process_id=… — read its output with
+bash_output.` — which becomes the next turn's input. Without the auto-wake
+(Slice C) this is SEMI-PUSH: it lands on the next turn boundary (drainInbox) or
+the operator's next submit, not a turn fired on its own. Gated on `!exiting` so
+the session-exit cleanup()'s mass SIGKILL doesn't enqueue notifications nobody
+will consume. A per-process `bgCommands` map names the command (bg_ended carries
+only processId/status/exitCode); full output stays recoverable via bash_output.
+
+Test: a bg process finishing mid-turn enqueues the notification, which becomes
+turn 2's input (command + exit + process_id asserted). Adjusted the A2 holder
+smoke test — `bg_ended` now has the enqueue side effect, so the smoke only
+exercises `bg_started`.
+
+Known follow-ups (flagged, not done): the notification renders as an
+operator-style queued bar (origin-distinct, non-editable rendering is a refine),
+and the output head-tail isn't inlined yet (Slice B2). Auto-wake-when-idle is
+Slice C.
+
 ## [2026-06-11] feat(tui): split the live footer chip into `bash bg` + `subagents`
 
 Two distinct in-flight signals were collapsing into one. Renamed the bg-process
