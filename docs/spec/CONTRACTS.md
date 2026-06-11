@@ -329,6 +329,8 @@ Família que observa o **relógio** e empurra no canal de notifications (`kind: 
 
 `in` é delay relativo com sufixo `s`/`m`/`h` (`"30s"`, `"10m"`, `"2h"`), validado positivo e ≤ cap de horizonte (default 24h). O disparo acorda a sessão se `idle` (wake-when-idle, §3B.4) ou aguarda o próximo boundary se `busy` (semi-push) — mesmas guardas do `bg_done`.
 
+**Disponibilidade — só REPL interativo** (`ORCHESTRATION.md §3B.9`). Sem scheduler (one-shot `run.ts`, subagent), as três tools são **escondidas do surface** do modelo (`buildToolDefs` filtra `requiresReminderScheduler`), e um whitelist de subagent que as liste falha no `validate` — um subagent *run-to-completion* não tem estado idle para acordar.
+
 ### 2.6.6 Justificativa do teto (22 vs 10)
 
 Tools agrupam-se em **4 famílias** que economizam slots conceituais:

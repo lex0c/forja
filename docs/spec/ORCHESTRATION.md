@@ -465,7 +465,12 @@ O auto-wake é o **comportamento default**, protegido por guardas medidas **ante
 
 O canal de §3B.3 foi desenhado genérico; o `reminder` é o segundo produtor sem nenhuma mudança na mecânica de enqueue/drain/wake/guardas. ADR e reconciliação com o princípio guia ("meta-cognição não é tool") em `CONTRACTS.md §2.6.10`; catálogo em `CONTRACTS.md §2.6.5f`.
 
-**O produtor.** Um `ReminderScheduler` **in-memory, session-scoped** — mesma natureza e ciclo de vida do `BgManager` (§3B.1) e do inbox: criado pelo REPL, morre no `cleanup()` do exit da sessão. **Não** precisa do padrão *holder* do `BgManager`: o scheduler não depende do `sessionId` (não escreve em SQLite — não há storage novo, §0/§13 preservados), então o REPL o constrói direto no boot e injeta em cada turn como o `todoStore`. Em **one-shot** (`run.ts`) o scheduler é ausente: a tool retorna tool-error limpo (como `bash_background` sem `bgLogDir`) — sem próximo turn, um reminder nunca dispararia de forma útil.
+**O produtor.** Um `ReminderScheduler` **in-memory, session-scoped** — mesma natureza e ciclo de vida do `BgManager` (§3B.1) e do inbox: criado pelo REPL, morre no `cleanup()` do exit da sessão. **Não** precisa do padrão *holder* do `BgManager`: o scheduler não depende do `sessionId` (não escreve em SQLite — não há storage novo, §0/§13 preservados), então o REPL o constrói direto no boot e injeta em cada turn como o `todoStore`.
+
+**Disponibilidade — só o REPL interativo.** A família `reminder` depende do scheduler + wake-when-idle, que **só** o REPL tem. Quando o scheduler é ausente, as tools são **escondidas do surface do modelo** (`buildToolDefs` filtra `requiresReminderScheduler` quando `config.reminderScheduler` é `undefined`, espelhando o gate de `requiresOperatorConfirm`) — não basta retornar tool-error, o modelo não deve ver uma tool que não pode usar. Dois contextos sem scheduler:
+
+- **one-shot** (`run.ts`): sem próximo turn, um reminder nunca dispararia. Tools escondidas.
+- **subagent**: sessão headless *run-to-completion*, sem estado idle para acordar. Tools escondidas do filho **e** barradas no `validate` (`requiresReminderScheduler` é o 4º check — um whitelist que liste reminder falha no bootstrap com mensagem clara). Distinto de `bash_background`, que um subagent *worktree* pode usar (roda dentro do próprio run do filho, sem precisar de wake).
 
 **Disparo.** `reminder({ in, note })` agenda um `setTimeout(delay)`. Ao disparar, o scheduler empurra no canal:
 
