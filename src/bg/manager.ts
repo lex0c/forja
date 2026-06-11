@@ -26,6 +26,29 @@ import {
 // a single read but bounded.
 const DEFAULT_OUTPUT_READ_LIMIT_BYTES = 64 * 1024;
 
+// Bootstrap that delivers the bg script without putting its body in
+// argv AND without letting a stdin-reading command inside the script
+// cannibalize the rest of the script.
+//
+// Background: keeping the body out of `/proc/<pid>/cmdline` (a local
+// info-leak: `ps aux` would expose interpolated secrets) means it
+// can't ride on argv. The previous fix piped the script to `bash -s`,
+// which reads the program from fd 0 — but `-s` makes fd 0 do double
+// duty: it's both the program source AND the inherited stdin of every
+// command the script runs. A script like `cat; echo done` or
+// `read x; ...` then has its `cat`/`read` swallow the remaining
+// script lines (or EOF), so later commands silently vanish.
+//
+// This wrapper severs the two roles. `cat` drains the ENTIRE script
+// off fd 0 into a variable in one shot (before any of it executes),
+// then `eval … </dev/null` runs it with a clean, empty stdin — so a
+// `read`/`cat` in the body sees EOF immediately instead of eating the
+// program. The argv is this constant string; the body lives only in
+// the shell's memory (the variable), never in cmdline. bwrap/
+// sandbox-exec forward fd 0 already, so this needs no temp file (which
+// `--tmpfs /tmp` would mask) and no extra fd (which bwrap would close).
+const BG_SCRIPT_BOOTSTRAP = '__forja_script="$(cat)"; eval "$__forja_script" </dev/null';
+
 // Default grace period for SIGTERM → SIGKILL escalation on per-call
 // kill. Long enough for a well-behaved process to flush state and
 // exit cleanly; short enough that an operator killing a hung server
@@ -685,19 +708,22 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
       input.sandboxProfile,
       whichFn,
     );
-    // Slice 173 — info-leak fix mirrors the broker bash handler.
-    // Pre-slice `['bash', '-c', input.command]` leaked the full
-    // command body (including any interpolated secrets) into
-    // `/proc/<pid>/cmdline`, readable by any local user via
-    // `ps aux`. Switching to `['bash', '-s']` and piping the
-    // script over stdin removes the body from argv entirely. Both
-    // bwrap (Linux) and sandbox-exec (macOS) forward stdin from
-    // their own stdin to the wrapped child by default, so the
+    // Info-leak fix mirrors the broker bash handler.
+    // `['bash', '-c', input.command]` would leak the full command
+    // body (including any interpolated secrets) into
+    // `/proc/<pid>/cmdline`, readable by any local user via `ps aux`.
+    // We keep the body off argv by piping the script over stdin, but
+    // run it through BG_SCRIPT_BOOTSTRAP rather than `bash -s`: the
+    // latter aliases the program source to the inherited stdin, so a
+    // `cat`/`read` in the script eats its own remaining lines. The
+    // bootstrap drains the script into a variable, then evals it with
+    // stdin redirected to /dev/null. Both bwrap (Linux) and
+    // sandbox-exec (macOS) forward fd 0 to the wrapped child, so the
     // script reaches bash even when wrapped.
     const cmd = wrapFn({
       ...(input.sandboxProfile !== undefined ? { profile: input.sandboxProfile } : {}),
       cwd,
-      innerArgv: ['bash', '-s'],
+      innerArgv: ['bash', '-c', BG_SCRIPT_BOOTSTRAP],
       // Slice 157 (phase 2): forward per-CLI-run sandbox tmpdir so
       // the SBPL profile on darwin scopes write access. No-op on
       // linux (the option is ignored by the bwrap path) and when
@@ -751,10 +777,10 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
           ...scrubEnv(process.env),
           ...(sandboxTmpdir !== undefined ? { TMPDIR: sandboxTmpdir } : {}),
         },
-        // Slice 173 — `bash -s` reads the script from stdin. We
-        // pipe `input.command` into the child and close stdin so
-        // bash sees EOF and processes the script. The body never
-        // appears in `/proc/<pid>/cmdline`.
+        // BG_SCRIPT_BOOTSTRAP reads the script from stdin (`cat`).
+        // We pipe `input.command` into the child and close stdin so
+        // the bootstrap's `cat` sees EOF and the script runs. The
+        // body never appears in `/proc/<pid>/cmdline`.
         stdin: 'pipe',
         // Slice 153 (review): pipes instead of Bun.file(path). The
         // manager drains each pipe into the corresponding log file
@@ -788,9 +814,9 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
       // resolves on detached children — no reaping regression.
       proc.unref();
 
-      // Slice 173 — feed the bash script over stdin and close so
-      // the child sees EOF and runs the script. Best-effort: if
-      // the pipe broke before we could write (child crashed on
+      // Feed the bash script over stdin and close so the
+      // bootstrap's `cat` sees EOF and runs the script. Best-effort:
+      // if the pipe broke before we could write (child crashed on
       // exec), the child exits non-zero and `proc.exited`
       // surfaces it through the normal lifecycle. We do NOT want
       // a failed stdin write to mask a `proc spawn ok` row.
