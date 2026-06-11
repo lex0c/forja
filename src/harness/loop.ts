@@ -205,9 +205,17 @@ const exitToHarnessStatus: Record<ExitReason, HarnessResult['status']> = {
 // recording the assumption.
 export const buildToolDefs = (config: HarnessConfig): ProviderToolDef[] => {
   const operatorPresent = config.confirmPermission !== undefined;
+  // The reminder family only resolves against a session-scoped scheduler
+  // (ORCHESTRATION.md §3B.9), which only the interactive REPL builds — a
+  // one-shot run and a subagent have no next turn to wake, so they get no
+  // scheduler. Hide those tools from the surface there rather than show a
+  // tool the model would only get `scheduler_unavailable` from. Same
+  // shape as the operator-confirm gate above.
+  const reminderAvailable = config.reminderScheduler !== undefined;
   return config.toolRegistry
     .list()
     .filter((t) => operatorPresent || t.metadata.requiresOperatorConfirm !== true)
+    .filter((t) => reminderAvailable || t.metadata.requiresReminderScheduler !== true)
     .map((t) => ({
       name: t.name,
       description: t.description,
