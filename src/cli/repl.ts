@@ -683,6 +683,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // Per-process command text, kept so a completion notification can name
   // the command — bg_ended carries only processId/status/exitCode.
   const bgCommands = new Map<string, string>();
+  // NOTE: this closure references bindings declared further down
+  // (`exiting`, `enqueueNotification`) — safe ONLY because the loop
+  // builds the manager on the first turn, after the whole setup ran.
+  // Building/firing it earlier (e.g. at boot) would hit the TDZ.
   const bgManagerHolder: BgManagerHolder = {
     manager: undefined,
     onEvent: (e: HarnessEvent): void => {

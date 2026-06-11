@@ -333,7 +333,10 @@ export interface GrepOutputResult {
   exitCode: number | null;
   stdoutMatches: string[];
   stderrMatches: string[];
-  // True if either stream had more matches than `maxMatches`.
+  // True when either stream stopped early — more matches than
+  // `maxMatches`, or the per-stream byte budget was exhausted. Overlong
+  // matched lines are additionally clipped in place (elision markers in
+  // the line itself), which does NOT set this flag.
   truncated: boolean;
 }
 
@@ -1346,7 +1349,8 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
   // cheap path for "find the failures in a multi-MB output" without
   // paging the cursor window into the model's context. Substring match
   // (no regex). Streaming (not a whole-file read) keeps a huge log out of
-  // memory, and the match cap stops the read early.
+  // memory; three caps stop the read early: the match cap, a per-line
+  // clip, and a per-stream byte budget (below).
   const grepOutput = async (id: string, opts: GrepOutputInput): Promise<GrepOutputResult> => {
     const row = getBgProcess(db, id);
     if (row === null) throw new Error(`bg process not found: ${id}`);
@@ -1354,10 +1358,51 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     const maxMatches = opts.maxMatches !== undefined && opts.maxMatches > 0 ? opts.maxMatches : 200;
     const ignoreCase = opts.ignoreCase === true;
     const needle = ignoreCase ? opts.pattern.toLowerCase() : opts.pattern;
-    const matches = (line: string): boolean =>
-      (ignoreCase ? line.toLowerCase() : line).includes(needle);
+    const findIdx = (line: string): number =>
+      (ignoreCase ? line.toLowerCase() : line).indexOf(needle);
+    const matches = (line: string): boolean => findIdx(line) !== -1;
+    // The match cap alone does not bound the RETURN: lines have no
+    // intrinsic length (minified output, progress bars that only emit
+    // `\r`), so 200 matched "lines" could be megabytes — straight into
+    // the model's context, bypassing the 64 KB cap the cursor path
+    // enforces. Nor does it bound MEMORY: a log with no newline at all
+    // makes the pending-line carry `buf` grow to the whole file. Three
+    // guards (all in UTF-16 code units — close enough to bytes for
+    // budget purposes, and what JS strings natively count):
+    //  - GREP_LINE_CLIP: a matched line longer than this is clipped to a
+    //    window AROUND THE FIRST MATCH (a head-anchored cut could hide
+    //    the very needle that matched), with elision markers.
+    //  - GREP_STREAM_BUDGET: total returned text per stream; mirrors the
+    //    cursor path's 64 KB read cap. Hitting it sets `truncated`.
+    //  - GREP_PENDING_CAP: when the pending (newline-less) carry exceeds
+    //    this, treat the cap as a synthetic line break: match + clip what
+    //    we have, then keep only a needle-sized overlap so an occurrence
+    //    straddling the cut still matches. One physical giant line can
+    //    thus yield several clipped fragments — bounded and honest,
+    //    where the alternative was unbounded heap.
+    const GREP_LINE_CLIP = 2048;
+    const GREP_STREAM_BUDGET = DEFAULT_OUTPUT_READ_LIMIT_BYTES;
+    const GREP_PENDING_CAP = 64 * 1024;
+    const clip = (line: string): string => {
+      if (line.length <= GREP_LINE_CLIP) return line;
+      const idx = findIdx(line);
+      const start = Math.max(0, idx - 256);
+      const end = Math.min(line.length, start + GREP_LINE_CLIP);
+      const head = start > 0 ? '… ' : '';
+      const tail = end < line.length ? ` … [line clipped; ${line.length} chars total]` : '';
+      return `${head}${line.slice(start, end)}${tail}`;
+    };
     const grepFile = async (path: string): Promise<{ lines: string[]; hitCap: boolean }> => {
       const lines: string[] = [];
+      let budget = GREP_STREAM_BUDGET;
+      const push = (line: string): boolean => {
+        const clipped = clip(line);
+        lines.push(clipped);
+        budget -= clipped.length;
+        // Reaching either cap returns early; the for-await break
+        // cancels the underlying stream (no further read).
+        return lines.length >= maxMatches || budget <= 0;
+      };
       const decoder = new TextDecoder();
       let buf = '';
       try {
@@ -1365,23 +1410,22 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
           buf += decoder.decode(chunk, { stream: true });
           const parts = buf.split('\n');
           // Last part is an incomplete line (no trailing newline yet) —
-          // carry it to the next chunk; `buf` never holds more than one
-          // pending line, so a multi-MB log stays out of memory.
+          // carry it to the next chunk.
           buf = parts.pop() ?? '';
           for (const line of parts) {
-            if (matches(line)) {
-              lines.push(line);
-              // Reaching the cap returns early; the for-await break
-              // cancels the underlying stream (no further read).
-              if (lines.length >= maxMatches) return { lines, hitCap: true };
-            }
+            if (matches(line) && push(line)) return { lines, hitCap: true };
+          }
+          // Memory guard: a newline-less stream (\r progress, minified
+          // single-line output) would otherwise grow the carry without
+          // bound. Synthetic break at the cap — see GREP_PENDING_CAP.
+          if (buf.length > GREP_PENDING_CAP) {
+            if (matches(buf) && push(buf)) return { lines, hitCap: true };
+            const overlap = Math.max(0, needle.length - 1);
+            buf = overlap > 0 ? buf.slice(-overlap) : '';
           }
         }
         buf += decoder.decode(); // flush any trailing multibyte remainder
-        if (buf.length > 0 && matches(buf)) {
-          lines.push(buf);
-          if (lines.length >= maxMatches) return { lines, hitCap: true };
-        }
+        if (buf.length > 0 && matches(buf) && push(buf)) return { lines, hitCap: true };
       } catch {
         // Log missing/unreadable (never spawned, cleaned up, mid-read
         // truncation) — return whatever matched; the row still gives
