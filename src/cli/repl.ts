@@ -763,6 +763,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       if (exiting) return; // teardown clears timers; ignore any last fire
       enqueueNotification({ kind: 'reminder', note: r.note, scheduledAt: r.scheduledAt });
     },
+    // Mirror the pending count onto the footer chip (UI.md §4.10.6).
+    // Fires on set/cancel/fire/cleanup; the reducer stores it directly.
+    onChange: (count) => bus.emit({ type: 'reminders:update', ts: now(), count }),
   });
   baseConfig.reminderScheduler = reminderScheduler;
 

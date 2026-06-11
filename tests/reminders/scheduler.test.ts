@@ -114,6 +114,24 @@ describe('reminder scheduler', () => {
     expect(fired).toHaveLength(0); // nothing fires after cleanup
   });
 
+  test('onChange reports the pending count on set / cancel / fire / cleanup', () => {
+    const clock = makeClock();
+    const counts: number[] = [];
+    const s = createReminderScheduler({
+      onFire: () => {},
+      onChange: (n) => counts.push(n),
+      now: clock.now,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    });
+    const a = s.set({ delayMs: 10_000, note: 'a' }); // → 1
+    s.set({ delayMs: 20_000, note: 'b' }); // → 2
+    s.cancel(a.id); // → 1
+    clock.advance(25_000); // fires 'b' → 0
+    s.cleanup(); // → 0 (idempotent, still reports)
+    expect(counts).toEqual([1, 2, 1, 0, 0]);
+  });
+
   test('rejects a non-positive or non-finite delay', () => {
     const s = createReminderScheduler({ onFire: () => {} });
     expect(() => s.set({ delayMs: 0, note: 'x' })).toThrow();

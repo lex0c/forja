@@ -43,6 +43,10 @@ export interface CreateReminderSchedulerOptions {
   // Fired when a reminder's timer elapses. The REPL routes this to the
   // notification channel ({ kind: 'reminder', note, scheduledAt }).
   onFire: (reminder: Reminder) => void;
+  // Called after every change to the pending set (set / cancel / fire /
+  // cleanup) with the new pending count. The REPL wires this to the
+  // footer chip; optional so non-UI callers (tests) can omit it.
+  onChange?: (pendingCount: number) => void;
   // Injectable clock + timer for deterministic tests; default to the
   // platform globals. A fake lets a test fire reminders synchronously
   // without waiting wall-clock.
@@ -65,6 +69,7 @@ export const createReminderScheduler = (
   const clearTimer = options.clearTimer ?? ((h) => clearTimeout(h));
   const horizonCap = options.horizonCapMs ?? DEFAULT_HORIZON_CAP_MS;
   const entries = new Map<string, Entry>();
+  const notifyChange = (): void => options.onChange?.(entries.size);
 
   const set = (input: SetReminderInput): { id: string; fireAt: number } => {
     const { delayMs, note } = input;
@@ -84,9 +89,11 @@ export const createReminderScheduler = (
       // the fire callback then sees it already gone, and a stray
       // double-fire can't double-enqueue.
       entries.delete(id);
+      notifyChange();
       options.onFire(reminder);
     }, delayMs);
     entries.set(id, { reminder, handle });
+    notifyChange();
     return { id, fireAt: reminder.fireAt };
   };
 
@@ -98,12 +105,14 @@ export const createReminderScheduler = (
     if (e === undefined) return false;
     clearTimer(e.handle);
     entries.delete(id);
+    notifyChange();
     return true;
   };
 
   const cleanup = (): void => {
     for (const e of entries.values()) clearTimer(e.handle);
     entries.clear();
+    notifyChange();
   };
 
   return { set, list, cancel, cleanup };

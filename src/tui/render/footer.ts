@@ -115,6 +115,15 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
 
   const status = state.status;
   const rightParts: string[] = [];
+  // Pending reminders (ORCHESTRATION.md §3B.9). Leads the live cluster,
+  // BEFORE `bash bg` — a scheduled wake is the operator's earliest cue
+  // that the session will re-engage on its own. Same live-signal
+  // treatment as the other two chips: `success` (green), suppressed at 0,
+  // survives the turn boundary (reminders are session-scoped).
+  const reminderCount = state.reminderCount;
+  if (reminderCount > 0) {
+    rightParts.push(paint(caps, 'success', `${reminderCount} reminders`));
+  }
   // Background processes in flight (bash_background — ORCHESTRATION.md
   // §3B). Leads the right cluster so this live signal reads before the
   // static model/token chips, and is painted `success` (green) — not

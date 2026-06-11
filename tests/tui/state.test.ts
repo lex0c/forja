@@ -1926,6 +1926,18 @@ describe('bg lifecycle', () => {
     expect(state.bgProcesses.size).toBe(0);
   });
 
+  test('initial state has zero reminders', () => {
+    expect(createInitialState().reminderCount).toBe(0);
+  });
+
+  test('reminders:update stores the absolute pending count', () => {
+    const { state } = drive([
+      { type: 'reminders:update', ts: 1, count: 2 },
+      { type: 'reminders:update', ts: 2, count: 1 },
+    ]);
+    expect(state.reminderCount).toBe(1);
+  });
+
   test('bg:start with duplicate processId overwrites silently', () => {
     // Producer bug shouldn't crash — Map.set semantics keep the
     // count correct (still 1) and the renderer shows the latest
