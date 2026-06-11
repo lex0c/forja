@@ -38,7 +38,7 @@ import type { PolicySource } from '../permissions/index.ts';
 import { createDefaultRegistry } from '../providers/registry.ts';
 import { buildAutoTerse } from '../recap/auto-display.ts';
 import { createReminderScheduler } from '../reminders/index.ts';
-import { stripAnsi } from '../sanitize/index.ts';
+import { flattenControlToLine, stripAnsi, stripControlKeepLines } from '../sanitize/index.ts';
 import {
   HISTORY_CAP,
   appendHistory,
@@ -727,7 +727,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
             try {
               const mgr = bgManagerHolder.manager;
               if (mgr !== undefined) {
-                summary = await buildBgSummary(mgr, processId);
+                const raw = await buildBgSummary(mgr, processId);
+                // Strip ANSI / control bytes from the process output before
+                // it reaches the operator's scrollback (anti-spoof); keep
+                // the line structure so the drain's per-line indent holds.
+                summary = raw === undefined ? undefined : stripControlKeepLines(raw);
               }
             } catch {
               // Best-effort: a read failure just drops the inline summary;
@@ -1467,12 +1471,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       case 'bg_done': {
         const code = n.exitCode === null ? '' : ` (exit ${n.exitCode})`;
         return (
-          `[background] \`${n.command}\` ${n.status}${code}. ` +
+          `[background] \`${flattenControlToLine(n.command)}\` ${n.status}${code}. ` +
           `process_id=${n.processId} — read complete output with bash_output.`
         );
       }
       case 'reminder':
-        return `[reminder] ${n.note}`;
+        return `[reminder] ${flattenControlToLine(n.note)}`;
     }
   };
   // Full text fed to the model as the wake-turn input: headline + any
