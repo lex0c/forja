@@ -682,12 +682,16 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
   // session row. The child's harness loads this via the
   // preassignedSessionId path and uses it as the conversation
   // start — the parent's prompt never crosses the IPC boundary
-  // as a CLI arg (avoids quoting / size limits).
+  // as a CLI arg (avoids quoting / size limits). It carries the
+  // provider `user` role but is harness-injected, never typed by
+  // a human — so `source: 'system'` keeps the child's audit/resume
+  // from attributing it to an operator (same rule as wake turns).
   try {
     appendMessage(input.db, {
       sessionId: childSession.id,
       role: 'user',
       content: input.prompt,
+      source: 'system',
     });
   } catch (e) {
     await cleanupOnFail();

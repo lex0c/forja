@@ -31,6 +31,24 @@ describe('messages repo', () => {
     expect(fetched?.content).toEqual({ text: 'hello' });
   });
 
+  test('source defaults to operator and round-trips an explicit system source (migration 075)', () => {
+    const op = appendMessage(db, { sessionId, role: 'user', content: 'hi' });
+    expect(op.source).toBe('operator');
+    expect(getMessage(db, op.id)?.source).toBe('operator');
+
+    const sys = appendMessage(db, {
+      sessionId,
+      role: 'user',
+      content: '[background] done',
+      source: 'system',
+    });
+    expect(sys.source).toBe('system');
+    expect(getMessage(db, sys.id)?.source).toBe('system');
+    // And survives the list path (what --resume reads).
+    const listed = listMessagesBySession(db, sessionId).find((m) => m.id === sys.id);
+    expect(listed?.source).toBe('system');
+  });
+
   test('preserves complex JSON content roundtrip', () => {
     const content = {
       blocks: [

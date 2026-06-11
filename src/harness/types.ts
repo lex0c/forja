@@ -10,6 +10,7 @@ import type { Provider, ProviderEffort, StreamEvent, UsageInfo } from '../provid
 import type { SkillCatalog } from '../skills/index.ts';
 import type { DB } from '../storage/index.ts';
 import type { ContextPinsStore } from '../storage/repos/context-pins.ts';
+import type { MessageSource } from '../storage/repos/messages.ts';
 import type { SessionStatus } from '../storage/repos/sessions.ts';
 import type { SubagentSet } from '../subagents/load.ts';
 import type { TelemetrySink } from '../telemetry/index.ts';
@@ -768,6 +769,12 @@ export interface HarnessConfig {
   // composition.
   systemPromptHash?: string;
   userPrompt: string;
+  // Origin of `userPrompt` (migration 075). Default 'operator' (the human
+  // typed it). The REPL passes 'system' for a wake-turn whose input is a
+  // bg_done notification, so it persists as a system message — not audited
+  // or resumed as operator input. The provider still sees it as user
+  // context either way.
+  userPromptSource?: MessageSource;
   budget?: Partial<RunBudget>;
   // Operational effort level (`src/harness/effort.ts`). Set via the
   // `/effort` slash command. Drives BOTH axes by resolution, not by

@@ -2286,7 +2286,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // The context's anchor (hydrated tail, or '' on a fresh run)
         // becomes this message's parentId, keeping the DB chain
         // connected; appendUser advances it.
-        ctx.appendUser(effectiveUserPrompt, config.systemPromptHash ?? null);
+        ctx.appendUser(
+          effectiveUserPrompt,
+          config.systemPromptHash ?? null,
+          config.userPromptSource ?? 'operator',
+        );
       }
       // else: no new user message. The context's anchor is already the
       // hydrated tail (or '' on a fresh/empty run), which the following

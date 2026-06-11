@@ -1554,6 +1554,9 @@ describe('repl — boot + smoke', () => {
     const prompt = ra.captured[1]?.configs[0]?.userPrompt ?? '';
     expect(prompt).toContain('[background]');
     expect(prompt).toContain('npm test');
+    // The wake-turn input is persisted as a SYSTEM message (migration 075)
+    // so audit/--resume don't treat it as operator input.
+    expect(ra.captured[1]?.configs[0]?.userPromptSource).toBe('system');
     ra.finish(1);
     await tick();
     stdin.feed('\x04');

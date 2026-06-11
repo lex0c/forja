@@ -48,6 +48,7 @@ import {
 } from '../storage/history.ts';
 import { closeDb, computeUsageStats, countMessagesBySession } from '../storage/index.ts';
 import { createContextPinsStore } from '../storage/repos/context-pins.ts';
+import type { MessageSource } from '../storage/repos/messages.ts';
 import { completeSession, createSession } from '../storage/repos/sessions.ts';
 import { settleRunningSubagentHandles } from '../storage/repos/subagent-handles.ts';
 import { runSubagent } from '../subagents/index.ts';
@@ -1961,7 +1962,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       });
   };
 
-  const startTurn = (text: string): void => {
+  // `source` (migration 075) marks WHO produced this turn's input:
+  // 'operator' (the human typed/queued it — the default) or 'system' (the
+  // REPL injected it — a bg_done wake-turn). It only changes how the
+  // userPrompt persists for audit/resume, never what the provider sees.
+  const startTurn = (text: string, source: MessageSource = 'operator'): void => {
     if (isBusy() || exiting) return;
     running = true;
     syncBusy();
@@ -1983,6 +1988,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     const cfg: HarnessConfig = {
       ...baseConfig,
       userPrompt: text,
+      // Only thread a non-default source so 'operator' turns stay byte-
+      // identical to before (and the harness default applies).
+      ...(source !== 'operator' ? { userPromptSource: source } : {}),
       signal: abortController.signal,
       softStopSignal: softStopController.signal,
       onEvent: (e) => onHarnessEvent(adapter, e),
@@ -2172,7 +2180,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
               .join('\n')}`;
       bus.emit({ type: 'info', ts: now(), tone: 'secondary', message });
     }
-    startTurn(drained.map(formatNotification).join('\n\n'));
+    // 'system' source: the wake input persists as a system message, so
+    // audit and --resume don't render it as operator input (migration 075).
+    startTurn(drained.map(formatNotification).join('\n\n'), 'system');
   };
 
   // Async cleanup. Only called via `requestShutdown` below — the
