@@ -2,6 +2,22 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-11] audit: harness-injected input is `system`, not `operator`
+
+Closing gap in the bash_background work. Wake-turn notifications and subagent
+seed prompts both carry the provider `user` role but are never typed by a human —
+the harness injects them. Persisting them with the implicit operator attribution
+corrupted `--resume` (a wake notification replayed as if the operator had typed
+it) and misattributed the subagent seed in the child's audit log.
+
+New `messages.source` column (migration 075, `DEFAULT 'operator'` so existing
+rows and real operator turns are byte-identical). An explicit `'system'` source
+is threaded through the wake-turn path (repl `drainNotifications` → `startTurn` →
+loop → `appendUser`) and the subagent seed. `resume-replay` emits a secondary
+info line for `system` rows instead of a `user:submit` event. No CHECK constraint
+on the column — SQLite can't `ADD CONSTRAINT` and `MessageSource` is a closed TS
+union guarding every call site, so a table rebuild wasn't worth it.
+
 ## [2026-06-11] bg: real output tail in the notification + streaming grep
 
 Two threads, both about pulling signal out of a large bg output.
