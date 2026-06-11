@@ -1446,6 +1446,48 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('injects a stable bg manager holder into every turn (spec §3B)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    // Turn 1.
+    stdin.feed('first\r');
+    await tick();
+    const holder1 = ra.captured[0]?.configs[0]?.bgManagerHolder;
+    expect(holder1).toBeDefined();
+    expect(typeof holder1?.onEvent).toBe('function');
+    // The loop owns `manager`; the mock runAgent never builds one, so it
+    // stays undefined here.
+    expect(holder1?.manager).toBeUndefined();
+    // onEvent is a pass-through sink to the bus — exercising it must not
+    // throw and must not depend on a live turn (it's the idle path too).
+    expect(() =>
+      holder1?.onEvent({ type: 'bg_started', processId: 'p1', command: 'sleep 1', label: null }),
+    ).not.toThrow();
+    expect(() =>
+      holder1?.onEvent({ type: 'bg_ended', processId: 'p1', status: 'exited', exitCode: 0 }),
+    ).not.toThrow();
+    // Turn 2 must receive the SAME holder instance — it's session-scoped,
+    // so the loop reuses the manager it stored there on turn 1.
+    ra.finish(0);
+    await tick();
+    stdin.feed('second\r');
+    await tick();
+    expect(ra.captured[1]?.configs[0]?.bgManagerHolder).toBe(holder1);
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('turn 2 reuses the live context from turn 1 (not resumeFromSessionId)', async () => {
     // Compact-once-reuse end to end: when turn 1's result carries a live
     // SessionContext, the REPL holds it and passes it as turn 2's

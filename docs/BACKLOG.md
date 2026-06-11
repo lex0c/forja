@@ -2,6 +2,22 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-11] feat(repl): wire the session-scoped BgManager holder
+
+The REPL half of ORCHESTRATION §3B (the loop half landed in the prior commit).
+The REPL builds one `BgManagerHolder` at boot and injects it into `baseConfig`,
+so every turn shares it and bash_background processes survive the turn boundary.
+The holder's `onEvent` is a pass-through sink that turns the loop's bg
+HarnessEvents into the bus UIEvents (bg:start/bg:end) the renderer's bgProcesses
+reducer consumes — emitted on the bus directly, not via a per-turn adapter, so a
+process exiting while the REPL is idle still updates that state. `shutdown()`
+calls `manager.cleanup()` at session exit (after renderer.close, before closeDb),
+which is now the only place bg processes are torn down. `harness/index.ts`
+re-exports `BgManagerHolder`. Tests: the holder is injected into every turn and
+is the SAME instance across turns (session-scoped); the onEvent sink is a
+function and routing it doesn't throw. The bg_done notification + wake-when-idle
+is the next slice — its hook is already marked in the onEvent body.
+
 ## [2026-06-11] feat(harness): session-scoped BgManager holder (loop side)
 
 Second slice of ORCHESTRATION §3B — the loop half of making bg processes survive

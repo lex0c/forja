@@ -23,6 +23,7 @@ import { existsSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { resolveProviderEffort } from '../harness/effort.ts';
 import {
+  type BgManagerHolder,
   type HarnessConfig,
   type HarnessEvent,
   type HarnessResult,
@@ -663,6 +664,36 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     permissionRefusingReason,
     permissionChain,
   } = bootstrapped;
+
+  // Session-scoped bg process manager (spec ORCHESTRATION.md §3B). The
+  // loop builds the BgManager on the first turn and stores it in this
+  // holder; later turns reuse it, so bash_background processes survive
+  // the turn boundary instead of being SIGKILLed at turn end. The
+  // holder's onEvent is the cross-turn sink: it turns the loop's bg
+  // HarnessEvents into the bus UIEvents (bg:start/bg:end) that the
+  // renderer's bgProcesses reducer consumes — emitted on the bus
+  // directly, independent of any turn's adapter, so a process that
+  // exits while the REPL is idle still updates that state (and any
+  // async-in-flight UI built on it). (A later slice also enqueues a
+  // bg_done notification + wake-when-idle here.) The REPL owns
+  // teardown: `shutdown()` calls `manager.cleanup()` at session exit.
+  const bgManagerHolder: BgManagerHolder = {
+    manager: undefined,
+    onEvent: (e: HarnessEvent): void => {
+      if (e.type === 'bg_started') {
+        bus.emit({ type: 'bg:start', ts: now(), processId: e.processId, command: e.command });
+      } else if (e.type === 'bg_ended') {
+        bus.emit({
+          type: 'bg:end',
+          ts: now(),
+          processId: e.processId,
+          cause: e.status,
+          exitCode: e.exitCode,
+        });
+      }
+    },
+  };
+  baseConfig.bgManagerHolder = bgManagerHolder;
 
   // Permission engine refused to come up (PERMISSION_ENGINE.md §7.2):
   // broken audit chain, invalid policy, install_id I/O failure, or a
@@ -2001,6 +2032,19 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // src/cli/run.ts. Awaits in-flight exec; closes idempotently.
     if (baseConfig.broker !== undefined) {
       await baseConfig.broker.close();
+    }
+    // Session-scoped bg processes (spec ORCHESTRATION.md §3B.1): the
+    // REPL owns the holder, so teardown runs HERE at session exit, not
+    // per-turn. Before closeDb — cleanup() flips surviving rows to
+    // 'killed', which is a DB write. Best-effort: a kill failure must
+    // not block exit (zombies stay visible in background_processes).
+    if (bgManagerHolder.manager !== undefined) {
+      try {
+        await bgManagerHolder.manager.cleanup();
+      } catch {
+        // Swallow — exit must not hang on a stubborn child; the audit
+        // row stays 'running' and `agent doctor` can surface it.
+      }
     }
     closeDb(db);
     // Resume hint. Printed AFTER renderer.close() (no live region to
