@@ -2,6 +2,24 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-11] feat(tools): bash_list — snapshot of session bg processes
+
+First implementation slice of `ORCHESTRATION.md §3B` (the bash_background-as-real-
+background rewrite). `bash_list` is the model's recovery path for a lost
+`process_id` (across turns / after compaction) — the bg analogue of `task_list`.
+Chosen as the opening slice because it's read-only, isolated (no loop/repl/
+lifecycle changes), and testable on its own.
+
+`BgManager` gains a `list()` that reads the durable `background_processes` rows
+(not the in-memory `live` map), so it surfaces processes that already exited. The
+tool returns a subset row (`process_id`, command, label, status, exit_code,
+spawned_at) plus full-set `running`/`total` counts, with an optional status
+filter applied in-process. Category `misc` (like bash_output/bash_kill — no
+`args.command` to pass the bash gate), `requiresBgManager: true`.
+
+Remaining slices: BgManager session-scoped (survive the turn) → notify channel
+(bg_done → inbox) → wake-when-idle + guards → UI/flags.
+
 ## [2026-06-11] spec: bash_background genuinely persistent + notify + wake
 
 Spec-only PR (code follows, spec-first). `bash_background` is a "background" tool

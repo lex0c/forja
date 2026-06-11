@@ -100,6 +100,7 @@ describe('bootstrap', () => {
         'bash',
         'bash_background',
         'bash_kill',
+        'bash_list',
         'bash_output',
         'clarify',
         'edit_file',

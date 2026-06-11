@@ -313,6 +313,15 @@ export interface BgManager {
   // Useful for tests and for `agent doctor` to spot leaks. Not
   // intended to be called during normal session flow.
   liveCount(): number;
+  // Snapshot of every bg process in THIS session (running and
+  // terminated), read straight from the durable `background_processes`
+  // rows — independent of the in-memory `live` map, so it surfaces
+  // processes that already exited. Backs the `bash_list` tool
+  // (`CONTRACTS.md §2.6.5d`): lets the model recover a `process_id` it
+  // lost across turns / compaction. Returns the full session set; the
+  // tool filters by status in-process (it needs the full set for the
+  // running/total counts anyway).
+  list(): BgProcess[];
 }
 
 interface LiveHandle {
@@ -1276,6 +1285,12 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     };
   };
 
+  // Durable snapshot of this session's bg processes (running +
+  // terminated). Reads the DB rows, not the in-memory `live` map, so
+  // it includes processes that already exited — the whole point of
+  // `bash_list` (recover a lost process_id).
+  const list = (): BgProcess[] => listBgProcessesBySession(db, sessionId);
+
   // Wire the abort signal AFTER cleanup is defined so the listener
   // can reference it. `once: true` means the listener runs at most
   // once even if the signal fires multiple times. The catch swallows
@@ -1298,5 +1313,5 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     }
   }
 
-  return { spawn, readOutput, kill, getStatus, cleanup, liveCount };
+  return { spawn, readOutput, kill, getStatus, cleanup, liveCount, list };
 };

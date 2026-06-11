@@ -1,6 +1,7 @@
 import type { ToolRegistry } from '../registry.ts';
 import { bashBackgroundTool } from './bash-background.ts';
 import { bashKillTool } from './bash-kill.ts';
+import { bashListTool } from './bash-list.ts';
 import { bashOutputTool } from './bash-output.ts';
 import { bashTool } from './bash.ts';
 import { clarifyTool } from './clarify.ts';
@@ -39,6 +40,8 @@ export { bashKillTool } from './bash-kill.ts';
 export type { BashKillInput, BashKillOutput } from './bash-kill.ts';
 export { bashOutputTool } from './bash-output.ts';
 export type { BashOutputInput, BashOutputOutput } from './bash-output.ts';
+export { bashListTool } from './bash-list.ts';
+export type { BashListEntry, BashListInput, BashListOutput } from './bash-list.ts';
 export { editFileTool } from './edit-file.ts';
 export type { EditFileInput, EditFileOutput } from './edit-file.ts';
 export { globTool } from './glob.ts';
@@ -145,6 +148,7 @@ export const BUILTIN_TOOLS = [
   bashBackgroundTool,
   bashOutputTool,
   bashKillTool,
+  bashListTool,
 ] as const;
 
 export const registerBuiltinTools = (reg: ToolRegistry): void => {
