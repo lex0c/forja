@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readSync, realpathSync } from 'node:fs';
 import { join, sep } from 'node:path';
 import { sanitizeForCodeSpan } from './prompt-codespan.ts';
 
@@ -220,20 +220,47 @@ export const assembleProjectContext = (input: ProjectContextInput): ProjectConte
   }
   if (resolved === undefined) return { text: '' };
 
+  // Read at most a bounded prefix — the byte cap must bound the READ,
+  // not just the embed. A trusted repo with a multi-GB guide (or a
+  // hostile one) must not stall boot or OOM before the cap applies;
+  // the pointer era only stat'd the file, so eager-loading can't
+  // regress that. We pull `cap + 1` bytes: the +1 detects "there's
+  // more beyond the cap" so the truncation marker is accurate without
+  // ever holding more than ~16 KB in memory.
+  //
   // Read failures degrade to an empty section rather than crashing
-  // boot: a race (file removed between probe and read) or a
-  // permission flip on a single guide file must not take down the
-  // session — the model can still read_file later if the file
-  // reappears. (Contrast the pointer era, which only stat'd; reading
-  // the body adds a failure surface worth absorbing here.)
+  // boot: a race (file removed between probe and read), a permission
+  // flip, or an EISDIR must not take down the session — the model can
+  // still read_file later if the file reappears.
   let raw: string;
+  let readBounded: boolean;
   try {
-    raw = readFileSync(resolved.path, 'utf8');
+    const fd = openSync(resolved.path, 'r');
+    try {
+      const buf = Buffer.allocUnsafe(PROJECT_GUIDE_MAX_BYTES + 1);
+      let n = 0;
+      // Loop to tolerate short reads: a single readSync may return
+      // fewer bytes than requested even when more are available.
+      while (n < buf.length) {
+        const got = readSync(fd, buf, n, buf.length - n, n);
+        if (got === 0) break;
+        n += got;
+      }
+      // Filling the buffer means the file has at least cap+1 bytes →
+      // more than the cap → the embed will be truncated regardless of
+      // how much sanitization later shrinks the prefix.
+      readBounded = n > PROJECT_GUIDE_MAX_BYTES;
+      raw = buf.subarray(0, n).toString('utf8');
+    } finally {
+      closeSync(fd);
+    }
   } catch {
     return { text: '' };
   }
 
-  const { body, truncated } = clipToByteCap(sanitizeGuideBody(raw));
+  const clipped = clipToByteCap(sanitizeGuideBody(raw));
+  const body = clipped.body;
+  const truncated = clipped.truncated || readBounded;
 
   // The path is embedded in a `code span`, so it goes through the
   // code-span sanitizer (backtick break-out, newline injection,

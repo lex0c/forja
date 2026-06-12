@@ -272,7 +272,11 @@ describe('assembleProjectContext — content sanitization + size cap', () => {
   });
 
   test('truncates an over-cap body with a visible marker and sets the flag', () => {
-    const big = `# header\n${'x'.repeat(PROJECT_GUIDE_MAX_BYTES + 4096)}\n`;
+    // Deliberately MUCH larger than the cap (8 MB) so this also
+    // regresses the "read only a bounded prefix" guarantee: the embed
+    // must stay near the cap regardless of file size, proving the cap
+    // bounds the READ and not just the final slice.
+    const big = `# header\n${'x'.repeat(PROJECT_GUIDE_MAX_BYTES + 8 * 1024 * 1024)}\n`;
     writeFileSync(join(dir, 'AGENTS.md'), big);
     const out = assembleProjectContext(trusted({ cwd: dir, repoRoot: dir }));
     expect(out.truncated).toBe(true);
