@@ -325,4 +325,28 @@ describe('formatWorkingState', () => {
     const block = formatWorkingState({ next: [], log: [], hypotheses }, 100) as string;
     expect(Buffer.byteLength(block, 'utf8')).toBeLessThanOrEqual(WS_CAPS.globalRenderMaxBytes);
   });
+
+  test('elision notice stays inside the byte cap across the danger band', () => {
+    // A heavy log forces elision (full > cap) for every config below. Sweeping
+    // evidence length moves the no-log block through the [cap - noticeLen, cap]
+    // band — where the elision notice used to be appended AFTER the cap check,
+    // so the returned block could overflow by the notice length. Invariant: the
+    // returned block never exceeds the cap, notice included.
+    const log = Array.from({ length: WS_CAPS.logMax }, () => ({
+      text: 'L'.repeat(WS_CAPS.logItemMaxChars),
+      atStep: 100,
+    }));
+    for (let evLen = 0; evLen <= WS_CAPS.evidenceItemMaxChars; evLen++) {
+      const hypotheses = Array.from({ length: 4 }, (_, i) => ({
+        id: `H${i + 1}`,
+        text: 'x'.repeat(WS_CAPS.hypothesisTextMaxChars),
+        status: 'open' as const,
+        source: 'model' as const,
+        evidence: Array.from({ length: WS_CAPS.evidenceMax }, () => 'e'.repeat(evLen)),
+        updatedAtStep: 100,
+      }));
+      const block = formatWorkingState({ next: [], log, hypotheses }, 100) as string;
+      expect(Buffer.byteLength(block, 'utf8')).toBeLessThanOrEqual(WS_CAPS.globalRenderMaxBytes);
+    }
+  });
 });

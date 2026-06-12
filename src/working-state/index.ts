@@ -343,11 +343,15 @@ export const formatWorkingState = (
   const full = renderBlock(state, currentStep, { log: true, evidence: true });
   if (byteLen(full) <= cap) return full;
 
-  const noLog = renderBlock(state, currentStep, { log: false, evidence: true });
-  if (byteLen(noLog) <= cap) return `${noLog}\n  (log elided: over size cap)`;
+  // Build each fallback WITH its elision notice and check THAT against the cap:
+  // a block that fits bare can still overflow once the ~30–40-byte notice is
+  // appended, which would defeat the guard the step before injection.
+  const noLog = `${renderBlock(state, currentStep, { log: false, evidence: true })}\n  (log elided: over size cap)`;
+  if (byteLen(noLog) <= cap) return noLog;
 
   const bare = renderBlock(state, currentStep, { log: false, evidence: false });
-  if (byteLen(bare) <= cap) return `${bare}\n  (log + evidence elided: over size cap)`;
+  const bareNotice = `${bare}\n  (log + evidence elided: over size cap)`;
+  if (byteLen(bareNotice) <= cap) return bareNotice;
 
   // Last resort: the bare block itself exceeds the cap. Trim by BYTES (the cap's
   // unit) so multibyte content is actually bounded, walking whole code points so
