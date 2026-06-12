@@ -364,6 +364,8 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       });
     },
     nextId: (sid) => baseWorkingStateStore.nextId(sid),
+    tickStep: (sid) => baseWorkingStateStore.tickStep(sid),
+    currentStep: (sid) => baseWorkingStateStore.currentStep(sid),
     clear: (sid) => baseWorkingStateStore.clear(sid),
   };
   // Like the todo store: the REPL injects a contextPinsStore so /pin and
@@ -2646,6 +2648,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         }
 
         steps += 1;
+        // Advance the session-monotonic working-state step in lockstep. Unlike
+        // `steps` (per-run, reset each runAgent call), this lives in the store
+        // and survives across REPL turns, so staleness stays monotonic for the
+        // whole session (WORKING_STATE.md §6).
+        const wsStep = workingStateStore.tickStep(sessionId);
         safeEmit(config.onEvent, { type: 'step_start', stepN: steps });
 
         const resolvedMaxTokens = resolveMaxOutputTokens(budget, config.provider.capabilities);
@@ -2660,7 +2667,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // Inject the working-state panel at the bottom of [current_turn]
         // (appended to the last user message) — max-attention, cache-neutral,
         // alternation-safe (WORKING_STATE.md §5). No-op when the panel is empty.
-        injectWorkingStateBlock(reqMessages, workingStateStore.get(sessionId), steps);
+        injectWorkingStateBlock(reqMessages, workingStateStore.get(sessionId), wsStep);
         const req: GenerateRequest = {
           model: config.provider.id,
           messages: reqMessages,
@@ -3031,10 +3038,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             config.permissionEngine.check(toolName, category, args),
           todoStore,
           workingStateStore,
-          // Monotonic step number for working-state staleness stamps
-          // (WORKING_STATE.md §6). The counter lives in this loop closure;
-          // exposed as a lazy getter so the tool reads the current step.
-          getStepNumber: () => steps,
+          // Session-monotonic step number for working-state staleness stamps
+          // (WORKING_STATE.md §6) — read from the store, which carries it across
+          // REPL turns (vs the per-run `steps` that resets each runAgent call).
+          getStepNumber: () => workingStateStore.currentStep(sessionId),
           ...(bgManager !== undefined ? { bgManager } : {}),
           // Session-scoped reminder scheduler (ORCHESTRATION.md §3B.9).
           // Owned by the REPL (like the bgManagerHolder); the loop just

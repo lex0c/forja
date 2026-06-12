@@ -376,7 +376,18 @@ export interface WorkingStateStore {
   // Monotonic per-session hypothesis id ("H1", "H2", …). Never recycles within a
   // session, so a stale reference resolves to not_found, not a different belief.
   nextId(sessionId: string): string;
-  // Session-end teardown. Idempotent; drops state + counter so a long-lived
+  // Session-monotonic step counter for staleness stamps (§6). `tickStep`
+  // advances it (call once per loop step) and returns the new value;
+  // `currentStep` peeks without advancing. It lives WITH the store, so in the
+  // REPL — where the store is injected and reused across turns — the step keeps
+  // climbing instead of resetting to 0 on each runAgent call. A per-run reset
+  // would let the just-added hypothesis look older than a prior turn's entries
+  // (wrong eviction) and clamp rendered ages back to 0. A one-shot run or
+  // subagent gets a fresh store, so the counter starts at 0 and stays monotonic
+  // for that single run.
+  tickStep(sessionId: string): number;
+  currentStep(sessionId: string): number;
+  // Session-end teardown. Idempotent; drops state + counters so a long-lived
   // process running many sessions doesn't accumulate dead panels.
   clear(sessionId: string): void;
 }
@@ -387,6 +398,10 @@ export const createWorkingStateStore = (): WorkingStateStore => {
   // read-modify-write churn of the tool — a moved/evicted hypothesis must not
   // free its id for reuse. Monotonic; reset only by clear().
   const counters = new Map<string, number>();
+  // Session-monotonic step counter (see interface). Separate from the per-run
+  // step index the harness loop tracks for budget/events — this one persists
+  // with the store across REPL turns so staleness never goes backward.
+  const stepCounters = new Map<string, number>();
   return {
     get: (sessionId) => {
       const s = states.get(sessionId);
@@ -401,9 +416,16 @@ export const createWorkingStateStore = (): WorkingStateStore => {
       counters.set(sessionId, n);
       return `H${n}`;
     },
+    tickStep: (sessionId) => {
+      const n = (stepCounters.get(sessionId) ?? 0) + 1;
+      stepCounters.set(sessionId, n);
+      return n;
+    },
+    currentStep: (sessionId) => stepCounters.get(sessionId) ?? 0,
     clear: (sessionId) => {
       states.delete(sessionId);
       counters.delete(sessionId);
+      stepCounters.delete(sessionId);
     },
   };
 };

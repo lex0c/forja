@@ -72,6 +72,49 @@ describe('WorkingStateStore (container)', () => {
   });
 });
 
+describe('WorkingStateStore — session step counter', () => {
+  test('tickStep advances monotonically; currentStep peeks; per-session', () => {
+    const store = createWorkingStateStore();
+    expect(store.currentStep('s1')).toBe(0);
+    expect(store.tickStep('s1')).toBe(1);
+    expect(store.tickStep('s1')).toBe(2);
+    expect(store.currentStep('s1')).toBe(2); // peek does not advance
+    expect(store.tickStep('s2')).toBe(1); // independent per session
+  });
+
+  test('step survives set()/get() (no reset) and is dropped by clear()', () => {
+    const store = createWorkingStateStore();
+    store.tickStep('s1');
+    store.tickStep('s1');
+    store.set('s1', { ...emptyWorkingState(), next: ['x'] });
+    store.get('s1');
+    expect(store.currentStep('s1')).toBe(2); // a turn's reads/writes don't reset it
+    store.clear('s1');
+    expect(store.currentStep('s1')).toBe(0);
+  });
+
+  test('staleness stays monotonic across a simulated REPL turn boundary', () => {
+    // Turn 1 fills the open-hypothesis cap at increasing session steps. A new
+    // runAgent (turn 2) resets its per-run step index to 0 — but the store's
+    // session step keeps climbing, so the just-added hypothesis is the NEWEST
+    // and the genuinely-oldest is evicted (not the just-added, which the old
+    // per-run-step bug would have done).
+    const store = createWorkingStateStore();
+    const gen = () => store.nextId('s1');
+    let state = emptyWorkingState();
+    for (let i = 1; i <= WS_CAPS.hypothesesMaxOpen; i++) {
+      const step = store.tickStep('s1'); // turn-1 session steps 1..7
+      state = applyWorkingStatePatch(state, { hypothesisAdd: { text: `h${i}` } }, step, gen).next;
+    }
+    const step = store.tickStep('s1'); // turn 2: 8, NOT a reset to 1
+    expect(step).toBe(WS_CAPS.hypothesesMaxOpen + 1);
+    const r = applyWorkingStatePatch(state, { hypothesisAdd: { text: 'newest' } }, step, gen);
+    expect(r.next.hypotheses.find((h) => h.text === 'newest')).toBeDefined(); // survives
+    expect(r.next.hypotheses.find((h) => h.id === 'H1')).toBeUndefined(); // oldest evicted
+    expect(r.mutations.hypothesisEvicted).toBe(1);
+  });
+});
+
 describe('applyWorkingStatePatch — focus & next', () => {
   test('focus set stamps the step; empty string clears it', () => {
     const r1 = apply(emptyWorkingState(), { focus: 'investigate cache' }, 5);
