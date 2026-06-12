@@ -90,18 +90,17 @@ export const workingStateUpdateTool: Tool<WorkingStateUpdateInput, WorkingStateU
     properties: {
       focus: {
         type: 'string',
-        description: 'One line: what you are doing now. Empty string clears it.',
+        description: "1 line; '' clears.",
       },
       next: {
         type: 'array',
         items: { type: 'string' },
-        description:
-          'Immediate next steps (replaces the list). At most 5; overflow belongs in todo_create.',
+        description: 'Immediate next steps; <=5, overflow is a plan (use todo_create).',
       },
       log_append: {
         type: 'array',
         items: { type: 'string' },
-        description: 'Short milestones to append (found X, tried Y and it failed). FIFO-bounded.',
+        description: 'Short milestones; FIFO-bounded.',
       },
       hypothesis_add: {
         type: 'object',
@@ -110,32 +109,30 @@ export const workingStateUpdateTool: Tool<WorkingStateUpdateInput, WorkingStateU
           source: {
             type: 'string',
             enum: [...HYP_SOURCES],
-            description: "Who originated it. Defaults to 'model'.",
+            description: "Default 'model'.",
           },
         },
         required: ['text'],
-        description:
-          'Create an open hypothesis; its assigned id is returned. Keep <=7 open (the most stale is auto-evicted).',
+        description: 'Opens a hypothesis, returns its id. <=7 open (most stale auto-evicted).',
       },
       hypothesis_update: {
         type: 'object',
         properties: {
-          id: { type: 'string', description: 'Id returned by hypothesis_add.' },
+          id: { type: 'string', description: 'From hypothesis_add.' },
           status: {
             type: 'string',
             enum: [...HYP_STATUSES],
-            description:
-              'confirmed or refuted removes it from the active list (archived to the log).',
+            description: 'confirmed/refuted archives it to the log.',
           },
           evidence_append: {
             type: 'array',
             items: { type: 'string' },
-            description: 'Evidence pointers to attach (FIFO-capped).',
+            description: 'Pointers; FIFO-capped.',
           },
         },
         required: ['id'],
         description:
-          'Attach evidence to and/or resolve an open hypothesis. Refuting a user-sourced one: confirm with the operator first.',
+          'Resolve or attach evidence. Refuting a user-sourced one: confirm with the operator first.',
       },
     },
   },
