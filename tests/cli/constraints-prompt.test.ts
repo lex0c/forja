@@ -60,6 +60,16 @@ describe('constraints-prompt', () => {
     expect(CONSTRAINTS_PROMPT.toLowerCase()).toContain('compaction');
   });
 
+  test('CONSTRAINTS_PROMPT nudges the planning panels so they are not dormant', () => {
+    // Same ghost-tool reasoning as pin_context (BACKLOG 2026-06-05):
+    // todo_create / working_state_update are re-injected panels that
+    // survive compaction but go unused without a prompt nudge. Anchored
+    // so a future edit cannot quietly drop the planning incentive.
+    expect(CONSTRAINTS_PROMPT).toContain('working_state_update');
+    expect(CONSTRAINTS_PROMPT).toContain('todo_create');
+    expect(CONSTRAINTS_PROMPT.toLowerCase()).toContain('hypotheses');
+  });
+
   test('CONSTRAINTS_PROMPT tells the model to match existing code conventions', () => {
     // Always-present floor against cross-file paradigm drift
     // (functional here, OO there). Explicit project rules ride in

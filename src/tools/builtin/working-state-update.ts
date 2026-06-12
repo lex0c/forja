@@ -84,7 +84,7 @@ export interface WorkingStateUpdateOutput {
 export const workingStateUpdateTool: Tool<WorkingStateUpdateInput, WorkingStateUpdateOutput> = {
   name: 'working_state_update',
   description:
-    "Update your working-state panel — the small operational scratchpad (focus / next steps / recent log / active hypotheses) injected into context every turn so you don't re-derive the thread from the conversation. Partial update: pass only what changed. Use it when your focus, active hypothesis, or next steps MATERIALLY change — not for every micro-action. Fields: focus (1 line; '' clears), next (<=5 immediate steps — a longer list is a plan, use todo_create), log_append (short milestones; FIFO, recent ones shown), hypothesis_add { text, source? } (creates an open belief, returns its id), hypothesis_update { id, status?, evidence_append? } (status confirmed|refuted archives it to the log; evidence are pointers). Keep <=7 open hypotheses (the most stale is auto-evicted). Refuting a user-sourced hypothesis: confirm with the operator first.",
+    "Track your operational thread — current focus, next steps, and the hypotheses you're testing — in a small panel re-injected into your context every turn that survives compaction, so in long work you don't lose it or re-derive it from the conversation. You read it for free (it's already in context); this tool only writes. Update it whenever your focus, active hypothesis, or next step materially changes — not for every micro-action. Partial: pass only the fields that changed.",
   inputSchema: {
     type: 'object',
     properties: {
@@ -114,7 +114,8 @@ export const workingStateUpdateTool: Tool<WorkingStateUpdateInput, WorkingStateU
           },
         },
         required: ['text'],
-        description: 'Create an open hypothesis; its assigned id is returned.',
+        description:
+          'Create an open hypothesis; its assigned id is returned. Keep <=7 open (the most stale is auto-evicted).',
       },
       hypothesis_update: {
         type: 'object',
@@ -133,7 +134,8 @@ export const workingStateUpdateTool: Tool<WorkingStateUpdateInput, WorkingStateU
           },
         },
         required: ['id'],
-        description: 'Attach evidence to and/or resolve an open hypothesis.',
+        description:
+          'Attach evidence to and/or resolve an open hypothesis. Refuting a user-sourced one: confirm with the operator first.',
       },
     },
   },

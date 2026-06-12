@@ -130,6 +130,7 @@ describe('bootstrap', () => {
         'todo_get',
         'todo_list',
         'todo_update',
+        'working_state_update',
         'write_file',
       ].sort(),
     );
