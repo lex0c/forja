@@ -430,21 +430,40 @@ nenhum dos dois é a verdade — o audit é.**
 Princípio 4: subsistema sem eval não ship. O working-state precisa **provar** que
 reduz degradação, não só parecer organizado.
 
-**Cenário de regressão** (`evals/`): sessão longa scriptada onde, no step ~20,
-uma hypothesis é registrada e depois **refutada** por evidência posterior. Mede
-no step ~200, **com vs. sem** o painel:
+### 9.1 Eval implementado: o estado sobrevive à compaction
+
+`evals/regression/51-working-state-survives-compaction.yaml` (espelha
+`24-compaction-preserves-goal`): o modelo registra uma hypothesis via
+`working_state_update`, lê arquivos suficientes pra **disparar compaction** (que
+apaga a conversa inicial, incluindo aquela tool call), e no final reporta a
+hypothesis verbatim. O token-marcador só pode reaparecer pela **re-injeção do
+painel** — ele vem do store, não da conversa comprimida. Asserções:
+`working_state_update` chamado, compaction disparada, marcador no output final,
+run `done`. Prova a tese central — **o estado operacional persiste onde a
+conversa não persiste** — com modelo real, dentro do runner declarativo
+existente.
+
+### 9.2 Eval-alvo aspiracional: degradação A/B (follow-up)
+
+O eval que mede a *redução de degradação* diretamente — sessão longa onde uma
+hypothesis registrada no step ~20 é **refutada** e, no step ~200, o agente **não
+age mais** sobre ela, medido **com vs. sem** o painel — precisa de infraestrutura
+que o runner declarativo atual NÃO tem: comparação A/B na mesma semente,
+observação do working-state final, e sessões de centenas de steps. As métricas
+que ele mediria:
 
 - **ações sobre crença morta**: o agente ainda propõe edits coerentes com a
-  hypothesis refutada? (alvo: cai pra ~0 com o painel)
-- **re-pergunta / re-descoberta**: frequência de "qual era o objetivo?" e de
-  re-execução de buscas cujo resultado já estava no `log`/`hypotheses`.
-- **custo**: tokens de input por step atribuíveis ao bloco (deve ficar ≤ teto e
-  não crescer com a sessão — valida o `O(1)`).
+  hypothesis refutada? (alvo: ~0 com o painel).
+- **re-pergunta / re-descoberta**: re-execução de buscas cujo resultado já estava
+  no `log`/`hypotheses`.
 - **mutation rate** (§4.4): updates por turn + breakdown (focus / created /
   confirmed / refuted). É a métrica **comportamental** — perto de zero delata
-  painel fantasma; altíssima delata spam. A saúde fica numa faixa intermediária,
-  a calibrar. É o sinal mais importante: o working-state só paga aluguel se o
-  modelo de fato o mantém.
+  painel fantasma; altíssima delata spam; saúde no meio. É o sinal mais
+  importante: o working-state só paga aluguel se o modelo de fato o mantém.
+- **custo**: tokens de input por step do bloco (≤ teto, não cresce com a sessão —
+  valida o `O(1)`).
+
+Fica registrado como follow-up até existir um A/B harness de eval.
 
 Os caps (`1 / 5 / 15 / 7`, global `2–4 KB`, janela de log `W ≈ 10`) são **pontos
 de partida**, tunáveis por estes evals, não constantes sagradas.

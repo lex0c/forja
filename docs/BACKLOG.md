@@ -2,6 +2,29 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-12] working-state: load-bearing eval
+
+Added `evals/regression/51-working-state-survives-compaction.yaml`, modeled on
+`24-compaction-preserves-goal`. The model registers a hypothesis via
+`working_state_update`, then reads the chunky-modules fixture until compaction
+fires (threshold 0.02, preserveTail 1) — which wipes the early conversation
+including that tool call — and must restate the hypothesis verbatim in its final
+message. The MARKER_WS_HYP token can only resurface via panel re-injection (it
+comes from the store, not the compacted conversation). Asserts:
+`working_state_update` called, compaction triggered, marker in final output, run
+`done`. Proves the central thesis — operational state persists where the
+conversation does not — with a real model in the existing declarative runner.
+YAML validated via `loadEvalCase` (parse-only, no model spend); NOT yet run
+against a live model (costs $ + needs a key — operator decision).
+
+Honest scope: this is NOT the full A/B "refuted-hypothesis-not-pursued-at-step-200"
+eval the spec originally sketched. That one needs infra the declarative runner
+lacks — same-seed A/B comparison, final working-state observation, hundreds of
+steps. WORKING_STATE.md §9 now splits into §9.1 (the implemented compaction-
+survival eval) and §9.2 (the aspirational A/B eval, kept as a follow-up until an
+A/B harness exists). Remaining to fully close the subsystem: run §9.1 against a
+live model, build the §9.2 A/B harness, and the TUI panel renderer.
+
 ## [2026-06-12] working-state: implementation
 
 Implemented the WORKING_STATE.md spec end-to-end (no spec divergence — code
