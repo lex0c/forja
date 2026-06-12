@@ -2,6 +2,61 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-12] working-state: spec PR — bounded hot-state operational panel
+
+New subsystem spec `docs/spec/WORKING_STATE.md` (no code yet — operator reviews
+the spec before any implementation, per the spec-PR-before-code rule). Design
+converged with the operator over a planning session; this entry records the why
+and the locked decisions.
+
+Problem: the agent re-infers its operational thread from raw conversation every
+turn (what am I doing / which hypothesis is live / next step / what's already
+rejected) — a named long-session degradation cause. Fix: a small in-memory
+operational panel injected every step so the model reads it for free and updates
+it cheaply, distinct from the historical record (messages/tool_calls/audit),
+which stays the single source of truth.
+
+Shape `WorkingState { focus?, next[], log[], hypotheses[] }`, one eviction axis
+per slot: `focus` set (1 line, never accumulates), `next` set (≤5; overflow is a
+plan → `todo_create`), `log` append-FIFO (≤15, drops by age), `hypotheses` (≤7
+active, drops by staleness; confirmed/refuted leave the active list and become a
+one-line log). Global render cap 2–4KB as the final guard. Cost is flat — O(1) in
+session size, not O(steps).
+
+Operator decisions: (a) **separate** from `TodoStore` — todos = formal task list,
+working-state = the lighter narrative thread, neither derives from the other;
+(b) **in-memory, session-scoped, disposable** — dies at session end like
+`TodoStore` and the inbox, no migration, audit remains the truth, resume does not
+re-hydrate; (c) **no `confidence` field** — numeric scores on operational state
+are numerology nobody calibrates; `status + evidence + staleness` carry the same
+signal; (d) **bounded-hot-state, not append-only** — only the audit log is
+append-only; (e) one permissive partial tool `working_state_update` (read is free
+via injection, so update is the only op), with the store doing all bookkeeping
+(moves confirmed/refuted to log, FIFO, staleness eviction) so the model never
+does formal chores.
+
+Injection at `[current_turn]` bottom, alongside goal re-injection + pins
+(CONTEXT_TUNING §10.2 / §12.4.3) — cache-neutral because `[current_turn]` is
+already rebuilt every step; any position above the breakpoints would re-cache the
+stable prefix every turn. Staleness in steps (STATE_MACHINE §3), not wall-clock.
+
+Eval (load-bearing, ships with the code): a hypothesis refuted at step ~20 is no
+longer acted on at step ~200, measured with vs. without the panel.
+
+Review pass (operator) folded into the spec: `hypothesis.source` (user | model |
+tool — a user-asserted belief needs `clarify` before refuting, a model guess does
+not); `log` injected by recency window (last ~W steps) instead of always-full,
+with old-but-relevant facts living in `hypothesis.evidence` rather than a
+log↔hypothesis cross-link; usage metrics projected from the audit (no new table)
+plus a live in-memory counter; and an explicit "update when focus/hypothesis/next
+materially change" nudge in the tool description to fight the ghost-tool risk.
+
+Deferred (operator): revalidation-before-edits / drift detector (ORCHESTRATION
+§11 — specified, never implemented) is the natural next slice and consumes the
+live hypothesis as its revalidation signal, but is explicitly out of scope here.
+Next step after spec review: implement the store (mirror `src/todo/index.ts`) +
+tool + injection + `clear` wiring in run.ts and repl.ts, born with tests.
+
 ## [2026-06-11] security: sanitize notification fields before scrollback render
 
 Review flagged the reminder `note` (model-authored, can quote untrusted
