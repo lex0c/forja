@@ -2,6 +2,53 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-12] project_context: pointer → eager content (spec §2.0 reversal)
+
+Flipped `[project_context]` from pointer-eager/body-lazy to **eager content,
+trust-gated** — operator decision, documented as an explicit amendment in
+`CONTEXT_TUNING.md §2.0` (spec PR before code, per workflow). The pointer's
+failure mode (the model never reads the guide and silently ignores project
+rules) is a recurring correctness cost; eager content removes it and survives
+compaction (sits in the stable system segment), the way principals get CLAUDE.md
+loaded for them. The §2.0 footnote that argued *against* this ("not eager-content
+default") is now reverted in place.
+
+Renamed `project-pointer.ts` → `project-context.ts` (the name is honest again).
+`assembleProjectContext` reuses the two-gate trust logic (cwd + repoRoot, exact-
+path membership) and now **resolves multiple filenames** —
+`PROJECT_GUIDE_FILENAMES` = AGENTS.md → CLAUDE.md → GEMINI.md → GOOSE.md →
+HERMES.md, first present per location, cwd-first across locations. The trust
+modal's probe (`repl.ts`) was widened to the same list so the operator can't be
+warned about one name while a different one loads; its copy now says the contents
+will be *loaded into context* (eager), not read on first use.
+
+Injection containment (the body is attacker-influenceable even after a trust
+grant): (1) trust gate — content embedded only from an explicitly-trusted dir;
+(2) **symlink containment** — the eager `readFileSync` bypasses the permission
+engine that gated the pointer-era `read_file`, so a guide symlinked to a secret
+outside the tree (`~/.ssh/id_rsa`) is refused: realpath must stay within the
+trusted dir (in-tree symlinks still load); (3) body byte-sanitized (terminal
+escapes / control bytes stripped, markdown preserved) and fenced with BEGIN/END
+markers; (4) caveat footer frames it as reference, not commands. Size-capped at
+`PROJECT_GUIDE_MAX_BYTES` (16 KB) with a visible truncation marker so a
+hostile/sprawling file can't inflate the cached prefix. Embedded path still goes
+through `sanitizeForCodeSpan`.
+
+Self-review caught the symlink/exfil vector (the eager read removed the engine's
+protected-path gate the pointer relied on); fixed with realpath containment +
+regression tests (escape blocked, escape-doesn't-break-fallback, in-tree allowed).
+
+Cache: content fuses into the stable segment (cache #1); editing the guide mid-
+session re-caches the prefix — accepted (rare mid-run, one-turn cost, not per-
+turn). Updated `docs/SYSTEM_PROMPT.md` (layer table + assembly map).
+
+Tests: rewrote `tests/cli/project-context.test.ts` for the eager contract (body
+embedded, caveat, multi-name precedence + fallback, trust boundary, content
+control-byte stripping with markdown preserved, path injection, truncation);
+updated `bootstrap.test.ts` + `repl.test.ts` wording/assertions. Green:
+project-context 19, bootstrap+repl 191, tui state+modal 196; typecheck + lint
+clean.
+
 ## [2026-06-12] working-state: load-bearing eval
 
 Added `evals/regression/51-working-state-survives-compaction.yaml`, modeled on

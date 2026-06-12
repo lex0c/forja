@@ -42,7 +42,7 @@ input.systemPrompt                                  ← base (typically empty)
   ↑ composeWithIdentity                             ← outermost / appears FIRST
 ```
 
-**Phase 2 — append / merge** (~lines 1101, 1192, 1200). `composeWithProjectPointer` appends a pointer block; `composeSystemPrompt` (a different helper in `memory-prompt.ts`) concatenates the memory section and then the skill catalog at the tail.
+**Phase 2 — append / merge** (~lines 1101, 1192, 1200). `composeWithProjectContext` appends the eager project-context block; `composeSystemPrompt` (a different helper in `memory-prompt.ts`) concatenates the memory section and then the skill catalog at the tail.
 
 **Final assembled order**, top to bottom:
 
@@ -54,7 +54,7 @@ input.systemPrompt                                  ← base (typically empty)
 6. **Tool ergonomics** — highest-payoff tool-usage patterns distilled from `TOOL_ERGONOMICS.md`
 7. **Playbook hint** — discovery table + delegation criteria for subagent routing (`PLAYBOOKS §1.4`)
 8. **Base systemPrompt** — caller-provided string (typically empty in production)
-9. **Project pointer** — `[project_context]` block (`CONTEXT_TUNING §2.0`)
+9. **Project context** — `[project_context]` block: eager, trust-gated guide content (`CONTEXT_TUNING §2.0`)
 10. **Memory section** — auto-injected memories per `MEMORY.md`
 11. **Skill catalog** — eager-load surface of available skills (body lazy)
 
@@ -88,7 +88,7 @@ The `name: 'system.autonomous'` is hardcoded because the autonomous profile is t
 
 ### 3.1 Why subagents need their own chain
 
-A subagent's system prompt is the **playbook body** (`audit.systemPrompt`) wrapped in a narrower set of affordances. It is NOT the principal's full surface — playbooks declare their own tool whitelist, their own references, their own optional output schema, and their own reflection mode. Including the principal's full chain (identity, environment, response format, constraints, tool ergonomics, project pointer, skill catalog) would (a) override the playbook author's intent, (b) blow the per-call token budget on content unrelated to the playbook's narrow job, and (c) defeat the purpose of having a playbook in the first place.
+A subagent's system prompt is the **playbook body** (`audit.systemPrompt`) wrapped in a narrower set of affordances. It is NOT the principal's full surface — playbooks declare their own tool whitelist, their own references, their own optional output schema, and their own reflection mode. Including the principal's full chain (identity, environment, response format, constraints, tool ergonomics, project context, skill catalog) would (a) override the playbook author's intent, (b) blow the per-call token budget on content unrelated to the playbook's narrow job, and (c) defeat the purpose of having a playbook in the first place.
 
 ### 3.2 The composer chain
 
@@ -198,7 +198,7 @@ Each composer lives in its own file under `src/cli/`. The file owns the composer
 | `composeWithConstraints` | `constraints-prompt.ts` | `# Constraints` block (`§1.6`) — correctness + build discipline + security + hard-to-reverse + goal-contradictory cancellation |
 | `composeWithToolErgonomics` | `tool-ergonomics-prompt.ts` | High-payoff tool patterns distilled from `TOOL_ERGONOMICS.md` |
 | `composeWithPlaybookHint` | `playbook-prompt.ts` | Subagent discovery table + delegation criteria (`PLAYBOOKS §1.4`) |
-| `composeWithProjectPointer` | `project-pointer.ts` | `[project_context]` pointer (`§2.0`) — pointer eager, body lazy |
+| `composeWithProjectContext` | `project-context.ts` | `[project_context]` block (`§2.0`) — eager, trust-gated guide content (AGENTS.md / CLAUDE.md / …) + caveat |
 | `composeSystemPrompt` | `memory-prompt.ts` | Generic tail-append helper (used for memory section + skill catalog) |
 
 ### 5.2 Subagent-only composers

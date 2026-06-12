@@ -78,6 +78,7 @@ import { operatorBootstrapFlags, reportRefusingEngine } from './boot-parity.ts';
 import { type BootstrapInput, type BootstrapResult, bootstrap } from './bootstrap.ts';
 import { maybeEmitHistoryBanner } from './history-banner.ts';
 import { concatQueuedBodies } from './inbox-drain.ts';
+import { PROJECT_GUIDE_FILENAMES } from './project-context.ts';
 import { prepareResumeContext } from './resume-prepare.ts';
 import { replayProviderMessages, replaySessionMessages } from './resume-replay.ts';
 import { resolveResumeIdOnDb } from './run.ts';
@@ -501,16 +502,19 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // which falls through to the same decline path below — exit 0
     // without ever entering the REPL.
     const trustTimeoutMs = options.trustPromptTimeoutMs ?? 5 * 60 * 1000;
-    // Probe for AGENTS.md at the cwd root (spec AGENTIC_CLI.md
-    // line 75: "AGENTS.md é input não-confiável até prova em
-    // contrário"). The reducer surfaces an explicit notice in the
-    // modal preview when the flag is set so the operator knows
-    // the file's instructions will be loaded on first use — a
-    // safety cue worth seeing before they grant trust. existsSync
-    // is fine here: cheap stat call on a single fixed path,
-    // synchronous fits the boot flow, and missing-permissions /
-    // ENOENT cleanly resolve to false.
-    const agentsMdPresent = existsSync(join(cwd, 'AGENTS.md'));
+    // Probe the cwd for a project agent-instructions file (spec
+    // AGENTIC_CLI.md line 75: "AGENTS.md é input não-confiável até
+    // prova em contrário"). The reducer surfaces an explicit notice
+    // in the modal preview when the flag is set so the operator
+    // knows the file's CONTENTS will be loaded eagerly into context
+    // once they grant trust (§2.0 eager-content) — a safety cue
+    // worth seeing first. The probe covers the SAME filename list
+    // the eager-loader embeds (PROJECT_GUIDE_FILENAMES), so the
+    // operator can't be warned about one name while a different one
+    // gets loaded. existsSync is fine here: cheap stat calls on a
+    // handful of fixed paths, synchronous fits the boot flow, and
+    // missing-permissions / ENOENT cleanly resolve to false.
+    const agentsMdPresent = PROJECT_GUIDE_FILENAMES.some((name) => existsSync(join(cwd, name)));
     // Two-step ordering matters: askTrust SYNCHRONOUSLY pushes its
     // handler onto the focus stack (see modalManager's
     // `enqueueConfirm` → `drain`) before returning the promise.

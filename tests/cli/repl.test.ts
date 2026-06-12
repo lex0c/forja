@@ -2943,12 +2943,14 @@ describe('repl — trust prompt (AGENTIC_CLI §9.1)', () => {
 
   test('AGENTS.md presence in cwd is surfaced in the trust modal preview', async () => {
     // Spec AGENTIC_CLI.md line 75: AGENTS.md is untrusted input
-    // until proven otherwise. The reducer adds an explicit
-    // "AGENTS.md present — its instructions will be loaded on
-    // first use" preview line when the flag is set; the producer
-    // (this REPL flow) has to detect the file and forward the
-    // flag. Pre-fix we always passed agentsMd=false, hiding the
-    // safety cue from the operator.
+    // until proven otherwise. The reducer adds an explicit preview
+    // line ("a project instructions file is present — its contents
+    // will be loaded into context if you trust this folder") when
+    // the flag is set; the producer (this REPL flow) has to detect
+    // the file and forward the flag. Pre-fix we always passed
+    // agentsMd=false, hiding the safety cue from the operator. The
+    // probe covers PROJECT_GUIDE_FILENAMES; this test uses AGENTS.md
+    // as the representative name.
     //
     // Cwd is a real temp dir (NOT the synthetic
     // `/tmp/forja-repl-test`) because the AGENTS.md probe runs a
@@ -2977,7 +2979,7 @@ describe('repl — trust prompt (AGENTIC_CLI §9.1)', () => {
       // the next ~33ms tick. flushFrame's 50ms is enough.
       await flushFrame();
       const rendered = captured.join('');
-      expect(rendered).toContain('AGENTS.md present');
+      expect(rendered).toContain('instructions file');
       // Decline so we exit cleanly without a runAgent invocation.
       stdin.feed('2');
       expect(await promise).toBe(0);
@@ -3008,7 +3010,7 @@ describe('repl — trust prompt (AGENTIC_CLI §9.1)', () => {
       });
       await flushFrame();
       const rendered = captured.join('');
-      expect(rendered).not.toContain('AGENTS.md present');
+      expect(rendered).not.toContain('instructions file');
       stdin.feed('2');
       expect(await promise).toBe(0);
     } finally {
