@@ -17,6 +17,7 @@ import type { SubagentSet } from '../subagents/load.ts';
 import type { TelemetrySink } from '../telemetry/index.ts';
 import type { TodoItem, TodoStore } from '../todo/index.ts';
 import type { ClarifyBridgeRequest, ClarifyBridgeResponse, ToolRegistry } from '../tools/index.ts';
+import type { WorkingState, WorkingStateStore } from '../working-state/index.ts';
 import type { RelevanceAudit } from './compaction-relevance.ts';
 import { type ForjaEffort, effortBudgetPatch } from './effort.ts';
 import type { SessionContext } from './session-context.ts';
@@ -255,6 +256,17 @@ export type HarnessEvent =
       type: 'todo_updated';
       sessionId: string;
       items: TodoItem[];
+    }
+  | {
+      // Emitted whenever the working-state panel is mutated via `set` —
+      // inside `working_state_update`'s execute, mirroring `todo_updated`. The
+      // TUI / telemetry derive a live mutation counter from it
+      // (WORKING_STATE.md §4.4). clear() is intentionally NOT wired (session-end
+      // is cleanup, not a planning event). State is deep-cloned by the store
+      // before emission so observers can't reach back into store state.
+      type: 'working_state_updated';
+      sessionId: string;
+      state: WorkingState;
     }
   | {
       // Lifecycle bracket for a subagent the parent harness just
@@ -1039,6 +1051,11 @@ export interface HarnessConfig {
   // When absent (one-shot run), the loop creates a per-run store and
   // clears it at session-end; the caller owns teardown of an injected one.
   todoStore?: TodoStore;
+  // Session-bound working-state panel store (WORKING_STATE.md). Same ownership
+  // contract as todoStore: a multi-turn caller (REPL) injects one so the panel
+  // survives across turns; a one-shot run leaves it undefined and the loop
+  // creates + clears a per-run store. In-memory, never persisted.
+  workingStateStore?: WorkingStateStore;
   // Async hook the harness calls when the permission engine returns
   // a `confirm` decision. Caller resolves true to allow the call
   // (recorded as confirm_yes) or false to deny (confirm_no). When

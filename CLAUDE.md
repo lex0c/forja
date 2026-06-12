@@ -26,6 +26,7 @@ The architectural spec lives in `docs/spec/AGENTIC_CLI.md`. Each subsystem has a
 | Checkpoints / undo | `AGENTIC_CLI` §12 |
 | Storage / schema / audit | `AGENTIC_CLI` §13, `AUDIT` |
 | Context engine, compaction | `AGENTIC_CLI` §6, `CONTEXT_TUNING` |
+| Working-state panel (session operational state: focus/next/log/hypotheses) | `WORKING_STATE` |
 | Sampling, output budgets | `TOKEN_TUNING` |
 | TUI (inline render, event bus, microcopy, palette/glyphs) | `AGENTIC_CLI` §17, `UI` |
 | Cross-session memory | `MEMORY` |

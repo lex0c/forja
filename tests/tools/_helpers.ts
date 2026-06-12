@@ -44,6 +44,10 @@ export const makeCtx = (overrides: Partial<ToolContext> = {}): ToolContext => ({
   isCwdTrusted: overrides.isCwdTrusted ?? true,
   ...(overrides.bgManager !== undefined ? { bgManager: overrides.bgManager } : {}),
   ...(overrides.todoStore !== undefined ? { todoStore: overrides.todoStore } : {}),
+  ...(overrides.workingStateStore !== undefined
+    ? { workingStateStore: overrides.workingStateStore }
+    : {}),
+  ...(overrides.getStepNumber !== undefined ? { getStepNumber: overrides.getStepNumber } : {}),
   ...(overrides.reminderScheduler !== undefined
     ? { reminderScheduler: overrides.reminderScheduler }
     : {}),

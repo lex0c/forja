@@ -18,6 +18,7 @@ import type { ContextPinsStore } from '../storage/repos/context-pins.ts';
 import type { SubagentHandleStore } from '../subagents/handle-store.ts';
 import type { WorktreeOutcome } from '../subagents/types.ts';
 import type { TodoStore } from '../todo/index.ts';
+import type { WorkingStateStore } from '../working-state/index.ts';
 
 // Per CONTRACTS §2: tool errors are *data*, not exceptions. The harness
 // catches stray throws and converts them, but tools are expected to
@@ -320,6 +321,15 @@ export interface ToolContext {
   // persist across sessions; the harness creates a fresh store at
   // session start and clears it at session end.
   todoStore?: TodoStore;
+  // Session-bound working-state panel store (WORKING_STATE.md). Optional, same
+  // pattern as todoStore: working_state_update surfaces a clean error when
+  // absent. In-memory, dies at session end — no persistence (§0.5).
+  workingStateStore?: WorkingStateStore;
+  // Current monotonic step number of the run, for stamping working-state
+  // staleness (atStep / updatedAtStep — WORKING_STATE.md §6). Lazy getter,
+  // mirroring getCostBudget: the counter lives in the loop closure. Undefined
+  // in test/legacy contexts (the tool falls back to step 0).
+  getStepNumber?: () => number;
   // Session-scoped reminder scheduler (ORCHESTRATION.md §3B.9). Optional,
   // same pattern as `bgManager`/`todoStore`: the `reminder` family
   // surfaces a clean error when absent (e.g. one-shot `run.ts`, which has

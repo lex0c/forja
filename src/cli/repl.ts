@@ -71,6 +71,7 @@ import {
   detectCapabilities,
   lookupToolVocab,
 } from '../tui/index.ts';
+import { createWorkingStateStore } from '../working-state/index.ts';
 import type { ParsedArgs } from './args.ts';
 import { buildBgSummary } from './bg-summary.ts';
 import { operatorBootstrapFlags, reportRefusingEngine } from './boot-parity.ts';
@@ -2006,6 +2007,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       clarify,
       contextPinsStore,
       todoStore,
+      workingStateStore,
       // Reuse the live context (compact-once-reuse). Fall back to
       // resumeFromSessionId only when there's no live context — a turn
       // that errored before resolving one — so the next turn re-derives
@@ -2446,6 +2448,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // fresh runAgent that would otherwise start with an empty store). See
   // HarnessConfig.todoStore.
   const todoStore = createTodoStore();
+
+  // One working-state panel store for the whole REPL session — injected into
+  // every turn's HarnessConfig so the panel survives across turns (each turn is
+  // a fresh runAgent that would otherwise start empty). In-memory, dies with the
+  // process; no explicit teardown, mirroring todoStore (WORKING_STATE.md §7).
+  const workingStateStore = createWorkingStateStore();
 
   // Hook dispatcher for slash commands (EVICTION.md §10.3). Mirrors
   // the harness loop's wrapper at loop.ts:dispatchHooks but uses the

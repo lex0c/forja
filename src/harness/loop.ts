@@ -62,6 +62,7 @@ import { MAX_SUBAGENT_DEPTH, runSubagent } from '../subagents/runtime.ts';
 import { type TodoStore, createTodoStore } from '../todo/index.ts';
 import type { ToolContext } from '../tools/index.ts';
 import type { SpawnSubagentArgs, SpawnSubagentResult } from '../tools/types.ts';
+import { type WorkingStateStore, createWorkingStateStore } from '../working-state/index.ts';
 import { StepStallError, abortableIterable, stallWatchdog } from './abortable.ts';
 import { CollectStepError, type CollectedToolUse, collectStep } from './collect.ts';
 import type { RelevanceAudit } from './compaction-relevance.ts';
@@ -89,6 +90,7 @@ import {
   isRecapEnabled,
   resolveMaxOutputTokens,
 } from './types.ts';
+import { injectWorkingStateBlock } from './working-state-inject.ts';
 
 type TerminalSessionStatus = 'done' | 'interrupted' | 'exhausted' | 'error';
 
@@ -344,6 +346,25 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     // id; the row lands via a later set() that emits. Plain pass-through.
     nextId: (sid) => baseTodoStore.nextId(sid),
     clear: (sid) => baseTodoStore.clear(sid),
+  };
+  // Working-state panel store — same ownership + emit pattern as todoStore.
+  // Injected by the REPL so the panel persists across turns; a one-shot run
+  // gets a fresh per-run store (cleared below). The set() wrapper emits
+  // `working_state_updated` so the TUI / telemetry can track mutation rate
+  // (WORKING_STATE.md §4.4). clear() stays unwrapped — session-end cleanup.
+  const baseWorkingStateStore = config.workingStateStore ?? createWorkingStateStore();
+  const workingStateStore: WorkingStateStore = {
+    get: (sid) => baseWorkingStateStore.get(sid),
+    set: (sid, state) => {
+      baseWorkingStateStore.set(sid, state);
+      safeEmit(config.onEvent, {
+        type: 'working_state_updated',
+        sessionId: sid,
+        state: baseWorkingStateStore.get(sid),
+      });
+    },
+    nextId: (sid) => baseWorkingStateStore.nextId(sid),
+    clear: (sid) => baseWorkingStateStore.clear(sid),
   };
   // Like the todo store: the REPL injects a contextPinsStore so /pin and
   // pin_context share one; a one-shot run gets a fresh wrapper over the same
@@ -2632,12 +2653,17 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // `providerEffort` (what an inherited subagent config carries)
         // wins, else derive from the operator's `effort` level.
         const reqEffort = resolveProviderEffort(config);
+        // Snapshot the running message list so post-call mutations (the next
+        // iteration appends assistant + tool_results) don't retroactively
+        // change what the provider observed.
+        const reqMessages = [...ctx.getMessages()];
+        // Inject the working-state panel at the bottom of [current_turn]
+        // (appended to the last user message) — max-attention, cache-neutral,
+        // alternation-safe (WORKING_STATE.md §5). No-op when the panel is empty.
+        injectWorkingStateBlock(reqMessages, workingStateStore.get(sessionId), steps);
         const req: GenerateRequest = {
           model: config.provider.id,
-          // Snapshot the running message list so post-call mutations (the next
-          // iteration appends assistant + tool_results) don't retroactively
-          // change what the provider observed.
-          messages: [...ctx.getMessages()],
+          messages: reqMessages,
           max_tokens: resolvedMaxTokens,
           ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
           ...(config.systemSegments !== undefined ? { systemSegments: config.systemSegments } : {}),
@@ -3004,6 +3030,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           permissionCheck: (toolName, category, args) =>
             config.permissionEngine.check(toolName, category, args),
           todoStore,
+          workingStateStore,
+          // Monotonic step number for working-state staleness stamps
+          // (WORKING_STATE.md §6). The counter lives in this loop closure;
+          // exposed as a lazy getter so the tool reads the current step.
+          getStepNumber: () => steps,
           ...(bgManager !== undefined ? { bgManager } : {}),
           // Session-scoped reminder scheduler (ORCHESTRATION.md §3B.9).
           // Owned by the REPL (like the bgManagerHolder); the loop just
@@ -3939,6 +3970,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     // every turn — the exact bug the injection fixes. Idempotent.
     if (config.todoStore === undefined) {
       todoStore.clear(sessionId);
+    }
+    // Same ownership contract for the working-state panel: clear only when the
+    // loop owns it (one-shot run). An injected store (REPL) survives the turn;
+    // the caller owns teardown. Idempotent.
+    if (config.workingStateStore === undefined) {
+      workingStateStore.clear(sessionId);
     }
   }
 };

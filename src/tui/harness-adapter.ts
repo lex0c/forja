@@ -653,6 +653,12 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         return out;
       }
 
+      case 'working_state_updated':
+        // The panel is injected into the model prompt, not (yet) rendered in the
+        // TUI. The event exists for telemetry / a future live mutation counter
+        // (WORKING_STATE.md §4.4); no UI event today.
+        return out;
+
       case 'checkpoints_unavailable':
         out.push({
           type: 'warn',

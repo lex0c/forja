@@ -2,6 +2,41 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-12] working-state: implementation
+
+Implemented the WORKING_STATE.md spec end-to-end (no spec divergence — code
+follows the reviewed doc). Born with tests; typecheck + lint clean; impacted
+areas (working-state / tools / harness, 966 tests) green.
+
+Pieces: `src/working-state/index.ts` — the store (mirrors TodoStore: per-session
+Maps, structuredClone, get/set/nextId/clear) plus the pure bookkeeping
+(`applyWorkingStatePatch`: per-slot caps, log FIFO, staleness eviction,
+confirmed/refuted → log, mutation delta) and `formatWorkingState` (recency-window
+log render + global byte guard). `src/tools/builtin/working-state-update.ts` — the
+single permissive partial tool, validates patch shape + hypothesis-not-found at
+the boundary, orchestrates get → applyPatch → set; registered in the
+internal-state group. `src/harness/working-state-inject.ts` — appends the
+`[working_state]` block to the last user message (bottom of current_turn,
+alternation-safe, cache-neutral), tested for string + tool_result tails.
+
+Wiring: ToolContext gained `workingStateStore` + `getStepNumber` (lazy getter
+over the loop's `steps` counter, for staleness stamps); HarnessConfig gained
+`workingStateStore`; the loop wraps the store with an emitting `set` (new
+`working_state_updated` HarnessEvent, mirrors `todo_updated`), injects the block
+before the provider call, and clears the store at session-end only when it owns
+it. REPL injects one persistent store (survives turns); one-shot run + subagents
+let the loop own a fresh per-run store (subagents start empty — §7.3). TUI
+harness-adapter handles the new event as a no-op (panel is prompt-injected, not
+yet TUI-rendered; the subagent heartbeat switch already had a default).
+
+Decisions held from the spec: no confidence (status + evidence + staleness);
+hypothesis.source (user/model/tool); log injected by recency window with
+old-but-relevant facts living in evidence; metrics projected from the audit (the
+tool result echoes the mutation delta) — no new table; in-memory, disposable, no
+migration. Eval (load-bearing, the refuted-hypothesis-at-turn-20 regression) and
+a TUI panel renderer are the remaining follow-ups before this closes.
+Discoverability: CLAUDE.md table row + a CONTEXT_TUNING §10.2 cross-ref.
+
 ## [2026-06-12] working-state: spec PR — bounded hot-state operational panel
 
 New subsystem spec `docs/spec/WORKING_STATE.md` (no code yet — operator reviews

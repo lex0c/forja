@@ -31,6 +31,7 @@ import { todoCreateTool } from './todo-create.ts';
 import { todoGetTool } from './todo-get.ts';
 import { todoListTool } from './todo-list.ts';
 import { todoUpdateTool } from './todo-update.ts';
+import { workingStateUpdateTool } from './working-state-update.ts';
 import { writeFileTool } from './write-file.ts';
 
 export { bashTool } from './bash.ts';
@@ -103,6 +104,11 @@ export type { TodoListInput, TodoListOutput } from './todo-list.ts';
 export { todoUpdateTool } from './todo-update.ts';
 export type { TodoUpdateInput, TodoUpdateOutput } from './todo-update.ts';
 export type { TodoWireItem } from './todo-shared.ts';
+export { workingStateUpdateTool } from './working-state-update.ts';
+export type {
+  WorkingStateUpdateInput,
+  WorkingStateUpdateOutput,
+} from './working-state-update.ts';
 export { waitForTool } from './wait-for.ts';
 export type { WaitForInput, WaitForOutput } from './wait-for.ts';
 export { writeFileTool } from './write-file.ts';
@@ -141,6 +147,10 @@ export const BUILTIN_TOOLS = [
   todoCreateTool,
   todoUpdateTool,
   todoClearTool,
+  // working_state_update — the session operational panel (WORKING_STATE.md).
+  // Sits with the internal-state group: its 'write' is harness-internal,
+  // in-memory, session-scoped, never an external mutation.
+  workingStateUpdateTool,
   // clarify — core anti-presumption tool (CONTRACTS §2.6.5e). Not a
   // write/exec; its modal bridge (ctx.clarify) is wired in the REPL.
   clarifyTool,

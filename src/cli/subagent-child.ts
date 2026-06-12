@@ -1348,7 +1348,11 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
                 he.type === 'session_finished' ||
                 he.type === 'subagent_start' ||
                 he.type === 'subagent_progress' ||
-                he.type === 'subagent_finished'
+                he.type === 'subagent_finished' ||
+                // working_state is the child's PRIVATE scratchpad (WORKING_STATE
+                // §7.3); the parent has no render for it, so forwarding would
+                // only flood the IPC channel and degrade to raw-type heartbeat.
+                he.type === 'working_state_updated'
               ) {
                 return;
               }

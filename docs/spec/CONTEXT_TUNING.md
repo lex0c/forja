@@ -778,6 +778,12 @@ Pinned context (always-include):       ← se houver pins ativos (§12.4)
 
 Marcadores `─` separam visualmente; modelo aprende padrão.
 
+> **Painel `[working_state]`** ([`WORKING_STATE.md §5`](./WORKING_STATE.md)): o
+> estado operacional efêmero da sessão (focus / next / hypotheses / log) é
+> injetado na MESMA zona — bottom do `[current_turn]`, anexado à última mensagem
+> de user — cache-neutro pelo mesmo motivo (o turn é reconstruído a cada step).
+> Coabita com o goal re-injection e os pins.
+
 ### 10.3 Format
 
 **Literal**, não resumido. Goal vem do primeiro user message da sessão; preservado byte-by-byte.
