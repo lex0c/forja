@@ -14,6 +14,9 @@ import { memorySearchTool } from './memory-search.ts';
 import { memoryWriteTool } from './memory-write.ts';
 import { pinContextTool } from './pin-context.ts';
 import { readFileTool } from './read-file.ts';
+import { reminderCancelTool } from './reminder-cancel.ts';
+import { reminderListTool } from './reminder-list.ts';
+import { reminderTool } from './reminder.ts';
 import { retrieveContextTool } from './retrieve-context.ts';
 import { skillInvokeTool } from './skill-invoke.ts';
 import { skillListTool } from './skill-list.ts';
@@ -59,6 +62,12 @@ export type {
 export { memoryWriteTool } from './memory-write.ts';
 export type { MemoryWriteInput, MemoryWriteOutput } from './memory-write.ts';
 export { monitorTool } from './monitor.ts';
+export { reminderTool } from './reminder.ts';
+export type { ReminderInput, ReminderOutput } from './reminder.ts';
+export { reminderListTool } from './reminder-list.ts';
+export type { ReminderListEntry, ReminderListInput, ReminderListOutput } from './reminder-list.ts';
+export { reminderCancelTool } from './reminder-cancel.ts';
+export type { ReminderCancelInput, ReminderCancelOutput } from './reminder-cancel.ts';
 export { pinContextTool } from './pin-context.ts';
 export type { PinContextInput, PinContextOutput } from './pin-context.ts';
 export { clarifyTool } from './clarify.ts';
@@ -150,6 +159,11 @@ export const BUILTIN_TOOLS = [
   bashOutputTool,
   bashKillTool,
   bashListTool,
+  // reminder family (CONTRACTS §2.6.5f / §2.6.10): the clock-driven
+  // producer of the notification channel — palette set/list/cancel.
+  reminderTool,
+  reminderListTool,
+  reminderCancelTool,
 ] as const;
 
 export const registerBuiltinTools = (reg: ToolRegistry): void => {

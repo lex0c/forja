@@ -32,3 +32,32 @@ describe('buildToolDefs: requiresOperatorConfirm tools need an operator surface'
     expect(buildToolDefs(config(true)).map((d) => d.name)).toEqual(['read_file', 'clarify']);
   });
 });
+
+describe('buildToolDefs: reminder family needs a session-scoped scheduler', () => {
+  const reminderStub = (name: string) => ({
+    name,
+    description: `${name} desc`,
+    inputSchema: { type: 'object', properties: {} },
+    metadata: {
+      category: 'misc',
+      writes: false,
+      idempotent: false,
+      requiresReminderScheduler: true,
+    },
+    execute: async () => ({}),
+  });
+  const cfg = (hasScheduler: boolean): HarnessConfig =>
+    ({
+      toolRegistry: { list: () => [stub('read_file', false), reminderStub('reminder')] },
+      confirmPermission: async () => true, // operator present — isolate the scheduler axis
+      ...(hasScheduler ? { reminderScheduler: {} } : {}),
+    }) as unknown as HarnessConfig;
+
+  test('no scheduler (one-shot / subagent) hides the reminder tools', () => {
+    expect(buildToolDefs(cfg(false)).map((d) => d.name)).toEqual(['read_file']);
+  });
+
+  test('scheduler present (REPL) exposes them', () => {
+    expect(buildToolDefs(cfg(true)).map((d) => d.name)).toEqual(['read_file', 'reminder']);
+  });
+});

@@ -806,7 +806,8 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
         return (
           tool.metadata.writes === true ||
           tool.metadata.exec === true ||
-          tool.metadata.requiresBgManager === true
+          tool.metadata.requiresBgManager === true ||
+          tool.metadata.requiresReminderScheduler === true
         );
       },
     });

@@ -205,9 +205,17 @@ const exitToHarnessStatus: Record<ExitReason, HarnessResult['status']> = {
 // recording the assumption.
 export const buildToolDefs = (config: HarnessConfig): ProviderToolDef[] => {
   const operatorPresent = config.confirmPermission !== undefined;
+  // The reminder family only resolves against a session-scoped scheduler
+  // (ORCHESTRATION.md §3B.9), which only the interactive REPL builds — a
+  // one-shot run and a subagent have no next turn to wake, so they get no
+  // scheduler. Hide those tools from the surface there rather than show a
+  // tool the model would only get `scheduler_unavailable` from. Same
+  // shape as the operator-confirm gate above.
+  const reminderAvailable = config.reminderScheduler !== undefined;
   return config.toolRegistry
     .list()
     .filter((t) => operatorPresent || t.metadata.requiresOperatorConfirm !== true)
+    .filter((t) => reminderAvailable || t.metadata.requiresReminderScheduler !== true)
     .map((t) => ({
       name: t.name,
       description: t.description,
@@ -2997,6 +3005,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             config.permissionEngine.check(toolName, category, args),
           todoStore,
           ...(bgManager !== undefined ? { bgManager } : {}),
+          // Session-scoped reminder scheduler (ORCHESTRATION.md §3B.9).
+          // Owned by the REPL (like the bgManagerHolder); the loop just
+          // forwards it to the reminder tools. Absent in one-shot runs.
+          ...(config.reminderScheduler !== undefined
+            ? { reminderScheduler: config.reminderScheduler }
+            : {}),
           ...(spawnSubagentClosure !== undefined ? { spawnSubagent: spawnSubagentClosure } : {}),
           ...(subagentHandleStore !== undefined ? { subagentHandleStore } : {}),
           // Slice 157 (review — phase 2 of macOS /tmp isolation). Per-

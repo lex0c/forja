@@ -85,6 +85,23 @@ const escapesTool = (name: string): Tool => ({
   },
 });
 
+// Tool factory mirroring the `reminder` family: writes:false (so the
+// writes gate doesn't fire) but requiresReminderScheduler:true.
+const reminderTool = (name: string): Tool => ({
+  name,
+  description: name,
+  inputSchema: { type: 'object' },
+  metadata: {
+    category: 'misc',
+    writes: false,
+    requiresReminderScheduler: true,
+    idempotent: false,
+  },
+  async execute() {
+    return { ok: true };
+  },
+});
+
 const buildRegistry = (...tools: Tool[]) => {
   const r = createToolRegistry();
   for (const t of tools) r.register(t);
@@ -163,6 +180,23 @@ describe('validateSubagentTools', () => {
       isolation: 'worktree',
     });
     expect(() => validateSubagentTools(def, reg)).not.toThrow();
+  });
+
+  test('rejects a tool requiring the reminder scheduler (no wake-when-idle in a subagent)', () => {
+    const reg = buildRegistry(tool('read_file', false), reminderTool('reminder'));
+    const def = definition({ tools: ['read_file', 'reminder'] });
+    expect(() => validateSubagentTools(def, reg)).toThrow(
+      /tool 'reminder' declares metadata.requiresReminderScheduler=true and cannot appear in subagent.tools\[\]/,
+    );
+  });
+
+  test('worktree does NOT lift the reminder gate (it is about wake, not write-containment)', () => {
+    // Unlike writes:true, worktree isolation doesn't help a reminder —
+    // the missing piece is the REPL's idle state to wake, which no
+    // isolation strategy provides.
+    const reg = buildRegistry(reminderTool('reminder'));
+    const def = definition({ tools: ['reminder'], isolation: 'worktree' });
+    expect(() => validateSubagentTools(def, reg)).toThrow(/requiresReminderScheduler=true/);
   });
 
   test('isolation: worktree accepts a writes+escapesCwd tool like bash', () => {

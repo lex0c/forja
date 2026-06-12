@@ -44,6 +44,9 @@ export const makeCtx = (overrides: Partial<ToolContext> = {}): ToolContext => ({
   isCwdTrusted: overrides.isCwdTrusted ?? true,
   ...(overrides.bgManager !== undefined ? { bgManager: overrides.bgManager } : {}),
   ...(overrides.todoStore !== undefined ? { todoStore: overrides.todoStore } : {}),
+  ...(overrides.reminderScheduler !== undefined
+    ? { reminderScheduler: overrides.reminderScheduler }
+    : {}),
   ...(overrides.spawnSubagent !== undefined ? { spawnSubagent: overrides.spawnSubagent } : {}),
   ...(overrides.subagentHandleStore !== undefined
     ? { subagentHandleStore: overrides.subagentHandleStore }

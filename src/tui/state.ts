@@ -476,6 +476,13 @@ export interface LiveState {
       liveCostUsd: number;
     }
   >;
+  // Pending reminders scheduled this session (ORCHESTRATION.md §3B.9).
+  // A plain count, not a Map: the footer chip only needs the size, and
+  // the ReminderScheduler is the source of truth — every set/cancel/fire/
+  // cleanup pushes the new count via `reminders:update`. Like
+  // `bgProcesses` it survives the turn boundary (reminders are
+  // session-scoped); a fresh PROCESS starts from 0.
+  reminderCount: number;
   // Operator hit Esc once during a running turn (spec UI.md §4.10.6
   // "Soft-aborted (ainda processando)"). The footer swaps its
   // interrupt cue from "esc to interrupt" to "esc again to force"
@@ -584,6 +591,7 @@ export const createInitialState = (): LiveState => ({
   todos: [],
   bgProcesses: new Map(),
   subagents: new Map(),
+  reminderCount: 0,
   parallelStatus: null,
   softInterrupted: false,
   exitArmed: null,
@@ -2223,6 +2231,13 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // a future "process tray" panel that surfaces per-process
       // status changes without flapping the counter.
       return { state, permanent: [] };
+
+    case 'reminders:update':
+      // Absolute pending count from the ReminderScheduler (§3B.9). Stored
+      // directly — the scheduler is the source of truth, so the reducer
+      // never derives it. No permanent scrollback line: the fire itself
+      // surfaces via the bg_done-style `● [reminder]` wake echo.
+      return { state: { ...state, reminderCount: event.count }, permanent: [] };
 
     case 'subagent:start': {
       // Insert a fresh row keyed by subagentId. Duplicate starts

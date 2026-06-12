@@ -406,7 +406,7 @@ Caveat herdado: logs muito grandes têm o head descartado (truncate-head); para 
 
 ### 3B.3 Notificação na conclusão (canal de notifications)
 
-Quando um processo settla (`exited`/`killed`/`failed`), o REPL empurra **um item num canal de NOTIFICATIONS in-memory — distinto do inbox**. O inbox carrega *intenção do operador* (input enfileirado durante um turn); o canal de notifications carrega *eventos de sistema* que devem alcançar o modelo. Separar os dois mantém responsabilidades distintas e habilita render próprio (§3B.7). O canal é **genérico, discriminado por `kind`**: `bg_done` é o primeiro produtor; uma futura tool de reminder adiciona outro `kind` (`reminder`) sem alterar o canal — o produtor traz sua própria lógica (o `BgManager` observa exits; o reminder observa o relógio), o canal só armazena, formata e drena.
+Quando um processo settla (`exited`/`killed`/`failed`), o REPL empurra **um item num canal de NOTIFICATIONS in-memory — distinto do inbox**. O inbox carrega *intenção do operador* (input enfileirado durante um turn); o canal de notifications carrega *eventos de sistema* que devem alcançar o modelo. Separar os dois mantém responsabilidades distintas e habilita render próprio (§3B.7). O canal é **genérico, discriminado por `kind`**: `bg_done` é o primeiro produtor; a família `reminder` (§3B.9, `CONTRACTS.md §2.6.10`) é o segundo, adicionando o `kind: 'reminder'` sem alterar o canal — cada produtor traz sua própria lógica (o `BgManager` observa exits; o `ReminderScheduler` observa o relógio), o canal só armazena, formata e drena.
 
 Shape do item `bg_done` (`CONTRACTS.md §2.6.5d`):
 
@@ -460,6 +460,38 @@ O auto-wake é o **comportamento default**, protegido por guardas medidas **ante
 | Pollar `bash_output` em loop quando a notificação resolveria | A notificação na conclusão é o mecanismo push; o poll é para inspeção mid-run. |
 
 **Eval acoplado:** `evals/bg/persistent_notify_wake/` — lança um bg de duração conhecida, fecha o turn, verifica que (a) o processo sobrevive ao boundary, (b) `bash_output` recupera o output depois, (c) a notificação aterrissa no inbox, (d) o wake dispara quando idle, (e) as guardas seguram (budget exausto → semi-push; burst → coalescing; cap de wakes para o loop).
+
+### 3B.9 Produtor #2 — reminders (observa o relógio)
+
+O canal de §3B.3 foi desenhado genérico; o `reminder` é o segundo produtor sem nenhuma mudança na mecânica de enqueue/drain/wake/guardas. ADR e reconciliação com o princípio guia ("meta-cognição não é tool") em `CONTRACTS.md §2.6.10`; catálogo em `CONTRACTS.md §2.6.5f`.
+
+**O produtor.** Um `ReminderScheduler` **in-memory, session-scoped** — mesma natureza e ciclo de vida do `BgManager` (§3B.1) e do inbox: criado pelo REPL, morre no `cleanup()` do exit da sessão. **Não** precisa do padrão *holder* do `BgManager`: o scheduler não depende do `sessionId` (não escreve em SQLite — não há storage novo, §0/§13 preservados), então o REPL o constrói direto no boot e injeta em cada turn como o `todoStore`.
+
+**Disponibilidade — só o REPL interativo.** A família `reminder` depende do scheduler + wake-when-idle, que **só** o REPL tem. Quando o scheduler é ausente, as tools são **escondidas do surface do modelo** (`buildToolDefs` filtra `requiresReminderScheduler` quando `config.reminderScheduler` é `undefined`, espelhando o gate de `requiresOperatorConfirm`) — não basta retornar tool-error, o modelo não deve ver uma tool que não pode usar. Dois contextos sem scheduler:
+
+- **one-shot** (`run.ts`): sem próximo turn, um reminder nunca dispararia. Tools escondidas.
+- **subagent**: sessão headless *run-to-completion*, sem estado idle para acordar. Tools escondidas do filho **e** barradas no `validate` (`requiresReminderScheduler` é o 4º check — um whitelist que liste reminder falha no bootstrap com mensagem clara). Distinto de `bash_background`, que um subagent *worktree* pode usar (roda dentro do próprio run do filho, sem precisar de wake).
+
+**Disparo.** `reminder({ in, note })` agenda um `setTimeout(delay)`. Ao disparar, o scheduler empurra no canal:
+
+```
+{ kind: 'reminder', note, scheduledAt }
+```
+
+A partir daí é idêntico ao `bg_done`: **idle → wake** (dispara um turn cujo input é a `note`, como linha de sistema `● [reminder] <note>` no scrollback, §3B.7); **turn em curso → semi-push** (drena no próximo boundary). Todas as guardas de §3B.4 valem sem adição — typing-gate, budget-gate, consecutive-wake cap, precedência do operador. O input do wake-turn persiste com `source: 'system'` (migration 075), não como input do operador.
+
+**Constraints normativas** (espelham `CONTRACTS.md §2.6.10`):
+
+| Constraint | Regra |
+|---|---|
+| **Escopo** | in-memory, session-scoped. Sem persistência cross-session (§0). Reminder com horizonte > vida da sessão não dispara — aceito. |
+| **Tempo** | só delay relativo (`in`); condicional é `wait_for` (retirado), não reintroduzir. |
+| **Cap de horizonte** | default 24h. Obrigatório: `setTimeout` > 2³¹ ms dispara imediatamente — o cap fica bem abaixo. |
+| **Cancel/list** | `reminder_cancel` faz `clearTimeout`+remove (idempotente); `reminder_list` snapshota os pendentes (recupera `reminder_id` perdido por compaction). |
+
+**Transição.** O wake de §3B.4 agora dispara por `bg_done ∨ reminder_fired` (`STATE_MACHINE.md §2.2`).
+
+**Eval acoplado:** `evals/reminders/` — agenda um reminder curto, fecha o turn, verifica (a) dispara no horizonte, (b) wake quando idle, (c) semi-push quando busy, (d) `reminder_cancel` desmarca antes do disparo, (e) `cleanup()` no exit não vaza timer pendente.
 
 ---
 

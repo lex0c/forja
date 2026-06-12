@@ -2,6 +2,101 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-11] security: sanitize notification fields before scrollback render
+
+Review flagged the reminder `note` (model-authored, can quote untrusted
+content) reaching the operator's scrollback verbatim via the `● ` info
+echo — ANSI could repaint the terminal, an embedded newline could forge a
+fake system row. Verified it was broader than the review assumed: the bg
+`command` and `summary` shared the gap (the channel never sanitized them,
+contrary to the review's "bg is sanitized" claim — only the synchronous
+bash tool's output was). Now aligned with the project's render-time
+sanitization discipline (`SECURITY_GUIDELINE`; cf. `permanent.ts` cards).
+
+Two helpers lifted into `src/sanitize`: `flattenControlToLine` (note /
+command → one line, no width cap so the wake-turn input isn't truncated)
+and `stripControlKeepLines` (bg summary → drop CR, keep LF/TAB for the
+per-line indent). Learned mid-fix that `stripAnsi` already drops every
+bare C0 byte except TAB/LF/CR, so the helpers only neutralize those three
+survivors. Open follow-up (pre-existing, out of scope): `flattenSubject`
+in harness-adapter flattens newlines but does NOT stripAnsi the
+model-authored tool `subject` — same ANSI gap on a different path.
+
+## [2026-06-11] reminders: REPL-only availability (hide off-REPL + reject in subagents)
+
+Closed a gap (surfaced in review): the reminder family was advertised in
+one-shot run.ts and subagents — which have no session-scoped scheduler —
+so every invocation there returned `scheduler_unavailable`, and a
+subagent whitelist listing `reminder` passed validation while the tool
+was dead. Two layers now: `buildToolDefs` hides `requiresReminderScheduler`
+tools when `config.reminderScheduler` is undefined (same shape as the
+`requiresOperatorConfirm` gate), so the model never sees them off-REPL;
+`validateSubagentTools` gains a 4th check rejecting them regardless of
+isolation (a run-to-completion subagent has no idle state to wake —
+worktree doesn't lift it, unlike `writes`). Clarified the bash_background
+contrast: it IS already barred in default-isolation subagents (writes:true)
+and only allowed in worktree ones, where it actually runs. Spec:
+ORCHESTRATION §3B.9 + CONTRACTS §2.6.5f.
+
+## [2026-06-11] tui: N reminders footer chip
+
+Operator-requested follow-up to the reminder tool: surface pending
+reminders as a live footer chip, BEFORE `bash bg` (a scheduled wake is
+the earliest cue the session will re-engage on its own). Same treatment
+as the bash-bg / subagents chips — green, suppressed at 0, survives the
+turn boundary.
+
+Plumbing: the ReminderScheduler gained `onChange(pendingCount)` (fires on
+set/cancel/fire/cleanup); the REPL routes it to a `reminders:update` bus
+event; `LiveState.reminderCount` stores the absolute count (a plain
+number, not a Map — the chip only needs the size; the scheduler is the
+source of truth so the reducer never derives it). Verified the cleanup's
+post-`renderer.close()` emit is safe (the renderer unsubscribes + the
+`closed` flag no-ops render — same as bg cleanup's `bg:end`). Spec
+follow-up still pending: §3B.7 / UI.md §4.10.6 say "two chips" — bump to
+three after the chip is validated in `bun run dev`.
+
+## [2026-06-11] reminder tool — spec PR + implementation
+
+New branch `feat/reminder-tool`. Adds the second producer to the
+notification channel that ORCHESTRATION §3B.3 reserved: a `reminder`
+family that observes the CLOCK (vs `bg_done` observing process exits).
+Reuses the channel, wake-when-idle, the five §3B.4 guards, the `● …`
+scrollback echo, and the `source: 'system'` wake-turn input (migration
+075) untouched — the new part is the time producer.
+
+Decisions (operator): in-memory session-scoped (dies at exit like
+bash_background §3B.1 and the inbox — no migration, preserves §0
+"nothing cross-session"); three tools `reminder` / `reminder_list` /
+`reminder_cancel` (palette symmetric to bash_*/task_*); relative delay
+only (`in: "10m"`), absolute time the model converts to a delta.
+
+Spec PR (before code): CONTRACTS §2.6.10 new ADR reconciling the
+"meta-cognition is not a tool" principle (§2.6.8) — scheduling a
+temporal event is an action in the world (at(1)/cron-like), distinct
+from recall-of-fact (memory) or plan management (todo_write);
+CONTRACTS §2.6.5d catalog + `ReminderNotification` envelope;
+ORCHESTRATION §3B.9 (time producer, in-memory scheduler, cleanup);
+STATE_MACHINE §2.2 wake fires on `bg_done ∨ reminder_fired`.
+
+Code shipped: `src/reminders/` scheduler (injectable clock/timer →
+deterministic tests) + duration parser; the three tools; the repl
+`Notification` type generalized to a `kind`-union with a switch
+formatter; REPL wiring (boot-created scheduler — no holder, no
+sessionId dependency — onFire → enqueueNotification, cleanup in
+shutdown); `ToolContext.reminderScheduler` + `HarnessConfig` forward +
+loop injection; `requiresReminderScheduler` metadata threaded through
+the side-effect oracle (bootstrap + subagent-child) like
+`requiresBgManager`. One-shot `run.ts` passes no scheduler → the tools
+surface a clean error.
+
+Eval: followed the bg precedent (no `evals/bg/` shell eval exists — it
+was aspirational in the spec). Coverage is the deterministic scheduler
+tests (fake clock: fire/list/cancel/cleanup/horizon-cap) + tool tests
++ a repl-level integration test proving a reminder firing while idle
+auto-wakes a turn whose input is `[reminder] <note>`, persisted as a
+system message — the same wake path bg_done already exercises.
+
 ## [2026-06-11] bg: bound grep output by bytes + memory, not just matches
 
 Robustness review of the branch (against develop) flagged grep mode as

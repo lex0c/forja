@@ -305,6 +305,36 @@ describe('renderFooter', () => {
     });
   });
 
+  describe('pending reminders chip (`N reminders`)', () => {
+    test('surfaces a `N reminders` chip from the pending count', () => {
+      const s = startedSession();
+      s.reminderCount = 2;
+      const out = renderFooter(s, caps) ?? '';
+      expect(out).toContain('2 reminders');
+    });
+
+    test('zero pending drops the chip entirely', () => {
+      const out = renderFooter(startedSession(), caps) ?? '';
+      expect(out).not.toContain('reminders');
+    });
+
+    test('renders BEFORE the bash bg chip', () => {
+      const s = startedSession();
+      s.reminderCount = 1;
+      s.bgProcesses.set('p1', { processId: 'p1', command: 'npm run dev' });
+      const out = renderFooter(s, caps) ?? '';
+      expect(out.indexOf('1 reminders')).toBeLessThan(out.indexOf('1 bash bg'));
+    });
+
+    test('painted success (green) like the other live chips', () => {
+      const colored: Capabilities = { ...caps, color: 'basic' };
+      const s = startedSession();
+      s.reminderCount = 3;
+      const out = renderFooter(s, colored) ?? '';
+      expect(out).toContain(`${CSI}32m3 reminders${CSI}0m`);
+    });
+  });
+
   test('memoryCount does NOT surface in the footer (chip removed)', () => {
     const out = renderFooter(startedSession({ memoryCount: 7 }), caps) ?? '';
     expect(out).not.toContain('mem ');

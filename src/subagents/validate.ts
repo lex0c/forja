@@ -22,7 +22,7 @@ import type { SubagentDefinition } from './types.ts';
 // without polluting the parent's tree. The validator still rejects
 // unregistered tool names regardless of isolation.
 //
-// Three checks per tool:
+// Four checks per tool:
 //   1. The tool must be registered with the active registry. The
 //      runtime would catch this at child-registry construction
 //      time too, but pulling it forward gives the author a clean
@@ -42,6 +42,12 @@ import type { SubagentDefinition } from './types.ts';
 //      will lift this gate; until then, we reject at validate time
 //      so the author gets a clean error instead of a deferred
 //      `headless_mode` rejection at first invocation.
+//   4. The tool's metadata must NOT declare `requiresReminderScheduler`
+//      regardless of isolation. The reminder family needs the REPL's
+//      clock-driven wake-when-idle (ORCHESTRATION.md §3B.9); a headless
+//      run-to-completion subagent has no idle state, so a reminder there
+//      could never fire. Unlike `requiresBgManager` (every subagent gets
+//      a bg log dir — see below), there is no per-subagent scheduler.
 //
 // `requiresBgManager` is not a third check: every subagent
 // gets its own bg log directory namespaced
@@ -79,6 +85,19 @@ export const validateSubagentTools = (
     if (tool.metadata.requiresOperatorConfirm === true) {
       throw new Error(
         `subagent '${definition.name}' (${definition.sourcePath}): tool '${toolName}' declares metadata.requiresOperatorConfirm=true and cannot appear in subagent.tools[] — the tool needs a modal-confirmation pipe to the parent REPL, which subagents do not have today. Remove the tool from this subagent's whitelist.`,
+      );
+    }
+    // The reminder family depends on the session-scoped scheduler +
+    // wake-when-idle (ORCHESTRATION.md §3B.9), which only the interactive
+    // REPL has. A subagent is a headless, run-to-completion session with
+    // no idle state to wake — a reminder there could never fire. Reject
+    // at bootstrap so the author gets a clean reason instead of a
+    // deferred `scheduler_unavailable` at first invocation. (Distinct
+    // from bash_background, which a worktree subagent CAN use: it runs
+    // within the child's own run, no wake needed.)
+    if (tool.metadata.requiresReminderScheduler === true) {
+      throw new Error(
+        `subagent '${definition.name}' (${definition.sourcePath}): tool '${toolName}' declares metadata.requiresReminderScheduler=true and cannot appear in subagent.tools[] — reminders need the REPL's clock-driven wake-when-idle, which a headless run-to-completion subagent has no idle state for. Remove the tool from this subagent's whitelist.`,
       );
     }
     if (tool.metadata.writes === true && !allowWrites) {

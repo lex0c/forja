@@ -7,6 +7,7 @@ import type { EagerExposure, MemoryRegistry } from '../memory/index.ts';
 import type { OutcomeSink } from '../outcomes/index.ts';
 import type { Decision, PermissionEngine, PolicySource } from '../permissions/index.ts';
 import type { Provider, ProviderEffort, StreamEvent, UsageInfo } from '../providers/index.ts';
+import type { ReminderScheduler } from '../reminders/index.ts';
 import type { SkillCatalog } from '../skills/index.ts';
 import type { DB } from '../storage/index.ts';
 import type { ContextPinsStore } from '../storage/repos/context-pins.ts';
@@ -753,6 +754,14 @@ export interface HarnessConfig {
   // (or, when idle, the notification channel — §3B.3); the loop wires
   // the manager's onEvent to call this, and the caller routes.
   bgManagerHolder?: BgManagerHolder;
+  // Session-scoped reminder scheduler (ORCHESTRATION.md §3B.9). The
+  // second producer of the notification channel — observes the clock
+  // instead of process exits. Unlike the BgManager it needs no
+  // sessionId, so no holder: the REPL builds it directly at boot and
+  // passes it here; the loop forwards it to `ToolContext.reminderScheduler`
+  // for the reminder tools. Absent in one-shot runs (no next turn to
+  // wake) — the tools then surface a clean error.
+  reminderScheduler?: ReminderScheduler;
   cwd: string;
   systemPrompt?: string;
   // Per-segment view of the same prompt for adapters that support

@@ -245,7 +245,7 @@ Família para processos de longa duração e coordenação não-blocking. Tools 
 
 #### 2.6.5d.1 Lifecycle persistente e o envelope `bg_done`
 
-`bash_background` roda o processo **genuinamente em background** (`ORCHESTRATION.md §3B`): sobrevive ao fim do turn, vive até término natural / `bash_kill` / exit da sessão (cross-turn, **não** cross-process), e **notifica** o modelo na conclusão em vez de exigir poll. Na conclusão, o REPL empurra um item no **canal de notifications** in-memory — distinto do inbox, genérico e discriminado por `kind` (`ORCHESTRATION.md §3B.3`; uma futura tool de reminder adiciona outro `kind`):
+`bash_background` roda o processo **genuinamente em background** (`ORCHESTRATION.md §3B`): sobrevive ao fim do turn, vive até término natural / `bash_kill` / exit da sessão (cross-turn, **não** cross-process), e **notifica** o modelo na conclusão em vez de exigir poll. Na conclusão, o REPL empurra um item no **canal de notifications** in-memory — distinto do inbox, genérico e discriminado por `kind` (`ORCHESTRATION.md §3B.3`; a família `reminder` adiciona o `kind: 'reminder'` — §2.6.5f / §2.6.10):
 
 ```ts
 interface BgDoneNotification {
@@ -314,6 +314,22 @@ UI integration: status line mostra tray de `bash_*` ativos (`bg N`); status line
 - `clarify.budget_exceeded` — sessão emitiu mais de `clarification.max_per_session` (default 5); retorna erro estruturado e o modelo segue com a suposição
 
 **Disponibilidade ao modelo:** `clarify` é tool **core, sempre exposta** — disponível em toda sessão ao lado de `read`/`write`/`edit`, sem gate de playbook e sem modo por playbook.
+
+### 2.6.5f Timing (reminders)
+
+> **Cross-refs:** ADR completo + reconciliação com o princípio guia em `§2.6.10`; produtor #2 do canal de notifications em `ORCHESTRATION.md §3B.9`; wake-when-idle em `§3B.4`.
+
+Família que observa o **relógio** e empurra no canal de notifications (`kind: 'reminder'`) — o análogo temporal de `bash_background` (que observa **exits**). In-memory, session-scoped (morre no exit, como o bg). Só delay relativo.
+
+| Tool | Input | Output | Side effects | Idempotente | Custo típico |
+|---|---|---|---|---|---|
+| `reminder` | `{ in, note }` | `{ reminder_id, fire_at }` | agenda `setTimeout` session-scoped; no disparo enfileira `ReminderNotification` (§3B.9) | não | ~1ms |
+| `reminder_list` | `{}` | `{ reminders: [{ reminder_id, note, scheduled_at, fire_at }], total }` | nenhum (snapshot) | sim | ~1ms |
+| `reminder_cancel` | `{ reminder_id }` | `{ cancelled }` | `clearTimeout` + remove | sim (`false` em id desconhecido / já disparado) | ~1ms |
+
+`in` é delay relativo com sufixo `s`/`m`/`h` (`"30s"`, `"10m"`, `"2h"`), validado positivo e ≤ cap de horizonte (default 24h). O disparo acorda a sessão se `idle` (wake-when-idle, §3B.4) ou aguarda o próximo boundary se `busy` (semi-push) — mesmas guardas do `bg_done`.
+
+**Disponibilidade — só REPL interativo** (`ORCHESTRATION.md §3B.9`). Sem scheduler (one-shot `run.ts`, subagent), as três tools são **escondidas do surface** do modelo (`buildToolDefs` filtra `requiresReminderScheduler`), e um whitelist de subagent que as liste falha no `validate` — um subagent *run-to-completion* não tem estado idle para acordar.
 
 ### 2.6.6 Justificativa do teto (22 vs 10)
 
@@ -733,6 +749,80 @@ Estas 4 tools só viram visíveis ao modelo quando:
 4. Eval (`TOKEN_TUNING.md §13.4`) inclui ≥ 1 item por tool com `severity: critical` — gate de release.
 
 Sem (1)-(4): tool **registrada** mas com `visible_to_model: false` em todos os schemas. Decisão simétrica à de MCP servers não-confiáveis (`MCP.md §1.5`). Modelo nem sabe que existe a tool até pré-requisitos serem cumpridos.
+
+### 2.6.10 Timing tools (notification-channel-driven review)
+
+`ORCHESTRATION.md §3B` introduziu o **canal de notifications** genérico (discriminado por `kind`) + wake-when-idle. `bg_done` é o produtor #1 (observa **exits** de processo). Esta sub-seção formaliza o produtor #2: uma família `reminder` que observa o **relógio**.
+
+**Tensão com o princípio guia (§2.6.8).** "Meta-cognição não é tool; *lembrar* é do harness" rejeitou `todo_write`. O reminder parece colidir — a reconciliação **é** o ADR:
+
+- O "lembrar" rejeitado em §2.6.8 é **recall de fato** / gestão de plano: decisão *sobre o modelo*, harness-side (memory subsystem; todos via stream-parse). Continua não sendo tool.
+- `reminder` agenda um **evento temporal no mundo**. Análogo a `at(1)`/`cron`: dispara um trigger por relógio, exatamente como `bash_background` dispara por exit. O harness **não pode** decidir o "quando" — só o modelo sabe que "isto leva ~5 min" relativo à tarefa em curso. Delegar o quando via tool é a mesma lógica de `bash_background` ("rode isto e me avise"), não cognição.
+- **Fronteira:** o reminder não carrega estado cognitivo persistente (não é "nota pro futuro-self" — isso seria `pin_context`/memory). Carrega uma string de contexto (`note`) que vira o input do wake-turn; o efeito é puramente temporal.
+
+| # | Tool proposta | Decisão | Tool count após |
+|---|---|---|---|
+| H | `reminder` | **accepted** | 17 |
+| I | `reminder_list` | **accepted** | 18 |
+| J | `reminder_cancel` | **accepted** | 19 |
+
+Total: 16 → 19, **peso conceitual ~1 slot** — a família é uma *palette* (set → list → cancel), como `bash_background`/`bash_list`/`bash_kill` (§2.6.5d) e `task_async`/`task_list`/`task_cancel` (§2.6.5b). `_list`/`_cancel` são add-ons baratos da mesma razão de existência do `bash_list`: o modelo perde o `reminder_id` após compaction e precisa recuperá-lo/desmarcá-lo.
+
+**Schema:**
+
+```yaml
+name: reminder
+input:
+  in: string         # delay relativo: "30s" | "10m" | "2h" (sufixos s/m/h)
+  note: string       # contexto que vira o input do wake-turn no disparo
+output:
+  reminder_id: string
+  fire_at: number    # epoch ms agendado
+---
+name: reminder_list
+input: {}            # sem args — snapshot dos pendentes desta sessão
+output:
+  reminders: { reminder_id, note, scheduled_at, fire_at }[]
+  total: number
+---
+name: reminder_cancel
+input:  { reminder_id: string }
+output: { cancelled: boolean }   # false se id desconhecido / já disparou
+```
+
+No disparo, o scheduler empurra no canal de notifications (mesmo envelope-por-`kind` do `bg_done`):
+
+```ts
+interface ReminderNotification {
+  kind: 'reminder';
+  note: string;
+  scheduledAt: number;   // quando foi agendado (epoch ms)
+}
+```
+
+**Por que accepted:**
+- **Caso de uso não coberto:** delay temporal antes de re-engajar quando **não há processo** — reset de rate-limit, propagação de DNS, dar tempo a um deploy/humano externo. `bash_background` cobre "espere um processo"; `reminder` cobre "espere o relógio".
+- **Infra near-zero:** reusa o canal + wake-when-idle + as 5 guardas de §3B.4. O produtor é um `setTimeout` session-scoped. Sem o reminder, o modelo recai no anti-pattern `bash_background('sleep 600')` — desperdiça um processo + log file para obter um timer.
+- **Simetria de catálogo:** a palette set/list/cancel é o mesmo mental model das outras famílias.
+
+**Constraints (normativas — `ORCHESTRATION.md §3B.9`):**
+- **In-memory, session-scoped:** morre no exit da sessão, como `bash_background` (§3B.1) e o inbox. Sem persistência cross-session — preserva `AGENTIC_CLI.md §0`. Um reminder cujo horizonte excede a vida da sessão simplesmente não dispara (aceito; o caso comum no REPL interativo é delay curto).
+- **Só delay relativo** (`in`); horário absoluto o modelo converte para delta. Condicional (`when port_open`) é `wait_for` (retirado da superfície — §3B); não reintroduzir.
+- **Cap de horizonte** (default 24h): limite de sanidade **e** obrigatório tecnicamente — `setTimeout` com delay > 2³¹ ms dispara imediatamente.
+
+**Gatilho de reconsideração:**
+- Eval mostra reminders com horizonte > vida-média-de-sessão sendo comuns (o modelo quer cross-session) → reabrir a decisão de persistência durável (migration + re-hidratação no boot), aceitando a tensão com §0.
+- O modelo nunca usa `reminder_list`/`reminder_cancel` em N sessões medidas → colapsar para só `reminder` (anti-bloat).
+
+#### 2.6.10.x Resumo
+
+| Tool | Status | Próximo passo concreto |
+|---|---|---|
+| `reminder` | accepted | `ReminderScheduler` in-memory (`src/reminders/`); envelope em `ORCHESTRATION.md §3B.9`; eval `evals/reminders/` |
+| `reminder_list` | accepted | snapshot dos pendentes da sessão; análogo de `bash_list`/`task_list` |
+| `reminder_cancel` | accepted | `clearTimeout` + remove; idempotente em id desconhecido |
+
+Catalog count: **16 → 19** (peso conceitual ~1, família-palette).
 
 ---
 

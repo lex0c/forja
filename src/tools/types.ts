@@ -11,6 +11,7 @@ import type {
   ToolArgs,
 } from '../permissions/index.ts';
 import type { ProviderToolInputSchema } from '../providers/index.ts';
+import type { ReminderScheduler } from '../reminders/index.ts';
 import type { RetrieveFn } from '../retrieval/index.ts';
 import type { SkillCatalog } from '../skills/index.ts';
 import type { ContextPinsStore } from '../storage/repos/context-pins.ts';
@@ -68,6 +69,14 @@ export interface ToolMetadata {
   // whitelist includes a bg-bound tool finds out before first
   // invocation.
   requiresBgManager?: boolean;
+  // Tool depends on `ToolContext.reminderScheduler` (ORCHESTRATION.md
+  // §3B.9) — the `reminder` family. Same role as `requiresBgManager`:
+  // without the scheduler the tool surfaces a clean tool-error, and the
+  // side-effect oracle treats it as a side effect (arming a timer that
+  // can wake a turn is an effect even though no fs write happens). The
+  // scheduler is REPL-only (one-shot/subagent runs have no next turn to
+  // wake), so a subagent whitelist including a reminder tool is caught.
+  requiresReminderScheduler?: boolean;
   // Tool needs an interactive operator confirmation surface to run
   // (today only `memory_write`, which awaits the modal-bridge
   // callback before persisting). Subagents are headless from the
@@ -311,6 +320,12 @@ export interface ToolContext {
   // persist across sessions; the harness creates a fresh store at
   // session start and clears it at session end.
   todoStore?: TodoStore;
+  // Session-scoped reminder scheduler (ORCHESTRATION.md §3B.9). Optional,
+  // same pattern as `bgManager`/`todoStore`: the `reminder` family
+  // surfaces a clean error when absent (e.g. one-shot `run.ts`, which has
+  // no next turn for a reminder to wake) rather than dereferencing
+  // undefined. In-memory, dies at session exit — no persistence.
+  reminderScheduler?: ReminderScheduler;
   // Per-call permission predicate. The harness wires this to
   // `permissionEngine.check`. Tools whose category gate is too coarse
   // for their actual side effects (notably `wait_for` and `monitor`,

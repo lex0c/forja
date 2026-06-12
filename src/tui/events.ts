@@ -630,6 +630,11 @@ export type BgEndEvent = BaseEvent & {
   exitCode: number | null;
   signal?: string;
 };
+// Pending-reminder count changed (ORCHESTRATION.md §3B.9). Emitted by
+// the REPL whenever the ReminderScheduler's set changes (set / cancel /
+// fire / cleanup). Carries the absolute new count — the reducer stores
+// it directly, no per-id tracking needed for the footer chip.
+export type RemindersUpdateEvent = BaseEvent & { type: 'reminders:update'; count: number };
 
 // Budget / checkpoint signals consumed by the status line.
 export type StepBudgetEvent = BaseEvent & {
@@ -908,6 +913,7 @@ export type UIEvent =
   | BgStartEvent
   | BgUpdateEvent
   | BgEndEvent
+  | RemindersUpdateEvent
   | StepBudgetEvent
   | StatsRefreshEvent
   | ProviderWaitingStartEvent

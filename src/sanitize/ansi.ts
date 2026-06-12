@@ -146,6 +146,37 @@ export const sanitizeOneLineForDisplay = (raw: string, max = SAFE_ONE_LINE_MAX):
   return cleaned;
 };
 
+// Anti-spoof for untrusted text that lands in the operator's SCROLLBACK
+// (not a modal — so, unlike `sanitizeOneLineForDisplay`, no width cap;
+// the wake-turn input that shares this path shouldn't be truncated).
+// Used for a fired notification echoing a model-authored reminder note /
+// bg command, or raw bg process output. stripAnsi already drops ESC
+// sequences AND every bare C0 byte EXCEPT \t \n \r (its class keeps those
+// three to preserve ordinary text); those three are exactly the
+// scrollback-spoof vectors (\n / \r forge or overwrite rows). So both
+// helpers below only have to deal with \t \n \r after stripAnsi. The
+// char-scan (vs a control-char regex) keeps raw C0 bytes out of this
+// source and stays correct even if stripAnsi's class changes.
+//
+// `flattenControlToLine` collapses survivors to one line (note/command —
+// conceptually single-line). `stripControlKeepLines` drops \r (the
+// overwrite vector) but KEEPS \n and \t so a multi-line body (the bg
+// output head-tail) preserves its line structure for the caller's
+// per-line indent.
+export const flattenControlToLine = (s: string): string => {
+  let out = '';
+  for (const ch of stripAnsi(s)) out += ch.charCodeAt(0) <= 0x1f ? ' ' : ch;
+  return out.replace(/ {2,}/g, ' ').trim();
+};
+export const stripControlKeepLines = (s: string): string => {
+  let out = '';
+  for (const ch of stripAnsi(s)) {
+    const c = ch.charCodeAt(0);
+    if (c > 0x1f || c === 0x09 || c === 0x0a) out += ch; // printable + TAB + LF
+  }
+  return out;
+};
+
 // Recursively strip ANSI from every string leaf in a value. Preserves
 // shape (plain objects, arrays, numbers, booleans, null) so a tool
 // returning `{ stdout: "..", stderr: ".." }` keeps that schema for
