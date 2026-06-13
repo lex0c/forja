@@ -1003,6 +1003,31 @@ describe('engine.check (search tools: glob/grep)', () => {
     expect(eng.check('git', 'fs.read', { mode: 'status' }).kind).toBe('deny');
   });
 
+  test('git single-file modes match an EXACT-file allow (not just dir globs)', () => {
+    // Regression: search-tool matching appends `/.forja-check`, which
+    // misses an exact-file allow for `git blame -- f` / `git diff -- f`.
+    const eng = createPermissionEngine(
+      policy({ tools: { read_file: { allow_paths: ['src/a.ts'] } } }),
+      { cwd: CWD },
+    );
+    expect(eng.check('git', 'fs.read', { mode: 'blame', path: 'src/a.ts' }).kind).toBe('allow');
+    expect(eng.check('git', 'fs.read', { mode: 'diff', path: 'src/a.ts' }).kind).toBe('allow');
+    // a different exact file stays denied
+    expect(eng.check('git', 'fs.read', { mode: 'blame', path: 'src/b.ts' }).kind).toBe('deny');
+    // and a dir-glob allow still admits a tree root (synthetic descendant)
+    const dirEng = createPermissionEngine(
+      policy({ tools: { read_file: { allow_paths: ['src/**'] } } }),
+      { cwd: CWD },
+    );
+    expect(dirEng.check('git', 'fs.read', { mode: 'diff', path: 'src' }).kind).toBe('allow');
+  });
+
+  test('git exact-file session-allow matches via the literal path', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    eng.addSessionAllow('read_file', 'src/a.ts'); // git shares the read_file section
+    expect(eng.check('git', 'fs.read', { mode: 'blame', path: 'src/a.ts' }).kind).toBe('allow');
+  });
+
   test('view().canReadPath reflects read_file deny_paths + sensitive floor (content-tool gate)', () => {
     const eng = createPermissionEngine(
       policy({ tools: { read_file: { allow_paths: ['./**'], deny_paths: ['secrets/**'] } } }),

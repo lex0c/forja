@@ -2,6 +2,28 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] Preserve exact-file allows/grants for git single-file modes
+
+Regression introduced by adding `git` to `isSearchTool`: search-tool matching
+appends `/.forja-check` (the synthetic-descendant probe) to the path before
+allow/grant/session-allow matching, so a tree root admits a `dir/**` rule. But
+git's single-file modes (`blame -- f`, `diff -- f`) hand the engine an exact
+FILE — and `src/a.ts/.forja-check` no longer matches an exact-file allow/grant of
+`src/a.ts`. So an exact-file read grant was denied for git even though the same
+file is readable via read_file. The deny side already tested the literal path for
+search tools; the allow/grant/session-allow sides did not.
+
+Fix: on the allow side, also test the LITERAL path — but only for `git`, not
+grep/glob. grep/glob deliberately require a `dir/**` form there: a bare-root
+`dir` rule must NOT admit a subtree search (the "bare-root pattern does NOT fire"
+regression pin + the session-allow bridge's ensureDescendantGlob depend on it).
+git additionally accepting a bare-root `dir` literal is fine (no pin, and it
+matches the single-file intent). Deny runs first, so the extra literal match can
+only relax an over-strict allow, never bypass a deny or the sensitive floor.
+Tests: git blame/diff on an exact-file allow + an exact-file session-allow now
+resolve to allow, a different exact file stays denied, and a dir-glob still
+admits a tree root.
+
 ## [2026-06-13] Systematic audit of the git tool's config-driven exec/leak surface
 
 After six ad-hoc findings (fsmonitor/hooks, pager, ext-diff/textconv,

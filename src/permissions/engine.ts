@@ -892,7 +892,19 @@ const checkPath = (
   // path `escalate` tier still upgrades the decision to confirm —
   // the grant authorizes the WRITE attempt, but a confirm-on-
   // protected is mandatory even with prior approval.
-  const grantMatch = firstMatchingGrant(activeGrants, sectionKey, matchTarget, cwd);
+  // `git` ALSO tests the LITERAL path on the allow side. Its
+  // `matchTarget` is `path/.forja-check` (search-tool framing), which
+  // admits a tree root against `dir/**` but MISSES an exact-file allow/
+  // grant (e.g. `src/a.ts`) when git was handed a single file — the
+  // case for `git blame -- f` / `git diff -- f`. Restricted to `git`
+  // (not grep/glob): those deliberately require a `dir/**` form for the
+  // allow side — a bare-root `dir` rule must NOT admit a subtree search
+  // (see the "bare-root pattern does NOT fire" regression pin). Deny
+  // ran above, so this extra literal match only relaxes an over-strict
+  // allow, never bypasses a deny.
+  const grantMatch =
+    firstMatchingGrant(activeGrants, sectionKey, matchTarget, cwd) ??
+    (toolName === 'git' ? firstMatchingGrant(activeGrants, sectionKey, path, cwd) : null);
   if (grantMatch !== null) {
     if (protectedTier === 'escalate') {
       return {
@@ -916,7 +928,9 @@ const checkPath = (
   // <pattern>" answers. Runs before base allow so operator's
   // session decision shortcuts past any base confirm rule that
   // would otherwise fire. Deny already ran above.
-  const sessionMatched = firstMatchingPath(sessionAllow, matchTarget, cwd);
+  const sessionMatched =
+    firstMatchingPath(sessionAllow, matchTarget, cwd) ??
+    (toolName === 'git' ? firstMatchingPath(sessionAllow, path, cwd) : null);
   if (sessionMatched !== null) {
     if (protectedTier === 'escalate') {
       return {
@@ -933,7 +947,9 @@ const checkPath = (
       source: { layer: 'session', rule: sessionMatched, section: sectionName },
     };
   }
-  const allowed = firstMatchingPath(rules?.allow_paths, matchTarget, cwd);
+  const allowed =
+    firstMatchingPath(rules?.allow_paths, matchTarget, cwd) ??
+    (toolName === 'git' ? firstMatchingPath(rules?.allow_paths, path, cwd) : null);
   if (allowed !== null) {
     if (protectedTier === 'escalate') {
       return {
