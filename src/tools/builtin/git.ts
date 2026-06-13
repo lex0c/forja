@@ -301,6 +301,17 @@ const captureGit = async (
     ...(ctx.sandboxProfile !== undefined ? { profile: ctx.sandboxProfile } : {}),
     cwd: ctx.cwd,
     innerArgv,
+    // Under a sandbox profile the inner git runs after bwrap's
+    // `--clearenv`, so the outer `Bun.spawn({ env })` never reaches it
+    // and the `GIT_*` guards (GIT_CONFIG_GLOBAL=/dev/null, NOSYSTEM,
+    // OPTIONAL_LOCKS, LITERAL_PATHSPECS, PAGER, TERMINAL_PROMPT) would
+    // be silently absent — the whole config-hardening of this file
+    // gone whenever sandboxing is on. They are NOT in SANDBOX_SAFE_ENV
+    // _VARS, so thread them through `passthroughEnv` (emitted as
+    // `--setenv` past the clearenv boundary); `env` seeds the safe-list
+    // from our controlled env rather than `process.env`.
+    env: spawnEnv,
+    passthroughEnv: spawnEnv,
     ...(ctx.sandboxTmpdir !== undefined ? { tmpdir: ctx.sandboxTmpdir } : {}),
     failClosed: ctx.sandboxBootTool !== undefined,
   });

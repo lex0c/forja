@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { maybeWrapSandboxArgv } from '../../src/permissions/index.ts';
 import { buildModeArgs, gitTool } from '../../src/tools/builtin/git.ts';
 import { isToolError } from '../../src/tools/types.ts';
 import { makeCtx } from './_helpers.ts';
@@ -367,5 +368,53 @@ describe.if(GIT_AVAILABLE)('gitTool — against a real repo', () => {
     const out = await gitTool.execute({ mode: 'push' as any }, makeCtx({ cwd: dir }));
     expect(isToolError(out)).toBe(true);
     if (isToolError(out)) expect(out.error_code).toBe('tool.invalid_arg');
+  });
+});
+
+describe('git sandbox env forwarding', () => {
+  // The git GIT_* guards live OUTSIDE SANDBOX_SAFE_ENV_VARS, so under
+  // bwrap's --clearenv they only survive if threaded via passthroughEnv
+  // — which is exactly what captureGit now passes. This pins that the
+  // wrapper emits them as --setenv so sandboxed git is still hardened.
+  const hasSetenv = (argv: readonly string[], key: string, val: string): boolean => {
+    for (let i = 0; i + 2 < argv.length; i++) {
+      if (argv[i] === '--setenv' && argv[i + 1] === key && argv[i + 2] === val) return true;
+    }
+    return false;
+  };
+
+  test('GIT_* guards survive the --clearenv boundary as --setenv flags', () => {
+    const gitEnv: Record<string, string> = {
+      PATH: '/usr/bin',
+      HOME: '/home/op',
+      LC_ALL: 'C',
+      GIT_TERMINAL_PROMPT: '0',
+      GIT_PAGER: 'cat',
+      GIT_OPTIONAL_LOCKS: '0',
+      GIT_LITERAL_PATHSPECS: '1',
+      GIT_CONFIG_NOSYSTEM: '1',
+      GIT_CONFIG_GLOBAL: '/dev/null',
+    };
+    const argv = maybeWrapSandboxArgv({
+      profile: 'ro',
+      cwd: '/work/proj',
+      home: '/home/op',
+      innerArgv: ['/usr/bin/git', 'status'],
+      env: gitEnv,
+      passthroughEnv: gitEnv,
+      // Deterministic seams: fake bwrap present, identity realpath (no
+      // fs canonicalization of cwd/home), skip hide_paths mkdir.
+      platform: 'linux',
+      which: () => '/usr/bin/bwrap',
+      realpath: (p) => p,
+      pathExists: () => false,
+    });
+    // Sanity: we actually got a bwrap wrap (not the host passthrough).
+    expect(argv).toContain('--clearenv');
+    expect(hasSetenv(argv, 'GIT_CONFIG_GLOBAL', '/dev/null')).toBe(true);
+    expect(hasSetenv(argv, 'GIT_CONFIG_NOSYSTEM', '1')).toBe(true);
+    expect(hasSetenv(argv, 'GIT_LITERAL_PATHSPECS', '1')).toBe(true);
+    expect(hasSetenv(argv, 'GIT_OPTIONAL_LOCKS', '0')).toBe(true);
+    expect(hasSetenv(argv, 'GIT_PAGER', 'cat')).toBe(true);
   });
 });

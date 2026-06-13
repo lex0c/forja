@@ -2,6 +2,23 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] git tool: forward the GIT_* hardening into the sandbox wrapper
+
+Review finding: under a sandbox profile, `maybeWrapSandboxArgv` builds the inner
+bwrap command behind `--clearenv`, so only `SANDBOX_SAFE_ENV_VARS` (from `env`)
++ `passthroughEnv` reach the inner process — the outer `Bun.spawn({ env })` sets
+the bwrap process's env, not git's. The git tool passed its hardened env only to
+Bun.spawn, and the `GIT_*` guards (GIT_CONFIG_GLOBAL=/dev/null, NOSYSTEM,
+OPTIONAL_LOCKS, LITERAL_PATHSPECS, PAGER, TERMINAL_PROMPT) are NOT safe-listed —
+so every one of this file's config defenses was silently absent whenever
+sandboxing was enabled. Fix: thread the git spawn env through the wrapper via
+`passthroughEnv` (emitted as `--setenv` past the clearenv boundary) and `env`
+(seeds the safe-list from the controlled env, not process.env). Grep does NOT
+need this — its env is about NOT leaking secrets, which `--clearenv` +
+the safe-list already enforce more strictly than scrubEnv. Test: drives
+`maybeWrapSandboxArgv` with the git env + fake-bwrap seams and asserts each guard
+appears as a `--setenv` flag.
+
 ## [2026-06-13] grep: gate denied matches in-loop so they don't consume the cap
 
 The grep policy filter ran AFTER the streaming loop had already counted denied
