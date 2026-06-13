@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, test } from 'bun:test';
-import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AuditEmitInput } from '../../src/permissions/audit.ts';
@@ -1003,40 +1003,79 @@ describe('engine.check (search tools: glob/grep)', () => {
     expect(eng.check('git', 'fs.read', { mode: 'status' }).kind).toBe('deny');
   });
 
-  test('git single-file modes match an EXACT-file allow (not just dir globs)', () => {
-    // Regression: search-tool matching appends `/.forja-check`, which
-    // misses an exact-file allow for `git blame -- f` / `git diff -- f`.
-    const eng = createPermissionEngine(
-      policy({ tools: { read_file: { allow_paths: ['src/a.ts'] } } }),
-      { cwd: CWD },
-    );
-    expect(eng.check('git', 'fs.read', { mode: 'blame', path: 'src/a.ts' }).kind).toBe('allow');
-    expect(eng.check('git', 'fs.read', { mode: 'diff', path: 'src/a.ts' }).kind).toBe('allow');
-    // a different exact file stays denied
-    expect(eng.check('git', 'fs.read', { mode: 'blame', path: 'src/b.ts' }).kind).toBe('deny');
-    // and a dir-glob allow still admits a tree root (synthetic descendant)
-    const dirEng = createPermissionEngine(
-      policy({ tools: { read_file: { allow_paths: ['src/**'] } } }),
-      { cwd: CWD },
-    );
-    expect(dirEng.check('git', 'fs.read', { mode: 'diff', path: 'src' }).kind).toBe('allow');
+  // The git exact-file fallback is gated on the path resolving to a
+  // REGULAR FILE, so these use a real cwd with a real `src/a.ts`.
+  const realGitCwd = (): string => {
+    const d = realpathSync(mkdtempSync(join(tmpdir(), 'forja-eng-git-')));
+    mkdirSync(join(d, 'src'), { recursive: true });
+    writeFileSync(join(d, 'src/a.ts'), 'x');
+    return d;
+  };
+
+  test('git exact-FILE allow matches a single-file path; a dir allow does NOT grant a dir path', () => {
+    const cwd = realGitCwd();
+    try {
+      // exact-file allow → single-file git path (blame/diff -- f) allowed
+      const fileEng = createPermissionEngine(
+        policy({ tools: { read_file: { allow_paths: ['src/a.ts'] } } }),
+        { cwd },
+      );
+      expect(fileEng.check('git', 'fs.read', { mode: 'blame', path: 'src/a.ts' }).kind).toBe(
+        'allow',
+      );
+      expect(fileEng.check('git', 'fs.read', { mode: 'diff', path: 'src/a.ts' }).kind).toBe(
+        'allow',
+      );
+      // a different exact file stays denied
+      expect(fileEng.check('git', 'fs.read', { mode: 'blame', path: 'src/b.ts' }).kind).toBe(
+        'deny',
+      );
+      // a bare-DIRECTORY allow must NOT grant a directory git path: the
+      // exact-file fallback is file-only, so `ls_files -- src` can't
+      // enumerate the subtree off a bare `src` rule (needs `src/**`).
+      const dirAllowEng = createPermissionEngine(
+        policy({ tools: { read_file: { allow_paths: ['src'] } } }),
+        { cwd },
+      );
+      expect(dirAllowEng.check('git', 'fs.read', { mode: 'ls_files', path: 'src' }).kind).toBe(
+        'deny',
+      );
+      // but a dir-GLOB allow still admits a tree root via the synthetic descendant
+      const dirGlobEng = createPermissionEngine(
+        policy({ tools: { read_file: { allow_paths: ['src/**'] } } }),
+        { cwd },
+      );
+      expect(dirGlobEng.check('git', 'fs.read', { mode: 'diff', path: 'src' }).kind).toBe('allow');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   test('git exact-file session-allow matches via the literal path', () => {
-    const eng = createPermissionEngine(policy({}), { cwd: CWD });
-    eng.addSessionAllow('read_file', 'src/a.ts'); // git shares the read_file section
-    expect(eng.check('git', 'fs.read', { mode: 'blame', path: 'src/a.ts' }).kind).toBe('allow');
+    const cwd = realGitCwd();
+    try {
+      const eng = createPermissionEngine(policy({}), { cwd });
+      eng.addSessionAllow('read_file', 'src/a.ts'); // git shares the read_file section
+      expect(eng.check('git', 'fs.read', { mode: 'blame', path: 'src/a.ts' }).kind).toBe('allow');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   test('git exact-file confirm_paths prompts (does not default-deny)', () => {
-    const eng = createPermissionEngine(
-      policy({ tools: { read_file: { confirm_paths: ['src/a.ts'] } } }),
-      { cwd: CWD },
-    );
-    expect(eng.check('git', 'fs.read', { mode: 'blame', path: 'src/a.ts' }).kind).toBe('confirm');
-    expect(eng.check('git', 'fs.read', { mode: 'diff', path: 'src/a.ts' }).kind).toBe('confirm');
-    // a different exact file with no rule stays default-deny
-    expect(eng.check('git', 'fs.read', { mode: 'blame', path: 'src/b.ts' }).kind).toBe('deny');
+    const cwd = realGitCwd();
+    try {
+      const eng = createPermissionEngine(
+        policy({ tools: { read_file: { confirm_paths: ['src/a.ts'] } } }),
+        { cwd },
+      );
+      expect(eng.check('git', 'fs.read', { mode: 'blame', path: 'src/a.ts' }).kind).toBe('confirm');
+      expect(eng.check('git', 'fs.read', { mode: 'diff', path: 'src/a.ts' }).kind).toBe('confirm');
+      // a different exact file with no rule stays default-deny
+      expect(eng.check('git', 'fs.read', { mode: 'blame', path: 'src/b.ts' }).kind).toBe('deny');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   test('view().canReadPath reflects read_file deny_paths + sensitive floor (content-tool gate)', () => {

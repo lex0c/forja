@@ -1,4 +1,4 @@
-import { readlinkSync, realpathSync } from 'node:fs';
+import { readlinkSync, realpathSync, statSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { redactSecrets } from '../sanitize/secrets.ts';
 import type { TelemetryEvent } from '../telemetry/index.ts';
@@ -815,6 +815,21 @@ const resolveForProtected = (rawPath: string, cwd: string): string => {
   }
 };
 
+// True iff the symlink-resolved target is a REGULAR FILE. Gates the
+// `exactFileAllow` literal fallback so it grants only genuine
+// single-file reads (git blame/diff -- f): a bare-directory allow
+// (`src`) must NOT match a directory PATH (`git ls_files/log -- src`)
+// and thereby grant subtree enumeration that the search-tool rule
+// shape deliberately reserves for `src/**`. A non-existent path is not
+// a file → falls back to synthetic-descendant matching (safe).
+const isRegularFile = (absPath: string): boolean => {
+  try {
+    return statSync(absPath).isFile();
+  } catch {
+    return false;
+  }
+};
+
 // The fs "floor": the hardcoded protected zones (deny/escalate tiers,
 // §11) plus the sensitive-path deny-list (§8.4). Neither is overridable
 // by operator policy OR by `mode=bypass`. Centralized so checkPath, the
@@ -952,7 +967,9 @@ const checkPath = (
   // allow, never bypasses a deny.
   const grantMatch =
     firstMatchingGrant(activeGrants, sectionKey, matchTarget, cwd) ??
-    (allowsExactFile(toolName) ? firstMatchingGrant(activeGrants, sectionKey, path, cwd) : null);
+    (allowsExactFile(toolName) && isRegularFile(protectedAbsPath)
+      ? firstMatchingGrant(activeGrants, sectionKey, path, cwd)
+      : null);
   if (grantMatch !== null) {
     if (protectedTier === 'escalate') {
       return {
@@ -978,7 +995,9 @@ const checkPath = (
   // would otherwise fire. Deny already ran above.
   const sessionMatched =
     firstMatchingPath(sessionAllow, matchTarget, cwd) ??
-    (allowsExactFile(toolName) ? firstMatchingPath(sessionAllow, path, cwd) : null);
+    (allowsExactFile(toolName) && isRegularFile(protectedAbsPath)
+      ? firstMatchingPath(sessionAllow, path, cwd)
+      : null);
   if (sessionMatched !== null) {
     if (protectedTier === 'escalate') {
       return {
@@ -997,7 +1016,9 @@ const checkPath = (
   }
   const allowed =
     firstMatchingPath(rules?.allow_paths, matchTarget, cwd) ??
-    (allowsExactFile(toolName) ? firstMatchingPath(rules?.allow_paths, path, cwd) : null);
+    (allowsExactFile(toolName) && isRegularFile(protectedAbsPath)
+      ? firstMatchingPath(rules?.allow_paths, path, cwd)
+      : null);
   if (allowed !== null) {
     if (protectedTier === 'escalate') {
       return {
@@ -1020,7 +1041,9 @@ const checkPath = (
   // `src/a.ts/.forja-check` target would miss it).
   const confirm =
     firstMatchingPath(rules?.confirm_paths, matchTarget, cwd) ??
-    (allowsExactFile(toolName) ? firstMatchingPath(rules?.confirm_paths, path, cwd) : null);
+    (allowsExactFile(toolName) && isRegularFile(protectedAbsPath)
+      ? firstMatchingPath(rules?.confirm_paths, path, cwd)
+      : null);
   if (confirm !== null) {
     // acceptEdits accepts edits without confirmation. For writes, a
     // confirm_paths match becomes an auto-allow — that IS the

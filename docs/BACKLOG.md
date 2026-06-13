@@ -2,6 +2,22 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] Gate the git exact-file allow fallback on the path being a FILE
+
+Bug in the earlier "preserve exact-file allows for git" fix: the literal-path
+fallback fired for EVERY git path, not just single-file ones. So
+`read_file.allow_paths: ['src']` (a bare directory) matched a directory git path
+— `git ls_files`/`status`/`log -- src` was allowed and could enumerate/history
+the whole subtree, even though the search-tool rule shape reserves that for
+`src/**` and read_file would not allow `src/a.ts`. Content modes are per-file
+gated later, but the metadata modes are not. Fix: gate the fallback (all four
+match branches) on the resolved path being a regular FILE (`statSync().isFile()`
+— the engine already does realpath). A genuine single-file read (`git blame/diff
+-- src/a.ts`) still matches an exact-file rule; a directory path falls back to
+synthetic-descendant matching, so a bare-dir allow no longer grants subtree
+access. Updated the exact-file tests to use a real cwd with a real `src/a.ts`
+and added the bare-dir-allow → deny case.
+
 ## [2026-06-13] git tool: fail closed when filter enumeration is truncated
 
 Follow-up bug in the filter-neutralization fix itself: `filterDisableFlags`
