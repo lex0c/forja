@@ -1,5 +1,5 @@
 // Bundled canonical playbooks (`PLAYBOOKS.md` §12 — distribution).
-// The 3 .md files in this directory are imported as text assets
+// The 4 .md files in this directory are imported as text assets
 // and exposed as a stable array. The playbooks step of `agent init`
 // writes each entry into `<cwd>/.agent/agents/`, where the loader
 // picks them up at the next REPL boot.
@@ -18,6 +18,7 @@
 //      frontmatter is caught before the asset ships.
 
 import codeReviewMd from './code-review.md' with { type: 'text' };
+import generalPurposeMd from './general-purpose.md' with { type: 'text' };
 import perfInvestigateMd from './perf-investigate.md' with { type: 'text' };
 import securityAuditMd from './security-audit.md' with { type: 'text' };
 
@@ -38,6 +39,7 @@ export interface CanonicalPlaybook {
 // regression test snapshot) predictable.
 export const CANONICAL_PLAYBOOKS: ReadonlyArray<CanonicalPlaybook> = [
   { filename: 'code-review.md', content: codeReviewMd },
+  { filename: 'general-purpose.md', content: generalPurposeMd },
   { filename: 'perf-investigate.md', content: perfInvestigateMd },
   { filename: 'security-audit.md', content: securityAuditMd },
 ];

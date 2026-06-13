@@ -2,6 +2,59 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] Add a read-only `git` tool; give it to `general-purpose`
+
+New builtin tool `git` (`src/tools/builtin/git.ts`): structured, read-only git
+so a subagent can see history + working-tree state without `bash`. The model
+picks a `mode` (`log`/`show`/`diff`/`blame`/`status`/`ls_files`) + typed params;
+the tool builds a hardened argv. There is **no raw-flag passthrough**, which is
+the whole security posture — the read-command execution vectors (`-c
+core.pager=<cmd>`, `--output=`, `--ext-diff`/`--textconv` driven by a hostile
+`.gitattributes`, alias invocation) are all unreachable. We also inject `-c
+core.fsmonitor=` and `-c core.hooksPath=/dev/null` so a malicious repo-local
+`.git/config` can't get git to run a program during a "read". `ref`/`path` are
+validated (no leading `-`, no `..`, no absolute; paths fenced behind `--`).
+Spawned via `Bun.spawn` (no shell) with `scrubEnv` + sandbox wrap, output capped
+at 64 KiB.
+
+`category: 'fs.read'`, `writes: false`, `escapesCwd: false` — so it passes the
+subagent tool gate at `isolation: none` AND reads the parent's LIVE working tree
+(`diff`/`status` include uncommitted changes), which a HEAD-checked-out worktree
+would miss. That is the answer to "git in a read-only explorer without forcing
+worktree": a constrained capability, not raw `bash`.
+
+Added `git` to the `general-purpose` playbook's tools and its prompt body.
+Registered in `tools/builtin/index.ts`; new error codes `git.missing` /
+`git.failed` / `git.not_a_repo`. Tests: `tests/tools/git.test.ts` (pure
+flag-injection rejection via exported `buildModeArgs` + functional run against a
+temp repo, incl. the uncommitted-diff guarantee). Updated the exact tool-list in
+`tests/cli/bootstrap.test.ts`. Spec: `CONTRACTS §2.6.1` row + hardening note.
+
+## [2026-06-13] Add the `general-purpose` read-only subagent (bundled playbook)
+
+Shipped a fourth bundled playbook — `general-purpose` — the packaged instance of
+the generic subagent (AGENTIC_CLI §11), not a domain playbook. It is the
+read-only explorer the main agent launches for any investigation it scopes
+itself (explore a subsystem, research a mechanism, locate call sites, cross-read
+docs) and gets back a distilled answer instead of polluting its own context with
+the intermediate reads.
+
+Read-only by construction: tools are `read_file`, `grep`, `glob`,
+`retrieve_context`, `memory_read` — all writes:false, so `isolation: none` (no
+worktree, no `bash`). If a task needs an edit or an execution it returns that in
+`summary` and stops. Because the domain is open-ended it carries no fixed report
+schema — only the measure-twice honesty contract (`summary` + `confidence` +
+`assumptions` + `not_checked`, with optional `findings`/`sources` for
+locate/map-shaped tasks). `slash: explore`.
+
+Code: `src/cli/init-playbooks/general-purpose.md` + `index.ts` entry (now 4) +
+`evals/playbooks/general-purpose/01-locate-and-map.yaml`. Tests:
+`playbook-fixtures` membership + count anchor (3 → 4); `init.test`
+`CANONICAL_PLAYBOOKS.length` 3 → 4. Spec: `PLAYBOOKS §15` roster +
+`AGENTIC_CLI §11.3` count/slash list + `CONTEXT_TUNING` reflection table.
+Documented in the §15 roster (not a new §-template) precisely because it is the
+generic-subagent archetype, distinct in kind from the domain playbook sections.
+
 ## [2026-06-13] Trim the playbook catalog to 3 (drop gap-audit/challenge-assumptions)
 
 Removed the two anti-sycophancy meta-playbooks, leaving exactly the
