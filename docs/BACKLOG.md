@@ -2,6 +2,22 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] git tool: scope pathless modes to cwd (`-- .`)
+
+Review finding against the engine's cwd-resolution for pathless git: when the
+session cwd is a repo SUBDIRECTORY, the permission gate resolves a pathless git
+target to that subdir and authorizes on it — but `git status`/`log`/`diff`/
+`ls-files` without a pathspec operate REPO-WIDE. So from `/repo/src` under a
+policy allowing only `./**`, a pathless call still exposed repository-wide
+status/history metadata (sibling `/repo/docs/*` changes). Confirmed: `git status`
+from `src/` reported `../docs/b.txt`. Fixed in the tool (the finding's pathspec
+option): pathless modes now emit an explicit `-- .` so git scopes its output to
+the cwd subtree, matching what the engine gated. Verified the `--name-only`
+paths stay repo-root-relative (content gate unaffected) and `-- .` works under
+GIT_LITERAL_PATHSPECS; at the repo root `-- .` is the whole repo, so the common
+case is unchanged. Test: from a subdir, status omits the sibling change and log
+omits a docs-only commit.
+
 ## [2026-06-13] git tool: disable rename detection so the gate sees both paths
 
 Review finding against the content gate: with `diff.renames=true` (repo or global

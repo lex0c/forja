@@ -164,7 +164,15 @@ export const buildModeArgs = (args: GitInput): { args: string[] } | { error: str
     if (!REF_RE.test(ref)) return { error: 'ref contains unsupported characters' };
   }
 
-  const pathspec = path !== undefined ? ['--', path] : [];
+  // Pathless modes get an explicit `-- .` (current directory) pathspec.
+  // Without it, `status`/`log`/`diff`/`ls-files` operate REPO-WIDE even
+  // when the session cwd is a repo subdirectory — so from `/repo/src` a
+  // pathless call would expose `/repo/docs/*` status/history metadata
+  // that the permission gate (which resolves a pathless git target to
+  // the cwd) never authorized. `-- .` scopes git's output to the cwd
+  // subtree, matching what was gated. (`--name-only` paths stay
+  // repo-root-relative, so the content gate's resolution is unaffected.)
+  const pathspec = path !== undefined ? ['--', path] : ['--', '.'];
 
   switch (mode) {
     case 'log': {
@@ -271,7 +279,9 @@ const CONTENT_MODES: ReadonlySet<string> = new Set(['diff', 'show']);
 // represent (see buildModeArgs show, kept in lockstep).
 const nameOnlyArgs = (args: GitInput): string[] | null => {
   const ref = args.ref;
-  const pathspec = args.path !== undefined ? ['--', args.path] : [];
+  // Mirror buildModeArgs: pathless pre-flight scopes to `-- .` so the
+  // file list matches the (cwd-scoped) real command exactly.
+  const pathspec = args.path !== undefined ? ['--', args.path] : ['--', '.'];
   if (args.mode === 'diff') {
     return [
       'diff',

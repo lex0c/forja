@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { maybeWrapSandboxArgv } from '../../src/permissions/index.ts';
@@ -232,6 +232,33 @@ describe.if(GIT_AVAILABLE)('gitTool — against a real repo', () => {
     const out = await gitTool.execute({ mode: 'diff' }, makeCtx({ cwd: dir }));
     expect(isToolError(out)).toBe(true);
     if (isToolError(out)) expect(out.error_code).toBe('git.policy_denied');
+  });
+
+  test('pathless modes scope to cwd, not the whole repo (no subdir metadata leak)', async () => {
+    mkdirSync(join(dir, 'src'), { recursive: true });
+    mkdirSync(join(dir, 'docs'), { recursive: true });
+    writeFileSync(join(dir, 'src/x.ts'), 'export const x = 1;\n');
+    run(['add', 'src/x.ts']);
+    run(['commit', '-q', '-m', 'add src']);
+    // A docs-only commit — history that must NOT surface from src/.
+    writeFileSync(join(dir, 'docs/y.md'), '# y\n');
+    run(['add', 'docs/y.md']);
+    run(['commit', '-q', '-m', 'docs only change']);
+    // Uncommitted changes in BOTH subtrees.
+    writeFileSync(join(dir, 'src/x.ts'), 'export const x = 2;\n');
+    writeFileSync(join(dir, 'docs/y.md'), '# y2\n');
+
+    const fromSrc = makeCtx({ cwd: join(dir, 'src') });
+    // status from src/ must not report the docs sibling change.
+    const status = await gitTool.execute({ mode: 'status' }, fromSrc);
+    if (isToolError(status)) throw new Error(status.error_message);
+    expect(status.output).toContain('x.ts');
+    expect(status.output).not.toContain('docs');
+    // log from src/ must not surface the docs-only commit.
+    const log = await gitTool.execute({ mode: 'log' }, fromSrc);
+    if (isToolError(log)) throw new Error(log.error_message);
+    expect(log.output).toContain('add src');
+    expect(log.output).not.toContain('docs only change');
   });
 
   test('rename detection cannot hide a denied source path from the content gate', async () => {
