@@ -226,9 +226,21 @@ export const buildModeArgs = (args: GitInput): { args: string[] } | { error: str
       };
     }
     case 'status':
-      return { args: ['status', '--short', '--branch', ...pathspec] };
+      // `-z` + `--no-renames` make the output a stream of single-path,
+      // NUL-framed records (a rename decomposes into delete(source) +
+      // add(dest), each its own record) so the metadata path-gate can
+      // reliably split records and gate EVERY emitted name — a two-path
+      // rename record would otherwise hide the source path from the gate.
+      // Names stay cwd-relative (git's default) so the gate resolves them
+      // against ctx.cwd with no extra `rev-parse` spawn; `-- .` already
+      // confines the listing to the cwd subtree. The gate re-renders the
+      // kept records as newline-separated lines.
+      return { args: ['status', '--short', '--branch', '--no-renames', '-z', ...pathspec] };
     case 'ls_files':
-      return { args: ['ls-files', ...pathspec] };
+      // `-z` frames each path for reliable, quoting-proof splitting. Names
+      // stay cwd-relative (git's default — no `--full-name`) so the gate
+      // resolves them against ctx.cwd without a `rev-parse` spawn.
+      return { args: ['ls-files', '-z', ...pathspec] };
     default:
       return { error: `unknown mode '${String(mode)}'` };
   }
@@ -263,9 +275,21 @@ const EXTRA_GIT_ENV: Record<string, string> = {
 // a `diff` or `show` over a directory/whole-tree emits the contents of
 // every changed/committed file, so gating only the search root would
 // let a policy-denied descendant (a .env, a secrets/ file) leak in the
-// body. status/log(compact)/ls_files emit names only; blame requires a
-// single-file path that the engine already gates.
+// body. These fail CLOSED (refuse the whole command) — a diff cannot be
+// partially redacted into something meaningful.
 const CONTENT_MODES: ReadonlySet<string> = new Set(['diff', 'show']);
+
+// Modes whose OUTPUT is a list of file NAMES. The engine gates git on
+// the search ROOT only (cwd, or `src/**`), so under an allowed root a
+// `ls_files`/`status` would still EMIT the names of a policy-denied
+// descendant (deny_paths: `src/secrets/**`, a sensitive `src/.env`) —
+// the metadata sibling of the diff/show content leak. Unlike content,
+// names CAN be redacted line-by-line, so these FILTER: each emitted path
+// is resolved + canReadPath-checked, and denied entries are dropped from
+// the output (a single denied file does not blank the whole listing).
+// `log` (compact format) emits no per-file paths; `blame` requires a
+// single-file path the engine already gated — neither needs this.
+const PATH_METADATA_MODES: ReadonlySet<string> = new Set(['status', 'ls_files']);
 
 // The `--name-only` form of a content mode — used as a pre-flight to
 // learn which files the real command would emit, so each can be gated.
@@ -446,6 +470,73 @@ const filterDisableFlags = async (
   return flags;
 };
 
+// Resolve the repo root for the content gate, whose `--name-only` paths
+// are repo-root-relative (git diff always reports root-relative). Returns
+// null when it cannot be determined; the caller falls back to cwd.
+const resolveRepoRoot = async (
+  gitBin: string,
+  spawnEnv: Record<string, string>,
+  ctx: ToolContext,
+  hardening: readonly string[],
+): Promise<string | null> => {
+  const rootCap = await captureGit(
+    ['rev-parse', '--show-toplevel'],
+    gitBin,
+    spawnEnv,
+    ctx,
+    hardening,
+  );
+  if (isToolError(rootCap) || rootCap.exit !== 0) return null;
+  const root = rootCap.output.trim();
+  return root.length > 0 ? root : null;
+};
+
+// Extract the cwd-relative path from one NUL-framed metadata record.
+// ls_files: the record IS the path. status (`--short -z`): the status
+// field is two columns + a space, so the path starts at index 3; the
+// `## …` branch header carries no path. Returns null for records that
+// carry no path (kept verbatim in the output).
+const metadataRecordPath = (mode: GitMode, record: string): string | null => {
+  if (mode === 'ls_files') return record.length > 0 ? record : null;
+  // status: keep the branch header (and any other non-path line) as-is.
+  if (record.startsWith('##')) return null;
+  return record.length > 3 ? record.slice(3) : null;
+};
+
+// Filter a path-emitting metadata mode's captured output: drop every
+// record whose path the policy denies reading, then re-render the kept
+// records as newline-separated lines (the raw capture is `-z` framed).
+// No git sub-process: status/ls_files emit cwd-relative names (`-- .`
+// confines them to the cwd subtree), so each resolves against ctx.cwd
+// directly — no `rev-parse` spawn on this hot path. The only per-path
+// cost is canReadPath (one realpathSync), bounded by the capture's 64 KiB
+// cap (~hundreds of paths) regardless of repo size. Truncation is SAFE to
+// filter: only the captured (gated) prefix is shown; the unseen tail past
+// the cap is never emitted, and the trailing PARTIAL record is dropped.
+const filterMetadataOutput = (mode: GitMode, capture: GitCapture, ctx: ToolContext): string => {
+  if (capture.output.length === 0) return '';
+  // `-z` NUL-terminates every record. A complete capture ends in NUL, so
+  // splitting yields a trailing '' we discard. A capture truncated
+  // mid-record leaves a trailing PARTIAL path we can neither render nor
+  // gate — `pop()` drops it, so an incomplete final name is never shown.
+  const parts = capture.output.split('\0');
+  parts.pop();
+  const kept: string[] = [];
+  for (const record of parts) {
+    if (record.length === 0) continue;
+    const relPath = metadataRecordPath(mode, record);
+    if (relPath === null) {
+      kept.push(record); // header / pathless — no name to gate
+      continue;
+    }
+    if (ctx.permissions.canReadPath(resolve(ctx.cwd, relPath))) {
+      kept.push(record);
+    }
+    // denied → dropped
+  }
+  return kept.join('\n');
+};
+
 // For content modes, pre-flight `--name-only`, resolve each emitted
 // file to an absolute path, and refuse (fail-closed) if ANY would not
 // pass a `read_file` policy check — this is what stops pathless/dir
@@ -485,15 +576,9 @@ const gateContentFiles = async (
   if (files.length === 0) return null;
   // git --name-only paths are repo-root-relative; resolve against the
   // repo root so the policy check sees the same absolute path read_file
-  // would. Fall back to cwd if rev-parse fails.
-  const rootCap = await captureGit(
-    ['rev-parse', '--show-toplevel'],
-    gitBin,
-    spawnEnv,
-    ctx,
-    hardening,
-  );
-  const repoRoot = !isToolError(rootCap) && rootCap.exit === 0 ? rootCap.output.trim() : ctx.cwd;
+  // would. Fall back to cwd if rev-parse fails (the pre-flight already
+  // succeeded, so we are inside a repo; the fallback is belt-and-braces).
+  const repoRoot = (await resolveRepoRoot(gitBin, spawnEnv, ctx, hardening)) ?? ctx.cwd;
   const denied = files.filter((f) => !ctx.permissions.canReadPath(resolve(repoRoot, f)));
   if (denied.length === 0) return null;
   return toolError(
@@ -621,10 +706,17 @@ export const gitTool: Tool<GitInput, GitOutput> = {
       );
     }
 
+    // Path-emitting metadata modes: drop any emitted name the policy
+    // denies reading before the listing is returned (closes the metadata
+    // sibling of the content leak the gate above stops for diff/show).
+    const finalOutput = PATH_METADATA_MODES.has(args.mode)
+      ? filterMetadataOutput(args.mode, cap, ctx)
+      : output;
+
     return {
       mode: args.mode,
       command: commandLine,
-      output,
+      output: finalOutput,
       truncated,
       exit_code: exit,
     };

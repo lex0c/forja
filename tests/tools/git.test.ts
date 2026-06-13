@@ -197,6 +197,71 @@ describe.if(GIT_AVAILABLE)('gitTool — against a real repo', () => {
     expect(allowAll.output).toContain('.env');
   });
 
+  test('metadata modes drop policy-denied names (ls_files/status do not leak descendants)', async () => {
+    // Allowed root with a denied descendant — the engine gates git on the
+    // ROOT only, so ls_files/status would still emit the denied name.
+    mkdirSync(join(dir, 'secrets'), { recursive: true });
+    writeFileSync(join(dir, 'secrets/key.txt'), 'TOPSECRET\n');
+    run(['add', 'secrets/key.txt']);
+    run(['commit', '-q', '-m', 'add secret']);
+    // Uncommitted edits in both subtrees so status reports both.
+    writeFileSync(join(dir, 'a.ts'), 'export const a = 2;\n');
+    writeFileSync(join(dir, 'secrets/key.txt'), 'TOPSECRET2\n');
+
+    const denySecrets = makeCtx({
+      cwd: dir,
+      permissions: {
+        mode: 'strict',
+        posture: 'supervised',
+        canReadPath: (p) => !p.includes('/secrets/'),
+      },
+    });
+
+    const ls = await gitTool.execute({ mode: 'ls_files' }, denySecrets);
+    if (isToolError(ls)) throw new Error(ls.error_message);
+    expect(ls.output).toContain('a.ts');
+    expect(ls.output).not.toContain('secrets/key.txt');
+
+    const status = await gitTool.execute({ mode: 'status' }, denySecrets);
+    if (isToolError(status)) throw new Error(status.error_message);
+    expect(status.output).toContain('a.ts');
+    expect(status.output).not.toContain('secrets/key.txt');
+
+    // With an allow-all policy the denied name reappears (the drop is the
+    // policy's doing, not a hardcoded hide).
+    const allowAll = makeCtx({ cwd: dir });
+    const lsAll = await gitTool.execute({ mode: 'ls_files' }, allowAll);
+    if (isToolError(lsAll)) throw new Error(lsAll.error_message);
+    expect(lsAll.output).toContain('secrets/key.txt');
+  });
+
+  test('status decomposes renames so the gate sees BOTH paths (no two-path record)', async () => {
+    // Track a secret, then rename it to an allowed name + edit it. With
+    // rename detection a status would emit `R secrets/s.txt -> a2.ts`,
+    // hiding the denied SOURCE in a two-path record; --no-renames + the
+    // per-path gate must drop the source side.
+    mkdirSync(join(dir, 'secrets'), { recursive: true });
+    writeFileSync(join(dir, 'secrets/s.txt'), 'SECRET\n');
+    run(['add', 'secrets/s.txt']);
+    run(['commit', '-q', '-m', 'add secret']);
+    run(['mv', 'secrets/s.txt', 'a2.ts']);
+    appendFileSync(join(dir, 'a2.ts'), 'tail\n');
+
+    const denySecrets = makeCtx({
+      cwd: dir,
+      permissions: {
+        mode: 'strict',
+        posture: 'supervised',
+        canReadPath: (p) => !p.includes('/secrets/'),
+      },
+    });
+    const status = await gitTool.execute({ mode: 'status' }, denySecrets);
+    if (isToolError(status)) throw new Error(status.error_message);
+    // The allowed destination shows; the denied source name does not.
+    expect(status.output).toContain('a2.ts');
+    expect(status.output).not.toContain('secrets/s.txt');
+  });
+
   test('gates a denied file with a non-ASCII name (-z framing, not quotePath-escaped)', async () => {
     // Default core.quotePath would C-escape this name in --name-only
     // output; -z must frame it raw so the gate sees the real path.

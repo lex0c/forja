@@ -2,6 +2,33 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] git tool: gate path-emitting metadata modes against denied paths
+
+Review finding: the content gate only ran for `diff`/`show`, so it stopped the
+CONTENT of a denied descendant from leaking but left the NAMES exposed. Under an
+allowed root (cwd, `src/**`) the engine authorizes git on the root only, so
+`git ls_files`/`status` still EMITTED the names of a policy-denied descendant
+(`deny_paths: src/secrets/**`, a sensitive `src/.env`) — the metadata sibling of
+the content leak. Fix: a per-path metadata filter. `status` runs with
+`--no-renames -z` and `ls_files` with `-z`, so the capture is a stream of
+single-path, NUL-framed records; each emitted name is resolved and
+canReadPath-checked, and denied records are DROPPED before the listing is
+returned (a rename decomposes into delete+add so the denied SOURCE side is gated,
+not hidden in a two-path record). Unlike content modes (which fail closed — a
+diff can't be partially redacted), names are redactable, so one denied file no
+longer blanks the whole listing. Truncation is safe to filter (only the gated
+prefix is shown; the partial trailing record is dropped).
+
+Perf: the filter adds NO git sub-process. Names stay cwd-relative (git's default;
+`-- .` already confines the listing to the cwd subtree), so each resolves against
+`ctx.cwd` directly — no `rev-parse --show-toplevel` spawn on this hot path. The
+only added per-path cost is canReadPath's one `realpathSync`, bounded by the
+capture's 64 KiB cap (~hundreds of paths) regardless of repo size. (The content
+gate keeps its `rev-parse` because `git diff --name-only` is inherently
+root-relative; factored as `resolveRepoRoot`.) Tests: denied descendant dropped
+from ls_files/status while allowed names remain; allow-all shows it again; a
+rename's denied source is dropped.
+
 ## [2026-06-13] Gate the git exact-file allow fallback on the path being a FILE
 
 Bug in the earlier "preserve exact-file allows for git" fix: the literal-path
