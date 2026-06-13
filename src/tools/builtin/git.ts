@@ -80,6 +80,13 @@ const REF_RE = /^[A-Za-z0-9_./~^@{}-]+$/;
 //     `--name-only` content-gate pre-flight only sees the submodule
 //     PATH — so a denied `sub/.env` would leak whenever `sub` itself
 //     is readable. Forcing `short` emits only the subproject SHAs.
+//   - diff.external=: empty disables an external diff driver at the
+//     config level — defense in depth behind the per-mode
+//     `--no-ext-diff`, so the exec path stays shut even for a mode
+//     that forgets the flag. (`*.textconv` / `diff.<d>.command` bound
+//     via in-tree `.gitattributes` have no config wildcard and rely on
+//     the per-mode `--no-textconv` / `--no-ext-diff` — see the audit
+//     note in BACKLOG.)
 const HARDENING: readonly string[] = [
   '-c',
   'core.fsmonitor=',
@@ -89,6 +96,8 @@ const HARDENING: readonly string[] = [
   'log.showSignature=false',
   '-c',
   'diff.submodule=short',
+  '-c',
+  'diff.external=',
   // Disable color globally here rather than per-mode: `--no-color` is
   // not accepted by every subcommand (`git status` rejects it), but
   // the `-c color.ui=false` override is honored uniformly. Piped
@@ -210,6 +219,16 @@ const EXTRA_GIT_ENV: Record<string, string> = {
   GIT_PAGER: 'cat',
   GIT_OPTIONAL_LOCKS: '0',
   GIT_LITERAL_PATHSPECS: '1',
+  // Ignore the operator's global (~/.gitconfig) AND /etc/gitconfig:
+  // an exec/leak knob set there cannot fire (the `-c` overrides above
+  // already beat them for KNOWN knobs; this removes the whole source
+  // for unknown ones). Read-only modes never need the global identity,
+  // so dropping it is safe. The repo-local `.git/config` + in-tree
+  // `.gitattributes` are NOT (and cannot be) dropped this way — git
+  // always reads them — which is why the dangerous knobs are pinned
+  // via `-c` (highest precedence) and `--no-textconv`/`--no-ext-diff`.
+  GIT_CONFIG_NOSYSTEM: '1',
+  GIT_CONFIG_GLOBAL: '/dev/null',
 };
 
 // Modes whose OUTPUT carries file CONTENT (not just names/metadata):

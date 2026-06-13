@@ -2,6 +2,51 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] Systematic audit of the git tool's config-driven exec/leak surface
+
+After six ad-hoc findings (fsmonitor/hooks, pager, ext-diff/textconv,
+log.showSignature/gpg, submodule), swept the whole class instead of waiting for
+a seventh. Empirically probed every documented exec/leak config knob against the
+six read modes (log/show/diff/blame/status/ls_files) with a canary program.
+
+Knobs that actually FIRE on a read mode (and their coverage):
+- `core.fsmonitor` — fires on all modes → pinned `-c core.fsmonitor=`.
+- `core.pager` / `pager.<cmd>` — neutralized by `--no-pager` + `GIT_PAGER=cat`.
+- `core.hooksPath` / hooks — pinned `-c core.hooksPath=/dev/null`.
+- `diff.external` — fires on `diff` → was only covered by per-mode
+  `--no-ext-diff`; now ALSO pinned `-c diff.external=` (config-level, can't be
+  forgotten by a future mode).
+- `diff.<d>.textconv` / `diff.<d>.command` bound via in-tree `.gitattributes` —
+  fire on show/diff/blame → covered by per-mode `--no-textconv` / `--no-ext-diff`
+  (there is no config wildcard to pin, so the flags are load-bearing).
+- `log.showSignature` → `gpg.program`/`gpg.ssh.program` — pinned false.
+- `diff.submodule=diff` — leaks submodule content → pinned `short`.
+
+Knobs that do NOT reach these modes (verified non-firing): `core.editor`/
+`sequence.editor`, `core.sshCommand`, `uploadpack.packObjectsHook`, `init.*`,
+aliases (modes are literal subcommands, never alias names), filter clean/smudge
+(checkout/add only). Documented as out of scope.
+
+Plus a structural addition: `GIT_CONFIG_NOSYSTEM=1` + `GIT_CONFIG_GLOBAL=/dev/null`
+in the spawn env. The `-c` overrides already beat any config file for KNOWN
+knobs; this removes the operator's `~/.gitconfig` and `/etc/gitconfig` as a
+source ENTIRELY, so an UNKNOWN dangerous knob there can't fire either. Read-only
+modes don't need the global identity, so dropping it is safe (verified all modes
+still work). Repo-local `.git/config` + in-tree `.gitattributes` are NOT (and
+cannot be) dropped — git always reads them — which is exactly why the dangerous
+knobs are pinned via `-c` (highest precedence, beats repo-local) and the
+per-mode flags.
+
+Residual: an UNKNOWN exec knob settable in a hostile repo-local `.git/config`
+that fires on a read command and isn't among the pinned set. There is no git
+mechanism to allowlist config keys, so this can't be closed at the config layer.
+The backstop is the SANDBOX (bwrap), which the tool runs under via
+`maybeWrapSandboxArgv` and which blocks exec/file-escape at the kernel level
+regardless of git config; in host-mode the pinned set covers the known surface.
+
+Tests: repo-local `diff.external` canary is not executed; a hostile global
+`~/.gitconfig` `diff.external` is ignored (proves the env drop).
+
 ## [2026-06-13] git tool: force short submodule diffs before the content gate
 
 Review finding against the per-file content gate: with `diff.submodule=diff`

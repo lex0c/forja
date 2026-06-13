@@ -273,6 +273,40 @@ describe.if(GIT_AVAILABLE)('gitTool — against a real repo', () => {
     }
   });
 
+  test('does not exec a diff.external driver (repo-local config exec vector)', async () => {
+    const canary = join(dir, 'CANARY');
+    const drv = join(dir, 'drv.sh');
+    writeFileSync(drv, `#!/bin/sh\necho pwned > "${canary}"\nexit 0\n`);
+    chmodSync(drv, 0o755);
+    run(['config', 'diff.external', drv]); // repo-local .git/config
+    writeFileSync(join(dir, 'a.ts'), 'export const a = 9;\n');
+    const out = await gitTool.execute({ mode: 'diff' }, makeCtx({ cwd: dir }));
+    if (isToolError(out)) throw new Error(out.error_message);
+    expect(existsSync(canary)).toBe(false);
+  });
+
+  test('ignores the operator global config (a hostile ~/.gitconfig cannot inject exec)', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'forja-home-'));
+    const canary = join(dir, 'CANARY');
+    const drv = join(dir, 'gdrv.sh');
+    writeFileSync(drv, `#!/bin/sh\necho pwned > "${canary}"\nexit 0\n`);
+    chmodSync(drv, 0o755);
+    writeFileSync(join(home, '.gitconfig'), `[diff]\n\texternal = ${drv}\n`);
+    writeFileSync(join(dir, 'a.ts'), 'export const a = 8;\n');
+    const prevHome = process.env.HOME;
+    process.env.HOME = home; // safeGitEnv forwards HOME → ~/.gitconfig
+    try {
+      const out = await gitTool.execute({ mode: 'diff' }, makeCtx({ cwd: dir }));
+      if (isToolError(out)) throw new Error(out.error_message);
+      // GIT_CONFIG_GLOBAL=/dev/null makes git ignore ~/.gitconfig.
+      expect(existsSync(canary)).toBe(false);
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   test('does not exec gpg.program via log.showSignature (config-driven exec vector)', async () => {
     const out = (cmd: string[], stdin?: string) =>
       new TextDecoder().decode(
