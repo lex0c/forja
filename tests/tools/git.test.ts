@@ -340,9 +340,56 @@ describe.if(GIT_AVAILABLE)('gitTool — against a real repo', () => {
       .decode(Bun.spawnSync(['git', 'hash-object', join(dir, 'a.ts')], { cwd: dir }).stdout)
       .trim();
     // `show <blob>` would print the blob body; the tool peels `^{commit}`
-    // so this resolves to a fatal error, not a content dump.
+    // so this resolves to a fatal error, not a content dump — translated
+    // into an actionable invalidArg rather than a raw git plumbing error.
     const out = await gitTool.execute({ mode: 'show', ref: blob }, makeCtx({ cwd: dir }));
     expect(isToolError(out)).toBe(true);
+    if (isToolError(out)) {
+      expect(out.error_code).toBe('tool.invalid_arg');
+      expect(out.error_message).toMatch(/commit-ish|non-commit/i);
+    }
+  });
+
+  test('command field is a clean, copy-pasteable representation (no -z/peel/format noise)', async () => {
+    const log = await gitTool.execute({ mode: 'log' }, makeCtx({ cwd: dir }));
+    if (isToolError(log)) throw new Error(log.error_message);
+    // The logical command, not the hardened argv: no rendering/framing flags.
+    expect(log.command).toContain('git log');
+    expect(log.command).not.toContain('-z');
+    expect(log.command).not.toContain('--pretty');
+    const show = await gitTool.execute({ mode: 'show', ref: 'HEAD' }, makeCtx({ cwd: dir }));
+    if (isToolError(show)) throw new Error(show.error_message);
+    expect(show.command).not.toContain('^{commit}');
+    // A path with a space is shell-quoted so the line stays runnable.
+    writeFileSync(join(dir, 'a b.ts'), 'x\n');
+    const st = await gitTool.execute({ mode: 'status', path: 'a b.ts' }, makeCtx({ cwd: dir }));
+    if (isToolError(st)) throw new Error(st.error_message);
+    expect(st.command).toContain("'a b.ts'");
+  });
+
+  test('metadata modes announce how many entries policy hid', async () => {
+    mkdirSync(join(dir, 'secrets'), { recursive: true });
+    writeFileSync(join(dir, 'secrets/key.txt'), 'SECRET\n');
+    run(['add', '-A']);
+    run(['commit', '-q', '-m', 'add secret']);
+    const denySecrets = makeCtx({
+      cwd: dir,
+      permissions: {
+        mode: 'strict',
+        posture: 'supervised',
+        canReadPath: (p) => !p.includes('/secrets/'),
+      },
+    });
+    const ls = await gitTool.execute({ mode: 'ls_files' }, denySecrets);
+    if (isToolError(ls)) throw new Error(ls.error_message);
+    expect(ls.output).toContain('a.ts');
+    expect(ls.output).not.toContain('secrets/key.txt');
+    // The drop is surfaced, not silent.
+    expect(ls.output).toMatch(/\[forja: 1 path\(s\) hidden by policy\]/);
+    // With allow-all there is no notice.
+    const all = await gitTool.execute({ mode: 'ls_files' }, makeCtx({ cwd: dir }));
+    if (isToolError(all)) throw new Error(all.error_message);
+    expect(all.output).not.toContain('hidden by policy');
   });
 
   test('refuses content modes when the file list overflows the capture cap', async () => {

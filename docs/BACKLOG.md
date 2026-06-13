@@ -2,6 +2,39 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] git tool: review batch 2 — usability polish
+
+Four usability fixes from the review round (model ergonomics + user trust).
+
+(1) `command` field was the raw hardened argv: unquoted `--pretty=format:%h %ad
+…` broke copy-paste, and `-z`/`^{commit}`/`--no-renames` noise both confused the
+model and contradicted the newline-rendered output. Replaced with
+`representativeCommand` — the LOGICAL command (mode + ref + pathspec + semantic
+flags like --staged/--follow/-n), shell-quoted, internal framing omitted. Field
+doc now says it's representative, not a byte-exact replay (output is also
+policy-filtered).
+
+(2) `show` of a blob/tree ref failed with a raw plumbing error from the
+`^{commit}` peel ("expected commit type" / "can't be peeled"). Translated to an
+actionable invalidArg: the ref resolves to a non-commit; this tool shows commits,
+not file blobs — use read_file or pass a commit-ish ref.
+
+(3) `status`/`ls_files` dropped policy-denied entries silently — a `git status`
+missing files reads as "clean/absent", a trust bug. The filter now counts drops
+and appends a `[forja: N path(s) hidden by policy]` notice (the harness's existing
+marker convention), visible to the model (full JSON result) and the user (raw
+display). No notice when nothing was hidden.
+
+(4) Documented the behaviors that trip the model, in the schema: pathless modes
+are cwd-subtree-scoped, renames show as delete+add, output is ~64KB-capped (narrow
+with `path` on `truncated`), and `show` takes a commit-ish ref only. Tests:
+command-field cleanliness + shell-quoting, show-blob→invalidArg, hidden-count
+notice.
+
+Deferred (product decisions, not done): raising the 64KB cap, `show <ref>:<path>`
+(file at revision) + `diff --stat` capabilities, SIGKILL/timeout on the
+unsandboxed path, the TMPDIR-vs-sandbox-/tmp fix (cross-cutting with grep).
+
 ## [2026-06-13] git tool: review batch 1 — abort labeling + non-string arg guards
 
 Two low-stakes correctness fixes from the security/usability review round.

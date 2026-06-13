@@ -42,7 +42,11 @@ export interface GitInput {
 
 export interface GitOutput {
   mode: GitMode;
-  command: string; // the meaningful `git <mode> …` line (hardening prefix elided)
+  // A representative, copy-pasteable `git <mode> …` line (see
+  // representativeCommand): the logical command, with internal hardening/
+  // framing flags omitted. NOT a byte-exact replay — `output` is also
+  // policy-filtered.
+  command: string;
   output: string;
   truncated: boolean;
   exit_code: number;
@@ -570,6 +574,7 @@ const filterMetadataOutput = async (
     );
   }
   const kept: string[] = [];
+  let hidden = 0;
   for (const record of records) {
     const relPath = metadataRecordPath(mode, record);
     if (relPath === null) {
@@ -578,10 +583,19 @@ const filterMetadataOutput = async (
     }
     if (ctx.permissions.canReadPath(resolve(repoRoot, relPath))) {
       kept.push(record);
+    } else {
+      hidden++; // denied → dropped
     }
-    // denied → dropped
   }
-  return kept.join('\n');
+  const body = kept.join('\n');
+  // Don't let a silently-shortened listing read as "those files are clean /
+  // absent" — a `git status` that drops entries without a word is a trust
+  // bug. Append a framework notice (the `[forja: …]` convention the harness
+  // already uses) so both the model (full JSON result) and the user (raw
+  // display of `output`) see that the view is policy-filtered.
+  if (hidden === 0) return body;
+  const notice = `[forja: ${hidden} path(s) hidden by policy]`;
+  return body.length > 0 ? `${body}\n${notice}` : notice;
 };
 
 // For content modes, pre-flight `--name-only`, resolve each emitted
@@ -645,10 +659,65 @@ const gateContentFiles = async (
   );
 };
 
+// Shell-quote a token for the human-facing `command` field so it can be
+// copy-pasted. Bare-word safe chars pass through; anything else is
+// single-quoted with embedded quotes escaped.
+const shellQuote = (s: string): string =>
+  /^[A-Za-z0-9_./:@^~=,+-]+$/.test(s) ? s : `'${s.replace(/'/g, "'\\''")}'`;
+
+// A clean, copy-pasteable approximation of what the caller asked for — the
+// LOGICAL command, not the hardened argv. The real run carries internal
+// flags the user never wrote (`-z`, `--no-renames`, `--no-ext-diff`,
+// `--no-textconv`, the `--pretty`/`--date` format, the `^{commit}` peel)
+// and its output is additionally policy-filtered, so the raw argv is
+// neither runnable (unquoted `--pretty=format:%h %ad …` splits on spaces)
+// nor faithful to `output`. This keeps the semantic flags (ref, pathspec,
+// `--staged`, `--follow`, `-n`) and drops the framing — what a human would
+// type to get a similar view. The pathspec is shown (`-- <path>` or the
+// pathless `-- .`) so the cwd-scoping is visible rather than surprising.
+const representativeCommand = (args: GitInput): string => {
+  const parts: string[] = ['git'];
+  const ref = typeof args.ref === 'string' ? shellQuote(args.ref) : undefined;
+  const tail = typeof args.path === 'string' ? ['--', shellQuote(args.path)] : ['--', '.'];
+  switch (args.mode) {
+    case 'log':
+      parts.push('log');
+      if (typeof args.max_count === 'number' && Number.isInteger(args.max_count)) {
+        parts.push('-n', String(Math.min(args.max_count, MAX_LOG_COUNT)));
+      }
+      if (args.follow === true) parts.push('--follow');
+      if (ref !== undefined) parts.push(ref);
+      parts.push(...tail);
+      break;
+    case 'show':
+      parts.push('show', ref ?? 'HEAD', ...tail);
+      break;
+    case 'diff':
+      parts.push('diff');
+      if (args.staged === true) parts.push('--staged');
+      if (ref !== undefined) parts.push(ref);
+      parts.push(...tail);
+      break;
+    case 'blame':
+      parts.push('blame');
+      if (ref !== undefined) parts.push(ref);
+      // blame always has a path (buildModeArgs rejects it otherwise).
+      parts.push('--', shellQuote(typeof args.path === 'string' ? args.path : ''));
+      break;
+    case 'status':
+      parts.push('status', '--short', '--branch', ...tail);
+      break;
+    case 'ls_files':
+      parts.push('ls-files', ...tail);
+      break;
+  }
+  return parts.join(' ');
+};
+
 export const gitTool: Tool<GitInput, GitOutput> = {
   name: 'git',
   description:
-    'Read-only git: inspect history and working-tree state. Pick a `mode` (log/show/diff/blame/status/ls_files) and typed params — never raw flags. `diff`/`status` reflect the LIVE working tree (uncommitted changes included). Cannot commit, push, or mutate. Parallel-safe.',
+    'Read-only git: inspect history and working-tree state. Pick a `mode` (log/show/diff/blame/status/ls_files) and typed params — never raw flags. `diff`/`status` reflect the LIVE working tree (uncommitted changes included). Pathless modes are scoped to the current directory subtree; renames show as delete+add; output is capped (~64KB — when `truncated` is true, narrow with `path`). Cannot commit, push, or mutate. Parallel-safe.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -656,7 +725,7 @@ export const gitTool: Tool<GitInput, GitOutput> = {
         type: 'string',
         enum: ['log', 'show', 'diff', 'blame', 'status', 'ls_files'],
         description:
-          'log: commit history; show: a commit + its diff; diff: working-tree or staged changes (vs ref if given); blame: per-line last-change (requires path); status: working-tree state; ls_files: tracked files.',
+          'log: commit history; show: a commit + its diff (commit-ish ref only — not a file blob); diff: working-tree or staged changes (vs ref if given); blame: per-line last-change (requires path); status: working-tree state; ls_files: tracked files.',
       },
       path: {
         type: 'string',
@@ -750,7 +819,7 @@ export const gitTool: Tool<GitInput, GitOutput> = {
     const cap = await captureGit(modeArgs, gitBin, spawnEnv, ctx, hardening);
     if (isToolError(cap)) return cap;
     const { output, truncated, exit } = cap;
-    const commandLine = `git ${modeArgs.join(' ')}`;
+    const commandLine = representativeCommand(args);
 
     // SIGTERM-after-truncation exits non-zero; that is expected, not a
     // failure. Otherwise a non-zero exit is a real git error.
@@ -759,6 +828,20 @@ export const gitTool: Tool<GitInput, GitOutput> = {
         return toolError(ERROR_CODES.gitNotRepo, 'cwd is not inside a git repository', {
           details: { command: commandLine },
         });
+      }
+      // `show` peels its ref to `^{commit}`, so a blob/tree ref fails with a
+      // raw plumbing error ("expected commit type" / "can't be peeled").
+      // Translate it: the model passed a non-commit ref and needs to know
+      // this tool shows commits, not file blobs.
+      if (
+        args.mode === 'show' &&
+        /expected commit type|can't be peeled|dereferences to/i.test(cap.stderr)
+      ) {
+        return toolError(
+          ERROR_CODES.invalidArg,
+          `git show needs a commit-ish ref; '${args.ref ?? 'HEAD'}' resolves to a non-commit (blob/tree). This tool shows a commit and its diff, not a file blob — to read a file's contents use read_file, or pass a commit/branch/tag ref.`,
+          { details: { command: commandLine } },
+        );
       }
       return toolError(
         ERROR_CODES.gitFailed,
