@@ -154,11 +154,18 @@ export const buildModeArgs = (args: GitInput): { args: string[] } | { error: str
   const path = args.path;
   const ref = args.ref;
 
+  // Defend against non-string path/ref: nothing validates the model's
+  // tool-call JSON against `inputSchema` before execute(), so an internal
+  // or IPC caller can hand us `path: 123` / `ref: ['x']`. Without these
+  // guards the `.startsWith`/`.test` below throw a raw TypeError that
+  // surfaces as a leaky `tool.exception` instead of a clean `invalidArg`.
   if (path !== undefined) {
+    if (typeof path !== 'string') return { error: 'path must be a string' };
     const err = validatePath(path);
     if (err !== null) return { error: err };
   }
   if (ref !== undefined) {
+    if (typeof ref !== 'string') return { error: 'ref must be a string' };
     if (ref.length === 0) return { error: 'ref must be non-empty' };
     if (ref.startsWith('-')) return { error: "ref must not start with '-'" };
     if (!REF_RE.test(ref)) return { error: 'ref contains unsupported characters' };
@@ -419,6 +426,16 @@ const captureGit = async (
   }
 
   const exit = await proc.exited;
+  // A mid-stream abort is silent: Bun SIGTERMs the child and closes stdout
+  // cleanly, so the `for await` ends WITHOUT throwing and `proc.exited`
+  // resolves to 143 (128+SIGTERM). Without this check that 143 would fall
+  // through to the caller's `exit !== 0` branch and surface as a spurious
+  // `git.failed` ("git exited 143") instead of a clean `aborted`. Catch it
+  // here so every captureGit caller (filter enum, preflight, main run)
+  // reports cancellation correctly.
+  if (ctx.signal.aborted) {
+    return toolError(ERROR_CODES.aborted, 'git aborted mid-run', { retryable: true });
+  }
   const stderr = truncated
     ? ''
     : (await new Response(proc.stderr as ReadableStream<Uint8Array>).text()).trim();
@@ -701,6 +718,12 @@ export const gitTool: Tool<GitInput, GitOutput> = {
     // Extend the hardening prefix used by every subsequent run.
     const filterFlags = await filterDisableFlags(gitBin, spawnEnv, ctx);
     if (filterFlags === null) {
+      // An abort during the enumeration also collapses to null (captureGit
+      // returns the aborted error, which filterDisableFlags maps to null);
+      // surface the cancellation rather than the filter-unverified refusal.
+      if (ctx.signal.aborted) {
+        return toolError(ERROR_CODES.aborted, 'git aborted mid-run', { retryable: true });
+      }
       return toolError(
         ERROR_CODES.gitDenied,
         'cannot verify the repo’s git clean/smudge/process filters are disabled (filter-config enumeration was truncated or failed) — refusing rather than risk running a repo-configured filter command',

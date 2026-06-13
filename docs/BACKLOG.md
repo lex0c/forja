@@ -2,6 +2,29 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] git tool: review batch 1 — abort labeling + non-string arg guards
+
+Two low-stakes correctness fixes from the security/usability review round.
+
+(1) Abort mid-run mislabeled as `git.failed`. Bun's signal abort SIGTERMs the
+child and closes stdout cleanly, so `captureGit`'s `for await` ends WITHOUT
+throwing and `proc.exited` resolves to 143 — which fell through to the
+`exit !== 0` branch and surfaced as a spurious `git.failed` ("git exited 143")
+instead of `aborted`. `captureGit` now rechecks `ctx.signal.aborted` after
+`proc.exited` and returns `aborted` for every caller (filter enum, preflight,
+main run). Because that makes `filterDisableFlags` map an aborted enumeration to
+`null`, execute also rechecks abort in the `filterFlags === null` branch so the
+cancellation surfaces instead of the filter-unverified refusal. (The pre-spawn
+guards already covered abort-before-each-step; this covers abort-DURING a spawn.)
+
+(2) Non-string `path`/`ref` threw a raw `TypeError`. Nothing validates the
+model's tool-call JSON against `inputSchema` before execute(), so an internal/IPC
+caller passing `path: 123` / `ref: ['x']` hit `.startsWith`/`.test` on a
+non-string and surfaced a leaky `tool.exception`. `buildModeArgs` now guards
+`typeof` and returns a clean `invalidArg`. No security impact (a non-string never
+reached argv construction), purely error-quality. Tests: abort→aborted contract;
+non-string path/ref→error.
+
 ## [2026-06-13] git tool: fix metadata-gate relativity leak (resolve against repo root)
 
 Security review finding (a regression I introduced in the previous entry's perf

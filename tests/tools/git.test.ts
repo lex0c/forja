@@ -51,6 +51,18 @@ describe('buildModeArgs — flag-injection rejection', () => {
     expect('args' in buildModeArgs({ mode: 'diff', path: 'src/a.ts' })).toBe(true);
   });
 
+  test('rejects non-string path/ref with a clean error (no TypeError leak)', () => {
+    // Nothing validates the model's tool-call JSON against inputSchema
+    // before execute(), so a non-string must yield a validation error, not
+    // a thrown TypeError from `.startsWith`/`.test`.
+    // biome-ignore lint/suspicious/noExplicitAny: deliberately ill-typed input
+    expect('error' in buildModeArgs({ mode: 'diff', path: 123 as any })).toBe(true);
+    // biome-ignore lint/suspicious/noExplicitAny: deliberately ill-typed input
+    expect('error' in buildModeArgs({ mode: 'diff', ref: ['HEAD'] as any })).toBe(true);
+    // biome-ignore lint/suspicious/noExplicitAny: deliberately ill-typed input
+    expect('error' in buildModeArgs({ mode: 'blame', path: null as any })).toBe(true);
+  });
+
   test('blame requires a path', () => {
     expect('error' in buildModeArgs({ mode: 'blame' })).toBe(true);
     const ok = buildModeArgs({ mode: 'blame', path: 'src/a.ts' });
@@ -565,6 +577,22 @@ describe.if(GIT_AVAILABLE)('gitTool — against a real repo', () => {
     } finally {
       rmSync(nonRepo, { recursive: true, force: true });
     }
+  });
+
+  test('abort during the run surfaces as aborted, not git.failed', async () => {
+    // Abort AFTER execute() has returned its promise: the synchronous part
+    // (the pre-spawn signal guard) has already run with a non-aborted
+    // signal, so cancellation lands inside the first captureGit (the filter
+    // enumeration) — exactly the mid-stream case that used to surface as
+    // `git.failed` "git exited 143". It must come back `aborted` whether
+    // the abort is caught by captureGit's post-exit check or the
+    // filter-enumeration recheck.
+    const ctrl = new AbortController();
+    const out = gitTool.execute({ mode: 'log' }, makeCtx({ cwd: dir, signal: ctrl.signal }));
+    ctrl.abort();
+    const result = await out;
+    expect(isToolError(result)).toBe(true);
+    if (isToolError(result)) expect(result.error_code).toBe('tool.aborted');
   });
 
   test('invalid mode is rejected before spawn', async () => {
