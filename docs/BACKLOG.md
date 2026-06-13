@@ -2,6 +2,44 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] Gate per-emitted-file reads for git diff/show and grep
+
+Review finding: content-emitting tools gate only their search ROOT, but their
+OUTPUT carries content from many descendant files. A policy of `read_file:
+{ allow_paths: ['./**'], deny_paths: ['**/.env*', 'secrets'] }` would still let a
+pathless `git diff`/`git show` (or `grep`) return `.env`/secret content, because
+the denied filenames are never checked — only the (allowed) cwd root. grep had
+the same structural gap; in sandboxed sessions bwrap hide_paths backstops it, but
+host-mode policy-gated sessions were exposed.
+
+Fix (the complete option — covers operator deny_paths AND the sensitive floor,
+for both tools): extended `PermissionsView` with `canReadPath(path)` — a pure
+read_file evaluation through the same `checkPath` pipeline (so deny_paths +
+sensitive-floor both apply), with NO audit row / approval-seq side effect.
+Backed by the engine's `view()`; the test ctx defaults it permissive. Then:
+- `git` (diff/show): a `--name-only` pre-flight resolves each emitted file to an
+  absolute path (via `rev-parse --show-toplevel`) and refuses (`git.policy_denied`)
+  if ANY fails `canReadPath`. status/log/ls_files emit names only; blame is
+  single-file and already gated. Refactored the spawn into a reusable
+  `captureGit` for the pre-flight, repo-root probe, and main run.
+- `grep`: drops matches whose file fails `canReadPath` (per-file cached), so it
+  can't be used to read around deny_paths.
+
+Behavioral tests for both: a `.env` denied via `canReadPath` is refused
+(git) / filtered out (grep), while allowed files pass and an allow-all policy is
+unaffected.
+
+Code review of the gate then caught three further git bypasses, all fixed +
+tested: (1) default `core.quotePath` C-escapes non-ASCII filenames in
+`--name-only`, so the parsed path missed the real file — switched the pre-flight
+to `-z` (NUL-framed raw bytes, also survives spaces/newlines); (2) a `--name-only`
+list that overflows the 64 KiB capture cap was gated as a partial set, leaking
+the unseen tail — now fails closed on `truncated` (the check must precede the
+exit-code check, since truncation kills git with a non-zero SIGTERM exit);
+(3) `git show <blob>` dumps raw object content that `--name-only` cannot
+enumerate — `show` now peels its ref with `^{commit}`, so a bare blob/tree
+errors out instead. Plus an abort re-check before the (post-gate) main spawn.
+
 ## [2026-06-13] git tool: close the log.showSignature exec vector
 
 Review finding: `log.showSignature=true` in a repo-local or global `.git/config`

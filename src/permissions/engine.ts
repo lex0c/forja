@@ -2429,7 +2429,31 @@ export const createPermissionEngine = (
     return withSandboxProfile(withApprovalSeq(decision, e.seq), sandboxProfile);
   };
 
-  const view = (): PermissionsView => ({ mode, posture });
+  // Pure read_file path evaluation for content-emitting tools (see
+  // `PermissionsView.canReadPath`). Reuses the same `checkPath`
+  // pipeline as a real `read_file` decision — so operator deny_paths
+  // AND the sensitive-path engine floor both apply — but deliberately
+  // does NOT go through `check()`: no audit row, no approval-seq bump.
+  // A clean `allow` (not confirm/deny) is the only "yes".
+  const canReadPath = (path: string): boolean => {
+    const sectionRules = (policy.tools as unknown as Record<string, unknown>).read_file;
+    const decision = checkPath(
+      'read_file',
+      { path },
+      sectionRules as PathPolicy | undefined,
+      mode,
+      cwd,
+      home,
+      false,
+      provenance,
+      'read_file',
+      sessionAllow.get('read_file'),
+      options.grants?.listActive(Date.now()),
+    );
+    return decision.kind === 'allow';
+  };
+
+  const view = (): PermissionsView => ({ mode, posture, canReadPath });
 
   const addSessionAllow = (section: keyof PolicyToolsSection, pattern: string): void => {
     // Empty/whitespace-only pattern is a programming bug (the

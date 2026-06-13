@@ -1003,6 +1003,35 @@ describe('engine.check (search tools: glob/grep)', () => {
     expect(eng.check('git', 'fs.read', { mode: 'status' }).kind).toBe('deny');
   });
 
+  test('view().canReadPath reflects read_file deny_paths + sensitive floor (content-tool gate)', () => {
+    const eng = createPermissionEngine(
+      policy({ tools: { read_file: { allow_paths: ['./**'], deny_paths: ['secrets/**'] } } }),
+      { cwd: CWD },
+    );
+    const v = eng.view();
+    expect(v.canReadPath('src/a.ts')).toBe(true);
+    // operator deny_paths
+    expect(v.canReadPath('secrets/key.txt')).toBe(false);
+    // sensitive-path engine floor (denied even with allow_paths: ['**'])
+    expect(v.canReadPath('.env')).toBe(false);
+    expect(v.canReadPath('config/id_rsa')).toBe(false);
+  });
+
+  test('view().canReadPath is side-effect-free (no state mutation across probes)', () => {
+    const eng = createPermissionEngine(
+      policy({ tools: { read_file: { allow_paths: ['./**'] } } }),
+      { cwd: CWD },
+    );
+    // canReadPath routes through checkPath, not check() — so it emits no
+    // audit row and bumps no seq. We can't observe the audit sink here,
+    // but we can assert the observable: a real decision is unchanged by
+    // interleaved probes (no accumulated state leaks into it).
+    const before = eng.check('read_file', 'fs.read', { path: 'src/a.ts' });
+    for (let i = 0; i < 5; i++) eng.view().canReadPath(`src/probe-${i}.ts`);
+    const after = eng.check('read_file', 'fs.read', { path: 'src/a.ts' });
+    expect(after).toEqual(before);
+  });
+
   test('glob with non-string cwd is denied (does not crash on path.resolve)', () => {
     const eng = createPermissionEngine(
       policy({ tools: { glob: { allow_paths: ['./**'], deny_paths: ['secrets'] } } }),

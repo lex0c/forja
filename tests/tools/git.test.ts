@@ -76,10 +76,10 @@ describe('buildModeArgs — per-mode argv shape', () => {
     expect(r.args.some((a) => a.startsWith('--pretty='))).toBe(true);
   });
 
-  test('show defaults to HEAD', () => {
+  test('show defaults to HEAD, peeled to a commit (blocks blob/tree content dumps)', () => {
     const r = buildModeArgs({ mode: 'show' });
     if (!('args' in r)) throw new Error('expected args');
-    expect(r.args).toContain('HEAD');
+    expect(r.args).toContain('HEAD^{commit}');
   });
 });
 
@@ -146,6 +146,91 @@ describe.if(GIT_AVAILABLE)('gitTool — against a real repo', () => {
     // captured bytes never exceed the 64 KiB cap
     expect(Buffer.byteLength(out.output, 'utf8')).toBeLessThanOrEqual(64 * 1024);
     expect(out.output.length).toBeGreaterThan(0);
+  });
+
+  test('content modes refuse when output would include a policy-denied file', async () => {
+    // Track + commit a secret, then modify both it and an allowed file
+    // so a pathless `git diff` would emit BOTH file bodies.
+    writeFileSync(join(dir, '.env'), 'SECRET=1\n');
+    run(['add', '.env']);
+    run(['commit', '-q', '-m', 'add env']);
+    writeFileSync(join(dir, 'a.ts'), 'export const a = 2;\n');
+    writeFileSync(join(dir, '.env'), 'SECRET=2\n');
+
+    // Policy that denies reading .env (mirrors the sensitive floor /
+    // an operator deny_paths rule, surfaced through canReadPath).
+    const denyEnv = makeCtx({
+      cwd: dir,
+      permissions: {
+        mode: 'strict',
+        posture: 'supervised',
+        canReadPath: (p) => !p.endsWith('.env'),
+      },
+    });
+
+    // Pathless diff would emit .env content → must refuse.
+    const diff = await gitTool.execute({ mode: 'diff' }, denyEnv);
+    expect(isToolError(diff)).toBe(true);
+    if (isToolError(diff)) expect(diff.error_code).toBe('git.policy_denied');
+
+    // Same for show of the commit that introduced .env.
+    const show = await gitTool.execute({ mode: 'show', ref: 'HEAD' }, denyEnv);
+    expect(isToolError(show)).toBe(true);
+
+    // Scoped to the allowed file → runs fine (no denied file emitted).
+    const scoped = await gitTool.execute({ mode: 'diff', path: 'a.ts' }, denyEnv);
+    if (isToolError(scoped)) throw new Error(scoped.error_message);
+    expect(scoped.output).toContain('+export const a = 2;');
+
+    // And with an allow-all policy the pathless diff is unaffected.
+    const allowAll = await gitTool.execute({ mode: 'diff' }, makeCtx({ cwd: dir }));
+    if (isToolError(allowAll)) throw new Error(allowAll.error_message);
+    expect(allowAll.output).toContain('.env');
+  });
+
+  test('gates a denied file with a non-ASCII name (-z framing, not quotePath-escaped)', async () => {
+    // Default core.quotePath would C-escape this name in --name-only
+    // output; -z must frame it raw so the gate sees the real path.
+    writeFileSync(join(dir, 'файл.env'), 'SECRET=1\n');
+    run(['add', 'файл.env']);
+    run(['commit', '-q', '-m', 'add unicode env']);
+    writeFileSync(join(dir, 'файл.env'), 'SECRET=2\n');
+    const denyEnv = makeCtx({
+      cwd: dir,
+      permissions: {
+        mode: 'strict',
+        posture: 'supervised',
+        canReadPath: (p) => !p.endsWith('.env'),
+      },
+    });
+    const out = await gitTool.execute({ mode: 'diff' }, denyEnv);
+    expect(isToolError(out)).toBe(true);
+    if (isToolError(out)) expect(out.error_code).toBe('git.policy_denied');
+  });
+
+  test('show of a bare blob is refused (cannot dump ungated object content)', async () => {
+    const blob = new TextDecoder()
+      .decode(Bun.spawnSync(['git', 'hash-object', join(dir, 'a.ts')], { cwd: dir }).stdout)
+      .trim();
+    // `show <blob>` would print the blob body; the tool peels `^{commit}`
+    // so this resolves to a fatal error, not a content dump.
+    const out = await gitTool.execute({ mode: 'show', ref: blob }, makeCtx({ cwd: dir }));
+    expect(isToolError(out)).toBe(true);
+  });
+
+  test('refuses content modes when the file list overflows the capture cap', async () => {
+    // Enough long-named tracked+modified files to push `--name-only -z`
+    // output past OUTPUT_CAP_BYTES (64 KiB); a partial list must not be
+    // gated and then leak the unseen tail.
+    const prefix = 'f'.repeat(150);
+    for (let i = 0; i < 500; i++) writeFileSync(join(dir, `${prefix}${i}.txt`), '1\n');
+    run(['add', '-A']);
+    run(['commit', '-q', '-m', 'many']);
+    for (let i = 0; i < 500; i++) writeFileSync(join(dir, `${prefix}${i}.txt`), '2\n');
+    // Permissive policy — the refusal must come from truncation, not denial.
+    const out = await gitTool.execute({ mode: 'diff' }, makeCtx({ cwd: dir }));
+    expect(isToolError(out)).toBe(true);
+    if (isToolError(out)) expect(out.error_code).toBe('git.policy_denied');
   });
 
   test('does not exec gpg.program via log.showSignature (config-driven exec vector)', async () => {

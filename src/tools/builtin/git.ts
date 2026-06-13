@@ -1,6 +1,15 @@
+import { resolve } from 'node:path';
 import { maybeWrapSandboxArgv } from '../../permissions/index.ts';
 import { getGitBinaryWithEnv } from '../../subagents/git-binary.ts';
-import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
+import {
+  ERROR_CODES,
+  type Tool,
+  type ToolContext,
+  type ToolError,
+  type ToolResult,
+  isToolError,
+  toolError,
+} from '../types.ts';
 
 // Read-only, structured git access. A normal builtin offered to
 // every agent (main + subagents) like read_file/grep — it originated
@@ -148,8 +157,12 @@ export const buildModeArgs = (args: GitInput): { args: string[] } | { error: str
       };
     }
     case 'show':
+      // Peel to a commit so `show` can only ever emit a (gated) commit
+      // diff — a bare blob/tree ref would dump object content the
+      // content-gate's `--name-only` pre-flight cannot enumerate. Kept
+      // in lockstep with nameOnlyArgs's show form.
       return {
-        args: ['show', '--no-ext-diff', '--no-textconv', ref ?? 'HEAD', ...pathspec],
+        args: ['show', '--no-ext-diff', '--no-textconv', `${ref ?? 'HEAD'}^{commit}`, ...pathspec],
       };
     case 'diff':
       return {
@@ -190,6 +203,181 @@ const EXTRA_GIT_ENV: Record<string, string> = {
   GIT_PAGER: 'cat',
   GIT_OPTIONAL_LOCKS: '0',
   GIT_LITERAL_PATHSPECS: '1',
+};
+
+// Modes whose OUTPUT carries file CONTENT (not just names/metadata):
+// a `diff` or `show` over a directory/whole-tree emits the contents of
+// every changed/committed file, so gating only the search root would
+// let a policy-denied descendant (a .env, a secrets/ file) leak in the
+// body. status/log(compact)/ls_files emit names only; blame requires a
+// single-file path that the engine already gates.
+const CONTENT_MODES: ReadonlySet<string> = new Set(['diff', 'show']);
+
+// The `--name-only` form of a content mode — used as a pre-flight to
+// learn which files the real command would emit, so each can be gated.
+// `-z` (NUL-terminated) is load-bearing: with the default
+// `core.quotePath`, git C-escapes non-ASCII/control-char filenames
+// (e.g. `"\321\204.env"`), which would parse to the wrong path and
+// slip a denied file past the gate. NUL framing emits raw bytes and
+// also survives spaces/newlines in names. `show` peels its ref with
+// `^{commit}` so it can only ever diff a COMMIT — a bare blob/tree ref
+// would otherwise dump object content that `--name-only` does not
+// represent (see buildModeArgs show, kept in lockstep).
+const nameOnlyArgs = (args: GitInput): string[] | null => {
+  const ref = args.ref;
+  const pathspec = args.path !== undefined ? ['--', args.path] : [];
+  if (args.mode === 'diff') {
+    return [
+      'diff',
+      '--no-ext-diff',
+      '--no-textconv',
+      '--name-only',
+      '-z',
+      ...(args.staged === true ? ['--staged'] : []),
+      ...(ref !== undefined ? [ref] : []),
+      ...pathspec,
+    ];
+  }
+  if (args.mode === 'show') {
+    return [
+      'show',
+      '--no-ext-diff',
+      '--no-textconv',
+      '--name-only',
+      '-z',
+      '--format=',
+      `${ref ?? 'HEAD'}^{commit}`,
+      ...pathspec,
+    ];
+  }
+  return null;
+};
+
+interface GitCapture {
+  output: string;
+  truncated: boolean;
+  exit: number;
+  stderr: string;
+}
+
+// Run one hardened git invocation and capture stdout (byte-capped) +
+// exit + stderr. Returns a ToolError for spawn/stream failures; the
+// caller inspects exit/stderr for command-level errors. Shared by the
+// content pre-flight, the repo-root probe, and the main run.
+const captureGit = async (
+  modeArgs: readonly string[],
+  gitBin: string,
+  spawnEnv: Record<string, string>,
+  ctx: ToolContext,
+): Promise<GitCapture | ToolError> => {
+  const innerArgv = [gitBin, ...HARDENING, ...modeArgs];
+  const spawnArgv = maybeWrapSandboxArgv({
+    ...(ctx.sandboxProfile !== undefined ? { profile: ctx.sandboxProfile } : {}),
+    cwd: ctx.cwd,
+    innerArgv,
+    ...(ctx.sandboxTmpdir !== undefined ? { tmpdir: ctx.sandboxTmpdir } : {}),
+    failClosed: ctx.sandboxBootTool !== undefined,
+  });
+
+  let proc: ReturnType<typeof Bun.spawn>;
+  try {
+    proc = Bun.spawn(spawnArgv, {
+      stdout: 'pipe',
+      stderr: 'pipe',
+      cwd: ctx.cwd,
+      env: spawnEnv,
+      // biome-ignore lint/suspicious/noExplicitAny: Bun's spawn typing for `signal` is too narrow
+      ...({ signal: ctx.signal } as any),
+    });
+  } catch (e) {
+    const msg = (e as Error).message;
+    if (msg.includes('ENOENT')) {
+      return toolError(ERROR_CODES.gitMissing, 'git not found in PATH', {
+        hint: 'Install git to use the git tool.',
+      });
+    }
+    return toolError(ERROR_CODES.gitFailed, `failed to spawn git: ${msg}`);
+  }
+
+  let output = '';
+  let bytes = 0;
+  let truncated = false;
+  const decoder = new TextDecoder();
+  try {
+    for await (const chunk of proc.stdout as ReadableStream<Uint8Array>) {
+      bytes += chunk.byteLength;
+      if (bytes >= OUTPUT_CAP_BYTES) {
+        const remaining = OUTPUT_CAP_BYTES - (bytes - chunk.byteLength);
+        output += decoder.decode(chunk.subarray(0, Math.max(0, remaining)), { stream: true });
+        truncated = true;
+        try {
+          proc.kill('SIGTERM');
+        } catch {
+          // already exited
+        }
+        break;
+      }
+      output += decoder.decode(chunk, { stream: true });
+    }
+  } catch (e) {
+    return toolError(ERROR_CODES.gitFailed, `git stream failed: ${(e as Error).message}`);
+  }
+
+  const exit = await proc.exited;
+  const stderr = truncated
+    ? ''
+    : (await new Response(proc.stderr as ReadableStream<Uint8Array>).text()).trim();
+  return { output, truncated, exit, stderr };
+};
+
+// For content modes, pre-flight `--name-only`, resolve each emitted
+// file to an absolute path, and refuse (fail-closed) if ANY would not
+// pass a `read_file` policy check — this is what stops pathless/dir
+// `git diff`/`show` from leaking the CONTENT of denied files (.env,
+// secrets/) the way gating only the search root would. Returns a
+// ToolError to surface, or null to proceed with the real run.
+const gateContentFiles = async (
+  args: GitInput,
+  gitBin: string,
+  spawnEnv: Record<string, string>,
+  ctx: ToolContext,
+): Promise<ToolError | null> => {
+  const noArgs = nameOnlyArgs(args);
+  if (noArgs === null) return null;
+  const pre = await captureGit(noArgs, gitBin, spawnEnv, ctx);
+  if (isToolError(pre)) return null;
+  // Truncation FIRST: an overflowed file list means we cannot see every
+  // file the real command would emit → fail closed rather than gate a
+  // partial set and leak the unseen tail. This check must precede the
+  // exit-code check below, because truncation kills git with SIGTERM
+  // (a non-zero exit) — which would otherwise be read as a benign
+  // command failure and wrongly let the run proceed.
+  if (pre.truncated) {
+    return toolError(
+      ERROR_CODES.gitDenied,
+      `git ${args.mode} touches too many files to policy-check safely (file list truncated); scope to a specific path (e.g. path: "src/...") and retry`,
+      { details: { truncated: true } },
+    );
+  }
+  // A genuinely failed pre-flight means the real (superset) command
+  // fails too → no content emitted, no leak. Let the main run surface
+  // the error.
+  if (pre.exit !== 0) return null;
+  // `-z` frames each path with a trailing NUL (raw bytes, no quoting).
+  const files = pre.output.split('\0').filter((s) => s.length > 0);
+  if (files.length === 0) return null;
+  // git --name-only paths are repo-root-relative; resolve against the
+  // repo root so the policy check sees the same absolute path read_file
+  // would. Fall back to cwd if rev-parse fails.
+  const rootCap = await captureGit(['rev-parse', '--show-toplevel'], gitBin, spawnEnv, ctx);
+  const repoRoot = !isToolError(rootCap) && rootCap.exit === 0 ? rootCap.output.trim() : ctx.cwd;
+  const denied = files.filter((f) => !ctx.permissions.canReadPath(resolve(repoRoot, f)));
+  if (denied.length === 0) return null;
+  return toolError(
+    ERROR_CODES.gitDenied,
+    `git ${args.mode} would emit content from ${denied.length} of ${files.length} file(s) the policy denies reading; scope to a specific allowed path (e.g. path: "src/...") and retry`,
+    { details: { denied_count: denied.length, total: files.length } },
+  );
 };
 
 export const gitTool: Tool<GitInput, GitOutput> = {
@@ -253,82 +441,47 @@ export const gitTool: Tool<GitInput, GitOutput> = {
     // callers use. Resolve binary FIRST so the env carries the right
     // PATH (see git-binary.ts ordering note).
     const { git: gitBin, env: gitEnv } = await getGitBinaryWithEnv();
-    const innerArgv = [gitBin, ...HARDENING, ...modeArgs];
     const spawnEnv: Record<string, string> = {
       ...gitEnv,
       ...EXTRA_GIT_ENV,
       ...(ctx.sandboxTmpdir !== undefined ? { TMPDIR: ctx.sandboxTmpdir } : {}),
     };
 
-    const spawnArgv = maybeWrapSandboxArgv({
-      ...(ctx.sandboxProfile !== undefined ? { profile: ctx.sandboxProfile } : {}),
-      cwd: ctx.cwd,
-      innerArgv,
-      ...(ctx.sandboxTmpdir !== undefined ? { tmpdir: ctx.sandboxTmpdir } : {}),
-      failClosed: ctx.sandboxBootTool !== undefined,
-    });
-
-    let proc: ReturnType<typeof Bun.spawn>;
-    try {
-      proc = Bun.spawn(spawnArgv, {
-        stdout: 'pipe',
-        stderr: 'pipe',
-        cwd: ctx.cwd,
-        env: spawnEnv,
-        // biome-ignore lint/suspicious/noExplicitAny: Bun's spawn typing for `signal` is too narrow
-        ...({ signal: ctx.signal } as any),
-      });
-    } catch (e) {
-      const msg = (e as Error).message;
-      if (msg.includes('ENOENT')) {
-        return toolError(ERROR_CODES.gitMissing, 'git not found in PATH', {
-          hint: 'Install git to use the git tool.',
-        });
-      }
-      return toolError(ERROR_CODES.gitFailed, `failed to spawn git: ${msg}`);
+    // Content-emitting modes: refuse if the command would emit any file
+    // the policy denies reading (prevents the diff/show body from
+    // leaking denied descendants under an allowed root).
+    if (CONTENT_MODES.has(args.mode)) {
+      const denied = await gateContentFiles(args, gitBin, spawnEnv, ctx);
+      if (denied !== null) return denied;
     }
 
-    // Stream stdout with a byte cap; kill git once the cap is hit so a
-    // huge diff cannot blow up memory or the model's budget.
-    let output = '';
-    let bytes = 0;
-    let truncated = false;
-    const decoder = new TextDecoder();
-    try {
-      for await (const chunk of proc.stdout as ReadableStream<Uint8Array>) {
-        bytes += chunk.byteLength;
-        if (bytes >= OUTPUT_CAP_BYTES) {
-          const remaining = OUTPUT_CAP_BYTES - (bytes - chunk.byteLength);
-          output += decoder.decode(chunk.subarray(0, Math.max(0, remaining)), { stream: true });
-          truncated = true;
-          try {
-            proc.kill('SIGTERM');
-          } catch {
-            // already exited
-          }
-          break;
-        }
-        output += decoder.decode(chunk, { stream: true });
-      }
-    } catch (e) {
-      return toolError(ERROR_CODES.gitFailed, `git stream failed: ${(e as Error).message}`);
+    // The gate above ran one or two git sub-processes; honor an abort
+    // that landed in the meantime before spawning the (potentially
+    // expensive) main run.
+    if (ctx.signal.aborted) {
+      return toolError(ERROR_CODES.aborted, 'tool aborted before git', { retryable: true });
     }
 
-    const exit = await proc.exited;
+    const cap = await captureGit(modeArgs, gitBin, spawnEnv, ctx);
+    if (isToolError(cap)) return cap;
+    const { output, truncated, exit } = cap;
     const commandLine = `git ${modeArgs.join(' ')}`;
 
     // SIGTERM-after-truncation exits non-zero; that is expected, not a
     // failure. Otherwise a non-zero exit is a real git error.
     if (!truncated && exit !== 0) {
-      const stderr = (await new Response(proc.stderr as ReadableStream<Uint8Array>).text()).trim();
-      if (/not a git repository/i.test(stderr)) {
+      if (/not a git repository/i.test(cap.stderr)) {
         return toolError(ERROR_CODES.gitNotRepo, 'cwd is not inside a git repository', {
           details: { command: commandLine },
         });
       }
-      return toolError(ERROR_CODES.gitFailed, `git exited ${exit}: ${stderr || '(no stderr)'}`, {
-        details: { exit_code: exit, command: commandLine },
-      });
+      return toolError(
+        ERROR_CODES.gitFailed,
+        `git exited ${exit}: ${cap.stderr || '(no stderr)'}`,
+        {
+          details: { exit_code: exit, command: commandLine },
+        },
+      );
     }
 
     return {

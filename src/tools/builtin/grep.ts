@@ -263,10 +263,27 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
       );
     }
 
+    // Drop matches from files the policy denies reading. ripgrep was
+    // gated on its search ROOT, but it returns matching LINES from
+    // descendant files — which could include a denied secret (`.env`,
+    // `secrets/…`). Gate each match's file the same way `read_file`
+    // would, so grep can't be used to read around deny_paths / the
+    // sensitive-path floor. Per-file decision cached.
+    const readable = new Map<string, boolean>();
+    const filtered = matches.filter((m) => {
+      const abs = isAbsolute(m.file) ? m.file : resolve(ctx.cwd, m.file);
+      let ok = readable.get(abs);
+      if (ok === undefined) {
+        ok = ctx.permissions.canReadPath(abs);
+        readable.set(abs, ok);
+      }
+      return ok;
+    });
+
     return {
       pattern: args.pattern,
-      matches,
-      count: matches.length,
+      matches: filtered,
+      count: filtered.length,
       truncated,
     };
   },

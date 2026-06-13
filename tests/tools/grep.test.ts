@@ -39,6 +39,26 @@ describe.if(RG_AVAILABLE)('grepTool (with ripgrep)', () => {
     expect(files.some((f) => f.endsWith('b.ts'))).toBe(true);
   });
 
+  test('drops matches from policy-denied files (no read-around via grep)', async () => {
+    // A secret file matched by the same pattern as an allowed file.
+    writeFileSync(join(dir, '.env'), 'login_token = SECRET\n');
+    writeFileSync(join(dir, 'src/c.ts'), 'login();\n');
+    const denyEnv = makeCtx({
+      cwd: dir,
+      permissions: {
+        mode: 'strict',
+        posture: 'supervised',
+        canReadPath: (p) => !p.endsWith('.env'),
+      },
+    });
+    const out = await grepTool.execute({ pattern: 'login' }, denyEnv);
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    const files = out.matches.map((m) => m.file);
+    expect(files.some((f) => f.endsWith('.env'))).toBe(false);
+    // allowed files still match
+    expect(files.some((f) => f.endsWith('.ts'))).toBe(true);
+  });
+
   test('case_insensitive matches "Login"', async () => {
     const out = await grepTool.execute(
       { pattern: 'login', case_insensitive: true, path: 'README.md' },

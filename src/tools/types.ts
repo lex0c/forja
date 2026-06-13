@@ -635,6 +635,7 @@ export const ERROR_CODES = {
   gitMissing: 'git.missing',
   gitFailed: 'git.failed',
   gitNotRepo: 'git.not_a_repo',
+  gitDenied: 'git.policy_denied',
   aborted: 'tool.aborted',
   // Tools whose category gate is too coarse for their actual side
   // effects (wait_for / monitor) self-gate per leaf condition and
