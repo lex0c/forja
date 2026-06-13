@@ -104,6 +104,7 @@ describe('bootstrap', () => {
         'bash_output',
         'clarify',
         'edit_file',
+        'git',
         'glob',
         'grep',
         'memory_list',

@@ -6,6 +6,7 @@ import { bashOutputTool } from './bash-output.ts';
 import { bashTool } from './bash.ts';
 import { clarifyTool } from './clarify.ts';
 import { editFileTool } from './edit-file.ts';
+import { gitTool } from './git.ts';
 import { globTool } from './glob.ts';
 import { grepTool } from './grep.ts';
 import { memoryListTool } from './memory-list.ts';
@@ -46,6 +47,8 @@ export { bashListTool } from './bash-list.ts';
 export type { BashListEntry, BashListInput, BashListOutput } from './bash-list.ts';
 export { editFileTool } from './edit-file.ts';
 export type { EditFileInput, EditFileOutput } from './edit-file.ts';
+export { gitTool } from './git.ts';
+export type { GitInput, GitOutput, GitMode } from './git.ts';
 export { globTool } from './glob.ts';
 export type { GlobInput, GlobOutput } from './glob.ts';
 export { grepTool } from './grep.ts';
@@ -130,6 +133,7 @@ export const BUILTIN_TOOLS = [
   readFileTool,
   globTool,
   grepTool,
+  gitTool,
   memoryListTool,
   memoryReadTool,
   memorySearchTool,
