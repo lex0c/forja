@@ -2,6 +2,166 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-12] project_context: pointer → eager content (spec §2.0 reversal)
+
+Flipped `[project_context]` from pointer-eager/body-lazy to **eager content,
+trust-gated** — operator decision, documented as an explicit amendment in
+`CONTEXT_TUNING.md §2.0` (spec PR before code, per workflow). The pointer's
+failure mode (the model never reads the guide and silently ignores project
+rules) is a recurring correctness cost; eager content removes it and survives
+compaction (sits in the stable system segment), the way principals get CLAUDE.md
+loaded for them. The §2.0 footnote that argued *against* this ("not eager-content
+default") is now reverted in place.
+
+Renamed `project-pointer.ts` → `project-context.ts` (the name is honest again).
+`assembleProjectContext` reuses the two-gate trust logic (cwd + repoRoot, exact-
+path membership) and now **resolves multiple filenames** —
+`PROJECT_GUIDE_FILENAMES` = AGENTS.md → CLAUDE.md → GEMINI.md → GOOSE.md →
+HERMES.md, first present per location, cwd-first across locations. The trust
+modal's probe (`repl.ts`) was widened to the same list so the operator can't be
+warned about one name while a different one loads; its copy now says the contents
+will be *loaded into context* (eager), not read on first use.
+
+Injection containment (the body is attacker-influenceable even after a trust
+grant): (1) trust gate — content embedded only from an explicitly-trusted dir;
+(2) **symlink containment** — the eager `readFileSync` bypasses the permission
+engine that gated the pointer-era `read_file`, so a guide symlinked to a secret
+outside the tree (`~/.ssh/id_rsa`) is refused: realpath must stay within the
+trusted dir (in-tree symlinks still load); (3) body byte-sanitized (terminal
+escapes / control bytes stripped, markdown preserved) and fenced with BEGIN/END
+markers; (4) caveat footer frames it as reference, not commands. Size-capped at
+`PROJECT_GUIDE_MAX_BYTES` (16 KB) with a visible truncation marker so a
+hostile/sprawling file can't inflate the cached prefix. Embedded path still goes
+through `sanitizeForCodeSpan`.
+
+Self-review caught the symlink/exfil vector (the eager read removed the engine's
+protected-path gate the pointer relied on); fixed with realpath containment +
+regression tests (escape blocked, escape-doesn't-break-fallback, in-tree allowed).
+
+Cache: content fuses into the stable segment (cache #1); editing the guide mid-
+session re-caches the prefix — accepted (rare mid-run, one-turn cost, not per-
+turn). Updated `docs/SYSTEM_PROMPT.md` (layer table + assembly map).
+
+Tests: rewrote `tests/cli/project-context.test.ts` for the eager contract (body
+embedded, caveat, multi-name precedence + fallback, trust boundary, content
+control-byte stripping with markdown preserved, path injection, truncation);
+updated `bootstrap.test.ts` + `repl.test.ts` wording/assertions. Green:
+project-context 19, bootstrap+repl 191, tui state+modal 196; typecheck + lint
+clean.
+
+## [2026-06-12] working-state: load-bearing eval
+
+Added `evals/regression/51-working-state-survives-compaction.yaml`, modeled on
+`24-compaction-preserves-goal`. The model registers a hypothesis via
+`working_state_update`, then reads the chunky-modules fixture until compaction
+fires (threshold 0.02, preserveTail 1) — which wipes the early conversation
+including that tool call — and must restate the hypothesis verbatim in its final
+message. The MARKER_WS_HYP token can only resurface via panel re-injection (it
+comes from the store, not the compacted conversation). Asserts:
+`working_state_update` called, compaction triggered, marker in final output, run
+`done`. Proves the central thesis — operational state persists where the
+conversation does not — with a real model in the existing declarative runner.
+YAML validated via `loadEvalCase` (parse-only, no model spend); NOT yet run
+against a live model (costs $ + needs a key — operator decision).
+
+Honest scope: this is NOT the full A/B "refuted-hypothesis-not-pursued-at-step-200"
+eval the spec originally sketched. That one needs infra the declarative runner
+lacks — same-seed A/B comparison, final working-state observation, hundreds of
+steps. WORKING_STATE.md §9 now splits into §9.1 (the implemented compaction-
+survival eval) and §9.2 (the aspirational A/B eval, kept as a follow-up until an
+A/B harness exists). Remaining to fully close the subsystem: run §9.1 against a
+live model, build the §9.2 A/B harness, and the TUI panel renderer.
+
+## [2026-06-12] working-state: implementation
+
+Implemented the WORKING_STATE.md spec end-to-end (no spec divergence — code
+follows the reviewed doc). Born with tests; typecheck + lint clean; impacted
+areas (working-state / tools / harness, 966 tests) green.
+
+Pieces: `src/working-state/index.ts` — the store (mirrors TodoStore: per-session
+Maps, structuredClone, get/set/nextId/clear) plus the pure bookkeeping
+(`applyWorkingStatePatch`: per-slot caps, log FIFO, staleness eviction,
+confirmed/refuted → log, mutation delta) and `formatWorkingState` (recency-window
+log render + global byte guard). `src/tools/builtin/working-state-update.ts` — the
+single permissive partial tool, validates patch shape + hypothesis-not-found at
+the boundary, orchestrates get → applyPatch → set; registered in the
+internal-state group. `src/harness/working-state-inject.ts` — appends the
+`[working_state]` block to the last user message (bottom of current_turn,
+alternation-safe, cache-neutral), tested for string + tool_result tails.
+
+Wiring: ToolContext gained `workingStateStore` + `getStepNumber` (lazy getter
+over the loop's `steps` counter, for staleness stamps); HarnessConfig gained
+`workingStateStore`; the loop wraps the store with an emitting `set` (new
+`working_state_updated` HarnessEvent, mirrors `todo_updated`), injects the block
+before the provider call, and clears the store at session-end only when it owns
+it. REPL injects one persistent store (survives turns); one-shot run + subagents
+let the loop own a fresh per-run store (subagents start empty — §7.3). TUI
+harness-adapter handles the new event as a no-op (panel is prompt-injected, not
+yet TUI-rendered; the subagent heartbeat switch already had a default).
+
+Decisions held from the spec: no confidence (status + evidence + staleness);
+hypothesis.source (user/model/tool); log injected by recency window with
+old-but-relevant facts living in evidence; metrics projected from the audit (the
+tool result echoes the mutation delta) — no new table; in-memory, disposable, no
+migration. Eval (load-bearing, the refuted-hypothesis-at-turn-20 regression) and
+a TUI panel renderer are the remaining follow-ups before this closes.
+Discoverability: CLAUDE.md table row + a CONTEXT_TUNING §10.2 cross-ref.
+
+## [2026-06-12] working-state: spec PR — bounded hot-state operational panel
+
+New subsystem spec `docs/spec/WORKING_STATE.md` (no code yet — operator reviews
+the spec before any implementation, per the spec-PR-before-code rule). Design
+converged with the operator over a planning session; this entry records the why
+and the locked decisions.
+
+Problem: the agent re-infers its operational thread from raw conversation every
+turn (what am I doing / which hypothesis is live / next step / what's already
+rejected) — a named long-session degradation cause. Fix: a small in-memory
+operational panel injected every step so the model reads it for free and updates
+it cheaply, distinct from the historical record (messages/tool_calls/audit),
+which stays the single source of truth.
+
+Shape `WorkingState { focus?, next[], log[], hypotheses[] }`, one eviction axis
+per slot: `focus` set (1 line, never accumulates), `next` set (≤5; overflow is a
+plan → `todo_create`), `log` append-FIFO (≤15, drops by age), `hypotheses` (≤7
+active, drops by staleness; confirmed/refuted leave the active list and become a
+one-line log). Global render cap 2–4KB as the final guard. Cost is flat — O(1) in
+session size, not O(steps).
+
+Operator decisions: (a) **separate** from `TodoStore` — todos = formal task list,
+working-state = the lighter narrative thread, neither derives from the other;
+(b) **in-memory, session-scoped, disposable** — dies at session end like
+`TodoStore` and the inbox, no migration, audit remains the truth, resume does not
+re-hydrate; (c) **no `confidence` field** — numeric scores on operational state
+are numerology nobody calibrates; `status + evidence + staleness` carry the same
+signal; (d) **bounded-hot-state, not append-only** — only the audit log is
+append-only; (e) one permissive partial tool `working_state_update` (read is free
+via injection, so update is the only op), with the store doing all bookkeeping
+(moves confirmed/refuted to log, FIFO, staleness eviction) so the model never
+does formal chores.
+
+Injection at `[current_turn]` bottom, alongside goal re-injection + pins
+(CONTEXT_TUNING §10.2 / §12.4.3) — cache-neutral because `[current_turn]` is
+already rebuilt every step; any position above the breakpoints would re-cache the
+stable prefix every turn. Staleness in steps (STATE_MACHINE §3), not wall-clock.
+
+Eval (load-bearing, ships with the code): a hypothesis refuted at step ~20 is no
+longer acted on at step ~200, measured with vs. without the panel.
+
+Review pass (operator) folded into the spec: `hypothesis.source` (user | model |
+tool — a user-asserted belief needs `clarify` before refuting, a model guess does
+not); `log` injected by recency window (last ~W steps) instead of always-full,
+with old-but-relevant facts living in `hypothesis.evidence` rather than a
+log↔hypothesis cross-link; usage metrics projected from the audit (no new table)
+plus a live in-memory counter; and an explicit "update when focus/hypothesis/next
+materially change" nudge in the tool description to fight the ghost-tool risk.
+
+Deferred (operator): revalidation-before-edits / drift detector (ORCHESTRATION
+§11 — specified, never implemented) is the natural next slice and consumes the
+live hypothesis as its revalidation signal, but is explicitly out of scope here.
+Next step after spec review: implement the store (mirror `src/todo/index.ts`) +
+tool + injection + `clear` wiring in run.ts and repl.ts, born with tests.
+
 ## [2026-06-11] security: sanitize notification fields before scrollback render
 
 Review flagged the reminder `note` (model-authored, can quote untrusted

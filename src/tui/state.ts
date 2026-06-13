@@ -1852,7 +1852,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       if (event.agentsMd) {
         previewLines.push('');
         previewLines.push(
-          'AGENTS.md present — the agent will read it via read_file when project conventions are relevant.',
+          'A project instructions file (e.g. AGENTS.md) is present — its contents will be loaded into the agent’s context if you trust this folder. Review it first.',
         );
       }
       return {

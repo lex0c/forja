@@ -71,12 +71,14 @@ import {
   detectCapabilities,
   lookupToolVocab,
 } from '../tui/index.ts';
+import { createWorkingStateStore } from '../working-state/index.ts';
 import type { ParsedArgs } from './args.ts';
 import { buildBgSummary } from './bg-summary.ts';
 import { operatorBootstrapFlags, reportRefusingEngine } from './boot-parity.ts';
 import { type BootstrapInput, type BootstrapResult, bootstrap } from './bootstrap.ts';
 import { maybeEmitHistoryBanner } from './history-banner.ts';
 import { concatQueuedBodies } from './inbox-drain.ts';
+import { PROJECT_GUIDE_FILENAMES } from './project-context.ts';
 import { prepareResumeContext } from './resume-prepare.ts';
 import { replayProviderMessages, replaySessionMessages } from './resume-replay.ts';
 import { resolveResumeIdOnDb } from './run.ts';
@@ -500,16 +502,19 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // which falls through to the same decline path below — exit 0
     // without ever entering the REPL.
     const trustTimeoutMs = options.trustPromptTimeoutMs ?? 5 * 60 * 1000;
-    // Probe for AGENTS.md at the cwd root (spec AGENTIC_CLI.md
-    // line 75: "AGENTS.md é input não-confiável até prova em
-    // contrário"). The reducer surfaces an explicit notice in the
-    // modal preview when the flag is set so the operator knows
-    // the file's instructions will be loaded on first use — a
-    // safety cue worth seeing before they grant trust. existsSync
-    // is fine here: cheap stat call on a single fixed path,
-    // synchronous fits the boot flow, and missing-permissions /
-    // ENOENT cleanly resolve to false.
-    const agentsMdPresent = existsSync(join(cwd, 'AGENTS.md'));
+    // Probe the cwd for a project agent-instructions file (spec
+    // AGENTIC_CLI.md line 75: "AGENTS.md é input não-confiável até
+    // prova em contrário"). The reducer surfaces an explicit notice
+    // in the modal preview when the flag is set so the operator
+    // knows the file's CONTENTS will be loaded eagerly into context
+    // once they grant trust (§2.0 eager-content) — a safety cue
+    // worth seeing first. The probe covers the SAME filename list
+    // the eager-loader embeds (PROJECT_GUIDE_FILENAMES), so the
+    // operator can't be warned about one name while a different one
+    // gets loaded. existsSync is fine here: cheap stat calls on a
+    // handful of fixed paths, synchronous fits the boot flow, and
+    // missing-permissions / ENOENT cleanly resolve to false.
+    const agentsMdPresent = PROJECT_GUIDE_FILENAMES.some((name) => existsSync(join(cwd, name)));
     // Two-step ordering matters: askTrust SYNCHRONOUSLY pushes its
     // handler onto the focus stack (see modalManager's
     // `enqueueConfirm` → `drain`) before returning the promise.
@@ -2006,6 +2011,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       clarify,
       contextPinsStore,
       todoStore,
+      workingStateStore,
       // Reuse the live context (compact-once-reuse). Fall back to
       // resumeFromSessionId only when there's no live context — a turn
       // that errored before resolving one — so the next turn re-derives
@@ -2446,6 +2452,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // fresh runAgent that would otherwise start with an empty store). See
   // HarnessConfig.todoStore.
   const todoStore = createTodoStore();
+
+  // One working-state panel store for the whole REPL session — injected into
+  // every turn's HarnessConfig so the panel survives across turns (each turn is
+  // a fresh runAgent that would otherwise start empty). In-memory, dies with the
+  // process; no explicit teardown, mirroring todoStore (WORKING_STATE.md §7).
+  const workingStateStore = createWorkingStateStore();
 
   // Hook dispatcher for slash commands (EVICTION.md §10.3). Mirrors
   // the harness loop's wrapper at loop.ts:dispatchHooks but uses the

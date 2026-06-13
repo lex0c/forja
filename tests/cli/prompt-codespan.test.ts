@@ -4,7 +4,7 @@ import { PROMPT_CODESPAN_MAX_CHARS, sanitizeForCodeSpan } from '../../src/cli/pr
 // The shared sanitizer for prompt code-span values. Direct unit
 // coverage so a regression in one of the byte-class handlers
 // surfaces here independently of the integration tests in
-// `environment-prompt.test.ts` and `project-pointer.test.ts`.
+// `environment-prompt.test.ts` and `project-context.test.ts`.
 // Mishandling any class is a real prompt-injection vector — the
 // unit test is the fastest signal a change is wrong.
 

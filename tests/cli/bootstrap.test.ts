@@ -130,6 +130,7 @@ describe('bootstrap', () => {
         'todo_get',
         'todo_list',
         'todo_update',
+        'working_state_update',
         'write_file',
       ].sort(),
     );
@@ -532,11 +533,11 @@ Body.`,
     db.close();
   });
 
-  test('full layered system prompt: identity → env → response → constraints → parallel → tool-ergonomics → playbook → caller → project-pointer → memory → skills', async () => {
+  test('full layered system prompt: identity → env → response → constraints → parallel → tool-ergonomics → playbook → caller → project-context → memory → skills', async () => {
     // Extends the partial chain test above to assert ALL 13 final
     // layers in their canonical top-down position. Without this,
     // a refactor that drops or reorders tool-ergonomics, playbook
-    // hint, project-pointer, or the skill catalog would not be
+    // hint, project-context, or the skill catalog would not be
     // caught by the existing 7-layer test — those four sit
     // between `# Parallelism` and `# Memory` (or after `# Memory`,
     // in the case of `# Skills`) and the partial assertion is
@@ -546,7 +547,7 @@ Body.`,
     // doc/impl drift at the same time.
     const trustPath = join(workdir, 'trusted_dirs.json');
     writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
-    // AGENTS.md at workdir → project-pointer fires (trust-gated).
+    // AGENTS.md at workdir → project-context fires (trust-gated).
     writeFileSync(join(workdir, 'AGENTS.md'), '# project rules\nuse pnpm.\n');
     // Memory file → memory section fires.
     const memDir = join(workdir, '.agent', 'memory', 'local');
@@ -904,15 +905,15 @@ When the goal is to orient in a new repo.
     });
   });
 
-  describe('project pointer (AGENTS.md)', () => {
+  describe('project context (AGENTS.md / multi-name guide)', () => {
     // Pin the wire-up to the system prompt that
-    // src/cli/project-pointer.ts produces. Module-level tests
+    // src/cli/project-context.ts produces. Module-level tests
     // verify the helper's contract; these verify bootstrap
     // actually calls it with the right inputs and threads the
     // result into config.systemPrompt at the right position
     // (between the system layers and the memory section).
 
-    test('emits the AGENTS.md pointer when cwd is trusted and AGENTS.md exists', async () => {
+    test('embeds the AGENTS.md content when cwd is trusted and AGENTS.md exists', async () => {
       const trustPath = join(workdir, 'trusted_dirs.json');
       writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
       writeFileSync(join(workdir, 'AGENTS.md'), '# Project rules\nUse pnpm.\n');
@@ -928,33 +929,33 @@ When the goal is to orient in a new repo.
       expect(config.systemPrompt).toBeDefined();
       expect(config.systemPrompt).toContain('# Project context');
       expect(config.systemPrompt).toContain(join(workdir, 'AGENTS.md'));
-      // Pointer sits AFTER the universal hints (e.g. the
+      // The section sits AFTER the universal hints (e.g. the
       // parallelism layer) but BEFORE the memory section per
       // CONTEXT_TUNING.md §2 layout. The cache-stability
-      // ranking is most-stable-first; project pointer is
-      // stable until AGENTS.md is renamed/removed, memory index
-      // is stable until any /memory write. Pin both adjacencies
-      // so a future composer reorder shows up at PR review
-      // rather than as quiet cache invalidation.
+      // ranking is most-stable-first; project context is
+      // stable until the guide is edited/renamed/removed, memory
+      // index is stable until any /memory write. Pin both
+      // adjacencies so a future composer reorder shows up at PR
+      // review rather than as quiet cache invalidation.
       const promptText = config.systemPrompt ?? '';
       const hintIdx = promptText.indexOf('# Parallelism');
-      const pointerIdx = promptText.indexOf('# Project context');
+      const contextIdx = promptText.indexOf('# Project context');
       const memoryIdx = promptText.indexOf('# Memory');
-      expect(hintIdx).toBeLessThan(pointerIdx);
+      expect(hintIdx).toBeLessThan(contextIdx);
       // Memory section is only present when at least one
       // memory exists in the registry — the bootstrap test
       // setup isolates user scope under the workdir, which
       // starts empty, so the section is absent here. When
-      // present, pointer must precede it.
+      // present, project context must precede it.
       if (memoryIdx >= 0) {
-        expect(pointerIdx).toBeLessThan(memoryIdx);
+        expect(contextIdx).toBeLessThan(memoryIdx);
       }
       db.close();
     });
 
-    test('emits the pointer for the cwd-specific AGENTS.md when present (subdir scope)', async () => {
+    test('embeds the cwd-specific AGENTS.md when present (subdir scope)', async () => {
       // Operator running `agent` from a subdir that has its own
-      // AGENTS.md should see THAT file pointed to, not the
+      // AGENTS.md should see THAT file embedded, not the
       // repoRoot one. Bootstrap forwards both `cwd` and
       // `repoRoot` to the helper; cwd-first probe wins when
       // both files exist.
@@ -988,7 +989,7 @@ When the goal is to orient in a new repo.
       // NOT extend trust to its parent. AGENTS.md exists at the
       // (untrusted) repoRoot only; trust modal probed
       // `subdir/AGENTS.md` (absent) so the operator never saw a
-      // disclosure for the repoRoot file. The pointer must
+      // disclosure for the repoRoot file. The section must
       // suppress the fallback to keep the system prompt's path
       // surface aligned with what the operator authorized.
       //
@@ -1021,7 +1022,7 @@ When the goal is to orient in a new repo.
     test('falls back to repoRoot when BOTH cwd and repoRoot are trusted (typical workflow)', async () => {
       // The common operator workflow: trust the whole repo, run
       // `agent` from a subdir. Both directories are in the trust
-      // list. Pointer should fall back to repoRoot/AGENTS.md
+      // list. The section should fall back to repoRoot/AGENTS.md
       // when the subdir has no AGENTS.md.
       //
       // Same `git init workdir` setup as above so resolveRepoRoot
@@ -1045,12 +1046,12 @@ When the goal is to orient in a new repo.
       db.close();
     });
 
-    test('suppresses the pointer when cwd is untrusted (even with AGENTS.md present)', async () => {
+    test('suppresses the section when cwd is untrusted (even with AGENTS.md present)', async () => {
       // Trust modal not yet granted (one-shot CLI / programmatic
-      // boot) — the pointer must NOT advertise a file the
-      // operator hasn't authorized the agent to read. The
-      // permission engine would block read_file anyway; this
-      // gate avoids the misleading nudge upstream.
+      // boot) — the section must NOT embed the body of a file the
+      // operator hasn't authorized the agent to read. Eager-
+      // injecting untrusted content at system-prompt priority is
+      // exactly the prompt-injection surface the trust gate closes.
       writeFileSync(join(workdir, 'AGENTS.md'), '# Project rules\nUse pnpm.\n');
       const { config, db } = await bootstrap({
         prompt: 'hi',
@@ -1066,7 +1067,7 @@ When the goal is to orient in a new repo.
       db.close();
     });
 
-    test('suppresses the pointer when AGENTS.md is absent (even on a trusted cwd)', async () => {
+    test('suppresses the section when AGENTS.md is absent (even on a trusted cwd)', async () => {
       const trustPath = join(workdir, 'trusted_dirs.json');
       writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
       // No AGENTS.md written.

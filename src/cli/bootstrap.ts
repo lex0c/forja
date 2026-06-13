@@ -98,7 +98,7 @@ import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
 import { composeWithOutputStyle } from './output-style-prompt.ts';
 import { composeWithParallelHint } from './parallel-prompt.ts';
 import { composeWithPlaybookHint } from './playbook-prompt.ts';
-import { assembleProjectPointer, composeWithProjectPointer } from './project-pointer.ts';
+import { assembleProjectContext, composeWithProjectContext } from './project-context.ts';
 import { composeWithResponseFormat } from './response-format.ts';
 import { assembleSkillCatalogSection } from './skills-prompt.ts';
 import { composeWithToolErgonomics } from './tool-ergonomics-prompt.ts';
@@ -1192,33 +1192,35 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // cwd would silently miss every project-root file.
     const bootContext = evaluateBootTriggers(repoRoot);
     // [project_context] section (spec CONTEXT_TUNING.md §2.0).
-    // Pointer to AGENTS.md; body lazy via read_file. Sits in the
+    // Eager-loads the body of the project agent-instructions file
+    // (AGENTS.md / CLAUDE.md / … — see PROJECT_GUIDE_FILENAMES) into
+    // the system prompt when present and trust-gated. Sits in the
     // composed string BEFORE [memory_index] to match the layout in
     // §2 — most-stable-first ordering keeps the cache breakpoint
-    // economy intact: the pointer changes only when AGENTS.md is
-    // renamed/removed, while memory index changes on every
-    // /memory write. Empty-text section passes the base prompt
-    // through unchanged when neither path is both trusted and
-    // present.
+    // economy intact: the guide content changes only when the file
+    // is edited/renamed/removed (rare mid-session), while the memory
+    // index changes on every /memory write. Empty-text section
+    // passes the base prompt through unchanged when no guide is both
+    // trusted and present.
     //
     // `isRepoRootTrusted` is computed independently of
     // `isCwdTrusted`: trust storage is exact-path membership
     // (`isTrusted(trustList, path)`), so an operator who trusted
     // only a subdir has NOT implicitly trusted its parent. The
-    // pointer must not advertise paths outside the explicit
-    // trust grant — see `project-pointer.ts` §"Trust gate" for
-    // the threat model. When `cwd === repoRoot` (the common
-    // project-root invocation) the two flags are equal by
-    // construction and the second `isTrusted` call is a no-op.
+    // section must not embed content from paths outside the explicit
+    // trust grant — see `project-context.ts` §"Trust gate" for the
+    // threat model. When `cwd === repoRoot` (the common project-root
+    // invocation) the two flags are equal by construction and the
+    // second `isTrusted` call is a no-op.
     const isRepoRootTrusted =
       cwd === repoRoot ? isCwdTrusted : trustPath !== null && isTrusted(trustPath, repoRoot);
-    const projectPointer = assembleProjectPointer({
+    const projectContext = assembleProjectContext({
       cwd,
       repoRoot,
       isCwdTrusted,
       isRepoRootTrusted,
     });
-    resolvedSystemPrompt = composeWithProjectPointer(resolvedSystemPrompt, projectPointer.text);
+    resolvedSystemPrompt = composeWithProjectContext(resolvedSystemPrompt, projectContext.text);
     // S5 fail-closed eager-load gating. The project_shared scope
     // is eligible for the eager-load section ONLY when the trust
     // probe established confidence in the corpus' current state.
@@ -1419,7 +1421,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   const bgLogDir = join(cwd, '.agent', 'bg');
 
   // (`trustPath` and `isCwdTrusted` resolved above the try-block
-  // so the project-pointer section can gate on them at prompt-
+  // so the project-context section can gate on them at prompt-
   // assembly time; both are still consumed below — memory_write
   // honors the same flag (MEMORY.md §7.2.1) and the harness
   // surfaces it for downstream gates.)
