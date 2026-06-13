@@ -2,6 +2,32 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] git tool: fix metadata-gate relativity leak (resolve against repo root)
+
+Security review finding (a regression I introduced in the previous entry's perf
+tweak). To save a `rev-parse` spawn I made the metadata gate resolve emitted
+names against `ctx.cwd`, on the premise that `status`/`ls_files` emit cwd-relative
+names. That premise is FALSE for `status`: `git status -z` always emits
+REPO-ROOT-relative paths (porcelain ignores `status.relativePaths` under `-z`).
+So from a subdirectory cwd, `resolve(ctx.cwd, "app/secrets/x")` produced a doubled
+path (`/repo/app/app/secrets/x`); `canReadPath` checked the wrong path, and a
+descendant denied via operator `deny_paths` (non-sensitive basename — the
+sensitive floor still matched by basename) had its NAME leak through `status`.
+`ls_files` (cwd-relative) and `status` (root-relative) also disagreed, so one of
+the two leaked regardless of how the deny was authored. Empirically confirmed on
+git 2.54 from a subdir.
+
+Fix: both modes now emit ROOT-relative names (`status -z` natively; `ls_files`
+regains `--full-name`) and the gate resolves against the repo root via
+`resolveRepoRoot`. The `rev-parse` is LAZY — skipped when no record carries a
+path (clean `status` = just the `## branch` header; empty `ls_files`), so the
+common case stays spawn-free; taken only when there are real entries to gate. On
+an unresolvable root it FAILS CLOSED (refuses) rather than mis-resolving. Same
+class of bug fixed in the content gate: its `?? ctx.cwd` fallback (also a
+root-relative-resolved-against-cwd mis-resolution on a subdir) now fails closed
+too. Regression test uses a SUBDIR cwd + an absolute-prefix deny predicate (the
+prior tests used cwd=repo-root + substring mocks, which mask the doubling).
+
 ## [2026-06-13] git tool: gate path-emitting metadata modes against denied paths
 
 Review finding: the content gate only ran for `diff`/`show`, so it stopped the

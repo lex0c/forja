@@ -262,6 +262,47 @@ describe.if(GIT_AVAILABLE)('gitTool — against a real repo', () => {
     expect(status.output).not.toContain('secrets/s.txt');
   });
 
+  test('metadata gate resolves against the REPO ROOT, not cwd — denied name does not leak from a subdir', async () => {
+    // Regression for the relativity bug: `git status -z` emits ROOT-relative
+    // names (porcelain ignores status.relativePaths under -z) and `ls-files
+    // --full-name` likewise. Resolving those against ctx.cwd from a SUBDIR
+    // would double the prefix (/repo/app/app/secrets/x) and mis-gate, so a
+    // denied descendant's NAME would leak. The deny predicate keys on the
+    // ABSOLUTE secrets path, so a doubled (wrong) resolution is NOT denied —
+    // this test only passes if the gate resolves against the real root.
+    mkdirSync(join(dir, 'app/secrets'), { recursive: true });
+    writeFileSync(join(dir, 'app/a.ts'), 'export const a = 1;\n');
+    writeFileSync(join(dir, 'app/secrets/key.txt'), 'SECRET\n');
+    run(['add', '-A']);
+    run(['commit', '-q', '-m', 'add app']);
+    writeFileSync(join(dir, 'app/a.ts'), 'export const a = 2;\n');
+    writeFileSync(join(dir, 'app/secrets/key.txt'), 'SECRET2\n');
+
+    const secretsAbs = join(dir, 'app', 'secrets');
+    const fromSubdir = makeCtx({
+      cwd: join(dir, 'app'),
+      permissions: {
+        mode: 'strict',
+        posture: 'supervised',
+        // Deny only the REAL absolute secrets subtree. A path doubled by a
+        // cwd-relative mis-resolution (/repo/app/app/secrets/...) would NOT
+        // start with this prefix → would wrongly pass → the test would catch
+        // the leak.
+        canReadPath: (p) => !p.startsWith(secretsAbs),
+      },
+    });
+
+    const status = await gitTool.execute({ mode: 'status' }, fromSubdir);
+    if (isToolError(status)) throw new Error(status.error_message);
+    expect(status.output).toContain('a.ts');
+    expect(status.output).not.toContain('key.txt');
+
+    const ls = await gitTool.execute({ mode: 'ls_files' }, fromSubdir);
+    if (isToolError(ls)) throw new Error(ls.error_message);
+    expect(ls.output).toContain('a.ts');
+    expect(ls.output).not.toContain('key.txt');
+  });
+
   test('gates a denied file with a non-ASCII name (-z framing, not quotePath-escaped)', async () => {
     // Default core.quotePath would C-escape this name in --name-only
     // output; -z must frame it raw so the gate sees the real path.
