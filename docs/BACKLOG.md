@@ -2,7 +2,18 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
-## [2026-06-13] Gate per-emitted-file reads for git diff/show and grep
+## [2026-06-13] git tool: force short submodule diffs before the content gate
+
+Review finding against the per-file content gate: with `diff.submodule=diff`
+set (repo or global config), `git diff`/`show` inline the FULL content diff of a
+changed submodule — but the gate's `--name-only -z` pre-flight only returns the
+submodule PATH (e.g. `sm`). So `canReadPath('sm')` passes whenever the submodule
+is readable, yet the real diff leaks the body of a denied `sm/.env`. Confirmed:
+with the config set, the tool emitted `-SECRET=1 / +SECRET=2`; `-c
+diff.submodule=short` reduces it to `Subproject commit <sha>..<sha>`. Added that
+override to the HARDENING `-c` set (highest precedence, beats config files;
+applies to both the pre-flight and the real run). Behavioral test with a real
+submodule + `diff.submodule=diff` asserts the body never appears inline.
 
 Review finding: content-emitting tools gate only their search ROOT, but their
 OUTPUT carries content from many descendant files. A policy of `read_file:

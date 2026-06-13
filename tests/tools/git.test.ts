@@ -233,6 +233,46 @@ describe.if(GIT_AVAILABLE)('gitTool — against a real repo', () => {
     if (isToolError(out)) expect(out.error_code).toBe('git.policy_denied');
   });
 
+  test('forces short submodule diffs (config diff.submodule=diff cannot inline submodule content)', async () => {
+    // A submodule whose tree holds a secret.
+    const sub = mkdtempSync(join(tmpdir(), 'forja-sub-'));
+    const shSub = (cmd: string[]) => Bun.spawnSync(['git', ...cmd], { cwd: sub });
+    shSub(['init', '-q']);
+    shSub(['config', 'user.email', 's@s']);
+    shSub(['config', 'user.name', 'S']);
+    writeFileSync(join(sub, '.env'), 'SECRET=1\n');
+    shSub(['add', '-A']);
+    shSub(['commit', '-q', '-m', 's1']);
+    try {
+      // Add it as a submodule of the test repo (local file protocol).
+      const added = Bun.spawnSync(
+        ['git', '-c', 'protocol.file.allow=always', 'submodule', 'add', sub, 'sm'],
+        { cwd: dir },
+      );
+      // Some environments disable submodules; skip rather than false-fail.
+      if (added.exitCode !== 0) return;
+      run(['commit', '-q', '-m', 'add sm']);
+      // Advance the submodule THROUGH the superproject's checkout (sm is
+      // a clone of `sub`; editing `sub` would not move the gitlink) and
+      // set the dangerous config that inlines submodule content.
+      const smDir = join(dir, 'sm');
+      const shSm = (cmd: string[]) => Bun.spawnSync(['git', ...cmd], { cwd: smDir });
+      writeFileSync(join(smDir, '.env'), 'SECRET=2\n');
+      shSm(['add', '-A']);
+      shSm(['commit', '-q', '-m', 's2']);
+      run(['config', 'diff.submodule', 'diff']);
+
+      const out = await gitTool.execute({ mode: 'diff' }, makeCtx({ cwd: dir }));
+      if (isToolError(out)) throw new Error(out.error_message);
+      // The submodule body must NOT appear inline; only the subproject
+      // commit SHAs (the short form) may show.
+      expect(out.output).not.toContain('SECRET');
+      expect(out.output).toContain('Subproject commit');
+    } finally {
+      rmSync(sub, { recursive: true, force: true });
+    }
+  });
+
   test('does not exec gpg.program via log.showSignature (config-driven exec vector)', async () => {
     const out = (cmd: string[], stdin?: string) =>
       new TextDecoder().decode(

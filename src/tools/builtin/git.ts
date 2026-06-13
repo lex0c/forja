@@ -75,6 +75,11 @@ const REF_RE = /^[A-Za-z0-9_./~^@{}-]+$/;
 //     it false means signature verification (and thus the gpg exec)
 //     is never attempted. `--no-ext-diff` / `--no-textconv` (added
 //     per-mode) close the diff/textconv exec paths.
+//   - diff.submodule=short: with `diff.submodule=diff` set, diff/show
+//     inline the FULL content diff of a changed submodule, but the
+//     `--name-only` content-gate pre-flight only sees the submodule
+//     PATH — so a denied `sub/.env` would leak whenever `sub` itself
+//     is readable. Forcing `short` emits only the subproject SHAs.
 const HARDENING: readonly string[] = [
   '-c',
   'core.fsmonitor=',
@@ -82,6 +87,8 @@ const HARDENING: readonly string[] = [
   'core.hooksPath=/dev/null',
   '-c',
   'log.showSignature=false',
+  '-c',
+  'diff.submodule=short',
   // Disable color globally here rather than per-mode: `--no-color` is
   // not accepted by every subcommand (`git status` rejects it), but
   // the `-c color.ui=false` override is honored uniformly. Piped
