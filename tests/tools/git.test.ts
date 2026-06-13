@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildModeArgs, gitTool } from '../../src/tools/builtin/git.ts';
@@ -146,6 +146,50 @@ describe.if(GIT_AVAILABLE)('gitTool — against a real repo', () => {
     // captured bytes never exceed the 64 KiB cap
     expect(Buffer.byteLength(out.output, 'utf8')).toBeLessThanOrEqual(64 * 1024);
     expect(out.output.length).toBeGreaterThan(0);
+  });
+
+  test('does not exec gpg.program via log.showSignature (config-driven exec vector)', async () => {
+    const out = (cmd: string[], stdin?: string) =>
+      new TextDecoder().decode(
+        Bun.spawnSync(['git', ...cmd], {
+          cwd: dir,
+          stdin: stdin !== undefined ? new TextEncoder().encode(stdin) : undefined,
+        }).stdout,
+      );
+
+    // A gpg.program canary that writes a marker the instant git asks it
+    // to --verify a signature — i.e. the moment the read-only tool would
+    // have fork-exec'd a repo-controlled program.
+    const canary = join(dir, 'CANARY');
+    const fakegpg = join(dir, 'fakegpg.sh');
+    writeFileSync(
+      fakegpg,
+      `#!/bin/sh\nfor a in "$@"; do if [ "$a" = "--verify" ]; then echo pwned > "${canary}"; fi; done\necho "[GNUPG:] GOODSIG 0 fake"\nexit 0\n`,
+    );
+    chmodSync(fakegpg, 0o755);
+
+    // Forge a commit carrying a gpgsig header (no real gpg needed) so
+    // `git log --show-signature` will attempt verification.
+    const raw = out(['cat-file', 'commit', 'HEAD']);
+    const [hdr, ...rest] = raw.split('\n\n');
+    const sig = 'gpgsig -----BEGIN PGP SIGNATURE-----\n \n FAKE\n -----END PGP SIGNATURE-----';
+    const forged = `${hdr}\n${sig}\n\n${rest.join('\n\n')}`;
+    const newHash = out(['hash-object', '-w', '-t', 'commit', '--stdin'], forged).trim();
+    run(['update-ref', 'HEAD', newHash]);
+    run(['config', 'log.showSignature', 'true']);
+    run(['config', 'gpg.program', fakegpg]);
+
+    // Positive control: a raw `git log` honors the repo config and DOES
+    // fire the canary — proving the vector is live with this setup.
+    Bun.spawnSync(['git', 'log', '-1'], { cwd: dir });
+    expect(existsSync(canary)).toBe(true);
+
+    // The tool forces `-c log.showSignature=false`, so verification is
+    // never attempted: the canary must NOT reappear.
+    rmSync(canary, { force: true });
+    const result = await gitTool.execute({ mode: 'log' }, makeCtx({ cwd: dir }));
+    if (isToolError(result)) throw new Error(result.error_message);
+    expect(existsSync(canary)).toBe(false);
   });
 
   test('not-a-repo surfaces a clean error', async () => {

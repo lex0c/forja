@@ -2,6 +2,19 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] git tool: close the log.showSignature exec vector
+
+Review finding: `log.showSignature=true` in a repo-local or global `.git/config`
+makes `git log`/`git show` assume `--show-signature`, which feeds the commit
+signature to `gpg.program` / `gpg.ssh.program` — both config-selected
+executables. So a hostile repo could get arbitrary code to run during an
+"otherwise read-only, no-bash" git call. The hardening list only covered
+fsmonitor/hooks/pager. Added `-c log.showSignature=false` to the injected
+overrides (highest precedence — beats any config file), so verification is never
+attempted and the gpg exec never happens. Behavioral test: forge a commit with a
+gpgsig header + a canary `gpg.program`; a raw `git log` fires the canary
+(positive control proving the vector is live), the tool does not.
+
 ## [2026-06-13] Fix git tool: policy gate for pathless modes + repo-env scrub
 
 Two review findings on the new `git` tool, both real:

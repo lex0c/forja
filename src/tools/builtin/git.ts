@@ -55,14 +55,24 @@ const OUTPUT_CAP_BYTES = 64 * 1024;
 const REF_RE = /^[A-Za-z0-9_./~^@{}-]+$/;
 
 // Defensive `-c` overrides we inject ourselves (never the model).
-// `core.fsmonitor` and hook execution are the two ways a hostile
-// repo-local `.git/config` could get git to run an arbitrary program
-// during an otherwise read-only command; both are disabled here.
+// These close every config-driven way a hostile `.git/config` (repo-
+// local OR the operator's global) could get an "otherwise read-only"
+// git command to fork-exec an attacker-chosen program:
+//   - core.fsmonitor: runs a monitor program on most commands.
+//   - core.hooksPath / hooks: run on lifecycle events.
+//   - log.showSignature: makes log/show assume `--show-signature`,
+//     which feeds the commit signature to `gpg.program` /
+//     `gpg.ssh.program` — both config-selected executables. Forcing
+//     it false means signature verification (and thus the gpg exec)
+//     is never attempted. `--no-ext-diff` / `--no-textconv` (added
+//     per-mode) close the diff/textconv exec paths.
 const HARDENING: readonly string[] = [
   '-c',
   'core.fsmonitor=',
   '-c',
   'core.hooksPath=/dev/null',
+  '-c',
+  'log.showSignature=false',
   // Disable color globally here rather than per-mode: `--no-color` is
   // not accepted by every subcommand (`git status` rejects it), but
   // the `-c color.ui=false` override is honored uniformly. Piped
