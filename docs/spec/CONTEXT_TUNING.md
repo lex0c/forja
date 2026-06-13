@@ -1230,8 +1230,8 @@ Padrão **opt-in** onde o modelo emite reflexão estruturada no fim de cada step
 
 | Modo | Output emitido no fim de cada step | Tokens output/step | Quando usar |
 |---|---|---|---|
-| `off` | nada | 0 | code-review, perf, security-audit, gap-audit |
-| `terse` | 1 linha: `next: <descrição curta>` | ~15-30 | challenge-assumptions; sessão exploratória (default) |
+| `off` | nada | 0 | code-review, perf, security-audit |
+| `terse` | 1 linha: `next: <descrição curta>` | ~15-30 | sessão exploratória (default) |
 | `full` | 3 linhas: `just_did:` / `why_advances_goal:` / `next_step_planned:` | ~80-120 | opt-in raro; sessão exploratória crítica onde trace é artefato entregável |
 
 #### 13.10.2 Format canônico

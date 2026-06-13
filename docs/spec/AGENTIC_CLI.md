@@ -1619,7 +1619,7 @@ Diferenças vs subagent genérico:
 
 Definidos em `~/.config/agent/playbooks/*.md`. Disparados por slash command (`/review`, `/audit`, `/perf`) ou por `task(playbook: <name>)` em código de outro agente.
 
-Templates iniciais e princípios de design em [`PLAYBOOKS.md`](./PLAYBOOKS.md). **Cinco** playbooks na v1: `code-review`, `security-audit`, `perf-investigate`, mais os meta-playbooks `gap-audit` e `challenge-assumptions` (`git-hygiene`, `debug`, `refactor`, `explain` e `threat-model` foram removidos — voltam ao modo normal/skills). Dentro do teto recomendado de 6 — ver `PLAYBOOKS.md §12`/§15; revisão eval-driven gatilho se modelo confunde seleção > 5%.
+Templates iniciais e princípios de design em [`PLAYBOOKS.md`](./PLAYBOOKS.md). **Três** playbooks na v1: `code-review`, `security-audit`, `perf-investigate` — todos read-only e produtores de relatório estruturado (o ganho é isolamento/compressão de contexto). Foram removidos `git-hygiene`, `debug`, `refactor`, `explain`, `threat-model` (voltam ao modo normal/skills) e os meta-playbooks `gap-audit`/`challenge-assumptions`. Dentro do teto recomendado de 6 — ver `PLAYBOOKS.md §12`/§15.
 
 ---
 

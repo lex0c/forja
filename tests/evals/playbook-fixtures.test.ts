@@ -18,13 +18,11 @@ describe('loadPlaybookFixtures (bundled)', () => {
     // One stub per canonical playbook — the count anchors the
     // contract that every bundled playbook has at least one
     // regression entry.
-    expect(fixtures.length).toBeGreaterThanOrEqual(5);
+    expect(fixtures.length).toBeGreaterThanOrEqual(3);
     const playbookNames = new Set(fixtures.map((f) => f.playbook));
     expect(playbookNames).toContain('code-review');
     expect(playbookNames).toContain('security-audit');
     expect(playbookNames).toContain('perf-investigate');
-    expect(playbookNames).toContain('gap-audit');
-    expect(playbookNames).toContain('challenge-assumptions');
   });
 
   test('every fixture references its own directory as the playbook name', () => {

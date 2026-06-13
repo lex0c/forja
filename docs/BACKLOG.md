@@ -2,6 +2,28 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] Trim the playbook catalog to 3 (drop gap-audit/challenge-assumptions)
+
+Removed the two anti-sycophancy meta-playbooks, leaving exactly the
+isolation/compression set: `code-review`, `security-audit`, `perf-investigate`
+— all read-only, all producing a structured report, all cases where the cost of
+exploration far exceeds the cost of the distilled summary (the one shape where a
+context-isolated subagent clearly pays for itself). `gap-audit` and
+`challenge-assumptions` were justified by a *different* mechanism (injecting an
+explicit adversarial bias, not context compression); that bias folds back into
+normal mode. Net: the catalog now has a single coherent rationale.
+
+Code: deleted the two `.md` assets + `index.ts` imports/entries (now 3),
+`evals/playbooks/{gap-audit,challenge-assumptions}/`, and updated the
+`playbook-prompt.ts` delegation example (the `gap-audit` skepticism case).
+Tests: `playbook-fixtures` membership + count anchor (5 → 3); `init.test`
+`CANONICAL_PLAYBOOKS.length` 5 → 3.
+
+Spec in lockstep: `PLAYBOOKS §10–§11` tombstoned (numbers preserved — §12–§14
+are cross-referenced); §15 catalog count/list + the meta-playbook paragraph,
+the §1.4 discovery/delegation examples, `AGENTIC_CLI §11.3` count, and the
+`CONTEXT_TUNING` reflection-mode table all updated to the 3-playbook set.
+
 ## [2026-06-13] Trim the playbook catalog to 5 (drop debug/refactor/explain/threat-model)
 
 Removed four more bundled playbooks — `debug`, `refactor`, `explain`,

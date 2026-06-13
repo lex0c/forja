@@ -112,7 +112,7 @@ No startup, o harness varre `~/.config/agent/playbooks/*.md`, extrai `name + des
 | playbook              | when_to_use                                                              |
 |-----------------------|--------------------------------------------------------------------------|
 | code-review           | diff pronto pra revisão; mudança que precisa de gate antes de merge      |
-| challenge-assumptions | decisão com confiança alta + evidência fraca; "obviously", opção fantasma|
+| security-audit        | código que toca authz/crypto/input boundary; varredura por threat category|
 | ...                   | ...                                                                      |
 ```
 
@@ -127,10 +127,10 @@ NÃO delegue quando:
 - Usuário pediu resposta direta, não relatório estruturado
 
 Delegue quando:
-- Tarefa cabe num schema estruturado de algum playbook (`code-review`, `challenge-assumptions`, etc.) e o usuário se beneficia do output categorizado
+- Tarefa cabe num schema estruturado de algum playbook (`code-review`, `security-audit`, etc.) e o usuário se beneficia do output categorizado
 - Quer **isolation de contexto** — subagent não polui o turno principal com leituras intermediárias
 - Quer **tools restritas** — ex: red-team que NÃO deve poder editar código
-- Tarefa exige **viés explícito** que conflita com o tom default (ceticismo em `gap-audit`, paranoia em `security-audit`)
+- Tarefa exige **viés explícito** que conflita com o tom default (ex.: paranoia em `security-audit`)
 
 **Anti-pattern: auto-delegar tudo.** Subagent custa context handoff + budget + latência. Usar `task_sync` pra "que horas são" é cargo cult. Default é responder direto; delegação é exceção que paga benefício específico (isolation, schema, viés, tool restriction).
 
@@ -697,314 +697,15 @@ not_checked:
 
 ---
 
-## 10. Playbook: `gap-audit`
+## 10. Playbook: `gap-audit` (removido)
 
-Slash command: `/gapaudit`. Subagent isolado com viés cético. Audita um artefato (spec, plano, PR description, decision log, threat model) contra evidência verificável. Não corrige; reporta lacunas.
-
-Distinto de `code-review` (revisa **mudanças** de código contra correctness) e `security-audit` (varre **código** por threat categories). `gap-audit` opera sobre **artefatos textuais** verificando *claim vs evidence*.
-
-```yaml
----
-name: gap-audit
-description: Audita artefato (spec/plano/PR/threat model) procurando gaps, contradições e claims sem evidência. Não conserta.
-tools: [read_file, grep, glob]
-budget:
-  max_steps: 30
-  max_cost_usd: 0.50
-references:
-  - CRITICAL_THINKING.md
-  - TOOL_ERGONOMICS.md
-slash: gapaudit
-when_to_use: "spec/plano/PR description com claims a verificar; quero auditar claim vs evidência sem propor fix; artefato textual, não código"
-sampling:
-  temperature: 0.2                 # baixo; queremos consistência cética, não criatividade
-  max_tokens: 4096
-  thinking_budget: 4000            # vale pensar antes de declarar gap
-output_schema:
-  summary: string                  # 1-3 linhas: "audit verdict + headline gaps"
-  gaps:                            # algo que devia existir e não existe
-    - { artifact_ref, claim_or_section, what_is_missing, severity, why_it_matters }
-  contradictions:                  # X afirma Y; A afirma ¬Y
-    - { artifact_ref_a, artifact_ref_b, conflict, severity }
-  unverifiable:                    # claim feito sem evidência checável
-    - { artifact_ref, claim, why_unverifiable, suggested_evidence }
-  confirmed_ok:                    # claims que foram verificados contra evidência
-    - { artifact_ref, claim, evidence_ref }
-  not_checked:                     # honestidade epistêmica — escopo não auditado
-    - { area, reason }
-  assumptions: [string]
----
-```
-
-```markdown
-# Gap Audit
-
-Você audita artefatos (spec, plano, PR description, decision log) com viés cético.
-Sua única saída é um relatório no schema acima.
-Não escreve código. Não aplica fixes. Não reescreve o artefato.
-
-## NÃO faça
-
-- NÃO coloque nada em `confirmed_ok` sem ter verificado contra evidência específica (`file:line`, comando rodado, output observado).
-- NÃO use linguagem que confirma sem evidência ("parece OK", "provavelmente correto", "looks good"). Se não verificou, vai pra `unverifiable` ou `not_checked`.
-- NÃO marque gap baseado em ausência ambígua. Se "X não está mencionado" pode ser intencional, vai pra `unverifiable` com `suggested_evidence`, não pra `gaps`.
-- NÃO sugira como consertar. Esse é trabalho do autor; você só aponta.
-- NÃO trate o artefato como autoritativo. Se ele afirma que `tabela_X` existe, você grep pra confirmar — não assuma.
-- NÃO termine sem preencher `not_checked` honestamente. "Auditei tudo" é red flag.
-- NÃO produza output que parece thorough mas não cita evidência. Cada item tem `artifact_ref` (`file:line` ou `file §N`).
-
-## Faça
-
-- Cite `artifact_ref` (formato `file:line` ou `file §N.N`) em **todo** item.
-- Para `gaps`: explique **por que importa** — gap sem consequence é nit, não gap.
-- Para `contradictions`: cite **ambos** os lados com refs.
-- Para `unverifiable`: sugira que evidência fecharia (`suggested_evidence`), assim autor sabe o que produzir.
-- Para `confirmed_ok`: cite `evidence_ref` que verifica (pode ser outro `file:line`, comando, ou test fixture).
-- Em `summary`, comece com veredicto: "solid", "needs work", ou "structural issues".
-
-## Critérios de severidade (gaps e contradictions)
-
-| Severidade | Definição |
-|---|---|
-| `critical` | Gap/contradição que torna o artefato inaplicável (spec impossível de implementar, plano internamente inconsistente) |
-| `high` | Gap que vai surpreender quem implementar; contradição entre seções principais |
-| `medium` | Gap em edge case; claim importante sem evidência mas consertável |
-| `low` | Detalhe ausente, melhoria de clareza |
-
-`low` quase nunca vai em `gaps` — vira `unverifiable` ou `not_checked`. Auditor que reporta 30 itens `low` está fazendo nitpick, não audit.
-
-## Heurísticas (o que procurar)
-
-- **Conceito introduzido sem schema/contrato.** "Tabela X é usada" sem schema declarado.
-- **Cross-ref que não resolve.** `§N` ou `FOO.md §M` apontando pra inexistente.
-- **Symbol mencionado sem definição.** Tool/comando/estado citado sem aparecer em outro lugar canônico.
-- **Invariante declarada sem verificação.** "Sempre X" sem mecanismo que garanta X.
-- **Trade-off omitido.** Decisão sem custo declarado é decisão sem ponderação.
-- **Claim de "isso é seguro/correto/idempotente" sem evidência.** Vai pra `unverifiable`.
-- **Numeração inconsistente após renumeração.** Comum em spec longa editada incrementalmente.
-
-## Heurísticas de busca rápida
-
-```bash
-# Símbolo citado no artefato existe no código?
-rg -nw 'cited_symbol' src/
-
-# Cross-ref de seção (artefato cita "FOO.md §N.N" — existe?)
-rg -nE '^##+\s+N\.N\b' FOO.md
-
-# Tabela/schema mencionado bate com migrations?
-rg -niE 'CREATE TABLE\s+(IF NOT EXISTS\s+)?\bclaimed_name\b' migrations/
-
-# Numeração de seções: detectar gap ou duplicata
-rg -nE '^##\s+[0-9]+\.' artifact.md | awk -F'[. ]' '{print $3}' | sort -n | uniq -c
-
-# Cross-ref entre artefatos: linhas que mencionam outros docs
-rg -nE '\b[A-Z_]+\.md\b' artifact.md
-```
-
-## Anti-pattern do próprio auditor (sycophancy)
-
-Modelo default tende a confirmar. Sintomas:
-
-- `confirmed_ok` longo com itens não-verificados
-- Ratio `confirmed_ok / (gaps + contradictions + unverifiable)` > 3:1 sem evidência forte
-- Nenhuma `unverifiable` em audit de artefato com 1000+ linhas (improvável que tudo seja checável)
-
-Se o output parece "tudo OK", **revise** — provavelmente faltou cético.
-
-## Quando NÃO conseguir auditar
-
-- Artefato é prosa narrativa sem claims verificáveis (ensaio, design rationale puro): retorna `summary` reconhecendo isso + `not_checked` com motivo.
-- Faltam refs externas pra verificar (artefato cita `INTERNAL_DOC.md` que você não pode acessar): vai em `unverifiable`, não em `gaps`.
-
-## Exemplo de output mínimo
-
-\`\`\`yaml
-summary: "needs work — 2 contradictions estruturais entre STATE_MACHINE §2.3 e RECAP §3, 4 gaps de schema. Resto está sólido onde verificado."
-gaps:
-  - artifact_ref: "STATE_MACHINE.md §11"
-    claim_or_section: "drift detector emite drift_event(...)"
-    what_is_missing: "schema da tabela drift_events não declarado"
-    severity: high
-    why_it_matters: "consumidores (eval, /recap forensics) não sabem colunas"
-contradictions:
-  - artifact_ref_a: "RECAP.md §3 (linha 107)"
-    artifact_ref_b: "STATE_MACHINE.md §2.3.1 (schema)"
-    conflict: "RECAP define goal_stack com 6 campos; schema SQL canônico tem 9"
-    severity: medium
-unverifiable:
-  - artifact_ref: "ORCHESTRATION.md §4.6"
-    claim: "fallback estático tem latência < 50ms"
-    why_unverifiable: "sem benchmark referenciado"
-    suggested_evidence: "link pra evals/compaction/static_fallback/latency.json"
-confirmed_ok:
-  - artifact_ref: "STATE_MACHINE.md §9"
-    claim: "todos eventos novos (drift_*, regrounding_*) estão na tabela"
-    evidence_ref: "verificado via grep ^| em §9; 4 entries presentes"
-not_checked:
-  - area: "ORCHESTRATION.md §6 (self-critique)"
-    reason: "fora do escopo do patch auditado"
-assumptions:
-  - "spec é source of truth; não verifiquei contra implementação real (não existe ainda)"
-\`\`\`
-```
-
-**Eval acoplado:** `evals/playbooks/gap-audit/` com 10 fixtures:
-- 4 artefatos com gaps semeados deliberadamente (esperado: `gap_recall ≥ 0.8`)
-- 3 artefatos limpos (esperado: `false_positive_rate ≤ 0.05`, ou seja, `gaps[]` quase vazio)
-- 3 artefatos com contradições internas semeadas (esperado: detector recall ≥ 0.7)
-
-Métrica anti-sycophancy: **`false_confirmation_rate`** = items em `confirmed_ok` que não têm `evidence_ref` válido (resolvível) / total `confirmed_ok`. Threshold: ≤ 0.05. PR-bloqueante.
+> **Removido do catálogo canônico (2026-06-13).** Meta-playbook anti-sycophancy (auditava artefato textual: claim vs evidência). Removido junto com `challenge-assumptions` ao enxugar o catálogo para o conjunto de isolamento/compressão (`code-review`, `security-audit`, `perf-investigate`). Número da seção preservado como tombstone para não renumerar §12–§14.
 
 ---
 
-## 11. Playbook: `challenge-assumptions`
+## 11. Playbook: `challenge-assumptions` (removido)
 
-Slash command: `/challenge`. Subagent isolado com viés de red-team. Recebe uma decisão, plano, ou cadeia de raciocínio e ataca o **raciocínio**, não o artefato. Não propõe alternativas vencedoras; expõe o que seria preciso ser verdade para a conclusão se sustentar.
-
-Distinto de `gap-audit` (audita **artefato textual** procurando claim sem evidência) e `code-review` (revisa **mudanças** de código). `challenge-assumptions` opera sobre **uma cadeia de raciocínio** — pode ser um parágrafo, um design doc, uma seção de PR description, uma decisão tomada em chat.
-
-```yaml
----
-name: challenge-assumptions
-description: Ataca o raciocínio de uma decisão/plano/análise. Expõe premissas load-bearing, framings silenciosamente descartados e falsificadores. Não propõe alternativa vencedora.
-tools: [read_file, grep, glob]
-budget:
-  max_steps: 20
-  max_cost_usd: 0.40
-references:
-  - CRITICAL_THINKING.md
-  - GROUPTHINK_BIAS.md
-slash: challenge
-when_to_use: "decisão/plano com confiança alta + evidência fraca; raciocínio que usa 'obviously', 'sempre podemos depois', ou ignora opções óbvias (não fazer nada, comprar, deprecar)"
-sampling:
-  temperature: 0.3                 # leve divergência pra alternativas plausíveis, não fantasia
-  max_tokens: 4096
-  thinking_budget: 4000
-output_schema:
-  summary: string                  # 1-3 linhas: verdict + headline weakness
-  target:                          # o que está sendo desafiado (cite verbatim ou ref)
-    - { ref, claim_or_decision }
-  unverified_premises:             # asseridas como verdade, não verificadas
-    - { premise, why_load_bearing, how_to_verify, severity }
-  alternative_framings:            # framings descartados sem percepção
-    - { alternative, why_plausible, what_changes_if_true }
-  falsifiers:                      # o que precisaria ser verdade pra conclusão estar errada
-    - { claim, falsifier, observable }
-  confidence_gap:                  # confiança asserida > evidência apresentada
-    - { claim, asserted_confidence, evidence_strength, gap }
-  not_checked: [ { area, reason } ]
-  assumptions: [string]            # meta-assumptions do próprio challenge
----
-```
-
-```markdown
-# Challenge Assumptions
-
-Você ataca o raciocínio de uma decisão/plano/análise.
-Sua única saída é um relatório no schema acima.
-Não escreve código. Não decide pelo usuário. Não propõe a "alternativa vencedora".
-
-## NÃO faça
-
-- NÃO faça devil's-advocacy teatral. Cada `alternative_framing` tem que ser **plausivelmente verdadeira sob alguma evidência observável** — não basta ser logicamente possível.
-- NÃO faça bothsidesing. Se a decisão é dominante (uma opção ganha em todos critérios declarados), reporta isso em `summary` e enxuga `alternative_framings`.
-- NÃO transforme `falsifiers` em "what if" hipotético sem constraint real. Falsificador útil é observável e ligado a evidência atual ou futura ("se latência p99 > 200ms, premissa quebra").
-- NÃO desafie a conclusão atacando definição de termos. "Depende do que você chama de Y" é ruído, não challenge.
-- NÃO entre em recursão — desafiar o próprio challenge até nada ser acionável. Um nível de dúvida.
-- NÃO produza lista longa de premissas triviais (`assume HTTP funciona`). Premissa vai pra `unverified_premises` só se for **load-bearing** (conclusão muda se ela for falsa).
-- NÃO recomende a alternativa. Só exponha que ela existe e o que mudaria.
-
-## Faça
-
-- Cite o `target` verbatim ou com ref (`file:line`, mensagem específica). Sem isso, virou crítica genérica.
-- Para `unverified_premises`: explique **por que load-bearing** — qual passo do raciocínio cai se ela for falsa.
-- Para `alternative_framings`: declare **o que muda** se a alternativa for adotada — escopo, custo, prazo, risco. Alternativa sem consequência é ornamento.
-- Para `falsifiers`: dê observável concreto (métrica, comportamento, evidência futura) que decidiria a questão.
-- Para `confidence_gap`: distinga "asserido com confiança alta" vs "evidência apresentada" — a lacuna é o ponto.
-- Em `summary`, comece com veredicto: "solid reasoning", "load-bearing assumptions", "frame-trapped" (decidiu dentro de framing estreito), "confidence > evidence".
-
-## Critérios de severidade (unverified_premises)
-
-| Severidade | Definição |
-|---|---|
-| `critical` | Premissa cuja falsidade inverte a decisão |
-| `high` | Premissa cuja falsidade muda escopo/custo materialmente |
-| `medium` | Premissa cuja falsidade afeta edge case importante |
-| `low` | Premissa cuja falsidade muda detalhe — quase nunca reportar; vai pra `not_checked` |
-
-## Heurísticas (sinais de raciocínio frágil)
-
-- **Marcadores de intuição** — "obviously", "claramente", "óbvio que", "of course". Sinaliza premissa não examinada.
-- **Confiança assimétrica** — claim forte com evidência fraca ("vai escalar", "é seguro", "usuário vai gostar") sem benchmark/threat model/data.
-- **Opção fantasma** — alternativa óbvia não mencionada. Especialmente: "não fazer nada", "comprar em vez de construir", "matar a feature", "voltar à versão N-1".
-- **"Sempre podemos X depois"** — custo de reversão sendo ignorado. Geralmente não-trivial.
-- **Falácia conjuntiva** — argumento requer N coisas verdadeiras simultaneamente; cada uma ~80%, joint << 80%. Liste os N e multiplique.
-- **Anchor a um framing** — decisão entre A e B quando C existe. Frame-trap.
-- **Sycophancy social** — "todos concordam", "consensus do time" (ver `GROUPTHINK_BIAS.md`). Concordância não é evidência.
-- **Generalização de N=1** — "vimos isso funcionar antes" sem condições controladas.
-
-## Anti-pattern do próprio challenger
-
-Modelo default tende a OU concordar OU produzir contrarianismo barato. Sintomas:
-
-- `alternative_framings` vazio em decisão não-trivial → provavelmente sycophancy.
-- `alternative_framings` com 6+ alternativas, várias implausíveis → contrarian theater.
-- `falsifiers` sem observável (`"se a premissa estiver errada"` ≠ falsificador).
-- `confidence_gap` vazio em raciocínio que usa "obviously" — não checou.
-
-Se o output parece "concordo no geral, mas...", **revise** — provavelmente faltou ataque real.
-
-## Quando NÃO conseguir desafiar
-
-- Target é trivial (decisão sem stake real, escolha estética): retorna `summary` "low-stakes, no challenge warranted" + `not_checked` honesto.
-- Target já vem com análise de alternativas e falsificadores explícitos: spot-check 1-2 itens, retorna `summary` "reasoning robust where checked" + escopo em `not_checked`.
-- Target é fato verificável, não decisão (ex.: "a função X retorna Y"): redirecione — esse é trabalho de `gap-audit` ou leitura direta.
-
-## Exemplo de output mínimo
-
-\`\`\`yaml
-summary: "frame-trapped — decisão entre rewrite e refactor ignora opção 'kill feature'. Duas premissas load-bearing sem evidência."
-target:
-  - ref: "design_doc.md §3 (linha 42-58)"
-    claim_or_decision: "vamos refatorar o módulo de billing em vez de rewrite"
-unverified_premises:
-  - premise: "código atual de billing é >70% reusável"
-    why_load_bearing: "se < 50% reusável, refactor custa mais que rewrite — inverte decisão"
-    how_to_verify: "rodar análise de complexidade ciclomática + identificar dead code"
-    severity: critical
-  - premise: "feature continua relevante nos próximos 18 meses"
-    why_load_bearing: "ambas opções pressupõem que vale o investimento"
-    how_to_verify: "revisar roadmap + churn de billing nos últimos 6 meses"
-    severity: high
-alternative_framings:
-  - alternative: "deprecar feature e migrar usuários pra integração externa (Stripe Billing)"
-    why_plausible: "doc menciona que 80% dos casos de uso já cabem em Stripe nativo"
-    what_changes_if_true: "elimina ambos refactor e rewrite; esforço vira migração + comunicação"
-falsifiers:
-  - claim: "refactor é mais barato que rewrite"
-    falsifier: "se métrica de cobertura de testes < 40%, refactor sem rede de segurança custa mais"
-    observable: "coverage report do módulo billing"
-confidence_gap:
-  - claim: "código é mantível"
-    asserted_confidence: "alta (palavra 'sólido' no doc)"
-    evidence_strength: "nenhuma — sem métrica, sem review citado"
-    gap: "asserção forte sem evidência"
-not_checked:
-  - area: "custo de migração assumindo opção 'deprecar'"
-    reason: "fora do escopo; só sinalizando que opção existe"
-assumptions:
-  - "tratei design_doc.md como completo; pode haver análise em outro lugar não referenciado"
-\`\`\`
-```
-
-**Eval acoplado:** `evals/playbooks/challenge-assumptions/` com fixtures:
-- 3 decisões com framing estreito deliberado (esperado: detector recall de `alternative_framings` ≥ 0.7)
-- 3 decisões com premissa load-bearing semeada (esperado: aparece em `unverified_premises` com severity ≥ high)
-- 2 decisões robustas (alternativas e falsificadores já explícitos) — esperado: `summary` reconhece + `alternative_framings` curto
-- 2 decisões triviais — esperado: retorna "low-stakes" sem inflar output
-
-Métrica anti-contrarian-theater: **`implausible_alternative_rate`** = `alternative_framings` que não passam em revisão humana de plausibilidade / total. Threshold: ≤ 0.15. PR-bloqueante.
+> **Removido do catálogo canônico (2026-06-13).** Meta-playbook anti-frame-trap (auditava cadeia de raciocínio: premissa load-bearing, framing estreito, falácia conjuntiva). Removido junto com `gap-audit` — ver §10. Número da seção preservado como tombstone.
 
 ---
 
@@ -1056,11 +757,9 @@ Sem (5)-(6), o playbook regride silenciosamente quando o prompt do system mudar.
 
 ## 15. Playbooks futuros (candidatos)
 
-Ordem de retorno esperado. Teto recomendado: **6 playbooks total**. Mais que isso o modelo confunde a seleção. **Atual: 5** — dentro do teto. Gatilho de revisão: eval de slash command selection mostra confusão > 5% em sessões recentes → revisitar. Deprecar um playbook ativo exige PR de remoção (já foram `git-hygiene`, `debug`, `refactor`, `explain`, `threat-model`).
+Ordem de retorno esperado. Teto recomendado: **6 playbooks total**. Mais que isso o modelo confunde a seleção. **Atual: 3** — dentro do teto. Gatilho de revisão: eval de slash command selection mostra confusão > 5% em sessões recentes → revisitar. Deprecar um playbook ativo exige PR de remoção (já foram `git-hygiene`, `debug`, `refactor`, `explain`, `threat-model`, `gap-audit`, `challenge-assumptions`).
 
-Atual (5): `code-review`, `security-audit`, `perf-investigate`, `gap-audit`, `challenge-assumptions`. (`git-hygiene` removido em 2026-06-13; `debug`/`refactor`/`explain`/`threat-model` removidos em 2026-06-13 — diagnóstico, refactor, explicação e threat modeling voltam ao modo normal. Ver tombstones §4–§7 e §9.)
-
-Os dois meta-playbooks (`gap-audit`, `challenge-assumptions`) operam sobre input não-código e formam um par complementar: `gap-audit` ataca **artefato** (claim vs evidência), `challenge-assumptions` ataca **raciocínio** (premissa load-bearing, framing estreito, falácia conjuntiva). São primitivas canônicas anti-sycophancy / anti-frame-trap reusáveis (audit de spec, plano, PR description, decisão em chat, threat model com schema unificado).
+Atual (3): `code-review`, `security-audit`, `perf-investigate` — todos read-only, produzindo relatório estruturado; o ganho é **isolamento/compressão de contexto** (exploração cara → resumo destilado). Os meta-playbooks `gap-audit` e `challenge-assumptions` foram removidos em 2026-06-13 ao enxugar o catálogo para esse conjunto; o viés anti-sycophancy que eles ofereciam volta a ser responsabilidade do modo normal (ver tombstones §4–§7, §9, §10–§11).
 
 | Candidato | Quando fazer | Por quê |
 |---|---|---|
@@ -1070,7 +769,7 @@ Os dois meta-playbooks (`gap-audit`, `challenge-assumptions`) operam sobre input
 | `architect` | provavelmente nunca | Vira filosofia; modelo já é bom em design quando contexto é bom |
 | `pair-coding` | nunca | Modo default já é isso |
 
-Princípio: cada playbook novo só entra se **eval mostra que modo normal falha** no workflow. Sem evidência empírica, fica em backlog. Promoção de `perf-investigate` é decisão de design; eval-driven validation segue.
+Princípio: cada playbook novo só entra se **eval mostra que modo normal falha** no workflow. Sem evidência empírica, fica em backlog. O catálogo atual é deliberadamente o conjunto onde **custo de exploração >> custo do resumo** — workflows de edição/coordenação e tarefas pequenas ficam no modo normal.
 
 ---
 
