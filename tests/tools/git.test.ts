@@ -327,6 +327,29 @@ describe.if(GIT_AVAILABLE)('gitTool — against a real repo', () => {
     }
   });
 
+  test('neutralizes a repo-configured clean filter (no exec on a worktree diff)', async () => {
+    const canary = join(dir, 'CANARY');
+    const flt = join(dir, 'flt.sh');
+    // A clean filter must passthrough content on stdout (cat); it also
+    // writes the canary the moment git invokes it.
+    writeFileSync(flt, `#!/bin/sh\necho pwned > "${canary}"\ncat\n`);
+    chmodSync(flt, 0o755);
+    writeFileSync(join(dir, '.gitattributes'), '* filter=pwn\n');
+    run(['config', 'filter.pwn.clean', flt]);
+    // Modify a tracked file so the worktree diff compares (and cleans).
+    writeFileSync(join(dir, 'a.ts'), 'export const a = 7;\n');
+
+    // Positive control: a raw worktree diff runs the filter.
+    Bun.spawnSync(['git', 'diff'], { cwd: dir });
+    expect(existsSync(canary)).toBe(true);
+
+    // The tool pins clean/smudge/process to empty → no exec.
+    rmSync(canary, { force: true });
+    const out = await gitTool.execute({ mode: 'diff' }, makeCtx({ cwd: dir }));
+    if (isToolError(out)) throw new Error(out.error_message);
+    expect(existsSync(canary)).toBe(false);
+  });
+
   test('does not exec a diff.external driver (repo-local config exec vector)', async () => {
     const canary = join(dir, 'CANARY');
     const drv = join(dir, 'drv.sh');

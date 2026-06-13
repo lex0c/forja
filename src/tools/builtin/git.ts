@@ -325,8 +325,9 @@ const captureGit = async (
   gitBin: string,
   spawnEnv: Record<string, string>,
   ctx: ToolContext,
+  hardening: readonly string[] = HARDENING,
 ): Promise<GitCapture | ToolError> => {
-  const innerArgv = [gitBin, ...HARDENING, ...modeArgs];
+  const innerArgv = [gitBin, ...hardening, ...modeArgs];
   const spawnArgv = maybeWrapSandboxArgv({
     ...(ctx.sandboxProfile !== undefined ? { profile: ctx.sandboxProfile } : {}),
     cwd: ctx.cwd,
@@ -397,6 +398,39 @@ const captureGit = async (
   return { output, truncated, exit, stderr };
 };
 
+// Worktree-comparing commands (diff/status and the --name-only
+// pre-flight) run the `.gitattributes`-bound `clean`/`process` FILTER
+// to convert worktree content to repo form — and that filter is a
+// repo-config-backed COMMAND, i.e. attacker-controlled code in an
+// untrusted repo. Neither `--no-textconv` (text-conversion only) nor
+// any wildcard config disables it, so this read-only tool would run
+// repo code before the content gate even sees the file. There is no
+// name-agnostic switch, so enumerate the configured filter drivers and
+// pin each clean/smudge/process to empty (git then treats them as
+// pass-through — no exec). The `git config` read itself runs no filter.
+// Returns the extra `-c key=` flags to prepend to subsequent runs.
+const filterDisableFlags = async (
+  gitBin: string,
+  spawnEnv: Record<string, string>,
+  ctx: ToolContext,
+): Promise<string[]> => {
+  const cap = await captureGit(
+    ['config', '--name-only', '--get-regexp', '^filter\\..*\\.(clean|smudge|process)$'],
+    gitBin,
+    spawnEnv,
+    ctx,
+  );
+  if (isToolError(cap)) return [];
+  const flags: string[] = [];
+  for (const key of cap.output
+    .split('\n')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)) {
+    flags.push('-c', `${key}=`);
+  }
+  return flags;
+};
+
 // For content modes, pre-flight `--name-only`, resolve each emitted
 // file to an absolute path, and refuse (fail-closed) if ANY would not
 // pass a `read_file` policy check — this is what stops pathless/dir
@@ -408,10 +442,11 @@ const gateContentFiles = async (
   gitBin: string,
   spawnEnv: Record<string, string>,
   ctx: ToolContext,
+  hardening: readonly string[],
 ): Promise<ToolError | null> => {
   const noArgs = nameOnlyArgs(args);
   if (noArgs === null) return null;
-  const pre = await captureGit(noArgs, gitBin, spawnEnv, ctx);
+  const pre = await captureGit(noArgs, gitBin, spawnEnv, ctx, hardening);
   if (isToolError(pre)) return null;
   // Truncation FIRST: an overflowed file list means we cannot see every
   // file the real command would emit → fail closed rather than gate a
@@ -436,7 +471,13 @@ const gateContentFiles = async (
   // git --name-only paths are repo-root-relative; resolve against the
   // repo root so the policy check sees the same absolute path read_file
   // would. Fall back to cwd if rev-parse fails.
-  const rootCap = await captureGit(['rev-parse', '--show-toplevel'], gitBin, spawnEnv, ctx);
+  const rootCap = await captureGit(
+    ['rev-parse', '--show-toplevel'],
+    gitBin,
+    spawnEnv,
+    ctx,
+    hardening,
+  );
   const repoRoot = !isToolError(rootCap) && rootCap.exit === 0 ? rootCap.output.trim() : ctx.cwd;
   const denied = files.filter((f) => !ctx.permissions.canReadPath(resolve(repoRoot, f)));
   if (denied.length === 0) return null;
@@ -514,11 +555,18 @@ export const gitTool: Tool<GitInput, GitOutput> = {
       ...(ctx.sandboxTmpdir !== undefined ? { TMPDIR: ctx.sandboxTmpdir } : {}),
     };
 
+    // Neutralize any repo-configured clean/smudge/process filter before
+    // any worktree-comparing command runs (diff/status + the gate's
+    // pre-flight clean the worktree, executing the filter command).
+    // Extend the hardening prefix used by every subsequent run.
+    const filterFlags = await filterDisableFlags(gitBin, spawnEnv, ctx);
+    const hardening = filterFlags.length > 0 ? [...HARDENING, ...filterFlags] : HARDENING;
+
     // Content-emitting modes: refuse if the command would emit any file
     // the policy denies reading (prevents the diff/show body from
     // leaking denied descendants under an allowed root).
     if (CONTENT_MODES.has(args.mode)) {
-      const denied = await gateContentFiles(args, gitBin, spawnEnv, ctx);
+      const denied = await gateContentFiles(args, gitBin, spawnEnv, ctx, hardening);
       if (denied !== null) return denied;
     }
 
@@ -529,7 +577,7 @@ export const gitTool: Tool<GitInput, GitOutput> = {
       return toolError(ERROR_CODES.aborted, 'tool aborted before git', { retryable: true });
     }
 
-    const cap = await captureGit(modeArgs, gitBin, spawnEnv, ctx);
+    const cap = await captureGit(modeArgs, gitBin, spawnEnv, ctx, hardening);
     if (isToolError(cap)) return cap;
     const { output, truncated, exit } = cap;
     const commandLine = `git ${modeArgs.join(' ')}`;

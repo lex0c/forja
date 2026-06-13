@@ -2,6 +2,26 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] git tool: neutralize clean/smudge/process filters before diffing
+
+Review finding (a real exec vector the audit missed): a worktree-comparing
+command — `git diff`/`status` and the content gate's `--name-only` pre-flight —
+runs the `.gitattributes`-bound `clean`/`process` FILTER to convert worktree
+content to repo form, and that filter is a repo-config-backed COMMAND, i.e.
+attacker-controlled code in an untrusted repo. `--no-textconv` only disables
+text-conversion (gitattributes/diff) filters, NOT clean/smudge — verified that
+`git diff --no-ext-diff --no-textconv --name-only -z` still ran the filter
+script. So the read-only tool could run repo code before gateContentFiles even
+saw the file. There is no name-agnostic config switch (the driver name is
+arbitrary; GIT_ATTR_NOSYSTEM / core.attributesFile don't touch in-tree
+`.gitattributes`; only comparing the already-clean INDEX avoids it). Fix:
+enumerate the configured filter drivers (`git config --get-regexp
+'^filter\..*\.(clean|smudge|process)$'` — itself runs no filter) and pin each to
+empty via `-c key=`, so git treats them as pass-through. Those flags extend the
+hardening prefix for every subsequent run this execute makes (captureGit now
+takes the prefix as a param). Behavioral test: a `filter.pwn.clean` canary fires
+on a raw worktree diff (positive control) but not through the tool.
+
 ## [2026-06-13] Engine cleanup: declarative fs-tool traits + a single floor helper
 
 Two refactors (zero behavior change — all 2306 permission tests unchanged),
