@@ -2,6 +2,22 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] Apply playbook tool_restrictions to git
+
+Registering git as a built-in exposed it to playbook `tools[]`, but the subagent
+restriction wrapper only gates tools mapped in `TOOL_RESTRICTION_EXTRACTORS` —
+git was not there, so a playbook declaring `tools: [git]` with
+`tool_restrictions.git.allow_paths: ['src/**']` had a SILENTLY INERT restriction:
+the child could run pathless `git show`/`diff` over any parent-policy-readable
+part of the repo, bypassing the playbook's intended scope. Added git to both
+`TOOL_RESTRICTION_EXTRACTORS` (PATH_EXTRACTOR — its `path` arg is the fence
+target, same shape as grep) and `TOOL_RESTRICTION_SHAPE` (so the loader steers a
+mis-shaped `git.allow` toward `allow_paths`). With this, an explicit `git diff --
+src/a.ts` is gated against the fence and a pathless call is refused (its repo/cwd
+scope exceeds the allow list — checkRestriction's missing-path branch). Test:
+explicit in-fence path passes, out-of-fence refuses, pathless+allow_paths
+refuses.
+
 ## [2026-06-13] Preserve bypass semantics in canReadPath
 
 Review finding against the new content gate: `canReadPath` calls `checkPath`

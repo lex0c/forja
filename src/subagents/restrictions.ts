@@ -245,6 +245,13 @@ export const TOOL_RESTRICTION_SHAPE: Readonly<Record<string, ToolRestrictionShap
   // read_file/grep where this map already gates.
   read_file: 'path',
   grep: 'path',
+  // git diff/show leak file CONTENTS, status/log/ls_files leak repo
+  // metadata. Its `path` is optional like grep's; a playbook fencing
+  // `git.allow_paths: ['src/**']` gates an explicit `-- path`, and a
+  // pathless call (repo/cwd scope) is refused because that scope
+  // exceeds the allow list (see checkRestriction's missing-path
+  // branch). Without this entry the restriction is silently inert.
+  git: 'path',
 };
 
 // Render a refusal as a `ToolResult` error so the child's invoke
@@ -312,6 +319,9 @@ export const TOOL_RESTRICTION_EXTRACTORS: Readonly<Record<string, RestrictionExt
   edit_file: PATH_EXTRACTOR,
   read_file: PATH_EXTRACTOR,
   grep: PATH_EXTRACTOR,
+  // git's `path` arg is the fence target (same shape as grep); a
+  // pathless git call returns null → refused when allow_paths is set.
+  git: PATH_EXTRACTOR,
 };
 
 // Run the relevant restriction check for a tool given its raw

@@ -287,6 +287,23 @@ describe('checkRestriction (tool dispatch hook)', () => {
     expect(v.reason).toContain('does not match');
   });
 
+  test('git rule gates an explicit path; a pathless call with allow_paths is refused', () => {
+    const rules = { git: { allowPaths: ['src/**'] } };
+    // explicit path inside the fence → ok
+    expect(checkRestriction('git', { mode: 'diff', path: 'src/a.ts' }, rules, CWD).ok).toBe(true);
+    // explicit path outside the fence → refuse
+    const outside = checkRestriction('git', { mode: 'diff', path: 'docs/x.md' }, rules, CWD);
+    expect(outside.ok).toBe(false);
+    if (outside.ok) return;
+    expect(outside.reason).toContain('does not match');
+    // pathless content mode + allow_paths → refuse (repo/cwd scope
+    // exceeds the fence — the silent-bypass this finding closed).
+    const pathless = checkRestriction('git', { mode: 'diff' }, rules, CWD);
+    expect(pathless.ok).toBe(false);
+    if (pathless.ok) return;
+    expect(pathless.reason).toContain('without an explicit path');
+  });
+
   test('args missing the expected field falls through to passthrough', () => {
     // `bash` invoked without a `command` arg — restrictions cannot
     // gate on what they cannot see. The underlying tool will
