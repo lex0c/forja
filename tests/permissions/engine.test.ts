@@ -1053,6 +1053,20 @@ describe('engine.check (search tools: glob/grep)', () => {
     expect(v.canReadPath('config/id_rsa')).toBe(false);
   });
 
+  test('view().canReadPath honors bypass mode (allow all but the sensitive floor)', () => {
+    // bypass with NO read_file.allow_paths: a direct checkPath would
+    // default-deny every file, wrongly making the content gate drop
+    // all grep matches / fail git diff. canReadPath must mirror
+    // check()'s bypass semantics instead.
+    const eng = createPermissionEngine(policy({ defaults: { mode: 'bypass' } }), { cwd: CWD });
+    const v = eng.view();
+    expect(v.canReadPath('src/a.ts')).toBe(true);
+    expect(v.canReadPath('anything/else.txt')).toBe(true);
+    // bypass does NOT override the sensitive-path floor
+    expect(v.canReadPath('.env')).toBe(false);
+    expect(v.canReadPath('config/id_rsa')).toBe(false);
+  });
+
   test('view().canReadPath is side-effect-free (no state mutation across probes)', () => {
     const eng = createPermissionEngine(
       policy({ tools: { read_file: { allow_paths: ['./**'] } } }),

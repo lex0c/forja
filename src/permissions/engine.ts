@@ -2458,6 +2458,20 @@ export const createPermissionEngine = (
   // does NOT go through `check()`: no audit row, no approval-seq bump.
   // A clean `allow` (not confirm/deny) is the only "yes".
   const canReadPath = (path: string): boolean => {
+    // `bypass` is handled in check() BEFORE the static path-rule
+    // branch, so calling checkPath directly would miss it: with no
+    // read_file.allow_paths it would default-deny every non-sensitive
+    // file even though the engine allows the tool call under bypass.
+    // Mirror check()'s bypass-read floor — allow everything EXCEPT the
+    // hardcoded protected deny-tier and the sensitive-path floor
+    // (neither is overridable by bypass; an escalate-tier READ passes
+    // through, same as check()).
+    if (mode === 'bypass') {
+      const abs = resolveForProtected(path, cwd);
+      if (classifyProtectedPath({ absPath: abs, op: 'read', home, cwd }) === 'deny') return false;
+      if (matchSensitivePath(abs) !== null || matchSensitivePath(path) !== null) return false;
+      return true;
+    }
     const sectionRules = (policy.tools as unknown as Record<string, unknown>).read_file;
     const decision = checkPath(
       'read_file',

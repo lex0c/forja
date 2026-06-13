@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] Preserve bypass semantics in canReadPath
+
+Review finding against the new content gate: `canReadPath` calls `checkPath`
+directly, but `mode: 'bypass'` is handled in `check()` BEFORE the static
+path-rule branch. So under a normal bypass policy (no `read_file.allow_paths`)
+`canReadPath` default-denied every non-sensitive file — the grep filter dropped
+all matches and `git diff`/`show` failed closed as `git.policy_denied`, even
+though the engine ALLOWS the tool call under bypass. Special-cased bypass in
+canReadPath to mirror check()'s bypass-read floor: allow everything EXCEPT the
+hardcoded protected deny-tier and the sensitive-path floor (neither overridable
+by bypass; an escalate-tier read passes through, same as check()). Test: under
+mode=bypass canReadPath allows arbitrary files but still denies `.env` /
+`id_rsa`.
+
 ## [2026-06-13] Honor exact-file confirm_paths for git (consistency follow-up)
 
 The earlier "preserve exact-file allows/grants for git" fix added the git-only
