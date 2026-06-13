@@ -1135,40 +1135,13 @@ Goal re-injection: a cada 3 steps (review é multi-step)
 Few-shot: 1 exemplo de output schema
 ```
 
-### 13.2 `refactor`
+### 13.2 `refactor` (removido)
 
-```
-Sections:
-  - system + playbook refactor
-  - tool_schemas (write-enabled)
-  - project_context
-  - memory_index
-  - repo_map (eager; refactor precisa de mapa de callers)
-  - [target_file]: arquivo focal
-  - [callers section]: arquivos que importam o target (via grep)
-  - [tests section]
-  - recent_turns
-  - goal re-injection (always)
+> Recipe removida em 2026-06-13 — playbook `refactor` não é mais canônico (ver `PLAYBOOKS.md` §5). Número da subseção preservado como tombstone.
 
-Few-shot: 1 exemplo de plan + applied[] schema
-```
+### 13.3 `debug` (removido)
 
-### 13.3 `debug`
-
-```
-Sections:
-  - system + playbook debug
-  - tool_schemas (full + bash_background pra repro)
-  - project_context
-  - memory_index (filtered: debug refs)
-  - [symptom section]: bug description literal
-  - [repro section]: comandos pra reproduzir (se conhecidos)
-  - [logs section]: bg process output relevante
-  - recent_turns
-  - goal re-injection (sempre — debug é exploratório)
-
-Few-shot: 1 exemplo de hypothesis + verifies_with
-```
+> Recipe removida em 2026-06-13 — playbook `debug` não é mais canônico (ver `PLAYBOOKS.md` §4). Número da subseção preservado como tombstone.
 
 ### 13.4 `security-audit`
 
@@ -1187,49 +1160,13 @@ Sections:
 Few-shot: 1 exemplo de finding com exploit_chain
 ```
 
-### 13.5 `explain`
+### 13.5 `explain` (removido)
 
-```
-Sections:
-  - system + playbook explain (read-only)
-  - tool_schemas (read-only)
-  - project_context
-  - memory_index
-  - repo_map (eager — explain precisa visão estrutural)
-  - [target section]: o que está sendo explicado
-  - recent_turns
+> Recipe removida em 2026-06-13 — playbook `explain` não é mais canônico (ver `PLAYBOOKS.md` §6). Número da subseção preservado como tombstone.
 
-Few-shot: 1 exemplo de output estruturado (overview + flow + gotchas)
-```
+### 13.6 `threat-model` (removido)
 
-### 13.6 `threat-model`
-
-```
-Sections:
-  - system + playbook threat-model (read-only, proativo)
-  - tool_schemas (read-only + tools simbólicas — code_graph é load-bearing
-    pra walk de entry points e trust boundaries)
-  - project_context
-  - memory_index (filtered: security + architecture + reference)
-  - repo_map (eager — STRIDE walk precisa visão completa do design surface)
-  - [diff section]: git diff vs base se mudança é sobre PR de feature/design
-  - [security_refs]: SECURITY_GUIDELINE.md + THREAT_MODELING.md excerpts injetados
-    quando trust boundary identificada (lazy via reference resolution)
-  - recent_turns
-  - goal re-injection (a cada 4 steps — STRIDE é sistemático e multi-categoria;
-    fácil perder track de quais categorias já foram cobertas)
-
-Few-shot: 1 exemplo de threat completo (id + category + target + attack +
-          severity + mitigation com residual_risk declarado)
-
-Notas:
-- Sem [callers section]: trust boundaries vêm de design + code_graph entry points,
-  não de quem chama o quê. Callers seria ruído.
-- Memory filter inclui 'reference' pra capturar links pra docs de threat modeling
-  externas (OWASP, MITRE, CWE) que o user já registrou.
-- Goal canônico injetado: "STRIDE coverage; threats com residual_risk; assumptions
-  declaradas" — a cada 4 steps.
-```
+> Recipe removida em 2026-06-13 — playbook `threat-model` não é mais canônico (ver `PLAYBOOKS.md` §7). Número da subseção preservado como tombstone.
 
 ### 13.7 `perf-investigate`
 
@@ -1293,8 +1230,8 @@ Padrão **opt-in** onde o modelo emite reflexão estruturada no fim de cada step
 
 | Modo | Output emitido no fim de cada step | Tokens output/step | Quando usar |
 |---|---|---|---|
-| `off` | nada | 0 | refactor, code-review, perf, threat-model, security-audit, gap-audit |
-| `terse` | 1 linha: `next: <descrição curta>` | ~15-30 | debug, explain (default) |
+| `off` | nada | 0 | code-review, perf, security-audit, gap-audit |
+| `terse` | 1 linha: `next: <descrição curta>` | ~15-30 | challenge-assumptions; sessão exploratória (default) |
 | `full` | 3 linhas: `just_did:` / `why_advances_goal:` / `next_step_planned:` | ~80-120 | opt-in raro; sessão exploratória crítica onde trace é artefato entregável |
 
 #### 13.10.2 Format canônico
@@ -1345,7 +1282,7 @@ Determinístico — projeção do recap (`RECAP.md §3`) pode usar como input en
 #### 13.10.6 Anti-patterns
 
 - **`full` em playbook não-exploratório.** Refactor de 30 steps com `full` = ~3k tokens só de narração; drift detector + decisions[] já cobrem, narração vira ruído.
-- **`terse` em side-effect-heavy workflow.** Refactor não precisa de reflection — ação é o trace.
+- **`terse` em side-effect-heavy workflow.** Um refactor não precisa de reflection — ação é o trace.
 - **Reflection vagueada.** `next: continuar` sem objeto específico viola o ponto. Eval cobre via grep de patterns vagos (`continuar`, `prosseguir`, `seguir adiante` sem nome de arquivo/símbolo).
 - **Re-injetar `full`.** Custo dobrado sem ganho — body já está em recent_turns.
 - **Reflection como substituto de todo_write.** TODOs são plano persistente; reflection é por-step. Misturar = perda de ambos.

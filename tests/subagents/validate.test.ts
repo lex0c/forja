@@ -202,7 +202,7 @@ describe('validateSubagentTools', () => {
   test('isolation: worktree accepts a writes+escapesCwd tool like bash', () => {
     // Regression: a too-broad escapesCwd gate (added in the pin_context
     // rework, then reverted) rejected bash (writes:true, escapesCwd:true)
-    // in worktree subagents, breaking the debug/refactor SEED
+    // in worktree subagents, breaking write-capable SEED
     // playbooks at first-run bootstrap. escapesCwd is the "may touch
     // outside cwd" flag bash/write/edit all carry; worktree isolation is
     // what contains them — it must NOT bar the tool on its own.

@@ -1,5 +1,5 @@
 // Bundled canonical playbooks (`PLAYBOOKS.md` §12 — distribution).
-// The 9 .md files in this directory are imported as text assets
+// The 5 .md files in this directory are imported as text assets
 // and exposed as a stable array. The playbooks step of `agent init`
 // writes each entry into `<cwd>/.agent/agents/`, where the loader
 // picks them up at the next REPL boot.
@@ -19,13 +19,9 @@
 
 import challengeAssumptionsMd from './challenge-assumptions.md' with { type: 'text' };
 import codeReviewMd from './code-review.md' with { type: 'text' };
-import debugMd from './debug.md' with { type: 'text' };
-import explainMd from './explain.md' with { type: 'text' };
 import gapAuditMd from './gap-audit.md' with { type: 'text' };
 import perfInvestigateMd from './perf-investigate.md' with { type: 'text' };
-import refactorMd from './refactor.md' with { type: 'text' };
 import securityAuditMd from './security-audit.md' with { type: 'text' };
-import threatModelMd from './threat-model.md' with { type: 'text' };
 
 export interface CanonicalPlaybook {
   // Filename used at the destination (`<cwd>/.agent/agents/<filename>`).
@@ -45,11 +41,7 @@ export interface CanonicalPlaybook {
 export const CANONICAL_PLAYBOOKS: ReadonlyArray<CanonicalPlaybook> = [
   { filename: 'challenge-assumptions.md', content: challengeAssumptionsMd },
   { filename: 'code-review.md', content: codeReviewMd },
-  { filename: 'debug.md', content: debugMd },
-  { filename: 'explain.md', content: explainMd },
   { filename: 'gap-audit.md', content: gapAuditMd },
   { filename: 'perf-investigate.md', content: perfInvestigateMd },
-  { filename: 'refactor.md', content: refactorMd },
   { filename: 'security-audit.md', content: securityAuditMd },
-  { filename: 'threat-model.md', content: threatModelMd },
 ];

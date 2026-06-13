@@ -529,7 +529,7 @@ describe('runInit — playbooks step', () => {
     // the same `loadSubagentFromString` that the runtime uses.
     const { CANONICAL_PLAYBOOKS } = await import('../../src/cli/init-playbooks/index.ts');
     const { loadSubagentFromString } = await import('../../src/subagents/index.ts');
-    expect(CANONICAL_PLAYBOOKS.length).toBe(9);
+    expect(CANONICAL_PLAYBOOKS.length).toBe(5);
     for (const playbook of CANONICAL_PLAYBOOKS) {
       const def = loadSubagentFromString(
         playbook.content,

@@ -2,6 +2,32 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] Trim the playbook catalog to 5 (drop debug/refactor/explain/threat-model)
+
+Removed four more bundled playbooks — `debug`, `refactor`, `explain`,
+`threat-model` — leaving 5: `code-review`, `security-audit`, `perf-investigate`,
+and the two anti-sycophancy meta-playbooks `gap-audit` / `challenge-assumptions`.
+The four dropped workflows fold back into normal mode (the harness already gives
+hypothesis-driven debugging, scope-bounded edits with checkpoints, read-only
+explanation, and design-time threat reasoning without a dedicated context-isolated
+subagent). The catalog is now **within** the recommended ceiling of 6 — the
+"deliberately above the ceiling" framing in `PLAYBOOKS §15` / `AGENTIC_CLI §11.3`
+is retired.
+
+Code: deleted the four `.md` assets + `index.ts` imports/entries (now 5),
+`evals/playbooks/{debug,refactor,explain,threat-model}/`, and the
+`_routing/02-dispatch-debug.yaml` fixture. Tests: `playbook-fixtures` membership
+asserts + count anchor (9 → 5) and routing count (5 → 4); `init.test`
+`CANONICAL_PLAYBOOKS.length` 9 → 5; `validate.test` comment generalized.
+
+Spec kept in lockstep: `PLAYBOOKS §4–§7` and `CONTEXT_TUNING §13.2/§13.3/§13.5/
+§13.6` become tombstones (numbers preserved — `§6`/`§8`–`§14` are cross-referenced
+from code and other docs); slash enumerations, catalog counts, and the
+reflection-mode table updated. Deliberately left untouched: `RETRIEVAL_WORKFLOWS`
+(`refactor`/`explain`/`debug` are a retrieval ranking taxonomy per `RETRIEVAL.md
+§5.2`, baked into immutable migration 053 — independent of the playbook catalog),
+generic English uses of the words, and synthetic test fixtures named after them.
+
 ## [2026-06-13] Drop `git-hygiene` from the canonical playbook catalog
 
 Removed `git-hygiene` as a bundled playbook: suggesting commit messages /
