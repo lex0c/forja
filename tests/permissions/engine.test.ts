@@ -1028,6 +1028,17 @@ describe('engine.check (search tools: glob/grep)', () => {
     expect(eng.check('git', 'fs.read', { mode: 'blame', path: 'src/a.ts' }).kind).toBe('allow');
   });
 
+  test('git exact-file confirm_paths prompts (does not default-deny)', () => {
+    const eng = createPermissionEngine(
+      policy({ tools: { read_file: { confirm_paths: ['src/a.ts'] } } }),
+      { cwd: CWD },
+    );
+    expect(eng.check('git', 'fs.read', { mode: 'blame', path: 'src/a.ts' }).kind).toBe('confirm');
+    expect(eng.check('git', 'fs.read', { mode: 'diff', path: 'src/a.ts' }).kind).toBe('confirm');
+    // a different exact file with no rule stays default-deny
+    expect(eng.check('git', 'fs.read', { mode: 'blame', path: 'src/b.ts' }).kind).toBe('deny');
+  });
+
   test('view().canReadPath reflects read_file deny_paths + sensitive floor (content-tool gate)', () => {
     const eng = createPermissionEngine(
       policy({ tools: { read_file: { allow_paths: ['./**'], deny_paths: ['secrets/**'] } } }),

@@ -966,7 +966,13 @@ const checkPath = (
       source: { layer, rule: allowed, section: sectionName },
     };
   }
-  const confirm = firstMatchingPath(rules?.confirm_paths, matchTarget, cwd);
+  // Same git-only literal fallback as the allow/grant/session branches
+  // above — so an exact-file `confirm_paths: ['src/a.ts']` prompts for
+  // `git blame -- src/a.ts` instead of default-denying (the synthetic
+  // `src/a.ts/.forja-check` target would miss it).
+  const confirm =
+    firstMatchingPath(rules?.confirm_paths, matchTarget, cwd) ??
+    (toolName === 'git' ? firstMatchingPath(rules?.confirm_paths, path, cwd) : null);
   if (confirm !== null) {
     // acceptEdits accepts edits without confirmation. For writes, a
     // confirm_paths match becomes an auto-allow — that IS the

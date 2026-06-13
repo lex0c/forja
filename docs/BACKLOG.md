@@ -2,6 +2,18 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] Honor exact-file confirm_paths for git (consistency follow-up)
+
+The earlier "preserve exact-file allows/grants for git" fix added the git-only
+literal fallback to the allow / session-allow / grant branches but missed
+`confirm_paths`. So an exact-file `read_file.confirm_paths: ['src/a.ts']` for
+`git blame`/`diff -- src/a.ts` checked only the synthetic `src/a.ts/.forja-check`
+target → no match → default-deny instead of prompting. Added the same
+`toolName === 'git'` literal fallback to the confirm branch so git follows the
+read_file policy consistently across all four match kinds. Test: exact-file
+confirm_paths now yields `confirm` for git blame/diff, while an unruled file
+stays default-deny.
+
 ## [2026-06-13] git tool: scope pathless modes to cwd (`-- .`)
 
 Review finding against the engine's cwd-resolution for pathless git: when the
