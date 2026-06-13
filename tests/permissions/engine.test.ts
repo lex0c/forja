@@ -968,6 +968,41 @@ describe('engine.check (search tools: glob/grep)', () => {
     expect(eng.check('grep', 'fs.read', { pattern: 'foo' }).kind).toBe('deny');
   });
 
+  // `git` is read-only fs access that shares the `read_file` policy
+  // section and (like grep) defaults a pathless call to cwd. These
+  // guard the regression where pathless git modes (status/log/show)
+  // were early-denied with "missing path" before the call could run.
+  test('git pathless modes resolve to cwd and pass under a read_file allow', () => {
+    const eng = createPermissionEngine(
+      policy({ tools: { read_file: { allow_paths: ['./**'] } } }),
+      { cwd: CWD },
+    );
+    expect(eng.check('git', 'fs.read', { mode: 'status' }).kind).toBe('allow');
+    expect(eng.check('git', 'fs.read', { mode: 'log' }).kind).toBe('allow');
+  });
+
+  test('git with a path is checked against the read_file allow_paths', () => {
+    const eng = createPermissionEngine(
+      policy({ tools: { read_file: { allow_paths: ['src/**'] } } }),
+      { cwd: CWD },
+    );
+    expect(eng.check('git', 'fs.read', { mode: 'log', path: 'src' }).kind).toBe('allow');
+    expect(eng.check('git', 'fs.read', { mode: 'log', path: 'docs' }).kind).toBe('deny');
+  });
+
+  test('git rooted at a read_file deny_paths dir is rejected (literal match)', () => {
+    const eng = createPermissionEngine(
+      policy({ tools: { read_file: { allow_paths: ['**'], deny_paths: ['secrets'] } } }),
+      { cwd: CWD },
+    );
+    expect(eng.check('git', 'fs.read', { mode: 'diff', path: 'secrets' }).kind).toBe('deny');
+  });
+
+  test('git default-denies when read_file has no allow_paths (parity with grep/glob)', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    expect(eng.check('git', 'fs.read', { mode: 'status' }).kind).toBe('deny');
+  });
+
   test('glob with non-string cwd is denied (does not crash on path.resolve)', () => {
     const eng = createPermissionEngine(
       policy({ tools: { glob: { allow_paths: ['./**'], deny_paths: ['secrets'] } } }),

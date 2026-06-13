@@ -1,5 +1,5 @@
 import { maybeWrapSandboxArgv } from '../../permissions/index.ts';
-import { scrubEnv } from '../../sanitize/env.ts';
+import { getGitBinaryWithEnv } from '../../subagents/git-binary.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 
 // Read-only, structured git access. A normal builtin offered to
@@ -167,18 +167,20 @@ export const buildModeArgs = (args: GitInput): { args: string[] } | { error: str
   }
 };
 
-// Env for the spawned git: scrubbed (no operator/provider secrets
-// reach the subprocess — same contract as grep), plus a few
-// read-only / non-interactive guards. `--no-pager` is already in the
-// argv; `GIT_PAGER=cat` is belt-and-suspenders. Optional sandbox
-// TMPDIR overlaid after the scrub, as elsewhere.
-export const buildGitSpawnEnv = (sandboxTmpdir: string | undefined): Record<string, string> => ({
-  ...scrubEnv(process.env),
+// Extra env overlaid on top of `safeGitEnv()` for this read-only
+// path. `safeGitEnv()` is the controlled baseline the whole codebase
+// uses for git subprocesses — crucially it builds a fresh allowlist
+// (LC_ALL/PATH/HOME/GIT_TERMINAL_PROMPT) rather than inheriting
+// `process.env`, so repository-selection vars (GIT_DIR, GIT_WORK_TREE,
+// GIT_INDEX_FILE, GIT_OBJECT_DIRECTORY, …) cannot redirect this
+// supposedly cwd-scoped tool at a repo/index outside `ctx.cwd`. We add
+// pager/lock guards; `GIT_LITERAL_PATHSPECS` disables pathspec magic
+// at the env level as defense-in-depth behind the leading-`:` reject.
+const EXTRA_GIT_ENV: Record<string, string> = {
   GIT_PAGER: 'cat',
   GIT_OPTIONAL_LOCKS: '0',
-  GIT_TERMINAL_PROMPT: '0',
-  ...(sandboxTmpdir !== undefined ? { TMPDIR: sandboxTmpdir } : {}),
-});
+  GIT_LITERAL_PATHSPECS: '1',
+};
 
 export const gitTool: Tool<GitInput, GitOutput> = {
   name: 'git',
@@ -235,7 +237,18 @@ export const gitTool: Tool<GitInput, GitOutput> = {
       return toolError(ERROR_CODES.invalidArg, built.error);
     }
     const modeArgs = built.args;
-    const innerArgv = ['git', ...HARDENING, ...modeArgs];
+    // Pin git to an absolute path resolved via the canonical SAFE_PATH
+    // (anti mid-session PATH-shadowing) and pair it with `safeGitEnv()`
+    // — the same hardened binary+env the worktree/checkpoint git
+    // callers use. Resolve binary FIRST so the env carries the right
+    // PATH (see git-binary.ts ordering note).
+    const { git: gitBin, env: gitEnv } = await getGitBinaryWithEnv();
+    const innerArgv = [gitBin, ...HARDENING, ...modeArgs];
+    const spawnEnv: Record<string, string> = {
+      ...gitEnv,
+      ...EXTRA_GIT_ENV,
+      ...(ctx.sandboxTmpdir !== undefined ? { TMPDIR: ctx.sandboxTmpdir } : {}),
+    };
 
     const spawnArgv = maybeWrapSandboxArgv({
       ...(ctx.sandboxProfile !== undefined ? { profile: ctx.sandboxProfile } : {}),
@@ -251,7 +264,7 @@ export const gitTool: Tool<GitInput, GitOutput> = {
         stdout: 'pipe',
         stderr: 'pipe',
         cwd: ctx.cwd,
-        env: buildGitSpawnEnv(ctx.sandboxTmpdir),
+        env: spawnEnv,
         // biome-ignore lint/suspicious/noExplicitAny: Bun's spawn typing for `signal` is too narrow
         ...({ signal: ctx.signal } as any),
       });

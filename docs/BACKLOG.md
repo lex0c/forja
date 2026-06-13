@@ -2,6 +2,34 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] Fix git tool: policy gate for pathless modes + repo-env scrub
+
+Two review findings on the new `git` tool, both real:
+
+1. **Pathless modes were policy-denied.** Registered as `fs.read`, every git
+   call goes through `checkPath` → `resolveFsTarget` before execute. Only
+   grep/glob defaulted an omitted path to cwd; git fell to `filePathOf`, which
+   returns null for `status`/`log`/`show`/`ls_files`/bare `diff`, and checkPath
+   denies on null. So the advertised pathless calls were rejected before running.
+   The tool's own tests called `execute` directly and never crossed the gate, so
+   it slipped. Fix: integrate git into the engine like a search tool — it now
+   *shares the `read_file` policy section* (`policySectionFor`, the way the bash
+   family shares `tools.bash`), defaults a pathless target to cwd
+   (`resolveFsTarget`), counts as a search tool for deny-root matching
+   (`isSearchTool`), and has a `read-fs` resolver (`resolvers/fs.ts`, mirroring
+   grep) so the resolver gate stops forcing a conservative confirm. Net: git is
+   allowed wherever `read_file` is. Added engine tests that cross the gate.
+
+2. **Repo-selection env vars could redirect it outside cwd.** The spawn used
+   `scrubEnv(process.env)`, which preserves `GIT_DIR`/`GIT_WORK_TREE`/
+   `GIT_INDEX_FILE` — so a `escapesCwd: false` tool could be pointed at a repo or
+   index outside `ctx.cwd`. Switched to the existing `getGitBinaryWithEnv()`:
+   `safeGitEnv()` builds a fresh allowlist (no inherited `GIT_*`), and the git
+   binary is pinned to an absolute canonical path (anti mid-session PATH
+   shadowing) — the same hardening the worktree/checkpoint git callers use. Also
+   set `GIT_LITERAL_PATHSPECS=1` as env-level defense behind the leading-`:`
+   reject.
+
 ## [2026-06-13] Give `code-review` and `security-audit` the read-only `git` tool
 
 Both playbooks review **changes** but their toolset (`read_file`/`grep`/`glob`)

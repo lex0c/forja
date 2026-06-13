@@ -495,6 +495,14 @@ const resolveFsTarget = (toolName: string, args: ToolArgs, cwd: string): string 
     if (args.path === undefined) return cwd;
     return isNonEmptyString(args.path) ? args.path : null;
   }
+  // `git` reads the repo: pathless modes (status/log/show/ls_files,
+  // bare diff) target the session cwd, exactly like `grep` with no
+  // `path`. Without this, `filePathOf` returns null for those modes
+  // and `checkPath` rejects every advertised pathless git call.
+  if (toolName === 'git') {
+    if (args.path === undefined) return cwd;
+    return isNonEmptyString(args.path) ? args.path : null;
+  }
   return filePathOf(args);
 };
 
@@ -745,7 +753,8 @@ const checkBash = (
 // rule is unusable for search tools.
 const SYNTHETIC_DESCENDANT = '.forja-check';
 
-const isSearchTool = (toolName: string): boolean => toolName === 'grep' || toolName === 'glob';
+const isSearchTool = (toolName: string): boolean =>
+  toolName === 'grep' || toolName === 'glob' || toolName === 'git';
 
 const matchTargetForRules = (toolName: string, path: string): string =>
   isSearchTool(toolName) ? `${path}/${SYNTHETIC_DESCENDANT}` : path;
@@ -1067,6 +1076,12 @@ const policySectionFor = (
 ): keyof PolicyToolsSection | undefined => {
   if (category === 'bash') return 'bash';
   if (category === 'misc') return undefined;
+  // `git` is read-only fs access; it shares the `read_file` policy
+  // section (the bash family shares `tools.bash` the same way). An
+  // operator who grants file reads thereby governs git's reads with
+  // one allow/deny list, and git works out-of-box wherever read_file
+  // does — no separate `tools.git` section to forget.
+  if (toolName === 'git') return 'read_file';
   // fs.read / fs.write / web.fetch — section key is the literal
   // tool name. The cast asserts the tool's name is a known section
   // key; tools that aren't surface a clean default-deny via
