@@ -408,19 +408,34 @@ const captureGit = async (
 // name-agnostic switch, so enumerate the configured filter drivers and
 // pin each clean/smudge/process to empty (git then treats them as
 // pass-through — no exec). The `git config` read itself runs no filter.
-// Returns the extra `-c key=` flags to prepend to subsequent runs.
+// Returns the extra `-c key=` flags to prepend to subsequent runs, OR
+// `null` when the enumeration could not be trusted to be COMPLETE — a
+// truncated key list (a hostile repo with > a capful of filter entries
+// could push the active driver past the cap) or an unexpected read
+// failure. The caller MUST fail closed on null: a partial pin leaves an
+// undisabled clean/process command that a later worktree diff runs.
 const filterDisableFlags = async (
   gitBin: string,
   spawnEnv: Record<string, string>,
   ctx: ToolContext,
-): Promise<string[]> => {
+): Promise<string[] | null> => {
   const cap = await captureGit(
     ['config', '--name-only', '--get-regexp', '^filter\\..*\\.(clean|smudge|process)$'],
     gitBin,
     spawnEnv,
     ctx,
   );
-  if (isToolError(cap)) return [];
+  if (isToolError(cap)) {
+    // git-missing surfaces cleanly on the main run (don't mask it with a
+    // filter message); any other spawn/stream failure is unexpected →
+    // we cannot verify the filter set, so fail closed.
+    return cap.error_code === ERROR_CODES.gitMissing ? [] : null;
+  }
+  // Truncation is the exploitable case: the remaining (unseen) keys may
+  // include the ACTIVE driver, which would then run unpinned. exit 0
+  // (matches) / 1 (no match) / 128 (not a repo) all yield a COMPLETE
+  // key set (empty when none) as long as it wasn't truncated.
+  if (cap.truncated) return null;
   const flags: string[] = [];
   for (const key of cap.output
     .split('\n')
@@ -560,6 +575,13 @@ export const gitTool: Tool<GitInput, GitOutput> = {
     // pre-flight clean the worktree, executing the filter command).
     // Extend the hardening prefix used by every subsequent run.
     const filterFlags = await filterDisableFlags(gitBin, spawnEnv, ctx);
+    if (filterFlags === null) {
+      return toolError(
+        ERROR_CODES.gitDenied,
+        'cannot verify the repo’s git clean/smudge/process filters are disabled (filter-config enumeration was truncated or failed) — refusing rather than risk running a repo-configured filter command',
+        { details: { filter_enumeration: 'unverified' } },
+      );
+    }
     const hardening = filterFlags.length > 0 ? [...HARDENING, ...filterFlags] : HARDENING;
 
     // Content-emitting modes: refuse if the command would emit any file

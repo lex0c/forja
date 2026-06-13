@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { maybeWrapSandboxArgv } from '../../src/permissions/index.ts';
@@ -325,6 +333,20 @@ describe.if(GIT_AVAILABLE)('gitTool — against a real repo', () => {
     } finally {
       rmSync(sub, { recursive: true, force: true });
     }
+  });
+
+  test('fails closed when filter-config enumeration overflows the capture cap', async () => {
+    // A hostile repo with more filter.<name>.clean entries than fit in
+    // the 64 KiB key-list cap: a partial pin could leave the ACTIVE
+    // driver undisabled, so the tool must refuse rather than proceed.
+    const name = 'f'.repeat(150);
+    let cfg = '';
+    for (let i = 0; i < 600; i++) cfg += `[filter "${name}${i}"]\n\tclean = x\n`;
+    appendFileSync(join(dir, '.git', 'config'), cfg);
+    writeFileSync(join(dir, 'a.ts'), 'export const a = 5;\n');
+    const out = await gitTool.execute({ mode: 'diff' }, makeCtx({ cwd: dir }));
+    expect(isToolError(out)).toBe(true);
+    if (isToolError(out)) expect(out.error_code).toBe('git.policy_denied');
   });
 
   test('neutralizes a repo-configured clean filter (no exec on a worktree diff)', async () => {

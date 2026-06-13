@@ -2,6 +2,21 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] git tool: fail closed when filter enumeration is truncated
+
+Follow-up bug in the filter-neutralization fix itself: `filterDisableFlags`
+enumerates `filter.*.(clean|smudge|process)` via captureGit, which caps output at
+64 KiB. A hostile repo with enough filter entries to exceed the cap returned a
+PARTIAL key list, and the caller pinned only those — so the attacker could place
+the ACTIVE driver after the truncated prefix and a later `git diff`/`status`
+would still run its undisabled clean/process command. Now `filterDisableFlags`
+returns `null` on a truncated key list (or any unexpected read failure other than
+git-missing, which the main run surfaces cleanly), and execute hard-refuses
+(`git.policy_denied`) before running anything. Non-truncated reads — exit 0
+(matches) / 1 (none) / 128 (not a repo) — still yield a complete key set, so the
+common path is unchanged. Test: a `.git/config` padded past the cap with filter
+entries makes a worktree diff refuse.
+
 ## [2026-06-13] git tool: neutralize clean/smudge/process filters before diffing
 
 Review finding (a real exec vector the audit missed): a worktree-comparing
