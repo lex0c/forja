@@ -1,6 +1,6 @@
 ---
 name: general-purpose
-description: Open-ended read-only investigation the caller scopes; sweeps files/sources and returns a distilled answer
+description: Open-ended read-only exploration the caller scopes — explore/locate/map/trace across files, history, and docs; returns a distilled answer
 tools:
   - read_file
   - grep
@@ -14,7 +14,7 @@ budget:
   max_cost_usd: 1.5
   max_wall_clock_ms: 600000
 slash: explore
-when_to_use: "open-ended exploration/research/search the caller defines itself (no specialized playbook fits); when the cost of exploration exceeds the cost of the summary and the parent context should stay clean"
+when_to_use: "open-ended exploration / research / search / discovery the caller scopes itself — explore a subsystem, locate call sites, map how something works, trace history, cross-read docs (no specialized playbook fits); when exploration cost exceeds summary cost and the parent context should stay clean"
 sampling:
   max_tokens: 8192
   thinking_budget: 4096
