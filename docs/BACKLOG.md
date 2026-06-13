@@ -2,6 +2,24 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] Engine cleanup: declarative fs-tool traits + a single floor helper
+
+Two refactors (zero behavior change — all 2306 permission tests unchanged),
+removing smells the git work introduced:
+
+1. The 7 `toolName === 'git'` (and the grep/glob name-matches) scattered across
+   resolveFsTarget / isSearchTool / the allow-side literal fallback /
+   policySectionFor are now ONE declarative map, `FS_TOOL_TRAITS`: each fs tool
+   declares its `rootArg` (search-root arg → marks it a search tool), whether it
+   `exactFileAllow`s (literal-path match on the allow side, git only), and an
+   optional shared `section` (git → read_file). The engine consults traits, not
+   tool names — no more security-critical string-matching of one tool in six
+   places, and a future fs tool is one map entry.
+2. The protected-zone + sensitive-path "floor" computation was duplicated in
+   checkPath, the bypass branch, and canReadPath. Extracted `classifyFloor(path,
+   op)` → `{ absPath, tier, sensitive }`; all three now classify identically, so
+   a change to the floor lands in one place.
+
 ## [2026-06-13] Apply playbook tool_restrictions to git
 
 Registering git as a built-in exposed it to playbook `tools[]`, but the subagent

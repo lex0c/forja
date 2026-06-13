@@ -486,22 +486,40 @@ const filePathOf = (args: ToolArgs): string | null => {
   return null;
 };
 
+// Per-tool fs traits — the single declarative source for "what kind
+// of filesystem tool is this", so the engine consults a trait instead
+// of hard-coding tool names across resolveFsTarget / isSearchTool /
+// the allow-side literal fallback / policySectionFor.
+interface FsToolTraits {
+  // The (optional) arg holding the search ROOT; absent → session cwd.
+  // Having this marks the tool a "search tool": it walks a tree, so
+  // matching uses the synthetic-descendant probe and a pathless call
+  // targets cwd. (grep/git read `path`; glob reads `cwd`.)
+  rootArg?: 'path' | 'cwd';
+  // ALSO test the literal path on the ALLOW side. For single-file
+  // invocations (git blame/diff -- f) an exact-file rule must match;
+  // search tools without this require a `dir/**` form for allows (the
+  // grep/glob "bare-root does not fire" pin).
+  exactFileAllow?: boolean;
+  // Share another tool's policy section (git's reads are governed by
+  // `tools.read_file`).
+  section?: keyof PolicyToolsSection;
+}
+
+const FS_TOOL_TRAITS: Readonly<Record<string, FsToolTraits>> = {
+  glob: { rootArg: 'cwd' },
+  grep: { rootArg: 'path' },
+  git: { rootArg: 'path', exactFileAllow: true, section: 'read_file' },
+};
+
 const resolveFsTarget = (toolName: string, args: ToolArgs, cwd: string): string | null => {
-  if (toolName === 'glob') {
-    if (args.cwd === undefined) return cwd;
-    return isNonEmptyString(args.cwd) ? args.cwd : null;
-  }
-  if (toolName === 'grep') {
-    if (args.path === undefined) return cwd;
-    return isNonEmptyString(args.path) ? args.path : null;
-  }
-  // `git` reads the repo: pathless modes (status/log/show/ls_files,
-  // bare diff) target the session cwd, exactly like `grep` with no
-  // `path`. Without this, `filePathOf` returns null for those modes
-  // and `checkPath` rejects every advertised pathless git call.
-  if (toolName === 'git') {
-    if (args.path === undefined) return cwd;
-    return isNonEmptyString(args.path) ? args.path : null;
+  const rootArg = FS_TOOL_TRAITS[toolName]?.rootArg;
+  if (rootArg !== undefined) {
+    // Search tool: a pathless/cwd-less call targets the session cwd;
+    // a present-but-non-string value is structural failure (null).
+    const value = args[rootArg];
+    if (value === undefined) return cwd;
+    return isNonEmptyString(value) ? value : null;
   }
   return filePathOf(args);
 };
@@ -753,8 +771,14 @@ const checkBash = (
 // rule is unusable for search tools.
 const SYNTHETIC_DESCENDANT = '.forja-check';
 
-const isSearchTool = (toolName: string): boolean =>
-  toolName === 'grep' || toolName === 'glob' || toolName === 'git';
+// A search tool walks a tree from a root (declared via `rootArg`),
+// so deny/allow matching uses the synthetic-descendant probe.
+const isSearchTool = (toolName: string): boolean => FS_TOOL_TRAITS[toolName]?.rootArg !== undefined;
+
+// Whether a tool's ALLOW side also tests the literal path (exact-file
+// rules for single-file invocations — git only today).
+const allowsExactFile = (toolName: string): boolean =>
+  FS_TOOL_TRAITS[toolName]?.exactFileAllow === true;
 
 const matchTargetForRules = (toolName: string, path: string): string =>
   isSearchTool(toolName) ? `${path}/${SYNTHETIC_DESCENDANT}` : path;
@@ -791,6 +815,34 @@ const resolveForProtected = (rawPath: string, cwd: string): string => {
   }
 };
 
+// The fs "floor": the hardcoded protected zones (deny/escalate tiers,
+// §11) plus the sensitive-path deny-list (§8.4). Neither is overridable
+// by operator policy OR by `mode=bypass`. Centralized so checkPath, the
+// bypass branch, and canReadPath classify a path identically (a change
+// to the floor lands in ONE place). Symlink-resolves the path first so
+// a symlink into a protected/sensitive target is still caught.
+interface FloorClassification {
+  absPath: string;
+  // null = not protected. `deny` short-circuits; `escalate` is carried
+  // forward (confirm-on-write).
+  tier: ProtectedTier | null;
+  // Matched sensitive pattern, or null. Skipped when tier === 'deny'
+  // (a deny already wins, so the sensitive check would be moot).
+  sensitive: string | null;
+}
+const classifyFloor = (
+  rawPath: string,
+  op: ProtectedOp,
+  cwd: string,
+  home: string,
+): FloorClassification => {
+  const absPath = resolveForProtected(rawPath, cwd);
+  const tier = classifyProtectedPath({ absPath, op, home, cwd });
+  const sensitive =
+    tier === 'deny' ? null : (matchSensitivePath(absPath) ?? matchSensitivePath(rawPath));
+  return { absPath, tier, sensitive };
+};
+
 const checkPath = (
   toolName: string,
   args: ToolArgs,
@@ -824,13 +876,9 @@ const checkPath = (
   // `confirm` (write/delete on a protected path always escalates to
   // confirm at minimum). Reads of escalate-tier paths pass through
   // unchanged.
-  const protectedAbsPath = resolveForProtected(path, cwd);
-  const protectedTier: ProtectedTier | null = classifyProtectedPath({
-    absPath: protectedAbsPath,
-    op: isWrite ? 'write' : 'read',
-    home,
-    cwd,
-  });
+  const floor = classifyFloor(path, isWrite ? 'write' : 'read', cwd, home);
+  const protectedAbsPath = floor.absPath;
+  const protectedTier = floor.tier;
   if (protectedTier === 'deny') {
     return {
       kind: 'deny',
@@ -861,7 +909,7 @@ const checkPath = (
   // by resolveForProtected) AND the operator-supplied path form, so
   // both a request for `~/.ssh/id_rsa` and one for a symlink
   // pointing at it land in the same refuse.
-  const sensitiveMatch = matchSensitivePath(protectedAbsPath) ?? matchSensitivePath(path);
+  const sensitiveMatch = floor.sensitive;
   if (sensitiveMatch !== null) {
     return {
       kind: 'deny',
@@ -904,7 +952,7 @@ const checkPath = (
   // allow, never bypasses a deny.
   const grantMatch =
     firstMatchingGrant(activeGrants, sectionKey, matchTarget, cwd) ??
-    (toolName === 'git' ? firstMatchingGrant(activeGrants, sectionKey, path, cwd) : null);
+    (allowsExactFile(toolName) ? firstMatchingGrant(activeGrants, sectionKey, path, cwd) : null);
   if (grantMatch !== null) {
     if (protectedTier === 'escalate') {
       return {
@@ -930,7 +978,7 @@ const checkPath = (
   // would otherwise fire. Deny already ran above.
   const sessionMatched =
     firstMatchingPath(sessionAllow, matchTarget, cwd) ??
-    (toolName === 'git' ? firstMatchingPath(sessionAllow, path, cwd) : null);
+    (allowsExactFile(toolName) ? firstMatchingPath(sessionAllow, path, cwd) : null);
   if (sessionMatched !== null) {
     if (protectedTier === 'escalate') {
       return {
@@ -949,7 +997,7 @@ const checkPath = (
   }
   const allowed =
     firstMatchingPath(rules?.allow_paths, matchTarget, cwd) ??
-    (toolName === 'git' ? firstMatchingPath(rules?.allow_paths, path, cwd) : null);
+    (allowsExactFile(toolName) ? firstMatchingPath(rules?.allow_paths, path, cwd) : null);
   if (allowed !== null) {
     if (protectedTier === 'escalate') {
       return {
@@ -972,7 +1020,7 @@ const checkPath = (
   // `src/a.ts/.forja-check` target would miss it).
   const confirm =
     firstMatchingPath(rules?.confirm_paths, matchTarget, cwd) ??
-    (toolName === 'git' ? firstMatchingPath(rules?.confirm_paths, path, cwd) : null);
+    (allowsExactFile(toolName) ? firstMatchingPath(rules?.confirm_paths, path, cwd) : null);
   if (confirm !== null) {
     // acceptEdits accepts edits without confirmation. For writes, a
     // confirm_paths match becomes an auto-allow — that IS the
@@ -1098,12 +1146,13 @@ const policySectionFor = (
 ): keyof PolicyToolsSection | undefined => {
   if (category === 'bash') return 'bash';
   if (category === 'misc') return undefined;
-  // `git` is read-only fs access; it shares the `read_file` policy
-  // section (the bash family shares `tools.bash` the same way). An
-  // operator who grants file reads thereby governs git's reads with
-  // one allow/deny list, and git works out-of-box wherever read_file
-  // does — no separate `tools.git` section to forget.
-  if (toolName === 'git') return 'read_file';
+  // A tool may SHARE another's policy section (declared in
+  // FS_TOOL_TRAITS). `git` shares `read_file` — an operator who grants
+  // file reads thereby governs git's reads with one allow/deny list,
+  // and git works out-of-box wherever read_file does (the bash family
+  // shares `tools.bash` the same way).
+  const shared = FS_TOOL_TRAITS[toolName]?.section;
+  if (shared !== undefined) return shared;
   // fs.read / fs.write / web.fetch — section key is the literal
   // tool name. The cast asserts the tool's name is a known section
   // key; tools that aren't surface a clean default-deny via
@@ -2098,8 +2147,9 @@ export const createPermissionEngine = (
         }
         if (cap.scope === null) continue;
         const op: ProtectedOp = cap.kind === 'read-fs' ? 'read' : 'write';
-        const protectedAbsPath = resolveForProtected(cap.scope, cwd);
-        const tier = classifyProtectedPath({ absPath: protectedAbsPath, op, home, cwd });
+        const floor = classifyFloor(cap.scope, op, cwd, home);
+        const protectedAbsPath = floor.absPath;
+        const tier = floor.tier;
         if (tier === 'deny') {
           // First deny wins — short-circuit and refuse outright.
           const decision: Decision = {
@@ -2133,8 +2183,7 @@ export const createPermissionEngine = (
         // path deny list. Operator who set mode=bypass intends to
         // skip CONFIRM prompts and policy matching, NOT to widen
         // access to credentials. These patterns remain a hard floor.
-        const sensitiveBypassMatch =
-          matchSensitivePath(protectedAbsPath) ?? matchSensitivePath(cap.scope);
+        const sensitiveBypassMatch = floor.sensitive;
         if (sensitiveBypassMatch !== null) {
           const decision: Decision = {
             kind: 'deny',
@@ -2467,10 +2516,11 @@ export const createPermissionEngine = (
     // (neither is overridable by bypass; an escalate-tier READ passes
     // through, same as check()).
     if (mode === 'bypass') {
-      const abs = resolveForProtected(path, cwd);
-      if (classifyProtectedPath({ absPath: abs, op: 'read', home, cwd }) === 'deny') return false;
-      if (matchSensitivePath(abs) !== null || matchSensitivePath(path) !== null) return false;
-      return true;
+      // Same floor as check()'s bypass-read: allow everything except a
+      // protected deny-tier and the sensitive-path list (escalate-tier
+      // read passes through).
+      const floor = classifyFloor(path, 'read', cwd, home);
+      return floor.tier !== 'deny' && floor.sensitive === null;
     }
     const sectionRules = (policy.tools as unknown as Record<string, unknown>).read_file;
     const decision = checkPath(
