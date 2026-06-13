@@ -2,6 +2,27 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] Drop `git-hygiene` from the canonical playbook catalog
+
+Removed `git-hygiene` as a bundled playbook: suggesting commit messages /
+branch names / rebase strategy is a read-only, procedure-shaped workflow that
+fits the **skill** model better than a context-isolated subagent — it carries
+no per-call budget/isolation justification and the other git workflows already
+live as skills (`git-bisect-regression`, `git-resolve-conflict`, …). The skill
+port is a separate follow-up (operator decision); this change only retires the
+playbook.
+
+Code: deleted `src/cli/init-playbooks/git-hygiene.md`, its `index.ts` import +
+catalog entry (now 9 bundled), and `evals/playbooks/git-hygiene/`. Tests:
+`playbook-fixtures.test.ts` dropped the `git-hygiene` membership assert and
+relaxed the count anchor 10 → 9.
+
+Spec (operator asked to keep spec in lockstep): catalog references retired in
+`PLAYBOOKS.md`, `AGENTIC_CLI.md §11.3`, `CONTEXT_TUNING.md §13`. Numbered
+sections (`PLAYBOOKS §9`, `CONTEXT_TUNING §13.8`) kept as **tombstones** rather
+than renumbered — `§10`–`§14` are cross-referenced from code comments and other
+docs, so renumbering would cascade; a tombstone keeps every existing ref valid.
+
 ## [2026-06-12] project_context: pointer → eager content (spec §2.0 reversal)
 
 Flipped `[project_context]` from pointer-eager/body-lazy to **eager content,

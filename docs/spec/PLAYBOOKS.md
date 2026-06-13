@@ -1342,193 +1342,15 @@ not_checked:
 
 ---
 
-## 9. Playbook: `git-hygiene`
+## 9. Playbook: `git-hygiene` (removido)
 
-Slash command: `/git-hygiene`. Subagent isolado. Sugere ações de git (commit msg, branch naming, rebase strategy) **sem executar**. User aplica manualmente.
-
-```yaml
----
-name: git-hygiene
-description: Sugestões de commit msg, branch naming, rebase, e cleanup de history (read-only)
-tools:
-  - read_file
-  - grep
-  - glob
-  - bash
-tool_restrictions:
-  bash:
-    allow_patterns:
-      - 'git log *'
-      - 'git diff *'
-      - 'git diff --stat *'
-      - 'git status *'
-      - 'git branch *'
-      - 'git rev-parse *'
-      - 'git show *'
-      - 'git blame *'
-      - 'git ls-files *'
-      - 'git remote *'
-      - 'git tag --list *'
-      - 'git config --get *'
-      - 'wc *'
-budget:
-  max_steps: 12
-  max_cost_usd: 0.30
-references:
-  - COMMIT.md
-  - AGENTS.md
-output_schema:
-  type: object
-  required: [summary, suggestions, assumptions, not_checked]
-  properties:
-    summary: { type: string }
-    branch_assessment:
-      type: object
-      properties:
-        current_branch: string
-        naming_match: { type: boolean }
-        suggested_name: string
-        reason: string
-    suggestions:
-      type: array
-      items:
-        type: object
-        required: [kind, action, command, why]
-        properties:
-          kind: { enum: [commit_message, branch_rename, rebase, squash, split_commit, amend, cleanup_history] }
-          action: string                    # descrição curta do que fazer
-          command:                          # comando(s) literal(is) pro user rodar
-            type: array
-            items: string
-          why: string
-          risk: { enum: [low, medium, high] }
-          reversible: { type: boolean }
-    commit_drafts:
-      type: array
-      items:
-        type: object
-        required: [files, subject, body, follows_convention]
-        properties:
-          files: { type: array, items: string }
-          subject: { type: string, maxLength: 72 }
-          body: string
-          follows_convention: string         # "Title Case verb (repo style)" / "conventional-commits" / etc
-    assumptions: { type: array }
-    not_checked: { type: array }
-slash: git-hygiene
-when_to_use: "branch suja antes de PR; commits a reorganizar; histórico precisa de limpeza (squash, rebase, message rewrite)"
-sampling:
-  temperature: 0.1
-  max_tokens: 2048
-context_recipe:
-  include_repo_map: lazy
-  include_diff: true
-  include_callers: false
-  goal_reinjection_every_n_steps: 6
-  fewshot_count: 1
-  memory_filter: ['feedback', 'reference']  # captura convenção do repo (ex: feedback_commit_style)
-prompt_version: 1
-context_recipe_version: 1
----
-```
-
-# Git Hygiene
-
-Sugere ações de git que melhoram **legibilidade do history** e aderência a convenções do projeto. **Não executa**. Output é shopping list de comandos pro user copiar.
-
-Não cria commit. Não faz push. Não rebase. Não força nada.
-
-## NÃO faça
-
-- Não execute `git commit`, `git push`, `git rebase`, `git reset`, `git restore`, `git tag`, `git checkout` (qualquer comando que muda state). Tool restriction enforça.
-- Não invente convenção; **leia AGENTS.md / CONTRIBUTING.md / git log recente** pra inferir o padrão do projeto.
-- Não sugira "Conventional Commits" se o projeto não usa. Olhe o histórico.
-- Não sugira squash/rebase em commits já push'd a `main` ou branch protegida.
-- Não recomende `--force` push em branches compartilhadas.
-- Não invente issue numbers ou PR refs ("Closes #123") sem evidência.
-- Não declare commit message "perfect" sem ler o diff completo.
-- Não revele credenciais ou secrets que apareçam em git log/diff (raro, mas redactor falhou se aparece).
-
-## Faça
-
-- Inferir convenção do projeto via `git log --oneline -50` antes de sugerir.
-- Convenções comuns conhecidas: Title Case verb (`Create X.md, Update Y.md`), Conventional Commits (`feat:`, `fix:`), Gitmoji, ALL CAPS de 3 chars (`ADD`/`FIX`). Identifique qual e siga.
-- Commit message: subject ≤ 72 chars, imperative mood, sem ponto final (a menos que convenção diga).
-- Body só se mudança não-óbvia; explique **por quê**, não **o quê** (diff já mostra o quê).
-- Branch naming: feature/X, fix/Y, ou padrão do projeto detectado.
-- Rebase só sugerido para commits **locais** (não em remoto compartilhado).
-- Squash apropriado quando há "WIP" / "fix typo" entre commits relacionados.
-
-## Convenções comuns (reconheça-as)
-
-| Padrão | Exemplo | Sinais |
-|---|---|---|
-| Title Case verb | `Create AGENTS.md, Update CONTEXT_TUNING.md` | git log mostra "Create"/"Update" prefix consistente |
-| Conventional Commits | `feat(auth): add password reset` | `feat:`/`fix:`/`chore:` em ≥ 70% dos commits recentes |
-| Gitmoji | `:sparkles: add feature` | emojis em ≥ 50% |
-| Ticket-prefixed | `JIRA-123: fix bug` | matching `[A-Z]+-\\d+:` em ≥ 70% |
-| ALL CAPS verb | `ADD support for X` | `[A-Z]{3,}\\s` prefix consistente |
-| Free-form | sem padrão | inconsistência > 50%; sugira mas não force |
-
-## Heurísticas de detecção de issues
-
-- **Commit msg vago** ("update", "fix bug", "wip"): propor refraseamento.
-- **Commit gigante** (>20 arquivos, lotes não-relacionados): propor split.
-- **Commits encadeados de "fix"**: propor squash.
-- **Branch name genérico** ("test", "tmp", "branch1"): propor rename.
-- **Histórico com WIP/typo no meio**: propor rebase interativo (commits locais apenas).
-- **Body com info que devia estar em PR description**: propor mover.
-
-## Quando NÃO conseguir terminar
-
-Output com suggestions vazia + `not_checked` justificando ("convenção do projeto não detectável; precisa de input humano"). Não invente convenção pra preencher.
-
-## Output
-
-Schema completo. Suggestions vazia é resultado válido (history limpo, convenção seguida — nada a mexer).
-
-`commit_drafts[].follows_convention` cita explicitamente qual convenção foi seguida; vincula ao memory de `feedback_commit_style` quando aplicável.
-
-## Exemplo de output mínimo
-
-```yaml
-summary: |
-  Branch atual segue convenção (feature/*). 3 commits locais não-pushed têm
-  msgs vagas ("wip", "fix typo"); sugiro squash em commit único com msg clara
-  seguindo o padrão "Title Case verb" detectado em git log -50.
-branch_assessment:
-  current_branch: feature/auth-refactor
-  naming_match: true
-  reason: "Padrão feature/<topic> seguido em ≥ 80% das branches recentes"
-suggestions:
-  - kind: squash
-    action: "Squash 3 commits locais ('wip', 'fix typo', 'cleanup') em um único"
-    command:
-      - "git rebase -i HEAD~3"
-      - "# marcar commits 2 e 3 como 'fixup'"
-      - "git commit --amend -m 'Update src/auth.ts, src/auth.test.ts'"
-    why: |
-      Commits intermediários não agregam ao history; squash deixa diff revisável
-      em 1 commit limpo. Seguro pois commits são locais (git rev-parse @{u}
-      mostra que upstream tem só HEAD~3).
-    risk: low
-    reversible: true   # git reflog cobre se errar
-commit_drafts:
-  - files: ["src/auth.ts", "src/auth.test.ts"]
-    subject: "Update src/auth.ts, src/auth.test.ts"
-    body: |
-      Extract validateToken to pure function; preserva semântica observable.
-      8/8 testes passando; nenhum caller afetado (ver code_graph dependents).
-    follows_convention: "Title Case verb (repo style — feedback_commit_style)"
-assumptions:
-  - item: "git rev-parse @{u} confirmou upstream = HEAD~3"
-    why: "Verificou que squash não afeta commits push'd"
-not_checked:
-  - area: "Conventional Commits format"
-    reason: "Repo não usa esse padrão (git log -50 mostra Title Case verb)"
-  - area: "PR description"
-    reason: "Out of scope; gh CLI não está em allow_patterns"
-```
+> **Removido do catálogo canônico (2026-06-13).** Sugerir commit message,
+> branch naming e estratégia de rebase é workflow read-only, em forma de
+> procedimento — encaixa melhor no modelo de **skill** que num subagent com
+> contexto isolado (não há budget/isolation por chamada que justifique o
+> overhead; os demais workflows de git já vivem como skills). O número da seção
+> é preservado como tombstone para não renumerar §10–§16, referenciadas em
+> código e em outros docs.
 
 ---
 
@@ -1891,9 +1713,9 @@ Sem (5)-(6), o playbook regride silenciosamente quando o prompt do system mudar.
 
 ## 15. Playbooks futuros (candidatos)
 
-Ordem de retorno esperado. Teto recomendado: **6 playbooks total**. Mais que isso o modelo confunde a seleção. **Atual: 10** — acima do teto. Decisão deliberada; gatilho de revisão: eval de slash command selection mostra confusão > 5% em sessões recentes → revisitar (deprecar `pair-coding`/`architect` é trivial — não existem; deprecar um dos 10 ativos exige PR de remoção).
+Ordem de retorno esperado. Teto recomendado: **6 playbooks total**. Mais que isso o modelo confunde a seleção. **Atual: 9** — acima do teto. Decisão deliberada; gatilho de revisão: eval de slash command selection mostra confusão > 5% em sessões recentes → revisitar (deprecar `pair-coding`/`architect` é trivial — não existem; deprecar um dos 9 ativos exige PR de remoção, como foi `git-hygiene`).
 
-Atual (10): `code-review`, `security-audit`, `debug`, `refactor`, `explain`, `threat-model`, `perf-investigate`, `git-hygiene`, `gap-audit`, `challenge-assumptions`.
+Atual (9): `code-review`, `security-audit`, `debug`, `refactor`, `explain`, `threat-model`, `perf-investigate`, `gap-audit`, `challenge-assumptions`. (`git-hygiene` removido em 2026-06-13 — melhor servido como skill; ver §9 tombstone.)
 
 Os dois meta-playbooks (`gap-audit`, `challenge-assumptions`) operam sobre input não-código e formam um par complementar: `gap-audit` ataca **artefato** (claim vs evidência), `challenge-assumptions` ataca **raciocínio** (premissa load-bearing, framing estreito, falácia conjuntiva). Trade-off aceito: 2 playbooks acima do teto em troca de primitivas canônicas anti-sycophancy / anti-frame-trap reusáveis (audit de spec, plano, PR description, decisão em chat, threat model com schema unificado).
 
@@ -1905,7 +1727,7 @@ Os dois meta-playbooks (`gap-audit`, `challenge-assumptions`) operam sobre input
 | `architect` | provavelmente nunca | Vira filosofia; modelo já é bom em design quando contexto é bom |
 | `pair-coding` | nunca | Modo default já é isso |
 
-Princípio: cada playbook novo só entra se **eval mostra que modo normal falha** no workflow. Sem evidência empírica, fica em backlog. Promoção dos 3 mais recentes (`threat-model`, `perf-investigate`, `git-hygiene`) é decisão de design; eval-driven validation segue.
+Princípio: cada playbook novo só entra se **eval mostra que modo normal falha** no workflow. Sem evidência empírica, fica em backlog. Promoção de `threat-model` e `perf-investigate` é decisão de design; eval-driven validation segue.
 
 ---
 

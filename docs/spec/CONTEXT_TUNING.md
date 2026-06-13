@@ -1263,39 +1263,11 @@ Notas:
   validada via medição, não leitura".
 ```
 
-### 13.8 `git-hygiene`
+### 13.8 `git-hygiene` (removido)
 
-```
-Sections:
-  - system + playbook git-hygiene (read-only sobre git state)
-  - tool_schemas (read_file + bash com whitelist read-only de git)
-  - project_context
-  - memory_index (filtered: feedback + reference — capturar feedback_commit_style
-    se existir)
-  - [diff section]: git diff (working tree + staged) — load-bearing pra propor
-    commit msg que reflete o que mudou
-  - [git_log_sample]: git log --oneline -50 da branch — pra inferir convenção
-    do projeto (Title Case verb / Conventional Commits / etc); injetado uma vez
-    no primeiro turn, cacheado
-  - recent_turns
-  - goal re-injection (a cada 6 steps — sessão curta; raramente precisa)
-
-Few-shot: 1 exemplo com branch_assessment + suggestions[] com commands literais
-          + commit_drafts seguindo convenção detectada
-
-Notas:
-- Sem repo_map: git-hygiene é sobre history e workflow, não estrutura de código.
-  Override: include_repo_map: lazy (sob demanda se user pedir explicação de
-  porque commit X tocou arquivos Y).
-- include_diff: true é load-bearing — sem diff, commit msg é alucinação.
-- memory_filter prioriza 'feedback' pra capturar `feedback_commit_style` se existir
-  (ver MEMORY.md exemplo: convenção Title Case do repo blablabla é memória deste
-  tipo).
-- Goal canônico injetado: "respeite convenção detectada; não execute; diff é
-  fonte de verdade".
-- Detecção de convenção é cached em `recap_cache` por sessão — não re-detectar
-  a cada turn.
-```
+> Playbook `git-hygiene` removido em 2026-06-13 — melhor servido como skill (ver
+> `PLAYBOOKS.md §9`). A recipe abaixo não é mais normativa. Número da subseção
+> preservado como tombstone para não renumerar §13.9/§13.10.
 
 ### 13.9 Per-recipe override
 
@@ -1321,7 +1293,7 @@ Padrão **opt-in** onde o modelo emite reflexão estruturada no fim de cada step
 
 | Modo | Output emitido no fim de cada step | Tokens output/step | Quando usar |
 |---|---|---|---|
-| `off` | nada | 0 | refactor, code-review, git-hygiene, perf, threat-model, security-audit, gap-audit |
+| `off` | nada | 0 | refactor, code-review, perf, threat-model, security-audit, gap-audit |
 | `terse` | 1 linha: `next: <descrição curta>` | ~15-30 | debug, explain (default) |
 | `full` | 3 linhas: `just_did:` / `why_advances_goal:` / `next_step_planned:` | ~80-120 | opt-in raro; sessão exploratória crítica onde trace é artefato entregável |
 
@@ -1373,7 +1345,7 @@ Determinístico — projeção do recap (`RECAP.md §3`) pode usar como input en
 #### 13.10.6 Anti-patterns
 
 - **`full` em playbook não-exploratório.** Refactor de 30 steps com `full` = ~3k tokens só de narração; drift detector + decisions[] já cobrem, narração vira ruído.
-- **`terse` em side-effect-heavy workflow.** Refactor/git-hygiene não precisam de reflection — ação é o trace.
+- **`terse` em side-effect-heavy workflow.** Refactor não precisa de reflection — ação é o trace.
 - **Reflection vagueada.** `next: continuar` sem objeto específico viola o ponto. Eval cobre via grep de patterns vagos (`continuar`, `prosseguir`, `seguir adiante` sem nome de arquivo/símbolo).
 - **Re-injetar `full`.** Custo dobrado sem ganho — body já está em recent_turns.
 - **Reflection como substituto de todo_write.** TODOs são plano persistente; reflection é por-step. Misturar = perda de ambos.

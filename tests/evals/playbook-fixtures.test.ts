@@ -18,7 +18,7 @@ describe('loadPlaybookFixtures (bundled)', () => {
     // Slice 10 ships exactly one stub per canonical playbook —
     // the count anchors the contract that every bundled
     // playbook has at least one regression entry.
-    expect(fixtures.length).toBeGreaterThanOrEqual(10);
+    expect(fixtures.length).toBeGreaterThanOrEqual(9);
     const playbookNames = new Set(fixtures.map((f) => f.playbook));
     expect(playbookNames).toContain('code-review');
     expect(playbookNames).toContain('security-audit');
@@ -27,7 +27,6 @@ describe('loadPlaybookFixtures (bundled)', () => {
     expect(playbookNames).toContain('explain');
     expect(playbookNames).toContain('threat-model');
     expect(playbookNames).toContain('perf-investigate');
-    expect(playbookNames).toContain('git-hygiene');
     expect(playbookNames).toContain('gap-audit');
     expect(playbookNames).toContain('challenge-assumptions');
   });
