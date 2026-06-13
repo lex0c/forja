@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] git tool: disable rename detection so the gate sees both paths
+
+Review finding against the content gate: with `diff.renames=true` (repo or global
+config), `git diff`/`show --name-only` reports only the rename DESTINATION — so a
+denied `secret.env` renamed+edited into an allowed `src/a.txt` shows the gate
+only `src/a.txt` (allowed), while the real diff prints the old secret content
+through its `--- a/secret.env` lines. Confirmed: with renames on, `--name-only`
+returned only `src/a.txt` and the diff leaked `TOPSECRET=…`; with
+`-c diff.renames=false` it returns BOTH paths. Added that override to HARDENING,
+so a rename decomposes into delete(source)+add(dest) and the pre-flight sees the
+denied source and refuses. `log --follow` is unaffected — it drives its own
+rename detection regardless of the config. Test: a denied secret renamed+edited
+into an allowed path under `diff.renames=true` is refused, not leaked.
+
 ## [2026-06-13] `/perms why git`: support pathless modes + mode/path parsing
 
 Registering gitTool exposed `/perms why git`, but the dry-check arg builder

@@ -96,6 +96,15 @@ const REF_RE = /^[A-Za-z0-9_./~^@{}-]+$/;
 //     via in-tree `.gitattributes` have no config wildcard and rely on
 //     the per-mode `--no-textconv` / `--no-ext-diff` — see the audit
 //     note in BACKLOG.)
+//   - diff.renames=false: with rename detection ON, `--name-only`
+//     reports only the rename DESTINATION, so the content-gate
+//     pre-flight would miss the SOURCE path — a denied `secret.env`
+//     renamed+edited into an allowed `src/a.txt` would leak its old
+//     contents through the real diff's `--- a/secret.env` lines.
+//     Disabling it decomposes a rename into delete(source)+add(dest)
+//     so `--name-only` reports both and the gate sees the source.
+//     (`log --follow` keeps working — it drives its own rename
+//     detection regardless of this config.)
 const HARDENING: readonly string[] = [
   '-c',
   'core.fsmonitor=',
@@ -107,6 +116,8 @@ const HARDENING: readonly string[] = [
   'diff.submodule=short',
   '-c',
   'diff.external=',
+  '-c',
+  'diff.renames=false',
   // Disable color globally here rather than per-mode: `--no-color` is
   // not accepted by every subcommand (`git status` rejects it), but
   // the `-c color.ui=false` override is honored uniformly. Piped

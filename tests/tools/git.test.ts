@@ -234,6 +234,32 @@ describe.if(GIT_AVAILABLE)('gitTool — against a real repo', () => {
     if (isToolError(out)) expect(out.error_code).toBe('git.policy_denied');
   });
 
+  test('rename detection cannot hide a denied source path from the content gate', async () => {
+    // Commit a secret, then rename+edit it into an allowed path with
+    // rename detection ON (the dangerous config). With detection on,
+    // --name-only would report ONLY the destination; the tool forces
+    // diff.renames=false so the gate still sees the denied source.
+    writeFileSync(join(dir, 'secret.env'), 'TOPSECRET=1\n');
+    run(['add', 'secret.env']);
+    run(['commit', '-q', '-m', 'add secret']);
+    run(['mv', 'secret.env', 'keep.txt']);
+    writeFileSync(join(dir, 'keep.txt'), 'TOPSECRET=2\n');
+    run(['add', 'keep.txt']);
+    run(['config', 'diff.renames', 'true']);
+
+    const denyEnv = makeCtx({
+      cwd: dir,
+      permissions: {
+        mode: 'strict',
+        posture: 'supervised',
+        canReadPath: (p) => !p.endsWith('secret.env'),
+      },
+    });
+    const out = await gitTool.execute({ mode: 'diff', staged: true }, denyEnv);
+    expect(isToolError(out)).toBe(true);
+    if (isToolError(out)) expect(out.error_code).toBe('git.policy_denied');
+  });
+
   test('forces short submodule diffs (config diff.submodule=diff cannot inline submodule content)', async () => {
     // A submodule whose tree holds a secret.
     const sub = mkdtempSync(join(tmpdir(), 'forja-sub-'));
