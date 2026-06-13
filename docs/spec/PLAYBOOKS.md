@@ -188,15 +188,10 @@ Slash command: `/review`. Subagent isolado. Não edita nada.
 ---
 name: code-review
 description: Revisa mudanças e reporta findings. Não conserta.
-tools: [read_file, grep, glob, bash]
-tool_restrictions:
-  bash:
-    - "git diff *"
-    - "git log *"
-    - "git show *"
-    - "git blame *"
-    - "rg *"
-    - "cat *"
+tools: [read_file, grep, glob, git]   # `git` (read-only) supersedes the old
+                                      # bash-restricted-to-git approach: same
+                                      # diff/log/show/blame, but writes:false →
+                                      # isolation:none, no worktree, no shell.
 budget:
   max_steps: 25
   max_cost_usd: 0.75
@@ -314,14 +309,8 @@ Slash command: `/audit`. Mindset paranoico, output estruturado por categoria de 
 ---
 name: security-audit
 description: Audita PR/branch/diff em busca de problemas de segurança.
-tools: [read_file, grep, glob, bash]
-tool_restrictions:
-  bash:
-    - "git diff *"
-    - "git log *"
-    - "git show *"
-    - "rg *"
-    - "cat *"
+tools: [read_file, grep, glob, git]   # `git` (read-only) supersedes the old
+                                      # bash-restricted-to-git approach.
 budget:
   max_steps: 40
   max_cost_usd: 1.50

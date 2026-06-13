@@ -2,6 +2,22 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] Give `code-review` and `security-audit` the read-only `git` tool
+
+Both playbooks review **changes** but their toolset (`read_file`/`grep`/`glob`)
+could not obtain the change itself — they depended on the diff arriving in the
+prompt or reconstructing it by reading files. Added `git` so they can
+`git diff`/`git show` the delta directly; `code-review` uses `git blame` to tell
+a regression from pre-existing code, `security-audit` uses the diff to scope the
+fresh attack surface and `log`/`blame` to date an introduced bug. Read-only, so
+both stay `isolation: none`.
+
+This realizes the original spec intent: `PLAYBOOKS §2`/`§3` already restricted a
+`bash` tool to exactly `git diff/log/show/blame` — but the shipped playbooks
+dropped `bash` (writes:true/escapesCwd:true would force a worktree). The `git`
+tool provides that same capability without bash's cost, so the spec §2/§3
+templates now list `git` and drop the bash `tool_restrictions` blocks.
+
 ## [2026-06-13] Add a read-only `git` tool; give it to `general-purpose`
 
 New builtin tool `git` (`src/tools/builtin/git.ts`): structured, read-only git
