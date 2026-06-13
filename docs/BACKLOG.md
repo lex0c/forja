@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] grep: gate denied matches in-loop so they don't consume the cap
+
+The grep policy filter ran AFTER the streaming loop had already counted denied
+matches toward `max_results` and possibly killed rg. So if a denied file owned
+the first `max` hits, grep returned zero allowed matches with `truncated: true`
+even though readable matches existed deeper in the tree — the denied file
+starved the cap. Moved the `canReadPath` gate INTO the loop: a denied match is
+skipped before it counts toward `max` or triggers the kill, so rg keeps scanning
+until `max` READABLE matches accumulate, and `truncated` now honestly means "hit
+the cap of readable hits". Also fixed the existing filter test, which used a
+dotfile (`.env`) that ripgrep skips by default — a vacuous assertion — and now
+uses a non-hidden secret. New test: a denied file with 50 hits + an allowed file
+with 2 under a cap of 3 returns both allowed matches, none denied.
+
 ## [2026-06-13] Preserve exact-file allows/grants for git single-file modes
 
 Regression introduced by adding `git` to `isSearchTool`: search-tool matching

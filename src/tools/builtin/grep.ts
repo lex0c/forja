@@ -211,6 +211,26 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
     const decoder = new TextDecoder();
     let buffer = '';
 
+    // Policy gate, applied DURING the scan (not after): ripgrep was
+    // gated on its search ROOT, but it returns matching LINES from
+    // descendant files which could include a denied secret (`.env`,
+    // `secrets/…`). A denied match must NOT count toward `max` or
+    // trigger the kill — otherwise a denied file owning the first
+    // `max` hits would consume the whole cap and starve readable
+    // matches deeper in the tree (returning 0 with truncated=true).
+    // So we skip denied matches and keep scanning until `max` READABLE
+    // ones accumulate. Per-file decision cached.
+    const readable = new Map<string, boolean>();
+    const canRead = (file: string): boolean => {
+      const abs = isAbsolute(file) ? file : resolve(ctx.cwd, file);
+      let ok = readable.get(abs);
+      if (ok === undefined) {
+        ok = ctx.permissions.canReadPath(abs);
+        readable.set(abs, ok);
+      }
+      return ok;
+    };
+
     try {
       for await (const chunk of proc.stdout as ReadableStream<Uint8Array>) {
         buffer += decoder.decode(chunk, { stream: true });
@@ -220,7 +240,7 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
           const line = buffer.slice(0, newlineIdx);
           buffer = buffer.slice(newlineIdx + 1);
           const m = parseRipgrepLine(line);
-          if (m !== null) {
+          if (m !== null && canRead(m.file)) {
             matches.push(m);
             if (matches.length >= max) {
               truncated = true;
@@ -242,7 +262,7 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
       // Flush any trailing line in the buffer that didn't end with `\n`.
       if (!truncated && buffer.length > 0) {
         const m = parseRipgrepLine(buffer);
-        if (m !== null) matches.push(m);
+        if (m !== null && canRead(m.file)) matches.push(m);
       }
     } catch (e) {
       // for-await on an aborted stream throws; surface as a clean error.
@@ -263,27 +283,12 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
       );
     }
 
-    // Drop matches from files the policy denies reading. ripgrep was
-    // gated on its search ROOT, but it returns matching LINES from
-    // descendant files — which could include a denied secret (`.env`,
-    // `secrets/…`). Gate each match's file the same way `read_file`
-    // would, so grep can't be used to read around deny_paths / the
-    // sensitive-path floor. Per-file decision cached.
-    const readable = new Map<string, boolean>();
-    const filtered = matches.filter((m) => {
-      const abs = isAbsolute(m.file) ? m.file : resolve(ctx.cwd, m.file);
-      let ok = readable.get(abs);
-      if (ok === undefined) {
-        ok = ctx.permissions.canReadPath(abs);
-        readable.set(abs, ok);
-      }
-      return ok;
-    });
-
+    // `matches` already holds only readable hits (gated in-loop), and
+    // `truncated` means we hit `max` READABLE matches — both honest.
     return {
       pattern: args.pattern,
-      matches: filtered,
-      count: filtered.length,
+      matches,
+      count: matches.length,
       truncated,
     };
   },

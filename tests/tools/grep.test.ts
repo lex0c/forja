@@ -40,23 +40,45 @@ describe.if(RG_AVAILABLE)('grepTool (with ripgrep)', () => {
   });
 
   test('drops matches from policy-denied files (no read-around via grep)', async () => {
-    // A secret file matched by the same pattern as an allowed file.
-    writeFileSync(join(dir, '.env'), 'login_token = SECRET\n');
+    // Non-hidden secret file (ripgrep skips dotfiles by default, so a
+    // `.env` would be a vacuous assertion) matched by the same pattern.
+    writeFileSync(join(dir, 'secret.txt'), 'login_token = SECRET\n');
     writeFileSync(join(dir, 'src/c.ts'), 'login();\n');
     const denyEnv = makeCtx({
       cwd: dir,
       permissions: {
         mode: 'strict',
         posture: 'supervised',
-        canReadPath: (p) => !p.endsWith('.env'),
+        canReadPath: (p) => !p.endsWith('secret.txt'),
       },
     });
     const out = await grepTool.execute({ pattern: 'login' }, denyEnv);
     if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
     const files = out.matches.map((m) => m.file);
-    expect(files.some((f) => f.endsWith('.env'))).toBe(false);
+    expect(files.some((f) => f.endsWith('secret.txt'))).toBe(false);
     // allowed files still match
     expect(files.some((f) => f.endsWith('.ts'))).toBe(true);
+  });
+
+  test('denied matches do not consume the cap (readable matches are not starved)', async () => {
+    // A denied file with far more hits than the cap, plus an allowed
+    // file with a couple. Denied hits must NOT count toward max_results
+    // or kill rg, or the allowed matches would be lost.
+    writeFileSync(join(dir, 'secret.txt'), `${Array(50).fill('NEEDLE x').join('\n')}\n`);
+    writeFileSync(join(dir, 'src/keep.ts'), 'NEEDLE one\nNEEDLE two\n');
+    const denyEnv = makeCtx({
+      cwd: dir,
+      permissions: {
+        mode: 'strict',
+        posture: 'supervised',
+        canReadPath: (p) => !p.endsWith('secret.txt'),
+      },
+    });
+    const out = await grepTool.execute({ pattern: 'NEEDLE', max_results: 3 }, denyEnv);
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    const files = out.matches.map((m) => m.file);
+    expect(files.every((f) => !f.endsWith('secret.txt'))).toBe(true);
+    expect(files.filter((f) => f.endsWith('keep.ts')).length).toBe(2);
   });
 
   test('case_insensitive matches "Login"', async () => {
