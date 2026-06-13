@@ -1121,6 +1121,45 @@ describe('/perms why', () => {
     expect(text).toContain('decision: allow');
   });
 
+  test('git without path — and a pathless mode token — are accepted (no missing-path error)', async () => {
+    // git shares the read_file section; its pathless modes resolve to
+    // cwd. `/perms why git` and `/perms why git status` must dry-check,
+    // not report a missing path.
+    const ctx = buildCtx(
+      { defaults: { mode: 'strict' }, tools: { read_file: { allow_paths: ['./**'] } } },
+      [{ name: 'git', category: 'fs.read' }],
+      { defaults: 'project', read_file: 'project' },
+    );
+    for (const argv of [
+      ['why', 'git'],
+      ['why', 'git', 'status'],
+    ]) {
+      const result = await permsCommand.exec(argv, ctx);
+      if (result.kind !== 'ok') {
+        throw new Error(
+          `expected ok for ${argv.join(' ')}: ${result.kind === 'error' ? result.message : result.kind}`,
+        );
+      }
+      expect((result.notes ?? []).join('\n')).toContain('decision: allow');
+    }
+  });
+
+  test('git checks the path, not the mode token', async () => {
+    const ctx = buildCtx(
+      { defaults: { mode: 'strict' }, tools: { read_file: { allow_paths: ['src/**'] } } },
+      [{ name: 'git', category: 'fs.read' }],
+      { defaults: 'project', read_file: 'project' },
+    );
+    // `diff` is consumed as a mode; the path is what gets checked.
+    const allowed = await permsCommand.exec(['why', 'git', 'diff', 'src/foo.ts'], ctx);
+    if (allowed.kind !== 'ok') throw new Error('expected ok');
+    expect((allowed.notes ?? []).join('\n')).toContain('decision: allow');
+    // a path outside the allow → deny (not silently passed as the mode).
+    const denied = await permsCommand.exec(['why', 'git', 'blame', 'docs/x.md'], ctx);
+    if (denied.kind !== 'ok') throw new Error('expected ok render');
+    expect((denied.notes ?? []).join('\n')).toContain('decision: deny');
+  });
+
   test('fetch_url URL rendering', async () => {
     const ctx = buildCtx(
       {

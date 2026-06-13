@@ -21,6 +21,7 @@
 
 import type { Decision, PolicyCategory, ToolArgs } from '../../../permissions/index.ts';
 import { renderPolicy, renderSandbox } from '../../../permissions/render.ts';
+import { GIT_MODES } from '../../../tools/builtin/git.ts';
 import type { SlashCommand } from '../types.ts';
 
 // Re-export for tests + downstream consumers (a few tests still
@@ -55,6 +56,21 @@ const buildDryCheckArgs = (
       };
     }
     return { ok: true, args: { command: rest.join(' ') } };
+  }
+  if (toolName === 'git') {
+    // git: optional [mode] then optional [path]. The engine keys ONLY
+    // on path (a pathless call defaults to cwd), so a bare `/perms why
+    // git` and the pathless modes (status/log/show/ls_files/bare diff)
+    // must be checkable. Consume a leading mode token so
+    // `/perms why git status` is not read as a path named "status".
+    const tokens = rest.length > 0 && GIT_MODES.has(rest[0] as string) ? rest.slice(1) : rest;
+    if (tokens.length > 1) {
+      return {
+        ok: false,
+        error: '/perms why git: takes [mode] [path] (e.g. /perms why git diff src/foo.ts)',
+      };
+    }
+    return { ok: true, args: tokens.length === 1 ? { path: tokens[0] as string } : {} };
   }
   if (category === 'fs.read' || category === 'fs.write') {
     // grep and glob accept an optional search root; everything

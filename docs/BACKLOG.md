@@ -2,6 +2,21 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] `/perms why git`: support pathless modes + mode/path parsing
+
+Registering gitTool exposed `/perms why git`, but the dry-check arg builder
+(`buildDryCheckArgs`) only treated grep/glob as fs.read tools with an optional
+path. So `/perms why git` (and the pathless modes status/log/show/ls_files/bare
+diff this work supports) reported "missing path" — operators couldn't inspect
+why those calls are allowed/denied. Added a git branch that parses `[mode]
+[path]`, both optional: a leading token matching a real git mode is consumed
+(the engine keys only on path, so mode is irrelevant to the decision) so
+`/perms why git status` isn't read as a path named "status", and a bare
+`/perms why git` resolves to the session cwd like grep. Exported `GIT_MODES`
+from the tool as the single source of truth for the mode set. Tests: bare git
+and a pathless mode both dry-check to allow; a real path is checked (allow in
+src/**, deny outside) rather than confused with the mode token.
+
 ## [2026-06-13] git tool: forward the GIT_* hardening into the sandbox wrapper
 
 Review finding: under a sandbox profile, `maybeWrapSandboxArgv` builds the inner

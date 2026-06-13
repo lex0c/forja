@@ -48,7 +48,16 @@ export interface GitOutput {
   exit_code: number;
 }
 
-const MODES: ReadonlySet<string> = new Set(['log', 'show', 'diff', 'blame', 'status', 'ls_files']);
+// The valid `mode` values. Exported so the `/perms why git` dry-check
+// can tell a mode token (`status`) from a path argument.
+export const GIT_MODES: ReadonlySet<string> = new Set([
+  'log',
+  'show',
+  'diff',
+  'blame',
+  'status',
+  'ls_files',
+]);
 
 const DEFAULT_LOG_COUNT = 50;
 const MAX_LOG_COUNT = 1000;
@@ -460,7 +469,7 @@ export const gitTool: Tool<GitInput, GitOutput> = {
     if (ctx.signal.aborted) {
       return toolError(ERROR_CODES.aborted, 'tool aborted before git', { retryable: true });
     }
-    if (typeof args.mode !== 'string' || !MODES.has(args.mode)) {
+    if (typeof args.mode !== 'string' || !GIT_MODES.has(args.mode)) {
       return toolError(
         ERROR_CODES.invalidArg,
         `mode must be one of log/show/diff/blame/status/ls_files (got '${String(args.mode)}')`,
