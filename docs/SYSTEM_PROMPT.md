@@ -19,7 +19,7 @@ Both pipelines:
 - End by hashing the assembled prompt and registering it in `prompt_versions` (AUDIT §1.3.3) — `kind='system'` for the principal, `kind='playbook'` for the subagent.
 - Thread the hash into the harness's `HarnessConfig.systemPromptHash`, which the loop (`src/harness/loop.ts`) stamps on every `messages.prompt_hash` and `tool_calls.prompt_hash` row written during the run.
 
-The two pipelines diverge because their CONSTRAINTS diverge: the principal must surface the entire workflow surface (skills, project pointer, environment, full constraints); the subagent only needs the playbook-specific surface (references, output schema, reflection mode) plus the parallelism affordance hint and an optional memory section.
+The two pipelines diverge because their CONSTRAINTS diverge: the principal must surface the entire workflow surface (skills, project context, environment, full constraints); the subagent only needs the playbook-specific surface (references, output schema, reflection mode) plus the parallelism affordance hint and an optional memory section.
 
 ---
 
@@ -49,7 +49,7 @@ input.systemPrompt                                  ← base (typically empty)
 1. **Identity** — what Forja is, the declarative policy it runs under, verify-before-acting (`CONTEXT_TUNING §1.2`)
 2. **Environment** — cwd, profile, git branch, current date (`§1.3`, `§1.4`)
 3. **Response format** — output surface fixed (`§1.5`)
-4. **Constraints** — the `# Constraints` block: correctness rules + build discipline + security posture + hard-to-reverse confirm + goal-contradictory cancellation (`§1.6` + `SECURITY_GUIDELINE §0.11`)
+4. **Constraints** — the `# Constraints` block: correctness rules + ask-don't-presume (`clarify`) + build discipline + match-surrounding-code + persistence nudges (`pin_context`, `todo_create`/`working_state_update`) + security posture + hard-to-reverse confirm + goal-contradictory cancellation (`§1.6` + `SECURITY_GUIDELINE §0.11`)
 5. **Parallel hint** — surfaces the harness's parallel-tool affordance
 6. **Tool ergonomics** — highest-payoff tool-usage patterns distilled from `TOOL_ERGONOMICS.md`
 7. **Playbook hint** — discovery table + delegation criteria for subagent routing (`PLAYBOOKS §1.4`)
@@ -63,7 +63,7 @@ input.systemPrompt                                  ← base (typically empty)
 The order is **not arbitrary** — it interacts with three things:
 
 - **Cache breakpoints** (`CONTEXT_TUNING §3`). Bootstrap emits TWO segments via `HarnessConfig.systemSegments` (a `string | SystemSegment[]` channel parallel to the canonical `systemPrompt` string):
-  - **`stable` segment** — identity + environment + response format + constraints + tool ergonomics + base systemPrompt + project pointer. This is the most stable region across the REPL session; gets its own `cache_control` marker so it persists when memory rotates.
+  - **`stable` segment** — identity + environment + response format + constraints + tool ergonomics + base systemPrompt + project context. This is the most stable region across the REPL session; gets its own `cache_control` marker so it persists when memory rotates.
   - **`memory` segment** — memory section + skill catalog. The high-churn region (invalidates on `memory_write` and skill palette changes); gets its own `cache_control` marker so a memory write doesn't drop the entire prefix.
   
   `flattenSystemSegments(segments) === systemPrompt` is the invariant — audit hash + non-segment-aware adapters (OpenAI, Google) read the canonical string; Anthropic reads the array. Date stays in the environment block; the per-bootstrap re-evaluation means resume on day N+1 sees `today: N+1` correctly (semantic continuity wins over the marginal cache cost of one extra `cache_creation` per cross-day resume).
@@ -195,7 +195,7 @@ Each composer lives in its own file under `src/cli/`. The file owns the composer
 | `composeWithIdentity` | `identity-prompt.ts` | Role-as-tool marker; what Forja is + declarative policy + verify-before-acting (`§1.2`) |
 | `composeWithEnvironment` | `environment-prompt.ts` | Situational anchor: cwd, profile, git branch, current date (`§1.3`, `§1.4`) |
 | `composeWithResponseFormat` | `response-format.ts` | Output surface (`§1.5`, `ANTI_PATTERNS §1.3`) — no "be concise" tuning |
-| `composeWithConstraints` | `constraints-prompt.ts` | `# Constraints` block (`§1.6`) — correctness + build discipline + security + hard-to-reverse + goal-contradictory cancellation |
+| `composeWithConstraints` | `constraints-prompt.ts` | `# Constraints` block (`§1.6`) — correctness + ask-don't-presume + build discipline + match-surrounding-code + persistence nudges (`pin_context`, `todo_create`/`working_state_update`) + security + hard-to-reverse + goal-contradictory cancellation |
 | `composeWithToolErgonomics` | `tool-ergonomics-prompt.ts` | High-payoff tool patterns distilled from `TOOL_ERGONOMICS.md` |
 | `composeWithPlaybookHint` | `playbook-prompt.ts` | Subagent discovery table + delegation criteria (`PLAYBOOKS §1.4`) |
 | `composeWithProjectContext` | `project-context.ts` | `[project_context]` block (`§2.0`) — eager, trust-gated guide content (AGENTS.md / CLAUDE.md / …) + caveat |
