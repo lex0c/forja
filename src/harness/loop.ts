@@ -78,6 +78,7 @@ import { invokeTool } from './invoke-tool.ts';
 import { MAX_RESUME_MESSAGES } from './resume.ts';
 import { DEFAULT_RETRY, generateWithRetry } from './retry.ts';
 import { type HydrateInfo, SessionContext } from './session-context.ts';
+import { injectStaticGuidance } from './static-guidance.ts';
 import {
   type ExitReason,
   type HarnessConfig,
@@ -2668,6 +2669,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // (appended to the last user message) — max-attention, cache-neutral,
         // alternation-safe (WORKING_STATE.md §5). No-op when the panel is empty.
         injectWorkingStateBlock(reqMessages, workingStateStore.get(sessionId), wsStep);
+        // Static operating guidance sits directly below the working-state panel
+        // at the bottom of [current_turn]. Injected after the panel (so it stays
+        // below) but gated to the primary agent: subagents have no working-state
+        // machinery, so they leave `enableStaticGuidance` off (set only by the
+        // main CLI bootstrap). Unlike the panel this is constant, not no-op'd.
+        if (config.enableStaticGuidance) injectStaticGuidance(reqMessages);
         const req: GenerateRequest = {
           model: config.provider.id,
           messages: reqMessages,

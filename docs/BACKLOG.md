@@ -2,6 +2,42 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] Inject static operating guidance below the working-state panel
+
+Added a constant guidance block — `[workflow_discipline]` (when to return to
+understand/plan, when to clarify, when to mark done, keep the working state
+accurate) and `[engineering_principles]` (high cohesion / low coupling,
+maintainable/robust, follow existing conventions) — appended to the bottom of
+`[current_turn]`, directly below `[working_state]`, in the max-attention zone.
+
+Kept it ARCHITECTURALLY SEPARATE from `formatWorkingState`: that renderer is
+ephemeral, conditional (no-op on an empty panel) and size-elided, so folding the
+guidance into it would make the principles vanish in a session that never
+touched the working-state tool, or get truncated by the byte guard. Instead the
+guidance is a constant, injected unconditionally every step right after
+`injectWorkingStateBlock`. Extracted the shared "append text to the last user
+message, alternation-safe, replace-not-mutate" logic into `turn-append.ts` so
+both injectors reuse one helper (DRY, low coupling). Re-injected per step like
+the working-state panel — current_turn is rebuilt every step anyway, so the only
+added cost is the block's own bytes; the stable cached prefix is untouched.
+
+When the turn tail is a tool_result, the helper now MERGES into the existing
+trailing text block (blank-line separated) instead of pushing a second one: the
+OpenAI/Responses adapter flattens multiple text blocks with `join('')`, so two
+separate blocks would glue the panel's last line straight into the guidance with
+no separator. One merged block is separator-safe across every adapter.
+
+Gated to the PRIMARY agent via a new `HarnessConfig.enableStaticGuidance` (default
+false): subagents have no working-state machinery (the `working_state_update` tool
+isn't in their whitelist and the panel never renders), so guidance that says "keep
+the working state accurate" would address a panel they don't have. The flag is set
+once in cli/bootstrap.ts (the shared one-shot + REPL entry); subagents build their
+config in cli/subagent-child.ts, which bypasses bootstrap, so they leave it off.
+Default-false also keeps programmatic/test runAgent callers byte-identical.
+
+Spec note: WORKING_STATE.md §5 does not yet describe this block — pending a spec
+PR (no spec edit made without explicit request).
+
 ## [2026-06-14] grep: disclose when the read_file content policy hides matches
 
 A strict policy that grants `tools.grep.allow_paths` but NOT the same paths under
