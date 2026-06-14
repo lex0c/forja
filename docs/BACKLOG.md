@@ -2,6 +2,30 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] playbooks: raise code-review + security-audit output cap to 8192, recalibrate cost soft-cap
+
+Live testing surfaced subagents hitting the per-call output cap (`stop_reason:
+max_tokens`) and exiting truncated — the cap is the playbook's `sampling.max_tokens`,
+which the harness forwards as the provider `max_tokens` (`subagent-child.ts`; the
+playbook value overrides the harness `maxOutputTokensPerCall`). Two of the four
+bundled playbooks were still at 4096 (`code-review`, `security-audit`); their
+findings reports are verbose enough to overflow it. Raised both to 8192, matching
+`general-purpose` / `perf-investigate`. Neither declares a `thinking_budget`, so the
+loader's `thinking_budget < max_tokens` cross-check is moot. The `.md` files are
+imported verbatim as text assets by `init-playbooks/index.ts` (no duplicated copy to
+sync); `tests/cli/init.test.ts` + `tests/subagents/canonical-seeds.test.ts` load and
+validate every bundled entry and stay green.
+
+FOLLOW-ON: doubling the output cap roughly doubled per-run cost, so the
+`max_cost_usd` soft-cap (forwarded as `softCostUsd`, the `cost_soft_cap_warn`
+regression signal — `loop.ts:510`) started tripping on legitimate runs ("subagent
+over budget estimate ($0.81 > $0.75)"). That warn has no mute toggle by design
+(`/budget cost off` is the parent's HARD cap, not this; the loader requires a
+positive `max_cost_usd`, so it can't be zeroed in-playbook) — the correct fix is to
+re-estimate, not silence. Recalibrated to track the new token ceiling: code-review
+`0.75 → 1.50`, security-audit `1.50 → 2.50`. Keeps the signal honest (still fires on
+a true cost regression) instead of muting a load-bearing warning.
+
 ## [2026-06-14] git tool: clarify show_file takes a bare ref + separate path
 
 Usability finding from live testing: a model tried `show_file` with

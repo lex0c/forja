@@ -4,11 +4,11 @@ description: Reviews changes and reports findings. Does not fix.
 tools: [read_file, grep, glob, git]
 budget:
   max_steps: 25
-  max_cost_usd: 0.75
+  max_cost_usd: 1.50
 slash: review
 when_to_use: "diff/PR ready for review; code change that needs a quality gate before merge"
 sampling:
-  max_tokens: 4096
+  max_tokens: 8192
 prompt_version: 1
 context_recipe_version: 1
 output_schema:

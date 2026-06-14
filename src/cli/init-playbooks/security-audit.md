@@ -4,11 +4,11 @@ description: Audits a PR/branch/diff for security issues.
 tools: [read_file, grep, glob, git]
 budget:
   max_steps: 40
-  max_cost_usd: 1.50
+  max_cost_usd: 2.50
 slash: audit
 when_to_use: "broad sweep of changed code for threat categories (auth, injection, supply-chain, secrets) with no specific target; pre-deploy or post-sensitive-feature"
 sampling:
-  max_tokens: 4096
+  max_tokens: 8192
 prompt_version: 1
 context_recipe_version: 1
 output_schema:
