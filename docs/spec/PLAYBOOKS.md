@@ -700,17 +700,17 @@ not_checked:
 
 ## 12. Distribuição inicial via `agent init`
 
-Os 10 playbooks canônicos listados em §2-§11 ficam empacotados no binário e são distribuídos via `agent init` (`AGENTIC_CLI.md §2.1`). Em `init` numa árvore sem `.agent/agents/`, cada playbook é copiado pra lá em formato `.md` — o mesmo formato que o loader de subagents lê depois. O scaffold é **idempotente por arquivo**: passos seguintes pulam playbooks já existentes (operador pode ter editado um), e `--force` (ou `--force=playbooks`) sobrescreve cada `.md` mesmo que tenha mudado.
+Os 4 playbooks canônicos da lista `CANONICAL_PLAYBOOKS` (`code-review` §2, `security-audit` §3, `perf-investigate` §8 e `general-purpose` — a instância empacotada do subagent genérico, §15) ficam empacotados no binário e são distribuídos via `agent init` (`AGENTIC_CLI.md §2.1`). As seções §4–§7 e §9–§11 são **tombstones** (playbooks removidos) e NÃO são copiadas. Em `init` numa árvore sem `.agent/agents/`, cada playbook é copiado pra lá em formato `.md` — o mesmo formato que o loader de subagents lê depois. O scaffold é **idempotente por arquivo**: passos seguintes pulam playbooks já existentes (operador pode ter editado um), e `--force` (ou `--force=playbooks`) sobrescreve cada `.md` mesmo que tenha mudado.
 
 Granularidade:
 
 - `agent init` — scaffolda os 4 artefatos do bootstrap (`permissions.yaml`, `.gitignore`, `config.toml`, playbooks) numa só invocação.
 - `agent init --only=playbooks` — re-copia só os playbooks (ex: após `git pull` que trouxe versão nova do binário, ou após apagar `.agent/agents/` manualmente).
-- `agent init --force=playbooks` — sobrescreve os 10 mesmo que o operador tenha editado. Use quando quer descartar customizações e voltar ao baseline canônico.
+- `agent init --force=playbooks` — sobrescreve os 4 mesmo que o operador tenha editado. Use quando quer descartar customizações e voltar ao baseline canônico.
 
-**Customizações continuam disjuntas do scaffold.** Playbooks per-developer ficam em `~/.config/agent/playbooks/`; playbooks per-projeto customizados ficam em `.agent/agents/` mas com nomes que não colidem com os 10 canônicos (o scaffold só toca arquivos cujo `filename` aparece em `src/cli/init-playbooks/index.ts`). Se o operador renomear um canônico (`code-review.md` → `code-review-strict.md`) o original re-aparece no próximo `init` — sintoma esperado; o scaffold não rastreia renames.
+**Customizações continuam disjuntas do scaffold.** Playbooks per-developer ficam em `~/.config/agent/playbooks/`; playbooks per-projeto customizados ficam em `.agent/agents/` mas com nomes que não colidem com os 4 canônicos (o scaffold só toca arquivos cujo `filename` aparece em `src/cli/init-playbooks/index.ts`). Se o operador renomear um canônico (`code-review.md` → `code-review-strict.md`) o original re-aparece no próximo `init` — sintoma esperado; o scaffold não rastreia renames.
 
-**Distribuição vs. discovery.** A discovery de playbook (system prompt injetado, listagem via `/`) lê de `~/.config/agent/playbooks/` + `.agent/agents/` independente de quem escreveu — `agent init` é só o mecanismo que coloca os 10 canônicos no diretório certo na primeira vez. Operador que prefere bootstrap manual pode pular o `--only=playbooks` e copiar à mão.
+**Distribuição vs. discovery.** A discovery de playbook (system prompt injetado, listagem via `/`) lê de `~/.config/agent/playbooks/` + `.agent/agents/` independente de quem escreveu — `agent init` é só o mecanismo que coloca os 4 canônicos no diretório certo na primeira vez. Operador que prefere bootstrap manual pode pular o `--only=playbooks` e copiar à mão.
 
 ---
 

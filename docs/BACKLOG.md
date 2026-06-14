@@ -2,6 +2,19 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] spec(PLAYBOOKS): fix the stale init distribution count (10 → 4)
+
+Doc lockstep. The catalog trim (this branch) brought the bundled set to 4
+(CANONICAL_PLAYBOOKS: code-review §2, security-audit §3, perf-investigate §8,
+general-purpose §15), but §12 "Distribuição inicial via agent init" still said
+"os 10 playbooks canônicos listados em §2-§11" in four places — an operator
+reading it would expect the removed tombstone playbooks (§4–§7, §9–§11) to be
+copied, and it contradicted the 4-entry CANONICAL_PLAYBOOKS. Updated the count to
+4 in all four spots, replaced the §2-§11 range with the actual active sections,
+and noted explicitly that the tombstone sections are NOT copied. §15 already read
+"Atual (4)", now consistent. Spec-only (PT-BR), no code change — the code was
+already at 4.
+
 ## [2026-06-13] /perms why git: preserve the mode token in the dry-check args
 
 Follow-up to the historical-git-paths engine fix. `buildDryCheckArgs` consumed the
