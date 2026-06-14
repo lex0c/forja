@@ -2,6 +2,26 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] git tool: disable REQUIRED filters along with their commands (LFS fix)
+
+Review finding (a real usability break). `filterDisableFlags` pinned each
+`filter.<d>.(clean|smudge|process)` to empty to neutralize the attacker-exec
+vector — but a REQUIRED filter (`filter.<d>.required=true`, which the standard Git
+LFS config sets as `filter.lfs.required=true`) treats an empty/failed filter as a
+FATAL error. So on a dirty LFS-tracked file the empty-pin made `git diff`/`status`
+exit 128 ("clean filter 'lfs' failed") — the tool broke normal LFS repos.
+Empirically reproduced (a `required=true` filter + dirty tracked file → exit 128
+with the command-pins alone; exit 0 once `required=false` is added).
+
+Fix: for every driver disabled, also pin `filter.<d>.required=false` so git
+accepts the (safe, no-exec) passthrough instead of erroring. The driver name is
+derived from each enumerated key (`filter.<name>.<clean|smudge|process>`, name is
+a case-sensitive subsection that may contain dots) and deduped. required=false
+enables no execution — it only changes error handling, so the exec-neutralization
+posture is unchanged; the truncation fail-closed (return null) still precedes the
+loop. Test: an LFS-style required filter + dirty tracked file → diff/status
+succeed (with a positive control asserting the command-pins-alone exit 128).
+
 ## [2026-06-13] permissions: don't require historical git paths to exist in the worktree
 
 Follow-up to show_file. The `isRegularFile` guard added to the git exact-file

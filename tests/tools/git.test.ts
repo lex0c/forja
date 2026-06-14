@@ -659,6 +659,46 @@ describe.if(GIT_AVAILABLE)('gitTool — against a real repo', () => {
     expect(existsSync(canary)).toBe(false);
   });
 
+  test('disables a REQUIRED filter without breaking diff/status (LFS-style required=true)', async () => {
+    // Mimic Git LFS (filter.lfs.required=true): a required filter bound to a
+    // file. Pinning the command to empty ALONE makes git treat the now-empty
+    // REQUIRED filter as a FATAL failure (exit 128) on a dirty tracked file;
+    // the tool must also pin required=false so diff/status still work.
+    writeFileSync(join(dir, '.gitattributes'), '*.bin filter=lfsish\n');
+    run(['config', 'filter.lfsish.clean', 'cat']);
+    run(['config', 'filter.lfsish.smudge', 'cat']);
+    run(['config', 'filter.lfsish.required', 'true']);
+    writeFileSync(join(dir, 'big.bin'), 'v1\n');
+    run(['add', '-A']);
+    run(['commit', '-q', '-m', 'add bin']);
+    writeFileSync(join(dir, 'big.bin'), 'v2-dirty\n'); // dirty the required-filtered file
+
+    // Positive control: pinning the command empty WITHOUT required=false
+    // breaks a worktree diff with exit 128.
+    const broken = Bun.spawnSync(
+      [
+        'git',
+        '-c',
+        'filter.lfsish.clean=',
+        '-c',
+        'filter.lfsish.smudge=',
+        '-c',
+        'filter.lfsish.process=',
+        'diff',
+      ],
+      { cwd: dir },
+    );
+    expect(broken.exitCode).toBe(128);
+
+    // The tool also pins required=false → diff and status succeed.
+    const diff = await gitTool.execute({ mode: 'diff' }, makeCtx({ cwd: dir }));
+    if (isToolError(diff)) throw new Error(diff.error_message);
+    expect(diff.output).toContain('big.bin');
+    const status = await gitTool.execute({ mode: 'status' }, makeCtx({ cwd: dir }));
+    if (isToolError(status)) throw new Error(status.error_message);
+    expect(status.output).toContain('big.bin');
+  });
+
   test('does not exec a diff.external driver (repo-local config exec vector)', async () => {
     const canary = join(dir, 'CANARY');
     const drv = join(dir, 'drv.sh');

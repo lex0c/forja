@@ -533,12 +533,22 @@ const captureGit = async (
 // name-agnostic switch, so enumerate the configured filter drivers and
 // pin each clean/smudge/process to empty (git then treats them as
 // pass-through — no exec). The `git config` read itself runs no filter.
-// Returns the extra `-c key=` flags to prepend to subsequent runs, OR
-// `null` when the enumeration could not be trusted to be COMPLETE — a
-// truncated key list (a hostile repo with > a capful of filter entries
-// could push the active driver past the cap) or an unexpected read
-// failure. The caller MUST fail closed on null: a partial pin leaves an
-// undisabled clean/process command that a later worktree diff runs.
+//
+// A REQUIRED filter (`filter.<d>.required=true` — the standard Git LFS
+// config sets `filter.lfs.required=true`) treats an empty/failed
+// clean/smudge as a FATAL error, so pinning the command to empty alone
+// makes `git diff`/`status` of a dirty LFS-tracked file exit 128 ("clean
+// filter 'lfs' failed") — breaking normal LFS repos. So for every driver
+// we disable we ALSO pin `filter.<d>.required=false`, making git accept
+// the (safe, no-exec) passthrough instead of erroring. required=false
+// enables no execution — it only changes error handling.
+//
+// Returns the extra `-c …` flags to prepend to subsequent runs, OR `null`
+// when the enumeration could not be trusted to be COMPLETE — a truncated
+// key list (a hostile repo with > a capful of filter entries could push
+// the active driver past the cap) or an unexpected read failure. The
+// caller MUST fail closed on null: a partial pin leaves an undisabled
+// clean/process command that a later worktree diff runs.
 const filterDisableFlags = async (
   gitBin: string,
   spawnEnv: Record<string, string>,
@@ -562,11 +572,21 @@ const filterDisableFlags = async (
   // key set (empty when none) as long as it wasn't truncated.
   if (cap.truncated) return null;
   const flags: string[] = [];
+  const drivers = new Set<string>();
   for (const key of cap.output
     .split('\n')
     .map((s) => s.trim())
     .filter((s) => s.length > 0)) {
     flags.push('-c', `${key}=`);
+    // Derive the driver name from `filter.<name>.<clean|smudge|process>`.
+    // `<name>` is a case-sensitive subsection that may itself contain dots
+    // (`filter.my.driver.clean`); strip the `filter.` prefix and the known
+    // suffix. The regex anchored the match, so both are present.
+    const name = key.slice('filter.'.length).replace(/\.(clean|smudge|process)$/, '');
+    if (name.length > 0) drivers.add(name);
+  }
+  for (const name of drivers) {
+    flags.push('-c', `filter.${name}.required=false`);
   }
   return flags;
 };
