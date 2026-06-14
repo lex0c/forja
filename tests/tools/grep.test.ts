@@ -58,6 +58,35 @@ describe.if(RG_AVAILABLE)('grepTool (with ripgrep)', () => {
     expect(files.some((f) => f.endsWith('secret.txt'))).toBe(false);
     // allowed files still match
     expect(files.some((f) => f.endsWith('.ts'))).toBe(true);
+    // The hidden secret.txt match is DISCLOSED, not silently dropped.
+    expect(out.policy_note).toBeDefined();
+    expect(out.policy_note).toContain('read_file');
+  });
+
+  test('an all-hidden grep surfaces policy_note instead of a silent count: 0', async () => {
+    // The finding's case: a policy authorizes the grep CALL (grep section) but
+    // denies the matched content under read_file → every match is gated out.
+    // Without the note the result reads as a bogus "no matches", and the
+    // operator can't tell a real empty search from a policy-hidden one.
+    writeFileSync(join(dir, 'only.txt'), 'login here\n');
+    const denyAll = makeCtx({
+      cwd: dir,
+      permissions: { mode: 'strict', posture: 'supervised', canReadPath: () => false },
+    });
+    const hidden = await grepTool.execute({ pattern: 'login', path: 'only.txt' }, denyAll);
+    if (isToolError(hidden)) throw new Error(`unexpected error: ${hidden.error_message}`);
+    expect(hidden.count).toBe(0);
+    expect(hidden.policy_note).toBeDefined();
+    expect(hidden.policy_note).toContain('read_file');
+
+    // Control: allow-all → real matches, and NO note (nothing was hidden).
+    const allow = await grepTool.execute(
+      { pattern: 'login', path: 'only.txt' },
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(allow)) throw new Error(`unexpected error: ${allow.error_message}`);
+    expect(allow.count).toBeGreaterThan(0);
+    expect(allow.policy_note).toBeUndefined();
   });
 
   test('denied matches do not consume the cap (readable matches are not starved)', async () => {

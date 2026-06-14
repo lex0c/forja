@@ -29,6 +29,17 @@ export interface GrepOutput {
   matches: GrepMatch[];
   count: number;
   truncated: boolean;
+  // Present (only) when the per-match policy gate dropped matches from one or
+  // more files the search covered. grep gates per-match disclosure on the
+  // `read_file` policy (PermissionsView.canReadPath), NOT its own `grep`
+  // section — read_file.allow_paths is the single content-disclosure floor that
+  // every content-emitting tool defers to. So a policy that grants
+  // `tools.grep.allow_paths` but not the same paths under `tools.read_file`
+  // authorizes the grep CALL yet hides every match — without this note that
+  // reads as a bogus `count: 0`. The note states the coupling so the operator
+  // can grant read_file (if the omission was accidental) or recognize the
+  // hidden hits as a deliberate deny / sensitive-floor block.
+  policy_note?: string;
 }
 
 const DEFAULT_MAX = 200;
@@ -207,6 +218,9 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
     // was small. With streaming we stop as soon as we hit `max` matches
     // and kill rg so it stops walking the tree.
     const matches: GrepMatch[] = [];
+    // Distinct files whose matches the policy gate dropped — surfaced as
+    // `policy_note` so an all-hidden result doesn't read as a silent count: 0.
+    const policyHiddenFiles = new Set<string>();
     let truncated = false;
     const decoder = new TextDecoder();
     let buffer = '';
@@ -240,11 +254,15 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
           const line = buffer.slice(0, newlineIdx);
           buffer = buffer.slice(newlineIdx + 1);
           const m = parseRipgrepLine(line);
-          if (m !== null && canRead(m.file)) {
-            matches.push(m);
-            if (matches.length >= max) {
-              truncated = true;
-              break;
+          if (m !== null) {
+            if (canRead(m.file)) {
+              matches.push(m);
+              if (matches.length >= max) {
+                truncated = true;
+                break;
+              }
+            } else {
+              policyHiddenFiles.add(m.file);
             }
           }
           newlineIdx = buffer.indexOf('\n');
@@ -262,7 +280,10 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
       // Flush any trailing line in the buffer that didn't end with `\n`.
       if (!truncated && buffer.length > 0) {
         const m = parseRipgrepLine(buffer);
-        if (m !== null && canRead(m.file)) matches.push(m);
+        if (m !== null) {
+          if (canRead(m.file)) matches.push(m);
+          else policyHiddenFiles.add(m.file);
+        }
       }
     } catch (e) {
       // for-await on an aborted stream throws; surface as a clean error.
@@ -290,6 +311,11 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
       matches,
       count: matches.length,
       truncated,
+      ...(policyHiddenFiles.size > 0
+        ? {
+            policy_note: `${policyHiddenFiles.size} file(s) had matches hidden by the read_file content policy. grep gates per-match disclosure on tools.read_file.allow_paths (the shared content-disclosure floor), NOT the tools.grep section that authorized this call. If results were expected from a grep-allowed path, grant the same path under tools.read_file; otherwise the hidden hits were a deliberate deny / sensitive-floor block.`,
+          }
+        : {}),
     };
   },
 };

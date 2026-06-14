@@ -2,6 +2,27 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] grep: disclose when the read_file content policy hides matches
+
+A strict policy that grants `tools.grep.allow_paths` but NOT the same paths under
+`tools.read_file` authorizes the grep CALL (grep section) yet the per-match gate
+— `ctx.permissions.canReadPath`, wired to the `read_file` section as the shared
+content-disclosure floor — drops every match, so grep returns a silent
+`count: 0`; the operator can't tell a real empty search from a policy-hidden one
+and ends up duplicating grep grants under read_file by trial and error.
+
+Kept the read_file-floor model (the documented design: every content-emitting
+tool defers to read_file so there is ONE disclosure policy; changing grep to its
+own section would make grep able to exceed a deliberately-narrow read_file grant,
+and would have to drag git along for consistency) and instead made the coupling
+EXPLICIT: grep now tracks the distinct files whose matches the gate dropped and,
+when any, returns a `policy_note` stating that disclosure is gated on
+read_file.allow_paths — so the operator grants read_file if the omission was
+accidental, or recognizes the hidden hits as a deliberate deny / sensitive-floor
+block. Neutral wording (the hide can be intentional). Tests: a partial-hide
+surfaces the note; an all-hidden grep returns count: 0 WITH the note; an allow-all
+control has none.
+
 ## [2026-06-14] git tool: scope the fail-closed filter enumeration to worktree modes
 
 `filterDisableFlags` (the clean/smudge neutralizer) ran UNCONDITIONALLY before
