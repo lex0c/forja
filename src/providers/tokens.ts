@@ -28,9 +28,12 @@ const charsInMessage = (m: ProviderMessage): number => {
       chars += block.text.length;
     } else if (block.type === 'tool_use') {
       chars += block.name.length + JSON.stringify(block.input).length;
-    } else {
+    } else if (block.type === 'tool_result') {
       chars += block.content.length + block.tool_use_id.length;
     }
+    // `reasoning` blocks contribute 0: they are not sent on the wire until
+    // replay is enabled (Phase 2/3), so counting them would inflate the
+    // estimate past what the request actually carries.
   }
   return chars;
 };

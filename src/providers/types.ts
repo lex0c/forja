@@ -94,6 +94,12 @@ export interface ProviderCapabilities {
   // provider-effort axis is gated here (best-effort per the
   // "request expresses intent, per-provider follows" convention).
   supports_reasoning_effort?: boolean;
+  // The model accepts the `xhigh` reasoning-effort level (between `high` and
+  // `max`). Narrower than `max`: on Anthropic only Opus 4.7/4.8 expose it, so a
+  // request for `xhigh` is clamped down to `high` when this is false/omitted, to
+  // avoid a 400. OpenAI's reasoning models take `xhigh` natively (it's their top
+  // level), so the OpenAI adapter doesn't consult this flag.
+  supports_effort_xhigh?: boolean;
 
   // Ceiling for the numeric thinking budget (Gemini's
   // `thinkingConfig.thinkingBudget`), in tokens. Gemini 2.5 caps it
@@ -130,6 +136,11 @@ export type StreamEvent =
   | { kind: 'tool_use_delta'; id: string; partial_args: string }
   | { kind: 'tool_use_stop'; id: string; final_args: Record<string, unknown> }
   | { kind: 'thinking_delta'; text: string }
+  // A captured, opaque reasoning artifact for the assistant turn (Anthropic
+  // signed thinking block, OpenAI reasoning item). Emitted by the adapter at
+  // reasoning-block stop; `thinking_delta` stays for live UI (orthogonal).
+  // Collected into the assistant turn so it can be replayed next request.
+  | { kind: 'reasoning'; provider: ProviderFamily; data: unknown }
   | { kind: 'usage'; usage: UsageInfo }
   | { kind: 'stop'; reason: StopReason }
   | { kind: 'error'; code: string; message: string; retryable: boolean };
@@ -162,10 +173,25 @@ export interface ProviderToolResultBlock {
   is_error?: boolean;
 }
 
+// Opaque, provider-specific reasoning state captured on an assistant turn and
+// replayed verbatim on later requests so reasoning persists across tool
+// round-trips (Anthropic thinking+signature, OpenAI reasoning items / codex
+// phase). The harness treats `data` as a black box — only the owning adapter
+// (matched by `provider`) reads it; foreign adapters DROP the block, mirroring
+// the providers' own behavior (reasoning state is model-specific and a block
+// replayed to a different model is dropped anyway). `data` is NEVER
+// canonicalized/normalized — signatures must round-trip byte-identical.
+export interface ProviderReasoningBlock {
+  type: 'reasoning';
+  provider: ProviderFamily;
+  data: unknown;
+}
+
 export type ProviderContentBlock =
   | ProviderTextBlock
   | ProviderToolUseBlock
-  | ProviderToolResultBlock;
+  | ProviderToolResultBlock
+  | ProviderReasoningBlock;
 
 export interface ProviderMessage {
   role: ProviderMessageRole;
@@ -222,10 +248,15 @@ export const flattenSystemSegments = (segments: SystemSegment[]): string =>
 
 // Agnostic reasoning-effort level (TOKEN_TUNING.md §4). One
 // vocabulary the whole stack speaks; each adapter translates it to
-// its native surface (`src/providers/effort.ts`). `max` is the
-// Forja ceiling — providers without a distinct top level map it to
-// theirs (OpenAI `xhigh`; Anthropic has a native `max`).
-export type ProviderEffort = 'low' | 'medium' | 'high' | 'max';
+// its native surface (`src/providers/effort.ts`). Ordered low < medium
+// < high < xhigh < max. `xhigh` is the documented sweet spot for
+// coding/agentic work on the frontier models (the level Claude Code
+// defaults to); `max` is the ceiling. Not every model exposes every
+// level — `xhigh` in particular is narrower than `max` on Anthropic
+// (Opus 4.7/4.8 only), so adapters clamp it down where unsupported
+// (see `supports_effort_xhigh`). OpenAI maps both `xhigh` and `max`
+// onto its native top, `xhigh`.
+export type ProviderEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 export interface GenerateRequest {
   model: string;

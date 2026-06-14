@@ -1,0 +1,41 @@
+name: long-horizon/accumulate-chain
+# Forced long-horizon dependency chain. Each file's `next:` names the next file
+# to read, and the names are unguessable, so the agent can only discover them by
+# following the chain ONE read at a time — ~13 strictly sequential read_file
+# turns that cannot be batched or globbed. Across the whole chain it must carry
+# TWO running accumulators (sum of `value:`, count of `flag: yes`) and combine
+# them at the end. This is the regime where reasoning continuity could matter
+# (sustained intermediate state over many tool round-trips); the short playbook
+# suite never exercises it, which is exactly why #25's reasoning-replay A/B read
+# as zero. Answer is deterministic: sum(values)=79 + count(flag:yes)=6 = 85.
+prompt: |
+  You are given a linked chain of files in the current directory. Begin by
+  reading `start.txt`. Every file has a `next:` line naming the next file to
+  read — read that file next with read_file, and keep following the `next:`
+  pointers until you reach a file whose line is `next: DONE`.
+
+  You must discover each file ONLY by following the `next:` pointer of the file
+  you just read. Do NOT list the directory, do NOT use glob, and do NOT guess
+  filenames — follow the chain one step at a time.
+
+  As you traverse, track two running quantities across the WHOLE chain:
+    1. the sum of every `value:` number you encounter, and
+    2. the count of files whose line is `flag: yes`.
+
+  When you reach `next: DONE`, compute `final = sum + count` and write ONLY that
+  number (digits only, no other text) to a new file named `result.txt`.
+setup:
+  fixture: fixtures/chain
+expect:
+  - tool_called: read_file
+  # The chain must actually be walked end-to-end, not shortcut — each pointer is
+  # only knowable after the prior read, so a correct run is ~13 sequential turns.
+  - min_steps: 10
+  # Deterministic derived answer; a run that drops intermediate state miscomputes.
+  - file_contains:
+      path: result.txt
+      pattern: "85"
+  - status: done
+budget:
+  maxSteps: 40
+  maxCostUsd: 2.0

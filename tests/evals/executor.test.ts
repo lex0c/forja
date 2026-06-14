@@ -117,6 +117,36 @@ describe('executeCase', () => {
     expect(r.expectations.every((e) => e.passed)).toBe(true);
   });
 
+  test('min_steps fails when the run is too short', async () => {
+    const c = baseCase({ expect: [{ kind: 'min_steps', count: 3 }] });
+    const r = await executeCase(c, {
+      bootstrapOverride: {
+        providerOverride: mockProvider([{ text: 'done in one turn' }]),
+      },
+    });
+    expect(r.passed).toBe(false);
+    expect(r.expectations[0]?.detail).toContain('ran 1 step');
+  });
+
+  test('min_steps passes when the run takes enough steps', async () => {
+    const c = baseCase({ expect: [{ kind: 'min_steps', count: 2 }] });
+    const r = await executeCase(c, {
+      bootstrapOverride: {
+        providerOverride: mockProvider([
+          {
+            tool_uses: [{ id: 't1', name: 'write_file', input: { path: 'a.txt', content: 'x\n' } }],
+          },
+          {
+            tool_uses: [{ id: 't2', name: 'write_file', input: { path: 'b.txt', content: 'y\n' } }],
+          },
+          { text: 'done' },
+        ]),
+        sandboxAvailabilityOverride: HERMETIC_SANDBOX,
+      },
+    });
+    expect(r.passed).toBe(true);
+  });
+
   test('output_contains matches accumulated text_delta', async () => {
     const c = baseCase({
       expect: [

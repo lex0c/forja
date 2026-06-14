@@ -26,7 +26,13 @@ import type { ProviderEffort } from '../providers/types.ts';
 // re-declared union) so the abstraction has exactly one definition.
 export type ForjaEffort = ProviderEffort;
 
-export const FORJA_EFFORT_LEVELS: readonly ForjaEffort[] = ['low', 'medium', 'high', 'max'];
+export const FORJA_EFFORT_LEVELS: readonly ForjaEffort[] = [
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+];
 
 // Default effort for a top-level session when the operator set none
 // (no `[sampling].effort` in config.toml, no `/effort`). Applied at
@@ -63,6 +69,10 @@ export const EFFORT_PROFILES: Record<ForjaEffort, EffortProfile> = {
   low: { providerEffort: 'low', maxSteps: 60, maxConcurrentSubagents: 1, maxToolErrors: 3 },
   medium: { providerEffort: 'medium', maxSteps: 120, maxConcurrentSubagents: 2, maxToolErrors: 5 },
   high: { providerEffort: 'high', maxSteps: 200, maxConcurrentSubagents: 4, maxToolErrors: 8 },
+  // The coding/agentic sweet spot (Claude Code's default on the frontier
+  // models): deeper reasoning than `high` without `max`'s overthinking. Sits
+  // between high and max on every axis.
+  xhigh: { providerEffort: 'xhigh', maxSteps: 300, maxConcurrentSubagents: 6, maxToolErrors: 10 },
   max: { providerEffort: 'max', maxSteps: 400, maxConcurrentSubagents: 8, maxToolErrors: 12 },
 };
 

@@ -2,17 +2,36 @@ import { describe, expect, test } from 'bun:test';
 import {
   EFFORT_THINKING_BUDGET,
   OPENAI_REASONING_EFFORT,
+  anthropicEffort,
   effortThinkingBudget,
 } from '../../src/providers/effort.ts';
 import type { ProviderEffort } from '../../src/providers/types.ts';
 
-const LEVELS: ProviderEffort[] = ['low', 'medium', 'high', 'max'];
+const LEVELS: ProviderEffort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+describe('anthropicEffort', () => {
+  test('clamps xhigh → high when the model does not expose it', () => {
+    expect(anthropicEffort('xhigh', false)).toBe('high');
+  });
+
+  test('passes xhigh through when supported (Opus 4.7/4.8)', () => {
+    expect(anthropicEffort('xhigh', true)).toBe('xhigh');
+  });
+
+  test('every other level is identity, regardless of xhigh support', () => {
+    for (const e of ['low', 'medium', 'high', 'max'] as ProviderEffort[]) {
+      expect(anthropicEffort(e, false)).toBe(e);
+      expect(anthropicEffort(e, true)).toBe(e);
+    }
+  });
+});
 
 describe('OPENAI_REASONING_EFFORT', () => {
-  test('low/medium/high are 1:1; max maps to xhigh (no OpenAI "max")', () => {
+  test('low/medium/high/xhigh are 1:1; max also maps to xhigh (OpenAI tops at xhigh)', () => {
     expect(OPENAI_REASONING_EFFORT.low).toBe('low');
     expect(OPENAI_REASONING_EFFORT.medium).toBe('medium');
     expect(OPENAI_REASONING_EFFORT.high).toBe('high');
+    expect(OPENAI_REASONING_EFFORT.xhigh).toBe('xhigh');
     expect(OPENAI_REASONING_EFFORT.max).toBe('xhigh');
   });
 });

@@ -5,6 +5,7 @@ import { stableStringify } from '../canonical-json.ts';
 // bounds. OpenAI has no server-side countTokens endpoint until tiktoken
 // lands in M5.
 import { OPENAI_REASONING_EFFORT } from '../effort.ts';
+import { boolFromEnv } from '../env.ts';
 import { deriveSeedFromRequest } from '../seed.ts';
 import { estimateMessagesTokens } from '../tokens.ts';
 import type {
@@ -83,6 +84,12 @@ const promptCacheRetentionFromEnv = (): '24h' | undefined => {
     : '24h';
 };
 
+// Opt-in (Phase 3): replay captured reasoning items across tool-bearing turns
+// (stateless continuity: pass items back as input + `include:
+// ['reasoning.encrypted_content']`). Default OFF until the long-horizon eval
+// proves value — #25 built this exact feature and reverted it for zero measured
+// benefit on the short suite. Only the Responses path honors it.
+//
 // Resolve the `includeUsage` default from the environment for callers
 // who don't pass an explicit option (notably the registry factory used
 // by the CLI bootstrap, which forwards no options today). Truthy by
@@ -139,8 +146,7 @@ const toOpenAIMessages = (m: ProviderMessage): OpenAIMessage[] => {
         type: 'function',
         function: { name: block.name, arguments: JSON.stringify(block.input) },
       });
-    } else {
-      // tool_result
+    } else if (block.type === 'tool_result') {
       if (m.role !== 'user') {
         throw new Error('tool_result blocks must appear on user messages');
       }
@@ -150,6 +156,9 @@ const toOpenAIMessages = (m: ProviderMessage): OpenAIMessage[] => {
         content: block.content,
       });
     }
+    // `reasoning` blocks are dropped on the Chat Completions path — reasoning
+    // replay is a Responses-API feature (wired in the OpenAI Responses path,
+    // flagged); Chat Completions has no input slot for reasoning items.
   }
 
   // Tool results come first so they read as the answer to the prior
@@ -215,6 +224,11 @@ export const createOpenAIProvider = (
     options.baseURL === undefined && caps.extended_prompt_cache === true
       ? promptCacheRetentionFromEnv()
       : undefined;
+  // Reasoning-item replay (Responses path): real OpenAI only (the `include`
+  // param + opaque input items may 400 on a compat endpoint), env-gated, OFF by
+  // default. Resolved once, threaded into generateViaResponses.
+  const reasoningReplay =
+    options.baseURL === undefined && boolFromEnv('FORJA_OPENAI_REASONING_REPLAY');
   // Sampling gate (mirrors the Anthropic adapter). Reasoning models —
   // OpenAI's o-series and gpt-5.x — REJECT `temperature`/`top_p` with HTTP
   // 400 ("Unsupported parameter"). The capability opts those models out
@@ -398,6 +412,7 @@ export const createOpenAIProvider = (
             req,
             responsesCacheKey(req),
             promptCacheRetention,
+            reasoningReplay,
           )
       : generate,
     generateConstrained: useResponses

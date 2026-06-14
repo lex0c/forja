@@ -2,6 +2,200 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] Reasoning propagation — code-review fixes (correctness + cleanup)
+
+Review pass over the reasoning-propagation + xhigh diff (7 finder angles, verified
+inline). Correctness:
+
+- **Empty wire message on a reasoning-only turn (hit the DEFAULT config).** Capture
+  is unconditional, so a turn with reasoning but no text/tool_use was stored as
+  `[reasoning]`, passing the append-time `hasContent` guard — then a non-replaying
+  converter dropped the block to `content: []`, which Anthropic/Gemini 400. Extracted
+  the assistant-content assembly into `buildAssistantContent` (`src/harness/assistant-content.ts`)
+  which OMITS reasoning when the turn has no text and no tool_use (such a turn ends
+  the loop; nothing to continue into). Loop now calls the helper.
+- **OpenAI reasoning item without `encrypted_content` would 400 on replay** after a
+  flag flip (item captured under flag-OFF never requested `include`). `toResponsesInput`
+  now drops items lacking `encrypted_content` instead of replaying them raw in
+  `store:false` mode.
+- **Cache breakpoint could land on a `thinking`/`redacted_thinking` block** (Anthropic
+  rejects `cache_control` there) once replay placed one at the tail. `messagesWithTailCacheBreakpoint`
+  now anchors on the last cache-eligible block and skips the breakpoint when the tail
+  is all thinking.
+- **Dead branch in the budget-vs-max_tokens cross-check.** The `reasoningReplay ||`
+  carve-out was unreachable (replay only engages on adaptive models, which the check
+  already excludes) and its comment claimed a restored safety check that never ran.
+  Removed; comment corrected.
+
+Cleanup: centralized the Anthropic `xhigh → high` clamp into `anthropicEffort`
+(`src/providers/effort.ts`, beside `OPENAI_REASONING_EFFORT`) — a pure, unit-testable
+mapping instead of an inline ternary in request assembly. Shared truthy-env parsing
+via `boolFromEnv` (`src/providers/env.ts`), replacing two byte-identical
+`*ReasoningReplayFromEnv` copies so the accepted flag vocabularies can't drift.
+
+New/updated tests: `buildAssistantContent`, `boolFromEnv`, `anthropicEffort`, the
+cache thinking-skip, and the OpenAI encrypted_content drop. 669 green in
+harness+providers · typecheck · lint clean. Not done (deliberate): per-block phase
+sentinel refactor (contained, theoretical collision), capture-always-on (Phase 1
+design), and the OpenAI reasoning-item ordering check (needs a live wire smoke).
+
+## [2026-06-14] Add the `xhigh` reasoning-effort level
+
+`ProviderEffort` jumped `high → max`, leaving the documented coding/agentic sweet
+spot unreachable on Anthropic — `xhigh` (between high and max) is what Claude Code
+defaults to on the frontier models, and `max` overshoots it ("diminishing returns,
+overthinking"). Added `xhigh` to the agnostic effort ladder: `ProviderEffort`,
+`FORJA_EFFORT_LEVELS`, `EFFORT_THINKING_BUDGET` (20_480, between high 16_384 and
+max 24_576), `OPENAI_REASONING_EFFORT` (xhigh→xhigh; max still →xhigh, OpenAI's
+top), and `EFFORT_PROFILES` (maxSteps 300 / subagents 6 / toolErrors 10).
+
+Per-model gating: `xhigh` is narrower than `max` (Anthropic exposes it only on
+Opus 4.7/4.8). Added a `supports_effort_xhigh` capability (true on opus-4-7/4-8);
+the Anthropic adapter clamps `xhigh → high` when a model lacks it (Sonnet 4.6 /
+Haiku) to avoid a 400. OpenAI reasoning models take it natively (no gate). CLI
+`--subagent-effort`, config `[effort].level`, and `/effort` validate against
+FORJA_EFFORT_LEVELS, so they accept it automatically. DEFAULT_EFFORT stays `high`
+(operators opt into xhigh per session); flipping the agentic default to xhigh is a
+separate call. Tests: ladder monotonicity, OpenAI mapping, Anthropic clamp
+(forward on opus, clamp on sonnet).
+
+## [2026-06-14] Reasoning propagation — close the coherence gaps (redacted_thinking, codex phase, adaptive gate)
+
+Three fixes surfaced by re-reading the adaptive/extended-thinking + codex docs
+against Phases 1-3 (all flag-gated, default behavior unchanged):
+
+- **Anthropic `redacted_thinking`**: the stream now captures safety-redacted
+  thinking blocks (`content_block` type `redacted_thinking`, opaque `data`) and
+  `toAnthropicMessage` replays them as native `{type:'redacted_thinking',data}`,
+  verbatim. Previously only signed `thinking` was captured, so a turn containing
+  a redacted block would replay an incomplete sequence and 400 ("the entire
+  sequence of consecutive thinking blocks must match"). The reasoning-wire type
+  is now a union (thinking | redacted_thinking).
+
+- **Anthropic adaptive gate**: reasoning replay is now gated to
+  `caps.supports_adaptive_thinking` — the documented header-free interleaved
+  path. Legacy/non-adaptive models (e.g. Haiku 4.5) would need the
+  `interleaved-thinking-2025-05-14` beta header, which we don't wire, so replay
+  stays off there rather than sending thinking on tool turns without it.
+
+- **OpenAI codex `phase`**: reasoning items already round-trip their `phase`
+  (captured verbatim). The assistant MESSAGE item's `phase` (commentary /
+  final_answer), which the harness loses when it rebuilds the message from text,
+  is now captured via a sentinel reasoning block and re-stamped onto the replayed
+  assistant message in `toResponsesInput`. Dropping it causes "significant
+  performance degradation" per the codex guide.
+
+Caveat: the OpenAI message-`phase` wire shape (capturing `item.phase` on the
+message item + sending `phase` on the replayed assistant message) is documented
+but unvalidatable here without a live gpt-5.3-codex run — it's flag-gated, so the
+risk is confined to opt-in usage and must be live-validated before any default
+flip (Phase 4). Tests: redacted capture+replay, phase capture+re-stamp,
+non-adaptive gate-off.
+
+## [2026-06-14] Reasoning propagation — Phase 3: OpenAI reasoning-item replay (flagged)
+
+Behind `FORJA_OPENAI_REASONING_REPLAY` (default OFF, real-OpenAI only): the
+OpenAI Responses stream now CAPTURES reasoning output items verbatim
+(`output_item.done` with `item.type === 'reasoning'` → a `reasoning` StreamEvent
+carrying the opaque item, incl. its `encrypted_content`), and `toResponsesInput`
+REPLAYS same-provider items back into the input array (after the assistant text,
+before the function calls they reasoned about) while requesting
+`include:['reasoning.encrypted_content']`. Foreign-tagged blocks are dropped.
+This is the stateless continuity path (`store:false` stays) — the #25 feature,
+rebuilt, but now gated behind the long-horizon eval per its revert lesson.
+
+The opaque-block design means the adapter never interprets the item's schema: it
+round-trips whatever the API emitted, so the wire shape can't drift. Capture
+emits nothing if the event shape differs (no 400, degrades to flag-off); replay
+only sends items when the flag is on (opt-in), so any wire-shape risk is confined
+to flagged usage and is unvalidatable here without an API key.
+
+Scope note: the gpt-5.3-codex `phase` field (on assistant MESSAGE items, not
+reasoning items) is NOT round-tripped — it would need the raw assistant message
+item preserved across Forja's text reconstruction plus live codex validation.
+Deferred as a follow-up; `gpt-5.3-codex` therefore still carries the phase caveat
+noted earlier. Phase 4 (long-horizon A/B + selective default flip) requires a
+live run and is the operator's call.
+
+## [2026-06-14] Reasoning propagation — Phase 2: Anthropic replay + gate lift (flagged)
+
+Behind `FORJA_ANTHROPIC_REASONING_REPLAY` (default OFF): the captured signed
+thinking blocks (Phase 1) now replay across tool-bearing turns, and the
+suppression gate lifts — so interleaved thinking can stay ON during the agentic
+loop, the payoff for Claude. `toAnthropicMessage` maps a `provider:'anthropic'`
+reasoning block → a native `{type:'thinking',thinking,signature}` block in situ
+(the loop already stores reasoning FIRST, satisfying Anthropic's thinking-first
+contract), VERBATIM — the signature must round-trip byte-identical. Foreign-
+tagged reasoning blocks are dropped, mirroring the API's own cross-model
+behavior. `anthropicThinkingParam` no longer returns `{}` on tool turns when the
+flag is on; the budget-vs-max_tokens cross-check re-enables for tool turns (the
+pair now reaches the API) and the one-time stderr warning is silenced.
+
+Key simplification (confirmed via the claude-api reference): the current Claude
+family uses ADAPTIVE thinking, which auto-enables interleaved thinking with NO
+beta header — so Phase 2 needed no header plumbing. `messagesWithTailCacheBreak-
+point` was made generic over the block type so the native thinking block passes
+through; the tail breakpoint never lands on it (thinking is always first, never
+the tail block). Default behavior is unchanged with the flag off.
+
+Pending: Phase 4's long-horizon A/B must show a measurable delta before flipping
+the default. Phase 3 (OpenAI replay + codex `phase`, incl. its capture) is next.
+
+## [2026-06-14] Reasoning propagation — Phase 1: abstraction + capture (no replay)
+
+Added the unified opaque carrier: `ProviderReasoningBlock { type:'reasoning';
+provider; data }` in the ProviderContentBlock union + a `{ kind:'reasoning';
+provider; data }` StreamEvent. The harness treats `data` as a black box (only the
+owning adapter reads it); it rides in `content`, so it persists + resumes via the
+existing message-JSON path — NO migration (the cost that sank #25).
+
+Capture: the Anthropic stream now accumulates `thinking_delta` text +
+`signature_delta` (previously dropped) per content block and emits a `reasoning`
+event at block stop — only when SIGNED (an unsigned thinking block can't be
+replayed with tool_results). `collectStep` gathers them into
+`CollectedStep.reasoning`; the loop prepends them to the assistant content
+VERBATIM (never canonicalized — signatures must byte-match), before text/tool_use
+to mirror the wire order.
+
+Consumer-safety (the real surface of Option A): every `content` consumer was made
+reasoning-safe — the Anthropic/OpenAI(chat+responses)/Google converters DROP
+reasoning blocks (requests stay byte-unchanged this phase), compaction drops them
+from the synthesized summary (kept verbatim in the preserved tail), token
+estimation counts them as 0 (not sent yet), and resume passes them through. No
+replay yet — that's flagged, per-provider, in Phases 2/3.
+
+Scope note: OpenAI reasoning-item capture folds into Phase 3 alongside its replay
+(the Responses reasoning-item/`phase` event shape is validated there). Phase 1
+ships the abstraction + Anthropic capture, which is enough to prove the
+capture→store→resume round-trip. Default behavior is unchanged (thinking still
+suppressed on tool turns until Phase 2 lifts the gate).
+
+## [2026-06-14] Reasoning propagation — Phase 0: long-horizon eval (the gate)
+
+First deliverable of the unified cross-provider reasoning-propagation plan
+(round-trip opaque provider reasoning state — Anthropic thinking signatures,
+OpenAI reasoning items, codex `phase` — so reasoning persists across tool
+round-trips; benefits Claude via interleaved thinking on tool turns). The plan
+phases the work eval-FIRST precisely because #25 (OpenAI reasoning replay) was
+built, A/B'd 9/10 vs 9/10 on the SHORT playbook suite, and reverted — short
+evals can't measure continuity. So before any machinery, we build the instrument.
+
+Added a `min_steps` expectation (types/loader/executor + tests) — asserts the run
+took at least N steps, so a model that shortcuts a forced chain in a few turns
+fails even if it lands the answer (the exact gpt-5.3-codex shortcut that made
+#25's A/B read as zero). New eval `evals/long-horizon/accumulate-chain.yaml` over
+an opaque-pointer fixture chain: ~13 strictly sequential `read_file` turns
+(next-file names are unguessable, no globbing) accumulating two running
+quantities into a deterministic derived answer (sum 79 + flag-count 6 = 85,
+asserted via `file_contains`). This is the regime where reasoning continuity
+could matter and the OFF arm of the eventual A/B. `eval:long-horizon` script
+added (defaults to opus; `--model` overrides for cross-provider). Live run needs
+an API key; loader/executor logic is unit-tested.
+
+Subsequent phases (abstraction + capture, Anthropic replay + gate lift, OpenAI
+replay + phase, A/B + selective default flip) are tracked separately and gated
+on this eval showing a measurable delta. Spec PR (PROVIDERS.md) pending.
+
 ## [2026-06-14] Add gpt-5-nano to the OpenAI capability matrix
 
 Fastest/cheapest GPT-5-base reasoning model ($0.05 / $0.40 per MTok, $0.005

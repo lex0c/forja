@@ -1,0 +1,3 @@
+value: 6
+flag: no
+next: n_y3.txt

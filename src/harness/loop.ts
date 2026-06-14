@@ -23,14 +23,11 @@ import {
   parseCapability,
 } from '../permissions/capabilities.ts';
 import { createDegradedBannerEmitter } from '../permissions/degraded-banner.ts';
-import { canonicalizeObject } from '../providers/canonical-json.ts';
 import { addUsage, computeCost, emptyUsage } from '../providers/cost.ts';
 import type {
   GenerateRequest,
-  ProviderContentBlock,
   ProviderToolDef,
   ProviderToolResultBlock,
-  ProviderToolUseBlock,
 } from '../providers/index.ts';
 import { estimatePromptTokens } from '../providers/tokens.ts';
 import { buildAutoTerse } from '../recap/auto-display.ts';
@@ -64,6 +61,7 @@ import type { ToolContext } from '../tools/index.ts';
 import type { SpawnSubagentArgs, SpawnSubagentResult } from '../tools/types.ts';
 import { type WorkingStateStore, createWorkingStateStore } from '../working-state/index.ts';
 import { StepStallError, abortableIterable, stallWatchdog } from './abortable.ts';
+import { buildAssistantContent } from './assistant-content.ts';
 import { CollectStepError, type CollectedToolUse, collectStep } from './collect.ts';
 import type { RelevanceAudit } from './compaction-relevance.ts';
 import {
@@ -2788,26 +2786,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           return await finish('providerError', detail);
         }
 
-        // Build assistant content blocks: text first, then tool_uses, mirroring
-        // the order the model produced them. Empty text is omitted.
-        const assistantContent: ProviderContentBlock[] = [];
-        if (collected.text.length > 0) {
-          assistantContent.push({ type: 'text', text: collected.text });
-        }
-        for (const tu of collected.tool_uses) {
-          const block: ProviderToolUseBlock = {
-            type: 'tool_use',
-            id: tu.id,
-            name: tu.name,
-            // Canonicalize the arg keys at the single point they enter
-            // history, so this block serializes to byte-stable bytes in
-            // every later request (all providers + resume) — a stable
-            // cache prefix. Key order is semantically irrelevant, so this
-            // never changes what the model or the tool sees.
-            input: canonicalizeObject(tu.input),
-          };
-          assistantContent.push(block);
-        }
+        // Build assistant content blocks (reasoning-first, then text, then
+        // tool_uses; reasoning omitted on a no-text/no-tool turn to avoid an
+        // empty wire message). See `buildAssistantContent`.
+        const assistantContent = buildAssistantContent(collected);
 
         const turnCostUsd = computeCost(config.provider.capabilities, collected.usage);
         totalUsage = addUsage(totalUsage, collected.usage);

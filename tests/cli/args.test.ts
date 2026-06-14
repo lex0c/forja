@@ -482,7 +482,7 @@ describe('--subagent-temperature', () => {
 
 describe('--subagent-effort', () => {
   test('captures a valid level into args.subagentProviderEffort', () => {
-    for (const level of ['low', 'medium', 'high', 'max'] as const) {
+    for (const level of ['low', 'medium', 'high', 'xhigh', 'max'] as const) {
       const r = parseArgs(['--subagent-effort', level]);
       expect(r.ok).toBe(true);
       if (!r.ok) continue;
@@ -495,9 +495,9 @@ describe('--subagent-effort', () => {
   });
 
   test('rejects an unknown level (allowlist guards flag-shaped values too)', () => {
-    // `xhigh` is a valid OpenAI level but NOT a ForjaEffort; uppercase
+    // `none`/`minimal` are OpenAI levels but NOT ForjaEffort values; uppercase
     // and flag-shaped values are rejected by the same allowlist.
-    for (const bad of ['xhigh', 'none', 'HIGH', '', '--subagent-depth']) {
+    for (const bad of ['none', 'minimal', 'HIGH', '', '--subagent-depth']) {
       expect(parseArgs(['--subagent-effort', bad]).ok).toBe(false);
     }
   });

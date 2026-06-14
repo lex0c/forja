@@ -109,6 +109,34 @@ describe('normalizeResponsesStream', () => {
       retryable: false,
     });
   });
+
+  test('reasoning output item is captured verbatim as a reasoning event', async () => {
+    const reasoningItem = {
+      type: 'reasoning',
+      id: 'rs_1',
+      summary: [],
+      encrypted_content: 'ENCRYPTED_BLOB',
+    };
+    const out = await collect([
+      { type: 'response.created', response: { id: 'r' } },
+      { type: 'response.output_item.done', item: reasoningItem } as RawResponsesEvent,
+      { type: 'response.completed', response: {} },
+    ]);
+    expect(out).toContainEqual({ kind: 'reasoning', provider: 'openai', data: reasoningItem });
+  });
+
+  test('codex message phase is captured as a sentinel reasoning event', async () => {
+    const out = await collect([
+      { type: 'response.created', response: { id: 'r' } },
+      { type: 'response.output_item.done', item: { type: 'message', phase: 'commentary' } },
+      { type: 'response.completed', response: {} },
+    ]);
+    expect(out).toContainEqual({
+      kind: 'reasoning',
+      provider: 'openai',
+      data: { __forja_message_phase: 'commentary' },
+    });
+  });
 });
 
 // Mock that routes generate (stream) and constrained (object) through
@@ -286,5 +314,144 @@ describe('createOpenAIProvider — Responses routing for reasoning models', () =
     expect((handle.calls[0] as { instructions?: string }).instructions).toBe(
       'Formatting re-enabled',
     );
+  });
+
+  describe('reasoning replay (Phase 3, FORJA_OPENAI_REASONING_REPLAY)', () => {
+    const reasoningItem = { type: 'reasoning', id: 'rs_9', encrypted_content: 'ENC' };
+    const assistantTurn = {
+      role: 'assistant' as const,
+      content: [
+        { type: 'reasoning' as const, provider: 'openai' as const, data: reasoningItem },
+        { type: 'tool_use' as const, id: 'call_1', name: 'read', input: { p: '/x' } },
+        // Foreign-tagged: dropped regardless of flag.
+        { type: 'reasoning' as const, provider: 'anthropic' as const, data: { thinking: 't' } },
+      ],
+    };
+    const drive = async (handle: { client: OpenAI }) => {
+      const provider = createOpenAIProvider('gpt-5.4-mini', { client: handle.client });
+      for await (const _ of provider.generate({
+        model: 'gpt-5.4-mini',
+        messages: [assistantTurn, { role: 'user', content: 'go' }],
+        max_tokens: 8,
+        effort: 'high',
+      })) {
+        // drain
+      }
+    };
+    const withReplay = async (on: boolean, fn: () => Promise<void>) => {
+      const prev = process.env.FORJA_OPENAI_REASONING_REPLAY;
+      if (on) process.env.FORJA_OPENAI_REASONING_REPLAY = '1';
+      else delete process.env.FORJA_OPENAI_REASONING_REPLAY;
+      try {
+        await fn();
+      } finally {
+        if (prev === undefined) delete process.env.FORJA_OPENAI_REASONING_REPLAY;
+        else process.env.FORJA_OPENAI_REASONING_REPLAY = prev;
+      }
+    };
+
+    test('off (default): reasoning items are not replayed and `include` is absent', async () => {
+      await withReplay(false, async () => {
+        const handle = mockResponsesClient([
+          { type: 'response.created', response: { id: 'r' } },
+          { type: 'response.completed', response: {} },
+        ]);
+        await drive(handle);
+        const p = handle.calls[0] as { input: Array<{ type?: string }>; include?: unknown };
+        expect(p.include).toBeUndefined();
+        expect(p.input.some((i) => i.type === 'reasoning')).toBe(false);
+      });
+    });
+
+    test('on: same-provider reasoning item replays into input + `include` is set', async () => {
+      await withReplay(true, async () => {
+        const handle = mockResponsesClient([
+          { type: 'response.created', response: { id: 'r' } },
+          { type: 'response.completed', response: {} },
+        ]);
+        await drive(handle);
+        const p = handle.calls[0] as { input: unknown[]; include?: unknown };
+        expect(p.include).toEqual(['reasoning.encrypted_content']);
+        // The captured OpenAI item rides into the input verbatim; the foreign
+        // (anthropic) reasoning block is dropped.
+        expect(p.input).toContainEqual(reasoningItem);
+        const reasoningCount = (p.input as Array<{ type?: string }>).filter(
+          (i) => i.type === 'reasoning',
+        ).length;
+        expect(reasoningCount).toBe(1);
+      });
+    });
+
+    test('on: codex message phase is re-stamped on the assistant message, not pushed as an item', async () => {
+      await withReplay(true, async () => {
+        const handle = mockResponsesClient([
+          { type: 'response.created', response: { id: 'r' } },
+          { type: 'response.completed', response: {} },
+        ]);
+        const provider = createOpenAIProvider('gpt-5.4-mini', { client: handle.client });
+        for await (const _ of provider.generate({
+          model: 'gpt-5.4-mini',
+          max_tokens: 8,
+          effort: 'high',
+          messages: [
+            {
+              role: 'assistant',
+              content: [
+                {
+                  type: 'reasoning',
+                  provider: 'openai',
+                  data: { __forja_message_phase: 'final_answer' },
+                },
+                { type: 'text', text: 'done' },
+              ],
+            },
+            { role: 'user', content: 'go' },
+          ],
+        })) {
+          // drain
+        }
+        const p = handle.calls[0] as {
+          input: Array<{ role?: string; type?: string; phase?: string }>;
+        };
+        const assistantMsg = p.input.find((i) => i.role === 'assistant');
+        expect(assistantMsg?.phase).toBe('final_answer');
+        // The sentinel is consumed, not emitted as a reasoning item.
+        expect(p.input.some((i) => i.type === 'reasoning')).toBe(false);
+      });
+    });
+
+    test('on: a reasoning item without encrypted_content is dropped (would 400 in stateless mode)', async () => {
+      // Captured under a flag-OFF request (no `include`), so it has no
+      // encrypted_content; a later flag flip must not replay it raw.
+      await withReplay(true, async () => {
+        const handle = mockResponsesClient([
+          { type: 'response.created', response: { id: 'r' } },
+          { type: 'response.completed', response: {} },
+        ]);
+        const provider = createOpenAIProvider('gpt-5.4-mini', { client: handle.client });
+        for await (const _ of provider.generate({
+          model: 'gpt-5.4-mini',
+          max_tokens: 8,
+          effort: 'high',
+          messages: [
+            {
+              role: 'assistant',
+              content: [
+                { type: 'reasoning', provider: 'openai', data: { type: 'reasoning', id: 'rs_x' } },
+                { type: 'text', text: 'hi' },
+              ],
+            },
+            { role: 'user', content: 'go' },
+          ],
+        })) {
+          // drain
+        }
+        const p = handle.calls[0] as { input: Array<{ type?: string }>; include?: unknown };
+        // `include` is still requested (replay is on) but the unverifiable item
+        // is not pushed into the input.
+        expect(p.include).toEqual(['reasoning.encrypted_content']);
+        expect(p.input.some((i) => i.type === 'reasoning')).toBe(false);
+      });
+    });
   });
 });

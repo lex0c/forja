@@ -49,7 +49,7 @@ const withMarkdownMarker = (system: string | undefined): string =>
 // text becomes role-tagged message items. Tool outputs are emitted before new
 // text so they read as answers to the prior calls (mirrors the Chat
 // Completions converter ordering).
-const toResponsesInput = (messages: ProviderMessage[]): unknown[] => {
+const toResponsesInput = (messages: ProviderMessage[], reasoningReplay = false): unknown[] => {
   const items: unknown[] = [];
   for (const m of messages) {
     if (typeof m.content === 'string') {
@@ -59,6 +59,8 @@ const toResponsesInput = (messages: ProviderMessage[]): unknown[] => {
     const textParts: string[] = [];
     const toolCalls: unknown[] = [];
     const toolOutputs: unknown[] = [];
+    const reasoningItems: unknown[] = [];
+    let messagePhase: string | undefined;
     for (const block of m.content) {
       if (block.type === 'text') {
         textParts.push(block.text);
@@ -69,18 +71,61 @@ const toResponsesInput = (messages: ProviderMessage[]): unknown[] => {
           name: block.name,
           arguments: JSON.stringify(block.input),
         });
-      } else {
-        // tool_result
+      } else if (block.type === 'tool_result') {
         toolOutputs.push({
           type: 'function_call_output',
           call_id: block.tool_use_id,
           output: block.content,
         });
+      } else if (block.type === 'reasoning') {
+        // Replay same-provider reasoning state when enabled; foreign-tagged +
+        // flag-off → dropped (Phase 1 behavior).
+        if (!reasoningReplay || block.provider !== 'openai') continue;
+        const sentinel = block.data as { __forja_message_phase?: unknown } | null;
+        if (
+          sentinel !== null &&
+          typeof sentinel === 'object' &&
+          '__forja_message_phase' in sentinel
+        ) {
+          // Not a real reasoning item — the codex message `phase` carrier.
+          // Re-stamp it onto the assistant message below instead of pushing it.
+          if (typeof sentinel.__forja_message_phase === 'string') {
+            messagePhase = sentinel.__forja_message_phase;
+          }
+        } else {
+          // The captured reasoning output item, replayed VERBATIM (encrypted_
+          // content / id / its own phase round-trip inside `data`). In stateless
+          // mode (`store: false`) ONLY an item carrying `encrypted_content` can
+          // be replayed; an item captured under a flag-OFF request never asked
+          // for `include: ['reasoning.encrypted_content']`, so it lacks the
+          // field and would 400 ("reasoning item ... without encrypted_content")
+          // after a later flag flip — drop it rather than break the request.
+          const item = block.data as { encrypted_content?: unknown } | null;
+          if (
+            item !== null &&
+            typeof item === 'object' &&
+            typeof item.encrypted_content === 'string' &&
+            item.encrypted_content.length > 0
+          ) {
+            reasoningItems.push(block.data);
+          }
+        }
       }
     }
     items.push(...toolOutputs);
     if (m.role === 'assistant') {
-      if (textParts.length > 0) items.push({ role: 'assistant', content: textParts.join('') });
+      if (textParts.length > 0) {
+        items.push({
+          role: 'assistant',
+          content: textParts.join(''),
+          // Re-stamp the codex message phase so the assistant item round-trips
+          // it (the harness rebuilds the message from text and would lose it).
+          ...(messagePhase !== undefined ? { phase: messagePhase } : {}),
+        });
+      }
+      // Reasoning items sit after the assistant text and before the function
+      // calls they reasoned about — the position OpenAI's continuity expects.
+      items.push(...reasoningItems);
       items.push(...toolCalls);
     } else if (textParts.length > 0) {
       items.push({ role: 'user', content: textParts.join('') });
@@ -112,11 +157,15 @@ export const generateViaResponses = (
   // Extended cache retention ('24h'), likewise resolved by the factory
   // (real OpenAI + capability). Undefined → the param is omitted.
   promptCacheRetention?: string,
+  // Replay captured reasoning items as input + request encrypted_content so
+  // reasoning persists across tool round-trips (factory-resolved: real OpenAI +
+  // FORJA_OPENAI_REASONING_REPLAY). Default OFF.
+  reasoningReplay = false,
 ): AsyncIterable<StreamEvent> =>
   (async function* () {
     const params: Record<string, unknown> = {
       model: modelName,
-      input: toResponsesInput(req.messages),
+      input: toResponsesInput(req.messages, reasoningReplay),
       max_output_tokens: req.max_tokens,
       store: false,
       stream: true,
@@ -127,6 +176,9 @@ export const generateViaResponses = (
     if (req.tools !== undefined) params.tools = toResponsesTools(req.tools);
     if (promptCacheKey !== undefined) params.prompt_cache_key = promptCacheKey;
     if (promptCacheRetention !== undefined) params.prompt_cache_retention = promptCacheRetention;
+    // Ask the API to attach the encrypted reasoning payload to output items so a
+    // captured item carries what a later replay needs (stateless, store:false).
+    if (reasoningReplay) params.include = ['reasoning.encrypted_content'];
     // Reasoning effort — the whole reason this path exists. `reasoning.effort`
     // (not the flat `reasoning_effort`), gated on the capability. No
     // temperature/top_p: reasoning models reject them (sampling gate).

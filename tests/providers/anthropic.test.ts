@@ -483,6 +483,195 @@ describe('createAnthropicProvider', () => {
     expect('stop_sequences' in params).toBe(false);
   });
 
+  test('forwards xhigh effort on a model that supports it (opus-4-8)', async () => {
+    const handle = mockClient([{ type: 'message_stop' }]);
+    const provider = createAnthropicProvider('claude-opus-4-8', { client: handle.client });
+    for await (const _ of provider.generate({
+      model: 'claude-opus-4-8',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 16,
+      effort: 'xhigh',
+    })) {
+      // drain
+    }
+    const params = handle.streamCalls[0]?.params as { output_config?: { effort?: string } };
+    expect(params.output_config?.effort).toBe('xhigh');
+  });
+
+  test('clamps xhigh effort to high on a model that lacks it (sonnet-4-6)', async () => {
+    const handle = mockClient([{ type: 'message_stop' }]);
+    const provider = createAnthropicProvider('claude-sonnet-4-6', { client: handle.client });
+    for await (const _ of provider.generate({
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 16,
+      effort: 'xhigh',
+    })) {
+      // drain
+    }
+    const params = handle.streamCalls[0]?.params as { output_config?: { effort?: string } };
+    expect(params.output_config?.effort).toBe('high');
+  });
+
+  describe('reasoning replay (Phase 2, FORJA_ANTHROPIC_REASONING_REPLAY)', () => {
+    const withReplay = async (on: boolean, fn: () => Promise<void>): Promise<void> => {
+      const prev = process.env.FORJA_ANTHROPIC_REASONING_REPLAY;
+      if (on) process.env.FORJA_ANTHROPIC_REASONING_REPLAY = '1';
+      else delete process.env.FORJA_ANTHROPIC_REASONING_REPLAY;
+      try {
+        await fn();
+      } finally {
+        if (prev === undefined) delete process.env.FORJA_ANTHROPIC_REASONING_REPLAY;
+        else process.env.FORJA_ANTHROPIC_REASONING_REPLAY = prev;
+      }
+    };
+
+    const assistantWithReasoning = {
+      role: 'assistant' as const,
+      content: [
+        {
+          type: 'reasoning' as const,
+          provider: 'anthropic' as const,
+          data: { thinking: 'pondering', signature: 'SIGBYTES' },
+        },
+        { type: 'text' as const, text: 'answer' },
+        // Foreign-tagged: must be dropped regardless of flag.
+        { type: 'reasoning' as const, provider: 'openai' as const, data: { foo: 1 } },
+      ],
+    };
+
+    test('off (default): reasoning blocks are dropped from messages', async () => {
+      await withReplay(false, async () => {
+        const handle = mockClient([{ type: 'message_stop' }]);
+        const provider = createAnthropicProvider('claude-sonnet-4-6', { client: handle.client });
+        for await (const _ of provider.generate({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 16,
+          messages: [assistantWithReasoning, { role: 'user', content: 'go' }],
+        })) {
+          // drain
+        }
+        const params = handle.streamCalls[0]?.params as {
+          messages: Array<{ content: Array<{ type: string }> }>;
+        };
+        expect(params.messages[0]?.content.map((b) => b.type)).toEqual(['text']);
+      });
+    });
+
+    test('on: anthropic reasoning replays as a signed thinking block first; foreign dropped', async () => {
+      await withReplay(true, async () => {
+        const handle = mockClient([{ type: 'message_stop' }]);
+        const provider = createAnthropicProvider('claude-sonnet-4-6', { client: handle.client });
+        for await (const _ of provider.generate({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 16,
+          messages: [assistantWithReasoning, { role: 'user', content: 'go' }],
+        })) {
+          // drain
+        }
+        const params = handle.streamCalls[0]?.params as {
+          messages: Array<{
+            content: Array<{ type: string; thinking?: string; signature?: string }>;
+          }>;
+        };
+        const blocks = params.messages[0]?.content ?? [];
+        // thinking first (contract), text after, openai reasoning dropped.
+        expect(blocks.map((b) => b.type)).toEqual(['thinking', 'text']);
+        // signature round-trips byte-identical.
+        expect(blocks[0]).toEqual({
+          type: 'thinking',
+          thinking: 'pondering',
+          signature: 'SIGBYTES',
+        });
+      });
+    });
+
+    test('on: lifts the thinking suppression gate on tool-bearing turns', async () => {
+      await withReplay(true, async () => {
+        const handle = mockClient([{ type: 'message_stop' }]);
+        const provider = createAnthropicProvider('claude-sonnet-4-6', { client: handle.client });
+        for await (const _ of provider.generate({
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 4096,
+          thinking_budget: 1000,
+          tools: [{ name: 't', description: 'd', input_schema: { type: 'object' } }],
+        })) {
+          // drain
+        }
+        const params = handle.streamCalls[0]?.params as Record<string, unknown>;
+        expect('thinking' in params).toBe(true);
+      });
+    });
+
+    test('off (default): thinking stays suppressed on tool-bearing turns', async () => {
+      await withReplay(false, async () => {
+        const handle = mockClient([{ type: 'message_stop' }]);
+        const provider = createAnthropicProvider('claude-sonnet-4-6', { client: handle.client });
+        for await (const _ of provider.generate({
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 4096,
+          thinking_budget: 1000,
+          tools: [{ name: 't', description: 'd', input_schema: { type: 'object' } }],
+        })) {
+          // drain
+        }
+        const params = handle.streamCalls[0]?.params as Record<string, unknown>;
+        expect('thinking' in params).toBe(false);
+      });
+    });
+
+    test('on: redacted_thinking replays as a native redacted_thinking block', async () => {
+      await withReplay(true, async () => {
+        const handle = mockClient([{ type: 'message_stop' }]);
+        const provider = createAnthropicProvider('claude-sonnet-4-6', { client: handle.client });
+        for await (const _ of provider.generate({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 16,
+          messages: [
+            {
+              role: 'assistant',
+              content: [
+                { type: 'reasoning', provider: 'anthropic', data: { redacted_thinking: 'ENC' } },
+                { type: 'text', text: 'a' },
+              ],
+            },
+            { role: 'user', content: 'go' },
+          ],
+        })) {
+          // drain
+        }
+        const params = handle.streamCalls[0]?.params as {
+          messages: Array<{ content: Array<{ type: string; data?: string }> }>;
+        };
+        expect(params.messages[0]?.content?.[0]).toEqual({
+          type: 'redacted_thinking',
+          data: 'ENC',
+        });
+      });
+    });
+
+    test('gated off for non-adaptive models even when the flag is on (haiku)', async () => {
+      await withReplay(true, async () => {
+        const handle = mockClient([{ type: 'message_stop' }]);
+        const provider = createAnthropicProvider('claude-haiku-4-5', { client: handle.client });
+        for await (const _ of provider.generate({
+          model: 'claude-haiku-4-5',
+          max_tokens: 16,
+          messages: [assistantWithReasoning, { role: 'user', content: 'go' }],
+        })) {
+          // drain
+        }
+        // Haiku is non-adaptive → replay gated off → reasoning dropped.
+        const params = handle.streamCalls[0]?.params as {
+          messages: Array<{ content: Array<{ type: string }> }>;
+        };
+        expect((params.messages[0]?.content ?? []).map((b) => b.type)).toEqual(['text']);
+      });
+    });
+  });
+
   test('rejects thinking_budget >= max_tokens before leaving the binary', async () => {
     // Anthropic 400s on thinking_budget >= max_tokens. The
     // loader-side gate (`subagents/load.ts`) only catches the

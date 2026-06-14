@@ -333,6 +333,17 @@ const evaluateExpectations = (
             : { detail: `assistant output did not contain '${expectation.pattern}'` }),
         };
       }
+      case 'min_steps': {
+        const steps = result?.steps ?? 0;
+        const passed = steps >= expectation.count;
+        return {
+          expectation,
+          passed,
+          ...(passed
+            ? {}
+            : { detail: `ran ${steps} step(s), expected at least ${expectation.count}` }),
+        };
+      }
       case 'compaction_triggered': {
         const matching =
           expectation.strategy === undefined

@@ -1,5 +1,10 @@
 import { emptyUsage } from '../providers/cost.ts';
-import type { StopReason, StreamEvent, UsageInfo } from '../providers/index.ts';
+import type {
+  ProviderReasoningBlock,
+  StopReason,
+  StreamEvent,
+  UsageInfo,
+} from '../providers/index.ts';
 
 // Wraps an iteration error so the partial CollectedStep is recoverable
 // at the harness layer. Without this, usage/text/tool_uses captured
@@ -36,6 +41,11 @@ export interface CollectedStep {
   text: string;
   tool_uses: CollectedToolUse[];
   thinking: string;
+  // Opaque, provider-tagged reasoning artifacts captured this turn (Anthropic
+  // signed thinking, OpenAI reasoning items). Stored on the assistant message
+  // for verbatim replay next request (capture is wired now; replay is flagged,
+  // per-provider). Distinct from `thinking`, which is the live-display text.
+  reasoning: ProviderReasoningBlock[];
   stop_reason: StopReason;
   errors: CollectedError[];
   usage: UsageInfo;
@@ -51,6 +61,7 @@ const empty = (): CollectedStep => ({
   text: '',
   tool_uses: [],
   thinking: '',
+  reasoning: [],
   stop_reason: 'end_turn',
   errors: [],
   usage: emptyUsage(),
@@ -87,6 +98,10 @@ export const collectStep = async (
           break;
         case 'thinking_delta':
           out.thinking += ev.text;
+          break;
+        case 'reasoning':
+          // Opaque artifact for replay — stored verbatim, never normalized.
+          out.reasoning.push({ type: 'reasoning', provider: ev.provider, data: ev.data });
           break;
         case 'tool_use_start':
           toolNamesById.set(ev.id, ev.name);

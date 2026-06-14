@@ -39,6 +39,9 @@ export interface RawResponsesEvent {
     call_id?: string;
     name?: string;
     arguments?: string;
+    // gpt-5.3-codex preamble/closeout marker on assistant message items
+    // (commentary | final_answer). Captured so it round-trips.
+    phase?: string;
   };
   // created / completed / incomplete / failed
   response?: {
@@ -145,6 +148,24 @@ export async function* normalizeResponsesStream(
             }
           }
           yield { kind: 'tool_use_stop', id: ev.item.call_id, final_args: parsed };
+        } else if (ev.item?.type === 'reasoning') {
+          // Capture the reasoning output item VERBATIM (opaque — carries id,
+          // summary, the encrypted_content requested via `include`, and any
+          // `phase`). Stored on the assistant turn; replayed as an input item
+          // next request only when FORJA_OPENAI_REASONING_REPLAY is on. The
+          // harness never inspects `data`; the adapter round-trips it unchanged.
+          yield { kind: 'reasoning', provider: 'openai', data: ev.item };
+        } else if (ev.item?.type === 'message' && typeof ev.item.phase === 'string') {
+          // gpt-5.3-codex `phase` rides on the assistant MESSAGE item, which the
+          // harness rebuilds from text (losing the field). Carry it on the
+          // reasoning channel via a sentinel so the OpenAI adapter can re-stamp
+          // it onto the replayed assistant message (dropping the phase causes
+          // "significant performance degradation" per the codex guide).
+          yield {
+            kind: 'reasoning',
+            provider: 'openai',
+            data: { __forja_message_phase: ev.item.phase },
+          };
         }
         break;
 

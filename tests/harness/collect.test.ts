@@ -24,6 +24,32 @@ describe('collectStep', () => {
     expect(out.errors).toEqual([]);
   });
 
+  test('reasoning events are collected verbatim into reasoning[]', async () => {
+    const out = await collectStep(
+      fromEvents([
+        { kind: 'start', message_id: 'm_r' },
+        { kind: 'thinking_delta', text: 'think live' },
+        {
+          kind: 'reasoning',
+          provider: 'anthropic',
+          data: { thinking: 'think live', signature: 'SIG1' },
+        },
+        { kind: 'text_delta', text: 'answer' },
+        { kind: 'stop', reason: 'end_turn' },
+      ]),
+    );
+    expect(out.reasoning).toEqual([
+      {
+        type: 'reasoning',
+        provider: 'anthropic',
+        data: { thinking: 'think live', signature: 'SIG1' },
+      },
+    ]);
+    // thinking-delta still feeds the live-display text channel, orthogonally.
+    expect(out.thinking).toBe('think live');
+    expect(out.text).toBe('answer');
+  });
+
   test('single tool_use accumulates name from start, args from stop', async () => {
     const out = await collectStep(
       fromEvents([

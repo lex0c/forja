@@ -1,0 +1,3 @@
+value: 5
+flag: no
+next: n_o6.txt

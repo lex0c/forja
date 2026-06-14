@@ -1,0 +1,3 @@
+value: 3
+flag: yes
+next: n_k2.txt

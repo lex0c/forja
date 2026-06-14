@@ -22,7 +22,8 @@ export type RawAnthropicEvent =
       content_block:
         | { type: 'text'; text?: string }
         | { type: 'tool_use'; id: string; name: string; input?: unknown }
-        | { type: 'thinking'; thinking?: string };
+        | { type: 'thinking'; thinking?: string }
+        | { type: 'redacted_thinking'; data?: string };
     }
   | {
       type: 'content_block_delta';
@@ -70,6 +71,15 @@ export async function* normalizeAnthropicStream(
   raw: AsyncIterable<RawAnthropicEvent>,
 ): AsyncIterable<StreamEvent> {
   const toolUses = new Map<number, ToolUseInProgress>();
+  // Accumulate signed thinking blocks per content-block index: text from
+  // `thinking_delta`, signature from `signature_delta`. Emitted as a canonical
+  // `reasoning` event at the block's stop so the harness can store + replay it
+  // (the signature must round-trip byte-identical or Anthropic 400s the next
+  // tool-bearing turn).
+  const thinkingBlocks = new Map<number, { thinking: string; signature: string }>();
+  // Safety-redacted thinking blocks: opaque `data`, captured at content_block_start
+  // (no deltas), replayed verbatim. Indexed like thinkingBlocks.
+  const redactedBlocks = new Map<number, string>();
   let stopReason: StopReason = 'end_turn';
   // Anthropic splits usage across two events: input/cache numbers ride
   // `message_start.message.usage`; output_tokens lands on the final
@@ -142,8 +152,16 @@ export async function* normalizeAnthropicStream(
               name: event.content_block.name,
             };
           }
-          // text and thinking blocks need no start event in the canonical shape;
-          // their first delta carries the data.
+          if (event.content_block.type === 'thinking') {
+            thinkingBlocks.set(event.index, {
+              thinking: event.content_block.thinking ?? '',
+              signature: '',
+            });
+          } else if (event.content_block.type === 'redacted_thinking') {
+            redactedBlocks.set(event.index, event.content_block.data ?? '');
+          }
+          // text blocks need no start event in the canonical shape; their first
+          // delta carries the data.
           break;
 
         case 'content_block_delta': {
@@ -161,14 +179,44 @@ export async function* normalizeAnthropicStream(
               };
             }
           } else if (delta.type === 'thinking_delta') {
+            const tb = thinkingBlocks.get(event.index);
+            if (tb !== undefined) tb.thinking += delta.thinking;
             yield { kind: 'thinking_delta', text: delta.thinking };
+          } else if (delta.type === 'signature_delta') {
+            // Captured (no longer dropped): the signature authenticates the
+            // thinking block and must be replayed verbatim with the next
+            // tool_result. Still has no UI surface — accumulated, not yielded.
+            const tb = thinkingBlocks.get(event.index);
+            if (tb !== undefined) tb.signature += delta.signature;
           }
-          // signature_delta (extended thinking signing) is intentionally dropped:
-          // it has no UI value and isn't part of the canonical taxonomy.
           break;
         }
 
         case 'content_block_stop': {
+          const redacted = redactedBlocks.get(event.index);
+          if (redacted !== undefined) {
+            redactedBlocks.delete(event.index);
+            yield {
+              kind: 'reasoning',
+              provider: 'anthropic',
+              data: { redacted_thinking: redacted },
+            };
+            break;
+          }
+          const thinking = thinkingBlocks.get(event.index);
+          if (thinking !== undefined) {
+            thinkingBlocks.delete(event.index);
+            // Only a SIGNED thinking block is replayable; an unsigned one would
+            // 400 if sent with tool_results, so we don't store it as reasoning.
+            if (thinking.signature.length > 0) {
+              yield {
+                kind: 'reasoning',
+                provider: 'anthropic',
+                data: { thinking: thinking.thinking, signature: thinking.signature },
+              };
+            }
+            break;
+          }
           const tool = toolUses.get(event.index);
           if (tool !== undefined) {
             let parsed: Record<string, unknown> = {};
