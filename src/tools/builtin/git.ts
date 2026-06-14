@@ -1075,11 +1075,22 @@ export const gitTool: Tool<GitInput, GitOutput> = {
       ...(ctx.sandboxTmpdir !== undefined ? { TMPDIR: ctx.sandboxTmpdir } : {}),
     };
 
-    // Neutralize any repo-configured clean/smudge/process filter before
-    // any worktree-comparing command runs (diff/status + the gate's
-    // pre-flight clean the worktree, executing the filter command).
-    // Extend the hardening prefix used by every subsequent run.
-    const filterFlags = await filterDisableFlags(gitBin, spawnEnv, ctx);
+    // Neutralize any repo-configured clean/smudge/process filter before a
+    // worktree-comparing command runs (the `.gitattributes`-bound clean filter
+    // is a repo-config-backed command = attacker code in an untrusted repo).
+    // ONLY diff (unstaged) / status / blame read worktree CONTENT and so can
+    // fire that filter (verified: each exits 128 against an empty required
+    // filter); log / ls_files / show / show_file / `diff --staged` read only
+    // committed objects or the index — never the worktree — so they run no
+    // filter at all. Limit the FAIL-CLOSED enumeration to that worktree set:
+    // running it unconditionally let a hostile/huge filter config overflow the
+    // 256 KiB capture cap and refuse a SAFE history/blob read (log, show_file,
+    // …) that never touches a filter. Extends the hardening prefix for the run.
+    const worktreeComparing =
+      args.mode === 'status' ||
+      args.mode === 'blame' ||
+      (args.mode === 'diff' && args.staged !== true);
+    const filterFlags = worktreeComparing ? await filterDisableFlags(gitBin, spawnEnv, ctx) : [];
     if (filterFlags === null) {
       // An abort during the enumeration also collapses to null (captureGit
       // returns the aborted error, which filterDisableFlags maps to null);

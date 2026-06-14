@@ -708,6 +708,36 @@ describe.if(GIT_AVAILABLE)('gitTool — against a real repo', () => {
     if (isToolError(out)) expect(out.error_code).toBe('git.policy_denied');
   });
 
+  test('a filter-config overflow does NOT block safe non-worktree modes (log/ls_files/show_file)', async () => {
+    // Same hostile/huge filter config, but log / ls_files / show_file never
+    // invoke a clean filter — the fail-closed enumeration is scoped to the
+    // worktree-comparing modes (diff/status/blame), so these stay readable
+    // instead of being refused because the key list overflowed the cap.
+    const name = 'f'.repeat(150);
+    let cfg = '';
+    for (let i = 0; i < 1700; i++) cfg += `[filter "${name}${i}"]\n\tclean = x\n`;
+    appendFileSync(join(dir, '.git', 'config'), cfg);
+    const allow = makeCtx({ cwd: dir });
+
+    const log = await gitTool.execute({ mode: 'log' }, allow);
+    if (isToolError(log)) throw new Error(`log refused: ${log.error_message}`);
+    expect(log.output).toContain('add a');
+
+    const ls = await gitTool.execute({ mode: 'ls_files' }, allow);
+    if (isToolError(ls)) throw new Error(`ls_files refused: ${ls.error_message}`);
+    expect(ls.output).toContain('a.ts');
+
+    const showFile = await gitTool.execute({ mode: 'show_file', path: 'a.ts' }, allow);
+    if (isToolError(showFile)) throw new Error(`show_file refused: ${showFile.error_message}`);
+    expect(showFile.output).toContain('export const a');
+
+    // Control: a worktree-comparing mode (diff) STILL fails closed on the same
+    // config — the enumeration runs there, where a clean filter could fire.
+    writeFileSync(join(dir, 'a.ts'), 'export const a = 5;\n');
+    const diff = await gitTool.execute({ mode: 'diff' }, allow);
+    expect(isToolError(diff)).toBe(true);
+  });
+
   test('neutralizes a repo-configured clean filter: no exec, and fails closed', async () => {
     const canary = join(dir, 'CANARY');
     const flt = join(dir, 'flt.sh');

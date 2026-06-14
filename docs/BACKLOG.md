@@ -2,6 +2,25 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] git tool: scope the fail-closed filter enumeration to worktree modes
+
+`filterDisableFlags` (the clean/smudge neutralizer) ran UNCONDITIONALLY before
+every mode, and it fails closed (refuses with git.policy_denied) if the
+`filter.*.clean` key list overflows the 256 KiB capture cap. So a repo with a
+huge/hostile filter config could refuse even `log` / `ls_files` / `show_file` —
+modes that never run a clean filter. Scoped the enumeration to the modes that
+actually read worktree CONTENT and so can fire the filter: `status`, unstaged
+`diff`, and `blame`. log / ls_files / show / show_file / `diff --staged` skip it
+(they read only committed objects or the index).
+
+Correction to the finding: it listed `blame` as safe, but `blame` DOES run the
+clean filter on a locally-modified filter-bound file (empirically exit 128 vs an
+empty required filter) — skipping the pin there would EXEC the repo's filter
+command, the exact hole the neutralizer closes. So blame stays gated; the
+genuinely-safe set (verified each exits 0) is log/ls_files/show/show_file/
+diff --staged. Test: a cap-overflowing filter config no longer refuses
+log/ls_files/show_file, while diff still fails closed.
+
 ## [2026-06-14] git tool: gate `log` against denied-subtree commits
 
 `log` was excluded from both per-file gates (content + metadata), so a pathless /
