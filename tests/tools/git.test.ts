@@ -11,7 +11,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { maybeWrapSandboxArgv } from '../../src/permissions/index.ts';
-import { buildModeArgs, gitTool } from '../../src/tools/builtin/git.ts';
+import { buildModeArgs, gitTool, sandboxPassthroughEnv } from '../../src/tools/builtin/git.ts';
 import { isToolError } from '../../src/tools/types.ts';
 import { makeCtx } from './_helpers.ts';
 
@@ -857,5 +857,45 @@ describe('git sandbox env forwarding', () => {
     expect(hasSetenv(argv, 'GIT_LITERAL_PATHSPECS', '1')).toBe(true);
     expect(hasSetenv(argv, 'GIT_OPTIONAL_LOCKS', '0')).toBe(true);
     expect(hasSetenv(argv, 'GIT_PAGER', 'cat')).toBe(true);
+  });
+
+  test('sandboxPassthroughEnv drops TMPDIR but keeps the GIT_* guards', () => {
+    // TMPDIR must NOT cross via passthrough: under shared_tmp the runner
+    // forces TMPDIR=/tmp (the writable bind) and applies the caller's
+    // passthrough LAST, so a forwarded host-path TMPDIR would override
+    // /tmp and send git's temp writes outside the namespace's writable tmp.
+    // Everything else (the GIT_* guards that aren't in the safe-list) must
+    // still pass through.
+    const passthrough = sandboxPassthroughEnv({
+      PATH: '/usr/bin',
+      HOME: '/home/op',
+      GIT_CONFIG_GLOBAL: '/dev/null',
+      GIT_OPTIONAL_LOCKS: '0',
+      GIT_LITERAL_PATHSPECS: '1',
+      TMPDIR: '/tmp/forja-session-abc',
+    });
+    expect(passthrough.TMPDIR).toBeUndefined();
+    expect(passthrough.GIT_CONFIG_GLOBAL).toBe('/dev/null');
+    expect(passthrough.GIT_OPTIONAL_LOCKS).toBe('0');
+    expect(passthrough.GIT_LITERAL_PATHSPECS).toBe('1');
+    expect(passthrough.PATH).toBe('/usr/bin');
+    expect(passthrough.HOME).toBe('/home/op');
+
+    // And the wrapper emits exactly those — the GIT_* guards survive, TMPDIR
+    // is not forwarded via passthrough (the safe-list/runner own TMPDIR).
+    const argv = maybeWrapSandboxArgv({
+      profile: 'ro',
+      cwd: '/work/proj',
+      home: '/home/op',
+      innerArgv: ['/usr/bin/git', 'status'],
+      env: { PATH: '/usr/bin', HOME: '/home/op' },
+      passthroughEnv: passthrough,
+      platform: 'linux',
+      which: () => '/usr/bin/bwrap',
+      realpath: (p) => p,
+      pathExists: () => false,
+    });
+    expect(hasSetenv(argv, 'GIT_CONFIG_GLOBAL', '/dev/null')).toBe(true);
+    expect(hasSetenv(argv, 'TMPDIR', '/tmp/forja-session-abc')).toBe(false);
   });
 });

@@ -400,6 +400,25 @@ interface GitCapture {
   stderr: string;
 }
 
+// The passthrough env for the sandbox wrapper: every key in spawnEnv
+// EXCEPT TMPDIR. TMPDIR must NOT cross via passthrough — under `shared_tmp`
+// (default on, Linux) the runner binds the session tmp dir to `/tmp` and
+// FORCES `TMPDIR=/tmp` (the writable mountpoint), but it applies the
+// caller's passthrough LAST (last-setenv-wins). So a host-path TMPDIR
+// forwarded here would override `/tmp` and point git's temp writes at a
+// path that isn't the writable bind inside the namespace (EROFS/ENOENT on
+// a large-object spill). TMPDIR stays in `env`: correct for the
+// unsandboxed spawn, and carried by the sandbox safe-list which the runner
+// then overrides with `/tmp`. Exported pure so the exclusion is unit-
+// testable without spawning git.
+export const sandboxPassthroughEnv = (spawnEnv: Record<string, string>): Record<string, string> => {
+  const rest: Record<string, string> = {};
+  for (const [key, value] of Object.entries(spawnEnv)) {
+    if (key !== 'TMPDIR') rest[key] = value;
+  }
+  return rest;
+};
+
 // Reap a git child we've ASKED to stop (truncation SIGTERM, or an abort
 // that made Bun SIGTERM it), bounding the wait: race `proc.exited` against
 // a grace window and escalate to an uncatchable SIGKILL if it overruns.
@@ -450,9 +469,11 @@ const captureGit = async (
     // gone whenever sandboxing is on. They are NOT in SANDBOX_SAFE_ENV
     // _VARS, so thread them through `passthroughEnv` (emitted as
     // `--setenv` past the clearenv boundary); `env` seeds the safe-list
-    // from our controlled env rather than `process.env`.
+    // from our controlled env rather than `process.env`. TMPDIR is
+    // dropped from the passthrough (see sandboxPassthroughEnv) so it can't
+    // override the runner's forced `TMPDIR=/tmp` under shared_tmp.
     env: spawnEnv,
-    passthroughEnv: spawnEnv,
+    passthroughEnv: sandboxPassthroughEnv(spawnEnv),
     ...(ctx.sandboxTmpdir !== undefined ? { tmpdir: ctx.sandboxTmpdir } : {}),
     failClosed: ctx.sandboxBootTool !== undefined,
   });

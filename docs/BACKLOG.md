@@ -2,6 +2,27 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] git tool: don't forward TMPDIR through the sandbox passthrough
+
+Review finding (sandbox correctness). captureGit passed its full `spawnEnv` as
+`passthroughEnv`, and spawnEnv carries `TMPDIR: ctx.sandboxTmpdir` (the HOST path).
+Under `shared_tmp` (default on, Linux) the runner binds the session tmp dir to
+`/tmp` and FORCES `TMPDIR=/tmp` (the writable mountpoint), but it applies the
+caller's passthrough LAST (last-setenv-wins) — so the forwarded host-path TMPDIR
+overrode `/tmp`, pointing git's temp writes at a path that isn't the writable
+bind inside the namespace (EROFS/ENOENT on a large-object spill). Latent for
+small reads (git rarely needs TMPDIR with ext-diff/textconv off and
+OPTIONAL_LOCKS=0), but it silently defeated a deliberate sandbox mechanism. (git-
+specific: grep doesn't pass a passthroughEnv at all, so it never had this.)
+
+Fix (option A, git-side): a pure `sandboxPassthroughEnv(spawnEnv)` that returns
+every key except TMPDIR; captureGit threads that as `passthroughEnv` while keeping
+TMPDIR in `env` (correct for the unsandboxed spawn, and carried by the safe-list
+which the runner then overrides with `/tmp`). The GIT_* guards still cross the
+clearenv boundary. Test: the helper drops TMPDIR + keeps the GIT_* guards, and the
+wrapper emits the guards but no TMPDIR via passthrough. This closes the last
+deferred item from the git-tool review round.
+
 ## [2026-06-13] git tool: disable REQUIRED filters along with their commands (LFS fix)
 
 Review finding (a real usability break). `filterDisableFlags` pinned each
