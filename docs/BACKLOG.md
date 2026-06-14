@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] git tool: clarify show_file takes a bare ref + separate path
+
+Usability finding from live testing: a model tried `show_file` with
+`ref: "HEAD:src/x.ts"` (git's native `rev:path` form) and hit the generic "ref
+contains unsupported characters". Root cause was the schema doc itself — the mode
+enum said "show_file: … (`ref:path`, requires path)", which invited the exact
+mistake while the `ref` field said "the revision" (contradictory). Fixed the doc:
+show_file now reads "put the file in `path` and the BARE revision in `ref` …; do
+NOT use git's `rev:path` form", and the `ref` field says "a BARE revision only —
+never `rev:path`". Also added a targeted error for a `ref` containing `:` ("ref
+must be a bare revision … not git's `rev:path` form; for show_file, pass the file
+in `path` separately") so a model that still slips gets pointed straight at the
+fix instead of the generic message. Test added.
+
 ## [2026-06-14] tui(subagents): group scrollback blocks under a `● Subagents` title; git chip subject
 
 Follow-ups to the subagent rework (UI-first; live-validated in the binary).

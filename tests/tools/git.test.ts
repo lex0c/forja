@@ -37,6 +37,14 @@ describe('buildModeArgs — flag-injection rejection', () => {
     }
   });
 
+  test('a `rev:path` ref gets a targeted message (the common show_file mistake)', () => {
+    const r = buildModeArgs({ mode: 'show_file', ref: 'HEAD:src/a.ts', path: 'src/a.ts' });
+    if (!('error' in r)) throw new Error('expected error');
+    expect(r.error).toMatch(/bare revision|rev:path/);
+    // (vs the generic "unsupported characters" for other bad refs)
+    expect(r.error).not.toBe('ref contains unsupported characters');
+  });
+
   test("rejects path with '..', absolute path, and leading '-'", () => {
     expect('error' in buildModeArgs({ mode: 'diff', path: '../etc/passwd' })).toBe(true);
     expect('error' in buildModeArgs({ mode: 'diff', path: '/etc/passwd' })).toBe(true);

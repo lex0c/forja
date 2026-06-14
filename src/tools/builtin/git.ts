@@ -185,6 +185,15 @@ export const buildModeArgs = (args: GitInput): { args: string[] } | { error: str
     if (typeof ref !== 'string') return { error: 'ref must be a string' };
     if (ref.length === 0) return { error: 'ref must be non-empty' };
     if (ref.startsWith('-')) return { error: "ref must not start with '-'" };
+    // A `:` means the caller used git's native `rev:path` form — the common
+    // show_file mistake. Catch it specifically (REF_RE would reject it with
+    // a generic message) and point at the typed-arg shape.
+    if (ref.includes(':')) {
+      return {
+        error:
+          "ref must be a bare revision (e.g. HEAD, a tag, a SHA) — not git's `rev:path` form; for show_file, pass the file in `path` separately",
+      };
+    }
     if (!REF_RE.test(ref)) return { error: 'ref contains unsupported characters' };
   }
 
@@ -869,7 +878,7 @@ export const gitTool: Tool<GitInput, GitOutput> = {
         type: 'string',
         enum: ['log', 'show', 'show_file', 'diff', 'blame', 'status', 'ls_files'],
         description:
-          'log: commit history; show: a commit + its diff (commit-ish ref only — not a file blob); show_file: the CONTENT of one file at a revision (`ref:path`, requires path); diff: working-tree or staged changes (vs ref if given); blame: per-line last-change (requires path); status: working-tree state; ls_files: tracked files.',
+          "log: commit history; show: a commit + its diff (commit-ish ref only — not a file blob); show_file: the CONTENT of one file at a revision — put the file in `path` and the BARE revision in `ref` (e.g. HEAD/tag/SHA, default HEAD); do NOT use git's `rev:path` form; diff: working-tree or staged changes (vs ref if given); blame: per-line last-change (requires path); status: working-tree state; ls_files: tracked files.",
       },
       path: {
         type: 'string',
@@ -878,7 +887,7 @@ export const gitTool: Tool<GitInput, GitOutput> = {
       ref: {
         type: 'string',
         description:
-          'Commit/branch/tag (or A..B range for diff; the revision for show_file, default HEAD). Read-only; never a flag.',
+          "Commit/branch/tag, or A..B range for diff. A BARE revision only — never git's `rev:path` form (pass the file in `path`); show_file defaults it to HEAD. Read-only; never a flag.",
       },
       max_count: { type: 'integer', minimum: 1, description: 'log: max commits (default 50).' },
       staged: {
