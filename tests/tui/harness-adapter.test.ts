@@ -621,6 +621,29 @@ describe('harness-adapter — tool lifecycle', () => {
     ).toEqual([]);
   });
 
+  test('task_* subagent-orchestration tools are silent (only the Subagents block shows)', () => {
+    // The parent's task_sync/task_async call is plumbing — the operator's
+    // surface is the live Subagents block, not a "Calling task_sync" chip
+    // stacked next to it. The vocab marks the task_* family `silent`.
+    const a = createHarnessAdapter(baseCtx());
+    for (const toolName of ['task_sync', 'task_async', 'task_await', 'task_cancel', 'task_list']) {
+      expect(
+        types(a.translate({ type: 'tool_invoking', toolUseId: 't', toolName, args: {} })),
+      ).toEqual([]);
+      expect(
+        types(
+          a.translate({
+            type: 'tool_finished',
+            toolUseId: 't',
+            toolName,
+            failed: false,
+            durationMs: 1,
+          }),
+        ),
+      ).toEqual([]);
+    }
+  });
+
   test('unknown tool falls back to generic Calling/Called verbs and null subject', () => {
     const a = createHarnessAdapter(baseCtx());
     const out = a.translate({
@@ -1269,10 +1292,9 @@ describe('harness-adapter — subagent observability', () => {
     expect(ev.progress).toBe('running echo');
   });
 
-  test('nested (subagent-mirrored) multi-line tool subject is flattened too', () => {
-    // The subagent mirror emits a parentId-tagged tool:start; a multi-line
-    // bash/heredoc command must be flattened to one line there too, or its
-    // raw `\n` leaks a stale nested card (same row-count bug as top-level).
+  test('subagent_progress flattens a multi-line subject into currentTool (line 2)', () => {
+    // The in-flight tool label (row line 2) must be one line — a multi-line
+    // bash/heredoc command can't leak a raw `\n` into the row.
     const a = createHarnessAdapter(baseCtx());
     const out = a.translate({
       type: 'subagent_progress',
@@ -1284,14 +1306,35 @@ describe('harness-adapter — subagent observability', () => {
         args: { command: 'echo a\n  for x in *; do\n  echo $x\n  done' },
       },
     });
-    const start = out.find((e) => e.type === 'tool:start') as Extract<
-      UIEvent,
-      { type: 'tool:start' }
-    >;
-    expect(start).toBeDefined();
-    expect(start.parentId).toBe('c');
-    expect(start.subject).not.toContain('\n');
-    expect(start.subject).toBe('echo a for x in *; do echo $x done');
+    expect(types(out)).toEqual(['subagent:update']);
+    const ev = out[0] as Extract<UIEvent, { type: 'subagent:update' }>;
+    // No raw newline reaches the row (sanitizeOneLineForDisplay maps
+    // \r\n\t → space; the renderer's truncate collapses any space run).
+    expect(ev.currentTool).not.toContain('\n');
+    expect(ev.currentTool?.startsWith('bash echo a')).toBe(true);
+    expect(ev.currentTool).toContain('done');
+  });
+
+  test('subagent_progress strips ANSI/control bytes out of currentTool (live-render safety)', () => {
+    // currentTool (line 2) re-renders into the live region every heartbeat
+    // tick; an untrusted ESC/BEL in a child's grep pattern / bash command
+    // would ring the bell or paint fake SGR on each redraw. The subject is
+    // sanitized at the state boundary.
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'subagent_progress',
+      subagentId: 'c',
+      lastEvent: {
+        type: 'tool_invoking',
+        toolUseId: 't1',
+        toolName: 'grep',
+        args: { pattern: 'red\x1b[31m\x07BEL' },
+      },
+    });
+    const ev = out[0] as Extract<UIEvent, { type: 'subagent:update' }>;
+    expect(ev.currentTool).not.toContain('\x1b'); // ESC stripped
+    expect(ev.currentTool).not.toContain('\x07'); // BEL stripped
+    expect(ev.currentTool).toBe('grep redBEL');
   });
 
   test('subagent_progress maps tool_finished failed/done correctly', () => {
@@ -1367,13 +1410,10 @@ describe('harness-adapter — subagent observability', () => {
     expect(types(out)).toEqual(['subagent:update']);
   });
 
-  test('subagent_progress with tool_invoking inner emits BOTH subagent:update AND tool:start', () => {
-    // Slice 1: a subagent doing real work shouldn't surface as
-    // nothing but a heartbeat row. The adapter dual-emits a
-    // permanent tool:start chip alongside the live subagent:update
-    // so the operator sees the actual file path / args in
-    // scrollback, not just the verb scrolling past on the live
-    // region.
+  test('subagent_progress tool_invoking sets currentTool (no nested tool:start)', () => {
+    // The child's tools no longer stream as scrollback chips — they feed
+    // the row's line 2 via `currentTool` (short tool name + subject).
+    // Only a subagent:update is emitted, no tool:start.
     const a = createHarnessAdapter(baseCtx());
     const out = a.translate({
       type: 'subagent_progress',
@@ -1385,36 +1425,16 @@ describe('harness-adapter — subagent observability', () => {
         args: { path: 'src/foo.ts' },
       },
     });
-    expect(types(out)).toEqual(['subagent:update', 'tool:start']);
-    const start = out[1] as Extract<UIEvent, { type: 'tool:start' }>;
-    // toolId is namespaced so concurrent subagents can't clash.
-    expect(start.toolId).toBe('sub:deadbeef-1234-5678-9abc-def012345678:tu-child-1');
-    expect(start.name).toBe('read_file');
-    // Slice 2: parentId carries the subagentId so the renderer
-    // can indent the chip with `|_`. Subject stays the raw vocab
-    // extractor output (no `[sub …]` prefix — the indent is the
-    // attribution signal now).
-    expect(start.parentId).toBe('deadbeef-1234-5678-9abc-def012345678');
-    expect(start.subject).toBe('src/foo.ts');
+    expect(types(out)).toEqual(['subagent:update']);
+    const ev = out[0] as Extract<UIEvent, { type: 'subagent:update' }>;
+    expect(ev.currentTool).toBe('read src/foo.ts');
+    expect(ev.progress).toBe('running read_file');
   });
 
-  test('subagent_progress tool_finished after tool_invoking → matched tool:end with same namespaced toolId', () => {
-    // Pin the round-trip: tool:start and tool:end carry the SAME
-    // namespaced toolId so the reducer's per-toolId state machine
-    // (state.tools map) matches them. A regression that
-    // forgot to namespace one side would leak entries in the
-    // map AND render an orphan tool-end with no preceding start.
+  test('subagent_progress tool_finished sets toolDone (no nested tool:end)', () => {
+    // The child's tools no longer stream as scrollback chips — a finished
+    // tool feeds the per-type aggregate via toolDone, not a tool:end.
     const a = createHarnessAdapter(baseCtx());
-    a.translate({
-      type: 'subagent_progress',
-      subagentId: 'aaaaaaaa-1111-2222-3333-444444444444',
-      lastEvent: {
-        type: 'tool_invoking',
-        toolUseId: 'tu-x',
-        toolName: 'echo',
-        args: { msg: 'hi' },
-      },
-    });
     const out = a.translate({
       type: 'subagent_progress',
       subagentId: 'aaaaaaaa-1111-2222-3333-444444444444',
@@ -1426,132 +1446,31 @@ describe('harness-adapter — subagent observability', () => {
         durationMs: 42,
       },
     });
-    expect(types(out)).toEqual(['subagent:update', 'tool:end']);
-    const end = out[1] as Extract<UIEvent, { type: 'tool:end' }>;
-    expect(end.toolId).toBe('sub:aaaaaaaa-1111-2222-3333-444444444444:tu-x');
-    expect(end.status).toBe('done');
-    expect(end.durationMs).toBe(42);
+    expect(types(out)).toEqual(['subagent:update']);
+    const ev = out[0] as Extract<UIEvent, { type: 'subagent:update' }>;
+    expect(ev.toolDone).toBe('echo');
+    expect(ev.progress).toBe('echo done');
   });
 
-  test('subagent_progress tool_execution_started → nested tool:execution-started', () => {
+  test('subagent_progress tool_execution_started emits a generic subagent:update (no chip)', () => {
     const a = createHarnessAdapter(baseCtx());
     const out = a.translate({
       type: 'subagent_progress',
       subagentId: 'bbbbbbbb-1111-2222-3333-444444444444',
       lastEvent: { type: 'tool_execution_started', toolUseId: 'tu-e' },
     });
-    expect(types(out)).toEqual(['subagent:update', 'tool:execution-started']);
-    const ev = out[1] as Extract<UIEvent, { type: 'tool:execution-started' }>;
-    expect(ev.toolId).toBe('sub:bbbbbbbb-1111-2222-3333-444444444444:tu-e');
+    expect(types(out)).toEqual(['subagent:update']);
+    const ev = out[0] as Extract<UIEvent, { type: 'subagent:update' }>;
+    expect(ev.currentTool).toBeUndefined();
+    expect(ev.toolDone).toBeUndefined();
   });
 
-  test('subagent_progress tool_finished forwards outputTruncated and exitCode onto tool:end', () => {
+  test('two concurrent subagents attribute currentTool to their own id (no shared state)', () => {
+    // The child's tool counts live in the reducer keyed by subagentId, so
+    // siblings reusing the same local toolUseId can't collide — the
+    // adapter just tags each subagent:update with its subagentId.
     const a = createHarnessAdapter(baseCtx());
-    a.translate({
-      type: 'subagent_progress',
-      subagentId: 'cccccccc-1111-2222-3333-444444444444',
-      lastEvent: { type: 'tool_invoking', toolUseId: 'tu-c', toolName: 'bash', args: {} },
-    });
-    const out = a.translate({
-      type: 'subagent_progress',
-      subagentId: 'cccccccc-1111-2222-3333-444444444444',
-      lastEvent: {
-        type: 'tool_finished',
-        toolUseId: 'tu-c',
-        toolName: 'bash',
-        failed: false,
-        durationMs: 12,
-        outputTruncated: true,
-        exitCode: 1,
-      },
-    });
-    const end = out.find((e) => e.type === 'tool:end') as Extract<UIEvent, { type: 'tool:end' }>;
-    expect(end.outputTruncated).toBe(true);
-    expect(end.exitCode).toBe(1);
-  });
-
-  test('subagent_progress tool_finished with failed=true → tool:end status=error', () => {
-    const a = createHarnessAdapter(baseCtx());
-    a.translate({
-      type: 'subagent_progress',
-      subagentId: 'c',
-      lastEvent: {
-        type: 'tool_invoking',
-        toolUseId: 'tu-fail',
-        toolName: 'grep',
-        args: { pattern: 'x' },
-      },
-    });
-    const out = a.translate({
-      type: 'subagent_progress',
-      subagentId: 'c',
-      lastEvent: {
-        type: 'tool_finished',
-        toolUseId: 'tu-fail',
-        toolName: 'grep',
-        failed: true,
-        durationMs: 5,
-      },
-    });
-    const end = out.find((e) => e.type === 'tool:end') as
-      | Extract<UIEvent, { type: 'tool:end' }>
-      | undefined;
-    expect(end?.status).toBe('error');
-  });
-
-  test('subagent_progress tool_decided=deny followed by tool_finished → tool:end status=denied with reason', () => {
-    // Mirrors the top-level deny path: the decision is captured
-    // on tool_decided and surfaces as the chip's `summary` on
-    // tool_finished. Without this, an operator who hits a strict
-    // policy in a subagent sees "echo failed" with no clue why.
-    const a = createHarnessAdapter(baseCtx());
-    a.translate({
-      type: 'subagent_progress',
-      subagentId: 'c',
-      lastEvent: {
-        type: 'tool_invoking',
-        toolUseId: 'tu-deny',
-        toolName: 'echo',
-        args: { msg: 'x' },
-      },
-    });
-    a.translate({
-      type: 'subagent_progress',
-      subagentId: 'c',
-      lastEvent: {
-        type: 'tool_decided',
-        toolUseId: 'tu-deny',
-        decision: { kind: 'deny', reason: 'policy says no' },
-      },
-    });
-    const out = a.translate({
-      type: 'subagent_progress',
-      subagentId: 'c',
-      lastEvent: {
-        type: 'tool_finished',
-        toolUseId: 'tu-deny',
-        toolName: 'echo',
-        failed: false,
-        denied: true,
-        durationMs: 1,
-      },
-    });
-    const end = out.find((e) => e.type === 'tool:end') as
-      | Extract<UIEvent, { type: 'tool:end' }>
-      | undefined;
-    expect(end?.status).toBe('denied');
-    expect(end?.summary).toBe('policy says no');
-  });
-
-  test('two concurrent subagents with the SAME local toolUseId do not collide on state.tools', () => {
-    // The child generates toolUseIds locally, so two siblings
-    // running in parallel both pick "tu1" with high probability
-    // (or hand-rolled in tests). Without namespacing, the second
-    // tool_invoking would overwrite the first's state entry; on
-    // tool_finished, both would resolve to the same map key and
-    // the surviving chip status would describe the wrong tool.
-    const a = createHarnessAdapter(baseCtx());
-    a.translate({
+    const aOut = a.translate({
       type: 'subagent_progress',
       subagentId: 'sub-A',
       lastEvent: {
@@ -1561,7 +1480,7 @@ describe('harness-adapter — subagent observability', () => {
         args: { path: 'a.ts' },
       },
     });
-    a.translate({
+    const bOut = a.translate({
       type: 'subagent_progress',
       subagentId: 'sub-B',
       lastEvent: {
@@ -1571,41 +1490,12 @@ describe('harness-adapter — subagent observability', () => {
         args: { path: 'b.ts' },
       },
     });
-    // A finishes failed, B finishes ok. If state collided,
-    // both would resolve to whichever subagent's invocation
-    // lived longer in the map.
-    const aOut = a.translate({
-      type: 'subagent_progress',
-      subagentId: 'sub-A',
-      lastEvent: {
-        type: 'tool_finished',
-        toolUseId: 'tu1',
-        toolName: 'read_file',
-        failed: true,
-        durationMs: 1,
-      },
-    });
-    const bOut = a.translate({
-      type: 'subagent_progress',
-      subagentId: 'sub-B',
-      lastEvent: {
-        type: 'tool_finished',
-        toolUseId: 'tu1',
-        toolName: 'read_file',
-        failed: false,
-        durationMs: 1,
-      },
-    });
-    const aEnd = aOut.find((e) => e.type === 'tool:end') as
-      | Extract<UIEvent, { type: 'tool:end' }>
-      | undefined;
-    const bEnd = bOut.find((e) => e.type === 'tool:end') as
-      | Extract<UIEvent, { type: 'tool:end' }>
-      | undefined;
-    expect(aEnd?.toolId).toBe('sub:sub-A:tu1');
-    expect(aEnd?.status).toBe('error');
-    expect(bEnd?.toolId).toBe('sub:sub-B:tu1');
-    expect(bEnd?.status).toBe('done');
+    const aEv = aOut[0] as Extract<UIEvent, { type: 'subagent:update' }>;
+    const bEv = bOut[0] as Extract<UIEvent, { type: 'subagent:update' }>;
+    expect(aEv.subagentId).toBe('sub-A');
+    expect(aEv.currentTool).toBe('read a.ts');
+    expect(bEv.subagentId).toBe('sub-B');
+    expect(bEv.currentTool).toBe('read b.ts');
   });
 
   test('subagent_finished forwards full status + reason + costUsd to subagent:end', () => {

@@ -2015,6 +2015,25 @@ describe('subagent lifecycle', () => {
     expect(permanent).toEqual([]);
   });
 
+  test('currentTool persists across tool finishes; toolDone aggregates by type', () => {
+    const { state } = drive([
+      { type: 'subagent:start', ts: 1, subagentId: 'c1', name: 'r', goal: 'g' },
+      { type: 'subagent:update', ts: 2, subagentId: 'c1', progress: 'x', currentTool: 'read a.ts' },
+      // tool finishes: the label must NOT blank (no flap to `starting`),
+      // and the per-type count increments.
+      { type: 'subagent:update', ts: 3, subagentId: 'c1', progress: 'x', toolDone: 'read_file' },
+      { type: 'subagent:update', ts: 4, subagentId: 'c1', progress: 'x', currentTool: 'grep "y"' },
+      { type: 'subagent:update', ts: 5, subagentId: 'c1', progress: 'x', toolDone: 'grep' },
+      { type: 'subagent:update', ts: 6, subagentId: 'c1', progress: 'x', toolDone: 'read_file' },
+    ]);
+    const row = state.subagents.get('c1');
+    // last tool label survives the finish (not cleared to '')
+    expect(row?.currentTool).toBe('grep "y"');
+    expect(row?.toolTotal).toBe(3);
+    expect(row?.toolCounts.get('read_file')).toBe(2);
+    expect(row?.toolCounts.get('grep')).toBe(1);
+  });
+
   test('subagent:update for unknown id is a silent no-op', () => {
     const { state, permanent } = drive([
       { type: 'subagent:update', ts: 1, subagentId: 'never', progress: '...' },

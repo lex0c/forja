@@ -2,6 +2,33 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] tui(subagents): grouped live section above Tasks + aggregated scrollback block
+
+Reworked how subagents render. (UI-first per the iterate-before-spec rule; UI.md
+§4.2 PR follows once the UX settles.)
+
+WHILE RUNNING — a grouped `Subagents` live section directly above `Tasks`: a
+shimmering header `Subagents · N running[ · M queued][ · $T]` and a TWO-LINE row
+per child — line 1 `spinner · name · elapsed · cost`, line 2 `└ <current tool>`
+(the in-flight tool, persisting until the next starts so it never flaps back to a
+`starting · <goal>` boot fallback). The child's tools NO LONGER stream into
+scrollback as nested chips; they feed line 2 (`currentTool`) and a per-type
+aggregate. ON END — the row collapses into a grouped scrollback block: a header
+(`● name · verb · summary · N tools · dur · $cost`) over a trail AGGREGATED BY
+TYPE (`├ read 38 files`, `├ grep 11 searches`, `└ git 4 reads`).
+
+Plumbing: `subagent:update` carries `currentTool`/`toolDone`; the reducer
+accumulates `toolCounts`/`toolTotal` (current label persists across finishes) and
+freezes them into the `subagent_summary` on `subagent:end`. `liveRegionActive`
+gained a subagents clause so the spinner/elapsed animate. The `task_*` family
+(task_sync/async/await/cancel/list) is marked `silent` in the tool vocab — the
+parent's spawn call is plumbing the operator shouldn't see as a "Calling
+task_sync" chip; the live Subagents block IS the surface. A code-review pass fixed
+two issues in the diff: `currentTool` is sanitized (sanitizeOneLineForDisplay) so
+an untrusted child grep/bash subject can't inject ANSI/BEL into the per-tick live
+render; and the moved compose-order comments were corrected. Validated live in the
+compiled binary (3 parallel subagents, aggregated trails, no task_* chips).
+
 ## [2026-06-13] spec(PLAYBOOKS): fix the stale init distribution count (10 → 4)
 
 Doc lockstep. The catalog trim (this branch) brought the bundled set to 4

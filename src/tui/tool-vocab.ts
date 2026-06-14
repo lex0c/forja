@@ -192,6 +192,39 @@ export const TOOL_VOCAB: Readonly<Record<string, ToolVocab>> = {
     subject: (a) => str(a.id),
     silent: true,
   },
+  // The task_* subagent-orchestration tools are `silent`: spawning,
+  // awaiting, cancelling and listing subagents is plumbing the operator
+  // shouldn't see as a tool chip. The operator's view of a subagent is the
+  // live `Subagents` block (and its grouped scrollback summary on end) —
+  // `task_sync`/`task_async`'s own "Calling task_sync" / "Called task_sync"
+  // card is redundant noise stacked next to that block. The adapter still
+  // tracks the call (so the per-tool machinery stays intact); it just emits
+  // no chip. Verbs kept for the day someone flips silent off.
+  task_sync: {
+    activeVerb: 'Running subagent',
+    finalVerb: 'Ran subagent',
+    silent: true,
+  },
+  task_async: {
+    activeVerb: 'Spawning subagent',
+    finalVerb: 'Spawned subagent',
+    silent: true,
+  },
+  task_await: {
+    activeVerb: 'Awaiting subagent',
+    finalVerb: 'Awaited subagent',
+    silent: true,
+  },
+  task_cancel: {
+    activeVerb: 'Cancelling subagent',
+    finalVerb: 'Cancelled subagent',
+    silent: true,
+  },
+  task_list: {
+    activeVerb: 'Listing subagents',
+    finalVerb: 'Listed subagents',
+    silent: true,
+  },
   monitor: {
     activeVerb: 'Monitoring',
     finalVerb: 'Monitored',
@@ -225,3 +258,24 @@ export const lookupToolVocab = (name: string): ToolVocab => {
   if (known !== undefined) return known;
   return { activeVerb: `Calling ${name}`, finalVerb: `Called ${name}` };
 };
+
+// Compact tool label for the subagent live row's line 2 and the
+// aggregated scrollback trail: `read_file` → `read`, `grep` → `grep`.
+export const shortToolName = (name: string): string => name.replace(/_file$/, '');
+
+// Plural noun for the aggregated-by-type subagent trail
+// (`read 38 files`, `grep 11 searches`); generic `calls` fallback.
+const TOOL_NOUN: Readonly<Record<string, string>> = {
+  read_file: 'files',
+  grep: 'searches',
+  glob: 'globs',
+  git: 'reads',
+  bash: 'commands',
+  edit_file: 'edits',
+  write_file: 'writes',
+  fetch_url: 'fetches',
+  memory_read: 'reads',
+  memory_search: 'searches',
+  retrieve_context: 'lookups',
+};
+export const toolNoun = (name: string): string => TOOL_NOUN[name] ?? 'calls';

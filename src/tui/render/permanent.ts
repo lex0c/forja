@@ -13,6 +13,7 @@
 import { sanitizeOneLineForDisplay } from '../../sanitize/ansi.ts';
 import type { PermanentItem } from '../state.ts';
 import { type Capabilities, paint, paintMulti, reverse } from '../term.ts';
+import { shortToolName, toolNoun } from '../tool-vocab.ts';
 import { formatChipDuration, formatCoarseDuration } from './duration.ts';
 import { padFrame } from './frame.ts';
 import { ellipsisGlyph, subContentConnector, treeBranchConnector } from './glyphs.ts';
@@ -534,14 +535,27 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
         trimmedSummary.length > maxSummary
           ? `${trimmedSummary.slice(0, maxSummary - 1)}…`
           : trimmedSummary;
-      const head = `${glyph} task ${item.name} ${verb}`;
-      const tail = `  [${formatChipDuration(item.durationMs)}]`;
-      const body = summary.length > 0 ? ` ${summary}` : '';
-      const line =
-        item.status === 'done'
-          ? paint(caps, 'secondary', `${head}${body}${tail}`)
-          : paint(caps, 'error', `${head}${body}${tail}`);
-      return [padFrame(line)];
+      const color = item.status === 'done' ? 'secondary' : 'error';
+      // Header: `● <name> · <verb>[ · <summary>] · N tools · <dur>[ · $X.XX]`.
+      const segs = [`${glyph} ${item.name}`, verb];
+      if (summary.length > 0) segs.push(summary);
+      if (item.toolTotal > 0) segs.push(`${item.toolTotal} tool${item.toolTotal === 1 ? '' : 's'}`);
+      segs.push(formatChipDuration(item.durationMs));
+      if (item.costUsd > 0) segs.push(`$${formatDollars(item.costUsd)}`);
+      const lines = [padFrame(paint(caps, color, segs.join(' · ')))];
+      // Aggregated-by-type trail: one line per tool type the child used,
+      // sorted desc by count upstream (`├ read 38 files`, `└ git 4 reads`).
+      // The child's tools no longer streamed live, so this is the record
+      // of what it did.
+      const counts = item.toolCounts;
+      for (let i = 0; i < counts.length; i++) {
+        const entry = counts[i] as readonly [string, number];
+        const connector =
+          i === counts.length - 1 ? subContentConnector(caps) : treeBranchConnector(caps);
+        const trail = `  ${connector}${shortToolName(entry[0])} ${entry[1]} ${toolNoun(entry[0])}`;
+        lines.push(padFrame(paint(caps, color, trail)));
+      }
+      return lines;
     }
   }
 };

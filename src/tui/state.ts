@@ -474,6 +474,17 @@ export interface LiveState {
       // `$X.XX` segment, preserving the existing test-fixture
       // visual shape.
       liveCostUsd: number;
+      // The child's IN-FLIGHT tool as a compact `read engine.ts`
+      // label — rendered on the live row's line 2. Empty before the
+      // first tool and after each tool finishes (cleared on toolDone).
+      currentTool: string;
+      // Per-tool-type invocation counts, accumulated as the child
+      // works (the child's tools no longer stream to scrollback live —
+      // they collapse into the grouped, aggregated trail on end).
+      // Insertion order preserved so the trail is stable across ticks.
+      toolCounts: Map<string, number>;
+      // Total tool invocations (the `N tools` figure in the summary).
+      toolTotal: number;
     }
   >;
   // Pending reminders scheduled this session (ORCHESTRATION.md §3B.9).
@@ -553,7 +564,12 @@ export const liveRegionActive = (state: LiveState): boolean =>
   // live region. renderTodoList applies the same `!ended` gate to the header
   // so the two never disagree (heartbeat idle + header wanting to shimmer =
   // a frozen highlighted char).
-  (!state.ended && state.todos.some((t) => t.status === 'in_progress'));
+  (!state.ended && state.todos.some((t) => t.status === 'in_progress')) ||
+  // A running subagent keeps the heartbeat awake so its row's spinner
+  // animates and the [elapsed]/cost tick. Gated on `!ended` like todos:
+  // an abnormal cut that leaves a row un-collapsed must not pin the
+  // heartbeat forever (subagent:end normally removes the row first).
+  (!state.ended && state.subagents.size > 0);
 
 export const createInitialState = (): LiveState => ({
   input: { value: '', cursor: 0 },
@@ -761,6 +777,12 @@ export type PermanentItem =
       costUsd: number;
       summary: string;
       durationMs: number;
+      // Per-tool-type invocation counts (insertion order), rendered as
+      // the grouped, aggregated trail under the summary header
+      // (`├ read 38 files`). Empty array → header-only block.
+      toolCounts: ReadonlyArray<readonly [string, number]>;
+      // Total tool invocations across the run (the `N tools` figure).
+      toolTotal: number;
     };
 
 export interface ApplyResult {
@@ -2252,6 +2274,9 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         progress: '',
         startedAt: event.ts,
         liveCostUsd: 0,
+        currentTool: '',
+        toolCounts: new Map(),
+        toolTotal: 0,
       });
       return { state: { ...state, subagents: next }, permanent: [] };
     }
@@ -2273,7 +2298,29 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // than zeroing it. Monotonic at the source (handle-store
       // enforces) so we don't need a max() guard.
       const liveCostUsd = event.cumulativeCostUsd ?? existing.liveCostUsd;
-      next.set(event.subagentId, { ...existing, progress: event.progress, liveCostUsd });
+      // `currentTool` (line 2) is set on tool-start and PERSISTS until the
+      // next tool starts — it is NOT cleared on `toolDone`. Clearing it
+      // would blank line 2 during the gap between tools (every model
+      // round-trip), flapping back to the `starting · <goal>` fallback on
+      // each tool finish. Keeping the last tool shown (with the spinner
+      // still conveying "active") reads as the subagent's most recent
+      // action instead. `toolDone` only feeds the per-type aggregate.
+      const currentTool = event.currentTool ?? existing.currentTool;
+      let toolCounts = existing.toolCounts;
+      let toolTotal = existing.toolTotal;
+      if (event.toolDone !== undefined) {
+        toolCounts = new Map(existing.toolCounts);
+        toolCounts.set(event.toolDone, (toolCounts.get(event.toolDone) ?? 0) + 1);
+        toolTotal = existing.toolTotal + 1;
+      }
+      next.set(event.subagentId, {
+        ...existing,
+        progress: event.progress,
+        liveCostUsd,
+        currentTool,
+        toolCounts,
+        toolTotal,
+      });
       return { state: { ...state, subagents: next }, permanent: [] };
     }
 
@@ -2300,6 +2347,13 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
                 costUsd: event.costUsd,
                 summary: event.summary,
                 durationMs: event.durationMs,
+                // Freeze the accumulated per-type counts for the grouped
+                // scrollback trail (sorted desc by count, then name for a
+                // stable tie-break).
+                toolCounts: [...existing.toolCounts.entries()].sort(
+                  (a, b) => b[1] - a[1] || a[0].localeCompare(b[0]),
+                ),
+                toolTotal: existing.toolTotal,
               },
             ];
       return { state: { ...state, subagents: next }, permanent };
