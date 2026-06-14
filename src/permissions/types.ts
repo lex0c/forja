@@ -356,4 +356,15 @@ export type Decision =
 export interface PermissionsView {
   mode: PolicyMode;
   posture: ApprovalPosture;
+  // True iff reading `path` would be a clean `allow` under the current
+  // read_file policy (deny / confirm / sensitive-floor → false). Pure:
+  // it does NOT record an audit decision or bump the approval seq.
+  //
+  // Content-emitting tools (`git diff`/`git show`, `grep`) gate on a
+  // single search ROOT, but their OUTPUT carries content from many
+  // descendant files. A denied file under an allowed root would leak
+  // through that output. Such tools call this per emitted file to drop
+  // the ones the policy would not let `read_file` open. `path` may be
+  // absolute or cwd-relative — same resolution as a `read_file` check.
+  canReadPath(path: string): boolean;
 }

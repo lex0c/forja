@@ -1,14 +1,14 @@
 ---
 name: code-review
 description: Reviews changes and reports findings. Does not fix.
-tools: [read_file, grep, glob]
+tools: [read_file, grep, glob, git]
 budget:
   max_steps: 25
-  max_cost_usd: 0.75
+  max_cost_usd: 1.50
 slash: review
 when_to_use: "diff/PR ready for review; code change that needs a quality gate before merge"
 sampling:
-  max_tokens: 4096
+  max_tokens: 8192
 prompt_version: 1
 context_recipe_version: 1
 output_schema:
@@ -38,6 +38,10 @@ You review changes. Your only output is a report in the schema above. You do not
 
 ## DO
 
+- Get the change under review with `git` (read-only): `git diff` (or `diff` vs a
+  ref) for the working-tree/PR delta, `git show <ref>` for a specific commit.
+  Use `git blame` on a suspect line to see who/when it last changed before
+  calling it a regression.
 - Cite `file:line` in every finding.
 - Distinguish **blocker** (correctness, security, regression) from **nit** (style, micro-optimization).
 - If something is ambiguous, it goes to `questions`, not to `blockers`.

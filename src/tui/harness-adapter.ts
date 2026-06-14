@@ -19,9 +19,9 @@
 import type { FileDiff } from '../diff/line-diff.ts';
 import type { ExitReason, HarnessEvent } from '../harness/types.ts';
 import type { Decision } from '../permissions/index.ts';
-import { stripAnsi } from '../sanitize/index.ts';
+import { sanitizeOneLineForDisplay, stripAnsi } from '../sanitize/index.ts';
 import type { SessionEndEvent, TodoItemForUI, UIEvent } from './events.ts';
-import { lookupToolVocab } from './tool-vocab.ts';
+import { lookupToolVocab, shortToolName } from './tool-vocab.ts';
 
 export interface HarnessAdapterCtx {
   // Status-line metadata. Not derivable from HarnessEvent: the harness
@@ -133,8 +133,10 @@ const mapExitReason = (reason: ExitReason): SessionEndEvent['reason'] => {
 // erase math and leaking a stale card into scrollback. Collapse each
 // line break (and the whitespace hugging it) to a single space.
 // Intra-line spacing and single-line subjects (file paths, patterns)
-// are left untouched. Applied to BOTH the top-level and the
-// subagent-mirrored (nested, parentId-tagged) tool:start paths.
+// are left untouched. Applied to the top-level tool:start path. (The
+// subagent row's line-2 `currentTool` uses sanitizeOneLineForDisplay
+// instead — it additionally strips ANSI/C0 control bytes, since that
+// label re-renders into the live region every heartbeat tick.)
 const flattenSubject = (subject: string | null): string | null =>
   subject?.includes('\n') ? subject.replace(/\s*\n\s*/g, ' ').trim() : subject;
 
@@ -540,11 +542,34 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           summary = event.resultDetail;
         }
         state.tools.delete(event.toolUseId);
-        // Silent tools (todos) emit no chip — see the tool:start case. The
-        // result still reaches the model; only the scrollback chip (incl.
-        // failures) is hidden, since the model surfaces todo errors in its
-        // prose and the live `Tasks` block reflects the real state.
-        if (!lookupToolVocab(event.toolName).silent) {
+        // Silent tools emit no SUCCESS chip — see the tool:start case. Todos
+        // hide their failures too (the model surfaces them in prose and the
+        // live `Tasks` block reflects state). A `revealFailure` silent tool
+        // (the task_* delegation family) instead SURFACES a failed finish: a
+        // delegation that dies before its child is created (unknown playbook,
+        // validation error, pre-spawn budget refusal) emits no subagent
+        // lifecycle, so the `Subagents` block has nothing to show and dropping
+        // the failure chip too would make the failed delegation invisible.
+        const vocab = lookupToolVocab(event.toolName);
+        const reveal = vocab.silent === true && vocab.revealFailure === true && status !== 'done';
+        if (!vocab.silent || reveal) {
+          // A silent tool emitted no tool:start, so a lone tool:end would
+          // no-op in the reducer (it finalizes a card that was never opened —
+          // state.ts tool:end returns empty on an unknown toolId). Synthesize
+          // the opening card here, in the SAME batch, so the failed chip
+          // renders; the reducer pairs start+end by toolId. No live noise: the
+          // pair collapses straight to the scrollback failure chip.
+          if (reveal) {
+            out.push({
+              type: 'tool:start',
+              ts,
+              toolId: event.toolUseId,
+              name: event.toolName,
+              activeVerb: vocab.activeVerb,
+              finalVerb: vocab.finalVerb,
+              subject: null,
+            });
+          }
           out.push({
             type: 'tool:end',
             ts,
@@ -730,15 +755,43 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         // Skipped for other inner events to leave `liveCostUsd`
         // alone (semantics: undefined = "no change").
         let cumulativeCostUsd: number | undefined;
+        // The child's tools no longer stream into scrollback live — they
+        // feed the row's line 2 (`currentTool`) and a per-type aggregate
+        // (`toolDone`, counted by the reducer) that collapses into the
+        // grouped summary block on end.
+        let currentTool: string | undefined;
+        let toolDone: string | undefined;
         switch (inner.type) {
           case 'step_start':
             progress = `step ${inner.stepN}`;
             break;
-          case 'tool_invoking':
+          case 'tool_invoking': {
             progress = `running ${inner.toolName}`;
+            // Build the compact line-2 label: short tool name + subject
+            // (the file/pattern), e.g. `read engine.ts` / `grep "x"`.
+            let subject: string | null = null;
+            try {
+              subject = lookupToolVocab(inner.toolName).subject?.(inner.args) ?? null;
+            } catch {
+              subject = null;
+            }
+            // The subject is model/child-authored (a grep pattern, a bash
+            // command, a path) and flows verbatim over IPC. `currentTool`
+            // is re-rendered into the LIVE region every heartbeat tick, so
+            // a raw ESC/BEL/CR would ring the bell, paint fake SGR, or
+            // forge cursor moves on every redraw. sanitizeOneLineForDisplay
+            // strips ANSI + C0 control bytes, collapses to one line, and
+            // caps the length at the STATE boundary (not just at render).
+            subject = subject !== null ? sanitizeOneLineForDisplay(subject) : null;
+            currentTool =
+              subject !== null && subject.length > 0
+                ? `${shortToolName(inner.toolName)} ${subject}`
+                : shortToolName(inner.toolName);
             break;
+          }
           case 'tool_finished':
             progress = inner.failed ? `${inner.toolName} failed` : `${inner.toolName} done`;
+            toolDone = inner.toolName;
             break;
           case 'compaction_started':
             progress = 'compacting context';
@@ -778,6 +831,8 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           subagentId: event.subagentId,
           progress,
           ...(cumulativeCostUsd !== undefined ? { cumulativeCostUsd } : {}),
+          ...(currentTool !== undefined ? { currentTool } : {}),
+          ...(toolDone !== undefined ? { toolDone } : {}),
         });
         // tool_warning from the child propagates as a top-level
         // `warn` so the operator sees the warning explicitly in the
@@ -816,116 +871,11 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
             message: `subagent ${event.subagentId.slice(0, 8)} over budget estimate ($${fmt(inner.cumulative)} > $${fmt(inner.threshold)})`,
           });
         }
-        // Permanent tool chips for tool_invoking / tool_decided /
-        // tool_finished from inside the child. Without these, a
-        // subagent doing real work shows up as nothing but the
-        // heartbeat row above — operator sees "running read_file"
-        // scroll past, never the file path, never the duration.
-        // Mirrors the top-level path (case 'tool_invoking' /
-        // 'tool_finished' earlier in this switch) with two
-        // adaptations:
-        //   - toolId is namespaced as `sub:<subagentId>:<toolUseId>`
-        //     so two concurrent subagents can't collide on a shared
-        //     id (the child generates ids locally; without the
-        //     prefix the parent's `state.tools` map would
-        //     overwrite). The reducer + renderer treat the
-        //     prefixed id as opaque.
-        //   - parentId is set to the subagentId so the renderer
-        //     indents the chip with `|_` and the operator can
-        //     visually attribute nested tools to their owner.
-        //     Slice-1 used a `[sub <id8>]` subject prefix instead;
-        //     slice 2 (this) drops that prefix in favor of the
-        //     indent, since carrying both is noisy.
-        if (
-          inner.type === 'tool_invoking' &&
-          typeof inner.toolUseId === 'string' &&
-          typeof inner.toolName === 'string'
-        ) {
-          const namespacedId = `sub:${event.subagentId}:${inner.toolUseId}`;
-          const vocab = lookupToolVocab(inner.toolName);
-          let subject: string | null = null;
-          try {
-            subject = vocab.subject?.(inner.args) ?? null;
-          } catch {
-            subject = null;
-          }
-          subject = flattenSubject(subject);
-          state.tools.set(namespacedId, { name: inner.toolName, decision: null });
-          // Silent tools (todos) are tracked but emit no nested chip —
-          // mirrors the top-level suppression.
-          if (!vocab.silent) {
-            out.push({
-              type: 'tool:start',
-              ts,
-              toolId: namespacedId,
-              name: inner.toolName,
-              activeVerb: vocab.activeVerb,
-              finalVerb: vocab.finalVerb,
-              subject,
-              parentId: event.subagentId,
-            });
-          }
-        }
-        if (inner.type === 'tool_decided' && typeof inner.toolUseId === 'string') {
-          // Mirror the top-level path: store the decision so
-          // tool_finished can branch on `denied` vs error vs done.
-          // No UI emission here — the decision surfaces via the
-          // chip's status on tool_finished.
-          const namespacedId = `sub:${event.subagentId}:${inner.toolUseId}`;
-          const tool = state.tools.get(namespacedId);
-          if (tool !== undefined) tool.decision = inner.decision;
-        }
-        // Rebase the nested card's clock when the child's tool body
-        // starts — mirrors the top-level `tool_execution_started` case
-        // so nested and top-level durations exclude the permission-
-        // modal wait the same way.
-        if (inner.type === 'tool_execution_started' && typeof inner.toolUseId === 'string') {
-          const nestedId = `sub:${event.subagentId}:${inner.toolUseId}`;
-          const tracked = state.tools.get(nestedId);
-          if (tracked === undefined || !lookupToolVocab(tracked.name).silent) {
-            out.push({ type: 'tool:execution-started', ts, toolId: nestedId });
-          }
-        }
-        if (inner.type === 'tool_finished' && typeof inner.toolUseId === 'string') {
-          const namespacedId = `sub:${event.subagentId}:${inner.toolUseId}`;
-          const tool = state.tools.get(namespacedId);
-          const decisionKind = tool?.decision?.kind;
-          const status: 'done' | 'error' | 'denied' = inner.denied
-            ? 'denied'
-            : decisionKind === 'deny'
-              ? 'denied'
-              : inner.failed
-                ? 'error'
-                : 'done';
-          let summary: string | undefined;
-          if (status === 'denied' && tool?.decision !== undefined && tool.decision !== null) {
-            const decision = tool.decision;
-            if (decision.kind === 'deny') {
-              summary = decision.reason;
-            } else if (decision.kind === 'confirm') {
-              summary = 'rejected at confirmation prompt';
-            }
-          } else if (
-            status === 'error' &&
-            typeof inner.errorMessage === 'string' &&
-            inner.errorMessage.length > 0
-          ) {
-            summary = inner.errorMessage;
-          }
-          state.tools.delete(namespacedId);
-          if (!lookupToolVocab(inner.toolName).silent) {
-            out.push({
-              type: 'tool:end',
-              ts,
-              toolId: namespacedId,
-              status,
-              durationMs: inner.durationMs,
-              ...(summary !== undefined ? { summary } : {}),
-              ...(inner.outputTruncated === true ? { outputTruncated: true } : {}),
-              ...(typeof inner.exitCode === 'number' ? { exitCode: inner.exitCode } : {}),
-            });
-          }
-        }
+        // The child's tools do NOT stream into scrollback live anymore:
+        // they feed the row's line 2 (`currentTool`, above) while running
+        // and a per-type aggregate (`toolDone`) that collapses into the
+        // grouped summary block on `subagent_finished`. So no nested
+        // `tool:*` chips and no child entries in `state.tools` here.
         return out;
       }
 

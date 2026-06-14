@@ -2,6 +2,1028 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] grep: disclose when the read_file content policy hides matches
+
+A strict policy that grants `tools.grep.allow_paths` but NOT the same paths under
+`tools.read_file` authorizes the grep CALL (grep section) yet the per-match gate
+— `ctx.permissions.canReadPath`, wired to the `read_file` section as the shared
+content-disclosure floor — drops every match, so grep returns a silent
+`count: 0`; the operator can't tell a real empty search from a policy-hidden one
+and ends up duplicating grep grants under read_file by trial and error.
+
+Kept the read_file-floor model (the documented design: every content-emitting
+tool defers to read_file so there is ONE disclosure policy; changing grep to its
+own section would make grep able to exceed a deliberately-narrow read_file grant,
+and would have to drag git along for consistency) and instead made the coupling
+EXPLICIT: grep now tracks the distinct files whose matches the gate dropped and,
+when any, returns a `policy_note` stating that disclosure is gated on
+read_file.allow_paths — so the operator grants read_file if the omission was
+accidental, or recognizes the hidden hits as a deliberate deny / sensitive-floor
+block. Neutral wording (the hide can be intentional). Tests: a partial-hide
+surfaces the note; an all-hidden grep returns count: 0 WITH the note; an allow-all
+control has none.
+
+## [2026-06-14] git tool: scope the fail-closed filter enumeration to worktree modes
+
+`filterDisableFlags` (the clean/smudge neutralizer) ran UNCONDITIONALLY before
+every mode, and it fails closed (refuses with git.policy_denied) if the
+`filter.*.clean` key list overflows the 256 KiB capture cap. So a repo with a
+huge/hostile filter config could refuse even `log` / `ls_files` / `show_file` —
+modes that never run a clean filter. Scoped the enumeration to the modes that
+actually read worktree CONTENT and so can fire the filter: `status`, unstaged
+`diff`, and `blame`. log / ls_files / show / show_file / `diff --staged` skip it
+(they read only committed objects or the index).
+
+Correction to the finding: it listed `blame` as safe, but `blame` DOES run the
+clean filter on a locally-modified filter-bound file (empirically exit 128 vs an
+empty required filter) — skipping the pin there would EXEC the repo's filter
+command, the exact hole the neutralizer closes. So blame stays gated; the
+genuinely-safe set (verified each exits 0) is log/ls_files/show/show_file/
+diff --staged. Test: a cap-overflowing filter config no longer refuses
+log/ls_files/show_file, while diff still fails closed.
+
+## [2026-06-14] git tool: gate `log` against denied-subtree commits
+
+`log` was excluded from both per-file gates (content + metadata), so a pathless /
+parent-scoped `git log` — authorized at the readable root — still printed commit
+subjects/authors/hashes/dates for commits that touched ONLY a policy-denied
+subtree (secrets/, the sensitive `.env` floor, a subagent `deny_paths`), leaking
+that history while `status`/`ls_files` were filtered. The "refuse when a denied
+descendant is in scope" option is too blunt (the `.env` floor would refuse every
+pathless log in any repo with a `.env`), so took the precise route: drop only the
+commits that are ENTIRELY about denied paths.
+
+`log` carries no path in its output line, so post-filter via a `--name-only`
+pre-flight: `filterLogOutput` re-runs the log scope (same -n/ref/follow/pathspec)
+as `--name-only -z --format=%x1e%h`, parses each commit's touched files, and for
+any commit whose files are ALL denied (`canReadPath`, which already folds in both
+the parent policy AND the subagent restriction deny) adds its hash to a drop set;
+the display run's lines are then filtered by leading `%h`. A commit touching >=1
+readable file is kept (its subject may mention denied work, but it legitimately
+touched an allowed file and a subject can't be partially redacted); a fileless
+commit (merge/empty) exposes no path and stays. Drops are disclosed
+(`[forja: N commit(s) hidden by policy]`), matching the metadata gate. Fails
+closed if the enumeration errors, truncates (later commits' files unknown), or the
+repo root can't resolve.
+
+Byte-layout gotcha (caught by the e2e): with `--format=%x1e%h --name-only -z`,
+git terminates the `%h` format output with a NUL BEFORE the --name-only newline
+(`<hash>\0\n<file>\0…`), so the pre-newline slice is `<hash>\0` — the trailing NUL
+has to be stripped or the gate hash never matches the clean display `%h`. Test:
+denied-only commit hidden + disclosure, mixed/allowed commits kept, unrestricted
+control shows the denied-only commit.
+
+## [2026-06-14] subagents: enforce git/grep tool_restrictions deny_paths on DESCENDANT output
+
+`wrapToolWithRestrictions` ran a pre-flight check on the literal `path` arg only.
+For a directory-scoped read whose OUTPUT carries descendant files — `git
+diff`/`show`/`status`/`ls_files`, `grep` — that misses descendant deny rules: a
+playbook with `git.allow_paths:['src']` + `deny_paths:['src/secrets/**']` calling
+`git diff` with `path:'src'` passed the wrapper (the literal `src` matches allow,
+doesn't match the deny glob), and the emitted diff/names still leaked
+`src/secrets/*` whenever the PARENT permission policy allowed them — the
+playbook's deny was bypassed.
+
+Took the finding's "thread the restriction into the emitted-file filtering"
+option. Those tools already call `ctx.permissions.canReadPath` per emitted file
+to honor the parent read policy (the `PermissionsView` doc spells this out), so
+the wrapper now folds the restriction's `deny_paths` into that exact chokepoint:
+on the allow branch it passes the tool a ctx whose `canReadPath` also denies
+paths matching `deny_paths` (canonicalized under cwd, reusing the symlink-aware
+`canonicalizeUnderCwd`). The descendant deny then lands where the parent deny
+already drops metadata names / fails closed on content modes — no gitTool change,
+no new ctx field. Fixes `grep` by the same mechanism (identical descendant
+surface). Only `deny_paths` is composed: `allow_paths` is a scope check on the
+literal arg (a directory arg's descendants are within the allowed subtree by
+construction, and a literal glob `src` does not match `src/x`, so composing allow
+per-file would wrongly deny every descendant). The wrap is inert for tools with
+no per-file read gate (write_file/edit_file/read_file never call it). Verified
+the wiring: `subagent-child` wraps every whitelisted tool (gitTool included),
+and `grep` calls `canReadPath` per file too, so both readers are covered. Tests:
+unit (denied descendant blocked while siblings pass; composition only tightens —
+a parent-denied path stays denied; no deny_paths → nothing composed) AND
+end-to-end against the REAL gitTool in a temp repo (status drops the denied
+descendant name; diff fails closed with a denied file in scope; a scoped sibling
+diff still works) — each e2e carries an unrestricted control that DOES surface
+the secret, proving the restriction is what filtered it.
+
+## [2026-06-14] tui: surface FAILED task delegations despite the silent task chip
+
+Follow-up to marking the `task_*` family `silent` (so the operator sees the live
+`Subagents` block, not a "Called task_sync" chip). Finding: that assumes every
+task call has a subagent lifecycle the block renders. A delegation that fails
+BEFORE a child is created — unknown playbook, validation error, pre-spawn budget
+refusal — emits no `subagent:start`/`subagent:end`, so the block shows nothing,
+AND `silent` suppressed both the start and end chips including the error summary:
+the failed delegation was completely invisible in scrollback.
+
+Chose to reveal failures rather than correlate-and-suppress. A precise option
+("suppress only calls that actually spawned a subagent") needs to attribute a
+`subagent:start` to the task call that spawned it, but `subagent:start` carries
+no parent `toolUseId` — a temporal in-flight heuristic would MISATTRIBUTE under
+concurrent `task_async` and could re-hide a pre-spawn failure (the exact bug).
+Hiding is worse than a little redundancy, so: a new `revealFailure` vocab flag on
+the `task_*` entries makes the adapter emit the chip on any non-`done` finish.
+Since a silent tool emits no `tool:start`, a lone `tool:end` no-ops in the reducer
+(finalizes a card never opened), so the adapter synthesizes the start+end pair in
+the same batch — collapsing straight to the scrollback failure chip, no live
+noise. Todos keep plain `silent` (no `revealFailure`): their failures stay hidden
+by design (model prose + the `Tasks` block carry them). A post-spawn child failure
+(`subagent.run_failed`) now shows in BOTH the block and a chip — accepted: the chip
+carries the tool-level reason, complementary to the block's run summary, and
+visible-twice beats silently-dropped. Tests: failed/denied task_* → chip; done →
+silent; failed todo → still silent.
+
+## [2026-06-14] git tool: fail closed on clean/smudge-filtered files instead of corrupting the worktree comparison
+
+The tool disables repo-configured clean/smudge/process filters before any
+worktree-comparing run (they are attacker-controllable code in an untrusted
+repo). It did so by pinning each filter command empty AND pinning
+`filter.<d>.required=false` to dodge git's "clean filter failed" abort. Finding:
+that `required=false` is the bug. With the filter neutralized, git compares the
+RAW worktree bytes against the CLEANED blob in the index — for Git LFS (and any
+transforming clean) those differ by construction, so an UNCHANGED filtered file
+reports as modified in `status` and `diff` emits a bogus pointer-vs-content hunk.
+Pass-through silently corrupts the working-tree result.
+
+Verified empirically (canary with an inverse clean/smudge pair simulating LFS):
+reproduced the false "modified" + bogus diff; confirmed git's required-filter
+machinery is the clean fix. The attr-pathspec detection route was killed by this
+tool's own `GIT_LITERAL_PATHSPECS=1` hardening (disables `:(attr:…)` magic) — and
+re-enabling magic would reopen the injection surface that flag closes. So instead
+of detecting filter-bound paths, FORCE `filter.<d>.required=true`: git then exits
+128 ("clean filter '<d>' failed", naming the file) the moment a worktree
+comparison touches a filter-bound file — fail-closed, for ALL configured drivers
+(a custom non-required filter would otherwise pass-through-corrupt too), and only
+for worktree-comparing modes (show/log/blame/ls_files/show_file never run a clean
+filter; a path-scoped diff/status of unfiltered files still works on an LFS repo).
+The main-run error mapping translates the exit-128 into an actionable refusal
+(narrow `path`, or read one file's stored blob via show_file). The empty-command
+pins still guarantee no filter exec; required=true changes only error handling.
+
+Two existing tests that asserted the old pass-through ("diff/status succeed")
+were rewritten to the fail-closed contract — one keeps the no-exec canary (now a
+non-required driver, also fail-closed), the other carries a positive control
+showing the raw pass-through's false "modified". New tests: path-scoped unfiltered
+diff/status still works; show_file still reads the stored pointer.
+
+## [2026-06-14] tui(subagents): sanitize model-authored name + goal before the live region
+
+A security-audit pass over the subagent-rework range flagged a defensive
+inconsistency the diff introduced: the live row's `currentTool` (line 2) is
+sanitized at ingress (`harness-adapter` → `sanitizeOneLineForDisplay`, strips
+ANSI + the full non-whitespace C0 range incl. BEL), but its siblings `name` (row
+head) and `goal` (the `starting · <goal>` fallback) entered the reducer RAW.
+`goal` is the raw seed prompt — fully model/child-authored — and the same range
+made `liveRegionActive` stay true for the whole subagent run, so those fields are
+repainted EVERY heartbeat tick. A malicious child could embed `\x1b[2J` /
+`\x07` / OSC title sequences and forge SGR, ring the bell, or move the cursor on
+every redraw (display-only, no exec). Verified end-to-end: render sites
+(`subagent-row.ts:109`/`:113`) interpolate both fields verbatim; `stripAnsi`
+covers BEL so the fix has no residual gap. Fixed at the STATE boundary
+(`state.ts` `subagent:start`), the same chokepoint `currentTool` and the
+`read_file` path already use — one sanitize covers the live row and the end-block
+summary (both read from state). Behavioral test added (control bytes in name +
+goal → stripped, visible text survives).
+
+Also corrected two stale doc-comments on the same range's events (`events.ts`):
+`currentTool` is set only on `tool_invoking` (not `tool_execution_started`) and
+PERSISTS across `toolDone` — the comments claimed it was cleared, contradicting
+the reducer and the `currentTool persists` test.
+
+## [2026-06-14] playbooks: raise code-review + security-audit output cap to 8192, recalibrate cost soft-cap
+
+Live testing surfaced subagents hitting the per-call output cap (`stop_reason:
+max_tokens`) and exiting truncated — the cap is the playbook's `sampling.max_tokens`,
+which the harness forwards as the provider `max_tokens` (`subagent-child.ts`; the
+playbook value overrides the harness `maxOutputTokensPerCall`). Two of the four
+bundled playbooks were still at 4096 (`code-review`, `security-audit`); their
+findings reports are verbose enough to overflow it. Raised both to 8192, matching
+`general-purpose` / `perf-investigate`. Neither declares a `thinking_budget`, so the
+loader's `thinking_budget < max_tokens` cross-check is moot. The `.md` files are
+imported verbatim as text assets by `init-playbooks/index.ts` (no duplicated copy to
+sync); `tests/cli/init.test.ts` + `tests/subagents/canonical-seeds.test.ts` load and
+validate every bundled entry and stay green.
+
+FOLLOW-ON: doubling the output cap roughly doubled per-run cost, so the
+`max_cost_usd` soft-cap (forwarded as `softCostUsd`, the `cost_soft_cap_warn`
+regression signal — `loop.ts:510`) started tripping on legitimate runs ("subagent
+over budget estimate ($0.81 > $0.75)"). That warn has no mute toggle by design
+(`/budget cost off` is the parent's HARD cap, not this; the loader requires a
+positive `max_cost_usd`, so it can't be zeroed in-playbook) — the correct fix is to
+re-estimate, not silence. Recalibrated to track the new token ceiling: code-review
+`0.75 → 1.50`, security-audit `1.50 → 2.50`. Keeps the signal honest (still fires on
+a true cost regression) instead of muting a load-bearing warning.
+
+## [2026-06-14] git tool: clarify show_file takes a bare ref + separate path
+
+Usability finding from live testing: a model tried `show_file` with
+`ref: "HEAD:src/x.ts"` (git's native `rev:path` form) and hit the generic "ref
+contains unsupported characters". Root cause was the schema doc itself — the mode
+enum said "show_file: … (`ref:path`, requires path)", which invited the exact
+mistake while the `ref` field said "the revision" (contradictory). Fixed the doc:
+show_file now reads "put the file in `path` and the BARE revision in `ref` …; do
+NOT use git's `rev:path` form", and the `ref` field says "a BARE revision only —
+never `rev:path`". Also added a targeted error for a `ref` containing `:` ("ref
+must be a bare revision … not git's `rev:path` form; for show_file, pass the file
+in `path` separately") so a model that still slips gets pointed straight at the
+fix instead of the generic message. Test added.
+
+## [2026-06-14] tui(subagents): group scrollback blocks under a `● Subagents` title; git chip subject
+
+Follow-ups to the subagent rework (UI-first; live-validated in the binary).
+
+SCROLLBACK GROUPING. A burst of finishing subagents now reads as one titled
+group: `● Subagents` (the chip `●` glyph, flush-left at col 0, default color)
+over the `  ● <name> · <verb> · N tools · dur · cost` blocks, which keep the
+2-space margin and indent under it. The child's own `summary` (a verbose
+first-person preamble) is NO LONGER echoed in the block — the actual answer is
+already relayed in the parent's reply, so a truncated preview there was noise.
+The title is owned by the `applyEvent` wrapper via a `subagentTitleShown` flag:
+emitted before the FIRST block of a run, suppressed for consecutive ones, and the
+run is broken (re-titles) by any other scrollback emission. A code-review pass on
+the wrapper caught + fixed two leaks in that flag: a BYPASSED tool-end (emits its
+chip immediately rather than buffering) now clears the flag (else the next burst
+went untitled with the tool wedged in), and `session:start` resets it at the turn
+boundary (it emits no permanent, so the wrapper couldn't).
+
+GIT CHIP SUBJECT. The `git` tool gained a tool-vocab entry so its scrollback chip
+shows WHAT ran — `Ran git · log src/foo.ts` / `diff --staged` / `show_file v1
+old.ts` — instead of a bare `Called git`. Also brought `git` and the `task_*`
+family into the vocab-lockstep test list (real builtins that were missing it).
+
+## [2026-06-14] tui(subagents): grouped live section above Tasks + aggregated scrollback block
+
+Reworked how subagents render. (UI-first per the iterate-before-spec rule; UI.md
+§4.2 PR follows once the UX settles.)
+
+WHILE RUNNING — a grouped `Subagents` live section directly above `Tasks`: a
+shimmering header `Subagents · N running[ · M queued][ · $T]` and a TWO-LINE row
+per child — line 1 `spinner · name · elapsed · cost`, line 2 `└ <current tool>`
+(the in-flight tool, persisting until the next starts so it never flaps back to a
+`starting · <goal>` boot fallback). The child's tools NO LONGER stream into
+scrollback as nested chips; they feed line 2 (`currentTool`) and a per-type
+aggregate. ON END — the row collapses into a grouped scrollback block: a header
+(`● name · verb · summary · N tools · dur · $cost`) over a trail AGGREGATED BY
+TYPE (`├ read 38 files`, `├ grep 11 searches`, `└ git 4 reads`).
+
+Plumbing: `subagent:update` carries `currentTool`/`toolDone`; the reducer
+accumulates `toolCounts`/`toolTotal` (current label persists across finishes) and
+freezes them into the `subagent_summary` on `subagent:end`. `liveRegionActive`
+gained a subagents clause so the spinner/elapsed animate. The `task_*` family
+(task_sync/async/await/cancel/list) is marked `silent` in the tool vocab — the
+parent's spawn call is plumbing the operator shouldn't see as a "Calling
+task_sync" chip; the live Subagents block IS the surface. A code-review pass fixed
+two issues in the diff: `currentTool` is sanitized (sanitizeOneLineForDisplay) so
+an untrusted child grep/bash subject can't inject ANSI/BEL into the per-tick live
+render; and the moved compose-order comments were corrected. Validated live in the
+compiled binary (3 parallel subagents, aggregated trails, no task_* chips).
+
+## [2026-06-13] spec(PLAYBOOKS): fix the stale init distribution count (10 → 4)
+
+Doc lockstep. The catalog trim (this branch) brought the bundled set to 4
+(CANONICAL_PLAYBOOKS: code-review §2, security-audit §3, perf-investigate §8,
+general-purpose §15), but §12 "Distribuição inicial via agent init" still said
+"os 10 playbooks canônicos listados em §2-§11" in four places — an operator
+reading it would expect the removed tombstone playbooks (§4–§7, §9–§11) to be
+copied, and it contradicted the 4-entry CANONICAL_PLAYBOOKS. Updated the count to
+4 in all four spots, replaced the §2-§11 range with the actual active sections,
+and noted explicitly that the tombstone sections are NOT copied. §15 already read
+"Atual (4)", now consistent. Spec-only (PT-BR), no code change — the code was
+already at 4.
+
+## [2026-06-13] /perms why git: preserve the mode token in the dry-check args
+
+Follow-up to the historical-git-paths engine fix. `buildDryCheckArgs` consumed the
+git mode token (so `/perms why git status` isn't read as a path named "status")
+but DROPPED it from the synthetic args — fine when the engine keyed only on
+`path`, but the engine now also keys on `args.mode` (`isSingleFileInvocation`
+treats blame/show_file as single-file invocations, which lets an exact-file rule
+match a file that exists only in history). So `/perms why git show_file old.ts`
+under `read_file.allow_paths: ['old.ts']` reported a default DENY while the real
+`git show_file` call would be ALLOWED — a dry-check that contradicts the live
+decision. Fix: preserve the mode in the synthetic args. Test: `show_file`/`blame`
+on an allowed-but-absent path now dry-check `allow`, while `ls_files` on the same
+path stays `deny` (the worktree-stat guard still applies to enumeration modes).
+
+## [2026-06-13] git tool: gate a collapsed untracked status dir as a subtree
+
+Review finding (metadata leak). `git status -u normal` (the default) collapses an
+untracked directory into ONE record — `?? secrets/` (trailing slash) — instead of
+listing its files. The metadata filter gated that literal directory path, but a
+subtree deny (`deny_paths: ['secrets/**']`) does NOT match the bare `secrets`
+path, so under `allow_paths: ['**'] + deny_paths: ['secrets/**']` the record
+survived and leaked the EXISTENCE of the denied subtree.
+
+Fix: a trailing-slash (collapsed-dir) record is now gated as a SUBTREE — in
+addition to the literal path it must pass a synthetic-descendant probe
+(`<dir>/.forja-check`, mirroring the permission engine's own search-root probe),
+and the record is dropped if reading INTO the subtree is denied. Chose this over
+`--untracked-files=all` (the other option): `-u all` would enumerate every
+untracked file, exploding `status` output on big untracked trees (node_modules)
+into truncation, whereas the probe keeps the compact collapsed-dir view and gates
+it consistently with how the engine gates search roots. Files (no trailing slash)
+and ls_files records are unaffected. Test: an untracked `secrets/` under a
+`secrets/**`-style deny is dropped (with the hidden-count notice) while an allowed
+untracked `public/` is kept.
+
+## [2026-06-13] git tool: don't forward TMPDIR through the sandbox passthrough
+
+Review finding (sandbox correctness). captureGit passed its full `spawnEnv` as
+`passthroughEnv`, and spawnEnv carries `TMPDIR: ctx.sandboxTmpdir` (the HOST path).
+Under `shared_tmp` (default on, Linux) the runner binds the session tmp dir to
+`/tmp` and FORCES `TMPDIR=/tmp` (the writable mountpoint), but it applies the
+caller's passthrough LAST (last-setenv-wins) — so the forwarded host-path TMPDIR
+overrode `/tmp`, pointing git's temp writes at a path that isn't the writable
+bind inside the namespace (EROFS/ENOENT on a large-object spill). Latent for
+small reads (git rarely needs TMPDIR with ext-diff/textconv off and
+OPTIONAL_LOCKS=0), but it silently defeated a deliberate sandbox mechanism. (git-
+specific: grep doesn't pass a passthroughEnv at all, so it never had this.)
+
+Fix (option A, git-side): a pure `sandboxPassthroughEnv(spawnEnv)` that returns
+every key except TMPDIR; captureGit threads that as `passthroughEnv` while keeping
+TMPDIR in `env` (correct for the unsandboxed spawn, and carried by the safe-list
+which the runner then overrides with `/tmp`). The GIT_* guards still cross the
+clearenv boundary. Test: the helper drops TMPDIR + keeps the GIT_* guards, and the
+wrapper emits the guards but no TMPDIR via passthrough. This closes the last
+deferred item from the git-tool review round.
+
+## [2026-06-13] git tool: disable REQUIRED filters along with their commands (LFS fix)
+
+Review finding (a real usability break). `filterDisableFlags` pinned each
+`filter.<d>.(clean|smudge|process)` to empty to neutralize the attacker-exec
+vector — but a REQUIRED filter (`filter.<d>.required=true`, which the standard Git
+LFS config sets as `filter.lfs.required=true`) treats an empty/failed filter as a
+FATAL error. So on a dirty LFS-tracked file the empty-pin made `git diff`/`status`
+exit 128 ("clean filter 'lfs' failed") — the tool broke normal LFS repos.
+Empirically reproduced (a `required=true` filter + dirty tracked file → exit 128
+with the command-pins alone; exit 0 once `required=false` is added).
+
+Fix: for every driver disabled, also pin `filter.<d>.required=false` so git
+accepts the (safe, no-exec) passthrough instead of erroring. The driver name is
+derived from each enumerated key (`filter.<name>.<clean|smudge|process>`, name is
+a case-sensitive subsection that may contain dots) and deduped. required=false
+enables no execution — it only changes error handling, so the exec-neutralization
+posture is unchanged; the truncation fail-closed (return null) still precedes the
+loop. Test: an LFS-style required filter + dirty tracked file → diff/status
+succeed (with a positive control asserting the command-pins-alone exit 128).
+
+## [2026-06-13] permissions: don't require historical git paths to exist in the worktree
+
+Follow-up to show_file. The `isRegularFile` guard added to the git exact-file
+allow fallback (so a bare-directory allow can't match a directory path and grant
+subtree enumeration) uses `statSync` against the LIVE worktree. But `git
+show_file`/`blame` read a file from HISTORY (`ref:path`) that may be deleted or
+renamed in the current checkout — so an exact `read_file.allow_paths: ['src/old.ts']`
+(or grant/session-allow) stopped matching once the file left the worktree,
+forcing a least-privilege policy to widen to `src/**`.
+
+Fix: the exact-file fallback now also applies for single-file-ONLY git modes
+(blame, show_file) regardless of worktree existence. Declared on FS_TOOL_TRAITS
+(`singleFileModeArg: 'mode'`, `singleFileModes: ['blame','show_file']`) and read by
+a new `isSingleFileInvocation`; the four fallback branches share one hoisted
+`exactFileEligible = allowsExactFile && (isRegularFile || isSingleFileInvocation)`.
+Safe because these modes can't enumerate a directory — the tool fails closed on a
+tree (`cat-file blob` / blame error), so there's no subtree-grant the worktree
+stat was guarding. Enumeration-capable modes (ls_files/status/diff) keep the
+worktree-stat guard: a non-existent path there stays denied. Test: an exact allow
+on a path absent from the worktree → allow for show_file/blame, deny for
+ls_files/diff.
+
+## [2026-06-13] git tool: review batch 3 — cap raise, stat, show_file, SIGKILL reap
+
+The opted-in subset of the review's deferred items (TMPDIR-vs-sandbox left out).
+
+(1) Output cap 64KB → 256KB, matching read_file's MAX_OUTPUT_BYTES, so a
+`show`/`diff` of a real change usually completes instead of truncating mid-patch.
+The three truncation tests were recalibrated to overflow the larger cap.
+
+(2) New `stat` flag (diff ONLY): emits a diffstat (changed files + churn) instead
+of the full patch — a cheap survey that also relieves the truncation pressure.
+Reuses the existing content gate (the --name-only pre-flight refuses on any denied
+file). NOTE: a pre-commit self-review found `show --stat` leaks a denied name on a
+MERGE — `show --stat` reports the FIRST-PARENT diffstat while the gate's
+`--name-only` uses COMBINED-diff, so a file taken cleanly from the second parent
+is invisible to the gate but appears in the stat. `diff` is always two-endpoint
+(never combined), so `diff --stat` is gate-consistent; `stat` is therefore
+rejected for every mode except `diff` (for a commit's stat, use a ref range like
+"HEAD~1..HEAD").
+
+(3) New `show_file` mode: the CONTENT of one file at a revision (the gap that
+previously forced the model to reach for `bash git`, which general-purpose lacks).
+Built as `git cat-file blob <ref>:./<path>` — NOT `git show`: a self-review found
+`git show <rev>:./<dir>` on a DIRECTORY dumps the tree's child NAMES, which the
+single-path gate never checks (a filename leak); `cat-file blob` fails closed on a
+non-blob, so only real files emit. cat-file is also a pure object read (no
+textconv/filter/diff drivers), so there's nothing to exec. The `./` forces git to
+resolve the path CWD-relative (a bare `<rev>:<path>` is repo-root-relative), so
+the file git reads is exactly the one the engine (rootArg: 'path') and an added
+in-tool canReadPath both gate — no relativity gap. Verified empirically (subdir
+cwd-relativity, tree fail-closed, no exec) under the hardened env.
+
+(4) SIGKILL-escalating reap (`reapWithGrace`): after we ask a git child to stop
+(truncation SIGTERM, or an abort that made Bun SIGTERM it), bound `await
+proc.exited` with a grace window and escalate to SIGKILL if it overruns — the
+structural backstop the broker has and this path, unsandboxed, lacked (sandboxed,
+bwrap's --die-with-parent already reaps). Only armed on the stop path; a normally
+running git is awaited with no deadline.
+
+Tests: show_file content + subdir cwd-relativity + denied-path refusal + requires
+path + directory fail-closed (no name leak); stat diff-only (show+stat rejected) +
+functional diffstat + still-gated; recalibrated truncation caps. Still deferred:
+the TMPDIR-vs-sandbox-/tmp fix (cross-cutting with grep).
+
+## [2026-06-13] git tool: review batch 2 — usability polish
+
+Four usability fixes from the review round (model ergonomics + user trust).
+
+(1) `command` field was the raw hardened argv: unquoted `--pretty=format:%h %ad
+…` broke copy-paste, and `-z`/`^{commit}`/`--no-renames` noise both confused the
+model and contradicted the newline-rendered output. Replaced with
+`representativeCommand` — the LOGICAL command (mode + ref + pathspec + semantic
+flags like --staged/--follow/-n), shell-quoted, internal framing omitted. Field
+doc now says it's representative, not a byte-exact replay (output is also
+policy-filtered).
+
+(2) `show` of a blob/tree ref failed with a raw plumbing error from the
+`^{commit}` peel ("expected commit type" / "can't be peeled"). Translated to an
+actionable invalidArg: the ref resolves to a non-commit; this tool shows commits,
+not file blobs — use read_file or pass a commit-ish ref.
+
+(3) `status`/`ls_files` dropped policy-denied entries silently — a `git status`
+missing files reads as "clean/absent", a trust bug. The filter now counts drops
+and appends a `[forja: N path(s) hidden by policy]` notice (the harness's existing
+marker convention), visible to the model (full JSON result) and the user (raw
+display). No notice when nothing was hidden.
+
+(4) Documented the behaviors that trip the model, in the schema: pathless modes
+are cwd-subtree-scoped, renames show as delete+add, output is ~64KB-capped (narrow
+with `path` on `truncated`), and `show` takes a commit-ish ref only. Tests:
+command-field cleanliness + shell-quoting, show-blob→invalidArg, hidden-count
+notice.
+
+Deferred (product decisions, not done): raising the 64KB cap, `show <ref>:<path>`
+(file at revision) + `diff --stat` capabilities, SIGKILL/timeout on the
+unsandboxed path, the TMPDIR-vs-sandbox-/tmp fix (cross-cutting with grep).
+
+## [2026-06-13] git tool: review batch 1 — abort labeling + non-string arg guards
+
+Two low-stakes correctness fixes from the security/usability review round.
+
+(1) Abort mid-run mislabeled as `git.failed`. Bun's signal abort SIGTERMs the
+child and closes stdout cleanly, so `captureGit`'s `for await` ends WITHOUT
+throwing and `proc.exited` resolves to 143 — which fell through to the
+`exit !== 0` branch and surfaced as a spurious `git.failed` ("git exited 143")
+instead of `aborted`. `captureGit` now rechecks `ctx.signal.aborted` after
+`proc.exited` and returns `aborted` for every caller (filter enum, preflight,
+main run). Because that makes `filterDisableFlags` map an aborted enumeration to
+`null`, execute also rechecks abort in the `filterFlags === null` branch so the
+cancellation surfaces instead of the filter-unverified refusal. (The pre-spawn
+guards already covered abort-before-each-step; this covers abort-DURING a spawn.)
+
+(2) Non-string `path`/`ref` threw a raw `TypeError`. Nothing validates the
+model's tool-call JSON against `inputSchema` before execute(), so an internal/IPC
+caller passing `path: 123` / `ref: ['x']` hit `.startsWith`/`.test` on a
+non-string and surfaced a leaky `tool.exception`. `buildModeArgs` now guards
+`typeof` and returns a clean `invalidArg`. No security impact (a non-string never
+reached argv construction), purely error-quality. Tests: abort→aborted contract;
+non-string path/ref→error.
+
+## [2026-06-13] git tool: fix metadata-gate relativity leak (resolve against repo root)
+
+Security review finding (a regression I introduced in the previous entry's perf
+tweak). To save a `rev-parse` spawn I made the metadata gate resolve emitted
+names against `ctx.cwd`, on the premise that `status`/`ls_files` emit cwd-relative
+names. That premise is FALSE for `status`: `git status -z` always emits
+REPO-ROOT-relative paths (porcelain ignores `status.relativePaths` under `-z`).
+So from a subdirectory cwd, `resolve(ctx.cwd, "app/secrets/x")` produced a doubled
+path (`/repo/app/app/secrets/x`); `canReadPath` checked the wrong path, and a
+descendant denied via operator `deny_paths` (non-sensitive basename — the
+sensitive floor still matched by basename) had its NAME leak through `status`.
+`ls_files` (cwd-relative) and `status` (root-relative) also disagreed, so one of
+the two leaked regardless of how the deny was authored. Empirically confirmed on
+git 2.54 from a subdir.
+
+Fix: both modes now emit ROOT-relative names (`status -z` natively; `ls_files`
+regains `--full-name`) and the gate resolves against the repo root via
+`resolveRepoRoot`. The `rev-parse` is LAZY — skipped when no record carries a
+path (clean `status` = just the `## branch` header; empty `ls_files`), so the
+common case stays spawn-free; taken only when there are real entries to gate. On
+an unresolvable root it FAILS CLOSED (refuses) rather than mis-resolving. Same
+class of bug fixed in the content gate: its `?? ctx.cwd` fallback (also a
+root-relative-resolved-against-cwd mis-resolution on a subdir) now fails closed
+too. Regression test uses a SUBDIR cwd + an absolute-prefix deny predicate (the
+prior tests used cwd=repo-root + substring mocks, which mask the doubling).
+
+## [2026-06-13] git tool: gate path-emitting metadata modes against denied paths
+
+Review finding: the content gate only ran for `diff`/`show`, so it stopped the
+CONTENT of a denied descendant from leaking but left the NAMES exposed. Under an
+allowed root (cwd, `src/**`) the engine authorizes git on the root only, so
+`git ls_files`/`status` still EMITTED the names of a policy-denied descendant
+(`deny_paths: src/secrets/**`, a sensitive `src/.env`) — the metadata sibling of
+the content leak. Fix: a per-path metadata filter. `status` runs with
+`--no-renames -z` and `ls_files` with `-z`, so the capture is a stream of
+single-path, NUL-framed records; each emitted name is resolved and
+canReadPath-checked, and denied records are DROPPED before the listing is
+returned (a rename decomposes into delete+add so the denied SOURCE side is gated,
+not hidden in a two-path record). Unlike content modes (which fail closed — a
+diff can't be partially redacted), names are redactable, so one denied file no
+longer blanks the whole listing. Truncation is safe to filter (only the gated
+prefix is shown; the partial trailing record is dropped).
+
+Perf: the filter adds NO git sub-process. Names stay cwd-relative (git's default;
+`-- .` already confines the listing to the cwd subtree), so each resolves against
+`ctx.cwd` directly — no `rev-parse --show-toplevel` spawn on this hot path. The
+only added per-path cost is canReadPath's one `realpathSync`, bounded by the
+capture's 64 KiB cap (~hundreds of paths) regardless of repo size. (The content
+gate keeps its `rev-parse` because `git diff --name-only` is inherently
+root-relative; factored as `resolveRepoRoot`.) Tests: denied descendant dropped
+from ls_files/status while allowed names remain; allow-all shows it again; a
+rename's denied source is dropped.
+
+## [2026-06-13] Gate the git exact-file allow fallback on the path being a FILE
+
+Bug in the earlier "preserve exact-file allows for git" fix: the literal-path
+fallback fired for EVERY git path, not just single-file ones. So
+`read_file.allow_paths: ['src']` (a bare directory) matched a directory git path
+— `git ls_files`/`status`/`log -- src` was allowed and could enumerate/history
+the whole subtree, even though the search-tool rule shape reserves that for
+`src/**` and read_file would not allow `src/a.ts`. Content modes are per-file
+gated later, but the metadata modes are not. Fix: gate the fallback (all four
+match branches) on the resolved path being a regular FILE (`statSync().isFile()`
+— the engine already does realpath). A genuine single-file read (`git blame/diff
+-- src/a.ts`) still matches an exact-file rule; a directory path falls back to
+synthetic-descendant matching, so a bare-dir allow no longer grants subtree
+access. Updated the exact-file tests to use a real cwd with a real `src/a.ts`
+and added the bare-dir-allow → deny case.
+
+## [2026-06-13] git tool: fail closed when filter enumeration is truncated
+
+Follow-up bug in the filter-neutralization fix itself: `filterDisableFlags`
+enumerates `filter.*.(clean|smudge|process)` via captureGit, which caps output at
+64 KiB. A hostile repo with enough filter entries to exceed the cap returned a
+PARTIAL key list, and the caller pinned only those — so the attacker could place
+the ACTIVE driver after the truncated prefix and a later `git diff`/`status`
+would still run its undisabled clean/process command. Now `filterDisableFlags`
+returns `null` on a truncated key list (or any unexpected read failure other than
+git-missing, which the main run surfaces cleanly), and execute hard-refuses
+(`git.policy_denied`) before running anything. Non-truncated reads — exit 0
+(matches) / 1 (none) / 128 (not a repo) — still yield a complete key set, so the
+common path is unchanged. Test: a `.git/config` padded past the cap with filter
+entries makes a worktree diff refuse.
+
+## [2026-06-13] git tool: neutralize clean/smudge/process filters before diffing
+
+Review finding (a real exec vector the audit missed): a worktree-comparing
+command — `git diff`/`status` and the content gate's `--name-only` pre-flight —
+runs the `.gitattributes`-bound `clean`/`process` FILTER to convert worktree
+content to repo form, and that filter is a repo-config-backed COMMAND, i.e.
+attacker-controlled code in an untrusted repo. `--no-textconv` only disables
+text-conversion (gitattributes/diff) filters, NOT clean/smudge — verified that
+`git diff --no-ext-diff --no-textconv --name-only -z` still ran the filter
+script. So the read-only tool could run repo code before gateContentFiles even
+saw the file. There is no name-agnostic config switch (the driver name is
+arbitrary; GIT_ATTR_NOSYSTEM / core.attributesFile don't touch in-tree
+`.gitattributes`; only comparing the already-clean INDEX avoids it). Fix:
+enumerate the configured filter drivers (`git config --get-regexp
+'^filter\..*\.(clean|smudge|process)$'` — itself runs no filter) and pin each to
+empty via `-c key=`, so git treats them as pass-through. Those flags extend the
+hardening prefix for every subsequent run this execute makes (captureGit now
+takes the prefix as a param). Behavioral test: a `filter.pwn.clean` canary fires
+on a raw worktree diff (positive control) but not through the tool.
+
+## [2026-06-13] Engine cleanup: declarative fs-tool traits + a single floor helper
+
+Two refactors (zero behavior change — all 2306 permission tests unchanged),
+removing smells the git work introduced:
+
+1. The 7 `toolName === 'git'` (and the grep/glob name-matches) scattered across
+   resolveFsTarget / isSearchTool / the allow-side literal fallback /
+   policySectionFor are now ONE declarative map, `FS_TOOL_TRAITS`: each fs tool
+   declares its `rootArg` (search-root arg → marks it a search tool), whether it
+   `exactFileAllow`s (literal-path match on the allow side, git only), and an
+   optional shared `section` (git → read_file). The engine consults traits, not
+   tool names — no more security-critical string-matching of one tool in six
+   places, and a future fs tool is one map entry.
+2. The protected-zone + sensitive-path "floor" computation was duplicated in
+   checkPath, the bypass branch, and canReadPath. Extracted `classifyFloor(path,
+   op)` → `{ absPath, tier, sensitive }`; all three now classify identically, so
+   a change to the floor lands in one place.
+
+## [2026-06-13] Apply playbook tool_restrictions to git
+
+Registering git as a built-in exposed it to playbook `tools[]`, but the subagent
+restriction wrapper only gates tools mapped in `TOOL_RESTRICTION_EXTRACTORS` —
+git was not there, so a playbook declaring `tools: [git]` with
+`tool_restrictions.git.allow_paths: ['src/**']` had a SILENTLY INERT restriction:
+the child could run pathless `git show`/`diff` over any parent-policy-readable
+part of the repo, bypassing the playbook's intended scope. Added git to both
+`TOOL_RESTRICTION_EXTRACTORS` (PATH_EXTRACTOR — its `path` arg is the fence
+target, same shape as grep) and `TOOL_RESTRICTION_SHAPE` (so the loader steers a
+mis-shaped `git.allow` toward `allow_paths`). With this, an explicit `git diff --
+src/a.ts` is gated against the fence and a pathless call is refused (its repo/cwd
+scope exceeds the allow list — checkRestriction's missing-path branch). Test:
+explicit in-fence path passes, out-of-fence refuses, pathless+allow_paths
+refuses.
+
+## [2026-06-13] Preserve bypass semantics in canReadPath
+
+Review finding against the new content gate: `canReadPath` calls `checkPath`
+directly, but `mode: 'bypass'` is handled in `check()` BEFORE the static
+path-rule branch. So under a normal bypass policy (no `read_file.allow_paths`)
+`canReadPath` default-denied every non-sensitive file — the grep filter dropped
+all matches and `git diff`/`show` failed closed as `git.policy_denied`, even
+though the engine ALLOWS the tool call under bypass. Special-cased bypass in
+canReadPath to mirror check()'s bypass-read floor: allow everything EXCEPT the
+hardcoded protected deny-tier and the sensitive-path floor (neither overridable
+by bypass; an escalate-tier read passes through, same as check()). Test: under
+mode=bypass canReadPath allows arbitrary files but still denies `.env` /
+`id_rsa`.
+
+## [2026-06-13] Honor exact-file confirm_paths for git (consistency follow-up)
+
+The earlier "preserve exact-file allows/grants for git" fix added the git-only
+literal fallback to the allow / session-allow / grant branches but missed
+`confirm_paths`. So an exact-file `read_file.confirm_paths: ['src/a.ts']` for
+`git blame`/`diff -- src/a.ts` checked only the synthetic `src/a.ts/.forja-check`
+target → no match → default-deny instead of prompting. Added the same
+`toolName === 'git'` literal fallback to the confirm branch so git follows the
+read_file policy consistently across all four match kinds. Test: exact-file
+confirm_paths now yields `confirm` for git blame/diff, while an unruled file
+stays default-deny.
+
+## [2026-06-13] git tool: scope pathless modes to cwd (`-- .`)
+
+Review finding against the engine's cwd-resolution for pathless git: when the
+session cwd is a repo SUBDIRECTORY, the permission gate resolves a pathless git
+target to that subdir and authorizes on it — but `git status`/`log`/`diff`/
+`ls-files` without a pathspec operate REPO-WIDE. So from `/repo/src` under a
+policy allowing only `./**`, a pathless call still exposed repository-wide
+status/history metadata (sibling `/repo/docs/*` changes). Confirmed: `git status`
+from `src/` reported `../docs/b.txt`. Fixed in the tool (the finding's pathspec
+option): pathless modes now emit an explicit `-- .` so git scopes its output to
+the cwd subtree, matching what the engine gated. Verified the `--name-only`
+paths stay repo-root-relative (content gate unaffected) and `-- .` works under
+GIT_LITERAL_PATHSPECS; at the repo root `-- .` is the whole repo, so the common
+case is unchanged. Test: from a subdir, status omits the sibling change and log
+omits a docs-only commit.
+
+## [2026-06-13] git tool: disable rename detection so the gate sees both paths
+
+Review finding against the content gate: with `diff.renames=true` (repo or global
+config), `git diff`/`show --name-only` reports only the rename DESTINATION — so a
+denied `secret.env` renamed+edited into an allowed `src/a.txt` shows the gate
+only `src/a.txt` (allowed), while the real diff prints the old secret content
+through its `--- a/secret.env` lines. Confirmed: with renames on, `--name-only`
+returned only `src/a.txt` and the diff leaked `TOPSECRET=…`; with
+`-c diff.renames=false` it returns BOTH paths. Added that override to HARDENING,
+so a rename decomposes into delete(source)+add(dest) and the pre-flight sees the
+denied source and refuses. `log --follow` is unaffected — it drives its own
+rename detection regardless of the config. Test: a denied secret renamed+edited
+into an allowed path under `diff.renames=true` is refused, not leaked.
+
+## [2026-06-13] `/perms why git`: support pathless modes + mode/path parsing
+
+Registering gitTool exposed `/perms why git`, but the dry-check arg builder
+(`buildDryCheckArgs`) only treated grep/glob as fs.read tools with an optional
+path. So `/perms why git` (and the pathless modes status/log/show/ls_files/bare
+diff this work supports) reported "missing path" — operators couldn't inspect
+why those calls are allowed/denied. Added a git branch that parses `[mode]
+[path]`, both optional: a leading token matching a real git mode is consumed
+(the engine keys only on path, so mode is irrelevant to the decision) so
+`/perms why git status` isn't read as a path named "status", and a bare
+`/perms why git` resolves to the session cwd like grep. Exported `GIT_MODES`
+from the tool as the single source of truth for the mode set. Tests: bare git
+and a pathless mode both dry-check to allow; a real path is checked (allow in
+src/**, deny outside) rather than confused with the mode token.
+
+## [2026-06-13] git tool: forward the GIT_* hardening into the sandbox wrapper
+
+Review finding: under a sandbox profile, `maybeWrapSandboxArgv` builds the inner
+bwrap command behind `--clearenv`, so only `SANDBOX_SAFE_ENV_VARS` (from `env`)
++ `passthroughEnv` reach the inner process — the outer `Bun.spawn({ env })` sets
+the bwrap process's env, not git's. The git tool passed its hardened env only to
+Bun.spawn, and the `GIT_*` guards (GIT_CONFIG_GLOBAL=/dev/null, NOSYSTEM,
+OPTIONAL_LOCKS, LITERAL_PATHSPECS, PAGER, TERMINAL_PROMPT) are NOT safe-listed —
+so every one of this file's config defenses was silently absent whenever
+sandboxing was enabled. Fix: thread the git spawn env through the wrapper via
+`passthroughEnv` (emitted as `--setenv` past the clearenv boundary) and `env`
+(seeds the safe-list from the controlled env, not process.env). Grep does NOT
+need this — its env is about NOT leaking secrets, which `--clearenv` +
+the safe-list already enforce more strictly than scrubEnv. Test: drives
+`maybeWrapSandboxArgv` with the git env + fake-bwrap seams and asserts each guard
+appears as a `--setenv` flag.
+
+## [2026-06-13] grep: gate denied matches in-loop so they don't consume the cap
+
+The grep policy filter ran AFTER the streaming loop had already counted denied
+matches toward `max_results` and possibly killed rg. So if a denied file owned
+the first `max` hits, grep returned zero allowed matches with `truncated: true`
+even though readable matches existed deeper in the tree — the denied file
+starved the cap. Moved the `canReadPath` gate INTO the loop: a denied match is
+skipped before it counts toward `max` or triggers the kill, so rg keeps scanning
+until `max` READABLE matches accumulate, and `truncated` now honestly means "hit
+the cap of readable hits". Also fixed the existing filter test, which used a
+dotfile (`.env`) that ripgrep skips by default — a vacuous assertion — and now
+uses a non-hidden secret. New test: a denied file with 50 hits + an allowed file
+with 2 under a cap of 3 returns both allowed matches, none denied.
+
+## [2026-06-13] Preserve exact-file allows/grants for git single-file modes
+
+Regression introduced by adding `git` to `isSearchTool`: search-tool matching
+appends `/.forja-check` (the synthetic-descendant probe) to the path before
+allow/grant/session-allow matching, so a tree root admits a `dir/**` rule. But
+git's single-file modes (`blame -- f`, `diff -- f`) hand the engine an exact
+FILE — and `src/a.ts/.forja-check` no longer matches an exact-file allow/grant of
+`src/a.ts`. So an exact-file read grant was denied for git even though the same
+file is readable via read_file. The deny side already tested the literal path for
+search tools; the allow/grant/session-allow sides did not.
+
+Fix: on the allow side, also test the LITERAL path — but only for `git`, not
+grep/glob. grep/glob deliberately require a `dir/**` form there: a bare-root
+`dir` rule must NOT admit a subtree search (the "bare-root pattern does NOT fire"
+regression pin + the session-allow bridge's ensureDescendantGlob depend on it).
+git additionally accepting a bare-root `dir` literal is fine (no pin, and it
+matches the single-file intent). Deny runs first, so the extra literal match can
+only relax an over-strict allow, never bypass a deny or the sensitive floor.
+Tests: git blame/diff on an exact-file allow + an exact-file session-allow now
+resolve to allow, a different exact file stays denied, and a dir-glob still
+admits a tree root.
+
+## [2026-06-13] Systematic audit of the git tool's config-driven exec/leak surface
+
+After six ad-hoc findings (fsmonitor/hooks, pager, ext-diff/textconv,
+log.showSignature/gpg, submodule), swept the whole class instead of waiting for
+a seventh. Empirically probed every documented exec/leak config knob against the
+six read modes (log/show/diff/blame/status/ls_files) with a canary program.
+
+Knobs that actually FIRE on a read mode (and their coverage):
+- `core.fsmonitor` — fires on all modes → pinned `-c core.fsmonitor=`.
+- `core.pager` / `pager.<cmd>` — neutralized by `--no-pager` + `GIT_PAGER=cat`.
+- `core.hooksPath` / hooks — pinned `-c core.hooksPath=/dev/null`.
+- `diff.external` — fires on `diff` → was only covered by per-mode
+  `--no-ext-diff`; now ALSO pinned `-c diff.external=` (config-level, can't be
+  forgotten by a future mode).
+- `diff.<d>.textconv` / `diff.<d>.command` bound via in-tree `.gitattributes` —
+  fire on show/diff/blame → covered by per-mode `--no-textconv` / `--no-ext-diff`
+  (there is no config wildcard to pin, so the flags are load-bearing).
+- `log.showSignature` → `gpg.program`/`gpg.ssh.program` — pinned false.
+- `diff.submodule=diff` — leaks submodule content → pinned `short`.
+
+Knobs that do NOT reach these modes (verified non-firing): `core.editor`/
+`sequence.editor`, `core.sshCommand`, `uploadpack.packObjectsHook`, `init.*`,
+aliases (modes are literal subcommands, never alias names), filter clean/smudge
+(checkout/add only). Documented as out of scope.
+
+Plus a structural addition: `GIT_CONFIG_NOSYSTEM=1` + `GIT_CONFIG_GLOBAL=/dev/null`
+in the spawn env. The `-c` overrides already beat any config file for KNOWN
+knobs; this removes the operator's `~/.gitconfig` and `/etc/gitconfig` as a
+source ENTIRELY, so an UNKNOWN dangerous knob there can't fire either. Read-only
+modes don't need the global identity, so dropping it is safe (verified all modes
+still work). Repo-local `.git/config` + in-tree `.gitattributes` are NOT (and
+cannot be) dropped — git always reads them — which is exactly why the dangerous
+knobs are pinned via `-c` (highest precedence, beats repo-local) and the
+per-mode flags.
+
+Residual: an UNKNOWN exec knob settable in a hostile repo-local `.git/config`
+that fires on a read command and isn't among the pinned set. There is no git
+mechanism to allowlist config keys, so this can't be closed at the config layer.
+The backstop is the SANDBOX (bwrap), which the tool runs under via
+`maybeWrapSandboxArgv` and which blocks exec/file-escape at the kernel level
+regardless of git config; in host-mode the pinned set covers the known surface.
+
+Tests: repo-local `diff.external` canary is not executed; a hostile global
+`~/.gitconfig` `diff.external` is ignored (proves the env drop).
+
+## [2026-06-13] git tool: force short submodule diffs before the content gate
+
+Review finding against the per-file content gate: with `diff.submodule=diff`
+set (repo or global config), `git diff`/`show` inline the FULL content diff of a
+changed submodule — but the gate's `--name-only -z` pre-flight only returns the
+submodule PATH (e.g. `sm`). So `canReadPath('sm')` passes whenever the submodule
+is readable, yet the real diff leaks the body of a denied `sm/.env`. Confirmed:
+with the config set, the tool emitted `-SECRET=1 / +SECRET=2`; `-c
+diff.submodule=short` reduces it to `Subproject commit <sha>..<sha>`. Added that
+override to the HARDENING `-c` set (highest precedence, beats config files;
+applies to both the pre-flight and the real run). Behavioral test with a real
+submodule + `diff.submodule=diff` asserts the body never appears inline.
+
+Review finding: content-emitting tools gate only their search ROOT, but their
+OUTPUT carries content from many descendant files. A policy of `read_file:
+{ allow_paths: ['./**'], deny_paths: ['**/.env*', 'secrets'] }` would still let a
+pathless `git diff`/`git show` (or `grep`) return `.env`/secret content, because
+the denied filenames are never checked — only the (allowed) cwd root. grep had
+the same structural gap; in sandboxed sessions bwrap hide_paths backstops it, but
+host-mode policy-gated sessions were exposed.
+
+Fix (the complete option — covers operator deny_paths AND the sensitive floor,
+for both tools): extended `PermissionsView` with `canReadPath(path)` — a pure
+read_file evaluation through the same `checkPath` pipeline (so deny_paths +
+sensitive-floor both apply), with NO audit row / approval-seq side effect.
+Backed by the engine's `view()`; the test ctx defaults it permissive. Then:
+- `git` (diff/show): a `--name-only` pre-flight resolves each emitted file to an
+  absolute path (via `rev-parse --show-toplevel`) and refuses (`git.policy_denied`)
+  if ANY fails `canReadPath`. status/log/ls_files emit names only; blame is
+  single-file and already gated. Refactored the spawn into a reusable
+  `captureGit` for the pre-flight, repo-root probe, and main run.
+- `grep`: drops matches whose file fails `canReadPath` (per-file cached), so it
+  can't be used to read around deny_paths.
+
+Behavioral tests for both: a `.env` denied via `canReadPath` is refused
+(git) / filtered out (grep), while allowed files pass and an allow-all policy is
+unaffected.
+
+Code review of the gate then caught three further git bypasses, all fixed +
+tested: (1) default `core.quotePath` C-escapes non-ASCII filenames in
+`--name-only`, so the parsed path missed the real file — switched the pre-flight
+to `-z` (NUL-framed raw bytes, also survives spaces/newlines); (2) a `--name-only`
+list that overflows the 64 KiB capture cap was gated as a partial set, leaking
+the unseen tail — now fails closed on `truncated` (the check must precede the
+exit-code check, since truncation kills git with a non-zero SIGTERM exit);
+(3) `git show <blob>` dumps raw object content that `--name-only` cannot
+enumerate — `show` now peels its ref with `^{commit}`, so a bare blob/tree
+errors out instead. Plus an abort re-check before the (post-gate) main spawn.
+
+## [2026-06-13] git tool: close the log.showSignature exec vector
+
+Review finding: `log.showSignature=true` in a repo-local or global `.git/config`
+makes `git log`/`git show` assume `--show-signature`, which feeds the commit
+signature to `gpg.program` / `gpg.ssh.program` — both config-selected
+executables. So a hostile repo could get arbitrary code to run during an
+"otherwise read-only, no-bash" git call. The hardening list only covered
+fsmonitor/hooks/pager. Added `-c log.showSignature=false` to the injected
+overrides (highest precedence — beats any config file), so verification is never
+attempted and the gpg exec never happens. Behavioral test: forge a commit with a
+gpgsig header + a canary `gpg.program`; a raw `git log` fires the canary
+(positive control proving the vector is live), the tool does not.
+
+## [2026-06-13] Fix git tool: policy gate for pathless modes + repo-env scrub
+
+Two review findings on the new `git` tool, both real:
+
+1. **Pathless modes were policy-denied.** Registered as `fs.read`, every git
+   call goes through `checkPath` → `resolveFsTarget` before execute. Only
+   grep/glob defaulted an omitted path to cwd; git fell to `filePathOf`, which
+   returns null for `status`/`log`/`show`/`ls_files`/bare `diff`, and checkPath
+   denies on null. So the advertised pathless calls were rejected before running.
+   The tool's own tests called `execute` directly and never crossed the gate, so
+   it slipped. Fix: integrate git into the engine like a search tool — it now
+   *shares the `read_file` policy section* (`policySectionFor`, the way the bash
+   family shares `tools.bash`), defaults a pathless target to cwd
+   (`resolveFsTarget`), counts as a search tool for deny-root matching
+   (`isSearchTool`), and has a `read-fs` resolver (`resolvers/fs.ts`, mirroring
+   grep) so the resolver gate stops forcing a conservative confirm. Net: git is
+   allowed wherever `read_file` is. Added engine tests that cross the gate.
+
+2. **Repo-selection env vars could redirect it outside cwd.** The spawn used
+   `scrubEnv(process.env)`, which preserves `GIT_DIR`/`GIT_WORK_TREE`/
+   `GIT_INDEX_FILE` — so a `escapesCwd: false` tool could be pointed at a repo or
+   index outside `ctx.cwd`. Switched to the existing `getGitBinaryWithEnv()`:
+   `safeGitEnv()` builds a fresh allowlist (no inherited `GIT_*`), and the git
+   binary is pinned to an absolute canonical path (anti mid-session PATH
+   shadowing) — the same hardening the worktree/checkpoint git callers use. Also
+   set `GIT_LITERAL_PATHSPECS=1` as env-level defense behind the leading-`:`
+   reject.
+
+## [2026-06-13] Give `code-review` and `security-audit` the read-only `git` tool
+
+Both playbooks review **changes** but their toolset (`read_file`/`grep`/`glob`)
+could not obtain the change itself — they depended on the diff arriving in the
+prompt or reconstructing it by reading files. Added `git` so they can
+`git diff`/`git show` the delta directly; `code-review` uses `git blame` to tell
+a regression from pre-existing code, `security-audit` uses the diff to scope the
+fresh attack surface and `log`/`blame` to date an introduced bug. Read-only, so
+both stay `isolation: none`.
+
+This realizes the original spec intent: `PLAYBOOKS §2`/`§3` already restricted a
+`bash` tool to exactly `git diff/log/show/blame` — but the shipped playbooks
+dropped `bash` (writes:true/escapesCwd:true would force a worktree). The `git`
+tool provides that same capability without bash's cost, so the spec §2/§3
+templates now list `git` and drop the bash `tool_restrictions` blocks.
+
+## [2026-06-13] Add a read-only `git` tool; give it to `general-purpose`
+
+New builtin tool `git` (`src/tools/builtin/git.ts`): structured, read-only git
+so a subagent can see history + working-tree state without `bash`. The model
+picks a `mode` (`log`/`show`/`diff`/`blame`/`status`/`ls_files`) + typed params;
+the tool builds a hardened argv. There is **no raw-flag passthrough**, which is
+the whole security posture — the read-command execution vectors (`-c
+core.pager=<cmd>`, `--output=`, `--ext-diff`/`--textconv` driven by a hostile
+`.gitattributes`, alias invocation) are all unreachable. We also inject `-c
+core.fsmonitor=` and `-c core.hooksPath=/dev/null` so a malicious repo-local
+`.git/config` can't get git to run a program during a "read". `ref`/`path` are
+validated (no leading `-`, no `..`, no absolute; paths fenced behind `--`).
+Spawned via `Bun.spawn` (no shell) with `scrubEnv` + sandbox wrap, output capped
+at 64 KiB.
+
+`category: 'fs.read'`, `writes: false`, `escapesCwd: false` — so it passes the
+subagent tool gate at `isolation: none` AND reads the parent's LIVE working tree
+(`diff`/`status` include uncommitted changes), which a HEAD-checked-out worktree
+would miss. That is the answer to "git in a read-only explorer without forcing
+worktree": a constrained capability, not raw `bash`.
+
+Added `git` to the `general-purpose` playbook's tools and its prompt body.
+Registered in `tools/builtin/index.ts`; new error codes `git.missing` /
+`git.failed` / `git.not_a_repo`. Tests: `tests/tools/git.test.ts` (pure
+flag-injection rejection via exported `buildModeArgs` + functional run against a
+temp repo, incl. the uncommitted-diff guarantee). Updated the exact tool-list in
+`tests/cli/bootstrap.test.ts`. Spec: `CONTRACTS §2.6.1` row + hardening note.
+
+## [2026-06-13] Add the `general-purpose` read-only subagent (bundled playbook)
+
+Shipped a fourth bundled playbook — `general-purpose` — the packaged instance of
+the generic subagent (AGENTIC_CLI §11), not a domain playbook. It is the
+read-only explorer the main agent launches for any investigation it scopes
+itself (explore a subsystem, research a mechanism, locate call sites, cross-read
+docs) and gets back a distilled answer instead of polluting its own context with
+the intermediate reads.
+
+Read-only by construction: tools are `read_file`, `grep`, `glob`,
+`retrieve_context`, `memory_read` — all writes:false, so `isolation: none` (no
+worktree, no `bash`). If a task needs an edit or an execution it returns that in
+`summary` and stops. Because the domain is open-ended it carries no fixed report
+schema — only the measure-twice honesty contract (`summary` + `confidence` +
+`assumptions` + `not_checked`, with optional `findings`/`sources` for
+locate/map-shaped tasks). `slash: explore`.
+
+Code: `src/cli/init-playbooks/general-purpose.md` + `index.ts` entry (now 4) +
+`evals/playbooks/general-purpose/01-locate-and-map.yaml`. Tests:
+`playbook-fixtures` membership + count anchor (3 → 4); `init.test`
+`CANONICAL_PLAYBOOKS.length` 3 → 4. Spec: `PLAYBOOKS §15` roster +
+`AGENTIC_CLI §11.3` count/slash list + `CONTEXT_TUNING` reflection table.
+Documented in the §15 roster (not a new §-template) precisely because it is the
+generic-subagent archetype, distinct in kind from the domain playbook sections.
+
+## [2026-06-13] Trim the playbook catalog to 3 (drop gap-audit/challenge-assumptions)
+
+Removed the two anti-sycophancy meta-playbooks, leaving exactly the
+isolation/compression set: `code-review`, `security-audit`, `perf-investigate`
+— all read-only, all producing a structured report, all cases where the cost of
+exploration far exceeds the cost of the distilled summary (the one shape where a
+context-isolated subagent clearly pays for itself). `gap-audit` and
+`challenge-assumptions` were justified by a *different* mechanism (injecting an
+explicit adversarial bias, not context compression); that bias folds back into
+normal mode. Net: the catalog now has a single coherent rationale.
+
+Code: deleted the two `.md` assets + `index.ts` imports/entries (now 3),
+`evals/playbooks/{gap-audit,challenge-assumptions}/`, and updated the
+`playbook-prompt.ts` delegation example (the `gap-audit` skepticism case).
+Tests: `playbook-fixtures` membership + count anchor (5 → 3); `init.test`
+`CANONICAL_PLAYBOOKS.length` 5 → 3.
+
+Spec in lockstep: `PLAYBOOKS §10–§11` tombstoned (numbers preserved — §12–§14
+are cross-referenced); §15 catalog count/list + the meta-playbook paragraph,
+the §1.4 discovery/delegation examples, `AGENTIC_CLI §11.3` count, and the
+`CONTEXT_TUNING` reflection-mode table all updated to the 3-playbook set.
+
+## [2026-06-13] Trim the playbook catalog to 5 (drop debug/refactor/explain/threat-model)
+
+Removed four more bundled playbooks — `debug`, `refactor`, `explain`,
+`threat-model` — leaving 5: `code-review`, `security-audit`, `perf-investigate`,
+and the two anti-sycophancy meta-playbooks `gap-audit` / `challenge-assumptions`.
+The four dropped workflows fold back into normal mode (the harness already gives
+hypothesis-driven debugging, scope-bounded edits with checkpoints, read-only
+explanation, and design-time threat reasoning without a dedicated context-isolated
+subagent). The catalog is now **within** the recommended ceiling of 6 — the
+"deliberately above the ceiling" framing in `PLAYBOOKS §15` / `AGENTIC_CLI §11.3`
+is retired.
+
+Code: deleted the four `.md` assets + `index.ts` imports/entries (now 5),
+`evals/playbooks/{debug,refactor,explain,threat-model}/`, and the
+`_routing/02-dispatch-debug.yaml` fixture. Tests: `playbook-fixtures` membership
+asserts + count anchor (9 → 5) and routing count (5 → 4); `init.test`
+`CANONICAL_PLAYBOOKS.length` 9 → 5; `validate.test` comment generalized.
+
+Spec kept in lockstep: `PLAYBOOKS §4–§7` and `CONTEXT_TUNING §13.2/§13.3/§13.5/
+§13.6` become tombstones (numbers preserved — `§6`/`§8`–`§14` are cross-referenced
+from code and other docs); slash enumerations, catalog counts, and the
+reflection-mode table updated. Deliberately left untouched: `RETRIEVAL_WORKFLOWS`
+(`refactor`/`explain`/`debug` are a retrieval ranking taxonomy per `RETRIEVAL.md
+§5.2`, baked into immutable migration 053 — independent of the playbook catalog),
+generic English uses of the words, and synthetic test fixtures named after them.
+
+## [2026-06-13] Drop `git-hygiene` from the canonical playbook catalog
+
+Removed `git-hygiene` as a bundled playbook: suggesting commit messages /
+branch names / rebase strategy is a read-only, procedure-shaped workflow that
+fits the **skill** model better than a context-isolated subagent — it carries
+no per-call budget/isolation justification and the other git workflows already
+live as skills (`git-bisect-regression`, `git-resolve-conflict`, …). The skill
+port is a separate follow-up (operator decision); this change only retires the
+playbook.
+
+Code: deleted `src/cli/init-playbooks/git-hygiene.md`, its `index.ts` import +
+catalog entry (now 9 bundled), and `evals/playbooks/git-hygiene/`. Tests:
+`playbook-fixtures.test.ts` dropped the `git-hygiene` membership assert and
+relaxed the count anchor 10 → 9.
+
+Spec (operator asked to keep spec in lockstep): catalog references retired in
+`PLAYBOOKS.md`, `AGENTIC_CLI.md §11.3`, `CONTEXT_TUNING.md §13`. Numbered
+sections (`PLAYBOOKS §9`, `CONTEXT_TUNING §13.8`) kept as **tombstones** rather
+than renumbered — `§10`–`§14` are cross-referenced from code comments and other
+docs, so renumbering would cascade; a tombstone keeps every existing ref valid.
+
 ## [2026-06-12] project_context: pointer → eager content (spec §2.0 reversal)
 
 Flipped `[project_context]` from pointer-eager/body-lazy to **eager content,

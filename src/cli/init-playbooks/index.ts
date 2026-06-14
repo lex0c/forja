@@ -1,5 +1,5 @@
 // Bundled canonical playbooks (`PLAYBOOKS.md` §12 — distribution).
-// The 10 .md files in this directory are imported as text assets
+// The 4 .md files in this directory are imported as text assets
 // and exposed as a stable array. The playbooks step of `agent init`
 // writes each entry into `<cwd>/.agent/agents/`, where the loader
 // picks them up at the next REPL boot.
@@ -13,20 +13,14 @@
 // Adding a new canonical playbook:
 //   1. Drop the `.md` file in this directory.
 //   2. Add the `import` + entry below.
-//   3. The loader test (`tests/cli/init-playbooks.test.ts`) runs
+//   3. The loader test (`tests/cli/init.test.ts`) runs
 //      `loadSubagentFromString` against every entry, so a malformed
 //      frontmatter is caught before the asset ships.
 
-import challengeAssumptionsMd from './challenge-assumptions.md' with { type: 'text' };
 import codeReviewMd from './code-review.md' with { type: 'text' };
-import debugMd from './debug.md' with { type: 'text' };
-import explainMd from './explain.md' with { type: 'text' };
-import gapAuditMd from './gap-audit.md' with { type: 'text' };
-import gitHygieneMd from './git-hygiene.md' with { type: 'text' };
+import generalPurposeMd from './general-purpose.md' with { type: 'text' };
 import perfInvestigateMd from './perf-investigate.md' with { type: 'text' };
-import refactorMd from './refactor.md' with { type: 'text' };
 import securityAuditMd from './security-audit.md' with { type: 'text' };
-import threatModelMd from './threat-model.md' with { type: 'text' };
 
 export interface CanonicalPlaybook {
   // Filename used at the destination (`<cwd>/.agent/agents/<filename>`).
@@ -44,14 +38,8 @@ export interface CanonicalPlaybook {
 // order, so a stable ordering keeps the stdout report (and any
 // regression test snapshot) predictable.
 export const CANONICAL_PLAYBOOKS: ReadonlyArray<CanonicalPlaybook> = [
-  { filename: 'challenge-assumptions.md', content: challengeAssumptionsMd },
   { filename: 'code-review.md', content: codeReviewMd },
-  { filename: 'debug.md', content: debugMd },
-  { filename: 'explain.md', content: explainMd },
-  { filename: 'gap-audit.md', content: gapAuditMd },
-  { filename: 'git-hygiene.md', content: gitHygieneMd },
+  { filename: 'general-purpose.md', content: generalPurposeMd },
   { filename: 'perf-investigate.md', content: perfInvestigateMd },
-  { filename: 'refactor.md', content: refactorMd },
   { filename: 'security-audit.md', content: securityAuditMd },
-  { filename: 'threat-model.md', content: threatModelMd },
 ];

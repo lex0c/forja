@@ -1,14 +1,14 @@
 ---
 name: security-audit
 description: Audits a PR/branch/diff for security issues.
-tools: [read_file, grep, glob]
+tools: [read_file, grep, glob, git]
 budget:
   max_steps: 40
-  max_cost_usd: 1.50
+  max_cost_usd: 2.50
 slash: audit
 when_to_use: "broad sweep of changed code for threat categories (auth, injection, supply-chain, secrets) with no specific target; pre-deploy or post-sensitive-feature"
 sampling:
-  max_tokens: 4096
+  max_tokens: 8192
 prompt_version: 1
 context_recipe_version: 1
 output_schema:
@@ -47,6 +47,9 @@ You hunt for vulnerabilities. You do not fix. You do not opine on style. You do 
 ## DO
 
 - Start with the **threat_model**: what does the attacker want? where do they enter? what is the critical asset?
+- Scope to the actual change with `git` (read-only): `git diff` / `git show <ref>`
+  to see exactly what code is new or modified — that is the fresh attack surface.
+  `git log`/`git blame` to tell an introduced bug from pre-existing code.
 - Cite `file:line` for every finding.
 - Always provide an `exploit_chain` even if short — it forces you to confirm viability.
 - Categorize each finding (avoid `other` unless last resort).

@@ -23,13 +23,25 @@
 
 import { type Capabilities, paint } from '../term.ts';
 import { formatCoarseDuration } from './duration.ts';
+import { renderShimmer } from './shimmer.ts';
 
-const ACTIVE_GLYPH = { unicode: '▸', ascii: '>' } as const;
+// Braille spinner — advances per heartbeat tick (liveRegionActive keeps
+// the heartbeat awake while any subagent runs). ASCII fallback rotates too.
+const SPINNER = {
+  unicode: ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'],
+  ascii: ['|', '/', '-', '\\'],
+} as const;
+const SPINNER_PERIOD_MS = 80;
 
-// Cap on the inline progress / goal text. Frame width drives the
-// real line budget; this is a defensive ceiling that prevents a
-// chatty child from blowing out the row before the renderer's
-// width pass clamps. Same magnitude as tool-card's preview cap.
+// Line-2 connector for the in-flight tool, under the name.
+const TREE_GLYPH = { unicode: '└', ascii: '\\' } as const;
+
+// Padded width for the subagent name on line 1, so the elapsed/cost
+// columns align across rows. Longer names truncate with an ellipsis.
+const NAME_WIDTH = 16;
+
+// Cap on the inline line-2 detail. Frame width drives the real budget;
+// this is a defensive ceiling so a chatty subject can't blow out the row.
 const MAX_DETAIL = 80;
 
 const truncate = (s: string, max: number): string => {
@@ -38,11 +50,15 @@ const truncate = (s: string, max: number): string => {
   return `${trimmed.slice(0, max - 1)}…`;
 };
 
+const padName = (name: string): string =>
+  name.length > NAME_WIDTH ? `${name.slice(0, NAME_WIDTH - 1)}…` : name.padEnd(NAME_WIDTH);
+
+// Renderer's view of a live subagent (structural subset of the reducer's
+// inline type in state.ts — only the fields the live row reads).
 export interface SubagentRowState {
   subagentId: string;
   name: string;
   goal: string;
-  progress: string;
   startedAt: number;
   // Cumulative live cost from `cost_update` IPC events. 0 when
   // no cost has been reported yet (or the child runs on a
@@ -50,47 +66,52 @@ export interface SubagentRowState {
   // suppresses the `$` chip when 0 so test fixtures and
   // free-tier runs stay visually clean.
   liveCostUsd: number;
+  // The child's in-flight tool as a compact `read engine.ts` label
+  // (line 2). Empty before the first tool and between tools.
+  currentTool: string;
 }
 
 export const renderSubagentRows = (
   subagents: ReadonlyMap<string, SubagentRowState>,
   caps: Capabilities,
   now: number,
+  // Harness backlog of not-yet-started children (parallel:status). Only a
+  // COUNT — queued children have no per-agent identities to render — so it
+  // surfaces in the header, not as rows.
+  queued = 0,
 ): string[] => {
   if (subagents.size === 0) return [];
 
-  const glyph = caps.unicode ? ACTIVE_GLYPH.unicode : ACTIVE_GLYPH.ascii;
-  const out: string[] = [];
-  // Header line: bare label, no glyph. Mirrors `renderTodoList`'s
-  // `Tasks` header — section title in primary color, rows beneath
-  // in `secondary` for the chrome and `primary` for the active
-  // text.
-  out.push('Subagents');
+  const frames = caps.unicode ? SPINNER.unicode : SPINNER.ascii;
+  const frame = frames[Math.floor(now / SPINNER_PERIOD_MS) % frames.length] as string;
+  const tree = caps.unicode ? TREE_GLYPH.unicode : TREE_GLYPH.ascii;
+
+  // Header: `Subagents · N running[ · M queued][ · $T]`. Running = the rows
+  // we render; queued is the header-only backlog; total sums live per-row
+  // cost (suppressed at 0 so zero-cost test/free-tier runs stay clean).
+  let total = 0;
+  for (const s of subagents.values()) total += s.liveCostUsd;
+  const parts = [`${subagents.size} running`];
+  if (queued > 0) parts.push(`${queued} queued`);
+  if (total > 0) parts.push(`$${total.toFixed(4)}`);
+  // The `Subagents` label shimmers (left-to-right accent slide) while any
+  // child runs — the section is only present when active, so it always
+  // animates (the heartbeat is kept awake by liveRegionActive's subagents
+  // clause). Mirrors the `Tasks` header's live-verb shimmer.
+  const header = `${renderShimmer('Subagents', caps, now, 'secondary')} ${paint(caps, 'secondary', `· ${parts.join(' · ')}`)}`;
+  const out: string[] = [header];
+
   for (const sub of subagents.values()) {
-    // Detail picks progress when present; falls back to a "seeded
-    // with goal" line so a subagent that hasn't pulsed yet still
-    // tells the operator what it's about to do.
-    const detail =
-      sub.progress.length > 0
-        ? truncate(sub.progress, MAX_DETAIL)
-        : truncate(`booting · ${sub.goal}`, MAX_DETAIL);
     const elapsed = formatCoarseDuration(Math.max(0, now - sub.startedAt));
-    // Cost chip: a 6-cent precision dollar amount when the
-    // child has reported any spend. Suppressed at 0 so test
-    // fixtures (zero-cost mock providers) and free-tier runs
-    // don't render an always-zero ornament.
-    const costChip = sub.liveCostUsd > 0 ? ` · $${sub.liveCostUsd.toFixed(4)}` : '';
-    // `▸ task <name>` is the title; `· <detail> · <elapsed>
-    // [· $X.XXXX]` is the secondary chrome. Color split keeps
-    // the operator's eye on the live verb (`running echo`)
-    // rather than the header word.
-    // No paint() on the head: the `paint` palette is alert-class
-    // (error/warn/success/secondary/etc.) — primary content is
-    // plain text. Secondary tail keeps the chrome dimmer than the
-    // verb so the operator scans the row's "name + activity".
-    const head = `  ${glyph} task ${sub.name}`;
-    const tail = paint(caps, 'secondary', ` · ${detail} · ${elapsed}${costChip}`);
-    out.push(`${head}${tail}`);
+    const cost = sub.liveCostUsd > 0 ? `  $${sub.liveCostUsd.toFixed(4)}` : '';
+    // Line 1: spinner (accent live-cue) + padded name (primary) + elapsed
+    // and cost (secondary chrome). padName aligns the columns across rows.
+    const head = `  ${paint(caps, 'accent', frame)} ${padName(sub.name)}`;
+    out.push(`${head}${paint(caps, 'secondary', `  ${elapsed}${cost}`)}`);
+    // Line 2: the in-flight tool (`└ read engine.ts`); before the first
+    // tool, the seed goal so a booting child still says what it's for.
+    const detail = sub.currentTool.length > 0 ? sub.currentTool : `starting · ${sub.goal}`;
+    out.push(paint(caps, 'secondary', `      ${tree} ${truncate(detail, MAX_DETAIL)}`));
   }
   return out;
 };

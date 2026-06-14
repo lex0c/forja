@@ -174,8 +174,27 @@ const globResolver: Resolver = (args, ctx): ResolverResult => {
   };
 };
 
+// `git` is read-only: every mode (log/show/diff/blame/status/ls_files)
+// reads the repo. Like grep it takes an optional `path` and defaults
+// to cwd when absent; the capability is always a `read-fs` over that
+// target. Without this resolver the engine's resolver gate forces a
+// conservative `confirm` on every git call ("no resolver registered").
+const gitResolver: Resolver = (args, ctx): ResolverResult => {
+  const path = args.path;
+  if (path !== undefined && !isNonEmptyString(path)) {
+    return { kind: 'refuse', reason: "git: non-string 'path' argument" };
+  }
+  const target = isNonEmptyString(path) ? resolveAbs(path, ctx) : ctx.cwd;
+  return {
+    kind: 'ok',
+    capabilities: [readFs(target)],
+    confidence: 'high',
+  };
+};
+
 registerResolver('read_file', readFileResolver);
 registerResolver('write_file', writeFileResolver);
 registerResolver('edit_file', editFileResolver);
 registerResolver('grep', grepResolver);
 registerResolver('glob', globResolver);
+registerResolver('git', gitResolver);

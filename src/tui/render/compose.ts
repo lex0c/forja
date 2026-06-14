@@ -22,9 +22,9 @@
 //      OR modal (when up), which owns the bottom slot entirely
 //      and carries its own structure.
 //
-// Order: history above (scrollback), then todos, subagents, the
-// accumulating tool batch, live tool cards, the pinned phase chip,
-// then the bottom anchor (rule/input/rule/footer).
+// Order: history above (scrollback), then the accumulating tool batch,
+// live tool cards, the subagent group, todos (pinned just above), the
+// pinned phase chip, then the bottom anchor (rule/input/rule/footer).
 
 import type { ComposeLive } from '../renderer-types.ts';
 import { type LiveState, flushPendingToolEndBatch } from '../state.ts';
@@ -254,11 +254,7 @@ export const composeLive: ComposeLive = (
     lines.push(...block.map(padFrame));
   };
 
-  // 1. Active subagents (UI.md §4.2). One row per concurrent child run;
-  // section disappears when state.subagents is empty.
-  appendBlock(renderSubagentRows(state.subagents, caps, now));
-
-  // 2. Live preview of the accumulating tool-end batch. Consecutive
+  // 1. Live preview of the accumulating tool-end batch. Consecutive
   // same-name tools (read/read/read, or a run of bash) buffer into
   // `pendingToolEndBatch` and only settle into scrollback when the
   // group ends (a different-name tool, assistant text, or session
@@ -281,7 +277,7 @@ export const composeLive: ComposeLive = (
     lines.push(...formatPermanent(item, caps));
   }
 
-  // 3. Active tool cards (running). Map insertion order is preserved, so
+  // 2. Active tool cards (running). Map insertion order is preserved, so
   // the visual order matches the order tools were started. The cards STACK
   // above the TodoList + phase chip below — read, write, bash… pile upward
   // as the harness fires them.
@@ -298,15 +294,26 @@ export const composeLive: ComposeLive = (
     for (let i = 1; i < block.length; i++) lines.push(padFrame(block[i] as string));
   }
 
+  // 3. Active subagents (UI.md §4.2), grouped directly ABOVE Tasks near the
+  // typing zone. One 2-line row per concurrent child (spinner · name ·
+  // elapsed · cost, then the in-flight tool); section disappears when empty.
+  // Queued backlog comes from parallel:status (count only). The child's
+  // tools no longer stream as live cards — they collapse into the grouped
+  // summary block on end — so this sits cleanly above Tasks.
+  appendBlock(
+    renderSubagentRows(state.subagents, caps, now, state.parallelStatus?.subagentsQueued ?? 0),
+  );
+
   // 4. Live TodoList, pinned at the BOTTOM of the volatile stack — just
   // above the phase chip, near the typing zone. The WHOLE tool zone (the
-  // settling batch §2 and the running cards §3) renders ABOVE it, so a
-  // completing tool moves card→batch entirely above the list instead of
-  // crossing it (the "tool flashes below Tasks" report). Because the live
-  // region is anchored to the input, the list stays put while that stack
-  // grows/shrinks overhead. renderTodoList returns [] when empty — the
-  // section drops. Diverges from spec §4.10.6 ("Todo list acima dos
-  // chips") — folds into the pending todolist spec follow-up.
+  // settling batch §1 and the running cards §2) plus the subagent group §3
+  // render ABOVE it, so a completing tool moves card→batch entirely above
+  // the list instead of crossing it (the "tool flashes below Tasks"
+  // report). Because the live region is anchored to the input, the list
+  // stays put while that stack grows/shrinks overhead. renderTodoList
+  // returns [] when empty — the section drops. Diverges from spec §4.10.6
+  // ("Todo list acima dos chips") — folds into the pending todolist spec
+  // follow-up.
   appendBlock(renderTodoList(state.todos, caps, now, !state.ended));
 
   // 5. Pinned turn-phase chip. The single live indicator for what the

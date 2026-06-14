@@ -15,21 +15,15 @@ describe('loadPlaybookFixtures (bundled)', () => {
   test('every shipped per-playbook stub loads cleanly', () => {
     const root = join(import.meta.dir, '../../evals/playbooks');
     const fixtures = loadPlaybookFixtures(root);
-    // Slice 10 ships exactly one stub per canonical playbook —
-    // the count anchors the contract that every bundled
-    // playbook has at least one regression entry.
-    expect(fixtures.length).toBeGreaterThanOrEqual(10);
+    // One stub per canonical playbook — the count anchors the
+    // contract that every bundled playbook has at least one
+    // regression entry.
+    expect(fixtures.length).toBeGreaterThanOrEqual(4);
     const playbookNames = new Set(fixtures.map((f) => f.playbook));
     expect(playbookNames).toContain('code-review');
     expect(playbookNames).toContain('security-audit');
-    expect(playbookNames).toContain('debug');
-    expect(playbookNames).toContain('refactor');
-    expect(playbookNames).toContain('explain');
-    expect(playbookNames).toContain('threat-model');
     expect(playbookNames).toContain('perf-investigate');
-    expect(playbookNames).toContain('git-hygiene');
-    expect(playbookNames).toContain('gap-audit');
-    expect(playbookNames).toContain('challenge-assumptions');
+    expect(playbookNames).toContain('general-purpose');
   });
 
   test('every fixture references its own directory as the playbook name', () => {
@@ -48,7 +42,7 @@ describe('loadRoutingFixtures (bundled)', () => {
   test('the bundled routing set covers dispatch / none / ambiguous', () => {
     const root = join(import.meta.dir, '../../evals/playbooks');
     const routing = loadRoutingFixtures(root);
-    expect(routing.length).toBeGreaterThanOrEqual(5);
+    expect(routing.length).toBeGreaterThanOrEqual(4);
     const flavors = new Set(routing.map((r) => r.expectDispatch));
     expect(flavors).toContain('none');
     expect(flavors).toContain('ambiguous');

@@ -632,6 +632,10 @@ export const ERROR_CODES = {
   bashSpawnFailed: 'bash.spawn_failed',
   ripgrepMissing: 'grep.ripgrep_missing',
   ripgrepFailed: 'grep.ripgrep_failed',
+  gitMissing: 'git.missing',
+  gitFailed: 'git.failed',
+  gitNotRepo: 'git.not_a_repo',
+  gitDenied: 'git.policy_denied',
   aborted: 'tool.aborted',
   // Tools whose category gate is too coarse for their actual side
   // effects (wait_for / monitor) self-gate per leaf condition and

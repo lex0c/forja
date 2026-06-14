@@ -142,6 +142,9 @@ Conjunto fechado para v1. Adições requerem PR contra este doc + eval de regres
 | `read_file` | `{ path, offset?, limit? }` | `{ content, total_lines, truncated }` | nenhum | sim | ~5ms; até `limit` linhas |
 | `glob` | `{ pattern, cwd? }` | `{ matches: string[], truncated }` | nenhum | sim | ~10-50ms; cap 1000 matches |
 | `grep` | `{ pattern, path?, type?, -A?, -B? }` | `{ matches: { file, line, text }[], truncated }` | nenhum | sim | ~50-500ms; cap 200 matches |
+| `git` | `{ mode, path?, ref?, max_count?, staged?, follow? }` | `{ mode, command, output, truncated, exit_code }` | nenhum | sim | ~60ms; cap 64 KiB |
+
+`git` é read-only por construção: o modelo escolhe `mode` (`log`/`show`/`diff`/`blame`/`status`/`ls_files`) e parâmetros tipados — nunca flags cruas. A tool constrói o argv já endurecido (`-c core.fsmonitor=`, `-c core.hooksPath=/dev/null`, `--no-ext-diff`/`--no-textconv`, sem passthrough), então as rotas de execução de comando do git em modo "leitura" (`core.pager`, `--ext-diff` + `.gitattributes`, aliases) são inalcançáveis. `diff`/`status` refletem a **working tree viva** (uncommitted incluído), diferente de um worktree em HEAD — por isso é a forma de dar git a um subagent `isolation: none` sem `bash`.
 
 ### 2.6.2 Filesystem (write)
 

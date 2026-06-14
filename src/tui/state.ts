@@ -366,6 +366,12 @@ export interface LiveState {
   // no batch is pending. The buffer is INTERNAL to the reducer —
   // renderer never reads it directly.
   pendingToolEndBatch: PendingToolEndBatch | null;
+  // True iff the LAST item emitted to scrollback was a subagent block, so
+  // a following `subagent:end` coalesces under the SAME `Subagent` title
+  // (no repeat). Owned by the `applyEvent` wrapper: set on a subagent
+  // block, cleared by any other scrollback emission (incl. a tool batch
+  // flushing between two subagent completions). Renderer never reads it.
+  subagentTitleShown: boolean;
   pendingAssistant: PendingAssistant | null;
   // `messageId` carried alongside `startedAt` so the thinking
   // chip can hash a stable per-turn seed when picking its
@@ -474,6 +480,17 @@ export interface LiveState {
       // `$X.XX` segment, preserving the existing test-fixture
       // visual shape.
       liveCostUsd: number;
+      // The child's IN-FLIGHT tool as a compact `read engine.ts`
+      // label — rendered on the live row's line 2. Empty before the
+      // first tool and after each tool finishes (cleared on toolDone).
+      currentTool: string;
+      // Per-tool-type invocation counts, accumulated as the child
+      // works (the child's tools no longer stream to scrollback live —
+      // they collapse into the grouped, aggregated trail on end).
+      // Insertion order preserved so the trail is stable across ticks.
+      toolCounts: Map<string, number>;
+      // Total tool invocations (the `N tools` figure in the summary).
+      toolTotal: number;
     }
   >;
   // Pending reminders scheduled this session (ORCHESTRATION.md §3B.9).
@@ -553,7 +570,12 @@ export const liveRegionActive = (state: LiveState): boolean =>
   // live region. renderTodoList applies the same `!ended` gate to the header
   // so the two never disagree (heartbeat idle + header wanting to shimmer =
   // a frozen highlighted char).
-  (!state.ended && state.todos.some((t) => t.status === 'in_progress'));
+  (!state.ended && state.todos.some((t) => t.status === 'in_progress')) ||
+  // A running subagent keeps the heartbeat awake so its row's spinner
+  // animates and the [elapsed]/cost tick. Gated on `!ended` like todos:
+  // an abnormal cut that leaves a row un-collapsed must not pin the
+  // heartbeat forever (subagent:end normally removes the row first).
+  (!state.ended && state.subagents.size > 0);
 
 export const createInitialState = (): LiveState => ({
   input: { value: '', cursor: 0 },
@@ -579,6 +601,7 @@ export const createInitialState = (): LiveState => ({
   },
   activeTools: new Map(),
   pendingToolEndBatch: null,
+  subagentTitleShown: false,
   pendingAssistant: null,
   thinking: null,
   awaitingProvider: null,
@@ -735,6 +758,15 @@ export type PermanentItem =
     }
   | { kind: 'recap-terse'; message: string }
   | {
+      // `Subagent` group title — emitted by the `applyEvent` wrapper
+      // before the FIRST subagent block of a consecutive run, so a burst
+      // of finishing subagents reads as one titled group in scrollback
+      // (mirrors how coalesced tools share a head). Renders as a single
+      // col-0 plain line.
+      kind: 'subagent_group_header';
+      ts: number;
+    }
+  | {
       // Subagent run terminal summary, emitted from the
       // `subagent:end` reducer branch. Renderer formats as a
       // single line with the name, status glyph, summary
@@ -761,6 +793,12 @@ export type PermanentItem =
       costUsd: number;
       summary: string;
       durationMs: number;
+      // Per-tool-type invocation counts (insertion order), rendered as
+      // the grouped, aggregated trail under the summary header
+      // (`├ read 38 files`). Empty array → header-only block.
+      toolCounts: ReadonlyArray<readonly [string, number]>;
+      // Total tool invocations across the run (the `N tools` figure).
+      toolTotal: number;
     };
 
 export interface ApplyResult {
@@ -972,6 +1010,12 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           // bgProcesses intentionally NOT reset (see boundary comment
           // above) — bash_background processes survive the turn.
           subagents: new Map(),
+          // Reset the scrollback title-run flag at the turn boundary: a new
+          // turn's first subagent burst must re-show the `● Subagents`
+          // title even if the prior turn ended on a subagent block (the
+          // boundary itself emits no permanent, so the wrapper can't clear
+          // it for us). Mirrors the pendingToolEndBatch drop below.
+          subagentTitleShown: false,
           parallelStatus: null,
           // Per-session: a stale "Awaiting model" indicator from a
           // crashed prior run (e.g., resume after parent crash mid-
@@ -2245,13 +2289,25 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // existing entry rather than no-oping; the new producer is
       // the source of truth for any field the renderer reads.
       const next = new Map(state.subagents);
+      // `name` and `goal` are model/child-authored — `goal` is the raw
+      // seed prompt verbatim — and the renderer paints them into the LIVE
+      // region every heartbeat tick (`name` in the row head, `goal` in the
+      // `starting · <goal>` line-2 fallback). Now that `liveRegionActive`
+      // stays true for the whole subagent run, a raw ESC/BEL/CR would ring
+      // the bell, forge SGR, or move the cursor on every redraw. Sanitize at
+      // this STATE boundary — same chokepoint the sibling `currentTool`
+      // (harness-adapter) and the `read_file` path already use — so every
+      // downstream read (live row, end-block summary) sees clean text.
       next.set(event.subagentId, {
         subagentId: event.subagentId,
-        name: event.name,
-        goal: event.goal,
+        name: sanitizeOneLineForDisplay(event.name),
+        goal: sanitizeOneLineForDisplay(event.goal),
         progress: '',
         startedAt: event.ts,
         liveCostUsd: 0,
+        currentTool: '',
+        toolCounts: new Map(),
+        toolTotal: 0,
       });
       return { state: { ...state, subagents: next }, permanent: [] };
     }
@@ -2273,7 +2329,29 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // than zeroing it. Monotonic at the source (handle-store
       // enforces) so we don't need a max() guard.
       const liveCostUsd = event.cumulativeCostUsd ?? existing.liveCostUsd;
-      next.set(event.subagentId, { ...existing, progress: event.progress, liveCostUsd });
+      // `currentTool` (line 2) is set on tool-start and PERSISTS until the
+      // next tool starts — it is NOT cleared on `toolDone`. Clearing it
+      // would blank line 2 during the gap between tools (every model
+      // round-trip), flapping back to the `starting · <goal>` fallback on
+      // each tool finish. Keeping the last tool shown (with the spinner
+      // still conveying "active") reads as the subagent's most recent
+      // action instead. `toolDone` only feeds the per-type aggregate.
+      const currentTool = event.currentTool ?? existing.currentTool;
+      let toolCounts = existing.toolCounts;
+      let toolTotal = existing.toolTotal;
+      if (event.toolDone !== undefined) {
+        toolCounts = new Map(existing.toolCounts);
+        toolCounts.set(event.toolDone, (toolCounts.get(event.toolDone) ?? 0) + 1);
+        toolTotal = existing.toolTotal + 1;
+      }
+      next.set(event.subagentId, {
+        ...existing,
+        progress: event.progress,
+        liveCostUsd,
+        currentTool,
+        toolCounts,
+        toolTotal,
+      });
       return { state: { ...state, subagents: next }, permanent: [] };
     }
 
@@ -2300,6 +2378,13 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
                 costUsd: event.costUsd,
                 summary: event.summary,
                 durationMs: event.durationMs,
+                // Freeze the accumulated per-type counts for the grouped
+                // scrollback trail (sorted desc by count, then name for a
+                // stable tie-break).
+                toolCounts: [...existing.toolCounts.entries()].sort(
+                  (a, b) => b[1] - a[1] || a[0].localeCompare(b[0]),
+                ),
+                toolTotal: existing.toolTotal,
               },
             ];
       return { state: { ...state, subagents: next }, permanent };
@@ -2371,11 +2456,40 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
 //   for everything else, treat the field as opaque.
 export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
   const inner = applyEventInner(state, event);
-  if (event.type === 'tool:end') return inner;
+  if (event.type === 'tool:end') {
+    // tool:end NEVER flushes here (it coalesces into pendingToolEndBatch).
+    // But a BYPASSED tool-end — one that emits its chip immediately rather
+    // than buffering (failed/denied status, an exit code, a diff, a
+    // summary) — lands a non-subagent block in scrollback, so it ends a
+    // subagent title-run. A BUFFERED tool-end emits no permanent yet, so it
+    // leaves the flag: the buffer re-titles via `flushed.permanent` when it
+    // flushes on the next event.
+    if (inner.permanent.length > 0 && state.subagentTitleShown) {
+      return { state: { ...inner.state, subagentTitleShown: false }, permanent: inner.permanent };
+    }
+    return inner;
+  }
   if (inner.permanent.length === 0) return inner;
   const flushed = flushPendingToolEndBatch(inner.state);
+  // Subagent group title: a `subagent:end` emits a `subagent_summary`
+  // block. Prepend a single `Subagent` header ONLY when the preceding
+  // scrollback wasn't already a subagent block (a fresh run) — including
+  // when a tool batch just flushed between two completions (flushed
+  // items break the run). Any OTHER scrollback-emitting event clears the
+  // flag, so the next burst re-titles. This coalesces a parallel batch of
+  // finishing subagents under one title (like tools share a head).
+  if (event.type === 'subagent:end') {
+    const startRun = !state.subagentTitleShown || flushed.permanent.length > 0;
+    const title: PermanentItem[] = startRun
+      ? [{ kind: 'subagent_group_header', ts: event.ts }]
+      : [];
+    return {
+      state: { ...flushed.state, subagentTitleShown: true },
+      permanent: [...flushed.permanent, ...title, ...inner.permanent],
+    };
+  }
   return {
-    state: flushed.state,
+    state: { ...flushed.state, subagentTitleShown: false },
     permanent: [...flushed.permanent, ...inner.permanent],
   };
 };

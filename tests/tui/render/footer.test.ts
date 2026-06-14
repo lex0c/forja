@@ -439,6 +439,9 @@ describe('renderFooter', () => {
         progress: '',
         startedAt: 0,
         liveCostUsd: 0,
+        currentTool: '',
+        toolCounts: new Map(),
+        toolTotal: 0,
       });
     };
 

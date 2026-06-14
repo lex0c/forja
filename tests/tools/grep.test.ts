@@ -39,6 +39,77 @@ describe.if(RG_AVAILABLE)('grepTool (with ripgrep)', () => {
     expect(files.some((f) => f.endsWith('b.ts'))).toBe(true);
   });
 
+  test('drops matches from policy-denied files (no read-around via grep)', async () => {
+    // Non-hidden secret file (ripgrep skips dotfiles by default, so a
+    // `.env` would be a vacuous assertion) matched by the same pattern.
+    writeFileSync(join(dir, 'secret.txt'), 'login_token = SECRET\n');
+    writeFileSync(join(dir, 'src/c.ts'), 'login();\n');
+    const denyEnv = makeCtx({
+      cwd: dir,
+      permissions: {
+        mode: 'strict',
+        posture: 'supervised',
+        canReadPath: (p) => !p.endsWith('secret.txt'),
+      },
+    });
+    const out = await grepTool.execute({ pattern: 'login' }, denyEnv);
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    const files = out.matches.map((m) => m.file);
+    expect(files.some((f) => f.endsWith('secret.txt'))).toBe(false);
+    // allowed files still match
+    expect(files.some((f) => f.endsWith('.ts'))).toBe(true);
+    // The hidden secret.txt match is DISCLOSED, not silently dropped.
+    expect(out.policy_note).toBeDefined();
+    expect(out.policy_note).toContain('read_file');
+  });
+
+  test('an all-hidden grep surfaces policy_note instead of a silent count: 0', async () => {
+    // The finding's case: a policy authorizes the grep CALL (grep section) but
+    // denies the matched content under read_file → every match is gated out.
+    // Without the note the result reads as a bogus "no matches", and the
+    // operator can't tell a real empty search from a policy-hidden one.
+    writeFileSync(join(dir, 'only.txt'), 'login here\n');
+    const denyAll = makeCtx({
+      cwd: dir,
+      permissions: { mode: 'strict', posture: 'supervised', canReadPath: () => false },
+    });
+    const hidden = await grepTool.execute({ pattern: 'login', path: 'only.txt' }, denyAll);
+    if (isToolError(hidden)) throw new Error(`unexpected error: ${hidden.error_message}`);
+    expect(hidden.count).toBe(0);
+    expect(hidden.policy_note).toBeDefined();
+    expect(hidden.policy_note).toContain('read_file');
+
+    // Control: allow-all → real matches, and NO note (nothing was hidden).
+    const allow = await grepTool.execute(
+      { pattern: 'login', path: 'only.txt' },
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(allow)) throw new Error(`unexpected error: ${allow.error_message}`);
+    expect(allow.count).toBeGreaterThan(0);
+    expect(allow.policy_note).toBeUndefined();
+  });
+
+  test('denied matches do not consume the cap (readable matches are not starved)', async () => {
+    // A denied file with far more hits than the cap, plus an allowed
+    // file with a couple. Denied hits must NOT count toward max_results
+    // or kill rg, or the allowed matches would be lost.
+    writeFileSync(join(dir, 'secret.txt'), `${Array(50).fill('NEEDLE x').join('\n')}\n`);
+    writeFileSync(join(dir, 'src/keep.ts'), 'NEEDLE one\nNEEDLE two\n');
+    const denyEnv = makeCtx({
+      cwd: dir,
+      permissions: {
+        mode: 'strict',
+        posture: 'supervised',
+        canReadPath: (p) => !p.endsWith('secret.txt'),
+      },
+    });
+    const out = await grepTool.execute({ pattern: 'NEEDLE', max_results: 3 }, denyEnv);
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    const files = out.matches.map((m) => m.file);
+    expect(files.every((f) => !f.endsWith('secret.txt'))).toBe(true);
+    expect(files.filter((f) => f.endsWith('keep.ts')).length).toBe(2);
+  });
+
   test('case_insensitive matches "Login"', async () => {
     const out = await grepTool.execute(
       { pattern: 'login', case_insensitive: true, path: 'README.md' },

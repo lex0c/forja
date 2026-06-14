@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, test } from 'bun:test';
-import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AuditEmitInput } from '../../src/permissions/audit.ts';
@@ -966,6 +966,187 @@ describe('engine.check (search tools: glob/grep)', () => {
     const eng = createPermissionEngine(policy({}), { cwd: CWD });
     expect(eng.check('glob', 'fs.read', { pattern: 'src/**' }).kind).toBe('deny');
     expect(eng.check('grep', 'fs.read', { pattern: 'foo' }).kind).toBe('deny');
+  });
+
+  // `git` is read-only fs access that shares the `read_file` policy
+  // section and (like grep) defaults a pathless call to cwd. These
+  // guard the regression where pathless git modes (status/log/show)
+  // were early-denied with "missing path" before the call could run.
+  test('git pathless modes resolve to cwd and pass under a read_file allow', () => {
+    const eng = createPermissionEngine(
+      policy({ tools: { read_file: { allow_paths: ['./**'] } } }),
+      { cwd: CWD },
+    );
+    expect(eng.check('git', 'fs.read', { mode: 'status' }).kind).toBe('allow');
+    expect(eng.check('git', 'fs.read', { mode: 'log' }).kind).toBe('allow');
+  });
+
+  test('git with a path is checked against the read_file allow_paths', () => {
+    const eng = createPermissionEngine(
+      policy({ tools: { read_file: { allow_paths: ['src/**'] } } }),
+      { cwd: CWD },
+    );
+    expect(eng.check('git', 'fs.read', { mode: 'log', path: 'src' }).kind).toBe('allow');
+    expect(eng.check('git', 'fs.read', { mode: 'log', path: 'docs' }).kind).toBe('deny');
+  });
+
+  test('git rooted at a read_file deny_paths dir is rejected (literal match)', () => {
+    const eng = createPermissionEngine(
+      policy({ tools: { read_file: { allow_paths: ['**'], deny_paths: ['secrets'] } } }),
+      { cwd: CWD },
+    );
+    expect(eng.check('git', 'fs.read', { mode: 'diff', path: 'secrets' }).kind).toBe('deny');
+  });
+
+  test('git default-denies when read_file has no allow_paths (parity with grep/glob)', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    expect(eng.check('git', 'fs.read', { mode: 'status' }).kind).toBe('deny');
+  });
+
+  // The git exact-file fallback is gated on the path resolving to a
+  // REGULAR FILE, so these use a real cwd with a real `src/a.ts`.
+  const realGitCwd = (): string => {
+    const d = realpathSync(mkdtempSync(join(tmpdir(), 'forja-eng-git-')));
+    mkdirSync(join(d, 'src'), { recursive: true });
+    writeFileSync(join(d, 'src/a.ts'), 'x');
+    return d;
+  };
+
+  test('git exact-FILE allow matches a single-file path; a dir allow does NOT grant a dir path', () => {
+    const cwd = realGitCwd();
+    try {
+      // exact-file allow → single-file git path (blame/diff -- f) allowed
+      const fileEng = createPermissionEngine(
+        policy({ tools: { read_file: { allow_paths: ['src/a.ts'] } } }),
+        { cwd },
+      );
+      expect(fileEng.check('git', 'fs.read', { mode: 'blame', path: 'src/a.ts' }).kind).toBe(
+        'allow',
+      );
+      expect(fileEng.check('git', 'fs.read', { mode: 'diff', path: 'src/a.ts' }).kind).toBe(
+        'allow',
+      );
+      // a different exact file stays denied
+      expect(fileEng.check('git', 'fs.read', { mode: 'blame', path: 'src/b.ts' }).kind).toBe(
+        'deny',
+      );
+      // a bare-DIRECTORY allow must NOT grant a directory git path: the
+      // exact-file fallback is file-only, so `ls_files -- src` can't
+      // enumerate the subtree off a bare `src` rule (needs `src/**`).
+      const dirAllowEng = createPermissionEngine(
+        policy({ tools: { read_file: { allow_paths: ['src'] } } }),
+        { cwd },
+      );
+      expect(dirAllowEng.check('git', 'fs.read', { mode: 'ls_files', path: 'src' }).kind).toBe(
+        'deny',
+      );
+      // but a dir-GLOB allow still admits a tree root via the synthetic descendant
+      const dirGlobEng = createPermissionEngine(
+        policy({ tools: { read_file: { allow_paths: ['src/**'] } } }),
+        { cwd },
+      );
+      expect(dirGlobEng.check('git', 'fs.read', { mode: 'diff', path: 'src' }).kind).toBe('allow');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('git single-file modes (show_file/blame) honor an exact allow even when the path is absent from the worktree', () => {
+    // Regression: show_file/blame read a file from HISTORY (`ref:path`)
+    // that may be deleted/renamed in the current checkout. The worktree
+    // stat must NOT force a least-privilege `src/old.ts` allow to widen to
+    // `src/**`. realGitCwd has src/a.ts but NO src/old.ts.
+    const cwd = realGitCwd();
+    try {
+      const eng = createPermissionEngine(
+        policy({ tools: { read_file: { allow_paths: ['src/old.ts'] } } }),
+        { cwd },
+      );
+      // single-file-only modes: allowed despite src/old.ts not existing on disk
+      expect(eng.check('git', 'fs.read', { mode: 'show_file', path: 'src/old.ts' }).kind).toBe(
+        'allow',
+      );
+      expect(eng.check('git', 'fs.read', { mode: 'blame', path: 'src/old.ts' }).kind).toBe('allow');
+      // enumeration-capable modes still require the worktree file (or a
+      // `dir/**` rule): a non-existent path must not slip the file-vs-dir
+      // guard — `ls_files`/`diff` on a missing path stay denied.
+      expect(eng.check('git', 'fs.read', { mode: 'ls_files', path: 'src/old.ts' }).kind).toBe(
+        'deny',
+      );
+      expect(eng.check('git', 'fs.read', { mode: 'diff', path: 'src/old.ts' }).kind).toBe('deny');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('git exact-file session-allow matches via the literal path', () => {
+    const cwd = realGitCwd();
+    try {
+      const eng = createPermissionEngine(policy({}), { cwd });
+      eng.addSessionAllow('read_file', 'src/a.ts'); // git shares the read_file section
+      expect(eng.check('git', 'fs.read', { mode: 'blame', path: 'src/a.ts' }).kind).toBe('allow');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('git exact-file confirm_paths prompts (does not default-deny)', () => {
+    const cwd = realGitCwd();
+    try {
+      const eng = createPermissionEngine(
+        policy({ tools: { read_file: { confirm_paths: ['src/a.ts'] } } }),
+        { cwd },
+      );
+      expect(eng.check('git', 'fs.read', { mode: 'blame', path: 'src/a.ts' }).kind).toBe('confirm');
+      expect(eng.check('git', 'fs.read', { mode: 'diff', path: 'src/a.ts' }).kind).toBe('confirm');
+      // a different exact file with no rule stays default-deny
+      expect(eng.check('git', 'fs.read', { mode: 'blame', path: 'src/b.ts' }).kind).toBe('deny');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('view().canReadPath reflects read_file deny_paths + sensitive floor (content-tool gate)', () => {
+    const eng = createPermissionEngine(
+      policy({ tools: { read_file: { allow_paths: ['./**'], deny_paths: ['secrets/**'] } } }),
+      { cwd: CWD },
+    );
+    const v = eng.view();
+    expect(v.canReadPath('src/a.ts')).toBe(true);
+    // operator deny_paths
+    expect(v.canReadPath('secrets/key.txt')).toBe(false);
+    // sensitive-path engine floor (denied even with allow_paths: ['**'])
+    expect(v.canReadPath('.env')).toBe(false);
+    expect(v.canReadPath('config/id_rsa')).toBe(false);
+  });
+
+  test('view().canReadPath honors bypass mode (allow all but the sensitive floor)', () => {
+    // bypass with NO read_file.allow_paths: a direct checkPath would
+    // default-deny every file, wrongly making the content gate drop
+    // all grep matches / fail git diff. canReadPath must mirror
+    // check()'s bypass semantics instead.
+    const eng = createPermissionEngine(policy({ defaults: { mode: 'bypass' } }), { cwd: CWD });
+    const v = eng.view();
+    expect(v.canReadPath('src/a.ts')).toBe(true);
+    expect(v.canReadPath('anything/else.txt')).toBe(true);
+    // bypass does NOT override the sensitive-path floor
+    expect(v.canReadPath('.env')).toBe(false);
+    expect(v.canReadPath('config/id_rsa')).toBe(false);
+  });
+
+  test('view().canReadPath is side-effect-free (no state mutation across probes)', () => {
+    const eng = createPermissionEngine(
+      policy({ tools: { read_file: { allow_paths: ['./**'] } } }),
+      { cwd: CWD },
+    );
+    // canReadPath routes through checkPath, not check() — so it emits no
+    // audit row and bumps no seq. We can't observe the audit sink here,
+    // but we can assert the observable: a real decision is unchanged by
+    // interleaved probes (no accumulated state leaks into it).
+    const before = eng.check('read_file', 'fs.read', { path: 'src/a.ts' });
+    for (let i = 0; i < 5; i++) eng.view().canReadPath(`src/probe-${i}.ts`);
+    const after = eng.check('read_file', 'fs.read', { path: 'src/a.ts' });
+    expect(after).toEqual(before);
   });
 
   test('glob with non-string cwd is denied (does not crash on path.resolve)', () => {

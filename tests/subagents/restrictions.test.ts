@@ -11,7 +11,17 @@ import {
   toRestrictionError,
   wrapToolWithRestrictions,
 } from '../../src/subagents/restrictions.ts';
+import { gitTool } from '../../src/tools/builtin/git.ts';
 import { type Tool, type ToolContext, isToolError } from '../../src/tools/types.ts';
+import { makeCtx } from '../tools/_helpers.ts';
+
+const GIT_AVAILABLE = (() => {
+  try {
+    return Bun.spawnSync(['git', '--version']).exitCode === 0;
+  } catch {
+    return false;
+  }
+})();
 
 describe('matchAny — glob/prefix matcher (no regex)', () => {
   test('literal pattern requires an exact match', () => {
@@ -285,6 +295,23 @@ describe('checkRestriction (tool dispatch hook)', () => {
     expect(v.ok).toBe(false);
     if (v.ok) return;
     expect(v.reason).toContain('does not match');
+  });
+
+  test('git rule gates an explicit path; a pathless call with allow_paths is refused', () => {
+    const rules = { git: { allowPaths: ['src/**'] } };
+    // explicit path inside the fence → ok
+    expect(checkRestriction('git', { mode: 'diff', path: 'src/a.ts' }, rules, CWD).ok).toBe(true);
+    // explicit path outside the fence → refuse
+    const outside = checkRestriction('git', { mode: 'diff', path: 'docs/x.md' }, rules, CWD);
+    expect(outside.ok).toBe(false);
+    if (outside.ok) return;
+    expect(outside.reason).toContain('does not match');
+    // pathless content mode + allow_paths → refuse (repo/cwd scope
+    // exceeds the fence — the silent-bypass this finding closed).
+    const pathless = checkRestriction('git', { mode: 'diff' }, rules, CWD);
+    expect(pathless.ok).toBe(false);
+    if (pathless.ok) return;
+    expect(pathless.reason).toContain('without an explicit path');
   });
 
   test('args missing the expected field falls through to passthrough', () => {
@@ -566,6 +593,79 @@ describe('wrapToolWithRestrictions — integration with ToolContext.cwd', () => 
   });
 });
 
+describe('wrapToolWithRestrictions — deny_paths folded into the per-file read gate', () => {
+  // A directory-scoped git/grep read passes the literal-arg pre-flight but its
+  // OUTPUT carries DESCENDANT files. The wrapper must compose deny_paths into
+  // the canReadPath the tool gates each emitted file with, or a descendant
+  // deny (allow_paths:['src'] + deny_paths:['src/secrets/**'] with path:'src')
+  // leaks whenever the parent policy allows it.
+  const makeProbeTool = (
+    probes: string[],
+    seen: Record<string, boolean>,
+  ): Tool<{ mode: string; path?: string }, { ok: boolean }> => ({
+    name: 'git',
+    description: 'fake git that probes ctx.permissions.canReadPath per emitted file',
+    metadata: { category: 'fs.read', writes: false, idempotent: true },
+    inputSchema: { type: 'object', properties: {} },
+    execute: async (_args, ctx) => {
+      for (const p of probes) seen[p] = ctx.permissions.canReadPath(p);
+      return { ok: true };
+    },
+  });
+
+  const makeCtx = (cwd: string, baseCanRead: (p: string) => boolean): ToolContext =>
+    ({
+      cwd,
+      sessionId: 'sess',
+      stepId: 'step',
+      signal: new AbortController().signal,
+      permissions: { canReadPath: baseCanRead } as unknown as ToolContext['permissions'],
+    }) as ToolContext;
+
+  test('denied descendant is blocked at the gate; allowed siblings still pass', async () => {
+    const seen: Record<string, boolean> = {};
+    const probes = ['/proj/src/a.ts', '/proj/src/secrets/key.pem', '/proj/src/secrets/deep/x'];
+    const wrapped = wrapToolWithRestrictions(makeProbeTool(probes, seen), {
+      git: { allowPaths: ['src'], denyPaths: ['src/secrets/**'] },
+    });
+    // Parent policy allows everything — the restriction is the only fence.
+    await wrapped.execute(
+      { mode: 'diff', path: 'src' },
+      makeCtx('/proj', () => true),
+    );
+    expect(seen['/proj/src/a.ts']).toBe(true);
+    expect(seen['/proj/src/secrets/key.pem']).toBe(false);
+    expect(seen['/proj/src/secrets/deep/x']).toBe(false);
+  });
+
+  test('composition only TIGHTENS: a parent-denied path stays denied', async () => {
+    const seen: Record<string, boolean> = {};
+    const probes = ['/proj/src/a.ts'];
+    const wrapped = wrapToolWithRestrictions(makeProbeTool(probes, seen), {
+      git: { denyPaths: ['src/secrets/**'] },
+    });
+    // Parent denies src/a.ts; the restriction's deny must not re-allow it.
+    await wrapped.execute(
+      { mode: 'diff', path: 'src' },
+      makeCtx('/proj', (p) => !p.includes('a.ts')),
+    );
+    expect(seen['/proj/src/a.ts']).toBe(false);
+  });
+
+  test('no deny_paths → nothing composed, the parent gate governs unchanged', async () => {
+    const seen: Record<string, boolean> = {};
+    const probes = ['/proj/src/secrets/key.pem'];
+    const wrapped = wrapToolWithRestrictions(makeProbeTool(probes, seen), {
+      git: { allowPaths: ['src'] }, // allow-only: no descendant deny to fold
+    });
+    await wrapped.execute(
+      { mode: 'diff', path: 'src' },
+      makeCtx('/proj', () => true),
+    );
+    expect(seen['/proj/src/secrets/key.pem']).toBe(true);
+  });
+});
+
 describe('toRestrictionError', () => {
   test('produces the canonical refusal envelope', () => {
     const err = toRestrictionError('bash', 'command is denied', 'rm *');
@@ -697,3 +797,72 @@ describe('checkRestriction — symlink-aware path canonicalization', () => {
     expect(v).toEqual({ ok: true });
   });
 });
+
+describe.if(GIT_AVAILABLE)(
+  'wrapToolWithRestrictions — real gitTool honors deny_paths on descendants',
+  () => {
+    // End-to-end: the wrapped REAL gitTool, given deny_paths, must not emit a
+    // denied DESCENDANT in its diff/status output even though the literal `path`
+    // arg passed the pre-flight. Each case carries an unrestricted CONTROL that
+    // DOES surface the secret — proving the restriction is what filtered it.
+    let dir: string;
+    const run = (cmd: string[]) => {
+      const p = Bun.spawnSync(['git', ...cmd], { cwd: dir });
+      if (p.exitCode !== 0) throw new Error(`git ${cmd.join(' ')} failed`);
+    };
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'forja-restrict-git-'));
+      run(['init', '-q']);
+      run(['config', 'user.email', 't@t.t']);
+      run(['config', 'user.name', 'T']);
+      mkdirSync(join(dir, 'src', 'secrets'), { recursive: true });
+      writeFileSync(join(dir, 'src', 'a.ts'), 'export const a = 1;\n');
+      writeFileSync(join(dir, 'src', 'secrets', 'key.pem'), 'OLD-SECRET\n');
+      run(['add', '-A']);
+      run(['commit', '-q', '-m', 'init']);
+      // Dirty BOTH so diff/status carry changes for each.
+      writeFileSync(join(dir, 'src', 'a.ts'), 'export const a = 2;\n');
+      writeFileSync(join(dir, 'src', 'secrets', 'key.pem'), 'NEW-SECRET\n');
+    });
+    afterEach(() => {
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const denyRule = { git: { denyPaths: ['src/secrets/**'] } };
+
+    test('status drops the denied descendant name; unrestricted control shows it', async () => {
+      const restricted = wrapToolWithRestrictions(gitTool, denyRule);
+      const out = await restricted.execute({ mode: 'status' }, makeCtx({ cwd: dir }));
+      if (isToolError(out)) throw new Error(out.error_message);
+      expect(out.output).toContain('a.ts');
+      expect(out.output).not.toContain('secrets');
+
+      const unrestricted = wrapToolWithRestrictions(gitTool, {});
+      const ctrl = await unrestricted.execute({ mode: 'status' }, makeCtx({ cwd: dir }));
+      if (isToolError(ctrl)) throw new Error(ctrl.error_message);
+      expect(ctrl.output).toContain('secrets'); // proves the restriction did the filtering
+    });
+
+    test('diff fails closed with a denied descendant in scope; control leaks the secret', async () => {
+      const restricted = wrapToolWithRestrictions(gitTool, denyRule);
+      const out = await restricted.execute({ mode: 'diff' }, makeCtx({ cwd: dir }));
+      // Content modes are all-or-nothing: a denied file in scope refuses the
+      // whole diff rather than emit a partially-redacted patch.
+      expect(isToolError(out)).toBe(true);
+
+      const unrestricted = wrapToolWithRestrictions(gitTool, {});
+      const ctrl = await unrestricted.execute({ mode: 'diff' }, makeCtx({ cwd: dir }));
+      if (isToolError(ctrl)) throw new Error(ctrl.error_message);
+      expect(ctrl.output).toContain('NEW-SECRET'); // unrestricted leaks it
+
+      // A diff scoped to the allowed sibling still works under the restriction.
+      const scoped = await restricted.execute(
+        { mode: 'diff', path: 'src/a.ts' },
+        makeCtx({ cwd: dir }),
+      );
+      if (isToolError(scoped)) throw new Error(scoped.error_message);
+      expect(scoped.output).toContain('export const a');
+      expect(scoped.output).not.toContain('SECRET');
+    });
+  },
+);

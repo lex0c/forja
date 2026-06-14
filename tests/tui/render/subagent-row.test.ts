@@ -15,9 +15,9 @@ const sub = (overrides: Partial<SubagentRowState> = {}): SubagentRowState => ({
   subagentId: 'c1',
   name: 'explore',
   goal: 'find the README',
-  progress: '',
   startedAt: 0,
   liveCostUsd: 0,
+  currentTool: '',
   ...overrides,
 });
 
@@ -26,68 +26,73 @@ describe('renderSubagentRows', () => {
     expect(renderSubagentRows(new Map(), caps, 1000)).toEqual([]);
   });
 
-  test('renders header + one row per active subagent', () => {
+  test('header + TWO lines per active subagent (line1 identity, line2 tool)', () => {
     const map = new Map<string, SubagentRowState>([
-      ['a', sub({ subagentId: 'a', name: 'explore', progress: 'step 1', startedAt: 0 })],
-      ['b', sub({ subagentId: 'b', name: 'audit', progress: 'running grep', startedAt: 0 })],
+      ['a', sub({ subagentId: 'a', name: 'explore', currentTool: 'read engine.ts' })],
+      ['b', sub({ subagentId: 'b', name: 'audit', currentTool: 'grep "x"' })],
     ]);
     const out = renderSubagentRows(map, caps, 1000);
-    expect(out).toHaveLength(3);
-    expect(out[0]).toBe('Subagents');
-    expect(out[1]).toContain('task explore');
-    expect(out[1]).toContain('step 1');
-    expect(out[2]).toContain('task audit');
-    expect(out[2]).toContain('running grep');
+    // header + 2 lines × 2 subagents
+    expect(out).toHaveLength(5);
+    expect(out[0]).toContain('Subagents');
+    expect(out[0]).toContain('2 running');
+    // line 1: name; line 2: the in-flight tool
+    expect(out[1]).toContain('explore');
+    expect(out[2]).toContain('read engine.ts');
+    expect(out[3]).toContain('audit');
+    expect(out[4]).toContain('grep "x"');
   });
 
-  test('uses goal fallback while progress is empty (booting state)', () => {
+  test('header surfaces queued backlog and total cost', () => {
+    const map = new Map<string, SubagentRowState>([['a', sub({ liveCostUsd: 0.011 })]]);
+    const out = renderSubagentRows(map, caps, 1000, 2);
+    expect(out[0]).toContain('1 running');
+    expect(out[0]).toContain('2 queued');
+    expect(out[0]).toContain('$0.0110');
+  });
+
+  test('line 2 falls back to the seed goal before the first tool', () => {
     const map = new Map<string, SubagentRowState>([
-      ['a', sub({ progress: '', goal: 'find the README' })],
+      ['a', sub({ currentTool: '', goal: 'find the README' })],
     ]);
     const out = renderSubagentRows(map, caps, 1);
-    expect(out[1]).toContain('booting');
-    expect(out[1]).toContain('find the README');
+    expect(out[2]).toContain('starting');
+    expect(out[2]).toContain('find the README');
   });
 
-  test('uses ASCII glyph when caps.unicode is false', () => {
-    const map = new Map<string, SubagentRowState>([['a', sub()]]);
+  test('ASCII fallback: rotating spinner on line 1, `\\` connector on line 2', () => {
+    const map = new Map<string, SubagentRowState>([['a', sub({ currentTool: 'read x' })]]);
     const out = renderSubagentRows(map, ascii, 1000);
-    // unicode glyph ▸ is replaced with `>`. The frame margin
-    // adds two leading spaces.
-    expect(out[1]?.startsWith('  > ')).toBe(true);
+    // line 1 begins with the frame margin + a non-space spinner frame.
+    expect(/^ {2}[|/\\-] /.test(out[1] as string)).toBe(true);
+    // line 2 uses the ASCII tree connector.
+    expect(out[2]).toContain('\\ read x');
   });
 
-  test('truncates long progress to MAX_DETAIL with ellipsis', () => {
-    const longProgress = 'x'.repeat(200);
-    const map = new Map<string, SubagentRowState>([['a', sub({ progress: longProgress })]]);
+  test('truncates a long current-tool label with an ellipsis', () => {
+    const map = new Map<string, SubagentRowState>([
+      ['a', sub({ currentTool: `read ${'x'.repeat(200)}` })],
+    ]);
     const out = renderSubagentRows(map, caps, 1000);
-    expect(out[1]?.includes('…')).toBe(true);
-    // Overall row length should be bounded by the truncation cap
-    // plus glyph + name + chrome.
-    expect((out[1]?.length ?? 0) < longProgress.length + 50).toBe(true);
+    expect(out[2]?.includes('…')).toBe(true);
+    expect((out[2]?.length ?? 0) < 250).toBe(true);
   });
 
-  test('elapsed renders as a duration token (sub-second / seconds / minutes)', () => {
-    const map = new Map<string, SubagentRowState>([['a', sub({ progress: 'p', startedAt: 0 })]]);
+  test('elapsed renders on line 1 as a duration token', () => {
+    const map = new Map<string, SubagentRowState>([['a', sub({ startedAt: 0 })]]);
     expect(renderSubagentRows(map, caps, 500)[1]).toContain('500ms');
     expect(renderSubagentRows(map, caps, 12_000)[1]).toContain('12s');
     expect(renderSubagentRows(map, caps, 75_000)[1]).toContain('1m15s');
   });
 
-  test('cost chip surfaces $X.XXXX when liveCostUsd > 0 (D232)', () => {
-    const map = new Map<string, SubagentRowState>([
-      ['a', sub({ progress: 'step 3', liveCostUsd: 0.0184 })],
-    ]);
-    const out = renderSubagentRows(map, caps, 1000);
-    expect(out[1]).toContain('$0.0184');
+  test('cost chip surfaces $X.XXXX on line 1 when liveCostUsd > 0 (D232)', () => {
+    const map = new Map<string, SubagentRowState>([['a', sub({ liveCostUsd: 0.0184 })]]);
+    expect(renderSubagentRows(map, caps, 1000)[1]).toContain('$0.0184');
   });
 
-  test('cost chip is suppressed at zero (test fixtures / free-tier)', () => {
-    const map = new Map<string, SubagentRowState>([
-      ['a', sub({ progress: 'step 3', liveCostUsd: 0 })],
-    ]);
+  test('cost chip is suppressed at zero on line 1 (test fixtures / free-tier)', () => {
+    const map = new Map<string, SubagentRowState>([['a', sub({ liveCostUsd: 0 })]]);
     const out = renderSubagentRows(map, caps, 1000);
-    expect(out[1]).not.toContain('$0');
     expect(out[1]).not.toContain('$');
   });
 });

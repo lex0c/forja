@@ -35,6 +35,19 @@ export interface ToolVocab {
   // chips are pure scrollback noise. The tool still runs and its result
   // still reaches the model — only the chip is hidden.
   silent?: boolean;
+  // For a `silent` tool: still surface a scrollback chip when the call
+  // FAILS (status !== 'done'). The task_* delegation tools set this. A
+  // silent SUCCESS is represented by the live `Subagents` block, but a
+  // delegation that fails BEFORE a child is created (unknown playbook,
+  // validation error, pre-spawn budget refusal) emits no subagent
+  // lifecycle for that block to show — fully suppressing its failure chip
+  // too would make the failed delegation invisible in scrollback. (A
+  // post-spawn child failure also surfaces here AND in the block: the
+  // chip carries the tool-level reason, complementary to the block's run
+  // summary, and erring toward visible beats silently dropping it.) Todos
+  // deliberately do NOT set this — their failures surface in the model's
+  // prose + the live `Tasks` block.
+  revealFailure?: boolean;
 }
 
 const str = (v: unknown): string | null => (typeof v === 'string' && v.length > 0 ? v : null);
@@ -114,6 +127,25 @@ export const TOOL_VOCAB: Readonly<Record<string, ToolVocab>> = {
     finalVerb: 'Grepped',
     subject: (a) => str(a.pattern),
   },
+  git: {
+    activeVerb: 'Running git',
+    finalVerb: 'Ran git',
+    // Show WHAT ran, not a bare `git`: `<mode> [--stat/--staged] [<ref>]
+    // [<path>]`. So the chip reads `Ran git · log src/foo.ts` /
+    // `Ran git · diff --staged` / `Ran git · show_file v1 old.ts`.
+    subject: (a) => {
+      const mode = str(a.mode);
+      if (mode === null) return null;
+      const parts = [mode];
+      if (a.stat === true) parts.push('--stat');
+      if (a.staged === true) parts.push('--staged');
+      const ref = str(a.ref);
+      if (ref !== null) parts.push(ref);
+      const path = str(a.path);
+      if (path !== null) parts.push(path);
+      return parts.join(' ');
+    },
+  },
   task: {
     // Verb stays bare — the subject already carries the agent name;
     // saying "Delegating to subagent / └─ reviewer" duplicates
@@ -192,6 +224,47 @@ export const TOOL_VOCAB: Readonly<Record<string, ToolVocab>> = {
     subject: (a) => str(a.id),
     silent: true,
   },
+  // The task_* subagent-orchestration tools are `silent`: spawning,
+  // awaiting, cancelling and listing subagents is plumbing the operator
+  // shouldn't see as a tool chip. The operator's view of a subagent is the
+  // live `Subagents` block (and its grouped scrollback summary on end) —
+  // `task_sync`/`task_async`'s own "Calling task_sync" / "Called task_sync"
+  // card is redundant noise stacked next to that block. The adapter still
+  // tracks the call (so the per-tool machinery stays intact); it just emits
+  // no chip on success. Verbs kept for the day someone flips silent off —
+  // and used NOW to render the failure chip `revealFailure` surfaces (a
+  // delegation that fails before its child exists has no Subagents block to
+  // appear in, so its failure must not vanish with the success chip).
+  task_sync: {
+    activeVerb: 'Running subagent',
+    finalVerb: 'Ran subagent',
+    silent: true,
+    revealFailure: true,
+  },
+  task_async: {
+    activeVerb: 'Spawning subagent',
+    finalVerb: 'Spawned subagent',
+    silent: true,
+    revealFailure: true,
+  },
+  task_await: {
+    activeVerb: 'Awaiting subagent',
+    finalVerb: 'Awaited subagent',
+    silent: true,
+    revealFailure: true,
+  },
+  task_cancel: {
+    activeVerb: 'Cancelling subagent',
+    finalVerb: 'Cancelled subagent',
+    silent: true,
+    revealFailure: true,
+  },
+  task_list: {
+    activeVerb: 'Listing subagents',
+    finalVerb: 'Listed subagents',
+    silent: true,
+    revealFailure: true,
+  },
   monitor: {
     activeVerb: 'Monitoring',
     finalVerb: 'Monitored',
@@ -225,3 +298,24 @@ export const lookupToolVocab = (name: string): ToolVocab => {
   if (known !== undefined) return known;
   return { activeVerb: `Calling ${name}`, finalVerb: `Called ${name}` };
 };
+
+// Compact tool label for the subagent live row's line 2 and the
+// aggregated scrollback trail: `read_file` → `read`, `grep` → `grep`.
+export const shortToolName = (name: string): string => name.replace(/_file$/, '');
+
+// Plural noun for the aggregated-by-type subagent trail
+// (`read 38 files`, `grep 11 searches`); generic `calls` fallback.
+const TOOL_NOUN: Readonly<Record<string, string>> = {
+  read_file: 'files',
+  grep: 'searches',
+  glob: 'globs',
+  git: 'reads',
+  bash: 'commands',
+  edit_file: 'edits',
+  write_file: 'writes',
+  fetch_url: 'fetches',
+  memory_read: 'reads',
+  memory_search: 'searches',
+  retrieve_context: 'lookups',
+};
+export const toolNoun = (name: string): string => TOOL_NOUN[name] ?? 'calls';

@@ -21,6 +21,7 @@
 
 import type { Decision, PolicyCategory, ToolArgs } from '../../../permissions/index.ts';
 import { renderPolicy, renderSandbox } from '../../../permissions/render.ts';
+import { GIT_MODES } from '../../../tools/builtin/git.ts';
 import type { SlashCommand } from '../types.ts';
 
 // Re-export for tests + downstream consumers (a few tests still
@@ -55,6 +56,30 @@ const buildDryCheckArgs = (
       };
     }
     return { ok: true, args: { command: rest.join(' ') } };
+  }
+  if (toolName === 'git') {
+    // git: optional [mode] then optional [path]. The engine keys on `path`
+    // (a pathless call defaults to cwd) AND on `mode`: blame/show_file are
+    // single-file invocations (engine `isSingleFileInvocation`), which lets
+    // an exact-file rule match a file that exists only in HISTORY. So
+    // consume a leading mode token (so `/perms why git status` isn't read as
+    // a path named "status") but PRESERVE it in the synthetic args —
+    // dropping it would make the dry-check default-deny a show_file/blame
+    // the real call would allow under the same policy.
+    const hasMode = rest.length > 0 && GIT_MODES.has(rest[0] as string);
+    const mode = hasMode ? (rest[0] as string) : undefined;
+    const tokens = hasMode ? rest.slice(1) : rest;
+    if (tokens.length > 1) {
+      return {
+        ok: false,
+        error: '/perms why git: takes [mode] [path] (e.g. /perms why git diff src/foo.ts)',
+      };
+    }
+    const gitArgs: ToolArgs = {
+      ...(mode !== undefined ? { mode } : {}),
+      ...(tokens.length === 1 ? { path: tokens[0] as string } : {}),
+    };
+    return { ok: true, args: gitArgs };
   }
   if (category === 'fs.read' || category === 'fs.write') {
     // grep and glob accept an optional search root; everything

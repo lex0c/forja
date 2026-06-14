@@ -590,12 +590,8 @@ Zero pressuposto de mouse. Todo fluxo navegável por teclado:
 /trust             # gerencia diretórios confiados
 /review            # playbook: code review (read-only)
 /audit             # playbook: security audit (read-only, reativo: input é código)
-/debug             # playbook: hypothesis-driven debugging
-/refactor          # playbook: scope-bounded refactor preservando semântica
-/explain           # playbook: read-only explicação estruturada de código/sistema
-/threat-model      # playbook: STRIDE-driven threat model (read-only, proativo: input é design)
 /perf              # playbook: performance investigate (profiler-driven, não aplica fixes)
-/git-hygiene       # playbook: sugere commit msg/branch/rebase (read-only, não executa)
+/explore           # playbook: general-purpose (subagent genérico read-only; investigação escopada pelo caller)
 /recap             # vista projetada da sessão atual (últimos N steps)
 /recap session     # vista de sessão específica
 /recap pr          # render como PR description
@@ -1622,9 +1618,9 @@ Diferenças vs subagent genérico:
 | Eval | opcional | **obrigatório** antes de virar `slash:` ativo |
 | References | livre | declaradas no frontmatter, lidas sob demanda (sem embed) |
 
-Definidos em `~/.config/agent/playbooks/*.md`. Disparados por slash command (`/review`, `/audit`, `/debug`, `/refactor`, `/explain`, `/threat-model`, `/perf`, `/git-hygiene`) ou por `task(playbook: <name>)` em código de outro agente.
+Definidos em `~/.config/agent/playbooks/*.md`. Disparados por slash command (`/review`, `/audit`, `/perf`, `/explore`) ou por `task(playbook: <name>)` em código de outro agente.
 
-Templates iniciais e princípios de design em [`PLAYBOOKS.md`](./PLAYBOOKS.md). **Oito** playbooks na v1: `code-review`, `security-audit`, `debug`, `refactor`, `explain`, `threat-model`, `perf-investigate`, `git-hygiene`. Acima do teto recomendado de 6 — decisão deliberada documentada em `PLAYBOOKS.md §12`; revisão eval-driven gatilho se modelo confunde seleção > 5%.
+Templates iniciais e princípios de design em [`PLAYBOOKS.md`](./PLAYBOOKS.md). **Quatro** playbooks na v1: `code-review`, `security-audit`, `perf-investigate` — três playbooks de domínio, read-only e produtores de relatório estruturado — mais `general-purpose`, a instância empacotada do subagent genérico (§11): read-only, sem schema fixo de relatório, escopado pelo caller. O ganho comum é isolamento/compressão de contexto. Foram removidos `git-hygiene`, `debug`, `refactor`, `explain`, `threat-model` (voltam ao modo normal/skills) e os meta-playbooks `gap-audit`/`challenge-assumptions`. Dentro do teto recomendado de 6 — ver `PLAYBOOKS.md §12`/§15.
 
 ---
 
@@ -2075,7 +2071,7 @@ Permission engine + compaction + telemetry + abort/budget + eval smoke + headles
 Subagents + worktree isolation + MCP client + slash commands + eval regression + resume + checkpoints + `/undo` + `bash_background` + `todo_write` + **Repo Map (tree-sitter)**.
 
 **M4 — Extensibilidade (semana 7-8)**
-Hooks system + replay + prompt caching consciente + sandbox `bwrap` opt-in + distribuição (binário Bun) + capability detection completa + **Memory subsystem** (markdown-based, escopo user/project, confirmação humana em writes, audit `memory_events`, slash commands `/memory *`) + **Recap subsystem** (projeção determinística + renderer human/json em M4.1; renderers pr/changelog/slack/terse + LLM com Haiku em M4.2; cross-session + pre-compact em M4.3 — ver [`RECAP.md`](./RECAP.md)) + **`/explain` playbook** (read-only, ver `PLAYBOOKS.md` §6) + **`agent doctor`** (diagnóstico de ambiente) + **Self-critique pass** opt-in (config `critique.mode`, default `off`).
+Hooks system + replay + prompt caching consciente + sandbox `bwrap` opt-in + distribuição (binário Bun) + capability detection completa + **Memory subsystem** (markdown-based, escopo user/project, confirmação humana em writes, audit `memory_events`, slash commands `/memory *`) + **Recap subsystem** (projeção determinística + renderer human/json em M4.1; renderers pr/changelog/slack/terse + LLM com Haiku em M4.2; cross-session + pre-compact em M4.3 — ver [`RECAP.md`](./RECAP.md)) + **`agent doctor`** (diagnóstico de ambiente) + **Self-critique pass** opt-in (config `critique.mode`, default `off`).
 
 **M5 — Local-first (semana 9-11)**
 Provider Ollama + Provider llama.cpp (HTTP) + Constrained generation backend (GBNF + JSON mode) + prompt templates por modelo + Validator framework.

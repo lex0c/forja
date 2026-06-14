@@ -12,6 +12,7 @@ describe('tool-vocab', () => {
       'bash_output',
       'clarify',
       'edit_file',
+      'git',
       'glob',
       'grep',
       'memory_list',
@@ -22,6 +23,11 @@ describe('tool-vocab', () => {
       'pin_context',
       'read_file',
       'task',
+      'task_async',
+      'task_await',
+      'task_cancel',
+      'task_list',
+      'task_sync',
       'todo_clear',
       'todo_create',
       'todo_get',
@@ -66,6 +72,23 @@ describe('tool-vocab', () => {
 
   test('bash subject is the command argument', () => {
     expect(TOOL_VOCAB.bash?.subject?.({ command: 'rg foo' })).toBe('rg foo');
+  });
+
+  test('git subject renders the operation (mode + flags + ref + path)', () => {
+    const s = TOOL_VOCAB.git?.subject;
+    expect(s?.({ mode: 'status' })).toBe('status');
+    expect(s?.({ mode: 'log', path: 'src/foo.ts' })).toBe('log src/foo.ts');
+    expect(s?.({ mode: 'diff', staged: true })).toBe('diff --staged');
+    expect(s?.({ mode: 'diff', stat: true })).toBe('diff --stat');
+    expect(s?.({ mode: 'show', ref: 'HEAD~1' })).toBe('show HEAD~1');
+    expect(s?.({ mode: 'show_file', ref: 'v1', path: 'old.ts' })).toBe('show_file v1 old.ts');
+    expect(s?.({})).toBeNull(); // no mode → no subject
+  });
+
+  test('the task_* subagent-orchestration family is silent', () => {
+    for (const name of ['task_sync', 'task_async', 'task_await', 'task_cancel', 'task_list']) {
+      expect(TOOL_VOCAB[name]?.silent).toBe(true);
+    }
   });
 
   test('memory_list surfaces scope: <name> as subject', () => {

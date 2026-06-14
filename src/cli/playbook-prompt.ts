@@ -41,7 +41,7 @@ Specialized subagents are available for structured workflows. Each one runs in a
 - The task fits a playbook's structured schema and the user benefits from the categorized output.
 - You want context isolation — the subagent's intermediate reads do not pollute this turn.
 - You want restricted tools — e.g., a review subagent that must NOT edit code.
-- The task demands an explicit bias (skepticism for \`gap-audit\`, paranoia for \`security-audit\`) that conflicts with the default tone.
+- The task demands an explicit bias (e.g., paranoia for \`security-audit\`) that conflicts with the default tone.
 
 **Do NOT delegate when:**
 - The question is answerable in 1-2 reads without a schema (e.g., "where is function X defined?").

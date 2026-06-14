@@ -2006,6 +2006,26 @@ describe('subagent lifecycle', () => {
     expect(permanent).toEqual([]);
   });
 
+  test('subagent:start strips control bytes from model-authored name + goal', () => {
+    // `goal` is the raw seed prompt and `name` is child-authored; both get
+    // repainted into the LIVE region every heartbeat (head + `starting ·`
+    // fallback). A malicious child embedding `\x1b[2J` (clear screen),
+    // `\x07` (bell), or `\x1b]0;…` (OSC window title) in either field would
+    // otherwise hijack the terminal on every redraw. Sanitized at ingress.
+    const evilGoal = '\x1b[2J\x1b[H\x1b]0;PWNED\x07audit the diff';
+    const evilName = '\x1b[31mreview\x1b[0m';
+    const { state } = drive([
+      { type: 'subagent:start', ts: 1, subagentId: 'c1', name: evilName, goal: evilGoal },
+    ]);
+    const entry = state.subagents.get('c1');
+    expect(entry?.goal).not.toContain('\x1b');
+    expect(entry?.goal).not.toContain('\x07');
+    expect(entry?.name).not.toContain('\x1b');
+    // The visible text survives the strip.
+    expect(entry?.goal).toContain('audit the diff');
+    expect(entry?.name).toContain('review');
+  });
+
   test('subagent:update mutates the existing entry in place', () => {
     const { state, permanent } = drive([
       { type: 'subagent:start', ts: 1, subagentId: 'c1', name: 'r', goal: 'g' },
@@ -2013,6 +2033,25 @@ describe('subagent lifecycle', () => {
     ]);
     expect(state.subagents.get('c1')?.progress).toBe('running echo');
     expect(permanent).toEqual([]);
+  });
+
+  test('currentTool persists across tool finishes; toolDone aggregates by type', () => {
+    const { state } = drive([
+      { type: 'subagent:start', ts: 1, subagentId: 'c1', name: 'r', goal: 'g' },
+      { type: 'subagent:update', ts: 2, subagentId: 'c1', progress: 'x', currentTool: 'read a.ts' },
+      // tool finishes: the label must NOT blank (no flap to `starting`),
+      // and the per-type count increments.
+      { type: 'subagent:update', ts: 3, subagentId: 'c1', progress: 'x', toolDone: 'read_file' },
+      { type: 'subagent:update', ts: 4, subagentId: 'c1', progress: 'x', currentTool: 'grep "y"' },
+      { type: 'subagent:update', ts: 5, subagentId: 'c1', progress: 'x', toolDone: 'grep' },
+      { type: 'subagent:update', ts: 6, subagentId: 'c1', progress: 'x', toolDone: 'read_file' },
+    ]);
+    const row = state.subagents.get('c1');
+    // last tool label survives the finish (not cleared to '')
+    expect(row?.currentTool).toBe('grep "y"');
+    expect(row?.toolTotal).toBe(3);
+    expect(row?.toolCounts.get('read_file')).toBe(2);
+    expect(row?.toolCounts.get('grep')).toBe(1);
   });
 
   test('subagent:update for unknown id is a silent no-op', () => {
@@ -2037,8 +2076,11 @@ describe('subagent lifecycle', () => {
       },
     ]);
     expect(state.subagents.size).toBe(0);
-    expect(permanent.length).toBe(1);
-    const item = permanent[0];
+    // First-in-a-run subagent block is preceded by the `Subagents` group
+    // title (see the applyEvent wrapper), then the summary itself.
+    expect(permanent.length).toBe(2);
+    expect(permanent[0]?.kind).toBe('subagent_group_header');
+    const item = permanent[1];
     if (item?.kind === 'subagent_summary') {
       expect(item.subagentId).toBe('c1');
       expect(item.name).toBe('explore');
@@ -2048,6 +2090,101 @@ describe('subagent lifecycle', () => {
     } else {
       throw new Error('expected subagent_summary permanent');
     }
+  });
+
+  test('consecutive subagent ends share ONE Subagents group title; an interruption re-titles', () => {
+    const titles = (perm: { kind: string }[]) =>
+      perm.filter((p) => p.kind === 'subagent_group_header').length;
+    const end = (id: string, ts: number) =>
+      ({
+        type: 'subagent:end',
+        ts,
+        subagentId: id,
+        status: 'done',
+        costUsd: 0,
+        summary: '',
+        durationMs: 1,
+      }) as const;
+    // Two back-to-back completions → a single title.
+    const a = drive([
+      { type: 'subagent:start', ts: 1, subagentId: 'x', name: 'gp', goal: 'g' },
+      { type: 'subagent:start', ts: 2, subagentId: 'y', name: 'gp', goal: 'g' },
+      end('x', 3),
+      end('y', 4),
+    ]);
+    expect(titles(a.permanent)).toBe(1);
+    // A non-subagent scrollback emission between completions breaks the run.
+    const b = drive([
+      { type: 'subagent:start', ts: 1, subagentId: 'x', name: 'gp', goal: 'g' },
+      end('x', 2),
+      { type: 'info', ts: 3, message: 'something else' },
+      { type: 'subagent:start', ts: 4, subagentId: 'y', name: 'gp', goal: 'g' },
+      end('y', 5),
+    ]);
+    expect(titles(b.permanent)).toBe(2);
+  });
+
+  test('a BYPASSED tool-end between two subagent bursts re-titles the second group', () => {
+    // A tool-end that emits its chip immediately (failed/denied status,
+    // exit code, diff, summary) rather than buffering ends the title-run —
+    // else the second subagent block would sit untitled under the first
+    // group with the tool wedged between (the wrapper's early-return for
+    // tool:end must still clear the flag for the bypass path).
+    const titles = (perm: { kind: string }[]) =>
+      perm.filter((p) => p.kind === 'subagent_group_header').length;
+    const end = (id: string, ts: number) =>
+      ({
+        type: 'subagent:end',
+        ts,
+        subagentId: id,
+        status: 'done',
+        costUsd: 0,
+        summary: '',
+        durationMs: 1,
+      }) as const;
+    const { permanent } = drive([
+      { type: 'subagent:start', ts: 1, subagentId: 'x', name: 'gp', goal: 'g' },
+      end('x', 2),
+      {
+        type: 'tool:start',
+        ts: 3,
+        toolId: 't',
+        name: 'read_file',
+        activeVerb: 'R',
+        finalVerb: 'Read',
+        subject: 'a',
+      },
+      { type: 'tool:end', ts: 4, toolId: 't', status: 'error', durationMs: 5 }, // bypass (error)
+      { type: 'subagent:start', ts: 5, subagentId: 'y', name: 'gp', goal: 'g' },
+      end('y', 6),
+    ]);
+    expect(titles(permanent)).toBe(2);
+  });
+
+  test('the Subagents title-run does not leak across a turn boundary (session:start)', () => {
+    const titles = (perm: { kind: string }[]) =>
+      perm.filter((p) => p.kind === 'subagent_group_header').length;
+    const end = (id: string, ts: number) =>
+      ({
+        type: 'subagent:end',
+        ts,
+        subagentId: id,
+        status: 'done',
+        costUsd: 0,
+        summary: '',
+        durationMs: 1,
+      }) as const;
+    // session:start emits no permanent, so the wrapper can't clear the flag
+    // — the reducer must reset it at the boundary, else turn 2's first
+    // subagent burst inherits turn 1's (scrolled-away) title.
+    const { permanent } = drive([
+      { type: 'subagent:start', ts: 1, subagentId: 'x', name: 'gp', goal: 'g' },
+      end('x', 2),
+      { type: 'session:start', ts: 3, sessionId: 's', project: 'p', model: 'm' },
+      { type: 'subagent:start', ts: 4, subagentId: 'y', name: 'gp', goal: 'g' },
+      end('y', 5),
+    ]);
+    expect(titles(permanent)).toBe(2);
   });
 
   test('subagent:end without a prior start emits no permanent (defensive)', () => {

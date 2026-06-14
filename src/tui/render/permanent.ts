@@ -13,6 +13,7 @@
 import { sanitizeOneLineForDisplay } from '../../sanitize/ansi.ts';
 import type { PermanentItem } from '../state.ts';
 import { type Capabilities, paint, paintMulti, reverse } from '../term.ts';
+import { shortToolName, toolNoun } from '../tool-vocab.ts';
 import { formatChipDuration, formatCoarseDuration } from './duration.ts';
 import { padFrame } from './frame.ts';
 import { ellipsisGlyph, subContentConnector, treeBranchConnector } from './glyphs.ts';
@@ -468,6 +469,16 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       const body = paint(caps, 'secondary', ` ${item.message}`);
       return ['', `${prefix}${body}`].map(padFrame);
     }
+    case 'subagent_group_header': {
+      // `● Subagents` group title over a burst of finishing subagents.
+      // Carries the same `●` chip glyph as a tool/subagent head, but at
+      // COL 0 (NOT frame-padded) so it reads as the parent of the `  ● …`
+      // blocks below, which keep their 2-space margin and indent under it.
+      // Plain (default/white); a leading blank separates the group from
+      // prior scrollback.
+      const headGlyph = caps.unicode ? CHIP_FINAL_GLYPH.unicode : CHIP_FINAL_GLYPH.ascii;
+      return ['', `${headGlyph} Subagents`];
+    }
     case 'subagent_summary': {
       // One-line scrollback summary for a subagent run. Mirrors
       // tool-end's compact shape: `● task <name> Done <summary>  [1m2s]`
@@ -525,23 +536,31 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
         return 'Failed';
       };
       const verb = verbFor(item.status, item.reason, item.costUsd);
-      // Truncate the summary so a verbose child doesn't blow out
-      // the line — the renderer's frame width is the operator's
-      // budget, not the producer's.
-      const maxSummary = 80;
-      const trimmedSummary = item.summary.replace(/\s+/g, ' ').trim();
-      const summary =
-        trimmedSummary.length > maxSummary
-          ? `${trimmedSummary.slice(0, maxSummary - 1)}…`
-          : trimmedSummary;
-      const head = `${glyph} task ${item.name} ${verb}`;
-      const tail = `  [${formatChipDuration(item.durationMs)}]`;
-      const body = summary.length > 0 ? ` ${summary}` : '';
-      const line =
-        item.status === 'done'
-          ? paint(caps, 'secondary', `${head}${body}${tail}`)
-          : paint(caps, 'error', `${head}${body}${tail}`);
-      return [padFrame(line)];
+      const color = item.status === 'done' ? 'secondary' : 'error';
+      // Header: `● <name> · <verb> · N tools · <dur>[ · $X.XX]`. The child's
+      // own `summary` (often a verbose first-person preamble) is NOT shown
+      // here — the actual answer is already relayed in the parent's
+      // response text, so echoing a truncated preview in the block is just
+      // noise. The block is the "what it DID" record (verb + tool trail +
+      // cost); the content lives in the parent's reply.
+      const segs = [`${glyph} ${item.name}`, verb];
+      if (item.toolTotal > 0) segs.push(`${item.toolTotal} tool${item.toolTotal === 1 ? '' : 's'}`);
+      segs.push(formatChipDuration(item.durationMs));
+      if (item.costUsd > 0) segs.push(`$${formatDollars(item.costUsd)}`);
+      const lines = [padFrame(paint(caps, color, segs.join(' · ')))];
+      // Aggregated-by-type trail: one line per tool type the child used,
+      // sorted desc by count upstream (`├ read 38 files`, `└ git 4 reads`).
+      // The child's tools no longer streamed live, so this is the record
+      // of what it did.
+      const counts = item.toolCounts;
+      for (let i = 0; i < counts.length; i++) {
+        const entry = counts[i] as readonly [string, number];
+        const connector =
+          i === counts.length - 1 ? subContentConnector(caps) : treeBranchConnector(caps);
+        const trail = `  ${connector}${shortToolName(entry[0])} ${entry[1]} ${toolNoun(entry[0])}`;
+        lines.push(padFrame(paint(caps, color, trail)));
+      }
+      return lines;
     }
   }
 };
