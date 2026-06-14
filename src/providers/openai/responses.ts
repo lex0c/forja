@@ -30,6 +30,20 @@ import {
 // Params are built as a plain object and cast at the SDK boundary, the same
 // pragmatic seam the Chat Completions path uses.
 
+// Reasoning models (the only consumers of this path) suppress markdown in
+// their responses by default; the documented opt-in is the literal string
+// `Formatting re-enabled` on the FIRST line of the developer message
+// (`instructions` here). Forja's TUI renders assistant prose as GitHub-flavored
+// markdown (render/markdown.ts), so without this the OpenAI output degrades to
+// flat text — no code fences, backticked paths, or lists — unlike the Anthropic
+// path. The marker is a constant prefix, so it doesn't disturb the cache prefix
+// (stable across turns) or the prompt_cache_key (hash of req.system, unchanged).
+const REASONING_MARKDOWN_MARKER = 'Formatting re-enabled';
+const withMarkdownMarker = (system: string | undefined): string =>
+  system !== undefined && system.length > 0
+    ? `${REASONING_MARKDOWN_MARKER}\n${system}`
+    : REASONING_MARKDOWN_MARKER;
+
 // ProviderMessage[] → Responses input items. Assistant tool calls become
 // `function_call` items; tool results become `function_call_output` items;
 // text becomes role-tagged message items. Tool outputs are emitted before new
@@ -107,7 +121,9 @@ export const generateViaResponses = (
       store: false,
       stream: true,
     };
-    if (req.system !== undefined) params.instructions = req.system;
+    // Always set instructions (at least the markdown marker) — see
+    // withMarkdownMarker. Reasoning models would otherwise emit flat text.
+    params.instructions = withMarkdownMarker(req.system);
     if (req.tools !== undefined) params.tools = toResponsesTools(req.tools);
     if (promptCacheKey !== undefined) params.prompt_cache_key = promptCacheKey;
     if (promptCacheRetention !== undefined) params.prompt_cache_retention = promptCacheRetention;
@@ -153,7 +169,7 @@ export const generateConstrainedViaResponses = async (
     ],
     tool_choice: { type: 'function', name: req.output_schema_name },
   };
-  if (req.system !== undefined) params.instructions = req.system;
+  params.instructions = withMarkdownMarker(req.system);
   if (promptCacheKey !== undefined) params.prompt_cache_key = promptCacheKey;
   if (promptCacheRetention !== undefined) params.prompt_cache_retention = promptCacheRetention;
   // Reasoning is intentionally omitted (default) — a structured render doesn't

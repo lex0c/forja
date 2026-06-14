@@ -166,7 +166,9 @@ describe('createOpenAIProvider — Responses routing for reasoning models', () =
     };
     expect(p.reasoning).toEqual({ effort: 'high' });
     expect(p.max_output_tokens).toBe(8);
-    expect(p.instructions).toBe('be concise');
+    // Markdown marker prepended as the first line (reasoning models suppress
+    // markdown otherwise), with the system prompt following.
+    expect(p.instructions).toBe('Formatting re-enabled\nbe concise');
     expect(Array.isArray(p.input)).toBe(true);
     // sampling gate: reasoning models never get temperature.
     expect(p.temperature).toBeUndefined();
@@ -247,5 +249,42 @@ describe('createOpenAIProvider — Responses routing for reasoning models', () =
     expect(r.usage).toEqual({ input: 40, output: 5, cache_read: 10, cache_creation: 0 });
     const p = handle.calls[0] as { tool_choice?: unknown };
     expect(p.tool_choice).toEqual({ type: 'function', name: 'render_output' });
+  });
+
+  test('generateConstrained also prepends the markdown marker to instructions', async () => {
+    const handle = mockResponsesClient([], {
+      output: [{ type: 'function_call', name: 'render_output', call_id: 'c1', arguments: '{}' }],
+    });
+    const provider = createOpenAIProvider('gpt-5.4-mini', { client: handle.client });
+    await provider.generateConstrained({
+      model: 'gpt-5.4-mini',
+      messages: [{ role: 'user', content: 'x' }],
+      max_tokens: 64,
+      system: 'render it',
+      output_schema: { type: 'object' },
+      output_schema_name: 'render_output',
+    });
+    expect((handle.calls[0] as { instructions?: string }).instructions).toBe(
+      'Formatting re-enabled\nrender it',
+    );
+  });
+
+  test('markdown marker is the whole instructions when there is no system prompt', async () => {
+    const handle = mockResponsesClient([
+      { type: 'response.created', response: { id: 'r' } },
+      { type: 'response.completed', response: {} },
+    ]);
+    const provider = createOpenAIProvider('gpt-5.4-mini', { client: handle.client });
+    for await (const _ of provider.generate({
+      model: 'gpt-5.4-mini',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 8,
+      effort: 'high',
+    })) {
+      // drain
+    }
+    expect((handle.calls[0] as { instructions?: string }).instructions).toBe(
+      'Formatting re-enabled',
+    );
   });
 });

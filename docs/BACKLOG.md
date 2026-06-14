@@ -2,6 +2,24 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] OpenAI reasoning models: re-enable markdown output
+
+Reasoning models suppress markdown in their responses by default; OpenAI's
+documented opt-in is the literal string `Formatting re-enabled` on the first
+line of the developer message. Forja's TUI renders assistant prose as
+GitHub-flavored markdown (tui/render/markdown.ts), so without it the OpenAI
+output degrades to flat text — no code fences, backticked paths, or lists —
+unlike the Anthropic path. Prepend the marker to `instructions` on the Responses
+path (the reasoning-only surface); the Chat Completions path (gpt-4o,
+non-reasoning) is untouched. The marker is a constant prefix, so it leaves the
+cache prefix and prompt_cache_key stable — no caching regression.
+
+Caveat: the marker behavior is documented for the o1/o3 era; whether gpt-5.x
+still suppresses markdown by default is unconfirmed without a live call. The
+change is asymmetric-positive and reversible — if the model already emits
+markdown, the marker is a near no-op. Same pending spec PR as the cache work
+(PROVIDERS.md §3.2).
+
 ## [2026-06-14] OpenAI prompt-cache parity: extended (24h) retention
 
 OpenAI's prefix cache is automatic, but the in-memory default expires after
