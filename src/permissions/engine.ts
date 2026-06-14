@@ -501,6 +501,18 @@ interface FsToolTraits {
   // search tools without this require a `dir/**` form for allows (the
   // grep/glob "bare-root does not fire" pin).
   exactFileAllow?: boolean;
+  // Modes (read from `args[singleFileModeArg]`) that operate on a SINGLE
+  // FILE by construction AND fail closed on a directory at the tool level
+  // (git blame, show_file). For these the exact-file allow applies even
+  // when the path is ABSENT from the live worktree: show_file/blame
+  // legitimately read a file from HISTORY (`ref:path`) that was deleted or
+  // renamed in the current checkout, so the worktree-stat guard
+  // (isRegularFile) would otherwise force a least-privilege `src/old.ts`
+  // allow to widen to `src/**`. Safe to skip the stat here precisely
+  // because these modes can't enumerate a directory — the tool refuses a
+  // tree, so there is no subtree-grant the stat was protecting against.
+  singleFileModeArg?: string;
+  singleFileModes?: readonly string[];
   // Share another tool's policy section (git's reads are governed by
   // `tools.read_file`).
   section?: keyof PolicyToolsSection;
@@ -509,7 +521,13 @@ interface FsToolTraits {
 const FS_TOOL_TRAITS: Readonly<Record<string, FsToolTraits>> = {
   glob: { rootArg: 'cwd' },
   grep: { rootArg: 'path' },
-  git: { rootArg: 'path', exactFileAllow: true, section: 'read_file' },
+  git: {
+    rootArg: 'path',
+    exactFileAllow: true,
+    singleFileModeArg: 'mode',
+    singleFileModes: ['blame', 'show_file'],
+    section: 'read_file',
+  },
 };
 
 const resolveFsTarget = (toolName: string, args: ToolArgs, cwd: string): string | null => {
@@ -821,13 +839,30 @@ const resolveForProtected = (rawPath: string, cwd: string): string => {
 // (`src`) must NOT match a directory PATH (`git ls_files/log -- src`)
 // and thereby grant subtree enumeration that the search-tool rule
 // shape deliberately reserves for `src/**`. A non-existent path is not
-// a file → falls back to synthetic-descendant matching (safe).
+// a file → falls back to synthetic-descendant matching — EXCEPT for
+// single-file-only modes (see isSingleFileInvocation), where a path
+// absent from the worktree is a legitimate HISTORY read.
 const isRegularFile = (absPath: string): boolean => {
   try {
     return statSync(absPath).isFile();
   } catch {
     return false;
   }
+};
+
+// True when this is a single-file-only invocation (git blame/show_file):
+// the exact-file allow then applies regardless of worktree existence.
+// These modes read a single file (the tool rejects a missing path and
+// fails closed on a directory), so there is no directory-enumeration risk
+// for the isRegularFile stat to guard — and the file may exist only in
+// history (`ref:path`), absent from the current checkout.
+const isSingleFileInvocation = (toolName: string, args: ToolArgs): boolean => {
+  const traits = FS_TOOL_TRAITS[toolName];
+  const modeArg = traits?.singleFileModeArg;
+  const modes = traits?.singleFileModes;
+  if (modeArg === undefined || modes === undefined) return false;
+  const mode = args[modeArg];
+  return typeof mode === 'string' && modes.includes(mode);
 };
 
 // The fs "floor": the hardcoded protected zones (deny/escalate tiers,
@@ -894,6 +929,15 @@ const checkPath = (
   const floor = classifyFloor(path, isWrite ? 'write' : 'read', cwd, home);
   const protectedAbsPath = floor.absPath;
   const protectedTier = floor.tier;
+  // Whether to ALSO test the literal path against allow/grant/session/
+  // confirm rules (the git exact-file fallback). Computed once: the path
+  // is a single file — either a regular file in the worktree, or a
+  // single-file-only mode (blame/show_file) reading from history where
+  // worktree existence is irrelevant. Search tools without `exactFileAllow`
+  // never take this branch (the grep/glob "bare-root does not fire" pin).
+  const exactFileEligible =
+    allowsExactFile(toolName) &&
+    (isRegularFile(protectedAbsPath) || isSingleFileInvocation(toolName, args));
   if (protectedTier === 'deny') {
     return {
       kind: 'deny',
@@ -955,21 +999,21 @@ const checkPath = (
   // path `escalate` tier still upgrades the decision to confirm —
   // the grant authorizes the WRITE attempt, but a confirm-on-
   // protected is mandatory even with prior approval.
-  // `git` ALSO tests the LITERAL path on the allow side. Its
-  // `matchTarget` is `path/.forja-check` (search-tool framing), which
+  // `git` ALSO tests the LITERAL path on the allow side (exactFileEligible).
+  // Its `matchTarget` is `path/.forja-check` (search-tool framing), which
   // admits a tree root against `dir/**` but MISSES an exact-file allow/
   // grant (e.g. `src/a.ts`) when git was handed a single file — the
-  // case for `git blame -- f` / `git diff -- f`. Restricted to `git`
-  // (not grep/glob): those deliberately require a `dir/**` form for the
-  // allow side — a bare-root `dir` rule must NOT admit a subtree search
-  // (see the "bare-root pattern does NOT fire" regression pin). Deny
-  // ran above, so this extra literal match only relaxes an over-strict
-  // allow, never bypasses a deny.
+  // case for `git blame -- f` / `git diff -- f` / `show_file ref:f`.
+  // Eligibility requires the path be a single file: a regular file in the
+  // worktree, OR a single-file-only mode (blame/show_file) that may read it
+  // from history. Restricted to `git` (not grep/glob): those deliberately
+  // require a `dir/**` form for the allow side — a bare-root `dir` rule
+  // must NOT admit a subtree search (see the "bare-root pattern does NOT
+  // fire" regression pin). Deny ran above, so this extra literal match only
+  // relaxes an over-strict allow, never bypasses a deny.
   const grantMatch =
     firstMatchingGrant(activeGrants, sectionKey, matchTarget, cwd) ??
-    (allowsExactFile(toolName) && isRegularFile(protectedAbsPath)
-      ? firstMatchingGrant(activeGrants, sectionKey, path, cwd)
-      : null);
+    (exactFileEligible ? firstMatchingGrant(activeGrants, sectionKey, path, cwd) : null);
   if (grantMatch !== null) {
     if (protectedTier === 'escalate') {
       return {
@@ -995,9 +1039,7 @@ const checkPath = (
   // would otherwise fire. Deny already ran above.
   const sessionMatched =
     firstMatchingPath(sessionAllow, matchTarget, cwd) ??
-    (allowsExactFile(toolName) && isRegularFile(protectedAbsPath)
-      ? firstMatchingPath(sessionAllow, path, cwd)
-      : null);
+    (exactFileEligible ? firstMatchingPath(sessionAllow, path, cwd) : null);
   if (sessionMatched !== null) {
     if (protectedTier === 'escalate') {
       return {
@@ -1016,9 +1058,7 @@ const checkPath = (
   }
   const allowed =
     firstMatchingPath(rules?.allow_paths, matchTarget, cwd) ??
-    (allowsExactFile(toolName) && isRegularFile(protectedAbsPath)
-      ? firstMatchingPath(rules?.allow_paths, path, cwd)
-      : null);
+    (exactFileEligible ? firstMatchingPath(rules?.allow_paths, path, cwd) : null);
   if (allowed !== null) {
     if (protectedTier === 'escalate') {
       return {
@@ -1041,9 +1081,7 @@ const checkPath = (
   // `src/a.ts/.forja-check` target would miss it).
   const confirm =
     firstMatchingPath(rules?.confirm_paths, matchTarget, cwd) ??
-    (allowsExactFile(toolName) && isRegularFile(protectedAbsPath)
-      ? firstMatchingPath(rules?.confirm_paths, path, cwd)
-      : null);
+    (exactFileEligible ? firstMatchingPath(rules?.confirm_paths, path, cwd) : null);
   if (confirm !== null) {
     // acceptEdits accepts edits without confirmation. For writes, a
     // confirm_paths match becomes an auto-allow — that IS the

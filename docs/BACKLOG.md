@@ -2,6 +2,28 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] permissions: don't require historical git paths to exist in the worktree
+
+Follow-up to show_file. The `isRegularFile` guard added to the git exact-file
+allow fallback (so a bare-directory allow can't match a directory path and grant
+subtree enumeration) uses `statSync` against the LIVE worktree. But `git
+show_file`/`blame` read a file from HISTORY (`ref:path`) that may be deleted or
+renamed in the current checkout — so an exact `read_file.allow_paths: ['src/old.ts']`
+(or grant/session-allow) stopped matching once the file left the worktree,
+forcing a least-privilege policy to widen to `src/**`.
+
+Fix: the exact-file fallback now also applies for single-file-ONLY git modes
+(blame, show_file) regardless of worktree existence. Declared on FS_TOOL_TRAITS
+(`singleFileModeArg: 'mode'`, `singleFileModes: ['blame','show_file']`) and read by
+a new `isSingleFileInvocation`; the four fallback branches share one hoisted
+`exactFileEligible = allowsExactFile && (isRegularFile || isSingleFileInvocation)`.
+Safe because these modes can't enumerate a directory — the tool fails closed on a
+tree (`cat-file blob` / blame error), so there's no subtree-grant the worktree
+stat was guarding. Enumeration-capable modes (ls_files/status/diff) keep the
+worktree-stat guard: a non-existent path there stays denied. Test: an exact allow
+on a path absent from the worktree → allow for show_file/blame, deny for
+ls_files/diff.
+
 ## [2026-06-13] git tool: review batch 3 — cap raise, stat, show_file, SIGKILL reap
 
 The opted-in subset of the review's deferred items (TMPDIR-vs-sandbox left out).

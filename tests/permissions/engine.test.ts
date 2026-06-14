@@ -1051,6 +1051,34 @@ describe('engine.check (search tools: glob/grep)', () => {
     }
   });
 
+  test('git single-file modes (show_file/blame) honor an exact allow even when the path is absent from the worktree', () => {
+    // Regression: show_file/blame read a file from HISTORY (`ref:path`)
+    // that may be deleted/renamed in the current checkout. The worktree
+    // stat must NOT force a least-privilege `src/old.ts` allow to widen to
+    // `src/**`. realGitCwd has src/a.ts but NO src/old.ts.
+    const cwd = realGitCwd();
+    try {
+      const eng = createPermissionEngine(
+        policy({ tools: { read_file: { allow_paths: ['src/old.ts'] } } }),
+        { cwd },
+      );
+      // single-file-only modes: allowed despite src/old.ts not existing on disk
+      expect(eng.check('git', 'fs.read', { mode: 'show_file', path: 'src/old.ts' }).kind).toBe(
+        'allow',
+      );
+      expect(eng.check('git', 'fs.read', { mode: 'blame', path: 'src/old.ts' }).kind).toBe('allow');
+      // enumeration-capable modes still require the worktree file (or a
+      // `dir/**` rule): a non-existent path must not slip the file-vs-dir
+      // guard — `ls_files`/`diff` on a missing path stay denied.
+      expect(eng.check('git', 'fs.read', { mode: 'ls_files', path: 'src/old.ts' }).kind).toBe(
+        'deny',
+      );
+      expect(eng.check('git', 'fs.read', { mode: 'diff', path: 'src/old.ts' }).kind).toBe('deny');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   test('git exact-file session-allow matches via the literal path', () => {
     const cwd = realGitCwd();
     try {
