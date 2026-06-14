@@ -2006,6 +2006,26 @@ describe('subagent lifecycle', () => {
     expect(permanent).toEqual([]);
   });
 
+  test('subagent:start strips control bytes from model-authored name + goal', () => {
+    // `goal` is the raw seed prompt and `name` is child-authored; both get
+    // repainted into the LIVE region every heartbeat (head + `starting ·`
+    // fallback). A malicious child embedding `\x1b[2J` (clear screen),
+    // `\x07` (bell), or `\x1b]0;…` (OSC window title) in either field would
+    // otherwise hijack the terminal on every redraw. Sanitized at ingress.
+    const evilGoal = '\x1b[2J\x1b[H\x1b]0;PWNED\x07audit the diff';
+    const evilName = '\x1b[31mreview\x1b[0m';
+    const { state } = drive([
+      { type: 'subagent:start', ts: 1, subagentId: 'c1', name: evilName, goal: evilGoal },
+    ]);
+    const entry = state.subagents.get('c1');
+    expect(entry?.goal).not.toContain('\x1b');
+    expect(entry?.goal).not.toContain('\x07');
+    expect(entry?.name).not.toContain('\x1b');
+    // The visible text survives the strip.
+    expect(entry?.goal).toContain('audit the diff');
+    expect(entry?.name).toContain('review');
+  });
+
   test('subagent:update mutates the existing entry in place', () => {
     const { state, permanent } = drive([
       { type: 'subagent:start', ts: 1, subagentId: 'c1', name: 'r', goal: 'g' },

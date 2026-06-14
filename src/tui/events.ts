@@ -571,13 +571,16 @@ export type SubagentUpdateEvent = BaseEvent & {
   cumulativeCostUsd?: number;
   // The child's IN-FLIGHT tool, as a compact `read engine.ts` label
   // (short tool name + subject). Rendered on the live row's line 2.
-  // Set on the child's `tool_invoking`/`tool_execution_started`;
+  // Set on the child's `tool_invoking`; PERSISTS until the next tool
+  // starts (deliberately NOT cleared on `toolDone`, so line 2 keeps
+  // showing the last action during the gap between tools).
   // `undefined` on other progress events = "no change".
   currentTool?: string;
   // The tool NAME the child just finished. The reducer increments the
-  // per-type aggregate (for the grouped scrollback trail on end),
-  // bumps the total, and clears `currentTool`. `undefined` = not a
-  // tool-finished update.
+  // per-type aggregate (for the grouped scrollback trail on end) and
+  // bumps the total. It does NOT touch `currentTool` (that persists
+  // until the next tool starts). `undefined` = not a tool-finished
+  // update.
   toolDone?: string;
 };
 export type SubagentEndEvent = BaseEvent & {

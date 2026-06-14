@@ -2,6 +2,30 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] tui(subagents): sanitize model-authored name + goal before the live region
+
+A security-audit pass over the subagent-rework range flagged a defensive
+inconsistency the diff introduced: the live row's `currentTool` (line 2) is
+sanitized at ingress (`harness-adapter` → `sanitizeOneLineForDisplay`, strips
+ANSI + the full non-whitespace C0 range incl. BEL), but its siblings `name` (row
+head) and `goal` (the `starting · <goal>` fallback) entered the reducer RAW.
+`goal` is the raw seed prompt — fully model/child-authored — and the same range
+made `liveRegionActive` stay true for the whole subagent run, so those fields are
+repainted EVERY heartbeat tick. A malicious child could embed `\x1b[2J` /
+`\x07` / OSC title sequences and forge SGR, ring the bell, or move the cursor on
+every redraw (display-only, no exec). Verified end-to-end: render sites
+(`subagent-row.ts:109`/`:113`) interpolate both fields verbatim; `stripAnsi`
+covers BEL so the fix has no residual gap. Fixed at the STATE boundary
+(`state.ts` `subagent:start`), the same chokepoint `currentTool` and the
+`read_file` path already use — one sanitize covers the live row and the end-block
+summary (both read from state). Behavioral test added (control bytes in name +
+goal → stripped, visible text survives).
+
+Also corrected two stale doc-comments on the same range's events (`events.ts`):
+`currentTool` is set only on `tool_invoking` (not `tool_execution_started`) and
+PERSISTS across `toolDone` — the comments claimed it was cleared, contradicting
+the reducer and the `currentTool persists` test.
+
 ## [2026-06-14] playbooks: raise code-review + security-audit output cap to 8192, recalibrate cost soft-cap
 
 Live testing surfaced subagents hitting the per-call output cap (`stop_reason:

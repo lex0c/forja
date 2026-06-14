@@ -2289,10 +2289,19 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // existing entry rather than no-oping; the new producer is
       // the source of truth for any field the renderer reads.
       const next = new Map(state.subagents);
+      // `name` and `goal` are model/child-authored — `goal` is the raw
+      // seed prompt verbatim — and the renderer paints them into the LIVE
+      // region every heartbeat tick (`name` in the row head, `goal` in the
+      // `starting · <goal>` line-2 fallback). Now that `liveRegionActive`
+      // stays true for the whole subagent run, a raw ESC/BEL/CR would ring
+      // the bell, forge SGR, or move the cursor on every redraw. Sanitize at
+      // this STATE boundary — same chokepoint the sibling `currentTool`
+      // (harness-adapter) and the `read_file` path already use — so every
+      // downstream read (live row, end-block summary) sees clean text.
       next.set(event.subagentId, {
         subagentId: event.subagentId,
-        name: event.name,
-        goal: event.goal,
+        name: sanitizeOneLineForDisplay(event.name),
+        goal: sanitizeOneLineForDisplay(event.goal),
         progress: '',
         startedAt: event.ts,
         liveCostUsd: 0,
