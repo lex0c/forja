@@ -1160,6 +1160,30 @@ describe('/perms why', () => {
     expect((denied.notes ?? []).join('\n')).toContain('decision: deny');
   });
 
+  test('git preserves the mode so show_file/blame match exact-file rules in history', async () => {
+    const ctx = buildCtx(
+      { defaults: { mode: 'strict' }, tools: { read_file: { allow_paths: ['old.ts'] } } },
+      [{ name: 'git', category: 'fs.read' }],
+      { defaults: 'project', read_file: 'project' },
+    );
+    // `old.ts` is allowed EXACTLY but does not exist in the dry-check cwd
+    // (/proj) — a file readable only at a past ref. show_file/blame are
+    // single-file modes, so the engine honors the exact allow regardless of
+    // worktree existence. The mode token must reach the engine: dropping it
+    // (the prior bug) would default-deny via the worktree-stat guard.
+    const showFile = await permsCommand.exec(['why', 'git', 'show_file', 'old.ts'], ctx);
+    if (showFile.kind !== 'ok') throw new Error('expected ok');
+    expect((showFile.notes ?? []).join('\n')).toContain('decision: allow');
+    const blame = await permsCommand.exec(['why', 'git', 'blame', 'old.ts'], ctx);
+    if (blame.kind !== 'ok') throw new Error('expected ok');
+    expect((blame.notes ?? []).join('\n')).toContain('decision: allow');
+    // a non-single-file mode (ls_files) on the same missing path stays deny
+    // (the worktree-stat guard still applies to enumeration modes).
+    const lsFiles = await permsCommand.exec(['why', 'git', 'ls_files', 'old.ts'], ctx);
+    if (lsFiles.kind !== 'ok') throw new Error('expected ok');
+    expect((lsFiles.notes ?? []).join('\n')).toContain('decision: deny');
+  });
+
   test('fetch_url URL rendering', async () => {
     const ctx = buildCtx(
       {

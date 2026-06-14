@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] /perms why git: preserve the mode token in the dry-check args
+
+Follow-up to the historical-git-paths engine fix. `buildDryCheckArgs` consumed the
+git mode token (so `/perms why git status` isn't read as a path named "status")
+but DROPPED it from the synthetic args — fine when the engine keyed only on
+`path`, but the engine now also keys on `args.mode` (`isSingleFileInvocation`
+treats blame/show_file as single-file invocations, which lets an exact-file rule
+match a file that exists only in history). So `/perms why git show_file old.ts`
+under `read_file.allow_paths: ['old.ts']` reported a default DENY while the real
+`git show_file` call would be ALLOWED — a dry-check that contradicts the live
+decision. Fix: preserve the mode in the synthetic args. Test: `show_file`/`blame`
+on an allowed-but-absent path now dry-check `allow`, while `ls_files` on the same
+path stays `deny` (the worktree-stat guard still applies to enumeration modes).
+
 ## [2026-06-13] git tool: gate a collapsed untracked status dir as a subtree
 
 Review finding (metadata leak). `git status -u normal` (the default) collapses an
