@@ -399,6 +399,32 @@ const nameOnlyArgs = (args: GitInput): string[] | null => {
       ...pathspec,
     ];
   }
+  if (args.mode === 'log') {
+    // Enumerate each shown commit's touched files so a commit that ONLY
+    // touched a policy-denied path can be dropped (its subject/author/date
+    // would otherwise leak denied-subtree history). `%x1e` (ASCII record
+    // separator) prefixes every commit's `%h` so one commit's NUL-framed
+    // --name-only file list can't be misread as the next commit's hash.
+    // Mirror buildModeArgs' count clamp + ref/follow/pathspec so the gate
+    // enumerates EXACTLY the commits the display run shows.
+    const max = Math.min(
+      typeof args.max_count === 'number' && Number.isInteger(args.max_count) && args.max_count > 0
+        ? args.max_count
+        : DEFAULT_LOG_COUNT,
+      MAX_LOG_COUNT,
+    );
+    return [
+      'log',
+      '-n',
+      String(max),
+      '--name-only',
+      '-z',
+      '--format=%x1e%h',
+      ...(args.follow === true ? ['--follow'] : []),
+      ...(ref !== undefined ? [ref] : []),
+      ...pathspec,
+    ];
+  }
   return null;
 };
 
@@ -756,6 +782,101 @@ const filterMetadataOutput = async (
   return body.length > 0 ? `${body}\n${notice}` : notice;
 };
 
+// `log` carries no file paths in its OUTPUT, yet a pathless / parent-scoped log
+// still reports commit subjects/authors/hashes for commits that touched ONLY a
+// policy-denied subtree (secrets/, the sensitive .env floor) — leaking that
+// history the way an ungated `status`/`ls_files` leaks names. The content +
+// metadata gates miss it (there is no path in the log LINE to drop). So
+// post-filter: enumerate each shown commit's touched files via a `--name-only`
+// pre-flight and drop the line of any commit whose files are ALL denied. A
+// commit touching >=1 readable file is KEPT — its line is legitimately in scope
+// even if its subject mentions denied work (a subject cannot be partially
+// redacted). A commit with NO files (merge / empty) exposes no path, so it
+// stays. `canReadPath` already folds in BOTH the parent read policy and the
+// subagent's tool_restrictions deny (restrictions.ts), so one gate covers both.
+const filterLogOutput = async (
+  capture: GitCapture,
+  args: GitInput,
+  gitBin: string,
+  spawnEnv: Record<string, string>,
+  ctx: ToolContext,
+  hardening: readonly string[],
+): Promise<string | ToolError> => {
+  if (capture.output.length === 0) return '';
+  const gateArgs = nameOnlyArgs(args);
+  if (gateArgs === null) return capture.output; // defensive: not a gateable mode
+  const gate = await captureGit(gateArgs, gitBin, spawnEnv, ctx, hardening);
+  if (isToolError(gate)) {
+    // Abort surfaces as-is; any other failure means we cannot tell which
+    // commits touched denied paths — refuse rather than emit an ungated log.
+    if (gate.error_code === ERROR_CODES.aborted) return gate;
+    return toolError(
+      ERROR_CODES.gitDenied,
+      'cannot enumerate per-commit paths to policy-check the log; refusing rather than risk leaking a denied-subtree commit',
+      { details: { log_gate: 'failed' } },
+    );
+  }
+  if (gate.truncated) {
+    // A truncated enumeration leaves later commits' file lists unknown — any
+    // could be denied-only. Fail closed; narrow `max_count` or scope a path.
+    return toolError(
+      ERROR_CODES.gitDenied,
+      'per-commit path enumeration for the log exceeded the capture cap; lower max_count or pass a path so the policy filter can apply',
+      { details: { log_gate: 'truncated' } },
+    );
+  }
+  // Parse the `%x1e`-delimited gate stream. Each block is `<hash>` optionally
+  // followed by `\n<file>\0<file>\0…` (the -z --name-only list); a fileless
+  // commit (merge / empty) is just `<hash>` with the -z NUL terminator.
+  const withFiles: { hash: string; files: string[] }[] = [];
+  for (const block of gate.output.split('\x1e').slice(1)) {
+    const nl = block.indexOf('\n');
+    if (nl === -1) continue; // no files → nothing to deny
+    // -z terminates the `%h` format output with a NUL before the --name-only
+    // newline, so the pre-newline slice is `<hash>\0`; strip that terminator so
+    // the hash matches the clean `%h` the display run printed.
+    const hash = block.slice(0, nl).replace(/\0+$/, '');
+    const files = block
+      .slice(nl + 1)
+      .split('\0')
+      .filter((f) => f.length > 0);
+    if (hash.length > 0 && files.length > 0) withFiles.push({ hash, files });
+  }
+  if (withFiles.length === 0) return capture.output; // no commit carries a path
+  const repoRoot = await resolveRepoRoot(gitBin, spawnEnv, ctx, hardening);
+  if (repoRoot === null) {
+    return toolError(
+      ERROR_CODES.gitDenied,
+      'cannot resolve the repo root to policy-check the log; refusing rather than risk leaking a denied-subtree commit',
+      { details: { repo_root: 'unresolved' } },
+    );
+  }
+  const denied = new Set<string>();
+  for (const { hash, files } of withFiles) {
+    if (files.every((f) => !ctx.permissions.canReadPath(resolve(repoRoot, f)))) {
+      denied.add(hash);
+    }
+  }
+  if (denied.size === 0) return capture.output;
+  // Drop the display line of every denied-only commit. The display format is
+  // `%h …`, so the first whitespace-delimited token is the short hash the gate
+  // (`%h`, same repo + abbrev) produced.
+  const kept: string[] = [];
+  let hidden = 0;
+  for (const line of capture.output.split('\n')) {
+    const hash = line.split(' ', 1)[0];
+    if (hash !== undefined && denied.has(hash)) {
+      hidden++;
+    } else {
+      kept.push(line);
+    }
+  }
+  if (hidden === 0) return capture.output;
+  const body = kept.join('\n');
+  const notice = `[forja: ${hidden} commit(s) hidden by policy]`;
+  return body.length > 0 ? `${body}\n${notice}` : notice;
+};
+
 // For content modes, pre-flight `--name-only`, resolve each emitted
 // file to an absolute path, and refuse (fail-closed) if ANY would not
 // pass a `read_file` policy check — this is what stops pathless/dir
@@ -1081,6 +1202,15 @@ export const gitTool: Tool<GitInput, GitOutput> = {
     let finalOutput = output;
     if (PATH_METADATA_MODES.has(args.mode)) {
       const filtered = await filterMetadataOutput(args.mode, cap, gitBin, spawnEnv, ctx, hardening);
+      if (isToolError(filtered)) return filtered;
+      finalOutput = filtered;
+    }
+    // `log` carries no path in its output line, so drop the whole line for any
+    // commit that touched ONLY denied paths (filterLogOutput re-enumerates via
+    // --name-only) — otherwise a parent-scoped log leaks denied-subtree
+    // subjects/authors that status/ls_files already filter.
+    if (args.mode === 'log') {
+      const filtered = await filterLogOutput(cap, args, gitBin, spawnEnv, ctx, hardening);
       if (isToolError(filtered)) return filtered;
       finalOutput = filtered;
     }

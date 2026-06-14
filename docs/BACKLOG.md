@@ -2,6 +2,37 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] git tool: gate `log` against denied-subtree commits
+
+`log` was excluded from both per-file gates (content + metadata), so a pathless /
+parent-scoped `git log` — authorized at the readable root — still printed commit
+subjects/authors/hashes/dates for commits that touched ONLY a policy-denied
+subtree (secrets/, the sensitive `.env` floor, a subagent `deny_paths`), leaking
+that history while `status`/`ls_files` were filtered. The "refuse when a denied
+descendant is in scope" option is too blunt (the `.env` floor would refuse every
+pathless log in any repo with a `.env`), so took the precise route: drop only the
+commits that are ENTIRELY about denied paths.
+
+`log` carries no path in its output line, so post-filter via a `--name-only`
+pre-flight: `filterLogOutput` re-runs the log scope (same -n/ref/follow/pathspec)
+as `--name-only -z --format=%x1e%h`, parses each commit's touched files, and for
+any commit whose files are ALL denied (`canReadPath`, which already folds in both
+the parent policy AND the subagent restriction deny) adds its hash to a drop set;
+the display run's lines are then filtered by leading `%h`. A commit touching >=1
+readable file is kept (its subject may mention denied work, but it legitimately
+touched an allowed file and a subject can't be partially redacted); a fileless
+commit (merge/empty) exposes no path and stays. Drops are disclosed
+(`[forja: N commit(s) hidden by policy]`), matching the metadata gate. Fails
+closed if the enumeration errors, truncates (later commits' files unknown), or the
+repo root can't resolve.
+
+Byte-layout gotcha (caught by the e2e): with `--format=%x1e%h --name-only -z`,
+git terminates the `%h` format output with a NUL BEFORE the --name-only newline
+(`<hash>\0\n<file>\0…`), so the pre-newline slice is `<hash>\0` — the trailing NUL
+has to be stripped or the gate hash never matches the clean display `%h`. Test:
+denied-only commit hidden + disclosure, mixed/allowed commits kept, unrestricted
+control shows the denied-only commit.
+
 ## [2026-06-14] subagents: enforce git/grep tool_restrictions deny_paths on DESCENDANT output
 
 `wrapToolWithRestrictions` ran a pre-flight check on the literal `path` arg only.

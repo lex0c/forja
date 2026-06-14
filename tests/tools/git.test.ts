@@ -167,6 +167,42 @@ describe.if(GIT_AVAILABLE)('gitTool — against a real repo', () => {
     expect(out.exit_code).toBe(0);
   });
 
+  test('log hides commits that touched ONLY a denied subtree (control: unrestricted shows them)', async () => {
+    // History on top of the beforeEach "add a" (touched a.ts, allowed):
+    //   - a commit touching ONLY secrets/ (denied) → its subject must vanish
+    //   - a commit touching BOTH a.ts + secrets/ (mixed) → kept (touched an
+    //     allowed file; a subject can't be partially redacted)
+    mkdirSync(join(dir, 'secrets'), { recursive: true });
+    writeFileSync(join(dir, 'secrets', 'key'), 'k\n');
+    run(['add', '-A']);
+    run(['commit', '-q', '-m', 'rotate DENIED-ONLY secret']);
+    writeFileSync(join(dir, 'a.ts'), 'export const a = 9;\n');
+    writeFileSync(join(dir, 'secrets', 'key'), 'k2\n');
+    run(['add', '-A']);
+    run(['commit', '-q', '-m', 'touch both MIXED']);
+
+    const denySecrets = makeCtx({
+      cwd: dir,
+      permissions: {
+        mode: 'strict',
+        posture: 'supervised',
+        canReadPath: (p) => !p.includes('/secrets/'),
+      },
+    });
+    const out = await gitTool.execute({ mode: 'log' }, denySecrets);
+    if (isToolError(out)) throw new Error(out.error_message);
+    expect(out.output).not.toContain('DENIED-ONLY'); // denied-only commit dropped
+    expect(out.output).toContain('MIXED'); // mixed touched a.ts → kept
+    expect(out.output).toContain('add a'); // allowed-only → kept
+    expect(out.output).toContain('1 commit(s) hidden by policy'); // disclosure
+
+    // Control: allow-all policy → the denied-only commit IS shown, proving the
+    // restriction did the filtering (not some unrelated scoping).
+    const ctrl = await gitTool.execute({ mode: 'log' }, makeCtx({ cwd: dir }));
+    if (isToolError(ctrl)) throw new Error(ctrl.error_message);
+    expect(ctrl.output).toContain('DENIED-ONLY');
+  });
+
   test('diff/status reflect the LIVE working tree (uncommitted)', async () => {
     // mutate the file WITHOUT committing — the whole point of isolation:none.
     writeFileSync(join(dir, 'a.ts'), 'export const a = 2;\n');
