@@ -2,6 +2,33 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] tui: surface FAILED task delegations despite the silent task chip
+
+Follow-up to marking the `task_*` family `silent` (so the operator sees the live
+`Subagents` block, not a "Called task_sync" chip). Finding: that assumes every
+task call has a subagent lifecycle the block renders. A delegation that fails
+BEFORE a child is created — unknown playbook, validation error, pre-spawn budget
+refusal — emits no `subagent:start`/`subagent:end`, so the block shows nothing,
+AND `silent` suppressed both the start and end chips including the error summary:
+the failed delegation was completely invisible in scrollback.
+
+Chose to reveal failures rather than correlate-and-suppress. A precise option
+("suppress only calls that actually spawned a subagent") needs to attribute a
+`subagent:start` to the task call that spawned it, but `subagent:start` carries
+no parent `toolUseId` — a temporal in-flight heuristic would MISATTRIBUTE under
+concurrent `task_async` and could re-hide a pre-spawn failure (the exact bug).
+Hiding is worse than a little redundancy, so: a new `revealFailure` vocab flag on
+the `task_*` entries makes the adapter emit the chip on any non-`done` finish.
+Since a silent tool emits no `tool:start`, a lone `tool:end` no-ops in the reducer
+(finalizes a card never opened), so the adapter synthesizes the start+end pair in
+the same batch — collapsing straight to the scrollback failure chip, no live
+noise. Todos keep plain `silent` (no `revealFailure`): their failures stay hidden
+by design (model prose + the `Tasks` block carry them). A post-spawn child failure
+(`subagent.run_failed`) now shows in BOTH the block and a chip — accepted: the chip
+carries the tool-level reason, complementary to the block's run summary, and
+visible-twice beats silently-dropped. Tests: failed/denied task_* → chip; done →
+silent; failed todo → still silent.
+
 ## [2026-06-14] git tool: fail closed on clean/smudge-filtered files instead of corrupting the worktree comparison
 
 The tool disables repo-configured clean/smudge/process filters before any

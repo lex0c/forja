@@ -542,11 +542,34 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           summary = event.resultDetail;
         }
         state.tools.delete(event.toolUseId);
-        // Silent tools (todos) emit no chip — see the tool:start case. The
-        // result still reaches the model; only the scrollback chip (incl.
-        // failures) is hidden, since the model surfaces todo errors in its
-        // prose and the live `Tasks` block reflects the real state.
-        if (!lookupToolVocab(event.toolName).silent) {
+        // Silent tools emit no SUCCESS chip — see the tool:start case. Todos
+        // hide their failures too (the model surfaces them in prose and the
+        // live `Tasks` block reflects state). A `revealFailure` silent tool
+        // (the task_* delegation family) instead SURFACES a failed finish: a
+        // delegation that dies before its child is created (unknown playbook,
+        // validation error, pre-spawn budget refusal) emits no subagent
+        // lifecycle, so the `Subagents` block has nothing to show and dropping
+        // the failure chip too would make the failed delegation invisible.
+        const vocab = lookupToolVocab(event.toolName);
+        const reveal = vocab.silent === true && vocab.revealFailure === true && status !== 'done';
+        if (!vocab.silent || reveal) {
+          // A silent tool emitted no tool:start, so a lone tool:end would
+          // no-op in the reducer (it finalizes a card that was never opened —
+          // state.ts tool:end returns empty on an unknown toolId). Synthesize
+          // the opening card here, in the SAME batch, so the failed chip
+          // renders; the reducer pairs start+end by toolId. No live noise: the
+          // pair collapses straight to the scrollback failure chip.
+          if (reveal) {
+            out.push({
+              type: 'tool:start',
+              ts,
+              toolId: event.toolUseId,
+              name: event.toolName,
+              activeVerb: vocab.activeVerb,
+              finalVerb: vocab.finalVerb,
+              subject: null,
+            });
+          }
           out.push({
             type: 'tool:end',
             ts,

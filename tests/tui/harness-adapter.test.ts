@@ -644,6 +644,69 @@ describe('harness-adapter — tool lifecycle', () => {
     }
   });
 
+  test('a FAILED task_* delegation surfaces a chip despite silent (pre-spawn failure)', () => {
+    // A task_sync that dies before a child exists (unknown playbook,
+    // validation error, pre-spawn budget refusal) emits no subagent
+    // lifecycle, so the Subagents block shows nothing. Suppressing its
+    // failure chip too (the way a success is suppressed) would make the
+    // failed delegation invisible in scrollback.
+    const a = createHarnessAdapter(baseCtx());
+    // tool_invoking stays silent — no live "running" chip.
+    expect(
+      types(
+        a.translate({ type: 'tool_invoking', toolUseId: 't1', toolName: 'task_sync', args: {} }),
+      ),
+    ).toEqual([]);
+    // The failed finish synthesizes a start+end pair so the chip renders (a
+    // lone tool:end no-ops in the reducer — the card was never opened).
+    const out = a.translate({
+      type: 'tool_finished',
+      toolUseId: 't1',
+      toolName: 'task_sync',
+      failed: true,
+      errorMessage: "subagent 'foo' not found",
+      durationMs: 5,
+    });
+    expect(types(out)).toEqual(['tool:start', 'tool:end']);
+    const end = out[1] as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(end.status).toBe('error');
+    expect(end.summary).toBe("subagent 'foo' not found");
+  });
+
+  test('a DENIED task_* delegation also surfaces a chip', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'tool_invoking', toolUseId: 't1', toolName: 'task_async', args: {} });
+    const out = a.translate({
+      type: 'tool_finished',
+      toolUseId: 't1',
+      toolName: 'task_async',
+      failed: true,
+      denied: true,
+      durationMs: 2,
+    });
+    expect(types(out)).toEqual(['tool:start', 'tool:end']);
+    expect((out[1] as Extract<UIEvent, { type: 'tool:end' }>).status).toBe('denied');
+  });
+
+  test('a FAILED todo stays silent — failures hidden by design, unlike task_*', () => {
+    // Todos deliberately do NOT set revealFailure: a failed todo op surfaces
+    // in the model's prose + the Tasks block, so still no chip even on error.
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'tool_invoking', toolUseId: 't1', toolName: 'todo_create', args: {} });
+    expect(
+      types(
+        a.translate({
+          type: 'tool_finished',
+          toolUseId: 't1',
+          toolName: 'todo_create',
+          failed: true,
+          errorMessage: 'boom',
+          durationMs: 1,
+        }),
+      ),
+    ).toEqual([]);
+  });
+
   test('unknown tool falls back to generic Calling/Called verbs and null subject', () => {
     const a = createHarnessAdapter(baseCtx());
     const out = a.translate({

@@ -35,6 +35,19 @@ export interface ToolVocab {
   // chips are pure scrollback noise. The tool still runs and its result
   // still reaches the model — only the chip is hidden.
   silent?: boolean;
+  // For a `silent` tool: still surface a scrollback chip when the call
+  // FAILS (status !== 'done'). The task_* delegation tools set this. A
+  // silent SUCCESS is represented by the live `Subagents` block, but a
+  // delegation that fails BEFORE a child is created (unknown playbook,
+  // validation error, pre-spawn budget refusal) emits no subagent
+  // lifecycle for that block to show — fully suppressing its failure chip
+  // too would make the failed delegation invisible in scrollback. (A
+  // post-spawn child failure also surfaces here AND in the block: the
+  // chip carries the tool-level reason, complementary to the block's run
+  // summary, and erring toward visible beats silently dropping it.) Todos
+  // deliberately do NOT set this — their failures surface in the model's
+  // prose + the live `Tasks` block.
+  revealFailure?: boolean;
 }
 
 const str = (v: unknown): string | null => (typeof v === 'string' && v.length > 0 ? v : null);
@@ -218,31 +231,39 @@ export const TOOL_VOCAB: Readonly<Record<string, ToolVocab>> = {
   // `task_sync`/`task_async`'s own "Calling task_sync" / "Called task_sync"
   // card is redundant noise stacked next to that block. The adapter still
   // tracks the call (so the per-tool machinery stays intact); it just emits
-  // no chip. Verbs kept for the day someone flips silent off.
+  // no chip on success. Verbs kept for the day someone flips silent off —
+  // and used NOW to render the failure chip `revealFailure` surfaces (a
+  // delegation that fails before its child exists has no Subagents block to
+  // appear in, so its failure must not vanish with the success chip).
   task_sync: {
     activeVerb: 'Running subagent',
     finalVerb: 'Ran subagent',
     silent: true,
+    revealFailure: true,
   },
   task_async: {
     activeVerb: 'Spawning subagent',
     finalVerb: 'Spawned subagent',
     silent: true,
+    revealFailure: true,
   },
   task_await: {
     activeVerb: 'Awaiting subagent',
     finalVerb: 'Awaited subagent',
     silent: true,
+    revealFailure: true,
   },
   task_cancel: {
     activeVerb: 'Cancelling subagent',
     finalVerb: 'Cancelled subagent',
     silent: true,
+    revealFailure: true,
   },
   task_list: {
     activeVerb: 'Listing subagents',
     finalVerb: 'Listed subagents',
     silent: true,
+    revealFailure: true,
   },
   monitor: {
     activeVerb: 'Monitoring',
