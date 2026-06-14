@@ -564,14 +564,28 @@ const captureGit = async (
 // pin each clean/smudge/process to empty (git then treats them as
 // pass-through — no exec). The `git config` read itself runs no filter.
 //
-// A REQUIRED filter (`filter.<d>.required=true` — the standard Git LFS
-// config sets `filter.lfs.required=true`) treats an empty/failed
-// clean/smudge as a FATAL error, so pinning the command to empty alone
-// makes `git diff`/`status` of a dirty LFS-tracked file exit 128 ("clean
-// filter 'lfs' failed") — breaking normal LFS repos. So for every driver
-// we disable we ALSO pin `filter.<d>.required=false`, making git accept
-// the (safe, no-exec) passthrough instead of erroring. required=false
-// enables no execution — it only changes error handling.
+// Pinning the command to empty is NOT inert for a repo with a real
+// clean/smudge filter (Git LFS being the common case). With the filter
+// neutralized git cannot convert the worktree file to its repo form, so a
+// worktree comparison (diff/status) measures the RAW worktree bytes
+// against the CLEANED blob already in the index. They differ by
+// construction: an unchanged LFS file then reports as MODIFIED and
+// `git diff` emits a bogus pointer-vs-content hunk. Pass-through here
+// silently CORRUPTS the working-tree result.
+//
+// So rather than accept that (an earlier version pinned `required=false`
+// to swallow the error and take the corrupt passthrough), we FORCE
+// `filter.<d>.required=true` for every disabled driver. git then treats
+// the empty clean as fatal and exits 128 ("clean filter '<d>' failed")
+// the moment a worktree comparison would touch a filter-bound file —
+// fail-closed instead of corrupt. The main-run error mapping translates
+// that exit into an actionable refusal. This holds for ALL configured
+// drivers, not just LFS: a custom filter that did not set `required`
+// would otherwise pass-through-corrupt just the same. Forcing required
+// changes ONLY error handling (the empty command already guarantees no
+// exec), and it bites ONLY worktree-comparing modes — show/log/blame/
+// ls_files/show_file never run a clean filter, and a path-scoped
+// diff/status of unfiltered files still works on an LFS repo.
 //
 // Returns the extra `-c …` flags to prepend to subsequent runs, OR `null`
 // when the enumeration could not be trusted to be COMPLETE — a truncated
@@ -616,7 +630,7 @@ const filterDisableFlags = async (
     if (name.length > 0) drivers.add(name);
   }
   for (const name of drivers) {
-    flags.push('-c', `filter.${name}.required=false`);
+    flags.push('-c', `filter.${name}.required=true`);
   }
   return flags;
 };
@@ -1029,6 +1043,27 @@ export const gitTool: Tool<GitInput, GitOutput> = {
           ERROR_CODES.invalidArg,
           `git show_file: '${args.path}' is not a readable file at '${args.ref ?? 'HEAD'}' — it may be a directory, or absent at that revision. show_file reads one file's content; pass a file path.`,
           { details: { command: commandLine } },
+        );
+      }
+      // A worktree-comparing mode (diff/status) over a file bound to a
+      // clean/smudge filter (Git LFS et al.) lands here: filterDisableFlags
+      // neutralized the filter command AND forced required=true, so git
+      // exits 128 instead of emitting the corrupt raw-worktree-vs-cleaned-
+      // index comparison that pass-through would produce. Translate the
+      // plumbing error into the actionable refusal — the tool will neither
+      // run the repo's filter command nor fabricate a pass-through result.
+      const cleanFilter = /(?:^|\n)fatal: (.+?): (?:clean|smudge) filter '([^']*)' failed/.exec(
+        cap.stderr,
+      );
+      if (cleanFilter !== null) {
+        const filteredPath = cleanFilter[1];
+        const driver = cleanFilter[2];
+        return toolError(
+          ERROR_CODES.gitDenied,
+          `${args.mode} touches '${filteredPath}', which this repo runs through the '${driver}' clean/smudge filter (e.g. Git LFS). This read-only tool disables repo-configured filter commands (they are attacker-controllable code in an untrusted repo) and refuses to emit the corrupt raw-vs-cleaned comparison that disabling them would otherwise produce — narrow \`path\` to unfiltered files, or read one file's stored content with show_file (it returns the committed blob, e.g. the LFS pointer).`,
+          {
+            details: { command: commandLine, filtered_path: filteredPath, filter_driver: driver },
+          },
         );
       }
       return toolError(

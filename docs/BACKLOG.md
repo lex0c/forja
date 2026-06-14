@@ -2,6 +2,39 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] git tool: fail closed on clean/smudge-filtered files instead of corrupting the worktree comparison
+
+The tool disables repo-configured clean/smudge/process filters before any
+worktree-comparing run (they are attacker-controllable code in an untrusted
+repo). It did so by pinning each filter command empty AND pinning
+`filter.<d>.required=false` to dodge git's "clean filter failed" abort. Finding:
+that `required=false` is the bug. With the filter neutralized, git compares the
+RAW worktree bytes against the CLEANED blob in the index — for Git LFS (and any
+transforming clean) those differ by construction, so an UNCHANGED filtered file
+reports as modified in `status` and `diff` emits a bogus pointer-vs-content hunk.
+Pass-through silently corrupts the working-tree result.
+
+Verified empirically (canary with an inverse clean/smudge pair simulating LFS):
+reproduced the false "modified" + bogus diff; confirmed git's required-filter
+machinery is the clean fix. The attr-pathspec detection route was killed by this
+tool's own `GIT_LITERAL_PATHSPECS=1` hardening (disables `:(attr:…)` magic) — and
+re-enabling magic would reopen the injection surface that flag closes. So instead
+of detecting filter-bound paths, FORCE `filter.<d>.required=true`: git then exits
+128 ("clean filter '<d>' failed", naming the file) the moment a worktree
+comparison touches a filter-bound file — fail-closed, for ALL configured drivers
+(a custom non-required filter would otherwise pass-through-corrupt too), and only
+for worktree-comparing modes (show/log/blame/ls_files/show_file never run a clean
+filter; a path-scoped diff/status of unfiltered files still works on an LFS repo).
+The main-run error mapping translates the exit-128 into an actionable refusal
+(narrow `path`, or read one file's stored blob via show_file). The empty-command
+pins still guarantee no filter exec; required=true changes only error handling.
+
+Two existing tests that asserted the old pass-through ("diff/status succeed")
+were rewritten to the fail-closed contract — one keeps the no-exec canary (now a
+non-required driver, also fail-closed), the other carries a positive control
+showing the raw pass-through's false "modified". New tests: path-scoped unfiltered
+diff/status still works; show_file still reads the stored pointer.
+
 ## [2026-06-14] tui(subagents): sanitize model-authored name + goal before the live region
 
 A security-audit pass over the subagent-rework range flagged a defensive

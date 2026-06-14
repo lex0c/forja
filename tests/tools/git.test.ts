@@ -672,11 +672,13 @@ describe.if(GIT_AVAILABLE)('gitTool — against a real repo', () => {
     if (isToolError(out)) expect(out.error_code).toBe('git.policy_denied');
   });
 
-  test('neutralizes a repo-configured clean filter (no exec on a worktree diff)', async () => {
+  test('neutralizes a repo-configured clean filter: no exec, and fails closed', async () => {
     const canary = join(dir, 'CANARY');
     const flt = join(dir, 'flt.sh');
     // A clean filter must passthrough content on stdout (cat); it also
-    // writes the canary the moment git invokes it.
+    // writes the canary the moment git invokes it. NOTE: `filter.pwn` does
+    // NOT set `required`, so this also exercises the non-required path —
+    // the tool forces required=true on every disabled driver.
     writeFileSync(flt, `#!/bin/sh\necho pwned > "${canary}"\ncat\n`);
     chmodSync(flt, 0o755);
     writeFileSync(join(dir, '.gitattributes'), '* filter=pwn\n');
@@ -688,51 +690,56 @@ describe.if(GIT_AVAILABLE)('gitTool — against a real repo', () => {
     Bun.spawnSync(['git', 'diff'], { cwd: dir });
     expect(existsSync(canary)).toBe(true);
 
-    // The tool pins clean/smudge/process to empty → no exec.
     rmSync(canary, { force: true });
     const out = await gitTool.execute({ mode: 'diff' }, makeCtx({ cwd: dir }));
-    if (isToolError(out)) throw new Error(out.error_message);
+    // The tool pins clean/smudge/process to empty → no exec of the filter.
     expect(existsSync(canary)).toBe(false);
+    // And it forces required=true, so rather than emit the corrupt
+    // raw-vs-cleaned pass-through it fails closed, naming the filter.
+    expect(isToolError(out)).toBe(true);
+    if (isToolError(out)) expect(out.error_message).toContain('clean/smudge filter');
   });
 
-  test('disables a REQUIRED filter without breaking diff/status (LFS-style required=true)', async () => {
-    // Mimic Git LFS (filter.lfs.required=true): a required filter bound to a
-    // file. Pinning the command to empty ALONE makes git treat the now-empty
-    // REQUIRED filter as a FATAL failure (exit 128) on a dirty tracked file;
-    // the tool must also pin required=false so diff/status still work.
+  test('fails closed on a REQUIRED filter-bound file instead of a corrupt pass-through (LFS-style)', async () => {
+    // Mimic Git LFS (filter.lfs.required=true) with a TRANSFORMING clean so the
+    // corruption is real: clean lowercases ("contracts to a pointer"). After
+    // commit the index holds the cleaned form ("hello") while the worktree
+    // holds the expanded form ("HELLO"), so big.bin is UNCHANGED under the
+    // filter — yet a raw-vs-cleaned comparison (filter disabled) reports it as
+    // modified. That false positive is what the tool must never emit.
     writeFileSync(join(dir, '.gitattributes'), '*.bin filter=lfsish\n');
-    run(['config', 'filter.lfsish.clean', 'cat']);
-    run(['config', 'filter.lfsish.smudge', 'cat']);
+    run(['config', 'filter.lfsish.clean', 'tr A-Z a-z']);
+    run(['config', 'filter.lfsish.smudge', 'tr a-z A-Z']);
     run(['config', 'filter.lfsish.required', 'true']);
-    writeFileSync(join(dir, 'big.bin'), 'v1\n');
+    writeFileSync(join(dir, 'big.bin'), 'HELLO\n');
     run(['add', '-A']);
     run(['commit', '-q', '-m', 'add bin']);
-    writeFileSync(join(dir, 'big.bin'), 'v2-dirty\n'); // dirty the required-filtered file
+    // big.bin is UNCHANGED in the worktree (index "hello" vs worktree "HELLO").
 
-    // Positive control: pinning the command empty WITHOUT required=false
-    // breaks a worktree diff with exit 128.
-    const broken = Bun.spawnSync(
+    // Positive control: the old behavior (pin empty + required=false) reports
+    // the unchanged file as modified — the corruption the fix removes.
+    const corrupt = Bun.spawnSync(
       [
         'git',
         '-c',
         'filter.lfsish.clean=',
         '-c',
-        'filter.lfsish.smudge=',
-        '-c',
-        'filter.lfsish.process=',
-        'diff',
+        'filter.lfsish.required=false',
+        'status',
+        '--porcelain',
       ],
       { cwd: dir },
     );
-    expect(broken.exitCode).toBe(128);
+    expect(new TextDecoder().decode(corrupt.stdout)).toContain('big.bin');
 
-    // The tool also pins required=false → diff and status succeed.
+    // The fix forces required=true → both diff and status fail closed, naming
+    // the file, rather than surface that corrupt comparison.
     const diff = await gitTool.execute({ mode: 'diff' }, makeCtx({ cwd: dir }));
-    if (isToolError(diff)) throw new Error(diff.error_message);
-    expect(diff.output).toContain('big.bin');
+    expect(isToolError(diff)).toBe(true);
+    if (isToolError(diff)) expect(diff.error_message).toContain('big.bin');
     const status = await gitTool.execute({ mode: 'status' }, makeCtx({ cwd: dir }));
-    if (isToolError(status)) throw new Error(status.error_message);
-    expect(status.output).toContain('big.bin');
+    expect(isToolError(status)).toBe(true);
+    if (isToolError(status)) expect(status.error_message).toContain('clean/smudge filter');
   });
 
   test('does not exec a diff.external driver (repo-local config exec vector)', async () => {
@@ -933,5 +940,68 @@ describe('git sandbox env forwarding', () => {
     });
     expect(hasSetenv(argv, 'GIT_CONFIG_GLOBAL', '/dev/null')).toBe(true);
     expect(hasSetenv(argv, 'TMPDIR', '/tmp/forja-session-abc')).toBe(false);
+  });
+});
+
+describe.if(GIT_AVAILABLE)('gitTool — clean/smudge filter (LFS) safety', () => {
+  let dir: string;
+
+  const run = (cmd: string[]) => {
+    const p = Bun.spawnSync(['git', ...cmd], { cwd: dir });
+    if (p.exitCode !== 0) {
+      throw new Error(`git ${cmd.join(' ')} failed: ${new TextDecoder().decode(p.stderr)}`);
+    }
+  };
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'forja-git-lfs-'));
+    run(['init', '-q']);
+    run(['config', 'user.email', 't@t.t']);
+    run(['config', 'user.name', 'T']);
+    // Simulate an LFS-style REQUIRED filter without needing git-lfs: a `clean`
+    // that contracts (worktree -> "pointer") and a `smudge` that expands. The
+    // index then holds the cleaned form while the worktree holds the expanded
+    // form, so an UNCHANGED filtered file still differs raw-vs-cleaned — the
+    // exact shape that made the old pass-through report it as modified.
+    run(['config', 'filter.lfsish.clean', 'tr A-Z a-z']);
+    run(['config', 'filter.lfsish.smudge', 'tr a-z A-Z']);
+    run(['config', 'filter.lfsish.required', 'true']);
+    writeFileSync(join(dir, '.gitattributes'), '*.bin filter=lfsish\n');
+    writeFileSync(join(dir, 'data.bin'), 'HELLO\n');
+    mkdirSync(join(dir, 'src'));
+    writeFileSync(join(dir, 'src', 'main.txt'), 'plain\n');
+    run(['add', '-A']);
+    run(['commit', '-q', '-m', 'init']);
+    // index: data.bin = clean("HELLO") = "hello"; worktree stays "HELLO".
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('path-scoped status of unfiltered files still works on a filtered repo', async () => {
+    // Monorepo case: an LFS asset elsewhere must not break a diff/status that
+    // only touches unfiltered files. From src/ there is no .bin in scope, so
+    // the worktree comparison never invokes the disabled filter.
+    writeFileSync(join(dir, 'src', 'main.txt'), 'plain CHANGED\n');
+    const out = await gitTool.execute({ mode: 'status' }, makeCtx({ cwd: join(dir, 'src') }));
+    if (isToolError(out)) {
+      throw new Error(`expected success, got refusal: ${out.error_message}`);
+    }
+    expect(out.exit_code).toBe(0);
+    expect(out.output).toContain('main.txt');
+  });
+
+  test('show_file reads the stored blob (pointer) without tripping the filter', async () => {
+    // show_file uses `cat-file blob` — no worktree clean — so it stays usable
+    // for filter-bound paths and returns the committed (cleaned) content.
+    const out = await gitTool.execute(
+      { mode: 'show_file', path: 'data.bin' },
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(out)) {
+      throw new Error(`expected success, got refusal: ${out.error_message}`);
+    }
+    expect(out.output).toContain('hello');
   });
 });
