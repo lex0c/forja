@@ -148,9 +148,9 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
   if (subagentCount > 0) {
     rightParts.push(paint(caps, 'success', `${subagentCount} subagents`));
   }
-  if (status.model !== null && status.model !== '') {
-    rightParts.push(dim(caps, status.model));
-  }
+  // Model is NOT shown here — it moved to the startup banner's identity line
+  // (render/permanent.ts) so the footer stays focused on live, changing signal
+  // (counts / tokens / cost) rather than a static chip.
   // Non-cache compute (input + output) and cache (read + creation) are
   // shown as two disjoint chips that sum back to the grand total. Cache
   // is provider-reported and billed, but far cheaper than input, so the
@@ -175,8 +175,8 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
   const leftW = visualWidth(left);
   const rightW = visualWidth(right);
   // Symmetric margins (UI.md §6.3): 2sp on the left already, mirror
-  // it on the right so the trailing chip (model name in particular)
-  // doesn't kiss the terminal edge.
+  // it on the right so the trailing chip (cost / tokens) doesn't kiss
+  // the terminal edge.
   const padding = ' '.repeat(Math.max(0, caps.cols - 2 * FRAME_MARGIN_WIDTH - leftW - rightW));
   return `${FRAME_MARGIN}${left}${padding}${right}${FRAME_MARGIN}`;
 };

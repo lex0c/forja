@@ -142,11 +142,12 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       return ['', paint(caps, 'secondary', verb)].map(padFrame);
     }
     case 'session-banner': {
-      // Two stacked lines: `<app> <version>` and `<cwd>`. The
-      // identity (model · ctx · max out) and env (flags / meta)
-      // blocks were dropped — model lives in the footer chips and
-      // the env detail was low-signal at boot. `item.env` still
-      // flows into the PermanentItem for NDJSON / audit consumers.
+      // Three stacked lines: `<app> <version>`, `<model> · effort <level>`,
+      // and `<cwd>`. The model + effort identity sits right under the version
+      // (moved here FROM the footer chips, which no longer carry the model) so
+      // the operator confirms what's loaded at a glance on boot. The env
+      // (flags / meta) block stays dropped — low-signal at boot — but
+      // `item.env` still flows into the PermanentItem for NDJSON / audit.
       //
       // The affirmative "✓ sandbox enforcement active" line was dropped
       // from the banner — boot greenlight noise the operator doesn't act
@@ -155,8 +156,11 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // operator-override / degraded passthrough) still surface on the
       // warn/error channels, since those ARE warnings.
       const versionDisplay = item.version.startsWith('v') ? item.version : `v${item.version}`;
+      const identity =
+        item.effort !== undefined ? `${item.model} · effort ${item.effort}` : item.model;
       const lines = [
         `${paint(caps, 'bold', item.app)} ${paint(caps, 'secondary', versionDisplay)}`,
+        paint(caps, 'secondary', identity),
         paint(caps, 'secondary', item.cwd),
       ];
       return lines.map(padFrame);

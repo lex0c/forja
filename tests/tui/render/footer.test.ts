@@ -83,7 +83,7 @@ describe('renderFooter', () => {
     expect(out).toContain('supervised mode on');
   });
 
-  test('idle state: operation-mode cue left, model + cost right (step chip removed)', () => {
+  test('idle state: operation-mode cue left, cost right (step chip removed)', () => {
     const out = renderFooter(startedSession(), caps);
     expect(out).not.toBeNull();
     // The operation-mode cue replaced the old `? for help` hint
@@ -93,7 +93,8 @@ describe('renderFooter', () => {
     // Newline hint pairs with the input editor's backslash
     // continuation (UI.md §5.4).
     expect(out).toContain('\\+Enter newline');
-    expect(out).toContain('sonnet-4.6');
+    // Model is no longer a footer chip (it moved to the startup banner).
+    expect(out).not.toContain('sonnet-4.6');
     // Current-turn cost surfaces beside the token count (2-decimal).
     expect(out).toContain('$0.01');
     // The step counter stays out of the footer — low-signal next to
@@ -289,11 +290,11 @@ describe('renderFooter', () => {
       expect(out).not.toContain('bash bg');
     });
 
-    test('leads the right cluster — bg reads before the static model chip', () => {
+    test('leads the right cluster — bg reads before the cumulative cost chip', () => {
       const s = startedSession();
       s.bgProcesses.set('p1', { processId: 'p1', command: 'npm run dev' });
       const out = renderFooter(s, caps) ?? '';
-      expect(out.indexOf('1 bash bg')).toBeLessThan(out.indexOf('sonnet-4.6'));
+      expect(out.indexOf('1 bash bg')).toBeLessThan(out.indexOf('$0.01'));
     });
 
     test('painted success (green) — distinct from the dim cumulative chips', () => {
@@ -341,12 +342,12 @@ describe('renderFooter', () => {
   });
 
   describe('session-total tokens chip', () => {
-    test('renders compact `Nk tokens` right after the model chip', () => {
+    test('renders compact `Nk tokens` before the cumulative cost chip', () => {
       const out = renderFooter(startedSession({ sessionTotalTokens: 12_400 }), caps) ?? '';
       expect(out).toContain('12k tokens');
-      // Order: model · tokens. Tokens come right after model so the
-      // operator's load cluster reads identity → weight.
-      expect(out.indexOf('sonnet-4.6')).toBeLessThan(out.indexOf('12k tokens'));
+      // Order: tokens · cost. Tokens lead the cumulative cluster so the
+      // operator reads weight → spend.
+      expect(out.indexOf('12k tokens')).toBeLessThan(out.indexOf('$0.01'));
     });
 
     test('zero tokens drops the chip entirely', () => {
@@ -414,18 +415,16 @@ describe('renderFooter', () => {
   });
 
   describe('"always visible" lead chips before session:start', () => {
-    test('model + tokens render even with sessionId null', () => {
-      // Simulates the boot window: banner landed (model stamped),
-      // tokens accumulated via assistant:end, but the user hasn't
-      // submitted yet so sessionId is still null.
+    test('tokens render even with sessionId null', () => {
+      // Simulates the boot window: tokens accumulated via assistant:end,
+      // but the user hasn't submitted yet so sessionId is still null. The
+      // cumulative chips surface regardless of session lifecycle.
       const s = createInitialState();
       s.status = {
         ...s.status,
-        model: 'anthropic/claude-opus-4-7',
         sessionTotalTokens: 12_400,
       };
       const out = renderFooter(s, caps) ?? '';
-      expect(out).toContain('anthropic/claude-opus-4-7');
       expect(out).toContain('12k tokens');
     });
   });
@@ -528,26 +527,16 @@ describe('renderFooter', () => {
   });
 
   test('overflow: long content collapses padding to 0 (truncation kicks in upstream)', () => {
-    // Stuff the model name to push the right column past caps.cols.
+    // Squeeze caps.cols below the left cluster's width so
     // visualWidth(left) + visualWidth(right) > caps.cols → padding=0.
     // The renderer's truncateToWidth handles the actual clip; the
     // footer just delivers a longer-than-cols line without crashing.
-    const wide = startedSession({ model: 'a'.repeat(200) });
-    const out = renderFooter(wide, caps);
+    const narrow: Capabilities = { ...caps, cols: 10 };
+    const out = renderFooter(startedSession(), narrow);
     expect(out).not.toBeNull();
     // No padding spaces between left and right means they touch.
     // visualWidth strips ANSI; result will exceed caps.cols.
-    expect(visualWidth(out ?? '')).toBeGreaterThanOrEqual(caps.cols);
-  });
-
-  test('pre-session: model visible before sessionId is set', () => {
-    // Model chip is "always visible" — surfaces as soon as
-    // session:banner lands (before sessionId is set on
-    // session:start), and stays across idle gaps between turns.
-    const half = createInitialState();
-    half.status = { ...half.status, model: 'sonnet-4.6' };
-    const out = renderFooter(half, caps);
-    expect(out).toContain('sonnet-4.6');
+    expect(visualWidth(out ?? '')).toBeGreaterThanOrEqual(narrow.cols);
   });
 
   describe('slash popover open suppresses help hints', () => {
@@ -565,11 +554,11 @@ describe('renderFooter', () => {
       expect(out).not.toContain('\\+Enter newline');
     });
 
-    test('right column stays intact (model still visible)', () => {
+    test('right column stays intact (cumulative chips still visible)', () => {
       const s = startedSession();
       s.slash = { suggestions: [], selectedIdx: -1 };
       const out = renderFooter(s, caps);
-      expect(out).toContain('sonnet-4.6');
+      expect(out).toContain('$0.01');
     });
 
     test('interrupt cue still surfaces if a run is in flight', () => {
@@ -670,9 +659,9 @@ describe('renderFooter', () => {
       const s = startedSession();
       s.exitArmed = { at: 1000 };
       const out = renderFooter(s, caps);
-      // The model remains in the right column — the gate only
+      // The cumulative chips remain in the right column — the gate only
       // takes over the left.
-      expect(out).toContain('sonnet-4.6');
+      expect(out).toContain('$0.01');
     });
   });
 });
