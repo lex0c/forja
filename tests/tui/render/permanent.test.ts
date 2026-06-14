@@ -1179,7 +1179,15 @@ describe('formatPermanent', () => {
   });
 
   describe('subagent_summary (S2 of subagent IPC)', () => {
-    test('done shape includes name + summary + duration', () => {
+    test('subagent_group_header renders `● Subagents` flush-left (leading blank, col 0)', () => {
+      const out = formatPermanent({ kind: 'subagent_group_header', ts: 1 }, unicode);
+      expect(out).toEqual(['', '● Subagents']);
+      // col 0 — the `●` sits flush-left (the `● …` blocks below keep the
+      // 2-space margin and indent under this parent glyph).
+      expect(out[1]?.startsWith('●')).toBe(true);
+    });
+
+    test('done shape: name + verb + duration; the child summary is NOT echoed', () => {
       const out = formatPermanent(
         {
           kind: 'subagent_summary',
@@ -1197,8 +1205,9 @@ describe('formatPermanent', () => {
       );
       expect(out).toHaveLength(1);
       expect(out[0]).toContain('● explore · Done');
-      expect(out[0]).toContain('README at /repo/README.md');
       expect(out[0]).toContain('5.0s');
+      // The verbose child summary is the parent's reply, not block noise.
+      expect(out[0]).not.toContain('README at /repo/README.md');
     });
 
     test('aggregated-by-type trail: header + one line per tool type', () => {
@@ -1415,7 +1424,7 @@ describe('formatPermanent', () => {
       expect(out[0]?.startsWith('  *')).toBe(true);
     });
 
-    test('truncates summary >80 chars with ellipsis', () => {
+    test('a long child summary is dropped from the block (not echoed or truncated in)', () => {
       const long = 'x'.repeat(200);
       const out = formatPermanent(
         {
@@ -1432,9 +1441,10 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out[0]?.includes('…')).toBe(true);
-      // The truncated summary plus chrome should still be a single line.
       expect(out).toHaveLength(1);
+      // None of the summary leaks into the block — not even truncated.
+      expect(out[0]).not.toContain('x');
+      expect(out[0]).toContain('Done');
     });
 
     test('empty summary: metric bracket follows the verb with the standard 2-space gap', () => {

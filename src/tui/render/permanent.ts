@@ -469,6 +469,16 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       const body = paint(caps, 'secondary', ` ${item.message}`);
       return ['', `${prefix}${body}`].map(padFrame);
     }
+    case 'subagent_group_header': {
+      // `● Subagents` group title over a burst of finishing subagents.
+      // Carries the same `●` chip glyph as a tool/subagent head, but at
+      // COL 0 (NOT frame-padded) so it reads as the parent of the `  ● …`
+      // blocks below, which keep their 2-space margin and indent under it.
+      // Plain (default/white); a leading blank separates the group from
+      // prior scrollback.
+      const headGlyph = caps.unicode ? CHIP_FINAL_GLYPH.unicode : CHIP_FINAL_GLYPH.ascii;
+      return ['', `${headGlyph} Subagents`];
+    }
     case 'subagent_summary': {
       // One-line scrollback summary for a subagent run. Mirrors
       // tool-end's compact shape: `● task <name> Done <summary>  [1m2s]`
@@ -526,19 +536,14 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
         return 'Failed';
       };
       const verb = verbFor(item.status, item.reason, item.costUsd);
-      // Truncate the summary so a verbose child doesn't blow out
-      // the line — the renderer's frame width is the operator's
-      // budget, not the producer's.
-      const maxSummary = 80;
-      const trimmedSummary = item.summary.replace(/\s+/g, ' ').trim();
-      const summary =
-        trimmedSummary.length > maxSummary
-          ? `${trimmedSummary.slice(0, maxSummary - 1)}…`
-          : trimmedSummary;
       const color = item.status === 'done' ? 'secondary' : 'error';
-      // Header: `● <name> · <verb>[ · <summary>] · N tools · <dur>[ · $X.XX]`.
+      // Header: `● <name> · <verb> · N tools · <dur>[ · $X.XX]`. The child's
+      // own `summary` (often a verbose first-person preamble) is NOT shown
+      // here — the actual answer is already relayed in the parent's
+      // response text, so echoing a truncated preview in the block is just
+      // noise. The block is the "what it DID" record (verb + tool trail +
+      // cost); the content lives in the parent's reply.
       const segs = [`${glyph} ${item.name}`, verb];
-      if (summary.length > 0) segs.push(summary);
       if (item.toolTotal > 0) segs.push(`${item.toolTotal} tool${item.toolTotal === 1 ? '' : 's'}`);
       segs.push(formatChipDuration(item.durationMs));
       if (item.costUsd > 0) segs.push(`$${formatDollars(item.costUsd)}`);

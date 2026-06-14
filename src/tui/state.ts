@@ -366,6 +366,12 @@ export interface LiveState {
   // no batch is pending. The buffer is INTERNAL to the reducer —
   // renderer never reads it directly.
   pendingToolEndBatch: PendingToolEndBatch | null;
+  // True iff the LAST item emitted to scrollback was a subagent block, so
+  // a following `subagent:end` coalesces under the SAME `Subagent` title
+  // (no repeat). Owned by the `applyEvent` wrapper: set on a subagent
+  // block, cleared by any other scrollback emission (incl. a tool batch
+  // flushing between two subagent completions). Renderer never reads it.
+  subagentTitleShown: boolean;
   pendingAssistant: PendingAssistant | null;
   // `messageId` carried alongside `startedAt` so the thinking
   // chip can hash a stable per-turn seed when picking its
@@ -595,6 +601,7 @@ export const createInitialState = (): LiveState => ({
   },
   activeTools: new Map(),
   pendingToolEndBatch: null,
+  subagentTitleShown: false,
   pendingAssistant: null,
   thinking: null,
   awaitingProvider: null,
@@ -750,6 +757,15 @@ export type PermanentItem =
       durationMs: number;
     }
   | { kind: 'recap-terse'; message: string }
+  | {
+      // `Subagent` group title — emitted by the `applyEvent` wrapper
+      // before the FIRST subagent block of a consecutive run, so a burst
+      // of finishing subagents reads as one titled group in scrollback
+      // (mirrors how coalesced tools share a head). Renders as a single
+      // col-0 plain line.
+      kind: 'subagent_group_header';
+      ts: number;
+    }
   | {
       // Subagent run terminal summary, emitted from the
       // `subagent:end` reducer branch. Renderer formats as a
@@ -994,6 +1010,12 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           // bgProcesses intentionally NOT reset (see boundary comment
           // above) — bash_background processes survive the turn.
           subagents: new Map(),
+          // Reset the scrollback title-run flag at the turn boundary: a new
+          // turn's first subagent burst must re-show the `● Subagents`
+          // title even if the prior turn ended on a subagent block (the
+          // boundary itself emits no permanent, so the wrapper can't clear
+          // it for us). Mirrors the pendingToolEndBatch drop below.
+          subagentTitleShown: false,
           parallelStatus: null,
           // Per-session: a stale "Awaiting model" indicator from a
           // crashed prior run (e.g., resume after parent crash mid-
@@ -2425,11 +2447,40 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
 //   for everything else, treat the field as opaque.
 export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
   const inner = applyEventInner(state, event);
-  if (event.type === 'tool:end') return inner;
+  if (event.type === 'tool:end') {
+    // tool:end NEVER flushes here (it coalesces into pendingToolEndBatch).
+    // But a BYPASSED tool-end — one that emits its chip immediately rather
+    // than buffering (failed/denied status, an exit code, a diff, a
+    // summary) — lands a non-subagent block in scrollback, so it ends a
+    // subagent title-run. A BUFFERED tool-end emits no permanent yet, so it
+    // leaves the flag: the buffer re-titles via `flushed.permanent` when it
+    // flushes on the next event.
+    if (inner.permanent.length > 0 && state.subagentTitleShown) {
+      return { state: { ...inner.state, subagentTitleShown: false }, permanent: inner.permanent };
+    }
+    return inner;
+  }
   if (inner.permanent.length === 0) return inner;
   const flushed = flushPendingToolEndBatch(inner.state);
+  // Subagent group title: a `subagent:end` emits a `subagent_summary`
+  // block. Prepend a single `Subagent` header ONLY when the preceding
+  // scrollback wasn't already a subagent block (a fresh run) — including
+  // when a tool batch just flushed between two completions (flushed
+  // items break the run). Any OTHER scrollback-emitting event clears the
+  // flag, so the next burst re-titles. This coalesces a parallel batch of
+  // finishing subagents under one title (like tools share a head).
+  if (event.type === 'subagent:end') {
+    const startRun = !state.subagentTitleShown || flushed.permanent.length > 0;
+    const title: PermanentItem[] = startRun
+      ? [{ kind: 'subagent_group_header', ts: event.ts }]
+      : [];
+    return {
+      state: { ...flushed.state, subagentTitleShown: true },
+      permanent: [...flushed.permanent, ...title, ...inner.permanent],
+    };
+  }
   return {
-    state: flushed.state,
+    state: { ...flushed.state, subagentTitleShown: false },
     permanent: [...flushed.permanent, ...inner.permanent],
   };
 };

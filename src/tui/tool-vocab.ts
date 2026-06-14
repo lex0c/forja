@@ -114,6 +114,25 @@ export const TOOL_VOCAB: Readonly<Record<string, ToolVocab>> = {
     finalVerb: 'Grepped',
     subject: (a) => str(a.pattern),
   },
+  git: {
+    activeVerb: 'Running git',
+    finalVerb: 'Ran git',
+    // Show WHAT ran, not a bare `git`: `<mode> [--stat/--staged] [<ref>]
+    // [<path>]`. So the chip reads `Ran git · log src/foo.ts` /
+    // `Ran git · diff --staged` / `Ran git · show_file v1 old.ts`.
+    subject: (a) => {
+      const mode = str(a.mode);
+      if (mode === null) return null;
+      const parts = [mode];
+      if (a.stat === true) parts.push('--stat');
+      if (a.staged === true) parts.push('--staged');
+      const ref = str(a.ref);
+      if (ref !== null) parts.push(ref);
+      const path = str(a.path);
+      if (path !== null) parts.push(path);
+      return parts.join(' ');
+    },
+  },
   task: {
     // Verb stays bare — the subject already carries the agent name;
     // saying "Delegating to subagent / └─ reviewer" duplicates

@@ -2,6 +2,29 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] tui(subagents): group scrollback blocks under a `● Subagents` title; git chip subject
+
+Follow-ups to the subagent rework (UI-first; live-validated in the binary).
+
+SCROLLBACK GROUPING. A burst of finishing subagents now reads as one titled
+group: `● Subagents` (the chip `●` glyph, flush-left at col 0, default color)
+over the `  ● <name> · <verb> · N tools · dur · cost` blocks, which keep the
+2-space margin and indent under it. The child's own `summary` (a verbose
+first-person preamble) is NO LONGER echoed in the block — the actual answer is
+already relayed in the parent's reply, so a truncated preview there was noise.
+The title is owned by the `applyEvent` wrapper via a `subagentTitleShown` flag:
+emitted before the FIRST block of a run, suppressed for consecutive ones, and the
+run is broken (re-titles) by any other scrollback emission. A code-review pass on
+the wrapper caught + fixed two leaks in that flag: a BYPASSED tool-end (emits its
+chip immediately rather than buffering) now clears the flag (else the next burst
+went untitled with the tool wedged in), and `session:start` resets it at the turn
+boundary (it emits no permanent, so the wrapper couldn't).
+
+GIT CHIP SUBJECT. The `git` tool gained a tool-vocab entry so its scrollback chip
+shows WHAT ran — `Ran git · log src/foo.ts` / `diff --staged` / `show_file v1
+old.ts` — instead of a bare `Called git`. Also brought `git` and the `task_*`
+family into the vocab-lockstep test list (real builtins that were missing it).
+
 ## [2026-06-14] tui(subagents): grouped live section above Tasks + aggregated scrollback block
 
 Reworked how subagents render. (UI-first per the iterate-before-spec rule; UI.md
