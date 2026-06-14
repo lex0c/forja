@@ -2,6 +2,27 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] git tool: gate a collapsed untracked status dir as a subtree
+
+Review finding (metadata leak). `git status -u normal` (the default) collapses an
+untracked directory into ONE record — `?? secrets/` (trailing slash) — instead of
+listing its files. The metadata filter gated that literal directory path, but a
+subtree deny (`deny_paths: ['secrets/**']`) does NOT match the bare `secrets`
+path, so under `allow_paths: ['**'] + deny_paths: ['secrets/**']` the record
+survived and leaked the EXISTENCE of the denied subtree.
+
+Fix: a trailing-slash (collapsed-dir) record is now gated as a SUBTREE — in
+addition to the literal path it must pass a synthetic-descendant probe
+(`<dir>/.forja-check`, mirroring the permission engine's own search-root probe),
+and the record is dropped if reading INTO the subtree is denied. Chose this over
+`--untracked-files=all` (the other option): `-u all` would enumerate every
+untracked file, exploding `status` output on big untracked trees (node_modules)
+into truncation, whereas the probe keeps the compact collapsed-dir view and gates
+it consistently with how the engine gates search roots. Files (no trailing slash)
+and ls_files records are unaffected. Test: an untracked `secrets/` under a
+`secrets/**`-style deny is dropped (with the hidden-count notice) while an allowed
+untracked `public/` is kept.
+
 ## [2026-06-13] git tool: don't forward TMPDIR through the sandbox passthrough
 
 Review finding (sandbox correctness). captureGit passed its full `spawnEnv` as

@@ -635,6 +635,12 @@ const resolveRepoRoot = async (
   return root.length > 0 ? root : null;
 };
 
+// Synthetic descendant appended to a collapsed untracked-directory record
+// to test whether reading INTO the subtree is denied (mirrors the
+// permission engine's own search-root probe of the same name; this glob
+// matches dotfiles under `**`, so it correctly trips a `dir/**` deny).
+const UNTRACKED_DIR_PROBE = '.forja-check';
+
 // Extract the repo-root-relative path from one NUL-framed metadata
 // record. ls_files (`--full-name`): the record IS the path. status
 // (`--short -z`): the status field is two columns + a space, so the path
@@ -699,7 +705,18 @@ const filterMetadataOutput = async (
       kept.push(record); // header / pathless — no name to gate
       continue;
     }
-    if (ctx.permissions.canReadPath(resolve(repoRoot, relPath))) {
+    const abs = resolve(repoRoot, relPath);
+    // A `git status -u normal` UNTRACKED DIRECTORY collapses into ONE record
+    // with a trailing slash (`?? secrets/`) instead of listing its files.
+    // The literal check catches a bare-dir deny, but a subtree glob
+    // (deny_paths: ['secrets/**']) does NOT match the directory path itself
+    // — so for a trailing-slash record ALSO gate a synthetic descendant,
+    // dropping it when reading INTO the subtree is denied. Otherwise the
+    // denied subtree's existence leaks through the collapsed name.
+    const readable =
+      ctx.permissions.canReadPath(abs) &&
+      (!relPath.endsWith('/') || ctx.permissions.canReadPath(resolve(abs, UNTRACKED_DIR_PROBE)));
+    if (readable) {
       kept.push(record);
     } else {
       hidden++; // denied → dropped

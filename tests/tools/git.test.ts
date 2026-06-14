@@ -271,6 +271,34 @@ describe.if(GIT_AVAILABLE)('gitTool — against a real repo', () => {
     expect(lsAll.output).toContain('secrets/key.txt');
   });
 
+  test('status gates a collapsed UNTRACKED directory as a subtree (no denied-subtree leak)', async () => {
+    // `git status -u normal` collapses an untracked dir into one record
+    // `?? secrets/` (trailing slash) instead of listing its files. A
+    // subtree deny (deny_paths: ['secrets/**']) does NOT match the bare
+    // `secrets` path, so gating the directory literally would still leak
+    // `?? secrets/`. The trailing-slash record must be gated as a subtree.
+    mkdirSync(join(dir, 'secrets'), { recursive: true });
+    writeFileSync(join(dir, 'secrets/key.txt'), 'SECRET\n');
+    mkdirSync(join(dir, 'public'), { recursive: true });
+    writeFileSync(join(dir, 'public/p.txt'), 'ok\n'); // an allowed untracked dir
+
+    // Mimics deny_paths: ['secrets/**'] — denies DESCENDANTS of secrets but
+    // not the bare `secrets` path (so a literal dir check would pass).
+    const denySubtree = makeCtx({
+      cwd: dir,
+      permissions: {
+        mode: 'strict',
+        posture: 'supervised',
+        canReadPath: (p) => !p.includes('/secrets/'),
+      },
+    });
+    const status = await gitTool.execute({ mode: 'status' }, denySubtree);
+    if (isToolError(status)) throw new Error(status.error_message);
+    expect(status.output).toContain('public/');
+    expect(status.output).not.toContain('secrets');
+    expect(status.output).toMatch(/hidden by policy/);
+  });
+
   test('status decomposes renames so the gate sees BOTH paths (no two-path record)', async () => {
     // Track a secret, then rename it to an allowed name + edit it. With
     // rename detection a status would emit `R secrets/s.txt -> a2.ts`,
