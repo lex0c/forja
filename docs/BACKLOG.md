@@ -2,6 +2,17 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] Add gpt-5-nano to the OpenAI capability matrix
+
+Fastest/cheapest GPT-5-base reasoning model ($0.05 / $0.40 per MTok, $0.005
+cached; 400K context / 128K output; cutoff 2024-05-31). Reasoning model, so it
+spreads OPENAI_REASONING_BASE (reasoning_effort on, sampling off → routed via
+Responses). extended_prompt_cache is overridden OFF: OpenAI's extended-retention
+list names `gpt-5` and `gpt-5-codex` but not the `-nano`/`-mini` sub-variants, so
+24h support is unconfirmed for nano — in-memory caching still applies, and the
+flag can flip to true once confirmed. Registry test iterates OPENAI_MODEL_NAMES
+dynamically, so no model-set assertion needed updating.
+
 ## [2026-06-14] OpenAI reasoning models: re-enable markdown output
 
 Reasoning models suppress markdown in their responses by default; OpenAI's

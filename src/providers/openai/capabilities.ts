@@ -87,6 +87,23 @@ export const OPENAI_CAPS: Record<string, ProviderCapabilities> = {
     cost_per_1k_cached_input: 0.175,
     notes: ['agentic coding; Responses API only'],
   },
+  // Fastest/cheapest GPT-5-base reasoning model. 400K context / 128K output,
+  // reasoning token support. Verified against developers.openai.com/api/docs/
+  // models/gpt-5-nano (knowledge cutoff 2024-05-31). NOTE: extended_prompt_cache
+  // is overridden OFF — OpenAI's extended-retention list names `gpt-5` and
+  // `gpt-5-codex` but NOT the `-nano`/`-mini` sub-variants, so 24h support is
+  // unconfirmed for nano; in-memory caching still applies. Flip to true if/when
+  // confirmed.
+  'gpt-5-nano': {
+    ...OPENAI_REASONING_BASE,
+    extended_prompt_cache: false,
+    context_window: 400_000,
+    output_max_tokens: 128_000,
+    cost_per_1k_input: 0.05,
+    cost_per_1k_output: 0.4,
+    cost_per_1k_cached_input: 0.005,
+    notes: ['fastest/cheapest GPT-5; summarization and classification'],
+  },
   'gpt-4o': {
     ...OPENAI_BASE,
     context_window: 128_000,
