@@ -124,7 +124,9 @@ describe('composeLive layout', () => {
     expect(out[1]).toBe(expectedRule(caps.cols, true));
     expect(out[2]).toBe('> ');
     expect(out[3]).toBe(expectedRule(caps.cols, true));
-    expect(out[4]).toContain('opus');
+    // Footer marker: the model moved to the banner, so anchor on the
+    // always-present mode cue instead.
+    expect(out[4]).toContain('supervised mode on');
   });
 
   test('active tool card sits ABOVE bottom anchor', () => {
@@ -157,7 +159,7 @@ describe('composeLive layout', () => {
     expect(out[6]).toBe(expectedRule(caps.cols, true));
     expect(out[7]).toBe('> ');
     expect(out[8]).toBe(expectedRule(caps.cols, true));
-    expect(out[9]).toContain('opus');
+    expect(out[9]).toContain('supervised mode on');
   });
 
   test('layered live region: tool cards → TodoList → pinned chip (top→bottom)', () => {
