@@ -162,6 +162,7 @@ describe('createOpenAIProvider — Responses routing for reasoning models', () =
       input?: unknown;
       temperature?: number;
       prompt_cache_key?: unknown;
+      prompt_cache_retention?: unknown;
     };
     expect(p.reasoning).toEqual({ effort: 'high' });
     expect(p.max_output_tokens).toBe(8);
@@ -172,6 +173,8 @@ describe('createOpenAIProvider — Responses routing for reasoning models', () =
     // cache-routing hint set on the Responses path (real OpenAI, no baseURL).
     expect(typeof p.prompt_cache_key).toBe('string');
     expect((p.prompt_cache_key as string).length).toBeGreaterThan(0);
+    // extended retention: gpt-5.x supports it → 24h on real OpenAI.
+    expect(p.prompt_cache_retention).toBe('24h');
   });
 
   test('omits prompt_cache_key on the Responses path when a custom baseURL is set', async () => {
@@ -193,7 +196,36 @@ describe('createOpenAIProvider — Responses routing for reasoning models', () =
     }
     // A custom endpoint may 400 on the unknown param — gate it off (mirrors
     // the Chat Completions path).
-    expect((handle.calls[0] as { prompt_cache_key?: unknown }).prompt_cache_key).toBeUndefined();
+    const p = handle.calls[0] as { prompt_cache_key?: unknown; prompt_cache_retention?: unknown };
+    expect(p.prompt_cache_key).toBeUndefined();
+    // Retention rides the same real-OpenAI gate — also omitted here.
+    expect(p.prompt_cache_retention).toBeUndefined();
+  });
+
+  test('opts out of extended retention when the env var disables it', async () => {
+    const prev = process.env.FORJA_OPENAI_PROMPT_CACHE_RETENTION;
+    process.env.FORJA_OPENAI_PROMPT_CACHE_RETENTION = 'in_memory';
+    try {
+      const handle = mockResponsesClient([
+        { type: 'response.created', response: { id: 'r' } },
+        { type: 'response.completed', response: {} },
+      ]);
+      const provider = createOpenAIProvider('gpt-5.4-mini', { client: handle.client });
+      for await (const _ of provider.generate({
+        model: 'gpt-5.4-mini',
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 8,
+        effort: 'high',
+      })) {
+        // drain
+      }
+      expect(
+        (handle.calls[0] as { prompt_cache_retention?: unknown }).prompt_cache_retention,
+      ).toBeUndefined();
+    } finally {
+      if (prev === undefined) delete process.env.FORJA_OPENAI_PROMPT_CACHE_RETENTION;
+      else process.env.FORJA_OPENAI_PROMPT_CACHE_RETENTION = prev;
+    }
   });
 
   test('gpt-5.4-mini generateConstrained via Responses returns args + usage', async () => {

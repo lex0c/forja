@@ -66,6 +66,23 @@ export const openaiPromptCacheKey = (req: GenerateRequest): string =>
     .update(stableStringify(req.tools ?? []))
     .digest('hex');
 
+// OpenAI extended prompt-cache retention (`prompt_cache_retention: '24h'`):
+// keep the cached prefix warm for up to 24h instead of the 5–10min in-memory
+// default, so a session's later turns still hit the cache after idle gaps —
+// parity with Anthropic's longer cache TTL. Only set on models that support it
+// (capability `extended_prompt_cache`) and on real OpenAI. Default ON; the env
+// var opts out for ZDR / data-residency-conscious users (the 24h policy may
+// offload key/value tensors to GPU-local storage) or compat endpoints that
+// 400 on the param: `in_memory` / `off` / `0` / `false` → disabled.
+const promptCacheRetentionFromEnv = (): '24h' | undefined => {
+  const v = process.env.FORJA_OPENAI_PROMPT_CACHE_RETENTION;
+  if (v === undefined || v === '') return '24h';
+  const norm = v.toLowerCase();
+  return norm === 'in_memory' || norm === 'off' || norm === '0' || norm === 'false'
+    ? undefined
+    : '24h';
+};
+
 // Resolve the `includeUsage` default from the environment for callers
 // who don't pass an explicit option (notably the registry factory used
 // by the CLI bootstrap, which forwards no options today). Truthy by
@@ -191,6 +208,13 @@ export const createOpenAIProvider = (
   }
 
   const includeUsage = options.includeUsage ?? includeUsageFromEnv();
+  // Extended prompt-cache retention, resolved once: only on real OpenAI (a
+  // custom baseURL may 400 on the param) and only for models whose capability
+  // advertises support. Undefined → the param is omitted entirely.
+  const promptCacheRetention =
+    options.baseURL === undefined && caps.extended_prompt_cache === true
+      ? promptCacheRetentionFromEnv()
+      : undefined;
   // Sampling gate (mirrors the Anthropic adapter). Reasoning models —
   // OpenAI's o-series and gpt-5.x — REJECT `temperature`/`top_p` with HTTP
   // 400 ("Unsupported parameter"). The capability opts those models out
@@ -233,6 +257,7 @@ export const createOpenAIProvider = (
     if (options.baseURL === undefined) {
       params.prompt_cache_key = openaiPromptCacheKey(req);
     }
+    if (promptCacheRetention !== undefined) params.prompt_cache_retention = promptCacheRetention;
     if (acceptsSampling && req.temperature !== undefined) params.temperature = req.temperature;
     if (acceptsSampling && req.top_p !== undefined) params.top_p = req.top_p;
     // Determinism intent (`PLAYBOOKS.md` §1.1
@@ -298,6 +323,7 @@ export const createOpenAIProvider = (
     };
     // Cache-routing hint — real OpenAI only (a custom baseURL may 400 on it).
     if (options.baseURL === undefined) params.prompt_cache_key = openaiPromptCacheKey(req);
+    if (promptCacheRetention !== undefined) params.prompt_cache_retention = promptCacheRetention;
     if (acceptsSampling && req.temperature !== undefined) params.temperature = req.temperature;
     if (acceptsSampling && req.top_p !== undefined) params.top_p = req.top_p;
 
@@ -365,11 +391,25 @@ export const createOpenAIProvider = (
     capabilities: caps,
     generate: useResponses
       ? (req: GenerateRequest) =>
-          generateViaResponses(client, modelName, caps, req, responsesCacheKey(req))
+          generateViaResponses(
+            client,
+            modelName,
+            caps,
+            req,
+            responsesCacheKey(req),
+            promptCacheRetention,
+          )
       : generate,
     generateConstrained: useResponses
       ? (req: ConstrainedRequest) =>
-          generateConstrainedViaResponses(client, modelName, caps, req, responsesCacheKey(req))
+          generateConstrainedViaResponses(
+            client,
+            modelName,
+            caps,
+            req,
+            responsesCacheKey(req),
+            promptCacheRetention,
+          )
       : generateConstrained,
     countTokens: (messages: ProviderMessage[]): Promise<number> =>
       Promise.resolve(estimateMessagesTokens(messages)),

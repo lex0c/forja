@@ -2,6 +2,32 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] OpenAI prompt-cache parity: extended (24h) retention
+
+OpenAI's prefix cache is automatic, but the in-memory default expires after
+5–10min of inactivity — so a REPL session's later turns miss the cache across
+idle gaps, while the Anthropic path keeps its prefix warm far longer. OpenAI now
+exposes `prompt_cache_retention: '24h'` (extended retention, offloading
+key/value tensors to GPU-local storage) on gpt-5.x + gpt-4.1; wiring it is the
+parity lever. `prompt_cache_key` (stable hash of system+tools) was already set —
+left as-is: coarse-by-prefix is correct for a single-user CLI (sequential
+sessions share the warmed prefix).
+
+Added an `extended_prompt_cache` capability (hoisted onto a shared
+OPENAI_REASONING_BASE for the four gpt-5.x models; gpt-4o stays out — it only
+has in-memory caching) and have the factory resolve the retention ONCE, gated on
+real OpenAI (custom baseURL may 400 on the param, like prompt_cache_key) AND the
+capability. Threaded through both the Chat Completions and Responses paths
+(stream + constrained). Env opt-out `FORJA_OPENAI_PROMPT_CACHE_RETENTION=
+in_memory|off` for ZDR / data-residency-conscious users or compat endpoints,
+mirroring the existing `FORJA_OPENAI_INCLUDE_USAGE` escape hatch. Capability-
+driven, not per-model special-casing in the adapter (the caps matrix is the
+reference impl).
+
+Spec note: PROVIDERS.md §3.2 still says OpenAI has "no controllable prompt
+cache" — now outdated. Pending a spec PR (no spec edit made without an explicit
+request).
+
 ## [2026-06-14] Inject static operating guidance below the working-state panel
 
 Added a constant guidance block — `[workflow_discipline]` (when to return to

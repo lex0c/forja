@@ -95,6 +95,9 @@ export const generateViaResponses = (
   // Cache-routing hint computed by the factory (gated on a real-OpenAI
   // baseURL); passed in rather than imported to avoid an index.ts cycle.
   promptCacheKey?: string,
+  // Extended cache retention ('24h'), likewise resolved by the factory
+  // (real OpenAI + capability). Undefined → the param is omitted.
+  promptCacheRetention?: string,
 ): AsyncIterable<StreamEvent> =>
   (async function* () {
     const params: Record<string, unknown> = {
@@ -107,6 +110,7 @@ export const generateViaResponses = (
     if (req.system !== undefined) params.instructions = req.system;
     if (req.tools !== undefined) params.tools = toResponsesTools(req.tools);
     if (promptCacheKey !== undefined) params.prompt_cache_key = promptCacheKey;
+    if (promptCacheRetention !== undefined) params.prompt_cache_retention = promptCacheRetention;
     // Reasoning effort — the whole reason this path exists. `reasoning.effort`
     // (not the flat `reasoning_effort`), gated on the capability. No
     // temperature/top_p: reasoning models reject them (sampling gate).
@@ -125,6 +129,7 @@ export const generateConstrainedViaResponses = async (
   _caps: ProviderCapabilities,
   req: ConstrainedRequest,
   promptCacheKey?: string,
+  promptCacheRetention?: string,
 ): Promise<ConstrainedResult> => {
   if (req.tools !== undefined && req.tools.length > 0) {
     throw new Error(
@@ -150,6 +155,7 @@ export const generateConstrainedViaResponses = async (
   };
   if (req.system !== undefined) params.instructions = req.system;
   if (promptCacheKey !== undefined) params.prompt_cache_key = promptCacheKey;
+  if (promptCacheRetention !== undefined) params.prompt_cache_retention = promptCacheRetention;
   // Reasoning is intentionally omitted (default) — a structured render doesn't
   // need deep reasoning, and omitting it is faster/cheaper (mirrors the
   // Anthropic constrained path, which forwards no thinking).

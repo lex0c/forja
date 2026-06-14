@@ -41,6 +41,12 @@ export interface ProviderCapabilities {
   // Hints (non-blocking)
   recommended_max_tools_per_step?: number;
   prompt_template_dialect?: PromptDialect;
+  // The model supports an EXTENDED prompt-cache retention window (OpenAI's
+  // `prompt_cache_retention: '24h'`), keeping a cached prefix warm for up to
+  // 24h instead of the 5–10min in-memory default. Parity with Anthropic's 1h
+  // cache TTL: a session's later turns still hit the cache after idle gaps.
+  // Adapter-translated — only the OpenAI adapter reads it today; others omit.
+  extended_prompt_cache?: boolean;
 
   // Cost (USD per 1k tokens — values are illustrative per spec §5)
   cost_per_1k_input: number;

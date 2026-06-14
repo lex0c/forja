@@ -16,6 +16,17 @@ const OPENAI_BASE = {
   recommended_max_tools_per_step: 12,
 } as const satisfies Partial<ProviderCapabilities>;
 
+// gpt-5.x reasoning models share three traits: they accept `reasoning_effort`,
+// REJECT temperature/top_p (HTTP 400 — the adapter strips them), and support
+// OpenAI's extended (24h) prompt-cache retention. Hoisted so the set stays in
+// one place; the gpt-4o (non-reasoning) entries keep OPENAI_BASE.
+const OPENAI_REASONING_BASE = {
+  ...OPENAI_BASE,
+  supports_reasoning_effort: true,
+  supports_sampling: false,
+  extended_prompt_cache: true,
+} as const satisfies Partial<ProviderCapabilities>;
+
 // Costs follow PROVIDERS.md §5 verbatim where it lists OpenAI rows; pricing
 // should ultimately live in dynamic config.
 export const OPENAI_CAPS: Record<string, ProviderCapabilities> = {
@@ -36,38 +47,31 @@ export const OPENAI_CAPS: Record<string, ProviderCapabilities> = {
   // instead") — Forja's agentic loop always sends both, so gpt-5.x needs the
   // Responses API path (task #19). gpt-4o (non-reasoning) is unaffected.
   'gpt-5.5': {
-    ...OPENAI_BASE,
+    ...OPENAI_REASONING_BASE,
     context_window: 1_050_000,
     output_max_tokens: 128_000,
     cost_per_1k_input: 5.0,
     cost_per_1k_output: 30.0,
     cost_per_1k_cached_input: 0.5,
-    supports_reasoning_effort: true,
-    // Reasoning models reject temperature/top_p (HTTP 400) — adapter strips.
-    supports_sampling: false,
     notes: ['frontier reasoning model for coding and professional work'],
   },
   'gpt-5.4': {
-    ...OPENAI_BASE,
+    ...OPENAI_REASONING_BASE,
     context_window: 1_050_000,
     output_max_tokens: 128_000,
     cost_per_1k_input: 2.5,
     cost_per_1k_output: 15.0,
     cost_per_1k_cached_input: 0.25,
-    supports_reasoning_effort: true,
-    supports_sampling: false,
     notes: ['cost-efficient reasoning model for coding and professional work'],
   },
   'gpt-5.4-mini': {
-    ...OPENAI_BASE,
+    ...OPENAI_REASONING_BASE,
     // 400K, NOT the family's 1.05M — verified on the OpenAI model page.
     context_window: 400_000,
     output_max_tokens: 128_000,
     cost_per_1k_input: 0.75,
     cost_per_1k_output: 4.5,
     cost_per_1k_cached_input: 0.075,
-    supports_reasoning_effort: true,
-    supports_sampling: false,
     notes: ['most capable mini; coding, computer use, and subagents'],
   },
   // Codex family — agentic-coding-optimized, Responses-API only (no Chat
@@ -75,14 +79,12 @@ export const OPENAI_CAPS: Record<string, ProviderCapabilities> = {
   // low/medium/high/xhigh. Verified against developers.openai.com/api/docs/
   // models/gpt-5.3-codex (knowledge cutoff 2025-08-31).
   'gpt-5.3-codex': {
-    ...OPENAI_BASE,
+    ...OPENAI_REASONING_BASE,
     context_window: 400_000,
     output_max_tokens: 128_000,
     cost_per_1k_input: 1.75,
     cost_per_1k_output: 14,
     cost_per_1k_cached_input: 0.175,
-    supports_reasoning_effort: true,
-    supports_sampling: false,
     notes: ['agentic coding; Responses API only'],
   },
   'gpt-4o': {
