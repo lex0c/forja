@@ -90,6 +90,10 @@ describe('bootstrap', () => {
     expect(config.cwd).toBe(workdir);
     // No [sampling].effort in config → bootstrap applies DEFAULT_EFFORT.
     expect(config.effort).toBe('high');
+    // Primary-agent only: bootstrap (the one-shot + REPL entry) turns the static
+    // operating guidance on. Subagents build their config in subagent-child.ts,
+    // bypassing bootstrap, so they never set it.
+    expect(config.enableStaticGuidance).toBe(true);
     expect(
       config.toolRegistry
         .list()

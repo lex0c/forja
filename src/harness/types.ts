@@ -1056,6 +1056,16 @@ export interface HarnessConfig {
   // survives across turns; a one-shot run leaves it undefined and the loop
   // creates + clears a per-run store. In-memory, never persisted.
   workingStateStore?: WorkingStateStore;
+  // Inject the static operating guidance block ([workflow_discipline] +
+  // [engineering_principles]) at the bottom of [current_turn], below the
+  // working-state panel. Primary-agent only: the main CLI bootstrap (cli/
+  // bootstrap.ts) turns it on for the one-shot and REPL loops, while subagents
+  // (which build their config in cli/subagent-child.ts, bypassing bootstrap)
+  // leave it off — they have no working-state machinery, so guidance that says
+  // "keep the working state accurate" would be addressed to a panel that never
+  // renders. Default false also keeps programmatic/test runAgent callers' byte
+  // output unchanged.
+  enableStaticGuidance?: boolean;
   // Async hook the harness calls when the permission engine returns
   // a `confirm` decision. Caller resolves true to allow the call
   // (recorded as confirm_yes) or false to deny (confirm_no). When

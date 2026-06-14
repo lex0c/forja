@@ -3648,9 +3648,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // Seed the footer's operation-mode cue from the engine's posture so
     // a `--autonomous` boot shows Autonomous from the first frame.
     operationMode: baseConfig.permissionEngine.approvalPosture(),
-    // Seed the footer's effort chip from the resolved session effort
-    // (config/DEFAULT_EFFORT). Optional on the event; omitted only when
-    // unset, which after bootstrap doesn't happen on the main session.
+    // Seed the banner's identity line (model · effort) from the resolved
+    // session effort (config/DEFAULT_EFFORT). Optional on the event; omitted
+    // only when unset, which after bootstrap doesn't happen on the main session.
     ...(baseConfig.effort !== undefined ? { effort: baseConfig.effort } : {}),
     // §13.7 — when sandbox enforcement is active, append the line
     // inline inside the banner block (secondary, no leading blank).

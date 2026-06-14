@@ -650,6 +650,10 @@ export type PermanentItem =
       app: string;
       version: string;
       model: string;
+      // Initial effort level (config/DEFAULT_EFFORT at boot). Rendered on the
+      // banner's identity line beside the model; optional so non-CLI emitters
+      // that omit it still produce a valid banner.
+      effort?: ForjaEffort;
       contextWindow: number;
       maxOutputTokens: number;
       cwd: string;
@@ -1125,6 +1129,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             app: event.app,
             version: event.version,
             model: event.model,
+            ...(event.effort !== undefined ? { effort: event.effort } : {}),
             contextWindow: event.contextWindow,
             maxOutputTokens: event.maxOutputTokens,
             cwd: event.cwd,

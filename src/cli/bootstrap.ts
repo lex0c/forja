@@ -1469,6 +1469,11 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // Checkpoints (M3 §12): enabled for every CLI run by default
     // so users get `--undo` for free.
     enableCheckpoints: true,
+    // Primary-agent only: inject the static operating guidance block below the
+    // working-state panel. Set here (the main one-shot + REPL entry) and NOT in
+    // cli/subagent-child.ts, so subagents — which have no working-state panel —
+    // never receive it.
+    enableStaticGuidance: true,
     // Wire the subagent set so the `task` tool can resolve names.
     // Always passed (even when empty) — the tool surfaces a clear
     // "no subagents defined" hint instead of "registry missing"

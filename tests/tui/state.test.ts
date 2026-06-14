@@ -263,6 +263,7 @@ describe('session lifecycle', () => {
       app: 'forja',
       version: '0.0.0',
       model: 'anthropic/claude-sonnet-4-6',
+      effort: 'high',
       contextWindow: 200000,
       maxOutputTokens: 4096,
       cwd: '/home/lex/forja',
@@ -272,18 +273,20 @@ describe('session lifecycle', () => {
       ],
     });
     // Banner is the earliest signal carrying provider capabilities;
-    // mirror model + contextWindow onto status here (the footer renders
-    // the model chip from this during the idle boot window before the
-    // first `session:start`; contextWindow is retained for non-footer
-    // consumers).
+    // mirror model + contextWindow + effort onto status here (the banner
+    // renders model + effort from the permanent; status mirrors them so
+    // other surfaces have them during the idle boot window before the
+    // first `session:start`).
     expect(r.state.status.model).toBe('anthropic/claude-sonnet-4-6');
     expect(r.state.status.contextWindow).toBe(200000);
+    expect(r.state.status.effort).toBe('high');
     expect(r.permanent).toEqual([
       {
         kind: 'session-banner',
         app: 'forja',
         version: '0.0.0',
         model: 'anthropic/claude-sonnet-4-6',
+        effort: 'high',
         contextWindow: 200000,
         maxOutputTokens: 4096,
         cwd: '/home/lex/forja',

@@ -156,11 +156,17 @@ describe('formatPermanent', () => {
       ],
     };
 
-    test('emits title + cwd only — no identity, no env block', () => {
+    test('stacks title, model identity, and cwd — no env block', () => {
       expect(formatPermanent(baseBanner, unicode)).toEqual([
         pad('forja v0.1.0'),
+        pad('anthropic/claude-sonnet-4-6'),
         pad('/home/lex/forja'),
       ]);
+    });
+
+    test('appends effort to the identity line when set', () => {
+      const out = formatPermanent({ ...baseBanner, effort: 'high' }, unicode);
+      expect(out[1]).toBe(pad('anthropic/claude-sonnet-4-6 · effort high'));
     });
 
     test('version already prefixed with v is not double-prefixed', () => {
@@ -181,7 +187,7 @@ describe('formatPermanent', () => {
       // banner (boot noise the operator doesn't act on). The field still
       // rides on the PermanentItem for NDJSON / audit, but must not surface.
       const out = formatPermanent({ ...baseBanner, sandboxActive: 'bwrap' }, unicode);
-      expect(out).toHaveLength(2);
+      expect(out).toHaveLength(3);
       expect(out.join('\n')).not.toContain('sandbox enforcement active');
     });
 
@@ -200,7 +206,7 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out).toHaveLength(2);
+      expect(out).toHaveLength(3);
       const joined = out.join('\n');
       expect(joined).not.toContain('checkpoints');
       expect(joined).not.toContain('memory');
