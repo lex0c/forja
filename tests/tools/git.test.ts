@@ -102,6 +102,30 @@ describe('buildModeArgs — per-mode argv shape', () => {
     if (!('args' in r)) throw new Error('expected args');
     expect(r.args).toContain('HEAD^{commit}');
   });
+
+  test('show_file builds a cwd-relative cat-file blob ref (requires path)', () => {
+    expect('error' in buildModeArgs({ mode: 'show_file' })).toBe(true);
+    const r = buildModeArgs({ mode: 'show_file', ref: 'v1', path: 'src/a.ts' });
+    if (!('args' in r)) throw new Error('expected args');
+    // `cat-file blob` fails closed on a tree (a directory path can't dump a
+    // listing); the `./` prefix forces cwd-relative resolution.
+    expect(r.args.slice(0, 2)).toEqual(['cat-file', 'blob']);
+    expect(r.args).toContain('v1:./src/a.ts');
+    // Defaults the revision to HEAD.
+    const def = buildModeArgs({ mode: 'show_file', path: 'src/a.ts' });
+    if (!('args' in def)) throw new Error('expected args');
+    expect(def.args).toContain('HEAD:./src/a.ts');
+  });
+
+  test('stat is diff-only: diff carries --stat, other modes reject it', () => {
+    const d = buildModeArgs({ mode: 'diff', stat: true });
+    if (!('args' in d)) throw new Error('expected args');
+    expect(d.args).toContain('--stat');
+    // show + stat is rejected (its first-parent merge stat would bypass the
+    // combined-diff content gate).
+    expect('error' in buildModeArgs({ mode: 'show', stat: true })).toBe(true);
+    expect('error' in buildModeArgs({ mode: 'log', stat: true })).toBe(true);
+  });
 });
 
 // ── Functional: against a real temp repo ───────────────────────────
@@ -155,17 +179,17 @@ describe.if(GIT_AVAILABLE)('gitTool — against a real repo', () => {
   });
 
   test('caps output at OUTPUT_CAP_BYTES and flags truncated', async () => {
-    // A ~230 KB file → `git show HEAD` emits a diff well past the
-    // 64 KiB cap, exercising the byte-slice + SIGTERM truncation path.
-    const big = `${Array.from({ length: 5000 }, (_, i) => `line ${i} padding padding padding`).join('\n')}\n`;
+    // A ~410 KB file → `git show HEAD` emits a diff well past the
+    // 256 KiB cap, exercising the byte-slice + SIGTERM truncation path.
+    const big = `${Array.from({ length: 12000 }, (_, i) => `line ${i} padding padding padding`).join('\n')}\n`;
     writeFileSync(join(dir, 'big.txt'), big);
     run(['add', 'big.txt']);
     run(['commit', '-q', '-m', 'add big']);
     const out = await gitTool.execute({ mode: 'show', ref: 'HEAD' }, makeCtx({ cwd: dir }));
     if (isToolError(out)) throw new Error(out.error_message);
     expect(out.truncated).toBe(true);
-    // captured bytes never exceed the 64 KiB cap
-    expect(Buffer.byteLength(out.output, 'utf8')).toBeLessThanOrEqual(64 * 1024);
+    // captured bytes never exceed the 256 KiB cap
+    expect(Buffer.byteLength(out.output, 'utf8')).toBeLessThanOrEqual(256 * 1024);
     expect(out.output.length).toBeGreaterThan(0);
   });
 
@@ -350,6 +374,102 @@ describe.if(GIT_AVAILABLE)('gitTool — against a real repo', () => {
     }
   });
 
+  test('show_file returns a file’s content at a revision', async () => {
+    // a.ts was committed as `export const a = 1;` then the working tree is
+    // dirty — show_file reads the COMMITTED content, not the worktree.
+    writeFileSync(join(dir, 'a.ts'), 'export const a = 999;\n');
+    const out = await gitTool.execute(
+      { mode: 'show_file', ref: 'HEAD', path: 'a.ts' },
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(out)) throw new Error(out.error_message);
+    expect(out.output).toContain('export const a = 1;');
+    expect(out.output).not.toContain('999');
+  });
+
+  test('show_file resolves the path against cwd, not the repo root (subdir)', async () => {
+    mkdirSync(join(dir, 'pkg'), { recursive: true });
+    writeFileSync(join(dir, 'pkg/inner.ts'), 'export const inner = 1;\n');
+    writeFileSync(join(dir, 'inner.ts'), 'export const ROOT = 1;\n'); // a DIFFERENT file at root
+    run(['add', '-A']);
+    run(['commit', '-q', '-m', 'add inner']);
+    // From pkg/, `path: inner.ts` must read pkg/inner.ts (cwd-relative),
+    // NOT the root inner.ts — the `:./` form guarantees this.
+    const out = await gitTool.execute(
+      { mode: 'show_file', path: 'inner.ts' },
+      makeCtx({ cwd: join(dir, 'pkg') }),
+    );
+    if (isToolError(out)) throw new Error(out.error_message);
+    expect(out.output).toContain('inner = 1');
+    expect(out.output).not.toContain('ROOT');
+  });
+
+  test('show_file fails closed on a directory (no tree-listing / child-name leak)', async () => {
+    // A directory path must NOT dump the tree's child names (which the
+    // single-path gate never checks) — `cat-file blob` errors on a tree.
+    mkdirSync(join(dir, 'secrets'), { recursive: true });
+    writeFileSync(join(dir, 'secrets/key.txt'), 'SECRET\n');
+    run(['add', '-A']);
+    run(['commit', '-q', '-m', 'add secrets']);
+    const out = await gitTool.execute(
+      { mode: 'show_file', path: 'secrets' },
+      makeCtx({ cwd: dir }),
+    );
+    expect(isToolError(out)).toBe(true);
+    if (isToolError(out)) {
+      expect(out.error_code).toBe('tool.invalid_arg');
+      // The child name must not have leaked into the error/output.
+      expect(out.error_message).not.toContain('key.txt');
+    }
+  });
+
+  test('show_file refuses a policy-denied path', async () => {
+    writeFileSync(join(dir, '.env'), 'SECRET=1\n');
+    run(['add', '.env']);
+    run(['commit', '-q', '-m', 'add env']);
+    const denyEnv = makeCtx({
+      cwd: dir,
+      permissions: {
+        mode: 'strict',
+        posture: 'supervised',
+        canReadPath: (p) => !p.endsWith('.env'),
+      },
+    });
+    const out = await gitTool.execute({ mode: 'show_file', path: '.env' }, denyEnv);
+    expect(isToolError(out)).toBe(true);
+    if (isToolError(out)) expect(out.error_code).toBe('git.policy_denied');
+  });
+
+  test('stat emits a diffstat and is still content-gated', async () => {
+    writeFileSync(join(dir, 'a.ts'), 'export const a = 2;\n');
+    const stat = await gitTool.execute({ mode: 'diff', stat: true }, makeCtx({ cwd: dir }));
+    if (isToolError(stat)) throw new Error(stat.error_message);
+    // diffstat shape: a `file | N +/-` summary, not the `+export` patch body.
+    expect(stat.output).toMatch(/a\.ts\s*\|/);
+    expect(stat.output).not.toContain('+export const a = 2;');
+    // A denied file in the changeset still fails the content gate under stat.
+    writeFileSync(join(dir, '.env'), 'SECRET=1\n');
+    run(['add', '.env']);
+    run(['commit', '-q', '-m', 'env']);
+    writeFileSync(join(dir, '.env'), 'SECRET=2\n');
+    const denyEnv = makeCtx({
+      cwd: dir,
+      permissions: {
+        mode: 'strict',
+        posture: 'supervised',
+        canReadPath: (p) => !p.endsWith('.env'),
+      },
+    });
+    const gated = await gitTool.execute({ mode: 'diff', stat: true }, denyEnv);
+    expect(isToolError(gated)).toBe(true);
+    if (isToolError(gated)) expect(gated.error_code).toBe('git.policy_denied');
+    // show + stat is rejected outright (its first-parent merge stat would
+    // bypass the combined-diff content gate) — closes that vector.
+    const showStat = await gitTool.execute({ mode: 'show', stat: true }, makeCtx({ cwd: dir }));
+    expect(isToolError(showStat)).toBe(true);
+    if (isToolError(showStat)) expect(showStat.error_code).toBe('tool.invalid_arg');
+  });
+
   test('command field is a clean, copy-pasteable representation (no -z/peel/format noise)', async () => {
     const log = await gitTool.execute({ mode: 'log' }, makeCtx({ cwd: dir }));
     if (isToolError(log)) throw new Error(log.error_message);
@@ -394,13 +514,14 @@ describe.if(GIT_AVAILABLE)('gitTool — against a real repo', () => {
 
   test('refuses content modes when the file list overflows the capture cap', async () => {
     // Enough long-named tracked+modified files to push `--name-only -z`
-    // output past OUTPUT_CAP_BYTES (64 KiB); a partial list must not be
-    // gated and then leak the unseen tail.
-    const prefix = 'f'.repeat(150);
-    for (let i = 0; i < 500; i++) writeFileSync(join(dir, `${prefix}${i}.txt`), '1\n');
+    // output past OUTPUT_CAP_BYTES (256 KiB); a partial list must not be
+    // gated and then leak the unseen tail. ~240-byte names (under the
+    // 255-byte filename limit) × ~1150 files ≈ 286 KB.
+    const prefix = 'f'.repeat(240);
+    for (let i = 0; i < 1150; i++) writeFileSync(join(dir, `${prefix}${i}.txt`), '1\n');
     run(['add', '-A']);
     run(['commit', '-q', '-m', 'many']);
-    for (let i = 0; i < 500; i++) writeFileSync(join(dir, `${prefix}${i}.txt`), '2\n');
+    for (let i = 0; i < 1150; i++) writeFileSync(join(dir, `${prefix}${i}.txt`), '2\n');
     // Permissive policy — the refusal must come from truncation, not denial.
     const out = await gitTool.execute({ mode: 'diff' }, makeCtx({ cwd: dir }));
     expect(isToolError(out)).toBe(true);
@@ -502,11 +623,12 @@ describe.if(GIT_AVAILABLE)('gitTool — against a real repo', () => {
 
   test('fails closed when filter-config enumeration overflows the capture cap', async () => {
     // A hostile repo with more filter.<name>.clean entries than fit in
-    // the 64 KiB key-list cap: a partial pin could leave the ACTIVE
+    // the 256 KiB key-list cap: a partial pin could leave the ACTIVE
     // driver undisabled, so the tool must refuse rather than proceed.
+    // ~167-byte keys × ~1700 entries ≈ 285 KB of `--get-regexp` output.
     const name = 'f'.repeat(150);
     let cfg = '';
-    for (let i = 0; i < 600; i++) cfg += `[filter "${name}${i}"]\n\tclean = x\n`;
+    for (let i = 0; i < 1700; i++) cfg += `[filter "${name}${i}"]\n\tclean = x\n`;
     appendFileSync(join(dir, '.git', 'config'), cfg);
     writeFileSync(join(dir, 'a.ts'), 'export const a = 5;\n');
     const out = await gitTool.execute({ mode: 'diff' }, makeCtx({ cwd: dir }));

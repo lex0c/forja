@@ -29,7 +29,7 @@ import {
 // LIVE working tree — so `diff` / `status` see uncommitted changes,
 // which a HEAD-checked-out worktree would miss.
 
-export type GitMode = 'log' | 'show' | 'diff' | 'blame' | 'status' | 'ls_files';
+export type GitMode = 'log' | 'show' | 'show_file' | 'diff' | 'blame' | 'status' | 'ls_files';
 
 export interface GitInput {
   mode: GitMode;
@@ -38,6 +38,7 @@ export interface GitInput {
   max_count?: number;
   staged?: boolean;
   follow?: boolean;
+  stat?: boolean;
 }
 
 export interface GitOutput {
@@ -57,6 +58,7 @@ export interface GitOutput {
 export const GIT_MODES: ReadonlySet<string> = new Set([
   'log',
   'show',
+  'show_file',
   'diff',
   'blame',
   'status',
@@ -66,8 +68,19 @@ export const GIT_MODES: ReadonlySet<string> = new Set([
 const DEFAULT_LOG_COUNT = 50;
 const MAX_LOG_COUNT = 1000;
 // Hard cap on captured stdout. git `show`/`diff`/`blame` on a large
-// file can run to MBs; we stream and stop here, flag `truncated`.
-const OUTPUT_CAP_BYTES = 64 * 1024;
+// file can run to MBs; we stream and stop here, flag `truncated`. Sized
+// to match read_file's MAX_OUTPUT_BYTES (256 KiB) so a `show`/`diff` of a
+// real change usually completes rather than truncating mid-patch; the
+// `stat` mode + `path` scoping are the cheaper ways to survey a big diff.
+const OUTPUT_CAP_BYTES = 256 * 1024;
+
+// Grace window after we ask a git child to stop (the truncation SIGTERM,
+// or an abort that made Bun SIGTERM it) before escalating to an
+// uncatchable SIGKILL. Bounds the `await proc.exited` hang if the child
+// ignores SIGTERM — the structural backstop the broker has and this path,
+// unsandboxed, otherwise lacked. Only armed on the stop path; a normally
+// running git is awaited without a deadline.
+const REAP_GRACE_MS = 2_000;
 
 // A ref is positional, so a value beginning with `-` would be parsed
 // as a flag. We forbid that and restrict to the characters that
@@ -175,6 +188,19 @@ export const buildModeArgs = (args: GitInput): { args: string[] } | { error: str
     if (!REF_RE.test(ref)) return { error: 'ref contains unsupported characters' };
   }
 
+  // `stat` is `diff`-only. `show --stat` on a MERGE reports the FIRST-PARENT
+  // diffstat while the content gate's `--name-only` pre-flight uses
+  // COMBINED-diff semantics — so a file taken cleanly from the second
+  // parent is invisible to the gate but its name+churn appears in the
+  // stat (a denied-name leak). `diff` is always two-endpoint (never
+  // combined), so `diff --stat` is gate-consistent. For a single commit's
+  // stat, use `diff` with a range (e.g. ref: "HEAD~1..HEAD").
+  if (args.stat === true && mode !== 'diff') {
+    return {
+      error: 'stat is only supported for diff (for a commit, use a ref range like "HEAD~1..HEAD")',
+    };
+  }
+
   // Pathless modes get an explicit `-- .` (current directory) pathspec.
   // Without it, `status`/`log`/`diff`/`ls-files` operate REPO-WIDE even
   // when the session cwd is a repo subdirectory — so from `/repo/src` a
@@ -215,9 +241,28 @@ export const buildModeArgs = (args: GitInput): { args: string[] } | { error: str
       // Peel to a commit so `show` can only ever emit a (gated) commit
       // diff — a bare blob/tree ref would dump object content the
       // content-gate's `--name-only` pre-flight cannot enumerate. Kept
-      // in lockstep with nameOnlyArgs's show form.
+      // in lockstep with nameOnlyArgs's show form. (`stat` is rejected for
+      // show above — its first-parent enumeration would diverge from the
+      // gate's combined-diff `--name-only` on a merge.)
       return {
         args: ['show', '--no-ext-diff', '--no-textconv', `${ref ?? 'HEAD'}^{commit}`, ...pathspec],
+      };
+    case 'show_file':
+      // Print the CONTENT of one file at a revision via `git cat-file blob
+      // <rev>:./<path>` — a raw object read, deliberately NOT `git show`:
+      //   - cat-file blob FAILS CLOSED on a non-blob: a DIRECTORY path
+      //     (`git show <rev>:./dir`) would dump the tree's child NAMES,
+      //     which `show_file`'s single-path gate never checks and the
+      //     metadata name-filter doesn't cover — a filename leak. cat-file
+      //     blob errors ("bad file") on a tree, so only real files emit.
+      //   - it never runs textconv/filters/diff drivers (pure object
+      //     access), so there is no `.gitattributes`-driven exec to block.
+      // The `./` prefix forces git to resolve <path> relative to the CWD
+      // (a bare `<rev>:<path>` is repo-root-relative) so the file git reads
+      // is exactly the one the engine + execute gate on (resolve(cwd, path)).
+      if (path === undefined) return { error: 'show_file requires a path' };
+      return {
+        args: ['cat-file', 'blob', `${ref ?? 'HEAD'}:./${path}`],
       };
     case 'diff':
       return {
@@ -225,6 +270,7 @@ export const buildModeArgs = (args: GitInput): { args: string[] } | { error: str
           'diff',
           '--no-ext-diff',
           '--no-textconv',
+          ...(args.stat === true ? ['--stat'] : []),
           ...(args.staged === true ? ['--staged'] : []),
           ...(ref !== undefined ? [ref] : []),
           ...pathspec,
@@ -354,6 +400,32 @@ interface GitCapture {
   stderr: string;
 }
 
+// Reap a git child we've ASKED to stop (truncation SIGTERM, or an abort
+// that made Bun SIGTERM it), bounding the wait: race `proc.exited` against
+// a grace window and escalate to an uncatchable SIGKILL if it overruns.
+// Used only on the stop path — a normally running git is awaited with no
+// deadline (it may legitimately take seconds), so this never kills healthy
+// work. Without it, a child ignoring SIGTERM (reachable only on the
+// unsandboxed path — bwrap's --die-with-parent reaps for us) would hang
+// `await proc.exited`, and invoke-tool awaits execute() with no timeout.
+const reapWithGrace = async (proc: ReturnType<typeof Bun.spawn>): Promise<number> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const graced = new Promise<'grace'>((res) => {
+    timer = setTimeout(() => res('grace'), REAP_GRACE_MS);
+  });
+  const winner = await Promise.race([proc.exited.then(() => 'exited' as const), graced]);
+  if (winner === 'grace') {
+    try {
+      proc.kill('SIGKILL');
+    } catch {
+      // already gone
+    }
+  }
+  const code = await proc.exited;
+  if (timer !== undefined) clearTimeout(timer);
+  return code;
+};
+
 // Run one hardened git invocation and capture stdout (byte-capped) +
 // exit + stderr. Returns a ToolError for spawn/stream failures; the
 // caller inspects exit/stderr for command-level errors. Shared by the
@@ -429,7 +501,12 @@ const captureGit = async (
     return toolError(ERROR_CODES.gitFailed, `git stream failed: ${(e as Error).message}`);
   }
 
-  const exit = await proc.exited;
+  // If we asked the child to stop (truncation kill above, or an abort that
+  // made Bun SIGTERM it), reap with a SIGKILL-escalating grace so a
+  // SIGTERM-ignoring child can't hang `await proc.exited`. A normal
+  // completion takes neither branch's deadline — it's awaited directly.
+  const stopping = truncated || ctx.signal.aborted;
+  const exit = stopping ? await reapWithGrace(proc) : await proc.exited;
   // A mid-stream abort is silent: Bun SIGTERMs the child and closes stdout
   // cleanly, so the `for await` ends WITHOUT throwing and `proc.exited`
   // resolves to 143 (128+SIGTERM). Without this check that 143 would fall
@@ -692,8 +769,17 @@ const representativeCommand = (args: GitInput): string => {
     case 'show':
       parts.push('show', ref ?? 'HEAD', ...tail);
       break;
+    case 'show_file':
+      parts.push(
+        'show',
+        shellQuote(
+          `${typeof args.ref === 'string' ? args.ref : 'HEAD'}:./${typeof args.path === 'string' ? args.path : ''}`,
+        ),
+      );
+      break;
     case 'diff':
       parts.push('diff');
+      if (args.stat === true) parts.push('--stat');
       if (args.staged === true) parts.push('--staged');
       if (ref !== undefined) parts.push(ref);
       parts.push(...tail);
@@ -717,23 +803,24 @@ const representativeCommand = (args: GitInput): string => {
 export const gitTool: Tool<GitInput, GitOutput> = {
   name: 'git',
   description:
-    'Read-only git: inspect history and working-tree state. Pick a `mode` (log/show/diff/blame/status/ls_files) and typed params — never raw flags. `diff`/`status` reflect the LIVE working tree (uncommitted changes included). Pathless modes are scoped to the current directory subtree; renames show as delete+add; output is capped (~64KB — when `truncated` is true, narrow with `path`). Cannot commit, push, or mutate. Parallel-safe.',
+    'Read-only git: inspect history and working-tree state. Pick a `mode` (log/show/show_file/diff/blame/status/ls_files) and typed params — never raw flags. `diff`/`status` reflect the LIVE working tree (uncommitted changes included). Pathless modes are scoped to the current directory subtree; renames show as delete+add; output is capped (~256KB — when `truncated` is true, narrow with `path` or use `stat`). Cannot commit, push, or mutate. Parallel-safe.',
   inputSchema: {
     type: 'object',
     properties: {
       mode: {
         type: 'string',
-        enum: ['log', 'show', 'diff', 'blame', 'status', 'ls_files'],
+        enum: ['log', 'show', 'show_file', 'diff', 'blame', 'status', 'ls_files'],
         description:
-          'log: commit history; show: a commit + its diff (commit-ish ref only — not a file blob); diff: working-tree or staged changes (vs ref if given); blame: per-line last-change (requires path); status: working-tree state; ls_files: tracked files.',
+          'log: commit history; show: a commit + its diff (commit-ish ref only — not a file blob); show_file: the CONTENT of one file at a revision (`ref:path`, requires path); diff: working-tree or staged changes (vs ref if given); blame: per-line last-change (requires path); status: working-tree state; ls_files: tracked files.',
       },
       path: {
         type: 'string',
-        description: 'Repo-relative file/dir to scope to. Required for blame.',
+        description: 'Repo-relative file/dir to scope to. Required for blame and show_file.',
       },
       ref: {
         type: 'string',
-        description: 'Commit/branch/tag (or A..B range for diff). Read-only; never a flag.',
+        description:
+          'Commit/branch/tag (or A..B range for diff; the revision for show_file, default HEAD). Read-only; never a flag.',
       },
       max_count: { type: 'integer', minimum: 1, description: 'log: max commits (default 50).' },
       staged: {
@@ -741,6 +828,11 @@ export const gitTool: Tool<GitInput, GitOutput> = {
         description: 'diff: show staged (index) changes instead of unstaged.',
       },
       follow: { type: 'boolean', description: 'log: follow a single file across renames.' },
+      stat: {
+        type: 'boolean',
+        description:
+          'diff only: emit a diffstat (changed files + churn) instead of the full patch.',
+      },
     },
     required: ['mode'],
   },
@@ -760,7 +852,7 @@ export const gitTool: Tool<GitInput, GitOutput> = {
     if (typeof args.mode !== 'string' || !GIT_MODES.has(args.mode)) {
       return toolError(
         ERROR_CODES.invalidArg,
-        `mode must be one of log/show/diff/blame/status/ls_files (got '${String(args.mode)}')`,
+        `mode must be one of log/show/show_file/diff/blame/status/ls_files (got '${String(args.mode)}')`,
       );
     }
 
@@ -809,6 +901,21 @@ export const gitTool: Tool<GitInput, GitOutput> = {
       if (denied !== null) return denied;
     }
 
+    // show_file emits ONE file's content at a revision; gate that single
+    // path the way read_file would. The `./` form in buildModeArgs makes
+    // git read resolve(cwd, path), so gate the same absolute path. The
+    // engine also gates it (rootArg: 'path'), but the tool re-checks —
+    // never rely solely on the caller's gate.
+    if (args.mode === 'show_file' && typeof args.path === 'string') {
+      if (!ctx.permissions.canReadPath(resolve(ctx.cwd, args.path))) {
+        return toolError(
+          ERROR_CODES.gitDenied,
+          `git show_file: policy denies reading '${args.path}'`,
+          { details: { path: args.path } },
+        );
+      }
+    }
+
     // The gate above ran one or two git sub-processes; honor an abort
     // that landed in the meantime before spawning the (potentially
     // expensive) main run.
@@ -840,6 +947,20 @@ export const gitTool: Tool<GitInput, GitOutput> = {
         return toolError(
           ERROR_CODES.invalidArg,
           `git show needs a commit-ish ref; '${args.ref ?? 'HEAD'}' resolves to a non-commit (blob/tree). This tool shows a commit and its diff, not a file blob — to read a file's contents use read_file, or pass a commit/branch/tag ref.`,
+          { details: { command: commandLine } },
+        );
+      }
+      // show_file uses `cat-file blob`, which fails closed on a non-file:
+      // a directory/tree ("bad file") or a path absent at the revision
+      // ("does not exist"). Translate the plumbing error to something the
+      // model can act on.
+      if (
+        args.mode === 'show_file' &&
+        /bad file|does not exist|not a valid object|exists, but not/i.test(cap.stderr)
+      ) {
+        return toolError(
+          ERROR_CODES.invalidArg,
+          `git show_file: '${args.path}' is not a readable file at '${args.ref ?? 'HEAD'}' — it may be a directory, or absent at that revision. show_file reads one file's content; pass a file path.`,
           { details: { command: commandLine } },
         );
       }

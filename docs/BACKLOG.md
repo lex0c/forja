@@ -2,6 +2,49 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-13] git tool: review batch 3 — cap raise, stat, show_file, SIGKILL reap
+
+The opted-in subset of the review's deferred items (TMPDIR-vs-sandbox left out).
+
+(1) Output cap 64KB → 256KB, matching read_file's MAX_OUTPUT_BYTES, so a
+`show`/`diff` of a real change usually completes instead of truncating mid-patch.
+The three truncation tests were recalibrated to overflow the larger cap.
+
+(2) New `stat` flag (diff ONLY): emits a diffstat (changed files + churn) instead
+of the full patch — a cheap survey that also relieves the truncation pressure.
+Reuses the existing content gate (the --name-only pre-flight refuses on any denied
+file). NOTE: a pre-commit self-review found `show --stat` leaks a denied name on a
+MERGE — `show --stat` reports the FIRST-PARENT diffstat while the gate's
+`--name-only` uses COMBINED-diff, so a file taken cleanly from the second parent
+is invisible to the gate but appears in the stat. `diff` is always two-endpoint
+(never combined), so `diff --stat` is gate-consistent; `stat` is therefore
+rejected for every mode except `diff` (for a commit's stat, use a ref range like
+"HEAD~1..HEAD").
+
+(3) New `show_file` mode: the CONTENT of one file at a revision (the gap that
+previously forced the model to reach for `bash git`, which general-purpose lacks).
+Built as `git cat-file blob <ref>:./<path>` — NOT `git show`: a self-review found
+`git show <rev>:./<dir>` on a DIRECTORY dumps the tree's child NAMES, which the
+single-path gate never checks (a filename leak); `cat-file blob` fails closed on a
+non-blob, so only real files emit. cat-file is also a pure object read (no
+textconv/filter/diff drivers), so there's nothing to exec. The `./` forces git to
+resolve the path CWD-relative (a bare `<rev>:<path>` is repo-root-relative), so
+the file git reads is exactly the one the engine (rootArg: 'path') and an added
+in-tool canReadPath both gate — no relativity gap. Verified empirically (subdir
+cwd-relativity, tree fail-closed, no exec) under the hardened env.
+
+(4) SIGKILL-escalating reap (`reapWithGrace`): after we ask a git child to stop
+(truncation SIGTERM, or an abort that made Bun SIGTERM it), bound `await
+proc.exited` with a grace window and escalate to SIGKILL if it overruns — the
+structural backstop the broker has and this path, unsandboxed, lacked (sandboxed,
+bwrap's --die-with-parent already reaps). Only armed on the stop path; a normally
+running git is awaited with no deadline.
+
+Tests: show_file content + subdir cwd-relativity + denied-path refusal + requires
+path + directory fail-closed (no name leak); stat diff-only (show+stat rejected) +
+functional diffstat + still-gated; recalibrated truncation caps. Still deferred:
+the TMPDIR-vs-sandbox-/tmp fix (cross-cutting with grep).
+
 ## [2026-06-13] git tool: review batch 2 — usability polish
 
 Four usability fixes from the review round (model ergonomics + user trust).
