@@ -24,7 +24,7 @@
 
 import { realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
-import type { Tool } from '../tools/types.ts';
+import type { Tool, ToolContext } from '../tools/types.ts';
 import { type ToolResult, toolError } from '../tools/types.ts';
 import type { ToolRestrictionRules, ToolRestrictions } from './types.ts';
 
@@ -511,6 +511,46 @@ const realpathDeepestPrefix = (abs: string): { ok: true; real: string } | { ok: 
 // is a per-playbook gate, scoped to subagents.
 export const RESTRICTION_ERROR_CODE = 'policy.tool_restricted';
 
+// Compose a path tool's `deny_paths` into the per-file read gate its OUTPUT
+// passes through. `checkRestriction` (the pre-flight) only sees the literal
+// `path` arg, but a directory-scoped read whose output carries DESCENDANT
+// content/metadata — `git diff`/`show`/`status`/`ls_files`, `grep` — emits
+// files UNDER that arg. A `deny_paths` rule on a descendant (e.g.
+// allow_paths:['src'] + deny_paths:['src/secrets/**'] with path:'src') never
+// matches the literal arg, so the pre-flight passes and the denied descendant
+// would leak whenever the PARENT policy lets it through. Those tools already
+// call `ctx.permissions.canReadPath` per emitted file to honor that parent
+// read policy (see PermissionsView), so fold the restriction's deny into the
+// SAME chokepoint — the descendant deny lands exactly where the parent deny
+// already drops files (metadata names) / fails closed (content modes).
+//
+// Only `deny_paths` is composed. `allow_paths` is a SCOPE check on the literal
+// arg (the pre-flight): a directory arg's descendants are within the allowed
+// subtree by construction, and a literal glob like `src` does NOT match
+// `src/x`, so composing allow per-file would wrongly deny every descendant of
+// an allowed directory. Tools without a per-file read gate (write_file /
+// edit_file / read_file) never call the composed function, so the wrap is
+// inert for them; only the descendant-emitting readers (git, grep) observe it.
+const composeDenyIntoReadGate = (
+  toolName: string,
+  restrictions: ToolRestrictions,
+  ctx: ToolContext,
+): ToolContext => {
+  if (TOOL_RESTRICTION_SHAPE[toolName] !== 'path') return ctx;
+  const denyPaths = restrictions[toolName]?.denyPaths;
+  if (denyPaths === undefined || denyPaths.length === 0) return ctx;
+  const { cwd } = ctx;
+  const canReadPath = (p: string): boolean => {
+    if (!ctx.permissions.canReadPath(p)) return false;
+    const canonical = canonicalizeUnderCwd(p, cwd);
+    // Outside cwd the cwd-relative deny globs cannot match; the parent
+    // policy already governed it in the check above.
+    if (canonical.escaped) return true;
+    return !matchAny(canonical.relPath, denyPaths).matched;
+  };
+  return { ...ctx, permissions: { ...ctx.permissions, canReadPath } };
+};
+
 // Wrap a tool so its `execute` is preceded by the restriction
 // check. The returned Tool is byte-identical to the input on every
 // surface except `execute`: same name, same input/output schemas,
@@ -541,7 +581,12 @@ export const wrapToolWithRestrictions = <I, O>(
     ...tool,
     execute: (args, ctx) => {
       const verdict = checkRestriction(tool.name, args, restrictions, ctx.cwd);
-      if (verdict.ok) return tool.execute(args, ctx);
+      // Pre-flight gated the literal `path` arg; ALSO fold deny_paths into the
+      // per-file read gate so a directory-scoped read's descendant output
+      // (git diff/show/status/ls_files, grep) can't escape the deny.
+      if (verdict.ok) {
+        return tool.execute(args, composeDenyIntoReadGate(tool.name, restrictions, ctx));
+      }
       const result: ToolResult<O> = toRestrictionError(
         tool.name,
         verdict.reason,

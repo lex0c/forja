@@ -2,6 +2,40 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] subagents: enforce git/grep tool_restrictions deny_paths on DESCENDANT output
+
+`wrapToolWithRestrictions` ran a pre-flight check on the literal `path` arg only.
+For a directory-scoped read whose OUTPUT carries descendant files — `git
+diff`/`show`/`status`/`ls_files`, `grep` — that misses descendant deny rules: a
+playbook with `git.allow_paths:['src']` + `deny_paths:['src/secrets/**']` calling
+`git diff` with `path:'src'` passed the wrapper (the literal `src` matches allow,
+doesn't match the deny glob), and the emitted diff/names still leaked
+`src/secrets/*` whenever the PARENT permission policy allowed them — the
+playbook's deny was bypassed.
+
+Took the finding's "thread the restriction into the emitted-file filtering"
+option. Those tools already call `ctx.permissions.canReadPath` per emitted file
+to honor the parent read policy (the `PermissionsView` doc spells this out), so
+the wrapper now folds the restriction's `deny_paths` into that exact chokepoint:
+on the allow branch it passes the tool a ctx whose `canReadPath` also denies
+paths matching `deny_paths` (canonicalized under cwd, reusing the symlink-aware
+`canonicalizeUnderCwd`). The descendant deny then lands where the parent deny
+already drops metadata names / fails closed on content modes — no gitTool change,
+no new ctx field. Fixes `grep` by the same mechanism (identical descendant
+surface). Only `deny_paths` is composed: `allow_paths` is a scope check on the
+literal arg (a directory arg's descendants are within the allowed subtree by
+construction, and a literal glob `src` does not match `src/x`, so composing allow
+per-file would wrongly deny every descendant). The wrap is inert for tools with
+no per-file read gate (write_file/edit_file/read_file never call it). Verified
+the wiring: `subagent-child` wraps every whitelisted tool (gitTool included),
+and `grep` calls `canReadPath` per file too, so both readers are covered. Tests:
+unit (denied descendant blocked while siblings pass; composition only tightens —
+a parent-denied path stays denied; no deny_paths → nothing composed) AND
+end-to-end against the REAL gitTool in a temp repo (status drops the denied
+descendant name; diff fails closed with a denied file in scope; a scoped sibling
+diff still works) — each e2e carries an unrestricted control that DOES surface
+the secret, proving the restriction is what filtered it.
+
 ## [2026-06-14] tui: surface FAILED task delegations despite the silent task chip
 
 Follow-up to marking the `task_*` family `silent` (so the operator sees the live
