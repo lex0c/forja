@@ -2942,3 +2942,42 @@ describe('resumemode:ask reducer', () => {
     expect(closed.state.modal).toBeNull();
   });
 });
+
+describe('slash:update ghost threading (inline arg-hint)', () => {
+  const sugg = [{ name: 'effort', description: 'set effort' }];
+
+  test('carries the ghost from the event onto state.slash', () => {
+    // The popover-nav fix depends on this: a nav re-emit re-sends the
+    // ghost and the reducer must mirror it so the hint survives ↑/↓.
+    const { state } = drive([
+      {
+        type: 'slash:update',
+        ts: 1,
+        suggestions: sugg,
+        selectedIdx: 0,
+        ghost: ' [low|medium|high]',
+      },
+    ]);
+    expect(state.slash?.ghost).toBe(' [low|medium|high]');
+  });
+
+  test('leaves ghost undefined when the event omits it (no exact match)', () => {
+    const { state } = drive([{ type: 'slash:update', ts: 1, suggestions: sugg, selectedIdx: 0 }]);
+    expect(state.slash).not.toBeNull();
+    expect(state.slash?.ghost).toBeUndefined();
+  });
+
+  test('the empty + -1 exit signal clears slash (and its ghost)', () => {
+    const { state } = drive([
+      {
+        type: 'slash:update',
+        ts: 1,
+        suggestions: sugg,
+        selectedIdx: 0,
+        ghost: ' [low|medium|high]',
+      },
+      { type: 'slash:update', ts: 2, suggestions: [], selectedIdx: -1 },
+    ]);
+    expect(state.slash).toBeNull();
+  });
+});

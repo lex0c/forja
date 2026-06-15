@@ -746,6 +746,11 @@ export type SlashUpdateEvent = BaseEvent & {
   type: 'slash:update';
   suggestions: { name: string; description: string }[];
   selectedIdx: number;
+  // Inline arg-hint ghost for an exactly-typed command with no args yet
+  // (e.g. ` [low|medium|high]` after `/effort`). Undefined when there's
+  // no exact match or the command takes no args. The renderer draws it
+  // dim after the typed text, only when the cursor is at the line end.
+  ghost?: string;
 };
 
 // Reverse-search overlay open/update. Spec HISTORY.md §2.2. Producer

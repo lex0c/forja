@@ -3710,6 +3710,7 @@ export const memoryCommand: SlashCommand = {
   name: 'memory',
   description:
     'manage cross-session memories (list/show/audit/provenance/governance/delete/quarantine/restore/promote/demote/trust/seeds)',
+  argHint: '<subcommand>',
   exec: async (args, ctx) => {
     const registry = ctx.baseConfig.memoryRegistry;
     if (registry === undefined) {

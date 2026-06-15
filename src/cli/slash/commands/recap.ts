@@ -724,6 +724,7 @@ export const runRecapSession = async (
 export const recapCommand: SlashCommand = {
   name: 'recap',
   description: 'projected view over this session (or another by id)',
+  argHint: '[list | <session-id>]',
   exec: async (args, ctx: SlashContext): Promise<SlashResult> => {
     // `/recap list` is a different shape entirely — multi-session
     // listing instead of a per-session render. Routed early so the

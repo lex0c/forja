@@ -312,6 +312,11 @@ export interface SlashAutocomplete {
   // Highlighted index within `suggestions`. -1 means "no selection"
   // (e.g., empty suggestions list when input is `/<unknown>`).
   selectedIdx: number;
+  // Inline arg-hint ghost for an exactly-typed command (e.g.
+  // ` [low|medium|high]` after `/effort`). Undefined when there's no
+  // exact command match or it takes no args. The input renderer draws
+  // it dim after the typed text, gated on the cursor being at line end.
+  ghost?: string;
 }
 
 // Reverse-search overlay (HISTORY.md §2.2). Active while the operator
@@ -1592,7 +1597,13 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       return {
         state: {
           ...state,
-          slash: empty ? null : { suggestions: event.suggestions, selectedIdx: event.selectedIdx },
+          slash: empty
+            ? null
+            : {
+                suggestions: event.suggestions,
+                selectedIdx: event.selectedIdx,
+                ...(event.ghost !== undefined ? { ghost: event.ghost } : {}),
+              },
         },
         permanent: [],
       };

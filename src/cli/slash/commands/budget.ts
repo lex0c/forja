@@ -31,8 +31,18 @@ import {
 import { formatCost, formatMs, withRunningCue } from '../format.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 
-const usage =
-  '/budget [steps <N> | cost <USD|none> | parallel-tools <N> | subagents <N> | relevance <on|off>]';
+// Single source for the subcommand set. `usage` (error messages) and the
+// command's inline `argHint` both derive from this, so a new subcommand
+// can't leave the two naming different sets.
+const BUDGET_SUBCOMMANDS = ['steps', 'cost', 'parallel-tools', 'subagents', 'relevance'] as const;
+const BUDGET_USAGE_FORMS: Record<(typeof BUDGET_SUBCOMMANDS)[number], string> = {
+  steps: 'steps <N>',
+  cost: 'cost <USD|none>',
+  'parallel-tools': 'parallel-tools <N>',
+  subagents: 'subagents <N>',
+  relevance: 'relevance <on|off>',
+};
+const usage = `/budget [${BUDGET_SUBCOMMANDS.map((s) => BUDGET_USAGE_FORMS[s]).join(' | ')}]`;
 
 const showAll = (ctx: SlashContext): SlashResult => {
   // Resolve through the SAME layered helper the loop uses so `/budget`
@@ -97,6 +107,7 @@ const writeBudget = (ctx: SlashContext, patch: Partial<RunBudget>): void => {
 export const budgetCommand: SlashCommand = {
   name: 'budget',
   description: 'show or set budget caps',
+  argHint: BUDGET_SUBCOMMANDS.join('|'),
   exec: async (args, ctx) => {
     if (args.length === 0) return showAll(ctx);
     const sub = (args[0] ?? '').toLowerCase();

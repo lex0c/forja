@@ -2798,11 +2798,27 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       return;
     }
     const matches = slashRegistry.complete(parsed.name);
+    // Inline arg-hint ghost: when the typed token is an exact command and
+    // the operator hasn't started typing args, suggest the accepted args
+    // dim after the name (e.g. `/effort` → ` [low|medium|high]`).
+    // `parsed.args` is empty for both `/effort` and `/effort ` (the parser
+    // trims), so the leading space is derived from the raw value. Dropped
+    // the moment an arg appears — the hint would then mislead.
+    let ghost: string | undefined;
+    if (parsed.args.length === 0) {
+      const exact =
+        slashRegistry.lookup(parsed.name) ??
+        matches.find((c) => c.name.toLowerCase() === parsed.name.toLowerCase());
+      if (exact?.argHint !== undefined && exact.argHint !== '') {
+        ghost = (/\s$/.test(value) ? '' : ' ') + exact.argHint;
+      }
+    }
     bus.emit({
       type: 'slash:update',
       ts: now(),
       suggestions: matches.map((c) => ({ name: c.name, description: c.description })),
       selectedIdx: matches.length > 0 ? 0 : -1,
+      ...(ghost !== undefined ? { ghost } : {}),
     });
     slashOpen = true;
   };
@@ -3164,6 +3180,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
             ts: now(),
             suggestions: slashState.suggestions,
             selectedIdx: idx,
+            // Navigation only moves the highlight — the typed text is
+            // unchanged, so carry the existing arg-hint ghost forward.
+            // Without this it'd be dropped on every ↑/↓ (the reducer
+            // rebuilds state.slash from the event).
+            ...(slashState.ghost !== undefined ? { ghost: slashState.ghost } : {}),
           });
         }
         return true;
@@ -3176,6 +3197,8 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
             ts: now(),
             suggestions: slashState.suggestions,
             selectedIdx: idx,
+            // See the ↑ branch: preserve the ghost across navigation.
+            ...(slashState.ghost !== undefined ? { ghost: slashState.ghost } : {}),
           });
         }
         return true;

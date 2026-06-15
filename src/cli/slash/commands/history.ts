@@ -154,6 +154,7 @@ const handleOn = (ctx: SlashContext): string[] => {
 export const historyCommand: SlashCommand = {
   name: 'history',
   description: 'manage REPL input history (list/clear/off/on)',
+  argHint: 'list|clear|off|on',
   exec: async (args, ctx) => {
     const sub = args[0];
     if (sub === undefined) {

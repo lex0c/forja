@@ -2,6 +2,36 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-15] TUI: inline arg-hint ghost for slash commands
+
+When the operator finishes typing a slash command (e.g. `/effort`), the accepted
+args now appear dim inline right after it (`/effort [low|medium|high]`) — a
+zsh-style affordance so the options are visible without opening `/help`. Added an
+optional `argHint` to `SlashCommand` (just the args portion, no name/slash) and
+populated the 9 commands that take args: `effort` (dynamic from
+`FORJA_EFFORT_LEVELS`), `model`, `history`, `skill`, `agent`, `perms`, `recap`,
+`budget`, `memory`. The ghost string is computed in `repl.ts` alongside the
+existing popover recompute — only when the typed token is an EXACT command and no
+arg has been typed yet (`parsed.args` empty); the leading space is derived from the
+raw value since the parser trims. It rides the `slash:update` event →
+`state.slash.ghost` → `renderInput`, which paints it `secondary` (SGR 90) after the
+typed text. Gates for autosuggest correctness: cursor at line end (checked in the
+renderer, which sees the live cursor, so it vanishes when the operator arrows off
+the end without a value change), single-line slash only, suppressed under
+dim/bash, and DROPPED rather than wrapped when it would overflow the row. The SGR
+is zero-width and the ghost is not in the buffer, so `composeCursor` (keyed off
+value + cursor) is unaffected — the caret sits just before the ghost. Free-form
+`argHint` (not a structured schema): cheap, and the renderer drops overlong hints,
+so a wide one like `budget` simply doesn't show on narrow terminals. Tests: 7 new
+render cases in `input.test` (trail, secondary paint, trailing-space spacing,
+cursor-mid hidden, dim-suppressed, overflow-dropped, non-slash ignored); `ghost?`
+is optional on the event/state so existing slash/footer/popover tests stay green.
+Spec: refinement over `UI.md §5.3` (popover) — code-first per the UX-iteration
+policy; a spec note can follow. (Verification note: every touched suite passes in
+isolation — input 28/0, slash 645/0, state 183/0 — one combined run surfaced the
+pre-existing `memory.test --trigger` cross-file ordering pollution, unrelated to
+this change.)
+
 ## [2026-06-15] Slash: withdraw /pin and the playbook-derived commands
 
 Trimmed the slash surface. `/pin` removed from the builtin registry —

@@ -194,6 +194,12 @@ export interface SlashCommand {
   // One-line description for the autocomplete popover and the
   // /help modal. Keep under 60 chars.
   description: string;
+  // Optional arg syntax shown as a dim inline ghost after the command
+  // name in the input box once it's fully typed (e.g. `[low|medium|high]`
+  // for `/effort`). Just the args portion — no leading slash, no command
+  // name. Commands that take no args omit it. Keep it short: the input
+  // renderer drops it when it would overflow the row.
+  argHint?: string;
   // Execute. `args` is the parsed positional args (everything after
   // the command name, split on whitespace, leading/trailing trimmed).
   // Tests verify per-command args parsing; commands assume `args`

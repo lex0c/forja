@@ -293,6 +293,7 @@ export { listPoliciesByActionSignature };
 export const agentPolicyCommand: SlashCommand = {
   name: 'agent',
   description: 'manage adaptation policies + inspect retrieval (subnamespaces: policy, retrieval)',
+  argHint: 'policy|retrieval',
   exec: async (args, ctx): Promise<SlashResult> => {
     const root = args[0];
     if (root === undefined) {

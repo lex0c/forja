@@ -232,6 +232,7 @@ const runWhy = (
 export const permsCommand: SlashCommand = {
   name: 'perms',
   description: 'show the active permission policy (or "/perms why <tool> [args]" for dry-check)',
+  argHint: '[why <tool>]',
   exec: async (args, ctx) => {
     if (args.length > 0 && args[0] === 'why') {
       return runWhy(args, ctx);

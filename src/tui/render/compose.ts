@@ -445,6 +445,10 @@ export const composeLive: ComposeLive = (
       // queued. renderInput shows it only on an empty buffer, so it
       // never hides a draft and vanishes the moment the operator types.
       ...(visibleQueued.length > 0 ? { placeholder: 'Press up to edit queued messages' } : {}),
+      // Inline arg-hint ghost for a fully-typed slash command (computed
+      // in the REPL alongside the popover). renderInput draws it dim
+      // after the typed text only when the cursor is at the line end.
+      ...(state.slash?.ghost !== undefined ? { commandGhost: state.slash.ghost } : {}),
     }),
   );
   lines.push(horizontalRule(caps, bashMode));

@@ -186,4 +186,18 @@ describe('createBuiltinRegistry', () => {
     // 18 commands → header + 18 rows + blank + emergency-exit footer = 21.
     expect(result.notes?.length).toBe(21);
   });
+
+  test('arg-hints match the args the command actually accepts', () => {
+    const r = createBuiltinRegistry();
+    // `/recap list` is a real subcommand (recap.ts routes args[0]==='list'),
+    // so the hint must surface it, not just the session-id form.
+    expect(r.lookup('recap')?.argHint).toContain('list');
+    // model + budget derive their hint from the `usage` const / the
+    // BUDGET_SUBCOMMANDS source — assert the derivation yields the args.
+    expect(r.lookup('model')?.argHint).toBe('[<id>]');
+    expect(r.lookup('budget')?.argHint).toBe('steps|cost|parallel-tools|subagents|relevance');
+    // Commands that take no args expose no hint.
+    expect(r.lookup('clear')?.argHint).toBeUndefined();
+    expect(r.lookup('quit')?.argHint).toBeUndefined();
+  });
 });

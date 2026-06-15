@@ -42,6 +42,14 @@ export interface RenderInputOptions {
   // cursor still lands at column 2 (composeCursor keys off the empty
   // value), sitting at the head of the ghost text.
   placeholder?: string;
+  // Inline arg-hint ghost (e.g. ` [low|medium|high]`) drawn dim AFTER the
+  // typed text of a single-line `/command`, anchored at the line end. The
+  // caller (compose) sources it from state.slash; renderInput shows it
+  // ONLY when the cursor is at the end of the buffer (otherwise it would
+  // trail past the caret and mislead) and only if it fits the row — the
+  // ghost is never wrapped. Dropped under dim/bash. Zero-width SGR + not
+  // part of the buffer ⇒ composeCursor (value+cursor) is unaffected.
+  commandGhost?: string;
   // Bash mode (operator `!cmd` shell escape). The caller (composeLive)
   // decides this — it needs the full LiveState for the idle gate (a `!`
   // typed mid-turn is refused, so it must NOT flip to bash mode then;
@@ -133,6 +141,27 @@ export const renderInput = (
         continue;
       }
       out.push(finish(prefix + line.slice(chunk.start, chunk.end)));
+    }
+  }
+  // Trailing arg-hint ghost: dim text after a fully-typed `/command`,
+  // anchored at the end of the (single) line. Gated on cursor-at-end so
+  // it never trails past a mid-line caret, single-line + slash, and only
+  // when it fits the row — we do NOT wrap the ghost (if `typedWidth +
+  // ghost` overflows, the line already wrapped or is full, so drop it).
+  const ghost = options.commandGhost;
+  if (
+    ghost !== undefined &&
+    ghost !== '' &&
+    options.dimmed !== true &&
+    !bang &&
+    input.value.startsWith('/') &&
+    !input.value.includes('\n') &&
+    input.cursor === input.value.length &&
+    out.length > 0
+  ) {
+    const typedWidth = PROMPT_PREFIX.length + input.value.length;
+    if (typedWidth + ghost.length <= caps.cols) {
+      out[out.length - 1] = `${out[out.length - 1]}${paint(caps, 'secondary', ghost)}`;
     }
   }
   return out;
