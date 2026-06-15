@@ -657,6 +657,9 @@ export type PermanentItem =
       contextWindow: number;
       maxOutputTokens: number;
       cwd: string;
+      // Operator home dir for the banner's `$HOME → ~` cwd collapse (display
+      // only; `cwd` stays raw). Optional — absent skips the collapse.
+      home?: string;
       // Mirror of SessionBannerEvent.env (UI.md §4.10.9). Renderer
       // discriminates on `kind` to pick the right palette per entry.
       env: SessionBannerEnvEntry[];
@@ -1133,6 +1136,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             contextWindow: event.contextWindow,
             maxOutputTokens: event.maxOutputTokens,
             cwd: event.cwd,
+            ...(event.home !== undefined ? { home: event.home } : {}),
             env: event.env,
             ...(event.sandboxActive !== undefined ? { sandboxActive: event.sandboxActive } : {}),
           },

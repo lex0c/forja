@@ -2,6 +2,23 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-15] TUI: shorten the banner cwd line
+
+The banner's third line printed `item.cwd` raw. On a removable-drive working
+copy (`/run/media/<uuid>/<user>/Workspaces/forja`) that buries the two parts that
+carry signal — where it's mounted and the repo — under the mount uuid + user.
+New pure helper `shortenCwd(cwd, home, caps)` (render/cwd.ts): collapse `$HOME` →
+`~`, then, when still over a readability budget (48 chars, NOT terminal width —
+the path fits 80 cols yet is unreadable), elide the middle keeping the leading two
+components + the last two, joined by the caps-aware ellipsis. So the motivating
+path renders `/run/media/…/Workspaces/forja`, and a home path shows `~/Workspaces/
+forja`. The RAW cwd stays on the PermanentItem (audit / NDJSON untouched) — only
+the human line shrinks; `home` rides the session:banner event (optional, from
+homedir() at the single emit site). Helper unit-tested + a banner-render case.
+
+Spec note: UI.md §6.1 describes the banner cwd line generically; the shortening
+is a display refinement that doesn't change the documented structure (code-leads-UX).
+
 ## [2026-06-15] TUI: restore the model id as a footer chip
 
 Commit 98e75572 moved the model from the footer to the startup banner's identity

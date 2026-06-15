@@ -20,6 +20,7 @@
 // AbortController for the running turn, and the exit promise.
 
 import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { resolveProviderEffort } from '../harness/effort.ts';
 import {
@@ -3644,6 +3645,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       providerCaps,
     ),
     cwd: baseConfig.cwd,
+    // Home for the banner's `$HOME → ~` cwd collapse (display only; the
+    // event's `cwd` stays raw for audit / NDJSON).
+    home: homedir(),
     env,
     // Seed the footer's operation-mode cue from the engine's posture so
     // a `--autonomous` boot shows Autonomous from the first frame.

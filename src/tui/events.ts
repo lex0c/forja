@@ -73,6 +73,10 @@ export type SessionBannerEvent = BaseEvent & {
   contextWindow: number;
   maxOutputTokens: number;
   cwd: string;
+  // Operator home dir, for the banner's `$HOME → ~` cwd collapse (display
+  // only — `cwd` stays raw for audit). Optional: absent skips the collapse,
+  // so non-CLI emitters / tests that omit it still produce a valid banner.
+  home?: string;
   env: SessionBannerEnvEntry[];
   // Tool name when sandbox enforcement is active (`bwrap` /
   // `sandbox-exec`); omitted when enforcement is disabled (the

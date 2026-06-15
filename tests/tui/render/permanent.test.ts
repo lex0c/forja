@@ -169,6 +169,18 @@ describe('formatPermanent', () => {
       expect(out[1]).toBe(pad('anthropic/claude-sonnet-4-6 · effort high'));
     });
 
+    test('shortens a long removable-drive cwd on the third line', () => {
+      const out = formatPermanent(
+        {
+          ...baseBanner,
+          cwd: '/run/media/lex/728c6e4f-56b6-4bf8-903c-838aeaaf2690/Workspaces/forja',
+          home: '/home/lex',
+        },
+        unicode,
+      );
+      expect(out[2]).toBe(pad('/run/media/…/Workspaces/forja'));
+    });
+
     test('version already prefixed with v is not double-prefixed', () => {
       const out = formatPermanent({ ...baseBanner, version: 'v2.3.4' }, unicode);
       expect(out[0]).toBe(pad('forja v2.3.4'));

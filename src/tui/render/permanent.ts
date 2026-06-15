@@ -14,6 +14,7 @@ import { sanitizeOneLineForDisplay } from '../../sanitize/ansi.ts';
 import type { PermanentItem } from '../state.ts';
 import { type Capabilities, paint, paintMulti, reverse } from '../term.ts';
 import { shortToolName, toolNoun } from '../tool-vocab.ts';
+import { shortenCwd } from './cwd.ts';
 import { formatChipDuration, formatCoarseDuration } from './duration.ts';
 import { padFrame } from './frame.ts';
 import { ellipsisGlyph, subContentConnector, treeBranchConnector } from './glyphs.ts';
@@ -160,7 +161,7 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       const lines = [
         `${paint(caps, 'bold', item.app)} ${paint(caps, 'secondary', versionDisplay)}`,
         paint(caps, 'secondary', identity),
-        paint(caps, 'secondary', item.cwd),
+        paint(caps, 'secondary', shortenCwd(item.cwd, item.home ?? '', caps)),
       ];
       return lines.map(padFrame);
     }
