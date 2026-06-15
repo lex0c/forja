@@ -77,6 +77,41 @@ describe('normalizeResponsesStream', () => {
     expect(out).toContainEqual({ kind: 'tool_use_stop', id: 'c1', final_args: { path: '/a' } });
   });
 
+  test('malformed tool args emit tool_args_parse_error and DROP the stop (no bogus call)', async () => {
+    const out = await collect([
+      { type: 'response.created', response: { id: 'r' } },
+      {
+        type: 'response.output_item.added',
+        item: { type: 'function_call', id: 'fc_1', call_id: 'c1', name: 'read' },
+      },
+      {
+        type: 'response.output_item.done',
+        item: { type: 'function_call', id: 'fc_1', call_id: 'c1', arguments: '{"path": "/a"' }, // truncated
+      },
+      { type: 'response.completed', response: {} },
+    ]);
+    expect(out.some((e) => e.kind === 'error' && e.code === 'tool_args_parse_error')).toBe(true);
+    // The stop is dropped — the harness must not execute read with empty/bogus args.
+    expect(out.some((e) => e.kind === 'tool_use_stop')).toBe(false);
+  });
+
+  test('non-object tool args (array/scalar) are rejected, not coerced to {}', async () => {
+    const out = await collect([
+      { type: 'response.created', response: { id: 'r' } },
+      {
+        type: 'response.output_item.added',
+        item: { type: 'function_call', id: 'fc_2', call_id: 'c2', name: 'read' },
+      },
+      {
+        type: 'response.output_item.done',
+        item: { type: 'function_call', id: 'fc_2', call_id: 'c2', arguments: '[1,2]' },
+      },
+      { type: 'response.completed', response: {} },
+    ]);
+    expect(out.some((e) => e.kind === 'error' && e.code === 'tool_args_parse_error')).toBe(true);
+    expect(out.some((e) => e.kind === 'tool_use_stop')).toBe(false);
+  });
+
   test('text-only turn stops with end_turn', async () => {
     const out = await collect([
       { type: 'response.created', response: { id: 'r' } },

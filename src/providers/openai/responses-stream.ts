@@ -131,20 +131,32 @@ export async function* normalizeResponsesStream(
 
       case 'response.output_item.done':
         if (ev.item?.type === 'function_call' && ev.item.call_id) {
-          let parsed: Record<string, unknown> = {};
           // Prefer the done item's full arguments; fall back to the chunks we
           // accumulated from the delta events if it's absent.
           const fromItem = ev.item.arguments ?? '';
           const argStr =
             fromItem.length > 0 ? fromItem : ev.item.id ? (argsByItem.get(ev.item.id) ?? '') : '';
+          let parsed: Record<string, unknown> = {};
           if (argStr.length > 0) {
             try {
-              parsed = JSON.parse(argStr) as Record<string, unknown>;
-            } catch {
-              // Malformed args — emit the stop with an empty object so the
-              // tool-use is still closed (the harness surfaces the bad call
-              // rather than wedging on an unterminated tool_use).
-              parsed = {};
+              const obj = JSON.parse(argStr) as unknown;
+              if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
+                throw new Error('tool args must decode to a JSON object');
+              }
+              parsed = obj as Record<string, unknown>;
+            } catch (e) {
+              // Malformed / non-object args = a FAILED call, not an empty one
+              // (matches the Anthropic + Chat Completions normalizers). Emit an
+              // error so the harness fails the turn, and DROP the stop so the
+              // bad call is never executed/recorded with bogus args — empty
+              // args on read_file/bash would otherwise run the wrong thing.
+              yield {
+                kind: 'error',
+                code: 'tool_args_parse_error',
+                message: `failed to parse tool_use args for ${ev.item.call_id}: ${(e as Error).message}`,
+                retryable: false,
+              };
+              break;
             }
           }
           yield { kind: 'tool_use_stop', id: ev.item.call_id, final_args: parsed };

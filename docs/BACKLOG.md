@@ -2,6 +2,18 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-15] OpenAI Responses: reject malformed tool args (was silently {})
+
+The Responses normalizer turned a malformed/truncated `function_call` arguments
+JSON into `{}` and still emitted `tool_use_stop` — so collectStep treated the call
+as valid and the harness could execute/record read_file/bash with EMPTY args after
+a bad stream. The Anthropic and Chat Completions normalizers instead emit
+`tool_args_parse_error` and drop the stop. Aligned the Responses path: on a parse
+failure OR a non-object/array decode, emit the error (the loop fails the turn) and
+drop the stop, so the bad call is never run. Empty args (a no-param tool) still
+decode to `{}` and close normally, matching Anthropic. Tests: truncated JSON and
+`[1,2]` both → tool_args_parse_error + no tool_use_stop.
+
 ## [2026-06-15] Default-flip review fixes: thinking yields to sampling; eval pins OpenAI replay
 
 Code review of the default-flip caught two real regressions; fixed both.
