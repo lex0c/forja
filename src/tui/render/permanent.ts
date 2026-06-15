@@ -163,6 +163,12 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
         paint(caps, 'secondary', identity),
         paint(caps, 'secondary', shortenCwd(item.cwd, item.home ?? '', caps)),
       ];
+      // Isolation-profile line — only when active. `warn` (yellow), like the
+      // sandbox-warning channel: a standing flag that this run writes to an
+      // isolated `forja-<profile>` namespace, not the operator's real state.
+      if (item.profile !== undefined && item.profile !== null) {
+        lines.push(paint(caps, 'warn', `profile: ${item.profile} (isolated namespace)`));
+      }
       return lines.map(padFrame);
     }
     case 'user-submit': {

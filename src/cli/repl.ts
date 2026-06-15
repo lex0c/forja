@@ -22,6 +22,7 @@
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
+import { activeProfile, projectDirName } from '../config/app-namespace.ts';
 import {
   type BgManagerHolder,
   type HarnessConfig,
@@ -3368,6 +3369,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     app: APP_NAME,
     version: VERSION,
     model: modelId,
+    // Active isolation namespace (`--profile`/FORJA_PROFILE), null on default.
+    // Surfaces on the boot banner + the always-visible footer chip.
+    profile: activeProfile(),
     contextWindow: providerCaps.context_window,
     maxOutputTokens: resolveMaxOutputTokens(
       effectiveBudget(baseConfig.budget, baseConfig.effort),
@@ -3474,8 +3478,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     bus.emit({
       type: 'error',
       ts: now(),
-      message:
-        "no permission policy found — strict default-deny is active. Create '.forja/permissions.yaml' or run /perms to inspect.",
+      message: `no permission policy found — strict default-deny is active. Create '${projectDirName()}/permissions.yaml' or run /perms to inspect.`,
     });
   }
 

@@ -13,6 +13,7 @@
 // re-prompts; nothing persists).
 
 import { posix, win32 } from 'node:path';
+import { appDirName } from '../config/app-namespace.ts';
 
 const pathMod = (platform: NodeJS.Platform) => (platform === 'win32' ? win32 : posix);
 
@@ -23,20 +24,20 @@ export const trustListPath = (
   const p = pathMod(platform);
   const xdg = env.XDG_CONFIG_HOME;
   if (xdg !== undefined && xdg.length > 0 && p.isAbsolute(xdg)) {
-    return p.join(xdg, 'forja', 'trusted_dirs.json');
+    return p.join(xdg, appDirName(env), 'trusted_dirs.json');
   }
   if (platform === 'win32') {
     const appdata = env.APPDATA;
     if (appdata !== undefined && appdata.length > 0 && p.isAbsolute(appdata)) {
-      return p.join(appdata, 'forja', 'trusted_dirs.json');
+      return p.join(appdata, appDirName(env), 'trusted_dirs.json');
     }
     const userprofile = env.USERPROFILE;
     if (userprofile !== undefined && userprofile.length > 0 && p.isAbsolute(userprofile)) {
-      return p.join(userprofile, 'AppData', 'Roaming', 'forja', 'trusted_dirs.json');
+      return p.join(userprofile, 'AppData', 'Roaming', appDirName(env), 'trusted_dirs.json');
     }
     return null;
   }
   const home = env.HOME;
   if (home === undefined || home.length === 0 || !p.isAbsolute(home)) return null;
-  return p.join(home, '.config', 'forja', 'trusted_dirs.json');
+  return p.join(home, '.config', appDirName(env), 'trusted_dirs.json');
 };

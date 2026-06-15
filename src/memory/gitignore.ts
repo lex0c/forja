@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { projectDirName } from '../config/app-namespace.ts';
 
 // Auto-generated `.forja/.gitignore` per spec §2.5.
 //
@@ -46,7 +47,7 @@ export interface EnsureAgentGitignoreResult {
 // layer; the bootstrap path decides whether to surface to the
 // operator or continue without the gitignore.
 export const ensureAgentGitignore = (repoRoot: string): EnsureAgentGitignoreResult => {
-  const gitignorePath = join(repoRoot, '.forja', '.gitignore');
+  const gitignorePath = join(repoRoot, projectDirName(), '.gitignore');
 
   if (existsSync(gitignorePath)) {
     return { path: gitignorePath, created: false };

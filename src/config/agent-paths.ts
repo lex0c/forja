@@ -28,6 +28,7 @@
 // reject it.
 
 import { posix, win32 } from 'node:path';
+import { appDirName, projectDirName } from './app-namespace.ts';
 
 const pathMod = (platform: NodeJS.Platform) => (platform === 'win32' ? win32 : posix);
 
@@ -54,22 +55,22 @@ export const agentConfigDir = (
   const p = pathMod(platform);
   const xdg = env.XDG_CONFIG_HOME;
   if (xdg !== undefined && xdg.length > 0 && p.isAbsolute(xdg)) {
-    return p.join(xdg, 'forja');
+    return p.join(xdg, appDirName(env));
   }
   if (platform === 'win32') {
     const appdata = env.APPDATA;
     if (appdata !== undefined && appdata.length > 0 && p.isAbsolute(appdata)) {
-      return p.join(appdata, 'forja');
+      return p.join(appdata, appDirName(env));
     }
     const userprofile = env.USERPROFILE;
     if (userprofile !== undefined && userprofile.length > 0 && p.isAbsolute(userprofile)) {
-      return p.join(userprofile, 'AppData', 'Roaming', 'forja');
+      return p.join(userprofile, 'AppData', 'Roaming', appDirName(env));
     }
     return null;
   }
   const home = env.HOME;
   if (home === undefined || home.length === 0 || !p.isAbsolute(home)) return null;
-  return p.join(home, '.config', 'forja');
+  return p.join(home, '.config', appDirName(env));
 };
 
 // Per-user path for an artifact named `filename` inside the agent
@@ -116,9 +117,9 @@ export const enterpriseAgentPath = (
     if (programData === undefined || programData.length === 0 || !p.isAbsolute(programData)) {
       return null;
     }
-    return p.join(programData, 'forja', filename);
+    return p.join(programData, appDirName(env), filename);
   }
-  return p.join('/etc/forja', filename);
+  return p.join(`/etc/${appDirName(env)}`, filename);
 };
 
 // Project-scope path for `filename` under the per-repo `.forja/`
@@ -131,4 +132,4 @@ export const projectAgentPath = (
   repoRoot: string,
   filename: string,
   platform: NodeJS.Platform = process.platform,
-): string => pathMod(platform).join(repoRoot, '.forja', filename);
+): string => pathMod(platform).join(repoRoot, projectDirName(), filename);

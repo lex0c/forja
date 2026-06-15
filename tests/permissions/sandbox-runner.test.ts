@@ -1274,6 +1274,34 @@ describe('buildBwrapArgv — XDG_DATA_HOME unmask defense (slice 140 sec-1)', ()
     }
   });
 
+  test('under --profile: masks BOTH the canonical AND the profile data dir at the XDG location', () => {
+    // dev-mode isolation: a `--profile dev` sandbox must not reach the
+    // operator's REAL `forja` data at a relocated XDG_DATA_HOME (the leak this
+    // closes), and its own `forja-dev` data must be masked too. Exact array-
+    // element checks so `/tmp/data/forja` isn't satisfied by the forja-dev
+    // substring.
+    const prevProfile = process.env.FORJA_PROFILE;
+    process.env.XDG_DATA_HOME = '/tmp/data';
+    process.env.FORJA_PROFILE = 'dev';
+    try {
+      const argv = buildBwrapArgv({
+        profile: 'home-rw',
+        cwd: '/work/proj',
+        home: '/home/op',
+        innerArgv: INNER,
+        env: {},
+        realpath: (p) => p,
+        pathExists: () => true,
+      });
+      expect(argv).toContain('/tmp/data/forja-dev'); // dev's own data dir
+      expect(argv).toContain('/tmp/data/forja'); // operator's REAL data dir — the cross-namespace leak
+    } finally {
+      if (prevProfile === undefined) delete process.env.FORJA_PROFILE;
+      else process.env.FORJA_PROFILE = prevProfile;
+      restoreEnv();
+    }
+  });
+
   test('XDG_DATA_HOME relocated but ABSENT: extra overlay SKIPPED (EROFS guard, review gap)', () => {
     // The relocated data dir lives OUTSIDE home, so on home-rw it sits
     // under the read-only base bind. When it does NOT exist on the host,

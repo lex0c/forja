@@ -46,6 +46,7 @@ import { constants, closeSync, lstatSync, mkdirSync, openSync, readSync, writeSy
 import type { Stats } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
+import { appDirName } from '../config/app-namespace.ts';
 
 // File mode for the marker — owner read/write only. Multi-tenant
 // hosts: other users can't probe whether `--i-know-what-im-doing`
@@ -76,7 +77,7 @@ const MARKER_DIR_MODE = 0o700;
 export const sandboxSkipPath = (env: NodeJS.ProcessEnv = process.env): string => {
   const xdgConfig = env.XDG_CONFIG_HOME;
   if (xdgConfig !== undefined && xdgConfig.length > 0 && isAbsolute(xdgConfig)) {
-    return join(xdgConfig, 'forja', 'sandbox_skip');
+    return join(xdgConfig, appDirName(env), 'sandbox_skip');
   }
   // Prefer env.HOME so tests can pin the path without setting the
   // OS-level home directory; fall back to homedir() for runtime
@@ -84,7 +85,7 @@ export const sandboxSkipPath = (env: NodeJS.ProcessEnv = process.env): string =>
   // XDG_CONFIG_HOME is unset, empty, OR a relative value (treated
   // as "ignored" per the XDG spec).
   const home = env.HOME !== undefined && env.HOME.length > 0 ? env.HOME : homedir();
-  return join(home, '.config', 'forja', 'sandbox_skip');
+  return join(home, '.config', appDirName(env), 'sandbox_skip');
 };
 
 // Filesystem primitives that touch the marker. The injectable

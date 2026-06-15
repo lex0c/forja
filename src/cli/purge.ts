@@ -43,6 +43,7 @@ import {
   unlinkSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { appDirName, projectDirName } from '../config/app-namespace.ts';
 import { resolveRepoRoot } from '../memory/paths.ts';
 import { ensureInstallId } from '../permissions/install_id.ts';
 import { closeDb, migrate, openDb } from '../storage/index.ts';
@@ -595,16 +596,24 @@ interface ForceReport {
 // every dry-run regardless of whether they exist — making the
 // contract observable (the operator doesn't need to grep for
 // "what's NOT touched").
-const PRESERVED_PATHS = [
-  '~/.local/share/forja/sessions.db    (global DB; sessions for this cwd remain queryable)',
-  '~/.config/forja/**                  (user-layer config + memory)',
-  '~/.local/share/forja/install_id     (install identity; audit chain genesis)',
-];
+//
+// A function (not a const) so the user-level segment is resolved at call time
+// — under `--profile dev` the dry-run names `~/.local/share/forja-dev/...` and
+// `~/.config/forja-dev/**`, matching where this run's state actually lives
+// (purge only ever touches the project `.forja[-<profile>]/` dir).
+const preservedPaths = (): string[] => {
+  const app = appDirName();
+  return [
+    `~/.local/share/${app}/sessions.db    (global DB; sessions for this cwd remain queryable)`,
+    `~/.config/${app}/**                  (user-layer config + memory)`,
+    `~/.local/share/${app}/install_id     (install identity; audit chain genesis)`,
+  ];
+};
 
 export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
   const { cwd, force, json, noAudit, out, err } = options;
   const repoRoot = resolveRepoRoot(cwd);
-  const agentDir = join(repoRoot, '.forja');
+  const agentDir = join(repoRoot, projectDirName());
 
   // Gate 1: directory exists.
   if (!existsSync(agentDir)) {
@@ -698,7 +707,7 @@ export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
       scope: agentDir,
       categories: walk.categories,
       totals: walk.totals,
-      preserved: PRESERVED_PATHS,
+      preserved: preservedPaths(),
       audit,
       command,
     };

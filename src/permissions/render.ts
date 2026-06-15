@@ -19,6 +19,7 @@
 // stay in their respective consumer modules — only the
 // per-section formatting and the column layout live here.
 
+import { projectDirName } from '../config/app-namespace.ts';
 import type { SandboxProvenance } from './hierarchy.ts';
 import type { BashPolicy, FetchPolicy, PathPolicy, Policy, PolicyToolsSection } from './types.ts';
 
@@ -161,7 +162,9 @@ export const renderPolicy = (policy: Policy): string[] => {
   if (sectionLines.length === 0 && sandboxLines.length === 0) {
     lines.push('  (no tool sections defined)');
     if (mode === 'strict') {
-      lines.push("  every gated tool will be denied. Create '.forja/permissions.yaml'");
+      lines.push(
+        `  every gated tool will be denied. Create '${projectDirName()}/permissions.yaml'`,
+      );
       lines.push('  with allow/confirm rules to enable tool use.');
     }
     return lines;

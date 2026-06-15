@@ -41,6 +41,7 @@
 // emerge that need per-policy `*_acknowledged_at` timestamps for
 // audit trails. Until then, the marker IS the acknowledgment.
 
+import { appDirName } from '../config/app-namespace.ts';
 import { runDoctor } from './doctor.ts';
 import { runSandboxSetup } from './sandbox-setup.ts';
 import {
@@ -116,7 +117,7 @@ const NEXT_STEPS_LINES = [
   '',
   '  forja init                Scaffold the .forja/ bootstrap bundle',
   '                            (permissions, gitignore, config, playbooks)',
-  '  agent "your prompt"        Ask the agent something',
+  '  forja "your prompt"        Ask the agent something',
   '  forja --explain-permissions',
   '                            Show the resolved policy + per-section attribution',
   '  forja permission grants    List active grants',
@@ -202,7 +203,9 @@ export const runWelcome = async (options: RunWelcomeOptions = {}): Promise<numbe
         `Sandbox setup skipped — marker present at ${safePath} (created ${safeCreatedAt}${versionStr}).\n`,
       );
     } else {
-      out('Sandbox setup skipped — `~/.config/forja/sandbox_skip` marker present.\n');
+      out(
+        `Sandbox setup skipped — \`~/.config/${appDirName(env)}/sandbox_skip\` marker present.\n`,
+      );
     }
     out('Remove that file to re-enable the prompt.\n');
   } else {

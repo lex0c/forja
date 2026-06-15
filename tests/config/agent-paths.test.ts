@@ -126,3 +126,31 @@ describe('projectAgentPath', () => {
     );
   });
 });
+
+// Dev-mode: `FORJA_PROFILE` relocates BOTH the user-level config dir and the
+// per-project dir so a dev/test build can't migrate or pollute the operator's
+// real state.
+describe('profile isolation (FORJA_PROFILE)', () => {
+  test('agentConfigDir routes the user-level segment through the profile', () => {
+    expect(agentConfigDir({ FORJA_PROFILE: 'dev', HOME: '/home/u' }, 'linux')).toBe(
+      '/home/u/.config/forja-dev',
+    );
+    expect(
+      agentConfigDir({ FORJA_PROFILE: 'dev', XDG_CONFIG_HOME: '/xdg', HOME: '/home/u' }, 'linux'),
+    ).toBe('/xdg/forja-dev');
+  });
+
+  test('projectAgentPath routes the project segment through the profile', () => {
+    // projectAgentPath reads process.env via projectDirName() — set + restore.
+    const prev = process.env.FORJA_PROFILE;
+    process.env.FORJA_PROFILE = 'dev';
+    try {
+      expect(projectAgentPath('/repo', 'permissions.yaml', 'linux')).toBe(
+        '/repo/.forja-dev/permissions.yaml',
+      );
+    } finally {
+      if (prev === undefined) delete process.env.FORJA_PROFILE;
+      else process.env.FORJA_PROFILE = prev;
+    }
+  });
+});

@@ -9,6 +9,7 @@ import {
   createInProcessBroker,
   createSpawnBroker,
 } from '../broker/index.ts';
+import { appDirName, projectDirName } from '../config/app-namespace.ts';
 import {
   DEFAULT_CACHE_PERSISTENCE,
   DEFAULT_SHARED_TMP,
@@ -606,7 +607,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // the banner on a wonky filesystem.
     const markerDir =
       input.governanceBannerMarkerDir === undefined
-        ? join(homedir(), '.local', 'share', 'forja')
+        ? join(homedir(), '.local', 'share', appDirName())
         : input.governanceBannerMarkerDir;
     let markerExists = false;
     if (markerDir !== null) {
@@ -1423,7 +1424,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // spawn; we just declare the path here so the manager knows where
   // to put log files. Per-cwd: a worktree's bg processes don't
   // collide with the parent repo's.
-  const bgLogDir = join(cwd, '.forja', 'bg');
+  const bgLogDir = join(cwd, projectDirName(), 'bg');
 
   // (`trustPath` and `isCwdTrusted` resolved above the try-block
   // so the project-context section can gate on them at prompt-
@@ -1730,7 +1731,17 @@ const constructBroker = (
         cwd: callCwd,
         innerArgv,
         ...(sandboxTmpdir !== undefined ? { tmpdir: sandboxTmpdir } : {}),
-        passthroughEnv: { FORJA_BROKER_WORKER: '1' },
+        // Also forward FORJA_PROFILE: bwrap `--clearenv` / sandbox-exec strip
+        // it otherwise, and while the worker is a thin tool-executor that
+        // resolves no namespaced path TODAY, a future worker-side path lookup
+        // must stay in the active profile's namespace — not silently corrupt
+        // the operator's real `forja` state from a `--profile` dev session.
+        passthroughEnv: {
+          FORJA_BROKER_WORKER: '1',
+          ...(process.env.FORJA_PROFILE !== undefined && process.env.FORJA_PROFILE.length > 0
+            ? { FORJA_PROFILE: process.env.FORJA_PROFILE }
+            : {}),
+        },
         // fail-closed on mid-session sandbox loss when the tool was present
         // at boot. A non-host profile that can't wrap now → throw → broker
         // maps to 'sandbox wrap failed' → tool error (LLM + operator see it)

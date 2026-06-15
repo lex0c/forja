@@ -666,10 +666,10 @@ describe('buildSbplProfile — XDG_DATA_HOME unmask defense (slice 140 sec-1)', 
 });
 
 // Slice 146: XDG_CONFIG_HOME unmask — macOS parity with the Linux
-// runner. Same threat: the 6 `.config/*` HIDE_PATHS_DIRS entries
-// (gcloud, azure, op, sops, agent, forja) live under
-// `$XDG_CONFIG_HOME/<sub>` when relocated. Pre-slice the SBPL deny
-// covered `<home>/.config/<sub>` only.
+// runner. Same threat: the `.config/*` hidePathsDirs() entries
+// (gcloud, azure, op, sops, forja — plus forja-<profile> under a
+// profile) live under `$XDG_CONFIG_HOME/<sub>` when relocated.
+// Pre-slice the SBPL deny covered `<home>/.config/<sub>` only.
 describe('buildSbplProfile — XDG_CONFIG_HOME unmask defense (slice 146)', () => {
   const originalXdg = process.env.XDG_CONFIG_HOME;
 

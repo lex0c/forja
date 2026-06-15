@@ -23,6 +23,7 @@
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { projectDirName } from '../../../config/app-namespace.ts';
 import {
   EMPTY_CORPUS_HASH,
   type MemoryFile,
@@ -3606,7 +3607,7 @@ const handleGovernanceToggle = (
   // despite a successful slash-command return. Falls back to cwd
   // when not in a git repo (matches bootstrap's symmetric
   // fallback).
-  const filePath = path.join(resolveRepoRoot(ctx.baseConfig.cwd), '.forja', 'config.toml');
+  const filePath = path.join(resolveRepoRoot(ctx.baseConfig.cwd), projectDirName(), 'config.toml');
   const patches: Parameters<typeof mutateMemoryConfig>[0]['patches'] = {};
   if (target.verify) patches.verifySemanticLlm = value;
   if (target.conflict) patches.conflictDetectLlm = value;

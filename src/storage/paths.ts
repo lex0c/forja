@@ -1,11 +1,12 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { appDirName } from '../config/app-namespace.ts';
 
 export const defaultDataDir = (): string => {
   const xdg = process.env.XDG_DATA_HOME;
   return xdg !== undefined && xdg.length > 0
-    ? join(xdg, 'forja')
-    : join(homedir(), '.local', 'share', 'forja');
+    ? join(xdg, appDirName())
+    : join(homedir(), '.local', 'share', appDirName());
 };
 
 export const defaultDbPath = (): string => join(defaultDataDir(), 'sessions.db');
@@ -22,8 +23,8 @@ export const defaultDbPath = (): string => join(defaultDataDir(), 'sessions.db')
 export const forjaCacheDir = (): string => {
   const xdg = process.env.XDG_CACHE_HOME;
   return xdg !== undefined && xdg.length > 0 && xdg.startsWith('/')
-    ? join(xdg, 'forja')
-    : join(homedir(), '.cache', 'forja');
+    ? join(xdg, appDirName())
+    : join(homedir(), '.cache', appDirName());
 };
 
 // Persistent build/dep cache base — bind-mounted read-write into the

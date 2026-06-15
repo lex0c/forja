@@ -33,6 +33,7 @@ import { execFileSync } from 'node:child_process';
 import { accessSync, existsSync, constants as fsConstants, mkdirSync, readFileSync } from 'node:fs';
 import { homedir, arch as nodeArch, platform as nodePlatform } from 'node:os';
 import { dirname, resolve as resolvePath } from 'node:path';
+import { activeProfile, appDirName } from '../config/app-namespace.ts';
 import {
   type SealStore,
   type VerifyResult,
@@ -282,12 +283,16 @@ const dataDirCheck = (env: NodeJS.ProcessEnv): DoctorCheck => {
   // defaultDataDir reads XDG_DATA_HOME / HOME from process.env;
   // override via env temporarily so the test seam works.
   const dir = (() => {
+    // appDirName(env) so `--profile dev` reports `~/.local/share/forja-dev`,
+    // matching where the session DB actually lands. Re-derived here (not via
+    // defaultDataDir) to honor the `env` test seam.
+    const app = appDirName(env);
     const xdg = env.XDG_DATA_HOME;
     if (xdg !== undefined && xdg.length > 0) {
-      return `${xdg}/forja`;
+      return `${xdg}/${app}`;
     }
     const home = env.HOME ?? homedir();
-    return `${home}/.local/share/forja`;
+    return `${home}/.local/share/${app}`;
   })();
   const probe = dirWritable(dir);
   if (probe.writable) {
@@ -1106,6 +1111,7 @@ export const runDoctor = async (options: RunDoctorOptions = {}): Promise<number>
         kind: 'info',
         engine_version: engineVersion,
         capability_ceiling: capabilityCeiling,
+        profile: activeProfile(env),
       })}\n`,
     );
     out(
@@ -1128,7 +1134,15 @@ export const runDoctor = async (options: RunDoctorOptions = {}): Promise<number>
   // §13.3 derived info — capability ceiling + engine version.
   // Always rendered (informational, not pass/fail signals).
   out(`capability ceiling: [${capabilityCeiling.join(', ')}]\n`);
-  out(`engine version: ${engineVersion}\n\n`);
+  out(`engine version: ${engineVersion}\n`);
+  // Profile namespace — only printed when active, so default installs see no
+  // extra noise. A non-null value means every dir above is the isolated
+  // `forja-<profile>` variant, not the operator's real `forja` state.
+  const profile = activeProfile(env);
+  if (profile !== null) {
+    out(`profile: ${profile} (isolated namespace — not your default forja state)\n`);
+  }
+  out('\n');
   if (failCount === 0 && warnCount === 0) {
     out('summary: all checks passed\n');
   } else if (failCount === 0) {

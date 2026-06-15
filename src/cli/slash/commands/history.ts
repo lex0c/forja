@@ -21,6 +21,7 @@
 
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { projectDirName } from '../../../config/app-namespace.ts';
 import { HISTORY_CAP, clearHistory, countHistory, loadHistory } from '../../../storage/history.ts';
 import type { SlashCommand, SlashContext } from '../types.ts';
 
@@ -74,7 +75,7 @@ const wipe = (ctx: SlashContext, alsoDisable: boolean): string[] => {
     // `mkdir -p .forja` in case bootstrap hasn't created it yet
     // (early projects; rare). The marker is empty — its existence
     // alone is the signal storage checks.
-    const agentDir = join(ctx.baseConfig.cwd, '.forja');
+    const agentDir = join(ctx.baseConfig.cwd, projectDirName());
     try {
       mkdirSync(agentDir, { recursive: true });
       writeFileSync(join(agentDir, 'no-history'), '');

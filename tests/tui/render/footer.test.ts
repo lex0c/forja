@@ -30,6 +30,18 @@ const startedSession = (overrides: Partial<LiveState['status']> = {}): LiveState
 };
 
 describe('renderFooter', () => {
+  test('isolation-profile chip shows when a profile is active', () => {
+    const out = renderFooter(startedSession({ profile: 'dev' }), caps);
+    expect(out).not.toBeNull();
+    expect(out).toContain('profile:dev');
+  });
+
+  test('no profile chip on the default namespace', () => {
+    const out = renderFooter(startedSession({ profile: null }), caps);
+    expect(out).not.toBeNull();
+    expect(out).not.toContain('profile:');
+  });
+
   test('bash mode replaces the footer with the shell-mode indicator', () => {
     const s = startedSession();
     const out = renderFooter({ ...s, input: { value: '!ls', cursor: 3 } }, caps);

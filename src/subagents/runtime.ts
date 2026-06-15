@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { projectDirName } from '../config/app-namespace.ts';
 import type { HarnessEvent } from '../harness/index.ts';
 import type { HookSpec } from '../hooks/types.ts';
 import type { PermissionEngine } from '../permissions/index.ts';
@@ -753,7 +754,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
   // the path here and forward it. For tests that inject a fake
   // spawn, the path is still computed (deterministic shape) but
   // unused by the fake.
-  const bgLogDir = join(input.cwd, '.forja', 'bg', 'subagents', childSession.id);
+  const bgLogDir = join(input.cwd, projectDirName(), 'bg', 'subagents', childSession.id);
   let handle: ChildProcessHandle;
   try {
     handle = spawn({

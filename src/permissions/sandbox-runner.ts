@@ -56,6 +56,7 @@
 
 import { existsSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { join as joinPath, resolve as resolveAbs } from 'node:path';
+import { appDirNames } from '../config/app-namespace.ts';
 import { defaultDataDir, forjaCachePersistBase } from '../storage/paths.ts';
 import { startsWithSegment } from './protected_paths.ts';
 import { SANDBOX_SAFE_ENV_VARS as SAFE_ENV_VARS } from './safe-env-vars.ts';
@@ -71,7 +72,7 @@ import {
   normalizeCacheDir,
 } from './sandbox-cache-dirs.ts';
 import { buildCacheRedirectEnv, getCachePersistenceOverride } from './sandbox-cache-env.ts';
-import { HIDE_PATHS_DIRS, HIDE_PATHS_FILES } from './sandbox-hide-paths.ts';
+import { HIDE_PATHS_FILES, hidePathsDirs } from './sandbox-hide-paths.ts';
 import { SANDBOX_PROFILE_ORDER, type SandboxProfile, isSandboxProfile } from './sandbox-plan.ts';
 import { buildSandboxExecArgv } from './sandbox-runner-macos.ts';
 
@@ -487,7 +488,7 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
   // the bound cwd inside the sandbox. The inner process would
   // receive a working dir that "vanishes" — opaque bwrap failure
   // with no diagnostic. Refuse at build time with a clear error.
-  for (const dir of HIDE_PATHS_DIRS) {
+  for (const dir of hidePathsDirs()) {
     const hiddenAbs = joinPath(home, dir);
     if (cwd === hiddenAbs || cwd.startsWith(`${hiddenAbs}/`)) {
       throw new Error(
@@ -680,44 +681,49 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
   // creates the mount regardless of host state — every sandbox
   // gets the same shape regardless of whether the operator
   // happens to have `~/.gnupg` set up.
-  for (const dir of HIDE_PATHS_DIRS) {
+  for (const dir of hidePathsDirs()) {
     const abs = joinPath(home, dir);
     if (shouldMask(abs)) flags.push('--tmpfs', abs);
   }
-  // XDG_DATA_HOME unmask. `defaultDataDir()` honors $XDG_DATA_HOME
-  // at runtime; when the operator sets it outside
-  // `$HOME/.local/share`, the canonical `.local/share/forja` overlay
-  // above covers the WRONG path — the sandboxed process on
-  // `home-rw` would have writable access to the live audit DB at
-  // the XDG location. Inject an extra overlay for the live data
-  // dir when it differs from the home-relative default. Idempotent:
-  // when XDG_DATA_HOME is unset, `liveDataDir ===
-  // homeRelativeDataDir` and we skip.
+  // XDG_DATA_HOME unmask. When the operator sets $XDG_DATA_HOME outside
+  // `$HOME/.local/share`, the real data lives at `<xdg>/forja*` and the
+  // home-relative HIDE_PATHS loop above masks the WRONG path — a sandboxed
+  // process on `home-rw` would reach the live audit DB / sessions at the XDG
+  // location. Overlay a tmpfs there.
   //
-  // Absolute-path guard mirrors the XDG_CONFIG_HOME branch below.
-  // Per XDG Base Directory Spec, implementations SHOULD ignore
-  // relative values — without the guard, a relative XDG_DATA_HOME
-  // produces a relative `liveDataDir` like `relative/forja`,
-  // which becomes an invalid bwrap mount target and crashes the
-  // sandbox at spawn time instead of falling back to the
-  // home-relative default (which is already masked by the
-  // HIDE_PATHS_DIRS loop above — `.local/share/forja` covers it).
-  const liveDataDir = defaultDataDir();
-  const homeRelativeDataDir = joinPath(home, '.local', 'share', 'forja');
+  // Iterate `appDirNames()` (NOT just the active `defaultDataDir()`): under
+  // `--profile dev` that returns both `forja` AND `forja-dev`, so the dev
+  // sandbox masks the operator's CANONICAL data dir at the XDG location too —
+  // otherwise the profile's isolation leaks (dev session reads the real
+  // sessions.db at `<xdg>/forja`). Mirrors the XDG_CONFIG_HOME branch below.
+  //
+  // Absolute-path guard per XDG Base Directory Spec (relative values are
+  // ignored): a relative $XDG_DATA_HOME would yield an invalid bwrap mount
+  // target, and the home-relative default it falls back to is already masked
+  // by the HIDE_PATHS loop above. Skipped when unset / exactly home-relative.
+  // Read process.env (NOT options.env): the REAL host data dir location is
+  // governed by the operator's environment — the same source defaultDataDir()
+  // resolved before this fix — not the sandbox's scrubbed env.
+  const xdgData = process.env.XDG_DATA_HOME;
+  const homeRelativeDataBase = joinPath(home, '.local', 'share');
   if (
-    liveDataDir.startsWith('/') &&
-    liveDataDir !== homeRelativeDataDir &&
-    shouldMask(liveDataDir)
+    xdgData !== undefined &&
+    xdgData.length > 0 &&
+    xdgData.startsWith('/') &&
+    xdgData !== homeRelativeDataBase
   ) {
-    flags.push('--tmpfs', liveDataDir);
+    for (const seg of appDirNames()) {
+      const abs = joinPath(xdgData, seg);
+      if (shouldMask(abs)) flags.push('--tmpfs', abs);
+    }
   }
   // XDG_CONFIG_HOME unmask. Analog of the XDG_DATA_HOME fix above.
   // When the operator relocates XDG_CONFIG_HOME outside `~/.config`
   // (e.g. `/srv/conf`), the canonical HIDE_PATHS_DIRS entries
   // beginning with `.config/` cover the WRONG path on disk: bwrap
-  // masks `<home>/.config/{gcloud,azure,op,sops,agent,forja}` while
+  // masks `<home>/.config/{gcloud,azure,op,sops,forja[-<profile>]}` while
   // the REAL credentials live at
-  // `<xdg-config>/{gcloud,azure,op,sops,agent,forja}`. Add a tmpfs
+  // `<xdg-config>/{gcloud,azure,op,sops,forja[-<profile>]}`. Add a tmpfs
   // overlay at the relocated location for each `.config/*` entry.
   // Idempotent: when XDG_CONFIG_HOME is unset (or set to exactly
   // `<home>/.config`), the effective path matches the home-relative
@@ -739,7 +745,7 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
     xdgConfig !== homeRelativeConfig
   ) {
     // DIRS: tmpfs overlay at the relocated `.config/*` dir.
-    for (const dir of HIDE_PATHS_DIRS) {
+    for (const dir of hidePathsDirs()) {
       if (!dir.startsWith('.config/')) continue;
       const sub = dir.slice('.config/'.length);
       const abs = joinPath(xdgConfig, sub);

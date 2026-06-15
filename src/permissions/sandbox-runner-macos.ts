@@ -35,10 +35,11 @@
 
 import { realpathSync } from 'node:fs';
 import { join as joinPath } from 'node:path';
-import { defaultDataDir, forjaCachePersistBase } from '../storage/paths.ts';
+import { appDirNames } from '../config/app-namespace.ts';
+import { forjaCachePersistBase } from '../storage/paths.ts';
 import { SANDBOX_SAFE_ENV_VARS } from './safe-env-vars.ts';
 import { buildCacheRedirectEnv, getCachePersistenceOverride } from './sandbox-cache-env.ts';
-import { HIDE_PATHS_DIRS, HIDE_PATHS_FILES } from './sandbox-hide-paths.ts';
+import { HIDE_PATHS_FILES, hidePathsDirs } from './sandbox-hide-paths.ts';
 import type { SandboxProfile } from './sandbox-plan.ts';
 
 export interface BuildSandboxExecArgvOptions {
@@ -353,7 +354,7 @@ export const buildSbplProfile = (
   // there too. Canonical lists from `sandbox-hide-paths.ts`,
   // shared with the Linux bwrap runner.
   const denyRules: string[] = [];
-  for (const dir of HIDE_PATHS_DIRS) {
+  for (const dir of hidePathsDirs()) {
     const absDir = joinPath(home, dir);
     const escaped = escapeSbplLiteral(absDir);
     denyRules.push(`(deny file-read* (subpath "${escaped}"))`);
@@ -378,29 +379,36 @@ export const buildSbplProfile = (
     denyRules.push(`(deny file-read* (literal "${escaped}"))`);
     denyRules.push(`(deny file-write* (literal "${escaped}"))`);
   }
-  // XDG_DATA_HOME unmask. Same gap as the Linux runner —
-  // `.local/share/forja` is only the home-relative default;
-  // `defaultDataDir()` honors $XDG_DATA_HOME at runtime. When the
-  // operator sets XDG_DATA_HOME outside $HOME/.local/share, the
-  // canonical literal deny covers the wrong subpath and the
-  // sandboxed process on `home-rw` can read/write the live audit
-  // DB. Idempotent: when XDG_DATA_HOME is unset, liveDataDir
-  // matches the home-relative default and the extra rule is
-  // redundant (SBPL accepts duplicate denies; last-match-wins).
+  // XDG_DATA_HOME unmask. Same gap as the Linux runner — when the operator
+  // sets XDG_DATA_HOME outside $HOME/.local/share, the real data lives at
+  // `<xdg>/forja*` and the home-relative deny covers the wrong subpath, so a
+  // sandboxed process on `home-rw` could read/write the live audit DB there.
   //
-  // Absolute-path guard: per XDG Base Directory Spec, relative
-  // values SHOULD be ignored. SBPL subpath rules require absolute
-  // paths, and a relative `liveDataDir` would either be rejected by
-  // `sandbox-exec` at profile-load time OR silently fail to match
-  // the actual data dir (worse: silent unmask). Skip the extra rule
-  // when XDG_DATA_HOME is non-absolute; the home-relative deny for
-  // `.local/share/forja` above still covers the canonical path.
-  const liveDataDir = defaultDataDir();
-  const homeRelativeDataDir = joinPath(home, '.local', 'share', 'forja');
-  if (liveDataDir.startsWith('/') && liveDataDir !== homeRelativeDataDir) {
-    const escaped = escapeSbplLiteral(liveDataDir);
-    denyRules.push(`(deny file-read* (subpath "${escaped}"))`);
-    denyRules.push(`(deny file-write* (subpath "${escaped}"))`);
+  // Iterate `appDirNames()` (NOT just the active `defaultDataDir()`): under
+  // `--profile dev` it returns both `forja` AND `forja-dev`, so the dev
+  // sandbox also denies the operator's CANONICAL data dir at the XDG location
+  // — otherwise the profile's isolation leaks. Mirrors the XDG_CONFIG_HOME
+  // block below; reads `process.env` directly (the SBPL builder takes no env
+  // param). Idempotent when XDG_DATA_HOME is unset (the home-relative deny
+  // above already covers the canonical path).
+  //
+  // Absolute-path guard: per XDG Base Directory Spec relative values SHOULD be
+  // ignored; SBPL subpath rules require absolute paths, and a relative value
+  // would be rejected at profile-load OR silently fail to match (silent
+  // unmask). Skip when XDG_DATA_HOME is non-absolute / exactly home-relative.
+  const xdgData = process.env.XDG_DATA_HOME;
+  const homeRelativeDataBase = joinPath(home, '.local', 'share');
+  if (
+    xdgData !== undefined &&
+    xdgData.length > 0 &&
+    xdgData.startsWith('/') &&
+    xdgData !== homeRelativeDataBase
+  ) {
+    for (const seg of appDirNames()) {
+      const escaped = escapeSbplLiteral(joinPath(xdgData, seg));
+      denyRules.push(`(deny file-read* (subpath "${escaped}"))`);
+      denyRules.push(`(deny file-write* (subpath "${escaped}"))`);
+    }
   }
   // XDG_CONFIG_HOME unmask — macOS parity with the Linux runner.
   // Same shape as the XDG_DATA_HOME block above; covers
@@ -417,7 +425,7 @@ export const buildSbplProfile = (
     xdgConfig.startsWith('/') &&
     xdgConfig !== homeRelativeConfig
   ) {
-    for (const dir of HIDE_PATHS_DIRS) {
+    for (const dir of hidePathsDirs()) {
       if (!dir.startsWith('.config/')) continue;
       const sub = dir.slice('.config/'.length);
       const absDir = joinPath(xdgConfig, sub);
@@ -523,7 +531,7 @@ export const buildSandboxExecArgv = (options: BuildSandboxExecArgvOptions): stri
   // sandbox, exec then fails with an opaque SBPL error rather than
   // a clear build-time refuse. Mirrors the Linux bwrap runner's
   // refuse. Applies to the canonicalized cwd computed above.
-  for (const dir of HIDE_PATHS_DIRS) {
+  for (const dir of hidePathsDirs()) {
     const hiddenAbs = joinPath(home, dir);
     if (cwd === hiddenAbs || cwd.startsWith(`${hiddenAbs}/`)) {
       throw new Error(

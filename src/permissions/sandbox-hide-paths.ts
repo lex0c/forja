@@ -1,3 +1,5 @@
+import { appDirNames } from '../config/app-namespace.ts';
+
 // Canonical credential-path lists. Both the Linux bwrap runner
 // and the macOS sandbox-exec runner mask these paths inside every
 // sandbox profile to prevent the LLM from reading credentials
@@ -58,22 +60,36 @@
 // versions; even modern svn stores enough in this dir to ship to
 // a remote. Mask the `auth` subdir only, not all of
 // `.subversion` — the rest of svn config is legitimate to read.
-export const HIDE_PATHS_DIRS: readonly string[] = [
+// Static credential dirs (non-Forja). Forja's own config+data dirs are
+// appended, profile-aware, by `hidePathsDirs()`.
+const HIDE_PATHS_DIRS_BASE: readonly string[] = [
   '.ssh',
   '.aws',
   '.config/gcloud',
   '.config/azure',
   '.config/op',
   '.config/sops',
-  '.config/forja',
   '.gnupg',
   '.kube',
   '.terraform.d',
   '.ansible',
-  '.local/share/forja',
   '.rustup',
   '.subversion/auth',
 ];
+
+// A function (not a const) so `--profile` set at CLI startup is honored —
+// Forja's own dirs are resolved at call time. Masks BOTH the canonical
+// `.config/forja` + `.local/share/forja` AND, under a profile, the
+// `forja-<profile>` variants, so neither install's audit DB / install_id /
+// secrets leak into the other's sandbox. No profile ⇒ identical to the
+// pre-profile list (canonical only).
+export const hidePathsDirs = (env: NodeJS.ProcessEnv = process.env): readonly string[] => {
+  const own: string[] = [];
+  for (const seg of appDirNames(env)) {
+    own.push(`.config/${seg}`, `.local/share/${seg}`);
+  }
+  return [...HIDE_PATHS_DIRS_BASE, ...own];
+};
 
 // Individual files masked as non-existent / empty inside the
 // sandbox.

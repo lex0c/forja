@@ -2,6 +2,74 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-15] dev-mode: isolated `--profile` namespace (dev vs real state)
+
+The maintainer develops Forja AND uses it on real projects from the same machine,
+so a dev build was migrating/polluting the operator's real sessions DB, config,
+memory, and trust list. dev-mode gives each `--profile <name>` (or `FORJA_PROFILE`
+env) a FULLY isolated on-disk namespace: user-level `~/.config/forja-<name>`,
+`~/.local/share/forja-<name>`, `~/.cache/forja-<name>`, and per-project
+`<cwd>/.forja-<name>/`. No profile ⇒ the canonical `forja`/`.forja`,
+byte-identical to before.
+
+Keystone is `src/config/app-namespace.ts`: `appDirName()` / `projectDirName()`
+(profile-aware path segments), `activeProfile()` (diagnostics), `appDirNames()`
+(canonical + active-profile, for the security lists), and `isValidProfile()` —
+the profile name is allowlisted char-by-char to `[a-z0-9][a-z0-9-]*` (no regex;
+rejects `/`, `..`, leading hyphen, empty) since it becomes a path segment. A
+malformed profile THROWS rather than silently falling back to the real namespace
+(that would defeat the isolation the operator asked for).
+
+Routed ~20 resolvers through the helpers (storage/paths, agent-paths,
+memory/paths, trust/paths, subagents/paths, skills/paths, sandbox-skip,
+worktree, history, bootstrap bg/banner, purge, init, runtime bg, slash
+memory/history, permission-policy-rollback, eval executor, gitignore, plus the
+user-facing "create `.forja/permissions.yaml`" hints in repl/render/
+explain-permissions). The security lists became profile-aware functions:
+`hidePathsDirs()` (sandbox masking) and `tildeEscalateDirs()` (engine
+escalate-on-write) now cover BOTH the canonical `forja` AND the active
+`forja-<profile>` dirs, so a dev sandbox can't read the operator's real audit
+DB/secrets and vice-versa — and the conversion deduped a latent double
+`.config/forja` entry. `FORJA_PROFILE` is not credential-shaped, so `scrubEnv`
+already preserves it across the subagent + broker-worker spawn boundaries
+(verified the broker worker resolves no profile path; the parent builds all
+sandbox args).
+
+Entry point: a global `--profile` pre-pass (`src/cli/profile-flag.ts`,
+`applyProfileFlag`) runs in `index.ts` BEFORE parseArgs and any resolver — it
+sets `process.env.FORJA_PROFILE`, strips the flag (every subcommand parser would
+reject it), and validates flag-or-env value to a clean usage error instead of a
+deep throw. Ergonomics: `bun run dev` now runs under `FORJA_PROFILE=dev`;
+`forja doctor` reports the profile (JSON `info.profile` + a footer line) and its
+`data_dir` check stopped hardcoding `forja`; the boot banner gains a yellow
+`profile: <name> (isolated namespace)` line and the always-visible footer a
+yellow `profile:<name>` chip (threaded through `SessionBannerEvent` →
+`StatusState`/`session-banner` item, no env reads in the renderers); root
+`.gitignore` ignores `.forja-*/`; `--profile` documented in `usage()` (which also
+shed two stale `agent` references from the rename). New tests: app-namespace
+helpers, `applyProfileFlag` parse/validation/strip, profile cases on agent-paths
++ sandbox-hide-paths, doctor profile output + data_dir, footer/banner chips.
+typecheck + lint clean; permissions (2309) + cli/storage/trust/memory/subagents
+(4295) + focused (445) all green; end-to-end smoke confirmed isolation under a
+temp HOME.
+
+Code review (9 finder angles + inline verify) surfaced one real isolation gap:
+the sandbox XDG_DATA_HOME overlay (linux bwrap + macOS SBPL) masked only the
+ACTIVE profile's data dir, so under `--profile dev` + a relocated XDG_DATA_HOME
++ `home-rw`, a dev sandbox could still read the operator's REAL `forja`
+sessions/audit DB at `<xdg>/forja`. Fixed both runners to iterate `appDirNames()`
+(mask canonical + profile), mirroring the XDG_CONFIG_HOME branch; reads
+`process.env` (the host data-dir source defaultDataDir used), with a regression
+test asserting both dirs are masked under a profile. Also folded in: forward
+`FORJA_PROFILE` through the broker worker's sandbox `passthroughEnv`
+(defense-in-depth — the worker resolves no namespaced path today but a future
+lookup must stay in-namespace); made `purge`'s PRESERVED_PATHS dry-run text +
+the welcome sandbox-skip fallback profile-aware; dropped a dead `=== ''` footer
+guard and a no-op argv reconstruction in `applyProfileFlag`; fixed stale
+`agent`/`6 .config/*` comments and one more `agent "your prompt"` rename
+leftover in the welcome next-steps. typecheck + lint clean; permissions (2578,
+one cross-process audit test flaked under load, green in isolation) green.
+
 ## [2026-06-15] Prompt: drop the model id from the # Environment block
 
 The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,

@@ -23,12 +23,12 @@
 
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { projectDirName } from '../config/app-namespace.ts';
 import { HISTORY_CAP } from '../storage/history.ts';
 import type { Bus } from '../tui/bus.ts';
 
 const ACK_MARKER = 'forja-history-acked';
 const NO_HISTORY_MARKER = 'no-history';
-const AGENT_DIR = '.forja';
 
 export interface MaybeEmitHistoryBannerOptions {
   bus: Bus;
@@ -53,7 +53,7 @@ export const maybeEmitHistoryBanner = (options: MaybeEmitHistoryBannerOptions): 
 
   // Permanent disables (env / file marker) suppress the banner.
   if (options.ignoreEnv !== true && process.env.FORJA_NO_HISTORY === '1') return false;
-  const agentDir = join(cwd, AGENT_DIR);
+  const agentDir = join(cwd, projectDirName());
   if (existsSync(join(agentDir, NO_HISTORY_MARKER))) return false;
 
   // Already acked: stay quiet.
@@ -67,7 +67,7 @@ export const maybeEmitHistoryBanner = (options: MaybeEmitHistoryBannerOptions): 
   bus.emit({
     type: 'info',
     ts: now(),
-    message: `history: persisted to ${AGENT_DIR}/forja.db (${HISTORY_CAP} entry cap)`,
+    message: `history: persisted to ${projectDirName()}/forja.db (${HISTORY_CAP} entry cap)`,
   });
   bus.emit({
     type: 'info',

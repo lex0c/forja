@@ -92,6 +92,11 @@ export type SessionBannerEvent = BaseEvent & {
   // first frame. Optional — absent keeps the reducer's current value.
   // Runtime changes ride `effort:change`.
   effort?: ForjaEffort;
+  // Active isolation profile (`--profile` / FORJA_PROFILE), or null on the
+  // default namespace. Drives the banner line + always-visible footer chip
+  // so the operator can't mistake a dev/test run for their real Forja state.
+  // Optional — absent keeps the reducer's current value (null default).
+  profile?: string | null;
 };
 export type SessionEndEvent = BaseEvent & {
   type: 'session:end';

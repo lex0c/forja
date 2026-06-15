@@ -10,6 +10,7 @@ import {
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
 import { type BootstrapInput, bootstrap } from '../cli/bootstrap.ts';
+import { projectDirName } from '../config/app-namespace.ts';
 import {
   type CompactionStrategy,
   type HarnessEvent,
@@ -167,9 +168,9 @@ const setupCwd = (caseDef: EvalCase): string => {
   // Drop a default permissions.yaml only when the case+fixture
   // didn't provide one. Checking after fixture+files copy lets
   // either source override the default.
-  const policyPath = join(dir, '.forja/permissions.yaml');
+  const policyPath = join(dir, projectDirName(), 'permissions.yaml');
   if (!existsSync(policyPath)) {
-    mkdirSync(join(dir, '.forja'), { recursive: true });
+    mkdirSync(join(dir, projectDirName()), { recursive: true });
     writeFileSync(policyPath, DEFAULT_EVAL_POLICY_YAML);
   }
   return dir;

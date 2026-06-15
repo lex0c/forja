@@ -148,6 +148,15 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
   if (subagentCount > 0) {
     rightParts.push(paint(caps, 'success', `${subagentCount} subagents`));
   }
+  // Isolation profile (`--profile`/FORJA_PROFILE). The banner scrolls out of
+  // view, so this is the always-visible guard against mistaking a dev/test
+  // run for real Forja state. Painted `warn` (yellow) — the one static chip
+  // that isn't `dim`, because it's a safety signal, not passive info.
+  // Suppressed on the default namespace (profile null) so normal runs see no
+  // extra chip.
+  if (status.profile !== null) {
+    rightParts.push(paint(caps, 'warn', `profile:${status.profile}`));
+  }
   // Loaded model id (e.g. `claude-opus-4-8`). Also on the startup banner's
   // identity line (render/permanent.ts), but kept here too: the banner scrolls
   // out of view, so the footer is the always-visible place to confirm which

@@ -1,6 +1,7 @@
 import { chmodSync, existsSync, lstatSync, mkdirSync, rmSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { appDirName } from '../config/app-namespace.ts';
 import { getGitBinary, safeGitEnv } from './git-binary.ts';
 import { type ValidationResult, validateWorktreeContents } from './worktree-validation.ts';
 
@@ -37,7 +38,7 @@ export const defaultWorktreeRoot = (env: NodeJS.ProcessEnv = process.env): strin
   const xdg = env.XDG_CACHE_HOME;
   const home = env.HOME ?? homedir();
   const cache = xdg !== undefined && xdg.length > 0 ? xdg : join(home, '.cache');
-  return join(cache, 'forja', 'worktrees');
+  return join(cache, appDirName(env), 'worktrees');
 };
 
 // Slug a free-form user prompt into a kebab-cased fragment safe
