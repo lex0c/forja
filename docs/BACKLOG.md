@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-15] OpenAI Responses replay: preserve interleaved reasoning↔tool order
+
+`toResponsesInput` batched all reasoning items ahead of all tool calls, discarding
+the order `CollectedStep.order` now preserves — so a multi-reasoning/tool turn
+[rs1, call1, rs2, call2] replayed as [rs1, rs2, call1, call2], orphaning rs1 from
+call1. OpenAI rejects exactly that ("reasoning item without its required following
+item"), so default-on replay could still 400 on those turns (the Anthropic
+interleaving fix didn't cover the OpenAI re-bucketing). Rewrote the assistant
+branch to emit blocks in original order (reasoning items / function_calls / the
+message in place), with the codex `phase` still pre-scanned (its sentinel sits
+after the text it stamps) and the encrypted_content drop-guard intact. The
+single-reasoning ordering (reasoning before message+call) still holds. Test:
+[rs1, call1, rs2, call2] replays in that exact order.
+
 ## [2026-06-15] OpenAI Responses: reject malformed tool args (was silently {})
 
 The Responses normalizer turned a malformed/truncated `function_call` arguments

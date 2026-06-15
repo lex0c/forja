@@ -56,86 +56,90 @@ const toResponsesInput = (messages: ProviderMessage[], reasoningReplay = false):
       items.push({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content });
       continue;
     }
-    const textParts: string[] = [];
-    const toolCalls: unknown[] = [];
-    const toolOutputs: unknown[] = [];
-    const reasoningItems: unknown[] = [];
+    // Codex message `phase` is carried by a sentinel reasoning block that the
+    // stream emits at the message item's position — AFTER the text it stamps —
+    // so pre-scan for it before walking (a single value; last wins).
     let messagePhase: string | undefined;
-    for (const block of m.content) {
-      if (block.type === 'text') {
-        textParts.push(block.text);
-      } else if (block.type === 'tool_use') {
-        toolCalls.push({
-          type: 'function_call',
-          call_id: block.id,
-          name: block.name,
-          arguments: JSON.stringify(block.input),
-        });
-      } else if (block.type === 'tool_result') {
-        toolOutputs.push({
-          type: 'function_call_output',
-          call_id: block.tool_use_id,
-          output: block.content,
-        });
-      } else if (block.type === 'reasoning') {
-        // Replay same-provider reasoning state when enabled; foreign-tagged +
-        // flag-off → dropped (Phase 1 behavior).
-        if (!reasoningReplay || block.provider !== 'openai') continue;
-        const sentinel = block.data as { __forja_message_phase?: unknown } | null;
+    if (m.role === 'assistant' && reasoningReplay) {
+      for (const block of m.content) {
+        if (block.type !== 'reasoning' || block.provider !== 'openai') continue;
+        const s = block.data as { __forja_message_phase?: unknown } | null;
         if (
-          sentinel !== null &&
-          typeof sentinel === 'object' &&
-          '__forja_message_phase' in sentinel
+          s !== null &&
+          typeof s === 'object' &&
+          '__forja_message_phase' in s &&
+          typeof s.__forja_message_phase === 'string'
         ) {
-          // Not a real reasoning item — the codex message `phase` carrier.
-          // Re-stamp it onto the assistant message below instead of pushing it.
-          if (typeof sentinel.__forja_message_phase === 'string') {
-            messagePhase = sentinel.__forja_message_phase;
-          }
-        } else {
-          // The captured reasoning output item, replayed VERBATIM (encrypted_
-          // content / id / its own phase round-trip inside `data`). In stateless
-          // mode (`store: false`) ONLY an item carrying `encrypted_content` can
-          // be replayed; an item captured under a flag-OFF request never asked
-          // for `include: ['reasoning.encrypted_content']`, so it lacks the
-          // field and would 400 ("reasoning item ... without encrypted_content")
-          // after a later flag flip — drop it rather than break the request.
-          const item = block.data as { encrypted_content?: unknown } | null;
-          if (
-            item !== null &&
-            typeof item === 'object' &&
-            typeof item.encrypted_content === 'string' &&
-            item.encrypted_content.length > 0
-          ) {
-            reasoningItems.push(block.data);
-          }
+          messagePhase = s.__forja_message_phase;
         }
       }
     }
-    items.push(...toolOutputs);
+
     if (m.role === 'assistant') {
-      // Reasoning items come FIRST — before the assistant message and the tool
-      // calls — mirroring the model's own output order (it reasons, THEN emits
-      // the message / function_call) and the order the loop stores the blocks.
-      // OpenAI's stateless replay rejects a reasoning item that is not directly
-      // followed by the item it generated ("Item 'rs_…' of type 'reasoning' was
-      // provided without its required following item"); hoisting the assistant
-      // message ahead of the reasoning triggered that 400 — intermittently,
-      // only on the turns that also emitted assistant text (the A/B's ~70%
-      // providerError rate on the long-horizon chain).
-      items.push(...reasoningItems);
-      if (textParts.length > 0) {
+      // Emit blocks in ORIGINAL order (the loop preserves it via CollectedStep.order)
+      // so each reasoning item stays directly followed by the item it generated.
+      // OpenAI's stateless replay rejects a reasoning item not directly followed by
+      // its generated item ("Item 'rs_…' of type 'reasoning' was provided without
+      // its required following item"); batching all reasoning ahead of all tool
+      // calls would break a multi-reasoning/tool turn like [rs1, call1, rs2, call2].
+      let pendingText = '';
+      const flushText = (): void => {
+        if (pendingText.length === 0) return;
         items.push({
           role: 'assistant',
-          content: textParts.join(''),
-          // Re-stamp the codex message phase so the assistant item round-trips
-          // it (the harness rebuilds the message from text and would lose it).
+          content: pendingText,
+          // Re-stamp the codex phase (the harness rebuilds the message from text
+          // and would otherwise lose it).
           ...(messagePhase !== undefined ? { phase: messagePhase } : {}),
         });
+        pendingText = '';
+      };
+      for (const block of m.content) {
+        if (block.type === 'text') {
+          pendingText += block.text;
+        } else if (block.type === 'tool_use') {
+          flushText();
+          items.push({
+            type: 'function_call',
+            call_id: block.id,
+            name: block.name,
+            arguments: JSON.stringify(block.input),
+          });
+        } else if (block.type === 'reasoning') {
+          // Foreign-tagged or flag-off → dropped. Sentinel (phase) → already
+          // pre-scanned. A real item replays VERBATIM, but ONLY if it carries
+          // `encrypted_content` (stateless mode rejects one without it — an item
+          // captured under a flag-OFF request lacks it; drop rather than 400).
+          if (!reasoningReplay || block.provider !== 'openai') continue;
+          const data = block.data as {
+            __forja_message_phase?: unknown;
+            encrypted_content?: unknown;
+          } | null;
+          if (data === null || typeof data !== 'object') continue;
+          if ('__forja_message_phase' in data) continue;
+          if (typeof data.encrypted_content === 'string' && data.encrypted_content.length > 0) {
+            flushText();
+            items.push(block.data);
+          }
+        }
       }
-      items.push(...toolCalls);
-    } else if (textParts.length > 0) {
-      items.push({ role: 'user', content: textParts.join('') });
+      flushText();
+    } else {
+      // User message: tool outputs first (they read as answers to the prior
+      // calls), then any text.
+      const textParts: string[] = [];
+      for (const block of m.content) {
+        if (block.type === 'tool_result') {
+          items.push({
+            type: 'function_call_output',
+            call_id: block.tool_use_id,
+            output: block.content,
+          });
+        } else if (block.type === 'text') {
+          textParts.push(block.text);
+        }
+      }
+      if (textParts.length > 0) items.push({ role: 'user', content: textParts.join('') });
     }
   }
   return items;

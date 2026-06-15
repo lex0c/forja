@@ -564,6 +564,53 @@ describe('createOpenAIProvider — Responses routing for reasoning models', () =
       });
     });
 
+    test('on: preserves interleaved order of MULTIPLE reasoning items + tool calls', async () => {
+      // [rs1, call1, rs2, call2] must replay in that exact order — NOT batched to
+      // [rs1, rs2, call1, call2], which orphans rs1 from call1 and 400s.
+      await withReplay(true, async () => {
+        const handle = mockResponsesClient([
+          { type: 'response.created', response: { id: 'r' } },
+          { type: 'response.completed', response: {} },
+        ]);
+        const provider = createOpenAIProvider('gpt-5.4-mini', { client: handle.client });
+        for await (const _ of provider.generate({
+          model: 'gpt-5.4-mini',
+          max_tokens: 8,
+          effort: 'high',
+          messages: [
+            {
+              role: 'assistant',
+              content: [
+                {
+                  type: 'reasoning',
+                  provider: 'openai',
+                  data: { type: 'reasoning', id: 'rs1', encrypted_content: 'E1' },
+                },
+                { type: 'tool_use', id: 'call_1', name: 'read', input: { p: '/a' } },
+                {
+                  type: 'reasoning',
+                  provider: 'openai',
+                  data: { type: 'reasoning', id: 'rs2', encrypted_content: 'E2' },
+                },
+                { type: 'tool_use', id: 'call_2', name: 'read', input: { p: '/b' } },
+              ],
+            },
+            { role: 'user', content: 'go' },
+          ],
+        })) {
+          // drain
+        }
+        const { input } = handle.calls[0] as {
+          input: Array<{ type?: string; id?: string; call_id?: string }>;
+        };
+        // Keep only the assistant-turn reasoning/function_call items, in order.
+        const seq = input
+          .filter((i) => i.type === 'reasoning' || i.type === 'function_call')
+          .map((i) => (i.type === 'reasoning' ? i.id : i.call_id));
+        expect(seq).toEqual(['rs1', 'call_1', 'rs2', 'call_2']);
+      });
+    });
+
     test('on: codex message phase is re-stamped on the assistant message, not pushed as an item', async () => {
       await withReplay(true, async () => {
         const handle = mockResponsesClient([
