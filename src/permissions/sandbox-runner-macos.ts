@@ -35,7 +35,7 @@
 
 import { realpathSync } from 'node:fs';
 import { join as joinPath } from 'node:path';
-import { appDirNames } from '../config/app-namespace.ts';
+import { appDirNames, foreignProjectDirNames } from '../config/app-namespace.ts';
 import { forjaCachePersistBase } from '../storage/paths.ts';
 import { SANDBOX_SAFE_ENV_VARS } from './safe-env-vars.ts';
 import { buildCacheRedirectEnv, getCachePersistenceOverride } from './sandbox-cache-env.ts';
@@ -357,6 +357,18 @@ export const buildSbplProfile = (
   for (const dir of hidePathsDirs()) {
     const absDir = joinPath(home, dir);
     const escaped = escapeSbplLiteral(absDir);
+    denyRules.push(`(deny file-read* (subpath "${escaped}"))`);
+    denyRules.push(`(deny file-write* (subpath "${escaped}"))`);
+  }
+  // Project read-floor (profile isolation) — parity with the Linux runner's
+  // foreign-dir tmpfs overlay. Deny read+write of any FOREIGN project dir (the
+  // operator's REAL `.forja/` under a profile) under cwd, so a profiled
+  // session's sandboxed bash can't disclose the real project's
+  // memory/config/traces. The active `.forja-<profile>/` is NOT in the list and
+  // stays accessible; the later deny wins over the cwd/home write-allow above.
+  // Empty on the default namespace ⇒ no rules added.
+  for (const dir of foreignProjectDirNames()) {
+    const escaped = escapeSbplLiteral(joinPath(cwd, dir));
     denyRules.push(`(deny file-read* (subpath "${escaped}"))`);
     denyRules.push(`(deny file-write* (subpath "${escaped}"))`);
   }

@@ -2562,3 +2562,50 @@ describe.skipIf(E2E_UNAVAILABLE)(
     });
   },
 );
+
+// Project read floor (profile isolation): a profiled session's sandbox must
+// mask the operator's REAL canonical `.forja/` under cwd, while leaving the
+// session's own `.forja-<profile>/` readable.
+describe('buildBwrapArgv — profile read floor (foreign .forja/ masking)', () => {
+  test('under FORJA_PROFILE: tmpfs-masks <cwd>/.forja but NOT the active <cwd>/.forja-<profile>', () => {
+    const prev = process.env.FORJA_PROFILE;
+    process.env.FORJA_PROFILE = 'dev';
+    try {
+      const argv = buildBwrapArgv({
+        profile: 'cwd-rw',
+        cwd: CWD,
+        home: HOME,
+        innerArgv: INNER,
+        env: {},
+        realpath: (p) => p,
+        pathExists: () => true,
+      });
+      // Real project state overlaid with an empty tmpfs → unreadable in-sandbox.
+      expect(argv).toContain(`${CWD}/.forja`);
+      // The dev session's OWN dir must stay readable — never masked.
+      expect(argv).not.toContain(`${CWD}/.forja-dev`);
+    } finally {
+      if (prev === undefined) delete process.env.FORJA_PROFILE;
+      else process.env.FORJA_PROFILE = prev;
+    }
+  });
+
+  test('no profile ⇒ no <cwd>/.forja overlay (the canonical dir IS the session)', () => {
+    const prev = process.env.FORJA_PROFILE;
+    delete process.env.FORJA_PROFILE;
+    try {
+      const argv = buildBwrapArgv({
+        profile: 'cwd-rw',
+        cwd: CWD,
+        home: HOME,
+        innerArgv: INNER,
+        env: {},
+        realpath: (p) => p,
+        pathExists: () => true,
+      });
+      expect(argv).not.toContain(`${CWD}/.forja`);
+    } finally {
+      if (prev !== undefined) process.env.FORJA_PROFILE = prev;
+    }
+  });
+});

@@ -3,6 +3,7 @@ import {
   activeProfile,
   appDirName,
   appDirNames,
+  foreignProjectDirNames,
   isValidProfile,
   projectDirName,
   projectDirNames,
@@ -96,5 +97,16 @@ describe('projectDirNames (project escalate-list baseline)', () => {
     // escalates writes to the operator's real `.forja/` (no silent edit of
     // canonical project policy/sessions), plus its own `.forja-<profile>/`.
     expect(projectDirNames({ FORJA_PROFILE: 'dev' })).toEqual(['.forja', '.forja-dev']);
+  });
+});
+
+describe('foreignProjectDirNames (project read-floor)', () => {
+  test('no profile ⇒ empty (the canonical .forja/ IS the active session, nothing foreign)', () => {
+    expect(foreignProjectDirNames({})).toEqual([]);
+  });
+
+  test('profile ⇒ the canonical .forja/ is foreign (real project state to mask/deny)', () => {
+    // NOT the active `.forja-<profile>/` — that stays readable/writable.
+    expect(foreignProjectDirNames({ FORJA_PROFILE: 'dev' })).toEqual(['.forja']);
   });
 });

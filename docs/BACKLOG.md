@@ -161,6 +161,23 @@ All routed through `forjaCommand`. No profile ⇒ byte-identical, so column
 alignment + every existing test holds. This is the class closed for real, across
 both command shapes and all surfaces (cli + tui + subagents).
 
+Seventh follow-up (a DIFFERENT class — project read isolation, operator-flagged):
+write isolation held, but a profiled session could still READ the operator's real
+canonical `.forja/` (project memory/config/traces) co-located in the repo. Two
+floors leaked: the engine classifier escalates `.forja/` only on WRITE (`op ===
+'read'` returns null), and the sandbox masked only home-level credential dirs,
+never a cwd-level project dir — so `read_file`/`grep` and sandboxed bash could
+disclose real project state despite the profile using `.forja-dev/`. (This also
+made the README's advertised "can't read your real memory" false.) Added
+`foreignProjectDirNames()` (the canonical `.forja` under a profile; empty on the
+default namespace — the active `.forja-<profile>/` is never foreign and stays
+readable). The engine now DENIES read+write of the foreign dir (deny tier, ahead
+of the read-passthrough; supersedes the canonical dir's escalate under a
+profile), and both sandbox runners (linux tmpfs overlay + macOS SBPL deny) mask
+it under cwd. No profile ⇒ no foreign dir, byte-identical. Tests both directions:
+foreign `.forja` denied/masked, active `.forja-<profile>` still readable
+(engine + linux + macOS). README claim now holds.
+
 ## [2026-06-15] Prompt: drop the model id from the # Environment block
 
 The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,

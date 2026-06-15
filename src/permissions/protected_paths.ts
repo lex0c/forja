@@ -35,7 +35,7 @@
 // `grep`) that bypass the bash AST entirely.
 
 import { resolve } from 'node:path';
-import { appDirNames, projectDirNames } from '../config/app-namespace.ts';
+import { appDirNames, foreignProjectDirNames, projectDirNames } from '../config/app-namespace.ts';
 import { createBoundedCache } from './bounded-cache.ts';
 
 export type ProtectedTier = 'deny' | 'escalate';
@@ -376,6 +376,12 @@ interface ResolvedProtectedTargets {
   tildeEscalateFiles: readonly string[];
   tildeEscalateDirs: readonly string[];
   cwdEscalateDirs: readonly string[];
+  // Project dirs belonging to ANOTHER namespace (the real canonical `.forja/`
+  // under a profile) — DENIED for read AND write so a profiled session can't
+  // disclose or touch the operator's real project state. Empty on the default
+  // namespace. Resolved against cwd, profile read from process.env (frozen per
+  // process, so the (home,cwd) cache key stays sound).
+  cwdForeignDenyDirs: readonly string[];
 }
 
 // Cap calibrated for the realistic (home, cwd) tuple churn —
@@ -396,6 +402,7 @@ const getResolvedTargets = (home: string, cwd: string): ResolvedProtectedTargets
       tildeEscalateFiles: TILDE_ESCALATE_FILES.map((f) => resolveTildeFile(home, f)),
       tildeEscalateDirs: tildeEscalateDirs().map((d) => resolveTildeFile(home, d)),
       cwdEscalateDirs: cwdEscalateDirs().map((d) => resolveCwdDir(cwd, d)),
+      cwdForeignDenyDirs: foreignProjectDirNames().map((d) => resolveCwdDir(cwd, d)),
     };
     targetCache.set(key, entry);
   }
@@ -404,6 +411,9 @@ const getResolvedTargets = (home: string, cwd: string): ResolvedProtectedTargets
 
 export const classifyProtectedPath = (input: ProtectedClassifyInput): ProtectedTier | null => {
   const { absPath, op, home, cwd } = input;
+  // Resolved up-front (cached on home+cwd): the foreign-dir deny below must run
+  // for READS too, before the escalate tier's read passthrough.
+  const targets = getResolvedTargets(home, cwd);
 
   // Tier `deny` — applies to reads and writes alike. SYSTEM_DENY_ROOTS
   // is a constant (no per-call resolve needed). Exceptions list
@@ -434,6 +444,18 @@ export const classifyProtectedPath = (input: ProtectedClassifyInput): ProtectedT
     return 'deny';
   }
 
+  // Tier `deny` (project read-floor) — a foreign-namespace project dir (the
+  // operator's real `.forja/` when running under a profile) is denied for READ
+  // AND WRITE. Reads: a profiled session must not disclose the real project's
+  // memory/config/traces. Writes: this supersedes the escalate the canonical
+  // dir would otherwise get (cwdEscalateDirs still lists `.forja` for the
+  // no-profile case where it IS the active session's). The active session's own
+  // dir is never in this list, so reads/writes of `.forja-<profile>/` are
+  // unaffected. Empty on the default namespace ⇒ no behavior change there.
+  for (const dir of targets.cwdForeignDenyDirs) {
+    if (startsWithSegment(absPath, dir)) return 'deny';
+  }
+
   // Tier `escalate` — only writes/deletes are upgraded. Reads pass
   // through; the engine's regular allow/confirm/deny chain still runs.
   if (op === 'read') return null;
@@ -443,7 +465,6 @@ export const classifyProtectedPath = (input: ProtectedClassifyInput): ProtectedT
     if (startsWithSegment(absPath, root)) return 'escalate';
   }
   // Tilde + cwd resolves come from the (home, cwd) cache.
-  const targets = getResolvedTargets(home, cwd);
   for (const file of targets.tildeEscalateFiles) {
     if (absPath === file) return 'escalate';
   }

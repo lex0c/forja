@@ -611,19 +611,23 @@ describe('isDevSafe — /dev pseudo-device deny carve-out', () => {
   });
 });
 
-// Dev-mode: a profile must NOT become a way to silently edit the operator's
-// real `.forja/` project state — writes there still escalate, alongside the
-// profile's own `.forja-<profile>/`.
-describe('classifyProtectedPath — profile escalates BOTH canonical and profile project dirs', () => {
-  test('under FORJA_PROFILE, writes to .forja AND .forja-<profile> escalate; reads pass', () => {
+// Dev-mode read floor: under a profile, the canonical `.forja/` is FOREIGN —
+// the operator's real project state — and is DENIED for READ and WRITE so a
+// profiled session can neither disclose nor touch it. The active
+// `.forja-<profile>/` is the session's own: writes escalate (confirm), reads
+// pass. On the default namespace `.forja/` is the active dir (covered by the
+// escalate-tier tests above), so there's no foreign dir and behavior is
+// unchanged.
+describe('classifyProtectedPath — profile isolates the foreign canonical .forja/', () => {
+  test('under FORJA_PROFILE: canonical .forja/ DENIED (read+write); active .forja-<profile>/ escalates writes, reads pass', () => {
     const prev = process.env.FORJA_PROFILE;
     process.env.FORJA_PROFILE = 'dev';
     // Fresh cwd so the (home,cwd)-keyed target cache can't serve a no-profile
-    // entry from an earlier test. (In production the profile is frozen per
-    // process, so the cache is only stale under mid-process env mutation.)
+    // entry from an earlier test (profile is frozen per process in production).
     const cwd = '/work/profiled-proj';
     try {
-      // The operator's REAL project state — the guard a profile must preserve.
+      // The operator's REAL project state — foreign to a dev session: deny BOTH
+      // reads (no disclosure of real memory/config) and writes (no pollution).
       expect(
         classifyProtectedPath({
           absPath: `${cwd}/.forja/permissions.yaml`,
@@ -631,8 +635,16 @@ describe('classifyProtectedPath — profile escalates BOTH canonical and profile
           home: HOME,
           cwd,
         }),
-      ).toBe('escalate');
-      // The dev session's own project state.
+      ).toBe('deny');
+      expect(
+        classifyProtectedPath({
+          absPath: `${cwd}/.forja/memory/local/x.md`,
+          op: 'read',
+          home: HOME,
+          cwd,
+        }),
+      ).toBe('deny');
+      // The dev session's OWN project state — writes escalate (confirm), reads pass.
       expect(
         classifyProtectedPath({
           absPath: `${cwd}/.forja-dev/permissions.yaml`,
@@ -641,10 +653,9 @@ describe('classifyProtectedPath — profile escalates BOTH canonical and profile
           cwd,
         }),
       ).toBe('escalate');
-      // Escalate is write-only; reads of the canonical dir still pass through.
       expect(
         classifyProtectedPath({
-          absPath: `${cwd}/.forja/permissions.yaml`,
+          absPath: `${cwd}/.forja-dev/memory/local/x.md`,
           op: 'read',
           home: HOME,
           cwd,

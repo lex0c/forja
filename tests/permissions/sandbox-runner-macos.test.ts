@@ -975,3 +975,34 @@ describe('macOS — opt-in persistent cache (cache_persistence)', () => {
     expect(argv.some((a) => a.startsWith('XDG_CACHE_HOME='))).toBe(false);
   });
 });
+
+// Project read floor (profile isolation) — macOS parity with the Linux runner's
+// foreign-dir tmpfs overlay.
+describe('buildSbplProfile — profile read floor (foreign .forja/ deny)', () => {
+  test('under FORJA_PROFILE: denies read+write of <cwd>/.forja but NOT the active <cwd>/.forja-<profile>', () => {
+    const prev = process.env.FORJA_PROFILE;
+    process.env.FORJA_PROFILE = 'dev';
+    try {
+      const profile = buildSbplProfile('cwd-rw', '/work/proj', '/home/op');
+      // The operator's REAL project state is denied (read + write).
+      expect(profile).toContain('(deny file-read* (subpath "/work/proj/.forja"))');
+      expect(profile).toContain('(deny file-write* (subpath "/work/proj/.forja"))');
+      // The dev session's OWN dir is NOT denied — it must read its own state.
+      expect(profile).not.toContain('(deny file-read* (subpath "/work/proj/.forja-dev"))');
+    } finally {
+      if (prev === undefined) delete process.env.FORJA_PROFILE;
+      else process.env.FORJA_PROFILE = prev;
+    }
+  });
+
+  test('no profile ⇒ no foreign .forja deny (the canonical dir IS the session)', () => {
+    const prev = process.env.FORJA_PROFILE;
+    delete process.env.FORJA_PROFILE;
+    try {
+      const profile = buildSbplProfile('cwd-rw', '/work/proj', '/home/op');
+      expect(profile).not.toContain('(deny file-read* (subpath "/work/proj/.forja"))');
+    } finally {
+      if (prev !== undefined) process.env.FORJA_PROFILE = prev;
+    }
+  });
+});

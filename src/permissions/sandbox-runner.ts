@@ -56,7 +56,7 @@
 
 import { existsSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { join as joinPath, resolve as resolveAbs } from 'node:path';
-import { appDirNames } from '../config/app-namespace.ts';
+import { appDirNames, foreignProjectDirNames } from '../config/app-namespace.ts';
 import { defaultDataDir, forjaCachePersistBase } from '../storage/paths.ts';
 import { startsWithSegment } from './protected_paths.ts';
 import { SANDBOX_SAFE_ENV_VARS as SAFE_ENV_VARS } from './safe-env-vars.ts';
@@ -683,6 +683,17 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
   // happens to have `~/.gnupg` set up.
   for (const dir of hidePathsDirs()) {
     const abs = joinPath(home, dir);
+    if (shouldMask(abs)) flags.push('--tmpfs', abs);
+  }
+  // Project read-floor (profile isolation). Mask any FOREIGN project dir — the
+  // operator's REAL `.forja/` when running under a profile — under cwd, so a
+  // profiled session's sandboxed bash (`cat .forja/...`, `grep -r .forja/`)
+  // can't disclose the real project's memory/config/traces. The active
+  // session's own `.forja-<profile>/` is NOT in this list and stays readable.
+  // Empty on the default namespace ⇒ no overlay (byte-identical argv).
+  // `shouldMask` applies the same EROFS gate as the home-relative loop above.
+  for (const dir of foreignProjectDirNames()) {
+    const abs = joinPath(cwd, dir);
     if (shouldMask(abs)) flags.push('--tmpfs', abs);
   }
   // XDG_DATA_HOME unmask. When the operator sets $XDG_DATA_HOME outside

@@ -89,3 +89,18 @@ export const projectDirNames = (env: NodeJS.ProcessEnv = process.env): readonly 
   const profile = resolveProfile(env);
   return profile === null ? ['.forja'] : ['.forja', `.forja-${profile}`];
 };
+
+// Per-project dir(s) that belong to a DIFFERENT namespace than the active
+// session and must be FULLY isolated at the read floor — masked from the
+// sandbox AND read-denied by the permission engine. Under a profile that's the
+// operator's REAL canonical `.forja/` (project memory/config/traces): a
+// profiled session must neither read nor write it. Empty on the default
+// namespace — the canonical `.forja/` IS the active session's, and other
+// `.forja-<x>/` profile dirs are themselves throwaway state, not the real
+// project, so they're out of scope (enumerating them would also need a cwd
+// scan). The active session's OWN dir (`projectDirName()`) is never here, so
+// it stays readable/writable.
+export const foreignProjectDirNames = (env: NodeJS.ProcessEnv = process.env): readonly string[] => {
+  const profile = resolveProfile(env);
+  return profile === null ? [] : ['.forja'];
+};
