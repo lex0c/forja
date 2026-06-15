@@ -115,7 +115,6 @@ describe('bootstrap', () => {
         'memory_read',
         'memory_search',
         'memory_write',
-        'pin_context',
         'read_file',
         'reminder',
         'reminder_cancel',

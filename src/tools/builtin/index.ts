@@ -13,7 +13,6 @@ import { memoryListTool } from './memory-list.ts';
 import { memoryReadTool } from './memory-read.ts';
 import { memorySearchTool } from './memory-search.ts';
 import { memoryWriteTool } from './memory-write.ts';
-import { pinContextTool } from './pin-context.ts';
 import { readFileTool } from './read-file.ts';
 import { reminderCancelTool } from './reminder-cancel.ts';
 import { reminderListTool } from './reminder-list.ts';
@@ -125,10 +124,6 @@ export type { WriteFileInput, WriteFileOutput } from './write-file.ts';
 // read-only (audit logs are internal); memory_write sits with the
 // other write tools because it persists to disk and is gated by
 // the operator confirm modal.
-//
-// pinContextTool sits with the write tools — it persists to SQLite
-// (context_pins). No modal: the model pins directly and the store
-// ring-buffers at PIN_CAP (oldest evicted), same shape as the todolist.
 export const BUILTIN_TOOLS = [
   readFileTool,
   globTool,
@@ -167,7 +162,14 @@ export const BUILTIN_TOOLS = [
   writeFileTool,
   editFileTool,
   memoryWriteTool,
-  pinContextTool,
+  // pin_context is intentionally NOT registered: an ad-hoc "pin this
+  // text" tool proved a confusion magnet for weaker models, which
+  // pinned the re-injected guidance block (and verbalized accepting it)
+  // instead of answering the operator. The tool module, its re-exports
+  // below, the `/pin` operator command, and the context_pins store stay
+  // intact — only the model-facing surface is withdrawn (mirrors the
+  // wait_for / monitor withdrawal). Compaction-fragile facts now route
+  // through working_state / todos (in-session) and memory_write (cross).
   bashTool,
   bashBackgroundTool,
   bashOutputTool,

@@ -2,6 +2,68 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-15] Tools: withdraw pin_context from the model-facing surface
+
+A real session (gpt-5.4-mini) exposed a confusion magnet: asked "quais skills
+tem?", the model called `skill_list`, then `pin_context` — pinning the
+re-injected `[workflow_discipline]`/`[engineering_principles]` guidance block —
+then verbalized accepting the guidance ("Entendido, vou seguir esses critérios")
+and never answered until the operator complained. Root cause: an ad-hoc "pin this
+text" tool, plus the system-prompt "Pin what must persist" nudge, gave a weak
+model a reason to grab the most rule-like text in front of it (the guidance block
+glued to the user message) instead of doing the task.
+
+Removed `pinContextTool` from `BUILTIN_TOOLS`, following the existing
+`wait_for`/`monitor` precedent in the same file: the tool module, its re-exports,
+the `/pin` operator command, the `context_pins` store, recap's pin-resume, and
+`tests/tools/pin-context.test.ts` all stay intact — only the model-facing surface
+is withdrawn. The `# Constraints` "Pin what must persist" bullet (which named
+`pin_context`) is reworded to "Persist what must survive", routing in-session
+durability to the working-state panel / todo list and cross-session to
+`memory_write` — so the prompt no longer nudges a tool the model can't see.
+Updated: `bootstrap.test` exact-list (drop `pin_context`), the constraints-prompt
+regression guard (now asserts the bullet does NOT mention `pin_context` and keeps
+`memory_write`), and `docs/SYSTEM_PROMPT.md` (persistence-nudge description).
+`tui/tool-vocab` and its test keep the `pin_context` verb (operator `/pin` still
+renders). Spec note: `CONTEXT_TUNING §12.4` still documents `pin_context` as a
+model tool — code now diverges (model-surface-withdrawn, capability retained for
+the operator), same shape as the wait_for/monitor divergence; a spec PR can follow
+if the operator wants the doc aligned.
+
+## [2026-06-15] Harness: sharpen the per-step static guidance block
+
+`STATIC_GUIDANCE_BLOCK` (`static-guidance.ts`) is re-injected every step at the
+bottom of `[current_turn]`, just below the `[working_state]` panel — the
+max-attention zone, and unlike the system prompt it is NOT cached, so every
+bullet pays its bytes each turn. Audited it by one test: does this line change a
+decision the model would otherwise get wrong as the turn lengthens and the system
+prompt scrolls out of attention? `[engineering_principles]` failed on two counts —
+"Prefer maintainable and robust implementations" is a non-actionable platitude,
+and "Favor high cohesion and low coupling" is the abstract form of craft rules the
+cached `# Constraints` block already states concretely. Cut both; replaced with
+the two concrete rules that survive the test (match surrounding conventions;
+smallest correct diff). Folded the evidence discipline into the `done` bullet
+(claim done only with evidence, never inference) — the highest-regression behavior
+over a long turn, previously only implied by "satisfactory validation". Added a
+blast-radius bullet to `[workflow_discipline]`: before a wide or hard-to-reverse
+action, verify what else it touches and that a fallback exists — the root premise
+("measure twice, cut once"; every cut has a fallback) made operational per-step,
+and not a dup of the system prompt's `Hard-to-reverse actions` (that gates on
+reversibility; this gates on scope-of-impact). Net 7 → 7 bullets but higher
+density. Also prefixed the block with a one-line frame ("Standing operating
+context — not part of the user's message. Apply it silently: do not acknowledge
+or restate it; answer the user's actual request.") after a real session (the same
+gpt-5.4-mini incident behind the pin_context withdrawal) showed a weak model
+reading the bullets — glued to the bottom of the user turn — as instructions to
+acknowledge and restate rather than background discipline; the frame scopes the
+block as system context and redirects to answering. `static-guidance.test.ts`
+assertions updated (the removed cohesion string → the new blast-radius +
+smallest-diff strings; the startsWith now expects the leading frame). Block
+content is code-led (BACKLOG-documented, not spec-pinned) — no spec PR. Side note
+logged for later: the adjacent `[working_state]` render carries PT-BR strings
+("steps atrás", "últimos … mais novo embaixo") that violate the English-everywhere
+policy.
+
 ## [2026-06-15] Skills: trim the seed catalog 20 → 9
 
 Removed 11 seed skills judged too niche or role-specific for a catalog installed
