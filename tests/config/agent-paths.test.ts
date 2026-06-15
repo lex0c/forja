@@ -153,4 +153,21 @@ describe('profile isolation (FORJA_PROFILE)', () => {
       else process.env.FORJA_PROFILE = prev;
     }
   });
+
+  test('enterpriseAgentPath stays CANONICAL under a profile (no enterprise-policy bypass)', () => {
+    // The enterprise layer is the admin guardrail (locked policy + hooks) at a
+    // fixed location. If a profile relocated it to /etc/forja-dev (which no
+    // admin installed), `forja --profile dev` would skip the enterprise layer
+    // entirely — a bypass. It MUST ignore FORJA_PROFILE.
+    expect(enterpriseAgentPath('permissions.yaml', { FORJA_PROFILE: 'dev' }, 'linux')).toBe(
+      '/etc/forja/permissions.yaml',
+    );
+    expect(
+      enterpriseAgentPath(
+        'hooks.toml',
+        { FORJA_PROFILE: 'dev', PROGRAMDATA: 'C:\\ProgramData' },
+        'win32',
+      ),
+    ).toBe('C:\\ProgramData\\forja\\hooks.toml');
+  });
 });

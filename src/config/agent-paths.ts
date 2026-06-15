@@ -90,9 +90,18 @@ export const userAgentPath = (
 };
 
 // Enterprise-installed path for `filename` under the machine-wide
-// agent config root.
+// agent config root. ALWAYS canonical (`forja`), NEVER profiled.
 //   - Windows: PROGRAMDATA (absolute) → `<PROGRAMDATA>\forja\<filename>`.
 //   - POSIX: hardcoded `/etc/forja/<filename>`.
+//
+// Deliberately does NOT route through `appDirName(env)` like the user/project
+// resolvers above: the enterprise layer is the admin-installed, non-user
+// guardrail (locked policy + hooks) at a fixed well-known location. Profiling
+// it would move the lookup to `/etc/forja-<profile>` / `%PROGRAMDATA%\forja-
+// <profile>` — which an admin never installed — so `forja --profile dev` would
+// silently skip the enterprise policy + locked hooks entirely, turning a
+// profile into an enterprise-policy bypass. A profile isolates USER and
+// PROJECT state only; the machine guardrail stays put.
 //
 // Returns null on Windows when PROGRAMDATA is missing or
 // non-absolute — operator running in a stripped-down container.
@@ -117,9 +126,9 @@ export const enterpriseAgentPath = (
     if (programData === undefined || programData.length === 0 || !p.isAbsolute(programData)) {
       return null;
     }
-    return p.join(programData, appDirName(env), filename);
+    return p.join(programData, 'forja', filename);
   }
-  return p.join(`/etc/${appDirName(env)}`, filename);
+  return p.join('/etc/forja', filename);
 };
 
 // Project-scope path for `filename` under the per-repo `.forja/`

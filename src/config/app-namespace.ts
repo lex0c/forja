@@ -5,11 +5,17 @@
 // build can't migrate or pollute the operator's real state. No profile ⇒ the
 // canonical `forja` / `.forja`, byte-identical to pre-profile behavior.
 //
-// Two segments because Forja's state lives at two levels:
+// Two segments because Forja's USER and PROJECT state live at two levels:
 //   - user-level: `~/.config/<app>`, `~/.local/share/<app>`, `~/.cache/<app>`
 //     (sessions.db, audit.db, install_id, config, memory, trust, cache)
 //   - project:    `<cwd>/<dotApp>` (permissions.yaml, playbooks, skills, …)
 // A profile relocates BOTH, so `forja --profile dev` is fully sandboxed.
+//
+// NOT relocated: the ENTERPRISE layer (`/etc/forja`, `%PROGRAMDATA%\forja`).
+// That is the admin-installed machine guardrail (locked policy + hooks) at a
+// fixed location — profiling it would let `--profile <x>` skip the enterprise
+// layer entirely (a bypass). `enterpriseAgentPath` in config/agent-paths.ts
+// stays canonical on purpose; do NOT route it through these helpers.
 //
 // The profile name becomes a filesystem path segment, so it is allowlisted to
 // `[a-z0-9][a-z0-9-]*` (checked char-by-char, no regex — this feeds path

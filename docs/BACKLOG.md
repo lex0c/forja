@@ -70,6 +70,17 @@ guard and a no-op argv reconstruction in `applyProfileFlag`; fixed stale
 leftover in the welcome next-steps. typecheck + lint clean; permissions (2578,
 one cross-process audit test flaked under load, green in isolation) green.
 
+Post-commit follow-up (review catch): `enterpriseAgentPath` was wrongly routed
+through `appDirName(env)`, so `--profile dev` would relocate the enterprise
+lookup to `/etc/forja-<profile>` / `%PROGRAMDATA%\forja-<profile>` — which no
+admin installed — and silently SKIP the enterprise policy + locked hooks (an
+enterprise-guardrail bypass via a profile). Reverted that resolver to canonical
+`/etc/forja` / `%PROGRAMDATA%\forja`; both enterprise consumers
+(`enterprisePolicyPath`, `enterpriseHooksPath`) delegate to it, so the fix
+covers policy and hooks. A profile now isolates USER + PROJECT state ONLY; the
+machine guardrail stays put. Regression test pins enterprise canonical under a
+profile; app-namespace header documents the carve-out.
+
 ## [2026-06-15] Prompt: drop the model id from the # Environment block
 
 The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,
