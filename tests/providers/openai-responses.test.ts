@@ -203,8 +203,28 @@ describe('createOpenAIProvider — Responses routing for reasoning models', () =
     // cache-routing hint set on the Responses path (real OpenAI, no baseURL).
     expect(typeof p.prompt_cache_key).toBe('string');
     expect((p.prompt_cache_key as string).length).toBeGreaterThan(0);
-    // extended retention: gpt-5.x supports it → 24h on real OpenAI.
-    expect(p.prompt_cache_retention).toBe('24h');
+    // gpt-5.4-mini is NOT on OpenAI's extended-retention list, so no 24h param
+    // (the routing key above still applies — it's not gated on retention).
+    expect(p.prompt_cache_retention).toBeUndefined();
+  });
+
+  test('extended retention (24h) is sent only for models on OpenAI’s list (gpt-5.4) ', async () => {
+    const handle = mockResponsesClient([
+      { type: 'response.created', response: { id: 'r' } },
+      { type: 'response.completed', response: {} },
+    ]);
+    const provider = createOpenAIProvider('gpt-5.4', { client: handle.client });
+    for await (const _ of provider.generate({
+      model: 'gpt-5.4',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 8,
+      effort: 'high',
+    })) {
+      // drain
+    }
+    expect((handle.calls[0] as { prompt_cache_retention?: unknown }).prompt_cache_retention).toBe(
+      '24h',
+    );
   });
 
   test('omits prompt_cache_key on the Responses path when a custom baseURL is set', async () => {
@@ -240,9 +260,12 @@ describe('createOpenAIProvider — Responses routing for reasoning models', () =
         { type: 'response.created', response: { id: 'r' } },
         { type: 'response.completed', response: {} },
       ]);
-      const provider = createOpenAIProvider('gpt-5.4-mini', { client: handle.client });
+      // gpt-5.4 IS on the extended-retention list, so the env opt-out is the only
+      // thing suppressing the param here (on gpt-5.4-mini it would be undefined
+      // regardless, which wouldn't actually exercise the opt-out path).
+      const provider = createOpenAIProvider('gpt-5.4', { client: handle.client });
       for await (const _ of provider.generate({
-        model: 'gpt-5.4-mini',
+        model: 'gpt-5.4',
         messages: [{ role: 'user', content: 'hi' }],
         max_tokens: 8,
         effort: 'high',

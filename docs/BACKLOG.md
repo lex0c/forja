@@ -2,6 +2,26 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] OpenAI extended-prompt-cache: scope the flag to the documented models
+
+`OPENAI_REASONING_BASE` carried `extended_prompt_cache: true`, so the factory
+defaulted `prompt_cache_retention: '24h'` for EVERY gpt-5.x id — including
+gpt-5.4-mini and gpt-5.3-codex, which are NOT on OpenAI's extended-retention list
+(verified against the prompt-caching guide: gpt-5.5/5.5-pro/5.4/5.2/5.1*/5/
+gpt-5-codex/gpt-4.1). Pulled the flag out of the shared base (it is not a family
+trait — only 2 of the 5 reasoning ids in the catalog qualify) and set it
+per-model on exactly gpt-5.5 and gpt-5.4; mini/codex/nano now get in-memory
+caching only. Removed nano's now-redundant `false` override and fixed its comment
+(which over-generalized "-mini variants" — OpenAI does list gpt-5.1-codex-mini).
+
+Severity: low. Sending 24h to an unlisted model is silently ignored today
+(live-verified: gpt-5.4-mini ×20 in the A/B and gpt-5.3-codex smokes all
+succeeded — no 400), so this is not a current outage. But the docs don't promise
+silent-ignore, and declaring a retention tier we don't actually receive corrupts
+cost/retention assumptions — so the catalog should be exact. Tests: mini now
+asserts no retention param; a new gpt-5.4 test asserts 24h IS sent; the env
+opt-out test moved to gpt-5.4 so it genuinely exercises the disable path.
+
 ## [2026-06-14] Reasoning propagation — live wire validation (close correctness confidence)
 
 Drove the provider adapters directly against the real APIs (keys from `.env`) to
