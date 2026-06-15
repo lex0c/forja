@@ -43,6 +43,7 @@
 
 import { appDirName } from '../config/app-namespace.ts';
 import { runDoctor } from './doctor.ts';
+import { forjaCommand } from './forja-command.ts';
 import { runSandboxSetup } from './sandbox-setup.ts';
 import {
   type SandboxSkipMetadata,
@@ -109,21 +110,26 @@ const SECTION_DIVIDER = '─'.repeat(60);
 const CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g;
 const stripControlChars = (s: string): string => s.replace(CONTROL_CHAR_RE, '');
 
-const NEXT_STEPS_LINES = [
+// A function (not a const) so the advertised commands carry the active
+// `--profile` via `forjaCommand`: under `forja --profile dev welcome`, the
+// walkthrough diagnosed the PROFILED namespace, so a bare `forja init` /
+// `forja "..."` next-step would open/scaffold the operator's REAL state. No
+// profile ⇒ byte-identical to the previous lines (column alignment preserved).
+const nextStepsLines = (): string[] => [
   '',
   SECTION_DIVIDER,
   'Next steps',
   SECTION_DIVIDER,
   '',
-  '  forja init                Scaffold the .forja/ bootstrap bundle',
+  `  ${forjaCommand('init')}                Scaffold the .forja/ bootstrap bundle`,
   '                            (permissions, gitignore, config, playbooks)',
-  '  forja "your prompt"        Ask the agent something',
-  '  forja --explain-permissions',
+  `  ${forjaCommand('"your prompt"')}        Ask the agent something`,
+  `  ${forjaCommand('--explain-permissions')}`,
   '                            Show the resolved policy + per-section attribution',
-  '  forja permission grants    List active grants',
-  '  forja --help               See all options',
+  `  ${forjaCommand('permission grants')}    List active grants`,
+  `  ${forjaCommand('--help')}               See all options`,
   '',
-  'Run `forja doctor` any time to re-check the environment.',
+  `Run \`${forjaCommand('doctor')}\` any time to re-check the environment.`,
 ];
 
 export const runWelcome = async (options: RunWelcomeOptions = {}): Promise<number> => {
@@ -221,7 +227,7 @@ export const runWelcome = async (options: RunWelcomeOptions = {}): Promise<numbe
     });
   }
 
-  for (const line of NEXT_STEPS_LINES) out(`${line}\n`);
+  for (const line of nextStepsLines()) out(`${line}\n`);
 
   // Welcome's exit code is the worst of the two inner verbs. doctor
   // returns 1 on any `fail` check; sandbox-setup returns 1 only on

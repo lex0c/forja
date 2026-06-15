@@ -619,7 +619,7 @@ export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
   // Gate 1: directory exists.
   if (!existsSync(agentDir)) {
     err(
-      `forja purge: ${agentDir} does not exist — nothing to purge (run 'forja init' to scaffold it first)\n`,
+      `forja purge: ${agentDir} does not exist — nothing to purge (run '${forjaCommand('init')}' to scaffold it first)\n`,
     );
     return 1;
   }

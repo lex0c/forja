@@ -147,6 +147,20 @@ no-verb launch command. Routed it through `forjaCommand('')` and extended the
 helper to render the bare launch command without a trailing space (`forja` /
 `forja --profile <name>`); unit-tested the empty-rest case.
 
+Sixth follow-up (the actual exhaustive sweep): grepped EVERY operator-facing
+`forja …` command string (verb + bare-launch shapes), not just the verb pattern
+the fifth-follow-up audit used. That found the rest of the class:
+`gc`'s suggested `forja gc --force [--table=…]` command (HIGH — mutating, sweeps
+the profile-aware global DB; missed before because the audit filter skipped
+`return` statements), `welcome`'s next-steps menu (operator-flagged: `init` /
+`"prompt"` / `--explain-permissions` / `permission grants` / `--help` / `doctor`),
+`purge`'s `run 'forja init'` not-initialized hint (would scaffold the REAL
+`.forja/`), and the lower-severity read-only/throwaway hints (`Run 'forja doctor'`
+in harness-adapter + sandbox-setup; `forja worktree gc` in runtime + worktree).
+All routed through `forjaCommand`. No profile ⇒ byte-identical, so column
+alignment + every existing test holds. This is the class closed for real, across
+both command shapes and all surfaces (cli + tui + subagents).
+
 ## [2026-06-15] Prompt: drop the model id from the # Environment block
 
 The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { forjaCommand } from '../cli/forja-command.ts';
 import { projectDirName } from '../config/app-namespace.ts';
 import type { HarnessEvent } from '../harness/index.ts';
 import type { HookSpec } from '../hooks/types.ts';
@@ -1440,7 +1441,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
     }
   } else if (stillRunningCount > 0) {
     process.stderr.write(
-      `subagent ${childSession.id}: bg log dir '${bgLogDir}' preserved — ${stillRunningCount} bg row(s) still 'running' (reaper deferred or kill incomplete); inspect via OS tools or 'forja worktree gc'\n`,
+      `subagent ${childSession.id}: bg log dir '${bgLogDir}' preserved — ${stillRunningCount} bg row(s) still 'running' (reaper deferred or kill incomplete); inspect via OS tools or '${forjaCommand('worktree gc')}'\n`,
     );
   }
   // stillRunningCount === -1: re-query failed; warning already

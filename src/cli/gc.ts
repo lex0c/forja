@@ -29,6 +29,7 @@ import {
   migrate,
   openDb,
 } from '../storage/index.ts';
+import { forjaCommand } from './forja-command.ts';
 
 export interface RunGcCliOptions {
   cwd: string;
@@ -70,9 +71,13 @@ const formatAge = (cutoffMs: number, nowMs: number): string => {
 // the suggestion sweeps every table, deleting data outside the
 // inspected scope. Operator safety > brevity.
 const buildForceCommand = (tables: ReadonlyArray<string>): string => {
-  if (tables.length === 0) return 'forja gc --force';
+  // forjaCommand re-prefixes the active --profile: gc sweeps the profile's own
+  // global DB (defaultDbPath is profile-aware), so a bare `forja gc --force`
+  // suggestion would delete rows from the operator's REAL DB, not the profiled
+  // one the dry-run inspected.
+  if (tables.length === 0) return forjaCommand('gc --force');
   const flags = tables.map((t) => `--table=${t}`).join(' ');
-  return `forja gc --force ${flags}`;
+  return forjaCommand(`gc --force ${flags}`);
 };
 
 const formatCutoffIso = (cutoffMs: number): string => {
