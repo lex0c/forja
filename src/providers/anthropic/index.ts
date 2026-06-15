@@ -156,20 +156,35 @@ export const anthropicThinkingParam = (
   req: GenerateRequest,
   caps: ProviderCapabilities,
   reasoningReplay = false,
+  thinkingDefaultOn = false,
 ): { thinking?: { type: 'adaptive' } | { type: 'enabled'; budget_tokens: number } } => {
   const budget = req.thinking_budget;
-  // Thinking is engaged ONLY by an explicit thinking budget (> 0), NOT
-  // by `effort`. `effort` sets `output_config.effort` (token-eagerness
-  // over text + tool calls, and thinking depth WHEN thinking is on) but
-  // must not turn thinking ON by itself: with the default effort='high'
-  // that would force extended thinking onto every run, and on a pre-4.7
-  // ADAPTIVE model that still accepts sampling (Sonnet 4.6), thinking
-  // together with a temperature/top_p override is rejected with HTTP
-  // 400. Decoupling keeps deterministic runs valid — an eval pinning
-  // `temperature: 0`, or a builtin subagent with `sampling.temperature`
-  // — while `effort` still shapes those runs via `output_config`. A
-  // budget of 0 / absent ⇒ no thinking (disable-via-zero, PLAYBOOKS §1.1).
-  if (budget === undefined || budget <= 0) return {};
+  const adaptive = caps.supports_adaptive_thinking === true;
+  // `budget: 0` (or negative) is the explicit disable-via-zero idiom and ALWAYS
+  // wins, even with thinking default-on (PLAYBOOKS §1.1) — evals/CI pin this for
+  // determinism.
+  if (budget !== undefined && budget <= 0) return {};
+  // When thinking is engaged:
+  //   - ADAPTIVE models (Opus 4.7/4.8, Sonnet 4.6): ON by default
+  //     (`thinkingDefaultOn`, from FORJA_ANTHROPIC_THINKING) OR an explicit
+  //     budget > 0. The Anthropic guidance is to default to adaptive thinking;
+  //     `effort` (output_config.effort) guides DEPTH, not on/off, so the two are
+  //     orthogonal.
+  //   - LEGACY models (Haiku): only via an explicit budget > 0 — there's no
+  //     adaptive surface and we don't wire the interleaved-thinking beta header.
+  //
+  // The AUTO default YIELDS to an explicit `temperature`/`top_p` pin: engaging
+  // thinking strips sampling (Anthropic 400s on thinking + sampling), so a caller
+  // that pinned sampling for DETERMINISM (the verify-* fact-check subagents at
+  // temperature 0.1, the compaction summarizer at 0, any eval/subagent with a
+  // sampling override) must keep it — auto-thinking would silently drop it. An
+  // EXPLICIT budget > 0 still wins (the caller asked for thinking outright; the
+  // pinned sampling is then stripped as before).
+  const hasExplicitSampling = req.temperature !== undefined || req.top_p !== undefined;
+  const wantThinking = adaptive
+    ? (budget !== undefined && budget > 0) || (thinkingDefaultOn && !hasExplicitSampling)
+    : budget !== undefined && budget > 0;
+  if (!wantThinking) return {};
   // Defensive gate: thinking is allowed only on NO-TOOL turns. When the model
   // emits a `thinking` block before a `tool_use`, the Anthropic contract
   // requires that unmodified block (including its cryptographic `signature`)
@@ -185,9 +200,10 @@ export const anthropicThinkingParam = (
   // reasoning replay ON the gate lifts: the signed thinking block now round-
   // trips with the tool_result, so thinking is safe on tool-bearing turns.
   if (!reasoningReplay && req.tools !== undefined && req.tools.length > 0) return {};
-  return caps.supports_adaptive_thinking === true
+  // Legacy branch is only reached with budget > 0 (see `wantThinking`).
+  return adaptive
     ? { thinking: { type: 'adaptive' } }
-    : { thinking: { type: 'enabled', budget_tokens: budget } };
+    : { thinking: { type: 'enabled', budget_tokens: budget as number } };
 };
 
 // Anthropic rejects `temperature` and `top_p` sent TOGETHER on
@@ -254,13 +270,23 @@ export const createAnthropicProvider = (
   }
 
   // Resolved once: whether to replay signed thinking blocks across tool turns
-  // and lift the suppression gate (Phase 2, flagged, default OFF). Gated to
-  // ADAPTIVE-thinking models — they auto-enable interleaved thinking with no
-  // beta header (the header-free path the docs describe). Legacy/non-adaptive
-  // models (e.g. Haiku) would need the `interleaved-thinking-2025-05-14` header
-  // to interleave on tool turns, which we don't wire, so replay stays off there.
+  // and lift the suppression gate. Default ON (the Anthropic docs make preserving
+  // thinking blocks across tool use MANDATORY when thinking is engaged); set
+  // FORJA_ANTHROPIC_REASONING_REPLAY=0 to opt out. Near-inert unless a
+  // thinking_budget is set — with thinking off there are no blocks to replay, so
+  // default-ON only changes behavior for sessions that actually enable thinking
+  // (where it's required for correctness). Gated to ADAPTIVE-thinking models —
+  // they auto-enable interleaved thinking with no beta header (the header-free
+  // path the docs describe). Legacy/non-adaptive (e.g. Haiku) would need the
+  // `interleaved-thinking-2025-05-14` header we don't wire, so replay stays off.
   const reasoningReplay =
-    boolFromEnv('FORJA_ANTHROPIC_REASONING_REPLAY') && caps.supports_adaptive_thinking === true;
+    boolFromEnv('FORJA_ANTHROPIC_REASONING_REPLAY', true) &&
+    caps.supports_adaptive_thinking === true;
+  // Adaptive thinking default-ON for adaptive models (the Anthropic guidance:
+  // default to adaptive thinking for non-trivial work). Set FORJA_ANTHROPIC_THINKING=0
+  // to opt out globally (CI/eval determinism, cost-sensitive sessions); a per-call
+  // `thinking_budget: 0` disables it for that call. Inert on legacy models.
+  const thinkingDefaultOn = boolFromEnv('FORJA_ANTHROPIC_THINKING', true);
 
   const generate = async function* (req: GenerateRequest): AsyncIterable<StreamEvent> {
     // The SDK's typed `messages.stream({...})` accepts our shape directly;
@@ -373,7 +399,7 @@ export const createAnthropicProvider = (
     // adaptive model with a thinking_budget + a configured temperature (an eval's
     // default temperature:0, or a Sonnet session with reasoning replay on) would
     // otherwise send both and 400. So whenever thinking is engaged, drop sampling.
-    const thinkingParam = anthropicThinkingParam(req, caps, reasoningReplay);
+    const thinkingParam = anthropicThinkingParam(req, caps, reasoningReplay, thinkingDefaultOn);
     const thinkingEngaged = 'thinking' in thinkingParam;
     const stream = client.messages.stream({
       model: modelName,

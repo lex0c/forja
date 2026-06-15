@@ -151,9 +151,9 @@ export async function* normalizeResponsesStream(
         } else if (ev.item?.type === 'reasoning') {
           // Capture the reasoning output item VERBATIM (opaque — carries id,
           // summary, the encrypted_content requested via `include`, and any
-          // `phase`). Stored on the assistant turn; replayed as an input item
-          // next request only when FORJA_OPENAI_REASONING_REPLAY is on. The
-          // harness never inspects `data`; the adapter round-trips it unchanged.
+          // `phase`). Stored on the assistant turn; replayed as an input item next
+          // request unless FORJA_OPENAI_REASONING_REPLAY=0 (replay defaults ON).
+          // The harness never inspects `data`; the adapter round-trips it unchanged.
           yield { kind: 'reasoning', provider: 'openai', data: ev.item };
         } else if (ev.item?.type === 'message' && typeof ev.item.phase === 'string') {
           // gpt-5.3-codex `phase` rides on the assistant MESSAGE item, which the

@@ -166,7 +166,8 @@ export const generateViaResponses = (
   promptCacheRetention?: string,
   // Replay captured reasoning items as input + request encrypted_content so
   // reasoning persists across tool round-trips (factory-resolved: real OpenAI +
-  // FORJA_OPENAI_REASONING_REPLAY). Default OFF.
+  // FORJA_OPENAI_REASONING_REPLAY, which now defaults ON; opt out with =0). The
+  // `= false` here is just the pure-function fallback for direct callers.
   reasoningReplay = false,
 ): AsyncIterable<StreamEvent> =>
   (async function* () {

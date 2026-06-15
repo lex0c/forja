@@ -410,8 +410,9 @@ describe('createOpenAIProvider — Responses routing for reasoning models', () =
     };
     const withReplay = async (on: boolean, fn: () => Promise<void>) => {
       const prev = process.env.FORJA_OPENAI_REASONING_REPLAY;
-      if (on) process.env.FORJA_OPENAI_REASONING_REPLAY = '1';
-      else delete process.env.FORJA_OPENAI_REASONING_REPLAY;
+      // OFF sets '0' (not unset): replay now defaults ON, so an unset flag would
+      // still replay — '0' is the genuine opt-out the OFF tests need.
+      process.env.FORJA_OPENAI_REASONING_REPLAY = on ? '1' : '0';
       try {
         await fn();
       } finally {

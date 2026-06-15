@@ -83,11 +83,12 @@ export interface AbResult {
 }
 
 // Flip an env flag for the duration of an async batch, restoring the prior value
-// (including the unset case) afterward — even on throw.
+// (including the unset case) afterward — even on throw. The OFF arm sets '0'
+// explicitly (not unset): the replay flags now default ON, so an unset flag would
+// leave the OFF arm replaying — '0' forces the genuine opt-out baseline.
 const withFlag = async <T>(flag: string, on: boolean, fn: () => Promise<T>): Promise<T> => {
   const prev = process.env[flag];
-  if (on) process.env[flag] = '1';
-  else delete process.env[flag];
+  process.env[flag] = on ? '1' : '0';
   try {
     return await fn();
   } finally {
@@ -150,9 +151,10 @@ export interface RunAbOutput {
   onRuns: EvalCaseResult[];
 }
 
-// Run both arms (OFF baseline first, then ON) and aggregate. The OFF arm runs
-// with the flag explicitly UNSET so a flag already exported in the operator's
-// shell can't contaminate the baseline.
+// Run both arms (OFF baseline first, then ON) and aggregate. The OFF arm forces
+// the flag to '0' (see `withFlag`) — NOT unset: the replay flags default ON, so an
+// unset OFF arm would replay and the A/B would compare ON-vs-ON. '0' is the
+// genuine opt-out baseline regardless of any flag exported in the operator's shell.
 export const runAbComparison = async (opts: RunAbOptions): Promise<RunAbOutput> => {
   const execute = opts.execute ?? {};
   const delayMs = opts.delayMs ?? 0;

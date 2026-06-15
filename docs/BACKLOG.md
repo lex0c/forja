@@ -2,6 +2,100 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-15] Default-flip review fixes: thinking yields to sampling; eval pins OpenAI replay
+
+Code review of the default-flip caught two real regressions; fixed both.
+
+1. **Thinking-default-on silently stripped explicit sampling pins.** Engaging
+   thinking strips `temperature`/`top_p` (Anthropic 400s on both together), so
+   with thinking default-ON, internal callers that pin sampling for DETERMINISM
+   but set no thinking_budget — the verify-* fact-check subagents (temperature
+   0.1), the compaction summarizer (0), any eval/subagent override — silently lost
+   their pin and ran stochastic + thinking-on. Fix: the AUTO default now YIELDS to
+   an explicit `temperature`/`top_p` (`thinkingDefaultOn && !hasExplicitSampling`);
+   an explicit `thinking_budget > 0` still wins (sampling then stripped, as before).
+   Restores determinism for verify/compaction/eval in one place, at the right
+   altitude (explicit sampling = "I want this sampling, not auto-thinking").
+2. **Eval determinism pin leaked for OpenAI.** The executor's `thinkingBudget: 0`
+   only disables Anthropic thinking; OpenAI reasoning replay (now default-ON) isn't
+   gated by it. `executeCase` now defaults `FORJA_OPENAI_REASONING_REPLAY=0` for
+   the run (only when unset — the A/B sets it per arm and wins), restored in finally.
+
+Also fixed the stale comments the flip left (the dangerous one: `ab.ts` said the
+A/B OFF arm "unsets" the flag — now '0'; reverting to unset would silently make the
+A/B compare ON-vs-ON; plus OpenAI responses "Default OFF" docs). Tests: thinking
+yields-to-sampling + explicit-budget-wins (anthropic + anthropic-effort). 817 green
+(providers+evals+harness) · typecheck · lint.
+
+Not applied (lower-priority review findings): FORJA_ANTHROPIC_THINKING is a bare
+env knob that should live in `[effort]`/config + has no Google parity (altitude
+debt); param-default(false)-vs-prod-default(true) split; test beforeEach FLAGS='0'
+pin is invisible coupling.
+
+## [2026-06-15] Flip defaults ON: reasoning replay + adaptive thinking (opt-out)
+
+Operator call: ship reasoning replay AND adaptive thinking ON by default (the
+docs' recommended posture for agentic/multi-turn), with opt-outs. NOTE: the A/B
+showed no measured pass-rate gain on the current eval — this is a docs-aligned bet
+on real long-horizon workloads, not an eval-proven win; revisit if a harder eval
+shows otherwise.
+
+- **Reasoning replay default ON** both providers via `boolFromEnv(flag, true)`;
+  opt out with `FORJA_{ANTHROPIC,OPENAI}_REASONING_REPLAY=0`. Anthropic gated to
+  adaptive models; OpenAI to the Responses path (`replaysReasoning`).
+- **Adaptive thinking default ON** on adaptive models (Opus 4.7/4.8, Sonnet 4.6):
+  `anthropicThinkingParam` gains `thinkingDefaultOn` (from `FORJA_ANTHROPIC_THINKING`,
+  default true). `effort` guides depth, not on/off. Disable globally with
+  `FORJA_ANTHROPIC_THINKING=0` or per-call `thinking_budget: 0`. Legacy (Haiku)
+  stays off without an explicit budget. Sampling is already stripped when thinking
+  is engaged (the Sonnet 400 fix), so default-on is safe there.
+- **Eval determinism preserved**: the eval executor pins `thinkingBudget: 0`
+  (disable-via-zero) so eval pass/fail stays reproducible; a case/override (the
+  A/B's `--thinking-budget`) still wins.
+- **A/B + test plumbing**: `withFlag`/`withReplay` OFF arms now set `'0'`
+  explicitly (an unset flag would replay under the new default). Provider test
+  suites pin a clean OFF baseline + dedicated default-on tests.
+
+Docs: `docs/PROVIDERS.md` (the English impl reference) updated — §5.1 (thinking +
+replay default-on, sampling strip, cache-skip-thinking), §5.2 (replay default-on,
+ordering, encrypted_content, retention scoping), §3 caps table (xhigh /
+extended_prompt_cache[_24h_only]), §6 effort ladder + cache. The PT-BR spec
+(`docs/spec/PROVIDERS.md`) left untouched (read-only without a spec request).
+Implications recorded earlier: cost/latency ↑ (thinking every turn, amplified by
+xhigh), context ↑ → earlier compaction, TPM pressure on OpenAI. 2862 tests green
+(providers+evals+harness+cli) · typecheck · lint.
+
+## [2026-06-15] Reasoning replay — residual live smokes (default-path + replay-ON)
+
+Closed most of the unit-only residuals against the real APIs.
+
+Default path (replay OFF): `eval:smoke` 8/10 — the 2 fails were a $0.0047 cost-budget
+overrun on an otherwise-correct run and a model tool-choice, NOT assembly/wire
+regressions. The order-based assembly refactor (now on every turn) round-tripped
+end-to-end across read/edit/grep/glob/compaction/parallel-tools.
+
+Replay ON, OpenAI (`eval:smoke --model openai/gpt-5.4-mini`, FORJA_OPENAI_REASONING_REPLAY=1):
+ZERO providerError/400 across all 10 cases (incl. multi-tool "parallel reads" and
+compaction). The 3 fails were model-behavior / model-window artifacts of running
+gpt-5.4-mini on Anthropic-tuned cases (e.g. compaction is window-sensitive; mini
+looped on skill_list), not replay bugs.
+
+Targeted replay-ON edge smokes (provider-direct, real API):
+- ✅ Sonnet 4.6 thinking + temperature/top_p → no 400 (sampling stripped) — LIVE.
+- ✅ gpt-5.3-codex reasoning + `phase` replay → phase carrier captured + replayed,
+  no 400 — LIVE (closes the mock-only phase re-stamp residual).
+- ✅ Anthropic multi-tool-in-one-turn replay → order preserved, no 400 — LIVE.
+
+Still unit-only (low risk): interleaved thinking BETWEEN tools in ONE turn
+(thinking1, tool1, thinking2, tool2). Tried twice to coax it (xhigh, budget 8192,
+deliberate-before-each-call prompt); Claude consistently reasons FIRST then issues
+all tool calls (order [reasoning, text, tool, tool]), so the within-turn
+between-tools pattern doesn't occur naturally — it's a cross-turn phenomenon, and
+each turn is thinking-first (handled). The order-preservation code is the defense
+if it ever does; unit-tested. cache-skip-thinking-tail (defensive; thinking is
+never the last block organically) and redacted_thinking (safety-triggered, not
+forceable) likewise stay unit/mock-only. Defaults stay OFF.
+
 ## [2026-06-14] OpenAI countTokens: use replaysReasoning, not the raw flag
 
 Follow-up to the replaysReasoning gating: the provider's own `countTokens` still

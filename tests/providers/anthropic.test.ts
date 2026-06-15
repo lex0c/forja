@@ -71,9 +71,18 @@ const mockClient = (
 
 describe('createAnthropicProvider', () => {
   let originalKey: string | undefined;
+  // Thinking and reasoning replay now default ON. Pin a clean OFF baseline for
+  // this suite so the forwarding/sampling/suppression tests isolate their
+  // surface; dedicated tests opt INTO the default-on behavior explicitly.
+  const FLAGS = ['FORJA_ANTHROPIC_THINKING', 'FORJA_ANTHROPIC_REASONING_REPLAY'] as const;
+  const originalFlags: Record<string, string | undefined> = {};
 
   beforeEach(() => {
     originalKey = process.env.ANTHROPIC_API_KEY;
+    for (const f of FLAGS) {
+      originalFlags[f] = process.env[f];
+      process.env[f] = '0';
+    }
   });
 
   afterEach(() => {
@@ -81,6 +90,10 @@ describe('createAnthropicProvider', () => {
       delete process.env.ANTHROPIC_API_KEY;
     } else {
       process.env.ANTHROPIC_API_KEY = originalKey;
+    }
+    for (const f of FLAGS) {
+      if (originalFlags[f] === undefined) delete process.env[f];
+      else process.env[f] = originalFlags[f];
     }
   });
 
@@ -516,8 +529,9 @@ describe('createAnthropicProvider', () => {
   describe('reasoning replay (Phase 2, FORJA_ANTHROPIC_REASONING_REPLAY)', () => {
     const withReplay = async (on: boolean, fn: () => Promise<void>): Promise<void> => {
       const prev = process.env.FORJA_ANTHROPIC_REASONING_REPLAY;
-      if (on) process.env.FORJA_ANTHROPIC_REASONING_REPLAY = '1';
-      else delete process.env.FORJA_ANTHROPIC_REASONING_REPLAY;
+      // OFF sets '0' (not unset): replay now defaults ON, so an unset flag would
+      // still replay — '0' is the genuine opt-out the OFF tests need.
+      process.env.FORJA_ANTHROPIC_REASONING_REPLAY = on ? '1' : '0';
       try {
         await fn();
       } finally {
@@ -799,10 +813,11 @@ describe('createAnthropicProvider', () => {
     expect('thinking' in params).toBe(false);
   });
 
-  test('thinking is suppressed when tools are present (signature round-trip not implemented)', async () => {
-    // Anthropic requires the thinking-block signature to be replayed with the
-    // next turn's tool_result; Forja can't round-trip it yet, so a
-    // tool-bearing turn must NOT engage thinking — even with a budget set.
+  test('thinking is suppressed on tool turns when reasoning replay is OFF (opt-out)', async () => {
+    // With replay OFF (the suite baseline pins FORJA_ANTHROPIC_REASONING_REPLAY=0),
+    // the signature can't round-trip with the tool_result, so a tool-bearing turn
+    // must NOT engage thinking even with a budget set. (Replay default-ON lifts
+    // this — covered in the reasoning-replay describe.)
     const handle = mockClient([{ type: 'message_stop' }]);
     const provider = createAnthropicProvider('claude-sonnet-4-6', { client: handle.client });
     for await (const _ of provider.generate({
@@ -817,6 +832,110 @@ describe('createAnthropicProvider', () => {
     expect(handle.streamCalls).toHaveLength(1);
     const params = handle.streamCalls[0]?.params as Record<string, unknown>;
     expect('thinking' in params).toBe(false);
+  });
+
+  describe('adaptive thinking default-on (FORJA_ANTHROPIC_THINKING)', () => {
+    test('adaptive model engages thinking by default when no sampling is pinned', async () => {
+      delete process.env.FORJA_ANTHROPIC_THINKING; // unset → default ON
+      const handle = mockClient([{ type: 'message_stop' }]);
+      const provider = createAnthropicProvider('claude-sonnet-4-6', { client: handle.client });
+      for await (const _ of provider.generate({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 8000,
+      })) {
+        // drain
+      }
+      const params = handle.streamCalls[0]?.params as Record<string, unknown>;
+      expect(params.thinking).toEqual({ type: 'adaptive' });
+    });
+
+    test('default-on YIELDS to an explicit temperature pin (determinism preserved, no thinking)', async () => {
+      // A caller pinning sampling (verify-* subagents, compaction, eval) keeps it:
+      // auto-thinking must NOT silently strip an explicit temperature/top_p.
+      delete process.env.FORJA_ANTHROPIC_THINKING; // default ON
+      const handle = mockClient([{ type: 'message_stop' }]);
+      const provider = createAnthropicProvider('claude-sonnet-4-6', { client: handle.client });
+      for await (const _ of provider.generate({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 8000,
+        temperature: 0.1,
+      })) {
+        // drain
+      }
+      const params = handle.streamCalls[0]?.params as Record<string, unknown>;
+      expect('thinking' in params).toBe(false); // auto-thinking yielded
+      expect(params.temperature).toBe(0.1); // pin preserved
+    });
+
+    test('explicit budget>0 still engages thinking even with a temperature pin (strips sampling)', async () => {
+      // An explicit thinking_budget is an outright thinking request — it wins over
+      // the sampling pin (which is then stripped, as Anthropic requires).
+      delete process.env.FORJA_ANTHROPIC_THINKING;
+      const handle = mockClient([{ type: 'message_stop' }]);
+      const provider = createAnthropicProvider('claude-sonnet-4-6', { client: handle.client });
+      for await (const _ of provider.generate({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 8000,
+        thinking_budget: 2000,
+        temperature: 0.1,
+      })) {
+        // drain
+      }
+      const params = handle.streamCalls[0]?.params as Record<string, unknown>;
+      expect(params.thinking).toEqual({ type: 'adaptive' });
+      expect('temperature' in params).toBe(false);
+    });
+
+    test('FORJA_ANTHROPIC_THINKING=0 → no thinking by default (sampling forwarded)', async () => {
+      process.env.FORJA_ANTHROPIC_THINKING = '0';
+      const handle = mockClient([{ type: 'message_stop' }]);
+      const provider = createAnthropicProvider('claude-sonnet-4-6', { client: handle.client });
+      for await (const _ of provider.generate({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 8000,
+        temperature: 0.5,
+      })) {
+        // drain
+      }
+      const params = handle.streamCalls[0]?.params as Record<string, unknown>;
+      expect('thinking' in params).toBe(false);
+      expect(params.temperature).toBe(0.5);
+    });
+
+    test('per-call thinking_budget:0 disables even with default ON (disable-via-zero)', async () => {
+      delete process.env.FORJA_ANTHROPIC_THINKING; // default ON
+      const handle = mockClient([{ type: 'message_stop' }]);
+      const provider = createAnthropicProvider('claude-sonnet-4-6', { client: handle.client });
+      for await (const _ of provider.generate({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 8000,
+        thinking_budget: 0,
+      })) {
+        // drain
+      }
+      const params = handle.streamCalls[0]?.params as Record<string, unknown>;
+      expect('thinking' in params).toBe(false);
+    });
+
+    test('legacy (non-adaptive) model stays OFF by default — needs an explicit budget', async () => {
+      delete process.env.FORJA_ANTHROPIC_THINKING; // default ON, but inert on legacy
+      const handle = mockClient([{ type: 'message_stop' }]);
+      const provider = createAnthropicProvider('claude-haiku-4-5', { client: handle.client });
+      for await (const _ of provider.generate({
+        model: 'claude-haiku-4-5',
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 8000,
+      })) {
+        // drain
+      }
+      const params = handle.streamCalls[0]?.params as Record<string, unknown>;
+      expect('thinking' in params).toBe(false);
+    });
   });
 
   test('thinking_budget >= max_tokens does NOT throw when tools are present (budget never sent)', async () => {

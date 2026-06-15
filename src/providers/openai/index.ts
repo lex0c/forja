@@ -85,11 +85,12 @@ const promptCacheRetentionFromEnv = (): '24h' | 'in_memory' => {
     : '24h';
 };
 
-// Opt-in (Phase 3): replay captured reasoning items across tool-bearing turns
-// (stateless continuity: pass items back as input + `include:
-// ['reasoning.encrypted_content']`). Default OFF until the long-horizon eval
-// proves value — #25 built this exact feature and reverted it for zero measured
-// benefit on the short suite. Only the Responses path honors it.
+// Replay captured reasoning items across tool-bearing turns (stateless
+// continuity: pass items back as input + `include: ['reasoning.encrypted_content']`).
+// Default ON — OpenAI "highly recommends" passing reasoning items back for
+// agentic/multi-turn function calling (better results, fewer recomputed tokens).
+// Set FORJA_OPENAI_REASONING_REPLAY=0 to opt out. Only the Responses path honors
+// it (Chat Completions drops reasoning); resolved against `replaysReasoning`.
 //
 // Resolve the `includeUsage` default from the environment for callers
 // who don't pass an explicit option (notably the registry factory used
@@ -245,7 +246,7 @@ export const createOpenAIProvider = (
   // param + opaque input items may 400 on a compat endpoint), env-gated, OFF by
   // default. Resolved once, threaded into generateViaResponses.
   const reasoningReplay =
-    options.baseURL === undefined && boolFromEnv('FORJA_OPENAI_REASONING_REPLAY');
+    options.baseURL === undefined && boolFromEnv('FORJA_OPENAI_REASONING_REPLAY', true);
   // Sampling gate (mirrors the Anthropic adapter). Reasoning models —
   // OpenAI's o-series and gpt-5.x — REJECT `temperature`/`top_p` with HTTP
   // 400 ("Unsupported parameter"). The capability opts those models out
