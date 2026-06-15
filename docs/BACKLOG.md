@@ -2,6 +2,23 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-15] Prompt: drop the model id from the # Environment block
+
+The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,
+not re-probed per turn) and carried a `- model: <id>` line. But `/model` swaps
+the provider mid-session WITHOUT recomposing the system prompt, so that line went
+stale — after a switch the block self-reported the BOOT model while the footer
+(which reads `baseConfig.provider.id` live) showed the new one. Keeping it live
+would mean re-deriving the env section and reconciling all three prompt
+representations (`systemPrompt` string / `systemSegments` cache array /
+`systemPromptHash` audit) on every switch — overkill for a redundant self-report:
+the model already knows its own identity, and the live model is shown in the
+footer. Removed the `model` field from `EnvironmentInput`, the rendered line, the
+bootstrap `modelId: provider.id` arg, and the modelId sanitization rationale. The
+block now carries cwd, os, today, + the git sub-block. `environment-prompt.test`
+updated with a regression guard (`not.toContain('model:')`); typecheck + lint
+clean, env/boot tests green.
+
 ## [2026-06-15] TUI: inline arg-hint ghost for slash commands
 
 When the operator finishes typing a slash command (e.g. `/effort`), the accepted

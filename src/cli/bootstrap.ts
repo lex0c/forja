@@ -920,7 +920,6 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     const withEnvironment = composeWithEnvironment(withOutputStyle, {
       cwd,
       platform: process.platform,
-      modelId: provider.id,
       // Today's date in `YYYY-MM-DD`, OPERATOR-LOCAL timezone.
       // Single Date.now() call at boot — stable for the whole
       // session, so the env block sits inside cache breakpoint

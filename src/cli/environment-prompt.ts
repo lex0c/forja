@@ -7,7 +7,6 @@ import { sanitizeForCodeSpan } from './prompt-codespan.ts';
 //   - cwd (where `forja` was invoked)
 //   - os (linux / darwin / win32 — drives "use this command on
 //     macOS, that on Linux" decisions)
-//   - model id (provider/model that's actually running)
 //   - today's date (YYYY-MM-DD — lets the model interpret
 //     "yesterday's commit" / "log since today" requests without
 //     a tool call)
@@ -29,8 +28,6 @@ export interface EnvironmentInput {
   // (`'linux' | 'darwin' | 'win32' | ...`); the composer
   // formats it human-readably.
   platform: string;
-  // Provider id, e.g. `anthropic/claude-sonnet-4-6`.
-  modelId: string;
   // ISO date `YYYY-MM-DD`. Bootstrap supplies the value so
   // tests can inject a fixed date and the composer stays
   // pure.
@@ -92,29 +89,22 @@ const renderGitBlock = (git: GitContext): string => {
 };
 
 export const renderEnvironmentSection = (input: EnvironmentInput): string => {
-  // cwd, modelId, and the platform string all need sanitizing
-  // before they hit the prompt. cwd is the highest-risk surface
-  // (POSIX paths can contain backticks, newlines, control bytes —
-  // a `cd /tmp/$(crafted)` pre-`forja` is a one-liner exploit);
-  // modelId is `--model` flag input and theoretically operator-
-  // controlled but a `--model "claude\\n## SYSTEM: ..."` from a
-  // misconfigured wrapper script would still inject. Platform is
-  // sanitized for symmetry — `formatPlatform` already returns
-  // canonical strings for known values, but the verbatim
-  // fallthrough for unknown platforms could carry crafted bytes
-  // if an embedder set process.platform to a non-OS string. Today
-  // is composer-supplied (always ISO date), no sanitization
-  // needed — the test fixture is the only attacker-controllable
-  // path and tests aren't a threat model.
+  // cwd and the platform string both need sanitizing before they
+  // hit the prompt. cwd is the highest-risk surface (POSIX paths can
+  // contain backticks, newlines, control bytes — a
+  // `cd /tmp/$(crafted)` pre-`forja` is a one-liner exploit).
+  // Platform is sanitized for symmetry — `formatPlatform` already
+  // returns canonical strings for known values, but the verbatim
+  // fallthrough for unknown platforms could carry crafted bytes if
+  // an embedder set process.platform to a non-OS string. Today is
+  // composer-supplied (always ISO date), no sanitization needed.
   const safeCwd = sanitizeForCodeSpan(input.cwd);
-  const safeModelId = sanitizeForCodeSpan(input.modelId);
   const safePlatform = sanitizeForCodeSpan(formatPlatform(input.platform));
   const lines: string[] = [
     '# Environment',
     '',
     `- cwd: \`${safeCwd}\``,
     `- os: ${safePlatform}`,
-    `- model: \`${safeModelId}\``,
     `- today: ${input.today}`,
   ];
   let body = lines.join('\n');
