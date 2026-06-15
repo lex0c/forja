@@ -103,16 +103,26 @@ export type ArmRunHook = (
   result: EvalCaseResult,
 ) => void;
 
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
 const runArm = async (
   arm: 'off' | 'on',
   cases: readonly EvalCase[],
   repeat: number,
   execute: ExecuteOptions,
+  delayMs: number,
   onRun?: ArmRunHook,
 ): Promise<EvalCaseResult[]> => {
   const runs: EvalCaseResult[] = [];
+  let first = true;
   for (let round = 1; round <= repeat; round++) {
     for (const c of cases) {
+      // Pace BETWEEN runs (not before the first): each run fires ~N rapid
+      // sequential requests, and back-to-back runs overlap in the provider's
+      // rolling per-minute token window — spacing them lets it drain so a
+      // token-heavier arm (e.g. OpenAI replay) doesn't 429 on TPM.
+      if (!first && delayMs > 0) await sleep(delayMs);
+      first = false;
       const r = await executeCase(c, execute);
       runs.push(r);
       onRun?.(arm, round, c, r);
@@ -128,6 +138,9 @@ export interface RunAbOptions {
   // Base execute options (model id / provider override / timeout). The flag is
   // layered on top per arm.
   execute?: ExecuteOptions;
+  // Delay (ms) between runs within an arm, to stay under provider rate limits.
+  // Default 0 (no pacing).
+  delayMs?: number;
   onRun?: ArmRunHook;
 }
 
@@ -142,11 +155,12 @@ export interface RunAbOutput {
 // shell can't contaminate the baseline.
 export const runAbComparison = async (opts: RunAbOptions): Promise<RunAbOutput> => {
   const execute = opts.execute ?? {};
+  const delayMs = opts.delayMs ?? 0;
   const offRuns = await withFlag(opts.flag, false, () =>
-    runArm('off', opts.cases, opts.repeat, execute, opts.onRun),
+    runArm('off', opts.cases, opts.repeat, execute, delayMs, opts.onRun),
   );
   const onRuns = await withFlag(opts.flag, true, () =>
-    runArm('on', opts.cases, opts.repeat, execute, opts.onRun),
+    runArm('on', opts.cases, opts.repeat, execute, delayMs, opts.onRun),
   );
   const off = aggregateArm('off', offRuns);
   const on = aggregateArm('on', onRuns);
@@ -204,6 +218,10 @@ export interface AbCliArgs {
   // the run would report a false "no delta". Ignored by OpenAI (it uses
   // reasoning.effort), so harmless to set on the default cross-provider command.
   thinkingBudget?: number;
+  // Delay (ms) between runs within an arm. Paces the A/B under provider
+  // per-minute token limits (the token-heavier replay-ON arm 429s otherwise when
+  // runs fire back-to-back). Default 0.
+  delayMs?: number;
 }
 
 const expectValue = (argv: readonly string[], i: number, flag: string): string => {
@@ -218,6 +236,7 @@ export const parseArgs = (argv: readonly string[]): AbCliArgs => {
   let repeat = 5;
   let perCaseTimeoutMs: number | undefined;
   let thinkingBudget: number | undefined;
+  let delayMs: number | undefined;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--model') {
@@ -248,6 +267,15 @@ export const parseArgs = (argv: readonly string[]): AbCliArgs => {
       thinkingBudget = v;
       continue;
     }
+    if (a === '--delay-ms') {
+      const v = Number(expectValue(argv, i, '--delay-ms'));
+      i += 1;
+      if (!Number.isInteger(v) || v < 0) {
+        throw new Error('--delay-ms must be a non-negative integer');
+      }
+      delayMs = v;
+      continue;
+    }
     if (a !== undefined && !a.startsWith('-')) {
       target = a;
       continue;
@@ -260,6 +288,7 @@ export const parseArgs = (argv: readonly string[]): AbCliArgs => {
   const result: AbCliArgs = { target, modelId, repeat };
   if (perCaseTimeoutMs !== undefined) result.perCaseTimeoutMs = perCaseTimeoutMs;
   if (thinkingBudget !== undefined) result.thinkingBudget = thinkingBudget;
+  if (delayMs !== undefined) result.delayMs = delayMs;
   return result;
 };
 
@@ -316,7 +345,7 @@ export const main = async (argv: readonly string[]): Promise<number> => {
   process.stderr.write(
     `A/B reasoning replay: ${parsed.modelId} (${flag}), ${cases.length} case(s) × ${parsed.repeat} round(s) per arm${
       parsed.thinkingBudget !== undefined ? `, thinking_budget=${parsed.thinkingBudget}` : ''
-    }\n`,
+    }${parsed.delayMs !== undefined ? `, delay=${parsed.delayMs}ms` : ''}\n`,
   );
 
   const execute: ExecuteOptions = {
@@ -332,6 +361,7 @@ export const main = async (argv: readonly string[]): Promise<number> => {
     flag,
     repeat: parsed.repeat,
     execute,
+    ...(parsed.delayMs !== undefined ? { delayMs: parsed.delayMs } : {}),
     onRun: (arm, round, c, r) => {
       emit({
         type: 'ab_run',

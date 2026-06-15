@@ -165,6 +165,15 @@ describe('parseArgs', () => {
   test('thinkingBudget is absent by default', () => {
     expect(parseArgs(['--model', 'openai/gpt-5.4-mini']).thinkingBudget).toBeUndefined();
   });
+  test('--delay-ms parses to a non-negative integer (0 allowed)', () => {
+    expect(parseArgs(['--model', 'openai/gpt-5.4-mini', '--delay-ms', '3000']).delayMs).toBe(3000);
+    expect(parseArgs(['--model', 'openai/gpt-5.4-mini', '--delay-ms', '0']).delayMs).toBe(0);
+  });
+  test('--delay-ms rejects a non-integer', () => {
+    expect(() => parseArgs(['--model', 'openai/gpt-5.4-mini', '--delay-ms', '1.5'])).toThrow(
+      /non-negative integer/,
+    );
+  });
 });
 
 describe('main — Anthropic gate guard', () => {

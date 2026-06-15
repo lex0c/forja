@@ -2,6 +2,54 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] Rate-limit handling: --delay-ms pacing + honor Retry-After
+
+The clean OpenAI A/B's ON arm hit 429s (TPM 200k/min) — not a replay bug: ~320
+growing requests (13-hop chain × K=10 × 2 arms) fired back-to-back, and ON's
+replayed reasoning items make each request heavier, so it tipped the rolling
+per-minute window. Two fixes:
+
+- **Retry-After honoring (`src/harness/retry.ts`, benefits the whole harness):**
+  `retryAfterMs` extracts the server hint from the thrown SDK error (`retry-after-ms`
+  ms or `retry-after` seconds; `Headers` instance or plain object, duck-typed).
+  The retry now waits `max(backoff, retry-after)` capped at `MAX_RETRY_AFTER_MS`
+  (8s) — a 200ms backoff that ignored a "retry in 5s" hint just burned an attempt.
+- **`--delay-ms` (A/B runner):** paces BETWEEN runs within an arm so consecutive
+  runs don't overlap in the provider's rolling token window. Default 0; for a
+  clean OpenAI value run, pass e.g. `--delay-ms 5000`.
+
+Tests: retryAfterMs extraction (ms/seconds/Headers/absent), the max(backoff,hint)
++ cap behavior, and --delay-ms parse/validation. The OpenAI value measurement (gap
+E for that provider) can now be re-run cleanly; Anthropic was already clean.
+
+## [2026-06-14] Phase 4 — A/B results recorded; both defaults stay OFF
+
+Ran the clean A/B on both providers (long-horizon chain, K=10/arm). Total API
+spend: ~$6.83 ($0.64 OpenAI + $6.18 Anthropic).
+
+- **Anthropic (opus-4-8, thinking_budget 4096) — CLEAN, zero delta.** OFF 10/10,
+  ON 10/10; steps 15 both; cost $0.311/run OFF vs $0.307/run ON (replay is
+  cost-NEUTRAL — the signed thinking blocks are small and cache-friendly). No
+  pass-rate signal: the chain is easy enough to pass without reasoning continuity.
+  → keep FORJA_ANTHROPIC_REASONING_REPLAY default OFF (the #25 disposition,
+  now MEASURED on a real long-horizon eval, not assumed).
+- **OpenAI (gpt-5.4-mini) — INCONCLUSIVE (rate-limit contaminated).** OFF 10/10,
+  ON 6/10 — but the 4 ON failures are 429 TPM rate limits (200k/min), NOT the
+  400 ordering bug (that fix holds — zero "reasoning item without its required
+  following item"). ON replays reasoning items → heavier requests → it burns the
+  per-minute token budget faster and 429s when 20 runs fire back-to-back. So the
+  −40pp is a throttling artifact, not a value/correctness signal; the true ON
+  cost overhead can't be read from this run (the failed runs ended early, making
+  ON look cheaper). A clean OpenAI value measurement needs inter-run throttling
+  or a higher TPM tier. → keep FORJA_OPENAI_REASONING_REPLAY default OFF.
+
+Decision: NO default flips. Anthropic measured a genuine zero delta; OpenAI is
+unmeasured-clean but has no positive signal to justify a flip. The reasoning
+replay stays a per-session opt-in (env flag) — correct and live-validated, value
+unproven. To surface value, a HARDER long-horizon eval (where OFF measurably
+fails) is the open follow-up (gap E); the OpenAI arm also needs throttling to be
+measurable. Phase 4 gate satisfied: measured, recorded, defaults held.
+
 ## [2026-06-14] A/B runner: thinking budget for a meaningful Anthropic gate
 
 The A/B runner only overrode modelId, so an Anthropic run never set thinking_budget

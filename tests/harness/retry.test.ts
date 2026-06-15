@@ -1,5 +1,10 @@
 import { describe, expect, test } from 'bun:test';
-import { generateWithRetry, isRetryableError } from '../../src/harness/retry.ts';
+import {
+  MAX_RETRY_AFTER_MS,
+  generateWithRetry,
+  isRetryableError,
+  retryAfterMs,
+} from '../../src/harness/retry.ts';
 import type { Provider, StreamEvent } from '../../src/providers/index.ts';
 
 const noSleep = (_ms: number): Promise<void> => Promise.resolve();
@@ -197,5 +202,79 @@ describe('generateWithRetry', () => {
     );
     // Two retries → two sleeps with exponential backoff.
     expect(sleeps).toEqual([200, 800]);
+  });
+
+  test('honors a server Retry-After when longer than the backoff (capped)', async () => {
+    const sleeps: number[] = [];
+    const sleep = (ms: number): Promise<void> => {
+      sleeps.push(ms);
+      return Promise.resolve();
+    };
+    let attempts = 0;
+    const provider = minimalProvider(async function* () {
+      attempts += 1;
+      if (attempts === 1) {
+        // 429 advertising a 5s wait — far longer than the 200ms backoff.
+        const e = new Error('rate limited') as Error & { status: number; headers: unknown };
+        e.status = 429;
+        e.headers = { 'retry-after': '5' };
+        throw e;
+      }
+      yield { kind: 'start', message_id: 'msg' };
+      yield { kind: 'stop', reason: 'end_turn' };
+    });
+    await collect(
+      generateWithRetry(provider, dummyReq, { maxAttempts: 3, baseDelayMs: 200, sleep }),
+    );
+    // Honored the 5s hint (> 200ms backoff), capped below the ceiling.
+    expect(sleeps).toEqual([5000]);
+    expect(sleeps[0]).toBeLessThanOrEqual(MAX_RETRY_AFTER_MS);
+  });
+
+  test('caps an absurd Retry-After at MAX_RETRY_AFTER_MS', async () => {
+    const sleeps: number[] = [];
+    const sleep = (ms: number): Promise<void> => {
+      sleeps.push(ms);
+      return Promise.resolve();
+    };
+    let attempts = 0;
+    const provider = minimalProvider(async function* () {
+      attempts += 1;
+      if (attempts === 1) {
+        const e = new Error('rate limited') as Error & { status: number; headers: unknown };
+        e.status = 429;
+        e.headers = { 'retry-after-ms': '999999' };
+        throw e;
+      }
+      yield { kind: 'start', message_id: 'msg' };
+      yield { kind: 'stop', reason: 'end_turn' };
+    });
+    await collect(
+      generateWithRetry(provider, dummyReq, { maxAttempts: 3, baseDelayMs: 200, sleep }),
+    );
+    expect(sleeps).toEqual([MAX_RETRY_AFTER_MS]);
+  });
+});
+
+describe('retryAfterMs', () => {
+  test('reads retry-after-ms (milliseconds) from a plain-object header bag', () => {
+    expect(retryAfterMs({ headers: { 'retry-after-ms': '1500' } })).toBe(1500);
+  });
+  test('reads retry-after (seconds) and converts to ms', () => {
+    expect(retryAfterMs({ headers: { 'retry-after': '3' } })).toBe(3000);
+  });
+  test('prefers retry-after-ms over retry-after', () => {
+    expect(retryAfterMs({ headers: { 'retry-after-ms': '250', 'retry-after': '9' } })).toBe(250);
+  });
+  test('reads from a Headers-like object with .get()', () => {
+    const headers = new Headers({ 'retry-after': '2' });
+    expect(retryAfterMs({ headers })).toBe(2000);
+  });
+  test('undefined when no headers / non-numeric / absent', () => {
+    expect(retryAfterMs(new Error('x'))).toBeUndefined();
+    expect(
+      retryAfterMs({ headers: { 'retry-after': 'Wed, 21 Oct 2026 07:28:00 GMT' } }),
+    ).toBeUndefined();
+    expect(retryAfterMs({ headers: {} })).toBeUndefined();
   });
 });
