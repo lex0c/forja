@@ -44,8 +44,11 @@ on the roadmap.
 ```bash
 git clone <repo-url> forja && cd forja
 bun install
-bun run build              # produces dist/forja-linux-x64
-ln -s "$PWD/dist/forja-linux-x64" ~/.local/bin/agent
+# The binary name carries the version (e.g. dist/forja-0.0.0-linux-x64).
+# A dev build (FORJA_PROFILE=dev bun run build) adds the profile:
+# dist/forja-0.0.0-dev-linux-x64 — the binary itself is profile-agnostic.
+bun run build              # produces dist/forja-<version>-linux-x64
+ln -s "$PWD/dist/forja-0.0.0-linux-x64" ~/.local/bin/agent
 ```
 
 Verify the install:

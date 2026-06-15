@@ -6,7 +6,7 @@
   "license": "Apache-2.0",
   "type": "module",
   "bin": {
-    "forja": "./dist/forja-linux-x64"
+    "forja": "./dist/forja-0.0.0-linux-x64"
   },
   "scripts": {
     "dev": "FORJA_PROFILE=dev bun run --watch src/cli/index.ts",

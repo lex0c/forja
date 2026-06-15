@@ -2,6 +2,27 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-15] build: version (+ profile) in the binary name
+
+The build artifact was a bare `dist/forja-<id>` — no version, and a dev build
+(`FORJA_PROFILE=dev bun run build`) silently clobbered the release artifact at
+the same path. `assetName(t)` (scripts/targets.ts, the single source every build
++ release script keys off) now produces `forja-<version>[-<profile>]-<id><ext>`:
+version from the canonical `VERSION` const (self-describing release artifacts,
+multiple versions coexist), and the profile segment ONLY when FORJA_PROFILE is
+set at build time. Crucially the profile is a build-CONTEXT label, NOT a
+behavioral lock — the binary is profile-agnostic and resolves the profile at its
+OWN runtime (verified: built under FORJA_PROFILE=dev, the binary still runs
+canonical when invoked without `--profile`); the label just keeps a dev build
+from overwriting a release one in dist/. `assetName` gained an `env` test seam.
+Every consumer (smoke, checksums, sbom, repro-check, size gate, sourcemap
+rename) follows automatically; updated `package.json` bin + README install to
+the versioned name and the script tests (targets/checksums/build-targets) off
+hardcoded names onto `assetName`. Measured: `bun run build` →
+`dist/forja-0.0.0-linux-x64`, `FORJA_PROFILE=dev bun run build` →
+`dist/forja-0.0.0-dev-linux-x64`, both coexisting; typecheck + lint + scripts
+tests (69) green.
+
 ## [2026-06-15] dev-mode: isolated `--profile` namespace (dev vs real state)
 
 The maintainer develops Forja AND uses it on real projects from the same machine,
