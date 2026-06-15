@@ -604,6 +604,32 @@ describe('createAnthropicProvider', () => {
       });
     });
 
+    test('on: strips sampling when thinking is engaged (Sonnet accepts both → 400 otherwise)', async () => {
+      // Sonnet 4.6 is adaptive AND accepts sampling; Anthropic rejects
+      // thinking + temperature/top_p together. With replay on + a thinking_budget
+      // + a configured temperature (an eval's default temperature:0), thinking is
+      // sent — so temperature/top_p MUST be dropped or the request 400s.
+      await withReplay(true, async () => {
+        const handle = mockClient([{ type: 'message_stop' }]);
+        const provider = createAnthropicProvider('claude-sonnet-4-6', { client: handle.client });
+        for await (const _ of provider.generate({
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 4096,
+          thinking_budget: 1000,
+          temperature: 0,
+          top_p: 0.9,
+          tools: [{ name: 't', description: 'd', input_schema: { type: 'object' } }],
+        })) {
+          // drain
+        }
+        const params = handle.streamCalls[0]?.params as Record<string, unknown>;
+        expect('thinking' in params).toBe(true);
+        expect('temperature' in params).toBe(false);
+        expect('top_p' in params).toBe(false);
+      });
+    });
+
     test('off (default): thinking stays suppressed on tool-bearing turns', async () => {
       await withReplay(false, async () => {
         const handle = mockClient([{ type: 'message_stop' }]);

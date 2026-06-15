@@ -2,6 +2,25 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] Anthropic: strip sampling when thinking is engaged (replay 400)
+
+Anthropic rejects `thinking` sent together with a `temperature`/`top_p` override
+(HTTP 400) on models that accept sampling. Opus 4.7/4.8 already strip sampling
+(`supports_sampling: false`), so this stayed latent — but Sonnet 4.6 is adaptive
+AND sampling-capable. With reasoning replay ON + a thinking_budget on a
+tool-bearing turn, the lifted suppression gate now emits `thinking:{adaptive}`
+while the assembly still forwarded `temperature` (evals default temperature:0) →
+a guaranteed 400 on any Sonnet A/B or temperature-configured Sonnet session with
+replay, instead of measuring replay. (The same conflict pre-existed on no-tool
+turns for a Sonnet thinking_budget + temperature.)
+
+Fix at the general altitude: compute the thinking param first and drop sampling
+whenever thinking is engaged (`samplingParams(req, acceptsSampling &&
+!thinkingEngaged)`) — thinking and sampling are mutually exclusive on Anthropic,
+so this is correct for adaptive and legacy-enabled paths alike, and a no-op on
+Opus (already stripped). Test: Sonnet + replay + thinking_budget + temperature +
+top_p → thinking sent, both sampling knobs dropped.
+
 ## [2026-06-14] Token estimate counts replayed reasoning (was always 0)
 
 The shared prompt estimator charged `reasoning` blocks as 0 unconditionally. With

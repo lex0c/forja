@@ -365,16 +365,24 @@ export const createAnthropicProvider = (
     // other Claude model accepting the canonical TOKEN_TUNING §9
     // values unchanged.
     const acceptsSampling = caps.supports_sampling !== false;
+    // Extended thinking — adaptive vs legacy manual budget, gated by capability.
+    // See `anthropicThinkingParam`. Computed first because it decides sampling:
+    // Anthropic REJECTS `thinking` sent together with a `temperature`/`top_p`
+    // override (HTTP 400) on models that accept sampling (e.g. Sonnet 4.6). Opus
+    // 4.7/4.8 already strip sampling via `acceptsSampling`, but a sampling-capable
+    // adaptive model with a thinking_budget + a configured temperature (an eval's
+    // default temperature:0, or a Sonnet session with reasoning replay on) would
+    // otherwise send both and 400. So whenever thinking is engaged, drop sampling.
+    const thinkingParam = anthropicThinkingParam(req, caps, reasoningReplay);
+    const thinkingEngaged = 'thinking' in thinkingParam;
     const stream = client.messages.stream({
       model: modelName,
       max_tokens: req.max_tokens,
       messages: cachedMessages,
       ...(cachedSystem !== undefined ? { system: cachedSystem } : {}),
       ...(cachedTools !== undefined ? { tools: cachedTools } : {}),
-      ...samplingParams(req, acceptsSampling),
-      // Extended thinking — adaptive vs legacy manual budget, gated
-      // by the model capability. See `anthropicThinkingParam`.
-      ...anthropicThinkingParam(req, caps, reasoningReplay),
+      ...samplingParams(req, acceptsSampling && !thinkingEngaged),
+      ...thinkingParam,
       // Agnostic reasoning effort (TOKEN_TUNING.md §4). Anthropic's native
       // `output_config.effort` maps via `anthropicEffort`, which clamps `xhigh`
       // (Opus 4.7/4.8 only) down to `high` where unsupported to avoid a 400.
