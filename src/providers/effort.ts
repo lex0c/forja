@@ -31,20 +31,30 @@ export const EFFORT_THINKING_BUDGET: Record<ProviderEffort, number> = {
   low: 2_048,
   medium: 8_192,
   high: 16_384,
+  xhigh: 20_480,
   max: 24_576,
 };
 
 // OpenAI's `reasoning.effort` vocabulary is none|minimal|low|medium|
-// high|xhigh. The Forja abstraction tops out at `max`, which has no
-// OpenAI counterpart, so it maps to `xhigh` — the highest level the
-// API exposes. low/medium/high are 1:1.
+// high|xhigh. `xhigh` is OpenAI's TOP level, so both the Forja `xhigh`
+// (1:1) and `max` (no OpenAI counterpart above xhigh) map onto it.
+// low/medium/high are 1:1.
 export const OPENAI_REASONING_EFFORT: Record<ProviderEffort, 'low' | 'medium' | 'high' | 'xhigh'> =
   {
     low: 'low',
     medium: 'medium',
     high: 'high',
+    xhigh: 'xhigh',
     max: 'xhigh',
   };
+
+// Anthropic's native `output_config.effort` maps 1:1 with the agnostic ladder
+// EXCEPT `xhigh`, which only Opus 4.7/4.8 expose; on every other model a request
+// for `xhigh` 400s, so clamp it down to `high`. Centralized here (beside the
+// OpenAI table) so the whole effort-translation surface lives in one file and
+// the clamp is unit-testable as a pure mapping, not buried in request assembly.
+export const anthropicEffort = (effort: ProviderEffort, supportsXhigh: boolean): ProviderEffort =>
+  effort === 'xhigh' && !supportsXhigh ? 'high' : effort;
 
 // Smallest thinking budget worth sending. Numeric-budget providers
 // reject (or silently no-op) a budget below their model minimum —

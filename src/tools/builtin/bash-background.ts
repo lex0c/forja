@@ -142,7 +142,10 @@ export const bashBackgroundTool: Tool<BashBackgroundInput, BashBackgroundOutput>
       const r = await ctx.bgManager.spawn({
         command: args.command,
         cwd: wd,
-        ...(args.label !== undefined ? { label: args.label } : {}),
+        // `label: ""` is omitted, not stored — an empty label carries no
+        // human-readable value and would only pollute the tray / audit row
+        // (the non-string reject above still fires for genuinely bad input).
+        ...(typeof args.label === 'string' && args.label.length > 0 ? { label: args.label } : {}),
         ...(args.max_runtime_ms !== undefined ? { maxRuntimeMs: args.max_runtime_ms } : {}),
         // §6.5: pass the engine's chosen profile through so the bg
         // manager's Bun.spawn wraps with bwrap when applicable.

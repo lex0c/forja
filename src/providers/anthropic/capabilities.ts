@@ -41,6 +41,9 @@ export const ANTHROPIC_CAPS: Record<string, ProviderCapabilities> = {
     supports_sampling: false,
     supports_adaptive_thinking: true,
     supports_reasoning_effort: true,
+    // Opus 4.7/4.8 expose the `xhigh` effort level (the coding/agentic sweet
+    // spot); Sonnet 4.6 / Haiku do not, so they clamp `xhigh` → `high`.
+    supports_effort_xhigh: true,
     notes: ['most capable model; default executor for coding and agentic work'],
   },
   'claude-opus-4-7': {
@@ -63,6 +66,7 @@ export const ANTHROPIC_CAPS: Record<string, ProviderCapabilities> = {
     supports_adaptive_thinking: true,
     // Accepts `output_config.effort` (low|medium|high|xhigh|max).
     supports_reasoning_effort: true,
+    supports_effort_xhigh: true,
     notes: ['frontier model; best for security-audit and deliberate reasoning workflows'],
   },
   'claude-sonnet-4-6': {

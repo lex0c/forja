@@ -22,6 +22,14 @@ export type EvalExpectation =
   | { kind: 'status'; status: HarnessResult['status'] }
   | { kind: 'exit_reason'; reason: ExitReason }
   | { kind: 'output_contains'; pattern: string }
+  // Asserts the run took at least `count` steps. Pairs with a
+  // forced dependency-chain prompt to prove the agent actually ran
+  // a LONG trajectory — a model that shortcuts the chain in a few
+  // steps fails even if it happens to land the answer. Critical for
+  // long-horizon evals where the property under test (e.g. reasoning
+  // continuity) only manifests across many tool round-trips; without
+  // it a 3-step lucky pass would mask the regime we mean to measure.
+  | { kind: 'min_steps'; count: number }
   // Compaction observability: assert that at least `minCount`
   // `compaction_finished` events fired during the run, optionally
   // restricted to a specific `strategy` ('llm' / 'fallback' /

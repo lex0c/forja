@@ -5,6 +5,7 @@ import { stableStringify } from '../canonical-json.ts';
 // bounds. OpenAI has no server-side countTokens endpoint until tiktoken
 // lands in M5.
 import { OPENAI_REASONING_EFFORT } from '../effort.ts';
+import { boolFromEnv } from '../env.ts';
 import { deriveSeedFromRequest } from '../seed.ts';
 import { estimateMessagesTokens } from '../tokens.ts';
 import type {
@@ -66,6 +67,31 @@ export const openaiPromptCacheKey = (req: GenerateRequest): string =>
     .update(stableStringify(req.tools ?? []))
     .digest('hex');
 
+// OpenAI prompt-cache retention INTENT from the env var. Returns the value to
+// SEND, not a boolean: `24h` (the default — keep the cached prefix warm up to 24h
+// vs the 5–10min in-memory baseline, parity with Anthropic's longer TTL) or
+// `in_memory` (the data-residency / ZDR-conscious opt-out). The opt-out must be
+// SENT explicitly, not omitted: OpenAI documents that an OMITTED retention
+// defaults to `24h` for supported models in a non-ZDR org, so dropping the field
+// would silently leave the user on extended cache — the opposite of opting out.
+// `in_memory` / `off` / `0` / `false` all select the opt-out. The factory then
+// reconciles this intent with the model (a 24h-only model rejects `in_memory`).
+const promptCacheRetentionFromEnv = (): '24h' | 'in_memory' => {
+  const v = process.env.FORJA_OPENAI_PROMPT_CACHE_RETENTION;
+  if (v === undefined || v === '') return '24h';
+  const norm = v.toLowerCase();
+  return norm === 'in_memory' || norm === 'off' || norm === '0' || norm === 'false'
+    ? 'in_memory'
+    : '24h';
+};
+
+// Replay captured reasoning items across tool-bearing turns (stateless
+// continuity: pass items back as input + `include: ['reasoning.encrypted_content']`).
+// Default ON — OpenAI "highly recommends" passing reasoning items back for
+// agentic/multi-turn function calling (better results, fewer recomputed tokens).
+// Set FORJA_OPENAI_REASONING_REPLAY=0 to opt out. Only the Responses path honors
+// it (Chat Completions drops reasoning); resolved against `replaysReasoning`.
+//
 // Resolve the `includeUsage` default from the environment for callers
 // who don't pass an explicit option (notably the registry factory used
 // by the CLI bootstrap, which forwards no options today). Truthy by
@@ -122,8 +148,7 @@ const toOpenAIMessages = (m: ProviderMessage): OpenAIMessage[] => {
         type: 'function',
         function: { name: block.name, arguments: JSON.stringify(block.input) },
       });
-    } else {
-      // tool_result
+    } else if (block.type === 'tool_result') {
       if (m.role !== 'user') {
         throw new Error('tool_result blocks must appear on user messages');
       }
@@ -133,6 +158,9 @@ const toOpenAIMessages = (m: ProviderMessage): OpenAIMessage[] => {
         content: block.content,
       });
     }
+    // `reasoning` blocks are dropped on the Chat Completions path — reasoning
+    // replay is a Responses-API feature (wired in the OpenAI Responses path,
+    // flagged); Chat Completions has no input slot for reasoning items.
   }
 
   // Tool results come first so they read as the answer to the prior
@@ -191,6 +219,34 @@ export const createOpenAIProvider = (
   }
 
   const includeUsage = options.includeUsage ?? includeUsageFromEnv();
+  // Prompt-cache retention, resolved once. Only on real OpenAI (a custom baseURL
+  // may 400 on the param) and only for models that advertise extended retention;
+  // otherwise omit (a non-extended model's only mode is in_memory, which is also
+  // OpenAI's default-on-omit there, so omitting already honors a data-residency
+  // opt-out). For extended models we SEND the resolved intent — including the
+  // `in_memory` opt-out, which must be explicit (omitting defaults to 24h). The
+  // exception: a 24h-only model (gpt-5.5/5.5-pro/future) REJECTS `in_memory`, so
+  // the opt-out can't be honored there — omit and warn, rather than send an
+  // invalid value (which would 400) or pretend it worked (a data-residency leak).
+  let promptCacheRetention: '24h' | 'in_memory' | undefined;
+  if (options.baseURL === undefined && caps.extended_prompt_cache === true) {
+    const intent = promptCacheRetentionFromEnv();
+    if (intent === 'in_memory' && caps.extended_prompt_cache_24h_only === true) {
+      promptCacheRetention = undefined;
+      process.stderr.write(
+        `forja: ${modelName} accepts only 24h prompt-cache retention; the in_memory data-residency opt-out (FORJA_OPENAI_PROMPT_CACHE_RETENTION) cannot be honored on this model — use a model that supports in_memory (e.g. gpt-5.4) for that workload.\n`,
+      );
+    } else {
+      promptCacheRetention = intent;
+    }
+  } else {
+    promptCacheRetention = undefined;
+  }
+  // Reasoning-item replay (Responses path): real OpenAI only (the `include`
+  // param + opaque input items may 400 on a compat endpoint), env-gated, OFF by
+  // default. Resolved once, threaded into generateViaResponses.
+  const reasoningReplay =
+    options.baseURL === undefined && boolFromEnv('FORJA_OPENAI_REASONING_REPLAY', true);
   // Sampling gate (mirrors the Anthropic adapter). Reasoning models —
   // OpenAI's o-series and gpt-5.x — REJECT `temperature`/`top_p` with HTTP
   // 400 ("Unsupported parameter"). The capability opts those models out
@@ -233,6 +289,7 @@ export const createOpenAIProvider = (
     if (options.baseURL === undefined) {
       params.prompt_cache_key = openaiPromptCacheKey(req);
     }
+    if (promptCacheRetention !== undefined) params.prompt_cache_retention = promptCacheRetention;
     if (acceptsSampling && req.temperature !== undefined) params.temperature = req.temperature;
     if (acceptsSampling && req.top_p !== undefined) params.top_p = req.top_p;
     // Determinism intent (`PLAYBOOKS.md` §1.1
@@ -298,6 +355,7 @@ export const createOpenAIProvider = (
     };
     // Cache-routing hint — real OpenAI only (a custom baseURL may 400 on it).
     if (options.baseURL === undefined) params.prompt_cache_key = openaiPromptCacheKey(req);
+    if (promptCacheRetention !== undefined) params.prompt_cache_retention = promptCacheRetention;
     if (acceptsSampling && req.temperature !== undefined) params.temperature = req.temperature;
     if (acceptsSampling && req.top_p !== undefined) params.top_p = req.top_p;
 
@@ -359,19 +417,46 @@ export const createOpenAIProvider = (
   const responsesCacheKey = (req: GenerateRequest | ConstrainedRequest): string | undefined =>
     options.baseURL === undefined ? openaiPromptCacheKey(req) : undefined;
 
+  // Replay only actually happens on the Responses path (generateViaResponses
+  // honors reasoningReplay). The Chat Completions path drops reasoning blocks in
+  // toOpenAIMessages, so a non-Responses model (gpt-4o) must NOT advertise
+  // replaysReasoning even with the flag on — otherwise the token estimator counts
+  // reasoning payloads it never sends (e.g. a session resumed from a reasoning
+  // model into gpt-4o) and compacts prematurely.
+  const replaysReasoning = useResponses && reasoningReplay;
+
   return {
     id: `openai/${modelName}`,
     family: 'openai',
     capabilities: caps,
+    replaysReasoning,
     generate: useResponses
       ? (req: GenerateRequest) =>
-          generateViaResponses(client, modelName, caps, req, responsesCacheKey(req))
+          generateViaResponses(
+            client,
+            modelName,
+            caps,
+            req,
+            responsesCacheKey(req),
+            promptCacheRetention,
+            reasoningReplay,
+          )
       : generate,
     generateConstrained: useResponses
       ? (req: ConstrainedRequest) =>
-          generateConstrainedViaResponses(client, modelName, caps, req, responsesCacheKey(req))
+          generateConstrainedViaResponses(
+            client,
+            modelName,
+            caps,
+            req,
+            responsesCacheKey(req),
+            promptCacheRetention,
+          )
       : generateConstrained,
+    // Use `replaysReasoning` (NOT the raw env flag) so the count matches the send
+    // path: a Chat Completions model drops reasoning, so counting it would inflate
+    // a resumed conversation's estimate and force premature compaction.
     countTokens: (messages: ProviderMessage[]): Promise<number> =>
-      Promise.resolve(estimateMessagesTokens(messages)),
+      Promise.resolve(estimateMessagesTokens(messages, { countReasoning: replaysReasoning })),
   };
 };

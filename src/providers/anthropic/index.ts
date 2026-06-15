@@ -1,4 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
+import { anthropicEffort } from '../effort.ts';
+import { boolFromEnv } from '../env.ts';
 import type {
   ConstrainedRequest,
   ConstrainedResult,
@@ -7,6 +9,7 @@ import type {
   ProviderCapabilities,
   ProviderContentBlock,
   ProviderMessage,
+  ProviderReasoningBlock,
   ProviderToolDef,
   StreamEvent,
   UsageInfo,
@@ -53,9 +56,22 @@ const cacheTtlFromEnv = (): CacheTtl =>
 // Gemini (which correlates results to calls by name). Anthropic
 // only accepts `tool_use_id`/`content`/`is_error` and 400s with
 // `Extra inputs are not permitted` if `name` leaks through.
-const stripToolResultName = (block: ProviderContentBlock): ProviderContentBlock => {
+// Content blocks Anthropic actually accepts on the wire. `reasoning` is the
+// provider-neutral opaque carrier — it is mapped to a native thinking block on
+// replay (Phase 2, flagged) or dropped; it is never sent as-is.
+type AnthropicSendableBlock = Exclude<ProviderContentBlock, ProviderReasoningBlock>;
+// Native Anthropic reasoning wire blocks — signed `thinking` or `redacted_thinking`
+// (safety-redacted, opaque `data`). Neither is a ProviderContentBlock; both only
+// exist at the wire boundary, reconstructed from a captured reasoning block. Both
+// MUST round-trip unchanged with tool_results or the API rejects the turn.
+type AnthropicReasoningWireBlock =
+  | { type: 'thinking'; thinking: string; signature: string }
+  | { type: 'redacted_thinking'; data: string };
+type AnthropicWireBlock = AnthropicSendableBlock | AnthropicReasoningWireBlock;
+
+const stripToolResultName = (block: AnthropicSendableBlock): AnthropicSendableBlock => {
   if (block.type !== 'tool_result') return block;
-  const cleaned: ProviderContentBlock = {
+  const cleaned: AnthropicSendableBlock = {
     type: 'tool_result',
     tool_use_id: block.tool_use_id,
     content: block.content,
@@ -64,12 +80,54 @@ const stripToolResultName = (block: ProviderContentBlock): ProviderContentBlock 
   return cleaned;
 };
 
+// Reconstruct the native signed thinking block from a captured reasoning block,
+// VERBATIM — the signature must round-trip byte-identical or Anthropic 400s the
+// tool-bearing turn. Only `provider: 'anthropic'` blocks map; foreign-tagged
+// blocks (a different family captured them mid-session) are dropped, mirroring
+// the API's own cross-model behavior. Returns undefined for anything unusable.
+const reasoningToWireBlock = (
+  block: ProviderReasoningBlock,
+): AnthropicReasoningWireBlock | undefined => {
+  if (block.provider !== 'anthropic') return undefined;
+  const data = block.data as {
+    thinking?: unknown;
+    signature?: unknown;
+    redacted_thinking?: unknown;
+  } | null;
+  if (data === null || typeof data !== 'object') return undefined;
+  // Safety-redacted thinking: opaque `data`, no readable summary — replayed
+  // verbatim (the multi-turn protocol breaks if it's dropped, per the API docs).
+  if (typeof data.redacted_thinking === 'string') {
+    return { type: 'redacted_thinking', data: data.redacted_thinking };
+  }
+  // Signed thinking: text (possibly empty under display:'omitted') + signature.
+  if (typeof data.thinking === 'string' && typeof data.signature === 'string') {
+    if (data.signature.length === 0) return undefined;
+    return { type: 'thinking', thinking: data.thinking, signature: data.signature };
+  }
+  return undefined;
+};
+
 const toAnthropicMessage = (
   m: ProviderMessage,
-): { role: ProviderMessage['role']; content: ProviderMessage['content'] } => ({
-  role: m.role,
-  content: typeof m.content === 'string' ? m.content : m.content.map(stripToolResultName),
-});
+  reasoningReplay: boolean,
+): { role: ProviderMessage['role']; content: string | AnthropicWireBlock[] } => {
+  if (typeof m.content === 'string') return { role: m.role, content: m.content };
+  const out: AnthropicWireBlock[] = [];
+  for (const b of m.content) {
+    if (b.type === 'reasoning') {
+      // Off (Phase 1 behavior): drop. On: replay as a native thinking block,
+      // placed in situ — the loop already stores reasoning FIRST in the
+      // assistant turn, so it lands before text/tool_use as the contract needs.
+      if (!reasoningReplay) continue;
+      const wire = reasoningToWireBlock(b);
+      if (wire !== undefined) out.push(wire);
+      continue;
+    }
+    out.push(stripToolResultName(b));
+  }
+  return { role: m.role, content: out };
+};
 
 const toAnthropicTool = (t: ProviderToolDef): Anthropic.Tool => ({
   name: t.name,
@@ -89,23 +147,44 @@ const toAnthropicTool = (t: ProviderToolDef): Anthropic.Tool => ({
 // operator cares about reasoning. LEGACY models keep the manual
 // `enabled + budget_tokens` surface; budget=0 omits the block
 // (disable-via-zero idiom, PLAYBOOKS.md §1.1).
+// Opt-in (Phase 2): replay signed thinking blocks across tool-bearing turns so
+// interleaved thinking stays ON during the agentic loop. Default OFF until the
+// long-horizon eval proves value. Adaptive-thinking models (the current Claude
+// family) auto-enable interleaved thinking with NO beta header; the signature
+// round-trips byte-identical via the reasoning block (never canonicalized).
 export const anthropicThinkingParam = (
   req: GenerateRequest,
   caps: ProviderCapabilities,
+  reasoningReplay = false,
+  thinkingDefaultOn = false,
 ): { thinking?: { type: 'adaptive' } | { type: 'enabled'; budget_tokens: number } } => {
   const budget = req.thinking_budget;
-  // Thinking is engaged ONLY by an explicit thinking budget (> 0), NOT
-  // by `effort`. `effort` sets `output_config.effort` (token-eagerness
-  // over text + tool calls, and thinking depth WHEN thinking is on) but
-  // must not turn thinking ON by itself: with the default effort='high'
-  // that would force extended thinking onto every run, and on a pre-4.7
-  // ADAPTIVE model that still accepts sampling (Sonnet 4.6), thinking
-  // together with a temperature/top_p override is rejected with HTTP
-  // 400. Decoupling keeps deterministic runs valid — an eval pinning
-  // `temperature: 0`, or a builtin subagent with `sampling.temperature`
-  // — while `effort` still shapes those runs via `output_config`. A
-  // budget of 0 / absent ⇒ no thinking (disable-via-zero, PLAYBOOKS §1.1).
-  if (budget === undefined || budget <= 0) return {};
+  const adaptive = caps.supports_adaptive_thinking === true;
+  // `budget: 0` (or negative) is the explicit disable-via-zero idiom and ALWAYS
+  // wins, even with thinking default-on (PLAYBOOKS §1.1) — evals/CI pin this for
+  // determinism.
+  if (budget !== undefined && budget <= 0) return {};
+  // When thinking is engaged:
+  //   - ADAPTIVE models (Opus 4.7/4.8, Sonnet 4.6): ON by default
+  //     (`thinkingDefaultOn`, from FORJA_ANTHROPIC_THINKING) OR an explicit
+  //     budget > 0. The Anthropic guidance is to default to adaptive thinking;
+  //     `effort` (output_config.effort) guides DEPTH, not on/off, so the two are
+  //     orthogonal.
+  //   - LEGACY models (Haiku): only via an explicit budget > 0 — there's no
+  //     adaptive surface and we don't wire the interleaved-thinking beta header.
+  //
+  // The AUTO default YIELDS to an explicit `temperature`/`top_p` pin: engaging
+  // thinking strips sampling (Anthropic 400s on thinking + sampling), so a caller
+  // that pinned sampling for DETERMINISM (the verify-* fact-check subagents at
+  // temperature 0.1, the compaction summarizer at 0, any eval/subagent with a
+  // sampling override) must keep it — auto-thinking would silently drop it. An
+  // EXPLICIT budget > 0 still wins (the caller asked for thinking outright; the
+  // pinned sampling is then stripped as before).
+  const hasExplicitSampling = req.temperature !== undefined || req.top_p !== undefined;
+  const wantThinking = adaptive
+    ? (budget !== undefined && budget > 0) || (thinkingDefaultOn && !hasExplicitSampling)
+    : budget !== undefined && budget > 0;
+  if (!wantThinking) return {};
   // Defensive gate: thinking is allowed only on NO-TOOL turns. When the model
   // emits a `thinking` block before a `tool_use`, the Anthropic contract
   // requires that unmodified block (including its cryptographic `signature`)
@@ -117,11 +196,14 @@ export const anthropicThinkingParam = (
   // are present — preserving the one case where it plausibly helps (reasoning
   // before a tool-less action) while keeping every tool-bearing turn safe.
   // The `generate` closure surfaces a one-time warning when this fires so the
-  // operator learns why a configured `thinking_budget` had no effect.
-  if (req.tools !== undefined && req.tools.length > 0) return {};
-  return caps.supports_adaptive_thinking === true
+  // operator learns why a configured `thinking_budget` had no effect. With
+  // reasoning replay ON the gate lifts: the signed thinking block now round-
+  // trips with the tool_result, so thinking is safe on tool-bearing turns.
+  if (!reasoningReplay && req.tools !== undefined && req.tools.length > 0) return {};
+  // Legacy branch is only reached with budget > 0 (see `wantThinking`).
+  return adaptive
     ? { thinking: { type: 'adaptive' } }
-    : { thinking: { type: 'enabled', budget_tokens: budget } };
+    : { thinking: { type: 'enabled', budget_tokens: budget as number } };
 };
 
 // Anthropic rejects `temperature` and `top_p` sent TOGETHER on
@@ -187,6 +269,25 @@ export const createAnthropicProvider = (
     client = new Anthropic({ apiKey });
   }
 
+  // Resolved once: whether to replay signed thinking blocks across tool turns
+  // and lift the suppression gate. Default ON (the Anthropic docs make preserving
+  // thinking blocks across tool use MANDATORY when thinking is engaged); set
+  // FORJA_ANTHROPIC_REASONING_REPLAY=0 to opt out. Near-inert unless a
+  // thinking_budget is set — with thinking off there are no blocks to replay, so
+  // default-ON only changes behavior for sessions that actually enable thinking
+  // (where it's required for correctness). Gated to ADAPTIVE-thinking models —
+  // they auto-enable interleaved thinking with no beta header (the header-free
+  // path the docs describe). Legacy/non-adaptive (e.g. Haiku) would need the
+  // `interleaved-thinking-2025-05-14` header we don't wire, so replay stays off.
+  const reasoningReplay =
+    boolFromEnv('FORJA_ANTHROPIC_REASONING_REPLAY', true) &&
+    caps.supports_adaptive_thinking === true;
+  // Adaptive thinking default-ON for adaptive models (the Anthropic guidance:
+  // default to adaptive thinking for non-trivial work). Set FORJA_ANTHROPIC_THINKING=0
+  // to opt out globally (CI/eval determinism, cost-sensitive sessions); a per-call
+  // `thinking_budget: 0` disables it for that call. Inert on legacy models.
+  const thinkingDefaultOn = boolFromEnv('FORJA_ANTHROPIC_THINKING', true);
+
   const generate = async function* (req: GenerateRequest): AsyncIterable<StreamEvent> {
     // The SDK's typed `messages.stream({...})` accepts our shape directly;
     // we cast the returned async iterable to the local minimal event type
@@ -210,7 +311,7 @@ export const createAnthropicProvider = (
         ? toolsWithCacheBreakpoint(req.tools.map(toAnthropicTool), marker)
         : undefined;
     const cachedMessages = messagesWithTailCacheBreakpoint(
-      req.messages.map(toAnthropicMessage),
+      req.messages.map((m) => toAnthropicMessage(m, reasoningReplay)),
       marker,
     );
     // Anthropic 400s on > 4 cache_control markers per request.
@@ -249,12 +350,13 @@ export const createAnthropicProvider = (
     if (
       // Only the LEGACY enabled path sends `budget_tokens`; adaptive
       // models drop it (`anthropicThinkingParam`), so the
-      // budget-vs-max_tokens cross-check is moot there — skip it.
+      // budget-vs-max_tokens cross-check is moot there — skip it. (Reasoning
+      // replay only engages on ADAPTIVE models, so it never reaches this
+      // legacy-only branch; no replay-specific carve-out is needed here.)
       caps.supports_adaptive_thinking !== true &&
-      // Tools present ⇒ thinking is suppressed entirely (`anthropicThinkingParam`),
-      // so no `budget_tokens` leaves the binary and the API never sees the
-      // budget-vs-max_tokens pair. Validating it here would reject a request
-      // that is actually valid, with a now-false "Anthropic rejects" reason.
+      // Tools present ⇒ thinking is suppressed (`anthropicThinkingParam`), so no
+      // `budget_tokens` leaves the binary and validating would reject a request
+      // that's actually valid — restrict the check to no-tool turns.
       (req.tools === undefined || req.tools.length === 0) &&
       req.thinking_budget !== undefined &&
       req.thinking_budget > 0 &&
@@ -270,6 +372,7 @@ export const createAnthropicProvider = (
     // no-op — the budget is honored only on no-tool turns until the
     // thinking-block signature round-trip lands.
     if (
+      !reasoningReplay &&
       !warnedThinkingSuppressedByTools &&
       req.thinking_budget !== undefined &&
       req.thinking_budget > 0 &&
@@ -288,24 +391,35 @@ export const createAnthropicProvider = (
     // other Claude model accepting the canonical TOKEN_TUNING §9
     // values unchanged.
     const acceptsSampling = caps.supports_sampling !== false;
+    // Extended thinking — adaptive vs legacy manual budget, gated by capability.
+    // See `anthropicThinkingParam`. Computed first because it decides sampling:
+    // Anthropic REJECTS `thinking` sent together with a `temperature`/`top_p`
+    // override (HTTP 400) on models that accept sampling (e.g. Sonnet 4.6). Opus
+    // 4.7/4.8 already strip sampling via `acceptsSampling`, but a sampling-capable
+    // adaptive model with a thinking_budget + a configured temperature (an eval's
+    // default temperature:0, or a Sonnet session with reasoning replay on) would
+    // otherwise send both and 400. So whenever thinking is engaged, drop sampling.
+    const thinkingParam = anthropicThinkingParam(req, caps, reasoningReplay, thinkingDefaultOn);
+    const thinkingEngaged = 'thinking' in thinkingParam;
     const stream = client.messages.stream({
       model: modelName,
       max_tokens: req.max_tokens,
       messages: cachedMessages,
       ...(cachedSystem !== undefined ? { system: cachedSystem } : {}),
       ...(cachedTools !== undefined ? { tools: cachedTools } : {}),
-      ...samplingParams(req, acceptsSampling),
-      // Extended thinking — adaptive vs legacy manual budget, gated
-      // by the model capability. See `anthropicThinkingParam`.
-      ...anthropicThinkingParam(req, caps),
-      // Agnostic reasoning effort (TOKEN_TUNING.md §4). Anthropic's
-      // native `output_config.effort` accepts low|medium|high|max
-      // 1:1 with `ProviderEffort`. Affects text, tool calls, and —
-      // when adaptive thinking is engaged above — thinking depth.
-      // Gated on the model capability: not every model exposes the
-      // surface, so emit only where declared supported to avoid a 400.
+      ...samplingParams(req, acceptsSampling && !thinkingEngaged),
+      ...thinkingParam,
+      // Agnostic reasoning effort (TOKEN_TUNING.md §4). Anthropic's native
+      // `output_config.effort` maps via `anthropicEffort`, which clamps `xhigh`
+      // (Opus 4.7/4.8 only) down to `high` where unsupported to avoid a 400.
+      // Affects text, tool calls, and — when adaptive thinking is engaged above
+      // — thinking depth. Gated on the capability: not every model exposes it.
       ...(req.effort !== undefined && caps.supports_reasoning_effort === true
-        ? { output_config: { effort: req.effort } }
+        ? {
+            output_config: {
+              effort: anthropicEffort(req.effort, caps.supports_effort_xhigh === true),
+            },
+          }
         : {}),
       ...(req.stop_sequences !== undefined ? { stop_sequences: req.stop_sequences } : {}),
       // `seed_in_eval` is intentionally NOT forwarded here. The
@@ -327,6 +441,7 @@ export const createAnthropicProvider = (
     id: `anthropic/${modelName}`,
     family: 'anthropic',
     capabilities: effectiveCaps,
+    replaysReasoning: reasoningReplay,
     generate,
     generateConstrained: async (req: ConstrainedRequest): Promise<ConstrainedResult> => {
       // Anthropic's structured-output surface is forced tool calling:
@@ -360,7 +475,7 @@ export const createAnthropicProvider = (
           ? systemSegmentsWithCacheBreakpoints(req.systemSegments, marker)
           : systemWithCacheBreakpoint(req.system, marker);
       const cachedMessages = messagesWithTailCacheBreakpoint(
-        req.messages.map(toAnthropicMessage),
+        req.messages.map((m) => toAnthropicMessage(m, reasoningReplay)),
         marker,
       );
       const schemaTool: Anthropic.Tool = {
@@ -423,7 +538,7 @@ export const createAnthropicProvider = (
     countTokens: async (messages: ProviderMessage[]): Promise<number> => {
       const response = await client.messages.countTokens({
         model: modelName,
-        messages: messages.map(toAnthropicMessage),
+        messages: messages.map((m) => toAnthropicMessage(m, reasoningReplay)),
       });
       return response.input_tokens;
     },

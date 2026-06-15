@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import type Anthropic from '@anthropic-ai/sdk';
 import {
   anthropicThinkingParam,
@@ -88,6 +88,23 @@ const drain = async (
 };
 
 describe('anthropic adapter request assembly (effort + adaptive migration)', () => {
+  // Thinking and replay now default ON; pin OFF here so the effort/budget
+  // assembly tests isolate their surface. A dedicated test covers default-on.
+  const FLAGS = ['FORJA_ANTHROPIC_THINKING', 'FORJA_ANTHROPIC_REASONING_REPLAY'] as const;
+  const orig: Record<string, string | undefined> = {};
+  beforeEach(() => {
+    for (const f of FLAGS) {
+      orig[f] = process.env[f];
+      process.env[f] = '0';
+    }
+  });
+  afterEach(() => {
+    for (const f of FLAGS) {
+      if (orig[f] === undefined) delete process.env[f];
+      else process.env[f] = orig[f];
+    }
+  });
+
   test('opus-4-7 (adaptive): effort → output_config.effort + thinking adaptive, no budget_tokens', async () => {
     const cap: { params?: Record<string, unknown> } = {};
     const provider = createAnthropicProvider('claude-opus-4-7', { client: fakeClient(cap) });
@@ -119,20 +136,42 @@ describe('anthropic adapter request assembly (effort + adaptive migration)', () 
     expect(cap.params?.thinking).toBeUndefined();
   });
 
-  test('sonnet-4-6: default effort + temperature does NOT engage thinking (sampling+thinking 400 guard)', async () => {
-    // Regression: bootstrap defaults effort='high'; Sonnet 4.6 is
-    // adaptive AND accepts sampling, so engaging thinking from effort
-    // would emit `thinking` alongside `temperature` → HTTP 400. effort
-    // must ride only output_config here, leaving thinking off so a
-    // deterministic (temperature:0) run stays valid.
+  test('sonnet-4-6 with thinking OFF (opt-out): effort rides output_config, sampling preserved', async () => {
+    // With FORJA_ANTHROPIC_THINKING=0 (the suite baseline), effort does NOT
+    // engage thinking, so `temperature` is forwarded with no conflict — effort
+    // still rides output_config. (Default-on flips this — covered below.)
     const cap: { params?: Record<string, unknown> } = {};
     const provider = createAnthropicProvider('claude-sonnet-4-6', { client: fakeClient(cap) });
     await drain(
       provider,
       req({ model: 'claude-sonnet-4-6', effort: 'high', temperature: 0, max_tokens: 8000 }),
     );
-    expect(cap.params?.thinking).toBeUndefined(); // no thinking from effort alone
+    expect(cap.params?.thinking).toBeUndefined();
+    expect(cap.params?.output_config).toEqual({ effort: 'high' });
+    expect(cap.params?.temperature).toBe(0);
+  });
+
+  test('sonnet-4-6 with thinking default-ON (no sampling pin): adaptive thinking + effort', async () => {
+    delete process.env.FORJA_ANTHROPIC_THINKING; // unset → default ON
+    const cap: { params?: Record<string, unknown> } = {};
+    const provider = createAnthropicProvider('claude-sonnet-4-6', { client: fakeClient(cap) });
+    await drain(provider, req({ model: 'claude-sonnet-4-6', effort: 'high', max_tokens: 8000 }));
+    expect(cap.params?.thinking).toEqual({ type: 'adaptive' }); // engaged by default
+    expect(cap.params?.output_config).toEqual({ effort: 'high' }); // effort guides depth
+  });
+
+  test('sonnet-4-6 default-ON YIELDS to an explicit temperature (determinism preserved)', async () => {
+    // The verify-*/compaction/eval case: a pinned temperature must survive — the
+    // auto-default must not engage thinking and strip it.
+    delete process.env.FORJA_ANTHROPIC_THINKING; // default ON
+    const cap: { params?: Record<string, unknown> } = {};
+    const provider = createAnthropicProvider('claude-sonnet-4-6', { client: fakeClient(cap) });
+    await drain(
+      provider,
+      req({ model: 'claude-sonnet-4-6', effort: 'high', temperature: 0, max_tokens: 8000 }),
+    );
+    expect(cap.params?.thinking).toBeUndefined(); // auto-thinking yielded to the pin
     expect(cap.params?.output_config).toEqual({ effort: 'high' }); // effort still applied
-    expect(cap.params?.temperature).toBe(0); // sampling preserved → no conflict
+    expect(cap.params?.temperature).toBe(0); // pin preserved
   });
 });

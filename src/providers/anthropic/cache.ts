@@ -1,5 +1,5 @@
 import type Anthropic from '@anthropic-ai/sdk';
-import type { ProviderContentBlock, ProviderMessage, SystemSegment } from '../types.ts';
+import type { ProviderMessage, SystemSegment } from '../types.ts';
 
 // Anchor `cache_control: { type: 'ephemeral' }` markers at the
 // breakpoints CONTEXT_TUNING.md §3.1 declares. Each marker tells
@@ -113,8 +113,12 @@ export const toolsWithCacheBreakpoint = (
 // already in the SDK design, and it's the right one for an agent
 // loop where prefix length grows monotonically: each write becomes
 // the next read's cache.
-export const messagesWithTailCacheBreakpoint = (
-  messages: { role: ProviderMessage['role']; content: string | ProviderContentBlock[] }[],
+// Generic over the content-block type: the function only spreads blocks and
+// hangs a `cache_control` marker on the tail, never branching on block kind, so
+// it accepts ProviderContentBlock[] AND the Anthropic-native wire blocks the
+// adapter reconstructs (e.g. signed `thinking` blocks on reasoning replay).
+export const messagesWithTailCacheBreakpoint = <B extends { type: string }>(
+  messages: { role: ProviderMessage['role']; content: string | B[] }[],
   marker: Anthropic.CacheControlEphemeral = EPHEMERAL,
 ): Anthropic.MessageParam[] => {
   if (messages.length === 0) return messages as unknown as Anthropic.MessageParam[];
@@ -140,7 +144,21 @@ export const messagesWithTailCacheBreakpoint = (
       };
     }
     if (content.length === 0) return m as Anthropic.MessageParam;
-    const lastBlockIdx = content.length - 1;
+    // Anchor on the last CACHE-ELIGIBLE block. Anthropic rejects cache_control
+    // on `thinking`/`redacted_thinking` blocks, which reasoning replay can place
+    // in the tail message — so skip them and mark the last text/tool_use/
+    // tool_result instead. If the tail is all thinking (a reasoning-only turn),
+    // skip the breakpoint entirely: it's a best-effort optimization, not a
+    // correctness requirement, and a phantom marker would 400.
+    let lastBlockIdx = -1;
+    for (let bi = content.length - 1; bi >= 0; bi--) {
+      const t = content[bi]?.type;
+      if (t !== undefined && t !== 'thinking' && t !== 'redacted_thinking') {
+        lastBlockIdx = bi;
+        break;
+      }
+    }
+    if (lastBlockIdx === -1) return m as unknown as Anthropic.MessageParam;
     const blocks = content.map((block, bi) => {
       if (bi !== lastBlockIdx) return block;
       // Each block kind has its own cache_control field on the
@@ -149,7 +167,7 @@ export const messagesWithTailCacheBreakpoint = (
       // on text, tool_use, and tool_result blocks alike.
       return { ...block, cache_control: marker };
     });
-    return { role: m.role, content: blocks } as Anthropic.MessageParam;
+    return { role: m.role, content: blocks } as unknown as Anthropic.MessageParam;
   });
 };
 

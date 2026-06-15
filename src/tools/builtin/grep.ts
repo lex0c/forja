@@ -159,8 +159,12 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
     // matches as we stream and killing rg when we hit `max`.
     const cmd: string[] = ['rg', '--json', '--max-count', String(max)];
     if (args.case_insensitive === true) cmd.push('-i');
-    if (args.glob !== undefined) cmd.push('--glob', args.glob);
-    if (args.type !== undefined) cmd.push('--type', args.type);
+    // Only forward `glob`/`type` when they're non-empty strings. Models sometimes
+    // emit `type: ''` (or a non-string) to mean "no filter"; passing `--type ''`
+    // makes ripgrep exit 2 ("unrecognized file type"), failing an otherwise-valid
+    // search. Treat empty/non-string as omitted.
+    if (typeof args.glob === 'string' && args.glob.length > 0) cmd.push('--glob', args.glob);
+    if (typeof args.type === 'string' && args.type.length > 0) cmd.push('--type', args.type);
     cmd.push('--', args.pattern);
     if (args.path !== undefined) {
       const target = isAbsolute(args.path) ? args.path : resolve(ctx.cwd, args.path);
@@ -297,10 +301,19 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
     // matches, 1 on no matches, 2+ on real errors.
     if (!truncated && exit !== 0 && exit !== 1) {
       const stderr = await new Response(proc.stderr as ReadableStream<Uint8Array>).text();
+      const trimmed = stderr.trim();
+      // Steer the model on the two errors it actually hits: a bad `--type` and a
+      // malformed `pattern` regex. A clear hint with the right knob beats a raw
+      // ripgrep stderr.
+      const hint = /unrecognized file type/i.test(trimmed)
+        ? "`type` must be a ripgrep file type (e.g. 'ts', 'js', 'py') — use `glob` (e.g. '*.ts') for filename patterns, or omit both."
+        : /regex parse error|error parsing/i.test(trimmed)
+          ? '`pattern` is a ripgrep regex — escape regex metacharacters, or simplify the pattern.'
+          : undefined;
       return toolError(
         ERROR_CODES.ripgrepFailed,
-        `ripgrep exited ${exit}: ${stderr.trim() || '(no stderr)'}`,
-        { details: { exit_code: exit, command: cmd } },
+        `ripgrep exited ${exit}: ${trimmed || '(no stderr)'}`,
+        { details: { exit_code: exit, command: cmd }, ...(hint !== undefined ? { hint } : {}) },
       );
     }
 

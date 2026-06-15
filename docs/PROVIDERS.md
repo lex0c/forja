@@ -33,6 +33,7 @@ interface Provider {
   id: string;                 // canonical, e.g. "openai/gpt-5.3-codex"
   family: ProviderFamily;     // 'anthropic' | 'openai' | 'google' | ...
   capabilities: ProviderCapabilities;
+  replaysReasoning?: boolean;  // does this instance actually replay reasoning on the wire?
   generate(req: GenerateRequest): AsyncIterable<StreamEvent>;
   generateConstrained(req: ConstrainedRequest): Promise<ConstrainedResult>;
   countTokens(messages: ProviderMessage[]): Promise<number>;
@@ -45,6 +46,10 @@ interface Provider {
   calling** (not strict JSON schema / `response_format`), for leniency. Returns
   the raw JSON arguments string + usage. Used by recap and any
   schema-constrained render.
+- **`replaysReasoning`** — whether this provider instance replays reasoning blocks
+  onto the wire (resolved in the factory from the env flag + capability + send
+  path). Consumers that size the prompt (the compaction trigger, token estimators)
+  read it to decide whether replayed reasoning payloads count against the window.
 - **`countTokens`** — pre-flight estimate. Anthropic and Google have server
   endpoints; OpenAI uses a chars/4 heuristic (`src/providers/tokens.ts`). It is
   currently **unconsumed** by live call sites (compaction uses its own estimate;
@@ -93,8 +98,11 @@ that gates behavior. Key fields:
 | `constrained` | `'tools' \| 'json_mode' \| 'gbnf' \| 'regex' \| false` — how structured output is forced |
 | `context_window`, `output_max_tokens` | size limits |
 | `supports_sampling` | `false` ⇒ strip `temperature`/`top_p` (reasoning models 400 on them) |
-| `supports_adaptive_thinking` | Anthropic adaptive thinking |
+| `supports_adaptive_thinking` | Anthropic adaptive thinking (also gates thinking/replay default-on) |
 | `supports_reasoning_effort` | reasoning models; on OpenAI this **also routes** gpt-5.x to the Responses path (§5.2) |
+| `supports_effort_xhigh` | model accepts the `xhigh` effort level (Opus 4.7/4.8); else `xhigh` clamps to `high` |
+| `extended_prompt_cache` | model supports OpenAI's 24h prompt-cache retention (gpt-5.5, gpt-5.4) |
+| `extended_prompt_cache_24h_only` | among those, accepts ONLY `24h` (gpt-5.5) — rejects the `in_memory` opt-out |
 | `max_rps`, `recommended_max_tools_per_step` | pacing hints |
 | `cost_per_1k_*` | per-**million**-token USD rates (the `_1k_` name is legacy; cost divides by 1e6 — see `src/providers/cost.ts`) |
 
@@ -134,7 +142,27 @@ breakpoints** (`anthropic/cache.ts`): `cache_control: {type:'ephemeral'}` marker
 anchored on the stable prefix (system + tools + the breakpoints
 `CONTEXT_TUNING.md §3.1` declares). Read at 0.1× input cost; write at 1.25×
 (5-minute) or 2× (1-hour). The 1-hour TTL is opt-in via
-`FORJA_ANTHROPIC_CACHE_TTL=1h`.
+`FORJA_ANTHROPIC_CACHE_TTL=1h`. The cache breakpoint never lands on a
+`thinking`/`redacted_thinking` block (Anthropic rejects `cache_control` there) —
+it anchors the last cache-eligible block.
+
+**Adaptive thinking is ON by default** on adaptive models (Opus 4.7/4.8, Sonnet
+4.6), per Anthropic's guidance to default to adaptive thinking; `effort` guides
+DEPTH (`output_config.effort`), not on/off. Opt out globally with
+`FORJA_ANTHROPIC_THINKING=0`, or per-call with `thinking_budget: 0`
+(disable-via-zero); evals pin it off for determinism. Legacy models (Haiku) stay
+off unless given an explicit `thinking_budget`. Because Anthropic 400s on
+`thinking` sent with `temperature`/`top_p`, **sampling is stripped whenever
+thinking is engaged** (Opus already strips it via `supports_sampling: false`; this
+covers Sonnet).
+
+**Reasoning replay is ON by default** (`FORJA_ANTHROPIC_REASONING_REPLAY=0` to opt
+out), gated to adaptive models. When thinking is engaged, the signed `thinking` /
+`redacted_thinking` blocks round-trip byte-identical with the next `tool_result`
+(Anthropic *requires* this) — lifting the old tool-turn suppression so thinking
+stays on through the agentic loop. Block order (including thinking interleaved with
+tool_use) is preserved verbatim. Replay is near-inert when thinking is off (nothing
+to round-trip).
 
 ### 5.2 OpenAI (two paths, routed by capability)
 
@@ -154,14 +182,26 @@ anchored on the stable prefix (system + tools + the breakpoints
 Both paths set **`prompt_cache_key`** (a sha256 of system+tools — the stable
 prefix) for cache routing, gated on a real-OpenAI `baseURL` (a custom endpoint
 may 400 on the unknown param). OpenAI caches automatically; there are no explicit
-breakpoints like Anthropic. The **sampling gate** strips `temperature`/`top_p`
-for `supports_sampling: false` models (the gpt-5.x reasoning models).
+breakpoints like Anthropic. **Extended (24h) prompt-cache retention** is sent only
+for models OpenAI lists for it (`extended_prompt_cache` — gpt-5.5, gpt-5.4) and
+only on real OpenAI; opt out / pick `in_memory` via `FORJA_OPENAI_PROMPT_CACHE_RETENTION`
+(a 24h-only model like gpt-5.5 can't honor `in_memory`, so the adapter omits +
+warns). The **sampling gate** strips `temperature`/`top_p` for `supports_sampling:
+false` models (the gpt-5.x reasoning models).
 
-> Reasoning continuity (replaying the Responses `reasoning` items across tool
-> round-trips, which OpenAI documents for stateless mode) was implemented and
-> **reverted** — an A/B on `gpt-5.3-codex` showed zero measured benefit on the
-> structured suite (Forja's full-history-every-turn already gives the model the
-> thread it needs to continue). Re-add only with a long-horizon eval.
+**Reasoning replay (default ON for the Responses path).** Captured `reasoning`
+items are replayed as input on later tool turns (`input` items + `include:
+['reasoning.encrypted_content']`), the continuity OpenAI "highly recommends" for
+agentic function-calling. Reasoning items are emitted FIRST (before the assistant
+message and tool calls) to match the model's output order — OpenAI rejects a
+reasoning item not directly followed by the item it generated. Items lacking
+`encrypted_content` (captured before replay was on) are dropped rather than 400 in
+stateless mode; the gpt-5.3-codex `phase` field rides the same channel. Only the
+Responses path replays (Chat Completions drops reasoning); `Provider.replaysReasoning`
+reflects this so the prompt-token estimator counts replayed payloads. Opt out with
+`FORJA_OPENAI_REASONING_REPLAY=0`. (History: #25 built this, measured zero benefit
+on the short suite, and reverted; re-added once the long-horizon eval existed — it
+no longer 400s, value is workload-dependent.)
 
 ### 5.3 Google / Gemini
 
@@ -183,16 +223,18 @@ not from `countTokens`.
 **Cost** — `computeCost(caps, usage)` and `computeCostBreakdown(caps, usage)`
 (`src/providers/cost.ts`); rates are per-million USD on the capability.
 
-**Effort** — one agnostic level (`low|medium|high|max`, `src/providers/effort.ts`)
-translated per adapter: Anthropic `effort`; OpenAI `reasoning_effort` /
-`reasoning.effort` with `max → xhigh`. Omitted for models that don't support it.
+**Effort** — one agnostic level (`low|medium|high|xhigh|max`, `src/providers/effort.ts`)
+translated per adapter: Anthropic `output_config.effort` (`xhigh` clamps to `high`
+on models without `supports_effort_xhigh`); OpenAI `reasoning_effort` /
+`reasoning.effort` (both `xhigh` and `max` → OpenAI's top `xhigh`). `xhigh` is the
+coding/agentic sweet spot (Opus 4.7/4.8). Omitted for models that don't support it.
 
 **Cache strategy** at a glance:
 
 | Provider | Mechanism | Forja's lever |
 |---|---|---|
 | Anthropic | explicit `cache_control` breakpoints (5min / 1h) | full control — Forja places the markers |
-| OpenAI | automatic prefix caching | `prompt_cache_key` routing (both paths) |
+| OpenAI | automatic prefix caching (+ opt-in 24h retention on supported models) | `prompt_cache_key` routing (both paths) |
 | Gemini | implicit | none wired yet (`CachedContent` pending) |
 
 **Retry** is **shared, not per-adapter** — `src/harness/retry.ts` wraps the

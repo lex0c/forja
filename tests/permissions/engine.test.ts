@@ -1159,7 +1159,7 @@ describe('engine.check (search tools: glob/grep)', () => {
       cwd: 123,
     } as unknown as Parameters<typeof eng.check>[2]);
     expect(d.kind).toBe('deny');
-    if (d.kind === 'deny') expect(d.reason).toContain('non-string');
+    if (d.kind === 'deny') expect(d.reason).toContain("'cwd' must be a string");
   });
 
   test('grep with non-string path is denied (does not crash on path.resolve)', () => {

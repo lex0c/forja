@@ -10,6 +10,7 @@ export type {
   ProviderFamily,
   ProviderMessage,
   ProviderMessageRole,
+  ProviderReasoningBlock,
   ProviderTextBlock,
   ProviderToolDef,
   ProviderToolInputSchema,

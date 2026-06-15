@@ -111,24 +111,31 @@ describe('working_state_update — hypotheses', () => {
     expect(r.mutations.hypothesisConfirmed).toBe(1);
   });
 
-  test('updating an unknown id is a clean not_found', async () => {
+  test('unknown hypothesis id is a non-fatal no-op + notice; sibling fields still apply', async () => {
     const { ctx } = setup();
-    expectError(
-      await run(ctx, { hypothesis_update: { id: 'H99', evidence_append: ['x'] } }),
-      'working_state.hypothesis_not_found',
-    );
+    // The whole call must NOT fail (that would discard `focus` and loop the model
+    // into inventing placeholder ids).
+    const r = await run(ctx, {
+      focus: 'mapping the repo',
+      hypothesis_update: { id: 'H99', evidence_append: ['x'] },
+    });
+    if (isToolError(r)) throw new Error(`should not error: ${r.error_message}`);
+    expect(r.focus).toBe('mapping the repo'); // sibling field applied
+    expect(r.hypotheses).toHaveLength(0); // nothing updated/created
+    expect(r.notices.some((n) => n.includes('H99'))).toBe(true); // skip surfaced
   });
 
-  test('a confirmed hypothesis is no longer updatable (not_found)', async () => {
+  test('updating a confirmed (archived) hypothesis is a no-op notice, not an error', async () => {
     const { ctx } = setup();
     const added = await run(ctx, { hypothesis_add: { text: 'h' } });
     if (isToolError(added)) throw new Error(added.error_message);
     const id = added.created_hypothesis_id as string;
     await run(ctx, { hypothesis_update: { id, status: 'confirmed' } });
-    expectError(
-      await run(ctx, { hypothesis_update: { id, evidence_append: ['late'] } }),
-      'working_state.hypothesis_not_found',
-    );
+    // id is now archived → unknown to the active list → no-op + notice (this call
+    // has only the bad update, so it's an empty-after-drop soft result).
+    const r = await run(ctx, { hypothesis_update: { id, evidence_append: ['late'] } });
+    if (isToolError(r)) throw new Error(`should not error: ${r.error_message}`);
+    expect(r.notices.some((n) => n.includes(id))).toBe(true);
   });
 
   test('age_steps reflects the step gap via getStepNumber', async () => {

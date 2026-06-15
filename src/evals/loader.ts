@@ -60,6 +60,7 @@ const EXPECTATION_KEYS = {
   exit_reason: new Set(['exit_reason']),
   output_contains: new Set(['output_contains']),
   compaction_triggered: new Set(['compaction_triggered']),
+  min_steps: new Set(['min_steps']),
 } as const satisfies Record<EvalExpectation['kind'], ReadonlySet<string>>;
 
 const requireString = (v: unknown, label: string): string => {
@@ -279,6 +280,13 @@ const parseExpectation = (raw: unknown, idx: number): EvalExpectation => {
     }
     case 'output_contains':
       return { kind, pattern: requireString(r.output_contains, `expect[${idx}].output_contains`) };
+    case 'min_steps': {
+      const n = r.min_steps;
+      if (typeof n !== 'number' || !Number.isInteger(n) || n < 1) {
+        throw new Error(`eval: expect[${idx}].min_steps must be a positive integer`);
+      }
+      return { kind, count: n };
+    }
     case 'compaction_triggered': {
       const cf = requireRecord(r.compaction_triggered, `expect[${idx}].compaction_triggered`);
       rejectUnknown(cf, new Set(['min_count', 'strategy']), `expect[${idx}].compaction_triggered`);

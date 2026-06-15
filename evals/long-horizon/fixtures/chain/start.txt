@@ -1,0 +1,3 @@
+This is the start of the chain.
+Follow the next pointer to begin.
+next: n_q7.txt

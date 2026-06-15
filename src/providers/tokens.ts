@@ -20,7 +20,7 @@ import type { ProviderMessage, ProviderToolDef } from './types.ts';
 // on the wire. Whitespace expansion in `JSON.stringify` is per-default
 // minimal (no indentation), so the estimate matches the eventual
 // request body within the heuristic's tolerance.
-const charsInMessage = (m: ProviderMessage): number => {
+const charsInMessage = (m: ProviderMessage, countReasoning: boolean): number => {
   let chars = 0;
   if (typeof m.content === 'string') return m.content.length;
   for (const block of m.content) {
@@ -28,8 +28,18 @@ const charsInMessage = (m: ProviderMessage): number => {
       chars += block.text.length;
     } else if (block.type === 'tool_use') {
       chars += block.name.length + JSON.stringify(block.input).length;
-    } else {
+    } else if (block.type === 'tool_result') {
       chars += block.content.length + block.tool_use_id.length;
+    } else if (block.type === 'reasoning' && countReasoning) {
+      // Reasoning blocks ride the wire ONLY when the provider replays them
+      // (FORJA_*_REASONING_REPLAY). When it does, the serialized `data`
+      // (signed-thinking text+signature, or an OpenAI reasoning item's
+      // encrypted_content) is real prompt weight — count it so a long tool loop
+      // accumulating these payloads still trips compaction before the request
+      // overruns the context window. When replay is OFF (`countReasoning` false)
+      // these are dropped at send, so counting them would inflate the estimate
+      // and compact prematurely — contribute 0.
+      chars += JSON.stringify(block.data).length;
     }
   }
   return chars;
@@ -42,9 +52,14 @@ const charsInTool = (t: ProviderToolDef): number =>
 // `countTokens` (whose interface only takes messages) — see
 // `estimatePromptTokens` for the full-request estimate including
 // system + tools.
-export const estimateMessagesTokens = (messages: ProviderMessage[]): number => {
+export const estimateMessagesTokens = (
+  messages: ProviderMessage[],
+  // Count replayed reasoning payloads (set when the provider replays reasoning).
+  options: { countReasoning?: boolean } = {},
+): number => {
+  const countReasoning = options.countReasoning === true;
   let chars = 0;
-  for (const m of messages) chars += charsInMessage(m);
+  for (const m of messages) chars += charsInMessage(m, countReasoning);
   return Math.ceil(chars / 4);
 };
 
@@ -58,13 +73,20 @@ export const estimateMessagesTokens = (messages: ProviderMessage[]): number => {
 // whether the next request would cross the compaction threshold.
 export const estimatePromptTokens = (
   messages: ProviderMessage[],
-  options: { system?: string; tools?: readonly ProviderToolDef[] } = {},
+  options: {
+    system?: string;
+    tools?: readonly ProviderToolDef[];
+    // Count replayed reasoning payloads (set from the provider's replaysReasoning
+    // so the compaction trigger sizes what the request actually carries).
+    countReasoning?: boolean;
+  } = {},
 ): number => {
+  const countReasoning = options.countReasoning === true;
   let chars = 0;
   if (options.system !== undefined) chars += options.system.length;
   if (options.tools !== undefined) {
     for (const t of options.tools) chars += charsInTool(t);
   }
-  for (const m of messages) chars += charsInMessage(m);
+  for (const m of messages) chars += charsInMessage(m, countReasoning);
   return Math.ceil(chars / 4);
 };

@@ -236,11 +236,15 @@ const renderTranscriptForSummary = (middle: ProviderMessage[]): string => {
         parts.push(block.text);
       } else if (block.type === 'tool_use') {
         parts.push(`[tool_use ${block.name}](${JSON.stringify(block.input)})`);
-      } else {
+      } else if (block.type === 'tool_result') {
         parts.push(
           `[tool_result ${block.name ?? '?'} is_error=${block.is_error ?? false}]\n${block.content}`,
         );
       }
+      // `reasoning` blocks are dropped from the summary input: the payload is
+      // opaque (a signature / encrypted item), useless as summary text, and the
+      // model only needs reasoning replayed on the verbatim TAIL (preserved as
+      // its own content), never folded into the synthesized middle.
     }
     lines.push(`<${m.role}>\n${parts.join('\n')}\n</${m.role}>`);
   }

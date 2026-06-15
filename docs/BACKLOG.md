@@ -2,6 +2,725 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-15] Tool UX, round 2: three more empty-string-is-omitted gaps
+
+Swept the remaining builtin tools (bash/monitor, file/memory, task/todo/reminder,
+skill/context) for the same recoverable-arg-mistake classes. Most candidates were
+false positives (a `deep:''` boolean check already catches and reports it; a
+`process_output` `pattern` is the core required field, not an optional one) or
+already-actionable (status enums already list the valid set; `expires_in` already
+hints `"30m"/"2h"`). Three genuine cases, all the empty-string-is-omitted convention
+from round 1 (git/grep):
+
+1. **memory_write `expires:''` sank the whole write.** `''` is never a valid
+   `YYYY-MM-DD`, so it failed `validateFrontmatter` and discarded name/scope/type/
+   body too — an all-or-nothing trap over one optional field. A shared
+   `suppliedExpires` helper now collapses `''` to omitted at both read sites (the
+   validator and `buildFrontmatter`), so the write lands and the inferred +90d
+   default still applies. Non-string `expires` still rejected.
+2. **bash_output `grep:''` barred the call.** Empty meant "no filter" to the model
+   but earned `grep must be a non-empty string`. Now `''` degrades to the normal
+   cursor read; only a non-string `grep` is rejected, with an omit hint.
+3. **bash_background `label:''` was stored verbatim**, polluting the tray/audit row
+   with an empty name. Now `''` is omitted (stored null), matching omission; the
+   non-string reject above is unchanged.
+
+Deliberately NOT changed: case-insensitive todo-status normalization (silent
+coercion is worse than the already-actionable "must be one of: …" listing — the
+schema constrains it and the model recovers in one retry). Tests cover each fix.
+
+## [2026-06-15] Tool UX: stop models from looping on recoverable arg mistakes
+
+A real gpt-5.x "explore the repo" trace wasted ~25 tool calls on recoverable arg
+errors. Fixed the four classes (all provider-agnostic — better schemas + tolerant
+inputs + actionable errors help every model and cut wasted calls):
+
+1. **working_state partial-success.** An unknown `hypothesis_update.id` hard-failed
+   the WHOLE call, discarding the `focus`/`next` sent alongside — so the model
+   looped inventing placeholder ids (`h1`, `__skip__`, `not-applicable`, …). Now an
+   unknown id is a non-fatal no-op + notice; the other fields still apply. Schema
+   description tightened ("OMIT when you have none; do NOT invent an id").
+2. **git empty ref/path → omitted.** `status .` / `ref:''` failed "ref must be
+   non-empty"; models emit `''` to mean "default". buildModeArgs now treats an
+   empty string as omitted (ref → working-tree/HEAD, path → cwd subtree).
+3. **grep empty/non-string `type`/`glob` → ignored.** `type:''` pushed `--type ''`
+   → ripgrep exit 2 ("unrecognized file type"). Now only non-empty strings are
+   forwarded.
+4. **Actionable errors.** The fs resolvers refused empty/odd `path`/`cwd` with a
+   terse "non-string 'path' argument" (and refused empty strings outright); now
+   they treat empty as the cwd default and, for a genuine non-string, return the
+   expected shape ("'path' must be a string … omit to scope the cwd"). grep's
+   ripgrep-exit error gains a hint for the bad-`type` and bad-regex cases.
+
+Principle: a tool call fails closed-but-recoverable — never nuke a multi-field call
+for one bad optional field, never pass a malformed arg to the underlying binary,
+and return the expected shape (+ example) over a raw passthrough. Tests cover each.
+(Separate workstream from reasoning — `fix(tools)`-scoped commits, cherry-pickable.)
+
+## [2026-06-15] A/B verdict: give the real opt-out action (default is ON now)
+
+`verdictLine` told the operator to "keep ${flag} default OFF" on a tie/regression,
+but the flip made the replay flags default ON — so following that verdict without
+exporting `${flag}=0` leaves production replaying anyway, defeating the gate. Fixed
+the verdict to the actual action under default-ON: positive delta → the ON default
+is earned, keep it; tie/regression → "set ${flag}=0 to disable; inaction keeps
+replaying." Tests updated to assert `F=0` (and that the misleading "default OFF" is
+gone).
+
+## [2026-06-15] OpenAI replay: drop reasoning on text-only turns (synthesized message can't pair)
+
+A text-only Responses turn was replayed as `[reasoning item, synthesized assistant
+message]` — but the stream only captures the text, not the message item's
+id/type/status, so the message is rebuilt fresh. OpenAI pairs a reasoning item
+with its exact following output item; on the next user turn after a text reply,
+the reasoning paired with a synthesized message can 400 ("reasoning … without its
+required following item"). Not caught by smoke (single-prompt cases never replay a
+text turn). Fix: replay reasoning ONLY for tool-bearing turns — a reasoning item's
+pair is the function_call (reconstructed faithfully via call_id); a final text
+answer has no tool round-trip to continue, so its reasoning is dropped. Test:
+text-only turn → message kept, reasoning dropped.
+
+Residual (honest): a mixed `[reasoning, text, tool_use]` turn still keeps reasoning
+followed by the synthesized message before the function_call — same id-loss shape.
+Likely tolerated (the smoke-ON tool turns showed zero 400, and we replay in the
+model's exact order), but the definitive check is a LIVE multi-turn smoke (text
+reply → follow-up → replay) — not yet run. If it 400s, the deeper fix is to
+capture/replay the message item verbatim (id/type/status), not synthesize it.
+
+## [2026-06-15] OpenAI Responses replay: preserve interleaved reasoning↔tool order
+
+`toResponsesInput` batched all reasoning items ahead of all tool calls, discarding
+the order `CollectedStep.order` now preserves — so a multi-reasoning/tool turn
+[rs1, call1, rs2, call2] replayed as [rs1, rs2, call1, call2], orphaning rs1 from
+call1. OpenAI rejects exactly that ("reasoning item without its required following
+item"), so default-on replay could still 400 on those turns (the Anthropic
+interleaving fix didn't cover the OpenAI re-bucketing). Rewrote the assistant
+branch to emit blocks in original order (reasoning items / function_calls / the
+message in place), with the codex `phase` still pre-scanned (its sentinel sits
+after the text it stamps) and the encrypted_content drop-guard intact. The
+single-reasoning ordering (reasoning before message+call) still holds. Test:
+[rs1, call1, rs2, call2] replays in that exact order.
+
+## [2026-06-15] OpenAI Responses: reject malformed tool args (was silently {})
+
+The Responses normalizer turned a malformed/truncated `function_call` arguments
+JSON into `{}` and still emitted `tool_use_stop` — so collectStep treated the call
+as valid and the harness could execute/record read_file/bash with EMPTY args after
+a bad stream. The Anthropic and Chat Completions normalizers instead emit
+`tool_args_parse_error` and drop the stop. Aligned the Responses path: on a parse
+failure OR a non-object/array decode, emit the error (the loop fails the turn) and
+drop the stop, so the bad call is never run. Empty args (a no-param tool) still
+decode to `{}` and close normally, matching Anthropic. Tests: truncated JSON and
+`[1,2]` both → tool_args_parse_error + no tool_use_stop.
+
+## [2026-06-15] Default-flip review fixes: thinking yields to sampling; eval pins OpenAI replay
+
+Code review of the default-flip caught two real regressions; fixed both.
+
+1. **Thinking-default-on silently stripped explicit sampling pins.** Engaging
+   thinking strips `temperature`/`top_p` (Anthropic 400s on both together), so
+   with thinking default-ON, internal callers that pin sampling for DETERMINISM
+   but set no thinking_budget — the verify-* fact-check subagents (temperature
+   0.1), the compaction summarizer (0), any eval/subagent override — silently lost
+   their pin and ran stochastic + thinking-on. Fix: the AUTO default now YIELDS to
+   an explicit `temperature`/`top_p` (`thinkingDefaultOn && !hasExplicitSampling`);
+   an explicit `thinking_budget > 0` still wins (sampling then stripped, as before).
+   Restores determinism for verify/compaction/eval in one place, at the right
+   altitude (explicit sampling = "I want this sampling, not auto-thinking").
+2. **Eval determinism pin leaked for OpenAI.** The executor's `thinkingBudget: 0`
+   only disables Anthropic thinking; OpenAI reasoning replay (now default-ON) isn't
+   gated by it. `executeCase` now defaults `FORJA_OPENAI_REASONING_REPLAY=0` for
+   the run (only when unset — the A/B sets it per arm and wins), restored in finally.
+
+Also fixed the stale comments the flip left (the dangerous one: `ab.ts` said the
+A/B OFF arm "unsets" the flag — now '0'; reverting to unset would silently make the
+A/B compare ON-vs-ON; plus OpenAI responses "Default OFF" docs). Tests: thinking
+yields-to-sampling + explicit-budget-wins (anthropic + anthropic-effort). 817 green
+(providers+evals+harness) · typecheck · lint.
+
+Not applied (lower-priority review findings): FORJA_ANTHROPIC_THINKING is a bare
+env knob that should live in `[effort]`/config + has no Google parity (altitude
+debt); param-default(false)-vs-prod-default(true) split; test beforeEach FLAGS='0'
+pin is invisible coupling.
+
+## [2026-06-15] Flip defaults ON: reasoning replay + adaptive thinking (opt-out)
+
+Operator call: ship reasoning replay AND adaptive thinking ON by default (the
+docs' recommended posture for agentic/multi-turn), with opt-outs. NOTE: the A/B
+showed no measured pass-rate gain on the current eval — this is a docs-aligned bet
+on real long-horizon workloads, not an eval-proven win; revisit if a harder eval
+shows otherwise.
+
+- **Reasoning replay default ON** both providers via `boolFromEnv(flag, true)`;
+  opt out with `FORJA_{ANTHROPIC,OPENAI}_REASONING_REPLAY=0`. Anthropic gated to
+  adaptive models; OpenAI to the Responses path (`replaysReasoning`).
+- **Adaptive thinking default ON** on adaptive models (Opus 4.7/4.8, Sonnet 4.6):
+  `anthropicThinkingParam` gains `thinkingDefaultOn` (from `FORJA_ANTHROPIC_THINKING`,
+  default true). `effort` guides depth, not on/off. Disable globally with
+  `FORJA_ANTHROPIC_THINKING=0` or per-call `thinking_budget: 0`. Legacy (Haiku)
+  stays off without an explicit budget. Sampling is already stripped when thinking
+  is engaged (the Sonnet 400 fix), so default-on is safe there.
+- **Eval determinism preserved**: the eval executor pins `thinkingBudget: 0`
+  (disable-via-zero) so eval pass/fail stays reproducible; a case/override (the
+  A/B's `--thinking-budget`) still wins.
+- **A/B + test plumbing**: `withFlag`/`withReplay` OFF arms now set `'0'`
+  explicitly (an unset flag would replay under the new default). Provider test
+  suites pin a clean OFF baseline + dedicated default-on tests.
+
+Docs: `docs/PROVIDERS.md` (the English impl reference) updated — §5.1 (thinking +
+replay default-on, sampling strip, cache-skip-thinking), §5.2 (replay default-on,
+ordering, encrypted_content, retention scoping), §3 caps table (xhigh /
+extended_prompt_cache[_24h_only]), §6 effort ladder + cache. The PT-BR spec
+(`docs/spec/PROVIDERS.md`) left untouched (read-only without a spec request).
+Implications recorded earlier: cost/latency ↑ (thinking every turn, amplified by
+xhigh), context ↑ → earlier compaction, TPM pressure on OpenAI. 2862 tests green
+(providers+evals+harness+cli) · typecheck · lint.
+
+## [2026-06-15] Reasoning replay — residual live smokes (default-path + replay-ON)
+
+Closed most of the unit-only residuals against the real APIs.
+
+Default path (replay OFF): `eval:smoke` 8/10 — the 2 fails were a $0.0047 cost-budget
+overrun on an otherwise-correct run and a model tool-choice, NOT assembly/wire
+regressions. The order-based assembly refactor (now on every turn) round-tripped
+end-to-end across read/edit/grep/glob/compaction/parallel-tools.
+
+Replay ON, OpenAI (`eval:smoke --model openai/gpt-5.4-mini`, FORJA_OPENAI_REASONING_REPLAY=1):
+ZERO providerError/400 across all 10 cases (incl. multi-tool "parallel reads" and
+compaction). The 3 fails were model-behavior / model-window artifacts of running
+gpt-5.4-mini on Anthropic-tuned cases (e.g. compaction is window-sensitive; mini
+looped on skill_list), not replay bugs.
+
+Targeted replay-ON edge smokes (provider-direct, real API):
+- ✅ Sonnet 4.6 thinking + temperature/top_p → no 400 (sampling stripped) — LIVE.
+- ✅ gpt-5.3-codex reasoning + `phase` replay → phase carrier captured + replayed,
+  no 400 — LIVE (closes the mock-only phase re-stamp residual).
+- ✅ Anthropic multi-tool-in-one-turn replay → order preserved, no 400 — LIVE.
+
+Still unit-only (low risk): interleaved thinking BETWEEN tools in ONE turn
+(thinking1, tool1, thinking2, tool2). Tried twice to coax it (xhigh, budget 8192,
+deliberate-before-each-call prompt); Claude consistently reasons FIRST then issues
+all tool calls (order [reasoning, text, tool, tool]), so the within-turn
+between-tools pattern doesn't occur naturally — it's a cross-turn phenomenon, and
+each turn is thinking-first (handled). The order-preservation code is the defense
+if it ever does; unit-tested. cache-skip-thinking-tail (defensive; thinking is
+never the last block organically) and redacted_thinking (safety-triggered, not
+forceable) likewise stay unit/mock-only. Defaults stay OFF.
+
+## [2026-06-14] OpenAI countTokens: use replaysReasoning, not the raw flag
+
+Follow-up to the replaysReasoning gating: the provider's own `countTokens` still
+passed the raw env-gated `reasoningReplay` to estimateMessagesTokens, while the
+send path and the `replaysReasoning` field both use `useResponses &&
+reasoningReplay`. So a Chat Completions model (gpt-4o) with the flag on dropped
+reasoning at send but still counted it in countTokens — any caller token-counting
+a resumed conversation with prior reasoning blocks got an inflated estimate →
+premature compaction / budget rejection. Switched countTokens to `replaysReasoning`
+so count and send agree. Test: gpt-4o countTokens omits a reasoning payload that
+gpt-5.4-mini counts (flag on).
+
+## [2026-06-14] Gate OpenAI replaysReasoning to Responses-path models
+
+The OpenAI provider set `replaysReasoning = reasoningReplay` unconditionally, but
+replay only happens on the Responses path (generateViaResponses) — the Chat
+Completions path drops reasoning blocks in toOpenAIMessages. So with the flag on,
+a non-Responses model (gpt-4o) advertised replaysReasoning=true while sending no
+reasoning; the token estimator then counted those payloads (via the replaysReasoning
+→ countReasoning wire), over-sizing the prompt and tripping premature compaction —
+e.g. a session resumed from a reasoning model into gpt-4o, whose history carries
+opaque reasoning items the chat path silently drops. Fixed: `replaysReasoning =
+useResponses && reasoningReplay`. Test: gpt-5.4-mini true, gpt-4o false (flag on).
+
+## [2026-06-14] Preserve interleaved reasoning↔tool_use order for replay
+
+`collectStep` bucketed reasoning and tool_uses into separate arrays, so
+`buildAssistantContent` rebuilt the turn reasoning-first — losing the original
+interleaving. With interleaved thinking (adaptive models, multiple tool calls in
+one turn) the model can emit thinking1, tool1, thinking2, tool2; grouping that to
+thinking1, thinking2, tool1, tool2 means a replayed thinking block changes
+position, and Anthropic 400s ("thinking blocks ... cannot be modified / sequence
+must match the outputs"). The interleaving was lost at CAPTURE, so the fix had to
+be there, not just in the rebuild.
+
+`collectStep` now records `order: CollectedBlock[]` — the turn's blocks in exact
+emission order (reasoning / text / tool_use), holding the same object refs as the
+buckets (text deltas flushed as one block before each reasoning/tool_use and at
+stream end). `buildAssistantContent` rebuilds from `order` when present (verbatim
+reasoning, canonicalized tool inputs, same reasoning-only suppression), falling
+back to the grouped behavior for synthetic callers without `order`. Buckets stay
+for order-agnostic consumers (tool execution, token counts). Mainly matters for
+Anthropic (1:1 block mapping); OpenAI re-buckets in toResponsesInput regardless.
+
+Tests: collect captures interleaved order incl. a text segment; buildAssistantContent
+keeps thinking1/tool1/thinking2/tool2 interleaved, omits reasoning-only, canonicalizes
+in the ordered path.
+
+## [2026-06-14] Anthropic: strip sampling when thinking is engaged (replay 400)
+
+Anthropic rejects `thinking` sent together with a `temperature`/`top_p` override
+(HTTP 400) on models that accept sampling. Opus 4.7/4.8 already strip sampling
+(`supports_sampling: false`), so this stayed latent — but Sonnet 4.6 is adaptive
+AND sampling-capable. With reasoning replay ON + a thinking_budget on a
+tool-bearing turn, the lifted suppression gate now emits `thinking:{adaptive}`
+while the assembly still forwarded `temperature` (evals default temperature:0) →
+a guaranteed 400 on any Sonnet A/B or temperature-configured Sonnet session with
+replay, instead of measuring replay. (The same conflict pre-existed on no-tool
+turns for a Sonnet thinking_budget + temperature.)
+
+Fix at the general altitude: compute the thinking param first and drop sampling
+whenever thinking is engaged (`samplingParams(req, acceptsSampling &&
+!thinkingEngaged)`) — thinking and sampling are mutually exclusive on Anthropic,
+so this is correct for adaptive and legacy-enabled paths alike, and a no-op on
+Opus (already stripped). Test: Sonnet + replay + thinking_budget + temperature +
+top_p → thinking sent, both sampling knobs dropped.
+
+## [2026-06-14] Token estimate counts replayed reasoning (was always 0)
+
+The shared prompt estimator charged `reasoning` blocks as 0 unconditionally. With
+replay ON the adapters DO send them, so a long tool loop accumulating
+encrypted_content / signed-thinking payloads could skip compaction and then
+overrun the context window at the API boundary. But counting them ALWAYS would
+over-charge the default (replay OFF) path — capture is always-on, so those blocks
+sit in history yet are dropped at send.
+
+Made it replay-aware at the right altitude: the provider is the authority on what
+it sends, so it now exposes `replaysReasoning` (resolved once in the factory from
+FORJA_*_REASONING_REPLAY + capability). `estimatePromptTokens` /
+`estimateMessagesTokens` gain a `countReasoning` option; when set they charge the
+serialized `data` payload, else 0. The compaction trigger (loop) passes
+`config.provider.replaysReasoning`, and the OpenAI `countTokens` passes its own
+resolved flag. So the estimate matches what the request actually carries on both
+arms — no undercount with replay on, no premature compaction with it off.
+
+Tests: reasoning block contributes 0 by default and its serialized payload under
+countReasoning.
+
+## [2026-06-14] Rate-limit handling: --delay-ms pacing + honor Retry-After
+
+The clean OpenAI A/B's ON arm hit 429s (TPM 200k/min) — not a replay bug: ~320
+growing requests (13-hop chain × K=10 × 2 arms) fired back-to-back, and ON's
+replayed reasoning items make each request heavier, so it tipped the rolling
+per-minute window. Two fixes:
+
+- **Retry-After honoring (`src/harness/retry.ts`, benefits the whole harness):**
+  `retryAfterMs` extracts the server hint from the thrown SDK error (`retry-after-ms`
+  ms or `retry-after` seconds; `Headers` instance or plain object, duck-typed).
+  The retry now waits `max(backoff, retry-after)` capped at `MAX_RETRY_AFTER_MS`
+  (8s) — a 200ms backoff that ignored a "retry in 5s" hint just burned an attempt.
+- **`--delay-ms` (A/B runner):** paces BETWEEN runs within an arm so consecutive
+  runs don't overlap in the provider's rolling token window. Default 0; for a
+  clean OpenAI value run, pass e.g. `--delay-ms 5000`.
+
+Tests: retryAfterMs extraction (ms/seconds/Headers/absent), the max(backoff,hint)
++ cap behavior, and --delay-ms parse/validation. The OpenAI value measurement (gap
+E for that provider) can now be re-run cleanly; Anthropic was already clean.
+
+## [2026-06-14] Phase 4 — A/B results recorded; both defaults stay OFF
+
+Ran the clean A/B on both providers (long-horizon chain, K=10/arm). Total API
+spend: ~$6.83 ($0.64 OpenAI + $6.18 Anthropic).
+
+- **Anthropic (opus-4-8, thinking_budget 4096) — CLEAN, zero delta.** OFF 10/10,
+  ON 10/10; steps 15 both; cost $0.311/run OFF vs $0.307/run ON (replay is
+  cost-NEUTRAL — the signed thinking blocks are small and cache-friendly). No
+  pass-rate signal: the chain is easy enough to pass without reasoning continuity.
+  → keep FORJA_ANTHROPIC_REASONING_REPLAY default OFF (the #25 disposition,
+  now MEASURED on a real long-horizon eval, not assumed).
+- **OpenAI (gpt-5.4-mini) — INCONCLUSIVE (rate-limit contaminated).** OFF 10/10,
+  ON 6/10 — but the 4 ON failures are 429 TPM rate limits (200k/min), NOT the
+  400 ordering bug (that fix holds — zero "reasoning item without its required
+  following item"). ON replays reasoning items → heavier requests → it burns the
+  per-minute token budget faster and 429s when 20 runs fire back-to-back. So the
+  −40pp is a throttling artifact, not a value/correctness signal; the true ON
+  cost overhead can't be read from this run (the failed runs ended early, making
+  ON look cheaper). A clean OpenAI value measurement needs inter-run throttling
+  or a higher TPM tier. → keep FORJA_OPENAI_REASONING_REPLAY default OFF.
+
+Decision: NO default flips. Anthropic measured a genuine zero delta; OpenAI is
+unmeasured-clean but has no positive signal to justify a flip. The reasoning
+replay stays a per-session opt-in (env flag) — correct and live-validated, value
+unproven. To surface value, a HARDER long-horizon eval (where OFF measurably
+fails) is the open follow-up (gap E); the OpenAI arm also needs throttling to be
+measurable. Phase 4 gate satisfied: measured, recorded, defaults held.
+
+## [2026-06-14] A/B runner: thinking budget for a meaningful Anthropic gate
+
+The A/B runner only overrode modelId, so an Anthropic run never set thinking_budget
+— and the adapter only emits signed thinking when thinking_budget > 0, so OFF and
+ON were identical (nothing to capture/replay) and the run would report a FALSE
+"no delta" for the Anthropic gate. Wired thinking_budget end-to-end:
+BootstrapInput.thinkingBudget → HarnessConfig → GenerateRequest.thinking_budget
+(the HarnessConfig→request leg already existed; bootstrap just didn't expose it).
+
+The runner gains `--thinking-budget <tokens>` (threaded via bootstrapOverride) and
+now REFUSES an Anthropic A/B with no budget (returns 1 + explains) rather than run
+a misleading comparison. The default `eval:long-horizon:ab` command carries
+`--thinking-budget 4096`; OpenAI ignores it (uses reasoning.effort), so it's safe
+on the shared cross-provider command. Tests: --thinking-budget parsing/validation,
+the Anthropic-no-budget refusal, and a request-recording mock proving
+bootstrapOverride.thinkingBudget reaches req.thinking_budget.
+
+## [2026-06-14] OpenAI retention opt-out: send in_memory explicitly (not omit)
+
+`FORJA_OPENAI_PROMPT_CACHE_RETENTION=in_memory` (the ZDR / data-residency opt-out)
+resolved to `undefined`, which omits the param. But OpenAI documents that an
+OMITTED retention defaults to `24h` for supported models in a non-ZDR org — so the
+"opt-out" silently left the user on extended cache for gpt-5.4. Fixed: the env
+resolver now returns the INTENT (`24h` | `in_memory`) and the factory SENDS it.
+
+Model-aware, because the proposal as stated would 400 on gpt-5.5: OpenAI documents
+gpt-5.5 / 5.5-pro / future models as `24h`-ONLY (they reject `in_memory`). Added an
+`extended_prompt_cache_24h_only` capability (set on gpt-5.5); when the in_memory
+opt-out hits such a model the adapter OMITS the param and warns once on stderr —
+the opt-out can't be honored there, and that's surfaced rather than sent as an
+invalid value or silently downgraded to 24h (a data-residency leak). gpt-5.4
+(accepts both) now genuinely sends in_memory on opt-out.
+
+Tests: opt-out → in_memory on gpt-5.4; opt-out → omitted on gpt-5.5; default →
+24h on both. Verified the default-on-omit and the 24h-only value restriction
+against OpenAI's prompt-caching guide.
+
+## [2026-06-14] OpenAI extended-prompt-cache: scope the flag to the documented models
+
+`OPENAI_REASONING_BASE` carried `extended_prompt_cache: true`, so the factory
+defaulted `prompt_cache_retention: '24h'` for EVERY gpt-5.x id — including
+gpt-5.4-mini and gpt-5.3-codex, which are NOT on OpenAI's extended-retention list
+(verified against the prompt-caching guide: gpt-5.5/5.5-pro/5.4/5.2/5.1*/5/
+gpt-5-codex/gpt-4.1). Pulled the flag out of the shared base (it is not a family
+trait — only 2 of the 5 reasoning ids in the catalog qualify) and set it
+per-model on exactly gpt-5.5 and gpt-5.4; mini/codex/nano now get in-memory
+caching only. Removed nano's now-redundant `false` override and fixed its comment
+(which over-generalized "-mini variants" — OpenAI does list gpt-5.1-codex-mini).
+
+Severity: low. Sending 24h to an unlisted model is silently ignored today
+(live-verified: gpt-5.4-mini ×20 in the A/B and gpt-5.3-codex smokes all
+succeeded — no 400), so this is not a current outage. But the docs don't promise
+silent-ignore, and declaring a retention tier we don't actually receive corrupts
+cost/retention assumptions — so the catalog should be exact. Tests: mini now
+asserts no retention param; a new gpt-5.4 test asserts 24h IS sent; the env
+opt-out test moved to gpt-5.4 so it genuinely exercises the disable path.
+
+## [2026-06-14] Reasoning propagation — live wire validation (close correctness confidence)
+
+Drove the provider adapters directly against the real APIs (keys from `.env`) to
+validate every replay path that was previously mock-only:
+
+- **Anthropic signed-thinking replay on a tool turn** (thinking_budget>0, effort
+  xhigh, replay ON): turn 1 captured a signed reasoning block + tool_use; turn 2
+  replayed it with the tool_result and completed with NO 400. Validates the
+  signature byte-round-trip, the lifted suppression gate, the cache-breakpoint
+  skip-thinking fix, AND `output_config.effort: 'xhigh'` on the wire. PASS.
+- **OpenAI gpt-5.3-codex reasoning-item replay** on a tool turn: PASS (no 400).
+  Caveat: that run did not emit a `phase` field, so the codex `phase` re-stamp
+  wire shape specifically remains mock-only (can't force it on demand).
+- **Cross-provider foreign-reasoning drop**, both directions with both flags ON
+  (anthropic-tagged → OpenAI request, openai-tagged → Anthropic request): the
+  foreign block is dropped, no 400 either way. PASS.
+- **Resume round-trip**: added a unit test that a reasoning block (signed thinking
+  + openai encrypted item) survives DB persist→read→list byte-identical.
+
+Correctness confidence is now high across every exercisable path. Residuals:
+replay VALUE is still unproven (both A/B arms sit near the ceiling on the current
+eval — needs a harder one before any default flip); codex `phase` and Anthropic
+`redacted_thinking` wire shapes stay mock-only (neither is forceable on demand);
+spec PR for PROVIDERS.md still pending. Defaults stay OFF.
+
+## [2026-06-14] OpenAI reasoning replay — fix the input ordering 400 (found by the A/B)
+
+Ran the Phase 4 A/B live on `openai/gpt-5.4-mini` (K=10, long-horizon chain). The
+ON arm REGRESSED to 3/10 vs OFF 9/10 — and all 7 ON failures were `providerError`,
+not wrong answers: the replay was 400-ing mid-chain, not "not helping" (the #25
+disposition is a clean zero delta, this was a crash). So the A/B doubled as the
+live wire smoke that was still pending, and caught a real bug.
+
+Root cause: `toResponsesInput` emitted `assistant message → reasoning items → tool
+calls`, but the model's native (and stored) order is `reasoning → message →
+function_call`. OpenAI stateless replay (`store:false`) rejects a reasoning item
+not directly followed by the item it generated ("…without its required following
+item"), which fired only on turns that ALSO emitted assistant text — hence the
+~70% intermittency. Fix: emit reasoning items FIRST, before the assistant message.
+A new test pins `reasoning idx < message idx < function_call idx`.
+
+Validated live with the fix: replay ON = 8/8 pass, 0 providerError (full 15-19 step
+chains). Bug dead. Also: `ab_run` now emits `failure`/`detail` so a future replay
+regression is debuggable straight from the NDJSON (this run needed a side repro to
+recover the provider message).
+
+Note on measuring replay VALUE: with the crash gone, OFF and ON both sit near the
+ceiling on this eval (~9-10/10), so it doesn't yet show a replay benefit — the
+chain is easy enough for the model to pass without continuity. A harder/longer
+eval is needed to surface value before any default flip; defaults stay OFF.
+
+## [2026-06-14] Phase 4 — reasoning-replay A/B runner
+
+The gate the #25 revert asked for: `src/evals/ab.ts` runs an eval target K times
+with `FORJA_<PROVIDER>_REASONING_REPLAY` OFF, then K times ON, and reports the
+pass-rate / cost / step deltas per provider. The OFF arm runs with the flag
+explicitly UNSET so a flag already exported in the shell can't contaminate the
+baseline; both arms restore the prior env on exit. `executeCase` builds a fresh
+provider per run (the factory reads the flag at construction), so flipping the env
+around each arm is sufficient.
+
+The runner only MEASURES — it never flips a default. `verdictLine` is conservative
+(ON must STRICTLY beat OFF on pass-rate to be called a candidate; ties/regressions
+keep OFF, the #25 disposition). Pure helpers (`flagForModel`, `aggregateArm`,
+`deltaOf`, `verdictLine`, `parseArgs`) are unit-tested; an integration test drives
+`runAbComparison` with a flag-sensitive mock provider (no live API) to prove the
+per-arm env flip + baseline isolation. Script: `eval:long-horizon:ab` (K=10).
+
+Still requires a live API key to run for real — running it + deciding any default
+flip (recording the delta here) is the remaining, operator-gated step. Defaults
+stay OFF until a measured positive delta.
+
+## [2026-06-14] Reasoning propagation — code-review fixes (correctness + cleanup)
+
+Review pass over the reasoning-propagation + xhigh diff (7 finder angles, verified
+inline). Correctness:
+
+- **Empty wire message on a reasoning-only turn (hit the DEFAULT config).** Capture
+  is unconditional, so a turn with reasoning but no text/tool_use was stored as
+  `[reasoning]`, passing the append-time `hasContent` guard — then a non-replaying
+  converter dropped the block to `content: []`, which Anthropic/Gemini 400. Extracted
+  the assistant-content assembly into `buildAssistantContent` (`src/harness/assistant-content.ts`)
+  which OMITS reasoning when the turn has no text and no tool_use (such a turn ends
+  the loop; nothing to continue into). Loop now calls the helper.
+- **OpenAI reasoning item without `encrypted_content` would 400 on replay** after a
+  flag flip (item captured under flag-OFF never requested `include`). `toResponsesInput`
+  now drops items lacking `encrypted_content` instead of replaying them raw in
+  `store:false` mode.
+- **Cache breakpoint could land on a `thinking`/`redacted_thinking` block** (Anthropic
+  rejects `cache_control` there) once replay placed one at the tail. `messagesWithTailCacheBreakpoint`
+  now anchors on the last cache-eligible block and skips the breakpoint when the tail
+  is all thinking.
+- **Dead branch in the budget-vs-max_tokens cross-check.** The `reasoningReplay ||`
+  carve-out was unreachable (replay only engages on adaptive models, which the check
+  already excludes) and its comment claimed a restored safety check that never ran.
+  Removed; comment corrected.
+
+Cleanup: centralized the Anthropic `xhigh → high` clamp into `anthropicEffort`
+(`src/providers/effort.ts`, beside `OPENAI_REASONING_EFFORT`) — a pure, unit-testable
+mapping instead of an inline ternary in request assembly. Shared truthy-env parsing
+via `boolFromEnv` (`src/providers/env.ts`), replacing two byte-identical
+`*ReasoningReplayFromEnv` copies so the accepted flag vocabularies can't drift.
+
+New/updated tests: `buildAssistantContent`, `boolFromEnv`, `anthropicEffort`, the
+cache thinking-skip, and the OpenAI encrypted_content drop. 669 green in
+harness+providers · typecheck · lint clean. Not done (deliberate): per-block phase
+sentinel refactor (contained, theoretical collision), capture-always-on (Phase 1
+design), and the OpenAI reasoning-item ordering check (needs a live wire smoke).
+
+## [2026-06-14] Add the `xhigh` reasoning-effort level
+
+`ProviderEffort` jumped `high → max`, leaving the documented coding/agentic sweet
+spot unreachable on Anthropic — `xhigh` (between high and max) is what Claude Code
+defaults to on the frontier models, and `max` overshoots it ("diminishing returns,
+overthinking"). Added `xhigh` to the agnostic effort ladder: `ProviderEffort`,
+`FORJA_EFFORT_LEVELS`, `EFFORT_THINKING_BUDGET` (20_480, between high 16_384 and
+max 24_576), `OPENAI_REASONING_EFFORT` (xhigh→xhigh; max still →xhigh, OpenAI's
+top), and `EFFORT_PROFILES` (maxSteps 300 / subagents 6 / toolErrors 10).
+
+Per-model gating: `xhigh` is narrower than `max` (Anthropic exposes it only on
+Opus 4.7/4.8). Added a `supports_effort_xhigh` capability (true on opus-4-7/4-8);
+the Anthropic adapter clamps `xhigh → high` when a model lacks it (Sonnet 4.6 /
+Haiku) to avoid a 400. OpenAI reasoning models take it natively (no gate). CLI
+`--subagent-effort`, config `[effort].level`, and `/effort` validate against
+FORJA_EFFORT_LEVELS, so they accept it automatically. DEFAULT_EFFORT stays `high`
+(operators opt into xhigh per session); flipping the agentic default to xhigh is a
+separate call. Tests: ladder monotonicity, OpenAI mapping, Anthropic clamp
+(forward on opus, clamp on sonnet).
+
+## [2026-06-14] Reasoning propagation — close the coherence gaps (redacted_thinking, codex phase, adaptive gate)
+
+Three fixes surfaced by re-reading the adaptive/extended-thinking + codex docs
+against Phases 1-3 (all flag-gated, default behavior unchanged):
+
+- **Anthropic `redacted_thinking`**: the stream now captures safety-redacted
+  thinking blocks (`content_block` type `redacted_thinking`, opaque `data`) and
+  `toAnthropicMessage` replays them as native `{type:'redacted_thinking',data}`,
+  verbatim. Previously only signed `thinking` was captured, so a turn containing
+  a redacted block would replay an incomplete sequence and 400 ("the entire
+  sequence of consecutive thinking blocks must match"). The reasoning-wire type
+  is now a union (thinking | redacted_thinking).
+
+- **Anthropic adaptive gate**: reasoning replay is now gated to
+  `caps.supports_adaptive_thinking` — the documented header-free interleaved
+  path. Legacy/non-adaptive models (e.g. Haiku 4.5) would need the
+  `interleaved-thinking-2025-05-14` beta header, which we don't wire, so replay
+  stays off there rather than sending thinking on tool turns without it.
+
+- **OpenAI codex `phase`**: reasoning items already round-trip their `phase`
+  (captured verbatim). The assistant MESSAGE item's `phase` (commentary /
+  final_answer), which the harness loses when it rebuilds the message from text,
+  is now captured via a sentinel reasoning block and re-stamped onto the replayed
+  assistant message in `toResponsesInput`. Dropping it causes "significant
+  performance degradation" per the codex guide.
+
+Caveat: the OpenAI message-`phase` wire shape (capturing `item.phase` on the
+message item + sending `phase` on the replayed assistant message) is documented
+but unvalidatable here without a live gpt-5.3-codex run — it's flag-gated, so the
+risk is confined to opt-in usage and must be live-validated before any default
+flip (Phase 4). Tests: redacted capture+replay, phase capture+re-stamp,
+non-adaptive gate-off.
+
+## [2026-06-14] Reasoning propagation — Phase 3: OpenAI reasoning-item replay (flagged)
+
+Behind `FORJA_OPENAI_REASONING_REPLAY` (default OFF, real-OpenAI only): the
+OpenAI Responses stream now CAPTURES reasoning output items verbatim
+(`output_item.done` with `item.type === 'reasoning'` → a `reasoning` StreamEvent
+carrying the opaque item, incl. its `encrypted_content`), and `toResponsesInput`
+REPLAYS same-provider items back into the input array (after the assistant text,
+before the function calls they reasoned about) while requesting
+`include:['reasoning.encrypted_content']`. Foreign-tagged blocks are dropped.
+This is the stateless continuity path (`store:false` stays) — the #25 feature,
+rebuilt, but now gated behind the long-horizon eval per its revert lesson.
+
+The opaque-block design means the adapter never interprets the item's schema: it
+round-trips whatever the API emitted, so the wire shape can't drift. Capture
+emits nothing if the event shape differs (no 400, degrades to flag-off); replay
+only sends items when the flag is on (opt-in), so any wire-shape risk is confined
+to flagged usage and is unvalidatable here without an API key.
+
+Scope note: the gpt-5.3-codex `phase` field (on assistant MESSAGE items, not
+reasoning items) is NOT round-tripped — it would need the raw assistant message
+item preserved across Forja's text reconstruction plus live codex validation.
+Deferred as a follow-up; `gpt-5.3-codex` therefore still carries the phase caveat
+noted earlier. Phase 4 (long-horizon A/B + selective default flip) requires a
+live run and is the operator's call.
+
+## [2026-06-14] Reasoning propagation — Phase 2: Anthropic replay + gate lift (flagged)
+
+Behind `FORJA_ANTHROPIC_REASONING_REPLAY` (default OFF): the captured signed
+thinking blocks (Phase 1) now replay across tool-bearing turns, and the
+suppression gate lifts — so interleaved thinking can stay ON during the agentic
+loop, the payoff for Claude. `toAnthropicMessage` maps a `provider:'anthropic'`
+reasoning block → a native `{type:'thinking',thinking,signature}` block in situ
+(the loop already stores reasoning FIRST, satisfying Anthropic's thinking-first
+contract), VERBATIM — the signature must round-trip byte-identical. Foreign-
+tagged reasoning blocks are dropped, mirroring the API's own cross-model
+behavior. `anthropicThinkingParam` no longer returns `{}` on tool turns when the
+flag is on; the budget-vs-max_tokens cross-check re-enables for tool turns (the
+pair now reaches the API) and the one-time stderr warning is silenced.
+
+Key simplification (confirmed via the claude-api reference): the current Claude
+family uses ADAPTIVE thinking, which auto-enables interleaved thinking with NO
+beta header — so Phase 2 needed no header plumbing. `messagesWithTailCacheBreak-
+point` was made generic over the block type so the native thinking block passes
+through; the tail breakpoint never lands on it (thinking is always first, never
+the tail block). Default behavior is unchanged with the flag off.
+
+Pending: Phase 4's long-horizon A/B must show a measurable delta before flipping
+the default. Phase 3 (OpenAI replay + codex `phase`, incl. its capture) is next.
+
+## [2026-06-14] Reasoning propagation — Phase 1: abstraction + capture (no replay)
+
+Added the unified opaque carrier: `ProviderReasoningBlock { type:'reasoning';
+provider; data }` in the ProviderContentBlock union + a `{ kind:'reasoning';
+provider; data }` StreamEvent. The harness treats `data` as a black box (only the
+owning adapter reads it); it rides in `content`, so it persists + resumes via the
+existing message-JSON path — NO migration (the cost that sank #25).
+
+Capture: the Anthropic stream now accumulates `thinking_delta` text +
+`signature_delta` (previously dropped) per content block and emits a `reasoning`
+event at block stop — only when SIGNED (an unsigned thinking block can't be
+replayed with tool_results). `collectStep` gathers them into
+`CollectedStep.reasoning`; the loop prepends them to the assistant content
+VERBATIM (never canonicalized — signatures must byte-match), before text/tool_use
+to mirror the wire order.
+
+Consumer-safety (the real surface of Option A): every `content` consumer was made
+reasoning-safe — the Anthropic/OpenAI(chat+responses)/Google converters DROP
+reasoning blocks (requests stay byte-unchanged this phase), compaction drops them
+from the synthesized summary (kept verbatim in the preserved tail), token
+estimation counts them as 0 (not sent yet), and resume passes them through. No
+replay yet — that's flagged, per-provider, in Phases 2/3.
+
+Scope note: OpenAI reasoning-item capture folds into Phase 3 alongside its replay
+(the Responses reasoning-item/`phase` event shape is validated there). Phase 1
+ships the abstraction + Anthropic capture, which is enough to prove the
+capture→store→resume round-trip. Default behavior is unchanged (thinking still
+suppressed on tool turns until Phase 2 lifts the gate).
+
+## [2026-06-14] Reasoning propagation — Phase 0: long-horizon eval (the gate)
+
+First deliverable of the unified cross-provider reasoning-propagation plan
+(round-trip opaque provider reasoning state — Anthropic thinking signatures,
+OpenAI reasoning items, codex `phase` — so reasoning persists across tool
+round-trips; benefits Claude via interleaved thinking on tool turns). The plan
+phases the work eval-FIRST precisely because #25 (OpenAI reasoning replay) was
+built, A/B'd 9/10 vs 9/10 on the SHORT playbook suite, and reverted — short
+evals can't measure continuity. So before any machinery, we build the instrument.
+
+Added a `min_steps` expectation (types/loader/executor + tests) — asserts the run
+took at least N steps, so a model that shortcuts a forced chain in a few turns
+fails even if it lands the answer (the exact gpt-5.3-codex shortcut that made
+#25's A/B read as zero). New eval `evals/long-horizon/accumulate-chain.yaml` over
+an opaque-pointer fixture chain: ~13 strictly sequential `read_file` turns
+(next-file names are unguessable, no globbing) accumulating two running
+quantities into a deterministic derived answer (sum 79 + flag-count 6 = 85,
+asserted via `file_contains`). This is the regime where reasoning continuity
+could matter and the OFF arm of the eventual A/B. `eval:long-horizon` script
+added (defaults to opus; `--model` overrides for cross-provider). Live run needs
+an API key; loader/executor logic is unit-tested.
+
+Subsequent phases (abstraction + capture, Anthropic replay + gate lift, OpenAI
+replay + phase, A/B + selective default flip) are tracked separately and gated
+on this eval showing a measurable delta. Spec PR (PROVIDERS.md) pending.
+
+## [2026-06-14] Add gpt-5-nano to the OpenAI capability matrix
+
+Fastest/cheapest GPT-5-base reasoning model ($0.05 / $0.40 per MTok, $0.005
+cached; 400K context / 128K output; cutoff 2024-05-31). Reasoning model, so it
+spreads OPENAI_REASONING_BASE (reasoning_effort on, sampling off → routed via
+Responses). extended_prompt_cache is overridden OFF: OpenAI's extended-retention
+list names `gpt-5` and `gpt-5-codex` but not the `-nano`/`-mini` sub-variants, so
+24h support is unconfirmed for nano — in-memory caching still applies, and the
+flag can flip to true once confirmed. Registry test iterates OPENAI_MODEL_NAMES
+dynamically, so no model-set assertion needed updating.
+
+## [2026-06-14] OpenAI reasoning models: re-enable markdown output
+
+Reasoning models suppress markdown in their responses by default; OpenAI's
+documented opt-in is the literal string `Formatting re-enabled` on the first
+line of the developer message. Forja's TUI renders assistant prose as
+GitHub-flavored markdown (tui/render/markdown.ts), so without it the OpenAI
+output degrades to flat text — no code fences, backticked paths, or lists —
+unlike the Anthropic path. Prepend the marker to `instructions` on the Responses
+path (the reasoning-only surface); the Chat Completions path (gpt-4o,
+non-reasoning) is untouched. The marker is a constant prefix, so it leaves the
+cache prefix and prompt_cache_key stable — no caching regression.
+
+Caveat: the marker behavior is documented for the o1/o3 era; whether gpt-5.x
+still suppresses markdown by default is unconfirmed without a live call. The
+change is asymmetric-positive and reversible — if the model already emits
+markdown, the marker is a near no-op. Same pending spec PR as the cache work
+(PROVIDERS.md §3.2).
+
+## [2026-06-14] OpenAI prompt-cache parity: extended (24h) retention
+
+OpenAI's prefix cache is automatic, but the in-memory default expires after
+5–10min of inactivity — so a REPL session's later turns miss the cache across
+idle gaps, while the Anthropic path keeps its prefix warm far longer. OpenAI now
+exposes `prompt_cache_retention: '24h'` (extended retention, offloading
+key/value tensors to GPU-local storage) on gpt-5.x + gpt-4.1; wiring it is the
+parity lever. `prompt_cache_key` (stable hash of system+tools) was already set —
+left as-is: coarse-by-prefix is correct for a single-user CLI (sequential
+sessions share the warmed prefix).
+
+Added an `extended_prompt_cache` capability (hoisted onto a shared
+OPENAI_REASONING_BASE for the four gpt-5.x models; gpt-4o stays out — it only
+has in-memory caching) and have the factory resolve the retention ONCE, gated on
+real OpenAI (custom baseURL may 400 on the param, like prompt_cache_key) AND the
+capability. Threaded through both the Chat Completions and Responses paths
+(stream + constrained). Env opt-out `FORJA_OPENAI_PROMPT_CACHE_RETENTION=
+in_memory|off` for ZDR / data-residency-conscious users or compat endpoints,
+mirroring the existing `FORJA_OPENAI_INCLUDE_USAGE` escape hatch. Capability-
+driven, not per-model special-casing in the adapter (the caps matrix is the
+reference impl).
+
+Spec note: PROVIDERS.md §3.2 still says OpenAI has "no controllable prompt
+cache" — now outdated. Pending a spec PR (no spec edit made without an explicit
+request).
+
 ## [2026-06-14] Inject static operating guidance below the working-state panel
 
 Added a constant guidance block — `[workflow_discipline]` (when to return to

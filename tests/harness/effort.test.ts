@@ -10,9 +10,9 @@ import {
 import { DEFAULT_BUDGET, type RunBudget, effectiveBudget } from '../../src/harness/types.ts';
 
 describe('EFFORT_PROFILES', () => {
-  test('defines exactly the four ordered levels', () => {
-    expect([...FORJA_EFFORT_LEVELS]).toEqual(['low', 'medium', 'high', 'max']);
-    expect(Object.keys(EFFORT_PROFILES).sort()).toEqual(['high', 'low', 'max', 'medium']);
+  test('defines exactly the five ordered levels', () => {
+    expect([...FORJA_EFFORT_LEVELS]).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+    expect(Object.keys(EFFORT_PROFILES).sort()).toEqual(['high', 'low', 'max', 'medium', 'xhigh']);
   });
 
   test('operational caps increase monotonically with level', () => {

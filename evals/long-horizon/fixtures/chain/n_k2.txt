@@ -1,0 +1,3 @@
+value: 7
+flag: no
+next: n_w9.txt

@@ -48,6 +48,45 @@ const computeBackoff = (attempt: number, base: number): number =>
   // attempt is 1-indexed; backoff is base * 4^(attempt - 1).
   base * 4 ** (attempt - 1);
 
+// Upper bound on how long we'll honor a server-supplied Retry-After. A 429 under
+// a per-minute token limit can advertise a multi-second wait; we honor the short,
+// common cases but cap so a pathological value can't hang a turn past its budget
+// (the eval per-case timeout is 60s; three capped waits stay well under it).
+export const MAX_RETRY_AFTER_MS = 8_000;
+
+// Extract a server-supplied retry delay (ms) from a thrown SDK error, honoring
+// the standard rate-limit headers. OpenAI/Anthropic APIErrors carry `.headers`
+// (a `Headers` instance OR a plain object); OpenAI also sends `retry-after-ms`
+// (milliseconds) alongside the HTTP-standard `retry-after` (seconds). Duck-typed
+// so we don't import each SDK's error class. Returns undefined when absent or
+// non-numeric (an HTTP-date Retry-After is ignored — rare for 429).
+export const retryAfterMs = (e: unknown): number | undefined => {
+  const headers = (e as { headers?: unknown }).headers;
+  if (headers === null || typeof headers !== 'object') return undefined;
+  const read = (key: string): string | undefined => {
+    const getter = (headers as { get?: unknown }).get;
+    if (typeof getter === 'function') {
+      const v = (getter as (k: string) => unknown).call(headers, key);
+      return typeof v === 'string' ? v : undefined;
+    }
+    const v = (headers as Record<string, unknown>)[key];
+    if (typeof v === 'string') return v;
+    if (typeof v === 'number') return String(v);
+    return undefined;
+  };
+  const ms = read('retry-after-ms');
+  if (ms !== undefined) {
+    const n = Number(ms);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  const secs = read('retry-after');
+  if (secs !== undefined) {
+    const n = Number(secs);
+    if (Number.isFinite(n) && n >= 0) return n * 1000;
+  }
+  return undefined;
+};
+
 // Wraps `provider.generate(req)` with retry semantics. The wrapper itself
 // is an async generator; on first event we commit to the attempt and
 // stop retrying. A failure before the first event is retried up to
@@ -72,7 +111,13 @@ export async function* generateWithRetry(
       if (yieldedAny) throw e;
       if (attempt >= options.maxAttempts) throw e;
       if (!isRetryableError(e)) throw e;
-      await sleep(computeBackoff(attempt, options.baseDelayMs));
+      // Wait the LONGER of our exponential backoff and the server's Retry-After
+      // (a 200ms backoff that ignores a "retry in 5s" hint just burns an attempt
+      // against a still-saturated limit), capped so a huge value can't hang.
+      const backoff = computeBackoff(attempt, options.baseDelayMs);
+      const serverHint = retryAfterMs(e);
+      const delay = Math.min(Math.max(backoff, serverHint ?? 0), MAX_RETRY_AFTER_MS);
+      await sleep(delay);
     }
   }
 }

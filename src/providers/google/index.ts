@@ -71,6 +71,11 @@ const blockToParts = (block: ProviderContentBlock): GooglePart[] => {
   if (block.type === 'tool_use') {
     return [{ functionCall: { name: block.name, args: block.input } }];
   }
+  // `reasoning` blocks are provider-tagged opaque state; Google has no native
+  // surface for them and they're never tagged 'google', so drop (no parts).
+  if (block.type === 'reasoning') {
+    return [];
+  }
   // tool_result: Gemini correlates by function name, not by tool_use_id.
   // The harness populates `name` on tool_result blocks specifically for
   // this case; if it's missing we fail loud instead of guessing.

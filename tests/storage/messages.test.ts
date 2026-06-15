@@ -60,6 +60,29 @@ describe('messages repo', () => {
     expect(getMessage(db, m.id)?.content).toEqual(content);
   });
 
+  test('preserves a reasoning block (opaque data byte-identical) through persist→read→list', () => {
+    // The reasoning-replay contract: a captured reasoning block must survive the
+    // DB round-trip with its `data` (signature / encrypted item) byte-identical,
+    // or replay on the resumed session 400s. Covers both the single-message read
+    // and the list path that --resume / messagesToProviderMessages consume.
+    const sig = 'AbC123==/+signature-with-base64-and-symbols';
+    const content = [
+      { type: 'reasoning', provider: 'anthropic', data: { thinking: 'reasoned', signature: sig } },
+      {
+        type: 'reasoning',
+        provider: 'openai',
+        data: { type: 'reasoning', id: 'rs_1', encrypted_content: 'ENC==' },
+      },
+      { type: 'text', text: 'answer' },
+    ];
+    const m = appendMessage(db, { sessionId, role: 'assistant', content });
+    expect(getMessage(db, m.id)?.content).toEqual(content);
+    const back = getMessage(db, m.id)?.content as Array<{ data?: { signature?: string } }>;
+    expect(back[0]?.data?.signature).toBe(sig);
+    const listed = listMessagesBySession(db, sessionId).find((x) => x.id === m.id);
+    expect(listed?.content).toEqual(content);
+  });
+
   test('persists and reads back effort (regression-attribution column)', () => {
     const m = appendMessage(db, {
       sessionId,

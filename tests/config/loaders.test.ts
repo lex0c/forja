@@ -1053,8 +1053,8 @@ describe('loadEffortConfig', () => {
     const cwd = makeTempCwd();
     try {
       mkdirSync(join(cwd, '.agent'), { recursive: true });
-      // `xhigh` is a valid OpenAI level but NOT a ForjaEffort.
-      writeFileSync(join(cwd, '.agent', 'config.toml'), '[effort]\nlevel = "xhigh"\n');
+      // `ultra` is not a ForjaEffort (the ladder is low|medium|high|xhigh|max).
+      writeFileSync(join(cwd, '.agent', 'config.toml'), '[effort]\nlevel = "ultra"\n');
       const result = loadEffortConfig({ cwd, env: { HOME: '/none' } });
       expect(result.effort).toBeUndefined();
       expect(result.warnings[0]).toContain('must be one of');

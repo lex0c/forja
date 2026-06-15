@@ -24,6 +24,61 @@ describe('collectStep', () => {
     expect(out.errors).toEqual([]);
   });
 
+  test('reasoning events are collected verbatim into reasoning[]', async () => {
+    const out = await collectStep(
+      fromEvents([
+        { kind: 'start', message_id: 'm_r' },
+        { kind: 'thinking_delta', text: 'think live' },
+        {
+          kind: 'reasoning',
+          provider: 'anthropic',
+          data: { thinking: 'think live', signature: 'SIG1' },
+        },
+        { kind: 'text_delta', text: 'answer' },
+        { kind: 'stop', reason: 'end_turn' },
+      ]),
+    );
+    expect(out.reasoning).toEqual([
+      {
+        type: 'reasoning',
+        provider: 'anthropic',
+        data: { thinking: 'think live', signature: 'SIG1' },
+      },
+    ]);
+    // thinking-delta still feeds the live-display text channel, orthogonally.
+    expect(out.thinking).toBe('think live');
+    expect(out.text).toBe('answer');
+  });
+
+  test('order preserves interleaved reasoning/tool_use/text (not bucketed grouping)', async () => {
+    const out = await collectStep(
+      fromEvents([
+        { kind: 'start', message_id: 'm_i' },
+        { kind: 'reasoning', provider: 'anthropic', data: { thinking: 't1', signature: 'S1' } },
+        { kind: 'text_delta', text: 'let me look' },
+        { kind: 'tool_use_start', id: 'c1', name: 'read' },
+        { kind: 'tool_use_stop', id: 'c1', final_args: { p: '/a' } },
+        { kind: 'reasoning', provider: 'anthropic', data: { thinking: 't2', signature: 'S2' } },
+        { kind: 'tool_use_start', id: 'c2', name: 'read' },
+        { kind: 'tool_use_stop', id: 'c2', final_args: { p: '/b' } },
+        { kind: 'stop', reason: 'tool_use' },
+      ]),
+    );
+    // Buckets still populated for order-agnostic consumers.
+    expect(out.reasoning).toHaveLength(2);
+    expect(out.tool_uses).toHaveLength(2);
+    // order captures the exact emission sequence.
+    expect(out.order.map((b) => b.kind)).toEqual([
+      'reasoning',
+      'text',
+      'tool_use',
+      'reasoning',
+      'tool_use',
+    ]);
+    const textBlock = out.order.find((b) => b.kind === 'text');
+    expect(textBlock).toEqual({ kind: 'text', text: 'let me look' });
+  });
+
   test('single tool_use accumulates name from start, args from stop', async () => {
     const out = await collectStep(
       fromEvents([

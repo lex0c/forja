@@ -71,6 +71,90 @@ describe('normalizeAnthropicStream', () => {
     ]);
   });
 
+  test('signed thinking block emits a reasoning event (thinking + signature)', async () => {
+    const events = await collectNonUsage(
+      normalizeAnthropicStream(
+        fromEvents([
+          { type: 'message_start', message: { id: 'msg_t' } },
+          { type: 'content_block_start', index: 0, content_block: { type: 'thinking' } },
+          {
+            type: 'content_block_delta',
+            index: 0,
+            delta: { type: 'thinking_delta', thinking: 'let me ' },
+          },
+          {
+            type: 'content_block_delta',
+            index: 0,
+            delta: { type: 'thinking_delta', thinking: 'reason' },
+          },
+          {
+            type: 'content_block_delta',
+            index: 0,
+            delta: { type: 'signature_delta', signature: 'SIGABC' },
+          },
+          { type: 'content_block_stop', index: 0 },
+          { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+          { type: 'message_stop' },
+        ]),
+      ),
+    );
+    expect(events).toEqual([
+      { kind: 'start', message_id: 'msg_t' },
+      { kind: 'thinking_delta', text: 'let me ' },
+      { kind: 'thinking_delta', text: 'reason' },
+      {
+        kind: 'reasoning',
+        provider: 'anthropic',
+        data: { thinking: 'let me reason', signature: 'SIGABC' },
+      },
+      { kind: 'stop', reason: 'end_turn' },
+    ]);
+  });
+
+  test('unsigned thinking block emits no reasoning event (not replayable)', async () => {
+    const events = await collectNonUsage(
+      normalizeAnthropicStream(
+        fromEvents([
+          { type: 'message_start', message: { id: 'msg_u' } },
+          { type: 'content_block_start', index: 0, content_block: { type: 'thinking' } },
+          {
+            type: 'content_block_delta',
+            index: 0,
+            delta: { type: 'thinking_delta', thinking: 'hmm' },
+          },
+          { type: 'content_block_stop', index: 0 },
+          { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+          { type: 'message_stop' },
+        ]),
+      ),
+    );
+    expect(events.some((e) => e.kind === 'reasoning')).toBe(false);
+    expect(events).toContainEqual({ kind: 'thinking_delta', text: 'hmm' });
+  });
+
+  test('redacted_thinking block is captured verbatim as a reasoning event', async () => {
+    const events = await collectNonUsage(
+      normalizeAnthropicStream(
+        fromEvents([
+          { type: 'message_start', message: { id: 'msg_rd' } },
+          {
+            type: 'content_block_start',
+            index: 0,
+            content_block: { type: 'redacted_thinking', data: 'ENCRYPTED_REDACTED' },
+          },
+          { type: 'content_block_stop', index: 0 },
+          { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+          { type: 'message_stop' },
+        ]),
+      ),
+    );
+    expect(events).toContainEqual({
+      kind: 'reasoning',
+      provider: 'anthropic',
+      data: { redacted_thinking: 'ENCRYPTED_REDACTED' },
+    });
+  });
+
   test('empty tool_use args produce final_args = {}', async () => {
     const events = await collectNonUsage(
       normalizeAnthropicStream(

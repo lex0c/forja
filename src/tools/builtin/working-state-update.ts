@@ -26,8 +26,6 @@ import {
 const STORE_UNAVAILABLE_HINT =
   'This usually means the harness was constructed without a workingStateStore. Check HarnessConfig.';
 
-const HYPOTHESIS_NOT_FOUND = 'working_state.hypothesis_not_found';
-
 const requireWorkingStateStore = (
   ctx: ToolContext,
   toolName: string,
@@ -118,7 +116,10 @@ export const workingStateUpdateTool: Tool<WorkingStateUpdateInput, WorkingStateU
       hypothesis_update: {
         type: 'object',
         properties: {
-          id: { type: 'string', description: 'From hypothesis_add.' },
+          id: {
+            type: 'string',
+            description: 'An id returned by hypothesis_add. Do NOT invent one.',
+          },
           status: {
             type: 'string',
             enum: [...HYP_STATUSES],
@@ -132,7 +133,7 @@ export const workingStateUpdateTool: Tool<WorkingStateUpdateInput, WorkingStateU
         },
         required: ['id'],
         description:
-          'Resolve or attach evidence. Refuting a user-sourced one: confirm with the operator first.',
+          'Resolve or attach evidence on an EXISTING open hypothesis. OMIT this field entirely when you have none — an unknown id is ignored (the other fields still apply). Refuting a user-sourced one: confirm with the operator first.',
       },
     },
   },
@@ -221,19 +222,21 @@ export const workingStateUpdateTool: Tool<WorkingStateUpdateInput, WorkingStateU
     const step = ctx.getStepNumber !== undefined ? ctx.getStepNumber() : 0;
     const current = store.get(sid);
 
-    // not_found is surfaced as a clean error (a stale id, or one already
-    // confirmed/refuted and thus no longer in the active list).
+    // A hypothesis_update for an unknown id (a stale/archived id, or a placeholder
+    // the model emitted instead of omitting the optional field — `''`, `h1`,
+    // `__skip__`, etc.) is DROPPED as a non-fatal no-op, NOT a hard error: failing
+    // the whole call would discard the focus/next/log fields sent alongside it and
+    // send the model into a retry loop inventing more placeholder ids. The skip is
+    // surfaced as a notice so a genuine typo is still visible.
+    const skipNotices: string[] = [];
     if (
       patch.hypothesisUpdate !== undefined &&
       !current.hypotheses.some((h) => h.id === patch.hypothesisUpdate?.id)
     ) {
-      return toolError(
-        HYPOTHESIS_NOT_FOUND,
-        `no open hypothesis with id ${patch.hypothesisUpdate.id}`,
-        {
-          hint: 'use the id returned by hypothesis_add; a confirmed/refuted hypothesis is archived and no longer updatable',
-        },
+      skipNotices.push(
+        `hypothesis_update ignored: no open hypothesis with id '${patch.hypothesisUpdate.id}' — use the id returned by hypothesis_add (confirmed/refuted ones are archived); omit hypothesis_update when you have none`,
       );
+      delete patch.hypothesisUpdate;
     }
 
     const result = applyWorkingStatePatch(current, patch, step, () => store.nextId(sid));
@@ -251,7 +254,7 @@ export const workingStateUpdateTool: Tool<WorkingStateUpdateInput, WorkingStateU
       })),
       log_size: result.next.log.length,
       mutations: result.mutations,
-      notices: result.notices,
+      notices: [...skipNotices, ...result.notices],
     };
     if (result.createdHypothesisId !== undefined) {
       out.created_hypothesis_id = result.createdHypothesisId;

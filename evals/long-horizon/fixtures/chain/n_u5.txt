@@ -1,0 +1,3 @@
+value: 8
+flag: yes
+next: n_i0.txt

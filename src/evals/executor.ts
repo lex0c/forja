@@ -333,6 +333,17 @@ const evaluateExpectations = (
             : { detail: `assistant output did not contain '${expectation.pattern}'` }),
         };
       }
+      case 'min_steps': {
+        const steps = result?.steps ?? 0;
+        const passed = steps >= expectation.count;
+        return {
+          expectation,
+          passed,
+          ...(passed
+            ? {}
+            : { detail: `ran ${steps} step(s), expected at least ${expectation.count}` }),
+        };
+      }
       case 'compaction_triggered': {
         const matching =
           expectation.strategy === undefined
@@ -382,6 +393,16 @@ export const executeCase = async (
   }
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
+  // Pin OpenAI reasoning replay OFF for eval determinism: it now defaults ON and
+  // is NOT gated by the `thinkingBudget: 0` pin below (that only disables Anthropic
+  // thinking), so an OpenAI eval would otherwise replay reasoning items and drift
+  // the baseline. Only default it when unset — the reasoning-replay A/B sets the
+  // flag explicitly per arm (via the runner) and must win. Restored in `finally`.
+  // (Anthropic replay needs no pin: with thinking off in evals there's nothing to
+  // replay.)
+  const prevOpenaiReplay = process.env.FORJA_OPENAI_REASONING_REPLAY;
+  if (prevOpenaiReplay === undefined) process.env.FORJA_OPENAI_REASONING_REPLAY = '0';
+
   try {
     cwd = setupCwd(caseDef);
 
@@ -399,6 +420,12 @@ export const executeCase = async (
       // callers can override via `bootstrapOverride.temperature`
       // when stochasticity is the property under test.
       temperature: 0,
+      // Thinking now defaults ON in production, but evals pin it OFF
+      // (disable-via-zero) for reproducible pass/fail — thinking adds reasoning
+      // variance and, on adaptive models, strips the temperature pin above. A
+      // case/override that sets `thinkingBudget` (e.g. the reasoning-replay A/B)
+      // wins via the bootstrapOverride spread below.
+      thinkingBudget: 0,
       ...(caseDef.setup?.approvalPosture !== undefined
         ? { approvalPosture: caseDef.setup.approvalPosture }
         : {}),
@@ -466,6 +493,7 @@ export const executeCase = async (
   } finally {
     clearTimeout(timer);
     options.signal?.removeEventListener('abort', onParentAbort);
+    if (prevOpenaiReplay === undefined) delete process.env.FORJA_OPENAI_REASONING_REPLAY;
   }
 
   // Evaluate expectations BEFORE cleanup so file_exists/file_contains

@@ -249,9 +249,15 @@ describe('createOpenAIProvider', () => {
       max_tokens: 1,
       system: 'be brief',
     });
-    const params = handle.createCalls[0]?.params as { prompt_cache_key?: string };
+    const params = handle.createCalls[0]?.params as {
+      prompt_cache_key?: string;
+      prompt_cache_retention?: unknown;
+    };
     expect(typeof params.prompt_cache_key).toBe('string');
     expect(params.prompt_cache_key?.length).toBeGreaterThan(0);
+    // gpt-4o has no extended-retention capability → the param stays absent
+    // even on real OpenAI (only in-memory caching applies to it).
+    expect(params.prompt_cache_retention).toBeUndefined();
   });
 
   test('omits prompt_cache_key when a custom baseURL is set (compat endpoint)', async () => {

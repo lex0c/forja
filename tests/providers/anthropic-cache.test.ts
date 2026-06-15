@@ -237,6 +237,33 @@ describe('messagesWithTailCacheBreakpoint', () => {
     const out = messagesWithTailCacheBreakpoint([userMsg([])]);
     expect(out[0]?.content).toEqual([]);
   });
+
+  test('never anchors on a trailing thinking block — falls back to the last cache-eligible block', () => {
+    // Anthropic 400s on cache_control over thinking/redacted_thinking blocks,
+    // which reasoning replay can leave at the tail. The marker must land on the
+    // last NON-thinking block instead.
+    const blocks = [
+      { type: 'thinking', thinking: 'reasoned', signature: 'sig' },
+      { type: 'text', text: 'the answer' },
+      { type: 'thinking', thinking: 'more', signature: 'sig2' },
+    ];
+    const out = messagesWithTailCacheBreakpoint([{ role: 'assistant', content: blocks }]);
+    const tail = (out[0]?.content ?? []) as Array<{ type: string; cache_control?: unknown }>;
+    expect(tail[0]?.cache_control).toBeUndefined();
+    expect(tail[1]?.cache_control).toEqual(ANTHROPIC_CACHE_EPHEMERAL); // the text block
+    expect(tail[2]?.cache_control).toBeUndefined(); // trailing thinking left clean
+  });
+
+  test('skips the breakpoint entirely when the tail is all thinking (reasoning-only turn)', () => {
+    const blocks = [
+      { type: 'thinking', thinking: 'just thinking', signature: 'sig' },
+      { type: 'redacted_thinking', data: 'opaque' },
+    ];
+    const out = messagesWithTailCacheBreakpoint([{ role: 'assistant', content: blocks }]);
+    const tail = (out[0]?.content ?? []) as Array<{ cache_control?: unknown }>;
+    expect(tail[0]?.cache_control).toBeUndefined();
+    expect(tail[1]?.cache_control).toBeUndefined();
+  });
 });
 
 describe('countCacheBreakpoints', () => {

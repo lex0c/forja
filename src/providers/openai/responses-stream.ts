@@ -39,6 +39,9 @@ export interface RawResponsesEvent {
     call_id?: string;
     name?: string;
     arguments?: string;
+    // gpt-5.3-codex preamble/closeout marker on assistant message items
+    // (commentary | final_answer). Captured so it round-trips.
+    phase?: string;
   };
   // created / completed / incomplete / failed
   response?: {
@@ -128,23 +131,53 @@ export async function* normalizeResponsesStream(
 
       case 'response.output_item.done':
         if (ev.item?.type === 'function_call' && ev.item.call_id) {
-          let parsed: Record<string, unknown> = {};
           // Prefer the done item's full arguments; fall back to the chunks we
           // accumulated from the delta events if it's absent.
           const fromItem = ev.item.arguments ?? '';
           const argStr =
             fromItem.length > 0 ? fromItem : ev.item.id ? (argsByItem.get(ev.item.id) ?? '') : '';
+          let parsed: Record<string, unknown> = {};
           if (argStr.length > 0) {
             try {
-              parsed = JSON.parse(argStr) as Record<string, unknown>;
-            } catch {
-              // Malformed args — emit the stop with an empty object so the
-              // tool-use is still closed (the harness surfaces the bad call
-              // rather than wedging on an unterminated tool_use).
-              parsed = {};
+              const obj = JSON.parse(argStr) as unknown;
+              if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
+                throw new Error('tool args must decode to a JSON object');
+              }
+              parsed = obj as Record<string, unknown>;
+            } catch (e) {
+              // Malformed / non-object args = a FAILED call, not an empty one
+              // (matches the Anthropic + Chat Completions normalizers). Emit an
+              // error so the harness fails the turn, and DROP the stop so the
+              // bad call is never executed/recorded with bogus args — empty
+              // args on read_file/bash would otherwise run the wrong thing.
+              yield {
+                kind: 'error',
+                code: 'tool_args_parse_error',
+                message: `failed to parse tool_use args for ${ev.item.call_id}: ${(e as Error).message}`,
+                retryable: false,
+              };
+              break;
             }
           }
           yield { kind: 'tool_use_stop', id: ev.item.call_id, final_args: parsed };
+        } else if (ev.item?.type === 'reasoning') {
+          // Capture the reasoning output item VERBATIM (opaque — carries id,
+          // summary, the encrypted_content requested via `include`, and any
+          // `phase`). Stored on the assistant turn; replayed as an input item next
+          // request unless FORJA_OPENAI_REASONING_REPLAY=0 (replay defaults ON).
+          // The harness never inspects `data`; the adapter round-trips it unchanged.
+          yield { kind: 'reasoning', provider: 'openai', data: ev.item };
+        } else if (ev.item?.type === 'message' && typeof ev.item.phase === 'string') {
+          // gpt-5.3-codex `phase` rides on the assistant MESSAGE item, which the
+          // harness rebuilds from text (losing the field). Carry it on the
+          // reasoning channel via a sentinel so the OpenAI adapter can re-stamp
+          // it onto the replayed assistant message (dropping the phase causes
+          // "significant performance degradation" per the codex guide).
+          yield {
+            kind: 'reasoning',
+            provider: 'openai',
+            data: { __forja_message_phase: ev.item.phase },
+          };
         }
         break;
 

@@ -1,0 +1,3 @@
+value: 10
+flag: yes
+next: n_p2.txt

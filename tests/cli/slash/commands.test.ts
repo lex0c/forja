@@ -1279,7 +1279,7 @@ describe('/effort', () => {
     const r = await effortCommand.exec([], ctx);
     if (r.kind !== 'ok') throw new Error('expected ok');
     expect(r.notes?.[0]).toContain('not set');
-    expect((r.notes ?? []).join('\n')).toContain('low | medium | high | max');
+    expect((r.notes ?? []).join('\n')).toContain('low | medium | high | xhigh | max');
   });
 
   test('/effort <level> records the level only; caps resolve via effectiveBudget (next turn)', async () => {
@@ -1334,7 +1334,7 @@ describe('/effort', () => {
     const r = await effortCommand.exec(['ultra'], ctx);
     if (r.kind !== 'error') throw new Error('expected error');
     expect(r.message).toContain('unknown level');
-    expect(r.message).toContain('low, medium, high, max');
+    expect(r.message).toContain('low, medium, high, xhigh, max');
   });
 
   test('/effort rejects too many args', async () => {

@@ -36,6 +36,7 @@ expect:
   - status: done
   - exit_reason: maxSteps
   - output_contains: hello
+  - min_steps: 5
 `;
     const c = parseEvalCase(yaml, '/tmp/c.yaml');
     expect(c.expect.map((e) => e.kind)).toEqual([
@@ -47,7 +48,21 @@ expect:
       'status',
       'exit_reason',
       'output_contains',
+      'min_steps',
     ]);
+    expect(c.expect.find((e) => e.kind === 'min_steps')).toEqual({ kind: 'min_steps', count: 5 });
+  });
+
+  test('rejects non-integer min_steps', () => {
+    const yaml = `
+name: x
+prompt: y
+expect:
+  - min_steps: 0
+`;
+    expect(() => parseEvalCase(yaml, '/tmp/c.yaml')).toThrow(
+      /min_steps must be a positive integer/,
+    );
   });
 
   test('rejects unknown top-level key', () => {

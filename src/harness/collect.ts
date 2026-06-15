@@ -1,5 +1,10 @@
 import { emptyUsage } from '../providers/cost.ts';
-import type { StopReason, StreamEvent, UsageInfo } from '../providers/index.ts';
+import type {
+  ProviderReasoningBlock,
+  StopReason,
+  StreamEvent,
+  UsageInfo,
+} from '../providers/index.ts';
 
 // Wraps an iteration error so the partial CollectedStep is recoverable
 // at the harness layer. Without this, usage/text/tool_uses captured
@@ -25,6 +30,17 @@ export interface CollectedToolUse {
   input: Record<string, unknown>;
 }
 
+// One content block in the exact order the model emitted it this turn. Preserves
+// interleaving (e.g. thinking1, tool1, thinking2, tool2) that the bucketed
+// `reasoning`/`tool_uses` arrays lose — Anthropic 400s if replayed thinking
+// blocks are reordered relative to the tool_use blocks around them. Holds the
+// same object references as the bucketed arrays (no copy). `buildAssistantContent`
+// rebuilds the assistant turn from this; other consumers keep using the buckets.
+export type CollectedBlock =
+  | { kind: 'reasoning'; reasoning: ProviderReasoningBlock }
+  | { kind: 'tool_use'; toolUse: CollectedToolUse }
+  | { kind: 'text'; text: string };
+
 export interface CollectedError {
   code: string;
   message: string;
@@ -36,6 +52,16 @@ export interface CollectedStep {
   text: string;
   tool_uses: CollectedToolUse[];
   thinking: string;
+  // Opaque, provider-tagged reasoning artifacts captured this turn (Anthropic
+  // signed thinking, OpenAI reasoning items). Stored on the assistant message
+  // for verbatim replay next request (capture is wired now; replay is flagged,
+  // per-provider). Distinct from `thinking`, which is the live-display text.
+  reasoning: ProviderReasoningBlock[];
+  // The turn's content blocks in original emission order (reasoning / text /
+  // tool_use interleaved as produced). Source of truth for rebuilding the
+  // assistant message; the bucketed `text`/`tool_uses`/`reasoning` above stay
+  // for consumers that don't care about order.
+  order: CollectedBlock[];
   stop_reason: StopReason;
   errors: CollectedError[];
   usage: UsageInfo;
@@ -51,6 +77,8 @@ const empty = (): CollectedStep => ({
   text: '',
   tool_uses: [],
   thinking: '',
+  reasoning: [],
+  order: [],
   stop_reason: 'end_turn',
   errors: [],
   usage: emptyUsage(),
@@ -68,6 +96,16 @@ export const collectStep = async (
 ): Promise<CollectedStep> => {
   const out = empty();
   const toolNamesById = new Map<string, string>();
+  // Buffer contiguous text deltas; flush as one ordered `text` block right
+  // before the next reasoning/tool_use block (and at stream end) so `order`
+  // captures where text sat relative to the other blocks.
+  let pendingText = '';
+  const flushText = (): void => {
+    if (pendingText.length > 0) {
+      out.order.push({ kind: 'text', text: pendingText });
+      pendingText = '';
+    }
+  };
 
   try {
     for await (const ev of events) {
@@ -84,10 +122,23 @@ export const collectStep = async (
           break;
         case 'text_delta':
           out.text += ev.text;
+          pendingText += ev.text;
           break;
         case 'thinking_delta':
           out.thinking += ev.text;
           break;
+        case 'reasoning': {
+          // Opaque artifact for replay — stored verbatim, never normalized.
+          flushText();
+          const block: ProviderReasoningBlock = {
+            type: 'reasoning',
+            provider: ev.provider,
+            data: ev.data,
+          };
+          out.reasoning.push(block);
+          out.order.push({ kind: 'reasoning', reasoning: block });
+          break;
+        }
         case 'tool_use_start':
           toolNamesById.set(ev.id, ev.name);
           break;
@@ -106,7 +157,10 @@ export const collectStep = async (
             });
             break;
           }
-          out.tool_uses.push({ id: ev.id, name, input: ev.final_args });
+          flushText();
+          const toolUse: CollectedToolUse = { id: ev.id, name, input: ev.final_args };
+          out.tool_uses.push(toolUse);
+          out.order.push({ kind: 'tool_use', toolUse });
           break;
         }
         case 'usage':
@@ -136,8 +190,10 @@ export const collectStep = async (
     // usage into session totals — otherwise turns that errored mid-
     // stream get billed by the provider but omitted from cost
     // tracking.
+    flushText();
     throw new CollectStepError(e, out);
   }
 
+  flushText();
   return out;
 };

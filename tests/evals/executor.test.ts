@@ -117,6 +117,57 @@ describe('executeCase', () => {
     expect(r.expectations.every((e) => e.passed)).toBe(true);
   });
 
+  test('bootstrapOverride.thinkingBudget reaches the provider request as thinking_budget', async () => {
+    // Locks the BootstrapInput → HarnessConfig → GenerateRequest.thinking_budget
+    // chain the reasoning-replay A/B depends on (the Anthropic adapter only emits
+    // thinking when thinking_budget > 0). Captured via a request-recording mock.
+    let captured: number | undefined;
+    const base = mockProvider([{ text: 'ok' }]);
+    const capturing: Provider = {
+      ...base,
+      async *generate(req: { thinking_budget?: number }): AsyncIterable<StreamEvent> {
+        captured = req.thinking_budget;
+        yield { kind: 'start', message_id: 'm' };
+        yield { kind: 'text_delta', text: 'ok' };
+        yield { kind: 'stop', reason: 'end_turn' };
+      },
+    };
+    await executeCase(baseCase(), {
+      bootstrapOverride: { providerOverride: capturing, thinkingBudget: 1234 },
+    });
+    expect(captured).toBe(1234);
+  });
+
+  test('min_steps fails when the run is too short', async () => {
+    const c = baseCase({ expect: [{ kind: 'min_steps', count: 3 }] });
+    const r = await executeCase(c, {
+      bootstrapOverride: {
+        providerOverride: mockProvider([{ text: 'done in one turn' }]),
+      },
+    });
+    expect(r.passed).toBe(false);
+    expect(r.expectations[0]?.detail).toContain('ran 1 step');
+  });
+
+  test('min_steps passes when the run takes enough steps', async () => {
+    const c = baseCase({ expect: [{ kind: 'min_steps', count: 2 }] });
+    const r = await executeCase(c, {
+      bootstrapOverride: {
+        providerOverride: mockProvider([
+          {
+            tool_uses: [{ id: 't1', name: 'write_file', input: { path: 'a.txt', content: 'x\n' } }],
+          },
+          {
+            tool_uses: [{ id: 't2', name: 'write_file', input: { path: 'b.txt', content: 'y\n' } }],
+          },
+          { text: 'done' },
+        ]),
+        sandboxAvailabilityOverride: HERMETIC_SANDBOX,
+      },
+    });
+    expect(r.passed).toBe(true);
+  });
+
   test('output_contains matches accumulated text_delta', async () => {
     const c = baseCase({
       expect: [
