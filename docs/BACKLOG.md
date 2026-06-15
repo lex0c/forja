@@ -2,6 +2,78 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] Reasoning propagation — live wire validation (close correctness confidence)
+
+Drove the provider adapters directly against the real APIs (keys from `.env`) to
+validate every replay path that was previously mock-only:
+
+- **Anthropic signed-thinking replay on a tool turn** (thinking_budget>0, effort
+  xhigh, replay ON): turn 1 captured a signed reasoning block + tool_use; turn 2
+  replayed it with the tool_result and completed with NO 400. Validates the
+  signature byte-round-trip, the lifted suppression gate, the cache-breakpoint
+  skip-thinking fix, AND `output_config.effort: 'xhigh'` on the wire. PASS.
+- **OpenAI gpt-5.3-codex reasoning-item replay** on a tool turn: PASS (no 400).
+  Caveat: that run did not emit a `phase` field, so the codex `phase` re-stamp
+  wire shape specifically remains mock-only (can't force it on demand).
+- **Cross-provider foreign-reasoning drop**, both directions with both flags ON
+  (anthropic-tagged → OpenAI request, openai-tagged → Anthropic request): the
+  foreign block is dropped, no 400 either way. PASS.
+- **Resume round-trip**: added a unit test that a reasoning block (signed thinking
+  + openai encrypted item) survives DB persist→read→list byte-identical.
+
+Correctness confidence is now high across every exercisable path. Residuals:
+replay VALUE is still unproven (both A/B arms sit near the ceiling on the current
+eval — needs a harder one before any default flip); codex `phase` and Anthropic
+`redacted_thinking` wire shapes stay mock-only (neither is forceable on demand);
+spec PR for PROVIDERS.md still pending. Defaults stay OFF.
+
+## [2026-06-14] OpenAI reasoning replay — fix the input ordering 400 (found by the A/B)
+
+Ran the Phase 4 A/B live on `openai/gpt-5.4-mini` (K=10, long-horizon chain). The
+ON arm REGRESSED to 3/10 vs OFF 9/10 — and all 7 ON failures were `providerError`,
+not wrong answers: the replay was 400-ing mid-chain, not "not helping" (the #25
+disposition is a clean zero delta, this was a crash). So the A/B doubled as the
+live wire smoke that was still pending, and caught a real bug.
+
+Root cause: `toResponsesInput` emitted `assistant message → reasoning items → tool
+calls`, but the model's native (and stored) order is `reasoning → message →
+function_call`. OpenAI stateless replay (`store:false`) rejects a reasoning item
+not directly followed by the item it generated ("…without its required following
+item"), which fired only on turns that ALSO emitted assistant text — hence the
+~70% intermittency. Fix: emit reasoning items FIRST, before the assistant message.
+A new test pins `reasoning idx < message idx < function_call idx`.
+
+Validated live with the fix: replay ON = 8/8 pass, 0 providerError (full 15-19 step
+chains). Bug dead. Also: `ab_run` now emits `failure`/`detail` so a future replay
+regression is debuggable straight from the NDJSON (this run needed a side repro to
+recover the provider message).
+
+Note on measuring replay VALUE: with the crash gone, OFF and ON both sit near the
+ceiling on this eval (~9-10/10), so it doesn't yet show a replay benefit — the
+chain is easy enough for the model to pass without continuity. A harder/longer
+eval is needed to surface value before any default flip; defaults stay OFF.
+
+## [2026-06-14] Phase 4 — reasoning-replay A/B runner
+
+The gate the #25 revert asked for: `src/evals/ab.ts` runs an eval target K times
+with `FORJA_<PROVIDER>_REASONING_REPLAY` OFF, then K times ON, and reports the
+pass-rate / cost / step deltas per provider. The OFF arm runs with the flag
+explicitly UNSET so a flag already exported in the shell can't contaminate the
+baseline; both arms restore the prior env on exit. `executeCase` builds a fresh
+provider per run (the factory reads the flag at construction), so flipping the env
+around each arm is sufficient.
+
+The runner only MEASURES — it never flips a default. `verdictLine` is conservative
+(ON must STRICTLY beat OFF on pass-rate to be called a candidate; ties/regressions
+keep OFF, the #25 disposition). Pure helpers (`flagForModel`, `aggregateArm`,
+`deltaOf`, `verdictLine`, `parseArgs`) are unit-tested; an integration test drives
+`runAbComparison` with a flag-sensitive mock provider (no live API) to prove the
+per-arm env flip + baseline isolation. Script: `eval:long-horizon:ab` (K=10).
+
+Still requires a live API key to run for real — running it + deciding any default
+flip (recording the delta here) is the remaining, operator-gated step. Defaults
+stay OFF until a measured positive delta.
+
 ## [2026-06-14] Reasoning propagation — code-review fixes (correctness + cleanup)
 
 Review pass over the reasoning-propagation + xhigh diff (7 finder angles, verified

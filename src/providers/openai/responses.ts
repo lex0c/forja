@@ -114,6 +114,16 @@ const toResponsesInput = (messages: ProviderMessage[], reasoningReplay = false):
     }
     items.push(...toolOutputs);
     if (m.role === 'assistant') {
+      // Reasoning items come FIRST — before the assistant message and the tool
+      // calls — mirroring the model's own output order (it reasons, THEN emits
+      // the message / function_call) and the order the loop stores the blocks.
+      // OpenAI's stateless replay rejects a reasoning item that is not directly
+      // followed by the item it generated ("Item 'rs_…' of type 'reasoning' was
+      // provided without its required following item"); hoisting the assistant
+      // message ahead of the reasoning triggered that 400 — intermittently,
+      // only on the turns that also emitted assistant text (the A/B's ~70%
+      // providerError rate on the long-horizon chain).
+      items.push(...reasoningItems);
       if (textParts.length > 0) {
         items.push({
           role: 'assistant',
@@ -123,9 +133,6 @@ const toResponsesInput = (messages: ProviderMessage[], reasoningReplay = false):
           ...(messagePhase !== undefined ? { phase: messagePhase } : {}),
         });
       }
-      // Reasoning items sit after the assistant text and before the function
-      // calls they reasoned about — the position OpenAI's continuity expects.
-      items.push(...reasoningItems);
       items.push(...toolCalls);
     } else if (textParts.length > 0) {
       items.push({ role: 'user', content: textParts.join('') });

@@ -382,6 +382,44 @@ describe('createOpenAIProvider — Responses routing for reasoning models', () =
       });
     });
 
+    test('on: reasoning item precedes the assistant message AND the tool call (model output order)', async () => {
+      // OpenAI's stateless replay rejects a reasoning item not directly followed
+      // by the item it generated; the reasoning must lead the turn, before any
+      // assistant text. Regression guard for the A/B's intermittent 400.
+      await withReplay(true, async () => {
+        const handle = mockResponsesClient([
+          { type: 'response.created', response: { id: 'r' } },
+          { type: 'response.completed', response: {} },
+        ]);
+        const provider = createOpenAIProvider('gpt-5.4-mini', { client: handle.client });
+        for await (const _ of provider.generate({
+          model: 'gpt-5.4-mini',
+          max_tokens: 8,
+          effort: 'high',
+          messages: [
+            {
+              role: 'assistant',
+              content: [
+                { type: 'reasoning', provider: 'openai', data: reasoningItem },
+                { type: 'text', text: 'let me read it' },
+                { type: 'tool_use', id: 'call_1', name: 'read', input: { p: '/x' } },
+              ],
+            },
+            { role: 'user', content: 'go' },
+          ],
+        })) {
+          // drain
+        }
+        const { input } = handle.calls[0] as { input: Array<{ type?: string; role?: string }> };
+        const reasoningIdx = input.findIndex((i) => i.type === 'reasoning');
+        const messageIdx = input.findIndex((i) => i.role === 'assistant');
+        const callIdx = input.findIndex((i) => i.type === 'function_call');
+        expect(reasoningIdx).toBeGreaterThanOrEqual(0);
+        expect(reasoningIdx).toBeLessThan(messageIdx);
+        expect(messageIdx).toBeLessThan(callIdx);
+      });
+    });
+
     test('on: codex message phase is re-stamped on the assistant message, not pushed as an item', async () => {
       await withReplay(true, async () => {
         const handle = mockResponsesClient([

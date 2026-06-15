@@ -16,6 +16,7 @@
     "eval:regression": "bun run src/evals/cli.ts evals/regression --model anthropic/claude-haiku-4-5",
     "eval:skills": "bun run src/evals/cli.ts evals/skills --model anthropic/claude-opus-4-8",
     "eval:long-horizon": "bun run src/evals/cli.ts evals/long-horizon --model anthropic/claude-opus-4-8",
+    "eval:long-horizon:ab": "bun run src/evals/ab.ts evals/long-horizon --model anthropic/claude-opus-4-8 --repeat 10",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "format": "biome format --write .",
