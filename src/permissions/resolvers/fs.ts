@@ -147,8 +147,15 @@ const grepResolver: Resolver = (args, ctx): ResolverResult => {
   // (same convention as the engine's `checkPath` for search tools).
   // Non-string path is structural — refuse rather than coerce.
   const path = args.path;
-  if (path !== undefined && !isNonEmptyString(path)) {
-    return { kind: 'refuse', reason: "grep: non-string 'path' argument" };
+  // Empty string → treated as omitted (search the cwd), matching the tool. Only a
+  // genuinely non-string `path` (array/number/object) is structural — refuse with
+  // the expected shape rather than a terse "non-string".
+  if (path !== undefined && typeof path !== 'string') {
+    return {
+      kind: 'refuse',
+      reason:
+        "grep: 'path' must be a string (a file or directory to search; omit it to search the cwd)",
+    };
   }
   const target = isNonEmptyString(path) ? resolveAbs(path, ctx) : ctx.cwd;
   return {
@@ -163,8 +170,11 @@ const globResolver: Resolver = (args, ctx): ResolverResult => {
   // arg, not the session cwd), and `pattern` controls what's matched
   // but not what's allowed. Same defaulting + refusal logic.
   const cwdArg = args.cwd;
-  if (cwdArg !== undefined && !isNonEmptyString(cwdArg)) {
-    return { kind: 'refuse', reason: "glob: non-string 'cwd' argument" };
+  if (cwdArg !== undefined && typeof cwdArg !== 'string') {
+    return {
+      kind: 'refuse',
+      reason: "glob: 'cwd' must be a string directory (omit it to use the session cwd)",
+    };
   }
   const target = isNonEmptyString(cwdArg) ? resolveAbs(cwdArg, ctx) : ctx.cwd;
   return {
@@ -181,8 +191,11 @@ const globResolver: Resolver = (args, ctx): ResolverResult => {
 // conservative `confirm` on every git call ("no resolver registered").
 const gitResolver: Resolver = (args, ctx): ResolverResult => {
   const path = args.path;
-  if (path !== undefined && !isNonEmptyString(path)) {
-    return { kind: 'refuse', reason: "git: non-string 'path' argument" };
+  if (path !== undefined && typeof path !== 'string') {
+    return {
+      kind: 'refuse',
+      reason: "git: 'path' must be a string repo-relative pathspec (omit it to scope the cwd)",
+    };
   }
   const target = isNonEmptyString(path) ? resolveAbs(path, ctx) : ctx.cwd;
   return {

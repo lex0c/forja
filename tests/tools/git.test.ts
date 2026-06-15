@@ -71,6 +71,22 @@ describe('buildModeArgs — flag-injection rejection', () => {
     expect('error' in buildModeArgs({ mode: 'blame', path: null as any })).toBe(true);
   });
 
+  test('empty-string ref/path are treated as OMITTED, not errors', () => {
+    // Models often emit `ref: ''` / `path: ''` to mean "the default" instead of
+    // omitting the optional field — that must not error (the trace: `status .`
+    // with an empty ref failed "ref must be non-empty").
+    const status = buildModeArgs({ mode: 'status', ref: '', path: '' });
+    expect('args' in status).toBe(true);
+    const log = buildModeArgs({ mode: 'log', ref: '' });
+    if (!('args' in log)) throw new Error('expected args');
+    // ref omitted → no bare revision in the argv (just the `-- .` pathspec).
+    expect(log.args).not.toContain('');
+    // show defaults the ref to HEAD when omitted/empty.
+    const show = buildModeArgs({ mode: 'show', ref: '' });
+    if (!('args' in show)) throw new Error('expected args');
+    expect(show.args.some((a) => a.includes('HEAD'))).toBe(true);
+  });
+
   test('blame requires a path', () => {
     expect('error' in buildModeArgs({ mode: 'blame' })).toBe(true);
     const ok = buildModeArgs({ mode: 'blame', path: 'src/a.ts' });

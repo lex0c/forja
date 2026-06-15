@@ -168,8 +168,13 @@ const validatePath = (path: string): string | null => {
 // per-mode argv shape) is unit-testable without spawning git.
 export const buildModeArgs = (args: GitInput): { args: string[] } | { error: string } => {
   const { mode } = args;
-  const path = args.path;
-  const ref = args.ref;
+  // An empty-string path/ref is treated as OMITTED (not an error): models often
+  // emit `ref: ''` / `path: ''` to mean "the default" instead of omitting the
+  // optional field. ref undefined → working-tree (status/log) or HEAD (show);
+  // path undefined → the cwd subtree (`-- .`). A non-string still fails the
+  // typeof guard below.
+  const path = args.path === '' ? undefined : args.path;
+  const ref = args.ref === '' ? undefined : args.ref;
 
   // Defend against non-string path/ref: nothing validates the model's
   // tool-call JSON against `inputSchema` before execute(), so an internal

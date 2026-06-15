@@ -2,6 +2,34 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-15] Tool UX: stop models from looping on recoverable arg mistakes
+
+A real gpt-5.x "explore the repo" trace wasted ~25 tool calls on recoverable arg
+errors. Fixed the four classes (all provider-agnostic — better schemas + tolerant
+inputs + actionable errors help every model and cut wasted calls):
+
+1. **working_state partial-success.** An unknown `hypothesis_update.id` hard-failed
+   the WHOLE call, discarding the `focus`/`next` sent alongside — so the model
+   looped inventing placeholder ids (`h1`, `__skip__`, `not-applicable`, …). Now an
+   unknown id is a non-fatal no-op + notice; the other fields still apply. Schema
+   description tightened ("OMIT when you have none; do NOT invent an id").
+2. **git empty ref/path → omitted.** `status .` / `ref:''` failed "ref must be
+   non-empty"; models emit `''` to mean "default". buildModeArgs now treats an
+   empty string as omitted (ref → working-tree/HEAD, path → cwd subtree).
+3. **grep empty/non-string `type`/`glob` → ignored.** `type:''` pushed `--type ''`
+   → ripgrep exit 2 ("unrecognized file type"). Now only non-empty strings are
+   forwarded.
+4. **Actionable errors.** The fs resolvers refused empty/odd `path`/`cwd` with a
+   terse "non-string 'path' argument" (and refused empty strings outright); now
+   they treat empty as the cwd default and, for a genuine non-string, return the
+   expected shape ("'path' must be a string … omit to scope the cwd"). grep's
+   ripgrep-exit error gains a hint for the bad-`type` and bad-regex cases.
+
+Principle: a tool call fails closed-but-recoverable — never nuke a multi-field call
+for one bad optional field, never pass a malformed arg to the underlying binary,
+and return the expected shape (+ example) over a raw passthrough. Tests cover each.
+(Separate workstream from reasoning — `fix(tools)`-scoped commits, cherry-pickable.)
+
 ## [2026-06-15] A/B verdict: give the real opt-out action (default is ON now)
 
 `verdictLine` told the operator to "keep ${flag} default OFF" on a tie/regression,
