@@ -2,6 +2,16 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-15] A/B verdict: give the real opt-out action (default is ON now)
+
+`verdictLine` told the operator to "keep ${flag} default OFF" on a tie/regression,
+but the flip made the replay flags default ON — so following that verdict without
+exporting `${flag}=0` leaves production replaying anyway, defeating the gate. Fixed
+the verdict to the actual action under default-ON: positive delta → the ON default
+is earned, keep it; tie/regression → "set ${flag}=0 to disable; inaction keeps
+replaying." Tests updated to assert `F=0` (and that the misleading "default OFF" is
+gone).
+
 ## [2026-06-15] OpenAI replay: drop reasoning on text-only turns (synthesized message can't pair)
 
 A text-only Responses turn was replayed as `[reasoning item, synthesized assistant

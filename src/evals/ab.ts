@@ -183,15 +183,19 @@ export const runAbComparison = async (opts: RunAbOptions): Promise<RunAbOutput> 
 // One-line, factual verdict. Deliberately conservative: ON must be STRICTLY
 // better on pass-rate to be called a candidate, mirroring the gate rule (flip a
 // default only on a measurable positive delta). Ties / regressions keep OFF.
+// Verdict + the correct OPERATOR ACTION. The replay flags default ON, so the
+// action to NOT replay is to set `${flag}=0` — saying "keep default OFF" would be
+// wrong (inaction keeps replaying). Positive delta → the ON default is earned;
+// tie/regression → opt out with `${flag}=0`.
 export const verdictLine = (r: AbResult): string => {
   const pp = (r.delta.passRate * 100).toFixed(1);
   if (r.delta.passRate > 0) {
-    return `replay ON improved pass-rate by ${pp}pp (${r.off.passCount}/${r.off.total} → ${r.on.passCount}/${r.on.total}) — candidate for flipping ${r.flag} default; confirm with a larger K and a live wire smoke before flipping.`;
+    return `replay ON improved pass-rate by ${pp}pp (${r.off.passCount}/${r.off.total} → ${r.on.passCount}/${r.on.total}) — the ON default for ${r.flag} is earned here; keep it (confirm with a larger K + a live wire smoke).`;
   }
   if (r.delta.passRate < 0) {
-    return `replay ON regressed pass-rate by ${pp}pp — keep ${r.flag} default OFF.`;
+    return `replay ON regressed pass-rate by ${pp}pp — ${r.flag} defaults ON, so set ${r.flag}=0 to disable it; inaction keeps replaying.`;
   }
-  return `no pass-rate delta (${r.on.passCount}/${r.on.total} both arms) — keep ${r.flag} default OFF (the #25 disposition); a longer chain or larger K may be needed to surface a signal.`;
+  return `no pass-rate delta (${r.on.passCount}/${r.on.total} both arms) — ${r.flag} defaults ON and isn't earning it on this eval; set ${r.flag}=0 to opt out (the #25 disposition), or use a harder / larger-K eval. Inaction keeps replaying.`;
 };
 
 // ---- CLI ----

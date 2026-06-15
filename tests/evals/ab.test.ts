@@ -101,7 +101,7 @@ describe('verdictLine', () => {
     stepsAvg: 10,
     durationAvg: 100,
   });
-  test('positive delta → candidate for flip', () => {
+  test('positive delta → the ON default is earned; keep it (no "flip", default is already ON)', () => {
     const v = verdictLine({
       flag: 'F',
       repeat: 10,
@@ -110,9 +110,10 @@ describe('verdictLine', () => {
       on: { ...armOf(0.8), arm: 'on' },
       delta: { passRate: 0.3, costAvg: 0, stepsAvg: 0 },
     });
-    expect(v).toContain('candidate for flipping F');
+    expect(v).toContain('earned');
+    expect(v).not.toContain('OFF'); // default is ON; must not tell the operator OFF
   });
-  test('zero delta → keep OFF (#25 disposition)', () => {
+  test('zero delta → opt out via F=0 (NOT "keep default OFF" — default is ON)', () => {
     const v = verdictLine({
       flag: 'F',
       repeat: 10,
@@ -121,9 +122,10 @@ describe('verdictLine', () => {
       on: { ...armOf(0.9), arm: 'on' },
       delta: { passRate: 0, costAvg: 0, stepsAvg: 0 },
     });
-    expect(v).toContain('keep F default OFF');
+    expect(v).toContain('F=0'); // the actual opt-out action
+    expect(v).not.toContain('default OFF'); // the stale, misleading phrasing
   });
-  test('regression → keep OFF', () => {
+  test('regression → set F=0 to disable (inaction keeps replaying)', () => {
     const v = verdictLine({
       flag: 'F',
       repeat: 10,
@@ -133,6 +135,7 @@ describe('verdictLine', () => {
       delta: { passRate: -0.3, costAvg: 0, stepsAvg: 0 },
     });
     expect(v).toContain('regressed');
+    expect(v).toContain('F=0');
   });
 });
 
