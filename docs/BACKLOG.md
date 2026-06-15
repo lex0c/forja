@@ -2,6 +2,32 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-15] Slash: withdraw /pin and the playbook-derived commands
+
+Trimmed the slash surface. `/pin` removed from the builtin registry —
+same withdraw-the-surface pattern as the tool changes: `pinCommand` + its test
+and the `context_pins` store/infra stay intact, only the registry entry goes.
+Consequence to flag: with `pin_context` already pulled from the model earlier
+today, NO surface now creates context pins — the store, the loop's pinnedBlock
+re-injection, and recap's pin-resume are retained but dormant. Fully retiring the
+pins subsystem (migrations, store, loop wiring) is a separate, larger call if the
+operator wants it; left intact for now.
+
+Playbook-derived slash commands (`/review`, `/explore`, `/perf`, `/audit` — one
+per def with a `slash:` field) no longer register: dropped the
+`buildPlaybookSlashCommands` wiring and the now-unused `subagents` param from
+`createBuiltinRegistry`. `buildPlaybookSlashCommands` + its test stay exported
+(not wired), mirroring the keep-the-module pattern. Playbooks remain reachable via
+`task_sync`/`task_async` and the model's playbook hint — which already states
+slash commands are operator-facing and never used for routing, so model behavior
+is unchanged; only the operator's `/review`-style shortcut is gone. Tests:
+`dispatch.test` 19 → 18 builtins (drop `pin`), help row-count 22 → 21, and the two
+playbook-slash-registration tests removed (with the now-unused `SubagentDefinition`
+import); `pin.test` / `playbook.test` untouched. `repl.ts` drops the arg. Spec
+note: `PLAYBOOKS.md §1.4` documents the playbook→slash auto-registration; code now
+diverges (surface withdrawn) — a spec PR can follow if the operator wants the doc
+aligned.
+
 ## [2026-06-15] Tools: withdraw pin_context from the model-facing surface
 
 A real session (gpt-5.4-mini) exposed a confusion magnet: asked "quais skills

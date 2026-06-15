@@ -2425,13 +2425,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // per REPL session — the registry is stable; cumulative is mutated
   // by startTurn's success branch and read by /cost.
   //
-  // Pass the discovered subagents in so every definition with a
-  // `slash:` field auto-registers as a slash command (`PLAYBOOKS.md`
-  // §1.4). The registry's duplicate-name guard surfaces conflicts
-  // between a builtin and a playbook author's chosen slash at boot
-  // — no chance of a typed `/<conflict>` ambiguously routing
-  // mid-session.
-  const slashRegistry = createBuiltinRegistry(subagents);
+  // Playbook `slash:` fields no longer auto-register as slash commands
+  // — that surface was withdrawn. Playbooks stay reachable via the
+  // model's task_* tools and the playbook hint; the operator just has
+  // no `/review`-style shortcut for them.
+  const slashRegistry = createBuiltinRegistry();
   const cumulative = { costUsd: 0, steps: 0, turns: 0 };
   // Single registry instance for the REPL's lifetime. /model uses it
   // for the lookup + factory; bootstrap built its own at boot for
