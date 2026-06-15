@@ -2,6 +2,33 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-15] Tool UX, round 2: three more empty-string-is-omitted gaps
+
+Swept the remaining builtin tools (bash/monitor, file/memory, task/todo/reminder,
+skill/context) for the same recoverable-arg-mistake classes. Most candidates were
+false positives (a `deep:''` boolean check already catches and reports it; a
+`process_output` `pattern` is the core required field, not an optional one) or
+already-actionable (status enums already list the valid set; `expires_in` already
+hints `"30m"/"2h"`). Three genuine cases, all the empty-string-is-omitted convention
+from round 1 (git/grep):
+
+1. **memory_write `expires:''` sank the whole write.** `''` is never a valid
+   `YYYY-MM-DD`, so it failed `validateFrontmatter` and discarded name/scope/type/
+   body too — an all-or-nothing trap over one optional field. A shared
+   `suppliedExpires` helper now collapses `''` to omitted at both read sites (the
+   validator and `buildFrontmatter`), so the write lands and the inferred +90d
+   default still applies. Non-string `expires` still rejected.
+2. **bash_output `grep:''` barred the call.** Empty meant "no filter" to the model
+   but earned `grep must be a non-empty string`. Now `''` degrades to the normal
+   cursor read; only a non-string `grep` is rejected, with an omit hint.
+3. **bash_background `label:''` was stored verbatim**, polluting the tray/audit row
+   with an empty name. Now `''` is omitted (stored null), matching omission; the
+   non-string reject above is unchanged.
+
+Deliberately NOT changed: case-insensitive todo-status normalization (silent
+coercion is worse than the already-actionable "must be one of: …" listing — the
+schema constrains it and the model recovers in one retry). Tests cover each fix.
+
 ## [2026-06-15] Tool UX: stop models from looping on recoverable arg mistakes
 
 A real gpt-5.x "explore the repo" trace wasted ~25 tool calls on recoverable arg

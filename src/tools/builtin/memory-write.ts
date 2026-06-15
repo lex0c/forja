@@ -530,6 +530,18 @@ export const memoryWriteTool: Tool<MemoryWriteInput, MemoryWriteOutput> = {
   },
 };
 
+// A model that means "no expiry" sometimes sends `expires: ""` rather
+// than omitting the field. An empty string is never a valid YYYY-MM-DD,
+// so without collapsing it here it would fail validateFrontmatter and
+// sink the WHOLE write (name/scope/type/body included) over an optional
+// field — the same all-or-nothing trap we removed elsewhere. Treat "" as
+// omitted (the empty-is-omitted convention the git/grep path uses), kept
+// as one helper so the validator and buildFrontmatter can't drift on what
+// counts as "supplied". A non-string `expires` is left intact so the type
+// guard in validateInputs still rejects it.
+const suppliedExpires = (expires: string | undefined): string | undefined =>
+  expires !== undefined && expires.length > 0 ? expires : undefined;
+
 // Build the on-disk frontmatter from validated inputs. Applies
 // the +90d default per spec §6.2; `user_explicit` never auto-
 // expires (operator opted in, so the lifecycle gc shouldn't
@@ -545,7 +557,7 @@ const buildFrontmatter = (
     type: args.type,
     source,
   };
-  let expires = args.expires;
+  let expires = suppliedExpires(args.expires);
   if (
     expires === undefined &&
     source === 'inferred' &&
@@ -588,6 +600,10 @@ const validateInputs = (args: MemoryWriteInput): ToolResult<MemoryWriteOutput> |
   if (args.expires !== undefined && typeof args.expires !== 'string') {
     return toolError(ERROR_CODES.invalidArg, 'expires must be a string when provided');
   }
+  // `expires: ""` is collapsed to omitted (see suppliedExpires) so an
+  // empty string never reaches the YYYY-MM-DD validator and sinks the
+  // whole write; a non-empty bad date still earns the actionable error.
+  const expires = suppliedExpires(args.expires);
   // Re-validate via the storage-layer validator. Catches name
   // shape, description length, expires shape, etc. — the same
   // rules the writer would enforce, surfaced as invalid_arg
@@ -598,7 +614,7 @@ const validateInputs = (args: MemoryWriteInput): ToolResult<MemoryWriteOutput> |
       description: args.description,
       type: args.type,
       source: args.source,
-      ...(args.expires !== undefined ? { expires: args.expires } : {}),
+      ...(expires !== undefined ? { expires } : {}),
     });
   } catch (err) {
     if (err instanceof FrontmatterError) {

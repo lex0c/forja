@@ -719,6 +719,25 @@ describe('memory_write tool — defaults and lookups', () => {
     expect(onDisk).toContain('expires: 2030-01-01');
   });
 
+  test('empty expires string is treated as omitted (write survives, +90d default applies)', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const reg = createMemoryRegistry({ roots });
+    const ctx = makeCtx({
+      memoryRegistry: reg,
+      confirmMemoryWrite: async () => 'yes',
+    });
+    // A model that means "no expiry" sometimes sends expires:'' instead of
+    // omitting it. '' is never a valid YYYY-MM-DD, so without the collapse
+    // it would fail validateFrontmatter and sink the WHOLE write over one
+    // optional field. It must instead behave exactly like omission — the
+    // inferred + project_local +90d default still applies.
+    const result = await memoryWriteTool.execute(validInput({ expires: '' }), ctx);
+    if (isToolError(result)) throw new Error(`unexpected: ${result.error_message}`);
+    const onDisk = readFileSync(result.path as string, 'utf-8');
+    expect(onDisk).toMatch(/expires: \d{4}-\d{2}-\d{2}/);
+  });
+
   test('user-scope writes to user root, no project files created', async () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);

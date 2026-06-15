@@ -67,6 +67,17 @@ describe('bash_background tool', () => {
     await waitForExit(r.process_id);
   });
 
+  test('empty-string label is treated as omitted (stored as null, not "")', async () => {
+    // A model passing label:'' means "no label", not a meaningful empty
+    // name; storing '' would only pollute the tray / audit row. It must
+    // behave exactly like omission.
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await bashBackgroundTool.execute({ command: 'true', label: '' }, ctx);
+    if (isToolError(r)) throw new Error('expected success');
+    expect(r.label).toBeNull();
+    await waitForExit(r.process_id);
+  });
+
   test('returns clean error when bgManager missing from ctx', async () => {
     const ctx = makeCtx({ sessionId });
     const r = await bashBackgroundTool.execute({ command: 'true' }, ctx);

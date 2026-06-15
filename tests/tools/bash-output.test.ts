@@ -222,10 +222,30 @@ describe('bash_output tool', () => {
       expect(r.grep_matches).toBe(0);
     });
 
-    test('empty grep string is rejected', async () => {
+    test('empty grep string is treated as omitted (falls through to the cursor read)', async () => {
+      // A model that means "no filter" sometimes sends grep:'' — that must
+      // not bar the whole call over an optional field. '' degrades to the
+      // normal cursor read: full window, cursor advances, no grep_matches.
+      const spawned = await mgr.spawn({ command: 'echo "line FAIL one"; echo "line ok"' });
+      await waitForExit(spawned.id);
       const ctx = makeCtx({ sessionId, bgManager: mgr });
-      const r = await bashOutputTool.execute({ process_id: 'whatever', grep: '' }, ctx);
+      const r = await bashOutputTool.execute({ process_id: spawned.id, grep: '' }, ctx);
+      if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
+      expect(r.stdout).toContain('line FAIL one');
+      expect(r.stdout).toContain('line ok');
+      expect(r.stdout_cursor).toBeGreaterThan(0); // cursor read advances; grep does not
+      expect(r.grep_matches).toBeUndefined(); // not grep mode
+    });
+
+    test('non-string grep is rejected with an omit hint', async () => {
+      const ctx = makeCtx({ sessionId, bgManager: mgr });
+      const r = await bashOutputTool.execute(
+        { process_id: 'whatever', grep: 123 as unknown as string },
+        ctx,
+      );
       expect(isToolError(r)).toBe(true);
+      if (!isToolError(r)) throw new Error('expected error');
+      expect(r.error_message).toContain('omit it');
     });
 
     test('caps matches and flags truncation (manager-level, exercises the streaming early-stop)', async () => {

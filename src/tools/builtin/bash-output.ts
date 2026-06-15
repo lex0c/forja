@@ -155,15 +155,23 @@ export const bashOutputTool: Tool<BashOutputInput, BashOutputOutput> = {
         return toolError(ERROR_CODES.invalidArg, 'max_bytes must be a positive integer (>=1)');
       }
     }
-    if (args.grep !== undefined && (typeof args.grep !== 'string' || args.grep.length === 0)) {
-      return toolError(ERROR_CODES.invalidArg, 'grep must be a non-empty string');
+    if (args.grep !== undefined && typeof args.grep !== 'string') {
+      return toolError(
+        ERROR_CODES.invalidArg,
+        'grep must be a string (omit it to read the cursor window instead of filtering)',
+      );
     }
+    // `grep: ""` means "no filter" to some models — treat empty as omitted
+    // and fall through to the normal cursor read rather than barring the
+    // whole call over an optional field (empty-is-omitted, as git/grep do).
+    const grepPattern =
+      typeof args.grep === 'string' && args.grep.length > 0 ? args.grep : undefined;
     try {
       // Grep mode: scan the whole log, return only matching lines. No
       // cursor window, no advance — the cheap path for huge outputs.
-      if (args.grep !== undefined) {
+      if (grepPattern !== undefined) {
         const g = await ctx.bgManager.grepOutput(args.process_id, {
-          pattern: args.grep,
+          pattern: grepPattern,
           ...(args.grep_ignore_case === true ? { ignoreCase: true } : {}),
         });
         return {
