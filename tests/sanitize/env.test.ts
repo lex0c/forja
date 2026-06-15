@@ -509,4 +509,22 @@ describe('scrubEnv — keep allowlist (subagent provider keys)', () => {
     expect(out.ANTHROPIC_API_KEY).toBeUndefined();
     expect(out.PATH).toBe('/usr/bin');
   });
+
+  test('preserves FORJA_PROFILE — subagent profile inheritance depends on it', () => {
+    // The subagent spawn (subagents/spawn-factory.ts) passes
+    // scrubEnv(process.env, { keep: PROVIDER_API_KEY_VARS }) as the child's
+    // env. FORJA_PROFILE is NOT credential-shaped, so it survives WITHOUT being
+    // in `keep` — and it MUST, or the child resolves defaultDbPath() in the
+    // CANONICAL namespace and can't find the session row the parent inserted in
+    // forja-<profile>/sessions.db. A future SCRUB_PATTERN like /_PROFILE$/ or
+    // /^FORJA_/ would silently break every subagent launched from a profiled
+    // run; this pins the invariant the whole profile-propagation chain rests on.
+    const out = scrubEnv(
+      { FORJA_PROFILE: 'dev', ANTHROPIC_API_KEY: 'k', PATH: '/usr/bin' },
+      { keep: PROVIDER_API_KEY_VARS },
+    );
+    expect(out.FORJA_PROFILE).toBe('dev');
+    // Survives even WITHOUT keep (broker / bash default path) — not a credential.
+    expect(scrubEnv({ FORJA_PROFILE: 'dev' }).FORJA_PROFILE).toBe('dev');
+  });
 });

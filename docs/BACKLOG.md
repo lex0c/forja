@@ -221,6 +221,21 @@ unchanged). Shakeout in a real git repo (subdir launch): write to
 `../.forja/x` → deny (foreign), `../.forja-dev/x` read → pass. typecheck + lint +
 protected_paths (120) green.
 
+Eleventh item (investigated, NOT a bug — first review item that didn't hold). A
+review flagged that the subagent spawn `scrubEnv(process.env, { keep:
+PROVIDER_API_KEY_VARS })` drops FORJA_PROFILE, so children would run in the
+canonical namespace and miss the parent's session row. Measured: `scrubEnv` does
+NOT drop FORJA_PROFILE — `_PROFILE` matches no SCRUB_PATTERN, so it passes
+through (no `keep` needed), and the child resolves `defaultDbPath()` (env-driven,
+`subagent-child.ts` takes no dbPath in production — comment: "defaultDbPath() so
+child + parent target the same file") → `forja-<profile>/sessions.db`, same file
+the parent wrote. The broker worker needed an explicit passthrough only because
+bwrap `--clearenv` strips env at the kernel boundary; the subagent is a plain
+`Bun.spawn({ env: scrubEnv(...) })` that preserves it. No code change — but added
+a regression test pinning "scrubEnv preserves FORJA_PROFILE" (the invariant the
+whole profile-propagation chain rests on), so a future `/_PROFILE$/`-style scrub
+pattern can't silently break subagents under a profile.
+
 ## [2026-06-15] Prompt: drop the model id from the # Environment block
 
 The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,
