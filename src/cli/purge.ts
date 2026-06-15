@@ -43,13 +43,14 @@ import {
   unlinkSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { activeProfile, appDirName, projectDirName } from '../config/app-namespace.ts';
+import { appDirName, projectDirName } from '../config/app-namespace.ts';
 import { resolveRepoRoot } from '../memory/paths.ts';
 import { ensureInstallId } from '../permissions/install_id.ts';
 import { closeDb, migrate, openDb } from '../storage/index.ts';
 import type { DB } from '../storage/index.ts';
 import { defaultDbPath } from '../storage/index.ts';
 import { insertPurgeEvent } from '../storage/repos/purge-events.ts';
+import { forjaCommand } from './forja-command.ts';
 import { VERSION } from './version.ts';
 
 // The five artifacts `forja init` scaffolds. Their presence (any
@@ -692,22 +693,13 @@ export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
   // Dry-run path
   // ────────────────────────────────────────────────────────────
   if (!force) {
-    // Build the suggested command, preserving the operator's --no-audit flag
-    // AND the active profile. Two reasons the suggestion must carry the
-    // operator's switches verbatim:
-    //   1. --no-audit: an operator who ran `forja purge --no-audit` (typically
-    //      because the DB is broken — the exact emergency the flag exists for)
-    //      must not be handed a bare `--force` that re-hits the audit gate and
-    //      aborts the emergency purge.
-    //   2. --profile: a profiled run (`forja --profile dev purge`) scoped the
-    //      dry-run to `.forja-<profile>/`. A bare `forja purge --force` would
-    //      drop the profile and operate on the REAL canonical `.forja/` — a
-    //      different namespace than the one just previewed, risking a purge of
-    //      the operator's real project state. Re-prefix the profile so the
-    //      suggested command hits the SAME namespace the report described.
-    const profile = activeProfile();
-    const profileFlag = profile !== null ? `--profile ${profile} ` : '';
-    const command = `forja ${profileFlag}purge --force${noAudit ? ' --no-audit' : ''}`;
+    // Suggested command must be directly executable AND hit the SAME namespace
+    // the dry-run reported. `forjaCommand` re-prefixes the active `--profile`
+    // (else a bare `forja purge --force` would purge the canonical `.forja/`,
+    // not the `.forja-<profile>/` just previewed). `--no-audit` is preserved
+    // because an operator who ran it (DB broken — the emergency the flag exists
+    // for) must not be handed a `--force` that re-hits the audit gate.
+    const command = forjaCommand(`purge --force${noAudit ? ' --no-audit' : ''}`);
     const report: DryRunReport = {
       mode: 'dry-run',
       repoRoot,

@@ -101,6 +101,21 @@ suggested command (human + JSON) now re-prefixes `--profile <name>` whenever a
 profile is active, so it hits the same namespace the report described.
 Regression test asserts scope AND command both stay profiled.
 
+Fourth follow-up (closing the class via a focused self-audit): enumerated every
+consumer of the profile helpers and every advertised `forja …` command string.
+The guardrail/protection + path resolvers were all confirmed correct; the
+remaining instances of the "advertised command drops the profile" footgun were
+`doctor`'s 5 remediations (`permission verify` / `rotate-chain` / `inspect` /
+`seal-verify` / `seal-now` — the mutating ones would have rotated/sealed the
+REAL chain from a profiled diagnosis) and `permission-inspect`'s "clear after
+inspection" hint. Extracted a shared `forjaCommand(rest)` helper
+(`src/cli/forja-command.ts`) that re-prefixes the active `--profile`, refactored
+purge onto it, and applied it to all six remaining strings. Unit-tested the
+helper (no profile ⇒ byte-identical bare command; profile ⇒ prefixed). This
+closes the "a profile silently drops/redirects a real-namespace guard" category
+end-to-end (enterprise layer, project escalate list, purge + doctor + inspect
+commands).
+
 ## [2026-06-15] Prompt: drop the model id from the # Environment block
 
 The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,

@@ -48,6 +48,7 @@ import type { SandboxProfile } from '../permissions/sandbox-plan.ts';
 import type { SealPolicy } from '../permissions/types.ts';
 import { closeDb, defaultDbPath, openDb } from '../storage/index.ts';
 import { type DoctorCheckCache, getSharedDoctorCache, withDoctorCache } from './doctor-cache.ts';
+import { forjaCommand } from './forja-command.ts';
 
 export type DoctorStatus = 'ok' | 'warn' | 'fail';
 
@@ -489,7 +490,7 @@ const chainCheck = (options: ChainCheckOptions): DoctorCheck => {
       // doctor just flagged. The honest framing is "run verify
       // — it will migrate the schema if needed AND verify the
       // chain".
-      remediation: `check ${options.dbPath} for corruption / permissions, OR run \`forja permission verify\` which migrates the schema to the current spec and re-verifies the chain`,
+      remediation: `check ${options.dbPath} for corruption / permissions, OR run \`${forjaCommand('permission verify')}\` which migrates the schema to the current spec and re-verifies the chain`,
     };
   } finally {
     if (db !== null) {
@@ -508,8 +509,7 @@ const chainCheck = (options: ChainCheckOptions): DoctorCheck => {
       name: 'hash_chain',
       status: 'fail',
       detail: `BROKEN at seq ${result.brokenAt}: ${result.reason}`,
-      remediation:
-        'run `forja permission verify` for full diagnostic, or `forja permission rotate-chain --reason <text>` to archive the broken segment',
+      remediation: `run \`${forjaCommand('permission verify')}\` for full diagnostic, or \`${forjaCommand('permission rotate-chain --reason <text>')}\` to archive the broken segment`,
     };
   }
 
@@ -534,7 +534,7 @@ const chainCheck = (options: ChainCheckOptions): DoctorCheck => {
       name: 'hash_chain',
       status: 'warn',
       detail: `${baseDetail}${rotationDetail}, quarantined)`,
-      remediation: `run \`forja permission inspect ${result.current_rotation_id}\` to audit the archived segment`,
+      remediation: `run \`${forjaCommand(`permission inspect ${result.current_rotation_id}`)}\` to audit the archived segment`,
     };
   }
 
@@ -664,7 +664,7 @@ const sealingCheck = (options: SealingCheckOptions): DoctorCheck => {
         name: 'sealing',
         status: 'fail',
         detail: `seal file corrupted at ${sealConfig.path}: ${(e as Error).message}`,
-        remediation: 'inspect the file; run `forja permission seal-verify` for chain cross-check',
+        remediation: `inspect the file; run \`${forjaCommand('permission seal-verify')}\` for chain cross-check`,
       };
     }
     if (entries.length === 0) {
@@ -672,8 +672,7 @@ const sealingCheck = (options: SealingCheckOptions): DoctorCheck => {
         name: 'sealing',
         status: 'warn',
         detail: `${sealConfig.mode} at ${sealConfig.path}: configured but no entries yet`,
-        remediation:
-          'the engine seals automatically per interval; run `forja permission seal-now` to force one',
+        remediation: `the engine seals automatically per interval; run \`${forjaCommand('permission seal-now')}\` to force one`,
       };
     }
     const last = entries[entries.length - 1];
