@@ -308,15 +308,15 @@ describe('parsePolicy — seal section (§7.3, slice 57)', () => {
   });
 
   test('mode=worm-file with path parses cleanly', () => {
-    const p = parsePolicy({ seal: { mode: 'worm-file', path: '/var/log/agent/seal.log' } });
-    expect(p.seal).toEqual({ mode: 'worm-file', path: '/var/log/agent/seal.log' });
+    const p = parsePolicy({ seal: { mode: 'worm-file', path: '/var/log/forja/seal.log' } });
+    expect(p.seal).toEqual({ mode: 'worm-file', path: '/var/log/forja/seal.log' });
   });
 
   test('all optional fields propagate', () => {
     const p = parsePolicy({
       seal: {
         mode: 'worm-file',
-        path: '/var/log/agent/seal.log',
+        path: '/var/log/forja/seal.log',
         interval_decisions: 50,
         interval_seconds: 1800,
         on_failure: 'refuse',
@@ -324,7 +324,7 @@ describe('parsePolicy — seal section (§7.3, slice 57)', () => {
     });
     expect(p.seal).toEqual({
       mode: 'worm-file',
-      path: '/var/log/agent/seal.log',
+      path: '/var/log/forja/seal.log',
       interval_decisions: 50,
       interval_seconds: 1800,
       on_failure: 'refuse',

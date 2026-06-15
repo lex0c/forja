@@ -437,7 +437,7 @@ describe('runDoctor — sealing check (§13.3 / slice 60)', () => {
   });
 
   test('mode=worm-file with empty seal file → warn "no entries yet"', async () => {
-    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/agent/seal.log');
+    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/forja/seal.log');
     const out = captured();
     const code = await runDoctor({
       env,
@@ -457,7 +457,7 @@ describe('runDoctor — sealing check (§13.3 / slice 60)', () => {
   });
 
   test('mode=worm-file with N entries → ok with relative-time + count', async () => {
-    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/agent/seal.log');
+    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/forja/seal.log');
     const entries: SealEntry[] = [
       { seq: 1, ts: 1_000_000_000_000, hash: 'sha256:a' },
       { seq: 50, ts: 1_000_000_300_000, hash: 'sha256:b' }, // 5 minutes after start
@@ -481,11 +481,11 @@ describe('runDoctor — sealing check (§13.3 / slice 60)', () => {
     const text = out.lines.join('');
     expect(text).toContain('3 entries');
     expect(text).toContain('last 4h ago');
-    expect(text).toContain('worm-file at /var/log/agent/seal.log');
+    expect(text).toContain('worm-file at /var/log/forja/seal.log');
   });
 
   test('mode=worm-file with single entry → singular "1 entry"', async () => {
-    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/agent/seal.log');
+    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/forja/seal.log');
     const out = captured();
     const code = await runDoctor({
       env,
@@ -506,7 +506,7 @@ describe('runDoctor — sealing check (§13.3 / slice 60)', () => {
   });
 
   test('corrupted seal file (list throws) → fail with remediation', async () => {
-    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/agent/seal.log');
+    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/forja/seal.log');
     const factory = (): SealStore => ({
       append: () => ({ ok: true }),
       list: () => {
@@ -560,7 +560,7 @@ describe('runDoctor — sealing check (§13.3 / slice 60)', () => {
   });
 
   test('--json: sealing check is included with structured fields', async () => {
-    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/agent/seal.log');
+    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/forja/seal.log');
     const out = captured();
     await runDoctor({
       env,

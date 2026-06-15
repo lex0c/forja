@@ -1248,7 +1248,7 @@ describe('bootstrapPermissionEngine — §18 telemetry wire-up (slice 71)', () =
           tools: {},
           seal: {
             mode: 'worm-file',
-            path: '/var/log/agent/seal.log',
+            path: '/var/log/forja/seal.log',
             interval_decisions: 1,
             interval_seconds: 0,
             on_failure: 'degrade',
@@ -1269,7 +1269,7 @@ describe('bootstrapPermissionEngine — §18 telemetry wire-up (slice 71)', () =
       throw new Error('expected sealing.failure event');
     }
     expect(event.mode).toBe('worm-file');
-    expect(event.path).toBe('/var/log/agent/seal.log');
+    expect(event.path).toBe('/var/log/forja/seal.log');
     expect(event.reason).toContain('chattr +a failed');
     expect(event.on_failure).toBe('degrade');
     expect(event.ts).toBe(99999);

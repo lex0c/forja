@@ -105,7 +105,7 @@ describe('createJsonLinesTelemetrySink (slice 77)', () => {
         kind: 'sealing.failure',
         ts: 3,
         mode: 'worm-file',
-        path: '/var/log/agent/seal.log',
+        path: '/var/log/forja/seal.log',
         reason: 'chattr failed',
         on_failure: 'degrade',
       } as SealingFailureEvent,

@@ -43,7 +43,7 @@ collect tool_uses ──▶ any tool with metadata.writes? ──no──▶ run
    │                   manager.snapshot({ stepId, hadBash, stepN })
    │                       │
    │                       ├─ working tree == prior snapshot? ─▶ no-op (returns null)
-   │                       └─ else: commit-tree on refs/agent/checkpoints/<session>,
+   │                       └─ else: commit-tree on refs/forja/checkpoints/<session>,
    │                                insert a `checkpoints` row, emit checkpoint_created
    ▼
 run tools (invokeTool)
@@ -73,7 +73,7 @@ with several writes; one snapshot before the first write keeps the rollback unit
 coherent. Reverting half a refactor would leave inconsistent state.
 
 **Private ref, not stash.** Each session's chain head lives at
-`refs/agent/checkpoints/<session_id>`, built with `git commit-tree` (not
+`refs/forja/checkpoints/<session_id>`, built with `git commit-tree` (not
 `git stash`). Reasons: stash is a single global stack (`refs/stash`) we'd
 pollute; and we chain each snapshot onto the prior one so the whole session
 history stays reachable from one ref and survives `git gc`. Commit message:
@@ -124,7 +124,7 @@ firing *before* any side effect:
    collides with a checkpoint path), save it first:
    - normal case → `git stash push -u` (recover with `git stash pop`);
    - unborn HEAD, or ignored↔checkpoint collision → a preservation commit under
-     `refs/agent/restore-saved/<ts>-<uuid>` (recover with `git read-tree --reset
+     `refs/forja/restore-saved/<ts>-<uuid>` (recover with `git read-tree --reset
      -u <ref>`). The two shapes are reported distinctly so the CLI prints the
      right recovery hint.
 4. **Apply** `read-tree --reset -u <sha>`, then re-sync the index to HEAD so

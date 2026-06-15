@@ -15,12 +15,12 @@ describe('capabilityCovers — kind matching', () => {
   test('different kinds never cover', () => {
     expect(capabilityCovers(cap('read-fs:**'), cap('write-fs:foo'))).toBe(false);
     expect(capabilityCovers(cap('exec:shell'), cap('read-fs:foo'))).toBe(false);
-    expect(capabilityCovers(cap('env-mutate'), cap('agent-mutate'))).toBe(false);
+    expect(capabilityCovers(cap('env-mutate'), cap('forja-mutate'))).toBe(false);
   });
 });
 
 describe('capabilityCovers — scope-less kinds', () => {
-  test.each(['env-mutate', 'agent-mutate', 'host-passthrough'])('%s covers itself', (kind) => {
+  test.each(['env-mutate', 'forja-mutate', 'host-passthrough'])('%s covers itself', (kind) => {
     expect(capabilityCovers(cap(kind), cap(kind))).toBe(true);
   });
 });

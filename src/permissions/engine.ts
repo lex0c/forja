@@ -1357,7 +1357,7 @@ const capRepoConfined = (cap: Capability, cwd: string, home: string): boolean =>
       return true;
     }
     default:
-      // net-egress, net-ingress, secret-access, env-mutate, agent-mutate,
+      // net-egress, net-ingress, secret-access, env-mutate, forja-mutate,
       // host-passthrough → never repo-confined.
       return false;
   }

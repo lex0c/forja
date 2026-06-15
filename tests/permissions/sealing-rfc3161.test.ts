@@ -280,30 +280,30 @@ describe('createRfc3161TsaSealer — path normalization preserves filesystem roo
     expect(calls.writeBinaryArg).toBe('/1-100.tsr');
   });
 
-  test('opts.path = "/var/lib/agent/" strips trailing slash (regression)', () => {
+  test('opts.path = "/var/lib/forja/" strips trailing slash (regression)', () => {
     const { calls, seams } = captureSeams();
     const sealer = createRfc3161TsaSealer({
-      path: '/var/lib/agent/',
+      path: '/var/lib/forja/',
       endpoint: 'https://tsa.example.com',
       submit: () => ({ ok: true, tsr: new Uint8Array([0x01]) }),
       ...seams,
     });
     sealer.append({ seq: 1, ts: 100, hash: ZERO_HASH });
-    expect(calls.ensureDirArg).toBe('/var/lib/agent');
-    expect(calls.writeBinaryArg).toBe('/var/lib/agent/1-100.tsr');
+    expect(calls.ensureDirArg).toBe('/var/lib/forja');
+    expect(calls.writeBinaryArg).toBe('/var/lib/forja/1-100.tsr');
   });
 
   test('opts.path with no trailing slash is unchanged (regression)', () => {
     const { calls, seams } = captureSeams();
     const sealer = createRfc3161TsaSealer({
-      path: '/var/lib/agent',
+      path: '/var/lib/forja',
       endpoint: 'https://tsa.example.com',
       submit: () => ({ ok: true, tsr: new Uint8Array([0x01]) }),
       ...seams,
     });
     sealer.append({ seq: 1, ts: 100, hash: ZERO_HASH });
-    expect(calls.ensureDirArg).toBe('/var/lib/agent');
-    expect(calls.writeBinaryArg).toBe('/var/lib/agent/1-100.tsr');
+    expect(calls.ensureDirArg).toBe('/var/lib/forja');
+    expect(calls.writeBinaryArg).toBe('/var/lib/forja/1-100.tsr');
   });
 });
 

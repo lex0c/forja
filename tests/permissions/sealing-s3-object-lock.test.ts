@@ -443,10 +443,10 @@ describe('createS3ObjectLockSealer — path normalization preserves filesystem r
     expect(calls.appendArg).toBe('/seal.log');
   });
 
-  test('opts.path = "/var/lib/agent/" strips trailing slash (regression)', () => {
+  test('opts.path = "/var/lib/forja/" strips trailing slash (regression)', () => {
     const { calls, seams } = captureSeams();
     const sealer = createS3ObjectLockSealer({
-      path: '/var/lib/agent/',
+      path: '/var/lib/forja/',
       bucket: 'b',
       retentionDays: 1,
       submit: () => ({ ok: true }),
@@ -454,14 +454,14 @@ describe('createS3ObjectLockSealer — path normalization preserves filesystem r
       ...seams,
     });
     sealer.append({ seq: 1, ts: 100, hash: SHA256_HASH });
-    expect(calls.ensureDirArg).toBe('/var/lib/agent');
-    expect(calls.appendArg).toBe('/var/lib/agent/seal.log');
+    expect(calls.ensureDirArg).toBe('/var/lib/forja');
+    expect(calls.appendArg).toBe('/var/lib/forja/seal.log');
   });
 
   test('opts.path with no trailing slash is unchanged (regression)', () => {
     const { calls, seams } = captureSeams();
     const sealer = createS3ObjectLockSealer({
-      path: '/var/lib/agent',
+      path: '/var/lib/forja',
       bucket: 'b',
       retentionDays: 1,
       submit: () => ({ ok: true }),
@@ -469,7 +469,7 @@ describe('createS3ObjectLockSealer — path normalization preserves filesystem r
       ...seams,
     });
     sealer.append({ seq: 1, ts: 100, hash: SHA256_HASH });
-    expect(calls.ensureDirArg).toBe('/var/lib/agent');
-    expect(calls.appendArg).toBe('/var/lib/agent/seal.log');
+    expect(calls.ensureDirArg).toBe('/var/lib/forja');
+    expect(calls.appendArg).toBe('/var/lib/forja/seal.log');
   });
 });

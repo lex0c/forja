@@ -85,7 +85,7 @@ const DANGEROUS_KINDS = new Set<Capability['kind']>([
   'delete-fs',
   'git-write',
   'env-mutate',
-  'agent-mutate',
+  'forja-mutate',
 ]);
 
 // Substrings flagged as lethal patterns. Match is plain substring —
@@ -164,7 +164,7 @@ export const RECENT_ERRORS_THRESHOLD = 3;
 // (emitted by `cmdNpmLike`, `cmdPip`, `cmdMake`, `cmdCargo`, and
 // the conservative-fallback for unknown commands) doesn't
 // qualify under `capability_risk` (which gates on
-// delete-fs / git-write / env-mutate / agent-mutate), so without
+// delete-fs / git-write / env-mutate / forja-mutate), so without
 // a dedicated weight `npm install` / `pip install` / `cargo build`
 // would resolve to ~0.10 (just medium confidence) and silently
 // auto-allow — every one of those commands is a supply-chain

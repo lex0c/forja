@@ -12,7 +12,7 @@
 //   net-ingress                     → port-pattern
 //   secret-access                   → identity (store name)
 //   git-write                       → identity (repo name)
-//   env-mutate / agent-mutate /
+//   env-mutate / forja-mutate /
 //   host-passthrough                → no scope (kind alone is the
 //                                       capability)
 //
@@ -36,7 +36,7 @@ export type CapabilityKind =
   | 'secret-access'
   | 'git-write'
   | 'env-mutate'
-  | 'agent-mutate'
+  | 'forja-mutate'
   | 'host-passthrough';
 
 // Whether the kind carries a scope component. Scope-less kinds
@@ -44,7 +44,7 @@ export type CapabilityKind =
 // rest require a scope (`read-fs:src/**`, `exec:shell`).
 const KINDS_WITHOUT_SCOPE: ReadonlySet<CapabilityKind> = new Set<CapabilityKind>([
   'env-mutate',
-  'agent-mutate',
+  'forja-mutate',
   'host-passthrough',
 ]);
 
@@ -58,7 +58,7 @@ const ALL_KINDS: ReadonlySet<string> = new Set<CapabilityKind>([
   'secret-access',
   'git-write',
   'env-mutate',
-  'agent-mutate',
+  'forja-mutate',
   'host-passthrough',
 ]);
 
@@ -187,7 +187,7 @@ export const sortCapabilities = (caps: readonly Capability[]): Capability[] => {
 // conformance case):
 //
 //   1. Different kinds → never. exec doesn't cover read-fs, etc.
-//   2. Scope-less kinds (env-mutate, agent-mutate, host-passthrough):
+//   2. Scope-less kinds (env-mutate, forja-mutate, host-passthrough):
 //      identity match (the kind alone IS the capability).
 //   3. exec hierarchy: `exec:arbitrary` covers every other class
 //      (`shell`, `python`, `node`); within the non-arbitrary set,
@@ -553,7 +553,7 @@ export const deriveParentCapabilities = (policy: Policy): Capability[] => {
   // reflect that: without this branch a bypass-mode parent derives an EMPTY
   // envelope (bypass never writes the allow rules the loop keys on) and every
   // capability a subagent declares would escalate. Tool-derived kinds only —
-  // secret-access / host-passthrough / agent-mutate aren't in any tool
+  // secret-access / host-passthrough / forja-mutate aren't in any tool
   // footprint, so they stay opt-in even under bypass (they need a profile or
   // sentinel that merely running tools doesn't imply).
   const bypass = policy.defaults.mode === 'bypass';
@@ -600,5 +600,5 @@ export const secretAccess = (store: string): Capability => ({
 });
 export const gitWrite = (repo: string): Capability => ({ kind: 'git-write', scope: repo });
 export const envMutate = (): Capability => ({ kind: 'env-mutate', scope: null });
-export const agentMutate = (): Capability => ({ kind: 'agent-mutate', scope: null });
+export const forjaMutate = (): Capability => ({ kind: 'forja-mutate', scope: null });
 export const hostPassthrough = (): Capability => ({ kind: 'host-passthrough', scope: null });

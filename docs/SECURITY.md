@@ -190,7 +190,7 @@ A `Capability` is a typed `{kind, scope}` pair:
 | `git-write` | `/work/proj/.git` | git commit, git push, git reset |
 | `secret-access` | `~/.aws`, `~/.ssh` | (engine-internal, used by sandbox planner) |
 | `env-mutate` | `PATH`, `HOME` | (reserved, for env-modifying tools) |
-| `agent-mutate` | `*` | (reserved) |
+| `forja-mutate` | `*` | (reserved) |
 | `host-passthrough` | `*` | (required for `host` sandbox profile) |
 
 Capabilities are the universal language for "what does this tool want to do". Resolvers emit them; policy rules match against them; the sandbox planner picks a profile that admits them; the audit row preserves them.
@@ -247,7 +247,7 @@ Eleven features, each with a fixed weight in `RISK_SCORE_WEIGHTS` (`src/permissi
 
 | Feature | Weight | Fires when |
 |---|---:|---|
-| `capability_risk` | 0.40 | any cap kind in `{delete-fs, git-write, env-mutate, agent-mutate}` |
+| `capability_risk` | 0.40 | any cap kind in `{delete-fs, git-write, env-mutate, forja-mutate}` |
 | `blocklist_command` | 0.30 | bash command contains a known-bad substring (`rm -rf`, `curl \| sh`, ...) |
 | `confidence_low` | 0.30 | resolver returned `confidence: 'low'` |
 | `untrusted_egress` | 0.25 | `net-egress:<host>` with host outside `trustedHosts` |
@@ -436,7 +436,7 @@ cwd-rw:      {read-fs, write-fs, delete-fs, exec, git-write}
 cwd-rw-net:  {read-fs, write-fs, delete-fs, exec, git-write, net-egress}
 home-rw:     {read-fs, write-fs, delete-fs, exec, git-write, secret-access}
 host:        {read-fs, write-fs, delete-fs, exec, git-write, net-egress,
-              net-ingress, secret-access, env-mutate, agent-mutate,
+              net-ingress, secret-access, env-mutate, forja-mutate,
               host-passthrough}
 ```
 

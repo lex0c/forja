@@ -57,7 +57,7 @@ describe('computeRiskScore — capability_risk feature', () => {
     ['delete-fs', deleteFs('/tmp/x')],
     ['git-write', gitWrite('/work/proj')],
     ['env-mutate', { kind: 'env-mutate', scope: null }],
-    ['agent-mutate', { kind: 'agent-mutate', scope: null }],
+    ['forja-mutate', { kind: 'forja-mutate', scope: null }],
   ])('%s contributes capability_risk weight', (_label, cap) => {
     const r = computeRiskScore(baseInput({ capabilities: [cap] }));
     expect(r.components.capability_risk).toBe(RISK_SCORE_WEIGHTS.capability_risk);

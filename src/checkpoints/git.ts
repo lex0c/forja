@@ -207,10 +207,10 @@ export const resolveRef = async (cwd: string, ref: string): Promise<string | nul
 };
 
 // Conventional ref name for a session's checkpoint chain head.
-// `refs/agent/checkpoints/<session>` puts it in a namespace ignored by
+// `refs/forja/checkpoints/<session>` puts it in a namespace ignored by
 // `git log` and friends — invisible to the user's normal git workflow,
 // per CHECKPOINTS §2.4.
-export const sessionRef = (sessionId: string): string => `refs/agent/checkpoints/${sessionId}`;
+export const sessionRef = (sessionId: string): string => `refs/forja/checkpoints/${sessionId}`;
 
 // Namespace for working-tree preservation commits created when
 // restore() can't use git stash. Two cases route here:
@@ -223,7 +223,7 @@ export const sessionRef = (sessionId: string): string => `refs/agent/checkpoints
 // Suffix is `<timestampMs>-<8-char-uuid>`: the timestamp drives
 // the lazy retention sweep (drop refs older than cutoff), the UUID
 // slice avoids collisions when two restores land in the same ms.
-export const RESTORE_SAVED_REF_PREFIX = 'refs/agent/restore-saved/';
+export const RESTORE_SAVED_REF_PREFIX = 'refs/forja/restore-saved/';
 
 const restoreSavedRefName = (): string => {
   const uuid = crypto.randomUUID().replace(/-/g, '').slice(0, 8);
@@ -248,7 +248,7 @@ export interface SnapshotInput {
   cwd: string;
   sessionId: string;
   // Step id this snapshot belongs to. Embedded in the commit message so
-  // a human running `git log refs/agent/checkpoints/<session>` sees the
+  // a human running `git log refs/forja/checkpoints/<session>` sees the
   // chain annotated with the originating step.
   stepId: string;
   // Absolute timestamp baked into the commit message for human grep.
@@ -344,7 +344,7 @@ export const snapshot = async (input: SnapshotInput): Promise<SnapshotResult> =>
     // `.env`, `.aws/credentials`, `*.pem`, `id_rsa*` that the
     // operator has in cwd. Without filtering, these flow into loose
     // git objects under `.git/objects/` reachable via
-    // `refs/agent/checkpoints/<session>/`. The objects stay even if
+    // `refs/forja/checkpoints/<session>/`. The objects stay even if
     // the ref is later deleted (until `git gc` fires; `git log
     // --all` and `git fsck` find them; repo backups capture them).
     //
@@ -457,7 +457,7 @@ export interface RestoreResult {
   // Recovery handle — present iff stashed=true. Two shapes:
   //   - `stash@{0}` when the regular `git stash push` path ran
   //     (born HEAD). Recover with `git stash pop`.
-  //   - `refs/agent/restore-saved/<ts>` when HEAD was unborn and
+  //   - `refs/forja/restore-saved/<ts>` when HEAD was unborn and
   //     git stash isn't available; we built our own preservation
   //     commit. Recover with `git read-tree --reset -u <ref>` or
   //     `git checkout <ref> -- .`.
@@ -688,7 +688,7 @@ export const restore = async (cwd: string, commitSha: string): Promise<RestoreRe
   if (dirty || collision) {
     // Decide between two preservation paths:
     //   - regular `git stash push -u` (cheap, recovery via stash pop)
-    //   - custom commit-tree under refs/agent/restore-saved/
+    //   - custom commit-tree under refs/forja/restore-saved/
     //     (recovery via `git read-tree --reset -u <ref>`)
     //
     // The custom path is required when:
@@ -720,7 +720,7 @@ export const restore = async (cwd: string, commitSha: string): Promise<RestoreRe
     } else {
       // Custom path: build a preservation commit capturing the
       // ENTIRE working tree (tracked + untracked + ignored) via
-      // a temp index. Anchored under refs/agent/restore-saved/<ts>
+      // a temp index. Anchored under refs/forja/restore-saved/<ts>
       // so it survives git gc; recovery via `git read-tree --reset
       // -u <ref>` overrides whatever the checkpoint wrote.
       //
@@ -864,7 +864,7 @@ export const getCommitTree = async (cwd: string, commitSha: string): Promise<str
 };
 
 // Read a commit's full message body. Same path: rewrites preserve
-// the original message verbatim so `git log refs/agent/checkpoints`
+// the original message verbatim so `git log refs/forja/checkpoints`
 // stays human-grep-able with the original "forja: pre-step N <iso>"
 // shape, and audit tooling indexed by message stays stable.
 export const getCommitMessage = async (cwd: string, commitSha: string): Promise<string> => {
@@ -944,7 +944,7 @@ export const listSessionRefs = async (
   cwd: string,
 ): Promise<{ sessionId: string; sha: string }[]> => {
   const { stdout } = await runGit(
-    ['for-each-ref', '--format=%(refname) %(objectname)', 'refs/agent/checkpoints'],
+    ['for-each-ref', '--format=%(refname) %(objectname)', 'refs/forja/checkpoints'],
     { cwd },
   );
   const lines = stdout.split('\n').filter((l) => l.length > 0);
@@ -952,7 +952,7 @@ export const listSessionRefs = async (
   for (const line of lines) {
     const [ref, sha] = line.split(' ');
     if (ref === undefined || sha === undefined) continue;
-    const prefix = 'refs/agent/checkpoints/';
+    const prefix = 'refs/forja/checkpoints/';
     if (!ref.startsWith(prefix)) continue;
     const sessionId = ref.slice(prefix.length);
     if (sessionId.length === 0) continue;

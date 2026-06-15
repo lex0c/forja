@@ -107,7 +107,7 @@ const PROFILE_ALLOWED_CAPABILITIES: Record<SandboxProfile, ReadonlySet<Capabilit
     'net-ingress',
     'secret-access',
     'env-mutate',
-    'agent-mutate',
+    'forja-mutate',
     'host-passthrough',
   ]),
 };
