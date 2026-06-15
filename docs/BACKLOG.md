@@ -2,6 +2,30 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] Preserve interleaved reasoning↔tool_use order for replay
+
+`collectStep` bucketed reasoning and tool_uses into separate arrays, so
+`buildAssistantContent` rebuilt the turn reasoning-first — losing the original
+interleaving. With interleaved thinking (adaptive models, multiple tool calls in
+one turn) the model can emit thinking1, tool1, thinking2, tool2; grouping that to
+thinking1, thinking2, tool1, tool2 means a replayed thinking block changes
+position, and Anthropic 400s ("thinking blocks ... cannot be modified / sequence
+must match the outputs"). The interleaving was lost at CAPTURE, so the fix had to
+be there, not just in the rebuild.
+
+`collectStep` now records `order: CollectedBlock[]` — the turn's blocks in exact
+emission order (reasoning / text / tool_use), holding the same object refs as the
+buckets (text deltas flushed as one block before each reasoning/tool_use and at
+stream end). `buildAssistantContent` rebuilds from `order` when present (verbatim
+reasoning, canonicalized tool inputs, same reasoning-only suppression), falling
+back to the grouped behavior for synthetic callers without `order`. Buckets stay
+for order-agnostic consumers (tool execution, token counts). Mainly matters for
+Anthropic (1:1 block mapping); OpenAI re-buckets in toResponsesInput regardless.
+
+Tests: collect captures interleaved order incl. a text segment; buildAssistantContent
+keeps thinking1/tool1/thinking2/tool2 interleaved, omits reasoning-only, canonicalizes
+in the ordered path.
+
 ## [2026-06-14] Anthropic: strip sampling when thinking is engaged (replay 400)
 
 Anthropic rejects `thinking` sent together with a `temperature`/`top_p` override
