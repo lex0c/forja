@@ -14,7 +14,7 @@ expires:     null
 
 Goal-shape: "review this before I commit", "check my changes", "anything wrong with this diff". Operates on the **current diff** (staged, or committed but unpushed) — a self-review gate before a commit or PR.
 
-Not a use case: reviewing a large external PR end-to-end (heavier, multi-file context); a security-only review of a boundary (`harden-input-boundary`, `threat-model-component`); chasing a known bug (`debug-failure`).
+Not a use case: reviewing a large external PR end-to-end (heavier, multi-file context); a security-only review of a boundary (`threat-model-component`); chasing a known bug.
 
 ## Prerequisites
 
@@ -26,7 +26,7 @@ Not a use case: reviewing a large external PR end-to-end (heavier, multi-file co
 1. **State the intent in one sentence.** What should this diff accomplish? If you cannot, obtain it before reviewing — you cannot judge correctness against an unknown goal.
 2. **Read the whole diff once, start to finish.** Comprehension only, no judgment. Note anything you do not understand — unclear code is a finding.
 3. **Correctness pass.** For each changed function: edge cases (null/empty/zero/negative/overflow), error and early-return paths, off-by-one, and whether the behavior matches the stated intent.
-4. **Boundary pass.** Does the diff touch untrusted input, auth, a query, a shell call, or a path? If yes, run `harden-input-boundary` on those lines.
+4. **Boundary pass.** Does the diff touch untrusted input, auth, a query, a shell call, or a path? If yes, scrutinize those lines for the sink-correct defense (parameterized query, escaping, path normalization).
 5. **Coupling/cohesion pass — concrete triggers, not taste.** A finding only counts if it hits one:
    - A new function >~40 lines, or one doing I/O + logic + formatting together → flag for split.
    - One logical edit reaching across >~3 modules → coupling smell.
@@ -40,7 +40,7 @@ Not a use case: reviewing a large external PR end-to-end (heavier, multi-file co
 
 - Every changed file was read in full (step 2), not just a summary or the hunk headers.
 - Each finding is concrete and actionable: `file:line`, the problem, the reason.
-- Lines touching a sink/boundary went through `harden-input-boundary`.
+- Lines touching a sink/boundary were checked for the sink-correct defense.
 - A "no findings" verdict was reached by running all passes — not by skipping them.
 
 ## Anti-cases

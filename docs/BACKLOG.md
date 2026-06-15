@@ -2,6 +2,28 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-15] Skills: trim the seed catalog 20 → 9
+
+Removed 11 seed skills judged too niche or role-specific for a catalog installed
+onto every project: `git-rewrite-history`, the debug/perf family
+(`reproduce-bug`, `debug-failure`, `diagnose-memory-leak`, `profile-hotspot`),
+the forensics/security boundary set (`acquire-forensic-evidence`,
+`investigate-suspicious-host`, `harden-input-boundary`), the two Postgres skills
+(`pg-blocked-sessions`, `pg-heavy-queries`), and `explore-codebase`. The 9 that
+remain stay weighted toward broadly-useful procedures any repo benefits from: git
+recovery / conflict / bisect (`git-recover-lost-work`, `git-resolve-conflict`,
+`git-bisect-regression`), the test family (`add-regression-test`,
+`triage-flaky-test`), the inline self-review pass (`review-diff`), threat modeling
+(`threat-model-component`), and bulk file operations (`bulk-edit-files`,
+`safe-bulk-delete`). The `.md` assets and their `CANONICAL_SKILLS` entries are
+gone; surviving skills' dangling cross-references to the removed ones were
+reworded inline (`add-regression-test`, `review-diff`, `triage-flaky-test` no
+longer point at `debug-failure` / `harden-input-boundary`); the `init-skills`
+count assertions and `docs/SKILLS.md` category summary moved to 9. The seed still
+installs into `project_shared` — install location unchanged. `docs/spec/MEMORY.md`
+keeps an illustrative `skills/pg-heavy-queries.md` example reference; spec is
+read-only and the example is non-normative, so it is left as-is.
+
 ## [2026-06-15] TUI: shorten the banner cwd line
 
 The banner's third line printed `item.cwd` raw. On a removable-drive working

@@ -23,7 +23,7 @@ Not a use case: broad coverage of untested code (that is `increase-coverage`); p
 
 ## Procedure
 
-1. **Pin down the minimal trigger.** Reduce the bug to the smallest input/state that produces the wrong behavior — that is the test case. If a fix is not written yet, this overlaps with `debug-failure` step 2.
+1. **Pin down the minimal trigger.** Reduce the bug to the smallest input/state that produces the wrong behavior — that is the test case.
 2. **Write the test asserting the *correct* behavior** — what *should* happen, not the current buggy output. Place it with the related tests; name it so it reads as the bug ("test_negative_quantity_rejected", and reference the issue ID in a comment).
 3. **Run it against the unfixed code — it must FAIL.** This is the load-bearing step: a regression test that has never been seen failing proves nothing. If it passes now, it does not exercise the bug — go back to step 1.
 4. **Apply the fix** (or, if the fix already exists, temporarily revert it to do step 3).

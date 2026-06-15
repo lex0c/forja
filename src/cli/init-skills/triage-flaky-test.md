@@ -14,7 +14,7 @@ expires:     null
 
 Goal-shape: "this test is flaky", "the test fails sometimes in CI", "passes locally, fails on the runner". Use when a test gives **different verdicts on the same code**.
 
-Not a use case: a test that fails deterministically (that is a real bug or a real regression — use `debug-failure`); a test that has never passed (it was written wrong).
+Not a use case: a test that fails deterministically (that is a real bug or a real regression); a test that has never passed (it was written wrong).
 
 ## Prerequisites
 
@@ -48,4 +48,4 @@ Not a use case: a test that fails deterministically (that is a real bug or a rea
 
 - "Re-run until green" as the fix → that hides the flake, does not remove it; it will fail in CI again.
 - Adding a longer `sleep` → trades a fast flake for a slow flake; replace the sleep with a real wait condition.
-- Deterministic failure mislabeled as flaky → if it fails every time, it is a bug; hand off to `debug-failure`.
+- Deterministic failure mislabeled as flaky → if it fails every time, it is a bug, not a flake.

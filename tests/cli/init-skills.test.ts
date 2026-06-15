@@ -11,8 +11,8 @@ import { runInit } from '../../src/cli/init.ts';
 import { createSkillCatalog, parseSkillFile } from '../../src/skills/index.ts';
 
 describe('CANONICAL_SKILLS — bundled seed catalog', () => {
-  test('ships 20 skills, each parseable with its filename matching the frontmatter name', () => {
-    expect(CANONICAL_SKILLS).toHaveLength(20);
+  test('ships 9 skills, each parseable with its filename matching the frontmatter name', () => {
+    expect(CANONICAL_SKILLS).toHaveLength(9);
     for (const skill of CANONICAL_SKILLS) {
       // parseSkillFile throws SkillFrontmatterError on bad
       // frontmatter — a malformed seed surfaces here, before it
@@ -40,7 +40,7 @@ describe('CANONICAL_SKILLS — bundled seed catalog', () => {
           projectLocal: join(cwd, '.agent', 'skills', 'local'),
         },
       });
-      expect(catalog.count()).toBe(20);
+      expect(catalog.count()).toBe(9);
       expect(catalog.filtered()).toHaveLength(0);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
