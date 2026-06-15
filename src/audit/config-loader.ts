@@ -1,8 +1,8 @@
 // Operator-facing config loader for retention sweeps (AUDIT.md
-// §1.2, consumed by AGENTIC_CLI §2.1.3 `agent gc`). Reads
+// §1.2, consumed by AGENTIC_CLI §2.1.3 `forja gc`). Reads
 // `[audit.retention]` from `config.toml` in two layers:
-//   1. user:    `~/.config/agent/config.toml`
-//   2. project: `<cwd>/.agent/config.toml`
+//   1. user:    `~/.config/forja/config.toml`
+//   2. project: `<cwd>/.forja/config.toml`
 //
 // Project overrides user (per-key; later layer wins). No enterprise
 // layer in Phase 1 — retention is operational hygiene, not
@@ -381,7 +381,7 @@ export interface LoadedRetentionConfig {
   config: RetentionConfig;
   warnings: string[];
   // Source provenance so the CLI can render "config from
-  // ~/.config/agent/config.toml (overriding defaults)" — helps
+  // ~/.config/forja/config.toml (overriding defaults)" — helps
   // operators trace surprising deletes back to a misconfig.
   sources: {
     user: string | null;
@@ -469,7 +469,7 @@ export const loadRetentionConfig = (input: LoadRetentionInput): LoadedRetentionC
   // always return a string when XDG is set, regardless of whether
   // the file exists on disk. Reporting the resolved path as the
   // active source would mislead operators ("Config source: /foo/
-  // .agent/config.toml") when in fact defaults were used because
+  // .forja/config.toml") when in fact defaults were used because
   // the file doesn't exist. We resolve to null when the file is
   // absent so the renderer can correctly fall back to "defaults".
   const userExists = userPath !== null && existsSync(userPath);

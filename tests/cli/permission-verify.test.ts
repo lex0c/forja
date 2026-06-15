@@ -13,7 +13,7 @@ const captured = () => {
 };
 
 describe('parseArgs — permission subcommand', () => {
-  test('agent permission verify routes to permission.verb', () => {
+  test('forja permission verify routes to permission.verb', () => {
     const r = parseArgs(['permission', 'verify']);
     expect(r.ok).toBe(true);
     if (r.ok) {

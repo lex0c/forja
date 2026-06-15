@@ -1,4 +1,4 @@
-// `agent permission policy-list [--json]` — §12.4 policy archive
+// `forja permission policy-list [--json]` — §12.4 policy archive
 // enumeration. Read-only operator surface for the `policy_archive`
 // table (slice 13 schema, §17 prerequisite + §12.4 rollback read
 // side). DB-only path — no provider, no session start.

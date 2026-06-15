@@ -99,7 +99,7 @@ jobs:
         with:
           name: release-assets
           path: |
-            dist/agent-*
+            dist/forja-*
             dist/sbom.cdx.json
             dist/SHA256SUMS
           # Keep retention modest; assets land in GitHub Releases
@@ -165,11 +165,11 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" --clobber dist/agent-* dist/sbom.cdx.json dist/SHA256SUMS
+            gh release upload "$TAG" --clobber dist/forja-* dist/sbom.cdx.json dist/SHA256SUMS
           else
             gh release create "$TAG" \
               --target "$TAG" \
               --title "$TAG" \
               --generate-notes \
-              dist/agent-* dist/sbom.cdx.json dist/SHA256SUMS
+              dist/forja-* dist/sbom.cdx.json dist/SHA256SUMS
           fi

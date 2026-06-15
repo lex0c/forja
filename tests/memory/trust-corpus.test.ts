@@ -175,7 +175,7 @@ describe('computeSharedFingerprint — corpus filter', () => {
   });
 
   test('symlinked .md body is rejected (S5 P1/F4 hardening)', () => {
-    // Threat: attacker commits a symlink under .agent/memory/shared/
+    // Threat: attacker commits a symlink under .forja/memory/shared/
     // pointing at /etc/passwd (or any operator-private file). Without
     // lstatSync rejection, the target's bytes would (a) participate
     // in the trust hash so the modal "trusts" them on confirm, and
@@ -264,11 +264,11 @@ describe('shared_corpus_trust repo helpers', () => {
   });
 
   test('getSharedTrust returns null when no row exists', () => {
-    expect(getSharedTrust(db, '/repo/.agent/memory/shared')).toBeNull();
+    expect(getSharedTrust(db, '/repo/.forja/memory/shared')).toBeNull();
   });
 
   test('setSharedTrust inserts a row, getSharedTrust round-trips', () => {
-    const root = '/repo/.agent/memory/shared';
+    const root = '/repo/.forja/memory/shared';
     setSharedTrust(db, root, 'hash-abc', 1_700_000_000_000);
     const row = getSharedTrust(db, root);
     expect(row).toEqual({
@@ -279,7 +279,7 @@ describe('shared_corpus_trust repo helpers', () => {
   });
 
   test('setSharedTrust upserts on the same scope_root', () => {
-    const root = '/repo/.agent/memory/shared';
+    const root = '/repo/.forja/memory/shared';
     setSharedTrust(db, root, 'hash-1', 1000);
     setSharedTrust(db, root, 'hash-2', 2000);
     const row = getSharedTrust(db, root);
@@ -300,7 +300,7 @@ describe('shared_corpus_trust repo helpers', () => {
   });
 
   test('clearSharedTrust removes the row', () => {
-    const root = '/repo/.agent/memory/shared';
+    const root = '/repo/.forja/memory/shared';
     setSharedTrust(db, root, 'hash', 1000);
     expect(getSharedTrust(db, root)).not.toBeNull();
     clearSharedTrust(db, root);

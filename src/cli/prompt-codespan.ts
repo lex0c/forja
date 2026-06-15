@@ -33,7 +33,7 @@
 // from the cwd, etc. All of these are attacker-influenceable
 // in real scenarios — a coworker creating a malicious directory
 // in a shared project, a `git clone` target with a crafted
-// branch name on a CI runner, `cd /tmp/$(crafted)` pre-`agent`,
+// branch name on a CI runner, `cd /tmp/$(crafted)` pre-`forja`,
 // a misconfigured wrapper script.
 //
 // Length cap is the last layer: a value that survived the byte

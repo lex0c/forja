@@ -213,12 +213,12 @@ describe('selectSandboxProfile — tie-break order', () => {
 describe('selectSandboxProfile — uncovered list', () => {
   test('uncovered names every kind in the requested set on refusal', () => {
     const r = selectSandboxProfile({
-      capabilities: caps('env-mutate', 'agent-mutate'),
+      capabilities: caps('env-mutate', 'forja-mutate'),
       hostExplicitlyAllowed: false,
     });
     expect(r.kind).toBe('refuse');
     if (r.kind === 'refuse') {
-      expect(r.uncovered).toEqual(['agent-mutate', 'env-mutate']);
+      expect(r.uncovered).toEqual(['env-mutate', 'forja-mutate']);
     }
   });
 });

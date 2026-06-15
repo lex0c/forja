@@ -208,7 +208,7 @@ export type HarnessEvent =
       // `degraded` state: once immediately on the FIRST tool call
       // after the transition, then every N tool calls (default
       // 10). Renderers display a non-suppressible banner with the
-      // reason + a hint to run `agent doctor`. Spec line 905-908.
+      // reason + a hint to run `forja doctor`. Spec line 905-908.
       //
       // `firstEmission` lets renderers format the initial entry
       // differently from recurring nudges ("⚠ Sandbox no longer
@@ -991,7 +991,7 @@ export interface HarnessConfig {
   // verify-semantic subagent (gated by cost / dispatch caps + the
   // memory_verify_attempts dedup table). Opt-out:
   //   - `/memory governance disable verify` (per-project, persisted
-  //     in `.agent/config.toml [memory] verify_semantic_llm = false`)
+  //     in `.forja/config.toml [memory] verify_semantic_llm = false`)
   //   - `--no-memory-verify-llm` (session-only)
   // Optional in the type so test fixtures + programmatic callers
   // that don't model memory governance can omit the field (loop.ts

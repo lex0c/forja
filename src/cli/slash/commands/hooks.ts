@@ -2,8 +2,8 @@
 // dispatch history (spec AGENTIC_CLI.md §10.4).
 //
 // Read-only by design. Mutating hooks goes through the on-disk
-// hooks.toml hierarchy (`<repo>/.agent/hooks.toml`,
-// `~/.config/agent/hooks.toml`, `/etc/agent/hooks.toml`) — keeps
+// hooks.toml hierarchy (`<repo>/.forja/hooks.toml`,
+// `~/.config/forja/hooks.toml`, `/etc/forja/hooks.toml`) — keeps
 // a single source of truth and avoids inventing a runtime
 // mutation path that would diverge from the file format.
 //
@@ -79,7 +79,7 @@ const handleSummary = (hooks: readonly HookSpec[]): SlashResult => {
       kind: 'ok',
       notes: [
         'hooks: 0 loaded',
-        '  no hooks.toml at /etc/agent, ~/.config/agent, or <repo>/.agent',
+        '  no hooks.toml at /etc/forja, ~/.config/forja, or <repo>/.forja',
         '  spec: AGENTIC_CLI.md §10',
       ],
     };

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Smoke test for `agent --worktrees list / gc` (Step 4.2d).
+# Smoke test for `forja --worktrees list / gc` (Step 4.2d).
 #
 # Unit tests cover the engine classification + CLI argument
 # parsing with stubs. This smoke exercises the real production

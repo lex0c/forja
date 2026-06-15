@@ -103,7 +103,7 @@ export interface HookSpec {
   // operator knows which file wrote the rule.
   layer: HookLayer;
   // Path to the originating config file. Used in error messages
-  // ("hook at /etc/agent/hooks.toml line 12 timed out").
+  // ("hook at /etc/forja/hooks.toml line 12 timed out").
   sourcePath: string;
   event: HookEvent;
   matcher: HookMatcher;

@@ -492,8 +492,8 @@ describe('runPermissionReplay', () => {
     // Override resolvePolicy lookup by setting a broken
     // user-policy file. resolvePolicy tries to read both enterprise +
     // user files; missing OK, but if HOME has a malformed
-    // ~/.config/agent/permissions.yaml it throws.
-    const userDir = join(tmp, '.config', 'agent');
+    // ~/.config/forja/permissions.yaml it throws.
+    const userDir = join(tmp, '.config', 'forja');
     require('node:fs').mkdirSync(userDir, { recursive: true });
     writeFileSync(join(userDir, 'permissions.yaml'), 'this is: not :: valid: yaml: : :');
 
@@ -787,15 +787,15 @@ describe('runPermissionReplay — --against-current-policy re-execution (slice 1
 
   test('deterministic: active policy produces the same decision', async () => {
     // Project policy allows ls in cwd; row is decision='allow';
-    // active policy (loaded from tmp cwd — no .agent/permissions.yaml
+    // active policy (loaded from tmp cwd — no .forja/permissions.yaml
     // so defaults apply) would default-deny. Hmm, default behavior is
     // strict + default-deny → drift. To make this case truly
     // deterministic we plant a project policy mirroring what produced
     // the row's allow.
     const { mkdirSync, writeFileSync } = await import('node:fs');
-    mkdirSync(join(tmp, '.agent'), { recursive: true });
+    mkdirSync(join(tmp, '.forja'), { recursive: true });
     writeFileSync(
-      join(tmp, '.agent', 'permissions.yaml'),
+      join(tmp, '.forja', 'permissions.yaml'),
       `defaults:
   mode: strict
 tools:
@@ -993,9 +993,9 @@ tools:
 
   test('JSON output includes against_current_policy sub-object', async () => {
     const { mkdirSync, writeFileSync } = await import('node:fs');
-    mkdirSync(join(tmp, '.agent'), { recursive: true });
+    mkdirSync(join(tmp, '.forja'), { recursive: true });
     writeFileSync(
-      join(tmp, '.agent', 'permissions.yaml'),
+      join(tmp, '.forja', 'permissions.yaml'),
       `defaults:
   mode: strict
 tools:
@@ -1134,9 +1134,9 @@ describe('runPermissionReplay — --against-current-policy decision coverage (sl
     // Active policy has bash.deny that matches the command. Row
     // recorded `deny`; replay against the same shape also denies.
     const { mkdirSync } = await import('node:fs');
-    mkdirSync(join(tmp, '.agent'), { recursive: true });
+    mkdirSync(join(tmp, '.forja'), { recursive: true });
     writeFileSync(
-      join(tmp, '.agent', 'permissions.yaml'),
+      join(tmp, '.forja', 'permissions.yaml'),
       `defaults:
   mode: strict
 tools:
@@ -1170,9 +1170,9 @@ tools:
     // allow rule survives without a conservative-resolver upgrade
     // to confirm; the verdict cleanly surfaces deny → allow.
     const { mkdirSync } = await import('node:fs');
-    mkdirSync(join(tmp, '.agent'), { recursive: true });
+    mkdirSync(join(tmp, '.forja'), { recursive: true });
     writeFileSync(
-      join(tmp, '.agent', 'permissions.yaml'),
+      join(tmp, '.forja', 'permissions.yaml'),
       `defaults:
   mode: strict
 tools:
@@ -1229,9 +1229,9 @@ tools:
     // Operator added a deny rule that catches the literal shape;
     // deny short-circuits before the compound-command guard fires.
     const { mkdirSync } = await import('node:fs');
-    mkdirSync(join(tmp, '.agent'), { recursive: true });
+    mkdirSync(join(tmp, '.forja'), { recursive: true });
     writeFileSync(
-      join(tmp, '.agent', 'permissions.yaml'),
+      join(tmp, '.forja', 'permissions.yaml'),
       `defaults:
   mode: strict
 tools:
@@ -1313,9 +1313,9 @@ tools:
   // cried `changed_decision` on a policy that never drifted.
   test('autonomous auto-approved allow row reproduces → deterministic (no fabricated drift)', async () => {
     const { mkdirSync } = await import('node:fs');
-    mkdirSync(join(tmp, '.agent'), { recursive: true });
+    mkdirSync(join(tmp, '.forja'), { recursive: true });
     writeFileSync(
-      join(tmp, '.agent', 'permissions.yaml'),
+      join(tmp, '.forja', 'permissions.yaml'),
       `defaults:
   mode: strict
 tools:
@@ -1358,9 +1358,9 @@ tools:
   // stays `confirm` and the posture caveat is absent.
   test('supervised confirm row keeps confirm and gains no posture caveat', async () => {
     const { mkdirSync } = await import('node:fs');
-    mkdirSync(join(tmp, '.agent'), { recursive: true });
+    mkdirSync(join(tmp, '.forja'), { recursive: true });
     writeFileSync(
-      join(tmp, '.agent', 'permissions.yaml'),
+      join(tmp, '.forja', 'permissions.yaml'),
       `defaults:
   mode: strict
 tools:
@@ -1433,8 +1433,8 @@ describe('runPermissionReplay — --against-archived-policy (slice 96, R11 #34)'
     const { resolvePolicy } = await import('../../src/permissions/index.ts');
 
     const { mkdirSync } = await import('node:fs');
-    mkdirSync(join(tmp, '.agent'), { recursive: true });
-    writeFileSync(join(tmp, '.agent', 'permissions.yaml'), params.policyYaml);
+    mkdirSync(join(tmp, '.forja'), { recursive: true });
+    writeFileSync(join(tmp, '.forja', 'permissions.yaml'), params.policyYaml);
 
     const resolved = resolvePolicy({ cwd: tmp, home: tmp, env });
     const canonicalJson = canonicalize(resolved.policy);

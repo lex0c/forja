@@ -1,4 +1,4 @@
-// Template for `.agent/permissions.yaml` written by `agent init`.
+// Template for `.forja/permissions.yaml` written by `forja init`.
 // Spec: AGENTIC_CLI.md §8 (the policy schema) + §2.1 (init mode).
 //
 // Posture: conservative allowlist for read-only inspection commands
@@ -45,7 +45,7 @@ export type InitMode = 'strict' | 'acceptEdits';
 
 export const renderInitTemplate = (
   mode: InitMode,
-): string => `# .agent/permissions.yaml — Forja permission policy.
+): string => `# .forja/permissions.yaml — Forja permission policy.
 #
 # Spec: AGENTIC_CLI.md §8. Hierarchy: enterprise > user > project
 # (this file) > session. Matching is prefix + glob (no regex).
@@ -54,7 +54,7 @@ export const renderInitTemplate = (
 #   strict       confirm what is confirmable, deny the rest (default)
 #   acceptEdits  auto-allow confirm rules; still respect deny
 #   bypass       no gating (requires explicit --dangerous; not
-#                scaffolded by 'agent init' — set by hand)
+#                scaffolded by 'forja init' — set by hand)
 
 defaults:
   mode: ${mode}

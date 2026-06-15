@@ -214,10 +214,10 @@ describe('/history clear', () => {
     expect(countHistory(db, tmpRoot)).toBe(0);
     expect(stub.cleared).toBe(true);
     // Plain wipe — should NOT have written the file marker.
-    expect(existsSync(join(tmpRoot, '.agent', 'no-history'))).toBe(false);
+    expect(existsSync(join(tmpRoot, '.forja', 'no-history'))).toBe(false);
   });
 
-  test('modal "yes-disable" answer wipes AND writes .agent/no-history marker', async () => {
+  test('modal "yes-disable" answer wipes AND writes .forja/no-history marker', async () => {
     const { ctx, db, stub } = makeCtx(tmpRoot, { historyAnswer: 'yes-disable' });
     appendHistory(db, tmpRoot, 'a', { ts: 1 });
     appendHistory(db, tmpRoot, 'b', { ts: 2 });
@@ -225,7 +225,7 @@ describe('/history clear', () => {
     expect(result.kind).toBe('ok');
     if (result.kind !== 'ok') return;
     expect(countHistory(db, tmpRoot)).toBe(0);
-    expect(existsSync(join(tmpRoot, '.agent', 'no-history'))).toBe(true);
+    expect(existsSync(join(tmpRoot, '.forja', 'no-history'))).toBe(true);
     // Session flag flipped to match the new permanent state.
     expect(stub.enabled).toBe(false);
     expect(result.notes?.some((n) => n.includes('persistence disabled'))).toBe(true);
@@ -281,14 +281,14 @@ describe('/history off / on', () => {
     expect(result.notes?.[0]).toContain('FORJA_NO_HISTORY');
   });
 
-  test('on refuses when .agent/no-history marker is present', async () => {
+  test('on refuses when .forja/no-history marker is present', async () => {
     const { ctx, stub } = makeCtx(tmpRoot);
     stub.enabled = false;
     stub.optOut = 'file-marker';
     const result = await historyCommand.exec(['on'], ctx);
     if (result.kind !== 'ok') return;
     expect(stub.enabled).toBe(false);
-    expect(result.notes?.[0]).toContain('.agent/no-history');
+    expect(result.notes?.[0]).toContain('.forja/no-history');
   });
 });
 

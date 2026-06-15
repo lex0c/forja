@@ -1,4 +1,4 @@
-# .agent/.gitignore (auto-generated; safe to edit)
+# .forja/.gitignore (auto-generated; safe to edit)
 sessions.db
 sessions.db-*
 traces/

@@ -17,7 +17,7 @@
 //   - on EVERY Nth call thereafter.
 //
 // When the engine transitions back to `ready` (operator ran
-// `agent doctor` + fixed the issue + the engine called
+// `forja doctor` + fixed the issue + the engine called
 // `restore()`), the counter resets so the next degraded
 // transition fires its own immediate banner.
 //

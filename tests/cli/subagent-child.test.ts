@@ -168,7 +168,7 @@ describe('runSubagentChild', () => {
 
   test('resolves [sandbox] config from the repo ROOT when the child cwd is a subdir', async () => {
     // Regression: an isolation:none child whose session.cwd is a repo
-    // SUBDIR must read `.agent/config.toml` from the repo ROOT — exactly
+    // SUBDIR must read `.forja/config.toml` from the repo ROOT — exactly
     // where the parent (resolveRepoRoot(cwd)) read it. Loading from the
     // raw subdir misses a root-level writable_cache_dirs and silently
     // falls back to the defaults.
@@ -176,9 +176,9 @@ describe('runSubagentChild', () => {
     try {
       // git repo so resolveRepoRoot (git rev-parse) finds the root.
       Bun.spawnSync({ cmd: ['git', 'init', '-q', repo] });
-      mkdirSync(join(repo, '.agent'), { recursive: true });
+      mkdirSync(join(repo, '.forja'), { recursive: true });
       writeFileSync(
-        join(repo, '.agent', 'config.toml'),
+        join(repo, '.forja', 'config.toml'),
         '[sandbox]\nwritable_cache_dirs = []\ncache_persistence = true\n',
       );
       const sub = join(repo, 'pkg', 'inner');
@@ -198,7 +198,7 @@ describe('runSubagentChild', () => {
       expect(exitCode).toBe(0);
       // The root config sets an explicit empty array (carve-out disabled).
       // The child must have read it — NOT `undefined`, which is what a raw
-      // `loadSandboxConfig({ cwd: subdir })` (no .agent there) would yield.
+      // `loadSandboxConfig({ cwd: subdir })` (no .forja there) would yield.
       expect(getWritableCacheDirsOverride()).toEqual([]);
       // PARITY: the child must also re-resolve cache_persistence (separate
       // process → module global starts unset; pre-seeded false above).
@@ -255,8 +255,8 @@ describe('runSubagentChild', () => {
       process.env.XDG_CACHE_HOME = xdg;
       try {
         Bun.spawnSync({ cmd: ['git', 'init', '-q', repo] });
-        mkdirSync(join(repo, '.agent'), { recursive: true });
-        writeFileSync(join(repo, '.agent', 'config.toml'), '[sandbox]\nshared_tmp = false\n');
+        mkdirSync(join(repo, '.forja'), { recursive: true });
+        writeFileSync(join(repo, '.forja', 'config.toml'), '[sandbox]\nshared_tmp = false\n');
         const { sessionId } = seedChildSession(repo);
         const exitCode = await runSubagentChild({
           sessionId,
@@ -341,7 +341,7 @@ describe('runSubagentChild', () => {
       dbPath,
       providerOverride: stubProvider('hello world'),
       // Disable real permission hierarchy so the test doesn't
-      // depend on the host's /etc/agent or ~/.config/agent state.
+      // depend on the host's /etc/forja or ~/.config/forja state.
       // Same shape for subagent discovery — keep tests
       // hermetic.
       userAgentsDir: null,
@@ -363,7 +363,7 @@ describe('runSubagentChild', () => {
   });
 
   test('policy snapshot from audit row is honored, NOT re-resolved from disk', async () => {
-    // Drift defense: even if `.agent/permissions.yaml` were
+    // Drift defense: even if `.forja/permissions.yaml` were
     // edited mid-run between parent spawn and child read, the
     // child must use the snapshot the parent persisted, not
     // re-resolve from disk. We seed an explicit `bypass`
@@ -1339,12 +1339,12 @@ You are the worker.`,
     const parentRepo = mkdtempSync(join(tmpdir(), 'forja-mem-parent-'));
     const worktreeCwd = mkdtempSync(join(tmpdir(), 'forja-mem-worktree-'));
     // Isolate user scope under the parent repo so the dev's real
-    // ~/.config/agent/memory/ doesn't bleed in.
+    // ~/.config/forja/memory/ doesn't bleed in.
     const originalXdg = process.env.XDG_CONFIG_HOME;
     process.env.XDG_CONFIG_HOME = parentRepo;
     try {
       // Seed parent's project_local memory.
-      const localDir = join(parentRepo, '.agent', 'memory', 'local');
+      const localDir = join(parentRepo, '.forja', 'memory', 'local');
       fs.mkdirSync(localDir, { recursive: true });
       fs.writeFileSync(join(localDir, 'MEMORY.md'), '- [Role](role.md) — full-stack TS dev\n');
       fs.writeFileSync(
@@ -1496,7 +1496,7 @@ You are the worker.`,
     process.env.XDG_CONFIG_HOME = parentRepo;
     try {
       // Memory tagged with both well-known boot triggers.
-      const localDir = join(parentRepo, '.agent', 'memory', 'local');
+      const localDir = join(parentRepo, '.forja', 'memory', 'local');
       fs.mkdirSync(localDir, { recursive: true });
       fs.writeFileSync(
         join(localDir, 'MEMORY.md'),
@@ -1627,7 +1627,7 @@ You are the worker.`,
       // Memory IS present in the parent's tree — but the
       // subagent's whitelist excludes memory tools, so it must
       // NOT see the section.
-      const localDir = join(parentRepo, '.agent', 'memory', 'local');
+      const localDir = join(parentRepo, '.forja', 'memory', 'local');
       fs.mkdirSync(localDir, { recursive: true });
       fs.writeFileSync(join(localDir, 'MEMORY.md'), '- [Role](role.md) — TS dev\n');
 
@@ -2627,7 +2627,7 @@ You are the worker.`,
     const marker = join(parentRepo, 'session-start-fired.txt');
     // Stage a SessionStart hook in the parent's project layer.
     // The subagent-child must re-resolve from this same path.
-    const hookDir = join(parentRepo, '.agent');
+    const hookDir = join(parentRepo, '.forja');
     fs.mkdirSync(hookDir, { recursive: true });
     fs.writeFileSync(
       join(hookDir, 'hooks.toml'),

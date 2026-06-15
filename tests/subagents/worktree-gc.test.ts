@@ -340,7 +340,7 @@ describe('buildGcPlan — security: cross-repo isolation', () => {
   test('regression: symlinked-checkout cwd matches canonical repo root', async () => {
     // Operator running `cd /home/user/symlink-to-projA && agent`
     // creates sessions with cwd = literal symlink path. Later
-    // `agent --worktrees gc` runs `git rev-parse --show-toplevel`
+    // `forja --worktrees gc` runs `git rev-parse --show-toplevel`
     // which returns the CANONICAL path (`/home/user/projA`).
     // Pre-fix the SQL query did string-equality on these two
     // forms — symlink-equivalent rows were excluded from

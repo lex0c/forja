@@ -106,7 +106,7 @@ describe('classifyProtectedPath — system deny tier', () => {
 });
 
 describe('classifyProtectedPath — escalate tier (writes only)', () => {
-  test.each(['/etc', '/etc/hosts', '/etc/passwd', '/etc/agent/policy.toml'])(
+  test.each(['/etc', '/etc/hosts', '/etc/passwd', '/etc/forja/policy.toml'])(
     'absolute escalate root %s',
     (absPath) => {
       expect(classifyProtectedPath({ absPath, op: 'write', home: HOME, cwd: CWD })).toBe(
@@ -127,8 +127,8 @@ describe('classifyProtectedPath — escalate tier (writes only)', () => {
   );
 
   test.each([
-    '/home/op/.config/agent',
-    '/home/op/.config/agent/policy.yaml',
+    '/home/op/.config/forja',
+    '/home/op/.config/forja/policy.yaml',
     '/home/op/.config/claude',
     '/home/op/.config/claude/install_id',
   ])('tilde escalate dir %s', (absPath) => {
@@ -139,8 +139,8 @@ describe('classifyProtectedPath — escalate tier (writes only)', () => {
     '/work/proj/.git',
     '/work/proj/.git/HEAD',
     '/work/proj/.git/refs/heads/main',
-    '/work/proj/.agent',
-    '/work/proj/.agent/sessions.db',
+    '/work/proj/.forja',
+    '/work/proj/.forja/sessions.db',
     '/work/proj/.claude',
     '/work/proj/.claude/settings.json',
   ])('cwd escalate dir %s', (absPath) => {
@@ -235,9 +235,9 @@ describe('protectedTargets', () => {
     expect(t.absoluteEscalate).toEqual(['/etc']);
     expect(t.tildeEscalateFiles).toContain('/home/op/.bashrc');
     expect(t.tildeEscalateFiles).toContain('/home/op/.zshrc');
-    expect(t.tildeEscalateDirs).toContain('/home/op/.config/agent');
+    expect(t.tildeEscalateDirs).toContain('/home/op/.config/forja');
     expect(t.cwdEscalateDirs).toContain('/work/proj/.git');
-    expect(t.cwdEscalateDirs).toContain('/work/proj/.agent');
+    expect(t.cwdEscalateDirs).toContain('/work/proj/.forja');
     expect(t.cwdEscalateDirs).toContain('/work/proj/.claude');
   });
 });

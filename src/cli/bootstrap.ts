@@ -107,7 +107,7 @@ import { composeWithToolErgonomics } from './tool-ergonomics-prompt.ts';
 // keep working. New code should prefer `src/providers/default-model.ts`
 // directly — importing it doesn't drag in this module's full
 // transitive closure (storage, providers, hooks, ...) on lighter
-// paths like `agent init`.
+// paths like `forja init`.
 export { DEFAULT_MODEL } from '../providers/default-model.ts';
 import { DEFAULT_MODEL } from '../providers/default-model.ts';
 
@@ -150,7 +150,7 @@ export interface BootstrapInput {
   dbPath?: string;
   // Test seams for the permission hierarchy. `null` disables the
   // corresponding layer entirely (e.g., tests that don't want to
-  // touch /etc/agent or ~/.config/agent).
+  // touch /etc/forja or ~/.config/forja).
   enterprisePolicyPath?: string | null;
   userPolicyPath?: string | null;
   // Test seams for subagent discovery. `null` disables the
@@ -164,7 +164,7 @@ export interface BootstrapInput {
   //   - null      → trust storage unavailable (cwd treated as
   //                 untrusted, fail-closed)
   //   - string    → use this path (test fixtures isolate from the
-  //                 user's real `~/.config/agent/trusted_dirs.json`)
+  //                 user's real `~/.config/forja/trusted_dirs.json`)
   // The resolved value drives `HarnessConfig.isCwdTrusted`, which
   // memory_write's trust gate consumes (spec MEMORY.md §7.2.1).
   trustListPathOverride?: string | null;
@@ -311,7 +311,7 @@ export interface BootstrapResult {
   // policy lockConflicts warnings.
   hookWarnings: readonly HookConfigWarning[];
   // Warnings from the memory governance config loader
-  // (`.agent/config.toml [memory]` keys). Loader degrades to
+  // (`.forja/config.toml [memory]` keys). Loader degrades to
   // defaults (currently default-ON) on bad values rather than
   // aborting boot — without this surface, an operator who writes
   // `verify_semantic_llm = "false"` (string instead of boolean)
@@ -320,7 +320,7 @@ export interface BootstrapResult {
   // these on stderr alongside the hook warnings.
   memoryConfigWarnings: readonly string[];
   // Warnings from the providers + budget config loaders
-  // (`.agent/config.toml [providers|budget]`). Same fail-soft
+  // (`.forja/config.toml [providers|budget]`). Same fail-soft
   // posture as the others: bad value → warning + degrade, not
   // a hard abort.
   providersConfigWarnings: readonly string[];
@@ -337,7 +337,7 @@ export interface BootstrapResult {
   // `SandboxEnforcementSnapshot` for the discriminator.
   sandboxEnforcement: SandboxEnforcementSnapshot;
   // Warnings from the audit / retention config loader
-  // (`.agent/config.toml [audit]` and `[audit.retention]`). Loader
+  // (`.forja/config.toml [audit]` and `[audit.retention]`). Loader
   // degrades to defaults on bad values rather than aborting boot —
   // without this surface, an operator who typed
   // `[audit.retention].context_pins = "ninety"` (string instead
@@ -369,7 +369,7 @@ export interface BootstrapResult {
   // CLI driver renders an explicit "chain ok / broken at seq N"
   // line so the operator sees the state on every boot.
   permissionChain: import('../permissions/index.ts').VerifyResult;
-  // Per-installation identity (`~/.config/agent/install_id`) bound
+  // Per-installation identity (`~/.config/forja/install_id`) bound
   // to the active audit chain. The CLI surfaces this in
   // diagnostics so operators can correlate logs across machines.
   installIdentity: import('../permissions/index.ts').InstallIdentity;
@@ -388,7 +388,7 @@ export interface BootstrapResult {
 
 // Build a HarnessConfig from environment + cwd + args. This is the main
 // entry-shaped wiring: read API key from env (the adapter does it), open
-// the DB, migrate, register builtins, load policy from `.agent/permissions.yaml`
+// the DB, migrate, register builtins, load policy from `.forja/permissions.yaml`
 // if present, instantiate the provider from the registry. Any failure
 // (unknown model, missing API key) bubbles up — the caller decides whether
 // to print to stderr and exit 1.
@@ -423,11 +423,11 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // Resolve project config root EARLY (needed by the providers
   // loader before model resolution). `resolveRepoRoot` walks up
   // from cwd looking for a git root and falls back to cwd when
-  // none is found — so `<repo>/.agent/config.toml` resolves the
+  // none is found — so `<repo>/.forja/config.toml` resolves the
   // same way whether the operator invoked from the repo root or
-  // a subdirectory. Without this resolve, a `<repo>/.agent/
+  // a subdirectory. Without this resolve, a `<repo>/.forja/
   // config.toml [providers] model = "..."` would be invisible when
-  // the operator ran `agent` from a subdir, and the boot would
+  // the operator ran `forja` from a subdir, and the boot would
   // silently use DEFAULT_MODEL. Reused below for [memory] / [budget]
   // loaders — same file, same path resolution.
   const projectConfigCwd = resolveRepoRoot(cwd);
@@ -470,10 +470,10 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // `projectConfigCwd` was resolved above (early in this function —
   // see the long comment near the providers loader). The same
   // repo-rooted cwd is reused here so [memory] / [budget] all read
-  // the SAME `.agent/config.toml` the providers loader already
-  // consumed. When `agent` is launched from a subdirectory, raw cwd
+  // the SAME `.forja/config.toml` the providers loader already
+  // consumed. When `forja` is launched from a subdirectory, raw cwd
   // would miss the repo-rooted file entirely — the operator would
-  // set `verify_semantic_llm = false` at `<repo>/.agent/config.toml`
+  // set `verify_semantic_llm = false` at `<repo>/.forja/config.toml`
   // and bootstrap would still resolve detectors via default + spend
   // LLM budget. resolveRepoRoot falls back to cwd when not in a git
   // repo, matching the historical "config lives where the operator
@@ -489,7 +489,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   const recapLoaded = loadRecapConfig({ cwd: projectConfigCwd, registry });
 
   // Slice Q — invert S11/S13 LLM-judge default to ON. The loader
-  // walks the same `.agent/config.toml` + `~/.config/agent/config.toml`
+  // walks the same `.forja/config.toml` + `~/.config/forja/config.toml`
   // pair as [budget]; project field wins. `userHadField` /
   // `projectHadField` per-field provenance signals drive the
   // first-run banner emission below: banner fires ONLY when both
@@ -715,7 +715,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   //
   // The ULID is fresh per CLI invocation so two parallel `forja`
   // processes never collide on the path, and a postmortem can
-  // correlate `ls -ld /tmp/forja-sb-*` against `agent doctor` /
+  // correlate `ls -ld /tmp/forja-sb-*` against `forja doctor` /
   // session log timelines.
   //
   // mkdir failure → falls back to undefined tmpdir, which downstream
@@ -949,14 +949,14 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
 
     // Memory subsystem (spec MEMORY.md / §4.1). Build the registry
     // from the REPO root, not the invocation cwd: project memory
-    // lives at `<repo>/.agent/memory/{shared,local}/` and an
-    // operator running `agent` from a subdir (the common case)
+    // lives at `<repo>/.forja/memory/{shared,local}/` and an
+    // operator running `forja` from a subdir (the common case)
     // would otherwise see empty project scopes. `resolveRepoRoot`
     // calls `git rev-parse --show-toplevel`; falls back to cwd
     // when not in a git repo (memory then lives wherever the
     // operator invoked from — same fallback as the pre-fix
     // behavior). User scope is unaffected (lives at
-    // ~/.config/agent/memory/, scope-roots derives it from env).
+    // ~/.config/forja/memory/, scope-roots derives it from env).
     //
     // Registry construction is unconditional in the production
     // path — an absent or empty memory subtree just produces an
@@ -965,7 +965,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // Resolve the repo root once and reuse for memory scope roots
     // AND boot trigger probes. Earlier cut called
     // `evaluateBootTriggers(cwd)` separately, which broke the
-    // common case of running `agent` from a repo subdirectory:
+    // common case of running `forja` from a repo subdirectory:
     // memory was loaded from the repo root (`resolveRepoRoot(cwd)`)
     // but trigger probes scanned `cwd`, missing root-level
     // `.git` / `package.json` / `tsconfig.json` etc. Memories
@@ -977,10 +977,10 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     const repoRoot = projectConfigCwd;
     const memoryRoots = resolveScopeRoots(repoRoot);
     // Vendor seeds are NOT installed at bootstrap — they ride along
-    // with `agent init` (spec MEMORY.md §5.7.4 + §5.7.8) so the
+    // with `forja init` (spec MEMORY.md §5.7.4 + §5.7.8) so the
     // operator's first explicit setup gesture is also where the
     // catalog lands, mirroring how skills/playbooks scaffold. An
-    // operator who never runs `agent init` does NOT see seeds in
+    // operator who never runs `forja init` does NOT see seeds in
     // their /memory list — that's a feature: nothing arrives in
     // the user scope without an explicit operator action.
     memoryRegistry = createMemoryRegistry({ roots: memoryRoots, db, cwd });
@@ -1192,7 +1192,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // memories tagged with `triggers:` in their frontmatter.
     // Probing the repo root (not the invocation cwd) matches the
     // memory roots resolved above — same anchor for both. An
-    // operator running `agent` from `/repo/src/components/`
+    // operator running `forja` from `/repo/src/components/`
     // expects `git` / `package` triggers to fire because the
     // project memory loaded from `/repo` mentions them; probing
     // cwd would silently miss every project-root file.
@@ -1260,7 +1260,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // loads ONLY when the stored trust row's hash matches the
     // current corpus fingerprint (the post-decision unchanged
     // state). This means:
-    //   - Headless `agent run` against a corpus that's drifted
+    //   - Headless `forja run` against a corpus that's drifted
     //     since the operator's last interactive confirm: scope
     //     excluded, no model exposure to unattested content. The
     //     operator must run the interactive REPL to re-confirm.
@@ -1292,7 +1292,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       // any unknown / mismatch.
       //
       // P1/F6 cost note (deferred): a CI run that boots N times
-      // against an unchanged corpus pays one full `.agent/memory/
+      // against an unchanged corpus pays one full `.forja/memory/
       // shared/` read per boot just to compute the hash that will
       // match. A proper mtime fast-path would persist per-file
       // (size, mtime) tuples alongside the trust row and skip the
@@ -1385,7 +1385,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // funneled into db.close() before the rethrow. Otherwise
     // the SQLite handle (and its WAL files) leak. Reuses the
     // `repoRoot` already computed for memory; the project layer
-    // probes `<repoRoot>/.agent/hooks.toml`.
+    // probes `<repoRoot>/.forja/hooks.toml`.
     const hookPaths = resolveHookPaths(repoRoot);
     resolvedHooks = resolveHookConfig(hookPaths);
     // Probe the shell the dispatcher will use. If hooks are
@@ -1419,12 +1419,12 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     throw e;
   }
 
-  // Background-process log directory. Lives under `.agent/bg/`
+  // Background-process log directory. Lives under `.forja/bg/`
   // alongside the DB (spec §2.7). The harness creates it on first
   // spawn; we just declare the path here so the manager knows where
   // to put log files. Per-cwd: a worktree's bg processes don't
   // collide with the parent repo's.
-  const bgLogDir = join(cwd, '.agent', 'bg');
+  const bgLogDir = join(cwd, '.forja', 'bg');
 
   // (`trustPath` and `isCwdTrusted` resolved above the try-block
   // so the project-context section can gate on them at prompt-

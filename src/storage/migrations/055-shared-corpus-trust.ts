@@ -1,5 +1,5 @@
 // shared_corpus_trust — last-confirmed fingerprint of the
-// `.agent/memory/shared/` corpus per scope-root path (MEMORY.md
+// `.forja/memory/shared/` corpus per scope-root path (MEMORY.md
 // §14.3 hardening, S5/T5.1).
 //
 // ────────────────────────────────────────────────────────────────────
@@ -11,11 +11,11 @@
 // since the operator last confirmed trust?".
 //
 // Use case (spec MEMORY.md §6.5.2, `trust_revoked` detector): an
-// operator clones a project, runs `agent`, confirms cwd trust on
+// operator clones a project, runs `forja`, confirms cwd trust on
 // first visit. Subsequent visits skip the prompt. But if a
 // `git pull` pulls in commits that ADD shared memories (e.g., a
 // malicious party with commit access could plant operator-
-// influencing instructions in `.agent/memory/shared/`), the
+// influencing instructions in `.forja/memory/shared/`), the
 // operator should be re-prompted. Hash-based detection makes
 // "shared corpus changed since last confirm" a deterministic
 // boolean.
@@ -23,7 +23,7 @@
 // SCHEMA:
 //
 // - `scope_root` (TEXT PRIMARY KEY). Absolute path to the
-//   `.agent/memory/shared/` directory. One trust row per
+//   `.forja/memory/shared/` directory. One trust row per
 //   scope-root — operators with multiple projects each get their
 //   own row.
 //

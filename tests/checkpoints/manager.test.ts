@@ -172,7 +172,7 @@ describe('CheckpointManager — available mode', () => {
   });
 
   test('purge by age does NOT touch rows from sessions in other cwds', async () => {
-    // Lazy retention runs at session_start of every agent run, with
+    // Lazy retention runs at session_start of every forja run, with
     // manager bound to the current cwd. The age-based row sweep must
     // be cwd-scoped — otherwise running the agent in /repo/A would
     // periodically wipe /repo/B's audit history once those rows
@@ -417,8 +417,8 @@ describe('CheckpointManager — available mode', () => {
     // reachable commit — the seed commit is convenient.
     const head = (await runGit(repo, ['rev-parse', 'HEAD'])).trim();
     const oldTs = Date.now() - 60_000;
-    const oldRef = `refs/agent/restore-saved/${oldTs}-aaaaaaaa`;
-    const freshRef = `refs/agent/restore-saved/${Date.now()}-bbbbbbbb`;
+    const oldRef = `refs/forja/restore-saved/${oldTs}-aaaaaaaa`;
+    const freshRef = `refs/forja/restore-saved/${Date.now()}-bbbbbbbb`;
     await runGit(repo, ['update-ref', oldRef, head]);
     await runGit(repo, ['update-ref', freshRef, head]);
 
@@ -438,7 +438,7 @@ describe('CheckpointManager — available mode', () => {
     await initRepoWithSeed(repo);
     const mgr = createCheckpointManager({ db, cwd: repo, sessionId, available: true });
     const head = (await runGit(repo, ['rev-parse', 'HEAD'])).trim();
-    const weirdRef = 'refs/agent/restore-saved/manual-tag';
+    const weirdRef = 'refs/forja/restore-saved/manual-tag';
     await runGit(repo, ['update-ref', weirdRef, head]);
 
     await mgr.purge({ olderThanDays: 0.0000001 });

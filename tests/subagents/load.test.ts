@@ -1238,7 +1238,7 @@ describe('loadSubagents (directory discovery)', () => {
 
   test('loads from user and project, project wins on collision', () => {
     const userDir = join(workspace, 'user-agents');
-    const projectDir = join(workspace, '.agent', 'agents');
+    const projectDir = join(workspace, '.forja', 'playbooks');
     writeFile(join(userDir, 'explore.md'), VALID);
     writeFile(
       join(projectDir, 'explore.md'),
@@ -1263,7 +1263,7 @@ describe('loadSubagents (directory discovery)', () => {
   });
 
   test('rejects duplicate names within the same scope', () => {
-    const dir = join(workspace, 'agents');
+    const dir = join(workspace, 'playbooks');
     writeFile(join(dir, 'a.md'), VALID);
     // Second file claiming the same `name` is an authoring mistake.
     writeFile(join(dir, 'b.md'), VALID);
@@ -1273,7 +1273,7 @@ describe('loadSubagents (directory discovery)', () => {
   });
 
   test('ignores non-md and non-file entries', () => {
-    const dir = join(workspace, 'agents');
+    const dir = join(workspace, 'playbooks');
     writeFile(join(dir, 'explore.md'), VALID);
     writeFile(join(dir, 'README.txt'), 'noise');
     mkdirSync(join(dir, 'nested-dir'), { recursive: true });
@@ -1289,7 +1289,7 @@ describe('loadSubagents (directory discovery)', () => {
   });
 
   test('userDir=null disables the user scope entirely', () => {
-    const projectDir = join(workspace, '.agent', 'agents');
+    const projectDir = join(workspace, '.forja', 'playbooks');
     writeFile(join(projectDir, 'explore.md'), VALID);
     const set = loadSubagents({
       cwd: workspace,
@@ -1428,7 +1428,7 @@ describe('loadSubagents (S11 builtin scope)', () => {
   });
 
   test('project shadow of a protected builtin (verify-semantic) surfaces a shadow row', () => {
-    const projectDir = join(workspace, '.agent', 'agents');
+    const projectDir = join(workspace, '.forja', 'playbooks');
     writeFile(
       join(projectDir, 'verify-semantic.md'),
       VALID.replace('name: explore', 'name: verify-semantic').replace(

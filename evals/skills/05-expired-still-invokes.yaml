@@ -10,7 +10,7 @@ prompt: |
   Give me our team's canonical release greeting line.
 setup:
   files:
-    '.agent/skills/shared/release-greeting.md': |
+    '.forja/skills/shared/release-greeting.md': |
       ---
       name: release-greeting
       description: Emit the team's canonical release greeting line.

@@ -132,7 +132,7 @@ describe('migration 066 — purge_events schema', () => {
     ).toThrow(/CHECK/);
   });
 
-  test('zero counts and empty json are valid (edge: purge of empty .agent/)', () => {
+  test('zero counts and empty json are valid (edge: purge of empty .forja/)', () => {
     const db = newDb();
     const row = insertPurgeEvent(db, {
       ts: 1_700_000_000_000,
@@ -155,7 +155,7 @@ describe('insertPurgeEvent', () => {
       ts: 1_700_000_000_000,
       install_id: 'inst-xyz',
       cwd: '/repo/A',
-      artifacts_present_json: '["/repo/A/.agent/permissions.yaml"]',
+      artifacts_present_json: '["/repo/A/.forja/permissions.yaml"]',
       bytes_present: 1234,
       files_present: 5,
       dirs_present: 2,
@@ -165,7 +165,7 @@ describe('insertPurgeEvent', () => {
     expect(r.ts).toBe(1_700_000_000_000);
     expect(r.install_id).toBe('inst-xyz');
     expect(r.cwd).toBe('/repo/A');
-    expect(r.artifacts_present_json).toBe('["/repo/A/.agent/permissions.yaml"]');
+    expect(r.artifacts_present_json).toBe('["/repo/A/.forja/permissions.yaml"]');
     expect(r.bytes_present).toBe(1234);
     expect(r.files_present).toBe(5);
     expect(r.dirs_present).toBe(2);
@@ -297,7 +297,7 @@ describe('append-only contract', () => {
     //   - insertPurgeEvent: the only writer (called by cli/purge.ts
     //     after the operator confirms a --force purge).
     //   - listPurgeEventsByCwd: forensic read for "purge history of
-    //     project X" (called by the future `agent purge log` reader).
+    //     project X" (called by the future `forja purge log` reader).
     //   - prunePurgeEvents: retention-only mutation, called ONLY by
     //     the gc orchestrator (src/audit/gc.ts:sweepOne) with an
     //     age cutoff. AUDIT.md §1.2 specifies 365d retention; the
@@ -368,7 +368,7 @@ describe('prunePurgeEvents — retention sweep', () => {
 
   test('deletes across all cwd values (install-scoped, not project-scoped)', () => {
     // prunePurgeEvents is install-wide hygiene — operator running
-    // `agent gc --force` shouldn't have to enumerate every project's
+    // `forja gc --force` shouldn't have to enumerate every project's
     // cwd. Confirm the SQL does not filter by cwd.
     const db = newDb();
     insertPurgeEvent(db, { ...baseRow, cwd: '/a', ts: ts(100) });

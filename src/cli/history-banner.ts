@@ -2,7 +2,7 @@
 //
 // Discovers whether the operator has already acknowledged that input
 // history is being persisted; if not, emits the disclosure as info
-// lines on the bus and drops a `.agent/forja-history-acked` marker so
+// lines on the bus and drops a `.forja/forja-history-acked` marker so
 // subsequent boots stay quiet.
 //
 // Skip rules:
@@ -10,15 +10,15 @@
 //   - `FORJA_NO_HISTORY=1` env: nothing is persisted, so the banner
 //     is irrelevant. Disclosure of a non-event would just train
 //     operators to ignore the boot prose.
-//   - `.agent/no-history` file marker: same shape as above —
+//   - `.forja/no-history` file marker: same shape as above —
 //     persistence is permanently off for this project.
-//   - `.agent/forja-history-acked` already exists: operator saw
+//   - `.forja/forja-history-acked` already exists: operator saw
 //     this once before; surfacing it on every REPL would erode the
 //     "first-run" contract.
 //
 // All checks are filesystem stat calls scoped to the cwd. We don't
 // touch any other path — the marker travels with the project (matches
-// how `.agent/forja.db` and `no-history` already work). Marker
+// how `.forja/forja.db` and `no-history` already work). Marker
 // content is irrelevant; existence is the signal.
 
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
@@ -28,7 +28,7 @@ import type { Bus } from '../tui/bus.ts';
 
 const ACK_MARKER = 'forja-history-acked';
 const NO_HISTORY_MARKER = 'no-history';
-const AGENT_DIR = '.agent';
+const AGENT_DIR = '.forja';
 
 export interface MaybeEmitHistoryBannerOptions {
   bus: Bus;
@@ -79,7 +79,7 @@ export const maybeEmitHistoryBanner = (options: MaybeEmitHistoryBannerOptions): 
   // persist is a warning rather than fatal: the operator already
   // saw the banner this boot; the worst case is they see it again
   // next boot. mkdir -p in case bootstrap hasn't materialized
-  // `.agent/` yet (early-stage projects, rare).
+  // `.forja/` yet (early-stage projects, rare).
   try {
     mkdirSync(agentDir, { recursive: true });
     writeFileSync(ackPath, '');

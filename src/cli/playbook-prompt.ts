@@ -74,7 +74,7 @@ export const PLAYBOOK_WORKFLOW_HEADER = `**Workflow:**
 - Every delegated task carries a self-contained \`prompt\` — assume the subagent has zero context from this conversation. Inline the goal, the constraints, and the expected output shape.`;
 
 // Names of the canonical review playbooks the closing-discipline
-// bullet references. Both ship in the playbooks step of `agent init`;
+// bullet references. Both ship in the playbooks step of `forja init`;
 // an operator who hand-rolled their registry without these will
 // not see the closing bullet rendered.
 const CLOSING_REVIEW_NAMES = ['code-review', 'security-audit'] as const;

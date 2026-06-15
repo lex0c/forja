@@ -98,7 +98,7 @@ describe('getHeadSha', () => {
 describe('resolveRef', () => {
   test('returns null when ref is missing', async () => {
     await initRepoWithCommit(repo);
-    expect(await resolveRef(repo, 'refs/agent/checkpoints/missing')).toBeNull();
+    expect(await resolveRef(repo, 'refs/forja/checkpoints/missing')).toBeNull();
   });
 
   test('returns sha when ref exists', async () => {
@@ -404,7 +404,7 @@ describe('restore', () => {
     const result = await restore(repo, ckpt.sha as string);
     expect(result.stashed).toBe(true);
     expect(result.stashRef).toBeDefined();
-    expect(result.stashRef).toMatch(/^refs\/agent\/restore-saved\//);
+    expect(result.stashRef).toMatch(/^refs\/forja\/restore-saved\//);
     expect(result.stashKind).toBe('agent-ref');
 
     // Working tree now has the checkpoint version.
@@ -588,13 +588,13 @@ describe('restore', () => {
     // `stash pop` would conflict with the checkpoint's restored copy
     // of the same path.
     expect(result.stashKind).toBe('agent-ref');
-    expect(result.stashRef).toMatch(/^refs\/agent\/restore-saved\//);
+    expect(result.stashRef).toMatch(/^refs\/forja\/restore-saved\//);
 
     // After restore, working tree has the checkpoint's version.
     expect(await Bun.file(join(repo, 'config.txt')).text()).toBe('original\n');
 
     // The user's "user-edit" content is preserved in the
-    // refs/agent/restore-saved/* commit's tree. `git read-tree
+    // refs/forja/restore-saved/* commit's tree. `git read-tree
     // --reset -u <ref>` is the documented recovery — applies the
     // saved tree over the working tree, restoring user-edit content.
     await runGit(repo, ['read-tree', '--reset', '-u', result.stashRef as string]);
@@ -702,7 +702,7 @@ describe('diff', () => {
 });
 
 describe('listSessionRefs / deleteSessionRef', () => {
-  test('list returns refs under refs/agent/checkpoints/', async () => {
+  test('list returns refs under refs/forja/checkpoints/', async () => {
     await initRepoWithCommit(repo);
     await writeFile(join(repo, 'a.txt'), 'a');
     await snapshot({ cwd: repo, sessionId: 's-alpha', stepId: 'm', iso: 'iso' });
@@ -743,7 +743,7 @@ describe('parseRestoreSavedTimestamp', () => {
 
   test('returns null for refs outside the namespace', () => {
     expect(parseRestoreSavedTimestamp('refs/heads/main')).toBeNull();
-    expect(parseRestoreSavedTimestamp('refs/agent/checkpoints/foo')).toBeNull();
+    expect(parseRestoreSavedTimestamp('refs/forja/checkpoints/foo')).toBeNull();
   });
 
   test('returns null for non-numeric prefixes', () => {

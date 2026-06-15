@@ -1,6 +1,6 @@
 // failure_events repo. Append-only — no UPDATE or DELETE method.
 // Retention (spec §1.2: failure_events 365d) operates from a
-// separate `agent gc` path landed in a later slice; this module
+// separate `forja gc` path landed in a later slice; this module
 // only provides INSERT + read primitives.
 //
 // Schema in migration 041-failure-events.ts. Distinct from
@@ -152,7 +152,7 @@ export const countFailureEvents = (db: DB): number => {
 
 // ─── pruneFailureEvents ────────────────────────────────────────────────
 //
-// Retention sweep for `agent gc` Phase 2 (AGENTIC_CLI §2.1.3, AUDIT
+// Retention sweep for `forja gc` Phase 2 (AGENTIC_CLI §2.1.3, AUDIT
 // §1.2). Default retention 365d on `created_at`. Cutoff EXCLUSIVE.
 //
 // **Chain trade-off (documented in spec §2.1.3).** failure_events

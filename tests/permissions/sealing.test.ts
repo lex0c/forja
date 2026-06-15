@@ -1054,7 +1054,7 @@ describe('verifySealAgainstChain — parametric matrix across all 4 backends (sl
 // — verifySealAgainstChain will fail with "missing from
 // approvals_log". This is the canonical "rotate without
 // sealing-first" gap; the test pins the observable failure mode
-// so an operator running `agent permission seal-verify` after a
+// so an operator running `forja permission seal-verify` after a
 // rotation sees a clear diagnostic instead of a silent pass.
 describe('verifySealAgainstChain — rotation + unsealed entries (slice 135 P1 audit-4)', () => {
   test('rotation orphans pre-rotation seal entries — verify reports missing seq', async () => {

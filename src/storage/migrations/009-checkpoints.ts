@@ -3,7 +3,7 @@ export const migration009Checkpoints = {
   name: '009-checkpoints',
   // Spec §12 + CHECKPOINTS.md design doc. Each step that
   // executes a tool with `writes: true` produces a snapshot in git
-  // (commit object referenced under `refs/agent/checkpoints/<session>/<id>`).
+  // (commit object referenced under `refs/forja/checkpoints/<session>/<id>`).
   // This table is the audit + lookup layer: it lets `--checkpoints list`
   // enumerate the chain without walking refs, and `--undo` find the
   // most recent snapshot without parsing reflogs.

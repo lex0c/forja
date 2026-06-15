@@ -190,7 +190,7 @@ export type { Capability, CapabilityKind } from './capabilities.ts';
 export type { EffectiveCoverResult, IntersectionResult } from './capabilities.ts';
 export {
   TOOL_CAPABILITY_FOOTPRINTS,
-  agentMutate,
+  forjaMutate,
   capabilityCovers,
   capabilityCoversCwdAware,
   capabilityEquals,

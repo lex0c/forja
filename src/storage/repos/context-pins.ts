@@ -429,7 +429,7 @@ export { PERSISTED_COLUMNS };
 
 // ─── pruneContextPins ──────────────────────────────────────────────────
 //
-// Retention sweep for `agent gc` (AGENTIC_CLI §2.1.3, AUDIT §1.2,
+// Retention sweep for `forja gc` (AGENTIC_CLI §2.1.3, AUDIT §1.2,
 // CONTEXT_TUNING §12.4). Default retention 90d on `created_at`.
 // Cutoff EXCLUSIVE — a row at exactly `olderThanMs` is KEPT.
 //

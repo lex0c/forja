@@ -2,15 +2,15 @@
 //
 // Three layers, looked up at boot in execution-priority order
 // (enterprise first):
-//   1. enterprise: `/etc/agent/hooks.toml` (Linux/macOS) or
-//      `%PROGRAMDATA%\agent\hooks.toml` (Windows). Locked rules
+//   1. enterprise: `/etc/forja/hooks.toml` (Linux/macOS) or
+//      `%PROGRAMDATA%\forja\hooks.toml` (Windows). Locked rules
 //      live here.
-//   2. user:       `~/.config/agent/hooks.toml` per XDG_CONFIG_HOME
+//   2. user:       `~/.config/forja/hooks.toml` per XDG_CONFIG_HOME
 //      convention. Now ALSO honors Windows APPDATA / USERPROFILE
 //      via the shared agent-paths helper — pre-consolidation this
 //      file only handled POSIX, leaving Windows users without
 //      XDG_CONFIG_HOME silently missing the user layer.
-//   3. project:    `<repo>/.agent/hooks.toml`. Tracked by git
+//   3. project:    `<repo>/.forja/hooks.toml`. Tracked by git
 //      (operator decides what to commit; locked-shared semantics
 //      land if/when team-shared trust storage matures).
 //

@@ -596,7 +596,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       // Snapshot the parent's resolved Policy so the subprocess
       // child runs under the same authorization rules the parent
       // validated. Without this, the child would re-resolve
-      // `.agent/permissions.yaml` etc. on its own startup; an
+      // `.forja/permissions.yaml` etc. on its own startup; an
       // edit between parent spawn and child read would diverge
       // the rules mid-run. The engine exposes its underlying
       // policy via `policy()`; that's the canonical source for
@@ -744,16 +744,16 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
   // operator's `bg list` view from the project root continues to
   // work; segregated under a `subagents/` infix so the namespace
   // is self-documenting (parent's bg files live as
-  // `.agent/bg/<bgId>.stdout.log` directly in the dir; subagent
+  // `.forja/bg/<bgId>.stdout.log` directly in the dir; subagent
   // bg files nest two more levels down at
-  // `.agent/bg/subagents/<sessionId>/<bgId>.stdout.log`); per-
+  // `.forja/bg/subagents/<sessionId>/<bgId>.stdout.log`); per-
   // session subdirectory so concurrent subagents don't collide
   // and cleanup is a single recursive rm. The dir is created
   // lazily by the bg manager on first spawn — we only compute
   // the path here and forward it. For tests that inject a fake
   // spawn, the path is still computed (deterministic shape) but
   // unused by the fake.
-  const bgLogDir = join(input.cwd, '.agent', 'bg', 'subagents', childSession.id);
+  const bgLogDir = join(input.cwd, '.forja', 'bg', 'subagents', childSession.id);
   let handle: ChildProcessHandle;
   try {
     handle = spawn({
@@ -892,7 +892,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       });
     } catch {
       // Audit gap; the row stays in the "still running" partial
-      // index. `agent worktree gc` reaps it later as orphan.
+      // index. `forja worktree gc` reaps it later as orphan.
     }
   });
 
@@ -1407,7 +1407,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
   //
   // Re-query post-reap; if the DB shows no 'running' rows for
   // this child session, every process is accounted for and the
-  // dir is safe to remove. Otherwise we leave it; `agent worktree
+  // dir is safe to remove. Otherwise we leave it; `forja worktree
   // gc` will reconcile alongside the audit table.
   let stillRunningCount: number;
   try {
@@ -1426,7 +1426,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
     // no directory to remove), so we silence it; other errors
     // (permission denied, disk full, etc.) get logged to stderr
     // so the operator knows the cache is leaking. Cleanup failure
-    // never changes the run outcome — operator's `agent worktree
+    // never changes the run outcome — operator's `forja worktree
     // gc` sweeps stragglers.
     try {
       rmSync(bgLogDir, { recursive: true, force: true });
@@ -1439,7 +1439,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
     }
   } else if (stillRunningCount > 0) {
     process.stderr.write(
-      `subagent ${childSession.id}: bg log dir '${bgLogDir}' preserved — ${stillRunningCount} bg row(s) still 'running' (reaper deferred or kill incomplete); inspect via OS tools or 'agent worktree gc'\n`,
+      `subagent ${childSession.id}: bg log dir '${bgLogDir}' preserved — ${stillRunningCount} bg row(s) still 'running' (reaper deferred or kill incomplete); inspect via OS tools or 'forja worktree gc'\n`,
     );
   }
   // stillRunningCount === -1: re-query failed; warning already

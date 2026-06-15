@@ -1,4 +1,4 @@
-// `agent --worktrees gc` engine. Reconciles three sources of
+// `forja --worktrees gc` engine. Reconciles three sources of
 // truth:
 //
 //   1. The audit table (`subagent_worktrees`) — the
@@ -178,7 +178,7 @@ const defaultResolveRepoRoot = async (parentCwd: string): Promise<string | null>
 // Format groups records by blank line; relevant fields are
 // `worktree <abs path>` and `branch <ref>` (refs/heads/foo or
 // `(no branch)` for detached). We treat detached worktrees as
-// branchless — `agent worktree gc` only operates on `agent/*`
+// branchless — `forja worktree gc` only operates on `agent/*`
 // branches that the spawn lifecycle guaranteed.
 const parseWorktreeList = (raw: string): Map<string, string | null> => {
   const out = new Map<string, string | null>();
@@ -564,7 +564,7 @@ export interface RemoveResult {
   // True when the worktree directory + git admin entry are
   // both gone after the operation. False when removal failed
   // (e.g., a process is still cwd'd inside on Windows / NFS).
-  // Failure leaves state for `agent worktree gc` retry.
+  // Failure leaves state for `forja worktree gc` retry.
   removed: boolean;
   // True when the agent branch was deleted. Independent of
   // `removed` because branch deletion is best-effort.

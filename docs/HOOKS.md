@@ -52,16 +52,16 @@ Hooks are declared in TOML files. Three layers, looked up at boot in execution o
 
 | Layer | Path (POSIX) | Path (Windows) |
 |---|---|---|
-| Enterprise | `/etc/agent/hooks.toml` | `%PROGRAMDATA%\agent\hooks.toml` |
-| User | `$XDG_CONFIG_HOME/agent/hooks.toml` (fallback: `~/.config/agent/hooks.toml`) | `~/.config/agent/hooks.toml` |
-| Project | `<repo>/.agent/hooks.toml` | `<repo>\.agent\hooks.toml` |
+| Enterprise | `/etc/forja/hooks.toml` | `%PROGRAMDATA%\forja\hooks.toml` |
+| User | `$XDG_CONFIG_HOME/agent/hooks.toml` (fallback: `~/.config/forja/hooks.toml`) | `~/.config/forja/hooks.toml` |
+| Project | `<repo>/.forja/hooks.toml` | `<repo>\.forja\hooks.toml` |
 
 Each layer is optional. Missing files mean "zero hooks at this layer" — no warning. A whole-file parse failure drops the layer with one warning; an individual malformed `[[hooks]]` entry is dropped with a warning while other entries in the file continue to load. Warnings surface in the `/hooks` command output.
 
 ### 3.1 Entry shape
 
 ```toml
-# ~/.config/agent/hooks.toml
+# ~/.config/forja/hooks.toml
 
 # Top-level — applies to this layer's whole file.
 disable_all_hooks = false   # optional; default false (see §9)
@@ -236,7 +236,7 @@ Hooks emit text the model should see on its next turn:
 
 ```bash
 #!/bin/bash
-# .agent/hooks/branch-state.sh — UserPromptSubmit hook
+# .forja/hooks/branch-state.sh — UserPromptSubmit hook
 cat <<EOF
 {"additionalContext": "Current branch: $(git branch --show-current)\nUncommitted files: $(git status --porcelain | wc -l)"}
 EOF
@@ -314,7 +314,7 @@ Like `PostToolUse`, this event is non-blocking — operators can't "unfail" a to
 Top-level boolean per `hooks.toml`. When set on any layer, OR'd across all three. Once true, the dispatcher short-circuits — every event chain returns empty immediately, no spawn, no audit, no matcher evaluation:
 
 ```toml
-# /etc/agent/hooks.toml — enterprise pins the kill switch
+# /etc/forja/hooks.toml — enterprise pins the kill switch
 disable_all_hooks = true
 
 # Hooks below would normally run, but the kill switch dominates.
@@ -373,7 +373,7 @@ If the audit writer fails (DB locked, disk full, schema mismatch), the dispatche
 
 Hooks are an **operator-trusted surface**. Forja's overall threat model assumes the operator authored every hook script and the LLM cannot install or modify them. Concretely:
 
-1. **The LLM cannot install hooks.** Writing to `~/.config/agent/`, `/etc/agent/`, or `<repo>/.agent/` is HIDE_PATHS-masked inside the sandbox. A model attempting `write_file('~/.config/agent/hooks.toml')` cannot reach those paths from any default tool. The protected-paths list is enforced by the permission engine even when the sandbox is unavailable.
+1. **The LLM cannot install hooks.** Writing to `~/.config/forja/`, `/etc/forja/`, or `<repo>/.forja/` is HIDE_PATHS-masked inside the sandbox. A model attempting `write_file('~/.config/forja/hooks.toml')` cannot reach those paths from any default tool. The protected-paths list is enforced by the permission engine even when the sandbox is unavailable.
 
 2. **Hooks run unsandboxed.** Each hook is spawned via `sh -c` with the host's `PATH` + `HOME`. This is intentional — hooks exist precisely to talk to the host (Slack, CI, package managers, secrets vaults). Sandboxing them would defeat their purpose. The trust boundary is the on-disk hook file, not the hook process.
 
@@ -385,7 +385,7 @@ Hooks are an **operator-trusted surface**. Forja's overall threat model assumes 
 
 6. **`fail_closed` is your gate.** Hooks gating sensitive operations should set `fail_closed = true` so a crashed / hung / misconfigured hook denies rather than allows. The default `false` exists for log-only hooks where unavailability shouldn't break the flow.
 
-7. **Locking via enterprise layer.** Operators in managed environments can pin critical hooks at `/etc/agent/hooks.toml` with `locked = true`; lower layers can't shadow them. Same applies to `disable_all_hooks = true` at enterprise scope — once pinned, user and project can't re-enable.
+7. **Locking via enterprise layer.** Operators in managed environments can pin critical hooks at `/etc/forja/hooks.toml` with `locked = true`; lower layers can't shadow them. Same applies to `disable_all_hooks = true` at enterprise scope — once pinned, user and project can't re-enable.
 
 ### 11.1 What hooks are NOT
 
@@ -401,7 +401,7 @@ Hooks are an **operator-trusted surface**. Forja's overall threat model assumes 
 ### 12.1 Auto-format TypeScript after writes
 
 ```toml
-# .agent/hooks.toml
+# .forja/hooks.toml
 [[hooks]]
 event = "PostToolUse"
 matcher = { tool = "write_file" }
@@ -416,7 +416,7 @@ The `if` filter avoids spawning prettier for non-TypeScript writes; the 10s time
 
 ```bash
 #!/usr/bin/env bash
-# ~/.config/agent/hooks/ci-status.sh
+# ~/.config/forja/hooks/ci-status.sh
 LATEST=$(gh run list --limit 1 --json status,conclusion --jq '.[0]')
 jq -n --argjson r "$LATEST" '{
   "additionalContext": ("Latest CI run: " + ($r | tostring))
@@ -424,10 +424,10 @@ jq -n --argjson r "$LATEST" '{
 ```
 
 ```toml
-# ~/.config/agent/hooks.toml
+# ~/.config/forja/hooks.toml
 [[hooks]]
 event = "UserPromptSubmit"
-command = "~/.config/agent/hooks/ci-status.sh"
+command = "~/.config/forja/hooks/ci-status.sh"
 timeout_ms = 3000
 ```
 
@@ -437,7 +437,7 @@ If `gh` is slow or unavailable, the hook exits non-zero and the prompt proceeds 
 
 ```bash
 #!/usr/bin/env bash
-# .agent/hooks/check-rm.sh — PreToolUse hook
+# .forja/hooks/check-rm.sh — PreToolUse hook
 INPUT=$(cat)
 COMMAND=$(echo "$INPUT" | jq -r '.data.tool.input.command')
 if echo "$COMMAND" | grep -qE 'rm[[:space:]]+-rf[[:space:]]+[^./]'; then
@@ -451,7 +451,7 @@ fi
 event = "PreToolUse"
 matcher = { tool = "bash" }
 if = "Bash(rm *)"
-command = ".agent/hooks/check-rm.sh"
+command = ".forja/hooks/check-rm.sh"
 fail_closed = true
 ```
 
@@ -460,7 +460,7 @@ fail_closed = true
 ### 12.4 Page on tool failure
 
 ```toml
-# /etc/agent/hooks.toml — enterprise layer
+# /etc/forja/hooks.toml — enterprise layer
 [[hooks]]
 event = "PostToolUseFailure"
 command = "curl -s -X POST $PAGER_WEBHOOK -d 'tool={{tool.name}}&error={{tool.error}}&session={{sessionId}}'"
@@ -490,7 +490,7 @@ esac
 event = "PreToolUse"
 matcher = { tool = "bash" }
 if = "Bash(git *)"
-command = ".agent/hooks/git-no-color.sh"
+command = ".forja/hooks/git-no-color.sh"
 ```
 
 The rewritten command is re-checked against the permission engine before execution (§7.2) — if `git --no-pager -c color.ui=never status` doesn't pass policy for this session, the tool is refused. Operators get a clear deny message and the audit trail shows the elevation attempt.

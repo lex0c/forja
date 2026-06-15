@@ -63,8 +63,8 @@ git config user.name "smoke"
 # Drop bypass-mode policy so write_file isn't policy-denied.
 # Without this the harness exits with no checkpoints because the
 # tool calls would be denied before the snapshot's write step.
-mkdir -p .agent
-cat > .agent/permissions.yaml <<'YAML'
+mkdir -p .forja
+cat > .forja/permissions.yaml <<'YAML'
 defaults:
   mode: bypass
 YAML
@@ -109,7 +109,7 @@ bun run "$ROOT/src/cli/index.ts" \
 
 SESSION_ID=$(jq -r 'select(.type == "session_finished") | .result.sessionId' < run.ndjson | head -1)
 if [[ -z "$SESSION_ID" || "$SESSION_ID" == "null" ]]; then
-  echo "Could not extract sessionId from agent run:" >&2
+  echo "Could not extract sessionId from forja run:" >&2
   cat run.ndjson >&2
   exit 1
 fi

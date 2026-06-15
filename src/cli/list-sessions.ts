@@ -1,4 +1,4 @@
-// `agent --list-sessions` handler. Independent of bootstrap because
+// `forja --list-sessions` handler. Independent of bootstrap because
 // it has no need for the provider, the permission engine, or the
 // tool registry — only the DB. Skipping bootstrap means no API key
 // is required to inspect prior runs, and a missing/unparsable
@@ -20,7 +20,7 @@ import {
 export interface ListSessionsOptions {
   json: boolean;
   // Test seams: a custom DB path / preopened handle (used by unit
-  // tests that don't want to touch ~/.config/agent/).
+  // tests that don't want to touch ~/.config/forja/).
   dbPath?: string;
   dbOverride?: DB;
   out: (s: string) => void;

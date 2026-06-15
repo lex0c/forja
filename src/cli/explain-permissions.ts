@@ -32,8 +32,8 @@ import {
 export interface ExplainPermissionsOptions {
   cwd: string;
   // Test seam: skip enterprise / user file lookup so unit tests
-  // don't trip on the host's real `/etc/agent/permissions.yaml` or
-  // `~/.config/agent/permissions.yaml`. Production callers leave
+  // don't trip on the host's real `/etc/forja/permissions.yaml` or
+  // `~/.config/forja/permissions.yaml`. Production callers leave
   // these undefined and the resolver does its normal discovery.
   enterprisePath?: string | null;
   userPath?: string | null;
@@ -183,7 +183,7 @@ export const renderExplainPermissions = (
     lines.push('');
     if (mode === 'strict') {
       lines.push(
-        "(no tool sections defined — every gated tool will be denied. Create '.agent/permissions.yaml')",
+        "(no tool sections defined — every gated tool will be denied. Create '.forja/permissions.yaml')",
       );
     } else {
       lines.push('(no tool sections defined)');

@@ -24,7 +24,7 @@
 //           → fire FIRST-VISIT modal. The cwd-trust modal attested
 //             "I trust this directory" — it did NOT attest the
 //             current shared-memory content. A fresh clone with
-//             cwd-trusted + a malicious pre-populated `.agent/
+//             cwd-trusted + a malicious pre-populated `.forja/
 //             memory/shared/` would otherwise silently bless the
 //             attacker's hash. Operator must see the inventory and
 //             explicitly confirm.

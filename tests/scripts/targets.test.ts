@@ -24,8 +24,8 @@ describe('targets registry', () => {
   });
 
   test('assetName uses agent-<id> with extension', () => {
-    expect(assetName(targetById('linux-x64'))).toBe('agent-linux-x64');
-    expect(assetName(targetById('windows-x64'))).toBe('agent-windows-x64.exe');
+    expect(assetName(targetById('linux-x64'))).toBe('forja-linux-x64');
+    expect(assetName(targetById('windows-x64'))).toBe('forja-windows-x64.exe');
   });
 
   test('findTarget returns undefined for unknown ids', () => {

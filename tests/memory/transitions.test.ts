@@ -527,7 +527,7 @@ describe('transitionMemoryState: Eviction hook blocks', () => {
         blockedBy: {
           spec: {
             layer: 'enterprise',
-            sourcePath: '/etc/agent/hooks.toml',
+            sourcePath: '/etc/forja/hooks.toml',
             event: 'Eviction',
             matcher: {},
             entryIndex: 0,
@@ -561,7 +561,7 @@ describe('transitionMemoryState: Eviction hook blocks', () => {
     });
     expect(r.kind).toBe('blocked_by_hook');
     if (r.kind !== 'blocked_by_hook') return;
-    expect(r.blockedBy).toContain('/etc/agent/hooks.toml');
+    expect(r.blockedBy).toContain('/etc/forja/hooks.toml');
     expect(r.reason).toBe('security policy refused');
 
     // File unchanged.
@@ -571,7 +571,7 @@ describe('transitionMemoryState: Eviction hook blocks', () => {
     // Audit: eviction_events with outcome=blocked_by_hook.
     const last = getLastEvictionForObject(db, 'memory', 'x', 'user');
     expect(last?.outcome).toBe('blocked_by_hook');
-    expect(last?.blockedBy).toContain('/etc/agent/hooks.toml');
+    expect(last?.blockedBy).toContain('/etc/forja/hooks.toml');
 
     // memory_events refused row landed.
     const refused = listMemoryEventsByName(db, 'x').find((e) => e.action === 'refused');
@@ -633,7 +633,7 @@ describe('transitionMemoryState: Eviction hook blocks restore', () => {
         blockedBy: {
           spec: {
             layer: 'enterprise',
-            sourcePath: '/etc/agent/hooks.toml',
+            sourcePath: '/etc/forja/hooks.toml',
             event: 'Eviction',
             matcher: {},
             entryIndex: 0,

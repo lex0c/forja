@@ -259,7 +259,7 @@ export const queryHookRuns = (db: DB, opts: HookRunsQuery = {}): HookRun[] => {
 
 // ─── pruneHookRuns ─────────────────────────────────────────────────────
 //
-// Retention sweep for `agent gc` Phase 2 (AGENTIC_CLI §2.1.3, AUDIT
+// Retention sweep for `forja gc` Phase 2 (AGENTIC_CLI §2.1.3, AUDIT
 // §1.2). Default retention 90d on `created_at`. Cutoff EXCLUSIVE.
 //
 // Per-event hook execution log. FK SET NULL with sessions — rows

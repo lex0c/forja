@@ -1,4 +1,4 @@
-// `agent permission verify` — walks the audit hash chain for the
+// `forja permission verify` — walks the audit hash chain for the
 // active install_id and reports integrity. DB-only path: no provider,
 // no session start. Exit code 0 (intact) or 1 (broken or bootstrap
 // error). The JSON form prints one NDJSON line so the command stays
@@ -138,10 +138,10 @@ export const runPermissionVerify = async (
   out('Investigate before continuing. Forensic options:\n');
   out('  - Restore the SQLite DB from a backup before the break.\n');
   out('  - Audit the row at the broken seq and adjacent rows.\n');
-  out('  - Re-run with `agent permission rotate-chain --reason "<text>"` to archive\n');
+  out('  - Re-run with `forja permission rotate-chain --reason "<text>"` to archive\n');
   out('    the broken segment and start a fresh chain (chain remains QUARANTINED\n');
   out('    until you inspect the archived rows).\n');
-  out('  - Re-run `agent --accept-broken-chain ...` to continue under the known break.\n');
+  out('  - Re-run `forja --accept-broken-chain ...` to continue under the known break.\n');
   out('    A `chain-break-accepted` audit row lands BEFORE new decisions; the\n');
   out('    acceptance is permanently visible in the chain and `verify` flags it.\n');
   return 1;

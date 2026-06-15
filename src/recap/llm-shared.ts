@@ -195,7 +195,7 @@ export const renderViaLlm = async <T>(
   const output = template(structured);
   // Strip a single trailing newline before counting. Templates
   // canonically end with `\n` so the file reads cleanly when piped
-  // (`agent recap pr ... > PR.md`); naive `split('\n').length`
+  // (`forja recap pr ... > PR.md`); naive `split('\n').length`
   // would count that terminator as an extra empty line and reject
   // outputs that exactly meet the cap. Only the trailing newline
   // is stripped — internal blank lines stay counted because they

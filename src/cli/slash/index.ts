@@ -37,12 +37,9 @@ export type { SlashCommand, SlashContext, SlashResult } from './types.ts';
 // can list every other command via `listCommands`. Order matters
 // for /help output (operator reads top-to-bottom).
 //
-// Playbook-derived slash commands (one per def with a `slash:` field)
-// are intentionally NOT registered: playbooks stay reachable via
-// task_sync / task_async and the model's playbook hint, but the
-// operator `/review`-style shortcuts are withdrawn from the surface.
-// `buildPlaybookSlashCommands` (commands/playbook.ts) stays exported
-// and tested for that potential wiring; it just isn't called here.
+// Playbooks have no operator-facing slash command (the `/review`-style
+// shortcuts were withdrawn). They stay reachable via task_sync /
+// task_async and the model's playbook hint.
 export const createBuiltinRegistry = (): SlashRegistry => {
   // Two-pass: build the registry without help first, then add help
   // with a closure over its `list()`. Avoids the chicken-and-egg

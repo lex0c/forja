@@ -15,7 +15,7 @@
 // edit took effect.
 //
 // Read-only by design. Editing policy goes through the YAML files
-// (`.agent/permissions.yaml` etc.) — keeps a single source of
+// (`.forja/permissions.yaml` etc.) — keeps a single source of
 // truth and avoids inventing a runtime mutation path that would
 // diverge from the on-disk format. Spec: AGENTIC_CLI §8.
 

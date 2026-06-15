@@ -1083,7 +1083,7 @@ describe('runSubagent — orchestration', () => {
     // children don't collide and the operator's `bg list` view
     // from the project root continues to show only the parent's
     // processes. Path shape:
-    // `<parentCwd>/.agent/bg/subagents/<childSessionId>/`. The
+    // `<parentCwd>/.forja/bg/subagents/<childSessionId>/`. The
     // `subagents/` infix segregates the namespace from the
     // parent's flat-file bg layout. The parent's runSubagent
     // computes it deterministically; the spawn fake captures it
@@ -1118,7 +1118,7 @@ describe('runSubagent — orchestration', () => {
       cwd: '/p',
       spawnChildProcess: recordingSpawn,
     });
-    expect(captured.bgLogDir).toBe(`/p/.agent/bg/subagents/${captured.sessionId}`);
+    expect(captured.bgLogDir).toBe(`/p/.forja/bg/subagents/${captured.sessionId}`);
   });
 
   test('4.2b.iv: cleanupWorktree end-of-run removes the bgLogDir if it exists', async () => {
@@ -1127,7 +1127,7 @@ describe('runSubagent — orchestration', () => {
     // writes a fake log file. After runSubagent finishes, the
     // runtime's end-of-run rmSync must delete the directory and
     // its contents. Without this cleanup, the parent's
-    // `.agent/bg/` would accumulate per-session subdirectories
+    // `.forja/bg/` would accumulate per-session subdirectories
     // on every subagent run.
     const parentCwd = mkdtempSync(join(tmpdir(), 'forja-rt-bg-'));
     try {
@@ -1167,8 +1167,8 @@ describe('runSubagent — orchestration', () => {
       expect(observedDir).toBeDefined();
       if (observedDir !== undefined) {
         // Path shape — anchored to the parent's cwd, not '/p',
-        // namespaced by session ID under .agent/bg/subagents/.
-        expect(observedDir.startsWith(`${parentCwd}/.agent/bg/subagents/`)).toBe(true);
+        // namespaced by session ID under .forja/bg/subagents/.
+        expect(observedDir.startsWith(`${parentCwd}/.forja/bg/subagents/`)).toBe(true);
         // Cleanup MUST have removed the dir.
         expect(existsSync(observedDir)).toBe(false);
       }
@@ -1270,7 +1270,7 @@ describe('runSubagent — orchestration', () => {
       }
 
       // Disk-level: bgLogDir is gone (rmSync ran AFTER the reap).
-      const expectedDir = `${parentCwd}/.agent/bg/subagents/${result.sessionId}`;
+      const expectedDir = `${parentCwd}/.forja/bg/subagents/${result.sessionId}`;
       expect(existsSync(expectedDir)).toBe(false);
     } finally {
       // Defensive: if the test failed before the reaper killed it,
@@ -1797,7 +1797,7 @@ describe('runSubagent — orchestration', () => {
       expect(childRows[0]?.status).toBe('running');
 
       // bgLogDir preserved because re-query saw a running row.
-      const expectedDir = `${parentCwd}/.agent/bg/subagents/${result.sessionId}`;
+      const expectedDir = `${parentCwd}/.forja/bg/subagents/${result.sessionId}`;
       expect(existsSync(expectedDir)).toBe(true);
     } finally {
       if (bashProc !== undefined) {
@@ -2552,7 +2552,7 @@ describe('runSubagent — subprocess audit (subagent_processes)', () => {
     // argv hash is SHA256 over cmd joined with NUL.
     expect(row?.argvHash).toMatch(/^[0-9a-f]{64}$/);
     // stderr log path matches the bgLogDir convention.
-    expect(row?.stderrLogPath).toContain('/.agent/bg/subagents/');
+    expect(row?.stderrLogPath).toContain('/.forja/bg/subagents/');
     expect(row?.stderrLogPath?.endsWith('/stderr.log')).toBe(true);
     // Exit fields populated by the proc.exited handler.
     expect(row?.exitedAt).not.toBeNull();
@@ -2695,20 +2695,20 @@ describe('computeArgvHash', () => {
 
   test('argv differing ONLY in --subagent-bg-log-dir produces the same hash', () => {
     // The bg-log-dir embeds the session id in its path
-    // (`.agent/bg/subagents/<id>/`), so it MUST be filtered along
+    // (`.forja/bg/subagents/<id>/`), so it MUST be filtered along
     // with `--subagent-session-id` for the hash to be stable
     // across runs.
     const cmdA = [
       '/bin/agent',
       '--subagent-bg-log-dir',
-      '/p/.agent/bg/subagents/aaa/',
+      '/p/.forja/bg/subagents/aaa/',
       '--subagent-depth',
       '0',
     ];
     const cmdB = [
       '/bin/agent',
       '--subagent-bg-log-dir',
-      '/p/.agent/bg/subagents/bbb/',
+      '/p/.forja/bg/subagents/bbb/',
       '--subagent-depth',
       '0',
     ];
@@ -2784,12 +2784,12 @@ describe('drainStderrToLogFile', () => {
   test('writes received bytes into <logDir>/stderr.log', async () => {
     const { stream, enqueue, close } = makeStream();
     const drained = drainStderrToLogFile(stream, tmp);
-    enqueue('forja: subagent-child: hook /etc/agent/hooks.toml: malformed entry\n');
+    enqueue('forja: subagent-child: hook /etc/forja/hooks.toml: malformed entry\n');
     enqueue('forja: subagent-child: another error\n');
     close();
     await drained;
     const contents = require('node:fs').readFileSync(stderrPath(), 'utf8');
-    expect(contents).toContain('hook /etc/agent/hooks.toml');
+    expect(contents).toContain('hook /etc/forja/hooks.toml');
     expect(contents).toContain('another error');
   });
 
@@ -4083,7 +4083,7 @@ describe('runSubagent — interrupt soft/hard (S3)', () => {
     const hooks = [
       {
         layer: 'enterprise' as const,
-        sourcePath: '/etc/agent/hooks.toml',
+        sourcePath: '/etc/forja/hooks.toml',
         event: 'PreToolUse' as const,
         matcher: { tool: 'bash' as const },
         command: 'audit-bash',

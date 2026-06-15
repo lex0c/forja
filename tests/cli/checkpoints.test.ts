@@ -381,7 +381,7 @@ describe('runCheckpointsCli', () => {
       });
       expect(code).toBe(0);
       const errStr = c.err.join('');
-      expect(errStr).toContain('refs/agent/restore-saved/');
+      expect(errStr).toContain('refs/forja/restore-saved/');
       expect(errStr).toContain('git read-tree --reset -u');
       // Must NOT instruct the user to run `git stash pop` — that
       // command would fail on unborn HEAD. The phrase may still

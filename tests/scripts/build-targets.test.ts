@@ -54,7 +54,7 @@ describe('buildArgs', () => {
     expect(args).toContain('--target=bun-linux-x64-modern');
     expect(args).toContain('--minify');
     expect(args).toContain('--sourcemap=external');
-    expect(args).toContain('--outfile=dist/agent-linux-x64');
+    expect(args).toContain('--outfile=dist/forja-linux-x64');
   });
 
   test('omits --minify and --sourcemap when disabled', () => {
@@ -67,7 +67,7 @@ describe('buildArgs', () => {
     });
     expect(args).not.toContain('--minify');
     expect(args.find((a) => a.startsWith('--sourcemap'))).toBeUndefined();
-    expect(args).toContain('--outfile=out/agent-windows-x64.exe');
+    expect(args).toContain('--outfile=out/forja-windows-x64.exe');
   });
 });
 
@@ -123,8 +123,8 @@ describe('runBuild', () => {
   test('removes pre-existing asset and per-target sourcemap before spawning the build', () => {
     const dir = mkdtempSync(join(tmpdir(), 'forja-build-'));
     try {
-      const stale = join(dir, 'agent-linux-x64');
-      const staleMap = join(dir, 'agent-linux-x64.map');
+      const stale = join(dir, 'forja-linux-x64');
+      const staleMap = join(dir, 'forja-linux-x64.map');
       writeFileSync(stale, 'old');
       writeFileSync(staleMap, 'old-map');
       let assetExistedAtSpawn = true;
@@ -158,7 +158,7 @@ describe('runBuild', () => {
         // the binary and an `index.js.map` (entry-derived name) into
         // the outdir. Without the rename, the next target's build
         // would clobber this file.
-        writeFileSync(join(dir, 'agent-linux-x64'), 'binary-A');
+        writeFileSync(join(dir, 'forja-linux-x64'), 'binary-A');
         writeFileSync(join(dir, 'index.js.map'), 'map-A');
         return { status: 0 };
       };
@@ -172,7 +172,7 @@ describe('runBuild', () => {
       });
       // Original entry-derived name gone; per-target name present.
       expect(existsSync(join(dir, 'index.js.map'))).toBe(false);
-      const renamed = join(dir, 'agent-linux-x64.map');
+      const renamed = join(dir, 'forja-linux-x64.map');
       expect(existsSync(renamed)).toBe(true);
       expect(statSync(renamed).size).toBeGreaterThan(0);
     } finally {
@@ -184,7 +184,7 @@ describe('runBuild', () => {
     const dir = mkdtempSync(join(tmpdir(), 'forja-build-'));
     try {
       const fakeSpawn = () => {
-        writeFileSync(join(dir, 'agent-linux-x64'), 'binary');
+        writeFileSync(join(dir, 'forja-linux-x64'), 'binary');
         // No sourcemap emitted under --no-sourcemap.
         return { status: 0 };
       };
@@ -196,7 +196,7 @@ describe('runBuild', () => {
         ids: ['linux-x64'],
         spawn: fakeSpawn,
       });
-      expect(existsSync(join(dir, 'agent-linux-x64.map'))).toBe(false);
+      expect(existsSync(join(dir, 'forja-linux-x64.map'))).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -222,7 +222,7 @@ describe('runBuild', () => {
       // happens for a failed build (the failure path is what the
       // operator inspects).
       expect(existsSync(join(dir, 'index.js.map'))).toBe(true);
-      expect(existsSync(join(dir, 'agent-linux-x64.map'))).toBe(false);
+      expect(existsSync(join(dir, 'forja-linux-x64.map'))).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -283,7 +283,7 @@ describe('sourcemap name helpers', () => {
   });
 
   test('targetSourcemapName uses the asset name + .map', () => {
-    expect(targetSourcemapName(targetById('linux-x64'))).toBe('agent-linux-x64.map');
-    expect(targetSourcemapName(targetById('windows-x64'))).toBe('agent-windows-x64.exe.map');
+    expect(targetSourcemapName(targetById('linux-x64'))).toBe('forja-linux-x64.map');
+    expect(targetSourcemapName(targetById('windows-x64'))).toBe('forja-windows-x64.exe.map');
   });
 });

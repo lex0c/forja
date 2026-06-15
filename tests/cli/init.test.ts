@@ -74,10 +74,10 @@ describe('runInit — permissions step', () => {
     rmSync(cwd, { recursive: true, force: true });
   });
 
-  test('writes .agent/permissions.yaml with strict mode by default', () => {
+  test('writes .forja/permissions.yaml with strict mode by default', () => {
     const code = runInit({ cwd, mode: 'strict', only: ['permissions'], out, err });
     expect(code).toBe(0);
-    const target = join(cwd, '.agent', 'permissions.yaml');
+    const target = join(cwd, '.forja', 'permissions.yaml');
     expect(existsSync(target)).toBe(true);
     const body = readFileSync(target, 'utf8');
     expect(body).toContain('mode: strict');
@@ -87,11 +87,11 @@ describe('runInit — permissions step', () => {
 
   test('written template parses as a valid Policy', () => {
     runInit({ cwd, mode: 'strict', only: ['permissions'], out, err });
-    const body = readFileSync(join(cwd, '.agent', 'permissions.yaml'), 'utf8');
+    const body = readFileSync(join(cwd, '.forja', 'permissions.yaml'), 'utf8');
     // Round-trip: the same loader the engine uses must accept the
     // template. Catches divergence between template syntax and
     // schema (e.g. a future deny rule format change that would
-    // make `agent init` produce unparseable output).
+    // make `forja init` produce unparseable output).
     const policy = loadPolicyFromString(body);
     expect(policy.defaults.mode).toBe('strict');
     // Bash carries a conservative read-only allowlist (git
@@ -120,14 +120,14 @@ describe('runInit — permissions step', () => {
 
   test('--mode acceptEdits emits matching defaults', () => {
     runInit({ cwd, mode: 'acceptEdits', only: ['permissions'], out, err });
-    const body = readFileSync(join(cwd, '.agent', 'permissions.yaml'), 'utf8');
+    const body = readFileSync(join(cwd, '.forja', 'permissions.yaml'), 'utf8');
     expect(body).toContain('mode: acceptEdits');
     const policy = loadPolicyFromString(body);
     expect(policy.defaults.mode).toBe('acceptEdits');
   });
 
   test('skips existing file when not forced (idempotent re-run)', () => {
-    const target = join(cwd, '.agent', 'permissions.yaml');
+    const target = join(cwd, '.forja', 'permissions.yaml');
     runInit({ cwd, mode: 'strict', only: ['permissions'], out, err });
     const original = readFileSync(target, 'utf8');
     outBuf = [];
@@ -144,7 +144,7 @@ describe('runInit — permissions step', () => {
   });
 
   test("--force='all' overwrites the existing file", () => {
-    const target = join(cwd, '.agent', 'permissions.yaml');
+    const target = join(cwd, '.forja', 'permissions.yaml');
     runInit({ cwd, mode: 'strict', only: ['permissions'], out, err });
     writeFileSync(target, '# operator hand edit\n', { encoding: 'utf8' });
     outBuf = [];
@@ -165,7 +165,7 @@ describe('runInit — permissions step', () => {
   });
 
   test("--force=['permissions'] overwrites only the permissions file", () => {
-    const target = join(cwd, '.agent', 'permissions.yaml');
+    const target = join(cwd, '.forja', 'permissions.yaml');
     runInit({ cwd, mode: 'strict', only: ['permissions'], out, err });
     writeFileSync(target, '# operator hand edit\n', { encoding: 'utf8' });
     outBuf = [];
@@ -182,11 +182,11 @@ describe('runInit — permissions step', () => {
     expect(readFileSync(target, 'utf8')).toContain('mode: strict');
   });
 
-  test('creates .agent/ directory if missing', () => {
-    expect(existsSync(join(cwd, '.agent'))).toBe(false);
+  test('creates .forja/ directory if missing', () => {
+    expect(existsSync(join(cwd, '.forja'))).toBe(false);
     const code = runInit({ cwd, mode: 'strict', only: ['permissions'], out, err });
     expect(code).toBe(0);
-    expect(existsSync(join(cwd, '.agent'))).toBe(true);
+    expect(existsSync(join(cwd, '.forja'))).toBe(true);
   });
 });
 
@@ -207,10 +207,10 @@ describe('runInit — gitignore step', () => {
     rmSync(cwd, { recursive: true, force: true });
   });
 
-  test('writes default .agent/.gitignore on clean cwd', () => {
+  test('writes default .forja/.gitignore on clean cwd', () => {
     const code = runInit({ cwd, mode: 'strict', only: ['gitignore'], out, err });
     expect(code).toBe(0);
-    const target = join(cwd, '.agent', '.gitignore');
+    const target = join(cwd, '.forja', '.gitignore');
     expect(existsSync(target)).toBe(true);
     const body = readFileSync(target, 'utf8');
     // Pins the default content surface — sessions.db,
@@ -224,8 +224,8 @@ describe('runInit — gitignore step', () => {
     expect(body).toContain('*.log');
   });
 
-  test('never overwrites an existing .agent/.gitignore (operator-owned)', () => {
-    const dir = join(cwd, '.agent');
+  test('never overwrites an existing .forja/.gitignore (operator-owned)', () => {
+    const dir = join(cwd, '.forja');
     const target = join(dir, '.gitignore');
     runInit({ cwd, mode: 'strict', only: ['gitignore'], out, err });
     const operatorEdit = '# operator owns this file\nsomething-custom\n';
@@ -249,7 +249,7 @@ describe('runInit — gitignore step', () => {
   });
 
   test('regeneration path: delete + re-run materializes the default again', () => {
-    const target = join(cwd, '.agent', '.gitignore');
+    const target = join(cwd, '.forja', '.gitignore');
     runInit({ cwd, mode: 'strict', only: ['gitignore'], out, err });
     rmSync(target);
     outBuf = [];
@@ -278,10 +278,10 @@ describe('runInit — config step', () => {
     rmSync(cwd, { recursive: true, force: true });
   });
 
-  test('writes .agent/config.toml with active values for all four sections', () => {
+  test('writes .forja/config.toml with active values for all four sections', () => {
     const code = runInit({ cwd, mode: 'strict', only: ['config'], out, err });
     expect(code).toBe(0);
-    const target = join(cwd, '.agent', 'config.toml');
+    const target = join(cwd, '.forja', 'config.toml');
     expect(existsSync(target)).toBe(true);
     const body = readFileSync(target, 'utf8');
     // Rich-scaffold posture (AGENTIC_CLI.md §2.1.1, post-rewrite):
@@ -299,7 +299,7 @@ describe('runInit — config step', () => {
 
   test('scaffolded config contains NO comments (slash round-trip would kill them)', () => {
     runInit({ cwd, mode: 'strict', only: ['config'], out, err });
-    const body = readFileSync(join(cwd, '.agent', 'config.toml'), 'utf8');
+    const body = readFileSync(join(cwd, '.forja', 'config.toml'), 'utf8');
     // `/memory governance enable|disable` rewrites this file via
     // TOML round-trip and Bun.TOML.parse drops comments. The
     // scaffold MUST NOT emit any `#`-prefixed line or the file's
@@ -311,7 +311,7 @@ describe('runInit — config step', () => {
   });
 
   test('skips existing config.toml when not forced', () => {
-    const target = join(cwd, '.agent', 'config.toml');
+    const target = join(cwd, '.forja', 'config.toml');
     runInit({ cwd, mode: 'strict', only: ['config'], out, err });
     const operatorEdit = '[memory]\nverify_semantic_llm = false\n';
     writeFileSync(target, operatorEdit, { encoding: 'utf8' });
@@ -323,7 +323,7 @@ describe('runInit — config step', () => {
   });
 
   test("--force=['config'] overwrites the config file", () => {
-    const target = join(cwd, '.agent', 'config.toml');
+    const target = join(cwd, '.forja', 'config.toml');
     runInit({ cwd, mode: 'strict', only: ['config'], out, err });
     writeFileSync(target, '# operator edit\n', { encoding: 'utf8' });
     outBuf = [];
@@ -364,7 +364,7 @@ describe('runInit — playbooks step', () => {
     rmSync(cwd, { recursive: true, force: true });
   });
 
-  test('copies every fixture into .agent/agents/ on a clean cwd', () => {
+  test('copies every fixture into .forja/playbooks/ on a clean cwd', () => {
     const code = runInit({
       cwd,
       mode: 'strict',
@@ -374,9 +374,9 @@ describe('runInit — playbooks step', () => {
       err,
     });
     expect(code).toBe(0);
-    expect(existsSync(join(cwd, '.agent', 'agents', 'fixture-a.md'))).toBe(true);
-    expect(existsSync(join(cwd, '.agent', 'agents', 'fixture-b.md'))).toBe(true);
-    expect(readFileSync(join(cwd, '.agent', 'agents', 'fixture-a.md'), 'utf8')).toContain(
+    expect(existsSync(join(cwd, '.forja', 'playbooks', 'fixture-a.md'))).toBe(true);
+    expect(existsSync(join(cwd, '.forja', 'playbooks', 'fixture-b.md'))).toBe(true);
+    expect(readFileSync(join(cwd, '.forja', 'playbooks', 'fixture-a.md'), 'utf8')).toContain(
       'name: fixture-a',
     );
     const summary = outBuf.join('');
@@ -393,7 +393,7 @@ describe('runInit — playbooks step', () => {
       out,
       err,
     });
-    const dir = join(cwd, '.agent', 'agents');
+    const dir = join(cwd, '.forja', 'playbooks');
     const initialContent = '# pre-existing edit';
     writeFileSync(join(dir, 'fixture-a.md'), initialContent, { encoding: 'utf8' });
     outBuf = [];
@@ -412,7 +412,7 @@ describe('runInit — playbooks step', () => {
   });
 
   test("--force=['playbooks'] overwrites existing playbooks", () => {
-    const dir = join(cwd, '.agent', 'agents');
+    const dir = join(cwd, '.forja', 'playbooks');
     runInit({
       cwd,
       mode: 'strict',
@@ -451,7 +451,7 @@ describe('runInit — playbooks step', () => {
       out,
       err,
     });
-    const playbookTarget = join(cwd, '.agent', 'agents', 'fixture-a.md');
+    const playbookTarget = join(cwd, '.forja', 'playbooks', 'fixture-a.md');
     const operatorEdit = '# operator owns this playbook';
     writeFileSync(playbookTarget, operatorEdit, { encoding: 'utf8' });
     outBuf = [];
@@ -460,8 +460,8 @@ describe('runInit — playbooks step', () => {
     expect(readFileSync(playbookTarget, 'utf8')).toBe(operatorEdit);
   });
 
-  test('creates .agent/agents/ if missing', () => {
-    expect(existsSync(join(cwd, '.agent', 'agents'))).toBe(false);
+  test('creates .forja/playbooks/ if missing', () => {
+    expect(existsSync(join(cwd, '.forja', 'playbooks'))).toBe(false);
     const code = runInit({
       cwd,
       mode: 'strict',
@@ -471,7 +471,7 @@ describe('runInit — playbooks step', () => {
       err,
     });
     expect(code).toBe(0);
-    expect(existsSync(join(cwd, '.agent', 'agents'))).toBe(true);
+    expect(existsSync(join(cwd, '.forja', 'playbooks'))).toBe(true);
   });
 
   test('mid-loop write failure aborts and preserves prior writes', () => {
@@ -487,7 +487,7 @@ describe('runInit — playbooks step', () => {
       { filename: 'good-1.md', content: '---\nname: a\n---\n' },
       { filename: 'good-2.md', content: '---\nname: b\n---\n' },
       // ENOENT trigger: parent `missing-subdir/` is not pre-created,
-      // and the scaffolder only mkdirs `.agent/agents/`, not nested
+      // and the scaffolder only mkdirs `.forja/playbooks/`, not nested
       // paths inside filenames.
       { filename: 'missing-subdir/bad.md', content: '---\nname: c\n---\n' },
       { filename: 'never-written.md', content: '---\nname: d\n---\n' },
@@ -502,20 +502,20 @@ describe('runInit — playbooks step', () => {
     });
     expect(code).toBe(1);
     // First two survive at their final paths.
-    expect(existsSync(join(cwd, '.agent', 'agents', 'good-1.md'))).toBe(true);
-    expect(existsSync(join(cwd, '.agent', 'agents', 'good-2.md'))).toBe(true);
+    expect(existsSync(join(cwd, '.forja', 'playbooks', 'good-1.md'))).toBe(true);
+    expect(existsSync(join(cwd, '.forja', 'playbooks', 'good-2.md'))).toBe(true);
     // Failed entry: no file at the target subpath, no leaked temp
     // sibling either (atomicWrite cleans up on write-throw).
-    expect(existsSync(join(cwd, '.agent', 'agents', 'missing-subdir'))).toBe(false);
+    expect(existsSync(join(cwd, '.forja', 'playbooks', 'missing-subdir'))).toBe(false);
     // Entry after the failure was never attempted — scaffolder
     // early-returns the moment any single playbook fails.
-    expect(existsSync(join(cwd, '.agent', 'agents', 'never-written.md'))).toBe(false);
+    expect(existsSync(join(cwd, '.forja', 'playbooks', 'never-written.md'))).toBe(false);
     // Operator-visible diagnostic on stderr.
     expect(errBuf.join('')).toContain('failed to write');
     expect(errBuf.join('')).toContain('missing-subdir/bad.md');
-    // No `.tmp-PID-TS` orphans anywhere in .agent/agents/.
+    // No `.tmp-PID-TS` orphans anywhere in .forja/playbooks/.
     const fs = require('node:fs') as typeof import('node:fs');
-    const agentsDir = join(cwd, '.agent', 'agents');
+    const agentsDir = join(cwd, '.forja', 'playbooks');
     const entries = fs.readdirSync(agentsDir);
     for (const e of entries) {
       expect(e).not.toMatch(/\.tmp-\d+-\d+$/);
@@ -566,7 +566,7 @@ describe('runInit — full bundle (default order)', () => {
     // list includes `seeds` (user-scope install), which the
     // dedicated init-seeds.test.ts exercises under an isolated
     // XDG_CONFIG_HOME. Mixing it in here would either pollute the
-    // developer's real ~/.config/agent or force a tmpdir XDG
+    // developer's real ~/.config/forja or force a tmpdir XDG
     // override on every test — both unnecessary because the seed
     // step is unrelated to the project-artifact scaffold this test
     // pins.
@@ -580,28 +580,28 @@ describe('runInit — full bundle (default order)', () => {
       err,
     });
     expect(code).toBe(0);
-    expect(existsSync(join(cwd, '.agent', 'permissions.yaml'))).toBe(true);
-    expect(existsSync(join(cwd, '.agent', '.gitignore'))).toBe(true);
-    expect(existsSync(join(cwd, '.agent', 'config.toml'))).toBe(true);
-    expect(existsSync(join(cwd, '.agent', 'agents', 'fixture-a.md'))).toBe(true);
-    expect(existsSync(join(cwd, '.agent', 'agents', 'fixture-b.md'))).toBe(true);
-    expect(existsSync(join(cwd, '.agent', 'skills', 'shared', 'fixture-skill-a.md'))).toBe(true);
-    expect(existsSync(join(cwd, '.agent', 'skills', 'shared', 'fixture-skill-b.md'))).toBe(true);
+    expect(existsSync(join(cwd, '.forja', 'permissions.yaml'))).toBe(true);
+    expect(existsSync(join(cwd, '.forja', '.gitignore'))).toBe(true);
+    expect(existsSync(join(cwd, '.forja', 'config.toml'))).toBe(true);
+    expect(existsSync(join(cwd, '.forja', 'playbooks', 'fixture-a.md'))).toBe(true);
+    expect(existsSync(join(cwd, '.forja', 'playbooks', 'fixture-b.md'))).toBe(true);
+    expect(existsSync(join(cwd, '.forja', 'skills', 'shared', 'fixture-skill-a.md'))).toBe(true);
+    expect(existsSync(join(cwd, '.forja', 'skills', 'shared', 'fixture-skill-b.md'))).toBe(true);
     // Aggregate count = 1 perm + 1 gitignore + 1 config + 2 playbooks + 2 skills
     expect(outBuf.join('')).toContain('7 wrote');
     expect(outBuf.join('')).toContain('5 steps');
-    expect(outBuf.join('')).toContain("review .agent/ and run 'agent'");
+    expect(outBuf.join('')).toContain("review .forja/ and run 'forja'");
   });
 
   test('atomic-write preserves the existing file mode on force-overwrite', () => {
-    // Operator who tightened `.agent/config.toml` to 0600 for
+    // Operator who tightened `.forja/config.toml` to 0600 for
     // security keeps that mode after `init --force=config`.
     // Without preservation, the temp+rename adopts the temp's
     // default (0644 modulated by umask) and silently relaxes the
     // restriction. Pin via a config-only scaffold so we don't
     // depend on the playbooks fixture or .gitignore.
     runInit({ cwd, mode: 'strict', only: ['config'], out, err });
-    const target = join(cwd, '.agent', 'config.toml');
+    const target = join(cwd, '.forja', 'config.toml');
     const fs = require('node:fs') as typeof import('node:fs');
     fs.chmodSync(target, 0o600);
     outBuf = [];
@@ -611,7 +611,7 @@ describe('runInit — full bundle (default order)', () => {
     expect(modeAfter).toBe(0o600);
   });
 
-  test('atomic-write leaves no `.tmp-*` orphan in .agent/ after a successful scaffold', () => {
+  test('atomic-write leaves no `.tmp-*` orphan in .forja/ after a successful scaffold', () => {
     // Pin for the atomic-write contract: temp+rename succeeded, the
     // temp file should be gone (rename moved it to the target). A
     // future refactor that drops the rename in favor of a direct
@@ -631,7 +631,7 @@ describe('runInit — full bundle (default order)', () => {
       }
       return out;
     };
-    const allFiles = walk(join(cwd, '.agent'));
+    const allFiles = walk(join(cwd, '.forja'));
     const tmps = allFiles.filter((p) => /\.tmp-\d+-\d+$/.test(p));
     expect(tmps).toEqual([]);
   });
@@ -645,10 +645,10 @@ describe('runInit — full bundle (default order)', () => {
       config: '# operator config edit',
       playbook: '# operator playbook edit',
     };
-    writeFileSync(join(cwd, '.agent', 'permissions.yaml'), edits.perm);
-    writeFileSync(join(cwd, '.agent', '.gitignore'), edits.gitignore);
-    writeFileSync(join(cwd, '.agent', 'config.toml'), edits.config);
-    writeFileSync(join(cwd, '.agent', 'agents', 'fixture-a.md'), edits.playbook);
+    writeFileSync(join(cwd, '.forja', 'permissions.yaml'), edits.perm);
+    writeFileSync(join(cwd, '.forja', '.gitignore'), edits.gitignore);
+    writeFileSync(join(cwd, '.forja', 'config.toml'), edits.config);
+    writeFileSync(join(cwd, '.forja', 'playbooks', 'fixture-a.md'), edits.playbook);
     outBuf = [];
     errBuf = [];
     const code = runInit({
@@ -659,15 +659,15 @@ describe('runInit — full bundle (default order)', () => {
       err,
     });
     expect(code).toBe(0);
-    expect(readFileSync(join(cwd, '.agent', 'permissions.yaml'), 'utf8')).toBe(edits.perm);
-    expect(readFileSync(join(cwd, '.agent', '.gitignore'), 'utf8')).toBe(edits.gitignore);
-    expect(readFileSync(join(cwd, '.agent', 'config.toml'), 'utf8')).toBe(edits.config);
-    expect(readFileSync(join(cwd, '.agent', 'agents', 'fixture-a.md'), 'utf8')).toBe(
+    expect(readFileSync(join(cwd, '.forja', 'permissions.yaml'), 'utf8')).toBe(edits.perm);
+    expect(readFileSync(join(cwd, '.forja', '.gitignore'), 'utf8')).toBe(edits.gitignore);
+    expect(readFileSync(join(cwd, '.forja', 'config.toml'), 'utf8')).toBe(edits.config);
+    expect(readFileSync(join(cwd, '.forja', 'playbooks', 'fixture-a.md'), 'utf8')).toBe(
       edits.playbook,
     );
     // Footer suppressed when nothing was written — re-runs are
     // quiet by design.
-    expect(outBuf.join('')).not.toContain("run 'agent' to start");
+    expect(outBuf.join('')).not.toContain("run 'forja' to start");
   });
 
   test("--force='all' overwrites every force-eligible artifact but NOT .gitignore", () => {
@@ -678,10 +678,10 @@ describe('runInit — full bundle (default order)', () => {
       config: '# operator config edit',
       playbook: '# operator playbook edit',
     };
-    writeFileSync(join(cwd, '.agent', 'permissions.yaml'), edits.perm);
-    writeFileSync(join(cwd, '.agent', '.gitignore'), edits.gitignore);
-    writeFileSync(join(cwd, '.agent', 'config.toml'), edits.config);
-    writeFileSync(join(cwd, '.agent', 'agents', 'fixture-a.md'), edits.playbook);
+    writeFileSync(join(cwd, '.forja', 'permissions.yaml'), edits.perm);
+    writeFileSync(join(cwd, '.forja', '.gitignore'), edits.gitignore);
+    writeFileSync(join(cwd, '.forja', 'config.toml'), edits.config);
+    writeFileSync(join(cwd, '.forja', 'playbooks', 'fixture-a.md'), edits.playbook);
     outBuf = [];
     errBuf = [];
     runInit({
@@ -693,13 +693,13 @@ describe('runInit — full bundle (default order)', () => {
       err,
     });
     // Force-eligible artifacts got rewritten.
-    expect(readFileSync(join(cwd, '.agent', 'permissions.yaml'), 'utf8')).toContain('mode: strict');
-    expect(readFileSync(join(cwd, '.agent', 'config.toml'), 'utf8')).toContain('[budget]');
-    expect(readFileSync(join(cwd, '.agent', 'agents', 'fixture-a.md'), 'utf8')).toContain(
+    expect(readFileSync(join(cwd, '.forja', 'permissions.yaml'), 'utf8')).toContain('mode: strict');
+    expect(readFileSync(join(cwd, '.forja', 'config.toml'), 'utf8')).toContain('[budget]');
+    expect(readFileSync(join(cwd, '.forja', 'playbooks', 'fixture-a.md'), 'utf8')).toContain(
       'name: fixture-a',
     );
     // .gitignore stayed — operator-owned per MEMORY.md §2.5.
-    expect(readFileSync(join(cwd, '.agent', '.gitignore'), 'utf8')).toBe(edits.gitignore);
+    expect(readFileSync(join(cwd, '.forja', '.gitignore'), 'utf8')).toBe(edits.gitignore);
   });
 
   test("--only=['permissions','config'] writes only those two", () => {
@@ -711,23 +711,23 @@ describe('runInit — full bundle (default order)', () => {
       err,
     });
     expect(code).toBe(0);
-    expect(existsSync(join(cwd, '.agent', 'permissions.yaml'))).toBe(true);
-    expect(existsSync(join(cwd, '.agent', 'config.toml'))).toBe(true);
-    expect(existsSync(join(cwd, '.agent', '.gitignore'))).toBe(false);
-    expect(existsSync(join(cwd, '.agent', 'agents'))).toBe(false);
+    expect(existsSync(join(cwd, '.forja', 'permissions.yaml'))).toBe(true);
+    expect(existsSync(join(cwd, '.forja', 'config.toml'))).toBe(true);
+    expect(existsSync(join(cwd, '.forja', '.gitignore'))).toBe(false);
+    expect(existsSync(join(cwd, '.forja', 'playbooks'))).toBe(false);
     expect(outBuf.join('')).toContain('2 steps');
   });
 
   test('partial failure exits 1 and preceding writes survive', () => {
     // First run lays everything down.
     runInit({ cwd, mode: 'strict', playbookSource: FIXTURE_PLAYBOOKS, out, err });
-    // Replace the .agent/agents directory with a regular file —
+    // Replace the .forja/playbooks directory with a regular file —
     // the playbooks step's mkdirSync(targetDir, {recursive:true})
     // will throw ENOTDIR. Permissions / gitignore / config already
     // exist from the first run, so they skip. The playbooks step
     // is the one that fails.
-    rmSync(join(cwd, '.agent', 'agents'), { recursive: true, force: true });
-    writeFileSync(join(cwd, '.agent', 'agents'), 'sentinel');
+    rmSync(join(cwd, '.forja', 'playbooks'), { recursive: true, force: true });
+    writeFileSync(join(cwd, '.forja', 'playbooks'), 'sentinel');
     outBuf = [];
     errBuf = [];
     const code = runInit({
@@ -741,8 +741,8 @@ describe('runInit — full bundle (default order)', () => {
     expect(errBuf.join('')).toContain('failed');
     // Surviving artifacts from earlier still on disk — no rollback
     // is the spec posture so the operator can iterate.
-    expect(existsSync(join(cwd, '.agent', 'permissions.yaml'))).toBe(true);
-    expect(existsSync(join(cwd, '.agent', '.gitignore'))).toBe(true);
-    expect(existsSync(join(cwd, '.agent', 'config.toml'))).toBe(true);
+    expect(existsSync(join(cwd, '.forja', 'permissions.yaml'))).toBe(true);
+    expect(existsSync(join(cwd, '.forja', '.gitignore'))).toBe(true);
+    expect(existsSync(join(cwd, '.forja', 'config.toml'))).toBe(true);
   });
 });

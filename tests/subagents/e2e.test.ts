@@ -476,7 +476,7 @@ describe('subagent e2e — real child harness over IPC (S4)', () => {
 
     // Audit chain: query the approvals table joined back to
     // tool_calls + messages so the assertion mirrors what an
-    // operator running `agent --list-sessions <child> --audit`
+    // operator running `forja --list-sessions <child> --audit`
     // would see — proves the chain "operator approved X for child Y
     // for tool Z" is reconstructable through the existing schema
     // (no migration needed, per BACKLOG decision).
@@ -615,7 +615,7 @@ describe('subagent e2e — real child harness over IPC (S4)', () => {
     // its systemPrompt; the shared memory body MUST be excluded.
     const { mkdirSync, writeFileSync } = await import('node:fs');
     const parentCwd = mkdtempSync(join(tmpdir(), 'forja-subagent-h3-'));
-    const sharedDir = join(parentCwd, '.agent', 'memory', 'shared');
+    const sharedDir = join(parentCwd, '.forja', 'memory', 'shared');
     mkdirSync(sharedDir, { recursive: true });
     writeFileSync(join(sharedDir, 'MEMORY.md'), '- [Sensitive](sensitive.md) — h\n');
     writeFileSync(

@@ -57,11 +57,11 @@ echo "alpha contents" > alpha.txt
 echo "beta contents"  > beta.txt
 echo "gamma contents" > gamma.txt
 
-mkdir -p .agent/agents
+mkdir -p .forja/playbooks
 
 # Coordinator: can spawn other subagents via task. Tools are just
 # `task` — no fs tools — so its only useful action is delegation.
-cat > .agent/agents/coordinator.md <<'MD'
+cat > .forja/playbooks/coordinator.md <<'MD'
 ---
 name: coordinator
 description: Coordinator that delegates filesystem work to worker subagents.
@@ -78,7 +78,7 @@ briefly.
 MD
 
 # Worker: read-only fs tools.
-cat > .agent/agents/worker.md <<'MD'
+cat > .forja/playbooks/worker.md <<'MD'
 ---
 name: worker
 description: Read-only file discovery and reading.
@@ -91,7 +91,7 @@ You are a worker subagent. Use glob/grep/read_file to answer
 the user's request. Be concise; return a short answer.
 MD
 
-cat > .agent/permissions.yaml <<'YAML'
+cat > .forja/permissions.yaml <<'YAML'
 defaults:
   mode: bypass
 YAML

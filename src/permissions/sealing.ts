@@ -245,7 +245,7 @@ export type VerifySealResult =
 // which `createWormFileSealer` wraps into the standard ok:false
 // reason string.
 //
-// Shared between bootstrap wire-up AND the `agent permission
+// Shared between bootstrap wire-up AND the `forja permission
 // seal-*` CLI verbs. Future backends ship alongside this factory
 // with their own `defaultXFactory` functions; the CLI dispatch
 // reads `config.mode` to pick.
@@ -499,7 +499,7 @@ export const factoryForSealMode = (mode: SealMode): ((c: SealPolicy) => SealStor
 // identity closes the cross-install forgery vector.
 //
 // `installId` is required (no default) so callers MUST pin the
-// identity at the verify boundary. CLI callers (`agent permission
+// identity at the verify boundary. CLI callers (`forja permission
 // seal-verify`) resolve identity via `ensureInstallId({ env })`
 // then pass through.
 export const verifySealAgainstChain = (

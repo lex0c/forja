@@ -711,7 +711,7 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         out.push({
           type: 'warn',
           ts,
-          message: "  Run 'agent doctor' to investigate.",
+          message: "  Run 'forja doctor' to investigate.",
         });
         return out;
       }

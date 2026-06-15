@@ -328,7 +328,7 @@ export const resolveSandboxBinary = (
 // `sessionId` is the harness's session UUID. Embedding it ties
 // the tmpdir to a single Forja session: two parallel `forja`
 // processes don't collide, and operator post-mortem can correlate
-// `ls /tmp/forja-sb-*` against `agent doctor` sessions.
+// `ls /tmp/forja-sb-*` against `forja doctor` sessions.
 //
 // Caller responsibility: pre-create (mkdir + mode 0o700), set
 // `TMPDIR=<this-path>` in the wrapped process's env, optionally
@@ -351,7 +351,7 @@ export const defaultSandboxTmpdir = (sessionId: string): string => {
 //   2. cleanup callback (rm -rf, best-effort). Caller registers
 //      this on process exit / session end so the directory doesn't
 //      orphan. Failure to clean up doesn't refuse — orphans get
-//      swept by `agent worktree gc` (offline) later.
+//      swept by `forja worktree gc` (offline) later.
 //
 // What this does NOT own:
 //   - sessionId generation (caller decides; CLI bootstrap uses a
@@ -407,7 +407,7 @@ export interface SandboxTmpdir {
   // Best-effort `rm -rf <tmpdir>`. Idempotent — calling twice is
   // safe; the second call is a no-op. Caller registers this on
   // process exit / session end. Failure inside the rm is swallowed
-  // (best-effort cleanup; orphans get swept by `agent worktree gc`).
+  // (best-effort cleanup; orphans get swept by `forja worktree gc`).
   cleanup: () => void;
 }
 

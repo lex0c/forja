@@ -1034,7 +1034,7 @@ describe('repl — mirror trim (cap enforcement)', () => {
 });
 
 describe('repl — /history on reload (boot disabled → re-enable)', () => {
-  test('boot with .agent/no-history present + entries in db; /history on after marker removal repopulates the mirror', async () => {
+  test('boot with .forja/no-history present + entries in db; /history on after marker removal repopulates the mirror', async () => {
     // Pre-stage: entries already in the db (operator was using history
     // before opting out via the marker), then create the marker so
     // boot starts with persistence disabled.
@@ -1044,8 +1044,8 @@ describe('repl — /history on reload (boot disabled → re-enable)', () => {
       migrate(dbForBoot);
       appendHistory(dbForBoot, realRoot, 'old-prompt-one', { ts: 1 });
       appendHistory(dbForBoot, realRoot, 'old-prompt-two', { ts: 2 });
-      mkdirSync(join(realRoot, '.agent'), { recursive: true });
-      writeFileSync(join(realRoot, '.agent', 'no-history'), '');
+      mkdirSync(join(realRoot, '.forja'), { recursive: true });
+      writeFileSync(join(realRoot, '.forja', 'no-history'), '');
 
       // Build a bootstrap stub pointing at this real path so storage's
       // file-marker check resolves correctly.
@@ -1105,7 +1105,7 @@ describe('repl — /history on reload (boot disabled → re-enable)', () => {
       // signal.
       // Operator removes the marker (out-of-band, e.g. via shell) and
       // runs /history on; the command must reload the mirror.
-      rmSync(join(realRoot, '.agent', 'no-history'));
+      rmSync(join(realRoot, '.forja', 'no-history'));
       stdin.feed('/history on\r');
       await tick();
       // ↑ should now recall the most-recent pre-existing entry.

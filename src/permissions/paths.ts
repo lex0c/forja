@@ -13,7 +13,7 @@
 import { enterpriseAgentPath, projectAgentPath, userAgentPath } from '../config/agent-paths.ts';
 
 // Enterprise-installed policy. Linux/macOS: well-known /etc path.
-// Windows: %PROGRAMDATA%\agent\permissions.yaml.
+// Windows: %PROGRAMDATA%\forja\permissions.yaml.
 export const enterprisePolicyPath = (
   platform: NodeJS.Platform = process.platform,
   env: NodeJS.ProcessEnv = process.env,

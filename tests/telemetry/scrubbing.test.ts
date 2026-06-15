@@ -135,7 +135,7 @@ describe('scrubEvent — sealing.failure', () => {
       kind: 'sealing.failure',
       ts: 100,
       mode: 'worm-file',
-      path: '/var/log/agent/seal.log',
+      path: '/var/log/forja/seal.log',
       reason: 'chattr failed',
       on_failure: 'degrade',
     };
@@ -163,12 +163,12 @@ describe('scrubEvent — sealing.failure', () => {
       kind: 'sealing.failure',
       ts: 100,
       mode: 'worm-file',
-      path: '/var/log/agent/seal.log',
+      path: '/var/log/forja/seal.log',
       reason: 'chattr failed',
       on_failure: 'degrade',
     };
     const out = scrubEvent(event, { redactPaths: false }) as SealingFailureEvent;
-    expect(out.path).toBe('/var/log/agent/seal.log');
+    expect(out.path).toBe('/var/log/forja/seal.log');
   });
 });
 
@@ -179,10 +179,10 @@ describe('scrubEvent — state.transition', () => {
       ts: 100,
       from: 'ready',
       to: 'degraded',
-      reason: 'sealing failed at /var/log/agent/seal.log because /usr/bin/chattr exited 1',
+      reason: 'sealing failed at /var/log/forja/seal.log because /usr/bin/chattr exited 1',
     };
     const out = scrubEvent(event) as StateTransitionEvent;
-    expect(out.reason).not.toContain('/var/log/agent/seal.log');
+    expect(out.reason).not.toContain('/var/log/forja/seal.log');
     expect(out.reason).not.toContain('/usr/bin/chattr');
     expect(out.reason).toContain('<path>');
   });
@@ -205,10 +205,10 @@ describe('scrubEvent — state.transition', () => {
       ts: 100,
       from: 'ready',
       to: 'degraded',
-      reason: 'failed at /etc/agent/policy.yaml',
+      reason: 'failed at /etc/forja/policy.yaml',
     };
     const out = scrubEvent(event, { redactPaths: false }) as StateTransitionEvent;
-    expect(out.reason).toBe('failed at /etc/agent/policy.yaml');
+    expect(out.reason).toBe('failed at /etc/forja/policy.yaml');
   });
 });
 

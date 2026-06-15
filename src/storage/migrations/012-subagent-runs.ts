@@ -5,7 +5,7 @@ export const migration012SubagentRuns = {
   // definitions live in `.md` files on disk; the harness loads them
   // at bootstrap and uses systemPrompt + tools to shape the child
   // run, but neither field is persisted into messages or sessions.
-  // Result: if the author edits `~/.config/agent/agents/explore.md`
+  // Result: if the author edits `~/.config/forja/playbooks/explore.md`
   // (or rotates the file out entirely) after a child has run,
   // there is NO way to reconstruct what definition the child was
   // executing under.

@@ -56,8 +56,8 @@ for n in $(seq 1 8); do
   echo "package $n" > "file_$n.txt"
 done
 
-mkdir -p .agent/agents
-cat > .agent/agents/explore.md <<'MD'
+mkdir -p .forja/playbooks
+cat > .forja/playbooks/explore.md <<'MD'
 ---
 name: explore
 description: Read-only file discovery. Read every file once.
@@ -72,7 +72,7 @@ read_file call per file). Report every file's contents
 verbatim. Do not summarize — show full contents.
 MD
 
-cat > .agent/permissions.yaml <<'YAML'
+cat > .forja/permissions.yaml <<'YAML'
 defaults:
   mode: bypass
 YAML

@@ -106,7 +106,7 @@ const makeFakeSpawn = (
 
 const makeSpec = (overrides: Partial<HookSpec> = {}): HookSpec => ({
   layer: 'project',
-  sourcePath: '/repo/.agent/hooks.toml',
+  sourcePath: '/repo/.forja/hooks.toml',
   event: 'PostToolUse',
   matcher: {},
   entryIndex: 0,

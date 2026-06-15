@@ -155,10 +155,10 @@ describe('validateSubagentTools', () => {
     const reg = buildRegistry(tool('write_file', true));
     const def = definition({
       tools: ['write_file'],
-      sourcePath: '/home/user/.config/agent/agents/refactor.md',
+      sourcePath: '/home/user/.config/forja/playbooks/refactor.md',
     });
     expect(() => validateSubagentTools(def, reg)).toThrow(
-      /\(\/home\/user\/\.config\/agent\/agents\/refactor\.md\)/,
+      /\(\/home\/user\/\.config\/forja\/playbooks\/refactor\.md\)/,
     );
   });
 

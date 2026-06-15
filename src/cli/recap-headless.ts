@@ -1,4 +1,4 @@
-// `agent recap [args]` — RECAP §9 headless surface. Lets a CI
+// `forja recap [args]` — RECAP §9 headless surface. Lets a CI
 // pipeline / shell script run `/recap` without entering the REPL.
 // When the global `--json` flag is set, emits the four-event
 // NDJSON stream the spec defines:
@@ -11,7 +11,7 @@
 // Without `--json`, the rendered text is written to stdout
 // verbatim (or to `--out PATH` if the recap-side flag is set).
 //
-// `agent recap list ...` is a special case — `/recap list` already
+// `forja recap list ...` is a special case — `/recap list` already
 // emits NDJSON of `recap_mini` rows when `--json` is in its args,
 // so the headless handler forwards the operator's `--json` to the
 // list-side parser instead of building the four-event envelope
@@ -32,7 +32,7 @@ import { runRecapList, runRecapSession } from './slash/commands/recap.ts';
 import type { SlashContext } from './slash/types.ts';
 
 // Headless render-model precedence (RECAP §8.2: `--model` > config >
-// session). On `agent recap`, `--model` is consumed top-level and
+// session). On `forja recap`, `--model` is consumed top-level and
 // folded into the SESSION provider by bootstrap, so it already IS the
 // render model — threading `[recap].render_model` on top would
 // override the operator's explicit CLI choice. Suppress the config
@@ -71,7 +71,7 @@ export interface RunRecapHeadlessOptions {
   now?: () => number;
   // Optional override for `currentSessionId`. Headless operation
   // has no live REPL, so the default is `() => null` and bare
-  // `agent recap` (no `session <id>`) errors with "no active
+  // `forja recap` (no `session <id>`) errors with "no active
   // session". Tests can override to drive `session_current`.
   currentSessionId?: () => string | null;
   // Operator's cwd at invocation time. Used by `day` / `range`

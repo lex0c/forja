@@ -117,7 +117,7 @@ export { writeFileTool } from './write-file.ts';
 export type { WriteFileInput, WriteFileOutput } from './write-file.ts';
 
 // Order is intentional: read-only tools first, then writes, then exec.
-// Useful when scanning a `agent --list-tools` output. The todo tools
+// Useful when scanning a `forja --list-tools` output. The todo tools
 // (todo_list / todo_get / todo_create / todo_update) sit with the
 // read-only group — their 'write' is harness-internal session state,
 // not external mutation. memory_list / read / search are

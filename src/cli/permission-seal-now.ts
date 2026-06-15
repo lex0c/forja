@@ -1,4 +1,4 @@
-// `agent permission seal-now` — manually flushes a §7.3 seal entry
+// `forja permission seal-now` — manually flushes a §7.3 seal entry
 // for the latest audit chain row. Operators run this before
 // SIGTERM in scripts, in scheduled cron, or when the inotify-driven
 // scheduler isn't suitable (e.g. one-shot batch jobs that don't

@@ -1,30 +1,30 @@
-// `agent purge` handler. Spec: AGENTIC_CLI.md §2.1.2.
+// `forja purge` handler. Spec: AGENTIC_CLI.md §2.1.2.
 //
 // Filesystem-only project-scope reset: removes everything under
-// <repoRoot>/.agent/, never touching the global DB
+// <repoRoot>/.forja/, never touching the global DB
 // (~/.local/share/forja/sessions.db) or user-layer configs
-// (~/.config/agent/**). Two-phase: bare invocation is dry-run
+// (~/.config/forja/**). Two-phase: bare invocation is dry-run
 // (no FS mutation, no DB write); --force executes after writing an
 // append-only purge_events audit row to the global DB.
 //
 // Why filesystem-only: the global DB's sessions / approvals_log /
 // memory_events for this cwd remain queryable after the purge —
-// `agent --list-sessions --project <cwd>` continues to surface
+// `forja --list-sessions --project <cwd>` continues to surface
 // historical sessions. The audit chain stays intact because we
 // never delete its rows, and `install_id` is preserved (genesis
 // hash unchanged). Trade-off declared in §2.1.2.
 //
 // Hard-coded safeties:
-//   1. Init marker required. <repoRoot>/.agent/ must exist AND
+//   1. Init marker required. <repoRoot>/.forja/ must exist AND
 //      contain at least one of the 5 init-canonical artifacts
 //      (permissions.yaml, config.toml, agents/, skills/, .gitignore).
-//      Without this gate, `agent purge` typed in $HOME by accident
-//      would happily destroy any `.agent/` that happens to be
+//      Without this gate, `forja purge` typed in $HOME by accident
+//      would happily destroy any `.forja/` that happens to be
 //      sitting there.
-//   2. Symlink defense. lstat-only on <repoRoot>/.agent/ and on
+//   2. Symlink defense. lstat-only on <repoRoot>/.forja/ and on
 //      every entry beneath it. Symlinks are never followed; the
 //      link itself is unlinked, the target is left alone. Without
-//      this, `ln -s ~/shared-state .agent` followed by purge would
+//      this, `ln -s ~/shared-state .forja` followed by purge would
 //      devastate ~/shared-state.
 //   3. Audit before any FS mutation. --force opens the DB,
 //      migrates if needed, inserts the audit row, AND ONLY THEN
@@ -51,21 +51,27 @@ import { defaultDbPath } from '../storage/index.ts';
 import { insertPurgeEvent } from '../storage/repos/purge-events.ts';
 import { VERSION } from './version.ts';
 
-// The five artifacts `agent init` scaffolds. Their presence (any
+// The five artifacts `forja init` scaffolds. Their presence (any
 // one of them) gates the purge. Order is the same as the init
 // orchestrator's DEFAULT_STEPS so the failure message lists them
 // in a stable order operators can grep for in docs. `skills` is the
-// project_shared/local skill catalog under `.agent/skills/`.
-const INIT_MARKERS = ['permissions.yaml', '.gitignore', 'config.toml', 'agents', 'skills'] as const;
+// project_shared/local skill catalog under `.forja/skills/`.
+const INIT_MARKERS = [
+  'permissions.yaml',
+  '.gitignore',
+  'config.toml',
+  'playbooks',
+  'skills',
+] as const;
 
 // Top-level categories rendered in the dry-run output. Order is
 // chosen for operator legibility: configs first (what `init`
 // scaffolded), then operator extensions, then memory, then
-// runtime. Anything in `.agent/` not matching one of these falls
+// runtime. Anything in `.forja/` not matching one of these falls
 // into a generic "other" category so we never silently hide
 // surprises from the operator.
 interface PurgeCategory {
-  // Display name as it appears in the dry-run (relative to .agent/).
+  // Display name as it appears in the dry-run (relative to .forja/).
   name: string;
   // Absolute path on disk.
   absolutePath: string;
@@ -137,7 +143,7 @@ const formatBytes = (n: number): string => {
 // would frustrate the "as if Forja never ran" goal of the verb.
 const OPERATOR_OWNED_NAMES = new Set(['.gitignore']);
 
-// Walks `.agent/` with lstat at every entry. Symlinks are recorded
+// Walks `.forja/` with lstat at every entry. Symlinks are recorded
 // as 'symlink' kind (count as files for the dirs/files split) and
 // NOT recursed into — their target lives outside our purge root by
 // adversarial construction. Real directories are recursed.
@@ -281,7 +287,7 @@ const hasInitMarker = (agentDir: string): boolean => {
 // itself, an adversary with concurrent FS access could replace the
 // directory with a symlink to an external path. Because readdirSync
 // follows symlinks, the walker would then list (and subsequently
-// delete) entries from the symlink target — outside `.agent/`,
+// delete) entries from the symlink target — outside `.forja/`,
 // defeating the top-of-walk symlink defense.
 //
 // This helper re-runs lstat AFTER readdir and verifies the path
@@ -322,7 +328,7 @@ export const verifySamePostReaddir = (path: string, preStat: Stats): boolean => 
 // distinguish the two operational shapes:
 //
 //   - partial == {0,0,0}: TOCTOU triggered before ANY removal (e.g.,
-//     race against the root `.agent/` itself). FS state unchanged.
+//     race against the root `.forja/` itself). FS state unchanged.
 //   - partial > 0: TOCTOU triggered mid-walk after some children
 //     were already removed. FS is in a partial state.
 //
@@ -407,7 +413,7 @@ export const removeTree = (
       // it for a symlink between lstat and readdir, ABORT THE
       // ENTIRE WALK — readdirSync follows symlinks, so the entries
       // listed might belong to an external target. Recursing would
-      // delete files outside `.agent/`.
+      // delete files outside `.forja/`.
       //
       // Throw (don't merely return) so the caller sees a real
       // failure regardless of where in the tree this triggers. The
@@ -463,7 +469,7 @@ const probeAuditWritabilityMutating = (dbPath: string): AuditWritability => {
 };
 
 // Non-mutating writability probe for the dry-run path. Critical
-// invariant: `agent purge` (without --force) must NEVER create the
+// invariant: `forja purge` (without --force) must NEVER create the
 // DB file, mutate its schema, or apply migrations. The dry-run
 // header literally promises "nothing will be modified" — any DB
 // side-effect violates that contract.
@@ -514,7 +520,7 @@ const renderHumanDryRun = (report: DryRunReport, out: (s: string) => void): void
   out(`Project root: ${report.repoRoot}\n`);
   out(`Scope:        ${report.scope}/\n\n`);
   if (report.categories.length === 0) {
-    out('  (.agent/ is empty)\n\n');
+    out('  (.forja/ is empty)\n\n');
   } else {
     out('Will remove:\n');
     for (const c of report.categories) {
@@ -591,26 +597,26 @@ interface ForceReport {
 // "what's NOT touched").
 const PRESERVED_PATHS = [
   '~/.local/share/forja/sessions.db    (global DB; sessions for this cwd remain queryable)',
-  '~/.config/agent/**                  (user-layer config + memory)',
+  '~/.config/forja/**                  (user-layer config + memory)',
   '~/.local/share/forja/install_id     (install identity; audit chain genesis)',
 ];
 
 export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
   const { cwd, force, json, noAudit, out, err } = options;
   const repoRoot = resolveRepoRoot(cwd);
-  const agentDir = join(repoRoot, '.agent');
+  const agentDir = join(repoRoot, '.forja');
 
   // Gate 1: directory exists.
   if (!existsSync(agentDir)) {
     err(
-      `forja purge: ${agentDir} does not exist — nothing to purge (run 'agent init' to scaffold it first)\n`,
+      `forja purge: ${agentDir} does not exist — nothing to purge (run 'forja init' to scaffold it first)\n`,
     );
     return 1;
   }
 
   // Gate 2: symlink defense. lstat (NOT stat) so we see the link,
   // not what it points to. Refusing here is the right move — any
-  // symlink shape at <repoRoot>/.agent suggests the operator
+  // symlink shape at <repoRoot>/.forja suggests the operator
   // deliberately wired the project to share state from elsewhere,
   // and we will not silently destroy that target.
   let agentSt: Stats;
@@ -632,12 +638,12 @@ export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
     return 1;
   }
 
-  // Gate 3: init marker. Avoids "operator typed `agent purge` in
-  // $HOME by accident" and "this .agent/ was planted by another
+  // Gate 3: init marker. Avoids "operator typed `forja purge` in
+  // $HOME by accident" and "this .forja/ was planted by another
   // tool". Permissive: any ONE of the five markers is enough.
   if (!hasInitMarker(agentDir)) {
     err(
-      `forja purge: ${agentDir} has no init markers — run 'agent init' first or remove .agent/ manually if you didn't initialize this project\n`,
+      `forja purge: ${agentDir} has no init markers — run 'forja init' first or remove .forja/ manually if you didn't initialize this project\n`,
     );
     err(`  (looked for: ${INIT_MARKERS.map((m) => join(agentDir, m)).join(', ')})\n`);
     return 1;
@@ -679,13 +685,13 @@ export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
   if (!force) {
     // Build the suggested command, preserving the operator's
     // --no-audit flag. Without this, an operator who ran
-    // `agent purge --no-audit` (typically because DB is broken
+    // `forja purge --no-audit` (typically because DB is broken
     // — the exact emergency the flag exists for) would see
-    // "agent purge --force" suggested. Copy-pasting that would
+    // "forja purge --force" suggested. Copy-pasting that would
     // hit the audit gate and abort, blocking the emergency
     // purge workflow. The suggested command must be directly
     // executable; preserve scope flags.
-    const command = noAudit ? 'agent purge --force --no-audit' : 'agent purge --force';
+    const command = noAudit ? 'forja purge --force --no-audit' : 'forja purge --force';
     const report: DryRunReport = {
       mode: 'dry-run',
       repoRoot,
@@ -711,7 +717,7 @@ export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
   // Audit gate. `--no-audit` is the PRIMARY opt-out — when set,
   // we skip the audit-row write entirely regardless of DB
   // writability. Pre-fix, this branch only fired when the DB was
-  // unwritable, meaning `agent purge --force --no-audit` on a
+  // unwritable, meaning `forja purge --force --no-audit` on a
   // healthy DB still wrote a row (operator-reported bug:
   // contradicts the documented "opt out of audit logging" intent).
   //
@@ -749,7 +755,7 @@ export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
     }
   }
 
-  // Atomic-ish FS removal. We remove the contents of `.agent/`
+  // Atomic-ish FS removal. We remove the contents of `.forja/`
   // first, then remove the directory itself last. Removing
   // contents-first means a kill mid-walk leaves a partial state
   // but the parent dir still exists — recoverable. Removing
@@ -817,9 +823,9 @@ export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
   return 0;
 };
 
-// Stat → human kind for the error message when `.agent` is neither
+// Stat → human kind for the error message when `.forja` is neither
 // a directory nor a symlink (very rare, but possible: a regular
-// file named `.agent`, a fifo, a device node).
+// file named `.forja`, a fifo, a device node).
 const describeStat = (st: Stats): string => {
   if (st.isFile()) return 'regular file';
   if (st.isBlockDevice()) return 'block device';

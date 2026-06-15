@@ -1,6 +1,6 @@
-// `agent sandbox setup [--json]` — §13 guided sandbox bootstrap.
+// `forja sandbox setup [--json]` — §13 guided sandbox bootstrap.
 //
-// Follow-on to slice 43's `agent doctor`. When doctor reports
+// Follow-on to slice 43's `forja doctor`. When doctor reports
 // `sandbox: warn` (no bwrap on Linux, or sandbox-exec genuinely
 // missing on macOS), this surface tells the operator HOW to fix it.
 // Per spec §13.1 "detect, don't distribute" — never auto-installs;
@@ -170,7 +170,7 @@ const computeRecommendation = (opts: RunSandboxSetupOptions): Recommendation => 
       platform,
       arch,
       status: 'already-installed',
-      message: `${availability.tool ?? 'sandbox'} is already installed. Run 'agent doctor' to verify the full health check.`,
+      message: `${availability.tool ?? 'sandbox'} is already installed. Run 'forja doctor' to verify the full health check.`,
     };
   }
 
@@ -234,7 +234,7 @@ const renderPlain = (r: Recommendation): string => {
     lines.push(`  ${r.installCommand}`);
     lines.push('');
     lines.push('After install, verify with:');
-    lines.push('  agent doctor');
+    lines.push('  forja doctor');
     return lines.join('\n');
   }
   if (r.status === 'install') {
@@ -242,7 +242,7 @@ const renderPlain = (r: Recommendation): string => {
     lines.push(r.message);
     lines.push('');
     lines.push('After install, verify with:');
-    lines.push('  agent doctor');
+    lines.push('  forja doctor');
     return lines.join('\n');
   }
   // path-broken / unsupported — just the message; nothing to run.

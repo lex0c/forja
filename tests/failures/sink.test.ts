@@ -301,7 +301,7 @@ describe('createSqliteFailureSink — payload scrub', () => {
       recovery_action: 'ignored',
       user_visible: false,
       session_id: 's',
-      payload: { trace: 'failed at /home/lex/.config/agent/secrets' },
+      payload: { trace: 'failed at /home/lex/.config/forja/secrets' },
     });
     const rows = listFailureEventsBySession(db, 's');
     const payload = JSON.parse(rows[0]?.payload_json as string);

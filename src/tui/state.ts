@@ -1952,7 +1952,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       //     bodies are still unattested. Confirm before they enter
       //     eager-load.
       //   - 'drift': stored hash diverged from current (usually
-      //     after a `git pull` touched `.agent/memory/shared/`).
+      //     after a `git pull` touched `.forja/memory/shared/`).
       //
       // Both modes share answer space: yes → re-stamp (after TOCTOU
       // recheck), no → bulk-invalidate, cancel → defer.
@@ -1974,7 +1974,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
 
       // SECURITY (P0/F1 hardening). Filenames flow from
       // disk-attacker-controlled readdirSync (an attacker with
-      // commit access to `.agent/memory/shared/` can name a file
+      // commit access to `.forja/memory/shared/` can name a file
       // `\x1b[2J\x1b[Hfake.md` and repaint the entire modal). The
       // sanitizer strips ANSI escapes, collapses \r/\n/\t to single
       // spaces, and caps length. `event.path` is operator-derived
@@ -1988,7 +1988,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // then a bounded inventory cap so a malicious corpus can't
       // explode the modal height. The cap is deliberately small —
       // operators with a large corpus should review the files
-      // outside the modal (e.g., `ls .agent/memory/shared/`); the
+      // outside the modal (e.g., `ls .forja/memory/shared/`); the
       // modal's job is to flag THAT something changed and let the
       // operator make a deliberate yes/no, not to be the audit UI.
       const MAX_LIST = 8;
@@ -2006,7 +2006,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         previewLines.push(
           'The shared memory corpus changed since you last confirmed trust.',
           'This commonly happens after a `git pull` that modifies, adds, or removes',
-          'files under `.agent/memory/shared/`. Review the current contents below:',
+          'files under `.forja/memory/shared/`. Review the current contents below:',
         );
       }
       previewLines.push('');
@@ -2075,7 +2075,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
     case 'history-clear:ask': {
       // Three options per HISTORY.md §2.3: clear-only, clear-and-
       // disable-permanently, no. `yes-disable` writes the
-      // `.agent/no-history` marker (spec §3.3 level 2) on top of
+      // `.forja/no-history` marker (spec §3.3 level 2) on top of
       // the wipe so subsequent REPLs in this project never
       // re-enable persistence without explicit operator action.
       const options: ConfirmOption[] = [

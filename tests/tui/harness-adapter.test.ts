@@ -188,7 +188,7 @@ describe('harness-adapter — session lifecycle', () => {
       usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
       costUsd: 0,
       usageComplete: true,
-      detail: 'denied by user hook /etc/agent/hooks.toml',
+      detail: 'denied by user hook /etc/forja/hooks.toml',
     };
     const out = a.translate({ type: 'session_finished', result });
     expect(types(out)).toEqual(['step:budget', 'session:end']);

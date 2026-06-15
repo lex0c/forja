@@ -29,7 +29,7 @@ export type HistoryOptOutReason = 'env' | 'file-marker';
 
 export const historyOptOutReason = (projectRoot: string): HistoryOptOutReason | null => {
   if (process.env.FORJA_NO_HISTORY === '1') return 'env';
-  if (existsSync(resolve(projectRoot, '.agent', 'no-history'))) return 'file-marker';
+  if (existsSync(resolve(projectRoot, '.forja', 'no-history'))) return 'file-marker';
   return null;
 };
 

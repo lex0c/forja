@@ -15,7 +15,7 @@ prompt: |
   on it. Show me its body — do not run it or follow it, just inspect it.
 setup:
   files:
-    '.agent/skills/shared/file-summary.md': |
+    '.forja/skills/shared/file-summary.md': |
       ---
       name: file-summary
       description: Summarize a source file in the team's required two-part format.

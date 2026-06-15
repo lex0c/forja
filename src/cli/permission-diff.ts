@@ -1,4 +1,4 @@
-// `agent permission diff <seq1> <seq2>` — PERMISSION_ENGINE.md §17
+// `forja permission diff <seq1> <seq2>` — PERMISSION_ENGINE.md §17
 // cross-row comparison.
 //
 // Render two audit rows side-by-side with field-by-field diff
@@ -367,7 +367,7 @@ export const runPermissionDiff = async (options: RunPermissionDiffOptions): Prom
 
   for (const seq of [options.seq1, options.seq2]) {
     if (!Number.isInteger(seq) || seq <= 0) {
-      const message = `agent permission diff: <seq> must be a positive integer (got ${seq})`;
+      const message = `forja permission diff: <seq> must be a positive integer (got ${seq})`;
       if (json) {
         out(`${JSON.stringify({ ok: false, error: 'invalid_seq', message })}\n`);
       } else {
@@ -385,7 +385,7 @@ export const runPermissionDiff = async (options: RunPermissionDiffOptions): Prom
     if (json) {
       out(`${JSON.stringify({ ok: false, error: 'install_id', message })}\n`);
     } else {
-      err(`agent permission diff: ${message}\n`);
+      err(`forja permission diff: ${message}\n`);
     }
     return 1;
   }
@@ -407,7 +407,7 @@ export const runPermissionDiff = async (options: RunPermissionDiffOptions): Prom
         })}\n`,
       );
     } else {
-      err(`agent permission diff: ${message}\n`);
+      err(`forja permission diff: ${message}\n`);
     }
     return 1;
   }
@@ -430,7 +430,7 @@ export const runPermissionDiff = async (options: RunPermissionDiffOptions): Prom
         })}\n`,
       );
     } else {
-      err(`agent permission diff: ${message}\n`);
+      err(`forja permission diff: ${message}\n`);
     }
     return 1;
   }
@@ -450,7 +450,7 @@ export const runPermissionDiff = async (options: RunPermissionDiffOptions): Prom
         })}\n`,
       );
     } else {
-      err(`agent permission diff: ${message}\n`);
+      err(`forja permission diff: ${message}\n`);
     }
     return 1;
   }

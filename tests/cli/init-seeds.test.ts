@@ -74,10 +74,10 @@ describe('CANONICAL_SEEDS — bundled vendor seed catalog', () => {
   });
 });
 
-// Vendor seed catalog ships with `agent init`. The integration test
+// Vendor seed catalog ships with `forja init`. The integration test
 // isolates XDG_CONFIG_HOME so the install lands in a tmp tree instead
-// of polluting the developer's real ~/.config/agent.
-describe('agent init seeds — installs vendor catalog under user scope', () => {
+// of polluting the developer's real ~/.config/forja.
+describe('forja init seeds — installs vendor catalog under user scope', () => {
   const cleanup: string[] = [];
   let originalXdg: string | undefined;
 
@@ -120,7 +120,7 @@ describe('agent init seeds — installs vendor catalog under user scope', () => 
     expect(code).toBe(0);
 
     // Bodies land at <XDG>/agent/memory/seeds/<name>.md.
-    const seedsDir = join(userHome, 'agent', 'memory', 'seeds');
+    const seedsDir = join(userHome, 'forja', 'memory', 'seeds');
     expect(existsSync(seedsDir)).toBe(true);
     for (const seed of CANONICAL_SEEDS) {
       expect(existsSync(join(seedsDir, seed.filename))).toBe(true);
@@ -180,7 +180,7 @@ describe('agent init seeds — installs vendor catalog under user scope', () => 
     // by hand-editing the sentinel) should see the count in the
     // init summary. Without this pin, a refactor of the totals
     // aggregator could silently drop the suffix and the operator
-    // running `agent init` after a long pause would lose the
+    // running `forja init` after a long pause would lose the
     // signal that their opt-outs are still active.
     const cwd = mkdtempSync(join(tmpdir(), 'forja-init-seeds-disabled-'));
     const userHome = mkdtempSync(join(tmpdir(), 'forja-init-seeds-disabled-xdg-'));

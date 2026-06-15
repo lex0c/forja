@@ -44,7 +44,7 @@ export const taskCancelTool: Tool<TaskCancelInput, TaskCancelOutput> = {
     // declared `isolation: worktree`, the cleanup path
     // (`cleanupWorktree`) shells out `git worktree remove --force`,
     // which mutates `.git/`. Operators with leftover handles can
-    // also cancel via the explicit `agent worktree gc` command
+    // also cancel via the explicit `forja worktree gc` command
     // surface.
     display: 'raw',
   },

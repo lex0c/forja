@@ -1137,7 +1137,7 @@ export const countEvictionEvents = (db: DB): number => {
 
 // ─── pruneEvictionEvents ───────────────────────────────────────────────
 //
-// Retention sweep for `agent gc` Phase 2 (AGENTIC_CLI §2.1.3, AUDIT
+// Retention sweep for `forja gc` Phase 2 (AGENTIC_CLI §2.1.3, AUDIT
 // §1.2). Default retention 365d on `recorded_at`. Cutoff EXCLUSIVE.
 //
 // Cross-substrate lifecycle audit (memory/policy/candidate/slot_item

@@ -65,7 +65,7 @@
 // Default carve-out: the mainstream caches whose REAL default location
 // (under the sandbox's clearenv, where GOCACHE/XDG_CACHE_HOME/etc. are
 // unset so tools fall back to defaults) is exactly one of these
-// $HOME-relative paths. Operators override via `.agent/config.toml`
+// $HOME-relative paths. Operators override via `.forja/config.toml`
 // `[sandbox] writable_cache_dirs` (see `loadSandboxConfig`).
 export const DEFAULT_WRITABLE_CACHE_DIRS: readonly string[] = [
   '.cache', // XDG cache: go-build (~/.cache/go-build), pip, uv, …

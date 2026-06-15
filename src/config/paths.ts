@@ -1,4 +1,4 @@
-// Per-project `.agent/config.toml` path resolvers (currently
+// Per-project `.forja/config.toml` path resolvers (currently
 // consumed by memory governance, providers, budget
 // loaders). Path-resolution plumbing centralized in
 // `src/config/agent-paths.ts` so the XDG / HOME / Windows
@@ -10,7 +10,7 @@
 
 import { projectAgentPath, userAgentPath } from './agent-paths.ts';
 
-// User-layer path for `~/.config/agent/config.toml` (or the
+// User-layer path for `~/.config/forja/config.toml` (or the
 // platform/XDG equivalent). Returns null on a stripped-down env
 // where no absolute root can be derived; the loaders treat null as
 // "no user file" and proceed with project-only resolution.

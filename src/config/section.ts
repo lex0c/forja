@@ -1,4 +1,4 @@
-// Shared TOML-section reader for the per-project `.agent/config.toml`
+// Shared TOML-section reader for the per-project `.forja/config.toml`
 // loaders (memory, providers, budget). Each loader used to
 // reimplement steps 1-7 of "open file, parse TOML, find section,
 // validate it's a table" — that boilerplate was ~30 lines per parser

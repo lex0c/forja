@@ -1,5 +1,5 @@
 // Bundled seed-catalog tests (spec SKILLS.md §6). Validates the
-// canonical skills ship parseable and that `agent init` installs a
+// canonical skills ship parseable and that `forja init` installs a
 // catalog every entry resolves into.
 
 import { describe, expect, test } from 'bun:test';
@@ -22,7 +22,7 @@ describe('CANONICAL_SKILLS — bundled seed catalog', () => {
     }
   });
 
-  test('agent init installs the catalog and every skill resolves cleanly', () => {
+  test('forja init installs the catalog and every skill resolves cleanly', () => {
     const cwd = mkdtempSync(join(tmpdir(), 'forja-init-skills-'));
     try {
       const code = runInit({
@@ -36,8 +36,8 @@ describe('CANONICAL_SKILLS — bundled seed catalog', () => {
       const catalog = createSkillCatalog({
         roots: {
           user: null,
-          projectShared: join(cwd, '.agent', 'skills', 'shared'),
-          projectLocal: join(cwd, '.agent', 'skills', 'local'),
+          projectShared: join(cwd, '.forja', 'skills', 'shared'),
+          projectLocal: join(cwd, '.forja', 'skills', 'local'),
         },
       });
       expect(catalog.count()).toBe(9);

@@ -42,11 +42,11 @@ describe('renderExplainPermissions', () => {
         tools: { bash: { allow: ['npm test*'], deny: ['rm -rf *'] } },
       },
       { defaults: 'project', bash: 'project' },
-      [{ layer: 'project', path: '/r/.agent/permissions.yaml' }],
+      [{ layer: 'project', path: '/r/.forja/permissions.yaml' }],
     );
     const text = lines.join('\n');
     // Layer header lists the loaded file paths.
-    expect(text).toContain('- project /r/.agent/permissions.yaml');
+    expect(text).toContain('- project /r/.forja/permissions.yaml');
     // Mode line carries the writer.
     expect(text).toContain('mode=acceptEdits [from project policy]');
     // Section block has the layer hint inline.
@@ -63,8 +63,8 @@ describe('renderExplainPermissions', () => {
       },
       { defaults: 'enterprise', bash: 'enterprise' },
       [
-        { layer: 'enterprise', path: '/etc/agent/permissions.yaml' },
-        { layer: 'project', path: '/r/.agent/permissions.yaml' },
+        { layer: 'enterprise', path: '/etc/forja/permissions.yaml' },
+        { layer: 'project', path: '/r/.forja/permissions.yaml' },
       ],
     );
     const text = lines.join('\n');
@@ -233,7 +233,7 @@ describe('runExplainPermissionsCli', () => {
 
   test('project YAML loaded → output names the file path', async () => {
     writeYaml(
-      join(workdir, '.agent/permissions.yaml'),
+      join(workdir, '.forja/permissions.yaml'),
       'defaults:\n  mode: acceptEdits\ntools:\n  bash:\n    allow:\n      - "ls *"\n',
     );
     const out: string[] = [];
@@ -249,7 +249,7 @@ describe('runExplainPermissionsCli', () => {
     const text = out.join('');
     expect(text).toContain('mode=acceptEdits [from project policy]');
     expect(text).toContain('bash: [from project policy]');
-    expect(text).toContain('.agent/permissions.yaml');
+    expect(text).toContain('.forja/permissions.yaml');
     expect(text).toContain("'ls *'");
   });
 
@@ -261,7 +261,7 @@ describe('runExplainPermissionsCli', () => {
     const ent = join(workdir, 'ent.yaml');
     writeFileSync(ent, 'tools:\n  bash:\n    deny:\n      - "*"\n    locked: true\n');
     writeYaml(
-      join(workdir, '.agent/permissions.yaml'),
+      join(workdir, '.forja/permissions.yaml'),
       'tools:\n  bash:\n    allow:\n      - "ls *"\n',
     );
     const out: string[] = [];
@@ -281,7 +281,7 @@ describe('runExplainPermissionsCli', () => {
   });
 
   test('malformed YAML surfaces as a non-zero exit + stderr message', async () => {
-    writeYaml(join(workdir, '.agent/permissions.yaml'), 'defaults:\n  mode: bogus\n');
+    writeYaml(join(workdir, '.forja/permissions.yaml'), 'defaults:\n  mode: bogus\n');
     const out: string[] = [];
     const err: string[] = [];
     const code = await runExplainPermissionsCli({
@@ -297,7 +297,7 @@ describe('runExplainPermissionsCli', () => {
 
   test('--json: NDJSON output with layer + merged events (slice 38)', async () => {
     writeYaml(
-      join(workdir, '.agent/permissions.yaml'),
+      join(workdir, '.forja/permissions.yaml'),
       'defaults:\n  mode: strict\ntools:\n  bash:\n    allow:\n      - "ls *"\nsandbox:\n  required: true\n',
     );
     const out: string[] = [];
@@ -321,7 +321,7 @@ describe('runExplainPermissionsCli', () => {
     expect(lines.length).toBe(2);
     const events = lines.map((l) => JSON.parse(l));
     expect(events[0]).toMatchObject({ kind: 'layer', layer: 'project' });
-    expect(events[0].path).toContain('.agent/permissions.yaml');
+    expect(events[0].path).toContain('.forja/permissions.yaml');
     expect(events[1].kind).toBe('merged');
     expect(events[1].policy.defaults.mode).toBe('strict');
     expect(events[1].policy.tools.bash.allow).toEqual(['ls *']);
@@ -340,7 +340,7 @@ describe('runExplainPermissionsCli', () => {
     // stays a pure stream and consumers parse one input.
     const usr = join(workdir, 'user-policy.yaml');
     writeYaml(usr, 'sandbox:\n  required: true\n  locked: true\n');
-    writeYaml(join(workdir, '.agent/permissions.yaml'), 'sandbox:\n  required: false\n');
+    writeYaml(join(workdir, '.forja/permissions.yaml'), 'sandbox:\n  required: false\n');
     const out: string[] = [];
     const err: string[] = [];
     const code = await runExplainPermissionsCli({

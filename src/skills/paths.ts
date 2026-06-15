@@ -41,7 +41,7 @@ export interface SkillScopeRoots {
 const pathMod = (platform: NodeJS.Platform) => (platform === 'win32' ? win32 : posix);
 
 // User-scope root: `<agent config dir>/skills` (spec §3.1
-// `~/.config/agent/skills/`). The config-root resolution delegates
+// `~/.config/forja/skills/`). The config-root resolution delegates
 // to `config/agent-paths.ts:agentConfigDir` — the codebase's single
 // source of truth for the XDG / Windows `APPDATA` dance. Hand-
 // rolling that resolution (as an earlier draft of this file did) is
@@ -59,12 +59,12 @@ export const userScopeRoot = (
 };
 
 // Project-scope roots, derived from the absolute repo root. Spec
-// §3.2/§3.3: shared lives in `.agent/skills/shared/` (versioned),
-// local in `.agent/skills/local/` (gitignored). When the agent runs
+// §3.2/§3.3: shared lives in `.forja/skills/shared/` (versioned),
+// local in `.forja/skills/local/` (gitignored). When the agent runs
 // outside a git repo, the caller passes the cwd itself as `repoRoot`.
 export const projectScopeRoots = (repoRoot: string): { shared: string; local: string } => ({
-  shared: join(repoRoot, '.agent', 'skills', 'shared'),
-  local: join(repoRoot, '.agent', 'skills', 'local'),
+  shared: join(repoRoot, '.forja', 'skills', 'shared'),
+  local: join(repoRoot, '.forja', 'skills', 'local'),
 });
 
 export const resolveScopeRoots = (

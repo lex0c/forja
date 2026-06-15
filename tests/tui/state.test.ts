@@ -2346,7 +2346,7 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
   test('options are Yes / No (session-allow option removed)', () => {
     // The previous option 2 ("Yes, don't ask again for: X") was
     // removed. The modal now only offers Yes / No — operator who
-    // needs a persistent rule edits `.agent/permissions.yaml`
+    // needs a persistent rule edits `.forja/permissions.yaml`
     // directly (or future `/perms` slash commands), with the full
     // layered policy view in front of them.
     const r = applyEvent(createInitialState(), {
@@ -2694,7 +2694,7 @@ describe('shared-trust:ask reducer (P0/F1 + P1/M2-rel)', () => {
     type: 'shared-trust:ask',
     ts: 1,
     promptId: 'p1',
-    path: overrides.path ?? '/repo/.agent/memory/shared',
+    path: overrides.path ?? '/repo/.forja/memory/shared',
     mode: overrides.mode,
     corpusFiles: overrides.corpusFiles ?? [{ name: 'alpha.md', bytes: 42 }],
   });
@@ -2812,7 +2812,7 @@ describe('shared-trust:ask reducer (P0/F1 + P1/M2-rel)', () => {
       initial,
       sharedTrustEvent({
         mode: 'drift',
-        path: '\x1b[31mfake\x1b[0m/.agent/memory/shared',
+        path: '\x1b[31mfake\x1b[0m/.forja/memory/shared',
       }),
     );
     const modal = r.state.modal;

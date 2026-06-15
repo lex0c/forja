@@ -28,7 +28,7 @@ beforeEach(() => {
   resetSharedDoctorCache();
 });
 
-describe('parseArgs — agent welcome', () => {
+describe('parseArgs — forja welcome', () => {
   test('verb is recognized', () => {
     const r = parseArgs(['welcome']);
     expect(r.ok).toBe(true);
@@ -90,9 +90,9 @@ describe('runWelcome', () => {
     expect(text).toContain('Environment health check');
     expect(text).toContain('Sandbox setup');
     expect(text).toContain('Next steps');
-    expect(text).toContain('agent doctor');
-    expect(text).toContain('agent init');
-    expect(text).toContain('agent --help');
+    expect(text).toContain('forja doctor');
+    expect(text).toContain('forja init');
+    expect(text).toContain('forja --help');
   });
 
   test('missing sandbox + git: surfaces both warnings, exit still 0', async () => {
@@ -174,7 +174,7 @@ describe('runWelcome', () => {
 
 // ─── §13.5 sandbox_skip marker (slice 91) ─────────────────────────────────
 
-describe('parseArgs — agent welcome --i-know-what-im-doing', () => {
+describe('parseArgs — forja welcome --i-know-what-im-doing', () => {
   test('flag is captured into iKnowWhatImDoing', () => {
     const r = parseArgs(['welcome', '--i-know-what-im-doing']);
     expect(r.ok).toBe(true);

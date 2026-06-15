@@ -37,7 +37,7 @@ export const defaultWorktreeRoot = (env: NodeJS.ProcessEnv = process.env): strin
   const xdg = env.XDG_CACHE_HOME;
   const home = env.HOME ?? homedir();
   const cache = xdg !== undefined && xdg.length > 0 ? xdg : join(home, '.cache');
-  return join(cache, 'agent', 'worktrees');
+  return join(cache, 'forja', 'worktrees');
 };
 
 // Slug a free-form user prompt into a kebab-cased fragment safe
@@ -169,7 +169,7 @@ export interface WorktreeHandle {
 // Create a fresh git worktree for a subagent run. Throws on:
 //   - parent cwd not inside a git repo (`git rev-parse` fails)
 //   - target path already exists (orphan from a prior crash;
-//     the user should `agent worktree gc` it before retrying)
+//     the user should `forja worktree gc` it before retrying)
 //   - `git worktree add` itself fails (refname collision, disk
 //     full, permissions). The error message preserves git's
 //     stderr so diagnostics survive.
@@ -231,7 +231,7 @@ export const createWorktree = async (opts: CreateWorktreeOptions): Promise<Workt
   const path = join(root, opts.sessionId);
   if (existsSync(path)) {
     throw new Error(
-      `worktree path '${path}' already exists; an earlier run may have crashed before cleanup. Remove it manually or wait for 'agent worktree gc'.`,
+      `worktree path '${path}' already exists; an earlier run may have crashed before cleanup. Remove it manually or wait for 'forja worktree gc'.`,
     );
   }
   const branch = branchName(opts.sessionId, opts.prompt);
@@ -247,7 +247,7 @@ export const createWorktree = async (opts: CreateWorktreeOptions): Promise<Workt
   }
   if (list.stdout.includes(`worktree ${path}\n`) || list.stdout.includes(`worktree ${path}\0`)) {
     throw new Error(
-      `worktree '${path}' is already registered with git (orphan from a prior run); run 'git worktree prune' or 'agent worktree gc' before retrying`,
+      `worktree '${path}' is already registered with git (orphan from a prior run); run 'git worktree prune' or 'forja worktree gc' before retrying`,
     );
   }
   // Make sure parent dir of the worktree path exists. `git
@@ -363,7 +363,7 @@ export const createWorktree = async (opts: CreateWorktreeOptions): Promise<Workt
 // the run already passed validation and the worktree is in a
 // secure state; the worst case from a skip-worktree failure is
 // a preserved-but-cleanable worktree at end of run, which the
-// operator's `agent worktree gc` reconciles.
+// operator's `forja worktree gc` reconciles.
 const markValidatorDeletionsSkipWorktree = async (
   worktreePath: string,
   deniedRemoved: ReadonlyArray<{ path: string; pattern: string }>,
@@ -424,7 +424,7 @@ export interface CleanupResult {
 // and the result is authoritative. Failures during remove leave
 // the worktree on disk (preserved: true) with the failure
 // captured on stderr; the operator deals with it through
-// `agent worktree gc` later.
+// `forja worktree gc` later.
 export const cleanupWorktree = async (opts: CleanupWorktreeOptions): Promise<CleanupResult> => {
   const { handle, parentCwd } = opts;
   // First check: did the child re-create or modify any path

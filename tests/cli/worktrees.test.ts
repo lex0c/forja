@@ -233,7 +233,7 @@ describe('runWorktreesCli — gc', () => {
 
   test('list rejects positional arguments', async () => {
     // list takes no positionals. Stray words sneaking through
-    // (e.g. operator typo `agent --worktrees list xyz`) must
+    // (e.g. operator typo `forja --worktrees list xyz`) must
     // fail loud, not silently ignore.
     const code = await runWorktreesCli({
       verb: 'list',

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { parseArgs } from '../../src/cli/args.ts';
 import { runPermissionSealVerify } from '../../src/cli/permission-seal-verify.ts';
 
-describe('parseArgs — agent permission seal-verify', () => {
+describe('parseArgs — forja permission seal-verify', () => {
   test('verb is recognized', () => {
     const r = parseArgs(['permission', 'seal-verify']);
     expect(r.ok).toBe(true);
@@ -194,7 +194,7 @@ describe('runPermissionSealVerify', () => {
     // hash matches its row payload (that recompute lives in `permission
     // verify`). Without this directive a clean seal-verify is mistaken
     // for full chain integrity.
-    expect(io.stdout).toContain('agent permission verify');
+    expect(io.stdout).toContain('forja permission verify');
     expect(io.stdout).toContain('stored chain hashes only');
   });
 

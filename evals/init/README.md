@@ -1,4 +1,4 @@
-# `agent init` eval
+# `forja init` eval
 
 End-to-end pin for the init → bootstrap handshake. Per
 [`CLAUDE.md`](../../CLAUDE.md) principle 4 + spec
@@ -8,8 +8,8 @@ End-to-end pin for the init → bootstrap handshake. Per
 
 `tests/cli/init*.test.ts` and `tests/cli/bootstrap*.test.ts` each
 cover their side in isolation. This eval is different: it pins the
-**cross-subsystem invariant** — `agent init` scaffolds exactly the
-files `agent` boot reads, with exactly the values the bootstrap
+**cross-subsystem invariant** — `forja init` scaffolds exactly the
+files `forja` boot reads, with exactly the values the bootstrap
 loaders expect. A refactor in either side that silently breaks the
 handshake fails here before the operator's first invocation does.
 
@@ -45,7 +45,7 @@ handshake fails here before the operator's first invocation does.
   `anthropic/claude-opus-4-7` (or whatever DEFAULT_MODEL is) is
   resolvable against the registry is covered by
   `tests/providers/*` and `bootstrap.test.ts`.
-- **Multi-operator concurrency.** Two `agent init` running
+- **Multi-operator concurrency.** Two `forja init` running
   simultaneously could TOCTOU; the atomic-write fix shipped
   alongside this eval reduces but does not eliminate the window.
 - **Compiled-binary path** (`bun build --compile`). Asset bundling

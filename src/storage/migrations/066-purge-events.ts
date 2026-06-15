@@ -1,10 +1,10 @@
-// purge_events — append-only ledger of `agent purge --force`
+// purge_events — append-only ledger of `forja purge --force`
 // invocations. Spec: AGENTIC_CLI.md §2.1.2, AUDIT.md §1.
 //
 // ────────────────────────────────────────────────────────────────────
 // WHY THIS TABLE EXISTS
 //
-// `agent purge` removes everything under <repoRoot>/.agent/ (configs,
+// `forja purge` removes everything under <repoRoot>/.forja/ (configs,
 // memory, bg logs, operator-edited playbooks). Without an audit row,
 // the only post-purge evidence is "the directory is gone" — an
 // operator cannot reconstruct "what was here before I purged?" and
@@ -43,7 +43,7 @@
 // - `cwd` (TEXT NOT NULL). Canonical repoRoot resolved via
 //   `git rev-parse --show-toplevel` (memory/paths.ts:resolveRepoRoot).
 //   NOT the operator's invocation cwd — always the repo root so
-//   `agent purge` from `<repo>/src/` and from `<repo>/` record the
+//   `forja purge` from `<repo>/src/` and from `<repo>/` record the
 //   same `cwd` row. Indexed for "show purge history for project X"
 //   queries.
 //
@@ -68,12 +68,12 @@
 //   Separate counts because symlink entries count as files (not
 //   dirs) even when the link target is a directory — we never
 //   followed it. Same snapshot semantics as `bytes_present`.
-//   `dirs_present` does NOT include the `.agent/` root itself —
+//   `dirs_present` does NOT include the `.forja/` root itself —
 //   only the children walked into it.
 //
 // - `forja_version` (TEXT NOT NULL). VERSION string at purge time.
 //   Lets a future bisect ("which version started purging
-//   `.agent/agents/` aggressively?") work without a schema bump.
+//   `.forja/playbooks/` aggressively?") work without a schema bump.
 //
 // ────────────────────────────────────────────────────────────────────
 // INDEXES

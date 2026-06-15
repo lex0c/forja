@@ -28,7 +28,7 @@ describe('isCapabilityKind', () => {
     'secret-access',
     'git-write',
     'env-mutate',
-    'agent-mutate',
+    'forja-mutate',
     'host-passthrough',
   ])('accepts %s', (s) => {
     expect(isCapabilityKind(s)).toBe(true);
@@ -49,7 +49,7 @@ describe('formatCapability + parseCapability', () => {
     [{ kind: 'secret-access', scope: 'aws' }, 'secret-access:aws'],
     [{ kind: 'git-write', scope: 'origin' }, 'git-write:origin'],
     [{ kind: 'env-mutate', scope: null }, 'env-mutate'],
-    [{ kind: 'agent-mutate', scope: null }, 'agent-mutate'],
+    [{ kind: 'forja-mutate', scope: null }, 'forja-mutate'],
     [{ kind: 'host-passthrough', scope: null }, 'host-passthrough'],
   ])('round-trips %p', (cap, expected) => {
     expect(formatCapability(cap)).toBe(expected);

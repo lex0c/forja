@@ -82,7 +82,7 @@ Stack changes require a PR against `docs/spec/AGENTIC_CLI.md §3`.
 - `bun run typecheck` — `tsc --noEmit`
 - `bun run lint` — Biome check
 - `bun run lint:fix` — Biome auto-fix
-- `bun run build` — compile binary into `dist/agent`
+- `bun run build` — compile binary into `dist/forja`
 
 ## Layout
 

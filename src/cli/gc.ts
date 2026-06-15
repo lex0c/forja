@@ -1,10 +1,10 @@
-// `agent gc` CLI handler. Spec: AGENTIC_CLI.md §2.1.3.
+// `forja gc` CLI handler. Spec: AGENTIC_CLI.md §2.1.3.
 //
 // Operator-facing surface for the retention sweeps defined in
 // AUDIT.md §1.2. Resolves the [audit.retention] config, opens
 // the global DB, hands off to `audit/gc.ts:runGc`, renders.
 //
-// Two-phase like `agent purge`: bare invocation is dry-run, --force
+// Two-phase like `forja purge`: bare invocation is dry-run, --force
 // executes. Differences from purge:
 //   - No init-marker / no symlink defense — gc operates on the
 //     global DB, not on a project FS tree.
@@ -63,16 +63,16 @@ const formatAge = (cutoffMs: number, nowMs: number): string => {
   return `${days}d ago`;
 };
 
-// Build the suggested `agent gc --force` command, preserving the
+// Build the suggested `forja gc --force` command, preserving the
 // caller's `--table=X` filters. Operator who runs
-// `agent gc --table=memory_events` (scoped dry-run) should see the
+// `forja gc --table=memory_events` (scoped dry-run) should see the
 // suggested command echo the same scope — otherwise copy-pasting
 // the suggestion sweeps every table, deleting data outside the
 // inspected scope. Operator safety > brevity.
 const buildForceCommand = (tables: ReadonlyArray<string>): string => {
-  if (tables.length === 0) return 'agent gc --force';
+  if (tables.length === 0) return 'forja gc --force';
   const flags = tables.map((t) => `--table=${t}`).join(' ');
-  return `agent gc --force ${flags}`;
+  return `forja gc --force ${flags}`;
 };
 
 const formatCutoffIso = (cutoffMs: number): string => {
@@ -171,9 +171,9 @@ export const runGcCli = async (options: RunGcCliOptions): Promise<number> => {
   // proceeds with defaults for the bad keys.
   //
   // resolveRepoRoot is REQUIRED here. `loadRetentionConfig` reads
-  // `<cwd>/.agent/config.toml`; passing the raw process cwd means
-  // an operator running `agent gc` from `<repo>/src/` would read
-  // `<repo>/src/.agent/config.toml` (which doesn't exist), silently
+  // `<cwd>/.forja/config.toml`; passing the raw process cwd means
+  // an operator running `forja gc` from `<repo>/src/` would read
+  // `<repo>/src/.forja/config.toml` (which doesn't exist), silently
   // falling back to defaults and pruning rows with the wrong
   // retention window. Data-retention regression in --force mode.
   // Bootstrap already does this resolution for the harness's own
@@ -222,7 +222,7 @@ export const runGcCli = async (options: RunGcCliOptions): Promise<number> => {
         //   - File truly absent (ENOENT) → fresh-install case.
         //     Legitimate "no rows to sweep yet"; downgrade to empty
         //     report + exit 0. Operator just installed Forja and
-        //     ran `agent gc` before any session created the DB.
+        //     ran `forja gc` before any session created the DB.
         //   - File present but openDb fails → real operational
         //     failure (corruption, perm denied on file,
         //     integrity_check refusal, locked by other process).
@@ -298,7 +298,7 @@ export const runGcCli = async (options: RunGcCliOptions): Promise<number> => {
         const pending = countPendingMigrations(db);
         if (pending > 0) {
           err(
-            `forja gc: ${pending} migration(s) pending; dry-run uses current schema (run \`agent gc --force\` or any command that bootstraps the DB to apply)\n`,
+            `forja gc: ${pending} migration(s) pending; dry-run uses current schema (run \`forja gc --force\` or any command that bootstraps the DB to apply)\n`,
           );
         }
       }

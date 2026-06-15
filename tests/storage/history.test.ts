@@ -185,11 +185,11 @@ describe('history storage — opt-out', () => {
     expect(loadHistory(db, PROJECT_A)).toEqual([]);
   });
 
-  test('.agent/no-history file marker disables persistence per-project', () => {
+  test('.forja/no-history file marker disables persistence per-project', () => {
     const root = mkdtempSync(join(tmpdir(), 'forja-history-marker-'));
     try {
-      mkdirSync(join(root, '.agent'), { recursive: true });
-      writeFileSync(join(root, '.agent', 'no-history'), '');
+      mkdirSync(join(root, '.forja'), { recursive: true });
+      writeFileSync(join(root, '.forja', 'no-history'), '');
       appendHistory(db, root, 'never persisted', { ts: 1 });
       expect(loadHistory(db, root)).toEqual([]);
       expect(countHistory(db, root)).toBe(0);
@@ -198,12 +198,12 @@ describe('history storage — opt-out', () => {
     }
   });
 
-  test('.agent/no-history in project A does not affect project B', () => {
+  test('.forja/no-history in project A does not affect project B', () => {
     const rootA = mkdtempSync(join(tmpdir(), 'forja-history-marker-a-'));
     const rootB = mkdtempSync(join(tmpdir(), 'forja-history-marker-b-'));
     try {
-      mkdirSync(join(rootA, '.agent'), { recursive: true });
-      writeFileSync(join(rootA, '.agent', 'no-history'), '');
+      mkdirSync(join(rootA, '.forja'), { recursive: true });
+      writeFileSync(join(rootA, '.forja', 'no-history'), '');
       appendHistory(db, rootA, 'A', { ts: 1 });
       appendHistory(db, rootB, 'B', { ts: 2 });
       expect(loadHistory(db, rootA)).toEqual([]);

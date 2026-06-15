@@ -142,9 +142,9 @@ export const memoryWriteTool: Tool<MemoryWriteInput, MemoryWriteOutput> = {
     category: 'misc',
     // Persists to disk.
     writes: true,
-    // Body / index files live in `~/.config/agent/memory/` (user
+    // Body / index files live in `~/.config/forja/memory/` (user
     // scope) — outside the worktree. Even project_local writes
-    // land in `.agent/memory/local/` which is gitignored, so
+    // land in `.forja/memory/local/` which is gitignored, so
     // checkpoint snapshots don't capture memory state. Surface
     // the warning in `--undo` per CHECKPOINTS.md §2.6.
     escapesCwd: true,
