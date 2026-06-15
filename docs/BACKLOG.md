@@ -206,6 +206,21 @@ dev`) confirmed both floors end-to-end: engine DENIES read+write of the real
 `.forja/`, leaves the active `.forja-dev/` readable; sandbox masks `<root>/.forja`
 not `<subdir>/.forja`. typecheck + lint + permissions (2317) green.
 
+Tenth follow-up (same root, the OTHER half — operator-flagged asymmetry): the
+ninth fix repo-rooted the foreign DENY but left the active-project ESCALATE
+(`.git` / `.claude` / `.forja-<profile>` via cwdEscalateDirs) anchored at the
+launch cwd. So a profile launched from a subdir would NOT escalate writes to the
+active `<repoRoot>/.forja-<profile>/permissions.yaml` (reachable as
+`../.forja-<profile>/...`) — they'd pass silently under acceptEdits / broad
+write policies, missing the intended confirm for Forja project state. Closed by
+anchoring `cwdEscalateDirs` at the same `projectRoot` (resolveRepoRoot) as the
+foreign deny when a profile is active — both halves now repo-rooted, reusing the
+one cached resolveRepoRoot call (no extra git spawn; default namespace
+unchanged). Shakeout in a real git repo (subdir launch): write to
+`../.forja-dev/permissions.yaml` → escalate, `../.git/config` → escalate,
+`../.forja/x` → deny (foreign), `../.forja-dev/x` read → pass. typecheck + lint +
+protected_paths (120) green.
+
 ## [2026-06-15] Prompt: drop the model id from the # Environment block
 
 The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,

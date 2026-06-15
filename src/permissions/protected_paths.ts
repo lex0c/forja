@@ -399,22 +399,29 @@ const getResolvedTargets = (home: string, cwd: string): ResolvedProtectedTargets
   const key = `${home}\0${cwd}`;
   let entry = targetCache.get(key);
   if (entry === undefined) {
-    // Anchor the foreign-`.forja` deny at the PROJECT ROOT, not the raw `cwd`.
-    // The engine's cwd is the launch cwd, which may be a SUBDIR of the repo
-    // (e.g. `forja` run from `repo/src/`), while the real `.forja/` lives at
-    // the repo root and resolves as `../.forja/...`. `resolveRepoRoot` runs
-    // ONLY when a profile is active (foreignDirs non-empty) and the result is
-    // cached on (home,cwd), so there's no git spawn on the default namespace;
-    // it falls back to `cwd` if git is unavailable. When cwd already IS the
-    // repo root (the common launch case) `resolveRepoRoot(cwd) === cwd`, so
-    // this is byte-identical there and only changes the subdir-launch case.
+    // Under a profile, anchor BOTH the active-project escalate roots AND the
+    // foreign deny at the PROJECT ROOT, not the launch `cwd`. The engine's cwd
+    // is the launch cwd, which may be a SUBDIR of the repo (e.g. `forja` run
+    // from `repo/src/`), but the project state — `.git`, `.claude`, the active
+    // `.forja-<profile>/`, and the foreign canonical `.forja/` — all live at the
+    // repo root and resolve as `../...`. Without repo-rooting, writes to
+    // `<repoRoot>/.forja-<profile>/permissions.yaml` would miss the escalate
+    // floor and proceed silently under acceptEdits / broad write policies.
+    //
+    // `resolveRepoRoot` runs ONLY when a profile is active (foreignDirs
+    // non-empty), is cached on (home,cwd) — so no git spawn on the default
+    // namespace — falls back to `cwd` if git is unavailable, and equals `cwd`
+    // when cwd already IS the repo root (the common launch), so this is
+    // byte-identical there and only changes the subdir-launch case. The
+    // default namespace keeps cwd-anchoring (no extra git spawn); its
+    // subdir-launch behavior is unchanged (pre-existing).
     const foreignDirs = foreignProjectDirNames();
-    const foreignRoot = foreignDirs.length > 0 ? resolveRepoRoot(cwd) : cwd;
+    const projectRoot = foreignDirs.length > 0 ? resolveRepoRoot(cwd) : cwd;
     entry = {
       tildeEscalateFiles: TILDE_ESCALATE_FILES.map((f) => resolveTildeFile(home, f)),
       tildeEscalateDirs: tildeEscalateDirs().map((d) => resolveTildeFile(home, d)),
-      cwdEscalateDirs: cwdEscalateDirs().map((d) => resolveCwdDir(cwd, d)),
-      cwdForeignDenyDirs: foreignDirs.map((d) => resolveCwdDir(foreignRoot, d)),
+      cwdEscalateDirs: cwdEscalateDirs().map((d) => resolveCwdDir(projectRoot, d)),
+      cwdForeignDenyDirs: foreignDirs.map((d) => resolveCwdDir(projectRoot, d)),
     };
     targetCache.set(key, entry);
   }
