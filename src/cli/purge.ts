@@ -43,7 +43,7 @@ import {
   unlinkSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { appDirName, projectDirName } from '../config/app-namespace.ts';
+import { activeProfile, appDirName, projectDirName } from '../config/app-namespace.ts';
 import { resolveRepoRoot } from '../memory/paths.ts';
 import { ensureInstallId } from '../permissions/install_id.ts';
 import { closeDb, migrate, openDb } from '../storage/index.ts';
@@ -692,15 +692,22 @@ export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
   // Dry-run path
   // ────────────────────────────────────────────────────────────
   if (!force) {
-    // Build the suggested command, preserving the operator's
-    // --no-audit flag. Without this, an operator who ran
-    // `forja purge --no-audit` (typically because DB is broken
-    // — the exact emergency the flag exists for) would see
-    // "forja purge --force" suggested. Copy-pasting that would
-    // hit the audit gate and abort, blocking the emergency
-    // purge workflow. The suggested command must be directly
-    // executable; preserve scope flags.
-    const command = noAudit ? 'forja purge --force --no-audit' : 'forja purge --force';
+    // Build the suggested command, preserving the operator's --no-audit flag
+    // AND the active profile. Two reasons the suggestion must carry the
+    // operator's switches verbatim:
+    //   1. --no-audit: an operator who ran `forja purge --no-audit` (typically
+    //      because the DB is broken — the exact emergency the flag exists for)
+    //      must not be handed a bare `--force` that re-hits the audit gate and
+    //      aborts the emergency purge.
+    //   2. --profile: a profiled run (`forja --profile dev purge`) scoped the
+    //      dry-run to `.forja-<profile>/`. A bare `forja purge --force` would
+    //      drop the profile and operate on the REAL canonical `.forja/` — a
+    //      different namespace than the one just previewed, risking a purge of
+    //      the operator's real project state. Re-prefix the profile so the
+    //      suggested command hits the SAME namespace the report described.
+    const profile = activeProfile();
+    const profileFlag = profile !== null ? `--profile ${profile} ` : '';
+    const command = `forja ${profileFlag}purge --force${noAudit ? ' --no-audit' : ''}`;
     const report: DryRunReport = {
       mode: 'dry-run',
       repoRoot,

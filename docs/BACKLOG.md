@@ -92,6 +92,15 @@ of `appDirNames()`) and route the escalate list through it so it covers BOTH
 byte-identical. Regression test asserts writes to both project dirs escalate
 (reads pass) under a profile.
 
+Third follow-up (same direction, purge UX footgun): `forja purge`'s dry-run
+scopes to `.forja-<profile>/` under a profile, but the advertised
+`report.command` was a bare `forja purge --force` — copy-pasting it drops the
+profile and operates on the REAL canonical `.forja/`, a different namespace than
+the one previewed, risking a purge of the operator's real project state. The
+suggested command (human + JSON) now re-prefixes `--profile <name>` whenever a
+profile is active, so it hits the same namespace the report described.
+Regression test asserts scope AND command both stay profiled.
+
 ## [2026-06-15] Prompt: drop the model id from the # Environment block
 
 The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,
