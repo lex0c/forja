@@ -610,3 +610,49 @@ describe('isDevSafe — /dev pseudo-device deny carve-out', () => {
     }
   });
 });
+
+// Dev-mode: a profile must NOT become a way to silently edit the operator's
+// real `.forja/` project state — writes there still escalate, alongside the
+// profile's own `.forja-<profile>/`.
+describe('classifyProtectedPath — profile escalates BOTH canonical and profile project dirs', () => {
+  test('under FORJA_PROFILE, writes to .forja AND .forja-<profile> escalate; reads pass', () => {
+    const prev = process.env.FORJA_PROFILE;
+    process.env.FORJA_PROFILE = 'dev';
+    // Fresh cwd so the (home,cwd)-keyed target cache can't serve a no-profile
+    // entry from an earlier test. (In production the profile is frozen per
+    // process, so the cache is only stale under mid-process env mutation.)
+    const cwd = '/work/profiled-proj';
+    try {
+      // The operator's REAL project state — the guard a profile must preserve.
+      expect(
+        classifyProtectedPath({
+          absPath: `${cwd}/.forja/permissions.yaml`,
+          op: 'write',
+          home: HOME,
+          cwd,
+        }),
+      ).toBe('escalate');
+      // The dev session's own project state.
+      expect(
+        classifyProtectedPath({
+          absPath: `${cwd}/.forja-dev/permissions.yaml`,
+          op: 'write',
+          home: HOME,
+          cwd,
+        }),
+      ).toBe('escalate');
+      // Escalate is write-only; reads of the canonical dir still pass through.
+      expect(
+        classifyProtectedPath({
+          absPath: `${cwd}/.forja/permissions.yaml`,
+          op: 'read',
+          home: HOME,
+          cwd,
+        }),
+      ).toBeNull();
+    } finally {
+      if (prev === undefined) delete process.env.FORJA_PROFILE;
+      else process.env.FORJA_PROFILE = prev;
+    }
+  });
+});

@@ -5,6 +5,7 @@ import {
   appDirNames,
   isValidProfile,
   projectDirName,
+  projectDirNames,
 } from '../../src/config/app-namespace.ts';
 
 // The app-namespace keystone: every on-disk resolver routes its segment through
@@ -82,5 +83,18 @@ describe('appDirNames (security-list baseline)', () => {
     // The sandbox hide-paths / protected-paths lists build from this so a dev
     // sandbox masks BOTH the real `forja` state AND the dev `forja-dev` state.
     expect(appDirNames({ FORJA_PROFILE: 'dev' })).toEqual(['forja', 'forja-dev']);
+  });
+});
+
+describe('projectDirNames (project escalate-list baseline)', () => {
+  test('no profile ⇒ canonical only', () => {
+    expect(projectDirNames({})).toEqual(['.forja']);
+  });
+
+  test('profile ⇒ canonical `.forja` FIRST, then the profile variant', () => {
+    // The cwd escalate-on-write list builds from this so a profiled run STILL
+    // escalates writes to the operator's real `.forja/` (no silent edit of
+    // canonical project policy/sessions), plus its own `.forja-<profile>/`.
+    expect(projectDirNames({ FORJA_PROFILE: 'dev' })).toEqual(['.forja', '.forja-dev']);
   });
 });

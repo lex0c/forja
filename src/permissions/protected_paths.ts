@@ -35,7 +35,7 @@
 // `grep`) that bypass the bash AST entirely.
 
 import { resolve } from 'node:path';
-import { appDirNames, projectDirName } from '../config/app-namespace.ts';
+import { appDirNames, projectDirNames } from '../config/app-namespace.ts';
 import { createBoundedCache } from './bounded-cache.ts';
 
 export type ProtectedTier = 'deny' | 'escalate';
@@ -331,10 +331,15 @@ const ABSOLUTE_ESCALATE_ROOTS: readonly string[] = ['/etc'];
 // joined against the session's `cwd` at classification time. The
 // engine's own state lives under `.forja/` (sessions, traces, policy
 // archive); CI/operator state is under `.git/` and `.claude/`.
-// A function (not a const) so `--profile` set at CLI startup is honored:
-// the project dir segment (`.forja` / `.forja-<profile>`) is resolved at
-// classification time, not at module load.
-const cwdEscalateDirs = (): readonly string[] => ['.git', projectDirName(), '.claude'];
+//
+// A function (not a const) so `--profile` is honored at classification time.
+// Built from `projectDirNames()` so it escalates writes to BOTH the canonical
+// `.forja/` AND, under a profile, `.forja-<profile>/`: a profiled run must
+// still NOT silently edit the operator's real project policy/sessions (the
+// guard a profile is meant to preserve, not drop), and its own profile dir
+// gets the same protection. No profile ⇒ `['.git', '.forja', '.claude']`,
+// identical to before.
+const cwdEscalateDirs = (): readonly string[] => ['.git', ...projectDirNames(), '.claude'];
 
 // Posix-only segment-boundary prefix match: avoids false positives like
 // `/procfoo` matching `/proc`. Exported as the one source of truth so

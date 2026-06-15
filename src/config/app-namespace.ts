@@ -77,3 +77,15 @@ export const appDirNames = (env: NodeJS.ProcessEnv = process.env): readonly stri
   const profile = resolveProfile(env);
   return profile === null ? ['forja'] : ['forja', `forja-${profile}`];
 };
+
+// Project-segment analog of `appDirNames`: every per-project dir a session must
+// defend. Always includes the canonical `.forja`; under a profile it ALSO
+// includes `.forja-<profile>`. The protected-paths cwd escalate-on-write list
+// builds from this so a profiled run STILL escalates writes to the operator's
+// real `.forja/` (sessions, policy, traces) — a profile must not become a way
+// to silently edit the canonical project state — while also escalating its own
+// `.forja-<profile>/`. No profile ⇒ `['.forja']`, byte-identical to before.
+export const projectDirNames = (env: NodeJS.ProcessEnv = process.env): readonly string[] => {
+  const profile = resolveProfile(env);
+  return profile === null ? ['.forja'] : ['.forja', `.forja-${profile}`];
+};

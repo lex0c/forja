@@ -81,6 +81,17 @@ covers policy and hooks. A profile now isolates USER + PROJECT state ONLY; the
 machine guardrail stays put. Regression test pins enterprise canonical under a
 profile; app-namespace header documents the carve-out.
 
+Second follow-up (same class, project level): the protected-paths
+`cwdEscalateDirs()` was built from `projectDirName()`, so under a profile it
+listed only `.forja-<profile>` and DROPPED the canonical `.forja` — writes to
+the operator's real `/repo/.forja/permissions.yaml` (policy, sessions) stopped
+escalating during a profiled run, losing the guard against silent edits a
+profile is meant to preserve. Added a `projectDirNames()` helper (project analog
+of `appDirNames()`) and route the escalate list through it so it covers BOTH
+`.forja` AND `.forja-<profile>`. No profile ⇒ `['.git', '.forja', '.claude']`,
+byte-identical. Regression test asserts writes to both project dirs escalate
+(reads pass) under a profile.
+
 ## [2026-06-15] Prompt: drop the model id from the # Environment block
 
 The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,
