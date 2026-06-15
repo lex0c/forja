@@ -7,6 +7,7 @@ import {
   aggregateArm,
   deltaOf,
   flagForModel,
+  main,
   parseArgs,
   runAbComparison,
   verdictLine,
@@ -151,6 +152,28 @@ describe('parseArgs', () => {
     expect(() => parseArgs(['--model', 'openai/gpt-5.4-mini', '--repeat', '0'])).toThrow(
       /positive integer/,
     );
+  });
+  test('--thinking-budget parses to a positive integer', () => {
+    const a = parseArgs(['--model', 'anthropic/claude-opus-4-8', '--thinking-budget', '2048']);
+    expect(a.thinkingBudget).toBe(2048);
+  });
+  test('--thinking-budget rejects non-positive', () => {
+    expect(() =>
+      parseArgs(['--model', 'anthropic/claude-opus-4-8', '--thinking-budget', '0']),
+    ).toThrow(/positive integer/);
+  });
+  test('thinkingBudget is absent by default', () => {
+    expect(parseArgs(['--model', 'openai/gpt-5.4-mini']).thinkingBudget).toBeUndefined();
+  });
+});
+
+describe('main — Anthropic gate guard', () => {
+  test('refuses an Anthropic A/B with no thinking budget (would be a false no-delta)', async () => {
+    // Anthropic + no --thinking-budget: the run would capture no thinking blocks,
+    // making OFF and ON identical. main must refuse (return 1) BEFORE any API call
+    // — the guard fires after cases load, before runAbComparison.
+    const code = await main(['--model', 'anthropic/claude-opus-4-8', '--repeat', '5']);
+    expect(code).toBe(1);
   });
 });
 

@@ -198,6 +198,12 @@ export interface AbCliArgs {
   modelId: string;
   repeat: number;
   perCaseTimeoutMs?: number;
+  // Extended-thinking budget (tokens). REQUIRED for a meaningful Anthropic A/B:
+  // the adapter only emits signed thinking blocks when thinking_budget > 0, so
+  // without it the OFF and ON arms are identical (nothing captured to replay) and
+  // the run would report a false "no delta". Ignored by OpenAI (it uses
+  // reasoning.effort), so harmless to set on the default cross-provider command.
+  thinkingBudget?: number;
 }
 
 const expectValue = (argv: readonly string[], i: number, flag: string): string => {
@@ -211,6 +217,7 @@ export const parseArgs = (argv: readonly string[]): AbCliArgs => {
   let modelId: string | undefined;
   let repeat = 5;
   let perCaseTimeoutMs: number | undefined;
+  let thinkingBudget: number | undefined;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--model') {
@@ -232,6 +239,15 @@ export const parseArgs = (argv: readonly string[]): AbCliArgs => {
       perCaseTimeoutMs = v;
       continue;
     }
+    if (a === '--thinking-budget') {
+      const v = Number(expectValue(argv, i, '--thinking-budget'));
+      i += 1;
+      if (!Number.isInteger(v) || v < 1) {
+        throw new Error('--thinking-budget must be a positive integer');
+      }
+      thinkingBudget = v;
+      continue;
+    }
     if (a !== undefined && !a.startsWith('-')) {
       target = a;
       continue;
@@ -243,6 +259,7 @@ export const parseArgs = (argv: readonly string[]): AbCliArgs => {
   }
   const result: AbCliArgs = { target, modelId, repeat };
   if (perCaseTimeoutMs !== undefined) result.perCaseTimeoutMs = perCaseTimeoutMs;
+  if (thinkingBudget !== undefined) result.thinkingBudget = thinkingBudget;
   return result;
 };
 
@@ -284,11 +301,30 @@ export const main = async (argv: readonly string[]): Promise<number> => {
       `forja eval:ab: warning — K=${parsed.repeat} is low signal; use --repeat 10+ before trusting a delta.\n`,
     );
   }
+  // Anthropic only emits signed thinking blocks when thinking_budget > 0, so an
+  // Anthropic A/B with no budget captures nothing — both arms are identical and
+  // the run reports a FALSE "no delta". Refuse to run that misleading comparison.
+  if (
+    flag === 'FORJA_ANTHROPIC_REASONING_REPLAY' &&
+    (parsed.thinkingBudget === undefined || parsed.thinkingBudget <= 0)
+  ) {
+    process.stderr.write(
+      'forja eval:ab: Anthropic reasoning replay needs --thinking-budget <tokens> (> 0) to engage thinking; without it no signed thinking blocks are produced and the OFF/ON arms are identical (a false "no delta"). Re-run with e.g. --thinking-budget 2048.\n',
+    );
+    return 1;
+  }
   process.stderr.write(
-    `A/B reasoning replay: ${parsed.modelId} (${flag}), ${cases.length} case(s) × ${parsed.repeat} round(s) per arm\n`,
+    `A/B reasoning replay: ${parsed.modelId} (${flag}), ${cases.length} case(s) × ${parsed.repeat} round(s) per arm${
+      parsed.thinkingBudget !== undefined ? `, thinking_budget=${parsed.thinkingBudget}` : ''
+    }\n`,
   );
 
-  const execute: ExecuteOptions = { bootstrapOverride: { modelId: parsed.modelId } };
+  const execute: ExecuteOptions = {
+    bootstrapOverride: {
+      modelId: parsed.modelId,
+      ...(parsed.thinkingBudget !== undefined ? { thinkingBudget: parsed.thinkingBudget } : {}),
+    },
+  };
   if (parsed.perCaseTimeoutMs !== undefined) execute.perCaseTimeoutMs = parsed.perCaseTimeoutMs;
 
   const { result } = await runAbComparison({

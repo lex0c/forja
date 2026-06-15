@@ -131,6 +131,12 @@ export interface BootstrapInput {
   // Sampling temperature plumbed straight to HarnessConfig.
   // Evals set this to 0 for deterministic runs.
   temperature?: number;
+  // Extended-thinking budget (tokens) plumbed straight to HarnessConfig
+  // (PLAYBOOKS.md §1.1). Engages thinking when > 0; the Anthropic adapter only
+  // emits signed thinking blocks when this is set, so the reasoning-replay A/B
+  // needs it to exercise the Anthropic gate. OpenAI/Google map it to their own
+  // surfaces or drop it (best-effort, per the GenerateRequest contract).
+  thinkingBudget?: number;
   // Resume mode (AGENTIC_CLI §2.1): when set, the harness skips
   // createSession and continues the named session by reloading
   // its persisted messages and appending `prompt` as the new
@@ -1575,6 +1581,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     ...(resolvedSystemSegments !== undefined ? { systemSegments: resolvedSystemSegments } : {}),
     ...(systemPromptHash !== undefined ? { systemPromptHash } : {}),
     ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
+    ...(input.thinkingBudget !== undefined ? { thinkingBudget: input.thinkingBudget } : {}),
     ...(input.resumeFromSessionId !== undefined
       ? { resumeFromSessionId: input.resumeFromSessionId }
       : {}),

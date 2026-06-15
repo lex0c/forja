@@ -2,6 +2,23 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] A/B runner: thinking budget for a meaningful Anthropic gate
+
+The A/B runner only overrode modelId, so an Anthropic run never set thinking_budget
+— and the adapter only emits signed thinking when thinking_budget > 0, so OFF and
+ON were identical (nothing to capture/replay) and the run would report a FALSE
+"no delta" for the Anthropic gate. Wired thinking_budget end-to-end:
+BootstrapInput.thinkingBudget → HarnessConfig → GenerateRequest.thinking_budget
+(the HarnessConfig→request leg already existed; bootstrap just didn't expose it).
+
+The runner gains `--thinking-budget <tokens>` (threaded via bootstrapOverride) and
+now REFUSES an Anthropic A/B with no budget (returns 1 + explains) rather than run
+a misleading comparison. The default `eval:long-horizon:ab` command carries
+`--thinking-budget 4096`; OpenAI ignores it (uses reasoning.effort), so it's safe
+on the shared cross-provider command. Tests: --thinking-budget parsing/validation,
+the Anthropic-no-budget refusal, and a request-recording mock proving
+bootstrapOverride.thinkingBudget reaches req.thinking_budget.
+
 ## [2026-06-14] OpenAI retention opt-out: send in_memory explicitly (not omit)
 
 `FORJA_OPENAI_PROMPT_CACHE_RETENTION=in_memory` (the ZDR / data-residency opt-out)
