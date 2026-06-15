@@ -407,6 +407,7 @@ export const createAnthropicProvider = (
     id: `anthropic/${modelName}`,
     family: 'anthropic',
     capabilities: effectiveCaps,
+    replaysReasoning: reasoningReplay,
     generate,
     generateConstrained: async (req: ConstrainedRequest): Promise<ConstrainedResult> => {
       // Anthropic's structured-output surface is forced tool calling:

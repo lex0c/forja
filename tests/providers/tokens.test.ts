@@ -35,6 +35,26 @@ describe('estimateMessagesTokens', () => {
     // Lengths: 'hi'(2) + 'echo'(4) + JSON.stringify({msg:'x'})(11) + 'ok'(2) + 't1'(2) = 21
     expect(estimateMessagesTokens(messages)).toBe(Math.ceil(21 / 4));
   });
+
+  test('reasoning blocks: 0 by default, serialized payload when countReasoning', () => {
+    const data = { thinking: 'reasoned hard', signature: 'SIG==' };
+    const messages: ProviderMessage[] = [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', provider: 'anthropic', data },
+          { type: 'text', text: 'ans' }, // 3 chars
+        ],
+      },
+    ];
+    // Default (replay off): reasoning contributes 0 → only the 3-char text.
+    expect(estimateMessagesTokens(messages)).toBe(Math.ceil(3 / 4));
+    // countReasoning: the serialized data payload is charged.
+    const payload = JSON.stringify(data).length;
+    expect(estimateMessagesTokens(messages, { countReasoning: true })).toBe(
+      Math.ceil((3 + payload) / 4),
+    );
+  });
 });
 
 describe('estimatePromptTokens', () => {

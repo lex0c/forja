@@ -420,6 +420,7 @@ export const createOpenAIProvider = (
     id: `openai/${modelName}`,
     family: 'openai',
     capabilities: caps,
+    replaysReasoning: reasoningReplay,
     generate: useResponses
       ? (req: GenerateRequest) =>
           generateViaResponses(
@@ -444,6 +445,6 @@ export const createOpenAIProvider = (
           )
       : generateConstrained,
     countTokens: (messages: ProviderMessage[]): Promise<number> =>
-      Promise.resolve(estimateMessagesTokens(messages)),
+      Promise.resolve(estimateMessagesTokens(messages, { countReasoning: reasoningReplay })),
   };
 };

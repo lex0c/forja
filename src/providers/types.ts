@@ -352,6 +352,12 @@ export interface Provider {
   id: string;
   family: ProviderFamily;
   capabilities: ProviderCapabilities;
+  // Whether this provider instance replays reasoning blocks onto the wire
+  // (resolved once in the factory from FORJA_*_REASONING_REPLAY + capability).
+  // Consumers that size the outbound prompt (the compaction trigger, token
+  // estimators) read it to decide whether replayed reasoning payloads count
+  // against the context window. Omitted/false ⇒ reasoning is dropped at send.
+  replaysReasoning?: boolean;
   generate(req: GenerateRequest): AsyncIterable<StreamEvent>;
   generateConstrained(req: ConstrainedRequest): Promise<ConstrainedResult>;
   countTokens(messages: ProviderMessage[]): Promise<number>;

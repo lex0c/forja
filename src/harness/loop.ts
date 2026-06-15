@@ -2409,6 +2409,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         const promptTokens = estimatePromptTokens([...ctx.getMessages()], {
           ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
           ...(tools.length > 0 ? { tools } : {}),
+          countReasoning: config.provider.replaysReasoning === true,
         });
         const contextWindow = config.provider.capabilities.context_window;
         const triggerAt = compactionTriggerTokens(budget.compactionThreshold, contextWindow);
@@ -2460,6 +2461,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           estimatePromptTokens([...ctxRef.getMessages()], {
             ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
             ...(tools.length > 0 ? { tools } : {}),
+            countReasoning: config.provider.replaysReasoning === true,
           });
         const beforeHash = hashContext(ctxRef.getMessages());
         // Thin adapter over the shared recorder: supplies the loop's beforeHash

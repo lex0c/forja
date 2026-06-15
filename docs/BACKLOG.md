@@ -2,6 +2,27 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] Token estimate counts replayed reasoning (was always 0)
+
+The shared prompt estimator charged `reasoning` blocks as 0 unconditionally. With
+replay ON the adapters DO send them, so a long tool loop accumulating
+encrypted_content / signed-thinking payloads could skip compaction and then
+overrun the context window at the API boundary. But counting them ALWAYS would
+over-charge the default (replay OFF) path — capture is always-on, so those blocks
+sit in history yet are dropped at send.
+
+Made it replay-aware at the right altitude: the provider is the authority on what
+it sends, so it now exposes `replaysReasoning` (resolved once in the factory from
+FORJA_*_REASONING_REPLAY + capability). `estimatePromptTokens` /
+`estimateMessagesTokens` gain a `countReasoning` option; when set they charge the
+serialized `data` payload, else 0. The compaction trigger (loop) passes
+`config.provider.replaysReasoning`, and the OpenAI `countTokens` passes its own
+resolved flag. So the estimate matches what the request actually carries on both
+arms — no undercount with replay on, no premature compaction with it off.
+
+Tests: reasoning block contributes 0 by default and its serialized payload under
+countReasoning.
+
 ## [2026-06-14] Rate-limit handling: --delay-ms pacing + honor Retry-After
 
 The clean OpenAI A/B's ON arm hit 429s (TPM 200k/min) — not a replay bug: ~320
