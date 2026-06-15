@@ -137,6 +137,16 @@ closes the "a profile silently drops/redirects a real-namespace guard" category
 end-to-end (enterprise layer, project escalate list, purge + doctor + inspect
 commands).
 
+Fifth follow-up (audit gap — `init`): the "closed end-to-end" claim above was
+overstated. `init`'s scaffold follow-up — `review .forja-<profile>/ and run
+'forja' to start` — advertised a BARE `forja` launch command; copy-pasting it
+opens the canonical namespace, creating/migrating the real `~/.config/forja` +
+`~/.local/share/forja` state a profile is meant to keep isolated. The self-audit
+missed it because its grep matched `forja permission|purge|...` verbs, not the
+no-verb launch command. Routed it through `forjaCommand('')` and extended the
+helper to render the bare launch command without a trailing space (`forja` /
+`forja --profile <name>`); unit-tested the empty-rest case.
+
 ## [2026-06-15] Prompt: drop the model id from the # Environment block
 
 The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,

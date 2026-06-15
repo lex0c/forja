@@ -13,11 +13,14 @@
 //
 // `rest` is the command MINUS the leading `forja ` (e.g. `'permission verify'`,
 // `'purge --force'`). No profile ⇒ `forja <rest>`, byte-identical to a bare
-// string, so default-namespace output is unchanged.
+// string, so default-namespace output is unchanged. Empty `rest` yields the
+// bare launch command (`forja` / `forja --profile <name>`) with no trailing
+// space — used by the `init` "run '<cmd>' to start" follow-up.
 
 import { activeProfile } from '../config/app-namespace.ts';
 
 export const forjaCommand = (rest: string, env: NodeJS.ProcessEnv = process.env): string => {
   const profile = activeProfile(env);
-  return profile === null ? `forja ${rest}` : `forja --profile ${profile} ${rest}`;
+  const base = profile === null ? 'forja' : `forja --profile ${profile}`;
+  return rest.length > 0 ? `${base} ${rest}` : base;
 };

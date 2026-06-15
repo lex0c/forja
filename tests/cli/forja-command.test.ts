@@ -23,4 +23,9 @@ describe('forjaCommand', () => {
       'forja --profile dev permission rotate-chain --reason x',
     );
   });
+
+  test('empty rest ⇒ bare launch command, NO trailing space (init follow-up)', () => {
+    expect(forjaCommand('', {})).toBe('forja');
+    expect(forjaCommand('', { FORJA_PROFILE: 'dev' })).toBe('forja --profile dev');
+  });
 });

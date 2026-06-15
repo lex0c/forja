@@ -42,6 +42,7 @@ import { projectPolicyPath } from '../permissions/index.ts';
 import { DEFAULT_MODEL } from '../providers/default-model.ts';
 import { projectScopeRoots } from '../skills/index.ts';
 import { projectAgentsDir } from '../subagents/paths.ts';
+import { forjaCommand } from './forja-command.ts';
 import { renderInitConfigTemplate } from './init-config-template.ts';
 import { CANONICAL_PLAYBOOKS, type CanonicalPlaybook } from './init-playbooks/index.ts';
 import type { CanonicalSeed } from './init-seeds/index.ts';
@@ -489,7 +490,7 @@ export const runInit = (options: InitOptions): number => {
     `forja: ${totals.wrote} wrote, ${totals.overwritten} overwritten, ${totals.skipped} skipped${archivedSuffix}${disabledSuffix} (${steps.length} ${stepWord})\n`,
   );
   if (totals.wrote + totals.overwritten > 0) {
-    options.out(`forja: review ${projectDirName()}/ and run 'forja' to start.\n`);
+    options.out(`forja: review ${projectDirName()}/ and run '${forjaCommand('')}' to start.\n`);
   }
   return 0;
 };
