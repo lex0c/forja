@@ -68,17 +68,16 @@ const MAX_BATCH_SUBJECTS = 5;
 const MAX_OPERATOR_BASH_LINES = 200;
 
 // `… output truncated` hint line (slice 2). A tool that capped its
-// own output gets one secondary line under the card body. The
-// `ctrl+o` key stays unwired — UI.md §4.10.5 defers the expansion
-// panel to a later slice; the hint stands on its own until then.
+// own output gets one secondary line under the card body. The hint
+// deliberately does NOT advertise `(ctrl+o to expand)`: that key is
+// unwired (UI.md §4.10.5 defers the expansion panel to a later slice),
+// and a hint promising an action that no-ops is dishonest — the same
+// reasoning that kept the dead-key hint off the args chip (BACKLOG D90).
+// Re-add the key cue when the expansion panel lands.
 // Indented 3 cols so it lines up under the `└─ ` connector's
 // content, reading as a footnote of the card rather than a sibling.
 const truncationHint = (caps: Capabilities, indent: string): string =>
-  paint(
-    caps,
-    'secondary',
-    `${indent}   ${ellipsisGlyph(caps)} output truncated (ctrl+o to expand)`,
-  );
+  paint(caps, 'secondary', `${indent}   ${ellipsisGlyph(caps)} output truncated`);
 
 export const formatPermanent = (item: PermanentItem, caps: Capabilities): string[] => {
   // Frame margin (UI.md §6.3): every permanent kind emits 2sp-padded

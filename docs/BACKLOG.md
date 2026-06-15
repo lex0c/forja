@@ -2,6 +2,20 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-15] TUI: drop the dead-key `(ctrl+o to expand)` from the truncation hint
+
+The `… output truncated` card line advertised `(ctrl+o to expand)`, but `ctrl+o`
+is unwired (the expansion panel is deferred — UI.md §4.10.5) — so the cue promised
+an action that no-ops. Removed the parenthetical; the line now reads just
+`… output truncated`. This applies the exact reasoning of D90 ("a hint without the
+action is dishonest", which kept the dead-key cue off the args chip) to the one
+render path that hadn't followed it. Re-add the key cue when the expansion panel
+lands. Updated the three `permanent.test.ts` assertions + the `state.ts` doc comment.
+
+Spec debt: UI.md §4.10.5 (l.466) and §4.10 (l.414/428) still document the hint
+showing `(ctrl+o to expand)` while the key no-ops; a spec PR should reconcile the
+microcopy (the code-leads-UX convention applies — code first, spec PR after).
+
 ## [2026-06-15] Tool UX, round 2: three more empty-string-is-omitted gaps
 
 Swept the remaining builtin tools (bash/monitor, file/memory, task/todo/reminder,

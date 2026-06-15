@@ -700,7 +700,7 @@ export type PermanentItem =
       // belongs to its owner. Absent for top-level tool calls.
       parentId?: string;
       // True when the tool capped its own output — renderer adds a
-      // `… output truncated (ctrl+o to expand)` line under the card.
+      // `… output truncated` line under the card.
       outputTruncated?: boolean;
       // Display diff (write/edit) — renderer shows +N/−M on the head and
       // a bounded colored snippet under the card. Display-only.

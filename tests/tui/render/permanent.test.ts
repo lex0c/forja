@@ -749,7 +749,7 @@ describe('formatPermanent', () => {
       // blank, head, `└─` subject, hint — the hint indents 3 cols so
       // it sits under the connector's content.
       expect(out).toHaveLength(4);
-      expect(out[3]).toBe(pad('   … output truncated (ctrl+o to expand)'));
+      expect(out[3]).toBe(pad('   … output truncated'));
     });
 
     test('no hint line when outputTruncated is absent', () => {
@@ -781,7 +781,7 @@ describe('formatPermanent', () => {
         },
         ascii,
       );
-      expect(out[out.length - 1]).toBe(pad('   ... output truncated (ctrl+o to expand)'));
+      expect(out[out.length - 1]).toBe(pad('   ... output truncated'));
     });
   });
 
@@ -949,7 +949,7 @@ describe('formatPermanent', () => {
       );
       // blank, head, ├─ a, └─ b, then a single hint for the group.
       expect(out).toHaveLength(5);
-      expect(out[4]).toBe(pad('   … output truncated (ctrl+o to expand)'));
+      expect(out[4]).toBe(pad('   … output truncated'));
     });
 
     test('single-subject batch closes the tree with └─ on the only row', () => {
