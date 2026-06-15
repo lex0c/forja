@@ -67,20 +67,21 @@ export const openaiPromptCacheKey = (req: GenerateRequest): string =>
     .update(stableStringify(req.tools ?? []))
     .digest('hex');
 
-// OpenAI extended prompt-cache retention (`prompt_cache_retention: '24h'`):
-// keep the cached prefix warm for up to 24h instead of the 5–10min in-memory
-// default, so a session's later turns still hit the cache after idle gaps —
-// parity with Anthropic's longer cache TTL. Only set on models that support it
-// (capability `extended_prompt_cache`) and on real OpenAI. Default ON; the env
-// var opts out for ZDR / data-residency-conscious users (the 24h policy may
-// offload key/value tensors to GPU-local storage) or compat endpoints that
-// 400 on the param: `in_memory` / `off` / `0` / `false` → disabled.
-const promptCacheRetentionFromEnv = (): '24h' | undefined => {
+// OpenAI prompt-cache retention INTENT from the env var. Returns the value to
+// SEND, not a boolean: `24h` (the default — keep the cached prefix warm up to 24h
+// vs the 5–10min in-memory baseline, parity with Anthropic's longer TTL) or
+// `in_memory` (the data-residency / ZDR-conscious opt-out). The opt-out must be
+// SENT explicitly, not omitted: OpenAI documents that an OMITTED retention
+// defaults to `24h` for supported models in a non-ZDR org, so dropping the field
+// would silently leave the user on extended cache — the opposite of opting out.
+// `in_memory` / `off` / `0` / `false` all select the opt-out. The factory then
+// reconciles this intent with the model (a 24h-only model rejects `in_memory`).
+const promptCacheRetentionFromEnv = (): '24h' | 'in_memory' => {
   const v = process.env.FORJA_OPENAI_PROMPT_CACHE_RETENTION;
   if (v === undefined || v === '') return '24h';
   const norm = v.toLowerCase();
   return norm === 'in_memory' || norm === 'off' || norm === '0' || norm === 'false'
-    ? undefined
+    ? 'in_memory'
     : '24h';
 };
 
@@ -217,13 +218,29 @@ export const createOpenAIProvider = (
   }
 
   const includeUsage = options.includeUsage ?? includeUsageFromEnv();
-  // Extended prompt-cache retention, resolved once: only on real OpenAI (a
-  // custom baseURL may 400 on the param) and only for models whose capability
-  // advertises support. Undefined → the param is omitted entirely.
-  const promptCacheRetention =
-    options.baseURL === undefined && caps.extended_prompt_cache === true
-      ? promptCacheRetentionFromEnv()
-      : undefined;
+  // Prompt-cache retention, resolved once. Only on real OpenAI (a custom baseURL
+  // may 400 on the param) and only for models that advertise extended retention;
+  // otherwise omit (a non-extended model's only mode is in_memory, which is also
+  // OpenAI's default-on-omit there, so omitting already honors a data-residency
+  // opt-out). For extended models we SEND the resolved intent — including the
+  // `in_memory` opt-out, which must be explicit (omitting defaults to 24h). The
+  // exception: a 24h-only model (gpt-5.5/5.5-pro/future) REJECTS `in_memory`, so
+  // the opt-out can't be honored there — omit and warn, rather than send an
+  // invalid value (which would 400) or pretend it worked (a data-residency leak).
+  let promptCacheRetention: '24h' | 'in_memory' | undefined;
+  if (options.baseURL === undefined && caps.extended_prompt_cache === true) {
+    const intent = promptCacheRetentionFromEnv();
+    if (intent === 'in_memory' && caps.extended_prompt_cache_24h_only === true) {
+      promptCacheRetention = undefined;
+      process.stderr.write(
+        `forja: ${modelName} accepts only 24h prompt-cache retention; the in_memory data-residency opt-out (FORJA_OPENAI_PROMPT_CACHE_RETENTION) cannot be honored on this model — use a model that supports in_memory (e.g. gpt-5.4) for that workload.\n`,
+      );
+    } else {
+      promptCacheRetention = intent;
+    }
+  } else {
+    promptCacheRetention = undefined;
+  }
   // Reasoning-item replay (Responses path): real OpenAI only (the `include`
   // param + opaque input items may 400 on a compat endpoint), env-gated, OFF by
   // default. Resolved once, threaded into generateViaResponses.

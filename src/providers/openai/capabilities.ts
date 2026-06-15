@@ -56,8 +56,11 @@ export const OPENAI_CAPS: Record<string, ProviderCapabilities> = {
   // Responses API path (task #19). gpt-4o (non-reasoning) is unaffected.
   'gpt-5.5': {
     ...OPENAI_REASONING_BASE,
-    // On OpenAI's extended-retention list → 24h prompt-cache retention.
+    // On OpenAI's extended-retention list → 24h prompt-cache retention. 24h-ONLY:
+    // gpt-5.5/5.5-pro/future reject the `in_memory` value, so the in_memory
+    // data-residency opt-out can't be sent here (adapter warns + omits instead).
     extended_prompt_cache: true,
+    extended_prompt_cache_24h_only: true,
     context_window: 1_050_000,
     output_max_tokens: 128_000,
     cost_per_1k_input: 5.0,
@@ -67,7 +70,8 @@ export const OPENAI_CAPS: Record<string, ProviderCapabilities> = {
   },
   'gpt-5.4': {
     ...OPENAI_REASONING_BASE,
-    // On OpenAI's extended-retention list → 24h prompt-cache retention.
+    // On OpenAI's extended-retention list and accepts BOTH 24h and in_memory
+    // (not 24h-only), so the in_memory data-residency opt-out is honored here.
     extended_prompt_cache: true,
     context_window: 1_050_000,
     output_max_tokens: 128_000,

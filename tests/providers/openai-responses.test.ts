@@ -252,7 +252,7 @@ describe('createOpenAIProvider — Responses routing for reasoning models', () =
     expect(p.prompt_cache_retention).toBeUndefined();
   });
 
-  test('opts out of extended retention when the env var disables it', async () => {
+  test('env opt-out SENDS in_memory (not omit) on a model that supports it (gpt-5.4)', async () => {
     const prev = process.env.FORJA_OPENAI_PROMPT_CACHE_RETENTION;
     process.env.FORJA_OPENAI_PROMPT_CACHE_RETENTION = 'in_memory';
     try {
@@ -260,12 +260,40 @@ describe('createOpenAIProvider — Responses routing for reasoning models', () =
         { type: 'response.created', response: { id: 'r' } },
         { type: 'response.completed', response: {} },
       ]);
-      // gpt-5.4 IS on the extended-retention list, so the env opt-out is the only
-      // thing suppressing the param here (on gpt-5.4-mini it would be undefined
-      // regardless, which wouldn't actually exercise the opt-out path).
+      // gpt-5.4 accepts both 24h and in_memory. Omitting would default to 24h on
+      // a non-ZDR org (per OpenAI docs), so the data-residency opt-out must be
+      // SENT explicitly as in_memory — not dropped.
       const provider = createOpenAIProvider('gpt-5.4', { client: handle.client });
       for await (const _ of provider.generate({
         model: 'gpt-5.4',
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 8,
+        effort: 'high',
+      })) {
+        // drain
+      }
+      expect((handle.calls[0] as { prompt_cache_retention?: unknown }).prompt_cache_retention).toBe(
+        'in_memory',
+      );
+    } finally {
+      if (prev === undefined) delete process.env.FORJA_OPENAI_PROMPT_CACHE_RETENTION;
+      else process.env.FORJA_OPENAI_PROMPT_CACHE_RETENTION = prev;
+    }
+  });
+
+  test('env opt-out is OMITTED (not in_memory) on a 24h-only model (gpt-5.5)', async () => {
+    // gpt-5.5 rejects the in_memory value, so the opt-out cannot be honored —
+    // the adapter must omit the param rather than send an invalid value (400).
+    const prev = process.env.FORJA_OPENAI_PROMPT_CACHE_RETENTION;
+    process.env.FORJA_OPENAI_PROMPT_CACHE_RETENTION = 'in_memory';
+    try {
+      const handle = mockResponsesClient([
+        { type: 'response.created', response: { id: 'r' } },
+        { type: 'response.completed', response: {} },
+      ]);
+      const provider = createOpenAIProvider('gpt-5.5', { client: handle.client });
+      for await (const _ of provider.generate({
+        model: 'gpt-5.5',
         messages: [{ role: 'user', content: 'hi' }],
         max_tokens: 8,
         effort: 'high',
@@ -279,6 +307,25 @@ describe('createOpenAIProvider — Responses routing for reasoning models', () =
       if (prev === undefined) delete process.env.FORJA_OPENAI_PROMPT_CACHE_RETENTION;
       else process.env.FORJA_OPENAI_PROMPT_CACHE_RETENTION = prev;
     }
+  });
+
+  test('default (no env) sends 24h on a 24h-only model (gpt-5.5)', async () => {
+    const handle = mockResponsesClient([
+      { type: 'response.created', response: { id: 'r' } },
+      { type: 'response.completed', response: {} },
+    ]);
+    const provider = createOpenAIProvider('gpt-5.5', { client: handle.client });
+    for await (const _ of provider.generate({
+      model: 'gpt-5.5',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 8,
+      effort: 'high',
+    })) {
+      // drain
+    }
+    expect((handle.calls[0] as { prompt_cache_retention?: unknown }).prompt_cache_retention).toBe(
+      '24h',
+    );
   });
 
   test('gpt-5.4-mini generateConstrained via Responses returns args + usage', async () => {

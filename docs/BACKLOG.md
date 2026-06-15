@@ -2,6 +2,26 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] OpenAI retention opt-out: send in_memory explicitly (not omit)
+
+`FORJA_OPENAI_PROMPT_CACHE_RETENTION=in_memory` (the ZDR / data-residency opt-out)
+resolved to `undefined`, which omits the param. But OpenAI documents that an
+OMITTED retention defaults to `24h` for supported models in a non-ZDR org — so the
+"opt-out" silently left the user on extended cache for gpt-5.4. Fixed: the env
+resolver now returns the INTENT (`24h` | `in_memory`) and the factory SENDS it.
+
+Model-aware, because the proposal as stated would 400 on gpt-5.5: OpenAI documents
+gpt-5.5 / 5.5-pro / future models as `24h`-ONLY (they reject `in_memory`). Added an
+`extended_prompt_cache_24h_only` capability (set on gpt-5.5); when the in_memory
+opt-out hits such a model the adapter OMITS the param and warns once on stderr —
+the opt-out can't be honored there, and that's surfaced rather than sent as an
+invalid value or silently downgraded to 24h (a data-residency leak). gpt-5.4
+(accepts both) now genuinely sends in_memory on opt-out.
+
+Tests: opt-out → in_memory on gpt-5.4; opt-out → omitted on gpt-5.5; default →
+24h on both. Verified the default-on-omit and the 24h-only value restriction
+against OpenAI's prompt-caching guide.
+
 ## [2026-06-14] OpenAI extended-prompt-cache: scope the flag to the documented models
 
 `OPENAI_REASONING_BASE` carried `extended_prompt_cache: true`, so the factory

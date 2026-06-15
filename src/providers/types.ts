@@ -47,6 +47,13 @@ export interface ProviderCapabilities {
   // cache TTL: a session's later turns still hit the cache after idle gaps.
   // Adapter-translated — only the OpenAI adapter reads it today; others omit.
   extended_prompt_cache?: boolean;
+  // Among `extended_prompt_cache` models, this one accepts ONLY `24h` — the
+  // `in_memory` retention value is rejected (OpenAI documents gpt-5.5 / 5.5-pro
+  // / future models as 24h-only). The adapter uses this to NOT send the
+  // `in_memory` data-residency opt-out to such a model (it would be an invalid
+  // value); the opt-out can't be honored there and the adapter warns instead.
+  // Absent/false on models that accept both 24h and in_memory (e.g. gpt-5.4).
+  extended_prompt_cache_24h_only?: boolean;
 
   // Cost (USD per 1k tokens — values are illustrative per spec §5)
   cost_per_1k_input: number;
