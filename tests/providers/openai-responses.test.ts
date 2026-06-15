@@ -433,6 +433,31 @@ describe('createOpenAIProvider — Responses routing for reasoning models', () =
       });
     });
 
+    test('countTokens honors replaysReasoning: gpt-4o omits the payload, gpt-5.4-mini counts it', async () => {
+      await withReplay(true, async () => {
+        const msgs = [
+          {
+            role: 'assistant' as const,
+            content: [
+              {
+                type: 'reasoning' as const,
+                provider: 'openai' as const,
+                data: { ec: 'X'.repeat(400) },
+              },
+              { type: 'text' as const, text: 'hi' },
+            ],
+          },
+        ];
+        const mini = createOpenAIProvider('gpt-5.4-mini', { apiKey: 'sk-test' });
+        const gpt4o = createOpenAIProvider('gpt-4o', { apiKey: 'sk-test' });
+        const miniCount = await mini.countTokens(msgs);
+        const gpt4oCount = await gpt4o.countTokens(msgs);
+        // gpt-4o (Chat Completions, drops reasoning) must not charge the ~400-char
+        // payload it never sends, so its estimate is strictly smaller.
+        expect(gpt4oCount).toBeLessThan(miniCount);
+      });
+    });
+
     test('off (default): reasoning items are not replayed and `include` is absent', async () => {
       await withReplay(false, async () => {
         const handle = mockResponsesClient([

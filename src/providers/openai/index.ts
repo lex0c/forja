@@ -452,7 +452,10 @@ export const createOpenAIProvider = (
             promptCacheRetention,
           )
       : generateConstrained,
+    // Use `replaysReasoning` (NOT the raw env flag) so the count matches the send
+    // path: a Chat Completions model drops reasoning, so counting it would inflate
+    // a resumed conversation's estimate and force premature compaction.
     countTokens: (messages: ProviderMessage[]): Promise<number> =>
-      Promise.resolve(estimateMessagesTokens(messages, { countReasoning: reasoningReplay })),
+      Promise.resolve(estimateMessagesTokens(messages, { countReasoning: replaysReasoning })),
   };
 };

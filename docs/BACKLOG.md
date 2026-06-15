@@ -2,6 +2,18 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] OpenAI countTokens: use replaysReasoning, not the raw flag
+
+Follow-up to the replaysReasoning gating: the provider's own `countTokens` still
+passed the raw env-gated `reasoningReplay` to estimateMessagesTokens, while the
+send path and the `replaysReasoning` field both use `useResponses &&
+reasoningReplay`. So a Chat Completions model (gpt-4o) with the flag on dropped
+reasoning at send but still counted it in countTokens — any caller token-counting
+a resumed conversation with prior reasoning blocks got an inflated estimate →
+premature compaction / budget rejection. Switched countTokens to `replaysReasoning`
+so count and send agree. Test: gpt-4o countTokens omits a reasoning payload that
+gpt-5.4-mini counts (flag on).
+
 ## [2026-06-14] Gate OpenAI replaysReasoning to Responses-path models
 
 The OpenAI provider set `replaysReasoning = reasoningReplay` unconditionally, but
