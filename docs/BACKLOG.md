@@ -178,6 +178,34 @@ it under cwd. No profile ⇒ no foreign dir, byte-identical. Tests both directio
 foreign `.forja` denied/masked, active `.forja-<profile>` still readable
 (engine + linux + macOS). README claim now holds.
 
+Eighth follow-up (same class, subdir gap — operator-flagged): the sandbox
+foreign-`.forja` overlay was anchored at the per-command `cwd`. A bash command's
+`args.cwd` can be any subdir of the session tree, so it overlaid `<subdir>/.forja`
+(usually nonexistent) while the real project state at `<repoRoot>/.forja` stayed
+reachable as `../.forja/...`. Threaded the bootstrap-resolved session root
+(`projectConfigCwd = resolveRepoRoot(cwd)`, already computed once at startup — no
+per-call git spawn) through `constructBroker` → the sandbox runner → both
+`buildBwrapArgv` (tmpfs) and macOS `buildSbplProfile` (SBPL deny) as `projectRoot`,
+and anchored the foreign overlay there (defaults to `cwd` when omitted, for
+back-compat/tests). Regression tests: subdir cwd + project root → overlay/deny
+lands at `<root>/.forja`, not `<subdir>/.forja` (linux + macOS).
+
+Ninth follow-up (measured-not-assumed: the ENGINE had the gap too). The eighth
+note claimed the engine floor was already correct because it uses the session
+cwd, not per-command `args.cwd`. Measuring it (`bootstrap.ts:776` passes the raw
+launch `cwd` to `bootstrapPermissionEngine`, NOT the resolved repo root) showed
+that was wrong for the launch-from-a-subdir case: the engine's foreign-`.forja`
+deny resolved at `<launchCwd>/.forja`, missing the real `<repoRoot>/.forja` (a
+profiled session launched from `repo/src/` could `read_file ../.forja/...`).
+Fixed by anchoring the engine's foreign-deny at `resolveRepoRoot(cwd)` in
+`getResolvedTargets` — gated on a profile being active (no git spawn on the
+default namespace), cached per (home,cwd), graceful-degrade to `cwd` if git is
+unavailable, and byte-identical when cwd already IS the repo root (the common
+launch). An adversarial shakeout in a REAL git repo (subdir launch, `--profile
+dev`) confirmed both floors end-to-end: engine DENIES read+write of the real
+`.forja/`, leaves the active `.forja-dev/` readable; sandbox masks `<root>/.forja`
+not `<subdir>/.forja`. typecheck + lint + permissions (2317) green.
+
 ## [2026-06-15] Prompt: drop the model id from the # Environment block
 
 The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,

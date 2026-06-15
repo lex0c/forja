@@ -47,6 +47,9 @@ export interface BuildSandboxExecArgvOptions {
   // Working directory the wrapped process should start in. For
   // cwd-rw / cwd-rw-net this is also the writable subpath target.
   cwd: string;
+  // Project/session root anchoring the foreign `.forja/` deny (see
+  // buildSbplProfile + the Linux runner's projectRoot). Omitted ⇒ `cwd`.
+  projectRoot?: string;
   // Operator's home. For home-rw, this is the writable subpath target.
   home: string;
   // The inner command + args the sandbox-exec wraps. Cannot be empty.
@@ -159,6 +162,9 @@ export const buildSbplProfile = (
   // allow. See BuildSandboxExecArgvOptions.tmpdir for the threat
   // shape + caller-responsibility contract.
   tmpdir?: string,
+  // Project/session root anchoring the foreign `.forja/` deny so it lands at
+  // the repo root even when `cwd` is a subdir. Defaults to `cwd` when omitted.
+  projectRoot?: string,
 ): string => {
   // Common header for every sandboxed profile.
   const header = [
@@ -367,8 +373,9 @@ export const buildSbplProfile = (
   // memory/config/traces. The active `.forja-<profile>/` is NOT in the list and
   // stays accessible; the later deny wins over the cwd/home write-allow above.
   // Empty on the default namespace ⇒ no rules added.
+  const foreignRoot = projectRoot ?? cwd;
   for (const dir of foreignProjectDirNames()) {
-    const escaped = escapeSbplLiteral(joinPath(cwd, dir));
+    const escaped = escapeSbplLiteral(joinPath(foreignRoot, dir));
     denyRules.push(`(deny file-read* (subpath "${escaped}"))`);
     denyRules.push(`(deny file-write* (subpath "${escaped}"))`);
   }
@@ -552,7 +559,7 @@ export const buildSandboxExecArgv = (options: BuildSandboxExecArgvOptions): stri
     }
   }
 
-  const profileString = buildSbplProfile(profile, cwd, home, options.tmpdir);
+  const profileString = buildSbplProfile(profile, cwd, home, options.tmpdir, options.projectRoot);
   // Use the resolved absolute path when provided (production via
   // maybeWrapSandboxArgv); fall back to the bare binary name for
   // direct-build test callers.

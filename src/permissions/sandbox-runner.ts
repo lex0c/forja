@@ -211,6 +211,13 @@ export interface BuildBwrapArgvOptions {
   cwd: string;
   // Operator's home. For home-rw, this is the writable mount target.
   home: string;
+  // Project/session root (resolveRepoRoot of the session cwd, threaded from
+  // bootstrap). Anchors the FOREIGN `.forja/` overlay at the real repo root so
+  // it's masked even when `cwd` is a SUBDIRECTORY — a bash command's args.cwd
+  // can be any dir in the session tree, and the real project state resolves at
+  // the root (`../.forja/...`). Defaults to `cwd` when omitted (back-compat /
+  // tests; production always threads it).
+  projectRoot?: string;
   // The inner command + args the bwrap wraps. Typical bash tool
   // shape: `['bash', '-s']` — the script body is piped to the
   // child's stdin by the caller to avoid argv exposure in
@@ -686,14 +693,17 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
     if (shouldMask(abs)) flags.push('--tmpfs', abs);
   }
   // Project read-floor (profile isolation). Mask any FOREIGN project dir — the
-  // operator's REAL `.forja/` when running under a profile — under cwd, so a
-  // profiled session's sandboxed bash (`cat .forja/...`, `grep -r .forja/`)
-  // can't disclose the real project's memory/config/traces. The active
-  // session's own `.forja-<profile>/` is NOT in this list and stays readable.
-  // Empty on the default namespace ⇒ no overlay (byte-identical argv).
-  // `shouldMask` applies the same EROFS gate as the home-relative loop above.
+  // operator's REAL `.forja/` when running under a profile — so a profiled
+  // session's sandboxed bash (`cat ../.forja/...`, `grep -r`) can't disclose
+  // the real project's memory/config/traces. Anchored at the PROJECT ROOT (not
+  // `cwd`): a bash args.cwd can be any subdir of the session tree, where the
+  // real `.forja/` is reachable as `../.forja/...`. The active session's own
+  // `.forja-<profile>/` is NOT in this list and stays readable. Empty on the
+  // default namespace ⇒ no overlay (byte-identical argv). `shouldMask` applies
+  // the same EROFS gate as the home-relative loop above.
+  const foreignRoot = options.projectRoot ?? cwd;
   for (const dir of foreignProjectDirNames()) {
-    const abs = joinPath(cwd, dir);
+    const abs = joinPath(foreignRoot, dir);
     if (shouldMask(abs)) flags.push('--tmpfs', abs);
   }
   // XDG_DATA_HOME unmask. When the operator sets $XDG_DATA_HOME outside
@@ -831,6 +841,10 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
 export interface MaybeWrapSandboxArgvOptions {
   profile?: string;
   cwd: string;
+  // Project/session root (resolveRepoRoot of the session cwd). Threaded to the
+  // platform runner to anchor the foreign `.forja/` read-floor at the repo root
+  // even when `cwd` is a subdir. Omitted ⇒ runner defaults to `cwd`.
+  projectRoot?: string;
   home?: string;
   innerArgv: readonly string[];
   // Env handed to the kernel-level allowlist (bwrap `--clearenv` +
@@ -1006,6 +1020,7 @@ export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): stri
         bwrapPath: r.path,
       };
       if (realpath !== undefined) bwrapOpts.realpath = realpath;
+      if (options.projectRoot !== undefined) bwrapOpts.projectRoot = options.projectRoot;
       if (options.pathExists !== undefined) bwrapOpts.pathExists = options.pathExists;
       if (options.passthroughEnv !== undefined) bwrapOpts.passthroughEnv = options.passthroughEnv;
       if (options.writableCacheDirs !== undefined)
@@ -1030,6 +1045,7 @@ export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): stri
         sandboxExecPath: r.path,
       };
       if (realpath !== undefined) macOpts.realpath = realpath;
+      if (options.projectRoot !== undefined) macOpts.projectRoot = options.projectRoot;
       // Forward tmpdir to restrict SBPL write allow to that subpath
       // on macOS. Linux ignores tmpdir entirely (--tmpfs /tmp
       // already gives isolation).

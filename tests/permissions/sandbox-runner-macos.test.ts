@@ -1005,4 +1005,24 @@ describe('buildSbplProfile — profile read floor (foreign .forja/ deny)', () =>
       if (prev !== undefined) process.env.FORJA_PROFILE = prev;
     }
   });
+
+  test('denies the foreign .forja at the PROJECT ROOT, not the subdir cwd', () => {
+    const prev = process.env.FORJA_PROFILE;
+    process.env.FORJA_PROFILE = 'dev';
+    try {
+      // tmpdir undefined, projectRoot = repo root; cwd is a subdir.
+      const profile = buildSbplProfile(
+        'cwd-rw',
+        '/work/proj/src/deep',
+        '/home/op',
+        undefined,
+        '/work/proj',
+      );
+      expect(profile).toContain('(deny file-read* (subpath "/work/proj/.forja"))');
+      expect(profile).not.toContain('(deny file-read* (subpath "/work/proj/src/deep/.forja"))');
+    } finally {
+      if (prev === undefined) delete process.env.FORJA_PROFILE;
+      else process.env.FORJA_PROFILE = prev;
+    }
+  });
 });

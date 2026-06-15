@@ -1461,6 +1461,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     cwd,
     sandboxTmpdirHandle.tmpdir,
     sandboxAvail.available,
+    projectConfigCwd,
   );
 
   const config: HarnessConfig = {
@@ -1698,6 +1699,10 @@ const constructBroker = (
   // when spawn was force-selected without a tool (`--broker spawn` on a host
   // with no bwrap) — it never had one, so keep the graceful degrade.
   sandboxAvailableAtBoot: boolean,
+  // Session/project root (resolveRepoRoot of the session cwd). Threaded to the
+  // sandbox runner so the foreign `.forja/` read-floor is anchored at the repo
+  // root even when a bash command's cwd is a subdirectory of the session tree.
+  projectRoot: string,
 ): Broker => {
   if (mode === 'spawn') {
     // Slice 103 (R6 #9): no `as SandboxProfile` cast. The TS
@@ -1729,6 +1734,7 @@ const constructBroker = (
       maybeWrapSandboxArgv({
         profile,
         cwd: callCwd,
+        projectRoot,
         innerArgv,
         ...(sandboxTmpdir !== undefined ? { tmpdir: sandboxTmpdir } : {}),
         // Also forward FORJA_PROFILE: bwrap `--clearenv` / sandbox-exec strip

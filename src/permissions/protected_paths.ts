@@ -36,6 +36,7 @@
 
 import { resolve } from 'node:path';
 import { appDirNames, foreignProjectDirNames, projectDirNames } from '../config/app-namespace.ts';
+import { resolveRepoRoot } from '../memory/paths.ts';
 import { createBoundedCache } from './bounded-cache.ts';
 
 export type ProtectedTier = 'deny' | 'escalate';
@@ -398,11 +399,22 @@ const getResolvedTargets = (home: string, cwd: string): ResolvedProtectedTargets
   const key = `${home}\0${cwd}`;
   let entry = targetCache.get(key);
   if (entry === undefined) {
+    // Anchor the foreign-`.forja` deny at the PROJECT ROOT, not the raw `cwd`.
+    // The engine's cwd is the launch cwd, which may be a SUBDIR of the repo
+    // (e.g. `forja` run from `repo/src/`), while the real `.forja/` lives at
+    // the repo root and resolves as `../.forja/...`. `resolveRepoRoot` runs
+    // ONLY when a profile is active (foreignDirs non-empty) and the result is
+    // cached on (home,cwd), so there's no git spawn on the default namespace;
+    // it falls back to `cwd` if git is unavailable. When cwd already IS the
+    // repo root (the common launch case) `resolveRepoRoot(cwd) === cwd`, so
+    // this is byte-identical there and only changes the subdir-launch case.
+    const foreignDirs = foreignProjectDirNames();
+    const foreignRoot = foreignDirs.length > 0 ? resolveRepoRoot(cwd) : cwd;
     entry = {
       tildeEscalateFiles: TILDE_ESCALATE_FILES.map((f) => resolveTildeFile(home, f)),
       tildeEscalateDirs: tildeEscalateDirs().map((d) => resolveTildeFile(home, d)),
       cwdEscalateDirs: cwdEscalateDirs().map((d) => resolveCwdDir(cwd, d)),
-      cwdForeignDenyDirs: foreignProjectDirNames().map((d) => resolveCwdDir(cwd, d)),
+      cwdForeignDenyDirs: foreignDirs.map((d) => resolveCwdDir(foreignRoot, d)),
     };
     targetCache.set(key, entry);
   }

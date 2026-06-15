@@ -2608,4 +2608,29 @@ describe('buildBwrapArgv — profile read floor (foreign .forja/ masking)', () =
       if (prev !== undefined) process.env.FORJA_PROFILE = prev;
     }
   });
+
+  test('masks the foreign .forja at the PROJECT ROOT, not the subdir cwd (bash args.cwd)', () => {
+    // A bash command runs from a subdir of the session tree; the real `.forja/`
+    // lives at the repo root (reachable as `../.forja/`). The overlay must land
+    // at <projectRoot>/.forja, NOT <subdir>/.forja.
+    const prev = process.env.FORJA_PROFILE;
+    process.env.FORJA_PROFILE = 'dev';
+    try {
+      const argv = buildBwrapArgv({
+        profile: 'cwd-rw',
+        cwd: '/work/proj/src/deep',
+        projectRoot: '/work/proj',
+        home: HOME,
+        innerArgv: INNER,
+        env: {},
+        realpath: (p) => p,
+        pathExists: () => true,
+      });
+      expect(argv).toContain('/work/proj/.forja'); // real state at the root — masked
+      expect(argv).not.toContain('/work/proj/src/deep/.forja'); // not the subdir
+    } finally {
+      if (prev === undefined) delete process.env.FORJA_PROFILE;
+      else process.env.FORJA_PROFILE = prev;
+    }
+  });
 });
