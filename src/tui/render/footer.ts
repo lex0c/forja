@@ -148,9 +148,14 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
   if (subagentCount > 0) {
     rightParts.push(paint(caps, 'success', `${subagentCount} subagents`));
   }
-  // Model is NOT shown here — it moved to the startup banner's identity line
-  // (render/permanent.ts) so the footer stays focused on live, changing signal
-  // (counts / tokens / cost) rather than a static chip.
+  // Loaded model id (e.g. `claude-opus-4-8`). Also on the startup banner's
+  // identity line (render/permanent.ts), but kept here too: the banner scrolls
+  // out of view, so the footer is the always-visible place to confirm which
+  // model is answering. Leads the static chips, after the live cluster;
+  // suppressed pre-boot (banner not yet landed → model null/empty).
+  if (status.model !== null && status.model !== '') {
+    rightParts.push(dim(caps, status.model));
+  }
   // Non-cache compute (input + output) and cache (read + creation) are
   // shown as two disjoint chips that sum back to the grand total. Cache
   // is provider-reported and billed, but far cheaper than input, so the

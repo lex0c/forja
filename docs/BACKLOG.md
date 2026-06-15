@@ -2,6 +2,18 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-15] TUI: restore the model id as a footer chip
+
+Commit 98e75572 moved the model from the footer to the startup banner's identity
+line. But the banner scrolls out of view, so during a long session there was no
+always-visible place to confirm which model is answering — and UI.md §4.10.6 still
+documents `<model>` as a footer chip leading the static cluster. Restored the chip
+(`status.model`, after the live cluster, before tokens, suppressed pre-boot) without
+reverting the commit: the banner keeps its `<model> · effort <level>` identity line.
+The model now shows in both places by design — the footer for the always-visible
+glance, the banner for the boot-time confirmation. Footer tests reinstated to assert
+presence + ordering (model before tokens, after the bg/reminders/subagents chips).
+
 ## [2026-06-15] TUI: drop the dead-key `(ctrl+o to expand)` from the truncation hint
 
 The `… output truncated` card line advertised `(ctrl+o to expand)`, but `ctrl+o`
