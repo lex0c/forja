@@ -2,6 +2,18 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-14] Gate OpenAI replaysReasoning to Responses-path models
+
+The OpenAI provider set `replaysReasoning = reasoningReplay` unconditionally, but
+replay only happens on the Responses path (generateViaResponses) — the Chat
+Completions path drops reasoning blocks in toOpenAIMessages. So with the flag on,
+a non-Responses model (gpt-4o) advertised replaysReasoning=true while sending no
+reasoning; the token estimator then counted those payloads (via the replaysReasoning
+→ countReasoning wire), over-sizing the prompt and tripping premature compaction —
+e.g. a session resumed from a reasoning model into gpt-4o, whose history carries
+opaque reasoning items the chat path silently drops. Fixed: `replaysReasoning =
+useResponses && reasoningReplay`. Test: gpt-5.4-mini true, gpt-4o false (flag on).
+
 ## [2026-06-14] Preserve interleaved reasoning↔tool_use order for replay
 
 `collectStep` bucketed reasoning and tool_uses into separate arrays, so

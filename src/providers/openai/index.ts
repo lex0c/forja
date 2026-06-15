@@ -416,11 +416,19 @@ export const createOpenAIProvider = (
   const responsesCacheKey = (req: GenerateRequest | ConstrainedRequest): string | undefined =>
     options.baseURL === undefined ? openaiPromptCacheKey(req) : undefined;
 
+  // Replay only actually happens on the Responses path (generateViaResponses
+  // honors reasoningReplay). The Chat Completions path drops reasoning blocks in
+  // toOpenAIMessages, so a non-Responses model (gpt-4o) must NOT advertise
+  // replaysReasoning even with the flag on — otherwise the token estimator counts
+  // reasoning payloads it never sends (e.g. a session resumed from a reasoning
+  // model into gpt-4o) and compacts prematurely.
+  const replaysReasoning = useResponses && reasoningReplay;
+
   return {
     id: `openai/${modelName}`,
     family: 'openai',
     capabilities: caps,
-    replaysReasoning: reasoningReplay,
+    replaysReasoning,
     generate: useResponses
       ? (req: GenerateRequest) =>
           generateViaResponses(

@@ -420,6 +420,19 @@ describe('createOpenAIProvider — Responses routing for reasoning models', () =
       }
     };
 
+    test('replaysReasoning: true only for Responses models; false for Chat Completions (gpt-4o)', async () => {
+      await withReplay(true, async () => {
+        // gpt-5.4-mini routes through Responses → actually replays.
+        expect(createOpenAIProvider('gpt-5.4-mini', { apiKey: 'sk-test' }).replaysReasoning).toBe(
+          true,
+        );
+        // gpt-4o is Chat Completions → drops reasoning at send, so it must NOT
+        // advertise replay (else the token estimator over-counts on a resumed
+        // session and compacts prematurely).
+        expect(createOpenAIProvider('gpt-4o', { apiKey: 'sk-test' }).replaysReasoning).toBe(false);
+      });
+    });
+
     test('off (default): reasoning items are not replayed and `include` is absent', async () => {
       await withReplay(false, async () => {
         const handle = mockResponsesClient([
