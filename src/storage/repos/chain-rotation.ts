@@ -33,7 +33,7 @@ export interface ChainMetaRow {
   pre_rotation_tip_hash: string;
   pre_rotation_seq_max: number;
   // 1 = quarantined (rotation event unread by operator);
-  // 0 = inspected. Surfaced by `agent permission verify` until the
+  // 0 = inspected. Surfaced by `forja permission verify` until the
   // operator explicitly clears it. Spec §7.2 documents this as
   // "quarantine flag em queries até inspeção".
   quarantined: 0 | 1;
@@ -200,7 +200,7 @@ export const getLatestChainMeta = (db: DB, installId: string): ChainMetaRow | nu
 };
 
 // Full rotation history (oldest → newest). Used by future tooling
-// (`agent permission history`) and by tests that assert re-rotation
+// (`forja permission history`) and by tests that assert re-rotation
 // behavior. Cheap because rotations are rare (operator action only).
 export const listChainMetaByInstall = (db: DB, installId: string): ChainMetaRow[] => {
   const rows = db.query(LIST_META_SQL).all(installId) as ChainMetaRow[];

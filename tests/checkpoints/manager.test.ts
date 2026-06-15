@@ -172,7 +172,7 @@ describe('CheckpointManager — available mode', () => {
   });
 
   test('purge by age does NOT touch rows from sessions in other cwds', async () => {
-    // Lazy retention runs at session_start of every agent run, with
+    // Lazy retention runs at session_start of every forja run, with
     // manager bound to the current cwd. The age-based row sweep must
     // be cwd-scoped — otherwise running the agent in /repo/A would
     // periodically wipe /repo/B's audit history once those rows

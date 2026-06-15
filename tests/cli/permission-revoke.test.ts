@@ -13,7 +13,7 @@ const captured = () => {
   return { write: (s: string) => lines.push(s), lines };
 };
 
-describe('parseArgs — agent permission revoke', () => {
+describe('parseArgs — forja permission revoke', () => {
   test('revoke verb requires a single positional', () => {
     const r = parseArgs(['permission', 'revoke']);
     expect(r.ok).toBe(false);

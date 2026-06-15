@@ -17,9 +17,9 @@ export type MemorySource = 'user_explicit' | 'seed' | 'inferred' | 'imported';
 
 // Origin of a seed memory per spec §5.7.2. `vendor` shipped with
 // the binary (trusted by construction); `team` came from an
-// opt-in team-seeds repository (`agent init --team-seeds=<repo>`,
+// opt-in team-seeds repository (`forja init --team-seeds=<repo>`,
 // triggers the trust prompt on first load — §5.7.9); `install`
-// was opted into interactively during `agent init`.
+// was opted into interactively during `forja init`.
 export type SeedOrigin = 'vendor' | 'team' | 'install';
 
 // Trust marker on a memory file. Default `trusted` when the

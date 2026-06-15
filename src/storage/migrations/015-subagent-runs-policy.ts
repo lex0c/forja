@@ -4,7 +4,7 @@ export const migration015SubagentRunsPolicy = {
   // Policy drift defense.
   //
   // The subprocess flow had the child re-resolve
-  // `.agent/permissions.yaml` (+ enterprise + user layers) at
+  // `.forja/permissions.yaml` (+ enterprise + user layers) at
   // its own startup. If a human edited any of those files
   // between parent spawn and child startup (race window: ~ms
   // to seconds), the child ran under different policy than the

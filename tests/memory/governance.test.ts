@@ -917,7 +917,7 @@ describe('applyProposal — transition result mapping (uncovered branches)', () 
       blockedBy: {
         spec: {
           layer: 'enterprise',
-          sourcePath: '/etc/agent/hooks.toml',
+          sourcePath: '/etc/forja/hooks.toml',
           event: 'Eviction',
           matcher: {},
           entryIndex: 0,

@@ -1,6 +1,6 @@
-// `agent permission seal-verify` — runs `verifySealAgainstChain`
+// `forja permission seal-verify` — runs `verifySealAgainstChain`
 // for the active install_id's seal file, reports integrity.
-// Complement to `agent permission verify` (audit chain integrity):
+// Complement to `forja permission verify` (audit chain integrity):
 // chain-verify checks the SQLite chain itself; seal-verify checks
 // that the EXTERNAL seal file matches the chain at every recorded
 // point. A divergence indicates either chain tampering OR seal-
@@ -173,14 +173,14 @@ export const runPermissionSealVerify = async (
     // full chain integrity.
     if (result.entriesChecked > 0) {
       out('  note: this confirms the seal matches the stored chain hashes only.\n');
-      out('  for full integrity, also run `agent permission verify` (recomputes\n');
+      out('  for full integrity, also run `forja permission verify` (recomputes\n');
       out('  each row hash from its payload — catches a tampered row whose\n');
       out('  stored hash was left stale).\n');
     }
     if (result.entriesChecked === 0) {
       out('  note: no seal entries yet — the file is empty\n');
       out('  the engine seals automatically per interval_decisions / interval_seconds,\n');
-      out('  or run `agent permission seal-now` to force one\n');
+      out('  or run `forja permission seal-now` to force one\n');
     }
     return 0;
   }
@@ -200,6 +200,6 @@ export const runPermissionSealVerify = async (
   out('  - Either the DB was tampered with (chain hash changed) or the seal file\n');
   out('    was edited (`chattr -a` first, then write). lsattr the seal file to\n');
   out('    confirm the +a bit is still set.\n');
-  out('  - Run `agent permission verify` to check the chain integrity in isolation.\n');
+  out('  - Run `forja permission verify` to check the chain integrity in isolation.\n');
   return 1;
 };

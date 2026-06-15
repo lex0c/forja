@@ -5,7 +5,7 @@ prompt: |
   extension, do NOT switch tools.
 setup:
   files:
-    .agent/permissions.yaml: |
+    .forja/permissions.yaml: |
       defaults:
         mode: strict
       tools:

@@ -306,7 +306,7 @@ describe('run end-to-end with mock provider', () => {
     // their tweak take effect. Run-level wiring must echo each
     // shadow on stderr (gated on non-JSON for stdout purity).
     const userAgents = join(workdir, 'user-agents');
-    const projectAgents = join(workdir, 'project', '.agent', 'agents');
+    const projectAgents = join(workdir, 'project', '.forja', 'playbooks');
     mkdirSync(userAgents, { recursive: true });
     mkdirSync(projectAgents, { recursive: true });
     const def = (name: string, desc: string) =>
@@ -340,7 +340,7 @@ describe('run end-to-end with mock provider', () => {
     // human admin lines off stderr too in JSON mode so any pipeline
     // that captures both streams stays parseable.
     const userAgents = join(workdir, 'user-agents');
-    const projectAgents = join(workdir, 'project', '.agent', 'agents');
+    const projectAgents = join(workdir, 'project', '.forja', 'playbooks');
     mkdirSync(userAgents, { recursive: true });
     mkdirSync(projectAgents, { recursive: true });
     const def = (name: string) =>
@@ -414,9 +414,9 @@ describe('run end-to-end with mock provider', () => {
     // sees their config dropped silently otherwise.
     const fs = await import('node:fs');
     const path = await import('node:path');
-    fs.mkdirSync(path.join(workdir, '.agent'), { recursive: true });
+    fs.mkdirSync(path.join(workdir, '.forja'), { recursive: true });
     fs.writeFileSync(
-      path.join(workdir, '.agent/hooks.toml'),
+      path.join(workdir, '.forja/hooks.toml'),
       [
         '[[hooks]]',
         'event = "Stop"',
@@ -451,9 +451,9 @@ describe('run end-to-end with mock provider', () => {
   test('hook warnings suppressed in JSON mode (NDJSON contract)', async () => {
     const fs = await import('node:fs');
     const path = await import('node:path');
-    fs.mkdirSync(path.join(workdir, '.agent'), { recursive: true });
+    fs.mkdirSync(path.join(workdir, '.forja'), { recursive: true });
     fs.writeFileSync(
-      path.join(workdir, '.agent/hooks.toml'),
+      path.join(workdir, '.forja/hooks.toml'),
       ['[[hooks]]', 'event = "BadEvent"', 'command = "true"', ''].join('\n'),
     );
 
@@ -486,9 +486,9 @@ describe('run end-to-end with mock provider', () => {
     const path = await import('node:path');
     const entFile = path.join(workdir, 'ent.yaml');
     fs.writeFileSync(entFile, 'tools:\n  bash:\n    deny:\n      - "rm *"\n    locked: true\n');
-    fs.mkdirSync(path.join(workdir, '.agent'), { recursive: true });
+    fs.mkdirSync(path.join(workdir, '.forja'), { recursive: true });
     fs.writeFileSync(
-      path.join(workdir, '.agent/permissions.yaml'),
+      path.join(workdir, '.forja/permissions.yaml'),
       'tools:\n  bash:\n    allow:\n      - "ls *"\n',
     );
 

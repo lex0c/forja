@@ -1061,7 +1061,7 @@ describe('buildBwrapArgv — hide_paths existence gate (EROFS regression)', () =
     // home-rw binds $HOME read-WRITE, so bwrap CAN create the
     // mountpoint for an absent target — AND the create-and-plant
     // write-tampering vector (~/.gitconfig core.sshCommand RCE,
-    // ~/.config/agent/permissions.yaml policy tamper) is live. Mask
+    // ~/.config/forja/permissions.yaml policy tamper) is live. Mask
     // regardless of host existence.
     const argv = buildBwrapArgv({
       profile: 'home-rw',
@@ -1075,7 +1075,7 @@ describe('buildBwrapArgv — hide_paths existence gate (EROFS regression)', () =
     });
     const argvStr = argv.join(' ');
     expect(argvStr).toContain('--tmpfs /home/op/.ssh');
-    expect(argvStr).toContain('--tmpfs /home/op/.config/agent');
+    expect(argvStr).toContain('--tmpfs /home/op/.config/forja');
     expect(argvStr).toContain(`--ro-bind ${MASK} /home/op/.gitconfig`);
   });
 
@@ -1436,14 +1436,13 @@ describe('buildBwrapArgv — XDG_CONFIG_HOME unmask defense (slice 146)', () => 
     expect(argvStr).toContain('--tmpfs /home/op/.config/azure');
     expect(argvStr).toContain('--tmpfs /home/op/.config/op');
     expect(argvStr).toContain('--tmpfs /home/op/.config/sops');
-    expect(argvStr).toContain('--tmpfs /home/op/.config/agent');
+    expect(argvStr).toContain('--tmpfs /home/op/.config/forja');
     expect(argvStr).toContain('--tmpfs /home/op/.config/forja');
     // Plus the XDG-relocated overlays, one per .config/* entry.
     expect(argvStr).toContain('--tmpfs /srv/conf/gcloud');
     expect(argvStr).toContain('--tmpfs /srv/conf/azure');
     expect(argvStr).toContain('--tmpfs /srv/conf/op');
     expect(argvStr).toContain('--tmpfs /srv/conf/sops');
-    expect(argvStr).toContain('--tmpfs /srv/conf/agent');
     expect(argvStr).toContain('--tmpfs /srv/conf/forja');
     // FILES under .config/* (NuGet/Composer auth) must ALSO be masked at the
     // relocated path, not only home-relative (#2 review fix). Without it, a

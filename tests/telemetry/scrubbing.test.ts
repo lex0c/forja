@@ -205,10 +205,10 @@ describe('scrubEvent — state.transition', () => {
       ts: 100,
       from: 'ready',
       to: 'degraded',
-      reason: 'failed at /etc/agent/policy.yaml',
+      reason: 'failed at /etc/forja/policy.yaml',
     };
     const out = scrubEvent(event, { redactPaths: false }) as StateTransitionEvent;
-    expect(out.reason).toBe('failed at /etc/agent/policy.yaml');
+    expect(out.reason).toBe('failed at /etc/forja/policy.yaml');
   });
 });
 

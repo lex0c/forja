@@ -1135,7 +1135,7 @@ const projectRecapMiniCached = (ctx: SlashContext, session: Session): RecapMini 
   return fresh;
 };
 
-// `agent --list-sessions` shape: `YYYY-MM-DD HH:MM:SSZ`. ISO 8601
+// `forja --list-sessions` shape: `YYYY-MM-DD HH:MM:SSZ`. ISO 8601
 // with explicit Z so operators in non-UTC zones don't misread the
 // listing as local time.
 const formatListTime = (ms: number): string => {
@@ -1182,7 +1182,7 @@ const renderListTable = (rows: readonly RecapMini[]): string => {
 };
 
 const renderListJson = (rows: readonly RecapMini[]): string => {
-  // NDJSON: one row per line, matching `agent --list-sessions
+  // NDJSON: one row per line, matching `forja --list-sessions
   // --json` convention. Headless consumers can stream-parse.
   if (rows.length === 0) return '';
   return `${rows.map((r) => JSON.stringify(redactMiniForOutput(r))).join('\n')}\n`;
@@ -1277,7 +1277,7 @@ export const runRecapList = async (
   // on the NDJSON channel breaks stream parsers (the operator
   // explicitly asked for machine-readable output, so silence on
   // empty is the correct contract; exit code 0 still signals
-  // "query ran successfully"). `agent recap list --json` was
+  // "query ran successfully"). `forja recap list --json` was
   // forwarding the diagnostic to stdout verbatim, polluting the
   // NDJSON envelope with an unparseable first line.
   if (resultRows.length === 0 && filters.json) {

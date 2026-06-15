@@ -68,7 +68,7 @@
 // (AUDIT.md §1.2) but `checkpoint_reverted` deserves longer
 // retention (strong calibration signal) so the sink overrides
 // per kind. GC sweep (deferred slice) reads this column when
-// `agent gc` materializes.
+// `forja gc` materializes.
 //
 // Indices: lookup by approval_seq (the primary aggregator query
 // path), lookup by install_id (post-rotation aggregation), and

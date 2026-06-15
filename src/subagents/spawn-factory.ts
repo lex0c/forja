@@ -104,7 +104,7 @@ export interface SpawnChildProcessOptions {
   sharedScopeOffline?: boolean;
   // Per-subagent background-process log directory. Threaded
   // across via `--subagent-bg-log-dir`. Format:
-  // `<parentCwd>/.agent/bg/<childSessionId>/`. Each subagent
+  // `<parentCwd>/.forja/bg/<childSessionId>/`. Each subagent
   // gets its own directory so that:
   //   - parent's `bg list` doesn't see (and doesn't accidentally
   //     manage) the child's bg processes
@@ -352,7 +352,7 @@ export const defaultSpawnChildProcess: SpawnChildProcess = (opts) => {
   // child binary on an older release that doesn't recognize
   // `--ipc` would surface "unknown flag" — caller catches it as
   // `subprocess_spawn_failed` upstream, which is the correct
-  // outcome (operator runs `agent --version` and learns the
+  // outcome (operator runs `forja --version` and learns the
   // mismatch).
   if (opts.ipc === true) {
     appendArgs.push(`--ipc=${IPC_PROTOCOL_VERSION}`);

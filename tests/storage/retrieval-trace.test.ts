@@ -265,7 +265,7 @@ describe('createRetrievalTrace', () => {
     // eval replay couldn't re-rank against truth. Spec stores raw
     // here; the prompt-boundary scrub layer handles credentials at
     // I/O time.
-    const rawContent = '# notes\n\nsee /home/operator/.config/agent/memory/user_role.md';
+    const rawContent = '# notes\n\nsee /home/operator/.config/forja/memory/user_role.md';
     const trace = createRetrievalTrace(db, {
       sessionId,
       queryText: 'q',

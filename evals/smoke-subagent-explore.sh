@@ -8,7 +8,7 @@
 # run.
 #
 # Mocks lie: they don't exercise definition discovery from the
-# project .agent/agents/ directory, the bootstrap wiring of
+# project .forja/playbooks/ directory, the bootstrap wiring of
 # subagentRegistry into the harness, the JSON shape the child emits
 # as a tool result back to the parent, OR the IPC wire's behavior
 # under real provider streaming + real tool calls + real subprocess
@@ -17,7 +17,7 @@
 #
 # Flow:
 #   1. mktemp workspace + isolated XDG.
-#   2. Drop a project-scoped explore.md under .agent/agents/.
+#   2. Drop a project-scoped explore.md under .forja/playbooks/.
 #   3. Drop bypass-mode permissions so the parent's tools aren't denied.
 #   4. Run the agent in --json mode (which sets onEvent in the
 #      harness, which auto-implies ipc:true on every spawned
@@ -80,10 +80,10 @@ echo "package beta"  > beta.txt
 echo "package gamma" > gamma.txt
 
 # Project-scoped subagent definition. The spec puts user scope at
-# ~/.config/agent/agents and project at <cwd>/.agent/agents. We use
+# ~/.config/forja/playbooks and project at <cwd>/.forja/playbooks. We use
 # project here so the smoke doesn't depend on $HOME state.
-mkdir -p .agent/agents
-cat > .agent/agents/explore.md <<'MD'
+mkdir -p .forja/playbooks
+cat > .forja/playbooks/explore.md <<'MD'
 ---
 name: explore
 description: Read-only file discovery in the working tree.
@@ -101,7 +101,7 @@ MD
 # Drop bypass-mode policy so write_file isn't policy-denied if the
 # parent decides to use it (it shouldn't for this smoke; bypass is
 # defense in depth so the child whitelist is the real test).
-cat > .agent/permissions.yaml <<'YAML'
+cat > .forja/permissions.yaml <<'YAML'
 defaults:
   mode: bypass
 YAML
@@ -226,7 +226,7 @@ hash_file() {
   fi
 }
 SNAPSHOT_SHA=$(sqlite3 "$DB" "SELECT source_sha256 FROM subagent_runs WHERE session_id = '$CHILD_ID'")
-EXPECTED_SHA=$(hash_file ".agent/agents/explore.md")
+EXPECTED_SHA=$(hash_file ".forja/playbooks/explore.md")
 if [[ "$SNAPSHOT_SHA" != "$EXPECTED_SHA" ]]; then
   echo "FAIL: snapshot source_sha256 mismatch." >&2
   echo "  expected: $EXPECTED_SHA" >&2

@@ -208,7 +208,7 @@ describe('parsePolicy — protected paths (§11)', () => {
   });
 
   test('cwd-tier roots are SKIPPED without context (cwd-dependent — caller-side compat)', () => {
-    // CWD-relative `.git`/`.agent`/`.claude` need `cwd` to resolve.
+    // CWD-relative `.git`/`.forja`/`.claude` need `cwd` to resolve.
     // Without it, an allow_paths pattern referencing an absolute
     // path that HAPPENS to look like `<some-cwd>/.git/...` can't be
     // distinguished from a regular allow — only checked when cwd
@@ -238,13 +238,13 @@ describe('parsePolicy — protected paths (§11)', () => {
     ).toThrow(/redefines a protected path/);
   });
 
-  test('cwd-rooted protected dirs (.git, .agent, .claude) flagged', () => {
+  test('cwd-rooted protected dirs (.git, .forja, .claude) flagged', () => {
     expect(() =>
       parsePolicy({ tools: { write_file: { allow_paths: ['/work/proj/.git/**'] } } }, ctx),
     ).toThrow(/redefines a protected path/);
     expect(() =>
       parsePolicy(
-        { tools: { write_file: { allow_paths: ['/work/proj/.agent/sessions.db'] } } },
+        { tools: { write_file: { allow_paths: ['/work/proj/.forja/sessions.db'] } } },
         ctx,
       ),
     ).toThrow(/redefines a protected path/);

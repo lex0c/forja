@@ -1,10 +1,10 @@
-// `agent init` handler. Spec: AGENTIC_CLI.md §2.1 (init mode) +
+// `forja init` handler. Spec: AGENTIC_CLI.md §2.1 (init mode) +
 // §2.1.1 (config.toml schema) + §8 (permission engine bootstrap
 // path) + MEMORY.md §2.5 (gitignore ownership) + PLAYBOOKS.md §12
 // (canonical playbooks distribution) + SKILLS.md §6 (seed skill
 // catalog distribution).
 //
-// Scaffolds the five bootstrap artifacts under .agent/:
+// Scaffolds the five bootstrap artifacts under .forja/:
 //
 //   1. permissions.yaml   — strict default-deny baseline (mode tunable)
 //   2. .gitignore         — runtime data exclusion (operator-owned post-creation)
@@ -51,7 +51,7 @@ import { type InitMode, renderInitTemplate } from './init-template.ts';
 // the order they run when no `--only` is passed: permissions first
 // (load-bearing — without it everything denies), gitignore next
 // (so subsequent writes don't pollute the operator's git status),
-// config third (depends only on .agent/ existing), then the
+// config third (depends only on .forja/ existing), then the
 // playbooks + skills catalogs (largest payloads, longest to walk),
 // finally `seeds` which lands in the operator's USER scope
 // (`<user>/seeds/` per MEMORY.md §5.7.4) — last so the install
@@ -122,7 +122,7 @@ interface StepResult {
   // (which lumps `unchanged` and `userKept` together, both
   // technical-pipeline outcomes) because `disabled` is operator-
   // intent and warrants its own summary suffix so an operator running
-  // `agent init` sees "5 disabled" instead of "5 skipped" hiding the
+  // `forja init` sees "5 disabled" instead of "5 skipped" hiding the
   // opt-out behind the same number that would mean "no work to do".
   disabled?: number;
 }
@@ -139,7 +139,7 @@ interface StepResult {
 // Permission-bit preservation: if `target` already exists, we
 // capture its mode via `statSync` BEFORE writing and `chmodSync`
 // the temp to match BEFORE the rename. Operators who
-// `chmod 600 .agent/config.toml` for a security-tightened repo
+// `chmod 600 .forja/config.toml` for a security-tightened repo
 // keep that mode after `init --force=config`. Without this,
 // rename adopts the temp's default mode (typically 0644 modulated
 // by umask) and silently relaxes the restriction.
@@ -161,9 +161,9 @@ interface StepResult {
 //
 // Symlink note: if `target` is a symlink, `renameSync` replaces the
 // SYMLINK with the regular file. The link breaks. Operator who
-// linked `.agent/permissions.yaml → ~/shared-policy.yaml` and
+// linked `.forja/permissions.yaml → ~/shared-policy.yaml` and
 // runs `init --force=permissions` ends up with a regular file at
-// the .agent path, no longer following the shared policy.
+// the .forja path, no longer following the shared policy.
 //
 // Mirrors the temp+rename idiom from `cli/slash/commands/memory.ts`
 // (`mutateMemoryConfig`) and `memory/writer.ts`. TODO: extract to
@@ -252,14 +252,14 @@ const scaffoldGitignore = (options: InitOptions): StepResult | null => {
     return { wrote: 0, skipped: 1, overwritten: 0 };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    err(`forja: failed to write .agent/.gitignore: ${msg}\n`);
+    err(`forja: failed to write .forja/.gitignore: ${msg}\n`);
     return null;
   }
 };
 
 const scaffoldConfig = (options: InitOptions, force: boolean): StepResult | null => {
   const { cwd, out, err } = options;
-  const target = join(cwd, '.agent', 'config.toml');
+  const target = join(cwd, '.forja', 'config.toml');
   const exists = existsSync(target);
   if (exists && !force) {
     out(`forja: skip ${target} (already exists; use --force or --force=config to overwrite)\n`);
@@ -351,7 +351,7 @@ const scaffoldPlaybooks = (options: InitOptions, force: boolean): StepResult | n
     forceLabel: 'playbooks',
   });
 
-// Skills land in the project_shared scope (`.agent/skills/shared/`);
+// Skills land in the project_shared scope (`.forja/skills/shared/`);
 // the catalog scan picks them up at the next REPL boot.
 const scaffoldSkills = (options: InitOptions, force: boolean): StepResult | null =>
   scaffoldAssetDir(options, force, {
@@ -361,12 +361,12 @@ const scaffoldSkills = (options: InitOptions, force: boolean): StepResult | null
   });
 
 // Vendor seed catalog (spec MEMORY.md §5.7.4 + §5.7.8). Unlike
-// playbooks / skills (which land at `<cwd>/.agent/...` per-project),
+// playbooks / skills (which land at `<cwd>/.forja/...` per-project),
 // seeds install into the user-global scope at `<user>/seeds/` —
 // they are agent meta-behavior, not project content. Wiring through
 // `installVendorSeeds` reuses the slice-4 upgrade state machine
 // (fresh / unchanged / vendor_updated / user_kept / archived) so
-// running `agent init seeds` on a host that already has the catalog
+// running `forja init seeds` on a host that already has the catalog
 // silently no-ops the bodies the operator hasn't touched and
 // preserves the ones they have.
 //
@@ -390,11 +390,11 @@ const scaffoldSeeds = (options: InitOptions): StepResult | null => {
     err(`forja: failed to install vendor seeds: ${msg}\n`);
     // Seeds is the last DEFAULT_STEPS step (init.ts:63-70), so a
     // failure here means the five project-scope steps ALREADY wrote
-    // files under <cwd>/.agent/. Operator can fix the user-scope
+    // files under <cwd>/.forja/. Operator can fix the user-scope
     // issue (permissions, disk space, XDG path) and resume without
-    // re-doing the project work via `agent init --only=seeds`.
+    // re-doing the project work via `forja init --only=seeds`.
     err(
-      'forja: project artifacts already scaffolded; re-run with `agent init --only=seeds` after fixing the user-scope issue\n',
+      'forja: project artifacts already scaffolded; re-run with `forja init --only=seeds` after fixing the user-scope issue\n',
     );
     return null;
   }
@@ -411,7 +411,7 @@ const scaffoldSeeds = (options: InitOptions): StepResult | null => {
     // modal. Pointing operators at a command that doesn't exist
     // would silently fail at the REPL.
     out(
-      `forja: skip ${memoryRoots.user}/seeds/${filename} (operator-edited; delete the body and re-run \`agent init --only=seeds\` to restore vendor content)\n`,
+      `forja: skip ${memoryRoots.user}/seeds/${filename} (operator-edited; delete the body and re-run \`forja init --only=seeds\` to restore vendor content)\n`,
     );
   }
   for (const filename of result.archived) {
@@ -488,7 +488,7 @@ export const runInit = (options: InitOptions): number => {
     `forja: ${totals.wrote} wrote, ${totals.overwritten} overwritten, ${totals.skipped} skipped${archivedSuffix}${disabledSuffix} (${steps.length} ${stepWord})\n`,
   );
   if (totals.wrote + totals.overwritten > 0) {
-    options.out("forja: review .agent/ and run 'agent' to start.\n");
+    options.out("forja: review .forja/ and run 'forja' to start.\n");
   }
   return 0;
 };

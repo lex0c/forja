@@ -785,7 +785,7 @@ export const restore = async (cwd: string, commitSha: string): Promise<RestoreRe
   // above, the index matches the checkpoint's tree, NOT HEAD — so the
   // user's `git status` would show every file that differs between HEAD
   // and the checkpoint as "staged for commit". For users who hadn't
-  // committed during the agent run, HEAD already matches the checkpoint
+  // committed during the forja run, HEAD already matches the checkpoint
   // and this is a no-op; for users who had, this collapses the surprise
   // "you have N staged files" message into the natural "you have N
   // unstaged changes vs HEAD" view. Skipped on unborn HEAD where

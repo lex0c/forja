@@ -4,10 +4,10 @@ prompt: |
   whatever the tool returns, including any error message text.
 setup:
   files:
-    .agent/permissions.yaml: |
+    .forja/permissions.yaml: |
       defaults:
         mode: bypass
-    .agent/hooks.toml: |
+    .forja/hooks.toml: |
       [[hooks]]
       event = "PreToolUse"
       command = "echo blocked-by-policy-X; exit 2"

@@ -101,7 +101,7 @@ export const taskListTool: Tool<TaskListInput, TaskListOutput> = {
         'subagent.unavailable',
         'subagents are not available in this run (no registry wired)',
         {
-          hint: 'task_list needs the same harness wiring as task_async / task_await. Define agents under ~/.config/agent/agents/ or <cwd>/.agent/agents/ and bootstrap will pick them up.',
+          hint: 'task_list needs the same harness wiring as task_async / task_await. Define agents under ~/.config/forja/playbooks/ or <cwd>/.forja/playbooks/ and bootstrap will pick them up.',
         },
       );
     }

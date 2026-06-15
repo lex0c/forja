@@ -443,7 +443,7 @@ describe('repl — boot + smoke', () => {
 
   test('forwards --autonomous to bootstrap as autonomous posture (matches run.ts)', async () => {
     // Regression: run.ts forwarded `--autonomous` into BootstrapInput
-    // (approvalPosture); the REPL dropped it, so `agent --autonomous`
+    // (approvalPosture); the REPL dropped it, so `forja --autonomous`
     // entering the REPL silently booted supervised — the flag has no
     // config fallback. runRepl now forwards it.
     let captured: BootstrapInput | undefined;
@@ -2877,7 +2877,7 @@ describe('repl — boot + smoke', () => {
 
 describe('repl — trust prompt (AGENTIC_CLI §9.1)', () => {
   // Each test points the trust file at a fresh temp path so the
-  // dev machine's real `~/.config/agent/trusted_dirs.json` isn't
+  // dev machine's real `~/.config/forja/trusted_dirs.json` isn't
   // mutated and tests don't share state across runs.
   let trustDir: string;
   let trustPath: string;
@@ -5565,7 +5565,7 @@ describe('REPL — subagent shadow render uses actual scopes (post-review)', () 
     const userDef = {
       ...builtinDef,
       scope: 'user',
-      sourcePath: '/home/op/.config/agent/agents/verify-semantic.md',
+      sourcePath: '/home/op/.config/forja/playbooks/verify-semantic.md',
     };
     (stub.subagents as { shadows: unknown[] }).shadows = [
       { name: 'verify-semantic', shadowed: builtinDef, winning: userDef },
@@ -5603,7 +5603,7 @@ describe('REPL — subagent shadow render uses actual scopes (post-review)', () 
     const userDef = {
       name: 'helper',
       scope: 'user',
-      sourcePath: '/home/op/.config/agent/agents/helper.md',
+      sourcePath: '/home/op/.config/forja/playbooks/helper.md',
       description: '',
       tools: [],
       budget: { maxSteps: 1, maxCostUsd: 0.01 },
@@ -5614,7 +5614,7 @@ describe('REPL — subagent shadow render uses actual scopes (post-review)', () 
     const projectDef = {
       ...userDef,
       scope: 'project',
-      sourcePath: '/repo/.agent/agents/helper.md',
+      sourcePath: '/repo/.forja/playbooks/helper.md',
     };
     (stub.subagents as { shadows: unknown[] }).shadows = [
       { name: 'helper', shadowed: userDef, winning: projectDef },
@@ -5636,8 +5636,8 @@ describe('REPL — subagent shadow render uses actual scopes (post-review)', () 
     await tick();
     stdin.feed('\x04');
     await promise;
-    expect(stderr).toContain('/home/op/.config/agent/agents/helper.md (user)');
-    expect(stderr).toContain('/repo/.agent/agents/helper.md (project)');
+    expect(stderr).toContain('/home/op/.config/forja/playbooks/helper.md (user)');
+    expect(stderr).toContain('/repo/.forja/playbooks/helper.md (project)');
     expect(stderr).not.toContain('(builtin)');
   });
 });

@@ -4,13 +4,13 @@ prompt: |
   reply with each skill's name.
 setup:
   files:
-    '.agent/skills/shared/file-summary.md': |
+    '.forja/skills/shared/file-summary.md': |
       ---
       name: file-summary
       description: Summarize a source file in the team's required two-part format.
       ---
       Read the file, then reply with a PURPOSE: line and a LINECOUNT: line.
-    '.agent/skills/shared/changelog-entry.md': |
+    '.forja/skills/shared/changelog-entry.md': |
       ---
       name: changelog-entry
       description: Draft a changelog entry from a diff in the Keep a Changelog style.

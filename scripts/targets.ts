@@ -12,7 +12,7 @@
 
 export interface BuildTarget {
   // Canonical id used in asset filenames and as the suffix of
-  // `dist/agent-<id>`. Stable; do not rename without bumping the
+  // `dist/forja-<id>`. Stable; do not rename without bumping the
   // install script's lookup table.
   readonly id: string;
   // Bun --compile target. Bun's matrix is more granular than
@@ -83,4 +83,4 @@ export const SIZE_BLOCK_RATIO = 1.2;
 
 export const findTarget = (id: string): BuildTarget | undefined => TARGETS.find((t) => t.id === id);
 
-export const assetName = (t: BuildTarget): string => `agent-${t.id}${t.ext}`;
+export const assetName = (t: BuildTarget): string => `forja-${t.id}${t.ext}`;

@@ -112,7 +112,7 @@ describe('runRecapHeadless — plain text mode', () => {
     // Regression: the headless surface used to drop the
     // bootstrap-resolved recapEnabled, so `[recap].enabled=false` /
     // `--no-recap` did not force the deterministic path for
-    // `agent recap` — it still spent on the LLM render. A
+    // `forja recap` — it still spent on the LLM render. A
     // constrained-capable provider here would be used if the switch
     // leaked; assert it is never called.
     const { id } = seedSession();

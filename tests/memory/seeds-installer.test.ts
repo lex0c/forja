@@ -402,7 +402,7 @@ describe('installVendorSeeds — manifest persistence', () => {
 
   test('manifest with an invalid-name key (e.g., `../old`) self-heals — install does not throw', () => {
     // Reported bug: a hand-edited or corrupt manifest key that
-    // fails `validateName` would crash `agent init --only=seeds`
+    // fails `validateName` would crash `forja init --only=seeds`
     // because the orphan-archive loop called `seedMemoryFilePath`
     // on it BEFORE the manifest could be rewritten — leaving no
     // recovery path. Fix: `loadSeedManifest` filters invalid-name

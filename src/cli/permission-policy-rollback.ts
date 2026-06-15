@@ -1,4 +1,4 @@
-// `agent permission policy-rollback <hash> [--target <file>] [--write] [--json]`
+// `forja permission policy-rollback <hash> [--target <file>] [--write] [--json]`
 // — §12.4 policy archive write surface. Dry-run by default (safety);
 // `--write` commits the canonical JSON bytes to the target YAML file
 // AND emits an audit row per spec line 756 ("Cada rollback é audit
@@ -28,7 +28,7 @@ import { getPolicyArchive } from '../storage/repos/policy-archive.ts';
 
 export interface RunPermissionPolicyRollbackOptions {
   hash: string;
-  // Default `.agent/permissions.yaml` (project-local). Resolved
+  // Default `.forja/permissions.yaml` (project-local). Resolved
   // against the runner's cwd unless absolute.
   target?: string;
   // When true, writes the canonical JSON bytes to `target` AND emits
@@ -64,7 +64,7 @@ const defaultReadFile = (path: string): string | null => {
   }
 };
 
-const DEFAULT_TARGET = '.agent/permissions.yaml';
+const DEFAULT_TARGET = '.forja/permissions.yaml';
 
 export const runPermissionPolicyRollback = async (
   options: RunPermissionPolicyRollbackOptions,

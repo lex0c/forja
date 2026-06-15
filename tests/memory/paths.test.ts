@@ -84,29 +84,29 @@ describe('resolveRepoRoot', () => {
 describe('userScopeRoot', () => {
   test('honors XDG_CONFIG_HOME when set absolute', () => {
     const root = userScopeRoot({ XDG_CONFIG_HOME: '/custom/xdg' });
-    expect(root).toBe('/custom/xdg/agent/memory');
+    expect(root).toBe('/custom/xdg/forja/memory');
   });
 
   test('falls back to ~/.config when XDG unset', () => {
     const root = userScopeRoot({});
-    expect(root).toBe(join(homedir(), '.config', 'agent', 'memory'));
+    expect(root).toBe(join(homedir(), '.config', 'forja', 'memory'));
   });
 
   test('ignores XDG when value is empty or relative', () => {
     expect(userScopeRoot({ XDG_CONFIG_HOME: '' })).toBe(
-      join(homedir(), '.config', 'agent', 'memory'),
+      join(homedir(), '.config', 'forja', 'memory'),
     );
     expect(userScopeRoot({ XDG_CONFIG_HOME: 'relative/path' })).toBe(
-      join(homedir(), '.config', 'agent', 'memory'),
+      join(homedir(), '.config', 'forja', 'memory'),
     );
   });
 });
 
 describe('projectScopeRoots', () => {
-  test('produces shared and local under .agent/memory/', () => {
+  test('produces shared and local under .forja/memory/', () => {
     const roots = projectScopeRoots('/repo');
-    expect(roots.shared).toBe('/repo/.agent/memory/shared');
-    expect(roots.local).toBe('/repo/.agent/memory/local');
+    expect(roots.shared).toBe('/repo/.forja/memory/shared');
+    expect(roots.local).toBe('/repo/.forja/memory/local');
   });
 });
 
@@ -114,27 +114,27 @@ describe('resolveScopeRoots', () => {
   test('combines user + project scopes', () => {
     const roots = resolveScopeRoots('/repo', { XDG_CONFIG_HOME: '/x' });
     expect(roots).toEqual({
-      user: '/x/agent/memory',
-      projectShared: '/repo/.agent/memory/shared',
-      projectLocal: '/repo/.agent/memory/local',
+      user: '/x/forja/memory',
+      projectShared: '/repo/.forja/memory/shared',
+      projectLocal: '/repo/.forja/memory/local',
     });
   });
 });
 
 describe('memoryFilePath', () => {
   const roots = {
-    user: '/x/agent/memory',
-    projectShared: '/repo/.agent/memory/shared',
-    projectLocal: '/repo/.agent/memory/local',
+    user: '/x/forja/memory',
+    projectShared: '/repo/.forja/memory/shared',
+    projectLocal: '/repo/.forja/memory/local',
   };
 
   test('builds <root>/<name>.md for each scope', () => {
-    expect(memoryFilePath(roots, 'user', 'role')).toBe('/x/agent/memory/role.md');
+    expect(memoryFilePath(roots, 'user', 'role')).toBe('/x/forja/memory/role.md');
     expect(memoryFilePath(roots, 'project_shared', 'team-conv')).toBe(
-      '/repo/.agent/memory/shared/team-conv.md',
+      '/repo/.forja/memory/shared/team-conv.md',
     );
     expect(memoryFilePath(roots, 'project_local', 'in-progress')).toBe(
-      '/repo/.agent/memory/local/in-progress.md',
+      '/repo/.forja/memory/local/in-progress.md',
     );
   });
 
@@ -148,44 +148,44 @@ describe('memoryFilePath', () => {
 
 describe('indexFilePath', () => {
   const roots = {
-    user: '/x/agent/memory',
-    projectShared: '/repo/.agent/memory/shared',
-    projectLocal: '/repo/.agent/memory/local',
+    user: '/x/forja/memory',
+    projectShared: '/repo/.forja/memory/shared',
+    projectLocal: '/repo/.forja/memory/local',
   };
 
   test('points at MEMORY.md within the scope root', () => {
-    expect(indexFilePath(roots, 'user')).toBe('/x/agent/memory/MEMORY.md');
-    expect(indexFilePath(roots, 'project_shared')).toBe('/repo/.agent/memory/shared/MEMORY.md');
-    expect(indexFilePath(roots, 'project_local')).toBe('/repo/.agent/memory/local/MEMORY.md');
+    expect(indexFilePath(roots, 'user')).toBe('/x/forja/memory/MEMORY.md');
+    expect(indexFilePath(roots, 'project_shared')).toBe('/repo/.forja/memory/shared/MEMORY.md');
+    expect(indexFilePath(roots, 'project_local')).toBe('/repo/.forja/memory/local/MEMORY.md');
   });
 });
 
 describe('scopeOfPath', () => {
   const roots = {
-    user: '/home/u/.config/agent/memory',
-    projectShared: '/repo/.agent/memory/shared',
-    projectLocal: '/repo/.agent/memory/local',
+    user: '/home/u/.config/forja/memory',
+    projectShared: '/repo/.forja/memory/shared',
+    projectLocal: '/repo/.forja/memory/local',
   };
 
   test('identifies each scope by path prefix', () => {
-    expect(scopeOfPath(roots, '/home/u/.config/agent/memory/role.md')).toBe('user');
-    expect(scopeOfPath(roots, '/repo/.agent/memory/shared/x.md')).toBe('project_shared');
-    expect(scopeOfPath(roots, '/repo/.agent/memory/local/y.md')).toBe('project_local');
+    expect(scopeOfPath(roots, '/home/u/.config/forja/memory/role.md')).toBe('user');
+    expect(scopeOfPath(roots, '/repo/.forja/memory/shared/x.md')).toBe('project_shared');
+    expect(scopeOfPath(roots, '/repo/.forja/memory/local/y.md')).toBe('project_local');
   });
 
   test('local takes precedence over shared when paths overlap', () => {
-    // shared and local share the parent .agent/memory/. The
+    // shared and local share the parent .forja/memory/. The
     // resolver checks local first so a hypothetical local path
     // never matches shared.
-    expect(scopeOfPath(roots, '/repo/.agent/memory/local/z.md')).toBe('project_local');
+    expect(scopeOfPath(roots, '/repo/.forja/memory/local/z.md')).toBe('project_local');
   });
 
   test('returns null for paths outside every scope', () => {
     expect(scopeOfPath(roots, '/etc/passwd')).toBeNull();
-    expect(scopeOfPath(roots, '/repo/.agent/sessions.db')).toBeNull();
+    expect(scopeOfPath(roots, '/repo/.forja/sessions.db')).toBeNull();
     // The scope root itself is not "inside" — only strict
     // children are.
-    expect(scopeOfPath(roots, '/repo/.agent/memory/shared')).toBeNull();
+    expect(scopeOfPath(roots, '/repo/.forja/memory/shared')).toBeNull();
   });
 
   test('does not match sibling roots that share a prefix', () => {
@@ -203,37 +203,37 @@ describe('scopeOfPath', () => {
 describe('memoryFilePath with non-canonical roots (regression: C1)', () => {
   test('accepts a root that contains `..` segments (resolved before sandbox check)', () => {
     const roots = {
-      user: '/x/agent/memory',
+      user: '/x/forja/memory',
       // Non-canonical: traverses up and back down. Resolves to
-      // /repo/.agent/memory/shared.
-      projectShared: '/repo/sub/../.agent/memory/shared',
-      projectLocal: '/repo/.agent/memory/local',
+      // /repo/.forja/memory/shared.
+      projectShared: '/repo/sub/../.forja/memory/shared',
+      projectLocal: '/repo/.forja/memory/local',
     };
     expect(memoryFilePath(roots, 'project_shared', 'foo')).toBe(
-      '/repo/.agent/memory/shared/foo.md',
+      '/repo/.forja/memory/shared/foo.md',
     );
   });
 
   test('accepts a root with a trailing slash', () => {
     const roots = {
-      user: '/x/agent/memory/',
-      projectShared: '/repo/.agent/memory/shared',
-      projectLocal: '/repo/.agent/memory/local',
+      user: '/x/forja/memory/',
+      projectShared: '/repo/.forja/memory/shared',
+      projectLocal: '/repo/.forja/memory/local',
     };
-    expect(memoryFilePath(roots, 'user', 'foo')).toBe('/x/agent/memory/foo.md');
+    expect(memoryFilePath(roots, 'user', 'foo')).toBe('/x/forja/memory/foo.md');
   });
 });
 
 describe('scopeOfPath with non-canonical roots (regression: C1)', () => {
   test('matches when both roots and path are non-canonical', () => {
     const roots = {
-      user: '/home/u/.config/agent/memory/',
-      projectShared: '/repo/sub/../.agent/memory/shared',
-      projectLocal: '/repo/./.agent/memory/local',
+      user: '/home/u/.config/forja/memory/',
+      projectShared: '/repo/sub/../.forja/memory/shared',
+      projectLocal: '/repo/./.forja/memory/local',
     };
-    expect(scopeOfPath(roots, '/repo/.agent/memory/shared/x.md')).toBe('project_shared');
-    expect(scopeOfPath(roots, '/repo/sub/../.agent/memory/local/y.md')).toBe('project_local');
-    expect(scopeOfPath(roots, '/home/u/.config/agent/memory/role.md')).toBe('user');
+    expect(scopeOfPath(roots, '/repo/.forja/memory/shared/x.md')).toBe('project_shared');
+    expect(scopeOfPath(roots, '/repo/sub/../.forja/memory/local/y.md')).toBe('project_local');
+    expect(scopeOfPath(roots, '/home/u/.config/forja/memory/role.md')).toBe('user');
   });
 });
 
@@ -259,9 +259,9 @@ describe('memoryFilePath sandbox - defense in depth', () => {
 
 describe('seed path primitives (spec §5.7.4)', () => {
   const roots = {
-    user: '/home/u/.config/agent/memory',
-    projectShared: '/repo/.agent/memory/shared',
-    projectLocal: '/repo/.agent/memory/local',
+    user: '/home/u/.config/forja/memory',
+    projectShared: '/repo/.forja/memory/shared',
+    projectLocal: '/repo/.forja/memory/local',
   };
 
   test('SEEDS_SUBDIR is the literal "seeds"', () => {
@@ -269,12 +269,12 @@ describe('seed path primitives (spec §5.7.4)', () => {
   });
 
   test('seedsRoot resolves to <user>/seeds', () => {
-    expect(seedsRoot(roots)).toBe('/home/u/.config/agent/memory/seeds');
+    expect(seedsRoot(roots)).toBe('/home/u/.config/forja/memory/seeds');
   });
 
   test('seedMemoryFilePath builds <user>/seeds/<name>.md', () => {
     expect(seedMemoryFilePath(roots, 'safe-edit')).toBe(
-      '/home/u/.config/agent/memory/seeds/safe-edit.md',
+      '/home/u/.config/forja/memory/seeds/safe-edit.md',
     );
   });
 
@@ -285,16 +285,16 @@ describe('seed path primitives (spec §5.7.4)', () => {
   });
 
   test('seedIndexFilePath points at <user>/seeds/MEMORY.md', () => {
-    expect(seedIndexFilePath(roots)).toBe('/home/u/.config/agent/memory/seeds/MEMORY.md');
+    expect(seedIndexFilePath(roots)).toBe('/home/u/.config/forja/memory/seeds/MEMORY.md');
   });
 
   test('seedTombstonesDir is <user>/seeds/.tombstones', () => {
-    expect(seedTombstonesDir(roots)).toBe('/home/u/.config/agent/memory/seeds/.tombstones');
+    expect(seedTombstonesDir(roots)).toBe('/home/u/.config/forja/memory/seeds/.tombstones');
   });
 
   test('seedTombstonePath embeds the timestamp', () => {
     expect(seedTombstonePath(roots, 'safe-edit', 1714138800)).toBe(
-      '/home/u/.config/agent/memory/seeds/.tombstones/safe-edit.1714138800.md',
+      '/home/u/.config/forja/memory/seeds/.tombstones/safe-edit.1714138800.md',
     );
   });
 
@@ -311,23 +311,23 @@ describe('seed path primitives with non-canonical roots (regression: C1 parity)'
   // from operator-supplied XDG_CONFIG_HOME or env-derived paths).
   test('seedMemoryFilePath canonicalizes roots with `..` segments', () => {
     const roots = {
-      user: '/home/u/.config/sub/../agent/memory',
-      projectShared: '/repo/.agent/memory/shared',
-      projectLocal: '/repo/.agent/memory/local',
+      user: '/home/u/.config/sub/../forja/memory',
+      projectShared: '/repo/.forja/memory/shared',
+      projectLocal: '/repo/.forja/memory/local',
     };
     expect(seedMemoryFilePath(roots, 'safe-edit')).toBe(
-      '/home/u/.config/agent/memory/seeds/safe-edit.md',
+      '/home/u/.config/forja/memory/seeds/safe-edit.md',
     );
   });
 
   test('seedMemoryFilePath accepts a root with a trailing slash', () => {
     const roots = {
-      user: '/home/u/.config/agent/memory/',
-      projectShared: '/repo/.agent/memory/shared',
-      projectLocal: '/repo/.agent/memory/local',
+      user: '/home/u/.config/forja/memory/',
+      projectShared: '/repo/.forja/memory/shared',
+      projectLocal: '/repo/.forja/memory/local',
     };
     expect(seedMemoryFilePath(roots, 'safe-edit')).toBe(
-      '/home/u/.config/agent/memory/seeds/safe-edit.md',
+      '/home/u/.config/forja/memory/seeds/safe-edit.md',
     );
   });
 
@@ -337,21 +337,21 @@ describe('seed path primitives with non-canonical roots (regression: C1 parity)'
     // the same path regardless of root shape — otherwise downstream
     // hash/compare keys diverge.
     const canonical = {
-      user: '/home/u/.config/agent/memory',
-      projectShared: '/repo/.agent/memory/shared',
-      projectLocal: '/repo/.agent/memory/local',
+      user: '/home/u/.config/forja/memory',
+      projectShared: '/repo/.forja/memory/shared',
+      projectLocal: '/repo/.forja/memory/local',
     };
     const noisy = {
-      user: '/home/u/.config/agent/memory/',
-      projectShared: '/repo/.agent/memory/shared',
-      projectLocal: '/repo/.agent/memory/local',
+      user: '/home/u/.config/forja/memory/',
+      projectShared: '/repo/.forja/memory/shared',
+      projectLocal: '/repo/.forja/memory/local',
     };
     const trickier = {
-      user: '/home/u/./.config/sub/../agent/memory',
-      projectShared: '/repo/.agent/memory/shared',
-      projectLocal: '/repo/.agent/memory/local',
+      user: '/home/u/./.config/sub/../forja/memory',
+      projectShared: '/repo/.forja/memory/shared',
+      projectLocal: '/repo/.forja/memory/local',
     };
-    const target = '/home/u/.config/agent/memory/seeds/MEMORY.md';
+    const target = '/home/u/.config/forja/memory/seeds/MEMORY.md';
     expect(resolve(seedIndexFilePath(canonical))).toBe(target);
     expect(resolve(seedIndexFilePath(noisy))).toBe(target);
     expect(resolve(seedIndexFilePath(trickier))).toBe(target);
@@ -359,27 +359,27 @@ describe('seed path primitives with non-canonical roots (regression: C1 parity)'
 
   test('seedTombstonePath canonicalizes roots with `..` segments', () => {
     const roots = {
-      user: '/home/u/.config/sub/../agent/memory',
-      projectShared: '/repo/.agent/memory/shared',
-      projectLocal: '/repo/.agent/memory/local',
+      user: '/home/u/.config/sub/../forja/memory',
+      projectShared: '/repo/.forja/memory/shared',
+      projectLocal: '/repo/.forja/memory/local',
     };
     expect(seedTombstonePath(roots, 'safe-edit', 1714138800)).toBe(
-      '/home/u/.config/agent/memory/seeds/.tombstones/safe-edit.1714138800.md',
+      '/home/u/.config/forja/memory/seeds/.tombstones/safe-edit.1714138800.md',
     );
   });
 });
 
 describe('scopeOfPath treats seeds/ as user scope (not a separate scope)', () => {
   const roots = {
-    user: '/home/u/.config/agent/memory',
-    projectShared: '/repo/.agent/memory/shared',
-    projectLocal: '/repo/.agent/memory/local',
+    user: '/home/u/.config/forja/memory',
+    projectShared: '/repo/.forja/memory/shared',
+    projectLocal: '/repo/.forja/memory/local',
   };
 
   test('paths under <user>/seeds/ resolve to "user"', () => {
-    expect(scopeOfPath(roots, '/home/u/.config/agent/memory/seeds/safe-edit.md')).toBe('user');
-    expect(scopeOfPath(roots, '/home/u/.config/agent/memory/seeds/MEMORY.md')).toBe('user');
-    expect(scopeOfPath(roots, '/home/u/.config/agent/memory/seeds/.tombstones/x.1.md')).toBe(
+    expect(scopeOfPath(roots, '/home/u/.config/forja/memory/seeds/safe-edit.md')).toBe('user');
+    expect(scopeOfPath(roots, '/home/u/.config/forja/memory/seeds/MEMORY.md')).toBe('user');
+    expect(scopeOfPath(roots, '/home/u/.config/forja/memory/seeds/.tombstones/x.1.md')).toBe(
       'user',
     );
   });
@@ -391,8 +391,8 @@ describe('scopeOfPath treats seeds/ as user scope (not a separate scope)', () =>
     // explicit allowlist, or a per-scope subdir registry) is a
     // visible test break, not a silent semantic shift. If you flip
     // this test, do it in the same PR that lands the allowlist.
-    expect(scopeOfPath(roots, '/home/u/.config/agent/memory/cache/junk.txt')).toBe('user');
-    expect(scopeOfPath(roots, '/home/u/.config/agent/memory/archived/x.md')).toBe('user');
-    expect(scopeOfPath(roots, '/home/u/.config/agent/memory/scratch/note.md')).toBe('user');
+    expect(scopeOfPath(roots, '/home/u/.config/forja/memory/cache/junk.txt')).toBe('user');
+    expect(scopeOfPath(roots, '/home/u/.config/forja/memory/archived/x.md')).toBe('user');
+    expect(scopeOfPath(roots, '/home/u/.config/forja/memory/scratch/note.md')).toBe('user');
   });
 });

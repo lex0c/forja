@@ -97,7 +97,7 @@ export const getSubagentWorktree = (db: DB, sessionId: string): SubagentWorktree
 // table — both `active` (subprocess path while a child runs) and
 // `preserved` ("child wrote something, kept for inspection").
 // 'cleaned' rows are excluded because the worktree dir + branch
-// were already dropped. Used by `agent worktree gc`. Order:
+// were already dropped. Used by `forja worktree gc`. Order:
 // oldest first, so a sweep can act on the longest-orphaned ones
 // up front.
 //
@@ -167,7 +167,7 @@ const fromRowWithParent = (
 });
 
 // Surface every audit row joined with its parent session's cwd.
-// Used by `agent --worktrees gc` to scope rows to
+// Used by `forja --worktrees gc` to scope rows to
 // the repo gc was invoked from. The caller is expected to
 // canonicalize both `parentCwd` and the resolved repo root
 // before comparing.

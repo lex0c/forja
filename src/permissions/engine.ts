@@ -93,7 +93,7 @@ export interface EngineOptions {
   // Decision falls back to source.layer='default'.
   provenance?: SectionProvenance;
   // Home directory used by `classifyProtectedPath` to resolve
-  // tilde-rooted protected targets (~/.bashrc, ~/.config/agent).
+  // tilde-rooted protected targets (~/.bashrc, ~/.config/forja).
   // Default `process.env.HOME ?? cwd` — production bootstrap
   // passes the operator's HOME explicitly so tests can swap it
   // without polluting process.env.
@@ -386,7 +386,7 @@ export interface PermissionEngine {
   // Returns a deep copy of the resolved Policy this engine was
   // built from. Subagent runtime persists the copy on
   // `subagent_runs` so the subprocess child runs under the
-  // parent's exact policy even if `.agent/permissions.yaml`
+  // parent's exact policy even if `.forja/permissions.yaml`
   // etc. are edited mid-run. The deep copy is defensive: a
   // future caller mutating the returned object MUST NOT corrupt
   // the engine's active enforcement state. Cost is negligible
@@ -1320,7 +1320,7 @@ const autoApprovePolicyConfirm = (decision: Decision): Decision => {
 // so they gate even though they also git-write), an unknown binary
 // (`exec:arbitrary`), python/node interpreters, secret-access, env/agent
 // mutation, and ANY path outside the repo or hitting a protected
-// (`.git`/`.agent`/system) or sensitive (`.env`/`*.pem`/`id_rsa`/
+// (`.git`/`.forja`/system) or sensitive (`.env`/`*.pem`/`id_rsa`/
 // credentials) target. The sensitive/protected checks are
 // belt-and-suspenders — the engine's §8.4 sensitive floor already DENIES
 // most of these before this runs — so a future floor change can't
@@ -1342,7 +1342,7 @@ const capRepoConfined = (cap: Capability, cwd: string, home: string): boolean =>
       if (path === null) return false;
       if (isDevSafe(path)) return true; // /dev/null, /dev/stdout, /dev/fd/*, ...
       if (!startsWithSegment(path, cwd)) return false; // escapes the repo
-      // Gate if protected for EITHER op. `.git`/`.agent`/`.claude` are
+      // Gate if protected for EITHER op. `.git`/`.forja`/`.claude` are
       // write-escalate but readable to git in general — for the no-modal
       // auto-approval we treat them as off-limits for reads too (they can
       // carry tokens / `core.sshCommand`), honoring the operator's

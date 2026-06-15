@@ -43,7 +43,7 @@ describe('trust/storage', () => {
 
   test('addTrustedDir creates parent directory and persists', () => {
     // Use a nested path to simulate the first-ever boot when
-    // ~/.config/agent doesn't exist yet.
+    // ~/.config/forja doesn't exist yet.
     const nested = join(dir, 'a', 'b', 'trusted_dirs.json');
     addTrustedDir(nested, '/projects/foo');
     expect(existsSync(nested)).toBe(true);

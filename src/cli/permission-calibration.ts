@@ -1,4 +1,4 @@
-// `agent permission calibration-export` — operator surface for
+// `forja permission calibration-export` — operator surface for
 // the spec §6.3.2 step 1 "coletar triples por 30d em deployment
 // piloto" data extraction. DB-only path: no provider, no session
 // start. Reads `approvals_log` + `outcome_signals` for the

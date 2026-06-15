@@ -609,7 +609,7 @@ describe('--ipc', () => {
 
   test('rejects --ipc without --subagent-session-id (would otherwise silently strip from prompt)', () => {
     // `--ipc` is an INTERNAL flag the parent appends to child
-    // argv. Operators typing `agent --ipc=1 "fix the bug"`
+    // argv. Operators typing `forja --ipc=1 "fix the bug"`
     // would have it silently consumed (no IPC channel actually
     // wired in non-subagent mode); a prompt fragment starting
     // with `--ipc=...` would be unexpectedly stripped from the
@@ -635,7 +635,7 @@ describe('--ipc', () => {
 
   test('coexists with other internal subagent flags', () => {
     // Concurrent flag presence is the realistic invocation:
-    // `agent --subagent-session-id <id> --subagent-depth 1
+    // `forja --subagent-session-id <id> --subagent-depth 1
     //  --ipc=1`. Each flag captures into its own field; no
     // ordering coupling.
     const r = parseArgs(['--subagent-session-id', 'sess-x', '--subagent-depth', '2', '--ipc=1']);
@@ -783,22 +783,22 @@ describe('--memory', () => {
   });
 });
 
-// Slice 123 (R9 P1): pre-slice `agent --i-know-what-im-doing`
+// Slice 123 (R9 P1): pre-slice `forja --i-know-what-im-doing`
 // (without the `welcome` verb) silently parsed `iKnowWhatImDoing:
 // true`, but the flag is only read inside the welcome branch in
 // run.ts — so the top-level form was a no-op that LOOKED like
 // it acknowledged unsafe-mode. Now the top-level parser rejects
 // with a pointer to the correct invocation.
 describe('--i-know-what-im-doing top-level rejection (slice 123, R9 P1)', () => {
-  test('agent --i-know-what-im-doing (no welcome) returns error pointing at `agent welcome`', () => {
+  test('forja --i-know-what-im-doing (no welcome) returns error pointing at `forja welcome`', () => {
     const r = parseArgs(['--i-know-what-im-doing']);
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.message).toContain('--i-know-what-im-doing');
-    expect(r.message).toContain('agent welcome');
+    expect(r.message).toContain('forja welcome');
   });
 
-  test('agent welcome --i-know-what-im-doing still parses successfully', () => {
+  test('forja welcome --i-know-what-im-doing still parses successfully', () => {
     // The welcome subcommand parser is separate from the top-level
     // parser and continues to accept the flag (slice 91 contract).
     const r = parseArgs(['welcome', '--i-know-what-im-doing']);
@@ -808,24 +808,24 @@ describe('--i-know-what-im-doing top-level rejection (slice 123, R9 P1)', () => 
     expect(r.args.iKnowWhatImDoing).toBe(true);
   });
 
-  test('agent --i-know-what-im-doing with other flags before still rejects', () => {
+  test('forja --i-know-what-im-doing with other flags before still rejects', () => {
     // Even when the flag appears alongside otherwise-valid flags,
     // the top-level form is invalid.
     const r = parseArgs(['--json', '--i-know-what-im-doing', 'hello']);
     expect(r.ok).toBe(false);
     if (r.ok) return;
-    expect(r.message).toContain('agent welcome');
+    expect(r.message).toContain('forja welcome');
   });
 });
 
 // Welcome subcommand detection is anchored to argv[0]. An earlier
 // cut scanned the entire argv for the literal word `welcome` to
-// accommodate `agent --i-know-what-im-doing welcome` (welcome
+// accommodate `forja --i-know-what-im-doing welcome` (welcome
 // after a flag) — but that regression-broke prompts containing
 // the word `welcome` as plain text, mis-routing them into the
 // welcome subcommand and erroring on unknown flags.
 describe('welcome subcommand detection — argv[0] only (review fix)', () => {
-  test('agent --json welcome → prompt is "welcome" with --json (NOT welcome subcommand)', () => {
+  test('forja --json welcome → prompt is "welcome" with --json (NOT welcome subcommand)', () => {
     const r = parseArgs(['--json', 'welcome']);
     expect(r.ok).toBe(true);
     if (!r.ok) return;
@@ -852,7 +852,7 @@ describe('welcome subcommand detection — argv[0] only (review fix)', () => {
     expect(r.args.prompt).toBe('welcome to forja');
   });
 
-  test('agent welcome → IS the welcome subcommand', () => {
+  test('forja welcome → IS the welcome subcommand', () => {
     // Sanity check: the canonical form still works (argv[0] match).
     const r = parseArgs(['welcome']);
     expect(r.ok).toBe(true);
@@ -860,7 +860,7 @@ describe('welcome subcommand detection — argv[0] only (review fix)', () => {
     expect(r.args.welcome).toBe(true);
   });
 
-  test('agent welcome --help → welcome subcommand with help flag', () => {
+  test('forja welcome --help → welcome subcommand with help flag', () => {
     const r = parseArgs(['welcome', '--help']);
     expect(r.ok).toBe(true);
     if (!r.ok) return;
@@ -886,7 +886,7 @@ describe('usage', () => {
     // The `--only=csv` description must enumerate every step the
     // orchestrator runs. Pre-slice-5a it omitted 'seeds' (the slice-3
     // add wasn't reflected in usage()), so an operator running
-    // `agent init --help` would see an outdated subset and think
+    // `forja init --help` would see an outdated subset and think
     // seeds wasn't `--only=`-selectable. This assertion pins the
     // enumeration so a future step add can't silently regress.
     expect(u).toContain('permissions,gitignore,config,playbooks,skills,seeds');
@@ -1176,7 +1176,7 @@ describe('parseArgs — recap subcommand', () => {
   test('--model <id> is consumed at top-level, not forwarded to recap args', () => {
     // Regression: pre-fix `--model` was forwarded into recap args
     // and the slash-side parser rejected it as an unknown flag,
-    // making model selection for `agent recap` impossible despite
+    // making model selection for `forja recap` impossible despite
     // run() honoring args.model when bootstrapping the provider.
     const r = parseArgs(['recap', 'pr', '--model', 'anthropic/claude-haiku-4-5']);
     expect(r.ok).toBe(true);
@@ -1197,7 +1197,7 @@ describe('parseArgs — recap subcommand', () => {
   test('--no-recap is consumed at the subcommand boundary, not forwarded', () => {
     // Regression: routing into `recap` returns before the global
     // --no-recap switch, and the slash-side parser does not know the
-    // flag — so without consuming it here, `agent recap pr --no-recap`
+    // flag — so without consuming it here, `forja recap pr --no-recap`
     // errored as "unknown flag" instead of forcing deterministic
     // render. bootstrap reads args.noRecap → recapEnabled=false.
     const r = parseArgs(['recap', 'pr', '--no-recap']);

@@ -10,7 +10,7 @@ prompt: |
 setup:
   approvalPosture: autonomous
   files:
-    .agent/permissions.yaml: |
+    .forja/permissions.yaml: |
       defaults:
         mode: strict
       tools:

@@ -1,5 +1,5 @@
 // Operator-facing config loaders for the per-project
-// `.agent/config.toml` sections that share the same fail-soft,
+// `.forja/config.toml` sections that share the same fail-soft,
 // two-layer (user + project) posture: [memory], [providers], [budget],
 // [effort], [audit], [sandbox]. AGENTIC_CLI.md §2.1.1.
 //
@@ -31,7 +31,7 @@ export { projectConfigPath, userConfigPath };
 // ────────────────────────────────────────────────────────────────────
 // MEMORY DETECTOR CONFIG (Slice Q — invert S11/S13 default to ON)
 //
-// Same TOML file (`.agent/config.toml`), same user+project precedence,
+// Same TOML file (`.forja/config.toml`), same user+project precedence,
 // same fail-soft parse posture as the other sections here. Reuses
 // `userConfigPath` / `projectConfigPath` / `loadTomlSection` plumbing.
 

@@ -31,11 +31,11 @@
 
 // Directories masked as opaque empty directories inside the sandbox.
 //
-// `.config/agent` and `.config/forja`: the sandbox boundary isn't
-// a one-way valve — `home-rw` profile gives writable home, and
-// the sandboxed process can plant config that the NEXT boot's
-// bootstrap reads as authoritative:
-//   - `.config/agent/permissions.yaml` is the user-scope policy
+// `.config/forja`: the sandbox boundary isn't a one-way valve —
+// `home-rw` profile gives writable home, and the sandboxed process
+// can plant config that the NEXT boot's bootstrap reads as
+// authoritative:
+//   - `.config/forja/permissions.yaml` is the user-scope policy
 //     layer. A sandboxed call can rewrite it to disable sandbox,
 //     broaden allows, or set hostAllowed:true. Session N+1 boots
 //     under the tampered policy.
@@ -65,7 +65,6 @@ export const HIDE_PATHS_DIRS: readonly string[] = [
   '.config/azure',
   '.config/op',
   '.config/sops',
-  '.config/agent',
   '.config/forja',
   '.gnupg',
   '.kube',

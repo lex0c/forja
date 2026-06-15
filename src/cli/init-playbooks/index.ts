@@ -1,7 +1,7 @@
 // Bundled canonical playbooks (`PLAYBOOKS.md` §12 — distribution).
 // The 4 .md files in this directory are imported as text assets
-// and exposed as a stable array. The playbooks step of `agent init`
-// writes each entry into `<cwd>/.agent/agents/`, where the loader
+// and exposed as a stable array. The playbooks step of `forja init`
+// writes each entry into `<cwd>/.forja/playbooks/`, where the loader
 // picks them up at the next REPL boot.
 //
 // Bun's `with { type: 'text' }` import attribute embeds the file
@@ -23,7 +23,7 @@ import perfInvestigateMd from './perf-investigate.md' with { type: 'text' };
 import securityAuditMd from './security-audit.md' with { type: 'text' };
 
 export interface CanonicalPlaybook {
-  // Filename used at the destination (`<cwd>/.agent/agents/<filename>`).
+  // Filename used at the destination (`<cwd>/.forja/playbooks/<filename>`).
   // Kept as `.md` so the loader's directory scan picks the file up
   // alongside any user-authored playbooks.
   filename: string;

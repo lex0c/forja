@@ -43,7 +43,7 @@ export const EMBEDDED_BUILTINS: ReadonlyArray<{
  * loudly in the loader's `shadows` output (`src/subagents/load.ts`).
  *
  * The default precedence for built-ins is "shadow silently" — an
- * operator who replaces a built-in via `~/.config/agent/agents/foo.md`
+ * operator who replaces a built-in via `~/.config/forja/playbooks/foo.md`
  * intentionally overrode the shipped definition; surfacing the
  * shadow on every boot would be noise.
  *

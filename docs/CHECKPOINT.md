@@ -26,7 +26,7 @@ git workflow.
 | `src/checkpoints/manager.ts` | `CheckpointManager` — orchestrates git + DB. The surface the harness and CLI consume. |
 | `src/storage/repos/checkpoints.ts` | Audit/lookup table rows (`checkpoints`). |
 | `src/storage/migrations/009-checkpoints.ts` | The `checkpoints` table schema. |
-| `src/cli/checkpoints.ts` | `agent --checkpoints <verb>` and `agent --undo`. |
+| `src/cli/checkpoints.ts` | `forja --checkpoints <verb>` and `forja --undo`. |
 | `src/harness/loop.ts` | Wires the manager: snapshot before write-steps, lazy retention sweep at startup. |
 
 ## The write-step flow
@@ -147,11 +147,11 @@ WARNING: this step ran bash. --undo / --checkpoints restore reverts
 DB + git only — no provider, no API key, no session start.
 
 ```
-agent --checkpoints list <session>            # newest-first table / NDJSON
-agent --checkpoints diff <session> <ckpt>     # working tree vs checkpoint
-agent --checkpoints restore <session> <ckpt>  # reset to a specific checkpoint
-agent --checkpoints purge <session>           # drop all rows + the session ref
-agent --undo <session>                        # restore the latest checkpoint
+forja --checkpoints list <session>            # newest-first table / NDJSON
+forja --checkpoints diff <session> <ckpt>     # working tree vs checkpoint
+forja --checkpoints restore <session> <ckpt>  # reset to a specific checkpoint
+forja --checkpoints purge <session>           # drop all rows + the session ref
+forja --undo <session>                        # restore the latest checkpoint
 ```
 
 Every verb validates the session belongs to the **current cwd**
@@ -189,7 +189,7 @@ deleting a session drops its audit trail.
 - Cleanup runs **lazy** at startup (`purge`), fire-and-forget — it never blocks
   the run and never bubbles errors. Scoped to the current cwd so it won't wipe
   audit history for sessions in other projects.
-- `agent --checkpoints purge <session>` forces it.
+- `forja --checkpoints purge <session>` forces it.
 
 The non-trivial part: when *some* checkpoints in a session age out but others
 survive, the survivors still parent the aged commits, so `git gc` can never

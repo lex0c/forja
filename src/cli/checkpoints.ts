@@ -1,4 +1,4 @@
-// `agent --checkpoints <verb>` and `agent --undo <session>` handlers.
+// `forja --checkpoints <verb>` and `forja --undo <session>` handlers.
 // Independent of bootstrap (no provider, no permissions, no tool registry —
 // only DB + git in cwd) so inspecting/restoring history doesn't require
 // an API key. Mirrors the structure of `runListSessions`.
@@ -130,7 +130,7 @@ const ensureSessionForCwd = (
   }
   if (session.cwd !== cwd) {
     err(
-      `forja: session ${sessionId} was created in '${session.cwd}', not '${cwd}'.\ncd to the original directory to operate on this session, or use\n\`agent --list-sessions\` to find a session for the current cwd.\n`,
+      `forja: session ${sessionId} was created in '${session.cwd}', not '${cwd}'.\ncd to the original directory to operate on this session, or use\n\`forja --list-sessions\` to find a session for the current cwd.\n`,
     );
     return false;
   }
@@ -342,7 +342,7 @@ const runRestoreImpl = async (
       msg.includes('Needed a single revision')
     ) {
       input.err(
-        `forja: checkpoint ${ckpt.id} references commit ${ckpt.gitRef} which is no\nlonger reachable in git (likely garbage-collected). Run\n\`agent --checkpoints purge ${sessionId}\` to drop the stale rows.\n`,
+        `forja: checkpoint ${ckpt.id} references commit ${ckpt.gitRef} which is no\nlonger reachable in git (likely garbage-collected). Run\n\`forja --checkpoints purge ${sessionId}\` to drop the stale rows.\n`,
       );
       return 1;
     }
@@ -415,7 +415,7 @@ export const runCheckpointsCli = async (input: CheckpointsCliInput): Promise<num
     // Slice 131: when caller didn't pass an outcomeSink AND the
     // verb is restore/undo (the only verbs that emit signals),
     // construct one from the opened DB. Keeps the CLI verbs
-    // self-contained — `agent --undo` doesn't need bootstrap.ts
+    // self-contained — `forja --undo` doesn't need bootstrap.ts
     // wiring to record calibration signals. Tests that want to
     // assert NO emit can pass `outcomeSink: createNoopOutcomeSink()`.
     const effectiveInput: CheckpointsCliInput =

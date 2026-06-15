@@ -20,11 +20,11 @@ afterEach(() => {
 });
 
 describe('ensureAgentGitignore', () => {
-  test('creates .agent/.gitignore with default contents on first call', () => {
+  test('creates .forja/.gitignore with default contents on first call', () => {
     const repo = makeTmp();
     const result = ensureAgentGitignore(repo);
     expect(result.created).toBe(true);
-    expect(result.path).toBe(join(repo, '.agent', '.gitignore'));
+    expect(result.path).toBe(join(repo, '.forja', '.gitignore'));
     expect(readFileSync(result.path, 'utf-8')).toBe(DEFAULT_AGENT_GITIGNORE);
   });
 
@@ -46,18 +46,18 @@ describe('ensureAgentGitignore', () => {
 
   test('never overwrites existing operator-edited .gitignore', () => {
     const repo = makeTmp();
-    mkdirSync(join(repo, '.agent'), { recursive: true });
-    const path = join(repo, '.agent', '.gitignore');
+    mkdirSync(join(repo, '.forja'), { recursive: true });
+    const path = join(repo, '.forja', '.gitignore');
     writeFileSync(path, 'custom contents\n');
     const result = ensureAgentGitignore(repo);
     expect(result.created).toBe(false);
     expect(readFileSync(path, 'utf-8')).toBe('custom contents\n');
   });
 
-  test('creates the .agent parent directory when absent', () => {
+  test('creates the .forja parent directory when absent', () => {
     const repo = makeTmp();
-    expect(existsSync(join(repo, '.agent'))).toBe(false);
+    expect(existsSync(join(repo, '.forja'))).toBe(false);
     ensureAgentGitignore(repo);
-    expect(existsSync(join(repo, '.agent'))).toBe(true);
+    expect(existsSync(join(repo, '.forja'))).toBe(true);
   });
 });

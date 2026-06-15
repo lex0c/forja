@@ -6,7 +6,7 @@
   "license": "Apache-2.0",
   "type": "module",
   "bin": {
-    "agent": "./dist/agent-linux-x64"
+    "forja": "./dist/forja-linux-x64"
   },
   "scripts": {
     "dev": "bun run --watch src/cli/index.ts",

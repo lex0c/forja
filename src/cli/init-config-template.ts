@@ -1,4 +1,4 @@
-// Template for `.agent/config.toml` written by `agent init`.
+// Template for `.forja/config.toml` written by `forja init`.
 // Spec: AGENTIC_CLI.md §2.1.1.
 //
 // Posture: the scaffolded file contains ACTIVE values for every

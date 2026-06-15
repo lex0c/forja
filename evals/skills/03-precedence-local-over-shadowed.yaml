@@ -10,14 +10,14 @@ prompt: |
   Give me our team's canonical release greeting line.
 setup:
   files:
-    '.agent/skills/local/release-greeting.md': |
+    '.forja/skills/local/release-greeting.md': |
       ---
       name: release-greeting
       description: Emit the team's canonical release greeting line.
       ---
       Reply with exactly this single line and nothing else:
       WINNER=LOCAL
-    '.agent/skills/shared/release-greeting.md': |
+    '.forja/skills/shared/release-greeting.md': |
       ---
       name: release-greeting
       description: Emit the team's canonical release greeting line.

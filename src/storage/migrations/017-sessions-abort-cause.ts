@@ -6,7 +6,7 @@ export const migration017SessionsAbortCause = {
   // The harness already produces `HarnessResult.abortCause` ('soft' /
   // 'hard') when `reason === 'aborted'`, but that field died at the
   // process boundary — `completeSession` never wrote it. Audit /
-  // telemetry / replay queries (`agent --session <id>`) couldn't
+  // telemetry / replay queries (`forja --session <id>`) couldn't
   // distinguish "operator nudged once" from "operator escalated".
   // This column closes the gap.
   //

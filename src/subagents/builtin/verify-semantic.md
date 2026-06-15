@@ -99,7 +99,7 @@ Your FINAL assistant turn MUST be a YAML mapping matching the schema declared in
 ```
 verdict: contradicted
 confidence: 0.85
-claim_extracted: "memories live in `.agent/memory/` per the README"
+claim_extracted: "memories live in `.forja/memory/` per the README"
 ground_truth_observed: "actual layout uses `.forja/memory/` per src/memory/paths.ts:14"
 evidence_paths:
   - src/memory/paths.ts

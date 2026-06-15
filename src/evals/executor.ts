@@ -55,7 +55,7 @@ interface CompactionRecord {
 // doesn't ship one. Evals run autonomously — there's no operator
 // to confirm tool calls, so strict mode would dead-end every
 // `read_file`/`write_file`/`bash`. Cases that want stricter rules
-// drop their own `.agent/permissions.yaml` via `setup.files` or
+// drop their own `.forja/permissions.yaml` via `setup.files` or
 // `fixture`.
 const DEFAULT_EVAL_POLICY_YAML = `defaults:
   mode: bypass
@@ -167,9 +167,9 @@ const setupCwd = (caseDef: EvalCase): string => {
   // Drop a default permissions.yaml only when the case+fixture
   // didn't provide one. Checking after fixture+files copy lets
   // either source override the default.
-  const policyPath = join(dir, '.agent/permissions.yaml');
+  const policyPath = join(dir, '.forja/permissions.yaml');
   if (!existsSync(policyPath)) {
-    mkdirSync(join(dir, '.agent'), { recursive: true });
+    mkdirSync(join(dir, '.forja'), { recursive: true });
     writeFileSync(policyPath, DEFAULT_EVAL_POLICY_YAML);
   }
   return dir;

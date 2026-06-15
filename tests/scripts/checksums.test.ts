@@ -25,16 +25,16 @@ describe('sha256File', () => {
 describe('formatSums / parseSums', () => {
   test('round-trips a stable, alphabetized list', () => {
     const text = formatSums([
-      { filename: 'agent-linux-x64', sha256: 'a'.repeat(64) },
-      { filename: 'agent-darwin-arm64', sha256: 'b'.repeat(64) },
+      { filename: 'forja-linux-x64', sha256: 'a'.repeat(64) },
+      { filename: 'forja-darwin-arm64', sha256: 'b'.repeat(64) },
     ]);
     const lines = text.trimEnd().split('\n');
     // Alphabetical: darwin-arm64 first.
-    expect(lines[0]).toBe(`${'b'.repeat(64)}  agent-darwin-arm64`);
-    expect(lines[1]).toBe(`${'a'.repeat(64)}  agent-linux-x64`);
+    expect(lines[0]).toBe(`${'b'.repeat(64)}  forja-darwin-arm64`);
+    expect(lines[1]).toBe(`${'a'.repeat(64)}  forja-linux-x64`);
     expect(parseSums(text)).toEqual([
-      { filename: 'agent-darwin-arm64', sha256: 'b'.repeat(64) },
-      { filename: 'agent-linux-x64', sha256: 'a'.repeat(64) },
+      { filename: 'forja-darwin-arm64', sha256: 'b'.repeat(64) },
+      { filename: 'forja-linux-x64', sha256: 'a'.repeat(64) },
     ]);
   });
 
@@ -43,31 +43,31 @@ describe('formatSums / parseSums', () => {
   });
 
   test('parseSums tolerates trailing newline and skips blank lines', () => {
-    const sum = `${'c'.repeat(64)}  agent-linux-x64`;
+    const sum = `${'c'.repeat(64)}  forja-linux-x64`;
     const text = `\n${sum}\n\n`;
     const parsed = parseSums(text);
     expect(parsed.length).toBe(1);
-    expect(parsed[0]?.filename).toBe('agent-linux-x64');
+    expect(parsed[0]?.filename).toBe('forja-linux-x64');
   });
 
   test('parseSums normalizes CRLF before splitting', () => {
-    const sum = `${'d'.repeat(64)}  agent-linux-x64`;
+    const sum = `${'d'.repeat(64)}  forja-linux-x64`;
     // SUMS file produced on Windows or downloaded through a
     // CRLF-introducing proxy must parse identically to the LF form.
     const parsed = parseSums(`${sum}\r\n`);
     expect(parsed.length).toBe(1);
-    expect(parsed[0]?.filename).toBe('agent-linux-x64');
+    expect(parsed[0]?.filename).toBe('forja-linux-x64');
   });
 
   test('parseSums rejects whitespace other than two literal spaces', () => {
     const hash = 'e'.repeat(64);
     // Tab + tab between hash and filename: rejected (defense in depth
     // against a malformed/hand-edited SUMS file).
-    expect(() => parseSums(`${hash}\t\tagent-linux-x64\n`)).toThrow();
+    expect(() => parseSums(`${hash}\t\tforja-linux-x64\n`)).toThrow();
     // Single space: rejected (GNU sha256sum uses two).
-    expect(() => parseSums(`${hash} agent-linux-x64\n`)).toThrow();
+    expect(() => parseSums(`${hash} forja-linux-x64\n`)).toThrow();
     // Three spaces: rejected.
-    expect(() => parseSums(`${hash}   agent-linux-x64\n`)).toThrow();
+    expect(() => parseSums(`${hash}   forja-linux-x64\n`)).toThrow();
   });
 });
 
@@ -93,17 +93,17 @@ describe('generate / verify', () => {
       ],
       // sourcemap should be excluded; sbom.cdx.json should be included.
       [
-        { name: 'agent-linux-x64.map', content: '{}' },
+        { name: 'forja-linux-x64.map', content: '{}' },
         { name: 'sbom.cdx.json', content: '{"bomFormat":"CycloneDX"}' },
       ],
     );
     try {
       generate(dir);
       const text = readFileSync(join(dir, 'SHA256SUMS'), 'utf-8');
-      expect(text).toContain('agent-linux-x64');
-      expect(text).toContain('agent-darwin-arm64');
+      expect(text).toContain('forja-linux-x64');
+      expect(text).toContain('forja-darwin-arm64');
       expect(text).toContain('sbom.cdx.json');
-      expect(text).not.toContain('agent-linux-x64.map');
+      expect(text).not.toContain('forja-linux-x64.map');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -134,11 +134,11 @@ describe('generate / verify', () => {
     const dir = setupDist([{ id: 'linux-x64', content: 'binary-linux' }]);
     try {
       generate(dir);
-      writeFileSync(join(dir, 'agent-linux-x64'), 'tampered');
+      writeFileSync(join(dir, 'forja-linux-x64'), 'tampered');
       const result = verify(dir);
       expect(result.ok).toBe(false);
       expect(result.failed.length).toBe(1);
-      expect(result.failed[0]?.filename).toBe('agent-linux-x64');
+      expect(result.failed[0]?.filename).toBe('forja-linux-x64');
       expect(result.failed[0]?.actual).not.toBe(result.failed[0]?.expected);
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -149,7 +149,7 @@ describe('generate / verify', () => {
     const dir = setupDist([{ id: 'linux-x64', content: 'binary-linux' }]);
     try {
       generate(dir);
-      rmSync(join(dir, 'agent-linux-x64'));
+      rmSync(join(dir, 'forja-linux-x64'));
       const result = verify(dir);
       expect(result.ok).toBe(false);
       expect(result.failed[0]?.actual).toBeNull();

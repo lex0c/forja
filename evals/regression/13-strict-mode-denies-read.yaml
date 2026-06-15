@@ -7,7 +7,7 @@ setup:
   files:
     notes.txt: |
       this content should never reach the model
-    .agent/permissions.yaml: |
+    .forja/permissions.yaml: |
       defaults:
         mode: strict
 expect:

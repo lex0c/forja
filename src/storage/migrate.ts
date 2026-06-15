@@ -72,7 +72,7 @@ const validateRegistry = (migrations: readonly Migration[]): void => {
 
 // Read-only check: how many registered migrations have NOT been
 // applied to this DB? Used by code paths that want to know about
-// pending migrations WITHOUT applying them (e.g., `agent gc`
+// pending migrations WITHOUT applying them (e.g., `forja gc`
 // dry-run, which must not mutate schema).
 //
 // Returns the count of migrations whose `id` is missing from

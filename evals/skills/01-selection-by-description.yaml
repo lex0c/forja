@@ -10,7 +10,7 @@ prompt: |
   for file summaries. Carry the procedure out and give me the result.
 setup:
   files:
-    '.agent/skills/shared/file-summary.md': |
+    '.forja/skills/shared/file-summary.md': |
       ---
       name: file-summary
       description: Summarize a source file in the team's required two-part format.
@@ -21,7 +21,7 @@ setup:
       2. Reply with these two lines, the labels written verbatim:
          PURPOSE: <one sentence on what the file does>
          LINECOUNT: <number of lines in the file>
-    '.agent/skills/shared/changelog-entry.md': |
+    '.forja/skills/shared/changelog-entry.md': |
       ---
       name: changelog-entry
       description: Draft a changelog entry from a diff in the Keep a Changelog style.

@@ -10,7 +10,7 @@ const captured = () => {
 const NEVER_WHICH = (_cmd: string): string | null => null;
 const ALWAYS_WHICH = (cmd: string): string | null => `/usr/bin/${cmd}`;
 
-describe('parseArgs — agent sandbox setup', () => {
+describe('parseArgs — forja sandbox setup', () => {
   test('verb is recognized', () => {
     const r = parseArgs(['sandbox', 'setup']);
     expect(r.ok).toBe(true);
@@ -63,7 +63,7 @@ describe('runSandboxSetup', () => {
     expect(code).toBe(0);
     const text = out.lines.join('');
     expect(text).toContain('already installed');
-    expect(text).toContain('agent doctor');
+    expect(text).toContain('forja doctor');
   });
 
   test('linux missing bwrap on ubuntu → apt install command', async () => {
@@ -83,7 +83,7 @@ describe('runSandboxSetup', () => {
     expect(text).toContain('Ubuntu 22.04 LTS');
     expect(text).toContain('ubuntu');
     expect(text).toContain('sudo apt install bubblewrap');
-    expect(text).toContain('agent doctor');
+    expect(text).toContain('forja doctor');
   });
 
   test('linux missing bwrap on fedora → dnf install command', async () => {

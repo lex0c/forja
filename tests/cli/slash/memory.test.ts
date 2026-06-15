@@ -1720,7 +1720,7 @@ const stubBlockingDispatcher =
     blockedBy: {
       spec: {
         layer: 'enterprise' as const,
-        sourcePath: '/etc/agent/hooks.toml',
+        sourcePath: '/etc/forja/hooks.toml',
         event: 'Eviction' as const,
         matcher: {},
         entryIndex: 0,
@@ -1815,7 +1815,7 @@ describe('/memory delete + restore — Eviction hook chain', () => {
     );
     const last = getLastEvictionForObject(db, 'memory', 'mem', 'user');
     expect(last?.outcome).toBe('blocked_by_hook');
-    expect(last?.blockedBy).toContain('/etc/agent/hooks.toml');
+    expect(last?.blockedBy).toContain('/etc/forja/hooks.toml');
 
     // memory_events: refused row landed.
     const { listMemoryEventsByName } = await import('../../../src/storage/repos/memory-events.ts');
@@ -1916,7 +1916,7 @@ describe('/memory delete + restore — Eviction hook chain', () => {
           blockedBy: {
             spec: {
               layer: 'enterprise' as const,
-              sourcePath: '/etc/agent/hooks.toml',
+              sourcePath: '/etc/forja/hooks.toml',
               event: 'Eviction' as const,
               matcher: {},
               entryIndex: 0,
@@ -3941,16 +3941,16 @@ describe('/memory governance status: source-label render matrix', () => {
     label: string;
   }> = [
     { enabled: true, source: 'cli', label: 'yes (--memory-verify-llm)' },
-    { enabled: true, source: 'project-config', label: 'yes (.agent/config.toml)' },
-    { enabled: true, source: 'user-config', label: 'yes (~/.config/agent/config.toml)' },
+    { enabled: true, source: 'project-config', label: 'yes (.forja/config.toml)' },
+    { enabled: true, source: 'user-config', label: 'yes (~/.config/forja/config.toml)' },
     {
       enabled: true,
       source: 'default',
       label: 'yes (default; disable: /memory governance disable verify)',
     },
     { enabled: false, source: 'cli', label: 'no (--no-memory-verify-llm)' },
-    { enabled: false, source: 'project-config', label: 'no (.agent/config.toml)' },
-    { enabled: false, source: 'user-config', label: 'no (~/.config/agent/config.toml)' },
+    { enabled: false, source: 'project-config', label: 'no (.forja/config.toml)' },
+    { enabled: false, source: 'user-config', label: 'no (~/.config/forja/config.toml)' },
     { enabled: false, source: 'default', label: 'no (default)' },
   ];
   for (const row of verifyMatrix) {
@@ -3971,16 +3971,16 @@ describe('/memory governance status: source-label render matrix', () => {
     label: string;
   }> = [
     { enabled: true, source: 'cli', label: 'yes (--memory-conflict-llm)' },
-    { enabled: true, source: 'project-config', label: 'yes (.agent/config.toml)' },
-    { enabled: true, source: 'user-config', label: 'yes (~/.config/agent/config.toml)' },
+    { enabled: true, source: 'project-config', label: 'yes (.forja/config.toml)' },
+    { enabled: true, source: 'user-config', label: 'yes (~/.config/forja/config.toml)' },
     {
       enabled: true,
       source: 'default',
       label: 'yes (default; disable: /memory governance disable conflict)',
     },
     { enabled: false, source: 'cli', label: 'no (--no-memory-conflict-llm)' },
-    { enabled: false, source: 'project-config', label: 'no (.agent/config.toml)' },
-    { enabled: false, source: 'user-config', label: 'no (~/.config/agent/config.toml)' },
+    { enabled: false, source: 'project-config', label: 'no (.forja/config.toml)' },
+    { enabled: false, source: 'user-config', label: 'no (~/.config/forja/config.toml)' },
     { enabled: false, source: 'default', label: 'no (default)' },
   ];
   for (const row of conflictMatrix) {
@@ -3991,7 +3991,7 @@ describe('/memory governance status: source-label render matrix', () => {
       const r = await memoryCommand.exec(['governance', 'status'], ctx);
       if (r.kind !== 'ok') throw new Error(JSON.stringify(r));
       // Several conflict labels collide with verify labels (e.g.
-      // 'no (.agent/config.toml)'); split the rendered text at the
+      // 'no (.forja/config.toml)'); split the rendered text at the
       // S13 header so the assertion only sees the conflict block.
       const text = (r.notes ?? []).join('\n');
       const conflictBlock =
@@ -4019,16 +4019,16 @@ describe('/memory governance status: source-label render matrix', () => {
     label: string;
   }> = [
     { enabled: true, source: 'cli', label: 'yes (--memory-override-llm)' },
-    { enabled: true, source: 'project-config', label: 'yes (.agent/config.toml)' },
-    { enabled: true, source: 'user-config', label: 'yes (~/.config/agent/config.toml)' },
+    { enabled: true, source: 'project-config', label: 'yes (.forja/config.toml)' },
+    { enabled: true, source: 'user-config', label: 'yes (~/.config/forja/config.toml)' },
     {
       enabled: true,
       source: 'default',
       label: 'yes (default; disable: /memory governance disable override)',
     },
     { enabled: false, source: 'cli', label: 'no (--no-memory-override-llm)' },
-    { enabled: false, source: 'project-config', label: 'no (.agent/config.toml)' },
-    { enabled: false, source: 'user-config', label: 'no (~/.config/agent/config.toml)' },
+    { enabled: false, source: 'project-config', label: 'no (.forja/config.toml)' },
+    { enabled: false, source: 'user-config', label: 'no (~/.config/forja/config.toml)' },
     { enabled: false, source: 'default', label: 'no (default)' },
   ];
   for (const row of overrideMatrix) {
@@ -4176,7 +4176,7 @@ describe('/memory seeds — per-seed opt-out (spec §5.7.6)', () => {
   test('seeds list reports every canonical seed as `absent` when nothing is installed', async () => {
     // Pre-fix behavior was to label every non-disabled seed as
     // `active` regardless of whether the body lived at <user>/seeds/.
-    // After `agent init --no-seeds` (or a session where init was
+    // After `forja init --no-seeds` (or a session where init was
     // never run), the canonical bodies do NOT exist on disk and the
     // registry's user/seeds snapshot is empty — so the model never
     // sees them in prompt assembly. Calling them "active" misled
@@ -4195,7 +4195,7 @@ describe('/memory seeds — per-seed opt-out (spec §5.7.6)', () => {
       `0 active, 0 disabled, ${CANONICAL_SEEDS.length} absent (of ${CANONICAL_SEEDS.length} canonical)`,
     );
     // Recovery hint fires when absent > 0.
-    expect(text).toContain('`agent init`');
+    expect(text).toContain('`forja init`');
     // Every canonical seed is named in the body AND tagged `absent`.
     for (const seed of CANONICAL_SEEDS) {
       expect(text).toContain(`[absent  ] ${seed.name}`);
@@ -4221,7 +4221,7 @@ describe('/memory seeds — per-seed opt-out (spec §5.7.6)', () => {
     );
     expect(text).not.toContain('absent');
     // Recovery hint omitted (nothing absent to recover).
-    expect(text).not.toContain('`agent init`');
+    expect(text).not.toContain('`forja init`');
     // Every seed tagged active.
     for (const seed of CANONICAL_SEEDS) {
       expect(text).toContain(`[active  ] ${seed.name}`);
@@ -4297,7 +4297,7 @@ describe('/memory seeds — per-seed opt-out (spec §5.7.6)', () => {
   });
 
   test('seeds disable announces no-body-on-disk path when the body was never written', async () => {
-    // Operator who ran `agent init --no-seeds` (slice 5a) then runs
+    // Operator who ran `forja init --no-seeds` (slice 5a) then runs
     // `/memory seeds disable foo` — the body was never installed,
     // so the disable message must NOT claim "body preserved at
     // <path>". The handler branches on existsSync.
@@ -4322,7 +4322,7 @@ describe('/memory seeds — per-seed opt-out (spec §5.7.6)', () => {
     // routed an absent-body + prior-manifest seed through `user_kept`
     // (honoring the operator-delete intent that predated the
     // explicit sentinel). The post-enable index excluded the entry
-    // and the operator was told to run `agent init --only=seeds` —
+    // and the operator was told to run `forja init --only=seeds` —
     // which produced the same user_kept loop, leaving them with no
     // recovery path. Post-fix: `enable` drops the manifest entry
     // when the body is absent, the installer then routes through

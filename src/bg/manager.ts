@@ -352,7 +352,7 @@ export interface BgManager {
   // Thin status accessor — returns null when the id is unknown.
   // Used by the wait subsystem's `process_exit` polling loop and
   // by external tooling that needs lifecycle info without pulling
-  // the whole row (`agent doctor`, future UI tray, etc). Cheaper
+  // the whole row (`forja doctor`, future UI tray, etc). Cheaper
   // than readOutput (no log file IO).
   getStatus(id: string): StatusSnapshot | null;
   // Terminate every still-running process started by this manager.
@@ -360,7 +360,7 @@ export interface BgManager {
   // DB rows are flipped to 'killed' even if the OS kill fails.
   cleanup(): Promise<{ killed: number }>;
   // Diagnostic accessor — number of in-memory live process handles.
-  // Useful for tests and for `agent doctor` to spot leaks. Not
+  // Useful for tests and for `forja doctor` to spot leaks. Not
   // intended to be called during normal session flow.
   liveCount(): number;
   // Snapshot of every bg process in THIS session (running and
@@ -423,7 +423,7 @@ export interface CreateBgManagerOptions {
   sessionId: string;
   // Directory where stdout/stderr log files for this session's bg
   // processes are written. Created on demand. Caller's responsibility
-  // to wire to `.agent/bg/<session-or-global>/` per spec §2.7.
+  // to wire to `.forja/bg/<session-or-global>/` per spec §2.7.
   logDir: string;
   // Harness-level abort signal. When provided, the manager registers
   // a one-shot listener that runs `cleanup()` immediately on abort
@@ -485,9 +485,9 @@ const ensureDir = (dir: string): void => {
   // bash commands — npm-install network secrets, curl Bearer tokens,
   // env dumps that echo provider API keys. Default umask leaves the
   // dir 0755 (other local users read) and files 0644. Slice 163
-  // tightened sessions.db perms but not `.agent/bg/`. Lock down
-  // here; the dir lives under `<cwd>/.agent/bg/` per spec §2.7
-  // (or per-subagent under `<cwd>/.agent/bg/subagents/<id>/`),
+  // tightened sessions.db perms but not `.forja/bg/`. Lock down
+  // here; the dir lives under `<cwd>/.forja/bg/` per spec §2.7
+  // (or per-subagent under `<cwd>/.forja/bg/subagents/<id>/`),
   // both of which are operator-owned trees.
   // Best-effort — exotic FS (FAT/exFAT) ignore chmod.
   try {

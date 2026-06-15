@@ -16,7 +16,7 @@ describe('ensureInstallId', () => {
   });
 
   test('creates identity at supplied path with mode 0600 on first call', () => {
-    const path = join(tmp, 'agent', 'install_id');
+    const path = join(tmp, 'forja', 'install_id');
     const id = ensureInstallId({
       pathOverride: path,
       now: () => 1731000000000,
@@ -99,7 +99,7 @@ describe('ensureInstallId', () => {
       uuid: () => 'discovered-path-uuid',
       now: () => 1731000000001,
     });
-    expect(existsSync(join(tmp, '.config', 'agent', 'install_id'))).toBe(true);
+    expect(existsSync(join(tmp, '.config', 'forja', 'install_id'))).toBe(true);
     expect(id.install_id).toBe('discovered-path-uuid');
   });
 
@@ -146,12 +146,12 @@ describe('isFirstBoot (slice 46)', () => {
   });
 
   test('returns true when the install_id file does not exist', () => {
-    const path = join(tmp, 'agent', 'install_id');
+    const path = join(tmp, 'forja', 'install_id');
     expect(isFirstBoot({ pathOverride: path })).toBe(true);
   });
 
   test('returns false after ensureInstallId creates the file', () => {
-    const path = join(tmp, 'agent', 'install_id');
+    const path = join(tmp, 'forja', 'install_id');
     ensureInstallId({
       pathOverride: path,
       now: () => 1731000000000,

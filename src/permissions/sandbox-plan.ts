@@ -77,7 +77,7 @@ export const isSandboxProfile = (s: unknown): s is SandboxProfile =>
 //     the process inherits the sandbox constraints. `host` is
 //     the only profile that grants `host-passthrough`.
 //   - `secret-access` requires either `home-rw` or `host` because
-//     secrets live under `$HOME` (e.g. `~/.config/agent/secrets`).
+//     secrets live under `$HOME` (e.g. `~/.config/forja/secrets`).
 const PROFILE_ALLOWED_CAPABILITIES: Record<SandboxProfile, ReadonlySet<CapabilityKind>> = {
   ro: new Set<CapabilityKind>(['read-fs', 'exec']),
   'cwd-rw': new Set<CapabilityKind>(['read-fs', 'write-fs', 'delete-fs', 'exec', 'git-write']),

@@ -1,5 +1,5 @@
 // outcome_signals repo. Append-only — no UPDATE or DELETE method.
-// Retention is per-row (`ttl_expires_at`) so the future `agent gc`
+// Retention is per-row (`ttl_expires_at`) so the future `forja gc`
 // path filters via WHERE clauses rather than per-table policy.
 //
 // Schema in migration 042-outcome-signals.ts. Linked to
@@ -128,7 +128,7 @@ export const countOutcomeSignals = (db: DB): number => {
 
 // ─── pruneExpiredOutcomeSignals ────────────────────────────────────────
 //
-// Retention sweep for `agent gc` Phase 2 (AGENTIC_CLI §2.1.3, AUDIT
+// Retention sweep for `forja gc` Phase 2 (AGENTIC_CLI §2.1.3, AUDIT
 // §1.2.1). Unlike most prune helpers, outcome_signals uses an
 // absolute TTL column (`ttl_expires_at`, populated at INSERT via
 // per-`signal_kind` defaults from DEFAULT_SIGNAL_TTL_DAYS) rather

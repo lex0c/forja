@@ -117,7 +117,7 @@ export type TrustAnswer = 'yes' | 'no' | 'cancel';
 // keeping the type discriminant strict prevents a future refactor
 // from accidentally swapping them.
 export interface SharedTrustAskArgs {
-  // Absolute path of the shared-corpus root (`<repo>/.agent/memory/shared`).
+  // Absolute path of the shared-corpus root (`<repo>/.forja/memory/shared`).
   path: string;
   // 'first-visit' (no prior trust row + non-empty corpus) vs 'drift'
   // (prior row but hash diverged). Reducer adapts the prose to match.
@@ -126,7 +126,7 @@ export interface SharedTrustAskArgs {
   // wraps long lists with an explicit "(N more)" suffix; the
   // producer should NOT pre-truncate so the audit event carries the
   // full inventory. Filenames may contain operator-untrusted bytes
-  // (attacker with commit access on `.agent/memory/shared/`); the
+  // (attacker with commit access on `.forja/memory/shared/`); the
   // reducer sanitizes before rendering.
   corpusFiles: readonly { name: string; bytes: number }[];
 }
@@ -135,7 +135,7 @@ export type SharedTrustAnswer = 'yes' | 'no' | 'cancel';
 
 // History-clear flavor (HISTORY.md §2.3 `/history clear` modal).
 // `yes` = clear only, `yes-disable` = clear + write the
-// `.agent/no-history` marker (permanent per-project opt-out), `no` =
+// `.forja/no-history` marker (permanent per-project opt-out), `no` =
 // reject explicitly, `cancel` = closed via Esc / timeout. The
 // dispatcher is the place that distinguishes 'no' vs 'cancel' for
 // audit; for history specifically both are no-ops on disk.
@@ -264,7 +264,7 @@ const MEMORY_ACTION_OPTIONS: readonly ConfirmOption[] = [
 // in-memory allowlist mid-modal lets an operator widen authority
 // without a chance to revoke for the rest of the session, and
 // every operator who needs that workflow can edit
-// `.agent/permissions.yaml` (or run `/perms` slash commands when
+// `.forja/permissions.yaml` (or run `/perms` slash commands when
 // they land) with the full layered policy view in front of them.
 // `engine.addSessionAllow` stays on the API surface for those
 // non-modal paths.

@@ -39,7 +39,7 @@ const makeEvictionPayload = (overrides: Partial<EvictionEventData> = {}): HookEv
 
 const makeSpec = (matcher: HookMatcher = {}): HookSpec => ({
   layer: 'project',
-  sourcePath: '/repo/.agent/hooks.toml',
+  sourcePath: '/repo/.forja/hooks.toml',
   event: 'Eviction',
   matcher,
   entryIndex: 0,

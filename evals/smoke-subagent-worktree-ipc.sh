@@ -12,7 +12,7 @@
 #     channel relative to cwd.
 #   - bgLogDir is anchored to PARENT's cwd, NOT the worktree.
 #     The runtime computes
-#     `<parentCwd>/.agent/bg/subagents/<sessionId>/`. A bug that
+#     `<parentCwd>/.forja/bg/subagents/<sessionId>/`. A bug that
 #     anchored at the worktree would leak bg logs into the
 #     ephemeral worktree dir and lose them on cleanup.
 #   - subagent_worktrees audit row lands AND the post-run
@@ -67,8 +67,8 @@ echo "beta original" > beta.txt
 git add alpha.txt beta.txt
 git -c user.email=smoke@forja.local -c user.name=smoke commit -q -m "seed"
 
-mkdir -p .agent/agents
-cat > .agent/agents/scribe.md <<'MD'
+mkdir -p .forja/playbooks
+cat > .forja/playbooks/scribe.md <<'MD'
 ---
 name: scribe
 description: Writes a small report in an isolated worktree.
@@ -85,7 +85,7 @@ file, with the file's content). Be brief. Do not modify
 existing files.
 MD
 
-cat > .agent/permissions.yaml <<'YAML'
+cat > .forja/permissions.yaml <<'YAML'
 defaults:
   mode: bypass
 YAML

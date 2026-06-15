@@ -132,7 +132,7 @@ describe('bootstrapPermissionEngine — happy path', () => {
     // doesn't silently regress: an internal "github.com" plus the
     // default's "github.com" must remain one entry.
     const projDir = join(tmpRoot, 'proj');
-    const agentDir = join(projDir, '.agent');
+    const agentDir = join(projDir, '.forja');
     require('node:fs').mkdirSync(agentDir, { recursive: true });
     writeFileSync(
       join(agentDir, 'permissions.yaml'),
@@ -178,7 +178,7 @@ tools:
     // trustedHosts narrows untrusted_egress"); this test pins the
     // WIRE from policy yaml → engine option.
     const projDir = join(tmpRoot, 'proj');
-    const agentDir = join(projDir, '.agent');
+    const agentDir = join(projDir, '.forja');
     require('node:fs').mkdirSync(agentDir, { recursive: true });
     writeFileSync(
       join(agentDir, 'permissions.yaml'),
@@ -234,7 +234,7 @@ describe('bootstrapPermissionEngine — refusing paths', () => {
   test('malformed policy → refusing', async () => {
     // Write a project policy that violates §11 (rejected at parse).
     const projDir = join(tmpRoot, 'proj');
-    const agentDir = join(projDir, '.agent');
+    const agentDir = join(projDir, '.forja');
     require('node:fs').mkdirSync(agentDir, { recursive: true });
     writeFileSync(
       join(agentDir, 'permissions.yaml'),
@@ -384,9 +384,9 @@ describe('bootstrapPermissionEngine — policy_archive (§17 prerequisite)', () 
 
   test('refusing-state bootstrap does NOT archive (no replay-worthy decisions follow)', async () => {
     // Force a refusing bootstrap via malformed user policy.
-    const userYaml = join(tmpRoot, '.config', 'agent', 'permissions.yaml');
+    const userYaml = join(tmpRoot, '.config', 'forja', 'permissions.yaml');
     const { mkdirSync } = await import('node:fs');
-    mkdirSync(join(tmpRoot, '.config', 'agent'), { recursive: true });
+    mkdirSync(join(tmpRoot, '.config', 'forja'), { recursive: true });
     writeFileSync(userYaml, 'this is: not :: valid: :: yaml: :');
 
     const db = baseDb();

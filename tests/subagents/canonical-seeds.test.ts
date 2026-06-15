@@ -5,7 +5,7 @@ import { validateSubagentSet } from '../../src/subagents/validate.ts';
 import { registerBuiltinTools } from '../../src/tools/builtin/index.ts';
 import { createToolRegistry } from '../../src/tools/registry.ts';
 
-// First-run eval. `agent init` materializes these canonical playbooks as
+// First-run eval. `forja init` materializes these canonical playbooks as
 // subagent seeds, and bootstrap validates them via validateSubagentSet
 // against the builtin toolset. A tool-capability gate that rejects a seed
 // (e.g. the too-broad escapesCwd gate that briefly barred bash) bricks the

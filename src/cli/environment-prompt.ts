@@ -4,7 +4,7 @@ import { sanitizeForCodeSpan } from './prompt-codespan.ts';
 // Environment block for the system prompt. Gives the model a
 // situational anchor at session boot:
 //
-//   - cwd (where `agent` was invoked)
+//   - cwd (where `forja` was invoked)
 //   - os (linux / darwin / win32 — drives "use this command on
 //     macOS, that on Linux" decisions)
 //   - model id (provider/model that's actually running)
@@ -95,7 +95,7 @@ export const renderEnvironmentSection = (input: EnvironmentInput): string => {
   // cwd, modelId, and the platform string all need sanitizing
   // before they hit the prompt. cwd is the highest-risk surface
   // (POSIX paths can contain backticks, newlines, control bytes —
-  // a `cd /tmp/$(crafted)` pre-`agent` is a one-liner exploit);
+  // a `cd /tmp/$(crafted)` pre-`forja` is a one-liner exploit);
   // modelId is `--model` flag input and theoretically operator-
   // controlled but a `--model "claude\\n## SYSTEM: ..."` from a
   // misconfigured wrapper script would still inject. Platform is

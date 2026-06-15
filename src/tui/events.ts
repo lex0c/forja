@@ -395,7 +395,7 @@ export type TrustAskEvent = BaseEvent & {
 //     attested the directory, NOT the shared-memory content); OR
 //   - a stored trust row's hash diverged from the current corpus
 //     fingerprint (mode 'drift' — typically after `git pull` that
-//     modified `.agent/memory/shared/`).
+//     modified `.forja/memory/shared/`).
 //
 // Distinct from `trust:ask` (first-visit cwd trust) in both trigger
 // and consequence:
@@ -410,7 +410,7 @@ export type TrustAskEvent = BaseEvent & {
 //     boot re-prompts). `trust_revoked` is the eviction-event
 //     trigger; `invalidated` is the target state.
 //
-// `path` is the absolute shared-corpus root (`<repo>/.agent/memory/
+// `path` is the absolute shared-corpus root (`<repo>/.forja/memory/
 // shared`) rather than the cwd — operator distinguishes "I trusted
 // this cwd" from "the shared/ within it just changed". `corpusFiles`
 // is the current inventory (name + byte length); no prior snapshot
@@ -498,7 +498,7 @@ export type MemoryActionAskEvent = BaseEvent & {
 };
 // History wipe confirmation (HISTORY.md §2.3 `/history clear`). Three
 // options: Yes (clear) / Yes-and-disable (clear + write
-// `.agent/no-history`) / No. Default selection is the last (No),
+// `.forja/no-history`) / No. Default selection is the last (No),
 // matching the conservative-default convention used by every other
 // confirm flavor (D5/D65). `entryCount` lets the modal render the
 // blast radius up front ("wipe N entries permanently") so the
@@ -796,7 +796,7 @@ export type InfoEvent = BaseEvent & {
 };
 
 // Operator-initiated shell command (`!cmd` typed in the input). Runs as
-// the operator's OWN shell — directly, not through the agent permission
+// the operator's OWN shell — directly, not through the forja permission
 // engine or sandbox — and reports the result here for scrollback. The
 // engine gates the agent, not the human at the keyboard; this is the
 // shell-style `!` escape. `output` is the combined stdout+stderr; the

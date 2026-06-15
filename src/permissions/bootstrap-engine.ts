@@ -112,7 +112,7 @@ export interface BootstrapPermissionEngineInput {
   // `watchAndReload` on the discovered policy paths AND emits
   // `policy-reloaded` / `policy-reload-failed` audit rows on every
   // reload event. Default false — one-shot CLI verbs
-  // (`agent permission verify` etc.) don't pay the inotify cost.
+  // (`forja permission verify` etc.) don't pay the inotify cost.
   // The REPL bootstrap is the primary caller; it owns the returned
   // `policyWatcher` and closes it on session end.
   watchPolicy?: boolean;
@@ -204,7 +204,7 @@ export const preflightPermissionEngine = (input: PreflightInput): PreflightResul
   // bootstrap would have a `resolved` policy whose `projectPolicyPath`
   // discovery walked a lexical cwd while bootstrap's engine would
   // get the canonical form — the two paths could disagree on which
-  // `.agent/policy.toml` file applies when cwd is symlinked.
+  // `.forja/policy.toml` file applies when cwd is symlinked.
   const cwd = (() => {
     try {
       return realpathSync(input.cwd);
@@ -406,7 +406,7 @@ export const bootstrapPermissionEngine = async (
   //     → confidence='low' → confirm-on-every-tool.
   //   - engine's `resolveForProtected`: protected-path classifier
   //     compares canonical target against lexical cwd-relative
-  //     escalate dirs, silently misses `.git` / `.agent` / `.claude`
+  //     escalate dirs, silently misses `.git` / `.forja` / `.claude`
   //     when cwd is symlinked.
   // Sandbox runner already canonicalizes cwd (slice 155) at the wrap
   // boundary; this closes the engine-side gap so the two layers agree
@@ -755,7 +755,7 @@ export const bootstrapPermissionEngine = async (
         // Archive the post-reload policy bytes BEFORE emitting the
         // audit row. Without this, post-reload `policy-reloaded`
         // audit rows have no matching entry in `policy_archive`,
-        // and `agent permission replay <seq>
+        // and `forja permission replay <seq>
         // --against-archived-policy` later reports `skipped_reason:
         // 'policy hash <H> not in policy_archive'` for every
         // post-reload row.

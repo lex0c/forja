@@ -183,7 +183,7 @@ export const run = async (options: RunOptions): Promise<number> => {
 
   try {
     // List-sessions short-circuit. No provider, no policy engine, no
-    // harness — only the DB. Lets `agent --list-sessions` work
+    // harness — only the DB. Lets `forja --list-sessions` work
     // without an API key set, which is the right shape for an
     // inspection tool.
     if (args.listSessions) {
@@ -216,7 +216,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       });
     }
 
-    // `agent permission <verb>` — DB-only operator surface for the
+    // `forja permission <verb>` — DB-only operator surface for the
     // v2 permission engine. Both verbs are read-only / one-shot,
     // never start a provider or session. They read the operator's
     // session DB and the per-install install_id only.
@@ -427,8 +427,8 @@ export const run = async (options: RunOptions): Promise<number> => {
       return 1;
     }
 
-    // `agent recap [args]` headless surface (RECAP §9). Tries to
-    // bootstrap the real provider so `agent recap pr` exercises
+    // `forja recap [args]` headless surface (RECAP §9). Tries to
+    // bootstrap the real provider so `forja recap pr` exercises
     // the LLM surface when an API key is configured — bootstrap
     // throws inside the Anthropic factory when the key is absent,
     // which we catch and fall back to a stub. The stub fails the
@@ -440,7 +440,7 @@ export const run = async (options: RunOptions): Promise<number> => {
     // NDJSON envelope (recap_start / recap_intermediate /
     // recap_render / recap_end); without it, the rendered text
     // streams to stdout verbatim.
-    // `agent doctor [--json]` — §13 platform provisioning health check.
+    // `forja doctor [--json]` — §13 platform provisioning health check.
     // No provider, no DB, no harness — just probes the host and
     // emits a structured report. Exit 0 on all-pass, 1 if any check
     // fails.
@@ -453,7 +453,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       });
     }
 
-    // `agent sandbox <verb> [--json]` — §13 guided sandbox bootstrap.
+    // `forja sandbox <verb> [--json]` — §13 guided sandbox bootstrap.
     // Slice 44: setup verb. Same lifecycle-mode shape as doctor.
     if (args.sandbox !== undefined) {
       if (args.sandbox.verb === 'setup') {
@@ -470,7 +470,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       return 1;
     }
 
-    // `agent welcome` — §13.5 first-boot walkthrough (slice 45).
+    // `forja welcome` — §13.5 first-boot walkthrough (slice 45).
     // Composes doctor + sandbox setup. Same lifecycle-mode shape.
     if (args.welcome === true) {
       const { runWelcome } = await import('./welcome.ts');
@@ -504,7 +504,7 @@ export const run = async (options: RunOptions): Promise<number> => {
           ...(args.noRecap === true ? { noRecap: true } : {}),
           signal: options.signal ?? new AbortController().signal,
           // Pipe --json through so bootstrap's first-boot governance
-          // banner suppresses correctly for `agent recap --json`
+          // banner suppresses correctly for `forja recap --json`
           // consumers. Mirror of the main run path below — the recap
           // bootstrap was missing this and JSON consumers saw a one-
           // time stderr line on first boot polluting their stream.
@@ -795,7 +795,7 @@ export const run = async (options: RunOptions): Promise<number> => {
     }
 
     // Surface cross-scope subagent shadows. A user's
-    // ~/.config/agent/agents/<name>.md silently being eclipsed by
+    // ~/.config/forja/playbooks/<name>.md silently being eclipsed by
     // a project-scope file is the kind of misconfiguration that
     // wastes hours when the author doesn't see it; one warning
     // per shadow on stderr makes the precedence visible.
@@ -846,7 +846,7 @@ export const run = async (options: RunOptions): Promise<number> => {
         const layerFrag = w.layer !== null ? `${w.layer} ` : '';
         errSink(`forja: ${layerFrag}hook ${w.sourcePath}: ${w.message}\n`);
       }
-      // Memory governance config warnings (`.agent/config.toml
+      // Memory governance config warnings (`.forja/config.toml
       // [memory]`). Loader degrades to defaults (currently
       // default-ON detectors) on bad values rather than aborting
       // boot. Surface here so an operator who typoed
@@ -856,7 +856,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       for (const w of memoryConfigWarnings) {
         errSink(`forja: memory config: ${w}\n`);
       }
-      // [providers] config warnings (`.agent/config.toml
+      // [providers] config warnings (`.forja/config.toml
       // [providers]`). Operator who typos a model id gets stderr
       // visibility — without it, the bootstrap silently falls back
       // to DEFAULT_MODEL and the operator wonders why their pinned

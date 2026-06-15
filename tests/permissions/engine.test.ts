@@ -1985,7 +1985,7 @@ describe('addSessionAllow (runtime "Yes, don\'t ask again for: <rule>")', () => 
 
 describe('engine.check — protected paths (§11 integration)', () => {
   // Most tests cwd at /work/proj so we have a stable handle on
-  // `.git/`, `.agent/`, `.claude/` for cwd-relative protected dirs.
+  // `.git/`, `.forja/`, `.claude/` for cwd-relative protected dirs.
   const PROJ = '/work/proj';
   const HOME = '/home/op';
 
@@ -2089,7 +2089,7 @@ describe('engine.check — protected paths (§11 integration)', () => {
     );
   });
 
-  test('cwd-relative protected dirs (.git/, .agent/, .claude/) escalate writes', () => {
+  test('cwd-relative protected dirs (.git/, .forja/, .claude/) escalate writes', () => {
     const eng = createPermissionEngine(policy({ tools: { write_file: { allow_paths: ['**'] } } }), {
       cwd: PROJ,
       home: HOME,
@@ -2098,7 +2098,7 @@ describe('engine.check — protected paths (§11 integration)', () => {
       'confirm',
     );
     expect(
-      eng.check('write_file', 'fs.write', { path: '/work/proj/.agent/sessions.db' }).kind,
+      eng.check('write_file', 'fs.write', { path: '/work/proj/.forja/sessions.db' }).kind,
     ).toBe('confirm');
     expect(
       eng.check('write_file', 'fs.write', { path: '/work/proj/.claude/settings.json' }).kind,

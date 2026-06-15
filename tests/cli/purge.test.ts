@@ -1,18 +1,18 @@
-// `agent purge` handler tests. Pin the operator-facing contracts:
-//   - Init-marker gate: refuses purge when .agent/ has none of the
+// `forja purge` handler tests. Pin the operator-facing contracts:
+//   - Init-marker gate: refuses purge when .forja/ has none of the
 //     five canonical artifacts; accepts when any one is present.
-//   - Symlink defense: refuses when .agent/ is a symlink, never
+//   - Symlink defense: refuses when .forja/ is a symlink, never
 //     follows symlink entries beneath it.
 //   - Dry-run vs --force separation: dry-run never mutates FS or DB.
 //   - Force happy path: audit row written BEFORE FS removal, then
-//     entire .agent/ tree gone.
+//     entire .forja/ tree gone.
 //   - --no-audit escape hatch: --force succeeds even with DB
 //     unwriteable; without it, --force aborts.
 //   - JSON shape for both modes.
 //
 // We isolate XDG_CONFIG_HOME + HOME so `ensureInstallId` writes to
 // the test's temp workdir instead of the developer's real
-// ~/.config/agent/install_id.
+// ~/.config/forja/install_id.
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
@@ -76,15 +76,15 @@ const writeFile = (rel: string, content: string): void => {
   writeFileSync(abs, content);
 };
 
-// Materialize a minimally-initialized .agent/ — just permissions.yaml
+// Materialize a minimally-initialized .forja/ — just permissions.yaml
 // so the init-marker gate passes. Tests that need richer fixtures add
 // their own files on top.
 const seedMinimal = (): void => {
-  writeFile('.agent/permissions.yaml', '# scaffolded\n');
+  writeFile('.forja/permissions.yaml', '# scaffolded\n');
 };
 
 describe('runPurge — init-marker gate', () => {
-  test('refuses when .agent/ does not exist', async () => {
+  test('refuses when .forja/ does not exist', async () => {
     const code = await runPurge({
       cwd,
       force: false,
@@ -98,10 +98,10 @@ describe('runPurge — init-marker gate', () => {
     expect(errBuf.join('')).toContain('does not exist');
   });
 
-  test('refuses when .agent/ exists but has no init markers', async () => {
-    // Operator-planted .agent/ with content that doesn't match any
+  test('refuses when .forja/ exists but has no init markers', async () => {
+    // Operator-planted .forja/ with content that doesn't match any
     // of the five canonical artifacts.
-    writeFile('.agent/random.txt', 'not from init\n');
+    writeFile('.forja/random.txt', 'not from init\n');
     const code = await runPurge({
       cwd,
       force: false,
@@ -126,7 +126,7 @@ describe('runPurge — init-marker gate', () => {
   // toolchain, and naming each marker per-case keeps the test report
   // readable when one regresses.
   test('accepts when permissions.yaml is the only marker present', async () => {
-    writeFile('.agent/permissions.yaml', '# fixture\n');
+    writeFile('.forja/permissions.yaml', '# fixture\n');
     const code = await runPurge({
       cwd,
       force: false,
@@ -140,7 +140,7 @@ describe('runPurge — init-marker gate', () => {
   });
 
   test('accepts when .gitignore is the only marker present', async () => {
-    writeFile('.agent/.gitignore', '# fixture\n');
+    writeFile('.forja/.gitignore', '# fixture\n');
     const code = await runPurge({
       cwd,
       force: false,
@@ -154,7 +154,7 @@ describe('runPurge — init-marker gate', () => {
   });
 
   test('accepts when config.toml is the only marker present', async () => {
-    writeFile('.agent/config.toml', '# fixture\n');
+    writeFile('.forja/config.toml', '# fixture\n');
     const code = await runPurge({
       cwd,
       force: false,
@@ -168,7 +168,7 @@ describe('runPurge — init-marker gate', () => {
   });
 
   test('accepts when agents/ is the only marker present', async () => {
-    mkdirSync(join(cwd, '.agent', 'agents'), { recursive: true });
+    mkdirSync(join(cwd, '.forja', 'playbooks'), { recursive: true });
     const code = await runPurge({
       cwd,
       force: false,
@@ -183,11 +183,11 @@ describe('runPurge — init-marker gate', () => {
 });
 
 describe('runPurge — symlink defense', () => {
-  test('refuses when .agent/ itself is a symlink', async () => {
-    // Create a real target dir somewhere outside .agent, then symlink.
+  test('refuses when .forja/ itself is a symlink', async () => {
+    // Create a real target dir somewhere outside .forja, then symlink.
     const realTarget = mkdtempSync(join(tmpdir(), 'forja-purge-target-'));
     try {
-      symlinkSync(realTarget, join(cwd, '.agent'));
+      symlinkSync(realTarget, join(cwd, '.forja'));
       const code = await runPurge({
         cwd,
         force: false,
@@ -199,21 +199,21 @@ describe('runPurge — symlink defense', () => {
       });
       expect(code).toBe(1);
       expect(errBuf.join('')).toContain('is a symlink');
-      // The target outside .agent/ MUST remain intact.
+      // The target outside .forja/ MUST remain intact.
       expect(existsSync(realTarget)).toBe(true);
     } finally {
       rmSync(realTarget, { recursive: true, force: true });
     }
   });
 
-  test('--force unlinks symlink entries inside .agent/ without following them', async () => {
+  test('--force unlinks symlink entries inside .forja/ without following them', async () => {
     seedMinimal();
     // External target the symlink points to — must survive.
     const external = mkdtempSync(join(tmpdir(), 'forja-purge-ext-'));
     const sentinel = join(external, 'sentinel.txt');
     writeFileSync(sentinel, 'must survive\n');
     try {
-      symlinkSync(external, join(cwd, '.agent', 'leaked-link'));
+      symlinkSync(external, join(cwd, '.forja', 'leaked-link'));
       const code = await runPurge({
         cwd,
         force: true,
@@ -224,8 +224,8 @@ describe('runPurge — symlink defense', () => {
         dbPath,
       });
       expect(code).toBe(0);
-      // .agent/ is gone (with the symlink entry).
-      expect(existsSync(join(cwd, '.agent'))).toBe(false);
+      // .forja/ is gone (with the symlink entry).
+      expect(existsSync(join(cwd, '.forja'))).toBe(false);
       // External target is preserved.
       expect(existsSync(sentinel)).toBe(true);
     } finally {
@@ -237,8 +237,8 @@ describe('runPurge — symlink defense', () => {
 describe('runPurge — dry-run output', () => {
   test('does not mutate FS or DB in dry-run', async () => {
     seedMinimal();
-    writeFile('.agent/config.toml', '# config\n');
-    writeFile('.agent/memory/local/foo.md', '---\nname: foo\n---\nbody');
+    writeFile('.forja/config.toml', '# config\n');
+    writeFile('.forja/memory/local/foo.md', '---\nname: foo\n---\nbody');
     const code = await runPurge({
       cwd,
       force: false,
@@ -250,8 +250,8 @@ describe('runPurge — dry-run output', () => {
     });
     expect(code).toBe(0);
     // FS unchanged.
-    expect(existsSync(join(cwd, '.agent', 'permissions.yaml'))).toBe(true);
-    expect(existsSync(join(cwd, '.agent', 'memory', 'local', 'foo.md'))).toBe(true);
+    expect(existsSync(join(cwd, '.forja', 'permissions.yaml'))).toBe(true);
+    expect(existsSync(join(cwd, '.forja', 'memory', 'local', 'foo.md'))).toBe(true);
     // DB not even created (dry-run probes but never inserts).
     if (existsSync(dbPath)) {
       const db = openDb(dbPath);
@@ -324,7 +324,7 @@ describe('runPurge — dry-run output', () => {
 
   test('human output lists scope, categories, totals, preserved, command', async () => {
     seedMinimal();
-    writeFile('.agent/agents/foo.md', '---\nname: foo\n---\nbody');
+    writeFile('.forja/playbooks/foo.md', '---\nname: foo\n---\nbody');
     const code = await runPurge({
       cwd,
       force: false,
@@ -337,17 +337,17 @@ describe('runPurge — dry-run output', () => {
     expect(code).toBe(0);
     const stdout = outBuf.join('');
     expect(stdout).toContain('DRY RUN');
-    expect(stdout).toContain(join(cwd, '.agent'));
+    expect(stdout).toContain(join(cwd, '.forja'));
     expect(stdout).toContain('permissions.yaml');
-    expect(stdout).toContain('agents/');
+    expect(stdout).toContain('playbooks/');
     expect(stdout).toContain('Total:');
     expect(stdout).toContain('Preserved');
-    expect(stdout).toContain('agent purge --force');
+    expect(stdout).toContain('forja purge --force');
   });
 
   test('flags .gitignore as operator-owned with confirmation hint', async () => {
     seedMinimal();
-    writeFile('.agent/.gitignore', 'sessions.db\n');
+    writeFile('.forja/.gitignore', 'sessions.db\n');
     const code = await runPurge({
       cwd,
       force: false,
@@ -363,7 +363,7 @@ describe('runPurge — dry-run output', () => {
 
   test('JSON dry-run shape includes scope, categories, totals, audit, command', async () => {
     seedMinimal();
-    writeFile('.agent/config.toml', '# config\n');
+    writeFile('.forja/config.toml', '# config\n');
     const code = await runPurge({
       cwd,
       force: false,
@@ -386,18 +386,18 @@ describe('runPurge — dry-run output', () => {
       command: string;
     };
     expect(parsed.mode).toBe('dry-run');
-    expect(parsed.scope).toBe(join(cwd, '.agent'));
+    expect(parsed.scope).toBe(join(cwd, '.forja'));
     expect(parsed.categories.length).toBeGreaterThanOrEqual(2);
     expect(parsed.totals.files).toBeGreaterThanOrEqual(2);
     expect(parsed.audit.writable).toBe(true);
     expect(parsed.audit.dbPath).toBe(dbPath);
-    expect(parsed.command).toBe('agent purge --force');
+    expect(parsed.command).toBe('forja purge --force');
   });
 
-  test('handles empty .agent/ with init marker only', async () => {
+  test('handles empty .forja/ with init marker only', async () => {
     // Edge: .gitignore is the only init marker and is itself an
     // empty file. Walker reports 1 file, 0 dirs.
-    writeFile('.agent/.gitignore', '');
+    writeFile('.forja/.gitignore', '');
     const code = await runPurge({
       cwd,
       force: false,
@@ -417,13 +417,13 @@ describe('runPurge — dry-run output', () => {
 });
 
 describe('runPurge — --force happy path', () => {
-  test('removes .agent/ tree and writes audit row', async () => {
+  test('removes .forja/ tree and writes audit row', async () => {
     seedMinimal();
-    writeFile('.agent/config.toml', '# config\n');
-    writeFile('.agent/agents/a.md', 'A');
-    writeFile('.agent/agents/b.md', 'B');
-    writeFile('.agent/memory/local/m.md', 'mem');
-    writeFile('.agent/bg/log.txt', 'log');
+    writeFile('.forja/config.toml', '# config\n');
+    writeFile('.forja/playbooks/a.md', 'A');
+    writeFile('.forja/playbooks/b.md', 'B');
+    writeFile('.forja/memory/local/m.md', 'mem');
+    writeFile('.forja/bg/log.txt', 'log');
 
     const now = () => 1_700_000_000_000;
     const code = await runPurge({
@@ -438,8 +438,8 @@ describe('runPurge — --force happy path', () => {
     });
     expect(code).toBe(0);
 
-    // .agent/ tree gone entirely.
-    expect(existsSync(join(cwd, '.agent'))).toBe(false);
+    // .forja/ tree gone entirely.
+    expect(existsSync(join(cwd, '.forja'))).toBe(false);
 
     // Audit row landed with the expected counts.
     const db = openDb(dbPath);
@@ -450,7 +450,7 @@ describe('runPurge — --force happy path', () => {
     expect(rows[0]?.cwd).toBe(cwd);
     // 5 files + 1 marker = 6 entries; counts mirror the walker.
     expect(rows[0]?.files_present).toBeGreaterThanOrEqual(5);
-    expect(rows[0]?.dirs_present ?? 0).toBeGreaterThanOrEqual(3); // .agent itself + memory/local + bg + agents
+    expect(rows[0]?.dirs_present ?? 0).toBeGreaterThanOrEqual(3); // .forja itself + memory/local + bg + agents
     // artifacts_present_json round-trips as a sorted string[].
     const arr = JSON.parse(rows[0]?.artifacts_present_json ?? '[]') as string[];
     expect(arr.length).toBeGreaterThan(0);
@@ -461,7 +461,7 @@ describe('runPurge — --force happy path', () => {
 
   test('JSON force-mode output exposes auditId and removed totals', async () => {
     seedMinimal();
-    writeFile('.agent/config.toml', '# c\n');
+    writeFile('.forja/config.toml', '# c\n');
     const code = await runPurge({
       cwd,
       force: true,
@@ -496,9 +496,9 @@ describe('runPurge — --force happy path', () => {
       dbPath,
     });
     expect(code1).toBe(0);
-    expect(existsSync(join(cwd, '.agent'))).toBe(false);
+    expect(existsSync(join(cwd, '.forja'))).toBe(false);
 
-    // Operator re-runs `agent init` (simulated: just re-seed). The
+    // Operator re-runs `forja init` (simulated: just re-seed). The
     // directory recreates idempotently; a SECOND purge then works
     // exactly like the first.
     seedMinimal();
@@ -544,7 +544,7 @@ describe('runPurge — --no-audit escape hatch', () => {
     });
     expect(code).toBe(1);
     // FS NOT touched — the audit gate fired before removal.
-    expect(existsSync(join(cwd, '.agent', 'permissions.yaml'))).toBe(true);
+    expect(existsSync(join(cwd, '.forja', 'permissions.yaml'))).toBe(true);
     expect(errBuf.join('')).toContain('cannot write audit row');
   });
 
@@ -564,7 +564,7 @@ describe('runPurge — --no-audit escape hatch', () => {
     });
     expect(code).toBe(0);
     // FS removal happened despite no audit row.
-    expect(existsSync(join(cwd, '.agent'))).toBe(false);
+    expect(existsSync(join(cwd, '.forja'))).toBe(false);
     // stderr explains the bypass (uniform message — probe was
     // skipped, so we don't even know whether the DB is broken).
     expect(errBuf.join('')).toContain('audit row skipped (DB not probed)');
@@ -592,7 +592,7 @@ describe('runPurge — --no-audit escape hatch', () => {
     });
     expect(code).toBe(0);
     // FS removal happened.
-    expect(existsSync(join(cwd, '.agent'))).toBe(false);
+    expect(existsSync(join(cwd, '.forja'))).toBe(false);
     // stderr confirms opt-out — single uniform message regardless
     // of DB state (operator who passed --no-audit knows the DB
     // wasn't even queried).
@@ -652,7 +652,7 @@ describe('runPurge — --no-audit escape hatch', () => {
     });
     expect(code).toBe(0);
     // FS purge happened.
-    expect(existsSync(join(cwd, '.agent'))).toBe(false);
+    expect(existsSync(join(cwd, '.forja'))).toBe(false);
     // DB and sidecars NOT created.
     expect(existsSync(freshDb)).toBe(false);
     expect(existsSync(`${freshDb}-shm`)).toBe(false);
@@ -661,7 +661,7 @@ describe('runPurge — --no-audit escape hatch', () => {
 });
 
 describe('runPurge — repoRoot resolution', () => {
-  test('purge from <repo>/src/ targets <repo>/.agent/, not <repo>/src/.agent/', async () => {
+  test('purge from <repo>/src/ targets <repo>/.forja/, not <repo>/src/.forja/', async () => {
     // git init at cwd so resolveRepoRoot can walk back from subdir.
     // Without git, resolveRepoRoot falls back to the passed-in cwd
     // and this test wouldn't exercise the resolution at all.
@@ -688,8 +688,8 @@ describe('runPurge — repoRoot resolution', () => {
       dbPath,
     });
     expect(code).toBe(0);
-    // The .agent/ at the REPO ROOT (not at subdir) is gone.
-    expect(existsSync(join(cwd, '.agent'))).toBe(false);
+    // The .forja/ at the REPO ROOT (not at subdir) is gone.
+    expect(existsSync(join(cwd, '.forja'))).toBe(false);
     // subdir itself is intact (we didn't sweep into it).
     expect(existsSync(subdir)).toBe(true);
 
@@ -711,11 +711,11 @@ describe('runPurge — walker / removeTree parity', () => {
     // seedMinimal writes 13 bytes (`# scaffolded\n`) to
     // permissions.yaml — included in the byte total below.
     seedMinimal(); // permissions.yaml (13 bytes)
-    writeFile('.agent/config.toml', 'X'); // 1 byte
-    writeFile('.agent/agents/a.md', 'AA'); // 2 bytes
-    writeFile('.agent/memory/local/m.md', 'MMM'); // 3 bytes
+    writeFile('.forja/config.toml', 'X'); // 1 byte
+    writeFile('.forja/playbooks/a.md', 'AA'); // 2 bytes
+    writeFile('.forja/memory/local/m.md', 'MMM'); // 3 bytes
     // Expected pre-purge: 4 files, 19 bytes, 3 subdirs (agents/,
-    // memory/, memory/local/) — root .agent/ NOT in walker totals.
+    // memory/, memory/local/) — root .forja/ NOT in walker totals.
 
     // Step 1: dry-run --json to capture walk.totals.
     const code1 = await runPurge({
@@ -755,7 +755,7 @@ describe('runPurge — walker / removeTree parity', () => {
     // Parity invariants — these are the contract:
     expect(forceParsed.removed.files).toBe(dryParsed.totals.files);
     expect(forceParsed.removed.bytes).toBe(dryParsed.totals.bytes);
-    // removeTree counts the .agent/ root itself; walker does not.
+    // removeTree counts the .forja/ root itself; walker does not.
     // The +1 is the documented divergence.
     expect(forceParsed.removed.dirs).toBe(dryParsed.totals.dirs + 1);
   });
@@ -772,7 +772,7 @@ describe('drift-guard — INIT_MARKERS ↔ init.DEFAULT_STEPS', () => {
   //
   // Exception: `seeds` step writes to the USER scope
   // (`<user>/seeds/<name>.md`), not the project scope. Purge operates
-  // on `<cwd>/.agent/`, so seeds leave no project-level marker — the
+  // on `<cwd>/.forja/`, so seeds leave no project-level marker — the
   // step is intentionally absent from STEP_TO_MARKER and from
   // INIT_MARKERS. The `null` mapping documents the omission so a
   // future contributor can't accidentally read "seeds was forgotten"
@@ -786,7 +786,7 @@ describe('drift-guard — INIT_MARKERS ↔ init.DEFAULT_STEPS', () => {
     permissions: 'permissions.yaml',
     gitignore: '.gitignore',
     config: 'config.toml',
-    playbooks: 'agents',
+    playbooks: 'playbooks',
     skills: 'skills',
     seeds: null, // user-scope, no project marker — see comment above
   };
@@ -826,7 +826,7 @@ describe('verifySamePostReaddir — TOCTOU race detector', () => {
   // path is a real directory) and readdirSync (which follows
   // symlinks), an adversary can swap the directory for a symlink
   // to an external path. Without the post-readdir re-check, the
-  // walker would recurse into and delete files outside .agent/.
+  // walker would recurse into and delete files outside .forja/.
   //
   // These pins exercise the detector directly (without simulating
   // the racy scheduling, which would be flaky). We CONSTRUCT the
@@ -928,7 +928,7 @@ describe('verifySamePostReaddir — TOCTOU race detector', () => {
 describe('removeTree — TOCTOU abort throws PurgeToctouError', () => {
   // Operator-reported bug: when verifySamePostReaddir failed inside
   // walkRemove, the old code wrote stderr and `return`-ed from the
-  // current frame only. If the failure was at the ROOT (.agent/
+  // current frame only. If the failure was at the ROOT (.forja/
   // itself), removeTree returned {0,0,0} cleanly, runPurge built a
   // ForceReport with `removed={0,0,0}` and rendered SUCCESS (exit
   // 0). That silently violated --force semantics — operators saw
@@ -963,11 +963,11 @@ describe('removeTree — TOCTOU abort throws PurgeToctouError', () => {
     // Simulates the reported bug: verifier returns false on the very
     // first directory checked (the root). Old code returned {0,0,0}
     // silently; new code throws.
-    const root = join(workdir, '.agent');
+    const root = join(workdir, '.forja');
     mkdirSync(root);
     writeFileSync(join(root, 'config.toml'), 'data');
-    mkdirSync(join(root, 'agents'));
-    writeFileSync(join(root, 'agents', 'one.md'), 'x');
+    mkdirSync(join(root, 'playbooks'));
+    writeFileSync(join(root, 'playbooks', 'one.md'), 'x');
 
     const alwaysFail = () => false;
     let thrown: unknown;
@@ -984,7 +984,7 @@ describe('removeTree — TOCTOU abort throws PurgeToctouError', () => {
     // Crucial: NOTHING was removed.
     expect(existsSync(root)).toBe(true);
     expect(existsSync(join(root, 'config.toml'))).toBe(true);
-    expect(existsSync(join(root, 'agents', 'one.md'))).toBe(true);
+    expect(existsSync(join(root, 'playbooks', 'one.md'))).toBe(true);
   });
 
   test('mid-tree TOCTOU: throws at the failing subtree; offending path + parent still exist', () => {
@@ -992,7 +992,7 @@ describe('removeTree — TOCTOU abort throws PurgeToctouError', () => {
     // `sub/`. Throw bubbles up through the parent's for-loop;
     // rmdirSync on the parent never runs. Operator can identify
     // the exact path via PurgeToctouError.path.
-    const root = join(workdir, '.agent');
+    const root = join(workdir, '.forja');
     mkdirSync(root);
     const sub = join(root, 'sub');
     mkdirSync(sub);
@@ -1023,7 +1023,7 @@ describe('removeTree — TOCTOU abort throws PurgeToctouError', () => {
     // concurrent modification) and removeTree completes normally.
     // Pin so a future regression in the default-arg wiring lands
     // here rather than going unnoticed.
-    const root = join(workdir, '.agent');
+    const root = join(workdir, '.forja');
     mkdirSync(root);
     writeFileSync(join(root, 'a.txt'), 'abc'); // 3 bytes
     mkdirSync(join(root, 'sub'));
@@ -1045,7 +1045,7 @@ describe('removeTree — TOCTOU abort throws PurgeToctouError', () => {
     // DESCENDING into a child directory. By placing files
     // alongside a dir and pointing the failing verifier at the
     // dir, we get deterministic partial state.
-    const root = join(workdir, '.agent');
+    const root = join(workdir, '.forja');
     mkdirSync(root);
     // Two file entries — each contributes to `files` and `bytes`
     // BEFORE we ever try to descend into `sub/`.
@@ -1127,10 +1127,10 @@ describe('runPurge — generic mid-walk failure: audit message gated on actual w
     // Crucial: audit line MUST NOT appear under --no-audit.
     expect(stderr).not.toContain('Audit row was already written');
     expect(stderr).not.toContain('audit row was already written'); // both casings
-    // FS state: the .agent dir still exists (walker threw before
+    // FS state: the .forja dir still exists (walker threw before
     // completing). We don't assert exact contents because the throw
     // happens on the root directory check, before any unlink.
-    expect(existsSync(join(cwd, '.agent'))).toBe(true);
+    expect(existsSync(join(cwd, '.forja'))).toBe(true);
   });
 
   test('--force (audit ON) + generic walker throw: "Audit row" line WITH id', async () => {
@@ -1170,12 +1170,12 @@ describe('runPurge — generic mid-walk failure: audit message gated on actual w
 
 describe('runPurge — dry-run suggestion preserves --no-audit', () => {
   // Operator-safety bug: dry-run with --no-audit suggested a bare
-  // `agent purge --force` command. Copy-pasting in the emergency
+  // `forja purge --force` command. Copy-pasting in the emergency
   // case (DB broken — the exact reason --no-audit exists) would
   // hit the audit gate and abort, blocking the recovery workflow.
   // Fix: suggested command echoes --no-audit when set.
 
-  test('no --no-audit → "agent purge --force" (baseline)', async () => {
+  test('no --no-audit → "forja purge --force" (baseline)', async () => {
     seedMinimal();
     const code = await runPurge({
       cwd,
@@ -1188,7 +1188,7 @@ describe('runPurge — dry-run suggestion preserves --no-audit', () => {
     });
     expect(code).toBe(0);
     const parsed = JSON.parse(outBuf.join('').trim()) as { command: string };
-    expect(parsed.command).toBe('agent purge --force');
+    expect(parsed.command).toBe('forja purge --force');
   });
 
   test('--no-audit set → suggestion preserves the flag', async () => {
@@ -1204,7 +1204,7 @@ describe('runPurge — dry-run suggestion preserves --no-audit', () => {
     });
     expect(code).toBe(0);
     const parsed = JSON.parse(outBuf.join('').trim()) as { command: string };
-    expect(parsed.command).toBe('agent purge --force --no-audit');
+    expect(parsed.command).toBe('forja purge --force --no-audit');
   });
 
   test('human output echoes --no-audit suggestion', async () => {
@@ -1220,10 +1220,10 @@ describe('runPurge — dry-run suggestion preserves --no-audit', () => {
     });
     expect(code).toBe(0);
     const stdout = outBuf.join('');
-    expect(stdout).toContain('agent purge --force --no-audit');
+    expect(stdout).toContain('forja purge --force --no-audit');
     // Negative polarity: bare suggestion must NOT appear (would
     // indicate the flag was dropped — exact regression target).
-    expect(stdout).not.toMatch(/agent purge --force\n/);
+    expect(stdout).not.toMatch(/forja purge --force\n/);
   });
 
   test('--no-audit + unwritable DB → suggestion still executable', async () => {
@@ -1248,6 +1248,6 @@ describe('runPurge — dry-run suggestion preserves --no-audit', () => {
     // The suggestion includes --no-audit even when probe was
     // skipped — operator who copy-pastes this gets the correct
     // emergency-recovery command.
-    expect(parsed.command).toBe('agent purge --force --no-audit');
+    expect(parsed.command).toBe('forja purge --force --no-audit');
   });
 });

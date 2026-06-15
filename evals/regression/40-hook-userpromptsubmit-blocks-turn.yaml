@@ -3,10 +3,10 @@ prompt: |
   Use the write_file tool to create `out.txt` with content `landed`.
 setup:
   files:
-    .agent/permissions.yaml: |
+    .forja/permissions.yaml: |
       defaults:
         mode: bypass
-    .agent/hooks.toml: |
+    .forja/hooks.toml: |
       [[hooks]]
       event = "UserPromptSubmit"
       command = "exit 1"

@@ -87,7 +87,7 @@ export const loadSeedManifest = (roots: ScopeRoots): SeedManifest => {
     // before any downstream consumer (orphan-archive loop, sentinel
     // diff) calls `seedMemoryFilePath(key)` — which would throw on
     // `validateName` and abort the entire install. Without this
-    // check, a corrupt manifest blocks `agent init --only=seeds`
+    // check, a corrupt manifest blocks `forja init --only=seeds`
     // even though the loader's contract is "malformed rows are
     // recoverable". Self-heal works because the installer rewrites
     // the manifest at the end of the pass; the invalid key is

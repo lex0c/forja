@@ -18,7 +18,7 @@
 # opt-in gate that may run on many PRs. Operators wanting higher
 # fidelity can override via `workflow_dispatch` input — opus is the
 # closest match to the local interactive default pinned in
-# `.agent/config.toml`.
+# `.forja/config.toml`.
 #
 # The runner's own exit code is the gate: `src/evals/cli.ts`
 # returns 1 when any case fails, 0 when all pass — GitHub surfaces

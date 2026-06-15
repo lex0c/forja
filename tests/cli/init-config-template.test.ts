@@ -24,7 +24,7 @@ describe('renderInitConfigTemplate', () => {
     // Guard against typos / unbalanced brackets in the rendered
     // file. The renderer interpolates values directly into a
     // template string; a future bug that produces malformed TOML
-    // surfaces here before the operator's `agent` boot hits the
+    // surfaces here before the operator's `forja` boot hits the
     // loader's parse error.
     expect(() => Bun.TOML.parse(renderInitConfigTemplate(defaults()))).not.toThrow();
   });

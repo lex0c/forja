@@ -174,7 +174,7 @@ export interface RunReplOptions {
   skipResumeModePrompt?: boolean;
   // Test seam: override the trust list file path. Without this,
   // the trust-prompt tests would persist across runs in the dev
-  // machine's real `~/.config/agent/trusted_dirs.json` and
+  // machine's real `~/.config/forja/trusted_dirs.json` and
   // interfere with each other (run 1 trusts /tmp/forja-repl-test,
   // run 2 finds it already trusted, modal never fires). Tests
   // point this at a temp file unique to the test. Production
@@ -621,7 +621,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // agree on which file is authoritative. Without this,
         // a test that pins `trustListPathOverride` for the boot
         // modal would still see bootstrap fall through to the
-        // dev's real `~/.config/agent/trusted_dirs.json` —
+        // dev's real `~/.config/forja/trusted_dirs.json` —
         // bootstrap's `isCwdTrusted` would be wrong, and the
         // memory_write trust gate would surprise the test author.
         // `undefined` (production default) lets bootstrap use its
@@ -827,7 +827,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     const layerFrag = w.layer !== null ? `${w.layer} ` : '';
     errSink(`forja: ${layerFrag}hook ${w.sourcePath}: ${w.message}\n`);
   }
-  // Memory governance config warnings (`.agent/config.toml [memory]`).
+  // Memory governance config warnings (`.forja/config.toml [memory]`).
   // Same surfacing as run.ts: loader degrades to defaults on bad
   // values, so the operator needs stderr visibility to spot a
   // silent opt-out failure (e.g., typed `verify_semantic_llm =
@@ -835,7 +835,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   for (const w of memoryConfigWarnings) {
     errSink(`forja: memory config: ${w}\n`);
   }
-  // [providers] config warnings (`.agent/config.toml [providers]`) —
+  // [providers] config warnings (`.forja/config.toml [providers]`) —
   // same surfacing as run.ts: a bad model alias / route silently falls
   // back to the default, so stderr visibility lets the operator catch
   // it instead of running on a model they didn't intend.
@@ -895,11 +895,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       // machine forbids invalidated → active. Surface the manual
       // path here AND echo the 7-day auto-eviction window so the
       // operator knows their bodies aren't permanently gone yet
-      // (they're still in .agent/memory/shared/ on disk until
+      // (they're still in .forja/memory/shared/ on disk until
       // gcStaleInvalidatedMemories progresses them to .tombstones/).
       if (invCount > 0) {
         errSink('forja:   recovery: edit the `.md` frontmatter to drop `state: invalidated`,\n');
-        errSink('            then re-add the entry to .agent/memory/shared/MEMORY.md.\n');
+        errSink('            then re-add the entry to .forja/memory/shared/MEMORY.md.\n');
         errSink('            Or accept the revoke — invalidated memories auto-evict to\n');
         errSink('            .tombstones/ after 7 days (EVICTION.md §7.1).\n');
       }
@@ -909,7 +909,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       // TOCTOU swap during deliberation both arrive here, but the
       // cause changes what they should do next: 'modal_cancel'
       // means "answer the modal next boot", 'tocttou_during_prompt'
-      // means "something is writing to .agent/memory/shared/ on
+      // means "something is writing to .forja/memory/shared/ on
       // your behalf, investigate before re-confirming".
       const reason =
         p.cause === 'modal_cancel'
@@ -1219,7 +1219,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   let historyScratch: string | null = null;
   // Seed `historyEnabled` from the storage-level opt-out so the
   // REPL flag agrees with what storage will actually accept. With
-  // `FORJA_NO_HISTORY=1` or `.agent/no-history` set, `appendHistory`
+  // `FORJA_NO_HISTORY=1` or `.forja/no-history` set, `appendHistory`
   // already no-ops; without this seed the flag would say "on" while
   // every submit silently dropped, leaving the in-memory mirror
   // and the table out of sync. `/history on` re-checks this on
@@ -1725,7 +1725,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     );
 
   // Operator `!cmd` execution. Runs as the operator's own shell — NOT
-  // through the agent permission engine or sandbox (the engine gates the
+  // through the forja permission engine or sandbox (the engine gates the
   // agent, not the human at the keyboard; this is the shell-style `!`
   // escape). `bash -c` in the REPL cwd with the operator's full env. A
   // generous timeout is the guard, so a hung command can't wedge the
@@ -2277,7 +2277,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         await bgManagerHolder.manager.cleanup();
       } catch {
         // Swallow — exit must not hang on a stubborn child; the audit
-        // row stays 'running' and `agent doctor` can surface it.
+        // row stays 'running' and `forja doctor` can surface it.
       }
     }
     // Session-scoped reminders (ORCHESTRATION.md §3B.9): clear every
@@ -2552,7 +2552,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // mirror with storage, otherwise ↑/↓ and Ctrl+R stay empty
         // until process restart. Two scenarios this fixes:
         //
-        //   1. Boot with `.agent/no-history` marker present →
+        //   1. Boot with `.forja/no-history` marker present →
         //      `loadHistory` no-opped, mirror seeded as []. Operator
         //      removes the marker (or it was created by some other
         //      REPL post-boot), runs /history on. Without the
@@ -2582,7 +2582,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       // Re-probe each call: a `yes-disable` from /history clear
       // writes the file marker mid-session, which should immediately
       // be visible to `/history on` even though the env never
-      // changes. Cheap (single existsSync against `.agent/no-history`).
+      // changes. Cheap (single existsSync against `.forja/no-history`).
       optOutReason: () => historyOptOutReason(baseConfig.cwd),
     },
     // Playbook dispatcher (`PLAYBOOKS.md` §1.4). Slash commands
@@ -3691,7 +3691,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // cwd was already trusted.
 
   // §13.7 sandbox-enforcement banner. Surfaces "is bash being
-  // wrapped?" to operators who never run `agent doctor`. Four
+  // wrapped?" to operators who never run `forja doctor`. Four
   // states from the bootstrap snapshot (see
   // SandboxEnforcementSnapshot in bootstrap.ts):
   //
@@ -3767,7 +3767,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       type: 'error',
       ts: now(),
       message:
-        "no permission policy found — strict default-deny is active. Create '.agent/permissions.yaml' or run /perms to inspect.",
+        "no permission policy found — strict default-deny is active. Create '.forja/permissions.yaml' or run /perms to inspect.",
     });
   }
 

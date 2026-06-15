@@ -12,7 +12,7 @@ import {
 } from '../../src/permissions/index.ts';
 import { MIGRATIONS, migrate, openDb } from '../../src/storage/index.ts';
 
-describe('parseArgs — agent permission seal-now', () => {
+describe('parseArgs — forja permission seal-now', () => {
   test('verb is recognized', () => {
     const r = parseArgs(['permission', 'seal-now']);
     expect(r.ok).toBe(true);

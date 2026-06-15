@@ -45,7 +45,7 @@ Issues affecting the security model documented in [`docs/SECURITY.md`](docs/SECU
 
 - **Permission engine bypass** — making the engine return `allow` when policy + rules + score should refuse, or making it return `deny`/`confirm` skip a step that should fire.
 - **Sandbox escape** — reading or writing outside the profile's declared scope, bypassing `HIDE_PATHS`, escaping the PID/network namespace.
-- **Audit chain forgery** — rewriting `approvals_log` rows undetected by `agent permission verify`, or forging seal store entries that pass `seal-verify`.
+- **Audit chain forgery** — rewriting `approvals_log` rows undetected by `forja permission verify`, or forging seal store entries that pass `seal-verify`.
 - **Credential exfiltration** — paths that leak env vars / file contents from masked directories despite `scrubEnv` + `HIDE_PATHS`.
 - **Cross-session pollution** — failure events or outcome signals attributed to the wrong session, or audit rows from session A planted on session B.
 - **MCP tool injection** — malicious MCP server inducing engine to authorize calls outside its declared capabilities.

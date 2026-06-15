@@ -62,12 +62,12 @@ const main = async (): Promise<number> => {
     const { isFirstBoot } = await import('../permissions/install_id.ts');
     if (isFirstBoot()) {
       process.stderr.write(
-        'forja: first run detected — try `agent welcome` for a setup walkthrough.\n',
+        'forja: first run detected — try `forja welcome` for a setup walkthrough.\n',
       );
     }
   }
 
-  // `agent init` — scaffold the .agent/ bootstrap bundle
+  // `forja init` — scaffold the .forja/ bootstrap bundle
   // (permissions.yaml, .gitignore, config.toml, agents/*.md).
   // Pure filesystem work, no provider/DB needed; same lazy-import
   // posture as the other handlers below so a broken provider dep
@@ -89,7 +89,7 @@ const main = async (): Promise<number> => {
     return runInit(initOptions);
   }
 
-  // `agent purge [--force] [--json] [--no-audit]` — §2.1.2
+  // `forja purge [--force] [--json] [--no-audit]` — §2.1.2
   // project-scope FS reset. Pure-FS in the dry-run path; the
   // force path also writes one append-only audit row to the
   // global DB. Lazy import: pulling `./purge.ts` brings in
@@ -109,7 +109,7 @@ const main = async (): Promise<number> => {
     });
   }
 
-  // `agent gc [--force] [--json] [--table=X]` — §2.1.3 retention
+  // `forja gc [--force] [--json] [--table=X]` — §2.1.3 retention
   // sweep age-based on the global DB. Phase 1 covers 4 tables.
   // Lazy-import shape mirrors purge: keeps help/version/etc.
   // immune to storage / audit-config dependency failures.
@@ -125,7 +125,7 @@ const main = async (): Promise<number> => {
     });
   }
 
-  // `agent cache clear [--force] [--json]` — reclaim the persistent sandbox
+  // `forja cache clear [--force] [--json]` — reclaim the persistent sandbox
   // cache (~/.cache/forja). Lifecycle mode: no prompt/provider/REPL. Pure FS
   // (size walk + rm); lazy import keeps the help/version branches immune to
   // its deps.
@@ -207,37 +207,37 @@ const main = async (): Promise<number> => {
     args.worktrees !== undefined ||
     args.memory !== undefined ||
     args.explainPermissions ||
-    // `agent recap [args]` is the headless surface for the recap
+    // `forja recap [args]` is the headless surface for the recap
     // slash (RECAP §9). It carries its own positional verbs in
     // `args.recap.args` and never expects a free-text prompt — the
     // empty-prompt check below would otherwise route it into the
     // REPL TTY gate or the `--json requires a prompt` rejection.
     args.recap !== undefined ||
-    // `agent doctor` (§13 slice 43) is the headless platform-health
+    // `forja doctor` (§13 slice 43) is the headless platform-health
     // surface. No prompt, no provider, no REPL — same exemption as
     // the other lifecycle modes above.
     args.doctor !== undefined ||
-    // `agent sandbox setup` (§13 slice 44) — same lifecycle-mode
+    // `forja sandbox setup` (§13 slice 44) — same lifecycle-mode
     // exemption as doctor. Pure informational verb.
     args.sandbox !== undefined ||
-    // `agent welcome` (§13.5 slice 45) — first-boot walkthrough.
+    // `forja welcome` (§13.5 slice 45) — first-boot walkthrough.
     // Composes doctor + sandbox setup; same lifecycle-mode shape.
     args.welcome === true ||
-    // `agent permission <verb>` (PERMISSION_ENGINE.md operator
+    // `forja permission <verb>` (PERMISSION_ENGINE.md operator
     // surface) — every verb is DB-only and one-shot; no prompt,
     // no provider, no REPL. Pre-fixup the empty-prompt branch
     // hit before the run.ts dispatcher could route the verb, so
-    // `agent permission verify --json` produced "--json requires
+    // `forja permission verify --json` produced "--json requires
     // a prompt" instead of the chain integrity report.
     args.permission !== undefined ||
-    // `agent purge` (§2.1.2) — operator-fired FS reset. Lifecycle
+    // `forja purge` (§2.1.2) — operator-fired FS reset. Lifecycle
     // mode: no prompt, no provider, no REPL. Same exemption shape
     // as init/doctor/sandbox/permission.
     args.purge !== undefined ||
-    // `agent gc` (§2.1.3) — retention sweep. Lifecycle mode; no
+    // `forja gc` (§2.1.3) — retention sweep. Lifecycle mode; no
     // prompt, no provider, no REPL.
     args.gc !== undefined ||
-    // `agent cache clear` — reclaim the persistent sandbox cache.
+    // `forja cache clear` — reclaim the persistent sandbox cache.
     // Lifecycle mode; no prompt/provider/REPL.
     args.cache !== undefined;
   if (args.prompt.length === 0 && !promptOptional) {

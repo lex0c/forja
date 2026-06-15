@@ -703,7 +703,6 @@ describe('buildSbplProfile — XDG_CONFIG_HOME unmask defense (slice 146)', () =
       expect(profile).toContain('(deny file-read* (subpath "/srv/conf/azure"))');
       expect(profile).toContain('(deny file-read* (subpath "/srv/conf/op"))');
       expect(profile).toContain('(deny file-read* (subpath "/srv/conf/sops"))');
-      expect(profile).toContain('(deny file-read* (subpath "/srv/conf/agent"))');
       expect(profile).toContain('(deny file-read* (subpath "/srv/conf/forja"))');
       // FILES under .config/* (NuGet/Composer auth) must ALSO get a
       // relocated literal deny, not only the home-relative one (#2 review fix).

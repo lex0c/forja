@@ -5,7 +5,7 @@
 // dispatchOne propagates, and operators with `failClosed: true`
 // hooks get every blocking event treated as "shell unavailable
 // → block". Since paths.ts already resolves
-// %PROGRAMDATA%\agent\hooks.toml on Windows, this layer must
+// %PROGRAMDATA%\forja\hooks.toml on Windows, this layer must
 // match: hooks need to dispatch on the same hosts where their
 // config gets loaded.
 //

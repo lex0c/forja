@@ -1,7 +1,7 @@
 // Bundled canonical skills (`SKILLS.md` §6 — seed catalog). The 9
 // .md files in this directory are imported as text assets and
-// exposed as a stable array. The skills step of `agent init` writes
-// each entry into `<cwd>/.agent/skills/shared/`, where the catalog
+// exposed as a stable array. The skills step of `forja init` writes
+// each entry into `<cwd>/.forja/skills/shared/`, where the catalog
 // scan picks them up at the next REPL boot.
 //
 // Bun's `with { type: 'text' }` import attribute embeds the file
@@ -29,7 +29,7 @@ import triageFlakyTestMd from './triage-flaky-test.md' with { type: 'text' };
 
 export interface CanonicalSkill {
   // Filename at the destination
-  // (`<cwd>/.agent/skills/shared/<filename>`). Kept as `.md` so the
+  // (`<cwd>/.forja/skills/shared/<filename>`). Kept as `.md` so the
   // catalog's directory scan picks the file up alongside any
   // operator-authored skills.
   filename: string;

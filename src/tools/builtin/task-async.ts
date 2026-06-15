@@ -94,7 +94,7 @@ export const taskAsyncTool: Tool<TaskAsyncInput, TaskAsyncOutput> = {
         'subagent.unavailable',
         'subagents are not available in this run (no registry wired)',
         {
-          hint: 'The harness was built without subagentRegistry. Define agents under ~/.config/agent/agents/ or <cwd>/.agent/agents/ and bootstrap will pick them up.',
+          hint: 'The harness was built without subagentRegistry. Define agents under ~/.config/forja/playbooks/ or <cwd>/.forja/playbooks/ and bootstrap will pick them up.',
         },
       );
     }
@@ -203,7 +203,7 @@ export const taskAsyncTool: Tool<TaskAsyncInput, TaskAsyncOutput> = {
         hint:
           available.length > 0
             ? `Known subagents: ${available.join(', ')}.`
-            : 'No subagents are defined. Add a .md file under ~/.config/agent/agents/ or <cwd>/.agent/agents/.',
+            : 'No subagents are defined. Add a .md file under ~/.config/forja/playbooks/ or <cwd>/.forja/playbooks/.',
         details: { available },
       });
     }

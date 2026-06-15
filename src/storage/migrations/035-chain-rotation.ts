@@ -1,6 +1,6 @@
 // approvals_log_archived + chain_meta — PERMISSION_ENGINE.md §7.2
 // "Quebra de chain → --rotate-chain". When the operator invokes
-// `agent permission rotate-chain`, the current `approvals_log` rows
+// `forja permission rotate-chain`, the current `approvals_log` rows
 // for the active install_id are atomically moved to
 // `approvals_log_archived` with a rotation_id segment marker, and a
 // `chain_meta` row records the forensics (motive, pre-rotation tip,
@@ -15,7 +15,7 @@
 //      ever rotate?". A fresh install has no rows here; the first
 //      rotation inserts rotation_id=1; subsequent rotations
 //      auto-increment. The latest row's `quarantined` flag surfaces
-//      in `agent permission verify` output until an explicit clear.
+//      in `forja permission verify` output until an explicit clear.
 //   3. The `quarantined` flag does NOT degrade the engine — spec
 //      §7.2 calls it a "quarantine flag em queries até inspeção",
 //      i.e. forensic-only. Engine operation continues normally

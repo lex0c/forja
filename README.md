@@ -44,21 +44,21 @@ on the roadmap.
 ```bash
 git clone <repo-url> forja && cd forja
 bun install
-bun run build              # produces dist/agent-linux-x64
-ln -s "$PWD/dist/agent-linux-x64" ~/.local/bin/agent
+bun run build              # produces dist/forja-linux-x64
+ln -s "$PWD/dist/forja-linux-x64" ~/.local/bin/agent
 ```
 
 Verify the install:
 
 ```bash
-agent --version
-agent doctor               # platform, sandbox tools, config + data dirs, git
+forja --version
+forja doctor               # platform, sandbox tools, config + data dirs, git
 ```
 
 For a guided first-boot walkthrough (doctor + sandbox setup + next steps):
 
 ```bash
-agent welcome
+forja welcome
 ```
 
 ---
@@ -81,20 +81,20 @@ agent
 ```
 
 The first time Forja sees a directory, it asks you to attest the trust
-boundary — once accepted, your `.agent/` bootstrap (`permissions.yaml`,
+boundary — once accepted, your `.forja/` bootstrap (`permissions.yaml`,
 playbooks, skills, project-local memory) is loaded.
 
 Or run a one-shot prompt:
 
 ```bash
 agent "summarize the README"
-agent --model openai/gpt-4o "list the public functions in src/api/"
+forja --model openai/gpt-4o "list the public functions in src/api/"
 ```
 
 Run it as a headless tool (emits NDJSON events to stdout):
 
 ```bash
-agent --json "what changed in the last commit?" > events.ndjson
+forja --json "what changed in the last commit?" > events.ndjson
 ```
 
 ---
@@ -104,15 +104,15 @@ agent --json "what changed in the last commit?" > events.ndjson
 | Subsystem | What it does | Surfaces |
 |---|---|---|
 | **Harness loop** | The agent runtime: step budget, max-cost cap, compaction at 70% context, retries with classified failure modes | `agent <prompt>` |
-| **Permissions** | Layered allow/deny policy with glob + prefix matching (no regex). Sandbox profiles per tool category. Per-session approval posture (supervised / autonomous) | `agent --explain-permissions`, `--autonomous`, Shift+Tab, `.agent/permissions.yaml` |
-| **Memory** | Cross-session knowledge with three scopes (user / project_shared / project_local), explicit trust, lifecycle states (active / quarantined / invalidated), provenance tracking | `agent --memory list`, `agent --memory show <name>`, `/memory` slash |
+| **Permissions** | Layered allow/deny policy with glob + prefix matching (no regex). Sandbox profiles per tool category. Per-session approval posture (supervised / autonomous) | `forja --explain-permissions`, `--autonomous`, Shift+Tab, `.forja/permissions.yaml` |
+| **Memory** | Cross-session knowledge with three scopes (user / project_shared / project_local), explicit trust, lifecycle states (active / quarantined / invalidated), provenance tracking | `forja --memory list`, `forja --memory show <name>`, `/memory` slash |
 | **Skills** | Eager-loaded catalog of operator-authored procedures, body lazy | Skills auto-surface in system prompt; `/skill` slash |
 | **Subagents** | Worktree-isolated child runs (`task`), async handles (`task_async`), parallel dispatch with caps | `agents/*.md` playbooks |
-| **Checkpoints** | Auto-snapshot of the working tree before any write tool. `--undo` restores | `agent --undo <session>`, `agent --checkpoints list <session>` |
+| **Checkpoints** | Auto-snapshot of the working tree before any write tool. `--undo` restores | `forja --undo <session>`, `forja --checkpoints list <session>` |
 | **Audit** | Append-only event log across messages, tool calls, approvals, hooks, failures, memory events, checkpoints. Optional hash chain (tamper-evident) | `audit_timeline` view, `.local/share/forja/audit.db` |
-| **Hooks** | Operator-provided shell hooks at lifecycle events (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, etc.) with `additionalContext` injection | `.agent/hooks/` |
+| **Hooks** | Operator-provided shell hooks at lifecycle events (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, etc.) with `additionalContext` injection | `.forja/hooks/` |
 | **Recap** | Session-end terse summary; structured PR / Slack / mini formats via the recap pipeline | `/recap`, session-end output |
-| **Resume** | Continue a prior session by id (or `last`) — replays scrollback and rebuilds context with auto-rehydrate | `agent --resume <id> "follow-up prompt"` |
+| **Resume** | Continue a prior session by id (or `last`) — replays scrollback and rebuilds context with auto-rehydrate | `forja --resume <id> "follow-up prompt"` |
 | **Token efficiency** | Cache breakpoints split across stable / memory segments; per-tool output summarization (bash / grep / glob) | `[forja:output_summarized ...]` markers |
 
 ---
@@ -135,7 +135,7 @@ session lifecycle, tool calls, assistant messages, usage, failures). Stderr
 carries logs. Consumable by external tooling:
 
 ```bash
-agent --json "lint the src/ tree" | jq 'select(.type=="tool:end")'
+forja --json "lint the src/ tree" | jq 'select(.type=="tool:end")'
 ```
 
 ---
@@ -163,8 +163,8 @@ Two independent knobs control how a run thinks. Both can be set at boot
 
 Which provider/model answers. Resolution order (first wins):
 
-1. `--model <id>` flag — `agent --model openai/gpt-4o "..."`
-2. Project config — `.agent/config.toml` → `[providers].model`
+1. `--model <id>` flag — `forja --model openai/gpt-4o "..."`
+2. Project config — `.forja/config.toml` → `[providers].model`
 3. User config — `~/.config/forja/config.toml` → `[providers].model`
 4. Built-in default — `anthropic/claude-opus-4-8`
 
@@ -173,7 +173,7 @@ window, max output); `/model <id>` switches it from the next turn. The swap is
 session-scoped and in memory — it is not written to config or the session row.
 
 ```toml
-# .agent/config.toml
+# .forja/config.toml
 [providers]
 model = "anthropic/claude-opus-4-8"
 ```
@@ -186,7 +186,7 @@ errors). Levels: `low | medium | high | max` (default `high`).
 
 Resolution order (first wins):
 
-1. Project config — `.agent/config.toml` → `[effort].level`
+1. Project config — `.forja/config.toml` → `[effort].level`
 2. User config — `~/.config/forja/config.toml` → `[effort].level`
 3. Built-in default — `high`
 
@@ -196,7 +196,7 @@ not persisted). Subagents inherit the operator's level. An explicit `/budget`
 override always wins over the level's preset caps.
 
 ```toml
-# .agent/config.toml
+# .forja/config.toml
 [effort]
 level = "high"
 ```
@@ -209,17 +209,17 @@ Forja layers configuration from three sources, each optional:
 
 - **Enterprise** — system-wide (`/etc/forja/permissions.yaml`)
 - **User** — `~/.config/forja/`
-- **Project** — `.agent/` in the repo root (created by `agent init`)
+- **Project** — `.forja/` in the repo root (created by `forja init`)
 
-`agent --explain-permissions` shows the resolved policy with per-section
+`forja --explain-permissions` shows the resolved policy with per-section
 attribution to its originating layer.
 
 Bootstrap a new project:
 
 ```bash
 cd ~/projects/my-repo
-agent init                  # creates .agent/permissions.yaml + playbooks + skills
-agent init --mode strict    # locked-down default (no auto-allow on bash)
+forja init                  # creates .forja/permissions.yaml + playbooks + skills
+forja init --mode strict    # locked-down default (no auto-allow on bash)
 ```
 
 ---
@@ -230,7 +230,7 @@ agent init --mode strict    # locked-down default (no auto-allow on bash)
   attest the directory. Untrusted directories don't load project
   configuration.
 - **Sandbox.** On Linux, Forja runs bash inside `bwrap` with `hide_paths`
-  for sensitive directories (`~/.ssh`, `~/.config/agent`, the audit DB).
+  for sensitive directories (`~/.ssh`, `~/.config/forja`, the audit DB).
   On macOS, the same defense via `sandbox-exec` SBPL.
 - **Permission engine.** Tool calls pass through a layered policy with
   decision attribution. By default, confirms route through an interactive

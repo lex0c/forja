@@ -170,7 +170,7 @@ describe('cli entrypoint: prompt requirement', () => {
 
   test('`recap` subcommand does NOT require a prompt (--json + headless)', async () => {
     // Regression: the entry's `promptOptional` list omitted
-    // `args.recap`, so `agent recap session <id> --json` was
+    // `args.recap`, so `forja recap session <id> --json` was
     // rejected with "--json requires a prompt (REPL mode is TTY
     // only)" before reaching `runRecapHeadless`. Same shape as
     // the --list-sessions / --undo regressions above. End-to-end
@@ -209,11 +209,11 @@ describe('cli entrypoint: prompt requirement', () => {
     expect(stderr).toContain('/recap:');
   });
 
-  // Slice 138 regression net for `agent permission <verb>`. The
+  // Slice 138 regression net for `forja permission <verb>`. The
   // entry's `promptOptional` list MUST include `args.permission`
   // — every permission verb is DB-only with no prompt. Pre-slice
   // 138 the gate fired BEFORE the dispatcher in run.ts could
-  // route the verb, so e.g. `agent permission verify --json`
+  // route the verb, so e.g. `forja permission verify --json`
   // produced "--json requires a prompt" instead of the chain
   // integrity report.
   //
@@ -239,7 +239,7 @@ describe('cli entrypoint: prompt requirement', () => {
 
   test('`recap` warns and falls back to stub when provider bootstrap fails', async () => {
     // Regression: pre-fix the dispatcher hardcoded a stub provider
-    // (`constrained: false`), so `agent recap pr` could never
+    // (`constrained: false`), so `forja recap pr` could never
     // exercise the LLM render path even with API keys configured.
     // Post-fix: try `bootstrap()` for the real provider; on failure
     // (e.g., missing ANTHROPIC_API_KEY) emit a one-line warn AND
@@ -311,7 +311,7 @@ describe('cli entrypoint: prompt requirement', () => {
     }
   });
 
-  test('`recap` hard-fails on a malformed .agent/permissions.yaml (config error, not auth)', async () => {
+  test('`recap` hard-fails on a malformed .forja/permissions.yaml (config error, not auth)', async () => {
     // Regression: pre-fix the catch block was a catch-all — every
     // bootstrap failure that wasn't "unknown model" degraded to
     // the stub, including malformed policy YAML, broken hook
@@ -322,12 +322,12 @@ describe('cli entrypoint: prompt requirement', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'forja-cli-'));
     const spawnCwd = mkdtempSync(join(tmpdir(), 'forja-bad-policy-'));
     try {
-      // Seed a malformed permissions.yaml inside .agent/. Bootstrap
+      // Seed a malformed permissions.yaml inside .forja/. Bootstrap
       // reads it during policy resolution and throws a YAML parse
       // error — that's exactly the "real config bug" shape the
       // fallback was wrongly hiding.
-      mkdirSync(join(spawnCwd, '.agent'), { recursive: true });
-      writeFileSync(join(spawnCwd, '.agent', 'permissions.yaml'), 'this: is: not: valid: yaml\n');
+      mkdirSync(join(spawnCwd, '.forja'), { recursive: true });
+      writeFileSync(join(spawnCwd, '.forja', 'permissions.yaml'), 'this: is: not: valid: yaml\n');
       // Inject a fake API key so bootstrap clears the provider
       // auth gate (which fires before YAML parsing) — without
       // this, environments without ANTHROPIC_API_KEY in process.env
@@ -364,7 +364,7 @@ describe('cli entrypoint: prompt requirement', () => {
 });
 
 // Slice 135 P0-14: pin the first-boot nudge (slice 46 §13.5).
-// The line "forja: first run detected — try `agent welcome`..."
+// The line "forja: first run detected — try `forja welcome`..."
 // fires when install_id doesn't exist, EXCEPT on setup verbs
 // (welcome/doctor/sandbox). The once-only contract is the whole
 // UX promise — a regression that flips the condition silently
@@ -372,7 +372,7 @@ describe('cli entrypoint: prompt requirement', () => {
 // this test the CI passes either way.
 describe('first-boot nudge (slice 46 §13.5)', () => {
   // Isolated install dir via XDG_CONFIG_HOME so the test never
-  // touches the developer's ~/.config/agent/install_id.
+  // touches the developer's ~/.config/forja/install_id.
   const runWithIsolatedConfig = async (
     args: string[],
     options: { preinstalledIdentity?: boolean } = {},
@@ -382,9 +382,9 @@ describe('first-boot nudge (slice 46 §13.5)', () => {
     try {
       if (options.preinstalledIdentity === true) {
         // Pre-plant install_id so isFirstBoot returns false.
-        mkdirSync(join(configDir, 'agent'), { recursive: true, mode: 0o700 });
+        mkdirSync(join(configDir, 'forja'), { recursive: true, mode: 0o700 });
         writeFileSync(
-          join(configDir, 'agent', 'install_id'),
+          join(configDir, 'forja', 'install_id'),
           JSON.stringify({ install_id: 'pre-existing', created_at_ms: 1 }),
           { mode: 0o600 },
         );
@@ -416,7 +416,7 @@ describe('first-boot nudge (slice 46 §13.5)', () => {
   test('missing identity + normal verb (--list-sessions) → nudge on stderr', async () => {
     const r = await runWithIsolatedConfig(['--list-sessions']);
     expect(r.stderr).toContain('first run detected');
-    expect(r.stderr).toContain('agent welcome');
+    expect(r.stderr).toContain('forja welcome');
   });
 
   test('present identity → no nudge', async () => {

@@ -135,7 +135,7 @@ export interface SubagentChildOptions {
   //
   // Test seams for subagent discovery — same shape as bootstrap.
   // `null` disables the layer entirely (useful for tests that
-  // shouldn't touch the host's ~/.config/agent or repo .agent
+  // shouldn't touch the host's ~/.config/forja or repo .forja
   // directories).
   userAgentsDir?: string | null;
   projectAgentsDir?: string | null;
@@ -164,7 +164,7 @@ export interface SubagentChildOptions {
   providerEffort?: ProviderEffort;
   // Trust verdict carried across via `--subagent-cwd-trusted`
   // (presence-only). The parent resolved trust at bootstrap
-  // against `~/.config/agent/trust.json`; the child can't
+  // against `~/.config/forja/trust.json`; the child can't
   // re-resolve correctly because (a) worktree-isolated
   // subagents have a cache-dir cwd that's never on the trust
   // list, and (b) re-reading mid-run could observe a different
@@ -190,7 +190,7 @@ export interface SubagentChildOptions {
   // into the bg manager so `bash_background` / `bash_output` /
   // `bash_kill` / process-aware `wait_for` and `monitor` work
   // for subagent runs. The directory is namespaced under the
-  // PARENT's `.agent/bg/<sessionId>/` (computed by the parent's
+  // PARENT's `.forja/bg/<sessionId>/` (computed by the parent's
   // runSubagent), so concurrent children don't collide and the
   // operator's `bg list` view from the project root continues
   // to show only the parent's processes — a child's processes
@@ -561,9 +561,9 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     //
     // Anchor at the REPO ROOT, exactly like the parent: bootstrap.ts
     // resolves `projectConfigCwd = resolveRepoRoot(cwd)` BEFORE loading
-    // `.agent/config.toml`. `session.cwd` may be a repo subdirectory (an
+    // `.forja/config.toml`. `session.cwd` may be a repo subdirectory (an
     // isolation:none child launched from a subdir), so loading config
-    // from it raw would miss a repo-root `.agent/config.toml` and
+    // from it raw would miss a repo-root `.forja/config.toml` and
     // silently fall back to defaults. Anchor via `memoryCwd` (the
     // parent's invocation cwd, when forwarded) else `session.cwd`, then
     // walk to the repo root — same shape as the hook re-resolution below.
@@ -689,7 +689,7 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     // Build the permission engine from the SNAPSHOT the parent
     // persisted on subagent_runs (migration 015). We deliberately
     // do NOT call `resolvePolicy(...)` here — re-resolving the
-    // .agent/permissions.yaml + enterprise + user layers would
+    // .forja/permissions.yaml + enterprise + user layers would
     // open a drift window: a human edit between parent spawn
     // and child startup could run the child under different
     // rules than the parent had validated. The snapshot

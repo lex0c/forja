@@ -1,4 +1,4 @@
-// End-to-end eval: `agent init` scaffolds files → `bootstrap` reads
+// End-to-end eval: `forja init` scaffolds files → `bootstrap` reads
 // them → engine reaches `ready` with the scaffolded values flowing
 // through every loader. See `evals/init/README.md` for what this
 // pins (and what it doesn't).
@@ -88,7 +88,7 @@ beforeEach(() => {
   workdir = mkdtempSync(join(tmpdir(), 'forja-init-eval-'));
   dbPath = join(workdir, 'sessions.db');
   // Isolate user-scope config + memory under the workdir so the
-  // developer's real ~/.config/agent doesn't bleed into the eval
+  // developer's real ~/.config/forja doesn't bleed into the eval
   // (mirrors bootstrap.test.ts hygiene).
   originalXdg = process.env.XDG_CONFIG_HOME;
   originalHome = process.env.HOME;
@@ -126,7 +126,7 @@ describe('init → bootstrap eval', () => {
       err: sinks.err,
     });
     expect(initCode).toBe(0);
-    // Bootstrap reads .agent/config.toml; the per-key merge in
+    // Bootstrap reads .forja/config.toml; the per-key merge in
     // bootstrap (CLI > project > user > DEFAULT) should land the
     // scaffolded project values into HarnessConfig.
     const {
@@ -230,10 +230,13 @@ describe('init → bootstrap eval', () => {
     // post-second-init. If the second run somehow re-wrote the
     // file with different content (e.g., DEFAULT_BUDGET drift mid-
     // process — implausible but worth pinning), this catches it.
-    const beforePerm = readFileSync(join(workdir, '.agent', 'permissions.yaml'), 'utf8');
-    const beforeConfig = readFileSync(join(workdir, '.agent', 'config.toml'), 'utf8');
-    const beforeGitignore = readFileSync(join(workdir, '.agent', '.gitignore'), 'utf8');
-    const beforePlaybook = readFileSync(join(workdir, '.agent', 'agents', 'fixture-a.md'), 'utf8');
+    const beforePerm = readFileSync(join(workdir, '.forja', 'permissions.yaml'), 'utf8');
+    const beforeConfig = readFileSync(join(workdir, '.forja', 'config.toml'), 'utf8');
+    const beforeGitignore = readFileSync(join(workdir, '.forja', '.gitignore'), 'utf8');
+    const beforePlaybook = readFileSync(
+      join(workdir, '.forja', 'playbooks', 'fixture-a.md'),
+      'utf8',
+    );
 
     const sinks2 = collectingSinks();
     const code2 = runInit({
@@ -245,10 +248,10 @@ describe('init → bootstrap eval', () => {
     });
     expect(code2).toBe(0);
     expect(sinks2.outBuf.join('')).toContain('skipped');
-    expect(readFileSync(join(workdir, '.agent', 'permissions.yaml'), 'utf8')).toBe(beforePerm);
-    expect(readFileSync(join(workdir, '.agent', 'config.toml'), 'utf8')).toBe(beforeConfig);
-    expect(readFileSync(join(workdir, '.agent', '.gitignore'), 'utf8')).toBe(beforeGitignore);
-    expect(readFileSync(join(workdir, '.agent', 'agents', 'fixture-a.md'), 'utf8')).toBe(
+    expect(readFileSync(join(workdir, '.forja', 'permissions.yaml'), 'utf8')).toBe(beforePerm);
+    expect(readFileSync(join(workdir, '.forja', 'config.toml'), 'utf8')).toBe(beforeConfig);
+    expect(readFileSync(join(workdir, '.forja', '.gitignore'), 'utf8')).toBe(beforeGitignore);
+    expect(readFileSync(join(workdir, '.forja', 'playbooks', 'fixture-a.md'), 'utf8')).toBe(
       beforePlaybook,
     );
 

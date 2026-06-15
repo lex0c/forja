@@ -4,10 +4,10 @@ prompt: |
   Report what the tool returned.
 setup:
   files:
-    .agent/permissions.yaml: |
+    .forja/permissions.yaml: |
       defaults:
         mode: bypass
-    .agent/hooks.toml: |
+    .forja/hooks.toml: |
       [[hooks]]
       event = "PostToolUse"
       command = "echo posthook-fired > posthook.marker"

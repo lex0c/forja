@@ -252,7 +252,7 @@ export const listMemoryEventsByName = (
 
 // ─── pruneMemoryEvents ─────────────────────────────────────────────────
 //
-// Retention sweep for `agent gc` Phase 2 (AGENTIC_CLI §2.1.3, AUDIT
+// Retention sweep for `forja gc` Phase 2 (AGENTIC_CLI §2.1.3, AUDIT
 // §1.2). Default retention 365d on `created_at`. Cutoff EXCLUSIVE.
 //
 // Lifecycle audit (created/edited/deleted/read/promoted/demoted).

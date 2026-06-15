@@ -336,7 +336,7 @@ describe('dispatchSemanticVerify — happy paths', () => {
 
   test('contradicted + high confidence → attempt + governance proposal pending', async () => {
     const contradicted =
-      'verdict: contradicted\nconfidence: 0.92\nclaim_extracted: "memories live in .agent/memory/"\nground_truth_observed: "actual layout differs per src/x.ts"\nevidence_paths:\n  - src/x.ts\n';
+      'verdict: contradicted\nconfidence: 0.92\nclaim_extracted: "memories live in .forja/memory/"\nground_truth_observed: "actual layout differs per src/x.ts"\nevidence_paths:\n  - src/x.ts\n';
     const outcome = await dispatchSemanticVerify({
       db,
       definition: fakeDefinition,
@@ -741,7 +741,7 @@ describe('dispatchSemanticVerify — atomic persistence (H3)', () => {
     // throws SQLITE_CONSTRAINT_FOREIGNKEY at INSERT time.
     const ghostSessionId = '00000000-0000-0000-0000-0000000000ff';
     const contradicted =
-      'verdict: contradicted\nconfidence: 0.92\nclaim_extracted: "memories live in .agent/memory/"\nground_truth_observed: "actual layout differs per src/x.ts"\nevidence_paths:\n  - src/x.ts\n';
+      'verdict: contradicted\nconfidence: 0.92\nclaim_extracted: "memories live in .forja/memory/"\nground_truth_observed: "actual layout differs per src/x.ts"\nevidence_paths:\n  - src/x.ts\n';
     const outcome = await dispatchSemanticVerify({
       db,
       definition: fakeDefinition,

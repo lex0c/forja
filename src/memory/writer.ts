@@ -122,7 +122,7 @@ const loadOrEmptyIndex = (path: string): ParsedIndex => {
 // Refuse to follow a symlink at the target path. The sandbox check
 // in `memoryFilePath` only validates path SHAPE, not the inode it
 // resolves to — an attacker who can drop a symlink at
-// `~/.config/agent/memory/<name>.md` pointing at `/etc/passwd`
+// `~/.config/forja/memory/<name>.md` pointing at `/etc/passwd`
 // could otherwise have us "create" that name and silently overwrite
 // the linked file (same defense the worktree validator runs in
 // subagents/worktree.ts). `lstatSync` does NOT follow symlinks; we
@@ -218,8 +218,8 @@ export const writeMemory = (input: WriteMemoryInput): WriteMemoryResult => {
 
   // Ensure the scope directory exists. mkdirSync with recursive=true
   // is idempotent on existing dirs and handles fresh installs
-  // (~/.config/agent/memory/ created on first user-scope write,
-  // .agent/memory/local/ on first project_local write).
+  // (~/.config/forja/memory/ created on first user-scope write,
+  // .forja/memory/local/ on first project_local write).
   try {
     mkdirSync(dirname(bodyPath), { recursive: true });
   } catch (err) {

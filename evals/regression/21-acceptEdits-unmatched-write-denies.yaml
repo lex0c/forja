@@ -5,7 +5,7 @@ prompt: |
   NOT switch tools.
 setup:
   files:
-    .agent/permissions.yaml: |
+    .forja/permissions.yaml: |
       defaults:
         mode: acceptEdits
 expect:

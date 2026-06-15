@@ -181,7 +181,7 @@ export const listProcessesByParent = (db: DB, parentSessionId: string): Subagent
 
 // Subprocesses that started but never recorded an exit. Janitor /
 // forensics surface for "what did the parent crash leave behind".
-// Used by future `agent worktree gc` extensions.
+// Used by future `forja worktree gc` extensions.
 export const listOrphanedProcesses = (db: DB): SubagentProcessRecord[] => {
   const rows = db
     .query<SubagentProcessRow, []>(

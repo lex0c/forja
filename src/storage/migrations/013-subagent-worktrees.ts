@@ -6,7 +6,7 @@ export const migration013SubagentWorktrees = {
   // worktree for the child run before invoking the loop. Without
   // persistence, a parent process crash (or even a clean exit) leaves
   // the operator with a worktree on disk and no record of which
-  // session owned it — `agent worktree gc` needs the
+  // session owned it — `forja worktree gc` needs the
   // audit row to know what is safe to remove and what is still
   // attached to a live or paused session.
   //

@@ -11,7 +11,7 @@ export const migration005BackgroundProcesses = {
   //   OS pid: keeping the public surface decoupled from os-level
   //   identifiers lets us swap process strategy later (daemon, remote,
   //   bun_worker) without changing the tool contract.
-  // - os_pid is recorded for `agent doctor`-class diagnostics (M4) so a
+  // - os_pid is recorded for `forja doctor`-class diagnostics (M4) so a
   //   crashed harness's orphans can be identified externally.
   // - cwd is captured at spawn so `bash_output` can resolve relative log
   //   paths even if the session's cwd changed mid-run.

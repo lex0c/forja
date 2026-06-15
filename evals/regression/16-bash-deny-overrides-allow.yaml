@@ -7,7 +7,7 @@ setup:
   files:
     doomed.txt: |
       should survive the run
-    .agent/permissions.yaml: |
+    .forja/permissions.yaml: |
       defaults:
         mode: strict
       tools:

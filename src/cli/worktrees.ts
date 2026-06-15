@@ -1,4 +1,4 @@
-// `agent --worktrees <verb>` handler. Independent of bootstrap
+// `forja --worktrees <verb>` handler. Independent of bootstrap
 // (no provider, no permissions, no tool registry — only DB +
 // git in cwd) so inspecting/garbage-collecting worktrees doesn't
 // require an API key. Mirrors the structure of

@@ -837,7 +837,7 @@ describe('/perms', () => {
     const text = (result.notes ?? []).join('\n');
     expect(text).toContain('mode=strict');
     expect(text).toContain('no tool sections defined');
-    expect(text).toContain('.agent/permissions.yaml');
+    expect(text).toContain('.forja/permissions.yaml');
   });
 
   test('renders bash + read_file rule sections', async () => {

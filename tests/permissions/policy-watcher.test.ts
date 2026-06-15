@@ -65,8 +65,8 @@ describe('watchAndReload', () => {
   });
 
   test('successful reload: onReload fires with hash transition', async () => {
-    const projectFile = join(tmp, '.agent', 'permissions.yaml');
-    mkdirSync(join(tmp, '.agent'), { recursive: true });
+    const projectFile = join(tmp, '.forja', 'permissions.yaml');
+    mkdirSync(join(tmp, '.forja'), { recursive: true });
     writeFileSync(projectFile, 'defaults:\n  mode: strict\ntools:\n  bash:\n    allow: ["ls *"]\n');
 
     const eng = createPermissionEngine(policy({ defaults: { mode: 'strict' } }), {
@@ -105,8 +105,8 @@ describe('watchAndReload', () => {
   });
 
   test('debounce: multiple rapid events coalesce into one reload', async () => {
-    const projectFile = join(tmp, '.agent', 'permissions.yaml');
-    mkdirSync(join(tmp, '.agent'), { recursive: true });
+    const projectFile = join(tmp, '.forja', 'permissions.yaml');
+    mkdirSync(join(tmp, '.forja'), { recursive: true });
     writeFileSync(projectFile, 'defaults:\n  mode: strict\n');
 
     const eng = createPermissionEngine(policy({}), { cwd: CWD_FALLBACK });
@@ -151,8 +151,8 @@ describe('watchAndReload', () => {
   });
 
   test('only existing paths: project file present → only that one watched', () => {
-    const projectFile = join(tmp, '.agent', 'permissions.yaml');
-    mkdirSync(join(tmp, '.agent'), { recursive: true });
+    const projectFile = join(tmp, '.forja', 'permissions.yaml');
+    mkdirSync(join(tmp, '.forja'), { recursive: true });
     writeFileSync(projectFile, 'defaults:\n  mode: strict\n');
 
     const eng = createPermissionEngine(policy({}), { cwd: CWD_FALLBACK });
@@ -169,8 +169,8 @@ describe('watchAndReload', () => {
   });
 
   test('malformed YAML on disk: onReloadFailed with parse diagnostic, engine unchanged', () => {
-    const projectFile = join(tmp, '.agent', 'permissions.yaml');
-    mkdirSync(join(tmp, '.agent'), { recursive: true });
+    const projectFile = join(tmp, '.forja', 'permissions.yaml');
+    mkdirSync(join(tmp, '.forja'), { recursive: true });
     writeFileSync(projectFile, 'defaults: { mode: strict\n  unclosed-mapping');
 
     const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
@@ -201,8 +201,8 @@ describe('watchAndReload', () => {
   test('lock conflicts: onReloadFailed, engine unchanged', () => {
     // user file locks sandbox; project file tries to override → conflict.
     const userFile = join(tmp, 'user-policy.yaml');
-    const projectFile = join(tmp, '.agent', 'permissions.yaml');
-    mkdirSync(join(tmp, '.agent'), { recursive: true });
+    const projectFile = join(tmp, '.forja', 'permissions.yaml');
+    mkdirSync(join(tmp, '.forja'), { recursive: true });
     writeFileSync(userFile, 'sandbox:\n  required: true\n  locked: true\n');
     writeFileSync(projectFile, 'sandbox:\n  required: false\n');
 
@@ -227,8 +227,8 @@ describe('watchAndReload', () => {
   });
 
   test('close() cleans up all watchers + cancels pending timer', () => {
-    const projectFile = join(tmp, '.agent', 'permissions.yaml');
-    mkdirSync(join(tmp, '.agent'), { recursive: true });
+    const projectFile = join(tmp, '.forja', 'permissions.yaml');
+    mkdirSync(join(tmp, '.forja'), { recursive: true });
     writeFileSync(projectFile, 'defaults:\n  mode: strict\n');
 
     const eng = createPermissionEngine(policy({}), { cwd: CWD_FALLBACK });
@@ -257,8 +257,8 @@ describe('watchAndReload', () => {
   });
 
   test('watcher throws on subscribe: onReloadFailed surfaces the error, other paths still set up', () => {
-    const projectFile = join(tmp, '.agent', 'permissions.yaml');
-    mkdirSync(join(tmp, '.agent'), { recursive: true });
+    const projectFile = join(tmp, '.forja', 'permissions.yaml');
+    mkdirSync(join(tmp, '.forja'), { recursive: true });
     writeFileSync(projectFile, 'defaults:\n  mode: strict\n');
 
     const eng = createPermissionEngine(policy({}), { cwd: CWD_FALLBACK });
@@ -291,8 +291,8 @@ describe('watchAndReload', () => {
   // session YAML, etc.). Fix: forward resolved.provenance to
   // engine.reloadPolicy as the second argument.
   test('forwards resolved provenance to engine.reloadPolicy (slice 139 C4)', () => {
-    const projectFile = join(tmp, '.agent', 'permissions.yaml');
-    mkdirSync(join(tmp, '.agent'), { recursive: true });
+    const projectFile = join(tmp, '.forja', 'permissions.yaml');
+    mkdirSync(join(tmp, '.forja'), { recursive: true });
     writeFileSync(
       projectFile,
       'defaults:\n  mode: strict\ntools:\n  bash:\n    allow: ["initial"]\n',
@@ -341,8 +341,8 @@ describe('watchAndReload', () => {
     // `mergeTrustedHosts(newPolicy.tools.fetch_url?.trusted_hosts
     // ?? [])` and forwards as the 3rd arg of reloadPolicy. This
     // test pins the wire by spying on the call.
-    const projectFile = join(tmp, '.agent', 'permissions.yaml');
-    mkdirSync(join(tmp, '.agent'), { recursive: true });
+    const projectFile = join(tmp, '.forja', 'permissions.yaml');
+    mkdirSync(join(tmp, '.forja'), { recursive: true });
     writeFileSync(
       projectFile,
       'defaults:\n  mode: strict\ntools:\n  fetch_url:\n    trusted_hosts:\n      - "internal.cdn.example.com"\n',
@@ -379,8 +379,8 @@ describe('watchAndReload', () => {
   });
 
   test('successive reloads: each one fires its own callback', () => {
-    const projectFile = join(tmp, '.agent', 'permissions.yaml');
-    mkdirSync(join(tmp, '.agent'), { recursive: true });
+    const projectFile = join(tmp, '.forja', 'permissions.yaml');
+    mkdirSync(join(tmp, '.forja'), { recursive: true });
     writeFileSync(projectFile, 'defaults:\n  mode: strict\ntools:\n  bash:\n    allow: ["v1"]\n');
 
     const eng = createPermissionEngine(policy({}), { cwd: CWD_FALLBACK });
@@ -426,7 +426,7 @@ describe('watchAndReload — atomic-rename save survives the watcher (slice 166)
     const tmp = mkdtempSync(join(tmpdir(), 'forja-policy-watch-rename-'));
     try {
       const projectDir = join(tmp, 'proj');
-      const agentDir = join(projectDir, '.agent');
+      const agentDir = join(projectDir, '.forja');
       mkdirSync(agentDir, { recursive: true });
       const policyPath = join(agentDir, 'permissions.yaml');
       writeFileSync(policyPath, 'defaults:\n  mode: strict\ntools:\n  bash:\n    allow: ["v1"]\n');
@@ -488,7 +488,7 @@ describe('watchAndReload — atomic-rename save survives the watcher (slice 166)
     const tmp = mkdtempSync(join(tmpdir(), 'forja-policy-watch-sibling-'));
     try {
       const projectDir = join(tmp, 'proj');
-      const agentDir = join(projectDir, '.agent');
+      const agentDir = join(projectDir, '.forja');
       mkdirSync(agentDir, { recursive: true });
       const policyPath = join(agentDir, 'permissions.yaml');
       writeFileSync(policyPath, 'defaults:\n  mode: strict\ntools:\n  bash:\n    allow: ["v1"]\n');

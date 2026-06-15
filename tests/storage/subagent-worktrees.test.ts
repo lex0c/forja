@@ -28,7 +28,7 @@ describe('subagent_worktrees repo', () => {
     const child = seedSession(parent.id);
     insertSubagentWorktree(db, {
       sessionId: child.id,
-      path: '/h/.cache/agent/worktrees/abcd',
+      path: '/h/.cache/forja/worktrees/abcd',
       branch: 'agent/refactor-abcd1234',
       status: 'cleaned',
       createdAt: 1_700_000_000_000,
@@ -37,7 +37,7 @@ describe('subagent_worktrees repo', () => {
     const wt = getSubagentWorktree(db, child.id);
     expect(wt).not.toBeNull();
     expect(wt?.sessionId).toBe(child.id);
-    expect(wt?.path).toBe('/h/.cache/agent/worktrees/abcd');
+    expect(wt?.path).toBe('/h/.cache/forja/worktrees/abcd');
     expect(wt?.branch).toBe('agent/refactor-abcd1234');
     expect(wt?.status).toBe('cleaned');
     expect(wt?.createdAt).toBe(1_700_000_000_000);

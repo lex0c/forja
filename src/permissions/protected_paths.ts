@@ -289,7 +289,7 @@ const TILDE_ESCALATE_FILES: readonly string[] = [
 // an fs tool in `mode: acceptEdits` + `host` profile would NOT
 // escalate to confirm (silent credential injection).
 const TILDE_ESCALATE_DIRS: readonly string[] = [
-  '.config/agent',
+  '.config/forja',
   '.config/claude',
   '.config/forja',
   '.config/gcloud',
@@ -314,9 +314,9 @@ const ABSOLUTE_ESCALATE_ROOTS: readonly string[] = ['/etc'];
 
 // Project-relative directories that escalate on write. Each entry is
 // joined against the session's `cwd` at classification time. The
-// engine's own state lives under `.agent/` (sessions, traces, policy
+// engine's own state lives under `.forja/` (sessions, traces, policy
 // archive); CI/operator state is under `.git/` and `.claude/`.
-const CWD_ESCALATE_DIRS: readonly string[] = ['.git', '.agent', '.claude'];
+const CWD_ESCALATE_DIRS: readonly string[] = ['.git', '.forja', '.claude'];
 
 // Posix-only segment-boundary prefix match: avoids false positives like
 // `/procfoo` matching `/proc`. Exported as the one source of truth so

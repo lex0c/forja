@@ -81,7 +81,7 @@ let workdir: string;
 // Snapshot env vars that the bootstrap chain reads from disk (the
 // memory / providers / budget config loaders). Tests under this
 // suite run real `bootstrap()` via `executeCase` → providerOverride;
-// a dev's `~/.config/agent/config.toml` declaring project config
+// a dev's `~/.config/forja/config.toml` declaring project config
 // could otherwise leak into the run and perturb the mock provider.
 // Pinning XDG_CONFIG_HOME and HOME at the temp workdir guarantees the
 // loaders see empty layers regardless of the host env.
@@ -579,7 +579,7 @@ describe('executeCase — approval posture (operation mode, AGENTIC_CLI §8.1)',
       setup: {
         approvalPosture: 'autonomous',
         files: {
-          '.agent/permissions.yaml': policyYaml(
+          '.forja/permissions.yaml': policyYaml(
             '  write_file:\n    confirm_paths:\n      - "out.txt"\n',
           ),
         },
@@ -610,7 +610,7 @@ describe('executeCase — approval posture (operation mode, AGENTIC_CLI §8.1)',
       setup: {
         approvalPosture: 'supervised',
         files: {
-          '.agent/permissions.yaml': policyYaml(
+          '.forja/permissions.yaml': policyYaml(
             '  write_file:\n    confirm_paths:\n      - "out.txt"\n',
           ),
         },
@@ -646,7 +646,7 @@ describe('executeCase — approval posture (operation mode, AGENTIC_CLI §8.1)',
     const c = baseCase({
       setup: {
         approvalPosture: 'autonomous',
-        files: { '.agent/permissions.yaml': policyYaml('  bash:\n    allow:\n      - "echo *"\n') },
+        files: { '.forja/permissions.yaml': policyYaml('  bash:\n    allow:\n      - "echo *"\n') },
       },
       expect: [
         { kind: 'tool_called', tool: 'bash' },

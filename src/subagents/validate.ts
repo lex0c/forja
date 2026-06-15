@@ -51,7 +51,7 @@ import type { SubagentDefinition } from './types.ts';
 //
 // `requiresBgManager` is not a third check: every subagent
 // gets its own bg log directory namespaced
-// under `<parentCwd>/.agent/bg/<childSessionId>/`, so
+// under `<parentCwd>/.forja/bg/<childSessionId>/`, so
 // `bash_background` / `bash_output` / `bash_kill` /
 // process-aware `wait_for` and `monitor` are safe to expose. The
 // child's harness wires the directory in via `--subagent-bg-log-dir`

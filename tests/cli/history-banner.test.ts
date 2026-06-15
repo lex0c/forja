@@ -56,11 +56,11 @@ describe('maybeEmitHistoryBanner — first-run path', () => {
     expect(h.emit()).toBe(true);
     const infos = h.events.filter((e) => e.type === 'info');
     expect(infos).toHaveLength(2);
-    expect((infos[0] as Extract<UIEvent, { type: 'info' }>).message).toContain('.agent/forja.db');
+    expect((infos[0] as Extract<UIEvent, { type: 'info' }>).message).toContain('.forja/forja.db');
     expect((infos[0] as Extract<UIEvent, { type: 'info' }>).message).toContain('entry cap');
     expect((infos[1] as Extract<UIEvent, { type: 'info' }>).message).toContain('/history off');
     expect((infos[1] as Extract<UIEvent, { type: 'info' }>).message).toContain('/history clear');
-    expect(existsSync(join(cwd, '.agent', 'forja-history-acked'))).toBe(true);
+    expect(existsSync(join(cwd, '.forja', 'forja-history-acked'))).toBe(true);
   });
 
   test('runs are idempotent: second invocation suppresses banner', () => {
@@ -71,33 +71,33 @@ describe('maybeEmitHistoryBanner — first-run path', () => {
     expect(infos).toHaveLength(2); // first emit only
   });
 
-  test('creates .agent/ when missing (early-stage projects)', () => {
-    // tmp dir starts without .agent — the banner must mkdir -p.
-    expect(existsSync(join(cwd, '.agent'))).toBe(false);
+  test('creates .forja/ when missing (early-stage projects)', () => {
+    // tmp dir starts without .forja — the banner must mkdir -p.
+    expect(existsSync(join(cwd, '.forja'))).toBe(false);
     const h = makeHarness(cwd);
     h.emit();
-    expect(existsSync(join(cwd, '.agent'))).toBe(true);
+    expect(existsSync(join(cwd, '.forja'))).toBe(true);
   });
 });
 
 describe('maybeEmitHistoryBanner — suppression rules', () => {
   test('existing ack marker suppresses the banner', () => {
-    mkdirSync(join(cwd, '.agent'), { recursive: true });
-    writeFileSync(join(cwd, '.agent', 'forja-history-acked'), '');
+    mkdirSync(join(cwd, '.forja'), { recursive: true });
+    writeFileSync(join(cwd, '.forja', 'forja-history-acked'), '');
     const h = makeHarness(cwd);
     expect(h.emit()).toBe(false);
     expect(h.events.filter((e) => e.type === 'info')).toHaveLength(0);
   });
 
-  test('.agent/no-history marker (per-project disable) suppresses the banner', () => {
-    mkdirSync(join(cwd, '.agent'), { recursive: true });
-    writeFileSync(join(cwd, '.agent', 'no-history'), '');
+  test('.forja/no-history marker (per-project disable) suppresses the banner', () => {
+    mkdirSync(join(cwd, '.forja'), { recursive: true });
+    writeFileSync(join(cwd, '.forja', 'no-history'), '');
     const h = makeHarness(cwd);
     expect(h.emit()).toBe(false);
     // ack marker is NOT created — operator never saw the disclosure;
     // future boots that re-enable persistence (by deleting no-history)
     // should still get the first-run banner.
-    expect(existsSync(join(cwd, '.agent', 'forja-history-acked'))).toBe(false);
+    expect(existsSync(join(cwd, '.forja', 'forja-history-acked'))).toBe(false);
   });
 
   test('FORJA_NO_HISTORY env (without ignoreEnv) suppresses the banner', () => {
@@ -114,15 +114,15 @@ describe('maybeEmitHistoryBanner — suppression rules', () => {
     });
     expect(result).toBe(false);
     expect(events).toHaveLength(0);
-    expect(existsSync(join(cwd, '.agent', 'forja-history-acked'))).toBe(false);
+    expect(existsSync(join(cwd, '.forja', 'forja-history-acked'))).toBe(false);
   });
 });
 
 describe('maybeEmitHistoryBanner — failure paths', () => {
   test('marker-write failure emits a warn but still emits the banner this boot', () => {
-    // Force a write failure: replace `.agent` with a regular file
+    // Force a write failure: replace `.forja` with a regular file
     // so mkdir/writeFile both throw EEXIST/ENOTDIR.
-    writeFileSync(join(cwd, '.agent'), '');
+    writeFileSync(join(cwd, '.forja'), '');
     const h = makeHarness(cwd);
     expect(h.emit()).toBe(true);
     const infos = h.events.filter((e) => e.type === 'info');

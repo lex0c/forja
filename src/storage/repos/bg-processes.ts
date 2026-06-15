@@ -310,7 +310,7 @@ export const markBgProcessAsKilled = (db: DB, id: string): boolean => {
 
 // ─── pruneBgProcesses ──────────────────────────────────────────────────
 //
-// Retention sweep for `agent gc` (AGENTIC_CLI §2.1.3, AUDIT §1.2).
+// Retention sweep for `forja gc` (AGENTIC_CLI §2.1.3, AUDIT §1.2).
 // Default retention 30d on `spawned_at`. Cutoff EXCLUSIVE.
 //
 // **`status = 'running'` rows are NEVER deleted**, regardless of

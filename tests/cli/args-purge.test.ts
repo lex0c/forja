@@ -1,4 +1,4 @@
-// `agent purge` parser tests. Pin the subcommand shape so future
+// `forja purge` parser tests. Pin the subcommand shape so future
 // arg additions to other verbs don't accidentally swallow purge
 // tokens, and so the three flags (`--force`, `--json`, `--no-audit`)
 // keep their parsed-to-config mapping stable.

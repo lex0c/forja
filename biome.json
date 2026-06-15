@@ -10,7 +10,7 @@
     "ignore": [
       "dist",
       "node_modules",
-      ".agent",
+      ".forja",
       ".claude",
       "docs/spec",
       "evals/fixtures",

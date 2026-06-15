@@ -7,13 +7,13 @@ import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { listMemoryEventsByName } from '../../src/storage/repos/memory-events.ts';
 
-// CLI-level tests for `agent --memory <verb>`. The registry
+// CLI-level tests for `forja --memory <verb>`. The registry
 // itself is unit-tested in tests/memory/registry.test.ts; here we
 // cover argument parsing, output shape (table vs NDJSON), exit
 // codes, and audit emission for `show`.
 //
 // We override XDG_CONFIG_HOME in setup so the user scope lands in
-// a tmpdir instead of the developer's real ~/.config/agent/memory/.
+// a tmpdir instead of the developer's real ~/.config/forja/memory/.
 // This is the same seam `userScopeRoot` already honors.
 
 let db: DB;
@@ -74,9 +74,9 @@ afterEach(() => {
   }
 });
 
-const userScopeDir = (): string => join(xdgRoot, 'agent', 'memory');
-const projectLocalDir = (): string => join(cwd, '.agent', 'memory', 'local');
-const projectSharedDir = (): string => join(cwd, '.agent', 'memory', 'shared');
+const userScopeDir = (): string => join(xdgRoot, 'forja', 'memory');
+const projectLocalDir = (): string => join(cwd, '.forja', 'memory', 'local');
+const projectSharedDir = (): string => join(cwd, '.forja', 'memory', 'shared');
 
 describe('runMemoryCli — list', () => {
   test('empty state → "no memories found" (table) / count=0 (json)', async () => {
@@ -156,7 +156,7 @@ describe('runMemoryCli — list', () => {
 
   test('vendor seeds surface `subdir:"seeds"` in JSON and ` [seed]` in table (spec §5.7.3)', async () => {
     // Parity with the slash `/memory list [seed]` marker. Without
-    // a JSON discriminator, a script consuming `agent --memory list
+    // a JSON discriminator, a script consuming `forja --memory list
     // --json` to inventory operator memories can't distinguish
     // vendor-curated meta-behavior from operator-authored entries
     // in the user scope. The marker also propagates to the table
@@ -425,8 +425,8 @@ describe('runMemoryCli — show', () => {
 
 describe('runMemoryCli — repo-root resolution (regression: subdir blindspot)', () => {
   test('list from a subdir still finds project memories at the repo root', async () => {
-    // Operator runs `agent --memory list` from a subdir of a
-    // git repo. Memories live at <repo>/.agent/memory/...; the
+    // Operator runs `forja --memory list` from a subdir of a
+    // git repo. Memories live at <repo>/.forja/memory/...; the
     // CLI must resolve repo root via git rev-parse rather than
     // anchoring at the invocation cwd. Pre-fix this returned
     // an empty list silently.

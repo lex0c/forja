@@ -295,7 +295,7 @@ export const countOutcomes = (db: DB): number => {
 
 // ─── pruneOutcomes ─────────────────────────────────────────────────────
 //
-// Retention sweep for `agent gc` Phase 2 (AGENTIC_CLI §2.1.3, AUDIT
+// Retention sweep for `forja gc` Phase 2 (AGENTIC_CLI §2.1.3, AUDIT
 // §1.2). Default retention 90d on `recorded_at`. Cutoff EXCLUSIVE.
 //
 // Cross-substrate operational outcomes (tier 1-5 + action_signature

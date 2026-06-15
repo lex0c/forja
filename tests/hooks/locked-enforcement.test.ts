@@ -39,7 +39,7 @@ beforeEach(async () => {
   scratch = await mkdtemp(join(tmpdir(), 'forja-locked-'));
   // Distinct subdirs so each layer has its own hooks.toml. We
   // pass them explicitly to resolveHookConfig — that way the
-  // test isn't polluted by any /etc/agent or ~/.config/agent
+  // test isn't polluted by any /etc/forja or ~/.config/forja
   // file the runner machine happens to have.
   await mkdir(join(scratch, 'enterprise'), { recursive: true });
   await mkdir(join(scratch, 'user'), { recursive: true });
