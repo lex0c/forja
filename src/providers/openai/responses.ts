@@ -82,6 +82,16 @@ const toResponsesInput = (messages: ProviderMessage[], reasoningReplay = false):
       // its generated item ("Item 'rs_…' of type 'reasoning' was provided without
       // its required following item"); batching all reasoning ahead of all tool
       // calls would break a multi-reasoning/tool turn like [rs1, call1, rs2, call2].
+      //
+      // Reasoning is replayed ONLY for tool-bearing turns: a reasoning item's
+      // "required following item" is the function_call it preceded, which we
+      // reconstruct faithfully via its call_id. A text-only turn has no
+      // function_call — its message item would have to be SYNTHESIZED (the stream
+      // only captures the text, not the message item's id/type/status), and a
+      // reasoning item paired with a synthesized message can 400 on the next user
+      // turn. The reasoning of a final text answer has no tool round-trip to
+      // continue into, so dropping it loses ~nothing.
+      const hasToolUse = m.content.some((b) => b.type === 'tool_use');
       let pendingText = '';
       const flushText = (): void => {
         if (pendingText.length === 0) return;
@@ -117,6 +127,8 @@ const toResponsesInput = (messages: ProviderMessage[], reasoningReplay = false):
           } | null;
           if (data === null || typeof data !== 'object') continue;
           if ('__forja_message_phase' in data) continue;
+          // Text-only turn → no function_call to pair with; drop (see above).
+          if (!hasToolUse) continue;
           if (typeof data.encrypted_content === 'string' && data.encrypted_content.length > 0) {
             flushText();
             items.push(block.data);

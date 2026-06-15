@@ -2,6 +2,26 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-15] OpenAI replay: drop reasoning on text-only turns (synthesized message can't pair)
+
+A text-only Responses turn was replayed as `[reasoning item, synthesized assistant
+message]` — but the stream only captures the text, not the message item's
+id/type/status, so the message is rebuilt fresh. OpenAI pairs a reasoning item
+with its exact following output item; on the next user turn after a text reply,
+the reasoning paired with a synthesized message can 400 ("reasoning … without its
+required following item"). Not caught by smoke (single-prompt cases never replay a
+text turn). Fix: replay reasoning ONLY for tool-bearing turns — a reasoning item's
+pair is the function_call (reconstructed faithfully via call_id); a final text
+answer has no tool round-trip to continue, so its reasoning is dropped. Test:
+text-only turn → message kept, reasoning dropped.
+
+Residual (honest): a mixed `[reasoning, text, tool_use]` turn still keeps reasoning
+followed by the synthesized message before the function_call — same id-loss shape.
+Likely tolerated (the smoke-ON tool turns showed zero 400, and we replay in the
+model's exact order), but the definitive check is a LIVE multi-turn smoke (text
+reply → follow-up → replay) — not yet run. If it 400s, the deeper fix is to
+capture/replay the message item verbatim (id/type/status), not synthesize it.
+
 ## [2026-06-15] OpenAI Responses replay: preserve interleaved reasoning↔tool order
 
 `toResponsesInput` batched all reasoning items ahead of all tool calls, discarding

@@ -564,6 +564,43 @@ describe('createOpenAIProvider — Responses routing for reasoning models', () =
       });
     });
 
+    test('on: text-only turn (no tool_use) DROPS reasoning (no item to pair the synthesized message)', async () => {
+      // OpenAI pairs a reasoning item with its exact following output item. A
+      // text-only turn's message is synthesized (no original id), so a reasoning
+      // item before it can 400 on the next user turn — drop it.
+      await withReplay(true, async () => {
+        const handle = mockResponsesClient([
+          { type: 'response.created', response: { id: 'r' } },
+          { type: 'response.completed', response: {} },
+        ]);
+        const provider = createOpenAIProvider('gpt-5.4-mini', { client: handle.client });
+        for await (const _ of provider.generate({
+          model: 'gpt-5.4-mini',
+          max_tokens: 8,
+          effort: 'high',
+          messages: [
+            {
+              role: 'assistant',
+              content: [
+                {
+                  type: 'reasoning',
+                  provider: 'openai',
+                  data: { type: 'reasoning', id: 'rs1', encrypted_content: 'E1' },
+                },
+                { type: 'text', text: 'here is the answer' },
+              ],
+            },
+            { role: 'user', content: 'follow up' },
+          ],
+        })) {
+          // drain
+        }
+        const { input } = handle.calls[0] as { input: Array<{ type?: string; role?: string }> };
+        expect(input.some((i) => i.type === 'reasoning')).toBe(false); // dropped
+        expect(input.some((i) => i.role === 'assistant')).toBe(true); // message kept
+      });
+    });
+
     test('on: preserves interleaved order of MULTIPLE reasoning items + tool calls', async () => {
       // [rs1, call1, rs2, call2] must replay in that exact order — NOT batched to
       // [rs1, rs2, call1, call2], which orphans rs1 from call1 and 400s.
