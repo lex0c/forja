@@ -3666,7 +3666,6 @@ describe('repl — slash commands integration', () => {
     expect(await promise).toBe(0);
     expect(ra.captured).toHaveLength(0);
   });
-
 });
 
 describe('repl — --resume gating + session seed (Phase 1)', () => {

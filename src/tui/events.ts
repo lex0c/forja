@@ -810,13 +810,13 @@ export type OperatorBashDoneEvent = BaseEvent & {
 };
 
 // REPL busy-state transition. The REPL's `isBusy()` (a foreground turn
-// OR a playbook OR an operator `!cmd` in flight) is the gate the submit
-// path uses to refuse a new submission — but two of its three inputs
-// (`playbookRunning`, `operatorBashRunning`) have no other reflection in
-// LiveState. This event mirrors the combined predicate into the renderer
-// so the bash-mode visuals can gate on the SAME condition the submit
-// does (otherwise typing `!` during a playbook / another `!` shows the
-// shell UI for a command that Enter will refuse). Emitted only on actual
+// OR an operator `!cmd` / /compact in flight) is the gate the submit
+// path uses to refuse a new submission — but `operatorBashRunning` has
+// no other reflection in LiveState. This event mirrors the combined
+// predicate into the renderer so the bash-mode visuals can gate on the
+// SAME condition the submit does (otherwise typing `!` during another
+// `!` shows the shell UI for a command that Enter will refuse). Emitted
+// only on actual
 // transitions (deduped at the producer).
 export type BusyChangeEvent = BaseEvent & {
   type: 'busy:change';

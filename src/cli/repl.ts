@@ -22,7 +22,6 @@
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
-import { resolveProviderEffort } from '../harness/effort.ts';
 import {
   type BgManagerHolder,
   type HarnessConfig,
@@ -50,9 +49,7 @@ import {
 import { closeDb, computeUsageStats, countMessagesBySession } from '../storage/index.ts';
 import { createContextPinsStore } from '../storage/repos/context-pins.ts';
 import type { MessageSource } from '../storage/repos/messages.ts';
-import { completeSession, createSession } from '../storage/repos/sessions.ts';
 import { settleRunningSubagentHandles } from '../storage/repos/subagent-handles.ts';
-import { runSubagent } from '../subagents/index.ts';
 import { createTodoStore } from '../todo/index.ts';
 import type { ClarifyBridgeRequest } from '../tools/index.ts';
 import { addTrustedDir, isTrusted, trustListPath } from '../trust/index.ts';
@@ -109,11 +106,6 @@ export interface RunReplOptions {
   // Tests inject a fake that drives a scripted set of HarnessEvents
   // through `cfg.onEvent` and resolves a HarnessResult.
   runAgentOverride?: (cfg: HarnessConfig) => Promise<HarnessResult>;
-  // Test seam: replace the subagent runtime entry used by the
-  // playbook dispatcher. Defaults to `runSubagent`. Tests inject a
-  // fake to capture the input (especially `onPermissionAsk`) without
-  // spinning up a child Bun subprocess.
-  runSubagentOverride?: typeof runSubagent;
   // Stdin source. Production wires to `process.stdin`; tests inject
   // an EventEmitter-backed fake that doesn't need a TTY.
   stdin?: NodeJS.ReadStream;
@@ -327,17 +319,6 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     resolveExit = r;
   });
   let running = false;
-  // Mirrors `running` for slash playbook dispatches. Foreground
-  // turns and slash playbooks share the provider, the DB, and the
-  // permission engine — running them concurrently would interleave
-  // tool calls and audit rows under the same parent session, which
-  // the playbook layer's "one-at-a-time" contract was meant to
-  // prevent. The slash `exec` body checks `ctx.isRunning()`
-  // synchronously before awaiting `runPlaybook`; flipping this flag
-  // SYNCHRONOUSLY at the top of `runPlaybook` (before its first
-  // await) ensures a second slash dispatch fired in the same Enter
-  // burst sees `isRunning() === true` and refuses cleanly.
-  let playbookRunning = false;
   // True while an operator `!cmd` shell command is in flight. Part of
   // `isBusy` so it serializes against agent turns and playbooks (and
   // against a second `!` command) — one operator action at a time.
@@ -345,7 +326,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // True while a /compact summary call is in flight. Part of `isBusy` so a
   // follow-up turn (or a second /compact) can't start while compaction is
   // rewriting the live context's message array in place. Set SYNCHRONOUSLY
-  // (runExclusive below) before the await, same contract as playbookRunning.
+  // (runExclusive below) before the await, same contract as `running`.
   let compacting = false;
   // True while the boot-time resume prep (full/summary hydrate, and the
   // summary compaction) is in flight. Distinct from `compacting` so the flag's
@@ -367,24 +348,21 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // first Ctrl+C/Esc, SIGKILL on a repeat if the command ignored it.
   let operatorBashInterrupted = false;
   // The in-flight `!cmd` promise, so shutdown can kill + await it (the
-  // same contract `runningPromise` / `playbookPromise` have). Without
+  // same contract `runningPromise` has). Without
   // this, EOF / SIGINT mid-`!cmd` would close the REPL while the
   // detached group kept running and its completion tried to emit on a
   // torn-down bus. Null when no command runs.
   let operatorBashPromise: Promise<void> | null = null;
   // Single busy predicate threaded through every submit gate
   // (foreground startTurn, Enter in the editor, Enter in
-  // reverse-search) AND the slash dispatcher's `isRunning()`
-  // closure. Without it, the foreground submit paths would gate
-  // on `running` alone and let a normal turn start mid-playbook
-  // — the exact serialization the playbookRunning flag was
-  // supposed to enforce, defeated at every other entry point.
-  const isBusy = (): boolean =>
-    running || playbookRunning || operatorBashRunning || compacting || resumePrepping;
+  // reverse-search). Without it, the foreground submit paths would
+  // gate on `running` alone and let a normal turn start while an
+  // operator `!cmd` or /compact is mid-flight.
+  const isBusy = (): boolean => running || operatorBashRunning || compacting || resumePrepping;
   // Mirror `isBusy()` into renderer state so the bash-mode visuals gate
   // on the same condition the submit path uses (render/mode.ts). Call
-  // after EVERY mutation of `running` / `playbookRunning` /
-  // `operatorBashRunning` — the dedup makes spurious calls cheap, but a
+  // after EVERY mutation of `running` / `operatorBashRunning` — the
+  // dedup makes spurious calls cheap, but a
   // MISSED call leaves `state.busy` stale (a `!` would show shell UI for
   // a command Enter refuses). Deduped so only real transitions emit.
   let lastBusyEmitted = false;
@@ -1156,44 +1134,6 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // resumed session.
   if (resumedSessionId !== null) trackReplSessionId(resumedSessionId);
 
-  // Synthetic parent session id for slash playbook dispatches that
-  // happen BEFORE any normal turn has run. `runSubagent` requires a
-  // `parentSessionId` for audit attribution + budget cascading; the
-  // bridge used to refuse with "no session yet" until the operator
-  // typed a regular prompt first. The synthetic is created lazily on
-  // the first slash dispatch (see `ensureParentSessionId` below),
-  // immediately closed to status='done' so it doesn't sit running
-  // forever, and reused across subsequent dispatches until a real
-  // turn assigns `lastSessionId` — at which point the real id wins
-  // and the synthetic is left as a no-cost / no-message orphan in
-  // the sessions table.
-  //
-  // Marked `is_subagent: true` so it stays hidden from top-level
-  // surfaces. Without that flag the synthetic lands as the most
-  // recent top-level row for this cwd, and `--resume last`
-  // (listSessions(..., { cwd, limit: 1 }) filtered to
-  // is_subagent = 0) resurrects an empty shell instead of the
-  // operator's real conversation. The flag also keeps
-  // `--list-sessions` clean of these audit-only rows.
-  let syntheticParentSessionId: string | null = null;
-  const ensureParentSessionId = (): string => {
-    if (lastSessionId !== null) return lastSessionId;
-    if (syntheticParentSessionId !== null) return syntheticParentSessionId;
-    const synthetic = createSession(db, {
-      model: baseConfig.provider.id,
-      cwd: baseConfig.cwd,
-      isSubagent: true,
-    });
-    // Immediately close. The session row exists only as an audit
-    // anchor for the slash dispatch's child; it has no turns, no
-    // messages, no cost. Leaving it 'running' would pile up over
-    // a long REPL session that does many slash dispatches before
-    // any normal turn (rare but possible in eval / scripted runs).
-    completeSession(db, synthetic.id, 'done', 0, true);
-    syntheticParentSessionId = synthetic.id;
-    return synthetic.id;
-  };
-
   // ─── Input history (HISTORY.md §2.1) ───────────────────────────────
   // In-memory mirror of repl_history for the current project, oldest-
   // first. Loaded once at boot — concurrent REPLs in the same project
@@ -1370,23 +1310,6 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // can't leak forward.
   let abortController: AbortController | null = null;
   let softStopController: AbortController | null = null;
-  // Mirror controllers for the slash playbook dispatcher's
-  // runSubagent call. Set inside runPlaybook before the await
-  // and cleared in its finally block; triggerInterrupt below
-  // aborts whichever pair (foreground OR playbook) is live so
-  // Esc / Ctrl+C / SIGINT preempt a long-running /<playbook>
-  // dispatch the same way they preempt a foreground turn.
-  let playbookAbortController: AbortController | null = null;
-  let playbookSoftStopController: AbortController | null = null;
-  // Promise handle for the in-flight slash playbook dispatch.
-  // shutdown() aborts the playbook controller AND awaits this so
-  // the child's setSubagentPayload completes before db.close() —
-  // without it, /quit during a long /<playbook> tears down the
-  // SQLite handle while the runtime is still flushing the
-  // envelope, surfacing as a "database is closed" throw and
-  // leaking the child subprocess past REPL exit. Mirrors the
-  // foreground `runningPromise` contract.
-  let playbookPromise: Promise<unknown> | null = null;
   // The promise returned by the in-flight runAgent (already wrapped
   // in `.catch().finally()`, so awaiting never throws). `shutdown`
   // awaits this before closing the DB so the harness's async cleanup
@@ -2205,12 +2128,6 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // function does the work without needing its own guard.
   const shutdown = async (): Promise<void> => {
     if (abortController !== null) abortController.abort();
-    // Same hard-abort signal for an in-flight slash playbook so
-    // its runSubagent settles instead of running to natural
-    // completion past the operator's /quit. The promise await
-    // below blocks db.close() until the child's payload write
-    // lands.
-    if (playbookAbortController !== null) playbookAbortController.abort();
     // SIGKILL an in-flight operator `!cmd`'s process group so it doesn't
     // outlive the REPL (detached → would keep running for up to the
     // timeout) and so its completion settles + emits BEFORE renderer.close
@@ -2230,19 +2147,6 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // and SQLite throws on the closed handle. The promise is already
     // .catch()ed so awaiting never throws.
     if (runningPromise !== null) await runningPromise;
-    // Same wait for the playbook dispatch — the runtime's final
-    // `setSubagentPayload` AND `reclassifySessionStatus` calls land
-    // BEFORE db.close(), keeping the audit trail consistent with
-    // the published envelope even on a /quit-mid-playbook race.
-    if (playbookPromise !== null) {
-      try {
-        await playbookPromise;
-      } catch {
-        // Swallow — runPlaybook's caller (slash exec) already
-        // surfaces failures via the slash bus error channel; the
-        // shutdown path only needs the wait, not the verdict.
-      }
-    }
     // Same wait for an operator `!cmd` (SIGKILLed above): let its
     // `operator-bash:done` emit land while the renderer is still open,
     // and the read loop release, before teardown. The chain is already
@@ -2346,15 +2250,8 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     bus.emit({ type: 'interrupt', ts: now(), level });
     if (level === 'hard') {
       if (abortController !== null) abortController.abort();
-      // Abort the playbook controller TOO if a slash dispatch
-      // is in flight. Foreground and playbook controllers are
-      // never both populated simultaneously (the busy gate
-      // serializes them), so this is "abort whichever is live"
-      // rather than two separate state machines.
-      if (playbookAbortController !== null) playbookAbortController.abort();
     } else {
       if (softStopController !== null) softStopController.abort();
-      if (playbookSoftStopController !== null) playbookSoftStopController.abort();
     }
   };
 
@@ -2584,195 +2481,6 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       // be visible to `/history on` even though the env never
       // changes. Cheap (single existsSync against `.forja/no-history`).
       optOutReason: () => historyOptOutReason(baseConfig.cwd),
-    },
-    // Playbook dispatcher (`PLAYBOOKS.md` §1.4). Slash commands
-    // built from subagent definitions invoke this to run a child
-    // inline against the operator's session. Same `runSubagent`
-    // path the harness uses for `task_*` tool calls — provider,
-    // tool registry, permission engine, trust verdict all
-    // inherited from `baseConfig`.
-    //
-    // Two preconditions surface early as user-visible errors so
-    // the operator gets a clear cause rather than a deferred
-    // failure mid-run:
-    //
-    //   1. Definition unknown — slash registration filtered defs
-    //      without `slash:`, but a typo or dynamic shadow change
-    //      could still produce a name the registry doesn't have.
-    //
-    // No "session yet" precondition: `ensureParentSessionId` lazily
-    // creates a synthetic parent on the first dispatch when a real
-    // turn hasn't run — the operator can `/review` immediately on
-    // boot. The slash command itself further gates on `isRunning()`
-    // so a slash dispatch never races a foreground turn.
-    runPlaybook: async ({ name, prompt }) => {
-      // Defensive serialization. The slash command's `exec` body
-      // checks `ctx.isRunning()` before calling us, but a programmatic
-      // caller (or a future slash path that forgets the gate) could
-      // re-enter while a prior dispatch is still mid-flight. Refusing
-      // here preserves the one-at-a-time contract regardless of how
-      // we're invoked. Set the flag SYNCHRONOUSLY before any await so
-      // a second dispatch queued in the same Enter burst sees
-      // `isRunning() === true` and refuses cleanly via the slash
-      // surface (which renders an operator-friendly error) rather
-      // than landing on this throw.
-      if (playbookRunning) {
-        throw new Error(`playbook '${name}' rejected — another playbook dispatch is in flight`);
-      }
-      const definition = subagents.byName.get(name);
-      if (definition === undefined) {
-        throw new Error(`playbook '${name}' is not registered`);
-      }
-      playbookRunning = true;
-      syncBusy();
-      // Fresh per-dispatch controllers. `triggerInterrupt`
-      // (Esc / Ctrl+C / SIGINT / modal-cancel) reads these as a
-      // mirror of the foreground per-turn controllers and
-      // aborts whichever pair is live. The finally block clears
-      // them so a subsequent triggerInterrupt fired in idle
-      // does not abort a stale signal.
-      const ac = new AbortController();
-      const softAc = new AbortController();
-      playbookAbortController = ac;
-      playbookSoftStopController = softAc;
-      try {
-        const parentSessionId = ensureParentSessionId();
-        const runSubagentImpl = options.runSubagentOverride ?? runSubagent;
-        // Capture the dispatch promise BEFORE awaiting so the
-        // module-scope `playbookPromise` ref points at the same
-        // settle the shutdown path can wait on. Without the
-        // pre-await capture, shutdown would either close the DB
-        // before the runtime's `setSubagentPayload` /
-        // `reclassifySessionStatus` writes land or have nothing
-        // to wait on at all.
-        // Resolve once (the spread needs a narrowed const): explicit
-        // providerEffort wins — none on the main session — else derive
-        // from baseConfig.effort (the operator's /effort or default).
-        const childProviderEffort = resolveProviderEffort(baseConfig);
-        const dispatchPromise = runSubagentImpl({
-          definition,
-          prompt,
-          parentSessionId,
-          provider: baseConfig.provider,
-          parentToolRegistry: baseConfig.toolRegistry,
-          permissionEngine: baseConfig.permissionEngine,
-          db,
-          cwd: baseConfig.cwd,
-          signal: ac.signal,
-          softStopSignal: softAc.signal,
-          subagentRegistry: subagents,
-          ...(baseConfig.isCwdTrusted !== undefined ? { cwdTrusted: baseConfig.isCwdTrusted } : {}),
-          // Forward the session-level temperature pin to the
-          // child. Without this, /<playbook> dispatch diverges
-          // from the foreground task_* spawn path
-          // (harness/loop.ts ~1010), which DOES forward
-          // config.temperature: an eval rig that started the
-          // REPL with temperature: 0 would see deterministic
-          // task_sync runs but nondeterministic /<playbook>
-          // runs depending on the route the model picks.
-          // Reading per-dispatch from baseConfig.provider so a
-          // mid-session /model swap (which mints a new provider
-          // object) is observed; reading temperature too keeps
-          // the precedence ladder honest.
-          ...(baseConfig.temperature !== undefined ? { temperature: baseConfig.temperature } : {}),
-          // Forward the resolved provider-effort so /<playbook>
-          // dispatch honors the operator's /effort (or configured
-          // default) — same as the foreground task_* spawn path
-          // (harness/loop.ts forwards resolveProviderEffort(config)).
-          // Without this the child runs at the provider default while
-          // the footer + /effort confirmation say a level is active.
-          // Carries ONLY the provider axis; operational caps stay
-          // per-playbook (child gets providerEffort, never effort).
-          ...(childProviderEffort !== undefined ? { providerEffort: childProviderEffort } : {}),
-          // Hook chain snapshot. The foreground task_* spawn path
-          // in harness/loop.ts forwards config.hooks as
-          // hooksSnapshot so the child uses the parent's validated
-          // chain instead of re-resolving hooks.toml from disk —
-          // closes the drift window where a human edit between
-          // parent boot and child startup would land the child on
-          // a different chain than the operator validated. Without
-          // this forward the slash dispatch path opens that exact
-          // drift hole; mirror the loop's wiring.
-          ...(baseConfig.hooks !== undefined ? { hooksSnapshot: baseConfig.hooks } : {}),
-          // Permission proxy (spec docs/spec/IPC.md §7). Without this
-          // the runtime auto-denies every child `permission:ask`, so a
-          // playbook that touches a confirm-gated tool (bash / write
-          // under `confirm` policy) would silently fail with denials
-          // instead of prompting the operator. Mirrors the harness's
-          // spawnSubagentImpl wiring (loop.ts) — the `boolean ↔
-          // PermissionDecision` shape adapter is the same one.
-          onPermissionAsk: async (req) => {
-            const allowed = await confirmPermission({
-              toolName: req.toolName,
-              args: req.args,
-              cwd: req.cwd,
-              prompt: req.prompt,
-              subagent: req.subagent,
-              signal: req.signal,
-            });
-            return allowed ? 'allow' : 'deny';
-          },
-          // Per-response footer refresh during the dispatch — the
-          // foreground task_* spawn path gets this via the loop's
-          // forwarder → onHarnessEvent, but a slash dispatch
-          // bypasses the loop entirely; this is the second seam the
-          // shared handler covers (see refreshOnSubagentUsage).
-          //
-          // DELIBERATE side effect: setting the observer force-
-          // enables the IPC wire (runtime's implicit opt-in,
-          // runtime.ts `effectiveIpc`). Slash dispatches previously
-          // ran channel-less, which silently made the permission
-          // proxy above DEAD CODE — the child auto-denied every
-          // confirm verdict because no permission:ask could cross.
-          // With the wire on, confirm-gated tools in a playbook now
-          // prompt the operator as the proxy's comment always
-          // claimed. It also arms the IPC version-mismatch exit-code
-          // mapping for these children.
-          onChildEvent: refreshOnSubagentUsage,
-        });
-        playbookPromise = dispatchPromise;
-        const result = await dispatchPromise;
-        // Roll the playbook spend into the REPL cumulative tracker.
-        // Without this, /cost reports zero for slash-dispatched
-        // playbooks because the foreground `session_finished` path
-        // (the only place cumulative is mutated) never fires for
-        // them — the harness never ran for the parent. NaN-guarded
-        // because a misbehaving runtime could synthesize a
-        // non-finite cost on a kill path; including it would poison
-        // the running total for every subsequent dispatch.
-        if (Number.isFinite(result.costUsd)) {
-          cumulative.costUsd += result.costUsd;
-        }
-        cumulative.steps += result.steps;
-        cumulative.turns += 1;
-        // Track the playbook child session so REPL-wide aggregation
-        // (anything reading `replSessionIds`) sees the child's
-        // session alongside the parent's. The child wrote its rows
-        // into the same DB at execution time; we just need its
-        // session id to find them again.
-        trackReplSessionId(result.sessionId);
-        // Footer totals: fold the playbook child's spend/tokens in.
-        emitStatsRefresh();
-        return result;
-      } finally {
-        // Drop the gate even on throw — a stuck `playbookRunning`
-        // would lock the operator out of every subsequent dispatch
-        // until process restart. Same logic for the controllers
-        // and the promise ref: clear them so a subsequent
-        // triggerInterrupt / shutdown fired in idle does not
-        // call abort() on a settled signal or await a stale
-        // promise.
-        playbookRunning = false;
-        syncBusy();
-        playbookAbortController = null;
-        playbookSoftStopController = null;
-        playbookPromise = null;
-        // INBOX §9: the parent inbox drains after the subagent/playbook
-        // ends — same boundary semantics as a foreground turn. Deferred
-        // so it runs after this finally unwinds and `playbookRunning` is
-        // observably false to the drain's isBusy() guard.
-        queueMicrotask(() => drainInbox());
-      }
     },
   };
 
