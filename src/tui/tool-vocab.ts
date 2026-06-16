@@ -300,6 +300,60 @@ export const TOOL_VOCAB: Readonly<Record<string, ToolVocab>> = {
       return kind !== null ? `kind: ${kind}` : null;
     },
   },
+  // Background-process inventory (`bash_list`); like the other list tools it
+  // surfaces a chip, with the optional status filter as the subject.
+  bash_list: {
+    activeVerb: 'Listing processes',
+    finalVerb: 'Listed processes',
+    subject: (a) => {
+      const s = str(a.status);
+      return s !== null ? `status: ${s}` : null;
+    },
+  },
+  // Reminders subsystem. The note is the salient subject for `reminder`; the id
+  // for a cancel; the list has no subject.
+  reminder: {
+    activeVerb: 'Setting reminder',
+    finalVerb: 'Set reminder',
+    subject: (a) => str(a.note),
+  },
+  reminder_cancel: {
+    activeVerb: 'Cancelling reminder',
+    finalVerb: 'Cancelled reminder',
+    subject: (a) => str(a.reminder_id),
+  },
+  reminder_list: {
+    activeVerb: 'Listing reminders',
+    finalVerb: 'Listed reminders',
+  },
+  // Context retrieval (memory/guide bodies). The query is the subject.
+  retrieve_context: {
+    activeVerb: 'Retrieving context',
+    finalVerb: 'Retrieved context',
+    subject: (a) => str(a.query),
+  },
+  // Skills. `invoke` runs one (and the model follows the body); `show` prints a
+  // body without running it; `list` enumerates the catalog. The skill NAME is
+  // the salient subject so the chip reads `Invoked skill · review-diff` rather
+  // than the contentless `Called skill_invoke`.
+  skill_invoke: {
+    activeVerb: 'Invoking skill',
+    finalVerb: 'Invoked skill',
+    subject: (a) => str(a.name),
+  },
+  skill_show: {
+    activeVerb: 'Reading skill',
+    finalVerb: 'Read skill',
+    subject: (a) => str(a.name),
+  },
+  skill_list: {
+    activeVerb: 'Listing skills',
+    finalVerb: 'Listed skills',
+    subject: (a) => {
+      const s = str(a.scope);
+      return s !== null ? `scope: ${s}` : null;
+    },
+  },
 };
 
 // Resolve a tool name to its vocabulary. Tools without an entry get a

@@ -2,6 +2,24 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-16] tui: vocab for the 8 chip-less builtins + self-maintaining coverage
+
+Asking how a skill appears in the TUI surfaced the same gap as working_state_update,
+but wider: EIGHT registered builtins had no `TOOL_VOCAB` entry and rendered the
+awkward `Called <name>` fallback (no subject) — `skill_invoke` / `skill_show` /
+`skill_list`, `reminder` / `reminder_cancel` / `reminder_list`,
+`retrieve_context`, and `bash_list`. So invoking `review-diff` showed only
+`Called skill_invoke` — not even WHICH skill. Added vocab for all eight with a
+subject that surfaces the salient arg (skill `name` → `Invoked skill ·
+review-diff`; `retrieve_context` query; `reminder` note; `reminder_cancel` id;
+`bash_list` / `skill_list` status/scope). Root cause of why this kept hiding:
+the vocab-coverage test enumerated a HAND-MAINTAINED `builtins` array that
+drifted from the registry (it was also missing working_state_update). Replaced
+it with a derivation from the authoritative `BUILTIN_TOOLS` export — a new
+builtin without a vocab entry now fails the test automatically, no list to keep
+in sync. Added a skill-subject test. Full TUI suite green (1032). Pure vocab data
++ test; no render change.
+
 ## [2026-06-16] tui: render the working-state panel on update
 
 `working_state_update` had no `TOOL_VOCAB` entry, so it rendered the generic
