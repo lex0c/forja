@@ -510,15 +510,31 @@ export interface ProtectedTargets {
   tildeEscalateFiles: readonly string[];
   tildeEscalateDirs: readonly string[];
   cwdEscalateDirs: readonly string[];
+  // Foreign-namespace project dir(s) — the real canonical `.forja/` under a
+  // profile, denied for read AND write. Surfaced so runtime consumers (the bash
+  // glob guard) can refuse a glob that could reach them; empty on the default
+  // namespace. Resolved at the repo root (see getResolvedTargets), so a glob
+  // like `../.forja/*` from a subdir cwd is still caught.
+  cwdForeignDenyDirs: readonly string[];
 }
 
-export const protectedTargets = (home: string, cwd: string): ProtectedTargets => ({
-  systemDeny: SYSTEM_DENY_ROOTS,
-  absoluteEscalate: ABSOLUTE_ESCALATE_ROOTS,
-  tildeEscalateFiles: TILDE_ESCALATE_FILES.map((f) => resolveTildeFile(home, f)),
-  tildeEscalateDirs: tildeEscalateDirs().map((d) => resolveTildeFile(home, d)),
-  cwdEscalateDirs: cwdEscalateDirs().map((d) => resolveCwdDir(cwd, d)),
-});
+// Reuse the cached `getResolvedTargets` so this exported view stays consistent
+// with `classifyProtectedPath`: the cwd-escalate roots AND the foreign deny are
+// repo-root-anchored under a profile (not the launch/subdir cwd), and the
+// foreign deny root is included for the glob guard. systemDeny + absoluteEscalate
+// are constants. No behavior change on the default namespace (getResolvedTargets
+// anchors at cwd there, foreign list empty).
+export const protectedTargets = (home: string, cwd: string): ProtectedTargets => {
+  const resolved = getResolvedTargets(home, cwd);
+  return {
+    systemDeny: SYSTEM_DENY_ROOTS,
+    absoluteEscalate: ABSOLUTE_ESCALATE_ROOTS,
+    tildeEscalateFiles: resolved.tildeEscalateFiles,
+    tildeEscalateDirs: resolved.tildeEscalateDirs,
+    cwdEscalateDirs: resolved.cwdEscalateDirs,
+    cwdForeignDenyDirs: resolved.cwdForeignDenyDirs,
+  };
+};
 
 // Stable list of all protected absolute prefixes (deny + escalate
 // combined) for use by policy validators that don't care about tier

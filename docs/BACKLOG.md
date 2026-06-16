@@ -255,6 +255,21 @@ shakeout: `maybeWrapSandboxArgv` with no projectRoot + a subdir cwd masks
 readable. Deterministic regression test for the explicit-projectRoot
 pass-through (bwrap-conditional, like the sibling live-host tests).
 
+Thirteenth follow-up (the EXPORTED targets view — my own scoping miss). When the
+foreign deny was added (9th), it went only into the internal `getResolvedTargets`
+(used by `classifyProtectedPath`), NOT the exported `protectedTargets` —
+reasoned as "policy-validator-only, out of scope." But `protectedTargets` also
+feeds the bash GLOB GUARD (`couldGlobReachProtected`) at runtime, and it still
+(a) lacked the foreign deny root and (b) resolved cwdEscalateDirs against the
+raw/subdir cwd. So a glob like `../.forja/*` from a subdir could slip the
+protected-glob refuse and read/write the real project state in sandbox-host /
+in-process runs. Fixed by making `protectedTargets` REUSE `getResolvedTargets`
+(repo-root-anchored cwd-escalate + the foreign deny root, cached), adding
+`cwdForeignDenyDirs` to the `ProtectedTargets` shape, and including it in the
+glob guard's reachability scan. The policy validator uses explicit fields, so
+it's unaffected (additive). No behavior change on the default namespace. Tests:
+protectedTargets surfaces the foreign root under a profile, empty without.
+
 ## [2026-06-15] Prompt: drop the model id from the # Environment block
 
 The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,

@@ -239,6 +239,28 @@ describe('protectedTargets', () => {
     expect(t.cwdEscalateDirs).toContain('/work/proj/.git');
     expect(t.cwdEscalateDirs).toContain('/work/proj/.forja');
     expect(t.cwdEscalateDirs).toContain('/work/proj/.claude');
+    // Default namespace: no foreign deny root.
+    expect(t.cwdForeignDenyDirs).toEqual([]);
+  });
+
+  test('under a profile, surfaces the foreign canonical .forja deny root (for the glob guard)', () => {
+    // The bash glob guard consumes protectedTargets, so the foreign deny must
+    // appear here too (not just in classifyProtectedPath) — else a glob like
+    // `.forja/*` / `../.forja/*` slips the protected-glob refuse in
+    // sandbox-host / in-process runs. Synthetic cwd ⇒ resolveRepoRoot falls
+    // back to cwd; the repo-root anchoring for a subdir is covered by the
+    // real-git shakeout. The active `.forja-<profile>/` is NOT foreign.
+    const prev = process.env.FORJA_PROFILE;
+    process.env.FORJA_PROFILE = 'dev';
+    const cwd = '/work/profiled-targets';
+    try {
+      const t = protectedTargets(HOME, cwd);
+      expect(t.cwdForeignDenyDirs).toContain(`${cwd}/.forja`);
+      expect(t.cwdForeignDenyDirs).not.toContain(`${cwd}/.forja-dev`);
+    } finally {
+      if (prev === undefined) delete process.env.FORJA_PROFILE;
+      else process.env.FORJA_PROFILE = prev;
+    }
   });
 });
 

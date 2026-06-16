@@ -4237,6 +4237,12 @@ const couldGlobReachProtected = (
     // refused too (a literal read still passes — escalate is write-only —
     // but a glob into the zone is held conservative, as for /etc and ~).
     ...targets.cwdEscalateDirs,
+    // Foreign project dir(s) — the real canonical `.forja/` under a profile,
+    // repo-root-anchored so `../.forja/*` from a subdir cwd is caught. DENY
+    // (read+write), so refusing a glob that could reach them is doubly
+    // warranted (a literal read is denied too, not just escalated). Empty on
+    // the default namespace.
+    ...targets.cwdForeignDenyDirs,
   ];
   // Normalize: a literal-prefix that ends in `/` is "in a parent
   // directory; glob fills in the next segment". A literal-prefix
