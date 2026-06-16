@@ -114,10 +114,46 @@ describe('runPurge — init-marker gate', () => {
     expect(code).toBe(1);
     const stderr = errBuf.join('');
     expect(stderr).toContain('no init markers');
+    // Default namespace: the init suggestion + the manual-remove target
+    // render canonical (byte-identical to the pre-forjaCommand strings).
+    expect(stderr).toContain("run 'forja init' first");
+    expect(stderr).toContain('remove .forja/ manually');
     // Lists the five markers it looked for so the operator can
     // diagnose without grepping source.
     for (const m of INIT_MARKERS) {
       expect(stderr).toContain(m);
+    }
+  });
+
+  test('under a profile, the no-init-markers hint stays in the profiled namespace', async () => {
+    // A profiled purge gated on `.forja-dev/` (exists, no markers) must suggest
+    // `forja --profile dev init` and point the manual-remove at `.forja-dev/` —
+    // a bare `forja init` would scaffold the canonical `.forja/` and a bare
+    // `.forja/` remove hint would touch the operator's real project state.
+    const prev = process.env.FORJA_PROFILE;
+    process.env.FORJA_PROFILE = 'dev';
+    writeFile('.forja-dev/random.txt', 'not from init\n');
+    try {
+      const code = await runPurge({
+        cwd,
+        force: false,
+        json: false,
+        noAudit: false,
+        out,
+        err,
+        dbPath,
+      });
+      expect(code).toBe(1);
+      const stderr = errBuf.join('');
+      expect(stderr).toContain('no init markers');
+      expect(stderr).toContain("run 'forja --profile dev init' first");
+      expect(stderr).toContain('remove .forja-dev/ manually');
+      // NOT the canonical forms (would target the operator's real state).
+      expect(stderr).not.toContain("run 'forja init'");
+      expect(stderr).not.toContain('remove .forja/ manually');
+    } finally {
+      if (prev === undefined) delete process.env.FORJA_PROFILE;
+      else process.env.FORJA_PROFILE = prev;
     }
   });
 

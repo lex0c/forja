@@ -653,7 +653,7 @@ export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
   // tool". Permissive: any ONE of the five markers is enough.
   if (!hasInitMarker(agentDir)) {
     err(
-      `forja purge: ${agentDir} has no init markers — run 'forja init' first or remove .forja/ manually if you didn't initialize this project\n`,
+      `forja purge: ${agentDir} has no init markers — run '${forjaCommand('init')}' first or remove ${projectDirName()}/ manually if you didn't initialize this project\n`,
     );
     err(`  (looked for: ${INIT_MARKERS.map((m) => join(agentDir, m)).join(', ')})\n`);
     return 1;

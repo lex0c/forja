@@ -403,6 +403,21 @@ not a copy-paste command — left as-is. Tests: a new pending-migration-hint blo
 profiled case (process.env.FORJA_PROFILE=dev) carrying `--profile dev` and not
 the bare form. gc suite green (22).
 
+Twenty-first follow-up (purge no-init-markers hint — the OTHER init suggestion
+the fifth follow-up missed, operator-flagged). The fifth follow-up routed
+purge's dir-doesn't-exist hint through `forjaCommand('init')`, but the SIBLING
+Gate-3 message (dir exists, no init markers) hardcoded BOTH `forja init` AND a
+literal `remove .forja/ manually`. Under `forja --profile dev` the purge gates
+on `.forja-dev/` (projectDirName), so pasting `forja init` would scaffold the
+canonical `.forja/` (leaving the profiled purge still broken) and the manual-
+remove hint would point at the operator's REAL project dir. Routed the command
+through `forjaCommand('init')` and the dir through `projectDirName()` (already
+imported), so both track the active namespace. The `forja purge:` stderr prefix
+stays a diagnostic label. Tests: extended the canonical Gate-3 case to assert
+both render canonical (no-profile byte-identical) + a new profiled case
+(`.forja-dev/` seeded without markers) asserting `forja --profile dev init` and
+`remove .forja-dev/ manually`, and NOT the bare forms. purge suite green (46).
+
 ## [2026-06-15] Prompt: drop the model id from the # Environment block
 
 The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,
