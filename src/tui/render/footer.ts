@@ -184,6 +184,26 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
   if (status.sessionTotalCostUsd > 0) {
     rightParts.push(dim(caps, formatCost(status.sessionTotalCostUsd)));
   }
+  // Context-window occupancy, the trailing chip (after cost). Deliberately a
+  // LATE-only signal: shown solely at >= 97% as a near-the-ceiling warning that
+  // compaction/overflow is imminent — below that it's noise the operator
+  // doesn't need. Painted `error` (red), not `dim` — at >= 97% the window is
+  // about to overflow, the strongest passive signal the footer carries.
+  // Suppressed pre-boot (contextWindow 0), before the first measured
+  // turn (lastTurnContextTokens 0), and while stale (post-compaction, before a
+  // real turn re-measures from provider usage) so we never show an estimated or
+  // outdated number. Floor + clamp so the figure never overstates or exceeds
+  // 100%. lastTurnContextTokens = input + cache of the latest turn = what
+  // actually occupied the window when the model generated.
+  if (status.contextWindow > 0 && status.lastTurnContextTokens > 0 && !status.contextStale) {
+    const pct = Math.min(
+      100,
+      Math.floor((status.lastTurnContextTokens / status.contextWindow) * 100),
+    );
+    if (pct >= 97) {
+      rightParts.push(paint(caps, 'error', `${pct}% context used`));
+    }
+  }
   const right = rightParts.join(sep);
 
   const leftW = visualWidth(left);

@@ -289,6 +289,83 @@ describe('renderFooter', () => {
     });
   });
 
+  describe('context-used chip (`N% context used`, >= 97% only)', () => {
+    test('surfaces at >= 97% occupancy', () => {
+      const out =
+        renderFooter(
+          startedSession({ contextWindow: 200_000, lastTurnContextTokens: 195_000 }),
+          caps,
+        ) ?? '';
+      expect(out).toContain('97% context used'); // 195k/200k = 97.5% → floor 97
+    });
+
+    test('renders after the cost chip (trailing chip)', () => {
+      const out =
+        renderFooter(
+          startedSession({
+            contextWindow: 200_000,
+            lastTurnContextTokens: 199_000,
+            sessionTotalCostUsd: 0.5,
+          }),
+          caps,
+        ) ?? '';
+      expect(out.indexOf('$0.50')).toBeLessThan(out.indexOf('% context used'));
+    });
+
+    test('suppressed below 97%', () => {
+      const out =
+        renderFooter(
+          startedSession({ contextWindow: 200_000, lastTurnContextTokens: 192_000 }),
+          caps,
+        ) ?? ''; // 96%
+      expect(out).not.toContain('context used');
+    });
+
+    test('suppressed while the context is stale (post-compaction, pre-remeasure)', () => {
+      const out =
+        renderFooter(
+          startedSession({
+            contextWindow: 200_000,
+            lastTurnContextTokens: 199_000,
+            contextStale: true,
+          }),
+          caps,
+        ) ?? '';
+      expect(out).not.toContain('context used');
+    });
+
+    test('suppressed pre-boot (no context window) and before the first measured turn', () => {
+      expect(renderFooter(startedSession({ contextWindow: 0 }), caps) ?? '').not.toContain(
+        'context used',
+      );
+      expect(
+        renderFooter(startedSession({ contextWindow: 200_000, lastTurnContextTokens: 0 }), caps) ??
+          '',
+      ).not.toContain('context used');
+    });
+
+    test('display never exceeds 100% even if the turn over-fills the window', () => {
+      const out =
+        renderFooter(
+          startedSession({ contextWindow: 200_000, lastTurnContextTokens: 210_000 }),
+          caps,
+        ) ?? '';
+      expect(out).toContain('100% context used');
+      expect(out).not.toContain('105% context used');
+    });
+
+    test('painted error (red) when color is enabled', () => {
+      const colored: Capabilities = { ...caps, color: 'basic' };
+      const out =
+        renderFooter(
+          startedSession({ contextWindow: 200_000, lastTurnContextTokens: 199_000 }),
+          colored,
+        ) ?? '';
+      // error = SGR 31 — near-overflow is the strongest passive footer signal.
+      expect(out).toContain(`${CSI}31m99% context used${CSI}0m`);
+    });
+  });
+
   describe('in-flight bg processes chip (ORCHESTRATION §3B)', () => {
     test('surfaces a `N bash bg` chip counting running bg processes', () => {
       const s = startedSession();

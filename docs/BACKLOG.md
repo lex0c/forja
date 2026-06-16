@@ -2,6 +2,27 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-16] tui: footer `N% context used` chip (>= 97% only)
+
+Wired the long-anticipated context-occupancy chip into the footer's right
+cluster, as the TRAILING segment (after cost). The data model was already in
+place and maintained — `status.contextWindow` (banner-seeded),
+`status.lastTurnContextTokens` (input + cache of the latest turn = what occupied
+the window when the model generated), and `status.contextStale` (set on
+compaction, cleared by the next turn with real usage); the field comments even
+said "the footer suppresses the %", but no chip rendered it. Now it does:
+`{pct}% context used` painted `error` (red — the strongest passive footer
+signal, since the window is about to overflow), shown ONLY at >= 97% — a late
+near-the-ceiling warning that compaction/overflow is imminent; below that it's
+noise. Suppressed pre-boot
+(contextWindow 0), before the first measured turn (lastTurnContextTokens 0), and
+while stale (post-compaction, pre-remeasure) so we never show an estimated or
+outdated figure. `Math.floor` + clamp to 100 so the number never overstates or
+exceeds 100%. Tests: surfaces at >=97%, trailing position after cost, suppressed
+below 97% / stale / pre-boot, 100% clamp, warn color. Footer suite green (65).
+UI-first — validate via `bun run dev`; the 97% threshold is a literal const,
+trivially tunable if the warning lands too late.
+
 ## [2026-06-16] fix(tui/openai): harden the reasoning block (review follow-ups)
 
 A `/code-review` (xhigh) over the two uncommitted reasoning changes surfaced a
