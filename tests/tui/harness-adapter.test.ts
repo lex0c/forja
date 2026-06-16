@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import type { HarnessEvent, HarnessResult } from '../../src/harness/types.ts';
 import type { UIEvent } from '../../src/tui/events.ts';
 import { type HarnessAdapterCtx, createHarnessAdapter } from '../../src/tui/harness-adapter.ts';
+import { type WorkingState, emptyWorkingState } from '../../src/working-state/index.ts';
 
 const baseCtx = (): HarnessAdapterCtx => {
   let counter = 1000;
@@ -1814,5 +1815,39 @@ describe('harness-adapter — subagent observability', () => {
     const ev = out[0] as Extract<UIEvent, { type: 'warn' }>;
     expect(ev.message).toContain('1 subagent ');
     expect(ev.message).not.toContain('1 subagents');
+  });
+});
+
+describe('harness-adapter — working state', () => {
+  test('working_state_updated renders the current panel as an info block (no chip, no log)', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const state: WorkingState = {
+      focus: { text: 'close the XDG gap', atStep: 1 },
+      next: ['commit'],
+      log: [{ text: 'LOG-HISTORY', atStep: 1 }],
+      hypotheses: [],
+    };
+    const out = a.translate({ type: 'working_state_updated', sessionId: 's', state });
+    const info = out.find((e) => e.type === 'info') as Extract<UIEvent, { type: 'info' }>;
+    expect(info).toBeDefined();
+    // Header in the default tone (labels the block); body in the grey meta
+    // channel (recedes, not primary content).
+    expect(info.header).toBe('Updated working state');
+    expect(info.tone).toBe('secondary');
+    expect(info.message).toContain('focus: close the XDG gap');
+    expect(info.message).toContain('next: commit');
+    // Header is not duplicated into the toned body; log is history → excluded.
+    expect(info.message).not.toContain('Updated working state');
+    expect(info.message).not.toContain('LOG-HISTORY');
+  });
+
+  test('working_state_updated with an empty panel emits nothing', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'working_state_updated',
+      sessionId: 's',
+      state: emptyWorkingState(),
+    });
+    expect(out.find((e) => e.type === 'info')).toBeUndefined();
   });
 });

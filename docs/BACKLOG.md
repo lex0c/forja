@@ -2,6 +2,34 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-16] tui: render the working-state panel on update
+
+`working_state_update` had no `TOOL_VOCAB` entry, so it rendered the generic
+fallback chip `Called working_state_update` — visible noise with zero info about
+what changed — while the panel itself (focus/next/hypotheses) went only to the
+model's prompt (the `working_state_updated` event was a TUI no-op). Made the
+chip `silent` and turned that event into the operator-facing feedback: the
+adapter formats `event.state` (which the event already carries) into a compact
+`info` block — header `Updated working state` + focus + next + open hypotheses,
+a SNAPSHOT of the current state, NOT the log (history; would bloat scrollback on
+every update). Two-tone: the `Updated working state` header renders in the
+DEFAULT tone (visible label) while the body recedes in the `secondary` (grey
+meta) channel — operational scaffolding, not primary content. The split rides a
+new optional `header` field on the `info` item/event (header always default,
+message in the item's tone); `formatWorkingStatePanel` returns `{ header, body }`. A new `formatWorkingStatePanel` (render/working-state.ts)
+one-line-sanitizes each model-authored field (no ANSI/control injection, no
+fabricated rows) and returns null when nothing operational is set (empty /
+log-only / cleared → renders nothing). Generalized the `info` render in
+permanent.ts to be multi-line-safe (one framed line per `\n`; single-line
+unchanged). The chip is `silent` but `revealFailure: true`: a REJECTED update
+fires no success event, so without it an error would vanish — now it surfaces a
+failure chip with the reason. Also added `working_state_update` to the
+vocab-coverage test's builtins list (it was missing — which is why the absent
+entry went uncaught). Tests: formatter (render/skip/sanitize), vocab
+(silent+revealFailure), adapter (event→info, empty→nothing), info multi-line.
+Full TUI suite green (1031). UI-first per the iterate-before-spec convention —
+validate via `bun run dev`; UI.md / WORKING_STATE.md §4.4 sync is a follow-up.
+
 ## [2026-06-16] fix(security): escalate-on-write floor follows XDG too
 
 Closed the related gap the previous entry left open. The foreign-deny fix made

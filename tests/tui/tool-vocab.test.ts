@@ -34,6 +34,7 @@ describe('tool-vocab', () => {
       'todo_list',
       'todo_update',
       'wait_for',
+      'working_state_update',
       'write_file',
     ];
     for (const name of builtins) {
@@ -89,6 +90,16 @@ describe('tool-vocab', () => {
     for (const name of ['task_sync', 'task_async', 'task_await', 'task_cancel', 'task_list']) {
       expect(TOOL_VOCAB[name]?.silent).toBe(true);
     }
+  });
+
+  test('working_state_update is silent on success but reveals failures', () => {
+    // Success feedback is the `working_state_updated` event → scrollback panel
+    // block, so the per-call chip is silent. revealFailure keeps a rejected
+    // update visible (no success event fires for it, so it would otherwise
+    // vanish entirely).
+    expect(TOOL_VOCAB.working_state_update?.silent).toBe(true);
+    expect(TOOL_VOCAB.working_state_update?.revealFailure).toBe(true);
+    expect(TOOL_VOCAB.working_state_update?.finalVerb).toBe('Updated working state');
   });
 
   test('memory_list surfaces scope: <name> as subject', () => {

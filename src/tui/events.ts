@@ -798,6 +798,10 @@ export type InfoEvent = BaseEvent & {
   type: 'info';
   message: string;
   tone?: 'plain' | 'secondary';
+  // Optional title line rendered ABOVE the message in the DEFAULT tone,
+  // regardless of `tone` — so a block can label itself (default) while its body
+  // recedes (secondary). Used by the working-state panel.
+  header?: string;
 };
 
 // Operator-initiated shell command (`!cmd` typed in the input). Runs as

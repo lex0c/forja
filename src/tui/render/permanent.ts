@@ -419,9 +419,18 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // history/new-turns anchor). Same leading blank as error/warn
       // so consecutive info lines from different sources don't blob
       // together.
-      const body =
-        item.tone === 'secondary' ? paint(caps, 'secondary', item.message) : item.message;
-      return ['', body].map(padFrame);
+      // Multi-line messages (e.g. the working-state panel) render one framed
+      // line per `\n` so every row keeps the frame margin — a single padFrame
+      // over an embedded newline would indent only the first line. Single-line
+      // is the common case (`split` returns one entry).
+      const painted = item.message
+        .split('\n')
+        .map((l) => (item.tone === 'secondary' ? paint(caps, 'secondary', l) : l));
+      // `header` (when present) labels the block in the DEFAULT tone above the
+      // toned body — so a secondary-toned block can still carry a visible title
+      // (see InfoEvent.header; used by the working-state panel).
+      const headerLines = item.header !== undefined ? [item.header] : [];
+      return ['', ...headerLines, ...painted].map(padFrame);
     }
     case 'operator-bash': {
       // Operator `!cmd` result (shell-style escape — ran as the operator's

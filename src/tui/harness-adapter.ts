@@ -22,6 +22,7 @@ import type { ExitReason, HarnessEvent } from '../harness/types.ts';
 import type { Decision } from '../permissions/index.ts';
 import { sanitizeOneLineForDisplay, stripAnsi } from '../sanitize/index.ts';
 import type { SessionEndEvent, TodoItemForUI, UIEvent } from './events.ts';
+import { formatWorkingStatePanel } from './render/working-state.ts';
 import { lookupToolVocab, shortToolName } from './tool-vocab.ts';
 
 export interface HarnessAdapterCtx {
@@ -679,11 +680,28 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         return out;
       }
 
-      case 'working_state_updated':
-        // The panel is injected into the model prompt, not (yet) rendered in the
-        // TUI. The event exists for telemetry / a future live mutation counter
-        // (WORKING_STATE.md §4.4); no UI event today.
+      case 'working_state_updated': {
+        // Render the current panel as a scrollback `info` block — focus / next /
+        // open hypotheses (not the log; that's history). The per-call tool chip
+        // is silent (TOOL_VOCAB), so this event IS the operator-facing feedback.
+        // A FAILED update never reaches here (the store didn't mutate, so no
+        // event fires) — it surfaces via the tool's `revealFailure` chip
+        // instead. Skip when the panel has nothing operational to show.
+        // Header stays DEFAULT tone (labels the update); the body is the
+        // `secondary` grey meta channel — operational scaffolding that recedes,
+        // not primary content.
+        const panel = formatWorkingStatePanel(event.state);
+        if (panel !== null) {
+          out.push({
+            type: 'info',
+            ts,
+            header: panel.header,
+            message: panel.body,
+            tone: 'secondary',
+          });
+        }
         return out;
+      }
 
       case 'checkpoints_unavailable':
         out.push({

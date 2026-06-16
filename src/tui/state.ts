@@ -767,7 +767,7 @@ export type PermanentItem =
     }
   | { kind: 'error'; message: string }
   | { kind: 'warn'; message: string }
-  | { kind: 'info'; message: string; tone?: 'plain' | 'secondary' }
+  | { kind: 'info'; message: string; tone?: 'plain' | 'secondary'; header?: string }
   | {
       kind: 'operator-bash';
       command: string;
@@ -1652,6 +1652,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             kind: 'info',
             message: event.message,
             ...(event.tone !== undefined ? { tone: event.tone } : {}),
+            ...(event.header !== undefined ? { header: event.header } : {}),
           },
         ],
       };

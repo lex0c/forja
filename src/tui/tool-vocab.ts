@@ -193,6 +193,19 @@ export const TOOL_VOCAB: Readonly<Record<string, ToolVocab>> = {
       return name ?? scope;
     },
   },
+  // working_state_update mutates the session's working-state panel. Its
+  // per-call chip is noise like the todo tools' — but unlike todos there is no
+  // live panel block, so on SUCCESS the `working_state_updated` event renders
+  // the current panel as a scrollback `info` block (render/working-state.ts)
+  // and this chip stays silent. `revealFailure` surfaces a failure chip (with
+  // the reason) when the update is rejected: the success event never fires on a
+  // failed update, so without it an error would be fully invisible.
+  working_state_update: {
+    activeVerb: 'Updating working state',
+    finalVerb: 'Updated working state',
+    silent: true,
+    revealFailure: true,
+  },
   // The todo tools are `silent`: the adapter tracks each call but emits no
   // chip. The operator's view of todos is the live `Tasks` block; the
   // per-call chips ("Added todos", "Updated todo", …) are just noise. The
