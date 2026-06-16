@@ -2,6 +2,30 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-16] playbook: rewrite the code-review gate (merge-gatekeeper prose)
+
+Rewrote the `code-review` seed playbook body around a sharper merge-gatekeeper
+prompt — adopting its objective, enumerated structure wholesale (Find / Ignore /
+Consider / Report: concrete lists of what counts as a real issue, what to ignore
+outright, and the analytical lens to apply) over the old DO/DO NOT paraphrase.
+The ONE thing not adopted is the gatekeeper prompt's free-form markdown output:
+that would break the eval's `output_schema_valid` assertion and the
+machine-readable `task` envelope, so output stays the validated YAML
+`output_schema`. Kept the root-premise fields `not_reviewed` + `assumptions`
+("declare what was NOT measured") and the `questions` channel, plus the Forja-
+specific operational bits a spawned subagent needs (read-only `git` fetch, grep
+impact-radius heuristics) that the source prompt lacked. Added a second axis
+`confidence` (high/medium/low) ORTHOGONAL to severity, and `introduced_by` (the
+causal link to THIS diff, distinct from `why`/impact) to every blocker in the
+schema, with criteria tables for both ("how bad if real" vs "how sure it's
+real"). Hardened scope: no pre-existing issue unless the diff worsens it, no
+weak-evidence findings, a few strong over many weak, untraceable-to-diff ⇒ drop.
+Bumped `prompt_version` 1→2 (prompt + schema changed; context recipe unchanged).
+Extended the eval (`evals/playbooks/code-review/01-blocker-and-nit.yaml`) to
+assert the output carries `confidence` + `introduced_by`. Loader test green (28)
+— the playbook still parses; the LLM-driven eval itself was not run here (no
+provider).
+
 ## [2026-06-15] build: version (+ profile) in the binary name
 
 The build artifact was a bare `dist/forja-<id>` — no version, and a dev build
