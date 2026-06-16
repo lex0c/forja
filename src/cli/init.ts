@@ -9,8 +9,8 @@
 //   1. permissions.yaml   — strict default-deny baseline (mode tunable)
 //   2. .gitignore         — runtime data exclusion (operator-owned post-creation)
 //   3. config.toml        — schema documentation (every key commented)
-//   4. agents/*.md        — 10 canonical playbooks
-//   5. skills/shared/*.md — 20 canonical skills
+//   4. playbooks/*.md     — 4 canonical playbooks
+//   5. skills/shared/*.md — 8 canonical skills
 //
 // Each step is idempotent — skips files that already exist so a
 // re-run after partial failure is safe and an operator's hand edits

@@ -51,7 +51,7 @@ export interface ScopeRoots {
 // repo root, we'd look under `/repo/src/components/.forja/...`
 // (which doesn't exist) and silently miss every project memory.
 // The user scope is unaffected because it lives outside the repo
-// (at `~/.config/forja/memory/` or `$XDG_CONFIG_HOME/agent/memory/`).
+// (at `~/.config/forja/memory/` or `$XDG_CONFIG_HOME/forja/memory/`).
 export const resolveRepoRoot = (cwd: string): string => {
   try {
     // Pinned git binary + canonical PATH (slice 178 hardening C2).

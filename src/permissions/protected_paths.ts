@@ -378,6 +378,35 @@ export const startsWithSegment = (path: string, prefix: string): boolean => {
 const resolveTildeFile = (home: string, file: string): string => resolve(home, file);
 const resolveCwdDir = (cwd: string, dir: string): string => resolve(cwd, dir);
 
+// Resolve a FOREIGN Forja user dir (`.config/<seg>` / `.local/share/<seg>`) to
+// EVERY absolute location the real state can live at — both home-relative AND
+// the XDG location. Forja's own dirs follow the XDG base-dir spec
+// (`defaultDataDir` resolves `<XDG_DATA_HOME>/<seg>`, the config dir
+// `<XDG_CONFIG_HOME>/<seg>` when set), and the SANDBOX masks those XDG locations
+// (sandbox-runner.ts). The engine foreign-deny floor MUST follow them too:
+// `read_file` / `grep` run OUTSIDE the sandbox, so this floor is their only
+// defense — a home-relative-only match misses the operator's real `<XDG>/forja`
+// state under an XDG relocation, letting a profiled session read the real
+// audit / sessions / trust corpus (the exact disclosure the foreign deny exists
+// to block). Reads process.env (the source `defaultDataDir` itself reads — the
+// REAL host location is governed by the operator's environment, not the
+// sandbox's scrubbed env; frozen per process so the (home,cwd) cache stays
+// sound). Same absolute-and-differs guard the sandbox uses, so a relative or
+// home-equal XDG value adds nothing.
+const resolveForeignTildeDir = (home: string, dir: string): string[] => {
+  const out = [resolveTildeFile(home, dir)];
+  const addXdg = (xdg: string | undefined, homeBase: string, prefix: string): void => {
+    if (xdg === undefined || xdg.length === 0 || !xdg.startsWith('/') || xdg === homeBase) return;
+    out.push(resolve(xdg, dir.slice(prefix.length)));
+  };
+  if (dir.startsWith('.local/share/')) {
+    addXdg(process.env.XDG_DATA_HOME, resolve(home, '.local/share'), '.local/share/');
+  } else if (dir.startsWith('.config/')) {
+    addXdg(process.env.XDG_CONFIG_HOME, resolve(home, '.config'), '.config/');
+  }
+  return out;
+};
+
 // Hot-path memoization. `classifyProtectedPath` runs in the
 // per-tool-call hot path AND inside the bash bypass capability
 // loop (per-cap). Without this cache, every invocation calls
@@ -406,7 +435,9 @@ interface ResolvedProtectedTargets {
   // `~/.config/forja` + `~/.local/share/forja` under a profile) — DENIED for
   // read AND write. The user-level analog of `cwdForeignDenyDirs`: the more
   // sensitive surface (audit DB, trust, sessions span ALL projects). Resolved
-  // against `home`. Empty on the default namespace.
+  // against `home` AND, when set, the XDG location (XDG_DATA_HOME for
+  // `.local/share`, XDG_CONFIG_HOME for `.config`) — mirroring the sandbox mask,
+  // since the real dirs follow XDG. Empty on the default namespace.
   tildeForeignDenyDirs: readonly string[];
 }
 
@@ -447,7 +478,7 @@ const getResolvedTargets = (home: string, cwd: string): ResolvedProtectedTargets
       tildeEscalateDirs: tildeEscalateDirs().map((d) => resolveTildeFile(home, d)),
       cwdEscalateDirs: cwdEscalateDirs().map((d) => resolveCwdDir(projectRoot, d)),
       cwdForeignDenyDirs: foreignDirs.map((d) => resolveCwdDir(projectRoot, d)),
-      tildeForeignDenyDirs: tildeForeignDenyDirs().map((d) => resolveTildeFile(home, d)),
+      tildeForeignDenyDirs: tildeForeignDenyDirs().flatMap((d) => resolveForeignTildeDir(home, d)),
     };
     targetCache.set(key, entry);
   }

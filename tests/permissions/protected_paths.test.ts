@@ -277,6 +277,71 @@ describe('classifyProtectedPath — user-level foreign deny (under a profile)', 
       classifyProtectedPath({ absPath: '/home/op/.config/forja', op: 'write', home: HOME, cwd }),
     ).toBe('escalate');
   });
+
+  test('the foreign deny follows XDG_DATA_HOME / XDG_CONFIG_HOME relocation', () => {
+    // The real DB/config follow XDG (storage/paths.ts defaultDataDir) and the
+    // sandbox masks the XDG location — the engine floor must too, else a
+    // profiled read_file/grep (which run OUTSIDE the sandbox) can read the
+    // operator's real audit/sessions/config at <XDG>/forja. Unique home so the
+    // (home,cwd) target cache doesn't collide with a prior no-XDG entry.
+    const prevProfile = process.env.FORJA_PROFILE;
+    const prevData = process.env.XDG_DATA_HOME;
+    const prevConfig = process.env.XDG_CONFIG_HOME;
+    process.env.FORJA_PROFILE = 'dev';
+    process.env.XDG_DATA_HOME = '/srv/data';
+    process.env.XDG_CONFIG_HOME = '/srv/conf';
+    const home = '/home/xdgop';
+    const cwd = '/work/foreign-user-xdg';
+    try {
+      // Real canonical state at the XDG locations is DENIED (read + write).
+      expect(
+        classifyProtectedPath({ absPath: '/srv/data/forja/sessions.db', op: 'read', home, cwd }),
+      ).toBe('deny');
+      expect(
+        classifyProtectedPath({ absPath: '/srv/data/forja/audit.db', op: 'write', home, cwd }),
+      ).toBe('deny');
+      expect(
+        classifyProtectedPath({
+          absPath: '/srv/conf/forja/permissions.yaml',
+          op: 'read',
+          home,
+          cwd,
+        }),
+      ).toBe('deny');
+      // The active forja-dev at the XDG location stays accessible (own state) —
+      // segment-boundary match must not treat `forja-dev` as under `forja`.
+      expect(
+        classifyProtectedPath({
+          absPath: '/srv/data/forja-dev/sessions.db',
+          op: 'read',
+          home,
+          cwd,
+        }),
+      ).toBeNull();
+      // Home-relative location is STILL denied (defense in depth, both covered).
+      expect(
+        classifyProtectedPath({
+          absPath: '/home/xdgop/.local/share/forja/audit.db',
+          op: 'read',
+          home,
+          cwd,
+        }),
+      ).toBe('deny');
+      // Surfaced for the bash glob guard too.
+      const t = protectedTargets(home, cwd);
+      expect(t.tildeForeignDenyDirs).toContain('/srv/data/forja');
+      expect(t.tildeForeignDenyDirs).toContain('/srv/conf/forja');
+      expect(t.tildeForeignDenyDirs).not.toContain('/srv/data/forja-dev');
+    } finally {
+      const restore = (k: string, v: string | undefined) => {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      };
+      restore('FORJA_PROFILE', prevProfile);
+      restore('XDG_DATA_HOME', prevData);
+      restore('XDG_CONFIG_HOME', prevConfig);
+    }
+  });
 });
 
 describe('protectedTargets', () => {
