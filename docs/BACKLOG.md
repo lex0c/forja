@@ -236,6 +236,25 @@ a regression test pinning "scrubEnv preserves FORJA_PROFILE" (the invariant the
 whole profile-propagation chain rests on), so a future `/_PROFILE$/`-style scrub
 pattern can't silently break subagents under a profile.
 
+Twelfth follow-up (the subdir read-floor, ALL sandbox callers — operator-flagged):
+the project-root anchoring only reached the broker bash path (it threads
+`projectRoot` from bootstrap). The OTHER `maybeWrapSandboxArgv` callers —
+`tools/builtin/grep.ts`, `tools/builtin/git.ts`, `bg/manager.ts` — pass only
+`cwd: ctx.cwd` (a per-tool-call cwd, possibly a subdir), so under a profile a
+sandboxed grep/git/bg subprocess fell back to masking `<subdir>/.forja` and left
+the real `<repoRoot>/.forja` readable via `../.forja/...`. Threading
+`projectRoot` through ToolContext + the bg manager would have plumbed a new field
+across the whole tool infra; instead centralized the default IN
+`maybeWrapSandboxArgv`: when no `projectRoot` is passed and a profile is active,
+it resolves the repo root (`resolveRepoRoot`, profile-gated so no git spawn on
+the default namespace, cached per cwd, graceful-degrade to cwd). Every caller —
+current and future — now anchors at the repo root; the broker keeps passing its
+bootstrap-resolved root explicitly (no spawn). Verified by a real-git+bwrap
+shakeout: `maybeWrapSandboxArgv` with no projectRoot + a subdir cwd masks
+`<repoRoot>/.forja`, not `<subdir>/.forja`, and leaves the active `.forja-dev`
+readable. Deterministic regression test for the explicit-projectRoot
+pass-through (bwrap-conditional, like the sibling live-host tests).
+
 ## [2026-06-15] Prompt: drop the model id from the # Environment block
 
 The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,

@@ -57,6 +57,7 @@
 import { existsSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { join as joinPath, resolve as resolveAbs } from 'node:path';
 import { appDirNames, foreignProjectDirNames } from '../config/app-namespace.ts';
+import { resolveRepoRoot } from '../memory/paths.ts';
 import { defaultDataDir, forjaCachePersistBase } from '../storage/paths.ts';
 import { startsWithSegment } from './protected_paths.ts';
 import { SANDBOX_SAFE_ENV_VARS as SAFE_ENV_VARS } from './safe-env-vars.ts';
@@ -945,8 +946,31 @@ const canonicalizeInnerArgv = (
   return [resolved, ...innerArgv.slice(1)];
 };
 
+// Resolve the project root that anchors the foreign-`.forja` masking when a
+// caller does NOT thread `projectRoot`. Without this, a sandboxed subprocess
+// launched with a SUBDIR cwd under a profile (grep / git / bg spawns all pass
+// `cwd: ctx.cwd`) would mask `<subdir>/.forja` and leave the real
+// `<repoRoot>/.forja` readable via `../.forja/...`. Profile-gated — returns
+// `cwd` unchanged on the default namespace, so NO git spawn there — and cached
+// per cwd (one spawn per distinct cwd, not per call); falls back to `cwd` if
+// git is unavailable. The broker passes `projectRoot` explicitly (resolved once
+// at bootstrap) and never reaches this.
+const sandboxRepoRootCache = new Map<string, string>();
+const sandboxProjectRoot = (cwd: string): string => {
+  if (foreignProjectDirNames().length === 0) return cwd;
+  const cached = sandboxRepoRootCache.get(cwd);
+  if (cached !== undefined) return cached;
+  const root = resolveRepoRoot(cwd);
+  sandboxRepoRootCache.set(cwd, root);
+  return root;
+};
+
 export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): string[] => {
   const { profile, cwd, home, innerArgv } = options;
+  // Foreign-`.forja` anchor: caller-supplied projectRoot (broker) wins;
+  // otherwise resolve the repo root so subdir-cwd spawns (grep/git/bg) still
+  // mask the real `<repoRoot>/.forja`, not `<subdir>/.forja`.
+  const effectiveProjectRoot = options.projectRoot ?? sandboxProjectRoot(cwd);
   const env = options.env ?? process.env;
   const platform = options.platform ?? process.platform;
   const which = options.which ?? ((name) => Bun.which(name));
@@ -1020,7 +1044,7 @@ export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): stri
         bwrapPath: r.path,
       };
       if (realpath !== undefined) bwrapOpts.realpath = realpath;
-      if (options.projectRoot !== undefined) bwrapOpts.projectRoot = options.projectRoot;
+      bwrapOpts.projectRoot = effectiveProjectRoot;
       if (options.pathExists !== undefined) bwrapOpts.pathExists = options.pathExists;
       if (options.passthroughEnv !== undefined) bwrapOpts.passthroughEnv = options.passthroughEnv;
       if (options.writableCacheDirs !== undefined)
@@ -1045,7 +1069,7 @@ export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): stri
         sandboxExecPath: r.path,
       };
       if (realpath !== undefined) macOpts.realpath = realpath;
-      if (options.projectRoot !== undefined) macOpts.projectRoot = options.projectRoot;
+      macOpts.projectRoot = effectiveProjectRoot;
       // Forward tmpdir to restrict SBPL write allow to that subpath
       // on macOS. Linux ignores tmpdir entirely (--tmpfs /tmp
       // already gives isolation).

@@ -493,6 +493,36 @@ describe('maybeWrapSandboxArgv — per-spawn-site consume primitive', () => {
     expect(argv2).toEqual(['bash', '-c', 'echo hi']);
   });
 
+  test('threads projectRoot → foreign .forja masked at the project root, not the subdir cwd', () => {
+    // Explicit projectRoot (broker-style; grep/git/bg get it via the internal
+    // resolveRepoRoot default, covered by the real-git shakeout). Deterministic
+    // here — no git needed. bwrap-conditional like the sibling live-host tests.
+    const bwrapInstalled = Bun.which('bwrap') !== null;
+    const onLinux = process.platform === 'linux';
+    const prev = process.env.FORJA_PROFILE;
+    process.env.FORJA_PROFILE = 'dev';
+    try {
+      const argv = maybeWrapSandboxArgv({
+        profile: 'cwd-rw',
+        cwd: '/work/proj/src/deep',
+        projectRoot: '/work/proj',
+        home: HOME,
+        innerArgv: INNER,
+        realpath: (p) => p,
+        pathExists: () => true,
+      });
+      if (bwrapInstalled && onLinux) {
+        expect(argv).toContain('/work/proj/.forja'); // masked at the repo root
+        expect(argv).not.toContain('/work/proj/src/deep/.forja'); // not the subdir
+      } else {
+        expect(argv).toEqual(['bash', '-c', 'echo hi']); // passthrough w/o bwrap
+      }
+    } finally {
+      if (prev === undefined) delete process.env.FORJA_PROFILE;
+      else process.env.FORJA_PROFILE = prev;
+    }
+  });
+
   // Live host check — the helper consults process.platform +
   // Bun.which('bwrap') at call time. We can't stub those without
   // intercepting global state, so we ASSERT THE INVARIANT:
