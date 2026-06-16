@@ -10,13 +10,14 @@
 // The reducer in `state.ts` builds the `PermanentItem` records and
 // never sees `caps`.
 
+import wrapAnsi from 'wrap-ansi';
 import { sanitizeOneLineForDisplay } from '../../sanitize/ansi.ts';
 import type { PermanentItem } from '../state.ts';
 import { type Capabilities, paint, paintMulti, reverse } from '../term.ts';
 import { shortToolName, toolNoun } from '../tool-vocab.ts';
 import { shortenCwd } from './cwd.ts';
 import { formatChipDuration, formatCoarseDuration } from './duration.ts';
-import { padFrame } from './frame.ts';
+import { frameWidth, padFrame } from './frame.ts';
 import { ellipsisGlyph, subContentConnector, treeBranchConnector } from './glyphs.ts';
 import { renderMarkdown } from './markdown.ts';
 import { visualWidth } from './width.ts';
@@ -431,6 +432,25 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // (see InfoEvent.header; used by the working-state panel).
       const headerLines = item.header !== undefined ? [item.header] : [];
       return ['', ...headerLines, ...painted].map(padFrame);
+    }
+    case 'reasoning': {
+      // Extended-thinking / reasoning block: the whole thing is the model's
+      // scratch work, not the answer, so it sits in the secondary (grey meta)
+      // channel and recedes — the `reasoning:` label is grey too, just BOLD to
+      // anchor the block (bold + secondary stacked via paintMulti). One framed
+      // line per `\n`; body already capped at flush (state.ts capReasoning).
+      const header = paintMulti(caps, ['bold', 'secondary'], 'reasoning:');
+      // Soft-wrap to the frame's inner width so a single long reasoning line
+      // (OpenAI summaries are often one paragraph) can't overflow `cols` and
+      // break the 2sp margin. `hard` also breaks an unbroken token. Text is
+      // already ANSI-stripped on entry (harness-adapter thinking_delta), so the
+      // wrap operates on clean content. Blank lines (part separators) survive.
+      const width = frameWidth(caps);
+      const body = item.text
+        .split('\n')
+        .flatMap((l) => (width > 0 ? wrapAnsi(l, width, { hard: true }).split('\n') : [l]))
+        .map((l) => paint(caps, 'secondary', l));
+      return ['', header, ...body].map(padFrame);
     }
     case 'operator-bash': {
       // Operator `!cmd` result (shell-style escape — ran as the operator's

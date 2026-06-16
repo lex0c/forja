@@ -487,6 +487,22 @@ describe('harness-adapter — thinking', () => {
     expect(s.messageId).toBe('m');
   });
 
+  test('thinking_delta is ANSI-stripped on entry (same invariant as text_delta)', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'provider_event', event: { kind: 'start', message_id: 'm' } });
+    const out = a.translate({
+      type: 'provider_event',
+      event: { kind: 'thinking_delta', text: 'weigh \x1b[31mred\x1b[0m and \x1b[?1049h danger' },
+    });
+    const delta = out.find((e) => e.type === 'thinking:delta') as Extract<
+      UIEvent,
+      { type: 'thinking:delta' }
+    >;
+    expect(delta.text).not.toContain('\x1b');
+    expect(delta.text).toContain('weigh');
+    expect(delta.text).toContain('danger');
+  });
+
   test('subsequent thinking_delta does not re-emit thinking:start', () => {
     const a = createHarnessAdapter(baseCtx());
     a.translate({ type: 'provider_event', event: { kind: 'start', message_id: 'm' } });

@@ -389,7 +389,9 @@ export interface LiveState {
   // collapse to a single static verb or drift to a non-stable
   // seed (timestamp-based picks can change mid-turn under clock
   // skew or replay).
-  thinking: { startedAt: number; messageId: string } | null;
+  // `text` accumulates the `thinking:delta` reasoning so `thinking:end` can
+  // flush it to scrollback (the chip reads only startedAt/messageId; ignores it).
+  thinking: { startedAt: number; messageId: string; text: string } | null;
   // "Awaiting model" indicator. Set by `provider:waiting:start`
   // (which the harness adapter emits on `step_start` — i.e.,
   // right after the harness loop hands the request to the
@@ -644,6 +646,22 @@ const TOOL_PREVIEW_MAX_LINES = 5;
 //
 // Adding a new kind: extend the union, handle it in `formatPermanent`
 // (renderer.ts), and emit from the relevant `applyEvent` branch.
+// Cap a reasoning block before it lands in scrollback. Extended-thinking turns
+// emit thousands of tokens; persisting all of it would bury the conversation in
+// grey. Keep a useful head and mark the rest. Char-based (not line-based) so a
+// single long paragraph is bounded too. Tunable.
+const REASONING_MAX_CHARS = 1500;
+export const capReasoning = (text: string): string => {
+  if (text.length <= REASONING_MAX_CHARS) return text;
+  let head = text.slice(0, REASONING_MAX_CHARS);
+  // Don't cut through a surrogate pair: a lone high surrogate at the boundary
+  // would render as U+FFFD (replacement char). Drop it so the head ends on a
+  // whole code point.
+  const lastUnit = head.charCodeAt(head.length - 1);
+  if (lastUnit >= 0xd800 && lastUnit <= 0xdbff) head = head.slice(0, -1);
+  return `${head.trimEnd()}\n… (reasoning truncated)`;
+};
+
 export type PermanentItem =
   | {
       kind: 'session-footer';
@@ -776,6 +794,10 @@ export type PermanentItem =
       durationMs: number;
     }
   | { kind: 'recap-terse'; message: string }
+  // Extended-thinking / reasoning block flushed at `thinking:end`. Rendered as
+  // a bold `reasoning:` label over a secondary-toned body (the model's scratch
+  // work, not the answer). `text` is already capped at flush.
+  | { kind: 'reasoning'; text: string }
   | {
       // `Subagent` group title — emitted by the `applyEvent` wrapper
       // before the FIRST subagent block of a consecutive run, so a burst
@@ -1373,19 +1395,39 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           // (thinking precedes any text). `assistant:start` re-sets
           // it to the same messageId later — see that case.
           currentTurnId: event.messageId,
-          thinking: { startedAt: event.ts, messageId: event.messageId },
+          thinking: { startedAt: event.ts, messageId: event.messageId, text: '' },
         },
         permanent: [],
       };
 
-    case 'thinking:end':
     case 'thinking:delta':
-      // Delta events don't change state — duration is computed at render
-      // time from `startedAt`. End clears the indicator.
+      // Accumulate the reasoning text so `thinking:end` can flush it to
+      // scrollback. Duration is still computed at render time from `startedAt`.
       return {
-        state: event.type === 'thinking:end' ? { ...state, thinking: null } : state,
+        state: state.thinking
+          ? {
+              ...state,
+              // `event.text` is optional on the event contract (omitted for
+              // headless replay deltas). `?? ''` so a textless delta doesn't
+              // concatenate the literal string "undefined" into the buffer.
+              thinking: { ...state.thinking, text: state.thinking.text + (event.text ?? '') },
+            }
+          : state,
         permanent: [],
       };
+
+    case 'thinking:end': {
+      // Flush the accumulated reasoning as a scrollback `reasoning` block (bold
+      // label + secondary body), then clear the live indicator. Capped so an
+      // extended-thinking turn doesn't bury the conversation in grey text.
+      // Trim BEFORE capping: the guard already keys off `.trim()`, and capping
+      // the untrimmed text would persist leading/trailing blank lines that
+      // render as empty grey rows in the `reasoning:` block.
+      const reasoning = (state.thinking?.text ?? '').trim();
+      const permanent: PermanentItem[] =
+        reasoning.length > 0 ? [{ kind: 'reasoning', text: capReasoning(reasoning) }] : [];
+      return { state: { ...state, thinking: null }, permanent };
+    }
 
     case 'tool:start': {
       const tool: ActiveTool = {

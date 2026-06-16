@@ -163,7 +163,7 @@ describe('renderFooter', () => {
 
   test('thinking state also triggers interrupt cue', () => {
     const s = startedSession();
-    s.thinking = { startedAt: 0, messageId: 'm1' };
+    s.thinking = { startedAt: 0, messageId: 'm1', text: '' };
     s.busy = true;
     expect(renderFooter(s, caps)).toContain('esc to interrupt');
   });

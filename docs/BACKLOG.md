@@ -2,6 +2,79 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-16] fix(tui/openai): harden the reasoning block (review follow-ups)
+
+A `/code-review` (xhigh) over the two uncommitted reasoning changes surfaced a
+blocker-class issue plus several mediums, all fixed here before commit:
+
+- **Sanitize reasoning on entry (blocker).** `harness-adapter.ts` passed
+  `thinking_delta` text RAW while `text_delta` right above it stripped ANSI —
+  reasoning is model output too and can carry DEC private modes (alt-screen,
+  hide-cursor) that hijack the terminal once painted to the live chip /
+  scrollback `reasoning:` block. Now `stripAnsi`'d on entry, same single-point
+  invariant as `text_delta`.
+- **Textless delta no longer injects `"undefined"`.** `thinking:delta.text` is
+  optional on the event contract; the reducer concatenated it unguarded
+  (`buffer + undefined` → literal `"undefined"`). Now `?? ''`.
+- **Flush trims before capping** so leading/trailing whitespace can't persist as
+  empty grey rows; the guard already keyed off `.trim()`.
+- **`capReasoning` no longer splits a surrogate pair** at the 1500-char cut
+  (would render U+FFFD); drops a lone trailing high surrogate.
+- **Reasoning body soft-wraps** to the frame inner width (`wrap-ansi`, `hard`) —
+  an OpenAI summary is often one long paragraph that would overflow `cols` and
+  break the 2sp margin. Blank part-separators survive the wrap.
+- **OpenAI multi-part/multi-step summaries get a blank-line separator.** The
+  normalizer only handled `reasoning_summary_text.delta`; consecutive summary
+  parts (and reasoning items across tool round-trips) ran together. Now
+  `reasoning_summary_part.added` injects `\n\n` at each boundary after the first.
+
+Tests: adapter ANSI-strip on thinking_delta; reducer textless-delta + trim-flush;
+capReasoning surrogate boundary; the reasoning render case (was untested) for
+content/colors/wrap/blank-separators; stream multi-part separator. Scoped suites
+green (TUI state+render 294, adapter 96, openai 55+); typecheck + lint clean.
+Known-deferred: Anthropic thinking is suppressed on tool-bearing turns (no
+signature round-trip unless reasoning-replay, default off), so Claude's block
+only populates on no-tool turns — pre-existing, not this change.
+
+## [2026-06-16] openai: stream the reasoning summary as thinking_delta
+
+Empirically confirmed (gpt-5.4): the reasoning scrollback block stayed empty for
+OpenAI. Reasoning EFFORT was enabled (`reasoning.effort` on the Responses path)
+so the model reasoned, but the adapter (a) requested no summary and (b) captured
+the reasoning output item OPAQUELY (`kind: 'reasoning'`, encrypted, for replay) —
+never as `thinking_delta`. OpenAI never exposes the raw chain-of-thought, but it
+WILL stream a SUMMARY when asked. Two changes: `responses.ts` now sends
+`reasoning: { effort, summary: 'auto' }` (gated on the same supports_reasoning_effort
+as effort — the gpt-5.x reasoning models that support summaries), and
+`responses-stream.ts` maps `response.reasoning_summary_text.delta` →
+`thinking_delta`. That feeds the existing pipeline: live "Thinking…" chip AND the
+new scrollback `reasoning:` block now populate for gpt (with a summary, vs
+Anthropic's full extended thinking). Tests: stream normalizer surfaces summary
+deltas as thinking_delta (answer still flows as text_delta); the Responses params
+assertion now pins `summary: 'auto'`. OpenAI suite green (55). NOT verified
+against the live API — `summary: 'auto'` is broadly available for gpt-5.x but the
+real proof is a live run; `'detailed'` can need org verification, hence `'auto'`.
+
+## [2026-06-16] tui: persist the reasoning block to scrollback
+
+Providers return reasoning (Anthropic extended-thinking emits `thinking_delta`
+text; OpenAI is often opaque/summary), but the TUI only showed a live
+"Thinking…" spinner and the reducer EXPLICITLY discarded the delta text
+("Delta events don't change state"). Now the deltas accumulate (LiveState.thinking
+gains a `text` buffer) and `thinking:end` flushes a scrollback `reasoning` block:
+a `reasoning:` label and body both in the secondary (grey meta) channel — it's
+the model's scratch work, not the answer, so the whole block recedes; the label
+is just BOLD (bold + secondary stacked) to anchor it. Capped
+at flush (`capReasoning`, 1500 chars + "… (reasoning truncated)") so an
+extended-thinking turn doesn't bury the conversation in grey; empty/whitespace
+reasoning (e.g. opaque OpenAI turns) flushes nothing. The live spinner is
+unchanged; this adds the persisted block on close. New `reasoning` PermanentItem
++ render case; `bold` was already an SGR token. Tests: accumulate→flush,
+empty→nothing, capReasoning. Updated 6 pre-existing thinking-state fixtures for
+the new required `text` field. Full TUI suite green (1035). UI-first — validate
+via `bun run dev`; tunable cap / opt-out left for follow-up if the default
+volume is wrong.
+
 ## [2026-06-16] fix(permissions): empty-string fs path is "omitted", not a deny
 
 Observed in a real session: a `git` call with `path: ''` was DENIED with

@@ -207,7 +207,13 @@ export const generateViaResponses = (
     // (not the flat `reasoning_effort`), gated on the capability. No
     // temperature/top_p: reasoning models reject them (sampling gate).
     if (req.effort !== undefined && caps.supports_reasoning_effort === true) {
-      params.reasoning = { effort: OPENAI_REASONING_EFFORT[req.effort] };
+      // `summary: 'auto'` makes the API STREAM a summary of the reasoning as
+      // `response.reasoning_summary_text.delta` events — OpenAI never exposes
+      // the raw chain-of-thought, so a summary is the only reasoning text
+      // available, and it's what lets the TUI show a `reasoning:` block for gpt
+      // (Anthropic streams its extended thinking directly). Without it the
+      // reasoning item is opaque (encrypted, for replay) and nothing surfaces.
+      params.reasoning = { effort: OPENAI_REASONING_EFFORT[req.effort], summary: 'auto' };
     }
     const stream = (await client.responses.create(
       params as unknown as CreateParam,

@@ -160,6 +160,44 @@ describe('normalizeResponsesStream', () => {
     expect(out).toContainEqual({ kind: 'reasoning', provider: 'openai', data: reasoningItem });
   });
 
+  test('reasoning summary deltas surface as thinking_delta (gpt reasoning in the TUI)', async () => {
+    // Requested via `reasoning.summary: 'auto'`; OpenAI never streams the raw
+    // CoT, but the summary deltas drive the live chip + scrollback reasoning
+    // block. The answer still flows as text_delta, separately.
+    const out = await collect([
+      { type: 'response.created', response: { id: 'r' } },
+      { type: 'response.reasoning_summary_text.delta', delta: 'weighing ' } as RawResponsesEvent,
+      { type: 'response.reasoning_summary_text.delta', delta: 'options' } as RawResponsesEvent,
+      { type: 'response.output_text.delta', delta: 'answer' },
+      { type: 'response.completed', response: {} },
+    ]);
+    expect(out).toContainEqual({ kind: 'thinking_delta', text: 'weighing ' });
+    expect(out).toContainEqual({ kind: 'thinking_delta', text: 'options' });
+    expect(out).toContainEqual({ kind: 'text_delta', text: 'answer' });
+  });
+
+  test('a new summary part is separated from the previous one with a blank line', async () => {
+    // Multi-part / multi-step reasoning streams each part as its own run of
+    // summary deltas with no inter-part text. The normalizer injects a blank
+    // line at each part boundary AFTER the first so they don't run together.
+    const thinks = (
+      await collect([
+        { type: 'response.created', response: { id: 'r' } },
+        { type: 'response.reasoning_summary_part.added' } as RawResponsesEvent,
+        { type: 'response.reasoning_summary_text.delta', delta: 'part one' } as RawResponsesEvent,
+        { type: 'response.reasoning_summary_part.added' } as RawResponsesEvent,
+        { type: 'response.reasoning_summary_text.delta', delta: 'part two' } as RawResponsesEvent,
+        { type: 'response.completed', response: {} },
+      ])
+    ).filter((e) => e.kind === 'thinking_delta');
+    // First part.added is suppressed (no leading blank); the second injects one.
+    expect(thinks).toEqual([
+      { kind: 'thinking_delta', text: 'part one' },
+      { kind: 'thinking_delta', text: '\n\n' },
+      { kind: 'thinking_delta', text: 'part two' },
+    ]);
+  });
+
   test('codex message phase is captured as a sentinel reasoning event', async () => {
     const out = await collect([
       { type: 'response.created', response: { id: 'r' } },
@@ -227,7 +265,9 @@ describe('createOpenAIProvider — Responses routing for reasoning models', () =
       prompt_cache_key?: unknown;
       prompt_cache_retention?: unknown;
     };
-    expect(p.reasoning).toEqual({ effort: 'high' });
+    // `summary: 'auto'` is requested alongside effort so the reasoning summary
+    // streams (the only reasoning text OpenAI exposes) and surfaces in the TUI.
+    expect(p.reasoning).toEqual({ effort: 'high', summary: 'auto' });
     expect(p.max_output_tokens).toBe(8);
     // Markdown marker prepended as the first line (reasoning models suppress
     // markdown otherwise), with the system prompt following.

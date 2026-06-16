@@ -350,7 +350,12 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
               state.thinkingActive = true;
               out.push({ type: 'thinking:start', ts, messageId });
             }
-            out.push({ type: 'thinking:delta', ts, messageId, text: ev.text });
+            // Strip ANSI on entry, same invariant as `text_delta` above:
+            // reasoning text (Anthropic extended thinking, OpenAI summary) is
+            // model output too and can carry escape sequences, but it lands in
+            // the live "Thinking…" chip and the scrollback `reasoning:` block
+            // without those surfaces re-sanitizing. Clean it here, once.
+            out.push({ type: 'thinking:delta', ts, messageId, text: stripAnsi(ev.text) });
             return out;
           }
 

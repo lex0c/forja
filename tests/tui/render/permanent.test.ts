@@ -1612,4 +1612,32 @@ describe('formatPermanent — diff snippet (write/edit cards)', () => {
     expect(joined).toContain('hack');
     expect(joined.includes(esc)).toBe(false); // no escape sequence leaked through
   });
+
+  describe('reasoning (extended-thinking block, UI.md)', () => {
+    test('renders a blank lead, a "reasoning:" header, then one body line per \\n', () => {
+      const out = formatPermanent({ kind: 'reasoning', text: 'line one\nline two' }, ascii);
+      expect(out).toEqual([pad(''), pad('reasoning:'), pad('line one'), pad('line two')]);
+    });
+
+    test('header is bold+secondary, body is secondary (colored caps)', () => {
+      const out = formatPermanent({ kind: 'reasoning', text: 'scratch' }, colored);
+      // header: bold then secondary, single trailing reset (paintMulti).
+      expect(out[1]).toBe(pad(`${CSI}1m${CSI}90mreasoning:${CSI}0m`));
+      // body: secondary only.
+      expect(out[2]).toBe(pad(`${CSI}90mscratch${CSI}0m`));
+    });
+
+    test('soft-wraps a long single line so no rendered row overflows cols', () => {
+      const long = 'word '.repeat(60).trim(); // ~299 chars, no embedded newline
+      const out = formatPermanent({ kind: 'reasoning', text: long }, { ...ascii, cols: 40 });
+      // header + at least two wrapped body rows.
+      expect(out.length).toBeGreaterThan(3);
+      for (const row of out) expect(row.length).toBeLessThanOrEqual(40);
+    });
+
+    test('preserves blank separator lines between summary parts', () => {
+      const out = formatPermanent({ kind: 'reasoning', text: 'part one\n\npart two' }, ascii);
+      expect(out).toEqual([pad(''), pad('reasoning:'), pad('part one'), pad(''), pad('part two')]);
+    });
+  });
 });
