@@ -340,6 +340,23 @@ byte-identical, and the glob-guard surfacing. Full permissions suite green
 (2344). Spec note (AGENTIC_CLI §9 / SECURITY_GUIDELINE) deferred — dev-mode is
 still code-behind-spec end-to-end.
 
+Seventeenth follow-up (smoke coverage tracked the rename — operator-flagged).
+Routing `worktree.ts` through `appDirName()` means `defaultWorktreeRoot()` now
+resolves `$XDG_CACHE_HOME/forja/worktrees` (or the active profile), but
+`evals/smoke-worktree-gc.sh` still seeded its fixture under the pre-rename
+`$XDG_CACHE_HOME/agent/worktrees`. The smoke still PASSED — the GC plan includes
+DB rows filtered by the parent repo cwd, so the seeded row was handled via the
+DB path — but the fixture sat OUTSIDE the root the CLI scans, so the cache-scan
+reconciliation (`listCacheDirs`) and the under-root removal fallback
+(`isUnderRoot`, worktree-gc.ts) were no longer exercised: a silent false-green.
+Fixed by DERIVING the root from the source of truth at smoke startup
+(`bun -e … defaultWorktreeRoot()`) instead of hardcoding a namespace — so the
+fixture always lands under whatever root `--worktrees gc` resolves, and the
+coverage can't silently drift on a future rename or profile. Dropped the dead
+`mkdir $XDG_DATA_HOME/agent` (openDb auto-creates its dir). Verified: smoke green
+canonical AND under FORJA_PROFILE=dev (seed + CLI both resolve `forja-dev`, fixture
+under that root).
+
 ## [2026-06-15] Prompt: drop the model id from the # Environment block
 
 The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,
