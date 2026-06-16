@@ -2,6 +2,53 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-16] prompt: dispatch is the default when the request IS a playbook job
+
+Operator-reproduced on the DEFAULT model (opus-4-8, clean catalog): "faça code
+review da branch atual" was performed INLINE (git diff + read files, then a hard
+abort at 23s) instead of dispatching the `code-review` playbook. Not a weak-model
+issue and not the earlier stale-catalog phantom — a real routing gap. Root cause:
+the delegation preamble framed delegation as "the exception" with "default to
+answering directly", which pulls a capable model toward doing the review itself
+even though the request matches the playbook's `when_to_use` exactly and the
+routing eval already expects dispatch. Fixed by making dispatch the DEFAULT for a
+request that names a playbook's domain: added an explicit, up-front directive
+mapping "review this diff/PR/branch" → `code-review`, "audit / is this secure" →
+`security-audit`, "why is this slow" → `perf-investigate`, and calling out the
+inline anti-pattern ("the request named the job; route it, do not re-implement
+it"). Qualified the closing so "default to answering directly" now scopes to a
+general question, while a playbook-domain request defaults to dispatch. Kept the
+test-pinned phrases. Locked with a regression routing eval
+(`_routing/06-dispatch-review-current-branch.yaml`, the exact failing prompt) +
+a unit test asserting the directive + the review→code-review mapping.
+playbook-prompt + bootstrap suites green (82). NOTE: the behavioral fix (does
+opus now dispatch?) is NOT verified here — the routing eval is LLM-driven and was
+not run (no provider); needs a live REPL re-test or an eval run with a key.
+
+## [2026-06-16] skills: retire `review-diff`, absorb its sharp checks into the gate
+
+Removed the `review-diff` seed skill (9 → 8 canonical skills). It was the
+in-context self-review-before-commit pass — but with the `code-review` playbook
+now a proper merge gate, the two overlapped enough that keeping both invited
+the model to pick the wrong primitive. Before deleting, absorbed the three
+checks that genuinely SHARPEN a read-only gate and weren't already explicit in
+the playbook: leaked secrets/keys/tokens committed in the diff (→ `Find`, a
+clear critical blocker the generic "security risks" didn't name); the
+sink-correct defense for untrusted-input/auth/query/shell/path lines —
+parameterized query, output escaping, path normalization (→ `Consider`); and
+"read the enclosing function of each hunk, not just the changed lines" (→
+`Consider`, anti-shallow review). Deliberately did NOT absorb the parts that
+would re-introduce the noise the gatekeeper rewrite removed: the coupling/
+cohesion triggers (maintainability, not a merge blocker), the broad
+"new logic must ship a test" mandate (the gate flags only a specific
+dangerous-path test gap), the self-fix/`edit` behavior (the gate is read-only),
+and "state intent in one sentence" (the gate takes intent from the PR; `questions`
+covers ambiguity). Removal footprint: deleted the `.md`, dropped the
+`init-skills/index.ts` import + `CANONICAL_SKILLS` entry, updated `docs/SKILLS.md`
+(seed-set sentence + the two `9` counts → `8`), and the two count assertions in
+`init-skills.test.ts`. No eval or sibling-skill referenced it. skills + init +
+playbook suites green (58).
+
 ## [2026-06-16] prompt: frame subagent delegation as context compression
 
 The `# Playbook subagents` delegation preamble (`playbook-prompt.ts`) already

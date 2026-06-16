@@ -37,6 +37,8 @@ export const PLAYBOOK_DELEGATION_PREAMBLE = `# Playbook subagents
 
 Specialized subagents are available for structured workflows. Each one runs in an isolated context with restricted tools and returns a fixed-schema report. Spawn one with \`task_sync(playbook=<name>, prompt=<self-contained instruction>)\` for sequential coordination, or \`task_async\` when fanning out independent subtasks. The \`name\` column below is the routing identifier — slash commands (when present) are operator-facing and never used for tool routing.
 
+**If the request IS a loaded playbook's job, dispatch that playbook — do not do the work inline.** "review this diff/PR/branch" → \`code-review\`; "audit this / is this secure?" → \`security-audit\`; "why is this slow / find the regression" → \`perf-investigate\`. The request named the job; route it, do not re-implement it. Doing it inline floods this turn with the exact reads the playbook would isolate and drops its structured report (and, for review, its read-only guarantee).
+
 The core benefit is context compression: a subagent's reads, greps, and tool output stay in ITS context, and only a concise summary returns to this turn. Delegate when the cost of the exploration would exceed the cost of that summary — a large, self-contained investigation whose raw trail you do not need to keep. Ask the child for findings, conclusions, and evidence (file:line), not the trail.
 
 **Delegate to a playbook when:**
@@ -53,7 +55,7 @@ The core benefit is context compression: a subagent's reads, greps, and tool out
 - The task does not match any playbook's \`when_to_use\` and is not a clean general-purpose investigation — do not force-fit.
 - The user asked for a direct answer, not a structured report.
 
-Spawning a subagent costs context handoff, budget, and latency. Default to answering directly; delegation is the exception that pays a specific benefit — context compression, isolation, schema, bias, or tool restriction.`;
+Spawning a subagent costs context handoff, budget, and latency. For a general question, default to answering directly — delegation is the exception there. But when the request matches a playbook's domain (above), dispatching IS the default, not the exception; the benefit it pays is context compression, isolation, schema, bias, or tool restriction.`;
 
 // Workflow discipline that complements the delegation criteria.
 // PLAYBOOKS.md §1.4 frames delegation as a per-call decision; this

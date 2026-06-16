@@ -54,6 +54,20 @@ describe('PLAYBOOK_DELEGATION_PREAMBLE', () => {
     expect(PLAYBOOK_DELEGATION_PREAMBLE.toLowerCase()).toContain('default to answering directly');
   });
 
+  test('makes dispatch the default when the request IS a playbook job (not inline)', () => {
+    // Regression: opus-4-8 with a clean catalog reviewed "faça code review da
+    // branch atual" INLINE instead of dispatching code-review — the "default
+    // to answering directly" framing pulled against dispatch for a request that
+    // names the playbook's job. The preamble must explicitly route such a
+    // request to dispatch and call out the inline anti-pattern.
+    const lower = PLAYBOOK_DELEGATION_PREAMBLE.toLowerCase();
+    expect(lower).toContain('dispatch');
+    expect(lower).toContain('inline');
+    // The concrete review → code-review mapping must be present so the model
+    // connects the natural-language ask to the routing identifier.
+    expect(lower).toMatch(/review[^\n]*code-review/);
+  });
+
   test('frames the context-compression economics, not just schema-fit', () => {
     // The load-bearing reason to delegate is keeping a large raw
     // exploration out of the parent context — exploration cost vs
