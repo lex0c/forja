@@ -2,6 +2,23 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-16] fix(permissions): empty-string fs path is "omitted", not a deny
+
+Observed in a real session: a `git` call with `path: ''` was DENIED with
+"missing or non-string path argument", forcing the model to retry with `.`. Root
+cause is a tool↔engine inconsistency for the rootArg tools (grep/glob/git): the
+TOOLS treat an empty path as OMITTED (repo-wide — git.ts/grep.ts say so, and
+models often emit `''`), but the engine's `resolveFsTarget` mapped only
+`undefined` → cwd, while `''` fell through to `isNonEmptyString('') === false`
+→ null → deny. So a repo-wide `git status` with `path: ''` was blocked even
+though the identical call with the arg absent passed and the tool would have run
+repo-wide either way. Fixed `resolveFsTarget` to treat `''` like `undefined`
+(→ cwd) for rootArg tools. NOT a security loosening: empty path = repo-wide =
+exactly what an absent arg already resolves to (cwd, an already-classified
+scope); a genuinely non-string value (number/array/null) still returns null →
+deny. Regression test: `git` with `path: ''` resolves to cwd and passes under a
+read_file allow. Full permissions suite green (2328).
+
 ## [2026-06-16] tui: vocab for the 8 chip-less builtins + self-maintaining coverage
 
 Asking how a skill appears in the TUI surfaced the same gap as working_state_update,

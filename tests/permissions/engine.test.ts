@@ -981,6 +981,20 @@ describe('engine.check (search tools: glob/grep)', () => {
     expect(eng.check('git', 'fs.read', { mode: 'log' }).kind).toBe('allow');
   });
 
+  test('empty-string path is treated as omitted (resolves to cwd), not denied', () => {
+    // Regression: git/grep treat `path: ''` as omitted (repo-wide; models often
+    // emit it), but the engine denied it as "missing or non-string path" — so a
+    // repo-wide `git status` with `path: ''` was wrongly blocked while the same
+    // call with the arg absent passed. Empty string now resolves to cwd like an
+    // absent arg (the pathless case above), matching the tool's convention.
+    const eng = createPermissionEngine(
+      policy({ tools: { read_file: { allow_paths: ['./**'] } } }),
+      { cwd: CWD },
+    );
+    expect(eng.check('git', 'fs.read', { mode: 'status', path: '' }).kind).toBe('allow');
+    expect(eng.check('git', 'fs.read', { mode: 'log', path: '' }).kind).toBe('allow');
+  });
+
   test('git with a path is checked against the read_file allow_paths', () => {
     const eng = createPermissionEngine(
       policy({ tools: { read_file: { allow_paths: ['src/**'] } } }),

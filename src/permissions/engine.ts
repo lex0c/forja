@@ -533,10 +533,17 @@ const FS_TOOL_TRAITS: Readonly<Record<string, FsToolTraits>> = {
 const resolveFsTarget = (toolName: string, args: ToolArgs, cwd: string): string | null => {
   const rootArg = FS_TOOL_TRAITS[toolName]?.rootArg;
   if (rootArg !== undefined) {
-    // Search tool: a pathless/cwd-less call targets the session cwd;
-    // a present-but-non-string value is structural failure (null).
+    // Search/survey tool (grep/glob/git): a pathless call targets the session
+    // cwd. An EMPTY-STRING path is the SAME "omitted" signal — these tools
+    // themselves treat `path: ''` as omitted (models often emit it; see
+    // git.ts / grep.ts), so the engine must classify it as cwd too rather than
+    // deny it as malformed. Without this, a repo-wide `git status` / `grep`
+    // with `path: ''` is wrongly DENIED while the identical call with the arg
+    // absent is allowed — the tool would have run repo-wide either way. A
+    // present NON-string value (number, array, null) is still a structural
+    // failure (null → deny).
     const value = args[rootArg];
-    if (value === undefined) return cwd;
+    if (value === undefined || value === '') return cwd;
     return isNonEmptyString(value) ? value : null;
   }
   return filePathOf(args);
