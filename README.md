@@ -48,7 +48,7 @@ bun install
 # A dev build (FORJA_PROFILE=dev bun run build) adds the profile:
 # dist/forja-0.0.0-dev-linux-x64 — the binary itself is profile-agnostic.
 bun run build              # produces dist/forja-<version>-linux-x64
-ln -s "$PWD/dist/forja-0.0.0-linux-x64" ~/.local/bin/agent
+ln -s "$PWD/dist/forja-0.0.0-linux-x64" ~/.local/bin/forja
 ```
 
 Verify the install:
@@ -80,7 +80,7 @@ Open the interactive REPL inside a project you want to work on:
 
 ```bash
 cd ~/projects/my-repo
-agent
+forja
 ```
 
 The first time Forja sees a directory, it asks you to attest the trust
@@ -90,7 +90,7 @@ playbooks, skills, project-local memory) is loaded.
 Or run a one-shot prompt:
 
 ```bash
-agent "summarize the README"
+forja "summarize the README"
 forja --model openai/gpt-4o "list the public functions in src/api/"
 ```
 
@@ -106,11 +106,11 @@ forja --json "what changed in the last commit?" > events.ndjson
 
 | Subsystem | What it does | Surfaces |
 |---|---|---|
-| **Harness loop** | The agent runtime: step budget, max-cost cap, compaction at 70% context, retries with classified failure modes | `agent <prompt>` |
+| **Harness loop** | The agent runtime: step budget, max-cost cap, compaction at 70% context, retries with classified failure modes | `forja <prompt>` |
 | **Permissions** | Layered allow/deny policy with glob + prefix matching (no regex). Sandbox profiles per tool category. Per-session approval posture (supervised / autonomous) | `forja --explain-permissions`, `--autonomous`, Shift+Tab, `.forja/permissions.yaml` |
 | **Memory** | Cross-session knowledge with three scopes (user / project_shared / project_local), explicit trust, lifecycle states (active / quarantined / invalidated), provenance tracking | `forja --memory list`, `forja --memory show <name>`, `/memory` slash |
 | **Skills** | Eager-loaded catalog of operator-authored procedures, body lazy | Skills auto-surface in system prompt; `/skill` slash |
-| **Subagents** | Worktree-isolated child runs (`task`), async handles (`task_async`), parallel dispatch with caps | `agents/*.md` playbooks |
+| **Subagents** | Worktree-isolated child runs (`task`), async handles (`task_async`), parallel dispatch with caps | `.forja/playbooks/*.md` |
 | **Checkpoints** | Auto-snapshot of the working tree before any write tool. `--undo` restores | `forja --undo <session>`, `forja --checkpoints list <session>` |
 | **Audit** | Append-only event log across messages, tool calls, approvals, hooks, failures, memory events, checkpoints. Optional hash chain (tamper-evident) | `audit_timeline` view, `.local/share/forja/audit.db` |
 | **Hooks** | Operator-provided shell hooks at lifecycle events (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, etc.) with `additionalContext` injection | `.forja/hooks/` |
@@ -130,7 +130,7 @@ search, ctrl-c double-tap-to-exit gate.
 and exits. Useful in scripts:
 
 ```bash
-agent "regenerate the openapi.yaml from the route handlers and run npm test"
+forja "regenerate the openapi.yaml from the route handlers and run npm test"
 ```
 
 **Headless / NDJSON.** `--json` emits one event per line on stdout (banner,

@@ -357,6 +357,19 @@ coverage can't silently drift on a future rename or profile. Dropped the dead
 canonical AND under FORJA_PROFILE=dev (seed + CLI both resolve `forja-dev`, fixture
 under that root).
 
+Eighteenth follow-up (README rename residue — same class, operator-flagged). The
+install block symlinked the binary to `~/.local/bin/agent` (pre-rename name) but
+the very next verify commands use `forja --version` / `forja doctor` — a fresh
+install with no existing `forja` on PATH would fail despite a successful build.
+Retargeted the symlink to `~/.local/bin/forja` (the canonical command, matching
+package.json `bin` and every other invocation in the doc) rather than adding a
+dead `agent` alias. Swept the same residue while there: the REPL-launch and
+one-shot examples (`agent` / `agent "…"`), the harness-loop table cell
+(`agent <prompt>` → `forja <prompt>`), and a stale playbook-path cell
+(`agents/*.md` → `.forja/playbooks/*.md`, the real discovery dir). Left the
+generic English prose untouched ("coding agent", "agent CLIs", "the agent
+runtime"). Docs-only.
+
 ## [2026-06-15] Prompt: drop the model id from the # Environment block
 
 The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,
