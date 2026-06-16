@@ -2,6 +2,31 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-16] prompt: frame subagent delegation as context compression
+
+The `# Playbook subagents` delegation preamble (`playbook-prompt.ts`) already
+listed "context isolation" as one of four reasons to delegate, but framed the
+whole decision around schema-fit (named playbooks) and actively DISCOURAGED
+delegating exploration ("premature delegation locks in a schema"). That left the
+highest-value case under-served: delegating a large, well-scoped investigation
+to `general-purpose` purely to keep its raw reads/greps OUT of the parent context
+— the lever that most reduces context growth (and, per the cost profile, the
+write-cost axis). Augmented the preamble (NOT a second competing section — the
+existing one is the right home) with the central economics up front: a subagent
+returns only a summary, so delegate when the cost of the exploration exceeds the
+cost of that summary; ask for findings + evidence (file:line), not the trail.
+Added the self-contained-investigation case (repo exploration, root-cause, broad
+search) as an explicit "delegate when", and reconciled the exploration
+contradiction: a clear question over voluminous reading IS compression (good);
+an ill-formed problem you are still shaping interactively is not (delegate once
+the question is sharp). Added a "tightly coupled / continuous coordination"
+exclusion. Kept the test-pinned phrases (`task_sync`/`task_async`, "Delegate to
+a playbook when", "Do NOT delegate when", "Default to answering directly"); no
+layer added, so the system-prompt order is unchanged. New test asserts the
+compression framing + the new candidate/exclusion. playbook-prompt + bootstrap
+suites green (81). (Spec `PLAYBOOKS.md §1.4` could be synced to match; left for a
+spec PR — not touched here.)
+
 ## [2026-06-16] playbook: rewrite the code-review gate (merge-gatekeeper prose)
 
 Rewrote the `code-review` seed playbook body around a sharper merge-gatekeeper
