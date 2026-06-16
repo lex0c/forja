@@ -4243,6 +4243,11 @@ const couldGlobReachProtected = (
     // warranted (a literal read is denied too, not just escalated). Empty on
     // the default namespace.
     ...targets.cwdForeignDenyDirs,
+    // Foreign USER dir(s) — the operator's real `~/.config/forja` +
+    // `~/.local/share/forja` under a profile, also DENY (read+write). Same
+    // reasoning: a glob like `~/.config/f*` that could expand into the real
+    // namespace is held conservative. Empty on the default namespace.
+    ...targets.tildeForeignDenyDirs,
   ];
   // Normalize: a literal-prefix that ends in `/` is "in a parent
   // directory; glob fills in the next segment". A literal-prefix

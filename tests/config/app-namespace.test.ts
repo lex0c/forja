@@ -3,6 +3,7 @@ import {
   activeProfile,
   appDirName,
   appDirNames,
+  foreignAppDirNames,
   foreignProjectDirNames,
   isValidProfile,
   projectDirName,
@@ -108,5 +109,24 @@ describe('foreignProjectDirNames (project read-floor)', () => {
   test('profile ⇒ the canonical .forja/ is foreign (real project state to mask/deny)', () => {
     // NOT the active `.forja-<profile>/` — that stays readable/writable.
     expect(foreignProjectDirNames({ FORJA_PROFILE: 'dev' })).toEqual(['.forja']);
+  });
+});
+
+describe('foreignAppDirNames (user-level read-floor)', () => {
+  test('no profile ⇒ empty (the canonical forja IS the active session, nothing foreign)', () => {
+    expect(foreignAppDirNames({})).toEqual([]);
+    expect(foreignAppDirNames({ FORJA_PROFILE: '' })).toEqual([]);
+  });
+
+  test('profile ⇒ the canonical forja is foreign (real user state: audit/trust/sessions)', () => {
+    // The active `forja-<profile>` is NOT here — it keeps escalate-on-write +
+    // readability; only the operator's real `forja` user dir is denied.
+    expect(foreignAppDirNames({ FORJA_PROFILE: 'dev' })).toEqual(['forja']);
+  });
+
+  test('a malformed profile throws rather than silently using canonical', () => {
+    expect(() => foreignAppDirNames({ FORJA_PROFILE: '../escape' })).toThrow(
+      /invalid FORJA_PROFILE/,
+    );
   });
 });

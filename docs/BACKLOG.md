@@ -312,6 +312,34 @@ runtime path). New unit test for `playbookDirsHint` (no-profile byte-identical /
 profile-carried / malformed-throws); the existing default-namespace label tests
 in memory.test.ts stay green unchanged (byte-identical when no profile is set).
 
+Sixteenth follow-up (closing the one real isolation asymmetry the sweep's
+verdict named — operator-asked "totalmente isolados?"). The closing sweep
+reported the functional surface clean EXCEPT one asymmetry: the project-level
+real `.forja/` was read+write DENIED from a profiled session, but the USER-level
+real state (`~/.config/forja` + `~/.local/share/forja` — audit DB, trust list,
+sessions, install_id; strictly MORE sensitive, spanning all projects) had only
+escalate-on-write + the sandbox mask. The sandbox masks both namespaces' user
+dirs for EXEC tools (`hidePathsDirs`), but `read_file`/`grep` read OUTSIDE the
+sandbox and hit only the engine floor — and for `op === 'read'` the engine
+denied just SYSTEM_DENY_ROOTS + the project foreign dir, so a profiled session
+could disclose the operator's real audit/sessions/config via a plain read
+(confirm, not deny). Closed it symmetric to the project level: new
+`foreignAppDirNames()` (`[]` default / `['forja']` under profile — the user-level
+dual of `foreignProjectDirNames`), a `tildeForeignDenyDirs` set covering
+`.config/<seg>` + `.local/share/<seg>` (mirroring exactly what the escalate list
+and the sandbox mask cover), and a deny loop in `classifyProtectedPath` that
+runs BEFORE the read passthrough (read AND write) — superseding the escalate the
+canonical dir would otherwise get, while the active `forja-<profile>` dir (never
+foreign) keeps escalate-on-write + readability. Surfaced on `protectedTargets`
+so the bash glob guard refuses a glob like `~/.config/f*` into the real
+namespace too. Additive: empty on the default namespace ⇒ byte-identical, no git
+spawn, no sandbox change (the mask already covered exec). Tests: foreignAppDirNames
+(default/profile/malformed), engine deny of the real user dir for read+write
+under profile, the active forja-dev dir staying accessible, no-profile
+byte-identical, and the glob-guard surfacing. Full permissions suite green
+(2344). Spec note (AGENTIC_CLI §9 / SECURITY_GUIDELINE) deferred — dev-mode is
+still code-behind-spec end-to-end.
+
 ## [2026-06-15] Prompt: drop the model id from the # Environment block
 
 The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,

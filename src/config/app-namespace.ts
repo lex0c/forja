@@ -104,3 +104,21 @@ export const foreignProjectDirNames = (env: NodeJS.ProcessEnv = process.env): re
   const profile = resolveProfile(env);
   return profile === null ? [] : ['.forja'];
 };
+
+// User-level analog of `foreignProjectDirNames`: the user-level app dir(s) that
+// belong to a DIFFERENT namespace than the active session and must be FULLY
+// isolated at the read floor — read-AND-write denied by the permission engine.
+// Under a profile that's the operator's REAL canonical `forja` (their
+// `~/.config/forja` + `~/.local/share/forja`: audit DB, trust list, sessions,
+// install_id — state spanning ALL their projects, strictly more sensitive than
+// any single project dir). The sandbox already MASKS both namespaces' user dirs
+// from sandboxed exec (`hidePathsDirs`), but the `read_file`/`grep` tools read
+// outside the sandbox and hit only this engine floor — so without this a
+// profiled session could read the operator's real audit/sessions/config via a
+// plain tool. The active session's OWN user dir (`appDirName()`) is never here,
+// so its escalate-on-write protection is untouched. Empty on the default
+// namespace — the canonical `forja` IS the active session's there.
+export const foreignAppDirNames = (env: NodeJS.ProcessEnv = process.env): readonly string[] => {
+  const profile = resolveProfile(env);
+  return profile === null ? [] : ['forja'];
+};

@@ -225,6 +225,60 @@ describe('classifyProtectedPath — escalate tier (writes only)', () => {
   });
 });
 
+describe('classifyProtectedPath — user-level foreign deny (under a profile)', () => {
+  // The operator's REAL `~/.config/forja` + `~/.local/share/forja` (audit DB,
+  // trust, sessions) must be denied for READ and WRITE from a profiled session
+  // — the user-level dual of the project foreign deny. A unique cwd per test so
+  // the (home,cwd) target cache never collides with a no-profile entry.
+  const withProfile = (cwd: string, fn: (cwd: string) => void) => {
+    const prev = process.env.FORJA_PROFILE;
+    process.env.FORJA_PROFILE = 'dev';
+    try {
+      fn(cwd);
+    } finally {
+      if (prev === undefined) delete process.env.FORJA_PROFILE;
+      else process.env.FORJA_PROFILE = prev;
+    }
+  };
+
+  test.each([
+    '/home/op/.config/forja',
+    '/home/op/.config/forja/permissions.yaml',
+    '/home/op/.local/share/forja',
+    '/home/op/.local/share/forja/audit.db',
+  ])('denies the real user dir %s for both read and write', (absPath) => {
+    withProfile('/work/foreign-user-deny', (cwd) => {
+      expect(classifyProtectedPath({ absPath, op: 'read', home: HOME, cwd })).toBe('deny');
+      expect(classifyProtectedPath({ absPath, op: 'write', home: HOME, cwd })).toBe('deny');
+    });
+  });
+
+  test('the active forja-dev user dir stays accessible (escalate-write / read-passthrough)', () => {
+    withProfile('/work/foreign-user-own', (cwd) => {
+      // Own namespace: NOT denied. Write still escalates (silent-edit guard),
+      // read passes through to the normal allow/confirm chain.
+      const own = '/home/op/.config/forja-dev/permissions.yaml';
+      expect(classifyProtectedPath({ absPath: own, op: 'write', home: HOME, cwd })).toBe(
+        'escalate',
+      );
+      expect(classifyProtectedPath({ absPath: own, op: 'read', home: HOME, cwd })).toBeNull();
+      const ownData = '/home/op/.local/share/forja-dev/audit.db';
+      expect(classifyProtectedPath({ absPath: ownData, op: 'read', home: HOME, cwd })).toBeNull();
+    });
+  });
+
+  test('no profile ⇒ no user-level deny (byte-identical: real dir is the active session)', () => {
+    // Distinct cwd from the profile tests; no FORJA_PROFILE set.
+    const cwd = '/work/foreign-user-none';
+    expect(
+      classifyProtectedPath({ absPath: '/home/op/.config/forja', op: 'read', home: HOME, cwd }),
+    ).toBeNull();
+    expect(
+      classifyProtectedPath({ absPath: '/home/op/.config/forja', op: 'write', home: HOME, cwd }),
+    ).toBe('escalate');
+  });
+});
+
 describe('protectedTargets', () => {
   test('resolves tilde and cwd entries against supplied roots', () => {
     const t = protectedTargets(HOME, CWD);
@@ -239,8 +293,9 @@ describe('protectedTargets', () => {
     expect(t.cwdEscalateDirs).toContain('/work/proj/.git');
     expect(t.cwdEscalateDirs).toContain('/work/proj/.forja');
     expect(t.cwdEscalateDirs).toContain('/work/proj/.claude');
-    // Default namespace: no foreign deny root.
+    // Default namespace: no foreign deny roots (project or user level).
     expect(t.cwdForeignDenyDirs).toEqual([]);
+    expect(t.tildeForeignDenyDirs).toEqual([]);
   });
 
   test('under a profile, surfaces the foreign canonical .forja deny root (for the glob guard)', () => {
@@ -257,6 +312,11 @@ describe('protectedTargets', () => {
       const t = protectedTargets(HOME, cwd);
       expect(t.cwdForeignDenyDirs).toContain(`${cwd}/.forja`);
       expect(t.cwdForeignDenyDirs).not.toContain(`${cwd}/.forja-dev`);
+      // User-level foreign deny surfaced for the glob guard too: the real
+      // ~/.config/forja + ~/.local/share/forja, NOT the active forja-dev.
+      expect(t.tildeForeignDenyDirs).toContain('/home/op/.config/forja');
+      expect(t.tildeForeignDenyDirs).toContain('/home/op/.local/share/forja');
+      expect(t.tildeForeignDenyDirs).not.toContain('/home/op/.config/forja-dev');
     } finally {
       if (prev === undefined) delete process.env.FORJA_PROFILE;
       else process.env.FORJA_PROFILE = prev;

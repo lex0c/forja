@@ -35,7 +35,12 @@
 // `grep`) that bypass the bash AST entirely.
 
 import { resolve } from 'node:path';
-import { appDirNames, foreignProjectDirNames, projectDirNames } from '../config/app-namespace.ts';
+import {
+  appDirNames,
+  foreignAppDirNames,
+  foreignProjectDirNames,
+  projectDirNames,
+} from '../config/app-namespace.ts';
 import { resolveRepoRoot } from '../memory/paths.ts';
 import { createBoundedCache } from './bounded-cache.ts';
 
@@ -325,6 +330,20 @@ const tildeEscalateDirs = (): readonly string[] => {
   return [...TILDE_ESCALATE_DIRS_BASE, ...own];
 };
 
+// User-level dirs of a FOREIGN namespace — the operator's real `forja` under a
+// profile — that are DENIED for read AND write (the tilde analog of
+// `cwdEscalateDirs`'s foreign counterpart). Covers `.config/<seg>` +
+// `.local/share/<seg>` for each foreign segment, mirroring exactly what
+// `tildeEscalateDirs` (escalate) and `hidePathsDirs` (sandbox mask) cover for
+// the active namespace. Empty on the default namespace ⇒ no behavior change.
+const tildeForeignDenyDirs = (): readonly string[] => {
+  const dirs: string[] = [];
+  for (const seg of foreignAppDirNames()) {
+    dirs.push(`.config/${seg}`, `.local/share/${seg}`);
+  }
+  return dirs;
+};
+
 // Absolute roots that escalate on write regardless of cwd or home.
 const ABSOLUTE_ESCALATE_ROOTS: readonly string[] = ['/etc'];
 
@@ -383,6 +402,12 @@ interface ResolvedProtectedTargets {
   // namespace. Resolved against cwd, profile read from process.env (frozen per
   // process, so the (home,cwd) cache key stays sound).
   cwdForeignDenyDirs: readonly string[];
+  // USER-level dirs of a foreign namespace (the operator's real
+  // `~/.config/forja` + `~/.local/share/forja` under a profile) — DENIED for
+  // read AND write. The user-level analog of `cwdForeignDenyDirs`: the more
+  // sensitive surface (audit DB, trust, sessions span ALL projects). Resolved
+  // against `home`. Empty on the default namespace.
+  tildeForeignDenyDirs: readonly string[];
 }
 
 // Cap calibrated for the realistic (home, cwd) tuple churn —
@@ -422,6 +447,7 @@ const getResolvedTargets = (home: string, cwd: string): ResolvedProtectedTargets
       tildeEscalateDirs: tildeEscalateDirs().map((d) => resolveTildeFile(home, d)),
       cwdEscalateDirs: cwdEscalateDirs().map((d) => resolveCwdDir(projectRoot, d)),
       cwdForeignDenyDirs: foreignDirs.map((d) => resolveCwdDir(projectRoot, d)),
+      tildeForeignDenyDirs: tildeForeignDenyDirs().map((d) => resolveTildeFile(home, d)),
     };
     targetCache.set(key, entry);
   }
@@ -475,6 +501,20 @@ export const classifyProtectedPath = (input: ProtectedClassifyInput): ProtectedT
     if (startsWithSegment(absPath, dir)) return 'deny';
   }
 
+  // Tier `deny` (user-level read-floor) — the operator's REAL `~/.config/forja`
+  // + `~/.local/share/forja` under a profile: denied for READ AND WRITE, the
+  // user-level dual of the project foreign-deny above. The sandbox masks these
+  // for exec tools, but `read_file`/`grep` read outside the sandbox and reach
+  // only this floor — so without this loop a profiled session could disclose
+  // the operator's real audit DB / sessions / trust list via a plain read. Runs
+  // before the read passthrough (the canonical dir is also in tildeEscalateDirs;
+  // this supersedes that escalate for the foreign case). The active session's
+  // own `forja-<profile>` dir is never here, so it keeps escalate-on-write +
+  // readability. Empty on the default namespace ⇒ no behavior change there.
+  for (const dir of targets.tildeForeignDenyDirs) {
+    if (startsWithSegment(absPath, dir)) return 'deny';
+  }
+
   // Tier `escalate` — only writes/deletes are upgraded. Reads pass
   // through; the engine's regular allow/confirm/deny chain still runs.
   if (op === 'read') return null;
@@ -516,6 +556,11 @@ export interface ProtectedTargets {
   // namespace. Resolved at the repo root (see getResolvedTargets), so a glob
   // like `../.forja/*` from a subdir cwd is still caught.
   cwdForeignDenyDirs: readonly string[];
+  // Foreign-namespace USER dir(s) — the real `~/.config/forja` +
+  // `~/.local/share/forja` under a profile, denied for read AND write. Surfaced
+  // for the same glob guard (`cat ~/.config/f*/…`); empty on the default
+  // namespace.
+  tildeForeignDenyDirs: readonly string[];
 }
 
 // Reuse the cached `getResolvedTargets` so this exported view stays consistent
@@ -533,6 +578,7 @@ export const protectedTargets = (home: string, cwd: string): ProtectedTargets =>
     tildeEscalateDirs: resolved.tildeEscalateDirs,
     cwdEscalateDirs: resolved.cwdEscalateDirs,
     cwdForeignDenyDirs: resolved.cwdForeignDenyDirs,
+    tildeForeignDenyDirs: resolved.tildeForeignDenyDirs,
   };
 };
 
