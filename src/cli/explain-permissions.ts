@@ -16,6 +16,7 @@
 // --list-sessions: each line is a self-contained JSON object,
 // `kind` discriminates. Consumers stream-parse via jq or similar.
 
+import { projectDirName } from '../config/app-namespace.ts';
 import {
   type Layer,
   type LayerPolicy,
@@ -183,7 +184,7 @@ export const renderExplainPermissions = (
     lines.push('');
     if (mode === 'strict') {
       lines.push(
-        "(no tool sections defined — every gated tool will be denied. Create '.forja/permissions.yaml')",
+        `(no tool sections defined — every gated tool will be denied. Create '${projectDirName()}/permissions.yaml')`,
       );
     } else {
       lines.push('(no tool sections defined)');

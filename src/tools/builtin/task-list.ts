@@ -1,4 +1,5 @@
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
+import { playbookDirsHint } from './task-shared.ts';
 
 // `task_list` returns a snapshot of every subagent handle the
 // current session knows about — both the handles still running
@@ -101,7 +102,7 @@ export const taskListTool: Tool<TaskListInput, TaskListOutput> = {
         'subagent.unavailable',
         'subagents are not available in this run (no registry wired)',
         {
-          hint: 'task_list needs the same harness wiring as task_async / task_await. Define agents under ~/.config/forja/playbooks/ or <cwd>/.forja/playbooks/ and bootstrap will pick them up.',
+          hint: `task_list needs the same harness wiring as task_async / task_await. Define agents under ${playbookDirsHint()} and bootstrap will pick them up.`,
         },
       );
     }

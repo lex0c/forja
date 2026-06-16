@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import { rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { forjaCommand } from '../cli/forja-command.ts';
+import { projectDirName } from '../config/app-namespace.ts';
 import type { HarnessEvent } from '../harness/index.ts';
 import type { HookSpec } from '../hooks/types.ts';
 import type { PermissionEngine } from '../permissions/index.ts';
@@ -753,7 +755,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
   // the path here and forward it. For tests that inject a fake
   // spawn, the path is still computed (deterministic shape) but
   // unused by the fake.
-  const bgLogDir = join(input.cwd, '.forja', 'bg', 'subagents', childSession.id);
+  const bgLogDir = join(input.cwd, projectDirName(), 'bg', 'subagents', childSession.id);
   let handle: ChildProcessHandle;
   try {
     handle = spawn({
@@ -1439,7 +1441,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
     }
   } else if (stillRunningCount > 0) {
     process.stderr.write(
-      `subagent ${childSession.id}: bg log dir '${bgLogDir}' preserved — ${stillRunningCount} bg row(s) still 'running' (reaper deferred or kill incomplete); inspect via OS tools or 'forja worktree gc'\n`,
+      `subagent ${childSession.id}: bg log dir '${bgLogDir}' preserved — ${stillRunningCount} bg row(s) still 'running' (reaper deferred or kill incomplete); inspect via OS tools or '${forjaCommand('worktree gc')}'\n`,
     );
   }
   // stillRunningCount === -1: re-query failed; warning already

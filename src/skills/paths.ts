@@ -1,5 +1,6 @@
 import { join, posix, resolve, sep, win32 } from 'node:path';
 import { agentConfigDir } from '../config/agent-paths.ts';
+import { projectDirName } from '../config/app-namespace.ts';
 import { validateName } from './frontmatter.ts';
 import type { SkillScope } from './types.ts';
 
@@ -63,8 +64,8 @@ export const userScopeRoot = (
 // local in `.forja/skills/local/` (gitignored). When the agent runs
 // outside a git repo, the caller passes the cwd itself as `repoRoot`.
 export const projectScopeRoots = (repoRoot: string): { shared: string; local: string } => ({
-  shared: join(repoRoot, '.forja', 'skills', 'shared'),
-  local: join(repoRoot, '.forja', 'skills', 'local'),
+  shared: join(repoRoot, projectDirName(), 'skills', 'shared'),
+  local: join(repoRoot, projectDirName(), 'skills', 'local'),
 });
 
 export const resolveScopeRoots = (

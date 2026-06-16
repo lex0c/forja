@@ -6,10 +6,10 @@
   "license": "Apache-2.0",
   "type": "module",
   "bin": {
-    "forja": "./dist/forja-linux-x64"
+    "forja": "./dist/forja-0.0.0-linux-x64"
   },
   "scripts": {
-    "dev": "bun run --watch src/cli/index.ts",
+    "dev": "FORJA_PROFILE=dev bun run --watch src/cli/index.ts",
     "start": "bun run src/cli/index.ts",
     "test": "bun test",
     "eval:smoke": "bun run src/evals/cli.ts evals/smoke",

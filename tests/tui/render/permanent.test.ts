@@ -229,6 +229,17 @@ describe('formatPermanent', () => {
       const out = formatPermanent(baseBanner, unicode);
       for (const line of out) expect(line).not.toContain(CSI);
     });
+
+    test('appends an isolation-profile line when a profile is active', () => {
+      const out = formatPermanent({ ...baseBanner, profile: 'dev' }, unicode);
+      expect(out).toHaveLength(4);
+      expect(out[3]).toBe(pad('profile: dev (isolated namespace)'));
+    });
+
+    test('no profile line on the default namespace (null / absent)', () => {
+      expect(formatPermanent({ ...baseBanner, profile: null }, unicode)).toHaveLength(3);
+      expect(formatPermanent(baseBanner, unicode)).toHaveLength(3);
+    });
   });
 
   describe('user-submit (inverse bar, UI.md §4.10.8)', () => {

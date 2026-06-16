@@ -26,6 +26,8 @@ dist/
 # Bun
 .bun/
 .forja/
+# Isolated dev/test profile dirs (`forja --profile <name>` / `bun run dev`)
+.forja-*/
 .claude/
 
 # Scratch probe dirs from security-audit / debug sessions

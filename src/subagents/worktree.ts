@@ -1,6 +1,8 @@
 import { chmodSync, existsSync, lstatSync, mkdirSync, rmSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { forjaCommand } from '../cli/forja-command.ts';
+import { appDirName } from '../config/app-namespace.ts';
 import { getGitBinary, safeGitEnv } from './git-binary.ts';
 import { type ValidationResult, validateWorktreeContents } from './worktree-validation.ts';
 
@@ -37,7 +39,7 @@ export const defaultWorktreeRoot = (env: NodeJS.ProcessEnv = process.env): strin
   const xdg = env.XDG_CACHE_HOME;
   const home = env.HOME ?? homedir();
   const cache = xdg !== undefined && xdg.length > 0 ? xdg : join(home, '.cache');
-  return join(cache, 'forja', 'worktrees');
+  return join(cache, appDirName(env), 'worktrees');
 };
 
 // Slug a free-form user prompt into a kebab-cased fragment safe
@@ -231,7 +233,7 @@ export const createWorktree = async (opts: CreateWorktreeOptions): Promise<Workt
   const path = join(root, opts.sessionId);
   if (existsSync(path)) {
     throw new Error(
-      `worktree path '${path}' already exists; an earlier run may have crashed before cleanup. Remove it manually or wait for 'forja worktree gc'.`,
+      `worktree path '${path}' already exists; an earlier run may have crashed before cleanup. Remove it manually or wait for '${forjaCommand('worktree gc')}'.`,
     );
   }
   const branch = branchName(opts.sessionId, opts.prompt);
@@ -247,7 +249,7 @@ export const createWorktree = async (opts: CreateWorktreeOptions): Promise<Workt
   }
   if (list.stdout.includes(`worktree ${path}\n`) || list.stdout.includes(`worktree ${path}\0`)) {
     throw new Error(
-      `worktree '${path}' is already registered with git (orphan from a prior run); run 'git worktree prune' or 'forja worktree gc' before retrying`,
+      `worktree '${path}' is already registered with git (orphan from a prior run); run 'git worktree prune' or '${forjaCommand('worktree gc')}' before retrying`,
     );
   }
   // Make sure parent dir of the worktree path exists. `git

@@ -16,6 +16,7 @@
 // Anything the renderer doesn't understand goes through as a `warn`
 // — better a one-line scrollback note than silent loss.
 
+import { forjaCommand } from '../cli/forja-command.ts';
 import type { FileDiff } from '../diff/line-diff.ts';
 import type { ExitReason, HarnessEvent } from '../harness/types.ts';
 import type { Decision } from '../permissions/index.ts';
@@ -711,7 +712,7 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         out.push({
           type: 'warn',
           ts,
-          message: "  Run 'forja doctor' to investigate.",
+          message: `  Run '${forjaCommand('doctor')}' to investigate.`,
         });
         return out;
       }

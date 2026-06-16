@@ -43,12 +43,14 @@ import {
   unlinkSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { appDirName, projectDirName } from '../config/app-namespace.ts';
 import { resolveRepoRoot } from '../memory/paths.ts';
 import { ensureInstallId } from '../permissions/install_id.ts';
 import { closeDb, migrate, openDb } from '../storage/index.ts';
 import type { DB } from '../storage/index.ts';
 import { defaultDbPath } from '../storage/index.ts';
 import { insertPurgeEvent } from '../storage/repos/purge-events.ts';
+import { forjaCommand } from './forja-command.ts';
 import { VERSION } from './version.ts';
 
 // The five artifacts `forja init` scaffolds. Their presence (any
@@ -595,21 +597,29 @@ interface ForceReport {
 // every dry-run regardless of whether they exist — making the
 // contract observable (the operator doesn't need to grep for
 // "what's NOT touched").
-const PRESERVED_PATHS = [
-  '~/.local/share/forja/sessions.db    (global DB; sessions for this cwd remain queryable)',
-  '~/.config/forja/**                  (user-layer config + memory)',
-  '~/.local/share/forja/install_id     (install identity; audit chain genesis)',
-];
+//
+// A function (not a const) so the user-level segment is resolved at call time
+// — under `--profile dev` the dry-run names `~/.local/share/forja-dev/...` and
+// `~/.config/forja-dev/**`, matching where this run's state actually lives
+// (purge only ever touches the project `.forja[-<profile>]/` dir).
+const preservedPaths = (): string[] => {
+  const app = appDirName();
+  return [
+    `~/.local/share/${app}/sessions.db    (global DB; sessions for this cwd remain queryable)`,
+    `~/.config/${app}/**                  (user-layer config + memory)`,
+    `~/.local/share/${app}/install_id     (install identity; audit chain genesis)`,
+  ];
+};
 
 export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
   const { cwd, force, json, noAudit, out, err } = options;
   const repoRoot = resolveRepoRoot(cwd);
-  const agentDir = join(repoRoot, '.forja');
+  const agentDir = join(repoRoot, projectDirName());
 
   // Gate 1: directory exists.
   if (!existsSync(agentDir)) {
     err(
-      `forja purge: ${agentDir} does not exist — nothing to purge (run 'forja init' to scaffold it first)\n`,
+      `forja purge: ${agentDir} does not exist — nothing to purge (run '${forjaCommand('init')}' to scaffold it first)\n`,
     );
     return 1;
   }
@@ -683,22 +693,20 @@ export const runPurge = async (options: RunPurgeOptions): Promise<number> => {
   // Dry-run path
   // ────────────────────────────────────────────────────────────
   if (!force) {
-    // Build the suggested command, preserving the operator's
-    // --no-audit flag. Without this, an operator who ran
-    // `forja purge --no-audit` (typically because DB is broken
-    // — the exact emergency the flag exists for) would see
-    // "forja purge --force" suggested. Copy-pasting that would
-    // hit the audit gate and abort, blocking the emergency
-    // purge workflow. The suggested command must be directly
-    // executable; preserve scope flags.
-    const command = noAudit ? 'forja purge --force --no-audit' : 'forja purge --force';
+    // Suggested command must be directly executable AND hit the SAME namespace
+    // the dry-run reported. `forjaCommand` re-prefixes the active `--profile`
+    // (else a bare `forja purge --force` would purge the canonical `.forja/`,
+    // not the `.forja-<profile>/` just previewed). `--no-audit` is preserved
+    // because an operator who ran it (DB broken — the emergency the flag exists
+    // for) must not be handed a `--force` that re-hits the audit gate.
+    const command = forjaCommand(`purge --force${noAudit ? ' --no-audit' : ''}`);
     const report: DryRunReport = {
       mode: 'dry-run',
       repoRoot,
       scope: agentDir,
       categories: walk.categories,
       totals: walk.totals,
-      preserved: PRESERVED_PATHS,
+      preserved: preservedPaths(),
       audit,
       command,
     };

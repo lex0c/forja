@@ -34,6 +34,7 @@
 import { readFileSync } from 'node:fs';
 import { arch as nodeArch, platform as nodePlatform } from 'node:os';
 import { detectSandboxAvailability } from '../permissions/index.ts';
+import { forjaCommand } from './forja-command.ts';
 
 export interface RunSandboxSetupOptions {
   json?: boolean;
@@ -170,7 +171,7 @@ const computeRecommendation = (opts: RunSandboxSetupOptions): Recommendation => 
       platform,
       arch,
       status: 'already-installed',
-      message: `${availability.tool ?? 'sandbox'} is already installed. Run 'forja doctor' to verify the full health check.`,
+      message: `${availability.tool ?? 'sandbox'} is already installed. Run '${forjaCommand('doctor')}' to verify the full health check.`,
     };
   }
 

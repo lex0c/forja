@@ -15,8 +15,12 @@
 // sandbox lists.
 
 import { describe, expect, test } from 'bun:test';
-import { HIDE_PATHS_DIRS, HIDE_PATHS_FILES } from '../../src/permissions/sandbox-hide-paths.ts';
+import { HIDE_PATHS_FILES, hidePathsDirs } from '../../src/permissions/sandbox-hide-paths.ts';
 import { SENSITIVE_PATH_DENY_LIST } from '../../src/subagents/sensitive-paths.ts';
+
+// No FORJA_PROFILE in the test env ⇒ canonical list (the `forja` segment only).
+// Profile-aware expansion is asserted separately below.
+const HIDE_PATHS_DIRS = hidePathsDirs();
 
 describe('sandbox-hide-paths content', () => {
   test('canonical §9 directories present', () => {
@@ -63,6 +67,28 @@ describe('sandbox-hide-paths content', () => {
     for (const f of HIDE_PATHS_FILES) {
       expect(dirsSet.has(f)).toBe(false);
     }
+  });
+
+  test('profile env masks BOTH the canonical and the profile-namespaced Forja dirs', () => {
+    const dirs = hidePathsDirs({ FORJA_PROFILE: 'dev' });
+    // The canonical install still hidden — a dev sandbox must not read the
+    // operator's real audit DB / install_id / secrets.
+    expect(dirs).toContain('.config/forja');
+    expect(dirs).toContain('.local/share/forja');
+    // The dev install's own state hidden too.
+    expect(dirs).toContain('.config/forja-dev');
+    expect(dirs).toContain('.local/share/forja-dev');
+    // Non-Forja credential dirs unaffected.
+    expect(dirs).toContain('.ssh');
+  });
+
+  test('no profile ⇒ canonical Forja dirs only (byte-identical to pre-profile)', () => {
+    const dirs = hidePathsDirs({});
+    expect(dirs).toContain('.config/forja');
+    expect(dirs).toContain('.local/share/forja');
+    expect(dirs.filter((d) => d.startsWith('.config/forja') || d === '.local/share/forja')).toEqual(
+      ['.config/forja', '.local/share/forja'],
+    );
   });
 });
 

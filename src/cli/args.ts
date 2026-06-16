@@ -2221,7 +2221,7 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
 
 export const usage = (): string =>
   [
-    'Usage: agent [options] <prompt>',
+    'Usage: forja [options] <prompt>',
     '       forja init [--mode strict|acceptEdits] [--only=csv] [--no-seeds] [--force[=csv]]',
     '',
     'Subcommands:',
@@ -2240,6 +2240,8 @@ export const usage = (): string =>
     '  --version, -v          Print version and exit',
     '  --help, -h             Show this help and exit',
     '  --json                 Emit NDJSON events to stdout (headless)',
+    '  --profile <name>       Run against an isolated on-disk namespace (~/.config/forja-<name>, ~/.local/share/forja-<name>, .forja-<name>/)',
+    '                         so a dev build never migrates or pollutes your real Forja state. Also via FORJA_PROFILE env. Name: [a-z0-9][a-z0-9-]*',
     '  --autonomous           Start in Autonomous mode: auto-approve routine confirms (Shift+Tab toggles)',
     '  --no-recap             Disable recap for this run: no session-end/Alt+R auto-display, no resume rehydrate, deterministic /recap render',
     '  --list-sessions        Print known sessions (newest first) and exit',
@@ -2259,7 +2261,8 @@ export const usage = (): string =>
     '',
     'Examples:',
     '  forja init',
-    '  agent "summarize the README"',
+    '  forja "summarize the README"',
+    '  forja --profile dev "iterate on Forja without touching your real sessions/config"',
     '  forja --model openai/gpt-4o "list the source files"',
     '  forja --json "what changed in the last commit?" > events.ndjson',
     '  forja --list-sessions --json',

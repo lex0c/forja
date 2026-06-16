@@ -117,6 +117,9 @@ export interface StatusState {
   sessionId: string | null;
   project: string | null;
   model: string | null;
+  // Active isolation profile (`--profile`/FORJA_PROFILE), or null on the
+  // default namespace. Seeded by session:banner; drives the footer chip.
+  profile: string | null;
   steps: number;
   maxSteps: number;
   // Current-turn spend (this harness session only). Reset to 0 at each
@@ -590,6 +593,7 @@ export const createInitialState = (): LiveState => ({
     sessionId: null,
     project: null,
     model: null,
+    profile: null,
     steps: 0,
     maxSteps: 0,
     costUsd: 0,
@@ -655,6 +659,9 @@ export type PermanentItem =
       app: string;
       version: string;
       model: string;
+      // Active isolation profile, or null/absent on the default namespace.
+      // Renders a boot-banner line so a dev/test run is obvious at a glance.
+      profile?: string | null;
       // Initial effort level (config/DEFAULT_EFFORT at boot). Rendered on the
       // banner's identity line beside the model; optional so non-CLI emitters
       // that omit it still produce a valid banner.
@@ -1126,6 +1133,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           status: {
             ...state.status,
             model: event.model,
+            profile: event.profile ?? state.status.profile,
             contextWindow: event.contextWindow,
             operationMode: event.operationMode ?? state.status.operationMode,
             effort: event.effort ?? state.status.effort,
@@ -1137,6 +1145,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             app: event.app,
             version: event.version,
             model: event.model,
+            ...(event.profile !== undefined ? { profile: event.profile } : {}),
             ...(event.effort !== undefined ? { effort: event.effort } : {}),
             contextWindow: event.contextWindow,
             maxOutputTokens: event.maxOutputTokens,

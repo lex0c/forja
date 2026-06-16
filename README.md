@@ -44,8 +44,11 @@ on the roadmap.
 ```bash
 git clone <repo-url> forja && cd forja
 bun install
-bun run build              # produces dist/forja-linux-x64
-ln -s "$PWD/dist/forja-linux-x64" ~/.local/bin/agent
+# The binary name carries the version (e.g. dist/forja-0.0.0-linux-x64).
+# A dev build (FORJA_PROFILE=dev bun run build) adds the profile:
+# dist/forja-0.0.0-dev-linux-x64 — the binary itself is profile-agnostic.
+bun run build              # produces dist/forja-<version>-linux-x64
+ln -s "$PWD/dist/forja-0.0.0-linux-x64" ~/.local/bin/agent
 ```
 
 Verify the install:
@@ -221,6 +224,42 @@ cd ~/projects/my-repo
 forja init                  # creates .forja/permissions.yaml + playbooks + skills
 forja init --mode strict    # locked-down default (no auto-allow on bash)
 ```
+
+### Isolated profiles (dev mode)
+
+By default Forja uses the canonical namespace — `~/.config/forja`,
+`~/.local/share/forja` (sessions + audit DB), `~/.cache/forja`, and `.forja/`
+in the repo. **That default IS your real state; there is no separate "prod"
+profile** — absence of a profile is the real namespace.
+
+`--profile <name>` (or the `FORJA_PROFILE` env var) selects a fully isolated
+parallel namespace, so a dev build can't migrate, pollute, or read your real
+sessions, config, memory, or trust list:
+
+```bash
+forja --profile dev "iterate on Forja without touching my real state"
+FORJA_PROFILE=dev forja doctor        # env form — equivalent
+```
+
+A profile relocates **both** levels at once:
+
+| Default          | Under `--profile dev`   |
+|------------------|-------------------------|
+| `~/.config/forja`        | `~/.config/forja-dev`        |
+| `~/.local/share/forja`   | `~/.local/share/forja-dev`   |
+| `~/.cache/forja`         | `~/.cache/forja-dev`         |
+| `<cwd>/.forja/`          | `<cwd>/.forja-dev/`          |
+
+- The profile name must match `[a-z0-9][a-z0-9-]*`; an invalid value fails
+  fast rather than silently falling back to your real state.
+- `forja doctor` reports the active profile and the resolved dirs; the boot
+  banner and the always-visible footer flag it in yellow so a dev run is never
+  mistaken for your real one.
+- When developing Forja from a source checkout, `bun run dev` already sets
+  `FORJA_PROFILE=dev` for you (use `bun run start` to run against the real
+  namespace).
+- Add `.forja-*/` to your project's `.gitignore` so per-profile dirs stay out
+  of version control.
 
 ---
 

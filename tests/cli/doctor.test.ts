@@ -270,6 +270,48 @@ describe('runDoctor', () => {
     expect(enforcement?.detail).toContain('sandbox binary missing');
   });
 
+  test('active profile: data_dir reflects forja-<profile> + footer carries the profile line', async () => {
+    const out = captured();
+    const code = await runDoctor({
+      env: { ...env, FORJA_PROFILE: 'dev' },
+      which: (cmd) => `/usr/bin/${cmd}`,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code === 0 || code === 1).toBe(true); // host-dependent checks; profile output is what we assert
+    const text = out.lines.join('');
+    // data_dir must point at the ISOLATED namespace, not the canonical one
+    // (the bug this fixed: dataDirCheck hardcoded `forja`).
+    expect(text).toContain('forja-dev');
+    expect(text).not.toContain('.local/share/forja\n');
+    // Explicit profile footer — only printed when active.
+    expect(text).toContain('profile: dev');
+  });
+
+  test('--json: info event carries the active profile (null on default namespace)', async () => {
+    const run = async (extraEnv: NodeJS.ProcessEnv): Promise<Record<string, unknown>> => {
+      const out = captured();
+      await runDoctor({
+        json: true,
+        env: { ...env, ...extraEnv },
+        which: (cmd) => `/usr/bin/${cmd}`,
+        out: out.write,
+        err: captured().write,
+      });
+      const events = out.lines
+        .join('')
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      const info = events.find((e) => e.kind === 'info');
+      if (info === undefined) throw new Error('no info event emitted');
+      return info;
+    };
+    expect((await run({ FORJA_PROFILE: 'dev' })).profile).toBe('dev');
+    expect((await run({})).profile).toBeNull();
+  });
+
   test('missing git → warn, exit 0', async () => {
     const out = captured();
     const code = await runDoctor({

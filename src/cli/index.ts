@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { parseArgs, usage } from './args.ts';
 import type { InitOptions } from './init.ts';
+import { applyProfileFlag } from './profile-flag.ts';
 import { VERSION } from './version.ts';
 
 // §13.7 broker-worker self-exec. The spawn broker's only way to
@@ -24,7 +25,16 @@ if (process.env.FORJA_BROKER_WORKER === '1') {
 }
 
 const main = async (): Promise<number> => {
-  const parsed = parseArgs(Bun.argv.slice(2));
+  // Global `--profile <name>` pre-pass: sets process.env.FORJA_PROFILE and
+  // strips the flag BEFORE parseArgs and before any path resolver fires, so
+  // the isolated namespace applies to every subcommand. Malformed value →
+  // clean usage error instead of a deep resolver throw.
+  const profile = applyProfileFlag(Bun.argv.slice(2));
+  if (profile.error !== undefined) {
+    process.stderr.write(`forja: ${profile.error}\n\n${usage()}\n`);
+    return 1;
+  }
+  const parsed = parseArgs(profile.argv);
   if (!parsed.ok) {
     process.stderr.write(`forja: ${parsed.message}\n\n${usage()}\n`);
     return 1;

@@ -2,6 +2,316 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-15] build: version (+ profile) in the binary name
+
+The build artifact was a bare `dist/forja-<id>` — no version, and a dev build
+(`FORJA_PROFILE=dev bun run build`) silently clobbered the release artifact at
+the same path. `assetName(t)` (scripts/targets.ts, the single source every build
++ release script keys off) now produces `forja-<version>[-<profile>]-<id><ext>`:
+version from the canonical `VERSION` const (self-describing release artifacts,
+multiple versions coexist), and the profile segment ONLY when FORJA_PROFILE is
+set at build time. Crucially the profile is a build-CONTEXT label, NOT a
+behavioral lock — the binary is profile-agnostic and resolves the profile at its
+OWN runtime (verified: built under FORJA_PROFILE=dev, the binary still runs
+canonical when invoked without `--profile`); the label just keeps a dev build
+from overwriting a release one in dist/. `assetName` gained an `env` test seam.
+Every consumer (smoke, checksums, sbom, repro-check, size gate, sourcemap
+rename) follows automatically; updated `package.json` bin + README install to
+the versioned name and the script tests (targets/checksums/build-targets) off
+hardcoded names onto `assetName`. Measured: `bun run build` →
+`dist/forja-0.0.0-linux-x64`, `FORJA_PROFILE=dev bun run build` →
+`dist/forja-0.0.0-dev-linux-x64`, both coexisting; typecheck + lint + scripts
+tests (69) green.
+
+## [2026-06-15] dev-mode: isolated `--profile` namespace (dev vs real state)
+
+The maintainer develops Forja AND uses it on real projects from the same machine,
+so a dev build was migrating/polluting the operator's real sessions DB, config,
+memory, and trust list. dev-mode gives each `--profile <name>` (or `FORJA_PROFILE`
+env) a FULLY isolated on-disk namespace: user-level `~/.config/forja-<name>`,
+`~/.local/share/forja-<name>`, `~/.cache/forja-<name>`, and per-project
+`<cwd>/.forja-<name>/`. No profile ⇒ the canonical `forja`/`.forja`,
+byte-identical to before.
+
+Keystone is `src/config/app-namespace.ts`: `appDirName()` / `projectDirName()`
+(profile-aware path segments), `activeProfile()` (diagnostics), `appDirNames()`
+(canonical + active-profile, for the security lists), and `isValidProfile()` —
+the profile name is allowlisted char-by-char to `[a-z0-9][a-z0-9-]*` (no regex;
+rejects `/`, `..`, leading hyphen, empty) since it becomes a path segment. A
+malformed profile THROWS rather than silently falling back to the real namespace
+(that would defeat the isolation the operator asked for).
+
+Routed ~20 resolvers through the helpers (storage/paths, agent-paths,
+memory/paths, trust/paths, subagents/paths, skills/paths, sandbox-skip,
+worktree, history, bootstrap bg/banner, purge, init, runtime bg, slash
+memory/history, permission-policy-rollback, eval executor, gitignore, plus the
+user-facing "create `.forja/permissions.yaml`" hints in repl/render/
+explain-permissions). The security lists became profile-aware functions:
+`hidePathsDirs()` (sandbox masking) and `tildeEscalateDirs()` (engine
+escalate-on-write) now cover BOTH the canonical `forja` AND the active
+`forja-<profile>` dirs, so a dev sandbox can't read the operator's real audit
+DB/secrets and vice-versa — and the conversion deduped a latent double
+`.config/forja` entry. `FORJA_PROFILE` is not credential-shaped, so `scrubEnv`
+already preserves it across the subagent + broker-worker spawn boundaries
+(verified the broker worker resolves no profile path; the parent builds all
+sandbox args).
+
+Entry point: a global `--profile` pre-pass (`src/cli/profile-flag.ts`,
+`applyProfileFlag`) runs in `index.ts` BEFORE parseArgs and any resolver — it
+sets `process.env.FORJA_PROFILE`, strips the flag (every subcommand parser would
+reject it), and validates flag-or-env value to a clean usage error instead of a
+deep throw. Ergonomics: `bun run dev` now runs under `FORJA_PROFILE=dev`;
+`forja doctor` reports the profile (JSON `info.profile` + a footer line) and its
+`data_dir` check stopped hardcoding `forja`; the boot banner gains a yellow
+`profile: <name> (isolated namespace)` line and the always-visible footer a
+yellow `profile:<name>` chip (threaded through `SessionBannerEvent` →
+`StatusState`/`session-banner` item, no env reads in the renderers); root
+`.gitignore` ignores `.forja-*/`; `--profile` documented in `usage()` (which also
+shed two stale `agent` references from the rename). New tests: app-namespace
+helpers, `applyProfileFlag` parse/validation/strip, profile cases on agent-paths
++ sandbox-hide-paths, doctor profile output + data_dir, footer/banner chips.
+typecheck + lint clean; permissions (2309) + cli/storage/trust/memory/subagents
+(4295) + focused (445) all green; end-to-end smoke confirmed isolation under a
+temp HOME.
+
+Code review (9 finder angles + inline verify) surfaced one real isolation gap:
+the sandbox XDG_DATA_HOME overlay (linux bwrap + macOS SBPL) masked only the
+ACTIVE profile's data dir, so under `--profile dev` + a relocated XDG_DATA_HOME
++ `home-rw`, a dev sandbox could still read the operator's REAL `forja`
+sessions/audit DB at `<xdg>/forja`. Fixed both runners to iterate `appDirNames()`
+(mask canonical + profile), mirroring the XDG_CONFIG_HOME branch; reads
+`process.env` (the host data-dir source defaultDataDir used), with a regression
+test asserting both dirs are masked under a profile. Also folded in: forward
+`FORJA_PROFILE` through the broker worker's sandbox `passthroughEnv`
+(defense-in-depth — the worker resolves no namespaced path today but a future
+lookup must stay in-namespace); made `purge`'s PRESERVED_PATHS dry-run text +
+the welcome sandbox-skip fallback profile-aware; dropped a dead `=== ''` footer
+guard and a no-op argv reconstruction in `applyProfileFlag`; fixed stale
+`agent`/`6 .config/*` comments and one more `agent "your prompt"` rename
+leftover in the welcome next-steps. typecheck + lint clean; permissions (2578,
+one cross-process audit test flaked under load, green in isolation) green.
+
+Post-commit follow-up (review catch): `enterpriseAgentPath` was wrongly routed
+through `appDirName(env)`, so `--profile dev` would relocate the enterprise
+lookup to `/etc/forja-<profile>` / `%PROGRAMDATA%\forja-<profile>` — which no
+admin installed — and silently SKIP the enterprise policy + locked hooks (an
+enterprise-guardrail bypass via a profile). Reverted that resolver to canonical
+`/etc/forja` / `%PROGRAMDATA%\forja`; both enterprise consumers
+(`enterprisePolicyPath`, `enterpriseHooksPath`) delegate to it, so the fix
+covers policy and hooks. A profile now isolates USER + PROJECT state ONLY; the
+machine guardrail stays put. Regression test pins enterprise canonical under a
+profile; app-namespace header documents the carve-out.
+
+Second follow-up (same class, project level): the protected-paths
+`cwdEscalateDirs()` was built from `projectDirName()`, so under a profile it
+listed only `.forja-<profile>` and DROPPED the canonical `.forja` — writes to
+the operator's real `/repo/.forja/permissions.yaml` (policy, sessions) stopped
+escalating during a profiled run, losing the guard against silent edits a
+profile is meant to preserve. Added a `projectDirNames()` helper (project analog
+of `appDirNames()`) and route the escalate list through it so it covers BOTH
+`.forja` AND `.forja-<profile>`. No profile ⇒ `['.git', '.forja', '.claude']`,
+byte-identical. Regression test asserts writes to both project dirs escalate
+(reads pass) under a profile.
+
+Third follow-up (same direction, purge UX footgun): `forja purge`'s dry-run
+scopes to `.forja-<profile>/` under a profile, but the advertised
+`report.command` was a bare `forja purge --force` — copy-pasting it drops the
+profile and operates on the REAL canonical `.forja/`, a different namespace than
+the one previewed, risking a purge of the operator's real project state. The
+suggested command (human + JSON) now re-prefixes `--profile <name>` whenever a
+profile is active, so it hits the same namespace the report described.
+Regression test asserts scope AND command both stay profiled.
+
+Fourth follow-up (closing the class via a focused self-audit): enumerated every
+consumer of the profile helpers and every advertised `forja …` command string.
+The guardrail/protection + path resolvers were all confirmed correct; the
+remaining instances of the "advertised command drops the profile" footgun were
+`doctor`'s 5 remediations (`permission verify` / `rotate-chain` / `inspect` /
+`seal-verify` / `seal-now` — the mutating ones would have rotated/sealed the
+REAL chain from a profiled diagnosis) and `permission-inspect`'s "clear after
+inspection" hint. Extracted a shared `forjaCommand(rest)` helper
+(`src/cli/forja-command.ts`) that re-prefixes the active `--profile`, refactored
+purge onto it, and applied it to all six remaining strings. Unit-tested the
+helper (no profile ⇒ byte-identical bare command; profile ⇒ prefixed). This
+closes the "a profile silently drops/redirects a real-namespace guard" category
+end-to-end (enterprise layer, project escalate list, purge + doctor + inspect
+commands).
+
+Fifth follow-up (audit gap — `init`): the "closed end-to-end" claim above was
+overstated. `init`'s scaffold follow-up — `review .forja-<profile>/ and run
+'forja' to start` — advertised a BARE `forja` launch command; copy-pasting it
+opens the canonical namespace, creating/migrating the real `~/.config/forja` +
+`~/.local/share/forja` state a profile is meant to keep isolated. The self-audit
+missed it because its grep matched `forja permission|purge|...` verbs, not the
+no-verb launch command. Routed it through `forjaCommand('')` and extended the
+helper to render the bare launch command without a trailing space (`forja` /
+`forja --profile <name>`); unit-tested the empty-rest case.
+
+Sixth follow-up (the actual exhaustive sweep): grepped EVERY operator-facing
+`forja …` command string (verb + bare-launch shapes), not just the verb pattern
+the fifth-follow-up audit used. That found the rest of the class:
+`gc`'s suggested `forja gc --force [--table=…]` command (HIGH — mutating, sweeps
+the profile-aware global DB; missed before because the audit filter skipped
+`return` statements), `welcome`'s next-steps menu (operator-flagged: `init` /
+`"prompt"` / `--explain-permissions` / `permission grants` / `--help` / `doctor`),
+`purge`'s `run 'forja init'` not-initialized hint (would scaffold the REAL
+`.forja/`), and the lower-severity read-only/throwaway hints (`Run 'forja doctor'`
+in harness-adapter + sandbox-setup; `forja worktree gc` in runtime + worktree).
+All routed through `forjaCommand`. No profile ⇒ byte-identical, so column
+alignment + every existing test holds. This is the class closed for real, across
+both command shapes and all surfaces (cli + tui + subagents).
+
+Seventh follow-up (a DIFFERENT class — project read isolation, operator-flagged):
+write isolation held, but a profiled session could still READ the operator's real
+canonical `.forja/` (project memory/config/traces) co-located in the repo. Two
+floors leaked: the engine classifier escalates `.forja/` only on WRITE (`op ===
+'read'` returns null), and the sandbox masked only home-level credential dirs,
+never a cwd-level project dir — so `read_file`/`grep` and sandboxed bash could
+disclose real project state despite the profile using `.forja-dev/`. (This also
+made the README's advertised "can't read your real memory" false.) Added
+`foreignProjectDirNames()` (the canonical `.forja` under a profile; empty on the
+default namespace — the active `.forja-<profile>/` is never foreign and stays
+readable). The engine now DENIES read+write of the foreign dir (deny tier, ahead
+of the read-passthrough; supersedes the canonical dir's escalate under a
+profile), and both sandbox runners (linux tmpfs overlay + macOS SBPL deny) mask
+it under cwd. No profile ⇒ no foreign dir, byte-identical. Tests both directions:
+foreign `.forja` denied/masked, active `.forja-<profile>` still readable
+(engine + linux + macOS). README claim now holds.
+
+Eighth follow-up (same class, subdir gap — operator-flagged): the sandbox
+foreign-`.forja` overlay was anchored at the per-command `cwd`. A bash command's
+`args.cwd` can be any subdir of the session tree, so it overlaid `<subdir>/.forja`
+(usually nonexistent) while the real project state at `<repoRoot>/.forja` stayed
+reachable as `../.forja/...`. Threaded the bootstrap-resolved session root
+(`projectConfigCwd = resolveRepoRoot(cwd)`, already computed once at startup — no
+per-call git spawn) through `constructBroker` → the sandbox runner → both
+`buildBwrapArgv` (tmpfs) and macOS `buildSbplProfile` (SBPL deny) as `projectRoot`,
+and anchored the foreign overlay there (defaults to `cwd` when omitted, for
+back-compat/tests). Regression tests: subdir cwd + project root → overlay/deny
+lands at `<root>/.forja`, not `<subdir>/.forja` (linux + macOS).
+
+Ninth follow-up (measured-not-assumed: the ENGINE had the gap too). The eighth
+note claimed the engine floor was already correct because it uses the session
+cwd, not per-command `args.cwd`. Measuring it (`bootstrap.ts:776` passes the raw
+launch `cwd` to `bootstrapPermissionEngine`, NOT the resolved repo root) showed
+that was wrong for the launch-from-a-subdir case: the engine's foreign-`.forja`
+deny resolved at `<launchCwd>/.forja`, missing the real `<repoRoot>/.forja` (a
+profiled session launched from `repo/src/` could `read_file ../.forja/...`).
+Fixed by anchoring the engine's foreign-deny at `resolveRepoRoot(cwd)` in
+`getResolvedTargets` — gated on a profile being active (no git spawn on the
+default namespace), cached per (home,cwd), graceful-degrade to `cwd` if git is
+unavailable, and byte-identical when cwd already IS the repo root (the common
+launch). An adversarial shakeout in a REAL git repo (subdir launch, `--profile
+dev`) confirmed both floors end-to-end: engine DENIES read+write of the real
+`.forja/`, leaves the active `.forja-dev/` readable; sandbox masks `<root>/.forja`
+not `<subdir>/.forja`. typecheck + lint + permissions (2317) green.
+
+Tenth follow-up (same root, the OTHER half — operator-flagged asymmetry): the
+ninth fix repo-rooted the foreign DENY but left the active-project ESCALATE
+(`.git` / `.claude` / `.forja-<profile>` via cwdEscalateDirs) anchored at the
+launch cwd. So a profile launched from a subdir would NOT escalate writes to the
+active `<repoRoot>/.forja-<profile>/permissions.yaml` (reachable as
+`../.forja-<profile>/...`) — they'd pass silently under acceptEdits / broad
+write policies, missing the intended confirm for Forja project state. Closed by
+anchoring `cwdEscalateDirs` at the same `projectRoot` (resolveRepoRoot) as the
+foreign deny when a profile is active — both halves now repo-rooted, reusing the
+one cached resolveRepoRoot call (no extra git spawn; default namespace
+unchanged). Shakeout in a real git repo (subdir launch): write to
+`../.forja-dev/permissions.yaml` → escalate, `../.git/config` → escalate,
+`../.forja/x` → deny (foreign), `../.forja-dev/x` read → pass. typecheck + lint +
+protected_paths (120) green.
+
+Eleventh item (investigated, NOT a bug — first review item that didn't hold). A
+review flagged that the subagent spawn `scrubEnv(process.env, { keep:
+PROVIDER_API_KEY_VARS })` drops FORJA_PROFILE, so children would run in the
+canonical namespace and miss the parent's session row. Measured: `scrubEnv` does
+NOT drop FORJA_PROFILE — `_PROFILE` matches no SCRUB_PATTERN, so it passes
+through (no `keep` needed), and the child resolves `defaultDbPath()` (env-driven,
+`subagent-child.ts` takes no dbPath in production — comment: "defaultDbPath() so
+child + parent target the same file") → `forja-<profile>/sessions.db`, same file
+the parent wrote. The broker worker needed an explicit passthrough only because
+bwrap `--clearenv` strips env at the kernel boundary; the subagent is a plain
+`Bun.spawn({ env: scrubEnv(...) })` that preserves it. No code change — but added
+a regression test pinning "scrubEnv preserves FORJA_PROFILE" (the invariant the
+whole profile-propagation chain rests on), so a future `/_PROFILE$/`-style scrub
+pattern can't silently break subagents under a profile.
+
+Twelfth follow-up (the subdir read-floor, ALL sandbox callers — operator-flagged):
+the project-root anchoring only reached the broker bash path (it threads
+`projectRoot` from bootstrap). The OTHER `maybeWrapSandboxArgv` callers —
+`tools/builtin/grep.ts`, `tools/builtin/git.ts`, `bg/manager.ts` — pass only
+`cwd: ctx.cwd` (a per-tool-call cwd, possibly a subdir), so under a profile a
+sandboxed grep/git/bg subprocess fell back to masking `<subdir>/.forja` and left
+the real `<repoRoot>/.forja` readable via `../.forja/...`. Threading
+`projectRoot` through ToolContext + the bg manager would have plumbed a new field
+across the whole tool infra; instead centralized the default IN
+`maybeWrapSandboxArgv`: when no `projectRoot` is passed and a profile is active,
+it resolves the repo root (`resolveRepoRoot`, profile-gated so no git spawn on
+the default namespace, cached per cwd, graceful-degrade to cwd). Every caller —
+current and future — now anchors at the repo root; the broker keeps passing its
+bootstrap-resolved root explicitly (no spawn). Verified by a real-git+bwrap
+shakeout: `maybeWrapSandboxArgv` with no projectRoot + a subdir cwd masks
+`<repoRoot>/.forja`, not `<subdir>/.forja`, and leaves the active `.forja-dev`
+readable. Deterministic regression test for the explicit-projectRoot
+pass-through (bwrap-conditional, like the sibling live-host tests).
+
+Thirteenth follow-up (the EXPORTED targets view — my own scoping miss). When the
+foreign deny was added (9th), it went only into the internal `getResolvedTargets`
+(used by `classifyProtectedPath`), NOT the exported `protectedTargets` —
+reasoned as "policy-validator-only, out of scope." But `protectedTargets` also
+feeds the bash GLOB GUARD (`couldGlobReachProtected`) at runtime, and it still
+(a) lacked the foreign deny root and (b) resolved cwdEscalateDirs against the
+raw/subdir cwd. So a glob like `../.forja/*` from a subdir could slip the
+protected-glob refuse and read/write the real project state in sandbox-host /
+in-process runs. Fixed by making `protectedTargets` REUSE `getResolvedTargets`
+(repo-root-anchored cwd-escalate + the foreign deny root, cached), adding
+`cwdForeignDenyDirs` to the `ProtectedTargets` shape, and including it in the
+glob guard's reachability scan. The policy validator uses explicit fields, so
+it's unaffected (additive). No behavior change on the default namespace. Tests:
+protectedTargets surfaces the foreign root under a profile, empty without.
+
+Fourteenth follow-up (eval hermeticity — my own routing miss, operator-flagged).
+The 1st-commit routing pushed the eval executor's policy path through
+`projectDirName()`. Eval cases author fixtures/setup.files against the canonical
+`.forja/permissions.yaml`; under a dev-profile shell the executor looked for
+`.forja-<profile>/`, didn't see the case's policy, wrote the DEFAULT (bypass)
+there, and bootstrap (also profiled) read that — so custom eval policies were
+silently ignored and experiments ran against the wrong policy. Evals must be
+HERMETIC w.r.t. FORJA_PROFILE: reverted the policy path to the literal canonical
+`.forja/`, and `executeCase` now clears FORJA_PROFILE for the run (save/delete/
+restore, beside the existing FORJA_OPENAI_REASONING_REPLAY pin) so setupCwd's
+write AND bootstrap's read both resolve `.forja/` (the eval DB is a temp file,
+unaffected). Behavioral regression test: under FORJA_PROFILE=dev a case shipping
+a strict `.forja/` policy denies write_file (file_exists fails) — which only
+holds if the canonical policy was read; a `.forja-dev/` mis-read would get the
+default bypass and pass. Also pins env restore.
+
+Fifteenth follow-up (closing-sweep verdict — full re-audit of every helper
+consumer, operator-requested). Enumerated EVERY consumer of the app-namespace
+helpers across src/ plus every remaining raw `.forja`/`forja` path literal, and
+classified each against intent. Verdict: the functional + security surface is
+CLEAN — all on-disk state correctly profiled, the two carve-outs correct on
+purpose (`enterpriseAgentPath` canonical so `--profile` can't skip the admin
+guardrail; the eval executor hermetic per the fourteenth follow-up), and the
+security lists cover both namespaces. The only mis-routes were three clusters of
+DISPLAY-only advisory strings that hardcoded the canonical name while their
+FUNCTIONAL counterpart was already profiled — so a `--profile` session was told
+to look in a directory the run never reads: (1) the "Define agents under
+`~/.config/forja/playbooks/` or `<cwd>/.forja/playbooks/`" hint in all three
+subagent tools (task/task_async/task_list) — the real dirs (subagents/paths.ts)
+are profile-aware; (2) `/hooks`'s "no hooks.toml at …" note (kept `/etc/forja`
+canonical — the enterprise layer is NOT profiled — but routed the user + project
+segments); (3) `/memory governance`'s source-label strings
+(`yes (~/.config/forja/config.toml)` etc.) while the actual write site already
+used `projectDirName()`. Fixed by interpolating the helpers; the five playbook
+sites now share one `playbookDirsHint(env=process.env)` in task-shared.ts (the
+module all three tools already import), which throws on a malformed profile like
+the path helpers rather than silently using canonical. Code COMMENTS describing
+the canonical layout were left as-is (documentation of the default form, not a
+runtime path). New unit test for `playbookDirsHint` (no-profile byte-identical /
+profile-carried / malformed-throws); the existing default-namespace label tests
+in memory.test.ts stay green unchanged (byte-identical when no profile is set).
+
 ## [2026-06-15] Prompt: drop the model id from the # Environment block
 
 The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,

@@ -35,6 +35,8 @@
 // `grep`) that bypass the bash AST entirely.
 
 import { resolve } from 'node:path';
+import { appDirNames, foreignProjectDirNames, projectDirNames } from '../config/app-namespace.ts';
+import { resolveRepoRoot } from '../memory/paths.ts';
 import { createBoundedCache } from './bounded-cache.ts';
 
 export type ProtectedTier = 'deny' | 'escalate';
@@ -288,10 +290,10 @@ const TILDE_ESCALATE_FILES: readonly string[] = [
 // asymmetry means a write to `.config/gcloud/credentials.db` from
 // an fs tool in `mode: acceptEdits` + `host` profile would NOT
 // escalate to confirm (silent credential injection).
-const TILDE_ESCALATE_DIRS: readonly string[] = [
-  '.config/forja',
+// Static credential dirs (non-Forja). Forja's own config+data dirs are
+// appended, profile-aware, by `tildeEscalateDirs()`.
+const TILDE_ESCALATE_DIRS_BASE: readonly string[] = [
   '.config/claude',
-  '.config/forja',
   '.config/gcloud',
   '.config/azure',
   '.config/op',
@@ -306,8 +308,22 @@ const TILDE_ESCALATE_DIRS: readonly string[] = [
   '.ansible',
   '.rustup',
   '.subversion/auth',
-  '.local/share/forja',
 ];
+
+// A function (not a const) so `--profile` set at CLI startup is honored —
+// Forja's own config+data dirs are resolved at classification time. Escalates
+// writes to BOTH the canonical `.config/forja` + `.local/share/forja` AND,
+// under a profile, the `forja-<profile>` variants, keeping this list the exact
+// dual of the sandbox-side `hidePathsDirs()`. No profile ⇒ identical to the
+// pre-profile list (canonical only). The previous const duplicated
+// `.config/forja`; building from `appDirNames()` removes that artifact.
+const tildeEscalateDirs = (): readonly string[] => {
+  const own: string[] = [];
+  for (const seg of appDirNames()) {
+    own.push(`.config/${seg}`, `.local/share/${seg}`);
+  }
+  return [...TILDE_ESCALATE_DIRS_BASE, ...own];
+};
 
 // Absolute roots that escalate on write regardless of cwd or home.
 const ABSOLUTE_ESCALATE_ROOTS: readonly string[] = ['/etc'];
@@ -316,7 +332,15 @@ const ABSOLUTE_ESCALATE_ROOTS: readonly string[] = ['/etc'];
 // joined against the session's `cwd` at classification time. The
 // engine's own state lives under `.forja/` (sessions, traces, policy
 // archive); CI/operator state is under `.git/` and `.claude/`.
-const CWD_ESCALATE_DIRS: readonly string[] = ['.git', '.forja', '.claude'];
+//
+// A function (not a const) so `--profile` is honored at classification time.
+// Built from `projectDirNames()` so it escalates writes to BOTH the canonical
+// `.forja/` AND, under a profile, `.forja-<profile>/`: a profiled run must
+// still NOT silently edit the operator's real project policy/sessions (the
+// guard a profile is meant to preserve, not drop), and its own profile dir
+// gets the same protection. No profile ⇒ `['.git', '.forja', '.claude']`,
+// identical to before.
+const cwdEscalateDirs = (): readonly string[] => ['.git', ...projectDirNames(), '.claude'];
 
 // Posix-only segment-boundary prefix match: avoids false positives like
 // `/procfoo` matching `/proc`. Exported as the one source of truth so
@@ -353,6 +377,12 @@ interface ResolvedProtectedTargets {
   tildeEscalateFiles: readonly string[];
   tildeEscalateDirs: readonly string[];
   cwdEscalateDirs: readonly string[];
+  // Project dirs belonging to ANOTHER namespace (the real canonical `.forja/`
+  // under a profile) — DENIED for read AND write so a profiled session can't
+  // disclose or touch the operator's real project state. Empty on the default
+  // namespace. Resolved against cwd, profile read from process.env (frozen per
+  // process, so the (home,cwd) cache key stays sound).
+  cwdForeignDenyDirs: readonly string[];
 }
 
 // Cap calibrated for the realistic (home, cwd) tuple churn —
@@ -369,10 +399,29 @@ const getResolvedTargets = (home: string, cwd: string): ResolvedProtectedTargets
   const key = `${home}\0${cwd}`;
   let entry = targetCache.get(key);
   if (entry === undefined) {
+    // Under a profile, anchor BOTH the active-project escalate roots AND the
+    // foreign deny at the PROJECT ROOT, not the launch `cwd`. The engine's cwd
+    // is the launch cwd, which may be a SUBDIR of the repo (e.g. `forja` run
+    // from `repo/src/`), but the project state — `.git`, `.claude`, the active
+    // `.forja-<profile>/`, and the foreign canonical `.forja/` — all live at the
+    // repo root and resolve as `../...`. Without repo-rooting, writes to
+    // `<repoRoot>/.forja-<profile>/permissions.yaml` would miss the escalate
+    // floor and proceed silently under acceptEdits / broad write policies.
+    //
+    // `resolveRepoRoot` runs ONLY when a profile is active (foreignDirs
+    // non-empty), is cached on (home,cwd) — so no git spawn on the default
+    // namespace — falls back to `cwd` if git is unavailable, and equals `cwd`
+    // when cwd already IS the repo root (the common launch), so this is
+    // byte-identical there and only changes the subdir-launch case. The
+    // default namespace keeps cwd-anchoring (no extra git spawn); its
+    // subdir-launch behavior is unchanged (pre-existing).
+    const foreignDirs = foreignProjectDirNames();
+    const projectRoot = foreignDirs.length > 0 ? resolveRepoRoot(cwd) : cwd;
     entry = {
       tildeEscalateFiles: TILDE_ESCALATE_FILES.map((f) => resolveTildeFile(home, f)),
-      tildeEscalateDirs: TILDE_ESCALATE_DIRS.map((d) => resolveTildeFile(home, d)),
-      cwdEscalateDirs: CWD_ESCALATE_DIRS.map((d) => resolveCwdDir(cwd, d)),
+      tildeEscalateDirs: tildeEscalateDirs().map((d) => resolveTildeFile(home, d)),
+      cwdEscalateDirs: cwdEscalateDirs().map((d) => resolveCwdDir(projectRoot, d)),
+      cwdForeignDenyDirs: foreignDirs.map((d) => resolveCwdDir(projectRoot, d)),
     };
     targetCache.set(key, entry);
   }
@@ -381,6 +430,9 @@ const getResolvedTargets = (home: string, cwd: string): ResolvedProtectedTargets
 
 export const classifyProtectedPath = (input: ProtectedClassifyInput): ProtectedTier | null => {
   const { absPath, op, home, cwd } = input;
+  // Resolved up-front (cached on home+cwd): the foreign-dir deny below must run
+  // for READS too, before the escalate tier's read passthrough.
+  const targets = getResolvedTargets(home, cwd);
 
   // Tier `deny` — applies to reads and writes alike. SYSTEM_DENY_ROOTS
   // is a constant (no per-call resolve needed). Exceptions list
@@ -411,6 +463,18 @@ export const classifyProtectedPath = (input: ProtectedClassifyInput): ProtectedT
     return 'deny';
   }
 
+  // Tier `deny` (project read-floor) — a foreign-namespace project dir (the
+  // operator's real `.forja/` when running under a profile) is denied for READ
+  // AND WRITE. Reads: a profiled session must not disclose the real project's
+  // memory/config/traces. Writes: this supersedes the escalate the canonical
+  // dir would otherwise get (cwdEscalateDirs still lists `.forja` for the
+  // no-profile case where it IS the active session's). The active session's own
+  // dir is never in this list, so reads/writes of `.forja-<profile>/` are
+  // unaffected. Empty on the default namespace ⇒ no behavior change there.
+  for (const dir of targets.cwdForeignDenyDirs) {
+    if (startsWithSegment(absPath, dir)) return 'deny';
+  }
+
   // Tier `escalate` — only writes/deletes are upgraded. Reads pass
   // through; the engine's regular allow/confirm/deny chain still runs.
   if (op === 'read') return null;
@@ -420,7 +484,6 @@ export const classifyProtectedPath = (input: ProtectedClassifyInput): ProtectedT
     if (startsWithSegment(absPath, root)) return 'escalate';
   }
   // Tilde + cwd resolves come from the (home, cwd) cache.
-  const targets = getResolvedTargets(home, cwd);
   for (const file of targets.tildeEscalateFiles) {
     if (absPath === file) return 'escalate';
   }
@@ -447,15 +510,31 @@ export interface ProtectedTargets {
   tildeEscalateFiles: readonly string[];
   tildeEscalateDirs: readonly string[];
   cwdEscalateDirs: readonly string[];
+  // Foreign-namespace project dir(s) — the real canonical `.forja/` under a
+  // profile, denied for read AND write. Surfaced so runtime consumers (the bash
+  // glob guard) can refuse a glob that could reach them; empty on the default
+  // namespace. Resolved at the repo root (see getResolvedTargets), so a glob
+  // like `../.forja/*` from a subdir cwd is still caught.
+  cwdForeignDenyDirs: readonly string[];
 }
 
-export const protectedTargets = (home: string, cwd: string): ProtectedTargets => ({
-  systemDeny: SYSTEM_DENY_ROOTS,
-  absoluteEscalate: ABSOLUTE_ESCALATE_ROOTS,
-  tildeEscalateFiles: TILDE_ESCALATE_FILES.map((f) => resolveTildeFile(home, f)),
-  tildeEscalateDirs: TILDE_ESCALATE_DIRS.map((d) => resolveTildeFile(home, d)),
-  cwdEscalateDirs: CWD_ESCALATE_DIRS.map((d) => resolveCwdDir(cwd, d)),
-});
+// Reuse the cached `getResolvedTargets` so this exported view stays consistent
+// with `classifyProtectedPath`: the cwd-escalate roots AND the foreign deny are
+// repo-root-anchored under a profile (not the launch/subdir cwd), and the
+// foreign deny root is included for the glob guard. systemDeny + absoluteEscalate
+// are constants. No behavior change on the default namespace (getResolvedTargets
+// anchors at cwd there, foreign list empty).
+export const protectedTargets = (home: string, cwd: string): ProtectedTargets => {
+  const resolved = getResolvedTargets(home, cwd);
+  return {
+    systemDeny: SYSTEM_DENY_ROOTS,
+    absoluteEscalate: ABSOLUTE_ESCALATE_ROOTS,
+    tildeEscalateFiles: resolved.tildeEscalateFiles,
+    tildeEscalateDirs: resolved.tildeEscalateDirs,
+    cwdEscalateDirs: resolved.cwdEscalateDirs,
+    cwdForeignDenyDirs: resolved.cwdForeignDenyDirs,
+  };
+};
 
 // Stable list of all protected absolute prefixes (deny + escalate
 // combined) for use by policy validators that don't care about tier

@@ -17,6 +17,7 @@
 //     [--event <e>]      filter by event
 //     [--limit N]        cap output (default 20, max 200)
 
+import { appDirName, projectDirName } from '../../../config/app-namespace.ts';
 import type { HookEvent, HookLayer, HookSpec } from '../../../hooks/index.ts';
 import { type HookRun, queryHookRuns } from '../../../storage/repos/hook-runs.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
@@ -79,7 +80,7 @@ const handleSummary = (hooks: readonly HookSpec[]): SlashResult => {
       kind: 'ok',
       notes: [
         'hooks: 0 loaded',
-        '  no hooks.toml at /etc/forja, ~/.config/forja, or <repo>/.forja',
+        `  no hooks.toml at /etc/forja, ~/.config/${appDirName()}, or <repo>/${projectDirName()}`,
         '  spec: AGENTIC_CLI.md §10',
       ],
     };

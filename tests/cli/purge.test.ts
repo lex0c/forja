@@ -394,6 +394,37 @@ describe('runPurge — dry-run output', () => {
     expect(parsed.command).toBe('forja purge --force');
   });
 
+  test('under a profile: scope AND suggested command stay in the profiled namespace', async () => {
+    // The footgun this closes: a profiled dry-run scopes to `.forja-dev/`, but
+    // a bare `forja purge --force` suggestion would drop the profile and purge
+    // the operator's REAL `.forja/`. The command must re-prefix `--profile`.
+    const prev = process.env.FORJA_PROFILE;
+    process.env.FORJA_PROFILE = 'dev';
+    // Seed the PROFILE dir (init-marker gate checks projectDirName()).
+    writeFile('.forja-dev/permissions.yaml', '# scaffolded\n');
+    writeFile('.forja-dev/config.toml', '# config\n');
+    try {
+      const code = await runPurge({
+        cwd,
+        force: false,
+        json: true,
+        noAudit: false,
+        out,
+        err,
+        dbPath,
+      });
+      expect(code).toBe(0);
+      const parsed = JSON.parse(outBuf.join('').trim()) as { scope: string; command: string };
+      // Dry-run scoped to the profile dir...
+      expect(parsed.scope).toBe(join(cwd, '.forja-dev'));
+      // ...and the copy-paste command targets the SAME namespace, not the real one.
+      expect(parsed.command).toBe('forja --profile dev purge --force');
+    } finally {
+      if (prev === undefined) delete process.env.FORJA_PROFILE;
+      else process.env.FORJA_PROFILE = prev;
+    }
+  });
+
   test('handles empty .forja/ with init marker only', async () => {
     // Edge: .gitignore is the only init marker and is itself an
     // empty file. Walker reports 1 file, 0 dirs.

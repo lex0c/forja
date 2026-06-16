@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { TARGETS, assetName, findTarget } from '../../scripts/targets.ts';
+import { VERSION } from '../../src/cli/version.ts';
 import { targetById } from './_helpers.ts';
 
 describe('targets registry', () => {
@@ -23,9 +24,17 @@ describe('targets registry', () => {
     expect(findTarget('windows-x64')?.sizeMaxMiB).toBe(125);
   });
 
-  test('assetName uses agent-<id> with extension', () => {
-    expect(assetName(targetById('linux-x64'))).toBe('forja-linux-x64');
-    expect(assetName(targetById('windows-x64'))).toBe('forja-windows-x64.exe');
+  test('assetName is forja-<version>-<id><ext>; no profile segment by default', () => {
+    // Explicit `{}` env so the assertion is immune to an ambient FORJA_PROFILE
+    // in the runner's shell (e.g. a maintainer testing from a `bun run dev` env).
+    expect(assetName(targetById('linux-x64'), {})).toBe(`forja-${VERSION}-linux-x64`);
+    expect(assetName(targetById('windows-x64'), {})).toBe(`forja-${VERSION}-windows-x64.exe`);
+  });
+
+  test('assetName inserts the active profile as a build-context label when set', () => {
+    expect(assetName(targetById('linux-x64'), { FORJA_PROFILE: 'dev' })).toBe(
+      `forja-${VERSION}-dev-linux-x64`,
+    );
   });
 
   test('findTarget returns undefined for unknown ids', () => {

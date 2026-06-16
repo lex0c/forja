@@ -93,17 +93,17 @@ describe('generate / verify', () => {
       ],
       // sourcemap should be excluded; sbom.cdx.json should be included.
       [
-        { name: 'forja-linux-x64.map', content: '{}' },
+        { name: `${assetName(targetById('linux-x64'))}.map`, content: '{}' },
         { name: 'sbom.cdx.json', content: '{"bomFormat":"CycloneDX"}' },
       ],
     );
     try {
       generate(dir);
       const text = readFileSync(join(dir, 'SHA256SUMS'), 'utf-8');
-      expect(text).toContain('forja-linux-x64');
-      expect(text).toContain('forja-darwin-arm64');
+      expect(text).toContain(assetName(targetById('linux-x64')));
+      expect(text).toContain(assetName(targetById('darwin-arm64')));
       expect(text).toContain('sbom.cdx.json');
-      expect(text).not.toContain('forja-linux-x64.map');
+      expect(text).not.toContain(`${assetName(targetById('linux-x64'))}.map`);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -134,11 +134,11 @@ describe('generate / verify', () => {
     const dir = setupDist([{ id: 'linux-x64', content: 'binary-linux' }]);
     try {
       generate(dir);
-      writeFileSync(join(dir, 'forja-linux-x64'), 'tampered');
+      writeFileSync(join(dir, assetName(targetById('linux-x64'))), 'tampered');
       const result = verify(dir);
       expect(result.ok).toBe(false);
       expect(result.failed.length).toBe(1);
-      expect(result.failed[0]?.filename).toBe('forja-linux-x64');
+      expect(result.failed[0]?.filename).toBe(assetName(targetById('linux-x64')));
       expect(result.failed[0]?.actual).not.toBe(result.failed[0]?.expected);
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -149,7 +149,7 @@ describe('generate / verify', () => {
     const dir = setupDist([{ id: 'linux-x64', content: 'binary-linux' }]);
     try {
       generate(dir);
-      rmSync(join(dir, 'forja-linux-x64'));
+      rmSync(join(dir, assetName(targetById('linux-x64'))));
       const result = verify(dir);
       expect(result.ok).toBe(false);
       expect(result.failed[0]?.actual).toBeNull();

@@ -22,6 +22,7 @@
 // captures the from/to hashes and target file.
 
 import { resolve as resolvePath } from 'node:path';
+import { projectDirName } from '../config/app-namespace.ts';
 import { type ReasonChainEntry, createSqliteSink, ensureInstallId } from '../permissions/index.ts';
 import { MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 import { getPolicyArchive } from '../storage/repos/policy-archive.ts';
@@ -64,7 +65,9 @@ const defaultReadFile = (path: string): string | null => {
   }
 };
 
-const DEFAULT_TARGET = '.forja/permissions.yaml';
+// A function so `--profile` set at CLI startup is honored (resolved at
+// call time, not module load).
+const defaultTarget = (): string => `${projectDirName()}/permissions.yaml`;
 
 export const runPermissionPolicyRollback = async (
   options: RunPermissionPolicyRollbackOptions,
@@ -78,7 +81,7 @@ export const runPermissionPolicyRollback = async (
   const writeFile = options.writeFile ?? defaultWriteFile;
   const readFile = options.readFile ?? defaultReadFile;
   const dbPath = options.dbPath ?? defaultDbPath();
-  const target = resolvePath(cwd, options.target ?? DEFAULT_TARGET);
+  const target = resolvePath(cwd, options.target ?? defaultTarget());
 
   // Establish install context (mirrors verify / grants for error
   // symmetry). When --write is set, we also need the identity for

@@ -28,6 +28,7 @@
 // reject it.
 
 import { posix, win32 } from 'node:path';
+import { appDirName, projectDirName } from './app-namespace.ts';
 
 const pathMod = (platform: NodeJS.Platform) => (platform === 'win32' ? win32 : posix);
 
@@ -54,22 +55,22 @@ export const agentConfigDir = (
   const p = pathMod(platform);
   const xdg = env.XDG_CONFIG_HOME;
   if (xdg !== undefined && xdg.length > 0 && p.isAbsolute(xdg)) {
-    return p.join(xdg, 'forja');
+    return p.join(xdg, appDirName(env));
   }
   if (platform === 'win32') {
     const appdata = env.APPDATA;
     if (appdata !== undefined && appdata.length > 0 && p.isAbsolute(appdata)) {
-      return p.join(appdata, 'forja');
+      return p.join(appdata, appDirName(env));
     }
     const userprofile = env.USERPROFILE;
     if (userprofile !== undefined && userprofile.length > 0 && p.isAbsolute(userprofile)) {
-      return p.join(userprofile, 'AppData', 'Roaming', 'forja');
+      return p.join(userprofile, 'AppData', 'Roaming', appDirName(env));
     }
     return null;
   }
   const home = env.HOME;
   if (home === undefined || home.length === 0 || !p.isAbsolute(home)) return null;
-  return p.join(home, '.config', 'forja');
+  return p.join(home, '.config', appDirName(env));
 };
 
 // Per-user path for an artifact named `filename` inside the agent
@@ -89,9 +90,18 @@ export const userAgentPath = (
 };
 
 // Enterprise-installed path for `filename` under the machine-wide
-// agent config root.
+// agent config root. ALWAYS canonical (`forja`), NEVER profiled.
 //   - Windows: PROGRAMDATA (absolute) → `<PROGRAMDATA>\forja\<filename>`.
 //   - POSIX: hardcoded `/etc/forja/<filename>`.
+//
+// Deliberately does NOT route through `appDirName(env)` like the user/project
+// resolvers above: the enterprise layer is the admin-installed, non-user
+// guardrail (locked policy + hooks) at a fixed well-known location. Profiling
+// it would move the lookup to `/etc/forja-<profile>` / `%PROGRAMDATA%\forja-
+// <profile>` — which an admin never installed — so `forja --profile dev` would
+// silently skip the enterprise policy + locked hooks entirely, turning a
+// profile into an enterprise-policy bypass. A profile isolates USER and
+// PROJECT state only; the machine guardrail stays put.
 //
 // Returns null on Windows when PROGRAMDATA is missing or
 // non-absolute — operator running in a stripped-down container.
@@ -131,4 +141,4 @@ export const projectAgentPath = (
   repoRoot: string,
   filename: string,
   platform: NodeJS.Platform = process.platform,
-): string => pathMod(platform).join(repoRoot, '.forja', filename);
+): string => pathMod(platform).join(repoRoot, projectDirName(), filename);

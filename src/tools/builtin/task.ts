@@ -1,7 +1,7 @@
 import { parseCapability } from '../../permissions/capabilities.ts';
 import type { WorktreeOutcome } from '../../subagents/types.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
-import { childOutputHeadTail, summarizeChildEnvelope } from './task-shared.ts';
+import { childOutputHeadTail, playbookDirsHint, summarizeChildEnvelope } from './task-shared.ts';
 
 // `task` invokes a subagent (spec §11). The model passes a subagent
 // name (resolved against the harness-level registry) and a prompt;
@@ -137,7 +137,7 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
         'subagent.unavailable',
         'subagents are not available in this run (no registry wired)',
         {
-          hint: 'The harness was built without subagentRegistry. Define agents under ~/.config/forja/playbooks/ or <cwd>/.forja/playbooks/ and bootstrap will pick them up.',
+          hint: `The harness was built without subagentRegistry. Define agents under ${playbookDirsHint()} and bootstrap will pick them up.`,
         },
       );
     }
@@ -232,7 +232,7 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
         hint:
           result.available.length > 0
             ? `Known subagents: ${result.available.join(', ')}.`
-            : 'No subagents are defined. Add a .md file under ~/.config/forja/playbooks/ or <cwd>/.forja/playbooks/.',
+            : `No subagents are defined. Add a .md file under ${playbookDirsHint()}.`,
         details: { available: result.available },
       });
     }

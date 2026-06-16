@@ -224,6 +224,47 @@ describe('executeCase', () => {
     expect(r.passed).toBe(true);
   });
 
+  test('hermetic w.r.t. FORJA_PROFILE: honors the case .forja/ policy, not .forja-<profile>/', async () => {
+    // Regression: routing the eval policy through projectDirName() made a
+    // dev-profile shell look for `.forja-dev/permissions.yaml`, miss the case's
+    // `.forja/` policy, and silently run the executor's default (bypass) —
+    // experiments on the wrong policy. The case here ships a strict `.forja/`
+    // policy (write_file → default-deny). file_exists fails IFF the write was
+    // denied, which only happens if the case's `.forja/` policy was read; a
+    // `.forja-dev/` mis-read would get the default bypass → write allowed →
+    // out.txt created → file_exists passes.
+    const prev = process.env.FORJA_PROFILE;
+    process.env.FORJA_PROFILE = 'dev';
+    try {
+      const c = baseCase({
+        setup: { files: { '.forja/permissions.yaml': 'defaults:\n  mode: strict\n' } },
+        expect: [{ kind: 'file_exists', path: 'out.txt' }],
+      });
+      const r = await executeCase(c, {
+        bootstrapOverride: {
+          providerOverride: mockProvider([
+            {
+              tool_uses: [
+                { id: 't1', name: 'write_file', input: { path: 'out.txt', content: 'x\n' } },
+              ],
+            },
+            { text: 'done' },
+          ]),
+          sandboxAvailabilityOverride: HERMETIC_SANDBOX,
+        },
+      });
+      // write_file denied by the case's strict `.forja/` policy → out.txt
+      // absent → file_exists fails. (A `.forja-dev/` mis-read → default bypass
+      // → out.txt created → would pass.)
+      expect(r.passed).toBe(false);
+      // executeCase restores the ambient profile after the run.
+      expect(process.env.FORJA_PROFILE).toBe('dev');
+    } finally {
+      if (prev === undefined) delete process.env.FORJA_PROFILE;
+      else process.env.FORJA_PROFILE = prev;
+    }
+  });
+
   test('tool_not_called fails when tool was invoked', async () => {
     const c = baseCase({
       expect: [{ kind: 'tool_not_called', tool: 'write_file' }],

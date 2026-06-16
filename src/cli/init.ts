@@ -32,6 +32,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { projectDirName } from '../config/app-namespace.ts';
 import { DEFAULT_MEMORY_CONFIG } from '../config/loaders.ts';
 import { DEFAULT_BUDGET } from '../harness/types.ts';
 import { ensureAgentGitignore } from '../memory/gitignore.ts';
@@ -41,6 +42,7 @@ import { projectPolicyPath } from '../permissions/index.ts';
 import { DEFAULT_MODEL } from '../providers/default-model.ts';
 import { projectScopeRoots } from '../skills/index.ts';
 import { projectAgentsDir } from '../subagents/paths.ts';
+import { forjaCommand } from './forja-command.ts';
 import { renderInitConfigTemplate } from './init-config-template.ts';
 import { CANONICAL_PLAYBOOKS, type CanonicalPlaybook } from './init-playbooks/index.ts';
 import type { CanonicalSeed } from './init-seeds/index.ts';
@@ -259,7 +261,7 @@ const scaffoldGitignore = (options: InitOptions): StepResult | null => {
 
 const scaffoldConfig = (options: InitOptions, force: boolean): StepResult | null => {
   const { cwd, out, err } = options;
-  const target = join(cwd, '.forja', 'config.toml');
+  const target = join(cwd, projectDirName(), 'config.toml');
   const exists = existsSync(target);
   if (exists && !force) {
     out(`forja: skip ${target} (already exists; use --force or --force=config to overwrite)\n`);
@@ -488,7 +490,7 @@ export const runInit = (options: InitOptions): number => {
     `forja: ${totals.wrote} wrote, ${totals.overwritten} overwritten, ${totals.skipped} skipped${archivedSuffix}${disabledSuffix} (${steps.length} ${stepWord})\n`,
   );
   if (totals.wrote + totals.overwritten > 0) {
-    options.out("forja: review .forja/ and run 'forja' to start.\n");
+    options.out(`forja: review ${projectDirName()}/ and run '${forjaCommand('')}' to start.\n`);
   }
   return 0;
 };

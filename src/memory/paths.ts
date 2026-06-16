@@ -1,5 +1,6 @@
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve, sep } from 'node:path';
+import { appDirName, projectDirName } from '../config/app-namespace.ts';
 import { getGitBinarySync, safeGitEnv } from '../subagents/git-binary.ts';
 import { validateName } from './frontmatter.ts';
 import type { MemoryScope } from './types.ts';
@@ -85,7 +86,7 @@ export const userScopeRoot = (env: NodeJS.ProcessEnv = process.env): string => {
   const xdg = env.XDG_CONFIG_HOME;
   const base =
     xdg !== undefined && xdg.length > 0 && isAbsolute(xdg) ? xdg : join(homedir(), '.config');
-  return join(base, 'forja', 'memory');
+  return join(base, appDirName(env), 'memory');
 };
 
 // Project-scope roots, derived from the current repo root. The
@@ -96,8 +97,8 @@ export const userScopeRoot = (env: NodeJS.ProcessEnv = process.env): string => {
 // then lives in the working directory's `.forja/memory/` tree
 // just like sessions.db does today.
 export const projectScopeRoots = (repoRoot: string): { shared: string; local: string } => ({
-  shared: join(repoRoot, '.forja', 'memory', 'shared'),
-  local: join(repoRoot, '.forja', 'memory', 'local'),
+  shared: join(repoRoot, projectDirName(), 'memory', 'shared'),
+  local: join(repoRoot, projectDirName(), 'memory', 'local'),
 });
 
 export const resolveScopeRoots = (

@@ -23,6 +23,7 @@ import {
   getLatestChainMeta,
   listChainMetaByInstall,
 } from '../storage/repos/chain-rotation.ts';
+import { forjaCommand } from './forja-command.ts';
 
 export interface RunPermissionInspectOptions {
   rotationId: number;
@@ -70,7 +71,9 @@ const renderText = (result: InspectResult, out: (s: string) => void): void => {
     out(
       `  Inspect with: SELECT * FROM approvals_log_archived WHERE archive_rotation_id = ${r.rotationId};\n`,
     );
-    out(`  Clear after inspection: forja permission inspect ${r.rotationId} --clear\n`);
+    out(
+      `  Clear after inspection: ${forjaCommand(`permission inspect ${r.rotationId} --clear`)}\n`,
+    );
   } else {
     out('  status:                 ✓ not quarantined\n');
   }

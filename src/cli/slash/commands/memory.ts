@@ -23,6 +23,7 @@
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { appDirName, projectDirName } from '../../../config/app-namespace.ts';
 import {
   EMPTY_CORPUS_HASH,
   type MemoryFile,
@@ -3243,12 +3244,14 @@ const handleGovernanceStatus = (ctx: SlashContext, args: string[]): SlashResult 
   const verifySource = ctx.baseConfig.memorySemanticVerifySource ?? 'default';
   const verifyLabel = (() => {
     if (enabled && verifySource === 'cli') return 'yes (--memory-verify-llm)';
-    if (enabled && verifySource === 'project-config') return 'yes (.forja/config.toml)';
-    if (enabled && verifySource === 'user-config') return 'yes (~/.config/forja/config.toml)';
+    if (enabled && verifySource === 'project-config')
+      return `yes (${projectDirName()}/config.toml)`;
+    if (enabled && verifySource === 'user-config')
+      return `yes (~/.config/${appDirName()}/config.toml)`;
     if (enabled) return 'yes (default; disable: /memory governance disable verify)';
     if (verifySource === 'cli') return 'no (--no-memory-verify-llm)';
-    if (verifySource === 'project-config') return 'no (.forja/config.toml)';
-    if (verifySource === 'user-config') return 'no (~/.config/forja/config.toml)';
+    if (verifySource === 'project-config') return `no (${projectDirName()}/config.toml)`;
+    if (verifySource === 'user-config') return `no (~/.config/${appDirName()}/config.toml)`;
     return 'no (default)';
   })();
   const lines: string[] = [];
@@ -3296,13 +3299,14 @@ const handleGovernanceStatus = (ctx: SlashContext, args: string[]): SlashResult 
   const conflictSource = ctx.baseConfig.memoryConflictDetectSource ?? 'default';
   const conflictLabel = (() => {
     if (conflictEnabled && conflictSource === 'cli') return 'yes (--memory-conflict-llm)';
-    if (conflictEnabled && conflictSource === 'project-config') return 'yes (.forja/config.toml)';
+    if (conflictEnabled && conflictSource === 'project-config')
+      return `yes (${projectDirName()}/config.toml)`;
     if (conflictEnabled && conflictSource === 'user-config')
-      return 'yes (~/.config/forja/config.toml)';
+      return `yes (~/.config/${appDirName()}/config.toml)`;
     if (conflictEnabled) return 'yes (default; disable: /memory governance disable conflict)';
     if (conflictSource === 'cli') return 'no (--no-memory-conflict-llm)';
-    if (conflictSource === 'project-config') return 'no (.forja/config.toml)';
-    if (conflictSource === 'user-config') return 'no (~/.config/forja/config.toml)';
+    if (conflictSource === 'project-config') return `no (${projectDirName()}/config.toml)`;
+    if (conflictSource === 'user-config') return `no (~/.config/${appDirName()}/config.toml)`;
     return 'no (default)';
   })();
   lines.push(`  enabled:             ${conflictLabel}`);
@@ -3344,13 +3348,14 @@ const handleGovernanceStatus = (ctx: SlashContext, args: string[]): SlashResult 
   const overrideSource = ctx.baseConfig.memoryOverrideDetectSource ?? 'default';
   const overrideLabel = (() => {
     if (overrideEnabled && overrideSource === 'cli') return 'yes (--memory-override-llm)';
-    if (overrideEnabled && overrideSource === 'project-config') return 'yes (.forja/config.toml)';
+    if (overrideEnabled && overrideSource === 'project-config')
+      return `yes (${projectDirName()}/config.toml)`;
     if (overrideEnabled && overrideSource === 'user-config')
-      return 'yes (~/.config/forja/config.toml)';
+      return `yes (~/.config/${appDirName()}/config.toml)`;
     if (overrideEnabled) return 'yes (default; disable: /memory governance disable override)';
     if (overrideSource === 'cli') return 'no (--no-memory-override-llm)';
-    if (overrideSource === 'project-config') return 'no (.forja/config.toml)';
-    if (overrideSource === 'user-config') return 'no (~/.config/forja/config.toml)';
+    if (overrideSource === 'project-config') return `no (${projectDirName()}/config.toml)`;
+    if (overrideSource === 'user-config') return `no (~/.config/${appDirName()}/config.toml)`;
     return 'no (default)';
   })();
   lines.push(`  enabled:             ${overrideLabel}`);
@@ -3606,7 +3611,7 @@ const handleGovernanceToggle = (
   // despite a successful slash-command return. Falls back to cwd
   // when not in a git repo (matches bootstrap's symmetric
   // fallback).
-  const filePath = path.join(resolveRepoRoot(ctx.baseConfig.cwd), '.forja', 'config.toml');
+  const filePath = path.join(resolveRepoRoot(ctx.baseConfig.cwd), projectDirName(), 'config.toml');
   const patches: Parameters<typeof mutateMemoryConfig>[0]['patches'] = {};
   if (target.verify) patches.verifySemanticLlm = value;
   if (target.conflict) patches.conflictDetectLlm = value;
