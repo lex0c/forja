@@ -387,6 +387,22 @@ byte-identical) + a new profiled case (env FORJA_PROFILE=dev; install_id seeded
 + verified under the same profiled env) asserting both commands carry
 `--profile dev` and NOT the bare form. permission-verify suite green (18).
 
+Twentieth follow-up (gc migration hint — the one `forja gc` suggestion the sixth
+follow-up missed, operator-flagged). The sixth follow-up routed gc's main
+dry-run EXECUTE hint and the fresh-install hint through `buildForceCommand`
+(→ forjaCommand), but a THIRD suggestion — the pending-migrations notice on a
+profiled dry-run ("N migration(s) pending; … run `forja gc --force` …") — still
+hardcoded the bare command. gc sweeps the profile's own global DB
+(defaultDbPath is profile-aware) AND --force opens RW + migrates, so a profiled
+operator pasting it would apply migrations / sweep the CANONICAL real DB. Routed
+it through the SAME `buildForceCommand(tables)` already used two lines up (the
+fresh-install hint), so it preserves both the active --profile and the
+operator's `--table` scope. The `forja gc:` stderr PREFIX is a diagnostic label,
+not a copy-paste command — left as-is. Tests: a new pending-migration-hint block
+(empty-schema DB triggers the notice) asserting canonical bare rendering and a
+profiled case (process.env.FORJA_PROFILE=dev) carrying `--profile dev` and not
+the bare form. gc suite green (22).
+
 ## [2026-06-15] Prompt: drop the model id from the # Environment block
 
 The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,

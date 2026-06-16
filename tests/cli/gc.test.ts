@@ -436,6 +436,65 @@ describe('runGcCli — dry-run no-mutation invariant', () => {
   });
 });
 
+describe('runGcCli — pending-migration hint', () => {
+  // An empty-schema DB (file exists but migrate() never ran) makes the dry-run
+  // report pending migrations; the hint names a --force command to apply them.
+  // That command must stay in the active namespace — the dry-run inspected the
+  // profiled DB, so a bare `forja gc --force` would migrate/sweep the canonical
+  // real state instead.
+  const seedEmptyDb = (p: string) => {
+    const seed = openDb(p);
+    seed.close();
+  };
+
+  test('canonical: hint names the bare `forja gc --force`', async () => {
+    const emptyDb = join(xdgHome, 'pending.db');
+    seedEmptyDb(emptyDb);
+    const code = await runGcCli({
+      cwd,
+      force: false,
+      json: false,
+      tables: [],
+      out,
+      err,
+      dbPath: emptyDb,
+      now: () => NOW,
+    });
+    expect([0, 2]).toContain(code);
+    const stderr = errBuf.join('');
+    expect(stderr).toContain('migration(s) pending');
+    expect(stderr).toContain('`forja gc --force`');
+  });
+
+  test('under a profile, the hint carries --profile', async () => {
+    const prev = process.env.FORJA_PROFILE;
+    process.env.FORJA_PROFILE = 'dev';
+    try {
+      const emptyDb = join(xdgHome, 'pending-prof.db');
+      seedEmptyDb(emptyDb);
+      const code = await runGcCli({
+        cwd,
+        force: false,
+        json: false,
+        tables: [],
+        out,
+        err,
+        dbPath: emptyDb,
+        now: () => NOW,
+      });
+      expect([0, 2]).toContain(code);
+      const stderr = errBuf.join('');
+      expect(stderr).toContain('migration(s) pending');
+      expect(stderr).toContain('`forja --profile dev gc --force`');
+      // NOT the bare form (would point at the operator's real DB).
+      expect(stderr).not.toContain('`forja gc --force`');
+    } finally {
+      if (prev === undefined) delete process.env.FORJA_PROFILE;
+      else process.env.FORJA_PROFILE = prev;
+    }
+  });
+});
+
 describe('runGcCli — repoRoot resolution', () => {
   test('gc from <repo>/src/ honors <repo>/.forja/config.toml (not subdir defaults)', async () => {
     // Operator-reported bug: handler passed raw cwd to

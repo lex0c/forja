@@ -302,8 +302,12 @@ export const runGcCli = async (options: RunGcCliOptions): Promise<number> => {
         }
         const pending = countPendingMigrations(db);
         if (pending > 0) {
+          // forceCommand preserves the active --profile: the dry-run inspected
+          // the profiled DB, so the apply-migrations suggestion must target the
+          // same namespace, not the canonical install.
+          const forceCommand = buildForceCommand(tables);
           err(
-            `forja gc: ${pending} migration(s) pending; dry-run uses current schema (run \`forja gc --force\` or any command that bootstraps the DB to apply)\n`,
+            `forja gc: ${pending} migration(s) pending; dry-run uses current schema (run \`${forceCommand}\` or any command that bootstraps the DB to apply)\n`,
           );
         }
       }
