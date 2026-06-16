@@ -137,8 +137,14 @@ if [ "$os" = "windows" ] && [ "$arch" = "arm64" ]; then
 fi
 
 target_id="${os}-${arch}"
-asset="agent-${target_id}"
-[ "$os" = "windows" ] && asset="${asset}.exe"
+# Release assets are named `forja-<version>-<target_id>[.exe]`
+# (scripts/targets.ts `assetName`). We do NOT reconstruct the `<version>`
+# segment here: it comes from the build's version.ts, which is not guaranteed
+# to equal the git tag. Instead we read the exact filename from the published
+# SHA256SUMS (below), matching this host's target by suffix — so the installer
+# can never drift from the naming scheme the release actually shipped.
+asset_suffix="-${target_id}"
+[ "$os" = "windows" ] && asset_suffix="${asset_suffix}.exe"
 
 # Resolve version. The latest-release endpoint follows redirects to
 # the actual tag URL; we extract the tag from the Location header so
@@ -163,20 +169,37 @@ if [ -z "$VERSION" ]; then
 fi
 
 base="https://github.com/${REPO}/releases/download/${VERSION}"
-asset_url="${base}/${asset}"
 sums_url="${base}/SHA256SUMS"
 
 tmp=$(mktemp -d 2>/dev/null || mktemp -d -t forja-install)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
+# Fetch SHA256SUMS first — it's the source of truth for the asset filename.
+printf 'install.sh: downloading SHA256SUMS\n' >&2
+fetch "$sums_url" "$tmp/SHA256SUMS"
+[ -s "$tmp/SHA256SUMS" ] || { printf 'install.sh: empty download for SHA256SUMS\n' >&2; exit 1; }
+
+# Derive this host's asset filename from SHA256SUMS: the `forja-…` entry whose
+# name ends with our target suffix (`-<os>-<arch>[.exe]`). Literal suffix match
+# (no regex — `.exe` would otherwise read as "any char + exe"), so the version
+# segment stays opaque to the installer.
+asset=$(awk -v suf="$asset_suffix" '
+  { fn = $2; n = length(fn); s = length(suf)
+    if (n >= s && substr(fn, n - s + 1) == suf && substr(fn, 1, 6) == "forja-") {
+      print fn; exit
+    } }
+' "$tmp/SHA256SUMS")
+if [ -z "$asset" ]; then
+  printf 'install.sh: no asset for target %s found in SHA256SUMS — refusing to install\n' "$target_id" >&2
+  exit 1
+fi
+
+asset_url="${base}/${asset}"
 printf 'install.sh: downloading %s\n' "$asset_url" >&2
 fetch "$asset_url" "$tmp/$asset"
 # Some `wget` builds write a 0-byte file and exit 0 on partial
 # failures; `curl -fsSL` is stricter but we belt-and-suspenders.
 [ -s "$tmp/$asset" ] || { printf 'install.sh: empty download for %s\n' "$asset" >&2; exit 1; }
-printf 'install.sh: downloading SHA256SUMS\n' >&2
-fetch "$sums_url" "$tmp/SHA256SUMS"
-[ -s "$tmp/SHA256SUMS" ] || { printf 'install.sh: empty download for SHA256SUMS\n' >&2; exit 1; }
 
 # Pull the line matching our asset and compare hashes. Use awk to
 # extract the expected hash; never feed the raw SHA256SUMS to
@@ -198,7 +221,7 @@ fi
 printf 'install.sh: hash verified (%s)\n' "$actual" >&2
 
 mkdir -p "$PREFIX"
-dest="$PREFIX/agent"
+dest="$PREFIX/forja"
 [ "$os" = "windows" ] && dest="${dest}.exe"
 
 mv "$tmp/$asset" "$dest"

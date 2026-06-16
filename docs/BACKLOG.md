@@ -418,6 +418,27 @@ both render canonical (no-profile byte-identical) + a new profiled case
 (`.forja-dev/` seeded without markers) asserting `forja --profile dev init` and
 `remove .forja-dev/ manually`, and NOT the bare forms. purge suite green (46).
 
+Twenty-second follow-up (curl installer — release-breaking rename residue,
+operator-flagged). `assetName` now produces `forja-<version>-<target>[.exe]` and
+release.yml uploads `dist/forja-*`, but `install.sh` still built
+`asset="agent-${target_id}"` — so ANY release built from this lineage would make
+`curl … | sh` request a non-existent `agent-linux-x64` and fail before checksum
+verification. Two traps beyond the bare rename: (a) the version segment comes
+from the build's version.ts, NOT the git tag (version injection is still a
+future TODO — a `v0.1.0` tag today ships `forja-0.0.0-…`), so reconstructing the
+name from the resolved tag would 404; (b) `asset` was built before the version
+was even resolved. Fixed by DERIVING the asset filename from the published
+SHA256SUMS (downloaded first now): a literal-suffix awk match for the `forja-…`
+entry ending in `-<os>-<arch>[.exe]` — substr compare, not regex, so `.exe`
+isn't read as "any char + exe". The installer never has to know the version
+segment and can't drift from the shipped scheme again; a target absent from
+SHA256SUMS yields a clear "no asset for target" refusal instead of a 404. Also
+fixed the install destination (`$PREFIX/agent` → `$PREFIX/forja`, same class as
+the README symlink — installing under a command the docs don't verify). No
+install.sh test harness exists; verified `sh -n` + exercised the derivation awk
+against a realistic SHA256SUMS fixture (linux-x64 disambiguates from linux-arm64
+and the .exe line; missing target → empty).
+
 ## [2026-06-15] Prompt: drop the model id from the # Environment block
 
 The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,
