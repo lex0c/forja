@@ -270,6 +270,22 @@ glob guard's reachability scan. The policy validator uses explicit fields, so
 it's unaffected (additive). No behavior change on the default namespace. Tests:
 protectedTargets surfaces the foreign root under a profile, empty without.
 
+Fourteenth follow-up (eval hermeticity — my own routing miss, operator-flagged).
+The 1st-commit routing pushed the eval executor's policy path through
+`projectDirName()`. Eval cases author fixtures/setup.files against the canonical
+`.forja/permissions.yaml`; under a dev-profile shell the executor looked for
+`.forja-<profile>/`, didn't see the case's policy, wrote the DEFAULT (bypass)
+there, and bootstrap (also profiled) read that — so custom eval policies were
+silently ignored and experiments ran against the wrong policy. Evals must be
+HERMETIC w.r.t. FORJA_PROFILE: reverted the policy path to the literal canonical
+`.forja/`, and `executeCase` now clears FORJA_PROFILE for the run (save/delete/
+restore, beside the existing FORJA_OPENAI_REASONING_REPLAY pin) so setupCwd's
+write AND bootstrap's read both resolve `.forja/` (the eval DB is a temp file,
+unaffected). Behavioral regression test: under FORJA_PROFILE=dev a case shipping
+a strict `.forja/` policy denies write_file (file_exists fails) — which only
+holds if the canonical policy was read; a `.forja-dev/` mis-read would get the
+default bypass and pass. Also pins env restore.
+
 ## [2026-06-15] Prompt: drop the model id from the # Environment block
 
 The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,

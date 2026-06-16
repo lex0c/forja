@@ -10,7 +10,6 @@ import {
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
 import { type BootstrapInput, bootstrap } from '../cli/bootstrap.ts';
-import { projectDirName } from '../config/app-namespace.ts';
 import {
   type CompactionStrategy,
   type HarnessEvent,
@@ -168,9 +167,16 @@ const setupCwd = (caseDef: EvalCase): string => {
   // Drop a default permissions.yaml only when the case+fixture
   // didn't provide one. Checking after fixture+files copy lets
   // either source override the default.
-  const policyPath = join(dir, projectDirName(), 'permissions.yaml');
+  //
+  // CANONICAL `.forja/` — NOT profile-aware. Eval cases author their
+  // fixtures/setup.files against `.forja/permissions.yaml`, and the run is made
+  // hermetic w.r.t. FORJA_PROFILE in `executeCase` (it clears the env so
+  // bootstrap reads here too). Routing this through `projectDirName()` would
+  // look for `.forja-<profile>/` under a dev-profile shell, miss the case's
+  // policy, and silently run the default — experiments against the wrong policy.
+  const policyPath = join(dir, '.forja', 'permissions.yaml');
   if (!existsSync(policyPath)) {
-    mkdirSync(join(dir, projectDirName()), { recursive: true });
+    mkdirSync(join(dir, '.forja'), { recursive: true });
     writeFileSync(policyPath, DEFAULT_EVAL_POLICY_YAML);
   }
   return dir;
@@ -404,6 +410,16 @@ export const executeCase = async (
   const prevOpenaiReplay = process.env.FORJA_OPENAI_REASONING_REPLAY;
   if (prevOpenaiReplay === undefined) process.env.FORJA_OPENAI_REASONING_REPLAY = '0';
 
+  // Evals are HERMETIC w.r.t. FORJA_PROFILE. Cases author fixtures against the
+  // canonical `.forja/`, and both the default-policy write (setupCwd) and the
+  // policy read (bootstrap, below) resolve their project dir from
+  // process.env.FORJA_PROFILE. A dev running evals from a `--profile dev` shell
+  // would otherwise resolve `.forja-dev/`, miss the case's `.forja/` policy, and
+  // silently run against the default — experiments on the wrong policy. Clear it
+  // for the case (the eval DB is a temp file, unaffected); restored in finally.
+  const prevProfile = process.env.FORJA_PROFILE;
+  if (prevProfile !== undefined) delete process.env.FORJA_PROFILE;
+
   try {
     cwd = setupCwd(caseDef);
 
@@ -495,6 +511,7 @@ export const executeCase = async (
     clearTimeout(timer);
     options.signal?.removeEventListener('abort', onParentAbort);
     if (prevOpenaiReplay === undefined) delete process.env.FORJA_OPENAI_REASONING_REPLAY;
+    if (prevProfile !== undefined) process.env.FORJA_PROFILE = prevProfile;
   }
 
   // Evaluate expectations BEFORE cleanup so file_exists/file_contains
