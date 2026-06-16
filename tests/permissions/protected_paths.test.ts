@@ -223,6 +223,57 @@ describe('classifyProtectedPath — escalate tier (writes only)', () => {
       }),
     ).toBe('escalate');
   });
+
+  test('escalate dirs follow XDG relocation (no silent own-policy edit under XDG)', () => {
+    // The escalate floor forces confirm-on-write to Forja's own config/data
+    // dirs even in acceptEdits/autonomous. Under an XDG relocation the real dir
+    // is at <XDG>/forja, so a home-only match would let a write to the relocated
+    // own permissions.yaml skip the confirm — mirror the sandbox's XDG mask.
+    // No profile here: explicitly cleared so a leaked FORJA_PROFILE can't flip
+    // `.config/forja` into the foreign-deny tier. Unique home avoids the cache.
+    const prevProfile = process.env.FORJA_PROFILE;
+    const prevData = process.env.XDG_DATA_HOME;
+    const prevConfig = process.env.XDG_CONFIG_HOME;
+    delete process.env.FORJA_PROFILE;
+    process.env.XDG_DATA_HOME = '/srv/data';
+    process.env.XDG_CONFIG_HOME = '/srv/conf';
+    const home = '/home/xdgesc';
+    const cwd = '/work/escalate-xdg';
+    try {
+      expect(
+        classifyProtectedPath({
+          absPath: '/srv/conf/forja/permissions.yaml',
+          op: 'write',
+          home,
+          cwd,
+        }),
+      ).toBe('escalate');
+      expect(
+        classifyProtectedPath({ absPath: '/srv/data/forja/sessions.db', op: 'write', home, cwd }),
+      ).toBe('escalate');
+      // Escalate is write-only — reads still pass.
+      expect(
+        classifyProtectedPath({
+          absPath: '/srv/conf/forja/permissions.yaml',
+          op: 'read',
+          home,
+          cwd,
+        }),
+      ).toBeNull();
+      // Home-relative still escalates too (defense in depth, both covered).
+      expect(
+        classifyProtectedPath({ absPath: '/home/xdgesc/.config/forja/x', op: 'write', home, cwd }),
+      ).toBe('escalate');
+    } finally {
+      const restore = (k: string, v: string | undefined) => {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      };
+      restore('FORJA_PROFILE', prevProfile);
+      restore('XDG_DATA_HOME', prevData);
+      restore('XDG_CONFIG_HOME', prevConfig);
+    }
+  });
 });
 
 describe('classifyProtectedPath — user-level foreign deny (under a profile)', () => {

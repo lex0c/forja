@@ -2,6 +2,27 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-16] fix(security): escalate-on-write floor follows XDG too
+
+Closed the related gap the previous entry left open. The foreign-deny fix made
+the DENY floor XDG-aware, but `tildeEscalateDirs` (escalate-on-write for Forja's
+own config/data dirs) still resolved home-relative only. Re-examined under
+pressure: this is NOT a disclosure, but the escalate tier's job is to force a
+confirm even in acceptEdits / autonomous — so under an XDG relocation a write to
+the relocated own `permissions.yaml` would skip that confirm, a silent
+self-policy-edit (broaden allows / disable sandbox; next boot under the tampered
+policy). Supervised mode is unaffected (writes confirm anyway); the teeth are in
+acceptEdits/autonomous. My earlier "lower severity" call leaned on supervised
+mode and under-weighted that — closing it. Generalized the foreign-deny's
+XDG resolver into one `resolveUserTildeDir` (home-relative + XDG location for
+`.config/…`→XDG_CONFIG_HOME and `.local/share/…`→XDG_DATA_HOME; `.ssh`/`.aws`/
+shell rc stay home-only) and applied it to BOTH the escalate dirs and the
+foreign deny — so the engine floor and the sandbox mask now cover the identical
+set. Additive: default namespace + no XDG is byte-identical. Regression test:
+under XDG relocation a write to `<XDG_CONFIG_HOME>/forja/permissions.yaml`
+escalates (read still passes; home-relative still covered). Engine + sandbox
+suites green (262).
+
 ## [2026-06-16] playbook: tune code-review from its first real run
 
 The code-review playbook's debut (a 351-file branch) caught a real security

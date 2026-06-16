@@ -378,22 +378,25 @@ export const startsWithSegment = (path: string, prefix: string): boolean => {
 const resolveTildeFile = (home: string, file: string): string => resolve(home, file);
 const resolveCwdDir = (cwd: string, dir: string): string => resolve(cwd, dir);
 
-// Resolve a FOREIGN Forja user dir (`.config/<seg>` / `.local/share/<seg>`) to
-// EVERY absolute location the real state can live at — both home-relative AND
-// the XDG location. Forja's own dirs follow the XDG base-dir spec
-// (`defaultDataDir` resolves `<XDG_DATA_HOME>/<seg>`, the config dir
-// `<XDG_CONFIG_HOME>/<seg>` when set), and the SANDBOX masks those XDG locations
-// (sandbox-runner.ts). The engine foreign-deny floor MUST follow them too:
-// `read_file` / `grep` run OUTSIDE the sandbox, so this floor is their only
-// defense — a home-relative-only match misses the operator's real `<XDG>/forja`
-// state under an XDG relocation, letting a profiled session read the real
-// audit / sessions / trust corpus (the exact disclosure the foreign deny exists
-// to block). Reads process.env (the source `defaultDataDir` itself reads — the
-// REAL host location is governed by the operator's environment, not the
-// sandbox's scrubbed env; frozen per process so the (home,cwd) cache stays
-// sound). Same absolute-and-differs guard the sandbox uses, so a relative or
-// home-equal XDG value adds nothing.
-const resolveForeignTildeDir = (home: string, dir: string): string[] => {
+// Resolve a user-level tilde dir to EVERY absolute location the real dir can
+// live at — home-relative AND, for an XDG-following entry (`.config/…` →
+// XDG_CONFIG_HOME, `.local/share/…` → XDG_DATA_HOME), the XDG location. Used by
+// BOTH the foreign read+write DENY and the escalate-on-write floor: the real
+// dirs follow the XDG base-dir spec (`defaultDataDir` → `<XDG_DATA_HOME>/<seg>`)
+// and the SANDBOX masks the XDG locations (sandbox-runner.ts), so the engine
+// floor must too — `read_file` / `grep` / `write_file` run OUTSIDE the sandbox,
+// so it is their only defense. A home-relative-only match misses the operator's
+// real `<XDG>/forja` state under an XDG relocation: that is a DISCLOSURE for the
+// deny (a profiled session reads the real audit/sessions/trust) and a silent
+// self-policy edit for the escalate (a write to the relocated own
+// `permissions.yaml` skips the confirm in acceptEdits / autonomous). Reads
+// process.env (the source `defaultDataDir` itself reads — the REAL host location
+// is governed by the operator's environment, not the sandbox's scrubbed env;
+// frozen per process so the (home,cwd) cache stays sound). Same
+// absolute-and-differs guard the sandbox uses, so a relative or home-equal XDG
+// value adds nothing. Entries that do NOT follow XDG (`.ssh`, `.aws`, shell rc
+// files) keep their single home-relative form.
+const resolveUserTildeDir = (home: string, dir: string): string[] => {
   const out = [resolveTildeFile(home, dir)];
   const addXdg = (xdg: string | undefined, homeBase: string, prefix: string): void => {
     if (xdg === undefined || xdg.length === 0 || !xdg.startsWith('/') || xdg === homeBase) return;
@@ -475,10 +478,10 @@ const getResolvedTargets = (home: string, cwd: string): ResolvedProtectedTargets
     const projectRoot = foreignDirs.length > 0 ? resolveRepoRoot(cwd) : cwd;
     entry = {
       tildeEscalateFiles: TILDE_ESCALATE_FILES.map((f) => resolveTildeFile(home, f)),
-      tildeEscalateDirs: tildeEscalateDirs().map((d) => resolveTildeFile(home, d)),
+      tildeEscalateDirs: tildeEscalateDirs().flatMap((d) => resolveUserTildeDir(home, d)),
       cwdEscalateDirs: cwdEscalateDirs().map((d) => resolveCwdDir(projectRoot, d)),
       cwdForeignDenyDirs: foreignDirs.map((d) => resolveCwdDir(projectRoot, d)),
-      tildeForeignDenyDirs: tildeForeignDenyDirs().flatMap((d) => resolveForeignTildeDir(home, d)),
+      tildeForeignDenyDirs: tildeForeignDenyDirs().flatMap((d) => resolveUserTildeDir(home, d)),
     };
     targetCache.set(key, entry);
   }
