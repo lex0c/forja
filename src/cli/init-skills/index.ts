@@ -22,7 +22,6 @@ import bulkEditFilesMd from './bulk-edit-files.md' with { type: 'text' };
 import gitBisectRegressionMd from './git-bisect-regression.md' with { type: 'text' };
 import gitRecoverLostWorkMd from './git-recover-lost-work.md' with { type: 'text' };
 import gitResolveConflictMd from './git-resolve-conflict.md' with { type: 'text' };
-import reviewDiffMd from './review-diff.md' with { type: 'text' };
 import safeBulkDeleteMd from './safe-bulk-delete.md' with { type: 'text' };
 import threatModelComponentMd from './threat-model-component.md' with { type: 'text' };
 import triageFlakyTestMd from './triage-flaky-test.md' with { type: 'text' };
@@ -48,7 +47,6 @@ export const CANONICAL_SKILLS: ReadonlyArray<CanonicalSkill> = [
   { filename: 'git-bisect-regression.md', content: gitBisectRegressionMd },
   { filename: 'git-recover-lost-work.md', content: gitRecoverLostWorkMd },
   { filename: 'git-resolve-conflict.md', content: gitResolveConflictMd },
-  { filename: 'review-diff.md', content: reviewDiffMd },
   { filename: 'safe-bulk-delete.md', content: safeBulkDeleteMd },
   { filename: 'threat-model-component.md', content: threatModelComponentMd },
   { filename: 'triage-flaky-test.md', content: triageFlakyTestMd },

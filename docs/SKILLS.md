@@ -51,7 +51,7 @@ Storage and pure logic live under `src/skills/`; the audit table lives in `src/s
   ▼                      ▼                         ▼                          ▼
 src/tools/builtin/   src/cli/skills-prompt.ts   src/cli/slash/commands/   src/cli/init-skills/
 skill-invoke         assembleSkillCatalog       skill.ts                  CANONICAL_SKILLS
-skill-list           Section — the eager        /skill list/show/new      (9 seed skills,
+skill-list           Section — the eager        /skill list/show/new      (8 seed skills,
 skill-show           `# Skills` prompt block    /promote/demote/delete    installed by `forja init`)
 ```
 
@@ -236,9 +236,9 @@ The model is trained to treat text inside `<skill>…</skill>` as a procedure to
 
 ## 10. The seed catalog
 
-`forja init` scaffolds a fifth artifact (after permissions, gitignore, config, playbooks): the seed skill catalog. The 9 canonical skills are bundled into the binary (`src/cli/init-skills/`, imported as text assets) and written into `<cwd>/.forja/skills/shared/` — the catalog scan picks them up at the next REPL boot.
+`forja init` scaffolds a fifth artifact (after permissions, gitignore, config, playbooks): the seed skill catalog. The 8 canonical skills are bundled into the binary (`src/cli/init-skills/`, imported as text assets) and written into `<cwd>/.forja/skills/shared/` — the catalog scan picks them up at the next REPL boot.
 
-The seed set spans git workflows (`git-bisect-regression`, `git-resolve-conflict`, `git-recover-lost-work`), testing (`add-regression-test`, `triage-flaky-test`), security (`threat-model-component`), bulk file operations (`bulk-edit-files`, `safe-bulk-delete`), and diff review (`review-diff`).
+The seed set spans git workflows (`git-bisect-regression`, `git-resolve-conflict`, `git-recover-lost-work`), testing (`add-regression-test`, `triage-flaky-test`), security (`threat-model-component`), and bulk file operations (`bulk-edit-files`, `safe-bulk-delete`).
 
 `forja init --only=skills` re-runs just this step; `--force=skills` overwrites existing files. Each step is skip-if-exists, so a re-run after an operator's hand edits is safe.
 

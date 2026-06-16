@@ -37,9 +37,10 @@ on a suspect line before calling it a regression.
 ## Find
 
 Real issues introduced or exposed by this change: bugs, regressions, security
-risks, permission/auth failures, validation gaps, data loss, API/contract
-breaks, concurrency issues, operational risks, meaningful performance problems,
-or a missing test for a specific dangerous path.
+risks, permission/auth failures, validation gaps, data loss, leaked
+secrets/keys/tokens committed in the diff, API/contract breaks, concurrency
+issues, operational risks, meaningful performance problems, or a missing test
+for a specific dangerous path.
 
 ## Ignore
 
@@ -59,7 +60,11 @@ null/empty values, untrusted input, permissions, backward compatibility, and
 side effects. Follow project instructions, local architecture rules, and the
 existing test patterns. Do not flag a refactor or a "best practice" without
 naming the concrete problem it solves. Read files outside the diff only when
-they are a direct dependency of something in it.
+they are a direct dependency of something in it. Read the enclosing function of
+each hunk, not just the changed lines — a bug often hides in how the change
+interacts with the unchanged code around it. For a line touching untrusted
+input, auth, a query, a shell call, or a path, confirm the sink-correct defense
+is present (parameterized query, output escaping, path normalization).
 
 Search heuristics: similar usage elsewhere for a consistency check
 (`grep -nw 'pattern'`); callers of a changed symbol for the impact radius
