@@ -9,8 +9,20 @@
 // async path leak exactly what the sync path now caps
 // (OUTPUT_POLICY §6 exception).
 
+import { appDirName, projectDirName } from '../../config/app-namespace.ts';
 import { HEAD_TAIL_DEFAULT_LINES, headTailSummary } from '../output-summarizer.ts';
 import type { SummarizedOutput } from '../types.ts';
+
+// The two playbook discovery dirs, profile-aware, as a reusable hint
+// fragment ("<user> or <project>"). The three subagent tools all point
+// the model at these dirs when no registry/definition is found; under a
+// `--profile` session the real dirs are `forja-<p>` / `.forja-<p>`
+// (subagents/paths.ts resolves them via the same helpers), so a
+// hardcoded canonical hint would send the operator to a directory the
+// run never reads. Built from the helpers so the advice tracks the
+// active namespace.
+export const playbookDirsHint = (env: NodeJS.ProcessEnv = process.env): string =>
+  `~/.config/${appDirName(env)}/playbooks/ or <cwd>/${projectDirName(env)}/playbooks/`;
 
 // Byte threshold above which the child's terminal `output` is
 // head-tailed before the parent sees it. Asymmetric counterpart to

@@ -286,6 +286,32 @@ a strict `.forja/` policy denies write_file (file_exists fails) — which only
 holds if the canonical policy was read; a `.forja-dev/` mis-read would get the
 default bypass and pass. Also pins env restore.
 
+Fifteenth follow-up (closing-sweep verdict — full re-audit of every helper
+consumer, operator-requested). Enumerated EVERY consumer of the app-namespace
+helpers across src/ plus every remaining raw `.forja`/`forja` path literal, and
+classified each against intent. Verdict: the functional + security surface is
+CLEAN — all on-disk state correctly profiled, the two carve-outs correct on
+purpose (`enterpriseAgentPath` canonical so `--profile` can't skip the admin
+guardrail; the eval executor hermetic per the fourteenth follow-up), and the
+security lists cover both namespaces. The only mis-routes were three clusters of
+DISPLAY-only advisory strings that hardcoded the canonical name while their
+FUNCTIONAL counterpart was already profiled — so a `--profile` session was told
+to look in a directory the run never reads: (1) the "Define agents under
+`~/.config/forja/playbooks/` or `<cwd>/.forja/playbooks/`" hint in all three
+subagent tools (task/task_async/task_list) — the real dirs (subagents/paths.ts)
+are profile-aware; (2) `/hooks`'s "no hooks.toml at …" note (kept `/etc/forja`
+canonical — the enterprise layer is NOT profiled — but routed the user + project
+segments); (3) `/memory governance`'s source-label strings
+(`yes (~/.config/forja/config.toml)` etc.) while the actual write site already
+used `projectDirName()`. Fixed by interpolating the helpers; the five playbook
+sites now share one `playbookDirsHint(env=process.env)` in task-shared.ts (the
+module all three tools already import), which throws on a malformed profile like
+the path helpers rather than silently using canonical. Code COMMENTS describing
+the canonical layout were left as-is (documentation of the default form, not a
+runtime path). New unit test for `playbookDirsHint` (no-profile byte-identical /
+profile-carried / malformed-throws); the existing default-namespace label tests
+in memory.test.ts stay green unchanged (byte-identical when no profile is set).
+
 ## [2026-06-15] Prompt: drop the model id from the # Environment block
 
 The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,

@@ -1,6 +1,7 @@
 import { parseCapability } from '../../permissions/capabilities.ts';
 import { MAX_SUBAGENT_DEPTH } from '../../subagents/types.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
+import { playbookDirsHint } from './task-shared.ts';
 
 // `task_async` spawns a subagent without blocking the parent on its
 // completion. Returns a handle the model can later pass to
@@ -94,7 +95,7 @@ export const taskAsyncTool: Tool<TaskAsyncInput, TaskAsyncOutput> = {
         'subagent.unavailable',
         'subagents are not available in this run (no registry wired)',
         {
-          hint: 'The harness was built without subagentRegistry. Define agents under ~/.config/forja/playbooks/ or <cwd>/.forja/playbooks/ and bootstrap will pick them up.',
+          hint: `The harness was built without subagentRegistry. Define agents under ${playbookDirsHint()} and bootstrap will pick them up.`,
         },
       );
     }
@@ -203,7 +204,7 @@ export const taskAsyncTool: Tool<TaskAsyncInput, TaskAsyncOutput> = {
         hint:
           available.length > 0
             ? `Known subagents: ${available.join(', ')}.`
-            : 'No subagents are defined. Add a .md file under ~/.config/forja/playbooks/ or <cwd>/.forja/playbooks/.',
+            : `No subagents are defined. Add a .md file under ${playbookDirsHint()}.`,
         details: { available },
       });
     }
