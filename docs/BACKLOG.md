@@ -2,6 +2,61 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-16] playbook: tune code-review from its first real run
+
+The code-review playbook's debut (a 351-file branch) caught a real security
+blocker but also exposed four tuning gaps; applied all four. (1) Budget was stale
+— the run cost $1.81 / 38 tools against a `max_cost_usd: 1.50` / `max_steps: 25`
+cap (over-budget warning fired); raised to $2.50 / 45 to cover a realistic
+branch. (2) Generalize-the-finding: the review found the foreign-deny XDG bug but
+missed the IDENTICAL home-only resolution in the sibling escalate-dirs — added a
+directive to check whether a handling/resolution pattern recurs in sibling code
+and report the CLASS, not the first instance. (3) Large-diff protocol: codified
+what the run did emergently — classify mechanical churn vs substantive logic
+first, review the substantive set, record the rest in `not_reviewed`, don't drown
+in volume. (4) Self-verify high-impact: a `critical`/`high` finding should be
+verified to high confidence by the read-only reviewer's own tools before
+returning, not handed back unverified for the parent to re-check. Bumped
+`prompt_version` 2→3. Body refinements are behavior-covered by the eval +
+loader-parse (no brittle phrase tests, per precedent); loader green (28).
+
+## [2026-06-16] fix(security): foreign read-deny floor must follow XDG relocation
+
+The code-review playbook (now dispatching correctly) immediately earned its keep:
+it flagged a real security blocker in the very `tildeForeignDenyDirs` floor added
+two follow-ups ago (commit 10502139). Independently verified against source: the
+real data/config dirs follow XDG (`storage/paths.ts` `defaultDataDir` →
+`<XDG_DATA_HOME>/<seg>`), and the SANDBOX masks those XDG locations
+(`sandbox-runner.ts` iterates `appDirNames()` over XDG_DATA_HOME/XDG_CONFIG_HOME)
+— but the ENGINE foreign-deny resolved `resolve(home, …)` only. Since
+`read_file`/`grep` run OUTSIDE the sandbox, that floor is their sole defense, so
+under an XDG relocation (a supported config) a `--profile` session could
+`read_file`/`grep` the operator's real audit hash-chain, sessions, and trust
+corpus at `<XDG>/forja` — the exact disclosure the foreign deny exists to block.
+Fixed by resolving each foreign Forja user dir to BOTH its home-relative path AND
+its XDG location (`.local/share/<seg>`→XDG_DATA_HOME, `.config/<seg>`→
+XDG_CONFIG_HOME), reading `process.env` and using the same absolute-and-differs
+guard as the sandbox — so the engine floor and the sandbox mask now cover the
+same set. Deny applies to read AND write, so this closes both directions.
+Regression test: under FORJA_PROFILE=dev + relocated XDG, a profiled session is
+denied reading `<XDG_DATA_HOME>/forja/sessions.db` and `<XDG_CONFIG_HOME>/forja/…`
+while the active `forja-dev` at the XDG location stays accessible; home-relative
+still denied (defense in depth). Engine + sandbox suites green (261). Also fixed
+two stale-comment nits the review caught (`init.ts` playbook/skill counts +
+path: agents/*.md/10 → playbooks/*.md/4, skills 20 → 8; `memory/paths.ts` a
+`$XDG_CONFIG_HOME/agent/memory/` rename leftover → `forja`). Two flagged
+questions are non-issues: the eval executor's `process.env.FORJA_PROFILE`
+save/restore is safe under the sequential case runner (documented constraint),
+and `applyProfileFlag`'s global `--profile` strip is by design (no subcommand
+takes a positional equal to the literal string `--profile`).
+
+NOTE — related lower-severity gap left open: `tildeEscalateDirs` (escalate-on-
+write for the ACTIVE namespace + the canonical credential dirs) has the same
+home-only resolution, so a write to the XDG-relocated active config wouldn't
+escalate. Not a disclosure (the foreign DENY, now XDG-aware, covers the
+canonical dir's writes), and pre-existing; a separate follow-up if we want the
+escalate floor XDG-aware too.
+
 ## [2026-06-16] prompt: dispatch is the default when the request IS a playbook job
 
 Operator-reproduced on the DEFAULT model (opus-4-8, clean catalog): "faça code
