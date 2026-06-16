@@ -12,6 +12,35 @@ const captured = () => {
   return { write: (s: string) => lines.push(s), lines };
 };
 
+// Seed a two-row chain and tamper seq 2's prev_hash so `verify` reports BROKEN
+// (the path that prints the copy-paste remediation commands). Returns nothing;
+// the caller verifies against the same dbPath + install_id.
+const seedTamperedChain = (dbPath: string, identity: ReturnType<typeof ensureInstallId>): void => {
+  const db = openDb(dbPath);
+  migrate(db, MIGRATIONS);
+  const sink = createSqliteSink({ db, identity });
+  const row = (ts: number) => ({
+    session_id: 'sess-x',
+    tool_name: 'bash',
+    args: {},
+    decision: 'allow' as const,
+    policy_hash: 'sha256:fixture',
+    reason_chain: [{ stage: 'static-rule' }],
+    capabilities: [],
+    score: 0,
+    score_components: {},
+    classifier_hash: 'none',
+    classifier_adjust: null,
+    sandbox_profile: null,
+    ttl_expires_at: null,
+    ts,
+  });
+  sink.emit(row(1));
+  sink.emit(row(2));
+  db.run('UPDATE approvals_log SET prev_hash = ? WHERE seq = 2', ['forged']);
+  db.close();
+};
+
 describe('parseArgs — permission subcommand', () => {
   test('forja permission verify routes to permission.verb', () => {
     const r = parseArgs(['permission', 'verify']);
@@ -208,6 +237,36 @@ describe('runPermissionVerify', () => {
     expect(text).toContain('BROKEN at seq 2');
     expect(text).toContain('prev_hash_mismatch');
     expect(text).toContain('forged');
+    // Default namespace: remediation commands render as bare `forja …`
+    // (byte-identical to the pre-forjaCommand hardcoded strings).
+    expect(text).toContain('`forja permission rotate-chain --reason "<text>"`');
+    expect(text).toContain('`forja --accept-broken-chain ...`');
+  });
+
+  test('under a profile, remediation commands carry --profile', async () => {
+    // The diagnostic ran against the PROFILED chain, so its copy-paste fixes
+    // (rotate-chain / --accept-broken-chain) must target the same namespace —
+    // not the canonical install. install_id is discovered + the chain seeded
+    // under the SAME profiled env so verify finds the broken rows.
+    const profEnv: NodeJS.ProcessEnv = { HOME: tmp, FORJA_PROFILE: 'dev' };
+    const identity = ensureInstallId({ env: profEnv });
+    seedTamperedChain(dbPath, identity);
+
+    const out = captured();
+    const code = await runPermissionVerify({
+      dbPath,
+      env: profEnv,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(1);
+    const text = out.lines.join('');
+    expect(text).toContain('BROKEN at seq 2');
+    expect(text).toContain('`forja --profile dev permission rotate-chain --reason "<text>"`');
+    expect(text).toContain('`forja --profile dev --accept-broken-chain ...`');
+    // And NOT the bare canonical form (would target the operator's real state).
+    expect(text).not.toContain('`forja permission rotate-chain');
+    expect(text).not.toContain('`forja --accept-broken-chain');
   });
 
   test('--json prints single NDJSON line', async () => {

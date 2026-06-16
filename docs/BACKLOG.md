@@ -370,6 +370,23 @@ one-shot examples (`agent` / `agent "…"`), the harness-loop table cell
 generic English prose untouched ("coding agent", "agent CLIs", "the agent
 runtime"). Docs-only.
 
+Nineteenth follow-up (verify remediation commands — same advertised-command
+class, operator-flagged). `forja permission verify` on a BROKEN chain prints two
+copy-paste remediations — `forja permission rotate-chain --reason "…"` and
+`forja --accept-broken-chain …`. Under `forja --profile dev` the chain just
+checked lives in the profiled `forja-dev` namespace, but the bare suggestions
+omitted `--profile`: pasting rotate-chain (MUTATING) or continuing with
+--accept-broken-chain would operate on the CANONICAL install, not the broken
+profiled chain — exactly the bypass `forjaCommand` exists to prevent (its doc
+comment even names verify/rotate-chain). Built both through
+`forjaCommand(rest, options.env)` (threading the test seam; undefined ⇒
+process.env). The SQL-query hints (`SELECT * FROM …`) and the `forja permission
+verify:` error PREFIX are not copy-paste `forja` commands, left as-is. Tests:
+extended the tampered-chain case to assert canonical bare rendering (no-profile
+byte-identical) + a new profiled case (env FORJA_PROFILE=dev; install_id seeded
++ verified under the same profiled env) asserting both commands carry
+`--profile dev` and NOT the bare form. permission-verify suite green (18).
+
 ## [2026-06-15] Prompt: drop the model id from the # Environment block
 
 The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,
