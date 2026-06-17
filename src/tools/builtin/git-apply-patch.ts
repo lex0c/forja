@@ -25,6 +25,14 @@ const MAX_PATCH_BYTES = 10 * 1024 * 1024;
 // model can re-emit a valid patch); `unsupported` shapes are not (the operation
 // is out of scope for the single-file tool — switch to edit_file/write_file).
 const rejectToError = (reason: PatchRejectReason, message: string): ToolResult<never> => {
+  if (reason === 'deletion') {
+    // File removal is a delete-fs op the engine gates separately; route it to
+    // the shell rather than perform a delete under this tool's write-fs gate.
+    return toolError(ERROR_CODES.patchUnsupported, message, {
+      retryable: false,
+      hint: 'Delete files with the shell (rm); git_apply_patch edits or creates content.',
+    });
+  }
   if (
     reason === 'multi_file' ||
     reason === 'rename_or_copy' ||

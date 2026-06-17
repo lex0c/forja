@@ -110,6 +110,19 @@ describe('gitApplyPatchTool', () => {
     expect(readFileSync(join(dir, 'foo '), 'utf8')).toBe('A\n'); // sibling untouched
   });
 
+  test('rejects a deletion patch and leaves the file in place (delete-fs is out of scope)', async () => {
+    gitInit(dir);
+    writeFileSync(join(dir, 'gone.ts'), 'export const x = 1;\n');
+    const del = '--- a/gone.ts\n+++ /dev/null\n@@ -1 +0,0 @@\n-export const x = 1;\n';
+    const res = await gitApplyPatchTool.execute(
+      { path: 'gone.ts', patch: del },
+      makeCtx({ cwd: dir }),
+    );
+    expect(isToolError(res)).toBe(true);
+    if (isToolError(res)) expect(res.error_code).toBe(ERROR_CODES.patchUnsupported);
+    expect(existsSync(join(dir, 'gone.ts'))).toBe(true); // not deleted
+  });
+
   test('refuses outside a git work-tree (git.not_a_repo)', async () => {
     // No git init.
     writeFileSync(join(dir, 'f.txt'), 'a\nb\nc\n');

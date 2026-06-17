@@ -2,6 +2,23 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-16] sec(git_apply_patch): reject deletion patches (delete-fs under-declared)
+
+The parser accepted deletion patches (`+++ /dev/null`) and git apply removed the
+file, but the resolver only ever declared write-fs/read-fs — never delete-fs.
+`delete-fs` is a first-class, distinguished capability (risk-score.ts weights it
+alongside git-write/env-mutate; engine.ts has a delete-fs floor case; bash `rm`
+emits deleteFs per path), so a deletion via git_apply_patch removed an allowed
+write target while escaping the delete-fs floor/risk that governs every other
+removal. Fix: reject deletion patches outright (new `deletion` reject reason →
+patch.unsupported, with a hint to delete via the shell `rm`, which the engine
+gates correctly). Chosen over threading delete-fs through the resolver: deletion
+is out of this tool's "edit/create content" scope, it's a destructive op better
+left to the properly-gated `rm`, and rejecting keeps the tool from performing an
+operation it can't accurately declare. Create (`--- /dev/null`) stays — that's a
+write, correctly declared write-fs. Tests: parser rejects deletion; tool
+integration leaves the file in place.
+
 ## [2026-06-16] sec(git_apply_patch): preserve filename whitespace when pinning (confinement bypass)
 
 Third confinement bypass, same class as the -p1 one: `headerPath` did `.trim()`

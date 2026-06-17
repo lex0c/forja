@@ -20,6 +20,7 @@ export type PatchRejectReason =
   | 'rename_or_copy' // rename/copy — a second path the single-path gate can't see
   | 'binary' // binary patch — not a line-oriented content change
   | 'mode_change' // chmod (old mode/new mode) — not a content edit
+  | 'deletion' // `+++ /dev/null` — file removal is a delete-fs op (use the shell)
   | 'bad_header' // header path not `/dev/null` or `a/`/`b/`-prefixed (git-diff format)
   | 'no_hunk'; // headers but no `@@` hunk (e.g. mode-only change)
 
@@ -148,11 +149,23 @@ export const parseSingleFilePatch = (patch: string): ParseGitPatchResult => {
     return { ok: false, reason: 'no_hunk', message: 'patch has no @@ hunk to apply' };
   }
 
-  const { minus, plus } = headers[0] as { minus: string; plus: string };
-  // Modify → both sides name the file. Creation → `--- /dev/null`, path on +++.
-  // Deletion → `+++ /dev/null`, path on ---.
-  const path = plus === '/dev/null' ? minus : plus;
-  if (path === '/dev/null' || path.length === 0) {
+  const { plus } = headers[0] as { plus: string };
+  // Deletion (`+++ /dev/null`) REMOVES the file — a destructive op the engine
+  // gates and risk-scores as `delete-fs` (like `rm`), distinct from a write.
+  // This content-edit tool only declares write-fs/read-fs (see its resolver),
+  // so applying a deletion here would remove a file under a write-fs
+  // declaration, escaping the delete-fs floor/risk. Refuse it; delete files
+  // with the shell (`rm`), which the permission engine gates correctly.
+  if (plus === '/dev/null') {
+    return {
+      ok: false,
+      reason: 'deletion',
+      message: 'deletion patches are not supported; remove files with the shell (rm)',
+    };
+  }
+  // Modify and creation both name the file on the `+++` side.
+  const path = plus;
+  if (path.length === 0) {
     return {
       ok: false,
       reason: 'no_path',

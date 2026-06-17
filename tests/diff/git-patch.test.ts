@@ -23,11 +23,12 @@ describe('parseSingleFilePatch', () => {
     expect(r).toEqual({ ok: true, path: 'src/new.ts' });
   });
 
-  test('deletion (+++ /dev/null) → path from the --- side', () => {
+  test('deletion (+++ /dev/null) is rejected — file removal is a delete-fs op', () => {
     const r = parseSingleFilePatch(
       '--- a/src/old.ts\n+++ /dev/null\n@@ -1 +0,0 @@\n-export const x = 1;\n',
     );
-    expect(r).toEqual({ ok: true, path: 'src/old.ts' });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('deletion');
   });
 
   test('strips a trailing tab-timestamp from the header path', () => {
