@@ -11,7 +11,8 @@
 // never sees `caps`.
 
 import wrapAnsi from 'wrap-ansi';
-import { sanitizeOneLineForDisplay } from '../../sanitize/ansi.ts';
+import type { DiffLine } from '../../diff/line-diff.ts';
+import { SAFE_ONE_LINE_MAX, sanitizeOneLineForDisplay } from '../../sanitize/ansi.ts';
 import type { PermanentItem } from '../state.ts';
 import { type Capabilities, paint, paintMulti, reverse } from '../term.ts';
 import { shortToolName, toolNoun } from '../tool-vocab.ts';
@@ -252,14 +253,16 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // match" of grep or a failed `test`, so it flags, not alarms.
       const exitMark =
         item.exitCode !== undefined ? paint(caps, 'warn', `  exit ${item.exitCode}`) : '';
-      // Diff counts (write/edit): +added in success tone, -removed in
-      // error tone, on the head — a GitHub-style summary. ASCII signs so
-      // they read on non-unicode terminals too.
+      // Diff counts (write/edit): +added in success tone, -removed in error
+      // tone — a GitHub-style summary. ASCII signs so they read on non-unicode
+      // terminals too. Rendered on the FILE-PATH (sub-content) line, not the
+      // head: it sits right next to the path it describes, and keeps the head a
+      // clean `verb [Xms]`. Empty when there's no diff.
       const counts =
         item.diff !== undefined
           ? `  ${paint(caps, 'success', `+${item.diff.added}`)} ${paint(caps, 'error', `-${item.diff.removed}`)}`
           : '';
-      const head = `${paint(caps, headTone, headRaw)}${counts}${exitMark}${metric}`;
+      const head = `${paint(caps, headTone, headRaw)}${exitMark}${metric}`;
       // Leading blank (UI.md §6.3) — each tool finalization is its
       // own "session" block; the operator scrolls and sees each tool
       // (chip + sub-content) as a self-contained unit instead of a
@@ -303,17 +306,53 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // the sub-content too so the connector lines under the nest
       // glyph stay visually tied to the nested chip head.
       if (subText !== null) {
-        lines.push(paint(caps, 'secondary', `${indent}${sub}${subText}`));
+        // Counts ride here, after the path, in their own green/red — so the
+        // subject stays secondary while `+N -M` keeps its semantic color.
+        lines.push(`${paint(caps, 'secondary', `${indent}${sub}${subText}`)}${counts}`);
+      } else if (counts !== '') {
+        // Diff but no vocab subject (shouldn't happen for write/edit, which
+        // always carry a path) — still surface the counts under the connector.
+        lines.push(`${paint(caps, 'secondary', `${indent}${sub}`)}${counts.trimStart()}`);
       }
       // Diff snippet (write/edit): the first changed region under the
       // card — add in success tone, del in error tone, context dim. Each
       // line is sanitized (file content is untrusted: strip ANSI/control
       // and cap width) so it can't hijack the terminal.
       if (item.diff !== undefined) {
+        // Line-number gutter: new-file number for surviving/added lines,
+        // old-file for deletions (`newLine ?? oldLine`). Right-aligned to the
+        // widest number so the `│` rail lines up. The NUMBER takes the line's
+        // own tone (add green / del red / ctx dim) so it reads as part of the
+        // change; only the `│` rail stays `secondary` (grey) as a neutral
+        // divider between gutter and content. Width 0 (no gutter) when no line
+        // carries a number — hand-built diffs / older fixtures render as before.
+        const displayNo = (dl: DiffLine): number | undefined => dl.newLine ?? dl.oldLine;
+        const gutterDigits = item.diff.snippet.reduce((w, dl) => {
+          const n = displayNo(dl);
+          return n !== undefined ? Math.max(w, String(n).length) : w;
+        }, 0);
+        const rail = caps.unicode ? '│' : '|';
+        // Shrink the content cap by the gutter so a numbered line is never
+        // longer than the unnumbered one was (gutter = digits + " │ ").
+        const contentMax = Math.max(
+          0,
+          SAFE_ONE_LINE_MAX - (gutterDigits > 0 ? gutterDigits + 3 : 0),
+        );
         for (const dl of item.diff.snippet) {
           const tone = dl.type === 'add' ? 'success' : dl.type === 'del' ? 'error' : 'dim';
           const mark = dl.type === 'add' ? '+' : dl.type === 'del' ? '-' : ' ';
-          lines.push(paint(caps, tone, `${indent}  ${mark} ${sanitizeOneLineForDisplay(dl.text)}`));
+          const n = displayNo(dl);
+          // Number in the line's tone; rail in `secondary` (neutral divider).
+          const gutter =
+            gutterDigits > 0
+              ? `${paint(caps, tone, (n !== undefined ? String(n) : '').padStart(gutterDigits))}${paint(caps, 'secondary', ` ${rail} `)}`
+              : '';
+          const body = paint(
+            caps,
+            tone,
+            `${mark} ${sanitizeOneLineForDisplay(dl.text, contentMax)}`,
+          );
+          lines.push(`${indent}  ${gutter}${body}`);
         }
         if (item.diff.hiddenChanges > 0) {
           lines.push(

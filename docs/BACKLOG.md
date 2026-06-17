@@ -2,6 +2,32 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-16] tui: line-number gutter on the write/edit diff snippet
+
+The diff card showed `+N/-N` counts and a colored snippet but no positions — the
+operator saw WHAT changed, not WHERE. `lineDiff` already walks both files via
+LCS, so it knew the indices; now it stamps each `DiffLine` with `oldLine` /
+`newLine` (1-based; `del` carries old only, `add` new only, `ctx` both). Numbers
+are absolute (threaded through `diffOps`, not snippet-relative) and survive the
+block-replace fallback path. The renderer adds a right-aligned line-number
+gutter — `newLine ?? oldLine`, so surviving/added lines show new-file numbers and
+deletions show old-file — with the `│` rail (`|` in ASCII). The number takes the
+line's own tone (add green / del red / ctx dim) so it reads as part of the change;
+only the rail stays `secondary` (grey) as a neutral divider. The `+N -M` counts
+also moved OFF the head onto the file-path line (right after the path they
+describe), keeping the head a clean `verb [Xms]`. The content width cap
+shrinks by the gutter so a numbered line is never longer than the unnumbered one
+was. Gutter is suppressed (width 0) when no line carries a number, so hand-built
+diffs / older fixtures render exactly as before — the existing render tests pass
+untouched. write/edit tools and the harness→TUI plumbing are unchanged (only the
+optional fields were added). Tests: line numbers for replace/insert/delete +
+absolute-position deep in a file (line-diff); gutter render new-vs-old, right-
+alignment to the widest number, `│` rail under unicode, no-gutter back-compat
+(permanent). Scoped suites green (line-diff + permanent 119, tools + adapter
+149); typecheck + lint clean. UI-first — validate via `bun run dev`. Follow-up
+left open: intra-line (word-level) highlight of the changed span on modified
+lines; multiple hunks instead of only the first changed region.
+
 ## [2026-06-16] tui: footer `N% context used` chip (>= 97% only)
 
 Wired the long-anticipated context-occupancy chip into the footer's right

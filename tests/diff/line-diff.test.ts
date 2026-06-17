@@ -84,3 +84,51 @@ describe('lineDiff', () => {
     expect(lineDiff('a\nb\n', 'a\nb').removed).toBe(0);
   });
 });
+
+describe('lineDiff — line numbers', () => {
+  // Compact triple per line for readable assertions: text + the two 1-based
+  // positions (undefined where the line doesn't exist on that side).
+  const positions = (lines: DiffLine[]) =>
+    lines.map((l) => [l.text, l.oldLine, l.newLine] as const);
+
+  test('single replace: ctx carries both, del carries old, add carries new', () => {
+    const d = lineDiff('a\nb\nc', 'a\nB\nc');
+    expect(positions(d.snippet)).toEqual([
+      ['a', 1, 1],
+      ['b', 2, undefined], // del → old only
+      ['B', undefined, 2], // add → new only
+      ['c', 3, 3],
+    ]);
+  });
+
+  test('pure insertion: added lines get consecutive new-file numbers', () => {
+    const d = lineDiff('a\nb', 'a\nX\nY\nb');
+    expect(positions(d.snippet)).toEqual([
+      ['a', 1, 1],
+      ['X', undefined, 2],
+      ['Y', undefined, 3],
+      ['b', 2, 4], // b shifted down to new line 4
+    ]);
+  });
+
+  test('pure deletion: deleted lines keep their old-file numbers', () => {
+    const d = lineDiff('a\nX\nY\nb', 'a\nb');
+    expect(positions(d.snippet)).toEqual([
+      ['a', 1, 1],
+      ['X', 2, undefined],
+      ['Y', 3, undefined],
+      ['b', 4, 2], // b moved up to new line 2
+    ]);
+  });
+
+  test('numbers are absolute, not snippet-relative, for a change deep in a file', () => {
+    const big = Array.from({ length: 500 }, (_, i) => `line ${i}`);
+    const after = [...big];
+    after[250] = 'CHANGED'; // 0-based index 250 → 1-based line 251
+    const d = lineDiff(big.join('\n'), after.join('\n'));
+    const del = d.snippet.find((l) => l.type === 'del');
+    const add = d.snippet.find((l) => l.type === 'add');
+    expect(del?.oldLine).toBe(251);
+    expect(add?.newLine).toBe(251);
+  });
+});
