@@ -2,7 +2,35 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
-## [2026-06-17] sec(subagents): enforce path restrictions for git_apply_patch
+## [2026-06-17] git_apply_patch: per-tool coverage audit (find every surface that must know it)
+
+Systematic sweep (3 parallel adversarial finders: permissions/sandbox · harness/
+hooks · tui/cli/audit) for every surface keyed on tool name/category where
+git_apply_patch was missing vs how write_file/edit_file are handled. Verified
+each candidate inline. Two REAL gaps fixed:
+- Hook `if:` path filter (hooks/dispatcher-matching.ts): the fs-path-extraction
+  list was write_file/edit_file/read_file only, so an `if: git_apply_patch(*.ts)`
+  filter fell to fail-open and ignored the path glob. Added git_apply_patch.
+- Batch headline verb (tui/state.ts): no case → headless batches read "Applied
+  patch ×N"; added `Applied N patches`.
+
+Refuted (not gaps, verified): grant-relevance switch is section-keyed (resolves
+to write_file); TOOL_CAPABILITY_FOOTPRINTS is PolicyToolsSection-keyed (inherits
+write_file's footprint); escapesCwd/hadBash is for out-of-worktree effects (git
+apply's write is an in-scope, checkpoint-reversible worktree write — same as
+write_file); ergonomics/constraints prompts intentionally don't promote patch
+(it's the niche per the eval). Shared-section design (no separate
+tools.git_apply_patch policy/render/template) is correct by design.
+
+SANDBOX (finder flagged "critical", verified NOT): git_apply_patch spawns `git
+apply` without consuming ctx.sandboxProfile — but write_file/edit_file IGNORE it
+too (the planner emits a profile by capability, so all fs.write tools get one
+and none bwrap-wrap; only bash consumes it). fs.write tools confine via the
+permission GATE (authorized path + the tool's header==gated path-pin), not
+bwrap. So git_apply_patch is consistent. The one genuine distinction — git apply
+is an EXTERNAL binary vs write_file's in-process write — makes bwrap-confining it
+a reasonable defense-in-depth backstop, but it's optional, sizable, and would be
+inconsistent to do for git_apply_patch alone; deferred.
 
 A subagent playbook can whitelist git_apply_patch and declare
 `tool_restrictions.git_apply_patch.allow_paths`, but restrictions.ts wired path
