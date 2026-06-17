@@ -339,6 +339,18 @@ export const gitApplyPatchTool: Tool<GitApplyPatchInput, GitApplyPatchOutput> = 
     // worktree. This keeps the single-path gate sufficient — git can only touch
     // the one authorized file, and the path comes from git itself (no parser
     // divergence from what apply will write).
+    //
+    // Deliberately NOT tilde-expanded (unlike the engine's fs resolver, which
+    // maps `~` via its resolved `ctx.home`). ToolContext carries no `home`, so
+    // expanding here would have to use a DIFFERENT source (homedir/env) than the
+    // engine used; if the engine ran with an injected `options.home`, a homedir-
+    // based gatedAbs could coincidentally equal writeAbs and let git write a file
+    // the engine authorized under a different home — weakening the pin. A `~`
+    // path instead resolves to a literal `<cwd>/~/…`, never matches the tilde-
+    // free worktree-relative writeAbs, and fails the pin closed. (git's own patch
+    // paths are worktree-relative and never carry `~`, so this rejects nothing
+    // real.) Do not "fix" this with homedir() — the safe expansion needs the
+    // engine's exact home plumbed through ToolContext.
     const gatedAbs = isAbsolute(pathArg) ? resolve(pathArg) : resolve(ctx.cwd, pathArg);
     const writeAbs = resolve(worktreeRoot, cls.path);
     const relToRoot = relative(worktreeRoot, gatedAbs);

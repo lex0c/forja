@@ -27,15 +27,22 @@ pre-apply; if it existed before and is gone after a successful apply, the patch
 deleted it — restore from the before-image and refuse. Precise (a creation never
 trips it; a content edit always leaves the file), so no false positives.
 
-NIT (declined, documented) — tilde divergence. The tool's gatedAbs uses raw
-resolve() while the engine resolver expands `~` via ctx.home. Not exploitable
-(the writeAbs===gatedAbs pin fails closed on any divergence). Declined because
-ToolContext carries no `home`, so expanding `~` in the tool would use a
-DIFFERENT home source (homedir/env) than the engine's ctx.home — a new
-divergence worse than the current fail-closed behavior on the (nonsensical for a
-repo-relative patch) `~`-path case. A correct fix is cross-cutting (thread the
-engine's home into ToolContext, or dedup the thrice-duplicated expandTilde into a
-shared util) and is its own task.
+NIT (tilde divergence) — resolved as a dedup, tool-expansion deliberately left
+out. The reviewer asked to share the tilde-aware resolver. expandTilde was
+copy-pasted in THREE places (resolvers/fs.ts, resolvers/bash.ts, config.ts —
+fs/bash byte-identical, config functionally identical via slice(1) vs slice(2)):
+exactly the divergence risk this codebase keeps closing. Extracted to
+src/permissions/tilde.ts; all three import it (+ a unit test pinning the
+config.ts slice equivalence and the `~user` literal rule). The tool's gatedAbs
+still does NOT expand `~`, now with a comment explaining why: ToolContext carries
+no `home`, so a homedir/env-based expansion could DIFFER from the engine's
+injected `options.home` and let a homedir-matching gatedAbs coincide with
+writeAbs — weakening the pin. A `~` path instead resolves to a literal `<cwd>/~/…`
+that never matches the tilde-free worktree-relative writeAbs and fails the pin
+closed (git's patch paths are worktree-relative and never carry `~`, so this
+rejects nothing real). The safe expansion would need the engine's exact home
+plumbed through ToolContext — left as a follow-up, with a "do not fix with
+homedir()" guard comment so the fail-closed choice isn't naively undone.
 
 ## [2026-06-17] Symlink write-confinement: close the dangling-symlink escape (engine + matcher)
 

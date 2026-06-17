@@ -8,6 +8,7 @@
 import { resolve } from 'node:path';
 import type { Capability } from '../capabilities.ts';
 import { readFs, writeFs } from '../capabilities.ts';
+import { expandTilde } from '../tilde.ts';
 import {
   type Resolver,
   type ResolverContext,
@@ -74,23 +75,8 @@ const conflictingPathArgsRefuse = (
 // Tilde expansion (slice 97, R2 P0 finding): a model-emitted
 // `'~/.ssh/id_rsa'` would otherwise resolve to `<cwd>/~/.ssh/id_rsa`
 // — a literal `~` filename under cwd, which would silently bypass
-// every `~`-rooted protected_paths rule because the lexical form
-// no longer mentions HOME. Shells expand `~` on execution, so the
-// engine has to too or the resolved capability lies about what the
-// tool actually touches. Two shapes expand:
-//   - bare `'~'` → `ctx.home`
-//   - `'~/<rest>'` → `<ctx.home>/<rest>`
-// `'~user/...'` (other-user expansion) stays literal: there's no
-// safe way to resolve another user's home without an OS call, and
-// agents authoring `~root/...` are far more likely an attack than
-// legitimate. The literal form will land somewhere harmless or
-// outside the operator's policy, surfacing a deny.
-const expandTilde = (path: string, home: string): string => {
-  if (path === '~') return home;
-  if (path.startsWith('~/')) return `${home}/${path.slice(2)}`;
-  return path;
-};
-
+// every `~`-rooted protected_paths rule because the lexical form no
+// longer mentions HOME. See `expandTilde` (tilde.ts) for the shapes.
 const resolveAbs = (path: string, ctx: ResolverContext): string =>
   resolve(ctx.cwd, expandTilde(path, ctx.home));
 

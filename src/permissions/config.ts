@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { parse as parseYaml } from 'yaml';
 import { protectedTargets } from './protected_paths.ts';
+import { expandTilde } from './tilde.ts';
 import type { Policy, PolicyMode, SealMode, SealOnFailure } from './types.ts';
 
 // Optional validation context for parsePolicy. When supplied, the
@@ -15,12 +16,6 @@ export interface ParsePolicyContext {
   home?: string;
   cwd?: string;
 }
-
-const expandTilde = (pattern: string, home: string): string => {
-  if (pattern === '~') return home;
-  if (pattern.startsWith('~/')) return `${home}${pattern.slice(1)}`;
-  return pattern;
-};
 
 // True when `pattern` targets a protected path WITHOUT relying on
 // engine-wide catch-alls. Three shapes flagged:
