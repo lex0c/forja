@@ -1571,6 +1571,46 @@ describe('formatPermanent — diff snippet (write/edit cards)', () => {
     expect(out.some((l) => l.includes('+ B'))).toBe(true);
   });
 
+  test('bolds the file path on a diff card (secondary + bold)', () => {
+    const out = formatPermanent(
+      {
+        kind: 'tool-end',
+        name: 'edit_file',
+        verb: 'Edited file',
+        subject: 'src/a.ts',
+        status: 'done',
+        durationMs: 10,
+        diff: {
+          added: 1,
+          removed: 0,
+          snippet: [{ type: 'add', text: 'x', newLine: 1 }],
+          hiddenChanges: 0,
+        },
+      },
+      colored,
+    );
+    const pathLine = out.find((l) => l.includes('src/a.ts'));
+    // secondary (90) + bold (1) wrap the path, single trailing reset.
+    expect(pathLine).toContain(`${CSI}90m${CSI}1msrc/a.ts${CSI}0m`);
+  });
+
+  test('a non-diff tool subject stays plain secondary (no bold)', () => {
+    const out = formatPermanent(
+      {
+        kind: 'tool-end',
+        name: 'bash',
+        verb: 'Executed',
+        subject: 'ls -la',
+        status: 'done',
+        durationMs: 5,
+      },
+      colored,
+    );
+    const subjectLine = out.find((l) => l.includes('ls -la'));
+    expect(subjectLine).toContain(`${CSI}90m`); // still secondary
+    expect(subjectLine?.includes(`${CSI}1m`)).toBe(false); // but not bold
+  });
+
   test('summarizes changes beyond the snippet via the hidden-changes tail', () => {
     const out = formatPermanent(
       {

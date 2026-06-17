@@ -308,7 +308,15 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       if (subText !== null) {
         // Counts ride here, after the path, in their own green/red — so the
         // subject stays secondary while `+N -M` keeps its semantic color.
-        lines.push(`${paint(caps, 'secondary', `${indent}${sub}${subText}`)}${counts}`);
+        // For write/edit (diff present) the subText IS the changed file path,
+        // so bold it as the card's anchor (still secondary-toned); other
+        // subjects (bash command, error reason) stay plain secondary. The
+        // connector stays non-bold so only the path itself is emphasized.
+        const subjectPainted =
+          item.diff !== undefined
+            ? `${paint(caps, 'secondary', `${indent}${sub}`)}${paintMulti(caps, ['secondary', 'bold'], subText)}`
+            : paint(caps, 'secondary', `${indent}${sub}${subText}`);
+        lines.push(`${subjectPainted}${counts}`);
       } else if (counts !== '') {
         // Diff but no vocab subject (shouldn't happen for write/edit, which
         // always carry a path) — still surface the counts under the connector.
