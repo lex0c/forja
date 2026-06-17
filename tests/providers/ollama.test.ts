@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
+import { generateWithRetry } from '../../src/harness/retry.ts';
 import type { OllamaChatResponse } from '../../src/providers/ollama/http.ts';
-import { createOllamaProvider } from '../../src/providers/ollama/index.ts';
+import { createOllamaProvider, parseOllamaHeaders } from '../../src/providers/ollama/index.ts';
 import type {
   ConstrainedRequest,
   GenerateRequest,
@@ -56,6 +57,25 @@ const reqCon = (over: Partial<ConstrainedRequest>): ConstrainedRequest => ({
   ...over,
 });
 
+describe('parseOllamaHeaders', () => {
+  test('parses a JSON object of string headers', () => {
+    expect(parseOllamaHeaders('{"Authorization":"Bearer x","X-Foo":"y"}')).toEqual({
+      Authorization: 'Bearer x',
+      'X-Foo': 'y',
+    });
+  });
+  test('undefined for empty / absent / invalid / non-object', () => {
+    expect(parseOllamaHeaders(undefined)).toBeUndefined();
+    expect(parseOllamaHeaders('')).toBeUndefined();
+    expect(parseOllamaHeaders('not json')).toBeUndefined();
+    expect(parseOllamaHeaders('["a","b"]')).toBeUndefined();
+    expect(parseOllamaHeaders('{}')).toBeUndefined();
+  });
+  test('drops non-string values', () => {
+    expect(parseOllamaHeaders('{"a":"x","b":3,"c":null}')).toEqual({ a: 'x' });
+  });
+});
+
 describe('createOllamaProvider', () => {
   test('throws on an uncatalogued model', () => {
     expect(() => createOllamaProvider('nope:1b')).toThrow(/unknown Ollama model/);
@@ -69,7 +89,7 @@ describe('createOllamaProvider', () => {
     expect(p.replaysReasoning).toBe(false);
   });
 
-  test('generate sends num_ctx + stream:false and yields normalized events', async () => {
+  test('generate sends num_ctx + stream:true and yields normalized events', async () => {
     const { fn, bodies } = recordingFetch(() =>
       okResponse({ message: { role: 'assistant', content: 'hello' } }),
     );
@@ -81,7 +101,7 @@ describe('createOllamaProvider', () => {
 
     const body = bodies[0] as Record<string, unknown>;
     expect(body.model).toBe('qwen2.5-coder:14b');
-    expect(body.stream).toBe(false);
+    expect(body.stream).toBe(true);
     expect((body.options as Record<string, unknown>).num_ctx).toBe(32_768);
     expect((body.messages as Array<Record<string, unknown>>)[0]).toEqual({
       role: 'system',
@@ -106,6 +126,20 @@ describe('createOllamaProvider', () => {
     expect(Array.isArray(body.tools)).toBe(true);
   });
 
+  test('generate forwards keep_alive from the option', async () => {
+    const { fn, bodies } = recordingFetch(okResponse);
+    const p = createOllamaProvider('qwen2.5-coder:14b', { fetch: fn, keepAlive: '-1' });
+    await collect(p.generate(reqGen({ messages: [{ role: 'user', content: 'x' }] })));
+    expect((bodies[0] as Record<string, unknown>).keep_alive).toBe('-1');
+  });
+
+  test('no keep_alive by default (Ollama default applies)', async () => {
+    const { fn, bodies } = recordingFetch(okResponse);
+    const p = createOllamaProvider('qwen2.5-coder:14b', { fetch: fn });
+    await collect(p.generate(reqGen({ messages: [{ role: 'user', content: 'x' }] })));
+    expect('keep_alive' in (bodies[0] as Record<string, unknown>)).toBe(false);
+  });
+
   test('generate surfaces tool calls from the response', async () => {
     const { fn } = recordingFetch(() =>
       okResponse({
@@ -127,6 +161,26 @@ describe('createOllamaProvider', () => {
     await expect(
       collect(p.generate(reqGen({ messages: [{ role: 'user', content: 'x' }] }))),
     ).rejects.toMatchObject({ code: 'local.model.not_loaded' });
+  });
+
+  test('a transient 5xx is retried by generateWithRetry (status-based)', async () => {
+    let calls = 0;
+    const fn = (async () => {
+      calls += 1;
+      return calls === 1
+        ? new Response('overloaded', { status: 503 })
+        : okResponse({ message: { role: 'assistant', content: 'ok' } });
+    }) as unknown as typeof fetch;
+    const p = createOllamaProvider('qwen2.5-coder:14b', { fetch: fn });
+    const ev = await collect(
+      generateWithRetry(p, reqGen({ messages: [{ role: 'user', content: 'x' }] }), {
+        maxAttempts: 3,
+        baseDelayMs: 1,
+        sleep: () => Promise.resolve(),
+      }),
+    );
+    expect(calls).toBe(2);
+    expect(ev.some((e) => e.kind === 'text_delta' && e.text === 'ok')).toBe(true);
   });
 
   test('generateConstrained sets format and returns output + usage', async () => {
@@ -169,6 +223,23 @@ describe('createOllamaProvider', () => {
     );
     const p = createOllamaProvider('qwen2.5-coder:14b', { fetch: fn });
     await expect(p.generateConstrained(reqCon({}))).rejects.toThrow(/empty content/);
+  });
+
+  test('keep_alive from FORJA_OLLAMA_KEEP_ALIVE coerces a bare integer to a number', async () => {
+    const saved = process.env.FORJA_OLLAMA_KEEP_ALIVE;
+    process.env.FORJA_OLLAMA_KEEP_ALIVE = '300';
+    try {
+      const { fn, bodies } = recordingFetch(okResponse);
+      const p = createOllamaProvider('qwen2.5-coder:14b', { fetch: fn });
+      await collect(p.generate(reqGen({ messages: [{ role: 'user', content: 'x' }] })));
+      expect((bodies[0] as Record<string, unknown>).keep_alive).toBe(300);
+    } finally {
+      if (saved === undefined) {
+        delete process.env.FORJA_OLLAMA_KEEP_ALIVE;
+      } else {
+        process.env.FORJA_OLLAMA_KEEP_ALIVE = saved;
+      }
+    }
   });
 
   test('countTokens returns a positive estimate', async () => {

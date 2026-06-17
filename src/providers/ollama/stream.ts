@@ -1,52 +1,93 @@
 import type { StopReason, StreamEvent } from '../types.ts';
-import type { OllamaChatResponse } from './http.ts';
+import type { OllamaChatResponse, OllamaToolCall } from './http.ts';
 
-const mapStopReason = (res: OllamaChatResponse): StopReason => {
-  // `length` takes precedence over `tool_use`: a turn truncated at num_predict
-  // must surface as max_tokens (the truncation signal) even when it also carried
-  // a tool call, rather than hiding the cut behind tool_use.
-  if (res.done_reason === 'length') {
+// Stop reason from the final (done) chunk plus whether ANY tool call was emitted
+// across the whole stream. Tool calls can arrive on a non-final chunk, so
+// `tool_use` is derived from the accumulated set — not `final.message.tool_calls`,
+// which may be empty on the terminating chunk.
+const stopReason = (final: OllamaChatResponse | undefined, hasToolCalls: boolean): StopReason => {
+  // `length` wins: a truncation must surface as max_tokens even when a tool call
+  // was also emitted, rather than hiding the cut behind tool_use.
+  if (final?.done_reason === 'length') {
     return 'max_tokens';
   }
-  if (res.message.tool_calls !== undefined && res.message.tool_calls.length > 0) {
+  if (hasToolCalls) {
     return 'tool_use';
   }
   return 'end_turn';
 };
 
-// Normalize a non-streaming /api/chat response into the canonical StreamEvent
-// sequence. F1 is stream:false, so each piece arrives complete: tool calls emit
-// `tool_use_start` + `tool_use_stop` with no incremental deltas (the args are
-// already a parsed object), and `usage` + `stop` close the turn. Incremental
-// NDJSON streaming (F2) will reuse this taxonomy with real deltas.
-export const normalizeOllamaResponse = (res: OllamaChatResponse): StreamEvent[] => {
-  const events: StreamEvent[] = [];
-  // Ollama has no message id; created_at identifies the turn (model as fallback).
-  events.push({ kind: 'start', message_id: res.created_at || res.model });
+// Normalize the streamed /api/chat NDJSON chunks into the canonical StreamEvent
+// sequence: `start` on the first chunk, `text_delta` / `thinking_delta` per chunk,
+// tool calls accumulated and emitted as start+stop pairs (args are already
+// objects), then `usage` + `stop` from the final (done) chunk. Works for a single
+// non-streamed object too (one chunk in → the same events out).
+export async function* normalizeOllamaStream(
+  chunks: AsyncIterable<OllamaChatResponse>,
+): AsyncIterable<StreamEvent> {
+  let started = false;
+  const toolCalls: OllamaToolCall[] = [];
+  let final: OllamaChatResponse | undefined;
 
-  const { message } = res;
-  if (message.thinking !== undefined && message.thinking.length > 0) {
-    events.push({ kind: 'thinking_delta', text: message.thinking });
+  for await (const chunk of chunks) {
+    if (!started) {
+      // Ollama has no message id; created_at identifies the turn (model fallback).
+      yield { kind: 'start', message_id: chunk.created_at || chunk.model };
+      started = true;
+    }
+    const msg = chunk.message;
+    if (msg.thinking !== undefined && msg.thinking.length > 0) {
+      yield { kind: 'thinking_delta', text: msg.thinking };
+    }
+    // `content` is typed string, but a tool-call-only / divergent chunk may omit
+    // it — guard so a missing content doesn't deref mid-stream.
+    if (typeof msg.content === 'string' && msg.content.length > 0) {
+      yield { kind: 'text_delta', text: msg.content };
+    }
+    if (msg.tool_calls !== undefined) {
+      toolCalls.push(...msg.tool_calls);
+    }
+    if (chunk.done) {
+      final = chunk;
+    }
   }
-  if (message.content.length > 0) {
-    events.push({ kind: 'text_delta', text: message.content });
+
+  // A stream with no chunks at all, or one that never carried a `done:true`
+  // chunk (dropped connection / proxy cut), was truncated — surface it as an
+  // error instead of faking a clean end_turn with zero usage.
+  if (!started) {
+    yield {
+      kind: 'error',
+      code: 'local.stream_incomplete',
+      message: 'Ollama /api/chat returned an empty stream',
+      retryable: false,
+    };
+    return;
   }
-  for (const [i, call] of (message.tool_calls ?? []).entries()) {
+  if (final === undefined) {
+    yield {
+      kind: 'error',
+      code: 'local.stream_incomplete',
+      message: 'Ollama /api/chat stream ended without a final (done) chunk',
+      retryable: false,
+    };
+    return;
+  }
+
+  for (const [i, call] of toolCalls.entries()) {
     const id = `ollama-${i}`;
-    events.push({ kind: 'tool_use_start', id, name: call.function.name });
-    events.push({ kind: 'tool_use_stop', id, final_args: call.function.arguments });
+    yield { kind: 'tool_use_start', id, name: call.function.name };
+    yield { kind: 'tool_use_stop', id, final_args: call.function.arguments };
   }
 
-  events.push({
+  yield {
     kind: 'usage',
     usage: {
-      input: res.prompt_eval_count ?? 0,
-      output: res.eval_count ?? 0,
+      input: final.prompt_eval_count ?? 0,
+      output: final.eval_count ?? 0,
       cache_read: 0,
       cache_creation: 0,
     },
-  });
-  events.push({ kind: 'stop', reason: mapStopReason(res) });
-
-  return events;
-};
+  };
+  yield { kind: 'stop', reason: stopReason(final, toolCalls.length > 0) };
+}

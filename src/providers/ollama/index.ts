@@ -16,7 +16,7 @@ import {
   createOllamaHttp,
 } from './http.ts';
 import { effortToThink, ollamaOptions, toOllamaMessages, toOllamaTools } from './messages.ts';
-import { normalizeOllamaResponse } from './stream.ts';
+import { normalizeOllamaStream } from './stream.ts';
 
 // FORJA_OLLAMA_NUM_CTX override (positive integer). Lets an operator raise the
 // served window past the default cap (a VRAM trade-off) without code changes,
@@ -30,10 +30,51 @@ const numCtxFromEnv = (): number | undefined => {
   return Number.isInteger(n) && n > 0 ? n : undefined;
 };
 
+// FORJA_OLLAMA_KEEP_ALIVE override. Forwarded verbatim as Ollama's `keep_alive`
+// (e.g. "-1" pins the model in VRAM, "30m" / "300" set an idle window). Unset
+// leaves Ollama's own default (~5m), which already avoids reloads between close
+// steps; raising it helps long sessions with pauses.
+const keepAliveFromEnv = (): string | number | undefined => {
+  const v = process.env.FORJA_OLLAMA_KEEP_ALIVE;
+  if (v === undefined || v === '') {
+    return undefined;
+  }
+  // A bare integer (300, -1, 0) is sent as a NUMBER — Ollama wants seconds as a
+  // number, not the string "300"; a Go duration like "5m"/"30s" stays a string.
+  return /^-?\d+$/.test(v) ? Number(v) : v;
+};
+
+// FORJA_OLLAMA_HEADERS — a JSON object of string headers (e.g. an Authorization
+// bearer for Ollama Cloud / a guarded LAN host), so auth reaches production where
+// the registry factory runs with no options. Invalid JSON / non-string values are
+// ignored. Exported for direct testing.
+export const parseOllamaHeaders = (raw: string | undefined): Record<string, string> | undefined => {
+  if (raw === undefined || raw === '') {
+    return undefined;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return undefined;
+  }
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(parsed)) {
+    if (typeof v === 'string') {
+      out[k] = v;
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+};
+
 export interface CreateOllamaProviderOptions {
   // Defaults to FORJA_OLLAMA_BASE_URL or http://localhost:11434.
   baseUrl?: string;
-  // Extra headers (e.g. auth for a remote / cloud host).
+  // Extra headers (e.g. auth for a remote / cloud host). Falls back to
+  // FORJA_OLLAMA_HEADERS (a JSON object) in production.
   headers?: Record<string, string>;
   // Inject fetch (test seam / pin Bun's fetch).
   fetch?: typeof fetch;
@@ -42,6 +83,9 @@ export interface CreateOllamaProviderOptions {
   // Override num_ctx, bypassing the default cap (a VRAM trade-off). Falls back to
   // FORJA_OLLAMA_NUM_CTX, then to the capped model window.
   numCtx?: number;
+  // Ollama `keep_alive` (model residency). Falls back to FORJA_OLLAMA_KEEP_ALIVE,
+  // then to Ollama's own default when unset.
+  keepAlive?: string | number;
 }
 
 export const createOllamaProvider = (
@@ -60,8 +104,9 @@ export const createOllamaProvider = (
   // Build conditionally: exactOptionalPropertyTypes rejects passing an explicit
   // `undefined` for the optional headers/fetch fields.
   const httpOpts: OllamaHttpOptions = { baseUrl };
-  if (options.headers !== undefined) {
-    httpOpts.headers = options.headers;
+  const headers = options.headers ?? parseOllamaHeaders(process.env.FORJA_OLLAMA_HEADERS);
+  if (headers !== undefined) {
+    httpOpts.headers = headers;
   }
   if (options.fetch !== undefined) {
     httpOpts.fetch = options.fetch;
@@ -70,6 +115,7 @@ export const createOllamaProvider = (
 
   // Explicit override (option or env) bypasses the default num_ctx cap.
   const numCtx = options.numCtx ?? numCtxFromEnv();
+  const keepAlive = options.keepAlive ?? keepAliveFromEnv();
 
   // Shared request builder for both paths. `format` is added only by the
   // constrained path; the streaming path leaves it unset.
@@ -87,15 +133,21 @@ export const createOllamaProvider = (
     if (think !== undefined) {
       body.think = think;
     }
+    if (keepAlive !== undefined) {
+      body.keep_alive = keepAlive;
+    }
     return body;
   };
 
-  const generate = async function* (req: GenerateRequest): AsyncIterable<StreamEvent> {
-    // http.chat throws OllamaHttpError on transport/HTTP failure; it propagates
-    // to the loop (same convention the other adapters use for SDK errors).
-    const res = await http.chat(buildBody(req));
-    yield* normalizeOllamaResponse(res);
-  };
+  // http.chatStream throws OllamaHttpError on transport/HTTP failure before the
+  // first chunk; it propagates to the loop (and generateWithRetry can retry a
+  // pre-output 5xx), the same convention the other adapters use for SDK errors.
+  // On abort, the harness's abortableIterable abandons this iterator; the
+  // for-await cleanup chains return() down to chatStream's finally →
+  // reader.cancel(), so the in-flight fetch is actually aborted — no signal param
+  // on Provider.generate needed.
+  const generate = (req: GenerateRequest): AsyncIterable<StreamEvent> =>
+    normalizeOllamaStream(http.chatStream(buildBody(req)));
 
   // Structured output via Ollama's `format` (a full JSON Schema). Single
   // round-trip; the bytes come from the forced-format channel and the caller
@@ -115,7 +167,9 @@ export const createOllamaProvider = (
         `ollama constrained: structured output truncated at num_predict=${req.max_tokens} (done_reason=length) — raise max_tokens or simplify the schema`,
       );
     }
-    const output = res.message.content;
+    // `content` is typed string, but a divergent daemon may return a message
+    // object without it — coalesce so the empty check fires instead of a deref.
+    const output = res.message.content ?? '';
     if (output.length === 0) {
       throw new Error(
         `ollama constrained: model returned empty content (done_reason=${res.done_reason ?? 'unknown'})`,
@@ -141,6 +195,11 @@ export const createOllamaProvider = (
     replaysReasoning: false,
     generate,
     generateConstrained,
+    // Char-based estimate via the shared helper. Deliberately NOT calibrated
+    // against Ollama's prompt_eval_count: that counts the whole prompt (system +
+    // tools + chat template), not the messages-only figure this contract returns,
+    // so folding it in would inflate the count with fixed overhead. The shared
+    // estimator is the same approximation every adapter uses.
     countTokens: (messages: ProviderMessage[]): Promise<number> =>
       Promise.resolve(estimateMessagesTokens(messages, { countReasoning: false })),
   };

@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
   type OllamaChatRequest,
+  type OllamaChatResponse,
   type OllamaHttpError,
   createOllamaHttp,
 } from '../../src/providers/ollama/http.ts';
@@ -23,6 +24,31 @@ const mockFetch = (impl: (url: string, init: RequestInit) => Response) => {
     return impl(u, init ?? {});
   }) as unknown as typeof fetch;
   return { fn, calls };
+};
+
+// Build a streamed Response from raw byte segments (each `seg` is enqueued as one
+// read, so a JSON line can be split across segments to exercise buffering).
+const streamResponse = (segments: string[], status = 200): Response => {
+  const encoder = new TextEncoder();
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const s of segments) {
+        controller.enqueue(encoder.encode(s));
+      }
+      controller.close();
+    },
+  });
+  return new Response(body, { status });
+};
+
+const collectChunks = async (
+  it: AsyncIterable<OllamaChatResponse>,
+): Promise<OllamaChatResponse[]> => {
+  const out: OllamaChatResponse[] = [];
+  for await (const c of it) {
+    out.push(c);
+  }
+  return out;
 };
 
 describe('createOllamaHttp', () => {
@@ -124,5 +150,91 @@ describe('createOllamaHttp', () => {
     const { fn } = mockFetch(() => new Response('{"done":true}', { status: 200 }));
     const http = createOllamaHttp({ fetch: fn });
     await expect(http.chat(REQ)).rejects.toMatchObject({ code: 'local.http_error' });
+  });
+});
+
+describe('chatStream', () => {
+  test('yields one chunk per NDJSON line', async () => {
+    const lines = [
+      '{"model":"m","created_at":"t","message":{"role":"assistant","content":"he"},"done":false}\n',
+      '{"model":"m","created_at":"t","message":{"role":"assistant","content":"llo"},"done":true,"done_reason":"stop","eval_count":2}\n',
+    ];
+    const { fn } = mockFetch(() => streamResponse(lines));
+    const http = createOllamaHttp({ fetch: fn });
+    const chunks = await collectChunks(http.chatStream(REQ));
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0]?.message.content).toBe('he');
+    expect(chunks[1]?.message.content).toBe('llo');
+    expect(chunks[1]?.done).toBe(true);
+  });
+
+  test('sends stream:true', async () => {
+    const { fn, calls } = mockFetch(() => streamResponse([OK_BODY, '\n']));
+    const http = createOllamaHttp({ fetch: fn });
+    await collectChunks(http.chatStream(REQ));
+    expect(JSON.parse(String(calls[0]?.init.body)).stream).toBe(true);
+  });
+
+  test('buffers a JSON line split across reads', async () => {
+    const reads = [
+      '{"model":"m","created_at":"t","message":{"role":"assistant","content":"hel',
+      'lo"},"done":false}\n{"model":"m","created_at":"t","message":{"role":"assistant","content":"!"},"done":true}\n',
+    ];
+    const { fn } = mockFetch(() => streamResponse(reads));
+    const http = createOllamaHttp({ fetch: fn });
+    const chunks = await collectChunks(http.chatStream(REQ));
+    expect(chunks.map((c) => c.message.content)).toEqual(['hello', '!']);
+  });
+
+  test('parses a final line with no trailing newline', async () => {
+    const { fn } = mockFetch(() =>
+      streamResponse([
+        '{"model":"m","created_at":"t","message":{"role":"assistant","content":"x"},"done":true}',
+      ]),
+    );
+    const http = createOllamaHttp({ fetch: fn });
+    const chunks = await collectChunks(http.chatStream(REQ));
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]?.message.content).toBe('x');
+  });
+
+  test('a null JSON line → local.http_error (no opaque deref)', async () => {
+    const { fn } = mockFetch(() => streamResponse(['null\n']));
+    const http = createOllamaHttp({ fetch: fn });
+    await expect(collectChunks(http.chatStream(REQ))).rejects.toMatchObject({
+      code: 'local.http_error',
+    });
+  });
+
+  test('throws a typed error on a stream error chunk', async () => {
+    const { fn } = mockFetch(() => streamResponse(['{"error":"model runner crashed"}\n']));
+    const http = createOllamaHttp({ fetch: fn });
+    await expect(collectChunks(http.chatStream(REQ))).rejects.toMatchObject({
+      code: 'local.http_error',
+    });
+  });
+
+  test('abandoning the stream cancels the body reader (best-effort abort)', async () => {
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          new TextEncoder().encode(
+            '{"model":"m","created_at":"t","message":{"role":"assistant","content":"a"},"done":false}\n',
+          ),
+        );
+        // intentionally left open — simulates an in-flight generation
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const fn = (async () => new Response(body, { status: 200 })) as unknown as typeof fetch;
+    const http = createOllamaHttp({ fetch: fn });
+    for await (const chunk of http.chatStream(REQ)) {
+      expect(chunk.message.content).toBe('a');
+      break; // abandon after the first chunk
+    }
+    expect(cancelled).toBe(true);
   });
 });
