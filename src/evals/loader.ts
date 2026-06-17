@@ -28,7 +28,7 @@ const TOP_LEVEL_KEYS: ReadonlySet<string> = new Set([
   'budget',
 ]);
 
-const SETUP_KEYS: ReadonlySet<string> = new Set(['fixture', 'files', 'approvalPosture']);
+const SETUP_KEYS: ReadonlySet<string> = new Set(['fixture', 'files', 'approvalPosture', 'gitInit']);
 
 const BUDGET_KEYS: ReadonlySet<string> = new Set([
   'maxSteps',
@@ -149,6 +149,12 @@ const parseSetup = (raw: unknown): EvalSetup | undefined => {
       out[path] = body;
     }
     setup.files = out;
+  }
+  if (r.gitInit !== undefined) {
+    if (typeof r.gitInit !== 'boolean') {
+      throw new Error('eval: setup.gitInit must be a boolean');
+    }
+    setup.gitInit = r.gitInit;
   }
   if (r.approvalPosture !== undefined) {
     const p = requireString(r.approvalPosture, 'setup.approvalPosture');

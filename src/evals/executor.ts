@@ -164,6 +164,23 @@ const setupCwd = (caseDef: EvalCase): string => {
       writeFileSync(target, body);
     }
   }
+  // git work-tree init for tools that require a repo (git_apply_patch). Done
+  // after fixture+files so the tree has the case's content. Fails loud — a
+  // silent miss would make a gitInit case dead-end on git.not_a_repo and look
+  // like a tool failure.
+  if (caseDef.setup?.gitInit === true) {
+    const r = Bun.spawnSync({
+      cmd: ['git', 'init', '-q'],
+      cwd: dir,
+      stdout: 'ignore',
+      stderr: 'pipe',
+    });
+    if (!r.success) {
+      throw new Error(
+        `eval setup.gitInit: 'git init' failed in ${dir} (is git installed?): ${r.stderr.toString().trim()}`,
+      );
+    }
+  }
   // Drop a default permissions.yaml only when the case+fixture
   // didn't provide one. Checking after fixture+files copy lets
   // either source override the default.

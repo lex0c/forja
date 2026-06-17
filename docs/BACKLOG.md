@@ -66,9 +66,26 @@ ways (git_apply_patch ↔ edit_file pointer); edit_file stays the stated default
 Whether patch should become the PRIMARY edit format is an eval question, not a
 call: added `evals/edit-format/` (4 tasks × 2 steered cases — single-line,
 multi-hunk, repeated-lines, nested-indent) measuring first-try edit success-rate
-per format per model, plus an `eval:edit-format` script. Promote the
-higher-passing format to primary; the other stays niche. Test: --recount applies
+per format per model, plus an `eval:edit-format` script. Test: --recount applies
 a patch with deliberately-wrong `@@` counts.
+
+EVAL VALIDITY FIX + first result. The first run looked like git_apply_patch 2/4,
+but that was a broken harness: the eval cwd (`~/.cache/forja-eval`) is not a git
+repo, so git_apply_patch always returned git.not_a_repo and the "passes" were
+edit_file fallback (the old `tool_called` only checks the tool was INVOKED, not
+that it succeeded). Fixed the framework: added `setup.gitInit` (types + loader +
+executor `git init`s the cwd) and added `tool_not_called` on the sibling edit
+tools to every case so a pass means the steered tool ALONE made the edit. Valid
+re-run, BOTH target models: **opus 8/8 and gpt-5.4 8/8 — edit_file 4/4 AND
+git_apply_patch 4/4 on each**. So the formats are equally reliable on the strong
+models; patch's earlier "weakness" was entirely the env bug, and --recount +
+single-file make it a co-equal alternative, not a liability. (gpt was slower —
+multi-hunk patch 43s/6 steps via the Responses path — but cheaper overall.)
+Caveats: single run each (non-deterministic), 4 easy-ish tasks — directional, not
+conclusive; a differentiator would need harder tasks (big files, many hunks,
+tricky whitespace) or weaker models (mini/haiku). No edit-success reason to flip
+primary, so edit_file stays the default (no git dep, simpler/auditable) and
+git_apply_patch the niche. Loader test added for `gitInit`.
 
 ## [2026-06-16] tui: line-number gutter on the write/edit diff snippet
 

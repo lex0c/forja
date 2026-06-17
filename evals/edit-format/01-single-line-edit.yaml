@@ -4,11 +4,14 @@ prompt: |
   reads `export const enabled = true;`. Use the edit_file tool. Reply "done"
   when applied.
 setup:
+  gitInit: true
   files:
     src/flag.ts: |
       export const enabled = false;
 expect:
   - tool_called: edit_file
+  - tool_not_called: git_apply_patch
+  - tool_not_called: write_file
   - file_contains:
       path: src/flag.ts
       pattern: export const enabled = true;

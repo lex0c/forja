@@ -51,6 +51,11 @@ export interface EvalSetup {
   // Inline files: { 'src/x.ts': 'export const x = 1\n' }. Useful
   // for cases too small to deserve a fixture dir.
   files?: Record<string, string>;
+  // Initialize the eval cwd as a git work-tree (`git init`) before the run.
+  // Needed for tools that require a repo (git_apply_patch) — the eval cache dir
+  // is not otherwise a git repo, so without this they'd dead-end on
+  // git.not_a_repo. cwd == worktree root, so patch paths resolve cleanly.
+  gitInit?: boolean;
   // Initial approval posture (operation-mode, AGENTIC_CLI §8.1).
   // Default 'supervised'. Evals run headless (no confirm bridge), so
   // under 'supervised' a `confirm` verdict dead-ends as a deny; under

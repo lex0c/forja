@@ -146,6 +146,27 @@ budget:
     expect(c.budget).toEqual({ maxSteps: 7, maxCostUsd: 0.05 });
   });
 
+  test('parses setup.gitInit (boolean) and rejects non-boolean', () => {
+    const yaml = `
+name: x
+prompt: y
+setup:
+  gitInit: true
+expect:
+  - status: done
+`;
+    expect(parseEvalCase(yaml, '/tmp/c.yaml').setup?.gitInit).toBe(true);
+    const bad = `
+name: x
+prompt: y
+setup:
+  gitInit: "yes"
+expect:
+  - status: done
+`;
+    expect(() => parseEvalCase(bad, '/tmp/c.yaml')).toThrow(/gitInit must be a boolean/);
+  });
+
   test('parses setup.approvalPosture (operation-mode)', () => {
     const yaml = `
 name: x

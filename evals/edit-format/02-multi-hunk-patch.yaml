@@ -5,6 +5,7 @@ prompt: |
   git_apply_patch call — a unified diff for `src/calc.ts` containing both hunks.
   Reply "done" when applied.
 setup:
+  gitInit: true
   files:
     src/calc.ts: |
       export function add(a: number, b: number): number {
@@ -16,6 +17,8 @@ setup:
       }
 expect:
   - tool_called: git_apply_patch
+  - tool_not_called: edit_file
+  - tool_not_called: write_file
   - file_contains:
       path: src/calc.ts
       pattern: return a + b;

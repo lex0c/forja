@@ -6,6 +6,7 @@ prompt: |
   hunk context (`doThing();` above, `doOther();` below) pins the right line.
   Reply "done" when applied.
 setup:
+  gitInit: true
   files:
     src/log.ts: |
       log.info("start");
@@ -15,6 +16,8 @@ setup:
       log.info("start");
 expect:
   - tool_called: git_apply_patch
+  - tool_not_called: edit_file
+  - tool_not_called: write_file
   - file_contains:
       path: src/log.ts
       pattern: log.info("middle");

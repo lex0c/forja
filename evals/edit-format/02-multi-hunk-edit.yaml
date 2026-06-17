@@ -4,6 +4,7 @@ prompt: |
   `mul` returns `a + b` (should be `a * b`). Fix BOTH in a single edit_file call
   (an array of two edits). Reply "done" when applied.
 setup:
+  gitInit: true
   files:
     src/calc.ts: |
       export function add(a: number, b: number): number {
@@ -15,6 +16,8 @@ setup:
       }
 expect:
   - tool_called: edit_file
+  - tool_not_called: git_apply_patch
+  - tool_not_called: write_file
   - file_contains:
       path: src/calc.ts
       pattern: return a + b;
