@@ -2,6 +2,32 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-17] tool_search: spec contract for an on-demand tool surface (§7.6)
+
+The model-facing surface grew to ~36 tools (~9k tokens of schema). Two costs,
+and the first isn't the real one: tokens are small + cached (the real cost lever
+is tool OUTPUT, OUTPUT_POLICY), but the SELECTION cost is real — principle 3 (§1,
+"10 well-designed beat 40 generic") says a large surface degrades tool choice,
+especially on weaker models (the same reason pin_context/wait_for/monitor were
+withdrawn). Plan: a two-tier surface — a curated visible core + a deferred set
+reachable via a `tool_search` tool, mirroring the description-based progressive
+disclosure the spec already blesses for skills/subagents/MCP (RETRIEVAL.md:104).
+
+Step 1 (this entry): spec PR first per CLAUDE.md. Added AGENTIC_CLI §7.6 —
+normative MECHANISM (deferred metadata flag; tool_search returns schemas in the
+tool RESULT, never rewriting the base `tools` array; sticky reveal; catalog of
+name+blurb embedded in tool_search's description; the cache invariant that the
+win only exists if fetches stay rare, so the visible core must cover the common
+path and no mandatory follow-up may be deferred — a visible primary without its
+satellite like bash_background sans bash_output is a footgun) and the v1 split as
+illustrative-not-normative (so catalog tweaks don't need a spec PR, per the
+seed-pack precedent). Out of v1: satellite auto-reveal (curation avoids orphans)
+and modal consolidation of over-split families (bash_job{action} etc. — pure
+principle-3, but a separate API refactor). Eval-gated (principle 4): discovery +
+fetch-rate + completion decide, not guesswork. Code (registry flag, tool_search
+builtin, loop revealed-set, eval, bootstrap-list update) follows after the spec
+lands.
+
 ## [2026-06-17] Symlink confinement: follow symlinked ANCESTORS in dangling targets
 
 Follow-up review finding on the dangling-symlink fix. The fix's final fallback

@@ -1307,6 +1307,39 @@ type ValidationResult =
 
 **Trade-off honesto:** validators custam manutenção. Não validar é mais simples mas modelo pequeno produz lixo. Não dá pra ter os dois.
 
+### 7.6 Superfície sob demanda (deferred tools + `tool_search`)
+
+O registry cresceu além do mínimo viável de §7.1. Expor o catálogo inteiro ao modelo a cada turno tem **dois custos diferentes — e o primeiro não é o que parece**:
+
+1. **Custo de tokens (pequeno).** Schemas vão no prefixo cacheado: ~9k tokens nos ~36 tools, lidos a custo de cache-read e quase nunca reescritos. Não é o gargalo de custo (esse é tool **output** no histórico — `OUTPUT_POLICY`). Medir antes de invocar isso como justificativa.
+2. **Custo de seleção (o que importa).** Princípio 3 (§1: "10 tools bem desenhadas vencem 40 genéricas"): superfície grande degrada a escolha de tool, sobretudo em modelos fracos. Foi por isso que `pin_context`/`wait_for`/`monitor` saíram da superfície model-facing mesmo seguindo registradas.
+
+**Modelo de duas camadas.** A superfície model-facing = **núcleo visível** (cobre o caminho comum) + **conjunto deferido** atrás de `tool_search`. Toda tool deferida segue **registrada e despachável** — só não vai no array `tools` até ser revelada. Flag no metadata, mesmo padrão dos gates existentes (`requiresOperatorConfirm`, `requiresReminderScheduler`):
+
+```ts
+interface ToolMetadata {
+  // ... gates existentes ...
+  deferred?: boolean   // fora da superfície base; alcançável via tool_search
+}
+```
+
+**Catálogo.** O modelo precisa saber o que existe pra buscar. Nome + blurb de ~6 palavras de cada deferida vão embutidos na **descrição do `tool_search`** (gerado das deferidas em build-time): co-localizado, cacheado, ~0.15k tokens — substitui os ~3k de schema das deferidas no prefixo.
+
+**Contrato `tool_search`:**
+- Input `{ query: string }`. Duas formas: busca por keyword (rankeia deferidas) e `select:nome1,nome2` (fetch direto por nome).
+- Retorna os schemas casados **no tool result** — nunca reescrevendo o `tools` base arbitrariamente.
+- **Sticky:** uma vez revelada, a tool fica calável pelo resto da sessão (entra em `revealed`; o loop monta `tools = base + revealed` por turno).
+
+**Invariante de cache (load-bearing).** O ganho só existe se o fetch for **raro**. O set base é estável → cacheado a cada turno; cada fetch cresce o `tools` e custa **uma** invalidação de prefixo, depois reestabiliza. Se o modelo busca a cada turno, perde-se pra churn de cache + round-trip. Logo: **o núcleo visível deve cobrir o caminho comum**, e nenhum *follow-up obrigatório* pode ficar deferido (um primário visível sem seu satélite — ex.: `bash_background` sem `bash_output` — é footgun; resolve-se por curadoria, não por máquina de auto-reveal).
+
+**Critério da divisão** (a lista concreta é v1, ajustável sem spec-PR — normativo é o critério): visível = primitivos do caminho comum + qualquer satélite obrigatório de um primário visível. Deferido = alternativas de nicho, gerência rara e self-contained, e tools cuja ausência o modelo não precisa adivinhar a cada turno. Divisão v1: ~22 visíveis + `tool_search`; ~14 deferidas (ex.: `git_apply_patch`, `bash_kill/list`, `task_cancel/list/sync`, `memory_list/write`, `retrieve_context`, `todo_clear`, `skill_list/show`, `reminder_list/cancel`).
+
+**Fora do v1:** auto-reveal de satélites no uso do primário (desnecessário se a curadoria não deixa órfãos; só entra se o eval mostrar thrashing numa deferida) e consolidação modal de famílias super-fatiadas (`bash_job{action}` etc. — princípio-3 puro, reduz a contagem real, mas é refactor de API à parte).
+
+**Gate (princípio 4):** eval mede **taxa de descoberta + fetch-rate + conclusão** em tarefas que exigem uma deferida. Fetch-rate alto ou queda de conclusão → promover a tool culpada de volta ao visível (ou auto-reveal pontual). O eval decide, não o palpite.
+
+**Trade-off honesto:** o ganho de tokens é modesto e cacheado; o ganho real é clareza de seleção. Se a curadoria estiver ruim (núcleo não cobre o comum), `tool_search` custa mais — em latência e cache — do que economiza. A camada só se justifica medida.
+
 ---
 
 ## 8. Permission Engine
