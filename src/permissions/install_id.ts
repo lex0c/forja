@@ -66,7 +66,7 @@ export interface IsFirstBootOptions {
 }
 
 // True when the install_id file doesn't exist yet. Used to render
-// a one-line nudge ("try `agent welcome`") on the operator's
+// a one-line nudge ("try `forja welcome`") on the operator's
 // first invocation of any normal verb. Returns false when the
 // path can't be derived (no $HOME / $XDG_CONFIG_HOME /
 // %APPDATA%) so the nudge stays silent in degraded environments;
@@ -88,7 +88,7 @@ export const isFirstBoot = (options: IsFirstBootOptions = {}): boolean => {
 //     genesis, so fail closed rather than degrade silently.
 //   - the existing file is corrupted (malformed JSON or wrong shape):
 //     the chain that was anchored to it can't be reproduced from
-//     unverifiable identity. Operator must run `agent permission
+//     unverifiable identity. Operator must run `forja permission
 //     verify` and decide rotation vs accept-broken-chain.
 export const ensureInstallId = (options: EnsureInstallIdOptions = {}): InstallIdentity => {
   const env = options.env ?? process.env;

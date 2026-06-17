@@ -42,7 +42,7 @@ beforeEach(() => {
   dbPath = join(workdir, 'sessions.db');
   originalKey = process.env.ANTHROPIC_API_KEY;
   // Isolate user-scope memory under the workdir so the dev's
-  // real ~/.config/agent/memory/ doesn't bleed into bootstrap
+  // real ~/.config/forja/memory/ doesn't bleed into bootstrap
   // tests asserting against systemPrompt. The 5.2.c memory
   // injection eagerly loads the merged index; without isolation
   // a developer with personal memories would see their content
@@ -109,13 +109,13 @@ describe('bootstrap', () => {
         'clarify',
         'edit_file',
         'git',
+        'git_apply_patch',
         'glob',
         'grep',
         'memory_list',
         'memory_read',
         'memory_search',
         'memory_write',
-        'pin_context',
         'read_file',
         'reminder',
         'reminder_cancel',
@@ -170,10 +170,10 @@ describe('bootstrap', () => {
     ).rejects.toThrow(/unknown model: fake\/nope/);
   });
 
-  test('loads project policy when .agent/permissions.yaml exists', async () => {
-    mkdirSync(join(workdir, '.agent'), { recursive: true });
+  test('loads project policy when .forja/permissions.yaml exists', async () => {
+    mkdirSync(join(workdir, '.forja'), { recursive: true });
     writeFileSync(
-      join(workdir, '.agent/permissions.yaml'),
+      join(workdir, '.forja/permissions.yaml'),
       'defaults:\n  mode: acceptEdits\ntools:\n  bash:\n    allow:\n      - "ls *"\n',
     );
     const { config, db, policyLayers } = await bootstrap({
@@ -298,11 +298,11 @@ describe('bootstrap', () => {
   });
 
   // Helper: write a playbook-shaped subagent definition under
-  // <workdir>/.agent/agents/<name>.md so bootstrap discovers it
+  // <workdir>/.forja/playbooks/<name>.md so bootstrap discovers it
   // through the project scope. Includes `when_to_use` so the def
   // qualifies for the discovery table.
   const writePlaybookDef = (name: string, whenToUse: string): void => {
-    const dir = join(workdir, '.agent', 'agents');
+    const dir = join(workdir, '.forja', 'playbooks');
     mkdirSync(dir, { recursive: true });
     writeFileSync(
       join(dir, `${name}.md`),
@@ -340,7 +340,7 @@ Body for ${name}.`,
   test('playbook hint absent when subagent has no when_to_use field', async () => {
     // Project def WITHOUT when_to_use must not surface in the
     // table. Anchors the §1.4 filter at the bootstrap layer.
-    const dir = join(workdir, '.agent', 'agents');
+    const dir = join(workdir, '.forja', 'playbooks');
     mkdirSync(dir, { recursive: true });
     writeFileSync(
       join(dir, 'legacy.md'),
@@ -419,7 +419,7 @@ Body.`,
 
   test('memory section appended to caller systemPrompt when memories exist', async () => {
     // Project local memory under workdir.
-    const localDir = join(workdir, '.agent', 'memory', 'local');
+    const localDir = join(workdir, '.forja', 'memory', 'local');
     mkdirSync(localDir, { recursive: true });
     writeFileSync(join(localDir, 'MEMORY.md'), '- [Role](role.md) — full-stack TS dev\n');
     const { config, db } = await bootstrap({
@@ -442,7 +442,7 @@ Body.`,
 
   test('boot triggers probe the repo root, not the invocation cwd (regression)', async () => {
     // Bug: bootstrap evaluated boot triggers from the invocation
-    // cwd, not the repo root. Operator running `agent` from
+    // cwd, not the repo root. Operator running `forja` from
     // `/repo/src/components/` saw `git` / `package` / `tsconfig`
     // triggers fail to fire because the probe scanned the subdir
     // (no root-level files there), even though memories were
@@ -460,7 +460,7 @@ Body.`,
     writeFileSync(join(workdir, 'package.json'), '{}');
     const subDir = join(workdir, 'src', 'sub');
     mkdirSync(subDir, { recursive: true });
-    const localDir = join(workdir, '.agent', 'memory', 'local');
+    const localDir = join(workdir, '.forja', 'memory', 'local');
     mkdirSync(localDir, { recursive: true });
     writeFileSync(
       join(localDir, 'MEMORY.md'),
@@ -510,7 +510,7 @@ Body.`,
     //   5. # Parallelism — concurrency mechanics.
     //   6. (caller / playbook hint wrap when applicable)
     //   7. # Memory — index of cross-session memories.
-    const localDir = join(workdir, '.agent', 'memory', 'local');
+    const localDir = join(workdir, '.forja', 'memory', 'local');
     mkdirSync(localDir, { recursive: true });
     writeFileSync(join(localDir, 'MEMORY.md'), '- [Role](role.md) — TS dev\n');
     const { config, db } = await bootstrap({
@@ -555,13 +555,13 @@ Body.`,
     // AGENTS.md at workdir → project-context fires (trust-gated).
     writeFileSync(join(workdir, 'AGENTS.md'), '# project rules\nuse pnpm.\n');
     // Memory file → memory section fires.
-    const memDir = join(workdir, '.agent', 'memory', 'local');
+    const memDir = join(workdir, '.forja', 'memory', 'local');
     mkdirSync(memDir, { recursive: true });
     writeFileSync(join(memDir, 'MEMORY.md'), '- [Role](role.md) — TS dev\n');
     // Playbook def with when_to_use → playbook hint fires.
     writePlaybookDef('code-review', 'gate diff before merge');
     // Skill → skill catalog fires.
-    const skillsDir = join(workdir, '.agent', 'skills', 'shared');
+    const skillsDir = join(workdir, '.forja', 'skills', 'shared');
     mkdirSync(skillsDir, { recursive: true });
     writeFileSync(
       join(skillsDir, 'explore.md'),
@@ -635,7 +635,7 @@ When the goal is to orient in a new repo.
     // index parser succeeds, then chmod the file 0 so loadScopeIndex
     // hits EACCES on read. The construction error must propagate
     // without leaking the SQLite handle.
-    const localDir = join(workdir, '.agent', 'memory', 'local');
+    const localDir = join(workdir, '.forja', 'memory', 'local');
     mkdirSync(localDir, { recursive: true });
     const memPath = join(localDir, 'MEMORY.md');
     writeFileSync(memPath, '- [Role](role.md) — TS dev\n');
@@ -673,9 +673,9 @@ When the goal is to orient in a new repo.
   });
 
   test('memory loads from repo root, not subdir (regression: subdir blindspot)', async () => {
-    // Operator runs `agent` from a subdirectory of a git repo
+    // Operator runs `forja` from a subdirectory of a git repo
     // (e.g., `/repo/src/components/`). Memory tree lives at the
-    // repo root (`/repo/.agent/memory/...`). Pre-fix the
+    // repo root (`/repo/.forja/memory/...`). Pre-fix the
     // bootstrap would resolve scope roots from the subdir cwd
     // and silently miss every project memory. Post-fix it calls
     // git rev-parse and anchors at the repo root.
@@ -691,7 +691,7 @@ When the goal is to orient in a new repo.
     };
     await initRepo(workdir);
     // Seed the repo-root project_local memory.
-    const localDir = join(workdir, '.agent', 'memory', 'local');
+    const localDir = join(workdir, '.forja', 'memory', 'local');
     mkdirSync(localDir, { recursive: true });
     writeFileSync(join(localDir, 'MEMORY.md'), '- [Role](role.md) — repo root memory\n');
 
@@ -723,7 +723,7 @@ When the goal is to orient in a new repo.
       userPolicyPath: null,
     });
     // Bootstrap does NOT install vendor seeds — that's the
-    // `agent init` job (spec §5.7.4 + §5.7.8). An operator who
+    // `forja init` job (spec §5.7.4 + §5.7.8). An operator who
     // never ran init sees the # Memory section's save-criteria
     // guidance but no inventory lines, including no vendor seeds.
     // This preserves the principle that nothing arrives in the
@@ -814,8 +814,8 @@ When the goal is to orient in a new repo.
   });
 
   test('malformed permissions.yaml throws BEFORE the DB is opened (no leak)', async () => {
-    mkdirSync(join(workdir, '.agent'), { recursive: true });
-    writeFileSync(join(workdir, '.agent/permissions.yaml'), 'defaults: { mode: [unterminated');
+    mkdirSync(join(workdir, '.forja'), { recursive: true });
+    writeFileSync(join(workdir, '.forja/permissions.yaml'), 'defaults: { mode: [unterminated');
     await expect(
       bootstrap({
         prompt: 'hi',
@@ -959,7 +959,7 @@ When the goal is to orient in a new repo.
     });
 
     test('embeds the cwd-specific AGENTS.md when present (subdir scope)', async () => {
-      // Operator running `agent` from a subdir that has its own
+      // Operator running `forja` from a subdir that has its own
       // AGENTS.md should see THAT file embedded, not the
       // repoRoot one. Bootstrap forwards both `cwd` and
       // `repoRoot` to the helper; cwd-first probe wins when
@@ -1026,7 +1026,7 @@ When the goal is to orient in a new repo.
 
     test('falls back to repoRoot when BOTH cwd and repoRoot are trusted (typical workflow)', async () => {
       // The common operator workflow: trust the whole repo, run
-      // `agent` from a subdir. Both directories are in the trust
+      // `forja` from a subdir. Both directories are in the trust
       // list. The section should fall back to repoRoot/AGENTS.md
       // when the subdir has no AGENTS.md.
       //
@@ -1364,7 +1364,7 @@ When the goal is to orient in a new repo.
     };
 
     test('skipped when no askSharedTrust callback is supplied', async () => {
-      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      const sharedDir = join(workdir, '.forja', 'memory', 'shared');
       mkdirSync(sharedDir, { recursive: true });
       writeFileSync(join(sharedDir, 'MEMORY.md'), '- [A](a.md) — h\n');
       writeFileSync(
@@ -1388,7 +1388,7 @@ When the goal is to orient in a new repo.
     });
 
     test('skipped when cwd is not trusted (probe requires cwd consent first)', async () => {
-      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      const sharedDir = join(workdir, '.forja', 'memory', 'shared');
       mkdirSync(sharedDir, { recursive: true });
       writeFileSync(join(sharedDir, 'MEMORY.md'), '- [A](a.md) — h\n');
       writeFileSync(
@@ -1419,7 +1419,7 @@ When the goal is to orient in a new repo.
 
     test('seeded silently when no shared corpus exists (empty case)', async () => {
       // P0/F2: silent seed is reserved for the case where there's
-      // nothing to consent to. No `.agent/memory/shared/` directory
+      // nothing to consent to. No `.forja/memory/shared/` directory
       // at all → EMPTY_CORPUS_HASH → no modal fires.
       const trustPath = join(workdir, 'trusted_dirs.json');
       writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
@@ -1446,9 +1446,9 @@ When the goal is to orient in a new repo.
     test('first-visit non-empty: modal fires in mode=first-visit (P0/F2)', async () => {
       // Pre-populated shared/ + cwd already trusted MUST trigger the
       // first-visit modal. Silent seeding here would let a poisoned
-      // repo's `.agent/memory/shared/` flow into the model on the
+      // repo's `.forja/memory/shared/` flow into the model on the
       // very first agent invocation after `git clone`.
-      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      const sharedDir = join(workdir, '.forja', 'memory', 'shared');
       mkdirSync(sharedDir, { recursive: true });
       writeFileSync(join(sharedDir, 'MEMORY.md'), '- [A](a.md) — h\n');
       writeFileSync(
@@ -1481,7 +1481,7 @@ When the goal is to orient in a new repo.
     });
 
     test('revoked: corpus changed after seeding → modal fires, bulk-invalidate runs', async () => {
-      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      const sharedDir = join(workdir, '.forja', 'memory', 'shared');
       mkdirSync(sharedDir, { recursive: true });
       writeFileSync(join(sharedDir, 'MEMORY.md'), '- [A](a.md) — h\n');
       writeFileSync(
@@ -1549,7 +1549,7 @@ When the goal is to orient in a new repo.
       // built this very boot. Without that ordering the operator
       // would need to restart to get the memories out of the
       // system prompt.
-      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      const sharedDir = join(workdir, '.forja', 'memory', 'shared');
       mkdirSync(sharedDir, { recursive: true });
       writeFileSync(join(sharedDir, 'MEMORY.md'), '- [Quokka](quokka.md) — h\n');
       writeFileSync(
@@ -1597,7 +1597,7 @@ When the goal is to orient in a new repo.
       // induce a divergence on the in-sync path (e.g., a registry
       // construction quirk that wrote to the corpus and shifted
       // its hash).
-      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      const sharedDir = join(workdir, '.forja', 'memory', 'shared');
       mkdirSync(sharedDir, { recursive: true });
       writeFileSync(join(sharedDir, 'MEMORY.md'), '- [A](a.md) — h\n');
       writeFileSync(
@@ -1646,7 +1646,7 @@ When the goal is to orient in a new repo.
       // Post-hardening: when the probe doesn't run, the bootstrap
       // computes the hash itself and excludes project_shared
       // unless stored trust matches.
-      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      const sharedDir = join(workdir, '.forja', 'memory', 'shared');
       mkdirSync(sharedDir, { recursive: true });
       writeFileSync(join(sharedDir, 'MEMORY.md'), '- [X](x.md) — h\n');
       writeFileSync(
@@ -1691,7 +1691,7 @@ When the goal is to orient in a new repo.
       // operator-confirmed trust row matching current disk state,
       // headless callers DO load the scope. Otherwise CI runs
       // against a well-curated repo would be broken.
-      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      const sharedDir = join(workdir, '.forja', 'memory', 'shared');
       mkdirSync(sharedDir, { recursive: true });
       writeFileSync(join(sharedDir, 'MEMORY.md'), '- [K](kept.md) — h\n');
       writeFileSync(
@@ -1731,7 +1731,7 @@ When the goal is to orient in a new repo.
       // Spec §9 — trust is per-project. Without cwd-trust, the
       // shared scope must not load. Probe is also skipped (gated on
       // isCwdTrusted) and the fail-closed branch fires.
-      const sharedDir = join(workdir, '.agent', 'memory', 'shared');
+      const sharedDir = join(workdir, '.forja', 'memory', 'shared');
       mkdirSync(sharedDir, { recursive: true });
       writeFileSync(join(sharedDir, 'MEMORY.md'), '- [S](s.md) — h\n');
       writeFileSync(

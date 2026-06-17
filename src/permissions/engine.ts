@@ -1,5 +1,5 @@
 import { readlinkSync, realpathSync, statSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import { redactSecrets } from '../sanitize/secrets.ts';
 import type { TelemetryEvent } from '../telemetry/index.ts';
 import type { AuditEmitInput, AuditSink, ReasonChainEntry } from './audit.ts';
@@ -34,6 +34,7 @@ import {
   matchCommand,
   matchHost,
   matchPath,
+  resolveSymlinks,
 } from './matcher.ts';
 import {
   type ProtectedOp,
@@ -93,7 +94,7 @@ export interface EngineOptions {
   // Decision falls back to source.layer='default'.
   provenance?: SectionProvenance;
   // Home directory used by `classifyProtectedPath` to resolve
-  // tilde-rooted protected targets (~/.bashrc, ~/.config/agent).
+  // tilde-rooted protected targets (~/.bashrc, ~/.config/forja).
   // Default `process.env.HOME ?? cwd` — production bootstrap
   // passes the operator's HOME explicitly so tests can swap it
   // without polluting process.env.
@@ -386,7 +387,7 @@ export interface PermissionEngine {
   // Returns a deep copy of the resolved Policy this engine was
   // built from. Subagent runtime persists the copy on
   // `subagent_runs` so the subprocess child runs under the
-  // parent's exact policy even if `.agent/permissions.yaml`
+  // parent's exact policy even if `.forja/permissions.yaml`
   // etc. are edited mid-run. The deep copy is defensive: a
   // future caller mutating the returned object MUST NOT corrupt
   // the engine's active enforcement state. Cost is negligible
@@ -528,15 +529,28 @@ const FS_TOOL_TRAITS: Readonly<Record<string, FsToolTraits>> = {
     singleFileModes: ['blame', 'show_file'],
     section: 'read_file',
   },
+  // git_apply_patch writes ONE file (it takes an explicit `path` arg, so it's a
+  // normal single-path FS tool — no rootArg). It shares the `write_file` policy
+  // section: an operator who governs write_file thereby governs patch applies
+  // with one allow/deny list, and there's no separate `tools.git_apply_patch`
+  // surface to configure.
+  git_apply_patch: { section: 'write_file' },
 };
 
 const resolveFsTarget = (toolName: string, args: ToolArgs, cwd: string): string | null => {
   const rootArg = FS_TOOL_TRAITS[toolName]?.rootArg;
   if (rootArg !== undefined) {
-    // Search tool: a pathless/cwd-less call targets the session cwd;
-    // a present-but-non-string value is structural failure (null).
+    // Search/survey tool (grep/glob/git): a pathless call targets the session
+    // cwd. An EMPTY-STRING path is the SAME "omitted" signal — these tools
+    // themselves treat `path: ''` as omitted (models often emit it; see
+    // git.ts / grep.ts), so the engine must classify it as cwd too rather than
+    // deny it as malformed. Without this, a repo-wide `git status` / `grep`
+    // with `path: ''` is wrongly DENIED while the identical call with the arg
+    // absent is allowed — the tool would have run repo-wide either way. A
+    // present NON-string value (number, array, null) is still a structural
+    // failure (null → deny).
     const value = args[rootArg];
-    if (value === undefined) return cwd;
+    if (value === undefined || value === '') return cwd;
     return isNonEmptyString(value) ? value : null;
   }
   return filePathOf(args);
@@ -802,36 +816,22 @@ const matchTargetForRules = (toolName: string, path: string): string =>
   isSearchTool(toolName) ? `${path}/${SYNTHETIC_DESCENDANT}` : path;
 
 // Resolve a path to its symlink-followed absolute form for protected
-// path classification. Mirrors the matcher's `resolveSymlinks` so a
-// symlink at `./safe → /etc/passwd` is caught by the protected check
-// just like the matcher catches it for rule matching.
+// path classification. Delegates to the matcher's `resolveSymlinks` so the
+// protected floor and the allow/deny matcher canonicalize a path IDENTICALLY
+// — a single source of truth. (When these two diverged, a dangling symlink
+// resolved one way for matching and another for the protected floor, leaking
+// past one of them; sharing the resolver closes that class.)
 //
-// Always normalizes lexically via `path.resolve(cwd, rawPath)` first
-// — even when `rawPath` is already absolute. Without this,
-// `/work/proj/data/../../etc/hosts` in a fictional cwd stays
-// un-normalized (both realpath fallbacks ENOENT-fail, textual abs
-// returns with the `/work/proj/` prefix intact, and the protected
-// classifier misses the underlying `/etc/` target). `path.resolve`
-// does the .. and `./` resolution lexically without touching the
-// filesystem; realpath then refines for symlinks if the resolved
-// target exists.
-//
-// realpath fails on paths that don't exist (write_file creating a
-// new file); fall back to realpathing the parent + joining the
-// basename (catches symlink parents) and finally to the lexically
-// normalized absolute form.
-const resolveForProtected = (rawPath: string, cwd: string): string => {
-  const abs = resolve(cwd, rawPath);
-  try {
-    return realpathSync(abs);
-  } catch {
-    try {
-      return join(realpathSync(dirname(abs)), basename(abs));
-    } catch {
-      return abs;
-    }
-  }
-};
+// Always normalizes lexically via `path.resolve(cwd, rawPath)` first — even
+// when `rawPath` is already absolute. Without this,
+// `/work/proj/data/../../etc/hosts` in a fictional cwd stays un-normalized
+// (the realpath fallbacks ENOENT-fail, textual abs returns with the
+// `/work/proj/` prefix intact, and the protected classifier misses the
+// underlying `/etc/` target). `path.resolve` does the `..`/`./` resolution
+// lexically without touching the filesystem; `resolveSymlinks` then follows
+// links (including dangling ones — see its comment) for the protected check.
+const resolveForProtected = (rawPath: string, cwd: string): string =>
+  resolveSymlinks(resolve(cwd, rawPath));
 
 // True iff the symlink-resolved target is a REGULAR FILE. Gates the
 // `exactFileAllow` literal fallback so it grants only genuine
@@ -1320,7 +1320,7 @@ const autoApprovePolicyConfirm = (decision: Decision): Decision => {
 // so they gate even though they also git-write), an unknown binary
 // (`exec:arbitrary`), python/node interpreters, secret-access, env/agent
 // mutation, and ANY path outside the repo or hitting a protected
-// (`.git`/`.agent`/system) or sensitive (`.env`/`*.pem`/`id_rsa`/
+// (`.git`/`.forja`/system) or sensitive (`.env`/`*.pem`/`id_rsa`/
 // credentials) target. The sensitive/protected checks are
 // belt-and-suspenders — the engine's §8.4 sensitive floor already DENIES
 // most of these before this runs — so a future floor change can't
@@ -1342,7 +1342,7 @@ const capRepoConfined = (cap: Capability, cwd: string, home: string): boolean =>
       if (path === null) return false;
       if (isDevSafe(path)) return true; // /dev/null, /dev/stdout, /dev/fd/*, ...
       if (!startsWithSegment(path, cwd)) return false; // escapes the repo
-      // Gate if protected for EITHER op. `.git`/`.agent`/`.claude` are
+      // Gate if protected for EITHER op. `.git`/`.forja`/`.claude` are
       // write-escalate but readable to git in general — for the no-modal
       // auto-approval we treat them as off-limits for reads too (they can
       // carry tokens / `core.sshCommand`), honoring the operator's
@@ -1357,7 +1357,7 @@ const capRepoConfined = (cap: Capability, cwd: string, home: string): boolean =>
       return true;
     }
     default:
-      // net-egress, net-ingress, secret-access, env-mutate, agent-mutate,
+      // net-egress, net-ingress, secret-access, env-mutate, forja-mutate,
       // host-passthrough → never repo-confined.
       return false;
   }

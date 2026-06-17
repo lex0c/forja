@@ -8,7 +8,7 @@
 //   - Wall-clock timer: fires every `intervalSeconds` (when > 0),
 //     seals the latest chain row, restarts itself.
 //   - `sealNow()`: manual trigger. Used by SessionEnd / SIGTERM
-//     final-seal handlers and the `agent permission seal-now` CLI
+//     final-seal handlers and the `forja permission seal-now` CLI
 //     verb.
 //
 // All paths converge on `sealLatestInternal`: query the latest

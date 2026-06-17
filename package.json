@@ -6,15 +6,16 @@
   "license": "Apache-2.0",
   "type": "module",
   "bin": {
-    "agent": "./dist/agent-linux-x64"
+    "forja": "./dist/forja-0.0.0-linux-x64"
   },
   "scripts": {
-    "dev": "bun run --watch src/cli/index.ts",
+    "dev": "FORJA_PROFILE=dev bun run --watch src/cli/index.ts",
     "start": "bun run src/cli/index.ts",
     "test": "bun test",
     "eval:smoke": "bun run src/evals/cli.ts evals/smoke",
     "eval:regression": "bun run src/evals/cli.ts evals/regression --model anthropic/claude-haiku-4-5",
     "eval:skills": "bun run src/evals/cli.ts evals/skills --model anthropic/claude-opus-4-8",
+    "eval:edit-format": "bun run src/evals/cli.ts evals/edit-format --model anthropic/claude-opus-4-8",
     "eval:long-horizon": "bun run src/evals/cli.ts evals/long-horizon --model anthropic/claude-opus-4-8",
     "eval:long-horizon:ab": "bun run src/evals/ab.ts evals/long-horizon --model anthropic/claude-opus-4-8 --repeat 10 --thinking-budget 4096",
     "lint": "biome check .",

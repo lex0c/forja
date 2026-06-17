@@ -1,4 +1,4 @@
-// `agent permission rotate-chain` — archives the active audit chain
+// `forja permission rotate-chain` — archives the active audit chain
 // segment under a new rotation_id and starts a fresh chain
 // (PERMISSION_ENGINE.md §7.2). Operator-driven only; the engine
 // never auto-rotates.

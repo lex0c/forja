@@ -229,6 +229,17 @@ describe('formatPermanent', () => {
       const out = formatPermanent(baseBanner, unicode);
       for (const line of out) expect(line).not.toContain(CSI);
     });
+
+    test('appends an isolation-profile line when a profile is active', () => {
+      const out = formatPermanent({ ...baseBanner, profile: 'dev' }, unicode);
+      expect(out).toHaveLength(4);
+      expect(out[3]).toBe(pad('profile: dev (isolated namespace)'));
+    });
+
+    test('no profile line on the default namespace (null / absent)', () => {
+      expect(formatPermanent({ ...baseBanner, profile: null }, unicode)).toHaveLength(3);
+      expect(formatPermanent(baseBanner, unicode)).toHaveLength(3);
+    });
   });
 
   describe('user-submit (inverse bar, UI.md §4.10.8)', () => {
@@ -1527,7 +1538,7 @@ describe('formatPermanent', () => {
 });
 
 describe('formatPermanent — diff snippet (write/edit cards)', () => {
-  test('renders +N/-N counts on the head and a colored snippet under the card', () => {
+  test('renders +N/-N counts on the file-path line (not the head) and a colored snippet', () => {
     const out = formatPermanent(
       {
         kind: 'tool-end',
@@ -1550,11 +1561,54 @@ describe('formatPermanent — diff snippet (write/edit cards)', () => {
       },
       ascii,
     );
-    const joined = out.join('\n');
-    expect(joined).toContain('+1');
-    expect(joined).toContain('-1');
+    const head = out.find((l) => l.includes('Edited file'));
+    const pathLine = out.find((l) => l.includes('src/a.ts'));
+    // Counts moved off the head onto the path line.
+    expect(head?.includes('+1')).toBe(false);
+    expect(pathLine).toContain('+1');
+    expect(pathLine).toContain('-1');
     expect(out.some((l) => l.includes('- b'))).toBe(true);
     expect(out.some((l) => l.includes('+ B'))).toBe(true);
+  });
+
+  test('bolds the file path on a diff card (secondary + bold)', () => {
+    const out = formatPermanent(
+      {
+        kind: 'tool-end',
+        name: 'edit_file',
+        verb: 'Edited file',
+        subject: 'src/a.ts',
+        status: 'done',
+        durationMs: 10,
+        diff: {
+          added: 1,
+          removed: 0,
+          snippet: [{ type: 'add', text: 'x', newLine: 1 }],
+          hiddenChanges: 0,
+        },
+      },
+      colored,
+    );
+    const pathLine = out.find((l) => l.includes('src/a.ts'));
+    // secondary (90) + bold (1) wrap the path, single trailing reset.
+    expect(pathLine).toContain(`${CSI}90m${CSI}1msrc/a.ts${CSI}0m`);
+  });
+
+  test('a non-diff tool subject stays plain secondary (no bold)', () => {
+    const out = formatPermanent(
+      {
+        kind: 'tool-end',
+        name: 'bash',
+        verb: 'Executed',
+        subject: 'ls -la',
+        status: 'done',
+        durationMs: 5,
+      },
+      colored,
+    );
+    const subjectLine = out.find((l) => l.includes('ls -la'));
+    expect(subjectLine).toContain(`${CSI}90m`); // still secondary
+    expect(subjectLine?.includes(`${CSI}1m`)).toBe(false); // but not bold
   });
 
   test('summarizes changes beyond the snippet via the hidden-changes tail', () => {
@@ -1600,5 +1654,158 @@ describe('formatPermanent — diff snippet (write/edit cards)', () => {
     const joined = out.join('\n');
     expect(joined).toContain('hack');
     expect(joined.includes(esc)).toBe(false); // no escape sequence leaked through
+  });
+
+  test('renders a line-number gutter: new-file for ctx/add, old-file for del', () => {
+    const out = formatPermanent(
+      {
+        kind: 'tool-end',
+        name: 'edit_file',
+        verb: 'Edited file',
+        subject: 'src/a.ts',
+        status: 'done',
+        durationMs: 10,
+        diff: {
+          added: 1,
+          removed: 1,
+          snippet: [
+            { type: 'ctx', text: 'a', oldLine: 1, newLine: 1 },
+            { type: 'del', text: 'b', oldLine: 2 },
+            { type: 'add', text: 'B', newLine: 2 },
+            { type: 'ctx', text: 'c', oldLine: 3, newLine: 3 },
+          ],
+          hiddenChanges: 0,
+        },
+      },
+      ascii,
+    );
+    expect(out.some((l) => l.includes('2 | - b'))).toBe(true); // del shows old line 2
+    expect(out.some((l) => l.includes('2 | + B'))).toBe(true); // add shows new line 2
+    expect(out.some((l) => l.includes('1 |'))).toBe(true);
+    expect(out.some((l) => l.includes('3 |'))).toBe(true);
+  });
+
+  test('right-aligns the gutter to the widest line number', () => {
+    const out = formatPermanent(
+      {
+        kind: 'tool-end',
+        name: 'edit_file',
+        verb: 'Edited file',
+        subject: 'x',
+        status: 'done',
+        durationMs: 1,
+        diff: {
+          added: 1,
+          removed: 0,
+          snippet: [
+            { type: 'ctx', text: 'nine', oldLine: 9, newLine: 9 },
+            { type: 'add', text: 'ten', newLine: 10 },
+          ],
+          hiddenChanges: 0,
+        },
+      },
+      ascii,
+    );
+    // 9 padded to width 2 so the rail aligns under the 2-digit 10.
+    expect(out.some((l) => l.includes(' 9 | '))).toBe(true);
+    expect(out.some((l) => l.includes('10 | '))).toBe(true);
+  });
+
+  test('uses the │ rail under unicode caps', () => {
+    const out = formatPermanent(
+      {
+        kind: 'tool-end',
+        name: 'edit_file',
+        verb: 'Edited file',
+        subject: 'x',
+        status: 'done',
+        durationMs: 1,
+        diff: {
+          added: 1,
+          removed: 0,
+          snippet: [{ type: 'add', text: 'x', newLine: 1 }],
+          hiddenChanges: 0,
+        },
+      },
+      unicode,
+    );
+    expect(out.join('\n')).toContain('│');
+  });
+
+  test('paints the number in the line tone; the rail stays secondary', () => {
+    const out = formatPermanent(
+      {
+        kind: 'tool-end',
+        name: 'edit_file',
+        verb: 'Edited file',
+        subject: 'x',
+        status: 'done',
+        durationMs: 1,
+        diff: {
+          added: 1,
+          removed: 1,
+          snippet: [
+            { type: 'del', text: 'b', oldLine: 2 },
+            { type: 'add', text: 'B', newLine: 2 },
+          ],
+          hiddenChanges: 0,
+        },
+      },
+      colored,
+    );
+    const joined = out.join('\n');
+    expect(joined).toContain(`${CSI}31m2${CSI}0m`); // del number → error (red)
+    expect(joined).toContain(`${CSI}32m2${CSI}0m`); // add number → success (green)
+    expect(joined).toContain(`${CSI}90m │ ${CSI}0m`); // rail → secondary (grey)
+  });
+
+  test('no gutter when the snippet carries no line numbers (back-compat)', () => {
+    const out = formatPermanent(
+      {
+        kind: 'tool-end',
+        name: 'write_file',
+        verb: 'Wrote file',
+        subject: 'x',
+        status: 'done',
+        durationMs: 1,
+        diff: {
+          added: 1,
+          removed: 0,
+          snippet: [{ type: 'add', text: 'x' }],
+          hiddenChanges: 0,
+        },
+      },
+      ascii,
+    );
+    const addLine = out.find((l) => l.includes('+ x'));
+    expect(addLine?.trimStart().startsWith('+')).toBe(true); // no leading "N |"
+  });
+
+  describe('reasoning (extended-thinking block, UI.md)', () => {
+    test('renders a blank lead, a "reasoning:" header, then one body line per \\n', () => {
+      const out = formatPermanent({ kind: 'reasoning', text: 'line one\nline two' }, ascii);
+      expect(out).toEqual([pad(''), pad('reasoning:'), pad('line one'), pad('line two')]);
+    });
+
+    test('header is bold+secondary, body is secondary (colored caps)', () => {
+      const out = formatPermanent({ kind: 'reasoning', text: 'scratch' }, colored);
+      // header: bold then secondary, single trailing reset (paintMulti).
+      expect(out[1]).toBe(pad(`${CSI}1m${CSI}90mreasoning:${CSI}0m`));
+      // body: secondary only.
+      expect(out[2]).toBe(pad(`${CSI}90mscratch${CSI}0m`));
+    });
+
+    test('soft-wraps a long single line so no rendered row overflows cols', () => {
+      const long = 'word '.repeat(60).trim(); // ~299 chars, no embedded newline
+      const out = formatPermanent({ kind: 'reasoning', text: long }, { ...ascii, cols: 40 });
+      // header + at least two wrapped body rows.
+      expect(out.length).toBeGreaterThan(3);
+      for (const row of out) expect(row.length).toBeLessThanOrEqual(40);
+    });
+
+    test('preserves blank separator lines between summary parts', () => {
+      const out = formatPermanent({ kind: 'reasoning', text: 'part one\n\npart two' }, ascii);
+      expect(out).toEqual([pad(''), pad('reasoning:'), pad('part one'), pad(''), pad('part two')]);
+    });
   });
 });

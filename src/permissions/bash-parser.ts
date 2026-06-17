@@ -107,7 +107,7 @@ import type { Node, Tree } from 'web-tree-sitter';
 //
 // Threat sizing: Bun runs JS single-threaded; every parse blocks
 // the engine. An adversary planting N pathological inputs (prompt
-// injection in an .agent file, a compromised subagent) burns
+// injection in an .forja file, a compromised subagent) burns
 // N×TIMEOUT_MS of engine wall-clock before each refuse. A 5s cap
 // (pre-slice) put a 10-call attack at ~50s of frozen engine; the
 // 1500ms cap below puts it at ~15s. Either is unacceptable as a

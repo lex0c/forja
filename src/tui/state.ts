@@ -117,6 +117,9 @@ export interface StatusState {
   sessionId: string | null;
   project: string | null;
   model: string | null;
+  // Active isolation profile (`--profile`/FORJA_PROFILE), or null on the
+  // default namespace. Seeded by session:banner; drives the footer chip.
+  profile: string | null;
   steps: number;
   maxSteps: number;
   // Current-turn spend (this harness session only). Reset to 0 at each
@@ -312,6 +315,11 @@ export interface SlashAutocomplete {
   // Highlighted index within `suggestions`. -1 means "no selection"
   // (e.g., empty suggestions list when input is `/<unknown>`).
   selectedIdx: number;
+  // Inline arg-hint ghost for an exactly-typed command (e.g.
+  // ` [low|medium|high]` after `/effort`). Undefined when there's no
+  // exact command match or it takes no args. The input renderer draws
+  // it dim after the typed text, gated on the cursor being at line end.
+  ghost?: string;
 }
 
 // Reverse-search overlay (HISTORY.md §2.2). Active while the operator
@@ -381,7 +389,9 @@ export interface LiveState {
   // collapse to a single static verb or drift to a non-stable
   // seed (timestamp-based picks can change mid-turn under clock
   // skew or replay).
-  thinking: { startedAt: number; messageId: string } | null;
+  // `text` accumulates the `thinking:delta` reasoning so `thinking:end` can
+  // flush it to scrollback (the chip reads only startedAt/messageId; ignores it).
+  thinking: { startedAt: number; messageId: string; text: string } | null;
   // "Awaiting model" indicator. Set by `provider:waiting:start`
   // (which the harness adapter emits on `step_start` — i.e.,
   // right after the harness loop hands the request to the
@@ -585,6 +595,7 @@ export const createInitialState = (): LiveState => ({
     sessionId: null,
     project: null,
     model: null,
+    profile: null,
     steps: 0,
     maxSteps: 0,
     costUsd: 0,
@@ -635,6 +646,22 @@ const TOOL_PREVIEW_MAX_LINES = 5;
 //
 // Adding a new kind: extend the union, handle it in `formatPermanent`
 // (renderer.ts), and emit from the relevant `applyEvent` branch.
+// Cap a reasoning block before it lands in scrollback. Extended-thinking turns
+// emit thousands of tokens; persisting all of it would bury the conversation in
+// grey. Keep a useful head and mark the rest. Char-based (not line-based) so a
+// single long paragraph is bounded too. Tunable.
+const REASONING_MAX_CHARS = 1500;
+export const capReasoning = (text: string): string => {
+  if (text.length <= REASONING_MAX_CHARS) return text;
+  let head = text.slice(0, REASONING_MAX_CHARS);
+  // Don't cut through a surrogate pair: a lone high surrogate at the boundary
+  // would render as U+FFFD (replacement char). Drop it so the head ends on a
+  // whole code point.
+  const lastUnit = head.charCodeAt(head.length - 1);
+  if (lastUnit >= 0xd800 && lastUnit <= 0xdbff) head = head.slice(0, -1);
+  return `${head.trimEnd()}\n… (reasoning truncated)`;
+};
+
 export type PermanentItem =
   | {
       kind: 'session-footer';
@@ -650,6 +677,9 @@ export type PermanentItem =
       app: string;
       version: string;
       model: string;
+      // Active isolation profile, or null/absent on the default namespace.
+      // Renders a boot-banner line so a dev/test run is obvious at a glance.
+      profile?: string | null;
       // Initial effort level (config/DEFAULT_EFFORT at boot). Rendered on the
       // banner's identity line beside the model; optional so non-CLI emitters
       // that omit it still produce a valid banner.
@@ -755,7 +785,7 @@ export type PermanentItem =
     }
   | { kind: 'error'; message: string }
   | { kind: 'warn'; message: string }
-  | { kind: 'info'; message: string; tone?: 'plain' | 'secondary' }
+  | { kind: 'info'; message: string; tone?: 'plain' | 'secondary'; header?: string }
   | {
       kind: 'operator-bash';
       command: string;
@@ -764,6 +794,10 @@ export type PermanentItem =
       durationMs: number;
     }
   | { kind: 'recap-terse'; message: string }
+  // Extended-thinking / reasoning block flushed at `thinking:end`. Rendered as
+  // a bold `reasoning:` label over a secondary-toned body (the model's scratch
+  // work, not the answer). `text` is already capped at flush.
+  | { kind: 'reasoning'; text: string }
   | {
       // `Subagent` group title — emitted by the `applyEvent` wrapper
       // before the FIRST subagent block of a consecutive run, so a burst
@@ -847,6 +881,8 @@ const batchHeadlineVerb = (name: string, childVerb: string, count: number): stri
       return `Wrote ${count} files`;
     case 'edit_file':
       return `Edited ${count} files`;
+    case 'git_apply_patch':
+      return `Applied ${count} patches`;
     case 'bash':
       return `Executed ${count} commands`;
     case 'grep':
@@ -1121,6 +1157,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           status: {
             ...state.status,
             model: event.model,
+            profile: event.profile ?? state.status.profile,
             contextWindow: event.contextWindow,
             operationMode: event.operationMode ?? state.status.operationMode,
             effort: event.effort ?? state.status.effort,
@@ -1132,6 +1169,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             app: event.app,
             version: event.version,
             model: event.model,
+            ...(event.profile !== undefined ? { profile: event.profile } : {}),
             ...(event.effort !== undefined ? { effort: event.effort } : {}),
             contextWindow: event.contextWindow,
             maxOutputTokens: event.maxOutputTokens,
@@ -1359,19 +1397,39 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           // (thinking precedes any text). `assistant:start` re-sets
           // it to the same messageId later — see that case.
           currentTurnId: event.messageId,
-          thinking: { startedAt: event.ts, messageId: event.messageId },
+          thinking: { startedAt: event.ts, messageId: event.messageId, text: '' },
         },
         permanent: [],
       };
 
-    case 'thinking:end':
     case 'thinking:delta':
-      // Delta events don't change state — duration is computed at render
-      // time from `startedAt`. End clears the indicator.
+      // Accumulate the reasoning text so `thinking:end` can flush it to
+      // scrollback. Duration is still computed at render time from `startedAt`.
       return {
-        state: event.type === 'thinking:end' ? { ...state, thinking: null } : state,
+        state: state.thinking
+          ? {
+              ...state,
+              // `event.text` is optional on the event contract (omitted for
+              // headless replay deltas). `?? ''` so a textless delta doesn't
+              // concatenate the literal string "undefined" into the buffer.
+              thinking: { ...state.thinking, text: state.thinking.text + (event.text ?? '') },
+            }
+          : state,
         permanent: [],
       };
+
+    case 'thinking:end': {
+      // Flush the accumulated reasoning as a scrollback `reasoning` block (bold
+      // label + secondary body), then clear the live indicator. Capped so an
+      // extended-thinking turn doesn't bury the conversation in grey text.
+      // Trim BEFORE capping: the guard already keys off `.trim()`, and capping
+      // the untrimmed text would persist leading/trailing blank lines that
+      // render as empty grey rows in the `reasoning:` block.
+      const reasoning = (state.thinking?.text ?? '').trim();
+      const permanent: PermanentItem[] =
+        reasoning.length > 0 ? [{ kind: 'reasoning', text: capReasoning(reasoning) }] : [];
+      return { state: { ...state, thinking: null }, permanent };
+    }
 
     case 'tool:start': {
       const tool: ActiveTool = {
@@ -1592,7 +1650,13 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       return {
         state: {
           ...state,
-          slash: empty ? null : { suggestions: event.suggestions, selectedIdx: event.selectedIdx },
+          slash: empty
+            ? null
+            : {
+                suggestions: event.suggestions,
+                selectedIdx: event.selectedIdx,
+                ...(event.ghost !== undefined ? { ghost: event.ghost } : {}),
+              },
         },
         permanent: [],
       };
@@ -1632,6 +1696,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             kind: 'info',
             message: event.message,
             ...(event.tone !== undefined ? { tone: event.tone } : {}),
+            ...(event.header !== undefined ? { header: event.header } : {}),
           },
         ],
       };
@@ -1941,7 +2006,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       //     bodies are still unattested. Confirm before they enter
       //     eager-load.
       //   - 'drift': stored hash diverged from current (usually
-      //     after a `git pull` touched `.agent/memory/shared/`).
+      //     after a `git pull` touched `.forja/memory/shared/`).
       //
       // Both modes share answer space: yes → re-stamp (after TOCTOU
       // recheck), no → bulk-invalidate, cancel → defer.
@@ -1963,7 +2028,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
 
       // SECURITY (P0/F1 hardening). Filenames flow from
       // disk-attacker-controlled readdirSync (an attacker with
-      // commit access to `.agent/memory/shared/` can name a file
+      // commit access to `.forja/memory/shared/` can name a file
       // `\x1b[2J\x1b[Hfake.md` and repaint the entire modal). The
       // sanitizer strips ANSI escapes, collapses \r/\n/\t to single
       // spaces, and caps length. `event.path` is operator-derived
@@ -1977,7 +2042,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // then a bounded inventory cap so a malicious corpus can't
       // explode the modal height. The cap is deliberately small —
       // operators with a large corpus should review the files
-      // outside the modal (e.g., `ls .agent/memory/shared/`); the
+      // outside the modal (e.g., `ls .forja/memory/shared/`); the
       // modal's job is to flag THAT something changed and let the
       // operator make a deliberate yes/no, not to be the audit UI.
       const MAX_LIST = 8;
@@ -1995,7 +2060,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         previewLines.push(
           'The shared memory corpus changed since you last confirmed trust.',
           'This commonly happens after a `git pull` that modifies, adds, or removes',
-          'files under `.agent/memory/shared/`. Review the current contents below:',
+          'files under `.forja/memory/shared/`. Review the current contents below:',
         );
       }
       previewLines.push('');
@@ -2064,7 +2129,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
     case 'history-clear:ask': {
       // Three options per HISTORY.md §2.3: clear-only, clear-and-
       // disable-permanently, no. `yes-disable` writes the
-      // `.agent/no-history` marker (spec §3.3 level 2) on top of
+      // `.forja/no-history` marker (spec §3.3 level 2) on top of
       // the wipe so subsequent REPLs in this project never
       // re-enable persistence without explicit operator action.
       const options: ConfirmOption[] = [

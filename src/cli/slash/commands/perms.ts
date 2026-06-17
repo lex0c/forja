@@ -15,7 +15,7 @@
 // edit took effect.
 //
 // Read-only by design. Editing policy goes through the YAML files
-// (`.agent/permissions.yaml` etc.) — keeps a single source of
+// (`.forja/permissions.yaml` etc.) — keeps a single source of
 // truth and avoids inventing a runtime mutation path that would
 // diverge from the on-disk format. Spec: AGENTIC_CLI §8.
 
@@ -232,6 +232,7 @@ const runWhy = (
 export const permsCommand: SlashCommand = {
   name: 'perms',
   description: 'show the active permission policy (or "/perms why <tool> [args]" for dry-check)',
+  argHint: '[why <tool>]',
   exec: async (args, ctx) => {
     if (args.length > 0 && args[0] === 'why') {
       return runWhy(args, ctx);

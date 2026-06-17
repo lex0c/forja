@@ -1,7 +1,7 @@
 import { parseCapability } from '../../permissions/capabilities.ts';
 import type { WorktreeOutcome } from '../../subagents/types.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
-import { childOutputHeadTail, summarizeChildEnvelope } from './task-shared.ts';
+import { childOutputHeadTail, playbookDirsHint, summarizeChildEnvelope } from './task-shared.ts';
 
 // `task` invokes a subagent (spec §11). The model passes a subagent
 // name (resolved against the harness-level registry) and a prompt;
@@ -14,8 +14,8 @@ import { childOutputHeadTail, summarizeChildEnvelope } from './task-shared.ts';
 
 export interface TaskInput {
   // Name of the subagent to spawn. Must match a kebab-case name
-  // discovered in either ~/.config/agent/agents/ (user scope) or
-  // <cwd>/.agent/agents/ (project scope; shadows user on collision).
+  // discovered in either ~/.config/forja/playbooks/ (user scope) or
+  // <cwd>/.forja/playbooks/ (project scope; shadows user on collision).
   subagent: string;
   // Initial user prompt for the child run. The child sees only this
   // — no parent history is leaked.
@@ -137,7 +137,7 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
         'subagent.unavailable',
         'subagents are not available in this run (no registry wired)',
         {
-          hint: 'The harness was built without subagentRegistry. Define agents under ~/.config/agent/agents/ or <cwd>/.agent/agents/ and bootstrap will pick them up.',
+          hint: `The harness was built without subagentRegistry. Define agents under ${playbookDirsHint()} and bootstrap will pick them up.`,
         },
       );
     }
@@ -232,7 +232,7 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
         hint:
           result.available.length > 0
             ? `Known subagents: ${result.available.join(', ')}.`
-            : 'No subagents are defined. Add a .md file under ~/.config/agent/agents/ or <cwd>/.agent/agents/.',
+            : `No subagents are defined. Add a .md file under ${playbookDirsHint()}.`,
         details: { available: result.available },
       });
     }

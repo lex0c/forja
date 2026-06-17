@@ -1,4 +1,4 @@
-// `agent permission policy-rollback <hash> [--target <file>] [--write] [--json]`
+// `forja permission policy-rollback <hash> [--target <file>] [--write] [--json]`
 // — §12.4 policy archive write surface. Dry-run by default (safety);
 // `--write` commits the canonical JSON bytes to the target YAML file
 // AND emits an audit row per spec line 756 ("Cada rollback é audit
@@ -22,13 +22,14 @@
 // captures the from/to hashes and target file.
 
 import { resolve as resolvePath } from 'node:path';
+import { projectDirName } from '../config/app-namespace.ts';
 import { type ReasonChainEntry, createSqliteSink, ensureInstallId } from '../permissions/index.ts';
 import { MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 import { getPolicyArchive } from '../storage/repos/policy-archive.ts';
 
 export interface RunPermissionPolicyRollbackOptions {
   hash: string;
-  // Default `.agent/permissions.yaml` (project-local). Resolved
+  // Default `.forja/permissions.yaml` (project-local). Resolved
   // against the runner's cwd unless absolute.
   target?: string;
   // When true, writes the canonical JSON bytes to `target` AND emits
@@ -64,7 +65,9 @@ const defaultReadFile = (path: string): string | null => {
   }
 };
 
-const DEFAULT_TARGET = '.agent/permissions.yaml';
+// A function so `--profile` set at CLI startup is honored (resolved at
+// call time, not module load).
+const defaultTarget = (): string => `${projectDirName()}/permissions.yaml`;
 
 export const runPermissionPolicyRollback = async (
   options: RunPermissionPolicyRollbackOptions,
@@ -78,7 +81,7 @@ export const runPermissionPolicyRollback = async (
   const writeFile = options.writeFile ?? defaultWriteFile;
   const readFile = options.readFile ?? defaultReadFile;
   const dbPath = options.dbPath ?? defaultDbPath();
-  const target = resolvePath(cwd, options.target ?? DEFAULT_TARGET);
+  const target = resolvePath(cwd, options.target ?? defaultTarget());
 
   // Establish install context (mirrors verify / grants for error
   // symmetry). When --write is set, we also need the identity for

@@ -14,7 +14,7 @@ const captured = () => {
   return { write: (s: string) => lines.push(s), lines };
 };
 
-describe('parseArgs — agent permission policy-rollback', () => {
+describe('parseArgs — forja permission policy-rollback', () => {
   test('hash positional captured', () => {
     const r = parseArgs(['permission', 'policy-rollback', 'sha256:abc']);
     expect(r.ok).toBe(true);
@@ -275,7 +275,7 @@ describe('runPermissionPolicyRollback', () => {
     expect(env_.error).toBe('not_found');
   });
 
-  test('default target is `.agent/permissions.yaml` relative to cwd', async () => {
+  test('default target is `.forja/permissions.yaml` relative to cwd', async () => {
     seedArchive([{ hash: HASH, canonical: CANONICAL }]);
     const targetBox: { path: string | null } = { path: null };
     await runPermissionPolicyRollback({
@@ -291,6 +291,6 @@ describe('runPermissionPolicyRollback', () => {
       out: captured().write,
       err: captured().write,
     });
-    expect(targetBox.path).toBe(join(tmp, '.agent/permissions.yaml'));
+    expect(targetBox.path).toBe(join(tmp, '.forja/permissions.yaml'));
   });
 });

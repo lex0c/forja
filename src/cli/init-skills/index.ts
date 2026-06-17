@@ -1,7 +1,7 @@
-// Bundled canonical skills (`SKILLS.md` §6 — seed catalog). The 20
+// Bundled canonical skills (`SKILLS.md` §6 — seed catalog). The 9
 // .md files in this directory are imported as text assets and
-// exposed as a stable array. The skills step of `agent init` writes
-// each entry into `<cwd>/.agent/skills/shared/`, where the catalog
+// exposed as a stable array. The skills step of `forja init` writes
+// each entry into `<cwd>/.forja/skills/shared/`, where the catalog
 // scan picks them up at the next REPL boot.
 //
 // Bun's `with { type: 'text' }` import attribute embeds the file
@@ -17,30 +17,18 @@
 //      `parseSkillFile` against every entry, so a malformed
 //      frontmatter is caught before the asset ships.
 
-import acquireForensicEvidenceMd from './acquire-forensic-evidence.md' with { type: 'text' };
 import addRegressionTestMd from './add-regression-test.md' with { type: 'text' };
 import bulkEditFilesMd from './bulk-edit-files.md' with { type: 'text' };
-import debugFailureMd from './debug-failure.md' with { type: 'text' };
-import diagnoseMemoryLeakMd from './diagnose-memory-leak.md' with { type: 'text' };
-import exploreCodebaseMd from './explore-codebase.md' with { type: 'text' };
 import gitBisectRegressionMd from './git-bisect-regression.md' with { type: 'text' };
 import gitRecoverLostWorkMd from './git-recover-lost-work.md' with { type: 'text' };
 import gitResolveConflictMd from './git-resolve-conflict.md' with { type: 'text' };
-import gitRewriteHistoryMd from './git-rewrite-history.md' with { type: 'text' };
-import hardenInputBoundaryMd from './harden-input-boundary.md' with { type: 'text' };
-import investigateSuspiciousHostMd from './investigate-suspicious-host.md' with { type: 'text' };
-import pgBlockedSessionsMd from './pg-blocked-sessions.md' with { type: 'text' };
-import pgHeavyQueriesMd from './pg-heavy-queries.md' with { type: 'text' };
-import profileHotspotMd from './profile-hotspot.md' with { type: 'text' };
-import reproduceBugMd from './reproduce-bug.md' with { type: 'text' };
-import reviewDiffMd from './review-diff.md' with { type: 'text' };
 import safeBulkDeleteMd from './safe-bulk-delete.md' with { type: 'text' };
 import threatModelComponentMd from './threat-model-component.md' with { type: 'text' };
 import triageFlakyTestMd from './triage-flaky-test.md' with { type: 'text' };
 
 export interface CanonicalSkill {
   // Filename at the destination
-  // (`<cwd>/.agent/skills/shared/<filename>`). Kept as `.md` so the
+  // (`<cwd>/.forja/skills/shared/<filename>`). Kept as `.md` so the
   // catalog's directory scan picks the file up alongside any
   // operator-authored skills.
   filename: string;
@@ -54,23 +42,11 @@ export interface CanonicalSkill {
 // order, so a stable sequence keeps the stdout report (and the
 // regression-test snapshot) predictable.
 export const CANONICAL_SKILLS: ReadonlyArray<CanonicalSkill> = [
-  { filename: 'acquire-forensic-evidence.md', content: acquireForensicEvidenceMd },
   { filename: 'add-regression-test.md', content: addRegressionTestMd },
   { filename: 'bulk-edit-files.md', content: bulkEditFilesMd },
-  { filename: 'debug-failure.md', content: debugFailureMd },
-  { filename: 'diagnose-memory-leak.md', content: diagnoseMemoryLeakMd },
-  { filename: 'explore-codebase.md', content: exploreCodebaseMd },
   { filename: 'git-bisect-regression.md', content: gitBisectRegressionMd },
   { filename: 'git-recover-lost-work.md', content: gitRecoverLostWorkMd },
   { filename: 'git-resolve-conflict.md', content: gitResolveConflictMd },
-  { filename: 'git-rewrite-history.md', content: gitRewriteHistoryMd },
-  { filename: 'harden-input-boundary.md', content: hardenInputBoundaryMd },
-  { filename: 'investigate-suspicious-host.md', content: investigateSuspiciousHostMd },
-  { filename: 'pg-blocked-sessions.md', content: pgBlockedSessionsMd },
-  { filename: 'pg-heavy-queries.md', content: pgHeavyQueriesMd },
-  { filename: 'profile-hotspot.md', content: profileHotspotMd },
-  { filename: 'reproduce-bug.md', content: reproduceBugMd },
-  { filename: 'review-diff.md', content: reviewDiffMd },
   { filename: 'safe-bulk-delete.md', content: safeBulkDeleteMd },
   { filename: 'threat-model-component.md', content: threatModelComponentMd },
   { filename: 'triage-flaky-test.md', content: triageFlakyTestMd },

@@ -1,7 +1,7 @@
 // Boot-time integration for memory governance defaults (Slice Q).
 //
 // Asserts:
-//   - Fresh repo (no `.agent/`, no user config) boots with both
+//   - Fresh repo (no `.forja/`, no user config) boots with both
 //     detectors resolved=ON via the hardcoded default.
 //   - `HarnessConfig.memorySemanticVerify` + `memoryConflictDetect`
 //     reflect the precedence chain (CLI > project > user > default).
@@ -185,9 +185,9 @@ describe('bootstrap: memory governance defaults', () => {
   });
 
   test('project config disabling verify suppresses banner + sets source', async () => {
-    mkdirSync(join(workdir, '.agent'), { recursive: true });
+    mkdirSync(join(workdir, '.forja'), { recursive: true });
     writeFileSync(
-      join(workdir, '.agent', 'config.toml'),
+      join(workdir, '.forja', 'config.toml'),
       `[memory]
 verify_semantic_llm = false
 conflict_detect_llm = true
@@ -217,9 +217,9 @@ conflict_detect_llm = true
     // XDG_CONFIG_HOME points at workdir -> user-layer file lives at
     // <workdir>/agent/config.toml (see userConfigPath in
     // src/config/loaders.ts).
-    mkdirSync(join(workdir, 'agent'), { recursive: true });
+    mkdirSync(join(workdir, 'forja'), { recursive: true });
     writeFileSync(
-      join(workdir, 'agent', 'config.toml'),
+      join(workdir, 'forja', 'config.toml'),
       `[memory]
 conflict_detect_llm = false
 `,
@@ -243,16 +243,16 @@ conflict_detect_llm = false
   });
 
   test('project wins over user when both touch verify', async () => {
-    mkdirSync(join(workdir, 'agent'), { recursive: true });
+    mkdirSync(join(workdir, 'forja'), { recursive: true });
     writeFileSync(
-      join(workdir, 'agent', 'config.toml'),
+      join(workdir, 'forja', 'config.toml'),
       `[memory]
 verify_semantic_llm = true
 `,
     );
-    mkdirSync(join(workdir, '.agent'), { recursive: true });
+    mkdirSync(join(workdir, '.forja'), { recursive: true });
     writeFileSync(
-      join(workdir, '.agent', 'config.toml'),
+      join(workdir, '.forja', 'config.toml'),
       `[memory]
 verify_semantic_llm = false
 `,
@@ -303,9 +303,9 @@ verify_semantic_llm = false
     // useless if the field actually opted out silently, and the
     // fallback is the very behavior that makes the warning
     // load-bearing.
-    mkdirSync(join(workdir, '.agent'), { recursive: true });
+    mkdirSync(join(workdir, '.forja'), { recursive: true });
     writeFileSync(
-      join(workdir, '.agent', 'config.toml'),
+      join(workdir, '.forja', 'config.toml'),
       '[memory]\nverify_semantic_llm = "false"\nconflict_detect_llm = "no"\noverride_detect_llm = 0\n',
     );
     const result = await bootstrap({
@@ -335,11 +335,11 @@ verify_semantic_llm = false
     }
   });
 
-  test('loads [memory] from repo-root .agent/config.toml when launched from a subdirectory (post-review)', async () => {
+  test('loads [memory] from repo-root .forja/config.toml when launched from a subdirectory (post-review)', async () => {
     // Pre-fix: loadMemoryConfig received the raw invocation cwd, so
-    // bootstrap from `<repo>/src/sub` read `<repo>/src/sub/.agent/
+    // bootstrap from `<repo>/src/sub` read `<repo>/src/sub/.forja/
     // config.toml` (nonexistent) and missed the operator's actual
-    // opt-out at `<repo>/.agent/config.toml`. Default-on detectors
+    // opt-out at `<repo>/.forja/config.toml`. Default-on detectors
     // re-enabled silently, LLM budget burned despite the configured
     // disable.
     //
@@ -353,9 +353,9 @@ verify_semantic_llm = false
     // config at the root. Bootstrap with cwd = subdir.
     const { spawnSync } = await import('node:child_process');
     spawnSync('git', ['init', '-q', workdir], { stdio: 'ignore' });
-    mkdirSync(join(workdir, '.agent'), { recursive: true });
+    mkdirSync(join(workdir, '.forja'), { recursive: true });
     writeFileSync(
-      join(workdir, '.agent', 'config.toml'),
+      join(workdir, '.forja', 'config.toml'),
       '[memory]\nverify_semantic_llm = false\n',
     );
     const subdir = join(workdir, 'src', 'components');
@@ -408,9 +408,9 @@ describe('bootstrap — auditConfigWarnings propagation', () => {
   // re-orders the bootstrap return) lands the failure here.
 
   test('malformed [audit.retention] value surfaces in BootstrapResult.auditConfigWarnings + falls back to defaults', async () => {
-    mkdirSync(join(workdir, '.agent'), { recursive: true });
+    mkdirSync(join(workdir, '.forja'), { recursive: true });
     writeFileSync(
-      join(workdir, '.agent', 'config.toml'),
+      join(workdir, '.forja', 'config.toml'),
       [
         '[audit.retention]',
         'context_pins = "ninety"', // string instead of int days
@@ -451,9 +451,9 @@ describe('bootstrap — auditConfigWarnings propagation', () => {
     // Operator typed `run_gc_on_stp` (missing 'o') — the typo
     // guard in parseLayer should fire AND the actual flag should
     // default to false (Stop-hook gc trigger remains off).
-    mkdirSync(join(workdir, '.agent'), { recursive: true });
+    mkdirSync(join(workdir, '.forja'), { recursive: true });
     writeFileSync(
-      join(workdir, '.agent', 'config.toml'),
+      join(workdir, '.forja', 'config.toml'),
       '[audit]\nrun_gc_on_stp = true\n', // typo: missing the second 'o'
     );
     const result = await bootstrap({
@@ -481,9 +481,9 @@ describe('bootstrap — auditConfigWarnings propagation', () => {
   });
 
   test('clean [audit] config produces an empty auditConfigWarnings array (no false positives)', async () => {
-    mkdirSync(join(workdir, '.agent'), { recursive: true });
+    mkdirSync(join(workdir, '.forja'), { recursive: true });
     writeFileSync(
-      join(workdir, '.agent', 'config.toml'),
+      join(workdir, '.forja', 'config.toml'),
       [
         '[audit]',
         'run_gc_on_stop = true',

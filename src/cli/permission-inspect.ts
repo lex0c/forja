@@ -1,4 +1,4 @@
-// `agent permission inspect <rotation_id> [--clear]` — PERMISSION_ENGINE.md
+// `forja permission inspect <rotation_id> [--clear]` — PERMISSION_ENGINE.md
 // §7.2 quarantine clearance flow.
 //
 // Slice 8 added the rotate-chain verb that archives the live audit
@@ -23,6 +23,7 @@ import {
   getLatestChainMeta,
   listChainMetaByInstall,
 } from '../storage/repos/chain-rotation.ts';
+import { forjaCommand } from './forja-command.ts';
 
 export interface RunPermissionInspectOptions {
   rotationId: number;
@@ -70,7 +71,9 @@ const renderText = (result: InspectResult, out: (s: string) => void): void => {
     out(
       `  Inspect with: SELECT * FROM approvals_log_archived WHERE archive_rotation_id = ${r.rotationId};\n`,
     );
-    out(`  Clear after inspection: agent permission inspect ${r.rotationId} --clear\n`);
+    out(
+      `  Clear after inspection: ${forjaCommand(`permission inspect ${r.rotationId} --clear`)}\n`,
+    );
   } else {
     out('  status:                 ✓ not quarantined\n');
   }
@@ -103,7 +106,7 @@ export const runPermissionInspect = async (
   const env = options.env ?? process.env;
 
   if (!Number.isInteger(options.rotationId) || options.rotationId <= 0) {
-    const message = `agent permission inspect: <rotation_id> must be a positive integer (got ${options.rotationId})`;
+    const message = `forja permission inspect: <rotation_id> must be a positive integer (got ${options.rotationId})`;
     if (json) {
       out(`${JSON.stringify({ ok: false, error: 'invalid_rotation_id', message })}\n`);
     } else {
@@ -120,7 +123,7 @@ export const runPermissionInspect = async (
     if (json) {
       out(`${JSON.stringify({ ok: false, error: 'install_id', message })}\n`);
     } else {
-      err(`agent permission inspect: ${message}\n`);
+      err(`forja permission inspect: ${message}\n`);
     }
     return 1;
   }
@@ -142,7 +145,7 @@ export const runPermissionInspect = async (
         })}\n`,
       );
     } else {
-      err(`agent permission inspect: ${message}\n`);
+      err(`forja permission inspect: ${message}\n`);
     }
     return 1;
   }
@@ -166,7 +169,7 @@ export const runPermissionInspect = async (
         })}\n`,
       );
     } else {
-      err(`agent permission inspect: ${message}\n`);
+      err(`forja permission inspect: ${message}\n`);
     }
     return 1;
   }

@@ -1,6 +1,6 @@
-// `agent doctor [--json]` — §13 platform provisioning health check.
+// `forja doctor [--json]` — §13 platform provisioning health check.
 //
-// First slice on §13 — foundation for future `agent sandbox setup`
+// First slice on §13 — foundation for future `forja sandbox setup`
 // + broker/worker arch. Runs a fixed set of checks and reports
 // status per check. Spec philosophy line 765: "detect, don't
 // distribute" — we probe the host, surface what's there, and
@@ -9,7 +9,7 @@
 // Checks:
 //   - platform: OS + architecture (informational, always ok).
 //   - sandbox: bwrap (linux) or sandbox-exec (macOS) availability.
-//   - config_dir: `~/.config/agent` writability — needed for
+//   - config_dir: `~/.config/forja` writability — needed for
 //     install_id + policy files.
 //   - data_dir: `~/.local/share/forja` writability — needed for
 //     the sessions DB.
@@ -33,6 +33,7 @@ import { execFileSync } from 'node:child_process';
 import { accessSync, existsSync, constants as fsConstants, mkdirSync, readFileSync } from 'node:fs';
 import { homedir, arch as nodeArch, platform as nodePlatform } from 'node:os';
 import { dirname, resolve as resolvePath } from 'node:path';
+import { activeProfile, appDirName } from '../config/app-namespace.ts';
 import {
   type SealStore,
   type VerifyResult,
@@ -47,6 +48,7 @@ import type { SandboxProfile } from '../permissions/sandbox-plan.ts';
 import type { SealPolicy } from '../permissions/types.ts';
 import { closeDb, defaultDbPath, openDb } from '../storage/index.ts';
 import { type DoctorCheckCache, getSharedDoctorCache, withDoctorCache } from './doctor-cache.ts';
+import { forjaCommand } from './forja-command.ts';
 
 export type DoctorStatus = 'ok' | 'warn' | 'fail';
 
@@ -78,7 +80,7 @@ export interface RunDoctorOptions {
   isExecutable?: (path: string) => boolean;
   // Working directory used by the sealing check's policy resolution.
   // Defaults to process.cwd() in production; tests pin a specific
-  // directory containing the relevant `.agent/permissions.yaml`.
+  // directory containing the relevant `.forja/permissions.yaml`.
   cwd?: string;
   // Test seams for `resolvePolicy` — match the CLI verbs' shape so
   // the same yaml fixtures work across surfaces. `null` disables the
@@ -282,12 +284,16 @@ const dataDirCheck = (env: NodeJS.ProcessEnv): DoctorCheck => {
   // defaultDataDir reads XDG_DATA_HOME / HOME from process.env;
   // override via env temporarily so the test seam works.
   const dir = (() => {
+    // appDirName(env) so `--profile dev` reports `~/.local/share/forja-dev`,
+    // matching where the session DB actually lands. Re-derived here (not via
+    // defaultDataDir) to honor the `env` test seam.
+    const app = appDirName(env);
     const xdg = env.XDG_DATA_HOME;
     if (xdg !== undefined && xdg.length > 0) {
-      return `${xdg}/forja`;
+      return `${xdg}/${app}`;
     }
     const home = env.HOME ?? homedir();
-    return `${home}/.local/share/forja`;
+    return `${home}/.local/share/${app}`;
   })();
   const probe = dirWritable(dir);
   if (probe.writable) {
@@ -390,19 +396,19 @@ const policyLoadCheck = (options: PolicyLoadCheckOptions): DoctorCheck => {
 
 // §7.2 + §13.3 hash chain health check (slice 62). Walks the
 // audit chain for the current install_id and reports integrity.
-// Mirrors what `agent permission verify` does, in a doctor-shaped
+// Mirrors what `forja permission verify` does, in a doctor-shaped
 // output: one line per outcome instead of the full forensic dump.
 //
 // Failure modes ranked:
 //   - `fail` — chain BROKEN at seq M with the verifier's reason.
 //     This is a P0 signal per spec line 1212
 //     (`chain_verification_failures_total > 0 = P0`). Operator
-//     remediation: full `agent permission verify` for details, or
-//     `agent permission rotate-chain` to archive the broken
+//     remediation: full `forja permission verify` for details, or
+//     `forja permission rotate-chain` to archive the broken
 //     segment.
 //   - `warn` — chain intact BUT quarantined (post-rotation segment
 //     unreviewed). Engine still works; operator should inspect via
-//     `agent permission inspect <rotation_id>`.
+//     `forja permission inspect <rotation_id>`.
 //   - `ok`   — chain intact, not quarantined. Reports the row
 //     count + rotation_id when non-zero.
 //
@@ -476,7 +482,7 @@ const chainCheck = (options: ChainCheckOptions): DoctorCheck => {
       status: 'fail',
       detail: `DB error: ${(e as Error).message}`,
       // Slice 127 (R3 P1): rename remediation so the operator
-      // knows that `agent permission verify` ALSO migrates the
+      // knows that `forja permission verify` ALSO migrates the
       // schema as a side effect (it's the operator-invoked verb
       // that brings the local DB up to spec). Pre-slice the
       // remediation said "for details" — misleading because the
@@ -484,7 +490,7 @@ const chainCheck = (options: ChainCheckOptions): DoctorCheck => {
       // doctor just flagged. The honest framing is "run verify
       // — it will migrate the schema if needed AND verify the
       // chain".
-      remediation: `check ${options.dbPath} for corruption / permissions, OR run \`agent permission verify\` which migrates the schema to the current spec and re-verifies the chain`,
+      remediation: `check ${options.dbPath} for corruption / permissions, OR run \`${forjaCommand('permission verify')}\` which migrates the schema to the current spec and re-verifies the chain`,
     };
   } finally {
     if (db !== null) {
@@ -503,8 +509,7 @@ const chainCheck = (options: ChainCheckOptions): DoctorCheck => {
       name: 'hash_chain',
       status: 'fail',
       detail: `BROKEN at seq ${result.brokenAt}: ${result.reason}`,
-      remediation:
-        'run `agent permission verify` for full diagnostic, or `agent permission rotate-chain --reason <text>` to archive the broken segment',
+      remediation: `run \`${forjaCommand('permission verify')}\` for full diagnostic, or \`${forjaCommand('permission rotate-chain --reason <text>')}\` to archive the broken segment`,
     };
   }
 
@@ -529,7 +534,7 @@ const chainCheck = (options: ChainCheckOptions): DoctorCheck => {
       name: 'hash_chain',
       status: 'warn',
       detail: `${baseDetail}${rotationDetail}, quarantined)`,
-      remediation: `run \`agent permission inspect ${result.current_rotation_id}\` to audit the archived segment`,
+      remediation: `run \`${forjaCommand(`permission inspect ${result.current_rotation_id}`)}\` to audit the archived segment`,
     };
   }
 
@@ -659,7 +664,7 @@ const sealingCheck = (options: SealingCheckOptions): DoctorCheck => {
         name: 'sealing',
         status: 'fail',
         detail: `seal file corrupted at ${sealConfig.path}: ${(e as Error).message}`,
-        remediation: 'inspect the file; run `agent permission seal-verify` for chain cross-check',
+        remediation: `inspect the file; run \`${forjaCommand('permission seal-verify')}\` for chain cross-check`,
       };
     }
     if (entries.length === 0) {
@@ -667,8 +672,7 @@ const sealingCheck = (options: SealingCheckOptions): DoctorCheck => {
         name: 'sealing',
         status: 'warn',
         detail: `${sealConfig.mode} at ${sealConfig.path}: configured but no entries yet`,
-        remediation:
-          'the engine seals automatically per interval; run `agent permission seal-now` to force one',
+        remediation: `the engine seals automatically per interval; run \`${forjaCommand('permission seal-now')}\` to force one`,
       };
     }
     const last = entries[entries.length - 1];
@@ -1106,6 +1110,7 @@ export const runDoctor = async (options: RunDoctorOptions = {}): Promise<number>
         kind: 'info',
         engine_version: engineVersion,
         capability_ceiling: capabilityCeiling,
+        profile: activeProfile(env),
       })}\n`,
     );
     out(
@@ -1128,7 +1133,15 @@ export const runDoctor = async (options: RunDoctorOptions = {}): Promise<number>
   // §13.3 derived info — capability ceiling + engine version.
   // Always rendered (informational, not pass/fail signals).
   out(`capability ceiling: [${capabilityCeiling.join(', ')}]\n`);
-  out(`engine version: ${engineVersion}\n\n`);
+  out(`engine version: ${engineVersion}\n`);
+  // Profile namespace — only printed when active, so default installs see no
+  // extra noise. A non-null value means every dir above is the isolated
+  // `forja-<profile>` variant, not the operator's real `forja` state.
+  const profile = activeProfile(env);
+  if (profile !== null) {
+    out(`profile: ${profile} (isolated namespace — not your default forja state)\n`);
+  }
+  out('\n');
   if (failCount === 0 && warnCount === 0) {
     out('summary: all checks passed\n');
   } else if (failCount === 0) {

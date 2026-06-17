@@ -24,8 +24,12 @@ import { RECAP_MINI_LIMITS, RECAP_MINI_SCHEMA_VERSION, type RecapMini } from './
 // Mirror of `FILE_WRITER_TOOLS` in src/recap/projection.ts. Kept
 // in sync by hand; the set is small and changes rarely. If a new
 // file-writing tool ships, both this file and projection.ts need
-// the entry.
-const FILE_WRITER_TOOLS: ReadonlySet<string> = new Set(['write_file', 'edit_file']);
+// the entry. (git_apply_patch is single-file, keyed by input.path.)
+const FILE_WRITER_TOOLS: ReadonlySet<string> = new Set([
+  'write_file',
+  'edit_file',
+  'git_apply_patch',
+]);
 
 // First user message content. Sessions almost always have at
 // least one (the original prompt); the rare race where the

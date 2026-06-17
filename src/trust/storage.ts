@@ -1,15 +1,15 @@
 // Trusted-directories storage. Spec: AGENTIC_CLI.md §9.1.
 //
 // The store is intentionally minimal: a flat list of
-// absolute paths in `~/.config/agent/trusted_dirs.json`. Once a path
+// absolute paths in `~/.config/forja/trusted_dirs.json`. Once a path
 // is added, subsequent boots from that cwd skip the trust prompt.
 //
 // Spec §9.1 also calls for an aggregate hash of the project's
-// `.agent/` content + `AGENTS.md`, with re-prompt on any change.
+// `.forja/` content + `AGENTS.md`, with re-prompt on any change.
 // That hardening is deferred to a follow-up slice; absent it, an
 // operator who clones into a previously-trusted path inherits the
 // trust without a re-confirm. Acceptable for the operator-driven
-// workflow we ship today (operator types `agent` in their own repo,
+// workflow we ship today (operator types `forja` in their own repo,
 // not in arbitrary cloned tree); the hash check is the right answer
 // when team-shared trust storage lands.
 //
@@ -57,11 +57,11 @@ export const isTrusted = (path: string, cwd: string): boolean =>
 // Append a directory to the trust list and persist atomically. If
 // the dir is already trusted, no-op (don't grow the file with
 // duplicates). Creates the parent directory as needed (e.g., first
-// ever forja boot when `~/.config/agent/` doesn't exist).
+// ever forja boot when `~/.config/forja/` doesn't exist).
 //
 // Atomic write via tmp-then-rename. POSIX `rename(2)` is atomic
 // when source and destination are on the same filesystem (always
-// true here — same parent dir). Two concurrent `agent` invocations
+// true here — same parent dir). Two concurrent `forja` invocations
 // approving from different terminals can still race the read
 // portion (A reads, B reads, A writes, B writes — B clobbers A's
 // new entry), but the file itself never lands in a corrupt half-

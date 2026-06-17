@@ -1,4 +1,4 @@
-// `agent gc` parser tests. Pins the subcommand shape so future arg
+// `forja gc` parser tests. Pins the subcommand shape so future arg
 // additions to other verbs don't swallow gc tokens, and the three
 // flags (`--force`, `--json`, `--table=X`) keep their parsed-to-config
 // mapping stable.
@@ -162,7 +162,7 @@ describe('parseArgs — independence from gc runtime', () => {
   test('args.ts does NOT statically import from audit/gc.ts (heavy graph)', () => {
     // Negative polarity: the runtime module pulls storage repos +
     // memory chain. parseArgs must NOT depend on those at module
-    // load time — `agent --help` / `--version` rely on it.
+    // load time — `forja --help` / `--version` rely on it.
     expect(argsSource).not.toMatch(/from\s+['"]\.\.\/audit\/gc\.ts['"]/);
   });
 

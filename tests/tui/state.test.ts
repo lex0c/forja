@@ -4,6 +4,7 @@ import {
   type LiveState,
   type PermanentItem,
   applyEvent,
+  capReasoning,
   createInitialState,
   flushPendingToolEndBatch,
   liveRegionActive,
@@ -52,7 +53,9 @@ describe('liveRegionActive', () => {
 
   test('also active for thinking / awaiting-provider (extracted logic intact)', () => {
     const base = createInitialState();
-    expect(liveRegionActive({ ...base, thinking: { startedAt: 0, messageId: 'm' } })).toBe(true);
+    expect(
+      liveRegionActive({ ...base, thinking: { startedAt: 0, messageId: 'm', text: '' } }),
+    ).toBe(true);
     expect(liveRegionActive({ ...base, awaitingProvider: { stepN: 1, startedAt: 0 } })).toBe(true);
     // Compaction chip animates its spinner + ticking [elapsed] — must keep
     // the scheduler awake or the chip freezes after a single frame.
@@ -711,12 +714,15 @@ describe('assistant streaming', () => {
 });
 
 describe('thinking lifecycle', () => {
-  test('start sets startedAt; end clears it; delta is a no-op', () => {
+  test('start sets startedAt; a textless delta keeps the buffer empty; end clears it', () => {
     const result = drive([
       { type: 'thinking:start', ts: 100, messageId: 'm1' },
+      // No `text` (allowed by the event contract) — must NOT concatenate the
+      // literal string "undefined" into the reasoning buffer.
       { type: 'thinking:delta', ts: 200, messageId: 'm1' },
     ]);
     expect(result.state.thinking?.startedAt).toBe(100);
+    expect(result.state.thinking?.text).toBe('');
     const after = applyEvent(result.state, { type: 'thinking:end', ts: 300, messageId: 'm1' });
     expect(after.state.thinking).toBeNull();
   });
@@ -2346,7 +2352,7 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
   test('options are Yes / No (session-allow option removed)', () => {
     // The previous option 2 ("Yes, don't ask again for: X") was
     // removed. The modal now only offers Yes / No — operator who
-    // needs a persistent rule edits `.agent/permissions.yaml`
+    // needs a persistent rule edits `.forja/permissions.yaml`
     // directly (or future `/perms` slash commands), with the full
     // layered policy view in front of them.
     const r = applyEvent(createInitialState(), {
@@ -2694,7 +2700,7 @@ describe('shared-trust:ask reducer (P0/F1 + P1/M2-rel)', () => {
     type: 'shared-trust:ask',
     ts: 1,
     promptId: 'p1',
-    path: overrides.path ?? '/repo/.agent/memory/shared',
+    path: overrides.path ?? '/repo/.forja/memory/shared',
     mode: overrides.mode,
     corpusFiles: overrides.corpusFiles ?? [{ name: 'alpha.md', bytes: 42 }],
   });
@@ -2812,7 +2818,7 @@ describe('shared-trust:ask reducer (P0/F1 + P1/M2-rel)', () => {
       initial,
       sharedTrustEvent({
         mode: 'drift',
-        path: '\x1b[31mfake\x1b[0m/.agent/memory/shared',
+        path: '\x1b[31mfake\x1b[0m/.forja/memory/shared',
       }),
     );
     const modal = r.state.modal;
@@ -2940,5 +2946,115 @@ describe('resumemode:ask reducer', () => {
       decision: 'full',
     });
     expect(closed.state.modal).toBeNull();
+  });
+});
+
+describe('slash:update ghost threading (inline arg-hint)', () => {
+  const sugg = [{ name: 'effort', description: 'set effort' }];
+
+  test('carries the ghost from the event onto state.slash', () => {
+    // The popover-nav fix depends on this: a nav re-emit re-sends the
+    // ghost and the reducer must mirror it so the hint survives ↑/↓.
+    const { state } = drive([
+      {
+        type: 'slash:update',
+        ts: 1,
+        suggestions: sugg,
+        selectedIdx: 0,
+        ghost: ' [low|medium|high]',
+      },
+    ]);
+    expect(state.slash?.ghost).toBe(' [low|medium|high]');
+  });
+
+  test('leaves ghost undefined when the event omits it (no exact match)', () => {
+    const { state } = drive([{ type: 'slash:update', ts: 1, suggestions: sugg, selectedIdx: 0 }]);
+    expect(state.slash).not.toBeNull();
+    expect(state.slash?.ghost).toBeUndefined();
+  });
+
+  test('the empty + -1 exit signal clears slash (and its ghost)', () => {
+    const { state } = drive([
+      {
+        type: 'slash:update',
+        ts: 1,
+        suggestions: sugg,
+        selectedIdx: 0,
+        ghost: ' [low|medium|high]',
+      },
+      { type: 'slash:update', ts: 2, suggestions: [], selectedIdx: -1 },
+    ]);
+    expect(state.slash).toBeNull();
+  });
+});
+
+describe('reasoning (extended-thinking) → scrollback', () => {
+  const drive = () => {
+    let s = createInitialState();
+    return (e: UIEvent): PermanentItem[] => {
+      const r = applyEvent(s, e);
+      s = r.state;
+      return r.permanent;
+    };
+  };
+
+  test('accumulates thinking deltas and flushes a reasoning block on thinking:end', () => {
+    const ev = drive();
+    expect(ev({ type: 'thinking:start', ts: 0, messageId: 'm1' })).toEqual([]);
+    expect(ev({ type: 'thinking:delta', ts: 1, messageId: 'm1', text: 'first ' })).toEqual([]);
+    expect(ev({ type: 'thinking:delta', ts: 2, messageId: 'm1', text: 'second' })).toEqual([]);
+    expect(ev({ type: 'thinking:end', ts: 3, messageId: 'm1' })).toEqual([
+      { kind: 'reasoning', text: 'first second' },
+    ]);
+  });
+
+  test('empty / whitespace-only reasoning flushes nothing', () => {
+    const ev = drive();
+    ev({ type: 'thinking:start', ts: 0, messageId: 'm1' });
+    ev({ type: 'thinking:delta', ts: 1, messageId: 'm1', text: '   ' });
+    expect(ev({ type: 'thinking:end', ts: 2, messageId: 'm1' })).toEqual([]);
+  });
+
+  test('a textless delta between text deltas does not inject "undefined"', () => {
+    const ev = drive();
+    ev({ type: 'thinking:start', ts: 0, messageId: 'm1' });
+    ev({ type: 'thinking:delta', ts: 1, messageId: 'm1', text: 'a' });
+    ev({ type: 'thinking:delta', ts: 2, messageId: 'm1' }); // no text
+    ev({ type: 'thinking:delta', ts: 3, messageId: 'm1', text: 'b' });
+    expect(ev({ type: 'thinking:end', ts: 4, messageId: 'm1' })).toEqual([
+      { kind: 'reasoning', text: 'ab' },
+    ]);
+  });
+
+  test('flush trims surrounding whitespace before capping (no leading blank rows)', () => {
+    const ev = drive();
+    ev({ type: 'thinking:start', ts: 0, messageId: 'm1' });
+    ev({ type: 'thinking:delta', ts: 1, messageId: 'm1', text: '\n\n  weighing options  \n' });
+    expect(ev({ type: 'thinking:end', ts: 2, messageId: 'm1' })).toEqual([
+      { kind: 'reasoning', text: 'weighing options' },
+    ]);
+  });
+});
+
+describe('capReasoning', () => {
+  test('passes short text through; caps long text with a marker', () => {
+    expect(capReasoning('short reasoning')).toBe('short reasoning');
+    const long = 'x'.repeat(3000);
+    const capped = capReasoning(long);
+    expect(capped.length).toBeLessThan(long.length);
+    expect(capped).toContain('reasoning truncated');
+  });
+
+  test('does not split a surrogate pair at the cut boundary', () => {
+    // 1499 ASCII chars, then an emoji (surrogate pair) straddling index 1500:
+    // the high surrogate is at 1499, low at 1500. A naive slice(0,1500) keeps
+    // the lone high surrogate → U+FFFD. capReasoning must drop it.
+    const text = `${'x'.repeat(1499)}😀${'y'.repeat(50)}`;
+    const capped = capReasoning(text);
+    const head = capped.split('\n')[0] ?? '';
+    expect(head.endsWith('�')).toBe(false);
+    // The trailing unit of the head must not be a lone high surrogate.
+    const lastUnit = head.charCodeAt(head.length - 1);
+    expect(lastUnit >= 0xd800 && lastUnit <= 0xdbff).toBe(false);
   });
 });

@@ -1,0 +1,10 @@
+name: 06-dispatch-review-current-branch
+# Regression: a bare "review the current branch" request (no diff pasted) was
+# performed INLINE — even by a strong model — instead of dispatching the
+# code-review playbook. The preamble's "default to answering directly" framing
+# pulled against dispatch despite the request being exactly the playbook's job.
+# The request names the job; it must route to code-review, not be re-implemented
+# with inline git/read calls.
+prompt: |-
+  faça code review da branch atual. branch origin: develop
+expect_dispatch: code-review

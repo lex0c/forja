@@ -233,6 +233,9 @@ export const TOOL_RESTRICTION_SHAPE: Readonly<Record<string, ToolRestrictionShap
   // "command string" or "path" shape.
   write_file: 'path',
   edit_file: 'path',
+  // git_apply_patch writes one file via a patch — same path-shaped fence as
+  // write_file/edit_file (its `path` arg is the gated, header-pinned target).
+  git_apply_patch: 'path',
   // Read-class path tools. read_file leaks file CONTENTS verbatim
   // and grep leaks matching LINES from any file the path arg
   // resolves to — both are content-disclosure surfaces a playbook
@@ -312,12 +315,39 @@ const PATH_EXTRACTOR: RestrictionExtractor = {
   },
 };
 
+// Path extractor for the file-class tools (write_file / edit_file / read_file /
+// git_apply_patch). These resolve their target with `file_path > path`
+// precedence (tools/builtin/_path-arg.ts `pathArgOf`; the engine's
+// `filePathOf`), so the restriction MUST gate the same field the tool acts on —
+// reading only `path` would let a child send `{ file_path: … }` and slip past
+// the playbook's allow_paths fence on a field the tool still honors. Search
+// tools (grep/git) stay on PATH_EXTRACTOR: the engine gates THEM on `args.path`
+// only (FS_TOOL_TRAITS rootArg), never the file_path alias.
+const FILE_PATH_EXTRACTOR: RestrictionExtractor = {
+  shape: 'path',
+  extract: (args) => {
+    if (args === null || typeof args !== 'object') return null;
+    const a = args as Record<string, unknown>;
+    if (typeof a.file_path === 'string' && a.file_path.length > 0) return a.file_path;
+    if (typeof a.path === 'string' && a.path.length > 0) return a.path;
+    return null;
+  },
+};
+
 export const TOOL_RESTRICTION_EXTRACTORS: Readonly<Record<string, RestrictionExtractor>> = {
   bash: BASH_EXTRACTOR,
   bash_background: BASH_EXTRACTOR,
-  write_file: PATH_EXTRACTOR,
-  edit_file: PATH_EXTRACTOR,
-  read_file: PATH_EXTRACTOR,
+  // File-class tools resolve `file_path > path`, so the fence honors the same
+  // alias (FILE_PATH_EXTRACTOR) — gating only `path` would leave a file_path
+  // bypass.
+  write_file: FILE_PATH_EXTRACTOR,
+  edit_file: FILE_PATH_EXTRACTOR,
+  read_file: FILE_PATH_EXTRACTOR,
+  // git_apply_patch is a single-path write tool (its `path` arg is the gated
+  // file, pinned to the patch header); fence it like write_file/edit_file.
+  // Without this entry the playbook's git_apply_patch.allow_paths is silently
+  // ignored and the child can patch any path the parent policy allows.
+  git_apply_patch: FILE_PATH_EXTRACTOR,
   grep: PATH_EXTRACTOR,
   // git's `path` arg is the fence target (same shape as grep); a
   // pathless git call returns null → refused when allow_paths is set.

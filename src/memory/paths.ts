@@ -1,5 +1,6 @@
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve, sep } from 'node:path';
+import { appDirName, projectDirName } from '../config/app-namespace.ts';
 import { getGitBinarySync, safeGitEnv } from '../subagents/git-binary.ts';
 import { validateName } from './frontmatter.ts';
 import type { MemoryScope } from './types.ts';
@@ -13,7 +14,7 @@ import type { MemoryScope } from './types.ts';
 // sandbox.
 //
 // Sandbox rule (spec §7.2 mitigation 6): "memória escrita só em
-// `~/.config/agent/memory/` e `./.agent/memory/`. Tentativa de
+// `~/.config/forja/memory/` e `./.forja/memory/`. Tentativa de
 // path traversal = erro fatal + audit." We enforce two layers:
 //
 //   1. The `name` parameter must pass frontmatter.validateName —
@@ -44,13 +45,13 @@ export interface ScopeRoots {
 // is one-shot per session and dominated by SQLite migrate.
 //
 // Why we need this: project memory is per-REPO, not per-cwd. An
-// operator invoking `agent` from `src/components/` inside a
+// operator invoking `forja` from `src/components/` inside a
 // repo at `/repo` must still see memories at
-// `/repo/.agent/memory/{shared,local}/` — without resolving the
-// repo root, we'd look under `/repo/src/components/.agent/...`
+// `/repo/.forja/memory/{shared,local}/` — without resolving the
+// repo root, we'd look under `/repo/src/components/.forja/...`
 // (which doesn't exist) and silently miss every project memory.
 // The user scope is unaffected because it lives outside the repo
-// (at `~/.config/agent/memory/` or `$XDG_CONFIG_HOME/agent/memory/`).
+// (at `~/.config/forja/memory/` or `$XDG_CONFIG_HOME/forja/memory/`).
 export const resolveRepoRoot = (cwd: string): string => {
   try {
     // Pinned git binary + canonical PATH (slice 178 hardening C2).
@@ -75,7 +76,7 @@ export const resolveRepoRoot = (cwd: string): string => {
   }
 };
 
-// User-scope root. Spec uses `~/.config/agent/memory/` literally;
+// User-scope root. Spec uses `~/.config/forja/memory/` literally;
 // that path follows the XDG convention, so we honor
 // `XDG_CONFIG_HOME` when set. Falls back to `~/.config` otherwise.
 // We deliberately do NOT use XDG_DATA_HOME or the project's
@@ -85,7 +86,7 @@ export const userScopeRoot = (env: NodeJS.ProcessEnv = process.env): string => {
   const xdg = env.XDG_CONFIG_HOME;
   const base =
     xdg !== undefined && xdg.length > 0 && isAbsolute(xdg) ? xdg : join(homedir(), '.config');
-  return join(base, 'agent', 'memory');
+  return join(base, appDirName(env), 'memory');
 };
 
 // Project-scope roots, derived from the current repo root. The
@@ -93,11 +94,11 @@ export const userScopeRoot = (env: NodeJS.ProcessEnv = process.env): string => {
 // `git rev-parse --show-toplevel` upstream) — this module does
 // not run git. When the operator runs the agent outside any
 // repo, the caller should pass the cwd itself; project memory
-// then lives in the working directory's `.agent/memory/` tree
+// then lives in the working directory's `.forja/memory/` tree
 // just like sessions.db does today.
 export const projectScopeRoots = (repoRoot: string): { shared: string; local: string } => ({
-  shared: join(repoRoot, '.agent', 'memory', 'shared'),
-  local: join(repoRoot, '.agent', 'memory', 'local'),
+  shared: join(repoRoot, projectDirName(), 'memory', 'shared'),
+  local: join(repoRoot, projectDirName(), 'memory', 'local'),
 });
 
 export const resolveScopeRoots = (
@@ -135,7 +136,7 @@ export const rootForScope = (roots: ScopeRoots, scope: MemoryScope): string => {
 // never write at the root path; the file would BE the directory).
 //
 // Both inputs must be already path-normalized via `resolve()` so
-// that a non-canonical caller-supplied root (e.g. `/repo/.agent/..`)
+// that a non-canonical caller-supplied root (e.g. `/repo/.forja/..`)
 // doesn't break the prefix comparison against a normalized
 // candidate. Callers in this module always do that before calling
 // in.
@@ -165,7 +166,7 @@ export const memoryFilePath = (roots: ScopeRoots, scope: MemoryScope, name: stri
   validateName(name);
   // Normalize BOTH the root and the candidate before the prefix
   // check. The caller's repoRoot might be non-canonical
-  // (e.g. `/repo/.agent/..`); without resolving the root, the
+  // (e.g. `/repo/.forja/..`); without resolving the root, the
   // sandbox would reject a semantically-correct path because the
   // candidate (post-resolve) wouldn't share the unnormalized
   // prefix. Resolve also collapses any leftover `..`/`.` from a
@@ -313,13 +314,13 @@ export const seedArchivedFilePath = (roots: ScopeRoots, name: string, ts: number
 // original frontmatter with `state: evicted`) so restore is a
 // cheap rename and the retention window has a single GC root.
 //
-// User scope: `~/.config/agent/memory/.tombstones/` — fully out
+// User scope: `~/.config/forja/memory/.tombstones/` — fully out
 // of any tree the operator might commit.
-// Project shared: `./.agent/memory/shared/.tombstones/` —
+// Project shared: `./.forja/memory/shared/.tombstones/` —
 // versioned in git (per §6.5.4) so eviction history is
 // observable cross-team; restore-via-git works past the
 // retention window.
-// Project local: `./.agent/memory/local/.tombstones/` —
+// Project local: `./.forja/memory/local/.tombstones/` —
 // gitignored by inheritance from the project default
 // `.gitignore` entry `memory/local/` (a prefix match catches
 // `memory/local/.tombstones/`). See MEMORY.md §2.5 for the

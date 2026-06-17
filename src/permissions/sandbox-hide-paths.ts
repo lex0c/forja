@@ -1,3 +1,5 @@
+import { appDirNames } from '../config/app-namespace.ts';
+
 // Canonical credential-path lists. Both the Linux bwrap runner
 // and the macOS sandbox-exec runner mask these paths inside every
 // sandbox profile to prevent the LLM from reading credentials
@@ -31,11 +33,11 @@
 
 // Directories masked as opaque empty directories inside the sandbox.
 //
-// `.config/agent` and `.config/forja`: the sandbox boundary isn't
-// a one-way valve — `home-rw` profile gives writable home, and
-// the sandboxed process can plant config that the NEXT boot's
-// bootstrap reads as authoritative:
-//   - `.config/agent/permissions.yaml` is the user-scope policy
+// `.config/forja`: the sandbox boundary isn't a one-way valve —
+// `home-rw` profile gives writable home, and the sandboxed process
+// can plant config that the NEXT boot's bootstrap reads as
+// authoritative:
+//   - `.config/forja/permissions.yaml` is the user-scope policy
 //     layer. A sandboxed call can rewrite it to disable sandbox,
 //     broaden allows, or set hostAllowed:true. Session N+1 boots
 //     under the tampered policy.
@@ -58,23 +60,36 @@
 // versions; even modern svn stores enough in this dir to ship to
 // a remote. Mask the `auth` subdir only, not all of
 // `.subversion` — the rest of svn config is legitimate to read.
-export const HIDE_PATHS_DIRS: readonly string[] = [
+// Static credential dirs (non-Forja). Forja's own config+data dirs are
+// appended, profile-aware, by `hidePathsDirs()`.
+const HIDE_PATHS_DIRS_BASE: readonly string[] = [
   '.ssh',
   '.aws',
   '.config/gcloud',
   '.config/azure',
   '.config/op',
   '.config/sops',
-  '.config/agent',
-  '.config/forja',
   '.gnupg',
   '.kube',
   '.terraform.d',
   '.ansible',
-  '.local/share/forja',
   '.rustup',
   '.subversion/auth',
 ];
+
+// A function (not a const) so `--profile` set at CLI startup is honored —
+// Forja's own dirs are resolved at call time. Masks BOTH the canonical
+// `.config/forja` + `.local/share/forja` AND, under a profile, the
+// `forja-<profile>` variants, so neither install's audit DB / install_id /
+// secrets leak into the other's sandbox. No profile ⇒ identical to the
+// pre-profile list (canonical only).
+export const hidePathsDirs = (env: NodeJS.ProcessEnv = process.env): readonly string[] => {
+  const own: string[] = [];
+  for (const seg of appDirNames(env)) {
+    own.push(`.config/${seg}`, `.local/share/${seg}`);
+  }
+  return [...HIDE_PATHS_DIRS_BASE, ...own];
+};
 
 // Individual files masked as non-existent / empty inside the
 // sandbox.

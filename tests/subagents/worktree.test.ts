@@ -133,19 +133,19 @@ describe('branchName', () => {
 describe('defaultWorktreeRoot', () => {
   test('honors XDG_CACHE_HOME when set', () => {
     const root = defaultWorktreeRoot({ XDG_CACHE_HOME: '/x/cache', HOME: '/h' });
-    expect(root).toBe('/x/cache/agent/worktrees');
+    expect(root).toBe('/x/cache/forja/worktrees');
   });
 
   test('falls back to ~/.cache when XDG_CACHE_HOME is empty', () => {
     const root = defaultWorktreeRoot({ HOME: '/h' });
-    expect(root).toBe('/h/.cache/agent/worktrees');
+    expect(root).toBe('/h/.cache/forja/worktrees');
   });
 
   test('treats explicitly empty XDG_CACHE_HOME as unset', () => {
     // Empty string is a common shell oddity; XDG spec treats it as
-    // "not set" — we honor that to avoid landing under '/agent/...'.
+    // "not set" — we honor that to avoid landing under '/forja/...'.
     const root = defaultWorktreeRoot({ XDG_CACHE_HOME: '', HOME: '/h' });
-    expect(root).toBe('/h/.cache/agent/worktrees');
+    expect(root).toBe('/h/.cache/forja/worktrees');
   });
 });
 
@@ -225,7 +225,7 @@ describe('createWorktree', () => {
       expect(threw).toBe(true);
       // Critical regression: the worktree dir was rolled back,
       // so the cache root is empty. Without rollback, an
-      // operator running `agent worktree gc` would see a stale
+      // operator running `forja worktree gc` would see a stale
       // entry that the run never produced.
       expect(readdirSync(worktreeRoot)).toEqual([]);
       // Branch was deleted (the rollback path runs `branch -D`).

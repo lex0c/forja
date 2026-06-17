@@ -156,4 +156,59 @@ describe('renderInput', () => {
     const out = renderInput({ value: 'x', cursor: 1 }, colored);
     expect(out[0]).not.toContain(`${CSI}2m`);
   });
+
+  test('commandGhost trails a fully-typed slash command (cursor at end)', () => {
+    const out = renderInput({ value: '/effort', cursor: 7 }, caps, {
+      commandGhost: ' [low|medium|high]',
+    });
+    expect(out).toEqual(['> /effort [low|medium|high]']);
+  });
+
+  test('commandGhost is painted secondary (SGR 90); the token keeps its accent', () => {
+    const out = renderInput({ value: '/effort', cursor: 7 }, colored, {
+      commandGhost: ' [low|medium|high]',
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0]).toContain(`${CSI}94m/effort`); // accent token
+    expect(out[0]).toContain(`${CSI}90m`); // secondary ghost
+    expect(out[0]).toContain('[low|medium|high]');
+  });
+
+  test('commandGhost works after a trailing space (no leading space in the hint)', () => {
+    const out = renderInput({ value: '/effort ', cursor: 8 }, caps, {
+      commandGhost: '[low|medium|high]',
+    });
+    expect(out).toEqual(['> /effort [low|medium|high]']);
+  });
+
+  test('commandGhost is hidden when the cursor is NOT at the line end', () => {
+    // Operator arrowed left — a trailing ghost would sit past the caret.
+    const out = renderInput({ value: '/effort', cursor: 3 }, caps, {
+      commandGhost: ' [low|medium|high]',
+    });
+    expect(out).toEqual(['> /effort']);
+  });
+
+  test('commandGhost is suppressed under dim (reverse-search owns the palette)', () => {
+    const out = renderInput({ value: '/effort', cursor: 7 }, colored, {
+      commandGhost: ' [low|medium|high]',
+      dimmed: true,
+    });
+    expect(out[0]).not.toContain('low|medium|high');
+  });
+
+  test('commandGhost is dropped rather than wrapped when it overflows the row', () => {
+    // cols=10: prompt(2)+/effort(7)=9; the 18-col hint would overflow, so
+    // the ghost is dropped (never wrapped onto a second row).
+    const narrow: Capabilities = { ...caps, cols: 10 };
+    const out = renderInput({ value: '/effort', cursor: 7 }, narrow, {
+      commandGhost: ' [low|medium|high]',
+    });
+    expect(out).toEqual(['> /effort']);
+  });
+
+  test('commandGhost is ignored for a non-slash buffer', () => {
+    const out = renderInput({ value: 'hello', cursor: 5 }, caps, { commandGhost: ' x' });
+    expect(out).toEqual(['> hello']);
+  });
 });

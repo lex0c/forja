@@ -26,6 +26,8 @@ const usage = '/model [<id>]';
 export const modelCommand: SlashCommand = {
   name: 'model',
   description: 'show or switch the active model',
+  // Derived from `usage` (its arg portion) so the two can't drift.
+  argHint: usage.slice(usage.indexOf(' ') + 1),
   exec: async (args, ctx) => {
     if (args.length === 0) {
       const provider = ctx.baseConfig.provider;

@@ -1,4 +1,4 @@
-// `agent permission revoke <id> [--reason <text>] [--json]` — revoke
+// `forja permission revoke <id> [--reason <text>] [--json]` — revoke
 // a §8 persisted grant. Idempotent per spec line 621: calling twice
 // on the same id is a no-op after the first call. Plain-text mode
 // reports whether THIS call performed the revocation or the grant

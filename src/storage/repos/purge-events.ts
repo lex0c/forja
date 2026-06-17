@@ -19,7 +19,7 @@
 //   1. No hash chain. Purge is an operational event, not a policy
 //      decision with replay semantics. Tampering with rows here
 //      doesn't break a verifiable chain — the trade-off is accepted
-//      because `agent purge` happens rarely and the cost of a chain
+//      because `forja purge` happens rarely and the cost of a chain
 //      (per-write read-modify-write, install-scoped genesis) is
 //      disproportionate to the threat model.
 //
@@ -93,7 +93,7 @@ export const insertPurgeEvent = (db: DB, input: InsertPurgeEventInput): PurgeEve
 // List purge events for a given cwd, most recent first. Bounded by
 // `limit` (default 50) so a hypothetical operator with thousands of
 // purges doesn't OOM the inspector. Used by future
-// `agent purge log` reader and by tests that pin the insert path.
+// `forja purge log` reader and by tests that pin the insert path.
 export const listPurgeEventsByCwd = (db: DB, cwd: string, limit = 50): PurgeEventRow[] => {
   return db
     .query(`${SELECT_ALL} WHERE cwd = ? ORDER BY ts DESC LIMIT ?`)

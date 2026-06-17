@@ -51,12 +51,14 @@ describe('constraints-prompt', () => {
     expect(CONSTRAINTS_PROMPT.toLowerCase()).toContain('smallest correct diff');
   });
 
-  test('CONSTRAINTS_PROMPT re-arms pin_context so the shipped tool is not dormant', () => {
-    // Regression guard: the only pin_context nudge used to live in
-    // the dissolved `# Task discipline` section. Without a prompt
-    // mention the tool ships but goes dormant (BACKLOG 2026-06-05),
-    // so the re-armed bullet is anchored here.
-    expect(CONSTRAINTS_PROMPT).toContain('pin_context');
+  test('CONSTRAINTS_PROMPT persistence nudge names the surviving mechanisms, not the withdrawn pin_context', () => {
+    // pin_context was withdrawn from the model-facing surface (BACKLOG
+    // 2026-06-15) because weak models pinned the re-injected guidance
+    // block instead of answering. The persistence bullet must NOT
+    // resurrect it, and must keep nudging memory_write for facts that
+    // outlive the context window.
+    expect(CONSTRAINTS_PROMPT).not.toContain('pin_context');
+    expect(CONSTRAINTS_PROMPT).toContain('memory_write');
     expect(CONSTRAINTS_PROMPT.toLowerCase()).toContain('compaction');
   });
 

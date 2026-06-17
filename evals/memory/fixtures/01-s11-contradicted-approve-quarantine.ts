@@ -24,10 +24,10 @@ export const fixture: MemoryGovernanceFixture = {
     memory: {
       scope: 'project_local',
       name: 'memory-layout-claim',
-      description: 'memories live in .agent/memory/',
+      description: 'memories live in .forja/memory/',
       type: 'project',
       source: 'user_explicit',
-      body: 'Forja memories live under `.agent/memory/` in the repo root.',
+      body: 'Forja memories live under `.forja/memory/` in the repo root.',
     },
     // The verify-semantic dispatcher's F8 hallucination guard
     // refuses contradicted verdicts whose evidence_paths don't
@@ -40,7 +40,7 @@ export const fixture: MemoryGovernanceFixture = {
   subagentOutput:
     'verdict: contradicted\n' +
     'confidence: 0.92\n' +
-    'claim_extracted: "memories live in .agent/memory/"\n' +
+    'claim_extracted: "memories live in .forja/memory/"\n' +
     'ground_truth_observed: "actual layout differs per src/x.ts"\n' +
     'evidence_paths:\n' +
     '  - src/x.ts\n',

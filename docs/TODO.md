@@ -99,7 +99,7 @@ Mass-quarantines `shared/` memories when operator revokes trust after a hash cha
 
 | Task | Description |
 |---|---|
-| **T5.1 ✅** | `shared/` content fingerprint — hash over canonical concat of `.agent/memory/shared/MEMORY.md` + every body file (sorted by name). Persisted in `shared_corpus_trust` (migration 055), keyed by absolute scope-root path. SHA-256 with `forja:shared-corpus:v1\n` domain separator and `filename\n<bytes-len>\n<bytes>\n` framing per file. `src/memory/trust-corpus.ts` exports `computeSharedFingerprint`, `getSharedTrust`, `setSharedTrust`, `clearSharedTrust`. 19 substrate tests. |
+| **T5.1 ✅** | `shared/` content fingerprint — hash over canonical concat of `.forja/memory/shared/MEMORY.md` + every body file (sorted by name). Persisted in `shared_corpus_trust` (migration 055), keyed by absolute scope-root path. SHA-256 with `forja:shared-corpus:v1\n` domain separator and `filename\n<bytes-len>\n<bytes>\n` framing per file. `src/memory/trust-corpus.ts` exports `computeSharedFingerprint`, `getSharedTrust`, `setSharedTrust`, `clearSharedTrust`. 19 substrate tests. |
 | **T5.2 ✅** | Boot-time re-prompt — `src/memory/trust-corpus-probe.ts` orchestrator runs the probe state machine (seeded / unchanged / reconfirmed / revoked / verify_failed). TUI flavor `shared-trust:ask` (`src/tui/events.ts`, `modal-manager.ts`, `state.ts`) renders a corpus inventory preview (file names + byte sizes, capped at 8 visible). Wired into `bootstrap.ts` BETWEEN GC sweeps AND `assembleMemorySection` so the bulk-invalidate landing on disk takes effect in this very boot's system prompt. REPL boot (`src/cli/repl.ts`) passes the modal callback + pre-subscribes stdin so the modal can receive input during bootstrap. 8 probe tests + 5 bootstrap integration tests. |
 | **T5.3 ✅** | On operator revoke → emit `trust_revoked` for every `state=active` shared memory; transition all to `invalidated` with `motivo=security` (NOT `quarantined` — per EVICTION.md §4.1, `active → quarantined` admits only `conflict`/`low_roi`; `active → invalidated` is the canonical target for security events). Already-quarantined shared memories are left alone (`quarantined → invalidated` admits only `shift`). The modal interaction IS the authorization — no governance proposal layer for the bulk transition. Also added: `src/cli/memory-prompt.ts` filters `state === 'invalidated'` from the eager-load section so the revocation removes invalidated memories from THIS session's system prompt (rather than requiring restart). |
 | **T5.4 ✅** | `/memory trust status` shows trust state + last hash + last re-confirm timestamp. Read-only inspector in `src/cli/slash/commands/memory.ts:handleTrust`. Renders four states: `never confirmed`, `in sync`, `DIVERGED` (upper-cased for visual weight), `VERIFY FAILED`. Hashes truncated to first 12 hex chars + ellipsis; inventory line reports file count + total bytes (counts MEMORY.md alongside body files since the fingerprint hashes both). Strict args validation refuses unknown subcommands AND extra args after `status`. 6 slash tests. |
@@ -167,7 +167,7 @@ THE detector for factual contradiction in memory subsystem. Shipped on `feat/mem
 
 | Task | Description |
 |---|---|
-| **T11.1** | Subagent definition `src/subagents/builtin/verify-semantic.md` (or `.agent/subagents/`, TBD per project convention) — system prompt frames input as adversarial, requires JSON output, enumerates allowed tools (read_file, grep, memory_read — read-only set). Output schema: `{verdict: "passed"|"contradicted"|"inconclusive", confidence: 0.0-1.0, claim_extracted: string, ground_truth_observed: string, evidence_paths: string[]}`. |
+| **T11.1** | Subagent definition `src/subagents/builtin/verify-semantic.md` (or `.forja/subagents/`, TBD per project convention) — system prompt frames input as adversarial, requires JSON output, enumerates allowed tools (read_file, grep, memory_read — read-only set). Output schema: `{verdict: "passed"|"contradicted"|"inconclusive", confidence: 0.0-1.0, claim_extracted: string, ground_truth_observed: string, evidence_paths: string[]}`. |
 | **T11.2** | Injection pre-check — `scanForInjection(memory.body)` runs BEFORE the body enters the subagent's input. Flagged bodies skip semantic verification entirely; emit `verify_skipped` stderr line. The trust filter's intent (untrusted bodies out of model windows) extends to governance subagent windows. |
 | **T11.3** | Scheduler dispatch — extend `createVerifyScheduler` so when the project heuristic returns `unknown`, the scheduler enqueues a SECONDARY task that dispatches the semantic subagent. Gated on `config.memorySemanticVerify === true` (opt-in flag in `HarnessConfig`, default false) so operators consciously enable LLM cost. **Pre-dispatch dedup guard:** before enqueueing, check `listProposalsForMemory(scope, name)` with `status='pending'` AND `kind='quarantine'`. If a pending proposal already exists for this memory, skip dispatch — avoids paying LLM cost to generate a proposal that would collide with the existing pending row anyway (T8.2's fingerprint UNIQUE index would refuse the INSERT). |
 | **T11.4** | Subagent runner integration — uses existing `task_async` infrastructure: subagent spawn carries its own sandbox profile (no fs.write, no bash, no network beyond tool whitelist), depth gate, cost budget. Reuses `subagent_runs` audit table for prompt_hash + model_id + structured_output capture. |
@@ -445,7 +445,7 @@ fix is mechanical.
 
 ---
 
-## Trust prompt: aggregate-hash re-prompt on `.agent/` / `AGENTS.md` change (`AGENTIC_CLI §9.1`)
+## Trust prompt: aggregate-hash re-prompt on `.forja/` / `AGENTS.md` change (`AGENTIC_CLI §9.1`)
 
 **Status:** the primary trust-prompt work is **done**. Both original
 pull-in signals fired during M3/M4: the modal UI landed (`modalManager`
@@ -457,9 +457,9 @@ explicit close-out; this entry now tracks only the **residual**.
 **What's already in:**
 
 - `src/trust/` subsystem (`paths.ts`, `storage.ts`, `index.ts`).
-- `~/.config/agent/trusted_dirs.json` persisted with absolute paths.
+- `~/.config/forja/trusted_dirs.json` persisted with absolute paths.
 - `askTrust` modal wired in REPL boot **before** opening the editor
-  or loading the rest of `.agent/` — fires on first-boot in a new
+  or loading the rest of `.forja/` — fires on first-boot in a new
   cwd; subsequent boots in a trusted cwd skip the prompt.
 - `[y/N]` answer flow with timeout + cancel paths covered by
   `tests/tui/modal-manager.test.ts` (slice 137 ops-3) and the
@@ -467,29 +467,29 @@ explicit close-out; this entry now tracks only the **residual**.
 
 **What's still deferred — aggregate hash + re-prompt:**
 
-Spec §9.1 calls for a hash of every loaded `.agent/` artifact +
+Spec §9.1 calls for a hash of every loaded `.forja/` artifact +
 `AGENTS.md`, stored alongside the trusted-dir entry. Re-prompt on
 any subsequent boot where the hash diverges (operator updated
-`.agent/permissions.yaml`, a new hook landed, AGENTS.md grew a
+`.forja/permissions.yaml`, a new hook landed, AGENTS.md grew a
 section). Storage explicitly documents this gap at
 `src/trust/storage.ts:8-13`:
 
 > "Spec §9.1 also calls for an aggregate hash of the project's
-> `.agent/` content + `AGENTS.md`, with re-prompt on any change.
+> `.forja/` content + `AGENTS.md`, with re-prompt on any change.
 > That hardening is deferred to a follow-up slice; absent it, an
 > operator who clones into a previously-trusted path inherits the
 > trust without a re-confirm."
 
 **Why this remainder is deferred:**
 
-1. **Threat shape today is narrow.** Operator types `agent` in
+1. **Threat shape today is narrow.** Operator types `forja` in
    their own repo, not in arbitrary cloned trees from third parties.
    The hash-mismatch class of attack assumes a trusted cwd whose
-   `.agent/` was rewritten between boots (by a co-located process or
+   `.forja/` was rewritten between boots (by a co-located process or
    by `git pull`-ing changes); plausible but not currently observed.
 2. **`inspect` mode is the real UX answer.** Spec wires the
    re-prompt to a `[y/N/inspecionar]` choice — "inspect" diffs
-   `.agent/` against the trusted hash and renders what changed.
+   `.forja/` against the trusted hash and renders what changed.
    That's a TUI subsystem of its own. Re-prompt without inspect is
    useless friction (operator just re-clicks `y`); inspect needs a
    diff renderer the project doesn't have yet.
@@ -505,7 +505,7 @@ Pull this back into scope when EITHER:
 - A team-shared trust storage scenario surfaces (more than one
   operator, or a cwd that team members `git pull` updates into).
   Hash mismatch becomes load-bearing the moment "an artifact under
-  `.agent/` changed between trusted boot and now" stops being a
+  `.forja/` changed between trusted boot and now" stops being a
   hypothetical.
 - MCP manifest trust lands. The `mcp_manifest_history` work
   expects the same hash-and-re-prompt machinery; bundle the work
@@ -966,7 +966,7 @@ Pull when EITHER:
 |---|---|---|
 | 1 | Discoverability: `--explain-permissions`, modal cites matching rule + layer, `/perms why <tool>` | ~2 weeks |
 | 2 | Pattern learning (opt-in): N-approval prompt to promote, `--learn-mode`, `/perms suggestions` | ~3 weeks |
-| 3 | Policy templates: `safe-readonly`, `trusted-fullstack`, `ci-locked`; `agent init --template=<name>` | ~1 week |
+| 3 | Policy templates: `safe-readonly`, `trusted-fullstack`, `ci-locked`; `forja init --template=<name>` | ~1 week |
 | 4 | AST-based bash matching; explicit relative-vs-absolute path glob semantics; rule composability (any-of / all-of) | ~2 weeks |
 | 5 | `/perms diff session`, `/perms commit` (promote session-allowlist to project layer with confirm), `/perms revert` | ~1 week |
 

@@ -6,7 +6,7 @@
 // eviction-events, etc.).
 //
 // Why this matters: cli/args.ts is loaded by EVERY agent
-// invocation, including `agent --help` and `agent --version`. If
+// invocation, including `forja --help` and `forja --version`. If
 // the parser pulled audit/gc.ts at module load time, those
 // lightweight commands would fail whenever any deep storage
 // dependency was unavailable (broken native binding, partial

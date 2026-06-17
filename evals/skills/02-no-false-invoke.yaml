@@ -10,14 +10,14 @@ prompt: |
   Read config.json and tell me the value of the "port" field.
 setup:
   files:
-    '.agent/skills/shared/changelog-entry.md': |
+    '.forja/skills/shared/changelog-entry.md': |
       ---
       name: changelog-entry
       description: Draft a changelog entry from a diff in the Keep a Changelog style.
       ---
       Draft one changelog line under the correct heading — Added,
       Changed, Fixed, or Removed. One user-facing sentence.
-    '.agent/skills/shared/git-bisect-regression.md': |
+    '.forja/skills/shared/git-bisect-regression.md': |
       ---
       name: git-bisect-regression
       description: Find the commit that introduced a regression with git bisect.

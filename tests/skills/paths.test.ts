@@ -11,25 +11,25 @@ import {
 import type { SkillScopeRoots } from '../../src/skills/paths.ts';
 
 const roots: SkillScopeRoots = {
-  user: '/home/dev/.config/agent/skills',
-  projectShared: '/repo/.agent/skills/shared',
-  projectLocal: '/repo/.agent/skills/local',
+  user: '/home/dev/.config/forja/skills',
+  projectShared: '/repo/.forja/skills/shared',
+  projectLocal: '/repo/.forja/skills/local',
 };
 
 describe('userScopeRoot', () => {
-  test('resolves <HOME>/.config/agent/skills on POSIX', () => {
-    expect(userScopeRoot({ HOME: '/home/dev' }, 'linux')).toBe('/home/dev/.config/agent/skills');
+  test('resolves <HOME>/.config/forja/skills on POSIX', () => {
+    expect(userScopeRoot({ HOME: '/home/dev' }, 'linux')).toBe('/home/dev/.config/forja/skills');
   });
 
   test('honors an absolute XDG_CONFIG_HOME', () => {
     expect(userScopeRoot({ XDG_CONFIG_HOME: '/custom/cfg' }, 'linux')).toBe(
-      '/custom/cfg/agent/skills',
+      '/custom/cfg/forja/skills',
     );
   });
 
   test('resolves the Windows APPDATA location', () => {
     expect(userScopeRoot({ APPDATA: 'C:\\Users\\dev\\AppData\\Roaming' }, 'win32')).toBe(
-      'C:\\Users\\dev\\AppData\\Roaming\\agent\\skills',
+      'C:\\Users\\dev\\AppData\\Roaming\\forja\\skills',
     );
   });
 
@@ -39,25 +39,25 @@ describe('userScopeRoot', () => {
 });
 
 describe('projectScopeRoots / resolveScopeRoots', () => {
-  test('places shared + local under .agent/skills', () => {
+  test('places shared + local under .forja/skills', () => {
     expect(projectScopeRoots('/repo')).toEqual({
-      shared: '/repo/.agent/skills/shared',
-      local: '/repo/.agent/skills/local',
+      shared: '/repo/.forja/skills/shared',
+      local: '/repo/.forja/skills/local',
     });
   });
 
   test('resolveScopeRoots combines the user + project roots', () => {
     expect(resolveScopeRoots('/repo', { XDG_CONFIG_HOME: '/cfg' }, 'linux')).toEqual({
-      user: '/cfg/agent/skills',
-      projectShared: '/repo/.agent/skills/shared',
-      projectLocal: '/repo/.agent/skills/local',
+      user: '/cfg/forja/skills',
+      projectShared: '/repo/.forja/skills/shared',
+      projectLocal: '/repo/.forja/skills/local',
     });
   });
 
   test('resolveScopeRoots carries a null user root through', () => {
     const resolved = resolveScopeRoots('/repo', {}, 'linux');
     expect(resolved.user).toBeNull();
-    expect(resolved.projectShared).toBe('/repo/.agent/skills/shared');
+    expect(resolved.projectShared).toBe('/repo/.forja/skills/shared');
   });
 });
 
@@ -76,7 +76,7 @@ describe('rootForScope', () => {
 describe('skillFilePath', () => {
   test('builds <root>/<name>.md for a valid name', () => {
     expect(skillFilePath(roots, 'project_shared', 'triage-flaky-test')).toBe(
-      '/repo/.agent/skills/shared/triage-flaky-test.md',
+      '/repo/.forja/skills/shared/triage-flaky-test.md',
     );
   });
 

@@ -67,7 +67,7 @@
     # host-passthrough cap), so home-rw is the only viable option.
     sandbox_capabilities:
       - "read-fs:**"
-      - "secret-access:~/.config/agent"
+      - "secret-access:~/.config/forja"
   expect:
     sandbox_profile: "home-rw"
 

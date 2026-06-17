@@ -68,8 +68,8 @@ const setupCwd = (): { workdir: string; userRoot: string; roots: ScopeRoots } =>
   const userRoot = mkdtempSync(join(tmpdir(), 'forja-mem-eval-user-'));
   const roots: ScopeRoots = {
     user: userRoot,
-    projectShared: join(workdir, '.agent', 'memory', 'shared'),
-    projectLocal: join(workdir, '.agent', 'memory', 'local'),
+    projectShared: join(workdir, '.forja', 'memory', 'shared'),
+    projectLocal: join(workdir, '.forja', 'memory', 'local'),
   };
   mkdirSync(roots.projectShared, { recursive: true });
   mkdirSync(roots.projectLocal, { recursive: true });

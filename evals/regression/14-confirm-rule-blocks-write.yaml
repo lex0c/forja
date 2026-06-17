@@ -5,7 +5,7 @@ prompt: |
   Do NOT retry under a different name, do NOT switch to a different tool.
 setup:
   files:
-    .agent/permissions.yaml: |
+    .forja/permissions.yaml: |
       defaults:
         mode: strict
       tools:

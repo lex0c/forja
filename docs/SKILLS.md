@@ -1,6 +1,6 @@
 # Forja Skills Operator Guide
 
-This document describes Forja's skills subsystem: what a skill is, where skill files live on disk, how the catalog resolves them, the tools the model uses to invoke them, the `/skill` command operators use day-to-day, the audit trail, and the seed catalog `agent init` installs.
+This document describes Forja's skills subsystem: what a skill is, where skill files live on disk, how the catalog resolves them, the tools the model uses to invoke them, the `/skill` command operators use day-to-day, the audit trail, and the seed catalog `forja init` installs.
 
 The canonical specification lives in `docs/spec/SKILLS.md` (PT-BR), with cross-cuts in `docs/spec/RETRIEVAL.md §3.4` (gating) and `docs/spec/AUDIT.md` (event tables). This document is the English-language operational reference; when the two diverge, the spec wins.
 
@@ -51,8 +51,8 @@ Storage and pure logic live under `src/skills/`; the audit table lives in `src/s
   ▼                      ▼                         ▼                          ▼
 src/tools/builtin/   src/cli/skills-prompt.ts   src/cli/slash/commands/   src/cli/init-skills/
 skill-invoke         assembleSkillCatalog       skill.ts                  CANONICAL_SKILLS
-skill-list           Section — the eager        /skill list/show/new      (20 seed skills,
-skill-show           `# Skills` prompt block    /promote/demote/delete    installed by `agent init`)
+skill-list           Section — the eager        /skill list/show/new      (8 seed skills,
+skill-show           `# Skills` prompt block    /promote/demote/delete    installed by `forja init`)
 ```
 
 One scan, two outputs: every scanned file becomes either a catalog **entry** (a resolved skill) or a **filtered** record (malformed, name-mismatched, or shadowed) — never silently dropped.
@@ -111,13 +111,13 @@ A skill lives in one of three scopes. Discovery is a **directory glob** — ther
 
 | Scope | Location | Git |
 |---|---|---|
-| `user` | `~/.config/agent/skills/<name>.md` (XDG; `%APPDATA%` on Windows) | personal, not in any repo |
-| `project_shared` | `<repo>/.agent/skills/shared/<name>.md` | committed — the team's skills |
-| `project_local` | `<repo>/.agent/skills/local/<name>.md` | gitignored — your private project skills |
+| `user` | `~/.config/forja/skills/<name>.md` (XDG; `%APPDATA%` on Windows) | personal, not in any repo |
+| `project_shared` | `<repo>/.forja/skills/shared/<name>.md` | committed — the team's skills |
+| `project_local` | `<repo>/.forja/skills/local/<name>.md` | gitignored — your private project skills |
 
-**Precedence: `project_local` > `project_shared` > `user`.** When the same `name` exists in more than one scope, the highest-precedence file wins; the others are recorded as `shadowed` (§4). `agent init` writes `skills/local/` into `.agent/.gitignore`, mirroring `memory/local/`.
+**Precedence: `project_local` > `project_shared` > `user`.** When the same `name` exists in more than one scope, the highest-precedence file wins; the others are recorded as `shadowed` (§4). `forja init` writes `skills/local/` into `.forja/.gitignore`, mirroring `memory/local/`.
 
-A fourth scope, `imported` (`.agent/skills/imported/<source>/<name>.md`), is reserved for v1's successor — see §11.
+A fourth scope, `imported` (`.forja/skills/imported/<source>/<name>.md`), is reserved for v1's successor — see §11.
 
 ---
 
@@ -214,7 +214,7 @@ A row carries `scope`, `skill_name`, `session_id` (nullable FK, `ON DELETE SET N
 
 Correlating `surfaced` against `invoked` per skill is the operator's signal for tuning a skill's `description`: a skill surfaced often but never invoked has a description that is not triggering. `recordSurface` is idempotent per session, so a resumed session does not double-count.
 
-The audit table is retained indefinitely in v1; a `pruneSkillEvents` + `agent gc` retention pass is a noted follow-up.
+The audit table is retained indefinitely in v1; a `pruneSkillEvents` + `forja gc` retention pass is a noted follow-up.
 
 ---
 
@@ -236,11 +236,11 @@ The model is trained to treat text inside `<skill>…</skill>` as a procedure to
 
 ## 10. The seed catalog
 
-`agent init` scaffolds a fifth artifact (after permissions, gitignore, config, playbooks): the seed skill catalog. The 20 canonical skills are bundled into the binary (`src/cli/init-skills/`, imported as text assets) and written into `<cwd>/.agent/skills/shared/` — the catalog scan picks them up at the next REPL boot.
+`forja init` scaffolds a fifth artifact (after permissions, gitignore, config, playbooks): the seed skill catalog. The 8 canonical skills are bundled into the binary (`src/cli/init-skills/`, imported as text assets) and written into `<cwd>/.forja/skills/shared/` — the catalog scan picks them up at the next REPL boot.
 
-The seed set spans git workflows (`git-bisect-regression`, `git-resolve-conflict`, `git-rewrite-history`, `git-recover-lost-work`), debugging and performance (`debug-failure`, `reproduce-bug`, `triage-flaky-test`, `profile-hotspot`, `diagnose-memory-leak`, `add-regression-test`), security and forensics (`threat-model-component`, `harden-input-boundary`, `investigate-suspicious-host`, `acquire-forensic-evidence`), databases (`pg-blocked-sessions`, `pg-heavy-queries`), bulk file operations (`bulk-edit-files`, `safe-bulk-delete`), and code comprehension and review (`explore-codebase`, `review-diff`).
+The seed set spans git workflows (`git-bisect-regression`, `git-resolve-conflict`, `git-recover-lost-work`), testing (`add-regression-test`, `triage-flaky-test`), security (`threat-model-component`), and bulk file operations (`bulk-edit-files`, `safe-bulk-delete`).
 
-`agent init --only=skills` re-runs just this step; `--force=skills` overwrites existing files. Each step is skip-if-exists, so a re-run after an operator's hand edits is safe.
+`forja init --only=skills` re-runs just this step; `--force=skills` overwrites existing files. Each step is skip-if-exists, so a re-run after an operator's hand edits is safe.
 
 ---
 

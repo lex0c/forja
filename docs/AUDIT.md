@@ -32,18 +32,18 @@ Scope: what works today, what's spec'd but deferred, what the operator workflows
 
 | Verb | Purpose |
 |---|---|
-| `agent permission verify` | Walk `approvals_log` chain, report integrity + first-mismatch row |
-| `agent permission seal-verify` | Cross-reference seal store against the chain (install_id bound, slice 128) |
-| `agent permission inspect <rotation_id> [--clear]` | Inspect a rotation segment (head, tail, row count, motive). `--clear` flips `chain_meta.quarantined=0` after operator review — REQUIRED to fully accept a rotation (every rotation defaults to quarantined). |
-| `agent permission replay <seq>` | Render a single audit row + reason chain + score + classifier + sandbox profile |
-| `agent permission diff <seq1> <seq2>` | Diff two rows field by field — primary scalars (tool, decision, confidence, score, classifier_hash, policy_hash, sandbox_profile, args_hash, session_id, plus `parent_approval_id` / `ttl_expires_at` / `install_id` added by slice 177), capabilities set diff (only-in-seq1 / only-in-seq2 / common), score_components per-key deltas, and the FULL reason chain rendered stage-by-stage (slice 177 — pre-slice the diff filtered out most chain entries via a mismatched local type) |
-| `agent permission rotate-chain --reason "<msg>"` | Archive current chain, start a new genesis (audit-loud) |
-| `agent permission seal-now` | Force an immediate seal of the current chain head |
-| `agent permission grants [--all]` | List active grants (operator-issued time-bound allow rules) |
-| `agent permission revoke <id>` | Revoke a grant by ID |
-| `agent permission policy-list` | List archived policy snapshots |
-| `agent permission policy-rollback <hash>` | Restore an archived policy |
-| `agent permission calibration-export [--json] [--since-days N] [--all-decisions]` | Export `(score, decision, outcome)` triples for offline regression (spec §6.3.2.2, slice 138) |
+| `forja permission verify` | Walk `approvals_log` chain, report integrity + first-mismatch row |
+| `forja permission seal-verify` | Cross-reference seal store against the chain (install_id bound, slice 128) |
+| `forja permission inspect <rotation_id> [--clear]` | Inspect a rotation segment (head, tail, row count, motive). `--clear` flips `chain_meta.quarantined=0` after operator review — REQUIRED to fully accept a rotation (every rotation defaults to quarantined). |
+| `forja permission replay <seq>` | Render a single audit row + reason chain + score + classifier + sandbox profile |
+| `forja permission diff <seq1> <seq2>` | Diff two rows field by field — primary scalars (tool, decision, confidence, score, classifier_hash, policy_hash, sandbox_profile, args_hash, session_id, plus `parent_approval_id` / `ttl_expires_at` / `install_id` added by slice 177), capabilities set diff (only-in-seq1 / only-in-seq2 / common), score_components per-key deltas, and the FULL reason chain rendered stage-by-stage (slice 177 — pre-slice the diff filtered out most chain entries via a mismatched local type) |
+| `forja permission rotate-chain --reason "<msg>"` | Archive current chain, start a new genesis (audit-loud) |
+| `forja permission seal-now` | Force an immediate seal of the current chain head |
+| `forja permission grants [--all]` | List active grants (operator-issued time-bound allow rules) |
+| `forja permission revoke <id>` | Revoke a grant by ID |
+| `forja permission policy-list` | List archived policy snapshots |
+| `forja permission policy-rollback <hash>` | Restore an archived policy |
+| `forja permission calibration-export [--json] [--since-days N] [--all-decisions]` | Export `(score, decision, outcome)` triples for offline regression (spec §6.3.2.2, slice 138) |
 | `agent perms` / `--explain-permissions` | Render merged effective policy with per-section layer attribution |
 
 ### 1.3 Deferred (spec-only, not yet implemented)
@@ -54,9 +54,9 @@ Scope: what works today, what's spec'd but deferred, what the operator workflows
 | `agent audit failures --since 7d` | AUDIT.md §6 | Reader primitives exist; CLI verb deferred |
 | `agent audit costs --by tool` | AUDIT.md §6 | Deferred |
 | `agent forensics <session>` | AUDIT.md §5 | Bundle generation deferred |
-| `agent gc` | AUDIT.md §10.3 | Retention sweep deferred |
+| `forja gc` | AUDIT.md §10.3 | Retention sweep deferred |
 | `redaction_events` table | AUDIT.md §3.3 | Pipeline partial (`telemetry/scrubbing.ts` exists); dedicated table not migrated |
-| Offline calibration regression (steps 2-5 of §6.3.2 plan) | PERMISSION_ENGINE.md §6.3.2 | Out-of-tree (operator tooling — Python/R/etc.) consumes the NDJSON emitted by `agent permission calibration-export --json` (slice 138, §6.3.2.2). Step 1 (triple extraction) is in-tree as of slice 138. |
+| Offline calibration regression (steps 2-5 of §6.3.2 plan) | PERMISSION_ENGINE.md §6.3.2 | Out-of-tree (operator tooling — Python/R/etc.) consumes the NDJSON emitted by `forja permission calibration-export --json` (slice 138, §6.3.2.2). Step 1 (triple extraction) is in-tree as of slice 138. |
 
 When operators ask about these features, the answer today is "the data is there, the CLI verb to surface it isn't". Reader functions are exported from `src/permissions/index.ts`, `src/failures/index.ts`, `src/outcomes/index.ts` for script-side use.
 
@@ -69,14 +69,14 @@ The simplest healthy-system operator routine:
 ```bash
 # Verify chain integrity. Walks every row, recomputes prev_hash → this_hash.
 # Bounded by per-install retention (~100k rows / 365d default).
-$ agent permission verify
+$ forja permission verify
 chain ok: 1842 rows from genesis at sha256:e5f3...
 no rotations, current rotation_id=0
 not quarantined
 
 # Verify seal store cross-references the chain. Only meaningful when sealing
 # is configured (worm-file / rfc3161 / git-anchored / s3-object-lock).
-$ agent permission seal-verify
+$ forja permission seal-verify
 seal ok: 367 entries against chain rows 1, 6, 11, ..., 1841
 last seal at 2026-05-13T14:23:11Z (worm-file backend)
 ```
@@ -89,8 +89,8 @@ Add to crontab for production environments:
 
 ```cron
 # Verify daily, alert on non-ok.
-0 4 * * * agent permission verify --json | jq -e '.ok' >/dev/null || mail -s "FORJA AUDIT BROKEN" you@example.com
-0 4 * * * agent permission seal-verify --json | jq -e '.ok' >/dev/null || mail -s "FORJA SEAL MISMATCH" you@example.com
+0 4 * * * forja permission verify --json | jq -e '.ok' >/dev/null || mail -s "FORJA AUDIT BROKEN" you@example.com
+0 4 * * * forja permission seal-verify --json | jq -e '.ok' >/dev/null || mail -s "FORJA SEAL MISMATCH" you@example.com
 ```
 
 The `--json` output is stable across versions (audit schema versioning per AUDIT.md §8). Operators who want JSON-only output for piping to alerting systems can request it on any read verb.
@@ -103,7 +103,7 @@ The risk-score `baseline-v2.0` weights (PERMISSION_ENGINE.md §6.3.2) are an inf
 
 ```bash
 # Text summary on stdout: how much data is in the window?
-$ agent permission calibration-export --since-days 30
+$ forja permission calibration-export --since-days 30
 calibration export — install_id=68ac9b74-b6d2-4683-ac42-3c96026f7fcb
 window: last 30 days
 triples: 1423
@@ -115,7 +115,7 @@ by decision:
   confirm-denied: 532
 
 # NDJSON on stdout for offline analysis; coverage summary on stderr.
-$ agent permission calibration-export --json --since-days 30 > triples.ndjson 2> coverage.txt
+$ forja permission calibration-export --json --since-days 30 > triples.ndjson 2> coverage.txt
 ```
 
 The default decision filter keeps `confirm-allowed` + `confirm-denied` only — those are the clean human labels. Auto-allow / auto-deny rows have zero direct outcome signal and would skew the regression; widen with `--all-decisions` only if your offline pipeline accounts for selection bias.
@@ -133,7 +133,7 @@ Use case: "Something went wrong yesterday. What did the agent do, and how was it
 ### 3.1 Find the session
 
 ```bash
-$ agent --list-sessions --since 24h
+$ forja --list-sessions --since 24h
 sess-7a3f...  2026-05-12 14:02  cost=$0.41 steps=12 status=done
 sess-9b8c...  2026-05-12 18:55  cost=$0.18 steps=4  status=error  ← likely
 sess-2d1e...  2026-05-13 09:11  cost=$0.62 steps=23 status=done
@@ -161,7 +161,7 @@ Row 19 is interesting: score 0.78 (above threshold 0.40) AND operator denied at 
 ### 3.3 Replay a specific decision
 
 ```bash
-$ agent permission replay 19
+$ forja permission replay 19
 Replay approval seq=19 (install_id=abc-...):
   ts:                 1715534148000
   tool:               bash (version=v1)
@@ -210,13 +210,13 @@ If the project policy has changed since the decision:
 ```bash
 # Default: replay against the policy that was active at decision time
 # (recovered from approvals_log.policy_hash → policy_archive).
-$ agent permission replay 19
+$ forja permission replay 19
 
 # Against current policy: would this decision still hold under today's rules?
-$ agent permission replay 19 --against-current-policy
+$ forja permission replay 19 --against-current-policy
 
 # Against a specific archived policy (e.g., to test a candidate change before rollback):
-$ agent permission replay 19 --against-archived-policy <hash>
+$ forja permission replay 19 --against-archived-policy <hash>
 ```
 
 The `policy drift` line in the output flags when the active policy hash differs from the row's `policy_hash`.
@@ -257,7 +257,7 @@ The composite max-wins is 0.2, below the 0.5 threshold — `harmless`. Calibrati
 
 ## 4. Sealing backends
 
-The hash chain inside the DB is only as trustworthy as the DB file. **External sealing** periodically commits a `(seq, hash)` pair to an out-of-DB store. Without a configured sealer, an attacker with root can rewrite the entire `approvals_log` consistently and `agent permission verify` will report `ok`.
+The hash chain inside the DB is only as trustworthy as the DB file. **External sealing** periodically commits a `(seq, hash)` pair to an out-of-DB store. Without a configured sealer, an attacker with root can rewrite the entire `approvals_log` consistently and `forja permission verify` will report `ok`.
 
 Four backends. Choose based on threat model + operational constraints.
 
@@ -268,7 +268,7 @@ Four backends. Choose based on threat model + operational constraints.
 Append-only file with `chattr +a` (Linux append-only attribute). Requires root for the initial `chattr` operation (subsequent appends do not).
 
 ```yaml
-# .agent/permissions.yaml or ~/.config/agent/permissions.yaml
+# .forja/permissions.yaml or ~/.config/forja/permissions.yaml
 seal:
   mode: worm-file
   path: /var/lib/forja/audit-seal.log
@@ -393,7 +393,7 @@ Operator perspective: pre-rotation data is preserved verbatim in the archived ta
 ### 5.2 Running a rotation
 
 ```bash
-$ agent permission rotate-chain --reason "annual handover"
+$ forja permission rotate-chain --reason "annual handover"
 chain rotated:
   rotation_id: 2
   pre-rotation tip: sha256:b3a1...
@@ -413,7 +413,7 @@ The `--reason` is required — rotation is audit-loud, and `chain_meta.reason` i
 Inspecting (without `--clear`) reports current quarantine state:
 
 ```bash
-$ agent permission inspect 2
+$ forja permission inspect 2
 Inspect rotation_id=2 (install_id=abc-...):
   rotated_at:             1715581200000
   reason:                 annual handover
@@ -423,13 +423,13 @@ Inspect rotation_id=2 (install_id=abc-...):
 
   Status: rotation segment is QUARANTINED — operator inspection required.
   Inspect with: SELECT * FROM approvals_log_archived WHERE archive_rotation_id = 2;
-  Clear after inspection: agent permission inspect 2 --clear
+  Clear after inspection: forja permission inspect 2 --clear
 ```
 
 After reviewing the archived rows (via the suggested SQL or a forensics tool), clear:
 
 ```bash
-$ agent permission inspect 2 --clear
+$ forja permission inspect 2 --clear
 Inspect rotation_id=2 (install_id=abc-...):
   rotated_at:             1715581200000
   reason:                 annual handover
@@ -442,14 +442,14 @@ Inspect rotation_id=2 (install_id=abc-...):
 
 The `--clear` flag flips `chain_meta.quarantined` from `1` to `0` and writes the change. Idempotent — re-running on an already-cleared rotation reports `(already clear — no change)`.
 
-`agent permission verify` reports `quarantined: true` in its JSON output as long as ANY rotation segment for the current install is quarantined. Operators wanting their nightly verify to stay green must clear each rotation after review.
+`forja permission verify` reports `quarantined: true` in its JSON output as long as ANY rotation segment for the current install is quarantined. Operators wanting their nightly verify to stay green must clear each rotation after review.
 
 ### 5.4 Accepting a broken chain
 
-`agent permission verify` reports break:
+`forja permission verify` reports break:
 
 ```bash
-$ agent permission verify
+$ forja permission verify
 chain BROKEN at seq=4521:
   expected this_hash: sha256:e5f3...
   actual this_hash:   sha256:d8a2...
@@ -464,7 +464,7 @@ chain BROKEN at seq=4521:
 Choice 3 is for environments where rotating is operationally expensive. The accept flag writes a `chain-break-accepted` audit row BEFORE the engine starts accepting new decisions:
 
 ```bash
-$ agent --accept-broken-chain
+$ forja --accept-broken-chain
 # Engine boots. First audit row is reason_chain=[{stage:'chain-break-accepted', ...}]
 # Subsequent decisions chain from the broken tip.
 # Future verify reports the original break PLUS the explicit accept.
@@ -493,7 +493,7 @@ checkpoints.ndjson
 subagent_outputs.ndjson
 traces.ndjson                # OTEL spans
 redaction_events.ndjson      # spec-only; pipeline partial today
-chain_verification.json      # result of `agent permission verify`
+chain_verification.json      # result of `forja permission verify`
 signature.sig                # cosign signature of manifest.json
 ```
 
@@ -514,7 +514,7 @@ sqlite3 $DB "SELECT json_object('session', json_group_array(json(*))) FROM sessi
 for table in messages tool_calls approvals approvals_log hook_runs failure_events outcome_signals memory_events checkpoints subagent_outputs; do
   sqlite3 $DB ".mode json" "SELECT * FROM $table WHERE session_id='$SESSION'" > $TMPDIR/$table.ndjson
 done
-agent permission verify --json > $TMPDIR/chain_verification.json
+forja permission verify --json > $TMPDIR/chain_verification.json
 tar -czf $OUT -C $TMPDIR .
 echo "wrote $OUT"
 ```
@@ -571,9 +571,9 @@ Total provider cost lives in `sessions.cost_usd_total` (and per-step in `cost_pr
 
 ## 8. Retention + garbage collection (deferred)
 
-Spec AUDIT.md §1.2 specifies per-table retention; `agent gc` is the planned sweep mechanism. **Status: not yet implemented.**
+Spec AUDIT.md §1.2 specifies per-table retention; `forja gc` is the planned sweep mechanism. **Status: not yet implemented.**
 
-Until `agent gc` ships, operators can run manual cleanup with the spec's retention defaults:
+Until `forja gc` ships, operators can run manual cleanup with the spec's retention defaults:
 
 ```bash
 # Delete sessions + cascading rows older than 90 days.
@@ -592,7 +592,7 @@ $ sqlite3 ~/.local/share/forja/audit.db \
 $ sqlite3 ~/.local/share/forja/audit.db "VACUUM;"
 ```
 
-**Important:** Manual DELETE on `approvals_log` requires care. The chain validates `prev_hash` linkage; deleting middle rows breaks `verify`. Always use `agent permission rotate-chain` to archive then purge atomically, not raw DELETE.
+**Important:** Manual DELETE on `approvals_log` requires care. The chain validates `prev_hash` linkage; deleting middle rows breaks `verify`. Always use `forja permission rotate-chain` to archive then purge atomically, not raw DELETE.
 
 ---
 
@@ -625,7 +625,7 @@ The `redaction_events` table is spec'd (AUDIT.md §3.3) but not yet migrated. Wh
 ## 10. Verification decision tree
 
 ```
-agent permission verify → ?
+forja permission verify → ?
 ├─ ok: 1842 rows, not quarantined
 │  └─ healthy. routine review only.
 │
@@ -658,8 +658,8 @@ agent permission verify → ?
    │
    └─ Operational paths after the diagnosis:
       ├─ Discard install: rm ~/.local/share/forja, re-init.
-      ├─ Rotate: agent permission rotate-chain --reason "<diagnosis>"
-      └─ Accept: agent --accept-broken-chain  (audit-loud; visible in chain_meta)
+      ├─ Rotate: forja permission rotate-chain --reason "<diagnosis>"
+      └─ Accept: forja --accept-broken-chain  (audit-loud; visible in chain_meta)
 ```
 
 ---

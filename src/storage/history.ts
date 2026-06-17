@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { projectDirName } from '../config/app-namespace.ts';
 import type { DB } from './db.ts';
 
 // HISTORY.md §1.3 — default cap, env-overridable. Read once at
@@ -29,7 +30,7 @@ export type HistoryOptOutReason = 'env' | 'file-marker';
 
 export const historyOptOutReason = (projectRoot: string): HistoryOptOutReason | null => {
   if (process.env.FORJA_NO_HISTORY === '1') return 'env';
-  if (existsSync(resolve(projectRoot, '.agent', 'no-history'))) return 'file-marker';
+  if (existsSync(resolve(projectRoot, projectDirName(), 'no-history'))) return 'file-marker';
   return null;
 };
 

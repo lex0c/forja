@@ -385,7 +385,7 @@ describe('runListSessions', () => {
       `INSERT INTO subagent_runs
          (session_id, name, scope, source_path, source_sha256, system_prompt,
           tools_whitelist, budget_max_steps, budget_max_cost_usd, captured_at)
-       VALUES (?, 'explore', 'project', '/p/.agent/agents/explore.md',
+       VALUES (?, 'explore', 'project', '/p/.forja/playbooks/explore.md',
                '${'a'.repeat(64)}', 'You are explore.', '["read_file"]', 5, 0.01, 0)`,
     ).run(child.id);
 

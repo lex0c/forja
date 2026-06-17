@@ -1,0 +1,27 @@
+name: edit-format nested-indent via edit_file
+prompt: |
+  In `src/nested.ts`, change the deeply-indented call `doStuff(x);` to
+  `doStuff(x, opts);` — preserve its exact indentation. Use edit_file. Reply
+  "done" when applied.
+setup:
+  gitInit: true
+  files:
+    src/nested.ts: |
+      function outer() {
+        if (cond) {
+          for (const x of items) {
+            doStuff(x);
+          }
+        }
+      }
+expect:
+  - tool_called: edit_file
+  - tool_not_called: git_apply_patch
+  - tool_not_called: write_file
+  - file_contains:
+      path: src/nested.ts
+      pattern: doStuff(x, opts);
+  - status: done
+budget:
+  maxSteps: 6
+  maxCostUsd: 0.20

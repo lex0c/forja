@@ -85,6 +85,20 @@ describe('engine.check (paths)', () => {
     expect(eng.check('write_file', 'fs.write', { path: 'src/foo.ts' }).kind).toBe('allow');
   });
 
+  test('git_apply_patch shares the write_file section (single-path, same rules)', () => {
+    const eng = createPermissionEngine(
+      policy({
+        tools: { write_file: { allow_paths: ['src/**'], deny_paths: ['**/.env*'] } },
+      }),
+      { cwd: CWD },
+    );
+    // Gated as a single path from the `path` arg, governed by tools.write_file.
+    expect(eng.check('git_apply_patch', 'fs.write', { path: 'src/foo.ts' }).kind).toBe('allow');
+    expect(eng.check('git_apply_patch', 'fs.write', { path: 'src/.env' }).kind).toBe('deny');
+    // Outside the allow_paths grant → not allowed.
+    expect(eng.check('git_apply_patch', 'fs.write', { path: 'other/x.ts' }).kind).not.toBe('allow');
+  });
+
   test('read_file: deny_paths blocks reads', () => {
     const eng = createPermissionEngine(
       policy({ tools: { read_file: { deny_paths: ['**/.env*'] } } }),
@@ -979,6 +993,20 @@ describe('engine.check (search tools: glob/grep)', () => {
     );
     expect(eng.check('git', 'fs.read', { mode: 'status' }).kind).toBe('allow');
     expect(eng.check('git', 'fs.read', { mode: 'log' }).kind).toBe('allow');
+  });
+
+  test('empty-string path is treated as omitted (resolves to cwd), not denied', () => {
+    // Regression: git/grep treat `path: ''` as omitted (repo-wide; models often
+    // emit it), but the engine denied it as "missing or non-string path" — so a
+    // repo-wide `git status` with `path: ''` was wrongly blocked while the same
+    // call with the arg absent passed. Empty string now resolves to cwd like an
+    // absent arg (the pathless case above), matching the tool's convention.
+    const eng = createPermissionEngine(
+      policy({ tools: { read_file: { allow_paths: ['./**'] } } }),
+      { cwd: CWD },
+    );
+    expect(eng.check('git', 'fs.read', { mode: 'status', path: '' }).kind).toBe('allow');
+    expect(eng.check('git', 'fs.read', { mode: 'log', path: '' }).kind).toBe('allow');
   });
 
   test('git with a path is checked against the read_file allow_paths', () => {
@@ -1985,7 +2013,7 @@ describe('addSessionAllow (runtime "Yes, don\'t ask again for: <rule>")', () => 
 
 describe('engine.check — protected paths (§11 integration)', () => {
   // Most tests cwd at /work/proj so we have a stable handle on
-  // `.git/`, `.agent/`, `.claude/` for cwd-relative protected dirs.
+  // `.git/`, `.forja/`, `.claude/` for cwd-relative protected dirs.
   const PROJ = '/work/proj';
   const HOME = '/home/op';
 
@@ -2089,7 +2117,7 @@ describe('engine.check — protected paths (§11 integration)', () => {
     );
   });
 
-  test('cwd-relative protected dirs (.git/, .agent/, .claude/) escalate writes', () => {
+  test('cwd-relative protected dirs (.git/, .forja/, .claude/) escalate writes', () => {
     const eng = createPermissionEngine(policy({ tools: { write_file: { allow_paths: ['**'] } } }), {
       cwd: PROJ,
       home: HOME,
@@ -2098,7 +2126,7 @@ describe('engine.check — protected paths (§11 integration)', () => {
       'confirm',
     );
     expect(
-      eng.check('write_file', 'fs.write', { path: '/work/proj/.agent/sessions.db' }).kind,
+      eng.check('write_file', 'fs.write', { path: '/work/proj/.forja/sessions.db' }).kind,
     ).toBe('confirm');
     expect(
       eng.check('write_file', 'fs.write', { path: '/work/proj/.claude/settings.json' }).kind,

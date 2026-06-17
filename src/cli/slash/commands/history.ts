@@ -13,7 +13,7 @@
 // — the storage layer and the in-memory mirror in repl.ts agree on
 // that key, so cross-project entries can never bleed in.
 //
-// Permanent opt-outs (`FORJA_NO_HISTORY=1` env, `.agent/no-history`
+// Permanent opt-outs (`FORJA_NO_HISTORY=1` env, `.forja/no-history`
 // file marker) are checked downstream of this command — `appendHistory`
 // / `loadHistory` no-op in the storage layer regardless of what
 // `/history on` says, and we surface that asymmetry to the operator
@@ -21,6 +21,7 @@
 
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { projectDirName } from '../../../config/app-namespace.ts';
 import { HISTORY_CAP, clearHistory, countHistory, loadHistory } from '../../../storage/history.ts';
 import type { SlashCommand, SlashContext } from '../types.ts';
 
@@ -71,14 +72,14 @@ const wipe = (ctx: SlashContext, alsoDisable: boolean): string[] => {
   const notes = ['history cleared'];
   if (alsoDisable) {
     // Permanent per-project opt-out (HISTORY.md §3.3 level 2).
-    // `mkdir -p .agent` in case bootstrap hasn't created it yet
+    // `mkdir -p .forja` in case bootstrap hasn't created it yet
     // (early projects; rare). The marker is empty — its existence
     // alone is the signal storage checks.
-    const agentDir = join(ctx.baseConfig.cwd, '.agent');
+    const agentDir = join(ctx.baseConfig.cwd, projectDirName());
     try {
       mkdirSync(agentDir, { recursive: true });
       writeFileSync(join(agentDir, 'no-history'), '');
-      notes.push('persistence disabled — .agent/no-history written');
+      notes.push('persistence disabled — .forja/no-history written');
       // Mirror in-session: the file marker disables persistence
       // even if the operator later runs `/history on`, so we flip
       // the session flag too for consistency between what they
@@ -86,7 +87,7 @@ const wipe = (ctx: SlashContext, alsoDisable: boolean): string[] => {
       ctx.history?.setEnabled(false);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      notes.push(`warning: could not write .agent/no-history (${msg})`);
+      notes.push(`warning: could not write .forja/no-history (${msg})`);
     }
   }
   return notes;
@@ -143,8 +144,8 @@ const handleOn = (ctx: SlashContext): string[] => {
   }
   if (reason === 'file-marker') {
     return [
-      '/history on refused — .agent/no-history marker is present',
-      'remove .agent/no-history and run /history on again to re-enable',
+      '/history on refused — .forja/no-history marker is present',
+      'remove .forja/no-history and run /history on again to re-enable',
     ];
   }
   ctx.history.setEnabled(true);
@@ -154,6 +155,7 @@ const handleOn = (ctx: SlashContext): string[] => {
 export const historyCommand: SlashCommand = {
   name: 'history',
   description: 'manage REPL input history (list/clear/off/on)',
+  argHint: 'list|clear|off|on',
   exec: async (args, ctx) => {
     const sub = args[0];
     if (sub === undefined) {

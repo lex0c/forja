@@ -4,7 +4,7 @@ prompt: |
   Reply with the exact output of the command, nothing else.
 setup:
   files:
-    .agent/permissions.yaml: |
+    .forja/permissions.yaml: |
       defaults:
         mode: strict
       tools:

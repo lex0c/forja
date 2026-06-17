@@ -10,13 +10,15 @@
 // The reducer in `state.ts` builds the `PermanentItem` records and
 // never sees `caps`.
 
-import { sanitizeOneLineForDisplay } from '../../sanitize/ansi.ts';
+import wrapAnsi from 'wrap-ansi';
+import type { DiffLine } from '../../diff/line-diff.ts';
+import { SAFE_ONE_LINE_MAX, sanitizeOneLineForDisplay } from '../../sanitize/ansi.ts';
 import type { PermanentItem } from '../state.ts';
 import { type Capabilities, paint, paintMulti, reverse } from '../term.ts';
 import { shortToolName, toolNoun } from '../tool-vocab.ts';
 import { shortenCwd } from './cwd.ts';
 import { formatChipDuration, formatCoarseDuration } from './duration.ts';
-import { padFrame } from './frame.ts';
+import { frameWidth, padFrame } from './frame.ts';
 import { ellipsisGlyph, subContentConnector, treeBranchConnector } from './glyphs.ts';
 import { renderMarkdown } from './markdown.ts';
 import { visualWidth } from './width.ts';
@@ -163,6 +165,12 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
         paint(caps, 'secondary', identity),
         paint(caps, 'secondary', shortenCwd(item.cwd, item.home ?? '', caps)),
       ];
+      // Isolation-profile line — only when active. `warn` (yellow), like the
+      // sandbox-warning channel: a standing flag that this run writes to an
+      // isolated `forja-<profile>` namespace, not the operator's real state.
+      if (item.profile !== undefined && item.profile !== null) {
+        lines.push(paint(caps, 'warn', `profile: ${item.profile} (isolated namespace)`));
+      }
       return lines.map(padFrame);
     }
     case 'user-submit': {
@@ -245,14 +253,16 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // match" of grep or a failed `test`, so it flags, not alarms.
       const exitMark =
         item.exitCode !== undefined ? paint(caps, 'warn', `  exit ${item.exitCode}`) : '';
-      // Diff counts (write/edit): +added in success tone, -removed in
-      // error tone, on the head — a GitHub-style summary. ASCII signs so
-      // they read on non-unicode terminals too.
+      // Diff counts (write/edit): +added in success tone, -removed in error
+      // tone — a GitHub-style summary. ASCII signs so they read on non-unicode
+      // terminals too. Rendered on the FILE-PATH (sub-content) line, not the
+      // head: it sits right next to the path it describes, and keeps the head a
+      // clean `verb [Xms]`. Empty when there's no diff.
       const counts =
         item.diff !== undefined
           ? `  ${paint(caps, 'success', `+${item.diff.added}`)} ${paint(caps, 'error', `-${item.diff.removed}`)}`
           : '';
-      const head = `${paint(caps, headTone, headRaw)}${counts}${exitMark}${metric}`;
+      const head = `${paint(caps, headTone, headRaw)}${exitMark}${metric}`;
       // Leading blank (UI.md §6.3) — each tool finalization is its
       // own "session" block; the operator scrolls and sees each tool
       // (chip + sub-content) as a self-contained unit instead of a
@@ -296,17 +306,61 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // the sub-content too so the connector lines under the nest
       // glyph stay visually tied to the nested chip head.
       if (subText !== null) {
-        lines.push(paint(caps, 'secondary', `${indent}${sub}${subText}`));
+        // Counts ride here, after the path, in their own green/red — so the
+        // subject stays secondary while `+N -M` keeps its semantic color.
+        // For write/edit (diff present) the subText IS the changed file path,
+        // so bold it as the card's anchor (still secondary-toned); other
+        // subjects (bash command, error reason) stay plain secondary. The
+        // connector stays non-bold so only the path itself is emphasized.
+        const subjectPainted =
+          item.diff !== undefined
+            ? `${paint(caps, 'secondary', `${indent}${sub}`)}${paintMulti(caps, ['secondary', 'bold'], subText)}`
+            : paint(caps, 'secondary', `${indent}${sub}${subText}`);
+        lines.push(`${subjectPainted}${counts}`);
+      } else if (counts !== '') {
+        // Diff but no vocab subject (shouldn't happen for write/edit, which
+        // always carry a path) — still surface the counts under the connector.
+        lines.push(`${paint(caps, 'secondary', `${indent}${sub}`)}${counts.trimStart()}`);
       }
       // Diff snippet (write/edit): the first changed region under the
       // card — add in success tone, del in error tone, context dim. Each
       // line is sanitized (file content is untrusted: strip ANSI/control
       // and cap width) so it can't hijack the terminal.
       if (item.diff !== undefined) {
+        // Line-number gutter: new-file number for surviving/added lines,
+        // old-file for deletions (`newLine ?? oldLine`). Right-aligned to the
+        // widest number so the `│` rail lines up. The NUMBER takes the line's
+        // own tone (add green / del red / ctx dim) so it reads as part of the
+        // change; only the `│` rail stays `secondary` (grey) as a neutral
+        // divider between gutter and content. Width 0 (no gutter) when no line
+        // carries a number — hand-built diffs / older fixtures render as before.
+        const displayNo = (dl: DiffLine): number | undefined => dl.newLine ?? dl.oldLine;
+        const gutterDigits = item.diff.snippet.reduce((w, dl) => {
+          const n = displayNo(dl);
+          return n !== undefined ? Math.max(w, String(n).length) : w;
+        }, 0);
+        const rail = caps.unicode ? '│' : '|';
+        // Shrink the content cap by the gutter so a numbered line is never
+        // longer than the unnumbered one was (gutter = digits + " │ ").
+        const contentMax = Math.max(
+          0,
+          SAFE_ONE_LINE_MAX - (gutterDigits > 0 ? gutterDigits + 3 : 0),
+        );
         for (const dl of item.diff.snippet) {
           const tone = dl.type === 'add' ? 'success' : dl.type === 'del' ? 'error' : 'dim';
           const mark = dl.type === 'add' ? '+' : dl.type === 'del' ? '-' : ' ';
-          lines.push(paint(caps, tone, `${indent}  ${mark} ${sanitizeOneLineForDisplay(dl.text)}`));
+          const n = displayNo(dl);
+          // Number in the line's tone; rail in `secondary` (neutral divider).
+          const gutter =
+            gutterDigits > 0
+              ? `${paint(caps, tone, (n !== undefined ? String(n) : '').padStart(gutterDigits))}${paint(caps, 'secondary', ` ${rail} `)}`
+              : '';
+          const body = paint(
+            caps,
+            tone,
+            `${mark} ${sanitizeOneLineForDisplay(dl.text, contentMax)}`,
+          );
+          lines.push(`${indent}  ${gutter}${body}`);
         }
         if (item.diff.hiddenChanges > 0) {
           lines.push(
@@ -413,9 +467,37 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // history/new-turns anchor). Same leading blank as error/warn
       // so consecutive info lines from different sources don't blob
       // together.
-      const body =
-        item.tone === 'secondary' ? paint(caps, 'secondary', item.message) : item.message;
-      return ['', body].map(padFrame);
+      // Multi-line messages (e.g. the working-state panel) render one framed
+      // line per `\n` so every row keeps the frame margin — a single padFrame
+      // over an embedded newline would indent only the first line. Single-line
+      // is the common case (`split` returns one entry).
+      const painted = item.message
+        .split('\n')
+        .map((l) => (item.tone === 'secondary' ? paint(caps, 'secondary', l) : l));
+      // `header` (when present) labels the block in the DEFAULT tone above the
+      // toned body — so a secondary-toned block can still carry a visible title
+      // (see InfoEvent.header; used by the working-state panel).
+      const headerLines = item.header !== undefined ? [item.header] : [];
+      return ['', ...headerLines, ...painted].map(padFrame);
+    }
+    case 'reasoning': {
+      // Extended-thinking / reasoning block: the whole thing is the model's
+      // scratch work, not the answer, so it sits in the secondary (grey meta)
+      // channel and recedes — the `reasoning:` label is grey too, just BOLD to
+      // anchor the block (bold + secondary stacked via paintMulti). One framed
+      // line per `\n`; body already capped at flush (state.ts capReasoning).
+      const header = paintMulti(caps, ['bold', 'secondary'], 'reasoning:');
+      // Soft-wrap to the frame's inner width so a single long reasoning line
+      // (OpenAI summaries are often one paragraph) can't overflow `cols` and
+      // break the 2sp margin. `hard` also breaks an unbroken token. Text is
+      // already ANSI-stripped on entry (harness-adapter thinking_delta), so the
+      // wrap operates on clean content. Blank lines (part separators) survive.
+      const width = frameWidth(caps);
+      const body = item.text
+        .split('\n')
+        .flatMap((l) => (width > 0 ? wrapAnsi(l, width, { hard: true }).split('\n') : [l]))
+        .map((l) => paint(caps, 'secondary', l));
+      return ['', header, ...body].map(padFrame);
     }
     case 'operator-bash': {
       // Operator `!cmd` result (shell-style escape — ran as the operator's

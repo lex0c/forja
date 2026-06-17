@@ -99,7 +99,7 @@ export interface ParsedArgs {
   iKnowWhatImDoing?: boolean;
   // Undo mode (AGENTIC_CLI §12 / CHECKPOINTS.md §2.3). Restores
   // the latest checkpoint of the named session. Same semantics as
-  // `agent --checkpoints restore <session> <latest-ckpt>` but
+  // `forja --checkpoints restore <session> <latest-ckpt>` but
   // resolves the latest id internally.
   undo?: string;
   // Checkpoint subcommands (CHECKPOINTS.md §2.3). The verb is one
@@ -163,7 +163,7 @@ export interface ParsedArgs {
   // Trust state carried across the subprocess boundary.
   // Presence = true (no value); absence = false. Spec §9 trust
   // is per-PROJECT, not per-instance: the parent already
-  // resolved trust against `~/.config/agent/trust.json` at
+  // resolved trust against `~/.config/forja/trust.json` at
   // bootstrap, and the child must run under that same verdict.
   // Without this forwarding the child's harness defaults
   // `isCwdTrusted` to false (fail-closed) — even when the
@@ -171,7 +171,7 @@ export interface ParsedArgs {
   // trust (e.g., `memory_write` refuses inferred writes on
   // untrusted cwd) silently degrade for every subagent the
   // operator spawns. Worktree-isolated subagents particularly
-  // hit this: the worktree path under `~/.cache/agent/worktrees/`
+  // hit this: the worktree path under `~/.cache/forja/worktrees/`
   // is never on the trusted list, so re-resolving trust from
   // `session.cwd` would also default false. Carrying the
   // parent's verdict explicitly is the only correct option.
@@ -190,8 +190,8 @@ export interface ParsedArgs {
   // scheduler polls memory_provenance for newly-exposed factual
   // memories and dispatches the verify-semantic subagent (gated by
   // cost/dispatch caps + dedup table). Slice Q inverted the
-  // default to ON; persistent opt-out belongs in `.agent/config.
-  // toml [memory]` or `~/.config/agent/config.toml`. CLI flags
+  // default to ON; persistent opt-out belongs in `.forja/config.
+  // toml [memory]` or `~/.config/forja/config.toml`. CLI flags
   // (`--memory-verify-llm` / `--no-memory-verify-llm`) are session-
   // only overrides that win over config. `undefined` means "no CLI
   // override; honor config" — explicit boolean values are forwarded
@@ -210,7 +210,7 @@ export interface ParsedArgs {
   memoryOverrideLlm?: boolean;
   // Internal: per-subagent bg log directory. The parent's
   // runSubagent computes
-  // `<parentCwd>/.agent/bg/<childSessionId>/` and forwards via
+  // `<parentCwd>/.forja/bg/<childSessionId>/` and forwards via
   // `--subagent-bg-log-dir <path>`. The child wires this into
   // its harness's bg manager so background-process tools
   // (`bash_background` / `bash_output` / `bash_kill` /
@@ -243,8 +243,8 @@ export interface ParsedArgs {
   // default — present-but-mismatched is a hard refusal at
   // child boot.
   subagentIpcVersion?: number;
-  // `agent init` mode (AGENTIC_CLI §2.1). Scaffolds the four
-  // bootstrap artifacts under `.agent/` (permissions.yaml,
+  // `forja init` mode (AGENTIC_CLI §2.1). Scaffolds the four
+  // bootstrap artifacts under `.forja/` (permissions.yaml,
   // .gitignore, config.toml, agents/*.md) and exits. The first
   // positional arg `init` triggers it — diverging from the
   // `--<flag>` convention every other subcommand uses, but
@@ -269,10 +269,10 @@ export interface ParsedArgs {
     only?: ReadonlyArray<InitStep>;
     force?: 'all' | ReadonlyArray<ForceEligibleStep>;
   };
-  // `agent recap [args]` headless subcommand (RECAP.md §9). Routes
+  // `forja recap [args]` headless subcommand (RECAP.md §9). Routes
   // to the `runRecapHeadless` handler — same surface as the
   // `/recap` slash but invoked from a non-REPL context (CI, scripts,
-  // `gh pr create --body $(agent recap pr ...)`). The args array is
+  // `gh pr create --body $(forja recap pr ...)`). The args array is
   // forwarded verbatim to the slash parser so every recap form
   // (`pr`, `changelog`, `slack`, `terse`, `last <N>`, `session
   // <id>`, `list [filtros]`, `json`, etc.) works the same way the
@@ -281,7 +281,7 @@ export interface ParsedArgs {
   // (recap_start / recap_intermediate / recap_render / recap_end);
   // without `--json`, headless output is the rendered string only.
   recap?: { args: string[] };
-  // `agent doctor [--json]` — §13 platform provisioning surface.
+  // `forja doctor [--json]` — §13 platform provisioning surface.
   // Runs a series of health checks (platform info, sandbox tool
   // availability, config + data dir writability, git binary
   // presence) and renders a structured report. Exit 0 on all-pass,
@@ -289,20 +289,20 @@ export interface ParsedArgs {
   // emit NDJSON one-line-per-check + a summary line, same shape
   // convention as --list-sessions / --explain-permissions.
   //
-  // First slice on §13 — foundation for future `agent sandbox
+  // First slice on §13 — foundation for future `forja sandbox
   // setup` + broker/worker architecture.
   doctor?: { json: boolean };
-  // `agent sandbox <verb> [args]` — §13 platform provisioning
+  // `forja sandbox <verb> [args]` — §13 platform provisioning
   // operator surface. Verb is the second token. Currently:
   //   setup — print the recommended sandbox install command for
   //           the detected platform / distribution.
   sandbox?: { verb: 'setup'; json: boolean };
-  // `agent welcome` — §13.5 first-boot walkthrough. Composes doctor
+  // `forja welcome` — §13.5 first-boot walkthrough. Composes doctor
   // + sandbox setup + next-steps menu into a guided intro. Idempotent
   // — running it later as a "checkup" is fine.
   welcome?: true;
-  // `agent purge` — §2.1.2 project-scope reset. Filesystem-only
-  // (removes everything under <repoRoot>/.agent/); never touches the
+  // `forja purge` — §2.1.2 project-scope reset. Filesystem-only
+  // (removes everything under <repoRoot>/.forja/); never touches the
   // global DB or user-layer configs. Two-phase: bare invocation is
   // dry-run (prints scope + audit-writability + literal force
   // command); `--force` executes after writing a purge_events audit
@@ -310,19 +310,19 @@ export interface ParsedArgs {
   // global DB is unwriteable but the operator still needs the FS
   // reset — purge proceeds without leaving a forensic row.
   purge?: { force: boolean; json: boolean; noAudit: boolean };
-  // `agent gc` — §2.1.3 retention sweep age-based across the
+  // `forja gc` — §2.1.3 retention sweep age-based across the
   // global DB. Phase 1 covers four low-sensitivity tables
   // (recap_cache, retrieval_trace, context_pins, bg_processes).
   // Bare invocation is dry-run (prints counts); --force executes.
   // --table=X restricts to a single table; repeatable.
   gc?: { force: boolean; json: boolean; tables: string[] };
-  // `agent cache clear [--force] [--json]` — reclaim the opt-in persistent
+  // `forja cache clear [--force] [--json]` — reclaim the opt-in persistent
   // sandbox cache (`~/.cache/forja`). The per-language redirect only exists
   // INSIDE the sandbox, so the operator's native `npm cache clean` etc. (run
   // on the host) never reach this tree. Bare invocation is dry-run (reports
   // size); --force removes. Mirrors the gc/purge two-phase shape.
   cache?: { verb: 'clear'; force: boolean; json: boolean };
-  // `agent permission <verb> [positionals]` — operator surface for
+  // `forja permission <verb> [positionals]` — operator surface for
   // the v2 permission engine (PERMISSION_ENGINE.md). Verbs:
   //   - 'verify'       — walk the audit hash chain for the current
   //                      install_id; exit 0 (intact) / 1 (broken).
@@ -335,18 +335,18 @@ export interface ParsedArgs {
     verb: string;
     positionals: string[];
     reason?: string;
-    // `agent permission replay <seq> --without-classifier` (§17 mode).
+    // `forja permission replay <seq> --without-classifier` (§17 mode).
     // Hint-only-impact analysis: split the row's deterministic score
     // from the classifier adjust and report whether the classifier
     // moved the decision across the §6.6 threshold.
     withoutClassifier?: boolean;
-    // `agent permission replay <seq> --against-current-policy` (§17 mode).
+    // `forja permission replay <seq> --against-current-policy` (§17 mode).
     // Re-executes the decision pipeline using the row's args (recovered
     // via approval_call_links + tool_calls.input) against the ACTIVE
     // policy. Reports the original decision vs the replayed one;
     // diverging outcomes flag policy drift impact.
     againstCurrentPolicy?: boolean;
-    // `agent permission replay <seq> --against-archived-policy` (§17
+    // `forja permission replay <seq> --against-archived-policy` (§17
     // mode, slice 96). The canonical reproducibility test: re-executes
     // the pipeline using the row's args against the EXACT policy bytes
     // that produced the row (looked up by `row.policy_hash` in the
@@ -356,31 +356,31 @@ export interface ParsedArgs {
     // archive doesn't contain the row's hash (pre-archive boot, or
     // archive rotated out).
     againstArchivedPolicy?: boolean;
-    // `agent permission inspect <rotation_id> --clear` (§7.2).
+    // `forja permission inspect <rotation_id> --clear` (§7.2).
     // Flips chain_meta.quarantined to 0 for the named rotation after
     // the operator confirms the archived segment is benign. Without
     // this flag, `inspect` is read-only — render chain_meta + the
     // archived-row count for the rotation_id.
     clearQuarantine?: boolean;
-    // `agent permission grants --all` (§8). Default lists only
+    // `forja permission grants --all` (§8). Default lists only
     // active (non-expired, non-revoked) grants. `--all` includes
     // every row for forensic audit (expired + revoked).
     allGrants?: boolean;
-    // `agent permission policy-rollback --write` (§12.4 slice 50).
+    // `forja permission policy-rollback --write` (§12.4 slice 50).
     // Without this flag, the verb is dry-run: prints the planned
     // rollback summary without touching the target file. With it,
     // canonical_json bytes are written to the target and an audit
     // row is emitted per spec line 756.
     rollbackWrite?: boolean;
-    // `agent permission policy-rollback --target <file>` override.
-    // Default `.agent/permissions.yaml` (project-local). Operators
+    // `forja permission policy-rollback --target <file>` override.
+    // Default `.forja/permissions.yaml` (project-local). Operators
     // pointing at a user-level or enterprise YAML pass --target.
     rollbackTarget?: string;
-    // `agent permission calibration-export --since-days <N>`
+    // `forja permission calibration-export --since-days <N>`
     // (slice 138, §6.3.2 step 1). Time window in days; default
     // 30. Must be > 0.
     sinceDays?: number;
-    // `agent permission calibration-export --all-decisions`.
+    // `forja permission calibration-export --all-decisions`.
     // Widens the decision filter to '*' (every approval_log row).
     // Default keeps the spec's clean-label set
     // (confirm-allowed + confirm-denied) per §6.3.2.1.
@@ -619,7 +619,7 @@ const parseInitSubcommand = (argv: readonly string[]): ParseResult | null => {
   };
 };
 
-// `agent recap [args]` — headless surface for the recap slash
+// `forja recap [args]` — headless surface for the recap slash
 // command. The verb has to be the very first token on the command
 // line (same convention as `init`); when present, every following
 // token is collected into `args.recap.args` verbatim and the
@@ -671,7 +671,7 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
       // bootstrap when wiring the headless LLM render path.
       // Without this extraction, the slash-side parser would
       // see `--model` and reject it as an unknown flag, leaving
-      // operators no way to override the model for `agent recap`.
+      // operators no way to override the model for `forja recap`.
       const value = argv[i + 1];
       if (value === undefined || value.startsWith('-')) {
         return { ok: false, message: '--model requires a value' };
@@ -732,20 +732,20 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
   };
 };
 
-// `agent welcome` — §13.5 first-boot walkthrough. Accepts --help
+// `forja welcome` — §13.5 first-boot walkthrough. Accepts --help
 // and --i-know-what-im-doing (slice 91, creates the
 // `~/.config/forja/sandbox_skip` marker + silences sandbox setup
 // in future sessions). Plain text only (operators wanting
-// structured data call `agent doctor --json` / `agent sandbox
+// structured data call `forja doctor --json` / `forja sandbox
 // setup --json` directly).
 const parseWelcomeSubcommand = (argv: readonly string[]): ParseResult | null => {
   // Welcome is detected ONLY at argv[0], matching every other
   // subcommand in this parser (init / recap / sandbox / doctor /
   // permission). An earlier cut scanned the entire argv via
   // `findIndex(t => t === 'welcome')` to accommodate
-  // `agent --i-know-what-im-doing welcome` (welcome after a
+  // `forja --i-know-what-im-doing welcome` (welcome after a
   // flag) — but that regression-broke any normal prompt
-  // containing the literal word `welcome`. `agent --json
+  // containing the literal word `welcome`. `forja --json
   // welcome` (operator's prompt is the word "welcome", wants
   // JSON output) and `agent hello welcome world` (prompt is a
   // sentence containing the word) both got mis-routed into the
@@ -756,8 +756,8 @@ const parseWelcomeSubcommand = (argv: readonly string[]): ParseResult | null => 
   // The flag-then-welcome case the earlier cut was trying to
   // accept is already covered by the top-level
   // `--i-know-what-im-doing` rejection path: an operator who
-  // types `agent --i-know-what-im-doing welcome` hits the
-  // explicit error pointing at `agent welcome
+  // types `forja --i-know-what-im-doing welcome` hits the
+  // explicit error pointing at `forja welcome
   // --i-know-what-im-doing` (the canonical form), so the UX is
   // recoverable without sacrificing prompt parsing.
   if (argv.length === 0 || argv[0] !== 'welcome') return null;
@@ -787,7 +787,7 @@ const parseWelcomeSubcommand = (argv: readonly string[]): ParseResult | null => 
     }
     return {
       ok: false,
-      message: `agent welcome: unknown flag '${token}' (only --help and --i-know-what-im-doing are accepted)`,
+      message: `forja welcome: unknown flag '${token}' (only --help and --i-know-what-im-doing are accepted)`,
     };
   }
   return {
@@ -807,7 +807,7 @@ const parseWelcomeSubcommand = (argv: readonly string[]): ParseResult | null => 
   };
 };
 
-// `agent sandbox <verb> [--json]` — §13 platform provisioning
+// `forja sandbox <verb> [--json]` — §13 platform provisioning
 // guided bootstrap. First verb: `setup` (slice 44). Future verbs
 // will cover sandbox profile testing + introspection.
 const KNOWN_SANDBOX_VERBS = ['setup'] as const;
@@ -817,17 +817,17 @@ const parseSandboxSubcommand = (argv: readonly string[]): ParseResult | null => 
   if (argv.length === 1) {
     return {
       ok: false,
-      message: `usage: agent sandbox <${KNOWN_SANDBOX_VERBS.join('|')}> [--json]`,
+      message: `usage: forja sandbox <${KNOWN_SANDBOX_VERBS.join('|')}> [--json]`,
     };
   }
   const verb = argv[1];
   if (verb === undefined) {
-    return { ok: false, message: 'agent sandbox: missing verb' };
+    return { ok: false, message: 'forja sandbox: missing verb' };
   }
   if (!KNOWN_SANDBOX_VERBS.includes(verb as (typeof KNOWN_SANDBOX_VERBS)[number])) {
     return {
       ok: false,
-      message: `agent sandbox: unknown verb '${verb}' (expected: ${KNOWN_SANDBOX_VERBS.join('|')})`,
+      message: `forja sandbox: unknown verb '${verb}' (expected: ${KNOWN_SANDBOX_VERBS.join('|')})`,
     };
   }
   let json = false;
@@ -855,7 +855,7 @@ const parseSandboxSubcommand = (argv: readonly string[]): ParseResult | null => 
     }
     return {
       ok: false,
-      message: `agent sandbox ${verb}: unknown flag '${token}' (only --json and --help are accepted)`,
+      message: `forja sandbox ${verb}: unknown flag '${token}' (only --json and --help are accepted)`,
     };
   }
   return {
@@ -874,7 +874,7 @@ const parseSandboxSubcommand = (argv: readonly string[]): ParseResult | null => 
   };
 };
 
-// `agent doctor [--json]` — §13 platform provisioning health
+// `forja doctor [--json]` — §13 platform provisioning health
 // check. No positionals, no verb. Top-level subcommand mirroring
 // the `init` / `recap` / `permission` shape.
 const parseDoctorSubcommand = (argv: readonly string[]): ParseResult | null => {
@@ -904,7 +904,7 @@ const parseDoctorSubcommand = (argv: readonly string[]): ParseResult | null => {
     }
     return {
       ok: false,
-      message: `agent doctor: unknown flag '${token}' (only --json and --help are accepted)`,
+      message: `forja doctor: unknown flag '${token}' (only --json and --help are accepted)`,
     };
   }
   return {
@@ -923,7 +923,7 @@ const parseDoctorSubcommand = (argv: readonly string[]): ParseResult | null => {
   };
 };
 
-// `agent permission <verb> [positionals]` — operator surface for the
+// `forja permission <verb> [positionals]` — operator surface for the
 // v2 permission engine (PERMISSION_ENGINE.md). Mirrors the recap /
 // init parsers: verb is the second token, everything after is
 // positional. `--json` is honored as a top-level toggle so headless
@@ -970,7 +970,7 @@ const parseDoctorSubcommand = (argv: readonly string[]): ParseResult | null => {
 //                     commits the canonical JSON to the target file
 //                     and emits an audit event per spec line 756.
 //                     `--target <file>` overrides the default
-//                     `.agent/permissions.yaml`. Positional <hash>
+//                     `.forja/permissions.yaml`. Positional <hash>
 //                     identifies the archive entry.
 //
 // Future verbs (each lands in its own slice):
@@ -993,7 +993,7 @@ const KNOWN_PERMISSION_VERBS = [
   'calibration-export',
 ] as const;
 
-// `agent purge [--force] [--json] [--no-audit]` — project-scope FS
+// `forja purge [--force] [--json] [--no-audit]` — project-scope FS
 // reset (AGENTIC_CLI.md §2.1.2). Mirrors the doctor / sandbox shape
 // (positional verb is the first token; sub-flags follow). Mutually
 // exclusive with every other run mode by virtue of consuming argv[0]
@@ -1042,7 +1042,7 @@ const parsePurgeSubcommand = (argv: readonly string[]): ParseResult | null => {
     }
     return {
       ok: false,
-      message: `agent purge: unknown flag '${token}' (accepted: --force, --json, --no-audit, --help)`,
+      message: `forja purge: unknown flag '${token}' (accepted: --force, --json, --no-audit, --help)`,
     };
   }
   return {
@@ -1061,7 +1061,7 @@ const parsePurgeSubcommand = (argv: readonly string[]): ParseResult | null => {
   };
 };
 
-// `agent gc [--force] [--json] [--table=X]` — retention sweep
+// `forja gc [--force] [--json] [--table=X]` — retention sweep
 // age-based on the global DB (AGENTIC_CLI.md §2.1.3). Mirrors the
 // purge/doctor shape (positional verb first). Mutually exclusive
 // with every other run mode.
@@ -1121,7 +1121,7 @@ const parseGcSubcommand = (argv: readonly string[]): ParseResult | null => {
       if (!KNOWN_GC_TABLES.has(value)) {
         return {
           ok: false,
-          message: `agent gc: --table='${value}' is not a recognized gc table (valid: ${[...KNOWN_GC_TABLES].join(', ')})`,
+          message: `forja gc: --table='${value}' is not a recognized gc table (valid: ${[...KNOWN_GC_TABLES].join(', ')})`,
         };
       }
       // Dedupe so `--table=X --table=X` runs once. Order preserved
@@ -1131,7 +1131,7 @@ const parseGcSubcommand = (argv: readonly string[]): ParseResult | null => {
     }
     return {
       ok: false,
-      message: `agent gc: unknown flag '${token}' (accepted: --force, --json, --table=<name>, --help)`,
+      message: `forja gc: unknown flag '${token}' (accepted: --force, --json, --table=<name>, --help)`,
     };
   }
   return {
@@ -1150,7 +1150,7 @@ const parseGcSubcommand = (argv: readonly string[]): ParseResult | null => {
   };
 };
 
-// `agent cache clear [--force] [--json]` — reclaim the persistent sandbox
+// `forja cache clear [--force] [--json]` — reclaim the persistent sandbox
 // cache (~/.cache/forja). Two-phase like gc/purge: bare = dry-run (report
 // size), --force removes. Only verb is `clear`.
 const parseCacheSubcommand = (argv: readonly string[]): ParseResult | null => {
@@ -1161,8 +1161,8 @@ const parseCacheSubcommand = (argv: readonly string[]): ParseResult | null => {
       ok: false,
       message:
         verb === undefined
-          ? 'usage: agent cache clear [--force] [--json]'
-          : `agent cache: unknown verb '${verb}' (expected: clear)`,
+          ? 'usage: forja cache clear [--force] [--json]'
+          : `forja cache: unknown verb '${verb}' (expected: clear)`,
     };
   }
   let force = false;
@@ -1195,7 +1195,7 @@ const parseCacheSubcommand = (argv: readonly string[]): ParseResult | null => {
     }
     return {
       ok: false,
-      message: `agent cache clear: unknown flag '${token}' (accepted: --force, --json, --help)`,
+      message: `forja cache clear: unknown flag '${token}' (accepted: --force, --json, --help)`,
     };
   }
   return {
@@ -1219,17 +1219,17 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
   if (argv.length === 1) {
     return {
       ok: false,
-      message: `usage: agent permission <${KNOWN_PERMISSION_VERBS.join('|')}> [--json] [--reason <text>]`,
+      message: `usage: forja permission <${KNOWN_PERMISSION_VERBS.join('|')}> [--json] [--reason <text>]`,
     };
   }
   const verb = argv[1];
   if (verb === undefined) {
-    return { ok: false, message: 'agent permission: missing verb' };
+    return { ok: false, message: 'forja permission: missing verb' };
   }
   if (!KNOWN_PERMISSION_VERBS.includes(verb as (typeof KNOWN_PERMISSION_VERBS)[number])) {
     return {
       ok: false,
-      message: `agent permission: unknown verb '${verb}' (expected: ${KNOWN_PERMISSION_VERBS.join('|')})`,
+      message: `forja permission: unknown verb '${verb}' (expected: ${KNOWN_PERMISSION_VERBS.join('|')})`,
     };
   }
   let json = false;
@@ -1271,7 +1271,7 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
       if (value === undefined || value.startsWith('--')) {
         return {
           ok: false,
-          message: 'agent permission: --reason requires a non-empty text value',
+          message: 'forja permission: --reason requires a non-empty text value',
         };
       }
       reason = value;
@@ -1307,7 +1307,7 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
       if (value === undefined || value.startsWith('--')) {
         return {
           ok: false,
-          message: 'agent permission policy-rollback: --target requires a file path',
+          message: 'forja permission policy-rollback: --target requires a file path',
         };
       }
       rollbackTarget = value;
@@ -1319,7 +1319,7 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
       if (value === undefined || !/^[1-9][0-9]*$/.test(value)) {
         return {
           ok: false,
-          message: 'agent permission calibration-export: --since-days requires a positive integer',
+          message: 'forja permission calibration-export: --since-days requires a positive integer',
         };
       }
       sinceDays = Number.parseInt(value, 10);
@@ -1335,43 +1335,43 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
   if (allGrants && verb !== 'grants') {
     return {
       ok: false,
-      message: `agent permission ${verb}: --all only applies to 'grants'`,
+      message: `forja permission ${verb}: --all only applies to 'grants'`,
     };
   }
   if ((rollbackWrite || rollbackTarget !== undefined) && verb !== 'policy-rollback') {
     return {
       ok: false,
-      message: `agent permission ${verb}: --write / --target only apply to 'policy-rollback'`,
+      message: `forja permission ${verb}: --write / --target only apply to 'policy-rollback'`,
     };
   }
   if (withoutClassifier && verb !== 'replay') {
     return {
       ok: false,
-      message: `agent permission ${verb}: --without-classifier only applies to 'replay'`,
+      message: `forja permission ${verb}: --without-classifier only applies to 'replay'`,
     };
   }
   if (againstCurrentPolicy && verb !== 'replay') {
     return {
       ok: false,
-      message: `agent permission ${verb}: --against-current-policy only applies to 'replay'`,
+      message: `forja permission ${verb}: --against-current-policy only applies to 'replay'`,
     };
   }
   if (againstArchivedPolicy && verb !== 'replay') {
     return {
       ok: false,
-      message: `agent permission ${verb}: --against-archived-policy only applies to 'replay'`,
+      message: `forja permission ${verb}: --against-archived-policy only applies to 'replay'`,
     };
   }
   if ((sinceDays !== undefined || allDecisions) && verb !== 'calibration-export') {
     return {
       ok: false,
-      message: `agent permission ${verb}: --since-days / --all-decisions only apply to 'calibration-export'`,
+      message: `forja permission ${verb}: --since-days / --all-decisions only apply to 'calibration-export'`,
     };
   }
   if (clearQuarantine && verb !== 'inspect') {
     return {
       ok: false,
-      message: `agent permission ${verb}: --clear only applies to 'inspect'`,
+      message: `forja permission ${verb}: --clear only applies to 'inspect'`,
     };
   }
   if (verb === 'rotate-chain') {
@@ -1379,7 +1379,7 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
       return {
         ok: false,
         message:
-          'agent permission rotate-chain: --reason <text> is required (forensic record of why the chain was rotated)',
+          'forja permission rotate-chain: --reason <text> is required (forensic record of why the chain was rotated)',
       };
     }
   }
@@ -1391,21 +1391,21 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
       return {
         ok: false,
         message:
-          'agent permission replay: exactly one <seq> positional is required (e.g. `agent permission replay 42`)',
+          'forja permission replay: exactly one <seq> positional is required (e.g. `forja permission replay 42`)',
       };
     }
     const raw = positionals[0] as string;
     if (!/^\d+$/.test(raw)) {
       return {
         ok: false,
-        message: `agent permission replay: <seq> must be a positive integer (got '${raw}')`,
+        message: `forja permission replay: <seq> must be a positive integer (got '${raw}')`,
       };
     }
     const seq = Number.parseInt(raw, 10);
     if (seq <= 0 || !Number.isSafeInteger(seq)) {
       return {
         ok: false,
-        message: `agent permission replay: <seq> out of range (got ${raw})`,
+        message: `forja permission replay: <seq> out of range (got ${raw})`,
       };
     }
   }
@@ -1415,21 +1415,21 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
       return {
         ok: false,
         message:
-          'agent permission inspect: exactly one <rotation_id> positional is required (e.g. `agent permission inspect 1`)',
+          'forja permission inspect: exactly one <rotation_id> positional is required (e.g. `forja permission inspect 1`)',
       };
     }
     const raw = positionals[0] as string;
     if (!/^\d+$/.test(raw)) {
       return {
         ok: false,
-        message: `agent permission inspect: <rotation_id> must be a positive integer (got '${raw}')`,
+        message: `forja permission inspect: <rotation_id> must be a positive integer (got '${raw}')`,
       };
     }
     const rotationId = Number.parseInt(raw, 10);
     if (rotationId <= 0 || !Number.isSafeInteger(rotationId)) {
       return {
         ok: false,
-        message: `agent permission inspect: <rotation_id> out of range (got ${raw})`,
+        message: `forja permission inspect: <rotation_id> out of range (got ${raw})`,
       };
     }
   }
@@ -1442,21 +1442,21 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
       return {
         ok: false,
         message:
-          'agent permission diff: exactly two <seq> positionals are required (e.g. `agent permission diff 42 43`)',
+          'forja permission diff: exactly two <seq> positionals are required (e.g. `forja permission diff 42 43`)',
       };
     }
     for (const raw of positionals) {
       if (!/^\d+$/.test(raw)) {
         return {
           ok: false,
-          message: `agent permission diff: <seq> must be a positive integer (got '${raw}')`,
+          message: `forja permission diff: <seq> must be a positive integer (got '${raw}')`,
         };
       }
       const seq = Number.parseInt(raw, 10);
       if (seq <= 0 || !Number.isSafeInteger(seq)) {
         return {
           ok: false,
-          message: `agent permission diff: <seq> out of range (got ${raw})`,
+          message: `forja permission diff: <seq> out of range (got ${raw})`,
         };
       }
     }
@@ -1466,13 +1466,13 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
     if (positionals.length !== 0) {
       return {
         ok: false,
-        message: `agent permission grants: no positionals expected (got ${positionals.length})`,
+        message: `forja permission grants: no positionals expected (got ${positionals.length})`,
       };
     }
     if (reason !== undefined) {
       return {
         ok: false,
-        message: 'agent permission grants: --reason only applies to revoke / rotate-chain',
+        message: 'forja permission grants: --reason only applies to revoke / rotate-chain',
       };
     }
   }
@@ -1482,13 +1482,13 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
     if (positionals.length !== 0) {
       return {
         ok: false,
-        message: `agent permission policy-list: no positionals expected (got ${positionals.length})`,
+        message: `forja permission policy-list: no positionals expected (got ${positionals.length})`,
       };
     }
     if (reason !== undefined) {
       return {
         ok: false,
-        message: 'agent permission policy-list: --reason only applies to revoke / rotate-chain',
+        message: 'forja permission policy-list: --reason only applies to revoke / rotate-chain',
       };
     }
   }
@@ -1496,18 +1496,18 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
     // <hash> positional required; ULID-shape NOT validated here
     // (policy_archive hashes are sha256, not ULID — the handler
     // validates against the archive contents instead). --write
-    // commits, --target overrides default `.agent/permissions.yaml`.
+    // commits, --target overrides default `.forja/permissions.yaml`.
     if (positionals.length !== 1) {
       return {
         ok: false,
         message:
-          'agent permission policy-rollback: exactly one <hash> positional is required (e.g. `agent permission policy-rollback sha256:abc...`)',
+          'forja permission policy-rollback: exactly one <hash> positional is required (e.g. `forja permission policy-rollback sha256:abc...`)',
       };
     }
     if (reason !== undefined) {
       return {
         ok: false,
-        message: 'agent permission policy-rollback: --reason only applies to revoke / rotate-chain',
+        message: 'forja permission policy-rollback: --reason only applies to revoke / rotate-chain',
       };
     }
   }
@@ -1520,7 +1520,7 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
       return {
         ok: false,
         message:
-          'agent permission revoke: exactly one <id> positional is required (e.g. `agent permission revoke 01JN...`)',
+          'forja permission revoke: exactly one <id> positional is required (e.g. `forja permission revoke 01JN...`)',
       };
     }
   }
@@ -1532,13 +1532,13 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
     if (positionals.length !== 0) {
       return {
         ok: false,
-        message: `agent permission ${verb}: no positionals expected (got ${positionals.length})`,
+        message: `forja permission ${verb}: no positionals expected (got ${positionals.length})`,
       };
     }
     if (reason !== undefined) {
       return {
         ok: false,
-        message: `agent permission ${verb}: --reason only applies to revoke / rotate-chain`,
+        message: `forja permission ${verb}: --reason only applies to revoke / rotate-chain`,
       };
     }
   }
@@ -1548,13 +1548,13 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
     if (positionals.length !== 0) {
       return {
         ok: false,
-        message: `agent permission ${verb}: no positionals expected (got ${positionals.length})`,
+        message: `forja permission ${verb}: no positionals expected (got ${positionals.length})`,
       };
     }
     if (reason !== undefined) {
       return {
         ok: false,
-        message: `agent permission ${verb}: --reason only applies to revoke / rotate-chain`,
+        message: `forja permission ${verb}: --reason only applies to revoke / rotate-chain`,
       };
     }
   }
@@ -1716,7 +1716,7 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         // Slice 123 (R9 P1): pre-slice this case silently accepted
         // the flag at the top level, but `args.iKnowWhatImDoing` is
         // only ever read inside the `args.welcome === true` branch
-        // in `run.ts` — so `agent --i-know-what-im-doing` (without
+        // in `run.ts` — so `forja --i-know-what-im-doing` (without
         // the `welcome` verb) parsed successfully and did nothing.
         // Now it's rejected with a pointer to the correct invocation
         // so operators don't silently no-op their unsafe-mode
@@ -1724,7 +1724,7 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         return {
           ok: false,
           message:
-            '--i-know-what-im-doing is only valid as a flag of `agent welcome`; use `agent welcome --i-know-what-im-doing`',
+            '--i-know-what-im-doing is only valid as a flag of `forja welcome`; use `forja welcome --i-know-what-im-doing`',
         };
       case '--undo': {
         const value = argv[i + 1];
@@ -1755,7 +1755,7 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         // implementation stopped only on `--json`/`--help`/`-h`,
         // which silently swallowed every OTHER top-level flag
         // (--yes, --model, etc.) into positionals — those tokens
-        // were then ignored by the handler, so `agent --worktrees
+        // were then ignored by the handler, so `forja --worktrees
         // list --model foo` ran the list with `foo` as a stray
         // positional and the operator wondered why --model didn't
         // do anything.
@@ -1938,7 +1938,7 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         // `--subagent-shared-scope-offline`.
         // Absence = false (fail-closed). Parent only emits this
         // when its OWN bootstrap resolved the cwd as trusted
-        // against `~/.config/agent/trust.json`, so the child
+        // against `~/.config/forja/trust.json`, so the child
         // inherits the same verdict without re-resolving.
         args.subagentCwdTrusted = true;
         i += 1;
@@ -2221,11 +2221,11 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
 
 export const usage = (): string =>
   [
-    'Usage: agent [options] <prompt>',
-    '       agent init [--mode strict|acceptEdits] [--only=csv] [--no-seeds] [--force[=csv]]',
+    'Usage: forja [options] <prompt>',
+    '       forja init [--mode strict|acceptEdits] [--only=csv] [--no-seeds] [--force[=csv]]',
     '',
     'Subcommands:',
-    '  init                   Scaffold the .agent/ bootstrap bundle:',
+    '  init                   Scaffold the .forja/ bootstrap bundle:',
     '                           permissions.yaml, .gitignore, config.toml, agents/*.md, skills/shared/*.md,',
     '                           <user>/seeds/*.md (vendor memory seed pack)',
     '                         Each step is idempotent (existing files skipped).',
@@ -2240,6 +2240,8 @@ export const usage = (): string =>
     '  --version, -v          Print version and exit',
     '  --help, -h             Show this help and exit',
     '  --json                 Emit NDJSON events to stdout (headless)',
+    '  --profile <name>       Run against an isolated on-disk namespace (~/.config/forja-<name>, ~/.local/share/forja-<name>, .forja-<name>/)',
+    '                         so a dev build never migrates or pollutes your real Forja state. Also via FORJA_PROFILE env. Name: [a-z0-9][a-z0-9-]*',
     '  --autonomous           Start in Autonomous mode: auto-approve routine confirms (Shift+Tab toggles)',
     '  --no-recap             Disable recap for this run: no session-end/Alt+R auto-display, no resume rehydrate, deterministic /recap render',
     '  --list-sessions        Print known sessions (newest first) and exit',
@@ -2258,14 +2260,15 @@ export const usage = (): string =>
     '  --max-steps <n>        Override harness step budget',
     '',
     'Examples:',
-    '  agent init',
-    '  agent "summarize the README"',
-    '  agent --model openai/gpt-4o "list the source files"',
-    '  agent --json "what changed in the last commit?" > events.ndjson',
-    '  agent --list-sessions --json',
-    '  agent --resume last "now refactor the parts you flagged"',
-    '  agent doctor             Health check: platform, sandbox tools, config + data dirs, git',
-    '  agent sandbox setup      Print the recommended sandbox install command for this platform',
-    '  agent welcome            First-boot walkthrough: composes doctor + sandbox setup + next steps',
-    '  agent cache clear        Reclaim the persistent sandbox cache (~/.cache/forja); --force to remove',
+    '  forja init',
+    '  forja "summarize the README"',
+    '  forja --profile dev "iterate on Forja without touching your real sessions/config"',
+    '  forja --model openai/gpt-4o "list the source files"',
+    '  forja --json "what changed in the last commit?" > events.ndjson',
+    '  forja --list-sessions --json',
+    '  forja --resume last "now refactor the parts you flagged"',
+    '  forja doctor             Health check: platform, sandbox tools, config + data dirs, git',
+    '  forja sandbox setup      Print the recommended sandbox install command for this platform',
+    '  forja welcome            First-boot walkthrough: composes doctor + sandbox setup + next steps',
+    '  forja cache clear        Reclaim the persistent sandbox cache (~/.cache/forja); --force to remove',
   ].join('\n');

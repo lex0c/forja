@@ -1,4 +1,4 @@
-// `agent permission replay <seq>` — PERMISSION_ENGINE.md §17.
+// `forja permission replay <seq>` — PERMISSION_ENGINE.md §17.
 //
 // Slice 12 shipped the minimum viable surface: read an approvals_log
 // row by its sequence number, render every field, and flag policy
@@ -18,14 +18,14 @@
 //     honest.
 //
 // Out of scope (deferred to later slices):
-//   - `agent permission diff <id1> <id2>`: cross-row comparison.
+//   - `forja permission diff <id1> <id2>`: cross-row comparison.
 //   - Raw args: live in session SQLite (not in approvals_log); a
 //     future slice persists them with a TTL. For now replay shows
 //     `args_hash` only.
 //   - Grants snapshot persistence on the audit row (R11 #35) — until
 //     this lands, the grants caveat above remains.
 //
-// The CLI surface mirrors `agent permission verify` /
+// The CLI surface mirrors `forja permission verify` /
 // `rotate-chain`: DB-only, no provider, no session start. Exit 0
 // on a row found, 1 on bootstrap/DB/missing-row errors.
 
@@ -890,7 +890,7 @@ export const runPermissionReplay = async (options: RunPermissionReplayOptions): 
   const cwd = options.cwd ?? process.cwd();
 
   if (!Number.isInteger(options.seq) || options.seq <= 0) {
-    const message = `agent permission replay: <seq> must be a positive integer (got ${options.seq})`;
+    const message = `forja permission replay: <seq> must be a positive integer (got ${options.seq})`;
     if (json) {
       out(`${JSON.stringify({ ok: false, error: 'invalid_seq', message })}\n`);
     } else {
@@ -907,7 +907,7 @@ export const runPermissionReplay = async (options: RunPermissionReplayOptions): 
     if (json) {
       out(`${JSON.stringify({ ok: false, error: 'install_id', message })}\n`);
     } else {
-      err(`agent permission replay: ${message}\n`);
+      err(`forja permission replay: ${message}\n`);
     }
     return 1;
   }
@@ -929,7 +929,7 @@ export const runPermissionReplay = async (options: RunPermissionReplayOptions): 
         })}\n`,
       );
     } else {
-      err(`agent permission replay: ${message}\n`);
+      err(`forja permission replay: ${message}\n`);
     }
     return 1;
   }
@@ -951,7 +951,7 @@ export const runPermissionReplay = async (options: RunPermissionReplayOptions): 
         })}\n`,
       );
     } else {
-      err(`agent permission replay: ${message}\n`);
+      err(`forja permission replay: ${message}\n`);
     }
     return 1;
   }

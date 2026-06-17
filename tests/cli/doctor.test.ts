@@ -18,7 +18,7 @@ const captured = () => {
   return { write: (s: string) => lines.push(s), lines };
 };
 
-describe('parseArgs — agent doctor', () => {
+describe('parseArgs — forja doctor', () => {
   test('doctor verb is recognized', () => {
     const r = parseArgs(['doctor']);
     expect(r.ok).toBe(true);
@@ -128,10 +128,10 @@ describe('runDoctor', () => {
   // `accessSync(dir, W_OK)` is probed and the check fails loud.
   test('config_dir on chmod 0500 → fail with EACCES-ish error', async () => {
     const out = captured();
-    // The config_dir resolution: HOME/.config/agent (we control
+    // The config_dir resolution: HOME/.config/forja (we control
     // HOME via env). Pre-create the tree and chmod the LEAF to
     // 0500 so accessSync(W_OK) fails.
-    const targetDir = join(tmp, '.config', 'agent');
+    const targetDir = join(tmp, '.config', 'forja');
     mkdirSync(targetDir, { recursive: true, mode: 0o700 });
     chmodSync(targetDir, 0o500);
     try {
@@ -268,6 +268,48 @@ describe('runDoctor', () => {
     const enforcement = events.find((e) => e.kind === 'check' && e.name === 'sandbox_enforcement');
     expect(enforcement?.status).toBe('warn');
     expect(enforcement?.detail).toContain('sandbox binary missing');
+  });
+
+  test('active profile: data_dir reflects forja-<profile> + footer carries the profile line', async () => {
+    const out = captured();
+    const code = await runDoctor({
+      env: { ...env, FORJA_PROFILE: 'dev' },
+      which: (cmd) => `/usr/bin/${cmd}`,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code === 0 || code === 1).toBe(true); // host-dependent checks; profile output is what we assert
+    const text = out.lines.join('');
+    // data_dir must point at the ISOLATED namespace, not the canonical one
+    // (the bug this fixed: dataDirCheck hardcoded `forja`).
+    expect(text).toContain('forja-dev');
+    expect(text).not.toContain('.local/share/forja\n');
+    // Explicit profile footer — only printed when active.
+    expect(text).toContain('profile: dev');
+  });
+
+  test('--json: info event carries the active profile (null on default namespace)', async () => {
+    const run = async (extraEnv: NodeJS.ProcessEnv): Promise<Record<string, unknown>> => {
+      const out = captured();
+      await runDoctor({
+        json: true,
+        env: { ...env, ...extraEnv },
+        which: (cmd) => `/usr/bin/${cmd}`,
+        out: out.write,
+        err: captured().write,
+      });
+      const events = out.lines
+        .join('')
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      const info = events.find((e) => e.kind === 'info');
+      if (info === undefined) throw new Error('no info event emitted');
+      return info;
+    };
+    expect((await run({ FORJA_PROFILE: 'dev' })).profile).toBe('dev');
+    expect((await run({})).profile).toBeNull();
   });
 
   test('missing git → warn, exit 0', async () => {
@@ -437,7 +479,7 @@ describe('runDoctor — sealing check (§13.3 / slice 60)', () => {
   });
 
   test('mode=worm-file with empty seal file → warn "no entries yet"', async () => {
-    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/agent/seal.log');
+    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/forja/seal.log');
     const out = captured();
     const code = await runDoctor({
       env,
@@ -457,7 +499,7 @@ describe('runDoctor — sealing check (§13.3 / slice 60)', () => {
   });
 
   test('mode=worm-file with N entries → ok with relative-time + count', async () => {
-    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/agent/seal.log');
+    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/forja/seal.log');
     const entries: SealEntry[] = [
       { seq: 1, ts: 1_000_000_000_000, hash: 'sha256:a' },
       { seq: 50, ts: 1_000_000_300_000, hash: 'sha256:b' }, // 5 minutes after start
@@ -481,11 +523,11 @@ describe('runDoctor — sealing check (§13.3 / slice 60)', () => {
     const text = out.lines.join('');
     expect(text).toContain('3 entries');
     expect(text).toContain('last 4h ago');
-    expect(text).toContain('worm-file at /var/log/agent/seal.log');
+    expect(text).toContain('worm-file at /var/log/forja/seal.log');
   });
 
   test('mode=worm-file with single entry → singular "1 entry"', async () => {
-    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/agent/seal.log');
+    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/forja/seal.log');
     const out = captured();
     const code = await runDoctor({
       env,
@@ -506,7 +548,7 @@ describe('runDoctor — sealing check (§13.3 / slice 60)', () => {
   });
 
   test('corrupted seal file (list throws) → fail with remediation', async () => {
-    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/agent/seal.log');
+    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/forja/seal.log');
     const factory = (): SealStore => ({
       append: () => ({ ok: true }),
       list: () => {
@@ -560,7 +602,7 @@ describe('runDoctor — sealing check (§13.3 / slice 60)', () => {
   });
 
   test('--json: sealing check is included with structured fields', async () => {
-    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/agent/seal.log');
+    const userPath = writeUserYaml('seal:\n  mode: worm-file\n  path: /var/log/forja/seal.log');
     const out = captured();
     await runDoctor({
       env,
@@ -634,9 +676,9 @@ describe('runDoctor — policy_load check (§13.3 / slice 61)', () => {
 
   test('project layer present → ok "project=ok"', async () => {
     // Project layer is discovered relative to cwd. Build a project
-    // policy under .agent/permissions.yaml.
+    // policy under .forja/permissions.yaml.
     const projDir = join(tmp, 'proj');
-    const agentDir = join(projDir, '.agent');
+    const agentDir = join(projDir, '.forja');
     mkdirSync(agentDir, { recursive: true });
     writeFileSync(join(agentDir, 'permissions.yaml'), 'defaults:\n  mode: strict\n');
     const out = captured();
@@ -660,8 +702,8 @@ describe('runDoctor — policy_load check (§13.3 / slice 61)', () => {
     const userPath = join(tmp, 'user-permissions.yaml');
     writeFileSync(userPath, 'defaults:\n  mode: strict\n');
     const projDir = join(tmp, 'proj');
-    mkdirSync(join(projDir, '.agent'), { recursive: true });
-    writeFileSync(join(projDir, '.agent', 'permissions.yaml'), 'defaults:\n  mode: strict\n');
+    mkdirSync(join(projDir, '.forja'), { recursive: true });
+    writeFileSync(join(projDir, '.forja', 'permissions.yaml'), 'defaults:\n  mode: strict\n');
     const out = captured();
     const code = await runDoctor({
       env,
@@ -892,8 +934,8 @@ describe('runDoctor — hash_chain check (§7.2 / §13.3 / slice 62)', () => {
     const text = out.lines.join('');
     expect(text).toContain('hash_chain');
     expect(text).toContain('BROKEN at seq 2');
-    expect(text).toContain('agent permission verify');
-    expect(text).toContain('agent permission rotate-chain');
+    expect(text).toContain('forja permission verify');
+    expect(text).toContain('forja permission rotate-chain');
   });
 
   test('install_id discovery failure → fail with remediation', async () => {

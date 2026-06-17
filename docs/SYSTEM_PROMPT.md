@@ -49,7 +49,7 @@ input.systemPrompt                                  ← base (typically empty)
 1. **Identity** — what Forja is, the declarative policy it runs under, verify-before-acting (`CONTEXT_TUNING §1.2`)
 2. **Environment** — cwd, profile, git branch, current date (`§1.3`, `§1.4`)
 3. **Response format** — output surface fixed (`§1.5`)
-4. **Constraints** — the `# Constraints` block: correctness rules + ask-don't-presume (`clarify`) + build discipline + match-surrounding-code + persistence nudges (`pin_context`, `todo_create`/`working_state_update`) + security posture + hard-to-reverse confirm + goal-contradictory cancellation (`§1.6` + `SECURITY_GUIDELINE §0.11`)
+4. **Constraints** — the `# Constraints` block: correctness rules + ask-don't-presume (`clarify`) + build discipline + match-surrounding-code + persistence nudges (`memory_write`, `todo_create`/`working_state_update`) + security posture + hard-to-reverse confirm + goal-contradictory cancellation (`§1.6` + `SECURITY_GUIDELINE §0.11`)
 5. **Parallel hint** — surfaces the harness's parallel-tool affordance
 6. **Tool ergonomics** — highest-payoff tool-usage patterns distilled from `TOOL_ERGONOMICS.md`
 7. **Playbook hint** — discovery table + delegation criteria for subagent routing (`PLAYBOOKS §1.4`)
@@ -195,7 +195,7 @@ Each composer lives in its own file under `src/cli/`. The file owns the composer
 | `composeWithIdentity` | `identity-prompt.ts` | Role-as-tool marker; what Forja is + declarative policy + verify-before-acting (`§1.2`) |
 | `composeWithEnvironment` | `environment-prompt.ts` | Situational anchor: cwd, profile, git branch, current date (`§1.3`, `§1.4`) |
 | `composeWithResponseFormat` | `response-format.ts` | Output surface (`§1.5`, `ANTI_PATTERNS §1.3`) — no "be concise" tuning |
-| `composeWithConstraints` | `constraints-prompt.ts` | `# Constraints` block (`§1.6`) — correctness + ask-don't-presume + build discipline + match-surrounding-code + persistence nudges (`pin_context`, `todo_create`/`working_state_update`) + security + hard-to-reverse + goal-contradictory cancellation |
+| `composeWithConstraints` | `constraints-prompt.ts` | `# Constraints` block (`§1.6`) — correctness + ask-don't-presume + build discipline + match-surrounding-code + persistence nudges (`memory_write`, `todo_create`/`working_state_update`) + security + hard-to-reverse + goal-contradictory cancellation |
 | `composeWithToolErgonomics` | `tool-ergonomics-prompt.ts` | High-payoff tool patterns distilled from `TOOL_ERGONOMICS.md` |
 | `composeWithPlaybookHint` | `playbook-prompt.ts` | Subagent discovery table + delegation criteria (`PLAYBOOKS §1.4`) |
 | `composeWithProjectContext` | `project-context.ts` | `[project_context]` block (`§2.0`) — eager, trust-gated guide content (AGENTS.md / CLAUDE.md / …) + caveat |

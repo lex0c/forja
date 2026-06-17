@@ -1,4 +1,4 @@
-// `agent --memory <verb>` handler. Independent of bootstrap (no
+// `forja --memory <verb>` handler. Independent of bootstrap (no
 // provider, no permissions, no tool registry — only DB + cwd) so
 // inspecting memory doesn't require an API key. Mirrors the
 // structure of `runWorktreesCli` and `runCheckpointsCli`.
@@ -102,7 +102,7 @@ const runList = (
   err: (s: string) => void,
 ): number => {
   // Optional scope positional. We accept zero or one positional;
-  // anything else is a typo (e.g. `agent --memory list role` when
+  // anything else is a typo (e.g. `forja --memory list role` when
   // the operator meant `show`).
   if (positionals.length > 1) {
     err(`forja: --memory list takes at most one scope positional; got: ${positionals.join(' ')}\n`);
@@ -242,8 +242,8 @@ export const runMemoryCli = async (input: MemoryCliInput): Promise<number> => {
     if (input.dbOverride === undefined) migrate(db);
 
     // Build the registry from the REPO root, not the invocation
-    // cwd. Project memory lives at `<repo>/.agent/memory/...`;
-    // an operator running `agent --memory list` from a subdir
+    // cwd. Project memory lives at `<repo>/.forja/memory/...`;
+    // an operator running `forja --memory list` from a subdir
     // would otherwise see empty project scopes. Falls back to
     // cwd when not in a git repo. The CLI doesn't have a session
     // (operator-driven inspection); the registry's audit hook

@@ -1,4 +1,4 @@
-// `agent gc` CLI handler tests. The orchestrator is already pinned
+// `forja gc` CLI handler tests. The orchestrator is already pinned
 // by tests/audit/gc.test.ts — this file covers the CLI seam:
 // rendering, JSON shape, table filter forwarding, exit codes.
 
@@ -92,7 +92,7 @@ describe('runGcCli — dry-run', () => {
     for (const t of ['recap_cache', 'retrieval_trace', 'context_pins', 'bg_processes']) {
       expect(stdout).toContain(t);
     }
-    expect(stdout).toContain('agent gc --force');
+    expect(stdout).toContain('forja gc --force');
   });
 
   test('JSON dry-run shape exposes mode, config, tables, command', async () => {
@@ -119,7 +119,7 @@ describe('runGcCli — dry-run', () => {
     expect(parsed.config.context_pins_days).toBe(90); // default
     // Phase 1 + Phase 2 + Phase 3 = 11 tables (outcome_signals enabled by default).
     expect(parsed.tables.length).toBe(11);
-    expect(parsed.command).toBe('agent gc --force');
+    expect(parsed.command).toBe('forja gc --force');
     // The "old" pin (200d back) is way past 90d default → 1 would-delete.
     const pinTable = parsed.tables.find((t) => t.table === 'context_pins');
     expect(pinTable?.beforeCount).toBe(2);
@@ -203,7 +203,7 @@ describe('runGcCli — config provenance', () => {
     // both stay below cutoff — no, fresh is 1s old, way under 1d.
     // So with 1d retention: old → deleted, fresh → kept. Same as
     // default 90d, but proves config is picked up.
-    const projectConfigDir = join(cwd, '.agent');
+    const projectConfigDir = join(cwd, '.forja');
     const projectConfigPath = join(projectConfigDir, 'config.toml');
     require('node:fs').mkdirSync(projectConfigDir, { recursive: true });
     writeFileSync(projectConfigPath, '[audit.retention]\ncontext_pins = 1\n');
@@ -224,11 +224,11 @@ describe('runGcCli — config provenance', () => {
       configSources: { project: string | null };
     };
     expect(parsed.config.context_pins_days).toBe(1);
-    expect(parsed.configSources.project).toContain('.agent/config.toml');
+    expect(parsed.configSources.project).toContain('.forja/config.toml');
   });
 
   test('warnings surface on stderr', async () => {
-    const projectConfigDir = join(cwd, '.agent');
+    const projectConfigDir = join(cwd, '.forja');
     const projectConfigPath = join(projectConfigDir, 'config.toml');
     require('node:fs').mkdirSync(projectConfigDir, { recursive: true });
     writeFileSync(projectConfigPath, '[audit.retention]\nretreival_trace = 7\n');
@@ -436,11 +436,70 @@ describe('runGcCli — dry-run no-mutation invariant', () => {
   });
 });
 
+describe('runGcCli — pending-migration hint', () => {
+  // An empty-schema DB (file exists but migrate() never ran) makes the dry-run
+  // report pending migrations; the hint names a --force command to apply them.
+  // That command must stay in the active namespace — the dry-run inspected the
+  // profiled DB, so a bare `forja gc --force` would migrate/sweep the canonical
+  // real state instead.
+  const seedEmptyDb = (p: string) => {
+    const seed = openDb(p);
+    seed.close();
+  };
+
+  test('canonical: hint names the bare `forja gc --force`', async () => {
+    const emptyDb = join(xdgHome, 'pending.db');
+    seedEmptyDb(emptyDb);
+    const code = await runGcCli({
+      cwd,
+      force: false,
+      json: false,
+      tables: [],
+      out,
+      err,
+      dbPath: emptyDb,
+      now: () => NOW,
+    });
+    expect([0, 2]).toContain(code);
+    const stderr = errBuf.join('');
+    expect(stderr).toContain('migration(s) pending');
+    expect(stderr).toContain('`forja gc --force`');
+  });
+
+  test('under a profile, the hint carries --profile', async () => {
+    const prev = process.env.FORJA_PROFILE;
+    process.env.FORJA_PROFILE = 'dev';
+    try {
+      const emptyDb = join(xdgHome, 'pending-prof.db');
+      seedEmptyDb(emptyDb);
+      const code = await runGcCli({
+        cwd,
+        force: false,
+        json: false,
+        tables: [],
+        out,
+        err,
+        dbPath: emptyDb,
+        now: () => NOW,
+      });
+      expect([0, 2]).toContain(code);
+      const stderr = errBuf.join('');
+      expect(stderr).toContain('migration(s) pending');
+      expect(stderr).toContain('`forja --profile dev gc --force`');
+      // NOT the bare form (would point at the operator's real DB).
+      expect(stderr).not.toContain('`forja gc --force`');
+    } finally {
+      if (prev === undefined) delete process.env.FORJA_PROFILE;
+      else process.env.FORJA_PROFILE = prev;
+    }
+  });
+});
+
 describe('runGcCli — repoRoot resolution', () => {
-  test('gc from <repo>/src/ honors <repo>/.agent/config.toml (not subdir defaults)', async () => {
+  test('gc from <repo>/src/ honors <repo>/.forja/config.toml (not subdir defaults)', async () => {
     // Operator-reported bug: handler passed raw cwd to
     // loadRetentionConfig, so running from a subdir read
-    // <subdir>/.agent/config.toml (non-existent) and silently used
+    // <subdir>/.forja/config.toml (non-existent) and silently used
     // defaults. In --force mode that pruned rows with the wrong
     // retention window — data-retention regression.
     //
@@ -455,7 +514,7 @@ describe('runGcCli — repoRoot resolution', () => {
       return;
     }
     // Write project config at REPO ROOT with a distinctive override.
-    const projectConfigDir = join(cwd, '.agent');
+    const projectConfigDir = join(cwd, '.forja');
     const projectConfigPath = join(projectConfigDir, 'config.toml');
     const { mkdirSync: mkdir } = await import('node:fs');
     mkdir(projectConfigDir, { recursive: true });
@@ -492,11 +551,11 @@ describe('runGcCli — repoRoot resolution', () => {
 
 describe('runGcCli — suggested force command preserves scope', () => {
   // Operator-reported safety bug: dry-run with --table=X suggested
-  // a bare `agent gc --force` command. Copy-pasting widened the
+  // a bare `forja gc --force` command. Copy-pasting widened the
   // sweep to ALL tables — data loss outside the inspected scope.
   // Fix: the suggested command echoes the same --table=X flags.
 
-  test('no --table → "agent gc --force" (unscoped)', async () => {
+  test('no --table → "forja gc --force" (unscoped)', async () => {
     const code = await runGcCli({
       cwd,
       force: false,
@@ -509,7 +568,7 @@ describe('runGcCli — suggested force command preserves scope', () => {
     });
     expect(code).toBe(0);
     const parsed = JSON.parse(outBuf.join('').trim()) as { command?: string };
-    expect(parsed.command).toBe('agent gc --force');
+    expect(parsed.command).toBe('forja gc --force');
   });
 
   test('single --table → preserved in suggestion', async () => {
@@ -525,7 +584,7 @@ describe('runGcCli — suggested force command preserves scope', () => {
     });
     expect(code).toBe(0);
     const parsed = JSON.parse(outBuf.join('').trim()) as { command?: string };
-    expect(parsed.command).toBe('agent gc --force --table=context_pins');
+    expect(parsed.command).toBe('forja gc --force --table=context_pins');
   });
 
   test('multiple --table → all preserved, order maintained', async () => {
@@ -542,7 +601,7 @@ describe('runGcCli — suggested force command preserves scope', () => {
     expect(code).toBe(0);
     const parsed = JSON.parse(outBuf.join('').trim()) as { command?: string };
     expect(parsed.command).toBe(
-      'agent gc --force --table=memory_events --table=hook_runs --table=outcomes',
+      'forja gc --force --table=memory_events --table=hook_runs --table=outcomes',
     );
   });
 
@@ -559,10 +618,10 @@ describe('runGcCli — suggested force command preserves scope', () => {
     });
     expect(code).toBe(0);
     const stdout = outBuf.join('');
-    expect(stdout).toContain('agent gc --force --table=retrieval_trace');
+    expect(stdout).toContain('forja gc --force --table=retrieval_trace');
     // Negative polarity: bare suggestion must NOT appear (would
     // otherwise indicate the scope was dropped).
-    expect(stdout).not.toMatch(/agent gc --force\n/);
+    expect(stdout).not.toMatch(/forja gc --force\n/);
   });
 
   test('force mode JSON omits command (no follow-up to suggest)', async () => {
@@ -596,7 +655,7 @@ describe('runGcCli — suggested force command preserves scope', () => {
     });
     expect(code).toBe(0);
     const parsed = JSON.parse(outBuf.join('').trim()) as { command?: string };
-    expect(parsed.command).toBe('agent gc --force --table=bg_processes');
-    expect(errBuf.join('')).toContain('agent gc --force --table=bg_processes');
+    expect(parsed.command).toBe('forja gc --force --table=bg_processes');
+    expect(errBuf.join('')).toContain('forja gc --force --table=bg_processes');
   });
 });

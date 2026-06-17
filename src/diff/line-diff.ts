@@ -11,6 +11,13 @@ export type DiffLineType = 'add' | 'del' | 'ctx';
 export interface DiffLine {
   type: DiffLineType;
   text: string;
+  // 1-based position in the BEFORE file. Present for `del` and `ctx`
+  // (lines that exist in the original); absent for a pure `add`.
+  oldLine?: number;
+  // 1-based position in the AFTER file. Present for `add` and `ctx`;
+  // absent for a `del`. The renderer's gutter shows `newLine ?? oldLine`
+  // — new-file numbers for surviving/added lines, old-file for deletions.
+  newLine?: number;
 }
 
 export interface FileDiff {
@@ -98,22 +105,42 @@ const diffOps = (a: string[], b: string[], context: number): DiffLine[] => {
   }
 
   const ops: DiffLine[] = [];
+  // Absolute 1-based line counters, threaded so each op carries its
+  // position. The lead-in starts at the common prefix offset; old and new
+  // share it (the prefix is identical on both sides). `lcsDiff` is content-
+  // only — it doesn't know absolute positions — so we re-stamp its ops here
+  // by advancing the counters per op type (ctx → both, del → old, add → new).
+  const leadInStart = Math.max(0, lo - context);
+  let oldIdx = leadInStart;
+  let newIdx = leadInStart;
+  const push = (type: DiffLineType, text: string): void => {
+    if (type === 'del') {
+      ops.push({ type, text, oldLine: oldIdx + 1 });
+      oldIdx += 1;
+    } else if (type === 'add') {
+      ops.push({ type, text, newLine: newIdx + 1 });
+      newIdx += 1;
+    } else {
+      ops.push({ type, text, oldLine: oldIdx + 1, newLine: newIdx + 1 });
+      oldIdx += 1;
+      newIdx += 1;
+    }
+  };
+
   // trailing `context` lines of the common prefix (lead-in to the change)
-  for (let i = Math.max(0, lo - context); i < lo; i++) ops.push({ type: 'ctx', text: a[i] ?? '' });
+  for (let i = leadInStart; i < lo; i++) push('ctx', a[i] ?? '');
 
   const midA = a.slice(lo, aHi);
   const midB = b.slice(lo, bHi);
   if (midA.length > MAX_LCS_LINES || midB.length > MAX_LCS_LINES) {
-    for (const text of midA) ops.push({ type: 'del', text });
-    for (const text of midB) ops.push({ type: 'add', text });
+    for (const text of midA) push('del', text);
+    for (const text of midB) push('add', text);
   } else {
-    ops.push(...lcsDiff(midA, midB));
+    for (const op of lcsDiff(midA, midB)) push(op.type, op.text);
   }
 
   // leading `context` lines of the common suffix (lead-out)
-  for (let i = aHi; i < Math.min(a.length, aHi + context); i++) {
-    ops.push({ type: 'ctx', text: a[i] ?? '' });
-  }
+  for (let i = aHi; i < Math.min(a.length, aHi + context); i++) push('ctx', a[i] ?? '');
   return ops;
 };
 

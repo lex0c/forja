@@ -1,4 +1,4 @@
-// Slice 138 — `agent permission calibration-export` CLI verb.
+// Slice 138 — `forja permission calibration-export` CLI verb.
 // Tests cover:
 //   - parseArgs: --since-days / --all-decisions parsing + scope
 //     guard against other verbs;

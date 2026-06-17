@@ -1,4 +1,5 @@
 import { posix, win32 } from 'node:path';
+import { appDirName, projectDirName } from '../config/app-namespace.ts';
 
 // Path discovery for subagent definitions (spec §11.1). Mirrors the
 // shape of `permissions/paths.ts` so the two layers stay legible
@@ -7,9 +8,9 @@ import { posix, win32 } from 'node:path';
 // unavailable", which the loader turns into "skip the directory".
 //
 // Layout:
-//   user:    $XDG_CONFIG_HOME/agent/agents/*.md  (Linux/macOS, default ~/.config)
-//            %APPDATA%\agent\agents\*.md         (Windows)
-//   project: <cwd>/.agent/agents/*.md
+//   user:    $XDG_CONFIG_HOME/forja/playbooks/*.md  (Linux/macOS, default ~/.config)
+//            %APPDATA%\forja\forjas\*.md         (Windows)
+//   project: <cwd>/.forja/playbooks/*.md
 //
 // We deliberately do NOT support an enterprise scope here — subagents
 // are author-friendly extensibility (spec §11.1: "pluggáveis sem
@@ -26,26 +27,26 @@ export const userAgentsDir = (
   const p = pathMod(platform);
   const xdg = env.XDG_CONFIG_HOME;
   if (xdg !== undefined && xdg.length > 0 && p.isAbsolute(xdg)) {
-    return p.join(xdg, 'agent', 'agents');
+    return p.join(xdg, appDirName(env), 'playbooks');
   }
   if (platform === 'win32') {
     const appdata = env.APPDATA;
     if (appdata !== undefined && appdata.length > 0 && p.isAbsolute(appdata)) {
-      return p.join(appdata, 'agent', 'agents');
+      return p.join(appdata, appDirName(env), 'playbooks');
     }
     const userprofile = env.USERPROFILE;
     if (userprofile !== undefined && userprofile.length > 0 && p.isAbsolute(userprofile)) {
-      return p.join(userprofile, 'AppData', 'Roaming', 'agent', 'agents');
+      return p.join(userprofile, 'AppData', 'Roaming', appDirName(env), 'playbooks');
     }
     return null;
   }
   const home = env.HOME;
   if (home === undefined || home.length === 0 || !p.isAbsolute(home)) return null;
-  return p.join(home, '.config', 'agent', 'agents');
+  return p.join(home, '.config', appDirName(env), 'playbooks');
 };
 
 export const projectAgentsDir = (cwd: string): string =>
-  pathMod(process.platform).join(cwd, '.agent', 'agents');
+  pathMod(process.platform).join(cwd, projectDirName(), 'playbooks');
 
 // Built-in subagent definitions ship inside the binary at
 // `src/subagents/builtin/`. Returned as an absolute path computed at

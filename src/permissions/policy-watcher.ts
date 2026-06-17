@@ -4,15 +4,15 @@
 // to the engine.
 //
 // Watched paths (per `paths.ts`):
-//   - Enterprise: /etc/agent/permissions.yaml (or %PROGRAMDATA% on Windows)
-//   - User:       ~/.config/agent/permissions.yaml (or XDG/APPDATA)
-//   - Project:    <cwd>/.agent/permissions.yaml
+//   - Enterprise: /etc/forja/permissions.yaml (or %PROGRAMDATA% on Windows)
+//   - User:       ~/.config/forja/permissions.yaml (or XDG/APPDATA)
+//   - Project:    <cwd>/.forja/permissions.yaml
 //
 // Only EXISTING paths are watched. Files created mid-session won't
 // trigger reloads until the next bootstrap; closing that gap would
 // require watching the parent directory + filtering by basename,
 // which adds complexity for a rare scenario (operators typically
-// create policy files via `agent init`, not mid-session).
+// create policy files via `forja init`, not mid-session).
 //
 // Events are debounced (default 100ms) — most editors fire multiple
 // fs events for a single save (truncate + write, atomic rename,

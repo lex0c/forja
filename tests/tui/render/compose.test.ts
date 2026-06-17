@@ -59,7 +59,7 @@ describe('compacting chip', () => {
     const s: LiveState = {
       ...startedSession(),
       compacting: { startedAt: 0 },
-      thinking: { startedAt: 0, messageId: 'm1' },
+      thinking: { startedAt: 0, messageId: 'm1', text: '' },
     };
     const out = composeLive(s, caps, 3000).join('\n');
     expect(out).not.toContain('Compacting context…');
@@ -264,7 +264,7 @@ describe('composeLive layout', () => {
       cacheRead: null,
       cacheCreation: null,
     };
-    s.thinking = { startedAt: 0, messageId: 'm1' };
+    s.thinking = { startedAt: 0, messageId: 'm1', text: '' };
     const out = composeLive(s, caps, 1000);
     const chipVerb = verbInLine(out[1]);
     expect(chipVerb).not.toBeNull();
@@ -277,7 +277,7 @@ describe('composeLive layout', () => {
     // assistant:start (out-of-order producer, mid-stream resume).
     // The chip should still render so the operator sees activity.
     const s = startedSession();
-    s.thinking = { startedAt: 0, messageId: 'm1' };
+    s.thinking = { startedAt: 0, messageId: 'm1', text: '' };
     const out = composeLive(s, caps, 1000);
     const chipVerb = verbInLine(out[1]);
     expect(COGNITIVE_VERB_POOL).toContain(chipVerb ?? '');

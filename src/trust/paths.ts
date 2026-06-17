@@ -1,5 +1,5 @@
 // Path discovery for the trusted-directories list. Spec:
-// AGENTIC_CLI.md §9.1 — `~/.config/agent/trusted_dirs.json` (Linux /
+// AGENTIC_CLI.md §9.1 — `~/.config/forja/trusted_dirs.json` (Linux /
 // macOS) or the Windows-equivalent under %APPDATA%. The list tracks
 // absolute paths the operator has explicitly approved, so subsequent
 // invocations from the same cwd skip the trust prompt.
@@ -13,6 +13,7 @@
 // re-prompts; nothing persists).
 
 import { posix, win32 } from 'node:path';
+import { appDirName } from '../config/app-namespace.ts';
 
 const pathMod = (platform: NodeJS.Platform) => (platform === 'win32' ? win32 : posix);
 
@@ -23,20 +24,20 @@ export const trustListPath = (
   const p = pathMod(platform);
   const xdg = env.XDG_CONFIG_HOME;
   if (xdg !== undefined && xdg.length > 0 && p.isAbsolute(xdg)) {
-    return p.join(xdg, 'agent', 'trusted_dirs.json');
+    return p.join(xdg, appDirName(env), 'trusted_dirs.json');
   }
   if (platform === 'win32') {
     const appdata = env.APPDATA;
     if (appdata !== undefined && appdata.length > 0 && p.isAbsolute(appdata)) {
-      return p.join(appdata, 'agent', 'trusted_dirs.json');
+      return p.join(appdata, appDirName(env), 'trusted_dirs.json');
     }
     const userprofile = env.USERPROFILE;
     if (userprofile !== undefined && userprofile.length > 0 && p.isAbsolute(userprofile)) {
-      return p.join(userprofile, 'AppData', 'Roaming', 'agent', 'trusted_dirs.json');
+      return p.join(userprofile, 'AppData', 'Roaming', appDirName(env), 'trusted_dirs.json');
     }
     return null;
   }
   const home = env.HOME;
   if (home === undefined || home.length === 0 || !p.isAbsolute(home)) return null;
-  return p.join(home, '.config', 'agent', 'trusted_dirs.json');
+  return p.join(home, '.config', appDirName(env), 'trusted_dirs.json');
 };

@@ -1,44 +1,19 @@
 import { describe, expect, test } from 'bun:test';
+import { BUILTIN_TOOLS } from '../../src/tools/builtin/index.ts';
 import { TOOL_VOCAB, lookupToolVocab } from '../../src/tui/tool-vocab.ts';
 
 describe('tool-vocab', () => {
-  test('every builtin tool name has a registered vocab entry', () => {
-    // Add to this list when registering a new builtin tool — keeps
-    // the vocab table in lockstep with `src/tools/builtin/`.
-    const builtins = [
-      'bash',
-      'bash_background',
-      'bash_kill',
-      'bash_output',
-      'clarify',
-      'edit_file',
-      'git',
-      'glob',
-      'grep',
-      'memory_list',
-      'memory_read',
-      'memory_search',
-      'memory_write',
-      'monitor',
-      'pin_context',
-      'read_file',
-      'task',
-      'task_async',
-      'task_await',
-      'task_cancel',
-      'task_list',
-      'task_sync',
-      'todo_clear',
-      'todo_create',
-      'todo_get',
-      'todo_list',
-      'todo_update',
-      'wait_for',
-      'write_file',
-    ];
-    for (const name of builtins) {
-      expect(TOOL_VOCAB[name]).toBeDefined();
-    }
+  test('every registered builtin tool has a vocab entry (derived from the registry)', () => {
+    // Derive from the AUTHORITATIVE registry, not a hand-maintained list. The
+    // old hand list silently drifted and hid 8 builtins with no vocab entry
+    // (skill_invoke/show/list, reminder/reminder_cancel/reminder_list,
+    // retrieve_context, bash_list) — they fell back to the awkward
+    // `Called <name>` chip. Deriving from BUILTIN_TOOLS means a new builtin
+    // without a vocab entry fails here automatically, no list to update.
+    const missing = BUILTIN_TOOLS.filter((t) => TOOL_VOCAB[t.name] === undefined).map(
+      (t) => t.name,
+    );
+    expect(missing).toEqual([]);
   });
 
   test('lookupToolVocab returns the registered entry when present', () => {
@@ -89,6 +64,25 @@ describe('tool-vocab', () => {
     for (const name of ['task_sync', 'task_async', 'task_await', 'task_cancel', 'task_list']) {
       expect(TOOL_VOCAB[name]?.silent).toBe(true);
     }
+  });
+
+  test('skill_invoke / skill_show surface the skill name as subject', () => {
+    // So the chip reads `Invoked skill · review-diff`, not the contentless
+    // `Called skill_invoke` — the operator sees WHICH skill ran.
+    expect(TOOL_VOCAB.skill_invoke?.subject?.({ name: 'review-diff' })).toBe('review-diff');
+    expect(TOOL_VOCAB.skill_show?.subject?.({ name: 'review-diff' })).toBe('review-diff');
+    expect(TOOL_VOCAB.skill_invoke?.finalVerb).toBe('Invoked skill');
+    expect(TOOL_VOCAB.skill_invoke?.subject?.({})).toBeNull();
+  });
+
+  test('working_state_update is silent on success but reveals failures', () => {
+    // Success feedback is the `working_state_updated` event → scrollback panel
+    // block, so the per-call chip is silent. revealFailure keeps a rejected
+    // update visible (no success event fires for it, so it would otherwise
+    // vanish entirely).
+    expect(TOOL_VOCAB.working_state_update?.silent).toBe(true);
+    expect(TOOL_VOCAB.working_state_update?.revealFailure).toBe(true);
+    expect(TOOL_VOCAB.working_state_update?.finalVerb).toBe('Updated working state');
   });
 
   test('memory_list surfaces scope: <name> as subject', () => {

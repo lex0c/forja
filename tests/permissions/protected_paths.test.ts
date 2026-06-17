@@ -106,7 +106,7 @@ describe('classifyProtectedPath — system deny tier', () => {
 });
 
 describe('classifyProtectedPath — escalate tier (writes only)', () => {
-  test.each(['/etc', '/etc/hosts', '/etc/passwd', '/etc/agent/policy.toml'])(
+  test.each(['/etc', '/etc/hosts', '/etc/passwd', '/etc/forja/policy.toml'])(
     'absolute escalate root %s',
     (absPath) => {
       expect(classifyProtectedPath({ absPath, op: 'write', home: HOME, cwd: CWD })).toBe(
@@ -127,8 +127,8 @@ describe('classifyProtectedPath — escalate tier (writes only)', () => {
   );
 
   test.each([
-    '/home/op/.config/agent',
-    '/home/op/.config/agent/policy.yaml',
+    '/home/op/.config/forja',
+    '/home/op/.config/forja/policy.yaml',
     '/home/op/.config/claude',
     '/home/op/.config/claude/install_id',
   ])('tilde escalate dir %s', (absPath) => {
@@ -139,8 +139,8 @@ describe('classifyProtectedPath — escalate tier (writes only)', () => {
     '/work/proj/.git',
     '/work/proj/.git/HEAD',
     '/work/proj/.git/refs/heads/main',
-    '/work/proj/.agent',
-    '/work/proj/.agent/sessions.db',
+    '/work/proj/.forja',
+    '/work/proj/.forja/sessions.db',
     '/work/proj/.claude',
     '/work/proj/.claude/settings.json',
   ])('cwd escalate dir %s', (absPath) => {
@@ -223,6 +223,176 @@ describe('classifyProtectedPath — escalate tier (writes only)', () => {
       }),
     ).toBe('escalate');
   });
+
+  test('escalate dirs follow XDG relocation (no silent own-policy edit under XDG)', () => {
+    // The escalate floor forces confirm-on-write to Forja's own config/data
+    // dirs even in acceptEdits/autonomous. Under an XDG relocation the real dir
+    // is at <XDG>/forja, so a home-only match would let a write to the relocated
+    // own permissions.yaml skip the confirm — mirror the sandbox's XDG mask.
+    // No profile here: explicitly cleared so a leaked FORJA_PROFILE can't flip
+    // `.config/forja` into the foreign-deny tier. Unique home avoids the cache.
+    const prevProfile = process.env.FORJA_PROFILE;
+    const prevData = process.env.XDG_DATA_HOME;
+    const prevConfig = process.env.XDG_CONFIG_HOME;
+    delete process.env.FORJA_PROFILE;
+    process.env.XDG_DATA_HOME = '/srv/data';
+    process.env.XDG_CONFIG_HOME = '/srv/conf';
+    const home = '/home/xdgesc';
+    const cwd = '/work/escalate-xdg';
+    try {
+      expect(
+        classifyProtectedPath({
+          absPath: '/srv/conf/forja/permissions.yaml',
+          op: 'write',
+          home,
+          cwd,
+        }),
+      ).toBe('escalate');
+      expect(
+        classifyProtectedPath({ absPath: '/srv/data/forja/sessions.db', op: 'write', home, cwd }),
+      ).toBe('escalate');
+      // Escalate is write-only — reads still pass.
+      expect(
+        classifyProtectedPath({
+          absPath: '/srv/conf/forja/permissions.yaml',
+          op: 'read',
+          home,
+          cwd,
+        }),
+      ).toBeNull();
+      // Home-relative still escalates too (defense in depth, both covered).
+      expect(
+        classifyProtectedPath({ absPath: '/home/xdgesc/.config/forja/x', op: 'write', home, cwd }),
+      ).toBe('escalate');
+    } finally {
+      const restore = (k: string, v: string | undefined) => {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      };
+      restore('FORJA_PROFILE', prevProfile);
+      restore('XDG_DATA_HOME', prevData);
+      restore('XDG_CONFIG_HOME', prevConfig);
+    }
+  });
+});
+
+describe('classifyProtectedPath — user-level foreign deny (under a profile)', () => {
+  // The operator's REAL `~/.config/forja` + `~/.local/share/forja` (audit DB,
+  // trust, sessions) must be denied for READ and WRITE from a profiled session
+  // — the user-level dual of the project foreign deny. A unique cwd per test so
+  // the (home,cwd) target cache never collides with a no-profile entry.
+  const withProfile = (cwd: string, fn: (cwd: string) => void) => {
+    const prev = process.env.FORJA_PROFILE;
+    process.env.FORJA_PROFILE = 'dev';
+    try {
+      fn(cwd);
+    } finally {
+      if (prev === undefined) delete process.env.FORJA_PROFILE;
+      else process.env.FORJA_PROFILE = prev;
+    }
+  };
+
+  test.each([
+    '/home/op/.config/forja',
+    '/home/op/.config/forja/permissions.yaml',
+    '/home/op/.local/share/forja',
+    '/home/op/.local/share/forja/audit.db',
+  ])('denies the real user dir %s for both read and write', (absPath) => {
+    withProfile('/work/foreign-user-deny', (cwd) => {
+      expect(classifyProtectedPath({ absPath, op: 'read', home: HOME, cwd })).toBe('deny');
+      expect(classifyProtectedPath({ absPath, op: 'write', home: HOME, cwd })).toBe('deny');
+    });
+  });
+
+  test('the active forja-dev user dir stays accessible (escalate-write / read-passthrough)', () => {
+    withProfile('/work/foreign-user-own', (cwd) => {
+      // Own namespace: NOT denied. Write still escalates (silent-edit guard),
+      // read passes through to the normal allow/confirm chain.
+      const own = '/home/op/.config/forja-dev/permissions.yaml';
+      expect(classifyProtectedPath({ absPath: own, op: 'write', home: HOME, cwd })).toBe(
+        'escalate',
+      );
+      expect(classifyProtectedPath({ absPath: own, op: 'read', home: HOME, cwd })).toBeNull();
+      const ownData = '/home/op/.local/share/forja-dev/audit.db';
+      expect(classifyProtectedPath({ absPath: ownData, op: 'read', home: HOME, cwd })).toBeNull();
+    });
+  });
+
+  test('no profile ⇒ no user-level deny (byte-identical: real dir is the active session)', () => {
+    // Distinct cwd from the profile tests; no FORJA_PROFILE set.
+    const cwd = '/work/foreign-user-none';
+    expect(
+      classifyProtectedPath({ absPath: '/home/op/.config/forja', op: 'read', home: HOME, cwd }),
+    ).toBeNull();
+    expect(
+      classifyProtectedPath({ absPath: '/home/op/.config/forja', op: 'write', home: HOME, cwd }),
+    ).toBe('escalate');
+  });
+
+  test('the foreign deny follows XDG_DATA_HOME / XDG_CONFIG_HOME relocation', () => {
+    // The real DB/config follow XDG (storage/paths.ts defaultDataDir) and the
+    // sandbox masks the XDG location — the engine floor must too, else a
+    // profiled read_file/grep (which run OUTSIDE the sandbox) can read the
+    // operator's real audit/sessions/config at <XDG>/forja. Unique home so the
+    // (home,cwd) target cache doesn't collide with a prior no-XDG entry.
+    const prevProfile = process.env.FORJA_PROFILE;
+    const prevData = process.env.XDG_DATA_HOME;
+    const prevConfig = process.env.XDG_CONFIG_HOME;
+    process.env.FORJA_PROFILE = 'dev';
+    process.env.XDG_DATA_HOME = '/srv/data';
+    process.env.XDG_CONFIG_HOME = '/srv/conf';
+    const home = '/home/xdgop';
+    const cwd = '/work/foreign-user-xdg';
+    try {
+      // Real canonical state at the XDG locations is DENIED (read + write).
+      expect(
+        classifyProtectedPath({ absPath: '/srv/data/forja/sessions.db', op: 'read', home, cwd }),
+      ).toBe('deny');
+      expect(
+        classifyProtectedPath({ absPath: '/srv/data/forja/audit.db', op: 'write', home, cwd }),
+      ).toBe('deny');
+      expect(
+        classifyProtectedPath({
+          absPath: '/srv/conf/forja/permissions.yaml',
+          op: 'read',
+          home,
+          cwd,
+        }),
+      ).toBe('deny');
+      // The active forja-dev at the XDG location stays accessible (own state) —
+      // segment-boundary match must not treat `forja-dev` as under `forja`.
+      expect(
+        classifyProtectedPath({
+          absPath: '/srv/data/forja-dev/sessions.db',
+          op: 'read',
+          home,
+          cwd,
+        }),
+      ).toBeNull();
+      // Home-relative location is STILL denied (defense in depth, both covered).
+      expect(
+        classifyProtectedPath({
+          absPath: '/home/xdgop/.local/share/forja/audit.db',
+          op: 'read',
+          home,
+          cwd,
+        }),
+      ).toBe('deny');
+      // Surfaced for the bash glob guard too.
+      const t = protectedTargets(home, cwd);
+      expect(t.tildeForeignDenyDirs).toContain('/srv/data/forja');
+      expect(t.tildeForeignDenyDirs).toContain('/srv/conf/forja');
+      expect(t.tildeForeignDenyDirs).not.toContain('/srv/data/forja-dev');
+    } finally {
+      const restore = (k: string, v: string | undefined) => {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      };
+      restore('FORJA_PROFILE', prevProfile);
+      restore('XDG_DATA_HOME', prevData);
+      restore('XDG_CONFIG_HOME', prevConfig);
+    }
+  });
 });
 
 describe('protectedTargets', () => {
@@ -235,10 +405,38 @@ describe('protectedTargets', () => {
     expect(t.absoluteEscalate).toEqual(['/etc']);
     expect(t.tildeEscalateFiles).toContain('/home/op/.bashrc');
     expect(t.tildeEscalateFiles).toContain('/home/op/.zshrc');
-    expect(t.tildeEscalateDirs).toContain('/home/op/.config/agent');
+    expect(t.tildeEscalateDirs).toContain('/home/op/.config/forja');
     expect(t.cwdEscalateDirs).toContain('/work/proj/.git');
-    expect(t.cwdEscalateDirs).toContain('/work/proj/.agent');
+    expect(t.cwdEscalateDirs).toContain('/work/proj/.forja');
     expect(t.cwdEscalateDirs).toContain('/work/proj/.claude');
+    // Default namespace: no foreign deny roots (project or user level).
+    expect(t.cwdForeignDenyDirs).toEqual([]);
+    expect(t.tildeForeignDenyDirs).toEqual([]);
+  });
+
+  test('under a profile, surfaces the foreign canonical .forja deny root (for the glob guard)', () => {
+    // The bash glob guard consumes protectedTargets, so the foreign deny must
+    // appear here too (not just in classifyProtectedPath) — else a glob like
+    // `.forja/*` / `../.forja/*` slips the protected-glob refuse in
+    // sandbox-host / in-process runs. Synthetic cwd ⇒ resolveRepoRoot falls
+    // back to cwd; the repo-root anchoring for a subdir is covered by the
+    // real-git shakeout. The active `.forja-<profile>/` is NOT foreign.
+    const prev = process.env.FORJA_PROFILE;
+    process.env.FORJA_PROFILE = 'dev';
+    const cwd = '/work/profiled-targets';
+    try {
+      const t = protectedTargets(HOME, cwd);
+      expect(t.cwdForeignDenyDirs).toContain(`${cwd}/.forja`);
+      expect(t.cwdForeignDenyDirs).not.toContain(`${cwd}/.forja-dev`);
+      // User-level foreign deny surfaced for the glob guard too: the real
+      // ~/.config/forja + ~/.local/share/forja, NOT the active forja-dev.
+      expect(t.tildeForeignDenyDirs).toContain('/home/op/.config/forja');
+      expect(t.tildeForeignDenyDirs).toContain('/home/op/.local/share/forja');
+      expect(t.tildeForeignDenyDirs).not.toContain('/home/op/.config/forja-dev');
+    } finally {
+      if (prev === undefined) delete process.env.FORJA_PROFILE;
+      else process.env.FORJA_PROFILE = prev;
+    }
   });
 });
 
@@ -607,6 +805,63 @@ describe('isDevSafe — /dev pseudo-device deny carve-out', () => {
     ]) {
       expect(classifyProtectedPath({ absPath: p, op: 'write', home: HOME, cwd: CWD })).toBe('deny');
       expect(classifyProtectedPath({ absPath: p, op: 'read', home: HOME, cwd: CWD })).toBe('deny');
+    }
+  });
+});
+
+// Dev-mode read floor: under a profile, the canonical `.forja/` is FOREIGN —
+// the operator's real project state — and is DENIED for READ and WRITE so a
+// profiled session can neither disclose nor touch it. The active
+// `.forja-<profile>/` is the session's own: writes escalate (confirm), reads
+// pass. On the default namespace `.forja/` is the active dir (covered by the
+// escalate-tier tests above), so there's no foreign dir and behavior is
+// unchanged.
+describe('classifyProtectedPath — profile isolates the foreign canonical .forja/', () => {
+  test('under FORJA_PROFILE: canonical .forja/ DENIED (read+write); active .forja-<profile>/ escalates writes, reads pass', () => {
+    const prev = process.env.FORJA_PROFILE;
+    process.env.FORJA_PROFILE = 'dev';
+    // Fresh cwd so the (home,cwd)-keyed target cache can't serve a no-profile
+    // entry from an earlier test (profile is frozen per process in production).
+    const cwd = '/work/profiled-proj';
+    try {
+      // The operator's REAL project state — foreign to a dev session: deny BOTH
+      // reads (no disclosure of real memory/config) and writes (no pollution).
+      expect(
+        classifyProtectedPath({
+          absPath: `${cwd}/.forja/permissions.yaml`,
+          op: 'write',
+          home: HOME,
+          cwd,
+        }),
+      ).toBe('deny');
+      expect(
+        classifyProtectedPath({
+          absPath: `${cwd}/.forja/memory/local/x.md`,
+          op: 'read',
+          home: HOME,
+          cwd,
+        }),
+      ).toBe('deny');
+      // The dev session's OWN project state — writes escalate (confirm), reads pass.
+      expect(
+        classifyProtectedPath({
+          absPath: `${cwd}/.forja-dev/permissions.yaml`,
+          op: 'write',
+          home: HOME,
+          cwd,
+        }),
+      ).toBe('escalate');
+      expect(
+        classifyProtectedPath({
+          absPath: `${cwd}/.forja-dev/memory/local/x.md`,
+          op: 'read',
+          home: HOME,
+          cwd,
+        }),
+      ).toBeNull();
+    } finally {
+      if (prev === undefined) delete process.env.FORJA_PROFILE;
+      else process.env.FORJA_PROFILE = prev;
     }
   });
 });

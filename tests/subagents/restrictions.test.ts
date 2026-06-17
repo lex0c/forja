@@ -297,6 +297,34 @@ describe('checkRestriction (tool dispatch hook)', () => {
     expect(v.reason).toContain('does not match');
   });
 
+  test('git_apply_patch rule is enforced via the path extractor (allow_paths fence)', () => {
+    const rules = { git_apply_patch: { allowPaths: ['src/**'] } };
+    // inside the fence → ok
+    expect(
+      checkRestriction('git_apply_patch', { path: 'src/a.ts', patch: 'x' }, rules, CWD).ok,
+    ).toBe(true);
+    // outside the fence → refuse (without this wiring the rule would be inert)
+    const outside = checkRestriction(
+      'git_apply_patch',
+      { path: 'secrets/x.ts', patch: 'x' },
+      rules,
+      CWD,
+    );
+    expect(outside.ok).toBe(false);
+  });
+
+  test('git_apply_patch fence honors the file_path alias (no path-only bypass)', () => {
+    const rules = { git_apply_patch: { allowPaths: ['src/**'] } };
+    // The tool resolves file_path > path; a file_path-only call must still be gated.
+    const v = checkRestriction(
+      'git_apply_patch',
+      { file_path: 'secrets/x.ts', patch: 'x' },
+      rules,
+      CWD,
+    );
+    expect(v.ok).toBe(false);
+  });
+
   test('git rule gates an explicit path; a pathless call with allow_paths is refused', () => {
     const rules = { git: { allowPaths: ['src/**'] } };
     // explicit path inside the fence → ok

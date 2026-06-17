@@ -49,7 +49,7 @@ import { sanitizeForCodeSpan } from './prompt-codespan.ts';
 //      modal's own probe surface (`repl.ts` checks the cwd for the
 //      same filename list before granting trust).
 //   2. repoRoot: probed only when `isRepoRootTrusted`. The common
-//      operator workflow (trust the whole repo, run `agent` from a
+//      operator workflow (trust the whole repo, run `forja` from a
 //      subdir) sets both flags true, so the fallback works. The
 //      narrow case (operator explicitly trusted only the subdir)
 //      skips the fallback and embeds nothing — never surfacing a
@@ -266,7 +266,7 @@ export const assembleProjectContext = (input: ProjectContextInput): ProjectConte
   // code-span sanitizer (backtick break-out, newline injection,
   // control bytes). The trust modal authorizes ACCESS to the
   // directory — it does NOT cleanse the path STRING of injection
-  // bytes (`cd /tmp/x\`y` pre-`agent`, a clone target with a crafted
+  // bytes (`cd /tmp/x\`y` pre-`forja`, a clone target with a crafted
   // name). The on-disk path is preserved verbatim on the return
   // value for observability/tests; only the embedded copy is
   // sanitized. The filename itself comes from the fixed list above,

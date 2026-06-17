@@ -340,7 +340,7 @@ export const countRetrievalTraces = (db: DB): number => {
 
 // ─── pruneRetrievalTrace ───────────────────────────────────────────────
 //
-// Retention sweep for `agent gc` (AGENTIC_CLI §2.1.3, AUDIT §1.2,
+// Retention sweep for `forja gc` (AGENTIC_CLI §2.1.3, AUDIT §1.2,
 // RETRIEVAL §10.1). Default retention 90d on `created_at`. Cutoff
 // EXCLUSIVE — a row at exactly `olderThanMs` is KEPT (matches
 // pruneVerifyAttempts and the other prune helpers).

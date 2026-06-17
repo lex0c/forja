@@ -1048,7 +1048,7 @@ export interface LoadSubagentsOptions {
   // tests don't depend on $HOME / $XDG_CONFIG_HOME. Pass null to
   // explicitly disable the user scope.
   userDir?: string | null;
-  // Same shape for project scope. Defaults to <cwd>/.agent/agents.
+  // Same shape for project scope. Defaults to <cwd>/.forja/playbooks.
   projectDir?: string | null;
   // Built-in scope path. Defaults to `src/subagents/builtin/`
   // (resolved at module load via import.meta.dir; see
@@ -1144,7 +1144,7 @@ export const loadSubagents = (options: LoadSubagentsOptions): SubagentSet => {
   // surfaces as a shadow row so the operator sees that a project /
   // user-scope file has replaced the shipped definition. The S11
   // review surfaced the risk: a project shipping
-  // `.agent/agents/verify-semantic.md` with `tools: [bash,
+  // `.forja/playbooks/verify-semantic.md` with `tools: [bash,
   // write_file]` silently replaces the safe built-in the moment the
   // operator opts into `--memory-verify-llm` in that repo. Surfacing
   // the shadow is defense-in-depth; the operator's trust modal +

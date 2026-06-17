@@ -89,6 +89,11 @@ export const TOOL_VOCAB: Readonly<Record<string, ToolVocab>> = {
     finalVerb: 'Edited file',
     subject: (a) => str(a.path),
   },
+  git_apply_patch: {
+    activeVerb: 'Applying patch',
+    finalVerb: 'Applied patch',
+    subject: (a) => str(a.path),
+  },
   bash: {
     activeVerb: 'Executing',
     finalVerb: 'Executed',
@@ -193,6 +198,19 @@ export const TOOL_VOCAB: Readonly<Record<string, ToolVocab>> = {
       return name ?? scope;
     },
   },
+  // working_state_update mutates the session's working-state panel. Its
+  // per-call chip is noise like the todo tools' — but unlike todos there is no
+  // live panel block, so on SUCCESS the `working_state_updated` event renders
+  // the current panel as a scrollback `info` block (render/working-state.ts)
+  // and this chip stays silent. `revealFailure` surfaces a failure chip (with
+  // the reason) when the update is rejected: the success event never fires on a
+  // failed update, so without it an error would be fully invisible.
+  working_state_update: {
+    activeVerb: 'Updating working state',
+    finalVerb: 'Updated working state',
+    silent: true,
+    revealFailure: true,
+  },
   // The todo tools are `silent`: the adapter tracks each call but emits no
   // chip. The operator's view of todos is the live `Tasks` block; the
   // per-call chips ("Added todos", "Updated todo", …) are just noise. The
@@ -287,6 +305,60 @@ export const TOOL_VOCAB: Readonly<Record<string, ToolVocab>> = {
       return kind !== null ? `kind: ${kind}` : null;
     },
   },
+  // Background-process inventory (`bash_list`); like the other list tools it
+  // surfaces a chip, with the optional status filter as the subject.
+  bash_list: {
+    activeVerb: 'Listing processes',
+    finalVerb: 'Listed processes',
+    subject: (a) => {
+      const s = str(a.status);
+      return s !== null ? `status: ${s}` : null;
+    },
+  },
+  // Reminders subsystem. The note is the salient subject for `reminder`; the id
+  // for a cancel; the list has no subject.
+  reminder: {
+    activeVerb: 'Setting reminder',
+    finalVerb: 'Set reminder',
+    subject: (a) => str(a.note),
+  },
+  reminder_cancel: {
+    activeVerb: 'Cancelling reminder',
+    finalVerb: 'Cancelled reminder',
+    subject: (a) => str(a.reminder_id),
+  },
+  reminder_list: {
+    activeVerb: 'Listing reminders',
+    finalVerb: 'Listed reminders',
+  },
+  // Context retrieval (memory/guide bodies). The query is the subject.
+  retrieve_context: {
+    activeVerb: 'Retrieving context',
+    finalVerb: 'Retrieved context',
+    subject: (a) => str(a.query),
+  },
+  // Skills. `invoke` runs one (and the model follows the body); `show` prints a
+  // body without running it; `list` enumerates the catalog. The skill NAME is
+  // the salient subject so the chip reads `Invoked skill · review-diff` rather
+  // than the contentless `Called skill_invoke`.
+  skill_invoke: {
+    activeVerb: 'Invoking skill',
+    finalVerb: 'Invoked skill',
+    subject: (a) => str(a.name),
+  },
+  skill_show: {
+    activeVerb: 'Reading skill',
+    finalVerb: 'Read skill',
+    subject: (a) => str(a.name),
+  },
+  skill_list: {
+    activeVerb: 'Listing skills',
+    finalVerb: 'Listed skills',
+    subject: (a) => {
+      const s = str(a.scope);
+      return s !== null ? `scope: ${s}` : null;
+    },
+  },
 };
 
 // Resolve a tool name to its vocabulary. Tools without an entry get a
@@ -313,6 +385,7 @@ const TOOL_NOUN: Readonly<Record<string, string>> = {
   bash: 'commands',
   edit_file: 'edits',
   write_file: 'writes',
+  git_apply_patch: 'patches',
   fetch_url: 'fetches',
   memory_read: 'reads',
   memory_search: 'searches',

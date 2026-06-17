@@ -7,7 +7,7 @@ setup:
   files:
     temp.txt: |
       doomed
-    .agent/permissions.yaml: |
+    .forja/permissions.yaml: |
       defaults:
         mode: bypass
       tools:

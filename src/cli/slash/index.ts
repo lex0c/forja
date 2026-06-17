@@ -5,7 +5,6 @@
 // `dispatch()` after parsing the user's slash input; this module
 // owns the lookup-and-execute path.
 
-import type { SubagentSet } from '../../subagents/index.ts';
 import { agentPolicyCommand } from './commands/agent-policy.ts';
 import { budgetCommand } from './commands/budget.ts';
 import { clearCommand } from './commands/clear.ts';
@@ -18,8 +17,6 @@ import { hooksCommand } from './commands/hooks.ts';
 import { memoryCommand } from './commands/memory.ts';
 import { modelCommand } from './commands/model.ts';
 import { permsCommand } from './commands/perms.ts';
-import { pinCommand } from './commands/pin.ts';
-import { buildPlaybookSlashCommands } from './commands/playbook.ts';
 import { quitCommand } from './commands/quit.ts';
 import { recapCommand } from './commands/recap.ts';
 import { sessionsCommand } from './commands/sessions.ts';
@@ -40,15 +37,10 @@ export type { SlashCommand, SlashContext, SlashResult } from './types.ts';
 // can list every other command via `listCommands`. Order matters
 // for /help output (operator reads top-to-bottom).
 //
-// `subagents` is optional: when provided, every definition with a
-// `slash` field contributes one entry to the registry, registered
-// AFTER builtins. A builtin name and a playbook slash colliding is
-// the playbook author's mistake — the registry's duplicate-name
-// check throws at construction so the operator sees the conflict
-// at boot, not at first `/<conflict>` press. Builtins keep their
-// names because the playbook is the new arrival; the author
-// renames `slash:` in their .md to fix.
-export const createBuiltinRegistry = (subagents?: SubagentSet): SlashRegistry => {
+// Playbooks have no operator-facing slash command (the `/review`-style
+// shortcuts were withdrawn). They stay reachable via task_sync /
+// task_async and the model's playbook hint.
+export const createBuiltinRegistry = (): SlashRegistry => {
   // Two-pass: build the registry without help first, then add help
   // with a closure over its `list()`. Avoids the chicken-and-egg
   // (help needs to know about itself + everything).
@@ -67,14 +59,15 @@ export const createBuiltinRegistry = (subagents?: SubagentSet): SlashRegistry =>
     permsCommand,
     historyCommand,
     memoryCommand,
-    pinCommand,
+    // `/pin` withdrawn: with pin_context also pulled from the model,
+    // no surface creates context pins anymore. pinCommand + its test
+    // and the context_pins store/infra stay intact (dormant) — only
+    // the slash entry is removed (see BACKLOG 2026-06-15).
     hooksCommand,
     agentPolicyCommand,
     skillCommand,
   ];
-  const playbookCommands =
-    subagents !== undefined ? buildPlaybookSlashCommands(subagents.byName.values()) : [];
-  const allWithoutHelp: readonly SlashCommand[] = [...builtinsWithoutHelp, ...playbookCommands];
+  const allWithoutHelp: readonly SlashCommand[] = builtinsWithoutHelp;
   const helpCommand = buildHelpCommand(() => [helpCommand, ...allWithoutHelp]);
   return createRegistry([helpCommand, ...allWithoutHelp]);
 };

@@ -666,10 +666,10 @@ describe('buildSbplProfile — XDG_DATA_HOME unmask defense (slice 140 sec-1)', 
 });
 
 // Slice 146: XDG_CONFIG_HOME unmask — macOS parity with the Linux
-// runner. Same threat: the 6 `.config/*` HIDE_PATHS_DIRS entries
-// (gcloud, azure, op, sops, agent, forja) live under
-// `$XDG_CONFIG_HOME/<sub>` when relocated. Pre-slice the SBPL deny
-// covered `<home>/.config/<sub>` only.
+// runner. Same threat: the `.config/*` hidePathsDirs() entries
+// (gcloud, azure, op, sops, forja — plus forja-<profile> under a
+// profile) live under `$XDG_CONFIG_HOME/<sub>` when relocated.
+// Pre-slice the SBPL deny covered `<home>/.config/<sub>` only.
 describe('buildSbplProfile — XDG_CONFIG_HOME unmask defense (slice 146)', () => {
   const originalXdg = process.env.XDG_CONFIG_HOME;
 
@@ -703,7 +703,6 @@ describe('buildSbplProfile — XDG_CONFIG_HOME unmask defense (slice 146)', () =
       expect(profile).toContain('(deny file-read* (subpath "/srv/conf/azure"))');
       expect(profile).toContain('(deny file-read* (subpath "/srv/conf/op"))');
       expect(profile).toContain('(deny file-read* (subpath "/srv/conf/sops"))');
-      expect(profile).toContain('(deny file-read* (subpath "/srv/conf/agent"))');
       expect(profile).toContain('(deny file-read* (subpath "/srv/conf/forja"))');
       // FILES under .config/* (NuGet/Composer auth) must ALSO get a
       // relocated literal deny, not only the home-relative one (#2 review fix).
@@ -974,5 +973,56 @@ describe('macOS — opt-in persistent cache (cache_persistence)', () => {
       realpath: (p) => p,
     });
     expect(argv.some((a) => a.startsWith('XDG_CACHE_HOME='))).toBe(false);
+  });
+});
+
+// Project read floor (profile isolation) — macOS parity with the Linux runner's
+// foreign-dir tmpfs overlay.
+describe('buildSbplProfile — profile read floor (foreign .forja/ deny)', () => {
+  test('under FORJA_PROFILE: denies read+write of <cwd>/.forja but NOT the active <cwd>/.forja-<profile>', () => {
+    const prev = process.env.FORJA_PROFILE;
+    process.env.FORJA_PROFILE = 'dev';
+    try {
+      const profile = buildSbplProfile('cwd-rw', '/work/proj', '/home/op');
+      // The operator's REAL project state is denied (read + write).
+      expect(profile).toContain('(deny file-read* (subpath "/work/proj/.forja"))');
+      expect(profile).toContain('(deny file-write* (subpath "/work/proj/.forja"))');
+      // The dev session's OWN dir is NOT denied — it must read its own state.
+      expect(profile).not.toContain('(deny file-read* (subpath "/work/proj/.forja-dev"))');
+    } finally {
+      if (prev === undefined) delete process.env.FORJA_PROFILE;
+      else process.env.FORJA_PROFILE = prev;
+    }
+  });
+
+  test('no profile ⇒ no foreign .forja deny (the canonical dir IS the session)', () => {
+    const prev = process.env.FORJA_PROFILE;
+    delete process.env.FORJA_PROFILE;
+    try {
+      const profile = buildSbplProfile('cwd-rw', '/work/proj', '/home/op');
+      expect(profile).not.toContain('(deny file-read* (subpath "/work/proj/.forja"))');
+    } finally {
+      if (prev !== undefined) process.env.FORJA_PROFILE = prev;
+    }
+  });
+
+  test('denies the foreign .forja at the PROJECT ROOT, not the subdir cwd', () => {
+    const prev = process.env.FORJA_PROFILE;
+    process.env.FORJA_PROFILE = 'dev';
+    try {
+      // tmpdir undefined, projectRoot = repo root; cwd is a subdir.
+      const profile = buildSbplProfile(
+        'cwd-rw',
+        '/work/proj/src/deep',
+        '/home/op',
+        undefined,
+        '/work/proj',
+      );
+      expect(profile).toContain('(deny file-read* (subpath "/work/proj/.forja"))');
+      expect(profile).not.toContain('(deny file-read* (subpath "/work/proj/src/deep/.forja"))');
+    } finally {
+      if (prev === undefined) delete process.env.FORJA_PROFILE;
+      else process.env.FORJA_PROFILE = prev;
+    }
   });
 });

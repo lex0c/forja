@@ -54,7 +54,7 @@ const runIntegrityCheck = (db: DB, path: string): void => {
   // the file handle + WAL writer slot.
   db.close();
   throw new Error(
-    `storage: PRAGMA integrity_check failed for '${path}': ${issues.join('; ')}. DB is corrupted — restore from backup or rotate (agent permission rotate-chain). See SEC §1.2 / spec §15.`,
+    `storage: PRAGMA integrity_check failed for '${path}': ${issues.join('; ')}. DB is corrupted — restore from backup or rotate (forja permission rotate-chain). See SEC §1.2 / spec §15.`,
   );
 };
 

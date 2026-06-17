@@ -1,0 +1,35 @@
+name: edit-format repeated-lines via edit_file
+prompt: |
+  `src/log.ts` has three identical `log.info("start");` lines. Change ONLY the
+  one that sits between `doThing();` and `doOther();` to `log.info("middle");`,
+  leaving the other two unchanged. Use edit_file (include enough surrounding
+  context to target the right occurrence). Reply "done" when applied.
+setup:
+  gitInit: true
+  files:
+    src/log.ts: |
+      log.info("start");
+      doThing();
+      log.info("start");
+      doOther();
+      log.info("start");
+expect:
+  - tool_called: edit_file
+  - tool_not_called: git_apply_patch
+  - tool_not_called: write_file
+  # Full expected file: proves ONLY the middle occurrence changed —
+  # the two outer `start` lines must survive and `middle` must sit
+  # between doThing()/doOther(). A bare `middle` substring would also
+  # pass if the model replaced all three, overstating precision.
+  - file_contains:
+      path: src/log.ts
+      pattern: |-
+        log.info("start");
+        doThing();
+        log.info("middle");
+        doOther();
+        log.info("start");
+  - status: done
+budget:
+  maxSteps: 7
+  maxCostUsd: 0.25

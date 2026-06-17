@@ -1,4 +1,4 @@
-// `agent cache clear` CLI handler.
+// `forja cache clear` CLI handler.
 //
 // Operator surface for the opt-in persistent dependency caches at
 // `forjaCachePersistBase()` = ~/.cache/forja/cache (build/dep caches: npm,
@@ -15,7 +15,7 @@
 // never touched — a `cache clear` from one terminal is safe while another
 // session runs.
 //
-// Two-phase like `agent gc` / `agent purge`: bare invocation is a dry-run
+// Two-phase like `forja gc` / `forja purge`: bare invocation is a dry-run
 // that reports the size; `--force` removes. `--json` emits one NDJSON line.
 
 import { readdirSync, rmSync, statSync } from 'node:fs';

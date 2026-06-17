@@ -293,7 +293,7 @@ describe('assembleProjectContext — path injection hardening', () => {
   // The trust modal authorizes ACCESS to a directory; it does NOT
   // cleanse the path STRING of bytes that would break out of the
   // code span the header embeds the path in. Realistic shapes:
-  //   - `cd /tmp/$(crafted)` pre-`agent`
+  //   - `cd /tmp/$(crafted)` pre-`forja`
   //   - a clone target whose name contains backticks or newlines
   //   - a shared-volume dir another user named with control bytes
 

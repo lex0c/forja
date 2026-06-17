@@ -121,8 +121,8 @@ MD
 # runtime; the rules are exercised purely as a snapshot
 # serialization test (forward-compat per restrictions.ts comment).
 # read_file is the tool the playbook actually uses.
-mkdir -p .agent/agents
-cat > .agent/agents/kitchen-sink.md <<'MD'
+mkdir -p .forja/playbooks
+cat > .forja/playbooks/kitchen-sink.md <<'MD'
 ---
 name: kitchen-sink
 description: Cross-cutting smoke fixture exercising every playbook field at once.
@@ -168,7 +168,7 @@ MD
 # child's whitelist (read_file/glob/grep only), not by the parent
 # permission engine — keeps the assertion target focused on the
 # playbook subsystem.
-cat > .agent/permissions.yaml <<'YAML'
+cat > .forja/permissions.yaml <<'YAML'
 defaults:
   mode: bypass
 YAML

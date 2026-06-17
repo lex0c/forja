@@ -1,4 +1,4 @@
-// `agent permission grants [--all] [--json]` — list §8 persisted
+// `forja permission grants [--all] [--json]` — list §8 persisted
 // grants for the active install. Default surface lists only active
 // (non-expired, non-revoked) grants; `--all` includes every row
 // for forensic audit. DB-only path — no provider, no session start.
@@ -88,7 +88,7 @@ export const runPermissionGrants = async (
   if (grants.length === 0) {
     out(`${label}: (none)\n`);
     if (!all) {
-      out("(use 'agent permission grants --all' to include expired and revoked rows)\n");
+      out("(use 'forja permission grants --all' to include expired and revoked rows)\n");
     }
     return 0;
   }

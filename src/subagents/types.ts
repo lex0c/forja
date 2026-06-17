@@ -37,8 +37,8 @@ export interface SubagentBudget {
 //     to their project or user scope (the loader's shadow surface
 //     stays SILENT for builtin shadows — they're expected; surfacing
 //     them on every boot would be noise for every install).
-//   - 'user' — `~/.config/agent/agents/`. Shadows builtin.
-//   - 'project' — `.agent/agents/` in the cwd. Shadows user + builtin.
+//   - 'user' — `~/.config/forja/playbooks/`. Shadows builtin.
+//   - 'project' — `.forja/playbooks/` in the cwd. Shadows user + builtin.
 export type SubagentScope = 'builtin' | 'user' | 'project';
 
 // Isolation strategy declared by the subagent author. Spec §11.2:
@@ -46,7 +46,7 @@ export type SubagentScope = 'builtin' | 'user' | 'project';
 // no write access — the loader / validator refuse `metadata.writes:true`
 // tools in `tools[]`, because the parent's `--undo` cannot reverse a
 // child's writes when checkpoints are off. `worktree` opts the child
-// into a dedicated git worktree under `~/.cache/agent/worktrees/<id>/`;
+// into a dedicated git worktree under `~/.cache/forja/worktrees/<id>/`;
 // the writes-true gate is lifted there because the child's mutations
 // land on a separate branch the parent can inspect, merge, or discard
 // without touching the principal tree.

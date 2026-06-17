@@ -200,11 +200,11 @@ describe('renderHuman', () => {
     const data = empty();
     data.notDone.push({
       what: 'refactor /home/lex/proj/legacy.ts',
-      reason: 'out of scope per /home/lex/.agent/policy',
+      reason: 'out of scope per /home/lex/.forja/policy',
     });
     const out = renderHuman(data, { home: '/home/lex' });
     expect(out).toContain('refactor ~/proj/legacy.ts');
-    expect(out).toContain('per ~/.agent/policy');
+    expect(out).toContain('per ~/.forja/policy');
     expect(out).not.toContain('/home/lex');
   });
 

@@ -46,7 +46,7 @@ const fakeBlock = (reason: 'silent' | 'message', message: string | null): HookCh
   blockedBy: {
     spec: {
       layer: 'project',
-      sourcePath: '/etc/agent/hooks.toml',
+      sourcePath: '/etc/forja/hooks.toml',
       event: 'MemoryWrite',
       matcher: {},
       command: 'fake',

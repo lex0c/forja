@@ -36,7 +36,7 @@ export const fixture: MemoryGovernanceFixture = {
       // Overwrite the memory file's body AFTER the runner has
       // already parsed the in-memory snapshot. The dispatcher's
       // F11 re-peek will see the new body and refuse.
-      '.agent/memory/local/toctou-target.md':
+      '.forja/memory/local/toctou-target.md':
         '---\nname: toctou-target\ndescription: memory that will be edited mid-dispatch\ntype: project\nsource: user_explicit\n---\n\nOperator edited the body AFTER the scheduler peeked.\n',
     },
   },

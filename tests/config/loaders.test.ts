@@ -73,12 +73,12 @@ const makeTempCwd = (): string => mkdtempSync(join(tmpdir(), 'forja-config-cfg-'
 describe('userConfigPath / projectConfigPath', () => {
   test('XDG_CONFIG_HOME wins when set + absolute', () => {
     expect(userConfigPath({ XDG_CONFIG_HOME: '/xdg', HOME: '/home/u' })).toBe(
-      '/xdg/agent/config.toml',
+      '/xdg/forja/config.toml',
     );
   });
 
   test('falls back to $HOME/.config when XDG is missing', () => {
-    expect(userConfigPath({ HOME: '/home/u' })).toBe('/home/u/.config/agent/config.toml');
+    expect(userConfigPath({ HOME: '/home/u' })).toBe('/home/u/.config/forja/config.toml');
   });
 
   test('non-absolute XDG falls through to HOME-based path', () => {
@@ -86,12 +86,12 @@ describe('userConfigPath / projectConfigPath', () => {
     // unset (security: a relative XDG could shadow user files via
     // path traversal). Falls through to $HOME/.config.
     expect(userConfigPath({ XDG_CONFIG_HOME: 'rel/path', HOME: '/home/u' })).toBe(
-      '/home/u/.config/agent/config.toml',
+      '/home/u/.config/forja/config.toml',
     );
   });
 
   test('projectConfigPath always derivable from cwd', () => {
-    expect(projectConfigPath('/repo')).toBe('/repo/.agent/config.toml');
+    expect(projectConfigPath('/repo')).toBe('/repo/.forja/config.toml');
   });
 });
 
@@ -129,9 +129,9 @@ describe('loadMemoryConfig — override_detect_llm (S3.5)', () => {
   test('project [memory] override_detect_llm = false → resolved false + hadField true', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [memory]
 override_detect_llm = false
@@ -151,9 +151,9 @@ override_detect_llm = false
   test('camelCase alias overrideDetectLlm accepted', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [memory]
 overrideDetectLlm = false
@@ -170,9 +170,9 @@ overrideDetectLlm = false
   test('snake + camel both present emits dual-key warning; snake wins', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [memory]
 override_detect_llm = false
@@ -195,17 +195,17 @@ overrideDetectLlm = true
     const cwd = makeTempCwd();
     const home = mkdtempSync(join(tmpdir(), 'forja-mem-home-'));
     try {
-      mkdirSync(join(home, '.config', 'agent'), { recursive: true });
+      mkdirSync(join(home, '.config', 'forja'), { recursive: true });
       writeFileSync(
-        join(home, '.config', 'agent', 'config.toml'),
+        join(home, '.config', 'forja', 'config.toml'),
         `
 [memory]
 override_detect_llm = true
 `,
       );
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [memory]
 override_detect_llm = false
@@ -226,9 +226,9 @@ describe('loadMemoryConfig — project layer', () => {
   test('project [memory] verify_semantic_llm = false → resolved false + projectHadField true (banner-suppress signal)', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [memory]
 verify_semantic_llm = false
@@ -247,9 +247,9 @@ verify_semantic_llm = false
   test('camelCase aliases (verifySemanticLlm) parsed equivalently', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [memory]
 verifySemanticLlm = false
@@ -271,9 +271,9 @@ describe('loadMemoryConfig — validation warnings', () => {
   test('non-boolean value → warning + skip + default retained + hadField false (banner-eligible)', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [memory]
 verify_semantic_llm = "no"
@@ -296,9 +296,9 @@ verify_semantic_llm = "no"
   test('dual-key (snake + camel for same field) emits warning; snake wins', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [memory]
 verify_semantic_llm = false
@@ -326,9 +326,9 @@ conflictDetectLlm = false
   test('single-spelling files do NOT emit dual-key warning', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [memory]
 verify_semantic_llm = false
@@ -350,11 +350,11 @@ conflictDetectLlm = false
     const cwd = makeTempCwd();
     const home = mkdtempSync(join(tmpdir(), 'forja-mem-home-'));
     try {
-      mkdirSync(join(home, '.config', 'agent'), { recursive: true });
-      writeFileSync(join(home, '.config', 'agent', 'config.toml'), 'not = valid = toml\n');
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(home, '.config', 'forja'), { recursive: true });
+      writeFileSync(join(home, '.config', 'forja', 'config.toml'), 'not = valid = toml\n');
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [memory]
 conflict_detect_llm = false
@@ -376,9 +376,9 @@ describe('loadMemoryConfig — layer merge (project overrides user)', () => {
     const cwd = makeTempCwd();
     const home = mkdtempSync(join(tmpdir(), 'forja-mem-home-'));
     try {
-      mkdirSync(join(home, '.config', 'agent'), { recursive: true });
+      mkdirSync(join(home, '.config', 'forja'), { recursive: true });
       writeFileSync(
-        join(home, '.config', 'agent', 'config.toml'),
+        join(home, '.config', 'forja', 'config.toml'),
         `
 [memory]
 verify_semantic_llm = false
@@ -398,17 +398,17 @@ verify_semantic_llm = false
     const cwd = makeTempCwd();
     const home = mkdtempSync(join(tmpdir(), 'forja-mem-home-'));
     try {
-      mkdirSync(join(home, '.config', 'agent'), { recursive: true });
+      mkdirSync(join(home, '.config', 'forja'), { recursive: true });
       writeFileSync(
-        join(home, '.config', 'agent', 'config.toml'),
+        join(home, '.config', 'forja', 'config.toml'),
         `
 [memory]
 verify_semantic_llm = true
 `,
       );
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [memory]
 verify_semantic_llm = false
@@ -427,8 +427,8 @@ verify_semantic_llm = false
 
 describe('loadRecapConfig', () => {
   const writeProjectRecap = (cwd: string, body: string): void => {
-    mkdirSync(join(cwd, '.agent'), { recursive: true });
-    writeFileSync(join(cwd, '.agent', 'config.toml'), body);
+    mkdirSync(join(cwd, '.forja'), { recursive: true });
+    writeFileSync(join(cwd, '.forja', 'config.toml'), body);
   };
 
   test('returns empty config + no warnings when no [recap] section', () => {
@@ -502,9 +502,9 @@ describe('loadProvidersConfig', () => {
   test('reads [providers].model from project config and validates against the registry', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [providers]
 model = "anthropic/claude-opus-4-7"
@@ -522,9 +522,9 @@ model = "anthropic/claude-opus-4-7"
   test('unknown model id warns and degrades to null (caller falls back to DEFAULT_MODEL)', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [providers]
 model = "anthropic/typo-model"
@@ -543,9 +543,9 @@ model = "anthropic/typo-model"
   test('non-string model warns and ignores', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [providers]
 model = 42
@@ -563,9 +563,9 @@ model = 42
   test('empty model string warns and ignores', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [providers]
 model = ""
@@ -584,14 +584,14 @@ model = ""
     const cwd = makeTempCwd();
     const home = mkdtempSync(join(tmpdir(), 'forja-providers-home-'));
     try {
-      mkdirSync(join(home, '.config', 'agent'), { recursive: true });
+      mkdirSync(join(home, '.config', 'forja'), { recursive: true });
       writeFileSync(
-        join(home, '.config', 'agent', 'config.toml'),
+        join(home, '.config', 'forja', 'config.toml'),
         '[providers]\nmodel = "anthropic/claude-haiku-4-5"\n',
       );
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         '[providers]\nmodel = "anthropic/claude-opus-4-7"\n',
       );
       const reg = stubRegistry(['anthropic/claude-haiku-4-5', 'anthropic/claude-opus-4-7']);
@@ -606,8 +606,8 @@ model = ""
   test('[providers] not a table warns and degrades', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
-      writeFileSync(join(cwd, '.agent', 'config.toml'), 'providers = "oops"\n');
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
+      writeFileSync(join(cwd, '.forja', 'config.toml'), 'providers = "oops"\n');
       const reg = stubRegistry([]);
       const result = loadProvidersConfig({ cwd, registry: reg, env: { HOME: '/none' } });
       expect(result.config.model).toBeUndefined();
@@ -633,9 +633,9 @@ describe('loadBudgetConfig', () => {
   test('reads all six [budget] keys from project config', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [budget]
 max_steps = 50
@@ -664,9 +664,9 @@ compaction_preserve_tail = 5
   test('integer fields reject non-integer values', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [budget]
 max_steps = 200.5
@@ -683,9 +683,9 @@ max_steps = 200.5
   test('float fields accept decimals (compaction_threshold = 0.65)', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [budget]
 compaction_threshold = 0.65
@@ -705,9 +705,9 @@ compaction_threshold = 0.65
     // runtime treats `usagePct >= 0` as always true.
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [budget]
 compaction_threshold = 0
@@ -727,9 +727,9 @@ compaction_threshold = 0
     // the natural "disable compaction" sentinel.
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [budget]
 compaction_threshold = 1
@@ -749,9 +749,9 @@ compaction_threshold = 1
     // only eval YAML could disable it.
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [budget]
 compaction_relevance = false
@@ -770,9 +770,9 @@ compaction_relevance = false
     // a string. Reject it loudly rather than silently treating it as truthy.
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [budget]
 compaction_relevance = "false"
@@ -789,9 +789,9 @@ compaction_relevance = "false"
   test('camelCase compactionRelevance is accepted (no snake key present)', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [budget]
 compactionRelevance = false
@@ -808,9 +808,9 @@ compactionRelevance = false
   test('both compaction_relevance spellings: snake_case wins and the conflict warns', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [budget]
 compaction_relevance = false
@@ -836,9 +836,9 @@ compactionRelevance = true
     // otherwise config can't express what the engine supports.
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [budget]
 max_step_stall_ms = 0
@@ -859,9 +859,9 @@ max_step_stall_ms = 0
     // that aborts on turn 1.
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [budget]
 max_steps = 0
@@ -878,9 +878,9 @@ max_steps = 0
   test('out-of-range values warn and ignore (max_cost_usd = -1)', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [budget]
 max_cost_usd = -1
@@ -897,9 +897,9 @@ max_cost_usd = -1
   test('out-of-range compaction_threshold = 1.5 warns', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [budget]
 compaction_threshold = 1.5
@@ -916,9 +916,9 @@ compaction_threshold = 1.5
   test('non-number value warns (max_steps = "200")', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [budget]
 max_steps = "200"
@@ -939,9 +939,9 @@ max_steps = "200"
     // form and its value lands.
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [budget]
 max_steps = 100
@@ -961,9 +961,9 @@ maxSteps = 200
   test('accepts camelCase aliases (maxSteps, maxCostUsd, ...)', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       writeFileSync(
-        join(cwd, '.agent', 'config.toml'),
+        join(cwd, '.forja', 'config.toml'),
         `
 [budget]
 maxSteps = 75
@@ -982,10 +982,10 @@ maxCostUsd = 1.5
     const cwd = makeTempCwd();
     const home = mkdtempSync(join(tmpdir(), 'forja-budget-home-'));
     try {
-      mkdirSync(join(home, '.config', 'agent'), { recursive: true });
-      writeFileSync(join(home, '.config', 'agent', 'config.toml'), '[budget]\nmax_steps = 300\n');
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
-      writeFileSync(join(cwd, '.agent', 'config.toml'), '[budget]\nmax_cost_usd = 2\n');
+      mkdirSync(join(home, '.config', 'forja'), { recursive: true });
+      writeFileSync(join(home, '.config', 'forja', 'config.toml'), '[budget]\nmax_steps = 300\n');
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
+      writeFileSync(join(cwd, '.forja', 'config.toml'), '[budget]\nmax_cost_usd = 2\n');
       const result = loadBudgetConfig({ cwd, env: { HOME: home } });
       // Per-key merge: user's max_steps survives because project
       // didn't touch it; project's max_cost_usd lands.
@@ -1000,8 +1000,8 @@ maxCostUsd = 1.5
   test('[budget] not a table warns', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
-      writeFileSync(join(cwd, '.agent', 'config.toml'), 'budget = 42\n');
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
+      writeFileSync(join(cwd, '.forja', 'config.toml'), 'budget = 42\n');
       const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
       expect(result.config).toEqual({});
       expect(result.warnings[0]).toContain('not a table');
@@ -1026,8 +1026,8 @@ describe('loadEffortConfig', () => {
   test('reads [effort].level from project config', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
-      writeFileSync(join(cwd, '.agent', 'config.toml'), '[effort]\nlevel = "low"\n');
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
+      writeFileSync(join(cwd, '.forja', 'config.toml'), '[effort]\nlevel = "low"\n');
       const result = loadEffortConfig({ cwd, env: { HOME: '/none' } });
       expect(result.effort).toBe('low');
       expect(result.warnings).toEqual([]);
@@ -1039,8 +1039,8 @@ describe('loadEffortConfig', () => {
   test('level is case-insensitive (matches /effort)', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
-      writeFileSync(join(cwd, '.agent', 'config.toml'), '[effort]\nlevel = "High"\n');
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
+      writeFileSync(join(cwd, '.forja', 'config.toml'), '[effort]\nlevel = "High"\n');
       const result = loadEffortConfig({ cwd, env: { HOME: '/none' } });
       expect(result.effort).toBe('high');
       expect(result.warnings).toEqual([]);
@@ -1052,9 +1052,9 @@ describe('loadEffortConfig', () => {
   test('unknown level warns and is ignored', () => {
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
       // `ultra` is not a ForjaEffort (the ladder is low|medium|high|xhigh|max).
-      writeFileSync(join(cwd, '.agent', 'config.toml'), '[effort]\nlevel = "ultra"\n');
+      writeFileSync(join(cwd, '.forja', 'config.toml'), '[effort]\nlevel = "ultra"\n');
       const result = loadEffortConfig({ cwd, env: { HOME: '/none' } });
       expect(result.effort).toBeUndefined();
       expect(result.warnings[0]).toContain('must be one of');
@@ -1067,10 +1067,10 @@ describe('loadEffortConfig', () => {
     const cwd = makeTempCwd();
     const home = mkdtempSync(join(tmpdir(), 'forja-effort-home-'));
     try {
-      mkdirSync(join(home, '.config', 'agent'), { recursive: true });
-      writeFileSync(join(home, '.config', 'agent', 'config.toml'), '[effort]\nlevel = "low"\n');
-      mkdirSync(join(cwd, '.agent'), { recursive: true });
-      writeFileSync(join(cwd, '.agent', 'config.toml'), '[effort]\nlevel = "max"\n');
+      mkdirSync(join(home, '.config', 'forja'), { recursive: true });
+      writeFileSync(join(home, '.config', 'forja', 'config.toml'), '[effort]\nlevel = "low"\n');
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
+      writeFileSync(join(cwd, '.forja', 'config.toml'), '[effort]\nlevel = "max"\n');
       const result = loadEffortConfig({ cwd, env: { HOME: home } });
       expect(result.effort).toBe('max');
     } finally {
@@ -1082,8 +1082,8 @@ describe('loadEffortConfig', () => {
 
 describe('loadSandboxConfig — [sandbox] writable_cache_dirs', () => {
   const writeProject = (cwd: string, toml: string): void => {
-    mkdirSync(join(cwd, '.agent'), { recursive: true });
-    writeFileSync(join(cwd, '.agent', 'config.toml'), toml);
+    mkdirSync(join(cwd, '.forja'), { recursive: true });
+    writeFileSync(join(cwd, '.forja', 'config.toml'), toml);
   };
 
   test('absent section → no override (undefined), no warnings', () => {
@@ -1166,9 +1166,9 @@ describe('loadSandboxConfig — [sandbox] writable_cache_dirs', () => {
     const home = mkdtempSync(join(tmpdir(), 'forja-sbx-home-'));
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(home, '.config', 'agent'), { recursive: true });
+      mkdirSync(join(home, '.config', 'forja'), { recursive: true });
       writeFileSync(
-        join(home, '.config', 'agent', 'config.toml'),
+        join(home, '.config', 'forja', 'config.toml'),
         '[sandbox]\nwritable_cache_dirs = [".npm"]\n',
       );
       writeProject(cwd, '[sandbox]\nwritable_cache_dirs = [".cargo"]\n');
@@ -1183,8 +1183,8 @@ describe('loadSandboxConfig — [sandbox] writable_cache_dirs', () => {
 
 describe('loadSandboxConfig — [sandbox] cache_persistence + shared_tmp', () => {
   const writeProject = (cwd: string, toml: string): void => {
-    mkdirSync(join(cwd, '.agent'), { recursive: true });
-    writeFileSync(join(cwd, '.agent', 'config.toml'), toml);
+    mkdirSync(join(cwd, '.forja'), { recursive: true });
+    writeFileSync(join(cwd, '.forja', 'config.toml'), toml);
   };
 
   test('absent → both undefined (default off), no warnings', () => {
@@ -1255,9 +1255,9 @@ describe('loadSandboxConfig — [sandbox] cache_persistence + shared_tmp', () =>
     const home = mkdtempSync(join(tmpdir(), 'forja-sbx2-home-'));
     const cwd = makeTempCwd();
     try {
-      mkdirSync(join(home, '.config', 'agent'), { recursive: true });
+      mkdirSync(join(home, '.config', 'forja'), { recursive: true });
       writeFileSync(
-        join(home, '.config', 'agent', 'config.toml'),
+        join(home, '.config', 'forja', 'config.toml'),
         '[sandbox]\ncache_persistence = true\n',
       );
       writeProject(cwd, '[sandbox]\ncache_persistence = false\n');

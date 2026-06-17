@@ -6,6 +6,7 @@ import { bashOutputTool } from './bash-output.ts';
 import { bashTool } from './bash.ts';
 import { clarifyTool } from './clarify.ts';
 import { editFileTool } from './edit-file.ts';
+import { gitApplyPatchTool } from './git-apply-patch.ts';
 import { gitTool } from './git.ts';
 import { globTool } from './glob.ts';
 import { grepTool } from './grep.ts';
@@ -13,7 +14,6 @@ import { memoryListTool } from './memory-list.ts';
 import { memoryReadTool } from './memory-read.ts';
 import { memorySearchTool } from './memory-search.ts';
 import { memoryWriteTool } from './memory-write.ts';
-import { pinContextTool } from './pin-context.ts';
 import { readFileTool } from './read-file.ts';
 import { reminderCancelTool } from './reminder-cancel.ts';
 import { reminderListTool } from './reminder-list.ts';
@@ -49,6 +49,8 @@ export { editFileTool } from './edit-file.ts';
 export type { EditFileInput, EditFileOutput } from './edit-file.ts';
 export { gitTool } from './git.ts';
 export type { GitInput, GitOutput, GitMode } from './git.ts';
+export { gitApplyPatchTool } from './git-apply-patch.ts';
+export type { GitApplyPatchInput, GitApplyPatchOutput } from './git-apply-patch.ts';
 export { globTool } from './glob.ts';
 export type { GlobInput, GlobOutput } from './glob.ts';
 export { grepTool } from './grep.ts';
@@ -118,17 +120,13 @@ export { writeFileTool } from './write-file.ts';
 export type { WriteFileInput, WriteFileOutput } from './write-file.ts';
 
 // Order is intentional: read-only tools first, then writes, then exec.
-// Useful when scanning a `agent --list-tools` output. The todo tools
+// Useful when scanning a `forja --list-tools` output. The todo tools
 // (todo_list / todo_get / todo_create / todo_update) sit with the
 // read-only group — their 'write' is harness-internal session state,
 // not external mutation. memory_list / read / search are
 // read-only (audit logs are internal); memory_write sits with the
 // other write tools because it persists to disk and is gated by
 // the operator confirm modal.
-//
-// pinContextTool sits with the write tools — it persists to SQLite
-// (context_pins). No modal: the model pins directly and the store
-// ring-buffers at PIN_CAP (oldest evicted), same shape as the todolist.
 export const BUILTIN_TOOLS = [
   readFileTool,
   globTool,
@@ -166,8 +164,16 @@ export const BUILTIN_TOOLS = [
   taskListTool,
   writeFileTool,
   editFileTool,
+  gitApplyPatchTool,
   memoryWriteTool,
-  pinContextTool,
+  // pin_context is intentionally NOT registered: an ad-hoc "pin this
+  // text" tool proved a confusion magnet for weaker models, which
+  // pinned the re-injected guidance block (and verbalized accepting it)
+  // instead of answering the operator. The tool module, its re-exports
+  // below, the `/pin` operator command, and the context_pins store stay
+  // intact — only the model-facing surface is withdrawn (mirrors the
+  // wait_for / monitor withdrawal). Compaction-fragile facts now route
+  // through working_state / todos (in-session) and memory_write (cross).
   bashTool,
   bashBackgroundTool,
   bashOutputTool,

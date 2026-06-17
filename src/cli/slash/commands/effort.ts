@@ -59,6 +59,7 @@ const showCurrent = (ctx: SlashContext): SlashResult => {
 export const effortCommand: SlashCommand = {
   name: 'effort',
   description: 'show or set the reasoning + operational effort level',
+  argHint: `[${FORJA_EFFORT_LEVELS.join('|')}]`,
   exec: async (args, ctx) => {
     if (args.length === 0) return showCurrent(ctx);
     if (args.length > 1) {

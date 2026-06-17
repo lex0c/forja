@@ -553,7 +553,7 @@ export const createSqliteSink = ({
     // CLI rotation between `createSqliteSink` and a later
     // `verifyChain` call is still reflected. emit() does not re-read
     // (no concurrent rotation under the same sink by construction),
-    // but verify is also exposed via `agent permission verify` which
+    // but verify is also exposed via `forja permission verify` which
     // operates on a freshly-constructed sink.
     const tipMeta = getLatestChainMeta(db, identity.install_id);
     const tipRotationId = tipMeta?.rotation_id ?? 0;

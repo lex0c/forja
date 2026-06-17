@@ -10,10 +10,13 @@
 // Single source of truth — adding a target means editing this file
 // and re-running `bun test scripts/`.
 
+import { VERSION } from '../src/cli/version.ts';
+import { activeProfile } from '../src/config/app-namespace.ts';
+
 export interface BuildTarget {
-  // Canonical id used in asset filenames and as the suffix of
-  // `dist/agent-<id>`. Stable; do not rename without bumping the
-  // install script's lookup table.
+  // Canonical id, the platform tuple inside the asset name
+  // `forja-<version>[-<profile>]-<id>`. Stable; do not rename without
+  // bumping the install script's lookup table.
   readonly id: string;
   // Bun --compile target. Bun's matrix is more granular than
   // ours (modern vs baseline x64); we pin -modern because the size
@@ -83,4 +86,20 @@ export const SIZE_BLOCK_RATIO = 1.2;
 
 export const findTarget = (id: string): BuildTarget | undefined => TARGETS.find((t) => t.id === id);
 
-export const assetName = (t: BuildTarget): string => `agent-${t.id}${t.ext}`;
+// Produced binary name: `forja-<version>[-<profile>]-<id><ext>`.
+//
+// Version (from src/cli/version.ts, the canonical version const) makes release
+// artifacts self-describing and lets multiple versions coexist in dist/.
+//
+// The profile segment is present ONLY when FORJA_PROFILE is set at build time
+// (e.g. `FORJA_PROFILE=dev bun run build`) — release/CI builds carry none, so
+// release names stay `forja-<version>-<id>`. It is a build-CONTEXT label, not a
+// behavioral lock: the binary is profile-agnostic and resolves the profile at
+// its own runtime, so `forja-<version>-dev-linux-x64` still runs canonical when
+// invoked without `--profile`. The label just keeps a dev build from clobbering
+// a release artifact in dist/. `env` is a test seam (default process.env).
+export const assetName = (t: BuildTarget, env: NodeJS.ProcessEnv = process.env): string => {
+  const profile = activeProfile(env);
+  const profileSeg = profile !== null ? `-${profile}` : '';
+  return `forja-${VERSION}${profileSeg}-${t.id}${t.ext}`;
+};

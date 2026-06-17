@@ -1,9 +1,9 @@
-// `agent welcome` — §13.5 first-boot UX. Composes `agent doctor`
-// (slice 43) + `agent sandbox setup` (slice 44) + an intro and
+// `forja welcome` — §13.5 first-boot UX. Composes `forja doctor`
+// (slice 43) + `forja sandbox setup` (slice 44) + an intro and
 // next-steps section into a single guided walkthrough.
 //
 // Designed for operators running Forja for the first time, but
-// it's idempotent — running `agent welcome` later is harmless and
+// it's idempotent — running `forja welcome` later is harmless and
 // useful as a "checkup". The verb doesn't write anything; it only
 // reads the host state and prints recommendations.
 //
@@ -14,7 +14,7 @@
 //   4. Next-steps menu.
 //
 // Plain text only — operators consuming structured data should call
-// `agent doctor --json` and `agent sandbox setup --json` directly.
+// `forja doctor --json` and `forja sandbox setup --json` directly.
 //
 // DEFERRED (REVIEW_NOTES.md R9 P0 #10 / slice 125 decision-C):
 // Spec PERMISSION_ENGINE.md §13.4 and §13.5 describe a dual-confirm
@@ -41,7 +41,9 @@
 // emerge that need per-policy `*_acknowledged_at` timestamps for
 // audit trails. Until then, the marker IS the acknowledgment.
 
+import { appDirName } from '../config/app-namespace.ts';
 import { runDoctor } from './doctor.ts';
+import { forjaCommand } from './forja-command.ts';
 import { runSandboxSetup } from './sandbox-setup.ts';
 import {
   type SandboxSkipMetadata,
@@ -108,21 +110,26 @@ const SECTION_DIVIDER = '─'.repeat(60);
 const CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g;
 const stripControlChars = (s: string): string => s.replace(CONTROL_CHAR_RE, '');
 
-const NEXT_STEPS_LINES = [
+// A function (not a const) so the advertised commands carry the active
+// `--profile` via `forjaCommand`: under `forja --profile dev welcome`, the
+// walkthrough diagnosed the PROFILED namespace, so a bare `forja init` /
+// `forja "..."` next-step would open/scaffold the operator's REAL state. No
+// profile ⇒ byte-identical to the previous lines (column alignment preserved).
+const nextStepsLines = (): string[] => [
   '',
   SECTION_DIVIDER,
   'Next steps',
   SECTION_DIVIDER,
   '',
-  '  agent init                Scaffold the .agent/ bootstrap bundle',
+  `  ${forjaCommand('init')}                Scaffold the .forja/ bootstrap bundle`,
   '                            (permissions, gitignore, config, playbooks)',
-  '  agent "your prompt"        Ask the agent something',
-  '  agent --explain-permissions',
+  `  ${forjaCommand('"your prompt"')}        Ask the agent something`,
+  `  ${forjaCommand('--explain-permissions')}`,
   '                            Show the resolved policy + per-section attribution',
-  '  agent permission grants    List active grants',
-  '  agent --help               See all options',
+  `  ${forjaCommand('permission grants')}    List active grants`,
+  `  ${forjaCommand('--help')}               See all options`,
   '',
-  'Run `agent doctor` any time to re-check the environment.',
+  `Run \`${forjaCommand('doctor')}\` any time to re-check the environment.`,
 ];
 
 export const runWelcome = async (options: RunWelcomeOptions = {}): Promise<number> => {
@@ -202,7 +209,9 @@ export const runWelcome = async (options: RunWelcomeOptions = {}): Promise<numbe
         `Sandbox setup skipped — marker present at ${safePath} (created ${safeCreatedAt}${versionStr}).\n`,
       );
     } else {
-      out('Sandbox setup skipped — `~/.config/forja/sandbox_skip` marker present.\n');
+      out(
+        `Sandbox setup skipped — \`~/.config/${appDirName(env)}/sandbox_skip\` marker present.\n`,
+      );
     }
     out('Remove that file to re-enable the prompt.\n');
   } else {
@@ -218,12 +227,12 @@ export const runWelcome = async (options: RunWelcomeOptions = {}): Promise<numbe
     });
   }
 
-  for (const line of NEXT_STEPS_LINES) out(`${line}\n`);
+  for (const line of nextStepsLines()) out(`${line}\n`);
 
   // Welcome's exit code is the worst of the two inner verbs. doctor
   // returns 1 on any `fail` check; sandbox-setup returns 1 only on
   // internal failure. Either non-zero → welcome non-zero so a CI
-  // pipeline running `agent welcome` as a pre-deploy sanity check
+  // pipeline running `forja welcome` as a pre-deploy sanity check
   // surfaces the bad state via exit code.
   return Math.max(doctorCode, setupCode);
 };

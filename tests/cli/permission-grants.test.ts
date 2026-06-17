@@ -13,7 +13,7 @@ const captured = () => {
   return { write: (s: string) => lines.push(s), lines };
 };
 
-describe('parseArgs — agent permission grants', () => {
+describe('parseArgs — forja permission grants', () => {
   test('grants verb is recognized', () => {
     const r = parseArgs(['permission', 'grants']);
     expect(r.ok).toBe(true);

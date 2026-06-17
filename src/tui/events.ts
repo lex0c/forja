@@ -92,6 +92,11 @@ export type SessionBannerEvent = BaseEvent & {
   // first frame. Optional — absent keeps the reducer's current value.
   // Runtime changes ride `effort:change`.
   effort?: ForjaEffort;
+  // Active isolation profile (`--profile` / FORJA_PROFILE), or null on the
+  // default namespace. Drives the banner line + always-visible footer chip
+  // so the operator can't mistake a dev/test run for their real Forja state.
+  // Optional — absent keeps the reducer's current value (null default).
+  profile?: string | null;
 };
 export type SessionEndEvent = BaseEvent & {
   type: 'session:end';
@@ -395,7 +400,7 @@ export type TrustAskEvent = BaseEvent & {
 //     attested the directory, NOT the shared-memory content); OR
 //   - a stored trust row's hash diverged from the current corpus
 //     fingerprint (mode 'drift' — typically after `git pull` that
-//     modified `.agent/memory/shared/`).
+//     modified `.forja/memory/shared/`).
 //
 // Distinct from `trust:ask` (first-visit cwd trust) in both trigger
 // and consequence:
@@ -410,7 +415,7 @@ export type TrustAskEvent = BaseEvent & {
 //     boot re-prompts). `trust_revoked` is the eviction-event
 //     trigger; `invalidated` is the target state.
 //
-// `path` is the absolute shared-corpus root (`<repo>/.agent/memory/
+// `path` is the absolute shared-corpus root (`<repo>/.forja/memory/
 // shared`) rather than the cwd — operator distinguishes "I trusted
 // this cwd" from "the shared/ within it just changed". `corpusFiles`
 // is the current inventory (name + byte length); no prior snapshot
@@ -498,7 +503,7 @@ export type MemoryActionAskEvent = BaseEvent & {
 };
 // History wipe confirmation (HISTORY.md §2.3 `/history clear`). Three
 // options: Yes (clear) / Yes-and-disable (clear + write
-// `.agent/no-history`) / No. Default selection is the last (No),
+// `.forja/no-history`) / No. Default selection is the last (No),
 // matching the conservative-default convention used by every other
 // confirm flavor (D5/D65). `entryCount` lets the modal render the
 // blast radius up front ("wipe N entries permanently") so the
@@ -746,6 +751,11 @@ export type SlashUpdateEvent = BaseEvent & {
   type: 'slash:update';
   suggestions: { name: string; description: string }[];
   selectedIdx: number;
+  // Inline arg-hint ghost for an exactly-typed command with no args yet
+  // (e.g. ` [low|medium|high]` after `/effort`). Undefined when there's
+  // no exact match or the command takes no args. The renderer draws it
+  // dim after the typed text, only when the cursor is at the line end.
+  ghost?: string;
 };
 
 // Reverse-search overlay open/update. Spec HISTORY.md §2.2. Producer
@@ -788,10 +798,14 @@ export type InfoEvent = BaseEvent & {
   type: 'info';
   message: string;
   tone?: 'plain' | 'secondary';
+  // Optional title line rendered ABOVE the message in the DEFAULT tone,
+  // regardless of `tone` — so a block can label itself (default) while its body
+  // recedes (secondary). Used by the working-state panel.
+  header?: string;
 };
 
 // Operator-initiated shell command (`!cmd` typed in the input). Runs as
-// the operator's OWN shell — directly, not through the agent permission
+// the operator's OWN shell — directly, not through the forja permission
 // engine or sandbox — and reports the result here for scrollback. The
 // engine gates the agent, not the human at the keyboard; this is the
 // shell-style `!` escape. `output` is the combined stdout+stderr; the
@@ -805,13 +819,13 @@ export type OperatorBashDoneEvent = BaseEvent & {
 };
 
 // REPL busy-state transition. The REPL's `isBusy()` (a foreground turn
-// OR a playbook OR an operator `!cmd` in flight) is the gate the submit
-// path uses to refuse a new submission — but two of its three inputs
-// (`playbookRunning`, `operatorBashRunning`) have no other reflection in
-// LiveState. This event mirrors the combined predicate into the renderer
-// so the bash-mode visuals can gate on the SAME condition the submit
-// does (otherwise typing `!` during a playbook / another `!` shows the
-// shell UI for a command that Enter will refuse). Emitted only on actual
+// OR an operator `!cmd` / /compact in flight) is the gate the submit
+// path uses to refuse a new submission — but `operatorBashRunning` has
+// no other reflection in LiveState. This event mirrors the combined
+// predicate into the renderer so the bash-mode visuals can gate on the
+// SAME condition the submit does (otherwise typing `!` during another
+// `!` shows the shell UI for a command that Enter will refuse). Emitted
+// only on actual
 // transitions (deduped at the producer).
 export type BusyChangeEvent = BaseEvent & {
   type: 'busy:change';

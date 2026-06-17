@@ -16,9 +16,11 @@ describe('injectStaticGuidance', () => {
     const messages: ProviderMessage[] = [{ role: 'user', content: 'do the thing' }];
     injectStaticGuidance(messages);
     const text = messages[0]?.content as string;
-    expect(text.startsWith('do the thing\n\n[workflow_discipline]')).toBe(true);
+    expect(text.startsWith('do the thing\n\nStanding operating context')).toBe(true);
+    expect(text).toContain('\n\n[workflow_discipline]');
     expect(text).toContain('[engineering_principles]');
-    expect(text).toContain('Favor high cohesion and low coupling.');
+    expect(text).toContain('verify its blast radius');
+    expect(text).toContain('Smallest correct diff');
   });
 
   test('appends a text block to a tool_result user message', () => {

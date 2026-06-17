@@ -23,6 +23,7 @@
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { appDirName, projectDirName } from '../../../config/app-namespace.ts';
 import {
   EMPTY_CORPUS_HASH,
   type MemoryFile,
@@ -1026,7 +1027,7 @@ const handleConflicts = (ctx: SlashContext, args: string[]): SlashResult => {
 // trust, and if so, against what?" without restarting the agent.
 //
 // Output sections:
-//   - `path` — absolute scope root (typically `<repo>/.agent/memory/
+//   - `path` — absolute scope root (typically `<repo>/.forja/memory/
 //     shared`). Surfaced so the operator can `cat` files outside
 //     the slash interaction if they want deeper inspection.
 //   - `status` — one of: `in sync`, `DIVERGED`, `never confirmed`,
@@ -1251,8 +1252,8 @@ const handleSeeds = (registry: MemoryRegistry, ctx: SlashContext, args: string[]
   //                body while disabled; disable's contract is the
   //                strongest signal).
   //   - absent   — no sentinel AND no body on disk. Three sub-cases
-  //                land here: (a) operator ran `agent init
-  //                --no-seeds`, (b) operator never ran `agent init`
+  //                land here: (a) operator ran `forja init
+  //                --no-seeds`, (b) operator never ran `forja init`
   //                at all, (c) operator deleted the body manually
   //                post-install (installer routes through user_kept
   //                with the manifest preserved; the body never
@@ -1299,12 +1300,12 @@ const handleSeeds = (registry: MemoryRegistry, ctx: SlashContext, args: string[]
     notes.unshift(`vendor seeds: ${totals.join(', ')} (of ${CANONICAL_SEEDS.length} canonical)`);
     if (absentCount > 0) {
       // Recovery hint only fires when there's something to recover.
-      // Naming `agent init` rather than `agent init --only=seeds`
+      // Naming `forja init` rather than `forja init --only=seeds`
       // because the operator's first install is the common path;
       // the `--only=seeds` form is for post-init catalog refreshes
       // already documented in the disable+delete recovery line.
       notes.push(
-        '  absent = not installed yet; run `agent init` (or `agent init --only=seeds`) to land them',
+        '  absent = not installed yet; run `forja init` (or `forja init --only=seeds`) to land them',
       );
     }
     return { kind: 'ok', notes };
@@ -1350,7 +1351,7 @@ const handleSeeds = (registry: MemoryRegistry, ctx: SlashContext, args: string[]
     writeDisabledSeeds(registry.roots, disabledMap);
     // Re-run the installer so `seeds/MEMORY.md` drops the entry
     // immediately — without this, the index would still advertise
-    // the seed until the next `agent init` pass, and `/memory list`
+    // the seed until the next `forja init` pass, and `/memory list`
     // would show it (the registry filter below catches that, but
     // the on-disk index would still be stale and confusing for an
     // operator who inspects the directory). The installer call is
@@ -1373,7 +1374,7 @@ const handleSeeds = (registry: MemoryRegistry, ctx: SlashContext, args: string[]
       kind: 'ok',
       notes: [
         persistenceLine,
-        '  the opt-out survives `agent init` and a future vendor catalog bump',
+        '  the opt-out survives `forja init` and a future vendor catalog bump',
         `  re-enable with: /memory seeds enable ${name}`,
       ],
     };
@@ -2476,7 +2477,7 @@ const handlePromote = async (
     subject: `project_local/${name} → project_shared/${name}`,
     preview: [
       'Promoting to shared makes this memory visible to the whole team',
-      'on next pull. The body lands in `.agent/memory/shared/` as a',
+      'on next pull. The body lands in `.forja/memory/shared/` as a',
       'tracked git change — no auto-commit; you commit manually.',
       '',
       ...peek.file.body.split('\n'),
@@ -3243,12 +3244,14 @@ const handleGovernanceStatus = (ctx: SlashContext, args: string[]): SlashResult 
   const verifySource = ctx.baseConfig.memorySemanticVerifySource ?? 'default';
   const verifyLabel = (() => {
     if (enabled && verifySource === 'cli') return 'yes (--memory-verify-llm)';
-    if (enabled && verifySource === 'project-config') return 'yes (.agent/config.toml)';
-    if (enabled && verifySource === 'user-config') return 'yes (~/.config/agent/config.toml)';
+    if (enabled && verifySource === 'project-config')
+      return `yes (${projectDirName()}/config.toml)`;
+    if (enabled && verifySource === 'user-config')
+      return `yes (~/.config/${appDirName()}/config.toml)`;
     if (enabled) return 'yes (default; disable: /memory governance disable verify)';
     if (verifySource === 'cli') return 'no (--no-memory-verify-llm)';
-    if (verifySource === 'project-config') return 'no (.agent/config.toml)';
-    if (verifySource === 'user-config') return 'no (~/.config/agent/config.toml)';
+    if (verifySource === 'project-config') return `no (${projectDirName()}/config.toml)`;
+    if (verifySource === 'user-config') return `no (~/.config/${appDirName()}/config.toml)`;
     return 'no (default)';
   })();
   const lines: string[] = [];
@@ -3296,13 +3299,14 @@ const handleGovernanceStatus = (ctx: SlashContext, args: string[]): SlashResult 
   const conflictSource = ctx.baseConfig.memoryConflictDetectSource ?? 'default';
   const conflictLabel = (() => {
     if (conflictEnabled && conflictSource === 'cli') return 'yes (--memory-conflict-llm)';
-    if (conflictEnabled && conflictSource === 'project-config') return 'yes (.agent/config.toml)';
+    if (conflictEnabled && conflictSource === 'project-config')
+      return `yes (${projectDirName()}/config.toml)`;
     if (conflictEnabled && conflictSource === 'user-config')
-      return 'yes (~/.config/agent/config.toml)';
+      return `yes (~/.config/${appDirName()}/config.toml)`;
     if (conflictEnabled) return 'yes (default; disable: /memory governance disable conflict)';
     if (conflictSource === 'cli') return 'no (--no-memory-conflict-llm)';
-    if (conflictSource === 'project-config') return 'no (.agent/config.toml)';
-    if (conflictSource === 'user-config') return 'no (~/.config/agent/config.toml)';
+    if (conflictSource === 'project-config') return `no (${projectDirName()}/config.toml)`;
+    if (conflictSource === 'user-config') return `no (~/.config/${appDirName()}/config.toml)`;
     return 'no (default)';
   })();
   lines.push(`  enabled:             ${conflictLabel}`);
@@ -3344,13 +3348,14 @@ const handleGovernanceStatus = (ctx: SlashContext, args: string[]): SlashResult 
   const overrideSource = ctx.baseConfig.memoryOverrideDetectSource ?? 'default';
   const overrideLabel = (() => {
     if (overrideEnabled && overrideSource === 'cli') return 'yes (--memory-override-llm)';
-    if (overrideEnabled && overrideSource === 'project-config') return 'yes (.agent/config.toml)';
+    if (overrideEnabled && overrideSource === 'project-config')
+      return `yes (${projectDirName()}/config.toml)`;
     if (overrideEnabled && overrideSource === 'user-config')
-      return 'yes (~/.config/agent/config.toml)';
+      return `yes (~/.config/${appDirName()}/config.toml)`;
     if (overrideEnabled) return 'yes (default; disable: /memory governance disable override)';
     if (overrideSource === 'cli') return 'no (--no-memory-override-llm)';
-    if (overrideSource === 'project-config') return 'no (.agent/config.toml)';
-    if (overrideSource === 'user-config') return 'no (~/.config/agent/config.toml)';
+    if (overrideSource === 'project-config') return `no (${projectDirName()}/config.toml)`;
+    if (overrideSource === 'user-config') return `no (~/.config/${appDirName()}/config.toml)`;
     return 'no (default)';
   })();
   lines.push(`  enabled:             ${overrideLabel}`);
@@ -3389,9 +3394,9 @@ const handleGovernanceStatus = (ctx: SlashContext, args: string[]): SlashResult 
 // ─── Slice Q: /memory governance enable | disable ─────────────────
 //
 // Slash surface for the operator to opt OUT of the (default-ON since
-// Slice Q) LLM-judge detectors per-project. Writes `.agent/config.toml
+// Slice Q) LLM-judge detectors per-project. Writes `.forja/config.toml
 // [memory]` keys; effect applies at next turn boundary (same snapshot
-// semantic as /model). Creates `.agent/` + the file if absent;
+// semantic as /model). Creates `.forja/` + the file if absent;
 // preserves other sections (`[providers]`, `[budget]`, etc.) verbatim
 // via a text-level edit of the `[memory]` block.
 
@@ -3412,7 +3417,7 @@ const parseDetectorTarget = (
   }
 };
 
-// Canonical TOML emitter for `.agent/config.toml`. Bun ships only
+// Canonical TOML emitter for `.forja/config.toml`. Bun ships only
 // TOML.parse — no stringify — so we round-trip the file as
 // parse → mutate → emit-canonical instead of text-level splicing
 // the `[memory]` block. Round-trip is robust against the shapes
@@ -3425,7 +3430,7 @@ const parseDetectorTarget = (
 // normalized shape (snake_case keys, alphabetical-ish by insertion
 // order, blank line between tables). Operators editing the file by hand
 // should expect rewrites to normalize formatting on the next
-// `/memory governance enable|disable`. Forja's `.agent/config.
+// `/memory governance enable|disable`. Forja's `.forja/config.
 // toml` schema is flat (no array-of-tables, no nested sub-tables),
 // so the 40-line emitter below covers it exhaustively; if a
 // future subsystem adds nested tables, extend `emitTomlDoc`.
@@ -3519,7 +3524,7 @@ const mutateMemoryConfig = (params: {
   // keys that were ABSENT from the project file STAY ABSENT —
   // materializing them as `true` would write project-level overrides
   // that silently shadow user-config opt-outs. E.g., if the operator
-  // disabled conflict_detect_llm globally in ~/.config/agent/config
+  // disabled conflict_detect_llm globally in ~/.config/forja/config
   // .toml and now runs `/memory governance disable verify`, the
   // pre-fix code wrote `conflict_detect_llm = true` to the project
   // config, which then beats the user-level disable per precedence.
@@ -3595,18 +3600,18 @@ const handleGovernanceToggle = (
     };
   }
   const path = require('node:path') as typeof import('node:path');
-  // Resolve repo root so the toggle writes to `<repo>/.agent/config
+  // Resolve repo root so the toggle writes to `<repo>/.forja/config
   // .toml` — the SAME file bootstrap reads via
   // `loadMemoryConfig({ cwd: resolveRepoRoot(cwd) })` (fixed in
   // commit 734a262). Pre-fix the toggle wrote to
-  // `<invocation-cwd>/.agent/config.toml`; when the REPL was
+  // `<invocation-cwd>/.forja/config.toml`; when the REPL was
   // launched from a subdir, the persisted file landed in the
   // subdir and the next process start would not see it — the
   // detector silently re-enabled from repo-root config + defaults
   // despite a successful slash-command return. Falls back to cwd
   // when not in a git repo (matches bootstrap's symmetric
   // fallback).
-  const filePath = path.join(resolveRepoRoot(ctx.baseConfig.cwd), '.agent', 'config.toml');
+  const filePath = path.join(resolveRepoRoot(ctx.baseConfig.cwd), projectDirName(), 'config.toml');
   const patches: Parameters<typeof mutateMemoryConfig>[0]['patches'] = {};
   if (target.verify) patches.verifySemanticLlm = value;
   if (target.conflict) patches.conflictDetectLlm = value;
@@ -3710,6 +3715,7 @@ export const memoryCommand: SlashCommand = {
   name: 'memory',
   description:
     'manage cross-session memories (list/show/audit/provenance/governance/delete/quarantine/restore/promote/demote/trust/seeds)',
+  argHint: '<subcommand>',
   exec: async (args, ctx) => {
     const registry = ctx.baseConfig.memoryRegistry;
     if (registry === undefined) {

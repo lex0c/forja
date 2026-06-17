@@ -80,7 +80,7 @@ Where each cap can be set:
 | Surface | Caps it can set | Scope |
 |---|---|---|
 | `DEFAULT_BUDGET` (code) | all | fallback |
-| `.agent/config.toml` `[budget]` | `max_steps`, `max_wall_clock_ms`, `max_step_stall_ms`, `compaction_preserve_tail`, `max_cost_usd`, `compaction_threshold`, `compaction_relevance` | persistent (project layer overrides user) |
+| `.forja/config.toml` `[budget]` | `max_steps`, `max_wall_clock_ms`, `max_step_stall_ms`, `compaction_preserve_tail`, `max_cost_usd`, `compaction_threshold`, `compaction_relevance` | persistent (project layer overrides user) |
 | CLI | `--max-steps` only | per-run |
 | `/effort <level>` preset | `maxSteps`, `maxConcurrentSubagents`, `maxToolErrors` | session (in memory, next turn) |
 | `/budget <sub> <val>` | `steps`, `cost`, `parallel-tools`, `subagents`, `relevance` | session (in memory, next turn) |

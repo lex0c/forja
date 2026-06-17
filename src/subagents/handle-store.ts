@@ -604,7 +604,7 @@ export const createSubagentHandleStore = (
   // **Concurrency assumption**: only ONE process at a time may
   // hold a session id open. Spec
   // `STATE_MACHINE.md §105` and `ORCHESTRATION.md §11`
-  // mandate a per-cwd lockfile (`.agent/lock`) that enforces
+  // mandate a per-cwd lockfile (`.forja/lock`) that enforces
   // this. The mass-settle here is destructive: every running
   // row owned by `parentSessionId` is converted to
   // `resumed_session`. If two parent processes simultaneously

@@ -148,6 +148,15 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
   if (subagentCount > 0) {
     rightParts.push(paint(caps, 'success', `${subagentCount} subagents`));
   }
+  // Isolation profile (`--profile`/FORJA_PROFILE). The banner scrolls out of
+  // view, so this is the always-visible guard against mistaking a dev/test
+  // run for real Forja state. Painted `warn` (yellow) — the one static chip
+  // that isn't `dim`, because it's a safety signal, not passive info.
+  // Suppressed on the default namespace (profile null) so normal runs see no
+  // extra chip.
+  if (status.profile !== null) {
+    rightParts.push(paint(caps, 'warn', `profile:${status.profile}`));
+  }
   // Loaded model id (e.g. `claude-opus-4-8`). Also on the startup banner's
   // identity line (render/permanent.ts), but kept here too: the banner scrolls
   // out of view, so the footer is the always-visible place to confirm which
@@ -174,6 +183,26 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
   // idle session.
   if (status.sessionTotalCostUsd > 0) {
     rightParts.push(dim(caps, formatCost(status.sessionTotalCostUsd)));
+  }
+  // Context-window occupancy, the trailing chip (after cost). Deliberately a
+  // LATE-only signal: shown solely at >= 97% as a near-the-ceiling warning that
+  // compaction/overflow is imminent — below that it's noise the operator
+  // doesn't need. Painted `error` (red), not `dim` — at >= 97% the window is
+  // about to overflow, the strongest passive signal the footer carries.
+  // Suppressed pre-boot (contextWindow 0), before the first measured
+  // turn (lastTurnContextTokens 0), and while stale (post-compaction, before a
+  // real turn re-measures from provider usage) so we never show an estimated or
+  // outdated number. Floor + clamp so the figure never overstates or exceeds
+  // 100%. lastTurnContextTokens = input + cache of the latest turn = what
+  // actually occupied the window when the model generated.
+  if (status.contextWindow > 0 && status.lastTurnContextTokens > 0 && !status.contextStale) {
+    const pct = Math.min(
+      100,
+      Math.floor((status.lastTurnContextTokens / status.contextWindow) * 100),
+    );
+    if (pct >= 97) {
+      rightParts.push(paint(caps, 'error', `${pct}% context used`));
+    }
   }
   const right = rightParts.join(sep);
 

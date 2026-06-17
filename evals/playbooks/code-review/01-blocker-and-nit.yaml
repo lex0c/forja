@@ -17,3 +17,5 @@ expect:
   output_contains:
     - summary
     - blockers
+    - confidence
+    - introduced_by

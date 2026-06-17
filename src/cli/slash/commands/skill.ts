@@ -348,6 +348,7 @@ const handleDelete = (
 export const skillCommand: SlashCommand = {
   name: 'skill',
   description: 'Manage skills — list, show, new, promote, demote, delete',
+  argHint: 'list|show|new|promote|demote|delete',
   // `exec` is async only to satisfy the SlashCommand contract; every
   // handler is synchronous (the lifecycle ops are sync `fs`).
   exec: async (args: string[], ctx: SlashContext): Promise<SlashResult> => {

@@ -16,9 +16,12 @@ const ascii: Capabilities = { ...caps, unicode: false };
 // provided. Tests that don't care about which verb gets picked
 // pass an arbitrary id; tests that exercise the verb pool pin
 // specific ids and expected pool entries.
-const thinking = (overrides: Partial<{ startedAt: number; messageId: string }> = {}) => ({
+const thinking = (
+  overrides: Partial<{ startedAt: number; messageId: string; text: string }> = {},
+) => ({
   startedAt: 0,
   messageId: 'm1',
+  text: '',
   ...overrides,
 });
 

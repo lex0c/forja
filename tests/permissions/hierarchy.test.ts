@@ -35,7 +35,7 @@ describe('resolvePolicy — discovery', () => {
   });
 
   test('loads project layer only when only project file exists', () => {
-    writeYaml(projectFile('.agent/permissions.yaml'), 'defaults:\n  mode: acceptEdits\n');
+    writeYaml(projectFile('.forja/permissions.yaml'), 'defaults:\n  mode: acceptEdits\n');
     const result = resolvePolicy({
       cwd: workdir,
       enterprisePath: null,
@@ -50,7 +50,7 @@ describe('resolvePolicy — discovery', () => {
     const usr = projectFile('usr.yaml');
     writeFileSync(ent, 'defaults:\n  mode: bypass\n');
     writeFileSync(usr, 'defaults:\n  mode: acceptEdits\n');
-    writeYaml(projectFile('.agent/permissions.yaml'), 'defaults:\n  mode: strict\n');
+    writeYaml(projectFile('.forja/permissions.yaml'), 'defaults:\n  mode: strict\n');
 
     const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: usr });
     expect(result.layers.map((l) => l.layer)).toEqual(['enterprise', 'user', 'project']);
@@ -60,11 +60,11 @@ describe('resolvePolicy — discovery', () => {
 
   test('skips user layer when userPolicyPath returns null (no absolute home)', () => {
     // Regression: when HOME is unset the user path used to fall
-    // through to a relative `.config/agent/permissions.yaml` and
+    // through to a relative `.config/forja/permissions.yaml` and
     // existsSync would check it against the cwd. A repo with such
     // a file could masquerade as the user layer and override
     // project-local policy. Resolver must skip when path is null.
-    writeYaml(projectFile('.agent/permissions.yaml'), 'defaults:\n  mode: acceptEdits\n');
+    writeYaml(projectFile('.forja/permissions.yaml'), 'defaults:\n  mode: acceptEdits\n');
     // Inject env with no HOME, no XDG — userPolicyPath returns null.
     const result = resolvePolicy({
       cwd: workdir,
@@ -76,7 +76,7 @@ describe('resolvePolicy — discovery', () => {
   });
 
   test('session layer takes precedence over project when injected', () => {
-    writeYaml(projectFile('.agent/permissions.yaml'), 'defaults:\n  mode: strict\n');
+    writeYaml(projectFile('.forja/permissions.yaml'), 'defaults:\n  mode: strict\n');
     const result = resolvePolicy({
       cwd: workdir,
       enterprisePath: null,
@@ -105,7 +105,7 @@ describe('resolvePolicy — locked semantics', () => {
     const ent = projectFile('ent.yaml');
     writeFileSync(ent, 'tools:\n  bash:\n    deny:\n      - "rm -rf /*"\n    locked: true\n');
     writeYaml(
-      projectFile('.agent/permissions.yaml'),
+      projectFile('.forja/permissions.yaml'),
       'tools:\n  bash:\n    allow:\n      - "rm -rf /*"\n',
     );
     const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: null });
@@ -124,7 +124,7 @@ describe('resolvePolicy — locked semantics', () => {
       'tools:\n  write_file:\n    deny_paths:\n      - "**/.env"\n    locked: true\n',
     );
     writeYaml(
-      projectFile('.agent/permissions.yaml'),
+      projectFile('.forja/permissions.yaml'),
       'tools:\n  write_file:\n    allow_paths:\n      - "**/.env"\n',
     );
     const result = resolvePolicy({
@@ -145,7 +145,7 @@ describe('resolvePolicy — locked semantics', () => {
     writeFileSync(ent, 'tools:\n  bash:\n    deny:\n      - "rm *"\n    locked: true\n');
     writeFileSync(usr, 'tools:\n  bash:\n    allow:\n      - "git *"\n');
     writeYaml(
-      projectFile('.agent/permissions.yaml'),
+      projectFile('.forja/permissions.yaml'),
       'tools:\n  bash:\n    allow:\n      - "ls *"\n',
     );
     const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: usr });
@@ -159,7 +159,7 @@ describe('resolvePolicy — locked semantics', () => {
     const ent = projectFile('ent.yaml');
     writeFileSync(ent, 'tools:\n  bash:\n    allow:\n      - "git *"\n');
     writeYaml(
-      projectFile('.agent/permissions.yaml'),
+      projectFile('.forja/permissions.yaml'),
       'tools:\n  bash:\n    allow:\n      - "ls *"\n',
     );
     const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: null });
@@ -192,7 +192,7 @@ describe('resolvePolicy — locked semantics', () => {
     writeFileSync(ent, 'defaults:\n  mode: bypass\n');
     // user freezes whatever mode it inherited (bypass), no mode field.
     writeFileSync(usr, 'defaults:\n  locked: true\n');
-    writeYaml(projectFile('.agent/permissions.yaml'), 'defaults:\n  mode: strict\n');
+    writeYaml(projectFile('.forja/permissions.yaml'), 'defaults:\n  mode: strict\n');
 
     const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: usr });
     // Inherited bypass survives; project's strict attempt is
@@ -209,7 +209,7 @@ describe('resolvePolicy — locked semantics', () => {
     // freezes the eventual default 'strict' applied at emit.
     const usr = projectFile('usr.yaml');
     writeFileSync(usr, 'defaults:\n  locked: true\n');
-    writeYaml(projectFile('.agent/permissions.yaml'), 'defaults:\n  mode: bypass\n');
+    writeYaml(projectFile('.forja/permissions.yaml'), 'defaults:\n  mode: bypass\n');
     const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
     // Project's bypass attempt is rejected; merged mode falls
     // back to the resolver's strict default at emit.
@@ -246,7 +246,7 @@ describe('resolvePolicy — section provenance', () => {
 
   test('single project layer writes per-section provenance', () => {
     writeYaml(
-      projectFile('.agent/permissions.yaml'),
+      projectFile('.forja/permissions.yaml'),
       'defaults:\n  mode: acceptEdits\ntools:\n  bash:\n    allow:\n      - "ls *"\n  read_file:\n    allow_paths:\n      - "src/**"\n',
     );
     const result = resolvePolicy({
@@ -274,7 +274,7 @@ describe('resolvePolicy — section provenance', () => {
     );
     writeFileSync(usr, 'tools:\n  read_file:\n    allow_paths:\n      - "src/**"\n');
     writeYaml(
-      projectFile('.agent/permissions.yaml'),
+      projectFile('.forja/permissions.yaml'),
       'tools:\n  write_file:\n    allow_paths:\n      - "src/**"\n',
     );
     const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: usr });
@@ -295,7 +295,7 @@ describe('resolvePolicy — section provenance', () => {
     const usr = projectFile('usr.yaml');
     writeFileSync(usr, 'tools:\n  bash:\n    allow:\n      - "ls *"\n');
     writeYaml(
-      projectFile('.agent/permissions.yaml'),
+      projectFile('.forja/permissions.yaml'),
       'tools:\n  bash:\n    deny:\n      - "rm *"\n',
     );
     const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
@@ -311,7 +311,7 @@ describe('resolvePolicy — section provenance', () => {
     const ent = projectFile('ent.yaml');
     writeFileSync(ent, 'tools:\n  bash:\n    deny:\n      - "*"\n    locked: true\n');
     writeYaml(
-      projectFile('.agent/permissions.yaml'),
+      projectFile('.forja/permissions.yaml'),
       'tools:\n  bash:\n    allow:\n      - "ls *"\n',
     );
     const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: null });
@@ -342,7 +342,7 @@ describe('resolvePolicy — section provenance', () => {
     // mode), not at project (which only set the lock).
     const usr = projectFile('usr.yaml');
     writeFileSync(usr, 'defaults:\n  mode: acceptEdits\n');
-    writeYaml(projectFile('.agent/permissions.yaml'), 'defaults:\n  locked: true\n');
+    writeYaml(projectFile('.forja/permissions.yaml'), 'defaults:\n  locked: true\n');
     const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
     expect(result.policy.defaults.mode).toBe('acceptEdits');
     expect(result.policy.defaults.locked).toBe(true);
@@ -359,7 +359,7 @@ describe('resolvePolicy — sandbox section (§6.5, slice 23)', () => {
 
   test('project-only sandbox surfaces in merged policy + provenance (slice 35: per-field)', () => {
     writeYaml(
-      projectFile('.agent/permissions.yaml'),
+      projectFile('.forja/permissions.yaml'),
       'sandbox:\n  required: true\n  host_allowed: true\n',
     );
     const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: null });
@@ -374,7 +374,7 @@ describe('resolvePolicy — sandbox section (§6.5, slice 23)', () => {
     // touch ANY field), losing the user's authorship of `required`.
     const usr = join(workdir, 'user-policy.yaml');
     writeYaml(usr, 'sandbox:\n  required: true\n');
-    writeYaml(projectFile('.agent/permissions.yaml'), 'sandbox:\n  host_allowed: true\n');
+    writeYaml(projectFile('.forja/permissions.yaml'), 'sandbox:\n  host_allowed: true\n');
     const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
     expect(result.policy.sandbox).toEqual({ required: true, hostAllowed: true });
     expect(result.provenance.sandbox).toEqual({ required: 'user', hostAllowed: 'project' });
@@ -383,7 +383,7 @@ describe('resolvePolicy — sandbox section (§6.5, slice 23)', () => {
   test('project explicitly overrides user (slice 35: required writer updates)', () => {
     const usr = join(workdir, 'user-policy.yaml');
     writeYaml(usr, 'sandbox:\n  required: true\n');
-    writeYaml(projectFile('.agent/permissions.yaml'), 'sandbox:\n  required: false\n');
+    writeYaml(projectFile('.forja/permissions.yaml'), 'sandbox:\n  required: false\n');
     const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
     expect(result.policy.sandbox?.required).toBe(false);
     expect(result.provenance.sandbox).toEqual({ required: 'project' });
@@ -393,7 +393,7 @@ describe('resolvePolicy — sandbox section (§6.5, slice 23)', () => {
     // user sets sandbox; project is silent → required writer stays at user.
     const usr = join(workdir, 'user-policy.yaml');
     writeYaml(usr, 'sandbox:\n  required: true\n');
-    writeYaml(projectFile('.agent/permissions.yaml'), 'defaults:\n  mode: bypass\n');
+    writeYaml(projectFile('.forja/permissions.yaml'), 'defaults:\n  mode: bypass\n');
     const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
     expect(result.policy.sandbox?.required).toBe(true);
     expect(result.provenance.sandbox).toEqual({ required: 'user' });
@@ -404,7 +404,7 @@ describe('resolvePolicy — sandbox section-level lock (§6.5, slice 34)', () =>
   test('user lock + project change to required → lockConflict, locked value preserved', () => {
     const usr = join(workdir, 'user-policy.yaml');
     writeYaml(usr, 'sandbox:\n  required: true\n  locked: true\n');
-    writeYaml(projectFile('.agent/permissions.yaml'), 'sandbox:\n  required: false\n');
+    writeYaml(projectFile('.forja/permissions.yaml'), 'sandbox:\n  required: false\n');
     const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
     expect(result.policy.sandbox).toEqual({ required: true, locked: true });
     expect(result.lockConflicts).toEqual([
@@ -419,7 +419,7 @@ describe('resolvePolicy — sandbox section-level lock (§6.5, slice 34)', () =>
   test('user lock + project re-asserts SAME required → silent (no conflict)', () => {
     const usr = join(workdir, 'user-policy.yaml');
     writeYaml(usr, 'sandbox:\n  required: true\n  locked: true\n');
-    writeYaml(projectFile('.agent/permissions.yaml'), 'sandbox:\n  required: true\n');
+    writeYaml(projectFile('.forja/permissions.yaml'), 'sandbox:\n  required: true\n');
     const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
     expect(result.policy.sandbox).toEqual({ required: true, locked: true });
     expect(result.lockConflicts).toEqual([]);
@@ -430,7 +430,7 @@ describe('resolvePolicy — sandbox section-level lock (§6.5, slice 34)', () =>
     // attempting to flip `host_allowed` is also discarded.
     const usr = join(workdir, 'user-policy.yaml');
     writeYaml(usr, 'sandbox:\n  host_allowed: false\n  locked: true\n');
-    writeYaml(projectFile('.agent/permissions.yaml'), 'sandbox:\n  host_allowed: true\n');
+    writeYaml(projectFile('.forja/permissions.yaml'), 'sandbox:\n  host_allowed: true\n');
     const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
     expect(result.policy.sandbox).toEqual({ hostAllowed: false, locked: true });
     expect(result.lockConflicts).toEqual([
@@ -446,7 +446,7 @@ describe('resolvePolicy — sandbox section-level lock (§6.5, slice 34)', () =>
     // frozen.
     const usr = join(workdir, 'user-policy.yaml');
     writeYaml(usr, 'sandbox:\n  locked: true\n');
-    writeYaml(projectFile('.agent/permissions.yaml'), 'sandbox:\n  required: true\n');
+    writeYaml(projectFile('.forja/permissions.yaml'), 'sandbox:\n  required: true\n');
     const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
     // `required` stays undefined (no layer wrote it); the lock alone
     // surfaced in the merged sandbox.
@@ -466,7 +466,7 @@ describe('resolvePolicy — sandbox section-level lock (§6.5, slice 34)', () =>
     const usr = join(workdir, 'user-policy.yaml');
     writeYaml(ent, 'sandbox:\n  required: true\n  locked: true\n');
     writeYaml(usr, 'sandbox:\n  required: false\n');
-    writeYaml(projectFile('.agent/permissions.yaml'), 'sandbox:\n  host_allowed: true\n');
+    writeYaml(projectFile('.forja/permissions.yaml'), 'sandbox:\n  host_allowed: true\n');
     const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: usr });
     expect(result.policy.sandbox).toEqual({ required: true, locked: true });
     expect(result.lockConflicts).toEqual([
@@ -481,7 +481,7 @@ describe('resolvePolicy — sandbox section-level lock (§6.5, slice 34)', () =>
     // without any lock → project wins, no conflict.
     const usr = join(workdir, 'user-policy.yaml');
     writeYaml(usr, 'sandbox:\n  required: true\n');
-    writeYaml(projectFile('.agent/permissions.yaml'), 'sandbox:\n  required: false\n');
+    writeYaml(projectFile('.forja/permissions.yaml'), 'sandbox:\n  required: false\n');
     const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
     expect(result.policy.sandbox).toEqual({ required: false });
     expect(result.lockConflicts).toEqual([]);
@@ -498,7 +498,7 @@ describe('resolvePolicy — sandbox per-field provenance (§6.5, slice 35)', () 
     const usr = join(workdir, 'user-policy.yaml');
     writeYaml(ent, 'sandbox:\n  required: true\n');
     writeYaml(usr, 'sandbox:\n  host_allowed: true\n');
-    writeYaml(projectFile('.agent/permissions.yaml'), 'sandbox:\n  locked: true\n');
+    writeYaml(projectFile('.forja/permissions.yaml'), 'sandbox:\n  locked: true\n');
     const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: usr });
     expect(result.policy.sandbox).toEqual({ required: true, hostAllowed: true, locked: true });
     expect(result.provenance.sandbox).toEqual({
@@ -529,7 +529,7 @@ describe('resolvePolicy — sandbox per-field provenance (§6.5, slice 35)', () 
     // `required` updates to project.
     const usr = join(workdir, 'user-policy.yaml');
     writeYaml(usr, 'sandbox:\n  required: true\n  host_allowed: true\n');
-    writeYaml(projectFile('.agent/permissions.yaml'), 'sandbox:\n  required: false\n');
+    writeYaml(projectFile('.forja/permissions.yaml'), 'sandbox:\n  required: false\n');
     const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
     expect(result.provenance.sandbox).toEqual({
       required: 'project',
@@ -544,7 +544,7 @@ describe('resolvePolicy — sandbox per-field provenance (§6.5, slice 35)', () 
     // the single-Layer shape would have collapsed to project.
     const usr = join(workdir, 'user-policy.yaml');
     writeYaml(usr, 'sandbox:\n  required: true\n');
-    writeYaml(projectFile('.agent/permissions.yaml'), 'sandbox:\n  locked: true\n');
+    writeYaml(projectFile('.forja/permissions.yaml'), 'sandbox:\n  locked: true\n');
     const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
     expect(result.policy.sandbox).toEqual({ required: true, locked: true });
     expect(result.provenance.sandbox).toEqual({
@@ -566,7 +566,7 @@ describe('resolvePolicy — seal section locking (slice 112, R8 #322)', () => {
   test('enterprise seal with locked:true blocks project override', () => {
     const ent = join(workdir, 'ent.yaml');
     writeYaml(ent, 'seal:\n  mode: worm-file\n  path: /var/log/seal.log\n  locked: true\n');
-    writeYaml(projectFile('.agent/permissions.yaml'), 'seal:\n  mode: none\n');
+    writeYaml(projectFile('.forja/permissions.yaml'), 'seal:\n  mode: none\n');
     const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: null });
     expect(result.policy.seal?.mode).toBe('worm-file');
     expect(result.policy.seal?.path).toBe('/var/log/seal.log');
@@ -585,7 +585,7 @@ describe('resolvePolicy — seal section locking (slice 112, R8 #322)', () => {
     const ent = join(workdir, 'ent.yaml');
     writeYaml(ent, 'seal:\n  mode: worm-file\n  path: /var/log/seal.log\n  locked: true\n');
     writeYaml(
-      projectFile('.agent/permissions.yaml'),
+      projectFile('.forja/permissions.yaml'),
       'seal:\n  mode: worm-file\n  path: /var/log/seal.log\n  locked: true\n',
     );
     const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: null });
@@ -597,7 +597,7 @@ describe('resolvePolicy — seal section locking (slice 112, R8 #322)', () => {
     const ent = join(workdir, 'ent.yaml');
     writeYaml(ent, 'seal:\n  mode: worm-file\n  path: /var/log/seal.log\n  locked: true\n');
     writeYaml(
-      projectFile('.agent/permissions.yaml'),
+      projectFile('.forja/permissions.yaml'),
       'seal:\n  mode: worm-file\n  path: /tmp/other-seal.log\n',
     );
     const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: null });
@@ -612,7 +612,7 @@ describe('resolvePolicy — seal section locking (slice 112, R8 #322)', () => {
     // CI policy). Session is the innermost layer; a session-supplied
     // seal can't override project's locked config.
     writeYaml(
-      projectFile('.agent/permissions.yaml'),
+      projectFile('.forja/permissions.yaml'),
       'seal:\n  mode: worm-file\n  path: /tmp/project-seal.log\n  locked: true\n',
     );
     const result = resolvePolicy({
@@ -639,7 +639,7 @@ describe('resolvePolicy — seal section locking (slice 112, R8 #322)', () => {
   // exact code path stableJsonStringify guards.
   test('programmatic session policy with reversed key order does NOT trigger lockConflict (R3)', () => {
     writeYaml(
-      projectFile('.agent/permissions.yaml'),
+      projectFile('.forja/permissions.yaml'),
       'seal:\n  mode: worm-file\n  path: /var/log/seal.log\n  locked: true\n',
     );
     const result = resolvePolicy({
@@ -658,7 +658,7 @@ describe('resolvePolicy — seal section locking (slice 112, R8 #322)', () => {
 
   test('programmatic session policy with DIFFERENT content DOES trigger lockConflict (R3 negative)', () => {
     writeYaml(
-      projectFile('.agent/permissions.yaml'),
+      projectFile('.forja/permissions.yaml'),
       'seal:\n  mode: worm-file\n  path: /var/log/seal.log\n  locked: true\n',
     );
     const result = resolvePolicy({
@@ -682,7 +682,7 @@ describe('resolvePolicy — seal section locking (slice 112, R8 #322)', () => {
     // applies.
     const ent = join(workdir, 'ent.yaml');
     writeYaml(ent, 'seal:\n  mode: worm-file\n  path: /var/log/seal.log\n');
-    writeYaml(projectFile('.agent/permissions.yaml'), 'seal:\n  mode: none\n');
+    writeYaml(projectFile('.forja/permissions.yaml'), 'seal:\n  mode: none\n');
     const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: null });
     expect(result.policy.seal?.mode).toBe('none');
     expect(result.lockConflicts.length).toBe(0);

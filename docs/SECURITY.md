@@ -17,7 +17,7 @@ Concretely, Forja defends against:
 1. **LLM-driven exfiltration.** A model that decides — under prompt injection or its own confused goals — to read credentials, post them to an external service, or otherwise smuggle them out of the operator's machine.
 2. **Capability laundering.** A model that uses ostensibly safe tools (e.g., `cat`, `cd`, `grep`) in combination to achieve effects it could not request directly (e.g., `command rm -rf /home`).
 3. **Tool-chain bypass.** A model that constructs commands designed to evade the static analysis the resolver performs — shell substitution, env-var injection, redirect tricks, encoding games.
-4. **Persistent compromise across sessions.** A model that writes to operator config files (e.g., `~/.config/agent/permissions.yaml`) intending the next session boot under tampered rules.
+4. **Persistent compromise across sessions.** A model that writes to operator config files (e.g., `~/.config/forja/permissions.yaml`) intending the next session boot under tampered rules.
 5. **Audit tampering.** A model (or downstream attacker with DB write) that rewrites the audit chain to hide what it did.
 
 ### 1.2 What Forja does NOT defend against
@@ -122,7 +122,7 @@ LLM emits tool_use
  execute audit  TUI modal → execute|deny
 ```
 
-Every step writes a `reason_chain` entry into `approvals_log`. The full chain — `protected-path`, `subagent-effective`, `static-rule`, `classifier`, `sandbox-plan`, `approval-gate` — is queryable via `agent permission replay <seq>`.
+Every step writes a `reason_chain` entry into `approvals_log`. The full chain — `protected-path`, `subagent-effective`, `static-rule`, `classifier`, `sandbox-plan`, `approval-gate` — is queryable via `forja permission replay <seq>`.
 
 ### 3.2 Resolvers
 
@@ -190,7 +190,7 @@ A `Capability` is a typed `{kind, scope}` pair:
 | `git-write` | `/work/proj/.git` | git commit, git push, git reset |
 | `secret-access` | `~/.aws`, `~/.ssh` | (engine-internal, used by sandbox planner) |
 | `env-mutate` | `PATH`, `HOME` | (reserved, for env-modifying tools) |
-| `agent-mutate` | `*` | (reserved) |
+| `forja-mutate` | `*` | (reserved) |
 | `host-passthrough` | `*` | (required for `host` sandbox profile) |
 
 Capabilities are the universal language for "what does this tool want to do". Resolvers emit them; policy rules match against them; the sandbox planner picks a profile that admits them; the audit row preserves them.
@@ -202,11 +202,11 @@ Policies stack from least-specific to most-specific:
 ```
 default (built-in, src/permissions/types.ts)
   ↓
-enterprise   /etc/agent/permissions.yaml (admin-controlled)
+enterprise   /etc/forja/permissions.yaml (admin-controlled)
   ↓
-user         ~/.config/agent/permissions.yaml
+user         ~/.config/forja/permissions.yaml
   ↓
-project      .agent/permissions.yaml (cwd-local)
+project      .forja/permissions.yaml (cwd-local)
   ↓
 session      CLI flags / runtime overrides
 ```
@@ -247,7 +247,7 @@ Eleven features, each with a fixed weight in `RISK_SCORE_WEIGHTS` (`src/permissi
 
 | Feature | Weight | Fires when |
 |---|---:|---|
-| `capability_risk` | 0.40 | any cap kind in `{delete-fs, git-write, env-mutate, agent-mutate}` |
+| `capability_risk` | 0.40 | any cap kind in `{delete-fs, git-write, env-mutate, forja-mutate}` |
 | `blocklist_command` | 0.30 | bash command contains a known-bad substring (`rm -rf`, `curl \| sh`, ...) |
 | `confidence_low` | 0.30 | resolver returned `confidence: 'low'` |
 | `untrusted_egress` | 0.25 | `net-egress:<host>` with host outside `trustedHosts` |
@@ -268,7 +268,7 @@ if confidence != 'high':           upgrade to confirm
 otherwise:                          allow stays allow
 ```
 
-Weights are documented as `baseline-v2.0`. Calibration plan (spec §6.3.2) collects 30 days of `(score, decision_humano, outcome)` triples (slice 131's `outcome_signals` materializes the third element) and derives `v2.1` via logistic regression. Step 1 of the plan — triple extraction — is in-tree as of slice 138 via `agent permission calibration-export` (spec §6.3.2.2, operator guide in `docs/AUDIT.md §2.2`); the regression itself stays offline.
+Weights are documented as `baseline-v2.0`. Calibration plan (spec §6.3.2) collects 30 days of `(score, decision_humano, outcome)` triples (slice 131's `outcome_signals` materializes the third element) and derives `v2.1` via logistic regression. Step 1 of the plan — triple extraction — is in-tree as of slice 138 via `forja permission calibration-export` (spec §6.3.2.2, operator guide in `docs/AUDIT.md §2.2`); the regression itself stays offline.
 
 ### 3.6 Decision shape + audit emission
 
@@ -405,7 +405,7 @@ SBPL evaluates top-to-bottom and **last-matching-rule wins** for each operation.
 - `.ssh` — SSH keys + known_hosts
 - `.aws` — AWS credentials
 - `.config/gcloud`, `.config/azure`, `.config/op` (1Password), `.config/sops` — cloud CLI creds
-- `.config/agent`, `.config/forja` — Forja's own policy files + `sandbox_skip` marker (sandboxed process must not plant tampered config for next boot — slices 122 + 128 R4 P0-Sand-1/2). `.config/forja` was explicitly added in slice 128 R4 P0-Sand-2 to prevent forging the `sandbox_skip` marker.
+- `.config/forja`, `.config/forja` — Forja's own policy files + `sandbox_skip` marker (sandboxed process must not plant tampered config for next boot — slices 122 + 128 R4 P0-Sand-1/2). `.config/forja` was explicitly added in slice 128 R4 P0-Sand-2 to prevent forging the `sandbox_skip` marker.
 - `.gnupg` — PGP keyring
 - `.kube` — Kubernetes credentials
 - `.terraform.d` — Terraform creds + credential cache
@@ -436,7 +436,7 @@ cwd-rw:      {read-fs, write-fs, delete-fs, exec, git-write}
 cwd-rw-net:  {read-fs, write-fs, delete-fs, exec, git-write, net-egress}
 home-rw:     {read-fs, write-fs, delete-fs, exec, git-write, secret-access}
 host:        {read-fs, write-fs, delete-fs, exec, git-write, net-egress,
-              net-ingress, secret-access, env-mutate, agent-mutate,
+              net-ingress, secret-access, env-mutate, forja-mutate,
               host-passthrough}
 ```
 
@@ -499,9 +499,9 @@ The baseline sandbox is ephemeral: `/tmp` is a fresh tmpfs per spawn and build/d
 
 **Mount-order invariant** (bwrap, last-wins): host-cache tmpfs → Forja-cache bind → cwd bind → credential overlays. A cache (poisoned or not) can NEVER unmask a credential. macOS has no bind primitive — persistence is `(allow file-write* (subpath …))` + the same env redirect; `/tmp` uses the tmpdir-subpath mechanism.
 
-**Reclaim:** `agent cache clear [--force] [--json]` reports the size and removes the dependency-cache subtree `~/.cache/forja/cache` (dry-run without `--force`). It deliberately leaves `~/.cache/forja/tmp/sessions/` alone — those are live bwrap `/tmp` bind sources for ACTIVE sessions, and deleting one mid-session would break that session's sandboxed tools (the runner's `--bind <src> /tmp` fails on a missing source). So a clear from one terminal is safe while another session runs. The redirect only exists inside the sandbox, so the operator's native cleanup run on the host (`npm cache clean`, `go clean -cache`, …) never reaches this tree. Several package managers also self-GC the dir (Go build trim, Gradle 30-day, Composer cache-ttl), which operates normally on the redirected path.
+**Reclaim:** `forja cache clear [--force] [--json]` reports the size and removes the dependency-cache subtree `~/.cache/forja/cache` (dry-run without `--force`). It deliberately leaves `~/.cache/forja/tmp/sessions/` alone — those are live bwrap `/tmp` bind sources for ACTIVE sessions, and deleting one mid-session would break that session's sandboxed tools (the runner's `--bind <src> /tmp` fails on a missing source). So a clear from one terminal is safe while another session runs. The redirect only exists inside the sandbox, so the operator's native cleanup run on the host (`npm cache clean`, `go clean -cache`, …) never reaches this tree. Several package managers also self-GC the dir (Go build trim, Gradle 30-day, Composer cache-ttl), which operates normally on the redirected path.
 
-**Trade-off:** the cache is shared per-user across sessions (an intra-Forja surface, never the host's). Notably `GRADLE_USER_HOME` carries `init.d/` init scripts that run on every gradle build, so one build can plant a script that later executes in another project's build — contained to the dedicated cache and the cwd-rw sandbox (never the host `~/.gradle`, never the host itself), but a cross-build channel within Forja. Accepted; `agent cache clear` resets it.
+**Trade-off:** the cache is shared per-user across sessions (an intra-Forja surface, never the host's). Notably `GRADLE_USER_HOME` carries `init.d/` init scripts that run on every gradle build, so one build can plant a script that later executes in another project's build — contained to the dedicated cache and the cwd-rw sandbox (never the host `~/.gradle`, never the host itself), but a cross-build channel within Forja. Accepted; `forja cache clear` resets it.
 
 ---
 
@@ -536,11 +536,11 @@ The engine + sandbox are the most visible defenses but they are not the whole pe
 
 `src/trust/`. Spec slice 122 (R9 P0).
 
-On first invocation in an unknown directory, Forja refuses to operate until the operator explicitly trusts the cwd. The trust list lives at `~/.config/agent/trusted_dirs` (newline-delimited absolute paths). The welcome flow prompts on initial run; refusal exits without touching anything.
+On first invocation in an unknown directory, Forja refuses to operate until the operator explicitly trusts the cwd. The trust list lives at `~/.config/forja/trusted_dirs` (newline-delimited absolute paths). The welcome flow prompts on initial run; refusal exits without touching anything.
 
-Defends against `cd ~/cloned-malicious-repo && agent` — the project's `.agent/permissions.yaml`, `AGENTS.md`, and any tool definitions in that directory could carry attack payloads. The trust gate prevents Forja from loading them as authoritative until the operator confirms.
+Defends against `cd ~/cloned-malicious-repo && agent` — the project's `.forja/permissions.yaml`, `AGENTS.md`, and any tool definitions in that directory could carry attack payloads. The trust gate prevents Forja from loading them as authoritative until the operator confirms.
 
-The trust file itself is in `HIDE_PATHS_DIRS` (`.config/agent`) so a sandboxed process cannot plant trust entries that take effect on the next session boot (slice 128 R4 P0-Sand-1).
+The trust file itself is in `HIDE_PATHS_DIRS` (`.config/forja`) so a sandboxed process cannot plant trust entries that take effect on the next session boot (slice 128 R4 P0-Sand-1).
 
 ### 5.5.2 Hooks
 
@@ -548,7 +548,7 @@ The trust file itself is in `HIDE_PATHS_DIRS` (`.config/agent`) so a sandboxed p
 
 Operators define shell commands that run at lifecycle points: `SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`, `UserPromptSubmit`. Hooks run **unsandboxed** (`bash` directly) because their purpose is exactly to interact with the host — kick CI, post to Slack, write a log entry, mint a token. They are a privileged surface **by operator design**.
 
-Trust model: hooks are operator-authored files in `~/.config/agent/hooks/` or `.agent/hooks/`. The LLM cannot install new hooks (write to `.config/agent` is HIDE_PATHS-masked inside sandbox). Existing hook scripts are vetted by the operator at the point of creation.
+Trust model: hooks are operator-authored files in `~/.config/forja/hooks/` or `.forja/hooks/`. The LLM cannot install new hooks (write to `.config/forja` is HIDE_PATHS-masked inside sandbox). Existing hook scripts are vetted by the operator at the point of creation.
 
 `PreToolUse` hooks can BLOCK a tool call by exiting non-zero — orthogonal to the engine's deny. Operators use this for org policies the engine vocabulary doesn't cover (e.g., "no `npm install` of unscoped packages on Fridays"). Hook outputs land in `hook_runs` with stdout redacted per spec §1.
 
@@ -581,7 +581,7 @@ Threat model: MCP servers are TRUSTED to the same degree as bundled tools, BUT t
 
 `src/tools/builtin/memory-write.ts`. Spec MEMORY.md §5.1.
 
-Operator-facing memory writes (entries under `~/.config/agent/memory/`) require explicit confirmation via a dedicated modal flavor (`askMemoryWrite`). The modal renders the **exact bytes** about to land on disk — operator can spot prompt-injection attempts before approving.
+Operator-facing memory writes (entries under `~/.config/forja/memory/`) require explicit confirmation via a dedicated modal flavor (`askMemoryWrite`). The modal renders the **exact bytes** about to land on disk — operator can spot prompt-injection attempts before approving.
 
 Refused writes audit-log as `memory_events.action='refused'`. The modal-manager distinguishes 'no' from 'cancel' for telemetry — both deny the write but operators reading audit can tell explicit rejection from accidental dismissal.
 
@@ -670,7 +670,7 @@ False positives (e.g., a legitimate `BUILD_TOKEN`) are acceptable cost — scrip
 
 `~/.config/forja/sandbox_skip`. Slice 122.
 
-Marker file that, when present, lets Forja boot without the sandbox-availability prompt. Operator opt-in for workflows where sandbox is wrong (CI environments that need unsandboxed FS access, debugging the engine itself). Created only via `agent welcome --skip-sandbox` after a confirmation flow.
+Marker file that, when present, lets Forja boot without the sandbox-availability prompt. Operator opt-in for workflows where sandbox is wrong (CI environments that need unsandboxed FS access, debugging the engine itself). Created only via `forja welcome --skip-sandbox` after a confirmation flow.
 
 Slice 128 R4 P0-Sand-2 added `.config/forja` to `HIDE_PATHS_DIRS` to prevent a sandboxed process from forging the marker (which would silently disable sandbox on next session start). Slice 122 also added a symlink-escape check — the `sandbox_skip` file itself must not be a symlink (would let an attacker plant a symlink pointing into HIDE_PATHS to bypass the marker check on a fresh boot).
 
@@ -680,10 +680,10 @@ Read-only CLI verbs that surface engine state for review. Designed to run withou
 
 | Verb | Purpose |
 |---|---|
-| `agent permission verify` | Walk `approvals_log` chain, report integrity + first-mismatch row. |
-| `agent permission seal-verify` | Cross-reference seal store against the chain (slice 128 added `install_id` binding to close cross-install forgery). |
-| `agent permission replay <seq>` | Render a single audit row + reason chain + score components + classifier metadata + sandbox profile. |
-| `agent permission diff <seq1> <seq2>` | Diff two rows field by field. |
+| `forja permission verify` | Walk `approvals_log` chain, report integrity + first-mismatch row. |
+| `forja permission seal-verify` | Cross-reference seal store against the chain (slice 128 added `install_id` binding to close cross-install forgery). |
+| `forja permission replay <seq>` | Render a single audit row + reason chain + score components + classifier metadata + sandbox profile. |
+| `forja permission diff <seq1> <seq2>` | Diff two rows field by field. |
 | `agent perms` (or `--explain-permissions`) | Render merged policy with per-section layer attribution. |
 | `agent forensics <session>` | Generate signed `forensics_<session>_<ts>.tar.gz` bundle with all session audit data (AUDIT.md §5). |
 | `/perms` slash command (in REPL) | Render merged policy inline. |
@@ -707,7 +707,7 @@ The modal is the human-in-the-loop. Every prior layer's job is to ensure it's RE
 
 **Autonomous posture — operator-elected, bounded bypass.** The operator runs Supervised by default (every `confirm` reaches the modal). Toggling Autonomous (Shift+Tab, or `--autonomous` at boot) delegates routine approvals so the modal isn't shown for them. This relaxes the human-in-the-loop deliberately and narrowly:
 
-- **Two auto-approvable classes — decided by EFFECT, not command structure.** (1) A low-risk `policy` confirm: cause `policy` (a plain `confirm:` rule match) AND low-risk (score below threshold, confidence not low, resolver not forcing). (2) A bash `compound` / `resolver` / `score` confirm whose EVERY resolved capability is **repo-confined** — fs read/write/delete under cwd (and not protected `.git`/`.agent`/`.claude` nor sensitive `.env`/`*.pem`/`id_rsa`/credentials), a LOCAL `git-write` on this repo, the `/dev` safe pseudo-devices, and `exec:shell` — AND no top-level segment matches an operator `deny` (re-checked per segment, closing checkBash's whole-string-glob gap). This is gated on the resolver having FULLY modeled the command (`kind: ok`): within that, structure (compound, static glob, pipeline) and confidence no longer gate — only the effect does. **Always re-arm the modal:** any non-repo-confined capability — network (`net-egress`, so `git push`/`pull`/`fetch`), outside-repo, unknown binary (`exec:arbitrary`), interpreter, protected/sensitive path — plus `escalate` (protected-path tier), `degraded`, **and any `conservative` resolver result** (soft control flow / loop, dynamic `$var`, unknown command), whose best-effort caps can under-represent the runtime target — e.g. `for f in /tmp/*; do rm "$f"; done` models `$f` as `<cwd>/$f` and emits no cap for the `/tmp/*` loop source, so it looks repo-confined while it deletes `/tmp`. The operator elects this class explicitly (it auto-approves working inside the repo, including writes/deletes); supervised is unchanged.
+- **Two auto-approvable classes — decided by EFFECT, not command structure.** (1) A low-risk `policy` confirm: cause `policy` (a plain `confirm:` rule match) AND low-risk (score below threshold, confidence not low, resolver not forcing). (2) A bash `compound` / `resolver` / `score` confirm whose EVERY resolved capability is **repo-confined** — fs read/write/delete under cwd (and not protected `.git`/`.forja`/`.claude` nor sensitive `.env`/`*.pem`/`id_rsa`/credentials), a LOCAL `git-write` on this repo, the `/dev` safe pseudo-devices, and `exec:shell` — AND no top-level segment matches an operator `deny` (re-checked per segment, closing checkBash's whole-string-glob gap). This is gated on the resolver having FULLY modeled the command (`kind: ok`): within that, structure (compound, static glob, pipeline) and confidence no longer gate — only the effect does. **Always re-arm the modal:** any non-repo-confined capability — network (`net-egress`, so `git push`/`pull`/`fetch`), outside-repo, unknown binary (`exec:arbitrary`), interpreter, protected/sensitive path — plus `escalate` (protected-path tier), `degraded`, **and any `conservative` resolver result** (soft control flow / loop, dynamic `$var`, unknown command), whose best-effort caps can under-represent the runtime target — e.g. `for f in /tmp/*; do rm "$f"; done` models `$f` as `<cwd>/$f` and emits no cap for the `/tmp/*` loop source, so it looks repo-confined while it deletes `/tmp`. The operator elects this class explicitly (it auto-approves working inside the repo, including writes/deletes); supervised is unchanged.
 - **A non-`ready` engine re-arms everything.** Degraded / refusing / quarantined suspends auto-approval (fail-closed). The guard reads the LIVE engine state, so a degrade that happens mid-check still suspends.
 - **Hard denies stay unreachable.** Protected paths and policy `deny` rules resolve to `deny`, not `confirm` — the posture never sees them, so it can never auto-approve a deny.
 - **Every auto-approval is audited.** The `allow` carries an `approval-posture` stage in its reason chain; posture changes are admin rows on the `approvals_log` hash chain; forensic replay reconstructs the posture so the row reproduces honestly instead of looking like policy drift.
@@ -721,8 +721,8 @@ Several Forja-owned files capture secret-shaped payloads (raw bash stdout/stderr
 | Surface | Mode | Slice |
 |---|---|---|
 | `audit.db` (and sidecar `-wal`/`-shm`) | 0o600 | 163 |
-| `.agent/bg/**` log dir + `stdout.log` / `stderr.log` | dir 0o700, files 0o600 | 172 |
-| `.agent/bg/subagents/<id>/stderr.log` + parent dir | dir 0o700, file 0o600 | 172 |
+| `.forja/bg/**` log dir + `stdout.log` / `stderr.log` | dir 0o700, files 0o600 | 172 |
+| `.forja/bg/subagents/<id>/stderr.log` + parent dir | dir 0o700, file 0o600 | 172 |
 | Git checkpoint tree contents | sensitive-pattern files dropped from the temp index before `write-tree` via `matchSensitivePath` (`.env*`, `id_rsa*`, `*.pem`, `*.kdbx`, `*.key`, etc.) so they never land in loose git objects under `.git/objects/` | 172 |
 
 All chmod calls are best-effort (try/catch swallow). Exotic filesystems (FAT, exFAT) ignore mode bits but the dir-mode `0o700` is the load-bearing layer; even if the file chmod fails for any reason, the parent dir's mode blocks cohabitant access. The checkpoint filter is hard-fail — `git ls-files -z` failure aborts the checkpoint rather than silently committing potentially-sensitive content.
@@ -766,7 +766,7 @@ this_hash              TEXT NOT NULL UNIQUE
 
 **Hash construction:** `this_hash = sha256Hex(canonical_json(row_minus_this_hash))` where `prev_hash` enters AS A COLUMN of the canonical payload (Forja convention, documented in spec §4.2.1). Equivalent to spec's `SHA256(prev || canonical(row))` but operationally simpler.
 
-**Chain rotation** (`src/storage/repos/chain-rotation.ts`): copies all rows to `approvals_log_archived`, deletes from `approvals_log`, restarts the chain with a new genesis derived from `install_id + rotated_at_ms + rotation_id`. Audit-loud: a `chain-break-accepted` row is written when the operator runs `agent permission rotate-chain` to acknowledge an intentional rotation.
+**Chain rotation** (`src/storage/repos/chain-rotation.ts`): copies all rows to `approvals_log_archived`, deletes from `approvals_log`, restarts the chain with a new genesis derived from `install_id + rotated_at_ms + rotation_id`. Audit-loud: a `chain-break-accepted` row is written when the operator runs `forja permission rotate-chain` to acknowledge an intentional rotation.
 
 ### 6.2 `failure_events` (per-session hash chain)
 
@@ -797,7 +797,7 @@ Slice 131 materializes the calibration triples spec §6.3.2 specifies. Each sign
 | `checkpoint_reverted` | 0.90 | cli/checkpoints `--undo` for each approval after the restored checkpoint | Strong |
 | `session_aborted` | 0.20 | harness/loop `finish()` last 5 approvals when terminal is interrupted/error | Weak |
 
-`computeOutcomeForApproval(seq)` walks signals via max-wins composite. Threshold 0.5 → `harmful`. Calibration scripts consume `(score, score_components_json, decision, outcome)` triples for logistic regression — see spec §6.3.2.1 for the baseline-v2.0 contract. Slice 138 ships the in-tree triple extractor + CLI verb (`agent permission calibration-export`, spec §6.3.2.2); offline regression on the NDJSON output stays operator-tooling.
+`computeOutcomeForApproval(seq)` walks signals via max-wins composite. Threshold 0.5 → `harmful`. Calibration scripts consume `(score, score_components_json, decision, outcome)` triples for logistic regression — see spec §6.3.2.1 for the baseline-v2.0 contract. Slice 138 ships the in-tree triple extractor + CLI verb (`forja permission calibration-export`, spec §6.3.2.2); offline regression on the NDJSON output stays operator-tooling.
 
 **Derived-audit semantics** (spec AUDIT.md §4.2.3): no `chain_hash` column. Every signal derives 100% from already-chained events in `approvals_log` + `failure_events` — re-hashing here would duplicate integrity without adding evidence. FK existence is validated at INSERT (sink probe `getApprovalsLogBySeq`), but **not** enforced via `ON DELETE CASCADE` — chain rotation deletes `approvals_log` rows, and cascading the deletion would silently wipe calibration data (slice 131 fixup #1). `install_id` is denormalized into the signal row so calibration scripts can join across `approvals_log` + `approvals_log_archived` post-rotation.
 

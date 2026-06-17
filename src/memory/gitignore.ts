@@ -1,7 +1,8 @@
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { projectDirName } from '../config/app-namespace.ts';
 
-// Auto-generated `.agent/.gitignore` per spec §2.5.
+// Auto-generated `.forja/.gitignore` per spec §2.5.
 //
 // The agent owns this file on first invocation and NEVER
 // overwrites it after creation. Operators are free to edit
@@ -16,7 +17,7 @@ import { dirname, join } from 'node:path';
 // build artifacts) belongs in the project's top-level `.gitignore`
 // because it isn't agent state.
 
-export const DEFAULT_AGENT_GITIGNORE = `# .agent/.gitignore (auto-generated; safe to edit)
+export const DEFAULT_AGENT_GITIGNORE = `# .forja/.gitignore (auto-generated; safe to edit)
 sessions.db
 sessions.db-*
 traces/
@@ -35,7 +36,7 @@ export interface EnsureAgentGitignoreResult {
   created: boolean;
 }
 
-// Idempotent. Creates the parent `.agent/` directory (and any
+// Idempotent. Creates the parent `.forja/` directory (and any
 // intermediates) if missing. Atomic-ish: we write directly with
 // `wx` to avoid clobbering a file that materialized between the
 // existsSync check and the write. ENOENT on the parent dir is
@@ -46,7 +47,7 @@ export interface EnsureAgentGitignoreResult {
 // layer; the bootstrap path decides whether to surface to the
 // operator or continue without the gitignore.
 export const ensureAgentGitignore = (repoRoot: string): EnsureAgentGitignoreResult => {
-  const gitignorePath = join(repoRoot, '.agent', '.gitignore');
+  const gitignorePath = join(repoRoot, projectDirName(), '.gitignore');
 
   if (existsSync(gitignorePath)) {
     return { path: gitignorePath, created: false };

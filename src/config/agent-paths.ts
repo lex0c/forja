@@ -9,7 +9,7 @@
 //     APPDATA + USERPROFILE\AppData\Roaming + HOME .config).
 //   - `hooks/paths.ts` covered XDG + HOME .config + enterprise
 //     PROGRAMDATA but MISSED Windows user paths (APPDATA /
-//     USERPROFILE) — operator running `agent` on Windows without
+//     USERPROFILE) — operator running `forja` on Windows without
 //     XDG_CONFIG_HOME silently failed to find user hooks.
 //   - `config/paths.ts` covered XDG + HOME but missed Windows
 //     entirely — same latent bug as hooks for any windows user.
@@ -28,6 +28,7 @@
 // reject it.
 
 import { posix, win32 } from 'node:path';
+import { appDirName, projectDirName } from './app-namespace.ts';
 
 const pathMod = (platform: NodeJS.Platform) => (platform === 'win32' ? win32 : posix);
 
@@ -36,16 +37,16 @@ const pathMod = (platform: NodeJS.Platform) => (platform === 'win32' ? win32 : p
 // stripped-down env (containers, CI workers without $HOME, …)
 // gets a `null` and consumer treats that as "user layer
 // unavailable" rather than producing a relative path that would
-// resolve against cwd (security: a repo with `.config/agent/`
+// resolve against cwd (security: a repo with `.config/forja/`
 // could otherwise silently shadow the real user layer).
 //
 // Precedence on every platform:
 //   1. XDG_CONFIG_HOME (absolute) — explicit operator opt-in,
 //      honored even on Windows for WSL / dotfile-manager users.
-//   2. Windows only: APPDATA (absolute) → `<APPDATA>\agent`.
+//   2. Windows only: APPDATA (absolute) → `<APPDATA>\forja`.
 //   3. Windows only: USERPROFILE (absolute) →
-//      `<USERPROFILE>\AppData\Roaming\agent`.
-//   4. POSIX only: HOME (absolute) → `<HOME>/.config/agent`.
+//      `<USERPROFILE>\AppData\Roaming\forja`.
+//   4. POSIX only: HOME (absolute) → `<HOME>/.config/forja`.
 //   5. Otherwise → null.
 export const agentConfigDir = (
   env: NodeJS.ProcessEnv = process.env,
@@ -54,29 +55,29 @@ export const agentConfigDir = (
   const p = pathMod(platform);
   const xdg = env.XDG_CONFIG_HOME;
   if (xdg !== undefined && xdg.length > 0 && p.isAbsolute(xdg)) {
-    return p.join(xdg, 'agent');
+    return p.join(xdg, appDirName(env));
   }
   if (platform === 'win32') {
     const appdata = env.APPDATA;
     if (appdata !== undefined && appdata.length > 0 && p.isAbsolute(appdata)) {
-      return p.join(appdata, 'agent');
+      return p.join(appdata, appDirName(env));
     }
     const userprofile = env.USERPROFILE;
     if (userprofile !== undefined && userprofile.length > 0 && p.isAbsolute(userprofile)) {
-      return p.join(userprofile, 'AppData', 'Roaming', 'agent');
+      return p.join(userprofile, 'AppData', 'Roaming', appDirName(env));
     }
     return null;
   }
   const home = env.HOME;
   if (home === undefined || home.length === 0 || !p.isAbsolute(home)) return null;
-  return p.join(home, '.config', 'agent');
+  return p.join(home, '.config', appDirName(env));
 };
 
 // Per-user path for an artifact named `filename` inside the agent
 // config root. Returns null when no absolute root is available.
 // Critical defensive measure: a fallback like `join('', filename)`
 // would produce a relative path that `existsSync` resolves against
-// cwd — a repo with a same-named file under `.config/agent/` could
+// cwd — a repo with a same-named file under `.config/forja/` could
 // silently override the real user layer.
 export const userAgentPath = (
   filename: string,
@@ -89,13 +90,22 @@ export const userAgentPath = (
 };
 
 // Enterprise-installed path for `filename` under the machine-wide
-// agent config root.
-//   - Windows: PROGRAMDATA (absolute) → `<PROGRAMDATA>\agent\<filename>`.
-//   - POSIX: hardcoded `/etc/agent/<filename>`.
+// agent config root. ALWAYS canonical (`forja`), NEVER profiled.
+//   - Windows: PROGRAMDATA (absolute) → `<PROGRAMDATA>\forja\<filename>`.
+//   - POSIX: hardcoded `/etc/forja/<filename>`.
+//
+// Deliberately does NOT route through `appDirName(env)` like the user/project
+// resolvers above: the enterprise layer is the admin-installed, non-user
+// guardrail (locked policy + hooks) at a fixed well-known location. Profiling
+// it would move the lookup to `/etc/forja-<profile>` / `%PROGRAMDATA%\forja-
+// <profile>` — which an admin never installed — so `forja --profile dev` would
+// silently skip the enterprise policy + locked hooks entirely, turning a
+// profile into an enterprise-policy bypass. A profile isolates USER and
+// PROJECT state only; the machine guardrail stays put.
 //
 // Returns null on Windows when PROGRAMDATA is missing or
 // non-absolute — operator running in a stripped-down container.
-// POSIX always returns a concrete path because `/etc/agent/` is
+// POSIX always returns a concrete path because `/etc/forja/` is
 // the canonical location regardless of env state.
 //
 // Both branches use `path.join` rather than string interpolation
@@ -116,19 +126,19 @@ export const enterpriseAgentPath = (
     if (programData === undefined || programData.length === 0 || !p.isAbsolute(programData)) {
       return null;
     }
-    return p.join(programData, 'agent', filename);
+    return p.join(programData, 'forja', filename);
   }
-  return p.join('/etc/agent', filename);
+  return p.join('/etc/forja', filename);
 };
 
-// Project-scope path for `filename` under the per-repo `.agent/`
+// Project-scope path for `filename` under the per-repo `.forja/`
 // dir. Always derivable from `repoRoot`; the loader treats absent
 // file as an empty layer. Platform-aware join so a Windows
-// `repoRoot` of `C:\repo\proj` produces `C:\repo\proj\.agent\<filename>`
+// `repoRoot` of `C:\repo\proj` produces `C:\repo\proj\.forja\<filename>`
 // on a Linux test runner (where the host `node:path` would
 // otherwise mis-join with `/` separators).
 export const projectAgentPath = (
   repoRoot: string,
   filename: string,
   platform: NodeJS.Platform = process.platform,
-): string => pathMod(platform).join(repoRoot, '.agent', filename);
+): string => pathMod(platform).join(repoRoot, projectDirName(), filename);

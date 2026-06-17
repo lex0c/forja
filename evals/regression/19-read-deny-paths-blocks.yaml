@@ -7,7 +7,7 @@ setup:
   files:
     .env: |
       SECRET=do-not-leak
-    .agent/permissions.yaml: |
+    .forja/permissions.yaml: |
       defaults:
         mode: acceptEdits
       tools:

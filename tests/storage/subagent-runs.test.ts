@@ -26,7 +26,7 @@ describe('subagent_runs repo', () => {
       sessionId: child.id,
       name: 'explore',
       scope: 'project',
-      sourcePath: '/p/.agent/agents/explore.md',
+      sourcePath: '/p/.forja/playbooks/explore.md',
       sourceSha256: 'a'.repeat(64),
       systemPrompt: 'You are explore.',
       toolsWhitelist: ['read_file', 'grep', 'glob'],
@@ -40,7 +40,7 @@ describe('subagent_runs repo', () => {
     expect(run?.sessionId).toBe(child.id);
     expect(run?.name).toBe('explore');
     expect(run?.scope).toBe('project');
-    expect(run?.sourcePath).toBe('/p/.agent/agents/explore.md');
+    expect(run?.sourcePath).toBe('/p/.forja/playbooks/explore.md');
     expect(run?.sourceSha256).toBe('a'.repeat(64));
     expect(run?.systemPrompt).toBe('You are explore.');
     expect(run?.toolsWhitelist).toEqual(['read_file', 'grep', 'glob']);
@@ -118,7 +118,7 @@ describe('subagent_runs repo', () => {
       sessionId: child.id,
       name: 'explore',
       scope: 'project',
-      sourcePath: '/p/.agent/agents/explore.md',
+      sourcePath: '/p/.forja/playbooks/explore.md',
       sourceSha256: 'c'.repeat(64),
       systemPrompt: 'p',
       toolsWhitelist: ['read_file'],
@@ -142,7 +142,7 @@ describe('subagent_runs repo', () => {
       sessionId: child.id,
       name: 'explore',
       scope: 'project',
-      sourcePath: '/p/.agent/agents/explore.md',
+      sourcePath: '/p/.forja/playbooks/explore.md',
       sourceSha256: 'd'.repeat(64),
       systemPrompt: 'p',
       toolsWhitelist: ['read_file'],
@@ -314,7 +314,7 @@ describe('subagent_runs repo', () => {
       const hooks = [
         {
           layer: 'enterprise' as const,
-          sourcePath: '/etc/agent/hooks.toml',
+          sourcePath: '/etc/forja/hooks.toml',
           event: 'PreToolUse' as const,
           matcher: { tool: 'bash' as const },
           command: 'audit-bash {{tool.input.command}}',
@@ -325,7 +325,7 @@ describe('subagent_runs repo', () => {
         },
         {
           layer: 'project' as const,
-          sourcePath: '/p/.agent/hooks.toml',
+          sourcePath: '/p/.forja/hooks.toml',
           event: 'PostToolUse' as const,
           matcher: { tool: 'write_file' as const },
           command: 'lint {{tool.input.path}}',
@@ -339,7 +339,7 @@ describe('subagent_runs repo', () => {
         sessionId: child.id,
         name: 'explore',
         scope: 'project',
-        sourcePath: '/p/.agent/agents/explore.md',
+        sourcePath: '/p/.forja/playbooks/explore.md',
         sourceSha256: 'a'.repeat(64),
         systemPrompt: 'You are explore.',
         toolsWhitelist: ['read_file'],
@@ -444,7 +444,7 @@ describe('subagent_runs repo', () => {
         sessionId: child.id,
         name: 'refactor',
         scope: 'project',
-        sourcePath: '/p/.agent/agents/refactor.md',
+        sourcePath: '/p/.forja/playbooks/refactor.md',
         sourceSha256: 'b'.repeat(64),
         systemPrompt: 'body',
         toolsWhitelist: ['bash', 'write_file'],
@@ -554,7 +554,7 @@ describe('subagent_runs repo', () => {
         sessionId: child.id,
         name: 'threat-model',
         scope: 'project',
-        sourcePath: '/p/.agent/agents/threat-model.md',
+        sourcePath: '/p/.forja/playbooks/threat-model.md',
         sourceSha256: 'e'.repeat(64),
         systemPrompt: 'body',
         toolsWhitelist: ['read_file'],
@@ -664,7 +664,7 @@ describe('subagent_runs repo', () => {
         sessionId: child.id,
         name: 'security-audit',
         scope: 'project',
-        sourcePath: '/p/.agent/agents/security-audit.md',
+        sourcePath: '/p/.forja/playbooks/security-audit.md',
         sourceSha256: '2'.repeat(64),
         systemPrompt: 'body',
         toolsWhitelist: ['read_file'],

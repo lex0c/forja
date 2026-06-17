@@ -1,7 +1,7 @@
 // RecapMini — subset projection per RECAP §3.1. Lighter and
 // cheaper than `RecapIntermediate`; consumed by:
 //
-//   - `agent --list-sessions --with-recap` (CLI)
+//   - `forja --list-sessions --with-recap` (CLI)
 //   - `/recap list [filtros]` (slash)
 //   - SessionPicker (TUI; future)
 //

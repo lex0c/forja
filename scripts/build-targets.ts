@@ -1,7 +1,7 @@
 // Cross-platform build orchestrator (PERFORMANCE.md §18.1, §18.5).
 //
 // For each target in `TARGETS`, runs `bun build --compile --minify
-// --sourcemap=external --target=<bun-target> --outfile=dist/agent-<id>`.
+// --sourcemap=external --target=<bun-target> --outfile=dist/forja-<id>`.
 //
 // Sourcemap handling: under `--compile`, Bun emits the external
 // sourcemap as `<dist>/index.js.map` (filename derived from the entry,

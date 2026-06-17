@@ -18,7 +18,7 @@ const baseSpec = (
   overrides: Partial<HookSpec> & Pick<HookSpec, 'event' | 'command'>,
 ): HookSpec => ({
   layer: 'project',
-  sourcePath: '/repo/.agent/hooks.toml',
+  sourcePath: '/repo/.forja/hooks.toml',
   matcher: {},
   timeoutMs: DEFAULT_HOOK_TIMEOUT_MS,
   failClosed: false,
@@ -84,7 +84,7 @@ describe('/hooks — summary (no args)', () => {
         event: 'PreToolUse',
         command: 'echo a',
         layer: 'enterprise',
-        sourcePath: '/etc/agent/hooks.toml',
+        sourcePath: '/etc/forja/hooks.toml',
       }),
       baseSpec({
         event: 'PreToolUse',
@@ -123,7 +123,7 @@ describe('/hooks list', () => {
         event: 'Stop',
         command: 'notify-send done',
         layer: 'user',
-        sourcePath: '/home/op/.config/agent/hooks.toml',
+        sourcePath: '/home/op/.config/forja/hooks.toml',
       }),
     ]);
     const r = await hooksCommand.exec(['list'], ctx);
@@ -136,8 +136,8 @@ describe('/hooks list', () => {
       expect(text).toContain('matcher=tool:write_file');
       expect(text).toContain('Stop');
       // Source-path frag should appear for both layers
-      expect(text).toContain('/repo/.agent/hooks.toml');
-      expect(text).toContain('/home/op/.config/agent/hooks.toml');
+      expect(text).toContain('/repo/.forja/hooks.toml');
+      expect(text).toContain('/home/op/.config/forja/hooks.toml');
     }
   });
 
@@ -205,7 +205,7 @@ describe('/hooks list', () => {
         locked: true,
         failClosed: true,
         layer: 'enterprise',
-        sourcePath: '/etc/agent/hooks.toml',
+        sourcePath: '/etc/forja/hooks.toml',
       }),
     ]);
     const r = await hooksCommand.exec(['list'], ctx);
@@ -270,7 +270,7 @@ describe('/hooks audit', () => {
         sessionId,
         event: 'PreToolUse',
         layer: 'project',
-        sourcePath: '/repo/.agent/hooks.toml',
+        sourcePath: '/repo/.forja/hooks.toml',
         hookIndex: 0,
         command: 'true',
         expanded: 'true',

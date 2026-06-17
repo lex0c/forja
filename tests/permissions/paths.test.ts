@@ -11,16 +11,16 @@ import {
 // branch on a Linux/macOS runner, making expectations host-dependent.
 
 describe('enterprisePolicyPath', () => {
-  test('Linux returns /etc/agent/permissions.yaml', () => {
-    expect(enterprisePolicyPath('linux', {})).toBe('/etc/agent/permissions.yaml');
+  test('Linux returns /etc/forja/permissions.yaml', () => {
+    expect(enterprisePolicyPath('linux', {})).toBe('/etc/forja/permissions.yaml');
   });
 
-  test('macOS returns /etc/agent/permissions.yaml', () => {
-    expect(enterprisePolicyPath('darwin', {})).toBe('/etc/agent/permissions.yaml');
+  test('macOS returns /etc/forja/permissions.yaml', () => {
+    expect(enterprisePolicyPath('darwin', {})).toBe('/etc/forja/permissions.yaml');
   });
 
-  test('Windows uses %PROGRAMDATA%\\agent\\permissions.yaml when set', () => {
-    expect(enterprisePolicyPath('win32', { PROGRAMDATA: 'C:\\ProgramData' })).toContain('agent');
+  test('Windows uses %PROGRAMDATA%\\forja\\permissions.yaml when set', () => {
+    expect(enterprisePolicyPath('win32', { PROGRAMDATA: 'C:\\ProgramData' })).toContain('forja');
     expect(enterprisePolicyPath('win32', { PROGRAMDATA: 'C:\\ProgramData' })).toContain(
       'permissions.yaml',
     );
@@ -38,19 +38,19 @@ describe('enterprisePolicyPath', () => {
 describe('userPolicyPath — Linux/macOS', () => {
   test('uses XDG_CONFIG_HOME when set', () => {
     expect(userPolicyPath({ XDG_CONFIG_HOME: '/x', HOME: '/h' }, 'linux')).toBe(
-      '/x/agent/permissions.yaml',
+      '/x/forja/permissions.yaml',
     );
   });
 
-  test('falls back to ~/.config/agent when XDG is unset', () => {
+  test('falls back to ~/.config/forja when XDG is unset', () => {
     expect(userPolicyPath({ HOME: '/home/lex' }, 'linux')).toBe(
-      '/home/lex/.config/agent/permissions.yaml',
+      '/home/lex/.config/forja/permissions.yaml',
     );
   });
 
   test('treats XDG empty string as unset', () => {
     expect(userPolicyPath({ XDG_CONFIG_HOME: '', HOME: '/home/lex' }, 'linux')).toBe(
-      '/home/lex/.config/agent/permissions.yaml',
+      '/home/lex/.config/forja/permissions.yaml',
     );
   });
 
@@ -68,7 +68,7 @@ describe('userPolicyPath — Linux/macOS', () => {
 
   test('ignores XDG_CONFIG_HOME when relative (per XDG spec)', () => {
     expect(userPolicyPath({ XDG_CONFIG_HOME: 'rel', HOME: '/home/lex' }, 'linux')).toBe(
-      '/home/lex/.config/agent/permissions.yaml',
+      '/home/lex/.config/forja/permissions.yaml',
     );
   });
 
@@ -80,7 +80,7 @@ describe('userPolicyPath — Linux/macOS', () => {
 describe('userPolicyPath — Windows', () => {
   test('uses APPDATA when set', () => {
     const result = userPolicyPath({ APPDATA: 'C:\\Users\\Lex\\AppData\\Roaming' }, 'win32');
-    expect(result).toContain('agent');
+    expect(result).toContain('forja');
     expect(result).toContain('permissions.yaml');
   });
 
@@ -88,7 +88,7 @@ describe('userPolicyPath — Windows', () => {
     const result = userPolicyPath({ USERPROFILE: 'C:\\Users\\Lex' }, 'win32');
     expect(result).toContain('AppData');
     expect(result).toContain('Roaming');
-    expect(result).toContain('agent');
+    expect(result).toContain('forja');
   });
 
   test('still honors XDG_CONFIG_HOME when explicitly set on Windows', () => {
@@ -109,11 +109,11 @@ describe('userPolicyPath — Windows', () => {
 });
 
 describe('projectPolicyPath', () => {
-  test('joins cwd with .agent/permissions.yaml', () => {
+  test('joins cwd with .forja/permissions.yaml', () => {
     // Asserts on substrings rather than exact path so the test
     // passes regardless of host separator.
     const result = projectPolicyPath('/p');
-    expect(result).toContain('.agent');
+    expect(result).toContain('.forja');
     expect(result).toContain('permissions.yaml');
   });
 });

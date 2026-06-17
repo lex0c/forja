@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Smoke test for `agent --worktrees list / gc` (Step 4.2d).
+# Smoke test for `forja --worktrees list / gc` (Step 4.2d).
 #
 # Unit tests cover the engine classification + CLI argument
 # parsing with stubs. This smoke exercises the real production
@@ -41,7 +41,18 @@ trap 'rm -rf "$TMPDIR"' EXIT
 # XDG_DATA_HOME; defaultWorktreeRoot() under XDG_CACHE_HOME.
 export XDG_DATA_HOME="$TMPDIR/xdg-data"
 export XDG_CACHE_HOME="$TMPDIR/xdg-cache"
-mkdir -p "$XDG_DATA_HOME/agent" "$XDG_CACHE_HOME/agent/worktrees"
+
+# Resolve the worktree cache root from the SAME source the CLI uses
+# (defaultWorktreeRoot → $XDG_CACHE_HOME/<app-namespace>/worktrees). DERIVE it
+# rather than hardcode the namespace, so the fixture always lands UNDER the root
+# `--worktrees gc` actually scans — keeping the cache-scan reconciliation
+# (listCacheDirs) and the under-root removal fallback exercised. Hardcoding
+# broke this once: the `agent`→`forja` namespace rename left the fixture outside
+# the scanned root and silently weakened coverage (the smoke still passed via
+# the DB-row path). The DB dir is auto-created by openDb, so no XDG_DATA_HOME
+# mkdir is needed.
+WORKTREE_ROOT="$(bun -e "process.stdout.write((await import('${ROOT}/src/subagents/worktree.ts')).defaultWorktreeRoot());")"
+mkdir -p "$WORKTREE_ROOT"
 
 PARENT_REPO="$TMPDIR/parent-repo"
 mkdir -p "$PARENT_REPO"
@@ -59,7 +70,7 @@ git commit -q -m "init"
 PARENT_ID="11111111-1111-1111-1111-111111111111"
 CHILD_ID="22222222-2222-2222-2222-222222222222"
 WORKTREE_BRANCH="agent/smoke-deadbeef"
-WORKTREE_PATH="$XDG_CACHE_HOME/agent/worktrees/$CHILD_ID"
+WORKTREE_PATH="$WORKTREE_ROOT/$CHILD_ID"
 
 # Seed via a small bun script. We re-use the project's storage
 # helpers so the schema matches whatever migrations are current —
