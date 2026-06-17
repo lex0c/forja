@@ -1,5 +1,5 @@
-import { existsSync, lstatSync } from 'node:fs';
-import { isAbsolute, relative, resolve } from 'node:path';
+import { existsSync, lstatSync, realpathSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { getWorktreeRoot, isGitRepo } from '../../checkpoints/git.ts';
 import { lineDiff } from '../../diff/line-diff.ts';
 import { getGitBinaryWithEnv } from '../../subagents/git-binary.ts';
@@ -92,6 +92,24 @@ const runGitApply = async (
   clearTimeout(timer);
   signal.removeEventListener('abort', onAbort);
   return { exitCode, stdout, stderr: stderr.trim(), timedOut, aborted };
+};
+
+// Canonicalize the DIRECTORY a path lives in to its realpath, keeping the
+// basename literal. getWorktreeRoot() returns git's realpath-resolved root, so
+// when the session cwd reaches the repo through a symlink (workspace mount,
+// symlinked checkout) a lexically-resolved path would sit under the symlink and
+// look like a worktree escape against the real root — falsely rejecting every
+// patch with path_mismatch. Resolving the parent dir puts both the gated path
+// and git's write target in the same coordinate system. The basename stays
+// un-followed so the symlink-leaf reject still inspects the link itself. Mirrors
+// the engine/matcher resolveSymlinks fallback; falls back to the lexical form
+// when the parent doesn't exist yet (a creation in a not-yet-made dir).
+const canonicalizeDir = (abs: string): string => {
+  try {
+    return join(realpathSync(dirname(abs)), basename(abs));
+  } catch {
+    return abs;
+  }
 };
 
 const unsupported = (message: string, hint: string): ToolResult<never> =>
@@ -340,6 +358,11 @@ export const gitApplyPatchTool: Tool<GitApplyPatchInput, GitApplyPatchOutput> = 
     // the one authorized file, and the path comes from git itself (no parser
     // divergence from what apply will write).
     //
+    // Both sides go through canonicalizeDir so a symlink ANYWHERE in the path
+    // (a symlinked cwd/checkout, a symlinked subdir, /tmp→/private/tmp on macOS)
+    // resolves identically — without it, git's realpath'd worktreeRoot vs a
+    // lexically-resolved gatedAbs would falsely read as an escape.
+    //
     // Deliberately NOT tilde-expanded (unlike the engine's fs resolver, which
     // maps `~` via its resolved `ctx.home`). ToolContext carries no `home`, so
     // expanding here would have to use a DIFFERENT source (homedir/env) than the
@@ -351,8 +374,10 @@ export const gitApplyPatchTool: Tool<GitApplyPatchInput, GitApplyPatchOutput> = 
     // paths are worktree-relative and never carry `~`, so this rejects nothing
     // real.) Do not "fix" this with homedir() — the safe expansion needs the
     // engine's exact home plumbed through ToolContext.
-    const gatedAbs = isAbsolute(pathArg) ? resolve(pathArg) : resolve(ctx.cwd, pathArg);
-    const writeAbs = resolve(worktreeRoot, cls.path);
+    const gatedAbs = canonicalizeDir(
+      isAbsolute(pathArg) ? resolve(pathArg) : resolve(ctx.cwd, pathArg),
+    );
+    const writeAbs = canonicalizeDir(resolve(worktreeRoot, cls.path));
     const relToRoot = relative(worktreeRoot, gatedAbs);
     if (relToRoot.startsWith('..') || isAbsolute(relToRoot)) {
       return toolError(

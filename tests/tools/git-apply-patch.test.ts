@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readlinkSync,
@@ -193,6 +194,25 @@ describe('gitApplyPatchTool', () => {
     if (isToolError(res)) expect(res.error_code).toBe(ERROR_CODES.patchUnsupported);
     // The symlink is untouched — still points at the original target.
     expect(readlinkSync(join(dir, 'link'))).toBe('old');
+  });
+
+  test('applies from a symlinked cwd (worktreeRoot is realpath, cwd is the symlink)', async () => {
+    // A real repo plus a symlink pointing at it; run with cwd = the symlink —
+    // a symlinked checkout / workspace mount. `git rev-parse --show-toplevel`
+    // canonicalizes to the real path, so without canonicalizeDir the gated path
+    // (under the symlink) reads as a worktree escape → false patch.path_mismatch.
+    const real = join(dir, 'realrepo');
+    const link = join(dir, 'linkrepo');
+    mkdirSync(real);
+    gitInit(real);
+    writeFileSync(join(real, 'f.txt'), 'a\nb\nc\n');
+    symlinkSync(real, link);
+    const res = await gitApplyPatchTool.execute(
+      { path: 'f.txt', patch: modifyPatch },
+      makeCtx({ cwd: link }),
+    );
+    expect(isToolError(res)).toBe(false);
+    expect(readFileSync(join(real, 'f.txt'), 'utf8')).toBe('a\nB\nc\n');
   });
 
   test('refuses outside a git work-tree (git.not_a_repo)', async () => {

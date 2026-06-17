@@ -2,6 +2,25 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-17] git_apply_patch: fix false escape rejection under a symlinked cwd
+
+Review finding (reproduced + confirmed live in this very environment, where
+/home/lex/Workspaces/forja realpaths to the /run/media checkout). When the
+session cwd reaches the repo through a symlink (workspace mount, symlinked
+checkout), `getWorktreeRoot()` returns git's realpath-resolved root while the
+gated path was resolved lexically under the symlink. `relative(worktreeRoot,
+gatedAbs)` then starts with `..` and the escape guard rejected even a valid patch
+to f.txt with patch.path_mismatch — git_apply_patch was unusable from symlinked
+checkouts. Empirically: `git rev-parse --show-toplevel` from a symlinked cwd
+returns the REAL path, and the tool returned patch.path_mismatch for a clean
+patch. Fix: a `canonicalizeDir` helper realpaths the DIRECTORY of a path while
+keeping the basename literal, applied to BOTH gatedAbs and writeAbs so a symlink
+anywhere in the path (cwd, subdir, /tmp→/private/tmp on macOS) resolves
+identically and the pin/escape checks run in git's coordinate system. The literal
+basename preserves the symlink-LEAF reject (it still lstat's the link itself).
+Mirrors the engine/matcher resolveSymlinks parent-realpath fallback. Test: a
+patch applies from a symlinked cwd; the symlink-leaf reject test still passes.
+
 ## [2026-06-17] git_apply_patch code-review fixes (recap tracking + deletion defense-in-depth)
 
 External review of the git_apply_patch feature. Verified each finding inline.
