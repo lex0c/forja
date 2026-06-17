@@ -39,6 +39,7 @@ describe('registry', () => {
       'read_file',
       'write_file',
       'edit_file',
+      'git_apply_patch',
       'grep',
       'glob',
       'fetch_url',

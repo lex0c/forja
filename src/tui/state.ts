@@ -881,6 +881,8 @@ const batchHeadlineVerb = (name: string, childVerb: string, count: number): stri
       return `Wrote ${count} files`;
     case 'edit_file':
       return `Edited ${count} files`;
+    case 'git_apply_patch':
+      return `Applied ${count} patches`;
     case 'bash':
       return `Executed ${count} commands`;
     case 'grep':

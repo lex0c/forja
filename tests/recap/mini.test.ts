@@ -32,7 +32,7 @@ const seedAssistantMessage = (sessionId: string, createdAt: number): string => {
 
 const seedFileWrite = (
   messageId: string,
-  toolName: 'write_file' | 'edit_file',
+  toolName: 'write_file' | 'edit_file' | 'git_apply_patch',
   path: string,
   createdAt: number,
 ): void => {
@@ -151,10 +151,12 @@ describe('projectRecapMini', () => {
     seedFileWrite(m1, 'write_file', '/p/a.ts', 1_201);
     seedFileWrite(m2, 'edit_file', '/p/b.ts', 1_301);
     seedFileWrite(m2, 'edit_file', '/p/c.ts', 1_302);
+    // git_apply_patch is a file-writer too — it must count toward filesChanged.
+    seedFileWrite(m2, 'git_apply_patch', '/p/d.ts', 1_303);
     completeSession(db, s.id, 'done', 0.01, true, 2_000);
     const result = projectRecapMini(db, { sessionId: s.id });
     expect(result.steps).toBe(2);
-    expect(result.filesChanged).toBe(3);
+    expect(result.filesChanged).toBe(4);
   });
 
   test('goal is the first line of the first user message, capped', () => {

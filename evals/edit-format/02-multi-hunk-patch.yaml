@@ -1,0 +1,31 @@
+name: edit-format multi-hunk via git_apply_patch
+prompt: |
+  `src/calc.ts` has two bugs: `add` returns `a - b` (should be `a + b`) and
+  `mul` returns `a + b` (should be `a * b`). Fix BOTH with a single
+  git_apply_patch call — a unified diff for `src/calc.ts` containing both hunks.
+  Reply "done" when applied.
+setup:
+  gitInit: true
+  files:
+    src/calc.ts: |
+      export function add(a: number, b: number): number {
+        return a - b;
+      }
+
+      export function mul(a: number, b: number): number {
+        return a + b;
+      }
+expect:
+  - tool_called: git_apply_patch
+  - tool_not_called: edit_file
+  - tool_not_called: write_file
+  - file_contains:
+      path: src/calc.ts
+      pattern: return a + b;
+  - file_contains:
+      path: src/calc.ts
+      pattern: return a * b;
+  - status: done
+budget:
+  maxSteps: 7
+  maxCostUsd: 0.25

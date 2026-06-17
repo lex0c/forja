@@ -1,0 +1,21 @@
+name: edit-format single-line via git_apply_patch
+prompt: |
+  In the file `src/flag.ts`, change the value `false` to `true` so the line
+  reads `export const enabled = true;`. Use the git_apply_patch tool: produce a
+  unified diff for `src/flag.ts` and apply it. Reply "done" when applied.
+setup:
+  gitInit: true
+  files:
+    src/flag.ts: |
+      export const enabled = false;
+expect:
+  - tool_called: git_apply_patch
+  - tool_not_called: edit_file
+  - tool_not_called: write_file
+  - file_contains:
+      path: src/flag.ts
+      pattern: export const enabled = true;
+  - status: done
+budget:
+  maxSteps: 6
+  maxCostUsd: 0.20

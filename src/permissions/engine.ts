@@ -1,5 +1,5 @@
 import { readlinkSync, realpathSync, statSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import { redactSecrets } from '../sanitize/secrets.ts';
 import type { TelemetryEvent } from '../telemetry/index.ts';
 import type { AuditEmitInput, AuditSink, ReasonChainEntry } from './audit.ts';
@@ -34,6 +34,7 @@ import {
   matchCommand,
   matchHost,
   matchPath,
+  resolveSymlinks,
 } from './matcher.ts';
 import {
   type ProtectedOp,
@@ -528,6 +529,12 @@ const FS_TOOL_TRAITS: Readonly<Record<string, FsToolTraits>> = {
     singleFileModes: ['blame', 'show_file'],
     section: 'read_file',
   },
+  // git_apply_patch writes ONE file (it takes an explicit `path` arg, so it's a
+  // normal single-path FS tool — no rootArg). It shares the `write_file` policy
+  // section: an operator who governs write_file thereby governs patch applies
+  // with one allow/deny list, and there's no separate `tools.git_apply_patch`
+  // surface to configure.
+  git_apply_patch: { section: 'write_file' },
 };
 
 const resolveFsTarget = (toolName: string, args: ToolArgs, cwd: string): string | null => {
@@ -809,36 +816,22 @@ const matchTargetForRules = (toolName: string, path: string): string =>
   isSearchTool(toolName) ? `${path}/${SYNTHETIC_DESCENDANT}` : path;
 
 // Resolve a path to its symlink-followed absolute form for protected
-// path classification. Mirrors the matcher's `resolveSymlinks` so a
-// symlink at `./safe → /etc/passwd` is caught by the protected check
-// just like the matcher catches it for rule matching.
+// path classification. Delegates to the matcher's `resolveSymlinks` so the
+// protected floor and the allow/deny matcher canonicalize a path IDENTICALLY
+// — a single source of truth. (When these two diverged, a dangling symlink
+// resolved one way for matching and another for the protected floor, leaking
+// past one of them; sharing the resolver closes that class.)
 //
-// Always normalizes lexically via `path.resolve(cwd, rawPath)` first
-// — even when `rawPath` is already absolute. Without this,
-// `/work/proj/data/../../etc/hosts` in a fictional cwd stays
-// un-normalized (both realpath fallbacks ENOENT-fail, textual abs
-// returns with the `/work/proj/` prefix intact, and the protected
-// classifier misses the underlying `/etc/` target). `path.resolve`
-// does the .. and `./` resolution lexically without touching the
-// filesystem; realpath then refines for symlinks if the resolved
-// target exists.
-//
-// realpath fails on paths that don't exist (write_file creating a
-// new file); fall back to realpathing the parent + joining the
-// basename (catches symlink parents) and finally to the lexically
-// normalized absolute form.
-const resolveForProtected = (rawPath: string, cwd: string): string => {
-  const abs = resolve(cwd, rawPath);
-  try {
-    return realpathSync(abs);
-  } catch {
-    try {
-      return join(realpathSync(dirname(abs)), basename(abs));
-    } catch {
-      return abs;
-    }
-  }
-};
+// Always normalizes lexically via `path.resolve(cwd, rawPath)` first — even
+// when `rawPath` is already absolute. Without this,
+// `/work/proj/data/../../etc/hosts` in a fictional cwd stays un-normalized
+// (the realpath fallbacks ENOENT-fail, textual abs returns with the
+// `/work/proj/` prefix intact, and the protected classifier misses the
+// underlying `/etc/` target). `path.resolve` does the `..`/`./` resolution
+// lexically without touching the filesystem; `resolveSymlinks` then follows
+// links (including dangling ones — see its comment) for the protected check.
+const resolveForProtected = (rawPath: string, cwd: string): string =>
+  resolveSymlinks(resolve(cwd, rawPath));
 
 // True iff the symlink-resolved target is a REGULAR FILE. Gates the
 // `exactFileAllow` literal fallback so it grants only genuine

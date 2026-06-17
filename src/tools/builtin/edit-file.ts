@@ -330,7 +330,7 @@ const applyEdit = (
 export const editFileTool: Tool<EditFileInput, EditFileOutput> = {
   name: 'edit_file',
   description:
-    "Apply one or more substring replacements to a file. Each edit is { old_string, new_string, replace_all? }; pass them as an array even for a single change. Edits apply SEQUENTIALLY — edit N operates on the result of edits 1..N-1, so an earlier edit may add or remove text that a later edit's old_string targets. The whole batch is ALL-OR-NOTHING: if any edit fails (old_string missing, ambiguous match, etc.) the file is not modified and the error names the failing edit's index. `old_string` must be unique in the (post-previous-edits) file content unless that edit sets `replace_all: true`. The file must already exist; use write_file to create one. Cap is 50 edits per call. Returns each edit's replacement count plus the total.",
+    "Apply one or more substring replacements to a file. Each edit is { old_string, new_string, replace_all? }; pass them as an array even for a single change. Edits apply SEQUENTIALLY — edit N operates on the result of edits 1..N-1, so an earlier edit may add or remove text that a later edit's old_string targets. The whole batch is ALL-OR-NOTHING: if any edit fails (old_string missing, ambiguous match, etc.) the file is not modified and the error names the failing edit's index. `old_string` must be unique in the (post-previous-edits) file content unless that edit sets `replace_all: true`. The file must already exist; use write_file to create one. To express the change as a unified diff instead of string pairs, use git_apply_patch. Cap is 50 edits per call. Returns each edit's replacement count plus the total.",
   inputSchema: {
     type: 'object',
     properties: {

@@ -2,6 +2,361 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-17] Symlink confinement: follow symlinked ANCESTORS in dangling targets
+
+Follow-up review finding on the dangling-symlink fix. The fix's final fallback
+only realpath'd `dirname(current)` — ONE level. So for `link → outdir/missing/
+file` where `outdir` is an in-cwd symlink to an outside/protected dir and
+`missing` is absent, `dirname(current)` (`…/outdir/missing`) also ENOENTs and the
+resolver returned the in-cwd lexical path. matchPath then allowed it while
+write_file/atomicWrite followed `outdir` and wrote OUTSIDE cwd — same escape
+class, one level deeper. Reproduced empirically (resolveSymlinks returned the
+in-cwd form; a real write landed outside). Fix: a `realpathDeepestPrefix` helper
+walks up to the deepest EXISTING component, realpaths THAT (resolving a symlinked
+ancestor at any depth), and re-appends the absent tail — replacing the one-level
+parent realpath. Terminates at the filesystem root. Shared resolveSymlinks, so
+both the matcher and the engine's resolveForProtected (which delegates to it) are
+covered. Test: the ancestor-symlink dangling target now resolves outside and
+fails matchPath; the prior dangling/in-cwd/new-file/loop cases still hold. Full
+tests/permissions green (2341).
+
+## [2026-06-17] git_apply_patch: fix false escape rejection under a symlinked cwd
+
+Review finding (reproduced + confirmed live in this very environment, where
+/home/lex/Workspaces/forja realpaths to the /run/media checkout). When the
+session cwd reaches the repo through a symlink (workspace mount, symlinked
+checkout), `getWorktreeRoot()` returns git's realpath-resolved root while the
+gated path was resolved lexically under the symlink. `relative(worktreeRoot,
+gatedAbs)` then starts with `..` and the escape guard rejected even a valid patch
+to f.txt with patch.path_mismatch — git_apply_patch was unusable from symlinked
+checkouts. Empirically: `git rev-parse --show-toplevel` from a symlinked cwd
+returns the REAL path, and the tool returned patch.path_mismatch for a clean
+patch. Fix: a `canonicalizeDir` helper realpaths the DIRECTORY of a path while
+keeping the basename literal, applied to BOTH gatedAbs and writeAbs so a symlink
+anywhere in the path (cwd, subdir, /tmp→/private/tmp on macOS) resolves
+identically and the pin/escape checks run in git's coordinate system. The literal
+basename preserves the symlink-LEAF reject (it still lstat's the link itself).
+Mirrors the engine/matcher resolveSymlinks parent-realpath fallback. Test: a
+patch applies from a symlinked cwd; the symlink-leaf reject test still passes.
+
+## [2026-06-17] git_apply_patch code-review fixes (recap tracking + deletion defense-in-depth)
+
+External review of the git_apply_patch feature. Verified each finding inline.
+
+BLOCKING — recap dropped git_apply_patch writes. `FILE_WRITER_TOOLS` (the set
+that decides which tool calls land in the recap's files-written view) listed
+only write_file/edit_file, in BOTH src/recap/projection.ts and
+src/recap/mini/deterministic.ts — each carrying the explicit "if a new
+file-writing tool ships, add it here" contract. git_apply_patch is writes:true
+and keyed by input.path (the exact shape projection.ts extracts), so every
+patched file silently vanished from writesByPath/filesChanged. Added
+'git_apply_patch' to both sets. Tests: projection now tracks a git_apply_patch
+call under filesWritten; mini filesChanged counts it.
+
+CONFIRMED + hardened — deletion rejection. classifyPatch rejects deletions by
+matching the `delete ` line in `git apply --summary`. Empirically verified all
+three deletion shapes (traditional `+++ /dev/null`, extended `deleted file
+mode`, and remove-all-lines which git also treats as a delete) emit `delete ` on
+git 2.54.0, and --numstat CANNOT corroborate (a deletion reports `0\tN\tpath`,
+identical to a line-removing edit). Since the summary text is the sole signal,
+added a version-independent defense-in-depth: capture whether the target existed
+pre-apply; if it existed before and is gone after a successful apply, the patch
+deleted it — restore from the before-image and refuse. Precise (a creation never
+trips it; a content edit always leaves the file), so no false positives.
+
+NIT (tilde divergence) — resolved as a dedup, tool-expansion deliberately left
+out. The reviewer asked to share the tilde-aware resolver. expandTilde was
+copy-pasted in THREE places (resolvers/fs.ts, resolvers/bash.ts, config.ts —
+fs/bash byte-identical, config functionally identical via slice(1) vs slice(2)):
+exactly the divergence risk this codebase keeps closing. Extracted to
+src/permissions/tilde.ts; all three import it (+ a unit test pinning the
+config.ts slice equivalence and the `~user` literal rule). The tool's gatedAbs
+still does NOT expand `~`, now with a comment explaining why: ToolContext carries
+no `home`, so a homedir/env-based expansion could DIFFER from the engine's
+injected `options.home` and let a homedir-matching gatedAbs coincide with
+writeAbs — weakening the pin. A `~` path instead resolves to a literal `<cwd>/~/…`
+that never matches the tilde-free worktree-relative writeAbs and fails the pin
+closed (git's patch paths are worktree-relative and never carry `~`, so this
+rejects nothing real). The safe expansion would need the engine's exact home
+plumbed through ToolContext — left as a follow-up, with a "do not fix with
+homedir()" guard comment so the fail-closed choice isn't naively undone.
+
+## [2026-06-17] Symlink write-confinement: close the dangling-symlink escape (engine + matcher)
+
+Two related fixes from a symlink sweep of the FS tool surface.
+
+(1) git_apply_patch — reject editing an EXISTING symlink. Editing a tracked
+symlink's blob via a content patch keeps mode 120000, so neither `git apply
+--summary` nor `--numstat` flags it (both pure patch-level), yet `git apply`
+rewrites the LINK TARGET in place (e.g. `link → ../../etc/passwd`), escaping the
+regular-files-only contract. lstat the write target before applying: a missing
+target is a classifier-proven regular-file create, an existing symlink (or any
+non-regular file) is refused. Mirrors the existing symlink-CREATE reject.
+
+(2) Engine/matcher — follow DANGLING symlinks in the protected/allow resolver.
+Root cause (confirmed empirically): `matcher.resolveSymlinks` and
+`engine.resolveForProtected` `realpathSync` the path, but on failure (the link's
+target doesn't exist) collapsed to the in-cwd lexical form. So a dangling
+`<cwd>/link → /etc/cron.d/x` resolved to `<cwd>/link` — a cwd-scoped allow rule
+matched AND the protected floor saw a safe path — while the KERNEL still followed
+the link on write (write_file → atomicWrite deliberately writes through dangling
+links, a tested feature). A single write_file through such a link landed outside
+cwd / inside a protected zone. Realistic vector: a dangling symlink shipped in an
+untrusted checked-out repo (write_file/git_apply_patch can't create symlinks; bash
+`ln -s` is analyzer-gated). Fix: when realpath fails, READ the link (lstat +
+readlink) and follow the stored target (chains, bounded at 40 hops), exactly as
+the bash resolver already does, then resolve its parent. The two resolvers are
+now UNIFIED — `resolveForProtected` delegates to the exported `resolveSymlinks`,
+so the protected floor and the allow matcher canonicalize identically (the
+divergence between them was itself a latent leak). A dangling link whose target
+stays in-cwd still matches (legit write-through preserved); only escaping links
+fall out. Sole live FS vector was write_file (edit_file/read_file bail on the
+dangling read; existing-target symlinks were already caught). Tests: dangling→
+outside no-match + resolves to real target, dangling→protected resolves to the
+protected path, dangling→in-cwd (abs + relative) still matches, symlink cycle
+bounded, new-regular-file/existing-outside/symlinked-parent regressions held.
+Full tests/permissions green (2334), write-file (16), git_apply_patch (17).
+
+## [2026-06-17] git_apply_patch: delegate patch parsing to git (eliminate the divergence class)
+
+A 6th parser bug — a valid single-file diff whose hunk ENDS with content lines
+that render as `--- a/X`/`+++ b/X` (file content `-- a/X` → `++ b/X`) was
+falsely rejected as multi-file (positional header detection can't tell a trailing
+content pair from a real header). Root cause across all 6: the hand-rolled diff
+parser kept diverging from what `git apply` actually does. Fix is architectural,
+not another patch: STOP re-parsing the diff; ask git.
+
+`parseSingleFilePatch` (and src/diff/git-patch.ts) is removed. The tool now
+classifies the patch via git itself, with the SAME `--recount` it applies with:
+- `git apply --summary --recount` → structural ops. Reject `delete ` (covers
+  both `delete mode …` and traditional `delete f`), `rename `, `copy `, `mode
+  change`. Creation is allowed.
+- `git apply --numstat -z --recount` → the file set + write target. 0 → malformed;
+  >1 → multi-file; `-`/`-` counts → binary; the one entry's path is git's EXACT
+  write target (already -p1-stripped, whitespace-preserved), which the pin
+  compares against the gated path. (Both probes are pure patch-level — verified
+  they don't read the worktree — so context-mismatch still surfaces via --check,
+  not as a parse error.)
+
+This SUBSUMES every prior hand-rolled fix (−p1 normalization, filename
+whitespace, metadata-only sections, multi-file count, binary, deletion) because
+git is now the single source of truth for what the patch touches — the parser
+cannot diverge from the applier (same binary, same flag). Net: the divergence
+class is closed; the finding's patch now applies; +2 git probes per call.
+Tests: the trailing-content-pair patch applies; multi-file (diff --git)/binary/
+deletion/rename/mode/metadata-section/path-mismatch/-p1/whitespace all reject;
+context-mismatch + --recount preserved. ~1114 scoped tests green.
+
+REVIEW HARDENING (2 finders, verified inline; confinement confirmed — no bypass):
+(A) result counts now come from numstat (git's truth), not lineDiff — a
+newline-only change reported 0/0 before (lineDiff strips the trailing newline);
+(B) runGitApply drains stdout/stderr BEFORE writing stdin (deadlock-safe pattern,
+output is small today but the order is now correct); (C) skip whitespace-only
+numstat entries (robust against a trailing-newline trailer); (D) reject symlink
+(`create mode 120000`) / submodule (`160000`) creates — write_file can't make
+those and a symlink at the gated path could set up a later write-through; regular
+creates (100644/100755) stay allowed. Tests added for regular create + symlink
+reject. Full tools suite green (640).
+
+Systematic sweep (3 parallel adversarial finders: permissions/sandbox · harness/
+hooks · tui/cli/audit) for every surface keyed on tool name/category where
+git_apply_patch was missing vs how write_file/edit_file are handled. Verified
+each candidate inline. Two REAL gaps fixed:
+- Hook `if:` path filter (hooks/dispatcher-matching.ts): the fs-path-extraction
+  list was write_file/edit_file/read_file only, so an `if: git_apply_patch(*.ts)`
+  filter fell to fail-open and ignored the path glob. Added git_apply_patch.
+- Batch headline verb (tui/state.ts): no case → headless batches read "Applied
+  patch ×N"; added `Applied N patches`.
+
+Refuted (not gaps, verified): grant-relevance switch is section-keyed (resolves
+to write_file); TOOL_CAPABILITY_FOOTPRINTS is PolicyToolsSection-keyed (inherits
+write_file's footprint); escapesCwd/hadBash is for out-of-worktree effects (git
+apply's write is an in-scope, checkpoint-reversible worktree write — same as
+write_file); ergonomics/constraints prompts intentionally don't promote patch
+(it's the niche per the eval). Shared-section design (no separate
+tools.git_apply_patch policy/render/template) is correct by design.
+
+SANDBOX (finder flagged "critical", verified NOT): git_apply_patch spawns `git
+apply` without consuming ctx.sandboxProfile — but write_file/edit_file IGNORE it
+too (the planner emits a profile by capability, so all fs.write tools get one
+and none bwrap-wrap; only bash consumes it). fs.write tools confine via the
+permission GATE (authorized path + the tool's header==gated path-pin), not
+bwrap. So git_apply_patch is consistent. The one genuine distinction — git apply
+is an EXTERNAL binary vs write_file's in-process write — makes bwrap-confining it
+a reasonable defense-in-depth backstop, but it's optional, sizable, and would be
+inconsistent to do for git_apply_patch alone; deferred.
+
+A subagent playbook can whitelist git_apply_patch and declare
+`tool_restrictions.git_apply_patch.allow_paths`, but restrictions.ts wired path
+extractors only for write_file/edit_file/read_file/grep/git — and
+`checkRestriction` returns ok for any tool with no extractor. So the declared
+path fence was silently ignored: the child could patch any path the PARENT
+policy allowed, not the playbook's narrower list. Fix: add git_apply_patch to
+both `TOOL_RESTRICTION_SHAPE` ('path') and `TOOL_RESTRICTION_EXTRACTORS`.
+
+While wiring it, closed a related latent gap: the extractor read only `args.path`,
+but the file-class tools resolve `file_path > path` (pathArgOf / the engine's
+filePathOf), so a child sending `{file_path:…}` would slip past the fence on a
+field the tool still honors. Added `FILE_PATH_EXTRACTOR` (file_path > path) for
+write_file / edit_file / read_file / git_apply_patch; grep/git stay on the
+path-only extractor (the engine gates THEM on `args.path` only, never the alias).
+Purely additive-protective — `path`-using callers are unchanged, it only closes
+the file_path bypass. Tests: git_apply_patch fenced by allow_paths (inside ok,
+outside refused) + the file_path-alias variant refused. Full subagents suite
+green (677).
+
+## [2026-06-16] sec(git_apply_patch): reject deletion patches (delete-fs under-declared)
+
+The parser accepted deletion patches (`+++ /dev/null`) and git apply removed the
+file, but the resolver only ever declared write-fs/read-fs — never delete-fs.
+`delete-fs` is a first-class, distinguished capability (risk-score.ts weights it
+alongside git-write/env-mutate; engine.ts has a delete-fs floor case; bash `rm`
+emits deleteFs per path), so a deletion via git_apply_patch removed an allowed
+write target while escaping the delete-fs floor/risk that governs every other
+removal. Fix: reject deletion patches outright (new `deletion` reject reason →
+patch.unsupported, with a hint to delete via the shell `rm`, which the engine
+gates correctly). Chosen over threading delete-fs through the resolver: deletion
+is out of this tool's "edit/create content" scope, it's a destructive op better
+left to the properly-gated `rm`, and rejecting keeps the tool from performing an
+operation it can't accurately declare. Create (`--- /dev/null`) stays — that's a
+write, correctly declared write-fs. Tests: parser rejects deletion; tool
+integration leaves the file in place.
+
+## [2026-06-16] sec(git_apply_patch): preserve filename whitespace when pinning (confinement bypass)
+
+Third confinement bypass, same class as the -p1 one: `headerPath` did `.trim()`
+on the parsed name, but git preserves leading/trailing spaces in filenames.
+Verified on git 2.54: `--- a/foo ` applies to the file `foo ` (trailing space),
+not `foo` — with both present, git wrote `foo ` and left `foo` untouched. So a
+call gated for `path:'foo'` could modify/create the sibling `foo ` that the
+engine never checked. Fix: drop the `.trim()`; strip only syntax git also strips
+— the `\t<timestamp>` suffix and a trailing CR (CRLF line ending) — never
+filename spaces. The normalized path now equals git's write target, so the pin
+holds. Tests: parser keeps the trailing space; tool integration proves a gated
+`foo` cannot touch `foo ` (patchPathMismatch, sibling untouched).
+
+## [2026-06-16] sec(git_apply_patch): normalize header paths exactly as git apply -p1 (confinement bypass)
+
+Second confinement bypass: the parser only stripped `a/`/`b/`, but the tool runs
+`git apply` with the default `-p1`, which strips the FIRST path component
+regardless. So a TRADITIONAL header without the prefix — `--- src/f.txt` —
+returned `src/f.txt` here and passed the pin against a gated `src/f.txt`, while
+`git apply -p1` stripped `src/` and wrote repo-root `f.txt` (leaving the gated
+file untouched). Reproduced: a patch naming `src/f.txt` edited root `f.txt`,
+which the engine never gated. Fix: a header path is valid only as `/dev/null`
+or with the `a/`/`b/` prefix (the canonical git-diff form, where stripping the
+prefix reproduces git's -p1 write target exactly); any other form → `bad_header`
+reject. Prefix-less / traditional `diff -u` headers are refused (the model is
+told to emit git-diff format anyway). Fail-closed: the normalized path now
+equals what git will write, so the pin can't be fooled. Tests: parser rejects a
+prefix-less header; tool integration proves the root file git -p1 would have hit
+stays untouched.
+
+## [2026-06-16] sec(git_apply_patch): reject metadata-only diff sections (confinement bypass)
+
+Found + fixed a real confinement bypass in the single-file check. The parser
+counted only `---`/`+++` header pairs, but a `diff --git` section can carry ONLY
+metadata — a chmod (`old mode`/`new mode`) or an empty create/delete (`new file
+mode`/`deleted file mode` with no hunk) — which has NO header pair. So a patch
+with one authorized content hunk for the gated `path` could append a second
+`diff --git a/other b/other` metadata section: header-pair count stayed 1 (passed
+the single-file check) while `git apply --recount` happily applied the second
+section, letting `git_apply_patch({path:'allowed'})` create/chmod/delete a path
+the permission engine never gated. Reproduced: an appended `new file mode`
+section created a brand-new file. Fix: (1) reject `old mode`/`new mode` (chmod is
+not a content edit); (2) require every `diff --git` line to be the canonical
+header for the one edited file (`diff --git a/<path> b/<path>`) — any other
+section (different path, or an unparseable/quoted name) is refused. Fail-closed;
+the gated file is the only thing git can touch. Tests: parser rejects the
+appended-metadata and chmod shapes + accepts the matching git-format header; tool
+integration proves the out-of-scope path is NOT created and the gated file is
+untouched.
+
+## [2026-06-16] tools: git_apply_patch — single-file, git-backed patch apply
+
+New builtin write tool: applies a single-file unified diff via `git apply`. Git
+is the proven applier (context matching, fuzz, whitespace); Forja owns the
+policy/safety layer around it. **Single-file by design** — this sidesteps the
+permission engine's one-path-per-tool model entirely (the tool takes an explicit
+`path` arg, so the engine gates exactly one path with ZERO engine rewrite), and
+it dissolves the `patch.partial_apply` failure mode that motivated the spec
+deferral (one file via `git apply` is atomic — all hunks or none). The display
+diff reuses `lineDiff(before, after)` so the card (line-number gutter, +N/-M,
+colors) is identical to write_file/edit_file. Gated as the `write_file` policy
+section (shared via FS_TOOL_TRAITS) and auto-checkpointed like any fs.write, so
+reversibility holds.
+
+Guard: refuses early with `git.missing` (no git binary) or `git.not_a_repo`
+(outside a worktree), both hinting at edit_file/write_file as the git-free
+fallback. Validation rejects multi-file / rename / copy / binary / mode-only
+patches and any header path that escapes the worktree or mismatches `path`.
+
+SPEC NOTE: `CONTRACTS.md §2.6.8.A` marks `apply_patch` **deferred → v2**. This
+diverges deliberately and conservatively — single-file (not the spec's
+multi-file `patches[]`), name `git_apply_patch`, git-backed. It satisfies the
+spec's own reopen trigger ("user reports a concrete pattern where edit_file
+fails" — exact-match brittleness on drifting/whitespace-inconsistent context)
+and removes the partial-apply objection. A spec-PR to flip the deferral and
+record the single-file/git decision is pending the operator's explicit ok (no
+docs/spec edits made without it).
+
+WIRING (non-obvious): a single-path FS tool needs TWO registrations to behave —
+`FS_TOOL_TRAITS[git_apply_patch] = { section: 'write_file' }` (so the policy
+lookup uses the write_file allow/deny lists) AND a capability resolver in
+resolvers/fs.ts (write-fs + read-fs on the path). Without the resolver the engine
+forces a conservative `confirm` ("no resolver registered"), so the trait alone is
+not enough. Reuses `getGitBinaryWithEnv` (pinned absolute git, controlled PATH)
+and `isGitRepo`/`getWorktreeRoot`; no sandbox-wrap (matches write_file — the gate
++ the header-path == gated-path pin confine the write to one authorized file).
+Tests: parser unit (11), tool integration (8: apply+diff, not-repo, context
+mismatch leaves file untouched, multi-file/path-escape/path-mismatch rejects,
+invalid-arg, abort), engine section-sharing. Green: lint + typecheck + impacted
+suites (diff/tools/permissions/cli/tui ~379).
+
+REVIEW HARDENING (3 finder angles, verified inline; no security escape found —
+fail-closed throughout): (1) `runGitApply` now has a 30s timeout + ctx.signal
+kill (was unbounded — a wedged git would hang the turn, the gap vs runGit); (2)
+parser detects file headers POSITIONALLY (consecutive `---`/`+++` followed by
+`@@`/`diff`/EOF) so a removed `-- x` (→`--- x`) or added `++ x` (→`+++ x`)
+content line is no longer miscounted as a second file → false multi_file; (3)
+path-mismatch error now shows both resolved paths + a cwd-not-root note (the tool
+reconciles cleanly when cwd is the repo root; the header is worktree-root-
+relative); (4) resolver-registration now test-covered (accidental removal →
+silent confirm-fallback otherwise); (5) `TOOL_NOUN['git_apply_patch']='patches'`.
+Refuted: symlink-TOCTOU (out-of-model concurrent-attacker race, shared by all
+write tools), absolute/`../` paths (caught by the pin + git), `@@`-loose
+detection. Green after fixes: typecheck + lint + 1126 tests across the 6 suites.
+
+EDIT-FORMAT POSITIONING: reframed git_apply_patch from "apply a pre-made diff"
+to a diff-shaped ALTERNATIVE edit format to edit_file's {old,new} pairs. Both
+git apply calls now pass `--recount` so git recomputes the `@@` hunk counts from
+the body — the model only needs correct context lines, not correct header
+arithmetic (the historical apply_patch fragility). Descriptions updated both
+ways (git_apply_patch ↔ edit_file pointer); edit_file stays the stated default.
+Whether patch should become the PRIMARY edit format is an eval question, not a
+call: added `evals/edit-format/` (4 tasks × 2 steered cases — single-line,
+multi-hunk, repeated-lines, nested-indent) measuring first-try edit success-rate
+per format per model, plus an `eval:edit-format` script. Test: --recount applies
+a patch with deliberately-wrong `@@` counts.
+
+EVAL VALIDITY FIX + first result. The first run looked like git_apply_patch 2/4,
+but that was a broken harness: the eval cwd (`~/.cache/forja-eval`) is not a git
+repo, so git_apply_patch always returned git.not_a_repo and the "passes" were
+edit_file fallback (the old `tool_called` only checks the tool was INVOKED, not
+that it succeeded). Fixed the framework: added `setup.gitInit` (types + loader +
+executor `git init`s the cwd) and added `tool_not_called` on the sibling edit
+tools to every case so a pass means the steered tool ALONE made the edit. Valid
+re-run, BOTH target models: **opus 8/8 and gpt-5.4 8/8 — edit_file 4/4 AND
+git_apply_patch 4/4 on each**. So the formats are equally reliable on the strong
+models; patch's earlier "weakness" was entirely the env bug, and --recount +
+single-file make it a co-equal alternative, not a liability. (gpt was slower —
+multi-hunk patch 43s/6 steps via the Responses path — but cheaper overall.)
+Caveats: single run each (non-deterministic), 4 easy-ish tasks — directional, not
+conclusive; a differentiator would need harder tasks (big files, many hunks,
+tricky whitespace) or weaker models (mini/haiku). No edit-success reason to flip
+primary, so edit_file stays the default (no git dep, simpler/auditable) and
+git_apply_patch the niche. Loader test added for `gitInit`.
+
 ## [2026-06-16] tui: line-number gutter on the write/edit diff snippet
 
 The diff card showed `+N/-N` counts and a colored snippet but no positions — the

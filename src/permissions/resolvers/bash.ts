@@ -50,6 +50,7 @@ import {
   isGlobSafeRunCarveout,
   protectedTargets,
 } from '../protected_paths.ts';
+import { expandTilde } from '../tilde.ts';
 import {
   type Resolver,
   type ResolverContext,
@@ -69,20 +70,8 @@ const isNonEmptyString = (v: unknown): v is string => typeof v === 'string' && v
 // Without it, `cat ~/.ssh/id_rsa` resolves to a literal `~/.ssh/`
 // under cwd in the capability scope, but the SHELL then expands
 // `~` to the real HOME on execution — the gap between resolver
-// view and runtime view is a §11 bypass. Both shapes the shell
-// honors are expanded here:
-//   - bare `'~'` → `ctx.home`
-//   - `'~/<rest>'` → `<ctx.home>/<rest>`
-// `'~user/...'` (other-user expansion) stays literal — the engine
-// can't safely resolve another user's home without an OS call,
-// and an LLM emitting `~root/...` is far more often an attack
-// than a legitimate operator-aliased reference.
-const expandTilde = (path: string, home: string): string => {
-  if (path === '~') return home;
-  if (path.startsWith('~/')) return `${home}/${path.slice(2)}`;
-  return path;
-};
-
+// view and runtime view is a §11 bypass. See `expandTilde`
+// (tilde.ts) for the shapes the shell honors.
 const resolveArg = (path: string, ctx: ResolverContext): string =>
   resolvePath(ctx.cwd, expandTilde(path, ctx.home));
 

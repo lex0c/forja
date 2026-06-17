@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { matchesPayload } from '../../src/hooks/dispatcher-matching.ts';
 import {
   STREAM_READ_CAP_BYTES,
   _readStreamForTests,
@@ -155,6 +156,21 @@ describe('filterMatchingHooks', () => {
   test('tool matcher requires toolName to be supplied', () => {
     const hooks = [makeSpec({ event: 'PreToolUse', matcher: { tool: 'bash' } })];
     expect(filterMatchingHooks(hooks, 'PreToolUse')).toEqual([]);
+  });
+});
+
+describe('if-filter path match — git_apply_patch (parity with write_file/edit_file)', () => {
+  const gapPayload = (path: string): HookEventPayload =>
+    makePayload({
+      data: { tool: { name: 'git_apply_patch', input: { path }, output: 'ok', failed: false } },
+    } as Partial<HookEventPayload>);
+
+  test('the `if` path glob matches git_apply_patch by its path arg', () => {
+    const spec = makeSpec({ if: 'git_apply_patch(*.ts)' });
+    expect(matchesPayload(spec, gapPayload('/repo/x.ts'))).toBe(true);
+    // Without git_apply_patch in the fs-path list this would fail-open to true;
+    // with it, the glob actually filters.
+    expect(matchesPayload(spec, gapPayload('/repo/x.md'))).toBe(false);
   });
 });
 

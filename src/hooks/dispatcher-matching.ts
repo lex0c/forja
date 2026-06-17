@@ -165,7 +165,12 @@ const ifFilterMatches = (spec: HookSpec, payload: HookEventPayload): boolean => 
     return matchCommand(pattern, cmd);
   }
   // For fs-shaped tools, match against the path field.
-  if (actualTool === 'write_file' || actualTool === 'edit_file' || actualTool === 'read_file') {
+  if (
+    actualTool === 'write_file' ||
+    actualTool === 'edit_file' ||
+    actualTool === 'read_file' ||
+    actualTool === 'git_apply_patch'
+  ) {
     const path =
       typeof payload.data.tool.input.file_path === 'string'
         ? payload.data.tool.input.file_path

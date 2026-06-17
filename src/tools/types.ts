@@ -636,6 +636,17 @@ export const ERROR_CODES = {
   gitFailed: 'git.failed',
   gitNotRepo: 'git.not_a_repo',
   gitDenied: 'git.policy_denied',
+  // git_apply_patch: structured patch failures. `malformed` = unparseable /
+  // empty / no hunk; `unsupported` = multi-file / rename / copy / binary (out
+  // of scope for the single-file tool); `contextMismatch` = `git apply --check`
+  // rejected the patch against the current file; `pathMismatch` = the patch's
+  // header path doesn't resolve to the gated `path` arg or escapes the worktree;
+  // `applyFailed` = git apply failed after --check passed (rare; file untouched).
+  patchMalformed: 'patch.malformed',
+  patchUnsupported: 'patch.unsupported',
+  patchContextMismatch: 'patch.context_mismatch',
+  patchPathMismatch: 'patch.path_mismatch',
+  patchApplyFailed: 'patch.apply_failed',
   aborted: 'tool.aborted',
   // Tools whose category gate is too coarse for their actual side
   // effects (wait_for / monitor) self-gate per leaf condition and
