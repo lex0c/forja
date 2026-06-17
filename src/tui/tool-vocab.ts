@@ -89,6 +89,11 @@ export const TOOL_VOCAB: Readonly<Record<string, ToolVocab>> = {
     finalVerb: 'Edited file',
     subject: (a) => str(a.path),
   },
+  git_apply_patch: {
+    activeVerb: 'Applying patch',
+    finalVerb: 'Applied patch',
+    subject: (a) => str(a.path),
+  },
   bash: {
     activeVerb: 'Executing',
     finalVerb: 'Executed',
@@ -380,6 +385,7 @@ const TOOL_NOUN: Readonly<Record<string, string>> = {
   bash: 'commands',
   edit_file: 'edits',
   write_file: 'writes',
+  git_apply_patch: 'patches',
   fetch_url: 'fetches',
   memory_read: 'reads',
   memory_search: 'searches',

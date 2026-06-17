@@ -2,6 +2,74 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-16] tools: git_apply_patch — single-file, git-backed patch apply
+
+New builtin write tool: applies a single-file unified diff via `git apply`. Git
+is the proven applier (context matching, fuzz, whitespace); Forja owns the
+policy/safety layer around it. **Single-file by design** — this sidesteps the
+permission engine's one-path-per-tool model entirely (the tool takes an explicit
+`path` arg, so the engine gates exactly one path with ZERO engine rewrite), and
+it dissolves the `patch.partial_apply` failure mode that motivated the spec
+deferral (one file via `git apply` is atomic — all hunks or none). The display
+diff reuses `lineDiff(before, after)` so the card (line-number gutter, +N/-M,
+colors) is identical to write_file/edit_file. Gated as the `write_file` policy
+section (shared via FS_TOOL_TRAITS) and auto-checkpointed like any fs.write, so
+reversibility holds.
+
+Guard: refuses early with `git.missing` (no git binary) or `git.not_a_repo`
+(outside a worktree), both hinting at edit_file/write_file as the git-free
+fallback. Validation rejects multi-file / rename / copy / binary / mode-only
+patches and any header path that escapes the worktree or mismatches `path`.
+
+SPEC NOTE: `CONTRACTS.md §2.6.8.A` marks `apply_patch` **deferred → v2**. This
+diverges deliberately and conservatively — single-file (not the spec's
+multi-file `patches[]`), name `git_apply_patch`, git-backed. It satisfies the
+spec's own reopen trigger ("user reports a concrete pattern where edit_file
+fails" — exact-match brittleness on drifting/whitespace-inconsistent context)
+and removes the partial-apply objection. A spec-PR to flip the deferral and
+record the single-file/git decision is pending the operator's explicit ok (no
+docs/spec edits made without it).
+
+WIRING (non-obvious): a single-path FS tool needs TWO registrations to behave —
+`FS_TOOL_TRAITS[git_apply_patch] = { section: 'write_file' }` (so the policy
+lookup uses the write_file allow/deny lists) AND a capability resolver in
+resolvers/fs.ts (write-fs + read-fs on the path). Without the resolver the engine
+forces a conservative `confirm` ("no resolver registered"), so the trait alone is
+not enough. Reuses `getGitBinaryWithEnv` (pinned absolute git, controlled PATH)
+and `isGitRepo`/`getWorktreeRoot`; no sandbox-wrap (matches write_file — the gate
++ the header-path == gated-path pin confine the write to one authorized file).
+Tests: parser unit (11), tool integration (8: apply+diff, not-repo, context
+mismatch leaves file untouched, multi-file/path-escape/path-mismatch rejects,
+invalid-arg, abort), engine section-sharing. Green: lint + typecheck + impacted
+suites (diff/tools/permissions/cli/tui ~379).
+
+REVIEW HARDENING (3 finder angles, verified inline; no security escape found —
+fail-closed throughout): (1) `runGitApply` now has a 30s timeout + ctx.signal
+kill (was unbounded — a wedged git would hang the turn, the gap vs runGit); (2)
+parser detects file headers POSITIONALLY (consecutive `---`/`+++` followed by
+`@@`/`diff`/EOF) so a removed `-- x` (→`--- x`) or added `++ x` (→`+++ x`)
+content line is no longer miscounted as a second file → false multi_file; (3)
+path-mismatch error now shows both resolved paths + a cwd-not-root note (the tool
+reconciles cleanly when cwd is the repo root; the header is worktree-root-
+relative); (4) resolver-registration now test-covered (accidental removal →
+silent confirm-fallback otherwise); (5) `TOOL_NOUN['git_apply_patch']='patches'`.
+Refuted: symlink-TOCTOU (out-of-model concurrent-attacker race, shared by all
+write tools), absolute/`../` paths (caught by the pin + git), `@@`-loose
+detection. Green after fixes: typecheck + lint + 1126 tests across the 6 suites.
+
+EDIT-FORMAT POSITIONING: reframed git_apply_patch from "apply a pre-made diff"
+to a diff-shaped ALTERNATIVE edit format to edit_file's {old,new} pairs. Both
+git apply calls now pass `--recount` so git recomputes the `@@` hunk counts from
+the body — the model only needs correct context lines, not correct header
+arithmetic (the historical apply_patch fragility). Descriptions updated both
+ways (git_apply_patch ↔ edit_file pointer); edit_file stays the stated default.
+Whether patch should become the PRIMARY edit format is an eval question, not a
+call: added `evals/edit-format/` (4 tasks × 2 steered cases — single-line,
+multi-hunk, repeated-lines, nested-indent) measuring first-try edit success-rate
+per format per model, plus an `eval:edit-format` script. Promote the
+higher-passing format to primary; the other stays niche. Test: --recount applies
+a patch with deliberately-wrong `@@` counts.
+
 ## [2026-06-16] tui: line-number gutter on the write/edit diff snippet
 
 The diff card showed `+N/-N` counts and a colored snippet but no positions — the

@@ -6,6 +6,7 @@ import { bashOutputTool } from './bash-output.ts';
 import { bashTool } from './bash.ts';
 import { clarifyTool } from './clarify.ts';
 import { editFileTool } from './edit-file.ts';
+import { gitApplyPatchTool } from './git-apply-patch.ts';
 import { gitTool } from './git.ts';
 import { globTool } from './glob.ts';
 import { grepTool } from './grep.ts';
@@ -48,6 +49,8 @@ export { editFileTool } from './edit-file.ts';
 export type { EditFileInput, EditFileOutput } from './edit-file.ts';
 export { gitTool } from './git.ts';
 export type { GitInput, GitOutput, GitMode } from './git.ts';
+export { gitApplyPatchTool } from './git-apply-patch.ts';
+export type { GitApplyPatchInput, GitApplyPatchOutput } from './git-apply-patch.ts';
 export { globTool } from './glob.ts';
 export type { GlobInput, GlobOutput } from './glob.ts';
 export { grepTool } from './grep.ts';
@@ -161,6 +164,7 @@ export const BUILTIN_TOOLS = [
   taskListTool,
   writeFileTool,
   editFileTool,
+  gitApplyPatchTool,
   memoryWriteTool,
   // pin_context is intentionally NOT registered: an ad-hoc "pin this
   // text" tool proved a confusion magnet for weaker models, which

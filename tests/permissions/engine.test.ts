@@ -85,6 +85,20 @@ describe('engine.check (paths)', () => {
     expect(eng.check('write_file', 'fs.write', { path: 'src/foo.ts' }).kind).toBe('allow');
   });
 
+  test('git_apply_patch shares the write_file section (single-path, same rules)', () => {
+    const eng = createPermissionEngine(
+      policy({
+        tools: { write_file: { allow_paths: ['src/**'], deny_paths: ['**/.env*'] } },
+      }),
+      { cwd: CWD },
+    );
+    // Gated as a single path from the `path` arg, governed by tools.write_file.
+    expect(eng.check('git_apply_patch', 'fs.write', { path: 'src/foo.ts' }).kind).toBe('allow');
+    expect(eng.check('git_apply_patch', 'fs.write', { path: 'src/.env' }).kind).toBe('deny');
+    // Outside the allow_paths grant → not allowed.
+    expect(eng.check('git_apply_patch', 'fs.write', { path: 'other/x.ts' }).kind).not.toBe('allow');
+  });
+
   test('read_file: deny_paths blocks reads', () => {
     const eng = createPermissionEngine(
       policy({ tools: { read_file: { deny_paths: ['**/.env*'] } } }),

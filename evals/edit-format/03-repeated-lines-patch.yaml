@@ -1,0 +1,24 @@
+name: edit-format repeated-lines via git_apply_patch
+prompt: |
+  `src/log.ts` has three identical `log.info("start");` lines. Change ONLY the
+  one that sits between `doThing();` and `doOther();` to `log.info("middle");`,
+  leaving the other two unchanged. Use git_apply_patch — a unified diff whose
+  hunk context (`doThing();` above, `doOther();` below) pins the right line.
+  Reply "done" when applied.
+setup:
+  files:
+    src/log.ts: |
+      log.info("start");
+      doThing();
+      log.info("start");
+      doOther();
+      log.info("start");
+expect:
+  - tool_called: git_apply_patch
+  - file_contains:
+      path: src/log.ts
+      pattern: log.info("middle");
+  - status: done
+budget:
+  maxSteps: 7
+  maxCostUsd: 0.25

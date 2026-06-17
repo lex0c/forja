@@ -142,6 +142,21 @@ const editFileResolver: Resolver = (args, ctx): ResolverResult => {
   };
 };
 
+// git_apply_patch reads the target file (before-image) and writes the result of
+// `git apply` — same capability shape as edit_file (write + the consequent
+// read). Without this resolver the engine's resolver gate forces a conservative
+// `confirm` on every call ("no resolver registered").
+const gitApplyPatchResolver: Resolver = (args, ctx): ResolverResult => {
+  const conflict = conflictingPathArgsRefuse(args, 'git_apply_patch');
+  if (conflict !== null) return conflict;
+  const path = filePathOf(args);
+  if (path === null) {
+    return { kind: 'refuse', reason: "git_apply_patch: missing or non-string 'path' argument" };
+  }
+  const abs = resolveAbs(path, ctx);
+  return { kind: 'ok', capabilities: [writeFs(abs), readFs(abs)], confidence: 'high' };
+};
+
 const grepResolver: Resolver = (args, ctx): ResolverResult => {
   // grep accepts an optional `path`; absent → falls back to cwd
   // (same convention as the engine's `checkPath` for search tools).
@@ -208,6 +223,7 @@ const gitResolver: Resolver = (args, ctx): ResolverResult => {
 registerResolver('read_file', readFileResolver);
 registerResolver('write_file', writeFileResolver);
 registerResolver('edit_file', editFileResolver);
+registerResolver('git_apply_patch', gitApplyPatchResolver);
 registerResolver('grep', grepResolver);
 registerResolver('glob', globResolver);
 registerResolver('git', gitResolver);

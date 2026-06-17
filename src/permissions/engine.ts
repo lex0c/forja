@@ -528,6 +528,12 @@ const FS_TOOL_TRAITS: Readonly<Record<string, FsToolTraits>> = {
     singleFileModes: ['blame', 'show_file'],
     section: 'read_file',
   },
+  // git_apply_patch writes ONE file (it takes an explicit `path` arg, so it's a
+  // normal single-path FS tool — no rootArg). It shares the `write_file` policy
+  // section: an operator who governs write_file thereby governs patch applies
+  // with one allow/deny list, and there's no separate `tools.git_apply_patch`
+  // surface to configure.
+  git_apply_patch: { section: 'write_file' },
 };
 
 const resolveFsTarget = (toolName: string, args: ToolArgs, cwd: string): string | null => {

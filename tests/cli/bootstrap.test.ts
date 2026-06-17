@@ -109,6 +109,7 @@ describe('bootstrap', () => {
         'clarify',
         'edit_file',
         'git',
+        'git_apply_patch',
         'glob',
         'grep',
         'memory_list',

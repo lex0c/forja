@@ -1,0 +1,27 @@
+name: edit-format multi-hunk via edit_file
+prompt: |
+  `src/calc.ts` has two bugs: `add` returns `a - b` (should be `a + b`) and
+  `mul` returns `a + b` (should be `a * b`). Fix BOTH in a single edit_file call
+  (an array of two edits). Reply "done" when applied.
+setup:
+  files:
+    src/calc.ts: |
+      export function add(a: number, b: number): number {
+        return a - b;
+      }
+
+      export function mul(a: number, b: number): number {
+        return a + b;
+      }
+expect:
+  - tool_called: edit_file
+  - file_contains:
+      path: src/calc.ts
+      pattern: return a + b;
+  - file_contains:
+      path: src/calc.ts
+      pattern: return a * b;
+  - status: done
+budget:
+  maxSteps: 7
+  maxCostUsd: 0.25
