@@ -2,6 +2,23 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-16] sec(git_apply_patch): normalize header paths exactly as git apply -p1 (confinement bypass)
+
+Second confinement bypass: the parser only stripped `a/`/`b/`, but the tool runs
+`git apply` with the default `-p1`, which strips the FIRST path component
+regardless. So a TRADITIONAL header without the prefix — `--- src/f.txt` —
+returned `src/f.txt` here and passed the pin against a gated `src/f.txt`, while
+`git apply -p1` stripped `src/` and wrote repo-root `f.txt` (leaving the gated
+file untouched). Reproduced: a patch naming `src/f.txt` edited root `f.txt`,
+which the engine never gated. Fix: a header path is valid only as `/dev/null`
+or with the `a/`/`b/` prefix (the canonical git-diff form, where stripping the
+prefix reproduces git's -p1 write target exactly); any other form → `bad_header`
+reject. Prefix-less / traditional `diff -u` headers are refused (the model is
+told to emit git-diff format anyway). Fail-closed: the normalized path now
+equals what git will write, so the pin can't be fooled. Tests: parser rejects a
+prefix-less header; tool integration proves the root file git -p1 would have hit
+stays untouched.
+
 ## [2026-06-16] sec(git_apply_patch): reject metadata-only diff sections (confinement bypass)
 
 Found + fixed a real confinement bypass in the single-file check. The parser

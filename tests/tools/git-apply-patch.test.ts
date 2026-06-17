@@ -82,6 +82,20 @@ describe('gitApplyPatchTool', () => {
     expect(readFileSync(join(dir, 'allowed.txt'), 'utf8')).toBe('hello\n');
   });
 
+  test('rejects prefix-less traditional headers (no git -p1 path-strip bypass)', async () => {
+    gitInit(dir);
+    // The path git -p1 WOULD strip `src/` down to and write — must stay untouched.
+    writeFileSync(join(dir, 'f.txt'), 'old\n');
+    const attack = '--- src/f.txt\n+++ src/f.txt\n@@ -1 +1 @@\n-old\n+HACKED\n';
+    const res = await gitApplyPatchTool.execute(
+      { path: 'src/f.txt', patch: attack },
+      makeCtx({ cwd: dir }),
+    );
+    expect(isToolError(res)).toBe(true);
+    if (isToolError(res)) expect(res.error_code).toBe(ERROR_CODES.patchMalformed);
+    expect(readFileSync(join(dir, 'f.txt'), 'utf8')).toBe('old\n');
+  });
+
   test('refuses outside a git work-tree (git.not_a_repo)', async () => {
     // No git init.
     writeFileSync(join(dir, 'f.txt'), 'a\nb\nc\n');

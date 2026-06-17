@@ -132,4 +132,12 @@ describe('parseSingleFilePatch', () => {
     );
     expect(r).toEqual({ ok: true, path: 'f.txt' });
   });
+
+  test('rejects traditional headers without a/ b/ prefixes (git -p1 strips a different component)', () => {
+    // `--- src/f.txt` has no a/ prefix; git apply -p1 would strip `src/` and
+    // write repo-root `f.txt`, diverging from a naive strip that keeps src/f.txt.
+    const r = parseSingleFilePatch('--- src/f.txt\n+++ src/f.txt\n@@ -1 +1 @@\n-old\n+new\n');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('bad_header');
+  });
 });

@@ -20,28 +20,33 @@ export type PatchRejectReason =
   | 'rename_or_copy' // rename/copy — a second path the single-path gate can't see
   | 'binary' // binary patch — not a line-oriented content change
   | 'mode_change' // chmod (old mode/new mode) — not a content edit
+  | 'bad_header' // header path not `/dev/null` or `a/`/`b/`-prefixed (git-diff format)
   | 'no_hunk'; // headers but no `@@` hunk (e.g. mode-only change)
 
 export type ParseGitPatchResult =
   | { ok: true; path: string }
   | { ok: false; reason: PatchRejectReason; message: string };
 
-// Strip a leading `a/` or `b/` strip-level-1 prefix (git's default). A path
-// equal to `/dev/null` (creation/deletion sentinel) is returned as-is so the
-// caller can detect it.
-const stripPrefix = (raw: string): string => {
-  if (raw === '/dev/null') return raw;
-  if (raw.startsWith('a/') || raw.startsWith('b/')) return raw.slice(2);
-  return raw;
-};
-
 // Extract the path from a `--- ` / `+++ ` header line: drop the 4-char marker,
-// then any trailing `\t<timestamp>` git/diff appends, then the strip prefix.
-const headerPath = (line: string): string => {
+// any trailing `\t<timestamp>` git/diff appends, then the strip-level-1 prefix.
+//
+// CRITICAL — must match `git apply`'s own path normalization. The tool runs
+// `git apply` with the DEFAULT `-p1`, which strips ONE leading path component.
+// For git-format headers that component is the `a/`/`b/` prefix, so stripping
+// it reproduces git's write target exactly. A TRADITIONAL header without the
+// prefix (e.g. `--- src/f.txt`) would have its first REAL component (`src/`)
+// stripped by git -p1 → git writes `f.txt` while this parser (if it returned
+// `src/f.txt`) would pin against `src/f.txt`, passing the gate while git edits
+// an UNGATED path. So a header path is valid only as `/dev/null` or with the
+// `a/`/`b/` prefix; anything else returns null and the caller refuses it,
+// rather than risk a normalization that diverges from the actual write.
+const headerPath = (line: string): string | null => {
   const afterMarker = line.slice(4);
   const tab = afterMarker.indexOf('\t');
-  const raw = tab === -1 ? afterMarker : afterMarker.slice(0, tab);
-  return stripPrefix(raw.trim());
+  const raw = (tab === -1 ? afterMarker : afterMarker.slice(0, tab)).trim();
+  if (raw === '/dev/null') return raw;
+  if (raw.startsWith('a/') || raw.startsWith('b/')) return raw.slice(2);
+  return null;
 };
 
 // Parse + validate a single-file unified diff. On success returns the one target
@@ -101,7 +106,20 @@ export const parseSingleFilePatch = (patch: string): ParseGitPatchResult => {
     // mid-hunk can't be mistaken for end-of-patch).
     const atEnd = after === undefined || (after === '' && i + 2 === lines.length - 1);
     if (atEnd || after.startsWith('@@ ') || after.startsWith('diff ')) {
-      headers.push({ minus: headerPath(a), plus: headerPath(b) });
+      const minus = headerPath(a);
+      const plus = headerPath(b);
+      // A real header whose path isn't `/dev/null` or `a/`/`b/`-prefixed would
+      // normalize differently under `git apply -p1` than here — refuse rather
+      // than risk pinning a path other than the one git writes.
+      if (minus === null || plus === null) {
+        return {
+          ok: false,
+          reason: 'bad_header',
+          message:
+            'patch header paths must be /dev/null or use git-diff a/ b/ prefixes (the tool runs git apply -p1)',
+        };
+      }
+      headers.push({ minus, plus });
     }
   }
   if (headers.length === 0) {
