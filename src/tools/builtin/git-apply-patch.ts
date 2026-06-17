@@ -1,3 +1,4 @@
+import { lstatSync } from 'node:fs';
 import { isAbsolute, relative, resolve } from 'node:path';
 import { getWorktreeRoot, isGitRepo } from '../../checkpoints/git.ts';
 import { lineDiff } from '../../diff/line-diff.ts';
@@ -366,6 +367,36 @@ export const gitApplyPatchTool: Tool<GitApplyPatchInput, GitApplyPatchOutput> = 
           retryable: true,
           hint: 'Set `path` so it resolves (from cwd) to the same file the patch writes (relative to the repo root).',
         },
+      );
+    }
+
+    // The patch must edit REGULAR-file content. If the gated path is already a
+    // symlink, `git apply` rewrites the LINK TARGET in place (mode stays 120000,
+    // so neither --summary nor --numstat flags it — numstat reports a normal 1/1
+    // text change), repointing it anywhere, e.g. `link -> ../../etc/passwd`. That
+    // escapes the regular-files-only contract the symlink-CREATE reject already
+    // enforces, so reject editing an existing symlink (or any non-regular file:
+    // gitlink, fifo, device) too. lstat (not stat) so we inspect the link itself,
+    // not its target. A missing target is a creation — the classifier already
+    // proved it's `create mode 100644/100755`, not 120000/160000.
+    let targetStat: ReturnType<typeof lstatSync> | null = null;
+    try {
+      targetStat = lstatSync(writeAbs);
+    } catch (e) {
+      // ENOENT → safe creation. Any other lstat failure (ELOOP from a symlink
+      // cycle, EACCES on an ancestor) means we cannot confirm a regular file —
+      // refuse rather than hand the path to `git apply` blind.
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
+        return unsupported(
+          `cannot stat the patch target: ${(e as Error).message}`,
+          'Ensure the path points at a regular file inside the work-tree.',
+        );
+      }
+    }
+    if (targetStat !== null && !targetStat.isFile()) {
+      return unsupported(
+        'patch target is a symlink or other non-regular file (regular-file content only)',
+        'git_apply_patch edits regular files; recreate links or special files with the shell.',
       );
     }
 

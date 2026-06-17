@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { FileDiff } from '../../src/diff/line-diff.ts';
@@ -165,6 +173,26 @@ describe('gitApplyPatchTool', () => {
     expect(isToolError(res)).toBe(true);
     if (isToolError(res)) expect(res.error_code).toBe(ERROR_CODES.patchUnsupported);
     expect(existsSync(join(dir, 'link'))).toBe(false);
+  });
+
+  test('rejects editing an EXISTING symlink (git would repoint the link target, escaping the work-tree)', async () => {
+    gitInit(dir);
+    // A symlink `link -> old`. Editing its blob via a content patch keeps mode
+    // 120000, so --summary emits nothing and --numstat reports a normal 1/1 text
+    // change on `link` (both are pure patch-level — they never read the
+    // work-tree). Without the lstat guard, `git apply` would rewrite the link
+    // target to `../../etc/passwd`, outside the repo.
+    symlinkSync('old', join(dir, 'link'));
+    const repoint =
+      'diff --git a/link b/link\nindex 0000000..1111111 120000\n--- a/link\n+++ b/link\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+../../etc/passwd\n\\ No newline at end of file\n';
+    const res = await gitApplyPatchTool.execute(
+      { path: 'link', patch: repoint },
+      makeCtx({ cwd: dir }),
+    );
+    expect(isToolError(res)).toBe(true);
+    if (isToolError(res)) expect(res.error_code).toBe(ERROR_CODES.patchUnsupported);
+    // The symlink is untouched — still points at the original target.
+    expect(readlinkSync(join(dir, 'link'))).toBe('old');
   });
 
   test('refuses outside a git work-tree (git.not_a_repo)', async () => {
