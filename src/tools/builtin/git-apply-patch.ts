@@ -1,4 +1,4 @@
-import { lstatSync } from 'node:fs';
+import { existsSync, lstatSync } from 'node:fs';
 import { isAbsolute, relative, resolve } from 'node:path';
 import { getWorktreeRoot, isGitRepo } from '../../checkpoints/git.ts';
 import { lineDiff } from '../../diff/line-diff.ts';
@@ -435,14 +435,13 @@ export const gitApplyPatchTool: Tool<GitApplyPatchInput, GitApplyPatchOutput> = 
       );
     }
 
-    // Before-image for the display diff only (read pre-apply). Skipped entirely
-    // in headless/SDK runs (no emitDiff) — the result counts come from numstat.
-    const before =
-      ctx.emitDiff !== undefined
-        ? await Bun.file(gatedAbs)
-            .text()
-            .catch(() => '')
-        : '';
+    // Before-image, read pre-apply. Feeds the display diff AND the deletion
+    // guard below (so restore doesn't depend on emitDiff being wired). One
+    // small read; '' for a creation (the file doesn't exist yet).
+    const existedBefore = targetStat !== null;
+    const before = await Bun.file(gatedAbs)
+      .text()
+      .catch(() => '');
 
     const apply = await runGitApply(
       git,
@@ -467,6 +466,23 @@ export const gitApplyPatchTool: Tool<GitApplyPatchInput, GitApplyPatchOutput> = 
         ERROR_CODES.patchApplyFailed,
         `git apply failed after --check passed: ${apply.stderr || `exited ${apply.exitCode}`}`,
         { retryable: true },
+      );
+    }
+
+    // Deletion guard, defense-in-depth and INDEPENDENT of `git apply --summary`
+    // text. classifyPatch rejects deletions by matching the summary's `delete `
+    // line, but --numstat can't corroborate it (a deletion reports `0\tN\tpath`,
+    // identical to an edit that removes lines). If some git version's --summary
+    // failed to emit `delete`, a deletion (a delete-fs op) would slip through
+    // under the write-fs gate. A file that EXISTED before and is gone after can
+    // only have been deleted — restore it from the before-image and refuse.
+    // (A creation never trips this: existedBefore is false; a content edit
+    // always leaves the file in place.)
+    if (existedBefore && !existsSync(writeAbs)) {
+      await Bun.write(gatedAbs, before);
+      return unsupported(
+        'patch deletes the file; deletion is not supported (delete-fs is out of scope)',
+        'Delete files with the shell (rm); git_apply_patch edits or creates content.',
       );
     }
 

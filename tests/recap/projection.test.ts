@@ -391,6 +391,28 @@ describe('projectRecap', () => {
     expect(out.actions.commandsRun).toEqual([{ command: 'ls -la', exitCode: 0, durationMs: 42 }]);
   });
 
+  test('git_apply_patch is tracked as a file write (keyed by input.path)', () => {
+    // Regression: git_apply_patch is writes:true and carries its target in
+    // input.path, but was missing from FILE_WRITER_TOOLS, so every patched
+    // file silently vanished from the recap.
+    const s = seedSession();
+    const userId = addUserTurn(s.id, 'patch a file');
+    const aId = addAssistantTurn(s.id, userId, 'applying');
+    addToolCall(
+      aId,
+      'git_apply_patch',
+      { path: 'src/patched.ts', patch: '--- a/src/patched.ts\n+++ b/src/patched.ts\n' },
+      { path: 'src/patched.ts', added: 1, removed: 1 },
+      'done',
+      10,
+      1_310,
+    );
+    const out = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+    });
+    expect(out.actions.filesWritten.map((w) => w.path)).toEqual(['src/patched.ts']);
+  });
+
   test('flags incomplete sessions explicitly', () => {
     const s = seedSession();
     addUserTurn(s.id, 'work in progress');

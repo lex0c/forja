@@ -2,6 +2,41 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-17] git_apply_patch code-review fixes (recap tracking + deletion defense-in-depth)
+
+External review of the git_apply_patch feature. Verified each finding inline.
+
+BLOCKING — recap dropped git_apply_patch writes. `FILE_WRITER_TOOLS` (the set
+that decides which tool calls land in the recap's files-written view) listed
+only write_file/edit_file, in BOTH src/recap/projection.ts and
+src/recap/mini/deterministic.ts — each carrying the explicit "if a new
+file-writing tool ships, add it here" contract. git_apply_patch is writes:true
+and keyed by input.path (the exact shape projection.ts extracts), so every
+patched file silently vanished from writesByPath/filesChanged. Added
+'git_apply_patch' to both sets. Tests: projection now tracks a git_apply_patch
+call under filesWritten; mini filesChanged counts it.
+
+CONFIRMED + hardened — deletion rejection. classifyPatch rejects deletions by
+matching the `delete ` line in `git apply --summary`. Empirically verified all
+three deletion shapes (traditional `+++ /dev/null`, extended `deleted file
+mode`, and remove-all-lines which git also treats as a delete) emit `delete ` on
+git 2.54.0, and --numstat CANNOT corroborate (a deletion reports `0\tN\tpath`,
+identical to a line-removing edit). Since the summary text is the sole signal,
+added a version-independent defense-in-depth: capture whether the target existed
+pre-apply; if it existed before and is gone after a successful apply, the patch
+deleted it — restore from the before-image and refuse. Precise (a creation never
+trips it; a content edit always leaves the file), so no false positives.
+
+NIT (declined, documented) — tilde divergence. The tool's gatedAbs uses raw
+resolve() while the engine resolver expands `~` via ctx.home. Not exploitable
+(the writeAbs===gatedAbs pin fails closed on any divergence). Declined because
+ToolContext carries no `home`, so expanding `~` in the tool would use a
+DIFFERENT home source (homedir/env) than the engine's ctx.home — a new
+divergence worse than the current fail-closed behavior on the (nonsensical for a
+repo-relative patch) `~`-path case. A correct fix is cross-cutting (thread the
+engine's home into ToolContext, or dedup the thrice-duplicated expandTilde into a
+shared util) and is its own task.
+
 ## [2026-06-17] Symlink write-confinement: close the dangling-symlink escape (engine + matcher)
 
 Two related fixes from a symlink sweep of the FS tool surface.
