@@ -207,6 +207,12 @@ describe('effortToThink', () => {
   test('non-thinking model → undefined even with effort', () => {
     expect(effortToThink(req({ effort: 'high' }), CODER)).toBeUndefined();
   });
+  test('thinking_budget 0 disables think even with effort set', () => {
+    expect(effortToThink(req({ effort: 'high', thinking_budget: 0 }), THINKER)).toBe(false);
+  });
+  test('positive thinking_budget enables think without effort', () => {
+    expect(effortToThink(req({ thinking_budget: 512 }), THINKER)).toBe(true);
+  });
 });
 
 describe('ollamaOptions', () => {

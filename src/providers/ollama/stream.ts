@@ -1,5 +1,5 @@
 import type { StopReason, StreamEvent } from '../types.ts';
-import type { OllamaChatResponse, OllamaToolCall } from './http.ts';
+import type { OllamaChatResponse, OllamaMessage, OllamaToolCall } from './http.ts';
 
 // Stop reason from the final (done) chunk plus whether ANY tool call was emitted
 // across the whole stream. Tool calls can arrive on a non-final chunk, so
@@ -35,17 +35,21 @@ export async function* normalizeOllamaStream(
       yield { kind: 'start', message_id: chunk.created_at || chunk.model };
       started = true;
     }
-    const msg = chunk.message;
-    if (msg.thinking !== undefined && msg.thinking.length > 0) {
-      yield { kind: 'thinking_delta', text: msg.thinking };
-    }
-    // `content` is typed string, but a tool-call-only / divergent chunk may omit
-    // it — guard so a missing content doesn't deref mid-stream.
-    if (typeof msg.content === 'string' && msg.content.length > 0) {
-      yield { kind: 'text_delta', text: msg.content };
-    }
-    if (msg.tool_calls !== undefined) {
-      toolCalls.push(...msg.tool_calls);
+    // A streamed chunk usually carries `message`, but a final stats-only chunk
+    // can omit it — guard the deref so a completed turn isn't turned into an
+    // error, and record `final` regardless so usage/stop still fire.
+    const msg = chunk.message as OllamaMessage | undefined;
+    if (msg !== undefined) {
+      if (msg.thinking !== undefined && msg.thinking.length > 0) {
+        yield { kind: 'thinking_delta', text: msg.thinking };
+      }
+      // `content` is typed string, but a tool-call-only chunk may omit it.
+      if (typeof msg.content === 'string' && msg.content.length > 0) {
+        yield { kind: 'text_delta', text: msg.content };
+      }
+      if (msg.tool_calls !== undefined) {
+        toolCalls.push(...msg.tool_calls);
+      }
     }
     if (chunk.done) {
       final = chunk;

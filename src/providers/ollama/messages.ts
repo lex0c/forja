@@ -91,10 +91,20 @@ export const effortToThink = (
   req: GenerateRequest,
   caps: ProviderCapabilities,
 ): boolean | undefined => {
-  if (caps.supports_reasoning_effort !== true || req.effort === undefined) {
+  if (caps.supports_reasoning_effort !== true) {
     return undefined;
   }
-  return true;
+  // `thinking_budget` is the explicit on/off override (PLAYBOOKS §1.1): 0 disables
+  // reasoning, a positive value enables it — it wins over `effort` so an eval /
+  // playbook can force a deterministic no-thinking run. `effort` is the fallback:
+  // any requested level maps to Ollama's boolean think.
+  if (req.thinking_budget !== undefined) {
+    return req.thinking_budget > 0;
+  }
+  if (req.effort !== undefined) {
+    return true;
+  }
+  return undefined;
 };
 
 // Sampling + window options. `num_ctx` defaults to the model window capped at

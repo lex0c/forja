@@ -232,6 +232,28 @@ describe('normalizeOllamaStream', () => {
     expect(ev.some((e) => e.kind === 'tool_use_start')).toBe(true);
   });
 
+  test('a final stats chunk without message → usage + stop still fire', async () => {
+    const statsChunk = {
+      model: 'm',
+      created_at: 't',
+      done: true,
+      done_reason: 'stop',
+      prompt_eval_count: 7,
+      eval_count: 3,
+    } as unknown as OllamaChatResponse;
+    const ev = await collect(
+      normalizeOllamaStream(
+        streamOf(res({ message: { role: 'assistant', content: 'hi' }, done: false }), statsChunk),
+      ),
+    );
+    expect(ev.map((e) => e.kind)).toEqual(['start', 'text_delta', 'usage', 'stop']);
+    expect(ev.find((e) => e.kind === 'usage')).toEqual({
+      kind: 'usage',
+      usage: { input: 7, output: 3, cache_read: 0, cache_creation: 0 },
+    });
+    expect(ev.at(-1)).toEqual({ kind: 'stop', reason: 'end_turn' });
+  });
+
   test('length truncation wins over tool_calls (max_tokens, not tool_use)', async () => {
     const ev = await collect(
       normalizeOllamaStream(
