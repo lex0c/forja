@@ -1,4 +1,4 @@
-import { realpathSync } from 'node:fs';
+import { lstatSync, readlinkSync, realpathSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { Glob } from 'bun';
 import { createBoundedCache } from './bounded-cache.ts';
@@ -62,23 +62,67 @@ const getHostRegex = (pattern: string): RegExp => {
   return r;
 };
 
+// Kernel ELOOP ceiling is 40 on Linux; matching it bounds a symlink cycle
+// (`a → b → a`) so the manual follow below can't spin forever.
+const MAX_SYMLINK_HOPS = 40;
+
 // Resolve symlinks before matching. Without this, a symlink at
 // `src/link → /etc/passwd` would let a `src/**` allow rule grant access
 // to `/etc/passwd` because the matcher only sees the cwd-relative form.
 //
-// realpath fails on paths that don't exist (e.g., `write_file` creating
-// a new file). For those we fall back to realpathing the parent dir +
-// joining the basename — that catches the case where `src` itself is a
-// symlink to `/etc/`. If even the parent doesn't exist, give up and use
-// the input — there's nothing to follow.
-const resolveSymlinks = (abs: string): string => {
+// `realpathSync` follows the whole chain and canonicalizes — but it THROWS
+// when the final target doesn't exist on disk. Two distinct cases land in the
+// catch, and they must be told apart:
+//
+//   1. A new regular file (`write_file({path: 'src/new.ts'})`): `abs` is not a
+//      symlink, it just doesn't exist yet. Resolve its PARENT (which catches a
+//      symlinked ancestor dir, e.g. `src → /etc`) and re-append the basename.
+//
+//   2. A DANGLING symlink (`src/link → /etc/passwd` where the target is
+//      absent): the OLD fallback collapsed this to `<cwd>/src/link` — the
+//      in-cwd lexical form — so a cwd-scoped allow rule matched and the
+//      protected floor saw a safe path, yet the KERNEL still follows the link
+//      on read/write and lands at `/etc/passwd`. A single write through such a
+//      link escaped every gate. So when realpath fails we now READ the link
+//      (lstat + readlink) and follow the stored target ourselves, chasing
+//      chains, exactly as the bash resolver already does for redirect targets.
+//      The deepest resolved target is then handed to case 1's parent-realpath
+//      step, so the gate classifies the REAL destination.
+//
+// A dangling link whose target stays inside cwd still resolves in-cwd and
+// keeps matching — only escaping links now fall out.
+export const resolveSymlinks = (abs: string): string => {
   try {
     return realpathSync(abs);
   } catch {
+    // Follow symlink hops manually: realpath couldn't because some target in
+    // the chain is absent, but the kernel will still traverse the links.
+    let current = abs;
+    for (let hop = 0; hop < MAX_SYMLINK_HOPS; hop++) {
+      let link: string;
+      try {
+        if (!lstatSync(current).isSymbolicLink()) break; // a real (or absent) leaf
+        link = readlinkSync(current);
+      } catch {
+        break; // `current` doesn't exist (new file) — nothing to follow
+      }
+      // A symlink target is relative to the LINK's own directory unless absolute.
+      current = resolve(dirname(current), link);
+      try {
+        // The hop may point at a path that DOES exist (a link into a real tree);
+        // canonicalize and finish. Otherwise keep chasing the chain.
+        return realpathSync(current);
+      } catch {
+        // still dangling — loop to follow another hop or fall through below
+      }
+    }
+    // `current` is the deepest target we could reach (a dangling leaf or an
+    // absent non-symlink). Resolve its parent so a symlinked ANCESTOR dir is
+    // still followed, then re-append the basename.
     try {
-      return join(realpathSync(dirname(abs)), basename(abs));
+      return join(realpathSync(dirname(current)), basename(current));
     } catch {
-      return abs;
+      return current;
     }
   }
 };

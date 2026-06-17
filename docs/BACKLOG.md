@@ -2,6 +2,42 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-17] Symlink write-confinement: close the dangling-symlink escape (engine + matcher)
+
+Two related fixes from a symlink sweep of the FS tool surface.
+
+(1) git_apply_patch — reject editing an EXISTING symlink. Editing a tracked
+symlink's blob via a content patch keeps mode 120000, so neither `git apply
+--summary` nor `--numstat` flags it (both pure patch-level), yet `git apply`
+rewrites the LINK TARGET in place (e.g. `link → ../../etc/passwd`), escaping the
+regular-files-only contract. lstat the write target before applying: a missing
+target is a classifier-proven regular-file create, an existing symlink (or any
+non-regular file) is refused. Mirrors the existing symlink-CREATE reject.
+
+(2) Engine/matcher — follow DANGLING symlinks in the protected/allow resolver.
+Root cause (confirmed empirically): `matcher.resolveSymlinks` and
+`engine.resolveForProtected` `realpathSync` the path, but on failure (the link's
+target doesn't exist) collapsed to the in-cwd lexical form. So a dangling
+`<cwd>/link → /etc/cron.d/x` resolved to `<cwd>/link` — a cwd-scoped allow rule
+matched AND the protected floor saw a safe path — while the KERNEL still followed
+the link on write (write_file → atomicWrite deliberately writes through dangling
+links, a tested feature). A single write_file through such a link landed outside
+cwd / inside a protected zone. Realistic vector: a dangling symlink shipped in an
+untrusted checked-out repo (write_file/git_apply_patch can't create symlinks; bash
+`ln -s` is analyzer-gated). Fix: when realpath fails, READ the link (lstat +
+readlink) and follow the stored target (chains, bounded at 40 hops), exactly as
+the bash resolver already does, then resolve its parent. The two resolvers are
+now UNIFIED — `resolveForProtected` delegates to the exported `resolveSymlinks`,
+so the protected floor and the allow matcher canonicalize identically (the
+divergence between them was itself a latent leak). A dangling link whose target
+stays in-cwd still matches (legit write-through preserved); only escaping links
+fall out. Sole live FS vector was write_file (edit_file/read_file bail on the
+dangling read; existing-target symlinks were already caught). Tests: dangling→
+outside no-match + resolves to real target, dangling→protected resolves to the
+protected path, dangling→in-cwd (abs + relative) still matches, symlink cycle
+bounded, new-regular-file/existing-outside/symlinked-parent regressions held.
+Full tests/permissions green (2334), write-file (16), git_apply_patch (17).
+
 ## [2026-06-17] git_apply_patch: delegate patch parsing to git (eliminate the divergence class)
 
 A 6th parser bug — a valid single-file diff whose hunk ENDS with content lines
