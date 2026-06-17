@@ -18,9 +18,18 @@ expect:
   - tool_called: git_apply_patch
   - tool_not_called: edit_file
   - tool_not_called: write_file
+  # Full expected file: proves ONLY the middle occurrence changed —
+  # the two outer `start` lines must survive and `middle` must sit
+  # between doThing()/doOther(). A bare `middle` substring would also
+  # pass if the model replaced all three, overstating precision.
   - file_contains:
       path: src/log.ts
-      pattern: log.info("middle");
+      pattern: |-
+        log.info("start");
+        doThing();
+        log.info("middle");
+        doOther();
+        log.info("start");
   - status: done
 budget:
   maxSteps: 7
