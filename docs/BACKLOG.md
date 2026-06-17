@@ -2,6 +2,27 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-17] sec(subagents): enforce path restrictions for git_apply_patch
+
+A subagent playbook can whitelist git_apply_patch and declare
+`tool_restrictions.git_apply_patch.allow_paths`, but restrictions.ts wired path
+extractors only for write_file/edit_file/read_file/grep/git — and
+`checkRestriction` returns ok for any tool with no extractor. So the declared
+path fence was silently ignored: the child could patch any path the PARENT
+policy allowed, not the playbook's narrower list. Fix: add git_apply_patch to
+both `TOOL_RESTRICTION_SHAPE` ('path') and `TOOL_RESTRICTION_EXTRACTORS`.
+
+While wiring it, closed a related latent gap: the extractor read only `args.path`,
+but the file-class tools resolve `file_path > path` (pathArgOf / the engine's
+filePathOf), so a child sending `{file_path:…}` would slip past the fence on a
+field the tool still honors. Added `FILE_PATH_EXTRACTOR` (file_path > path) for
+write_file / edit_file / read_file / git_apply_patch; grep/git stay on the
+path-only extractor (the engine gates THEM on `args.path` only, never the alias).
+Purely additive-protective — `path`-using callers are unchanged, it only closes
+the file_path bypass. Tests: git_apply_patch fenced by allow_paths (inside ok,
+outside refused) + the file_path-alias variant refused. Full subagents suite
+green (677).
+
 ## [2026-06-16] sec(git_apply_patch): reject deletion patches (delete-fs under-declared)
 
 The parser accepted deletion patches (`+++ /dev/null`) and git apply removed the
