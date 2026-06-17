@@ -85,6 +85,9 @@ export const taskListTool: Tool<TaskListInput, TaskListOutput> = {
     },
   },
   metadata: {
+    // Deferred (AGENTIC_CLI §7.6): rare async-subagent introspection; reached
+    // via tool_search.
+    deferred: true,
     category: 'misc',
     writes: false,
     idempotent: true,

@@ -68,6 +68,9 @@ export const memoryListTool: Tool<MemoryListInput, MemoryListOutput> = {
     },
   },
   metadata: {
+    // Deferred (AGENTIC_CLI §7.6): memory_read/memory_search cover the common
+    // path; the index listing is niche discovery. Reached via tool_search.
+    deferred: true,
     // misc — same rationale as the todo tools: the tool's only side
     // effect is reading the in-process registry snapshot. The
     // model's policy engine has no per-memory permission concept;

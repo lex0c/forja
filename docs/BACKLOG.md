@@ -2,6 +2,35 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-17] tool_search: implement the on-demand tool surface (§7.6 code)
+
+Built the deferred-tool surface the §7.6 spec fixed. (1) `deferred?: boolean` on
+ToolMetadata, same pattern as the existing requiresOperatorConfirm/
+requiresReminderScheduler surface gates; 13 tools opt in (bash_kill/list,
+task_sync/cancel/list, memory_list/write, retrieve_context, todo_clear,
+skill_list/show, reminder_list/cancel). (2) buildToolDefs filters deferred from
+the base surface, but ONLY at the top level — a subagent (depth > 0) runs a
+pre-narrowed whitelist that is already the curation, so it sees all its
+whitelisted tools directly. It also injects a generated catalog (name + one-line
+blurb of the unrevealed deferred tools) into tool_search's description, so the
+list never drifts from what's actually deferred. (3) `tool_search` builtin
+(visible): keyword ranking + `select:name1,name2`, ranking extracted to the pure
+`rankDeferredTools` for unit-testing; returns matched schemas in the result and
+reveals them via ctx.searchTools. (4) loop wiring: a sticky `revealed` set, a
+ctx.searchTools closure (top level only), and a per-iteration rebuild of the
+tools array when a fetch grew the set — one cache invalidation per fetch, then
+stable. Tests: tests/tools/tool-search.test.ts (ranking + select + tool execute)
+and tests/harness/tool-surface.test.ts (deferral filter, sticky reveal, subagent
+bypass, catalog generation); bootstrap exact-list updated (+tool_search; deferred
+tools stay registered). Model-in-the-loop gate: evals/tool-search (keyword +
+select discovery of a deferred tool) — written, not yet run.
+
+git_apply_patch stays VISIBLE (the operator's original curation) alongside
+write_file/edit_file: it's a write primitive, and deferring it would have made
+the edit-format eval's patch cases secretly test tool discovery, conflating that
+eval's edit-vs-patch purpose. The tool-search eval uses todo_clear as its
+headless-safe deferred example instead.
+
 ## [2026-06-17] tool_search: spec contract for an on-demand tool surface (§7.6)
 
 The model-facing surface grew to ~36 tools (~9k tokens of schema). Two costs,

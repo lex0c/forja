@@ -38,6 +38,9 @@ export const skillListTool: Tool<SkillListInput, SkillListOutput> = {
     },
   },
   metadata: {
+    // Deferred (AGENTIC_CLI §7.6): skill_invoke stays visible as the entry
+    // point; browse/detail (list/show) are reached via tool_search.
+    deferred: true,
     category: 'misc',
     writes: false,
     idempotent: true,

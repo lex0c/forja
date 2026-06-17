@@ -365,6 +365,10 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
 // §3.1: "task (alias legado) = task_sync".
 export const taskSyncTool: Tool<TaskInput, TaskOutput> = {
   ...taskTool,
+  // Deferred (AGENTIC_CLI §7.6): a legacy alias of the visible `task` — no need
+  // to spend base-surface room on both. Override metadata so `task` stays
+  // visible while `task_sync` is reached via tool_search.
+  metadata: { ...taskTool.metadata, deferred: true },
   name: 'task_sync',
   description:
     'Synchronous spawn of a subagent. Pairs with `task_async` / `task_await` / `task_cancel`. Identical to the legacy `task` tool — both names are wired to the same dispatcher. The `prompt` must be self-contained: the child has no view of this conversation.',

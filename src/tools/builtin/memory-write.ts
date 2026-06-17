@@ -139,6 +139,9 @@ export const memoryWriteTool: Tool<MemoryWriteInput, MemoryWriteOutput> = {
     required: ['name', 'scope', 'type', 'source', 'description', 'body'],
   },
   metadata: {
+    // Deferred (AGENTIC_CLI §7.6): cross-session persistence is rare and
+    // confirm-gated; kept off the base surface, reached via tool_search.
+    deferred: true,
     category: 'misc',
     // Persists to disk.
     writes: true,

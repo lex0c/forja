@@ -359,6 +359,13 @@ export const TOOL_VOCAB: Readonly<Record<string, ToolVocab>> = {
       return s !== null ? `scope: ${s}` : null;
     },
   },
+  // tool_search reveals deferred tools (AGENTIC_CLI §7.6). The query is the
+  // salient subject so the chip reads `Searched tools · cancel background`.
+  tool_search: {
+    activeVerb: 'Searching tools',
+    finalVerb: 'Searched tools',
+    subject: (a) => str(a.query),
+  },
 };
 
 // Resolve a tool name to its vocabulary. Tools without an entry get a

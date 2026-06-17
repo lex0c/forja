@@ -90,6 +90,15 @@ export interface ToolMetadata {
   // confirm channel (spec §11). Defaults to false; only memory_write
   // opts in today.
   requiresOperatorConfirm?: boolean;
+  // Tool is kept OUT of the base model-facing surface (AGENTIC_CLI §7.6):
+  // registered and dispatchable, but absent from the `tools` array a turn
+  // sends until `tool_search` reveals it. Trims selection pressure (principle
+  // 3) — the base surface should cover the common path, and only niche
+  // alternatives / rare self-contained management land here. NOT a permission
+  // gate: a revealed deferred tool runs under the same policy as any other.
+  // Defaults to false (visible). The reveal is sticky for the session; the
+  // loop rebuilds `tools = base + revealed`.
+  deferred?: boolean;
   idempotent: boolean;
   // Opt-in to parallel execution within a step (spec
   // ORCHESTRATION.md §1.3). When EVERY tool_use the model emits in
@@ -448,6 +457,14 @@ export interface ToolContext {
   // that produce no diff just don't call it; headless/SDK contexts omit
   // it.
   emitDiff?: (diff: FileDiff) => void;
+  // Deferred-tool search (AGENTIC_CLI §7.6). Wired by the harness loop at the
+  // TOP LEVEL only (subagents don't defer — their whitelist is the curation).
+  // The `tool_search` tool calls this to look up deferred tools by keyword or
+  // `select:name1,name2` and REVEAL the matches (sticky for the session); the
+  // matched wire defs come back so the model gets the schemas in the result and
+  // can call them next turn. Absent ⇒ tool_search returns
+  // `tool_search.unavailable` (subagent / headless without the wiring).
+  searchTools?: (query: string) => SearchToolsResult;
   // Hook chain dispatch — generic per-event funnel built in the
   // harness loop. Tools fire blocking events (MemoryWrite, future
   // event-bearing tools) and inspect `blockedBy` on the result.
@@ -467,6 +484,25 @@ export interface ToolContext {
   // `tests/tools/_helpers.ts#makeCtx`; bootstrap (slice 82) wires a
   // production broker for the live REPL.
   broker?: Broker;
+}
+
+// A deferred tool surfaced by tool_search (AGENTIC_CLI §7.6). Carries exactly
+// what the model needs to call it next turn: the same name/description/schema
+// the base surface would have shown, minus the per-turn cost of always showing
+// it. Field names mirror the Tool shape (inputSchema), not the provider wire
+// (input_schema) — the harness adapter does that translation.
+export interface ToolSearchHit {
+  name: string;
+  description: string;
+  inputSchema: unknown;
+}
+
+export interface SearchToolsResult {
+  // Matched deferred tools, already revealed (sticky) by the search call.
+  tools: ToolSearchHit[];
+  // Names from a `select:` query that matched no deferred tool — surfaced so the
+  // model learns the name was wrong rather than silently getting fewer tools.
+  notFound: string[];
 }
 
 // Inputs the `task` tool passes through to the harness's subagent
@@ -657,6 +693,11 @@ export const ERROR_CODES = {
   // Todo CRUD: a todo_update / todo_get referenced an id not in the
   // session's list — a stale reference or a typo in the model's call.
   todoNotFound: 'todo.not_found',
+  // tool_search ran without the harness wiring (ctx.searchTools) — a subagent
+  // or headless run where the deferred-tool surface (AGENTIC_CLI §7.6) doesn't
+  // apply. The base surface is already the full whitelist there; nothing to
+  // reveal.
+  toolSearchUnavailable: 'tool_search.unavailable',
 } as const;
 
 export const toolError = (

@@ -43,6 +43,9 @@ export const bashKillTool: Tool<BashKillInput, BashKillOutput> = {
     required: ['process_id'],
   },
   metadata: {
+    // Deferred (AGENTIC_CLI §7.6): rare bg-job management; bash/bash_background/
+    // bash_output stay visible. Reached via tool_search when needed.
+    deferred: true,
     // Category 'misc', not 'bash'. Same reasoning as bash_output:
     // checkBash requires `args.command` and denies when absent,
     // which would default-deny every kill under non-bypass mode.

@@ -27,6 +27,9 @@ export const reminderListTool: Tool<ReminderListInput, ReminderListOutput> = {
     required: [],
   },
   metadata: {
+    // Deferred (AGENTIC_CLI §7.6): rare reminder management; `reminder` (set)
+    // stays visible. Reached via tool_search.
+    deferred: true,
     category: 'misc',
     writes: false,
     requiresReminderScheduler: true,
