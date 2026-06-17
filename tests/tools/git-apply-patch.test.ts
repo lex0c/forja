@@ -82,9 +82,11 @@ describe('gitApplyPatchTool', () => {
     expect(readFileSync(join(dir, 'allowed.txt'), 'utf8')).toBe('hello\n');
   });
 
-  test('rejects prefix-less traditional headers (no git -p1 path-strip bypass)', async () => {
+  test('prefix-less header: the pin catches git -p1 stripping to a different file', async () => {
     gitInit(dir);
-    // The path git -p1 WOULD strip `src/` down to and write — must stay untouched.
+    // git apply -p1 strips `src/` from `--- src/f.txt`, so numstat reports the
+    // real write target `f.txt` — which the pin rejects against the gated
+    // `src/f.txt`. The root file git would have written stays untouched.
     writeFileSync(join(dir, 'f.txt'), 'old\n');
     const attack = '--- src/f.txt\n+++ src/f.txt\n@@ -1 +1 @@\n-old\n+HACKED\n';
     const res = await gitApplyPatchTool.execute(
@@ -92,8 +94,21 @@ describe('gitApplyPatchTool', () => {
       makeCtx({ cwd: dir }),
     );
     expect(isToolError(res)).toBe(true);
-    if (isToolError(res)) expect(res.error_code).toBe(ERROR_CODES.patchMalformed);
+    if (isToolError(res)) expect(res.error_code).toBe(ERROR_CODES.patchPathMismatch);
     expect(readFileSync(join(dir, 'f.txt'), 'utf8')).toBe('old\n');
+  });
+
+  test('applies a patch whose hunk ends with content lines that look like headers', async () => {
+    // Regression: trailing `-- a/X`/`++ b/X` content (rendered `--- a/X`/`+++
+    // b/X`) must not be miscounted as a second file. git (and now the tool, via
+    // numstat) sees ONE file.
+    gitInit(dir);
+    writeFileSync(join(dir, 'f.txt'), 'line1\n-- a/not-header\n');
+    const patch =
+      'diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1,2 @@\n line1\n--- a/not-header\n+++ b/not-header\n';
+    const res = await gitApplyPatchTool.execute({ path: 'f.txt', patch }, makeCtx({ cwd: dir }));
+    expect(isToolError(res)).toBe(false);
+    expect(readFileSync(join(dir, 'f.txt'), 'utf8')).toBe('line1\n++ b/not-header\n');
   });
 
   test('filename whitespace is significant — gated "foo" cannot touch sibling "foo " (trailing space)', async () => {
@@ -123,6 +138,35 @@ describe('gitApplyPatchTool', () => {
     expect(existsSync(join(dir, 'gone.ts'))).toBe(true); // not deleted
   });
 
+  test('creates a regular file (create is allowed; counts come from numstat)', async () => {
+    gitInit(dir);
+    const create =
+      'diff --git a/new.ts b/new.ts\nnew file mode 100644\nindex 0000000..abc1234\n--- /dev/null\n+++ b/new.ts\n@@ -0,0 +1 @@\n+export const x = 1;\n';
+    const res = await gitApplyPatchTool.execute(
+      { path: 'new.ts', patch: create },
+      makeCtx({ cwd: dir }),
+    );
+    expect(isToolError(res)).toBe(false);
+    expect(readFileSync(join(dir, 'new.ts'), 'utf8')).toBe('export const x = 1;\n');
+    if (!isToolError(res)) {
+      expect(res.added).toBe(1);
+      expect(res.removed).toBe(0);
+    }
+  });
+
+  test('rejects a symlink create (regular files only, like write_file)', async () => {
+    gitInit(dir);
+    const sym =
+      'diff --git a/link b/link\nnew file mode 120000\nindex 0000000..abc1234\n--- /dev/null\n+++ b/link\n@@ -0,0 +1 @@\n+/etc/passwd\n\\ No newline at end of file\n';
+    const res = await gitApplyPatchTool.execute(
+      { path: 'link', patch: sym },
+      makeCtx({ cwd: dir }),
+    );
+    expect(isToolError(res)).toBe(true);
+    if (isToolError(res)) expect(res.error_code).toBe(ERROR_CODES.patchUnsupported);
+    expect(existsSync(join(dir, 'link'))).toBe(false);
+  });
+
   test('refuses outside a git work-tree (git.not_a_repo)', async () => {
     // No git init.
     writeFileSync(join(dir, 'f.txt'), 'a\nb\nc\n');
@@ -147,9 +191,19 @@ describe('gitApplyPatchTool', () => {
     expect(readFileSync(join(dir, 'f.txt'), 'utf8')).toBe('totally\ndifferent\ncontent\n');
   });
 
-  test('multi-file patch is rejected before touching git (patch.unsupported)', async () => {
+  test('multi-file patch is rejected (patch.unsupported)', async () => {
     gitInit(dir);
-    const twoFiles = `${modifyPatch}--- a/g.txt
+    // Two `diff --git` sections → numstat reports two files. (A prefix-less
+    // traditional two-file patch instead collapses to one under --recount and
+    // fails the context check — also rejected, just via a different path.)
+    const twoFiles = `diff --git a/f.txt b/f.txt
+--- a/f.txt
++++ b/f.txt
+@@ -1 +1 @@
+-a
++A
+diff --git a/g.txt b/g.txt
+--- a/g.txt
 +++ b/g.txt
 @@ -1 +1 @@
 -x

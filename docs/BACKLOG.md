@@ -2,7 +2,46 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
-## [2026-06-17] git_apply_patch: per-tool coverage audit (find every surface that must know it)
+## [2026-06-17] git_apply_patch: delegate patch parsing to git (eliminate the divergence class)
+
+A 6th parser bug — a valid single-file diff whose hunk ENDS with content lines
+that render as `--- a/X`/`+++ b/X` (file content `-- a/X` → `++ b/X`) was
+falsely rejected as multi-file (positional header detection can't tell a trailing
+content pair from a real header). Root cause across all 6: the hand-rolled diff
+parser kept diverging from what `git apply` actually does. Fix is architectural,
+not another patch: STOP re-parsing the diff; ask git.
+
+`parseSingleFilePatch` (and src/diff/git-patch.ts) is removed. The tool now
+classifies the patch via git itself, with the SAME `--recount` it applies with:
+- `git apply --summary --recount` → structural ops. Reject `delete ` (covers
+  both `delete mode …` and traditional `delete f`), `rename `, `copy `, `mode
+  change`. Creation is allowed.
+- `git apply --numstat -z --recount` → the file set + write target. 0 → malformed;
+  >1 → multi-file; `-`/`-` counts → binary; the one entry's path is git's EXACT
+  write target (already -p1-stripped, whitespace-preserved), which the pin
+  compares against the gated path. (Both probes are pure patch-level — verified
+  they don't read the worktree — so context-mismatch still surfaces via --check,
+  not as a parse error.)
+
+This SUBSUMES every prior hand-rolled fix (−p1 normalization, filename
+whitespace, metadata-only sections, multi-file count, binary, deletion) because
+git is now the single source of truth for what the patch touches — the parser
+cannot diverge from the applier (same binary, same flag). Net: the divergence
+class is closed; the finding's patch now applies; +2 git probes per call.
+Tests: the trailing-content-pair patch applies; multi-file (diff --git)/binary/
+deletion/rename/mode/metadata-section/path-mismatch/-p1/whitespace all reject;
+context-mismatch + --recount preserved. ~1114 scoped tests green.
+
+REVIEW HARDENING (2 finders, verified inline; confinement confirmed — no bypass):
+(A) result counts now come from numstat (git's truth), not lineDiff — a
+newline-only change reported 0/0 before (lineDiff strips the trailing newline);
+(B) runGitApply drains stdout/stderr BEFORE writing stdin (deadlock-safe pattern,
+output is small today but the order is now correct); (C) skip whitespace-only
+numstat entries (robust against a trailing-newline trailer); (D) reject symlink
+(`create mode 120000`) / submodule (`160000`) creates — write_file can't make
+those and a symlink at the gated path could set up a later write-through; regular
+creates (100644/100755) stay allowed. Tests added for regular create + symlink
+reject. Full tools suite green (640).
 
 Systematic sweep (3 parallel adversarial finders: permissions/sandbox · harness/
 hooks · tui/cli/audit) for every surface keyed on tool name/category where

@@ -1,6 +1,5 @@
 import { isAbsolute, relative, resolve } from 'node:path';
 import { getWorktreeRoot, isGitRepo } from '../../checkpoints/git.ts';
-import { type PatchRejectReason, parseSingleFilePatch } from '../../diff/git-patch.ts';
 import { lineDiff } from '../../diff/line-diff.ts';
 import { getGitBinaryWithEnv } from '../../subagents/git-binary.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
@@ -21,41 +20,23 @@ export interface GitApplyPatchOutput {
 // larger than the file it edits, and an unbounded blob would pin the spawn.
 const MAX_PATCH_BYTES = 10 * 1024 * 1024;
 
-// Map a parser reject onto a ToolError. `malformed` shapes are retryable (the
-// model can re-emit a valid patch); `unsupported` shapes are not (the operation
-// is out of scope for the single-file tool — switch to edit_file/write_file).
-const rejectToError = (reason: PatchRejectReason, message: string): ToolResult<never> => {
-  if (reason === 'deletion') {
-    // File removal is a delete-fs op the engine gates separately; route it to
-    // the shell rather than perform a delete under this tool's write-fs gate.
-    return toolError(ERROR_CODES.patchUnsupported, message, {
-      retryable: false,
-      hint: 'Delete files with the shell (rm); git_apply_patch edits or creates content.',
-    });
-  }
-  if (
-    reason === 'multi_file' ||
-    reason === 'rename_or_copy' ||
-    reason === 'binary' ||
-    reason === 'mode_change'
-  ) {
-    return toolError(ERROR_CODES.patchUnsupported, message, {
-      retryable: false,
-      hint: 'git_apply_patch is single-file and content-only. Use edit_file/write_file, or split into one patch per file.',
-    });
-  }
-  return toolError(ERROR_CODES.patchMalformed, message, { retryable: true });
-};
-
 // Hard cap on a single git invocation. Mirrors checkpoints/git.ts RUN_GIT
 // timeout: long enough for a real apply, short enough that a wedged git (ref
 // lock, stalled network mount, hung hook) can't pin the turn indefinitely.
 const GIT_APPLY_TIMEOUT_MS = 30_000;
 
-// Spawn `git <args>` feeding `patch` on stdin; return exit code + stderr. Reuses
-// the hardened binary/env resolution (pinned absolute git, controlled PATH). A
-// 30s timeout AND ctx.signal both kill the subprocess — without either, a stuck
-// git apply would hang the whole turn (the gap the bespoke spawn had vs runGit).
+interface GitRun {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+  aborted: boolean;
+}
+
+// Spawn `git <args>` feeding `patch` on stdin; return exit code + stdout/stderr.
+// Reuses the hardened binary/env resolution (pinned absolute git, controlled
+// PATH). A 30s timeout AND ctx.signal both kill the subprocess — without either,
+// a stuck git apply would hang the whole turn.
 const runGitApply = async (
   git: string,
   env: Record<string, string>,
@@ -63,7 +44,7 @@ const runGitApply = async (
   args: string[],
   patch: string,
   signal: AbortSignal,
-): Promise<{ exitCode: number; stderr: string; timedOut: boolean; aborted: boolean }> => {
+): Promise<GitRun> => {
   const proc = Bun.spawn({
     cmd: [git, ...args],
     cwd,
@@ -90,6 +71,12 @@ const runGitApply = async (
     kill();
   };
   signal.addEventListener('abort', onAbort, { once: true });
+  // Start draining stdout/stderr BEFORE writing stdin: a large patch fed to
+  // stdin while git emits output would otherwise risk a pipe deadlock (git
+  // blocks on a full stdout pipe while we block writing stdin). Today's probes
+  // emit little, but the concurrent drain is the safe pattern.
+  const stdoutP = new Response(proc.stdout).text();
+  const stderrP = new Response(proc.stderr).text();
   const sink = proc.stdin;
   if (sink !== undefined) {
     try {
@@ -100,16 +87,187 @@ const runGitApply = async (
       // carries the real cause.
     }
   }
-  const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+  const [stdout, stderr, exitCode] = await Promise.all([stdoutP, stderrP, proc.exited]);
   clearTimeout(timer);
   signal.removeEventListener('abort', onAbort);
-  return { exitCode, stderr: stderr.trim(), timedOut, aborted };
+  return { exitCode, stdout, stderr: stderr.trim(), timedOut, aborted };
+};
+
+const unsupported = (message: string, hint: string): ToolResult<never> =>
+  toolError(ERROR_CODES.patchUnsupported, message, { retryable: false, hint });
+const malformed = (message: string): ToolResult<never> =>
+  toolError(ERROR_CODES.patchMalformed, message, { retryable: true });
+
+type Classified =
+  | { ok: true; path: string; added: number; removed: number }
+  | { ok: false; error: ToolResult<never> };
+
+// Classify the patch by asking GIT what it does, rather than re-parsing the
+// diff ourselves (the source of repeated divergence bugs). Both probes run with
+// the SAME `--recount` the apply uses and are pure patch-level (they don't read
+// the worktree), so their verdict is exactly what `git apply` will touch:
+//   - `--summary`: structural ops. Reject delete (delete-fs op — use the
+//     shell), rename/copy (second path), mode change (chmod, not a content
+//     edit). `create mode` is allowed (a creation is a write).
+//   - `--numstat -z`: the file set + the write target. >1 file → multi-file;
+//     `-`/`-` counts → binary; the one entry's path is git's exact write target
+//     (already -p1-stripped, whitespace-preserved), which the caller pins.
+const classifyPatch = async (
+  git: string,
+  env: Record<string, string>,
+  worktreeRoot: string,
+  patch: string,
+  signal: AbortSignal,
+): Promise<Classified> => {
+  const abortedErr = (where: string): Classified => ({
+    ok: false,
+    error: toolError(ERROR_CODES.aborted, `aborted during ${where}`, { retryable: true }),
+  });
+  const timedOutErr = (where: string): Classified => ({
+    ok: false,
+    error: toolError(ERROR_CODES.patchApplyFailed, `${where} timed out (30s)`, { retryable: true }),
+  });
+
+  // Structural ops (delete/rename/copy/mode). Run first so a rename never
+  // reaches the numstat parse (its -z output has an irregular shape).
+  const summary = await runGitApply(
+    git,
+    env,
+    worktreeRoot,
+    ['apply', '--summary', '--recount', '-'],
+    patch,
+    signal,
+  );
+  if (summary.aborted) return abortedErr('git apply --summary');
+  if (summary.timedOut) return timedOutErr('git apply --summary');
+  if (summary.exitCode !== 0) {
+    return {
+      ok: false,
+      error: malformed(
+        `patch does not parse: ${summary.stderr || `git apply --summary exited ${summary.exitCode}`}`,
+      ),
+    };
+  }
+  for (const raw of summary.stdout.split('\n')) {
+    const op = raw.trim();
+    // Both forms: git-format `delete mode 100644 f` and traditional `delete f`
+    // (a `+++ /dev/null` patch with no `deleted file mode` header still deletes).
+    if (op.startsWith('delete ')) {
+      return {
+        ok: false,
+        error: unsupported(
+          'deletion patches are not supported',
+          'Delete files with the shell (rm); git_apply_patch edits or creates content.',
+        ),
+      };
+    }
+    if (op.startsWith('rename ') || op.startsWith('copy ')) {
+      return {
+        ok: false,
+        error: unsupported(
+          'rename/copy patches touch two paths; not supported (single-file only)',
+          'Use the shell to move/copy, then patch content separately.',
+        ),
+      };
+    }
+    if (op.startsWith('mode change')) {
+      return {
+        ok: false,
+        error: unsupported(
+          'mode-change (chmod) patches are not supported (content edits only)',
+          'Change file modes with the shell (chmod).',
+        ),
+      };
+    }
+    // Symlink (120000) / submodule gitlink (160000) creates are NOT content —
+    // write_file can't make them either, and a symlink at the gated path could
+    // set up a later write-through. Allow only regular-file creates
+    // (`create mode 100644`/`100755`).
+    if (op.startsWith('create mode 120000') || op.startsWith('create mode 160000')) {
+      return {
+        ok: false,
+        error: unsupported(
+          'symlink/submodule creation is not supported (regular files only)',
+          'Create symlinks/submodules with the shell; git_apply_patch writes file content.',
+        ),
+      };
+    }
+    // A regular-file ` create mode 100644/100755 … ` is allowed — a creation is
+    // a write-fs op like write_file.
+  }
+
+  // File set + write target + binary, from git's own numstat.
+  const numstat = await runGitApply(
+    git,
+    env,
+    worktreeRoot,
+    ['apply', '--numstat', '-z', '--recount', '-'],
+    patch,
+    signal,
+  );
+  if (numstat.aborted) return abortedErr('git apply --numstat');
+  if (numstat.timedOut) return timedOutErr('git apply --numstat');
+  if (numstat.exitCode !== 0) {
+    return {
+      ok: false,
+      error: malformed(
+        `patch does not parse: ${numstat.stderr || `git apply --numstat exited ${numstat.exitCode}`}`,
+      ),
+    };
+  }
+
+  const files: { path: string; added: number; removed: number }[] = [];
+  for (const entry of numstat.stdout.split('\0')) {
+    // Skip empties AND any whitespace-only trailer (a trailing NUL yields '',
+    // and a stray trailing newline yields '\n') — never a real entry, which
+    // always begins with a count.
+    if (entry.trim().length === 0) continue;
+    const tab1 = entry.indexOf('\t');
+    const tab2 = tab1 === -1 ? -1 : entry.indexOf('\t', tab1 + 1);
+    if (tab1 === -1 || tab2 === -1) {
+      // Irregular entry (e.g. a rename's -z fragment). Renames are already
+      // rejected above; anything else here is a shape we won't risk pinning.
+      return {
+        ok: false,
+        error: unsupported('unrecognized patch shape', 'Use a plain single-file content diff.'),
+      };
+    }
+    const added = entry.slice(0, tab1);
+    const removed = entry.slice(tab1 + 1, tab2);
+    const path = entry.slice(tab2 + 1);
+    if (added === '-' || removed === '-') {
+      return {
+        ok: false,
+        error: unsupported('binary patches are not supported', 'git_apply_patch is content-only.'),
+      };
+    }
+    if (path.length === 0) {
+      return {
+        ok: false,
+        error: unsupported('unrecognized patch shape', 'Use a plain single-file content diff.'),
+      };
+    }
+    files.push({ path, added: Number(added), removed: Number(removed) });
+  }
+
+  if (files.length === 0) return { ok: false, error: malformed('patch touches no files') };
+  if (files.length > 1) {
+    return {
+      ok: false,
+      error: unsupported(
+        `patch touches ${files.length} files; git_apply_patch is single-file only`,
+        'Split into one patch per file, or use edit_file/write_file.',
+      ),
+    };
+  }
+  const only = files[0] as { path: string; added: number; removed: number };
+  return { ok: true, path: only.path, added: only.added, removed: only.removed };
 };
 
 export const gitApplyPatchTool: Tool<GitApplyPatchInput, GitApplyPatchOutput> = {
   name: 'git_apply_patch',
   description:
-    "Edit ONE file by applying a unified diff (git diff format) via `git apply` — a diff-shaped alternative to edit_file's {old_string,new_string} pairs. Pass `path` plus a `patch` whose header names that same file. Hunk line-counts are recomputed, so only the context lines must match (you need not get the @@ counts right). edit_file is the default for simple localized edits; reach for this when a diff is the natural shape — several hunks in one file, or a patch you already have. Single-file only: rejects multi-file, rename/copy, and binary patches. Requires a git work-tree (else use edit_file/write_file). All-or-nothing: the file changes only if the whole patch applies. Returns { path, added, removed }.",
+    "Edit ONE file by applying a unified diff (git diff format) via `git apply` — a diff-shaped alternative to edit_file's {old_string,new_string} pairs. Pass `path` plus a `patch` whose header names that same file. Hunk line-counts are recomputed, so only the context lines must match (you need not get the @@ counts right). edit_file is the default for simple localized edits; reach for this when a diff is the natural shape — several hunks in one file, or a patch you already have. Single-file only: rejects multi-file, rename/copy, deletion, and binary patches. Requires a git work-tree (else use edit_file/write_file). All-or-nothing: the file changes only if the whole patch applies. Returns { path, added, removed }.",
   inputSchema: {
     type: 'object',
     properties: {
@@ -152,11 +310,6 @@ export const gitApplyPatchTool: Tool<GitApplyPatchInput, GitApplyPatchOutput> = 
       );
     }
 
-    // Validate the patch shape BEFORE touching git: single file, no
-    // rename/copy/binary, a real hunk, and a resolvable target path.
-    const parsed = parseSingleFilePatch(args.patch);
-    if (!parsed.ok) return rejectToError(parsed.reason, parsed.message);
-
     // git availability. `getGitBinary` returns the bare 'git' (non-absolute)
     // only when neither the canonical nor the operator PATH resolved it.
     const { git, env } = await getGitBinaryWithEnv();
@@ -174,13 +327,19 @@ export const gitApplyPatchTool: Tool<GitApplyPatchInput, GitApplyPatchOutput> = 
     }
     const worktreeRoot = (await getWorktreeRoot(ctx.cwd)) ?? ctx.cwd;
 
-    // Path pinning: git apply runs at the worktree root, so it writes to
-    // `<root>/<header path>`. Require that to resolve to the SAME absolute file
-    // the engine gated (args.path), and to stay inside the worktree. This is
-    // what keeps a single-path gate sufficient — git can only touch the one
-    // authorized file.
+    // Ask git what the patch touches (single file? which path? structural ops?)
+    // rather than re-parse the diff — git is the source of truth and runs the
+    // same --recount the apply uses.
+    const cls = await classifyPatch(git, env, worktreeRoot, args.patch, ctx.signal);
+    if (!cls.ok) return cls.error;
+
+    // Path pinning: git apply writes `<worktreeRoot>/<numstat path>`. Require
+    // that to be the SAME absolute file the engine gated (args.path), inside the
+    // worktree. This keeps the single-path gate sufficient — git can only touch
+    // the one authorized file, and the path comes from git itself (no parser
+    // divergence from what apply will write).
     const gatedAbs = isAbsolute(pathArg) ? resolve(pathArg) : resolve(ctx.cwd, pathArg);
-    const headerAbs = resolve(worktreeRoot, parsed.path);
+    const writeAbs = resolve(worktreeRoot, cls.path);
     const relToRoot = relative(worktreeRoot, gatedAbs);
     if (relToRoot.startsWith('..') || isAbsolute(relToRoot)) {
       return toolError(
@@ -191,23 +350,21 @@ export const gitApplyPatchTool: Tool<GitApplyPatchInput, GitApplyPatchOutput> = 
         },
       );
     }
-    if (headerAbs !== gatedAbs) {
-      // The file git WILL write (header path resolved at the worktree root)
-      // differs from the file the engine gated (path arg resolved at cwd). This
-      // also bites when cwd is a SUBDIR of the repo: the patch header is
-      // worktree-root-relative (as `git diff` emits) while `path` resolves from
-      // cwd, so they only coincide when cwd is the repo root. Surface both
-      // resolved paths so the caller can correct the `path` arg.
+    if (writeAbs !== gatedAbs) {
+      // The file git WILL write differs from the file the engine gated. This
+      // also bites when cwd is a SUBDIR of the repo: git resolves the patch
+      // header relative to the worktree root while `path` resolves from cwd, so
+      // they only coincide when cwd is the repo root.
       const cwdNote =
-        worktreeRoot !== gatedAbs && relative(worktreeRoot, ctx.cwd) !== ''
-          ? ' (note: cwd is not the repo root; the patch header is resolved relative to the worktree root)'
+        relative(worktreeRoot, ctx.cwd) !== ''
+          ? ' (note: cwd is not the repo root; git resolves the patch path relative to the worktree root)'
           : '';
       return toolError(
         ERROR_CODES.patchPathMismatch,
-        `patch writes '${relative(worktreeRoot, headerAbs)}' but the path arg gates '${relative(worktreeRoot, gatedAbs)}'${cwdNote}`,
+        `patch writes '${cls.path}' but the path arg gates '${relative(worktreeRoot, gatedAbs)}'${cwdNote}`,
         {
           retryable: true,
-          hint: 'Set `path` so it resolves (from cwd) to the same file the patch header names (relative to the repo root).',
+          hint: 'Set `path` so it resolves (from cwd) to the same file the patch writes (relative to the repo root).',
         },
       );
     }
@@ -216,13 +373,8 @@ export const gitApplyPatchTool: Tool<GitApplyPatchInput, GitApplyPatchOutput> = 
       return toolError(ERROR_CODES.aborted, 'tool aborted before apply', { retryable: true });
     }
 
-    // Dry-run first: `git apply --check` validates the whole patch against the
-    // current file without writing. A failure here means the file is untouched.
-    // `--recount`: don't trust the `@@` line counts — recompute them from the
-    // hunk body. Models reliably get context lines right but often miscount the
-    // hunk header; this removes that failure mode so only the context must
-    // match (lets the patch be used as a general edit format, not just a
-    // pre-made diff). git still validates context, so confinement is unchanged.
+    // Dry-run first: `git apply --check` validates the patch against the current
+    // file (context match) without writing — a failure here leaves it untouched.
     const check = await runGitApply(
       git,
       env,
@@ -252,11 +404,14 @@ export const gitApplyPatchTool: Tool<GitApplyPatchInput, GitApplyPatchOutput> = 
       );
     }
 
-    // Before-image (for the counts in the result AND the display diff). A
-    // creation patch has no prior content → empty.
-    const before = await Bun.file(gatedAbs)
-      .text()
-      .catch(() => '');
+    // Before-image for the display diff only (read pre-apply). Skipped entirely
+    // in headless/SDK runs (no emitDiff) — the result counts come from numstat.
+    const before =
+      ctx.emitDiff !== undefined
+        ? await Bun.file(gatedAbs)
+            .text()
+            .catch(() => '')
+        : '';
 
     const apply = await runGitApply(
       git,
@@ -284,13 +439,18 @@ export const gitApplyPatchTool: Tool<GitApplyPatchInput, GitApplyPatchOutput> = 
       );
     }
 
-    // after-image → counts (always) + display diff (when a TUI consumer is
-    // wired). Reuses lineDiff so the card matches write_file/edit_file exactly.
-    const after = await Bun.file(gatedAbs)
-      .text()
-      .catch(() => '');
-    const fileDiff = lineDiff(before, after);
-    if (ctx.emitDiff !== undefined && fileDiff.added + fileDiff.removed > 0) ctx.emitDiff(fileDiff);
-    return { path: pathArg, added: fileDiff.added, removed: fileDiff.removed };
+    // Display diff (when a TUI consumer is wired) from lineDiff so the card —
+    // gutter, snippet, colors — matches write_file/edit_file. The model-facing
+    // RESULT counts come from git's numstat instead: lineDiff strips the
+    // trailing newline, so a newline-only change reports 0/0 there while git
+    // (and the user's intent) counts it. numstat is the authoritative count.
+    if (ctx.emitDiff !== undefined) {
+      const after = await Bun.file(gatedAbs)
+        .text()
+        .catch(() => '');
+      const fileDiff = lineDiff(before, after);
+      if (fileDiff.added + fileDiff.removed > 0) ctx.emitDiff(fileDiff);
+    }
+    return { path: pathArg, added: cls.added, removed: cls.removed };
   },
 };
