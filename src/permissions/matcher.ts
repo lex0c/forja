@@ -66,6 +66,31 @@ const getHostRegex = (pattern: string): RegExp => {
 // (`a → b → a`) so the manual follow below can't spin forever.
 const MAX_SYMLINK_HOPS = 40;
 
+// Realpath the DEEPEST existing prefix of `p`, re-appending the absent tail.
+// A plain `realpath(dirname(p))` only resolves ONE level, so a symlinked
+// ANCESTOR several components up stays unfollowed: for `outdir/missing/file`
+// where `outdir` is a symlink to an outside dir and `missing` is absent,
+// dirname is `outdir/missing` which also ENOENTs, collapsing back to the in-cwd
+// lexical path — and a write then follows `outdir` outside cwd. Walking up to
+// the deepest component that DOES exist (here `outdir`) resolves that ancestor
+// symlink, surfacing the real outside destination to the matcher. Terminates:
+// `dirname` shortens to the filesystem root, which always realpaths.
+const realpathDeepestPrefix = (p: string): string => {
+  const tail: string[] = [];
+  let cur = p;
+  for (;;) {
+    try {
+      const real = realpathSync(cur);
+      return tail.length === 0 ? real : join(real, ...tail.reverse());
+    } catch {
+      const parent = dirname(cur);
+      if (parent === cur) return p; // hit root with nothing real — lexical
+      tail.push(basename(cur));
+      cur = parent;
+    }
+  }
+};
+
 // Resolve symlinks before matching. Without this, a symlink at
 // `src/link → /etc/passwd` would let a `src/**` allow rule grant access
 // to `/etc/passwd` because the matcher only sees the cwd-relative form.
@@ -75,8 +100,9 @@ const MAX_SYMLINK_HOPS = 40;
 // catch, and they must be told apart:
 //
 //   1. A new regular file (`write_file({path: 'src/new.ts'})`): `abs` is not a
-//      symlink, it just doesn't exist yet. Resolve its PARENT (which catches a
-//      symlinked ancestor dir, e.g. `src → /etc`) and re-append the basename.
+//      symlink, it just doesn't exist yet. Resolve its deepest existing prefix
+//      (which catches a symlinked ancestor dir at any depth, e.g. `src → /etc`)
+//      and re-append the absent tail.
 //
 //   2. A DANGLING symlink (`src/link → /etc/passwd` where the target is
 //      absent): the OLD fallback collapsed this to `<cwd>/src/link` — the
@@ -86,8 +112,10 @@ const MAX_SYMLINK_HOPS = 40;
 //      link escaped every gate. So when realpath fails we now READ the link
 //      (lstat + readlink) and follow the stored target ourselves, chasing
 //      chains, exactly as the bash resolver already does for redirect targets.
-//      The deepest resolved target is then handed to case 1's parent-realpath
-//      step, so the gate classifies the REAL destination.
+//      The deepest resolved target is then handed to case 1's deepest-prefix
+//      step, so a symlinked ancestor in the target (`outdir/missing/file` with
+//      `outdir → outside`) is followed and the gate classifies the REAL
+//      destination.
 //
 // A dangling link whose target stays inside cwd still resolves in-cwd and
 // keeps matching — only escaping links now fall out.
@@ -117,13 +145,10 @@ export const resolveSymlinks = (abs: string): string => {
       }
     }
     // `current` is the deepest target we could reach (a dangling leaf or an
-    // absent non-symlink). Resolve its parent so a symlinked ANCESTOR dir is
-    // still followed, then re-append the basename.
-    try {
-      return join(realpathSync(dirname(current)), basename(current));
-    } catch {
-      return current;
-    }
+    // absent non-symlink). Resolve its deepest EXISTING prefix so a symlinked
+    // ANCESTOR — at any depth, not just the immediate parent — is still
+    // followed, then re-append the absent tail.
+    return realpathDeepestPrefix(current);
   }
 };
 

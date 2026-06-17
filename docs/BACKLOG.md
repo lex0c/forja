@@ -2,6 +2,24 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-17] Symlink confinement: follow symlinked ANCESTORS in dangling targets
+
+Follow-up review finding on the dangling-symlink fix. The fix's final fallback
+only realpath'd `dirname(current)` — ONE level. So for `link → outdir/missing/
+file` where `outdir` is an in-cwd symlink to an outside/protected dir and
+`missing` is absent, `dirname(current)` (`…/outdir/missing`) also ENOENTs and the
+resolver returned the in-cwd lexical path. matchPath then allowed it while
+write_file/atomicWrite followed `outdir` and wrote OUTSIDE cwd — same escape
+class, one level deeper. Reproduced empirically (resolveSymlinks returned the
+in-cwd form; a real write landed outside). Fix: a `realpathDeepestPrefix` helper
+walks up to the deepest EXISTING component, realpaths THAT (resolving a symlinked
+ancestor at any depth), and re-appends the absent tail — replacing the one-level
+parent realpath. Terminates at the filesystem root. Shared resolveSymlinks, so
+both the matcher and the engine's resolveForProtected (which delegates to it) are
+covered. Test: the ancestor-symlink dangling target now resolves outside and
+fails matchPath; the prior dangling/in-cwd/new-file/loop cases still hold. Full
+tests/permissions green (2341).
+
 ## [2026-06-17] git_apply_patch: fix false escape rejection under a symlinked cwd
 
 Review finding (reproduced + confirmed live in this very environment, where

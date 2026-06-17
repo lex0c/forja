@@ -80,6 +80,22 @@ describe('matchPath: DANGLING symlink resolution (target absent)', () => {
     rmSync(escapeTarget, { recursive: true, force: true });
   });
 
+  test('dangling target through a symlinked ANCESTOR resolves outside (deepest-prefix walk)', () => {
+    // `link → outdir/missing/file`, where `outdir` is an in-cwd symlink to an
+    // OUTSIDE dir and `missing` does not exist. A one-level parent realpath
+    // ENOENTs (missing is absent), so the old fallback collapsed to the in-cwd
+    // lexical path and a cwd allow matched — while a write follows `outdir`
+    // outside. Walking to the deepest existing prefix (`outdir`) resolves it.
+    const escapeTarget = mkdtempSync(join(tmpdir(), 'forja-escape-anc-'));
+    symlinkSync(escapeTarget, join(workdir, 'outdir'));
+    symlinkSync('outdir/missing/file', join(workdir, 'link'));
+
+    expect(resolveSymlinks(resolve(workdir, 'link'))).toBe(join(escapeTarget, 'missing', 'file'));
+    expect(matchPath('**', 'link', workdir)).toBe(false);
+
+    rmSync(escapeTarget, { recursive: true, force: true });
+  });
+
   test('dangling symlink into a PROTECTED zone resolves to the protected target', () => {
     // Nothing is written; we only assert the gate would SEE /etc/cron.d/...
     // (a protected zone) rather than a harmless in-cwd path.
