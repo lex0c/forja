@@ -140,4 +140,11 @@ describe('parseSingleFilePatch', () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe('bad_header');
   });
+
+  test('preserves significant trailing whitespace in the filename (git keeps it)', () => {
+    // git apply treats `--- a/foo ` as the file `foo ` (trailing space) — a
+    // .trim() here would pin `foo` while git writes `foo `.
+    const r = parseSingleFilePatch('--- a/foo \n+++ b/foo \n@@ -1 +1 @@\n-A\n+B\n');
+    expect(r).toEqual({ ok: true, path: 'foo ' });
+  });
 });

@@ -40,10 +40,17 @@ export type ParseGitPatchResult =
 // an UNGATED path. So a header path is valid only as `/dev/null` or with the
 // `a/`/`b/` prefix; anything else returns null and the caller refuses it,
 // rather than risk a normalization that diverges from the actual write.
+//
+// Strip ONLY syntax git also strips — the optional `\t<timestamp>` after the
+// name, and a trailing CR from a CRLF line ending — NOT filename whitespace.
+// git preserves leading/trailing spaces in the name (verified: `--- a/foo `
+// applies to the file `foo `, not `foo`), so a `.trim()` here would pin a
+// different path than git writes (a call gated for `foo` could touch `foo `).
 const headerPath = (line: string): string | null => {
   const afterMarker = line.slice(4);
   const tab = afterMarker.indexOf('\t');
-  const raw = (tab === -1 ? afterMarker : afterMarker.slice(0, tab)).trim();
+  let raw = tab === -1 ? afterMarker : afterMarker.slice(0, tab);
+  if (raw.endsWith('\r')) raw = raw.slice(0, -1);
   if (raw === '/dev/null') return raw;
   if (raw.startsWith('a/') || raw.startsWith('b/')) return raw.slice(2);
   return null;

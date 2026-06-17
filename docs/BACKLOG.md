@@ -2,6 +2,19 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-16] sec(git_apply_patch): preserve filename whitespace when pinning (confinement bypass)
+
+Third confinement bypass, same class as the -p1 one: `headerPath` did `.trim()`
+on the parsed name, but git preserves leading/trailing spaces in filenames.
+Verified on git 2.54: `--- a/foo ` applies to the file `foo ` (trailing space),
+not `foo` — with both present, git wrote `foo ` and left `foo` untouched. So a
+call gated for `path:'foo'` could modify/create the sibling `foo ` that the
+engine never checked. Fix: drop the `.trim()`; strip only syntax git also strips
+— the `\t<timestamp>` suffix and a trailing CR (CRLF line ending) — never
+filename spaces. The normalized path now equals git's write target, so the pin
+holds. Tests: parser keeps the trailing space; tool integration proves a gated
+`foo` cannot touch `foo ` (patchPathMismatch, sibling untouched).
+
 ## [2026-06-16] sec(git_apply_patch): normalize header paths exactly as git apply -p1 (confinement bypass)
 
 Second confinement bypass: the parser only stripped `a/`/`b/`, but the tool runs

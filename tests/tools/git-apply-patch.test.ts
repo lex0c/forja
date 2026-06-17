@@ -96,6 +96,20 @@ describe('gitApplyPatchTool', () => {
     expect(readFileSync(join(dir, 'f.txt'), 'utf8')).toBe('old\n');
   });
 
+  test('filename whitespace is significant — gated "foo" cannot touch sibling "foo " (trailing space)', async () => {
+    gitInit(dir);
+    writeFileSync(join(dir, 'foo '), 'A\n'); // sibling git would write via the spaced header
+    // Gated for 'foo', but the header names 'foo ' (trailing space) — git applies to 'foo '.
+    const attack = '--- a/foo \n+++ b/foo \n@@ -1 +1 @@\n-A\n+HACKED\n';
+    const res = await gitApplyPatchTool.execute(
+      { path: 'foo', patch: attack },
+      makeCtx({ cwd: dir }),
+    );
+    expect(isToolError(res)).toBe(true);
+    if (isToolError(res)) expect(res.error_code).toBe(ERROR_CODES.patchPathMismatch);
+    expect(readFileSync(join(dir, 'foo '), 'utf8')).toBe('A\n'); // sibling untouched
+  });
+
   test('refuses outside a git work-tree (git.not_a_repo)', async () => {
     // No git init.
     writeFileSync(join(dir, 'f.txt'), 'a\nb\nc\n');
