@@ -57,8 +57,14 @@ import { type SubagentHandleStore, createSubagentHandleStore } from '../subagent
 import type { PermissionDecision } from '../subagents/ipc.ts';
 import { MAX_SUBAGENT_DEPTH, runSubagent } from '../subagents/runtime.ts';
 import { type TodoStore, createTodoStore } from '../todo/index.ts';
+import { rankDeferredTools } from '../tools/builtin/tool-search.ts';
 import type { ToolContext } from '../tools/index.ts';
-import type { SpawnSubagentArgs, SpawnSubagentResult } from '../tools/types.ts';
+import type {
+  SearchToolsResult,
+  SpawnSubagentArgs,
+  SpawnSubagentResult,
+  ToolSearchHit,
+} from '../tools/types.ts';
 import { type WorkingStateStore, createWorkingStateStore } from '../working-state/index.ts';
 import { StepStallError, abortableIterable, stallWatchdog } from './abortable.ts';
 import { buildAssistantContent } from './assistant-content.ts';
@@ -194,6 +200,33 @@ const exitToHarnessStatus: Record<ExitReason, HarnessResult['status']> = {
   userPromptBlocked: 'interrupted',
 };
 
+// One-line blurb for the tool_search catalog: the description's first sentence,
+// capped. Enough for the model to decide whether to reveal the tool, at ~1/4 the
+// tokens of the full schema it replaces in the base surface.
+const toolBlurb = (desc: string): string => {
+  const dot = desc.indexOf('. ');
+  const firstSentence = dot > 0 ? desc.slice(0, dot + 1) : desc;
+  return firstSentence.length > 110 ? `${firstSentence.slice(0, 107)}...` : firstSentence;
+};
+
+// The deferred tools that are ALSO surface-available right now: deferred AND
+// past the same operator-confirm / reminder-scheduler gates the base filter
+// applies. A headless run (no confirmPermission / reminderScheduler) hides
+// memory_write / reminder_* via those gates even when revealed — so advertising
+// them in the catalog or "revealing" them via tool_search would dead-end the
+// model on a tool that never enters the surface. Single source of truth for both
+// the catalog and the searchTools reveal pool, so the two can't diverge from the
+// base filter.
+const availableDeferredTools = (config: HarnessConfig) =>
+  config.toolRegistry
+    .list()
+    .filter(
+      (t) =>
+        t.metadata.deferred === true &&
+        (config.confirmPermission !== undefined || t.metadata.requiresOperatorConfirm !== true) &&
+        (config.reminderScheduler !== undefined || t.metadata.requiresReminderScheduler !== true),
+    );
+
 // A `requiresOperatorConfirm` tool can only run where an operator
 // surface is wired: the REPL wires the confirm hooks (confirmPermission
 // + clarify + the memory confirms), while headless one-shot / SDK
@@ -204,7 +237,10 @@ const exitToHarnessStatus: Record<ExitReason, HarnessResult['status']> = {
 // REPL, never by `run.ts`), so gate on it: the model only sees these
 // tools when they can actually resolve, and otherwise falls back to
 // recording the assumption.
-export const buildToolDefs = (config: HarnessConfig): ProviderToolDef[] => {
+export const buildToolDefs = (
+  config: HarnessConfig,
+  revealed?: ReadonlySet<string>,
+): ProviderToolDef[] => {
   const operatorPresent = config.confirmPermission !== undefined;
   // The reminder family only resolves against a session-scoped scheduler
   // (ORCHESTRATION.md §3B.9), which only the interactive REPL builds — a
@@ -213,13 +249,35 @@ export const buildToolDefs = (config: HarnessConfig): ProviderToolDef[] => {
   // tool the model would only get `scheduler_unavailable` from. Same
   // shape as the operator-confirm gate above.
   const reminderAvailable = config.reminderScheduler !== undefined;
+  // Deferred tools (AGENTIC_CLI §7.6) leave the base surface until `tool_search`
+  // reveals them; `revealed` is sticky for the session, so a tool fetched in one
+  // turn rides every later turn's list. Only at the TOP LEVEL — a subagent
+  // (depth > 0) runs against a registry already narrowed to its `tools[]`
+  // whitelist, which IS the curation, so a whitelisted-but-deferred tool must
+  // stay directly visible (no tool_search round-trip in a headless child).
+  const applyDeferral = (config.subagentDepth ?? 0) === 0;
+  // Catalog appended to tool_search's description: the deferred tools NOT yet
+  // revealed (name + one-line blurb), generated from the registry so it never
+  // drifts from what's actually deferred. This is how the model learns what it
+  // can search for. Empty when nothing is deferred (or in a subagent) — then
+  // tool_search carries only its base description.
+  const catalogTools = applyDeferral
+    ? availableDeferredTools(config).filter((t) => revealed?.has(t.name) !== true)
+    : [];
+  const catalog =
+    catalogTools.length > 0
+      ? `\n\nDeferred tools — search to reveal, then call (stays available for the session):\n${catalogTools
+          .map((t) => `- ${t.name} — ${toolBlurb(t.description)}`)
+          .join('\n')}`
+      : '';
   return config.toolRegistry
     .list()
     .filter((t) => operatorPresent || t.metadata.requiresOperatorConfirm !== true)
     .filter((t) => reminderAvailable || t.metadata.requiresReminderScheduler !== true)
+    .filter((t) => !applyDeferral || t.metadata.deferred !== true || revealed?.has(t.name) === true)
     .map((t) => ({
       name: t.name,
-      description: t.description,
+      description: t.name === 'tool_search' ? `${t.description}${catalog}` : t.description,
       input_schema: t.inputSchema,
     }));
 };
@@ -248,7 +306,41 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   let ctx: SessionContext | undefined;
   // Resume-truncation diagnostics captured by hydrateFromDb (resume path).
   let hydrateInfo: HydrateInfo | null = null;
-  const tools = buildToolDefs(config);
+  // Deferred-tool surface (AGENTIC_CLI §7.6). `revealed` accumulates the tools
+  // tool_search has surfaced; `tools` is rebuilt from base+revealed whenever it
+  // grows (sticky). `toolsDirty` defers the rebuild to the top of the next
+  // iteration so a reveal mid-step takes effect on the next provider call — one
+  // cache invalidation per fetch, then stable.
+  // Sourced from config so a multi-turn caller (REPL) injects ONE set and reveals
+  // stay sticky ACROSS turns (each turn re-runs runAgent); a one-shot run gets a
+  // fresh per-run set — sticky within that run. Same contract as todoStore.
+  const revealed = config.revealedTools ?? new Set<string>();
+  let toolsDirty = false;
+  let tools = buildToolDefs(config, revealed);
+  // Search + reveal closure wired into ctx.searchTools at the top level only.
+  // Ranking is the pure `rankDeferredTools` (unit-tested); here we just map the
+  // matched names back to live tools, REVEAL them (sticky → `toolsDirty` forces
+  // a rebuild next iteration), and return wire hits so the model gets the
+  // schemas in the result.
+  const searchTools = (query: string): SearchToolsResult => {
+    // Same gated pool as the catalog: a deferred tool the operator/reminder gates
+    // would still drop is not revealable (else `select:memory_write` headless
+    // returns a fake hit the surface never honors).
+    const deferred = availableDeferredTools(config);
+    const { names, notFound } = rankDeferredTools(deferred, query);
+    const byName = new Map(deferred.map((t) => [t.name, t]));
+    const hits: ToolSearchHit[] = [];
+    for (const name of names) {
+      const tool = byName.get(name);
+      if (tool === undefined) continue;
+      if (!revealed.has(name)) {
+        revealed.add(name);
+        toolsDirty = true;
+      }
+      hits.push({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema });
+    }
+    return { tools: hits, notFound };
+  };
   const recentToolHashes: string[] = [];
   const HASH_WINDOW = 5;
 
@@ -2639,6 +2731,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           if (overage !== null) return await finish('maxCostUsd', overage);
         }
 
+        // Rebuild the tool surface if tool_search revealed new tools last step
+        // (AGENTIC_CLI §7.6). `revealed` only grows, so this fires once per fetch
+        // and then stays put — the base prefix stays cache-stable between fetches.
+        // MUST run before maybeCompact: the compaction gate estimates prompt size
+        // from `tools`, so a stale (pre-reveal, smaller) array could skip
+        // compaction near the threshold while the actual request below carries
+        // the just-revealed schema (e.g. retrieve_context ~0.5k) and tips over.
+        if (toolsDirty) {
+          tools = buildToolDefs(config, revealed);
+          toolsDirty = false;
+        }
+
         // Compact BEFORE the provider call when over threshold (see
         // maybeCompact above). Runs every iteration, so it covers the first
         // call of a resumed/long session — the post-tool-result-only site
@@ -3027,6 +3131,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           permissions: config.permissionEngine.view(),
           permissionCheck: (toolName, category, args) =>
             config.permissionEngine.check(toolName, category, args),
+          // Deferred-tool reveal (AGENTIC_CLI §7.6), top level only — a subagent
+          // runs a pre-narrowed whitelist (the curation), so nothing is deferred
+          // and tool_search has nothing to reveal there.
+          ...((config.subagentDepth ?? 0) === 0 ? { searchTools } : {}),
           todoStore,
           workingStateStore,
           // Session-monotonic step number for working-state staleness stamps

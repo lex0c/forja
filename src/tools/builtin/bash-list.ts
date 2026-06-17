@@ -49,6 +49,8 @@ export const bashListTool: Tool<BashListInput, BashListOutput> = {
     required: [],
   },
   metadata: {
+    // Deferred (AGENTIC_CLI §7.6): rare bg-job management; reached via tool_search.
+    deferred: true,
     // 'misc', not 'bash': like bash_output/bash_kill, this carries no
     // `args.command`, so the bash policy gate (which requires one)
     // would default-deny. A read-only snapshot of already-spawned

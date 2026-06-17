@@ -2,6 +2,121 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-17] tool_search review fix: rebuild revealed tools BEFORE the compaction gate
+
+Review finding. The loop ran maybeCompact() (which estimates prompt size from
+`tools`) BEFORE the toolsDirty rebuild. So on the step after a tool_search reveal,
+the compaction gate estimated against the stale (pre-reveal, smaller) tools array
+while the actual provider request below carried the just-revealed schema (e.g.
+retrieve_context ~0.5k). Near the threshold this could skip compaction on a turn
+that should have compacted — self-correcting next iteration (maybeCompact reruns
+with the rebuilt tools), but a real one-turn over-threshold window. Fix: move the
+rebuild above maybeCompact so the estimate counts the revealed schema. Pure
+reorder (rebuild touches only `tools`, maybeCompact only messages — independent),
+both still precede the provider call. No bespoke test added: the trigger is
+token-count-coupled (a near-threshold-after-reveal loop test would be brittle for
+its value) and the loop-level maybeCompact gate isn't unit-tested by any existing
+suite; the invariant is now textual (rebuild precedes maybeCompact) + documented.
+Regression: sticky/events/compaction/tool-surface/tool-search green (73).
+
+## [2026-06-17] tool_search review fix (P1): make reveals sticky ACROSS REPL turns
+
+The `revealed` set was a per-run `const` inside runAgent. The REPL re-runs
+runAgent every turn (preserving only sessionContext), so a tool_search reveal
+lasted only within that turn — next turn it vanished from the surface and needed
+re-searching, violating the documented "sticky for the session" contract
+(types.ts / §7.6) AND the rare-fetch cache invariant (re-search every turn = a
+cache invalidation every turn). Classic repl-is-a-parallel-consumer miss.
+
+Fix: thread the set through HarnessConfig.revealedTools, exactly like
+todoStore/workingStateStore — the REPL builds ONE Set at boot and injects it into
+every turn's config; runAgent does `config.revealedTools ?? new Set()` (one-shot
+runs get a fresh per-run set, sticky within the run). The set is mutated in place
+by the loop's searchTools, so reveals accumulate in the REPL-held object across
+turns. Test (tests/harness/tool-search-sticky.test.ts) drives the real loop two
+turns with a shared set + a recording provider: turn 1 reveals retrieve_context
+via tool_search (absent on call 1, present on the rebuilt call 2), the set
+persists, and turn 2's fresh runAgent offers it from the first provider call with
+no re-search; control asserts a deferred tool is absent without the set.
+
+## [2026-06-17] tool_search review fix: gate the catalog/reveal pool like the base surface
+
+Code-review blocker (verified). The catalog (buildToolDefs) and the searchTools
+reveal pool selected deferred tools by `metadata.deferred === true` ALONE, but the
+base surface filter also applies the operator-confirm and reminder-scheduler
+gates. memory_write is deferred + requiresOperatorConfirm; reminder_list/cancel
+are deferred + requiresReminderScheduler. In a headless/SDK run (no
+confirmPermission/reminderScheduler, top level) the catalog advertised those
+tools and searchTools "revealed" them with an apparent-success hit, yet the base
+filter kept dropping them via the gates — they never entered the tools array. A
+dead-end: the model spends turns discovering/revealing a tool that never appears.
+(The base surface itself never leaked the gated tool — the gates are AND-ed
+before the deferral check — so it was a wasted-turns / misleading-surface bug, not
+a confinement hole.) Fix: a single `availableDeferredTools(config)` helper =
+deferred AND past the same operator/reminder gates, used by BOTH the catalog and
+the searchTools pool, so neither can diverge from the base filter. Headless test
+added (the prior tests always wired both surfaces, so the overlap was unexercised).
+Also: dropped the unconditional "listed below" from tool_search's static
+description (a subagent gets no catalog) → conditional phrasing. Confirmed the
+subagent depth>0 deferral-bypass is safe: a subagent builds its OWN registry from
+its tools[] whitelist (subprocess, runtime.ts), so buildToolDefs there operates on
+an already-narrowed registry — the bypass shows the whitelist, not a full surface.
+
+## [2026-06-17] tool_search: implement the on-demand tool surface (§7.6 code)
+
+Built the deferred-tool surface the §7.6 spec fixed. (1) `deferred?: boolean` on
+ToolMetadata, same pattern as the existing requiresOperatorConfirm/
+requiresReminderScheduler surface gates; 13 tools opt in (bash_kill/list,
+task_sync/cancel/list, memory_list/write, retrieve_context, todo_clear,
+skill_list/show, reminder_list/cancel). (2) buildToolDefs filters deferred from
+the base surface, but ONLY at the top level — a subagent (depth > 0) runs a
+pre-narrowed whitelist that is already the curation, so it sees all its
+whitelisted tools directly. It also injects a generated catalog (name + one-line
+blurb of the unrevealed deferred tools) into tool_search's description, so the
+list never drifts from what's actually deferred. (3) `tool_search` builtin
+(visible): keyword ranking + `select:name1,name2`, ranking extracted to the pure
+`rankDeferredTools` for unit-testing; returns matched schemas in the result and
+reveals them via ctx.searchTools. (4) loop wiring: a sticky `revealed` set, a
+ctx.searchTools closure (top level only), and a per-iteration rebuild of the
+tools array when a fetch grew the set — one cache invalidation per fetch, then
+stable. Tests: tests/tools/tool-search.test.ts (ranking + select + tool execute)
+and tests/harness/tool-surface.test.ts (deferral filter, sticky reveal, subagent
+bypass, catalog generation); bootstrap exact-list updated (+tool_search; deferred
+tools stay registered). Model-in-the-loop gate: evals/tool-search (keyword +
+select discovery of a deferred tool) — written, not yet run.
+
+git_apply_patch stays VISIBLE (the operator's original curation) alongside
+write_file/edit_file: it's a write primitive, and deferring it would have made
+the edit-format eval's patch cases secretly test tool discovery, conflating that
+eval's edit-vs-patch purpose. The tool-search eval uses todo_clear as its
+headless-safe deferred example instead.
+
+## [2026-06-17] tool_search: spec contract for an on-demand tool surface (§7.6)
+
+The model-facing surface grew to ~36 tools (~9k tokens of schema). Two costs,
+and the first isn't the real one: tokens are small + cached (the real cost lever
+is tool OUTPUT, OUTPUT_POLICY), but the SELECTION cost is real — principle 3 (§1,
+"10 well-designed beat 40 generic") says a large surface degrades tool choice,
+especially on weaker models (the same reason pin_context/wait_for/monitor were
+withdrawn). Plan: a two-tier surface — a curated visible core + a deferred set
+reachable via a `tool_search` tool, mirroring the description-based progressive
+disclosure the spec already blesses for skills/subagents/MCP (RETRIEVAL.md:104).
+
+Step 1 (this entry): spec PR first per CLAUDE.md. Added AGENTIC_CLI §7.6 —
+normative MECHANISM (deferred metadata flag; tool_search returns schemas in the
+tool RESULT, never rewriting the base `tools` array; sticky reveal; catalog of
+name+blurb embedded in tool_search's description; the cache invariant that the
+win only exists if fetches stay rare, so the visible core must cover the common
+path and no mandatory follow-up may be deferred — a visible primary without its
+satellite like bash_background sans bash_output is a footgun) and the v1 split as
+illustrative-not-normative (so catalog tweaks don't need a spec PR, per the
+seed-pack precedent). Out of v1: satellite auto-reveal (curation avoids orphans)
+and modal consolidation of over-split families (bash_job{action} etc. — pure
+principle-3, but a separate API refactor). Eval-gated (principle 4): discovery +
+fetch-rate + completion decide, not guesswork. Code (registry flag, tool_search
+builtin, loop revealed-set, eval, bootstrap-list update) follows after the spec
+lands.
+
 ## [2026-06-17] Symlink confinement: follow symlinked ANCESTORS in dangling targets
 
 Follow-up review finding on the dangling-symlink fix. The fix's final fallback

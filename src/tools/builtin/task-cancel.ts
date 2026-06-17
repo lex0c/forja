@@ -36,6 +36,9 @@ export const taskCancelTool: Tool<TaskCancelInput, TaskCancelOutput> = {
     required: ['handle_id'],
   },
   metadata: {
+    // Deferred (AGENTIC_CLI §7.6): rare async-subagent management; task/
+    // task_async/task_await stay visible. Reached via tool_search.
+    deferred: true,
     category: 'misc',
     writes: false,
     idempotent: true,

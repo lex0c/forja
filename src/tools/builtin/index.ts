@@ -32,6 +32,7 @@ import { todoCreateTool } from './todo-create.ts';
 import { todoGetTool } from './todo-get.ts';
 import { todoListTool } from './todo-list.ts';
 import { todoUpdateTool } from './todo-update.ts';
+import { toolSearchTool } from './tool-search.ts';
 import { workingStateUpdateTool } from './working-state-update.ts';
 import { writeFileTool } from './write-file.ts';
 
@@ -109,6 +110,8 @@ export type { TodoListInput, TodoListOutput } from './todo-list.ts';
 export { todoUpdateTool } from './todo-update.ts';
 export type { TodoUpdateInput, TodoUpdateOutput } from './todo-update.ts';
 export type { TodoWireItem } from './todo-shared.ts';
+export { toolSearchTool } from './tool-search.ts';
+export type { ToolSearchInput } from './tool-search.ts';
 export { workingStateUpdateTool } from './working-state-update.ts';
 export type {
   WorkingStateUpdateInput,
@@ -139,6 +142,9 @@ export const BUILTIN_TOOLS = [
   skillListTool,
   skillShowTool,
   skillInvokeTool,
+  // tool_search — reveals deferred tools (AGENTIC_CLI §7.6). Read-only
+  // discovery; always visible (it's how the model reaches the deferred set).
+  toolSearchTool,
   // wait_for / monitor are intentionally NOT registered: the model
   // should not see or call them. The tool modules, their re-exports
   // below, and the underlying `src/wait/` subsystem stay intact —

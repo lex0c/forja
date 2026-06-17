@@ -45,6 +45,9 @@ export const skillShowTool: Tool<SkillShowInput, SkillShowOutput> = {
     required: ['name'],
   },
   metadata: {
+    // Deferred (AGENTIC_CLI §7.6): skill detail view; skill_invoke is the
+    // visible entry point. Reached via tool_search.
+    deferred: true,
     category: 'misc',
     writes: false,
     idempotent: true,

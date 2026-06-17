@@ -48,6 +48,9 @@ export const todoClearTool: Tool<TodoClearInput, TodoClearOutput> = {
     },
   },
   metadata: {
+    // Deferred (AGENTIC_CLI §7.6): rare todo op; list/get/create/update stay
+    // visible. Reached via tool_search.
+    deferred: true,
     category: 'misc',
     writes: false,
     idempotent: true,

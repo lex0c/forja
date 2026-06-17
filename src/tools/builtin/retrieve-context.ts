@@ -187,6 +187,9 @@ export const retrieveContextTool: Tool<RetrieveContextInput, RetrieveContextOutp
     required: ['query'],
   },
   metadata: {
+    // Deferred (AGENTIC_CLI §7.6): the heaviest schema; memory_read/search
+    // cover most needs. The retrieval pipeline is reached via tool_search.
+    deferred: true,
     category: 'misc',
     writes: false,
     idempotent: true,
