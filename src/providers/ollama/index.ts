@@ -1,3 +1,4 @@
+import { boolFromEnv } from '../env.ts';
 import { estimateMessagesTokens } from '../tokens.ts';
 import type {
   ConstrainedRequest,
@@ -117,12 +118,18 @@ export const createOllamaProvider = (
   const numCtx = options.numCtx ?? numCtxFromEnv();
   const keepAlive = options.keepAlive ?? keepAliveFromEnv();
 
+  // Reasoning replay: thinking-capable models round-trip the model's `thinking`
+  // on tool follow-ups (Ollama's tool-calling guidance). Default on, gated on the
+  // model's reasoning surface; FORJA_OLLAMA_REASONING_REPLAY=0 opts out.
+  const reasoningReplay =
+    caps.supports_reasoning_effort === true && boolFromEnv('FORJA_OLLAMA_REASONING_REPLAY', true);
+
   // Shared request builder for both paths. `format` is added only by the
   // constrained path; the streaming path leaves it unset.
   const buildBody = (req: GenerateRequest): OllamaChatRequest => {
     const body: OllamaChatRequest = {
       model: modelName,
-      messages: toOllamaMessages(req),
+      messages: toOllamaMessages(req, reasoningReplay),
       options: ollamaOptions(req, caps, numCtx),
     };
     const tools = toOllamaTools(req.tools);
@@ -190,9 +197,10 @@ export const createOllamaProvider = (
     id: `ollama/${modelName}`,
     family: 'ollama',
     capabilities: caps,
-    // Ollama has no reasoning-replay channel; reasoning blocks are dropped on
-    // send (toOllamaMessages), so the token estimator must not count them.
-    replaysReasoning: false,
+    // Reasoning replay round-trips the model's `thinking` on tool follow-ups for
+    // thinking-capable models (gated above). Off ⇒ toOllamaMessages drops
+    // reasoning blocks and the estimator skips them.
+    replaysReasoning: reasoningReplay,
     generate,
     generateConstrained,
     // Char-based estimate via the shared helper. Deliberately NOT calibrated
@@ -201,6 +209,6 @@ export const createOllamaProvider = (
     // so folding it in would inflate the count with fixed overhead. The shared
     // estimator is the same approximation every adapter uses.
     countTokens: (messages: ProviderMessage[]): Promise<number> =>
-      Promise.resolve(estimateMessagesTokens(messages, { countReasoning: false })),
+      Promise.resolve(estimateMessagesTokens(messages, { countReasoning: reasoningReplay })),
   };
 };

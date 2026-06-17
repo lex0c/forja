@@ -26,6 +26,7 @@ export async function* normalizeOllamaStream(
   chunks: AsyncIterable<OllamaChatResponse>,
 ): AsyncIterable<StreamEvent> {
   let started = false;
+  let thinkingText = '';
   const toolCalls: OllamaToolCall[] = [];
   let final: OllamaChatResponse | undefined;
 
@@ -41,7 +42,10 @@ export async function* normalizeOllamaStream(
     const msg = chunk.message as OllamaMessage | undefined;
     if (msg !== undefined) {
       if (msg.thinking !== undefined && msg.thinking.length > 0) {
+        // thinking_delta is UI-only; also accumulate for the reasoning block
+        // emitted at the end (collectStep persists `reasoning`, not thinking_delta).
         yield { kind: 'thinking_delta', text: msg.thinking };
+        thinkingText += msg.thinking;
       }
       // `content` is typed string, but a tool-call-only chunk may omit it.
       if (typeof msg.content === 'string' && msg.content.length > 0) {
@@ -76,6 +80,14 @@ export async function* normalizeOllamaStream(
       retryable: false,
     };
     return;
+  }
+
+  // Capture the turn's thinking as an opaque reasoning block so it round-trips on
+  // the next tool follow-up (Ollama's tool-calling guidance: gather thinking +
+  // content + tool_calls for the follow-up). Emitted before tool_use so it leads
+  // the assistant turn; the replay gate lives in toOllamaMessages.
+  if (thinkingText.length > 0) {
+    yield { kind: 'reasoning', provider: 'ollama', data: { thinking: thinkingText } };
   }
 
   for (const [i, call] of toolCalls.entries()) {

@@ -225,6 +225,11 @@ describe('createOllamaProvider', () => {
     await expect(p.generateConstrained(reqCon({}))).rejects.toThrow(/empty content/);
   });
 
+  test('replaysReasoning is on for a thinking model, off for a coder model', () => {
+    expect(createOllamaProvider('qwen3:8b').replaysReasoning).toBe(true);
+    expect(createOllamaProvider('qwen2.5-coder:14b').replaysReasoning).toBe(false);
+  });
+
   test('keep_alive from FORJA_OLLAMA_KEEP_ALIVE coerces a bare integer to a number', async () => {
     const saved = process.env.FORJA_OLLAMA_KEEP_ALIVE;
     process.env.FORJA_OLLAMA_KEEP_ALIVE = '300';

@@ -168,6 +168,47 @@ describe('toOllamaMessages', () => {
     expect(out).toHaveLength(1);
     expect(out[0]).toEqual({ role: 'assistant', content: 'done' });
   });
+
+  test('reasoning block → message.thinking when replay is on', () => {
+    const out = toOllamaMessages(
+      req({
+        messages: [
+          {
+            role: 'assistant',
+            content: [
+              { type: 'reasoning', provider: 'ollama', data: { thinking: 'let me think' } },
+              { type: 'text', text: 'answer' },
+              { type: 'tool_use', id: 't1', name: 'read_file', input: { path: 'a' } },
+            ],
+          },
+        ],
+      }),
+      true,
+    );
+    expect(out[0]).toEqual({
+      role: 'assistant',
+      content: 'answer',
+      thinking: 'let me think',
+      tool_calls: [{ function: { name: 'read_file', arguments: { path: 'a' } } }],
+    });
+  });
+
+  test('reasoning block dropped when replay is off (default)', () => {
+    const out = toOllamaMessages(
+      req({
+        messages: [
+          {
+            role: 'assistant',
+            content: [
+              { type: 'reasoning', provider: 'ollama', data: { thinking: 'x' } },
+              { type: 'text', text: 'answer' },
+            ],
+          },
+        ],
+      }),
+    );
+    expect(out[0]).toEqual({ role: 'assistant', content: 'answer' });
+  });
 });
 
 describe('toOllamaTools', () => {

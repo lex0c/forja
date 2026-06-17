@@ -17,7 +17,10 @@ export const DEFAULT_OLLAMA_NUM_CTX = 32_768;
 // message list. Internal roles are only user/assistant; `system` comes from the
 // request field, and `tool_result` blocks become standalone `role:'tool'`
 // messages. Reasoning blocks are dropped (Ollama has no reasoning-replay channel).
-export const toOllamaMessages = (req: GenerateRequest): OllamaMessage[] => {
+export const toOllamaMessages = (
+  req: GenerateRequest,
+  reasoningReplay = false,
+): OllamaMessage[] => {
   const out: OllamaMessage[] = [];
 
   const sys = req.systemSegments ? flattenSystemSegments(req.systemSegments) : req.system;
@@ -32,6 +35,7 @@ export const toOllamaMessages = (req: GenerateRequest): OllamaMessage[] => {
     }
 
     let text = '';
+    let thinking = '';
     const toolCalls: OllamaToolCall[] = [];
 
     for (const block of msg.content) {
@@ -56,13 +60,30 @@ export const toOllamaMessages = (req: GenerateRequest): OllamaMessage[] => {
           break;
         }
         case 'reasoning':
-          // Dropped — Ollama doesn't replay reasoning (replaysReasoning: false).
+          // Round-trip the model's thinking on tool follow-ups when replay is on
+          // (Ollama's tool-calling guidance). The block is the opaque
+          // { thinking: string } the stream normalizer captured; foreign-tagged
+          // blocks and the replay-off case fall through to a drop.
+          if (
+            reasoningReplay &&
+            block.provider === 'ollama' &&
+            block.data !== null &&
+            typeof block.data === 'object'
+          ) {
+            const t = (block.data as { thinking?: unknown }).thinking;
+            if (typeof t === 'string') {
+              thinking += t;
+            }
+          }
           break;
       }
     }
 
-    if (text.length > 0 || toolCalls.length > 0) {
+    if (text.length > 0 || toolCalls.length > 0 || thinking.length > 0) {
       const m: OllamaMessage = { role: msg.role, content: text };
+      if (thinking.length > 0) {
+        m.thinking = thinking;
+      }
       if (toolCalls.length > 0) {
         m.tool_calls = toolCalls;
       }

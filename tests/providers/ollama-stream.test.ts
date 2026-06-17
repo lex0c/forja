@@ -86,10 +86,17 @@ describe('normalizeOllamaStream', () => {
       'start',
       'thinking_delta',
       'text_delta',
+      'reasoning',
       'usage',
       'stop',
     ]);
     expect(ev[1]).toEqual({ kind: 'thinking_delta', text: 'because' });
+    // thinking is also captured as a reasoning block for tool follow-up replay.
+    expect(ev.find((e) => e.kind === 'reasoning')).toEqual({
+      kind: 'reasoning',
+      provider: 'ollama',
+      data: { thinking: 'because' },
+    });
   });
 
   test('empty content emits no text_delta', async () => {
