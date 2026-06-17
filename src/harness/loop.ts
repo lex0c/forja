@@ -2731,6 +2731,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           if (overage !== null) return await finish('maxCostUsd', overage);
         }
 
+        // Rebuild the tool surface if tool_search revealed new tools last step
+        // (AGENTIC_CLI §7.6). `revealed` only grows, so this fires once per fetch
+        // and then stays put — the base prefix stays cache-stable between fetches.
+        // MUST run before maybeCompact: the compaction gate estimates prompt size
+        // from `tools`, so a stale (pre-reveal, smaller) array could skip
+        // compaction near the threshold while the actual request below carries
+        // the just-revealed schema (e.g. retrieve_context ~0.5k) and tips over.
+        if (toolsDirty) {
+          tools = buildToolDefs(config, revealed);
+          toolsDirty = false;
+        }
+
         // Compact BEFORE the provider call when over threshold (see
         // maybeCompact above). Runs every iteration, so it covers the first
         // call of a resumed/long session — the post-tool-result-only site
@@ -2738,14 +2750,6 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         {
           const compactOverage = await maybeCompact();
           if (compactOverage !== null) return await finish('maxCostUsd', compactOverage);
-        }
-
-        // Rebuild the tool surface if tool_search revealed new tools last step
-        // (AGENTIC_CLI §7.6). `revealed` only grows, so this fires once per fetch
-        // and then stays put — the base prefix stays cache-stable between fetches.
-        if (toolsDirty) {
-          tools = buildToolDefs(config, revealed);
-          toolsDirty = false;
         }
 
         steps += 1;

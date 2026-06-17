@@ -2,6 +2,23 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-17] tool_search review fix: rebuild revealed tools BEFORE the compaction gate
+
+Review finding. The loop ran maybeCompact() (which estimates prompt size from
+`tools`) BEFORE the toolsDirty rebuild. So on the step after a tool_search reveal,
+the compaction gate estimated against the stale (pre-reveal, smaller) tools array
+while the actual provider request below carried the just-revealed schema (e.g.
+retrieve_context ~0.5k). Near the threshold this could skip compaction on a turn
+that should have compacted — self-correcting next iteration (maybeCompact reruns
+with the rebuilt tools), but a real one-turn over-threshold window. Fix: move the
+rebuild above maybeCompact so the estimate counts the revealed schema. Pure
+reorder (rebuild touches only `tools`, maybeCompact only messages — independent),
+both still precede the provider call. No bespoke test added: the trigger is
+token-count-coupled (a near-threshold-after-reveal loop test would be brittle for
+its value) and the loop-level maybeCompact gate isn't unit-tested by any existing
+suite; the invariant is now textual (rebuild precedes maybeCompact) + documented.
+Regression: sticky/events/compaction/tool-surface/tool-search green (73).
+
 ## [2026-06-17] tool_search review fix (P1): make reveals sticky ACROSS REPL turns
 
 The `revealed` set was a per-run `const` inside runAgent. The REPL re-runs
