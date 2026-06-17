@@ -1,5 +1,6 @@
 import { registerAnthropicModels } from './anthropic/register.ts';
 import { registerGoogleModels } from './google/register.ts';
+import { registerOllamaModels } from './ollama/register.ts';
 import { registerOpenAIModels } from './openai/register.ts';
 import type { Provider, ProviderCapabilities, ProviderFamily } from './types.ts';
 
@@ -46,13 +47,14 @@ export const createRegistry = (): ModelRegistry => {
   };
 };
 
-// Default registry for M1: Anthropic + Google + OpenAI. Adding a new family
+// Default registry: Anthropic + Google + Ollama + OpenAI. Adding a new family
 // is one new register*Models import + one call below; the rest lives in
 // the adapter folder.
 export const createDefaultRegistry = (): ModelRegistry => {
   const reg = createRegistry();
   registerAnthropicModels(reg);
   registerGoogleModels(reg);
+  registerOllamaModels(reg);
   registerOpenAIModels(reg);
   return reg;
 };

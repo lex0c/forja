@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { ANTHROPIC_MODEL_NAMES } from '../../src/providers/anthropic/capabilities.ts';
 import { GOOGLE_MODEL_NAMES } from '../../src/providers/google/capabilities.ts';
+import { OLLAMA_MODEL_NAMES } from '../../src/providers/ollama/capabilities.ts';
 import { OPENAI_MODEL_NAMES } from '../../src/providers/openai/capabilities.ts';
 import {
   type ModelEntry,
@@ -90,6 +91,13 @@ describe('createDefaultRegistry', () => {
     expect(reg.has('openai/gpt-4o-mini')).toBe(true);
   });
 
+  test('contains the Ollama lineup', () => {
+    const reg = createDefaultRegistry();
+    expect(reg.has('ollama/qwen2.5-coder:14b')).toBe(true);
+    expect(reg.has('ollama/qwen3-coder:30b')).toBe(true);
+    expect(reg.has('ollama/gpt-oss:20b')).toBe(true);
+  });
+
   test('every model in each caps table is registered exactly once', () => {
     const reg = createDefaultRegistry();
     for (const modelName of ANTHROPIC_MODEL_NAMES) {
@@ -101,8 +109,14 @@ describe('createDefaultRegistry', () => {
     for (const modelName of OPENAI_MODEL_NAMES) {
       expect(reg.has(`openai/${modelName}`)).toBe(true);
     }
+    for (const modelName of OLLAMA_MODEL_NAMES) {
+      expect(reg.has(`ollama/${modelName}`)).toBe(true);
+    }
     expect(reg.list()).toHaveLength(
-      ANTHROPIC_MODEL_NAMES.length + GOOGLE_MODEL_NAMES.length + OPENAI_MODEL_NAMES.length,
+      ANTHROPIC_MODEL_NAMES.length +
+        GOOGLE_MODEL_NAMES.length +
+        OPENAI_MODEL_NAMES.length +
+        OLLAMA_MODEL_NAMES.length,
     );
   });
 
@@ -139,7 +153,18 @@ describe('createDefaultRegistry', () => {
     expect(provider.capabilities).toEqual(entry.capabilities);
   });
 
-  test('all default entries can be instantiated with just an apiKey', () => {
+  test('Ollama entry: factory builds a provider with no API key (local)', () => {
+    const reg = createDefaultRegistry();
+    const entry = reg.get('ollama/qwen2.5-coder:14b');
+    expect(entry).not.toBeNull();
+    if (entry === null) return;
+    const provider = entry.factory();
+    expect(provider.id).toBe(entry.id);
+    expect(provider.family).toBe('ollama');
+    expect(provider.capabilities).toEqual(entry.capabilities);
+  });
+
+  test('all cloud default entries can be instantiated with just an apiKey', () => {
     const reg = createDefaultRegistry();
     for (const entry of reg.list()) {
       expect(() => entry.factory({ apiKey: 'k-test' })).not.toThrow();

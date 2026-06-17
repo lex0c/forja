@@ -1,0 +1,130 @@
+import { describe, expect, test } from 'bun:test';
+import type { OllamaChatResponse } from '../../src/providers/ollama/http.ts';
+import { normalizeOllamaResponse } from '../../src/providers/ollama/stream.ts';
+
+const res = (over: Partial<OllamaChatResponse>): OllamaChatResponse => ({
+  model: 'qwen2.5-coder:14b',
+  created_at: '2026-01-01T00:00:00Z',
+  message: { role: 'assistant', content: '' },
+  done: true,
+  ...over,
+});
+
+describe('normalizeOllamaResponse', () => {
+  test('text-only response → start, text_delta, usage, stop(end_turn)', () => {
+    const ev = normalizeOllamaResponse(
+      res({
+        message: { role: 'assistant', content: 'hello' },
+        done_reason: 'stop',
+        prompt_eval_count: 12,
+        eval_count: 4,
+      }),
+    );
+    expect(ev.map((e) => e.kind)).toEqual(['start', 'text_delta', 'usage', 'stop']);
+    expect(ev[1]).toEqual({ kind: 'text_delta', text: 'hello' });
+    expect(ev.at(-1)).toEqual({ kind: 'stop', reason: 'end_turn' });
+  });
+
+  test('start carries a message id (created_at)', () => {
+    const ev = normalizeOllamaResponse(res({ message: { role: 'assistant', content: 'x' } }));
+    expect(ev[0]).toEqual({ kind: 'start', message_id: '2026-01-01T00:00:00Z' });
+  });
+
+  test('thinking precedes text', () => {
+    const ev = normalizeOllamaResponse(
+      res({ message: { role: 'assistant', content: 'answer', thinking: 'because' } }),
+    );
+    expect(ev.map((e) => e.kind)).toEqual([
+      'start',
+      'thinking_delta',
+      'text_delta',
+      'usage',
+      'stop',
+    ]);
+    expect(ev[1]).toEqual({ kind: 'thinking_delta', text: 'because' });
+  });
+
+  test('empty content emits no text_delta', () => {
+    const ev = normalizeOllamaResponse(res({ message: { role: 'assistant', content: '' } }));
+    expect(ev.map((e) => e.kind)).toEqual(['start', 'usage', 'stop']);
+  });
+
+  test('tool call → start+stop pair with object args; stop reason tool_use', () => {
+    const ev = normalizeOllamaResponse(
+      res({
+        message: {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{ function: { name: 'read_file', arguments: { path: 'a.ts' } } }],
+        },
+        done_reason: 'stop',
+      }),
+    );
+    expect(ev.map((e) => e.kind)).toEqual([
+      'start',
+      'tool_use_start',
+      'tool_use_stop',
+      'usage',
+      'stop',
+    ]);
+    expect(ev[1]).toEqual({ kind: 'tool_use_start', id: 'ollama-0', name: 'read_file' });
+    expect(ev[2]).toEqual({ kind: 'tool_use_stop', id: 'ollama-0', final_args: { path: 'a.ts' } });
+    expect(ev.at(-1)).toEqual({ kind: 'stop', reason: 'tool_use' });
+  });
+
+  test('multiple tool calls get distinct synthetic ids', () => {
+    const ev = normalizeOllamaResponse(
+      res({
+        message: {
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            { function: { name: 'a', arguments: {} } },
+            { function: { name: 'b', arguments: {} } },
+          ],
+        },
+      }),
+    );
+    expect(ev.filter((e) => e.kind === 'tool_use_start')).toEqual([
+      { kind: 'tool_use_start', id: 'ollama-0', name: 'a' },
+      { kind: 'tool_use_start', id: 'ollama-1', name: 'b' },
+    ]);
+  });
+
+  test('usage maps prompt_eval_count/eval_count with cache zeroed', () => {
+    const ev = normalizeOllamaResponse(res({ prompt_eval_count: 100, eval_count: 25 }));
+    expect(ev.find((e) => e.kind === 'usage')).toEqual({
+      kind: 'usage',
+      usage: { input: 100, output: 25, cache_read: 0, cache_creation: 0 },
+    });
+  });
+
+  test('missing usage counts default to 0', () => {
+    const ev = normalizeOllamaResponse(res({ message: { role: 'assistant', content: 'x' } }));
+    expect(ev.find((e) => e.kind === 'usage')).toEqual({
+      kind: 'usage',
+      usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+    });
+  });
+
+  test('done_reason length → max_tokens', () => {
+    const ev = normalizeOllamaResponse(
+      res({ message: { role: 'assistant', content: 'x' }, done_reason: 'length' }),
+    );
+    expect(ev.at(-1)).toEqual({ kind: 'stop', reason: 'max_tokens' });
+  });
+
+  test('length truncation wins over tool_calls (max_tokens, not tool_use)', () => {
+    const ev = normalizeOllamaResponse(
+      res({
+        message: {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{ function: { name: 'read_file', arguments: { path: 'a' } } }],
+        },
+        done_reason: 'length',
+      }),
+    );
+    expect(ev.at(-1)).toEqual({ kind: 'stop', reason: 'max_tokens' });
+  });
+});
