@@ -107,4 +107,29 @@ describe('parseSingleFilePatch', () => {
     );
     expect(r).toEqual({ ok: true, path: 'f.txt' });
   });
+
+  test('rejects an appended metadata-only diff --git section for another path', () => {
+    // One authorized content hunk for allowed.txt + an empty-create section for
+    // created.txt that has NO ---/+++ pair — git apply would still create it.
+    const r = parseSingleFilePatch(
+      '--- a/allowed.txt\n+++ b/allowed.txt\n@@ -1 +1 @@\n-hello\n+HELLO\ndiff --git a/created.txt b/created.txt\nnew file mode 100644\nindex 0000000..0000000\n',
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('multi_file');
+  });
+
+  test('rejects a chmod (old mode/new mode) section', () => {
+    const r = parseSingleFilePatch(
+      'diff --git a/f.txt b/f.txt\nold mode 100644\nnew mode 100755\n',
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('mode_change');
+  });
+
+  test('a diff --git header matching the edited file is accepted', () => {
+    const r = parseSingleFilePatch(
+      'diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-a\n+b\n',
+    );
+    expect(r).toEqual({ ok: true, path: 'f.txt' });
+  });
 });

@@ -2,6 +2,26 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-16] sec(git_apply_patch): reject metadata-only diff sections (confinement bypass)
+
+Found + fixed a real confinement bypass in the single-file check. The parser
+counted only `---`/`+++` header pairs, but a `diff --git` section can carry ONLY
+metadata — a chmod (`old mode`/`new mode`) or an empty create/delete (`new file
+mode`/`deleted file mode` with no hunk) — which has NO header pair. So a patch
+with one authorized content hunk for the gated `path` could append a second
+`diff --git a/other b/other` metadata section: header-pair count stayed 1 (passed
+the single-file check) while `git apply --recount` happily applied the second
+section, letting `git_apply_patch({path:'allowed'})` create/chmod/delete a path
+the permission engine never gated. Reproduced: an appended `new file mode`
+section created a brand-new file. Fix: (1) reject `old mode`/`new mode` (chmod is
+not a content edit); (2) require every `diff --git` line to be the canonical
+header for the one edited file (`diff --git a/<path> b/<path>`) — any other
+section (different path, or an unparseable/quoted name) is refused. Fail-closed;
+the gated file is the only thing git can touch. Tests: parser rejects the
+appended-metadata and chmod shapes + accepts the matching git-format header; tool
+integration proves the out-of-scope path is NOT created and the gated file is
+untouched.
+
 ## [2026-06-16] tools: git_apply_patch — single-file, git-backed patch apply
 
 New builtin write tool: applies a single-file unified diff via `git apply`. Git

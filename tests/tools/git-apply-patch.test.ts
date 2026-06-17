@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { FileDiff } from '../../src/diff/line-diff.ts';
@@ -62,6 +62,24 @@ describe('gitApplyPatchTool', () => {
     );
     expect(isToolError(res)).toBe(false);
     expect(readFileSync(join(dir, 'f.txt'), 'utf8')).toBe('a\nB\nc\n');
+  });
+
+  test('rejects an appended metadata section that would touch another path (no confinement bypass)', async () => {
+    gitInit(dir);
+    writeFileSync(join(dir, 'allowed.txt'), 'hello\n');
+    // Content edit of the gated file + an appended empty-create of a path the
+    // permission engine never saw. git apply --recount would create it.
+    const attack =
+      '--- a/allowed.txt\n+++ b/allowed.txt\n@@ -1 +1 @@\n-hello\n+HELLO\ndiff --git a/created.txt b/created.txt\nnew file mode 100644\nindex 0000000..0000000\n';
+    const res = await gitApplyPatchTool.execute(
+      { path: 'allowed.txt', patch: attack },
+      makeCtx({ cwd: dir }),
+    );
+    expect(isToolError(res)).toBe(true);
+    if (isToolError(res)) expect(res.error_code).toBe(ERROR_CODES.patchUnsupported);
+    // The out-of-scope path was NOT created, and the gated file is untouched.
+    expect(existsSync(join(dir, 'created.txt'))).toBe(false);
+    expect(readFileSync(join(dir, 'allowed.txt'), 'utf8')).toBe('hello\n');
   });
 
   test('refuses outside a git work-tree (git.not_a_repo)', async () => {

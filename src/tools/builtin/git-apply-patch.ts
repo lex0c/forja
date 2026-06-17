@@ -25,7 +25,12 @@ const MAX_PATCH_BYTES = 10 * 1024 * 1024;
 // model can re-emit a valid patch); `unsupported` shapes are not (the operation
 // is out of scope for the single-file tool — switch to edit_file/write_file).
 const rejectToError = (reason: PatchRejectReason, message: string): ToolResult<never> => {
-  if (reason === 'multi_file' || reason === 'rename_or_copy' || reason === 'binary') {
+  if (
+    reason === 'multi_file' ||
+    reason === 'rename_or_copy' ||
+    reason === 'binary' ||
+    reason === 'mode_change'
+  ) {
     return toolError(ERROR_CODES.patchUnsupported, message, {
       retryable: false,
       hint: 'git_apply_patch is single-file and content-only. Use edit_file/write_file, or split into one patch per file.',

@@ -19,6 +19,7 @@ export type PatchRejectReason =
   | 'multi_file' // touches more than one file
   | 'rename_or_copy' // rename/copy — a second path the single-path gate can't see
   | 'binary' // binary patch — not a line-oriented content change
+  | 'mode_change' // chmod (old mode/new mode) — not a content edit
   | 'no_hunk'; // headers but no `@@` hunk (e.g. mode-only change)
 
 export type ParseGitPatchResult =
@@ -63,6 +64,18 @@ export const parseSingleFilePatch = (patch: string): ParseGitPatchResult => {
     }
     if (line.startsWith('GIT binary patch') || line.startsWith('Binary files ')) {
       return { ok: false, reason: 'binary', message: 'binary patches are not supported' };
+    }
+    // `old mode`/`new mode` = a chmod. Not a content edit, and a chmod-only
+    // section carries no ---/+++ pair, so the header-pair count below would
+    // miss it while `git apply` still applies it. Reject outright (a content
+    // diff never has these; `new file mode`/`deleted file mode`, which DO ride
+    // legit create/delete patches, are deliberately not matched here).
+    if (/^(old|new) mode /.test(line)) {
+      return {
+        ok: false,
+        reason: 'mode_change',
+        message: 'mode-change (chmod) patches are not supported (content edits only)',
+      };
     }
   }
 
@@ -120,6 +133,25 @@ export const parseSingleFilePatch = (patch: string): ParseGitPatchResult => {
       reason: 'no_path',
       message: 'could not resolve a target path from headers',
     };
+  }
+
+  // Every `diff --git a/X b/X` names a file `git apply` will act on. A
+  // metadata-only section (chmod, or an empty create/delete with `new file
+  // mode`/`deleted file mode` and NO hunk) carries no ---/+++ pair, so the
+  // header-pair count above misses it — yet `git apply --recount` still applies
+  // it, letting an appended section create/chmod/delete a path the permission
+  // engine never gated. Require every `diff --git` line to be the canonical
+  // header for the ONE edited file; anything else (a different path, or a
+  // quoted/spaced name we can't match) is a second section → refuse.
+  const canonical = `diff --git a/${path} b/${path}`;
+  for (const line of lines) {
+    if (line.startsWith('diff --git ') && line !== canonical) {
+      return {
+        ok: false,
+        reason: 'multi_file',
+        message: `patch has a 'diff --git' section other than the edited file '${path}'`,
+      };
+    }
   }
   return { ok: true, path };
 };
