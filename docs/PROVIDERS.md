@@ -57,9 +57,9 @@ interface Provider {
   observable effect today — a real tokenizer lands only when 4.9 wires
   `countTokens` into budgeting.
 
-The three implemented adapters live in `src/providers/{anthropic,openai,google}/`.
-`ProviderFamily` also declares `ollama`, `llama_cpp`, and `mistral` for the local
-/ future path; those have no catalog entries yet.
+The four implemented adapters live in `src/providers/{anthropic,openai,google,ollama}/`.
+`ProviderFamily` also declares `llama_cpp` and `mistral` for the future local path;
+those have no catalog entries yet.
 
 ---
 
@@ -78,6 +78,7 @@ The shipped catalogs (`<family>/capabilities.ts`):
 | **anthropic** | `claude-opus-4-8`, `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5` |
 | **openai** | `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex`, `gpt-4o`, `gpt-4o-mini` |
 | **google** | `gemini-3.5-flash`, `gemini-3.1-pro-preview`, `gemini-3.1-flash-lite`, `gemini-3-flash-preview`, `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite` |
+| **ollama** (local) | `qwen2.5-coder:7b/14b/32b`, `qwen3:8b/14b/30b`, `qwen3-coder:30b`, `llama3.1:8b`, `mistral-nemo:12b`, `gpt-oss:20b`, `devstral:24b` — all native tool calling, `$0` |
 
 Adding a model is usually a catalog entry (§8); the registry test
 (`tests/providers/registry.test.ts`) asserts every catalog model is registered
@@ -128,7 +129,7 @@ is responsible for accumulating them). `stop.reason` is `tool_use` when the turn
 emitted any tool call (so the loop continues), else `end_turn` / `max_tokens` /
 etc. Each adapter has its own normalizer: `anthropic/stream.ts`,
 `openai/stream.ts` (Chat Completions), `openai/responses-stream.ts` (Responses),
-`google/stream.ts`.
+`google/stream.ts`, `ollama/stream.ts` (native NDJSON).
 
 ---
 
@@ -211,6 +212,38 @@ via `toolConfig.functionCallingConfig {mode:'ANY'}`. Sampling gate present
 (`CachedContent`) is **not yet wired** — Gemini relies on whatever implicit
 caching the API does.
 
+### 5.4 Ollama (local, native `/api/chat`)
+
+`ollama/index.ts` — a native client (raw `fetch`, no SDK) on the daemon's
+`/api/chat`. `generate` streams the NDJSON chunk sequence and `ollama/stream.ts`
+normalizes it incrementally: `tool_use` is derived from the **accumulated**
+`tool_calls` (not just the final chunk), and a stream that ends without a `done`
+chunk becomes a typed `local.stream_incomplete` error rather than a fake
+zero-token turn. `generateConstrained` is single-shot with `format` (a full JSON
+Schema), failing fast on `done_reason: 'length'`. Ollama applies the chat template
+itself, so the adapter sends no dialect.
+
+- **Static curated catalog** (`ollama/capabilities.ts`) — only models with
+  **native** tool calling; capabilities are honest data (`tools: 'native'`,
+  `cache: false`, `vision: false`, cost `$0`). The formal tool-calling adapter for
+  non-native models is future work.
+- **`num_ctx`** is sent explicitly, capped at 32K (`DEFAULT_OLLAMA_NUM_CTX`) —
+  Ollama's own default truncates silently and its full window (up to 256K) would
+  OOM typical hardware; override with `FORJA_OLLAMA_NUM_CTX`.
+- **`effort` → `think`** (boolean) on thinking-capable models; `thinking_budget`
+  is the explicit on/off override (0 disables, >0 enables) and wins over `effort`.
+- **Probe / version-gate** (`ollama/probe.ts`): `probeOllama` (reachable + version
+  + pulled models) and `ollamaReadiness` (ok/warn/fail + remediation) — backs
+  `doctor` and the integration smoke's run-or-skip.
+- **Config (env):** `FORJA_OLLAMA_BASE_URL` (daemon host — point it at a remote /
+  LAN box), `FORJA_OLLAMA_NUM_CTX`, `FORJA_OLLAMA_KEEP_ALIVE` (model lifetime —
+  bare integer ⇒ seconds, Go duration `"5m"` ⇒ string), `FORJA_OLLAMA_HEADERS`
+  (extra HTTP headers as JSON, for remote/cloud auth).
+- **Defenses:** NDJSON framing with a line cap (anti-OOM) and `safeJsonParse`
+  (proto-pollution at the remote boundary); typed errors
+  (`local.daemon.unavailable` / `local.model.not_loaded`) with actionable hints;
+  abort cancels the in-flight fetch via the stream reader.
+
 ---
 
 ## 6. Cross-cutting conventions
@@ -236,6 +269,7 @@ coding/agentic sweet spot (Opus 4.7/4.8). Omitted for models that don't support 
 | Anthropic | explicit `cache_control` breakpoints (5min / 1h) | full control — Forja places the markers |
 | OpenAI | automatic prefix caching (+ opt-in 24h retention on supported models) | `prompt_cache_key` routing (both paths) |
 | Gemini | implicit | none wired yet (`CachedContent` pending) |
+| Ollama | none (local, `$0`) | n/a — no server-side cache |
 
 **Retry** is **shared, not per-adapter** — `src/harness/retry.ts` wraps the
 provider call at the harness level, so all families get the same policy: retry on
