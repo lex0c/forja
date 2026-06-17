@@ -5,15 +5,16 @@ import { registerBuiltinTools } from '../../src/tools/builtin/index.ts';
 import { createToolRegistry } from '../../src/tools/registry.ts';
 
 // Minimal config: buildToolDefs only reads toolRegistry + the operator/reminder
-// presence flags + subagentDepth. Both surfaces are "present" so the operator-
-// and reminder-gated tools aren't filtered for an unrelated reason.
-const makeConfig = (subagentDepth: number): HarnessConfig => {
+// presence flags + subagentDepth. By default both surfaces are "present" so the
+// operator- and reminder-gated tools aren't filtered for an unrelated reason;
+// pass `headless` to drop them (one-shot / SDK), exercising the gate overlap.
+const makeConfig = (subagentDepth: number, opts: { headless?: boolean } = {}): HarnessConfig => {
   const toolRegistry = createToolRegistry();
   registerBuiltinTools(toolRegistry);
   return {
     toolRegistry,
-    confirmPermission: () => Promise.resolve('allow'),
-    reminderScheduler: {},
+    ...(opts.headless === true ? {} : { confirmPermission: () => Promise.resolve('allow') }),
+    ...(opts.headless === true ? {} : { reminderScheduler: {} }),
     subagentDepth,
   } as unknown as HarnessConfig;
 };
@@ -72,5 +73,25 @@ describe('buildToolDefs — deferred surface (AGENTIC_CLI §7.6)', () => {
       (t) => t.name === 'tool_search',
     );
     expect(ts?.description ?? '').not.toContain('- memory_write —');
+  });
+
+  test('headless: a deferred tool also gated by operator/reminder is NOT advertised or revealable', () => {
+    // No confirmPermission / reminderScheduler. memory_write (deferred +
+    // requiresOperatorConfirm) and reminder_list/cancel (deferred +
+    // requiresReminderScheduler) are dropped by the base gates even when
+    // revealed — so they must NOT appear in the catalog (else the model
+    // dead-ends discovering a tool that never enters the surface).
+    const config = makeConfig(0, { headless: true });
+    const defs = buildToolDefs(config, new Set());
+    const ts = defs.find((t) => t.name === 'tool_search');
+    const desc = ts?.description ?? '';
+    for (const gated of ['memory_write', 'reminder_list', 'reminder_cancel']) {
+      expect(desc).not.toContain(`- ${gated} —`);
+    }
+    // A deferred-but-UNgated tool is still advertised headless.
+    expect(desc).toContain('- retrieve_context —');
+    // And even if such a gated tool were "revealed", the base gates still drop it.
+    const revealedNames = buildToolDefs(config, new Set(['memory_write'])).map((t) => t.name);
+    expect(revealedNames).not.toContain('memory_write');
   });
 });

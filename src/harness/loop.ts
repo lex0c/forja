@@ -209,6 +209,24 @@ const toolBlurb = (desc: string): string => {
   return firstSentence.length > 110 ? `${firstSentence.slice(0, 107)}...` : firstSentence;
 };
 
+// The deferred tools that are ALSO surface-available right now: deferred AND
+// past the same operator-confirm / reminder-scheduler gates the base filter
+// applies. A headless run (no confirmPermission / reminderScheduler) hides
+// memory_write / reminder_* via those gates even when revealed — so advertising
+// them in the catalog or "revealing" them via tool_search would dead-end the
+// model on a tool that never enters the surface. Single source of truth for both
+// the catalog and the searchTools reveal pool, so the two can't diverge from the
+// base filter.
+const availableDeferredTools = (config: HarnessConfig) =>
+  config.toolRegistry
+    .list()
+    .filter(
+      (t) =>
+        t.metadata.deferred === true &&
+        (config.confirmPermission !== undefined || t.metadata.requiresOperatorConfirm !== true) &&
+        (config.reminderScheduler !== undefined || t.metadata.requiresReminderScheduler !== true),
+    );
+
 // A `requiresOperatorConfirm` tool can only run where an operator
 // surface is wired: the REPL wires the confirm hooks (confirmPermission
 // + clarify + the memory confirms), while headless one-shot / SDK
@@ -244,9 +262,7 @@ export const buildToolDefs = (
   // can search for. Empty when nothing is deferred (or in a subagent) — then
   // tool_search carries only its base description.
   const catalogTools = applyDeferral
-    ? config.toolRegistry
-        .list()
-        .filter((t) => t.metadata.deferred === true && revealed?.has(t.name) !== true)
+    ? availableDeferredTools(config).filter((t) => revealed?.has(t.name) !== true)
     : [];
   const catalog =
     catalogTools.length > 0
@@ -304,7 +320,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // a rebuild next iteration), and return wire hits so the model gets the
   // schemas in the result.
   const searchTools = (query: string): SearchToolsResult => {
-    const deferred = config.toolRegistry.list().filter((t) => t.metadata.deferred === true);
+    // Same gated pool as the catalog: a deferred tool the operator/reminder gates
+    // would still drop is not revealable (else `select:memory_write` headless
+    // returns a fake hit the surface never honors).
+    const deferred = availableDeferredTools(config);
     const { names, notFound } = rankDeferredTools(deferred, query);
     const byName = new Map(deferred.map((t) => [t.name, t]));
     const hits: ToolSearchHit[] = [];

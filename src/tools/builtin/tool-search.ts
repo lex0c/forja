@@ -78,7 +78,7 @@ export const rankDeferredTools = (
 export const toolSearchTool: Tool<ToolSearchInput, SearchToolsResult> = {
   name: 'tool_search',
   description:
-    'Reveal a deferred tool so you can call it. Some tools are kept off the default list to reduce clutter; search here to bring one into scope, then call it on the next turn (it stays available for the rest of the session). `query` is either keywords (e.g. "cancel background") or `select:name1,name2` to fetch exact tools by name. Returns each match\'s name, description, and input schema. The set of deferred tools is listed below.',
+    'Reveal a deferred tool so you can call it. Some tools are kept off the default list to reduce clutter; search here to bring one into scope, then call it on the next turn (it stays available for the rest of the session). `query` is either keywords (e.g. "cancel background") or `select:name1,name2` to fetch exact tools by name. Returns each match\'s name, description, and input schema. When deferred tools are available, they are listed below.',
   inputSchema: {
     type: 'object',
     properties: {

@@ -2,6 +2,29 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-17] tool_search review fix: gate the catalog/reveal pool like the base surface
+
+Code-review blocker (verified). The catalog (buildToolDefs) and the searchTools
+reveal pool selected deferred tools by `metadata.deferred === true` ALONE, but the
+base surface filter also applies the operator-confirm and reminder-scheduler
+gates. memory_write is deferred + requiresOperatorConfirm; reminder_list/cancel
+are deferred + requiresReminderScheduler. In a headless/SDK run (no
+confirmPermission/reminderScheduler, top level) the catalog advertised those
+tools and searchTools "revealed" them with an apparent-success hit, yet the base
+filter kept dropping them via the gates — they never entered the tools array. A
+dead-end: the model spends turns discovering/revealing a tool that never appears.
+(The base surface itself never leaked the gated tool — the gates are AND-ed
+before the deferral check — so it was a wasted-turns / misleading-surface bug, not
+a confinement hole.) Fix: a single `availableDeferredTools(config)` helper =
+deferred AND past the same operator/reminder gates, used by BOTH the catalog and
+the searchTools pool, so neither can diverge from the base filter. Headless test
+added (the prior tests always wired both surfaces, so the overlap was unexercised).
+Also: dropped the unconditional "listed below" from tool_search's static
+description (a subagent gets no catalog) → conditional phrasing. Confirmed the
+subagent depth>0 deferral-bypass is safe: a subagent builds its OWN registry from
+its tools[] whitelist (subprocess, runtime.ts), so buildToolDefs there operates on
+an already-narrowed registry — the bypass shows the whitelist, not a full surface.
+
 ## [2026-06-17] tool_search: implement the on-demand tool surface (§7.6 code)
 
 Built the deferred-tool surface the §7.6 spec fixed. (1) `deferred?: boolean` on
