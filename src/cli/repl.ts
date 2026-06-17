@@ -1937,6 +1937,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       contextPinsStore,
       todoStore,
       workingStateStore,
+      revealedTools,
       // Reuse the live context (compact-once-reuse). Fall back to
       // resumeFromSessionId only when there's no live context — a turn
       // that errored before resolving one — so the next turn re-derives
@@ -2355,6 +2356,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // a fresh runAgent that would otherwise start empty). In-memory, dies with the
   // process; no explicit teardown, mirroring todoStore (WORKING_STATE.md §7).
   const workingStateStore = createWorkingStateStore();
+
+  // One set of tool_search-revealed deferred tools for the whole REPL session —
+  // injected into every turn's HarnessConfig so a reveal stays sticky across
+  // turns (AGENTIC_CLI §7.6). Without this each turn's fresh runAgent would start
+  // with an empty set, so a revealed tool would drop off the surface next turn
+  // and need re-searching. Same ownership pattern as todoStore.
+  const revealedTools = new Set<string>();
 
   // Hook dispatcher for slash commands (EVICTION.md §10.3). Mirrors
   // the harness loop's wrapper at loop.ts:dispatchHooks but uses the

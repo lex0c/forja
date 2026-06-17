@@ -1056,6 +1056,15 @@ export interface HarnessConfig {
   // survives across turns; a one-shot run leaves it undefined and the loop
   // creates + clears a per-run store. In-memory, never persisted.
   workingStateStore?: WorkingStateStore;
+  // Set of deferred tools revealed via tool_search (AGENTIC_CLI §7.6). Same
+  // ownership contract as todoStore: a multi-turn caller (REPL) injects ONE set
+  // at boot so reveals stay sticky "for the session" — each turn re-runs
+  // runAgent, and without injection the loop's per-run set starts empty every
+  // turn, so a revealed tool would vanish and need re-searching (breaking the
+  // stickiness contract AND the rare-fetch cache invariant). When absent
+  // (one-shot run), the loop creates a per-run set — sticky within that one run.
+  // Mutated in place by the loop's searchTools; the caller owns its lifetime.
+  revealedTools?: Set<string>;
   // Inject the static operating guidance block ([workflow_discipline] +
   // [engineering_principles]) at the bottom of [current_turn], below the
   // working-state panel. Primary-agent only: the main CLI bootstrap (cli/

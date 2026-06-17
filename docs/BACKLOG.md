@@ -2,6 +2,26 @@
 
 Forja progress diary. Entries in reverse chronological order (newest on top).
 
+## [2026-06-17] tool_search review fix (P1): make reveals sticky ACROSS REPL turns
+
+The `revealed` set was a per-run `const` inside runAgent. The REPL re-runs
+runAgent every turn (preserving only sessionContext), so a tool_search reveal
+lasted only within that turn — next turn it vanished from the surface and needed
+re-searching, violating the documented "sticky for the session" contract
+(types.ts / §7.6) AND the rare-fetch cache invariant (re-search every turn = a
+cache invalidation every turn). Classic repl-is-a-parallel-consumer miss.
+
+Fix: thread the set through HarnessConfig.revealedTools, exactly like
+todoStore/workingStateStore — the REPL builds ONE Set at boot and injects it into
+every turn's config; runAgent does `config.revealedTools ?? new Set()` (one-shot
+runs get a fresh per-run set, sticky within the run). The set is mutated in place
+by the loop's searchTools, so reveals accumulate in the REPL-held object across
+turns. Test (tests/harness/tool-search-sticky.test.ts) drives the real loop two
+turns with a shared set + a recording provider: turn 1 reveals retrieve_context
+via tool_search (absent on call 1, present on the rebuilt call 2), the set
+persists, and turn 2's fresh runAgent offers it from the first provider call with
+no re-search; control asserts a deferred tool is absent without the set.
+
 ## [2026-06-17] tool_search review fix: gate the catalog/reveal pool like the base surface
 
 Code-review blocker (verified). The catalog (buildToolDefs) and the searchTools

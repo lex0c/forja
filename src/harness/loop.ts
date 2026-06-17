@@ -307,11 +307,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // Resume-truncation diagnostics captured by hydrateFromDb (resume path).
   let hydrateInfo: HydrateInfo | null = null;
   // Deferred-tool surface (AGENTIC_CLI §7.6). `revealed` accumulates the tools
-  // tool_search has surfaced this session; `tools` is rebuilt from base+revealed
-  // whenever it grows (sticky). `toolsDirty` defers the rebuild to the top of
-  // the next iteration so a reveal mid-step takes effect on the next provider
-  // call — one cache invalidation per fetch, then stable.
-  const revealed = new Set<string>();
+  // tool_search has surfaced; `tools` is rebuilt from base+revealed whenever it
+  // grows (sticky). `toolsDirty` defers the rebuild to the top of the next
+  // iteration so a reveal mid-step takes effect on the next provider call — one
+  // cache invalidation per fetch, then stable.
+  // Sourced from config so a multi-turn caller (REPL) injects ONE set and reveals
+  // stay sticky ACROSS turns (each turn re-runs runAgent); a one-shot run gets a
+  // fresh per-run set — sticky within that run. Same contract as todoStore.
+  const revealed = config.revealedTools ?? new Set<string>();
   let toolsDirty = false;
   let tools = buildToolDefs(config, revealed);
   // Search + reveal closure wired into ctx.searchTools at the top level only.
