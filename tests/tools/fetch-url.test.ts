@@ -275,6 +275,17 @@ describe('fetch_url', () => {
     expect(fetchedUrl === 'http://[2606:4700:4700::1111]/p').toBe(true); // re-bracketed
   });
 
+  test('timeout_ms bounds a stalled DNS lookup, not just the fetch (§9.1.4)', async () => {
+    // A lookup that never resolves must not hang the tool past timeout_ms — the
+    // abort signal now races the DNS step, not only the fetch.
+    const tool = mkTool({
+      lookupImpl: () => new Promise<{ address: string; family: number }[]>(() => {}),
+      fetchImpl: async () => resp('<p>should not reach</p>', 'text/html'),
+    });
+    const r = await tool.execute({ url: 'https://example.com/p', timeout_ms: 50 }, makeCtx());
+    expect(isToolError(r) && r.error_code).toBe('tool.aborted');
+  });
+
   test('download is capped at max_bytes and reports truncation (§9.1.4)', async () => {
     const big = 'x'.repeat(5000);
     const tool = mkTool({ fetchImpl: async () => resp(big, 'text/plain') });

@@ -143,6 +143,32 @@ interface FetchUrlDeps {
   nonce?: () => string;
 }
 
+// Reject as soon as `signal` aborts so a pending await is bounded by the same
+// timeout as the fetch. The DNS lookup takes no abort signal of its own, so
+// without this a slow/stalled resolver sits past `timeout_ms` — and a fetch
+// that ignores an already-aborted signal could even succeed after the cap.
+// `p` here is `resolveAndValidate`, which only ever RESOLVES (lookup failures
+// come back as `{error}`), so the sole rejection path is the abort.
+const raceAbort = <T>(p: Promise<T>, signal: AbortSignal): Promise<T> => {
+  if (signal.aborted) return Promise.reject(new Error('aborted'));
+  return new Promise<T>((resolve, reject) => {
+    // `{ once: true }` auto-removes the listener when it fires (abort path); the
+    // settle path removes it explicitly so a fast resolve leaves nothing behind.
+    const onAbort = (): void => reject(new Error('aborted'));
+    signal.addEventListener('abort', onAbort, { once: true });
+    p.then(
+      (v) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(v);
+      },
+      (e) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(e);
+      },
+    );
+  });
+};
+
 // DNS-rebinding mitigation (§9.1.6). The permission resolver only saw the
 // hostname STRING; resolve it here and validate EVERY address against the
 // SSRF blocklist right before connecting. Returns the address to pin the
@@ -445,7 +471,23 @@ export const createFetchUrlTool = (
           // checked against the real name). A public-looking host that
           // resolves to loopback / metadata / RFC1918 is refused here, and a
           // rebind between check and connect can't swap the IP.
-          const resolved = await resolveAndValidate(hopUrl.hostname, doLookup);
+          // Race the DNS step against the abort signal so a slow/stalled
+          // resolver is bounded by timeout_ms too — not just the fetch below.
+          let resolved: Awaited<ReturnType<typeof resolveAndValidate>>;
+          try {
+            resolved = await raceAbort(
+              resolveAndValidate(hopUrl.hostname, doLookup),
+              controller.signal,
+            );
+          } catch {
+            // raceAbort rejects only on abort (resolveAndValidate resolves with
+            // `{error}` on lookup failure), so this is the timeout/cancel path.
+            return toolError(
+              ERROR_CODES.aborted,
+              `fetch_url: aborted/timed out after ${timeoutMs}ms during DNS resolution`,
+              { retryable: true },
+            );
+          }
           if ('error' in resolved) {
             return toolError(ERROR_CODES.fetchPolicyDenied, `fetch_url: ${resolved.error}`);
           }
