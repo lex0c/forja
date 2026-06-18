@@ -212,6 +212,26 @@ describe('fetch_url', () => {
     expect(seenSni === 'example.com').toBe(true);
   });
 
+  test('IPv6-literal URL: brackets stripped for DNS, re-added for the request', async () => {
+    // Bun's URL.hostname keeps the brackets (`[2606:…]`), but dns.lookup
+    // rejects that form — so a public IPv6 literal must not be denied.
+    let lookupHost = '';
+    let fetchedUrl = '';
+    const tool = mkTool({
+      lookupImpl: async (host) => {
+        lookupHost = host;
+        return [{ address: '2606:4700:4700::1111', family: 6 }];
+      },
+      fetchImpl: async (url) => {
+        fetchedUrl = String(url);
+        return resp('<p>ok</p>', 'text/html');
+      },
+    });
+    ok(await tool.execute({ url: 'http://[2606:4700:4700::1111]/p' }, makeCtx()));
+    expect(lookupHost === '2606:4700:4700::1111').toBe(true); // unbracketed for DNS
+    expect(fetchedUrl === 'http://[2606:4700:4700::1111]/p').toBe(true); // re-bracketed
+  });
+
   test('download is capped at max_bytes and reports truncation (§9.1.4)', async () => {
     const big = 'x'.repeat(5000);
     const tool = mkTool({ fetchImpl: async () => resp(big, 'text/plain') });

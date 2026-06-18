@@ -150,9 +150,15 @@ const resolveAndValidate = async (
   host: string,
   doLookup: LookupFn,
 ): Promise<{ ip: string; family: number } | { error: string }> => {
+  // Bun's URL.hostname keeps the brackets on an IPv6 literal
+  // (`[2606:4700:4700::1111]`), but dns.lookup rejects that form
+  // (ENOTFOUND) — strip them for the lookup. The bracketed form is
+  // re-added for the pinned URL (family 6 below) and the Host header
+  // preserves it, so the request still targets the right literal.
+  const lookupHost = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
   let addrs: ResolvedAddr[];
   try {
-    addrs = await doLookup(host);
+    addrs = await doLookup(lookupHost);
   } catch {
     return { error: `DNS resolution failed for '${host}'` };
   }
