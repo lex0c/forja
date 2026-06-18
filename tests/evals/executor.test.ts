@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  buildFetchStub,
+  buildFetchStubRegistry,
   executeCase,
   resolveEvalCacheRoot,
   summarize,
@@ -11,6 +11,7 @@ import {
 import type { EvalCase } from '../../src/evals/types.ts';
 import type { SandboxAvailability } from '../../src/permissions/sandbox-availability.ts';
 import type { Provider, StreamEvent } from '../../src/providers/index.ts';
+import { type ToolContext, isToolError } from '../../src/tools/types.ts';
 
 interface ScriptedStep {
   text?: string;
@@ -711,44 +712,49 @@ describe('executeCase — approval posture (operation mode, AGENTIC_CLI §8.1)',
   });
 });
 
-describe('buildFetchStub', () => {
-  test('serves canned responses and delegates unmatched URLs to the original', async () => {
-    let delegatedTo: string | undefined;
-    const original = (async (input: string | URL | Request) => {
-      delegatedTo =
-        typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
-      return new Response('ORIGINAL');
-    }) as unknown as typeof fetch;
-    const stub = buildFetchStub(
-      {
-        'https://docs.forja.test/a': { body: '<h1>A</h1>', contentType: 'text/html', status: 201 },
+describe('buildFetchStubRegistry', () => {
+  const fetchCtx = (): ToolContext =>
+    ({
+      signal: new AbortController().signal,
+      cwd: process.cwd(),
+      sessionId: 's',
+      stepId: 'st',
+      permissions: { mode: 'strict', posture: 'supervised', canReadPath: () => true },
+      permissionCheck: () => ({ kind: 'allow', reason: 'test' }),
+      isCwdTrusted: true,
+    }) as unknown as ToolContext;
+
+  test('the stubbed fetch_url serves the canned page (injected DNS + Host-mapped fetch)', async () => {
+    // Proves the seam survives the DNS-rebinding pin: the tool resolves via the
+    // injected lookup, pins to the test IP, fetches `https://<ip>/p` with the
+    // Host header, and the stub maps it back to the canned URL.
+    const reg = buildFetchStubRegistry({
+      'https://docs.forja.test/p': {
+        body: '<h1>Doc</h1><p>value 42</p>',
+        contentType: 'text/html',
       },
-      original,
-    );
-    const hit = await stub('https://docs.forja.test/a');
-    expect(hit.status).toBe(201);
-    expect(hit.headers.get('content-type')).toContain('text/html');
-    expect(await hit.text()).toContain('<h1>A</h1>');
-    // The provider's own API calls must pass through untouched.
-    const miss = await stub('https://api.anthropic.com/v1/messages');
-    expect(await miss.text()).toBe('ORIGINAL');
-    expect(delegatedTo).toBe('https://api.anthropic.com/v1/messages');
+    });
+    const tool = reg.get('fetch_url');
+    expect(tool).not.toBeNull();
+    const out = await tool?.execute({ url: 'https://docs.forja.test/p' }, fetchCtx());
+    expect(isToolError(out)).toBe(false);
+    if (out !== undefined && !isToolError(out)) {
+      const o = out as { content: string };
+      expect(o.content).toContain('# Doc');
+      expect(o.content).toContain('value 42');
+    }
   });
 
-  test('defaults status to 200 and content-type to html', async () => {
-    const stub = buildFetchStub(
-      { 'https://x.test/y': { body: 'hi' } },
-      (async () => new Response('x')) as unknown as typeof fetch,
-    );
-    const r = await stub('https://x.test/y');
-    expect(r.status).toBe(200);
-    expect(r.headers.get('content-type')).toContain('text/html');
+  test('rejects a fetch_url url that was not stubbed', async () => {
+    const reg = buildFetchStubRegistry({ 'https://x.test/a': { body: 'x' } });
+    const tool = reg.get('fetch_url');
+    const out = await tool?.execute({ url: 'https://y.test/b' }, fetchCtx());
+    expect(isToolError(out)).toBe(true);
   });
 });
 
 describe('executeCase — httpStub seam', () => {
-  test('runs fetch_url through the stub and restores the global fetch afterward', async () => {
-    const before = globalThis.fetch;
+  test('runs fetch_url through the stubbed registry in the loop', async () => {
     const c = baseCase({
       prompt: 'fetch the doc',
       setup: {
@@ -781,7 +787,5 @@ describe('executeCase — httpStub seam', () => {
       },
     });
     expect(r.passed).toBe(true);
-    // The swap is undone in the executor's finally — no leak across cases.
-    expect(globalThis.fetch).toBe(before);
   });
 });
