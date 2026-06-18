@@ -15,12 +15,12 @@ here earns its place, or it is deferred (§7.6) / withdrawn from the surface.
 
 ## 1. The surface model (§7.6)
 
-The set of registered tools (37) is larger than what the model sees on any given
+The set of registered tools (38) is larger than what the model sees on any given
 turn. Two tiers:
 
 - **Visible** (24) — the base surface, sent in the provider request every turn.
   Covers the common path.
-- **Deferred** (13) — registered and fully callable, but kept *out* of the base
+- **Deferred** (14) — registered and fully callable, but kept *out* of the base
   surface to cut selection pressure (principle 3). The model reaches one via
   **`tool_search`**, which reveals it (sticky for the session). A catalog of the
   deferred set (name + one-line blurb) is generated into `tool_search`'s
@@ -75,6 +75,11 @@ analyze — the process was already approved at spawn).
 | `bash_output` | V | Read new stdout/stderr from a background process. |
 | `bash_kill` | D `W` | Terminate a background process. |
 | `bash_list` | D | List the session's background processes. |
+
+### Network (`web.fetch`)
+| Tool | | Purpose |
+|---|---|---|
+| `fetch_url` | D | Fetch an http(s) page as markdown (HTML→md; large pages spill to a file). Host-gated by `FetchPolicy`; returned content is wrapped as untrusted data (SECURITY_GUIDELINE §9.1). |
 
 ### Subagents / tasks
 | Tool | | Purpose |

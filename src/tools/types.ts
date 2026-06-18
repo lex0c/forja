@@ -698,6 +698,17 @@ export const ERROR_CODES = {
   // apply. The base surface is already the full whitelist there; nothing to
   // reveal.
   toolSearchUnavailable: 'tool_search.unavailable',
+  // fetch_url failure modes (SECURITY_GUIDELINE.md §9.1).
+  // `invalid_url` = malformed / non-http(s) input the resolver didn't
+  // already refuse; `policy_denied` = a redirect hop was blocked by the
+  // re-gate (SSRF / deny / cross-host to an unapproved host);
+  // `unsupported_type` = response Content-Type is binary (image/pdf/...),
+  // which the tool can't render to text; `failed` = network error,
+  // timeout, or abort.
+  fetchInvalidUrl: 'fetch.invalid_url',
+  fetchPolicyDenied: 'fetch.policy_denied',
+  fetchUnsupportedType: 'fetch.unsupported_type',
+  fetchFailed: 'fetch.failed',
 } as const;
 
 export const toolError = (

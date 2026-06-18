@@ -108,6 +108,7 @@ describe('bootstrap', () => {
         'bash_output',
         'clarify',
         'edit_file',
+        'fetch_url',
         'git',
         'git_apply_patch',
         'glob',
