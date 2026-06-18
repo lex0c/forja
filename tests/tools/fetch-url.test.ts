@@ -168,6 +168,14 @@ describe('fetch_url', () => {
     expect(out.bytes).toBe(100);
   });
 
+  test('the default cap is 10 MB — a 3 MB page is not truncated without an override', async () => {
+    const body = 'x'.repeat(3 * 1024 * 1024); // >2 MB (old cap) but <10 MB
+    const tool = createFetchUrlTool({ fetchImpl: async () => resp(body, 'text/plain') });
+    const out = ok(await tool.execute({ url: 'https://example.com/doc' }, makeCtx()));
+    expect(out.truncated).toBe(false);
+    expect(out.bytes).toBe(3 * 1024 * 1024);
+  });
+
   test('injection patterns are detected and the strong warning is prepended (§9.1.5)', async () => {
     const tool = createFetchUrlTool({
       fetchImpl: async () =>

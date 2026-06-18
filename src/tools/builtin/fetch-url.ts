@@ -28,7 +28,8 @@ export interface FetchUrlInput {
   url: string;
   // Skip HTML→markdown conversion and return the decoded source text.
   raw?: boolean;
-  // Hard cap on downloaded bytes (§9.1.4). Default 256 KB, max 2 MB.
+  // Cap on downloaded bytes. Default 10 MB; the model may pass a smaller
+  // value for a quick fetch (10 MB is also the hard ceiling).
   max_bytes?: number;
   // Request timeout in ms (§9.1.4). Default 10s, max 30s.
   timeout_ms?: number;
@@ -66,8 +67,17 @@ export interface FetchUrlOutput {
 }
 
 // §9.1.4 size/time caps.
-const DEFAULT_MAX_BYTES = 256 * 1024;
-const ABSOLUTE_MAX_BYTES = 2 * 1024 * 1024;
+// Two roles via `clampInt(max_bytes, DEFAULT, 1, ABSOLUTE)`:
+//   DEFAULT  — used when the model passes no `max_bytes` (the common case).
+//   ABSOLUTE — hard ceiling: the model may dial max_bytes DOWN for a quick
+//              fetch, but never above this, even if it requests more.
+// Operator set both to 10 MB → one effective limit ("fetch up to 10 MB").
+// §9.1.4 specs a 256 KB default / 2 MB cap; this diverges (256 KB truncated
+// real doc pages before the article started). A small page still pulls only
+// its actual size — readCapped stops at EOF — so 10 MB is just where
+// truncation kicks in, not what every fetch downloads.
+const DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
+const ABSOLUTE_MAX_BYTES = 10 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 10_000;
 const ABSOLUTE_MAX_TIMEOUT_MS = 30_000;
 const DEFAULT_INLINE_CHARS = 20_000;
@@ -250,7 +260,7 @@ export const createFetchUrlTool = (
           type: 'integer',
           minimum: 1,
           description:
-            'Cap on downloaded bytes. Default 262144 (256 KB), max 2097152 (2 MB). Exceeding it truncates (never silent).',
+            'Cap on downloaded bytes. Default 10485760 (10 MB), which is also the max. Pass a smaller value for a quick fetch. Exceeding it truncates (never silent).',
         },
         timeout_ms: {
           type: 'integer',
