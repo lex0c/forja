@@ -156,6 +156,18 @@ describe('bootstrap', () => {
       dbPath,
       enterprisePolicyPath: null,
       userPolicyPath: null,
+      // Pin the sandbox verdict: a runner without bwrap (CI ubuntu-latest)
+      // boots the engine `degraded`, which downgrades automatic `allow` to
+      // `confirm` and would flip these grant assertions. We're testing that
+      // the session-allow grant EXISTS, not the host's sandbox state.
+      sandboxAvailabilityOverride: {
+        available: true,
+        tool: 'bwrap',
+        path: '/usr/bin/bwrap',
+        trustLevel: 'canonical',
+        reason: '',
+        trustWarnings: [],
+      },
     });
     const spill = join(forjaCacheDir(), 'fetch', 'abc123.md');
     expect(config.permissionEngine.check('read_file', 'fs.read', { path: spill }).kind).toBe(
