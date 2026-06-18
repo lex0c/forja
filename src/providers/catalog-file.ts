@@ -58,41 +58,47 @@ const entryToFactory =
         `model ${entry.id}: API key required — the configured api_key_env '${entry.api_key_env}' is unset or empty. Set it, or remove api_key_env to use the adapter's default. Refusing the default-vendor-key fallback so a configured base_url can't receive the wrong key.`,
       );
     }
-    switch (entry.family) {
-      case 'anthropic':
-        return createAnthropicProvider(entry.model_name, {
-          capabilities: entry.capabilities,
-          ...(hasKey ? { apiKey } : {}),
-          ...(baseURL !== undefined ? { baseURL } : {}),
-          ...((opts as CreateAnthropicProviderOptions | undefined) ?? {}),
-        });
-      case 'openai':
-        return createOpenAIProvider(entry.model_name, {
-          capabilities: entry.capabilities,
-          ...(hasKey ? { apiKey } : {}),
-          ...(baseURL !== undefined ? { baseURL } : {}),
-          ...((opts as CreateOpenAIProviderOptions | undefined) ?? {}),
-        });
-      case 'google':
-        return createGoogleProvider(entry.model_name, {
-          capabilities: entry.capabilities,
-          ...(hasKey ? { apiKey } : {}),
-          ...((opts as CreateGoogleProviderOptions | undefined) ?? {}),
-        });
-      case 'ollama':
-        return createOllamaProvider(entry.model_name, {
-          capabilities: entry.capabilities,
-          ...(baseURL !== undefined ? { baseUrl: baseURL } : {}),
-          // Map api_key_env → bearer header so Ollama Cloud / a guarded
-          // host authenticates; local Ollama (no key) omits it.
-          ...(hasKey ? { headers: { Authorization: `Bearer ${apiKey}` } } : {}),
-          ...((opts as CreateOllamaProviderOptions | undefined) ?? {}),
-        });
-      default:
-        // Unreachable: the loader rejects unsupported families before an
-        // entry reaches here. Kept as an exhaustiveness guard.
-        throw new Error(`unsupported family in catalog entry: ${entry.family}`);
-    }
+    const provider: Provider = ((): Provider => {
+      switch (entry.family) {
+        case 'anthropic':
+          return createAnthropicProvider(entry.model_name, {
+            capabilities: entry.capabilities,
+            ...(hasKey ? { apiKey } : {}),
+            ...(baseURL !== undefined ? { baseURL } : {}),
+            ...((opts as CreateAnthropicProviderOptions | undefined) ?? {}),
+          });
+        case 'openai':
+          return createOpenAIProvider(entry.model_name, {
+            capabilities: entry.capabilities,
+            ...(hasKey ? { apiKey } : {}),
+            ...(baseURL !== undefined ? { baseURL } : {}),
+            ...((opts as CreateOpenAIProviderOptions | undefined) ?? {}),
+          });
+        case 'google':
+          return createGoogleProvider(entry.model_name, {
+            capabilities: entry.capabilities,
+            ...(hasKey ? { apiKey } : {}),
+            ...((opts as CreateGoogleProviderOptions | undefined) ?? {}),
+          });
+        case 'ollama':
+          return createOllamaProvider(entry.model_name, {
+            capabilities: entry.capabilities,
+            ...(baseURL !== undefined ? { baseUrl: baseURL } : {}),
+            // Map api_key_env → bearer header so Ollama Cloud / a guarded
+            // host authenticates; local Ollama (no key) omits it.
+            ...(hasKey ? { headers: { Authorization: `Bearer ${apiKey}` } } : {}),
+            ...((opts as CreateOllamaProviderOptions | undefined) ?? {}),
+          });
+        default:
+          // Unreachable: the loader rejects unsupported families before an
+          // entry reaches here. Kept as an exhaustiveness guard.
+          throw new Error(`unsupported family in catalog entry: ${entry.family}`);
+      }
+    })();
+    // Provenance: stamp the source catalog entry on the provider so the
+    // subagent spawn path can snapshot it (Provider.catalogEntry) instead
+    // of having a spawned child re-read a possibly-edited catalog file.
+    return { ...provider, catalogEntry: entry };
   };
 
 // Construct a registry from validated entries. Assumes unique ids (the

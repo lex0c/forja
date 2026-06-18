@@ -1,5 +1,6 @@
 import type { HookSpec } from '../../hooks/types.ts';
 import type { ApprovalPosture, Policy } from '../../permissions/index.ts';
+import type { ModelProviderEntry } from '../../providers/types.ts';
 import type { ContextRecipe, SamplingOverride, ToolRestrictions } from '../../subagents/types.ts';
 import type { DB } from '../db.ts';
 
@@ -147,6 +148,14 @@ export interface SubagentRun {
   // under the posture the operator had when it spawned. Never null on
   // the read side — getSubagentRun maps a NULL column to 'supervised'.
   approvalPosture: ApprovalPosture;
+  // Snapshot of the catalog entry the PARENT resolved the provider from
+  // at spawn time (migration 076). The subprocess child rebuilds its
+  // provider from THIS instead of re-reading model_providers.json, so a
+  // mid-session edit / `--force` re-sync can't make it reject
+  // session.model or diverge on base_url/capabilities. Null on legacy
+  // rows and on spawns whose provider had no catalog entry (test mocks /
+  // providerOverride) → child falls back to re-reading the file.
+  modelEntrySnapshot: ModelProviderEntry | null;
   capturedAt: number;
 }
 
@@ -171,6 +180,7 @@ interface SubagentRunRow {
   effective_capabilities: string | null;
   parent_approval_id: string | null;
   approval_posture: string | null;
+  model_entry_snapshot: string | null;
   captured_at: number;
 }
 
@@ -377,6 +387,38 @@ const fromRow = (row: SubagentRunRow): SubagentRun => {
       effectiveCapabilities = null;
     }
   }
+  // Defensive parse on model_entry_snapshot (migration 076). Shape: a
+  // ModelProviderEntry (string id/family/model_name + object
+  // capabilities). Corrupt or wrong-shape rows collapse to null so the
+  // child falls back to re-reading the catalog file rather than building
+  // a provider from a malformed entry. The row was authored by the
+  // parent at spawn (trusted synchronous write); corruption is
+  // genuinely unexpected and the operator should see it in audit.
+  let modelEntrySnapshot: ModelProviderEntry | null;
+  if (row.model_entry_snapshot === null) {
+    modelEntrySnapshot = null;
+  } else {
+    try {
+      const parsed = JSON.parse(row.model_entry_snapshot) as unknown;
+      const e = parsed as Record<string, unknown>;
+      if (
+        parsed !== null &&
+        typeof parsed === 'object' &&
+        !Array.isArray(parsed) &&
+        typeof e.id === 'string' &&
+        typeof e.family === 'string' &&
+        typeof e.model_name === 'string' &&
+        e.capabilities !== null &&
+        typeof e.capabilities === 'object'
+      ) {
+        modelEntrySnapshot = parsed as ModelProviderEntry;
+      } else {
+        modelEntrySnapshot = null;
+      }
+    } catch {
+      modelEntrySnapshot = null;
+    }
+  }
   return {
     sessionId: row.session_id,
     name: row.name,
@@ -400,6 +442,7 @@ const fromRow = (row: SubagentRunRow): SubagentRun => {
     // NULL (legacy / pre-column row) → supervised (fail-closed). The
     // column CHECK guarantees any non-null value is one of the literals.
     approvalPosture: row.approval_posture === 'autonomous' ? 'autonomous' : 'supervised',
+    modelEntrySnapshot,
     capturedAt: row.captured_at,
   };
 };
@@ -504,6 +547,11 @@ export interface InsertSubagentRunInput {
   // parent engine's live posture so an autonomous parent's children
   // inherit it (operation-mode).
   approvalPosture?: ApprovalPosture;
+  // Catalog entry the parent resolved the provider from at spawn time
+  // (migration 076). Omitted ⇒ column NULL ⇒ child re-reads the catalog
+  // file (legacy / test mocks / providerOverride). Supplied ⇒ the child
+  // rebuilds the provider from it, never re-reading.
+  modelEntrySnapshot?: ModelProviderEntry;
   capturedAt?: number;
 }
 
@@ -565,6 +613,13 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
     input.effectiveCapabilities !== undefined && input.effectiveCapabilities !== null
       ? JSON.stringify(input.effectiveCapabilities)
       : null;
+  // Same NULL-vs-object convention for model_entry_snapshot: undefined ⇒
+  // column NULL (no snapshot ⇒ child re-reads the catalog file); an entry
+  // ⇒ JSON-serialized so the child rebuilds the provider from it.
+  const modelEntryJson =
+    input.modelEntrySnapshot !== undefined && input.modelEntrySnapshot !== null
+      ? JSON.stringify(input.modelEntrySnapshot)
+      : null;
   const parentApprovalId = input.parentApprovalId ?? null;
   const approvalPostureValue = input.approvalPosture ?? null;
   db.query(
@@ -574,8 +629,8 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
         budget_max_wall_ms, policy_snapshot, hooks_snapshot,
         tool_restrictions, sampling, reference_paths, output_schema,
         context_recipe, effective_capabilities, parent_approval_id,
-        approval_posture, captured_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        approval_posture, model_entry_snapshot, captured_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     input.sessionId,
     input.name,
@@ -597,6 +652,7 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
     effectiveCapsJson,
     parentApprovalId,
     approvalPostureValue,
+    modelEntryJson,
     capturedAt,
   );
   // Resolve the snapshot for the return value with the same
@@ -628,6 +684,7 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
       input.effectiveCapabilities === undefined ? null : [...input.effectiveCapabilities],
     parentApprovalId,
     approvalPosture: input.approvalPosture ?? 'supervised',
+    modelEntrySnapshot: input.modelEntrySnapshot ?? null,
     capturedAt,
   };
 };
@@ -649,7 +706,7 @@ export const getSubagentRun = (db: DB, sessionId: string): SubagentRun | null =>
               budget_max_wall_ms, policy_snapshot, hooks_snapshot,
               tool_restrictions, sampling, reference_paths, output_schema,
               context_recipe, effective_capabilities, parent_approval_id,
-              approval_posture, captured_at
+              approval_posture, model_entry_snapshot, captured_at
          FROM subagent_runs
         WHERE session_id = ?`,
     )

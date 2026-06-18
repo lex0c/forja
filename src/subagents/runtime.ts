@@ -586,6 +586,13 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       // rows but new dispatches are honest.
       scope: definition.scope,
       ...(input.parentApprovalId !== undefined ? { parentApprovalId: input.parentApprovalId } : {}),
+      // Snapshot the catalog entry the parent's provider was built from
+      // (migration 076) so the spawned child rebuilds the SAME provider
+      // instead of re-reading a possibly-edited model_providers.json.
+      // Absent on test mocks / providerOverride → child re-reads the file.
+      ...(input.provider.catalogEntry !== undefined
+        ? { modelEntrySnapshot: input.provider.catalogEntry }
+        : {}),
       sourcePath: definition.sourcePath,
       sourceSha256: definition.sourceSha256,
       systemPrompt: definition.systemPrompt,

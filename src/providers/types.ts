@@ -375,6 +375,16 @@ export interface Provider {
   id: string;
   family: ProviderFamily;
   capabilities: ProviderCapabilities;
+  // The catalog entry this provider was built from (stamped by
+  // catalog-file `entryToFactory`). Provenance ONLY — never read on the
+  // generate path. The subagent spawn path snapshots it onto
+  // subagent_runs (migration 076) so a spawned child rebuilds the SAME
+  // provider instead of re-reading a possibly-edited model_providers.json
+  // (which would let a mid-session edit / `--force` re-sync make the
+  // child reject session.model or diverge on base_url/capabilities).
+  // Absent on providers built outside the catalog (test mocks /
+  // providerOverride) — the child then falls back to re-reading the file.
+  catalogEntry?: ModelProviderEntry;
   // Whether this provider instance replays reasoning blocks onto the wire
   // (resolved once in the factory from FORJA_*_REASONING_REPLAY + capability).
   // Consumers that size the outbound prompt (the compaction trigger, token

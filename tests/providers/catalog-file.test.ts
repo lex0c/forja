@@ -250,6 +250,15 @@ describe('registry construction + factory wiring', () => {
     }
   });
 
+  test('factory stamps the source catalog entry on the provider (snapshot provenance)', () => {
+    // The subagent spawn path reads provider.catalogEntry to snapshot it
+    // onto subagent_runs (migration 076), so a spawned child rebuilds the
+    // SAME provider instead of re-reading a possibly-edited catalog file.
+    const e = entry({ base_url: 'http://h:1' });
+    const provider = buildRegistryFromEntries([e]).get('ollama/qwen3:14b')?.factory();
+    expect(provider?.catalogEntry).toEqual(e);
+  });
+
   test('loadModelRegistry throws when the file is absent', () => {
     expect(() => loadModelRegistry(env)).toThrow('forja init');
   });

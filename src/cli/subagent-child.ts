@@ -25,7 +25,12 @@ import {
 } from '../permissions/index.ts';
 import { setWritableCacheDirsOverride } from '../permissions/sandbox-cache-dirs.ts';
 import { setCachePersistenceOverride } from '../permissions/sandbox-cache-env.ts';
-import { type Provider, type ProviderEffort, loadModelRegistry } from '../providers/index.ts';
+import {
+  type Provider,
+  type ProviderEffort,
+  buildRegistryFromEntries,
+  loadModelRegistry,
+} from '../providers/index.ts';
 import type { SystemSegment } from '../providers/types.ts';
 import {
   type DB,
@@ -665,7 +670,17 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     if (opts.providerOverride !== undefined) {
       provider = opts.providerOverride;
     } else {
-      const { registry } = loadModelRegistry();
+      // Prefer the catalog entry the PARENT snapshotted at spawn time
+      // (migration 076): rebuild the provider from it so a mid-session
+      // edit / `--force` re-sync of model_providers.json can't make this
+      // child reject session.model or instantiate it with a different
+      // base_url/capabilities than the parent committed to. Fall back to
+      // re-reading the file only when no snapshot exists (legacy rows, or
+      // a provider built outside the catalog — test mocks).
+      const registry =
+        audit.modelEntrySnapshot !== null
+          ? buildRegistryFromEntries([audit.modelEntrySnapshot])
+          : loadModelRegistry().registry;
       const entry = registry.get(session.model);
       if (entry === null) {
         const envelope = {
