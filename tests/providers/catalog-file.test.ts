@@ -214,6 +214,42 @@ describe('registry construction + factory wiring', () => {
     }
   });
 
+  test('a configured-but-empty api_key_env FAILS instead of leaking the vendor default key', () => {
+    // Entry points at a third-party endpoint and names a custom key var
+    // that is UNSET, while the real vendor key IS present. The factory
+    // must refuse — not fall back to OPENAI_API_KEY and ship it to the
+    // catalog's base_url.
+    const customVar = 'FORJA_TEST_VLLM_KEY_UNSET';
+    delete process.env[customVar];
+    const priorOpenai = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = 'sk-real-vendor-key';
+    try {
+      const reg = buildRegistryFromEntries([
+        entry({
+          id: 'openai/vllm',
+          family: 'openai',
+          model_name: 'vllm',
+          api_key_env: customVar,
+          base_url: 'https://third-party.example',
+          capabilities: { ...VALID_CAPS, constrained: 'tools' },
+        }),
+      ]);
+      const resolved = resolveProviderFromId(reg, 'openai/vllm');
+      expect(resolved.ok).toBe(false);
+      // Narrow by `kind` (a type guard) so `.message` is accessible.
+      if (!resolved.ok && resolved.kind === 'factory-error') {
+        expect(resolved.message).toContain(customVar);
+        // Recognizable as a missing-key failure (recap stub-fallback gate).
+        expect(resolved.message).toContain('API key required');
+      } else {
+        throw new Error(`expected factory-error, got ${JSON.stringify(resolved)}`);
+      }
+    } finally {
+      if (priorOpenai === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = priorOpenai;
+    }
+  });
+
   test('loadModelRegistry throws when the file is absent', () => {
     expect(() => loadModelRegistry(env)).toThrow('forja init');
   });
