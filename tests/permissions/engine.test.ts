@@ -1875,10 +1875,40 @@ describe('addSessionAllow (runtime "Yes, don\'t ask again for: <rule>")', () => 
     expect(eng.check('read_file', 'fs.read', { path: 'src/x.ts' }).kind).toBe('deny');
   });
 
+  test('fetch_url default-confirms an unmatched host (was a hard deny)', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    const d = eng.check('fetch_url', 'web.fetch', { url: 'https://docs.example.com/guide' });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') {
+      expect(d.confirmCause).toBe('policy');
+      expect(d.prompt).toContain('docs.example.com');
+    }
+  });
+
+  test('fetch_url deny_hosts still hard-denies (no confirm fallback)', () => {
+    const eng = createPermissionEngine(
+      policy({ tools: { fetch_url: { deny_hosts: ['evil.com'] } } }),
+      { cwd: CWD },
+    );
+    expect(eng.check('fetch_url', 'web.fetch', { url: 'https://evil.com/x' }).kind).toBe('deny');
+  });
+
+  test('autonomous does NOT auto-approve a web.fetch confirm (egress always asks)', () => {
+    // Network egress can carry data out in the URL; unlike a repo-confined
+    // bash/path confirm, an unknown-host fetch stays a confirm even under
+    // autonomous so the operator always sees it (AGENTIC_CLI §9).
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    expect(eng.check('fetch_url', 'web.fetch', { url: 'https://unknown.example/x' }).kind).toBe(
+      'confirm',
+    );
+  });
+
   test('fetch_url session-allow promotes a host glob', () => {
     const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    // An unmatched host default-confirms (asks the operator); the
+    // session-allow then promotes it to a silent allow.
     expect(eng.check('fetch_url', 'web.fetch', { url: 'https://api.example.com/v1' }).kind).toBe(
-      'deny',
+      'confirm',
     );
     eng.addSessionAllow('fetch_url', 'api.example.com');
     const d = eng.check('fetch_url', 'web.fetch', { url: 'https://api.example.com/v1' });

@@ -237,7 +237,14 @@ export interface ConfirmOption {
 //     operator's eye lands on the command first
 // New tones land here when a future flavor needs them; the
 // renderer narrows on the discriminant.
-export type PreviewLine = string | { text: string; tone: 'secondary' | 'bold' };
+// A plain string renders dim; `{ text, tone }` renders the whole line in
+// one tone; `{ verb, text }` renders a BOLD verb followed by a dim subject
+// on one line (e.g. the permission modal's `fetch <url>` action — only the
+// verb is emphasized, the url stays dim).
+export type PreviewLine =
+  | string
+  | { text: string; tone: 'secondary' | 'bold' }
+  | { verb: string; text: string };
 
 export interface ConfirmState {
   // ID assigned by the producer; threaded through `permission:ask` and
@@ -1793,7 +1800,15 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // renderer's 2-space indent = 6 visible spaces. Rendered as a
       // plain `dim` line — the modal title stays the only bold one.
       previewLines.push('');
-      previewLines.push(`    ${event.command}`);
+      if (event.toolName === 'fetch_url') {
+        // For a network fetch the action (`event.command`) is the bare
+        // URL — a `fetch` verb in bold makes the ask read as the action
+        // it is ("fetch https://…"), not an opaque address. The verb is
+        // the one emphasized token; the URL stays dim like other actions.
+        previewLines.push({ verb: 'fetch', text: event.command });
+      } else {
+        previewLines.push(`    ${event.command}`);
+      }
 
       // Source attribution — a `secondary` line sitting directly
       // under the action, at the same 4-space indent. Tells the

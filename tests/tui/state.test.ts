@@ -2275,6 +2275,26 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
     }
   });
 
+  test('a fetch_url action renders a bold-verb preview line (fetch <url>)', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p1',
+      toolName: 'fetch_url',
+      command: 'https://claude.com/product/claude-code',
+      cwd: '/p',
+    } as UIEvent);
+    expect(r.state.modal).not.toBeNull();
+    if (r.state.modal !== null) {
+      // The url action is a { verb, text } line so the renderer can bold
+      // just "fetch" — not the plain dim string the other tools use.
+      expect(r.state.modal.preview[1]).toEqual({
+        verb: 'fetch',
+        text: 'https://claude.com/product/claude-code',
+      });
+    }
+  });
+
   test('title is the fixed "Permission required" label regardless of tool', () => {
     // The per-tool category labels (Bash command / Editing file / …)
     // were dropped for a single generic title; the command itself

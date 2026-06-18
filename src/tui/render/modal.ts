@@ -82,6 +82,12 @@ const previewRow = (line: PreviewLine, caps: Capabilities): string => {
   if (typeof line === 'string') {
     return line === '' ? '' : `  ${paint(caps, 'dim', line)}`;
   }
+  // `{ verb, text }`: bold verb + dim subject on one line, at the same
+  // 6-space lead the plain action line uses (2 here + the 4 it embeds).
+  // Only the verb is emphasized — the modal title stays the loudest weight.
+  if ('verb' in line) {
+    return `      ${paintMulti(caps, ['bold'], line.verb)} ${paint(caps, 'dim', line.text)}`;
+  }
   return line.text === '' ? '' : `  ${paint(caps, line.tone, line.text)}`;
 };
 

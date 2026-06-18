@@ -62,6 +62,18 @@ describe('renderModal (UI.md §4.10.13 layout)', () => {
     expect(out.filter((l) => /^─+$/.test(l))).toHaveLength(1);
   });
 
+  test('a { verb, text } preview line renders a BOLD verb + dim subject (fetch action)', () => {
+    const out = renderModal(
+      baseModal({ preview: [{ verb: 'fetch', text: 'https://claude.com/product/claude-code' }] }),
+      colored,
+    );
+    const action = out.find((l) => l.includes('fetch'));
+    expect(action).toBeDefined();
+    // bold (SGR 1) wraps only the verb; the url is dim (SGR 2).
+    expect(action).toContain(`${CSI}1mfetch${CSI}0m`);
+    expect(action).toContain(`${CSI}2mhttps://claude.com/product/claude-code`);
+  });
+
   test('top rule uses ASCII dashes when unicode disabled', () => {
     const out = renderModal(baseModal(), ascii);
     expect(out[0]).toMatch(/^-+$/);

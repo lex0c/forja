@@ -57,6 +57,12 @@ export interface FetchUrlOutput {
   // The model-facing body, wrapped in untrusted-content framing. Either
   // the full rendered content or a preview when `saved_path` is set.
   content: string;
+  // One-line operator-facing summary for the finalized TUI chip (status ·
+  // format · size, plus truncated / saved-to-file / injection-suspect
+  // flags). The harness reads `result_detail` and routes it to the chip's
+  // `└─` connector — without it a successful fetch shows no result detail,
+  // and the injection-suspect signal stays invisible to the operator.
+  result_detail?: string;
 }
 
 // §9.1.4 size/time caps.
@@ -95,6 +101,12 @@ const looksLikeHtml = (text: string): boolean =>
 // Used to refuse binary bodies even when the server omits Content-Type
 // (an empty CT must not be a free pass to decode arbitrary bytes as text).
 const looksBinary = (bytes: Uint8Array): boolean => bytes.subarray(0, 1024).includes(0);
+
+const formatBytes = (n: number): string => {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+};
 
 // Just the call signature we use — `typeof fetch` would drag in Bun's
 // `fetch.preconnect` static, which a plain test stub can't satisfy.
@@ -511,6 +523,14 @@ export const createFetchUrlTool = (
         } else {
           out.content = frameContent(rendered, finalUrl, injectionSuspect, nonce);
         }
+
+        // One-line chip detail (operator-facing). `injection-suspect` is the
+        // load-bearing flag here — it's otherwise invisible in the TUI.
+        const detailParts = [`${status}`, format, formatBytes(out.bytes)];
+        if (truncated) detailParts.push('truncated');
+        if (out.saved_path !== undefined) detailParts.push('saved to file');
+        if (injectionSuspect) detailParts.push('injection-suspect');
+        out.result_detail = detailParts.join(' · ');
 
         return out;
       } finally {
