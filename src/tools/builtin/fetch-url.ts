@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto';
+import { lookup } from 'node:dns/promises';
 import { join } from 'node:path';
 import { atomicWrite } from '../../fs/atomic-write.ts';
 import { redactSecrets } from '../../memory/index.ts';
+import { checkSsrfBlocklist } from '../../permissions/resolvers/fetch.ts';
 import { forjaCacheDir } from '../../storage/paths.ts';
 import { ERROR_CODES, type Tool, type ToolContext, type ToolResult, toolError } from '../types.ts';
 import { htmlToMarkdown } from './_html-to-markdown.ts';
@@ -119,17 +121,53 @@ const formatBytes = (n: number): string => {
 };
 
 // Just the call signature we use — `typeof fetch` would drag in Bun's
-// `fetch.preconnect` static, which a plain test stub can't satisfy.
-type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
+// `fetch.preconnect` static, which a plain test stub can't satisfy. The
+// `tls.serverName` extension (Bun) lets us pin the connection to a
+// validated IP while keeping the cert checked against the real hostname.
+type RequestInitWithTls = RequestInit & { tls?: { serverName?: string } };
+type FetchLike = (input: string | URL, init?: RequestInitWithTls) => Promise<Response>;
+
+type ResolvedAddr = { address: string; family: number };
+type LookupFn = (host: string) => Promise<ResolvedAddr[]>;
 
 interface FetchUrlDeps {
   // Injected for tests; defaults to the global fetch.
   fetchImpl?: FetchLike;
+  // Injected for tests; defaults to a real DNS lookup (all addresses).
+  lookupImpl?: LookupFn;
   // Injected for tests; defaults to the Forja cache dir.
   cacheDir?: () => string;
   // Injected for deterministic test assertions; defaults to a random hex.
   nonce?: () => string;
 }
+
+// DNS-rebinding mitigation (§9.1.6). The permission resolver only saw the
+// hostname STRING; resolve it here and validate EVERY address against the
+// SSRF blocklist right before connecting. Returns the address to pin the
+// connection to, or a refusal reason. Validating all addresses (not just
+// the one we pin) refuses round-robin `[public, internal]` setups too.
+const resolveAndValidate = async (
+  host: string,
+  doLookup: LookupFn,
+): Promise<{ ip: string; family: number } | { error: string }> => {
+  let addrs: ResolvedAddr[];
+  try {
+    addrs = await doLookup(host);
+  } catch {
+    return { error: `DNS resolution failed for '${host}'` };
+  }
+  if (addrs.length === 0) return { error: `'${host}' resolved to no addresses` };
+  for (const a of addrs) {
+    const blocked = checkSsrfBlocklist(a.address);
+    if (blocked !== null) {
+      return {
+        error: `'${host}' resolves to a blocked address ${a.address} (${blocked}); see SECURITY_GUIDELINE.md §9.1.6`,
+      };
+    }
+  }
+  const pick = addrs[0] as ResolvedAddr;
+  return { ip: pick.address, family: pick.family };
+};
 
 const isNonEmptyString = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
 
@@ -235,6 +273,7 @@ export const createFetchUrlTool = (
   // that swaps `globalThis.fetch` — notably the eval harness installing a
   // hermetic HTTP stub — is honored by the default tool.
   const doFetch: FetchLike = deps.fetchImpl ?? ((input, init) => fetch(input, init));
+  const doLookup: LookupFn = deps.lookupImpl ?? ((host) => lookup(host, { all: true }));
   const cacheDir = deps.cacheDir ?? forjaCacheDir;
   const makeNonce =
     deps.nonce ??
@@ -338,18 +377,21 @@ export const createFetchUrlTool = (
         let currentUrl = parsed.toString();
         let response: Response | undefined;
         for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+          const hopUrl = (() => {
+            try {
+              return new URL(currentUrl);
+            } catch {
+              return null;
+            }
+          })();
+          if (hopUrl === null) {
+            return toolError(ERROR_CODES.fetchInvalidUrl, `fetch_url: invalid URL '${currentUrl}'`);
+          }
           // The INITIAL hop was already gated by the harness; re-checking
           // it here would re-prompt a confirm the operator just answered
           // (grants don't persist). Re-gate only the redirect hops.
           if (hop > 0) {
-            const targetUrl = (() => {
-              try {
-                return new URL(currentUrl);
-              } catch {
-                return null;
-              }
-            })();
-            const targetHost = targetUrl?.hostname.toLowerCase() ?? '';
+            const targetHost = hopUrl.hostname.toLowerCase();
             const decision = ctx.permissionCheck('fetch_url', 'web.fetch', { url: currentUrl });
             // allow → trusted/allow_hosts (or SSRF already denied → not allow).
             // deny → SSRF / deny_hosts. confirm → unknown host: only follow
@@ -359,7 +401,7 @@ export const createFetchUrlTool = (
             // the same host — the operator approved an encrypted fetch, not a
             // plaintext one. Blocked hops surface the target so the model can
             // fetch it explicitly (re-triggering the normal confirm flow).
-            const downgrade = approvedScheme === 'https:' && targetUrl?.protocol === 'http:';
+            const downgrade = approvedScheme === 'https:' && hopUrl.protocol === 'http:';
             const sameHost = targetHost === approvedHost && targetHost.length > 0 && !downgrade;
             if (decision.kind === 'deny' || (decision.kind === 'confirm' && !sameHost)) {
               return toolError(
@@ -369,17 +411,36 @@ export const createFetchUrlTool = (
             }
           }
 
+          // DNS-rebinding mitigation (§9.1.6) — runs on EVERY hop. The gate
+          // only saw the hostname string; resolve it, validate every address
+          // against the SSRF blocklist, and PIN the connection to a validated
+          // IP (Host header routes the vhost, tls.serverName keeps the cert
+          // checked against the real name). A public-looking host that
+          // resolves to loopback / metadata / RFC1918 is refused here, and a
+          // rebind between check and connect can't swap the IP.
+          const resolved = await resolveAndValidate(hopUrl.hostname, doLookup);
+          if ('error' in resolved) {
+            return toolError(ERROR_CODES.fetchPolicyDenied, `fetch_url: ${resolved.error}`);
+          }
+          const ipHost = resolved.family === 6 ? `[${resolved.ip}]` : resolved.ip;
+          const portPart = hopUrl.port ? `:${hopUrl.port}` : '';
+          const pinnedUrl = `${hopUrl.protocol}//${ipHost}${portPart}${hopUrl.pathname}${hopUrl.search}`;
+
           let resp: Response;
           try {
-            resp = await doFetch(currentUrl, {
+            const init: RequestInitWithTls = {
               method: 'GET',
               redirect: 'manual',
               signal: controller.signal,
               headers: {
                 'User-Agent': USER_AGENT,
                 Accept: 'text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5',
+                // Socket goes to the pinned IP; Host routes the right vhost.
+                Host: hopUrl.host,
               },
-            });
+            };
+            if (hopUrl.protocol === 'https:') init.tls = { serverName: hopUrl.hostname };
+            resp = await doFetch(pinnedUrl, init);
           } catch (e) {
             const aborted = ctx.signal.aborted || controller.signal.aborted;
             const msg = e instanceof Error ? e.message : String(e);
