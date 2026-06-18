@@ -2,9 +2,9 @@ name: model fetches a doc URL and extracts a fact from the converted markdown
 # The positive path for fetch_url. fetch_url is host-gated: an unknown host
 # confirms, which dead-ends as a deny in the headless eval, so the case
 # pre-trusts the doc host via tools.fetch_url.allow_hosts. The page is served
-# by setup.httpStub — the executor swaps the global fetch so the tool reads
-# canned bytes instead of the live network (which is flaky AND blocked by the
-# SSRF gate for any local stub server). The property under test is purely the
+# by setup.httpStub — the executor injects a stubbed lookup+fetch into fetch_url
+# so the tool reads canned bytes instead of the live network (which is flaky AND
+# blocked by the SSRF gate for any local stub server). The property under test is purely the
 # behavior: the model reaches for fetch_url on a "fetch this URL" task and
 # reports the timeout value the HTML→markdown conversion surfaces.
 prompt: |

@@ -299,8 +299,8 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
               ? // A `done` chip can carry BOTH a subject (the target) and a
                 // one-line result detail (resultDetail → summary): render
                 // them together as `subject — detail` so a tool like
-                // fetch_url surfaces `url — 200 · markdown · 1.2 KB` instead
-                // of dropping the detail because the subject won the line.
+                // fetch_url surfaces `url — 200 · 1.2 KB` instead of dropping
+                // the detail because the subject won the line.
                 item.summary !== undefined
                 ? `${item.subject} — ${item.summary}`
                 : item.subject

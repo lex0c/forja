@@ -63,12 +63,15 @@ export interface EvalSetup {
   // confirms still deny — the security invariant a posture eval pins.
   approvalPosture?: ApprovalPosture;
   // Hermetic HTTP stub for network tools (fetch_url). Maps an exact
-  // request URL to a canned response. The executor swaps `globalThis.fetch`
-  // for the duration of the run so the tool fetches the canned bytes
-  // instead of the live network; unmatched URLs (the provider's own API
-  // calls) pass through to the real fetch. Lets a model-in-the-loop eval
-  // exercise fetch_url deterministically — the live-network alternative is
-  // both flaky and blocked by the SSRF gate for local stub servers.
+  // request URL to a canned response. The executor injects this into a
+  // stubbed fetch_url (`buildFetchStubRegistry`) — a `lookup` that returns a
+  // public test IP plus a `fetch` that maps the pinned request back to the
+  // original URL via the Host header — and swaps that tool into the registry.
+  // `globalThis.fetch` is NOT touched, so the provider's own API calls hit the
+  // real network; an unmatched fetch_url URL is rejected ('no canned
+  // response'). Lets a model-in-the-loop eval exercise fetch_url
+  // deterministically — the live-network alternative is both flaky and blocked
+  // by the SSRF gate for local stub servers.
   httpStub?: Record<string, EvalHttpResponse>;
 }
 
