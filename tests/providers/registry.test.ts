@@ -1,13 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 import { ANTHROPIC_MODEL_NAMES } from '../../src/providers/anthropic/capabilities.ts';
+import { createDefaultRegistry } from '../../src/providers/catalog-file.ts';
 import { GOOGLE_MODEL_NAMES } from '../../src/providers/google/capabilities.ts';
 import { OLLAMA_MODEL_NAMES } from '../../src/providers/ollama/capabilities.ts';
 import { OPENAI_MODEL_NAMES } from '../../src/providers/openai/capabilities.ts';
-import {
-  type ModelEntry,
-  createDefaultRegistry,
-  createRegistry,
-} from '../../src/providers/registry.ts';
+import { type ModelEntry, createRegistry } from '../../src/providers/registry.ts';
 
 const dummyEntry = (id: string): ModelEntry => ({
   id,

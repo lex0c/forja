@@ -1,0 +1,254 @@
+// Operator-owned model catalog: file I/O + validation (catalog-io) and
+// registry construction / factory wiring (catalog-file).
+//
+// The catalog file (`~/.config/forja/model_providers.json`) is the
+// runtime source of truth; these tests pin the fail-soft contract
+// (absent/corrupt → error; bad entry → warn+skip; dup id → first wins)
+// and the family→adapter wiring (capabilities + base_url + api_key_env).
+
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import {
+  buildRegistryFromEntries,
+  createDefaultRegistry,
+  loadModelRegistry,
+} from '../../src/providers/catalog-file.ts';
+import {
+  CATALOG_VERSION,
+  loadModelProvidersFile,
+  modelProvidersPath,
+  serializeModelProviders,
+} from '../../src/providers/catalog-io.ts';
+import { resolveProviderFromId } from '../../src/providers/resolve.ts';
+import { CANONICAL_MODEL_PROVIDERS } from '../../src/providers/seed-catalog.ts';
+import type { ModelProviderEntry, ProviderCapabilities } from '../../src/providers/types.ts';
+
+const VALID_CAPS: ProviderCapabilities = {
+  tools: 'native',
+  cache: false,
+  vision: false,
+  streaming: true,
+  constrained: 'json_mode',
+  context_window: 32_768,
+  output_max_tokens: 8_192,
+  cost_per_1k_input: 0,
+  cost_per_1k_output: 0,
+  notes: ['test model'],
+};
+
+let workdir: string;
+let env: NodeJS.ProcessEnv;
+
+beforeEach(() => {
+  workdir = mkdtempSync(join(tmpdir(), 'forja-catalog-'));
+  // loadModelProvidersFile takes an explicit env, so no process.env
+  // mutation — the resolved path is `<workdir>/forja/model_providers.json`.
+  env = { XDG_CONFIG_HOME: workdir };
+});
+
+afterEach(() => {
+  rmSync(workdir, { recursive: true, force: true });
+});
+
+// Write raw bytes to the resolved catalog path for `env`.
+const writeCatalog = (raw: string): void => {
+  const path = modelProvidersPath(env);
+  if (path === null) throw new Error('no path');
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, raw);
+};
+
+const entry = (over: Partial<ModelProviderEntry> = {}): ModelProviderEntry => ({
+  id: 'ollama/qwen3:14b',
+  family: 'ollama',
+  model_name: 'qwen3:14b',
+  capabilities: VALID_CAPS,
+  ...over,
+});
+
+const catalogJson = (models: unknown[]): string =>
+  JSON.stringify({ version: CATALOG_VERSION, models });
+
+describe('loadModelProvidersFile — hard errors (init mandatory)', () => {
+  test('absent file → error pointing at forja init', () => {
+    const r = loadModelProvidersFile(env);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain('forja init');
+  });
+
+  test('no derivable config dir → error', () => {
+    const r = loadModelProvidersFile({});
+    expect(r.ok).toBe(false);
+  });
+
+  test('invalid JSON → error mentioning re-init', () => {
+    writeCatalog('{ not json');
+    const r = loadModelProvidersFile(env);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain('--force=model_providers');
+  });
+
+  test('top level not an object → error', () => {
+    writeCatalog('[]');
+    const r = loadModelProvidersFile(env);
+    expect(r.ok).toBe(false);
+  });
+
+  test('models not an array → error', () => {
+    writeCatalog(JSON.stringify({ version: 1, models: {} }));
+    const r = loadModelProvidersFile(env);
+    expect(r.ok).toBe(false);
+  });
+
+  test('zero valid entries → error', () => {
+    writeCatalog(catalogJson([{ id: 'bogus' }]));
+    const r = loadModelProvidersFile(env);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain('no valid models');
+  });
+});
+
+describe('loadModelProvidersFile — per-entry fail-soft', () => {
+  test('valid entry loads', () => {
+    writeCatalog(catalogJson([entry()]));
+    const r = loadModelProvidersFile(env);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.entries).toHaveLength(1);
+      expect(r.entries[0]?.id).toBe('ollama/qwen3:14b');
+      expect(r.warnings).toHaveLength(0);
+    }
+  });
+
+  test('unsupported family → warn + skip, valid sibling survives', () => {
+    writeCatalog(
+      catalogJson([
+        entry({ id: 'openrouter/x', family: 'openrouter' as never, model_name: 'x' }),
+        entry(),
+      ]),
+    );
+    const r = loadModelProvidersFile(env);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.entries).toHaveLength(1);
+      expect(r.warnings[0]).toContain('family must be one of');
+    }
+  });
+
+  test('id not equal family/model_name → warn + skip', () => {
+    writeCatalog(catalogJson([entry({ id: 'ollama/mismatch' }), entry()]));
+    const r = loadModelProvidersFile(env);
+    if (r.ok) expect(r.warnings[0]).toContain('id must equal');
+  });
+
+  test('invalid api_key_env → warn + skip', () => {
+    writeCatalog(
+      catalogJson([
+        entry({ id: 'openai/m', family: 'openai', model_name: 'm', api_key_env: 'bad-name!' }),
+        entry(),
+      ]),
+    );
+    const r = loadModelProvidersFile(env);
+    if (r.ok) expect(r.warnings[0]).toContain('api_key_env');
+  });
+
+  test('incomplete capabilities → warn + skip naming the field', () => {
+    const broken = { ...entry(), capabilities: { tools: 'native' } };
+    writeCatalog(catalogJson([broken, entry()]));
+    const r = loadModelProvidersFile(env);
+    if (r.ok) expect(r.warnings[0]).toContain('vision must be a boolean');
+  });
+
+  test('duplicate id → warn + first wins', () => {
+    writeCatalog(
+      catalogJson([entry(), entry({ capabilities: { ...VALID_CAPS, context_window: 1 } })]),
+    );
+    const r = loadModelProvidersFile(env);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.entries).toHaveLength(1);
+      expect(r.entries[0]?.capabilities.context_window).toBe(32_768);
+      expect(r.warnings[0]).toContain('duplicate id');
+    }
+  });
+});
+
+describe('registry construction + factory wiring', () => {
+  test('buildRegistryFromEntries resolves an ollama model with overridden caps + base_url', () => {
+    const reg = buildRegistryFromEntries([
+      entry({
+        base_url: 'http://localhost:9999',
+        capabilities: { ...VALID_CAPS, context_window: 12_345 },
+      }),
+    ]);
+    const got = reg.get('ollama/qwen3:14b');
+    expect(got?.capabilities.context_window).toBe(12_345);
+    const resolved = resolveProviderFromId(reg, 'ollama/qwen3:14b');
+    expect(resolved.ok).toBe(true);
+    if (resolved.ok) expect(resolved.provider.id).toBe('ollama/qwen3:14b');
+  });
+
+  test('api_key_env is read from the named env var for the openai adapter', () => {
+    const key = 'FORJA_TEST_OPENAI_KEY_XYZ';
+    const prior = process.env[key];
+    process.env[key] = 'sk-test-123';
+    try {
+      const reg = buildRegistryFromEntries([
+        entry({
+          id: 'openai/gpt-x',
+          family: 'openai',
+          model_name: 'gpt-x',
+          api_key_env: key,
+          base_url: 'http://localhost:9',
+          capabilities: { ...VALID_CAPS, constrained: 'tools' },
+        }),
+      ]);
+      // Factory builds the SDK client without throwing → key resolved.
+      const resolved = resolveProviderFromId(reg, 'openai/gpt-x');
+      expect(resolved.ok).toBe(true);
+    } finally {
+      if (prior === undefined) delete process.env[key];
+      else process.env[key] = prior;
+    }
+  });
+
+  test('loadModelRegistry throws when the file is absent', () => {
+    expect(() => loadModelRegistry(env)).toThrow('forja init');
+  });
+
+  test('loadModelRegistry builds from a valid file', () => {
+    writeCatalog(catalogJson([entry()]));
+    const { registry, warnings } = loadModelRegistry(env);
+    expect(registry.has('ollama/qwen3:14b')).toBe(true);
+    expect(warnings).toHaveLength(0);
+  });
+});
+
+describe('seed catalog + serialization', () => {
+  test('createDefaultRegistry exposes the built-in families', () => {
+    const reg = createDefaultRegistry();
+    const ids = reg.list().map((e) => e.id);
+    expect(ids).toContain('anthropic/claude-opus-4-8');
+    expect(ids.some((id) => id.startsWith('openai/'))).toBe(true);
+    expect(ids.some((id) => id.startsWith('ollama/'))).toBe(true);
+    expect(ids.some((id) => id.startsWith('google/'))).toBe(true);
+  });
+
+  test('every seed entry has an id of the form family/model_name', () => {
+    for (const e of CANONICAL_MODEL_PROVIDERS) {
+      expect(e.id).toBe(`${e.family}/${e.model_name}`);
+    }
+  });
+
+  test('serialize → write → load round-trips the seed', () => {
+    writeCatalog(serializeModelProviders(CANONICAL_MODEL_PROVIDERS));
+    const r = loadModelProvidersFile(env);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.entries).toHaveLength(CANONICAL_MODEL_PROVIDERS.length);
+      expect(r.warnings).toHaveLength(0);
+    }
+  });
+});

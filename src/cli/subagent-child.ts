@@ -25,7 +25,7 @@ import {
 } from '../permissions/index.ts';
 import { setWritableCacheDirsOverride } from '../permissions/sandbox-cache-dirs.ts';
 import { setCachePersistenceOverride } from '../permissions/sandbox-cache-env.ts';
-import { type Provider, type ProviderEffort, createDefaultRegistry } from '../providers/index.ts';
+import { type Provider, type ProviderEffort, loadModelRegistry } from '../providers/index.ts';
 import type { SystemSegment } from '../providers/types.ts';
 import {
   type DB,
@@ -665,7 +665,7 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     if (opts.providerOverride !== undefined) {
       provider = opts.providerOverride;
     } else {
-      const registry = createDefaultRegistry();
+      const { registry } = loadModelRegistry();
       const entry = registry.get(session.model);
       if (entry === null) {
         const envelope = {

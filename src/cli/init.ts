@@ -39,7 +39,10 @@ import { ensureAgentGitignore } from '../memory/gitignore.ts';
 import { resolveScopeRoots as resolveMemoryScopeRoots } from '../memory/paths.ts';
 import { installVendorSeeds } from '../memory/seeds-installer.ts';
 import { projectPolicyPath } from '../permissions/index.ts';
+import { modelProvidersPath, serializeModelProviders } from '../providers/catalog-io.ts';
 import { DEFAULT_MODEL } from '../providers/default-model.ts';
+import { CANONICAL_MODEL_PROVIDERS } from '../providers/seed-catalog.ts';
+import type { ModelProviderEntry } from '../providers/types.ts';
 import { projectScopeRoots } from '../skills/index.ts';
 import { projectAgentsDir } from '../subagents/paths.ts';
 import { forjaCommand } from './forja-command.ts';
@@ -55,11 +58,19 @@ import { type InitMode, renderInitTemplate } from './init-template.ts';
 // (so subsequent writes don't pollute the operator's git status),
 // config third (depends only on .forja/ existing), then the
 // playbooks + skills catalogs (largest payloads, longest to walk),
-// finally `seeds` which lands in the operator's USER scope
-// (`<user>/seeds/` per MEMORY.md §5.7.4) — last so the install
-// report's stdout order moves from project-local to user-global,
-// matching the operator's mental "outside-in" model.
-export type InitStep = 'permissions' | 'gitignore' | 'config' | 'playbooks' | 'skills' | 'seeds';
+// then the two USER-scope artifacts: `model_providers` (the operator-
+// owned model catalog at `<user>/model_providers.json`, AGENTIC_CLI
+// §14.2) and `seeds` (`<user>/seeds/` per MEMORY.md §5.7.4) — last so
+// the install report's stdout order moves from project-local to
+// user-global, matching the operator's mental "outside-in" model.
+export type InitStep =
+  | 'permissions'
+  | 'gitignore'
+  | 'config'
+  | 'playbooks'
+  | 'skills'
+  | 'model_providers'
+  | 'seeds';
 
 export const DEFAULT_STEPS: ReadonlyArray<InitStep> = [
   'permissions',
@@ -67,6 +78,7 @@ export const DEFAULT_STEPS: ReadonlyArray<InitStep> = [
   'config',
   'playbooks',
   'skills',
+  'model_providers',
   'seeds',
 ];
 
@@ -100,6 +112,10 @@ export interface InitOptions {
   // CANONICAL_SEEDS; tests can pin a fixture so a future catalog
   // bump doesn't break the regression set.
   seedSource?: ReadonlyArray<CanonicalSeed>;
+  // Test seam for the model_providers step — pins the catalog seed so a
+  // future catalog change doesn't break the regression set. Production
+  // omits → bundled CANONICAL_MODEL_PROVIDERS.
+  modelProviderSource?: ReadonlyArray<ModelProviderEntry>;
   // Sink for the success / error messages. Production wires to
   // stdout/stderr; tests inject collectors.
   out: (s: string) => void;
@@ -439,6 +455,51 @@ const scaffoldSeeds = (options: InitOptions): StepResult | null => {
   };
 };
 
+// Operator-owned model catalog (AGENTIC_CLI §14.2). Like `seeds` it
+// lands in the USER scope (`<user>/model_providers.json`) — a machine-
+// wide catalog, not project content. Unlike `seeds` it has the SIMPLE
+// lifecycle: seed once, then operator-owned; `--force=model_providers`
+// re-syncs from the bundled CANONICAL_MODEL_PROVIDERS. That is why it IS
+// force-eligible (seeds is not — its upgrade state machine owns the
+// rewrite policy). Modeled on scaffoldConfig (single file, skip-if-
+// exists + force). Resolving the user path can fail on a stripped-down
+// env (no HOME / XDG) — that returns null and aborts the step, because
+// the catalog is mandatory for boot (the operator must resolve the env).
+const scaffoldModelProviders = (options: InitOptions, force: boolean): StepResult | null => {
+  const { out, err } = options;
+  const target = modelProvidersPath();
+  if (target === null) {
+    err(
+      'forja: cannot resolve the user config dir (no HOME / XDG_CONFIG_HOME); model_providers not written\n',
+    );
+    return null;
+  }
+  const exists = existsSync(target);
+  if (exists && !force) {
+    out(
+      `forja: skip ${target} (already exists; use --force or --force=model_providers to overwrite)\n`,
+    );
+    return { wrote: 0, skipped: 1, overwritten: 0 };
+  }
+  try {
+    mkdirSync(dirname(target), { recursive: true });
+    atomicWrite(
+      target,
+      serializeModelProviders(options.modelProviderSource ?? CANONICAL_MODEL_PROVIDERS),
+    );
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    err(`forja: failed to write ${target}: ${msg}\n`);
+    return null;
+  }
+  if (exists) {
+    out(`forja: overwrote ${target}\n`);
+    return { wrote: 0, skipped: 0, overwritten: 1 };
+  }
+  out(`forja: wrote ${target}\n`);
+  return { wrote: 1, skipped: 0, overwritten: 0 };
+};
+
 export const runInit = (options: InitOptions): number => {
   const steps = options.only ?? DEFAULT_STEPS;
   const totals: StepResult = { wrote: 0, skipped: 0, overwritten: 0 };
@@ -454,6 +515,8 @@ export const runInit = (options: InitOptions): number => {
       result = scaffoldPlaybooks(options, forcedFor(options.force, 'playbooks'));
     } else if (step === 'skills') {
       result = scaffoldSkills(options, forcedFor(options.force, 'skills'));
+    } else if (step === 'model_providers') {
+      result = scaffoldModelProviders(options, forcedFor(options.force, 'model_providers'));
     } else {
       // 'seeds' — no `force` flag (excluded from ForceEligibleStep).
       // The installer's upgrade state machine owns the rewrite policy.

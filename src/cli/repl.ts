@@ -36,7 +36,6 @@ import { effectiveBudget, isRecapEnabled, resolveMaxOutputTokens } from '../harn
 import { dispatchChain } from '../hooks/dispatcher.ts';
 import type { HookChainResult, HookEventPayload } from '../hooks/types.ts';
 import type { PolicySource } from '../permissions/index.ts';
-import { createDefaultRegistry } from '../providers/registry.ts';
 import { buildAutoTerse } from '../recap/auto-display.ts';
 import { createReminderScheduler } from '../reminders/index.ts';
 import { flattenControlToLine, stripAnsi, stripControlKeepLines } from '../sanitize/index.ts';
@@ -2330,12 +2329,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // no `/review`-style shortcut for them.
   const slashRegistry = createBuiltinRegistry();
   const cumulative = { costUsd: 0, steps: 0, turns: 0 };
-  // Single registry instance for the REPL's lifetime. /model uses it
-  // for the lookup + factory; bootstrap built its own at boot for
-  // initial provider resolution. Both call sites are independent —
-  // there's no shared state, so two instances are functionally
-  // equivalent (the registry is just a Map of model entries).
-  const modelRegistry = createDefaultRegistry();
+  // Reuse the registry bootstrap already built from the operator-owned
+  // `model_providers.json` (catalog file is read once per boot). /model
+  // uses it for the lookup + factory. Sharing the instance keeps /model
+  // consistent with the provider bootstrap resolved at boot — and means
+  // an operator-registered custom model is visible to /model too.
+  const modelRegistry = bootstrapped.registry;
 
   // Pinned context store (CONTEXT_TUNING.md §12.4). One instance for
   // the REPL's lifetime; threaded into both the SlashContext (so

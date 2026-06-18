@@ -415,6 +415,7 @@ const VALID_INIT_STEPS: ReadonlyArray<InitStep> = [
   'config',
   'playbooks',
   'skills',
+  'model_providers',
   'seeds',
 ];
 
@@ -427,6 +428,7 @@ const FORCE_ELIGIBLE_STEPS: ReadonlyArray<ForceEligibleStep> = [
   'config',
   'playbooks',
   'skills',
+  'model_providers',
 ];
 
 const parseCsvSubset = <T extends string>(

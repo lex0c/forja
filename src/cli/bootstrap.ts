@@ -57,7 +57,7 @@ import {
 } from '../permissions/index.ts';
 import { setWritableCacheDirsOverride } from '../permissions/sandbox-cache-dirs.ts';
 import { setCachePersistenceOverride } from '../permissions/sandbox-cache-env.ts';
-import { createDefaultRegistry } from '../providers/index.ts';
+import { type ModelRegistry, loadModelRegistry } from '../providers/index.ts';
 import type { Provider } from '../providers/index.ts';
 import { resolveProviderFromId } from '../providers/resolve.ts';
 import type { SystemSegment } from '../providers/types.ts';
@@ -282,6 +282,11 @@ export interface SandboxEnforcementSnapshot {
 export interface BootstrapResult {
   config: HarnessConfig;
   db: DB;
+  // Model registry built from the operator-owned catalog
+  // (`model_providers.json`). Shared with the REPL (and any other
+  // BootstrapResult consumer) so the catalog file is read ONCE per boot
+  // instead of each call site re-loading it independently.
+  registry: ModelRegistry;
   modelId: string;
   // SHA256 hex of the assembled system prompt, recorded in
   // `prompt_versions` (AUDIT.md §1.3). Undefined only when no
@@ -416,10 +421,17 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // policy YAML error or unknown model doesn't leak a SQLite handle
   // (and the WAL files that come with it).
   let provider: Provider;
-  // Build the registry once and share it across the executor and the
-  // providers-config loader. Creating independent default registries
-  // would double the model-table import cost for no benefit.
-  const registry = createDefaultRegistry();
+  // Load the operator-owned model catalog (`model_providers.json`) and
+  // build the registry once, shared across the executor and the
+  // providers-config loader. `forja init` is mandatory: an absent or
+  // corrupt catalog throws HERE (before the DB opens, alongside the
+  // other can-throw resolutions), with a message pointing at
+  // `forja init`. Malformed individual entries don't abort — they're
+  // skipped and surfaced as warnings on stderr (stdout stays pure).
+  const { registry, warnings: catalogWarnings } = loadModelRegistry();
+  for (const w of catalogWarnings) {
+    process.stderr.write(`forja: ${w}\n`);
+  }
 
   // Resolve project config root EARLY (needed by the providers
   // loader before model resolution). `resolveRepoRoot` walks up
@@ -455,7 +467,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       // recap path keys its deterministic-fallback whitelist on it.
       throw new Error(
         resolved.kind === 'unknown'
-          ? `unknown model: ${modelId}. Known: ${resolved.knownIds.join(', ')}`
+          ? `unknown model: ${modelId}. Known: ${resolved.knownIds.join(', ')}. Add it to model_providers.json (or re-run \`forja init --force=model_providers\`), or pass --model <known-id>.`
           : resolved.message,
       );
     }
@@ -1625,6 +1637,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   return {
     config,
     db,
+    registry,
     modelId,
     ...(systemPromptHash !== undefined ? { systemPromptHash } : {}),
     policyLayers,

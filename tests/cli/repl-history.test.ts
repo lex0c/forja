@@ -18,6 +18,7 @@ import { runRepl } from '../../src/cli/repl.ts';
 import type { HarnessConfig, HarnessEvent, HarnessResult } from '../../src/harness/index.ts';
 import { DEFAULT_BUDGET } from '../../src/harness/types.ts';
 import { createPermissionEngine } from '../../src/permissions/index.ts';
+import { createDefaultRegistry } from '../../src/providers/catalog-file.ts';
 import type { DB } from '../../src/storage/db.ts';
 import { openMemoryDb } from '../../src/storage/db.ts';
 import { appendHistory, countHistory, loadHistory } from '../../src/storage/history.ts';
@@ -72,6 +73,7 @@ const makeBootstrapStubWithDb = (db: DB): BootstrapResult => {
   return {
     config,
     db,
+    registry: createDefaultRegistry(),
     modelId: 'mock/m',
     policyLayers: [],
     lockConflicts: [],
@@ -1065,6 +1067,7 @@ describe('repl — /history on reload (boot disabled → re-enable)', () => {
           ),
         } as unknown as HarnessConfig,
         db: dbForBoot,
+        registry: createDefaultRegistry(),
         modelId: 'mock/m',
         policyLayers: [],
         lockConflicts: [],

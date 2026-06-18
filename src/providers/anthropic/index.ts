@@ -42,6 +42,13 @@ export interface CreateAnthropicProviderOptions {
   // FORJA_ANTHROPIC_CACHE_TTL env var so the CLI path (registry factory
   // invoked with no options) can A/B test by flipping one env var.
   cacheTtl?: CacheTtl;
+  // Override capabilities — supplied by the catalog-file loader for an
+  // operator-registered model. When omitted, capabilities resolve from
+  // the static ANTHROPIC_CAPS catalog.
+  capabilities?: ProviderCapabilities;
+  // Custom endpoint (Anthropic-compatible gateway / proxy). Optional;
+  // omitted ⇒ the SDK's default base URL.
+  baseURL?: string;
 }
 
 // Resolve the cache TTL default from the environment for callers who don't
@@ -232,9 +239,11 @@ export const createAnthropicProvider = (
   modelName: string,
   options: CreateAnthropicProviderOptions = {},
 ): Provider => {
-  const caps = ANTHROPIC_CAPS[modelName];
+  const caps = options.capabilities ?? ANTHROPIC_CAPS[modelName];
   if (caps === undefined) {
-    throw new Error(`unknown Anthropic model: ${modelName}`);
+    throw new Error(
+      `unknown Anthropic model: ${modelName} (pass options.capabilities or add it to ANTHROPIC_CAPS)`,
+    );
   }
 
   const cacheTtl = options.cacheTtl ?? cacheTtlFromEnv();
@@ -266,7 +275,10 @@ export const createAnthropicProvider = (
     if (apiKey === undefined || apiKey.length === 0) {
       throw new Error('Anthropic API key required (pass options.apiKey or set ANTHROPIC_API_KEY)');
     }
-    client = new Anthropic({ apiKey });
+    client = new Anthropic({
+      apiKey,
+      ...(options.baseURL !== undefined ? { baseURL: options.baseURL } : {}),
+    });
   }
 
   // Resolved once: whether to replay signed thinking blocks across tool turns

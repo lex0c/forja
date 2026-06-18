@@ -22,6 +22,7 @@ import { bootstrap } from '../../src/cli/bootstrap.ts';
 import { setWritableCacheDirsOverride } from '../../src/permissions/sandbox-cache-dirs.ts';
 import { setCachePersistenceOverride } from '../../src/permissions/sandbox-cache-env.ts';
 import type { Provider } from '../../src/providers/index.ts';
+import { seedModelCatalog } from '../helpers/seed-catalog.ts';
 
 let workdir: string;
 let dbPath: string;
@@ -86,6 +87,9 @@ beforeEach(() => {
   // the banner assertions would see.
   originalXdgCache = process.env.XDG_CACHE_HOME;
   process.env.XDG_CACHE_HOME = workdir;
+  // Catalog is mandatory at boot — materialize the seed at the
+  // workdir-scoped user path (XDG_CONFIG_HOME set above).
+  seedModelCatalog();
   captureStderr();
 });
 

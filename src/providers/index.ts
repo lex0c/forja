@@ -3,6 +3,7 @@ export type {
   ConstrainedKind,
   ConstrainedRequest,
   GenerateRequest,
+  ModelProviderEntry,
   Provider,
   ProviderCapabilities,
   ProviderContentBlock,
@@ -53,8 +54,26 @@ export type {
 export { registerOpenAIModels } from './openai/register.ts';
 
 // Registry
-export { createDefaultRegistry, createRegistry } from './registry.ts';
+export { createRegistry } from './registry.ts';
 export type { ModelEntry, ModelRegistry } from './registry.ts';
+
+// Operator-owned model catalog (`model_providers.json`) + seed.
+// Light I/O/validation/serialize is SDK-free (catalog-io); the
+// registry construction (catalog-file) pulls the provider SDKs.
+export {
+  CATALOG_VERSION,
+  MODEL_PROVIDERS_FILENAME,
+  loadModelProvidersFile,
+  modelProvidersPath,
+  serializeModelProviders,
+} from './catalog-io.ts';
+export type { LoadCatalogResult } from './catalog-io.ts';
+export {
+  buildRegistryFromEntries,
+  createDefaultRegistry,
+  loadModelRegistry,
+} from './catalog-file.ts';
+export { CANONICAL_MODEL_PROVIDERS } from './seed-catalog.ts';
 
 // Cost / usage helpers
 export { addUsage, computeCost, emptyUsage } from './cost.ts';

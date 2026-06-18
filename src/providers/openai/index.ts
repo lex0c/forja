@@ -52,6 +52,10 @@ export interface CreateOpenAIProviderOptions {
   // so users on the CLI path (where the registry factory is invoked
   // with no options) can still opt out without code changes.
   includeUsage?: boolean;
+  // Override capabilities — supplied by the catalog-file loader for an
+  // operator-registered model (custom / OpenAI-compatible). When
+  // omitted, capabilities resolve from the static OPENAI_CAPS catalog.
+  capabilities?: ProviderCapabilities;
 }
 
 // OpenAI `prompt_cache_key` (cache routing): requests sharing this key are
@@ -200,9 +204,11 @@ export const createOpenAIProvider = (
   modelName: string,
   options: CreateOpenAIProviderOptions = {},
 ): Provider => {
-  const caps = OPENAI_CAPS[modelName];
+  const caps = options.capabilities ?? OPENAI_CAPS[modelName];
   if (caps === undefined) {
-    throw new Error(`unknown OpenAI model: ${modelName}`);
+    throw new Error(
+      `unknown OpenAI model: ${modelName} (pass options.capabilities or add it to OPENAI_CAPS)`,
+    );
   }
 
   let client: OpenAI;

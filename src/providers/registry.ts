@@ -1,7 +1,3 @@
-import { registerAnthropicModels } from './anthropic/register.ts';
-import { registerGoogleModels } from './google/register.ts';
-import { registerOllamaModels } from './ollama/register.ts';
-import { registerOpenAIModels } from './openai/register.ts';
 import type { Provider, ProviderCapabilities, ProviderFamily } from './types.ts';
 
 export interface ModelEntry {
@@ -47,14 +43,8 @@ export const createRegistry = (): ModelRegistry => {
   };
 };
 
-// Default registry: Anthropic + Google + Ollama + OpenAI. Adding a new family
-// is one new register*Models import + one call below; the rest lives in
-// the adapter folder.
-export const createDefaultRegistry = (): ModelRegistry => {
-  const reg = createRegistry();
-  registerAnthropicModels(reg);
-  registerGoogleModels(reg);
-  registerOllamaModels(reg);
-  registerOpenAIModels(reg);
-  return reg;
-};
+// The runtime catalog is no longer built here from hardcoded
+// `register*Models` — it is loaded from the operator-owned
+// `model_providers.json` (src/providers/catalog-file.ts). The
+// seed-backed `createDefaultRegistry` (kept for tests) and the
+// production `loadModelRegistry` both live there.

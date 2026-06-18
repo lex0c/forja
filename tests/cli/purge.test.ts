@@ -855,6 +855,7 @@ describe('drift-guard — INIT_MARKERS ↔ init.DEFAULT_STEPS', () => {
     config: 'config.toml',
     playbooks: 'playbooks',
     skills: 'skills',
+    model_providers: null, // user-scope (`<user>/model_providers.json`), no project marker
     seeds: null, // user-scope, no project marker — see comment above
   };
 

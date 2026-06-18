@@ -19,6 +19,7 @@ import { DEFAULT_BUDGET } from '../../src/harness/types.ts';
 import type { SandboxAvailability } from '../../src/permissions/sandbox-availability.ts';
 import { DEFAULT_MODEL } from '../../src/providers/default-model.ts';
 import type { Provider } from '../../src/providers/index.ts';
+import { seedModelCatalog } from '../helpers/seed-catalog.ts';
 
 // Hermetic sandbox verdict. `bootstrap()` otherwise calls the real
 // `detectSandboxAvailability()` (a live `Bun.which('bwrap')` probe),
@@ -198,6 +199,11 @@ describe('init → bootstrap eval', () => {
       err: sinks.err,
     });
     expect(initCode).toBe(0);
+    // The partial scaffold (permissions+config) doesn't write the model
+    // catalog, but the catalog is user-global — materialize the seed as a
+    // prior full init would have, so this partial-boot probe resolves a
+    // catalog. (The mandatory-catalog gate is exercised separately.)
+    seedModelCatalog();
     const { db, modelId, permissionState } = await bootstrap({
       prompt: 'eval probe',
       cwd: workdir,
