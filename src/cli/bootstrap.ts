@@ -68,7 +68,7 @@ import {
   resolveScopeRoots as resolveSkillScopeRoots,
 } from '../skills/index.ts';
 import { type DB, closeDb, defaultDbPath, migrate, openDb } from '../storage/index.ts';
-import { forjaCachePersistBase } from '../storage/paths.ts';
+import { forjaCacheDir, forjaCachePersistBase } from '../storage/paths.ts';
 import {
   GOVERNANCE_PROPOSAL_TTL_MS,
   expirePendingProposals,
@@ -818,6 +818,17 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   });
   const permissionEngine = permResult.engine;
   const policyLayers = permResult.layerNames as ('enterprise' | 'user' | 'project' | 'session')[];
+
+  // fetch_url spills oversized pages to `<cache>/fetch/<hash>.md` and tells
+  // the model to `read_file` that path — but the scaffolded read_file/grep
+  // policy only allows `./**` (the workspace), so the absolute cache path
+  // would be denied and the elided content unreachable. Grant a session-allow
+  // for the fetch spill dir on both read tools so the follow-up read works
+  // out of the box. Safe: it's Forja's own cache, and fetch_url already
+  // redacted secrets and framed the body as untrusted before writing it.
+  const fetchSpillGlob = join(forjaCacheDir(), 'fetch', '**');
+  permissionEngine.addSessionAllow('read_file', fetchSpillGlob);
+  permissionEngine.addSessionAllow('grep', fetchSpillGlob);
 
   // Resolve cwd trust state EARLY so the system-prompt composition
   // (project pointer, below) can gate on it. Originally this lived

@@ -411,6 +411,30 @@ describe('formatPermanent', () => {
       expect(out[2]).toBe(pad('└─ which file? → src/checkout.ts'));
     });
 
+    test('done status with BOTH a subject and a summary combines them on the connector', () => {
+      // fetch_url carries a url subject AND a result_detail summary; the chip
+      // must show both as `url — detail` rather than dropping the detail
+      // (which carries the injection-suspect signal) because the subject won
+      // the connector line.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'fetch_url',
+          verb: 'Fetched',
+          subject: 'https://docs.example.com/guide',
+          status: 'done',
+          durationMs: 320,
+          summary: '200 · 1.2 KB · injection-suspect',
+        },
+        unicode,
+      );
+      expect(out).toHaveLength(3);
+      expect(out[1]).toBe('● Fetched  [320ms]');
+      expect(out[2]).toBe(
+        pad('└─ https://docs.example.com/guide — 200 · 1.2 KB · injection-suspect'),
+      );
+    });
+
     test('non-zero exitCode renders `exit N` on the head', () => {
       const out = formatPermanent(
         {

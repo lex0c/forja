@@ -7,7 +7,13 @@ import {
   EXIT_REASONS,
   type ExitReason,
 } from '../harness/index.ts';
-import type { EvalBudget, EvalCase, EvalExpectation, EvalSetup } from './types.ts';
+import type {
+  EvalBudget,
+  EvalCase,
+  EvalExpectation,
+  EvalHttpResponse,
+  EvalSetup,
+} from './types.ts';
 
 // Built once from the harness's source-of-truth tuple. Adding a new
 // `ExitReason` automatically widens this allowlist — no hand-rolled
@@ -28,7 +34,13 @@ const TOP_LEVEL_KEYS: ReadonlySet<string> = new Set([
   'budget',
 ]);
 
-const SETUP_KEYS: ReadonlySet<string> = new Set(['fixture', 'files', 'approvalPosture', 'gitInit']);
+const SETUP_KEYS: ReadonlySet<string> = new Set([
+  'fixture',
+  'files',
+  'approvalPosture',
+  'gitInit',
+  'httpStub',
+]);
 
 const BUDGET_KEYS: ReadonlySet<string> = new Set([
   'maxSteps',
@@ -164,6 +176,32 @@ const parseSetup = (raw: unknown): EvalSetup | undefined => {
       );
     }
     setup.approvalPosture = p;
+  }
+  if (r.httpStub !== undefined) {
+    const stub = requireRecord(r.httpStub, 'setup.httpStub');
+    const out: Record<string, EvalHttpResponse> = {};
+    for (const [url, resp] of Object.entries(stub)) {
+      const rr = requireRecord(resp, `setup.httpStub['${url}']`);
+      const entry: EvalHttpResponse = {
+        body: requireString(rr.body, `setup.httpStub['${url}'].body`),
+      };
+      if (rr.status !== undefined) {
+        if (
+          typeof rr.status !== 'number' ||
+          !Number.isInteger(rr.status) ||
+          rr.status < 100 ||
+          rr.status > 599
+        ) {
+          throw new Error(`eval: setup.httpStub['${url}'].status must be an integer in [100, 599]`);
+        }
+        entry.status = rr.status;
+      }
+      if (rr.contentType !== undefined) {
+        entry.contentType = requireString(rr.contentType, `setup.httpStub['${url}'].contentType`);
+      }
+      out[url] = entry;
+    }
+    setup.httpStub = out;
   }
   return setup;
 };

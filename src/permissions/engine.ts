@@ -82,6 +82,7 @@ import type {
   PolicyToolsSection,
   PostureChange,
 } from './types.ts';
+import { categoryIsEgress } from './types.ts';
 
 export interface EngineOptions {
   cwd: string;
@@ -1180,7 +1181,23 @@ const checkFetch = (
       source: { layer, rule: allowed, section: 'fetch_url' },
     };
   }
-  return denyDefault(toolName, mode, { layer, section: 'fetch_url' });
+  // Default-CONFIRM (not deny) for an unmatched host. deny_hosts / SSRF
+  // already short-circuited above; allow_hosts / grants / session-allow
+  // already returned allow; bypass never reaches here (short-circuited in
+  // check()). A hard deny here made `fetch_url` unusable for ad-hoc "read
+  // this URL" unless every host was pre-listed — and a URL the model
+  // surfaced is reviewable, so ASK rather than refuse. `confirmCause:
+  // 'policy'` routes through the standard modal in supervised; the
+  // autonomous-posture auto-approve EXCLUDES web.fetch (network egress
+  // always asks — exfil control, AGENTIC_CLI §9), so this can't become a
+  // silent fetch-anything under autonomous.
+  return {
+    kind: 'confirm',
+    confirmCause: 'policy',
+    prompt: `Fetch web content from ${host}`,
+    reason: `no allow rule matched for fetch_url host '${host}' (mode=${mode})`,
+    source: { layer, section: 'fetch_url' },
+  };
 };
 
 // Resolve the policy section name for a tool. The mapping is mostly
@@ -2488,7 +2505,20 @@ export const createPermissionEngine = (
       score >= scoreConfirmThreshold || gateConfidence === 'low' || resolverForcesConfirm;
     let postureNote: string | null = null;
     if (posture === 'autonomous' && liveState === 'ready' && decision.kind === 'confirm') {
-      if (decision.confirmCause === 'policy' && !policyConfirmIsRisky) {
+      // Network egress is NEVER auto-approved by autonomous. A fetch the model
+      // chose can carry data OUT in the URL (exfil), and the host isn't
+      // repo-confined the way the bash branch below requires — egress control
+      // (AGENTIC_CLI §9) means the operator always sees an unknown-host egress,
+      // even under autonomous. deny_hosts/allow_hosts still decide allow/deny
+      // without a modal; only the default-confirm falls here. `categoryIsEgress`
+      // (not a `=== 'web.fetch'` name check) keeps this exhaustive: a future
+      // egress category is excluded by construction, not by remembering to
+      // patch this line.
+      if (
+        decision.confirmCause === 'policy' &&
+        !policyConfirmIsRisky &&
+        !categoryIsEgress(category)
+      ) {
         decision = autoApprovePolicyConfirm(decision);
         if (decision.kind === 'allow') postureNote = 'autonomous: auto-approved policy confirm';
       } else if (

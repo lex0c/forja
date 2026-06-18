@@ -53,6 +53,56 @@ expect:
     expect(c.expect.find((e) => e.kind === 'min_steps')).toEqual({ kind: 'min_steps', count: 5 });
   });
 
+  test('parses setup.httpStub with defaults and explicit fields', () => {
+    const yaml = `
+name: stub
+prompt: p
+setup:
+  httpStub:
+    'https://docs.forja.test/x':
+      body: '<h1>hi</h1>'
+      contentType: 'text/html'
+      status: 201
+expect:
+  - status: done
+`;
+    const c = parseEvalCase(yaml, '/tmp/c.yaml');
+    expect(c.setup?.httpStub?.['https://docs.forja.test/x']).toEqual({
+      body: '<h1>hi</h1>',
+      contentType: 'text/html',
+      status: 201,
+    });
+  });
+
+  test('rejects setup.httpStub entry without a string body', () => {
+    const yaml = `
+name: bad
+prompt: p
+setup:
+  httpStub:
+    'https://x.test/y':
+      status: 200
+expect:
+  - status: done
+`;
+    expect(() => parseEvalCase(yaml, '/tmp/c.yaml')).toThrow(/httpStub.*body/);
+  });
+
+  test('rejects setup.httpStub status out of range', () => {
+    const yaml = `
+name: bad
+prompt: p
+setup:
+  httpStub:
+    'https://x.test/y':
+      body: 'x'
+      status: 7
+expect:
+  - status: done
+`;
+    expect(() => parseEvalCase(yaml, '/tmp/c.yaml')).toThrow(/status must be an integer/);
+  });
+
   test('rejects non-integer min_steps', () => {
     const yaml = `
 name: x

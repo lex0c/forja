@@ -37,7 +37,10 @@ const MAX_LINE_LENGTH = 2000;
 // margin; anything past it should be processed by purpose-built
 // tools (grep with line ranges, head/tail via bash) instead of
 // loaded into the model context wholesale.
-const MAX_FILE_BYTES = 10 * 1024 * 1024;
+// Exported so a producer that writes a file for the model to read back
+// (fetch_url's oversized-page spill) can cap its output to stay under this
+// limit — otherwise it would hand the model a saved_path read_file refuses.
+export const MAX_FILE_BYTES = 10 * 1024 * 1024;
 
 // Binary-detection scan window. We look for a NUL byte (0x00) in the
 // first N bytes to classify a file as binary — git uses the same

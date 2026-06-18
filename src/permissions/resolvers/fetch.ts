@@ -69,7 +69,12 @@ const DANGEROUS_PROTOCOLS: ReadonlyMap<string, string> = new Map([
 //   - IPv6: ::1 (loopback), :: (unspecified), fe80::/10 (link-local),
 //     fc00::/7 (unique local; fc + fd prefixes)
 //   - IPv4-mapped IPv6: `::ffff:127.0.0.1` and friends
-const checkSsrfBlocklist = (rawHost: string): string | null => {
+//
+// Exported so the fetch_url TOOL can re-run it on the RESOLVED IP(s) right
+// before connecting (DNS-rebinding mitigation, §9.1.6): this resolver only
+// sees the hostname STRING, so a public-looking name that resolves to an
+// internal IP would otherwise pass the gate and reach the internal service.
+export const checkSsrfBlocklist = (rawHost: string): string | null => {
   let h = rawHost.toLowerCase();
   // Strip IPv6 brackets if present — URL.hostname behavior varies
   // across runtimes (Node returns with brackets; the WHATWG URL

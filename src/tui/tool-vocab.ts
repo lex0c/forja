@@ -74,6 +74,11 @@ export const TOOL_VOCAB: Readonly<Record<string, ToolVocab>> = {
     finalVerb: 'Pinned context',
     subject: (a) => str(a.text),
   },
+  fetch_url: {
+    activeVerb: 'Fetching',
+    finalVerb: 'Fetched',
+    subject: (a) => str(a.url),
+  },
   read_file: {
     activeVerb: 'Reading file',
     finalVerb: 'Read file',

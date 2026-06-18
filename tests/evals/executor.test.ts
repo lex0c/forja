@@ -2,10 +2,16 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { executeCase, resolveEvalCacheRoot, summarize } from '../../src/evals/executor.ts';
+import {
+  buildFetchStubRegistry,
+  executeCase,
+  resolveEvalCacheRoot,
+  summarize,
+} from '../../src/evals/executor.ts';
 import type { EvalCase } from '../../src/evals/types.ts';
 import type { SandboxAvailability } from '../../src/permissions/sandbox-availability.ts';
 import type { Provider, StreamEvent } from '../../src/providers/index.ts';
+import { type ToolContext, isToolError } from '../../src/tools/types.ts';
 
 interface ScriptedStep {
   text?: string;
@@ -700,6 +706,84 @@ describe('executeCase — approval posture (operation mode, AGENTIC_CLI §8.1)',
           { tool_uses: [{ id: 't1', name: 'bash', input: { command: 'frobnicate a && echo b' } }] },
           { text: 'tried' },
         ]),
+      },
+    });
+    expect(r.passed).toBe(true);
+  });
+});
+
+describe('buildFetchStubRegistry', () => {
+  const fetchCtx = (): ToolContext =>
+    ({
+      signal: new AbortController().signal,
+      cwd: process.cwd(),
+      sessionId: 's',
+      stepId: 'st',
+      permissions: { mode: 'strict', posture: 'supervised', canReadPath: () => true },
+      permissionCheck: () => ({ kind: 'allow', reason: 'test' }),
+      isCwdTrusted: true,
+    }) as unknown as ToolContext;
+
+  test('the stubbed fetch_url serves the canned page (injected DNS + Host-mapped fetch)', async () => {
+    // Proves the seam survives the DNS-rebinding pin: the tool resolves via the
+    // injected lookup, pins to the test IP, fetches `https://<ip>/p` with the
+    // Host header, and the stub maps it back to the canned URL.
+    const reg = buildFetchStubRegistry({
+      'https://docs.forja.test/p': {
+        body: '<h1>Doc</h1><p>value 42</p>',
+        contentType: 'text/html',
+      },
+    });
+    const tool = reg.get('fetch_url');
+    expect(tool).not.toBeNull();
+    const out = await tool?.execute({ url: 'https://docs.forja.test/p' }, fetchCtx());
+    expect(isToolError(out)).toBe(false);
+    if (out !== undefined && !isToolError(out)) {
+      const o = out as { content: string };
+      expect(o.content).toContain('# Doc');
+      expect(o.content).toContain('value 42');
+    }
+  });
+
+  test('rejects a fetch_url url that was not stubbed', async () => {
+    const reg = buildFetchStubRegistry({ 'https://x.test/a': { body: 'x' } });
+    const tool = reg.get('fetch_url');
+    const out = await tool?.execute({ url: 'https://y.test/b' }, fetchCtx());
+    expect(isToolError(out)).toBe(true);
+  });
+});
+
+describe('executeCase — httpStub seam', () => {
+  test('runs fetch_url through the stubbed registry in the loop', async () => {
+    const c = baseCase({
+      prompt: 'fetch the doc',
+      setup: {
+        files: {
+          '.forja/permissions.yaml': "tools:\n  fetch_url:\n    allow_hosts: ['docs.forja.test']\n",
+        },
+        httpStub: {
+          'https://docs.forja.test/p': {
+            body: '<h1>Doc</h1><p>value 42</p>',
+            contentType: 'text/html',
+          },
+        },
+      },
+      expect: [
+        { kind: 'tool_called', tool: 'fetch_url' },
+        { kind: 'status', status: 'done' },
+      ],
+    });
+    const r = await executeCase(c, {
+      bootstrapOverride: {
+        providerOverride: mockProvider([
+          {
+            tool_uses: [
+              { id: 'f1', name: 'fetch_url', input: { url: 'https://docs.forja.test/p' } },
+            ],
+          },
+          { text: 'done' },
+        ]),
+        sandboxAvailabilityOverride: HERMETIC_SANDBOX,
       },
     });
     expect(r.passed).toBe(true);

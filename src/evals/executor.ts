@@ -17,7 +17,64 @@ import {
   runAgent,
 } from '../harness/index.ts';
 import { closeDb } from '../storage/db.ts';
-import type { EvalCase, EvalCaseResult, EvalSummary, ExpectationOutcome } from './types.ts';
+import { BUILTIN_TOOLS, createFetchUrlTool } from '../tools/builtin/index.ts';
+import { type ToolRegistry, createToolRegistry } from '../tools/index.ts';
+import type {
+  EvalCase,
+  EvalCaseResult,
+  EvalHttpResponse,
+  EvalSummary,
+  ExpectationOutcome,
+} from './types.ts';
+
+// TEST-NET-3 (RFC 5737) — a public, non-routable address that passes the
+// SSRF blocklist. The stubbed DNS resolves every host to it.
+const STUB_RESOLVED_IP = '203.0.113.1';
+
+// Make fetch_url hermetic for a case declaring `setup.httpStub`. An earlier
+// version swapped `globalThis.fetch`, but the DNS-rebinding fix means
+// fetch_url resolves the host, validates the IP, and connects to a PINNED IP
+// URL with the real host in the Host header — so a global-fetch swap keyed on
+// the request URL never matches, and the real DNS lookup of a reserved `.test`
+// host fails first. Instead, inject the tool's deps directly: a `lookup` that
+// returns STUB_RESOLVED_IP (so resolve+validate passes) and a `fetch` that
+// maps the pinned request back to the ORIGINAL url (via the Host header) to
+// find the canned response. Returns a fresh registry with the stubbed
+// fetch_url swapped in; every other tool is the real builtin, and the
+// provider's own API calls go through the untouched global fetch. Exported for
+// direct unit testing.
+export const buildFetchStubRegistry = (stub: Record<string, EvalHttpResponse>): ToolRegistry => {
+  const fetchImpl = (input: string | URL, init?: RequestInit): Promise<Response> => {
+    let pinned: URL;
+    try {
+      pinned = new URL(String(input));
+    } catch {
+      return Promise.reject(new Error(`eval httpStub: invalid request URL ${String(input)}`));
+    }
+    // The socket goes to the pinned IP; the original host rides the Host header.
+    const host = new Headers(init?.headers).get('host') ?? pinned.host;
+    const originalUrl = `${pinned.protocol}//${host}${pinned.pathname}${pinned.search}`;
+    const canned = stub[originalUrl];
+    if (canned === undefined) {
+      return Promise.reject(new Error(`eval httpStub: no canned response for ${originalUrl}`));
+    }
+    return Promise.resolve(
+      new Response(canned.body, {
+        status: canned.status ?? 200,
+        headers: { 'content-type': canned.contentType ?? 'text/html; charset=utf-8' },
+      }),
+    );
+  };
+  const lookupImpl = async (): Promise<{ address: string; family: number }[]> => [
+    { address: STUB_RESOLVED_IP, family: 4 },
+  ];
+  const fetchTool = createFetchUrlTool({ fetchImpl, lookupImpl });
+  const registry = createToolRegistry();
+  for (const tool of BUILTIN_TOOLS) {
+    registry.register(tool.name === 'fetch_url' ? fetchTool : tool);
+  }
+  return registry;
+};
 
 // Test seam: caller can pre-build a provider (mock for unit tests,
 // real-from-registry for the smoke runner). Mirrors the `bootstrap`
@@ -486,9 +543,15 @@ export const executeCase = async (
     };
 
     const { config, db } = await bootstrap(bootstrapInput);
+    // Hermetic HTTP stub (setup.httpStub): swap in a fetch_url whose DNS +
+    // fetch are stubbed (the post-pinning tool can't be stubbed via the global
+    // fetch — see buildFetchStubRegistry). No global mutation; the provider's
+    // own API calls use the untouched global fetch.
+    const httpStub = caseDef.setup?.httpStub;
     try {
       const cfg = {
         ...config,
+        ...(httpStub !== undefined ? { toolRegistry: buildFetchStubRegistry(httpStub) } : {}),
         onEvent: (e: HarnessEvent) => {
           if (e.type === 'tool_invoking') {
             invocations.push({ toolUseId: e.toolUseId, toolName: e.toolName, args: e.args });

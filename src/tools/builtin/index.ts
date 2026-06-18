@@ -6,6 +6,7 @@ import { bashOutputTool } from './bash-output.ts';
 import { bashTool } from './bash.ts';
 import { clarifyTool } from './clarify.ts';
 import { editFileTool } from './edit-file.ts';
+import { fetchUrlTool } from './fetch-url.ts';
 import { gitApplyPatchTool } from './git-apply-patch.ts';
 import { gitTool } from './git.ts';
 import { globTool } from './glob.ts';
@@ -48,6 +49,8 @@ export { bashListTool } from './bash-list.ts';
 export type { BashListEntry, BashListInput, BashListOutput } from './bash-list.ts';
 export { editFileTool } from './edit-file.ts';
 export type { EditFileInput, EditFileOutput } from './edit-file.ts';
+export { fetchUrlTool, createFetchUrlTool } from './fetch-url.ts';
+export type { FetchUrlInput, FetchUrlOutput } from './fetch-url.ts';
 export { gitTool } from './git.ts';
 export type { GitInput, GitOutput, GitMode } from './git.ts';
 export { gitApplyPatchTool } from './git-apply-patch.ts';
@@ -185,6 +188,10 @@ export const BUILTIN_TOOLS = [
   bashOutputTool,
   bashKillTool,
   bashListTool,
+  // fetch_url — network egress (web.fetch). Deferred (§7.6): reached via
+  // tool_search, not on the base surface. Gated by the existing fetch
+  // resolver + FetchPolicy (SECURITY_GUIDELINE.md §9.1).
+  fetchUrlTool,
   // reminder family (CONTRACTS §2.6.5f / §2.6.10): the clock-driven
   // producer of the notification channel — palette set/list/cancel.
   reminderTool,

@@ -1,0 +1,29 @@
+name: model does not reach for fetch_url when the answer is a local file
+# The negative gate (the over-fetch anti-pattern, mirror of the skills
+# no-false-invoke case). fetch_url is AVAILABLE — a host is even pre-trusted —
+# but the task is to read a local config value, which is read_file's job. The
+# model must not pattern-match "find a value" onto a network fetch. A bare
+# tool_not_called would pass vacuously if the model also skipped read_file, so
+# the positive read_file + the value pin that the task actually ran the
+# ordinary way.
+prompt: |
+  Read config.json and tell me the value of the "endpoint" field.
+setup:
+  files:
+    '.forja/permissions.yaml': |
+      tools:
+        fetch_url:
+          allow_hosts: ['docs.forja.test']
+    'config.json': |
+      {
+        "endpoint": "/v2/widgets",
+        "timeout_ms": 30000
+      }
+expect:
+  - tool_called: read_file
+  - tool_not_called: fetch_url
+  - output_contains: '/v2/widgets'
+  - status: done
+budget:
+  maxSteps: 6
+  maxCostUsd: 0.15
