@@ -7,6 +7,7 @@ import { redactSecrets } from '../../sanitize/index.ts';
 import { forjaCacheDir } from '../../storage/paths.ts';
 import { ERROR_CODES, type Tool, type ToolContext, type ToolResult, toolError } from '../types.ts';
 import { htmlToMarkdown } from './_html-to-markdown.ts';
+import { MAX_FILE_BYTES } from './read-file.ts';
 
 // `fetch_url` — fetch a web page and return it as markdown.
 //
@@ -259,6 +260,17 @@ const readCapped = async (
 // Wrap rendered content in untrusted-data framing. The BEGIN/END markers
 // carry a per-call nonce so the page body can't forge the closing marker
 // to "break out" of the data region.
+// Truncate `s` to at most `maxBytes` UTF-8 bytes WITHOUT splitting a
+// multibyte character. Encoding once, slicing the byte view, and decoding
+// with `stream: true` makes the decoder hold back (drop) an incomplete
+// trailing sequence instead of emitting a replacement char — so the result
+// always re-encodes to <= maxBytes (no overflow, no mojibake at the cut).
+const truncateToBytes = (s: string, maxBytes: number): string => {
+  const bytes = new TextEncoder().encode(s);
+  if (bytes.length <= maxBytes) return s;
+  return new TextDecoder('utf-8').decode(bytes.subarray(0, maxBytes), { stream: true });
+};
+
 const frameContent = (
   body: string,
   finalUrl: string,
@@ -586,9 +598,26 @@ export const createFetchUrlTool = (
         };
 
         if (rendered.length > maxInline) {
-          // Spill the full rendered body to a cache file; return a preview.
+          // Spill the rendered body to a cache file; return a preview.
           const hash = createHash('sha256').update(finalUrl).digest('hex').slice(0, 16);
           const path = join(cacheDir(), 'fetch', `${hash}.md`);
+          // The model reads this file back via read_file, which REFUSES a file
+          // over MAX_FILE_BYTES. The framed file is preamble + markers + body,
+          // so cap the body to leave room for the framing AND a truncation
+          // notice — otherwise a near-10 MiB page (the exact default-size case
+          // this path exists for) spills a saved_path the model can never read.
+          // frameContent('') is exactly the framing overhead, so this bound is
+          // tight: framingBytes + |spillBody| <= MAX_FILE_BYTES by construction.
+          const framingBytes = Buffer.byteLength(
+            frameContent('', finalUrl, injectionSuspect, nonce),
+            'utf8',
+          );
+          const truncNotice = '\n\n[... spill truncated to fit the read_file size cap]';
+          const bodyBudget = MAX_FILE_BYTES - framingBytes - Buffer.byteLength(truncNotice, 'utf8');
+          const spillTruncated = Buffer.byteLength(rendered, 'utf8') > bodyBudget;
+          const spillBody = spillTruncated
+            ? truncateToBytes(rendered, bodyBudget) + truncNotice
+            : rendered;
           try {
             // The file the model `read_file`s back carries the SAME untrusted
             // framing as the inline content (nonce'd markers + "treat as DATA"
@@ -596,9 +625,12 @@ export const createFetchUrlTool = (
             // it must not weaken the §9.1.5 defense. atomicWrite is the repo's
             // crash-safe write (temp + fsync + rename, mkdir -p) — no partial
             // file for the model to read.
-            atomicWrite(path, frameContent(rendered, finalUrl, injectionSuspect, nonce));
+            atomicWrite(path, frameContent(spillBody, finalUrl, injectionSuspect, nonce));
             out.saved_path = path;
-            const preview = `${rendered.slice(0, maxInline)}\n\n[... ${rendered.length - maxInline} more chars elided — full content saved to ${path}; read it with read_file]`;
+            const savedNote = spillTruncated
+              ? `truncated content saved to ${path} (page exceeded the read_file cap); read it with read_file`
+              : `full content saved to ${path}; read it with read_file`;
+            const preview = `${rendered.slice(0, maxInline)}\n\n[... ${rendered.length - maxInline} more chars elided — ${savedNote}]`;
             out.content = frameContent(preview, finalUrl, injectionSuspect, nonce);
           } catch (e) {
             // Spill failed — fall back to inline-truncated rather than error.

@@ -1,9 +1,10 @@
 import { afterAll, describe, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Decision } from '../../src/permissions/index.ts';
 import { type FetchUrlOutput, createFetchUrlTool } from '../../src/tools/builtin/fetch-url.ts';
+import { MAX_FILE_BYTES } from '../../src/tools/builtin/read-file.ts';
 import { isToolError } from '../../src/tools/types.ts';
 import { makeCtx } from './_helpers.ts';
 
@@ -344,6 +345,22 @@ describe('fetch_url', () => {
     expect(saved).toContain('UNTRUSTED WEB CONTENT');
     expect(out.content).toContain('read_file');
     expect(out.content).toContain('more chars elided');
+  });
+
+  test('spill file stays within read_file MAX_FILE_BYTES (framing + notice reserved)', async () => {
+    const dir = mkTmp();
+    // A raw-text body past read_file's cap. Without the spill-side byte cap,
+    // frameContent(rendered) would exceed MAX_FILE_BYTES and read_file would
+    // refuse the saved_path the tool just handed the model.
+    const huge = 'a'.repeat(MAX_FILE_BYTES + 4096);
+    const tool = mkTool({
+      fetchImpl: async () => resp(huge, 'text/plain'),
+      cacheDir: () => dir,
+    });
+    const out = ok(await tool.execute({ url: 'https://example.com/huge', raw: true }, makeCtx()));
+    expect(out.saved_path).toBeDefined();
+    expect(statSync(out.saved_path as string).size).toBeLessThanOrEqual(MAX_FILE_BYTES);
+    expect(out.content).toContain('truncated');
   });
 
   test('injection inside HTML markup tags is detected (scan covers raw source)', async () => {
