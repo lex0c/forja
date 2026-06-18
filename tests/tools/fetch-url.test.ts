@@ -240,14 +240,17 @@ describe('fetch_url', () => {
     expect(out.content).toContain('[SECURITY WARNING]');
   });
 
-  test('credentials in the body are redacted before return (§9.1.3)', async () => {
-    const secret = `ghp_${'a'.repeat(36)}`;
+  test('credentials in the body are redacted with the canonical redactor (§9.1.3)', async () => {
+    // gho_ (GitHub OAuth) is a shape the old memory-scanner redactor missed;
+    // the canonical sanitizer covers ghp/ghs/gho/ghu/ghr/github_pat plus JWT,
+    // bearer, Google, env-style — emitting `<redacted:NAME>`.
+    const ghToken = `gho_${'a'.repeat(36)}`;
     const tool = mkTool({
-      fetchImpl: async () => resp(`<p>token ${secret} here</p>`, 'text/html'),
+      fetchImpl: async () => resp(`<p>token ${ghToken} here</p>`, 'text/html'),
     });
     const out = ok(await tool.execute({ url: 'https://example.com/leak' }, makeCtx()));
-    expect(out.content).not.toContain(secret);
-    expect(out.content).toContain('REDACTED');
+    expect(out.content).not.toContain(ghToken);
+    expect(out.content).toContain('<redacted:');
   });
 
   test('latin-1 body is decoded by its declared charset', async () => {
