@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import type { AuditEmitInput } from '../../src/permissions/audit.ts';
 import { initBashParser } from '../../src/permissions/bash-parser.ts';
 import { createPermissionEngine } from '../../src/permissions/engine.ts';
+import { categoryIsEgress } from '../../src/permissions/types.ts';
 import type { Policy } from '../../src/permissions/types.ts';
 
 // Bash resolver (slice 6) walks the tree-sitter-bash AST. Init is
@@ -918,6 +919,24 @@ describe('engine.check (web.fetch)', () => {
   test('rejects malformed URL', () => {
     const eng = createPermissionEngine(policy({}), { cwd: CWD });
     expect(eng.check('fetch_url', 'web.fetch', { url: 'not a url' }).kind).toBe('deny');
+  });
+
+  test('categoryIsEgress marks only network-egress categories', () => {
+    expect(categoryIsEgress('web.fetch')).toBe(true);
+    expect(categoryIsEgress('fs.read')).toBe(false);
+    expect(categoryIsEgress('fs.write')).toBe(false);
+    expect(categoryIsEgress('bash')).toBe(false);
+    expect(categoryIsEgress('misc')).toBe(false);
+  });
+
+  test('autonomous does NOT auto-approve an unknown-host fetch (egress default-confirm)', () => {
+    // Empty policy → unknown host falls to the policy default-confirm. The
+    // egress guard (categoryIsEgress) must keep it a modal even under
+    // autonomous, or a model-chosen fetch to any host becomes silent exfil.
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    expect(eng.check('fetch_url', 'web.fetch', { url: 'https://unknown.example/x' }).kind).toBe(
+      'confirm',
+    );
   });
 });
 

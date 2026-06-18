@@ -60,9 +60,10 @@ export interface FetchUrlOutput {
   // The model-facing body, wrapped in untrusted-content framing. Either
   // the full rendered content or a preview when `saved_path` is set.
   content: string;
-  // One-line operator-facing summary for the finalized TUI chip (status ·
-  // format · size, plus truncated / saved-to-file / injection-suspect
-  // flags). The harness reads `result_detail` and routes it to the chip's
+  // One-line operator-facing summary for the finalized TUI chip: `status ·
+  // size`, plus an `injection-suspect` token when the body tripped the §9.1.5
+  // heuristic (format / truncated / saved-to-file are deliberately omitted as
+  // chip noise). The harness reads `result_detail` and routes it to the chip's
   // `└─` connector — without it a successful fetch shows no result detail,
   // and the injection-suspect signal stays invisible to the operator.
   result_detail?: string;
@@ -383,36 +384,44 @@ export const createFetchUrlTool = (
         let currentUrl = parsed.toString();
         let response: Response | undefined;
         for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-          const hopUrl = (() => {
-            try {
-              return new URL(currentUrl);
-            } catch {
-              return null;
-            }
-          })();
-          if (hopUrl === null) {
-            return toolError(ERROR_CODES.fetchInvalidUrl, `fetch_url: invalid URL '${currentUrl}'`);
-          }
+          // `currentUrl` is always a valid serialized URL here: the initial
+          // value is `parsed.toString()` and every redirect target is validated
+          // (the `new URL(loc, currentUrl)` below returns early on failure)
+          // before it is assigned, so this parse cannot throw.
+          const hopUrl = new URL(currentUrl);
           // The INITIAL hop was already gated by the harness; re-checking
           // it here would re-prompt a confirm the operator just answered
           // (grants don't persist). Re-gate only the redirect hops.
           if (hop > 0) {
             const targetHost = hopUrl.hostname.toLowerCase();
             const decision = ctx.permissionCheck('fetch_url', 'web.fetch', { url: currentUrl });
-            // allow → trusted/allow_hosts (or SSRF already denied → not allow).
-            // deny → SSRF / deny_hosts. confirm → unknown host: only follow
-            // when it's the SAME host the operator already approved (e.g. an
-            // http→https upgrade). A cross-host redirect to an unapproved
-            // host is blocked, AND so is a TLS downgrade (https→http) even on
-            // the same host — the operator approved an encrypted fetch, not a
-            // plaintext one. Blocked hops surface the target so the model can
-            // fetch it explicitly (re-triggering the normal confirm flow).
+            // A TLS downgrade (https→http) is refused on EVERY tier — including
+            // an allow_hosts / trusted host whose re-gate returns `allow`. The
+            // operator approved an ENCRYPTED fetch; a server-driven downgrade
+            // would put the (pinned-IP) request on the wire in cleartext. So
+            // `downgrade` blocks independently of the allow/confirm decision.
             const downgrade = approvedScheme === 'https:' && hopUrl.protocol === 'http:';
-            const sameHost = targetHost === approvedHost && targetHost.length > 0 && !downgrade;
-            if (decision.kind === 'deny' || (decision.kind === 'confirm' && !sameHost)) {
+            // confirm → unknown host: follow only when it's the SAME host AND
+            // port the operator already approved (e.g. an http→https upgrade).
+            // A different port is a different service the operator never saw
+            // (:443 → :8443 admin), so it gets no follow shortcut; a cross-host
+            // redirect is likewise blocked. deny → SSRF / deny_hosts. Blocked
+            // hops surface the target so the model can fetch it explicitly
+            // (re-triggering the normal confirm flow).
+            const sameHost =
+              targetHost === approvedHost &&
+              targetHost.length > 0 &&
+              hopUrl.port === parsed.port &&
+              !downgrade;
+            if (
+              decision.kind === 'deny' ||
+              downgrade ||
+              (decision.kind === 'confirm' && !sameHost)
+            ) {
+              const reason = downgrade ? 'https→http downgrade refused' : decision.reason;
               return toolError(
                 ERROR_CODES.fetchPolicyDenied,
-                `fetch_url: redirect to '${currentUrl}' blocked: ${decision.reason}. Fetch that URL directly if you intend to follow it.`,
+                `fetch_url: redirect to '${currentUrl}' blocked: ${reason}. Fetch that URL directly if you intend to follow it.`,
               );
             }
           }

@@ -8,6 +8,17 @@ import type { SandboxProfile } from './sandbox-plan.ts';
 
 export type PolicyCategory = 'fs.read' | 'fs.write' | 'bash' | 'web.fetch' | 'misc';
 
+// Categories that send bytes OUT of the machine to an operator-unconfined
+// destination. Egress is special-cased by the autonomous posture: a
+// default-confirm for an egress category is NEVER auto-approved — a
+// model-chosen fetch can carry data out in the URL (exfil; AGENTIC_CLI §9), so
+// the operator always sees an unknown-host egress, even under autonomous. This
+// is the SINGLE source of truth for "is this egress": a future egress category
+// (a POST/webhook tool, an MCP egress) must be added here, not re-pattern-
+// matched as `category === 'web.fetch'` at each guard site (which would
+// silently auto-approve the new category and reopen the exfil hole).
+export const categoryIsEgress = (category: PolicyCategory): boolean => category === 'web.fetch';
+
 export type PolicyMode = 'strict' | 'acceptEdits' | 'bypass';
 
 // Operation mode the operator flips from the prompt (shown as

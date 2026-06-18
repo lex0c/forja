@@ -169,6 +169,48 @@ describe('fetch_url', () => {
     expect(isToolError(r) && r.error_code).toBe('fetch.policy_denied');
   });
 
+  test('https→http downgrade is blocked even on an allow-tier host', async () => {
+    // The redirect re-gate returns `allow` for an allow_hosts/trusted host, so
+    // the downgrade guard must fire independently of the decision tier — else
+    // a server-driven https→http redirect puts the request on the wire in
+    // cleartext despite the operator approving an encrypted fetch.
+    const tool = mkTool({
+      fetchImpl: async (url) => {
+        if (new URL(String(url)).protocol === 'https:') {
+          return new Response(null, {
+            status: 301,
+            headers: { location: 'http://trusted.com/x', 'content-type': 'text/html' },
+          });
+        }
+        return resp('<p>plaintext landed</p>', 'text/html');
+      },
+    });
+    const ctx = makeCtx({ permissionCheck: () => allow() });
+    const r = await tool.execute({ url: 'https://trusted.com/p' }, ctx);
+    expect(isToolError(r) && r.error_code).toBe('fetch.policy_denied');
+    expect(isToolError(r) && r.error_message).toContain('downgrade');
+  });
+
+  test('same-host redirect to a DIFFERENT PORT is blocked (re-gate is port-aware)', async () => {
+    // Operator approved :443; :8443 is a different service they never saw, so
+    // the same-host follow shortcut must not apply.
+    const tool = mkTool({
+      fetchImpl: async (url) => {
+        if (new URL(String(url)).port === '') {
+          return new Response(null, {
+            status: 302,
+            headers: { location: 'https://site.com:8443/admin', 'content-type': 'text/html' },
+          });
+        }
+        return resp('<p>admin panel</p>', 'text/html');
+      },
+    });
+    const ctx = makeCtx({ permissionCheck: () => confirm('unknown host') });
+    const r = await tool.execute({ url: 'https://site.com/p' }, ctx);
+    expect(isToolError(r) && r.error_code).toBe('fetch.policy_denied');
+    expect(isToolError(r) && r.error_message).toContain('8443');
+  });
+
   test('a host that resolves to an internal IP is refused (DNS-rebinding, §9.1.6)', async () => {
     const tool = mkTool({
       lookupImpl: async () => [{ address: '127.0.0.1', family: 4 }],

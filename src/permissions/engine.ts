@@ -82,6 +82,7 @@ import type {
   PolicyToolsSection,
   PostureChange,
 } from './types.ts';
+import { categoryIsEgress } from './types.ts';
 
 export interface EngineOptions {
   cwd: string;
@@ -2504,14 +2505,20 @@ export const createPermissionEngine = (
       score >= scoreConfirmThreshold || gateConfidence === 'low' || resolverForcesConfirm;
     let postureNote: string | null = null;
     if (posture === 'autonomous' && liveState === 'ready' && decision.kind === 'confirm') {
-      // Network egress (web.fetch) is NEVER auto-approved by autonomous.
-      // A fetch the model chose can carry data OUT in the URL (exfil), and
-      // the host isn't repo-confined the way the bash branch below requires
-      // — egress control (AGENTIC_CLI §9) means the operator always sees an
-      // unknown-host fetch, even under autonomous. deny_hosts/allow_hosts
-      // still decide allow/deny without a modal; only the default-confirm
-      // falls here.
-      if (decision.confirmCause === 'policy' && !policyConfirmIsRisky && category !== 'web.fetch') {
+      // Network egress is NEVER auto-approved by autonomous. A fetch the model
+      // chose can carry data OUT in the URL (exfil), and the host isn't
+      // repo-confined the way the bash branch below requires — egress control
+      // (AGENTIC_CLI §9) means the operator always sees an unknown-host egress,
+      // even under autonomous. deny_hosts/allow_hosts still decide allow/deny
+      // without a modal; only the default-confirm falls here. `categoryIsEgress`
+      // (not a `=== 'web.fetch'` name check) keeps this exhaustive: a future
+      // egress category is excluded by construction, not by remembering to
+      // patch this line.
+      if (
+        decision.confirmCause === 'policy' &&
+        !policyConfirmIsRisky &&
+        !categoryIsEgress(category)
+      ) {
         decision = autoApprovePolicyConfirm(decision);
         if (decision.kind === 'allow') postureNote = 'autonomous: auto-approved policy confirm';
       } else if (
