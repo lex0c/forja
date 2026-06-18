@@ -524,11 +524,12 @@ export const createFetchUrlTool = (
           out.content = frameContent(rendered, finalUrl, injectionSuspect, nonce);
         }
 
-        // One-line chip detail (operator-facing). `injection-suspect` is the
-        // load-bearing flag here — it's otherwise invisible in the TUI.
-        const detailParts = [`${status}`, format, formatBytes(out.bytes)];
-        if (truncated) detailParts.push('truncated');
-        if (out.saved_path !== undefined) detailParts.push('saved to file');
+        // One-line chip detail (operator-facing) — kept compact: status +
+        // size, plus the `injection-suspect` flag (the load-bearing security
+        // signal, otherwise invisible in the TUI). Format is noise, and the
+        // byte-cap `truncated` is already shown by the chip's own
+        // "… output truncated" hint line, so neither is duplicated here.
+        const detailParts = [`${status}`, formatBytes(out.bytes)];
         if (injectionSuspect) detailParts.push('injection-suspect');
         out.result_detail = detailParts.join(' · ');
 

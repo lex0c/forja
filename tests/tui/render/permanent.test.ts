@@ -424,14 +424,14 @@ describe('formatPermanent', () => {
           subject: 'https://docs.example.com/guide',
           status: 'done',
           durationMs: 320,
-          summary: '200 · markdown · 1.2 KB · injection-suspect',
+          summary: '200 · 1.2 KB · injection-suspect',
         },
         unicode,
       );
       expect(out).toHaveLength(3);
       expect(out[1]).toBe('● Fetched  [320ms]');
       expect(out[2]).toBe(
-        pad('└─ https://docs.example.com/guide — 200 · markdown · 1.2 KB · injection-suspect'),
+        pad('└─ https://docs.example.com/guide — 200 · 1.2 KB · injection-suspect'),
       );
     });
 
