@@ -7,6 +7,7 @@ import { setWritableCacheDirsOverride } from '../../src/permissions/sandbox-cach
 import { setCachePersistenceOverride } from '../../src/permissions/sandbox-cache-env.ts';
 import type { Provider } from '../../src/providers/index.ts';
 import { flattenSystemSegments } from '../../src/providers/types.ts';
+import { forjaCacheDir } from '../../src/storage/paths.ts';
 
 let workdir: string;
 let dbPath: string;
@@ -141,6 +142,29 @@ describe('bootstrap', () => {
         'write_file',
       ].sort(),
     );
+    db.close();
+  });
+
+  test('grants read_file + grep on the fetch_url spill dir (read elided pages)', async () => {
+    // fetch_url spills oversized pages to `<cache>/fetch/<hash>.md`; without
+    // this grant the scaffolded `./**`-only read policy would deny the
+    // follow-up read and the elided content would be unreachable.
+    const { config, db } = await bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+    });
+    const spill = join(forjaCacheDir(), 'fetch', 'abc123.md');
+    expect(config.permissionEngine.check('read_file', 'fs.read', { path: spill }).kind).toBe(
+      'allow',
+    );
+    expect(
+      config.permissionEngine.check('grep', 'fs.read', { path: join(forjaCacheDir(), 'fetch') })
+        .kind,
+    ).toBe('allow');
     db.close();
   });
 
