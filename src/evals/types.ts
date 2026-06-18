@@ -62,6 +62,24 @@ export interface EvalSetup {
   // 'autonomous' a routine `policy` confirm auto-approves while risk
   // confirms still deny — the security invariant a posture eval pins.
   approvalPosture?: ApprovalPosture;
+  // Hermetic HTTP stub for network tools (fetch_url). Maps an exact
+  // request URL to a canned response. The executor swaps `globalThis.fetch`
+  // for the duration of the run so the tool fetches the canned bytes
+  // instead of the live network; unmatched URLs (the provider's own API
+  // calls) pass through to the real fetch. Lets a model-in-the-loop eval
+  // exercise fetch_url deterministically — the live-network alternative is
+  // both flaky and blocked by the SSRF gate for local stub servers.
+  httpStub?: Record<string, EvalHttpResponse>;
+}
+
+// One canned HTTP response for `EvalSetup.httpStub`.
+export interface EvalHttpResponse {
+  // Response body — for fetch_url, typically an HTML or text page.
+  body: string;
+  // HTTP status. Default 200.
+  status?: number;
+  // Content-Type header. Default 'text/html; charset=utf-8'.
+  contentType?: string;
 }
 
 export interface EvalBudget {

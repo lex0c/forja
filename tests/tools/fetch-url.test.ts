@@ -3,7 +3,11 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Decision } from '../../src/permissions/index.ts';
-import { type FetchUrlOutput, createFetchUrlTool } from '../../src/tools/builtin/fetch-url.ts';
+import {
+  type FetchUrlOutput,
+  createFetchUrlTool,
+  fetchUrlTool,
+} from '../../src/tools/builtin/fetch-url.ts';
 import { isToolError } from '../../src/tools/types.ts';
 import { makeCtx } from './_helpers.ts';
 
@@ -277,6 +281,21 @@ describe('fetch_url', () => {
     const tool = createFetchUrlTool({ fetchImpl: async () => resp('x', 'text/plain') });
     const r = await tool.execute({ url: 'ftp://example.com/f' }, makeCtx());
     expect(isToolError(r) && r.error_code).toBe('fetch.invalid_url');
+  });
+
+  test('the default tool reads the global fetch at call time (honors a swap)', async () => {
+    // The eval harness installs a hermetic HTTP stub by swapping
+    // globalThis.fetch; the default tool must pick it up at call time
+    // rather than having captured the original at construction.
+    const original = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      resp('<h1>Swapped</h1>', 'text/html')) as unknown as typeof fetch;
+    try {
+      const out = ok(await fetchUrlTool.execute({ url: 'https://example.com/swap' }, makeCtx()));
+      expect(out.content).toContain('# Swapped');
+    } finally {
+      globalThis.fetch = original;
+    }
   });
 
   test('the tool is web.fetch, deferred, non-writing', () => {

@@ -209,7 +209,10 @@ const frameContent = (
 export const createFetchUrlTool = (
   deps: FetchUrlDeps = {},
 ): Tool<FetchUrlInput, FetchUrlOutput> => {
-  const doFetch = deps.fetchImpl ?? fetch;
+  // Read the GLOBAL fetch at call time (not captured here) so a runtime
+  // that swaps `globalThis.fetch` — notably the eval harness installing a
+  // hermetic HTTP stub — is honored by the default tool.
+  const doFetch: FetchLike = deps.fetchImpl ?? ((input, init) => fetch(input, init));
   const cacheDir = deps.cacheDir ?? forjaCacheDir;
   const makeNonce =
     deps.nonce ??

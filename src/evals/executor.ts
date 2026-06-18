@@ -17,7 +17,45 @@ import {
   runAgent,
 } from '../harness/index.ts';
 import { closeDb } from '../storage/db.ts';
-import type { EvalCase, EvalCaseResult, EvalSummary, ExpectationOutcome } from './types.ts';
+import type {
+  EvalCase,
+  EvalCaseResult,
+  EvalHttpResponse,
+  EvalSummary,
+  ExpectationOutcome,
+} from './types.ts';
+
+type FetchFn = typeof globalThis.fetch;
+
+// Build a `fetch` replacement that serves the canned responses in `stub`
+// for exact-match URLs and delegates everything else (notably the
+// provider's own API calls) to `original`. The executor swaps
+// `globalThis.fetch` for a case declaring `setup.httpStub` so network
+// tools (fetch_url) run hermetically — the live-network alternative is
+// flaky AND blocked by the SSRF gate for any local stub server. Exported
+// for direct unit testing of the routing.
+export const buildFetchStub = (
+  stub: Record<string, EvalHttpResponse>,
+  original: FetchFn,
+): FetchFn => {
+  const stubbed = ((input: Parameters<FetchFn>[0], init?: Parameters<FetchFn>[1]) => {
+    const url =
+      typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    const canned = stub[url];
+    if (canned === undefined) return original(input, init);
+    return Promise.resolve(
+      new Response(canned.body, {
+        status: canned.status ?? 200,
+        headers: { 'content-type': canned.contentType ?? 'text/html; charset=utf-8' },
+      }),
+    );
+  }) as FetchFn;
+  // Preserve Bun's `fetch.preconnect` static so readers of it don't trip.
+  (stubbed as { preconnect?: unknown }).preconnect = (
+    original as { preconnect?: unknown }
+  ).preconnect;
+  return stubbed;
+};
 
 // Test seam: caller can pre-build a provider (mock for unit tests,
 // real-from-registry for the smoke runner). Mirrors the `bootstrap`
@@ -486,6 +524,13 @@ export const executeCase = async (
     };
 
     const { config, db } = await bootstrap(bootstrapInput);
+    // Hermetic HTTP stub (setup.httpStub): swap the global fetch AFTER
+    // bootstrap (the provider is already constructed) and restore in the
+    // finally. Cases run serially (cli.ts), so the global mutation can't
+    // leak across cases — same pattern as the env-var save/restore above.
+    const httpStub = caseDef.setup?.httpStub;
+    const originalFetch = globalThis.fetch;
+    if (httpStub !== undefined) globalThis.fetch = buildFetchStub(httpStub, originalFetch);
     try {
       const cfg = {
         ...config,
@@ -520,6 +565,7 @@ export const executeCase = async (
       };
       result = await runAgent(cfg);
     } finally {
+      if (httpStub !== undefined) globalThis.fetch = originalFetch;
       closeDb(db);
     }
   } catch (e) {
