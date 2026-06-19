@@ -39,23 +39,21 @@ const entryToFactory =
     const apiKey = entry.api_key_env !== undefined ? process.env[entry.api_key_env] : undefined;
     const hasKey = apiKey !== undefined && apiKey.length > 0;
     const baseURL = entry.base_url;
-    // A configured `api_key_env` is AUTHORITATIVE. If it is set but the
-    // named env var is unset/empty, FAIL — do NOT leave apiKey out and
-    // let the adapter fall back to its own default vendor env
-    // (OPENAI_API_KEY / ANTHROPIC_API_KEY / GOOGLE_API_KEY). With a
-    // custom `base_url`, that fallback would ship the operator's real
-    // vendor key to a third-party (OpenAI-/Anthropic-compatible)
-    // endpoint. A caller that supplies an explicit apiKey/client via the
-    // `opts` passthrough seam (tests, programmatic callers) overrides
-    // this — only the unconfigured production path is refused. The
-    // message carries "API key required" so the recap stub-fallback gate
-    // (run.ts) still recognizes it as a missing-key degrade.
+    // A configured `api_key_env` IS the model's key source — the cloud
+    // adapters have no env fallback of their own; the catalog is the only
+    // source. If it is set but the named var is unset/empty, fail HERE
+    // with a diagnostic that names the variable, instead of passing no key
+    // and letting the adapter throw a generic "API key required". A caller
+    // that supplies an explicit apiKey/client via the `opts` passthrough
+    // seam (tests, programmatic callers) overrides this. The message
+    // carries "API key required" so the recap stub-fallback gate (run.ts)
+    // still recognizes it as a missing-key degrade.
     const o = (opts ?? {}) as { apiKey?: unknown; client?: unknown };
     const callerSuppliedKey =
       (typeof o.apiKey === 'string' && o.apiKey.length > 0) || o.client !== undefined;
     if (entry.api_key_env !== undefined && !hasKey && !callerSuppliedKey) {
       throw new Error(
-        `model ${entry.id}: API key required — the configured api_key_env '${entry.api_key_env}' is unset or empty. Set it, or remove api_key_env to use the adapter's default. Refusing the default-vendor-key fallback so a configured base_url can't receive the wrong key.`,
+        `model ${entry.id}: API key required — the configured api_key_env '${entry.api_key_env}' is unset or empty. Set that variable, or edit the entry's api_key_env to one that is set (e.g. GEMINI_API_KEY for Google). The catalog is the only key source; the adapters have no env fallback.`,
       );
     }
     const provider: Provider = ((): Provider => {
