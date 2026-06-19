@@ -17,6 +17,7 @@ import {
 } from '../../src/providers/catalog-file.ts';
 import {
   CATALOG_VERSION,
+  isSupportedFamily,
   loadModelProvidersFile,
   modelProvidersPath,
   serializeModelProviders,
@@ -257,6 +258,17 @@ describe('registry construction + factory wiring', () => {
     const e = entry({ base_url: 'http://h:1' });
     const provider = buildRegistryFromEntries([e]).get('ollama/qwen3:14b')?.factory();
     expect(provider?.catalogEntry).toEqual(e);
+  });
+
+  test('isSupportedFamily recognizes only the shipped adapters', () => {
+    // The subagent child gates a persisted snapshot on this before
+    // rebuilding, so a corrupt unsupported family falls back to the file.
+    for (const f of ['anthropic', 'openai', 'ollama', 'google']) {
+      expect(isSupportedFamily(f)).toBe(true);
+    }
+    for (const f of ['openrouter', 'mistral', 'llama_cpp', 'bogus', '']) {
+      expect(isSupportedFamily(f)).toBe(false);
+    }
   });
 
   test('loadModelRegistry throws when the file is absent', () => {

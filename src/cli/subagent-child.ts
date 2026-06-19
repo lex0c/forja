@@ -29,6 +29,7 @@ import {
   type Provider,
   type ProviderEffort,
   buildRegistryFromEntries,
+  isSupportedFamily,
   loadModelRegistry,
 } from '../providers/index.ts';
 import type { SystemSegment } from '../providers/types.ts';
@@ -675,11 +676,14 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // edit / `--force` re-sync of model_providers.json can't make this
       // child reject session.model or instantiate it with a different
       // base_url/capabilities than the parent committed to. Fall back to
-      // re-reading the file only when no snapshot exists (legacy rows, or
-      // a provider built outside the catalog — test mocks).
+      // re-reading the file when no snapshot exists (legacy rows, or a
+      // provider built outside the catalog — test mocks) OR when a corrupt
+      // snapshot carries a family we ship no adapter for (re-reading the
+      // file recovers gracefully instead of throwing lazily at factory()).
+      const snapshot = audit.modelEntrySnapshot;
       const registry =
-        audit.modelEntrySnapshot !== null
-          ? buildRegistryFromEntries([audit.modelEntrySnapshot])
+        snapshot !== null && isSupportedFamily(snapshot.family)
+          ? buildRegistryFromEntries([snapshot])
           : loadModelRegistry().registry;
       const entry = registry.get(session.model);
       if (entry === null) {

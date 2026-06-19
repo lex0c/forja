@@ -30,7 +30,6 @@ export type { CreateAnthropicProviderOptions } from './anthropic/index.ts';
 export { ANTHROPIC_CAPS, ANTHROPIC_MODEL_NAMES } from './anthropic/capabilities.ts';
 export { normalizeAnthropicStream } from './anthropic/stream.ts';
 export type { RawAnthropicEvent } from './anthropic/stream.ts';
-export { registerAnthropicModels } from './anthropic/register.ts';
 
 // Google (Gemini)
 export { createGoogleProvider } from './google/index.ts';
@@ -38,7 +37,6 @@ export type { CreateGoogleProviderOptions } from './google/index.ts';
 export { GOOGLE_CAPS, GOOGLE_MODEL_NAMES } from './google/capabilities.ts';
 export { normalizeGoogleStream } from './google/stream.ts';
 export type { RawGoogleChunk, RawGoogleCandidate, RawGooglePart } from './google/stream.ts';
-export { registerGoogleModels } from './google/register.ts';
 
 // OpenAI
 export { createOpenAIProvider } from './openai/index.ts';
@@ -51,7 +49,6 @@ export type {
   RawOpenAIChoiceDelta,
   RawOpenAIToolCallDelta,
 } from './openai/stream.ts';
-export { registerOpenAIModels } from './openai/register.ts';
 
 // Registry
 export { createRegistry } from './registry.ts';
@@ -63,6 +60,7 @@ export type { ModelEntry, ModelRegistry } from './registry.ts';
 export {
   CATALOG_VERSION,
   MODEL_PROVIDERS_FILENAME,
+  isSupportedFamily,
   loadModelProvidersFile,
   modelProvidersPath,
   serializeModelProviders,

@@ -31,6 +31,14 @@ export const CATALOG_VERSION = 1;
 // not-yet-implemented members (llama_cpp, mistral).
 const SUPPORTED_FAMILIES = new Set<ProviderFamily>(['anthropic', 'openai', 'ollama', 'google']);
 
+// Whether Forja ships an adapter for this family. Exported so the
+// subagent child can validate a persisted model_entry_snapshot's family
+// before rebuilding from it: a corrupt snapshot (shape-valid but with an
+// unsupported family) falls back to re-reading the catalog file instead
+// of throwing lazily at factory() time.
+export const isSupportedFamily = (family: string): boolean =>
+  SUPPORTED_FAMILIES.has(family as ProviderFamily);
+
 // Profile-aware user-scope path, or null on a stripped-down env with no
 // derivable config root (containers / CI without HOME).
 export const modelProvidersPath = (env: NodeJS.ProcessEnv = process.env): string | null =>
