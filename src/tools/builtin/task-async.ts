@@ -1,5 +1,6 @@
 import { parseCapability } from '../../permissions/capabilities.ts';
 import { MAX_SUBAGENT_DEPTH } from '../../subagents/types.ts';
+import { DEFER_BELOW_TOKENS_SMALL } from '../context-budget.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 import { playbookDirsHint } from './task-shared.ts';
 
@@ -77,6 +78,9 @@ export const taskAsyncTool: Tool<TaskAsyncInput, TaskAsyncOutput> = {
   },
   metadata: {
     category: 'misc',
+    // Window-relative deferral (CONTEXT_TUNING §2.2): off the base surface on a
+    // small window; reachable via tool_search.
+    deferBelowTokens: DEFER_BELOW_TOKENS_SMALL,
     writes: false,
     idempotent: false,
     display: 'raw',

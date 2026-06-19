@@ -1,5 +1,6 @@
 import { parseCapability } from '../../permissions/capabilities.ts';
 import type { WorktreeOutcome } from '../../subagents/types.ts';
+import { DEFER_BELOW_TOKENS_SMALL } from '../context-budget.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 import { childOutputHeadTail, playbookDirsHint, summarizeChildEnvelope } from './task-shared.ts';
 
@@ -107,6 +108,11 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
     // Migration to a dedicated `subagent` category lands when the
     // permission shape is specified (later).
     category: 'misc',
+    // Window-relative deferral (CONTEXT_TUNING §2.2): subagent orchestration is
+    // base on large windows but leaves the surface on a tight one — a small-window
+    // model rarely spawns children and can re-acquire via tool_search. (taskSyncTool
+    // inherits this via the spread below; it is already `deferred: true`, so no-op.)
+    deferBelowTokens: DEFER_BELOW_TOKENS_SMALL,
     // The tool itself does not write to the working tree. Whether
     // the CHILD writes is the child's tool surface concern — its
     // own `writes:true` tools trip the child's checkpoint logic
