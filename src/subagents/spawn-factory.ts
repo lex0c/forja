@@ -131,6 +131,16 @@ export interface SpawnChildProcessOptions {
   // older callers); the child surfaces `memory.registry_unavailable`
   // on tool calls.
   memoryCwd?: string;
+  // Custom provider API-key env var for the SELECTED catalog model (e.g.
+  // FORJA_VLLM_KEY for an operator-registered OpenAI-compatible model).
+  // Preserved through scrubEnv IN ADDITION to the built-in
+  // PROVIDER_API_KEY_VARS so the child can read it when it rebuilds the
+  // provider from the spawn-time snapshot — otherwise scrubEnv strips
+  // every credential-shaped var and the child dies "API key required"
+  // before its first step. Undefined for built-in families (their var is
+  // already in PROVIDER_API_KEY_VARS) and test mocks. The catalog loader
+  // validated it as a well-formed env var name.
+  apiKeyEnv?: string;
   // Open the live IPC channel between parent and child. When
   // true, the spawn factory MUST set `stdin: 'pipe'` and
   // `stdout: 'pipe'` (subprocess can't write the channel if
@@ -317,6 +327,25 @@ export const drainStderrToLogFile = (
   })();
 };
 
+// The subagent child's env: scrubbed of credentials, but preserving the
+// provider key vars the child needs to talk to its assigned model — the
+// built-in vendor vars (PROVIDER_API_KEY_VARS) PLUS, for a custom catalog
+// model, its non-built-in `api_key_env` (e.g. FORJA_VLLM_KEY). Without the
+// latter the child rebuilding from the spawn-time snapshot reads an unset
+// var and dies "API key required". Only that one extra var is preserved;
+// every other credential stays stripped, same posture as the built-ins.
+// Exported for direct testing without spawning a real subprocess.
+export const buildSubagentChildEnv = (
+  env: NodeJS.ProcessEnv,
+  apiKeyEnv?: string,
+): Record<string, string> =>
+  scrubEnv(env, {
+    keep:
+      apiKeyEnv !== undefined && !PROVIDER_API_KEY_VARS.includes(apiKeyEnv)
+        ? [...PROVIDER_API_KEY_VARS, apiKeyEnv]
+        : PROVIDER_API_KEY_VARS,
+  });
+
 export const defaultSpawnChildProcess: SpawnChildProcess = (opts) => {
   // Internal flags appended in fixed order. `--subagent-temperature`
   // is conditional: omitting it (instead of stamping a default)
@@ -389,7 +418,10 @@ export const defaultSpawnChildProcess: SpawnChildProcess = (opts) => {
     // tools clear the env at the kernel boundary — so the key reaches only the
     // child's HTTP call to the provider. See PROVIDER_API_KEY_VARS for the
     // full invariant; a new spawn site that inherits process.env re-opens it.
-    env: scrubEnv(process.env, { keep: PROVIDER_API_KEY_VARS }),
+    // A custom catalog model carries its key in a non-built-in var
+    // (opts.apiKeyEnv); `buildSubagentChildEnv` keeps THAT too so the child
+    // rebuilding from the snapshot can authenticate.
+    env: buildSubagentChildEnv(process.env, opts.apiKeyEnv),
     ...(opts.ipc === true ? { stdin: 'pipe', stdout: 'pipe' } : { stdout: 'ignore' }),
     stderr: 'pipe',
   });

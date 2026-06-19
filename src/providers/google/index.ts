@@ -52,6 +52,10 @@ export interface CreateGoogleProviderOptions {
   apiKey?: string;
   // Inject a pre-built SDK client (test seam).
   client?: GoogleGenAI;
+  // Override capabilities — supplied by the catalog-file loader for an
+  // operator-registered model. When omitted, capabilities resolve from
+  // the static GOOGLE_CAPS catalog.
+  capabilities?: ProviderCapabilities;
 }
 
 interface GoogleContent {
@@ -121,19 +125,21 @@ export const createGoogleProvider = (
   modelName: string,
   options: CreateGoogleProviderOptions = {},
 ): Provider => {
-  const caps = GOOGLE_CAPS[modelName];
+  const caps = options.capabilities ?? GOOGLE_CAPS[modelName];
   if (caps === undefined) {
-    throw new Error(`unknown Google model: ${modelName}`);
+    throw new Error(
+      `unknown Google model: ${modelName} (pass options.capabilities or add it to GOOGLE_CAPS)`,
+    );
   }
 
   let client: GoogleGenAI;
   if (options.client !== undefined) {
     client = options.client;
   } else {
-    const apiKey = options.apiKey ?? process.env.GOOGLE_API_KEY ?? process.env.GEMINI_API_KEY;
+    const apiKey = options.apiKey;
     if (apiKey === undefined || apiKey.length === 0) {
       throw new Error(
-        'Google API key required (pass options.apiKey or set GOOGLE_API_KEY / GEMINI_API_KEY)',
+        'Google API key required (pass options.apiKey; the catalog provides it from the model api_key_env in model_providers.json — no env fallback, GEMINI_API_KEY included)',
       );
     }
     client = new GoogleGenAI({ apiKey });

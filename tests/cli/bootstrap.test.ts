@@ -8,6 +8,7 @@ import { setCachePersistenceOverride } from '../../src/permissions/sandbox-cache
 import type { Provider } from '../../src/providers/index.ts';
 import { flattenSystemSegments } from '../../src/providers/types.ts';
 import { forjaCacheDir } from '../../src/storage/paths.ts';
+import { seedModelCatalog } from '../helpers/seed-catalog.ts';
 
 let workdir: string;
 let dbPath: string;
@@ -57,6 +58,10 @@ beforeEach(() => {
   // afterEach rmSync of workdir sweeps them.
   originalXdgCache = process.env.XDG_CACHE_HOME;
   process.env.XDG_CACHE_HOME = workdir;
+  // The model catalog is mandatory at boot — materialize the seed at the
+  // (now workdir-scoped) user path so bootstrap reads a real on-disk file
+  // instead of aborting with "run `forja init`".
+  seedModelCatalog();
 });
 
 afterEach(() => {

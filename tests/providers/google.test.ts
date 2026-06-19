@@ -84,10 +84,13 @@ describe('createGoogleProvider', () => {
     expect(() => createGoogleProvider('gemini-2.5-flash')).toThrow(/API key required/);
   });
 
-  test('reads GEMINI_API_KEY when GOOGLE_API_KEY is unset', () => {
+  test('does NOT fall back to GEMINI_API_KEY (no env fallback)', () => {
     delete process.env.GOOGLE_API_KEY;
     process.env.GEMINI_API_KEY = 'k-gem';
-    expect(() => createGoogleProvider('gemini-2.5-flash')).not.toThrow();
+    // The catalog is the authoritative source: an operator using
+    // GEMINI_API_KEY sets the entry's api_key_env to GEMINI_API_KEY. The
+    // adapter itself reads no env var.
+    expect(() => createGoogleProvider('gemini-2.5-flash')).toThrow(/API key required/);
   });
 
   test('exposes canonical id, family, and capabilities', () => {

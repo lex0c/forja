@@ -12,6 +12,7 @@ import type { EvalCase } from '../../src/evals/types.ts';
 import type { SandboxAvailability } from '../../src/permissions/sandbox-availability.ts';
 import type { Provider, StreamEvent } from '../../src/providers/index.ts';
 import { type ToolContext, isToolError } from '../../src/tools/types.ts';
+import { seedModelCatalog } from '../helpers/seed-catalog.ts';
 
 interface ScriptedStep {
   text?: string;
@@ -100,6 +101,9 @@ beforeEach(() => {
   originalHome = process.env.HOME;
   process.env.XDG_CONFIG_HOME = workdir;
   process.env.HOME = workdir;
+  // Catalog is mandatory at boot — materialize the seed at the
+  // workdir-scoped user path so executeCase's bootstrap finds it.
+  seedModelCatalog();
 });
 
 afterEach(() => {

@@ -20,6 +20,7 @@ import type {
 } from '../../src/harness/index.ts';
 import { DEFAULT_BUDGET } from '../../src/harness/types.ts';
 import { type PermissionEngine, createPermissionEngine } from '../../src/permissions/index.ts';
+import { createDefaultRegistry } from '../../src/providers/catalog-file.ts';
 import { openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { appendMessage } from '../../src/storage/repos/messages.ts';
@@ -156,6 +157,7 @@ const makeBootstrapStub = (
   return {
     config,
     db: realDb,
+    registry: createDefaultRegistry(),
     modelId: 'mock/m',
     policyLayers: [],
     lockConflicts: [],

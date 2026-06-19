@@ -491,6 +491,11 @@ export const run = async (options: RunOptions): Promise<number> => {
       // failed) → headless defaults on with the session provider.
       let recapEnabled: boolean | undefined;
       let recapRenderModel: string | undefined;
+      // Catalog-backed registry from a successful bootstrap so a custom
+      // `[recap].render_model` resolves against the operator's file (not
+      // the seed). Undefined on the stub path (bootstrap failed) →
+      // headless falls back to the seed-backed registry.
+      let recapRegistry: import('../providers/index.ts').ModelRegistry | undefined;
       try {
         // Empty prompt is safe — bootstrap doesn't append a user
         // message at construction time (that happens inside
@@ -518,6 +523,7 @@ export const run = async (options: RunOptions): Promise<number> => {
         // `[recap].render_model` — see `headlessRecapRenderModel`.
         recapRenderModel = headlessRecapRenderModel(args.model, result.config.recapRenderModel);
         dbOverride = result.db;
+        recapRegistry = result.registry;
         bootstrappedDbCloser = () => closeDb(result.db);
       } catch (e) {
         const reason = e instanceof Error ? e.message : String(e);
@@ -581,6 +587,7 @@ export const run = async (options: RunOptions): Promise<number> => {
           provider,
           ...(recapEnabled !== undefined ? { recapEnabled } : {}),
           ...(recapRenderModel !== undefined ? { recapRenderModel } : {}),
+          ...(recapRegistry !== undefined ? { modelRegistry: recapRegistry } : {}),
           out: (s) => process.stdout.write(s),
           err: errSink,
         });

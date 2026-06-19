@@ -52,6 +52,10 @@ export interface CreateOpenAIProviderOptions {
   // so users on the CLI path (where the registry factory is invoked
   // with no options) can still opt out without code changes.
   includeUsage?: boolean;
+  // Override capabilities — supplied by the catalog-file loader for an
+  // operator-registered model (custom / OpenAI-compatible). When
+  // omitted, capabilities resolve from the static OPENAI_CAPS catalog.
+  capabilities?: ProviderCapabilities;
 }
 
 // OpenAI `prompt_cache_key` (cache routing): requests sharing this key are
@@ -200,18 +204,22 @@ export const createOpenAIProvider = (
   modelName: string,
   options: CreateOpenAIProviderOptions = {},
 ): Provider => {
-  const caps = OPENAI_CAPS[modelName];
+  const caps = options.capabilities ?? OPENAI_CAPS[modelName];
   if (caps === undefined) {
-    throw new Error(`unknown OpenAI model: ${modelName}`);
+    throw new Error(
+      `unknown OpenAI model: ${modelName} (pass options.capabilities or add it to OPENAI_CAPS)`,
+    );
   }
 
   let client: OpenAI;
   if (options.client !== undefined) {
     client = options.client;
   } else {
-    const apiKey = options.apiKey ?? process.env.OPENAI_API_KEY;
+    const apiKey = options.apiKey;
     if (apiKey === undefined || apiKey.length === 0) {
-      throw new Error('OpenAI API key required (pass options.apiKey or set OPENAI_API_KEY)');
+      throw new Error(
+        'OpenAI API key required (pass options.apiKey; the catalog provides it from the model api_key_env in model_providers.json — no env fallback)',
+      );
     }
     const sdkOpts: { apiKey: string; baseURL?: string } = { apiKey };
     if (options.baseURL !== undefined) sdkOpts.baseURL = options.baseURL;

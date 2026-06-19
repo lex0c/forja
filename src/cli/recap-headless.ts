@@ -18,7 +18,8 @@
 // (the multi-row shape doesn't match the §9 schema).
 
 import type { HarnessConfig } from '../harness/index.ts';
-import { createDefaultRegistry } from '../providers/registry.ts';
+import { createDefaultRegistry } from '../providers/catalog-file.ts';
+import type { ModelRegistry } from '../providers/registry.ts';
 import type { Provider } from '../providers/types.ts';
 import { redactSecretsInIntermediate } from '../recap/format.ts';
 import type { DB } from '../storage/db.ts';
@@ -61,6 +62,13 @@ export interface RunRecapHeadlessOptions {
   // and renders deterministically. The CLI bootstrap supplies the
   // active provider; tests pass stubs.
   provider: Provider;
+  // Registry to resolve a `[recap].render_model` override. The caller
+  // (run.ts) can inject the catalog-backed registry from a successful
+  // bootstrap; absent, this headless/fallback path uses the seed-backed
+  // registry — enough to resolve any BUILT-IN render_model. A
+  // render_model that is a CUSTOM catalog entry only resolves when the
+  // file-backed registry is injected here.
+  modelRegistry?: ModelRegistry;
   // Output sinks. Keep separate from process.stdout/stderr so tests
   // can capture without touching globals; the entry-point in
   // `cli/run.ts` wires the real fds.
@@ -133,9 +141,10 @@ const buildHeadlessContext = (options: RunRecapHeadlessOptions, db: DB): SlashCo
     isRunning: () => false,
     currentSessionId: options.currentSessionId ?? (() => null),
     replSessionIds: () => [],
-    // Populated registry (not the empty createRegistry()) so a
-    // `[recap].render_model` override resolves headless too.
-    modelRegistry: createDefaultRegistry(),
+    // Resolve a `[recap].render_model` override headless. Use the
+    // injected catalog-backed registry when present; else seed-backed
+    // (auxiliary/fallback path — see the options field).
+    modelRegistry: options.modelRegistry ?? createDefaultRegistry(),
   };
 };
 

@@ -50,6 +50,61 @@ describe('subagent_runs repo', () => {
     expect(run?.capturedAt).toBe(1_700_000_000_000);
   });
 
+  test('modelEntrySnapshot round-trips; omitted ⇒ null', () => {
+    const parent = seedSession();
+    // Omitted ⇒ null (legacy / test mocks / providerOverride → child
+    // re-reads the catalog file).
+    const childA = seedSession(parent.id);
+    insertSubagentRun(db, {
+      sessionId: childA.id,
+      name: 'a',
+      scope: 'project',
+      sourcePath: '/p/a.md',
+      sourceSha256: 'a'.repeat(64),
+      systemPrompt: 'a',
+      toolsWhitelist: [],
+      budgetMaxSteps: 1,
+      budgetMaxCostUsd: 0,
+    });
+    expect(getSubagentRun(db, childA.id)?.modelEntrySnapshot).toBeNull();
+
+    // Supplied ⇒ deep round-trip, so a spawned child rebuilds the SAME
+    // provider the parent committed to (base_url / capabilities sealed).
+    const childB = seedSession(parent.id);
+    const entry = {
+      id: 'openai/vllm',
+      family: 'openai' as const,
+      model_name: 'vllm',
+      api_key_env: 'MY_VLLM_KEY',
+      base_url: 'https://gw.internal',
+      capabilities: {
+        tools: 'native' as const,
+        cache: false as const,
+        vision: false,
+        streaming: true,
+        constrained: 'tools' as const,
+        context_window: 64_000,
+        output_max_tokens: 8_192,
+        cost_per_1k_input: 0,
+        cost_per_1k_output: 0,
+        notes: [],
+      },
+    };
+    insertSubagentRun(db, {
+      sessionId: childB.id,
+      name: 'b',
+      scope: 'project',
+      sourcePath: '/p/b.md',
+      sourceSha256: 'b'.repeat(64),
+      systemPrompt: 'b',
+      toolsWhitelist: [],
+      budgetMaxSteps: 1,
+      budgetMaxCostUsd: 0,
+      modelEntrySnapshot: entry,
+    });
+    expect(getSubagentRun(db, childB.id)?.modelEntrySnapshot).toEqual(entry);
+  });
+
   test('budgetMaxWallMs is null when omitted at insert', () => {
     // The wall-clock cap is optional in SubagentBudget; the
     // snapshot row mirrors that with a nullable column. A

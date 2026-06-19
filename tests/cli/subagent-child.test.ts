@@ -27,6 +27,7 @@ import {
   hashPromptContent,
   listPromptVersionsByName,
 } from '../../src/storage/repos/prompt-versions.ts';
+import { seedModelCatalog } from '../helpers/seed-catalog.ts';
 
 // Cover the canonical happy + error paths for the
 // subagent-child entry. The test injects a `providerOverride`
@@ -36,10 +37,18 @@ import {
 
 let dbDir: string;
 let dbPath: string;
+let originalXdg: string | undefined;
 
 beforeEach(() => {
   dbDir = mkdtempSync(join(tmpdir(), 'forja-child-test-'));
   dbPath = join(dbDir, 'agent.sqlite');
+  // The catalog is mandatory at boot — materialize the seed under an
+  // isolated XDG so the registry-lookup path (a child with no
+  // providerOverride) finds it instead of the dev's real ~/.config (or a
+  // clean CI with none). Tests that inject providerOverride never read it.
+  originalXdg = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = dbDir;
+  seedModelCatalog();
 });
 
 afterEach(() => {
@@ -53,6 +62,8 @@ afterEach(() => {
   try {
     rmSync(dbDir, { recursive: true, force: true });
   } catch {}
+  if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+  else process.env.XDG_CONFIG_HOME = originalXdg;
 });
 
 const stubProvider = (text: string): Provider => ({

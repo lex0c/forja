@@ -76,10 +76,18 @@ export OPENAI_API_KEY=sk-...            # OpenAI
 export GOOGLE_API_KEY=...               # Google
 ```
 
-Open the interactive REPL inside a project you want to work on:
+Scaffold the bootstrap on first use — this writes the per-project `.forja/`
+(permissions, playbooks, skills) and the operator-owned model catalog
+`~/.config/forja/model_providers.json`, which boot now requires:
 
 ```bash
 cd ~/projects/my-repo
+forja init
+```
+
+Then open the interactive REPL:
+
+```bash
 forja
 ```
 
@@ -147,13 +155,14 @@ forja --json "lint the src/ tree" | jq 'select(.type=="tool:end")'
 
 | Provider | Models | Cache | Streaming | Notes |
 |---|---|---|---|---|
-| Anthropic | claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5 | 5min ephemeral (1h opt-in planned) | ✓ | Default. Multi-block cache breakpoints (stable + memory + tools + tail). |
-| OpenAI | gpt-4o, gpt-4o-mini, gpt-5.x (selected) | — | ✓ | Reads the canonical system prompt; ignores per-segment cache markers. |
-| Google | gemini-2.x families | — | ✓ | Same compat path as OpenAI. |
-| Local models | Planned (`ollama`, `llama.cpp`) | varies | varies | Specs in `docs/spec/LOCAL_MODELS.md`; not yet shipped. |
+| Anthropic | claude-opus-4-8, claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5 | 5min ephemeral (1h opt-in planned) | ✓ | Default. Multi-block cache breakpoints (stable + memory + tools + tail). |
+| OpenAI | gpt-4o, gpt-4o-mini, gpt-5.x (selected) | — | ✓ | Reads the canonical system prompt; ignores per-segment cache markers. Also covers OpenAI-compatible endpoints via a catalog `base_url`. |
+| Google | gemini-2.5 / 3.x families | — | ✓ | Same compat path as OpenAI. |
+| Ollama (local) | qwen2.5-coder, qwen3, qwen3-coder, llama3.1, mistral-nemo, gpt-oss, devstral | — | ✓ | Native tool calling, `$0`. `--model ollama/<name>`; `llama.cpp` planned. |
 
 Cost is computed per-turn from declared per-1M pricing in
-`src/providers/<family>/capabilities.ts`.
+`src/providers/<family>/capabilities.ts`. The exact installed set is the
+operator-owned catalog (see **Model** below) — this table is the seeded default.
 
 ---
 
@@ -180,6 +189,14 @@ session-scoped and in memory — it is not written to config or the session row.
 [providers]
 model = "anthropic/claude-opus-4-8"
 ```
+
+Which models **exist** — and how to register your own (a local model you pulled,
+an OpenAI-/Anthropic-compatible endpoint, a price tweak) — is the operator-owned
+catalog `~/.config/forja/model_providers.json`, written by `forja init`
+(mandatory: with no catalog, boot stops and points you at it). Each entry names
+its `api_key_env` (which env var holds the key) and an optional `base_url` for
+custom endpoints. See [`docs/PROVIDERS.md` §2.1](docs/PROVIDERS.md) for the full
+how-to.
 
 ### Effort
 

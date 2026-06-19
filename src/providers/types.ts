@@ -123,6 +123,29 @@ export interface ProviderCapabilities {
   notes: string[];
 }
 
+// One model entry as authored in the operator-owned catalog file
+// (`~/.config/forja/model_providers.json`, AGENTIC_CLI §14.2). That
+// file is the runtime source of truth; `CANONICAL_MODEL_PROVIDERS`
+// (src/providers/seed-catalog.ts) is the embedded seed `forja init`
+// writes into it. `family` must be one Forja ships an adapter for
+// (anthropic/openai/ollama/google today; openrouter later); the
+// catalog loader skips entries with an unknown family fail-soft.
+export interface ModelProviderEntry {
+  // Canonical fully-qualified id, e.g. "anthropic/claude-opus-4-8".
+  id: string;
+  family: ProviderFamily;
+  // What the underlying SDK sees, e.g. "claude-opus-4-8".
+  model_name: string;
+  // Name of the env var that holds the API key — NEVER the key
+  // itself. Optional: Ollama-local needs none; when omitted the
+  // adapter falls back to its own default env (OPENAI_API_KEY, …).
+  api_key_env?: string;
+  // Custom endpoint for Ollama-remote / OpenAI-compatible hosts.
+  // Optional; omitted ⇒ the adapter's default base URL.
+  base_url?: string;
+  capabilities: ProviderCapabilities;
+}
+
 // Per-turn token usage as reported by the provider. Adapters surface this
 // once per turn (typically right before `stop`); not every provider exposes
 // every field. `cache_read` / `cache_creation` are zero when the provider
@@ -352,6 +375,16 @@ export interface Provider {
   id: string;
   family: ProviderFamily;
   capabilities: ProviderCapabilities;
+  // The catalog entry this provider was built from (stamped by
+  // catalog-file `entryToFactory`). Provenance ONLY — never read on the
+  // generate path. The subagent spawn path snapshots it onto
+  // subagent_runs (migration 076) so a spawned child rebuilds the SAME
+  // provider instead of re-reading a possibly-edited model_providers.json
+  // (which would let a mid-session edit / `--force` re-sync make the
+  // child reject session.model or diverge on base_url/capabilities).
+  // Absent on providers built outside the catalog (test mocks /
+  // providerOverride) — the child then falls back to re-reading the file.
+  catalogEntry?: ModelProviderEntry;
   // Whether this provider instance replays reasoning blocks onto the wire
   // (resolved once in the factory from FORJA_*_REASONING_REPLAY + capability).
   // Consumers that size the outbound prompt (the compaction trigger, token

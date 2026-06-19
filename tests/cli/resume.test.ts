@@ -16,6 +16,7 @@ import {
   listSessions,
   updateSessionCost,
 } from '../../src/storage/repos/sessions.ts';
+import { seedModelCatalog } from '../helpers/seed-catalog.ts';
 
 const baseArgs = (overrides: Partial<ParsedArgs> = {}): ParsedArgs => ({
   prompt: 'hi',
@@ -75,14 +76,23 @@ const mockProvider = (script: ScriptedStep[]): Provider => {
 let workdir: string;
 let dbPath: string;
 let db: DB;
+let originalXdg: string | undefined;
 
 beforeEach(() => {
   workdir = mkdtempSync(join(tmpdir(), 'forja-resume-'));
   dbPath = join(workdir, 'sessions.db');
+  // Isolate user config under the workdir and materialize the mandatory
+  // model catalog there so run()'s bootstrap doesn't read (or require
+  // `forja init` against) the developer's real ~/.config.
+  originalXdg = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = workdir;
+  seedModelCatalog();
 });
 
 afterEach(() => {
   rmSync(workdir, { recursive: true, force: true });
+  if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+  else process.env.XDG_CONFIG_HOME = originalXdg;
 });
 
 const openTestDb = (): DB => {

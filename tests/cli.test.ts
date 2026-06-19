@@ -1,12 +1,25 @@
-import { describe, expect, test } from 'bun:test';
+import { afterAll, describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { seedModelCatalog } from './helpers/seed-catalog.ts';
 
 const ENTRY = 'src/cli/index.ts';
+
+// The model catalog is mandatory at boot — give the spawned CLI an
+// isolated XDG_CONFIG_HOME seeded with the catalog so boot-reaching tests
+// (unknown model, ...) don't read the dev's real ~/.config or fail on a
+// clean CI that has none.
+const cliConfigDir = mkdtempSync(join(tmpdir(), 'forja-cli-cfg-'));
+seedModelCatalog({ ...process.env, XDG_CONFIG_HOME: cliConfigDir });
+afterAll(() => rmSync(cliConfigDir, { recursive: true, force: true }));
 
 const run = (...args: string[]) => {
   const result = Bun.spawnSync({
     cmd: ['bun', 'run', ENTRY, ...args],
     stdout: 'pipe',
     stderr: 'pipe',
+    env: { ...process.env, XDG_CONFIG_HOME: cliConfigDir },
   });
   return {
     code: result.exitCode,

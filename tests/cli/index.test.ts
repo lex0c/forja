@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { seedModelCatalog } from '../helpers/seed-catalog.ts';
 
 // Spawn the CLI entrypoint as a subprocess with a preload that throws
 // the moment src/cli/run.ts is loaded. If `--help` or `--version`
@@ -41,12 +42,17 @@ const runCli = async (args: string[]): Promise<CliResult> => {
 // developer's actual ~/.local/share/forja state.
 const runCliWithRun = async (args: string[]): Promise<CliResult & { dataDir: string }> => {
   const dataDir = mkdtempSync(join(tmpdir(), 'forja-cli-'));
+  // The model catalog is mandatory at boot — materialize the seed under
+  // an isolated XDG_CONFIG_HOME so the spawned CLI boots without reading
+  // (or requiring `forja init` against) the developer's real ~/.config.
+  const configDir = mkdtempSync(join(tmpdir(), 'forja-cli-cfg-'));
+  seedModelCatalog({ ...process.env, XDG_CONFIG_HOME: configDir });
   try {
     const proc = Bun.spawn(['bun', entry, ...args], {
       cwd: repoRoot,
       stdout: 'pipe',
       stderr: 'pipe',
-      env: { ...process.env, XDG_DATA_HOME: dataDir },
+      env: { ...process.env, XDG_DATA_HOME: dataDir, XDG_CONFIG_HOME: configDir },
     });
     const [stdout, stderr, exitCode] = await Promise.all([
       new Response(proc.stdout as ReadableStream<Uint8Array>).text(),
@@ -56,6 +62,7 @@ const runCliWithRun = async (args: string[]): Promise<CliResult & { dataDir: str
     return { exitCode, stdout, stderr, dataDir };
   } finally {
     rmSync(dataDir, { recursive: true, force: true });
+    rmSync(configDir, { recursive: true, force: true });
   }
 };
 
@@ -252,8 +259,13 @@ describe('cli entrypoint: prompt requirement', () => {
     // the failure path deterministic.
     const dataDir = mkdtempSync(join(tmpdir(), 'forja-cli-'));
     const spawnCwd = mkdtempSync(join(tmpdir(), 'forja-no-env-'));
+    const configDir = mkdtempSync(join(tmpdir(), 'forja-cli-cfg-'));
+    // Catalog is mandatory at boot — materialize it so bootstrap reaches
+    // the provider-build step (where the missing key fails) instead of
+    // aborting earlier at the catalog gate.
+    seedModelCatalog({ ...process.env, XDG_CONFIG_HOME: configDir });
     try {
-      const env = { ...process.env, XDG_DATA_HOME: dataDir };
+      const env = { ...process.env, XDG_DATA_HOME: dataDir, XDG_CONFIG_HOME: configDir };
       delete (env as { ANTHROPIC_API_KEY?: string }).ANTHROPIC_API_KEY;
       const proc = Bun.spawn(
         ['bun', entry, 'recap', 'session', 'no-such-session', '--no-llm-render'],
@@ -273,6 +285,7 @@ describe('cli entrypoint: prompt requirement', () => {
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
       rmSync(spawnCwd, { recursive: true, force: true });
+      rmSync(configDir, { recursive: true, force: true });
     }
   });
 
@@ -285,13 +298,17 @@ describe('cli entrypoint: prompt requirement', () => {
     // is a config error and must exit non-zero.
     const dataDir = mkdtempSync(join(tmpdir(), 'forja-cli-'));
     const spawnCwd = mkdtempSync(join(tmpdir(), 'forja-no-env-'));
+    const configDir = mkdtempSync(join(tmpdir(), 'forja-cli-cfg-'));
+    // Catalog is mandatory at boot — materialize it so the unknown-model
+    // error surfaces from the registry lookup, not the catalog gate.
+    seedModelCatalog({ ...process.env, XDG_CONFIG_HOME: configDir });
     try {
       // Even with the API key present (loaded from .env or env),
       // an unknown model id throws "unknown model: ..." inside
       // the registry lookup BEFORE the factory runs, so the auth
       // path is irrelevant. Pass through the dev's env so the
       // failure is unambiguously about the model id.
-      const env = { ...process.env, XDG_DATA_HOME: dataDir };
+      const env = { ...process.env, XDG_DATA_HOME: dataDir, XDG_CONFIG_HOME: configDir };
       const proc = Bun.spawn(
         ['bun', entry, 'recap', 'session', 'no-such-session', '--model', 'anthropic/sonnett-typo'],
         { cwd: spawnCwd, stdout: 'pipe', stderr: 'pipe', env },
@@ -308,6 +325,7 @@ describe('cli entrypoint: prompt requirement', () => {
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
       rmSync(spawnCwd, { recursive: true, force: true });
+      rmSync(configDir, { recursive: true, force: true });
     }
   });
 
