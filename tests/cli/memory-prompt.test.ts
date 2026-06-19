@@ -80,6 +80,19 @@ describe('assembleMemorySection — window cap (CONTEXT_TUNING §2.2)', () => {
     expect(result.entryCount).toBe(2);
     expect(result.text).not.toContain('trimmed to fit');
   });
+
+  test('leanHeader condenses the header (drops the save taxonomy, keeps the index)', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Role](role.md) — dev\n');
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry, leanHeader: true });
+    expect(result.text).toContain('Cross-session memory index below');
+    expect(result.text).not.toContain('Four types of memory exist');
+    // the index line still renders under the lean header
+    expect(result.text).toContain('[user] role — dev');
+    expect(result.entryCount).toBe(1);
+  });
 });
 
 describe('assembleMemorySection', () => {

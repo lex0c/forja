@@ -76,4 +76,17 @@ describe('shapeSystemPrompt', () => {
       shapeSystemPrompt(inputs(), LARGE).system,
     );
   });
+
+  test('directive tier: lean prefix below the small-window tier, full at/above', () => {
+    const i = inputs({ stablePrefix: 'FULL_PREFIX', stablePrefixLean: 'LEAN_PREFIX' });
+    expect(shapeSystemPrompt(i, SMALL).system).toContain('LEAN_PREFIX');
+    expect(shapeSystemPrompt(i, SMALL).system).not.toContain('FULL_PREFIX');
+    expect(shapeSystemPrompt(i, LARGE).system).toContain('FULL_PREFIX');
+    expect(shapeSystemPrompt(i, LARGE).system).not.toContain('LEAN_PREFIX');
+  });
+
+  test('falls back to the full prefix when no lean variant was captured', () => {
+    const i = inputs({ stablePrefix: 'ONLY_PREFIX' });
+    expect(shapeSystemPrompt(i, SMALL).system).toContain('ONLY_PREFIX');
+  });
 });

@@ -1,6 +1,6 @@
 import type { SystemSegment } from '../providers/types.ts';
 import { hashPromptContent } from '../storage/repos/prompt-versions.ts';
-import { guideMaxBytes } from '../tools/context-budget.ts';
+import { guideMaxBytes, isSmallWindow } from '../tools/context-budget.ts';
 import { composeSystemPrompt } from './memory-prompt.ts';
 import {
   type AcquiredGuide,
@@ -25,8 +25,12 @@ import {
 // legacy inline bootstrap composition byte-for-byte.
 export interface SystemInputs {
   // The composeWith* chain output (identity/env/constraints/…/caller prompt) —
-  // everything BEFORE the project guide. Window-independent.
+  // everything BEFORE the project guide. The FULL directive tier.
   stablePrefix?: string;
+  // The lean directive tier (CONTEXT_TUNING §2.2): same chain minus the parallel
+  // + tool-ergonomics hints, used on a tight window. Two precomputed variants so
+  // shape just picks — recomputed per turn, so a /model swap re-tiers it.
+  stablePrefixLean?: string;
   // The acquired guide body (sanitized, clipped to the absolute cap) plus its
   // framing metadata. Re-clipped to the window budget on every shape. Absent
   // when no trusted guide was found.
@@ -54,9 +58,15 @@ export const shapeSystemPrompt = (
           guideMaxBytes(contextWindow, PROJECT_GUIDE_MAX_BYTES),
         ).text
       : '';
+  // Directive tier (CONTEXT_TUNING §2.2): a tight window uses the lean prefix;
+  // falls back to the full prefix when no lean variant was captured.
+  const prefix =
+    isSmallWindow(contextWindow) && inputs.stablePrefixLean !== undefined
+      ? inputs.stablePrefixLean
+      : inputs.stablePrefix;
   // Stable segment = prefix + (re-clipped) guide. Mirrors bootstrap's
   // composeWithProjectContext(prefix, guide) exactly.
-  const stableSegmentText = composeWithProjectContext(inputs.stablePrefix, guideSection) ?? '';
+  const stableSegmentText = composeWithProjectContext(prefix, guideSection) ?? '';
   const memorySegmentText = inputs.memorySegmentText;
   // Final string = stable ⊕ memory-segment. Equivalent to bootstrap's
   // composeSystemPrompt(composeSystemPrompt(stable, memory), skills): the

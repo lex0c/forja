@@ -337,10 +337,14 @@ recomputação que muda os bytes é a **troca de modelo**, que já esfria o cach
 
 **Alavancas window-relativas** (fonte única num módulo de política, `context-budget`):
 
-| Alavanca | Regra | Section afetada |
-|---|---|---|
-| Deferral adaptativa | tool sai da base quando `window < deferBelowTokens` (além do flag `deferred` estático) | `[tool_schemas]` |
-| Guide fracional | `guideMaxBytes(window) = min(PROJECT_GUIDE_MAX_BYTES, β × window)` | `[project_context]` |
+| Alavanca | Regra | Section afetada | Quando decide |
+|---|---|---|---|
+| Deferral adaptativa | tool sai da base quando `window < deferBelowTokens` (além do flag `deferred` estático) | `[tool_schemas]` | por turno |
+| Guide fracional | `guideMaxBytes(window) = min(PROJECT_GUIDE_MAX_BYTES, β × window)` | `[project_context]` | por turno (re-clipa no /model) |
+| Tiering de diretivas | `isSmallWindow(window)` → prefixo lean (drop dos hints `parallel` + `tool-ergonomics`; mantém constraints/format) | `[system]` (segmento `stable`) | por turno (two-variant no shape) |
+| Header de memória condensado | `isSmallWindow(window)` → header curto (sem taxonomia de save) | `[memory_index]` | boot-pinned (provenance) |
+| Drop do catálogo de skills | `isSmallWindow(window)` → seção vazia | `[memory_index]` | boot-pinned |
+| Cap do índice de memória | `memoryMaxEntries(window)` (guardrail `<64K`) | `[memory_index]` | boot-pinned |
 
 `deferBelowTokens` estende o mecanismo de deferred tools (§7.6): o flag `deferred` continua
 sendo "sempre deferred"; o threshold marca tools base **dispensáveis em janela pequena** sem
@@ -352,8 +356,15 @@ escolha do operador, tunável por eval, não um invariante. Deferir `grep`/`git`
 capability: `bash` fica na base em toda janela e roda `rg`/`git` direto; o `tool_search`
 re-revela a versão estruturada/endurecida quando o JSON + gating dedicado valem o schema. O predicado window-aware roda nos
 **dois** sites — a lista enviada e o catálogo/reveal-pool do `tool_search` — para os dois não
-divergirem. Caps de memória/skills e tiering de diretivas são alavancas futuras na mesma
-mecânica (não normativas aqui).
+divergirem.
+
+**Divisão por segmento de cache.** O segmento `stable` (diretivas + guide) é shapeado por
+turno → tiering de diretivas e clip do guide reagem ao `/model` mid-session. O segmento
+`memory` (índice + skills) é **boot-pinned**: o header condensado, o drop de skills e o cap
+do índice decidem no boot porque a provenance de eager-exposure é um conceito de boot
+(`MEMORY.md §11.2`) — não se re-decide por turno. O header condensado se justifica porque,
+numa janela apertada, todas as tools de memória já estão fora da base, então a taxonomia de
+save estaria ensinando ferramenta ausente da wire. `constraints` (safety) nunca é cortado.
 
 **`model_changed` — canal só-de-efeito-colateral.** Onde efeitos colaterais genuínos precisam
 disparar na troca (re-emitir a linha de janela do banner, gravar `prompt_versions` quando o

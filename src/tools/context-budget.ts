@@ -88,3 +88,11 @@ export const memoryMaxEntries = (contextWindow: number): number | undefined => {
   );
   return Math.max(MEMORY_MIN_ENTRIES, fromWindow);
 };
+
+// The "tight window" tier (CONTEXT_TUNING §2.2): below it the prefix leans out
+// (lean directive prefix, condensed memory header, skill catalog dropped). Same
+// `< 64K` boundary the tool deferral and memory cap key off, named once. A
+// non-positive (unknown) window is NOT small — keep the full prefix (the static
+// fallback the rest of the allocator uses).
+export const isSmallWindow = (contextWindow: number): boolean =>
+  contextWindow > 0 && contextWindow < DEFER_BELOW_TOKENS_SMALL;

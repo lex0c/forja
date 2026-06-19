@@ -5,6 +5,7 @@ import {
   MEMORY_MIN_ENTRIES,
   guideMaxBytes,
   isDeferred,
+  isSmallWindow,
   memoryMaxEntries,
 } from '../../src/tools/context-budget.ts';
 
@@ -95,5 +96,19 @@ describe('memoryMaxEntries', () => {
   test('never caps below the floor', () => {
     // A tiny window computes < MEMORY_MIN_ENTRIES; the floor wins.
     expect(memoryMaxEntries(1_000)).toBe(MEMORY_MIN_ENTRIES);
+  });
+});
+
+describe('isSmallWindow', () => {
+  test('true below the 64K tier, false at/above', () => {
+    expect(isSmallWindow(32_000)).toBe(true);
+    expect(isSmallWindow(63_999)).toBe(true);
+    expect(isSmallWindow(DEFER_BELOW_TOKENS_SMALL)).toBe(false);
+    expect(isSmallWindow(200_000)).toBe(false);
+  });
+
+  test('an unknown (non-positive) window is not small (full prefix)', () => {
+    expect(isSmallWindow(0)).toBe(false);
+    expect(isSmallWindow(-1)).toBe(false);
   });
 });

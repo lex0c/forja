@@ -123,6 +123,15 @@ Entries tagged \`[seed]\` are vendor-curated default disciplines (how to work, n
 
 Before acting on a FACTUAL memory (file paths, exported names, schema shape), verify it against the current code with grep / read_file. If reality has drifted from the memory, update or discard the memory rather than acting on stale info. PREFERENCE memories (commit style, naming conventions) have no "current state" to verify against — proceed without re-checking.`;
 
+// Condensed header for tight windows (CONTEXT_TUNING §2.2). On a small window the
+// whole memory toolset (memory_read/search/write/list) is off the base surface,
+// so the full header's save-taxonomy + verify guidance is teaching tools that
+// aren't on the wire — ~510 tokens the window can't spare. Keep only the index
+// pointer; the discipline returns with the full header on a larger window.
+const MEMORY_SECTION_HEADER_LEAN = `# Memory
+
+Cross-session memory index below (\`[scope] name — hook\`). Memory bodies and the memory tools (memory_read / memory_search / memory_write) are off the base tool surface at this context-window size — reach them via tool_search when a listed memory is relevant to the task.`;
+
 export interface AssembleMemorySectionInput {
   registry: MemoryRegistry;
   // Boot-time trigger context (spec §4.3). When omitted, the
@@ -174,6 +183,12 @@ export interface AssembleMemorySectionInput {
   // boot-pinned (eager-exposure provenance is a boot concept), not re-applied
   // per turn.
   maxEntries?: number;
+  // Condense the section header for a tight window (CONTEXT_TUNING §2.2). When
+  // true, the verbose save-taxonomy / verify guidance is replaced by a short
+  // index pointer — justified because the memory tools are off the base surface
+  // on a small window anyway. Index lines + cap marker are unaffected. Boot-time
+  // decision (same window the cap keys off). Default false = full header.
+  leanHeader?: boolean;
 }
 
 export interface AssembleMemorySectionResult {
@@ -216,6 +231,7 @@ export const assembleMemorySection = (
   // which is the most-specific TRUSTED scope. That matches the
   // user's intent: "promote the trusted shadow to active when the
   // more-specific scope is marked untrusted".
+  const header = input.leanHeader === true ? MEMORY_SECTION_HEADER_LEAN : MEMORY_SECTION_HEADER;
   const all = input.registry.list();
   if (all.length === 0) {
     // Header-only render. The save-criteria + 4-type semantics +
@@ -229,7 +245,7 @@ export const assembleMemorySection = (
     // inverted the need (more memories = more orientation; zero
     // memories = no orientation). +~250 prompt tokens accepted as
     // the cost of consistent save guidance across all sessions.
-    return { text: MEMORY_SECTION_HEADER, entryCount: 0, eagerLoaded: [] };
+    return { text: header, entryCount: 0, eagerLoaded: [] };
   }
   // Scope-level fail-closed exclusion (S5 P0/H2-rob). Applied BEFORE
   // the per-memory peek so an unreadable scope doesn't cost N extra
@@ -303,7 +319,7 @@ export const assembleMemorySection = (
     // so save guidance is present — same rationale as the
     // registry-empty branch above. The eagerLoaded inventory
     // stays empty because no entries actually shipped.
-    return { text: MEMORY_SECTION_HEADER, entryCount: 0, eagerLoaded: [] };
+    return { text: header, entryCount: 0, eagerLoaded: [] };
   }
   // Dedupe by name on the eligible list. precedence order is
   // preserved (most-specific surviving scope wins).
@@ -333,7 +349,7 @@ export const assembleMemorySection = (
     input.maxEntries !== undefined && input.maxEntries > 0 ? input.maxEntries : deduped.length;
   const rendered = deduped.slice(0, cap);
   const dropped = deduped.length - rendered.length;
-  const lines: string[] = [MEMORY_SECTION_HEADER, ''];
+  const lines: string[] = [header, ''];
   const eagerLoaded: EagerExposure[] = [];
   for (const { listing, file } of rendered) {
     const state = file?.frontmatter.state;

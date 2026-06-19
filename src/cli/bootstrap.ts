@@ -88,7 +88,7 @@ import {
 } from '../storage/repos/prompt-versions.ts';
 import { setRecapCacheTtlOverride } from '../storage/repos/recap-cache.ts';
 import { type SubagentSet, loadSubagents, validateSubagentSet } from '../subagents/index.ts';
-import { memoryMaxEntries } from '../tools/context-budget.ts';
+import { isSmallWindow, memoryMaxEntries } from '../tools/context-budget.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import { isTrusted, trustListPath } from '../trust/index.ts';
 import { composeWithConstraints } from './constraints-prompt.ts';
@@ -939,44 +939,43 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     //       canonical [system] section). Fully static, unlike
     //       the environment block's date below it.
     const withPlaybook = composeWithPlaybookHint(input.systemPrompt, subagents);
-    const withErgonomics = composeWithToolErgonomics(withPlaybook);
-    const withParallel = composeWithParallelHint(withErgonomics);
-    const withConstraints = composeWithConstraints(withParallel);
-    const withResponseFormat = composeWithResponseFormat(withConstraints);
-    // Output-density default (signal per token, not word count) —
-    // sibling to the response-format block: both govern HOW the model
-    // writes its output. Static in the stable segment, so it never
-    // invalidates the cache prefix; per-task verbosity is the `effort`
-    // request param, not a prompt edit. See `output-style-prompt.ts`.
-    const withOutputStyle = composeWithOutputStyle(withResponseFormat);
-    const withEnvironment = composeWithEnvironment(withOutputStyle, {
+    // Environment input computed ONCE (a single git probe + date read) and shared
+    // by both prefix variants below so their tails are byte-identical.
+    //
+    // Today's date in `YYYY-MM-DD`, OPERATOR-LOCAL timezone: a single boot read,
+    // stable for the session (the env block sits in cache breakpoint #1). Local,
+    // not UTC — the model interprets relative requests ("today's commits") against
+    // it; UTC is a day ahead in US-evening sessions and pushes the wrong git
+    // --since window (see `local-date.ts`). Git probe is best-effort: null when
+    // cwd is not a repo → the git sub-block is omitted.
+    const envInput = {
       cwd,
       platform: process.platform,
-      // Today's date in `YYYY-MM-DD`, OPERATOR-LOCAL timezone.
-      // Single Date.now() call at boot — stable for the whole
-      // session, so the env block sits inside cache breakpoint
-      // #1 across turns within a session. Across session
-      // boundaries spanning local midnight the cache
-      // invalidates, which is the intended trade-off.
-      //
-      // Local time, not UTC: the model uses this value to
-      // interpret relative requests like "today's commits" /
-      // "yesterday's logs". `Date.toISOString()` would emit
-      // UTC, which is one day ahead in US evening sessions and
-      // similar; the wrong day in the prompt then pushes the
-      // model toward the wrong git --since window. See
-      // `local-date.ts` for the timezone-math rationale.
       today: localIsoDate(),
-      // Git probes are best-effort: when cwd is not a git repo
-      // the helper returns null and the env section omits the
-      // git sub-block entirely.
       git: probeGitContext(cwd),
-    });
-    // Identity / role marker (CONTEXT_TUNING §1.2) — outermost
-    // layer, prepended last so it lands FIRST in the final
-    // string, ahead of the environment block. Fully static, so
-    // it sits in the most-stable region of cache breakpoint #1.
-    resolvedSystemPrompt = composeWithIdentity(withEnvironment);
+    };
+    // Directive tail shared by both prefix variants: constraints (safety) +
+    // response/output format + environment + identity — kept on EVERY window.
+    // Identity is applied last so it lands FIRST (CONTEXT_TUNING §1.1/§1.2),
+    // ahead of the environment block, in the most-stable region of breakpoint #1.
+    const withDirectiveTail = (base: string | undefined): string =>
+      composeWithIdentity(
+        composeWithEnvironment(
+          composeWithOutputStyle(composeWithResponseFormat(composeWithConstraints(base))),
+          envInput,
+        ),
+      );
+    // Two directive tiers (CONTEXT_TUNING §2.2). FULL adds the tool-ergonomics +
+    // parallel hints; LEAN (tight window) drops both (~620 tok the window can't
+    // spare) while keeping the safety constraints and format rules. Both are
+    // precomputed; `shapeSystemPrompt` picks per turn against the live window, so
+    // a mid-session /model swap re-tiers. At a large boot window FULL is byte-
+    // identical to the legacy single-chain composition.
+    const stablePrefixFull = withDirectiveTail(
+      composeWithParallelHint(composeWithToolErgonomics(withPlaybook)),
+    );
+    const stablePrefixLean = withDirectiveTail(withPlaybook);
+    resolvedSystemPrompt = stablePrefixFull;
 
     // Memory subsystem (spec MEMORY.md / §4.1). Build the registry
     // from the REPO root, not the invocation cwd: project memory
@@ -1353,11 +1352,17 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // re-clips per turn via shapeSystemPrompt. CONTEXT_TUNING §2.2.
     const bootWindow = provider.capabilities.context_window;
     const memCap = memoryMaxEntries(bootWindow);
+    // Tight-window lean (CONTEXT_TUNING §2.2): condense the memory header and
+    // drop the skill catalog. Boot-time, like the memory cap — the `memory`
+    // cache segment is boot-pinned (eager-exposure provenance), unlike the
+    // per-turn `stable` segment.
+    const small = isSmallWindow(bootWindow);
     const memorySection = assembleMemorySection({
       registry: memoryRegistry,
       bootContext,
       ...(sharedScopeOffline ? { excludeScopes: ['project_shared'] as const } : {}),
       ...(memCap !== undefined ? { maxEntries: memCap } : {}),
+      leanHeader: small,
     });
     eagerExposures = memorySection.eagerLoaded;
     // Skill catalog section (spec SKILLS.md §4.1: surface eager,
@@ -1365,8 +1370,9 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // composeSystemPrompt passes through unchanged. The
     // surfaced/filtered audit is emitted by the harness loop after
     // createSession — the session row must exist before a
-    // skill_events row can reference it.
-    const skillSectionText = assembleSkillCatalogSection(skillCatalog);
+    // skill_events row can reference it. Dropped on a tight window — the model
+    // reaches skills via skill_invoke / tool_search → skill_list instead.
+    const skillSectionText = small ? '' : assembleSkillCatalogSection(skillCatalog);
     const memorySegmentText = composeSystemPrompt(memorySection.text, skillSectionText) ?? '';
     // Acquire/shape split (CONTEXT_TUNING §2.2). Hold the window-independent
     // pieces — stable prefix, acquired guide, boot-capped memory segment — so
@@ -1376,6 +1382,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // `flattenSystemSegments(systemSegments)` still equals `system`.
     systemInputs = {
       ...(stablePrefix !== undefined ? { stablePrefix } : {}),
+      stablePrefixLean,
       ...(acquiredGuide !== undefined ? { acquiredGuide } : {}),
       memorySegmentText,
     };
