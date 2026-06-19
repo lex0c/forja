@@ -267,7 +267,7 @@ describe('createOpenRouterProvider', () => {
           {
             type: 'reasoning',
             provider: 'openrouter',
-            data: [{ type: 'reasoning.text', text: 'r' }],
+            data: { reasoning_details: [{ type: 'reasoning.text', text: 'r' }] },
           },
         ],
       },
@@ -275,6 +275,33 @@ describe('createOpenRouterProvider', () => {
     await collect(p.generate(reqGen({ messages })));
     const assistant = (body.messages as Body[]).find((m) => m.role === 'assistant');
     expect(assistant?.reasoning_details).toEqual([{ type: 'reasoning.text', text: 'r' }]);
+  });
+
+  test('plaintext reasoning replay: round-trips via the assistant `reasoning` field', async () => {
+    let body: Body = {};
+    const p = createOpenRouterProvider('deepseek/deepseek-v3.2', {
+      client: makeClient({
+        chunks: textChunks,
+        onBody: (b) => {
+          body = b;
+        },
+      }),
+    });
+    // A plaintext-only block (no reasoning_details) — replays as the `reasoning`
+    // string, not reasoning_details.
+    const messages: ProviderMessage[] = [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'answer' },
+          { type: 'reasoning', provider: 'openrouter', data: { reasoning: 'plain thoughts' } },
+        ],
+      },
+    ];
+    await collect(p.generate(reqGen({ messages })));
+    const assistant = (body.messages as Body[]).find((m) => m.role === 'assistant');
+    expect(assistant?.reasoning).toBe('plain thoughts');
+    expect('reasoning_details' in (assistant ?? {})).toBe(false);
   });
 
   test('reasoning replay OFF drops the block (FORJA_OPENROUTER_REASONING_REPLAY=0)', async () => {
@@ -299,7 +326,7 @@ describe('createOpenRouterProvider', () => {
                 role: 'assistant',
                 content: [
                   { type: 'text', text: 'x' },
-                  { type: 'reasoning', provider: 'openrouter', data: [{ text: 'r' }] },
+                  { type: 'reasoning', provider: 'openrouter', data: { reasoning: 'r' } },
                 ],
               },
             ],
@@ -308,6 +335,7 @@ describe('createOpenRouterProvider', () => {
       );
       const assistant = (body.messages as Body[]).find((m) => m.role === 'assistant');
       expect('reasoning_details' in (assistant ?? {})).toBe(false);
+      expect('reasoning' in (assistant ?? {})).toBe(false);
     } finally {
       if (saved === undefined) delete process.env.FORJA_OPENROUTER_REASONING_REPLAY;
       else process.env.FORJA_OPENROUTER_REASONING_REPLAY = saved;

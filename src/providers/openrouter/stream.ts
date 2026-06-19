@@ -86,6 +86,9 @@ export async function* normalizeOpenRouterStream(
   let stopReason: StopReason = 'end_turn';
   const toolCalls = new Map<number, ToolCallInProgress>();
   const reasoningDetails: unknown[] = [];
+  // Plaintext reasoning (delta.reasoning / reasoning_content) accumulated for
+  // replay when a model streams no structured reasoning_details.
+  let reasoningText = '';
   let rawPrompt = 0;
   let rawCompletion = 0;
   let rawCached = 0;
@@ -168,6 +171,9 @@ export async function* normalizeOpenRouterStream(
         const hadPlaintextReasoning = plaintextReasoning !== undefined;
         if (plaintextReasoning !== undefined) {
           yield { kind: 'thinking_delta', text: plaintextReasoning };
+          // Capture for replay too — not just the live UI — so plaintext-only
+          // models still round-trip their reasoning on tool follow-ups.
+          reasoningText += plaintextReasoning;
         }
         // Structured reasoning accumulated verbatim for the replay block. When a
         // provider streams ONLY reasoning_details (no plaintext delta.reasoning),
@@ -241,10 +247,18 @@ export async function* normalizeOpenRouterStream(
       }
     }
 
-    // Emit the captured reasoning block (verbatim) before tool stops so it leads
-    // the assistant turn, matching the ordering the ollama/anthropic adapters use.
+    // Emit the captured reasoning block before tool stops so it leads the
+    // assistant turn (ollama/anthropic ordering). Prefer the structured details;
+    // fall back to accumulated plaintext so plaintext-only models still persist a
+    // replayable reasoning event (messages.ts replays it via `message.reasoning`).
     if (reasoningDetails.length > 0) {
-      yield { kind: 'reasoning', provider: 'openrouter', data: reasoningDetails };
+      yield {
+        kind: 'reasoning',
+        provider: 'openrouter',
+        data: { reasoning_details: reasoningDetails },
+      };
+    } else if (reasoningText.length > 0) {
+      yield { kind: 'reasoning', provider: 'openrouter', data: { reasoning: reasoningText } };
     }
 
     const sortedTools = Array.from(toolCalls.entries()).sort(([a], [b]) => a - b);

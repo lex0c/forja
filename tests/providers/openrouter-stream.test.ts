@@ -68,10 +68,12 @@ describe('normalizeOpenRouterStream', () => {
     expect(reasoning).toEqual({
       kind: 'reasoning',
       provider: 'openrouter',
-      data: [
-        { type: 'reasoning.text', text: 'think ' },
-        { type: 'reasoning.text', text: 'more' },
-      ],
+      data: {
+        reasoning_details: [
+          { type: 'reasoning.text', text: 'think ' },
+          { type: 'reasoning.text', text: 'more' },
+        ],
+      },
     });
     // reasoning block leads the textual answer's stop.
     expect(ev.at(-1)).toEqual({ kind: 'stop', reason: 'end_turn' });
@@ -93,11 +95,29 @@ describe('normalizeOpenRouterStream', () => {
     expect(ev.find((e) => e.kind === 'reasoning')).toEqual({
       kind: 'reasoning',
       provider: 'openrouter',
-      data: [{ type: 'reasoning.text', text: 'silent think' }],
+      data: { reasoning_details: [{ type: 'reasoning.text', text: 'silent think' }] },
     });
   });
 
-  test('reasoning_content alias is surfaced as thinking_delta', async () => {
+  test('plaintext-only reasoning (delta.reasoning, no details) is persisted for replay', async () => {
+    const ev = await collect([
+      { id: 'm1', choices: [{ delta: { reasoning: 'step one ' } }] },
+      { choices: [{ delta: { reasoning: 'step two' } }] },
+      { choices: [{ delta: { content: 'answer' }, finish_reason: 'stop' }] },
+    ]);
+    expect(
+      ev.filter((e) => e.kind === 'thinking_delta').map((e) => (e as { text: string }).text),
+    ).toEqual(['step one ', 'step two']);
+    // No reasoning_details streamed → the reasoning event carries the accumulated
+    // plaintext so messages.ts can replay it via `message.reasoning`.
+    expect(ev.find((e) => e.kind === 'reasoning')).toEqual({
+      kind: 'reasoning',
+      provider: 'openrouter',
+      data: { reasoning: 'step one step two' },
+    });
+  });
+
+  test('reasoning_content alias is surfaced as thinking_delta and persisted for replay', async () => {
     const ev = await collect([
       { id: 'm1', choices: [{ delta: { reasoning_content: 'via alias' } }] },
       { choices: [{ delta: { content: 'answer' }, finish_reason: 'stop' }] },
@@ -105,6 +125,11 @@ describe('normalizeOpenRouterStream', () => {
     expect(
       ev.filter((e) => e.kind === 'thinking_delta').map((e) => (e as { text: string }).text),
     ).toEqual(['via alias']);
+    expect(ev.find((e) => e.kind === 'reasoning')).toEqual({
+      kind: 'reasoning',
+      provider: 'openrouter',
+      data: { reasoning: 'via alias' },
+    });
   });
 
   test('tool call accumulates args across deltas and stops with tool_use', async () => {

@@ -408,9 +408,10 @@ add any other OpenRouter model via a catalog entry (§2.1).
 - **Reasoning** — the unified `reasoning` object: `effort` (the shared agnostic
   ladder, `max`→`xhigh`) or `thinking_budget`→`reasoning.max_tokens`;
   `thinking_budget: 0` disables via the documented `effort:'none'`. Reasoning
-  replay round-trips `reasoning_details` across tool turns (default ON,
-  `FORJA_OPENROUTER_REASONING_REPLAY=0` to opt out); the live trace also reads the
-  `reasoning_content` alias.
+  replay round-trips `reasoning_details` — or, for models that stream only
+  plaintext (`delta.reasoning` / the `reasoning_content` alias) with no structured
+  details, the accumulated plaintext via the assistant `reasoning` field — across
+  tool turns (default ON, `FORJA_OPENROUTER_REASONING_REPLAY=0` to opt out).
 - **Caching** — automatic server-side caches are captured passively
   (`cached_tokens` → `cache_read`, `cache_write_tokens` → `cache_creation`). Models
   that need **explicit** breakpoints (Qwen, capability `cache_explicit_breakpoints`)

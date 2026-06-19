@@ -30,9 +30,11 @@ export interface ORMessage {
   content?: string | null | ORTextBlock[];
   tool_calls?: ORToolCall[];
   tool_call_id?: string;
-  // Replayed verbatim (the array captured by the stream normalizer). The model
-  // owns its shape — we never canonicalize it.
+  // Reasoning replay (OpenRouter accepts either form): `reasoning_details` is the
+  // structured array, replayed verbatim; `reasoning` is the plaintext string for
+  // models that stream no structured details. The model owns the shape.
   reasoning_details?: unknown;
+  reasoning?: string;
 }
 
 // Build the system message. With explicit prompt caching on (qwen-style models
@@ -145,7 +147,19 @@ export const toOpenRouterMessages = (
       if (content !== null || toolCalls.length > 0) {
         const m: ORMessage = { role: 'assistant', content };
         if (toolCalls.length > 0) m.tool_calls = toolCalls;
-        if (reasoningData !== undefined) m.reasoning_details = reasoningData;
+        // Replay captured reasoning: structured details when present, else the
+        // plaintext via `reasoning` (the block the stream normalizer emitted is a
+        // tagged object; an Array is the legacy raw-details shape).
+        if (Array.isArray(reasoningData)) {
+          m.reasoning_details = reasoningData;
+        } else if (reasoningData !== null && typeof reasoningData === 'object') {
+          const rd = reasoningData as { reasoning_details?: unknown; reasoning?: unknown };
+          if (rd.reasoning_details !== undefined) {
+            m.reasoning_details = rd.reasoning_details;
+          } else if (typeof rd.reasoning === 'string') {
+            m.reasoning = rd.reasoning;
+          }
+        }
         out.push(m);
       }
     } else if (textParts.length > 0) {
