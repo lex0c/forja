@@ -22,7 +22,7 @@
 // (`subagent-child.ts`) also prepends this hint, there as the
 // outermost layer over the playbook body. The authoritative
 // top-down layer order for both pipelines lives in
-// `docs/SYSTEM_PROMPT.md §2.1`; consult it rather than a per-file
+// `docs/CONTEXT.md §5.1`; consult it rather than a per-file
 // recap, which is what drifted stale here.
 export const PARALLEL_HINT_PROMPT = `# Parallelism
 

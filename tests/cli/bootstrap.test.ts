@@ -622,8 +622,8 @@ Body.`,
     // between `# Parallelism` and `# Memory` (or after `# Memory`,
     // in the case of `# Skills`) and the partial assertion is
     // satisfied as long as the parallel→memory anchor holds.
-    // Mirrors the impl chain documented in `docs/SYSTEM_PROMPT.md
-    // §2.1` so a future contributor running this test catches the
+    // Mirrors the impl chain documented in `docs/CONTEXT.md
+    // §5.1` so a future contributor running this test catches the
     // doc/impl drift at the same time.
     const trustPath = join(workdir, 'trusted_dirs.json');
     writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
