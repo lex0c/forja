@@ -17,6 +17,7 @@ import { ANTHROPIC_CAPS } from './anthropic/capabilities.ts';
 import { GOOGLE_CAPS } from './google/capabilities.ts';
 import { OLLAMA_CAPS } from './ollama/capabilities.ts';
 import { OPENAI_CAPS } from './openai/capabilities.ts';
+import { OPENROUTER_CAPS } from './openrouter/capabilities.ts';
 import type { ModelProviderEntry, ProviderCapabilities, ProviderFamily } from './types.ts';
 
 const fromCaps = (
@@ -46,4 +47,7 @@ export const CANONICAL_MODEL_PROVIDERS: ReadonlyArray<ModelProviderEntry> = [
   ...fromCaps('google', GOOGLE_CAPS, 'GOOGLE_API_KEY'),
   ...fromCaps('ollama', OLLAMA_CAPS),
   ...fromCaps('openai', OPENAI_CAPS, 'OPENAI_API_KEY'),
+  // OpenRouter carries no env fallback either — the catalog's api_key_env
+  // (OPENROUTER_API_KEY) is the sole key source, mapped to a bearer header.
+  ...fromCaps('openrouter', OPENROUTER_CAPS, 'OPENROUTER_API_KEY'),
 ];

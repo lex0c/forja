@@ -5,9 +5,12 @@ import type { ProviderCapabilities } from '../types.ts';
 // catalog. No dynamic resolution: `--model ollama/<name>` resolves against these
 // static entries, exactly like the other providers.
 //
-// `context_window` is the model's CAPACITY. Ollama serves a low default num_ctx
-// (~2–4K) and truncates silently above it, so the adapter MUST send
-// `options.num_ctx` = this value (see messages.ts) for the window to be real.
+// `context_window` is the model's CAPACITY (catalog ceiling). Ollama serves a low
+// default num_ctx (~2–4K) and truncates silently above it, so the adapter sends an
+// explicit `options.num_ctx` (see messages.ts) — capped at DEFAULT_OLLAMA_NUM_CTX
+// to keep the KV cache off OOM. The factory then re-exposes that SERVED window as
+// the provider's `context_window` (index.ts), so the harness budgets against what
+// the daemon actually processes; the value here is the ceiling that cap clamps to.
 // `output_max_tokens` is a practical generation ceiling — Ollama imposes no hard
 // cap (num_predict controls it); thinking-capable models get more headroom for
 // reasoning tokens.

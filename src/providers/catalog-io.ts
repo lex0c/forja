@@ -26,10 +26,16 @@ export const MODEL_PROVIDERS_FILENAME = 'model_providers.json';
 export const CATALOG_VERSION = 1;
 
 // Families Forja ships an adapter for. The file may name only these; an
-// unknown family (a typo, or `openrouter` before its adapter lands) is
-// dropped fail-soft. Narrower than `ProviderFamily`, which also carries
-// not-yet-implemented members (llama_cpp, mistral).
-const SUPPORTED_FAMILIES = new Set<ProviderFamily>(['anthropic', 'openai', 'ollama', 'google']);
+// unknown family (a typo, or a not-yet-implemented one) is dropped fail-soft.
+// Narrower than `ProviderFamily`, which also carries members without an adapter
+// (llama_cpp, mistral).
+const SUPPORTED_FAMILIES = new Set<ProviderFamily>([
+  'anthropic',
+  'openai',
+  'ollama',
+  'google',
+  'openrouter',
+]);
 
 // Whether Forja ships an adapter for this family. Exported so the
 // subagent child can validate a persisted model_entry_snapshot's family

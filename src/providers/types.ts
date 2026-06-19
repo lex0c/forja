@@ -4,7 +4,14 @@
 // in M1 — it's coupled to TOKEN_TUNING.md §10, which is its own subsystem
 // step. Will be added when that step lands.
 
-export type ProviderFamily = 'anthropic' | 'openai' | 'ollama' | 'llama_cpp' | 'google' | 'mistral';
+export type ProviderFamily =
+  | 'anthropic'
+  | 'openai'
+  | 'ollama'
+  | 'llama_cpp'
+  | 'google'
+  | 'mistral'
+  | 'openrouter';
 
 export type ToolCallingMode = 'native' | 'adapted';
 export type CacheMode = 'server_5min' | 'server_persistent' | 'client_only';
@@ -66,6 +73,11 @@ export interface ProviderCapabilities {
   // cost stays exact. Only providers with a distinct 1h tier set it.
   cost_per_1k_cache_write?: number;
   cost_per_1k_cache_write_1h?: number;
+  // The model needs EXPLICIT `cache_control` breakpoints to cache its prompt
+  // (Qwen/Anthropic-style), as opposed to automatic server-side caching. The
+  // OpenRouter adapter reads this to emit cache_control markers on the stable
+  // system segments; other adapters ignore it. Absent/false ⇒ automatic or no cache.
+  cache_explicit_breakpoints?: boolean;
 
   // Whether the model accepts the `temperature` / `top_p` sampling
   // parameters at the API boundary. Vendors deprecate these on
@@ -101,6 +113,12 @@ export interface ProviderCapabilities {
   // provider-effort axis is gated here (best-effort per the
   // "request expresses intent, per-provider follows" convention).
   supports_reasoning_effort?: boolean;
+  // The model produces reasoning to capture & replay but does NOT expose
+  // effort-level selection (it has the generic reasoning toggle only). Distinct
+  // from `supports_reasoning_effort`: the OpenRouter adapter replays these models'
+  // reasoning and toggles them via `reasoning.enabled`, never sending an effort
+  // level the model would reject. Adapters that don't model this ignore it.
+  supports_reasoning?: boolean;
   // The model accepts the `xhigh` reasoning-effort level (between `high` and
   // `max`). Narrower than `max`: on Anthropic only Opus 4.7/4.8 expose it, so a
   // request for `xhigh` is clamped down to `high` when this is false/omitted, to

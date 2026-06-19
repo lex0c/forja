@@ -29,9 +29,13 @@ const runResult = (over: Partial<EvalCaseResult>): EvalCaseResult => ({
 });
 
 describe('flagForModel', () => {
-  test('maps anthropic + openai families to their replay flags', () => {
+  test('maps anthropic + openai + openrouter families to their replay flags', () => {
     expect(flagForModel('anthropic/claude-opus-4-8')).toBe('FORJA_ANTHROPIC_REASONING_REPLAY');
     expect(flagForModel('openai/gpt-5.4-mini')).toBe('FORJA_OPENAI_REASONING_REPLAY');
+    // Two-slash OpenRouter id: family is still the first segment.
+    expect(flagForModel('openrouter/deepseek/deepseek-r1')).toBe(
+      'FORJA_OPENROUTER_REASONING_REPLAY',
+    );
   });
 
   test('throws for a provider with no replay wiring', () => {

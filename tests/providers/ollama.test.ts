@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { generateWithRetry } from '../../src/harness/retry.ts';
+import { OLLAMA_CAPS } from '../../src/providers/ollama/capabilities.ts';
 import type { OllamaChatResponse } from '../../src/providers/ollama/http.ts';
 import { createOllamaProvider, parseOllamaHeaders } from '../../src/providers/ollama/index.ts';
 import type {
@@ -251,5 +252,64 @@ describe('createOllamaProvider', () => {
     const p = createOllamaProvider('qwen2.5-coder:14b', { fetch: recordingFetch(okResponse).fn });
     const n = await p.countTokens([{ role: 'user', content: 'hello world this is a test' }]);
     expect(n).toBeGreaterThan(0);
+  });
+});
+
+// The factory re-exposes the SERVED num_ctx as capabilities.context_window so the
+// harness (compaction, subagent composer, window-relative allocator) budgets
+// against what the daemon actually processes — not the catalog capacity Ollama
+// would silently truncate above num_ctx.
+describe('served context window (num_ctx ↔ capabilities)', () => {
+  const numCtxOf = (body: Record<string, unknown>): unknown =>
+    (body.options as Record<string, unknown>).num_ctx;
+
+  test('a >cap model reports the SERVED (capped) window, not the catalog capacity', async () => {
+    const { fn, bodies } = recordingFetch(okResponse);
+    // qwen3-coder:30b capacity is 262144; the default cap is 32768.
+    const p = createOllamaProvider('qwen3-coder:30b', { fetch: fn });
+    expect(p.capabilities.context_window).toBe(32_768);
+    await collect(p.generate(reqGen({ messages: [{ role: 'user', content: 'x' }] })));
+    expect(numCtxOf(bodies[0] as Record<string, unknown>)).toBe(32_768);
+  });
+
+  test('an at-or-below-cap model keeps its full window', () => {
+    expect(createOllamaProvider('qwen2.5-coder:14b').capabilities.context_window).toBe(32_768);
+  });
+
+  test('numCtx override raises both the served window and num_ctx', async () => {
+    const { fn, bodies } = recordingFetch(okResponse);
+    const p = createOllamaProvider('qwen3-coder:30b', { fetch: fn, numCtx: 65_536 });
+    expect(p.capabilities.context_window).toBe(65_536);
+    await collect(p.generate(reqGen({ messages: [{ role: 'user', content: 'x' }] })));
+    expect(numCtxOf(bodies[0] as Record<string, unknown>)).toBe(65_536);
+  });
+
+  test('an over-capacity override cannot claim a window past the model capacity', async () => {
+    const { fn, bodies } = recordingFetch(okResponse);
+    // llama3.1:8b capacity is 131072.
+    const p = createOllamaProvider('llama3.1:8b', { fetch: fn, numCtx: 1_000_000 });
+    expect(p.capabilities.context_window).toBe(131_072);
+    await collect(p.generate(reqGen({ messages: [{ role: 'user', content: 'x' }] })));
+    // num_ctx still forwards the operator's explicit ask (their VRAM call).
+    expect(numCtxOf(bodies[0] as Record<string, unknown>)).toBe(1_000_000);
+  });
+
+  test('FORJA_OLLAMA_NUM_CTX env sets the served window', () => {
+    const saved = process.env.FORJA_OLLAMA_NUM_CTX;
+    process.env.FORJA_OLLAMA_NUM_CTX = '49152';
+    try {
+      expect(createOllamaProvider('qwen3-coder:30b').capabilities.context_window).toBe(49_152);
+    } finally {
+      if (saved === undefined) {
+        delete process.env.FORJA_OLLAMA_NUM_CTX;
+      } else {
+        process.env.FORJA_OLLAMA_NUM_CTX = saved;
+      }
+    }
+  });
+
+  test('does not mutate the shared static catalog capability', () => {
+    createOllamaProvider('qwen3-coder:30b');
+    expect(OLLAMA_CAPS['qwen3-coder:30b']?.context_window).toBe(262_144);
   });
 });

@@ -4,6 +4,7 @@ import { createDefaultRegistry } from '../../src/providers/catalog-file.ts';
 import { GOOGLE_MODEL_NAMES } from '../../src/providers/google/capabilities.ts';
 import { OLLAMA_MODEL_NAMES } from '../../src/providers/ollama/capabilities.ts';
 import { OPENAI_MODEL_NAMES } from '../../src/providers/openai/capabilities.ts';
+import { OPENROUTER_MODEL_NAMES } from '../../src/providers/openrouter/capabilities.ts';
 import { type ModelEntry, createRegistry } from '../../src/providers/registry.ts';
 
 const dummyEntry = (id: string): ModelEntry => ({
@@ -109,11 +110,15 @@ describe('createDefaultRegistry', () => {
     for (const modelName of OLLAMA_MODEL_NAMES) {
       expect(reg.has(`ollama/${modelName}`)).toBe(true);
     }
+    for (const modelName of OPENROUTER_MODEL_NAMES) {
+      expect(reg.has(`openrouter/${modelName}`)).toBe(true);
+    }
     expect(reg.list()).toHaveLength(
       ANTHROPIC_MODEL_NAMES.length +
         GOOGLE_MODEL_NAMES.length +
         OPENAI_MODEL_NAMES.length +
-        OLLAMA_MODEL_NAMES.length,
+        OLLAMA_MODEL_NAMES.length +
+        OPENROUTER_MODEL_NAMES.length,
     );
   });
 

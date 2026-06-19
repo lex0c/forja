@@ -18,17 +18,18 @@ import type { EvalCase, EvalCaseResult } from './types.ts';
 const REPLAY_FLAG: Record<string, string> = {
   anthropic: 'FORJA_ANTHROPIC_REASONING_REPLAY',
   openai: 'FORJA_OPENAI_REASONING_REPLAY',
+  openrouter: 'FORJA_OPENROUTER_REASONING_REPLAY',
 };
 
-// Resolve the replay flag a model's provider family honors. Only Anthropic and
-// OpenAI wire reasoning replay today; anything else has no flag to flip and the
-// A/B would compare two identical arms — fail loud instead.
+// Resolve the replay flag a model's provider family honors. Anthropic, OpenAI,
+// and OpenRouter wire reasoning replay today; anything else has no flag to flip
+// and the A/B would compare two identical arms — fail loud instead.
 export const flagForModel = (modelId: string): string => {
   const family = modelId.split('/')[0] ?? '';
   const flag = REPLAY_FLAG[family];
   if (flag === undefined) {
     throw new Error(
-      `reasoning-replay A/B is only defined for anthropic/* and openai/* models; got '${modelId}'`,
+      `reasoning-replay A/B is only defined for anthropic/*, openai/*, and openrouter/* models; got '${modelId}'`,
     );
   }
   return flag;

@@ -57,9 +57,10 @@ interface Provider {
   observable effect today — a real tokenizer lands only when 4.9 wires
   `countTokens` into budgeting.
 
-The four implemented adapters live in `src/providers/{anthropic,openai,google,ollama}/`.
-`ProviderFamily` also declares `llama_cpp` and `mistral` for the future local path;
-those have no catalog entries yet.
+The five implemented adapters live in
+`src/providers/{anthropic,openai,google,ollama,openrouter}/`. `ProviderFamily` also
+declares `llama_cpp` and `mistral` for the future local path; those have no catalog
+entries yet.
 
 ---
 
@@ -87,6 +88,7 @@ seeded models:
 | **openai** | `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex`, `gpt-4o`, `gpt-4o-mini` |
 | **google** | `gemini-3.5-flash`, `gemini-3.1-pro-preview`, `gemini-3.1-flash-lite`, `gemini-3-flash-preview`, `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite` |
 | **ollama** (local) | `qwen2.5-coder:7b/14b/32b`, `qwen3:8b/14b/30b`, `qwen3-coder:30b`, `llama3.1:8b`, `mistral-nemo:12b`, `gpt-oss:20b`, `devstral:24b` — all native tool calling, `$0` |
+| **openrouter** (gateway) | `deepseek/deepseek-v3.2`, `deepseek/deepseek-r1`, `qwen/qwen3-coder-plus`, `x-ai/grok-4.3`, `z-ai/glm-4.6`, `moonshotai/kimi-k2-thinking`, `meta-llama/llama-3.3-70b-instruct` — models not reachable as a first-class family; ids are `openrouter/<vendor>/<model>` (two slashes) |
 
 To add, remove, or adjust a model, edit the file (§2.1) — no recompile. The
 registry test (`tests/providers/registry.test.ts`) asserts every seeded model
@@ -120,8 +122,10 @@ Each entry:
 ```
 
 - **`id`** — `family/model_name`. `family` must be one Forja ships an adapter for
-  (`anthropic`, `openai`, `ollama`, `google`); the file registers *models*, not
-  new adapters (those are a code change — §8).
+  (`anthropic`, `openai`, `ollama`, `google`, `openrouter`); the file registers
+  *models*, not new adapters (those are a code change — §8). For `openrouter` the
+  `model_name` itself is `<vendor>/<model>`, so the id carries two slashes
+  (`openrouter/deepseek/deepseek-v3.2`).
 - **`model_name`** — what the underlying SDK / HTTP API sees.
 - **`api_key_env`** — the env var that holds the API key (never the key itself).
   It is **authoritative**: the cloud adapters have no env fallback of their own,
@@ -129,7 +133,8 @@ Each entry:
   boot fails naming it. Omit it for local Ollama (no key); a Google user on
   `GEMINI_API_KEY` sets `api_key_env` to `GEMINI_API_KEY`.
 - **`base_url`** (optional) — a custom endpoint: a remote/cloud Ollama host, or an
-  OpenAI-compatible gateway (vLLM, LM Studio, OpenRouter, Azure).
+  OpenAI-compatible gateway (vLLM, LM Studio, Azure). OpenRouter is its own
+  first-class family (§5.5), not the openai adapter pointed at a gateway.
 - **`capabilities`** — the `ProviderCapabilities` shape (§3): tool calling, cache
   mode, context window, output cap, per-1k costs, and the `supports_*` reasoning
   flags.
@@ -156,6 +161,80 @@ absent/corrupt file, or a catalog with zero valid models, is fatal.
 
 Then `--model <id>` (boot) or `/model <id>` (in the REPL) selects it. Because the
 catalog is user-scope only, a cloned repo cannot inject a `base_url` / key var.
+
+### 2.2 Quickstart: selecting and running a model
+
+Run `forja init` once (writes the catalog), then pick a model with `--model <id>`
+at boot or `/model <id>` in the REPL. Concrete recipes:
+
+#### Ollama — local models
+
+Run on your own machine at `$0`, fully offline. Start the daemon, pull a seeded
+model, and select it:
+
+```sh
+ollama serve                              # if not already running
+ollama pull qwen2.5-coder:14b            # any seeded model (§2)
+forja --model ollama/qwen2.5-coder:14b
+```
+
+No API key — local inference needs none. Optional tuning (env):
+
+```sh
+FORJA_OLLAMA_NUM_CTX=65536               # raise the served window (VRAM trade-off; default cap 32K)
+FORJA_OLLAMA_KEEP_ALIVE=30m              # keep the model resident between turns ("-1" = forever)
+FORJA_OLLAMA_REASONING_REPLAY=0          # opt out of reasoning replay on thinking models
+```
+
+`agent doctor` reports daemon reachability, version, and whether the model is
+pulled. To use a pulled model that is not seeded, add a catalog entry (§2.1).
+
+#### Ollama — cloud / remote host
+
+The same adapter talks to a remote/LAN box or Ollama's hosted cloud — point it at
+the host and pass auth. Quickest, via env:
+
+```sh
+export FORJA_OLLAMA_BASE_URL=https://ollama.com           # your remote/cloud host
+export FORJA_OLLAMA_HEADERS='{"Authorization":"Bearer <OLLAMA_API_KEY>"}'
+forja --model ollama/qwen3-coder:30b
+```
+
+Or persist it as a catalog entry, so the key comes from an env var that the adapter
+maps to a bearer header automatically:
+
+```json
+{ "id": "ollama/qwen3-coder:30b", "family": "ollama", "model_name": "qwen3-coder:30b",
+  "base_url": "https://ollama.com", "api_key_env": "OLLAMA_API_KEY",
+  "capabilities": { "tools": "native", "cache": false, "vision": false, "streaming": true,
+    "constrained": "json_mode", "context_window": 262144, "output_max_tokens": 16384,
+    "cost_per_1k_input": 0, "cost_per_1k_output": 0, "notes": ["ollama cloud"] } }
+```
+
+A non-localhost host sends your context off the machine — treat it like any cloud
+provider.
+
+#### OpenRouter — one key, many models
+
+A gateway: a single `OPENROUTER_API_KEY` reaches models Forja does not ship
+first-class (DeepSeek, Qwen-Coder, Grok, GLM, Kimi, Llama). Set the key and select
+a seeded model — the id carries the vendor, so it has **two slashes**:
+
+```sh
+export OPENROUTER_API_KEY=sk-or-...
+forja --model openrouter/deepseek/deepseek-v3.2
+```
+
+Any other OpenRouter model works via a catalog entry (§2.1) with
+`family: "openrouter"` and `model_name: "<vendor>/<model>"`. Optional env:
+
+```sh
+FORJA_OPENROUTER_REFERER=https://your.app      # attribution on the OpenRouter rankings
+FORJA_OPENROUTER_TITLE="Your App"
+FORJA_OPENROUTER_REASONING_REPLAY=0            # opt out of reasoning replay
+```
+
+See §5.5 for what the adapter does with caching, reasoning, and routing.
 
 ---
 
@@ -317,6 +396,48 @@ itself, so the adapter sends no dialect.
   (`local.daemon.unavailable` / `local.model.not_loaded`) with actionable hints;
   abort cancels the in-flight fetch via the stream reader.
 
+### 5.5 OpenRouter (OpenAI-compatible gateway)
+
+`openrouter/index.ts` — a thin adapter reusing the OpenAI SDK as transport
+(`baseURL` = `https://openrouter.ai/api/v1` + optional attribution headers), with
+its own request builder, normalizer, and curated static catalog. Models are
+`openrouter/<vendor>/<model>` (two slashes); the catalog is **OpenRouter-exclusive**
+(no anthropic/openai/google duplicates — use those families directly). Operators
+add any other OpenRouter model via a catalog entry (§2.1).
+
+- **Reasoning** — the unified `reasoning` object. Only models whose
+  `/api/v1/models` exposes `supported_efforts` (here: Grok, `supports_reasoning_effort`)
+  get `reasoning.effort` (the shared agnostic ladder, `max`→`xhigh`) /
+  `thinking_budget`→`reasoning.max_tokens`, with `effort:'none'` to disable.
+  Thinking models that expose only the generic reasoning toggle (DeepSeek / GLM /
+  Kimi, `supports_reasoning`) are driven via `reasoning.enabled` — never an effort
+  level they would reject. Reasoning
+  replay round-trips `reasoning_details` — or, for models that stream only
+  plaintext (`delta.reasoning` / the `reasoning_content` alias) with no structured
+  details, the accumulated plaintext via the assistant `reasoning` field — across
+  tool turns (default ON, `FORJA_OPENROUTER_REASONING_REPLAY=0` to opt out).
+- **Caching** — automatic server-side caches are captured passively
+  (`cached_tokens` → `cache_read`, `cache_write_tokens` → `cache_creation`). Models
+  that need **explicit** breakpoints (Qwen, capability `cache_explicit_breakpoints`)
+  get `cache_control` markers on the stable system segments, reusing the same
+  `systemSegments` hint as Anthropic (the `\n\n` joiner is re-added so the bytes
+  match the canonical system string).
+- **Honest window** — `transforms: []` disables OpenRouter's middle-out compression
+  so the Forja context engine owns truncation; `context_window` is seeded from the
+  served (top-provider) window, not the headline max (same premise as the Ollama
+  served-window cap).
+- **Usage** — always returned (the legacy `usage:{include}` / `stream_options`
+  flags are no-ops; the adapter sends `usage:{include:true}` defensively); cost via
+  the seeded per-model rates (`usage.cost` is not consumed yet).
+- **Errors** — in-band stream failures (HTTP 200 + `finish_reason:"error"` or an
+  `error` object on the chunk) normalize to a typed `error` event, retryable on
+  429/5xx.
+- **Config (env):** `OPENROUTER_API_KEY` (sole key source, no fallback),
+  `FORJA_OPENROUTER_REFERER` / `FORJA_OPENROUTER_TITLE` (attribution),
+  `FORJA_OPENROUTER_REASONING_REPLAY`.
+- **Not wired (deferred):** response caching (`X-OpenRouter-Cache`), `session_id`
+  sticky routing, and `:exacto`/provider-routing controls.
+
 ---
 
 ## 6. Cross-cutting conventions
@@ -343,6 +464,7 @@ coding/agentic sweet spot (Opus 4.7/4.8). Omitted for models that don't support 
 | OpenAI | automatic prefix caching (+ opt-in 24h retention on supported models) | `prompt_cache_key` routing (both paths) |
 | Gemini | implicit | none wired yet (`CachedContent` pending) |
 | Ollama | none (local, `$0`) | n/a — no server-side cache |
+| OpenRouter | per-model: automatic (most) or explicit `cache_control` (Qwen) | passive `cached_tokens` capture; markers on the stable prefix for explicit-cache models |
 
 **Retry** is **shared, not per-adapter** — `src/harness/retry.ts` wraps the
 provider call at the harness level, so all families get the same policy: retry on
