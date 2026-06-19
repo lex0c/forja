@@ -22,6 +22,7 @@ smoke_require_key() {
     google/*)
       if [[ -n "${GOOGLE_API_KEY:-}" ]]; then var=GOOGLE_API_KEY; else var=GEMINI_API_KEY; fi
       ;;
+    openrouter/*) var=OPENROUTER_API_KEY ;;
     *) var=ANTHROPIC_API_KEY ;;
   esac
   if [[ -z "${!var:-}" ]]; then
