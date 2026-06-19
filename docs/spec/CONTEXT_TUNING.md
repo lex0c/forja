@@ -349,10 +349,13 @@ recomputação que muda os bytes é a **troca de modelo**, que já esfria o cach
 `deferBelowTokens` estende o mecanismo de deferred tools (§7.6): o flag `deferred` continua
 sendo "sempre deferred"; o threshold marca tools base **dispensáveis em janela pequena** sem
 mexer no comportamento em janela grande. O núcleo mínimo de ação (`read_file`/`glob`/`bash`/
-`edit_file`/`write_file`/`tool_search` + estado de sessão) nunca recebe threshold; busca/
-discovery mais pesada (`grep`, `git`, `memory_read`/`memory_search`) e orquestração de
-subagent (`task*`) **podem** ser deferidas numa janela apertada — qual conjunto exato é uma
-escolha do operador, tunável por eval, não um invariante. Deferir `grep`/`git` não tira a
+`edit_file`/`write_file`/`tool_search` + estado de sessão) nunca recebe threshold. `grep` e
+`git` ficam **sempre** deferidas (flag `deferred` estático, §7.6, em TODA janela): o `bash`
+cobre a capability sempre (`rg`/`git` direto), então a versão estruturada/endurecida só vale
+sob demanda via `tool_search`. Busca de memória (`memory_read`/`memory_search`) e orquestração
+de subagent (`task*`, `git_apply_patch`) são **window-tier** (`deferBelowTokens`) — deferidas
+só numa janela apertada. Qual tool fica em qual camada é escolha do operador, tunável por eval,
+não um invariante. Deferir `grep`/`git` não tira a
 capability: `bash` fica na base em toda janela e roda `rg`/`git` direto; o `tool_search`
 re-revela a versão estruturada/endurecida quando o JSON + gating dedicado valem o schema. O predicado window-aware roda nos
 **dois** sites — a lista enviada e o catálogo/reveal-pool do `tool_search` — para os dois não
