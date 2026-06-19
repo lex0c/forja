@@ -777,6 +777,13 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       // parent's cwd keeps the child's view consistent with the
       // parent's: same shared, same local, same user scope.
       memoryCwd: input.cwd,
+      // Preserve the selected model's custom api_key_env through the
+      // child's scrubEnv so a custom catalog model (non-built-in key var)
+      // can authenticate after rebuilding from the snapshot; built-in
+      // families already ride PROVIDER_API_KEY_VARS.
+      ...(input.provider.catalogEntry?.api_key_env !== undefined
+        ? { apiKeyEnv: input.provider.catalogEntry.api_key_env }
+        : {}),
       ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
       ...(input.providerEffort !== undefined ? { providerEffort: input.providerEffort } : {}),
       ...(input.cwdTrusted === true ? { cwdTrusted: true } : {}),
