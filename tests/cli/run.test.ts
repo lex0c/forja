@@ -9,6 +9,7 @@ import type { HarnessEvent, HarnessResult } from '../../src/harness/index.ts';
 import type { Provider, StreamEvent } from '../../src/providers/index.ts';
 import { closeDb, migrate, openDb } from '../../src/storage/index.ts';
 import { createSession } from '../../src/storage/repos/sessions.ts';
+import { seedModelCatalog } from '../helpers/seed-catalog.ts';
 
 const baseArgs = (overrides: Partial<ParsedArgs> = {}): ParsedArgs => ({
   prompt: 'hi',
@@ -82,14 +83,23 @@ const mockProvider = (script: ScriptedStep[]): Provider => {
 
 let workdir: string;
 let dbPath: string;
+let originalXdg: string | undefined;
 
 beforeEach(() => {
   workdir = mkdtempSync(join(tmpdir(), 'forja-run-'));
   dbPath = join(workdir, 'sessions.db');
+  // Isolate user config to the workdir and materialize the mandatory
+  // model catalog there so run()'s bootstrap doesn't read the dev's real
+  // ~/.config (or fail on a clean CI with no catalog).
+  originalXdg = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = workdir;
+  seedModelCatalog();
 });
 
 afterEach(() => {
   rmSync(workdir, { recursive: true, force: true });
+  if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+  else process.env.XDG_CONFIG_HOME = originalXdg;
 });
 
 describe('run dispatch — --explain-permissions short-circuit', () => {
