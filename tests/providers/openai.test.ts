@@ -71,9 +71,11 @@ describe('createOpenAIProvider', () => {
     expect(() => createOpenAIProvider('gpt-4o-mini')).toThrow(/API key required/);
   });
 
-  test('reads OPENAI_API_KEY from env when no apiKey option', () => {
+  test('does NOT read OPENAI_API_KEY from env (no env fallback)', () => {
     process.env.OPENAI_API_KEY = 'sk-env';
-    expect(() => createOpenAIProvider('gpt-4o-mini')).not.toThrow();
+    // The catalog resolves the key from the model's api_key_env and passes
+    // it as options.apiKey; the adapter has no env fallback of its own.
+    expect(() => createOpenAIProvider('gpt-4o-mini')).toThrow(/API key required/);
   });
 
   test('exposes canonical id, family, and capabilities', () => {

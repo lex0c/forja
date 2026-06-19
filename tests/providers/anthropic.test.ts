@@ -108,9 +108,11 @@ describe('createAnthropicProvider', () => {
     expect(() => createAnthropicProvider('claude-sonnet-4-6')).toThrow(/API key required/);
   });
 
-  test('reads ANTHROPIC_API_KEY from env when no apiKey option', () => {
+  test('does NOT read ANTHROPIC_API_KEY from env (no env fallback)', () => {
     process.env.ANTHROPIC_API_KEY = 'sk-env';
-    expect(() => createAnthropicProvider('claude-sonnet-4-6')).not.toThrow();
+    // The catalog resolves the key from the model's api_key_env and passes
+    // it as options.apiKey; the adapter has no env fallback of its own.
+    expect(() => createAnthropicProvider('claude-sonnet-4-6')).toThrow(/API key required/);
   });
 
   test('exposes canonical id and family', () => {

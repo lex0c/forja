@@ -271,9 +271,11 @@ export const createAnthropicProvider = (
   if (options.client !== undefined) {
     client = options.client;
   } else {
-    const apiKey = options.apiKey ?? process.env.ANTHROPIC_API_KEY;
+    const apiKey = options.apiKey;
     if (apiKey === undefined || apiKey.length === 0) {
-      throw new Error('Anthropic API key required (pass options.apiKey or set ANTHROPIC_API_KEY)');
+      throw new Error(
+        'Anthropic API key required (pass options.apiKey; the catalog provides it from the model api_key_env in model_providers.json — no env fallback)',
+      );
     }
     client = new Anthropic({
       apiKey,

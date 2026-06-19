@@ -38,8 +38,9 @@ const fromCaps = (
 // ollama, openai) so the seeded file's diff is stable. Ollama carries
 // no `api_key_env` — local inference needs no key; remote/cloud Ollama
 // auth flows through FORJA_OLLAMA_HEADERS or a per-entry `base_url` the
-// operator adds. Google seeds `GOOGLE_API_KEY` (the adapter still falls
-// back to GEMINI_API_KEY when that env is unset).
+// operator adds. Google seeds `GOOGLE_API_KEY`; there is NO env fallback,
+// so an operator who instead uses GEMINI_API_KEY edits the entry's
+// api_key_env to GEMINI_API_KEY (the file is the authoritative source).
 export const CANONICAL_MODEL_PROVIDERS: ReadonlyArray<ModelProviderEntry> = [
   ...fromCaps('anthropic', ANTHROPIC_CAPS, 'ANTHROPIC_API_KEY'),
   ...fromCaps('google', GOOGLE_CAPS, 'GOOGLE_API_KEY'),

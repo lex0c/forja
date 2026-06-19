@@ -136,10 +136,10 @@ export const createGoogleProvider = (
   if (options.client !== undefined) {
     client = options.client;
   } else {
-    const apiKey = options.apiKey ?? process.env.GOOGLE_API_KEY ?? process.env.GEMINI_API_KEY;
+    const apiKey = options.apiKey;
     if (apiKey === undefined || apiKey.length === 0) {
       throw new Error(
-        'Google API key required (pass options.apiKey or set GOOGLE_API_KEY / GEMINI_API_KEY)',
+        'Google API key required (pass options.apiKey; the catalog provides it from the model api_key_env in model_providers.json — no env fallback, GEMINI_API_KEY included)',
       );
     }
     client = new GoogleGenAI({ apiKey });

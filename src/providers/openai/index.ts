@@ -215,9 +215,11 @@ export const createOpenAIProvider = (
   if (options.client !== undefined) {
     client = options.client;
   } else {
-    const apiKey = options.apiKey ?? process.env.OPENAI_API_KEY;
+    const apiKey = options.apiKey;
     if (apiKey === undefined || apiKey.length === 0) {
-      throw new Error('OpenAI API key required (pass options.apiKey or set OPENAI_API_KEY)');
+      throw new Error(
+        'OpenAI API key required (pass options.apiKey; the catalog provides it from the model api_key_env in model_providers.json — no env fallback)',
+      );
     }
     const sdkOpts: { apiKey: string; baseURL?: string } = { apiKey };
     if (options.baseURL !== undefined) sdkOpts.baseURL = options.baseURL;
