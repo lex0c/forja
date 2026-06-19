@@ -1,4 +1,5 @@
 import type { MemoryScope } from '../../memory/index.ts';
+import { DEFER_BELOW_TOKENS_SMALL } from '../context-budget.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 
 // memory_search — substring search across memory names and
@@ -85,6 +86,9 @@ export const memorySearchTool: Tool<MemorySearchInput, MemorySearchOutput> = {
   },
   metadata: {
     category: 'misc',
+    // Window-relative deferral (CONTEXT_TUNING §2.2): off the base surface on a
+    // small window; reachable via tool_search (the memory INDEX stays in-prompt).
+    deferBelowTokens: DEFER_BELOW_TOKENS_SMALL,
     writes: false,
     idempotent: true,
     parallel_safe: true,

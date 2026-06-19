@@ -105,10 +105,12 @@ export interface ToolMetadata {
   // `tool_search`) on small ones. Independent of the static `deferred` flag:
   // `deferred: true` means always-deferred, while `deferBelowTokens` marks a
   // base-but-dispensable tool that leans out only when the window is tight. The
-  // window-tier constants live in `src/tools/context-budget.ts`; the core
-  // surface (read/grep/glob/bash/edit/write/tool_search + orchestration minimum)
-  // never opts in. A non-positive (unknown) window disables this arm — the tool
-  // stays visible — matching the compaction gate's unknown-window convention.
+  // window-tier constants live in `src/tools/context-budget.ts`. The minimal
+  // action core (read_file/glob/bash/edit_file/write_file/tool_search + session
+  // state) never opts in; heavier discovery (grep/git/memory_read/memory_search)
+  // and subagent orchestration (task*) may, on a tight window — the exact set is
+  // an operator/eval choice, not an invariant. A non-positive (unknown) window
+  // disables this arm — the tool stays visible — matching the compaction gate.
   deferBelowTokens?: number;
   idempotent: boolean;
   // Opt-in to parallel execution within a step (spec

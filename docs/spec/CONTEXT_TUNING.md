@@ -344,8 +344,13 @@ recomputação que muda os bytes é a **troca de modelo**, que já esfria o cach
 
 `deferBelowTokens` estende o mecanismo de deferred tools (§7.6): o flag `deferred` continua
 sendo "sempre deferred"; o threshold marca tools base **dispensáveis em janela pequena** sem
-mexer no comportamento em janela grande. O núcleo (read/grep/glob/bash/edit/write/tool_search
-+ os mínimos de orquestração) nunca recebe threshold. O predicado window-aware roda nos
+mexer no comportamento em janela grande. O núcleo mínimo de ação (`read_file`/`glob`/`bash`/
+`edit_file`/`write_file`/`tool_search` + estado de sessão) nunca recebe threshold; busca/
+discovery mais pesada (`grep`, `git`, `memory_read`/`memory_search`) e orquestração de
+subagent (`task*`) **podem** ser deferidas numa janela apertada — qual conjunto exato é uma
+escolha do operador, tunável por eval, não um invariante. Deferir `grep`/`git` não tira a
+capability: `bash` fica na base em toda janela e roda `rg`/`git` direto; o `tool_search`
+re-revela a versão estruturada/endurecida quando o JSON + gating dedicado valem o schema. O predicado window-aware roda nos
 **dois** sites — a lista enviada e o catálogo/reveal-pool do `tool_search` — para os dois não
 divergirem. Caps de memória/skills e tiering de diretivas são alavancas futuras na mesma
 mecânica (não normativas aqui).

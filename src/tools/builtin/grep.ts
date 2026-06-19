@@ -1,6 +1,7 @@
 import { isAbsolute, resolve } from 'node:path';
 import { maybeWrapSandboxArgv } from '../../permissions/index.ts';
 import { scrubEnv } from '../../sanitize/env.ts';
+import { DEFER_BELOW_TOKENS_SMALL } from '../context-budget.ts';
 import {
   ERROR_CODES,
   type SummarizedOutput,
@@ -124,6 +125,11 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
   },
   metadata: {
     category: 'fs.read',
+    // Window-relative deferral (CONTEXT_TUNING §2.2): off the base surface on a
+    // small window. The capability isn't lost — `bash` (always on the wire) runs
+    // `rg`/`grep` directly; `tool_search` re-reveals this structured, policy-gated
+    // tool when its JSON output / per-match read_file gating earns the schema.
+    deferBelowTokens: DEFER_BELOW_TOKENS_SMALL,
     writes: false,
     idempotent: true,
     parallel_safe: true,

@@ -1,6 +1,7 @@
 import { resolve } from 'node:path';
 import { maybeWrapSandboxArgv } from '../../permissions/index.ts';
 import { getGitBinaryWithEnv } from '../../subagents/git-binary.ts';
+import { DEFER_BELOW_TOKENS_SMALL } from '../context-budget.ts';
 import {
   ERROR_CODES,
   type Tool,
@@ -1045,6 +1046,11 @@ export const gitTool: Tool<GitInput, GitOutput> = {
   },
   metadata: {
     category: 'fs.read',
+    // Window-relative deferral (CONTEXT_TUNING §2.2): off the base surface on a
+    // small window. The capability isn't lost — `bash` (always on the wire) runs
+    // `git` directly; `tool_search` re-reveals this hardened, no-passthrough tool
+    // when its tighter gating earns the schema.
+    deferBelowTokens: DEFER_BELOW_TOKENS_SMALL,
     writes: false,
     escapesCwd: false,
     idempotent: true,
