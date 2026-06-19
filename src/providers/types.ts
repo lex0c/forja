@@ -113,6 +113,12 @@ export interface ProviderCapabilities {
   // provider-effort axis is gated here (best-effort per the
   // "request expresses intent, per-provider follows" convention).
   supports_reasoning_effort?: boolean;
+  // The model produces reasoning to capture & replay but does NOT expose
+  // effort-level selection (it has the generic reasoning toggle only). Distinct
+  // from `supports_reasoning_effort`: the OpenRouter adapter replays these models'
+  // reasoning and toggles them via `reasoning.enabled`, never sending an effort
+  // level the model would reject. Adapters that don't model this ignore it.
+  supports_reasoning?: boolean;
   // The model accepts the `xhigh` reasoning-effort level (between `high` and
   // `max`). Narrower than `max`: on Anthropic only Opus 4.7/4.8 expose it, so a
   // request for `xhigh` is clamped down to `high` when this is false/omitted, to

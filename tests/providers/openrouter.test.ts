@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import type OpenAI from 'openai';
+import { computeCost } from '../../src/providers/cost.ts';
+import { OPENROUTER_CAPS } from '../../src/providers/openrouter/capabilities.ts';
 import { createOpenRouterProvider } from '../../src/providers/openrouter/index.ts';
 import type { RawORChunk } from '../../src/providers/openrouter/stream.ts';
 import type {
@@ -84,9 +86,24 @@ describe('createOpenRouterProvider', () => {
     expect(p.capabilities.tools).toBe('native');
   });
 
+  test('costs are per-million tokens (guards the $/1k → $/1M unit)', () => {
+    const caps = OPENROUTER_CAPS['deepseek/deepseek-v3.2'];
+    expect(caps).toBeDefined();
+    if (caps === undefined) return;
+    // 1M input tokens should cost the headline input rate ($0.2288), not 1000× less.
+    const cost = computeCost(caps, {
+      input: 1_000_000,
+      output: 0,
+      cache_read: 0,
+      cache_creation: 0,
+    });
+    expect(cost).toBeCloseTo(0.2288, 4);
+  });
+
   test('generate body: stream + max_tokens + transforms:[] + reasoning + usage:{include}, no stream_options', async () => {
     let body: Body = {};
-    const p = createOpenRouterProvider('deepseek/deepseek-v3.2', {
+    // grok-4.3 is the effort-capable model, so reasoning.effort is emitted.
+    const p = createOpenRouterProvider('x-ai/grok-4.3', {
       client: makeClient({
         chunks: textChunks,
         onBody: (b) => {
@@ -98,7 +115,7 @@ describe('createOpenRouterProvider', () => {
       p.generate(reqGen({ effort: 'high', messages: [{ role: 'user', content: 'hi' }] })),
     );
     expect(ev.map((e) => e.kind)).toEqual(['start', 'text_delta', 'usage', 'stop']);
-    expect(body.model).toBe('deepseek/deepseek-v3.2');
+    expect(body.model).toBe('x-ai/grok-4.3');
     expect(body.stream).toBe(true);
     expect(body.max_tokens).toBe(512);
     expect(body.transforms).toEqual([]);
@@ -233,9 +250,9 @@ describe('createOpenRouterProvider', () => {
     expect((body.messages as Body[])[0]).toEqual({ role: 'system', content: 'sys' });
   });
 
-  test('thinking_budget 0 disables reasoning via effort:none', async () => {
+  test('grok (effort-capable): thinking_budget 0 disables reasoning via effort:none', async () => {
     let body: Body = {};
-    const p = createOpenRouterProvider('deepseek/deepseek-v3.2', {
+    const p = createOpenRouterProvider('x-ai/grok-4.3', {
       client: makeClient({
         chunks: textChunks,
         onBody: (b) => {
@@ -247,6 +264,25 @@ describe('createOpenRouterProvider', () => {
       p.generate(reqGen({ thinking_budget: 0, messages: [{ role: 'user', content: 'x' }] })),
     );
     expect(body.reasoning).toEqual({ effort: 'none' });
+  });
+
+  test('reasoning model without effort levels (deepseek-v3.2) toggles via reasoning.enabled', async () => {
+    const run = async (over: Partial<GenerateRequest>): Promise<Body> => {
+      let body: Body = {};
+      const p = createOpenRouterProvider('deepseek/deepseek-v3.2', {
+        client: makeClient({
+          chunks: textChunks,
+          onBody: (b) => {
+            body = b;
+          },
+        }),
+      });
+      await collect(p.generate(reqGen({ messages: [{ role: 'user', content: 'x' }], ...over })));
+      return body;
+    };
+    // CLI default effort=high must NOT send an effort this model rejects.
+    expect((await run({ effort: 'high' })).reasoning).toEqual({ enabled: true });
+    expect((await run({ thinking_budget: 0 })).reasoning).toEqual({ enabled: false });
   });
 
   test('reasoning_details replay: round-trips the captured block onto the assistant message', async () => {

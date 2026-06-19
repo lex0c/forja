@@ -183,14 +183,29 @@ export const buildReasoningParam = (
   req: GenerateRequest,
   caps: ProviderCapabilities,
 ): ORReasoningParam | undefined => {
-  if (caps.supports_reasoning_effort !== true) return undefined;
-  if (req.thinking_budget !== undefined) {
-    // `effort:'none'` is OpenRouter's documented disable (a mandatory-reasoning
-    // model rejects it — that is the operator forcing off a model that can't be).
-    return req.thinking_budget > 0 ? { max_tokens: req.thinking_budget } : { effort: 'none' };
+  // Effort-capable models (e.g. Grok, with `reasoning.supported_efforts`): send
+  // the mapped effort or an explicit token budget.
+  if (caps.supports_reasoning_effort === true) {
+    if (req.thinking_budget !== undefined) {
+      // `effort:'none'` is OpenRouter's documented disable.
+      return req.thinking_budget > 0 ? { max_tokens: req.thinking_budget } : { effort: 'none' };
+    }
+    if (req.effort !== undefined) {
+      return { effort: OPENAI_REASONING_EFFORT[req.effort] };
+    }
+    return undefined;
   }
-  if (req.effort !== undefined) {
-    return { effort: OPENAI_REASONING_EFFORT[req.effort] };
+  // Reasoning models WITHOUT effort levels (DeepSeek / GLM / Kimi): toggle via
+  // `reasoning.enabled` — never send an effort level the model would reject or
+  // silently ignore. `thinking_budget` is the explicit on/off override.
+  if (caps.supports_reasoning === true) {
+    if (req.thinking_budget !== undefined) {
+      return req.thinking_budget > 0 ? { enabled: true } : { enabled: false };
+    }
+    if (req.effort !== undefined) {
+      return { enabled: true };
+    }
+    return undefined;
   }
   return undefined;
 };

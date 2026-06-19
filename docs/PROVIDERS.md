@@ -405,9 +405,13 @@ its own request builder, normalizer, and curated static catalog. Models are
 (no anthropic/openai/google duplicates — use those families directly). Operators
 add any other OpenRouter model via a catalog entry (§2.1).
 
-- **Reasoning** — the unified `reasoning` object: `effort` (the shared agnostic
-  ladder, `max`→`xhigh`) or `thinking_budget`→`reasoning.max_tokens`;
-  `thinking_budget: 0` disables via the documented `effort:'none'`. Reasoning
+- **Reasoning** — the unified `reasoning` object. Only models whose
+  `/api/v1/models` exposes `supported_efforts` (here: Grok, `supports_reasoning_effort`)
+  get `reasoning.effort` (the shared agnostic ladder, `max`→`xhigh`) /
+  `thinking_budget`→`reasoning.max_tokens`, with `effort:'none'` to disable.
+  Thinking models that expose only the generic reasoning toggle (DeepSeek / GLM /
+  Kimi, `supports_reasoning`) are driven via `reasoning.enabled` — never an effort
+  level they would reject. Reasoning
   replay round-trips `reasoning_details` — or, for models that stream only
   plaintext (`delta.reasoning` / the `reasoning_content` alias) with no structured
   details, the accumulated plaintext via the assistant `reasoning` field — across

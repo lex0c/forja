@@ -72,11 +72,13 @@ export const createOpenRouterProvider = (
     client = new OpenAI(sdkOpts);
   }
 
-  // Reasoning replay round-trips the model's reasoning_details on tool follow-ups
-  // (OpenRouter's documented continuity mechanism). Gated on the model's reasoning
-  // surface; FORJA_OPENROUTER_REASONING_REPLAY=0 opts out.
+  // Reasoning replay round-trips the model's reasoning on tool follow-ups
+  // (OpenRouter's documented continuity mechanism). Gated on the model reasoning
+  // at all — either with effort levels (Grok) or via the generic toggle (DeepSeek
+  // R1 / Kimi / GLM); NOT on effort support, so mandatory reasoners still replay.
+  // FORJA_OPENROUTER_REASONING_REPLAY=0 opts out.
   const reasoningReplay =
-    caps.supports_reasoning_effort === true &&
+    (caps.supports_reasoning_effort === true || caps.supports_reasoning === true) &&
     boolFromEnv('FORJA_OPENROUTER_REASONING_REPLAY', true);
   // Reasoning models often reject sampling params; OpenRouter silently drops
   // unsupported params anyway, but we still honor an explicit opt-out.
