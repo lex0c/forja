@@ -16,7 +16,13 @@ import {
   type OllamaHttpOptions,
   createOllamaHttp,
 } from './http.ts';
-import { effortToThink, ollamaOptions, toOllamaMessages, toOllamaTools } from './messages.ts';
+import {
+  DEFAULT_OLLAMA_NUM_CTX,
+  effortToThink,
+  ollamaOptions,
+  toOllamaMessages,
+  toOllamaTools,
+} from './messages.ts';
 import { normalizeOllamaStream } from './stream.ts';
 
 // FORJA_OLLAMA_NUM_CTX override (positive integer). Lets an operator raise the
@@ -118,11 +124,27 @@ export const createOllamaProvider = (
   const numCtx = options.numCtx ?? numCtxFromEnv();
   const keepAlive = options.keepAlive ?? keepAliveFromEnv();
 
+  // The window Ollama will ACTUALLY serve this turn: the override, or the model
+  // capacity capped at DEFAULT_OLLAMA_NUM_CTX. Ollama sizes its KV cache to
+  // num_ctx and truncates the prompt SILENTLY above it (dropping the oldest
+  // tokens — including the system prompt), so the harness must budget against
+  // this served window, not the raw catalog capacity. We therefore re-expose it
+  // AS `capabilities.context_window`: compaction, the subagent composer, and the
+  // window-relative allocator all read that field, and reporting the uncapped
+  // 128K/256K capacity there would let them pack a prompt the daemon then
+  // truncates. Floored at nothing and capped at the model capacity so an
+  // over-large override can't claim a window past what the model was trained for.
+  const servedNumCtx = numCtx ?? Math.min(caps.context_window, DEFAULT_OLLAMA_NUM_CTX);
+  const effectiveWindow = Math.min(servedNumCtx, caps.context_window);
+  const effectiveCaps: ProviderCapabilities =
+    effectiveWindow === caps.context_window ? caps : { ...caps, context_window: effectiveWindow };
+
   // Reasoning replay: thinking-capable models round-trip the model's `thinking`
   // on tool follow-ups (Ollama's tool-calling guidance). Default on, gated on the
   // model's reasoning surface; FORJA_OLLAMA_REASONING_REPLAY=0 opts out.
   const reasoningReplay =
-    caps.supports_reasoning_effort === true && boolFromEnv('FORJA_OLLAMA_REASONING_REPLAY', true);
+    effectiveCaps.supports_reasoning_effort === true &&
+    boolFromEnv('FORJA_OLLAMA_REASONING_REPLAY', true);
 
   // Shared request builder for both paths. `format` is added only by the
   // constrained path; the streaming path leaves it unset.
@@ -130,13 +152,13 @@ export const createOllamaProvider = (
     const body: OllamaChatRequest = {
       model: modelName,
       messages: toOllamaMessages(req, reasoningReplay),
-      options: ollamaOptions(req, caps, numCtx),
+      options: ollamaOptions(req, effectiveCaps, servedNumCtx),
     };
     const tools = toOllamaTools(req.tools);
     if (tools !== undefined) {
       body.tools = tools;
     }
-    const think = effortToThink(req, caps);
+    const think = effortToThink(req, effectiveCaps);
     if (think !== undefined) {
       body.think = think;
     }
@@ -196,7 +218,7 @@ export const createOllamaProvider = (
   return {
     id: `ollama/${modelName}`,
     family: 'ollama',
-    capabilities: caps,
+    capabilities: effectiveCaps,
     // Reasoning replay round-trips the model's `thinking` on tool follow-ups for
     // thinking-capable models (gated above). Off ⇒ toOllamaMessages drops
     // reasoning blocks and the estimator skips them.
