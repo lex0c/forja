@@ -27,8 +27,8 @@ const BYTES_PER_TOKEN = 4;
 // Fraction of the context window (in tokens) the eagerly-embedded project guide
 // (`[project_context]`) may occupy. Tunable knob — the ship gate is eval, not a
 // fixed %. At 0.10 a 200K window's cap is dominated by the absolute ceiling (no
-// behavior change for frontier models); a 32K window clips the guide to ~10%
-// (~3.2 KB).
+// behavior change for frontier models); a 32K window clips the guide to ~10% of
+// the window (~3.2K tokens ≈ 12.8 KB, since 1 token ≈ 4 bytes).
 export const GUIDE_WINDOW_FRACTION = 0.1;
 
 // Window threshold (tokens) below which deferrable-but-non-core tools leave the

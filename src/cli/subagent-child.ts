@@ -75,6 +75,7 @@ import {
   createChildPermissionBridge,
 } from '../subagents/permission-bridge.ts';
 import { createRecordingTelemetrySink } from '../telemetry/index.ts';
+import { isSmallWindow, memoryMaxEntries } from '../tools/context-budget.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
 import { composeWithOutputSchemaBlock } from './output-schema-block.ts';
@@ -1059,6 +1060,15 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // declared filter value. Absent filter ⇒ existing
       // (unfiltered, post-trust, post-trigger) behavior.
       const memoryFilter = audit.contextRecipe?.memoryFilter;
+      // Window-relative allocator (CONTEXT_TUNING §2.2) also applies to the
+      // subagent composer: a child pinned to a small local model gets the same
+      // condensed header + index cap the parent would lean at that window.
+      // Keyed on the CHILD's resolved provider window (subagents are headless,
+      // single-epoch, fixed-model — a boot-window decision, like run.ts). The
+      // directive prefix + project guide don't exist in the subagent prompt, so
+      // memory is the only applicable lever here.
+      const childWindow = provider.capabilities.context_window;
+      const memCap = memoryMaxEntries(childWindow);
       const memorySection = assembleMemorySection({
         registry: memoryRegistry,
         bootContext,
@@ -1070,6 +1080,8 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
         // serializing a list). We rehydrate back to the array
         // shape `assembleMemorySection` expects.
         ...(opts.sharedScopeOffline === true ? { excludeScopes: ['project_shared'] as const } : {}),
+        ...(memCap !== undefined ? { maxEntries: memCap } : {}),
+        leanHeader: isSmallWindow(childWindow),
       });
       resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, memorySection.text) ?? '';
       eagerExposures = memorySection.eagerLoaded;

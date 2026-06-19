@@ -21,8 +21,10 @@ import {
 // — the same pull-at-startTurn pattern `buildToolDefs` uses for the tool list.
 //
 // Within a model epoch the window is constant ⇒ the output is byte-stable ⇒ the
-// cache prefix holds. At the boot window, `shapeSystemPrompt` reproduces the
-// legacy inline bootstrap composition byte-for-byte.
+// cache prefix holds. At a LARGE boot window (full directive tier, guide at the
+// absolute cap), `shapeSystemPrompt` reproduces the legacy inline bootstrap
+// composition byte-for-byte; a small boot window intentionally diverges (lean
+// directive tier + tighter guide clip).
 export interface SystemInputs {
   // The composeWith* chain output (identity/env/constraints/…/caller prompt) —
   // everything BEFORE the project guide. The FULL directive tier.

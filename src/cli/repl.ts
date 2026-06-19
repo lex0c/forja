@@ -1917,6 +1917,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   const shapedSystemFields = (): Partial<HarnessConfig> => {
     if (systemInputs === undefined) return {};
     const shaped = shapeSystemPrompt(systemInputs, baseConfig.provider.capabilities.context_window);
+    // All-or-nothing. shape returns system === undefined only with empty
+    // SystemInputs (never in production — identity is always the outermost
+    // layer). Don't override then: emitting only systemSegments while
+    // systemPrompt/hash keep baseConfig's frozen values would desync the three
+    // fields (flattenSystemSegments(segments) !== system).
+    if (shaped.system === undefined) return {};
     if (shaped.systemPromptHash !== undefined && shaped.systemPromptHash !== lastShapedHash) {
       recordPromptVersion(db, {
         hash: shaped.systemPromptHash,
