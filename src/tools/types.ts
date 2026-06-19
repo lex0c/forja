@@ -99,6 +99,19 @@ export interface ToolMetadata {
   // Defaults to false (visible). The reveal is sticky for the session; the
   // loop rebuilds `tools = base + revealed`.
   deferred?: boolean;
+  // Window-relative deferral (CONTEXT_TUNING §2.2). When set, the tool leaves
+  // the base surface whenever the active `context_window` is BELOW this token
+  // threshold — i.e. it is base on large windows but deferred (reachable via
+  // `tool_search`) on small ones. Independent of the static `deferred` flag:
+  // `deferred: true` means always-deferred, while `deferBelowTokens` marks a
+  // base-but-dispensable tool that leans out only when the window is tight. The
+  // window-tier constants live in `src/tools/context-budget.ts`. The minimal
+  // action core (read_file/glob/bash/edit_file/write_file/tool_search + session
+  // state) never opts in; heavier discovery (grep/git/memory_read/memory_search)
+  // and subagent orchestration (task*) may, on a tight window — the exact set is
+  // an operator/eval choice, not an invariant. A non-positive (unknown) window
+  // disables this arm — the tool stays visible — matching the compaction gate.
+  deferBelowTokens?: number;
   idempotent: boolean;
   // Opt-in to parallel execution within a step (spec
   // ORCHESTRATION.md §1.3). When EVERY tool_use the model emits in

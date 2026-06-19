@@ -18,7 +18,7 @@
 // section lands after `# Environment` and before `# Constraints`
 // — it is NOT the outermost layer (identity and environment
 // precede it). The authoritative top-down layer order lives in
-// `docs/SYSTEM_PROMPT.md §2.1`; consult it rather than a per-file
+// `docs/CONTEXT.md §5.1`; consult it rather than a per-file
 // recap, which is what drifted stale here.
 //
 // Token cost: ~200 tokens. Earns its place ONLY because every

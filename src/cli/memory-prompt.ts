@@ -123,6 +123,25 @@ Entries tagged \`[seed]\` are vendor-curated default disciplines (how to work, n
 
 Before acting on a FACTUAL memory (file paths, exported names, schema shape), verify it against the current code with grep / read_file. If reality has drifted from the memory, update or discard the memory rather than acting on stale info. PREFERENCE memories (commit style, naming conventions) have no "current state" to verify against — proceed without re-checking.`;
 
+// Condensed header for tight windows (CONTEXT_TUNING §2.2). On a small window the
+// whole memory toolset (memory_read/search/write/list) is off the base surface,
+// so the full header's save-taxonomy + verify guidance is teaching tools that
+// aren't on the wire — ~510 tokens the window can't spare. Keep only the index
+// pointer; the discipline returns with the full header on a larger window.
+//
+// The tool guidance is CONDITIONAL ("if … isn't in your toolset, reveal via
+// tool_search"), NOT an assertion that the tools are off the surface. This
+// header is boot-pinned (the `memory` segment is), but the tool list is
+// per-turn: after a `/model` swap to a larger window, buildToolDefs re-adds
+// memory_read/memory_search to the wire while this header stays put. A hard
+// "they're off the surface — use tool_search" claim would then misdirect the
+// model into tool_search, which filters the now-undeferred tools out of its
+// catalog → a dead-end notFound instead of just calling the visible tool. The
+// conditional phrasing stays correct whether or not the tools are on the wire.
+const MEMORY_SECTION_HEADER_LEAN = `# Memory
+
+Cross-session memory index below (\`[scope] name — hook\`). Load a body with memory_read, search with memory_search — if a memory tool isn't already in your toolset, reveal it with tool_search first.`;
+
 export interface AssembleMemorySectionInput {
   registry: MemoryRegistry;
   // Boot-time trigger context (spec §4.3). When omitted, the
@@ -164,6 +183,22 @@ export interface AssembleMemorySectionInput {
   // the previously-loaded shared memories in the model's context.
   // Empty / absent = no exclusion (current behavior).
   excludeScopes?: ReadonlyArray<MemoryScope>;
+  // Window-relative cap on rendered index entries (CONTEXT_TUNING §2.2,
+  // `memoryMaxEntries`). Applied AFTER trust/state/trigger/playbook filtering
+  // and dedupe, keeping the highest-precedence entries. Caps the rendered
+  // lines AND the `eagerLoaded` inventory together (consistency by
+  // construction). The drop is NOT silent — a visible marker tells the model
+  // how many were trimmed and how to reach them. Undefined / non-positive =
+  // no cap. Bootstrap passes `memoryMaxEntries(bootWindow)`; the cap is
+  // boot-pinned (eager-exposure provenance is a boot concept), not re-applied
+  // per turn.
+  maxEntries?: number;
+  // Condense the section header for a tight window (CONTEXT_TUNING §2.2). When
+  // true, the verbose save-taxonomy / verify guidance is replaced by a short
+  // index pointer — justified because the memory tools are off the base surface
+  // on a small window anyway. Index lines + cap marker are unaffected. Boot-time
+  // decision (same window the cap keys off). Default false = full header.
+  leanHeader?: boolean;
 }
 
 export interface AssembleMemorySectionResult {
@@ -206,6 +241,7 @@ export const assembleMemorySection = (
   // which is the most-specific TRUSTED scope. That matches the
   // user's intent: "promote the trusted shadow to active when the
   // more-specific scope is marked untrusted".
+  const header = input.leanHeader === true ? MEMORY_SECTION_HEADER_LEAN : MEMORY_SECTION_HEADER;
   const all = input.registry.list();
   if (all.length === 0) {
     // Header-only render. The save-criteria + 4-type semantics +
@@ -219,7 +255,7 @@ export const assembleMemorySection = (
     // inverted the need (more memories = more orientation; zero
     // memories = no orientation). +~250 prompt tokens accepted as
     // the cost of consistent save guidance across all sessions.
-    return { text: MEMORY_SECTION_HEADER, entryCount: 0, eagerLoaded: [] };
+    return { text: header, entryCount: 0, eagerLoaded: [] };
   }
   // Scope-level fail-closed exclusion (S5 P0/H2-rob). Applied BEFORE
   // the per-memory peek so an unreadable scope doesn't cost N extra
@@ -293,7 +329,7 @@ export const assembleMemorySection = (
     // so save guidance is present — same rationale as the
     // registry-empty branch above. The eagerLoaded inventory
     // stays empty because no entries actually shipped.
-    return { text: MEMORY_SECTION_HEADER, entryCount: 0, eagerLoaded: [] };
+    return { text: header, entryCount: 0, eagerLoaded: [] };
   }
   // Dedupe by name on the eligible list. precedence order is
   // preserved (most-specific surviving scope wins).
@@ -308,12 +344,24 @@ export const assembleMemorySection = (
   // The flag without motivo+date still delivers the load-bearing
   // signal: "model, this memory is under review; be cautious".
   const seen = new Set<string>();
-  const lines: string[] = [MEMORY_SECTION_HEADER, ''];
+  const deduped: typeof eligible = [];
+  for (const e of eligible) {
+    if (seen.has(e.listing.name)) continue;
+    seen.add(e.listing.name);
+    deduped.push(e);
+  }
+  // Window-relative cap (CONTEXT_TUNING §2.2). Keep the highest-precedence
+  // entries (the deduped list is already in precedence order — most-specific
+  // surviving scope first), trim the tail. Applied here so the rendered lines
+  // and the eagerLoaded inventory stay consistent by construction. The cap is
+  // a small-window guardrail; a non-positive / undefined cap means no trim.
+  const cap =
+    input.maxEntries !== undefined && input.maxEntries > 0 ? input.maxEntries : deduped.length;
+  const rendered = deduped.slice(0, cap);
+  const dropped = deduped.length - rendered.length;
+  const lines: string[] = [header, ''];
   const eagerLoaded: EagerExposure[] = [];
-  let included = 0;
-  for (const { listing, file } of eligible) {
-    if (seen.has(listing.name)) continue;
-    seen.add(listing.name);
+  for (const { listing, file } of rendered) {
     const state = file?.frontmatter.state;
     const stateFlag = state === 'quarantined' ? ' [memory: quarantined]' : '';
     // Spec §5.7.3: "UI mostrar `[seed]` discreto na lista —
@@ -326,10 +374,17 @@ export const assembleMemorySection = (
     lines.push(
       `- [${listing.scope}] ${listing.name}${seedFlag}${stateFlag} — ${listing.entry.hook}`,
     );
-    included++;
     eagerLoaded.push(toEagerExposure(listing.scope, listing.name, file));
   }
-  return { text: lines.join('\n'), entryCount: included, eagerLoaded };
+  // No silent caps (principle: log what was dropped). The model sees the
+  // elision and how to reach the trimmed memories, mirroring the project
+  // guide's truncation marker.
+  if (dropped > 0) {
+    lines.push(
+      `- … and ${dropped} more ${dropped === 1 ? 'memory' : 'memories'} trimmed to fit the context window — use memory_list / memory_search to reach them.`,
+    );
+  }
+  return { text: lines.join('\n'), entryCount: rendered.length, eagerLoaded };
 };
 
 // Snapshot one eager-loaded entry. `file === null` happens for the

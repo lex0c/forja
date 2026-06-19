@@ -291,6 +291,95 @@ Section emite o **conteúdo** do guia de instruções do projeto (`AGENTS.md`, `
 
 Total estável (cache hit): ~5-10k tokens. Variável: ~5-30k tokens.
 
+### 2.2 Alocador window-relativo do prefixo fixo (pull-no-turno)
+
+As caps das sections acima são **constantes absolutas** (`PROJECT_GUIDE_MAX_BYTES` = 16 KB,
+conjunto fixo de deferred tools). O prefixo fixo (`[system]` + `[tool_schemas]`) é montado e
+enviado **na íntegra independente da `context_window` do modelo**. Num modelo de janela
+pequena (ex.: local 32 K) o prefixo come uma fração desproporcional da janela antes de
+qualquer mensagem; a única window-awareness existente (§4.x / `ORCHESTRATION §4.1`) dispara
+compaction do **histórico**, nunca enxuga o prefixo. Esta seção especifica o alocador que
+torna o prefixo fixo relativo à janela.
+
+**Princípio — derive do estado vivo no limite do turno, não reaja a evento.** O prefixo fixo
+é uma **derivação pura** de `(inputs estáveis, context_window)`, recomputada no início de
+cada turno a partir do `provider.capabilities.context_window` vivo. É o padrão já em uso para
+o budget e o modelo exibido: comandos de mutação (`/model`, `/budget`) editam `baseConfig` em
+runtime e os consumidores leem `baseConfig.provider` no `startTurn` (não no boot), mantendo o
+que é exibido alinhado com o que o harness executa. **Não** se introduz um event-bus com
+listeners internos que assinam uma troca de modelo: pub/sub paga quando há N reatores
+assíncronos desacoplados, mas aqui há **um único ponto de reação** (a fronteira do turno), e
+um fan-out de listeners mutando `baseConfig` reintroduz ordering, janela de update parcial,
+staleness-por-subscription-esquecida e custo de replay/audit que o pull elimina por
+construção (princípio 7; `ANTI_PATTERNS` — não adicionar máquina para problema já resolvido
+por derivação de estado).
+
+**Invariante de cache — estabilidade por época-de-modelo.** O orçamento é função **apenas** de
+`context_window` (constante dentro de uma sessão até um `/model`), nunca da posição na
+conversa. Dentro de uma época-de-modelo, `shape(inputs, window)` devolve bytes **idênticos**
+turno a turno ⇒ o prefixo cacheado (breakpoints #1–#3, §3) permanece estável. A única
+recomputação que muda os bytes é a **troca de modelo**, que já esfria o cache da Anthropic
+(cache é per-model) e/ou troca de provider — portanto recomputar o prefixo no switch é
+**grátis** (zero penalidade adicional). É proibido derivar o orçamento de algo que varie
+*dentro* de uma época (ex.: tamanho do histórico) — isso thrashearia o cache, custando mais.
+
+**Mecanismo — split aquisição/shaping.** A montagem do prefixo separa-se em duas fases:
+
+1. **Aquisição (caro, bootstrap-once):** ler/trust-probe/sanitizar o guia de projeto, carregar
+   o índice de memória e o catálogo de skills — o trabalho com efeito colateral e I/O. Produz
+   `systemInputs` imutável.
+2. **Shaping (puro, por turno):** `shapeSystemPrompt(systemInputs, window)` clipa o guia a
+   `guideMaxBytes(window)`, compõe as strings, emite `systemSegments` e o `systemPromptHash`.
+   Espelha exatamente como `buildToolDefs(config)` já faz o shaping da lista de tools por turno
+   (registry adquirido 1×; superfície derivada a cada turno). Injetado no mesmo ponto que o
+   `cfg` per-turn é montado, e replicado no caminho headless (dois consumidores espelham o
+   fluxo — manter ambos).
+
+**Alavancas window-relativas** (fonte única num módulo de política, `context-budget`):
+
+| Alavanca | Regra | Section afetada | Quando decide |
+|---|---|---|---|
+| Deferral adaptativa | tool sai da base quando `window < deferBelowTokens` (além do flag `deferred` estático) | `[tool_schemas]` | por turno |
+| Guide fracional | `guideMaxBytes(window) = min(PROJECT_GUIDE_MAX_BYTES, β × window)` | `[project_context]` | por turno (re-clipa no /model) |
+| Tiering de diretivas | `isSmallWindow(window)` → prefixo lean (drop dos hints `parallel` + `tool-ergonomics`; mantém constraints/format) | `[system]` (segmento `stable`) | por turno (two-variant no shape) |
+| Header de memória condensado | `isSmallWindow(window)` → header curto (sem taxonomia de save) | `[memory_index]` | boot-pinned (provenance) |
+| Drop do catálogo de skills | `isSmallWindow(window)` → seção vazia | `[memory_index]` | boot-pinned |
+| Cap do índice de memória | `memoryMaxEntries(window)` (guardrail `<64K`) | `[memory_index]` | boot-pinned |
+
+`deferBelowTokens` estende o mecanismo de deferred tools (§7.6): o flag `deferred` continua
+sendo "sempre deferred"; o threshold marca tools base **dispensáveis em janela pequena** sem
+mexer no comportamento em janela grande. O núcleo mínimo de ação (`read_file`/`glob`/`bash`/
+`edit_file`/`write_file`/`tool_search` + estado de sessão) nunca recebe threshold. `grep` e
+`git` ficam **sempre** deferidas (flag `deferred` estático, §7.6, em TODA janela): o `bash`
+cobre a capability sempre (`rg`/`git` direto), então a versão estruturada/endurecida só vale
+sob demanda via `tool_search`. Busca de memória (`memory_read`/`memory_search`) e orquestração
+de subagent (`task*`, `git_apply_patch`) são **window-tier** (`deferBelowTokens`) — deferidas
+só numa janela apertada. Qual tool fica em qual camada é escolha do operador, tunável por eval,
+não um invariante. Deferir `grep`/`git` não tira a
+capability: `bash` fica na base em toda janela e roda `rg`/`git` direto; o `tool_search`
+re-revela a versão estruturada/endurecida quando o JSON + gating dedicado valem o schema. O predicado window-aware roda nos
+**dois** sites — a lista enviada e o catálogo/reveal-pool do `tool_search` — para os dois não
+divergirem.
+
+**Divisão por segmento de cache.** O segmento `stable` (diretivas + guide) é shapeado por
+turno → tiering de diretivas e clip do guide reagem ao `/model` mid-session. O segmento
+`memory` (índice + skills) é **boot-pinned**: o header condensado, o drop de skills e o cap
+do índice decidem no boot porque a provenance de eager-exposure é um conceito de boot
+(`MEMORY.md §11.2`) — não se re-decide por turno. O header condensado se justifica porque,
+numa janela apertada, todas as tools de memória já estão fora da base, então a taxonomia de
+save estaria ensinando ferramenta ausente da wire. `constraints` (safety) nunca é cortado.
+
+**`model_changed` — canal só-de-efeito-colateral.** Onde efeitos colaterais genuínos precisam
+disparar na troca (re-emitir a linha de janela do banner, gravar `prompt_versions` quando o
+hash muda), reusa-se **um** evento `model_changed` no stream `onEvent` já existente. Isso
+**não** é onde tools/prompt reagem (essas derivam por pull); não se cria registro de
+subscribers internos.
+
+**Gate de eval** (princípio 4): o alocador não sobe sem eval provando que um modelo de janela
+pequena ainda completa a tarefa com a deferral agressiva e o guia clipado — incluindo o edge
+em que uma tool que era base some na troca para modelo menor e o modelo a re-adquire via
+`tool_search`.
+
 ---
 
 ## 3. Cache breakpoints strategy detalhada

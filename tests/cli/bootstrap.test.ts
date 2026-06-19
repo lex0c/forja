@@ -25,7 +25,10 @@ const mockProvider: Provider = {
     vision: false,
     streaming: true,
     constrained: 'tools',
-    context_window: 1000,
+    // A normal large window so the composition tests see the FULL prefix.
+    // Window-relative leaning is exercised separately with a small-window
+    // override (CONTEXT_TUNING §2.2).
+    context_window: 200_000,
     output_max_tokens: 100,
     cost_per_1k_input: 0,
     cost_per_1k_output: 0,
@@ -266,6 +269,35 @@ describe('bootstrap', () => {
     // Output-density default is wired into the stable segment.
     expect(config.systemPrompt).toContain('# Output');
     expect(config.systemPrompt).toContain('signal per token');
+    db.close();
+  });
+
+  test('a tight context window leans the prefix (drops parallelism, condenses memory)', async () => {
+    // CONTEXT_TUNING §2.2: below the small-window tier the prefix sheds the
+    // parallelism + tool-ergonomics hints and condenses the memory header,
+    // while keeping the safety constraints and format rules.
+    const smallProvider: Provider = {
+      ...mockProvider,
+      capabilities: { ...mockProvider.capabilities, context_window: 32_000 },
+    };
+    const { config, db } = await bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: smallProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+    });
+    expect(config.systemPrompt).toBeDefined();
+    // Directive tier leaned out.
+    expect(config.systemPrompt).not.toContain('# Parallelism');
+    expect(config.systemPrompt).not.toContain('emit MULTIPLE tool calls in a SINGLE turn');
+    // Memory header condensed: verbose save-taxonomy gone, index pointer kept.
+    expect(config.systemPrompt).not.toContain('Four types of memory exist');
+    expect(config.systemPrompt).toContain('Cross-session memory index below');
+    // Safety constraints + format rules stay on every window.
+    expect(config.systemPrompt).toContain('# Constraints');
+    expect(config.systemPrompt).toContain('# Response surface');
     db.close();
   });
 
@@ -590,8 +622,8 @@ Body.`,
     // between `# Parallelism` and `# Memory` (or after `# Memory`,
     // in the case of `# Skills`) and the partial assertion is
     // satisfied as long as the parallel→memory anchor holds.
-    // Mirrors the impl chain documented in `docs/SYSTEM_PROMPT.md
-    // §2.1` so a future contributor running this test catches the
+    // Mirrors the impl chain documented in `docs/CONTEXT.md
+    // §5.1` so a future contributor running this test catches the
     // doc/impl drift at the same time.
     const trustPath = join(workdir, 'trusted_dirs.json');
     writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));

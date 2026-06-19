@@ -1,4 +1,5 @@
 import type { WorktreeOutcome } from '../../subagents/types.ts';
+import { DEFER_BELOW_TOKENS_SMALL } from '../context-budget.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 import { childOutputHeadTail, summarizeChildEnvelope } from './task-shared.ts';
 
@@ -60,6 +61,9 @@ export const taskAwaitTool: Tool<TaskAwaitInput, TaskAwaitOutput> = {
   },
   metadata: {
     category: 'misc',
+    // Window-relative deferral (CONTEXT_TUNING §2.2): off the base surface on a
+    // small window; reachable via tool_search.
+    deferBelowTokens: DEFER_BELOW_TOKENS_SMALL,
     writes: false,
     // Repeat awaits on a settled handle return the cached
     // envelope deterministically — `task_await` itself is

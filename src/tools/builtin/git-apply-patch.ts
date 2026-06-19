@@ -3,6 +3,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:pat
 import { getWorktreeRoot, isGitRepo } from '../../checkpoints/git.ts';
 import { lineDiff } from '../../diff/line-diff.ts';
 import { getGitBinaryWithEnv } from '../../subagents/git-binary.ts';
+import { DEFER_BELOW_TOKENS_SMALL } from '../context-budget.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 import { pathArgOf } from './_path-arg.ts';
 
@@ -304,6 +305,10 @@ export const gitApplyPatchTool: Tool<GitApplyPatchInput, GitApplyPatchOutput> = 
   },
   metadata: {
     category: 'fs.write',
+    // Window-relative deferral (CONTEXT_TUNING §2.2): advanced multi-hunk patch is
+    // off the base surface on a small window (edit_file/write_file cover the common
+    // path there); reachable via tool_search.
+    deferBelowTokens: DEFER_BELOW_TOKENS_SMALL,
     writes: true,
     idempotent: false,
     display: 'diff',

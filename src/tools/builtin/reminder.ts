@@ -1,4 +1,5 @@
 import { parseDuration } from '../../reminders/index.ts';
+import { DEFER_BELOW_TOKENS_SMALL } from '../context-budget.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 
 export interface ReminderInput {
@@ -34,6 +35,9 @@ export const reminderTool: Tool<ReminderInput, ReminderOutput> = {
     // policy gate (which requires one) would default-deny. Scheduling a
     // session-local timer opens no fs/exec surface.
     category: 'misc',
+    // Window-relative deferral (CONTEXT_TUNING §2.2): scheduling is off the base
+    // surface on a small window; reachable via tool_search.
+    deferBelowTokens: DEFER_BELOW_TOKENS_SMALL,
     writes: false,
     // Arms a session-scoped timer that can wake a turn — a side effect,
     // hence flagged (parallels requiresBgManager).

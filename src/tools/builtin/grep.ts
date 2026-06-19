@@ -124,6 +124,11 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
   },
   metadata: {
     category: 'fs.read',
+    // Deferred at EVERY window (AGENTIC_CLI §7.6 / CONTEXT_TUNING §2.2): off the
+    // base surface entirely. No capability loss — `bash` (always on the wire) runs
+    // `rg`/`grep` directly; `tool_search` re-reveals this structured, policy-gated
+    // tool when its JSON output / per-match read_file gating earns the schema.
+    deferred: true,
     writes: false,
     idempotent: true,
     parallel_safe: true,

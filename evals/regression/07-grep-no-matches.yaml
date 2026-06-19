@@ -1,13 +1,15 @@
-name: grep handles zero matches gracefully
+name: search handles zero matches gracefully
 prompt: |
-  Use the grep tool to search the working directory for the literal string
-  `XYZZY_NEVER_OCCURS`. The string is not present in any file. Report that
+  Search the working directory (with `grep` or `rg` via bash) for the literal
+  string `XYZZY_NEVER_OCCURS`. The string is not present in any file. Report that
   no matches were found in plain English. Do NOT create files, do NOT
   retry with a different pattern.
 setup:
   fixture: ../fixtures/code-with-todos
 expect:
-  - tool_called: grep
+  # `grep`/`git` are deferred at every window (CONTEXT_TUNING §2.2); `bash` runs
+  # `rg`/`grep` directly and is the base search path.
+  - tool_called: bash
   - tool_not_called: write_file
   - tool_not_called: edit_file
   - status: done

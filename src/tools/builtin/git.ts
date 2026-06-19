@@ -1045,6 +1045,11 @@ export const gitTool: Tool<GitInput, GitOutput> = {
   },
   metadata: {
     category: 'fs.read',
+    // Deferred at EVERY window (AGENTIC_CLI §7.6 / CONTEXT_TUNING §2.2): off the
+    // base surface entirely. No capability loss — `bash` (always on the wire) runs
+    // `git` directly; `tool_search` re-reveals this hardened, no-passthrough tool
+    // when its tighter gating earns the schema.
+    deferred: true,
     writes: false,
     escapesCwd: false,
     idempotent: true,

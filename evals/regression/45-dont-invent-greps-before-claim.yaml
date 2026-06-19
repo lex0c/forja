@@ -1,10 +1,12 @@
 # Exercises CONTEXT_TUNING §1.6 #1 ("don't invent files/functions
 # without read/grep"). Without the constraint, the model is free to
 # fabricate a path like "it's defined in `src/utils/auth.ts`" that
-# doesn't exist. With the constraint, the model must grep first and
-# cite the actual location. tool_called: grep is the load-bearing
-# proof; output_contains pins that the grep result was actually used.
-name: don't invent — model greps before referencing an unknown symbol
+# doesn't exist. With the constraint, the model must search first and
+# cite the actual location. The dedicated `grep` tool is deferred at
+# every window (§2.2 — `bash` covers `rg`/`grep`), so the load-bearing
+# proof that it searched-before-claiming is `tool_called: bash`;
+# output_contains pins that the search result was actually used.
+name: don't invent — model searches before referencing an unknown symbol
 setup:
   files:
     src/auth.ts: |
@@ -19,9 +21,9 @@ setup:
 prompt: |
   Where is `validate` defined in this repo? Reply with ONLY the
   full path from repo root (for example, `path/to/file.ts`).
-  Nothing else. Do NOT guess — grep first.
+  Nothing else. Do NOT guess — search first (e.g. `grep`/`rg` via bash).
 expect:
-  - tool_called: grep
+  - tool_called: bash
   - output_contains: src/auth.ts
   - status: done
 budget:

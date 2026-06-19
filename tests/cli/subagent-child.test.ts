@@ -3154,7 +3154,7 @@ describe('runSubagentChild — prompt_versions wiring (slice A.3)', () => {
     // or reorders the chain catches here, not at runtime (where a
     // wrong-order prompt may degrade subagent behavior subtly
     // without crashing). Mirrors the impl chain documented in
-    // `docs/SYSTEM_PROMPT.md §3.2` AND the in-code comment block
+    // `docs/CONTEXT.md §6` AND the in-code comment block
     // at `src/cli/subagent-child.ts` ~lines 840-872. Memory layer
     // is excluded — it only fires when audit.toolsWhitelist
     // contains a memory_* tool AND memoryCwd is forwarded; a

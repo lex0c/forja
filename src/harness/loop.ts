@@ -58,6 +58,7 @@ import type { PermissionDecision } from '../subagents/ipc.ts';
 import { MAX_SUBAGENT_DEPTH, runSubagent } from '../subagents/runtime.ts';
 import { type TodoStore, createTodoStore } from '../todo/index.ts';
 import { rankDeferredTools } from '../tools/builtin/tool-search.ts';
+import { isDeferred } from '../tools/context-budget.ts';
 import type { ToolContext } from '../tools/index.ts';
 import type {
   SearchToolsResult,
@@ -217,15 +218,23 @@ const toolBlurb = (desc: string): string => {
 // model on a tool that never enters the surface. Single source of truth for both
 // the catalog and the searchTools reveal pool, so the two can't diverge from the
 // base filter.
-const availableDeferredTools = (config: HarnessConfig) =>
-  config.toolRegistry
+const availableDeferredTools = (config: HarnessConfig) => {
+  // Window-relative deferral (CONTEXT_TUNING §2.2): a tool is deferred either by
+  // its static `deferred` flag or because the live window is below its
+  // `deferBelowTokens` tier. Read live so a mid-session `/model` swap re-leans
+  // the catalog on the next turn (buildToolDefs re-runs per turn). Optional-chained:
+  // an absent/partial provider (test stubs, degraded config) reads as 0 = unknown
+  // window, which disables the window-relative arm (static behavior preserved).
+  const contextWindow = config.provider?.capabilities?.context_window ?? 0;
+  return config.toolRegistry
     .list()
     .filter(
       (t) =>
-        t.metadata.deferred === true &&
+        isDeferred(t.metadata, contextWindow) &&
         (config.confirmPermission !== undefined || t.metadata.requiresOperatorConfirm !== true) &&
         (config.reminderScheduler !== undefined || t.metadata.requiresReminderScheduler !== true),
     );
+};
 
 // A `requiresOperatorConfirm` tool can only run where an operator
 // surface is wired: the REPL wires the confirm hooks (confirmPermission
@@ -256,6 +265,13 @@ export const buildToolDefs = (
   // whitelist, which IS the curation, so a whitelisted-but-deferred tool must
   // stay directly visible (no tool_search round-trip in a headless child).
   const applyDeferral = (config.subagentDepth ?? 0) === 0;
+  // Window-relative deferral tier (CONTEXT_TUNING §2.2): on top of the static
+  // `deferred` flag, a base-but-dispensable tool leaves the surface when the live
+  // window is below its `deferBelowTokens`. Read live so a `/model` swap re-leans
+  // the surface next turn (buildToolDefs re-runs per turn, top-of-loop rebuild).
+  // Optional-chained: absent/partial provider → 0 = unknown window → window arm
+  // disabled (static behavior preserved for test stubs and degraded configs).
+  const contextWindow = config.provider?.capabilities?.context_window ?? 0;
   // Catalog appended to tool_search's description: the deferred tools NOT yet
   // revealed (name + one-line blurb), generated from the registry so it never
   // drifts from what's actually deferred. This is how the model learns what it
@@ -274,7 +290,10 @@ export const buildToolDefs = (
     .list()
     .filter((t) => operatorPresent || t.metadata.requiresOperatorConfirm !== true)
     .filter((t) => reminderAvailable || t.metadata.requiresReminderScheduler !== true)
-    .filter((t) => !applyDeferral || t.metadata.deferred !== true || revealed?.has(t.name) === true)
+    .filter(
+      (t) =>
+        !applyDeferral || !isDeferred(t.metadata, contextWindow) || revealed?.has(t.name) === true,
+    )
     .map((t) => ({
       name: t.name,
       description: t.name === 'tool_search' ? `${t.description}${catalog}` : t.description,
