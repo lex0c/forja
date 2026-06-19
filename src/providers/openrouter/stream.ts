@@ -19,6 +19,9 @@ export interface RawORChoiceDelta {
   content?: string | null;
   refusal?: string | null;
   reasoning?: string | null;
+  // Alias some providers stream instead of `reasoning` (OpenRouter documents
+  // `reasoning_content` as identical to `reasoning`).
+  reasoning_content?: string | null;
   // Structured reasoning, accumulated verbatim for replay.
   reasoning_details?: unknown[];
   tool_calls?: RawORToolCallDelta[];
@@ -154,11 +157,17 @@ export async function* normalizeOpenRouterStream(
 
       const delta = choice.delta;
       if (delta !== undefined) {
-        // Live reasoning for the UI.
-        const hadPlaintextReasoning =
-          typeof delta.reasoning === 'string' && delta.reasoning.length > 0;
-        if (hadPlaintextReasoning) {
-          yield { kind: 'thinking_delta', text: delta.reasoning as string };
+        // Live reasoning for the UI. OpenRouter normalizes to `reasoning`, but
+        // some providers stream the `reasoning_content` alias — accept either.
+        const plaintextReasoning =
+          typeof delta.reasoning === 'string' && delta.reasoning.length > 0
+            ? delta.reasoning
+            : typeof delta.reasoning_content === 'string' && delta.reasoning_content.length > 0
+              ? delta.reasoning_content
+              : undefined;
+        const hadPlaintextReasoning = plaintextReasoning !== undefined;
+        if (plaintextReasoning !== undefined) {
+          yield { kind: 'thinking_delta', text: plaintextReasoning };
         }
         // Structured reasoning accumulated verbatim for the replay block. When a
         // provider streams ONLY reasoning_details (no plaintext delta.reasoning),

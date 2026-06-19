@@ -74,12 +74,17 @@ export const OPENROUTER_CAPS: Record<string, ProviderCapabilities> = {
   // Explicit cache available upstream but not wired (cache: false for now).
   'qwen/qwen3-coder-plus': {
     ...OPENROUTER_BASE,
+    // Alibaba/Qwen needs explicit cache_control breakpoints (not automatic).
+    cache: 'server_5min',
     context_window: 1_000_000,
     output_max_tokens: 32_768,
     recommended_max_tools_per_step: 6,
     cost_per_1k_input: 0.00065,
     cost_per_1k_output: 0.00325,
-    notes: ['Qwen3 Coder Plus; agentic coding; 1M context'],
+    cost_per_1k_cached_input: 0.00013,
+    cost_per_1k_cache_write: 0.0008125,
+    cache_explicit_breakpoints: true,
+    notes: ['Qwen3 Coder Plus; agentic coding; 1M context; explicit prompt-cache breakpoints'],
   },
   // xAI Grok 4.3 — 1M context, reasoning, automatic prompt cache (read discount).
   'x-ai/grok-4.3': {

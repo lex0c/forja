@@ -81,11 +81,15 @@ export const createOpenRouterProvider = (
   // Reasoning models often reject sampling params; OpenRouter silently drops
   // unsupported params anyway, but we still honor an explicit opt-out.
   const acceptsSampling = caps.supports_sampling !== false;
+  // Explicit prompt-cache breakpoints (qwen-style). When set, the system prompt
+  // is sent as structured blocks with cache_control markers on the stable
+  // segments; otherwise it stays a flat string (automatic/no cache).
+  const explicitCache = caps.cache_explicit_breakpoints === true;
 
   const generate = async function* (req: GenerateRequest): AsyncIterable<StreamEvent> {
     const params: Record<string, unknown> = {
       model: modelName,
-      messages: toOpenRouterMessages(req, reasoningReplay),
+      messages: toOpenRouterMessages(req, reasoningReplay, explicitCache),
       stream: true,
       // OpenRouter accepts max_tokens on every model (unlike OpenAI's native
       // reasoning models, which require max_completion_tokens).
@@ -124,7 +128,7 @@ export const createOpenRouterProvider = (
     }
     const params: Record<string, unknown> = {
       model: modelName,
-      messages: toOpenRouterMessages(req, reasoningReplay),
+      messages: toOpenRouterMessages(req, reasoningReplay, explicitCache),
       max_tokens: req.max_tokens,
       transforms: [],
       tools: [

@@ -97,6 +97,16 @@ describe('normalizeOpenRouterStream', () => {
     });
   });
 
+  test('reasoning_content alias is surfaced as thinking_delta', async () => {
+    const ev = await collect([
+      { id: 'm1', choices: [{ delta: { reasoning_content: 'via alias' } }] },
+      { choices: [{ delta: { content: 'answer' }, finish_reason: 'stop' }] },
+    ]);
+    expect(
+      ev.filter((e) => e.kind === 'thinking_delta').map((e) => (e as { text: string }).text),
+    ).toEqual(['via alias']);
+  });
+
   test('tool call accumulates args across deltas and stops with tool_use', async () => {
     // Split across deltas: id+name arrive first, args (balanced JSON) follow.
     const ev = await collect([

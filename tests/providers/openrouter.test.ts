@@ -174,6 +174,81 @@ describe('createOpenRouterProvider', () => {
     });
   });
 
+  test('explicit-cache model (qwen) sends system as blocks with cache_control on breakpoints', async () => {
+    let body: Body = {};
+    const p = createOpenRouterProvider('qwen/qwen3-coder-plus', {
+      client: makeClient({
+        chunks: textChunks,
+        onBody: (b) => {
+          body = b;
+        },
+      }),
+    });
+    await collect(
+      p.generate(
+        reqGen({
+          system: 'stable\n\nmem',
+          systemSegments: [
+            { id: 'stable', text: 'stable', cacheBreakpoint: true },
+            { id: 'memory', text: 'mem', cacheBreakpoint: true },
+          ],
+          messages: [{ role: 'user', content: 'x' }],
+        }),
+      ),
+    );
+    const sys = (body.messages as Body[])[0];
+    expect(sys).toEqual({
+      role: 'system',
+      content: [
+        { type: 'text', text: 'stable\n\n', cache_control: { type: 'ephemeral' } },
+        { type: 'text', text: 'mem', cache_control: { type: 'ephemeral' } },
+      ],
+    });
+    // Concatenating the block texts reproduces the canonical system string
+    // (matches flattenSystemSegments and the recorded prompt hash).
+    expect((sys?.content as Array<{ text: string }>).map((b) => b.text).join('')).toBe(
+      'stable\n\nmem',
+    );
+  });
+
+  test('non-explicit-cache model keeps a flat string system (no cache_control)', async () => {
+    let body: Body = {};
+    const p = createOpenRouterProvider('deepseek/deepseek-v3.2', {
+      client: makeClient({
+        chunks: textChunks,
+        onBody: (b) => {
+          body = b;
+        },
+      }),
+    });
+    await collect(
+      p.generate(
+        reqGen({
+          system: 'sys',
+          systemSegments: [{ id: 'stable', text: 'sys', cacheBreakpoint: true }],
+          messages: [{ role: 'user', content: 'x' }],
+        }),
+      ),
+    );
+    expect((body.messages as Body[])[0]).toEqual({ role: 'system', content: 'sys' });
+  });
+
+  test('thinking_budget 0 disables reasoning via effort:none', async () => {
+    let body: Body = {};
+    const p = createOpenRouterProvider('deepseek/deepseek-v3.2', {
+      client: makeClient({
+        chunks: textChunks,
+        onBody: (b) => {
+          body = b;
+        },
+      }),
+    });
+    await collect(
+      p.generate(reqGen({ thinking_budget: 0, messages: [{ role: 'user', content: 'x' }] })),
+    );
+    expect(body.reasoning).toEqual({ effort: 'none' });
+  });
+
   test('reasoning_details replay: round-trips the captured block onto the assistant message', async () => {
     let body: Body = {};
     const p = createOpenRouterProvider('deepseek/deepseek-v3.2', {
