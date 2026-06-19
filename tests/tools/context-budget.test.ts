@@ -2,8 +2,10 @@ import { describe, expect, test } from 'bun:test';
 import {
   DEFER_BELOW_TOKENS_SMALL,
   GUIDE_WINDOW_FRACTION,
+  MEMORY_MIN_ENTRIES,
   guideMaxBytes,
   isDeferred,
+  memoryMaxEntries,
 } from '../../src/tools/context-budget.ts';
 
 const ABSOLUTE = 16 * 1024; // PROJECT_GUIDE_MAX_BYTES
@@ -71,5 +73,27 @@ describe('isDeferred', () => {
     // visible rather than vanishing on a 0/negative capability.
     expect(isDeferred({ deferBelowTokens: DEFER_BELOW_TOKENS_SMALL }, 0)).toBe(false);
     expect(isDeferred({ deferBelowTokens: DEFER_BELOW_TOKENS_SMALL }, -1)).toBe(false);
+  });
+});
+
+describe('memoryMaxEntries', () => {
+  test('no cap at or above the small tier (64K)', () => {
+    expect(memoryMaxEntries(DEFER_BELOW_TOKENS_SMALL)).toBeUndefined();
+    expect(memoryMaxEntries(200_000)).toBeUndefined();
+  });
+
+  test('an unknown window means no cap', () => {
+    expect(memoryMaxEntries(0)).toBeUndefined();
+    expect(memoryMaxEntries(-1)).toBeUndefined();
+  });
+
+  test('a small window caps to the window fraction', () => {
+    // 32K × 0.04 / 20 = 64.
+    expect(memoryMaxEntries(32_000)).toBe(64);
+  });
+
+  test('never caps below the floor', () => {
+    // A tiny window computes < MEMORY_MIN_ENTRIES; the floor wins.
+    expect(memoryMaxEntries(1_000)).toBe(MEMORY_MIN_ENTRIES);
   });
 });

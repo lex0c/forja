@@ -164,6 +164,16 @@ export interface AssembleMemorySectionInput {
   // the previously-loaded shared memories in the model's context.
   // Empty / absent = no exclusion (current behavior).
   excludeScopes?: ReadonlyArray<MemoryScope>;
+  // Window-relative cap on rendered index entries (CONTEXT_TUNING §2.2,
+  // `memoryMaxEntries`). Applied AFTER trust/state/trigger/playbook filtering
+  // and dedupe, keeping the highest-precedence entries. Caps the rendered
+  // lines AND the `eagerLoaded` inventory together (consistency by
+  // construction). The drop is NOT silent — a visible marker tells the model
+  // how many were trimmed and how to reach them. Undefined / non-positive =
+  // no cap. Bootstrap passes `memoryMaxEntries(bootWindow)`; the cap is
+  // boot-pinned (eager-exposure provenance is a boot concept), not re-applied
+  // per turn.
+  maxEntries?: number;
 }
 
 export interface AssembleMemorySectionResult {
@@ -308,12 +318,24 @@ export const assembleMemorySection = (
   // The flag without motivo+date still delivers the load-bearing
   // signal: "model, this memory is under review; be cautious".
   const seen = new Set<string>();
+  const deduped: typeof eligible = [];
+  for (const e of eligible) {
+    if (seen.has(e.listing.name)) continue;
+    seen.add(e.listing.name);
+    deduped.push(e);
+  }
+  // Window-relative cap (CONTEXT_TUNING §2.2). Keep the highest-precedence
+  // entries (the deduped list is already in precedence order — most-specific
+  // surviving scope first), trim the tail. Applied here so the rendered lines
+  // and the eagerLoaded inventory stay consistent by construction. The cap is
+  // a small-window guardrail; a non-positive / undefined cap means no trim.
+  const cap =
+    input.maxEntries !== undefined && input.maxEntries > 0 ? input.maxEntries : deduped.length;
+  const rendered = deduped.slice(0, cap);
+  const dropped = deduped.length - rendered.length;
   const lines: string[] = [MEMORY_SECTION_HEADER, ''];
   const eagerLoaded: EagerExposure[] = [];
-  let included = 0;
-  for (const { listing, file } of eligible) {
-    if (seen.has(listing.name)) continue;
-    seen.add(listing.name);
+  for (const { listing, file } of rendered) {
     const state = file?.frontmatter.state;
     const stateFlag = state === 'quarantined' ? ' [memory: quarantined]' : '';
     // Spec §5.7.3: "UI mostrar `[seed]` discreto na lista —
@@ -326,10 +348,17 @@ export const assembleMemorySection = (
     lines.push(
       `- [${listing.scope}] ${listing.name}${seedFlag}${stateFlag} — ${listing.entry.hook}`,
     );
-    included++;
     eagerLoaded.push(toEagerExposure(listing.scope, listing.name, file));
   }
-  return { text: lines.join('\n'), entryCount: included, eagerLoaded };
+  // No silent caps (principle: log what was dropped). The model sees the
+  // elision and how to reach the trimmed memories, mirroring the project
+  // guide's truncation marker.
+  if (dropped > 0) {
+    lines.push(
+      `- … and ${dropped} more ${dropped === 1 ? 'memory' : 'memories'} trimmed to fit the context window — use memory_list / memory_search to reach them.`,
+    );
+  }
+  return { text: lines.join('\n'), entryCount: rendered.length, eagerLoaded };
 };
 
 // Snapshot one eager-loaded entry. `file === null` happens for the

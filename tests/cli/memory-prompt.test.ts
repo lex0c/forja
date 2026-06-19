@@ -53,6 +53,35 @@ afterEach(() => {
   }
 });
 
+describe('assembleMemorySection — window cap (CONTEXT_TUNING §2.2)', () => {
+  test('maxEntries trims to the cap, marks the elision, and keeps eagerLoaded consistent', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const lines = Array.from({ length: 10 }, (_, i) => `- [M${i}](m${i}.md) — hook ${i}`).join(
+      '\n',
+    );
+    writeIndex(roots.user, `${lines}\n`);
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry, maxEntries: 4 });
+    // Rendered lines === cap; eagerLoaded mirrors exactly what shipped.
+    expect(result.entryCount).toBe(4);
+    expect(result.eagerLoaded).toHaveLength(4);
+    // No silent cap — a visible marker for the 6 trimmed.
+    expect(result.text).toContain('6 more memories trimmed to fit the context window');
+    expect(result.text).toContain('memory_list / memory_search');
+  });
+
+  test('maxEntries at or above the entry count is a no-op (no marker)', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [A](a.md) — hook a\n- [B](b.md) — hook b\n');
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry, maxEntries: 10 });
+    expect(result.entryCount).toBe(2);
+    expect(result.text).not.toContain('trimmed to fit');
+  });
+});
+
 describe('assembleMemorySection', () => {
   test('renders header-only block with zero count when no memories exist', () => {
     // Post-review fix: save-criteria + 4-type semantics + DO-NOT-save

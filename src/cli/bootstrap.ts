@@ -88,6 +88,7 @@ import {
 } from '../storage/repos/prompt-versions.ts';
 import { setRecapCacheTtlOverride } from '../storage/repos/recap-cache.ts';
 import { type SubagentSet, loadSubagents, validateSubagentSet } from '../subagents/index.ts';
+import { memoryMaxEntries } from '../tools/context-budget.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import { isTrusted, trustListPath } from '../trust/index.ts';
 import { composeWithConstraints } from './constraints-prompt.ts';
@@ -99,8 +100,9 @@ import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
 import { composeWithOutputStyle } from './output-style-prompt.ts';
 import { composeWithParallelHint } from './parallel-prompt.ts';
 import { composeWithPlaybookHint } from './playbook-prompt.ts';
-import { assembleProjectContext, composeWithProjectContext } from './project-context.ts';
+import { acquireProjectGuide } from './project-context.ts';
 import { composeWithResponseFormat } from './response-format.ts';
+import { type SystemInputs, shapeSystemPrompt } from './shape-system-prompt.ts';
 import { assembleSkillCatalogSection } from './skills-prompt.ts';
 import { composeWithToolErgonomics } from './tool-ergonomics-prompt.ts';
 
@@ -296,6 +298,11 @@ export interface BootstrapResult {
   // row so the §1.3.5 join queries can trace any audit row back to
   // the exact prompt that produced it.
   systemPromptHash?: string;
+  // Window-independent acquired inputs for the system prompt (CONTEXT_TUNING
+  // §2.2 acquire/shape split). The REPL re-shapes the prompt per turn from
+  // these against the live window so a mid-session /model swap re-clips the
+  // project guide. Undefined when no prompt was assembled (test fixtures).
+  systemInputs?: SystemInputs;
   // Which layers contributed to the effective policy. `'default'`
   // means no layer file was found anywhere — engine falls back to
   // strict + empty rules.
@@ -857,6 +864,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   let resolvedSystemPrompt: string | undefined;
   let resolvedSystemSegments: SystemSegment[] | undefined;
   let systemPromptHash: string | undefined;
+  let systemInputs: SystemInputs | undefined;
   let memoryRegistry: ReturnType<typeof createMemoryRegistry>;
   let skillCatalog: ReturnType<typeof createSkillCatalog>;
   let resolvedHooks: ReturnType<typeof resolveHookConfig>;
@@ -1243,13 +1251,18 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // second `isTrusted` call is a no-op.
     const isRepoRootTrusted =
       cwd === repoRoot ? isCwdTrusted : trustPath !== null && isTrusted(trustPath, repoRoot);
-    const projectContext = assembleProjectContext({
+    const acquiredGuide = acquireProjectGuide({
       cwd,
       repoRoot,
       isCwdTrusted,
       isRepoRootTrusted,
     });
-    resolvedSystemPrompt = composeWithProjectContext(resolvedSystemPrompt, projectContext.text);
+    // The composeWith* prefix BEFORE the project guide. Captured for the
+    // acquire/shape split (CONTEXT_TUNING §2.2): the guide is re-clipped per
+    // turn against the live window, so it must NOT be baked into the frozen
+    // prefix here — shapeSystemPrompt re-appends it below (and per turn in the
+    // REPL).
+    const stablePrefix = resolvedSystemPrompt;
     // S5 fail-closed eager-load gating. The project_shared scope
     // is eligible for the eager-load section ONLY when the trust
     // probe established confidence in the corpus' current state.
@@ -1333,23 +1346,19 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       if (storedTrust === null) return true; // never confirmed
       return storedTrust.lastConfirmedHash !== currentHash; // drift
     })();
-    // Snapshot the "stable" portion of the prompt — identity, env,
-    // ergonomics, constraints, base systemPrompt, project pointer.
-    // Everything composed BEFORE the memory/skills append. Captured
-    // here so the Anthropic adapter can place a cache breakpoint
-    // after this segment, separating it from the memory_index +
-    // skills tail that invalidates on `memory_write` / skill palette
-    // changes. CONTEXT_TUNING.md §3.1 declares 4 breakpoints; this
-    // implements the [system] / [memory_index] split (the
-    // [project_context] dedicated breakpoint is fused with [system]
-    // here because the pointer is small and invalidates rarely).
-    const stableSegmentText = resolvedSystemPrompt ?? '';
+    // Memory index + skill catalog — the high-rotation `memory` segment.
+    // Assembled here and capped to the BOOT window's budget; window-independent
+    // thereafter. The memory cap is boot-pinned because eager-exposure
+    // provenance is a boot concept (MEMORY.md §11.2); the guide, by contrast,
+    // re-clips per turn via shapeSystemPrompt. CONTEXT_TUNING §2.2.
+    const bootWindow = provider.capabilities.context_window;
+    const memCap = memoryMaxEntries(bootWindow);
     const memorySection = assembleMemorySection({
       registry: memoryRegistry,
       bootContext,
       ...(sharedScopeOffline ? { excludeScopes: ['project_shared'] as const } : {}),
+      ...(memCap !== undefined ? { maxEntries: memCap } : {}),
     });
-    resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, memorySection.text);
     eagerExposures = memorySection.eagerLoaded;
     // Skill catalog section (spec SKILLS.md §4.1: surface eager,
     // body lazy). An empty catalog yields an empty section that
@@ -1358,19 +1367,21 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // createSession — the session row must exist before a
     // skill_events row can reference it.
     const skillSectionText = assembleSkillCatalogSection(skillCatalog);
-    resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, skillSectionText);
-    // Build the segment list mirroring resolvedSystemPrompt's
-    // composition. `flattenSystemSegments(systemSegments)` must
-    // equal `resolvedSystemPrompt` — both adapters and the audit
-    // hash see identical content; segments only change which
-    // boundaries the cache marker lands on.
     const memorySegmentText = composeSystemPrompt(memorySection.text, skillSectionText) ?? '';
-    resolvedSystemSegments = [
-      { id: 'stable', text: stableSegmentText, cacheBreakpoint: true },
-      ...(memorySegmentText.length > 0
-        ? [{ id: 'memory' as const, text: memorySegmentText, cacheBreakpoint: true }]
-        : []),
-    ];
+    // Acquire/shape split (CONTEXT_TUNING §2.2). Hold the window-independent
+    // pieces — stable prefix, acquired guide, boot-capped memory segment — so
+    // the REPL can RE-SHAPE the prompt per turn against the live window (the
+    // guide re-clips on a mid-session /model swap). At the boot window,
+    // shapeSystemPrompt reproduces the legacy inline composition byte-for-byte;
+    // `flattenSystemSegments(systemSegments)` still equals `system`.
+    systemInputs = {
+      ...(stablePrefix !== undefined ? { stablePrefix } : {}),
+      ...(acquiredGuide !== undefined ? { acquiredGuide } : {}),
+      memorySegmentText,
+    };
+    const shaped = shapeSystemPrompt(systemInputs, bootWindow);
+    resolvedSystemPrompt = shaped.system;
+    resolvedSystemSegments = shaped.systemSegments;
 
     // Register the assembled system prompt in `prompt_versions`
     // (AUDIT.md §1.3.3): content-addressed, idempotent by hash so a
@@ -1640,6 +1651,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     registry,
     modelId,
     ...(systemPromptHash !== undefined ? { systemPromptHash } : {}),
+    ...(systemInputs !== undefined ? { systemInputs } : {}),
     policyLayers,
     lockConflicts: [...permResult.lockConflicts],
     subagents,

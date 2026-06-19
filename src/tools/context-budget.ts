@@ -63,3 +63,28 @@ export const isDeferred = (
   (meta.deferBelowTokens !== undefined &&
     contextWindow > 0 &&
     contextWindow < meta.deferBelowTokens);
+
+// Minimum memory index entries kept even on a tight window — always show at
+// least the top dozen so a small-window session isn't blinded to its own
+// memories; the trimmed rest stay reachable via memory_list / memory_search.
+export const MEMORY_MIN_ENTRIES = 12;
+
+// Fraction of the context window (in tokens) the memory index LINES may occupy.
+// The always-on header is excluded from this budget — it carries load-bearing
+// save guidance and is not the lever here. ~20 tokens/line (≈80 chars / 4).
+export const MEMORY_LINES_WINDOW_FRACTION = 0.04;
+const MEMORY_LINE_TOKENS = 20;
+
+// Max memory index entries at this window, or undefined for "no cap". The index
+// is cheap relative to a large window, so only the small tier (< 64K) caps —
+// this is a guardrail against a pathological memory count on a tight local
+// model, not a routine trim. Applied at ASSEMBLY, not per turn: eager-exposure
+// provenance is boot-pinned (MEMORY.md §11.2), so the cap is a boot decision
+// (unlike the per-turn guide clip). A non-positive (unknown) window → no cap.
+export const memoryMaxEntries = (contextWindow: number): number | undefined => {
+  if (contextWindow <= 0 || contextWindow >= DEFER_BELOW_TOKENS_SMALL) return undefined;
+  const fromWindow = Math.floor(
+    (contextWindow * MEMORY_LINES_WINDOW_FRACTION) / MEMORY_LINE_TOKENS,
+  );
+  return Math.max(MEMORY_MIN_ENTRIES, fromWindow);
+};

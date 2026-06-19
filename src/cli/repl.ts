@@ -49,6 +49,7 @@ import {
 import { closeDb, computeUsageStats, countMessagesBySession } from '../storage/index.ts';
 import { createContextPinsStore } from '../storage/repos/context-pins.ts';
 import type { MessageSource } from '../storage/repos/messages.ts';
+import { recordPromptVersion, resolveAuthor } from '../storage/repos/prompt-versions.ts';
 import { settleRunningSubagentHandles } from '../storage/repos/subagent-handles.ts';
 import { createTodoStore } from '../todo/index.ts';
 import type { ClarifyBridgeRequest } from '../tools/index.ts';
@@ -80,6 +81,7 @@ import { PROJECT_GUIDE_FILENAMES } from './project-context.ts';
 import { prepareResumeContext } from './resume-prepare.ts';
 import { replayProviderMessages, replaySessionMessages } from './resume-replay.ts';
 import { resolveResumeIdOnDb } from './run.ts';
+import { shapeSystemPrompt } from './shape-system-prompt.ts';
 import {
   type SlashContext,
   createBuiltinRegistry,
@@ -635,6 +637,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     config: baseConfig,
     db,
     modelId,
+    systemInputs,
     lockConflicts,
     subagents,
     policyLayers,
@@ -1901,6 +1904,37 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // 'operator' (the human typed/queued it — the default) or 'system' (the
   // REPL injected it — a bg_done wake-turn). It only changes how the
   // userPrompt persists for audit/resume, never what the provider sees.
+  // Window-relative system-prompt re-shaping (CONTEXT_TUNING §2.2). The fixed
+  // prefix is a per-turn derivation of the live window: a mid-session /model
+  // swap changes provider.capabilities.context_window, so the project guide
+  // re-clips on the next turn (pull-no-turno — no event/listener). At an
+  // unchanged window the shaped bytes are byte-identical to bootstrap's, so the
+  // cache prefix holds. Falls back to the frozen baseConfig prompt when
+  // bootstrap captured no systemInputs (test fixtures). recordPromptVersion
+  // fires only when the hash actually changes (the narrow guide-reclip path),
+  // keeping the audit soft-FK intact without per-turn DB churn.
+  let lastShapedHash = baseConfig.systemPromptHash;
+  const shapedSystemFields = (): Partial<HarnessConfig> => {
+    if (systemInputs === undefined) return {};
+    const shaped = shapeSystemPrompt(systemInputs, baseConfig.provider.capabilities.context_window);
+    if (shaped.systemPromptHash !== undefined && shaped.systemPromptHash !== lastShapedHash) {
+      recordPromptVersion(db, {
+        hash: shaped.systemPromptHash,
+        kind: 'system',
+        name: 'system.autonomous',
+        content: shaped.system ?? '',
+        author: resolveAuthor(),
+      });
+      lastShapedHash = shaped.systemPromptHash;
+    }
+    return {
+      ...(shaped.system !== undefined ? { systemPrompt: shaped.system } : {}),
+      ...(shaped.systemSegments !== undefined ? { systemSegments: shaped.systemSegments } : {}),
+      ...(shaped.systemPromptHash !== undefined
+        ? { systemPromptHash: shaped.systemPromptHash }
+        : {}),
+    };
+  };
   const startTurn = (text: string, source: MessageSource = 'operator'): void => {
     if (isBusy() || exiting) return;
     running = true;
@@ -1922,6 +1956,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     resumeRecapPending = false;
     const cfg: HarnessConfig = {
       ...baseConfig,
+      // Re-shape the system prompt against the live window (overrides the frozen
+      // baseConfig systemPrompt/segments/hash). CONTEXT_TUNING §2.2.
+      ...shapedSystemFields(),
       userPrompt: text,
       // Only thread a non-default source so 'operator' turns stay byte-
       // identical to before (and the harness default applies).
