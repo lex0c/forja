@@ -14,6 +14,7 @@ import {
 } from '../../src/evals/ab.ts';
 import type { EvalCase, EvalCaseResult } from '../../src/evals/types.ts';
 import type { Provider, StreamEvent } from '../../src/providers/index.ts';
+import { seedModelCatalog } from '../helpers/seed-catalog.ts';
 
 const runResult = (over: Partial<EvalCaseResult>): EvalCaseResult => ({
   name: 'c',
@@ -240,6 +241,10 @@ beforeEach(() => {
   originalFlag = process.env[FLAG];
   process.env.XDG_CONFIG_HOME = workdir;
   process.env.HOME = workdir;
+  // The model catalog is mandatory at boot — runAbComparison runs cases
+  // through bootstrap (even with providerOverride, the catalog gate fires
+  // first), so materialize the seed at the workdir-scoped user path.
+  seedModelCatalog();
 });
 
 afterEach(() => {
