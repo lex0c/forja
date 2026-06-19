@@ -18,6 +18,10 @@ import { loadModelProvidersFile } from './catalog-io.ts';
 import { type CreateGoogleProviderOptions, createGoogleProvider } from './google/index.ts';
 import { type CreateOllamaProviderOptions, createOllamaProvider } from './ollama/index.ts';
 import { type CreateOpenAIProviderOptions, createOpenAIProvider } from './openai/index.ts';
+import {
+  type CreateOpenRouterProviderOptions,
+  createOpenRouterProvider,
+} from './openrouter/index.ts';
 import { type ModelRegistry, createRegistry } from './registry.ts';
 import { CANONICAL_MODEL_PROVIDERS } from './seed-catalog.ts';
 import type { ModelProviderEntry, Provider } from './types.ts';
@@ -86,6 +90,13 @@ const entryToFactory =
             // host authenticates; local Ollama (no key) omits it.
             ...(hasKey ? { headers: { Authorization: `Bearer ${apiKey}` } } : {}),
             ...((opts as CreateOllamaProviderOptions | undefined) ?? {}),
+          });
+        case 'openrouter':
+          return createOpenRouterProvider(entry.model_name, {
+            capabilities: entry.capabilities,
+            ...(hasKey ? { apiKey } : {}),
+            ...(baseURL !== undefined ? { baseURL } : {}),
+            ...((opts as CreateOpenRouterProviderOptions | undefined) ?? {}),
           });
         default:
           // Unreachable: the loader rejects unsupported families before an

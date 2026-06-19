@@ -185,7 +185,9 @@ const toOpenAIMessages = (m: ProviderMessage): OpenAIMessage[] => {
   return out;
 };
 
-const toOpenAITools = (
+// Exported for reuse by the OpenRouter adapter (identical OpenAI-shape tools
+// payload); kept here so the OpenAI request assembly stays the single owner.
+export const toOpenAITools = (
   tools: ProviderToolDef[],
 ): Array<{
   type: 'function';

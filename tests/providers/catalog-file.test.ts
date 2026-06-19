@@ -126,7 +126,7 @@ describe('loadModelProvidersFile — per-entry fail-soft', () => {
   test('unsupported family → warn + skip, valid sibling survives', () => {
     writeCatalog(
       catalogJson([
-        entry({ id: 'openrouter/x', family: 'openrouter' as never, model_name: 'x' }),
+        entry({ id: 'mistral/x', family: 'mistral' as never, model_name: 'x' }),
         entry(),
       ]),
     );
@@ -293,10 +293,10 @@ describe('registry construction + factory wiring', () => {
   test('isSupportedFamily recognizes only the shipped adapters', () => {
     // The subagent child gates a persisted snapshot on this before
     // rebuilding, so a corrupt unsupported family falls back to the file.
-    for (const f of ['anthropic', 'openai', 'ollama', 'google']) {
+    for (const f of ['anthropic', 'openai', 'ollama', 'google', 'openrouter']) {
       expect(isSupportedFamily(f)).toBe(true);
     }
-    for (const f of ['openrouter', 'mistral', 'llama_cpp', 'bogus', '']) {
+    for (const f of ['mistral', 'llama_cpp', 'bogus', '']) {
       expect(isSupportedFamily(f)).toBe(false);
     }
   });
@@ -321,6 +321,8 @@ describe('seed catalog + serialization', () => {
     expect(ids.some((id) => id.startsWith('openai/'))).toBe(true);
     expect(ids.some((id) => id.startsWith('ollama/'))).toBe(true);
     expect(ids.some((id) => id.startsWith('google/'))).toBe(true);
+    // OpenRouter ids carry two slashes (openrouter/<vendor>/<model>).
+    expect(ids.some((id) => id.startsWith('openrouter/'))).toBe(true);
   });
 
   test('every seed entry has an id of the form family/model_name', () => {

@@ -4,7 +4,14 @@
 // in M1 — it's coupled to TOKEN_TUNING.md §10, which is its own subsystem
 // step. Will be added when that step lands.
 
-export type ProviderFamily = 'anthropic' | 'openai' | 'ollama' | 'llama_cpp' | 'google' | 'mistral';
+export type ProviderFamily =
+  | 'anthropic'
+  | 'openai'
+  | 'ollama'
+  | 'llama_cpp'
+  | 'google'
+  | 'mistral'
+  | 'openrouter';
 
 export type ToolCallingMode = 'native' | 'adapted';
 export type CacheMode = 'server_5min' | 'server_persistent' | 'client_only';
