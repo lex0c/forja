@@ -128,9 +128,19 @@ Before acting on a FACTUAL memory (file paths, exported names, schema shape), ve
 // so the full header's save-taxonomy + verify guidance is teaching tools that
 // aren't on the wire — ~510 tokens the window can't spare. Keep only the index
 // pointer; the discipline returns with the full header on a larger window.
+//
+// The tool guidance is CONDITIONAL ("if … isn't in your toolset, reveal via
+// tool_search"), NOT an assertion that the tools are off the surface. This
+// header is boot-pinned (the `memory` segment is), but the tool list is
+// per-turn: after a `/model` swap to a larger window, buildToolDefs re-adds
+// memory_read/memory_search to the wire while this header stays put. A hard
+// "they're off the surface — use tool_search" claim would then misdirect the
+// model into tool_search, which filters the now-undeferred tools out of its
+// catalog → a dead-end notFound instead of just calling the visible tool. The
+// conditional phrasing stays correct whether or not the tools are on the wire.
 const MEMORY_SECTION_HEADER_LEAN = `# Memory
 
-Cross-session memory index below (\`[scope] name — hook\`). Memory bodies and the memory tools (memory_read / memory_search / memory_write) are off the base tool surface at this context-window size — reach them via tool_search when a listed memory is relevant to the task.`;
+Cross-session memory index below (\`[scope] name — hook\`). Load a body with memory_read, search with memory_search — if a memory tool isn't already in your toolset, reveal it with tool_search first.`;
 
 export interface AssembleMemorySectionInput {
   registry: MemoryRegistry;
