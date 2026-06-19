@@ -63,15 +63,23 @@ those have no catalog entries yet.
 
 ---
 
-## 2. Registry and model ids
+## 2. Registry and the model catalog
 
 Models are addressed by a **fully-qualified id**, `family/model`
-(e.g. `anthropic/claude-opus-4-8`, `openai/gpt-5.3-codex`). The registry
-(`src/providers/registry.ts`) maps an id to a `{ family, modelName, factory }`
-entry; each family registers its catalog via `register.ts`. The default when no
-`--model` is given is `anthropic/claude-opus-4-8` (`src/providers/default-model.ts`).
+(e.g. `anthropic/claude-opus-4-8`, `ollama/qwen3:14b`). At boot the registry
+(`src/providers/registry.ts`) is built from the operator-owned catalog file
+`~/.config/forja/model_providers.json` — `loadModelRegistry`
+(`src/providers/catalog-file.ts`) reads it and maps each id to a
+`{ family, modelName, capabilities, factory }` entry. That file is the **runtime
+source of truth**: running `forja init` to write it is mandatory; with no
+catalog, boot aborts pointing at `forja init` rather than silently falling back
+to a built-in list. The default when no `--model` is given is
+`anthropic/claude-opus-4-8` (`src/providers/default-model.ts`).
 
-The shipped catalogs (`<family>/capabilities.ts`):
+The in-binary `<family>/capabilities.ts` constants are no longer the runtime
+catalog — they are the **seed** (`src/providers/seed-catalog.ts`,
+`CANONICAL_MODEL_PROVIDERS`) that `forja init` materializes into the file. The
+seeded models:
 
 | Family | Models |
 |---|---|
@@ -80,9 +88,74 @@ The shipped catalogs (`<family>/capabilities.ts`):
 | **google** | `gemini-3.5-flash`, `gemini-3.1-pro-preview`, `gemini-3.1-flash-lite`, `gemini-3-flash-preview`, `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite` |
 | **ollama** (local) | `qwen2.5-coder:7b/14b/32b`, `qwen3:8b/14b/30b`, `qwen3-coder:30b`, `llama3.1:8b`, `mistral-nemo:12b`, `gpt-oss:20b`, `devstral:24b` — all native tool calling, `$0` |
 
-Adding a model is usually a catalog entry (§8); the registry test
-(`tests/providers/registry.test.ts`) asserts every catalog model is registered
-exactly once.
+To add, remove, or adjust a model, edit the file (§2.1) — no recompile. The
+registry test (`tests/providers/registry.test.ts`) asserts every seeded model
+builds; `tests/providers/catalog-file.test.ts` covers the file loader.
+
+### 2.1 Configuring the model catalog (`model_providers.json`)
+
+`forja init` writes `~/.config/forja/model_providers.json` (user scope,
+profile-aware) seeded with the built-in models. It is operator-owned — edit it to
+register a local model you pulled, point at an OpenAI-/Anthropic-compatible
+endpoint, tweak a price or window, or remove models you do not use. When the file
+is present it is the **exclusive** catalog (a model you delete stays deleted);
+the binary never overwrites it. `forja init --force=model_providers` re-syncs it
+from the seed.
+
+Each entry:
+
+```json
+{
+  "version": 1,
+  "models": [
+    {
+      "id": "anthropic/claude-opus-4-8",
+      "family": "anthropic",
+      "model_name": "claude-opus-4-8",
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "capabilities": { "tools": "native", "cache": "server_5min", "...": "..." }
+    }
+  ]
+}
+```
+
+- **`id`** — `family/model_name`. `family` must be one Forja ships an adapter for
+  (`anthropic`, `openai`, `ollama`, `google`); the file registers *models*, not
+  new adapters (those are a code change — §8).
+- **`model_name`** — what the underlying SDK / HTTP API sees.
+- **`api_key_env`** — the env var that holds the API key (never the key itself).
+  It is **authoritative**: the cloud adapters have no env fallback of their own,
+  so the key comes only from this var. If it is set but the var is unset/empty,
+  boot fails naming it. Omit it for local Ollama (no key); a Google user on
+  `GEMINI_API_KEY` sets `api_key_env` to `GEMINI_API_KEY`.
+- **`base_url`** (optional) — a custom endpoint: a remote/cloud Ollama host, or an
+  OpenAI-compatible gateway (vLLM, LM Studio, OpenRouter, Azure).
+- **`capabilities`** — the `ProviderCapabilities` shape (§3): tool calling, cache
+  mode, context window, output cap, per-1k costs, and the `supports_*` reasoning
+  flags.
+
+A malformed entry is dropped with a stderr warning (the rest still load); only an
+absent/corrupt file, or a catalog with zero valid models, is fatal.
+
+**Register a local Ollama model** you pulled but that is not seeded:
+
+```json
+{ "id": "ollama/deepseek-r1:14b", "family": "ollama", "model_name": "deepseek-r1:14b",
+  "capabilities": { "tools": "native", "cache": false, "vision": false, "streaming": true,
+    "constrained": "json_mode", "context_window": 131072, "output_max_tokens": 16384,
+    "cost_per_1k_input": 0, "cost_per_1k_output": 0, "notes": ["local"] } }
+```
+
+**Register an OpenAI-compatible endpoint** (vLLM, a corporate gateway):
+
+```json
+{ "id": "openai/gateway-qwen", "family": "openai", "model_name": "Qwen2.5-72B-Instruct",
+  "api_key_env": "MY_GATEWAY_KEY", "base_url": "https://gateway.internal/v1",
+  "capabilities": { "...": "..." } }
+```
+
+Then `--model <id>` (boot) or `/model <id>` (in the REPL) selects it. Because the
+catalog is user-scope only, a cloned repo cannot inject a `base_url` / key var.
 
 ---
 
@@ -292,14 +365,19 @@ attempts, and only when no events have streamed yet (per `CONTRACTS.md §4`).
 
 ## 8. Extending the layer
 
-**Add a model** to an existing family: add a `capabilities.ts` entry (id, context
-window, output cap, cost rates, the `supports_*` flags). Routing and tests follow
-from the capability — e.g. an OpenAI model with `supports_reasoning_effort: true`
+**Add a model** to a family Forja already adapts: edit
+`~/.config/forja/model_providers.json` (§2.1) — no recompile. To ship it as a
+default (so `forja init` seeds it), add a `<family>/capabilities.ts` entry (id,
+context window, output cap, cost rates, the `supports_*` flags); it flows into
+`CANONICAL_MODEL_PROVIDERS` automatically. Routing and tests follow from the
+capability — e.g. an OpenAI model with `supports_reasoning_effort: true`
 automatically uses the Responses path. Validate live before trusting it (a probe
 + the structured suite via `bun run src/evals/cli.ts evals/smoke --model <id>`).
 
-**Add a provider family**: implement the `Provider` interface, a `register.ts`
-that populates the registry, a `capabilities.ts` catalog, and a `stream.ts`
-normalizer onto the canonical `StreamEvent`. Reuse the shared retry/cost/effort
+**Add a provider family**: implement the `Provider` interface, a `capabilities.ts`
+seed catalog, and a `stream.ts` normalizer onto the canonical `StreamEvent`, then
+wire the family into `entryToFactory` (`src/providers/catalog-file.ts`) so a
+catalog entry of that family builds the right adapter (passing `capabilities` /
+`base_url` / the resolved `api_key_env`). Reuse the shared retry/cost/effort
 machinery rather than re-implementing it. A subsystem without eval doesn't ship —
 add smoke coverage (`evals/`, parameterized via `SMOKE_MODEL`).
