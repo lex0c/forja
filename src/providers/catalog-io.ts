@@ -85,14 +85,22 @@ const validateCapabilities = (
   enumOrFalse(c.constrained, CONSTRAINED_VALUES, 'constrained');
   if (typeof c.vision !== 'boolean') errs.push('vision must be a boolean');
   if (typeof c.streaming !== 'boolean') errs.push('streaming must be a boolean');
-  for (const k of [
-    'context_window',
-    'output_max_tokens',
-    'cost_per_1k_input',
-    'cost_per_1k_output',
-  ] as const) {
+  // Token counts: positive integers. A zero/negative/fractional window or
+  // output cap would feed invalid math into the budget/compaction logic and
+  // an invalid `max_tokens` into provider requests.
+  for (const k of ['context_window', 'output_max_tokens'] as const) {
     const n = c[k];
-    if (typeof n !== 'number' || !Number.isFinite(n)) errs.push(`${k} must be a finite number`);
+    if (typeof n !== 'number' || !Number.isInteger(n) || n <= 0) {
+      errs.push(`${k} must be a positive integer`);
+    }
+  }
+  // Prices ($/1k tokens): non-negative finite numbers (0 is valid — local
+  // models are free). A negative rate would corrupt cost accounting.
+  for (const k of ['cost_per_1k_input', 'cost_per_1k_output'] as const) {
+    const n = c[k];
+    if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) {
+      errs.push(`${k} must be a non-negative number`);
+    }
   }
   if (!Array.isArray(c.notes) || !c.notes.every((n) => typeof n === 'string')) {
     errs.push('notes must be an array of strings');

@@ -162,6 +162,36 @@ describe('loadModelProvidersFile — per-entry fail-soft', () => {
     if (r.ok) expect(r.warnings[0]).toContain('vision must be a boolean');
   });
 
+  test('non-positive token counts and negative prices → warn + skip', () => {
+    const negWindow = entry({
+      id: 'ollama/a',
+      model_name: 'a',
+      capabilities: { ...VALID_CAPS, context_window: -1 },
+    });
+    const zeroOutput = entry({
+      id: 'ollama/b',
+      model_name: 'b',
+      capabilities: { ...VALID_CAPS, output_max_tokens: 0 },
+    });
+    const negCost = entry({
+      id: 'ollama/c',
+      model_name: 'c',
+      capabilities: { ...VALID_CAPS, cost_per_1k_input: -0.5 },
+    });
+    writeCatalog(catalogJson([negWindow, zeroOutput, negCost, entry()]));
+    const r = loadModelProvidersFile(env);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      // Only the valid default entry survives the three bad ones.
+      expect(r.entries).toHaveLength(1);
+      expect(r.entries[0]?.id).toBe('ollama/qwen3:14b');
+      const w = r.warnings.join(' ');
+      expect(w).toContain('context_window must be a positive integer');
+      expect(w).toContain('output_max_tokens must be a positive integer');
+      expect(w).toContain('cost_per_1k_input must be a non-negative number');
+    }
+  });
+
   test('duplicate id → warn + first wins', () => {
     writeCatalog(
       catalogJson([entry(), entry({ capabilities: { ...VALID_CAPS, context_window: 1 } })]),
