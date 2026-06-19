@@ -999,8 +999,13 @@ describe('/memory audit', () => {
     const r = await memoryCommand.exec(['audit', '--trigger', 'verify_failed'], ctx);
     if (r.kind !== 'ok') throw new Error(`unexpected: ${JSON.stringify(r)}`);
     const text = (r.notes ?? []).join('\n');
-    expect(text).toContain('vf');
-    expect(text).not.toContain('cd');
+    // Assert on the rendered `scope/name` ref, not the bare 2-char name. Each
+    // audit line includes the session UUID's first 8 hex chars, and 'cd' (both
+    // hex digits) collides with that prefix ~2.7% of runs — a CI-flaky false
+    // failure even though the `cd` memory is correctly filtered out. '/cd'
+    // cannot appear in the hex prefix.
+    expect(text).toContain('/vf');
+    expect(text).not.toContain('/cd');
   });
 
   test('--trigger filter with zero matches yields a clear message', async () => {
