@@ -273,27 +273,31 @@ describe('runAgent', () => {
     expect(lastAssistantText(result)).toContain('PARTIAL: checked A');
   });
 
-  test('synthesis turn is skipped when the last in-budget step already has text', async () => {
-    // The last step already produced text, so there's nothing to synthesize —
-    // no extra provider call. The script has only 2 steps, so a stray synthesis
-    // call would throw 'mock script exhausted'; requests.length === 2 proves it
-    // never fired.
+  test('synthesis fires when the last step is text-plus-tool_use (preamble, unconsumed results)', async () => {
+    // The last in-budget step emits text ("I'll inspect…") ALONGSIDE a tool_use;
+    // its tool_results land afterward, unconsumed. That preamble is NOT a settled
+    // answer, so the synthesis must still fire — regression for the gate walking
+    // back past the trailing tool_results and wrongly skipping.
     const { config, handle } = buildConfig(
       [
         { tool_uses: [{ id: 'tu1', name: 'echo', input: { msg: '1' } }], stop_reason: 'tool_use' },
         {
-          text: 'here is my answer',
+          text: "I'll inspect the file",
           tool_uses: [{ id: 'tu2', name: 'echo', input: { msg: '2' } }],
           stop_reason: 'tool_use',
         },
+        { text: 'FINAL: checked, the answer is X.', stop_reason: 'end_turn' },
       ],
       { budget: { maxSteps: 2 } },
     );
     const result = await runAgent(config);
     expect(result.status).toBe('exhausted');
     expect(result.reason).toBe('maxSteps');
-    expect(handle.requests).toHaveLength(2);
-    expect(lastAssistantText(result)).toContain('here is my answer');
+    expect(result.steps).toBe(2); // the synthesis turn is not a budget step
+    // The synthesis fired (3rd call, tool-less) and replaced the preamble.
+    expect(handle.requests).toHaveLength(3);
+    expect(handle.requests[2]?.tools).toBeUndefined();
+    expect(lastAssistantText(result)).toContain('FINAL: checked');
   });
 
   test('an abort DURING the synthesis turn exits as aborted, not maxSteps', async () => {

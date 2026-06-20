@@ -2721,21 +2721,21 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         return costCapDetailIfExceeded();
       };
 
-      // Does the last assistant turn already carry non-empty text? If so the
-      // run has an answer to return and the exhaustion synthesis below is a
-      // no-op — only a run that ended every step on a bare tool_use (e.g. an
-      // audit that read files until the cap) has nothing to hand back.
-      const lastAssistantHasText = (): boolean => {
+      // Did the run end on a SETTLED text answer — the LAST message an assistant
+      // carrying non-empty text, with nothing pending after it? Then the synthesis
+      // below is a no-op. Crucially this inspects the LAST message, NOT the last
+      // assistant: a `text + tool_use` turn whose tool_results were appended AFTER
+      // it is NOT settled — the model emitted a preamble ("I'll inspect…") and never
+      // incorporated the tool output, so the run must still synthesize. Walking back
+      // past trailing tool_results would mistake that preamble for the answer.
+      const endsWithSettledAnswer = (): boolean => {
         if (ctx === undefined) return true;
         const msgs = ctx.getMessages();
-        for (let i = msgs.length - 1; i >= 0; i -= 1) {
-          const m = msgs[i];
-          if (m?.role !== 'assistant') continue;
-          const c = m.content;
-          if (typeof c === 'string') return c.trim().length > 0;
-          return c.some((b) => b.type === 'text' && b.text.trim().length > 0);
-        }
-        return false;
+        const last = msgs[msgs.length - 1];
+        if (last?.role !== 'assistant') return false; // trailing tool_results ⇒ unconsumed
+        const c = last.content;
+        if (typeof c === 'string') return c.trim().length > 0;
+        return c.some((b) => b.type === 'text' && b.text.trim().length > 0);
       };
 
       // Final synthesis turn on max_steps exhaustion (STATE_MACHINE.md §2.2 /
@@ -2745,12 +2745,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // to `exhausted`, make ONE tool-less provider call ("budget's up, write
       // your answer now") and persist it as the closing assistant turn. This is
       // the LAST action of `running` (part of the → exhausted transition), not a
-      // return from a terminal state. Gated: skipped when the last assistant
-      // already has text, or when the cost cap is also blown (no budget for the
-      // call). Best-effort — any failure just proceeds to finish('maxSteps').
+      // return from a terminal state. Gated: skipped when the run already ended on
+      // a settled text answer (nothing pending), or when the cost cap is also blown
+      // (no budget). Best-effort — any failure just proceeds to finish('maxSteps').
       const synthesizeOnExhaustion = async (): Promise<void> => {
         if (ctx === undefined) return;
-        if (lastAssistantHasText()) return;
+        if (endsWithSettledAnswer()) return;
         if (costCapDetailIfExceeded() !== null) return;
         const synthMessages: ProviderMessage[] = [...ctx.getMessages()];
         const directive =
