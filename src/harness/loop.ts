@@ -2773,9 +2773,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           max_tokens: resolveMaxOutputTokens(budget, config.provider.capabilities),
           ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
           ...(config.systemSegments !== undefined ? { systemSegments: config.systemSegments } : {}),
+          // Mirror the normal turn's sampling/determinism axes so the synthesis
+          // isn't silently sampled differently — `seed_in_eval` in particular
+          // keeps eval replay reproducible.
+          ...(config.temperature !== undefined ? { temperature: config.temperature } : {}),
+          ...(config.topP !== undefined ? { top_p: config.topP } : {}),
+          ...(config.thinkingBudget !== undefined
+            ? { thinking_budget: config.thinkingBudget }
+            : {}),
           // NO tools: the load-bearing difference — the model can only
           // synthesize, never consume more budget or recurse.
           ...(reqEffort !== undefined ? { effort: reqEffort } : {}),
+          ...(config.seedInEval !== undefined ? { seed_in_eval: config.seedInEval } : {}),
         };
         let collected: Awaited<ReturnType<typeof collectStep>>;
         try {
@@ -2789,9 +2798,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             ),
             (ev) => safeEmit(config.onEvent, { type: 'provider_event', event: ev }),
           );
-        } catch {
+        } catch (e) {
           // A failed synthesis turn must never mask the exhaustion result.
+          // Still recover whatever the provider already billed — it charges
+          // input tokens the moment the request is accepted — mirroring the
+          // normal turn's CollectStepError recovery so the cost isn't lost.
           usageComplete = false;
+          if (e instanceof CollectStepError && e.partial.usageSeen) {
+            const partialCost = computeCost(config.provider.capabilities, e.partial.usage);
+            totalUsage = addUsage(totalUsage, e.partial.usage);
+            totalCostUsd += partialCost;
+            emitCostUpdate(partialCost);
+          }
           return;
         }
         const assistantContent = buildAssistantContent(collected);
@@ -2835,6 +2853,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // Pre-terminal synthesis turn (STATE_MACHINE.md §2.2): give the run
           // a chance to write its answer before the budget closes it out.
           await synthesizeOnExhaustion();
+          // A Ctrl+C / wall-clock timeout DURING that best-effort turn is
+          // swallowed by its catch; honor it here before classifying as
+          // exhaustion — abort takes precedence over the budget exit, matching
+          // the top-of-loop ordering above.
+          if (signal.aborted) {
+            return isWallClockTimeout()
+              ? await finish('maxWallClockMs')
+              : await finish('aborted', undefined, 'hard');
+          }
           return await finish('maxSteps');
         }
         // Cost cap pre-check. Critical on resume: a session whose

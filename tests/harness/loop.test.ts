@@ -296,6 +296,46 @@ describe('runAgent', () => {
     expect(lastAssistantText(result)).toContain('here is my answer');
   });
 
+  test('an abort DURING the synthesis turn exits as aborted, not maxSteps', async () => {
+    // Budget exhausts on bare tool_use, the synthesis turn fires, and the user
+    // hits Ctrl+C mid-call. Abort must win over the maxSteps classification —
+    // the synthesis catch swallows the abort, so the call site re-checks it.
+    const ctrl = new AbortController();
+    const base = mockProvider([]).provider;
+    let calls = 0;
+    const provider: Provider = {
+      ...base,
+      async *generate(): AsyncGenerator<StreamEvent> {
+        calls += 1;
+        if (calls <= 3) {
+          yield { kind: 'start', message_id: `m${calls}` };
+          yield { kind: 'tool_use_start', id: `tu${calls}`, name: 'echo' };
+          yield { kind: 'tool_use_stop', id: `tu${calls}`, final_args: { msg: `${calls}` } };
+          yield { kind: 'stop', reason: 'tool_use' };
+          return;
+        }
+        // 4th call = the synthesis turn; the user's Ctrl+C lands now.
+        ctrl.abort();
+        yield { kind: 'start', message_id: 'synth' };
+        yield { kind: 'stop', reason: 'end_turn' };
+      },
+    };
+    const registry = createToolRegistry();
+    registry.register(echoTool);
+    const result = await runAgent({
+      provider,
+      toolRegistry: registry,
+      permissionEngine: createPermissionEngine(policy({}), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'hi',
+      signal: ctrl.signal,
+      budget: { maxSteps: 3 },
+    });
+    expect(result.reason).toBe('aborted');
+    expect(result.abortCause).toBe('hard');
+  });
+
   test('aborted signal: exits as interrupted with abortCause=hard', async () => {
     const ctrl = new AbortController();
     ctrl.abort();
