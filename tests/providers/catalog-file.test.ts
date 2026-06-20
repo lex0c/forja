@@ -396,7 +396,12 @@ describe('seed catalog + serialization', () => {
     const cloud = CANONICAL_MODEL_PROVIDERS.filter(
       (e) => e.family === 'ollama' && e.base_url === 'https://ollama.com',
     );
-    expect(cloud.map((e) => e.id).sort()).toEqual(['ollama/glm-5.2', 'ollama/qwen3-coder:480b']);
+    expect(cloud.map((e) => e.id).sort()).toEqual([
+      'ollama/devstral-2:123b',
+      'ollama/glm-5.2',
+      'ollama/qwen3-coder-next',
+      'ollama/qwen3-coder:480b',
+    ]);
     for (const e of cloud) {
       expect(e.api_key_env).toBe('OLLAMA_API_KEY');
       expect(e.num_ctx).toBe(131_072);

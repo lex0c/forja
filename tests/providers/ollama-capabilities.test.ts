@@ -3,7 +3,7 @@ import { OLLAMA_CAPS, OLLAMA_MODEL_NAMES } from '../../src/providers/ollama/capa
 
 describe('OLLAMA_CAPS catalog', () => {
   test('exposes the curated set and OLLAMA_MODEL_NAMES matches the keys', () => {
-    expect(OLLAMA_MODEL_NAMES).toHaveLength(11);
+    expect(OLLAMA_MODEL_NAMES).toHaveLength(7);
     expect([...OLLAMA_MODEL_NAMES].sort()).toEqual(Object.keys(OLLAMA_CAPS).sort());
   });
 

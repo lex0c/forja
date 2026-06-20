@@ -95,7 +95,7 @@ describe('createDefaultRegistry', () => {
   test('contains the Ollama lineup', () => {
     const reg = createDefaultRegistry();
     expect(reg.has('ollama/qwen2.5-coder:14b')).toBe(true);
-    expect(reg.has('ollama/qwen3-coder:30b')).toBe(true);
+    expect(reg.has('ollama/glm-5.2')).toBe(true);
     expect(reg.has('ollama/gpt-oss:20b')).toBe(true);
   });
 

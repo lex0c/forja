@@ -45,7 +45,7 @@ const K256 = 262_144;
 // Keyed by the exact Ollama model name (the `ollama/<name>` tail).
 export const OLLAMA_CAPS: Record<string, ProviderCapabilities> = {
   // Qwen2.5-Coder — code-specific, 32K, tools native. The classic local
-  // cost/benefit sweet spot across 7b/14b/32b.
+  // cost/benefit sweet spot across 7b/14b (the 32b dense moved to cloud).
   'qwen2.5-coder:7b': {
     ...OLLAMA_BASE,
     context_window: K32,
@@ -60,14 +60,7 @@ export const OLLAMA_CAPS: Record<string, ProviderCapabilities> = {
     recommended_max_tools_per_step: 4,
     notes: ['code-specific Qwen; sweet-spot coder'],
   },
-  'qwen2.5-coder:32b': {
-    ...OLLAMA_BASE,
-    context_window: K32,
-    output_max_tokens: 8_192,
-    recommended_max_tools_per_step: 6,
-    notes: ['code-specific Qwen; strongest dense coder'],
-  },
-  // Qwen3 — general dense/MoE, tools + thinking. 40K on 8b/14b, 256K on 30b.
+  // Qwen3 — general dense, tools + thinking. 40K on 8b/14b.
   'qwen3:8b': {
     ...OLLAMA_THINKING_BASE,
     context_window: K40,
@@ -81,21 +74,6 @@ export const OLLAMA_CAPS: Record<string, ProviderCapabilities> = {
     output_max_tokens: 16_384,
     recommended_max_tools_per_step: 4,
     notes: ['general dense; tools + thinking'],
-  },
-  'qwen3:30b': {
-    ...OLLAMA_THINKING_BASE,
-    context_window: K256,
-    output_max_tokens: 16_384,
-    recommended_max_tools_per_step: 6,
-    notes: ['MoE; tools + thinking; 256K context'],
-  },
-  // Qwen3-Coder — agentic coding, 256K context, tools (no thinking badge).
-  'qwen3-coder:30b': {
-    ...OLLAMA_BASE,
-    context_window: K256,
-    output_max_tokens: 16_384,
-    recommended_max_tools_per_step: 6,
-    notes: ['agentic coding; 256K context; top local coding agent'],
   },
   // Llama 3.1 8B — general-purpose, 128K, tools. Strong light option.
   'llama3.1:8b': {
@@ -120,14 +98,6 @@ export const OLLAMA_CAPS: Record<string, ProviderCapabilities> = {
     output_max_tokens: 16_384,
     recommended_max_tools_per_step: 5,
     notes: ['OpenAI open-weights; reasoning + agentic; think levels are F3'],
-  },
-  // Devstral 24B — built for coding agents, 128K, tools.
-  'devstral:24b': {
-    ...OLLAMA_BASE,
-    context_window: K128,
-    output_max_tokens: 16_384,
-    recommended_max_tools_per_step: 5,
-    notes: ['Mistral; built for coding agents'],
   },
 };
 
@@ -155,6 +125,22 @@ export const OLLAMA_CLOUD_CAPS: Record<string, ProviderCapabilities> = {
     output_max_tokens: 16_384,
     recommended_max_tools_per_step: 6,
     notes: ['Ollama Cloud; qwen3-coder 480B MoE; agentic coding'],
+  },
+  // Qwen3-Coder-Next 80B MoE (3B active) — fast agentic coding; non-thinking.
+  'qwen3-coder-next': {
+    ...OLLAMA_BASE,
+    context_window: K256,
+    output_max_tokens: 16_384,
+    recommended_max_tools_per_step: 6,
+    notes: ['Ollama Cloud; Qwen3-Coder-Next 80B MoE (3B active); fast agentic coding'],
+  },
+  // Devstral 2 123B — Mistral, built for coding agents.
+  'devstral-2:123b': {
+    ...OLLAMA_BASE,
+    context_window: K128,
+    output_max_tokens: 16_384,
+    recommended_max_tools_per_step: 6,
+    notes: ['Ollama Cloud; Devstral 2 123B; coding agents'],
   },
 };
 
