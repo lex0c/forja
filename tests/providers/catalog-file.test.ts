@@ -192,6 +192,26 @@ describe('loadModelProvidersFile — per-entry fail-soft', () => {
     }
   });
 
+  test('non-positive / non-integer num_ctx → warn + skip', () => {
+    const zero = entry({ id: 'ollama/a', model_name: 'a', num_ctx: 0 });
+    const frac = entry({ id: 'ollama/b', model_name: 'b', num_ctx: 1.5 });
+    writeCatalog(catalogJson([zero, frac, entry()]));
+    const r = loadModelProvidersFile(env);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.entries).toHaveLength(1);
+      expect(r.entries[0]?.id).toBe('ollama/qwen3:14b');
+      expect(r.warnings.join(' ')).toContain('num_ctx must be a positive integer');
+    }
+  });
+
+  test('a valid num_ctx loads onto the entry', () => {
+    writeCatalog(catalogJson([entry({ num_ctx: 131_072 })]));
+    const r = loadModelProvidersFile(env);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.entries[0]?.num_ctx).toBe(131_072);
+  });
+
   test('duplicate id → warn + first wins', () => {
     writeCatalog(
       catalogJson([entry(), entry({ capabilities: { ...VALID_CAPS, context_window: 1 } })]),
@@ -219,6 +239,26 @@ describe('registry construction + factory wiring', () => {
     const resolved = resolveProviderFromId(reg, 'ollama/qwen3:14b');
     expect(resolved.ok).toBe(true);
     if (resolved.ok) expect(resolved.provider.id).toBe('ollama/qwen3:14b');
+  });
+
+  test('per-entry num_ctx flows to the ollama factory and bypasses the 32K cap', () => {
+    // A 256K-capacity entry with NO num_ctx clamps to the default 32K cap
+    // (VRAM protection) — the served window the harness budgets against.
+    const capped = buildRegistryFromEntries([
+      entry({ capabilities: { ...VALID_CAPS, context_window: 262_144 } }),
+    ])
+      .get('ollama/qwen3:14b')
+      ?.factory();
+    expect(capped?.capabilities.context_window).toBe(32_768);
+
+    // The SAME entry WITH a per-entry num_ctx serves that window instead —
+    // the cloud-window fix (a remote host has no local VRAM to protect).
+    const widened = buildRegistryFromEntries([
+      entry({ num_ctx: 131_072, capabilities: { ...VALID_CAPS, context_window: 262_144 } }),
+    ])
+      .get('ollama/qwen3:14b')
+      ?.factory();
+    expect(widened?.capabilities.context_window).toBe(131_072);
   });
 
   test('api_key_env is read from the named env var for the openai adapter', () => {
@@ -338,6 +378,17 @@ describe('seed catalog + serialization', () => {
     if (r.ok) {
       expect(r.entries).toHaveLength(CANONICAL_MODEL_PROVIDERS.length);
       expect(r.warnings).toHaveLength(0);
+    }
+  });
+
+  test('serialize → load round-trips a per-entry num_ctx + base_url', () => {
+    const e = entry({ base_url: 'https://ollama.com', num_ctx: 131_072 });
+    writeCatalog(serializeModelProviders([e]));
+    const r = loadModelProvidersFile(env);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.entries[0]?.num_ctx).toBe(131_072);
+      expect(r.entries[0]?.base_url).toBe('https://ollama.com');
     }
   });
 });

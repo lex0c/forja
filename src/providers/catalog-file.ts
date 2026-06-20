@@ -86,6 +86,10 @@ const entryToFactory =
           return createOllamaProvider(entry.model_name, {
             capabilities: entry.capabilities,
             ...(baseURL !== undefined ? { baseUrl: baseURL } : {}),
+            // Per-entry num_ctx bypasses the DEFAULT_OLLAMA_NUM_CTX cap so a
+            // cloud entry serves its real window; a later explicit `opts.numCtx`
+            // (programmatic caller) still wins via the trailing spread.
+            ...(entry.num_ctx !== undefined ? { numCtx: entry.num_ctx } : {}),
             // Map api_key_env → bearer header so Ollama Cloud / a guarded
             // host authenticates; local Ollama (no key) omits it.
             ...(hasKey ? { headers: { Authorization: `Bearer ${apiKey}` } } : {}),

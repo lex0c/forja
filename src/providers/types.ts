@@ -161,6 +161,12 @@ export interface ModelProviderEntry {
   // Custom endpoint for Ollama-remote / OpenAI-compatible hosts.
   // Optional; omitted ⇒ the adapter's default base URL.
   base_url?: string;
+  // Ollama-only: explicit num_ctx (the KV-cache window the daemon serves),
+  // bypassing the DEFAULT_OLLAMA_NUM_CTX cap. That cap protects LOCAL VRAM;
+  // a cloud/remote host (`base_url`) has none, so a cloud entry sets this to
+  // its real window (e.g. 131072) instead of being clamped to 32K. Other
+  // families ignore it. Omitted ⇒ the adapter's default cap applies.
+  num_ctx?: number;
   capabilities: ProviderCapabilities;
 }
 

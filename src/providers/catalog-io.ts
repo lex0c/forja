@@ -149,6 +149,12 @@ const validateEntry = (
   if (r.base_url !== undefined && (typeof r.base_url !== 'string' || r.base_url.length === 0)) {
     return bad('base_url must be a non-empty string');
   }
+  if (
+    r.num_ctx !== undefined &&
+    (typeof r.num_ctx !== 'number' || !Number.isInteger(r.num_ctx) || r.num_ctx <= 0)
+  ) {
+    return bad('num_ctx must be a positive integer');
+  }
   const caps = validateCapabilities(r.capabilities);
   if (!caps.ok) return bad(caps.reason);
   const entry: ModelProviderEntry = {
@@ -159,6 +165,7 @@ const validateEntry = (
   };
   if (typeof r.api_key_env === 'string') entry.api_key_env = r.api_key_env;
   if (typeof r.base_url === 'string') entry.base_url = r.base_url;
+  if (typeof r.num_ctx === 'number') entry.num_ctx = r.num_ctx;
   return { ok: true, entry };
 };
 
@@ -234,6 +241,7 @@ export const serializeModelProviders = (entries: ReadonlyArray<ModelProviderEntr
     const out: Record<string, unknown> = { id: e.id, family: e.family, model_name: e.model_name };
     if (e.api_key_env !== undefined) out.api_key_env = e.api_key_env;
     if (e.base_url !== undefined) out.base_url = e.base_url;
+    if (e.num_ctx !== undefined) out.num_ctx = e.num_ctx;
     out.capabilities = e.capabilities;
     return out;
   });
