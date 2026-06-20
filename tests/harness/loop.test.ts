@@ -2185,13 +2185,12 @@ describe('runAgent', () => {
     expect(result.usageComplete).toBe(false);
   });
 
-  test('compaction does NOT trigger on the final allowed step (maxSteps reached)', async () => {
-    // Regression: compaction runs at the END of a step body, but
-    // the loop's maxSteps check is at the TOP of the next
-    // iteration. With budget.maxSteps=2 and the trigger firing at
-    // the bottom of step 2, we'd burn an extra billed summary call
-    // right before the next top-check exits as maxSteps. Skip
-    // when no further step is allowed.
+  test('compaction is forced for the synthesis at max_steps so its request fits', async () => {
+    // The last in-budget tool_results push the history past the (tiny) window. The
+    // top-of-loop maybeCompact() skips at steps >= maxSteps, so the exhaustion
+    // synthesis FORCES compaction — else the un-compacted synthesis request would
+    // overflow the window and 400. The summary is USED (the synthesis builds from
+    // the compacted history), not the wasted call the old skip guarded against.
     const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
     const fatTool: Tool = {
       name: 'fat',
@@ -2204,8 +2203,6 @@ describe('runAgent', () => {
     };
     const { config } = buildConfig(
       [
-        // Two fat-tool turns: estimate crosses threshold after
-        // turn 2. With maxSteps=2 the loop must NOT compact.
         {
           tool_uses: [{ id: 't1', name: 'echo', input: { msg: 'a' } }],
           stop_reason: 'tool_use',
@@ -2216,6 +2213,10 @@ describe('runAgent', () => {
           stop_reason: 'tool_use',
           usage: { input: 50, output: 5 },
         },
+        // Forced compaction summary (text, no usage block — replayStep skips usage).
+        { text: '[compacted_history]\nGOAL: x\n[/compacted_history]', stop_reason: 'end_turn' },
+        // The synthesis answer, built from the compacted history.
+        { text: 'FINAL: synthesized.', stop_reason: 'end_turn' },
       ],
       {
         extraTools: [fatTool],
@@ -2230,7 +2231,9 @@ describe('runAgent', () => {
     );
     const result = await runAgent({ ...config, onEvent: (e) => events.push(e) });
     expect(result.reason).toBe('maxSteps');
-    expect(events.find((e) => e.type === 'compaction_started')).toBeUndefined();
+    // Compaction WAS forced for the synthesis — its summary is used, not discarded.
+    expect(events.find((e) => e.type === 'compaction_started')).toBeDefined();
+    expect(lastAssistantText(result)).toContain('FINAL: synthesized');
   });
 
   test('compaction does NOT trigger after the run is aborted', async () => {

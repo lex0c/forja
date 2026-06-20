@@ -2507,13 +2507,17 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // call pushed the cumulative total over the cap (caller must finish),
       // else null. Mutates `messages` in place and folds usage into the run
       // totals via closure.
-      const maybeCompact = async () => {
-        // Skip when aborted / budget exhausted / window unknown — don't burn
-        // a billed summary call whose result the loop is about to discard.
+      // `force` runs the compaction even at steps >= maxSteps — for the exhaustion
+      // synthesis, which builds its request from the live history AT the cap and
+      // must fit the window (the normal top-of-loop call skips there).
+      const maybeCompact = async (force = false) => {
+        // Skip when aborted / window unknown — don't burn a billed summary call
+        // whose result the loop is about to discard. At steps >= maxSteps the loop
+        // is exiting, so skip too — UNLESS forced (the synthesis still needs it).
         if (
           ctx === undefined ||
           signal.aborted ||
-          steps >= budget.maxSteps ||
+          (!force && steps >= budget.maxSteps) ||
           config.provider.capabilities.context_window <= 0
         ) {
           return null;
@@ -2751,6 +2755,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       const synthesizeOnExhaustion = async (): Promise<void> => {
         if (ctx === undefined) return;
         if (endsWithSettledAnswer()) return;
+        if (costCapDetailIfExceeded() !== null) return;
+        // Compact/elide first: a read-heavy run's last tool_results can push the
+        // history past the window, and the top-of-loop maybeCompact() is bypassed
+        // here (it skips at steps >= maxSteps), so an un-compacted synthesis request
+        // would 400. Force it for this transition, then re-check the cost cap — the
+        // summary call can itself cross it.
+        await maybeCompact(true);
         if (costCapDetailIfExceeded() !== null) return;
         const synthMessages: ProviderMessage[] = [...ctx.getMessages()];
         const directive =
