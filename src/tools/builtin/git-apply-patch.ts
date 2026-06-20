@@ -3,7 +3,6 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:pat
 import { getWorktreeRoot, isGitRepo } from '../../checkpoints/git.ts';
 import { lineDiff } from '../../diff/line-diff.ts';
 import { getGitBinaryWithEnv } from '../../subagents/git-binary.ts';
-import { DEFER_BELOW_TOKENS_SMALL } from '../context-budget.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 import { pathArgOf } from './_path-arg.ts';
 
@@ -305,10 +304,13 @@ export const gitApplyPatchTool: Tool<GitApplyPatchInput, GitApplyPatchOutput> = 
   },
   metadata: {
     category: 'fs.write',
-    // Window-relative deferral (CONTEXT_TUNING §2.2): advanced multi-hunk patch is
-    // off the base surface on a small window (edit_file/write_file cover the common
-    // path there); reachable via tool_search.
-    deferBelowTokens: DEFER_BELOW_TOKENS_SMALL,
+    // Always deferred (CONTEXT_TUNING §2.2): unified-diff generation is brittle for
+    // weaker models (off-by-one hunks/context lines), while edit_file/write_file cover
+    // the common path reliably. Kept off the base surface at ANY window — a model that
+    // genuinely wants a diff reaches it via tool_search. (Was deferBelowTokens; the
+    // num_ctx fix raised served windows past that threshold and re-exposed it to
+    // models that fumble the format — measured via the edit-format eval.)
+    deferred: true,
     writes: true,
     idempotent: false,
     display: 'diff',
