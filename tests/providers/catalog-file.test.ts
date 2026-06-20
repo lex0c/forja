@@ -330,6 +330,44 @@ describe('registry construction + factory wiring', () => {
     expect(provider?.catalogEntry).toEqual(e);
   });
 
+  test('ollama: an injected opts.apiKey becomes the Authorization header (cloud auth)', async () => {
+    // A cloud entry names an UNSET api_key_env (hasKey=false); a programmatic caller
+    // injects apiKey, satisfying the missing-key guard. Ollama auths via a header (no
+    // SDK apiKey field), so the injected key MUST map to Authorization — else the
+    // provider ships unauthenticated and the first /api/chat 401s.
+    const unsetVar = 'FORJA_TEST_OLLAMA_KEY_UNSET';
+    delete process.env[unsetVar];
+    let auth: string | null | undefined;
+    const fetchFn = (async (_url: string, init?: { headers?: Record<string, string> }) => {
+      auth = new Headers(init?.headers).get('authorization');
+      return new Response('{"done":true}\n', {
+        headers: { 'content-type': 'application/x-ndjson' },
+      });
+    }) as unknown as typeof fetch;
+
+    const provider = buildRegistryFromEntries([
+      entry({ api_key_env: unsetVar, base_url: 'https://ollama.com' }),
+    ])
+      .get('ollama/qwen3:14b')
+      ?.factory({ apiKey: 'injected-key', fetch: fetchFn });
+    if (provider === undefined) throw new Error('provider not built');
+
+    try {
+      // Drain to fire the request; the header is captured on the fetch call, so
+      // the minimal response's stream shape is irrelevant to the assertion.
+      for await (const _ev of provider.generate({
+        model: 'qwen3:14b',
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 64,
+      })) {
+        // no-op
+      }
+    } catch {
+      // stream content is not under test
+    }
+    expect(auth).toBe('Bearer injected-key');
+  });
+
   test('isSupportedFamily recognizes only the shipped adapters', () => {
     // The subagent child gates a persisted snapshot on this before
     // rebuilding, so a corrupt unsupported family falls back to the file.

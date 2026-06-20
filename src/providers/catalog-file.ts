@@ -82,7 +82,19 @@ const entryToFactory =
             ...(hasKey ? { apiKey } : {}),
             ...((opts as CreateGoogleProviderOptions | undefined) ?? {}),
           });
-        case 'ollama':
+        case 'ollama': {
+          // Ollama authenticates via an Authorization header, not an SDK apiKey
+          // field (CreateOllamaProviderOptions has none). Resolve the bearer from
+          // a caller-injected `opts.apiKey` — which satisfies the missing-key guard
+          // above — OR the env key, so an injected key actually authenticates
+          // instead of bypassing the guard into an unauthenticated cloud client.
+          // Caller's key wins over env, mirroring the other adapters' opts override.
+          const bearer =
+            typeof o.apiKey === 'string' && o.apiKey.length > 0
+              ? o.apiKey
+              : hasKey
+                ? apiKey
+                : undefined;
           return createOllamaProvider(entry.model_name, {
             capabilities: entry.capabilities,
             ...(baseURL !== undefined ? { baseUrl: baseURL } : {}),
@@ -90,11 +102,13 @@ const entryToFactory =
             // cloud entry serves its real window; a later explicit `opts.numCtx`
             // (programmatic caller) still wins via the trailing spread.
             ...(entry.num_ctx !== undefined ? { numCtx: entry.num_ctx } : {}),
-            // Map api_key_env → bearer header so Ollama Cloud / a guarded
-            // host authenticates; local Ollama (no key) omits it.
-            ...(hasKey ? { headers: { Authorization: `Bearer ${apiKey}` } } : {}),
+            // Map the resolved key → bearer header so Ollama Cloud / a guarded
+            // host authenticates; local Ollama (no key) omits it. An explicit
+            // `opts.headers` still wins via the trailing spread.
+            ...(bearer !== undefined ? { headers: { Authorization: `Bearer ${bearer}` } } : {}),
             ...((opts as CreateOllamaProviderOptions | undefined) ?? {}),
           });
+        }
         case 'openrouter':
           return createOpenRouterProvider(entry.model_name, {
             capabilities: entry.capabilities,
