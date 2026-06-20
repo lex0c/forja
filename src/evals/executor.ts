@@ -666,6 +666,7 @@ export const executeCase = async (
   if (result !== undefined) {
     out.status = result.status;
     out.exitReason = result.reason;
+    out.usage = result.usage;
     if (result.detail !== undefined) out.detail = result.detail;
   }
   if (failure !== undefined) {

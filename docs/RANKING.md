@@ -79,6 +79,10 @@ not the same as passing):
   independent of pass/fail.
 - **`p50 latency`** and **cost** — when the ranked models cost $0 in the catalog, cost is flat and
   only latency separates them; cost becomes a real axis once any paid model is included.
+- **`cache_read_rate`** — fraction of prompt tokens served from a cache read (the prompt-cache hit
+  rate). Filled only when the provider caches; **blank** for providers that don't (e.g. Ollama), so
+  it reads as "n/a" rather than "0% hit". Like cost, it only matters once a caching model (e.g.
+  Anthropic) is in the battery.
 
 ### Rules (summary)
 

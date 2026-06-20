@@ -57,6 +57,9 @@ interface SuiteResult {
   stepsAvg: number;
   exhaustRate: number;
   costAvgUsd: number;
+  cacheReadSum: number;
+  cacheWriteSum: number;
+  promptTokenSum: number;
   p50DurationMs: number;
   stableCases: number;
   multiRoundCases: number;
@@ -70,6 +73,7 @@ interface ModelRow {
   stability: number | null;
   p50DurationMs: number;
   costPerBatteryUsd: number;
+  cacheReadRate: number | null;
 }
 interface Provenance {
   generated_at: string;
@@ -113,6 +117,17 @@ export const unfinished = (r: EvalCaseResult): boolean =>
   r.status === 'interrupted' ||
   r.status === 'error';
 
+// Fraction of prompt tokens served from a cache read — the cache-hit signal.
+// Returns null (→ blank CSV cell) when the provider never cached this battery (no
+// read OR write activity), so a no-cache model reads as "n/a", not "0% hit". The
+// 0/0 guard keeps an all-setup-failure battery (no usage at all) null too.
+export const cacheReadRate = (
+  totalRead: number,
+  totalWrite: number,
+  totalPrompt: number,
+): number | null =>
+  totalRead + totalWrite > 0 && totalPrompt > 0 ? totalRead / totalPrompt : null;
+
 const runSuite = async (modelId: string, dir: string, repeat: number): Promise<SuiteResult> => {
   const cases = discoverCases(resolve(dir)).map(loadEvalCase);
   const all: EvalCaseResult[] = [];
@@ -148,6 +163,12 @@ const runSuite = async (modelId: string, dir: string, repeat: number): Promise<S
     stepsAvg: all.reduce((a, r) => a + r.steps, 0) / n,
     exhaustRate: all.filter((r) => unfinished(r)).length / n,
     costAvgUsd: all.reduce((a, r) => a + r.costUsd, 0) / n,
+    cacheReadSum: all.reduce((a, r) => a + (r.usage?.cache_read ?? 0), 0),
+    cacheWriteSum: all.reduce((a, r) => a + (r.usage?.cache_creation ?? 0), 0),
+    promptTokenSum: all.reduce(
+      (a, r) => a + (r.usage ? r.usage.input + r.usage.cache_read + r.usage.cache_creation : 0),
+      0,
+    ),
     p50DurationMs: p50(all.map((r) => r.durationMs)),
     stableCases,
     multiRoundCases,
@@ -155,7 +176,7 @@ const runSuite = async (modelId: string, dir: string, repeat: number): Promise<S
 };
 
 // --- CSV (append-only) ----------------------------------------------------
-const CSV_COLUMNS: readonly string[] = [
+export const CSV_COLUMNS: readonly string[] = [
   'run_date',
   'run_ts',
   'harness_commit',
@@ -167,6 +188,7 @@ const CSV_COLUMNS: readonly string[] = [
   'unfinished_rate',
   'p50_ms',
   'cost_usd',
+  'cache_read_rate',
 ];
 
 const num = (x: number, dp: number): string => x.toFixed(dp);
@@ -190,15 +212,46 @@ const csvRow = (
     num(r.exhaustRate, 4),
     String(Math.round(r.p50DurationMs)),
     num(r.costPerBatteryUsd, 6),
+    r.cacheReadRate === null ? '' : num(r.cacheReadRate, 4),
   ].join(',');
 
-// Append one row per model. Writes the header only when the file is new, so the
-// CSV accumulates every run forever — filter on run_ts downstream for a batch.
+// Re-map a historical row (parsed by its OLD header) onto the current column set,
+// filling '' for columns the old schema lacked. Keeps the file well-formed when a
+// column is added — old runs get a blank cell, never a width mismatch.
+export const remapRow = (oldHeader: string, row: string): string => {
+  const oldCols = oldHeader.split(',');
+  const cells = row.split(',');
+  const byName = new Map(oldCols.map((c, i) => [c, cells[i] ?? '']));
+  return CSV_COLUMNS.map((c) => byName.get(c) ?? '').join(',');
+};
+
+// Append one row per model. The CSV accumulates every run forever (filter on
+// run_ts downstream for a batch). When a column was added since the file was last
+// written, migrate the historical rows onto the new header first so every row has
+// the same width — no run is lost; old runs just get a blank cell for the new one.
 const appendCsv = (prov: Provenance): void => {
   mkdirSync(dirname(CSV_PATH), { recursive: true });
+  const header = CSV_COLUMNS.join(',');
   const body = `${prov.rows.map((r) => csvRow(r, prov)).join('\n')}\n`;
-  if (existsSync(CSV_PATH)) appendFileSync(CSV_PATH, body);
-  else writeFileSync(CSV_PATH, `${CSV_COLUMNS.join(',')}\n${body}`);
+  if (!existsSync(CSV_PATH)) {
+    writeFileSync(CSV_PATH, `${header}\n${body}`);
+  } else {
+    const lines = readFileSync(CSV_PATH, 'utf-8').split('\n');
+    const oldHeader = lines[0] ?? '';
+    if (oldHeader === header) {
+      appendFileSync(CSV_PATH, body);
+    } else {
+      const migrated = lines
+        .slice(1)
+        .filter((l) => l.length > 0)
+        .map((l) => remapRow(oldHeader, l));
+      const prefix = migrated.length > 0 ? `${migrated.join('\n')}\n` : '';
+      writeFileSync(CSV_PATH, `${header}\n${prefix}${body}`);
+      process.stderr.write(
+        `Migrated CSV to ${CSV_COLUMNS.length} columns; ${migrated.length} historical row(s) repadded\n`,
+      );
+    }
+  }
   process.stderr.write(`Appended ${prov.rows.length} row(s) to ${CSV_PATH}\n`);
 };
 
@@ -251,6 +304,9 @@ const main = async (): Promise<void> => {
       (a, s) => a + (get(s.name)?.costAvgUsd ?? 0) * (get(s.name)?.runs ?? 0),
       0,
     );
+    const totalCacheRead = SUITES.reduce((a, s) => a + (get(s.name)?.cacheReadSum ?? 0), 0);
+    const totalCacheWrite = SUITES.reduce((a, s) => a + (get(s.name)?.cacheWriteSum ?? 0), 0);
+    const totalPrompt = SUITES.reduce((a, s) => a + (get(s.name)?.promptTokenSum ?? 0), 0);
     rows.push({
       model,
       suites,
@@ -260,6 +316,7 @@ const main = async (): Promise<void> => {
       stability: multiSum > 0 ? stableSum / multiSum : null,
       p50DurationMs: p50(Object.values(suites).map((sr) => sr.p50DurationMs)),
       costPerBatteryUsd: costPerBattery,
+      cacheReadRate: cacheReadRate(totalCacheRead, totalCacheWrite, totalPrompt),
     });
   }
   rows.sort((a, b) => b.composite - a.composite);

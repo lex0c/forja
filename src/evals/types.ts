@@ -1,5 +1,6 @@
 import type { CompactionStrategy, ExitReason, HarnessResult } from '../harness/index.ts';
 import type { ApprovalPosture } from '../permissions/index.ts';
+import type { UsageInfo } from '../providers/index.ts';
 
 // One declarative expectation evaluated against a finished run.
 // Each shape carries exactly the data needed for its assertion;
@@ -143,6 +144,10 @@ export interface EvalCaseResult {
   // When false, costUsd is a lower bound — surfaced so summary
   // stats can flag inflight underreporting.
   usageComplete: boolean;
+  // Aggregated token usage from the harness result (input / output / cache_read /
+  // cache_creation). Undefined when the run produced no result (setup failure).
+  // Lets the ranking derive a cache-hit rate when the provider caches.
+  usage?: UsageInfo;
   expectations: ExpectationOutcome[];
   // Top-level failure reason when the case never reached the
   // expect phase (fixture missing, runAgent threw, budget cap).
