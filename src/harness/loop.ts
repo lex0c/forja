@@ -2509,7 +2509,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // totals via closure.
       // `force` runs the compaction even at steps >= maxSteps — for the exhaustion
       // synthesis, which builds its request from the live history AT the cap and
-      // must fit the window (the normal top-of-loop call skips there).
+      // must fit the window (the normal top-of-loop call skips there). It also
+      // estimates the prompt WITHOUT tools, matching that synthesis request (which
+      // sends none): a history that fits tool-less must not trigger a paid compaction
+      // just because the tool schemas would have pushed the normal request over.
       const maybeCompact = async (force = false) => {
         // Skip when aborted / window unknown — don't burn a billed summary call
         // whose result the loop is about to discard. At steps >= maxSteps the loop
@@ -2524,7 +2527,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         }
         const promptTokens = estimatePromptTokens([...ctx.getMessages()], {
           ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
-          ...(tools.length > 0 ? { tools } : {}),
+          // force ⇒ the tool-less synthesis request; don't count tool schemas the
+          // synthesis won't send (else a tool-less-fitting history compacts needlessly).
+          ...(!force && tools.length > 0 ? { tools } : {}),
           countReasoning: config.provider.replaysReasoning === true,
         });
         const contextWindow = config.provider.capabilities.context_window;
@@ -2847,6 +2852,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           reqEffort ?? null,
         );
         emitCostUpdate(turnCostUsd);
+        // usage_persisted is the display cue (fires for EVERY settled response);
+        // emitCostUpdate skips zero deltas, so a $0 local model would otherwise leave
+        // the REPL/subagent footer stale for the synthesized turn until a later boundary.
+        safeEmit(config.onEvent, { type: 'usage_persisted' });
         // The synthesis cost may have crossed the cap — caller finishes maxCostUsd.
         return costCapDetailIfExceeded();
       };

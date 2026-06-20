@@ -330,6 +330,72 @@ describe('runAgent', () => {
     expect(result.status).toBe('exhausted');
   });
 
+  test('synthesis turn emits usage_persisted so the footer refreshes even at $0', async () => {
+    // emitCostUpdate is silent for zero-cost turns; usage_persisted is the display
+    // cue the REPL/subagent footer keys off. The synthesis must emit it like a
+    // normal turn — count is 2 (the one in-budget turn + the synthesis).
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const { config } = buildConfig(
+      [
+        { tool_uses: [{ id: 'tu1', name: 'echo', input: { msg: '1' } }], stop_reason: 'tool_use' },
+        { text: 'FINAL', stop_reason: 'end_turn' },
+      ],
+      { budget: { maxSteps: 1 } },
+    );
+    await runAgent({ ...config, onEvent: (e) => events.push(e) });
+    expect(events.filter((e) => e.type === 'usage_persisted').length).toBe(2);
+  });
+
+  test('synthesis pre-compaction ignores tool schemas (tool-less-fitting history not compacted)', async () => {
+    // At the synthesis point history+tools is over the threshold but history ALONE
+    // is under. The synthesis sends no tools, so the forced pre-synthesis compaction
+    // must NOT fire (it would bill a needless summary, and pull the synthesis's
+    // script entry as the summary).
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const fatTool: Tool = {
+      name: 'fat',
+      description: 'returns sizable text',
+      inputSchema: { type: 'object' },
+      metadata: { category: 'misc', writes: false, idempotent: true },
+      async execute() {
+        return 'r'.repeat(1520);
+      },
+    };
+    const bigSchemaTool: Tool = {
+      name: 'big_schema',
+      description: 'd'.repeat(2000),
+      inputSchema: { type: 'object' },
+      metadata: { category: 'misc', writes: false, idempotent: true },
+      async execute() {
+        return 'ok';
+      },
+    };
+    const { config } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 'f1', name: 'fat', input: {} }],
+          stop_reason: 'tool_use',
+          usage: { input: 20, output: 5 },
+        },
+        { text: 'FINAL: synthesized.', stop_reason: 'end_turn' },
+      ],
+      {
+        extraTools: [fatTool, bigSchemaTool],
+        capsOverride: { context_window: 1000 },
+        budget: {
+          compactionThreshold: 0.7,
+          compactionPreserveTail: 1,
+          maxToolErrors: 99,
+          maxSteps: 1,
+        },
+      },
+    );
+    const result = await runAgent({ ...config, onEvent: (e) => events.push(e) });
+    expect(result.reason).toBe('maxSteps');
+    expect(events.some((e) => e.type === 'compaction_started')).toBe(false);
+    expect(lastAssistantText(result)).toContain('FINAL: synthesized');
+  });
+
   test('an abort DURING the synthesis turn exits as aborted, not maxSteps', async () => {
     // Budget exhausts on bare tool_use, the synthesis turn fires, and the user
     // hits Ctrl+C mid-call. Abort must win over the maxSteps classification —
