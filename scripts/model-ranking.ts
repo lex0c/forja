@@ -99,10 +99,18 @@ const p50 = (xs: readonly number[]): number => {
   return s[Math.floor((s.length - 1) / 2)] ?? 0;
 };
 
-// A run that didn't finish cleanly — flailed to the step cap, was cut off, or
-// errored. High rate = unreliable in the loop, independent of pass/fail.
-const unfinished = (status: string): boolean =>
-  status === 'exhausted' || status === 'interrupted' || status === 'error';
+// A run that didn't finish cleanly — flailed to the step cap, was cut off,
+// errored, or never produced a harness result at all. A setup failure (missing
+// API key, bootstrap throw, early timeout) leaves status UNDEFINED + failure set
+// — the least reliable outcome of all, so it must count as unfinished, not read
+// as 0% because the status string didn't match. High rate = unreliable in the
+// loop, independent of pass/fail.
+export const unfinished = (r: EvalCaseResult): boolean =>
+  r.status === undefined ||
+  r.failure !== undefined ||
+  r.status === 'exhausted' ||
+  r.status === 'interrupted' ||
+  r.status === 'error';
 
 const runSuite = async (modelId: string, dir: string, repeat: number): Promise<SuiteResult> => {
   const cases = discoverCases(resolve(dir)).map(loadEvalCase);
@@ -137,7 +145,7 @@ const runSuite = async (modelId: string, dir: string, repeat: number): Promise<S
     passed: s.passed,
     runs: all.length,
     stepsAvg: all.reduce((a, r) => a + r.steps, 0) / n,
-    exhaustRate: all.filter((r) => unfinished(r.status)).length / n,
+    exhaustRate: all.filter((r) => unfinished(r)).length / n,
     costAvgUsd: all.reduce((a, r) => a + r.costUsd, 0) / n,
     p50DurationMs: p50(all.map((r) => r.durationMs)),
     stableCases,
