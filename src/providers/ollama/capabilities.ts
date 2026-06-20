@@ -132,3 +132,30 @@ export const OLLAMA_CAPS: Record<string, ProviderCapabilities> = {
 };
 
 export const OLLAMA_MODEL_NAMES = Object.keys(OLLAMA_CAPS);
+
+// Curated Ollama Cloud (ollama.com) tier. Kept SEPARATE from OLLAMA_CAPS (the
+// local tier, pinned at 11) because these are served remotely: seed-catalog.ts
+// attaches `base_url` + `api_key_env` + `num_ctx` (the real served window) to
+// each, which the local capability map can't express. context_window is the
+// model CAPACITY; `num_ctx` in the seed entry pins what the cloud actually
+// serves (a remote host has no local VRAM to clamp against).
+export const OLLAMA_CLOUD_CAPS: Record<string, ProviderCapabilities> = {
+  // GLM-5.2 — strong agentic coding over long trajectories; thinking-capable.
+  'glm-5.2': {
+    ...OLLAMA_THINKING_BASE,
+    context_window: K256,
+    output_max_tokens: 16_384,
+    recommended_max_tools_per_step: 6,
+    notes: ['Ollama Cloud; GLM-5.2; strong agentic coding (long trajectories); High Usage tier'],
+  },
+  // Qwen3-Coder 480B MoE — agentic coding; non-thinking.
+  'qwen3-coder:480b': {
+    ...OLLAMA_BASE,
+    context_window: K256,
+    output_max_tokens: 16_384,
+    recommended_max_tools_per_step: 6,
+    notes: ['Ollama Cloud; qwen3-coder 480B MoE; agentic coding'],
+  },
+};
+
+export const OLLAMA_CLOUD_MODEL_NAMES = Object.keys(OLLAMA_CLOUD_CAPS);

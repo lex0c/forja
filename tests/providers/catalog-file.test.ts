@@ -391,4 +391,16 @@ describe('seed catalog + serialization', () => {
       expect(r.entries[0]?.base_url).toBe('https://ollama.com');
     }
   });
+
+  test('seed ships the curated Ollama Cloud tier with base_url + api_key_env + num_ctx', () => {
+    const cloud = CANONICAL_MODEL_PROVIDERS.filter(
+      (e) => e.family === 'ollama' && e.base_url === 'https://ollama.com',
+    );
+    expect(cloud.map((e) => e.id).sort()).toEqual(['ollama/glm-5.2', 'ollama/qwen3-coder:480b']);
+    for (const e of cloud) {
+      expect(e.api_key_env).toBe('OLLAMA_API_KEY');
+      expect(e.num_ctx).toBe(131_072);
+      expect(e.capabilities.tools).toBe('native');
+    }
+  });
 });

@@ -15,7 +15,7 @@
 
 import { ANTHROPIC_CAPS } from './anthropic/capabilities.ts';
 import { GOOGLE_CAPS } from './google/capabilities.ts';
-import { OLLAMA_CAPS } from './ollama/capabilities.ts';
+import { OLLAMA_CAPS, OLLAMA_CLOUD_CAPS } from './ollama/capabilities.ts';
 import { OPENAI_CAPS } from './openai/capabilities.ts';
 import { OPENROUTER_CAPS } from './openrouter/capabilities.ts';
 import type { ModelProviderEntry, ProviderCapabilities, ProviderFamily } from './types.ts';
@@ -35,17 +35,34 @@ const fromCaps = (
     capabilities,
   }));
 
-// Order mirrors the historical registration order (anthropic, google,
-// ollama, openai) so the seeded file's diff is stable. Ollama carries
-// no `api_key_env` — local inference needs no key; remote/cloud Ollama
-// auth flows through FORJA_OLLAMA_HEADERS or a per-entry `base_url` the
-// operator adds. Google seeds `GOOGLE_API_KEY`; there is NO env fallback,
-// so an operator who instead uses GEMINI_API_KEY edits the entry's
+// Curated Ollama Cloud (ollama.com) tier. Unlike the LOCAL Ollama seed, these
+// carry `base_url` + `api_key_env` + `num_ctx` so a fresh install reaches the
+// cloud tier without manual catalog edits; `num_ctx` pins the real served
+// window (a remote host has no local VRAM to clamp). OLLAMA_API_KEY is required
+// at factory time (a clear "API key required" diagnostic fires if unset).
+const OLLAMA_CLOUD: ReadonlyArray<ModelProviderEntry> = Object.entries(OLLAMA_CLOUD_CAPS).map(
+  ([modelName, capabilities]): ModelProviderEntry => ({
+    id: `ollama/${modelName}`,
+    family: 'ollama',
+    model_name: modelName,
+    base_url: 'https://ollama.com',
+    api_key_env: 'OLLAMA_API_KEY',
+    num_ctx: 131_072,
+    capabilities,
+  }),
+);
+
+// Order mirrors the historical registration order (anthropic, google, ollama,
+// openai) so the seeded file's diff is stable. The LOCAL Ollama tier carries no
+// `api_key_env` (local inference needs no key); the CLOUD tier above DOES
+// (OLLAMA_API_KEY → bearer). Google seeds `GOOGLE_API_KEY`; there is NO env
+// fallback, so an operator who instead uses GEMINI_API_KEY edits the entry's
 // api_key_env to GEMINI_API_KEY (the file is the authoritative source).
 export const CANONICAL_MODEL_PROVIDERS: ReadonlyArray<ModelProviderEntry> = [
   ...fromCaps('anthropic', ANTHROPIC_CAPS, 'ANTHROPIC_API_KEY'),
   ...fromCaps('google', GOOGLE_CAPS, 'GOOGLE_API_KEY'),
   ...fromCaps('ollama', OLLAMA_CAPS),
+  ...OLLAMA_CLOUD,
   ...fromCaps('openai', OPENAI_CAPS, 'OPENAI_API_KEY'),
   // OpenRouter carries no env fallback either — the catalog's api_key_env
   // (OPENROUTER_API_KEY) is the sole key source, mapped to a bearer header.
