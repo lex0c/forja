@@ -19,6 +19,10 @@ export type EvalExpectation =
   | { kind: 'file_exists'; path: string }
   | { kind: 'file_not_exists'; path: string }
   | { kind: 'file_contains'; path: string; pattern: string }
+  // The negation: assert an edit REMOVED text (the old content is gone), not just
+  // that new content is present. The file must exist (fails if missing), like
+  // file_contains — so a rename/refactor case can prove no stale name lingers.
+  | { kind: 'file_not_contains'; path: string; pattern: string }
   | { kind: 'status'; status: HarnessResult['status'] }
   | { kind: 'exit_reason'; reason: ExitReason }
   | { kind: 'output_contains'; pattern: string }

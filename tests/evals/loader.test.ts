@@ -33,6 +33,9 @@ expect:
   - file_contains:
       path: c.ts
       pattern: export
+  - file_not_contains:
+      path: c.ts
+      pattern: removed
   - status: done
   - exit_reason: maxSteps
   - output_contains: hello
@@ -45,6 +48,7 @@ expect:
       'file_exists',
       'file_not_exists',
       'file_contains',
+      'file_not_contains',
       'status',
       'exit_reason',
       'output_contains',

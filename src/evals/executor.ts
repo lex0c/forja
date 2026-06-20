@@ -378,6 +378,34 @@ const evaluateExpectations = (
               }),
         };
       }
+      case 'file_not_contains': {
+        const target = resolve(cwd, expectation.path);
+        if (!containsPath(cwd, target)) {
+          return {
+            expectation,
+            passed: false,
+            detail: `file '${expectation.path}' escapes the eval workspace`,
+          };
+        }
+        if (!existsSync(target)) {
+          return {
+            expectation,
+            passed: false,
+            detail: `file '${expectation.path}' does not exist`,
+          };
+        }
+        const body = readFileSync(target, 'utf8');
+        const passed = !body.includes(expectation.pattern);
+        return {
+          expectation,
+          passed,
+          ...(passed
+            ? {}
+            : {
+                detail: `file '${expectation.path}' still contains pattern '${expectation.pattern}'`,
+              }),
+        };
+      }
       case 'status': {
         if (result === undefined) {
           return { expectation, passed: false, detail: 'run did not produce a result' };

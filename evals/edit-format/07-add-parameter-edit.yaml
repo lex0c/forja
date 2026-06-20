@@ -1,0 +1,29 @@
+name: edit-format add a parameter and use it via edit_file
+prompt: |
+  In `src/greet.ts`, add a second parameter `greeting: string` to the `greet`
+  function and use it so the function returns `${greeting}, ${name}!` instead of
+  the hard-coded "Hello". Use edit_file. Reply "done" when applied.
+setup:
+  gitInit: true
+  files:
+    src/greet.ts: |
+      export function greet(name: string): string {
+        return `Hello, ${name}!`;
+      }
+expect:
+  - tool_called: edit_file
+  - tool_not_called: write_file
+  # Two coordinated changes in one function: the signature and the body.
+  - file_contains:
+      path: src/greet.ts
+      pattern: "greeting: string"
+  - file_contains:
+      path: src/greet.ts
+      pattern: "${greeting}, ${name}!"
+  - file_not_contains:
+      path: src/greet.ts
+      pattern: "Hello"
+  - status: done
+budget:
+  maxSteps: 7
+  maxCostUsd: 0.25

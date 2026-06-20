@@ -1,0 +1,32 @@
+name: edit-format locate-then-edit (ground the edit in real content) via edit_file
+prompt: |
+  `src/config.ts` declares a request timeout. Change that timeout to 5000 — find
+  its current key and value in the file rather than guessing them. Leave the
+  other settings unchanged. Use edit_file. Reply "done" when applied.
+setup:
+  gitInit: true
+  files:
+    src/config.ts: |
+      export const config = {
+        retries: 3,
+        timeoutMs: 1200,
+        verbose: false,
+      };
+expect:
+  - tool_called: edit_file
+  - tool_not_called: write_file
+  - file_contains:
+      path: src/config.ts
+      pattern: "timeoutMs: 5000,"
+  # The old value must be gone, and the model had to read the file to learn the
+  # exact key (timeoutMs, not "timeout") — a guessed edit fails this pair.
+  - file_not_contains:
+      path: src/config.ts
+      pattern: "timeoutMs: 1200,"
+  - file_contains:
+      path: src/config.ts
+      pattern: "retries: 3,"
+  - status: done
+budget:
+  maxSteps: 7
+  maxCostUsd: 0.25
