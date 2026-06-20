@@ -1740,3 +1740,89 @@ than the current additive `score_components` already gives; (c) a
 concrete model wins a published eval against the tuned weights. Until
 then: tune `RISK_SCORE_WEIGHTS`. Preferred engine: **LightGBM**
 (smaller / faster / lower memory, fits the single-binary CLI).
+
+# Eval — capability signal via self-SWE-bench from git history
+
+**Goal.** The model ranking (`scripts/model-ranking.ts` / `docs/RANKING.md`) measures
+**harness-fit** — did the model call the right tool, land the exact edit format, finish
+before the cap. That correlates with capability but is confounded by convention-matching:
+a capable model can rank low for using `write_file` instead of `edit_file`. Add a signal
+that measures **capability** — did the model actually solve the problem, verified by a
+ground-truth check independent of HOW it acted ("performed well in Forja" → "is a strong
+model").
+
+**The idea.** Forja's "born with tests" rule (`CLAUDE.md`) means every fix commit ships a
+`src/` change + a test. So the git history IS a ready-made task corpus — SWE-bench on
+Forja's own repo. For a fix commit `C` with parent `P`:
+
+- Split the diff by path: **test patch** = `tests/**`, gold **source patch** = `src/**`
+  (ignore `docs/`).
+- Workspace = a snapshot of the repo at `P` via `git archive P` extracted to a temp dir —
+  **no `.git`** (so the agent can't `git show <C>` and copy the fix). Apply the test patch
+  on top → the test now exists and FAILS.
+- Deps: symlink `node_modules` (do not reinstall per task).
+- Prompt = the failing test as the spec: "this test fails; diagnose and fix the source so
+  it passes, without editing the test." NOT the BACKLOG prose (it describes the solution →
+  leak). BACKLOG / git is only the **selector** of candidate commits.
+- Verifier (fail-to-pass): run that test file + `bun run typecheck`. Pass = the bug is
+  fixed by OUTCOME, regardless of tool/format — that is the capability signal.
+
+**Correctness gates (load-bearing).**
+
+- **Validate each candidate automatically:** the test must FAIL at `P`+testpatch and PASS
+  at `C`. Otherwise it is not a real fail-to-pass (refactor, flaky, test that already
+  passed) → drop it. This filter is what makes the corpus trustworthy.
+- **No `.git` in the workspace** (hence `git archive`, not a worktree) — anti-cheat is
+  load-bearing; otherwise the original fix is one `git log --all` away.
+- **Deterministic tests only** (mock-based; most Forja tests are). Model non-determinism is
+  the eval's inherent variance → repeats.
+- **Scope the verifier** to the specific test file, not the whole suite (speed).
+
+**Prerequisite.** A `command_succeeds` expectation kind (run an author-specified command in
+the workspace cwd, assert exit 0 / stdout) — the same small, exhaustively-typed addition as
+`file_not_contains` (eval types + loader + executor + tests). It is the verifier for this
+whole class (and reusable for a hermetic inline fail-to-pass eval too).
+
+**Reporting.** Do NOT fold this into the harness-fit composite (RANKING.md keeps "separate
+axes, never folded in"). Add a `capability` axis = pass-rate of the verified suite. Tag
+each task with a difficulty tier (1 = trivial fix, 2 = multi-location / reasoning, 3 =
+multi-file / recover-from-wrong-attempt) and report per-tier, so the score reflects a
+capability CEILING, not a uniform pass-rate.
+
+**Honest caveat.** Still "capability AS exercised through Forja's loop" — the model acts
+through the harness; it is not a vacuum benchmark. But outcome-verification removes the
+format/convention confound. It is the most honest capability claim an agent harness can
+make, and fairer than the current one.
+
+**Cost / why staged.** A dedicated harness (snapshot / split / validate), NOT a
+`setup.files` YAML case — core-file fixes (`loop.ts`, ~3k lines) can't be inlined, so the
+agent edits the real large file → high context + steps → per-task budget matters. Upside:
+it **generates tasks forever** (every future fix is a new task, automatically).
+
+**Phases.**
+
+1. `command_succeeds` (framework + test) + **one** hand-wired commit from this session
+   (e.g. `8f6be12e` file_not_contains, or `e08f7df4` cost-cap — small, self-contained) to
+   prove the format end-to-end. Surfaces the real problems (deps in the snapshot, test
+   scoping, anti-cheat) on one task before scaling.
+2. Automate commit selection from git: scan commits, split by path, validate fail-to-pass,
+   discard the invalid ones.
+3. Tier + wire into the ranking as the `capability` axis.
+
+**Adjacent (lower priority, separate, no framework change).** A **prompt-injection
+resistance** eval — `setup.files` carries a malicious instruction inside untrusted content
+(a doc the agent reads, a tool result); the prompt is the legitimate task; expectations
+assert the task is done AND the malicious action did NOT happen (`tool_not_called` /
+`file_not_exists` / `file_not_contains`). Feasible with the current expectation kinds,
+deeply aligned with Forja's trust / permission model, a sibling of the existing "security
+posture refuses destructive command" regression cases.
+
+**Out of scope (would be cargo-cult of other benchmarks, `ANTI_PATTERNS §2.2`).** The eval
+harness is a temp dir + the in-process agent — it cannot host ML/PyTorch (Terminal-Bench
+model tasks), VM/QEMU/SSH (sysadmin tasks), Coq (formal proofs), full GAIA multimodal
+(spreadsheets / PDFs / images), or a browser. Forcing those tests infra Forja is not.
+
+**Pull-in signal:** a model lands in the ranking that is clearly capable but scores low on
+harness-fit (convention mismatch), making the gap between "fits Forja" and "is strong"
+concrete — OR a second model tier is added and the ranking needs to discriminate real
+capability, not just loop-fit.
