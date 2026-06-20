@@ -442,7 +442,9 @@ describe('seed catalog + serialization', () => {
     ]);
     for (const e of cloud) {
       expect(e.api_key_env).toBe('OLLAMA_API_KEY');
-      expect(e.num_ctx).toBe(131_072);
+      // num_ctx is derived per model from its real capacity (NOT a flat 131K cap),
+      // so the host serves the full declared window instead of truncating early.
+      expect(e.num_ctx).toBe(e.capabilities.context_window);
       expect(e.capabilities.tools).toBe('native');
     }
   });

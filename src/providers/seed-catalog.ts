@@ -37,9 +37,11 @@ const fromCaps = (
 
 // Curated Ollama Cloud (ollama.com) tier. Unlike the LOCAL Ollama seed, these
 // carry `base_url` + `api_key_env` + `num_ctx` so a fresh install reaches the
-// cloud tier without manual catalog edits; `num_ctx` pins the real served
-// window (a remote host has no local VRAM to clamp). OLLAMA_API_KEY is required
-// at factory time (a clear "API key required" diagnostic fires if unset).
+// cloud tier without manual catalog edits. `num_ctx` is derived PER MODEL from
+// its own `context_window` (a remote host has no local VRAM to clamp, so it
+// serves the full declared window) — NOT a flat value that truncates the
+// larger-context models early. OLLAMA_API_KEY is required at factory time (a
+// clear "API key required" diagnostic fires if unset).
 const OLLAMA_CLOUD: ReadonlyArray<ModelProviderEntry> = Object.entries(OLLAMA_CLOUD_CAPS).map(
   ([modelName, capabilities]): ModelProviderEntry => ({
     id: `ollama/${modelName}`,
@@ -47,7 +49,7 @@ const OLLAMA_CLOUD: ReadonlyArray<ModelProviderEntry> = Object.entries(OLLAMA_CL
     model_name: modelName,
     base_url: 'https://ollama.com',
     api_key_env: 'OLLAMA_API_KEY',
-    num_ctx: 131_072,
+    num_ctx: capabilities.context_window,
     capabilities,
   }),
 );

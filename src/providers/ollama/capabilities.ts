@@ -104,13 +104,16 @@ export const OLLAMA_CAPS: Record<string, ProviderCapabilities> = {
 export const OLLAMA_MODEL_NAMES = Object.keys(OLLAMA_CAPS);
 
 // Curated Ollama Cloud (ollama.com) tier. Kept SEPARATE from OLLAMA_CAPS (the
-// local tier, pinned at 11) because these are served remotely: seed-catalog.ts
-// attaches `base_url` + `api_key_env` + `num_ctx` (the real served window) to
-// each, which the local capability map can't express. context_window is the
-// model CAPACITY; `num_ctx` in the seed entry pins what the cloud actually
-// serves (a remote host has no local VRAM to clamp against).
+// local tier) because these are served remotely: seed-catalog.ts attaches
+// `base_url` + `api_key_env` + `num_ctx` to each, which the local capability map
+// can't express. context_window is the model's CAPACITY; seed-catalog.ts derives
+// the served `num_ctx` from it PER MODEL (a remote host has no local VRAM to
+// clamp) — NOT a flat value that truncates the larger-context models early.
 export const OLLAMA_CLOUD_CAPS: Record<string, ProviderCapabilities> = {
   // GLM-5.2 — strong agentic coding over long trajectories; thinking-capable.
+  // The host serves up to 1M tokens, but the served window is capped at 256K here
+  // (a 1M KV cache is impractical and far past any coding session) — an operator
+  // can raise num_ctx in their own catalog to go higher.
   'glm-5.2': {
     ...OLLAMA_THINKING_BASE,
     context_window: K256,
@@ -134,10 +137,11 @@ export const OLLAMA_CLOUD_CAPS: Record<string, ProviderCapabilities> = {
     recommended_max_tools_per_step: 6,
     notes: ['Ollama Cloud; Qwen3-Coder-Next 80B MoE (3B active); fast agentic coding'],
   },
-  // Devstral 2 123B — Mistral, built for coding agents.
+  // Devstral 2 123B — Mistral, built for coding agents. Real capacity 256K
+  // (ollama.com /api/show), not the 128K the seed previously declared.
   'devstral-2:123b': {
     ...OLLAMA_BASE,
-    context_window: K128,
+    context_window: K256,
     output_max_tokens: 16_384,
     recommended_max_tools_per_step: 6,
     notes: ['Ollama Cloud; Devstral 2 123B; coding agents'],

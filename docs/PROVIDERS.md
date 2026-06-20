@@ -215,11 +215,15 @@ adapter maps to a bearer header automatically:
 
 ```json
 { "id": "ollama/gpt-oss:120b", "family": "ollama", "model_name": "gpt-oss:120b",
-  "base_url": "https://ollama.com", "api_key_env": "OLLAMA_API_KEY",
+  "base_url": "https://ollama.com", "api_key_env": "OLLAMA_API_KEY", "num_ctx": 131072,
   "capabilities": { "tools": "native", "cache": false, "vision": false, "streaming": true,
     "constrained": "json_mode", "context_window": 131072, "output_max_tokens": 16384,
     "cost_per_1k_input": 0, "cost_per_1k_output": 0, "notes": ["ollama cloud"] } }
 ```
+
+`num_ctx` is what makes a cloud entry serve its full window — without it the adapter
+caps the served context at 32K (the local-VRAM default) and truncates long sessions.
+Set it to the model's real window (here 128K). The seeded cloud tier sets it for you.
 
 A non-localhost host sends your context off the machine — treat it like any cloud
 provider.
