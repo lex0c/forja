@@ -26,7 +26,6 @@ import { createDegradedBannerEmitter } from '../permissions/degraded-banner.ts';
 import { addUsage, computeCost, emptyUsage } from '../providers/cost.ts';
 import type {
   GenerateRequest,
-  ProviderMessage,
   ProviderToolDef,
   ProviderToolResultBlock,
 } from '../providers/index.ts';
@@ -80,6 +79,7 @@ import {
   relevanceVerbatimBudgetBytes,
 } from './compaction.ts';
 import { resolveProviderEffort } from './effort.ts';
+import { synthesizeOnExhaustion } from './exhaustion-synthesis.ts';
 import { invokeTool } from './invoke-tool.ts';
 import { MAX_RESUME_MESSAGES } from './resume.ts';
 import { DEFAULT_RETRY, generateWithRetry } from './retry.ts';
@@ -2730,134 +2730,35 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         return costCapDetailIfExceeded();
       };
 
-      // Did the run end on a SETTLED text answer — the LAST message an assistant
-      // carrying non-empty text, with nothing pending after it? Then the synthesis
-      // below is a no-op. Crucially this inspects the LAST message, NOT the last
-      // assistant: a `text + tool_use` turn whose tool_results were appended AFTER
-      // it is NOT settled — the model emitted a preamble ("I'll inspect…") and never
-      // incorporated the tool output, so the run must still synthesize. Walking back
-      // past trailing tool_results would mistake that preamble for the answer.
-      const endsWithSettledAnswer = (): boolean => {
-        if (ctx === undefined) return true;
-        const msgs = ctx.getMessages();
-        const last = msgs[msgs.length - 1];
-        if (last?.role !== 'assistant') return false; // trailing tool_results ⇒ unconsumed
-        const c = last.content;
-        if (typeof c === 'string') return c.trim().length > 0;
-        return c.some((b) => b.type === 'text' && b.text.trim().length > 0);
-      };
-
-      // Final synthesis turn on max_steps exhaustion (STATE_MACHINE.md §2.2 /
-      // ORCHESTRATION.md §8.2). A run that spent its whole step budget on tool
-      // calls would otherwise return an EMPTY output — the report was always
-      // going to be the last action, which never came. So before transitioning
-      // to `exhausted`, make ONE tool-less provider call ("budget's up, write
-      // your answer now") and persist it as the closing assistant turn. This is
-      // the LAST action of `running` (part of the → exhausted transition), not a
-      // return from a terminal state. RETURNS the cost-cap overage (or null): a
-      // hard maxCostUsd breach — already over, or crossed by the compaction /
-      // synthesis below — must surface its own reason + diagnostics, so the caller
-      // finishes maxCostUsd instead of maxSteps. No-op on a settled answer;
-      // best-effort — a failed synthesis still proceeds (with cost recovered).
-      const synthesizeOnExhaustion = async (): Promise<string | null> => {
+      // Pre-terminal synthesis turn (STATE_MACHINE.md §2.2 / ORCHESTRATION.md
+      // §8.2): a run that spent its whole step budget on tool calls would
+      // otherwise return EMPTY output. `synthesizeOnExhaustion` — extracted to
+      // exhaustion-synthesis.ts so its decision + orchestration are unit-testable
+      // in isolation — makes ONE tool-less provider call before the → exhausted
+      // transition and RETURNS the cost-cap overage (or null) so the caller can
+      // finish maxCostUsd vs maxSteps. The loop owns the mutable run totals;
+      // `recordUsage` / `markUsageIncomplete` are the single write seam, and the
+      // cost-cap / compaction closures pass straight through.
+      const runSynthesis = async (): Promise<string | null> => {
         if (ctx === undefined) return null;
-        if (endsWithSettledAnswer()) return null;
-        const preOverage = costCapDetailIfExceeded();
-        if (preOverage !== null) return preOverage;
-        // Compact/elide first: a read-heavy run's last tool_results can push the
-        // history past the window, and the top-of-loop maybeCompact() is bypassed
-        // here (it skips at steps >= maxSteps), so an un-compacted synthesis request
-        // would 400. Force it for this transition, then re-check the cost cap — the
-        // summary call can itself cross it.
-        await maybeCompact(true);
-        const compactOverage = costCapDetailIfExceeded();
-        if (compactOverage !== null) return compactOverage;
-        const synthMessages: ProviderMessage[] = [...ctx.getMessages()];
-        const directive =
-          'Your step budget is exhausted — you may not call any more tools. Write your final answer or report NOW using only what you have already gathered, and state explicitly what you did not get to check.';
-        // Append the directive to the last user message (alternation-safe;
-        // ephemeral — only the assistant synthesis below is persisted).
-        const last = synthMessages[synthMessages.length - 1];
-        if (last?.role === 'user') {
-          synthMessages[synthMessages.length - 1] =
-            typeof last.content === 'string'
-              ? { role: 'user', content: `${last.content}\n\n${directive}` }
-              : { role: 'user', content: [...last.content, { type: 'text', text: directive }] };
-        } else {
-          synthMessages.push({ role: 'user', content: directive });
-        }
-        const reqEffort = resolveProviderEffort(config);
-        const req: GenerateRequest = {
-          model: config.provider.id,
-          messages: synthMessages,
-          max_tokens: resolveMaxOutputTokens(budget, config.provider.capabilities),
-          ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
-          ...(config.systemSegments !== undefined ? { systemSegments: config.systemSegments } : {}),
-          // Mirror the normal turn's sampling/determinism axes so the synthesis
-          // isn't silently sampled differently — `seed_in_eval` in particular
-          // keeps eval replay reproducible.
-          ...(config.temperature !== undefined ? { temperature: config.temperature } : {}),
-          ...(config.topP !== undefined ? { top_p: config.topP } : {}),
-          ...(config.thinkingBudget !== undefined
-            ? { thinking_budget: config.thinkingBudget }
-            : {}),
-          // NO tools: the load-bearing difference — the model can only
-          // synthesize, never consume more budget or recurse.
-          ...(reqEffort !== undefined ? { effort: reqEffort } : {}),
-          ...(config.seedInEval !== undefined ? { seed_in_eval: config.seedInEval } : {}),
-        };
-        let collected: Awaited<ReturnType<typeof collectStep>>;
-        try {
-          collected = await collectStep(
-            abortableIterable(
-              stallWatchdog(
-                generateWithRetry(config.provider, req, DEFAULT_RETRY),
-                budget.maxStepStallMs,
-              ),
-              signal,
-            ),
-            (ev) => safeEmit(config.onEvent, { type: 'provider_event', event: ev }),
-          );
-        } catch (e) {
-          // A failed synthesis turn must never mask the exhaustion result.
-          // Still recover whatever the provider already billed — it charges
-          // input tokens the moment the request is accepted — mirroring the
-          // normal turn's CollectStepError recovery so the cost isn't lost.
-          usageComplete = false;
-          if (e instanceof CollectStepError && e.partial.usageSeen) {
-            const partialCost = computeCost(config.provider.capabilities, e.partial.usage);
-            totalUsage = addUsage(totalUsage, e.partial.usage);
-            totalCostUsd += partialCost;
-            emitCostUpdate(partialCost);
-          }
-          // The recovered partial cost above may have crossed the cap.
-          return costCapDetailIfExceeded();
-        }
-        const assistantContent = buildAssistantContent(collected);
-        const turnCostUsd = computeCost(config.provider.capabilities, collected.usage);
-        totalUsage = addUsage(totalUsage, collected.usage);
-        totalCostUsd += turnCostUsd;
-        if (!collected.usageSeen) usageComplete = false;
-        ctx.appendAssistant(
-          assistantContent,
-          {
-            usageSeen: collected.usageSeen,
-            tokensIn: collected.usage.input,
-            tokensOut: collected.usage.output,
-            cacheRead: collected.usage.cache_read,
-            cacheCreation: collected.usage.cache_creation,
-            costUsd: turnCostUsd,
+        return synthesizeOnExhaustion({
+          ctx,
+          config,
+          budget,
+          signal,
+          costCapDetailIfExceeded,
+          maybeCompact,
+          recordUsage: (usage, cost, usageSeen) => {
+            totalUsage = addUsage(totalUsage, usage);
+            totalCostUsd += cost;
+            if (!usageSeen) usageComplete = false;
           },
-          config.systemPromptHash ?? null,
-          reqEffort ?? null,
-        );
-        emitCostUpdate(turnCostUsd);
-        // usage_persisted is the display cue (fires for EVERY settled response);
-        // emitCostUpdate skips zero deltas, so a $0 local model would otherwise leave
-        // the REPL/subagent footer stale for the synthesized turn until a later boundary.
-        safeEmit(config.onEvent, { type: 'usage_persisted' });
-        // The synthesis cost may have crossed the cap — caller finishes maxCostUsd.
-        return costCapDetailIfExceeded();
+          markUsageIncomplete: () => {
+            usageComplete = false;
+          },
+          emit: (event) => safeEmit(config.onEvent, event),
+          emitCostUpdate,
+        });
       };
 
       while (true) {
@@ -2879,7 +2780,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         if (steps >= budget.maxSteps) {
           // Pre-terminal synthesis turn (STATE_MACHINE.md §2.2): give the run
           // a chance to write its answer before the budget closes it out.
-          const synthCostOverage = await synthesizeOnExhaustion();
+          const synthCostOverage = await runSynthesis();
           // A Ctrl+C / wall-clock timeout DURING that best-effort turn is
           // swallowed by its catch; honor it here before classifying as
           // exhaustion — abort takes precedence over the budget exit, matching
