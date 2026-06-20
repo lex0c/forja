@@ -285,6 +285,7 @@ Estado transiente — usuário cancelou e agente está em cleanup (matando subpr
 
 - `[done*]` — fim normal. `sessions.ended_at` setado.
 - `[exhausted*]` — budget atingido. Estado preservado para review/resume com novo budget.
+  - **Synthesis turn em `max_steps`:** antes de entrar no estado, se o limite atingido foi `max_steps` e o último turno NÃO emitiu texto não-vazio, o harness executa um único provider call final SEM tools ("o budget acabou; escreva agora sua resposta/relatório final com o que tem") cujo texto vira o output da sessão. Garante que um subagent que gastou todo o budget em tool calls (ex.: um audit que só leu arquivos) retorne uma síntese em vez de output vazio, em vez de descartar o trabalho. É a ÚLTIMA ação do `running` (parte da transição `→ exhausted`), não um retorno de um estado terminal — a invariante "estados terminais não voltam" (§0, item 4) se mantém. Pulado quando o último turno já tem texto (nada a sintetizar) ou quando `max_cost_usd` também estourou (sem budget pro call). O turno é contabilizado em custo/usage e auditado como step normal. Comportamento operacional em `ORCHESTRATION.md §8.2`.
 - `[error_fatal*]` — erro irrecoverable. Logs preservados; sessão não é resumível com mesmo state.
 
 ### 2.3 Goal stack

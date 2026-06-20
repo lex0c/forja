@@ -26,6 +26,7 @@ import { createDegradedBannerEmitter } from '../permissions/degraded-banner.ts';
 import { addUsage, computeCost, emptyUsage } from '../providers/cost.ts';
 import type {
   GenerateRequest,
+  ProviderMessage,
   ProviderToolDef,
   ProviderToolResultBlock,
 } from '../providers/index.ts';
@@ -2720,6 +2721,100 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         return costCapDetailIfExceeded();
       };
 
+      // Does the last assistant turn already carry non-empty text? If so the
+      // run has an answer to return and the exhaustion synthesis below is a
+      // no-op — only a run that ended every step on a bare tool_use (e.g. an
+      // audit that read files until the cap) has nothing to hand back.
+      const lastAssistantHasText = (): boolean => {
+        if (ctx === undefined) return true;
+        const msgs = ctx.getMessages();
+        for (let i = msgs.length - 1; i >= 0; i -= 1) {
+          const m = msgs[i];
+          if (m?.role !== 'assistant') continue;
+          const c = m.content;
+          if (typeof c === 'string') return c.trim().length > 0;
+          return c.some((b) => b.type === 'text' && b.text.trim().length > 0);
+        }
+        return false;
+      };
+
+      // Final synthesis turn on max_steps exhaustion (STATE_MACHINE.md §2.2 /
+      // ORCHESTRATION.md §8.2). A run that spent its whole step budget on tool
+      // calls would otherwise return an EMPTY output — the report was always
+      // going to be the last action, which never came. So before transitioning
+      // to `exhausted`, make ONE tool-less provider call ("budget's up, write
+      // your answer now") and persist it as the closing assistant turn. This is
+      // the LAST action of `running` (part of the → exhausted transition), not a
+      // return from a terminal state. Gated: skipped when the last assistant
+      // already has text, or when the cost cap is also blown (no budget for the
+      // call). Best-effort — any failure just proceeds to finish('maxSteps').
+      const synthesizeOnExhaustion = async (): Promise<void> => {
+        if (ctx === undefined) return;
+        if (lastAssistantHasText()) return;
+        if (costCapDetailIfExceeded() !== null) return;
+        const synthMessages: ProviderMessage[] = [...ctx.getMessages()];
+        const directive =
+          'Your step budget is exhausted — you may not call any more tools. Write your final answer or report NOW using only what you have already gathered, and state explicitly what you did not get to check.';
+        // Append the directive to the last user message (alternation-safe;
+        // ephemeral — only the assistant synthesis below is persisted).
+        const last = synthMessages[synthMessages.length - 1];
+        if (last?.role === 'user') {
+          synthMessages[synthMessages.length - 1] =
+            typeof last.content === 'string'
+              ? { role: 'user', content: `${last.content}\n\n${directive}` }
+              : { role: 'user', content: [...last.content, { type: 'text', text: directive }] };
+        } else {
+          synthMessages.push({ role: 'user', content: directive });
+        }
+        const reqEffort = resolveProviderEffort(config);
+        const req: GenerateRequest = {
+          model: config.provider.id,
+          messages: synthMessages,
+          max_tokens: resolveMaxOutputTokens(budget, config.provider.capabilities),
+          ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
+          ...(config.systemSegments !== undefined ? { systemSegments: config.systemSegments } : {}),
+          // NO tools: the load-bearing difference — the model can only
+          // synthesize, never consume more budget or recurse.
+          ...(reqEffort !== undefined ? { effort: reqEffort } : {}),
+        };
+        let collected: Awaited<ReturnType<typeof collectStep>>;
+        try {
+          collected = await collectStep(
+            abortableIterable(
+              stallWatchdog(
+                generateWithRetry(config.provider, req, DEFAULT_RETRY),
+                budget.maxStepStallMs,
+              ),
+              signal,
+            ),
+            (ev) => safeEmit(config.onEvent, { type: 'provider_event', event: ev }),
+          );
+        } catch {
+          // A failed synthesis turn must never mask the exhaustion result.
+          usageComplete = false;
+          return;
+        }
+        const assistantContent = buildAssistantContent(collected);
+        const turnCostUsd = computeCost(config.provider.capabilities, collected.usage);
+        totalUsage = addUsage(totalUsage, collected.usage);
+        totalCostUsd += turnCostUsd;
+        if (!collected.usageSeen) usageComplete = false;
+        ctx.appendAssistant(
+          assistantContent,
+          {
+            usageSeen: collected.usageSeen,
+            tokensIn: collected.usage.input,
+            tokensOut: collected.usage.output,
+            cacheRead: collected.usage.cache_read,
+            cacheCreation: collected.usage.cache_creation,
+            costUsd: turnCostUsd,
+          },
+          config.systemPromptHash ?? null,
+          reqEffort ?? null,
+        );
+        emitCostUpdate(turnCostUsd);
+      };
+
       while (true) {
         if (signal.aborted) {
           return isWallClockTimeout()
@@ -2736,7 +2831,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         if (config.softStopSignal?.aborted) {
           return await finish('aborted', undefined, 'soft');
         }
-        if (steps >= budget.maxSteps) return await finish('maxSteps');
+        if (steps >= budget.maxSteps) {
+          // Pre-terminal synthesis turn (STATE_MACHINE.md §2.2): give the run
+          // a chance to write its answer before the budget closes it out.
+          await synthesizeOnExhaustion();
+          return await finish('maxSteps');
+        }
         // Cost cap pre-check. Critical on resume: a session whose
         // priorCostUsd already crossed budget.maxCostUsd would
         // otherwise issue one billed provider call before the

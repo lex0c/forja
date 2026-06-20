@@ -235,6 +235,67 @@ describe('runAgent', () => {
     expect(result.steps).toBe(3);
   });
 
+  // Concatenated text of the last assistant message — what a subagent hands
+  // back as its `output`. Empty when the run never wrote anything.
+  const lastAssistantText = (result: Awaited<ReturnType<typeof runAgent>>): string => {
+    const msgs = result.sessionContext?.getMessages() ?? [];
+    for (let i = msgs.length - 1; i >= 0; i -= 1) {
+      const m = msgs[i];
+      if (m?.role !== 'assistant') continue;
+      const c = m.content;
+      if (typeof c === 'string') return c;
+      return c.map((b) => (b.type === 'text' ? b.text : '')).join('');
+    }
+    return '';
+  };
+
+  test('maxSteps exhaustion runs a tool-less synthesis turn that yields a final answer', async () => {
+    // Three tool_use steps burn the budget with NO text written; the harness
+    // then makes ONE final tool-less call so the run hands back an answer
+    // instead of an empty output (the security-audit failure mode).
+    const { config, handle } = buildConfig(
+      [
+        { tool_uses: [{ id: 'tu1', name: 'echo', input: { msg: '1' } }], stop_reason: 'tool_use' },
+        { tool_uses: [{ id: 'tu2', name: 'echo', input: { msg: '2' } }], stop_reason: 'tool_use' },
+        { tool_uses: [{ id: 'tu3', name: 'echo', input: { msg: '3' } }], stop_reason: 'tool_use' },
+        { text: 'PARTIAL: checked A; did not check B.', stop_reason: 'end_turn' },
+      ],
+      { budget: { maxSteps: 3 } },
+    );
+    const result = await runAgent(config);
+    expect(result.status).toBe('exhausted');
+    expect(result.reason).toBe('maxSteps');
+    expect(result.steps).toBe(3); // the synthesis turn is not a budget step
+    // Exactly one extra provider call (the synthesis), and it carried NO tools.
+    expect(handle.requests).toHaveLength(4);
+    expect(handle.requests[3]?.tools).toBeUndefined();
+    // The closing assistant turn carries the synthesized text → non-empty output.
+    expect(lastAssistantText(result)).toContain('PARTIAL: checked A');
+  });
+
+  test('synthesis turn is skipped when the last in-budget step already has text', async () => {
+    // The last step already produced text, so there's nothing to synthesize —
+    // no extra provider call. The script has only 2 steps, so a stray synthesis
+    // call would throw 'mock script exhausted'; requests.length === 2 proves it
+    // never fired.
+    const { config, handle } = buildConfig(
+      [
+        { tool_uses: [{ id: 'tu1', name: 'echo', input: { msg: '1' } }], stop_reason: 'tool_use' },
+        {
+          text: 'here is my answer',
+          tool_uses: [{ id: 'tu2', name: 'echo', input: { msg: '2' } }],
+          stop_reason: 'tool_use',
+        },
+      ],
+      { budget: { maxSteps: 2 } },
+    );
+    const result = await runAgent(config);
+    expect(result.status).toBe('exhausted');
+    expect(result.reason).toBe('maxSteps');
+    expect(handle.requests).toHaveLength(2);
+    expect(lastAssistantText(result)).toContain('here is my answer');
+  });
+
   test('aborted signal: exits as interrupted with abortCause=hard', async () => {
     const ctrl = new AbortController();
     ctrl.abort();

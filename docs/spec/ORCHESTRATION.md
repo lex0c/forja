@@ -848,7 +848,7 @@ Tudo compete pelo budget remanescente.
 |---|---|
 | Hard cap (`max_cost_usd`) | step ativo recebe sinal de finalizar; novos spawns rejeitados; sessão eventualmente marca `exhausted` |
 | Soft warning (90%) | UI alerta; user pode `/budget extend $N` |
-| `max_steps` hit | sessão imediatamente `exhausted` no fim do step atual |
+| `max_steps` hit | **synthesis turn** final (1 provider call, SEM tools) produz o output com o que já foi coletado; então `exhausted` no fim do step. Pulado se o último turno já emitiu texto não-vazio, ou se `max_cost_usd` também estourou (sem budget pro call). Ver `STATE_MACHINE.md §2.2`. |
 | `max_wall_clock_ms` hit | `interrupt_signal` paralelo; cleanup |
 
 ### 8.3 Subagent vs pai
