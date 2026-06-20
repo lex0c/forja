@@ -101,13 +101,14 @@ const p50 = (xs: readonly number[]): number => {
 
 // A run that didn't finish cleanly — flailed to the step cap, was cut off,
 // errored, or never produced a harness result at all. A setup failure (missing
-// API key, bootstrap throw, early timeout) leaves status UNDEFINED + failure set
-// — the least reliable outcome of all, so it must count as unfinished, not read
-// as 0% because the status string didn't match. High rate = unreliable in the
-// loop, independent of pass/fail.
+// API key, bootstrap throw, early timeout) produces NO harness result, so its
+// status is UNDEFINED — that's the unfinished signal. Deliberately NOT keyed on
+// `failure`: a run that completed but merely overspent its declared maxCostUsd
+// keeps a real status (e.g. 'done') AND a "cost exceeded" failure — it reached
+// the expect phase, so it belongs to pass/cost, not reliability. High rate =
+// unreliable in the loop, independent of pass/fail.
 export const unfinished = (r: EvalCaseResult): boolean =>
   r.status === undefined ||
-  r.failure !== undefined ||
   r.status === 'exhausted' ||
   r.status === 'interrupted' ||
   r.status === 'error';
