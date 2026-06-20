@@ -79,7 +79,7 @@ import {
   relevanceVerbatimBudgetBytes,
 } from './compaction.ts';
 import { resolveProviderEffort } from './effort.ts';
-import { synthesizeOnExhaustion } from './exhaustion-synthesis.ts';
+import { type ExhaustionSynthesisResult, synthesizeOnExhaustion } from './exhaustion-synthesis.ts';
 import { invokeTool } from './invoke-tool.ts';
 import { MAX_RESUME_MESSAGES } from './resume.ts';
 import { DEFAULT_RETRY, generateWithRetry } from './retry.ts';
@@ -2739,8 +2739,8 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // finish maxCostUsd vs maxSteps. The loop owns the mutable run totals;
       // `recordUsage` / `markUsageIncomplete` are the single write seam, and the
       // cost-cap / compaction closures pass straight through.
-      const runSynthesis = async (): Promise<string | null> => {
-        if (ctx === undefined) return null;
+      const runSynthesis = async (): Promise<ExhaustionSynthesisResult> => {
+        if (ctx === undefined) return { costOverage: null, truncation: null };
         return synthesizeOnExhaustion({
           ctx,
           config,
@@ -2780,7 +2780,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         if (steps >= budget.maxSteps) {
           // Pre-terminal synthesis turn (STATE_MACHINE.md §2.2): give the run
           // a chance to write its answer before the budget closes it out.
-          const synthCostOverage = await runSynthesis();
+          const synth = await runSynthesis();
           // A Ctrl+C / wall-clock timeout DURING that best-effort turn is
           // swallowed by its catch; honor it here before classifying as
           // exhaustion — abort takes precedence over the budget exit, matching
@@ -2792,7 +2792,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           }
           // The synthesis can be the FIRST turn to cross the hard cost cap; a
           // breach must surface as maxCostUsd, not be masked as step exhaustion.
-          if (synthCostOverage !== null) return await finish('maxCostUsd', synthCostOverage);
+          if (synth.costOverage !== null) return await finish('maxCostUsd', synth.costOverage);
+          // The synthesis call itself can truncate (max_tokens) or overflow the
+          // window — the final report is incomplete, so surface maxOutputTokens /
+          // maxContextTokens like a normal turn instead of a clean maxSteps.
+          if (synth.truncation !== null)
+            return await finish(synth.truncation.reason, synth.truncation.detail);
           return await finish('maxSteps');
         }
         // Cost cap pre-check. Critical on resume: a session whose

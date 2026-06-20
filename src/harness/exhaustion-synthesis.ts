@@ -107,17 +107,32 @@ export interface ExhaustionSynthesisDeps {
   emitCostUpdate: (delta: number) => void;
 }
 
-// Returns the cost-cap overage (or null): a hard maxCostUsd breach — already
-// over, or crossed by the compaction / synthesis — must surface its own reason +
-// diagnostics, so the caller finishes maxCostUsd instead of maxSteps. No-op on a
-// settled answer; best-effort — a failed synthesis still proceeds (cost recovered).
+// The outcome the caller acts on. `costOverage` (non-null) → finish maxCostUsd (a
+// hard cap breach, already over or crossed by the compaction / synthesis).
+// `truncation` → the synthesis call ITSELF stopped at max_tokens / the context
+// window, so the final report is incomplete; surface maxOutputTokens /
+// maxContextTokens like a normal turn instead of masking it as plain step
+// exhaustion. Both null → the caller finishes maxSteps.
+export interface ExhaustionSynthesisResult {
+  costOverage: string | null;
+  truncation: { reason: 'maxOutputTokens' | 'maxContextTokens'; detail: string } | null;
+}
+
+const NO_OP: ExhaustionSynthesisResult = { costOverage: null, truncation: null };
+const overage = (costOverage: string | null): ExhaustionSynthesisResult => ({
+  costOverage,
+  truncation: null,
+});
+
+// Best-effort closing turn. No-op on a settled answer; a failed synthesis still
+// proceeds (cost recovered). See ExhaustionSynthesisResult for what the caller does.
 export const synthesizeOnExhaustion = async (
   deps: ExhaustionSynthesisDeps,
-): Promise<string | null> => {
+): Promise<ExhaustionSynthesisResult> => {
   const { ctx, config, budget, signal } = deps;
-  if (endsWithSettledAnswer(ctx.getMessages())) return null;
+  if (endsWithSettledAnswer(ctx.getMessages())) return NO_OP;
   const preOverage = deps.costCapDetailIfExceeded();
-  if (preOverage !== null) return preOverage;
+  if (preOverage !== null) return overage(preOverage);
   // Compact/elide first: a read-heavy run's last tool_results can push the
   // history past the window, and the top-of-loop maybeCompact() is bypassed here
   // (it skips at steps >= maxSteps), so an un-compacted synthesis request would
@@ -125,7 +140,7 @@ export const synthesizeOnExhaustion = async (
   // call can itself cross it.
   await deps.maybeCompact(true);
   const compactOverage = deps.costCapDetailIfExceeded();
-  if (compactOverage !== null) return compactOverage;
+  if (compactOverage !== null) return overage(compactOverage);
   const reqEffort = resolveProviderEffort(config);
   const req = buildSynthesisRequest(
     config,
@@ -155,8 +170,9 @@ export const synthesizeOnExhaustion = async (
       deps.recordUsage(e.partial.usage, partialCost, true);
       deps.emitCostUpdate(partialCost);
     }
-    // The recovered partial cost above may have crossed the cap.
-    return deps.costCapDetailIfExceeded();
+    // The recovered partial cost above may have crossed the cap. A failed call
+    // produced no usable report, so there's no truncation to surface.
+    return overage(deps.costCapDetailIfExceeded());
   }
   const assistantContent = buildAssistantContent(collected);
   const turnCostUsd = computeCost(config.provider.capabilities, collected.usage);
@@ -179,6 +195,22 @@ export const synthesizeOnExhaustion = async (
   // emitCostUpdate skips zero deltas, so a $0 local model would otherwise leave
   // the REPL/subagent footer stale for the synthesized turn until a later boundary.
   deps.emit({ type: 'usage_persisted' });
-  // The synthesis cost may have crossed the cap — caller finishes maxCostUsd.
-  return deps.costCapDetailIfExceeded();
+  // The synthesis call itself can truncate (max_tokens) or overflow the context
+  // window — the report just persisted is incomplete, so signal that (like a normal
+  // turn) instead of letting the caller report a clean maxSteps.
+  let truncation: ExhaustionSynthesisResult['truncation'] = null;
+  if (collected.stop_reason === 'max_tokens') {
+    truncation = {
+      reason: 'maxOutputTokens',
+      detail: `synthesis truncated at max_tokens (cap=${req.max_tokens})`,
+    };
+  } else if (collected.stop_reason === 'model_context_window_exceeded') {
+    truncation = {
+      reason: 'maxContextTokens',
+      detail:
+        'synthesis stopped at the context window limit (model_context_window_exceeded); reduce input or rely on compaction',
+    };
+  }
+  // The synthesis cost may also have crossed the cap — caller finishes maxCostUsd.
+  return { costOverage: deps.costCapDetailIfExceeded(), truncation };
 };

@@ -330,6 +330,36 @@ describe('runAgent', () => {
     expect(result.status).toBe('exhausted');
   });
 
+  test('synthesis truncated at max_tokens exits as maxOutputTokens, not maxSteps', async () => {
+    // The final synthesis call stops at the per-call output cap — the report is
+    // incomplete, so the run signals maxOutputTokens (raise the cap), not a clean
+    // maxSteps. The partial report is still persisted.
+    const { config } = buildConfig(
+      [
+        { tool_uses: [{ id: 'tu1', name: 'echo', input: { msg: '1' } }], stop_reason: 'tool_use' },
+        { text: 'partial repo', stop_reason: 'max_tokens' },
+      ],
+      { budget: { maxSteps: 1 } },
+    );
+    const result = await runAgent(config);
+    expect(result.reason).toBe('maxOutputTokens');
+    expect(result.status).toBe('exhausted');
+    expect(lastAssistantText(result)).toContain('partial repo');
+  });
+
+  test('synthesis hitting the context window exits as maxContextTokens, not maxSteps', async () => {
+    const { config } = buildConfig(
+      [
+        { tool_uses: [{ id: 'tu1', name: 'echo', input: { msg: '1' } }], stop_reason: 'tool_use' },
+        { text: 'cut off', stop_reason: 'model_context_window_exceeded' },
+      ],
+      { budget: { maxSteps: 1 } },
+    );
+    const result = await runAgent(config);
+    expect(result.reason).toBe('maxContextTokens');
+    expect(result.status).toBe('exhausted');
+  });
+
   test('synthesis turn emits usage_persisted so the footer refreshes even at $0', async () => {
     // emitCostUpdate is silent for zero-cost turns; usage_persisted is the display
     // cue the REPL/subagent footer keys off. The synthesis must emit it like a
