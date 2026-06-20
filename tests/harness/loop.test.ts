@@ -300,6 +300,36 @@ describe('runAgent', () => {
     expect(lastAssistantText(result)).toContain('FINAL: checked');
   });
 
+  test('synthesis crossing maxCostUsd exits as maxCostUsd, not maxSteps', async () => {
+    // The two in-budget turns stay under the cap; the synthesis turn is the FIRST
+    // to push cumulative spend over it. A hard cap must surface its own reason —
+    // not be masked as step exhaustion.
+    const { config } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 't1', name: 'echo', input: { msg: '1' } }],
+          stop_reason: 'tool_use',
+          usage: { input: 100, output: 0 },
+        },
+        {
+          tool_uses: [{ id: 't2', name: 'echo', input: { msg: '2' } }],
+          stop_reason: 'tool_use',
+          usage: { input: 100, output: 0 },
+        },
+        { text: 'FINAL', stop_reason: 'end_turn', usage: { input: 300, output: 0 } },
+      ],
+      {
+        // cost = input × rate / 1e6, so rate 1000 ⇒ 100 tok = $0.1, 300 tok = $0.3.
+        capsOverride: { cost_per_1k_input: 1000, cost_per_1k_output: 0 },
+        budget: { maxSteps: 2, maxCostUsd: 0.4 },
+      },
+    );
+    // 0.1 + 0.1 stays under 0.4 at max_steps; the synthesis adds 0.3 → 0.5 > 0.4.
+    const result = await runAgent(config);
+    expect(result.reason).toBe('maxCostUsd');
+    expect(result.status).toBe('exhausted');
+  });
+
   test('an abort DURING the synthesis turn exits as aborted, not maxSteps', async () => {
     // Budget exhausts on bare tool_use, the synthesis turn fires, and the user
     // hits Ctrl+C mid-call. Abort must win over the maxSteps classification —

@@ -2749,20 +2749,24 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // to `exhausted`, make ONE tool-less provider call ("budget's up, write
       // your answer now") and persist it as the closing assistant turn. This is
       // the LAST action of `running` (part of the → exhausted transition), not a
-      // return from a terminal state. Gated: skipped when the run already ended on
-      // a settled text answer (nothing pending), or when the cost cap is also blown
-      // (no budget). Best-effort — any failure just proceeds to finish('maxSteps').
-      const synthesizeOnExhaustion = async (): Promise<void> => {
-        if (ctx === undefined) return;
-        if (endsWithSettledAnswer()) return;
-        if (costCapDetailIfExceeded() !== null) return;
+      // return from a terminal state. RETURNS the cost-cap overage (or null): a
+      // hard maxCostUsd breach — already over, or crossed by the compaction /
+      // synthesis below — must surface its own reason + diagnostics, so the caller
+      // finishes maxCostUsd instead of maxSteps. No-op on a settled answer;
+      // best-effort — a failed synthesis still proceeds (with cost recovered).
+      const synthesizeOnExhaustion = async (): Promise<string | null> => {
+        if (ctx === undefined) return null;
+        if (endsWithSettledAnswer()) return null;
+        const preOverage = costCapDetailIfExceeded();
+        if (preOverage !== null) return preOverage;
         // Compact/elide first: a read-heavy run's last tool_results can push the
         // history past the window, and the top-of-loop maybeCompact() is bypassed
         // here (it skips at steps >= maxSteps), so an un-compacted synthesis request
         // would 400. Force it for this transition, then re-check the cost cap — the
         // summary call can itself cross it.
         await maybeCompact(true);
-        if (costCapDetailIfExceeded() !== null) return;
+        const compactOverage = costCapDetailIfExceeded();
+        if (compactOverage !== null) return compactOverage;
         const synthMessages: ProviderMessage[] = [...ctx.getMessages()];
         const directive =
           'Your step budget is exhausted — you may not call any more tools. Write your final answer or report NOW using only what you have already gathered, and state explicitly what you did not get to check.';
@@ -2821,7 +2825,8 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             totalCostUsd += partialCost;
             emitCostUpdate(partialCost);
           }
-          return;
+          // The recovered partial cost above may have crossed the cap.
+          return costCapDetailIfExceeded();
         }
         const assistantContent = buildAssistantContent(collected);
         const turnCostUsd = computeCost(config.provider.capabilities, collected.usage);
@@ -2842,6 +2847,8 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           reqEffort ?? null,
         );
         emitCostUpdate(turnCostUsd);
+        // The synthesis cost may have crossed the cap — caller finishes maxCostUsd.
+        return costCapDetailIfExceeded();
       };
 
       while (true) {
@@ -2863,7 +2870,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         if (steps >= budget.maxSteps) {
           // Pre-terminal synthesis turn (STATE_MACHINE.md §2.2): give the run
           // a chance to write its answer before the budget closes it out.
-          await synthesizeOnExhaustion();
+          const synthCostOverage = await synthesizeOnExhaustion();
           // A Ctrl+C / wall-clock timeout DURING that best-effort turn is
           // swallowed by its catch; honor it here before classifying as
           // exhaustion — abort takes precedence over the budget exit, matching
@@ -2873,6 +2880,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               ? await finish('maxWallClockMs')
               : await finish('aborted', undefined, 'hard');
           }
+          // The synthesis can be the FIRST turn to cross the hard cost cap; a
+          // breach must surface as maxCostUsd, not be masked as step exhaustion.
+          if (synthCostOverage !== null) return await finish('maxCostUsd', synthCostOverage);
           return await finish('maxSteps');
         }
         // Cost cap pre-check. Critical on resume: a session whose
