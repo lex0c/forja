@@ -7,34 +7,31 @@ this page explains how the ranking works — the methodology, not the models in 
 
 ## Current ranking
 
-> Snapshot of the latest run — **2026-06-21** (commits `5aa34cdb` / `8787d691`, same harness; `smoke` ×2 + `edit-format` ×2 + `regression` ×1).
-> Sorted by **composite**, highest first. Authoritative data:
-> [`evals/ranking/results.csv`](../evals/ranking/results.csv) (when this table and the CSV disagree, the CSV wins).
->
-> **⚠ Pre-split snapshot.** This table is the **60-case** set (before the `evaluates: model|harness`
-> split). The ranking now runs the **35 model-only** cases, which drops the compaction/permission/hook
-> noise — expect big-window models to rise (no more compaction window-artifact) and the table to be
-> refreshed on the model-only set.
->
-> **Not comparable across the suite change:** `edit-format` is now `edit_file`-only — the forced
-> `git_apply_patch` A/B was removed in `5aa34cdb`, since production defers that tool. That column (and the
-> composite it feeds, ×2) jumped for every model vs older batches; the earlier 56–69% was the forced
-> deferred-tool penalty, not capability. Cost is **unmetered** for this cloud tier (billed by subscription,
-> not per token), so `cost_usd` is blank.
+> Snapshot — **2026-06-21**, commit `8cc00bdc`, the **model-only** set: 35 cases (smoke 9 + edit-format 7 +
+> regression 19; `harness` cases excluded). `smoke` ×2 + `edit-format` ×2 + `regression` ×1, sorted by
+> **composite**. Authoritative data: [`results.csv`](../evals/ranking/results.csv) (CSV wins). Not comparable
+> to batches before `8cc00bdc` (different case set). Cost is **unmetered** (subscription, not per token), so
+> `cost_usd` is blank.
 
 | # | Model | Composite | smoke | edit-format | regression | steps/case | stable | unfinished | p50 lat |
 |---|---|---|---|---|---|---|---|---|---|
-| 1 | `ollama/devstral-2:123b` | **94%** | 90% | 100% | 91% | 3.1 | 100% | 4% | 4.4s |
-| 2 | `ollama/glm-5.2` | **93%** | 90% | 100% | 88% | 2.6 | 100% | 1% | 3.3s |
-| 3 | `ollama/qwen3-coder-next` | **90%** | 70% | 100% | 91% | 2.4 | 100% | 1% | 3.0s |
-| 4 | `ollama/qwen3-coder:480b` | **87%** | 70% | 100% | 81% | 3.4 | 100% | 13% | 4.7s |
-| 5 | `ollama/gpt-oss:20b` | **74%** | 65% | 71% | 81% | 3.4 | 82% | 16% | 6.4s |
+| 1 | `ollama/devstral-2:123b` | **98%** | 89% | 100% | 100% | 2.7 | 100% | 0% | 5.3s |
+| 2 | `ollama/glm-5.2` | **97%** | 83% | 100% | 100% | 2.6 | 94% | 0% | 5.5s |
+| 3 | `ollama/qwen3-coder:480b` | **96%** | 78% | 100% | 100% | 2.8 | 100% | 4% | 4.8s |
+| 4 | `ollama/qwen3-coder-next` | **91%** | 78% | 100% | 89% | 2.5 | 100% | 0% | 3.5s |
+| 5 | `ollama/gpt-oss:20b` | **89%** | 72% | 86% | 100% | 3.3 | 81% | 8% | 6.9s |
 
+> **Cleaner set, higher + fairer.** Removing the harness cases lifted everyone vs the old 60-case set — most
+> for big-window models, since the compaction window-artifact no longer penalizes them: `qwen3-coder:480b`
+> +9 (and #4→#3), `gpt-oss:20b` +15. `edit-format` and `regression` are ~100% across the board now, so the
+> live discriminator is **smoke** (parallel-read batching, search) plus a couple gaps (`qwen3-coder-next`
+> regression 89%, `gpt-oss:20b` edit 86%).
+>
 > **Smallest viable model is `gpt-oss:20b` (20B, cloud).** Local small models were tried and retired — both
 > scored ~2%: `qwen2.5-coder:7b` emits no native `tool_calls` via Ollama (1 step, never executes), and
 > `llama3.1:8b` drives the loop but is too slow on test hardware (~180s to read one file → every case times
-> out). Ollama Cloud serves nothing under ~20B, so the bench is effectively cloud-only. Their rows stay in
-> the CSV as documented attempts.
+> out). Ollama Cloud serves nothing under ~20B (`llama3.1`/`qwen2.5-coder` aren't on the cloud tier at all),
+> so the bench is effectively cloud-only.
 
 ---
 
