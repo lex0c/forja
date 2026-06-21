@@ -183,6 +183,10 @@ export class SessionContext {
     // turn (migration 074) — the per-call dimension for regression
     // attribution. Null when no effort was resolved.
     effort: string | null = null,
+    // The model that billed this turn (migration 077) — the per-request provider
+    // id (e.g. 'ollama/glm-5.2'). A `/model` switch changes it per turn, so it is
+    // passed per call, not stored on the context. Null when no provider resolved.
+    model: string | null = null,
   ): string {
     const hasContent = content.length > 0;
     const msg = appendMessage(this.db, {
@@ -197,6 +201,7 @@ export class SessionContext {
       costUsd: usage.usageSeen ? usage.costUsd : null,
       promptHash,
       effort,
+      model,
     });
     this.lastMessageId = msg.id;
     if (hasContent) {

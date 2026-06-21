@@ -22,6 +22,7 @@ const msg = (role: 'user' | 'assistant' | 'tool', content: unknown): Message => 
   promptHash: null,
   effort: null,
   source: 'operator',
+  model: null,
 });
 
 describe('messagesToProviderMessages', () => {

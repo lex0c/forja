@@ -118,7 +118,10 @@ export const statsCommand: SlashCommand = {
     // vice-versa. Resolve from the scope's models against the catalog. Pure-unmetered
     // scope → the label; a mixed scope shows the tracked metered spend + the marker (a
     // lower bound — the unmetered usage adds untracked cost) so real money is never hidden
-    // and untracked $0 is never read as free.
+    // and untracked $0 is never read as free. NOTE: `.some` here (ANY unmetered model in
+    // scope ⇒ the marker) is the INVERSE quantifier of the per-session `isSessionUnmetered`
+    // (`.every`: ALL unmetered ⇒ unmetered). Intentional — this asks "does the scope contain
+    // untracked usage?", not "is one session wholly unmetered?". Keep them distinct.
     const scopeUnmetered = s.models.some((m) => isUnmeteredModel(ctx.modelRegistry, m));
     const costStr =
       scopeUnmetered && s.costUsd > 0

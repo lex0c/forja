@@ -77,6 +77,66 @@ describe('computeUsageStats', () => {
     expect(s.sessionCount).toBe(1);
   });
 
+  test('models reflects the per-turn models a session billed on, not its initial model', () => {
+    // A session created on 'mock/initial' that /model-switched: two assistant turns on
+    // different models. computeUsageStats must surface the ACTUAL models (migration 077),
+    // not the stale sessions.model — so /stats resolves scope metering correctly.
+    const root = createSession(db, { model: 'mock/initial', cwd: '/p' });
+    appendMessage(db, {
+      sessionId: root.id,
+      role: 'assistant',
+      content: 'a',
+      model: 'ollama/glm-5.2',
+      costUsd: 0,
+    });
+    appendMessage(db, {
+      sessionId: root.id,
+      role: 'assistant',
+      content: 'b',
+      model: 'anthropic/claude-opus-4-8',
+      costUsd: 0.01,
+    });
+    const s = computeUsageStats(db, [root.id]);
+    expect([...s.models].sort()).toEqual(['anthropic/claude-opus-4-8', 'ollama/glm-5.2']);
+    expect(s.models).not.toContain('mock/initial'); // the stale initial model is NOT used
+  });
+
+  test('models falls back to the session model when no turn recorded one', () => {
+    // Pre-migration rows / turns with no resolved provider record NULL model →
+    // effectiveSessionModels falls back to sessions.model so the scope is never empty.
+    const root = createSession(db, { model: 'mock/initial', cwd: '/p' });
+    usage(root.id, { in: 1, out: 1, cacheRead: 0, cacheCreation: 0 }); // assistant turn, NULL model
+    const s = computeUsageStats(db, [root.id]);
+    expect(s.models).toEqual(['mock/initial']);
+  });
+
+  test('models surfaces a compaction-only metered model (migration 078)', () => {
+    // The 078 bug end-to-end through /stats: assistant turns on an unmetered model, but a
+    // billed /compact ran on a metered one. The compaction model lives in compaction_events,
+    // not messages — computeUsageStats' scope must still surface it so /stats flags the mixed
+    // scope (its cost is already in total_cost_usd).
+    const root = createSession(db, { model: 'ollama/glm-5.2', cwd: '/p' });
+    appendMessage(db, {
+      sessionId: root.id,
+      role: 'assistant',
+      content: 'a',
+      model: 'ollama/glm-5.2',
+      costUsd: 0,
+    });
+    appendCompactionEvent(db, {
+      sessionId: root.id,
+      strategy: 'llm',
+      foldedCount: 1,
+      beforeHash: 'a',
+      afterHash: 'b',
+      recordedAt: 1,
+      callUsage: { tokensIn: 1, tokensOut: 1, cacheRead: 0, cacheCreation: 0 },
+      model: 'anthropic/claude-opus-4-8',
+    });
+    const s = computeUsageStats(db, [root.id]);
+    expect([...s.models].sort()).toEqual(['anthropic/claude-opus-4-8', 'ollama/glm-5.2']);
+  });
+
   test('walks subagent descendants (cost + tokens) via parent_session_id', () => {
     const root = createSession(db, { model: 'm', cwd: '/p' });
     updateSessionCost(db, root.id, 0.04);
@@ -97,6 +157,35 @@ describe('computeUsageStats', () => {
     expect(s.cacheRead).toBe(10);
     expect(s.cacheCreation).toBe(5);
     expect(s.sessionCount).toBe(3);
+  });
+
+  test('a subagent on a DIFFERENT model surfaces both models in scope (metering stays coherent)', () => {
+    // Main session on an unmetered model; a task_* subagent runs a metered model in its OWN
+    // child session. The per-turn model lives on each session's own messages (migration 077),
+    // so the tree walk surfaces BOTH — /stats' `.some(unmetered)` then flags the mixed scope
+    // ("$cost + untracked"), with the subagent's metered cost already rolled into total_cost_usd.
+    const root = createSession(db, { model: 'ollama/glm-5.2', cwd: '/p' });
+    appendMessage(db, {
+      sessionId: root.id,
+      role: 'assistant',
+      content: 'a',
+      model: 'ollama/glm-5.2',
+      costUsd: 0,
+    });
+    const sub = createSession(db, {
+      model: 'anthropic/claude-opus-4-8',
+      cwd: '/p',
+      parentSessionId: root.id,
+    });
+    appendMessage(db, {
+      sessionId: sub.id,
+      role: 'assistant',
+      content: 'b',
+      model: 'anthropic/claude-opus-4-8',
+      costUsd: 0.5,
+    });
+    const s = computeUsageStats(db, [root.id]);
+    expect([...s.models].sort()).toEqual(['anthropic/claude-opus-4-8', 'ollama/glm-5.2']);
   });
 
   test('aggregates across multiple roots (replSessionIds with several entries)', () => {

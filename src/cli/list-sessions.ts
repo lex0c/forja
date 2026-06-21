@@ -5,7 +5,7 @@
 // permissions.yaml doesn't block the listing.
 
 import { createDefaultRegistry, loadModelRegistry } from '../providers/catalog-file.ts';
-import { isUnmeteredModel } from '../providers/cost-format.ts';
+import { isSessionUnmetered } from '../providers/cost-format.ts';
 import type { ModelRegistry } from '../providers/registry.ts';
 import type { Session } from '../storage/index.ts';
 import {
@@ -19,6 +19,7 @@ import {
   migrate,
   openDb,
 } from '../storage/index.ts';
+import { effectiveSessionModels } from '../storage/repos/messages.ts';
 
 export interface ListSessionsOptions {
   json: boolean;
@@ -313,7 +314,7 @@ export const runListSessions = (options: ListSessionsOptions): number => {
           db,
           0,
           root !== undefined ? root.cumulativeCost : s.totalCostUsd,
-          isUnmeteredModel(registry, s.model),
+          isSessionUnmetered(registry, effectiveSessionModels(db, s.id, s.model)),
         );
       });
       emittedTopLevels = parents.length;
@@ -343,7 +344,7 @@ export const runListSessions = (options: ListSessionsOptions): number => {
               db,
               depth,
               cumulativeCost,
-              isUnmeteredModel(registry, session.model),
+              isSessionUnmetered(registry, effectiveSessionModels(db, session.id, session.model)),
             ),
           );
         }

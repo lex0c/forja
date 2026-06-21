@@ -2,8 +2,11 @@ import { beforeEach, describe, expect, test } from 'bun:test';
 import { openMemoryDb } from '../../src/storage/db.ts';
 import type { DB } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
+import { appendCompactionEvent } from '../../src/storage/repos/compaction-events.ts';
 import {
   appendMessage,
+  distinctSessionModels,
+  effectiveSessionModels,
   getMessage,
   listMessageTailBySession,
   listMessagesBySession,
@@ -29,6 +32,107 @@ describe('messages repo', () => {
     const fetched = getMessage(db, m.id);
     expect(fetched).toEqual(m);
     expect(fetched?.content).toEqual({ text: 'hello' });
+  });
+
+  test('records the per-turn model on assistant rows and round-trips it (migration 077)', () => {
+    const a = appendMessage(db, {
+      sessionId,
+      role: 'assistant',
+      content: 'hi',
+      costUsd: 0.01,
+      model: 'anthropic/claude-opus-4-8',
+    });
+    expect(a.model).toBe('anthropic/claude-opus-4-8');
+    expect(getMessage(db, a.id)?.model).toBe('anthropic/claude-opus-4-8');
+    // Defaults to null when not supplied (user / tool rows have no model).
+    const u = appendMessage(db, { sessionId, role: 'user', content: 'q' });
+    expect(u.model).toBeNull();
+    expect(getMessage(db, u.id)?.model).toBeNull();
+  });
+
+  test('distinctSessionModels returns the distinct non-null models that billed the session', () => {
+    // A session that started on one model and /model-switched to another.
+    appendMessage(db, { sessionId, role: 'assistant', content: 'a', model: 'ollama/glm-5.2' });
+    appendMessage(db, { sessionId, role: 'user', content: 'q' }); // no model
+    appendMessage(db, { sessionId, role: 'assistant', content: 'b', model: 'ollama/glm-5.2' }); // dup
+    appendMessage(db, {
+      sessionId,
+      role: 'assistant',
+      content: 'c',
+      model: 'anthropic/claude-opus-4-8',
+    });
+    expect(distinctSessionModels(db, sessionId).sort()).toEqual([
+      'anthropic/claude-opus-4-8',
+      'ollama/glm-5.2',
+    ]);
+    // A session with no recorded model → empty (caller falls back to sessions.model).
+    const other = createSession(db, { model: 'm', cwd: '/p' }).id;
+    appendMessage(db, { sessionId: other, role: 'user', content: 'q' });
+    expect(distinctSessionModels(db, other)).toEqual([]);
+  });
+
+  test('effectiveSessionModels returns per-turn models, else [fallback] when none recorded', () => {
+    appendMessage(db, { sessionId, role: 'assistant', content: 'a', model: 'ollama/glm-5.2' });
+    expect(effectiveSessionModels(db, sessionId, 'fallback/x')).toEqual(['ollama/glm-5.2']);
+    // No billed turns → the fallback (sessions.model) as a single-element list, so callers
+    // never face an empty set.
+    const other = createSession(db, { model: 'm', cwd: '/p' }).id;
+    appendMessage(db, { sessionId: other, role: 'user', content: 'q' });
+    expect(effectiveSessionModels(db, other, 'fallback/x')).toEqual(['fallback/x']);
+  });
+
+  test('effectiveSessionModels keeps the fallback when a billed turn still has a NULL model', () => {
+    // Pre-migration session: an assistant turn billed on the (metered) sessions.model but
+    // recorded NULL model, then resumed post-migration with an unmetered turn. The fallback
+    // MUST stay in the set — else the metered pre-migration spend is dropped and the session
+    // would read as unmetered. A NULL-model USER row must NOT trigger it (not a billed turn).
+    appendMessage(db, { sessionId, role: 'assistant', content: 'pre', costUsd: 0.5 }); // NULL model
+    appendMessage(db, { sessionId, role: 'user', content: 'q' }); // NULL model, not billed
+    appendMessage(db, { sessionId, role: 'assistant', content: 'post', model: 'ollama/glm-5.2' });
+    expect(effectiveSessionModels(db, sessionId, 'metered/initial').sort()).toEqual([
+      'metered/initial',
+      'ollama/glm-5.2',
+    ]);
+  });
+
+  test('effectiveSessionModels folds in a compaction model absent from every assistant turn', () => {
+    // The bug: assistant turns all on an unmetered model, but a /compact billed on a metered
+    // model (a /model switch then /compact). The compaction model lives in compaction_events,
+    // NOT messages, so it must be unioned in — else the session reads as wholly unmetered while
+    // its total_cost_usd carries the metered compaction spend.
+    appendMessage(db, { sessionId, role: 'assistant', content: 'a', model: 'ollama/glm-5.2' });
+    appendCompactionEvent(db, {
+      sessionId,
+      strategy: 'llm',
+      foldedCount: 1,
+      beforeHash: 'a',
+      afterHash: 'b',
+      recordedAt: 1,
+      callUsage: { tokensIn: 1, tokensOut: 1, cacheRead: 0, cacheCreation: 0 },
+      model: 'anthropic/claude-opus-4-8',
+    });
+    expect(effectiveSessionModels(db, sessionId, 'fallback/x').sort()).toEqual([
+      'anthropic/claude-opus-4-8',
+      'ollama/glm-5.2',
+    ]);
+  });
+
+  test('effectiveSessionModels falls back when a billed compaction predates 078 (NULL model)', () => {
+    // A pre-078 billed (`llm`) compaction has a NULL model = spend on a model we can't recover.
+    // With no assistant row recording a model, effectiveSessionModels must STILL include the
+    // fallback (sessions.model) via `compaction.hasUntracked` — else the session reads as having
+    // no billed model. Exercises the `|| compaction.hasUntracked` wiring, not just the helper.
+    appendCompactionEvent(db, {
+      sessionId,
+      strategy: 'llm',
+      foldedCount: 1,
+      beforeHash: 'a',
+      afterHash: 'b',
+      recordedAt: 1,
+      callUsage: { tokensIn: 1, tokensOut: 1, cacheRead: 0, cacheCreation: 0 },
+      // no model → NULL (a compaction row written before migration 078)
+    });
+    expect(effectiveSessionModels(db, sessionId, 'metered/initial')).toEqual(['metered/initial']);
   });
 
   test('source defaults to operator and round-trips an explicit system source (migration 075)', () => {

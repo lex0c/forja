@@ -78,6 +78,47 @@ describe('runListSessions', () => {
     expect(item.unmetered).toBe(true);
   });
 
+  test('a /model-switch to a metered model reads as metered, not the unmetered initial model', () => {
+    // The deep cost fix (migration 077): metering resolves from the models the
+    // session ACTUALLY used (per-turn), not sessions.model. Here the stored model
+    // is unmetered but a later turn billed on a metered one — the row must NOT read
+    // as unmetered (its recorded spend is real), even though sessions.model is still
+    // the unmetered initial one.
+    const s = createSession(db, { model: 'custom/cloud-x', cwd: '/p', startedAt: 1000 });
+    appendMessage(db, { sessionId: s.id, role: 'assistant', content: 'a', model: 'custom/paid-y' });
+    completeSession(db, s.id, 'done', 0.05, true);
+    const reg = {
+      get: (id: string) =>
+        id === 'custom/cloud-x'
+          ? { capabilities: { unmetered: true } }
+          : id === 'custom/paid-y'
+            ? { capabilities: {} }
+            : null,
+    } as unknown as ModelRegistry;
+    const out: string[] = [];
+    runListSessions({ json: true, dbOverride: db, registryOverride: reg, out: (l) => out.push(l) });
+    const item = JSON.parse(out.join('').trim()) as { model: string; unmetered: boolean };
+    expect(item.model).toBe('custom/cloud-x'); // stored initial model is unchanged
+    expect(item.unmetered).toBe(false); // but metering reflects the metered turn
+  });
+
+  test('a session whose turns all billed on its unmetered model stays unmetered', () => {
+    const s = createSession(db, { model: 'custom/cloud-x', cwd: '/p', startedAt: 1000 });
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'assistant',
+      content: 'a',
+      model: 'custom/cloud-x',
+    });
+    completeSession(db, s.id, 'done', 0, true);
+    const reg = {
+      get: (id: string) => (id === 'custom/cloud-x' ? { capabilities: { unmetered: true } } : null),
+    } as unknown as ModelRegistry;
+    const out: string[] = [];
+    runListSessions({ json: true, dbOverride: db, registryOverride: reg, out: (l) => out.push(l) });
+    expect((JSON.parse(out.join('').trim()) as { unmetered: boolean }).unmetered).toBe(true);
+  });
+
   test('human render shows recorded dollars, not "unmetered", for an unmetered-row session that spent', () => {
     // The row model resolves unmetered (e.g. an Ollama Cloud start), but the session carries a
     // nonzero recorded cost — a /model switch to a metered model leaves real spend on a row whose
