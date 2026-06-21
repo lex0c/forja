@@ -36,6 +36,7 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { isRecapEnabled } from '../../../harness/types.ts';
+import { isUnmetered } from '../../../providers/cost-format.ts';
 import { resolveProviderFromId } from '../../../providers/resolve.ts';
 import type { Provider } from '../../../providers/types.ts';
 import { renderChangelogDeterministic } from '../../../recap/changelog/index.ts';
@@ -576,6 +577,7 @@ export type RunRecapSessionResult =
       usedLlm: boolean;
       cacheHit: boolean;
       costUsd: number;
+      unmetered: boolean;
       tokensIn: number;
       tokensOut: number;
       promptVersion: string | null;
@@ -714,6 +716,7 @@ export const runRecapSession = async (
     usedLlm: renderResult.usedLlm,
     cacheHit: renderResult.cacheHit,
     costUsd: renderResult.costUsd,
+    unmetered: renderResult.unmetered,
     tokensIn: renderResult.tokensIn,
     tokensOut: renderResult.tokensOut,
     promptVersion: renderResult.promptVersion,
@@ -752,6 +755,10 @@ interface RenderOutcome {
   usedLlm: boolean;
   cacheHit: boolean;
   costUsd: number;
+  // The render LLM ran on an unmetered provider (cost untracked, not free). False on the
+  // deterministic path. Carries the ACTUAL render model's metering — which can differ
+  // from the session provider via `--model` / `[recap].render_model` — out to recap_end.
+  unmetered: boolean;
   tokensIn: number;
   tokensOut: number;
   promptVersion: string | null;
@@ -762,6 +769,8 @@ const deterministicOutcome = (output: string): RenderOutcome => ({
   usedLlm: false,
   cacheHit: false,
   costUsd: 0,
+  // No LLM ran — $0 is genuinely free, not untracked.
+  unmetered: false,
   tokensIn: 0,
   tokensOut: 0,
   promptVersion: null,
@@ -840,6 +849,7 @@ const renderWithLlmOrFallback = async (
       usedLlm: true,
       cacheHit: true,
       costUsd: 0,
+      unmetered: isUnmetered(provider),
       tokensIn: 0,
       tokensOut: 0,
       promptVersion: dispatch.promptVersion,
@@ -872,6 +882,7 @@ const renderWithLlmOrFallback = async (
         usedLlm: true,
         cacheHit: false,
         costUsd: result.costUsd,
+        unmetered: isUnmetered(provider),
         tokensIn: result.usage.input + result.usage.cache_read + result.usage.cache_creation,
         tokensOut: result.usage.output,
         promptVersion: dispatch.promptVersion,
@@ -908,6 +919,7 @@ const renderWithLlmOrFallback = async (
     usedLlm: true,
     cacheHit: false,
     costUsd: result.costUsd,
+    unmetered: isUnmetered(provider),
     tokensIn: result.usage.input + result.usage.cache_read + result.usage.cache_creation,
     tokensOut: result.usage.output,
     promptVersion: dispatch.promptVersion,

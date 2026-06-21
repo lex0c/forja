@@ -19,7 +19,6 @@
 
 import type { HarnessConfig } from '../harness/index.ts';
 import { createDefaultRegistry } from '../providers/catalog-file.ts';
-import { isUnmetered } from '../providers/cost-format.ts';
 import type { ModelRegistry } from '../providers/registry.ts';
 import type { Provider } from '../providers/types.ts';
 import { redactSecretsInIntermediate } from '../recap/format.ts';
@@ -220,8 +219,10 @@ export const runRecapHeadless = async (options: RunRecapHeadlessOptions): Promis
         duration_ms: now() - startTs,
         used_llm: result.usedLlm,
         cost_usd: result.costUsd,
-        // Untracked-not-free when the render model is unmetered (e.g. Ollama Cloud).
-        unmetered: isUnmetered(options.provider),
+        // The ACTUAL render model's metering — which can differ from the session/boot
+        // provider via `--model` / `[recap].render_model` — carried out of the render
+        // path. Untracked-not-free when that model is unmetered (e.g. Ollama Cloud).
+        unmetered: result.unmetered,
       });
       return 0;
     }
