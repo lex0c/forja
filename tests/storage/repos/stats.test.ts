@@ -132,6 +132,35 @@ describe('computeUsageStats', () => {
     expect(s.sessionCount).toBe(3);
   });
 
+  test('a subagent on a DIFFERENT model surfaces both models in scope (metering stays coherent)', () => {
+    // Main session on an unmetered model; a task_* subagent runs a metered model in its OWN
+    // child session. The per-turn model lives on each session's own messages (migration 077),
+    // so the tree walk surfaces BOTH — /stats' `.some(unmetered)` then flags the mixed scope
+    // ("$cost + untracked"), with the subagent's metered cost already rolled into total_cost_usd.
+    const root = createSession(db, { model: 'ollama/glm-5.2', cwd: '/p' });
+    appendMessage(db, {
+      sessionId: root.id,
+      role: 'assistant',
+      content: 'a',
+      model: 'ollama/glm-5.2',
+      costUsd: 0,
+    });
+    const sub = createSession(db, {
+      model: 'anthropic/claude-opus-4-8',
+      cwd: '/p',
+      parentSessionId: root.id,
+    });
+    appendMessage(db, {
+      sessionId: sub.id,
+      role: 'assistant',
+      content: 'b',
+      model: 'anthropic/claude-opus-4-8',
+      costUsd: 0.5,
+    });
+    const s = computeUsageStats(db, [root.id]);
+    expect([...s.models].sort()).toEqual(['anthropic/claude-opus-4-8', 'ollama/glm-5.2']);
+  });
+
   test('aggregates across multiple roots (replSessionIds with several entries)', () => {
     const a = createSession(db, { model: 'm', cwd: '/p' });
     updateSessionCost(db, a.id, 0.01);
