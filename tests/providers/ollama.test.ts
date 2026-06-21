@@ -290,8 +290,11 @@ describe('served context window (num_ctx ↔ capabilities)', () => {
     const p = createOllamaProvider('llama3.1:8b', { fetch: fn, numCtx: 1_000_000 });
     expect(p.capabilities.context_window).toBe(131_072);
     await collect(p.generate(reqGen({ messages: [{ role: 'user', content: 'x' }] })));
-    // num_ctx still forwards the operator's explicit ask (their VRAM call).
-    expect(numCtxOf(bodies[0] as Record<string, unknown>)).toBe(1_000_000);
+    // The SERVED num_ctx is clamped to the capacity too — not forwarded raw. A num_ctx past the
+    // model's trained window is a typo / pure VRAM waste (the harness caps the prompt at the
+    // capacity regardless, so the extra KV is never used); raising `context_window` is the knob
+    // for a bigger budget AND served window.
+    expect(numCtxOf(bodies[0] as Record<string, unknown>)).toBe(131_072);
   });
 
   test('FORJA_OLLAMA_NUM_CTX env sets the served window', () => {
