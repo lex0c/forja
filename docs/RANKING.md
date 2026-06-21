@@ -7,39 +7,52 @@ this page explains how the ranking works — the methodology, not the models in 
 
 ## Current ranking
 
-> Snapshot — **2026-06-21**, commit `8cc00bdc`, the **model-only** set: **35 cases → 51 executions/model**.
+> Snapshot — **2026-06-21**, the **model-only** set: **35 cases → 51 executions/model**. Commits: `ollama/*`
+> on `9af6ed9a`, `openai/*` on `4e74fea7` — one commit apart, but the diff is a cost-**display** fix
+> (`formatCostCell`), not the eval path, so the case set and run behavior are identical → comparable.
 > Repeats: smoke ×2, edit-format ×2, regression ×1 (9·2 + 7·2 + 19·1 = 51). Weights (composite, distinct from
 > repeats): smoke ×1, edit-format ×2, regression ×2. Sorted by full-precision composite. Authoritative data:
-> [`results.csv`](../evals/ranking/results.csv) (CSV wins). Not comparable to batches before `8cc00bdc`
-> (different case set). The 5 `ollama/*` are **unmetered** (subscription, not per token → blank `cost_usd`);
-> the 3 `openai/*` are metered — `cost` is the **total metered model cost over the 51 executions** (incl.
-> retries / subagents / summaries), measured, not estimated.
+> [`results.csv`](../evals/ranking/results.csv) (CSV wins). Not comparable to batches before `d79aee58` (the
+> case set was reframed — read-file de-weaponized, per-case cost gate swept). The 5 `ollama/*` are
+> **unmetered** (subscription, not per token → blank `cost_usd`); the 5 `openai/*` are metered — `cost` is the
+> **total metered model cost over the 51 executions** (incl. retries / subagents / summaries), measured.
 >
 > ⚠ **The top is saturated — read it as a tie, not an ordering.** `edit-format` and `regression` are ~100%
-> across the leaders, so the composite is driven by the 9 `smoke` cases (18 executions); one smoke flip moves
-> it ≈ **1.1 pp**. Treat scores within ~1–2 pp as **effectively tied** until a harder/larger battery (e.g.
-> self-SWE-bench) separates them. Honest claim today: a **top group of ~98%**, indistinguishable among
-> `gpt-5.3-codex` / `devstral-2:123b` / `gpt-5.4-mini`.
+> across the leaders, so the composite rides on the 9 `smoke` cases (18 executions); one smoke flip moves it
+> ≈ **1.1 pp**, and `regression` runs a single round so one flaky flip is a whole case. Treat scores within
+> ~1–2 pp as **effectively tied**. The top is an **exact 3-way tie** — `devstral-2:123b`, `gpt-5-nano`,
+> `gpt-5.4-mini` share identical suite scores (89 / 100 / 100). A harder/larger battery (e.g. self-SWE-bench)
+> is what would actually separate them.
 
 | # | Model | Composite | smoke | edit-format | regression | steps/case | stable | unfinished | p50 lat | cost | cache |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| 1 | `openai/gpt-5.3-codex` | **98%** | 100% | 100% | 95% | 3.0 | 100% | 2% | 9.5s | **$1.08** | 70% |
-| 2 | `ollama/devstral-2:123b` | **98%** | 89% | 100% | 100% | 2.7 | 100% | 0% | 5.3s | unmetered | — |
-| 2 | `openai/gpt-5.4-mini` | **98%** | 89% | 100% | 100% | 2.9 | 88% | 0% | 9.0s | **$0.39** | 68% |
-| 4 | `ollama/glm-5.2` | **97%** | 83% | 100% | 100% | 2.6 | 94% | 0% | 5.5s | unmetered | — |
-| 5 | `ollama/qwen3-coder:480b` | **96%** | 78% | 100% | 100% | 2.8 | 100% | 4% | 4.8s | unmetered | — |
-| 6 | `ollama/qwen3-coder-next` | **91%** | 78% | 100% | 89% | 2.5 | 100% | 0% | 3.5s | unmetered | — |
-| 7 | `ollama/gpt-oss:20b` | **89%** | 72% | 86% | 100% | 3.3 | 81% | 8% | 6.9s | unmetered | — |
-| 8 | `openai/gpt-5-nano` | **82%** | 83% | 64% | 100% | 3.3 | 75% | 8% | 34.2s | **$0.14** | 64% |
+| 1 | `ollama/devstral-2:123b` | **98%** | 89% | 100% | 100% | 2.7 | 100% | 0% | 7.8s | unmetered | — |
+| 1 | `openai/gpt-5-nano` | **98%** | 89% | 100% | 100% | 3.1 | 88% | 2% | 34.9s | **$0.12** | 66% |
+| 1 | `openai/gpt-5.4-mini` | **98%** | 89% | 100% | 100% | 3.0 | 100% | 0% | 7.9s | **$0.39** | 68% |
+| 4 | `ollama/glm-5.2` | **96%** | 89% | 100% | 95% | 2.8 | 100% | 0% | 4.5s | unmetered | — |
+| 5 | `ollama/qwen3-coder:480b` | **96%** | 78% | 100% | 100% | 2.8 | 100% | 4% | 4.3s | unmetered | — |
+| 6 | `openai/gpt-5.5` | **95%** | 100% | 93% | 95% | 2.8 | 94% | 4% | 9.5s | **$2.54** | 61% |
+| 7 | `openai/gpt-5.3-codex` | **95%** | 94% | 100% | 89% | 3.0 | 94% | 6% | 8.2s | **$1.03** | 76% |
+| 8 | `ollama/gpt-oss:20b` | **93%** | 78% | 93% | 100% | 3.5 | 94% | 6% | 8.5s | unmetered | — |
+| 9 | `ollama/qwen3-coder-next` | **91%** | 78% | 100% | 89% | 2.6 | 100% | 0% | 4.0s | unmetered | — |
+| 10 | `openai/gpt-5.4` | **89%** | 89% | 100% | 79% | 3.6 | 88% | 12% | 9.8s | **$2.04** | 68% |
 
-> **The 3 `openai/*` rows are ad-hoc** (run later, not in the standing `ALL_MODELS`; comparable by shared
-> `harness_commit` + case set, not `run_ts`). `gpt-5.3-codex` (98%, $1.08 — the only model to ace `smoke`)
-> and `gpt-5.4-mini` (98%, $0.39) join the top tie; `gpt-5-nano` (82%, $0.14) is held back by `edit-format`
-> (64% — weak at precise `edit_file`). Their `cache` 64–70% is why the OpenAI costs came in low.
+> **The 5 `openai/*` rows are ad-hoc** (run later, not in the standing `ALL_MODELS`; comparable by shared
+> case set, not `run_ts`). `cache` 61–76% is why their costs came in as low as they did.
 >
-> **Cleaner set, higher + fairer.** Removing the harness cases lifted the Ollama models vs the old 60-case
-> set — most for big-window models, since the compaction window-artifact no longer penalizes them:
-> `qwen3-coder:480b` +9, `gpt-oss:20b` +15.
+> **Cheap/small models top the flagships — and that is the saturation artifact, not a verdict.** The top tie
+> pairs a free Ollama (`devstral`) with the two **cheapest** OpenAI models (`gpt-5-nano` $0.12, `gpt-5.4-mini`
+> $0.39), while `gpt-5.5` ($2.54) and `gpt-5.4` ($2.04) sit *below* them. Read the cause, not the order:
+> `gpt-5.5` is the **only model to ace `smoke` (100%)** — strongest on the suite that actually discriminates —
+> but it flaked `edit-format` (93%) and `regression` (95%) on single rounds, which the composite punishes; the
+> small models simply didn't flake. Do **not** read "nano > gpt-5.5" — cross-check the `smoke` column (or
+> `plot_ranking.py --metric smoke`) before ranking capability.
+>
+> **`gpt-5.4` is last (89%)** on `regression` 79% — multi-tool `edit_file` flows it mostly **passes on
+> re-run** (variance, exaggerated by regression's single round); its `unfinished` 12% (it grinds past the step
+> cap when it misfires) is the real tell. **Pareto view:** `devstral` (free, 98%) dominates — nothing scores
+> higher for less, and every paid flagship is dominated on this metric. The cost × quality chart is
+> [`scripts/plot_ranking.py`](../scripts/plot_ranking.py) (see [`plot_ranking.md`](../scripts/plot_ranking.md)).
 >
 > **Smallest viable Ollama model is `gpt-oss:20b` (20B, cloud).** Local small models were retired (~2% each):
 > `qwen2.5-coder:7b` emits no native `tool_calls` via Ollama (1 step), `llama3.1:8b` is too slow (~180s/read
