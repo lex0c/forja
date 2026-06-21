@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, test } from 'bun:test';
 import { openMemoryDb } from '../../src/storage/db.ts';
 import type { DB } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
+import { appendCompactionEvent } from '../../src/storage/repos/compaction-events.ts';
 import {
   appendMessage,
   distinctSessionModels,
@@ -92,6 +93,46 @@ describe('messages repo', () => {
       'metered/initial',
       'ollama/glm-5.2',
     ]);
+  });
+
+  test('effectiveSessionModels folds in a compaction model absent from every assistant turn', () => {
+    // The bug: assistant turns all on an unmetered model, but a /compact billed on a metered
+    // model (a /model switch then /compact). The compaction model lives in compaction_events,
+    // NOT messages, so it must be unioned in — else the session reads as wholly unmetered while
+    // its total_cost_usd carries the metered compaction spend.
+    appendMessage(db, { sessionId, role: 'assistant', content: 'a', model: 'ollama/glm-5.2' });
+    appendCompactionEvent(db, {
+      sessionId,
+      strategy: 'llm',
+      foldedCount: 1,
+      beforeHash: 'a',
+      afterHash: 'b',
+      recordedAt: 1,
+      callUsage: { tokensIn: 1, tokensOut: 1, cacheRead: 0, cacheCreation: 0 },
+      model: 'anthropic/claude-opus-4-8',
+    });
+    expect(effectiveSessionModels(db, sessionId, 'fallback/x').sort()).toEqual([
+      'anthropic/claude-opus-4-8',
+      'ollama/glm-5.2',
+    ]);
+  });
+
+  test('effectiveSessionModels falls back when a billed compaction predates 078 (NULL model)', () => {
+    // A pre-078 billed (`llm`) compaction has a NULL model = spend on a model we can't recover.
+    // With no assistant row recording a model, effectiveSessionModels must STILL include the
+    // fallback (sessions.model) via `compaction.hasUntracked` — else the session reads as having
+    // no billed model. Exercises the `|| compaction.hasUntracked` wiring, not just the helper.
+    appendCompactionEvent(db, {
+      sessionId,
+      strategy: 'llm',
+      foldedCount: 1,
+      beforeHash: 'a',
+      afterHash: 'b',
+      recordedAt: 1,
+      callUsage: { tokensIn: 1, tokensOut: 1, cacheRead: 0, cacheCreation: 0 },
+      // no model → NULL (a compaction row written before migration 078)
+    });
+    expect(effectiveSessionModels(db, sessionId, 'metered/initial')).toEqual(['metered/initial']);
   });
 
   test('source defaults to operator and round-trips an explicit system source (migration 075)', () => {

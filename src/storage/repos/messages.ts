@@ -1,5 +1,8 @@
 import type { DB } from '../db.ts';
 import { parseJsonSafe } from '../json-safe.ts';
+// Value import; `compaction-events.ts` only imports a TYPE from here (erased at runtime), so
+// this does not create a runtime module cycle.
+import { compactionMetering } from './compaction-events.ts';
 
 export type MessageRole = 'user' | 'assistant' | 'tool';
 
@@ -244,12 +247,14 @@ export const distinctSessionModels = (db: DB, sessionId: string): string[] => {
   return rows.map((r) => r.model);
 };
 
-// The session's EFFECTIVE models for metering: its per-turn models, PLUS the stored
-// `sessions.model` fallback when (a) no model was recorded at all, OR (b) any BILLED turn
-// still has a NULL model — an assistant row persisted before migration 077, i.e. spend on a
-// model we can't recover, which we attribute to `sessions.model`. The ONE place the fallback
-// rule lives, so the read surfaces (`--list`, `/sessions`, `/stats`) can't drift on it.
-// Always non-empty, so callers (e.g. `isSessionUnmetered`) never face `[].every()`.
+// The session's EFFECTIVE models for metering: every model it BILLED on — per-turn assistant
+// models (`messages`, migration 077) UNIONED with compaction-call models (`compaction_events`,
+// migration 078, whose cost is in `total_cost_usd` but writes no message row) — PLUS the stored
+// `sessions.model` fallback when (a) no model was recorded at all, OR (b) any billed turn/call
+// still has a NULL model (an assistant row pre-077 or a billed compaction pre-078 — spend on a
+// model we can't recover, attributed to `sessions.model`). The ONE place the fallback rule
+// lives, so the read surfaces (`--list`, `/sessions`, `/stats`) can't drift on it. Always
+// non-empty, so callers (e.g. `isSessionUnmetered`) never face `[].every()`.
 //
 // Including the fallback on (b) — not only (a) — is load-bearing: a session that spent on a
 // metered model PRE-migration (NULL rows) and is later resumed with an unmetered turn would
@@ -259,14 +264,15 @@ export const effectiveSessionModels = (
   sessionId: string,
   fallbackModel: string,
 ): string[] => {
-  const models = distinctSessionModels(db, sessionId);
-  const hasUntrackedBilledTurn =
+  const compaction = compactionMetering(db, sessionId);
+  const models = [...new Set([...distinctSessionModels(db, sessionId), ...compaction.models])];
+  const hasUntrackedAssistant =
     db
       .query(
         "SELECT 1 FROM messages WHERE session_id = ? AND role = 'assistant' AND model IS NULL LIMIT 1",
       )
       .get(sessionId) !== null;
-  if (models.length === 0 || hasUntrackedBilledTurn) {
+  if (models.length === 0 || hasUntrackedAssistant || compaction.hasUntracked) {
     return models.includes(fallbackModel) ? models : [...models, fallbackModel];
   }
   return models;

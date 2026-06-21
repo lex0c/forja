@@ -110,6 +110,33 @@ describe('computeUsageStats', () => {
     expect(s.models).toEqual(['mock/initial']);
   });
 
+  test('models surfaces a compaction-only metered model (migration 078)', () => {
+    // The 078 bug end-to-end through /stats: assistant turns on an unmetered model, but a
+    // billed /compact ran on a metered one. The compaction model lives in compaction_events,
+    // not messages — computeUsageStats' scope must still surface it so /stats flags the mixed
+    // scope (its cost is already in total_cost_usd).
+    const root = createSession(db, { model: 'ollama/glm-5.2', cwd: '/p' });
+    appendMessage(db, {
+      sessionId: root.id,
+      role: 'assistant',
+      content: 'a',
+      model: 'ollama/glm-5.2',
+      costUsd: 0,
+    });
+    appendCompactionEvent(db, {
+      sessionId: root.id,
+      strategy: 'llm',
+      foldedCount: 1,
+      beforeHash: 'a',
+      afterHash: 'b',
+      recordedAt: 1,
+      callUsage: { tokensIn: 1, tokensOut: 1, cacheRead: 0, cacheCreation: 0 },
+      model: 'anthropic/claude-opus-4-8',
+    });
+    const s = computeUsageStats(db, [root.id]);
+    expect([...s.models].sort()).toEqual(['anthropic/claude-opus-4-8', 'ollama/glm-5.2']);
+  });
+
   test('walks subagent descendants (cost + tokens) via parent_session_id', () => {
     const root = createSession(db, { model: 'm', cwd: '/p' });
     updateSessionCost(db, root.id, 0.04);

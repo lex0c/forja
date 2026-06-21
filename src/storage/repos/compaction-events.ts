@@ -30,6 +30,10 @@ export interface CompactionEventRow {
   call_tokens_out: number | null;
   call_cache_read: number | null;
   call_cache_creation: number | null;
+  // The model that billed this compaction call (migration 078). Set on the `llm` /
+  // `fallback` paths (a provider call happened); NULL on `relevance` (no call) and on rows
+  // written before the migration.
+  model: string | null;
 }
 
 export interface AppendCompactionEventInput {
@@ -53,18 +57,22 @@ export interface AppendCompactionEventInput {
   // `fallback` paths; absent on `relevance` (no provider call → zero usage,
   // stored as NULL). The caller maps the harness `UsageInfo` shape here.
   callUsage?: MessageUsageTotals;
+  // The model that billed the compaction call (migration 078) — the compaction provider's id.
+  // The caller sets it ONLY for billed strategies (`llm` / `fallback`); `relevance` / `skipped`
+  // make no provider call, so it stays NULL and never marks the session metered.
+  model?: string | null;
 }
 
 const INSERT_SQL = `INSERT INTO compaction_events
   (id, session_id, strategy, folded_count, freed_bytes, tokens_before,
    tokens_after, before_hash, after_hash, elided_ids, summary, reason, recorded_at,
-   call_tokens_in, call_tokens_out, call_cache_read, call_cache_creation)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+   call_tokens_in, call_tokens_out, call_cache_read, call_cache_creation, model)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 
 const SELECT_ALL = `SELECT id, session_id, strategy, folded_count, freed_bytes,
        tokens_before, tokens_after, before_hash, after_hash, elided_ids,
        summary, reason, recorded_at,
-       call_tokens_in, call_tokens_out, call_cache_read, call_cache_creation
+       call_tokens_in, call_tokens_out, call_cache_read, call_cache_creation, model
   FROM compaction_events`;
 
 // Append one row; returns the generated id. ULID = sortable + globally unique
@@ -89,6 +97,7 @@ export const appendCompactionEvent = (db: DB, input: AppendCompactionEventInput)
     input.callUsage?.tokensOut ?? null,
     input.callUsage?.cacheRead ?? null,
     input.callUsage?.cacheCreation ?? null,
+    input.model ?? null,
   ];
   db.query(INSERT_SQL).run(...bindings);
   return id;
@@ -153,3 +162,33 @@ export const listCompactionEventsBySession = (db: DB, sessionId: string): Compac
   db
     .query(`${SELECT_ALL} WHERE session_id = ? ORDER BY recorded_at ASC, id ASC`)
     .all(sessionId) as CompactionEventRow[];
+
+// Whether a compaction strategy makes a BILLED provider call (`llm`, or `fallback` after an
+// llm attempt) — vs `relevance` / `skipped`, which make no call. The SINGLE source for the
+// gate: the write paths (loop / `/compact`) record the model only for these strategies, and
+// `compactionMetering` flags a NULL-model row as untracked only for these. Lives in the storage
+// layer (not `harness/compaction.ts`, which can't be imported from here per the storage→harness
+// no-import rule). A new billed strategy added to the harness MUST be added here too, or its
+// metered spend reads as unmetered.
+export const isBilledCompactionStrategy = (strategy: string): boolean =>
+  strategy === 'llm' || strategy === 'fallback';
+
+// The models that BILLED compaction for a session (migration 078), plus whether any billed
+// compaction predates the migration. A compaction call (`llm` / `fallback`) bills — its cost
+// is in `sessions.total_cost_usd` and `/stats` counts its tokens — but writes no `messages`
+// row, so the metering resolver (`effectiveSessionModels`) folds these in to avoid mislabeling
+// a session unmetered when it compacted on a metered model. `hasUntracked` flags a NULL-model
+// row on a billed strategy (a pre-078 billed compaction whose model we can't recover →
+// attributed to `sessions.model`); a NULL model on `relevance` / `skipped` is NOT spend and is
+// ignored.
+export const compactionMetering = (
+  db: DB,
+  sessionId: string,
+): { models: string[]; hasUntracked: boolean } => {
+  const rows = db
+    .query('SELECT DISTINCT model, strategy FROM compaction_events WHERE session_id = ?')
+    .all(sessionId) as { model: string | null; strategy: string }[];
+  const models = [...new Set(rows.map((r) => r.model).filter((m): m is string => m !== null))];
+  const hasUntracked = rows.some((r) => r.model === null && isBilledCompactionStrategy(r.strategy));
+  return { models, hasUntracked };
+};

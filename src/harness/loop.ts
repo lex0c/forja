@@ -46,6 +46,7 @@ import {
   updateSessionCost,
 } from '../storage/index.ts';
 import { listApprovalsLogBySessionRecent } from '../storage/repos/approvals-log.ts';
+import { isBilledCompactionStrategy } from '../storage/repos/compaction-events.ts';
 import {
   createContextPinsStore,
   formatPinnedBlock,
@@ -2611,6 +2612,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             tokensBefore: promptTokens,
             recordedAt: Date.now(),
             ...e,
+            // The compaction provider's id (migration 078), recorded only when a provider
+            // call BILLED (llm / fallback). The relevance pre-pass makes no call → NULL, so a
+            // zero-cost relevance never marks the session metered.
+            model: isBilledCompactionStrategy(e.strategy) ? config.provider.id : null,
           });
 
         // Relevance pre-pass (opt-in): cheaply pointer-elide low-goal-

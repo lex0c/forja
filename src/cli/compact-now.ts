@@ -21,6 +21,7 @@ import type { SessionContext } from '../harness/session-context.ts';
 import type { RunBudget } from '../harness/types.ts';
 import type { Provider } from '../providers/index.ts';
 import type { DB } from '../storage/index.ts';
+import { isBilledCompactionStrategy } from '../storage/repos/compaction-events.ts';
 import { formatPinnedBlock, getActivePinsBySession } from '../storage/repos/context-pins.ts';
 import {
   getSession,
@@ -138,6 +139,9 @@ export const compactContextNow = async (
         cacheRead: result.usage.cache_read,
         cacheCreation: result.usage.cache_creation,
       },
+      // The compaction provider's id (migration 078), only when a provider call BILLED
+      // (llm / fallback); a relevance-only result made no call → NULL.
+      model: isBilledCompactionStrategy(result.strategy) ? provider.id : null,
       ...(relevanceElided !== null && relevanceElided.elidedCount > 0
         ? { freedBytes: relevanceElided.freedBytes, elidedIds: relevanceElided.elidedIds }
         : {}),
