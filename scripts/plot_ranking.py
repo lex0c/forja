@@ -107,6 +107,7 @@ def build_points(rows: list[dict], metric: str) -> list[dict]:
                 "free": cost is None,
                 "p50": to_float(r.get("p50_ms")),
                 "x": 0.0 if cost is None else cost,
+                "commit": (r.get("harness_commit") or "")[:8],
             }
         )
     return pts
@@ -282,8 +283,9 @@ def main() -> None:
         handles.append(Line2D([0], [0], ls="--", color="#444444", label="Pareto frontier"))
     ax.legend(handles=handles, title="provider", loc="lower right", fontsize=8, framealpha=0.9)
 
-    # Caption: provenance + how to read it.
-    commits = sorted({(r.get("harness_commit") or "")[:8] for r in rows if r.get("harness_commit")})
+    # Caption: provenance + how to read it. Commits come from the PLOTTED points
+    # (post-filter), so a dropped model's run can't leak into the provenance line.
+    commits = sorted({p["commit"] for p in pts if p["commit"]})
     size_note = "" if args.no_size else "   ·   point size ∝ speed (bigger = faster)"
     fig.text(
         0.5,
