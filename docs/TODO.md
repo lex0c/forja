@@ -517,6 +517,57 @@ half consumes.
 
 ---
 
+## Per-turn model provenance for historical cost surfaces (metered/unmetered split)
+
+**Status:** noted 2026-06-21 while closing a series of unmetered-cost-display bugs
+(`/stats`, `/sessions`, `--list`, headless recap). Each was the SAME root cause patched one
+surface at a time; this entry tracks the deep fix those patches deferred to.
+
+**What it is:** every cost surface infers a session's metering (real metered $ vs untracked
+"unmetered") from a SINGLE model — the live provider (`/stats`, recap) or the session row's
+model (`/sessions`, `--list`). But a session spans MULTIPLE models: `/model` switches
+mid-session, resume, and metered/unmetered subagents. The row's `model` is only the one at
+createSession time; `/model` mutates only `ctx.baseConfig.provider`. So a session that
+starts unmetered and switches to a metered model carries real `total_cost_usd` that the
+surfaces can mislabel. The minimum fixes already landed (never hide a nonzero recorded
+total; `/stats` resolves the SET of models in scope via `UsageStats.models`; recap carries
+the resolved render provider's flag). The deep fix is to **persist the model per turn**
+alongside its cost, so any surface computes the EXACT metered/unmetered split from the
+actual per-turn models instead of inferring from one.
+
+**Why deferred:** the minimum fixes close the data-loss risk (real money is never hidden);
+the deep fix is for breakdown PRECISION ("$X metered on A/B + untracked usage on C"), which
+only matters once switching between metered and unmetered tiers mid-session is common. It
+needs a migration + write-path + read-path change, not a render tweak.
+
+**Where it would land:**
+
+- **Migration** — a `model` column on the per-turn cost record (the assistant `messages`
+  rows that carry usage, or a dedicated per-turn usage table). Migrations are immutable → a
+  new migration.
+- **Write path** — record `config.provider.id` for the turn alongside its usage/cost when
+  the turn completes (`src/harness/loop.ts` cost-recording path).
+- **Read path** — `computeUsageStats` (`src/storage/repos/stats.ts`) + the `--list` /
+  `/sessions` aggregations group cost by the per-turn model, resolve each via the registry
+  (`isUnmeteredModel`), and report `{ metered: $X, hasUntracked: bool }` instead of a single
+  inferred flag. `formatCostCell` / the renderers then show the precise split.
+
+**Pull-in signal:** any of: (a) an operator who switches between metered (Anthropic/OpenAI)
+and unmetered (Ollama Cloud) models mid-session reports a misleading lifetime cost; (b) the
+ranking or a billing surface needs a per-model cost breakdown WITHIN a session; (c) the
+`unmetered` JSON field on `--list` rows is consumed by tooling that needs it accurate (today
+it's the initial-model approximation, with the dollars guarded separately so spend is never
+hidden).
+
+**Cost when pulled:** medium — one migration + the write-path field + the read-path
+aggregation. The `/stats` `UsageStats.models` set is a coarse half-step already in place.
+
+**Spec reference:** none yet — the cost-display contract (the `unmetered` capability) is
+unaffected; this is internal provenance + aggregation. A spec note on per-turn cost
+attribution could accompany it if the read-path surfaces change shape.
+
+---
+
 ## Rename `cost_per_1k_*` → `cost_per_1m_*` on `ProviderCapabilities`
 
 **Status:** field-name vs value-unit mismatch. Surfaced during the
