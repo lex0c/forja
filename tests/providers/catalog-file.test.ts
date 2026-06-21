@@ -465,6 +465,7 @@ describe('seed catalog + serialization', () => {
     expect(cloud.map((e) => e.id).sort()).toEqual([
       'ollama/devstral-2:123b',
       'ollama/glm-5.2',
+      'ollama/gpt-oss:20b',
       'ollama/qwen3-coder-next',
       'ollama/qwen3-coder:480b',
     ]);

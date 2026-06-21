@@ -3,7 +3,8 @@ import { OLLAMA_CAPS, OLLAMA_MODEL_NAMES } from '../../src/providers/ollama/capa
 
 describe('OLLAMA_CAPS catalog', () => {
   test('exposes the curated set and OLLAMA_MODEL_NAMES matches the keys', () => {
-    expect(OLLAMA_MODEL_NAMES).toHaveLength(7);
+    // gpt-oss:20b moved to the Ollama Cloud tier (OLLAMA_CLOUD_CAPS), leaving 6 local entries.
+    expect(OLLAMA_MODEL_NAMES).toHaveLength(6);
     expect([...OLLAMA_MODEL_NAMES].sort()).toEqual(Object.keys(OLLAMA_CAPS).sort());
   });
 

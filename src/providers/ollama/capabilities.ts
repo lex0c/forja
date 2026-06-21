@@ -91,14 +91,6 @@ export const OLLAMA_CAPS: Record<string, ProviderCapabilities> = {
     recommended_max_tools_per_step: 4,
     notes: ['12B, 128K context; tools'],
   },
-  // gpt-oss 20B — OpenAI open-weights, reasoning + agentic, 128K.
-  'gpt-oss:20b': {
-    ...OLLAMA_THINKING_BASE,
-    context_window: K128,
-    output_max_tokens: 16_384,
-    recommended_max_tools_per_step: 5,
-    notes: ['OpenAI open-weights; reasoning + agentic; think levels are F3'],
-  },
 };
 
 export const OLLAMA_MODEL_NAMES = Object.keys(OLLAMA_CAPS);
@@ -153,6 +145,19 @@ export const OLLAMA_CLOUD_CAPS: Record<string, ProviderCapabilities> = {
     output_max_tokens: 16_384,
     recommended_max_tools_per_step: 6,
     notes: ['Ollama Cloud; Devstral 2 123B; coding agents'],
+  },
+  // gpt-oss 20B — OpenAI open-weights, reasoning + agentic, 128K. Served on Ollama Cloud
+  // (and locally, but the seed ships the CLOUD tier so a default ranking/run reaches the
+  // hosted model, not a localhost daemon). 128K is its real capacity, not the 256K of the
+  // larger cloud models.
+  'gpt-oss:20b': {
+    ...OLLAMA_THINKING_BASE,
+    // Hosted on ollama.com — billed by subscription/GPU-time, not per token.
+    unmetered: true,
+    context_window: K128,
+    output_max_tokens: 16_384,
+    recommended_max_tools_per_step: 5,
+    notes: ['Ollama Cloud; OpenAI open-weights gpt-oss 20B; reasoning + agentic; think levels are F3'],
   },
 };
 
