@@ -7,16 +7,22 @@ this page explains how the ranking works — the methodology, not the models in 
 
 ## Current ranking
 
-> Snapshot of the latest run — **2026-06-20** (`smoke` ×2 + `edit-format` ×2 + `regression` ×1).
+> Snapshot of the latest run — **2026-06-21** (commit `5aa34cdb`; `smoke` ×2 + `edit-format` ×2 + `regression` ×1).
 > Sorted by **composite**, highest first. Authoritative data:
 > [`evals/ranking/results.csv`](../evals/ranking/results.csv) (when this table and the CSV disagree, the CSV wins).
+>
+> **Not comparable across the suite change:** `edit-format` is now `edit_file`-only — the forced
+> `git_apply_patch` A/B was removed in `5aa34cdb`, since production defers that tool. That column (and the
+> composite it feeds, ×2) jumped for every model vs older batches; the earlier 56–69% was the forced
+> deferred-tool penalty, not capability. Cost is **unmetered** for this cloud tier (billed by subscription,
+> not per token), so `cost_usd` is blank.
 
 | # | Model | Composite | smoke | edit-format | regression | steps/case | stable | unfinished | p50 lat |
 |---|---|---|---|---|---|---|---|---|---|
-| 1 | `ollama/devstral-2:123b` | **87%** | 90% | 88% | 86% | 3.1 | 100% | 6% | 4.9s |
-| 2 | `ollama/qwen3-coder:480b` | **78%** | 80% | 69% | 86% | 3.5 | 94% | 13% | 4.6s |
-| 3 | `ollama/glm-5.2` | **76%** | 90% | 56% | 88% | 2.8 | 94% | 10% | 4.5s |
-| 4 | `ollama/qwen3-coder-next` | **74%** | 80% | 56% | 88% | 2.8 | 94% | 8% | 3.6s |
+| 1 | `ollama/devstral-2:123b` | **94%** | 90% | 100% | 91% | 3.1 | 100% | 4% | 4.4s |
+| 2 | `ollama/glm-5.2` | **93%** | 90% | 100% | 88% | 2.6 | 100% | 1% | 3.3s |
+| 3 | `ollama/qwen3-coder-next` | **90%** | 70% | 100% | 91% | 2.4 | 100% | 1% | 3.0s |
+| 4 | `ollama/qwen3-coder:480b` | **87%** | 70% | 100% | 81% | 3.4 | 100% | 13% | 4.7s |
 
 ---
 
