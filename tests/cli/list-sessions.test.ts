@@ -119,6 +119,39 @@ describe('runListSessions', () => {
     expect((JSON.parse(out.join('').trim()) as { unmetered: boolean }).unmetered).toBe(true);
   });
 
+  test('default listing folds subtree models: unmetered parent + metered subagent reads metered', () => {
+    // --list (no --include-subagents) shows the parent's CUMULATIVE cost (folds the hidden
+    // subtree), so its unmetered flag must fold the subtree's models too. An unmetered parent
+    // with a metered subagent must NOT read as unmetered — its cumulative cost carries the
+    // subagent's metered spend.
+    const parent = createSession(db, { model: 'unmet/parent', cwd: '/p', startedAt: 1000 });
+    completeSession(db, parent.id, 'done', 0, true); // parent itself untracked ($0)
+    const child = createSession(db, {
+      model: 'met/child',
+      cwd: '/p',
+      startedAt: 1001,
+      parentSessionId: parent.id,
+    });
+    completeSession(db, child.id, 'done', 0.5, true); // metered subagent spend
+    const reg = {
+      get: (id: string) =>
+        id === 'unmet/parent'
+          ? { capabilities: { unmetered: true } }
+          : id === 'met/child'
+            ? { capabilities: {} }
+            : null,
+    } as unknown as ModelRegistry;
+    const out: string[] = [];
+    runListSessions({ json: true, dbOverride: db, registryOverride: reg, out: (l) => out.push(l) });
+    // Default mode emits only the parent row; its cumulative cost folds the subagent.
+    const item = JSON.parse(out.join('').trim()) as {
+      unmetered: boolean;
+      cumulative_cost_usd: number;
+    };
+    expect(item.cumulative_cost_usd).toBeCloseTo(0.5, 9);
+    expect(item.unmetered).toBe(false); // ...so the flag must fold the metered subagent model
+  });
+
   test('human render shows recorded dollars, not "unmetered", for an unmetered-row session that spent', () => {
     // The row model resolves unmetered (e.g. an Ollama Cloud start), but the session carries a
     // nonzero recorded cost — a /model switch to a metered model leaves real spend on a row whose

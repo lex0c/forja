@@ -184,28 +184,41 @@ const buildItem = (
 // both the tree shape AND the cost rollup, but consumers (JSON
 // or table renderer) get accurate cumulative for every node
 // without paying per-row walks.
-const fanSubtree = (
-  root: Session,
-  db: DB,
-  seen: Set<string>,
-): { session: Session; depth: number; cumulativeCost: number }[] => {
-  const out: { session: Session; depth: number; cumulativeCost: number }[] = [];
-  // Each visit appends a placeholder, recurses (filling
-  // descendants), then patches the placeholder's cumulative
-  // with own + sum of children's cumulatives. Returning the
-  // node's own cumulative lets the parent fold it in.
-  const visit = (s: Session, depth: number): number => {
-    if (seen.has(s.id)) return 0;
+interface SubtreeNode {
+  session: Session;
+  depth: number;
+  cumulativeCost: number;
+  // The models the node's WHOLE subtree billed on (own ∪ descendants), via
+  // effectiveSessionModels. Rolled up post-order alongside cumulativeCost so a row's
+  // metering is resolved from the same subtree its displayed cost folds — else an unmetered
+  // parent with a metered subagent (or the reverse) reads with the wrong unmetered flag while
+  // its cumulative cost carries the hidden subtree's spend.
+  cumulativeModels: string[];
+}
+
+const fanSubtree = (root: Session, db: DB, seen: Set<string>): SubtreeNode[] => {
+  const out: SubtreeNode[] = [];
+  // Each visit appends a placeholder, recurses (filling descendants), then patches the
+  // placeholder's cumulative cost AND models with own + the union of children's. Returning
+  // the node's own rollup lets the parent fold it in.
+  const visit = (s: Session, depth: number): { cost: number; models: readonly string[] } => {
+    if (seen.has(s.id)) return { cost: 0, models: [] };
     seen.add(s.id);
     const idx = out.length;
-    out.push({ session: s, depth, cumulativeCost: 0 });
+    out.push({ session: s, depth, cumulativeCost: 0, cumulativeModels: [] });
     let cumulative = s.totalCostUsd;
+    const models = new Set<string>(effectiveSessionModels(db, s.id, s.model));
     for (const child of listChildSessions(db, s.id)) {
-      cumulative += visit(child, depth + 1);
+      const childRollup = visit(child, depth + 1);
+      cumulative += childRollup.cost;
+      for (const m of childRollup.models) models.add(m);
     }
     const slot = out[idx];
-    if (slot !== undefined) slot.cumulativeCost = cumulative;
-    return cumulative;
+    if (slot !== undefined) {
+      slot.cumulativeCost = cumulative;
+      slot.cumulativeModels = [...models];
+    }
+    return { cost: cumulative, models: [...models] };
   };
   visit(root, 0);
   return out;
@@ -314,7 +327,13 @@ export const runListSessions = (options: ListSessionsOptions): number => {
           db,
           0,
           root !== undefined ? root.cumulativeCost : s.totalCostUsd,
-          isSessionUnmetered(registry, effectiveSessionModels(db, s.id, s.model)),
+          // Metering folds the SUBTREE's models (matching the cumulative cost), not just the
+          // parent's own — the subtree is hidden in this default listing, so its metered/
+          // unmetered usage must still be reflected in the row's flag.
+          isSessionUnmetered(
+            registry,
+            root !== undefined ? root.cumulativeModels : effectiveSessionModels(db, s.id, s.model),
+          ),
         );
       });
       emittedTopLevels = parents.length;
@@ -337,14 +356,16 @@ export const runListSessions = (options: ListSessionsOptions): number => {
       for (const parent of parents) {
         const subtree = fanSubtree(parent, db, seen);
         if (items.length + subtree.length > limit) break;
-        for (const { session, depth, cumulativeCost } of subtree) {
+        for (const { session, depth, cumulativeCost, cumulativeModels } of subtree) {
           items.push(
             buildItem(
               session,
               db,
               depth,
               cumulativeCost,
-              isSessionUnmetered(registry, effectiveSessionModels(db, session.id, session.model)),
+              // Same subtree-folded metering as the default path: each row's cumulativeCost
+              // already folds its descendants, so its flag must too.
+              isSessionUnmetered(registry, cumulativeModels),
             ),
           );
         }
