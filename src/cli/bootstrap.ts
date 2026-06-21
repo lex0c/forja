@@ -23,6 +23,7 @@ import {
 import { createSqliteFailureSink } from '../failures/index.ts';
 import { DEFAULT_EFFORT } from '../harness/effort.ts';
 import type { HarnessConfig, RunBudget } from '../harness/index.ts';
+import { effectiveBudget } from '../harness/types.ts';
 import {
   type HookConfigWarning,
   resolveHookConfig,
@@ -1654,11 +1655,17 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
 
   // maxCostUsd cannot bound an unmetered provider: cost is never tracked, so the
   // cap never triggers. Surface it instead of letting the operator believe their
-  // cost cap protects them on a hosted/unmetered tier (e.g. Ollama Cloud).
+  // cost cap protects them on a hosted/unmetered tier (e.g. Ollama Cloud). Resolve
+  // through `effectiveBudget` (NOT the partial `config.budget`): the common case is
+  // no explicit `[budget]`, yet the harness still applies DEFAULT_BUDGET.maxCostUsd
+  // ($100) and the UI presents it — an inert cap the operator should be warned about
+  // too. A genuine opt-out (`maxCostUsd: undefined`) resolves to undefined here and
+  // correctly stays silent.
+  const effectiveMaxCostUsd = effectiveBudget(config.budget, config.effort).maxCostUsd;
   const unmeteredCapWarnings =
-    config.budget?.maxCostUsd !== undefined && config.provider.capabilities.unmetered === true
+    effectiveMaxCostUsd !== undefined && config.provider.capabilities.unmetered === true
       ? [
-          `budget.maxCostUsd is set but model '${config.provider.id}' is unmetered (cost is not tracked per-token) — the cap cannot bound this run.`,
+          `the maxCostUsd cost cap ($${effectiveMaxCostUsd}) cannot bound this run: model '${config.provider.id}' is unmetered (cost is not tracked per-token).`,
         ]
       : [];
 

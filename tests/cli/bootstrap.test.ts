@@ -189,6 +189,49 @@ describe('bootstrap', () => {
     expect(budgetConfigWarnings.some((w) => w.includes('unmetered'))).toBe(false);
   });
 
+  test('budget warning fires on an unmetered provider with no explicit maxCostUsd (default cap)', async () => {
+    // No [budget] / CLI override: config.budget is absent here, but the harness still
+    // applies DEFAULT_BUDGET.maxCostUsd ($100) and the UI presents it — an inert cap on
+    // an unmetered tier. The warning must fire on the EFFECTIVE budget, not the partial.
+    const unmeteredProvider: Provider = {
+      ...mockProvider,
+      capabilities: { ...mockProvider.capabilities, unmetered: true },
+    };
+    const { db, budgetConfigWarnings } = await bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: unmeteredProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      // no budget override — the default $100 cap is what the harness/UI will use
+    });
+    db.close();
+    expect(
+      budgetConfigWarnings.some((w) => w.includes('unmetered') && w.includes('maxCostUsd')),
+    ).toBe(true);
+  });
+
+  test('no unmetered budget warning when the cost cap is opted out (maxCostUsd: undefined)', async () => {
+    // An explicit opt-out resolves through effectiveBudget to no cap at all — there is
+    // nothing inert to warn about, so the warning must stay silent.
+    const unmeteredProvider: Provider = {
+      ...mockProvider,
+      capabilities: { ...mockProvider.capabilities, unmetered: true },
+    };
+    const { db, budgetConfigWarnings } = await bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: unmeteredProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      budget: { maxCostUsd: undefined },
+    });
+    db.close();
+    expect(budgetConfigWarnings.some((w) => w.includes('unmetered'))).toBe(false);
+  });
+
   test('grants read_file + grep on the fetch_url spill dir (read elided pages)', async () => {
     // fetch_url spills oversized pages to `<cache>/fetch/<hash>.md`; without
     // this grant the scaffolded `./**`-only read policy would deny the
