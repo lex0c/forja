@@ -32,6 +32,7 @@ const TOP_LEVEL_KEYS: ReadonlySet<string> = new Set([
   'setup',
   'expect',
   'budget',
+  'evaluates',
 ]);
 
 const SETUP_KEYS: ReadonlySet<string> = new Set([
@@ -400,6 +401,12 @@ export const parseEvalCase = (yamlText: string, sourcePath: string): EvalCase =>
   if (setup !== undefined) out.setup = setup;
   const budget = parseBudget(r.budget);
   if (budget !== undefined) out.budget = budget;
+  if (r.evaluates !== undefined) {
+    if (r.evaluates !== 'model' && r.evaluates !== 'harness') {
+      throw new Error(`eval: ${sourcePath}: evaluates must be 'model' or 'harness'`);
+    }
+    out.evaluates = r.evaluates;
+  }
   return out;
 };
 

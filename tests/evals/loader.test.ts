@@ -21,6 +21,34 @@ describe('parseEvalCase', () => {
     expect(c.expect[0]).toEqual({ kind: 'tool_called', tool: 'read_file' });
   });
 
+  test('evaluates defaults to undefined (counts as model in the ranking)', () => {
+    expect(parseEvalCase(minimal, '/tmp/case.yaml').evaluates).toBeUndefined();
+  });
+
+  test('parses evaluates: harness', () => {
+    const yaml = `
+name: c
+prompt: p
+evaluates: harness
+expect:
+  - tool_called: read_file
+`;
+    expect(parseEvalCase(yaml, '/tmp/c.yaml').evaluates).toBe('harness');
+  });
+
+  test('rejects an invalid evaluates value', () => {
+    const yaml = `
+name: c
+prompt: p
+evaluates: sometimes
+expect:
+  - tool_called: read_file
+`;
+    expect(() => parseEvalCase(yaml, '/tmp/c.yaml')).toThrow(
+      /evaluates must be 'model' or 'harness'/,
+    );
+  });
+
   test('parses all expectation kinds', () => {
     const yaml = `
 name: all

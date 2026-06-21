@@ -1,4 +1,5 @@
 name: compaction triggers more than once in a single run
+evaluates: harness
 prompt: |
   Read every TypeScript file under src/ in alphabetical order
   (a.ts, b.ts, c.ts, d.ts, e.ts), then read each one a SECOND time in the

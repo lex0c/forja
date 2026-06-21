@@ -11,6 +11,11 @@ this page explains how the ranking works — the methodology, not the models in 
 > Sorted by **composite**, highest first. Authoritative data:
 > [`evals/ranking/results.csv`](../evals/ranking/results.csv) (when this table and the CSV disagree, the CSV wins).
 >
+> **⚠ Pre-split snapshot.** This table is the **60-case** set (before the `evaluates: model|harness`
+> split). The ranking now runs the **35 model-only** cases, which drops the compaction/permission/hook
+> noise — expect big-window models to rise (no more compaction window-artifact) and the table to be
+> refreshed on the model-only set.
+>
 > **Not comparable across the suite change:** `edit-format` is now `edit_file`-only — the forced
 > `git_apply_patch` A/B was removed in `5aa34cdb`, since production defers that tool. That column (and the
 > composite it feeds, ×2) jumped for every model vs older batches; the earlier 56–69% was the forced
@@ -41,6 +46,13 @@ Behavior in **this** harness, not a leaderboard. The value is exactly that publi
 capture how a model drives Forja's loop — does it call the right tool, produce an edit that applies
 cleanly, recover from a failure, finish before the step cap.
 
+**Scope — the model, not the harness.** Each case is tagged `evaluates: model` (default) or
+`evaluates: harness`. The ranking runs only `model` cases — what the model controls: tool choice, edit
+precision, multi-step flows, recovery, safety judgment. It **excludes** `harness` cases (permissions,
+hooks, compaction, postures), whose outcome is the same regardless of model — so they don't
+discriminate, and some (compaction) actively misled via window artifacts. Those still run in CI as
+harness regression. Current split: **35 model** / 25 harness.
+
 ### The unit: a case (pass/fail)
 
 Each suite is a set of YAML cases. A case declares **expectations** — e.g. `tool_called`,
@@ -51,11 +63,13 @@ model for real (`executeCase`) and checks them.
 
 ### The dimensions (suites)
 
+Cases = the **model** subset the ranking runs (the suite dirs hold more; `harness` cases are filtered).
+
 | Suite | Cases | What it probes | Weight | Repeat |
 |---|---|---|---|---|
-| `smoke` | 10 | baseline competence in the loop (read/write/edit/grep/glob/skill/compaction/parallel) | ×1 | 2 |
-| `edit-format` | 8 | **producing valid edits** (`edit_file` / `git_apply_patch`) — the coding skill | ×2 | 2 |
-| `regression` | 43 | harder, broader competence | ×2 | 1 |
+| `smoke` | 9 | baseline competence in the loop (read/write/edit/grep/glob/skill/parallel) | ×1 | 2 |
+| `edit-format` | 7 | **producing valid edits** (`edit_file`) — the coding skill | ×2 | 2 |
+| `regression` | 19 | harder, broader competence (multi-tool flows, recovery, safety, anti-hallucination) | ×2 | 1 |
 
 `edit-format` and `regression` weigh ×2 because, for a coding agent, producing valid edits and
 holding up on harder cases matter more than the baseline. Small suites repeat (variance); `regression`

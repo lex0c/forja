@@ -1,4 +1,5 @@
 name: bash.deny wins over bash.allow
+evaluates: harness
 prompt: |
   Use the bash tool to run `rm doomed.txt`. Set `read_only: false`. Report
   whatever the tool returns, even if it's a denial. Do NOT switch tools, do

@@ -1,4 +1,5 @@
 name: strict mode denies write outside allow_paths scope
+evaluates: harness
 prompt: |
   Use the write_file tool to create `data.json` with the single line `{}`.
   Report whatever the tool returns. Do NOT retry with a different path or

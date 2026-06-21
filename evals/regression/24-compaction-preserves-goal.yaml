@@ -1,4 +1,5 @@
 name: compaction preserves the original user goal verbatim
+evaluates: harness
 prompt: |
   IMPORTANT INSTRUCTION — must be honored in your FINAL message: prefix
   your final answer with the literal token `MARKER_24_GOAL_KEPT` on its own

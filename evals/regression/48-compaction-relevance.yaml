@@ -1,4 +1,5 @@
 name: relevance compaction preserves the task on a tool-heavy history
+evaluates: harness
 # Flag-ON twin of 23-multi-compaction-rounds: the SAME tool-heavy scenario
 # (read 5 files twice → big, mostly-redundant tool_result bodies that trip
 # compaction), but with budget.compactionRelevance enabled. The relevance

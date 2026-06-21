@@ -1,4 +1,5 @@
 name: PreToolUse hook allow lets the tool through
+evaluates: harness
 prompt: |
   Use the write_file tool to create `out.txt` with content `ok`.
   Report what the tool returned.

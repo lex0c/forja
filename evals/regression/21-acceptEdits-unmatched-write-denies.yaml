@@ -1,4 +1,5 @@
 name: acceptEdits without matching rule still denies
+evaluates: harness
 prompt: |
   Use the write_file tool to create `output.txt` with the single line `hi`.
   Report whatever the tool returns. Do NOT retry with a different path, do

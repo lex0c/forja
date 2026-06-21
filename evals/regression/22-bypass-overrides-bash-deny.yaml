@@ -1,4 +1,5 @@
 name: bypass mode short-circuits and ignores deny rules
+evaluates: harness
 prompt: |
   Use the bash tool to run `rm temp.txt`. Set `read_only: false`. Reply with
   whatever the tool returns. The file already exists in the working

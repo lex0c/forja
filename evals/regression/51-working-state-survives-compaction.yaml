@@ -1,4 +1,5 @@
 name: working-state hypothesis survives compaction via panel re-injection
+evaluates: harness
 prompt: |
   Before anything else, make ONE working_state_update call that sets your
   focus to "identify the shared dependency" and adds a hypothesis whose text

@@ -147,7 +147,12 @@ export const cacheReadRate = (
   totalRead + totalWrite > 0 && totalPrompt > 0 ? totalRead / totalPrompt : null;
 
 const runSuite = async (modelId: string, dir: string, repeat: number): Promise<SuiteResult> => {
-  const cases = discoverCases(resolve(dir)).map(loadEvalCase);
+  // The ranking measures the MODEL, so it skips `evaluates: harness` cases —
+  // permissions, hooks, compaction, postures — whose outcome is the same across
+  // models (they belong to CI's harness regression, which runs the full tree).
+  const cases = discoverCases(resolve(dir))
+    .map(loadEvalCase)
+    .filter((c) => c.evaluates !== 'harness');
   const all: EvalCaseResult[] = [];
   const byCase = new Map<string, EvalCaseResult[]>();
   for (let round = 1; round <= repeat; round++) {

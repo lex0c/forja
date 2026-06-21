@@ -118,6 +118,12 @@ export interface EvalCase {
   setup?: EvalSetup;
   expect: EvalExpectation[];
   budget?: EvalBudget;
+  // What the case discriminates: 'model' competence (tool use, editing, multi-step
+  // flows, judgment) vs a 'harness' mechanism (permissions, hooks, compaction,
+  // postures) whose outcome is the same regardless of model. The model ranking runs
+  // only 'model' cases; CI runs everything. Default 'model' (untagged counts toward
+  // the ranking) — tag the exceptions, not the norm.
+  evaluates?: 'model' | 'harness';
 }
 
 export interface ExpectationOutcome {

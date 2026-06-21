@@ -1,4 +1,5 @@
 name: strict mode with no rules default-denies
+evaluates: harness
 prompt: |
   Use the read_file tool to read `notes.txt`. Reply with whatever the tool
   returns, even if it's an error. Do NOT switch to a different tool, do NOT
