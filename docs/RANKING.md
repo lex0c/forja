@@ -7,7 +7,7 @@ this page explains how the ranking works — the methodology, not the models in 
 
 ## Current ranking
 
-> Snapshot of the latest run — **2026-06-21** (commit `5aa34cdb`; `smoke` ×2 + `edit-format` ×2 + `regression` ×1).
+> Snapshot of the latest run — **2026-06-21** (commits `5aa34cdb` / `8787d691`, same harness; `smoke` ×2 + `edit-format` ×2 + `regression` ×1).
 > Sorted by **composite**, highest first. Authoritative data:
 > [`evals/ranking/results.csv`](../evals/ranking/results.csv) (when this table and the CSV disagree, the CSV wins).
 >
@@ -23,6 +23,13 @@ this page explains how the ranking works — the methodology, not the models in 
 | 2 | `ollama/glm-5.2` | **93%** | 90% | 100% | 88% | 2.6 | 100% | 1% | 3.3s |
 | 3 | `ollama/qwen3-coder-next` | **90%** | 70% | 100% | 91% | 2.4 | 100% | 1% | 3.0s |
 | 4 | `ollama/qwen3-coder:480b` | **87%** | 70% | 100% | 81% | 3.4 | 100% | 13% | 4.7s |
+| 5 | `ollama/gpt-oss:20b` | **74%** | 65% | 71% | 81% | 3.4 | 82% | 16% | 6.4s |
+
+> **Smallest viable model is `gpt-oss:20b` (20B, cloud).** Local small models were tried and retired — both
+> scored ~2%: `qwen2.5-coder:7b` emits no native `tool_calls` via Ollama (1 step, never executes), and
+> `llama3.1:8b` drives the loop but is too slow on test hardware (~180s to read one file → every case times
+> out). Ollama Cloud serves nothing under ~20B, so the bench is effectively cloud-only. Their rows stay in
+> the CSV as documented attempts.
 
 ---
 

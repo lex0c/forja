@@ -29,12 +29,28 @@ import { loadEvalCase } from '../src/evals/loader.ts';
 import type { EvalCaseResult } from '../src/evals/types.ts';
 
 // --- Battery config -------------------------------------------------------
-const MODELS: readonly string[] = [
+// The full ranking set. RANKING_MODELS="id,id" runs a SUBSET — e.g. to add a new
+// model without re-running the rest. A subset batch stays comparable to the others
+// as long as harness_commit matches (the unit of comparability), just under a
+// different run_ts.
+//
+// All cloud. Local small models proved non-viable on this bench/hardware and were
+// retired: qwen2.5-coder:7b emits no native tool_calls via Ollama (1 step, never
+// executes → 2%); llama3.1:8b drives the loop but is too slow (~180s to read one
+// file → every case times out → 2%). Ollama Cloud serves no model under ~20B, so
+// gpt-oss:20b is the smallest agent that actually completes the battery.
+const ALL_MODELS: readonly string[] = [
   'ollama/glm-5.2',
   'ollama/devstral-2:123b',
   'ollama/qwen3-coder-next',
   'ollama/qwen3-coder:480b',
+  'ollama/gpt-oss:20b',
 ];
+const MODELS: readonly string[] = process.env.RANKING_MODELS
+  ? process.env.RANKING_MODELS.split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0)
+  : ALL_MODELS;
 
 // Per-suite repeat: small suites repeat for variance; regression (43 cases)
 // already has a stable N at repeat 1. RANKING_REPEAT overrides the small ones.
