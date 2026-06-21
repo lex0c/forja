@@ -80,6 +80,20 @@ describe('messages repo', () => {
     expect(effectiveSessionModels(db, other, 'fallback/x')).toEqual(['fallback/x']);
   });
 
+  test('effectiveSessionModels keeps the fallback when a billed turn still has a NULL model', () => {
+    // Pre-migration session: an assistant turn billed on the (metered) sessions.model but
+    // recorded NULL model, then resumed post-migration with an unmetered turn. The fallback
+    // MUST stay in the set — else the metered pre-migration spend is dropped and the session
+    // would read as unmetered. A NULL-model USER row must NOT trigger it (not a billed turn).
+    appendMessage(db, { sessionId, role: 'assistant', content: 'pre', costUsd: 0.5 }); // NULL model
+    appendMessage(db, { sessionId, role: 'user', content: 'q' }); // NULL model, not billed
+    appendMessage(db, { sessionId, role: 'assistant', content: 'post', model: 'ollama/glm-5.2' });
+    expect(effectiveSessionModels(db, sessionId, 'metered/initial').sort()).toEqual([
+      'metered/initial',
+      'ollama/glm-5.2',
+    ]);
+  });
+
   test('source defaults to operator and round-trips an explicit system source (migration 075)', () => {
     const op = appendMessage(db, { sessionId, role: 'user', content: 'hi' });
     expect(op.source).toBe('operator');

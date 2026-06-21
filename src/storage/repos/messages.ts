@@ -244,18 +244,32 @@ export const distinctSessionModels = (db: DB, sessionId: string): string[] => {
   return rows.map((r) => r.model);
 };
 
-// The session's EFFECTIVE models for metering: its per-turn models, or
-// `[fallbackModel]` (the stored `sessions.model`) when none were recorded
-// (pre-migration rows / no billed turns). The ONE place the fallback rule lives,
-// so the read surfaces (`--list`, `/sessions`, `/stats`) can't drift on it.
+// The session's EFFECTIVE models for metering: its per-turn models, PLUS the stored
+// `sessions.model` fallback when (a) no model was recorded at all, OR (b) any BILLED turn
+// still has a NULL model — an assistant row persisted before migration 077, i.e. spend on a
+// model we can't recover, which we attribute to `sessions.model`. The ONE place the fallback
+// rule lives, so the read surfaces (`--list`, `/sessions`, `/stats`) can't drift on it.
 // Always non-empty, so callers (e.g. `isSessionUnmetered`) never face `[].every()`.
+//
+// Including the fallback on (b) — not only (a) — is load-bearing: a session that spent on a
+// metered model PRE-migration (NULL rows) and is later resumed with an unmetered turn would
+// otherwise return only the unmetered model and read as unmetered, hiding that metered spend.
 export const effectiveSessionModels = (
   db: DB,
   sessionId: string,
   fallbackModel: string,
 ): string[] => {
   const models = distinctSessionModels(db, sessionId);
-  return models.length > 0 ? models : [fallbackModel];
+  const hasUntrackedBilledTurn =
+    db
+      .query(
+        "SELECT 1 FROM messages WHERE session_id = ? AND role = 'assistant' AND model IS NULL LIMIT 1",
+      )
+      .get(sessionId) !== null;
+  if (models.length === 0 || hasUntrackedBilledTurn) {
+    return models.includes(fallbackModel) ? models : [...models, fallbackModel];
+  }
+  return models;
 };
 
 // Bounded tail variant for resume: fetches at most `limit` of the
