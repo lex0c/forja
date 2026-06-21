@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   UNMETERED_LABEL,
   formatCostCell,
+  isSessionUnmetered,
   isUnmetered,
   isUnmeteredModel,
 } from '../../src/providers/cost-format.ts';
@@ -55,5 +56,34 @@ describe('isUnmeteredModel (historical, via registry)', () => {
     expect(isUnmeteredModel(reg, 'x/unmet')).toBe(true);
     expect(isUnmeteredModel(reg, 'x/met')).toBe(false);
     expect(isUnmeteredModel(reg, 'x/gone')).toBe(false);
+  });
+});
+
+describe('isSessionUnmetered (per-turn provenance, migration 077)', () => {
+  const reg = {
+    get: (id: string) =>
+      id === 'x/unmet' || id === 'x/unmet2'
+        ? { capabilities: caps({ unmetered: true }) }
+        : id === 'x/met'
+          ? { capabilities: caps({}) }
+          : null,
+  } as unknown as ModelRegistry;
+
+  test('every model unmetered ⇒ unmetered (the recorded $ is untracked)', () => {
+    expect(isSessionUnmetered(reg, ['x/unmet', 'x/unmet2'])).toBe(true);
+  });
+  test('ANY metered model ⇒ NOT unmetered, even mixed with an unmetered one', () => {
+    // The switched-session bug: started unmetered, then /model-switched to a metered
+    // model. The metered spend is real, so the row must NOT read as "unmetered".
+    expect(isSessionUnmetered(reg, ['x/unmet', 'x/met'])).toBe(false);
+    expect(isSessionUnmetered(reg, ['x/met'])).toBe(false);
+  });
+  test('empty model set ⇒ not unmetered (guard; callers pass effective, non-empty models)', () => {
+    // The fallback to sessions.model lives in `effectiveSessionModels`, so an empty set
+    // here is misuse — it must NOT read as vacuously unmetered (`[].every() === true`).
+    expect(isSessionUnmetered(reg, [])).toBe(false);
+  });
+  test('an unknown model (dropped from the catalog) counts as metered', () => {
+    expect(isSessionUnmetered(reg, ['x/gone'])).toBe(false);
   });
 });

@@ -39,6 +39,12 @@ export interface Message {
   // every pre-migration row and the normal case; 'system' for
   // harness-injected turns (bg_done wake notifications). See MessageSource.
   source: MessageSource;
+  // The model that BILLED this turn — migration 077. Set on ASSISTANT rows (the
+  // provider id, e.g. 'ollama/glm-5.2' / 'anthropic/claude-opus-4-8'); NULL on
+  // user/tool rows and rows persisted before the migration. Per-turn provenance
+  // so historical cost surfaces resolve a session's ACTUAL metering from the
+  // models it really used, not the session's initial `sessions.model`.
+  model: string | null;
 }
 
 interface MessageRow {
@@ -56,6 +62,7 @@ interface MessageRow {
   prompt_hash: string | null;
   effort: string | null;
   source: MessageSource;
+  model: string | null;
 }
 
 const fromRow = (row: MessageRow): Message => ({
@@ -73,6 +80,7 @@ const fromRow = (row: MessageRow): Message => ({
   promptHash: row.prompt_hash,
   effort: row.effort,
   source: row.source,
+  model: row.model,
 });
 
 export interface AppendMessageInput {
@@ -101,6 +109,10 @@ export interface AppendMessageInput {
   // path passes 'system' so the notification isn't audited/resumed as
   // operator input. See MessageSource.
   source?: MessageSource;
+  // The model that billed this turn (migration 077). The harness loop sources
+  // it from the per-request provider id. Nullable: user/tool rows and turns
+  // with no resolved provider.
+  model?: string | null;
 }
 
 export const appendMessage = (db: DB, input: AppendMessageInput): Message => {
@@ -143,12 +155,13 @@ export const appendMessage = (db: DB, input: AppendMessageInput): Message => {
   const promptHash = input.promptHash ?? null;
   const effort = input.effort ?? null;
   const source: MessageSource = input.source ?? 'operator';
+  const model = input.model ?? null;
   db.query(
     `INSERT INTO messages
      (id, session_id, parent_id, role, content,
-      tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source, seq)
+      tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source, model, seq)
      VALUES (
-       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
        (SELECT COALESCE(MAX(seq), -1) + 1 FROM messages WHERE session_id = ?)
      )`,
   ).run(
@@ -166,6 +179,7 @@ export const appendMessage = (db: DB, input: AppendMessageInput): Message => {
     promptHash,
     effort,
     source,
+    model,
     input.sessionId,
   );
   return {
@@ -183,6 +197,7 @@ export const appendMessage = (db: DB, input: AppendMessageInput): Message => {
     promptHash,
     effort,
     source,
+    model,
   };
 };
 
@@ -190,7 +205,7 @@ export const getMessage = (db: DB, id: string): Message | null => {
   const row = db
     .query(
       `SELECT id, session_id, parent_id, role, content,
-              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source
+              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source, model
        FROM messages WHERE id = ?`,
     )
     .get(id) as MessageRow | null;
@@ -207,13 +222,40 @@ export const listMessagesBySession = (db: DB, sessionId: string): Message[] => {
   const rows = db
     .query(
       `SELECT id, session_id, parent_id, role, content,
-              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source
+              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source, model
        FROM messages
        WHERE session_id = ?
        ORDER BY seq ASC`,
     )
     .all(sessionId) as MessageRow[];
   return rows.map(fromRow);
+};
+
+// The distinct non-null models that BILLED a session's turns (migration 077) —
+// per-turn provenance. Lets a historical cost surface resolve the session's
+// ACTUAL metering from the models it really used, instead of `sessions.model`
+// (the model at createSession time, which a `/model` switch leaves stale).
+// Empty when no turn recorded a model (pre-migration rows, or a session with no
+// billed assistant turns); callers fall back to `sessions.model` in that case.
+export const distinctSessionModels = (db: DB, sessionId: string): string[] => {
+  const rows = db
+    .query('SELECT DISTINCT model FROM messages WHERE session_id = ? AND model IS NOT NULL')
+    .all(sessionId) as { model: string }[];
+  return rows.map((r) => r.model);
+};
+
+// The session's EFFECTIVE models for metering: its per-turn models, or
+// `[fallbackModel]` (the stored `sessions.model`) when none were recorded
+// (pre-migration rows / no billed turns). The ONE place the fallback rule lives,
+// so the read surfaces (`--list`, `/sessions`, `/stats`) can't drift on it.
+// Always non-empty, so callers (e.g. `isSessionUnmetered`) never face `[].every()`.
+export const effectiveSessionModels = (
+  db: DB,
+  sessionId: string,
+  fallbackModel: string,
+): string[] => {
+  const models = distinctSessionModels(db, sessionId);
+  return models.length > 0 ? models : [fallbackModel];
 };
 
 // Bounded tail variant for resume: fetches at most `limit` of the
@@ -265,7 +307,7 @@ export const listMessageTailBySession = (db: DB, sessionId: string, limit: numbe
   const rows = db
     .query(
       `SELECT id, session_id, parent_id, role, content,
-              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source
+              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source, model
        FROM (
          SELECT * FROM messages
          WHERE session_id = ?

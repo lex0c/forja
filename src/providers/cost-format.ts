@@ -19,9 +19,20 @@ export const isUnmetered = (provider: Pick<Provider, 'capabilities'>): boolean =
 // back to the recorded cost), no worse than before. Caveat: a REPL session's stored model
 // is the one at createSession time; a `/model` switch mid-session does NOT update it, so
 // this can mislabel a session that switched metering — which is why `formatCostCell` never
-// lets the label replace a nonzero recorded total.
+// lets the label replace a nonzero recorded total, and why historical surfaces should
+// prefer `isSessionUnmetered` (per-turn provenance) when the session's models are known.
 export const isUnmeteredModel = (registry: ModelRegistry, modelId: string): boolean =>
   registry.get(modelId)?.capabilities.unmetered === true;
+
+// Is a session's recorded cost untracked? unmetered=true ONLY when EVERY model it billed on
+// is unmetered — a session that used any metered model carries real recorded spend and is
+// NOT unmetered (even if it also used an unmetered one), so the dollars are never mislabeled
+// away as "unmetered". `models` is the session's EFFECTIVE models (from
+// `effectiveSessionModels`, which folds the `sessions.model` fallback in ONE place); the
+// `length > 0` guard keeps an empty set (a misuse — effective models are never empty) from
+// reading as vacuously unmetered.
+export const isSessionUnmetered = (registry: ModelRegistry, models: string[]): boolean =>
+  models.length > 0 && models.every((m) => isUnmeteredModel(registry, m));
 
 // The shared cost cell. The "unmetered" label renders ONLY when the recorded cost is
 // exactly 0 — the label means "$0 is untracked, not free", which is meaningful only when

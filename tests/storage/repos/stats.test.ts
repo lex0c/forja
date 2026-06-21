@@ -77,6 +77,39 @@ describe('computeUsageStats', () => {
     expect(s.sessionCount).toBe(1);
   });
 
+  test('models reflects the per-turn models a session billed on, not its initial model', () => {
+    // A session created on 'mock/initial' that /model-switched: two assistant turns on
+    // different models. computeUsageStats must surface the ACTUAL models (migration 077),
+    // not the stale sessions.model — so /stats resolves scope metering correctly.
+    const root = createSession(db, { model: 'mock/initial', cwd: '/p' });
+    appendMessage(db, {
+      sessionId: root.id,
+      role: 'assistant',
+      content: 'a',
+      model: 'ollama/glm-5.2',
+      costUsd: 0,
+    });
+    appendMessage(db, {
+      sessionId: root.id,
+      role: 'assistant',
+      content: 'b',
+      model: 'anthropic/claude-opus-4-8',
+      costUsd: 0.01,
+    });
+    const s = computeUsageStats(db, [root.id]);
+    expect([...s.models].sort()).toEqual(['anthropic/claude-opus-4-8', 'ollama/glm-5.2']);
+    expect(s.models).not.toContain('mock/initial'); // the stale initial model is NOT used
+  });
+
+  test('models falls back to the session model when no turn recorded one', () => {
+    // Pre-migration rows / turns with no resolved provider record NULL model →
+    // effectiveSessionModels falls back to sessions.model so the scope is never empty.
+    const root = createSession(db, { model: 'mock/initial', cwd: '/p' });
+    usage(root.id, { in: 1, out: 1, cacheRead: 0, cacheCreation: 0 }); // assistant turn, NULL model
+    const s = computeUsageStats(db, [root.id]);
+    expect(s.models).toEqual(['mock/initial']);
+  });
+
   test('walks subagent descendants (cost + tokens) via parent_session_id', () => {
     const root = createSession(db, { model: 'm', cwd: '/p' });
     updateSessionCost(db, root.id, 0.04);

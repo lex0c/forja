@@ -3012,6 +3012,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // The provider reasoning-effort resolved for THIS request
           // (migration 074) — records the effort that produced the turn.
           reqEffort ?? null,
+          // The model that billed THIS turn (migration 077) — per-turn provenance
+          // so historical cost surfaces resolve metering from the models actually
+          // used, not the session's initial model. A /model switch changes it.
+          config.provider.id,
         );
 
         // After appendAssistant so the post-persist contract holds:

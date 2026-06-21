@@ -22,7 +22,11 @@
 
 import type { DB } from '../db.ts';
 import { sumCompactionContextReclaim, sumCompactionUsage } from './compaction-events.ts';
-import { countAssistantMessagesBySession, sumMessageUsage } from './messages.ts';
+import {
+  countAssistantMessagesBySession,
+  effectiveSessionModels,
+  sumMessageUsage,
+} from './messages.ts';
 import { getSession, listChildSessions } from './sessions.ts';
 
 export interface UsageStats {
@@ -121,7 +125,11 @@ export const computeUsageStats = (db: DB, rootSessionIds: readonly string[]): Us
     const session = getSession(db, id);
     if (session === null) return;
     stats.sessionCount += 1;
-    models.add(session.model);
+    // Per-turn models (migration 077) so the scope's metering reflects the models
+    // ACTUALLY used, not each session's initial `model` (a /model switch leaves it
+    // stale). `effectiveSessionModels` folds the pre-migration / no-billed-turn
+    // fallback to `sessions.model` in one place (shared with `isSessionUnmetered`).
+    for (const m of effectiveSessionModels(db, id, session.model)) models.add(m);
     stats.costUsd += session.totalCostUsd;
     if (!session.usageComplete) stats.usageComplete = false;
     // Tokens come from TWO sources: the per-turn `messages` rows, plus the

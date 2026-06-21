@@ -189,6 +189,8 @@ export const synthesizeOnExhaustion = async (
     },
     config.systemPromptHash ?? null,
     reqEffort ?? null,
+    // The model that billed this synthesis turn (migration 077).
+    config.provider.id,
   );
   deps.emitCostUpdate(turnCostUsd);
   // usage_persisted is the display cue (fires for EVERY settled response);

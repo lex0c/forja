@@ -4,6 +4,8 @@ import type { DB } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import {
   appendMessage,
+  distinctSessionModels,
+  effectiveSessionModels,
   getMessage,
   listMessageTailBySession,
   listMessagesBySession,
@@ -29,6 +31,53 @@ describe('messages repo', () => {
     const fetched = getMessage(db, m.id);
     expect(fetched).toEqual(m);
     expect(fetched?.content).toEqual({ text: 'hello' });
+  });
+
+  test('records the per-turn model on assistant rows and round-trips it (migration 077)', () => {
+    const a = appendMessage(db, {
+      sessionId,
+      role: 'assistant',
+      content: 'hi',
+      costUsd: 0.01,
+      model: 'anthropic/claude-opus-4-8',
+    });
+    expect(a.model).toBe('anthropic/claude-opus-4-8');
+    expect(getMessage(db, a.id)?.model).toBe('anthropic/claude-opus-4-8');
+    // Defaults to null when not supplied (user / tool rows have no model).
+    const u = appendMessage(db, { sessionId, role: 'user', content: 'q' });
+    expect(u.model).toBeNull();
+    expect(getMessage(db, u.id)?.model).toBeNull();
+  });
+
+  test('distinctSessionModels returns the distinct non-null models that billed the session', () => {
+    // A session that started on one model and /model-switched to another.
+    appendMessage(db, { sessionId, role: 'assistant', content: 'a', model: 'ollama/glm-5.2' });
+    appendMessage(db, { sessionId, role: 'user', content: 'q' }); // no model
+    appendMessage(db, { sessionId, role: 'assistant', content: 'b', model: 'ollama/glm-5.2' }); // dup
+    appendMessage(db, {
+      sessionId,
+      role: 'assistant',
+      content: 'c',
+      model: 'anthropic/claude-opus-4-8',
+    });
+    expect(distinctSessionModels(db, sessionId).sort()).toEqual([
+      'anthropic/claude-opus-4-8',
+      'ollama/glm-5.2',
+    ]);
+    // A session with no recorded model → empty (caller falls back to sessions.model).
+    const other = createSession(db, { model: 'm', cwd: '/p' }).id;
+    appendMessage(db, { sessionId: other, role: 'user', content: 'q' });
+    expect(distinctSessionModels(db, other)).toEqual([]);
+  });
+
+  test('effectiveSessionModels returns per-turn models, else [fallback] when none recorded', () => {
+    appendMessage(db, { sessionId, role: 'assistant', content: 'a', model: 'ollama/glm-5.2' });
+    expect(effectiveSessionModels(db, sessionId, 'fallback/x')).toEqual(['ollama/glm-5.2']);
+    // No billed turns → the fallback (sessions.model) as a single-element list, so callers
+    // never face an empty set.
+    const other = createSession(db, { model: 'm', cwd: '/p' }).id;
+    appendMessage(db, { sessionId: other, role: 'user', content: 'q' });
+    expect(effectiveSessionModels(db, other, 'fallback/x')).toEqual(['fallback/x']);
   });
 
   test('source defaults to operator and round-trips an explicit system source (migration 075)', () => {

@@ -6,8 +6,9 @@
 // cluttering the list). Defaults to 10 most recent; first arg
 // overrides the limit (`/sessions 25`).
 
-import { formatCostCell, isUnmeteredModel } from '../../../providers/cost-format.ts';
+import { formatCostCell, isSessionUnmetered } from '../../../providers/cost-format.ts';
 import { listSessions } from '../../../storage/index.ts';
+import { effectiveSessionModels } from '../../../storage/repos/messages.ts';
 import { formatCost } from '../format.ts';
 import type { SlashCommand } from '../types.ts';
 
@@ -69,7 +70,7 @@ export const sessionsCommand: SlashCommand = {
       // An unmetered tier records $0 (reads as "free") — show "unmetered"; an
       // unknown model (dropped from the catalog) falls back to the recorded cost.
       const cost = formatCostCell(
-        isUnmeteredModel(ctx.modelRegistry, s.model),
+        isSessionUnmetered(ctx.modelRegistry, effectiveSessionModels(ctx.db, s.id, s.model)),
         s.usageComplete,
         formatCost,
         s.totalCostUsd,
