@@ -4,8 +4,9 @@
 // is required to inspect prior runs, and a missing/unparsable
 // permissions.yaml doesn't block the listing.
 
-import { createDefaultRegistry } from '../providers/catalog-file.ts';
+import { createDefaultRegistry, loadModelRegistry } from '../providers/catalog-file.ts';
 import { isUnmeteredModel } from '../providers/cost-format.ts';
+import type { ModelRegistry } from '../providers/registry.ts';
 import type { Session } from '../storage/index.ts';
 import {
   type DB,
@@ -25,6 +26,9 @@ export interface ListSessionsOptions {
   // tests that don't want to touch ~/.config/forja/).
   dbPath?: string;
   dbOverride?: DB;
+  // Test seam: the catalog used to resolve per-row metering. Production loads the
+  // operator's installed catalog (with a seed fallback); a test passes a stub.
+  registryOverride?: ModelRegistry;
   out: (s: string) => void;
   // Optional stderr sink. Used only to emit a one-line truncation
   // hint when --include-subagents would have produced more rows
@@ -251,15 +255,27 @@ const writeTable = (items: SessionListItem[], out: (s: string) => void): void =>
   }
 };
 
+// Resolve metering against the operator's INSTALLED catalog; fall back to the built-in
+// seed when the catalog file is absent/unparsable (best-effort, non-blocking — keeps
+// list-sessions free of the bootstrap and API-key requirements its header promises).
+const loadInstalledRegistry = (): ModelRegistry => {
+  try {
+    return loadModelRegistry().registry;
+  } catch {
+    return createDefaultRegistry();
+  }
+};
+
 export const runListSessions = (options: ListSessionsOptions): number => {
   const dbPath = options.dbPath ?? defaultDbPath();
   const db = options.dbOverride ?? openDb(dbPath);
   const ownsDb = options.dbOverride === undefined;
   const limit = options.limit ?? 20;
-  // Seed registry (no catalog file / API key needed — keeps this handler
-  // bootstrap-independent) to resolve each row's metering: an unmetered model
-  // records $0 that must not read as free.
-  const registry = createDefaultRegistry();
+  // Resolve each row's metering against the OPERATOR's installed catalog (the sessions
+  // were created with it) so a custom/edited `unmetered` entry renders correctly — not
+  // just the seed. `loadInstalledRegistry` falls back to the seed when the catalog file is
+  // absent/unparsable. A test may inject `registryOverride`.
+  const registry = options.registryOverride ?? loadInstalledRegistry();
   try {
     if (ownsDb) migrate(db);
     // listSessions filters out children by default. When the user

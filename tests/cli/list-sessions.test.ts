@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runListSessions } from '../../src/cli/list-sessions.ts';
+import type { ModelRegistry } from '../../src/providers/registry.ts';
 import { type DB, openDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { appendMessage } from '../../src/storage/repos/messages.ts';
@@ -53,6 +54,28 @@ describe('runListSessions', () => {
     expect(first.status).toBe('running');
     expect(second.id).toBe(a.id);
     expect(second.status).toBe('done');
+  });
+
+  test('resolves metering against the injected operator catalog, not just the seed', () => {
+    // A custom unmetered entry the built-in seed does NOT know — only the operator's
+    // installed catalog does. list-sessions must resolve against that catalog (regression:
+    // it used the seed, so a custom unmetered row wrongly read $0 / unmetered:false).
+    const s = createSession(db, { model: 'custom/cloud-x', cwd: '/p', startedAt: 1000 });
+    completeSession(db, s.id, 'done', 0, true); // an unmetered tier records $0
+    const reg = {
+      get: (id: string) => (id === 'custom/cloud-x' ? { capabilities: { unmetered: true } } : null),
+    } as unknown as ModelRegistry;
+    const out: string[] = [];
+    const code = runListSessions({
+      json: true,
+      dbOverride: db,
+      registryOverride: reg,
+      out: (line) => out.push(line),
+    });
+    expect(code).toBe(0);
+    const item = JSON.parse(out.join('').trim()) as { model: string; unmetered: boolean };
+    expect(item.model).toBe('custom/cloud-x');
+    expect(item.unmetered).toBe(true);
   });
 
   test('json mode includes prompt_preview from first user message', () => {
