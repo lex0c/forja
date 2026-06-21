@@ -446,6 +446,8 @@ describe('seed catalog + serialization', () => {
       // so the host serves the full declared window instead of truncating early.
       expect(e.num_ctx).toBe(e.capabilities.context_window);
       expect(e.capabilities.tools).toBe('native');
+      // Hosted = unmetered (billed by subscription/GPU-time, not per token).
+      expect(e.capabilities.unmetered).toBe(true);
     }
   });
 });

@@ -148,6 +148,9 @@ export interface EvalCaseResult {
   // cache_creation). Undefined when the run produced no result (setup failure).
   // Lets the ranking derive a cache-hit rate when the provider caches.
   usage?: UsageInfo;
+  // The selected provider is unmetered (cost not tracked per-token, e.g. Ollama
+  // Cloud) — lets the ranking blank cost_usd instead of reading $0 as "free".
+  unmetered?: boolean;
   expectations: ExpectationOutcome[];
   // Top-level failure reason when the case never reached the
   // expect phase (fixture missing, runAgent threw, budget cap).

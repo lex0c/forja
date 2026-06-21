@@ -15,6 +15,7 @@
 // usage report on some turn, so the totals are a lower bound — marked
 // with a leading `~` and an explanatory footnote.
 
+import { formatCostCell, isUnmetered } from '../../../providers/cost-format.ts';
 import { computeCostBreakdown } from '../../../providers/cost.ts';
 import {
   cacheHitRatio,
@@ -110,9 +111,17 @@ export const statsCommand: SlashCommand = {
     // to write-amplification (its inverse-ish) — "each written token was read
     // back N times". 0 when nothing has been written yet.
     const reuse = s.cacheCreation > 0 ? s.cacheRead / s.cacheCreation : 0;
+    // The current model may be unmetered (e.g. Ollama Cloud — billed by
+    // subscription, not per token): its $0 is "untracked", not free.
+    const costStr = formatCostCell(
+      isUnmetered(ctx.baseConfig.provider),
+      s.usageComplete,
+      formatCost,
+      s.costUsd,
+    );
     const notes: string[] = [
       'session stats (this REPL, incl. subagents):',
-      `  cost:   ${lb}${formatCost(s.costUsd)}`,
+      `  cost:   ${costStr}`,
       `  spend:  in ${formatCost(bd.inputCost)} (${pct(bd.inputCost)}%) · out ${formatCost(bd.outputCost)} (${pct(bd.outputCost)}%) · cache read ${formatCost(bd.cacheReadCost)} (${pct(bd.cacheReadCost)}%) · cache write ${formatCost(bd.cacheWriteCost)} (${pct(bd.cacheWriteCost)}%)`,
       // Cache savings vs the no-cache counterfactual (skipped for zero-rate
       // providers like local models, where there is nothing to save).

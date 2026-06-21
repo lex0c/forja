@@ -4,6 +4,8 @@
 // is required to inspect prior runs, and a missing/unparsable
 // permissions.yaml doesn't block the listing.
 
+import { createDefaultRegistry } from '../providers/catalog-file.ts';
+import { isUnmeteredModel } from '../providers/cost-format.ts';
 import type { Session } from '../storage/index.ts';
 import {
   type DB,
@@ -69,6 +71,9 @@ interface SessionListItem {
   started_at: string;
   ended_at: string | null;
   model: string;
+  // The model is unmetered (cost not tracked per token, e.g. Ollama Cloud),
+  // resolved from the seed catalog. cost_usd is 0 = "untracked", not free.
+  unmetered: boolean;
   status: Session['status'];
   cost_usd: number;
   // Sum of cost_usd for THIS row plus every descendant reachable
@@ -106,7 +111,13 @@ interface SessionListItem {
   subagent_run: { name: string; source_sha256: string } | null;
 }
 
-const buildItem = (s: Session, db: DB, depth: number, cumulativeCost: number): SessionListItem => {
+const buildItem = (
+  s: Session,
+  db: DB,
+  depth: number,
+  cumulativeCost: number,
+  unmetered: boolean,
+): SessionListItem => {
   // First user message content. Sessions almost always have at
   // least one user message (the original prompt); the rare race
   // where listSessions runs before appendMessage just yields an
@@ -136,6 +147,7 @@ const buildItem = (s: Session, db: DB, depth: number, cumulativeCost: number): S
     started_at: formatTime(s.startedAt),
     ended_at: s.endedAt === null ? null : formatTime(s.endedAt),
     model: s.model,
+    unmetered,
     status: s.status,
     cost_usd: s.totalCostUsd,
     // Cumulative is the row's own cost plus its full subtree.
@@ -231,11 +243,9 @@ const writeTable = (items: SessionListItem[], out: (s: string) => void): void =>
     // last-shown digit at .toFixed(4)) so the annotation only
     // surfaces when it would render as nonzero — pairs the cost
     // gate with the format precision and avoids `+$0.0000` noise.
+    const own = it.unmetered ? 'unmetered' : `$${it.cost_usd.toFixed(4)}`;
     const descendants = it.cumulative_cost_usd - it.cost_usd;
-    const costStr =
-      descendants > 5e-5
-        ? `$${it.cost_usd.toFixed(4)} +$${descendants.toFixed(4)}`
-        : `$${it.cost_usd.toFixed(4)}`;
+    const costStr = descendants > 5e-5 ? `${own} +$${descendants.toFixed(4)}` : own;
     const cost = costStr.padEnd(COST_WIDTH);
     out(`${it.started_at}  ${status} ${cost}${id}  ${it.prompt_preview}\n`);
   }
@@ -246,6 +256,10 @@ export const runListSessions = (options: ListSessionsOptions): number => {
   const db = options.dbOverride ?? openDb(dbPath);
   const ownsDb = options.dbOverride === undefined;
   const limit = options.limit ?? 20;
+  // Seed registry (no catalog file / API key needed — keeps this handler
+  // bootstrap-independent) to resolve each row's metering: an unmetered model
+  // records $0 that must not read as free.
+  const registry = createDefaultRegistry();
   try {
     if (ownsDb) migrate(db);
     // listSessions filters out children by default. When the user
@@ -274,7 +288,13 @@ export const runListSessions = (options: ListSessionsOptions): number => {
       items = parents.map((s) => {
         const subtree = fanSubtree(s, db, new Set<string>());
         const root = subtree[0];
-        return buildItem(s, db, 0, root !== undefined ? root.cumulativeCost : s.totalCostUsd);
+        return buildItem(
+          s,
+          db,
+          0,
+          root !== undefined ? root.cumulativeCost : s.totalCostUsd,
+          isUnmeteredModel(registry, s.model),
+        );
       });
       emittedTopLevels = parents.length;
     } else {
@@ -297,7 +317,15 @@ export const runListSessions = (options: ListSessionsOptions): number => {
         const subtree = fanSubtree(parent, db, seen);
         if (items.length + subtree.length > limit) break;
         for (const { session, depth, cumulativeCost } of subtree) {
-          items.push(buildItem(session, db, depth, cumulativeCost));
+          items.push(
+            buildItem(
+              session,
+              db,
+              depth,
+              cumulativeCost,
+              isUnmeteredModel(registry, session.model),
+            ),
+          );
         }
         emittedTopLevels += 1;
       }

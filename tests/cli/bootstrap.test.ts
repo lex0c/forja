@@ -153,6 +153,42 @@ describe('bootstrap', () => {
     db.close();
   });
 
+  test('budget warning fires when maxCostUsd is set on an unmetered provider', async () => {
+    // An unmetered tier (e.g. Ollama Cloud) reports $0 from computeCost, so the
+    // cost cap never triggers — the operator must be told it has no effect.
+    const unmeteredProvider: Provider = {
+      ...mockProvider,
+      capabilities: { ...mockProvider.capabilities, unmetered: true },
+    };
+    const { db, budgetConfigWarnings } = await bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: unmeteredProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      budget: { maxCostUsd: 1 },
+    });
+    db.close();
+    expect(
+      budgetConfigWarnings.some((w) => w.includes('unmetered') && w.includes('maxCostUsd')),
+    ).toBe(true);
+  });
+
+  test('no unmetered budget warning for a metered provider with maxCostUsd', async () => {
+    const { db, budgetConfigWarnings } = await bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider, // metered (no unmetered flag)
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      budget: { maxCostUsd: 1 },
+    });
+    db.close();
+    expect(budgetConfigWarnings.some((w) => w.includes('unmetered'))).toBe(false);
+  });
+
   test('grants read_file + grep on the fetch_url spill dir (read elided pages)', async () => {
     // fetch_url spills oversized pages to `<cache>/fetch/<hash>.md`; without
     // this grant the scaffolded `./**`-only read policy would deny the

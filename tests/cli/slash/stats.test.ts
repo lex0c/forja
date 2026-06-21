@@ -133,6 +133,20 @@ describe('/stats', () => {
     expect(text).not.toContain('~');
   });
 
+  test('cost line reads "unmetered" for an unmetered provider, not $0', async () => {
+    const root = createSession(db, { model: 'm', cwd: '/p' });
+    updateSessionCost(db, root.id, 0); // an unmetered tier records $0
+    usage(root.id, { in: 6000, out: 2400, cacheRead: 0, cacheCreation: 0 });
+    replIds = [root.id];
+    const ctx = buildCtx();
+    (ctx.baseConfig.provider.capabilities as { unmetered?: boolean }).unmetered = true;
+    const r = await statsCommand.exec([], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('cost:   unmetered');
+  });
+
   test('attributes cache write by source + write amplification', async () => {
     // parent writes 1000, a subagent writes 400, compaction writes 100.
     // total cache write 1500; reads 13,500 → amplification 1500/15000 = 10%.

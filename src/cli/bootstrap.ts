@@ -1652,6 +1652,16 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     outcomeSink,
   };
 
+  // maxCostUsd cannot bound an unmetered provider: cost is never tracked, so the
+  // cap never triggers. Surface it instead of letting the operator believe their
+  // cost cap protects them on a hosted/unmetered tier (e.g. Ollama Cloud).
+  const unmeteredCapWarnings =
+    config.budget?.maxCostUsd !== undefined && config.provider.capabilities.unmetered === true
+      ? [
+          `budget.maxCostUsd is set but model '${config.provider.id}' is unmetered (cost is not tracked per-token) — the cap cannot bound this run.`,
+        ]
+      : [];
+
   return {
     config,
     db,
@@ -1666,7 +1676,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     memoryConfigWarnings: memoryLoaded.warnings,
     providersConfigWarnings: providersLoaded.warnings,
     recapConfigWarnings: recapLoaded.warnings,
-    budgetConfigWarnings: budgetLoaded.warnings,
+    budgetConfigWarnings: [...budgetLoaded.warnings, ...unmeteredCapWarnings],
     effortConfigWarnings: effortLoaded.warnings,
     auditConfigWarnings: auditLoaded.warnings,
     sandboxConfigWarnings: sandboxLoaded.warnings,

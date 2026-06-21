@@ -1301,6 +1301,9 @@ export interface HarnessResult {
   // older SDKs without telemetry). Renderers should mark partial
   // results as estimates so the user doesn't read the cost as final.
   usageComplete: boolean;
+  // The run's provider does not bill per token (unmetered, e.g. Ollama Cloud), so
+  // `costUsd` is 0 = "untracked", not free. Renderers show "unmetered", not $0.
+  unmetered?: boolean;
   // Final assistant message id, if any was produced.
   lastMessageId?: string;
   // The live in-memory context after this run. A multi-turn caller

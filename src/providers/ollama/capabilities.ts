@@ -116,6 +116,8 @@ export const OLLAMA_CLOUD_CAPS: Record<string, ProviderCapabilities> = {
   // can raise num_ctx in their own catalog to go higher.
   'glm-5.2': {
     ...OLLAMA_THINKING_BASE,
+    // Hosted on ollama.com — billed by subscription/GPU-time, not per token.
+    unmetered: true,
     context_window: K256,
     output_max_tokens: 16_384,
     recommended_max_tools_per_step: 6,
@@ -124,6 +126,8 @@ export const OLLAMA_CLOUD_CAPS: Record<string, ProviderCapabilities> = {
   // Qwen3-Coder 480B MoE — agentic coding; non-thinking.
   'qwen3-coder:480b': {
     ...OLLAMA_BASE,
+    // Hosted on ollama.com — billed by subscription/GPU-time, not per token.
+    unmetered: true,
     context_window: K256,
     output_max_tokens: 16_384,
     recommended_max_tools_per_step: 6,
@@ -132,6 +136,8 @@ export const OLLAMA_CLOUD_CAPS: Record<string, ProviderCapabilities> = {
   // Qwen3-Coder-Next 80B MoE (3B active) — fast agentic coding; non-thinking.
   'qwen3-coder-next': {
     ...OLLAMA_BASE,
+    // Hosted on ollama.com — billed by subscription/GPU-time, not per token.
+    unmetered: true,
     context_window: K256,
     output_max_tokens: 16_384,
     recommended_max_tools_per_step: 6,
@@ -141,6 +147,8 @@ export const OLLAMA_CLOUD_CAPS: Record<string, ProviderCapabilities> = {
   // (ollama.com /api/show), not the 128K the seed previously declared.
   'devstral-2:123b': {
     ...OLLAMA_BASE,
+    // Hosted on ollama.com — billed by subscription/GPU-time, not per token.
+    unmetered: true,
     context_window: K256,
     output_max_tokens: 16_384,
     recommended_max_tools_per_step: 6,

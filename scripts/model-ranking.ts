@@ -60,6 +60,7 @@ interface SuiteResult {
   cacheReadSum: number;
   cacheWriteSum: number;
   promptTokenSum: number;
+  unmetered: boolean;
   p50DurationMs: number;
   stableCases: number;
   multiRoundCases: number;
@@ -74,6 +75,7 @@ interface ModelRow {
   p50DurationMs: number;
   costPerBatteryUsd: number;
   cacheReadRate: number | null;
+  unmetered: boolean;
 }
 interface Provenance {
   generated_at: string;
@@ -169,6 +171,7 @@ const runSuite = async (modelId: string, dir: string, repeat: number): Promise<S
       (a, r) => a + (r.usage ? r.usage.input + r.usage.cache_read + r.usage.cache_creation : 0),
       0,
     ),
+    unmetered: all.some((r) => r.unmetered === true),
     p50DurationMs: p50(all.map((r) => r.durationMs)),
     stableCases,
     multiRoundCases,
@@ -211,7 +214,7 @@ const csvRow = (
     r.stability === null ? '' : num(r.stability, 4),
     num(r.exhaustRate, 4),
     String(Math.round(r.p50DurationMs)),
-    num(r.costPerBatteryUsd, 6),
+    r.unmetered ? '' : num(r.costPerBatteryUsd, 6),
     r.cacheReadRate === null ? '' : num(r.cacheReadRate, 4),
   ].join(',');
 
@@ -307,6 +310,7 @@ const main = async (): Promise<void> => {
     const totalCacheRead = SUITES.reduce((a, s) => a + (get(s.name)?.cacheReadSum ?? 0), 0);
     const totalCacheWrite = SUITES.reduce((a, s) => a + (get(s.name)?.cacheWriteSum ?? 0), 0);
     const totalPrompt = SUITES.reduce((a, s) => a + (get(s.name)?.promptTokenSum ?? 0), 0);
+    const unmetered = SUITES.some((s) => get(s.name)?.unmetered === true);
     rows.push({
       model,
       suites,
@@ -317,6 +321,7 @@ const main = async (): Promise<void> => {
       p50DurationMs: p50(Object.values(suites).map((sr) => sr.p50DurationMs)),
       costPerBatteryUsd: costPerBattery,
       cacheReadRate: cacheReadRate(totalCacheRead, totalCacheWrite, totalPrompt),
+      unmetered,
     });
   }
   rows.sort((a, b) => b.composite - a.composite);

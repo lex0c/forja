@@ -77,8 +77,10 @@ not the same as passing):
   ran ≥2 rounds, so it reflects the repeated suites.
 - **`unfinished`** — % of runs that hit the step cap, were cut off, or errored (reliability),
   independent of pass/fail.
-- **`p50 latency`** and **cost** — when the ranked models cost $0 in the catalog, cost is flat and
-  only latency separates them; cost becomes a real axis once any paid model is included.
+- **`p50 latency`** and **cost** — `cost_usd` is a real number for per-token-billed providers, and
+  **blank** for **unmetered** ones (e.g. Ollama Cloud — billed by subscription / GPU-time, not per
+  token; "untracked", NOT "$0 / free"). When cost is flat or blank, latency separates models. Note: a
+  cost cap (`maxCostUsd`) cannot bound an unmetered model — bootstrap warns when one is set.
 - **`cache_read_rate`** — fraction of prompt tokens served from a cache read (the prompt-cache hit
   rate). Filled only when the provider caches; **blank** for providers that don't (e.g. Ollama), so
   it reads as "n/a" rather than "0% hit". Like cost, it only matters once a caching model (e.g.

@@ -826,6 +826,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       usage: totalUsage,
       costUsd: totalCostUsd,
       usageComplete,
+      unmetered: config.provider.capabilities.unmetered === true,
       // ctx is undefined only if init failed before the session-
       // decision block resolved it (early internalError) — keep the
       // pre-ctx '' so that path's result shape is unchanged.

@@ -73,6 +73,13 @@ export interface ProviderCapabilities {
   // cost stays exact. Only providers with a distinct 1h tier set it.
   cost_per_1k_cache_write?: number;
   cost_per_1k_cache_write_1h?: number;
+  // The provider does NOT bill per token, so cost is UNTRACKED here — e.g. Ollama
+  // Cloud (subscription + GPU-time / session limits, not per-token). When true the
+  // rates above are 0 but that is NOT "$0 / free": computeCost is meaningless, so
+  // callers must distinguish unmetered from metered-$0 (genuine for local Ollama).
+  // The ranking blanks its cost column, and bootstrap warns that `maxCostUsd`
+  // cannot bound the run. Absent/false = metered.
+  unmetered?: boolean;
   // The model needs EXPLICIT `cache_control` breakpoints to cache its prompt
   // (Qwen/Anthropic-style), as opposed to automatic server-side caching. The
   // OpenRouter adapter reads this to emit cache_control markers on the stable
