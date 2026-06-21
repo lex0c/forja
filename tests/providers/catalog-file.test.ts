@@ -261,6 +261,34 @@ describe('registry construction + factory wiring', () => {
     expect(widened?.capabilities.context_window).toBe(131_072);
   });
 
+  test('ollama cloud entry: a { client } override does NOT bypass the missing-key guard', () => {
+    // Ollama authenticates via a bearer header (apiKey/env), not an SDK client —
+    // createOllamaProvider has no client param. A client override satisfies the guard for
+    // SDK families, but for an ollama entry it would otherwise instantiate a key-requiring
+    // cloud model with no Authorization header, so the guard must still demand a key.
+    const key = 'FORJA_TEST_OLLAMA_KEY_XYZ';
+    const prior = process.env[key];
+    delete process.env[key]; // env key UNSET
+    try {
+      const ollama = buildRegistryFromEntries([
+        entry({
+          id: 'ollama/cloud-x',
+          family: 'ollama',
+          model_name: 'cloud-x',
+          api_key_env: key,
+          base_url: 'https://ollama.com',
+        }),
+      ]).get('ollama/cloud-x');
+      // The bug: a client override let this construct unauthenticated. Now it throws.
+      expect(() => ollama?.factory({ client: {} })).toThrow(/API key required/);
+      // An injected apiKey DOES satisfy it — it becomes the bearer header.
+      expect(() => ollama?.factory({ apiKey: 'sk-bearer' })).not.toThrow();
+    } finally {
+      if (prior === undefined) delete process.env[key];
+      else process.env[key] = prior;
+    }
+  });
+
   test('api_key_env is read from the named env var for the openai adapter', () => {
     const key = 'FORJA_TEST_OPENAI_KEY_XYZ';
     const prior = process.env[key];

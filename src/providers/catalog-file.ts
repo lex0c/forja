@@ -53,8 +53,15 @@ const entryToFactory =
     // carries "API key required" so the recap stub-fallback gate (run.ts)
     // still recognizes it as a missing-key degrade.
     const o = (opts ?? {}) as { apiKey?: unknown; client?: unknown };
+    // A `{ client }` override means the caller supplies auth via an SDK client — but only
+    // the SDK families (anthropic / openai / google / openrouter) consume one. Ollama
+    // authenticates with a bearer header derived from apiKey/env and IGNORES a client
+    // (CreateOllamaProviderOptions has no client field), so a client override must NOT
+    // satisfy the guard for an Ollama entry — that would instantiate a key-requiring cloud
+    // model with no Authorization header instead of failing with the missing-key diagnostic.
+    const clientSatisfies = o.client !== undefined && entry.family !== 'ollama';
     const callerSuppliedKey =
-      (typeof o.apiKey === 'string' && o.apiKey.length > 0) || o.client !== undefined;
+      (typeof o.apiKey === 'string' && o.apiKey.length > 0) || clientSatisfies;
     if (entry.api_key_env !== undefined && !hasKey && !callerSuppliedKey) {
       throw new Error(
         `model ${entry.id}: API key required — the configured api_key_env '${entry.api_key_env}' is unset or empty. Set that variable, or edit the entry's api_key_env to one that is set (e.g. GEMINI_API_KEY for Google). The catalog is the only key source; the adapters have no env fallback.`,
