@@ -10,28 +10,33 @@ this page explains how the ranking works — the methodology, not the models in 
 > Snapshot — **2026-06-21**, commit `8cc00bdc`, the **model-only** set: 35 cases (smoke 9 + edit-format 7 +
 > regression 19; `harness` cases excluded). `smoke` ×2 + `edit-format` ×2 + `regression` ×1, sorted by
 > **composite**. Authoritative data: [`results.csv`](../evals/ranking/results.csv) (CSV wins). Not comparable
-> to batches before `8cc00bdc` (different case set). Cost is **unmetered** (subscription, not per token), so
-> `cost_usd` is blank.
+> to batches before `8cc00bdc` (different case set). The 5 `ollama/*` models are **unmetered** (subscription,
+> not per token → blank `cost_usd`); the 2 `openai/*` are metered, with the measured `cost` shown.
 
-| # | Model | Composite | smoke | edit-format | regression | steps/case | stable | unfinished | p50 lat |
-|---|---|---|---|---|---|---|---|---|---|
-| 1 | `ollama/devstral-2:123b` | **98%** | 89% | 100% | 100% | 2.7 | 100% | 0% | 5.3s |
-| 2 | `ollama/glm-5.2` | **97%** | 83% | 100% | 100% | 2.6 | 94% | 0% | 5.5s |
-| 3 | `ollama/qwen3-coder:480b` | **96%** | 78% | 100% | 100% | 2.8 | 100% | 4% | 4.8s |
-| 4 | `ollama/qwen3-coder-next` | **91%** | 78% | 100% | 89% | 2.5 | 100% | 0% | 3.5s |
-| 5 | `ollama/gpt-oss:20b` | **89%** | 72% | 86% | 100% | 3.3 | 81% | 8% | 6.9s |
+| # | Model | Composite | smoke | edit-format | regression | steps/case | stable | unfinished | p50 lat | cost |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | `ollama/devstral-2:123b` | **98%** | 89% | 100% | 100% | 2.7 | 100% | 0% | 5.3s | unmetered |
+| 1 | `openai/gpt-5.4-mini` | **98%** | 89% | 100% | 100% | 2.9 | 88% | 0% | 9.0s | **$0.39** |
+| 3 | `ollama/glm-5.2` | **97%** | 83% | 100% | 100% | 2.6 | 94% | 0% | 5.5s | unmetered |
+| 4 | `ollama/qwen3-coder:480b` | **96%** | 78% | 100% | 100% | 2.8 | 100% | 4% | 4.8s | unmetered |
+| 5 | `ollama/qwen3-coder-next` | **91%** | 78% | 100% | 89% | 2.5 | 100% | 0% | 3.5s | unmetered |
+| 6 | `ollama/gpt-oss:20b` | **89%** | 72% | 86% | 100% | 3.3 | 81% | 8% | 6.9s | unmetered |
+| 7 | `openai/gpt-5-nano` | **82%** | 83% | 64% | 100% | 3.3 | 75% | 8% | 34.2s | **$0.14** |
 
-> **Cleaner set, higher + fairer.** Removing the harness cases lifted everyone vs the old 60-case set — most
-> for big-window models, since the compaction window-artifact no longer penalizes them: `qwen3-coder:480b`
-> +9 (and #4→#3), `gpt-oss:20b` +15. `edit-format` and `regression` are ~100% across the board now, so the
-> live discriminator is **smoke** (parallel-read batching, search) plus a couple gaps (`qwen3-coder-next`
-> regression 89%, `gpt-oss:20b` edit 86%).
+> **gpt-5.4-mini ties the top at pennies.** The two `openai/*` rows were run ad-hoc (not in the standing
+> `ALL_MODELS`): `gpt-5.4-mini` matches `devstral-2:123b` (98%) for **$0.39**; `gpt-5-nano` lands at 82% for
+> **$0.14**, held back by `edit-format` (64% — weak at precise `edit_file`). Both reasoning models are slow
+> per case (nano p50 34s).
 >
-> **Smallest viable model is `gpt-oss:20b` (20B, cloud).** Local small models were tried and retired — both
-> scored ~2%: `qwen2.5-coder:7b` emits no native `tool_calls` via Ollama (1 step, never executes), and
-> `llama3.1:8b` drives the loop but is too slow on test hardware (~180s to read one file → every case times
-> out). Ollama Cloud serves nothing under ~20B (`llama3.1`/`qwen2.5-coder` aren't on the cloud tier at all),
-> so the bench is effectively cloud-only.
+> **Cleaner set, higher + fairer.** Removing the harness cases lifted the Ollama models vs the old 60-case
+> set — most for big-window models, since the compaction window-artifact no longer penalizes them:
+> `qwen3-coder:480b` +9, `gpt-oss:20b` +15. `edit-format` and `regression` are ~100% across the board, so the
+> live discriminator is **smoke** (parallel-read batching, search) plus a couple gaps.
+>
+> **Smallest viable Ollama model is `gpt-oss:20b` (20B, cloud).** Local small models were retired — both ~2%:
+> `qwen2.5-coder:7b` emits no native `tool_calls` via Ollama (1 step, never executes), `llama3.1:8b` is too
+> slow on test hardware (~180s to read one file → timeout). Ollama Cloud serves nothing under ~20B
+> (`llama3.1`/`qwen2.5-coder` aren't on the cloud tier at all).
 
 ---
 
