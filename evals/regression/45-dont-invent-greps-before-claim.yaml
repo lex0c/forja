@@ -27,19 +27,9 @@ expect:
   - output_contains: src/auth.ts
   - status: done
 budget:
-  # Two-pass calibration on opus-4-7. The first regression run had
-  # maxSteps=5/maxCostUsd=0.05: model correctly called grep
-  # (tool_called passed) but exhausted steps before composing the
-  # final answer with the literal path. Bump 1 raised to
-  # 8 steps / $0.10 → expectations all passed (grep + path cited +
-  # status done) but standalone cost landed at $0.13 (no
-  # cross-case prompt-cache hit a full-suite run benefits from).
-  # Bump 2 raises maxCostUsd to 0.20 so the case is reliable in
-  # BOTH modes: standalone (CI re-running a single case in
-  # isolation) and full-suite (`bun run eval:regression`). Still
-  # bounded — a future regression that makes the model loop
-  # forever trips on the wider envelope; the case enforces
-  # BEHAVIOR (grep before claim), not cost economy. Cost noise is
-  # signal noise here, not a regression class.
+  # Enforces BEHAVIOR (grep before claiming the path), not cost economy. The cost cap was
+  # dropped in the model-case cost-gate sweep — the ranking reports cost as a SEPARATE axis,
+  # so a reasoning model overthinking must not "fail" for spend. maxSteps is 8 (not the
+  # usual 5): the model legitimately needs grep + read + compose-the-literal-path steps; an
+  # earlier maxSteps=5 exhausted before it could cite the path. maxSteps still bounds runaway.
   maxSteps: 8
-  maxCostUsd: 0.20

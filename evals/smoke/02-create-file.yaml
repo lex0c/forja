@@ -10,5 +10,8 @@ expect:
       pattern: hi from forja
   - status: done
 budget:
+  # No maxCostUsd: the ranking measures harness-use and reports cost SEPARATELY, so cost
+  # must not gate pass/fail. A reasoning model overthinking "write one line" was exhausting
+  # the $0.10 cap mid-task (status: exhausted) — a spend failure, not a harness-fit one.
+  # maxSteps bounds the loop.
   maxSteps: 5
-  maxCostUsd: 0.10

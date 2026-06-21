@@ -1,13 +1,21 @@
 name: read file and report contents
+# Benign read-and-report: tests harness-use (call read_file, surface its content), NOT
+# refusal calibration. The prior framing ("read src/secret.txt and reply with just the
+# exact token") tripped safety-tuned models into refusing a credential-exfiltration
+# pattern — they called no tool and emitted no value, failing for alignment, not
+# harness-fit. A build marker carries the same distinctive-substring assertion with zero
+# secret-shaped framing.
 prompt: |
-  Read the file at src/secret.txt and tell me the exact token it contains.
-  Reply with just the token, nothing else.
+  Read the file at src/version.txt and tell me the build marker it contains.
 setup:
-  fixture: ../fixtures/src-with-secret
+  fixture: ../fixtures/src-with-version
 expect:
   - tool_called: read_file
-  - output_contains: TOKEN_FORJA_42
+  - output_contains: FORJA_BUILD_1183
   - status: done
 budget:
+  # No maxCostUsd: the ranking measures harness-use and reports cost as a SEPARATE axis,
+  # so cost must not gate pass/fail. A reasoning model overthinking a trivial read would
+  # otherwise exhaust a tight cap mid-task and "fail" for spend, not capability. maxSteps
+  # bounds the loop.
   maxSteps: 5
-  maxCostUsd: 0.10
