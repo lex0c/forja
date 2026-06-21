@@ -247,7 +247,11 @@ const writeTable = (items: SessionListItem[], out: (s: string) => void): void =>
     // last-shown digit at .toFixed(4)) so the annotation only
     // surfaces when it would render as nonzero — pairs the cost
     // gate with the format precision and avoids `+$0.0000` noise.
-    const own = it.unmetered ? 'unmetered' : `$${it.cost_usd.toFixed(4)}`;
+    // "unmetered" only when there is NO recorded spend: `unmetered` is resolved from the
+    // row's model (the one at createSession time), but a `/model` switch can leave a real
+    // nonzero `cost_usd` on a row whose initial model was unmetered — show the dollars, do
+    // not hide them behind the label. Mirrors `formatCostCell`'s zero-cost gate.
+    const own = it.unmetered && it.cost_usd === 0 ? 'unmetered' : `$${it.cost_usd.toFixed(4)}`;
     const descendants = it.cumulative_cost_usd - it.cost_usd;
     const costStr = descendants > 5e-5 ? `${own} +$${descendants.toFixed(4)}` : own;
     const cost = costStr.padEnd(COST_WIDTH);

@@ -78,6 +78,43 @@ describe('runListSessions', () => {
     expect(item.unmetered).toBe(true);
   });
 
+  test('human render shows recorded dollars, not "unmetered", for an unmetered-row session that spent', () => {
+    // The row model resolves unmetered (e.g. an Ollama Cloud start), but the session carries a
+    // nonzero recorded cost — a /model switch to a metered model leaves real spend on a row whose
+    // INITIAL model was unmetered. The dollars must show, not the bare label that hides them.
+    const s = createSession(db, { model: 'custom/cloud-x', cwd: '/p', startedAt: 1000 });
+    completeSession(db, s.id, 'done', 0.0042, true); // real recorded spend
+    const reg = {
+      get: (id: string) => (id === 'custom/cloud-x' ? { capabilities: { unmetered: true } } : null),
+    } as unknown as ModelRegistry;
+    const out: string[] = [];
+    runListSessions({
+      json: false,
+      dbOverride: db,
+      registryOverride: reg,
+      out: (l) => out.push(l),
+    });
+    const text = out.join('');
+    expect(text).toContain('$0.0042'); // dollars shown, not hidden
+    expect(text).not.toContain('unmetered'); // NOT the bare label
+  });
+
+  test('human render shows "unmetered" only when an unmetered-row session has NO recorded spend', () => {
+    const s = createSession(db, { model: 'custom/cloud-x', cwd: '/p', startedAt: 1000 });
+    completeSession(db, s.id, 'done', 0, true); // $0 — untracked, not free
+    const reg = {
+      get: (id: string) => (id === 'custom/cloud-x' ? { capabilities: { unmetered: true } } : null),
+    } as unknown as ModelRegistry;
+    const out: string[] = [];
+    runListSessions({
+      json: false,
+      dbOverride: db,
+      registryOverride: reg,
+      out: (l) => out.push(l),
+    });
+    expect(out.join('')).toContain('unmetered');
+  });
+
   test('json mode includes prompt_preview from first user message', () => {
     const s = createSession(db, { model: 'mock/a', cwd: '/p' });
     appendMessage(db, { sessionId: s.id, role: 'user', content: 'list the source files' });

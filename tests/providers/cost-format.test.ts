@@ -13,9 +13,15 @@ const caps = (over: Partial<ProviderCapabilities>): ProviderCapabilities =>
 
 describe('formatCostCell', () => {
   const fmt = (usd: number): string => `$${usd.toFixed(4)}`;
-  test('unmetered → the label, regardless of usd / completeness', () => {
+  test('unmetered + ZERO recorded cost → the label ($0 is untracked, not free)', () => {
     expect(formatCostCell(true, true, fmt, 0)).toBe(UNMETERED_LABEL);
-    expect(formatCostCell(true, false, fmt, 0.5)).toBe(UNMETERED_LABEL);
+    expect(formatCostCell(true, false, fmt, 0)).toBe(UNMETERED_LABEL);
+  });
+  test('unmetered BUT nonzero recorded cost → the dollars win, never hidden by the label', () => {
+    // A historical session whose row model resolves unmetered but that switched via /model
+    // to a metered one carries real recorded spend — the label must not replace it.
+    expect(formatCostCell(true, true, fmt, 0.5)).toBe('$0.5000');
+    expect(formatCostCell(true, false, fmt, 0.5)).toBe('~$0.5000');
   });
   test('metered + complete → the formatted dollar amount', () => {
     expect(formatCostCell(false, true, fmt, 0.0123)).toBe('$0.0123');
