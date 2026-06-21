@@ -64,6 +64,16 @@ const buildCtx = (overrides: Partial<SlashContext> = {}): SlashContext => {
   };
 };
 
+// A registry stub that resolves the given model ids as unmetered (everything else
+// metered). /stats derives the unmetered marker from the scope's session models, so the
+// test controls metering per model, independent of the currently selected provider.
+const registryWithUnmetered = (
+  unmetered: readonly string[],
+): ReturnType<typeof createModelRegistry> =>
+  ({
+    get: (id: string) => (unmetered.includes(id) ? { capabilities: { unmetered: true } } : null),
+  }) as unknown as ReturnType<typeof createModelRegistry>;
+
 const usage = (
   sessionId: string,
   u: { in: number; out: number; cacheRead: number; cacheCreation: number },
@@ -133,13 +143,15 @@ describe('/stats', () => {
     expect(text).not.toContain('~');
   });
 
-  test('cost line reads "unmetered" for an unmetered provider, not $0', async () => {
-    const root = createSession(db, { model: 'm', cwd: '/p' });
-    updateSessionCost(db, root.id, 0); // an unmetered tier records $0
+  test('marks "unmetered" from the scope, even when the current provider is metered', async () => {
+    // The marker is a property of the SESSIONS aggregated, not the live provider. A session
+    // that ran on an unmetered model records $0 (untracked) and must not read as free after
+    // a switch to a metered model — the default buildCtx provider is metered.
+    const root = createSession(db, { model: 'u', cwd: '/p' }); // ran on an unmetered model
+    updateSessionCost(db, root.id, 0); // unmetered tier records $0
     usage(root.id, { in: 6000, out: 2400, cacheRead: 0, cacheCreation: 0 });
     replIds = [root.id];
-    const ctx = buildCtx();
-    (ctx.baseConfig.provider.capabilities as { unmetered?: boolean }).unmetered = true;
+    const ctx = buildCtx({ modelRegistry: registryWithUnmetered(['u']) });
     const r = await statsCommand.exec([], ctx);
     expect(r.kind).toBe('ok');
     if (r.kind !== 'ok') return;
@@ -147,23 +159,24 @@ describe('/stats', () => {
     expect(text).toContain('cost:   unmetered');
   });
 
-  test('cost line preserves real metered spend in a mixed scope (unmetered current model)', async () => {
-    // A metered turn billed earlier (model switch / resumed session / metered subagent)
-    // persists real cost in the aggregate. Switching to an unmetered model must NOT hide
-    // those dollars behind the bare "unmetered" label.
-    const root = createSession(db, { model: 'm', cwd: '/p' });
-    updateSessionCost(db, root.id, 0.05); // real metered spend in scope
-    usage(root.id, { in: 6000, out: 2400, cacheRead: 0, cacheCreation: 0 });
-    replIds = [root.id];
-    const ctx = buildCtx();
-    (ctx.baseConfig.provider.capabilities as { unmetered?: boolean }).unmetered = true;
+  test('mixed scope: shows tracked metered spend AND the unmetered marker', async () => {
+    // One session billed real metered cost; another ran on an unmetered model ($0,
+    // untracked). The dollars must show, and the marker must flag the untracked usage —
+    // neither hidden behind the bare label nor read as a complete total.
+    const metered = createSession(db, { model: 'm', cwd: '/p' });
+    updateSessionCost(db, metered.id, 0.05);
+    usage(metered.id, { in: 6000, out: 2400, cacheRead: 0, cacheCreation: 0 });
+    const unmeteredSess = createSession(db, { model: 'u', cwd: '/p' });
+    updateSessionCost(db, unmeteredSess.id, 0); // untracked $0
+    replIds = [metered.id, unmeteredSess.id];
+    const ctx = buildCtx({ modelRegistry: registryWithUnmetered(['u']) });
     const r = await statsCommand.exec([], ctx);
     expect(r.kind).toBe('ok');
     if (r.kind !== 'ok') return;
     const text = (r.notes ?? []).join('\n');
-    expect(text).toMatch(/cost:\s+\$0\.05/); // the metered dollars are shown, not hidden
-    expect(text).toContain('unmetered'); // and the untracked current-model component is flagged
-    expect(text).not.toContain('cost:   unmetered'); // NOT the bare label that would hide spend
+    expect(text).toMatch(/cost:\s+\$0\.05/); // the metered dollars are shown
+    expect(text).toContain('unmetered'); // and the untracked component is flagged
+    expect(text).not.toContain('cost:   unmetered'); // not the bare label that hides spend
   });
 
   test('attributes cache write by source + write amplification', async () => {
