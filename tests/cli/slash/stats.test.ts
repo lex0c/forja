@@ -147,6 +147,25 @@ describe('/stats', () => {
     expect(text).toContain('cost:   unmetered');
   });
 
+  test('cost line preserves real metered spend in a mixed scope (unmetered current model)', async () => {
+    // A metered turn billed earlier (model switch / resumed session / metered subagent)
+    // persists real cost in the aggregate. Switching to an unmetered model must NOT hide
+    // those dollars behind the bare "unmetered" label.
+    const root = createSession(db, { model: 'm', cwd: '/p' });
+    updateSessionCost(db, root.id, 0.05); // real metered spend in scope
+    usage(root.id, { in: 6000, out: 2400, cacheRead: 0, cacheCreation: 0 });
+    replIds = [root.id];
+    const ctx = buildCtx();
+    (ctx.baseConfig.provider.capabilities as { unmetered?: boolean }).unmetered = true;
+    const r = await statsCommand.exec([], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toMatch(/cost:\s+\$0\.05/); // the metered dollars are shown, not hidden
+    expect(text).toContain('unmetered'); // and the untracked current-model component is flagged
+    expect(text).not.toContain('cost:   unmetered'); // NOT the bare label that would hide spend
+  });
+
   test('attributes cache write by source + write amplification', async () => {
     // parent writes 1000, a subagent writes 400, compaction writes 100.
     // total cache write 1500; reads 13,500 → amplification 1500/15000 = 10%.

@@ -111,14 +111,18 @@ export const statsCommand: SlashCommand = {
     // to write-amplification (its inverse-ish) — "each written token was read
     // back N times". 0 when nothing has been written yet.
     const reuse = s.cacheCreation > 0 ? s.cacheRead / s.cacheCreation : 0;
-    // The current model may be unmetered (e.g. Ollama Cloud — billed by
-    // subscription, not per token): its $0 is "untracked", not free.
-    const costStr = formatCostCell(
-      isUnmetered(ctx.baseConfig.provider),
-      s.usageComplete,
-      formatCost,
-      s.costUsd,
-    );
+    // The current model may be unmetered (Ollama Cloud — billed by subscription, not
+    // per token): its $0 is "untracked", not free. But computeUsageStats aggregates
+    // EVERY repl session + subagent tree, so a current-unmetered provider does NOT mean
+    // the whole scope is — earlier metered turns, a resumed session, or a metered
+    // subagent persist real dollars in s.costUsd. Label only a PURE-unmetered scope; a
+    // mixed one shows the tracked spend (a lower bound: the unmetered turns add untracked
+    // cost on top) so real money is never hidden behind the label.
+    const unmetered = isUnmetered(ctx.baseConfig.provider);
+    const costStr =
+      unmetered && s.costUsd > 0
+        ? `${lb}${formatCost(s.costUsd)} + unmetered (current model untracked)`
+        : formatCostCell(unmetered, s.usageComplete, formatCost, s.costUsd);
     const notes: string[] = [
       'session stats (this REPL, incl. subagents):',
       `  cost:   ${costStr}`,
