@@ -157,7 +157,9 @@ export const OLLAMA_CLOUD_CAPS: Record<string, ProviderCapabilities> = {
     context_window: K128,
     output_max_tokens: 16_384,
     recommended_max_tools_per_step: 5,
-    notes: ['Ollama Cloud; OpenAI open-weights gpt-oss 20B; reasoning + agentic; think levels are F3'],
+    notes: [
+      'Ollama Cloud; OpenAI open-weights gpt-oss 20B; reasoning + agentic; think levels are F3',
+    ],
   },
 };
 
