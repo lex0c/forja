@@ -517,6 +517,61 @@ half consumes.
 
 ---
 
+## Sandbox hardening: rlimits on the confined child (DoS resistance)
+
+**Status:** surfaced by a sandbox security audit (an in-REPL glm-5.2 run, 2026-06-21), verified against the
+code afterward. Severity recalibrated DOWN from the audit's "High": this is DoS-of-self, not a containment
+break, and the audit's cited `SECURITY_GUIDELINE §8.2` requirement does NOT exist (no resource-limit clause
+in the spec — that citation was a hallucination).
+
+**What it is:** `buildBwrapArgv` (`src/permissions/sandbox-runner.ts`) sets namespaces, session, and
+die-with-parent but attaches NO resource limits (memory / CPU / nproc / file-size). A confined child is FS-
+and network-isolated (no breakout / exfil), but UNBOUNDED — it can fork-bomb, OOM, or fill the tmpfs `/tmp`,
+taking down the agent and stressing the host.
+
+**Why deferred:** hardening, not a containment hole — the isolation that matters (FS, network, env) holds.
+No spec requirement and no observed incident; it raises the floor against a runaway / hostile bash.
+
+**Where it would land:** wrap the bwrap exec with `prlimit` / `systemd-run --user --scope` / a `ulimit`
+preamble, with per-profile CPU / memory / nproc / file-size caps. Mirror a sensible default on the macOS path
+where Seatbelt allows.
+
+**Pull-in signal:** a sandboxed bash fork-bombs / OOMs the agent in real use, or a threat-model pass
+prioritizes DoS resistance for untrusted-repo / multi-tenant operation.
+
+**Spec reference:** none today (the audit's `§8.2` citation is unfounded). A `SECURITY_GUIDELINE` clause on
+resource limits could accompany the work.
+
+---
+
+## Sandbox hardening: canonicalize the cache carve-out source before `--bind`
+
+**Status:** surfaced by the same sandbox audit (2026-06-21) and verified — but it is a KNOWN, in-code
+documented limitation (`src/permissions/sandbox-runner.ts:153-157`), not a hidden bug. Medium.
+
+**What it is:** `canonicalizeCwd` realpath-resolves cwd (and home) so the `hide_paths` check, the `--bind`,
+and the `--chdir` all agree on one canonical target. The cache carve-out dirs (`~/.cache`, `GOCACHE`, etc.)
+bound into the sandbox are NOT canonicalized. A symlink planted inside a cache dir (by a prior tool call or a
+hostile repo) can point outside the allowed tree, and `bwrap` follows it at mount time — granting the
+sandboxed process read/write to host paths that should be unreachable.
+
+**Why deferred:** the in-code comment already flags it; closing it fully needs a recursive realpath sweep of
+the cache trees (cost), and the practical exposure requires an attacker who can plant a symlink inside a
+cache dir. The cwd / home canonicalization (the common path) already holds.
+
+**Where it would land:** `src/permissions/sandbox-cache-dirs.ts` / `sandbox-runner.ts` — realpath-resolve each
+cache-dir source before `--bind`, and reject (or resolve-and-rebind) any cache entry whose canonical target
+leaves the allowed tree. A shallow realpath of the bind ROOT is cheap; the recursive sweep of contents is the
+expensive part the comment notes.
+
+**Pull-in signal:** an untrusted-repo / multi-tenant scenario where a cache dir could be symlink-poisoned, or
+a security review that won't accept the documented carve-out.
+
+**Spec reference:** `SECURITY_GUIDELINE` (sandbox path canonicalization); the in-code limitation comment at
+`sandbox-runner.ts:153-157` is the current record.
+
+---
+
 ## Surface the per-turn models / metered-untracked breakdown in cost surfaces
 
 **Status:** noted 2026-06-21 during the code review of the per-turn model provenance fix
