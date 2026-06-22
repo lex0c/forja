@@ -41,7 +41,6 @@ const SETUP_KEYS: ReadonlySet<string> = new Set([
   'approvalPosture',
   'gitInit',
   'httpStub',
-  'swe',
 ]);
 
 const BUDGET_KEYS: ReadonlySet<string> = new Set([
@@ -172,14 +171,6 @@ const parseSetup = (raw: unknown): EvalSetup | undefined => {
     }
     setup.gitInit = r.gitInit;
   }
-  if (r.swe !== undefined) {
-    const swe = requireRecord(r.swe, 'setup.swe');
-    rejectUnknown(swe, new Set(['commit', 'repoRoot']), 'setup.swe');
-    setup.swe = { commit: requireString(swe.commit, 'setup.swe.commit') };
-    if (swe.repoRoot !== undefined) {
-      setup.swe.repoRoot = requireString(swe.repoRoot, 'setup.swe.repoRoot');
-    }
-  }
   if (r.approvalPosture !== undefined) {
     const p = requireString(r.approvalPosture, 'setup.approvalPosture');
     if (p !== 'supervised' && p !== 'autonomous') {
@@ -214,14 +205,6 @@ const parseSetup = (raw: unknown): EvalSetup | undefined => {
       out[url] = entry;
     }
     setup.httpStub = out;
-  }
-  // swe materializes the cwd from an archived commit tree, so it OWNS the starting state —
-  // fixture/files would be silently dropped by setupCwd's swe branch. Reject the combination
-  // loudly rather than let a case author believe their files landed.
-  if (setup.swe !== undefined && (setup.fixture !== undefined || setup.files !== undefined)) {
-    throw new Error(
-      'eval: setup.swe is mutually exclusive with setup.fixture / setup.files (a swe case starts from the archived commit tree)',
-    );
   }
   return setup;
 };

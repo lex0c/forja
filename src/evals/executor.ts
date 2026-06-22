@@ -20,7 +20,6 @@ import { maybeWrapSandboxArgv } from '../permissions/sandbox-runner.ts';
 import { closeDb } from '../storage/db.ts';
 import { BUILTIN_TOOLS, createFetchUrlTool } from '../tools/builtin/index.ts';
 import { type ToolRegistry, createToolRegistry } from '../tools/index.ts';
-import { gitToplevel, materializeSweWorkspace, restoreSweTests } from './swe-bench/workspace.ts';
 import type {
   EvalCase,
   EvalCaseResult,
@@ -182,9 +181,6 @@ const EVAL_CACHE_ROOT = resolveEvalCacheRoot(process.env, homedir());
 
 interface SetupResult {
   dir: string;
-  // Present only for `setup.swe` cases: restores the canonical test files from the fix commit
-  // (anti-cheat) — `executeCase` calls it after the agent runs, before the verifier.
-  sweRestore?: () => void;
 }
 
 const setupCwd = (caseDef: EvalCase): SetupResult => {
@@ -197,48 +193,37 @@ const setupCwd = (caseDef: EvalCase): SetupResult => {
     );
   }
   const dir = mkdtempSync(join(EVAL_CACHE_ROOT, 'case-'));
-  let sweRestore: (() => void) | undefined;
-  if (caseDef.setup?.swe !== undefined) {
-    // self-SWE-bench: the starting state IS the archived parent tree (+ failing test patch),
-    // so swe is mutually exclusive with fixture/files. The agent fixes src/; the canonical
-    // tests are restored before verifying (sweRestore).
-    const { commit } = caseDef.setup.swe;
-    const repoRoot = caseDef.setup.swe.repoRoot ?? gitToplevel(process.cwd());
-    const { testPaths } = materializeSweWorkspace({ commit, repoRoot, cwd: dir });
-    sweRestore = () => restoreSweTests({ commit, repoRoot, cwd: dir, testPaths });
-  } else {
-    if (caseDef.setup?.fixture !== undefined) {
-      const caseDir = dirname(caseDef.sourcePath);
-      // Boundary: fixture must resolve under the parent of the
-      // case file's directory. Allows reaching sibling dirs
-      // (`../fixtures/foo` — our own smoke layout) but refuses
-      // climbing further (`../../..`) or jumping out entirely
-      // via absolute paths (`/etc`). Loader-level check rejects
-      // absolute paths at parse time; this guard catches `..`
-      // traversal escapes and protects programmatic EvalCase
-      // construction that bypasses the loader.
-      const boundary = dirname(caseDir);
-      const src = resolve(caseDir, caseDef.setup.fixture);
-      if (!containsPath(boundary, src)) {
-        throw new Error(
-          `eval setup.fixture '${caseDef.setup.fixture}' escapes the case boundary (${boundary})`,
-        );
-      }
-      if (!existsSync(src)) {
-        throw new Error(`fixture not found: ${src}`);
-      }
-      cpSync(src, dir, { recursive: true });
+  if (caseDef.setup?.fixture !== undefined) {
+    const caseDir = dirname(caseDef.sourcePath);
+    // Boundary: fixture must resolve under the parent of the
+    // case file's directory. Allows reaching sibling dirs
+    // (`../fixtures/foo` — our own smoke layout) but refuses
+    // climbing further (`../../..`) or jumping out entirely
+    // via absolute paths (`/etc`). Loader-level check rejects
+    // absolute paths at parse time; this guard catches `..`
+    // traversal escapes and protects programmatic EvalCase
+    // construction that bypasses the loader.
+    const boundary = dirname(caseDir);
+    const src = resolve(caseDir, caseDef.setup.fixture);
+    if (!containsPath(boundary, src)) {
+      throw new Error(
+        `eval setup.fixture '${caseDef.setup.fixture}' escapes the case boundary (${boundary})`,
+      );
     }
-    if (caseDef.setup?.files !== undefined) {
-      for (const [relPath, body] of Object.entries(caseDef.setup.files)) {
-        const target = resolve(dir, relPath);
-        if (!containsPath(dir, target)) {
-          throw new Error(`eval setup.files path '${relPath}' escapes the eval workspace`);
-        }
-        const targetDir = dirname(target);
-        if (!existsSync(targetDir)) mkdirSync(targetDir, { recursive: true });
-        writeFileSync(target, body);
+    if (!existsSync(src)) {
+      throw new Error(`fixture not found: ${src}`);
+    }
+    cpSync(src, dir, { recursive: true });
+  }
+  if (caseDef.setup?.files !== undefined) {
+    for (const [relPath, body] of Object.entries(caseDef.setup.files)) {
+      const target = resolve(dir, relPath);
+      if (!containsPath(dir, target)) {
+        throw new Error(`eval setup.files path '${relPath}' escapes the eval workspace`);
       }
+      const targetDir = dirname(target);
+      if (!existsSync(targetDir)) mkdirSync(targetDir, { recursive: true });
+      writeFileSync(target, body);
     }
   }
   // git work-tree init for tools that require a repo (git_apply_patch). Done
@@ -273,7 +258,7 @@ const setupCwd = (caseDef: EvalCase): SetupResult => {
     mkdirSync(join(dir, '.forja'), { recursive: true });
     writeFileSync(policyPath, DEFAULT_EVAL_POLICY_YAML);
   }
-  return { dir, ...(sweRestore !== undefined ? { sweRestore } : {}) };
+  return { dir };
 };
 
 // `command_succeeds` default timeout — generous for `bun test <file>` + `bun run typecheck`
@@ -569,9 +554,6 @@ export const executeCase = async (
   let outputText = '';
 
   let cwd: string | undefined;
-  // self-SWE-bench anti-cheat: restores the canonical test files before the verifier (set by
-  // setupCwd only for swe cases). Undefined for every other case.
-  let sweRestore: (() => void) | undefined;
   let result: HarnessResult | undefined;
   let failure: string | undefined;
   // Captured from the resolved provider (config is scoped to the try below): an
@@ -615,7 +597,6 @@ export const executeCase = async (
   try {
     const setup = setupCwd(caseDef);
     cwd = setup.dir;
-    sweRestore = setup.sweRestore;
 
     const dbPath = join(cwd, '.forja-eval-sessions.db');
     const bootstrapInput: BootstrapInput = {
@@ -660,11 +641,6 @@ export const executeCase = async (
         : {}),
       signal: controller.signal,
       ...(options.bootstrapOverride ?? {}),
-      // self-SWE-bench (anti-cheat gate #7): run the AGENT network-off so it can't fetch the gold
-      // fix from the project's public repo. setup.swe cases only; default off everywhere else.
-      // Spread LAST — after bootstrapOverride — so the gate is PINNED: an override cannot silently
-      // re-enable network for a swe case (a security control must not be clobberable).
-      ...(caseDef.setup?.swe !== undefined ? { denyNetwork: true } : {}),
     };
 
     const { config, db } = await bootstrap(bootstrapInput);
@@ -718,17 +694,6 @@ export const executeCase = async (
     options.signal?.removeEventListener('abort', onParentAbort);
     if (prevOpenaiReplay === undefined) delete process.env.FORJA_OPENAI_REASONING_REPLAY;
     if (prevProfile !== undefined) process.env.FORJA_PROFILE = prevProfile;
-  }
-
-  // self-SWE-bench anti-cheat: restore the canonical test files (discarding any agent edits to
-  // the oracle) AFTER the agent ran, BEFORE the verifier reads them. A throw here (e.g. the
-  // commit's tests vanished) fails the case rather than crashing the runner.
-  if (cwd !== undefined && failure === undefined && sweRestore !== undefined) {
-    try {
-      sweRestore();
-    } catch (e) {
-      failure = e instanceof Error ? e.message || e.name || String(e) : String(e);
-    }
   }
 
   // Evaluate expectations BEFORE cleanup so file_exists/file_contains

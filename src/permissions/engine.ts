@@ -238,9 +238,6 @@ export interface EngineOptions {
     available: boolean;
     hostExplicitlyAllowed: boolean;
     required: boolean;
-    // When true, prune the network profile so any net-egress call refuses (self-SWE-bench runs
-    // the agent network-off — see SelectSandboxProfileOptions.denyNetwork). Default off.
-    denyNetwork?: boolean;
     emitHostPassthrough?: boolean;
   };
   // Optional grants snapshot provider. Engine calls
@@ -2166,7 +2163,6 @@ export const createPermissionEngine = (
       const planResult = selectSandboxProfile({
         capabilities: planCapabilities,
         hostExplicitlyAllowed: sandboxOptions.hostExplicitlyAllowed,
-        ...(sandboxOptions.denyNetwork === true ? { denyNetwork: true } : {}),
       });
       sandboxStage = sandboxPlanStageEntry(planResult);
       if (planResult.kind === 'refuse') {

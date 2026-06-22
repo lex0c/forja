@@ -71,13 +71,6 @@ export interface EvalSetup {
   // is not otherwise a git repo, so without this they'd dead-end on
   // git.not_a_repo. cwd == worktree root, so patch paths resolve cleanly.
   gitInit?: boolean;
-  // self-SWE-bench task source (CODE_GENERATION / docs/TODO.md). Materializes the eval cwd
-  // from a fix commit `C`: archive the parent `C^` (NO .git — anti-cheat), apply the commit's
-  // `tests/**` patch (so the gold test exists and FAILS), and symlink node_modules. The agent
-  // must fix `src/**` to make the test pass; before the verifier runs, the canonical test
-  // files are restored from `C` (anti-cheat against the model editing the oracle). Mutually
-  // exclusive with fixture/files — a swe case's starting state is the archived tree.
-  swe?: EvalSweSetup;
   // Initial approval posture (operation-mode, AGENTIC_CLI §8.1).
   // Default 'supervised'. Evals run headless (no confirm bridge), so
   // under 'supervised' a `confirm` verdict dead-ends as a deny; under
@@ -95,17 +88,6 @@ export interface EvalSetup {
   // deterministically — the live-network alternative is both flaky and blocked
   // by the SSRF gate for local stub servers.
   httpStub?: Record<string, EvalHttpResponse>;
-}
-
-// self-SWE-bench task descriptor (`EvalSetup.swe`).
-export interface EvalSweSetup {
-  // The fix commit `C` (any git-resolvable ref). Its parent `C^` is the buggy snapshot; the
-  // `tests/**` portion of `C^..C` is the failing oracle; the `src/**` portion is the gold the
-  // agent must reproduce.
-  commit: string;
-  // Repo to archive/diff against. Defaults to the git toplevel of `process.cwd()` — the Forja
-  // checkout running the eval (the corpus is the repo's own history).
-  repoRoot?: string;
 }
 
 // One canned HTTP response for `EvalSetup.httpStub`.

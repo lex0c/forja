@@ -75,9 +75,6 @@ export interface BootstrapPermissionEngineInput {
     available: boolean;
     hostExplicitlyAllowed: boolean;
     required: boolean;
-    // When true, the engine prunes the network profile so any net-egress call refuses
-    // (self-SWE-bench runs the agent network-off so it can't fetch the gold). Default off.
-    denyNetwork?: boolean;
     // Gate 2 of the `host` profile (SECURITY.md §4.1/§4.7): when true, the
     // engine injects the `host-passthrough` sentinel into the planner's
     // capability set, making `host` selectable when gate 1

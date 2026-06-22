@@ -200,10 +200,6 @@ export interface BootstrapInput {
   // flag for the `sandbox_skip` marker — here it gates runtime
   // profile selection for the agent run.
   iKnowWhatImDoing?: boolean;
-  // When true, the engine prunes the network sandbox profile so any net-egress call (curl,
-  // fetch_url) refuses. Self-SWE-bench sets this so the agent can't fetch the gold fix from the
-  // project's public repo during a task. Default off ⇒ no change to normal sessions.
-  denyNetwork?: boolean;
   // Test seam — pins the `detectSandboxAvailability` result instead
   // of probing the host. Production callers never pass this; tests
   // that exercise both branches of the default-broker resolver
@@ -824,7 +820,6 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       available: sandboxAvail.available,
       hostExplicitlyAllowed: input.sandboxHost === true || policySandbox?.hostAllowed === true,
       required: policySandbox?.required === true,
-      denyNetwork: input.denyNetwork === true,
       // Gate 2 of host passthrough (SECURITY.md §4.1/§4.7). The
       // operator's `--i-know-what-im-doing` opt-in is the SOLE source of
       // the `host-passthrough` sentinel; the engine injects it into the

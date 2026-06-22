@@ -11,7 +11,6 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { computePassToPass } from '../../scripts/swe-bench-passtopass.ts';
-import { executeCase } from '../../src/evals/executor.ts';
 import {
   ensureIsolatedDeps,
   gitToplevel,
@@ -19,20 +18,13 @@ import {
   restoreSweTests,
   sweTestPaths,
 } from '../../src/evals/swe-bench/workspace.ts';
-import type { EvalCase } from '../../src/evals/types.ts';
-import {
-  type SandboxAvailability,
-  detectSandboxAvailability,
-} from '../../src/permissions/sandbox-availability.ts';
-import type { Provider, StreamEvent } from '../../src/providers/index.ts';
-import { seedModelCatalog } from '../helpers/seed-catalog.ts';
+import { detectSandboxAvailability } from '../../src/permissions/sandbox-availability.ts';
 import { installSweDepsFixture } from '../helpers/swe-deps-fixture.ts';
 
 // The reference task: a small, deterministic born-with-tests fix. At C^+testPatch the gold test
 // FAILS (buggy src); with the gold src it PASSES — a real fail-to-pass.
 const COMMIT = '0be3c4299';
 const TEST_PATH = 'tests/tools/wait-for.test.ts';
-const SRC_PATH = 'src/tools/builtin/wait-for.ts';
 
 const repoRoot: string | null = (() => {
   try {
@@ -128,168 +120,6 @@ describe('swe-bench workspace (reference task 0be3c4299)', () => {
     expect(existsSync(`${work}/node_modules/../evals`)).toBe(false);
     expect(existsSync(`${work}/node_modules/../docs`)).toBe(false);
   });
-});
-
-// --- e2e through executeCase (the setup.swe path): materialize → agent → restore → verify ---
-
-interface ScriptedStep {
-  text?: string;
-  tool_uses?: { id: string; name: string; input: Record<string, unknown> }[];
-}
-const replayStep = function* (step: ScriptedStep): Iterable<StreamEvent> {
-  yield { kind: 'start', message_id: `mock_${crypto.randomUUID()}` };
-  if (step.text !== undefined && step.text.length > 0)
-    yield { kind: 'text_delta', text: step.text };
-  for (const tu of step.tool_uses ?? []) {
-    yield { kind: 'tool_use_start', id: tu.id, name: tu.name };
-    yield { kind: 'tool_use_stop', id: tu.id, final_args: tu.input };
-  }
-  yield { kind: 'stop', reason: step.tool_uses?.length ? 'tool_use' : 'end_turn' };
-};
-const mockProvider = (script: ScriptedStep[]): Provider => {
-  let i = 0;
-  return {
-    id: 'mock/m',
-    family: 'anthropic',
-    capabilities: {
-      tools: 'native',
-      cache: false,
-      vision: false,
-      streaming: true,
-      constrained: 'tools',
-      context_window: 1000,
-      output_max_tokens: 100,
-      cost_per_1k_input: 0,
-      cost_per_1k_output: 0,
-      notes: [],
-    },
-    async *generate() {
-      const step = script[i++];
-      if (step === undefined) throw new Error('mock script exhausted');
-      for (const ev of replayStep(step)) yield ev;
-    },
-    generateConstrained: () => Promise.reject(new Error('n/a')),
-    countTokens: () => Promise.resolve(0),
-  };
-};
-// available:true keeps the default `allow` on write_file (a degraded boot downgrades it to
-// confirm → dead-ends as deny in headless evals, so the gold write wouldn't land).
-const HERMETIC_SANDBOX: SandboxAvailability = {
-  available: true,
-  tool: 'bwrap',
-  path: '/usr/bin/bwrap',
-  trustLevel: 'canonical',
-  reason: '',
-  trustWarnings: [],
-};
-
-describe('swe-bench executeCase e2e (reference task 0be3c4299)', () => {
-  let xdg: string | undefined;
-  let home: string | undefined;
-  let workdir: string;
-  beforeEach(() => {
-    workdir = mkdtempSync(join(tmpdir(), 'swe-e2e-'));
-    xdg = process.env.XDG_CONFIG_HOME;
-    home = process.env.HOME;
-    process.env.XDG_CONFIG_HOME = workdir;
-    process.env.HOME = workdir;
-    seedModelCatalog();
-  });
-  afterEach(() => {
-    rmSync(workdir, { recursive: true, force: true });
-    if (xdg === undefined) delete process.env.XDG_CONFIG_HOME;
-    else process.env.XDG_CONFIG_HOME = xdg;
-    if (home === undefined) delete process.env.HOME;
-    else process.env.HOME = home;
-  });
-
-  const sweCase = (): EvalCase => ({
-    name: 'swe wait-for ipv6',
-    sourcePath: '/tmp/swe.yaml',
-    prompt: 'This test fails. Fix the source so it passes, without editing the test.',
-    setup: { swe: { commit: COMMIT, repoRoot: REPO } },
-    // sandboxed: the verifier runs `bun test` over model-authored files (the Phase 1b gate).
-    expect: [
-      {
-        kind: 'command_succeeds',
-        command: `bun test ${TEST_PATH}`,
-        sandboxed: true,
-        timeoutMs: 120_000,
-      },
-    ],
-  });
-
-  test.skipIf(!CAN_RUN)('PASS: agent writes the gold src → outcome verifier passes', async () => {
-    const gold = gitOut(['show', `${COMMIT}:${SRC_PATH}`]).toString();
-    const r = await executeCase(sweCase(), {
-      bootstrapOverride: {
-        providerOverride: mockProvider([
-          {
-            text: 'fixing the IPv6 bracket bug',
-            tool_uses: [{ id: 't1', name: 'write_file', input: { path: SRC_PATH, content: gold } }],
-          },
-          { text: 'done' },
-        ]),
-        sandboxAvailabilityOverride: HERMETIC_SANDBOX,
-      },
-      perCaseTimeoutMs: 120_000,
-    });
-    expect(r.expectations[0]?.passed).toBe(true);
-    expect(r.passed).toBe(true);
-  });
-
-  test.skipIf(!CAN_RUN)('FAIL: agent does nothing → verifier fails (the bug remains)', async () => {
-    const r = await executeCase(sweCase(), {
-      bootstrapOverride: {
-        providerOverride: mockProvider([{ text: 'I changed nothing' }]),
-        sandboxAvailabilityOverride: HERMETIC_SANDBOX,
-      },
-      perCaseTimeoutMs: 120_000,
-    });
-    expect(r.expectations[0]?.passed).toBe(false);
-    expect(r.passed).toBe(false);
-  });
-
-  // GATE #7: a swe case runs the AGENT network-off (denyNetwork) by STRIPPING net-egress, so a
-  // net-requesting command RUNS without network (curl/git-fetch reach nothing) rather than being
-  // refused. The network-IS-cut half is the sandbox-plan unit test (net-egress → cwd-rw = unshare-
-  // net). Here we prove the NOT-BROKEN half: a net-egress bash command (`bun` always requests
-  // net-egress via cmdNpmLike) is ALLOWED and executes — leaving its marker — instead of being
-  // denied as the earlier prune-to-refuse design did (which would have killed `bun test`).
-  test.skipIf(!CAN_RUN)(
-    'GATE #7: a swe agent net-egress command (bun) runs, not refused',
-    async () => {
-      const c: EvalCase = {
-        name: 'swe net-off',
-        sourcePath: '/tmp/swe.yaml',
-        prompt: 'fix it',
-        setup: { swe: { commit: COMMIT, repoRoot: REPO } },
-        expect: [{ kind: 'file_exists', path: 'gate7-marker.txt' }],
-      };
-      const r = await executeCase(c, {
-        bootstrapOverride: {
-          providerOverride: mockProvider([
-            {
-              text: 'verifying',
-              tool_uses: [
-                {
-                  id: 'c1',
-                  name: 'bash',
-                  input: { command: 'bun --version > gate7-marker.txt' },
-                },
-              ],
-            },
-            { text: 'done' },
-          ]),
-          sandboxAvailabilityOverride: HERMETIC_SANDBOX,
-        },
-        perCaseTimeoutMs: 120_000,
-      });
-      // file_exists passes ⇒ the net-egress `bun` command was ALLOWED and ran (net stripped, not
-      // refused); a prune-to-refuse gate would have denied it and left no marker.
-      expect(r.expectations[0]?.passed).toBe(true);
-    },
-  );
 });
 
 // --- workspace guards on a SYNTHETIC repo (no dependency on the running checkout's history, so

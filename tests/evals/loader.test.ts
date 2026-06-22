@@ -116,21 +116,6 @@ expect:
     );
   });
 
-  test('rejects setup.swe combined with setup.files / fixture (mutually exclusive)', () => {
-    const yaml = `
-name: c
-prompt: p
-setup:
-  swe:
-    commit: abc1234
-  files:
-    'x.ts': 'export const x = 1'
-expect:
-  - status: done
-`;
-    expect(() => parseEvalCase(yaml, '/tmp/c.yaml')).toThrow(/mutually exclusive/);
-  });
-
   test('parses setup.httpStub with defaults and explicit fields', () => {
     const yaml = `
 name: stub

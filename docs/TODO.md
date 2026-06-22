@@ -1877,10 +1877,12 @@ the Phase-1 machinery found cheat surfaces the test-file restore + sandboxed ver
 The outcome IS the score, so each is a way to inflate the capability signal WITHOUT fixing the bug.
 Close before running the corpus on third-party models:
 
-- **Cut the AGENT's network.** ✅ DONE (`denyNetwork`). The sandbox STRIPS `net-egress` for swe
-  cases → curl / git fetch / fetch_url resolve to a no-net profile and reach nothing, while `bun
-  test` (which requests net-egress unconditionally via `cmdNpmLike`) still runs — so the agent keeps
-  its self-verify loop. Threaded sandbox-plan→engine→bootstrap→executor (pinned after override).
+- **Cut the AGENT's network.** ✅ DONE (Docker egress lock). The task container sits on an
+  `--internal` network whose only route out is a proxy sidecar allowlisting the model host alone, so
+  curl / git fetch reach nothing else (github is 403'd) — and `bun test` still runs (no real net
+  needed). The earlier in-process `denyNetwork` sandbox option did this for the in-process path and
+  was REMOVED with it (the path let the agent read the live answer by absolute path — superseded by
+  the container boundary).
 - **Broaden / freeze the restore.** ✅ DONE. `restoreSweTests` `rm`s + re-archives the whole `tests/`
   tree from C (no model-added test survives) and restores-or-DELETES the test-runner config
   (`bunfig.toml`/`tsconfig.json`/`package.json`/`bun.lock` + the `.env*` bun auto-loads).
@@ -1920,10 +1922,12 @@ it **generates tasks forever** (every future fix is a new task, automatically).
 
 **Phases.**
 
-1. ✅ DONE. `command_succeeds` (framework + test) + the `setup.swe` task machinery, proven
-   end-to-end on `0be3c4299` (wait_for IPv6): `git archive C^` + test patch + node_modules symlink
-   (`src/evals/swe-bench/workspace.ts`), restore-from-commit anti-cheat, the SANDBOXED verifier
-   (`command_succeeds { sandboxed: true }` → cwd-rw), verifier scoping. Surfaced + fixed the
+1. ✅ DONE — but the in-process `setup.swe` EXECUTOR path was later REMOVED (Docker supersedes; it
+   ran the agent on the host where it could read the live answer by absolute path). KEPT and reused by
+   the Docker runner: `command_succeeds` (framework + test) and the shared
+   `src/evals/swe-bench/workspace.ts` (materialize + restore-from-commit + isolated deps). Proven
+   end-to-end on `0be3c4299` (wait_for IPv6): `git archive C^` + test patch + node_modules symlink,
+   restore-from-commit anti-cheat, the sandboxed verifier, verifier scoping. Surfaced + fixed the
    restore mechanism (archive-from-commit, NOT re-apply-patch) and the shallow-clone gate (tests
    skipIf the commit + parent are absent).
 2. ✅ DONE (corpus v1). The miner (`scripts/swe-bench-mine.ts`: candidateCommits / tierOf /
