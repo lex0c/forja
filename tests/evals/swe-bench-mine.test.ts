@@ -2,7 +2,14 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { candidateCommits, tierOf, validateFailToPass } from '../../scripts/swe-bench-mine.ts';
+import {
+  type Task,
+  candidateCommits,
+  kindOf,
+  preserveCuration,
+  tierOf,
+  validateFailToPass,
+} from '../../scripts/swe-bench-mine.ts';
 
 // All tests build a throwaway git repo (no dependency on the running checkout's history → they run
 // on a shallow CI clone too). bun:test is a builtin, so a synthetic oracle needs no real deps; an
@@ -80,6 +87,49 @@ describe('tierOf', () => {
   });
   test('3 = more than 3 files', () => {
     expect(tierOf({ srcFiles: ['a', 'b', 'c', 'd'], srcLines: 5 })).toBe(3);
+  });
+});
+
+describe('kindOf', () => {
+  test('feat* → feature', () => {
+    expect(kindOf('feat(tools): refuse binary files in read_file')).toBe('feature');
+    expect(kindOf('feat: add a thing')).toBe('feature');
+  });
+  test('fix / sec / non-conventional → bug', () => {
+    expect(kindOf('fix(permissions): empty-string fs path treated as omitted')).toBe('bug');
+    expect(kindOf('sec(sandbox): close the cp-to-tmp bypass')).toBe('bug');
+    expect(kindOf('refactor(harness): extract the loop')).toBe('bug');
+    expect(kindOf('Merge pull request #1 from x/y')).toBe('bug');
+  });
+});
+
+describe('preserveCuration', () => {
+  const mk = (commit: string, passToPass?: string[]): Task => ({
+    id: commit.slice(0, 3),
+    commit,
+    subject: 'fix: x',
+    kind: 'bug',
+    testFiles: [],
+    srcFiles: [],
+    tier: 1,
+    ...(passToPass ? { passToPass } : {}),
+  });
+
+  test('carries curated passToPass onto a re-mined task by commit; new tasks stay bare', () => {
+    const fresh = [mk('aaaaaa'), mk('bbbbbb')];
+    const prior = JSON.stringify([
+      { commit: 'aaaaaa', passToPass: ['tests/sibling.test.ts'] }, // survives → carried
+      { commit: 'zzzzzz', passToPass: ['tests/gone.test.ts'] }, // dropped commit → ignored
+    ]);
+    const merged = preserveCuration(fresh, prior);
+    expect(merged[0]?.passToPass).toEqual(['tests/sibling.test.ts']);
+    expect(merged[1]?.passToPass).toBeUndefined();
+  });
+
+  test('absent or unreadable prior corpus → returns the fresh mine unchanged', () => {
+    const fresh = [mk('aaaaaa', ['tests/a.test.ts'])];
+    expect(preserveCuration(fresh, undefined)).toEqual(fresh);
+    expect(preserveCuration(fresh, '{ not json')).toEqual(fresh);
   });
 });
 

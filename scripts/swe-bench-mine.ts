@@ -9,7 +9,7 @@
 //
 // Run: `bun run scripts/swe-bench-mine.ts ['<since>'] [--limit N]` → writes evals/swe-bench/corpus.json.
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gitToplevel, materializeSweWorkspace } from '../src/evals/swe-bench/workspace.ts';
@@ -26,9 +26,13 @@ export interface Task {
   id: string;
   commit: string;
   subject: string;
+  kind: 'bug' | 'feature';
   testFiles: string[];
   srcFiles: string[];
   tier: 1 | 2 | 3;
+  // Human-curated, NOT derivable from git: the anti-cheat #9 sibling tests a person picked to guard
+  // against overfit. Absent on a fresh mine; preserved across re-mines by `preserveCuration`.
+  passToPass?: string[];
 }
 
 export interface Dropped {
@@ -121,6 +125,12 @@ export const tierOf = ({
   return 3;
 };
 
+// bug/feature label from the conventional-commit type: `feat*` is a feature, everything else (fix,
+// sec, refactor, …) a bug. The corpus carries this for per-kind capability comparison
+// (swe-bench-run.ts logs + the results CSV key off `t.kind`); curation can override an edge case.
+export const kindOf = (subject: string): 'bug' | 'feature' =>
+  subject.startsWith('feat') ? 'feature' : 'bug';
+
 const runBunTest = (cwd: string, testFiles: string[]): boolean =>
   Bun.spawnSync({ cmd: ['bun', 'test', ...testFiles], cwd, stdout: 'ignore', stderr: 'ignore' })
     .success;
@@ -196,6 +206,7 @@ export const mineCorpus = ({
         id: c.sha.slice(0, 9),
         commit: c.sha,
         subject: c.subject,
+        kind: kindOf(c.subject),
         testFiles: c.testFiles,
         srcFiles: c.srcFiles,
         tier: tierOf(c),
@@ -205,6 +216,32 @@ export const mineCorpus = ({
     }
   }
   return { valid, dropped };
+};
+
+// Carry human curation that lives ONLY in corpus.json (not git) from the existing corpus onto a
+// freshly-mined list, matched by full commit SHA. Re-mining regenerates the mechanical fields
+// (id/subject/kind/tier/files), but `passToPass` (anti-cheat #9) was hand-picked — without this a
+// re-mine would silently wipe it. A surviving task keeps its set; a new task stays bare (to curate);
+// a dropped commit is simply not carried. Unreadable/absent prior → emit the fresh mine untouched.
+export const preserveCuration = (tasks: Task[], existingCorpusJson: string | undefined): Task[] => {
+  if (existingCorpusJson === undefined) return tasks;
+  let prior: unknown;
+  try {
+    prior = JSON.parse(existingCorpusJson);
+  } catch {
+    return tasks;
+  }
+  if (!Array.isArray(prior)) return tasks;
+  const byCommit = new Map<string, string[]>();
+  for (const t of prior as Array<{ commit?: unknown; passToPass?: unknown }>) {
+    if (typeof t?.commit === 'string' && Array.isArray(t.passToPass) && t.passToPass.length > 0) {
+      byCommit.set(t.commit, t.passToPass as string[]);
+    }
+  }
+  return tasks.map((t) => {
+    const carried = byCommit.get(t.commit);
+    return carried ? { ...t, passToPass: carried } : t;
+  });
 };
 
 if (import.meta.main) {
@@ -232,7 +269,14 @@ if (import.meta.main) {
   const sorted = [...valid].sort((a, b) => a.id.localeCompare(b.id));
   const corpusDir = join(repoRoot, 'evals', 'swe-bench');
   mkdirSync(corpusDir, { recursive: true });
-  writeFileSync(join(corpusDir, 'corpus.json'), `${JSON.stringify(sorted, null, 2)}\n`);
+  const corpusPath = join(corpusDir, 'corpus.json');
+  // Preserve hand-curated passToPass from the prior corpus so a re-mine doesn't wipe the #9 gate.
+  const merged = preserveCuration(
+    sorted,
+    existsSync(corpusPath) ? readFileSync(corpusPath, 'utf8') : undefined,
+  );
+  const carried = merged.filter((t) => t.passToPass !== undefined).length;
+  writeFileSync(corpusPath, `${JSON.stringify(merged, null, 2)}\n`);
   process.stderr.write('\n=== swe-bench corpus ===\n');
   process.stderr.write(
     `candidates: ${valid.length + dropped.length}, valid: ${valid.length}, dropped: ${dropped.length}\n`,
@@ -241,5 +285,7 @@ if (import.meta.main) {
   for (const d of dropped) {
     process.stderr.write(`  DROP ${d.sha.slice(0, 9)} ${d.subject.slice(0, 50)} — ${d.reason}\n`);
   }
-  process.stderr.write(`wrote ${sorted.length} task(s) → evals/swe-bench/corpus.json\n`);
+  process.stderr.write(
+    `wrote ${merged.length} task(s) (${carried} with curated passToPass carried over) → evals/swe-bench/corpus.json\n`,
+  );
 }
