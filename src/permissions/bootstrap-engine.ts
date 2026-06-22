@@ -75,6 +75,9 @@ export interface BootstrapPermissionEngineInput {
     available: boolean;
     hostExplicitlyAllowed: boolean;
     required: boolean;
+    // When true, the engine prunes the network profile so any net-egress call refuses
+    // (self-SWE-bench runs the agent network-off so it can't fetch the gold). Default off.
+    denyNetwork?: boolean;
     // Resolver's trust marker so bootstrap can emit a
     // `sandbox.path_resolved` failure_event when the sandbox tool
     // was resolved via $PATH (non-canonical install). Optional for

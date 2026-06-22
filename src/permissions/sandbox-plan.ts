@@ -119,6 +119,16 @@ export interface SelectSandboxProfileOptions {
   // the policy would otherwise allow it. Defense against accidental
   // passthrough.
   hostExplicitlyAllowed: boolean;
+  // When true, `net-egress` is STRIPPED from the required capabilities before profile selection,
+  // so a network call resolves to a NO-NET profile (`cwd-rw`) and RUNS WITHOUT network rather than
+  // being refused: `curl`/`git fetch` run but can't reach the host (unshare-net) → no data fetched,
+  // while `bun test` (which requests net-egress via cmdNpmLike yet needs no network with deps
+  // present) still runs. Used by self-SWE-bench to deny the agent network egress — the corpus is
+  // the project's own PUBLIC repo, so otherwise a model could `curl`/`git clone` the gold fix.
+  // (Pruning `cwd-rw-net` to REFUSE instead would also deny `bun test`, breaking self-verify.)
+  // The engine still SEES net-egress for the allow/deny DECISION; only profile selection drops it.
+  // Default off ⇒ no change.
+  denyNetwork?: boolean;
 }
 
 export type SelectSandboxProfileResult =
@@ -134,7 +144,12 @@ export const selectSandboxProfile = (
   options: SelectSandboxProfileOptions,
 ): SelectSandboxProfileResult => {
   const requiredKinds = new Set<CapabilityKind>();
-  for (const cap of options.capabilities) requiredKinds.add(cap.kind);
+  for (const cap of options.capabilities) {
+    // denyNetwork: drop net-egress so the call resolves to a no-net profile (cwd-rw) and runs
+    // WITHOUT network — see the option doc. Refusing net-egress instead would break `bun test`.
+    if (options.denyNetwork === true && cap.kind === 'net-egress') continue;
+    requiredKinds.add(cap.kind);
+  }
 
   // `host` needs an explicit operator flag AND a host-passthrough
   // capability in the resolved set. Either missing prunes host

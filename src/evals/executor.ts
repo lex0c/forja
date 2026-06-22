@@ -660,6 +660,11 @@ export const executeCase = async (
         : {}),
       signal: controller.signal,
       ...(options.bootstrapOverride ?? {}),
+      // self-SWE-bench (anti-cheat gate #7): run the AGENT network-off so it can't fetch the gold
+      // fix from the project's public repo. setup.swe cases only; default off everywhere else.
+      // Spread LAST — after bootstrapOverride — so the gate is PINNED: an override cannot silently
+      // re-enable network for a swe case (a security control must not be clobberable).
+      ...(caseDef.setup?.swe !== undefined ? { denyNetwork: true } : {}),
     };
 
     const { config, db } = await bootstrap(bootstrapInput);
