@@ -1925,9 +1925,16 @@ it **generates tasks forever** (every future fix is a new task, automatically).
    (`command_succeeds { sandboxed: true }` → cwd-rw), verifier scoping. Surfaced + fixed the
    restore mechanism (archive-from-commit, NOT re-apply-patch) and the shallow-clone gate (tests
    skipIf the commit + parent are absent).
-2. Automate commit selection from git: scan commits, split by path, validate fail-to-pass,
-   discard the invalid ones.
-3. Tier + wire into the ranking as the `capability` axis.
+2. ✅ DONE (corpus v1). The miner (`scripts/swe-bench-mine.ts`: candidateCommits / tierOf /
+   validateFailToPass / mineCorpus) scans history for src+test fix commits and validates each is a
+   real fail-to-pass (measured ~94% over a 3-month window, 1329 candidates → bulk-to-500 feasible).
+   The curated v1 corpus (`evals/swe-bench/corpus.json`) is 50 hand-curated tasks (40 bugs + 10
+   features, ~20 subsystems, tiers 1=14 / 2=24 / 3=12) — SWE-bench-Verified style. The BACKLOG is
+   the SELECTOR only; the prompt is the failing test, never the commit/BACKLOG prose. Remaining:
+   scale to bulk ~500 (run the miner over a wide window + 2 robustness tweaks — per-candidate
+   `bun test` timeout + exclude meta commits whose src is wholly under `src/evals/`|`scripts/`).
+3. Tier + wire into the ranking as the `capability` axis (needs the corpus runner #10 + the
+   load-bearing anti-cheat gates before any untrusted-model run).
 
 **Adjacent (lower priority, separate, no framework change).** A **prompt-injection
 resistance** eval — `setup.files` carries a malicious instruction inside untrusted content

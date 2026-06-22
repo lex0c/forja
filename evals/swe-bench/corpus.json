@@ -1,0 +1,705 @@
+[
+  {
+    "id": "08362a6e5",
+    "commit": "08362a6e5ed7359e6dbef70b73db0e5fbdb24dfd",
+    "subject": "feat(tools): refuse binary files in read_file (NUL-byte detection)",
+    "kind": "feature",
+    "testFiles": [
+      "tests/tools/read-file.test.ts"
+    ],
+    "srcFiles": [
+      "src/tools/builtin/read-file.ts",
+      "src/tools/types.ts"
+    ],
+    "tier": 2
+  },
+  {
+    "id": "131a14ae0",
+    "commit": "131a14ae0d881bf4090c3942e0d14a7743c44697",
+    "subject": "fix(hooks): reject FORJA_HOOK_SHELL overrides that pre-fill -c command text",
+    "kind": "bug",
+    "testFiles": [
+      "tests/hooks/dispatcher.test.ts"
+    ],
+    "srcFiles": [
+      "src/hooks/dispatcher.ts"
+    ],
+    "tier": 3
+  },
+  {
+    "id": "17bcaf158",
+    "commit": "17bcaf1585c7cdc12f5d4fcce069863708255439",
+    "subject": "fix(harness): apply same-length tool_use repairs in ensureAlternation",
+    "kind": "bug",
+    "testFiles": [
+      "tests/harness/session-context.test.ts"
+    ],
+    "srcFiles": [
+      "src/harness/session-context.ts"
+    ],
+    "tier": 1
+  },
+  {
+    "id": "1aa34fb4d",
+    "commit": "1aa34fb4db40f856712954f12b7ab9bf19c926c3",
+    "subject": "feat(stats): break cost down by axis (input/output/cache-read/cache-write)",
+    "kind": "feature",
+    "testFiles": [
+      "tests/cli/slash/stats.test.ts",
+      "tests/providers/cost.test.ts"
+    ],
+    "srcFiles": [
+      "src/cli/slash/commands/stats.ts",
+      "src/providers/cost.ts"
+    ],
+    "tier": 1
+  },
+  {
+    "id": "200796f0b",
+    "commit": "200796f0b9c0168c92135b1f882adbb4a33fe82b",
+    "subject": "fix(tui): Markdown autolink no longer duplicates the URL under formatting",
+    "kind": "bug",
+    "testFiles": [
+      "tests/tui/render/markdown.test.ts"
+    ],
+    "srcFiles": [
+      "src/tui/render/markdown.ts"
+    ],
+    "tier": 2
+  },
+  {
+    "id": "2e0803399",
+    "commit": "2e080339960cf6f36fa208843cf8200a985b5ae1",
+    "subject": "fix(resume): synthetic assistant placeholder for stranded user tail",
+    "kind": "bug",
+    "testFiles": [
+      "tests/cli/resume.test.ts"
+    ],
+    "srcFiles": [
+      "src/harness/loop.ts",
+      "src/harness/resume.ts"
+    ],
+    "tier": 2
+  },
+  {
+    "id": "3739b3b08",
+    "commit": "3739b3b08ee56e05a9448e517c6928eda1bc8a2a",
+    "subject": "feat(stats): surface cache hit ratio in /stats",
+    "kind": "feature",
+    "testFiles": [
+      "tests/cli/slash/stats.test.ts",
+      "tests/storage/repos/stats.test.ts"
+    ],
+    "srcFiles": [
+      "src/cli/slash/commands/stats.ts",
+      "src/storage/index.ts",
+      "src/storage/repos/stats.ts"
+    ],
+    "tier": 1
+  },
+  {
+    "id": "38c637a68",
+    "commit": "38c637a6815d4303fe9ab007e1ac8a7a465de771",
+    "subject": "fix(permissions): empty-string fs path is treated as omitted, not denied",
+    "kind": "bug",
+    "testFiles": [
+      "tests/permissions/engine.test.ts"
+    ],
+    "srcFiles": [
+      "src/permissions/engine.ts"
+    ],
+    "tier": 1
+  },
+  {
+    "id": "39d1ce983",
+    "commit": "39d1ce9836a715776f6096d13aa11511ab039a84",
+    "subject": "feat(compaction): preserve active pins across compaction",
+    "kind": "feature",
+    "testFiles": [
+      "tests/harness/compaction.test.ts",
+      "tests/tools/pin-context.test.ts"
+    ],
+    "srcFiles": [
+      "src/harness/compaction.ts",
+      "src/harness/loop.ts",
+      "src/tools/builtin/pin-context.ts"
+    ],
+    "tier": 3
+  },
+  {
+    "id": "40ad81974",
+    "commit": "40ad81974c665b13c9ac09a19f4d0a2ba557e85d",
+    "subject": "feat(tools): edit_file whitespace-tolerant fallback + actionable errors",
+    "kind": "feature",
+    "testFiles": [
+      "tests/tools/edit-file.test.ts",
+      "tests/tools/read-file.test.ts"
+    ],
+    "srcFiles": [
+      "src/tools/builtin/edit-file.ts"
+    ],
+    "tier": 3
+  },
+  {
+    "id": "4b339ed40",
+    "commit": "4b339ed405635e2bd0358687d6ac35dd7b03642e",
+    "subject": "fix(tui): memory-write modal resolved No while the cursor showed Yes",
+    "kind": "bug",
+    "testFiles": [
+      "tests/tui/modal-manager.test.ts",
+      "tests/tui/render/modal.test.ts"
+    ],
+    "srcFiles": [
+      "src/tui/modal-manager.ts",
+      "src/tui/render/modal.ts",
+      "src/tui/state.ts"
+    ],
+    "tier": 2
+  },
+  {
+    "id": "4c0cf1dda",
+    "commit": "4c0cf1dda5f8622c33656fdb73f2f18db034be1f",
+    "subject": "fix(permissions): treat bare `sed -i` without `-e` as exec:arbitrary (BSD suffix shift)",
+    "kind": "bug",
+    "testFiles": [
+      "tests/permissions/engine.test.ts",
+      "tests/permissions/resolvers.test.ts"
+    ],
+    "srcFiles": [
+      "src/permissions/resolvers/bash.ts"
+    ],
+    "tier": 2
+  },
+  {
+    "id": "564f90633",
+    "commit": "564f90633279d50aec4b009bf8818e6c0ae6ac7d",
+    "subject": "fix(openai): reject malformed Responses tool args instead of coercing to {}",
+    "kind": "bug",
+    "testFiles": [
+      "tests/providers/openai-responses.test.ts"
+    ],
+    "srcFiles": [
+      "src/providers/openai/responses-stream.ts"
+    ],
+    "tier": 1
+  },
+  {
+    "id": "5b541dfb3",
+    "commit": "5b541dfb321a6e36a1c3beb7070b0921197e1d66",
+    "subject": "feat(stats): attribute cache write by source + write amplification",
+    "kind": "feature",
+    "testFiles": [
+      "tests/cli/slash/stats.test.ts",
+      "tests/storage/repos/stats.test.ts"
+    ],
+    "srcFiles": [
+      "src/cli/slash/commands/stats.ts",
+      "src/storage/index.ts",
+      "src/storage/repos/stats.ts"
+    ],
+    "tier": 2
+  },
+  {
+    "id": "5d886fe6b",
+    "commit": "5d886fe6b394ee94f0e16f370d6b8b3b97fab21d",
+    "subject": "fix(skills): roll back the destination when a move's source delete fails",
+    "kind": "bug",
+    "testFiles": [
+      "tests/skills/lifecycle.test.ts"
+    ],
+    "srcFiles": [
+      "src/skills/lifecycle.ts"
+    ],
+    "tier": 2
+  },
+  {
+    "id": "6180c89bc",
+    "commit": "6180c89bc0f0a281ed2590504f1fa6c28c361c09",
+    "subject": "fix(cli/slash/agent-retrieval): percentileOf off-by-one inflated tail latencies",
+    "kind": "bug",
+    "testFiles": [
+      "tests/cli/slash/agent-retrieval.test.ts"
+    ],
+    "srcFiles": [
+      "src/cli/slash/commands/agent-retrieval.ts"
+    ],
+    "tier": 1
+  },
+  {
+    "id": "655110a48",
+    "commit": "655110a4864c54ac6b3f5ed32761a1b65b3403ab",
+    "subject": "sec(permissions): follow dangling symlinks in the fs confinement resolver",
+    "kind": "bug",
+    "testFiles": [
+      "tests/permissions/symlink.test.ts"
+    ],
+    "srcFiles": [
+      "src/permissions/engine.ts",
+      "src/permissions/matcher.ts"
+    ],
+    "tier": 3
+  },
+  {
+    "id": "68bf36eb7",
+    "commit": "68bf36eb7089923718b4a414b01342d31c44deb7",
+    "subject": "fix(memory/registry): parseExpiresEndOfDayMs rejected legitimate month-end dates",
+    "kind": "bug",
+    "testFiles": [
+      "tests/memory/registry.test.ts"
+    ],
+    "srcFiles": [
+      "src/memory/registry.ts"
+    ],
+    "tier": 1
+  },
+  {
+    "id": "7481e4830",
+    "commit": "7481e48301d173f17d7cc9c74be758dba9bc226a",
+    "subject": "fix(recap): aggregate file writes by path before rendering",
+    "kind": "bug",
+    "testFiles": [
+      "tests/recap/projection.test.ts"
+    ],
+    "srcFiles": [
+      "src/recap/projection.ts"
+    ],
+    "tier": 1
+  },
+  {
+    "id": "7b7753279",
+    "commit": "7b775327934b7bc84eeb392722faf5ce8dc29d5f",
+    "subject": "feat(providers): per-entry num_ctx so Ollama cloud entries serve their real window",
+    "kind": "feature",
+    "testFiles": [
+      "tests/providers/catalog-file.test.ts"
+    ],
+    "srcFiles": [
+      "src/providers/catalog-file.ts",
+      "src/providers/catalog-io.ts",
+      "src/providers/types.ts"
+    ],
+    "tier": 2
+  },
+  {
+    "id": "83f3f9713",
+    "commit": "83f3f971379e6c1891532ffe049db963d19f8d2b",
+    "subject": "fix(tui): propagate outputTruncated on the non-zero-exit tool-end path",
+    "kind": "bug",
+    "testFiles": [
+      "tests/tui/state.test.ts"
+    ],
+    "srcFiles": [
+      "src/tui/state.ts"
+    ],
+    "tier": 1
+  },
+  {
+    "id": "84772c3f7",
+    "commit": "84772c3f793fc2160e47530245dc6e3e30f16300",
+    "subject": "fix(git): fail closed on clean/smudge-filtered files instead of corrupting the worktree comparison",
+    "kind": "bug",
+    "testFiles": [
+      "tests/tools/git.test.ts"
+    ],
+    "srcFiles": [
+      "src/tools/builtin/git.ts"
+    ],
+    "tier": 2
+  },
+  {
+    "id": "86caae831",
+    "commit": "86caae8315e73ef564557fb36246d1151d10d801",
+    "subject": "fix(harness): the exhaustion synthesis honors its own truncation stops",
+    "kind": "bug",
+    "testFiles": [
+      "tests/harness/loop.test.ts"
+    ],
+    "srcFiles": [
+      "src/harness/exhaustion-synthesis.ts",
+      "src/harness/loop.ts"
+    ],
+    "tier": 3
+  },
+  {
+    "id": "8ce08ef5d",
+    "commit": "8ce08ef5daebd282c691a5f1305091281a26a7b4",
+    "subject": "fix(skills): let deleteSkill remove a file with a malformed filename",
+    "kind": "bug",
+    "testFiles": [
+      "tests/cli/slash/skill.test.ts",
+      "tests/skills/lifecycle.test.ts"
+    ],
+    "srcFiles": [
+      "src/skills/lifecycle.ts",
+      "src/skills/paths.ts"
+    ],
+    "tier": 2
+  },
+  {
+    "id": "932c14861",
+    "commit": "932c1486112ada50f9df561fc3120bb5fe526b73",
+    "subject": "fix(permissions): make §8.4 sensitive-path matching case-insensitive",
+    "kind": "bug",
+    "testFiles": [
+      "tests/permissions/sensitive-paths-case.test.ts"
+    ],
+    "srcFiles": [
+      "src/permissions/sensitive-paths.ts"
+    ],
+    "tier": 1
+  },
+  {
+    "id": "9b45a0b36",
+    "commit": "9b45a0b3620e75740a687717d55b32b6243b03e8",
+    "subject": "fix(recap): treat bash_background as non-terminal in action aggregates",
+    "kind": "bug",
+    "testFiles": [
+      "tests/recap/projection.test.ts"
+    ],
+    "srcFiles": [
+      "src/recap/projection.ts"
+    ],
+    "tier": 2
+  },
+  {
+    "id": "a0ca32340",
+    "commit": "a0ca32340d5204ee3ea7f89519281ca62d0a1b6b",
+    "subject": "fix(memory): emit search provenance only for returned hits",
+    "kind": "bug",
+    "testFiles": [
+      "tests/memory/registry.test.ts",
+      "tests/tools/memory-search.test.ts"
+    ],
+    "srcFiles": [
+      "src/memory/registry.ts",
+      "src/tools/builtin/memory-search.ts"
+    ],
+    "tier": 3
+  },
+  {
+    "id": "a1afc3317",
+    "commit": "a1afc33176a62c7e329e796b90abad1e22c9c14f",
+    "subject": "fix(clarify): forward the run abort signal into the modal",
+    "kind": "bug",
+    "testFiles": [
+      "tests/tools/clarify.test.ts"
+    ],
+    "srcFiles": [
+      "src/cli/repl.ts",
+      "src/tools/builtin/clarify.ts",
+      "src/tools/types.ts"
+    ],
+    "tier": 2
+  },
+  {
+    "id": "a4b95045f",
+    "commit": "a4b95045f31b1739a49709565f43532f3ee85298",
+    "subject": "fix(tools/_bash-cwd): narrow cwd-escape check to real parent traversals",
+    "kind": "bug",
+    "testFiles": [
+      "tests/tools/_bash-cwd.test.ts"
+    ],
+    "srcFiles": [
+      "src/tools/builtin/_bash-cwd.ts"
+    ],
+    "tier": 1
+  },
+  {
+    "id": "b888c4ddd",
+    "commit": "b888c4ddd91a537ef56791e31241e344bd380075",
+    "subject": "fix(git_apply_patch): canonicalize paths so a symlinked cwd isn't a false escape",
+    "kind": "bug",
+    "testFiles": [
+      "tests/tools/git-apply-patch.test.ts"
+    ],
+    "srcFiles": [
+      "src/tools/builtin/git-apply-patch.ts"
+    ],
+    "tier": 2
+  },
+  {
+    "id": "bd7ecf84b",
+    "commit": "bd7ecf84bf3f9a4d1739e05ba85748acb02d36f9",
+    "subject": "feat(harness): final synthesis turn on max_steps so an exhausted run still returns its answer",
+    "kind": "feature",
+    "testFiles": [
+      "tests/harness/loop.test.ts"
+    ],
+    "srcFiles": [
+      "src/harness/loop.ts"
+    ],
+    "tier": 3
+  },
+  {
+    "id": "c12e891bf",
+    "commit": "c12e891bfb20182f20d94cda5f18f202e782ca32",
+    "subject": "fix(providers/anthropic): never send temperature and top_p together",
+    "kind": "bug",
+    "testFiles": [
+      "tests/providers/anthropic.test.ts"
+    ],
+    "srcFiles": [
+      "src/providers/anthropic/index.ts"
+    ],
+    "tier": 1
+  },
+  {
+    "id": "c266c8894",
+    "commit": "c266c8894e3b67cef8786e9de2472f9bc9d30af6",
+    "subject": "fix(checkpoints): preserve tracked secrets, anchor snapshot/restore at the worktree root",
+    "kind": "bug",
+    "testFiles": [
+      "tests/checkpoints/detect.test.ts",
+      "tests/checkpoints/git.test.ts",
+      "tests/checkpoints/manager.test.ts"
+    ],
+    "srcFiles": [
+      "src/checkpoints/detect.ts",
+      "src/checkpoints/git.ts",
+      "src/checkpoints/index.ts",
+      "src/checkpoints/manager.ts",
+      "src/cli/checkpoints.ts",
+      "src/harness/loop.ts"
+    ],
+    "tier": 3
+  },
+  {
+    "id": "c82402ddd",
+    "commit": "c82402dddf85db16a4e8e2072af8db91ff8b57cb",
+    "subject": "fix(permissions): route cwd-scope symlink escape to Conservative",
+    "kind": "bug",
+    "testFiles": [
+      "tests/permissions/engine.test.ts",
+      "tests/permissions/resolvers.test.ts"
+    ],
+    "srcFiles": [
+      "src/permissions/resolvers/bash.ts"
+    ],
+    "tier": 2
+  },
+  {
+    "id": "d23d056c0",
+    "commit": "d23d056c0a873db7cd163218d2ae3615ed44cfcb",
+    "subject": "fix(inbox): drain after a turn that rejects without session_finished",
+    "kind": "bug",
+    "testFiles": [
+      "tests/cli/repl.test.ts"
+    ],
+    "srcFiles": [
+      "src/cli/repl.ts"
+    ],
+    "tier": 2
+  },
+  {
+    "id": "d3747eb16",
+    "commit": "d3747eb16b67659c09912f48d9ae662607ab36b5",
+    "subject": "fix(critique): sort runs globally by createdAt before tail-slicing",
+    "kind": "bug",
+    "testFiles": [
+      "tests/cli/slash/commands.test.ts"
+    ],
+    "srcFiles": [
+      "src/cli/slash/commands/critique.ts"
+    ],
+    "tier": 2
+  },
+  {
+    "id": "d5849eade",
+    "commit": "d5849eade51a8e007637d3866f108e70b971a8a8",
+    "subject": "fix(storage/context-pins): cap counts only active pins, not expired rows",
+    "kind": "bug",
+    "testFiles": [
+      "tests/cli/slash/pin.test.ts",
+      "tests/storage/context-pins.test.ts"
+    ],
+    "srcFiles": [
+      "src/cli/slash/commands/pin.ts",
+      "src/storage/repos/context-pins.ts"
+    ],
+    "tier": 2
+  },
+  {
+    "id": "d8451612e",
+    "commit": "d8451612ea9574cc37fa3514738f8f3f92d049bb",
+    "subject": "feat(tools): bash_list — snapshot of session bg processes",
+    "kind": "feature",
+    "testFiles": [
+      "tests/cli/bootstrap.test.ts",
+      "tests/tools/bash-list.test.ts"
+    ],
+    "srcFiles": [
+      "src/bg/manager.ts",
+      "src/tools/builtin/bash-list.ts",
+      "src/tools/builtin/index.ts"
+    ],
+    "tier": 2
+  },
+  {
+    "id": "d8e189cec",
+    "commit": "d8e189cec11dacb3f22d631a1ae44ae65832a864",
+    "subject": "feat(reminders): in-memory clock-driven scheduler",
+    "kind": "feature",
+    "testFiles": [
+      "tests/reminders/duration.test.ts",
+      "tests/reminders/scheduler.test.ts"
+    ],
+    "srcFiles": [
+      "src/reminders/duration.ts",
+      "src/reminders/index.ts",
+      "src/reminders/scheduler.ts"
+    ],
+    "tier": 1
+  },
+  {
+    "id": "d99f0dd57",
+    "commit": "d99f0dd57a2bc01e49f0408eadca6aba68a95857",
+    "subject": "fix(inbox): record history at drain, not enqueue, so edits don't strand the original",
+    "kind": "bug",
+    "testFiles": [
+      "tests/cli/repl-history.test.ts"
+    ],
+    "srcFiles": [
+      "src/cli/repl.ts"
+    ],
+    "tier": 2
+  },
+  {
+    "id": "dce1cb6a9",
+    "commit": "dce1cb6a9fa2fe4c9cd0aa09adcece89c285256e",
+    "subject": "fix(working-state): keep staleness step monotonic across REPL turns",
+    "kind": "bug",
+    "testFiles": [
+      "tests/working-state/index.test.ts"
+    ],
+    "srcFiles": [
+      "src/harness/loop.ts",
+      "src/working-state/index.ts"
+    ],
+    "tier": 3
+  },
+  {
+    "id": "e2c7da71b",
+    "commit": "e2c7da71b6c7207a340d1909d428830e16993c5e",
+    "subject": "fix(permissions): preserve dynamic ($-expansion) path operands in conservative results",
+    "kind": "bug",
+    "testFiles": [
+      "tests/permissions/resolvers.test.ts"
+    ],
+    "srcFiles": [
+      "src/permissions/resolvers/bash.ts"
+    ],
+    "tier": 3
+  },
+  {
+    "id": "e38ea07f1",
+    "commit": "e38ea07f1a6cd2ef42788a8efe2e5f7811159945",
+    "subject": "fix(git): gate log against denied-subtree commits",
+    "kind": "bug",
+    "testFiles": [
+      "tests/tools/git.test.ts"
+    ],
+    "srcFiles": [
+      "src/tools/builtin/git.ts"
+    ],
+    "tier": 2
+  },
+  {
+    "id": "e763e1c92",
+    "commit": "e763e1c926c42b30059fec1f5f2d140a87de9696",
+    "subject": "sec(git_apply_patch): reject metadata-only diff sections (confinement bypass)",
+    "kind": "bug",
+    "testFiles": [
+      "tests/diff/git-patch.test.ts",
+      "tests/tools/git-apply-patch.test.ts"
+    ],
+    "srcFiles": [
+      "src/diff/git-patch.ts",
+      "src/tools/builtin/git-apply-patch.ts"
+    ],
+    "tier": 3
+  },
+  {
+    "id": "edfed8a24",
+    "commit": "edfed8a24cced61abbdb330d9dd778ddac3f14a9",
+    "subject": "fix(permissions): require a segment slash for the /run/media glob carve-out",
+    "kind": "bug",
+    "testFiles": [
+      "tests/permissions/protected_paths.test.ts",
+      "tests/permissions/resolvers.test.ts"
+    ],
+    "srcFiles": [
+      "src/permissions/protected_paths.ts"
+    ],
+    "tier": 1
+  },
+  {
+    "id": "f1fafd62b",
+    "commit": "f1fafd62b60ab0b2437e7572f3131bda93667e1a",
+    "subject": "Fix git metadata-gate relativity leak: resolve against the repo root",
+    "kind": "bug",
+    "testFiles": [
+      "tests/tools/git.test.ts"
+    ],
+    "srcFiles": [
+      "src/tools/builtin/git.ts"
+    ],
+    "tier": 2
+  },
+  {
+    "id": "f3fdc7a92",
+    "commit": "f3fdc7a9222cca23e04c546aec2a8a2d3448b1a0",
+    "subject": "fix(subagents): preserve a custom model's api_key_env into the child",
+    "kind": "bug",
+    "testFiles": [
+      "tests/subagents/spawn-factory.test.ts"
+    ],
+    "srcFiles": [
+      "src/subagents/runtime.ts",
+      "src/subagents/spawn-factory.ts"
+    ],
+    "tier": 2
+  },
+  {
+    "id": "f51ba40f6",
+    "commit": "f51ba40f6aecb97c39eabb9388d58d64b14066b3",
+    "subject": "fix(history): trim in-memory mirror to match storage cap",
+    "kind": "bug",
+    "testFiles": [
+      "tests/cli/repl-history.test.ts"
+    ],
+    "srcFiles": [
+      "src/cli/repl.ts"
+    ],
+    "tier": 2
+  },
+  {
+    "id": "fa8a694c2",
+    "commit": "fa8a694c2ca32d144b47a4674ef00e246d3159a5",
+    "subject": "fix: a mid-round tool abort no longer bricks the session",
+    "kind": "bug",
+    "testFiles": [
+      "tests/harness/loop.test.ts",
+      "tests/harness/resume.test.ts",
+      "tests/tui/render/tool-card.test.ts"
+    ],
+    "srcFiles": [
+      "src/harness/loop.ts",
+      "src/harness/resume.ts",
+      "src/tui/render/tool-card.ts"
+    ],
+    "tier": 3
+  },
+  {
+    "id": "fc6619bd7",
+    "commit": "fc6619bd773376675cedaa179559026226c2f238",
+    "subject": "fix(permissions): classify for-loop item words + preserve dynamic argv positions",
+    "kind": "bug",
+    "testFiles": [
+      "tests/permissions/resolvers.test.ts"
+    ],
+    "srcFiles": [
+      "src/permissions/resolvers/bash.ts"
+    ],
+    "tier": 2
+  }
+]
