@@ -10,6 +10,7 @@ import {
   tierOf,
   validateFailToPass,
 } from '../../scripts/swe-bench-mine.ts';
+import { installSweDepsFixture } from '../helpers/swe-deps-fixture.ts';
 
 // All tests build a throwaway git repo (no dependency on the running checkout's history → they run
 // on a shallow CI clone too). bun:test is a builtin, so a synthetic oracle needs no real deps; an
@@ -134,6 +135,10 @@ describe('preservePassToPass', () => {
 });
 
 describe('validateFailToPass', () => {
+  // The synthetic repo has no package.json; without a pre-built deps store ensureIsolatedDeps throws
+  // (CI has no warm ~/.cache/forja-swe-deps). See tests/helpers/swe-deps-fixture.ts.
+  installSweDepsFixture();
+
   test('ok:true on a synthetic fail-to-pass (oracle fails at parent, passes with gold src)', () => {
     const { repo, head } = makeRepo([
       // parent: buggy src, no oracle yet
