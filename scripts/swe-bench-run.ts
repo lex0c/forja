@@ -69,10 +69,10 @@ for (let i = 0; i < argv.length; i++) {
 }
 
 // The model receives the failing test as the spec — nothing from the commit/BACKLOG.
-const promptFor = (t: Task): string =>
-  `One or more tests in this repository are failing. Run \`bun test ${t.testFiles.join(' ')}\` to ` +
-  `see the failure, then fix the SOURCE under src/ so the test(s) pass. Do NOT edit the test files — ` +
-  `they specify the required behavior. You are done when \`bun test ${t.testFiles.join(' ')}\` exits 0.`;
+const promptFor = (t: Task): string => {
+  const cmd = `bun test ${t.testFiles.join(' ')}`;
+  return `One or more tests in this repository are failing. Run \`${cmd}\` to see the failure, then fix the SOURCE under src/ so the test(s) pass. Do NOT edit the test files — they specify the required behavior. You are done when \`${cmd}\` exits 0.`;
+};
 
 const toCase = (t: Task): EvalCase => {
   // OUTCOME oracle: the gold test, run sandboxed (cwd-rw, network off, failClosed).

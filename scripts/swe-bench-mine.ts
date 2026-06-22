@@ -185,7 +185,11 @@ export const mineCorpus = ({
 }: { repoRoot: string; since: string; limit?: number }): { valid: Task[]; dropped: Dropped[] } => {
   const valid: Task[] = [];
   const dropped: Dropped[] = [];
-  for (const c of candidateCommits({ repoRoot, since, ...(limit !== undefined ? { limit } : {}) })) {
+  for (const c of candidateCommits({
+    repoRoot,
+    since,
+    ...(limit !== undefined ? { limit } : {}),
+  })) {
     const v = validateFailToPass({ commit: c.sha, repoRoot, testFiles: c.testFiles });
     if (v.ok) {
       valid.push({
@@ -218,7 +222,11 @@ if (import.meta.main) {
   process.stderr.write(
     `swe-bench-mine: scanning '${since}'${limit ? ` (limit ${limit})` : ''}...\n`,
   );
-  const { valid, dropped } = mineCorpus({ repoRoot, since, ...(limit !== undefined ? { limit } : {}) });
+  const { valid, dropped } = mineCorpus({
+    repoRoot,
+    since,
+    ...(limit !== undefined ? { limit } : {}),
+  });
   const tiers = { 1: 0, 2: 0, 3: 0 };
   for (const t of valid) tiers[t.tier]++;
   const sorted = [...valid].sort((a, b) => a.id.localeCompare(b.id));

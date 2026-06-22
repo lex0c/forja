@@ -14,7 +14,8 @@
       ".claude",
       "docs/spec",
       "evals/fixtures",
-      "evals/recap/golden"
+      "evals/recap/golden",
+      "evals/swe-bench"
     ]
   },
   "formatter": {
