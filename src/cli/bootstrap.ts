@@ -23,6 +23,7 @@ import {
 import { createSqliteFailureSink } from '../failures/index.ts';
 import { DEFAULT_EFFORT } from '../harness/effort.ts';
 import type { HarnessConfig, RunBudget } from '../harness/index.ts';
+import { effectiveBudget } from '../harness/types.ts';
 import {
   type HookConfigWarning,
   resolveHookConfig,
@@ -1652,6 +1653,22 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     outcomeSink,
   };
 
+  // maxCostUsd cannot bound an unmetered provider: cost is never tracked, so the
+  // cap never triggers. Surface it instead of letting the operator believe their
+  // cost cap protects them on a hosted/unmetered tier (e.g. Ollama Cloud). Resolve
+  // through `effectiveBudget` (NOT the partial `config.budget`): the common case is
+  // no explicit `[budget]`, yet the harness still applies DEFAULT_BUDGET.maxCostUsd
+  // ($100) and the UI presents it — an inert cap the operator should be warned about
+  // too. A genuine opt-out (`maxCostUsd: undefined`) resolves to undefined here and
+  // correctly stays silent.
+  const effectiveMaxCostUsd = effectiveBudget(config.budget, config.effort).maxCostUsd;
+  const unmeteredCapWarnings =
+    effectiveMaxCostUsd !== undefined && config.provider.capabilities.unmetered === true
+      ? [
+          `the maxCostUsd cost cap ($${effectiveMaxCostUsd}) cannot bound this run: model '${config.provider.id}' is unmetered (cost is not tracked per-token).`,
+        ]
+      : [];
+
   return {
     config,
     db,
@@ -1666,7 +1683,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     memoryConfigWarnings: memoryLoaded.warnings,
     providersConfigWarnings: providersLoaded.warnings,
     recapConfigWarnings: recapLoaded.warnings,
-    budgetConfigWarnings: budgetLoaded.warnings,
+    budgetConfigWarnings: [...budgetLoaded.warnings, ...unmeteredCapWarnings],
     effortConfigWarnings: effortLoaded.warnings,
     auditConfigWarnings: auditLoaded.warnings,
     sandboxConfigWarnings: sandboxLoaded.warnings,

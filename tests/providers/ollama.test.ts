@@ -265,8 +265,8 @@ describe('served context window (num_ctx ↔ capabilities)', () => {
 
   test('a >cap model reports the SERVED (capped) window, not the catalog capacity', async () => {
     const { fn, bodies } = recordingFetch(okResponse);
-    // qwen3-coder:30b capacity is 262144; the default cap is 32768.
-    const p = createOllamaProvider('qwen3-coder:30b', { fetch: fn });
+    // mistral-nemo:12b capacity is 131072; the default cap is 32768.
+    const p = createOllamaProvider('mistral-nemo:12b', { fetch: fn });
     expect(p.capabilities.context_window).toBe(32_768);
     await collect(p.generate(reqGen({ messages: [{ role: 'user', content: 'x' }] })));
     expect(numCtxOf(bodies[0] as Record<string, unknown>)).toBe(32_768);
@@ -278,7 +278,7 @@ describe('served context window (num_ctx ↔ capabilities)', () => {
 
   test('numCtx override raises both the served window and num_ctx', async () => {
     const { fn, bodies } = recordingFetch(okResponse);
-    const p = createOllamaProvider('qwen3-coder:30b', { fetch: fn, numCtx: 65_536 });
+    const p = createOllamaProvider('mistral-nemo:12b', { fetch: fn, numCtx: 65_536 });
     expect(p.capabilities.context_window).toBe(65_536);
     await collect(p.generate(reqGen({ messages: [{ role: 'user', content: 'x' }] })));
     expect(numCtxOf(bodies[0] as Record<string, unknown>)).toBe(65_536);
@@ -290,15 +290,18 @@ describe('served context window (num_ctx ↔ capabilities)', () => {
     const p = createOllamaProvider('llama3.1:8b', { fetch: fn, numCtx: 1_000_000 });
     expect(p.capabilities.context_window).toBe(131_072);
     await collect(p.generate(reqGen({ messages: [{ role: 'user', content: 'x' }] })));
-    // num_ctx still forwards the operator's explicit ask (their VRAM call).
-    expect(numCtxOf(bodies[0] as Record<string, unknown>)).toBe(1_000_000);
+    // The SERVED num_ctx is clamped to the capacity too — not forwarded raw. A num_ctx past the
+    // model's trained window is a typo / pure VRAM waste (the harness caps the prompt at the
+    // capacity regardless, so the extra KV is never used); raising `context_window` is the knob
+    // for a bigger budget AND served window.
+    expect(numCtxOf(bodies[0] as Record<string, unknown>)).toBe(131_072);
   });
 
   test('FORJA_OLLAMA_NUM_CTX env sets the served window', () => {
     const saved = process.env.FORJA_OLLAMA_NUM_CTX;
     process.env.FORJA_OLLAMA_NUM_CTX = '49152';
     try {
-      expect(createOllamaProvider('qwen3-coder:30b').capabilities.context_window).toBe(49_152);
+      expect(createOllamaProvider('mistral-nemo:12b').capabilities.context_window).toBe(49_152);
     } finally {
       if (saved === undefined) {
         delete process.env.FORJA_OLLAMA_NUM_CTX;
@@ -309,7 +312,7 @@ describe('served context window (num_ctx ↔ capabilities)', () => {
   });
 
   test('does not mutate the shared static catalog capability', () => {
-    createOllamaProvider('qwen3-coder:30b');
-    expect(OLLAMA_CAPS['qwen3-coder:30b']?.context_window).toBe(262_144);
+    createOllamaProvider('mistral-nemo:12b');
+    expect(OLLAMA_CAPS['mistral-nemo:12b']?.context_window).toBe(131_072);
   });
 });

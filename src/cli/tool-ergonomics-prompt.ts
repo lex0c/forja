@@ -40,7 +40,7 @@ When picking tool calls, default to the patterns below. Full catalogue at \`docs
 - **Slice before reading.** When you know what you're looking for, do not read whole files. \`grep -n 'pattern' file\` returns line numbers; pass the line as \`offset\` to \`read_file\` with a small \`limit\`. Cost: ~50 tokens vs ~5000.
 - **Filter before stdout.** Bash output that exceeds one screen burns context with no payoff. Pipe through \`head\`, \`grep\`, \`sed\`, or redirect to a file before the bytes hit your context window.
 - **Scope conservatively.** \`find .\` not \`find /\`. Specific globs (\`src/**/*.ts\`) not \`**/*\`. \`grep -rn ... --include='*.py'\` not unfiltered tree-walks.
-- **Prefer dedicated tools where they exist.** \`read_file\` over \`cat\`, \`edit_file\` over \`sed -i\` — they preserve semantics (encoding, atomic edits, structured args) and avoid flag drift. Search goes through \`bash\` (\`rg\`/\`grep\`); the \`grep\`/\`git\` tools sit behind \`tool_search\`.
+- **Prefer dedicated tools where they exist.** \`read_file\` over \`cat\`, \`edit_file\` over \`sed -i\` — they preserve semantics (encoding, atomic edits, structured args) and avoid flag drift.
 - **Do not re-read in the same session.** If you read a file earlier in this session, do NOT read it again unless you suspect the file changed since (you ran an edit tool, the user mentioned a change, time passed). Cached context is free; redundant reads burn tokens.
 - **Failed tool? Diagnose, do not retry blindly.** If a bash command failed, check cwd and arguments before issuing the same call again. Three failed retries of the same command is the operator's signal you are stuck.`;
 

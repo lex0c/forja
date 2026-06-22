@@ -234,6 +234,34 @@ describe('executeCase', () => {
     expect(r.passed).toBe(true);
   });
 
+  test('file_not_contains passes when the pattern is absent, fails when present', async () => {
+    // Reuses the deterministic write (out.txt = "forja-was-here\n") so the only
+    // variable is the negated pattern check.
+    const run = (pattern: string) =>
+      executeCase(baseCase({ expect: [{ kind: 'file_not_contains', path: 'out.txt', pattern }] }), {
+        bootstrapOverride: {
+          providerOverride: mockProvider([
+            {
+              tool_uses: [
+                {
+                  id: 't1',
+                  name: 'write_file',
+                  input: { path: 'out.txt', content: 'forja-was-here\n' },
+                },
+              ],
+            },
+            { text: 'wrote the file' },
+          ]),
+          sandboxAvailabilityOverride: HERMETIC_SANDBOX,
+        },
+      });
+    const absent = await run('goodbye');
+    expect(absent.expectations[0]?.passed).toBe(true);
+    const present = await run('forja-was-here');
+    expect(present.expectations[0]?.passed).toBe(false);
+    expect(present.expectations[0]?.detail).toContain('still contains');
+  });
+
   test('hermetic w.r.t. FORJA_PROFILE: honors the case .forja/ policy, not .forja-<profile>/', async () => {
     // Regression: routing the eval policy through projectDirName() made a
     // dev-profile shell look for `.forja-dev/permissions.yaml`, miss the case's

@@ -1,4 +1,5 @@
 name: PreToolUse failClosed timeout denies the tool
+evaluates: harness
 prompt: |
   Use the write_file tool to create `out.txt` with content `landed`.
   Report what the tool returned, even if it's an error.

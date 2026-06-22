@@ -22,7 +22,11 @@
 
 import type { DB } from '../db.ts';
 import { sumCompactionContextReclaim, sumCompactionUsage } from './compaction-events.ts';
-import { countAssistantMessagesBySession, sumMessageUsage } from './messages.ts';
+import {
+  countAssistantMessagesBySession,
+  effectiveSessionModels,
+  sumMessageUsage,
+} from './messages.ts';
 import { getSession, listChildSessions } from './sessions.ts';
 
 export interface UsageStats {
@@ -65,6 +69,11 @@ export interface UsageStats {
   // to read compaction as a trade rather than a pure expense.
   compactionCount: number;
   reclaimedTokens: number;
+  // Distinct models across every session in scope (root(s) + subagent descendants).
+  // The CLI resolves these against the catalog to tell whether the aggregate holds
+  // UNMETERED usage (untracked $0) — which the currently selected provider alone can't
+  // reveal, since the scope spans model switches, resumes, and mixed-metering subagents.
+  models: string[];
 }
 
 const emptyStats = (): UsageStats => ({
@@ -75,6 +84,7 @@ const emptyStats = (): UsageStats => ({
   cacheCreation: 0,
   usageComplete: true,
   sessionCount: 0,
+  models: [],
   cacheWriteParent: 0,
   cacheWriteSubagent: 0,
   cacheWriteCompaction: 0,
@@ -107,6 +117,7 @@ export const cacheHitRatio = (stats: UsageStats): number => {
 export const computeUsageStats = (db: DB, rootSessionIds: readonly string[]): UsageStats => {
   const stats = emptyStats();
   const seen = new Set<string>();
+  const models = new Set<string>();
 
   const visit = (id: string): void => {
     if (seen.has(id)) return;
@@ -114,6 +125,11 @@ export const computeUsageStats = (db: DB, rootSessionIds: readonly string[]): Us
     const session = getSession(db, id);
     if (session === null) return;
     stats.sessionCount += 1;
+    // Per-turn models (migration 077) so the scope's metering reflects the models
+    // ACTUALLY used, not each session's initial `model` (a /model switch leaves it
+    // stale). `effectiveSessionModels` folds the pre-migration / no-billed-turn
+    // fallback to `sessions.model` in one place (shared with `isSessionUnmetered`).
+    for (const m of effectiveSessionModels(db, id, session.model)) models.add(m);
     stats.costUsd += session.totalCostUsd;
     if (!session.usageComplete) stats.usageComplete = false;
     // Tokens come from TWO sources: the per-turn `messages` rows, plus the
@@ -147,5 +163,6 @@ export const computeUsageStats = (db: DB, rootSessionIds: readonly string[]): Us
   };
 
   for (const root of rootSessionIds) visit(root);
+  stats.models = [...models];
   return stats;
 };

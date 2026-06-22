@@ -21,4 +21,3 @@ budget:
   # regression net for the parallel_safe wire from
   # ORCHESTRATION.md §1.3 (BACKLOG eval #34).
   maxSteps: 3
-  maxCostUsd: 0.15

@@ -25,4 +25,3 @@ budget:
   # If either guidance is absent or weak, the model defaults
   # to one read per turn and trips this cap.
   maxSteps: 4
-  maxCostUsd: 0.15

@@ -4,6 +4,9 @@
 // is required to inspect prior runs, and a missing/unparsable
 // permissions.yaml doesn't block the listing.
 
+import { createDefaultRegistry, loadModelRegistry } from '../providers/catalog-file.ts';
+import { isSessionUnmetered } from '../providers/cost-format.ts';
+import type { ModelRegistry } from '../providers/registry.ts';
 import type { Session } from '../storage/index.ts';
 import {
   type DB,
@@ -16,6 +19,7 @@ import {
   migrate,
   openDb,
 } from '../storage/index.ts';
+import { effectiveSessionModels } from '../storage/repos/messages.ts';
 
 export interface ListSessionsOptions {
   json: boolean;
@@ -23,6 +27,9 @@ export interface ListSessionsOptions {
   // tests that don't want to touch ~/.config/forja/).
   dbPath?: string;
   dbOverride?: DB;
+  // Test seam: the catalog used to resolve per-row metering. Production loads the
+  // operator's installed catalog (with a seed fallback); a test passes a stub.
+  registryOverride?: ModelRegistry;
   out: (s: string) => void;
   // Optional stderr sink. Used only to emit a one-line truncation
   // hint when --include-subagents would have produced more rows
@@ -69,6 +76,9 @@ interface SessionListItem {
   started_at: string;
   ended_at: string | null;
   model: string;
+  // The model is unmetered (cost not tracked per token, e.g. Ollama Cloud),
+  // resolved from the seed catalog. cost_usd is 0 = "untracked", not free.
+  unmetered: boolean;
   status: Session['status'];
   cost_usd: number;
   // Sum of cost_usd for THIS row plus every descendant reachable
@@ -106,7 +116,13 @@ interface SessionListItem {
   subagent_run: { name: string; source_sha256: string } | null;
 }
 
-const buildItem = (s: Session, db: DB, depth: number, cumulativeCost: number): SessionListItem => {
+const buildItem = (
+  s: Session,
+  db: DB,
+  depth: number,
+  cumulativeCost: number,
+  unmetered: boolean,
+): SessionListItem => {
   // First user message content. Sessions almost always have at
   // least one user message (the original prompt); the rare race
   // where listSessions runs before appendMessage just yields an
@@ -136,6 +152,7 @@ const buildItem = (s: Session, db: DB, depth: number, cumulativeCost: number): S
     started_at: formatTime(s.startedAt),
     ended_at: s.endedAt === null ? null : formatTime(s.endedAt),
     model: s.model,
+    unmetered,
     status: s.status,
     cost_usd: s.totalCostUsd,
     // Cumulative is the row's own cost plus its full subtree.
@@ -167,28 +184,41 @@ const buildItem = (s: Session, db: DB, depth: number, cumulativeCost: number): S
 // both the tree shape AND the cost rollup, but consumers (JSON
 // or table renderer) get accurate cumulative for every node
 // without paying per-row walks.
-const fanSubtree = (
-  root: Session,
-  db: DB,
-  seen: Set<string>,
-): { session: Session; depth: number; cumulativeCost: number }[] => {
-  const out: { session: Session; depth: number; cumulativeCost: number }[] = [];
-  // Each visit appends a placeholder, recurses (filling
-  // descendants), then patches the placeholder's cumulative
-  // with own + sum of children's cumulatives. Returning the
-  // node's own cumulative lets the parent fold it in.
-  const visit = (s: Session, depth: number): number => {
-    if (seen.has(s.id)) return 0;
+interface SubtreeNode {
+  session: Session;
+  depth: number;
+  cumulativeCost: number;
+  // The models the node's WHOLE subtree billed on (own ∪ descendants), via
+  // effectiveSessionModels. Rolled up post-order alongside cumulativeCost so a row's
+  // metering is resolved from the same subtree its displayed cost folds — else an unmetered
+  // parent with a metered subagent (or the reverse) reads with the wrong unmetered flag while
+  // its cumulative cost carries the hidden subtree's spend.
+  cumulativeModels: string[];
+}
+
+const fanSubtree = (root: Session, db: DB, seen: Set<string>): SubtreeNode[] => {
+  const out: SubtreeNode[] = [];
+  // Each visit appends a placeholder, recurses (filling descendants), then patches the
+  // placeholder's cumulative cost AND models with own + the union of children's. Returning
+  // the node's own rollup lets the parent fold it in.
+  const visit = (s: Session, depth: number): { cost: number; models: readonly string[] } => {
+    if (seen.has(s.id)) return { cost: 0, models: [] };
     seen.add(s.id);
     const idx = out.length;
-    out.push({ session: s, depth, cumulativeCost: 0 });
+    out.push({ session: s, depth, cumulativeCost: 0, cumulativeModels: [] });
     let cumulative = s.totalCostUsd;
+    const models = new Set<string>(effectiveSessionModels(db, s.id, s.model));
     for (const child of listChildSessions(db, s.id)) {
-      cumulative += visit(child, depth + 1);
+      const childRollup = visit(child, depth + 1);
+      cumulative += childRollup.cost;
+      for (const m of childRollup.models) models.add(m);
     }
     const slot = out[idx];
-    if (slot !== undefined) slot.cumulativeCost = cumulative;
-    return cumulative;
+    if (slot !== undefined) {
+      slot.cumulativeCost = cumulative;
+      slot.cumulativeModels = [...models];
+    }
+    return { cost: cumulative, models: [...models] };
   };
   visit(root, 0);
   return out;
@@ -231,13 +261,26 @@ const writeTable = (items: SessionListItem[], out: (s: string) => void): void =>
     // last-shown digit at .toFixed(4)) so the annotation only
     // surfaces when it would render as nonzero — pairs the cost
     // gate with the format precision and avoids `+$0.0000` noise.
+    // "unmetered" only when there is NO recorded spend: `unmetered` is resolved from the
+    // row's model (the one at createSession time), but a `/model` switch can leave a real
+    // nonzero `cost_usd` on a row whose initial model was unmetered — show the dollars, do
+    // not hide them behind the label. Mirrors `formatCostCell`'s zero-cost gate.
+    const own = it.unmetered && it.cost_usd === 0 ? 'unmetered' : `$${it.cost_usd.toFixed(4)}`;
     const descendants = it.cumulative_cost_usd - it.cost_usd;
-    const costStr =
-      descendants > 5e-5
-        ? `$${it.cost_usd.toFixed(4)} +$${descendants.toFixed(4)}`
-        : `$${it.cost_usd.toFixed(4)}`;
+    const costStr = descendants > 5e-5 ? `${own} +$${descendants.toFixed(4)}` : own;
     const cost = costStr.padEnd(COST_WIDTH);
     out(`${it.started_at}  ${status} ${cost}${id}  ${it.prompt_preview}\n`);
+  }
+};
+
+// Resolve metering against the operator's INSTALLED catalog; fall back to the built-in
+// seed when the catalog file is absent/unparsable (best-effort, non-blocking — keeps
+// list-sessions free of the bootstrap and API-key requirements its header promises).
+const loadInstalledRegistry = (): ModelRegistry => {
+  try {
+    return loadModelRegistry().registry;
+  } catch {
+    return createDefaultRegistry();
   }
 };
 
@@ -246,6 +289,11 @@ export const runListSessions = (options: ListSessionsOptions): number => {
   const db = options.dbOverride ?? openDb(dbPath);
   const ownsDb = options.dbOverride === undefined;
   const limit = options.limit ?? 20;
+  // Resolve each row's metering against the OPERATOR's installed catalog (the sessions
+  // were created with it) so a custom/edited `unmetered` entry renders correctly — not
+  // just the seed. `loadInstalledRegistry` falls back to the seed when the catalog file is
+  // absent/unparsable. A test may inject `registryOverride`.
+  const registry = options.registryOverride ?? loadInstalledRegistry();
   try {
     if (ownsDb) migrate(db);
     // listSessions filters out children by default. When the user
@@ -274,7 +322,19 @@ export const runListSessions = (options: ListSessionsOptions): number => {
       items = parents.map((s) => {
         const subtree = fanSubtree(s, db, new Set<string>());
         const root = subtree[0];
-        return buildItem(s, db, 0, root !== undefined ? root.cumulativeCost : s.totalCostUsd);
+        return buildItem(
+          s,
+          db,
+          0,
+          root !== undefined ? root.cumulativeCost : s.totalCostUsd,
+          // Metering folds the SUBTREE's models (matching the cumulative cost), not just the
+          // parent's own — the subtree is hidden in this default listing, so its metered/
+          // unmetered usage must still be reflected in the row's flag.
+          isSessionUnmetered(
+            registry,
+            root !== undefined ? root.cumulativeModels : effectiveSessionModels(db, s.id, s.model),
+          ),
+        );
       });
       emittedTopLevels = parents.length;
     } else {
@@ -296,8 +356,18 @@ export const runListSessions = (options: ListSessionsOptions): number => {
       for (const parent of parents) {
         const subtree = fanSubtree(parent, db, seen);
         if (items.length + subtree.length > limit) break;
-        for (const { session, depth, cumulativeCost } of subtree) {
-          items.push(buildItem(session, db, depth, cumulativeCost));
+        for (const { session, depth, cumulativeCost, cumulativeModels } of subtree) {
+          items.push(
+            buildItem(
+              session,
+              db,
+              depth,
+              cumulativeCost,
+              // Same subtree-folded metering as the default path: each row's cumulativeCost
+              // already folds its descendants, so its flag must too.
+              isSessionUnmetered(registry, cumulativeModels),
+            ),
+          );
         }
         emittedTopLevels += 1;
       }

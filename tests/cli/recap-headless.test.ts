@@ -293,11 +293,15 @@ describe('runRecapHeadless — --json mode (RECAP §9 NDJSON)', () => {
       duration_ms: number;
       used_llm: boolean;
       cost_usd: number;
+      unmetered: boolean;
     };
     expect(endEv.type).toBe('recap_end');
     expect(endEv.duration_ms).toBeGreaterThan(0);
     expect(endEv.used_llm).toBe(false);
     expect(endEv.cost_usd).toBe(0);
+    // Deterministic render: no LLM ran, so $0 is genuinely free — NOT unmetered. (The
+    // field is sourced from the RENDER outcome, not the session provider — the fix.)
+    expect(endEv.unmetered).toBe(false);
   });
 });
 

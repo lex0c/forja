@@ -19,7 +19,7 @@ const caps = (name: string) => {
 };
 const CODER = caps('qwen2.5-coder:14b'); // no thinking, 32K window
 const THINKER = caps('qwen3:8b'); // thinking
-const BIG = caps('qwen3-coder:30b'); // 256K window
+const BIG = caps('mistral-nemo:12b'); // 128K window
 
 const req = (over: Partial<GenerateRequest>): GenerateRequest => ({
   model: 'qwen2.5-coder:14b',

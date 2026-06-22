@@ -1,4 +1,5 @@
 name: PreToolUse hook block_silent denies the tool
+evaluates: harness
 prompt: |
   Use the write_file tool to create `out.txt` with content `landed`.
   Report whatever the tool returns, even if it's an error. Do NOT

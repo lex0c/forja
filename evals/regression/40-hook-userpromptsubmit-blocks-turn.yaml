@@ -1,4 +1,5 @@
 name: UserPromptSubmit hook block aborts the turn
+evaluates: harness
 prompt: |
   Use the write_file tool to create `out.txt` with content `landed`.
 setup:

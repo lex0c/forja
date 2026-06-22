@@ -1,4 +1,5 @@
 name: autonomous posture still gates a risk-signal command (denied headless)
+evaluates: harness
 # Operation-mode (AGENTIC_CLI §8.1). The honest-autonomous floor: a
 # compound shell command trips the compound/shell-injection guard
 # (confirmCause != policy), so the autonomous posture does NOT

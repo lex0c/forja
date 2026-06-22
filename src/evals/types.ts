@@ -1,5 +1,6 @@
 import type { CompactionStrategy, ExitReason, HarnessResult } from '../harness/index.ts';
 import type { ApprovalPosture } from '../permissions/index.ts';
+import type { UsageInfo } from '../providers/index.ts';
 
 // One declarative expectation evaluated against a finished run.
 // Each shape carries exactly the data needed for its assertion;
@@ -19,6 +20,10 @@ export type EvalExpectation =
   | { kind: 'file_exists'; path: string }
   | { kind: 'file_not_exists'; path: string }
   | { kind: 'file_contains'; path: string; pattern: string }
+  // The negation: assert an edit REMOVED text (the old content is gone), not just
+  // that new content is present. The file must exist (fails if missing), like
+  // file_contains — so a rename/refactor case can prove no stale name lingers.
+  | { kind: 'file_not_contains'; path: string; pattern: string }
   | { kind: 'status'; status: HarnessResult['status'] }
   | { kind: 'exit_reason'; reason: ExitReason }
   | { kind: 'output_contains'; pattern: string }
@@ -113,6 +118,12 @@ export interface EvalCase {
   setup?: EvalSetup;
   expect: EvalExpectation[];
   budget?: EvalBudget;
+  // What the case discriminates: 'model' competence (tool use, editing, multi-step
+  // flows, judgment) vs a 'harness' mechanism (permissions, hooks, compaction,
+  // postures) whose outcome is the same regardless of model. The model ranking runs
+  // only 'model' cases; CI runs everything. Default 'model' (untagged counts toward
+  // the ranking) — tag the exceptions, not the norm.
+  evaluates?: 'model' | 'harness';
 }
 
 export interface ExpectationOutcome {
@@ -139,6 +150,13 @@ export interface EvalCaseResult {
   // When false, costUsd is a lower bound — surfaced so summary
   // stats can flag inflight underreporting.
   usageComplete: boolean;
+  // Aggregated token usage from the harness result (input / output / cache_read /
+  // cache_creation). Undefined when the run produced no result (setup failure).
+  // Lets the ranking derive a cache-hit rate when the provider caches.
+  usage?: UsageInfo;
+  // The selected provider is unmetered (cost not tracked per-token, e.g. Ollama
+  // Cloud) — lets the ranking blank cost_usd instead of reading $0 as "free".
+  unmetered?: boolean;
   expectations: ExpectationOutcome[];
   // Top-level failure reason when the case never reached the
   // expect phase (fixture missing, runAgent threw, budget cap).

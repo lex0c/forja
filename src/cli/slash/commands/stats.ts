@@ -15,6 +15,7 @@
 // usage report on some turn, so the totals are a lower bound — marked
 // with a leading `~` and an explanatory footnote.
 
+import { formatCostCell, isUnmeteredModel } from '../../../providers/cost-format.ts';
 import { computeCostBreakdown } from '../../../providers/cost.ts';
 import {
   cacheHitRatio,
@@ -110,9 +111,25 @@ export const statsCommand: SlashCommand = {
     // to write-amplification (its inverse-ish) — "each written token was read
     // back N times". 0 when nothing has been written yet.
     const reuse = s.cacheCreation > 0 ? s.cacheRead / s.cacheCreation : 0;
+    // Whether the scope holds UNMETERED usage (untracked $0) is a property of the
+    // SESSIONS aggregated, NOT the currently selected provider: computeUsageStats rolls
+    // up every repl session + subagent tree, so a metered current model can sit over an
+    // earlier unmetered turn / a resumed unmetered session / an unmetered subagent, and
+    // vice-versa. Resolve from the scope's models against the catalog. Pure-unmetered
+    // scope → the label; a mixed scope shows the tracked metered spend + the marker (a
+    // lower bound — the unmetered usage adds untracked cost) so real money is never hidden
+    // and untracked $0 is never read as free. NOTE: `.some` here (ANY unmetered model in
+    // scope ⇒ the marker) is the INVERSE quantifier of the per-session `isSessionUnmetered`
+    // (`.every`: ALL unmetered ⇒ unmetered). Intentional — this asks "does the scope contain
+    // untracked usage?", not "is one session wholly unmetered?". Keep them distinct.
+    const scopeUnmetered = s.models.some((m) => isUnmeteredModel(ctx.modelRegistry, m));
+    const costStr =
+      scopeUnmetered && s.costUsd > 0
+        ? `${lb}${formatCost(s.costUsd)} + unmetered (untracked usage in scope)`
+        : formatCostCell(scopeUnmetered, s.usageComplete, formatCost, s.costUsd);
     const notes: string[] = [
       'session stats (this REPL, incl. subagents):',
-      `  cost:   ${lb}${formatCost(s.costUsd)}`,
+      `  cost:   ${costStr}`,
       `  spend:  in ${formatCost(bd.inputCost)} (${pct(bd.inputCost)}%) · out ${formatCost(bd.outputCost)} (${pct(bd.outputCost)}%) · cache read ${formatCost(bd.cacheReadCost)} (${pct(bd.cacheReadCost)}%) · cache write ${formatCost(bd.cacheWriteCost)} (${pct(bd.cacheWriteCost)}%)`,
       // Cache savings vs the no-cache counterfactual (skipped for zero-rate
       // providers like local models, where there is nothing to save).

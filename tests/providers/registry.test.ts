@@ -2,7 +2,10 @@ import { describe, expect, test } from 'bun:test';
 import { ANTHROPIC_MODEL_NAMES } from '../../src/providers/anthropic/capabilities.ts';
 import { createDefaultRegistry } from '../../src/providers/catalog-file.ts';
 import { GOOGLE_MODEL_NAMES } from '../../src/providers/google/capabilities.ts';
-import { OLLAMA_MODEL_NAMES } from '../../src/providers/ollama/capabilities.ts';
+import {
+  OLLAMA_CLOUD_MODEL_NAMES,
+  OLLAMA_MODEL_NAMES,
+} from '../../src/providers/ollama/capabilities.ts';
 import { OPENAI_MODEL_NAMES } from '../../src/providers/openai/capabilities.ts';
 import { OPENROUTER_MODEL_NAMES } from '../../src/providers/openrouter/capabilities.ts';
 import { type ModelEntry, createRegistry } from '../../src/providers/registry.ts';
@@ -92,7 +95,7 @@ describe('createDefaultRegistry', () => {
   test('contains the Ollama lineup', () => {
     const reg = createDefaultRegistry();
     expect(reg.has('ollama/qwen2.5-coder:14b')).toBe(true);
-    expect(reg.has('ollama/qwen3-coder:30b')).toBe(true);
+    expect(reg.has('ollama/glm-5.2')).toBe(true);
     expect(reg.has('ollama/gpt-oss:20b')).toBe(true);
   });
 
@@ -110,6 +113,9 @@ describe('createDefaultRegistry', () => {
     for (const modelName of OLLAMA_MODEL_NAMES) {
       expect(reg.has(`ollama/${modelName}`)).toBe(true);
     }
+    for (const modelName of OLLAMA_CLOUD_MODEL_NAMES) {
+      expect(reg.has(`ollama/${modelName}`)).toBe(true);
+    }
     for (const modelName of OPENROUTER_MODEL_NAMES) {
       expect(reg.has(`openrouter/${modelName}`)).toBe(true);
     }
@@ -118,6 +124,7 @@ describe('createDefaultRegistry', () => {
         GOOGLE_MODEL_NAMES.length +
         OPENAI_MODEL_NAMES.length +
         OLLAMA_MODEL_NAMES.length +
+        OLLAMA_CLOUD_MODEL_NAMES.length +
         OPENROUTER_MODEL_NAMES.length,
     );
   });

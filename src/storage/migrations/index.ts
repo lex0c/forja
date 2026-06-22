@@ -74,6 +74,8 @@ import { migration073CompactionEventsCallUsage } from './073-compaction-events-c
 import { migration074MessagesEffort } from './074-messages-effort.ts';
 import { migration075MessagesSource } from './075-messages-source.ts';
 import { migration076SubagentRunsModelEntry } from './076-subagent-runs-model-entry.ts';
+import { migration077MessagesModel } from './077-messages-model.ts';
+import { migration078CompactionEventsModel } from './078-compaction-events-model.ts';
 
 export interface Migration {
   id: number;
@@ -158,4 +160,6 @@ export const MIGRATIONS: readonly Migration[] = [
   migration074MessagesEffort,
   migration075MessagesSource,
   migration076SubagentRunsModelEntry,
+  migration077MessagesModel,
+  migration078CompactionEventsModel,
 ];

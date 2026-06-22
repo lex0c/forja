@@ -1,4 +1,5 @@
 name: compaction triggers and folds history
+evaluates: harness
 prompt: |
   Process the 5 TypeScript files under src/ STRICTLY ONE AT A TIME,
   in alphabetical order: a.ts, b.ts, c.ts, d.ts, e.ts.

@@ -235,6 +235,237 @@ describe('runAgent', () => {
     expect(result.steps).toBe(3);
   });
 
+  // Concatenated text of the last assistant message — what a subagent hands
+  // back as its `output`. Empty when the run never wrote anything.
+  const lastAssistantText = (result: Awaited<ReturnType<typeof runAgent>>): string => {
+    const msgs = result.sessionContext?.getMessages() ?? [];
+    for (let i = msgs.length - 1; i >= 0; i -= 1) {
+      const m = msgs[i];
+      if (m?.role !== 'assistant') continue;
+      const c = m.content;
+      if (typeof c === 'string') return c;
+      return c.map((b) => (b.type === 'text' ? b.text : '')).join('');
+    }
+    return '';
+  };
+
+  test('maxSteps exhaustion runs a tool-less synthesis turn that yields a final answer', async () => {
+    // Three tool_use steps burn the budget with NO text written; the harness
+    // then makes ONE final tool-less call so the run hands back an answer
+    // instead of an empty output (the security-audit failure mode).
+    const { config, handle } = buildConfig(
+      [
+        { tool_uses: [{ id: 'tu1', name: 'echo', input: { msg: '1' } }], stop_reason: 'tool_use' },
+        { tool_uses: [{ id: 'tu2', name: 'echo', input: { msg: '2' } }], stop_reason: 'tool_use' },
+        { tool_uses: [{ id: 'tu3', name: 'echo', input: { msg: '3' } }], stop_reason: 'tool_use' },
+        { text: 'PARTIAL: checked A; did not check B.', stop_reason: 'end_turn' },
+      ],
+      { budget: { maxSteps: 3 } },
+    );
+    const result = await runAgent(config);
+    expect(result.status).toBe('exhausted');
+    expect(result.reason).toBe('maxSteps');
+    expect(result.steps).toBe(3); // the synthesis turn is not a budget step
+    // Exactly one extra provider call (the synthesis), and it carried NO tools.
+    expect(handle.requests).toHaveLength(4);
+    expect(handle.requests[3]?.tools).toBeUndefined();
+    // The closing assistant turn carries the synthesized text → non-empty output.
+    expect(lastAssistantText(result)).toContain('PARTIAL: checked A');
+  });
+
+  test('synthesis fires when the last step is text-plus-tool_use (preamble, unconsumed results)', async () => {
+    // The last in-budget step emits text ("I'll inspect…") ALONGSIDE a tool_use;
+    // its tool_results land afterward, unconsumed. That preamble is NOT a settled
+    // answer, so the synthesis must still fire — regression for the gate walking
+    // back past the trailing tool_results and wrongly skipping.
+    const { config, handle } = buildConfig(
+      [
+        { tool_uses: [{ id: 'tu1', name: 'echo', input: { msg: '1' } }], stop_reason: 'tool_use' },
+        {
+          text: "I'll inspect the file",
+          tool_uses: [{ id: 'tu2', name: 'echo', input: { msg: '2' } }],
+          stop_reason: 'tool_use',
+        },
+        { text: 'FINAL: checked, the answer is X.', stop_reason: 'end_turn' },
+      ],
+      { budget: { maxSteps: 2 } },
+    );
+    const result = await runAgent(config);
+    expect(result.status).toBe('exhausted');
+    expect(result.reason).toBe('maxSteps');
+    expect(result.steps).toBe(2); // the synthesis turn is not a budget step
+    // The synthesis fired (3rd call, tool-less) and replaced the preamble.
+    expect(handle.requests).toHaveLength(3);
+    expect(handle.requests[2]?.tools).toBeUndefined();
+    expect(lastAssistantText(result)).toContain('FINAL: checked');
+  });
+
+  test('synthesis crossing maxCostUsd exits as maxCostUsd, not maxSteps', async () => {
+    // The two in-budget turns stay under the cap; the synthesis turn is the FIRST
+    // to push cumulative spend over it. A hard cap must surface its own reason —
+    // not be masked as step exhaustion.
+    const { config } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 't1', name: 'echo', input: { msg: '1' } }],
+          stop_reason: 'tool_use',
+          usage: { input: 100, output: 0 },
+        },
+        {
+          tool_uses: [{ id: 't2', name: 'echo', input: { msg: '2' } }],
+          stop_reason: 'tool_use',
+          usage: { input: 100, output: 0 },
+        },
+        { text: 'FINAL', stop_reason: 'end_turn', usage: { input: 300, output: 0 } },
+      ],
+      {
+        // cost = input × rate / 1e6, so rate 1000 ⇒ 100 tok = $0.1, 300 tok = $0.3.
+        capsOverride: { cost_per_1k_input: 1000, cost_per_1k_output: 0 },
+        budget: { maxSteps: 2, maxCostUsd: 0.4 },
+      },
+    );
+    // 0.1 + 0.1 stays under 0.4 at max_steps; the synthesis adds 0.3 → 0.5 > 0.4.
+    const result = await runAgent(config);
+    expect(result.reason).toBe('maxCostUsd');
+    expect(result.status).toBe('exhausted');
+  });
+
+  test('synthesis truncated at max_tokens exits as maxOutputTokens, not maxSteps', async () => {
+    // The final synthesis call stops at the per-call output cap — the report is
+    // incomplete, so the run signals maxOutputTokens (raise the cap), not a clean
+    // maxSteps. The partial report is still persisted.
+    const { config } = buildConfig(
+      [
+        { tool_uses: [{ id: 'tu1', name: 'echo', input: { msg: '1' } }], stop_reason: 'tool_use' },
+        { text: 'partial repo', stop_reason: 'max_tokens' },
+      ],
+      { budget: { maxSteps: 1 } },
+    );
+    const result = await runAgent(config);
+    expect(result.reason).toBe('maxOutputTokens');
+    expect(result.status).toBe('exhausted');
+    expect(lastAssistantText(result)).toContain('partial repo');
+  });
+
+  test('synthesis hitting the context window exits as maxContextTokens, not maxSteps', async () => {
+    const { config } = buildConfig(
+      [
+        { tool_uses: [{ id: 'tu1', name: 'echo', input: { msg: '1' } }], stop_reason: 'tool_use' },
+        { text: 'cut off', stop_reason: 'model_context_window_exceeded' },
+      ],
+      { budget: { maxSteps: 1 } },
+    );
+    const result = await runAgent(config);
+    expect(result.reason).toBe('maxContextTokens');
+    expect(result.status).toBe('exhausted');
+  });
+
+  test('synthesis turn emits usage_persisted so the footer refreshes even at $0', async () => {
+    // emitCostUpdate is silent for zero-cost turns; usage_persisted is the display
+    // cue the REPL/subagent footer keys off. The synthesis must emit it like a
+    // normal turn — count is 2 (the one in-budget turn + the synthesis).
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const { config } = buildConfig(
+      [
+        { tool_uses: [{ id: 'tu1', name: 'echo', input: { msg: '1' } }], stop_reason: 'tool_use' },
+        { text: 'FINAL', stop_reason: 'end_turn' },
+      ],
+      { budget: { maxSteps: 1 } },
+    );
+    await runAgent({ ...config, onEvent: (e) => events.push(e) });
+    expect(events.filter((e) => e.type === 'usage_persisted').length).toBe(2);
+  });
+
+  test('synthesis pre-compaction ignores tool schemas (tool-less-fitting history not compacted)', async () => {
+    // At the synthesis point history+tools is over the threshold but history ALONE
+    // is under. The synthesis sends no tools, so the forced pre-synthesis compaction
+    // must NOT fire (it would bill a needless summary, and pull the synthesis's
+    // script entry as the summary).
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const fatTool: Tool = {
+      name: 'fat',
+      description: 'returns sizable text',
+      inputSchema: { type: 'object' },
+      metadata: { category: 'misc', writes: false, idempotent: true },
+      async execute() {
+        return 'r'.repeat(1520);
+      },
+    };
+    const bigSchemaTool: Tool = {
+      name: 'big_schema',
+      description: 'd'.repeat(2000),
+      inputSchema: { type: 'object' },
+      metadata: { category: 'misc', writes: false, idempotent: true },
+      async execute() {
+        return 'ok';
+      },
+    };
+    const { config } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 'f1', name: 'fat', input: {} }],
+          stop_reason: 'tool_use',
+          usage: { input: 20, output: 5 },
+        },
+        { text: 'FINAL: synthesized.', stop_reason: 'end_turn' },
+      ],
+      {
+        extraTools: [fatTool, bigSchemaTool],
+        capsOverride: { context_window: 1000 },
+        budget: {
+          compactionThreshold: 0.7,
+          compactionPreserveTail: 1,
+          maxToolErrors: 99,
+          maxSteps: 1,
+        },
+      },
+    );
+    const result = await runAgent({ ...config, onEvent: (e) => events.push(e) });
+    expect(result.reason).toBe('maxSteps');
+    expect(events.some((e) => e.type === 'compaction_started')).toBe(false);
+    expect(lastAssistantText(result)).toContain('FINAL: synthesized');
+  });
+
+  test('an abort DURING the synthesis turn exits as aborted, not maxSteps', async () => {
+    // Budget exhausts on bare tool_use, the synthesis turn fires, and the user
+    // hits Ctrl+C mid-call. Abort must win over the maxSteps classification —
+    // the synthesis catch swallows the abort, so the call site re-checks it.
+    const ctrl = new AbortController();
+    const base = mockProvider([]).provider;
+    let calls = 0;
+    const provider: Provider = {
+      ...base,
+      async *generate(): AsyncGenerator<StreamEvent> {
+        calls += 1;
+        if (calls <= 3) {
+          yield { kind: 'start', message_id: `m${calls}` };
+          yield { kind: 'tool_use_start', id: `tu${calls}`, name: 'echo' };
+          yield { kind: 'tool_use_stop', id: `tu${calls}`, final_args: { msg: `${calls}` } };
+          yield { kind: 'stop', reason: 'tool_use' };
+          return;
+        }
+        // 4th call = the synthesis turn; the user's Ctrl+C lands now.
+        ctrl.abort();
+        yield { kind: 'start', message_id: 'synth' };
+        yield { kind: 'stop', reason: 'end_turn' };
+      },
+    };
+    const registry = createToolRegistry();
+    registry.register(echoTool);
+    const result = await runAgent({
+      provider,
+      toolRegistry: registry,
+      permissionEngine: createPermissionEngine(policy({}), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'hi',
+      signal: ctrl.signal,
+      budget: { maxSteps: 3 },
+    });
+    expect(result.reason).toBe('aborted');
+    expect(result.abortCause).toBe('hard');
+  });
+
   test('aborted signal: exits as interrupted with abortCause=hard', async () => {
     const ctrl = new AbortController();
     ctrl.abort();
@@ -2080,13 +2311,12 @@ describe('runAgent', () => {
     expect(result.usageComplete).toBe(false);
   });
 
-  test('compaction does NOT trigger on the final allowed step (maxSteps reached)', async () => {
-    // Regression: compaction runs at the END of a step body, but
-    // the loop's maxSteps check is at the TOP of the next
-    // iteration. With budget.maxSteps=2 and the trigger firing at
-    // the bottom of step 2, we'd burn an extra billed summary call
-    // right before the next top-check exits as maxSteps. Skip
-    // when no further step is allowed.
+  test('compaction is forced for the synthesis at max_steps so its request fits', async () => {
+    // The last in-budget tool_results push the history past the (tiny) window. The
+    // top-of-loop maybeCompact() skips at steps >= maxSteps, so the exhaustion
+    // synthesis FORCES compaction — else the un-compacted synthesis request would
+    // overflow the window and 400. The summary is USED (the synthesis builds from
+    // the compacted history), not the wasted call the old skip guarded against.
     const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
     const fatTool: Tool = {
       name: 'fat',
@@ -2099,8 +2329,6 @@ describe('runAgent', () => {
     };
     const { config } = buildConfig(
       [
-        // Two fat-tool turns: estimate crosses threshold after
-        // turn 2. With maxSteps=2 the loop must NOT compact.
         {
           tool_uses: [{ id: 't1', name: 'echo', input: { msg: 'a' } }],
           stop_reason: 'tool_use',
@@ -2111,6 +2339,10 @@ describe('runAgent', () => {
           stop_reason: 'tool_use',
           usage: { input: 50, output: 5 },
         },
+        // Forced compaction summary (text, no usage block — replayStep skips usage).
+        { text: '[compacted_history]\nGOAL: x\n[/compacted_history]', stop_reason: 'end_turn' },
+        // The synthesis answer, built from the compacted history.
+        { text: 'FINAL: synthesized.', stop_reason: 'end_turn' },
       ],
       {
         extraTools: [fatTool],
@@ -2125,7 +2357,9 @@ describe('runAgent', () => {
     );
     const result = await runAgent({ ...config, onEvent: (e) => events.push(e) });
     expect(result.reason).toBe('maxSteps');
-    expect(events.find((e) => e.type === 'compaction_started')).toBeUndefined();
+    // Compaction WAS forced for the synthesis — its summary is used, not discarded.
+    expect(events.find((e) => e.type === 'compaction_started')).toBeDefined();
+    expect(lastAssistantText(result)).toContain('FINAL: synthesized');
   });
 
   test('compaction does NOT trigger after the run is aborted', async () => {

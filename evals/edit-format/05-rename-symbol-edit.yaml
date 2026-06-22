@@ -1,0 +1,35 @@
+name: edit-format rename a local across its uses via edit_file
+prompt: |
+  In `src/total.ts`, rename the local variable `acc` to `sum` everywhere it
+  appears — leave the parameter `items` untouched. Use edit_file. Reply "done"
+  when applied.
+setup:
+  gitInit: true
+  files:
+    src/total.ts: |
+      export function total(items: number[]): number {
+        let acc = 0;
+        for (const n of items) {
+          acc += n;
+        }
+        return acc;
+      }
+expect:
+  - tool_called: edit_file
+  - tool_not_called: write_file
+  - file_contains:
+      path: src/total.ts
+      pattern: "let sum = 0;"
+  - file_contains:
+      path: src/total.ts
+      pattern: "sum += n;"
+  - file_contains:
+      path: src/total.ts
+      pattern: "return sum;"
+  # The whole point of a rename: no stale name lingers.
+  - file_not_contains:
+      path: src/total.ts
+      pattern: "acc"
+  - status: done
+budget:
+  maxSteps: 7

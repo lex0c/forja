@@ -134,8 +134,16 @@ export const createOllamaProvider = (
   // 128K/256K capacity there would let them pack a prompt the daemon then
   // truncates. Floored at nothing and capped at the model capacity so an
   // over-large override can't claim a window past what the model was trained for.
-  const servedNumCtx = numCtx ?? Math.min(caps.context_window, DEFAULT_OLLAMA_NUM_CTX);
-  const effectiveWindow = Math.min(servedNumCtx, caps.context_window);
+  // Capped at the model capacity too — NOT only `effectiveWindow` below. Clamping just the
+  // re-exposed window let an over-large override (a `num_ctx` typo in the catalog, or the env
+  // var) reach the request as `servedNumCtx`, so Ollama allocated a KV window past what the
+  // harness budgets/compacts against. `ollamaOptions` is the "override wins" primitive (it does
+  // not clamp), so the caller must bound it here.
+  const servedNumCtx = Math.min(
+    numCtx ?? Math.min(caps.context_window, DEFAULT_OLLAMA_NUM_CTX),
+    caps.context_window,
+  );
+  const effectiveWindow = servedNumCtx; // already ≤ caps.context_window
   const effectiveCaps: ProviderCapabilities =
     effectiveWindow === caps.context_window ? caps : { ...caps, context_window: effectiveWindow };
 

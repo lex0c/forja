@@ -1,4 +1,5 @@
 name: PreToolUse block_message stdout reaches the model context
+evaluates: harness
 prompt: |
   Use the write_file tool to create `out.txt`. Report verbatim
   whatever the tool returns, including any error message text.

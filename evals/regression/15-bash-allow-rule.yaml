@@ -1,4 +1,5 @@
 name: bash.allow lets a matching command through
+evaluates: harness
 prompt: |
   Use the bash tool to run `echo hello-from-policy`. Set `read_only: true`.
   Reply with the exact output of the command, nothing else.

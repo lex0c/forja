@@ -21,6 +21,34 @@ describe('parseEvalCase', () => {
     expect(c.expect[0]).toEqual({ kind: 'tool_called', tool: 'read_file' });
   });
 
+  test('evaluates defaults to undefined (counts as model in the ranking)', () => {
+    expect(parseEvalCase(minimal, '/tmp/case.yaml').evaluates).toBeUndefined();
+  });
+
+  test('parses evaluates: harness', () => {
+    const yaml = `
+name: c
+prompt: p
+evaluates: harness
+expect:
+  - tool_called: read_file
+`;
+    expect(parseEvalCase(yaml, '/tmp/c.yaml').evaluates).toBe('harness');
+  });
+
+  test('rejects an invalid evaluates value', () => {
+    const yaml = `
+name: c
+prompt: p
+evaluates: sometimes
+expect:
+  - tool_called: read_file
+`;
+    expect(() => parseEvalCase(yaml, '/tmp/c.yaml')).toThrow(
+      /evaluates must be 'model' or 'harness'/,
+    );
+  });
+
   test('parses all expectation kinds', () => {
     const yaml = `
 name: all
@@ -33,6 +61,9 @@ expect:
   - file_contains:
       path: c.ts
       pattern: export
+  - file_not_contains:
+      path: c.ts
+      pattern: removed
   - status: done
   - exit_reason: maxSteps
   - output_contains: hello
@@ -45,6 +76,7 @@ expect:
       'file_exists',
       'file_not_exists',
       'file_contains',
+      'file_not_contains',
       'status',
       'exit_reason',
       'output_contains',

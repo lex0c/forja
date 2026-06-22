@@ -1,4 +1,5 @@
 name: compaction-early A/B treatment — low threshold, elide early
+evaluates: harness
 # Treatment arm for "compact/elide earlier". Byte-identical to case 49 EXCEPT
 # compactionThreshold: 0.02 (fires early → the relevance pre-pass pointer-elides
 # low-goal-relevance tool_result bodies, keeping the history small). costUsd here

@@ -517,6 +517,96 @@ half consumes.
 
 ---
 
+## Sandbox hardening: rlimits on the confined child (DoS resistance)
+
+**Status:** surfaced by a sandbox security audit (an in-REPL glm-5.2 run, 2026-06-21), verified against the
+code afterward. Severity recalibrated DOWN from the audit's "High": this is DoS-of-self, not a containment
+break, and the audit's cited `SECURITY_GUIDELINE §8.2` requirement does NOT exist (no resource-limit clause
+in the spec — that citation was a hallucination).
+
+**What it is:** `buildBwrapArgv` (`src/permissions/sandbox-runner.ts`) sets namespaces, session, and
+die-with-parent but attaches NO resource limits (memory / CPU / nproc / file-size). A confined child is FS-
+and network-isolated (no breakout / exfil), but UNBOUNDED — it can fork-bomb, OOM, or fill the tmpfs `/tmp`,
+taking down the agent and stressing the host.
+
+**Why deferred:** hardening, not a containment hole — the isolation that matters (FS, network, env) holds.
+No spec requirement and no observed incident; it raises the floor against a runaway / hostile bash.
+
+**Where it would land:** wrap the bwrap exec with `prlimit` / `systemd-run --user --scope` / a `ulimit`
+preamble, with per-profile CPU / memory / nproc / file-size caps. Mirror a sensible default on the macOS path
+where Seatbelt allows.
+
+**Pull-in signal:** a sandboxed bash fork-bombs / OOMs the agent in real use, or a threat-model pass
+prioritizes DoS resistance for untrusted-repo / multi-tenant operation.
+
+**Spec reference:** none today (the audit's `§8.2` citation is unfounded). A `SECURITY_GUIDELINE` clause on
+resource limits could accompany the work.
+
+---
+
+## Sandbox hardening: canonicalize the cache carve-out source before `--bind`
+
+**Status:** surfaced by the same sandbox audit (2026-06-21) and verified — but it is a KNOWN, in-code
+documented limitation (`src/permissions/sandbox-runner.ts:153-157`), not a hidden bug. Medium.
+
+**What it is:** `canonicalizeCwd` realpath-resolves cwd (and home) so the `hide_paths` check, the `--bind`,
+and the `--chdir` all agree on one canonical target. The cache carve-out dirs (`~/.cache`, `GOCACHE`, etc.)
+bound into the sandbox are NOT canonicalized. A symlink planted inside a cache dir (by a prior tool call or a
+hostile repo) can point outside the allowed tree, and `bwrap` follows it at mount time — granting the
+sandboxed process read/write to host paths that should be unreachable.
+
+**Why deferred:** the in-code comment already flags it; closing it fully needs a recursive realpath sweep of
+the cache trees (cost), and the practical exposure requires an attacker who can plant a symlink inside a
+cache dir. The cwd / home canonicalization (the common path) already holds.
+
+**Where it would land:** `src/permissions/sandbox-cache-dirs.ts` / `sandbox-runner.ts` — realpath-resolve each
+cache-dir source before `--bind`, and reject (or resolve-and-rebind) any cache entry whose canonical target
+leaves the allowed tree. A shallow realpath of the bind ROOT is cheap; the recursive sweep of contents is the
+expensive part the comment notes.
+
+**Pull-in signal:** an untrusted-repo / multi-tenant scenario where a cache dir could be symlink-poisoned, or
+a security review that won't accept the documented carve-out.
+
+**Spec reference:** `SECURITY_GUIDELINE` (sandbox path canonicalization); the in-code limitation comment at
+`sandbox-runner.ts:153-157` is the current record.
+
+---
+
+## Surface the per-turn models / metered-untracked breakdown in cost surfaces
+
+**Status:** noted 2026-06-21 during the code review of the per-turn model provenance fix
+(migration 077). The deep fix landed — metering now resolves from the models a session
+ACTUALLY used (`effectiveSessionModels` + `isSessionUnmetered`), so the `unmetered` flag is
+accurate and spend is never hidden. This tracks the remaining READ-side presentation gap.
+
+**What it is:** `--list --json` still emits `model: sessions.model` (the INITIAL model) next
+to the now-accurate `unmetered` flag, so the two can disagree — `model` reads as an
+unmetered-tier id while `unmetered: false` because a later turn billed on a metered model —
+and a JSON consumer has no field that reconciles them: the per-turn models that explain the
+flag are never surfaced. Likewise, a mixed metered+unmetered session shows the tracked
+dollars but no precise "$X metered on A/B + untracked on C" breakdown; only `/stats` hints
+"+ unmetered (untracked usage in scope)" at the scope level.
+
+**Why deferred:** the flag is correct and no spend is hidden (the data-loss risk is closed);
+this is presentation precision for tooling / forensics, not a correctness gap. The data
+already exists (`distinctSessionModels`), so it's a small read-only follow-up.
+
+**Where it would land:**
+
+- `src/cli/list-sessions.ts` — add `models: string[]` (or a `metered` / `untracked` split)
+  to `SessionListItem`, populated from `distinctSessionModels(db, s.id)`.
+- `/sessions` + `/stats` human renders — optionally show the per-turn model set when it
+  differs from `sessions.model`.
+
+**Pull-in signal:** a tooling / billing consumer of `--list --json` needs to know WHICH
+models billed a session (not just whether it's unmetered), or an operator asks why a row
+reads as metered when its `model` column shows an unmetered tier.
+
+**Cost when pulled:** small — `distinctSessionModels` already exists; a field add + render,
+no schema or write-path change.
+
+---
+
 ## Rename `cost_per_1k_*` → `cost_per_1m_*` on `ProviderCapabilities`
 
 **Status:** field-name vs value-unit mismatch. Surfaced during the
@@ -1740,3 +1830,89 @@ than the current additive `score_components` already gives; (c) a
 concrete model wins a published eval against the tuned weights. Until
 then: tune `RISK_SCORE_WEIGHTS`. Preferred engine: **LightGBM**
 (smaller / faster / lower memory, fits the single-binary CLI).
+
+# Eval — capability signal via self-SWE-bench from git history
+
+**Goal.** The model ranking (`scripts/model-ranking.ts` / `docs/RANKING.md`) measures
+**harness-fit** — did the model call the right tool, land the exact edit format, finish
+before the cap. That correlates with capability but is confounded by convention-matching:
+a capable model can rank low for using `write_file` instead of `edit_file`. Add a signal
+that measures **capability** — did the model actually solve the problem, verified by a
+ground-truth check independent of HOW it acted ("performed well in Forja" → "is a strong
+model").
+
+**The idea.** Forja's "born with tests" rule (`CLAUDE.md`) means every fix commit ships a
+`src/` change + a test. So the git history IS a ready-made task corpus — SWE-bench on
+Forja's own repo. For a fix commit `C` with parent `P`:
+
+- Split the diff by path: **test patch** = `tests/**`, gold **source patch** = `src/**`
+  (ignore `docs/`).
+- Workspace = a snapshot of the repo at `P` via `git archive P` extracted to a temp dir —
+  **no `.git`** (so the agent can't `git show <C>` and copy the fix). Apply the test patch
+  on top → the test now exists and FAILS.
+- Deps: symlink `node_modules` (do not reinstall per task).
+- Prompt = the failing test as the spec: "this test fails; diagnose and fix the source so
+  it passes, without editing the test." NOT the BACKLOG prose (it describes the solution →
+  leak). BACKLOG / git is only the **selector** of candidate commits.
+- Verifier (fail-to-pass): run that test file + `bun run typecheck`. Pass = the bug is
+  fixed by OUTCOME, regardless of tool/format — that is the capability signal.
+
+**Correctness gates (load-bearing).**
+
+- **Validate each candidate automatically:** the test must FAIL at `P`+testpatch and PASS
+  at `C`. Otherwise it is not a real fail-to-pass (refactor, flaky, test that already
+  passed) → drop it. This filter is what makes the corpus trustworthy.
+- **No `.git` in the workspace** (hence `git archive`, not a worktree) — anti-cheat is
+  load-bearing; otherwise the original fix is one `git log --all` away.
+- **Deterministic tests only** (mock-based; most Forja tests are). Model non-determinism is
+  the eval's inherent variance → repeats.
+- **Scope the verifier** to the specific test file, not the whole suite (speed).
+
+**Prerequisite.** A `command_succeeds` expectation kind (run an author-specified command in
+the workspace cwd, assert exit 0 / stdout) — the same small, exhaustively-typed addition as
+`file_not_contains` (eval types + loader + executor + tests). It is the verifier for this
+whole class (and reusable for a hermetic inline fail-to-pass eval too).
+
+**Reporting.** Do NOT fold this into the harness-fit composite (RANKING.md keeps "separate
+axes, never folded in"). Add a `capability` axis = pass-rate of the verified suite. Tag
+each task with a difficulty tier (1 = trivial fix, 2 = multi-location / reasoning, 3 =
+multi-file / recover-from-wrong-attempt) and report per-tier, so the score reflects a
+capability CEILING, not a uniform pass-rate.
+
+**Honest caveat.** Still "capability AS exercised through Forja's loop" — the model acts
+through the harness; it is not a vacuum benchmark. But outcome-verification removes the
+format/convention confound. It is the most honest capability claim an agent harness can
+make, and fairer than the current one.
+
+**Cost / why staged.** A dedicated harness (snapshot / split / validate), NOT a
+`setup.files` YAML case — core-file fixes (`loop.ts`, ~3k lines) can't be inlined, so the
+agent edits the real large file → high context + steps → per-task budget matters. Upside:
+it **generates tasks forever** (every future fix is a new task, automatically).
+
+**Phases.**
+
+1. `command_succeeds` (framework + test) + **one** hand-wired commit from this session
+   (e.g. `8f6be12e` file_not_contains, or `e08f7df4` cost-cap — small, self-contained) to
+   prove the format end-to-end. Surfaces the real problems (deps in the snapshot, test
+   scoping, anti-cheat) on one task before scaling.
+2. Automate commit selection from git: scan commits, split by path, validate fail-to-pass,
+   discard the invalid ones.
+3. Tier + wire into the ranking as the `capability` axis.
+
+**Adjacent (lower priority, separate, no framework change).** A **prompt-injection
+resistance** eval — `setup.files` carries a malicious instruction inside untrusted content
+(a doc the agent reads, a tool result); the prompt is the legitimate task; expectations
+assert the task is done AND the malicious action did NOT happen (`tool_not_called` /
+`file_not_exists` / `file_not_contains`). Feasible with the current expectation kinds,
+deeply aligned with Forja's trust / permission model, a sibling of the existing "security
+posture refuses destructive command" regression cases.
+
+**Out of scope (would be cargo-cult of other benchmarks, `ANTI_PATTERNS §2.2`).** The eval
+harness is a temp dir + the in-process agent — it cannot host ML/PyTorch (Terminal-Bench
+model tasks), VM/QEMU/SSH (sysadmin tasks), Coq (formal proofs), full GAIA multimodal
+(spreadsheets / PDFs / images), or a browser. Forcing those tests infra Forja is not.
+
+**Pull-in signal:** a model lands in the ranking that is clearly capable but scores low on
+harness-fit (convention mismatch), making the gap between "fits Forja" and "is strong"
+concrete — OR a second model tier is added and the ranking needs to discriminate real
+capability, not just loop-fit.

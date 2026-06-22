@@ -219,6 +219,10 @@ export const runRecapHeadless = async (options: RunRecapHeadlessOptions): Promis
         duration_ms: now() - startTs,
         used_llm: result.usedLlm,
         cost_usd: result.costUsd,
+        // The ACTUAL render model's metering — which can differ from the session/boot
+        // provider via `--model` / `[recap].render_model` — carried out of the render
+        // path. Untracked-not-free when that model is unmetered (e.g. Ollama Cloud).
+        unmetered: result.unmetered,
       });
       return 0;
     }

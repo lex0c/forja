@@ -1,4 +1,5 @@
 import type { HarnessEvent } from '../../harness/index.ts';
+import { formatCostCell } from '../../providers/cost-format.ts';
 import type { OutputRenderer } from './types.ts';
 
 // Plain-text renderer for one-shot mode. Streams assistant text to stdout
@@ -123,7 +124,7 @@ export const createPlainRenderer = (options: PlainRendererOptions): OutputRender
           // turn this session produced output without reporting usage.
           // Mark both tokens and cost so the user reads them as
           // estimates instead of authoritative totals.
-          const cost = `${r.usageComplete ? '' : '~'}${formatCost(r.costUsd)}`;
+          const cost = formatCostCell(r.unmetered === true, r.usageComplete, formatCost, r.costUsd);
           const tokenLabel = r.usageComplete ? `tokens ${tokens}` : `tokens ~${tokens}`;
           err(
             `\n${colored} ${r.steps} steps · ${r.durationMs}ms · ${color(useColor, DIM, `${tokenLabel} · ${cost}`)}${detail}\n`,

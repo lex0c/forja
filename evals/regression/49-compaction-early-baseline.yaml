@@ -1,4 +1,5 @@
 name: compaction-early A/B baseline — high threshold, history grows un-compacted
+evaluates: harness
 # Controlled A/B for "compact/elide earlier" (the CONTEXT_TUNING §990 / BACKLOG
 # 404-416 follow-up). Same tool-heavy scenario as 23/48, with compactionRelevance
 # fixed ON in BOTH arms — the ONLY variable vs the treatment (case 50) is

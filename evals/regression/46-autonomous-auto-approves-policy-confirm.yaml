@@ -1,4 +1,5 @@
 name: autonomous posture auto-approves a routine policy confirm
+evaluates: harness
 # Operation-mode (AGENTIC_CLI §8.1). A plain `confirm` policy rule on a
 # low-risk write: under the autonomous posture the engine auto-approves
 # it (no modal), so the write actually lands. The companion case (47)

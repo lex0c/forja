@@ -87,7 +87,8 @@ seeded models:
 | **anthropic** | `claude-opus-4-8`, `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5` |
 | **openai** | `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex`, `gpt-4o`, `gpt-4o-mini` |
 | **google** | `gemini-3.5-flash`, `gemini-3.1-pro-preview`, `gemini-3.1-flash-lite`, `gemini-3-flash-preview`, `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite` |
-| **ollama** (local) | `qwen2.5-coder:7b/14b/32b`, `qwen3:8b/14b/30b`, `qwen3-coder:30b`, `llama3.1:8b`, `mistral-nemo:12b`, `gpt-oss:20b`, `devstral:24b` — all native tool calling, `$0` |
+| **ollama** (local) | `qwen2.5-coder:7b/14b`, `qwen3:8b/14b`, `llama3.1:8b`, `mistral-nemo:12b`, `gpt-oss:20b` — all native tool calling, `$0` |
+| **ollama** (cloud) | `glm-5.2`, `qwen3-coder:480b`, `qwen3-coder-next`, `devstral-2:123b` — hosted on `ollama.com`, seeded with `base_url` + `api_key_env`; need `OLLAMA_API_KEY` (see § Ollama — cloud) |
 | **openrouter** (gateway) | `deepseek/deepseek-v3.2`, `deepseek/deepseek-r1`, `qwen/qwen3-coder-plus`, `x-ai/grok-4.3`, `z-ai/glm-4.6`, `moonshotai/kimi-k2-thinking`, `meta-llama/llama-3.3-70b-instruct` — models not reachable as a first-class family; ids are `openrouter/<vendor>/<model>` (two slashes) |
 
 To add, remove, or adjust a model, edit the file (§2.1) — no recompile. The
@@ -191,25 +192,38 @@ pulled. To use a pulled model that is not seeded, add a catalog entry (§2.1).
 
 #### Ollama — cloud / remote host
 
-The same adapter talks to a remote/LAN box or Ollama's hosted cloud — point it at
-the host and pass auth. Quickest, via env:
+A curated Ollama Cloud tier is already seeded — `glm-5.2`, `qwen3-coder:480b`,
+`qwen3-coder-next`, `devstral-2:123b` — each carrying `base_url: https://ollama.com`
+and `api_key_env: OLLAMA_API_KEY`, so the only setup is the key:
+
+```sh
+export OLLAMA_API_KEY=<your key>
+forja --model ollama/qwen3-coder:480b
+```
+
+The same adapter also reaches a remote/LAN box or any hosted model NOT in the seed
+— point it at the host and pass auth. Via env (applies to every ollama model):
 
 ```sh
 export FORJA_OLLAMA_BASE_URL=https://ollama.com           # your remote/cloud host
 export FORJA_OLLAMA_HEADERS='{"Authorization":"Bearer <OLLAMA_API_KEY>"}'
-forja --model ollama/qwen3-coder:30b
+forja --model ollama/gpt-oss:120b
 ```
 
-Or persist it as a catalog entry, so the key comes from an env var that the adapter
-maps to a bearer header automatically:
+Or persist that model as a catalog entry, so the key comes from an env var that the
+adapter maps to a bearer header automatically:
 
 ```json
-{ "id": "ollama/qwen3-coder:30b", "family": "ollama", "model_name": "qwen3-coder:30b",
-  "base_url": "https://ollama.com", "api_key_env": "OLLAMA_API_KEY",
+{ "id": "ollama/gpt-oss:120b", "family": "ollama", "model_name": "gpt-oss:120b",
+  "base_url": "https://ollama.com", "api_key_env": "OLLAMA_API_KEY", "num_ctx": 131072,
   "capabilities": { "tools": "native", "cache": false, "vision": false, "streaming": true,
-    "constrained": "json_mode", "context_window": 262144, "output_max_tokens": 16384,
+    "constrained": "json_mode", "context_window": 131072, "output_max_tokens": 16384,
     "cost_per_1k_input": 0, "cost_per_1k_output": 0, "notes": ["ollama cloud"] } }
 ```
+
+`num_ctx` is what makes a cloud entry serve its full window — without it the adapter
+caps the served context at 32K (the local-VRAM default) and truncates long sessions.
+Set it to the model's real window (here 128K). The seeded cloud tier sets it for you.
 
 A non-localhost host sends your context off the machine — treat it like any cloud
 provider.

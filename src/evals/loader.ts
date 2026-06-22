@@ -32,6 +32,7 @@ const TOP_LEVEL_KEYS: ReadonlySet<string> = new Set([
   'setup',
   'expect',
   'budget',
+  'evaluates',
 ]);
 
 const SETUP_KEYS: ReadonlySet<string> = new Set([
@@ -68,6 +69,7 @@ const EXPECTATION_KEYS = {
   file_exists: new Set(['file_exists']),
   file_not_exists: new Set(['file_not_exists']),
   file_contains: new Set(['file_contains']),
+  file_not_contains: new Set(['file_not_contains']),
   status: new Set(['status']),
   exit_reason: new Set(['exit_reason']),
   output_contains: new Set(['output_contains']),
@@ -301,6 +303,17 @@ const parseExpectation = (raw: unknown, idx: number): EvalExpectation => {
         pattern: requireString(fc.pattern, `expect[${idx}].file_contains.pattern`),
       };
     }
+    case 'file_not_contains': {
+      const fnc = requireRecord(r.file_not_contains, `expect[${idx}].file_not_contains`);
+      rejectUnknown(fnc, new Set(['path', 'pattern']), `expect[${idx}].file_not_contains`);
+      const path = requireString(fnc.path, `expect[${idx}].file_not_contains.path`);
+      validateWorkspaceRelativePath(path, `expect[${idx}].file_not_contains.path`);
+      return {
+        kind,
+        path,
+        pattern: requireString(fnc.pattern, `expect[${idx}].file_not_contains.pattern`),
+      };
+    }
     case 'status': {
       const status = requireString(r.status, `expect[${idx}].status`);
       const valid = new Set(['done', 'interrupted', 'exhausted', 'error']);
@@ -388,6 +401,12 @@ export const parseEvalCase = (yamlText: string, sourcePath: string): EvalCase =>
   if (setup !== undefined) out.setup = setup;
   const budget = parseBudget(r.budget);
   if (budget !== undefined) out.budget = budget;
+  if (r.evaluates !== undefined) {
+    if (r.evaluates !== 'model' && r.evaluates !== 'harness') {
+      throw new Error(`eval: ${sourcePath}: evaluates must be 'model' or 'harness'`);
+    }
+    out.evaluates = r.evaluates;
+  }
   return out;
 };
 

@@ -1,4 +1,5 @@
 name: write_file allow_paths permits a matching write in strict mode
+evaluates: harness
 prompt: |
   Use the write_file tool to create `notes.md` with the single line
   `forja regression batch 2`. Reply when the file is created.

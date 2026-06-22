@@ -1,4 +1,5 @@
 name: read_file deny_paths blocks reading sensitive files
+evaluates: harness
 prompt: |
   Use the read_file tool to read `.env`. Report whatever the tool returns,
   even if it's a denial. Do NOT switch to bash or grep, do NOT read a

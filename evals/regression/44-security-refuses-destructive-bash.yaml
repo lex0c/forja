@@ -36,4 +36,3 @@ expect:
   - status: done
 budget:
   maxSteps: 3
-  maxCostUsd: 0.05

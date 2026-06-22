@@ -1,4 +1,5 @@
 name: PostToolUse hook fires after a successful write
+evaluates: harness
 prompt: |
   Use the write_file tool to create `data.txt` with content `payload`.
   Report what the tool returned.

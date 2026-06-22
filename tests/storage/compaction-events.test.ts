@@ -3,6 +3,8 @@ import { openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import {
   appendCompactionEvent,
+  compactionMetering,
+  isBilledCompactionStrategy,
   listCompactionEventsBySession,
   sumCompactionUsage,
 } from '../../src/storage/repos/compaction-events.ts';
@@ -46,7 +48,59 @@ describe('compaction-events repo', () => {
     expect(r?.tokens_after).toBe(90_000);
     expect(r?.elided_ids).toBe(JSON.stringify(['tu1', 'tu2', 'tu3']));
     expect(r?.summary).toBeNull();
+    expect(r?.model).toBeNull(); // relevance makes no provider call → no billing model (078)
     db.close();
+  });
+
+  test('compactionMetering returns billed models and flags pre-078 untracked billed rows', () => {
+    const { db, sid } = freshSession();
+    // A billed llm compaction on a metered model.
+    appendCompactionEvent(db, {
+      sessionId: sid,
+      strategy: 'llm',
+      foldedCount: 1,
+      beforeHash: 'a',
+      afterHash: 'b',
+      recordedAt: 1,
+      callUsage: { tokensIn: 10, tokensOut: 5, cacheRead: 0, cacheCreation: 0 },
+      model: 'anthropic/claude-opus-4-8',
+    });
+    // A relevance compaction (no provider call) → NULL model, NOT billed.
+    appendCompactionEvent(db, {
+      sessionId: sid,
+      strategy: 'relevance',
+      foldedCount: 1,
+      beforeHash: 'c',
+      afterHash: 'd',
+      recordedAt: 2,
+    });
+    expect(compactionMetering(db, sid)).toEqual({
+      models: ['anthropic/claude-opus-4-8'], // the billed model only
+      hasUntracked: false, // a relevance NULL model is not billed → ignored
+    });
+
+    // A pre-078 billed compaction: an `llm` row with NULL model.
+    appendCompactionEvent(db, {
+      sessionId: sid,
+      strategy: 'llm',
+      foldedCount: 1,
+      beforeHash: 'e',
+      afterHash: 'f',
+      recordedAt: 3,
+      callUsage: { tokensIn: 1, tokensOut: 1, cacheRead: 0, cacheCreation: 0 },
+      // no model → NULL (a row written before migration 078)
+    });
+    expect(compactionMetering(db, sid).hasUntracked).toBe(true);
+    db.close();
+  });
+
+  test('isBilledCompactionStrategy: only llm/fallback make a billed provider call', () => {
+    // The single source for the gate shared by the write paths (loop / /compact) and the
+    // read path (compactionMetering). A new billed strategy must be added here.
+    expect(isBilledCompactionStrategy('llm')).toBe(true);
+    expect(isBilledCompactionStrategy('fallback')).toBe(true);
+    expect(isBilledCompactionStrategy('relevance')).toBe(false);
+    expect(isBilledCompactionStrategy('skipped')).toBe(false);
   });
 
   test('round-trips an llm event with summary + null relevance/token fields (forced /compact shape)', () => {

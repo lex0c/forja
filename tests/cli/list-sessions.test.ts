@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runListSessions } from '../../src/cli/list-sessions.ts';
+import type { ModelRegistry } from '../../src/providers/registry.ts';
 import { type DB, openDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { appendMessage } from '../../src/storage/repos/messages.ts';
@@ -53,6 +54,139 @@ describe('runListSessions', () => {
     expect(first.status).toBe('running');
     expect(second.id).toBe(a.id);
     expect(second.status).toBe('done');
+  });
+
+  test('resolves metering against the injected operator catalog, not just the seed', () => {
+    // A custom unmetered entry the built-in seed does NOT know — only the operator's
+    // installed catalog does. list-sessions must resolve against that catalog (regression:
+    // it used the seed, so a custom unmetered row wrongly read $0 / unmetered:false).
+    const s = createSession(db, { model: 'custom/cloud-x', cwd: '/p', startedAt: 1000 });
+    completeSession(db, s.id, 'done', 0, true); // an unmetered tier records $0
+    const reg = {
+      get: (id: string) => (id === 'custom/cloud-x' ? { capabilities: { unmetered: true } } : null),
+    } as unknown as ModelRegistry;
+    const out: string[] = [];
+    const code = runListSessions({
+      json: true,
+      dbOverride: db,
+      registryOverride: reg,
+      out: (line) => out.push(line),
+    });
+    expect(code).toBe(0);
+    const item = JSON.parse(out.join('').trim()) as { model: string; unmetered: boolean };
+    expect(item.model).toBe('custom/cloud-x');
+    expect(item.unmetered).toBe(true);
+  });
+
+  test('a /model-switch to a metered model reads as metered, not the unmetered initial model', () => {
+    // The deep cost fix (migration 077): metering resolves from the models the
+    // session ACTUALLY used (per-turn), not sessions.model. Here the stored model
+    // is unmetered but a later turn billed on a metered one — the row must NOT read
+    // as unmetered (its recorded spend is real), even though sessions.model is still
+    // the unmetered initial one.
+    const s = createSession(db, { model: 'custom/cloud-x', cwd: '/p', startedAt: 1000 });
+    appendMessage(db, { sessionId: s.id, role: 'assistant', content: 'a', model: 'custom/paid-y' });
+    completeSession(db, s.id, 'done', 0.05, true);
+    const reg = {
+      get: (id: string) =>
+        id === 'custom/cloud-x'
+          ? { capabilities: { unmetered: true } }
+          : id === 'custom/paid-y'
+            ? { capabilities: {} }
+            : null,
+    } as unknown as ModelRegistry;
+    const out: string[] = [];
+    runListSessions({ json: true, dbOverride: db, registryOverride: reg, out: (l) => out.push(l) });
+    const item = JSON.parse(out.join('').trim()) as { model: string; unmetered: boolean };
+    expect(item.model).toBe('custom/cloud-x'); // stored initial model is unchanged
+    expect(item.unmetered).toBe(false); // but metering reflects the metered turn
+  });
+
+  test('a session whose turns all billed on its unmetered model stays unmetered', () => {
+    const s = createSession(db, { model: 'custom/cloud-x', cwd: '/p', startedAt: 1000 });
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'assistant',
+      content: 'a',
+      model: 'custom/cloud-x',
+    });
+    completeSession(db, s.id, 'done', 0, true);
+    const reg = {
+      get: (id: string) => (id === 'custom/cloud-x' ? { capabilities: { unmetered: true } } : null),
+    } as unknown as ModelRegistry;
+    const out: string[] = [];
+    runListSessions({ json: true, dbOverride: db, registryOverride: reg, out: (l) => out.push(l) });
+    expect((JSON.parse(out.join('').trim()) as { unmetered: boolean }).unmetered).toBe(true);
+  });
+
+  test('default listing folds subtree models: unmetered parent + metered subagent reads metered', () => {
+    // --list (no --include-subagents) shows the parent's CUMULATIVE cost (folds the hidden
+    // subtree), so its unmetered flag must fold the subtree's models too. An unmetered parent
+    // with a metered subagent must NOT read as unmetered — its cumulative cost carries the
+    // subagent's metered spend.
+    const parent = createSession(db, { model: 'unmet/parent', cwd: '/p', startedAt: 1000 });
+    completeSession(db, parent.id, 'done', 0, true); // parent itself untracked ($0)
+    const child = createSession(db, {
+      model: 'met/child',
+      cwd: '/p',
+      startedAt: 1001,
+      parentSessionId: parent.id,
+    });
+    completeSession(db, child.id, 'done', 0.5, true); // metered subagent spend
+    const reg = {
+      get: (id: string) =>
+        id === 'unmet/parent'
+          ? { capabilities: { unmetered: true } }
+          : id === 'met/child'
+            ? { capabilities: {} }
+            : null,
+    } as unknown as ModelRegistry;
+    const out: string[] = [];
+    runListSessions({ json: true, dbOverride: db, registryOverride: reg, out: (l) => out.push(l) });
+    // Default mode emits only the parent row; its cumulative cost folds the subagent.
+    const item = JSON.parse(out.join('').trim()) as {
+      unmetered: boolean;
+      cumulative_cost_usd: number;
+    };
+    expect(item.cumulative_cost_usd).toBeCloseTo(0.5, 9);
+    expect(item.unmetered).toBe(false); // ...so the flag must fold the metered subagent model
+  });
+
+  test('human render shows recorded dollars, not "unmetered", for an unmetered-row session that spent', () => {
+    // The row model resolves unmetered (e.g. an Ollama Cloud start), but the session carries a
+    // nonzero recorded cost — a /model switch to a metered model leaves real spend on a row whose
+    // INITIAL model was unmetered. The dollars must show, not the bare label that hides them.
+    const s = createSession(db, { model: 'custom/cloud-x', cwd: '/p', startedAt: 1000 });
+    completeSession(db, s.id, 'done', 0.0042, true); // real recorded spend
+    const reg = {
+      get: (id: string) => (id === 'custom/cloud-x' ? { capabilities: { unmetered: true } } : null),
+    } as unknown as ModelRegistry;
+    const out: string[] = [];
+    runListSessions({
+      json: false,
+      dbOverride: db,
+      registryOverride: reg,
+      out: (l) => out.push(l),
+    });
+    const text = out.join('');
+    expect(text).toContain('$0.0042'); // dollars shown, not hidden
+    expect(text).not.toContain('unmetered'); // NOT the bare label
+  });
+
+  test('human render shows "unmetered" only when an unmetered-row session has NO recorded spend', () => {
+    const s = createSession(db, { model: 'custom/cloud-x', cwd: '/p', startedAt: 1000 });
+    completeSession(db, s.id, 'done', 0, true); // $0 — untracked, not free
+    const reg = {
+      get: (id: string) => (id === 'custom/cloud-x' ? { capabilities: { unmetered: true } } : null),
+    } as unknown as ModelRegistry;
+    const out: string[] = [];
+    runListSessions({
+      json: false,
+      dbOverride: db,
+      registryOverride: reg,
+      out: (l) => out.push(l),
+    });
+    expect(out.join('')).toContain('unmetered');
   });
 
   test('json mode includes prompt_preview from first user message', () => {

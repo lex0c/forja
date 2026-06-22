@@ -32,3 +32,7 @@ dist/
 
 # Scratch probe dirs from security-audit / debug sessions
 *-probe/
+
+# Model ranking: results.csv is the versioned append-only history; results.json
+# is the regenerated latest-batch raw (read by RANKING_INGEST), not versioned.
+evals/ranking/results.json

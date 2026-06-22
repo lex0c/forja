@@ -46,6 +46,7 @@ import {
   updateSessionCost,
 } from '../storage/index.ts';
 import { listApprovalsLogBySessionRecent } from '../storage/repos/approvals-log.ts';
+import { isBilledCompactionStrategy } from '../storage/repos/compaction-events.ts';
 import {
   createContextPinsStore,
   formatPinnedBlock,
@@ -79,6 +80,7 @@ import {
   relevanceVerbatimBudgetBytes,
 } from './compaction.ts';
 import { resolveProviderEffort } from './effort.ts';
+import { type ExhaustionSynthesisResult, synthesizeOnExhaustion } from './exhaustion-synthesis.ts';
 import { invokeTool } from './invoke-tool.ts';
 import { MAX_RESUME_MESSAGES } from './resume.ts';
 import { DEFAULT_RETRY, generateWithRetry } from './retry.ts';
@@ -825,6 +827,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       usage: totalUsage,
       costUsd: totalCostUsd,
       usageComplete,
+      unmetered: config.provider.capabilities.unmetered === true,
       // ctx is undefined only if init failed before the session-
       // decision block resolved it (early internalError) — keep the
       // pre-ctx '' so that path's result shape is unchanged.
@@ -2506,20 +2509,29 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // call pushed the cumulative total over the cap (caller must finish),
       // else null. Mutates `messages` in place and folds usage into the run
       // totals via closure.
-      const maybeCompact = async () => {
-        // Skip when aborted / budget exhausted / window unknown — don't burn
-        // a billed summary call whose result the loop is about to discard.
+      // `force` runs the compaction even at steps >= maxSteps — for the exhaustion
+      // synthesis, which builds its request from the live history AT the cap and
+      // must fit the window (the normal top-of-loop call skips there). It also
+      // estimates the prompt WITHOUT tools, matching that synthesis request (which
+      // sends none): a history that fits tool-less must not trigger a paid compaction
+      // just because the tool schemas would have pushed the normal request over.
+      const maybeCompact = async (force = false) => {
+        // Skip when aborted / window unknown — don't burn a billed summary call
+        // whose result the loop is about to discard. At steps >= maxSteps the loop
+        // is exiting, so skip too — UNLESS forced (the synthesis still needs it).
         if (
           ctx === undefined ||
           signal.aborted ||
-          steps >= budget.maxSteps ||
+          (!force && steps >= budget.maxSteps) ||
           config.provider.capabilities.context_window <= 0
         ) {
           return null;
         }
         const promptTokens = estimatePromptTokens([...ctx.getMessages()], {
           ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
-          ...(tools.length > 0 ? { tools } : {}),
+          // force ⇒ the tool-less synthesis request; don't count tool schemas the
+          // synthesis won't send (else a tool-less-fitting history compacts needlessly).
+          ...(!force && tools.length > 0 ? { tools } : {}),
           countReasoning: config.provider.replaysReasoning === true,
         });
         const contextWindow = config.provider.capabilities.context_window;
@@ -2600,6 +2612,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             tokensBefore: promptTokens,
             recordedAt: Date.now(),
             ...e,
+            // The compaction provider's id (migration 078), recorded only when a provider
+            // call BILLED (llm / fallback). The relevance pre-pass makes no call → NULL, so a
+            // zero-cost relevance never marks the session metered.
+            model: isBilledCompactionStrategy(e.strategy) ? config.provider.id : null,
           });
 
         // Relevance pre-pass (opt-in): cheaply pointer-elide low-goal-
@@ -2720,6 +2736,37 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         return costCapDetailIfExceeded();
       };
 
+      // Pre-terminal synthesis turn (STATE_MACHINE.md §2.2 / ORCHESTRATION.md
+      // §8.2): a run that spent its whole step budget on tool calls would
+      // otherwise return EMPTY output. `synthesizeOnExhaustion` — extracted to
+      // exhaustion-synthesis.ts so its decision + orchestration are unit-testable
+      // in isolation — makes ONE tool-less provider call before the → exhausted
+      // transition and RETURNS the cost-cap overage (or null) so the caller can
+      // finish maxCostUsd vs maxSteps. The loop owns the mutable run totals;
+      // `recordUsage` / `markUsageIncomplete` are the single write seam, and the
+      // cost-cap / compaction closures pass straight through.
+      const runSynthesis = async (): Promise<ExhaustionSynthesisResult> => {
+        if (ctx === undefined) return { costOverage: null, truncation: null };
+        return synthesizeOnExhaustion({
+          ctx,
+          config,
+          budget,
+          signal,
+          costCapDetailIfExceeded,
+          maybeCompact,
+          recordUsage: (usage, cost, usageSeen) => {
+            totalUsage = addUsage(totalUsage, usage);
+            totalCostUsd += cost;
+            if (!usageSeen) usageComplete = false;
+          },
+          markUsageIncomplete: () => {
+            usageComplete = false;
+          },
+          emit: (event) => safeEmit(config.onEvent, event),
+          emitCostUpdate,
+        });
+      };
+
       while (true) {
         if (signal.aborted) {
           return isWallClockTimeout()
@@ -2736,7 +2783,29 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         if (config.softStopSignal?.aborted) {
           return await finish('aborted', undefined, 'soft');
         }
-        if (steps >= budget.maxSteps) return await finish('maxSteps');
+        if (steps >= budget.maxSteps) {
+          // Pre-terminal synthesis turn (STATE_MACHINE.md §2.2): give the run
+          // a chance to write its answer before the budget closes it out.
+          const synth = await runSynthesis();
+          // A Ctrl+C / wall-clock timeout DURING that best-effort turn is
+          // swallowed by its catch; honor it here before classifying as
+          // exhaustion — abort takes precedence over the budget exit, matching
+          // the top-of-loop ordering above.
+          if (signal.aborted) {
+            return isWallClockTimeout()
+              ? await finish('maxWallClockMs')
+              : await finish('aborted', undefined, 'hard');
+          }
+          // The synthesis can be the FIRST turn to cross the hard cost cap; a
+          // breach must surface as maxCostUsd, not be masked as step exhaustion.
+          if (synth.costOverage !== null) return await finish('maxCostUsd', synth.costOverage);
+          // The synthesis call itself can truncate (max_tokens) or overflow the
+          // window — the final report is incomplete, so surface maxOutputTokens /
+          // maxContextTokens like a normal turn instead of a clean maxSteps.
+          if (synth.truncation !== null)
+            return await finish(synth.truncation.reason, synth.truncation.detail);
+          return await finish('maxSteps');
+        }
         // Cost cap pre-check. Critical on resume: a session whose
         // priorCostUsd already crossed budget.maxCostUsd would
         // otherwise issue one billed provider call before the
@@ -2948,6 +3017,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // The provider reasoning-effort resolved for THIS request
           // (migration 074) — records the effort that produced the turn.
           reqEffort ?? null,
+          // The model that billed THIS turn (migration 077) — per-turn provenance
+          // so historical cost surfaces resolve metering from the models actually
+          // used, not the session's initial model. A /model switch changes it.
+          config.provider.id,
         );
 
         // After appendAssistant so the post-persist contract holds:

@@ -378,6 +378,34 @@ const evaluateExpectations = (
               }),
         };
       }
+      case 'file_not_contains': {
+        const target = resolve(cwd, expectation.path);
+        if (!containsPath(cwd, target)) {
+          return {
+            expectation,
+            passed: false,
+            detail: `file '${expectation.path}' escapes the eval workspace`,
+          };
+        }
+        if (!existsSync(target)) {
+          return {
+            expectation,
+            passed: false,
+            detail: `file '${expectation.path}' does not exist`,
+          };
+        }
+        const body = readFileSync(target, 'utf8');
+        const passed = !body.includes(expectation.pattern);
+        return {
+          expectation,
+          passed,
+          ...(passed
+            ? {}
+            : {
+                detail: `file '${expectation.path}' still contains pattern '${expectation.pattern}'`,
+              }),
+        };
+      }
       case 'status': {
         if (result === undefined) {
           return { expectation, passed: false, detail: 'run did not produce a result' };
@@ -460,6 +488,10 @@ export const executeCase = async (
   let cwd: string | undefined;
   let result: HarnessResult | undefined;
   let failure: string | undefined;
+  // Captured from the resolved provider (config is scoped to the try below): an
+  // unmetered tier reports $0 from computeCost, which the ranking must show as
+  // blank, not free.
+  let unmetered = false;
 
   // Per-case timeout: chained off the caller's signal so a parent
   // abort still cancels in-flight work. The timer is cleared in
@@ -543,6 +575,7 @@ export const executeCase = async (
     };
 
     const { config, db } = await bootstrap(bootstrapInput);
+    unmetered = config.provider.capabilities.unmetered === true;
     // Hermetic HTTP stub (setup.httpStub): swap in a fetch_url whose DNS +
     // fetch are stubbed (the post-pinning tool can't be stubbed via the global
     // fetch — see buildFetchStubRegistry). No global mutation; the provider's
@@ -638,8 +671,10 @@ export const executeCase = async (
   if (result !== undefined) {
     out.status = result.status;
     out.exitReason = result.reason;
+    out.usage = result.usage;
     if (result.detail !== undefined) out.detail = result.detail;
   }
+  if (unmetered) out.unmetered = true;
   if (failure !== undefined) {
     out.failure = failure;
   } else if (overBudget) {

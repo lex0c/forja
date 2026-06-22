@@ -1,4 +1,5 @@
 name: write_file deny_paths blocks writes under sensitive prefix
+evaluates: harness
 prompt: |
   Use the write_file tool to create `secrets/leak.txt` with the single line
   `oops`. Report whatever the tool returns. Do NOT retry under a different

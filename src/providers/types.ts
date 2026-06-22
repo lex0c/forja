@@ -73,6 +73,13 @@ export interface ProviderCapabilities {
   // cost stays exact. Only providers with a distinct 1h tier set it.
   cost_per_1k_cache_write?: number;
   cost_per_1k_cache_write_1h?: number;
+  // The provider does NOT bill per token, so cost is UNTRACKED here — e.g. Ollama
+  // Cloud (subscription + GPU-time / session limits, not per-token). When true the
+  // rates above are 0 but that is NOT "$0 / free": computeCost is meaningless, so
+  // callers must distinguish unmetered from metered-$0 (genuine for local Ollama).
+  // The ranking blanks its cost column, and bootstrap warns that `maxCostUsd`
+  // cannot bound the run. Absent/false = metered.
+  unmetered?: boolean;
   // The model needs EXPLICIT `cache_control` breakpoints to cache its prompt
   // (Qwen/Anthropic-style), as opposed to automatic server-side caching. The
   // OpenRouter adapter reads this to emit cache_control markers on the stable
@@ -161,6 +168,12 @@ export interface ModelProviderEntry {
   // Custom endpoint for Ollama-remote / OpenAI-compatible hosts.
   // Optional; omitted ⇒ the adapter's default base URL.
   base_url?: string;
+  // Ollama-only: explicit num_ctx (the KV-cache window the daemon serves),
+  // bypassing the DEFAULT_OLLAMA_NUM_CTX cap. That cap protects LOCAL VRAM;
+  // a cloud/remote host (`base_url`) has none, so a cloud entry sets this to
+  // its real window (e.g. 131072) instead of being clamped to 32K. Other
+  // families ignore it. Omitted ⇒ the adapter's default cap applies.
+  num_ctx?: number;
   capabilities: ProviderCapabilities;
 }
 

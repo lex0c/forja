@@ -6,7 +6,9 @@
 // cluttering the list). Defaults to 10 most recent; first arg
 // overrides the limit (`/sessions 25`).
 
+import { formatCostCell, isSessionUnmetered } from '../../../providers/cost-format.ts';
 import { listSessions } from '../../../storage/index.ts';
+import { effectiveSessionModels } from '../../../storage/repos/messages.ts';
 import { formatCost } from '../format.ts';
 import type { SlashCommand } from '../types.ts';
 
@@ -30,11 +32,6 @@ const formatTimestamp = (ms: number): string => {
   const ss = pad2(d.getSeconds());
   return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
 };
-
-// Sessions can have incomplete usage telemetry — prefix with `~`
-// to mark the cost as a lower bound.
-const formatSessionCost = (usd: number, complete: boolean): string =>
-  complete ? formatCost(usd) : `~${formatCost(usd)}`;
 
 export const sessionsCommand: SlashCommand = {
   name: 'sessions',
@@ -70,7 +67,14 @@ export const sessionsCommand: SlashCommand = {
     const lines = [`recent sessions (${sessions.length}):`];
     for (const s of sessions) {
       const status = s.endedAt !== null ? s.status : 'running';
-      const cost = formatSessionCost(s.totalCostUsd, s.usageComplete);
+      // An unmetered tier records $0 (reads as "free") — show "unmetered"; an
+      // unknown model (dropped from the catalog) falls back to the recorded cost.
+      const cost = formatCostCell(
+        isSessionUnmetered(ctx.modelRegistry, effectiveSessionModels(ctx.db, s.id, s.model)),
+        s.usageComplete,
+        formatCost,
+        s.totalCostUsd,
+      );
       lines.push(
         `  ${s.id.slice(0, 8)} · ${formatTimestamp(s.startedAt)} · ${status.padEnd(11)} · ${cost} · ${s.model}`,
       );

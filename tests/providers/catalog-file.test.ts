@@ -192,6 +192,26 @@ describe('loadModelProvidersFile — per-entry fail-soft', () => {
     }
   });
 
+  test('non-positive / non-integer num_ctx → warn + skip', () => {
+    const zero = entry({ id: 'ollama/a', model_name: 'a', num_ctx: 0 });
+    const frac = entry({ id: 'ollama/b', model_name: 'b', num_ctx: 1.5 });
+    writeCatalog(catalogJson([zero, frac, entry()]));
+    const r = loadModelProvidersFile(env);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.entries).toHaveLength(1);
+      expect(r.entries[0]?.id).toBe('ollama/qwen3:14b');
+      expect(r.warnings.join(' ')).toContain('num_ctx must be a positive integer');
+    }
+  });
+
+  test('a valid num_ctx loads onto the entry', () => {
+    writeCatalog(catalogJson([entry({ num_ctx: 131_072 })]));
+    const r = loadModelProvidersFile(env);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.entries[0]?.num_ctx).toBe(131_072);
+  });
+
   test('duplicate id → warn + first wins', () => {
     writeCatalog(
       catalogJson([entry(), entry({ capabilities: { ...VALID_CAPS, context_window: 1 } })]),
@@ -219,6 +239,54 @@ describe('registry construction + factory wiring', () => {
     const resolved = resolveProviderFromId(reg, 'ollama/qwen3:14b');
     expect(resolved.ok).toBe(true);
     if (resolved.ok) expect(resolved.provider.id).toBe('ollama/qwen3:14b');
+  });
+
+  test('per-entry num_ctx flows to the ollama factory and bypasses the 32K cap', () => {
+    // A 256K-capacity entry with NO num_ctx clamps to the default 32K cap
+    // (VRAM protection) — the served window the harness budgets against.
+    const capped = buildRegistryFromEntries([
+      entry({ capabilities: { ...VALID_CAPS, context_window: 262_144 } }),
+    ])
+      .get('ollama/qwen3:14b')
+      ?.factory();
+    expect(capped?.capabilities.context_window).toBe(32_768);
+
+    // The SAME entry WITH a per-entry num_ctx serves that window instead —
+    // the cloud-window fix (a remote host has no local VRAM to protect).
+    const widened = buildRegistryFromEntries([
+      entry({ num_ctx: 131_072, capabilities: { ...VALID_CAPS, context_window: 262_144 } }),
+    ])
+      .get('ollama/qwen3:14b')
+      ?.factory();
+    expect(widened?.capabilities.context_window).toBe(131_072);
+  });
+
+  test('ollama cloud entry: a { client } override does NOT bypass the missing-key guard', () => {
+    // Ollama authenticates via a bearer header (apiKey/env), not an SDK client —
+    // createOllamaProvider has no client param. A client override satisfies the guard for
+    // SDK families, but for an ollama entry it would otherwise instantiate a key-requiring
+    // cloud model with no Authorization header, so the guard must still demand a key.
+    const key = 'FORJA_TEST_OLLAMA_KEY_XYZ';
+    const prior = process.env[key];
+    delete process.env[key]; // env key UNSET
+    try {
+      const ollama = buildRegistryFromEntries([
+        entry({
+          id: 'ollama/cloud-x',
+          family: 'ollama',
+          model_name: 'cloud-x',
+          api_key_env: key,
+          base_url: 'https://ollama.com',
+        }),
+      ]).get('ollama/cloud-x');
+      // The bug: a client override let this construct unauthenticated. Now it throws.
+      expect(() => ollama?.factory({ client: {} })).toThrow(/API key required/);
+      // An injected apiKey DOES satisfy it — it becomes the bearer header.
+      expect(() => ollama?.factory({ apiKey: 'sk-bearer' })).not.toThrow();
+    } finally {
+      if (prior === undefined) delete process.env[key];
+      else process.env[key] = prior;
+    }
   });
 
   test('api_key_env is read from the named env var for the openai adapter', () => {
@@ -290,6 +358,44 @@ describe('registry construction + factory wiring', () => {
     expect(provider?.catalogEntry).toEqual(e);
   });
 
+  test('ollama: an injected opts.apiKey becomes the Authorization header (cloud auth)', async () => {
+    // A cloud entry names an UNSET api_key_env (hasKey=false); a programmatic caller
+    // injects apiKey, satisfying the missing-key guard. Ollama auths via a header (no
+    // SDK apiKey field), so the injected key MUST map to Authorization — else the
+    // provider ships unauthenticated and the first /api/chat 401s.
+    const unsetVar = 'FORJA_TEST_OLLAMA_KEY_UNSET';
+    delete process.env[unsetVar];
+    let auth: string | null | undefined;
+    const fetchFn = (async (_url: string, init?: { headers?: Record<string, string> }) => {
+      auth = new Headers(init?.headers).get('authorization');
+      return new Response('{"done":true}\n', {
+        headers: { 'content-type': 'application/x-ndjson' },
+      });
+    }) as unknown as typeof fetch;
+
+    const provider = buildRegistryFromEntries([
+      entry({ api_key_env: unsetVar, base_url: 'https://ollama.com' }),
+    ])
+      .get('ollama/qwen3:14b')
+      ?.factory({ apiKey: 'injected-key', fetch: fetchFn });
+    if (provider === undefined) throw new Error('provider not built');
+
+    try {
+      // Drain to fire the request; the header is captured on the fetch call, so
+      // the minimal response's stream shape is irrelevant to the assertion.
+      for await (const _ev of provider.generate({
+        model: 'qwen3:14b',
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 64,
+      })) {
+        // no-op
+      }
+    } catch {
+      // stream content is not under test
+    }
+    expect(auth).toBe('Bearer injected-key');
+  });
+
   test('isSupportedFamily recognizes only the shipped adapters', () => {
     // The subagent child gates a persisted snapshot on this before
     // rebuilding, so a corrupt unsupported family falls back to the file.
@@ -338,6 +444,39 @@ describe('seed catalog + serialization', () => {
     if (r.ok) {
       expect(r.entries).toHaveLength(CANONICAL_MODEL_PROVIDERS.length);
       expect(r.warnings).toHaveLength(0);
+    }
+  });
+
+  test('serialize → load round-trips a per-entry num_ctx + base_url', () => {
+    const e = entry({ base_url: 'https://ollama.com', num_ctx: 131_072 });
+    writeCatalog(serializeModelProviders([e]));
+    const r = loadModelProvidersFile(env);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.entries[0]?.num_ctx).toBe(131_072);
+      expect(r.entries[0]?.base_url).toBe('https://ollama.com');
+    }
+  });
+
+  test('seed ships the curated Ollama Cloud tier with base_url + api_key_env + num_ctx', () => {
+    const cloud = CANONICAL_MODEL_PROVIDERS.filter(
+      (e) => e.family === 'ollama' && e.base_url === 'https://ollama.com',
+    );
+    expect(cloud.map((e) => e.id).sort()).toEqual([
+      'ollama/devstral-2:123b',
+      'ollama/glm-5.2',
+      'ollama/gpt-oss:20b',
+      'ollama/qwen3-coder-next',
+      'ollama/qwen3-coder:480b',
+    ]);
+    for (const e of cloud) {
+      expect(e.api_key_env).toBe('OLLAMA_API_KEY');
+      // num_ctx is derived per model from its real capacity (NOT a flat 131K cap),
+      // so the host serves the full declared window instead of truncating early.
+      expect(e.num_ctx).toBe(e.capabilities.context_window);
+      expect(e.capabilities.tools).toBe('native');
+      // Hosted = unmetered (billed by subscription/GPU-time, not per token).
+      expect(e.capabilities.unmetered).toBe(true);
     }
   });
 });
