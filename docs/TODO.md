@@ -1904,11 +1904,12 @@ command in the workspace cwd after the agent, asserts exit 0, with a per-command
 hermetic inline fail-to-pass eval). NOTE: runs UNSANDBOXED — see the sandbox-the-verifier gate
 above before pointing it at model-authored files.
 
-**Reporting.** Do NOT fold this into the harness-fit composite (RANKING.md keeps "separate
-axes, never folded in"). Add a `capability` axis = pass-rate of the verified suite. Tag
-each task with a difficulty tier (1 = trivial fix, 2 = multi-location / reasoning, 3 =
-multi-file / recover-from-wrong-attempt) and report per-tier, so the score reflects a
-capability CEILING, not a uniform pass-rate.
+**Reporting.** ✅ DONE — `docs/BENCHMARK.md` is the capability-axis doc (per-tier pass-rate, hand-
+refreshed from `results.csv`, with the derived taxonomy/efficiency/fluency axes). Do NOT fold this into
+the harness-fit composite (RANKING.md keeps "separate axes, never folded in"). Add a `capability` axis =
+pass-rate of the verified suite. Tag each task with a difficulty tier (1 = trivial fix, 2 = multi-
+location / reasoning, 3 = multi-file / recover-from-wrong-attempt) and report per-tier, so the score
+reflects a capability CEILING, not a uniform pass-rate.
 
 **Honest caveat.** Still "capability AS exercised through Forja's loop" — the model acts
 through the harness; it is not a vacuum benchmark. But outcome-verification removes the
