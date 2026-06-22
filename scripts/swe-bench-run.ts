@@ -254,9 +254,7 @@ const preflightEgress = (hosts: string[]): void => {
     process.stderr.write(r.stdout.toString() + r.stderr.toString());
     if (!r.success) {
       throw new Error(
-        `swe-bench-run: egress preflight FAILED for ${host} (see the NET lines above) — aborting before ` +
-          `the corpus. A network-broken run would score every task as model incapacity; fix the sidecar ` +
-          `proxy / network and retry.`,
+        `swe-bench-run: egress preflight FAILED for ${host} (see the NET lines above) — aborting before the corpus. A network-broken run would score every task as model incapacity; fix the sidecar proxy / network and retry.`,
       );
     }
   }
@@ -363,9 +361,7 @@ const runTaskInner = (model: string, t: Task, logDir: string, work: string): Row
   const agentError = existsSync(agentErrorFile);
   if (agentError) {
     process.stderr.write(
-      `swe-bench-run: ${t.id} — forja exited abnormally (code ${readFileSync(agentErrorFile, 'utf8').trim()}) ` +
-        'before a normal finish; scoring HARNESS ERROR, not a model failure. If this repeats the config ' +
-        'is broken (unset key / bad model id) — abort and fix.\n',
+      `swe-bench-run: ${t.id} — forja exited abnormally (code ${readFileSync(agentErrorFile, 'utf8').trim()}) before a normal finish; scoring HARNESS ERROR, not a model failure. If this repeats the config is broken (unset key / bad model id) — abort and fix.\n`,
     );
   }
 

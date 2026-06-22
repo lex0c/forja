@@ -15,7 +15,8 @@
       "docs/spec",
       "evals/fixtures",
       "evals/recap/golden",
-      "evals/swe-bench/corpus.json"
+      "evals/swe-bench/corpus.json",
+      "evals/ranking/results.json"
     ]
   },
   "formatter": {

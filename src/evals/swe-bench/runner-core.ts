@@ -50,9 +50,7 @@ export const allowHostsFor = (modelIds: string[], entries: CatalogEntry[]): stri
     const entry = entries.find((e) => e.id === m);
     if (entry === undefined) {
       throw new Error(
-        `swe-bench-run: model '${m}' is not in the catalog (model_providers.json) — forja resolves ` +
-          `models strictly from it in-container, so the run would fail every task. Add the entry, or ` +
-          `fix the --models id (a typo, or did the catalog parse to []?).`,
+        `swe-bench-run: model '${m}' is not in the catalog (model_providers.json) — forja resolves models strictly from it in-container, so the run would fail every task. Add the entry, or fix the --models id (a typo, or did the catalog parse to []?).`,
       );
     }
     let host: string | undefined;
