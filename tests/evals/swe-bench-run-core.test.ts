@@ -1,0 +1,169 @@
+import { afterEach, describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  type CatalogEntry,
+  allowHostsFor,
+  apiKeyEnvsFor,
+  loadCatalogEntries,
+  parseMetrics,
+  scoreResult,
+} from '../../src/evals/swe-bench/runner-core.ts';
+
+// Pure core of scripts/swe-bench-run.ts. The runner script runs the bench on import (no
+// import.meta.main guard), so its host/key/score/metric logic — each of which has shipped a forwarded
+// bug — was untestable until extracted here. These tests inject catalog fixtures, never the real one.
+
+describe('scoreResult', () => {
+  const s = (
+    oracle: number | undefined,
+    p2p: number | undefined,
+    expectsP2P: boolean,
+    agentTimedOut = false,
+    restoreFailed = false,
+  ) => scoreResult({ oracle, p2p, expectsP2P, agentTimedOut, restoreFailed });
+
+  test('no PASS_TO_PASS, oracle passes → passed/ok', () => {
+    expect(s(0, undefined, false)).toEqual({ passed: true, regressed: false, status: 'ok' });
+  });
+  test('PASS_TO_PASS present and passing → passed/ok', () => {
+    expect(s(0, 0, true)).toEqual({ passed: true, regressed: false, status: 'ok' });
+  });
+  test('a sibling regressed (p2p != 0) → not passed, regressed, ok', () => {
+    expect(s(0, 1, true)).toEqual({ passed: false, regressed: true, status: 'ok' });
+  });
+  // The forwarded bug: a task that EXPECTS a p2p result but the verifier produced none (killed after
+  // .result, before .p2p) must be an ERROR — never a silent pass on an unchecked regression.
+  test('expects p2p but none produced → error, not a silent pass', () => {
+    expect(s(0, undefined, true)).toEqual({ passed: false, regressed: false, status: 'error' });
+  });
+  test('oracle fails → not passed', () => {
+    expect(s(1, 0, true)).toEqual({ passed: false, regressed: false, status: 'ok' });
+  });
+  test('agent timed out (verifier skipped → oracle undefined) → timeout, not passed', () => {
+    expect(s(undefined, undefined, true, true)).toEqual({
+      passed: false,
+      regressed: false,
+      status: 'timeout',
+    });
+  });
+  test('restore failed (verifier skipped) → error', () => {
+    expect(s(undefined, undefined, true, false, true)).toEqual({
+      passed: false,
+      regressed: false,
+      status: 'error',
+    });
+  });
+});
+
+describe('allowHostsFor', () => {
+  const entries: CatalogEntry[] = [
+    { id: 'openrouter/deepseek/deepseek-r1', api_key_env: 'OPENROUTER_API_KEY' },
+    { id: 'google/gemini-2.5-flash', api_key_env: 'GOOGLE_API_KEY' },
+    {
+      id: 'ollama/qwen3-coder:480b',
+      base_url: 'https://ollama.com',
+      api_key_env: 'OLLAMA_API_KEY',
+    },
+  ];
+
+  test('seeded openrouter/google (no base_url) resolve via the provider-family default', () => {
+    expect(allowHostsFor(['openrouter/deepseek/deepseek-r1'], entries)).toEqual(['openrouter.ai']);
+    expect(allowHostsFor(['google/gemini-2.5-flash'], entries)).toEqual([
+      'generativelanguage.googleapis.com',
+    ]);
+  });
+  test("an entry's base_url wins over the family default", () => {
+    expect(allowHostsFor(['ollama/qwen3-coder:480b'], entries)).toEqual(['ollama.com']);
+  });
+  test('distinct hosts across models, no dupes', () => {
+    expect(
+      allowHostsFor(['openrouter/deepseek/deepseek-r1', 'google/gemini-2.5-flash'], entries).sort(),
+    ).toEqual(['generativelanguage.googleapis.com', 'openrouter.ai']);
+  });
+  test('an unknown provider with no base_url THROWS (loud config error, not silent egress)', () => {
+    expect(() => allowHostsFor(['mystery/model'], entries)).toThrow(/no egress host/);
+  });
+});
+
+describe('apiKeyEnvsFor', () => {
+  const entries: CatalogEntry[] = [
+    { id: 'openrouter/x', api_key_env: 'OPENROUTER_API_KEY' },
+    { id: 'google/y', api_key_env: 'GOOGLE_API_KEY' },
+    { id: 'local/keyless' }, // no api_key_env → skipped
+  ];
+  test('collects the distinct api_key_env of the selected models', () => {
+    expect(apiKeyEnvsFor(['openrouter/x', 'google/y'], entries).sort()).toEqual([
+      'GOOGLE_API_KEY',
+      'OPENROUTER_API_KEY',
+    ]);
+  });
+  test('skips a keyless entry and a model absent from the catalog', () => {
+    expect(apiKeyEnvsFor(['local/keyless', 'not/in/catalog'], entries)).toEqual([]);
+  });
+  test('dedupes a shared key', () => {
+    const e: CatalogEntry[] = [
+      { id: 'a/1', api_key_env: 'K' },
+      { id: 'a/2', api_key_env: 'K' },
+    ];
+    expect(apiKeyEnvsFor(['a/1', 'a/2'], e)).toEqual(['K']);
+  });
+});
+
+describe('parseMetrics', () => {
+  test('reads the done-line: reason/steps/tokens/cost', () => {
+    const m = parseMetrics('noise\n[done/done] 12 steps · 1109ms · tokens 7141/431 · $0.0123\n');
+    expect(m).toMatchObject({ reason: 'done', steps: 12, inputTok: 7141, outputTok: 431 });
+    expect(m.costUsd).toBe(0.0123);
+    expect(m.unmetered).toBe(false);
+  });
+  test('the REASON half (not the class) of a non-clean exit + the unmetered flag', () => {
+    const m = parseMetrics('[exhausted/maxSteps] 40 steps · 5s · tokens 100/50 · unmetered\n');
+    expect(m.reason).toBe('maxSteps'); // the half AFTER the slash, not "exhausted"
+    expect(m.unmetered).toBe(true);
+    expect(m.costUsd).toBe(0);
+  });
+  test('the LAST done-line wins over earlier tool output that also matches', () => {
+    const log =
+      '→ bash {"command":"echo [fake/line] 99 steps"}\n  ✓ bash\n[done/done] 3 steps · 10ms · tokens 5/5 · unmetered\n';
+    expect(parseMetrics(log).steps).toBe(3);
+  });
+  test('counts tool calls (→) and errors (✗) over the whole log', () => {
+    const log =
+      '→ bash {}\n  ✓ bash (5ms)\n→ read_file {}\n  ✓ read_file (1ms)\n→ edit_file {}\n  ✗ edit_file (2ms)\n[done/done] 3 steps · tokens 1/1 · unmetered\n';
+    const m = parseMetrics(log);
+    expect(m.toolCalls).toBe(3);
+    expect(m.toolErrors).toBe(1);
+  });
+  test('no done-line → all defaults', () => {
+    expect(parseMetrics('no summary here\n')).toEqual({
+      reason: '',
+      steps: 0,
+      inputTok: 0,
+      outputTok: 0,
+      unmetered: false,
+      costUsd: 0,
+      toolCalls: 0,
+      toolErrors: 0,
+    });
+  });
+});
+
+describe('loadCatalogEntries', () => {
+  const temps: string[] = [];
+  afterEach(() => {
+    for (const t of temps.splice(0)) rmSync(t, { recursive: true, force: true });
+  });
+
+  test('parses a catalog file into its models array', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'swe-cat-'));
+    temps.push(dir);
+    const p = join(dir, 'model_providers.json');
+    writeFileSync(p, JSON.stringify({ models: [{ id: 'a/b', api_key_env: 'K' }] }));
+    expect(loadCatalogEntries(p)).toEqual([{ id: 'a/b', api_key_env: 'K' }]);
+  });
+  test('a missing/malformed file → [] (the caller throws a clearer per-model error)', () => {
+    expect(loadCatalogEntries('/no/such/catalog.json')).toEqual([]);
+  });
+});

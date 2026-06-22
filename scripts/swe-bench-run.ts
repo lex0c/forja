@@ -29,6 +29,13 @@ import {
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import {
+  allowHostsFor,
+  apiKeyEnvsFor,
+  loadCatalogEntries,
+  parseMetrics,
+  scoreResult,
+} from '../src/evals/swe-bench/runner-core.ts';
+import {
   gitToplevel,
   materializeSweWorkspace,
   restoreSweTests,
@@ -54,18 +61,6 @@ const PROXY_PORT = 8889;
 // per-task timeout.
 const VERIFY_TIMEOUT = 180_000;
 const catalogPath = join(userInfo().homedir, '.config', 'forja', 'model_providers.json');
-// The provider prefix of a model id maps to the host its base_url points at — the egress allowlist
-// is exactly the selected models' hosts, nothing else. (Local Ollama would be host.docker.internal;
-// the bench targets the cloud endpoints the ranking uses.)
-const PROVIDER_HOST: Record<string, string> = {
-  ollama: 'ollama.com',
-  anthropic: 'api.anthropic.com',
-  openai: 'api.openai.com',
-  // Seeded openrouter/* and google/* entries ship with NO base_url (the adapter uses its own default
-  // endpoint), so the egress host must come from here or allowHostsFor throws before any task runs.
-  openrouter: 'openrouter.ai',
-  google: 'generativelanguage.googleapis.com',
-};
 
 const repoRoot = gitToplevel(process.cwd());
 const corpus: Task[] = JSON.parse(
@@ -178,73 +173,10 @@ const buildImage = (rebuild: boolean): void => {
   }
 };
 
-// One catalog entry — only the fields the egress allowlist needs. The mounted file is the SAME
-// catalog forja reads in-container (model_providers.json), so `base_url` here is the host the
-// adapter will actually dial.
-interface CatalogEntry {
-  id: string;
-  base_url?: string;
-  api_key_env?: string;
-}
-
-// Read+parse the mounted model catalog once. The egress host of a model comes from its entry's
-// `base_url` when set (e.g. Ollama Cloud's https://ollama.com); the catalog is the source of truth,
-// so a custom/self-hosted endpoint is honored instead of being silently dropped.
-const loadCatalogEntries = (): CatalogEntry[] => {
-  try {
-    const parsed = JSON.parse(readFileSync(catalogPath, 'utf8')) as { models?: CatalogEntry[] };
-    return Array.isArray(parsed.models) ? parsed.models : [];
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    process.stderr.write(`swe-bench-run: could not parse catalog ${catalogPath} (${msg})\n`);
-    return [];
-  }
-};
-
-// The egress allowlist is EXACTLY the selected models' hosts. Per model: prefer the catalog
-// entry's `base_url` hostname; else the provider-family default (PROVIDER_HOST). If NEITHER yields
-// a host, THROW — opening egress for only the resolvable models would let the unresolved model's
-// tasks fail with masked network errors, so a missing host is a loud configuration error.
-const allowHostsFor = (modelIds: string[]): string[] => {
-  const entries = loadCatalogEntries();
-  const hosts = new Set<string>();
-  for (const m of modelIds) {
-    let host: string | undefined;
-    const baseUrl = entries.find((e) => e.id === m)?.base_url;
-    if (baseUrl !== undefined && baseUrl !== '') {
-      try {
-        host = new URL(baseUrl).hostname;
-      } catch {
-        // Fall through to PROVIDER_HOST below if base_url is malformed.
-      }
-    }
-    if (host === undefined) host = PROVIDER_HOST[m.split('/')[0] ?? ''];
-    if (host === undefined || host === '') {
-      throw new Error(
-        `swe-bench-run: no egress host for model '${m}' — no base_url in ${catalogPath} and no ` +
-          `default for provider '${m.split('/')[0] ?? ''}'`,
-      );
-    }
-    hosts.add(host);
-  }
-  if (hosts.size === 0)
-    throw new Error(`swe-bench-run: no known egress host for models ${modelIds.join(', ')}`);
-  return [...hosts];
-};
-
-// The distinct api_key_env of the selected models, read from the catalog — forwarded into each
-// container so the in-container forja can construct the provider. Entries with no key (a keyless
-// local) are skipped; a model absent from the catalog already fails loudly in allowHostsFor.
-const apiKeyEnvsFor = (modelIds: string[]): string[] => {
-  const entries = loadCatalogEntries();
-  const envs = new Set<string>();
-  for (const m of modelIds) {
-    const env = entries.find((e) => e.id === m)?.api_key_env;
-    if (env !== undefined && env !== '') envs.add(env);
-  }
-  return [...envs];
-};
-const apiKeyEnvs = apiKeyEnvsFor(models);
+// The selected models' catalog entries — egress hosts AND api_key_env both derive from these (the
+// pure resolvers live in runner-core, where they're unit-tested). Read once; passed to both.
+const catalogEntries = loadCatalogEntries(catalogPath);
+const apiKeyEnvs = apiKeyEnvsFor(models, catalogEntries);
 
 // The sidecar: an --internal network (no direct egress) + the proxy (the only egress, allowlisting
 // the model hosts). Shared across all tasks in the run.
@@ -315,41 +247,6 @@ const readExit = (path: string): number | undefined => {
   if (!existsSync(path)) return undefined;
   const n = Number.parseInt(readFileSync(path, 'utf8').trim(), 10);
   return Number.isNaN(n) ? undefined : n;
-};
-
-// Parse forja's done line, e.g. "[done/done] 12 steps · 1109ms · tokens 7141/431 · unmetered" (or
-// "· $0.0123" when metered). Defaults are 0 — a missing line means the agent didn't reach a clean exit.
-//
-// The metrics MUST be read off the done-line alone: tool/test output earlier in the log also matches
-// `[\w+/` and `\d+ steps`, so a whole-log scan would capture the FIRST such occurrence, not forja's
-// summary. Locate the done-line first — the LAST line that carries a `[<class>/<reason>]` terminal
-// marker AND the step count — then run every regex against THAT line; if there's none, fall back to
-// the whole log (defaults still apply). Match ANY class, not an allow-list: forja's terminal class is
-// done|error|exhausted (e.g. `[exhausted/maxSteps]` when --max-steps caps it) and may grow
-// (budget/timeout), so anchoring on done|error alone would silently miss those and regress to the
-// buggy whole-log first-match.
-const parseMetrics = (log: string) => {
-  let doneLine: string | undefined;
-  for (const line of log.split('\n')) {
-    if (/\[\w+\/\w+\][^\n]*\bsteps\b/.test(line)) doneLine = line;
-  }
-  const scope = doneLine ?? log;
-  // exit_reason is the REASON half after the slash (`maxSteps`, `degenerateLoop`), NOT the class before
-  // it (`exhausted`, `error`) — capturing the class collapses distinct budget/error exits into one bucket.
-  const reason = scope.match(/\[\w+\/(\w+)\]/)?.[1] ?? '';
-  const steps = Number(scope.match(/(\d+)\s+steps\b/)?.[1] ?? 0);
-  const tk = scope.match(/tokens\s+(\d+)\/(\d+)/);
-  const inputTok = Number(tk?.[1] ?? 0);
-  const outputTok = Number(tk?.[2] ?? 0);
-  const unmetered = /·\s*unmetered/.test(scope);
-  const costUsd = Number(scope.match(/·\s*\$([\d.]+)/)?.[1] ?? 0);
-  // Harness fluency, counted over the WHOLE log (not the done-line): how many tool calls the model
-  // made (`→ tool`) and how many came back failed/denied (`✗ tool`). Two models can share a pass rate
-  // yet differ sharply in how cleanly they drive Forja's loop — that's the Forja-specific signal a raw
-  // pass-rate misses.
-  const toolCalls = (log.match(/^[ \t]*→ \w+/gm) ?? []).length;
-  const toolErrors = (log.match(/^[ \t]*✗ \w+/gm) ?? []).length;
-  return { reason, steps, inputTok, outputTok, unmetered, costUsd, toolCalls, toolErrors };
 };
 
 const runTask = (model: string, t: Task, logDir: string): Row => {
@@ -465,25 +362,17 @@ const runTaskInner = (model: string, t: Task, logDir: string, work: string): Row
   }
   writeFileSync(join(dest, 'proxy.log'), dockerLogs(PROXY, 200));
 
-  const oraclePassed = oracle === 0;
-  // A task with a PASS_TO_PASS set MUST produce a .p2p exit code. A MISSING one (verifier killed /
-  // timed out after .result but before .p2p) means the regression check never ran — that's an ERROR,
-  // NOT a silent pass. Only a task with no siblings defaults the regression check to "passed".
-  const expectsP2P = (t.passToPass?.length ?? 0) > 0;
-  const p2pMissing = expectsP2P && p2p === undefined;
-  const p2pPassed = expectsP2P ? p2p === 0 : true;
-  const regressed = oraclePassed && expectsP2P && p2p !== undefined && p2p !== 0;
-  const passed = oraclePassed && p2pPassed;
+  // Score from the verifier's oracle + PASS_TO_PASS exit codes (pure + unit-tested in runner-core).
+  const { passed, regressed, status } = scoreResult({
+    oracle,
+    p2p,
+    expectsP2P: (t.passToPass?.length ?? 0) > 0,
+    agentTimedOut,
+    restoreFailed,
+  });
   // Metrics come from the AGENT log (the done-line) — the verifier container has no agent summary.
   const m = parseMetrics(agentLog);
   const durationMs = agentMs;
-  const status = agentTimedOut
-    ? 'timeout'
-    : restoreFailed || p2pMissing
-      ? 'error'
-      : oracle === undefined
-        ? 'error'
-        : 'ok';
 
   // Retain the workspace (the agent's actual src edits) when something went wrong; clean it on a pass.
   // The container runs as root, so the entrypoint chmods /task world-writable before exit to let this
@@ -545,7 +434,7 @@ buildImage(!noBuild);
 
 const rows: Row[] = [];
 try {
-  ensureSidecar(allowHostsFor(models));
+  ensureSidecar(allowHostsFor(models, catalogEntries));
   for (const model of models) {
     process.stderr.write(`\n=== ${model} ===\n`);
     for (const t of tasks) {
