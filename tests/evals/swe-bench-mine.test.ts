@@ -6,7 +6,7 @@ import {
   type Task,
   candidateCommits,
   kindOf,
-  preserveCuration,
+  preservePassToPass,
   tierOf,
   validateFailToPass,
 } from '../../scripts/swe-bench-mine.ts';
@@ -103,7 +103,7 @@ describe('kindOf', () => {
   });
 });
 
-describe('preserveCuration', () => {
+describe('preservePassToPass', () => {
   const mk = (commit: string, passToPass?: string[]): Task => ({
     id: commit.slice(0, 3),
     commit,
@@ -121,15 +121,15 @@ describe('preserveCuration', () => {
       { commit: 'aaaaaa', passToPass: ['tests/sibling.test.ts'] }, // survives → carried
       { commit: 'zzzzzz', passToPass: ['tests/gone.test.ts'] }, // dropped commit → ignored
     ]);
-    const merged = preserveCuration(fresh, prior);
+    const merged = preservePassToPass(fresh, prior);
     expect(merged[0]?.passToPass).toEqual(['tests/sibling.test.ts']);
     expect(merged[1]?.passToPass).toBeUndefined();
   });
 
   test('absent or unreadable prior corpus → returns the fresh mine unchanged', () => {
     const fresh = [mk('aaaaaa', ['tests/a.test.ts'])];
-    expect(preserveCuration(fresh, undefined)).toEqual(fresh);
-    expect(preserveCuration(fresh, '{ not json')).toEqual(fresh);
+    expect(preservePassToPass(fresh, undefined)).toEqual(fresh);
+    expect(preservePassToPass(fresh, '{ not json')).toEqual(fresh);
   });
 });
 

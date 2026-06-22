@@ -681,8 +681,9 @@ describe('bootstrapPermissionEngine — §12.3 watchPolicy wire-up', () => {
     );
     expect(r.state).toBe('ready');
     expect(r.engine.state()).toBe('ready');
-    // No degradation → no tool_unavailable failure_event.
+    // No degradation → no tool_unavailable failure_event; the bypass IS audited (ANTI_PATTERNS §7.8).
     expect(emitted.filter((e) => e.code === 'sandbox.tool_unavailable')).toHaveLength(0);
+    expect(emitted.filter((e) => e.code === 'sandbox.host_passthrough')).toHaveLength(1);
   });
 
   test('host-passthrough opt-in does NOT override a policy that REQUIRES a sandbox → refusing', async () => {

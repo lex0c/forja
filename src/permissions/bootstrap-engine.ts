@@ -691,6 +691,33 @@ export const bootstrapPermissionEngine = async (
     sandbox.hostExplicitlyAllowed === true &&
     sandbox.emitHostPassthrough === true;
 
+  // ANTI_PATTERNS §7.8 — a security-bypass flag must be LOUD, never silent. The opt-in runs every
+  // tool UNSANDBOXED (full host access), and the carve-out below even suppresses the
+  // `sandbox.tool_unavailable` row that would otherwise fire — so without this the bypass leaves no
+  // trace at all. Emit a forensic failure_event AND a visible stderr warning whenever it's active.
+  if (hostPassthroughOptIn) {
+    process.stderr.write(
+      'forja: ⚠ UNSANDBOXED — host passthrough active (--sandbox-host + --i-know-what-im-doing); tools run with full host access\n',
+    );
+    if (input.failureSink !== undefined) {
+      try {
+        input.failureSink.emit({
+          code: 'sandbox.host_passthrough',
+          classe: 'sandbox',
+          recovery_action: 'ignored',
+          user_visible: true,
+          session_id: input.sessionId,
+          payload: { platform: process.platform },
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        process.stderr.write(
+          `forja bootstrap: failure_events emit failed (${msg}); bypass still active\n`,
+        );
+      }
+    }
+  }
+
   if (sandbox !== undefined && !sandbox.available && !hostPassthroughOptIn) {
     // Structured failure_event so ops queries can answer "which
     // sessions booted without sandbox tooling?" without parsing

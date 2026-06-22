@@ -30,8 +30,9 @@ export interface Task {
   testFiles: string[];
   srcFiles: string[];
   tier: 1 | 2 | 3;
-  // Human-curated, NOT derivable from git: the anti-cheat #9 sibling tests a person picked to guard
-  // against overfit. Absent on a fresh mine; preserved across re-mines by `preserveCuration`.
+  // Computed by `swe-bench-passtopass.ts` (the anti-cheat #9 sibling tests that pass at the fixed
+  // state C), NOT by this miner. Absent on a fresh mine; preserved across re-mines by
+  // `preservePassToPass` so a mine-only re-run doesn't drop it.
   passToPass?: string[];
 }
 
@@ -218,12 +219,17 @@ export const mineCorpus = ({
   return { valid, dropped };
 };
 
-// Carry human curation that lives ONLY in corpus.json (not git) from the existing corpus onto a
-// freshly-mined list, matched by full commit SHA. Re-mining regenerates the mechanical fields
-// (id/subject/kind/tier/files), but `passToPass` (anti-cheat #9) was hand-picked — without this a
-// re-mine would silently wipe it. A surviving task keeps its set; a new task stays bare (to curate);
-// a dropped commit is simply not carried. Unreadable/absent prior → emit the fresh mine untouched.
-export const preserveCuration = (tasks: Task[], existingCorpusJson: string | undefined): Task[] => {
+// Carry `passToPass` forward from the existing corpus onto a freshly-mined list, matched by full
+// commit SHA. Re-mining regenerates the mechanical fields (id/subject/kind/tier/files), but
+// `passToPass` (anti-cheat #9) is COMPUTED by a separate script — `swe-bench-passtopass.ts`, which
+// vets the sibling tests that pass at the fixed state C — not by this miner. Without carrying it
+// forward, a mine-only re-run would silently wipe the #9 gate; the authoritative refresh is re-running
+// passtopass. A surviving task keeps its set; a new task stays bare; a dropped commit is not carried.
+// Unreadable/absent prior → emit the fresh mine untouched.
+export const preservePassToPass = (
+  tasks: Task[],
+  existingCorpusJson: string | undefined,
+): Task[] => {
   if (existingCorpusJson === undefined) return tasks;
   let prior: unknown;
   try {
@@ -270,8 +276,9 @@ if (import.meta.main) {
   const corpusDir = join(repoRoot, 'evals', 'swe-bench');
   mkdirSync(corpusDir, { recursive: true });
   const corpusPath = join(corpusDir, 'corpus.json');
-  // Preserve hand-curated passToPass from the prior corpus so a re-mine doesn't wipe the #9 gate.
-  const merged = preserveCuration(
+  // Carry passToPass (computed by swe-bench-passtopass.ts) forward from the prior corpus so a
+  // mine-only re-run doesn't wipe the #9 gate; re-run passtopass to refresh it.
+  const merged = preservePassToPass(
     sorted,
     existsSync(corpusPath) ? readFileSync(corpusPath, 'utf8') : undefined,
   );
@@ -286,6 +293,6 @@ if (import.meta.main) {
     process.stderr.write(`  DROP ${d.sha.slice(0, 9)} ${d.subject.slice(0, 50)} — ${d.reason}\n`);
   }
   process.stderr.write(
-    `wrote ${merged.length} task(s) (${carried} with curated passToPass carried over) → evals/swe-bench/corpus.json\n`,
+    `wrote ${merged.length} task(s) (${carried} with passToPass carried over; re-run swe-bench-passtopass.ts to refresh) → evals/swe-bench/corpus.json\n`,
   );
 }
