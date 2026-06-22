@@ -12,7 +12,17 @@
 // cheat the verifier. All git work shells out to the host `git`; failures throw loudly (a
 // silent miss would make a task look like a model failure).
 
-import { copyFileSync, existsSync, lstatSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  copyFileSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { userInfo } from 'node:os';
 import { join } from 'node:path';
 
@@ -115,10 +125,32 @@ const extractArchive = (
 const isolatedDepsDir = (): string =>
   process.env.FORJA_SWE_DEPS_DIR ?? join(userInfo().homedir, '.cache', 'forja-swe-deps');
 
+// A content hash of the repo's package.json + bun.lock — the store's cache key. When a dependency
+// update changes either file the hash changes and the store is rebuilt (see ensureIsolatedDeps), so a
+// workspace never symlinks a stale dependency graph. Empty (no manifest) for a synthetic test repo.
+export const manifestHash = (repoRoot: string): string => {
+  const h = createHash('sha256');
+  for (const f of ['package.json', 'bun.lock']) {
+    const src = join(repoRoot, f);
+    if (existsSync(src)) h.update(readFileSync(src));
+  }
+  return h.digest('hex');
+};
+
 export const ensureIsolatedDeps = (repoRoot: string): string => {
   const root = isolatedDepsDir();
   const nm = join(root, 'node_modules');
-  if (existsSync(nm)) return nm; // built once, reused across tasks + runs
+  const hashFile = join(root, '.manifest-hash');
+  const want = manifestHash(repoRoot);
+  if (existsSync(nm)) {
+    // No manifest in the repo (a synthetic test workspace) → nothing can go stale; reuse the store.
+    // Otherwise reuse ONLY if it was built from the SAME package.json + bun.lock. A changed manifest
+    // (dep update) or a store predating this check (no recorded hash) is STALE → rebuild, so the old
+    // "reuse unconditionally" behaviour (stale deps until the cache was deleted by hand) can't recur.
+    if (!existsSync(join(repoRoot, 'package.json'))) return nm;
+    if (existsSync(hashFile) && readFileSync(hashFile, 'utf8') === want) return nm;
+  }
+  rmSync(root, { recursive: true, force: true }); // wipe a stale/partial store before rebuilding
   mkdirSync(root, { recursive: true });
   for (const f of ['package.json', 'bun.lock']) {
     const src = join(repoRoot, f);
@@ -137,6 +169,7 @@ export const ensureIsolatedDeps = (repoRoot: string): string => {
       `swe-bench: could not build isolated deps at ${root} (bun install --frozen-lockfile): ${r.stderr.toString().trim()}`,
     );
   }
+  writeFileSync(hashFile, want); // record the manifest this store was built from
   return nm;
 };
 

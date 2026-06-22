@@ -14,6 +14,7 @@ import { computePassToPass } from '../../scripts/swe-bench-passtopass.ts';
 import {
   ensureIsolatedDeps,
   gitToplevel,
+  manifestHash,
   materializeSweWorkspace,
   restoreSweTests,
   sweTestPaths,
@@ -195,6 +196,23 @@ describe('swe-bench workspace guards (synthetic repo)', () => {
     } finally {
       delete process.env.FORJA_SWE_DEPS_DIR;
     }
+  });
+
+  test('manifestHash changes when the manifest changes — the stale-store rebuild trigger', () => {
+    const repo = mkdtempSync(join(tmpdir(), 'swe-mf-'));
+    temps.push(repo);
+    writeFileSync(join(repo, 'package.json'), '{"name":"a","version":"0.0.0"}\n');
+    const base = manifestHash(repo);
+    expect(manifestHash(repo)).toBe(base); // deterministic for identical content
+
+    // A dependency update — package.json OR bun.lock changing — yields a different hash, so
+    // ensureIsolatedDeps rebuilds the store instead of reusing a stale dependency graph.
+    writeFileSync(join(repo, 'package.json'), '{"name":"b","version":"0.0.0"}\n');
+    const afterPkg = manifestHash(repo);
+    expect(afterPkg).not.toBe(base);
+
+    writeFileSync(join(repo, 'bun.lock'), '{ "lockfileVersion": 1 }\n');
+    expect(manifestHash(repo)).not.toBe(afterPkg); // bun.lock is part of the key too
   });
 
   test('gitToplevel throws outside a git repo', () => {
