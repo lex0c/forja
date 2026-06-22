@@ -16,9 +16,11 @@ import {
   type HarnessResult,
   runAgent,
 } from '../harness/index.ts';
+import { maybeWrapSandboxArgv } from '../permissions/sandbox-runner.ts';
 import { closeDb } from '../storage/db.ts';
 import { BUILTIN_TOOLS, createFetchUrlTool } from '../tools/builtin/index.ts';
 import { type ToolRegistry, createToolRegistry } from '../tools/index.ts';
+import { gitToplevel, materializeSweWorkspace, restoreSweTests } from './swe-bench/workspace.ts';
 import type {
   EvalCase,
   EvalCaseResult,
@@ -178,7 +180,14 @@ export const resolveEvalCacheRoot = (env: NodeJS.ProcessEnv, home: string): stri
 
 const EVAL_CACHE_ROOT = resolveEvalCacheRoot(process.env, homedir());
 
-const setupCwd = (caseDef: EvalCase): string => {
+interface SetupResult {
+  dir: string;
+  // Present only for `setup.swe` cases: restores the canonical test files from the fix commit
+  // (anti-cheat) — `executeCase` calls it after the agent runs, before the verifier.
+  sweRestore?: () => void;
+}
+
+const setupCwd = (caseDef: EvalCase): SetupResult => {
   try {
     mkdirSync(EVAL_CACHE_ROOT, { recursive: true });
   } catch (e) {
@@ -188,37 +197,48 @@ const setupCwd = (caseDef: EvalCase): string => {
     );
   }
   const dir = mkdtempSync(join(EVAL_CACHE_ROOT, 'case-'));
-  if (caseDef.setup?.fixture !== undefined) {
-    const caseDir = dirname(caseDef.sourcePath);
-    // Boundary: fixture must resolve under the parent of the
-    // case file's directory. Allows reaching sibling dirs
-    // (`../fixtures/foo` — our own smoke layout) but refuses
-    // climbing further (`../../..`) or jumping out entirely
-    // via absolute paths (`/etc`). Loader-level check rejects
-    // absolute paths at parse time; this guard catches `..`
-    // traversal escapes and protects programmatic EvalCase
-    // construction that bypasses the loader.
-    const boundary = dirname(caseDir);
-    const src = resolve(caseDir, caseDef.setup.fixture);
-    if (!containsPath(boundary, src)) {
-      throw new Error(
-        `eval setup.fixture '${caseDef.setup.fixture}' escapes the case boundary (${boundary})`,
-      );
-    }
-    if (!existsSync(src)) {
-      throw new Error(`fixture not found: ${src}`);
-    }
-    cpSync(src, dir, { recursive: true });
-  }
-  if (caseDef.setup?.files !== undefined) {
-    for (const [relPath, body] of Object.entries(caseDef.setup.files)) {
-      const target = resolve(dir, relPath);
-      if (!containsPath(dir, target)) {
-        throw new Error(`eval setup.files path '${relPath}' escapes the eval workspace`);
+  let sweRestore: (() => void) | undefined;
+  if (caseDef.setup?.swe !== undefined) {
+    // self-SWE-bench: the starting state IS the archived parent tree (+ failing test patch),
+    // so swe is mutually exclusive with fixture/files. The agent fixes src/; the canonical
+    // tests are restored before verifying (sweRestore).
+    const { commit } = caseDef.setup.swe;
+    const repoRoot = caseDef.setup.swe.repoRoot ?? gitToplevel(process.cwd());
+    const { testPaths } = materializeSweWorkspace({ commit, repoRoot, cwd: dir });
+    sweRestore = () => restoreSweTests({ commit, repoRoot, cwd: dir, testPaths });
+  } else {
+    if (caseDef.setup?.fixture !== undefined) {
+      const caseDir = dirname(caseDef.sourcePath);
+      // Boundary: fixture must resolve under the parent of the
+      // case file's directory. Allows reaching sibling dirs
+      // (`../fixtures/foo` — our own smoke layout) but refuses
+      // climbing further (`../../..`) or jumping out entirely
+      // via absolute paths (`/etc`). Loader-level check rejects
+      // absolute paths at parse time; this guard catches `..`
+      // traversal escapes and protects programmatic EvalCase
+      // construction that bypasses the loader.
+      const boundary = dirname(caseDir);
+      const src = resolve(caseDir, caseDef.setup.fixture);
+      if (!containsPath(boundary, src)) {
+        throw new Error(
+          `eval setup.fixture '${caseDef.setup.fixture}' escapes the case boundary (${boundary})`,
+        );
       }
-      const targetDir = dirname(target);
-      if (!existsSync(targetDir)) mkdirSync(targetDir, { recursive: true });
-      writeFileSync(target, body);
+      if (!existsSync(src)) {
+        throw new Error(`fixture not found: ${src}`);
+      }
+      cpSync(src, dir, { recursive: true });
+    }
+    if (caseDef.setup?.files !== undefined) {
+      for (const [relPath, body] of Object.entries(caseDef.setup.files)) {
+        const target = resolve(dir, relPath);
+        if (!containsPath(dir, target)) {
+          throw new Error(`eval setup.files path '${relPath}' escapes the eval workspace`);
+        }
+        const targetDir = dirname(target);
+        if (!existsSync(targetDir)) mkdirSync(targetDir, { recursive: true });
+        writeFileSync(target, body);
+      }
     }
   }
   // git work-tree init for tools that require a repo (git_apply_patch). Done
@@ -253,7 +273,7 @@ const setupCwd = (caseDef: EvalCase): string => {
     mkdirSync(join(dir, '.forja'), { recursive: true });
     writeFileSync(policyPath, DEFAULT_EVAL_POLICY_YAML);
   }
-  return dir;
+  return { dir, ...(sweRestore !== undefined ? { sweRestore } : {}) };
 };
 
 // `command_succeeds` default timeout — generous for `bun test <file>` + `bun run typecheck`
@@ -480,17 +500,26 @@ const evaluateExpectations = (
         // Runs AFTER the agent, in the workspace it edited. The command STRING is trusted
         // eval-author config — NEVER model-controlled, so `sh -c` carries no injection risk.
         // But the command EXECUTES the files in the workspace, which the agent (a model under
-        // eval) wrote, and this spawn is NOT sandboxed (test process, full ambient env). Fine
-        // for hermetic author-authored cases; the self-SWE-bench harness (which runs a model's
-        // edits) MUST sandbox this verifier — network off, cwd-rw, minimal env — before it
-        // points `bun test` at model-authored files (else: ACE on the eval host). See the
-        // self-SWE-bench entry in docs/TODO.md (Phase 1b security gate).
+        // eval) wrote. `sandboxed` wraps it in the `cwd-rw` profile (ro outside cwd, network
+        // off) so a self-SWE-bench verifier running model-authored code can't reach the host
+        // FS / network / keys — load-bearing there (else: ACE on the eval host). Hermetic
+        // author-authored commands leave it off.
         const timeoutMs = expectation.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
         try {
-          // Inside the try so `r` keeps the narrow `stdout:'pipe'` overload (stdout/stderr
-          // are Buffers, never undefined) — annotating it widens back to the union.
+          const innerArgv = ['sh', '-c', expectation.command];
+          // failClosed:true so a host with NO sandbox tool FAILS the verifier (caught below)
+          // instead of silently running model-authored code unsandboxed with the runner's full
+          // env/FS — the gate must not fail OPEN. With bwrap present, --clearenv + the
+          // SAFE_ENV_VARS allowlist drop *_KEY/*_TOKEN, so no separate env scrub is needed.
+          // The wrap is inside the try so a fail-closed throw fails THIS expectation, not the
+          // run; `r` declared here keeps the narrow `stdout:'pipe'` overload (Buffers, never
+          // undefined — annotating it widens back to the union).
+          const argv =
+            expectation.sandboxed === true
+              ? maybeWrapSandboxArgv({ profile: 'cwd-rw', cwd, innerArgv, failClosed: true })
+              : innerArgv;
           const r = Bun.spawnSync({
-            cmd: ['sh', '-c', expectation.command],
+            cmd: argv,
             cwd,
             timeout: timeoutMs,
             stdout: 'pipe',
@@ -515,8 +544,9 @@ const evaluateExpectations = (
             detail: `command '${expectation.command}' failed (${why})${logTail ? `\n${logTail}` : ''}`,
           };
         } catch (e) {
-          // The spawn could not START (e.g. no `sh` on PATH — a Windows host without Git
-          // Bash / WSL). Fail THIS expectation; don't let the throw crash the whole case.
+          // Either the spawn could not START (no `sh` on PATH — a Windows host without Git
+          // Bash / WSL) OR a `sandboxed` verifier failed closed (no sandbox tool on the host).
+          // Fail THIS expectation; don't let the throw crash the whole case.
           return {
             expectation,
             passed: false,
@@ -539,6 +569,9 @@ export const executeCase = async (
   let outputText = '';
 
   let cwd: string | undefined;
+  // self-SWE-bench anti-cheat: restores the canonical test files before the verifier (set by
+  // setupCwd only for swe cases). Undefined for every other case.
+  let sweRestore: (() => void) | undefined;
   let result: HarnessResult | undefined;
   let failure: string | undefined;
   // Captured from the resolved provider (config is scoped to the try below): an
@@ -580,7 +613,9 @@ export const executeCase = async (
   if (prevProfile !== undefined) delete process.env.FORJA_PROFILE;
 
   try {
-    cwd = setupCwd(caseDef);
+    const setup = setupCwd(caseDef);
+    cwd = setup.dir;
+    sweRestore = setup.sweRestore;
 
     const dbPath = join(cwd, '.forja-eval-sessions.db');
     const bootstrapInput: BootstrapInput = {
@@ -678,6 +713,17 @@ export const executeCase = async (
     options.signal?.removeEventListener('abort', onParentAbort);
     if (prevOpenaiReplay === undefined) delete process.env.FORJA_OPENAI_REASONING_REPLAY;
     if (prevProfile !== undefined) process.env.FORJA_PROFILE = prevProfile;
+  }
+
+  // self-SWE-bench anti-cheat: restore the canonical test files (discarding any agent edits to
+  // the oracle) AFTER the agent ran, BEFORE the verifier reads them. A throw here (e.g. the
+  // commit's tests vanished) fails the case rather than crashing the runner.
+  if (cwd !== undefined && failure === undefined && sweRestore !== undefined) {
+    try {
+      sweRestore();
+    } catch (e) {
+      failure = e instanceof Error ? e.message || e.name || String(e) : String(e);
+    }
   }
 
   // Evaluate expectations BEFORE cleanup so file_exists/file_contains

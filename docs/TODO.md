@@ -1867,14 +1867,32 @@ Forja's own repo. For a fix commit `C` with parent `P`:
 - **Deterministic tests only** (mock-based; most Forja tests are). Model non-determinism is
   the eval's inherent variance → repeats.
 - **Scope the verifier** to the specific test file, not the whole suite (speed).
-- **Sandbox the verifier** (Phase 1b, load-bearing). `command_succeeds` runs `sh -c <cmd>` in
-  the workspace UNSANDBOXED — test process, full ambient env. Fine for hermetic author-authored
-  cases, but here the command runs `bun test` over MODEL-authored files: an untrusted / third-
-  party model under eval can plant code the verifier then executes with the runner's privileges
-  (network, real `$HOME`, API keys in env) → arbitrary code execution + key exfil on the eval
-  host. The Phase-1b harness MUST wrap the verifier in the agent's sandbox profile (network off,
-  cwd-rw, ro elsewhere) + a minimal env. Until then, only point it at trusted models. (Surfaced
-  by code review of the `command_succeeds` primitive.)
+- **Sandbox the verifier** ✅ DONE. `command_succeeds { sandboxed: true }` wraps the verifier in
+  the `cwd-rw` profile (ro outside cwd, network off) with `failClosed: true` — a host with no
+  sandbox tool FAILS the verifier instead of running model-authored `bun test` with the runner's
+  env/FS. With bwrap present, `--clearenv` + `SAFE_ENV_VARS` drop `*_KEY`/`*_TOKEN`.
+
+**Anti-cheat gaps (Phase 2, load-bearing before any UNTRUSTED model runs).** A code-review pass on
+the Phase-1 machinery found cheat surfaces the test-file restore + sandboxed verifier do NOT close.
+The outcome IS the score, so each is a way to inflate the capability signal WITHOUT fixing the bug.
+Close before running the corpus on third-party models:
+
+- **Cut the AGENT's network.** The agent phase runs `mode: bypass` with network ON, and the corpus
+  is Forja's PUBLIC repo — a model can `curl` / `git clone` the gold `src/**` for commit `C` from
+  GitHub during its run (the `.git` exclusion is moot; the fix is one HTTPS request away).
+  Self-SWE-bench tasks MUST run the AGENT network-off (a cwd-rw, no-net agent profile), not just
+  the verifier.
+- **Broaden / freeze the restore.** `restoreSweTests` re-extracts only the `tests/**` files THIS
+  commit touched. Everything else in the tree is mutable and unrestored: `bunfig.toml`
+  (`[test].preload`), `tsconfig.json` (path remaps), `package.json`, and shared test helpers the
+  oracle imports but `C` didn't modify. A model can write a preload / remap / no-op helper so
+  `bun test <file>` passes with the bug unfixed. Restore (or read-only-freeze) the test-affecting
+  config + the full set of files the oracle transitively loads.
+- **PASS_TO_PASS + the visible-test caveat.** The verifier runs ONLY the one oracle file and the
+  oracle is VISIBLE in the workspace, so a model can hard-code the test's exact inputs (overfit)
+  with no regression check. Classic SWE-bench HIDES the test for this reason. Add a PASS_TO_PASS
+  sample (a few unrelated tests must still pass) and consider withholding the oracle from the agent
+  (give the failure output, not the file).
 
 **Prerequisite — ✅ DONE.** The `command_succeeds` expectation kind: runs an author-specified
 command in the workspace cwd after the agent, asserts exit 0, with a per-command timeout
@@ -1901,11 +1919,12 @@ it **generates tasks forever** (every future fix is a new task, automatically).
 
 **Phases.**
 
-1. `command_succeeds` (framework + test) ✅ DONE. Remaining 1b: **one** hand-wired commit from
-   this session (e.g. `8f6be12e` file_not_contains, or `e08f7df4` cost-cap — small, self-
-   contained) to prove the format end-to-end — the snapshot setup (`git archive P` + test patch
-   + node_modules symlink), the restore-test-patch anti-cheat, the SANDBOXED verifier (see the
-   gate), and verifier scoping. Surfaces the real problems on one task before scaling.
+1. ✅ DONE. `command_succeeds` (framework + test) + the `setup.swe` task machinery, proven
+   end-to-end on `0be3c4299` (wait_for IPv6): `git archive C^` + test patch + node_modules symlink
+   (`src/evals/swe-bench/workspace.ts`), restore-from-commit anti-cheat, the SANDBOXED verifier
+   (`command_succeeds { sandboxed: true }` → cwd-rw), verifier scoping. Surfaced + fixed the
+   restore mechanism (archive-from-commit, NOT re-apply-patch) and the shallow-clone gate (tests
+   skipIf the commit + parent are absent).
 2. Automate commit selection from git: scan commits, split by path, validate fail-to-pass,
    discard the invalid ones.
 3. Tier + wire into the ranking as the `capability` axis.

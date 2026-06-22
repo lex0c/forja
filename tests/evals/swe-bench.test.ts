@@ -1,0 +1,296 @@
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { executeCase } from '../../src/evals/executor.ts';
+import {
+  gitToplevel,
+  materializeSweWorkspace,
+  restoreSweTests,
+  sweTestPaths,
+} from '../../src/evals/swe-bench/workspace.ts';
+import type { EvalCase } from '../../src/evals/types.ts';
+import type { SandboxAvailability } from '../../src/permissions/sandbox-availability.ts';
+import type { Provider, StreamEvent } from '../../src/providers/index.ts';
+import { seedModelCatalog } from '../helpers/seed-catalog.ts';
+
+// The reference task: a small, deterministic born-with-tests fix. At C^+testPatch the gold test
+// FAILS (buggy src); with the gold src it PASSES — a real fail-to-pass.
+const COMMIT = '0be3c4299';
+const TEST_PATH = 'tests/tools/wait-for.test.ts';
+const SRC_PATH = 'src/tools/builtin/wait-for.ts';
+
+const repoRoot: string | null = (() => {
+  try {
+    return gitToplevel(process.cwd());
+  } catch {
+    return null;
+  }
+})();
+const REPO = repoRoot ?? '';
+
+const commitPresent = (ref: string): boolean =>
+  repoRoot !== null &&
+  Bun.spawnSync({
+    cmd: ['git', '-C', repoRoot, 'cat-file', '-e', `${ref}^{commit}`],
+    stdout: 'ignore',
+    stderr: 'ignore',
+  }).success;
+
+// Needs the commit AND its parent in history. A shallow CI clone (fetch-depth 1) has neither, so
+// the whole self-SWE-bench class skips there — the corpus requires full history.
+const CAN_RUN = commitPresent(COMMIT) && commitPresent(`${COMMIT}^`);
+
+if (!CAN_RUN) {
+  // Visible in CI logs so a shallow clone (which skips the history-dependent tests below) is
+  // not mistaken for "the self-SWE-bench path passed" — those tests were never exercised. The
+  // synthetic-repo guard tests below still run regardless of history.
+  console.error(
+    `[swe-bench tests] commit ${COMMIT} + parent absent (shallow clone?) — history-dependent tests SKIPPED; the e2e swe path was NOT exercised here.`,
+  );
+}
+
+const gitOut = (args: string[]): Buffer =>
+  Bun.spawnSync({ cmd: ['git', '-C', REPO, ...args], stdout: 'pipe', stderr: 'pipe' }).stdout;
+
+const waitForTestPasses = (cwd: string): boolean =>
+  Bun.spawnSync({ cmd: ['bun', 'test', TEST_PATH], cwd, stdout: 'ignore', stderr: 'ignore' })
+    .success;
+
+describe('swe-bench workspace (reference task 0be3c4299)', () => {
+  let work: string;
+  beforeEach(() => {
+    work = mkdtempSync(join(tmpdir(), 'swe-ws-'));
+  });
+  afterEach(() => {
+    rmSync(work, { recursive: true, force: true });
+  });
+
+  test.skipIf(!CAN_RUN)('sweTestPaths returns the tests/ files the commit touched', () => {
+    expect(sweTestPaths({ commit: COMMIT, repoRoot: REPO })).toContain(TEST_PATH);
+  });
+
+  test.skipIf(!CAN_RUN)(
+    'materialize → oracle fails; gold src → oracle passes; restore recovers a deleted oracle',
+    () => {
+      const { testPaths } = materializeSweWorkspace({ commit: COMMIT, repoRoot: REPO, cwd: work });
+      expect(testPaths).toContain(TEST_PATH);
+      // Step 1: the archived parent (buggy) src → the gold test FAILS.
+      expect(waitForTestPasses(work)).toBe(false);
+
+      // Apply the gold src (what the agent must reproduce by OUTCOME) → the test PASSES.
+      const applied = Bun.spawnSync({
+        cmd: ['git', 'apply'],
+        cwd: work,
+        stdin: gitOut(['diff', `${COMMIT}^`, COMMIT, '--', 'src/']),
+        stdout: 'ignore',
+        stderr: 'pipe',
+      });
+      expect(applied.success).toBe(true);
+      expect(waitForTestPasses(work)).toBe(true);
+
+      // Anti-cheat: a model that DELETES the oracle is defeated by restore-from-commit
+      // (re-applying the patch would fail here — the file is gone; archive-from-commit doesn't).
+      rmSync(join(work, TEST_PATH));
+      expect(existsSync(join(work, TEST_PATH))).toBe(false);
+      restoreSweTests({ commit: COMMIT, repoRoot: REPO, cwd: work, testPaths });
+      expect(existsSync(join(work, TEST_PATH))).toBe(true);
+      expect(waitForTestPasses(work)).toBe(true);
+    },
+  );
+});
+
+// --- e2e through executeCase (the setup.swe path): materialize → agent → restore → verify ---
+
+interface ScriptedStep {
+  text?: string;
+  tool_uses?: { id: string; name: string; input: Record<string, unknown> }[];
+}
+const replayStep = function* (step: ScriptedStep): Iterable<StreamEvent> {
+  yield { kind: 'start', message_id: `mock_${crypto.randomUUID()}` };
+  if (step.text !== undefined && step.text.length > 0)
+    yield { kind: 'text_delta', text: step.text };
+  for (const tu of step.tool_uses ?? []) {
+    yield { kind: 'tool_use_start', id: tu.id, name: tu.name };
+    yield { kind: 'tool_use_stop', id: tu.id, final_args: tu.input };
+  }
+  yield { kind: 'stop', reason: step.tool_uses?.length ? 'tool_use' : 'end_turn' };
+};
+const mockProvider = (script: ScriptedStep[]): Provider => {
+  let i = 0;
+  return {
+    id: 'mock/m',
+    family: 'anthropic',
+    capabilities: {
+      tools: 'native',
+      cache: false,
+      vision: false,
+      streaming: true,
+      constrained: 'tools',
+      context_window: 1000,
+      output_max_tokens: 100,
+      cost_per_1k_input: 0,
+      cost_per_1k_output: 0,
+      notes: [],
+    },
+    async *generate() {
+      const step = script[i++];
+      if (step === undefined) throw new Error('mock script exhausted');
+      for (const ev of replayStep(step)) yield ev;
+    },
+    generateConstrained: () => Promise.reject(new Error('n/a')),
+    countTokens: () => Promise.resolve(0),
+  };
+};
+// available:true keeps the default `allow` on write_file (a degraded boot downgrades it to
+// confirm → dead-ends as deny in headless evals, so the gold write wouldn't land).
+const HERMETIC_SANDBOX: SandboxAvailability = {
+  available: true,
+  tool: 'bwrap',
+  path: '/usr/bin/bwrap',
+  trustLevel: 'canonical',
+  reason: '',
+  trustWarnings: [],
+};
+
+describe('swe-bench executeCase e2e (reference task 0be3c4299)', () => {
+  let xdg: string | undefined;
+  let home: string | undefined;
+  let workdir: string;
+  beforeEach(() => {
+    workdir = mkdtempSync(join(tmpdir(), 'swe-e2e-'));
+    xdg = process.env.XDG_CONFIG_HOME;
+    home = process.env.HOME;
+    process.env.XDG_CONFIG_HOME = workdir;
+    process.env.HOME = workdir;
+    seedModelCatalog();
+  });
+  afterEach(() => {
+    rmSync(workdir, { recursive: true, force: true });
+    if (xdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = xdg;
+    if (home === undefined) delete process.env.HOME;
+    else process.env.HOME = home;
+  });
+
+  const sweCase = (): EvalCase => ({
+    name: 'swe wait-for ipv6',
+    sourcePath: '/tmp/swe.yaml',
+    prompt: 'This test fails. Fix the source so it passes, without editing the test.',
+    setup: { swe: { commit: COMMIT, repoRoot: REPO } },
+    // sandboxed: the verifier runs `bun test` over model-authored files (the Phase 1b gate).
+    expect: [
+      {
+        kind: 'command_succeeds',
+        command: `bun test ${TEST_PATH}`,
+        sandboxed: true,
+        timeoutMs: 120_000,
+      },
+    ],
+  });
+
+  test.skipIf(!CAN_RUN)('PASS: agent writes the gold src → outcome verifier passes', async () => {
+    const gold = gitOut(['show', `${COMMIT}:${SRC_PATH}`]).toString();
+    const r = await executeCase(sweCase(), {
+      bootstrapOverride: {
+        providerOverride: mockProvider([
+          {
+            text: 'fixing the IPv6 bracket bug',
+            tool_uses: [{ id: 't1', name: 'write_file', input: { path: SRC_PATH, content: gold } }],
+          },
+          { text: 'done' },
+        ]),
+        sandboxAvailabilityOverride: HERMETIC_SANDBOX,
+      },
+      perCaseTimeoutMs: 120_000,
+    });
+    expect(r.expectations[0]?.passed).toBe(true);
+    expect(r.passed).toBe(true);
+  });
+
+  test.skipIf(!CAN_RUN)('FAIL: agent does nothing → verifier fails (the bug remains)', async () => {
+    const r = await executeCase(sweCase(), {
+      bootstrapOverride: {
+        providerOverride: mockProvider([{ text: 'I changed nothing' }]),
+        sandboxAvailabilityOverride: HERMETIC_SANDBOX,
+      },
+      perCaseTimeoutMs: 120_000,
+    });
+    expect(r.expectations[0]?.passed).toBe(false);
+    expect(r.passed).toBe(false);
+  });
+});
+
+// --- workspace guards on a SYNTHETIC repo (no dependency on the running checkout's history, so
+//     these run even on a shallow CI clone — they cover the loud-failure guards the module
+//     advertises) ---
+
+describe('swe-bench workspace guards (synthetic repo)', () => {
+  const temps: string[] = [];
+  // Build a throwaway git repo from a list of commit snapshots ({ relpath: content }).
+  const makeRepo = (snapshots: Array<Record<string, string>>): { repo: string; head: string } => {
+    const repo = mkdtempSync(join(tmpdir(), 'swe-synth-'));
+    temps.push(repo);
+    const run = (args: string[]): void => {
+      const r = Bun.spawnSync({
+        cmd: ['git', '-C', repo, ...args],
+        stdout: 'ignore',
+        stderr: 'pipe',
+      });
+      if (!r.success) throw new Error(`git ${args.join(' ')}: ${r.stderr.toString()}`);
+    };
+    run(['init', '-q', '-b', 'main']);
+    run(['config', 'user.email', 'x@x']);
+    run(['config', 'user.name', 'x']);
+    snapshots.forEach((files, i) => {
+      for (const [p, body] of Object.entries(files)) {
+        const abs = join(repo, p);
+        mkdirSync(dirname(abs), { recursive: true });
+        writeFileSync(abs, body);
+      }
+      run(['add', '.']);
+      run(['commit', '-qm', `c${i}`]);
+    });
+    const head = Bun.spawnSync({ cmd: ['git', '-C', repo, 'rev-parse', 'HEAD'], stdout: 'pipe' })
+      .stdout.toString()
+      .trim();
+    return { repo, head };
+  };
+  afterEach(() => {
+    for (const t of temps.splice(0)) rmSync(t, { recursive: true, force: true });
+  });
+
+  test('sweTestPaths returns the tests/ files a fix commit touched', () => {
+    const { repo, head } = makeRepo([
+      { 'src/a.ts': 'export const a = 2;\n' },
+      { 'src/a.ts': 'export const a = 1;\n', 'tests/a.test.ts': '// oracle\n' },
+    ]);
+    expect(sweTestPaths({ commit: head, repoRoot: repo })).toEqual(['tests/a.test.ts']);
+  });
+
+  test('sweTestPaths throws when the commit touches no tests/ (not a born-with-tests fix)', () => {
+    const { repo, head } = makeRepo([
+      { 'src/a.ts': 'export const a = 2;\n' },
+      { 'src/a.ts': 'export const a = 1;\n' }, // src-only — no oracle
+    ]);
+    expect(() => sweTestPaths({ commit: head, repoRoot: repo })).toThrow(/touches no tests/);
+  });
+
+  test('materializeSweWorkspace throws a clear error when repoRoot has no node_modules', () => {
+    const { repo, head } = makeRepo([
+      { 'src/a.ts': 'export const a = 2;\n' },
+      { 'src/a.ts': 'export const a = 1;\n', 'tests/a.test.ts': '// oracle\n' },
+    ]);
+    const cwd = mkdtempSync(join(tmpdir(), 'swe-synth-cwd-'));
+    temps.push(cwd);
+    expect(() => materializeSweWorkspace({ commit: head, repoRoot: repo, cwd })).toThrow(
+      /node_modules/,
+    );
+  });
+
+  test('gitToplevel throws outside a git repo', () => {
+    const nongit = mkdtempSync(join(tmpdir(), 'swe-nongit-'));
+    temps.push(nongit);
+    expect(() => gitToplevel(nongit)).toThrow(/git toplevel/);
+  });
+});

@@ -41,6 +41,7 @@ const SETUP_KEYS: ReadonlySet<string> = new Set([
   'approvalPosture',
   'gitInit',
   'httpStub',
+  'swe',
 ]);
 
 const BUDGET_KEYS: ReadonlySet<string> = new Set([
@@ -171,6 +172,14 @@ const parseSetup = (raw: unknown): EvalSetup | undefined => {
     }
     setup.gitInit = r.gitInit;
   }
+  if (r.swe !== undefined) {
+    const swe = requireRecord(r.swe, 'setup.swe');
+    rejectUnknown(swe, new Set(['commit', 'repoRoot']), 'setup.swe');
+    setup.swe = { commit: requireString(swe.commit, 'setup.swe.commit') };
+    if (swe.repoRoot !== undefined) {
+      setup.swe.repoRoot = requireString(swe.repoRoot, 'setup.swe.repoRoot');
+    }
+  }
   if (r.approvalPosture !== undefined) {
     const p = requireString(r.approvalPosture, 'setup.approvalPosture');
     if (p !== 'supervised' && p !== 'autonomous') {
@@ -205,6 +214,14 @@ const parseSetup = (raw: unknown): EvalSetup | undefined => {
       out[url] = entry;
     }
     setup.httpStub = out;
+  }
+  // swe materializes the cwd from an archived commit tree, so it OWNS the starting state —
+  // fixture/files would be silently dropped by setupCwd's swe branch. Reject the combination
+  // loudly rather than let a case author believe their files landed.
+  if (setup.swe !== undefined && (setup.fixture !== undefined || setup.files !== undefined)) {
+    throw new Error(
+      'eval: setup.swe is mutually exclusive with setup.fixture / setup.files (a swe case starts from the archived commit tree)',
+    );
   }
   return setup;
 };
@@ -372,7 +389,11 @@ const parseExpectation = (raw: unknown, idx: number): EvalExpectation => {
     }
     case 'command_succeeds': {
       const cs = requireRecord(r.command_succeeds, `expect[${idx}].command_succeeds`);
-      rejectUnknown(cs, new Set(['command', 'timeout_ms']), `expect[${idx}].command_succeeds`);
+      rejectUnknown(
+        cs,
+        new Set(['command', 'timeout_ms', 'sandboxed']),
+        `expect[${idx}].command_succeeds`,
+      );
       const out: EvalExpectation = {
         kind,
         command: requireString(cs.command, `expect[${idx}].command_succeeds.command`),
@@ -385,6 +406,12 @@ const parseExpectation = (raw: unknown, idx: number): EvalExpectation => {
           );
         }
         out.timeoutMs = t;
+      }
+      if (cs.sandboxed !== undefined) {
+        if (typeof cs.sandboxed !== 'boolean') {
+          throw new Error(`eval: expect[${idx}].command_succeeds.sandboxed must be a boolean`);
+        }
+        out.sandboxed = cs.sandboxed;
       }
       return out;
     }
