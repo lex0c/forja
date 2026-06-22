@@ -18,7 +18,6 @@ import {
   restoreSweTests,
   sweTestPaths,
 } from '../../src/evals/swe-bench/workspace.ts';
-import { detectSandboxAvailability } from '../../src/permissions/sandbox-availability.ts';
 import { installSweDepsFixture } from '../helpers/swe-deps-fixture.ts';
 
 // The reference task: a small, deterministic born-with-tests fix. At C^+testPatch the gold test
@@ -46,10 +45,6 @@ const commitPresent = (ref: string): boolean =>
 // Needs the commit AND its parent in history. A shallow CI clone (fetch-depth 1) has neither, so
 // the whole self-SWE-bench class skips there — the corpus requires full history.
 const CAN_RUN = commitPresent(COMMIT) && commitPresent(`${COMMIT}^`);
-
-// computePassToPass vets siblings under the cwd-rw sandbox (failClosed), so it needs a working bwrap.
-// A CI host without one would drop every sibling — skip there rather than report a false failure.
-const HAS_SANDBOX = detectSandboxAvailability().available;
 
 if (!CAN_RUN) {
   // Visible in CI logs so a shallow clone (which skips the history-dependent tests below) is
@@ -242,34 +237,31 @@ describe('swe-bench workspace guards (synthetic repo)', () => {
 
   // Anti-cheat gate #9: computePassToPass mines sibling tests that pass at the FIXED state, so the
   // model's fix must keep them green — keeps the ones that pass, drops a sibling that fails.
-  test.skipIf(!HAS_SANDBOX)(
-    'computePassToPass keeps siblings passing at C and drops a failing one',
-    () => {
-      const mk = (name: string, expected: number): string =>
-        `import { test, expect } from 'bun:test';\nimport { x } from '../src/x.ts';\ntest('${name}', () => expect(x()).toBe(${expected}));\n`;
-      const { repo, head } = makeRepo([
-        { 'src/x.ts': 'export const x = () => 2;\n' }, // buggy parent
-        {
-          'src/x.ts': 'export const x = () => 1;\n', // gold fix
-          'tests/x.test.ts': mk('oracle', 1),
-          'tests/sib-ok.test.ts': mk('ok', 1), // passes at C → kept
-          'tests/sib-bad.test.ts': mk('bad', 999), // fails at C → dropped
-        },
-      ]);
-      mkdirSync(join(repo, 'node_modules'), { recursive: true }); // materialize guard (bun:test is builtin)
-      const p2p = computePassToPass({
-        task: {
-          id: head.slice(0, 9),
-          commit: head,
-          subject: '',
-          kind: 'bug',
-          testFiles: ['tests/x.test.ts'],
-          srcFiles: ['src/x.ts'],
-          tier: 1,
-        },
-        repoRoot: repo,
-      });
-      expect(p2p).toEqual(['tests/sib-ok.test.ts']);
-    },
-  );
+  test('computePassToPass keeps siblings passing at C and drops a failing one', () => {
+    const mk = (name: string, expected: number): string =>
+      `import { test, expect } from 'bun:test';\nimport { x } from '../src/x.ts';\ntest('${name}', () => expect(x()).toBe(${expected}));\n`;
+    const { repo, head } = makeRepo([
+      { 'src/x.ts': 'export const x = () => 2;\n' }, // buggy parent
+      {
+        'src/x.ts': 'export const x = () => 1;\n', // gold fix
+        'tests/x.test.ts': mk('oracle', 1),
+        'tests/sib-ok.test.ts': mk('ok', 1), // passes at C → kept
+        'tests/sib-bad.test.ts': mk('bad', 999), // fails at C → dropped
+      },
+    ]);
+    mkdirSync(join(repo, 'node_modules'), { recursive: true }); // materialize guard (bun:test is builtin)
+    const p2p = computePassToPass({
+      task: {
+        id: head.slice(0, 9),
+        commit: head,
+        subject: '',
+        kind: 'bug',
+        testFiles: ['tests/x.test.ts'],
+        srcFiles: ['src/x.ts'],
+        tier: 1,
+      },
+      repoRoot: repo,
+    });
+    expect(p2p).toEqual(['tests/sib-ok.test.ts']);
+  });
 });

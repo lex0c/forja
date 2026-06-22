@@ -1891,8 +1891,8 @@ Close before running the corpus on third-party models:
 - **PASS_TO_PASS** ✅ DONE (the regression half). Each corpus task carries `passToPass` = ≤3 sibling
   test files (same dir as the oracle) that pass at C, vetted under the runner's `cwd-rw` sandbox; the
   runner runs them as a second verifier and records `regressed` (oracle passed but a sibling broke).
-  `scripts/swe-bench-passtopass.ts` enriches the corpus. The siblings are same-DIR (broad/collateral)
-  — a same-`srcFiles` heuristic would tighten the overfit guard (follow-up).
+  `scripts/swe-bench-passtopass.ts` enriches the corpus, ranking siblings that import the changed
+  `srcFiles` FIRST (✅ the same-`srcFiles` heuristic — a tighter overfit guard than plain same-DIR).
 - **Withhold the visible oracle** ⏳ NOT done. The oracle is VISIBLE in the workspace, so a model can
   hard-code the test's exact inputs. Classic SWE-bench HIDES the test (gives only the failure output).
   A separate, bigger design change (the verifier needs the test, but the agent shouldn't see it).

@@ -6,7 +6,9 @@
 // the container — resolves the target host, so the task container needs no DNS of its own.
 //
 // Go (static binary, no runtime) for a long-running sidecar across a full bench run. Stdlib only.
-// Env: EGRESS_ALLOW (comma list, host or .suffix; default ollama.com), EGRESS_PORT (default 8889).
+// Only HTTPS (`CONNECT host:443`) to an allowlisted host is tunneled — any other port is refused.
+// Env: EGRESS_ALLOW (comma list, host or .suffix, case-insensitive; UNSET → dev default ollama.com,
+// SET-empty → deny all), EGRESS_PORT (the proxy's own listen port, default 8889).
 package main
 
 import (
@@ -20,7 +22,11 @@ import (
 )
 
 func allowed(host string, allow []string) bool {
+	// DNS hostnames are case-insensitive; a client that upper/mixed-cases the CONNECT authority must
+	// still match (else a legitimate target is wrongly 403'd — fail-closed, but a needless wedge).
+	host = strings.ToLower(host)
 	for _, a := range allow {
+		a = strings.ToLower(a)
 		if a != "" && (host == a || strings.HasSuffix(host, "."+a)) {
 			return true
 		}
@@ -30,7 +36,13 @@ func allowed(host string, allow []string) bool {
 
 func main() {
 	port := envOr("EGRESS_PORT", "8889")
-	allow := splitTrim(envOr("EGRESS_ALLOW", "ollama.com"))
+	// Empty `EGRESS_ALLOW=""` (set but blank) means DENY ALL — fail closed — NOT "fall back to the
+	// default". Only an UNSET var uses the dev default (the orchestrator always sets it explicitly).
+	allowSrc := "ollama.com"
+	if v, set := os.LookupEnv("EGRESS_ALLOW"); set {
+		allowSrc = v
+	}
+	allow := splitTrim(allowSrc)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodConnect {
@@ -50,7 +62,10 @@ func main() {
 		if err != nil {
 			return
 		}
-		if !allowed(r.URL.Hostname(), allow) {
+		// Gate the PORT too, not just the host: a CONNECT to an allowlisted host on ANY port would
+		// otherwise tunnel raw TCP to it. The bench needs only the model's HTTPS endpoint (:443).
+		host, connPort, splitErr := net.SplitHostPort(r.Host)
+		if splitErr != nil || connPort != "443" || !allowed(host, allow) {
 			log.Printf("DENY  %s", r.Host)
 			_, _ = client.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n"))
 			client.Close()

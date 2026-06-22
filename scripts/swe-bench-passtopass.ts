@@ -17,7 +17,6 @@ import {
   materializeSweWorkspace,
   restoreSweTests,
 } from '../src/evals/swe-bench/workspace.ts';
-import { maybeWrapSandboxArgv } from '../src/permissions/sandbox-runner.ts';
 
 interface Task {
   id: string;
@@ -81,24 +80,40 @@ export const computePassToPass = ({
       }
     }
 
-    const keep: string[] = [];
-    for (const c of candidates.slice(0, MAX_CANDIDATES)) {
-      if (keep.length >= MAX_KEEP) break;
-      // Vet the sibling EXACTLY as the runner's verifier will run it — sandboxed cwd-rw. A sibling
-      // that passes unsandboxed but fails under cwd-rw (needs network, or the masked /tmp) would
-      // otherwise false-regress every model run and corrupt the score.
-      let ok = false;
+    // Prefer siblings that exercise the CHANGED src (import one of task.srcFiles) — those actually
+    // catch an overfit fix that special-cases the oracle and corrupts the changed function. Plain
+    // lexicographic order can pick same-dir tests that never touch the changed code (the broad/
+    // collateral guard the TODO flags). Relevant first; the sort is stable so each group stays
+    // alphabetical, and a task with no relevant sibling falls back to the old behavior.
+    const srcStems = task.srcFiles.map((s) => s.replace(/\.ts$/, ''));
+    const touchesChangedSrc = (rel: string): boolean => {
       try {
-        const argv = maybeWrapSandboxArgv({
-          profile: 'cwd-rw',
-          cwd,
-          innerArgv: ['sh', '-c', `bun test ${c}`],
-          failClosed: true,
-        });
-        ok = Bun.spawnSync({ cmd: argv, cwd, stdout: 'ignore', stderr: 'ignore' }).success;
+        const body = readFileSync(join(cwd, rel), 'utf8');
+        return srcStems.some((stem) => body.includes(stem));
       } catch {
-        ok = false;
+        return false;
       }
+    };
+    const ranked = candidates
+      .map((rel) => ({ rel, relevant: touchesChangedSrc(rel) }))
+      .sort((a, b) => Number(b.relevant) - Number(a.relevant))
+      .map((s) => s.rel);
+
+    const keep: string[] = [];
+    for (const c of ranked.slice(0, MAX_CANDIDATES)) {
+      if (keep.length >= MAX_KEEP) break;
+      // Run the sibling exactly as the Docker verifier will — plain `bun test` (the verifier runs
+      // unsandboxed INSIDE the container; the container IS the boundary). The sibling here is C's own
+      // TRUSTED test, not model-authored, so no host sandbox is needed. The old host-bwrap `cwd-rw`
+      // vetting both mismatched the container env (host bwrap ≠ Docker → false-regress) AND, where
+      // bwrap is absent (CI, or inside Docker), silently dropped EVERY sibling — the failClosed throw
+      // was swallowed by the inner catch, turning the #9 guard into a silent no-op.
+      const ok = Bun.spawnSync({
+        cmd: ['bun', 'test', c],
+        cwd,
+        stdout: 'ignore',
+        stderr: 'ignore',
+      }).success;
       if (ok) keep.push(c);
     }
     return keep;
