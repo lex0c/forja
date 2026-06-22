@@ -1,10 +1,19 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { computePassToPass } from '../../scripts/swe-bench-passtopass.ts';
 import { executeCase } from '../../src/evals/executor.ts';
 import {
+  ensureIsolatedDeps,
   gitToplevel,
   materializeSweWorkspace,
   restoreSweTests,
@@ -99,6 +108,18 @@ describe('swe-bench workspace (reference task 0be3c4299)', () => {
       expect(waitForTestPasses(work)).toBe(true);
     },
   );
+
+  // Anti-cheat: node_modules must NOT symlink to repoRoot/node_modules — that made `node_modules/..`
+  // a back-door to the live `.git` (`git show <C>` = the gold fix), corpus.json (the srcFiles), and
+  // the changelog, defeating the bench even with the network cut.
+  test.skipIf(!CAN_RUN)('node_modules does not back-door to the answer repo', () => {
+    materializeSweWorkspace({ commit: COMMIT, repoRoot: REPO, cwd: work });
+    expect(readlinkSync(join(work, 'node_modules')).startsWith(`${REPO}/`)).toBe(false);
+    // String paths (not join, which collapses `..` lexically) so the FS follows the symlink.
+    expect(existsSync(`${work}/node_modules/../.git`)).toBe(false);
+    expect(existsSync(`${work}/node_modules/../evals`)).toBe(false);
+    expect(existsSync(`${work}/node_modules/../docs`)).toBe(false);
+  });
 });
 
 // --- e2e through executeCase (the setup.swe path): materialize → agent → restore → verify ---
@@ -318,16 +339,26 @@ describe('swe-bench workspace guards (synthetic repo)', () => {
     expect(() => sweTestPaths({ commit: head, repoRoot: repo })).toThrow(/touches no tests/);
   });
 
-  test('materializeSweWorkspace throws a clear error when repoRoot has no node_modules', () => {
-    const { repo, head } = makeRepo([
+  test('ensureIsolatedDeps resolves node_modules outside the answer repo', () => {
+    // The deps store is built once OUTSIDE repoRoot, so the workspace's node_modules symlink can't be
+    // traversed (`node_modules/..`) back to the answer repo's .git/corpus/changelog — the back-door
+    // the old symlink-straight-to-repoRoot/node_modules opened (git show <C> = the gold fix).
+    const store = mkdtempSync(join(tmpdir(), 'swe-deps-'));
+    temps.push(store);
+    mkdirSync(join(store, 'node_modules'), { recursive: true }); // pretend the once-built store exists
+    const { repo } = makeRepo([
       { 'src/a.ts': 'export const a = 2;\n' },
       { 'src/a.ts': 'export const a = 1;\n', 'tests/a.test.ts': '// oracle\n' },
     ]);
-    const cwd = mkdtempSync(join(tmpdir(), 'swe-synth-cwd-'));
-    temps.push(cwd);
-    expect(() => materializeSweWorkspace({ commit: head, repoRoot: repo, cwd })).toThrow(
-      /node_modules/,
-    );
+    process.env.FORJA_SWE_DEPS_DIR = store;
+    try {
+      const nm = ensureIsolatedDeps(repo);
+      expect(nm).toBe(join(store, 'node_modules'));
+      expect(nm.startsWith(repo)).toBe(false);
+      expect(existsSync(join(nm, '..', '.git'))).toBe(false);
+    } finally {
+      delete process.env.FORJA_SWE_DEPS_DIR;
+    }
   });
 
   test('gitToplevel throws outside a git repo', () => {

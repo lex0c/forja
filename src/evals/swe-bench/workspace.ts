@@ -12,7 +12,8 @@
 // cheat the verifier. All git work shells out to the host `git`; failures throw loudly (a
 // silent miss would make a task look like a model failure).
 
-import { existsSync, lstatSync, rmSync, symlinkSync } from 'node:fs';
+import { copyFileSync, existsSync, lstatSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
+import { userInfo } from 'node:os';
 import { join } from 'node:path';
 
 export interface SweWorkspaceSpec {
@@ -102,6 +103,43 @@ const extractArchive = (
   pipeInto(archive, ['tar', '-x', '-C', cwd], cwd, label);
 };
 
+// A node_modules store OUTSIDE the answer repo. The workspace's node_modules used to symlink
+// straight to `repoRoot/node_modules`, so a model could read `node_modules/../.git` (`git show <C>`
+// = the gold fix), `node_modules/../evals/swe-bench/corpus.json` (the task's srcFiles), or the
+// changelog — defeating the anti-cheat even with the network cut. Pointing node_modules at an
+// isolated store (built once from the repo's manifest + lockfile, offline from the warm global bun
+// cache) means `node_modules/..` reaches only the store (package.json/bun.lock/node_modules).
+// The REAL user home (userInfo, not $HOME) so the store is stable across eval cases that override
+// HOME to a temp dir — they reuse the once-built deps instead of triggering an offline bun install.
+// $FORJA_SWE_DEPS_DIR overrides the location (tests point it at a fixture store; CI can pin it).
+const isolatedDepsDir = (): string =>
+  process.env.FORJA_SWE_DEPS_DIR ?? join(userInfo().homedir, '.cache', 'forja-swe-deps');
+
+export const ensureIsolatedDeps = (repoRoot: string): string => {
+  const root = isolatedDepsDir();
+  const nm = join(root, 'node_modules');
+  if (existsSync(nm)) return nm; // built once, reused across tasks + runs
+  mkdirSync(root, { recursive: true });
+  for (const f of ['package.json', 'bun.lock']) {
+    const src = join(repoRoot, f);
+    if (existsSync(src)) copyFileSync(src, join(root, f));
+  }
+  // Reproduce the repo's deps from its lockfile, offline (the repo already installed → the global
+  // bun cache is warm). The store holds ONLY the manifest + lockfile + node_modules — no repo.
+  const r = Bun.spawnSync({
+    cmd: ['bun', 'install', '--frozen-lockfile'],
+    cwd: root,
+    stdout: 'ignore',
+    stderr: 'pipe',
+  });
+  if (!r.success || !existsSync(nm)) {
+    throw new Error(
+      `swe-bench: could not build isolated deps at ${root} (bun install --frozen-lockfile): ${r.stderr.toString().trim()}`,
+    );
+  }
+  return nm;
+};
+
 // Materialize the task workspace: parent tree (no .git) + failing test patch + node_modules.
 // Returns the test paths so the caller can scope the verifier and the post-run restore.
 export const materializeSweWorkspace = ({
@@ -128,15 +166,11 @@ export const materializeSweWorkspace = ({
   const testPatch = git(repoRoot, ['diff', `${commit}^`, commit, '--', 'tests/']);
   pipeInto(testPatch, ['git', 'apply'], cwd, `apply test patch for ${commit}`);
 
-  // 3. symlink node_modules (don't reinstall per task). Assert the target exists first — a
-  //    dangling link surfaces as opaque module-resolution errors in the verifier, not a clear
-  //    "install deps".
-  const target = join(repoRoot, 'node_modules');
-  if (!existsSync(target)) {
-    throw new Error(
-      `swe-bench: ${target} does not exist — run \`bun install\` in the repo before materializing a task`,
-    );
-  }
+  // 3. symlink node_modules to the ISOLATED deps store, NOT repoRoot/node_modules — an absolute
+  //    symlink to the repo's node_modules made `node_modules/..` a back-door to the live `.git`
+  //    (`git show <C>` = the gold fix), corpus.json (the srcFiles), and the changelog, defeating
+  //    the anti-cheat even with the network cut. The store's parent holds only deps.
+  const target = ensureIsolatedDeps(repoRoot);
   const nm = join(cwd, 'node_modules');
   // lstatSync (not existsSync) so an EXISTING link — even a dangling one — is detected;
   // existsSync follows the link and would miss a dangling one, then symlinkSync throws EEXIST.
