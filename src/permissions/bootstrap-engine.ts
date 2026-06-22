@@ -78,6 +78,12 @@ export interface BootstrapPermissionEngineInput {
     // When true, the engine prunes the network profile so any net-egress call refuses
     // (self-SWE-bench runs the agent network-off so it can't fetch the gold). Default off.
     denyNetwork?: boolean;
+    // Gate 2 of the `host` profile (SECURITY.md §4.1/§4.7): when true, the
+    // engine injects the `host-passthrough` sentinel into the planner's
+    // capability set, making `host` selectable when gate 1
+    // (`hostExplicitlyAllowed`) is ALSO set. Sourced from the operator's
+    // `--i-know-what-im-doing` opt-in. Default off ⇒ `host` stays pruned.
+    emitHostPassthrough?: boolean;
     // Resolver's trust marker so bootstrap can emit a
     // `sandbox.path_resolved` failure_event when the sandbox tool
     // was resolved via $PATH (non-canonical install). Optional for
@@ -670,7 +676,22 @@ export const bootstrapPermissionEngine = async (
     }
   }
 
-  if (sandbox !== undefined && !sandbox.available) {
+  // The operator's explicit two-gate opt-in to run UNSANDBOXED (`--sandbox-host` AND the
+  // `--i-know-what-im-doing` host-passthrough sentinel) is an INTENTIONAL choice, not a degradation.
+  // A container/CI that already provides isolation has no bwrap; the operator accepts that and asks
+  // for the `host` passthrough profile. Without this carve-out the boot transition below fires
+  // `degraded` (every would-be allow → confirm) BEFORE the §6.5 per-call planner ever runs, so the
+  // host profile the planner would pick is moot and a headless agent dead-ends on un-answerable
+  // confirms. In lenient mode the opt-in stays `ready` and lets the planner select `host` (audited
+  // as sandbox_profile=host). A policy that REQUIRES a sandbox still wins — the operator flag below
+  // cannot override `sandbox.required` (that path falls through to `refusing`).
+  const hostPassthroughOptIn =
+    sandbox !== undefined &&
+    sandbox.required === false &&
+    sandbox.hostExplicitlyAllowed === true &&
+    sandbox.emitHostPassthrough === true;
+
+  if (sandbox !== undefined && !sandbox.available && !hostPassthroughOptIn) {
     // Structured failure_event so ops queries can answer "which
     // sessions booted without sandbox tooling?" without parsing
     // stderr. recovery_action reflects the state-machine branch

@@ -10,6 +10,7 @@ import {
   type CapabilityKind,
   effectiveCovers,
   formatCapability,
+  hostPassthrough,
   sortCapabilities,
 } from './capabilities.ts';
 import {
@@ -219,6 +220,20 @@ export interface EngineOptions {
   //   - `required`: policy demands a viable sandbox plan; when no
   //     profile covers, refuse the call AND (at bootstrap) refuse
   //     the engine if availability is false. Default false.
+  //   - `emitHostPassthrough`: GATE 2 of the `host` profile (SECURITY.md
+  //     §4.1/§4.7). The `host` (passthrough) profile is selectable only
+  //     when BOTH (a) `hostExplicitlyAllowed` is set (gate 1, the
+  //     `--sandbox-host` flag) AND (b) the resolved capability set carries
+  //     a `host-passthrough` sentinel. No resolver emits that sentinel —
+  //     it is injected HERE, and only when the operator opted in via
+  //     `--i-know-what-im-doing` ("I really want to run unsandboxed").
+  //     This is the sole emitter of the sentinel; without it the `host`
+  //     profile is always pruned (the planner's gate-2 check can never be
+  //     satisfied). Kept independent from gate 1 so neither flag alone
+  //     unlocks passthrough. Planner-scoped: the sentinel is added to the
+  //     capabilities FED TO `selectSandboxProfile`, NOT to the resolved
+  //     set the audit row / risk score / subagent-envelope stages read.
+  //     Default off ⇒ `host` stays unreachable.
   sandbox?: {
     available: boolean;
     hostExplicitlyAllowed: boolean;
@@ -226,6 +241,7 @@ export interface EngineOptions {
     // When true, prune the network profile so any net-egress call refuses (self-SWE-bench runs
     // the agent network-off — see SelectSandboxProfileOptions.denyNetwork). Default off.
     denyNetwork?: boolean;
+    emitHostPassthrough?: boolean;
   };
   // Optional grants snapshot provider. Engine calls
   // `listActive(Date.now())` on each `check()` so long-running
@@ -2132,8 +2148,23 @@ export const createPermissionEngine = (
     let sandboxProfile: string | null = null;
     let sandboxStage: ReasonChainEntry | null = null;
     if (sandboxOptions !== undefined) {
+      // Gate 2 of the `host` profile (SECURITY.md §4.1/§4.7): inject the
+      // `host-passthrough` sentinel into the capabilities FED TO the
+      // planner — and ONLY here, only under the explicit operator opt-in
+      // (`--i-know-what-im-doing`, threaded as `emitHostPassthrough`). No
+      // resolver emits this sentinel, so without the opt-in `host` is
+      // always pruned (gate-2 unsatisfiable). Kept independent from gate 1
+      // (`hostExplicitlyAllowed` / `--sandbox-host`): the planner ANDs the
+      // two, so one flag alone never unlocks passthrough. Scoped to the
+      // planner input — `resolvedCapabilities` (which the audit row, risk
+      // score, and subagent-envelope stages read) is left untouched, so
+      // the sentinel never inflates those surfaces.
+      const planCapabilities =
+        sandboxOptions.emitHostPassthrough === true
+          ? [...resolvedCapabilities, hostPassthrough()]
+          : resolvedCapabilities;
       const planResult = selectSandboxProfile({
-        capabilities: resolvedCapabilities,
+        capabilities: planCapabilities,
         hostExplicitlyAllowed: sandboxOptions.hostExplicitlyAllowed,
         ...(sandboxOptions.denyNetwork === true ? { denyNetwork: true } : {}),
       });

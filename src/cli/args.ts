@@ -87,15 +87,20 @@ export interface ParsedArgs {
   // bootstrap surfaces a clear error if the worker source isn't
   // on disk.
   brokerMode?: 'in-process' | 'spawn';
-  // §13.5 first-boot UX (slice 91). When set, the welcome /
-  // sandbox-setup flow creates `~/.config/forja/sandbox_skip`
-  // (if not already present) AND skips the re-prompt for this
-  // run. Subsequent sessions see the marker + skip the prompt
-  // entirely. The spec calls this the "silent skip" gate that's
-  // intentionally hard to engage: the long flag name signals
-  // intent unambiguously; no short form. Operator-facing UX
-  // ONLY — does NOT bypass any policy / permission / sandbox
-  // enforcement at runtime.
+  // Explicit "I really want to run unsandboxed" opt-in. Two roles,
+  // disambiguated by invocation:
+  //   1. `forja welcome --i-know-what-im-doing` (§13.5 first-boot UX,
+  //      slice 91) — creates `~/.config/forja/sandbox_skip` and skips the
+  //      sandbox-setup re-prompt. This is the operator-facing UX marker;
+  //      it does NOT itself bypass runtime enforcement.
+  //   2. `forja --i-know-what-im-doing <prompt>` (agent run) — GATE 2 of
+  //      the `host` sandbox profile (SECURITY.md §4.1/§4.7). Combined with
+  //      `--sandbox-host` (gate 1), it makes the engine inject the
+  //      `host-passthrough` sentinel so tools run unsandboxed. This DOES
+  //      change runtime profile selection; it is the deliberate escape
+  //      hatch for environments where the sandbox can't run.
+  // The long flag name (no short form) signals intent unambiguously in
+  // both roles.
   iKnowWhatImDoing?: boolean;
   // Undo mode (AGENTIC_CLI §12 / CHECKPOINTS.md §2.3). Restores
   // the latest checkpoint of the named session. Same semantics as
@@ -1715,19 +1720,23 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         break;
       }
       case '--i-know-what-im-doing':
-        // Slice 123 (R9 P1): pre-slice this case silently accepted
-        // the flag at the top level, but `args.iKnowWhatImDoing` is
-        // only ever read inside the `args.welcome === true` branch
-        // in `run.ts` — so `forja --i-know-what-im-doing` (without
-        // the `welcome` verb) parsed successfully and did nothing.
-        // Now it's rejected with a pointer to the correct invocation
-        // so operators don't silently no-op their unsafe-mode
-        // acknowledgment.
-        return {
-          ok: false,
-          message:
-            '--i-know-what-im-doing is only valid as a flag of `forja welcome`; use `forja welcome --i-know-what-im-doing`',
-        };
+        // Slice 123 (R9 P1) originally REJECTED this at the top level
+        // because `args.iKnowWhatImDoing` was read only inside the
+        // `args.welcome === true` branch — so a bare
+        // `forja --i-know-what-im-doing` parsed but did nothing.
+        // It is now load-bearing for the agent run: it is GATE 2 of the
+        // `host` sandbox profile (SECURITY.md §4.1/§4.7, "I really want to
+        // run unsandboxed"). Paired with `--sandbox-host` (gate 1), it
+        // makes the engine inject the `host-passthrough` sentinel so tools
+        // run unsandboxed — the escape hatch for environments where bwrap
+        // can't run (e.g. inside a container) and the default degraded
+        // mode would otherwise confirm every call. So the top-level flag
+        // is accepted and threaded through `operatorBootstrapFlags`. The
+        // `forja welcome --i-know-what-im-doing` form still parses
+        // independently in `parseWelcomeSubcommand` (argv[0]==='welcome').
+        args.iKnowWhatImDoing = true;
+        i += 1;
+        break;
       case '--undo': {
         const value = argv[i + 1];
         if (value === undefined || value.startsWith('--')) {

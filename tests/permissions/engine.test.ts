@@ -3622,6 +3622,153 @@ describe('engine — Decision.sandboxProfile (§6.5 runtime wire-up, slice 19)',
   });
 });
 
+// Two-gate `host` profile wiring (SECURITY.md §4.1/§4.7). The planner's
+// host gates (§6.5) are unit-tested directly in sandbox-plan.test.ts;
+// these tests prove the ENGINE-level emitter: `host` is reachable ONLY
+// when BOTH gates hold — gate 1 `hostExplicitlyAllowed` (the
+// `--sandbox-host` flag) AND gate 2 `emitHostPassthrough` (the
+// `--i-know-what-im-doing` opt-in that injects the `host-passthrough`
+// sentinel the planner requires). No resolver emits that sentinel, so
+// before this wiring the `host` profile was unreachable by construction.
+describe('engine — host profile two-gate wiring (SECURITY.md §4.1/§4.7)', () => {
+  const PROJ = '/work/proj';
+
+  // Captures the audited capabilities + score so the leak test can assert
+  // the sentinel never inflates the resolved set the audit/risk surfaces
+  // read.
+  interface CapturedEmit {
+    decision: 'allow' | 'deny' | 'confirm';
+    sandbox_profile?: string | null;
+    capabilities: readonly string[];
+    score: number;
+    reason_chain: ReadonlyArray<{ stage: string; note?: string }>;
+  }
+  const captureSink = (collected: CapturedEmit[]) => ({
+    emit(input: CapturedEmit) {
+      collected.push(input);
+      return { seq: collected.length, this_hash: `fake-${collected.length}` };
+    },
+    verifyChain() {
+      return {
+        ok: true as const,
+        rows: collected.length,
+        current_rotation_id: 0,
+        quarantined: false,
+      };
+    },
+  });
+
+  // (a) BOTH gates → host is selectable (gate 1) AND covered (gate 2);
+  // it is chosen because nothing else covers `host-passthrough`.
+  test('both gates present → host selected', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls*'] } } }), {
+      cwd: PROJ,
+      sandbox: {
+        available: true,
+        hostExplicitlyAllowed: true,
+        required: false,
+        emitHostPassthrough: true,
+      },
+    });
+    const d = eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(d.sandboxProfile).toBe('host');
+  });
+
+  // (b) Gate 1 only (`--sandbox-host`, no opt-in) → no sentinel emitted →
+  // gate 2 unsatisfiable → host pruned → falls to the restrictive profile.
+  test('only --sandbox-host (no opt-in) → host pruned, restrictive profile chosen', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls*'] } } }), {
+      cwd: PROJ,
+      sandbox: { available: true, hostExplicitlyAllowed: true, required: false },
+    });
+    const d = eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(d.sandboxProfile).not.toBe('host');
+    expect(d.sandboxProfile).toBe('ro');
+  });
+
+  // (c) Gate 2 only (opt-in, no `--sandbox-host`) → sentinel IS in the
+  // planner set but gate 1 absent → host not selectable → host pruned.
+  // The sentinel kind is covered ONLY by host, so with host pruned the
+  // plan refuses (`no_viable_sandbox`) — host never silently downgrades
+  // to a restricted profile when the opt-in alone was passed.
+  test('only opt-in (no --sandbox-host) → host pruned (refuse, never host)', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls*'] } } }), {
+      cwd: PROJ,
+      audit: captureSink(collected),
+      sandbox: {
+        available: true,
+        hostExplicitlyAllowed: false,
+        required: false,
+        emitHostPassthrough: true,
+      },
+    });
+    const d = eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(d.kind).toBe('deny');
+    expect(d.sandboxProfile).toBeUndefined();
+    expect(collected[0]?.sandbox_profile).toBeNull();
+    const planEntry = collected[0]?.reason_chain.find((e) => e.stage === 'sandbox-plan');
+    expect(planEntry?.note).toContain('no_viable_sandbox');
+  });
+
+  // (d) Neither gate → ordinary restrictive selection, host never appears.
+  test('neither gate → host pruned, ro chosen', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls*'] } } }), {
+      cwd: PROJ,
+      sandbox: { available: true, hostExplicitlyAllowed: false, required: false },
+    });
+    const d = eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(d.sandboxProfile).toBe('ro');
+  });
+
+  // The sentinel is a PLANNER-only injection: it must NOT appear in the
+  // audited resolved capabilities (which feed risk score, the subagent
+  // envelope, and the audit row). A bare `ls` resolves to read-fs+exec;
+  // host-passthrough must be absent from the recorded set even with both
+  // gates on. (Score parity is the observable proxy for "risk surface
+  // untouched" — host-passthrough is not a scored kind, but asserting the
+  // string's absence pins the contract.)
+  test('host-passthrough sentinel never leaks into the audited capability set', () => {
+    const withGates: CapturedEmit[] = [];
+    const engGated = createPermissionEngine(policy({ tools: { bash: { allow: ['ls*'] } } }), {
+      cwd: PROJ,
+      audit: captureSink(withGates),
+      sandbox: {
+        available: true,
+        hostExplicitlyAllowed: true,
+        required: false,
+        emitHostPassthrough: true,
+      },
+    });
+    engGated.check('bash', 'bash', { command: 'ls -la' });
+    expect(withGates[0]?.capabilities).not.toContain('host-passthrough');
+
+    // And the audited capabilities are identical to a run WITHOUT the
+    // opt-in (same resolver output; the injection only reached the planner).
+    const noGate: CapturedEmit[] = [];
+    const engPlain = createPermissionEngine(policy({ tools: { bash: { allow: ['ls*'] } } }), {
+      cwd: PROJ,
+      audit: captureSink(noGate),
+      sandbox: { available: true, hostExplicitlyAllowed: true, required: false },
+    });
+    engPlain.check('bash', 'bash', { command: 'ls -la' });
+    expect([...(withGates[0]?.capabilities ?? [])].sort()).toEqual(
+      [...(noGate[0]?.capabilities ?? [])].sort(),
+    );
+  });
+
+  // A normal run (no sandbox option at all) is unaffected — the opt-in is
+  // the ONLY path to the sentinel, and it requires the sandbox stage.
+  test('opt-in absent everywhere → a plain read-only call still lands ro', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls*'] } } }), {
+      cwd: PROJ,
+      sandbox: { available: true, hostExplicitlyAllowed: true, required: false },
+    });
+    const d = eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(d.sandboxProfile).toBe('ro');
+  });
+});
+
 describe('engine.check — §8 grants (slice 40)', () => {
   // Helper builds a minimal grants provider returning a fixed snapshot.
   // The engine calls `listActive(Date.now())` on each check; the test

@@ -267,6 +267,93 @@ describe('bootstrap', () => {
     db.close();
   });
 
+  // Two-gate `host` profile end-to-end (SECURITY.md §4.1/§4.7). Proves the
+  // BootstrapInput flags reach the engine's planner: `host` is selected
+  // ONLY when BOTH `--sandbox-host` (gate 1 → hostExplicitlyAllowed) AND
+  // `--i-know-what-im-doing` (gate 2 → emitHostPassthrough, the sentinel)
+  // are passed. A pinned availability override keeps the engine `ready` on
+  // CI hosts without bwrap so the planner runs (sandboxProfile is attached
+  // to the decision regardless of the scaffolded policy's allow/deny).
+  describe('host passthrough opt-in (--sandbox-host + --i-know-what-im-doing)', () => {
+    const availableSandbox = {
+      available: true as const,
+      tool: 'bwrap' as const,
+      path: '/usr/bin/bwrap',
+      trustLevel: 'canonical' as const,
+      reason: '',
+      trustWarnings: [] as readonly string[],
+    };
+
+    test('both flags → engine selects host for a tool call', async () => {
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        sandboxHost: true,
+        iKnowWhatImDoing: true,
+        sandboxAvailabilityOverride: availableSandbox,
+      });
+      const d = config.permissionEngine.check('bash', 'bash', { command: 'ls -la' });
+      expect(d.sandboxProfile).toBe('host');
+      db.close();
+    });
+
+    test('only --sandbox-host (no opt-in) → host pruned, restrictive profile', async () => {
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        sandboxHost: true,
+        sandboxAvailabilityOverride: availableSandbox,
+      });
+      const d = config.permissionEngine.check('bash', 'bash', { command: 'ls -la' });
+      expect(d.sandboxProfile).not.toBe('host');
+      expect(d.sandboxProfile).toBe('ro');
+      db.close();
+    });
+
+    test('only --i-know-what-im-doing (no --sandbox-host) → host pruned (refuse)', async () => {
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        iKnowWhatImDoing: true,
+        sandboxAvailabilityOverride: availableSandbox,
+      });
+      // Gate 1 absent: the sentinel is in the planner set but host is not
+      // selectable; the sentinel kind is covered only by host → no_viable_
+      // sandbox. The call denies and carries no host profile.
+      const d = config.permissionEngine.check('bash', 'bash', { command: 'ls -la' });
+      expect(d.kind).toBe('deny');
+      expect(d.sandboxProfile).not.toBe('host');
+      db.close();
+    });
+
+    test('neither flag → host never selected (ro)', async () => {
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        sandboxAvailabilityOverride: availableSandbox,
+      });
+      const d = config.permissionEngine.check('bash', 'bash', { command: 'ls -la' });
+      expect(d.sandboxProfile).toBe('ro');
+      db.close();
+    });
+  });
+
   test('honors --model override', async () => {
     const { modelId, db } = await bootstrap({
       prompt: 'hi',

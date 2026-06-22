@@ -50,6 +50,25 @@ describe('operatorBootstrapFlags', () => {
     });
   });
 
+  // Gate 2 of host passthrough (SECURITY.md §4.1/§4.7). The opt-in must be
+  // forwarded by the SHARED flag map so the one-shot (run.ts) and REPL
+  // paths thread it identically — pairs with --sandbox-host above.
+  test('forwards --i-know-what-im-doing (host passthrough gate 2)', () => {
+    expect(operatorBootstrapFlags(makeArgs({ iKnowWhatImDoing: true }))).toEqual({
+      iKnowWhatImDoing: true,
+    });
+    // Both host gates forwarded together — the combination that unlocks
+    // unsandboxed execution.
+    expect(operatorBootstrapFlags(makeArgs({ sandboxHost: true, iKnowWhatImDoing: true }))).toEqual(
+      {
+        sandboxHost: true,
+        iKnowWhatImDoing: true,
+      },
+    );
+    // Absent ⇒ key omitted (no accidental opt-in via a spread).
+    expect('iKnowWhatImDoing' in operatorBootstrapFlags(makeArgs())).toBe(false);
+  });
+
   test('forwards model / noRecap / maxSteps', () => {
     expect(
       operatorBootstrapFlags(makeArgs({ model: 'anthropic/x', noRecap: true, maxSteps: 7 })),

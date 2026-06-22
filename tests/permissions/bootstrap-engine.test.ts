@@ -651,6 +651,79 @@ describe('bootstrapPermissionEngine — §12.3 watchPolicy wire-up', () => {
     expect(emitted.filter((e) => e.code === 'sandbox.path_resolved')).toHaveLength(0);
   });
 
+  test('sandbox unavailable + host-passthrough opt-in (both gates, lenient) → ready, NOT degraded', async () => {
+    // The operator's explicit two-gate opt-in (--sandbox-host + --i-know-what-im-doing) to run
+    // UNSANDBOXED is intentional, not a degradation — a container/CI with no bwrap that already
+    // provides isolation. Without this carve-out the boot transition degrades (every allow → confirm)
+    // and a headless agent dead-ends on un-answerable confirms BEFORE the §6.5 planner ever picks the
+    // `host` profile.
+    const emitted: Array<{ code: string }> = [];
+    const failureSink = {
+      emit: (event: { code: string }) => {
+        emitted.push({ code: event.code });
+        return { id: `mock-${emitted.length}`, this_chain_hash: '' };
+      },
+      verifyChain: () => ({ ok: true as const, rows: emitted.length }),
+    };
+    const r = await bootstrapPermissionEngine(
+      baseInput({
+        failureSink,
+        sandbox: {
+          available: false,
+          hostExplicitlyAllowed: true,
+          required: false,
+          emitHostPassthrough: true,
+          trustLevel: 'absent',
+          path: null,
+          trustWarnings: [],
+        },
+      }),
+    );
+    expect(r.state).toBe('ready');
+    expect(r.engine.state()).toBe('ready');
+    // No degradation → no tool_unavailable failure_event.
+    expect(emitted.filter((e) => e.code === 'sandbox.tool_unavailable')).toHaveLength(0);
+  });
+
+  test('host-passthrough opt-in does NOT override a policy that REQUIRES a sandbox → refusing', async () => {
+    // `sandbox.required` (enterprise policy) is the stronger gate: the operator's --sandbox-host +
+    // --i-know-what-im-doing cannot run unsandboxed when the policy mandates a viable sandbox.
+    const r = await bootstrapPermissionEngine(
+      baseInput({
+        sandbox: {
+          available: false,
+          hostExplicitlyAllowed: true,
+          required: true,
+          emitHostPassthrough: true,
+          trustLevel: 'absent',
+          path: null,
+          trustWarnings: [],
+        },
+      }),
+    );
+    expect(r.state).toBe('refusing');
+  });
+
+  test('host opt-in needs BOTH gates — only --sandbox-host (no passthrough sentinel) → still degraded', async () => {
+    // One gate is not enough. --sandbox-host alone makes `host` selectable, but the passthrough
+    // sentinel (emitHostPassthrough, from --i-know-what-im-doing) is the deliberate acceptance of
+    // unsandboxed execution. Missing it → the safe default (degraded) holds.
+    const r = await bootstrapPermissionEngine(
+      baseInput({
+        sandbox: {
+          available: false,
+          hostExplicitlyAllowed: true,
+          required: false,
+          emitHostPassthrough: false,
+          trustLevel: 'absent',
+          path: null,
+          trustWarnings: [],
+        },
+      }),
+    );
+    expect(r.state).toBe('degraded');
+  });
+
   test('watchPolicy=true skipped when sandbox required+unavailable forces late refusing', async () => {
     // This is the SECOND refusing path — the late transition AFTER
     // archive but inside the same bootstrap body. The wire-up's
