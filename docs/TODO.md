@@ -1867,11 +1867,21 @@ Forja's own repo. For a fix commit `C` with parent `P`:
 - **Deterministic tests only** (mock-based; most Forja tests are). Model non-determinism is
   the eval's inherent variance → repeats.
 - **Scope the verifier** to the specific test file, not the whole suite (speed).
+- **Sandbox the verifier** (Phase 1b, load-bearing). `command_succeeds` runs `sh -c <cmd>` in
+  the workspace UNSANDBOXED — test process, full ambient env. Fine for hermetic author-authored
+  cases, but here the command runs `bun test` over MODEL-authored files: an untrusted / third-
+  party model under eval can plant code the verifier then executes with the runner's privileges
+  (network, real `$HOME`, API keys in env) → arbitrary code execution + key exfil on the eval
+  host. The Phase-1b harness MUST wrap the verifier in the agent's sandbox profile (network off,
+  cwd-rw, ro elsewhere) + a minimal env. Until then, only point it at trusted models. (Surfaced
+  by code review of the `command_succeeds` primitive.)
 
-**Prerequisite.** A `command_succeeds` expectation kind (run an author-specified command in
-the workspace cwd, assert exit 0 / stdout) — the same small, exhaustively-typed addition as
-`file_not_contains` (eval types + loader + executor + tests). It is the verifier for this
-whole class (and reusable for a hermetic inline fail-to-pass eval too).
+**Prerequisite — ✅ DONE.** The `command_succeeds` expectation kind: runs an author-specified
+command in the workspace cwd after the agent, asserts exit 0, with a per-command timeout
+(SIGTERM-labeled) and a failure log tail; spawn-failure fails the expectation, not the case
+(eval types + loader + executor + tests). The verifier for this whole class (and reusable for a
+hermetic inline fail-to-pass eval). NOTE: runs UNSANDBOXED — see the sandbox-the-verifier gate
+above before pointing it at model-authored files.
 
 **Reporting.** Do NOT fold this into the harness-fit composite (RANKING.md keeps "separate
 axes, never folded in"). Add a `capability` axis = pass-rate of the verified suite. Tag
@@ -1891,10 +1901,11 @@ it **generates tasks forever** (every future fix is a new task, automatically).
 
 **Phases.**
 
-1. `command_succeeds` (framework + test) + **one** hand-wired commit from this session
-   (e.g. `8f6be12e` file_not_contains, or `e08f7df4` cost-cap — small, self-contained) to
-   prove the format end-to-end. Surfaces the real problems (deps in the snapshot, test
-   scoping, anti-cheat) on one task before scaling.
+1. `command_succeeds` (framework + test) ✅ DONE. Remaining 1b: **one** hand-wired commit from
+   this session (e.g. `8f6be12e` file_not_contains, or `e08f7df4` cost-cap — small, self-
+   contained) to prove the format end-to-end — the snapshot setup (`git archive P` + test patch
+   + node_modules symlink), the restore-test-patch anti-cheat, the SANDBOXED verifier (see the
+   gate), and verifier scoping. Surfaces the real problems on one task before scaling.
 2. Automate commit selection from git: scan commits, split by path, validate fail-to-pass,
    discard the invalid ones.
 3. Tier + wire into the ranking as the `capability` axis.

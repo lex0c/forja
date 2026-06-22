@@ -256,6 +256,11 @@ const setupCwd = (caseDef: EvalCase): string => {
   return dir;
 };
 
+// `command_succeeds` default timeout — generous for `bun test <file>` + `bun run typecheck`
+// (the self-SWE-bench verifiers); a case overrides via `timeout_ms`. After it elapses the
+// command is killed and the expectation FAILS (a hung verifier is a fail, not a hang).
+const DEFAULT_COMMAND_TIMEOUT_MS = 60_000;
+
 const evaluateExpectations = (
   caseDef: EvalCase,
   cwd: string,
@@ -470,6 +475,54 @@ const evaluateExpectations = (
           passed,
           detail: `expected ${target}, observed strategies: [${seen}]`,
         };
+      }
+      case 'command_succeeds': {
+        // Runs AFTER the agent, in the workspace it edited. The command STRING is trusted
+        // eval-author config — NEVER model-controlled, so `sh -c` carries no injection risk.
+        // But the command EXECUTES the files in the workspace, which the agent (a model under
+        // eval) wrote, and this spawn is NOT sandboxed (test process, full ambient env). Fine
+        // for hermetic author-authored cases; the self-SWE-bench harness (which runs a model's
+        // edits) MUST sandbox this verifier — network off, cwd-rw, minimal env — before it
+        // points `bun test` at model-authored files (else: ACE on the eval host). See the
+        // self-SWE-bench entry in docs/TODO.md (Phase 1b security gate).
+        const timeoutMs = expectation.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+        try {
+          // Inside the try so `r` keeps the narrow `stdout:'pipe'` overload (stdout/stderr
+          // are Buffers, never undefined) — annotating it widens back to the union.
+          const r = Bun.spawnSync({
+            cmd: ['sh', '-c', expectation.command],
+            cwd,
+            timeout: timeoutMs,
+            stdout: 'pipe',
+            stderr: 'pipe',
+          });
+          if (r.success) return { expectation, passed: true };
+          const tail = (b: { toString(): string }): string =>
+            b.toString().trim().split('\n').slice(-10).join('\n');
+          // SIGTERM is the signal Bun's `timeout` kills with → label it a timeout. Any OTHER
+          // signal (SIGSEGV / SIGKILL / SIGABRT) is the command crashing on its own, possibly
+          // well within budget — report the signal, not a timeout that never elapsed.
+          const why =
+            r.signalCode === 'SIGTERM'
+              ? `timed out after ${timeoutMs}ms (SIGTERM)`
+              : r.signalCode != null
+                ? `killed by ${r.signalCode}`
+                : `exit ${r.exitCode}`;
+          const logTail = tail(r.stderr) || tail(r.stdout);
+          return {
+            expectation,
+            passed: false,
+            detail: `command '${expectation.command}' failed (${why})${logTail ? `\n${logTail}` : ''}`,
+          };
+        } catch (e) {
+          // The spawn could not START (e.g. no `sh` on PATH — a Windows host without Git
+          // Bash / WSL). Fail THIS expectation; don't let the throw crash the whole case.
+          return {
+            expectation,
+            passed: false,
+            detail: `command '${expectation.command}' could not start: ${e instanceof Error ? e.message : String(e)}`,
+          };
+        }
       }
     }
   });
