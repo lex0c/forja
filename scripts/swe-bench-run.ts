@@ -11,7 +11,9 @@
 // Model support mirrors the ranking: the host's model_providers.json is mounted, `--models` selects.
 //
 // Run: bun run scripts/swe-bench-run.ts --models ollama/devstral-2:123b[,anthropic/claude-opus-4-8]
-//      [--tier N] [--limit N] [--id <sha>] [--max-steps N] [--timeout MS]
+//      [--tier N] [--limit N] [--id <sha>] [--max-steps N] [--timeout MS] [--no-build]
+// The agent binary is rebuilt (`bun run build`) every run so a stale dist/ never bakes an old agent
+// into the image; --no-build skips that when dist/ is known-current (repeated runs of one build).
 
 import {
   appendFileSync,
@@ -73,6 +75,7 @@ let tier: number | undefined;
 let id: string | undefined;
 let maxSteps = 40;
 let perTaskTimeout = 900_000;
+let noBuild = false;
 const intArg = (raw: string | undefined, flag: string): number => {
   const n = Number.parseInt(raw ?? '', 10);
   if (Number.isNaN(n)) {
@@ -94,6 +97,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--id') id = argv[++i];
   else if (a === '--max-steps') maxSteps = intArg(argv[++i], '--max-steps');
   else if (a === '--timeout') perTaskTimeout = intArg(argv[++i], '--timeout');
+  else if (a === '--no-build') noBuild = true;
   else {
     process.stderr.write(`swe-bench-run: unknown flag '${a}'\n`);
     process.exit(1);
@@ -133,13 +137,16 @@ const dockerLogs = (name: string, tail?: number): string => {
 
 // Build the bench image: the compiled binary (built on demand) + the manifest go into the docker
 // context; the multi-stage Dockerfile bakes the deps + the Go proxy. Context files are cleaned after.
-const buildImage = (): void => {
+const buildImage = (rebuild: boolean): void => {
   const dist = join(repoRoot, 'dist');
-  let binary = existsSync(dist)
-    ? readdirSync(dist).find((f) => /^forja-[\d.]+-linux-x64$/.test(f))
-    : undefined;
-  if (binary === undefined) {
-    process.stderr.write('swe-bench-run: building the linux-x64 binary (`bun run build`)...\n');
+  // ALWAYS rebuild the agent binary before baking, unless --no-build. A stale dist/ binary (from an
+  // earlier commit, or source changed without rebuilding) would bake an OLD agent into the image while
+  // the corpus + deps are current — corrupting pass rates in a way that looks like model behavior, not
+  // a stale harness. --no-build is the escape hatch for repeated runs of an already-current dist/.
+  if (rebuild) {
+    process.stderr.write(
+      'swe-bench-run: building the linux-x64 agent binary (`bun run build`)...\n',
+    );
     const b = Bun.spawnSync({
       cmd: ['bun', 'run', 'build'],
       cwd: repoRoot,
@@ -147,10 +154,14 @@ const buildImage = (): void => {
       stderr: 'inherit',
     });
     if (!b.success) throw new Error('swe-bench-run: `bun run build` failed');
-    binary = readdirSync(dist).find((f) => /^forja-[\d.]+-linux-x64$/.test(f));
-    if (binary === undefined)
-      throw new Error('swe-bench-run: no linux-x64 binary in dist/ after build');
   }
+  const binary = existsSync(dist)
+    ? readdirSync(dist).find((f) => /^forja-[\d.]+-linux-x64$/.test(f))
+    : undefined;
+  if (binary === undefined)
+    throw new Error(
+      `swe-bench-run: no linux-x64 binary in dist/${rebuild ? ' after build' : ' (--no-build set — run `bun run build` first)'}`,
+    );
   const ctx = join(repoRoot, 'evals/swe-bench/docker');
   copyFileSync(join(dist, binary), join(ctx, 'forja'));
   copyFileSync(join(repoRoot, 'package.json'), join(ctx, 'package.json'));
@@ -302,7 +313,9 @@ const parseMetrics = (log: string) => {
     if (/\[\w+\/\w+\][^\n]*\bsteps\b/.test(line)) doneLine = line;
   }
   const scope = doneLine ?? log;
-  const reason = scope.match(/\[(\w+)\//)?.[1] ?? '';
+  // exit_reason is the REASON half after the slash (`maxSteps`, `degenerateLoop`), NOT the class before
+  // it (`exhausted`, `error`) — capturing the class collapses distinct budget/error exits into one bucket.
+  const reason = scope.match(/\[\w+\/(\w+)\]/)?.[1] ?? '';
   const steps = Number(scope.match(/(\d+)\s+steps\b/)?.[1] ?? 0);
   const tk = scope.match(/tokens\s+(\d+)\/(\d+)/);
   const inputTok = Number(tk?.[1] ?? 0);
@@ -496,7 +509,7 @@ if (!existsSync(catalogPath)) {
   process.exit(1);
 }
 
-buildImage();
+buildImage(!noBuild);
 
 const rows: Row[] = [];
 try {
