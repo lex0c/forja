@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { executeCase } from '../../src/evals/executor.ts';
@@ -219,6 +219,47 @@ describe('swe-bench executeCase e2e (reference task 0be3c4299)', () => {
     expect(r.expectations[0]?.passed).toBe(false);
     expect(r.passed).toBe(false);
   });
+
+  // GATE #7: a swe case runs the AGENT network-off (denyNetwork) by STRIPPING net-egress, so a
+  // net-requesting command RUNS without network (curl/git-fetch reach nothing) rather than being
+  // refused. The network-IS-cut half is the sandbox-plan unit test (net-egress → cwd-rw = unshare-
+  // net). Here we prove the NOT-BROKEN half: a net-egress bash command (`bun` always requests
+  // net-egress via cmdNpmLike) is ALLOWED and executes — leaving its marker — instead of being
+  // denied as the earlier prune-to-refuse design did (which would have killed `bun test`).
+  test.skipIf(!CAN_RUN)(
+    'GATE #7: a swe agent net-egress command (bun) runs, not refused',
+    async () => {
+      const c: EvalCase = {
+        name: 'swe net-off',
+        sourcePath: '/tmp/swe.yaml',
+        prompt: 'fix it',
+        setup: { swe: { commit: COMMIT, repoRoot: REPO } },
+        expect: [{ kind: 'file_exists', path: 'gate7-marker.txt' }],
+      };
+      const r = await executeCase(c, {
+        bootstrapOverride: {
+          providerOverride: mockProvider([
+            {
+              text: 'verifying',
+              tool_uses: [
+                {
+                  id: 'c1',
+                  name: 'bash',
+                  input: { command: 'bun --version > gate7-marker.txt' },
+                },
+              ],
+            },
+            { text: 'done' },
+          ]),
+          sandboxAvailabilityOverride: HERMETIC_SANDBOX,
+        },
+        perCaseTimeoutMs: 120_000,
+      });
+      // file_exists passes ⇒ the net-egress `bun` command was ALLOWED and ran (net stripped, not
+      // refused); a prune-to-refuse gate would have denied it and left no marker.
+      expect(r.expectations[0]?.passed).toBe(true);
+    },
+  );
 });
 
 // --- workspace guards on a SYNTHETIC repo (no dependency on the running checkout's history, so
@@ -292,5 +333,37 @@ describe('swe-bench workspace guards (synthetic repo)', () => {
     const nongit = mkdtempSync(join(tmpdir(), 'swe-nongit-'));
     temps.push(nongit);
     expect(() => gitToplevel(nongit)).toThrow(/git toplevel/);
+  });
+
+  // Anti-cheat gate #8: restoreSweTests reverts the whole test surface, not just the commit's
+  // own test files — a model can't hijack the verifier via an edited shared helper OR an added
+  // bunfig.toml preload (a config absent at C must be DELETED, not just left).
+  test('restoreSweTests reverts edited test helpers AND deletes a model-added runner config', () => {
+    const { repo, head } = makeRepo([
+      { 'src/a.ts': 'export const a = 2;\n' },
+      {
+        'src/a.ts': 'export const a = 1;\n',
+        'tests/a.test.ts': '// canonical oracle\n',
+        'tests/helper.ts': '// canonical helper\n',
+      },
+    ]);
+    const cwd = mkdtempSync(join(tmpdir(), 'swe-restore8-'));
+    temps.push(cwd);
+    // Simulate a cheating agent's workspace: oracle + helper tampered, plus an ADDED bunfig
+    // preload (the repo has no bunfig.toml at C, so the restore must delete it).
+    mkdirSync(join(cwd, 'tests'), { recursive: true });
+    writeFileSync(join(cwd, 'tests/a.test.ts'), '// TAMPERED to always pass\n');
+    writeFileSync(join(cwd, 'tests/helper.ts'), '// TAMPERED helper\n');
+    writeFileSync(join(cwd, 'tests/extra.ts'), '// model-ADDED helper (not at C)\n');
+    writeFileSync(join(cwd, 'bunfig.toml'), '[test]\npreload = "./cheat.ts"\n');
+    writeFileSync(join(cwd, '.env'), 'CHEAT=1\n');
+
+    restoreSweTests({ commit: head, repoRoot: repo, cwd, testPaths: ['tests/a.test.ts'] });
+
+    expect(readFileSync(join(cwd, 'tests/a.test.ts'), 'utf8')).toBe('// canonical oracle\n');
+    expect(readFileSync(join(cwd, 'tests/helper.ts'), 'utf8')).toBe('// canonical helper\n');
+    expect(existsSync(join(cwd, 'tests/extra.ts'))).toBe(false); // model-ADDED test file → gone (rm -rf tests/)
+    expect(existsSync(join(cwd, 'bunfig.toml'))).toBe(false); // added config → deleted
+    expect(existsSync(join(cwd, '.env'))).toBe(false); // bun auto-loads .env → added .env deleted
   });
 });

@@ -12,7 +12,7 @@
 // cheat the verifier. All git work shells out to the host `git`; failures throw loudly (a
 // silent miss would make a task look like a model failure).
 
-import { existsSync, lstatSync, symlinkSync } from 'node:fs';
+import { existsSync, lstatSync, rmSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 
 export interface SweWorkspaceSpec {
@@ -114,6 +114,15 @@ export const materializeSweWorkspace = ({
   // 1. parent (buggy) tree, no .git.
   extractArchive(repoRoot, `${commit}^`, cwd, [], `git archive ${commit}^`);
 
+  // 1b. Strip the LEAK SURFACE from the workspace. `git archive` ships the whole tree, including
+  //     docs/BACKLOG.md (a verbose per-fix changelog the model can read locally to glean approach)
+  //     and evals/swe-bench/ (corpus.json carries each task's subject + srcFiles — the fix spec).
+  //     The agent must work from the failing test alone, so these never reach it. (docs/spec + the
+  //     rest stay — they're the codebase's own docs, not a fix changelog/answer key.)
+  for (const leak of ['docs/BACKLOG.md', 'docs/TODO.md', 'evals/swe-bench']) {
+    rmSync(join(cwd, leak), { recursive: true, force: true });
+  }
+
   // 2. apply the tests/** patch so the gold test exists and fails. `git apply` runs with the
   //    workspace as cwd; it does not need the workspace to be a git repo.
   const testPatch = git(repoRoot, ['diff', `${commit}^`, commit, '--', 'tests/']);
@@ -142,26 +151,57 @@ export const materializeSweWorkspace = ({
   return { testPaths };
 };
 
-// Restore the canonical test files from `C`, discarding any agent edits to them. Robust against
-// the model deleting OR rewriting the oracle: archive-from-commit re-materializes the exact test
-// content regardless of the workspace's current state (re-applying the patch would break when
-// the test is a modify, not an add). Call AFTER the agent runs, BEFORE the verifier.
+// Config the test runner reads — a model can hijack the verifier through any of these without
+// touching a test FILE, so they're part of the restored surface (anti-cheat gate #8). `.env*` is
+// included because bun AUTO-LOADS .env / .env.test / .env.local from cwd at `bun test` startup, so
+// a model-written `.env` (the repo tracks none) would inject env the oracle reads.
+const TEST_RUNNER_CONFIG = [
+  'bunfig.toml',
+  'tsconfig.json',
+  'package.json',
+  'bun.lock',
+  '.env',
+  '.env.test',
+  '.env.local',
+] as const;
+
+// Restore the canonical TEST SURFACE from `C` — the whole `tests/` tree plus the test-runner
+// config — discarding any agent edits, so the verifier runs the gold oracle and only the model's
+// `src/` changes can make it pass. Restoring only the commit's own test files (the naive version)
+// left the model free to cheat via a shared test helper the oracle imports, a `bunfig.toml`
+// `[test].preload`, a `tsconfig.json` path remap, or `package.json` — none of which the commit
+// touched. archive-from-commit re-materializes exact content over whatever the model wrote (and is
+// robust to the oracle being a modify/rename/delete, where re-applying the patch would break).
+// Call AFTER the agent runs, BEFORE the verifier.
 export const restoreSweTests = ({
   commit,
   repoRoot,
   cwd,
   testPaths,
 }: { commit: string; repoRoot: string; cwd: string; testPaths: string[] }): void => {
-  // testPaths is the UNION of paths the commit touched, so a RENAME or DELETE leaves a path
-  // absent at C — `git archive C -- <stale>` would fail and abort the whole restore. Restore
-  // only the paths present at C (the oracle the verifier runs IS present at C).
-  const present = testPaths.filter((p) => existsAtRef(repoRoot, commit, p));
-  if (present.length === 0) {
-    throw new Error(
-      `swe-bench: none of the commit's test paths exist at ${commit} — cannot restore the oracle`,
-    );
+  // Fail loudly if the oracle itself is gone at C (a degenerate task) — nothing to verify against.
+  if (!testPaths.some((p) => existsAtRef(repoRoot, commit, p))) {
+    throw new Error(`swe-bench: none of the oracle test paths exist at ${commit} — cannot restore`);
   }
-  extractArchive(repoRoot, commit, cwd, present, `restore tests from ${commit}`);
+  // For each config file: restore C's version if it existed at C, else DELETE it (the model ADDED
+  // it — e.g. a `bunfig.toml` preload in a repo that has none — and `git archive` can't delete).
+  const presentAtC: string[] = [];
+  for (const f of TEST_RUNNER_CONFIG) {
+    if (existsAtRef(repoRoot, commit, f)) presentAtC.push(f);
+    else rmSync(join(cwd, f), { force: true });
+  }
+  // rm the whole tests/ tree FIRST so a model-ADDED file under tests/ doesn't survive — `tar -x`
+  // overwrites + adds but never DELETES, so without this the restored tests/ ⊇ C (not == C). After
+  // the rm, the archive re-materializes tests/ exactly as it is at C; the config present at C is
+  // overwritten back to canonical (config absent at C was already deleted above).
+  rmSync(join(cwd, 'tests'), { recursive: true, force: true });
+  extractArchive(
+    repoRoot,
+    commit,
+    cwd,
+    ['tests/', ...presentAtC],
+    `restore test surface from ${commit}`,
+  );
 };
 
 // The git toplevel of `from` — the default `repoRoot` when a swe case omits it (the corpus is

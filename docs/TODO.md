@@ -1877,18 +1877,16 @@ the Phase-1 machinery found cheat surfaces the test-file restore + sandboxed ver
 The outcome IS the score, so each is a way to inflate the capability signal WITHOUT fixing the bug.
 Close before running the corpus on third-party models:
 
-- **Cut the AGENT's network.** The agent phase runs `mode: bypass` with network ON, and the corpus
-  is Forja's PUBLIC repo — a model can `curl` / `git clone` the gold `src/**` for commit `C` from
-  GitHub during its run (the `.git` exclusion is moot; the fix is one HTTPS request away).
-  Self-SWE-bench tasks MUST run the AGENT network-off (a cwd-rw, no-net agent profile), not just
-  the verifier.
-- **Broaden / freeze the restore.** `restoreSweTests` re-extracts only the `tests/**` files THIS
-  commit touched. Everything else in the tree is mutable and unrestored: `bunfig.toml`
-  (`[test].preload`), `tsconfig.json` (path remaps), `package.json`, and shared test helpers the
-  oracle imports but `C` didn't modify. A model can write a preload / remap / no-op helper so
-  `bun test <file>` passes with the bug unfixed. Restore (or read-only-freeze) the test-affecting
-  config + the full set of files the oracle transitively loads.
-- **PASS_TO_PASS + the visible-test caveat.** The verifier runs ONLY the one oracle file and the
+- **Cut the AGENT's network.** ✅ DONE (`denyNetwork`). The sandbox STRIPS `net-egress` for swe
+  cases → curl / git fetch / fetch_url resolve to a no-net profile and reach nothing, while `bun
+  test` (which requests net-egress unconditionally via `cmdNpmLike`) still runs — so the agent keeps
+  its self-verify loop. Threaded sandbox-plan→engine→bootstrap→executor (pinned after override).
+- **Broaden / freeze the restore.** ✅ DONE. `restoreSweTests` `rm`s + re-archives the whole `tests/`
+  tree from C (no model-added test survives) and restores-or-DELETES the test-runner config
+  (`bunfig.toml`/`tsconfig.json`/`package.json`/`bun.lock` + the `.env*` bun auto-loads).
+  `materializeSweWorkspace` also strips the leak surface (`docs/BACKLOG.md`/`docs/TODO.md`/
+  `evals/swe-bench/`) from the workspace.
+- **PASS_TO_PASS + the visible-test caveat.** ⏳ The verifier runs ONLY the one oracle file and the
   oracle is VISIBLE in the workspace, so a model can hard-code the test's exact inputs (overfit)
   with no regression check. Classic SWE-bench HIDES the test for this reason. Add a PASS_TO_PASS
   sample (a few unrelated tests must still pass) and consider withholding the oracle from the agent
