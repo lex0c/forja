@@ -224,6 +224,44 @@ const teardownSidecar = (): void => {
   sh(['docker', 'network', 'rm', NETWORK], true);
 };
 
+// Egress preflight — before spending a corpus run, prove the sidecar egress is BOTH working (each model
+// host is reachable through the proxy via bun fetch, the real provider client) AND locked (github is
+// blocked). A Bun that stopped honoring HTTPS_PROXY, or a network/proxy misconfig, would otherwise fail
+// EVERY task silently (0 steps / timeout) and score as model incapacity — corrupting the benchmark with
+// no visible error. One throwaway container per distinct host runs the entrypoint's FORJA_NET_TEST.
+const preflightEgress = (hosts: string[]): void => {
+  for (const host of hosts) {
+    process.stderr.write(`swe-bench-run: egress preflight (${host})...\n`);
+    const r = Bun.spawnSync({
+      cmd: [
+        'docker',
+        'run',
+        '--rm',
+        '--network',
+        NETWORK,
+        '-e',
+        `HTTPS_PROXY=http://${PROXY}:${PROXY_PORT}`,
+        '-e',
+        'FORJA_NET_TEST=1',
+        '-e',
+        `FORJA_NET_TEST_HOST=${host}`,
+        IMAGE,
+      ],
+      stdout: 'pipe',
+      stderr: 'pipe',
+      timeout: 60_000,
+    });
+    process.stderr.write(r.stdout.toString() + r.stderr.toString());
+    if (!r.success) {
+      throw new Error(
+        `swe-bench-run: egress preflight FAILED for ${host} (see the NET lines above) — aborting before ` +
+          `the corpus. A network-broken run would score every task as model incapacity; fix the sidecar ` +
+          `proxy / network and retry.`,
+      );
+    }
+  }
+};
+
 interface Row {
   model: string;
   id: string;
@@ -434,7 +472,9 @@ buildImage(!noBuild);
 
 const rows: Row[] = [];
 try {
-  ensureSidecar(allowHostsFor(models, catalogEntries));
+  const allowHosts = allowHostsFor(models, catalogEntries);
+  ensureSidecar(allowHosts);
+  preflightEgress(allowHosts); // abort loudly if egress is broken/leaky BEFORE spending the corpus
   for (const model of models) {
     process.stderr.write(`\n=== ${model} ===\n`);
     for (const t of tasks) {

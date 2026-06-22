@@ -45,12 +45,30 @@ cd /task || exit 2
 # timeout/kill is the only path that skips it; the host tolerates a residual EPERM there.
 trap 'chmod -R a+rwX /task 2>/dev/null || true' EXIT
 
-# Egress self-check: model reachable through the proxy, github NOT (direct = no route, proxied = 403).
+# Egress self-check — the preflight the orchestrator runs before the corpus. The model host MUST be
+# reachable THROUGH the proxy via BUN fetch (the same client forja's providers use, so a Bun that stops
+# honoring HTTPS_PROXY is caught HERE, not as silent per-task model failures), AND github MUST be blocked
+# both ways (no direct route on the --internal net; the proxy allowlist 403s it). Exit non-zero on any
+# violation so the orchestrator aborts loudly rather than scoring a network-broken run as model incapacity.
 if [ -n "$FORJA_NET_TEST" ]; then
-  echo "model  via proxy: $(curl -s -o /dev/null -w '%{http_code}' --max-time 15 https://ollama.com 2>&1 || echo UNREACHABLE)"
-  echo "github direct   : $(curl -s -o /dev/null -w '%{http_code}' --max-time 8 --noproxy '*' https://api.github.com 2>&1 || echo NO-ROUTE)"
-  echo "github via proxy: $(curl -s -o /dev/null -w '%{http_code}' --max-time 8 https://api.github.com 2>&1 || echo REFUSED-403)"
-  exit 0
+  host="${FORJA_NET_TEST_HOST:-ollama.com}"
+  # Bun fetch, NOT curl: curl honors $HTTPS_PROXY natively, so a curl probe would pass even if Bun did
+  # not — masking the very regression this guards. 'FAIL' = bun fetch never reached the host.
+  model=$(bun -e "console.log(await fetch('https://$host',{signal:AbortSignal.timeout(15000)}).then(r=>r.status).catch(()=>'FAIL'))" 2>/dev/null || echo FAIL)
+  # The egress LOCK is a network property (internal net + proxy allowlist), client-independent → curl.
+  # curl's -w writes the http_code itself (000 when nothing answered), so NO `|| echo` — that would
+  # DOUBLE it to "000000". A real 3-digit code = the host answered (a leak); 000 / empty = blocked.
+  gh_direct=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 --noproxy '*' https://api.github.com 2>/dev/null)
+  gh_proxy=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 https://api.github.com 2>/dev/null)
+  echo "NET model $host via proxy (bun fetch): $model"
+  echo "NET github direct: ${gh_direct:-000}"
+  echo "NET github via proxy: ${gh_proxy:-000}"
+  rc=0
+  [ "$model" = "FAIL" ] && { echo "NET FAIL: bun fetch can't reach the model host through the proxy (proxy down, or this Bun doesn't honor HTTPS_PROXY)"; rc=1; }
+  case "$gh_direct" in [1-5][0-9][0-9]) echo "NET FAIL: github answered on DIRECT egress — the network is not --internal"; rc=1 ;; esac
+  case "$gh_proxy" in [23][0-9][0-9]) echo "NET FAIL: github reachable VIA the proxy — allowlist leak"; rc=1 ;; esac
+  [ "$rc" = 0 ] && echo "NET OK: model reachable via the proxy (bun fetch), github blocked both ways"
+  exit "$rc"
 fi
 
 # Agent phase — the FULL forja loop (tools, context, state) fixes the bug. The `|| echo …` swallows a
