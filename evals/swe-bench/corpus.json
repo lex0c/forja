@@ -11,7 +11,12 @@
       "src/tools/builtin/read-file.ts",
       "src/tools/types.ts"
     ],
-    "tier": 2
+    "tier": 2,
+    "passToPass": [
+      "tests/tools/_bash-cwd.test.ts",
+      "tests/tools/bash-background.test.ts",
+      "tests/tools/bash-broker.test.ts"
+    ]
   },
   {
     "id": "131a14ae0",
@@ -24,7 +29,12 @@
     "srcFiles": [
       "src/hooks/dispatcher.ts"
     ],
-    "tier": 3
+    "tier": 3,
+    "passToPass": [
+      "tests/hooks/config.test.ts",
+      "tests/hooks/locked-enforcement.test.ts",
+      "tests/hooks/paths.test.ts"
+    ]
   },
   {
     "id": "17bcaf158",
@@ -37,7 +47,12 @@
     "srcFiles": [
       "src/harness/session-context.ts"
     ],
-    "tier": 1
+    "tier": 1,
+    "passToPass": [
+      "tests/harness/abortable.test.ts",
+      "tests/harness/budget-defaults.test.ts",
+      "tests/harness/checkpoints.test.ts"
+    ]
   },
   {
     "id": "1aa34fb4d",
@@ -52,7 +67,12 @@
       "src/cli/slash/commands/stats.ts",
       "src/providers/cost.ts"
     ],
-    "tier": 1
+    "tier": 1,
+    "passToPass": [
+      "tests/cli/slash/agent-policy.test.ts",
+      "tests/cli/slash/agent-retrieval.test.ts",
+      "tests/cli/slash/commands.test.ts"
+    ]
   },
   {
     "id": "200796f0b",
@@ -65,7 +85,12 @@
     "srcFiles": [
       "src/tui/render/markdown.ts"
     ],
-    "tier": 2
+    "tier": 2,
+    "passToPass": [
+      "tests/tui/render/assistant-chip.test.ts",
+      "tests/tui/render/compose.test.ts",
+      "tests/tui/render/critique-chip.test.ts"
+    ]
   },
   {
     "id": "2e0803399",
@@ -79,7 +104,12 @@
       "src/harness/loop.ts",
       "src/harness/resume.ts"
     ],
-    "tier": 2
+    "tier": 2,
+    "passToPass": [
+      "tests/cli/args.test.ts",
+      "tests/cli/bootstrap.test.ts",
+      "tests/cli/index.test.ts"
+    ]
   },
   {
     "id": "3739b3b08",
@@ -95,7 +125,12 @@
       "src/storage/index.ts",
       "src/storage/repos/stats.ts"
     ],
-    "tier": 1
+    "tier": 1,
+    "passToPass": [
+      "tests/cli/slash/agent-policy.test.ts",
+      "tests/cli/slash/agent-retrieval.test.ts",
+      "tests/cli/slash/commands.test.ts"
+    ]
   },
   {
     "id": "38c637a68",
@@ -108,7 +143,12 @@
     "srcFiles": [
       "src/permissions/engine.ts"
     ],
-    "tier": 1
+    "tier": 1,
+    "passToPass": [
+      "tests/permissions/audit-rotation.test.ts",
+      "tests/permissions/audit-scheduler.test.ts",
+      "tests/permissions/audit-telemetry.test.ts"
+    ]
   },
   {
     "id": "39d1ce983",
@@ -124,7 +164,12 @@
       "src/harness/loop.ts",
       "src/tools/builtin/pin-context.ts"
     ],
-    "tier": 3
+    "tier": 3,
+    "passToPass": [
+      "tests/harness/abortable.test.ts",
+      "tests/harness/budget-defaults.test.ts",
+      "tests/harness/checkpoints.test.ts"
+    ]
   },
   {
     "id": "40ad81974",
@@ -138,7 +183,12 @@
     "srcFiles": [
       "src/tools/builtin/edit-file.ts"
     ],
-    "tier": 3
+    "tier": 3,
+    "passToPass": [
+      "tests/tools/_bash-cwd.test.ts",
+      "tests/tools/bash-background.test.ts",
+      "tests/tools/bash-broker.test.ts"
+    ]
   },
   {
     "id": "4b339ed40",
@@ -154,7 +204,12 @@
       "src/tui/render/modal.ts",
       "src/tui/state.ts"
     ],
-    "tier": 2
+    "tier": 2,
+    "passToPass": [
+      "tests/tui/bus.test.ts",
+      "tests/tui/focus-stack.test.ts",
+      "tests/tui/harness-adapter.test.ts"
+    ]
   },
   {
     "id": "4c0cf1dda",
@@ -168,7 +223,12 @@
     "srcFiles": [
       "src/permissions/resolvers/bash.ts"
     ],
-    "tier": 2
+    "tier": 2,
+    "passToPass": [
+      "tests/permissions/audit-rotation.test.ts",
+      "tests/permissions/audit-scheduler.test.ts",
+      "tests/permissions/audit-telemetry.test.ts"
+    ]
   },
   {
     "id": "564f90633",
@@ -181,7 +241,12 @@
     "srcFiles": [
       "src/providers/openai/responses-stream.ts"
     ],
-    "tier": 1
+    "tier": 1,
+    "passToPass": [
+      "tests/providers/anthropic-cache.test.ts",
+      "tests/providers/anthropic-effort.test.ts",
+      "tests/providers/anthropic-stream.test.ts"
+    ]
   },
   {
     "id": "5b541dfb3",
@@ -197,7 +262,12 @@
       "src/storage/index.ts",
       "src/storage/repos/stats.ts"
     ],
-    "tier": 2
+    "tier": 2,
+    "passToPass": [
+      "tests/cli/slash/agent-policy.test.ts",
+      "tests/cli/slash/agent-retrieval.test.ts",
+      "tests/cli/slash/commands.test.ts"
+    ]
   },
   {
     "id": "5d886fe6b",
@@ -210,7 +280,12 @@
     "srcFiles": [
       "src/skills/lifecycle.ts"
     ],
-    "tier": 2
+    "tier": 2,
+    "passToPass": [
+      "tests/skills/catalog.test.ts",
+      "tests/skills/frontmatter.test.ts",
+      "tests/skills/loader.test.ts"
+    ]
   },
   {
     "id": "6180c89bc",
@@ -223,7 +298,12 @@
     "srcFiles": [
       "src/cli/slash/commands/agent-retrieval.ts"
     ],
-    "tier": 1
+    "tier": 1,
+    "passToPass": [
+      "tests/cli/slash/agent-policy.test.ts",
+      "tests/cli/slash/commands.test.ts",
+      "tests/cli/slash/dispatch.test.ts"
+    ]
   },
   {
     "id": "655110a48",
@@ -237,7 +317,12 @@
       "src/permissions/engine.ts",
       "src/permissions/matcher.ts"
     ],
-    "tier": 3
+    "tier": 3,
+    "passToPass": [
+      "tests/permissions/audit-rotation.test.ts",
+      "tests/permissions/audit-scheduler.test.ts",
+      "tests/permissions/audit-telemetry.test.ts"
+    ]
   },
   {
     "id": "68bf36eb7",
@@ -250,7 +335,12 @@
     "srcFiles": [
       "src/memory/registry.ts"
     ],
-    "tier": 1
+    "tier": 1,
+    "passToPass": [
+      "tests/memory/dependents.test.ts",
+      "tests/memory/frontmatter.test.ts",
+      "tests/memory/gitignore.test.ts"
+    ]
   },
   {
     "id": "7481e4830",
@@ -263,7 +353,11 @@
     "srcFiles": [
       "src/recap/projection.ts"
     ],
-    "tier": 1
+    "tier": 1,
+    "passToPass": [
+      "tests/recap/eval.test.ts",
+      "tests/recap/render.test.ts"
+    ]
   },
   {
     "id": "7b7753279",
@@ -278,7 +372,12 @@
       "src/providers/catalog-io.ts",
       "src/providers/types.ts"
     ],
-    "tier": 2
+    "tier": 2,
+    "passToPass": [
+      "tests/providers/anthropic-cache.test.ts",
+      "tests/providers/anthropic-effort.test.ts",
+      "tests/providers/anthropic-stream.test.ts"
+    ]
   },
   {
     "id": "83f3f9713",
@@ -291,7 +390,12 @@
     "srcFiles": [
       "src/tui/state.ts"
     ],
-    "tier": 1
+    "tier": 1,
+    "passToPass": [
+      "tests/tui/bus.test.ts",
+      "tests/tui/focus-stack.test.ts",
+      "tests/tui/harness-adapter.test.ts"
+    ]
   },
   {
     "id": "84772c3f7",
@@ -304,7 +408,12 @@
     "srcFiles": [
       "src/tools/builtin/git.ts"
     ],
-    "tier": 2
+    "tier": 2,
+    "passToPass": [
+      "tests/tools/_bash-cwd.test.ts",
+      "tests/tools/bash-background.test.ts",
+      "tests/tools/bash-broker.test.ts"
+    ]
   },
   {
     "id": "86caae831",
@@ -318,7 +427,12 @@
       "src/harness/exhaustion-synthesis.ts",
       "src/harness/loop.ts"
     ],
-    "tier": 3
+    "tier": 3,
+    "passToPass": [
+      "tests/harness/abortable.test.ts",
+      "tests/harness/assistant-content.test.ts",
+      "tests/harness/bg-cleanup.test.ts"
+    ]
   },
   {
     "id": "8ce08ef5d",
@@ -333,7 +447,12 @@
       "src/skills/lifecycle.ts",
       "src/skills/paths.ts"
     ],
-    "tier": 2
+    "tier": 2,
+    "passToPass": [
+      "tests/cli/slash/agent-policy.test.ts",
+      "tests/cli/slash/agent-retrieval.test.ts",
+      "tests/cli/slash/commands.test.ts"
+    ]
   },
   {
     "id": "932c14861",
@@ -346,7 +465,12 @@
     "srcFiles": [
       "src/permissions/sensitive-paths.ts"
     ],
-    "tier": 1
+    "tier": 1,
+    "passToPass": [
+      "tests/permissions/audit-rotation.test.ts",
+      "tests/permissions/audit-scheduler.test.ts",
+      "tests/permissions/audit-telemetry.test.ts"
+    ]
   },
   {
     "id": "9b45a0b36",
@@ -359,7 +483,11 @@
     "srcFiles": [
       "src/recap/projection.ts"
     ],
-    "tier": 2
+    "tier": 2,
+    "passToPass": [
+      "tests/recap/eval.test.ts",
+      "tests/recap/render.test.ts"
+    ]
   },
   {
     "id": "a0ca32340",
@@ -374,7 +502,12 @@
       "src/memory/registry.ts",
       "src/tools/builtin/memory-search.ts"
     ],
-    "tier": 3
+    "tier": 3,
+    "passToPass": [
+      "tests/memory/dependents.test.ts",
+      "tests/memory/expires.test.ts",
+      "tests/memory/frontmatter.test.ts"
+    ]
   },
   {
     "id": "a1afc3317",
@@ -389,7 +522,12 @@
       "src/tools/builtin/clarify.ts",
       "src/tools/types.ts"
     ],
-    "tier": 2
+    "tier": 2,
+    "passToPass": [
+      "tests/tools/_bash-cwd.test.ts",
+      "tests/tools/bash-background.test.ts",
+      "tests/tools/bash-broker.test.ts"
+    ]
   },
   {
     "id": "a4b95045f",
@@ -402,7 +540,12 @@
     "srcFiles": [
       "src/tools/builtin/_bash-cwd.ts"
     ],
-    "tier": 1
+    "tier": 1,
+    "passToPass": [
+      "tests/tools/bash-background.test.ts",
+      "tests/tools/bash-broker.test.ts",
+      "tests/tools/bash-kill.test.ts"
+    ]
   },
   {
     "id": "b888c4ddd",
@@ -415,7 +558,12 @@
     "srcFiles": [
       "src/tools/builtin/git-apply-patch.ts"
     ],
-    "tier": 2
+    "tier": 2,
+    "passToPass": [
+      "tests/tools/_bash-cwd.test.ts",
+      "tests/tools/bash-background.test.ts",
+      "tests/tools/bash-broker.test.ts"
+    ]
   },
   {
     "id": "bd7ecf84b",
@@ -428,7 +576,12 @@
     "srcFiles": [
       "src/harness/loop.ts"
     ],
-    "tier": 3
+    "tier": 3,
+    "passToPass": [
+      "tests/harness/abortable.test.ts",
+      "tests/harness/assistant-content.test.ts",
+      "tests/harness/bg-cleanup.test.ts"
+    ]
   },
   {
     "id": "c12e891bf",
@@ -441,7 +594,12 @@
     "srcFiles": [
       "src/providers/anthropic/index.ts"
     ],
-    "tier": 1
+    "tier": 1,
+    "passToPass": [
+      "tests/providers/anthropic-cache.test.ts",
+      "tests/providers/anthropic-effort.test.ts",
+      "tests/providers/anthropic-stream.test.ts"
+    ]
   },
   {
     "id": "c266c8894",
@@ -475,7 +633,12 @@
     "srcFiles": [
       "src/permissions/resolvers/bash.ts"
     ],
-    "tier": 2
+    "tier": 2,
+    "passToPass": [
+      "tests/permissions/audit-rotation.test.ts",
+      "tests/permissions/audit-scheduler.test.ts",
+      "tests/permissions/audit-telemetry.test.ts"
+    ]
   },
   {
     "id": "d23d056c0",
@@ -488,7 +651,12 @@
     "srcFiles": [
       "src/cli/repl.ts"
     ],
-    "tier": 2
+    "tier": 2,
+    "passToPass": [
+      "tests/cli/args-gc.test.ts",
+      "tests/cli/args-purge.test.ts",
+      "tests/cli/args.test.ts"
+    ]
   },
   {
     "id": "d3747eb16",
@@ -501,7 +669,12 @@
     "srcFiles": [
       "src/cli/slash/commands/critique.ts"
     ],
-    "tier": 2
+    "tier": 2,
+    "passToPass": [
+      "tests/cli/slash/dispatch.test.ts",
+      "tests/cli/slash/history.test.ts",
+      "tests/cli/slash/hooks.test.ts"
+    ]
   },
   {
     "id": "d5849eade",
@@ -516,7 +689,12 @@
       "src/cli/slash/commands/pin.ts",
       "src/storage/repos/context-pins.ts"
     ],
-    "tier": 2
+    "tier": 2,
+    "passToPass": [
+      "tests/cli/slash/agent-policy.test.ts",
+      "tests/cli/slash/commands.test.ts",
+      "tests/cli/slash/dispatch.test.ts"
+    ]
   },
   {
     "id": "d8451612e",
@@ -532,7 +710,12 @@
       "src/tools/builtin/bash-list.ts",
       "src/tools/builtin/index.ts"
     ],
-    "tier": 2
+    "tier": 2,
+    "passToPass": [
+      "tests/cli/args-gc.test.ts",
+      "tests/cli/args-purge.test.ts",
+      "tests/cli/args.test.ts"
+    ]
   },
   {
     "id": "d8e189cec",
@@ -561,7 +744,12 @@
     "srcFiles": [
       "src/cli/repl.ts"
     ],
-    "tier": 2
+    "tier": 2,
+    "passToPass": [
+      "tests/cli/args-gc.test.ts",
+      "tests/cli/args-purge.test.ts",
+      "tests/cli/args.test.ts"
+    ]
   },
   {
     "id": "dce1cb6a9",
@@ -588,7 +776,12 @@
     "srcFiles": [
       "src/permissions/resolvers/bash.ts"
     ],
-    "tier": 3
+    "tier": 3,
+    "passToPass": [
+      "tests/permissions/audit-rotation.test.ts",
+      "tests/permissions/audit-scheduler.test.ts",
+      "tests/permissions/audit-telemetry.test.ts"
+    ]
   },
   {
     "id": "e38ea07f1",
@@ -601,7 +794,12 @@
     "srcFiles": [
       "src/tools/builtin/git.ts"
     ],
-    "tier": 2
+    "tier": 2,
+    "passToPass": [
+      "tests/tools/_bash-cwd.test.ts",
+      "tests/tools/bash-background.test.ts",
+      "tests/tools/bash-broker.test.ts"
+    ]
   },
   {
     "id": "e763e1c92",
@@ -616,7 +814,12 @@
       "src/diff/git-patch.ts",
       "src/tools/builtin/git-apply-patch.ts"
     ],
-    "tier": 3
+    "tier": 3,
+    "passToPass": [
+      "tests/diff/line-diff.test.ts",
+      "tests/tools/_bash-cwd.test.ts",
+      "tests/tools/bash-background.test.ts"
+    ]
   },
   {
     "id": "edfed8a24",
@@ -630,7 +833,12 @@
     "srcFiles": [
       "src/permissions/protected_paths.ts"
     ],
-    "tier": 1
+    "tier": 1,
+    "passToPass": [
+      "tests/permissions/audit-rotation.test.ts",
+      "tests/permissions/audit-scheduler.test.ts",
+      "tests/permissions/audit-telemetry.test.ts"
+    ]
   },
   {
     "id": "f1fafd62b",
@@ -643,7 +851,12 @@
     "srcFiles": [
       "src/tools/builtin/git.ts"
     ],
-    "tier": 2
+    "tier": 2,
+    "passToPass": [
+      "tests/tools/_bash-cwd.test.ts",
+      "tests/tools/bash-background.test.ts",
+      "tests/tools/bash-broker.test.ts"
+    ]
   },
   {
     "id": "f3fdc7a92",
@@ -657,7 +870,12 @@
       "src/subagents/runtime.ts",
       "src/subagents/spawn-factory.ts"
     ],
-    "tier": 2
+    "tier": 2,
+    "passToPass": [
+      "tests/subagents/builtin-embedded.test.ts",
+      "tests/subagents/canonical-seeds.test.ts",
+      "tests/subagents/e2e.test.ts"
+    ]
   },
   {
     "id": "f51ba40f6",
@@ -670,7 +888,12 @@
     "srcFiles": [
       "src/cli/repl.ts"
     ],
-    "tier": 2
+    "tier": 2,
+    "passToPass": [
+      "tests/cli/args.test.ts",
+      "tests/cli/bootstrap.test.ts",
+      "tests/cli/checkpoints.test.ts"
+    ]
   },
   {
     "id": "fa8a694c2",
@@ -687,7 +910,12 @@
       "src/harness/resume.ts",
       "src/tui/render/tool-card.ts"
     ],
-    "tier": 3
+    "tier": 3,
+    "passToPass": [
+      "tests/harness/abortable.test.ts",
+      "tests/harness/budget-defaults.test.ts",
+      "tests/harness/checkpoints.test.ts"
+    ]
   },
   {
     "id": "fc6619bd7",
@@ -700,6 +928,11 @@
     "srcFiles": [
       "src/permissions/resolvers/bash.ts"
     ],
-    "tier": 2
+    "tier": 2,
+    "passToPass": [
+      "tests/permissions/audit-rotation.test.ts",
+      "tests/permissions/audit-scheduler.test.ts",
+      "tests/permissions/audit-telemetry.test.ts"
+    ]
   }
 ]

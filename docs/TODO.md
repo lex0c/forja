@@ -1886,11 +1886,14 @@ Close before running the corpus on third-party models:
   (`bunfig.toml`/`tsconfig.json`/`package.json`/`bun.lock` + the `.env*` bun auto-loads).
   `materializeSweWorkspace` also strips the leak surface (`docs/BACKLOG.md`/`docs/TODO.md`/
   `evals/swe-bench/`) from the workspace.
-- **PASS_TO_PASS + the visible-test caveat.** ⏳ The verifier runs ONLY the one oracle file and the
-  oracle is VISIBLE in the workspace, so a model can hard-code the test's exact inputs (overfit)
-  with no regression check. Classic SWE-bench HIDES the test for this reason. Add a PASS_TO_PASS
-  sample (a few unrelated tests must still pass) and consider withholding the oracle from the agent
-  (give the failure output, not the file).
+- **PASS_TO_PASS** ✅ DONE (the regression half). Each corpus task carries `passToPass` = ≤3 sibling
+  test files (same dir as the oracle) that pass at C, vetted under the runner's `cwd-rw` sandbox; the
+  runner runs them as a second verifier and records `regressed` (oracle passed but a sibling broke).
+  `scripts/swe-bench-passtopass.ts` enriches the corpus. The siblings are same-DIR (broad/collateral)
+  — a same-`srcFiles` heuristic would tighten the overfit guard (follow-up).
+- **Withhold the visible oracle** ⏳ NOT done. The oracle is VISIBLE in the workspace, so a model can
+  hard-code the test's exact inputs. Classic SWE-bench HIDES the test (gives only the failure output).
+  A separate, bigger design change (the verifier needs the test, but the agent shouldn't see it).
 
 **Prerequisite — ✅ DONE.** The `command_succeeds` expectation kind: runs an author-specified
 command in the workspace cwd after the agent, asserts exit 0, with a per-command timeout

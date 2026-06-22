@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { computePassToPass } from '../../scripts/swe-bench-passtopass.ts';
 import { executeCase } from '../../src/evals/executor.ts';
 import {
   gitToplevel,
@@ -365,5 +366,35 @@ describe('swe-bench workspace guards (synthetic repo)', () => {
     expect(existsSync(join(cwd, 'tests/extra.ts'))).toBe(false); // model-ADDED test file → gone (rm -rf tests/)
     expect(existsSync(join(cwd, 'bunfig.toml'))).toBe(false); // added config → deleted
     expect(existsSync(join(cwd, '.env'))).toBe(false); // bun auto-loads .env → added .env deleted
+  });
+
+  // Anti-cheat gate #9: computePassToPass mines sibling tests that pass at the FIXED state, so the
+  // model's fix must keep them green — keeps the ones that pass, drops a sibling that fails.
+  test('computePassToPass keeps siblings passing at C and drops a failing one', () => {
+    const mk = (name: string, expected: number): string =>
+      `import { test, expect } from 'bun:test';\nimport { x } from '../src/x.ts';\ntest('${name}', () => expect(x()).toBe(${expected}));\n`;
+    const { repo, head } = makeRepo([
+      { 'src/x.ts': 'export const x = () => 2;\n' }, // buggy parent
+      {
+        'src/x.ts': 'export const x = () => 1;\n', // gold fix
+        'tests/x.test.ts': mk('oracle', 1),
+        'tests/sib-ok.test.ts': mk('ok', 1), // passes at C → kept
+        'tests/sib-bad.test.ts': mk('bad', 999), // fails at C → dropped
+      },
+    ]);
+    mkdirSync(join(repo, 'node_modules'), { recursive: true }); // materialize guard (bun:test is builtin)
+    const p2p = computePassToPass({
+      task: {
+        id: head.slice(0, 9),
+        commit: head,
+        subject: '',
+        kind: 'bug',
+        testFiles: ['tests/x.test.ts'],
+        srcFiles: ['src/x.ts'],
+        tier: 1,
+      },
+      repoRoot: repo,
+    });
+    expect(p2p).toEqual(['tests/sib-ok.test.ts']);
   });
 });

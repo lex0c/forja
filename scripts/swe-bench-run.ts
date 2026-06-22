@@ -28,6 +28,8 @@ interface Task {
   testFiles: string[];
   srcFiles: string[];
   tier: 1 | 2 | 3;
+  // Sibling tests that pass at C — the fix must keep them green (anti-cheat #9 PASS_TO_PASS).
+  passToPass?: string[];
 }
 
 const repoRoot = gitToplevel(process.cwd());
@@ -72,22 +74,35 @@ const promptFor = (t: Task): string =>
   `see the failure, then fix the SOURCE under src/ so the test(s) pass. Do NOT edit the test files — ` +
   `they specify the required behavior. You are done when \`bun test ${t.testFiles.join(' ')}\` exits 0.`;
 
-const toCase = (t: Task): EvalCase => ({
-  name: `swe/${t.id}`,
-  sourcePath: `corpus/${t.id}.json`,
-  prompt: promptFor(t),
-  setup: { swe: { commit: t.commit } },
-  budget: { maxSteps },
+const toCase = (t: Task): EvalCase => {
   // OUTCOME oracle: the gold test, run sandboxed (cwd-rw, network off, failClosed).
-  expect: [
+  const caseExpect: EvalCase['expect'] = [
     {
       kind: 'command_succeeds',
       command: `bun test ${t.testFiles.join(' ')}`,
       sandboxed: true,
       timeoutMs: 180_000,
     },
-  ],
-});
+  ];
+  // PASS_TO_PASS (#9): the fix must keep sibling tests green — catches a fix that overfits the
+  // visible oracle but breaks other callers. Second expectation ⇒ r.passed needs BOTH.
+  if (t.passToPass?.length) {
+    caseExpect.push({
+      kind: 'command_succeeds',
+      command: `bun test ${t.passToPass.join(' ')}`,
+      sandboxed: true,
+      timeoutMs: 180_000,
+    });
+  }
+  return {
+    name: `swe/${t.id}`,
+    sourcePath: `corpus/${t.id}.json`,
+    prompt: promptFor(t),
+    setup: { swe: { commit: t.commit } },
+    budget: { maxSteps },
+    expect: caseExpect,
+  };
+};
 
 let tasks = corpus;
 if (tier !== undefined) tasks = tasks.filter((t) => t.tier === tier);
@@ -112,6 +127,8 @@ interface Row {
   outputTok: number;
   costUsd: number;
   unmetered: boolean;
+  // Oracle passed but a PASS_TO_PASS sibling regressed — overfit/collateral, visible separately.
+  regressed: boolean;
 }
 const rows: Row[] = [];
 for (const t of tasks) {
@@ -121,6 +138,11 @@ for (const t of tasks) {
       bootstrapOverride: { modelId: model },
       perCaseTimeoutMs: perTaskTimeout,
     });
+    // regressed = oracle (expectation 0) passed but the PASS_TO_PASS sibling set (expectation 1)
+    // failed. No passToPass ⇒ only one expectation ⇒ never regressed.
+    const oraclePassed = r.expectations[0]?.passed ?? false;
+    const p2pPassed = r.expectations.length > 1 ? (r.expectations[1]?.passed ?? false) : true;
+    const regressed = oraclePassed && !p2pPassed;
     rows.push({
       id: t.id,
       tier: t.tier,
@@ -134,10 +156,11 @@ for (const t of tasks) {
       outputTok: r.usage?.output ?? 0,
       costUsd: r.costUsd,
       unmetered: r.unmetered ?? false,
+      regressed,
     });
     process.stderr.write(
-      `${r.passed ? 'PASS' : 'fail'} (${r.steps} steps, ${Math.round(r.durationMs / 1000)}s, ` +
-        `${(r.usage?.output ?? 0) / 1000}k out tok, ${r.status})\n`,
+      `${r.passed ? 'PASS' : regressed ? 'REGRESSED' : 'fail'} (${r.steps} steps, ` +
+        `${Math.round(r.durationMs / 1000)}s, ${(r.usage?.output ?? 0) / 1000}k out tok, ${r.status})\n`,
     );
   } catch (e) {
     rows.push({
@@ -153,6 +176,7 @@ for (const t of tasks) {
       outputTok: 0,
       costUsd: 0,
       unmetered: false,
+      regressed: false,
     });
     process.stderr.write(`ERROR ${e instanceof Error ? e.message : String(e)}\n`);
   }
@@ -165,7 +189,7 @@ const csvPath = join(dir, 'results.csv');
 if (!existsSync(csvPath)) {
   writeFileSync(
     csvPath,
-    'model,id,tier,kind,passed,status,exit_reason,steps,duration_ms,input_tokens,output_tokens,cost_usd,unmetered\n',
+    'model,id,tier,kind,passed,regressed,status,exit_reason,steps,duration_ms,input_tokens,output_tokens,cost_usd,unmetered\n',
   );
 }
 appendFileSync(
@@ -173,7 +197,7 @@ appendFileSync(
   `${rows
     .map(
       (r) =>
-        `${model},${r.id},${r.tier},${r.kind},${r.passed ? 1 : 0},${r.status},${r.exitReason},${r.steps},${r.durationMs},${r.inputTok},${r.outputTok},${r.costUsd.toFixed(4)},${r.unmetered ? 1 : 0}`,
+        `${model},${r.id},${r.tier},${r.kind},${r.passed ? 1 : 0},${r.regressed ? 1 : 0},${r.status},${r.exitReason},${r.steps},${r.durationMs},${r.inputTok},${r.outputTok},${r.costUsd.toFixed(4)},${r.unmetered ? 1 : 0}`,
     )
     .join('\n')}\n`,
 );
@@ -190,6 +214,7 @@ for (const r of rows) {
   if (r.passed) bucket.pass++;
 }
 const passed = rows.filter((r) => r.passed).length;
+const regressedCount = rows.filter((r) => r.regressed).length;
 const cost = rows.reduce((s, r) => s + r.costUsd, 0);
 const outTok = rows.reduce((s, r) => s + r.outputTok, 0);
 const avgSec = rows.length ? rows.reduce((s, r) => s + r.durationMs, 0) / rows.length / 1000 : 0;
@@ -197,7 +222,8 @@ const unmetered = rows.some((r) => r.unmetered);
 // For unmetered providers (Ollama Cloud) USD is $0 — report output tokens + wall-clock instead.
 const effort = unmetered ? `${Math.round(outTok / 1000)}k out tok` : `$${cost.toFixed(2)}`;
 process.stderr.write(
-  `\n=== ${model}: ${passed}/${rows.length} (${rows.length ? Math.round((100 * passed) / rows.length) : 0}%)  ${effort}  avg ${avgSec.toFixed(0)}s/task ===\n`,
+  `\n=== ${model}: ${passed}/${rows.length} (${rows.length ? Math.round((100 * passed) / rows.length) : 0}%)  ` +
+    `${regressedCount ? `${regressedCount} regressed (oracle ok, sibling broke)  ` : ''}${effort}  avg ${avgSec.toFixed(0)}s/task ===\n`,
 );
 for (const tr of [1, 2, 3] as const) {
   if (byTier[tr].n) process.stderr.write(`  tier${tr}: ${byTier[tr].pass}/${byTier[tr].n}\n`);
