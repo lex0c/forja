@@ -61,6 +61,10 @@ const PROVIDER_HOST: Record<string, string> = {
   ollama: 'ollama.com',
   anthropic: 'api.anthropic.com',
   openai: 'api.openai.com',
+  // Seeded openrouter/* and google/* entries ship with NO base_url (the adapter uses its own default
+  // endpoint), so the egress host must come from here or allowHostsFor throws before any task runs.
+  openrouter: 'openrouter.ai',
+  google: 'generativelanguage.googleapis.com',
 };
 
 const repoRoot = gitToplevel(process.cwd());
@@ -180,6 +184,7 @@ const buildImage = (rebuild: boolean): void => {
 interface CatalogEntry {
   id: string;
   base_url?: string;
+  api_key_env?: string;
 }
 
 // Read+parse the mounted model catalog once. The egress host of a model comes from its entry's
@@ -226,6 +231,20 @@ const allowHostsFor = (modelIds: string[]): string[] => {
     throw new Error(`swe-bench-run: no known egress host for models ${modelIds.join(', ')}`);
   return [...hosts];
 };
+
+// The distinct api_key_env of the selected models, read from the catalog — forwarded into each
+// container so the in-container forja can construct the provider. Entries with no key (a keyless
+// local) are skipped; a model absent from the catalog already fails loudly in allowHostsFor.
+const apiKeyEnvsFor = (modelIds: string[]): string[] => {
+  const entries = loadCatalogEntries();
+  const envs = new Set<string>();
+  for (const m of modelIds) {
+    const env = entries.find((e) => e.id === m)?.api_key_env;
+    if (env !== undefined && env !== '') envs.add(env);
+  }
+  return [...envs];
+};
+const apiKeyEnvs = apiKeyEnvsFor(models);
 
 // The sidecar: an --internal network (no direct egress) + the proxy (the only egress, allowlisting
 // the model hosts). Shared across all tasks in the run.
@@ -374,12 +393,10 @@ const runTaskInner = (model: string, t: Task, logDir: string, work: string): Row
       `HTTPS_PROXY=http://${PROXY}:${PROXY_PORT}`,
       '-e',
       `HTTP_PROXY=http://${PROXY}:${PROXY_PORT}`,
-      '-e',
-      'OLLAMA_API_KEY',
-      '-e',
-      'ANTHROPIC_API_KEY',
-      '-e',
-      'OPENAI_API_KEY',
+      // Forward the api_key_env of EVERY selected model (read from the catalog), not a fixed list — a
+      // google/openrouter/custom entry uses GOOGLE_API_KEY / OPENROUTER_API_KEY / a gateway key, and a
+      // missing one fails provider construction inside the container.
+      ...apiKeyEnvs.flatMap((k) => ['-e', k]),
       ...phaseEnv,
       IMAGE,
     ];
@@ -449,15 +466,20 @@ const runTaskInner = (model: string, t: Task, logDir: string, work: string): Row
   writeFileSync(join(dest, 'proxy.log'), dockerLogs(PROXY, 200));
 
   const oraclePassed = oracle === 0;
-  const p2pPassed = p2p === undefined ? true : p2p === 0;
-  const regressed = oraclePassed && !p2pPassed;
+  // A task with a PASS_TO_PASS set MUST produce a .p2p exit code. A MISSING one (verifier killed /
+  // timed out after .result but before .p2p) means the regression check never ran — that's an ERROR,
+  // NOT a silent pass. Only a task with no siblings defaults the regression check to "passed".
+  const expectsP2P = (t.passToPass?.length ?? 0) > 0;
+  const p2pMissing = expectsP2P && p2p === undefined;
+  const p2pPassed = expectsP2P ? p2p === 0 : true;
+  const regressed = oraclePassed && expectsP2P && p2p !== undefined && p2p !== 0;
   const passed = oraclePassed && p2pPassed;
   // Metrics come from the AGENT log (the done-line) — the verifier container has no agent summary.
   const m = parseMetrics(agentLog);
   const durationMs = agentMs;
   const status = agentTimedOut
     ? 'timeout'
-    : restoreFailed
+    : restoreFailed || p2pMissing
       ? 'error'
       : oracle === undefined
         ? 'error'
