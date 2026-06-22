@@ -36,3 +36,8 @@ dist/
 # Model ranking: results.csv is the versioned append-only history; results.json
 # is the regenerated latest-batch raw (read by RANKING_INGEST), not versioned.
 evals/ranking/results.json
+
+# Self-SWE-bench: per-run results CSVs + per-task debug logs. Gitignored WHILE the bench
+# stabilizes — we'll version the curated capability numbers once it's mature (docs/BENCHMARK.md).
+evals/swe-bench/results*.csv
+evals/swe-bench/logs/

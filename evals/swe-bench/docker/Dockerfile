@@ -16,11 +16,13 @@ RUN go mod init egress-proxy \
 # --- task runner image ---
 FROM oven/bun:1.3.13-slim
 
-# curl + ca-certificates for the egress self-check; bash for the entrypoint's tee. No iptables: the
-# force-through is a network property (the task container sits on an `--internal` network whose only
-# member with egress is the proxy sidecar), not a kernel rule — so no NET_ADMIN, no host-firewall dep.
+# git: the agent uses it (diff/status to reason about its edits) AND many tasks' tests drive git
+# (checkpoint/undo wiring) — without it those commands fail "git not found", which both contaminates
+# the verifier and traps the agent in a retry loop. curl + ca-certificates for the egress self-check;
+# bash for the entrypoint's tee. No iptables: the force-through is a network property (the task
+# container sits on an `--internal` network whose only egress member is the proxy), not a kernel rule.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends curl ca-certificates bash \
+  && apt-get install -y --no-install-recommends git curl ca-certificates bash \
   && rm -rf /var/lib/apt/lists/*
 
 # Bake the deps INTO the image (build-time network). Total isolation: the RUN-time task container

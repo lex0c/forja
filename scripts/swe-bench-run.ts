@@ -1,24 +1,36 @@
-// self-SWE-bench corpus runner (docs/TODO.md Phase 2, task #10). Runs a model over the curated
-// corpus (evals/swe-bench/corpus.json): each task materializes the buggy parent tree + the failing
-// test (setup.swe), the model fixes src/ to make the test pass, and a SANDBOXED `bun test` verifies
-// the OUTCOME. Reports per-tier pass rate and appends per-task rows to evals/swe-bench/results.csv.
+// self-SWE-bench corpus runner (Docker orchestrator). Runs each model over the curated corpus
+// (evals/swe-bench/corpus.json) as EPHEMERAL CONTAINERS PER TASK: the buggy parent tree + the
+// failing test are materialized and mounted at /task, the compiled forja binary (the full agent
+// loop) fixes src/ in ONE container, then — after the host re-materializes the canonical test
+// surface from commit C (anti-cheat: discard any agent edits to tests/ or runner config) — a SECOND
+// container runs `bun test` to verify the OUTCOME. The answer repo is NEVER present (no .git/corpus/
+// gold) and egress is locked to the model host alone (see evals/swe-bench/docker/). Appends per-task
+// rows to evals/swe-bench/results.csv and writes per-task debug logs under evals/swe-bench/logs/<run>/.
 //
 // The prompt is the FAILING TEST only — never the commit message / BACKLOG (that would leak the fix).
+// Model support mirrors the ranking: the host's model_providers.json is mounted, `--models` selects.
 //
-// Anti-cheat gates IN PLACE: the AGENT runs network-off (denyNetwork — curl/git-clone of the gold
-// in the public repo can't reach the network) and the full test surface (tests/ tree + runner config
-// + .env) is restored from C before the verifier. NOT yet gated: PASS_TO_PASS / overfit — a model
-// can hard-code the VISIBLE oracle's inputs, so a passing task isn't proof of a general fix until #9
-// (PASS_TO_PASS + withhold the oracle). docs/TODO.md anti-cheat gates.
-//
-// Run: bun run scripts/swe-bench-run.ts --model ollama/devstral-2:123b [--tier N] [--limit N]
-//      [--id <sha>] [--max-steps N] [--timeout MS]
+// Run: bun run scripts/swe-bench-run.ts --models ollama/devstral-2:123b[,anthropic/claude-opus-4-8]
+//      [--tier N] [--limit N] [--id <sha>] [--max-steps N] [--timeout MS]
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
-import { executeCase } from '../src/evals/executor.ts';
-import { gitToplevel } from '../src/evals/swe-bench/workspace.ts';
-import type { EvalCase } from '../src/evals/types.ts';
+import {
+  gitToplevel,
+  materializeSweWorkspace,
+  restoreSweTests,
+} from '../src/evals/swe-bench/workspace.ts';
 
 interface Task {
   id: string;
@@ -28,9 +40,26 @@ interface Task {
   testFiles: string[];
   srcFiles: string[];
   tier: 1 | 2 | 3;
-  // Sibling tests that pass at C — the fix must keep them green (anti-cheat #9 PASS_TO_PASS).
   passToPass?: string[];
 }
+
+const IMAGE = 'forja-swe-bench';
+const NETWORK = 'forja-swe-egress';
+const PROXY = 'forja-swe-proxy';
+const PROXY_PORT = 8889;
+// The verifier container only runs `bun test` (no agent loop), so it needs far less than the
+// per-task agent budget. A fixed cap keeps a hung test from holding a task open for the full
+// per-task timeout.
+const VERIFY_TIMEOUT = 180_000;
+const catalogPath = join(userInfo().homedir, '.config', 'forja', 'model_providers.json');
+// The provider prefix of a model id maps to the host its base_url points at — the egress allowlist
+// is exactly the selected models' hosts, nothing else. (Local Ollama would be host.docker.internal;
+// the bench targets the cloud endpoints the ranking uses.)
+const PROVIDER_HOST: Record<string, string> = {
+  ollama: 'ollama.com',
+  anthropic: 'api.anthropic.com',
+  openai: 'api.openai.com',
+};
 
 const repoRoot = gitToplevel(process.cwd());
 const corpus: Task[] = JSON.parse(
@@ -38,14 +67,12 @@ const corpus: Task[] = JSON.parse(
 );
 
 const argv = process.argv.slice(2);
-let model = 'ollama/devstral-2:123b';
+let models: string[] = ['ollama/devstral-2:123b'];
 let limit: number | undefined;
 let tier: number | undefined;
 let id: string | undefined;
 let maxSteps = 40;
 let perTaskTimeout = 900_000;
-// Parse an integer flag value or FAIL LOUD — a bad/missing value must not silently become NaN
-// (which would select 0 tasks, abort every case at t=0, or uncap the step budget).
 const intArg = (raw: string | undefined, flag: string): number => {
   const n = Number.parseInt(raw ?? '', 10);
   if (Number.isNaN(n)) {
@@ -56,7 +83,12 @@ const intArg = (raw: string | undefined, flag: string): number => {
 };
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
-  if (a === '--model') model = argv[++i] ?? model;
+  if (a === '--models')
+    models = (argv[++i] ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+  else if (a === '--model') models = [argv[++i] ?? models[0]];
   else if (a === '--limit') limit = intArg(argv[++i], '--limit');
   else if (a === '--tier') tier = intArg(argv[++i], '--tier');
   else if (a === '--id') id = argv[++i];
@@ -67,6 +99,10 @@ for (let i = 0; i < argv.length; i++) {
     process.exit(1);
   }
 }
+if (models.length === 0) {
+  process.stderr.write('swe-bench-run: --models needs at least one model id\n');
+  process.exit(1);
+}
 
 // The model receives the failing test as the spec — nothing from the commit/BACKLOG.
 const promptFor = (t: Task): string => {
@@ -74,51 +110,165 @@ const promptFor = (t: Task): string => {
   return `One or more tests in this repository are failing. Run \`${cmd}\` to see the failure, then fix the SOURCE under src/ so the test(s) pass. Do NOT edit the test files — they specify the required behavior. You are done when \`${cmd}\` exits 0.`;
 };
 
-const toCase = (t: Task): EvalCase => {
-  // OUTCOME oracle: the gold test, run sandboxed (cwd-rw, network off, failClosed).
-  const caseExpect: EvalCase['expect'] = [
-    {
-      kind: 'command_succeeds',
-      command: `bun test ${t.testFiles.join(' ')}`,
-      sandboxed: true,
-      timeoutMs: 180_000,
-    },
-  ];
-  // PASS_TO_PASS (#9): the fix must keep sibling tests green — catches a fix that overfits the
-  // visible oracle but breaks other callers. Second expectation ⇒ r.passed needs BOTH.
-  if (t.passToPass?.length) {
-    caseExpect.push({
-      kind: 'command_succeeds',
-      command: `bun test ${t.passToPass.join(' ')}`,
-      sandboxed: true,
-      timeoutMs: 180_000,
-    });
+const sh = (cmd: string[], soft = false): string => {
+  const r = Bun.spawnSync({ cmd, stdout: 'pipe', stderr: 'pipe' });
+  if (!r.success && !soft) {
+    throw new Error(
+      `swe-bench-run: \`${cmd.join(' ')}\` failed: ${r.stderr.toString().trim().slice(-300)}`,
+    );
   }
-  return {
-    name: `swe/${t.id}`,
-    sourcePath: `corpus/${t.id}.json`,
-    prompt: promptFor(t),
-    setup: { swe: { commit: t.commit } },
-    budget: { maxSteps },
-    expect: caseExpect,
-  };
+  return r.stdout.toString();
 };
 
-let tasks = corpus;
-if (tier !== undefined) tasks = tasks.filter((t) => t.tier === tier);
-if (id !== undefined) tasks = tasks.filter((t) => t.id.startsWith(id ?? ''));
-if (limit !== undefined) tasks = tasks.slice(0, limit);
+// `docker logs` writes the container's stdout to ITS stdout and the container's stderr to ITS stderr;
+// the proxy logs ("listening", ALLOW/DENY) go to stderr, so capture BOTH or they're invisible.
+const dockerLogs = (name: string, tail?: number): string => {
+  const cmd =
+    tail !== undefined
+      ? ['docker', 'logs', '--tail', String(tail), name]
+      : ['docker', 'logs', name];
+  const r = Bun.spawnSync({ cmd, stdout: 'pipe', stderr: 'pipe' });
+  return r.stdout.toString() + r.stderr.toString();
+};
 
-process.stderr.write(
-  `swe-bench-run: ${model} over ${tasks.length}/${corpus.length} task(s) ` +
-    `(maxSteps ${maxSteps}, per-task ${Math.round(perTaskTimeout / 1000)}s)\n`,
-);
+// Build the bench image: the compiled binary (built on demand) + the manifest go into the docker
+// context; the multi-stage Dockerfile bakes the deps + the Go proxy. Context files are cleaned after.
+const buildImage = (): void => {
+  const dist = join(repoRoot, 'dist');
+  let binary = existsSync(dist)
+    ? readdirSync(dist).find((f) => /^forja-[\d.]+-linux-x64$/.test(f))
+    : undefined;
+  if (binary === undefined) {
+    process.stderr.write('swe-bench-run: building the linux-x64 binary (`bun run build`)...\n');
+    const b = Bun.spawnSync({
+      cmd: ['bun', 'run', 'build'],
+      cwd: repoRoot,
+      stdout: 'inherit',
+      stderr: 'inherit',
+    });
+    if (!b.success) throw new Error('swe-bench-run: `bun run build` failed');
+    binary = readdirSync(dist).find((f) => /^forja-[\d.]+-linux-x64$/.test(f));
+    if (binary === undefined)
+      throw new Error('swe-bench-run: no linux-x64 binary in dist/ after build');
+  }
+  const ctx = join(repoRoot, 'evals/swe-bench/docker');
+  copyFileSync(join(dist, binary), join(ctx, 'forja'));
+  copyFileSync(join(repoRoot, 'package.json'), join(ctx, 'package.json'));
+  copyFileSync(join(repoRoot, 'bun.lock'), join(ctx, 'bun.lock'));
+  process.stderr.write('swe-bench-run: docker build...\n');
+  try {
+    sh(['docker', 'build', '-t', IMAGE, ctx]);
+  } finally {
+    for (const f of ['forja', 'package.json', 'bun.lock']) rmSync(join(ctx, f), { force: true });
+  }
+};
+
+// One catalog entry — only the fields the egress allowlist needs. The mounted file is the SAME
+// catalog forja reads in-container (model_providers.json), so `base_url` here is the host the
+// adapter will actually dial.
+interface CatalogEntry {
+  id: string;
+  base_url?: string;
+}
+
+// Read+parse the mounted model catalog once. The egress host of a model comes from its entry's
+// `base_url` when set (e.g. Ollama Cloud's https://ollama.com); the catalog is the source of truth,
+// so a custom/self-hosted endpoint is honored instead of being silently dropped.
+const loadCatalogEntries = (): CatalogEntry[] => {
+  try {
+    const parsed = JSON.parse(readFileSync(catalogPath, 'utf8')) as { models?: CatalogEntry[] };
+    return Array.isArray(parsed.models) ? parsed.models : [];
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    process.stderr.write(`swe-bench-run: could not parse catalog ${catalogPath} (${msg})\n`);
+    return [];
+  }
+};
+
+// The egress allowlist is EXACTLY the selected models' hosts. Per model: prefer the catalog
+// entry's `base_url` hostname; else the provider-family default (PROVIDER_HOST). If NEITHER yields
+// a host, THROW — opening egress for only the resolvable models would let the unresolved model's
+// tasks fail with masked network errors, so a missing host is a loud configuration error.
+const allowHostsFor = (modelIds: string[]): string[] => {
+  const entries = loadCatalogEntries();
+  const hosts = new Set<string>();
+  for (const m of modelIds) {
+    let host: string | undefined;
+    const baseUrl = entries.find((e) => e.id === m)?.base_url;
+    if (baseUrl !== undefined && baseUrl !== '') {
+      try {
+        host = new URL(baseUrl).hostname;
+      } catch {
+        // Fall through to PROVIDER_HOST below if base_url is malformed.
+      }
+    }
+    if (host === undefined) host = PROVIDER_HOST[m.split('/')[0] ?? ''];
+    if (host === undefined || host === '') {
+      throw new Error(
+        `swe-bench-run: no egress host for model '${m}' — no base_url in ${catalogPath} and no ` +
+          `default for provider '${m.split('/')[0] ?? ''}'`,
+      );
+    }
+    hosts.add(host);
+  }
+  if (hosts.size === 0)
+    throw new Error(`swe-bench-run: no known egress host for models ${modelIds.join(', ')}`);
+  return [...hosts];
+};
+
+// The sidecar: an --internal network (no direct egress) + the proxy (the only egress, allowlisting
+// the model hosts). Shared across all tasks in the run.
+const ensureSidecar = (allowHosts: string[]): void => {
+  teardownSidecar();
+  sh(['docker', 'network', 'create', '--internal', NETWORK]);
+  sh([
+    'docker',
+    'run',
+    '-d',
+    '--name',
+    PROXY,
+    '--network',
+    NETWORK,
+    '-e',
+    `EGRESS_ALLOW=${allowHosts.join(',')}`,
+    '--entrypoint',
+    '/usr/local/bin/egress-proxy',
+    IMAGE,
+  ]);
+  // Give the proxy (only) internet via the default `bridge` network. Soft: a daemon configured
+  // without a `bridge` network would throw here, but the proxy still needs egress, so warn loudly
+  // rather than abort — the readiness poll below fails clearly if the proxy ends up with no route.
+  const bridge = Bun.spawnSync({
+    cmd: ['docker', 'network', 'connect', 'bridge', PROXY],
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  if (!bridge.success) {
+    const detail = bridge.stderr.toString().trim().slice(-200);
+    process.stderr.write(
+      `swe-bench-run: could not connect proxy to the 'bridge' network (${detail}); the proxy may have no egress — check the daemon has a default bridge network\n`,
+    );
+  }
+  // Poll WITH a delay — the container start (image layers + namespace) takes a few seconds; a tight
+  // no-delay loop burns its iterations before the proxy logs "listening" and gives up too early.
+  for (let i = 0; i < 60; i++) {
+    if (dockerLogs(PROXY).includes('listening')) return;
+    Bun.sleepSync(250);
+  }
+  throw new Error('swe-bench-run: egress proxy did not come up');
+};
+const teardownSidecar = (): void => {
+  sh(['docker', 'rm', '-f', PROXY], true);
+  sh(['docker', 'network', 'rm', NETWORK], true);
+};
 
 interface Row {
+  model: string;
   id: string;
   tier: number;
   kind: string;
   passed: boolean;
+  regressed: boolean;
   status: string;
   exitReason: string;
   steps: number;
@@ -127,105 +277,337 @@ interface Row {
   outputTok: number;
   costUsd: number;
   unmetered: boolean;
-  // Oracle passed but a PASS_TO_PASS sibling regressed — overfit/collateral, visible separately.
-  regressed: boolean;
 }
-const rows: Row[] = [];
-for (const t of tasks) {
-  process.stderr.write(`  [${t.id}] tier${t.tier} ${t.kind} ${t.subject.slice(0, 42)} ... `);
-  try {
-    const r = await executeCase(toCase(t), {
-      bootstrapOverride: { modelId: model },
-      perCaseTimeoutMs: perTaskTimeout,
-    });
-    // regressed = oracle (expectation 0) passed but the PASS_TO_PASS sibling set (expectation 1)
-    // failed. No passToPass ⇒ only one expectation ⇒ never regressed.
-    const oraclePassed = r.expectations[0]?.passed ?? false;
-    const p2pPassed = r.expectations.length > 1 ? (r.expectations[1]?.passed ?? false) : true;
-    const regressed = oraclePassed && !p2pPassed;
-    rows.push({
-      id: t.id,
-      tier: t.tier,
-      kind: t.kind,
-      passed: r.passed,
-      status: r.status ?? '?',
-      exitReason: r.exitReason ?? '',
-      steps: r.steps,
-      durationMs: r.durationMs,
-      inputTok: r.usage?.input ?? 0,
-      outputTok: r.usage?.output ?? 0,
-      costUsd: r.costUsd,
-      unmetered: r.unmetered ?? false,
-      regressed,
-    });
-    process.stderr.write(
-      `${r.passed ? 'PASS' : regressed ? 'REGRESSED' : 'fail'} (${r.steps} steps, ` +
-        `${Math.round(r.durationMs / 1000)}s, ${(r.usage?.output ?? 0) / 1000}k out tok, ${r.status})\n`,
-    );
-  } catch (e) {
-    rows.push({
-      id: t.id,
-      tier: t.tier,
-      kind: t.kind,
-      passed: false,
-      status: 'error',
-      exitReason: 'error',
-      steps: 0,
-      durationMs: 0,
-      inputTok: 0,
-      outputTok: 0,
-      costUsd: 0,
-      unmetered: false,
-      regressed: false,
-    });
-    process.stderr.write(`ERROR ${e instanceof Error ? e.message : String(e)}\n`);
+
+const readExit = (path: string): number | undefined => {
+  if (!existsSync(path)) return undefined;
+  const n = Number.parseInt(readFileSync(path, 'utf8').trim(), 10);
+  return Number.isNaN(n) ? undefined : n;
+};
+
+// Parse forja's done line, e.g. "[done/done] 12 steps · 1109ms · tokens 7141/431 · unmetered" (or
+// "· $0.0123" when metered). Defaults are 0 — a missing line means the agent didn't reach a clean exit.
+//
+// The metrics MUST be read off the done-line alone: tool/test output earlier in the log also matches
+// `[\w+/` and `\d+ steps`, so a whole-log scan would capture the FIRST such occurrence, not forja's
+// summary. Locate the done-line first — the LAST line that carries a `[<class>/<reason>]` terminal
+// marker AND the step count — then run every regex against THAT line; if there's none, fall back to
+// the whole log (defaults still apply). Match ANY class, not an allow-list: forja's terminal class is
+// done|error|exhausted (e.g. `[exhausted/maxSteps]` when --max-steps caps it) and may grow
+// (budget/timeout), so anchoring on done|error alone would silently miss those and regress to the
+// buggy whole-log first-match.
+const parseMetrics = (log: string) => {
+  let doneLine: string | undefined;
+  for (const line of log.split('\n')) {
+    if (/\[\w+\/\w+\][^\n]*\bsteps\b/.test(line)) doneLine = line;
   }
+  const scope = doneLine ?? log;
+  const reason = scope.match(/\[(\w+)\//)?.[1] ?? '';
+  const steps = Number(scope.match(/(\d+)\s+steps\b/)?.[1] ?? 0);
+  const tk = scope.match(/tokens\s+(\d+)\/(\d+)/);
+  const inputTok = Number(tk?.[1] ?? 0);
+  const outputTok = Number(tk?.[2] ?? 0);
+  const unmetered = /·\s*unmetered/.test(scope);
+  const costUsd = Number(scope.match(/·\s*\$([\d.]+)/)?.[1] ?? 0);
+  return { reason, steps, inputTok, outputTok, unmetered, costUsd };
+};
+
+const runTask = (model: string, t: Task, logDir: string): Row => {
+  const work = mkdtempSync(join(tmpdir(), `swe-${t.id}-`));
+  // Wrap the whole body: a throw between materialize and the pass-cleanup would otherwise orphan
+  // the temp workspace (the caller's try/catch can't see `work`). Best-effort rm on throw, swallow
+  // EPERM (the agent container may have left root-owned files if it never chmodded), then rethrow.
+  try {
+    return runTaskInner(model, t, logDir, work);
+  } catch (e) {
+    try {
+      rmSync(work, { recursive: true, force: true });
+    } catch {
+      // Orphan rather than mask the original error — the caller logs the throw + records an error row.
+    }
+    throw e;
+  }
+};
+
+const runTaskInner = (model: string, t: Task, logDir: string, work: string): Row => {
+  const { testPaths } = materializeSweWorkspace({ commit: t.commit, repoRoot, cwd: work });
+
+  const dest = join(logDir, model.replace(/[/:]/g, '_'), t.id);
+  mkdirSync(dest, { recursive: true });
+
+  // The common `docker run` args (mounts, proxy, API keys) are identical across phases; only the
+  // phase-specific FORJA_*/ORACLE_*/PASS_TO_PASS env differs. `dockerRun` runs one container with a
+  // given phase env + timeout and returns the spawn result (so the caller reads exit/timeout).
+  const dockerRun = (phaseEnv: string[], timeoutMs: number) => {
+    const dockerArgv = [
+      'docker',
+      'run',
+      '--rm',
+      '--network',
+      NETWORK,
+      '-v',
+      `${work}:/task`,
+      '-v',
+      `${catalogPath}:/root/.config/forja/model_providers.json:ro`,
+      '-e',
+      `HTTPS_PROXY=http://${PROXY}:${PROXY_PORT}`,
+      '-e',
+      `HTTP_PROXY=http://${PROXY}:${PROXY_PORT}`,
+      '-e',
+      'OLLAMA_API_KEY',
+      '-e',
+      'ANTHROPIC_API_KEY',
+      '-e',
+      'OPENAI_API_KEY',
+      ...phaseEnv,
+      IMAGE,
+    ];
+    return Bun.spawnSync({ cmd: dockerArgv, stdout: 'pipe', stderr: 'pipe', timeout: timeoutMs });
+  };
+
+  // PHASE 1 — the agent, in its OWN container. SWE_SKIP_VERIFY=1 makes the entrypoint run the agent
+  // and exit BEFORE the verifier (the host restores the canonical test surface in between).
+  const agentStart = Date.now();
+  const agentRun = dockerRun(
+    [
+      '-e',
+      `FORJA_PROMPT=${promptFor(t)}`,
+      '-e',
+      `FORJA_MODEL=${model}`,
+      '-e',
+      `FORJA_MAX_STEPS=${maxSteps}`,
+      '-e',
+      'SWE_SKIP_VERIFY=1',
+    ],
+    perTaskTimeout,
+  );
+  const agentMs = Date.now() - agentStart;
+  const agentTimedOut = agentRun.exitedDueToTimeout === true;
+
+  // Preserve the agent log NOW — the metrics (the done-line) live in it, and the verifier container
+  // would overwrite /task/.run.log. Prefer the in-volume log; fall back to the captured streams.
+  const runLog = join(work, '.run.log');
+  const agentLog = existsSync(runLog)
+    ? readFileSync(runLog, 'utf8')
+    : agentRun.stdout.toString() + agentRun.stderr.toString();
+  writeFileSync(join(dest, 'run.log'), agentLog);
+
+  // PHASE 2 — host restore (anti-cheat). Re-materialize the canonical tests/ + runner config from C,
+  // discarding any agent edits, so only the model's src/ changes can make the oracle pass. The agent
+  // container chmodded /task world-writable on exit, so this non-root host CAN rm tests/ + re-extract.
+  // Skipped on a timeout (the workspace is incomplete / chmod may not have run).
+  let restoreFailed = false;
+  if (!agentTimedOut) {
+    try {
+      restoreSweTests({ commit: t.commit, repoRoot, cwd: work, testPaths });
+    } catch (e) {
+      restoreFailed = true;
+      const msg = e instanceof Error ? e.message : String(e);
+      process.stderr.write(`swe-bench-run: test-surface restore for ${t.id} failed: ${msg}\n`);
+    }
+  }
+
+  // PHASE 3 — the verifier, in a SEPARATE container, on the restored tree. No FORJA_PROMPT (so the
+  // entrypoint skips the agent) and no SWE_SKIP_VERIFY (so it runs the verifier). Skipped if the
+  // agent timed out or the restore failed — there's nothing trustworthy to score.
+  let oracle: number | undefined;
+  let p2p: number | undefined;
+  if (!agentTimedOut && !restoreFailed) {
+    dockerRun(
+      [
+        '-e',
+        `ORACLE_TESTS=${t.testFiles.join(' ')}`,
+        ...(t.passToPass?.length ? ['-e', `PASS_TO_PASS=${t.passToPass.join(' ')}`] : []),
+      ],
+      VERIFY_TIMEOUT,
+    );
+    if (existsSync(runLog)) copyFileSync(runLog, join(dest, 'verify.log'));
+    oracle = readExit(join(work, '.result'));
+    p2p = readExit(join(work, '.p2p'));
+  }
+  writeFileSync(join(dest, 'proxy.log'), dockerLogs(PROXY, 200));
+
+  const oraclePassed = oracle === 0;
+  const p2pPassed = p2p === undefined ? true : p2p === 0;
+  const regressed = oraclePassed && !p2pPassed;
+  const passed = oraclePassed && p2pPassed;
+  // Metrics come from the AGENT log (the done-line) — the verifier container has no agent summary.
+  const m = parseMetrics(agentLog);
+  const durationMs = agentMs;
+  const status = agentTimedOut
+    ? 'timeout'
+    : restoreFailed
+      ? 'error'
+      : oracle === undefined
+        ? 'error'
+        : 'ok';
+
+  // Retain the workspace (the agent's actual src edits) when something went wrong; clean it on a pass.
+  // The container runs as root, so the entrypoint chmods /task world-writable before exit to let this
+  // (non-root) host unlink it. Tolerate a residual EPERM (e.g. a timeout that skipped the chmod) so a
+  // cleanup failure never aborts the run — retain + note the path instead.
+  if (passed) {
+    try {
+      rmSync(work, { recursive: true, force: true });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      process.stderr.write(
+        `swe-bench-run: cleanup of ${work} failed (${msg.slice(0, 120)}); retained\n`,
+      );
+      writeFileSync(join(dest, 'workspace-path.txt'), work);
+    }
+  } else writeFileSync(join(dest, 'workspace-path.txt'), work);
+
+  return {
+    model,
+    id: t.id,
+    tier: t.tier,
+    kind: t.kind,
+    passed,
+    regressed,
+    status,
+    exitReason: m.reason,
+    steps: m.steps,
+    durationMs,
+    inputTok: m.inputTok,
+    outputTok: m.outputTok,
+    costUsd: m.costUsd,
+    unmetered: m.unmetered,
+  };
+};
+
+// --- run ---------------------------------------------------------------------
+
+let tasks = corpus;
+if (tier !== undefined) tasks = tasks.filter((t) => t.tier === tier);
+if (id !== undefined) tasks = tasks.filter((t) => t.id.startsWith(id ?? ''));
+if (limit !== undefined) tasks = tasks.slice(0, limit);
+
+const runId = `${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}`;
+const logDir = join(repoRoot, 'evals/swe-bench/logs', runId);
+mkdirSync(logDir, { recursive: true });
+
+process.stderr.write(
+  `swe-bench-run: ${models.length} model(s) × ${tasks.length}/${corpus.length} task(s) ` +
+    `(maxSteps ${maxSteps}, per-task ${Math.round(perTaskTimeout / 1000)}s) → logs ${logDir}\n`,
+);
+if (!existsSync(catalogPath)) {
+  process.stderr.write(`swe-bench-run: model catalog not found at ${catalogPath}\n`);
+  process.exit(1);
+}
+
+buildImage();
+
+const rows: Row[] = [];
+try {
+  ensureSidecar(allowHostsFor(models));
+  for (const model of models) {
+    process.stderr.write(`\n=== ${model} ===\n`);
+    for (const t of tasks) {
+      process.stderr.write(`  [${t.id}] tier${t.tier} ${t.kind} ${t.subject.slice(0, 42)} ... `);
+      // One task's failure (docker hiccup, parse error, cleanup EPERM) must not abort the whole run —
+      // record an error row and move on so a 50-task sweep always finishes + writes its CSV.
+      let row: Row;
+      try {
+        row = runTask(model, t, logDir);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        process.stderr.write(`runTask threw: ${msg.slice(0, 200)}\n`);
+        row = {
+          model,
+          id: t.id,
+          tier: t.tier,
+          kind: t.kind,
+          passed: false,
+          regressed: false,
+          status: 'error',
+          exitReason: 'harness-error',
+          steps: 0,
+          durationMs: 0,
+          inputTok: 0,
+          outputTok: 0,
+          costUsd: 0,
+          unmetered: false,
+        };
+      }
+      rows.push(row);
+      const verdict = row.passed
+        ? 'PASS'
+        : row.regressed
+          ? 'REGRESSED'
+          : row.status === 'ok'
+            ? 'fail'
+            : row.status.toUpperCase();
+      process.stderr.write(
+        `${verdict} (${row.steps} steps, ${Math.round(row.durationMs / 1000)}s, ${row.outputTok / 1000}k out tok)\n`,
+      );
+    }
+  }
+} finally {
+  teardownSidecar();
 }
 
 // Append per-task rows (CSV accumulates across runs/models; header written once).
-const dir = join(repoRoot, 'evals', 'swe-bench');
-mkdirSync(dir, { recursive: true });
-const csvPath = join(dir, 'results.csv');
+const csvPath = join(repoRoot, 'evals', 'swe-bench', 'results.csv');
 if (!existsSync(csvPath)) {
   writeFileSync(
     csvPath,
     'model,id,tier,kind,passed,regressed,status,exit_reason,steps,duration_ms,input_tokens,output_tokens,cost_usd,unmetered\n',
   );
 }
+// Minimal RFC-4180 quoting: a value that contains a comma, double-quote, or newline is wrapped in
+// double-quotes with internal quotes doubled; anything else is emitted raw. The string fields
+// (model id, status, exit_reason) are the realistic source of a stray comma.
+const csvCell = (v: string | number): string => {
+  const s = String(v);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
 appendFileSync(
   csvPath,
   `${rows
-    .map(
-      (r) =>
-        `${model},${r.id},${r.tier},${r.kind},${r.passed ? 1 : 0},${r.regressed ? 1 : 0},${r.status},${r.exitReason},${r.steps},${r.durationMs},${r.inputTok},${r.outputTok},${r.costUsd.toFixed(4)},${r.unmetered ? 1 : 0}`,
+    .map((r) =>
+      [
+        csvCell(r.model),
+        csvCell(r.id),
+        csvCell(r.tier),
+        csvCell(r.kind),
+        csvCell(r.passed ? 1 : 0),
+        csvCell(r.regressed ? 1 : 0),
+        csvCell(r.status),
+        csvCell(r.exitReason),
+        csvCell(r.steps),
+        csvCell(r.durationMs),
+        csvCell(r.inputTok),
+        csvCell(r.outputTok),
+        csvCell(r.costUsd.toFixed(4)),
+        csvCell(r.unmetered ? 1 : 0),
+      ].join(','),
     )
     .join('\n')}\n`,
 );
 
-const byTier: Record<number, { n: number; pass: number }> = {
-  1: { n: 0, pass: 0 },
-  2: { n: 0, pass: 0 },
-  3: { n: 0, pass: 0 },
-};
-for (const r of rows) {
-  const bucket = byTier[r.tier];
-  if (bucket === undefined) continue; // malformed corpus tier — don't crash the post-run summary
-  bucket.n++;
-  if (r.passed) bucket.pass++;
+// Per-model, per-tier summary.
+for (const model of models) {
+  const mr = rows.filter((r) => r.model === model);
+  if (mr.length === 0) continue;
+  const passed = mr.filter((r) => r.passed).length;
+  const regressed = mr.filter((r) => r.regressed).length;
+  const outTok = mr.reduce((s, r) => s + r.outputTok, 0);
+  const cost = mr.reduce((s, r) => s + r.costUsd, 0);
+  const avgSec = mr.reduce((s, r) => s + r.durationMs, 0) / mr.length / 1000;
+  const effort = mr.some((r) => r.unmetered)
+    ? `${Math.round(outTok / 1000)}k out tok`
+    : `$${cost.toFixed(2)}`;
+  process.stderr.write(
+    `\n=== ${model}: ${passed}/${mr.length} (${Math.round((100 * passed) / mr.length)}%)  ` +
+      `${regressed ? `${regressed} regressed  ` : ''}${effort}  avg ${avgSec.toFixed(0)}s/task ===\n`,
+  );
+  for (const tr of [1, 2, 3] as const) {
+    const tt = mr.filter((r) => r.tier === tr);
+    if (tt.length)
+      process.stderr.write(`  tier${tr}: ${tt.filter((r) => r.passed).length}/${tt.length}\n`);
+  }
 }
-const passed = rows.filter((r) => r.passed).length;
-const regressedCount = rows.filter((r) => r.regressed).length;
-const cost = rows.reduce((s, r) => s + r.costUsd, 0);
-const outTok = rows.reduce((s, r) => s + r.outputTok, 0);
-const avgSec = rows.length ? rows.reduce((s, r) => s + r.durationMs, 0) / rows.length / 1000 : 0;
-const unmetered = rows.some((r) => r.unmetered);
-// For unmetered providers (Ollama Cloud) USD is $0 — report output tokens + wall-clock instead.
-const effort = unmetered ? `${Math.round(outTok / 1000)}k out tok` : `$${cost.toFixed(2)}`;
 process.stderr.write(
-  `\n=== ${model}: ${passed}/${rows.length} (${rows.length ? Math.round((100 * passed) / rows.length) : 0}%)  ` +
-    `${regressedCount ? `${regressedCount} regressed (oracle ok, sibling broke)  ` : ''}${effort}  avg ${avgSec.toFixed(0)}s/task ===\n`,
+  `\nappended ${rows.length} row(s) → evals/swe-bench/results.csv · logs → ${logDir}\n`,
 );
-for (const tr of [1, 2, 3] as const) {
-  if (byTier[tr].n) process.stderr.write(`  tier${tr}: ${byTier[tr].pass}/${byTier[tr].n}\n`);
-}
-process.stderr.write(`appended ${rows.length} row(s) → evals/swe-bench/results.csv\n`);
