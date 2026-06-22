@@ -22,7 +22,8 @@ describe('scoreResult', () => {
     expectsP2P: boolean,
     agentTimedOut = false,
     restoreFailed = false,
-  ) => scoreResult({ oracle, p2p, expectsP2P, agentTimedOut, restoreFailed });
+    agentError = false,
+  ) => scoreResult({ oracle, p2p, expectsP2P, agentTimedOut, restoreFailed, agentError });
 
   test('no PASS_TO_PASS, oracle passes → passed/ok', () => {
     expect(s(0, undefined, false)).toEqual({ passed: true, regressed: false, status: 'ok' });
@@ -55,6 +56,15 @@ describe('scoreResult', () => {
       status: 'error',
     });
   });
+  // A forja startup/provider error (unresolvable model, unset api_key_env, mid-loop crash) must score
+  // as a harness error — NOT a 0-step "model failure" that corrupts the benchmark as incapacity.
+  test('a forja startup/provider error (agentError) → error, never a scored model failure', () => {
+    expect(s(undefined, undefined, true, false, false, true)).toEqual({
+      passed: false,
+      regressed: false,
+      status: 'error',
+    });
+  });
 });
 
 describe('allowHostsFor', () => {
@@ -82,8 +92,13 @@ describe('allowHostsFor', () => {
       allowHostsFor(['openrouter/deepseek/deepseek-r1', 'google/gemini-2.5-flash'], entries).sort(),
     ).toEqual(['generativelanguage.googleapis.com', 'openrouter.ai']);
   });
-  test('an unknown provider with no base_url THROWS (loud config error, not silent egress)', () => {
-    expect(() => allowHostsFor(['mystery/model'], entries)).toThrow(/no egress host/);
+  test('a model absent from the catalog THROWS (loud config error, not a wasted sweep)', () => {
+    // not in `entries` → fails BEFORE host resolution (the in-container forja couldn't resolve it either)
+    expect(() => allowHostsFor(['mystery/model'], entries)).toThrow(/not in the catalog/);
+  });
+  test('a CATALOGUED model with an unknown provider prefix and no base_url THROWS (no egress host)', () => {
+    const e: CatalogEntry[] = [{ id: 'mystery/model', api_key_env: 'K' }];
+    expect(() => allowHostsFor(['mystery/model'], e)).toThrow(/no egress host/);
   });
 });
 

@@ -356,6 +356,18 @@ const runTaskInner = (model: string, t: Task, logDir: string, work: string): Row
   );
   const agentMs = Date.now() - agentStart;
   const agentTimedOut = agentRun.exitedDueToTimeout === true;
+  // The agent container writes /task/.agent_error when forja exits with a non-normal code (a startup /
+  // provider error — unresolvable model, unset api_key_env, mid-loop crash). That is a HARNESS error,
+  // not a model attempt: skip restore + verify and score it `error`, never a 0-step task "failure".
+  const agentErrorFile = join(work, '.agent_error');
+  const agentError = existsSync(agentErrorFile);
+  if (agentError) {
+    process.stderr.write(
+      `swe-bench-run: ${t.id} — forja exited abnormally (code ${readFileSync(agentErrorFile, 'utf8').trim()}) ` +
+        'before a normal finish; scoring HARNESS ERROR, not a model failure. If this repeats the config ' +
+        'is broken (unset key / bad model id) — abort and fix.\n',
+    );
+  }
 
   // Preserve the agent log NOW — the metrics (the done-line) live in it, and the verifier container
   // would overwrite /task/.run.log. Prefer the in-volume log; fall back to the captured streams.
@@ -370,7 +382,7 @@ const runTaskInner = (model: string, t: Task, logDir: string, work: string): Row
   // container chmodded /task world-writable on exit, so this non-root host CAN rm tests/ + re-extract.
   // Skipped on a timeout (the workspace is incomplete / chmod may not have run).
   let restoreFailed = false;
-  if (!agentTimedOut) {
+  if (!agentTimedOut && !agentError) {
     try {
       restoreSweTests({ commit: t.commit, repoRoot, cwd: work, testPaths });
     } catch (e) {
@@ -385,7 +397,7 @@ const runTaskInner = (model: string, t: Task, logDir: string, work: string): Row
   // agent timed out or the restore failed — there's nothing trustworthy to score.
   let oracle: number | undefined;
   let p2p: number | undefined;
-  if (!agentTimedOut && !restoreFailed) {
+  if (!agentTimedOut && !restoreFailed && !agentError) {
     dockerRun(
       [
         '-e',
@@ -407,6 +419,7 @@ const runTaskInner = (model: string, t: Task, logDir: string, work: string): Row
     expectsP2P: (t.passToPass?.length ?? 0) > 0,
     agentTimedOut,
     restoreFailed,
+    agentError,
   });
   // Metrics come from the AGENT log (the done-line) — the verifier container has no agent summary.
   const m = parseMetrics(agentLog);

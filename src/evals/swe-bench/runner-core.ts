@@ -43,8 +43,20 @@ export const loadCatalogEntries = (catalogPath: string): CatalogEntry[] => {
 export const allowHostsFor = (modelIds: string[], entries: CatalogEntry[]): string[] => {
   const hosts = new Set<string>();
   for (const m of modelIds) {
+    // The model MUST exist in the catalog: the in-container forja resolves models STRICTLY from the
+    // mounted model_providers.json, so a typo'd id (or an empty/malformed catalog) that still matched a
+    // provider-family default below would pass this gate, then fail EVERY task in-container — wasting
+    // the whole sweep on per-task failures instead of one loud config error before the bench starts.
+    const entry = entries.find((e) => e.id === m);
+    if (entry === undefined) {
+      throw new Error(
+        `swe-bench-run: model '${m}' is not in the catalog (model_providers.json) — forja resolves ` +
+          `models strictly from it in-container, so the run would fail every task. Add the entry, or ` +
+          `fix the --models id (a typo, or did the catalog parse to []?).`,
+      );
+    }
     let host: string | undefined;
-    const baseUrl = entries.find((e) => e.id === m)?.base_url;
+    const baseUrl = entry.base_url;
     if (baseUrl !== undefined && baseUrl !== '') {
       try {
         host = new URL(baseUrl).hostname;
@@ -125,6 +137,9 @@ export interface ScoreInput {
   expectsP2P: boolean;
   agentTimedOut: boolean;
   restoreFailed: boolean;
+  // forja exited with a non-normal code (not done/exhausted) — a startup/provider error (unresolvable
+  // model, unset api_key_env) or a mid-loop crash. The agent did NOT produce a trustworthy attempt.
+  agentError: boolean;
 }
 
 // Score a task from the verifier's oracle + PASS_TO_PASS exit codes. A task with a PASS_TO_PASS set
@@ -142,7 +157,7 @@ export const scoreResult = (
   const passed = oraclePassed && p2pPassed;
   const status = i.agentTimedOut
     ? 'timeout'
-    : i.restoreFailed || p2pMissing
+    : i.agentError || i.restoreFailed || p2pMissing
       ? 'error'
       : i.oracle === undefined
         ? 'error'

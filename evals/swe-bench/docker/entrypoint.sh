@@ -93,8 +93,20 @@ if [ -n "$FORJA_PROMPT" ]; then
   # it. Safe here: the CONTAINER is the sandbox (no answer reachable, egress locked, ephemeral) — forja's
   # inner sandbox is redundant.
   forja "$FORJA_PROMPT" --model "$FORJA_MODEL" --sandbox-host --i-know-what-im-doing \
-    --max-steps "${FORJA_MAX_STEPS:-40}" \
-    || echo ">>> agent exited non-zero (continuing to verify)"
+    --max-steps "${FORJA_MAX_STEPS:-40}"
+  rc=$?
+  # forja's exit: 0 = done, 2 = exhausted (budget cap) — the agent loop RAN and finished, so the test is
+  # the judge (continue to verify the outcome). ANY other code (1 task/provider error, 130 interrupt, or
+  # a non-zero bootstrap exit on an unresolvable model / unset api_key_env) means the loop did NOT finish
+  # normally — usually it never STARTED. The old blanket `|| echo …continuing` swallowed those too, so an
+  # unchanged src got scored as a 0-step model FAILURE — corrupting the benchmark as incapacity. Flag it
+  # so the host records a harness error (reads .agent_error) instead of verifying.
+  if [ "$rc" = 0 ] || [ "$rc" = 2 ]; then
+    echo ">>> agent finished (exit $rc) — continuing to verify"
+  else
+    echo ">>> forja exited $rc — startup/provider error, NOT a normal agent finish; flagging harness error"
+    echo "$rc" > /task/.agent_error
+  fi
 fi
 
 # Split flow: the agent runs in its OWN container; the host then restores the canonical test
