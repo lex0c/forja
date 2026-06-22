@@ -30,7 +30,12 @@
 exec > >(tee /task/.run.log) 2>&1
 
 # The materialized workspace ships a node_modules symlink to a HOST path that doesn't exist here;
-# repoint it at the image's baked deps. -n (no-deref) + -f so the stale link is overwritten.
+# repoint it at the image's baked deps. rm -rf FIRST, not just `ln -sfn`: the agent can replace
+# /task/node_modules with a real DIRECTORY (its own `bun install`), and GNU ln would then drop the link
+# INSIDE it (node_modules/node_modules) rather than replacing it — so the verifier container would
+# resolve the AGENT's packages and the oracle could pass via dependency tampering, not a src/ fix. The
+# rm guarantees both phases (agent + verifier) always resolve the BAKED deps.
+rm -rf /task/node_modules
 ln -sfn /app/node_modules /task/node_modules
 cd /task || exit 2
 
