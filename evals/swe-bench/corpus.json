@@ -130,7 +130,7 @@
       "tests/providers/anthropic-effort.test.ts",
       "tests/providers/anthropic-stream.test.ts"
     ],
-    "prompt": "When the recap subsystem renders through a current Anthropic model (e.g. the Haiku 4.x family), every constrained render fails and silently falls back to a deterministic render — the LLM-rendered recap surface is effectively dead in production. The root cause is that these models accept sampling but reject requests that specify both `temperature` and `top_p` together (the API returns an HTTP 400 saying the two cannot both be specified for this model). Our sampling configuration sets both values at once, so the request is always rejected. Make the Anthropic provider tolerate this constraint so a request that carries both sampling knobs still succeeds, while a request that only sets one of them keeps passing that one through. Providers that accept the pair must be unaffected."
+    "prompt": "When the recap subsystem renders through a current Anthropic model (e.g. the Haiku 4.x family), every constrained render fails and silently falls back to a deterministic render — the LLM-rendered recap surface is effectively dead in production. The root cause is that these models accept sampling but reject requests that specify both `temperature` and `top_p` together (the API returns an HTTP 400 saying the two cannot both be specified for this model). Our sampling configuration sets both values at once, so the request is always rejected. Make the Anthropic provider tolerate this constraint so a request that carries both sampling knobs still succeeds, while a request that only sets one of them keeps passing that one through. Providers that accept the pair must be unaffected. When both temperature and top_p are set, keep temperature and drop top_p (Anthropic recommends a single sampling knob); a request that sets only one of them keeps passing that one through."
   },
   {
     "id": "c82402ddd",
@@ -138,8 +138,7 @@
     "subject": "fix(permissions): route cwd-scope symlink escape to Conservative",
     "kind": "bug",
     "testFiles": [
-      "tests/permissions/engine.test.ts",
-      "tests/permissions/resolvers.test.ts"
+      "tests/permissions/engine.test.ts"
     ],
     "srcFiles": [
       "src/permissions/resolvers/bash.ts"
@@ -218,8 +217,7 @@
     "kind": "bug",
     "testFiles": [
       "tests/harness/loop.test.ts",
-      "tests/harness/resume.test.ts",
-      "tests/tui/render/tool-card.test.ts"
+      "tests/harness/resume.test.ts"
     ],
     "srcFiles": [
       "src/harness/loop.ts",
@@ -268,7 +266,7 @@
       "src/tui/tool-vocab.ts"
     ],
     "tier": 3,
-    "prompt": "When a task delegation fails before its subagent ever starts running — for example because the playbook name is unknown, the task arguments fail validation, or a budget check refuses the spawn up front — the failure is completely invisible in the terminal scrollback. There is no error line, no chip, and nothing in the live Subagents area (which only ever populates once a child subagent has actually started). From the operator's view the delegation simply vanished, with no sign it was attempted or that it failed.\n\nThe cause is that the task-delegation tools are intentionally kept silent in the UI (so an in-progress delegation is shown by the live Subagents block rather than a generic \"called a tool\" chip). That silence is right for the normal path, but it also swallows the error when no subagent lifecycle ever begins.\n\nFix it so a task delegation that ends in failure is surfaced in the scrollback as a failure chip carrying the error reason — including the case where it failed before any subagent was created — while still keeping the normal successful (and in-progress) path quiet, with no extra live noise. Failing todo-management calls should remain silent, as they are today.",
+    "prompt": "When a task delegation fails before its subagent ever starts running — for example because the playbook name is unknown, the task arguments fail validation, or a budget check refuses the spawn up front — the failure is completely invisible in the terminal scrollback. There is no error line, no chip, and nothing in the live Subagents area (which only ever populates once a child subagent has actually started). From the operator's view the delegation simply vanished, with no sign it was attempted or that it failed.\n\nThe cause is that the task-delegation tools are intentionally kept silent in the UI (so an in-progress delegation is shown by the live Subagents block rather than a generic \"called a tool\" chip). That silence is right for the normal path, but it also swallows the error when no subagent lifecycle ever begins.\n\nFix it so a task delegation that ends in failure is surfaced in the scrollback as a failure chip carrying the error reason — including the case where it failed before any subagent was created — while still keeping the normal successful (and in-progress) path quiet, with no extra live noise. Failing todo-management calls should remain silent, as they are today. A delegation refused by a permission or budget denial surfaces with a distinct \"denied\" status, not the generic \"error\" status.",
     "passToPass": [
       "tests/tui/tool-vocab.test.ts",
       "tests/tui/bus.test.ts",
