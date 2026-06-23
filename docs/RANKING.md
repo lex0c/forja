@@ -181,6 +181,15 @@ not the same as passing):
 Model size / parameters, headline price, advertised context window, public benchmarks, vibes. Only
 measured behavior in the harness.
 
+## Relation to the benchmark
+
+[`BENCHMARK.md`](BENCHMARK.md) measures **capability** — can a model fix a real bug, verified by the
+project's own tests (the per-tier pass-rate of real fixes). This ranking measures **loop behavior** —
+does the model call the right tool, produce a clean edit, recover, finish, across fixed suites. They are
+**separate axes**: a model can drive the loop cleanly (high ranking) yet clear few hard real fixes (low
+capability), or the reverse. Neither is folded into the other — reported side by side, weighed by the
+reader.
+
 ## Data & reproducibility
 
 - **`evals/ranking/results.csv`** is the source of truth — **append-only**, one row per

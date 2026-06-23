@@ -5,9 +5,10 @@ the project's own tests, not by matching a diff. A separate axis from the [ranki
 composite (which probes loop behavior across fixed suites); the two are **never folded together** —
 passing harder real fixes is a different claim than driving the loop cleanly.
 
-Each task is a real Forja commit replayed without the answer: the buggy parent tree + the commit's
-failing test are materialized, the model fixes `src/`, and a verifier runs the test. The corpus
-**generates itself** — every future fix is a candidate task.
+Each task is a real Forja commit replayed without the answer: the buggy parent tree is materialized as a
+git repo (full history up to the parent, the fix commit unreachable), the model fixes `src/` from a
+curated ticket, and a verifier runs the commit's withheld test. The corpus is **hand-curated** from past
+fix commits — every real fix is a candidate, kept only if its test grades behavior, not the author's diff.
 
 ## Results
 
@@ -48,13 +49,17 @@ all held fixed.
 
 One task = one real Forja fix commit `C`, replayed without the answer:
 
-1. Materialize the **parent** tree `C^` (the buggy code) + apply `C`'s test patch → at this state the
-   oracle test **FAILS**.
-2. The model gets only the **failing test** as the spec — never the commit message / BACKLOG (that
-   would leak the fix) — and edits `src/` in a container.
-3. A verifier runs the oracle test. **Pass = it now exits 0** — a real fail-to-pass.
+1. Materialize the **parent** tree `C^` as a **git repo** — a bundle of `C^`'s history cloned into the
+   workspace. `C` and everything after it are unreachable (the bundle is truncated at `C^`), so the agent
+   gets the full pre-fix project — history, blame, BACKLOG, every file, the way an engineer sees the repo
+   before the fix — yet `git show C` (the gold) fails: the fix commit genuinely isn't there.
+2. The model gets a **curated ticket** — the bug's symptom + the required behavior — never the oracle
+   test (it's withheld) nor the commit message / BACKLOG (that would leak the fix). It edits `src/` in a
+   container.
+3. Before scoring, the host re-materializes the commit's test from `C` and a verifier runs it. **Pass =
+   it now exits 0** — a real fail-to-pass the model reached from the ticket, not from reading the test.
 
-**Tiers** — assigned structurally (`srcFiles` count + `srcLines`) as a difficulty proxy:
+**Tiers** — a curated difficulty rating (easy / medium / hard); the shape below is the rough guide:
 
 | Tier | Shape | Reads as |
 |---|---|---|
@@ -65,13 +70,25 @@ One task = one real Forja fix commit `C`, replayed without the answer:
 `kind` (bug / feature, from the commit subject) is recorded too, so a corpus skew toward one isn't
 mistaken for capability.
 
+### Why 9 tasks — three per tier
+
+The corpus is **three tasks per tier, nine total** — small on purpose, and three is the floor that makes
+a tier READABLE. One pass could be luck; two, coincidence; **three is the tie-breaker** — a tier read as
+`0/3 · 1/3 · 2/3 · 3/3` is a gradient, not a coin flip. Fewer than three and a single fluke flips the
+tier; many more multiplies the cost across every model on the ladder (each run is minutes to an hour)
+while the marginal signal per extra task fades. Nine keeps the **per-tier ceiling** legible AND the full
+run cheap enough to calibrate a *spread* of models — which is the only way a single model's number means
+anything (one model in isolation isn't a benchmark, it's a data point).
+
 ### Ephemeral container per task + the split-flow anti-cheat
 
 The whole point of outcome-verification is that the model must **fix the code**, not game the check.
 Five gates enforce that:
 
-1. **No answer reachable.** The container mounts ONLY the materialized `/task` — no `.git`, no
-   `corpus.json`, no gold fix, no changelog. `git show C` is impossible because `C` isn't there.
+1. **No answer reachable.** The container mounts ONLY the materialized `/task` + a read-only model
+   catalog — no `corpus.json`, no gold fix. The workspace IS a git repo (full history to `C^`, for
+   legitimate context), but the bundle is truncated at `C^`: `git show C` fails because `C` is
+   unreachable, and the throwaway clone tag is named with the parent SHA so it never leaks `C`'s id.
 2. **Egress locked.** The task container sits on an `--internal` docker network (no direct route out);
    its only egress is a proxy sidecar that tunnels **HTTPS to the model host alone** (`:443`,
    allowlisted). A direct `curl github` has no route; a proxied one gets 403 — the agent can't fetch
@@ -99,9 +116,11 @@ Five gates enforce that:
   never a silent pass).
 
 **Effort** (from the agent's done-line)
-- `steps`, `duration_ms`, `input_tokens`, `output_tokens`.
-- `cost_usd` — real for per-token providers; **0 / blank for `unmetered`** (Ollama Cloud bills by
-  subscription, not per token — "untracked", not "free"). Compare unmetered models by `tokens/solved`.
+- `steps`, `duration_ms`, `input_tokens`, `output_tokens`, `cache_read`, `cache_creation`.
+- `cost_usd` — real for per-token providers (already cache-aware); **0 / blank for `unmetered`** (Ollama
+  Cloud bills by subscription, not per token — "untracked", not "free"). `cache_read` / `cache_creation`
+  surface the cache breakdown behind that cost (cache-read is ~10× cheaper than fresh input). Compare
+  unmetered models by `tokens/solved`.
 - `exit_reason` — the reason half of forja's terminal marker (`done` / `maxSteps` / `degenerateLoop`).
 
 **Harness fluency** (counted over the agent log)
@@ -142,9 +161,9 @@ reader.
 
 ## Data & reproducibility
 
-- **`evals/swe-bench/results.csv`** — append-only source of truth, one row per (model × task). Build
-  per-tier pivots downstream; the page table is a hand-refreshed view, and **the CSV wins** on
-  disagreement. (Gitignored: it holds local run data, not a committed leaderboard.)
+- **`evals/swe-bench/results.csv`** — append-only source of truth, one row per (model × task) — the
+  versioned, curated capability history. Build per-tier pivots downstream; the page table is a
+  hand-refreshed view, and **the CSV wins** on disagreement. (The per-task debug logs stay gitignored.)
 - **`evals/swe-bench/corpus.json`** — the frozen, **hand-curated** task set (id = the commit's short
   SHA, so a task is reproducible from history). `passToPass` per task (the anti-cheat #9 regression
   siblings) is computed by `scripts/swe-bench-passtopass.ts`.
