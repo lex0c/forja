@@ -35,24 +35,30 @@ const repoRoot: string | null = (() => {
 })();
 const REPO = repoRoot ?? '';
 
-const commitPresent = (ref: string): boolean =>
+// The history-dependent tests need not just the commit but its TREES — git diff / git archive read them.
+// `cat-file -e ^{commit}` is NOT enough: a treeless partial clone (`--filter=tree:0`) has the commit
+// object while its trees are absent, so that guard passes and the tests then fail in git diff with
+// "unable to read tree". `ls-tree -r <ref>^{tree}` resolves the commit AND reads every tree it points at,
+// so it succeeds iff the full tree is materialized — covering both the shallow case (commit absent) and
+// the treeless case (trees absent).
+const historyUsable = (ref: string): boolean =>
   repoRoot !== null &&
   Bun.spawnSync({
-    cmd: ['git', '-C', repoRoot, 'cat-file', '-e', `${ref}^{commit}`],
+    cmd: ['git', '-C', repoRoot, 'ls-tree', '-r', `${ref}^{tree}`],
     stdout: 'ignore',
     stderr: 'ignore',
   }).success;
 
-// Needs the commit AND its parent in history. A shallow CI clone (fetch-depth 1) has neither, so
-// the whole self-SWE-bench class skips there — the corpus requires full history.
-const CAN_RUN = commitPresent(COMMIT) && commitPresent(`${COMMIT}^`);
+// Needs the commit AND its parent, WITH their trees, in history. A shallow CI clone (fetch-depth 1) or a
+// treeless partial clone lacks them, so the whole self-SWE-bench class skips there.
+const CAN_RUN = historyUsable(COMMIT) && historyUsable(`${COMMIT}^`);
 
 if (!CAN_RUN) {
   // Visible in CI logs so a shallow clone (which skips the history-dependent tests below) is
   // not mistaken for "the self-SWE-bench path passed" — those tests were never exercised. The
   // synthetic-repo guard tests below still run regardless of history.
   console.error(
-    `[swe-bench tests] commit ${COMMIT} + parent absent (shallow clone?) — history-dependent tests SKIPPED; the e2e swe path was NOT exercised here.`,
+    `[swe-bench tests] commit ${COMMIT} + parent (with trees) absent (shallow or treeless clone?) — history-dependent tests SKIPPED; the e2e swe path was NOT exercised here.`,
   );
 }
 
