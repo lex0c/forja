@@ -194,7 +194,7 @@ export const materializeSweWorkspace = ({
     rmSync(join(cwd, leak), { recursive: true, force: true });
   }
 
-  // 2. WITHHOLD the oracle test — this is the issue-as-spec variant: the agent works from the curated
+  // 2. WITHHOLD the oracle test — the agent works from the curated
   //    ticket alone and never sees the acceptance test. Remove the commit's test file(s): a NEW oracle
   //    isn't in `C^` anyway, and a MODIFIED one would otherwise survive in its old form. The verifier
   //    gets the oracle later from `restoreSweTests` (re-materializes C's tests/ before scoring);

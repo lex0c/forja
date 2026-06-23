@@ -1,6 +1,6 @@
 #!/bin/bash
 # Ephemeral self-SWE-bench TASK container. The ONLY mount is:
-#   /task  — the materialized workspace (parent `C^` tree + the failing-test patch; NO .git, NO
+#   /task  — the materialized workspace (parent `C^` tree, the oracle test WITHHELD; NO .git, NO
 #            corpus, NO gold). The agent fixes src/ here. Also receives the run artifacts below.
 # The deps are BAKED in the image at /app/node_modules. The answer repo is NOT present anywhere.
 #
@@ -16,7 +16,7 @@
 #                     sidecar's logs, captured host-side (`docker logs <proxy>`).
 #
 # Env:
-#   FORJA_PROMPT    — the agent prompt (the failing test). Empty ⇒ skip the agent (verifier-only).
+#   FORJA_PROMPT    — the agent prompt (the curated issue ticket). Empty ⇒ skip the agent (verifier-only).
 #   FORJA_MODEL     — the model id (e.g. ollama/devstral-2:123b). Required with FORJA_PROMPT.
 #   FORJA_MAX_STEPS — the agent's step budget (passed to forja --max-steps; default 40).
 #   SWE_SKIP_VERIFY — when set, the container runs the agent ONLY and exits (the host restores the
@@ -85,27 +85,38 @@ if [ -n "$FORJA_PROMPT" ]; then
   mkdir -p "$HOME/.config/forja" && touch "$HOME/.config/forja/sandbox_skip"
   mkdir -p /task/.forja
   printf 'defaults:\n  mode: bypass\n' > /task/.forja/permissions.yaml
-  echo ">>> agent: forja '$FORJA_MODEL' on the failing test"
+  echo ">>> agent: forja '$FORJA_MODEL' on the issue ticket"
   # Run UNSANDBOXED (the `host` profile). bwrap CANNOT run inside Docker (no new namespaces), so the
   # inner sandbox would be unavailable → forja's engine enters degraded mode (confirm every tool call →
   # headless deadlock). The two-gate host opt-in (SECURITY.md §4.1) bypasses it: --sandbox-host makes
   # `host` selectable, --i-know-what-im-doing emits the host-passthrough sentinel so the planner covers
   # it. Safe here: the CONTAINER is the sandbox (no answer reachable, egress locked, ephemeral) — forja's
   # inner sandbox is redundant.
+  # Pipe through tee so the done-line lands in /task/.agent-out SYNCHRONOUSLY: the global tee to .run.log
+  # is an async coprocess whose file can lag the rc check below, and that check reads the done-line.
   forja "$FORJA_PROMPT" --model "$FORJA_MODEL" --sandbox-host --i-know-what-im-doing \
-    --max-steps "${FORJA_MAX_STEPS:-40}"
-  rc=$?
-  # forja's exit: 0 = done, 2 = exhausted (budget cap) — the agent loop RAN and finished, so the test is
-  # the judge (continue to verify the outcome). ANY other code (1 task/provider error, 130 interrupt, or
-  # a non-zero bootstrap exit on an unresolvable model / unset api_key_env) means the loop did NOT finish
-  # normally — usually it never STARTED. The old blanket `|| echo …continuing` swallowed those too, so an
-  # unchanged src got scored as a 0-step model FAILURE — corrupting the benchmark as incapacity. Flag it
-  # so the host records a harness error (reads .agent_error) instead of verifying.
+    --max-steps "${FORJA_MAX_STEPS:-40}" 2>&1 | tee /task/.agent-out
+  rc=${PIPESTATUS[0]}
+  # forja's exit decides MODEL outcome (verify it) vs HARNESS error (don't score it as a 0-step model
+  # failure). 0 = done, 2 = exhausted (budget) — a clean finish → verify. For any other code the done-line
+  # REASON `[<class>/<reason>]` decides: a reason where the agent RAN and terminated on its OWN behaviour
+  # (degenerateLoop, maxToolErrors, …) is a model outcome → verify the partial src/, like exhausted. A
+  # provider/infra/harness reason (stepStalled = provider stream went silent, providerError, internalError,
+  # aborted) — or NO done-line at all (a startup/bootstrap crash) — gave the model no fair shot → harness
+  # error, so an unchanged src is never scored as model incapacity. (Reasons: src/harness/types.ts EXIT_REASONS.)
+  reason=$(grep -E '\[[a-zA-Z]+/[a-zA-Z]+\].*[0-9]+ steps' /task/.agent-out | tail -1 | sed -E 's#.*\[[a-zA-Z]+/([a-zA-Z]+)\].*#\1#')
   if [ "$rc" = 0 ] || [ "$rc" = 2 ]; then
     echo ">>> agent finished (exit $rc) — continuing to verify"
   else
-    echo ">>> forja exited $rc — startup/provider error, NOT a normal agent finish; flagging harness error"
-    echo "$rc" > /task/.agent_error
+    case "$reason" in
+      stepStalled | providerError | internalError | aborted | userPromptBlocked | '')
+        echo ">>> forja exited $rc — harness error (${reason:-no done-line: startup/bootstrap crash}), NOT a model outcome"
+        echo "$rc" > /task/.agent_error
+        ;;
+      *)
+        echo ">>> forja exited $rc — agent ran, terminated on '$reason' (a model outcome) — verifying"
+        ;;
+    esac
   fi
 fi
 

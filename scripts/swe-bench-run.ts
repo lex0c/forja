@@ -50,8 +50,8 @@ interface Task {
   srcFiles: string[];
   tier: 1 | 2 | 3;
   passToPass?: string[];
-  // The curated operator ticket. Issue-as-spec is the only mode: the model gets ONLY this (the oracle
-  // test is hidden), so every corpus task must carry one (asserted at load).
+  // The curated operator ticket — the model gets ONLY this (the oracle test is hidden), so every corpus
+  // task must carry one (asserted at load).
   prompt: string;
 }
 
@@ -69,7 +69,7 @@ const repoRoot = gitToplevel(process.cwd());
 const corpus: Task[] = JSON.parse(
   readFileSync(join(repoRoot, 'evals/swe-bench/corpus.json'), 'utf8'),
 );
-// Issue-as-spec is the ONLY mode: every task must carry a curated prompt (the ticket the model gets).
+// Every task must carry a curated prompt — the ticket the model gets (the oracle test is withheld).
 const missingPrompt = corpus.filter((t) => !t.prompt).map((t) => t.id);
 if (missingPrompt.length > 0)
   throw new Error(`swe-bench-run: corpus tasks missing a prompt: ${missingPrompt.join(', ')}`);
