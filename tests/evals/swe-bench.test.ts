@@ -77,16 +77,29 @@ describe('swe-bench workspace (reference task 0be3c4299)', () => {
   });
 
   test.skipIf(!CAN_RUN)(
-    'materialize WITHHOLDS the oracle; restore makes it present; fails at C^ src, passes at gold',
+    'materialize → git repo at C^ (history present, fix commit absent); restore brings the oracle; fails at C^ src, passes at gold',
     () => {
       const { testPaths } = materializeSweWorkspace({ commit: COMMIT, repoRoot: REPO, cwd: work });
       expect(testPaths).toContain(TEST_PATH);
-      // Issue-as-spec: the agent's workspace has NO oracle test — it works from the ticket alone.
-      expect(existsSync(join(work, TEST_PATH))).toBe(false);
+      // The workspace is a git REPO at C^ (not a bare tree) — the agent gets the full pre-fix history as
+      // an engineer would; the leak surfaces are NOT stripped (the corpus is curated to pre-bench commits).
+      expect(existsSync(join(work, '.git'))).toBe(true);
+      const log = Bun.spawnSync({
+        cmd: ['git', '-C', work, 'log', '--oneline'],
+        stdout: 'pipe',
+        stderr: 'ignore',
+      });
+      expect(log.stdout.toString().trim().split('\n').length).toBeGreaterThan(1);
+      // The fix commit C is UNREACHABLE — the bundle is truncated at C^, so `git show <C>` (the gold) fails.
+      const cReachable = Bun.spawnSync({
+        cmd: ['git', '-C', work, 'cat-file', '-e', COMMIT],
+        stdout: 'ignore',
+        stderr: 'ignore',
+      }).success;
+      expect(cReachable).toBe(false);
 
-      // The verifier gets the oracle from restore (re-materializes C's tests/). At the buggy C^ src it FAILS.
-      // (This also IS the anti-cheat: restore rm's + re-archives tests/ from C, so the agent — which never
-      // had the oracle — can't have tampered with it.)
+      // The oracle is C's NEW assertion, which lives in C and is absent here. restore re-materializes C's
+      // tests/; against the buggy C^ src that oracle FAILS.
       restoreSweTests({ commit: COMMIT, repoRoot: REPO, cwd: work, testPaths });
       expect(existsSync(join(work, TEST_PATH))).toBe(true);
       expect(waitForTestPasses(work)).toBe(false);

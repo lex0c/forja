@@ -173,7 +173,8 @@ export const ensureIsolatedDeps = (repoRoot: string): string => {
   return nm;
 };
 
-// Materialize the task workspace: parent tree (no .git), oracle test WITHHELD, node_modules symlink.
+// Materialize the task workspace as a git repo truncated at the parent C^ (full pre-fix project context
+// via the real history, the fix commit C and everything after it absent) + node_modules symlink.
 // Returns the test paths so the caller can scope the verifier and the post-run restore.
 export const materializeSweWorkspace = ({
   commit,
@@ -182,24 +183,27 @@ export const materializeSweWorkspace = ({
 }: SweWorkspaceSpec): { testPaths: string[] } => {
   const testPaths = sweTestPaths({ commit, repoRoot });
 
-  // 1. parent (buggy) tree, no .git.
-  extractArchive(repoRoot, `${commit}^`, cwd, [], `git archive ${commit}^`);
-
-  // 1b. Strip the LEAK SURFACE from the workspace. `git archive` ships the whole tree, including
-  //     docs/BACKLOG.md (a verbose per-fix changelog the model can read locally to glean approach)
-  //     and evals/swe-bench/ (corpus.json carries each task's subject + srcFiles — the fix spec).
-  //     The agent must work from the curated ticket alone, so these never reach it. (docs/spec + the
-  //     rest stay — they're the codebase's own docs, not a fix changelog/answer key.)
-  for (const leak of ['docs/BACKLOG.md', 'docs/TODO.md', 'evals/swe-bench']) {
-    rmSync(join(cwd, leak), { recursive: true, force: true });
+  // 1. Materialize the workspace as a git repo TRUNCATED at the parent C^. A bundle of C^'s history (C
+  //    and everything after it are unreachable from C^, so they are absent from the bundle — `git show
+  //    <C>` fails, the fix is genuinely gone) is cloned into cwd. The agent gets the FULL pre-existing
+  //    project at C^ — its history, blame, BACKLOG, every file — exactly as an engineer sees the repo
+  //    before the fix; that is legitimate context, not the answer. The oracle (C's NEW test assertion)
+  //    lives in C and is naturally absent (the C^ test file is its pre-fix form); the verifier gets the
+  //    real oracle from restoreSweTests. The corpus is curated to commits that PREDATE this bench
+  //    (evals/swe-bench, created 2026-06-22), so evals/swe-bench is never in C^'s tree — no
+  //    self-referential answer-key leak. A throwaway branch names C^ so the bundle is non-empty +
+  //    clonable; it is deleted from the real repo immediately.
+  const baseRef = 'refs/heads/swe-bench-bundle-base';
+  const bundle = `${cwd}.bundle`;
+  git(repoRoot, ['update-ref', baseRef, `${commit}^`]);
+  try {
+    git(repoRoot, ['bundle', 'create', bundle, baseRef]);
+  } finally {
+    git(repoRoot, ['update-ref', '-d', baseRef]);
   }
-
-  // 2. WITHHOLD the oracle test — the agent works from the curated
-  //    ticket alone and never sees the acceptance test. Remove the commit's test file(s): a NEW oracle
-  //    isn't in `C^` anyway, and a MODIFIED one would otherwise survive in its old form. The verifier
-  //    gets the oracle later from `restoreSweTests` (re-materializes C's tests/ before scoring);
-  //    `testPaths` is still returned (the verifier's ORACLE_TESTS + the restore need it).
-  for (const tp of testPaths) rmSync(join(cwd, tp), { force: true });
+  git(repoRoot, ['clone', '--quiet', '--branch', 'swe-bench-bundle-base', bundle, cwd]);
+  rmSync(bundle, { force: true });
+  git(cwd, ['remote', 'remove', 'origin']); // drop the dangling pointer to the (now deleted) bundle
 
   // 3. symlink node_modules to the ISOLATED deps store, NOT repoRoot/node_modules — an absolute
   //    symlink to the repo's node_modules made `node_modules/..` a back-door to the live `.git`

@@ -116,10 +116,13 @@ if (models.length === 0) {
   process.exit(1);
 }
 
-// The model receives ONLY the curated issue ticket — the oracle test is HIDDEN (not in its workspace),
-// and nothing comes from the commit message / BACKLOG (that would leak the fix).
+// The agent gets the curated issue ticket + the full pre-fix repo at C^ (history, existing tests,
+// BACKLOG — legitimate engineering context, the way a real engineer works). The acceptance test (C's new
+// assertion) lives in C and is naturally absent. The wrapper stays MINIMAL — no coaching; the agent
+// reads tests / git history on its own. The only rule is the anti-cheat boundary: the verifier restores
+// the test surface from C, so any edit to a test file or test config is discarded — say so up front.
 const promptFor = (t: Task): string =>
-  `${t.prompt}\n\nFix the source under src/ to resolve this. Read and run the repository's existing tests to understand the expected behavior and find the relevant code, and to check you haven't broken anything. The automated acceptance test that grades your fix is NOT in the workspace — work from the description above; don't waste steps searching for it. Do NOT edit any test files.`;
+  `${t.prompt}\n\nFix the bug. Do not edit test files or test configuration.`;
 
 const sh = (cmd: string[], soft = false): string => {
   const r = Bun.spawnSync({ cmd, stdout: 'pipe', stderr: 'pipe' });
