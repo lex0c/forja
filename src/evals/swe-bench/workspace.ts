@@ -192,12 +192,20 @@ export const materializeSweWorkspace = ({
   //    real oracle from restoreSweTests. The corpus is curated to commits that PREDATE this bench
   //    (evals/swe-bench, created 2026-06-22), so evals/swe-bench is never in C^'s tree — no
   //    self-referential answer-key leak. A throwaway TAG (NOT a branch) names C^ so the bundle is
-  //    non-empty + clonable: this runs against the real repoRoot, and a tag lives OUTSIDE refs/heads so it
-  //    can never clobber a developer's branch; the commit SHA in its name rules out a real-tag collision
-  //    too. It is deleted from the real repo immediately after the bundle is built.
-  const tag = `swe-bench-bundle-${commit}`;
+  //    non-empty + clonable: it lives OUTSIDE refs/heads so it can't clobber a developer's branch. It is
+  //    named with the PARENT SHA (C^), NEVER the gold commit C — the clone RETAINS the tag in the
+  //    workspace's .git, so a C-named tag would let `git tag` there reveal C, the withheld fix commit's
+  //    SHA (an answer-key identifier that could contaminate via model memorization or any future egress
+  //    path, even though the commit object itself is absent). C^ is the workspace's own HEAD, already
+  //    known to the agent, so its SHA in the name leaks nothing. The tag is deleted from the real repo
+  //    right after the bundle, and from the workspace clone right after checkout (it was only the clone
+  //    handle).
+  const parentSha = git(repoRoot, ['rev-parse', `${commit}^`])
+    .toString()
+    .trim();
+  const tag = `swe-bench-bundle-${parentSha}`;
   const bundle = `${cwd}.bundle`;
-  git(repoRoot, ['tag', '-f', tag, `${commit}^`]);
+  git(repoRoot, ['tag', '-f', tag, parentSha]);
   try {
     git(repoRoot, ['bundle', 'create', bundle, `refs/tags/${tag}`]);
   } finally {
@@ -205,6 +213,7 @@ export const materializeSweWorkspace = ({
   }
   git(repoRoot, ['clone', '--quiet', '--branch', tag, bundle, cwd]);
   rmSync(bundle, { force: true });
+  git(cwd, ['tag', '-d', tag]); // the tag was only the clone handle — drop it so the workspace keeps no ref
   git(cwd, ['remote', 'remove', 'origin']); // drop the dangling pointer to the (now deleted) bundle
 
   // 3. symlink node_modules to the ISOLATED deps store, NOT repoRoot/node_modules — an absolute

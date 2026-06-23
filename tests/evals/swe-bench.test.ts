@@ -103,6 +103,16 @@ describe('swe-bench workspace (reference task 0be3c4299)', () => {
         stderr: 'ignore',
       }).success;
       expect(cReachable).toBe(false);
+      // ...and C does not leak via a REF NAME either: the throwaway clone tag is named with the parent
+      // SHA and removed from the workspace, so neither `git tag` nor for-each-ref expose the gold SHA.
+      const fullC = gitOut(['rev-parse', COMMIT]).toString().trim();
+      const refNames = Bun.spawnSync({
+        cmd: ['git', '-C', work, 'for-each-ref', '--format=%(refname)'],
+        stdout: 'pipe',
+        stderr: 'ignore',
+      }).stdout.toString();
+      expect(refNames).not.toContain(COMMIT);
+      expect(refNames).not.toContain(fullC);
 
       // The oracle is C's NEW assertion, which lives in C and is absent here. restore re-materializes C's
       // tests/; against the buggy C^ src that oracle FAILS.
