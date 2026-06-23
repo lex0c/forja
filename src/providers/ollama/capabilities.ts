@@ -125,6 +125,28 @@ export const OLLAMA_CLOUD_CAPS: Record<string, ProviderCapabilities> = {
     recommended_max_tools_per_step: 6,
     notes: ['Ollama Cloud; qwen3-coder 480B MoE; agentic coding'],
   },
+  // Kimi K2.7 Code 1.04T MoE — agentic long-horizon coding; thinking-capable.
+  'kimi-k2.7-code:cloud': {
+    ...OLLAMA_THINKING_BASE,
+    // Hosted on ollama.com — billed by subscription/GPU-time, not per token.
+    unmetered: true,
+    context_window: K256,
+    output_max_tokens: 16_384,
+    recommended_max_tools_per_step: 6,
+    notes: ['Ollama Cloud; Kimi K2.7 Code 1.04T MoE; agentic long-horizon coding'],
+  },
+  // DeepSeek-V4-Pro 1.6T MoE (49B active) — agentic coding/math; thinking-capable.
+  // Real capacity 1M; served window capped at K256 here (a 1M KV cache is far past
+  // any coding session) — an operator can raise num_ctx in their own catalog.
+  'deepseek-v4-pro:cloud': {
+    ...OLLAMA_THINKING_BASE,
+    // Hosted on ollama.com — billed by subscription/GPU-time, not per token.
+    unmetered: true,
+    context_window: K256,
+    output_max_tokens: 16_384,
+    recommended_max_tools_per_step: 6,
+    notes: ['Ollama Cloud; DeepSeek-V4-Pro 1.6T MoE (49B active); agentic coding/math'],
+  },
   // Qwen3-Coder-Next 80B MoE (3B active) — fast agentic coding; non-thinking.
   'qwen3-coder-next': {
     ...OLLAMA_BASE,
