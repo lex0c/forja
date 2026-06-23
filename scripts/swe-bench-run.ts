@@ -447,6 +447,13 @@ const runTaskInner = (model: string, t: Task, logDir: string, work: string): Row
   let oracle: number | undefined;
   let p2p: number | undefined;
   if (!agentTimedOut && !restoreFailed && !agentError) {
+    // Anti-cheat: the agent could have pre-written .result/.p2p (= 0) in its writable workspace and then
+    // sabotaged the verifier (make `bun test` hang or abort) so the entrypoint never overwrites them. Clear
+    // any agent-created copies BEFORE the verifier runs — a verifier that fails to record a real exit code
+    // then leaves them ABSENT, so readExit → undefined → scoreResult scores not-passed/error (the path
+    // already covered + unit-tested), never a stale pass.
+    rmSync(join(work, '.result'), { force: true });
+    rmSync(join(work, '.p2p'), { force: true });
     dockerRun(
       [
         '-e',
