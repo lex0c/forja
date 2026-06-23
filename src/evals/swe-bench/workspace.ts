@@ -194,10 +194,12 @@ export const materializeSweWorkspace = ({
     rmSync(join(cwd, leak), { recursive: true, force: true });
   }
 
-  // 2. apply the tests/** patch so the gold test exists and fails. `git apply` runs with the
-  //    workspace as cwd; it does not need the workspace to be a git repo.
-  const testPatch = git(repoRoot, ['diff', `${commit}^`, commit, '--', 'tests/']);
-  pipeInto(testPatch, ['git', 'apply'], cwd, `apply test patch for ${commit}`);
+  // 2. WITHHOLD the oracle test — this is the issue-as-spec variant: the agent works from the curated
+  //    ticket alone and never sees the acceptance test. Remove the commit's test file(s): a NEW oracle
+  //    isn't in `C^` anyway, and a MODIFIED one would otherwise survive in its old form. The verifier
+  //    gets the oracle later from `restoreSweTests` (re-materializes C's tests/ before scoring);
+  //    `testPaths` is still returned (the verifier's ORACLE_TESTS + the restore need it).
+  for (const tp of testPaths) rmSync(join(cwd, tp), { force: true });
 
   // 3. symlink node_modules to the ISOLATED deps store, NOT repoRoot/node_modules — an absolute
   //    symlink to the repo's node_modules made `node_modules/..` a back-door to the live `.git`

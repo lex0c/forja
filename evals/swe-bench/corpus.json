@@ -1,80 +1,5 @@
 [
   {
-    "id": "08362a6e5",
-    "commit": "08362a6e5ed7359e6dbef70b73db0e5fbdb24dfd",
-    "subject": "feat(tools): refuse binary files in read_file (NUL-byte detection)",
-    "kind": "feature",
-    "testFiles": [
-      "tests/tools/read-file.test.ts"
-    ],
-    "srcFiles": [
-      "src/tools/builtin/read-file.ts",
-      "src/tools/types.ts"
-    ],
-    "tier": 2,
-    "passToPass": [
-      "tests/tools/_bash-cwd.test.ts",
-      "tests/tools/bash-background.test.ts",
-      "tests/tools/bash-broker.test.ts"
-    ]
-  },
-  {
-    "id": "131a14ae0",
-    "commit": "131a14ae0d881bf4090c3942e0d14a7743c44697",
-    "subject": "fix(hooks): reject FORJA_HOOK_SHELL overrides that pre-fill -c command text",
-    "kind": "bug",
-    "testFiles": [
-      "tests/hooks/dispatcher.test.ts"
-    ],
-    "srcFiles": [
-      "src/hooks/dispatcher.ts"
-    ],
-    "tier": 3,
-    "passToPass": [
-      "tests/hooks/config.test.ts",
-      "tests/hooks/locked-enforcement.test.ts",
-      "tests/hooks/paths.test.ts"
-    ]
-  },
-  {
-    "id": "17bcaf158",
-    "commit": "17bcaf1585c7cdc12f5d4fcce069863708255439",
-    "subject": "fix(harness): apply same-length tool_use repairs in ensureAlternation",
-    "kind": "bug",
-    "testFiles": [
-      "tests/harness/session-context.test.ts"
-    ],
-    "srcFiles": [
-      "src/harness/session-context.ts"
-    ],
-    "tier": 1,
-    "passToPass": [
-      "tests/harness/abortable.test.ts",
-      "tests/harness/budget-defaults.test.ts",
-      "tests/harness/checkpoints.test.ts"
-    ]
-  },
-  {
-    "id": "1aa34fb4d",
-    "commit": "1aa34fb4db40f856712954f12b7ab9bf19c926c3",
-    "subject": "feat(stats): break cost down by axis (input/output/cache-read/cache-write)",
-    "kind": "feature",
-    "testFiles": [
-      "tests/cli/slash/stats.test.ts",
-      "tests/providers/cost.test.ts"
-    ],
-    "srcFiles": [
-      "src/cli/slash/commands/stats.ts",
-      "src/providers/cost.ts"
-    ],
-    "tier": 1,
-    "passToPass": [
-      "tests/cli/slash/agent-policy.test.ts",
-      "tests/cli/slash/agent-retrieval.test.ts",
-      "tests/cli/slash/commands.test.ts"
-    ]
-  },
-  {
     "id": "200796f0b",
     "commit": "200796f0b9c0168c92135b1f882adbb4a33fe82b",
     "subject": "fix(tui): Markdown autolink no longer duplicates the URL under formatting",
@@ -90,47 +15,8 @@
       "tests/tui/render/assistant-chip.test.ts",
       "tests/tui/render/compose.test.ts",
       "tests/tui/render/critique-chip.test.ts"
-    ]
-  },
-  {
-    "id": "2e0803399",
-    "commit": "2e080339960cf6f36fa208843cf8200a985b5ae1",
-    "subject": "fix(resume): synthetic assistant placeholder for stranded user tail",
-    "kind": "bug",
-    "testFiles": [
-      "tests/cli/resume.test.ts"
     ],
-    "srcFiles": [
-      "src/harness/loop.ts",
-      "src/harness/resume.ts"
-    ],
-    "tier": 2,
-    "passToPass": [
-      "tests/cli/args.test.ts",
-      "tests/cli/bootstrap.test.ts",
-      "tests/cli/index.test.ts"
-    ]
-  },
-  {
-    "id": "3739b3b08",
-    "commit": "3739b3b08ee56e05a9448e517c6928eda1bc8a2a",
-    "subject": "feat(stats): surface cache hit ratio in /stats",
-    "kind": "feature",
-    "testFiles": [
-      "tests/cli/slash/stats.test.ts",
-      "tests/storage/repos/stats.test.ts"
-    ],
-    "srcFiles": [
-      "src/cli/slash/commands/stats.ts",
-      "src/storage/index.ts",
-      "src/storage/repos/stats.ts"
-    ],
-    "tier": 1,
-    "passToPass": [
-      "tests/cli/slash/agent-policy.test.ts",
-      "tests/cli/slash/agent-retrieval.test.ts",
-      "tests/cli/slash/commands.test.ts"
-    ]
+    "prompt": "In the terminal Markdown renderer, an autolink whose visible label is identical to its target URL — written as `[https://x.io](https://x.io)` — renders the URL twice, e.g. `https://x.io (https://x.io)`. The renderer is supposed to append the URL in parentheses only when it adds information beyond the label, which it does not here. The duplication shows up specifically when color is enabled, and it also happens when the autolink is wrapped in other formatting such as bold (`**[https://x.io](https://x.io)**`). Make an autolink whose label matches its URL render the URL a single time, regardless of any surrounding formatting; a link whose label genuinely differs from the URL must still show the URL alongside it."
   },
   {
     "id": "38c637a68",
@@ -148,68 +34,8 @@
       "tests/permissions/audit-rotation.test.ts",
       "tests/permissions/audit-scheduler.test.ts",
       "tests/permissions/audit-telemetry.test.ts"
-    ]
-  },
-  {
-    "id": "39d1ce983",
-    "commit": "39d1ce9836a715776f6096d13aa11511ab039a84",
-    "subject": "feat(compaction): preserve active pins across compaction",
-    "kind": "feature",
-    "testFiles": [
-      "tests/harness/compaction.test.ts",
-      "tests/tools/pin-context.test.ts"
     ],
-    "srcFiles": [
-      "src/harness/compaction.ts",
-      "src/harness/loop.ts",
-      "src/tools/builtin/pin-context.ts"
-    ],
-    "tier": 3,
-    "passToPass": [
-      "tests/harness/abortable.test.ts",
-      "tests/harness/budget-defaults.test.ts",
-      "tests/harness/checkpoints.test.ts"
-    ]
-  },
-  {
-    "id": "40ad81974",
-    "commit": "40ad81974c665b13c9ac09a19f4d0a2ba557e85d",
-    "subject": "feat(tools): edit_file whitespace-tolerant fallback + actionable errors",
-    "kind": "feature",
-    "testFiles": [
-      "tests/tools/edit-file.test.ts",
-      "tests/tools/read-file.test.ts"
-    ],
-    "srcFiles": [
-      "src/tools/builtin/edit-file.ts"
-    ],
-    "tier": 3,
-    "passToPass": [
-      "tests/tools/_bash-cwd.test.ts",
-      "tests/tools/bash-background.test.ts",
-      "tests/tools/bash-broker.test.ts"
-    ]
-  },
-  {
-    "id": "4b339ed40",
-    "commit": "4b339ed405635e2bd0358687d6ac35dd7b03642e",
-    "subject": "fix(tui): memory-write modal resolved No while the cursor showed Yes",
-    "kind": "bug",
-    "testFiles": [
-      "tests/tui/modal-manager.test.ts",
-      "tests/tui/render/modal.test.ts"
-    ],
-    "srcFiles": [
-      "src/tui/modal-manager.ts",
-      "src/tui/render/modal.ts",
-      "src/tui/state.ts"
-    ],
-    "tier": 2,
-    "passToPass": [
-      "tests/tui/bus.test.ts",
-      "tests/tui/focus-stack.test.ts",
-      "tests/tui/harness-adapter.test.ts"
-    ]
+    "prompt": "The permission engine denies a repo-wide read operation when the path argument is an empty string. The read-style tools (grep/glob/git) treat an empty path the same as an omitted one — meaning repo-wide — and models frequently emit `path: \"\"`. But the engine rejects it as a missing/invalid path, so a repo-wide `git status` with `path: \"\"` is blocked even though the identical call with the argument absent is allowed and would run repo-wide either way; the model is forced into a needless retry. Treat an empty-string path for these tools as equivalent to an omitted one (resolved against the working directory and classified accordingly). This must not loosen anything else: a genuinely non-string path value (number, array, null) should still be rejected."
   },
   {
     "id": "4c0cf1dda",
@@ -228,7 +54,8 @@
       "tests/permissions/audit-rotation.test.ts",
       "tests/permissions/audit-scheduler.test.ts",
       "tests/permissions/audit-telemetry.test.ts"
-    ]
+    ],
+    "prompt": "The bash permission resolver mis-classifies some `sed -i` commands as safe in-place edits and auto-approves them under the autonomous posture, when they can actually execute arbitrary code. On BSD/macOS, `sed -i` takes the backup suffix as a *separate* operand — it consumes the next token (any token), shifting the script one position to the right of where GNU sed puts it. So `sed -i p 's/x/id/e' file` runs the script `s/x/id/e` (which execs `id` via the `e` flag), but the resolver reads the first positional as a harmless print script and models it as a read-only/in-repo-write command. When the suffix-bearing form of `-i` is used without an explicit `-e SCRIPT`, the script position is platform-ambiguous and the command must be treated as arbitrary code execution (no auto-approval). The unambiguous forms — an attached suffix like `-i.bak`, an explicit `-e SCRIPT`, and the long `--in-place` — should stay modeled as ordinary repo-confined writes."
   },
   {
     "id": "564f90633",
@@ -246,28 +73,8 @@
       "tests/providers/anthropic-cache.test.ts",
       "tests/providers/anthropic-effort.test.ts",
       "tests/providers/anthropic-stream.test.ts"
-    ]
-  },
-  {
-    "id": "5b541dfb3",
-    "commit": "5b541dfb321a6e36a1c3beb7070b0921197e1d66",
-    "subject": "feat(stats): attribute cache write by source + write amplification",
-    "kind": "feature",
-    "testFiles": [
-      "tests/cli/slash/stats.test.ts",
-      "tests/storage/repos/stats.test.ts"
     ],
-    "srcFiles": [
-      "src/cli/slash/commands/stats.ts",
-      "src/storage/index.ts",
-      "src/storage/repos/stats.ts"
-    ],
-    "tier": 2,
-    "passToPass": [
-      "tests/cli/slash/agent-policy.test.ts",
-      "tests/cli/slash/agent-retrieval.test.ts",
-      "tests/cli/slash/commands.test.ts"
-    ]
+    "prompt": "In the OpenAI Responses streaming path, when a function call's arguments arrive malformed or truncated (invalid JSON), the normalizer turns them into an empty object and still finalizes the call as if it were valid. The harness then executes or records the tool (e.g. read_file or bash) with empty arguments after a corrupted stream — running the wrong action with no parameters. The other provider paths already reject this case (they surface a parse error and do not finalize the call); the Responses path should behave the same way. On a JSON parse failure, or when the decoded arguments are not a JSON object (e.g. a top-level array or scalar), the call must be treated as invalid and must not be finalized for execution. A genuinely empty argument object for a no-parameter tool should still decode and close normally."
   },
   {
     "id": "5d886fe6b",
@@ -285,44 +92,8 @@
       "tests/skills/catalog.test.ts",
       "tests/skills/frontmatter.test.ts",
       "tests/skills/loader.test.ts"
-    ]
-  },
-  {
-    "id": "6180c89bc",
-    "commit": "6180c89bc0f0a281ed2590504f1fa6c28c361c09",
-    "subject": "fix(cli/slash/agent-retrieval): percentileOf off-by-one inflated tail latencies",
-    "kind": "bug",
-    "testFiles": [
-      "tests/cli/slash/agent-retrieval.test.ts"
     ],
-    "srcFiles": [
-      "src/cli/slash/commands/agent-retrieval.ts"
-    ],
-    "tier": 1,
-    "passToPass": [
-      "tests/cli/slash/agent-policy.test.ts",
-      "tests/cli/slash/commands.test.ts",
-      "tests/cli/slash/dispatch.test.ts"
-    ]
-  },
-  {
-    "id": "655110a48",
-    "commit": "655110a4864c54ac6b3f5ed32761a1b65b3403ab",
-    "subject": "sec(permissions): follow dangling symlinks in the fs confinement resolver",
-    "kind": "bug",
-    "testFiles": [
-      "tests/permissions/symlink.test.ts"
-    ],
-    "srcFiles": [
-      "src/permissions/engine.ts",
-      "src/permissions/matcher.ts"
-    ],
-    "tier": 3,
-    "passToPass": [
-      "tests/permissions/audit-rotation.test.ts",
-      "tests/permissions/audit-scheduler.test.ts",
-      "tests/permissions/audit-telemetry.test.ts"
-    ]
+    "prompt": "Moving a skill between scopes can leave the skill present in BOTH scopes. The move copies the source to the destination and then deletes the source; if deleting the source fails (e.g. its directory is read-only), the operation reports an error but the freshly-written destination is left on disk. The skill then exists in two scopes at once — silently shifting precedence/shadowing — and retrying the move fails because the destination already exists. A failed move must mutate nothing: on any failure after the destination is written, roll the destination back so the source remains the only copy."
   },
   {
     "id": "68bf36eb7",
@@ -340,7 +111,8 @@
       "tests/memory/dependents.test.ts",
       "tests/memory/frontmatter.test.ts",
       "tests/memory/gitignore.test.ts"
-    ]
+    ],
+    "prompt": "Memories given an expiry date that falls on the last day of a month — for example `2026-01-31` or `2026-12-31` — never expire. Such an entry stays visible in the model-facing memory listing (the one that excludes expired entries) long past its expiry date, whereas a mid-month date like `2026-01-15` expires correctly. Leap-day dates such as `2024-02-29` are affected the same way. Fix expiry handling so a last-day-of-month (and leap-day) expiry date is honored: the memory is visible up to the end of that day and excluded once the day has passed, including across a year boundary. A date that isn't a real calendar day at all (e.g. `2026-02-31`, which can survive hand-editing) should be treated as having no expiry — it must not vanish by surprise."
   },
   {
     "id": "7481e4830",
@@ -357,45 +129,8 @@
     "passToPass": [
       "tests/recap/eval.test.ts",
       "tests/recap/render.test.ts"
-    ]
-  },
-  {
-    "id": "7b7753279",
-    "commit": "7b775327934b7bc84eeb392722faf5ce8dc29d5f",
-    "subject": "feat(providers): per-entry num_ctx so Ollama cloud entries serve their real window",
-    "kind": "feature",
-    "testFiles": [
-      "tests/providers/catalog-file.test.ts"
     ],
-    "srcFiles": [
-      "src/providers/catalog-file.ts",
-      "src/providers/catalog-io.ts",
-      "src/providers/types.ts"
-    ],
-    "tier": 2,
-    "passToPass": [
-      "tests/providers/anthropic-cache.test.ts",
-      "tests/providers/anthropic-effort.test.ts",
-      "tests/providers/anthropic-stream.test.ts"
-    ]
-  },
-  {
-    "id": "83f3f9713",
-    "commit": "83f3f971379e6c1891532ffe049db963d19f8d2b",
-    "subject": "fix(tui): propagate outputTruncated on the non-zero-exit tool-end path",
-    "kind": "bug",
-    "testFiles": [
-      "tests/tui/state.test.ts"
-    ],
-    "srcFiles": [
-      "src/tui/state.ts"
-    ],
-    "tier": 1,
-    "passToPass": [
-      "tests/tui/bus.test.ts",
-      "tests/tui/focus-stack.test.ts",
-      "tests/tui/harness-adapter.test.ts"
-    ]
+    "prompt": "The recap over-reports file-edit breadth. When a session edits the same file several times — the normal iterative pattern of editing `src/foo.ts`, then editing it again, then once more — the recap lists that path once per edit and the \"what changed\" headline counts each edit as a separate file (so four edits to one file read as \"4 files edited\"). It should report per file, not per write call: each path that was written appears a single time. Preserve the order in which paths were first touched (a path edited again later must not jump to the end of the list)."
   },
   {
     "id": "84772c3f7",
@@ -413,7 +148,8 @@
       "tests/tools/_bash-cwd.test.ts",
       "tests/tools/bash-background.test.ts",
       "tests/tools/bash-broker.test.ts"
-    ]
+    ],
+    "prompt": "The read-only git tool produces wrong results on repositories that use content filters (e.g. Git LFS, or any configured clean/smudge filter). On such a repo an unchanged tracked file is reported as modified by status, and diff emits a bogus hunk comparing a pointer/placeholder against the real content — so the tool silently fabricates a worktree comparison that never actually happened, which could mislead the operator or the model into acting on a false diff. Make the git tool trustworthy in the presence of these filters: it must never return a fabricated or corrupted comparison for filtered files. When it cannot produce a faithful result for such a file, it should refuse with a clear, actionable error that identifies the affected file rather than returning misleading output."
   },
   {
     "id": "86caae831",
@@ -432,7 +168,8 @@
       "tests/harness/abortable.test.ts",
       "tests/harness/assistant-content.test.ts",
       "tests/harness/bg-cleanup.test.ts"
-    ]
+    ],
+    "prompt": "When a run exhausts its step budget, the harness makes one final synthesis turn so an exhausted run still returns an answer — but if that synthesis turn is itself cut short, the caller gets a truncated final report with no indication why. A normal turn that stops because it hit the per-call output cap or the model's context window reports a distinct exhaustion reason (so the operator knows to raise the output cap or shrink the context); the final synthesis turn ignores its own stop reason and always reports the generic step-budget reason. When the synthesis turn stops at the output-token cap or exceeds the context window, the run should finish with the corresponding output-tokens / context-tokens reason (the partial report still kept), rather than masking it as a clean step-budget exhaustion."
   },
   {
     "id": "8ce08ef5d",
@@ -452,100 +189,8 @@
       "tests/cli/slash/agent-policy.test.ts",
       "tests/cli/slash/agent-retrieval.test.ts",
       "tests/cli/slash/commands.test.ts"
-    ]
-  },
-  {
-    "id": "932c14861",
-    "commit": "932c1486112ada50f9df561fc3120bb5fe526b73",
-    "subject": "fix(permissions): make §8.4 sensitive-path matching case-insensitive",
-    "kind": "bug",
-    "testFiles": [
-      "tests/permissions/sensitive-paths-case.test.ts"
     ],
-    "srcFiles": [
-      "src/permissions/sensitive-paths.ts"
-    ],
-    "tier": 1,
-    "passToPass": [
-      "tests/permissions/audit-rotation.test.ts",
-      "tests/permissions/audit-scheduler.test.ts",
-      "tests/permissions/audit-telemetry.test.ts"
-    ]
-  },
-  {
-    "id": "9b45a0b36",
-    "commit": "9b45a0b3620e75740a687717d55b32b6243b03e8",
-    "subject": "fix(recap): treat bash_background as non-terminal in action aggregates",
-    "kind": "bug",
-    "testFiles": [
-      "tests/recap/projection.test.ts"
-    ],
-    "srcFiles": [
-      "src/recap/projection.ts"
-    ],
-    "tier": 2,
-    "passToPass": [
-      "tests/recap/eval.test.ts",
-      "tests/recap/render.test.ts"
-    ]
-  },
-  {
-    "id": "a0ca32340",
-    "commit": "a0ca32340d5204ee3ea7f89519281ca62d0a1b6b",
-    "subject": "fix(memory): emit search provenance only for returned hits",
-    "kind": "bug",
-    "testFiles": [
-      "tests/memory/registry.test.ts",
-      "tests/tools/memory-search.test.ts"
-    ],
-    "srcFiles": [
-      "src/memory/registry.ts",
-      "src/tools/builtin/memory-search.ts"
-    ],
-    "tier": 3,
-    "passToPass": [
-      "tests/memory/dependents.test.ts",
-      "tests/memory/expires.test.ts",
-      "tests/memory/frontmatter.test.ts"
-    ]
-  },
-  {
-    "id": "a1afc3317",
-    "commit": "a1afc33176a62c7e329e796b90abad1e22c9c14f",
-    "subject": "fix(clarify): forward the run abort signal into the modal",
-    "kind": "bug",
-    "testFiles": [
-      "tests/tools/clarify.test.ts"
-    ],
-    "srcFiles": [
-      "src/cli/repl.ts",
-      "src/tools/builtin/clarify.ts",
-      "src/tools/types.ts"
-    ],
-    "tier": 2,
-    "passToPass": [
-      "tests/tools/_bash-cwd.test.ts",
-      "tests/tools/bash-background.test.ts",
-      "tests/tools/bash-broker.test.ts"
-    ]
-  },
-  {
-    "id": "a4b95045f",
-    "commit": "a4b95045f31b1739a49709565f43532f3ee85298",
-    "subject": "fix(tools/_bash-cwd): narrow cwd-escape check to real parent traversals",
-    "kind": "bug",
-    "testFiles": [
-      "tests/tools/_bash-cwd.test.ts"
-    ],
-    "srcFiles": [
-      "src/tools/builtin/_bash-cwd.ts"
-    ],
-    "tier": 1,
-    "passToPass": [
-      "tests/tools/bash-background.test.ts",
-      "tests/tools/bash-broker.test.ts",
-      "tests/tools/bash-kill.test.ts"
-    ]
+    "prompt": "In the skills subsystem, `/skill delete` cannot remove a skill file whose filename is not valid kebab-case (e.g. `Upper.md`, `Bad Name.md`). These malformed files are surfaced by `/skill list` as cleanup targets, and delete already removes files whose *contents* are malformed — but a non-kebab *filename* is rejected before any filesystem action, so the operator has no way to clean it up. Deleting an existing file should succeed regardless of whether its filename matches the naming format. A path that tries to escape the skills directory (traversal) must still be refused."
   },
   {
     "id": "b888c4ddd",
@@ -563,25 +208,8 @@
       "tests/tools/_bash-cwd.test.ts",
       "tests/tools/bash-background.test.ts",
       "tests/tools/bash-broker.test.ts"
-    ]
-  },
-  {
-    "id": "bd7ecf84b",
-    "commit": "bd7ecf84bf3f9a4d1739e05ba85748acb02d36f9",
-    "subject": "feat(harness): final synthesis turn on max_steps so an exhausted run still returns its answer",
-    "kind": "feature",
-    "testFiles": [
-      "tests/harness/loop.test.ts"
     ],
-    "srcFiles": [
-      "src/harness/loop.ts"
-    ],
-    "tier": 3,
-    "passToPass": [
-      "tests/harness/abortable.test.ts",
-      "tests/harness/assistant-content.test.ts",
-      "tests/harness/bg-cleanup.test.ts"
-    ]
+    "prompt": "`git_apply_patch` refuses valid patches when the working directory reaches the repository through a symlink (a symlinked checkout or workspace mount). The tool derives the worktree root from git, which reports a fully symlink-resolved (real) path, but it computes the patched file's path lexically under the session cwd. When the cwd is a symlink into the repo, those two paths live in different coordinate systems, so the in-worktree confinement check sees the file as escaping the worktree and rejects an otherwise valid patch with a path-mismatch error — making the tool unusable from symlinked checkouts. A patch targeting a file genuinely inside the repository must apply successfully even when the cwd is a symlink, while a patch whose leaf is itself a symlink is still rejected."
   },
   {
     "id": "c12e891bf",
@@ -599,27 +227,8 @@
       "tests/providers/anthropic-cache.test.ts",
       "tests/providers/anthropic-effort.test.ts",
       "tests/providers/anthropic-stream.test.ts"
-    ]
-  },
-  {
-    "id": "c266c8894",
-    "commit": "c266c8894e3b67cef8786e9de2472f9bc9d30af6",
-    "subject": "fix(checkpoints): preserve tracked secrets, anchor snapshot/restore at the worktree root",
-    "kind": "bug",
-    "testFiles": [
-      "tests/checkpoints/detect.test.ts",
-      "tests/checkpoints/git.test.ts",
-      "tests/checkpoints/manager.test.ts"
     ],
-    "srcFiles": [
-      "src/checkpoints/detect.ts",
-      "src/checkpoints/git.ts",
-      "src/checkpoints/index.ts",
-      "src/checkpoints/manager.ts",
-      "src/cli/checkpoints.ts",
-      "src/harness/loop.ts"
-    ],
-    "tier": 3
+    "prompt": "When the recap subsystem renders through a current Anthropic model (e.g. the Haiku 4.x family), every constrained render fails and silently falls back to a deterministic render — the LLM-rendered recap surface is effectively dead in production. The root cause is that these models accept sampling but reject requests that specify both `temperature` and `top_p` together (the API returns an HTTP 400 saying the two cannot both be specified for this model). Our sampling configuration sets both values at once, so the request is always rejected. Make the Anthropic provider tolerate this constraint so a request that carries both sampling knobs still succeeds, while a request that only sets one of them keeps passing that one through. Providers that accept the pair must be unaffected."
   },
   {
     "id": "c82402ddd",
@@ -638,7 +247,8 @@
       "tests/permissions/audit-rotation.test.ts",
       "tests/permissions/audit-scheduler.test.ts",
       "tests/permissions/audit-telemetry.test.ts"
-    ]
+    ],
+    "prompt": "Under the autonomous posture, the bash permission engine auto-approves a command that reads or writes outside the repository through a symlink. Repo-confined bash is auto-approved by treating a cwd-relative path as in-repo, but this check is purely lexical: if the leaf name is a symlink whose real target escapes the working directory, the command is still judged repo-confined and the confirmation prompt is skipped — so e.g. reading through such a link reads an external file with no prompt. A command operating on a cwd path whose symlink target leaves the repository must not be auto-approved (it should fall back to a confirmation), while a symlink that genuinely resolves inside the repo should still auto-approve. The same hole exists for a standalone output redirection to such a symlink."
   },
   {
     "id": "d23d056c0",
@@ -656,7 +266,8 @@
       "tests/cli/args-gc.test.ts",
       "tests/cli/args-purge.test.ts",
       "tests/cli/args.test.ts"
-    ]
+    ],
+    "prompt": "A message typed and queued while a turn is running gets stranded if that turn fails. The inbox is drained only when a turn emits its normal completion signal; if the turn's underlying run rejects/crashes before emitting that signal (e.g. a provider crash), the cleanup path clears the running state but never drains the queue, so the queued message sits pending until some later unrelated boundary instead of being sent next. After a turn ends abnormally without its completion signal, any message queued during it must still be drained and dispatched as the following turn."
   },
   {
     "id": "d3747eb16",
@@ -674,7 +285,8 @@
       "tests/cli/slash/dispatch.test.ts",
       "tests/cli/slash/history.test.ts",
       "tests/cli/slash/hooks.test.ts"
-    ]
+    ],
+    "prompt": "`/critique <N>` shows the wrong runs when sessions interleave in time. The recent-runs list is built by concatenating each session's runs in the order the sessions were added, then tail-slicing to N — but that concatenation is not a real global timeline. If session A runs, then a child/playbook session B runs, then A continues, the genuinely most-recent runs from A get dropped from the tail while older runs from B are kept, purely because of session ordering. The N most recent runs by their actual timestamps should be shown, newest first, regardless of which session they belong to (with a stable tiebreak so same-millisecond runs from one session keep their step order)."
   },
   {
     "id": "d5849eade",
@@ -694,44 +306,8 @@
       "tests/cli/slash/agent-policy.test.ts",
       "tests/cli/slash/commands.test.ts",
       "tests/cli/slash/dispatch.test.ts"
-    ]
-  },
-  {
-    "id": "d8451612e",
-    "commit": "d8451612ea9574cc37fa3514738f8f3f92d049bb",
-    "subject": "feat(tools): bash_list — snapshot of session bg processes",
-    "kind": "feature",
-    "testFiles": [
-      "tests/cli/bootstrap.test.ts",
-      "tests/tools/bash-list.test.ts"
     ],
-    "srcFiles": [
-      "src/bg/manager.ts",
-      "src/tools/builtin/bash-list.ts",
-      "src/tools/builtin/index.ts"
-    ],
-    "tier": 2,
-    "passToPass": [
-      "tests/cli/args-gc.test.ts",
-      "tests/cli/args-purge.test.ts",
-      "tests/cli/args.test.ts"
-    ]
-  },
-  {
-    "id": "d8e189cec",
-    "commit": "d8e189cec11dacb3f22d631a1ae44ae65832a864",
-    "subject": "feat(reminders): in-memory clock-driven scheduler",
-    "kind": "feature",
-    "testFiles": [
-      "tests/reminders/duration.test.ts",
-      "tests/reminders/scheduler.test.ts"
-    ],
-    "srcFiles": [
-      "src/reminders/duration.ts",
-      "src/reminders/index.ts",
-      "src/reminders/scheduler.ts"
-    ],
-    "tier": 1
+    "prompt": "The per-session pin cap counts expired pins against the limit, which traps the operator in a dead end. After someone creates the maximum number of short-lived pins and lets them expire, `/pin --list` shows nothing (it lists only active pins) yet a new `/pin` is still refused for hitting the cap — and there is no listed id to remove, so the session is stuck until they dig up the expired ids or restart. Make the cap count only currently-active pins: expired pins still linger as history but must not occupy capacity, so a fresh pin succeeds once earlier ones have expired. Creating beyond the limit while that many pins are genuinely active must still be refused as before."
   },
   {
     "id": "d99f0dd57",
@@ -749,77 +325,8 @@
       "tests/cli/args-gc.test.ts",
       "tests/cli/args-purge.test.ts",
       "tests/cli/args.test.ts"
-    ]
-  },
-  {
-    "id": "dce1cb6a9",
-    "commit": "dce1cb6a9fa2fe4c9cd0aa09adcece89c285256e",
-    "subject": "fix(working-state): keep staleness step monotonic across REPL turns",
-    "kind": "bug",
-    "testFiles": [
-      "tests/working-state/index.test.ts"
     ],
-    "srcFiles": [
-      "src/harness/loop.ts",
-      "src/working-state/index.ts"
-    ],
-    "tier": 3
-  },
-  {
-    "id": "e2c7da71b",
-    "commit": "e2c7da71b6c7207a340d1909d428830e16993c5e",
-    "subject": "fix(permissions): preserve dynamic ($-expansion) path operands in conservative results",
-    "kind": "bug",
-    "testFiles": [
-      "tests/permissions/resolvers.test.ts"
-    ],
-    "srcFiles": [
-      "src/permissions/resolvers/bash.ts"
-    ],
-    "tier": 3,
-    "passToPass": [
-      "tests/permissions/audit-rotation.test.ts",
-      "tests/permissions/audit-scheduler.test.ts",
-      "tests/permissions/audit-telemetry.test.ts"
-    ]
-  },
-  {
-    "id": "e38ea07f1",
-    "commit": "e38ea07f1a6cd2ef42788a8efe2e5f7811159945",
-    "subject": "fix(git): gate log against denied-subtree commits",
-    "kind": "bug",
-    "testFiles": [
-      "tests/tools/git.test.ts"
-    ],
-    "srcFiles": [
-      "src/tools/builtin/git.ts"
-    ],
-    "tier": 2,
-    "passToPass": [
-      "tests/tools/_bash-cwd.test.ts",
-      "tests/tools/bash-background.test.ts",
-      "tests/tools/bash-broker.test.ts"
-    ]
-  },
-  {
-    "id": "e763e1c92",
-    "commit": "e763e1c926c42b30059fec1f5f2d140a87de9696",
-    "subject": "sec(git_apply_patch): reject metadata-only diff sections (confinement bypass)",
-    "kind": "bug",
-    "testFiles": [
-      "tests/diff/git-patch.test.ts",
-      "tests/tools/git-apply-patch.test.ts"
-    ],
-    "srcFiles": [
-      "src/diff/git-patch.ts",
-      "src/tools/builtin/git-apply-patch.ts"
-    ],
-    "tier": 3,
-    "passToPass": [
-      "tests/diff/line-diff.test.ts",
-      "tests/tools/_bash-cwd.test.ts",
-      "tests/tools/bash-background.test.ts"
-    ]
+    "prompt": "Editing a queued message leaves a phantom entry in the input-history recall pool. When a message is queued while the agent is busy and then edited before it is sent (lift it with the up-arrow, change the text, submit), BOTH the original never-sent text and the edited text end up recallable via up-arrow / reverse-search — so the operator can recall a command that was never actually run. Input history should reflect only what was actually sent: a queued message that was edited away (or abandoned on quit before being sent) must never enter the recall pool."
   },
   {
     "id": "edfed8a24",
@@ -838,25 +345,8 @@
       "tests/permissions/audit-rotation.test.ts",
       "tests/permissions/audit-scheduler.test.ts",
       "tests/permissions/audit-telemetry.test.ts"
-    ]
-  },
-  {
-    "id": "f1fafd62b",
-    "commit": "f1fafd62b60ab0b2437e7572f3131bda93667e1a",
-    "subject": "Fix git metadata-gate relativity leak: resolve against the repo root",
-    "kind": "bug",
-    "testFiles": [
-      "tests/tools/git.test.ts"
     ],
-    "srcFiles": [
-      "src/tools/builtin/git.ts"
-    ],
-    "tier": 2,
-    "passToPass": [
-      "tests/tools/_bash-cwd.test.ts",
-      "tests/tools/bash-background.test.ts",
-      "tests/tools/bash-broker.test.ts"
-    ]
+    "prompt": "The permission engine has a carve-out so that ordinary globbing from a repo checked out under a removable-media mount path (`/run/media/<user>/<volume>/...`) isn't blanket-refused as escaping into protected `/run` paths. But the carve-out is too loose at the segment boundary: a glob anchored on the bare `/run/media` segment — e.g. `/run/media*` — is also treated as safe, even though the trailing `*` extends the `media` segment itself and can match sibling entries like `/run/mediaevil` or `/run/mediator` that have nothing to do with the mounted-volume area. So such a command is auto-approved when it could actually reach paths outside the intended carve-out. Tighten the carve-out so it applies only to globs genuinely inside a mounted volume (a `/run/media/<volume>/...` path); a glob anchored on the bare `/run/media` segment must not qualify for the carve-out and should be treated like any other potentially-escaping glob, while globs that stay strictly within a volume keep working."
   },
   {
     "id": "f3fdc7a92",
@@ -875,25 +365,8 @@
       "tests/subagents/builtin-embedded.test.ts",
       "tests/subagents/canonical-seeds.test.ts",
       "tests/subagents/e2e.test.ts"
-    ]
-  },
-  {
-    "id": "f51ba40f6",
-    "commit": "f51ba40f6aecb97c39eabb9388d58d64b14066b3",
-    "subject": "fix(history): trim in-memory mirror to match storage cap",
-    "kind": "bug",
-    "testFiles": [
-      "tests/cli/repl-history.test.ts"
     ],
-    "srcFiles": [
-      "src/cli/repl.ts"
-    ],
-    "tier": 2,
-    "passToPass": [
-      "tests/cli/args.test.ts",
-      "tests/cli/bootstrap.test.ts",
-      "tests/cli/checkpoints.test.ts"
-    ]
+    "prompt": "Subagents fail to run whenever they are assigned a custom model from the model catalog — one configured to read its API key from a non-standard environment variable (for instance an OpenAI-compatible endpoint whose key lives in a custom env var). Such a subagent dies immediately with an \"API key required\" error before executing a single step, while subagents on the built-in providers work fine. The cause is that spawning a subagent deliberately scrubs the child's environment down to a known set of credential variables for safety, and a custom model's key variable isn't in that set, so it gets stripped. Fix it so a subagent on a custom catalog model can authenticate and run: the specific environment variable that the selected model declares for its API key must survive into the child. Preserve the security posture — only that one declared variable should be allowed through, other credential-shaped variables must still be scrubbed, and the secret value itself must not be persisted anywhere."
   },
   {
     "id": "fa8a694c2",
@@ -915,24 +388,7 @@
       "tests/harness/abortable.test.ts",
       "tests/harness/budget-defaults.test.ts",
       "tests/harness/checkpoints.test.ts"
-    ]
-  },
-  {
-    "id": "fc6619bd7",
-    "commit": "fc6619bd773376675cedaa179559026226c2f238",
-    "subject": "fix(permissions): classify for-loop item words + preserve dynamic argv positions",
-    "kind": "bug",
-    "testFiles": [
-      "tests/permissions/resolvers.test.ts"
     ],
-    "srcFiles": [
-      "src/permissions/resolvers/bash.ts"
-    ],
-    "tier": 2,
-    "passToPass": [
-      "tests/permissions/audit-rotation.test.ts",
-      "tests/permissions/audit-scheduler.test.ts",
-      "tests/permissions/audit-telemetry.test.ts"
-    ]
+    "prompt": "In the agent harness, when a run aborts in the middle of a tool round — for example it trips the consecutive-tool-error guard while several tool calls from one assistant turn are still pending — the session becomes permanently unusable. Every subsequent request (including a later --resume) fails at the provider with an error about tool-call ids that have no corresponding result, and there is no way to recover the session. The expectation is that a run can abort mid-round without corrupting the conversation: after any such interruption the session must remain valid and resumable, with every tool call the assistant issued ending up accounted for so the next turn is accepted. Recovering a session that was already left in this broken state should also work."
   }
 ]

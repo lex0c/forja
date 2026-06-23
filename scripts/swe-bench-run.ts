@@ -50,6 +50,9 @@ interface Task {
   srcFiles: string[];
   tier: 1 | 2 | 3;
   passToPass?: string[];
+  // The curated operator ticket. Issue-as-spec is the only mode: the model gets ONLY this (the oracle
+  // test is hidden), so every corpus task must carry one (asserted at load).
+  prompt: string;
 }
 
 const IMAGE = 'forja-swe-bench';
@@ -66,6 +69,10 @@ const repoRoot = gitToplevel(process.cwd());
 const corpus: Task[] = JSON.parse(
   readFileSync(join(repoRoot, 'evals/swe-bench/corpus.json'), 'utf8'),
 );
+// Issue-as-spec is the ONLY mode: every task must carry a curated prompt (the ticket the model gets).
+const missingPrompt = corpus.filter((t) => !t.prompt).map((t) => t.id);
+if (missingPrompt.length > 0)
+  throw new Error(`swe-bench-run: corpus tasks missing a prompt: ${missingPrompt.join(', ')}`);
 
 const argv = process.argv.slice(2);
 let models: string[] = ['ollama/devstral-2:123b'];
@@ -107,11 +114,10 @@ if (models.length === 0) {
   process.exit(1);
 }
 
-// The model receives the failing test as the spec — nothing from the commit/BACKLOG.
-const promptFor = (t: Task): string => {
-  const cmd = `bun test ${t.testFiles.join(' ')}`;
-  return `One or more tests in this repository are failing. Run \`${cmd}\` to see the failure, then fix the SOURCE under src/ so the test(s) pass. Do NOT edit the test files — they specify the required behavior. You are done when \`${cmd}\` exits 0.`;
-};
+// The model receives ONLY the curated issue ticket — the oracle test is HIDDEN (not in its workspace),
+// and nothing comes from the commit message / BACKLOG (that would leak the fix).
+const promptFor = (t: Task): string =>
+  `${t.prompt}\n\nFix the source under src/ to resolve this. An automated acceptance test verifies your fix, but it is NOT in your workspace — work from the description above, don't go looking for it. You may run the existing test suite to check you haven't broken anything. Do NOT edit any test files.`;
 
 const sh = (cmd: string[], soft = false): string => {
   const r = Bun.spawnSync({ cmd, stdout: 'pipe', stderr: 'pipe' });
@@ -489,7 +495,7 @@ try {
     for (const t of tasks) {
       process.stderr.write(`  [${t.id}] tier${t.tier} ${t.kind} ${t.subject.slice(0, 42)} ... `);
       // One task's failure (docker hiccup, parse error, cleanup EPERM) must not abort the whole run —
-      // record an error row and move on so a 50-task sweep always finishes + writes its CSV.
+      // record an error row and move on so a long sweep always finishes + writes its CSV.
       let row: Row;
       try {
         row = runTask(model, t, logDir);

@@ -77,14 +77,21 @@ describe('swe-bench workspace (reference task 0be3c4299)', () => {
   });
 
   test.skipIf(!CAN_RUN)(
-    'materialize → oracle fails; gold src → oracle passes; restore recovers a deleted oracle',
+    'materialize WITHHOLDS the oracle; restore makes it present; fails at C^ src, passes at gold',
     () => {
       const { testPaths } = materializeSweWorkspace({ commit: COMMIT, repoRoot: REPO, cwd: work });
       expect(testPaths).toContain(TEST_PATH);
-      // Step 1: the archived parent (buggy) src → the gold test FAILS.
+      // Issue-as-spec: the agent's workspace has NO oracle test — it works from the ticket alone.
+      expect(existsSync(join(work, TEST_PATH))).toBe(false);
+
+      // The verifier gets the oracle from restore (re-materializes C's tests/). At the buggy C^ src it FAILS.
+      // (This also IS the anti-cheat: restore rm's + re-archives tests/ from C, so the agent — which never
+      // had the oracle — can't have tampered with it.)
+      restoreSweTests({ commit: COMMIT, repoRoot: REPO, cwd: work, testPaths });
+      expect(existsSync(join(work, TEST_PATH))).toBe(true);
       expect(waitForTestPasses(work)).toBe(false);
 
-      // Apply the gold src (what the agent must reproduce by OUTCOME) → the test PASSES.
+      // Apply the gold src (what the agent must reproduce by OUTCOME) → the oracle PASSES.
       const applied = Bun.spawnSync({
         cmd: ['git', 'apply'],
         cwd: work,
@@ -93,14 +100,6 @@ describe('swe-bench workspace (reference task 0be3c4299)', () => {
         stderr: 'pipe',
       });
       expect(applied.success).toBe(true);
-      expect(waitForTestPasses(work)).toBe(true);
-
-      // Anti-cheat: a model that DELETES the oracle is defeated by restore-from-commit
-      // (re-applying the patch would fail here — the file is gone; archive-from-commit doesn't).
-      rmSync(join(work, TEST_PATH));
-      expect(existsSync(join(work, TEST_PATH))).toBe(false);
-      restoreSweTests({ commit: COMMIT, repoRoot: REPO, cwd: work, testPaths });
-      expect(existsSync(join(work, TEST_PATH))).toBe(true);
       expect(waitForTestPasses(work)).toBe(true);
     },
   );
