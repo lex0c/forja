@@ -103,6 +103,8 @@ export const parseMetrics = (
   steps: number;
   inputTok: number;
   outputTok: number;
+  cacheRead: number;
+  cacheCreation: number;
   unmetered: boolean;
   costUsd: number;
   toolCalls: number;
@@ -120,13 +122,30 @@ export const parseMetrics = (
   const tk = scope.match(/tokens\s+(\d+)\/(\d+)/);
   const inputTok = Number(tk?.[1] ?? 0);
   const outputTok = Number(tk?.[2] ?? 0);
+  // Cache breakdown — the `cache <read>/<creation>` segment the done-line appends
+  // after `tokens`. ABSENT on older done-lines (and on the no-cache case where the
+  // segment never existed): both default to 0, so old logs still parse cleanly.
+  const ck = scope.match(/\bcache\s+(\d+)\/(\d+)/);
+  const cacheRead = Number(ck?.[1] ?? 0);
+  const cacheCreation = Number(ck?.[2] ?? 0);
   const unmetered = /·\s*unmetered/.test(scope);
   const costUsd = Number(scope.match(/·\s*\$([\d.]+)/)?.[1] ?? 0);
   // Counted over the WHOLE log (not the done-line): tool calls (`→ tool`) and failed/denied results
   // (`✗ tool`). Two models can share a pass rate yet differ sharply in how cleanly they drive the loop.
   const toolCalls = (log.match(/^[ \t]*→ \w+/gm) ?? []).length;
   const toolErrors = (log.match(/^[ \t]*✗ \w+/gm) ?? []).length;
-  return { reason, steps, inputTok, outputTok, unmetered, costUsd, toolCalls, toolErrors };
+  return {
+    reason,
+    steps,
+    inputTok,
+    outputTok,
+    cacheRead,
+    cacheCreation,
+    unmetered,
+    costUsd,
+    toolCalls,
+    toolErrors,
+  };
 };
 
 export interface ScoreInput {

@@ -284,6 +284,8 @@ interface Row {
   durationMs: number;
   inputTok: number;
   outputTok: number;
+  cacheRead: number;
+  cacheCreation: number;
   costUsd: number;
   unmetered: boolean;
   toolCalls: number;
@@ -510,6 +512,8 @@ const runTaskInner = (model: string, t: Task, logDir: string, work: string): Row
     durationMs,
     inputTok: m.inputTok,
     outputTok: m.outputTok,
+    cacheRead: m.cacheRead,
+    cacheCreation: m.cacheCreation,
     costUsd: m.costUsd,
     unmetered: m.unmetered,
     toolCalls: m.toolCalls,
@@ -571,6 +575,8 @@ try {
           durationMs: 0,
           inputTok: 0,
           outputTok: 0,
+          cacheRead: 0,
+          cacheCreation: 0,
           costUsd: 0,
           unmetered: false,
           toolCalls: 0,
@@ -601,7 +607,7 @@ const csvPath = join(repoRoot, 'evals', 'swe-bench', 'results.csv');
 if (!existsSync(csvPath)) {
   writeFileSync(
     csvPath,
-    'model,id,tier,kind,passed,regressed,status,exit_reason,steps,duration_ms,input_tokens,output_tokens,cost_usd,unmetered,tool_calls,tool_errors,files_changed,lines_changed\n',
+    'model,id,tier,kind,passed,regressed,status,exit_reason,steps,duration_ms,input_tokens,output_tokens,cache_read,cache_creation,cost_usd,unmetered,tool_calls,tool_errors,files_changed,lines_changed\n',
   );
 }
 // Minimal RFC-4180 quoting: a value that contains a comma, double-quote, or newline is wrapped in
@@ -628,6 +634,8 @@ appendFileSync(
         csvCell(r.durationMs),
         csvCell(r.inputTok),
         csvCell(r.outputTok),
+        csvCell(r.cacheRead),
+        csvCell(r.cacheCreation),
         csvCell(r.costUsd.toFixed(4)),
         csvCell(r.unmetered ? 1 : 0),
         csvCell(r.toolCalls),

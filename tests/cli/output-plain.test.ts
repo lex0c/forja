@@ -235,8 +235,32 @@ describe('plain renderer', () => {
       },
     });
     const out = cap.err.join('');
-    expect(out).toContain('cache_r 1000');
-    expect(out).toContain('cache_w 500');
+    // One cache form: the compact `cache <read>/<creation>` segment (also the SWE-bench runner's
+    // parseMetrics capture). No separate human `(cache_r …, cache_w …)` parenthetical.
+    expect(out).toContain('cache 1000/500');
+    expect(out).not.toContain('cache_r');
+    expect(out).not.toContain('cache_w');
+  });
+
+  test('session_finished omits the cache segment when zero', () => {
+    // Gated to non-zero — OpenAI / Gemini / ollama have no cache, no clutter. parseMetrics defaults
+    // both to 0 when the segment is absent (the same value), so the machine reads it correctly too.
+    const { renderer, cap } = make();
+    renderer.onEvent({
+      type: 'session_finished',
+      result: {
+        status: 'done',
+        reason: 'done',
+        sessionId: 's',
+        steps: 1,
+        durationMs: 10,
+        usage: { input: 100, output: 50, cache_read: 0, cache_creation: 0 },
+        costUsd: 0.0123,
+        usageComplete: true,
+      },
+    });
+    const out = cap.err.join('');
+    expect(out).not.toContain('cache');
   });
 
   test('inserts newline between text streaming and tool indicator', () => {

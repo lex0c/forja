@@ -158,11 +158,30 @@ describe('parseMetrics', () => {
       steps: 0,
       inputTok: 0,
       outputTok: 0,
+      cacheRead: 0,
+      cacheCreation: 0,
       unmetered: false,
       costUsd: 0,
       toolCalls: 0,
       toolErrors: 0,
     });
+  });
+  test('reads the cache segment (read/creation) when present', () => {
+    const m = parseMetrics(
+      '[done/done] 19 steps · 173660ms · tokens 387616/8398 · cache 350000/12000 · $0.1234\n',
+    );
+    expect(m).toMatchObject({ inputTok: 387616, outputTok: 8398 });
+    expect(m.cacheRead).toBe(350000);
+    expect(m.cacheCreation).toBe(12000);
+    expect(m.costUsd).toBe(0.1234);
+  });
+  test('an OLD done-line without a cache segment defaults cache to 0', () => {
+    const m = parseMetrics('[done/done] 12 steps · 1109ms · tokens 7141/431 · unmetered\n');
+    // tokens/steps/cost still parse; the absent cache segment is not mistaken
+    // for the token figures.
+    expect(m).toMatchObject({ steps: 12, inputTok: 7141, outputTok: 431, unmetered: true });
+    expect(m.cacheRead).toBe(0);
+    expect(m.cacheCreation).toBe(0);
   });
 });
 

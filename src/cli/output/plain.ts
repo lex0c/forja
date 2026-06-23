@@ -113,21 +113,21 @@ export const createPlainRenderer = (options: PlainRendererOptions): OutputRender
                 ? color(useColor, YELLOW, tag)
                 : color(useColor, RED, tag);
           const u = r.usage;
-          // Cache columns only printed when non-zero — Anthropic users see
-          // them, OpenAI/Gemini users typically don't, no need to clutter.
-          const cacheBits: string[] = [];
-          if (u.cache_read > 0) cacheBits.push(`cache_r ${u.cache_read}`);
-          if (u.cache_creation > 0) cacheBits.push(`cache_w ${u.cache_creation}`);
-          const cache = cacheBits.length > 0 ? ` (${cacheBits.join(', ')})` : '';
-          const tokens = `${u.input}/${u.output}${cache}`;
+          const tokens = `${u.input}/${u.output}`;
           // Tilde indicates the value is a lower bound — at least one
           // turn this session produced output without reporting usage.
           // Mark both tokens and cost so the user reads them as
           // estimates instead of authoritative totals.
           const cost = formatCostCell(r.unmetered === true, r.usageComplete, formatCost, r.costUsd);
           const tokenLabel = r.usageComplete ? `tokens ${tokens}` : `tokens ~${tokens}`;
+          // Cache breakdown, printed only when non-zero — Anthropic populates it; OpenAI / Gemini /
+          // ollama leave it 0, no need to clutter. When present, `cache <read>/<creation>` is also the
+          // SWE-bench runner's parseMetrics capture; when absent, parseMetrics defaults both to 0 — the
+          // same value, so a single non-zero-gated segment serves the human and the machine.
+          const hasCache = u.cache_read > 0 || u.cache_creation > 0;
+          const cacheLabel = hasCache ? ` · cache ${u.cache_read}/${u.cache_creation}` : '';
           err(
-            `\n${colored} ${r.steps} steps · ${r.durationMs}ms · ${color(useColor, DIM, `${tokenLabel} · ${cost}`)}${detail}\n`,
+            `\n${colored} ${r.steps} steps · ${r.durationMs}ms · ${color(useColor, DIM, `${tokenLabel}${cacheLabel} · ${cost}`)}${detail}\n`,
           );
           break;
         }
