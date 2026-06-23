@@ -191,17 +191,19 @@ export const materializeSweWorkspace = ({
   //    lives in C and is naturally absent (the C^ test file is its pre-fix form); the verifier gets the
   //    real oracle from restoreSweTests. The corpus is curated to commits that PREDATE this bench
   //    (evals/swe-bench, created 2026-06-22), so evals/swe-bench is never in C^'s tree — no
-  //    self-referential answer-key leak. A throwaway branch names C^ so the bundle is non-empty +
-  //    clonable; it is deleted from the real repo immediately.
-  const baseRef = 'refs/heads/swe-bench-bundle-base';
+  //    self-referential answer-key leak. A throwaway TAG (NOT a branch) names C^ so the bundle is
+  //    non-empty + clonable: this runs against the real repoRoot, and a tag lives OUTSIDE refs/heads so it
+  //    can never clobber a developer's branch; the commit SHA in its name rules out a real-tag collision
+  //    too. It is deleted from the real repo immediately after the bundle is built.
+  const tag = `swe-bench-bundle-${commit}`;
   const bundle = `${cwd}.bundle`;
-  git(repoRoot, ['update-ref', baseRef, `${commit}^`]);
+  git(repoRoot, ['tag', '-f', tag, `${commit}^`]);
   try {
-    git(repoRoot, ['bundle', 'create', bundle, baseRef]);
+    git(repoRoot, ['bundle', 'create', bundle, `refs/tags/${tag}`]);
   } finally {
-    git(repoRoot, ['update-ref', '-d', baseRef]);
+    git(repoRoot, ['tag', '-d', tag]);
   }
-  git(repoRoot, ['clone', '--quiet', '--branch', 'swe-bench-bundle-base', bundle, cwd]);
+  git(repoRoot, ['clone', '--quiet', '--branch', tag, bundle, cwd]);
   rmSync(bundle, { force: true });
   git(cwd, ['remote', 'remove', 'origin']); // drop the dangling pointer to the (now deleted) bundle
 
