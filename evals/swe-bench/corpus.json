@@ -23,26 +23,6 @@
     "prompt": "Every provider streaming adapter (Anthropic, OpenAI, Google) emits a usage event at the end of a stream even when the upstream SDK never carried any token counts — some OpenAI-compatible endpoints drop the usage payload, and older Gemini SDKs omit it. The harness treats any usage event as a real measurement, so these synthetic zero-usage events get persisted as a measured zero across the token and cost columns: \"no telemetry available\" becomes indistinguishable from \"genuinely zero tokens\", and real spend is silently under-counted on those endpoints.\n\nFix the adapters so a usage event is emitted only when the upstream actually reported at least one usage field. When nothing was reported, no usage event is emitted (the turn records no measurement, not a false zero); a partial measurement, where some fields are present, still emits."
   },
   {
-    "id": "2f34b581c",
-    "commit": "2f34b581cce0775082922427bb56f9e4a8808865",
-    "subject": "fix(compaction): reject degenerate summaries (markers-only / refusal / whitespace)",
-    "kind": "bug",
-    "testFiles": [
-      "tests/harness/compaction.test.ts"
-    ],
-    "srcFiles": [
-      "src/harness/compaction.ts",
-      "src/harness/loop.ts"
-    ],
-    "tier": 1,
-    "passToPass": [
-      "tests/harness/checkpoints.test.ts",
-      "tests/harness/dispatch-rewrite-audit.test.ts",
-      "tests/harness/events.test.ts"
-    ],
-    "prompt": "When the history is compacted by asking the model to summarize the middle of the conversation, the only check on the model's summary is that it is non-empty. So a degenerate response — only the canonical section markers, a refusal (\"I can't summarize that\"), or just whitespace — is accepted as a successful summary, and the entire folded-away middle of the history is silently discarded, losing real context.\n\nFix the acceptance check so it inspects the summary AFTER stripping the canonical markers and trimming: if nothing substantive remains, the model summary is rejected and compaction falls back to the deterministic strategy (which keeps the middle as pointers rather than dropping it). The result must report that it used the fallback strategy and why (a markers-only / empty summary). The reason reported with the fallback must contain the phrase \"empty or markers-only\"."
-  },
-  {
     "id": "803e404b5",
     "commit": "803e404b54ec946c65d90821e28317e3a7a9ab47",
     "subject": "fix(tui): sanitize subagent name + goal before the live region",
@@ -80,105 +60,6 @@
       "tests/tools/bash-broker.test.ts"
     ],
     "prompt": "The read_file tool has two gaps in its core behavior. (1) Reading a path that is a directory reports \"file not found\" instead of identifying it as a directory — the existence check returns false for a directory, so the dedicated \"is a directory\" result is never produced and the caller gets a misleading not-found error. (2) The per-line and per-call limits each bound one dimension but not their product, so a single default read of a long file with very long lines can emit several megabytes in one result.\n\nFix it so reading a directory returns a clear \"is a directory\" result, and the assembled output is bounded by a total output-size cap: when the cap is hit, the result is marked truncated with the reduced line count, so the caller can page on rather than receiving an enormous payload.\n\nCap the assembled output at 256 KiB of content bytes; above that, return fewer lines and mark the result truncated (with the reduced line count)."
-  },
-  {
-    "id": "f1de1e883",
-    "commit": "f1de1e883a3c9655966fb1902ec94c07f19e3801",
-    "subject": "fix(harness): synthesize after a text-plus-tool_use final step on max_steps",
-    "kind": "bug",
-    "testFiles": [
-      "tests/harness/loop.test.ts"
-    ],
-    "srcFiles": [
-      "src/harness/loop.ts"
-    ],
-    "tier": 2,
-    "passToPass": [
-      "tests/harness/bg-cleanup.test.ts",
-      "tests/harness/checkpoints.test.ts",
-      "tests/harness/dispatch-rewrite-audit.test.ts"
-    ],
-    "prompt": "When a run hits its max-steps budget, the harness fires a final best-effort synthesis turn to turn the work done so far into an answer — but only when the run hasn't already produced one. The \"already answered\" check looks backward past any trailing tool results to the last assistant message and treats it as the answer. So when the final budgeted step emitted a short text preamble (e.g. \"Let me inspect the config...\") ALONGSIDE a tool call, the run is judged already-answered: synthesis is skipped, the tool results that step produced are never consumed, and the run returns the preamble as if it were the final answer.\n\nFix the gate so it decides based on whether the LAST message is a settled assistant answer. A step that ends with tool calls still in flight — trailing tool results with no final assistant turn after them — must force the synthesis turn, even if an earlier assistant message in that step carried some text."
-  },
-  {
-    "id": "c8c8356f1",
-    "commit": "c8c8356f16cb3053f1d380b027b4f1753ef4678f",
-    "subject": "fix(harness): preserve usage emitted before stream exceptions",
-    "kind": "bug",
-    "testFiles": [
-      "tests/harness/loop.test.ts"
-    ],
-    "srcFiles": [
-      "src/harness/collect.ts",
-      "src/harness/loop.ts"
-    ],
-    "tier": 2,
-    "passToPass": [
-      "tests/harness/collect.test.ts",
-      "tests/harness/events.test.ts",
-      "tests/harness/abortable.test.ts"
-    ],
-    "prompt": "When a provider stream throws after it has already reported token usage (the adapter emits a usage event from its cleanup path on the way out), the harness discards that partial usage — it only marks usage as incomplete and drops the numbers. The provider still bills those tokens, so a turn that fails mid-stream is paid for upstream yet contributes nothing to the session's token and cost totals, under-reporting real spend.\n\nFix it so the usage reported before a stream exception is folded into the session totals (token counts and cost) but the turn is still recorded as having incomplete usage (it ended in an error, not a clean finish), unlike a turn that finished normally. A stream that throws BEFORE any usage was reported must still leave the totals untouched — no phantom numbers."
-  },
-  {
-    "id": "8b0095024",
-    "commit": "8b00950244d653cd8711ee0b7e67bf0fa0d35c2f",
-    "subject": "fix(providers): defer OpenAI tool_use_start until the tool name is known",
-    "kind": "bug",
-    "testFiles": [
-      "tests/providers/openai-stream.test.ts"
-    ],
-    "srcFiles": [
-      "src/providers/openai/stream.ts"
-    ],
-    "tier": 2,
-    "passToPass": [
-      "tests/providers/openai.test.ts",
-      "tests/providers/anthropic-stream.test.ts",
-      "tests/providers/anthropic.test.ts"
-    ],
-    "prompt": "In the OpenAI Chat-Completions streaming adapter, a tool call's start is announced as soon as the first tool-call delta arrives — but the function name can still be empty in that first chunk, arriving only in a later delta. The harness records a tool's name solely from its start announcement, so a name that straggles into a subsequent chunk is lost: the tool is dispatched with an empty / unknown name and the otherwise-valid call is dropped.\n\nFix the adapter so the tool-call start is announced only once the function name is known (non-empty), buffering any argument bytes that arrive before the name. If a streamed tool call ever completes without yielding a name, surface a clear provider error rather than dispatching a nameless call.\n\n(Scope: only the OpenAI streaming tool-call path and its test. Ignore any unrelated abort-handling concern.) The error surfaced for a nameless tool call must carry the code \"openai.tool_use_no_name\" (with a message that includes the tool-call id)."
-  },
-  {
-    "id": "82a1760f4",
-    "commit": "82a1760f4085e2285f6889bba1749b3f1ec0e6e0",
-    "subject": "fix(tui): stop the Tasks shimmer once the turn ends",
-    "kind": "bug",
-    "testFiles": [
-      "tests/tui/render/todo-list.test.ts",
-      "tests/tui/state.test.ts"
-    ],
-    "srcFiles": [
-      "src/tui/render/compose.ts",
-      "src/tui/render/todo-list.ts",
-      "src/tui/state.ts"
-    ],
-    "tier": 2,
-    "passToPass": [
-      "tests/tui/render/assistant-chip.test.ts",
-      "tests/tui/render/clarify-compose.test.ts",
-      "tests/tui/render/compose.test.ts"
-    ],
-    "prompt": "The Tasks panel header animates (shimmers) to signal that the agent is actively working. When a turn ends — especially an abnormal stop such as hitting the cost cap — a task left frozen at \"in progress\" keeps the header shimmering forever, falsely signalling that work is still happening, and pins the render heartbeat awake. The task list deliberately persists across the turn boundary, so a frozen in-progress task must not by itself keep the live animation going.\n\nFix it so the shimmer, and the heartbeat that drives it, stop once the turn is no longer live: both the heartbeat condition and the header's shimmer decision must agree on \"the turn is still running\" and go quiet when it has ended."
-  },
-  {
-    "id": "26df59a09",
-    "commit": "26df59a09fd3d9d863359751b5f603178f623ab5",
-    "subject": "fix(subagents): wall-clock verdict wins over abort on a no-payload exit",
-    "kind": "bug",
-    "testFiles": [
-      "tests/subagents/runtime.test.ts"
-    ],
-    "srcFiles": [
-      "src/subagents/runtime.ts"
-    ],
-    "tier": 2,
-    "passToPass": [
-      "tests/subagents/e2e.test.ts",
-      "tests/subagents/ipc.test.ts",
-      "tests/subagents/load.test.ts"
-    ],
-    "prompt": "When a child subagent exits with no result payload, the runtime classifies why it ended. The classification checks for a user interrupt / abort signal BEFORE checking whether the child was killed by a budget. So if a soft interrupt happens to be in flight AND the wall-clock budget fires AND the child exits empty, the exit is mislabelled as a user abort — even though it was the wall-clock budget that actually terminated the child (a soft interrupt never sends the kill signal). This corrupts operator diagnostics and any retry / telemetry keyed on the end reason.\n\nFix the precedence so a no-payload exit is classified in the right order: an actual budget kill (wall-clock or stale-heartbeat) is reported as that timeout reason, not as an abort, and the abort classification applies only when an abort is what actually ended the child."
   },
   {
     "id": "89ecaccf9",
@@ -236,28 +117,6 @@
     "prompt": "The session recap aggregates action counts — files read, files written, commands run, tests run — from every tool-call record, regardless of whether the call actually executed. So a tool call that was DENIED by policy still counts: a denied write_file shows up under \"files edited\", and a denied bash test is reported as a failed test run via a synthetic exit code. In a policy-heavy or failing session the recap's action summary is simply false.\n\nFix it so only tool calls that actually ran (status \"done\") feed the action aggregates; denied, errored, pending, and running calls are excluded from the counts. The approvals-and-decisions part of the recap must still surface the denied call as a decision — the denial stays visible, it just no longer counts as an executed action."
   },
   {
-    "id": "d9f20857b",
-    "commit": "d9f20857b968eb5957e69805353eb9de657b26f2",
-    "subject": "fix(compaction): tool-pair integrity, bounded goal, sanitized summary",
-    "kind": "bug",
-    "testFiles": [
-      "tests/harness/compaction.test.ts",
-      "tests/harness/loop.test.ts"
-    ],
-    "srcFiles": [
-      "src/harness/compaction.ts",
-      "src/harness/loop.ts",
-      "src/harness/types.ts"
-    ],
-    "tier": 3,
-    "passToPass": [
-      "tests/harness/events.test.ts",
-      "tests/harness/abortable.test.ts",
-      "tests/harness/collect.test.ts"
-    ],
-    "prompt": "The history-compaction path has three coupled correctness bugs.\n\n(1) Orphaned tool results. After folding the middle of the history into a summary, the preserved tail is aligned to a user-role message — but the harness stores tool results as user-role messages, so the tail can begin with a tool result whose originating tool call was folded into the summary. That orphaned tool result has no matching tool call and the provider rejects the next request. The tail must instead be aligned to an assistant-message boundary, so every preserved tool result still has its emitting tool call.\n\n(2) Unbounded goal growth. Each time the history is compacted, a new compacted-history block is stacked onto the first message, so repeated compaction grows it without bound. After re-compacting, the first message must hold exactly one compacted-history block, with the original goal preserved.\n\n(3) Unsanitized summary. The model-written summary text is wrapped into the goal without being stripped of terminal escape sequences. The wrapped goal must contain no escape (ANSI) bytes.\n\nFix all three."
-  },
-  {
     "id": "9d2ed2e0a",
     "commit": "9d2ed2e0a901bd1ee1412a365ac12da6090089d8",
     "subject": "fix(subagents): cap child output into parent context + bound the boot-time wedge",
@@ -298,5 +157,27 @@
       "tests/tools/bash-broker.test.ts"
     ],
     "prompt": "The read-only git tool filters its output by the active path policy — status and ls_files already hide files under a denied subtree (secrets/, the credential floor, a subagent's deny_paths). But git log is exempt from that per-file gating: a pathless or parent-scoped log, authorized at the readable repository root, still prints the subject, author, and hash of commits that touched ONLY a policy-denied subtree — leaking exactly the history that status and ls_files were filtering.\n\nFix git log so it does not disclose commits whose changes are entirely within denied paths. A commit that touched only denied files must be dropped from the log output; a commit that touched at least one readable (allowed) file is kept. The number of commits hidden this way must be disclosed to the caller, in the form \"N commit(s) hidden by policy\". If the tool cannot enumerate a commit's touched files to make this decision, it must fail closed (refuse) rather than risk leaking."
+  },
+  {
+    "id": "89d7b19fe",
+    "commit": "89d7b19fe00fe25ffeecf5defcf26cb1faf851d4",
+    "subject": "fix(harness): include system + tool schemas in the compaction trigger size",
+    "kind": "bug",
+    "testFiles": [
+      "tests/harness/loop.test.ts",
+      "tests/providers/tokens.test.ts"
+    ],
+    "srcFiles": [
+      "src/harness/loop.ts",
+      "src/providers/index.ts",
+      "src/providers/tokens.ts"
+    ],
+    "tier": 3,
+    "passToPass": [
+      "tests/harness/collect.test.ts",
+      "tests/harness/compaction.test.ts",
+      "tests/harness/events.test.ts"
+    ],
+    "prompt": "The harness decides when to compact the conversation by estimating the size of the next request and comparing it against the context-window budget. But that estimate counts only the messages — it ignores the system prompt and the tool schemas, which every provider call also ships (the tool definitions alone can run to several thousand tokens). So a turn whose messages are modest, but whose system-plus-tools overhead is what pushes the request near the window, slips past the trigger: compaction is skipped and the next provider call fails with a context-length-exceeded error.\n\nFix the compaction trigger so its size estimate reflects the WHOLE outbound prompt — the system prompt and the tool definitions, not just the messages. A turn that crosses the budget only because of that overhead must trigger compaction before the over-budget request is sent."
   }
 ]
