@@ -8,6 +8,7 @@ import {
   apiKeyEnvsFor,
   loadCatalogEntries,
   parseMetrics,
+  parseNumstat,
   scoreResult,
 } from '../../src/evals/swe-bench/runner-core.ts';
 
@@ -180,5 +181,23 @@ describe('loadCatalogEntries', () => {
   });
   test('a missing/malformed file → [] (the caller throws a clearer per-model error)', () => {
     expect(loadCatalogEntries('/no/such/catalog.json')).toEqual([]);
+  });
+});
+
+describe('parseNumstat', () => {
+  test('sums added + deleted across a file', () => {
+    expect(parseNumstat('23\t1\tsrc/skills/lifecycle.ts\n')).toEqual({ files: 1, lines: 24 });
+  });
+  test('counts multiple files', () => {
+    expect(parseNumstat('5\t0\ta.ts\n2\t3\tb.ts\n')).toEqual({ files: 2, lines: 10 });
+  });
+  test('a binary file counts as a changed file but 0 lines', () => {
+    expect(parseNumstat('-\t-\tx.bin\n')).toEqual({ files: 1, lines: 0 });
+  });
+  test('blank / non-numstat lines are skipped', () => {
+    expect(parseNumstat('\nwarning: foo\n4\t1\tc.ts\n')).toEqual({ files: 1, lines: 5 });
+  });
+  test('empty input maps to zero', () => {
+    expect(parseNumstat('')).toEqual({ files: 0, lines: 0 });
   });
 });

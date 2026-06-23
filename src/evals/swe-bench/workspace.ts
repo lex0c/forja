@@ -173,7 +173,7 @@ export const ensureIsolatedDeps = (repoRoot: string): string => {
   return nm;
 };
 
-// Materialize the task workspace: parent tree (no .git) + failing test patch + node_modules.
+// Materialize the task workspace: parent tree (no .git), oracle test WITHHELD, node_modules symlink.
 // Returns the test paths so the caller can scope the verifier and the post-run restore.
 export const materializeSweWorkspace = ({
   commit,
@@ -188,7 +188,7 @@ export const materializeSweWorkspace = ({
   // 1b. Strip the LEAK SURFACE from the workspace. `git archive` ships the whole tree, including
   //     docs/BACKLOG.md (a verbose per-fix changelog the model can read locally to glean approach)
   //     and evals/swe-bench/ (corpus.json carries each task's subject + srcFiles — the fix spec).
-  //     The agent must work from the failing test alone, so these never reach it. (docs/spec + the
+  //     The agent must work from the curated ticket alone, so these never reach it. (docs/spec + the
   //     rest stay — they're the codebase's own docs, not a fix changelog/answer key.)
   for (const leak of ['docs/BACKLOG.md', 'docs/TODO.md', 'evals/swe-bench']) {
     rmSync(join(cwd, leak), { recursive: true, force: true });

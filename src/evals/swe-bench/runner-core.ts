@@ -162,3 +162,18 @@ export const scoreResult = (
         : 'ok';
   return { passed, regressed, status };
 };
+
+// Sum a `git diff --numstat` block into a (files, lines) stat. Each changed file is one line,
+// `<added>\t<deleted>\t<path>`; a binary file shows `-\t-\t` (counts as a changed file, 0 lines).
+// Blank / non-numstat lines are skipped. The runner records this as the agent's edit footprint.
+export const parseNumstat = (numstat: string): { files: number; lines: number } => {
+  let files = 0;
+  let lines = 0;
+  for (const ln of numstat.split('\n')) {
+    const m = ln.match(/^(\d+|-)\t(\d+|-)\t/);
+    if (m === null) continue;
+    files += 1;
+    if (m[1] !== '-' && m[2] !== '-') lines += Number(m[1]) + Number(m[2]);
+  }
+  return { files, lines };
+};

@@ -1,63 +1,5 @@
 [
   {
-    "id": "200796f0b",
-    "commit": "200796f0b9c0168c92135b1f882adbb4a33fe82b",
-    "subject": "fix(tui): Markdown autolink no longer duplicates the URL under formatting",
-    "kind": "bug",
-    "testFiles": [
-      "tests/tui/render/markdown.test.ts"
-    ],
-    "srcFiles": [
-      "src/tui/render/markdown.ts"
-    ],
-    "tier": 2,
-    "passToPass": [
-      "tests/tui/render/assistant-chip.test.ts",
-      "tests/tui/render/compose.test.ts",
-      "tests/tui/render/critique-chip.test.ts"
-    ],
-    "prompt": "In the terminal Markdown renderer, an autolink whose visible label is identical to its target URL — written as `[https://x.io](https://x.io)` — renders the URL twice, e.g. `https://x.io (https://x.io)`. The renderer is supposed to append the URL in parentheses only when it adds information beyond the label, which it does not here. The duplication shows up specifically when color is enabled, and it also happens when the autolink is wrapped in other formatting such as bold (`**[https://x.io](https://x.io)**`). Make an autolink whose label matches its URL render the URL a single time, regardless of any surrounding formatting; a link whose label genuinely differs from the URL must still show the URL alongside it."
-  },
-  {
-    "id": "38c637a68",
-    "commit": "38c637a6815d4303fe9ab007e1ac8a7a465de771",
-    "subject": "fix(permissions): empty-string fs path is treated as omitted, not denied",
-    "kind": "bug",
-    "testFiles": [
-      "tests/permissions/engine.test.ts"
-    ],
-    "srcFiles": [
-      "src/permissions/engine.ts"
-    ],
-    "tier": 1,
-    "passToPass": [
-      "tests/permissions/audit-rotation.test.ts",
-      "tests/permissions/audit-scheduler.test.ts",
-      "tests/permissions/audit-telemetry.test.ts"
-    ],
-    "prompt": "The permission engine denies a repo-wide read operation when the path argument is an empty string. The read-style tools (grep/glob/git) treat an empty path the same as an omitted one — meaning repo-wide — and models frequently emit `path: \"\"`. But the engine rejects it as a missing/invalid path, so a repo-wide `git status` with `path: \"\"` is blocked even though the identical call with the argument absent is allowed and would run repo-wide either way; the model is forced into a needless retry. Treat an empty-string path for these tools as equivalent to an omitted one (resolved against the working directory and classified accordingly). This must not loosen anything else: a genuinely non-string path value (number, array, null) should still be rejected."
-  },
-  {
-    "id": "4c0cf1dda",
-    "commit": "4c0cf1dda5f8622c33656fdb73f2f18db034be1f",
-    "subject": "fix(permissions): treat bare `sed -i` without `-e` as exec:arbitrary (BSD suffix shift)",
-    "kind": "bug",
-    "testFiles": [
-      "tests/permissions/engine.test.ts",
-      "tests/permissions/resolvers.test.ts"
-    ],
-    "srcFiles": [
-      "src/permissions/resolvers/bash.ts"
-    ],
-    "tier": 2,
-    "passToPass": [
-      "tests/permissions/audit-rotation.test.ts",
-      "tests/permissions/audit-scheduler.test.ts",
-      "tests/permissions/audit-telemetry.test.ts"
-    ],
-    "prompt": "The bash permission resolver mis-classifies some `sed -i` commands as safe in-place edits and auto-approves them under the autonomous posture, when they can actually execute arbitrary code. On BSD/macOS, `sed -i` takes the backup suffix as a *separate* operand — it consumes the next token (any token), shifting the script one position to the right of where GNU sed puts it. So `sed -i p 's/x/id/e' file` runs the script `s/x/id/e` (which execs `id` via the `e` flag), but the resolver reads the first positional as a harmless print script and models it as a read-only/in-repo-write command. When the suffix-bearing form of `-i` is used without an explicit `-e SCRIPT`, the script position is platform-ambiguous and the command must be treated as arbitrary code execution (no auto-approval). The unambiguous forms — an attached suffix like `-i.bak`, an explicit `-e SCRIPT`, and the long `--in-place` — should stay modeled as ordinary repo-confined writes."
-  },
-  {
     "id": "564f90633",
     "commit": "564f90633279d50aec4b009bf8818e6c0ae6ac7d",
     "subject": "fix(openai): reject malformed Responses tool args instead of coercing to {}",
@@ -172,46 +114,6 @@
     "prompt": "When a run exhausts its step budget, the harness makes one final synthesis turn so an exhausted run still returns an answer — but if that synthesis turn is itself cut short, the caller gets a truncated final report with no indication why. A normal turn that stops because it hit the per-call output cap or the model's context window reports a distinct exhaustion reason (so the operator knows to raise the output cap or shrink the context); the final synthesis turn ignores its own stop reason and always reports the generic step-budget reason. When the synthesis turn stops at the output-token cap or exceeds the context window, the run should finish with the corresponding output-tokens / context-tokens reason (the partial report still kept), rather than masking it as a clean step-budget exhaustion."
   },
   {
-    "id": "8ce08ef5d",
-    "commit": "8ce08ef5daebd282c691a5f1305091281a26a7b4",
-    "subject": "fix(skills): let deleteSkill remove a file with a malformed filename",
-    "kind": "bug",
-    "testFiles": [
-      "tests/cli/slash/skill.test.ts",
-      "tests/skills/lifecycle.test.ts"
-    ],
-    "srcFiles": [
-      "src/skills/lifecycle.ts",
-      "src/skills/paths.ts"
-    ],
-    "tier": 2,
-    "passToPass": [
-      "tests/cli/slash/agent-policy.test.ts",
-      "tests/cli/slash/agent-retrieval.test.ts",
-      "tests/cli/slash/commands.test.ts"
-    ],
-    "prompt": "In the skills subsystem, `/skill delete` cannot remove a skill file whose filename is not valid kebab-case (e.g. `Upper.md`, `Bad Name.md`). These malformed files are surfaced by `/skill list` as cleanup targets, and delete already removes files whose *contents* are malformed — but a non-kebab *filename* is rejected before any filesystem action, so the operator has no way to clean it up. Deleting an existing file should succeed regardless of whether its filename matches the naming format. A path that tries to escape the skills directory (traversal) must still be refused."
-  },
-  {
-    "id": "b888c4ddd",
-    "commit": "b888c4ddd91a537ef56791e31241e344bd380075",
-    "subject": "fix(git_apply_patch): canonicalize paths so a symlinked cwd isn't a false escape",
-    "kind": "bug",
-    "testFiles": [
-      "tests/tools/git-apply-patch.test.ts"
-    ],
-    "srcFiles": [
-      "src/tools/builtin/git-apply-patch.ts"
-    ],
-    "tier": 2,
-    "passToPass": [
-      "tests/tools/_bash-cwd.test.ts",
-      "tests/tools/bash-background.test.ts",
-      "tests/tools/bash-broker.test.ts"
-    ],
-    "prompt": "`git_apply_patch` refuses valid patches when the working directory reaches the repository through a symlink (a symlinked checkout or workspace mount). The tool derives the worktree root from git, which reports a fully symlink-resolved (real) path, but it computes the patched file's path lexically under the session cwd. When the cwd is a symlink into the repo, those two paths live in different coordinate systems, so the in-worktree confinement check sees the file as escaping the worktree and rejects an otherwise valid patch with a path-mismatch error — making the tool unusable from symlinked checkouts. A patch targeting a file genuinely inside the repository must apply successfully even when the cwd is a symlink, while a patch whose leaf is itself a symlink is still rejected."
-  },
-  {
     "id": "c12e891bf",
     "commit": "c12e891bfb20182f20d94cda5f18f202e782ca32",
     "subject": "fix(providers/anthropic): never send temperature and top_p together",
@@ -249,65 +151,6 @@
       "tests/permissions/audit-telemetry.test.ts"
     ],
     "prompt": "Under the autonomous posture, the bash permission engine auto-approves a command that reads or writes outside the repository through a symlink. Repo-confined bash is auto-approved by treating a cwd-relative path as in-repo, but this check is purely lexical: if the leaf name is a symlink whose real target escapes the working directory, the command is still judged repo-confined and the confirmation prompt is skipped — so e.g. reading through such a link reads an external file with no prompt. A command operating on a cwd path whose symlink target leaves the repository must not be auto-approved (it should fall back to a confirmation), while a symlink that genuinely resolves inside the repo should still auto-approve. The same hole exists for a standalone output redirection to such a symlink."
-  },
-  {
-    "id": "d23d056c0",
-    "commit": "d23d056c0a873db7cd163218d2ae3615ed44cfcb",
-    "subject": "fix(inbox): drain after a turn that rejects without session_finished",
-    "kind": "bug",
-    "testFiles": [
-      "tests/cli/repl.test.ts"
-    ],
-    "srcFiles": [
-      "src/cli/repl.ts"
-    ],
-    "tier": 2,
-    "passToPass": [
-      "tests/cli/args-gc.test.ts",
-      "tests/cli/args-purge.test.ts",
-      "tests/cli/args.test.ts"
-    ],
-    "prompt": "A message typed and queued while a turn is running gets stranded if that turn fails. The inbox is drained only when a turn emits its normal completion signal; if the turn's underlying run rejects/crashes before emitting that signal (e.g. a provider crash), the cleanup path clears the running state but never drains the queue, so the queued message sits pending until some later unrelated boundary instead of being sent next. After a turn ends abnormally without its completion signal, any message queued during it must still be drained and dispatched as the following turn."
-  },
-  {
-    "id": "d3747eb16",
-    "commit": "d3747eb16b67659c09912f48d9ae662607ab36b5",
-    "subject": "fix(critique): sort runs globally by createdAt before tail-slicing",
-    "kind": "bug",
-    "testFiles": [
-      "tests/cli/slash/commands.test.ts"
-    ],
-    "srcFiles": [
-      "src/cli/slash/commands/critique.ts"
-    ],
-    "tier": 2,
-    "passToPass": [
-      "tests/cli/slash/dispatch.test.ts",
-      "tests/cli/slash/history.test.ts",
-      "tests/cli/slash/hooks.test.ts"
-    ],
-    "prompt": "`/critique <N>` shows the wrong runs when sessions interleave in time. The recent-runs list is built by concatenating each session's runs in the order the sessions were added, then tail-slicing to N — but that concatenation is not a real global timeline. If session A runs, then a child/playbook session B runs, then A continues, the genuinely most-recent runs from A get dropped from the tail while older runs from B are kept, purely because of session ordering. The N most recent runs by their actual timestamps should be shown, newest first, regardless of which session they belong to (with a stable tiebreak so same-millisecond runs from one session keep their step order)."
-  },
-  {
-    "id": "d5849eade",
-    "commit": "d5849eade51a8e007637d3866f108e70b971a8a8",
-    "subject": "fix(storage/context-pins): cap counts only active pins, not expired rows",
-    "kind": "bug",
-    "testFiles": [
-      "tests/cli/slash/pin.test.ts",
-      "tests/storage/context-pins.test.ts"
-    ],
-    "srcFiles": [
-      "src/cli/slash/commands/pin.ts",
-      "src/storage/repos/context-pins.ts"
-    ],
-    "tier": 2,
-    "passToPass": [
-      "tests/cli/slash/agent-policy.test.ts",
-      "tests/cli/slash/commands.test.ts",
-      "tests/cli/slash/dispatch.test.ts"
-    ],
-    "prompt": "The per-session pin cap counts expired pins against the limit, which traps the operator in a dead end. After someone creates the maximum number of short-lived pins and lets them expire, `/pin --list` shows nothing (it lists only active pins) yet a new `/pin` is still refused for hitting the cap — and there is no listed id to remove, so the session is stuck until they dig up the expired ids or restart. Make the cap count only currently-active pins: expired pins still linger as history but must not occupy capacity, so a fresh pin succeeds once earlier ones have expired. Creating beyond the limit while that many pins are genuinely active must still be refused as before."
   },
   {
     "id": "d99f0dd57",
@@ -390,5 +233,70 @@
       "tests/harness/checkpoints.test.ts"
     ],
     "prompt": "In the agent harness, when a run aborts in the middle of a tool round — for example it trips the consecutive-tool-error guard while several tool calls from one assistant turn are still pending — the session becomes permanently unusable. Every subsequent request (including a later --resume) fails at the provider with an error about tool-call ids that have no corresponding result, and there is no way to recover the session. The expectation is that a run can abort mid-round without corrupting the conversation: after any such interruption the session must remain valid and resumable, with every tool call the assistant issued ending up accounted for so the next turn is accepted. Recovering a session that was already left in this broken state should also work."
+  },
+  {
+    "id": "c266c8894",
+    "commit": "c266c8894e3b67cef8786e9de2472f9bc9d30af6",
+    "subject": "fix(checkpoints): preserve tracked secrets, anchor snapshot/restore at the worktree root",
+    "kind": "bug",
+    "testFiles": [
+      "tests/checkpoints/git.test.ts",
+      "tests/checkpoints/detect.test.ts",
+      "tests/checkpoints/manager.test.ts"
+    ],
+    "srcFiles": [
+      "src/checkpoints/detect.ts",
+      "src/checkpoints/git.ts",
+      "src/checkpoints/index.ts",
+      "src/checkpoints/manager.ts",
+      "src/cli/checkpoints.ts",
+      "src/harness/loop.ts"
+    ],
+    "tier": 3,
+    "prompt": "The checkpoint/undo subsystem has two correctness bugs.\n\n(1) A secret file that is already tracked in git is silently deleted by /undo. Checkpoints deliberately keep sensitive paths (API keys, credential files) out of their snapshots. But the exclusion is applied even to a secret that is committed and tracked at HEAD — so when /undo restores the working tree to a checkpoint that omits that tracked secret, the file is removed from the working tree and its contents are lost. Only an UNTRACKED secret should be left out of a checkpoint; a tracked, unmodified secret must come through /undo unchanged, with its real contents intact.\n\n(2) Running the agent from a subdirectory makes /undo throw away changes made outside that subdirectory. Taking a checkpoint and restoring one cover different sets of files: the snapshot is built relative to the current working directory, while the restore is applied to the whole worktree. So when the agent is started from a nested directory, files modified outside it are captured at their pre-session state and /undo resets them to it, discarding the work done in between. A checkpoint and its restore must always cover the same files — the entire worktree, anchored at the repository root — no matter which directory the agent runs from. The working directory should only affect retention scoping, never what a checkpoint includes.\n\nFix the checkpoint subsystem so both hold."
+  },
+  {
+    "id": "652139a2e",
+    "commit": "652139a2e1a16436e5328881091d31a4b734b32c",
+    "subject": "fix(tui): surface failed task delegations despite the silent task chip",
+    "kind": "bug",
+    "testFiles": [
+      "tests/tui/harness-adapter.test.ts"
+    ],
+    "srcFiles": [
+      "src/tui/harness-adapter.ts",
+      "src/tui/tool-vocab.ts"
+    ],
+    "tier": 3,
+    "prompt": "When a task delegation fails before its subagent ever starts running — for example because the playbook name is unknown, the task arguments fail validation, or a budget check refuses the spawn up front — the failure is completely invisible in the terminal scrollback. There is no error line, no chip, and nothing in the live Subagents area (which only ever populates once a child subagent has actually started). From the operator's view the delegation simply vanished, with no sign it was attempted or that it failed.\n\nThe cause is that the task-delegation tools are intentionally kept silent in the UI (so an in-progress delegation is shown by the live Subagents block rather than a generic \"called a tool\" chip). That silence is right for the normal path, but it also swallows the error when no subagent lifecycle ever begins.\n\nFix it so a task delegation that ends in failure is surfaced in the scrollback as a failure chip carrying the error reason — including the case where it failed before any subagent was created — while still keeping the normal successful (and in-progress) path quiet, with no extra live noise. Failing todo-management calls should remain silent, as they are today.",
+    "passToPass": [
+      "tests/tui/tool-vocab.test.ts",
+      "tests/tui/bus.test.ts",
+      "tests/tui/clarify-manager.test.ts"
+    ]
+  },
+  {
+    "id": "d5f44f10b",
+    "commit": "d5f44f10b33bab6702861c38cab74219d935e25c",
+    "subject": "fix(tools): read the path arg the engine gated (file_path/path parity)",
+    "kind": "bug",
+    "testFiles": [
+      "tests/tools/read-file.test.ts",
+      "tests/tools/edit-file.test.ts",
+      "tests/tools/write-file.test.ts"
+    ],
+    "srcFiles": [
+      "src/tools/builtin/_path-arg.ts",
+      "src/tools/builtin/edit-file.ts",
+      "src/tools/builtin/read-file.ts",
+      "src/tools/builtin/write-file.ts"
+    ],
+    "tier": 3,
+    "prompt": "Calling the read_file, write_file, or edit_file tools with a file_path argument (instead of path) crashes with an opaque internal error — even though the permission layer accepted the call. The permission engine treats file_path as the file path (it accepts either file_path or path), so a call that passes only file_path is authorized; but the tool handlers themselves look only at path, so they end up operating on an undefined path and throw, producing an internal-error crash and an audit row that shows the call as allowed yet crashed.\n\nMake the three file tools act on the same argument the permission engine gated. A call that provides file_path and no path must behave exactly as if path had been given; when both are present, file_path takes precedence (matching the engine), so the tool always operates on the path that was actually authorized; and a call that provides neither a usable file_path nor path must fail with a clean validation-style error, never an internal crash.",
+    "passToPass": [
+      "tests/tools/_bash-cwd.test.ts",
+      "tests/tools/bash-background.test.ts",
+      "tests/tools/bash-broker.test.ts"
+    ]
   }
 ]

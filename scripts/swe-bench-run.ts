@@ -1,13 +1,14 @@
 // self-SWE-bench corpus runner (Docker orchestrator). Runs each model over the curated corpus
-// (evals/swe-bench/corpus.json) as EPHEMERAL CONTAINERS PER TASK: the buggy parent tree + the
-// failing test are materialized and mounted at /task, the compiled forja binary (the full agent
-// loop) fixes src/ in ONE container, then — after the host re-materializes the canonical test
+// (evals/swe-bench/corpus.json) as EPHEMERAL CONTAINERS PER TASK: the buggy parent tree is materialized
+// and mounted at /task with the oracle test WITHHELD; the forja binary (the full agent loop) fixes src/
+// from the ticket in ONE container, then — after the host re-materializes the canonical test
 // surface from commit C (anti-cheat: discard any agent edits to tests/ or runner config) — a SECOND
 // container runs `bun test` to verify the OUTCOME. The answer repo is NEVER present (no .git/corpus/
 // gold) and egress is locked to the model host alone (see evals/swe-bench/docker/). Appends per-task
 // rows to evals/swe-bench/results.csv and writes per-task debug logs under evals/swe-bench/logs/<run>/.
 //
-// The prompt is the FAILING TEST only — never the commit message / BACKLOG (that would leak the fix).
+// The prompt is the curated issue ticket — never the test (it's withheld) nor the commit message /
+// BACKLOG (that would leak the fix).
 // Model support mirrors the ranking: the host's model_providers.json is mounted, `--models` selects.
 //
 // Run: bun run scripts/swe-bench-run.ts --models ollama/devstral-2:123b[,anthropic/claude-opus-4-8]
@@ -33,6 +34,7 @@ import {
   apiKeyEnvsFor,
   loadCatalogEntries,
   parseMetrics,
+  parseNumstat,
   scoreResult,
 } from '../src/evals/swe-bench/runner-core.ts';
 import {
@@ -117,7 +119,7 @@ if (models.length === 0) {
 // The model receives ONLY the curated issue ticket — the oracle test is HIDDEN (not in its workspace),
 // and nothing comes from the commit message / BACKLOG (that would leak the fix).
 const promptFor = (t: Task): string =>
-  `${t.prompt}\n\nFix the source under src/ to resolve this. An automated acceptance test verifies your fix, but it is NOT in your workspace — work from the description above, don't go looking for it. You may run the existing test suite to check you haven't broken anything. Do NOT edit any test files.`;
+  `${t.prompt}\n\nFix the source under src/ to resolve this. Read and run the repository's existing tests to understand the expected behavior and find the relevant code, and to check you haven't broken anything. The automated acceptance test that grades your fix is NOT in the workspace — work from the description above; don't waste steps searching for it. Do NOT edit any test files.`;
 
 const sh = (cmd: string[], soft = false): string => {
   const r = Bun.spawnSync({ cmd, stdout: 'pipe', stderr: 'pipe' });
@@ -283,12 +285,48 @@ interface Row {
   unmetered: boolean;
   toolCalls: number;
   toolErrors: number;
+  filesChanged: number;
+  linesChanged: number;
 }
 
 const readExit = (path: string): number | undefined => {
   if (!existsSync(path)) return undefined;
   const n = Number.parseInt(readFileSync(path, 'utf8').trim(), 10);
   return Number.isNaN(n) ? undefined : n;
+};
+
+// The agent's actual src/ change vs the parent tree C^ — what it edited (a focus signal: one tight file
+// vs a sprawl, and which) plus a reviewable patch. The workspace is .git-free (anti-cheat), so
+// materialize C^'s src into a throwaway dir and `git diff --no-index` the two trees (it exits 1 when
+// diffs exist — not an error — so the code is ignored). Best-effort: any hiccup yields 0/0/'' rather
+// than failing the task.
+const agentSrcDiff = (
+  commit: string,
+  work: string,
+): { files: number; lines: number; patch: string } => {
+  const base = mkdtempSync(join(tmpdir(), 'swe-base-'));
+  try {
+    const tar = join(base, 'parent.tar');
+    Bun.spawnSync({
+      cmd: ['git', '-C', repoRoot, 'archive', '--format=tar', '-o', tar, `${commit}^`, 'src'],
+    });
+    Bun.spawnSync({ cmd: ['tar', '-xf', tar, '-C', base] });
+    const a = join(base, 'src');
+    const b = join(work, 'src');
+    const numstat = Bun.spawnSync({
+      cmd: ['git', 'diff', '--no-index', '--numstat', a, b],
+    }).stdout.toString();
+    const { files, lines } = parseNumstat(numstat);
+    const patch = Bun.spawnSync({ cmd: ['git', 'diff', '--no-index', a, b] })
+      .stdout.toString()
+      .replaceAll(`${base}/`, '')
+      .replaceAll(`${work}/`, '');
+    return { files, lines, patch };
+  } catch {
+    return { files: 0, lines: 0, patch: '' };
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 };
 
 const runTask = (model: string, t: Task, logDir: string): Row => {
@@ -379,6 +417,12 @@ const runTaskInner = (model: string, t: Task, logDir: string, work: string): Row
     : agentRun.stdout.toString() + agentRun.stderr.toString();
   writeFileSync(join(dest, 'run.log'), agentLog);
 
+  // The agent's actual src/ edit (vs C^) — captured NOW, BEFORE the restore + verifier touch the
+  // workspace, so it reflects ONLY the model's change (the restore rewrites tests/ + config, not src/;
+  // a src-writing oracle test could otherwise pollute the footprint). A focus signal + a reviewable patch.
+  const diff = agentSrcDiff(t.commit, work);
+  if (diff.patch !== '') writeFileSync(join(dest, 'agent.patch'), diff.patch);
+
   // PHASE 2 — host restore (anti-cheat). Re-materialize the canonical tests/ + runner config from C,
   // discarding any agent edits, so only the model's src/ changes can make the oracle pass. The agent
   // container chmodded /task world-writable on exit, so this non-root host CAN rm tests/ + re-extract.
@@ -460,6 +504,8 @@ const runTaskInner = (model: string, t: Task, logDir: string, work: string): Row
     unmetered: m.unmetered,
     toolCalls: m.toolCalls,
     toolErrors: m.toolErrors,
+    filesChanged: diff.files,
+    linesChanged: diff.lines,
   };
 };
 
@@ -519,6 +565,8 @@ try {
           unmetered: false,
           toolCalls: 0,
           toolErrors: 0,
+          filesChanged: 0,
+          linesChanged: 0,
         };
       }
       rows.push(row);
@@ -543,7 +591,7 @@ const csvPath = join(repoRoot, 'evals', 'swe-bench', 'results.csv');
 if (!existsSync(csvPath)) {
   writeFileSync(
     csvPath,
-    'model,id,tier,kind,passed,regressed,status,exit_reason,steps,duration_ms,input_tokens,output_tokens,cost_usd,unmetered,tool_calls,tool_errors\n',
+    'model,id,tier,kind,passed,regressed,status,exit_reason,steps,duration_ms,input_tokens,output_tokens,cost_usd,unmetered,tool_calls,tool_errors,files_changed,lines_changed\n',
   );
 }
 // Minimal RFC-4180 quoting: a value that contains a comma, double-quote, or newline is wrapped in
@@ -574,6 +622,8 @@ appendFileSync(
         csvCell(r.unmetered ? 1 : 0),
         csvCell(r.toolCalls),
         csvCell(r.toolErrors),
+        csvCell(r.filesChanged),
+        csvCell(r.linesChanged),
       ].join(','),
     )
     .join('\n')}\n`,
