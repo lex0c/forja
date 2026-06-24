@@ -38,6 +38,14 @@ export const operatorBootstrapFlags = (args: ParsedArgs): Partial<BootstrapInput
   ...(args.maxSteps !== undefined ? { budget: { maxSteps: args.maxSteps } } : {}),
   ...(args.acceptBrokenChain === true ? { acceptBrokenChain: true } : {}),
   ...(args.sandboxHost === true ? { sandboxHost: true } : {}),
+  // Gate 2 of host passthrough (SECURITY.md §4.1/§4.7). Forwarded here so
+  // BOTH entrypoints (one-shot + REPL) thread the opt-in identically;
+  // pairs with `--sandbox-host` above. The same flag ALSO drives the
+  // welcome flow's `sandbox_skip` marker, but that path consumes
+  // `args.iKnowWhatImDoing` directly in `run.ts` (welcome branch) and
+  // never reaches bootstrap — so forwarding it for the agent run can't
+  // collide with welcome.
+  ...(args.iKnowWhatImDoing === true ? { iKnowWhatImDoing: true } : {}),
   ...(args.autonomous === true ? { approvalPosture: 'autonomous' as const } : {}),
   ...(args.brokerMode !== undefined ? { brokerMode: args.brokerMode } : {}),
   ...(args.memoryVerifyLlm !== undefined ? { memorySemanticVerify: args.memoryVerifyLlm } : {}),

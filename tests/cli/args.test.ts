@@ -783,19 +783,21 @@ describe('--memory', () => {
   });
 });
 
-// Slice 123 (R9 P1): pre-slice `forja --i-know-what-im-doing`
-// (without the `welcome` verb) silently parsed `iKnowWhatImDoing:
-// true`, but the flag is only read inside the welcome branch in
-// run.ts — so the top-level form was a no-op that LOOKED like
-// it acknowledged unsafe-mode. Now the top-level parser rejects
-// with a pointer to the correct invocation.
-describe('--i-know-what-im-doing top-level rejection (slice 123, R9 P1)', () => {
-  test('forja --i-know-what-im-doing (no welcome) returns error pointing at `forja welcome`', () => {
+// Top-level `--i-know-what-im-doing` is GATE 2 of the `host` sandbox
+// profile (SECURITY.md §4.1/§4.7, "I really want to run unsandboxed").
+// Slice 123 (R9 P1) used to REJECT it at the top level because the field
+// was read only inside the welcome branch; it is now load-bearing for the
+// agent run (threaded via `operatorBootstrapFlags` → bootstrap →
+// `sandbox.emitHostPassthrough`), so the parser captures it instead of
+// erroring.
+describe('--i-know-what-im-doing top-level (gate 2 of host passthrough)', () => {
+  test('forja --i-know-what-im-doing (no welcome) parses and sets iKnowWhatImDoing', () => {
     const r = parseArgs(['--i-know-what-im-doing']);
-    expect(r.ok).toBe(false);
-    if (r.ok) return;
-    expect(r.message).toContain('--i-know-what-im-doing');
-    expect(r.message).toContain('forja welcome');
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    // Top-level form is the agent run, not the welcome subcommand.
+    expect(r.args.welcome).toBeUndefined();
+    expect(r.args.iKnowWhatImDoing).toBe(true);
   });
 
   test('forja welcome --i-know-what-im-doing still parses successfully', () => {
@@ -808,13 +810,23 @@ describe('--i-know-what-im-doing top-level rejection (slice 123, R9 P1)', () => 
     expect(r.args.iKnowWhatImDoing).toBe(true);
   });
 
-  test('forja --i-know-what-im-doing with other flags before still rejects', () => {
-    // Even when the flag appears alongside otherwise-valid flags,
-    // the top-level form is invalid.
+  test('forja --json --i-know-what-im-doing hello → flag captured, prompt preserved', () => {
+    // The flag composes with other top-level flags and a prompt — no
+    // longer an error. `hello` remains the prompt; `--json` still parses.
     const r = parseArgs(['--json', '--i-know-what-im-doing', 'hello']);
-    expect(r.ok).toBe(false);
-    if (r.ok) return;
-    expect(r.message).toContain('forja welcome');
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.iKnowWhatImDoing).toBe(true);
+    expect(r.args.json).toBe(true);
+    expect(r.args.prompt).toBe('hello');
+    expect(r.args.welcome).toBeUndefined();
+  });
+
+  test('omitted leaves iKnowWhatImDoing undefined (no accidental opt-in)', () => {
+    const r = parseArgs(['ls']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.iKnowWhatImDoing).toBeUndefined();
   });
 });
 

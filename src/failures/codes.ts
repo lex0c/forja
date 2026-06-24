@@ -80,6 +80,12 @@ export const CODE_VOCABULARY: ReadonlyMap<string, FailureClass> = new Map<string
   // canonical em /opt/bin" signal. This code is emitted from
   // bootstrap when `trustLevel !== 'canonical'`.
   ['sandbox.path_resolved', 'sandbox'],
+  // sandbox.host_passthrough: the operator opted into running tools UNSANDBOXED (the `host` profile)
+  // via the two-gate `--sandbox-host` + `--i-know-what-im-doing` flags. ANTI_PATTERNS §7.8 requires a
+  // security-bypass flag to leave a forensic trail (and a visible signal); this is the informational
+  // row. recovery_action='ignored' — a deliberate operator choice, nothing to recover from. Emitted
+  // from bootstrap when the host-passthrough opt-in is active.
+  ['sandbox.host_passthrough', 'sandbox'],
   // Note: `sandbox.silent_passthrough` (when `maybeWrapSandboxArgv`
   // returns innerArgv unchanged due to missing sandbox tool at
   // spawn-time, despite the planner picking a non-host profile) is

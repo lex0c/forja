@@ -127,6 +127,48 @@ describe('executeCase', () => {
     expect(r.expectations.every((e) => e.passed)).toBe(true);
   });
 
+  test('command_succeeds passes when the command exits 0 in the workspace cwd', async () => {
+    // The command runs in the same cwd the agent worked in — proven by checking a setup file.
+    const c = baseCase({
+      setup: { files: { 'marker.txt': 'ok\n' } },
+      expect: [{ kind: 'command_succeeds', command: 'test -f marker.txt' }],
+    });
+    const r = await executeCase(c, {
+      bootstrapOverride: { providerOverride: mockProvider([{ text: 'done' }]) },
+    });
+    expect(r.expectations[0]?.passed).toBe(true);
+    expect(r.passed).toBe(true);
+  });
+
+  test('command_succeeds fails with the exit code + log tail when the command exits non-zero', async () => {
+    const c = baseCase({
+      expect: [{ kind: 'command_succeeds', command: 'echo boom 1>&2; exit 3' }],
+    });
+    const r = await executeCase(c, {
+      bootstrapOverride: { providerOverride: mockProvider([{ text: 'done' }]) },
+    });
+    const out = r.expectations[0];
+    expect(out?.passed).toBe(false);
+    expect(out?.detail).toContain('exit 3');
+    expect(out?.detail).toContain('boom'); // stderr tail surfaced for the failure
+    expect(r.passed).toBe(false);
+  });
+
+  test('command_succeeds fails as a timeout (not a hang) when the command exceeds timeout_ms', async () => {
+    // Exercises the timeout_ms override end-to-end (200ms, not the 60s default) and the
+    // SIGTERM-kill branch: a 5s sleep bounded at 200ms is killed and reported as a timeout.
+    const c = baseCase({
+      expect: [{ kind: 'command_succeeds', command: 'sleep 5', timeoutMs: 200 }],
+    });
+    const r = await executeCase(c, {
+      bootstrapOverride: { providerOverride: mockProvider([{ text: 'done' }]) },
+    });
+    const out = r.expectations[0];
+    expect(out?.passed).toBe(false);
+    expect(out?.detail).toContain('timed out after 200ms');
+    expect(r.passed).toBe(false);
+  });
+
   test('bootstrapOverride.thinkingBudget reaches the provider request as thinking_budget', async () => {
     // Locks the BootstrapInput → HarnessConfig → GenerateRequest.thinking_budget
     // chain the reasoning-replay A/B depends on (the Anthropic adapter only emits

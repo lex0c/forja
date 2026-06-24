@@ -43,7 +43,17 @@ export type EvalExpectation =
   // `compaction_finished` event with `strategy: 'fallback'` when
   // the LLM call fails — silently masking adapter bugs unless
   // we assert against the strategy directly.
-  | { kind: 'compaction_triggered'; minCount: number; strategy?: CompactionStrategy };
+  | { kind: 'compaction_triggered'; minCount: number; strategy?: CompactionStrategy }
+  // Runs an author-specified command in the eval cwd AFTER the agent finishes and asserts it
+  // exits 0. The OUTCOME oracle for capability evals (self-SWE-bench): the gold test is the
+  // spec, and "the bug is fixed" = the test command passes — independent of HOW the model
+  // acted (tool / format). Runs in the same workspace the agent edited, with its file changes
+  // in place. `timeoutMs` bounds a hung command (default DEFAULT_COMMAND_TIMEOUT_MS).
+  // `sandboxed` wraps the command in the `cwd-rw` sandbox profile (ro outside cwd, network
+  // off) — load-bearing for self-SWE-bench, where the command runs `bun test` over files the
+  // model wrote: without it a model under eval can plant code the verifier executes with the
+  // runner's full privileges. Defaults off (hermetic author-authored commands are trusted).
+  | { kind: 'command_succeeds'; command: string; timeoutMs?: number; sandboxed?: boolean };
 
 // Optional setup applied before the run: copy a fixture directory
 // into the eval's temp cwd, then overwrite/create files declared

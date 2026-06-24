@@ -463,9 +463,11 @@ describe('seed catalog + serialization', () => {
       (e) => e.family === 'ollama' && e.base_url === 'https://ollama.com',
     );
     expect(cloud.map((e) => e.id).sort()).toEqual([
+      'ollama/deepseek-v4-pro:cloud',
       'ollama/devstral-2:123b',
       'ollama/glm-5.2',
       'ollama/gpt-oss:20b',
+      'ollama/kimi-k2.7-code:cloud',
       'ollama/qwen3-coder-next',
       'ollama/qwen3-coder:480b',
     ]);

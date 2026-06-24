@@ -75,6 +75,7 @@ const EXPECTATION_KEYS = {
   output_contains: new Set(['output_contains']),
   compaction_triggered: new Set(['compaction_triggered']),
   min_steps: new Set(['min_steps']),
+  command_succeeds: new Set(['command_succeeds']),
 } as const satisfies Record<EvalExpectation['kind'], ReadonlySet<string>>;
 
 const requireString = (v: unknown, label: string): string => {
@@ -366,6 +367,34 @@ const parseExpectation = (raw: unknown, idx: number): EvalExpectation => {
           );
         }
         out.strategy = strategy as CompactionStrategy;
+      }
+      return out;
+    }
+    case 'command_succeeds': {
+      const cs = requireRecord(r.command_succeeds, `expect[${idx}].command_succeeds`);
+      rejectUnknown(
+        cs,
+        new Set(['command', 'timeout_ms', 'sandboxed']),
+        `expect[${idx}].command_succeeds`,
+      );
+      const out: EvalExpectation = {
+        kind,
+        command: requireString(cs.command, `expect[${idx}].command_succeeds.command`),
+      };
+      if (cs.timeout_ms !== undefined) {
+        const t = cs.timeout_ms;
+        if (typeof t !== 'number' || !Number.isInteger(t) || t < 1) {
+          throw new Error(
+            `eval: expect[${idx}].command_succeeds.timeout_ms must be a positive integer`,
+          );
+        }
+        out.timeoutMs = t;
+      }
+      if (cs.sandboxed !== undefined) {
+        if (typeof cs.sandboxed !== 'boolean') {
+          throw new Error(`eval: expect[${idx}].command_succeeds.sandboxed must be a boolean`);
+        }
+        out.sandboxed = cs.sandboxed;
       }
       return out;
     }

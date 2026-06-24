@@ -183,8 +183,23 @@ export interface BootstrapInput {
   // capabilities include `host-passthrough`, the sandbox planner
   // may pick `host` as a fallback when no restricted profile
   // covers. Without this flag, `host` is pruned from the candidate
-  // set unconditionally.
+  // set unconditionally. This is GATE 1 of the two-gate host model
+  // (SECURITY.md §4.1); GATE 2 is `iKnowWhatImDoing` below.
   sandboxHost?: boolean;
+  // GATE 2 of the `host` sandbox profile (SECURITY.md §4.1/§4.7):
+  // the explicit "I really want to run unsandboxed" opt-in
+  // (`--i-know-what-im-doing`). No resolver emits the
+  // `host-passthrough` sentinel the planner requires; setting this
+  // makes the engine inject it (via `sandbox.emitHostPassthrough`),
+  // so the `host` profile becomes COVERED. Paired with `sandboxHost`
+  // (gate 1, which makes it SELECTABLE): BOTH are required before
+  // tools run unsandboxed — neither flag alone unlocks passthrough.
+  // Without both, `host` stays pruned (an unavailable sandbox then
+  // degrades to confirm-everything rather than silently running
+  // unsandboxed). Distinct from the welcome flow's reuse of the same
+  // flag for the `sandbox_skip` marker — here it gates runtime
+  // profile selection for the agent run.
+  iKnowWhatImDoing?: boolean;
   // Test seam — pins the `detectSandboxAvailability` result instead
   // of probing the host. Production callers never pass this; tests
   // that exercise both branches of the default-broker resolver
@@ -805,6 +820,14 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       available: sandboxAvail.available,
       hostExplicitlyAllowed: input.sandboxHost === true || policySandbox?.hostAllowed === true,
       required: policySandbox?.required === true,
+      // Gate 2 of host passthrough (SECURITY.md §4.1/§4.7). The
+      // operator's `--i-know-what-im-doing` opt-in is the SOLE source of
+      // the `host-passthrough` sentinel; the engine injects it into the
+      // planner only when this is true. Independent of
+      // `hostExplicitlyAllowed` (gate 1) — both must hold before `host`
+      // is selected. Unlike gate 1, there is no policy-file equivalent:
+      // unsandboxed execution is opt-in per CLI invocation only.
+      emitHostPassthrough: input.iKnowWhatImDoing === true,
       // Slice 165 (review — Batch C sandbox observability). Forward
       // the trust marker so bootstrap can emit a
       // `sandbox.path_resolved` failure_event when the install isn't

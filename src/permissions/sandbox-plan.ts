@@ -134,7 +134,9 @@ export const selectSandboxProfile = (
   options: SelectSandboxProfileOptions,
 ): SelectSandboxProfileResult => {
   const requiredKinds = new Set<CapabilityKind>();
-  for (const cap of options.capabilities) requiredKinds.add(cap.kind);
+  for (const cap of options.capabilities) {
+    requiredKinds.add(cap.kind);
+  }
 
   // `host` needs an explicit operator flag AND a host-passthrough
   // capability in the resolved set. Either missing prunes host

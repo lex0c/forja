@@ -68,6 +68,9 @@ expect:
   - exit_reason: maxSteps
   - output_contains: hello
   - min_steps: 5
+  - command_succeeds:
+      command: bun test x.test.ts
+      timeout_ms: 5000
 `;
     const c = parseEvalCase(yaml, '/tmp/c.yaml');
     expect(c.expect.map((e) => e.kind)).toEqual([
@@ -81,8 +84,36 @@ expect:
       'exit_reason',
       'output_contains',
       'min_steps',
+      'command_succeeds',
     ]);
     expect(c.expect.find((e) => e.kind === 'min_steps')).toEqual({ kind: 'min_steps', count: 5 });
+    expect(c.expect.find((e) => e.kind === 'command_succeeds')).toEqual({
+      kind: 'command_succeeds',
+      command: 'bun test x.test.ts',
+      timeoutMs: 5000,
+    });
+  });
+
+  test('command_succeeds: command is required, timeout_ms must be a positive integer', () => {
+    const noCmd = `
+name: c
+prompt: p
+expect:
+  - command_succeeds:
+      timeout_ms: 100
+`;
+    expect(() => parseEvalCase(noCmd, '/tmp/c.yaml')).toThrow(/command_succeeds\.command/);
+    const badTimeout = `
+name: c
+prompt: p
+expect:
+  - command_succeeds:
+      command: bun test x
+      timeout_ms: -1
+`;
+    expect(() => parseEvalCase(badTimeout, '/tmp/c.yaml')).toThrow(
+      /timeout_ms must be a positive integer/,
+    );
   });
 
   test('parses setup.httpStub with defaults and explicit fields', () => {

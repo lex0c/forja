@@ -75,6 +75,12 @@ export interface BootstrapPermissionEngineInput {
     available: boolean;
     hostExplicitlyAllowed: boolean;
     required: boolean;
+    // Gate 2 of the `host` profile (SECURITY.md §4.1/§4.7): when true, the
+    // engine injects the `host-passthrough` sentinel into the planner's
+    // capability set, making `host` selectable when gate 1
+    // (`hostExplicitlyAllowed`) is ALSO set. Sourced from the operator's
+    // `--i-know-what-im-doing` opt-in. Default off ⇒ `host` stays pruned.
+    emitHostPassthrough?: boolean;
     // Resolver's trust marker so bootstrap can emit a
     // `sandbox.path_resolved` failure_event when the sandbox tool
     // was resolved via $PATH (non-canonical install). Optional for
@@ -667,7 +673,49 @@ export const bootstrapPermissionEngine = async (
     }
   }
 
-  if (sandbox !== undefined && !sandbox.available) {
+  // The operator's explicit two-gate opt-in to run UNSANDBOXED (`--sandbox-host` AND the
+  // `--i-know-what-im-doing` host-passthrough sentinel) is an INTENTIONAL choice, not a degradation.
+  // A container/CI that already provides isolation has no bwrap; the operator accepts that and asks
+  // for the `host` passthrough profile. Without this carve-out the boot transition below fires
+  // `degraded` (every would-be allow → confirm) BEFORE the §6.5 per-call planner ever runs, so the
+  // host profile the planner would pick is moot and a headless agent dead-ends on un-answerable
+  // confirms. In lenient mode the opt-in stays `ready` and lets the planner select `host` (audited
+  // as sandbox_profile=host). A policy that REQUIRES a sandbox still wins — the operator flag below
+  // cannot override `sandbox.required` (that path falls through to `refusing`).
+  const hostPassthroughOptIn =
+    sandbox !== undefined &&
+    sandbox.required === false &&
+    sandbox.hostExplicitlyAllowed === true &&
+    sandbox.emitHostPassthrough === true;
+
+  // ANTI_PATTERNS §7.8 — a security-bypass flag must be LOUD, never silent. The opt-in runs every
+  // tool UNSANDBOXED (full host access), and the carve-out below even suppresses the
+  // `sandbox.tool_unavailable` row that would otherwise fire — so without this the bypass leaves no
+  // trace at all. Emit a forensic failure_event AND a visible stderr warning whenever it's active.
+  if (hostPassthroughOptIn) {
+    process.stderr.write(
+      'forja: ⚠ UNSANDBOXED — host passthrough active (--sandbox-host + --i-know-what-im-doing); tools run with full host access\n',
+    );
+    if (input.failureSink !== undefined) {
+      try {
+        input.failureSink.emit({
+          code: 'sandbox.host_passthrough',
+          classe: 'sandbox',
+          recovery_action: 'ignored',
+          user_visible: true,
+          session_id: input.sessionId,
+          payload: { platform: process.platform },
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        process.stderr.write(
+          `forja bootstrap: failure_events emit failed (${msg}); bypass still active\n`,
+        );
+      }
+    }
+  }
+
+  if (sandbox !== undefined && !sandbox.available && !hostPassthroughOptIn) {
     // Structured failure_event so ops queries can answer "which
     // sessions booted without sandbox tooling?" without parsing
     // stderr. recovery_action reflects the state-machine branch

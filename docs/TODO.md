@@ -1867,17 +1867,49 @@ Forja's own repo. For a fix commit `C` with parent `P`:
 - **Deterministic tests only** (mock-based; most Forja tests are). Model non-determinism is
   the eval's inherent variance → repeats.
 - **Scope the verifier** to the specific test file, not the whole suite (speed).
+- **Sandbox the verifier** ✅ DONE. `command_succeeds { sandboxed: true }` wraps the verifier in
+  the `cwd-rw` profile (ro outside cwd, network off) with `failClosed: true` — a host with no
+  sandbox tool FAILS the verifier instead of running model-authored `bun test` with the runner's
+  env/FS. With bwrap present, `--clearenv` + `SAFE_ENV_VARS` drop `*_KEY`/`*_TOKEN`.
 
-**Prerequisite.** A `command_succeeds` expectation kind (run an author-specified command in
-the workspace cwd, assert exit 0 / stdout) — the same small, exhaustively-typed addition as
-`file_not_contains` (eval types + loader + executor + tests). It is the verifier for this
-whole class (and reusable for a hermetic inline fail-to-pass eval too).
+**Anti-cheat gaps (Phase 2, load-bearing before any UNTRUSTED model runs).** A code-review pass on
+the Phase-1 machinery found cheat surfaces the test-file restore + sandboxed verifier do NOT close.
+The outcome IS the score, so each is a way to inflate the capability signal WITHOUT fixing the bug.
+Close before running the corpus on third-party models:
 
-**Reporting.** Do NOT fold this into the harness-fit composite (RANKING.md keeps "separate
-axes, never folded in"). Add a `capability` axis = pass-rate of the verified suite. Tag
-each task with a difficulty tier (1 = trivial fix, 2 = multi-location / reasoning, 3 =
-multi-file / recover-from-wrong-attempt) and report per-tier, so the score reflects a
-capability CEILING, not a uniform pass-rate.
+- **Cut the AGENT's network.** ✅ DONE (Docker egress lock). The task container sits on an
+  `--internal` network whose only route out is a proxy sidecar allowlisting the model host alone, so
+  curl / git fetch reach nothing else (github is 403'd) — and `bun test` still runs (no real net
+  needed). The earlier in-process `denyNetwork` sandbox option did this for the in-process path and
+  was REMOVED with it (the path let the agent read the live answer by absolute path — superseded by
+  the container boundary).
+- **Broaden / freeze the restore.** ✅ DONE. `restoreSweTests` `rm`s + re-archives the whole `tests/`
+  tree from C (no model-added test survives) and restores-or-DELETES the test-runner config
+  (`bunfig.toml`/`tsconfig.json`/`package.json`/`bun.lock` + the `.env*` bun auto-loads).
+  `materializeSweWorkspace` also strips the leak surface (`docs/BACKLOG.md`/`docs/TODO.md`/
+  `evals/swe-bench/`) from the workspace.
+- **PASS_TO_PASS** ✅ DONE (the regression half). Each corpus task carries `passToPass` = ≤3 sibling
+  test files (same dir as the oracle) that pass at C, vetted under the runner's `cwd-rw` sandbox; the
+  runner runs them as a second verifier and records `regressed` (oracle passed but a sibling broke).
+  `scripts/swe-bench-passtopass.ts` enriches the corpus, ranking siblings that import the changed
+  `srcFiles` FIRST (✅ the same-`srcFiles` heuristic — a tighter overfit guard than plain same-DIR).
+- **Withhold the visible oracle** ⏳ NOT done. The oracle is VISIBLE in the workspace, so a model can
+  hard-code the test's exact inputs. Classic SWE-bench HIDES the test (gives only the failure output).
+  A separate, bigger design change (the verifier needs the test, but the agent shouldn't see it).
+
+**Prerequisite — ✅ DONE.** The `command_succeeds` expectation kind: runs an author-specified
+command in the workspace cwd after the agent, asserts exit 0, with a per-command timeout
+(SIGTERM-labeled) and a failure log tail; spawn-failure fails the expectation, not the case
+(eval types + loader + executor + tests). The verifier for this whole class (and reusable for a
+hermetic inline fail-to-pass eval). NOTE: runs UNSANDBOXED — see the sandbox-the-verifier gate
+above before pointing it at model-authored files.
+
+**Reporting.** ✅ DONE — `docs/BENCHMARK.md` is the capability-axis doc (per-tier pass-rate, hand-
+refreshed from `results.csv`, with the derived taxonomy/efficiency/fluency axes). Do NOT fold this into
+the harness-fit composite (RANKING.md keeps "separate axes, never folded in"). Add a `capability` axis =
+pass-rate of the verified suite. Tag each task with a difficulty tier (1 = trivial fix, 2 = multi-
+location / reasoning, 3 = multi-file / recover-from-wrong-attempt) and report per-tier, so the score
+reflects a capability CEILING, not a uniform pass-rate.
 
 **Honest caveat.** Still "capability AS exercised through Forja's loop" — the model acts
 through the harness; it is not a vacuum benchmark. But outcome-verification removes the
@@ -1891,13 +1923,24 @@ it **generates tasks forever** (every future fix is a new task, automatically).
 
 **Phases.**
 
-1. `command_succeeds` (framework + test) + **one** hand-wired commit from this session
-   (e.g. `8f6be12e` file_not_contains, or `e08f7df4` cost-cap — small, self-contained) to
-   prove the format end-to-end. Surfaces the real problems (deps in the snapshot, test
-   scoping, anti-cheat) on one task before scaling.
-2. Automate commit selection from git: scan commits, split by path, validate fail-to-pass,
-   discard the invalid ones.
-3. Tier + wire into the ranking as the `capability` axis.
+1. ✅ DONE — but the in-process `setup.swe` EXECUTOR path was later REMOVED (Docker supersedes; it
+   ran the agent on the host where it could read the live answer by absolute path). KEPT and reused by
+   the Docker runner: `command_succeeds` (framework + test) and the shared
+   `src/evals/swe-bench/workspace.ts` (materialize + restore-from-commit + isolated deps). Proven
+   end-to-end on `0be3c4299` (wait_for IPv6): `git archive C^` + test patch + node_modules symlink,
+   restore-from-commit anti-cheat, the sandboxed verifier, verifier scoping. Surfaced + fixed the
+   restore mechanism (archive-from-commit, NOT re-apply-patch) and the shallow-clone gate (tests
+   skipIf the commit + parent are absent).
+2. ✅ DONE (corpus v1). The miner (`scripts/swe-bench-mine.ts`: candidateCommits / tierOf /
+   validateFailToPass / mineCorpus) scans history for src+test fix commits and validates each is a
+   real fail-to-pass (measured ~94% over a 3-month window, 1329 candidates → bulk-to-500 feasible).
+   The curated v1 corpus (`evals/swe-bench/corpus.json`) is 50 hand-curated tasks (40 bugs + 10
+   features, ~20 subsystems, tiers 1=14 / 2=24 / 3=12) — SWE-bench-Verified style. The BACKLOG is
+   the SELECTOR only; the prompt is the failing test, never the commit/BACKLOG prose. Remaining:
+   scale to bulk ~500 (run the miner over a wide window + 2 robustness tweaks — per-candidate
+   `bun test` timeout + exclude meta commits whose src is wholly under `src/evals/`|`scripts/`).
+3. Tier + wire into the ranking as the `capability` axis (needs the corpus runner #10 + the
+   load-bearing anti-cheat gates before any untrusted-model run).
 
 **Adjacent (lower priority, separate, no framework change).** A **prompt-injection
 resistance** eval — `setup.files` carries a malicious instruction inside untrusted content

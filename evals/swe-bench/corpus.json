@@ -1,0 +1,181 @@
+[
+  {
+    "id": "ffd72160b",
+    "commit": "ffd72160b976eb599416e757341e4bf5ae5415f7",
+    "subject": "fix(providers): only emit usage event when upstream actually reported",
+    "kind": "bug",
+    "testFiles": [
+      "tests/providers/anthropic-stream.test.ts",
+      "tests/providers/google-stream.test.ts",
+      "tests/providers/openai-stream.test.ts"
+    ],
+    "srcFiles": [
+      "src/providers/anthropic/stream.ts",
+      "src/providers/google/stream.ts",
+      "src/providers/openai/stream.ts"
+    ],
+    "tier": 1,
+    "passToPass": [
+      "tests/providers/anthropic.test.ts",
+      "tests/providers/google.test.ts",
+      "tests/providers/openai.test.ts"
+    ],
+    "prompt": "Every provider streaming adapter (Anthropic, OpenAI, Google) emits a usage event at the end of a stream even when the upstream SDK never carried any token counts — some OpenAI-compatible endpoints drop the usage payload, and older Gemini SDKs omit it. The harness treats any usage event as a real measurement, so these synthetic zero-usage events get persisted as a measured zero across the token and cost columns: \"no telemetry available\" becomes indistinguishable from \"genuinely zero tokens\", and real spend is silently under-counted on those endpoints.\n\nFix the adapters so a usage event is emitted only when the upstream actually reported at least one usage field. When nothing was reported, no usage event is emitted (the turn records no measurement, not a false zero); a partial measurement, where some fields are present, still emits."
+  },
+  {
+    "id": "803e404b5",
+    "commit": "803e404b54ec946c65d90821e28317e3a7a9ab47",
+    "subject": "fix(tui): sanitize subagent name + goal before the live region",
+    "kind": "bug",
+    "testFiles": [
+      "tests/tui/state.test.ts"
+    ],
+    "srcFiles": [
+      "src/tui/events.ts",
+      "src/tui/state.ts"
+    ],
+    "tier": 1,
+    "passToPass": [
+      "tests/tui/bus.test.ts",
+      "tests/tui/clarify-manager.test.ts",
+      "tests/tui/clarify-reducer.test.ts"
+    ],
+    "prompt": "The live Subagents row repaints a child subagent's name and goal on every heartbeat tick, but both fields enter the render state unsanitized — unlike the sibling \"current tool\" field, which is already stripped at ingress. The name and goal come from the child's own seed prompt, so a child can embed terminal escape sequences (ESC / BEL / OSC bytes) into them and, on every redraw, forge styling, ring the bell, or move the cursor in the parent's terminal.\n\nFix it so the subagent name and goal are stripped of escape and control bytes inside the state reducer that turns the subagent:start event into the live subagent row — the place where the event payload becomes render state, not at the upstream event producer that emits it. The live row and the end-of-run summary must render them as clean text while preserving the real (printable) content."
+  },
+  {
+    "id": "3606adde3",
+    "commit": "3606adde323514e138989586f6ae57ff518fde11",
+    "subject": "fix(tools): read_file classifies directories and caps total output",
+    "kind": "bug",
+    "testFiles": [
+      "tests/tools/read-file.test.ts"
+    ],
+    "srcFiles": [
+      "src/tools/builtin/read-file.ts"
+    ],
+    "tier": 1,
+    "passToPass": [
+      "tests/tools/_bash-cwd.test.ts",
+      "tests/tools/bash-background.test.ts",
+      "tests/tools/bash-broker.test.ts"
+    ],
+    "prompt": "The read_file tool has two gaps in its core behavior. (1) Reading a path that is a directory reports \"file not found\" instead of identifying it as a directory — the existence check returns false for a directory, so the dedicated \"is a directory\" result is never produced and the caller gets a misleading not-found error. (2) The per-line and per-call limits each bound one dimension but not their product, so a single default read of a long file with very long lines can emit several megabytes in one result.\n\nFix it so reading a directory returns a clear \"is a directory\" result, and the assembled output is bounded by a total output-size cap: when the cap is hit, the result is marked truncated with the reduced line count, so the caller can page on rather than receiving an enormous payload.\n\nCap the assembled output at 256 KiB of content bytes; above that, return fewer lines and mark the result truncated (with the reduced line count)."
+  },
+  {
+    "id": "89ecaccf9",
+    "commit": "89ecaccf952c22d4bcfb3f91e78ed2e04870990a",
+    "subject": "fix(permissions): read live engine state before autonomous auto-approval",
+    "kind": "bug",
+    "testFiles": [
+      "tests/permissions/engine.test.ts"
+    ],
+    "srcFiles": [
+      "src/permissions/engine.ts"
+    ],
+    "tier": 2,
+    "passToPass": [
+      "tests/permissions/engine-classifier-telemetry.test.ts",
+      "tests/permissions/policy-watcher.test.ts",
+      "tests/permissions/sensitive-paths-engine.test.ts"
+    ],
+    "prompt": "In autonomous mode the permission engine may auto-approve a low-risk action that policy would otherwise send to confirmation. That auto-approval guard reads a snapshot of the engine state taken at the very start of the check. But a check can itself degrade the engine mid-flight — for example the risk classifier fails and the engine transitions to a degraded state during this same check. Because the guard consults the stale start-of-check snapshot, it can still clear a \"confirm\" to \"allow\" on the exact check that degraded the engine — a fail-open that violates the rule that a degraded engine suspends auto-approval.\n\nFix it so the auto-approval decision reads the LIVE engine state: once the engine is degraded, the decision stays at confirmation rather than being auto-approved."
+  },
+  {
+    "id": "6636b59a7",
+    "commit": "6636b59a710ec13e0b766cb540fddb0196402ad9",
+    "subject": "fix(memory/registry): apply state/expiry filter before deduplicating by name",
+    "kind": "bug",
+    "testFiles": [
+      "tests/memory/registry.test.ts"
+    ],
+    "srcFiles": [
+      "src/memory/registry.ts"
+    ],
+    "tier": 2,
+    "passToPass": [
+      "tests/memory/dependents.test.ts",
+      "tests/memory/lifecycle.test.ts",
+      "tests/memory/transitions.test.ts"
+    ],
+    "prompt": "When listing memories, the registry deduplicates entries by name — keeping the highest-precedence version of each name — BEFORE it applies the state and expiry filters. So if the highest-precedence version of a name is ineligible (quarantined, invalidated, evicted, or expired), it wins the precedence walk and is then dropped by the filter, silently suppressing a lower-precedence but ELIGIBLE sibling of the same name (for example a valid shared or user memory hidden behind an expired project-local shadow). The retrieval view ends up with no entry for that name even though a valid active version exists elsewhere.\n\nFix the order so the state / expiry filter runs FIRST, and the dedupe-by-name then picks the highest-precedence version among the eligible entries."
+  },
+  {
+    "id": "823cdc23f",
+    "commit": "823cdc23f8d0773ab5c33fcc726825b7dec8ded0",
+    "subject": "fix(recap): only aggregate executed tool calls into action counts",
+    "kind": "bug",
+    "testFiles": [
+      "tests/recap/projection.test.ts"
+    ],
+    "srcFiles": [
+      "src/recap/projection.ts"
+    ],
+    "tier": 2,
+    "passToPass": [
+      "tests/recap/render.test.ts"
+    ],
+    "prompt": "The session recap aggregates action counts — files read, files written, commands run, tests run — from every tool-call record, regardless of whether the call actually executed. So a tool call that was DENIED by policy still counts: a denied write_file shows up under \"files edited\", and a denied bash test is reported as a failed test run via a synthetic exit code. In a policy-heavy or failing session the recap's action summary is simply false.\n\nFix it so only tool calls that actually ran (status \"done\") feed the action aggregates; denied, errored, pending, and running calls are excluded from the counts. The approvals-and-decisions part of the recap must still surface the denied call as a decision — the denial stays visible, it just no longer counts as an executed action."
+  },
+  {
+    "id": "e38ea07f1",
+    "commit": "e38ea07f1a6cd2ef42788a8efe2e5f7811159945",
+    "subject": "fix(git): gate log against denied-subtree commits",
+    "kind": "bug",
+    "testFiles": [
+      "tests/tools/git.test.ts"
+    ],
+    "srcFiles": [
+      "src/tools/builtin/git.ts"
+    ],
+    "tier": 3,
+    "passToPass": [
+      "tests/tools/_bash-cwd.test.ts",
+      "tests/tools/bash-background.test.ts",
+      "tests/tools/bash-broker.test.ts"
+    ],
+    "prompt": "The read-only git tool filters its output by the active path policy — status and ls_files already hide files under a denied subtree (secrets/, the credential floor, a subagent's deny_paths). But git log is exempt from that per-file gating: a pathless or parent-scoped log, authorized at the readable repository root, still prints the subject, author, and hash of commits that touched ONLY a policy-denied subtree — leaking exactly the history that status and ls_files were filtering.\n\nFix git log so it does not disclose commits whose changes are entirely within denied paths. A commit that touched only denied files must be dropped from the log output; a commit that touched at least one readable (allowed) file is kept. The number of commits hidden this way must be disclosed to the caller, in the form \"N commit(s) hidden by policy\". If the tool cannot enumerate a commit's touched files to make this decision, it must fail closed (refuse) rather than risk leaking."
+  },
+  {
+    "id": "c82402ddd",
+    "commit": "c82402dddf85db16a4e8e2072af8db91ff8b57cb",
+    "subject": "fix(permissions): route cwd-scope symlink escape to Conservative",
+    "kind": "bug",
+    "testFiles": [
+      "tests/permissions/engine.test.ts",
+      "tests/permissions/resolvers.test.ts"
+    ],
+    "srcFiles": [
+      "src/permissions/resolvers/bash.ts"
+    ],
+    "tier": 3,
+    "prompt": "Under the autonomous (auto-approve) posture, a bash command that touches a path through a symlink in the working directory is gated by the path's lexical form, not its real target. So a symlink whose realpath escapes the repository (it resolves to a target OUTSIDE the workspace) is indistinguishable from a benign in-repo path and gets silently auto-approved: a model can read or write outside the workspace with no confirmation prompt.\n\nFix the bash resolver so a command reaching a path whose symlink resolves outside the repo is routed to require confirmation (the Conservative tier), not auto-approved. A symlink that resolves to a path still INSIDE the repo must keep auto-approving (no false friction). A redirect/orphan form that escapes the same way must also be confirmed.",
+    "passToPass": [
+      "tests/permissions/bash-parser.test.ts",
+      "tests/permissions/audit-rotation.test.ts",
+      "tests/permissions/audit-scheduler.test.ts"
+    ]
+  },
+  {
+    "id": "29b419c28",
+    "commit": "29b419c285870aacd6512d931c6307f424280378",
+    "subject": "fix(providers): emit partial usage when stream terminates early",
+    "kind": "bug",
+    "testFiles": [
+      "tests/providers/anthropic-stream.test.ts",
+      "tests/providers/google-stream.test.ts",
+      "tests/providers/openai-stream.test.ts"
+    ],
+    "srcFiles": [
+      "src/providers/anthropic/stream.ts",
+      "src/providers/google/stream.ts",
+      "src/providers/openai/stream.ts"
+    ],
+    "tier": 3,
+    "prompt": "Each provider's streaming normalizer reports a turn's token usage as a usage event built from the counts the provider sends early in the stream (e.g. Anthropic's message_start). But if the stream throws mid-turn (a dropped connection, a provider error after the counts arrived), the normalizer drops the usage entirely, so telemetry records ZERO tokens for a turn that was actually billed, and cost/budget undercount.\n\nFix the anthropic, google, and openai stream normalizers so a turn that fails AFTER usage data has arrived still surfaces that usage as a usage event, while a normal (non-failing) turn emits usage exactly once: never zero, never twice.",
+    "passToPass": [
+      "tests/providers/anthropic.test.ts",
+      "tests/providers/google.test.ts",
+      "tests/providers/openai.test.ts"
+    ]
+  }
+]

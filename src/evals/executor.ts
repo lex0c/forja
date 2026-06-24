@@ -16,6 +16,7 @@ import {
   type HarnessResult,
   runAgent,
 } from '../harness/index.ts';
+import { maybeWrapSandboxArgv } from '../permissions/sandbox-runner.ts';
 import { closeDb } from '../storage/db.ts';
 import { BUILTIN_TOOLS, createFetchUrlTool } from '../tools/builtin/index.ts';
 import { type ToolRegistry, createToolRegistry } from '../tools/index.ts';
@@ -178,7 +179,11 @@ export const resolveEvalCacheRoot = (env: NodeJS.ProcessEnv, home: string): stri
 
 const EVAL_CACHE_ROOT = resolveEvalCacheRoot(process.env, homedir());
 
-const setupCwd = (caseDef: EvalCase): string => {
+interface SetupResult {
+  dir: string;
+}
+
+const setupCwd = (caseDef: EvalCase): SetupResult => {
   try {
     mkdirSync(EVAL_CACHE_ROOT, { recursive: true });
   } catch (e) {
@@ -253,8 +258,13 @@ const setupCwd = (caseDef: EvalCase): string => {
     mkdirSync(join(dir, '.forja'), { recursive: true });
     writeFileSync(policyPath, DEFAULT_EVAL_POLICY_YAML);
   }
-  return dir;
+  return { dir };
 };
+
+// `command_succeeds` default timeout — generous for `bun test <file>` + `bun run typecheck`
+// (the self-SWE-bench verifiers); a case overrides via `timeout_ms`. After it elapses the
+// command is killed and the expectation FAILS (a hung verifier is a fail, not a hang).
+const DEFAULT_COMMAND_TIMEOUT_MS = 60_000;
 
 const evaluateExpectations = (
   caseDef: EvalCase,
@@ -471,6 +481,67 @@ const evaluateExpectations = (
           detail: `expected ${target}, observed strategies: [${seen}]`,
         };
       }
+      case 'command_succeeds': {
+        // Runs AFTER the agent, in the workspace it edited. The command STRING is trusted
+        // eval-author config — NEVER model-controlled, so `sh -c` carries no injection risk.
+        // But the command EXECUTES the files in the workspace, which the agent (a model under
+        // eval) wrote. `sandboxed` wraps it in the `cwd-rw` profile: the host FS is read-VISIBLE
+        // (--ro-bind / /), but only the cwd is WRITABLE, the network is off, and --clearenv drops
+        // *_KEY/*_TOKEN — so model-authored code can't WRITE outside the workspace, reach the network,
+        // or read a key from env. Load-bearing here (else: ACE with the runner's full env / FS / network
+        // on the eval host). It can still READ the host FS, so this is write + network + key isolation,
+        // NOT read isolation — a secret it reads can only land back in the cwd it already owns. Hermetic
+        // author-authored commands leave it off.
+        const timeoutMs = expectation.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+        try {
+          const innerArgv = ['sh', '-c', expectation.command];
+          // failClosed:true so a host with NO sandbox tool FAILS the verifier (caught below)
+          // instead of silently running model-authored code unsandboxed with the runner's full
+          // env/FS — the gate must not fail OPEN. With bwrap present, --clearenv + the
+          // SAFE_ENV_VARS allowlist drop *_KEY/*_TOKEN, so no separate env scrub is needed.
+          // The wrap is inside the try so a fail-closed throw fails THIS expectation, not the
+          // run; `r` declared here keeps the narrow `stdout:'pipe'` overload (Buffers, never
+          // undefined — annotating it widens back to the union).
+          const argv =
+            expectation.sandboxed === true
+              ? maybeWrapSandboxArgv({ profile: 'cwd-rw', cwd, innerArgv, failClosed: true })
+              : innerArgv;
+          const r = Bun.spawnSync({
+            cmd: argv,
+            cwd,
+            timeout: timeoutMs,
+            stdout: 'pipe',
+            stderr: 'pipe',
+          });
+          if (r.success) return { expectation, passed: true };
+          const tail = (b: { toString(): string }): string =>
+            b.toString().trim().split('\n').slice(-10).join('\n');
+          // SIGTERM is the signal Bun's `timeout` kills with → label it a timeout. Any OTHER
+          // signal (SIGSEGV / SIGKILL / SIGABRT) is the command crashing on its own, possibly
+          // well within budget — report the signal, not a timeout that never elapsed.
+          const why =
+            r.signalCode === 'SIGTERM'
+              ? `timed out after ${timeoutMs}ms (SIGTERM)`
+              : r.signalCode != null
+                ? `killed by ${r.signalCode}`
+                : `exit ${r.exitCode}`;
+          const logTail = tail(r.stderr) || tail(r.stdout);
+          return {
+            expectation,
+            passed: false,
+            detail: `command '${expectation.command}' failed (${why})${logTail ? `\n${logTail}` : ''}`,
+          };
+        } catch (e) {
+          // Either the spawn could not START (no `sh` on PATH — a Windows host without Git
+          // Bash / WSL) OR a `sandboxed` verifier failed closed (no sandbox tool on the host).
+          // Fail THIS expectation; don't let the throw crash the whole case.
+          return {
+            expectation,
+            passed: false,
+            detail: `command '${expectation.command}' could not start: ${e instanceof Error ? e.message : String(e)}`,
+          };
+        }
+      }
     }
   });
 };
@@ -527,7 +598,8 @@ export const executeCase = async (
   if (prevProfile !== undefined) delete process.env.FORJA_PROFILE;
 
   try {
-    cwd = setupCwd(caseDef);
+    const setup = setupCwd(caseDef);
+    cwd = setup.dir;
 
     const dbPath = join(cwd, '.forja-eval-sessions.db');
     const bootstrapInput: BootstrapInput = {
