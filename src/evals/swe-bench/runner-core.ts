@@ -5,6 +5,8 @@
 // take parsed ENTRIES (not a path) so a test injects fixtures instead of reading the operator's real
 // catalog.
 import { readFileSync } from 'node:fs';
+import { computeCost } from '../../providers/cost.ts';
+import type { ProviderCapabilities, UsageInfo } from '../../providers/types.ts';
 
 // The provider prefix of a model id (the part before the first '/') maps to the host its traffic goes
 // to — the egress allowlist the sidecar proxy enforces. Seeded openrouter/* and google/* entries ship
@@ -21,6 +23,9 @@ export interface CatalogEntry {
   id: string;
   base_url?: string;
   api_key_env?: string;
+  // The full capability block from the mounted catalog (rates + the `unmetered` flag). Optional because
+  // the egress/key helpers don't need it; the cost recompute does.
+  capabilities?: ProviderCapabilities;
 }
 
 // Parse the mounted model catalog (model_providers.json). A missing/malformed file → [] (the caller's
@@ -34,6 +39,22 @@ export const loadCatalogEntries = (catalogPath: string): CatalogEntry[] => {
     process.stderr.write(`swe-bench-run: could not parse catalog ${catalogPath} (${msg})\n`);
     return [];
   }
+};
+
+// Authoritative per-task cost from the RECORDED token usage + the catalog's own rates. The agent
+// done-line reports $0 on an ABNORMAL terminal (a maxSteps runaway, a mid-loop provider error) even after
+// burning tokens — a 40-step runaway can cache-write millions of tokens and still log $0, undercounting a
+// paid run by an order of magnitude and skewing the cost x capability chart. Recomputing from the usage
+// the runner already parsed is robust to that. A model with no caps (absent from the mounted catalog) or
+// an explicitly `unmetered` one scores 0 — "untracked", not a real $0.
+export const costForModel = (
+  modelId: string,
+  usage: UsageInfo,
+  entries: CatalogEntry[],
+): number => {
+  const caps = entries.find((e) => e.id === modelId)?.capabilities;
+  if (caps === undefined || caps.unmetered === true) return 0;
+  return computeCost(caps, usage);
 };
 
 // The egress allowlist is EXACTLY the selected models' hosts. Per model: prefer the catalog entry's

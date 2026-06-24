@@ -32,6 +32,7 @@ import {
   agentRunIsInfraFailure,
   allowHostsFor,
   apiKeyEnvsFor,
+  costForModel,
   loadCatalogEntries,
   parseMetrics,
   parseNumstat,
@@ -537,7 +538,18 @@ const runTaskInner = (model: string, t: Task, logDir: string, work: string): Row
     outputTok: m.outputTok,
     cacheRead: m.cacheRead,
     cacheCreation: m.cacheCreation,
-    costUsd: m.costUsd,
+    // Recompute from the recorded usage — the done-line $ (m.costUsd) is $0 on an abnormal terminal
+    // (a maxSteps runaway, a mid-loop provider error) even after the tokens were billed. See costForModel.
+    costUsd: costForModel(
+      model,
+      {
+        input: m.inputTok,
+        output: m.outputTok,
+        cache_read: m.cacheRead,
+        cache_creation: m.cacheCreation,
+      },
+      catalogEntries,
+    ),
     unmetered: m.unmetered,
     toolCalls: m.toolCalls,
     toolErrors: m.toolErrors,

@@ -7,11 +7,13 @@ import {
   agentRunIsInfraFailure,
   allowHostsFor,
   apiKeyEnvsFor,
+  costForModel,
   loadCatalogEntries,
   parseMetrics,
   parseNumstat,
   scoreResult,
 } from '../../src/evals/swe-bench/runner-core.ts';
+import type { ProviderCapabilities } from '../../src/providers/types.ts';
 
 // Pure core of scripts/swe-bench-run.ts. The runner script runs the bench on import (no
 // import.meta.main guard), so its host/key/score/metric logic — each of which has shipped a forwarded
@@ -85,6 +87,46 @@ describe('agentRunIsInfraFailure', () => {
   });
   test('an entrypoint-written .agent_error is owned by the agentError path, not infra', () => {
     expect(f(false, false, true)).toBe(false);
+  });
+});
+
+describe('costForModel', () => {
+  const caps = (c: Partial<ProviderCapabilities>): ProviderCapabilities =>
+    c as ProviderCapabilities;
+  const entries: CatalogEntry[] = [
+    {
+      id: 'anthropic/claude-opus-4-8',
+      capabilities: caps({
+        cost_per_1k_input: 5,
+        cost_per_1k_output: 25,
+        cost_per_1k_cached_input: 0.5,
+        cost_per_1k_cache_write: 6.25,
+      }),
+    },
+    { id: 'ollama/glm-5.2', capabilities: caps({ unmetered: true }) },
+  ];
+  const usage = (input: number, output: number, cache_read: number, cache_creation: number) => ({
+    input,
+    output,
+    cache_read,
+    cache_creation,
+  });
+
+  // The forwarded bug: a maxSteps runaway logs $0 on its done-line but cache-wrote millions of tokens.
+  // costForModel prices it from the RECORDED usage, never trusting the $0 — else the cost chart undercounts.
+  test('abnormal-terminal usage (done-line would log $0) is still priced from tokens', () => {
+    const cost = costForModel('anthropic/claude-opus-4-8', usage(0, 0, 468496, 2851992), entries);
+    expect(cost).toBeCloseTo((468496 * 0.5 + 2851992 * 6.25) / 1_000_000, 4);
+  });
+  test('a fully-priced turn sums input + output + cache-read + cache-write', () => {
+    const cost = costForModel('anthropic/claude-opus-4-8', usage(1000, 2000, 3000, 4000), entries);
+    expect(cost).toBeCloseTo((1000 * 5 + 2000 * 25 + 3000 * 0.5 + 4000 * 6.25) / 1_000_000, 6);
+  });
+  test('an unmetered model is 0 (untracked, not a real $0)', () => {
+    expect(costForModel('ollama/glm-5.2', usage(1000, 2000, 3000, 4000), entries)).toBe(0);
+  });
+  test('a model absent from the catalog is 0 (cannot price it)', () => {
+    expect(costForModel('openai/ghost', usage(1000, 2000, 3000, 4000), entries)).toBe(0);
   });
 });
 
