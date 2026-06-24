@@ -184,6 +184,27 @@ describe('task tool', () => {
     expect(result.details?.max_depth).toBe(4);
   });
 
+  test('errors on playbook_model_unavailable with model + reason in details', async () => {
+    const ctx = makeCtx({
+      spawnSubagent: async () => ({
+        kind: 'playbook_model_unavailable',
+        requested: 'review',
+        model: 'foo/bar',
+        reason: "unknown model 'foo/bar' is not in the catalog",
+      }),
+    });
+    const result = await taskTool.execute(
+      { subagent: 'review', prompt: 'go', capabilities: [] },
+      ctx,
+    );
+    expect(isToolError(result)).toBe(true);
+    if (!isToolError(result)) return;
+    expect(result.error_code).toBe('subagent.playbook_model_unavailable');
+    expect(result.error_message).toContain('foo/bar');
+    expect(result.details?.model).toBe('foo/bar');
+    expect(result.details?.reason).toContain('not in the catalog');
+  });
+
   test('appends `detail` to the run_failed error when the child forwarded one', async () => {
     // The child's HarnessResult.detail (e.g. provider error
     // message for reason='providerError') crosses IPC into

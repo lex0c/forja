@@ -29,6 +29,7 @@ import { runAgent } from '../../src/harness/loop.ts';
 import { createPermissionEngine } from '../../src/permissions/index.ts';
 import type { Policy } from '../../src/permissions/index.ts';
 import type { Provider, StreamEvent } from '../../src/providers/index.ts';
+import { buildRegistryFromEntries } from '../../src/providers/index.ts';
 import { type DB, openDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/index.ts';
 import { createChannel, fakeTransportPair } from '../../src/subagents/ipc.ts';
@@ -155,6 +156,83 @@ afterEach(() => {
 });
 
 describe('task_async / task_await — full e2e through harness loop and real child', () => {
+  test('playbook with an unresolvable model refuses the spawn (no child) — PLAYBOOKS.md §1.1', async () => {
+    // The playbook declares a `model` that is not in the catalog. The
+    // spawn preflight (loop.ts spawnSubagentImpl) must refuse with
+    // `subagent.playbook_model_unavailable` and NEVER spawn a child.
+    let received = 0;
+    let toolResult: string | undefined;
+    const parent: Provider = {
+      ...buildParentProvider([]),
+      async *generate(req) {
+        received += 1;
+        if (received === 1) {
+          for (const ev of replayStep({
+            tool_uses: [
+              {
+                id: 'tu1',
+                name: 'task',
+                input: { subagent: 'explore', prompt: 'go', capabilities: [] },
+              },
+            ],
+            stop_reason: 'tool_use',
+          })) {
+            yield ev;
+          }
+          return;
+        }
+        // Second turn: read the tool_result the harness fed back for tu1.
+        const lastUser = req.messages[req.messages.length - 1];
+        if (lastUser !== undefined && Array.isArray(lastUser.content)) {
+          for (const block of lastUser.content) {
+            if (block.type === 'tool_result' && typeof block.content === 'string') {
+              toolResult = block.content;
+            }
+          }
+        }
+        for (const ev of replayStep({ text: 'done', stop_reason: 'end_turn' })) yield ev;
+      },
+    };
+
+    const parentRegistry = createToolRegistry();
+    registerBuiltinTools(parentRegistry);
+    const engine = createPermissionEngine(policy(), { cwd: '/p' });
+    const subagentRegistry: SubagentSet = {
+      byName: new Map([['explore', definition({ model: 'nonexistent/model' })]]),
+      shadows: [],
+    };
+    let spawnCount = 0;
+    const spawn: SpawnChildProcess = () => {
+      spawnCount += 1;
+      const { a } = fakeTransportPair();
+      return {
+        exited: Promise.resolve({ exitCode: 0 }),
+        kill: () => undefined,
+        ipc: createChannel(a),
+      };
+    };
+
+    const result = await runAgent({
+      provider: parent,
+      toolRegistry: parentRegistry,
+      permissionEngine: engine,
+      db,
+      cwd: '/p',
+      userPrompt: 'go',
+      subagentRegistry,
+      // Empty catalog ⇒ the override id resolves to `unknown`.
+      modelRegistry: buildRegistryFromEntries([]),
+      spawnChildProcess: spawn,
+    });
+
+    expect(result.status).toBe('done');
+    // Preflight refused BEFORE any child process was started.
+    expect(spawnCount).toBe(0);
+    expect(toolResult).toBeDefined();
+    expect(toolResult).toContain('subagent.playbook_model_unavailable');
+    expect(toolResult).toContain('nonexistent/model');
+  });
+
   test('three task_async spawns + three task_await collect; children run in parallel', async () => {
     // The parent's tool_use script:
     //   step 1: emit three task_async calls in one turn

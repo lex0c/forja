@@ -31,6 +31,7 @@ Os 8 princípios abaixo são as derivações operacionais dessa diretriz:
 ---
 name: string                  # único, kebab-case
 description: string           # uma linha, aparece em /help
+model: string                 # opcional; id do catálogo. Default: herda o modelo da sessão (ver abaixo)
 tools: [string]               # whitelist (default: vazio = nenhuma)
 tool_restrictions:            # restrições por tool específica
   bash: [glob]                # comandos permitidos
@@ -67,6 +68,8 @@ phases:                       # opt-in; auto-emite push/pop em goal_stack (STATE
 ```
 
 Sampling defaults canônicos por workflow em [`TOKEN_TUNING.md`](./TOKEN_TUNING.md) §9. Context recipes canônicos por workflow em [`CONTEXT_TUNING.md`](./CONTEXT_TUNING.md) §13. Override per playbook conforme acima. Goal stack lifecycle em [`STATE_MACHINE.md`](./STATE_MACHINE.md) §2.3 — playbooks com `phases` declaradas auto-empilham objetivos; sem `phases`, push/pop é manual.
+
+**Modelo de execução (`model`).** Opcional. Ausente (o caso padrão), o subagent roda no **mesmo modelo da sessão** que o invocou — o comportamento atual, inalterado para todo playbook existente. Presente, deve ser um id do catálogo de modelos (`anthropic/claude-opus-4-8`, `openai/gpt-4o`, `ollama/<modelo>`, …): o harness resolve o provider pelo catálogo no momento do spawn e grava esse id na sessão-filha, de modo que custo e auditoria refletem o modelo realmente usado, não o do pai (o `subagent-child` já reconstrói o provider a partir de `session.model` + do snapshot do catalog entry). A resolução é **fail-soft com preflight**: se o id não existe no catálogo ou o provider não pode ser instanciado (ex.: credencial ausente), o spawn é recusado com um envelope de erro claro **antes** de gastar um processo — o modelo principal recebe o erro e corrige, em vez de o run falhar opaco. É um **override estático por playbook**, não orquestração: sem seleção dinâmica de modelo, sem DAG, sem perfil hybrid/orchestrated — apenas a resolução de modelo por catálogo que o resto do sistema já faz via `--model`. A profundidade de aninhamento permanece governada por `MAX_SUBAGENT_DEPTH`; `model` não interage com ela.
 
 ### 1.2 Output schema sempre tem
 

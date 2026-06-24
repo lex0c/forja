@@ -575,6 +575,18 @@ export type SpawnSubagentResult =
       maxDepth: number;
     }
   | {
+      // Refused at spawn preflight (PLAYBOOKS.md §1.1): the playbook
+      // declared a `model` the catalog can't resolve / instantiate
+      // (unknown id or missing credential). Model-fixable — fix the
+      // frontmatter `model`, wire the provider credential, or omit
+      // `model` to inherit the session model. The tool layer maps this
+      // onto a `subagent.playbook_model_unavailable` tool error.
+      kind: 'playbook_model_unavailable';
+      requested: string;
+      model: string;
+      reason: string;
+    }
+  | {
       // Refused by the cost-cap gate in `spawnSubagentImpl`
       // (spec ORCHESTRATION.md §3.5). `spent` includes parent
       // self-cost + cumulative child cost (settled, sync + async)

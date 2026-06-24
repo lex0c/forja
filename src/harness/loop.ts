@@ -29,6 +29,7 @@ import type {
   ProviderToolDef,
   ProviderToolResultBlock,
 } from '../providers/index.ts';
+import { resolveProviderFromId } from '../providers/resolve.ts';
 import { estimatePromptTokens } from '../providers/tokens.ts';
 import { buildAutoTerse } from '../recap/auto-display.ts';
 import { projectRecap } from '../recap/projection.ts';
@@ -1743,6 +1744,40 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             };
           }
 
+          // Per-playbook execution model (PLAYBOOKS.md §1.1). When the
+          // playbook declares `model`, run the child on a provider
+          // resolved from the catalog instead of the session provider;
+          // absence inherits it. Fail-soft preflight: a bad id or an
+          // uninstantiable provider (e.g. missing credential) refuses the
+          // spawn with a model-fixable envelope BEFORE any child process
+          // starts — same posture as the unknown/depth checks above. The
+          // child session records this provider's id (runSubagent →
+          // createSession), so cost attribution and audit stay honest.
+          let childProvider = config.provider;
+          if (def.model !== undefined) {
+            if (config.modelRegistry === undefined) {
+              return {
+                kind: 'playbook_model_unavailable',
+                requested: args.name,
+                model: def.model,
+                reason: 'no model catalog is wired to resolve the override',
+              };
+            }
+            const resolved = resolveProviderFromId(config.modelRegistry, def.model);
+            if (!resolved.ok) {
+              return {
+                kind: 'playbook_model_unavailable',
+                requested: args.name,
+                model: def.model,
+                reason:
+                  resolved.kind === 'unknown'
+                    ? `unknown model '${def.model}' is not in the catalog${resolved.knownIds.length > 0 ? ` (known: ${resolved.knownIds.join(', ')})` : ''}`
+                    : `provider for '${def.model}' could not be instantiated: ${resolved.message}`,
+              };
+            }
+            childProvider = resolved.provider;
+          }
+
           // Cost-cap gate (spec ORCHESTRATION.md §3.5).
           // Single source of truth for budget enforcement —
           // covers BOTH the sync `task` and async `task_async`
@@ -2063,7 +2098,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             definition: def,
             prompt: args.prompt,
             parentSessionId: sessionId,
-            provider: config.provider,
+            provider: childProvider,
             parentToolRegistry: rootRegistry,
             permissionEngine: config.permissionEngine,
             db: config.db,

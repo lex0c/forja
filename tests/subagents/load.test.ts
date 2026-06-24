@@ -319,6 +319,46 @@ budget: { max_steps: 1, max_cost_usd: 0.01 }
     ).toThrow(/'budget.max_cost_usd' must be a finite positive number/);
   });
 
+  // Per-playbook execution model override (PLAYBOOKS.md §1.1). Loader
+  // validates SHAPE only — catalog existence is a spawn-preflight concern.
+  const withModel = (v: string): string =>
+    VALID.replace('tools: [read_file, grep, glob]', `model: ${v}\ntools: [read_file, grep, glob]`);
+
+  test('parses a valid model override', () => {
+    const def = loadSubagentFromString(withModel('anthropic/claude-opus-4-8'), 'user', '/p');
+    expect(def.model).toBe('anthropic/claude-opus-4-8');
+  });
+
+  test('model absent yields undefined (inherits session model)', () => {
+    const def = loadSubagentFromString(VALID, 'user', '/p');
+    expect(def.model).toBeUndefined();
+  });
+
+  test('rejects a malformed model', () => {
+    // No slash — not a `<family>/<model>` catalog id.
+    expect(() => loadSubagentFromString(withModel('opus'), 'user', '/p')).toThrow(
+      /'model' must be a catalog id of the form/,
+    );
+    // Slash at the edge: empty family or empty model.
+    expect(() => loadSubagentFromString(withModel('anthropic/'), 'user', '/p')).toThrow(
+      /'model' must be a catalog id of the form/,
+    );
+    expect(() => loadSubagentFromString(withModel('/opus'), 'user', '/p')).toThrow(
+      /'model' must be a catalog id of the form/,
+    );
+    // Surrounding whitespace (quoted so YAML preserves it).
+    expect(() => loadSubagentFromString(withModel('" anthropic/opus"'), 'user', '/p')).toThrow(
+      /'model' has leading or trailing whitespace/,
+    );
+    // Non-string and empty-string both fail the non-empty-string gate.
+    expect(() => loadSubagentFromString(withModel('123'), 'user', '/p')).toThrow(
+      /'model' must be a non-empty string/,
+    );
+    expect(() => loadSubagentFromString(withModel('""'), 'user', '/p')).toThrow(
+      /'model' must be a non-empty string/,
+    );
+  });
+
   test('rejects non-finite max_cost_usd (Infinity / NaN)', () => {
     // YAML `.inf` parses to Infinity, which silently passed the
     // earlier `>= 0` check and disabled the spend cap that this
