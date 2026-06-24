@@ -29,7 +29,7 @@ import { runAgent } from '../../src/harness/loop.ts';
 import { createPermissionEngine } from '../../src/permissions/index.ts';
 import type { Policy } from '../../src/permissions/index.ts';
 import type { Provider, StreamEvent } from '../../src/providers/index.ts';
-import { buildRegistryFromEntries } from '../../src/providers/index.ts';
+import { buildRegistryFromEntries, createRegistry } from '../../src/providers/index.ts';
 import { type DB, openDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/index.ts';
 import { createChannel, fakeTransportPair } from '../../src/subagents/ipc.ts';
@@ -231,6 +231,83 @@ describe('task_async / task_await — full e2e through harness loop and real chi
     expect(toolResult).toBeDefined();
     expect(toolResult).toContain('subagent.playbook_model_unavailable');
     expect(toolResult).toContain('nonexistent/model');
+  });
+
+  test('a playbook with a valid model runs the child on THAT model (happy path) — PLAYBOOKS.md §1.1', async () => {
+    // The playbook declares a model present in the catalog. The spawn preflight
+    // resolves it and passes the resolved provider to runSubagent, so the child
+    // session records THAT model id — not the session's 'mock/parent'. Proves
+    // the override takes effect end-to-end (the child session is the audit/cost
+    // anchor that records which model actually ran).
+    const PLAYBOOK_MODEL = 'stub/playbook-model';
+    const resolvedProvider: Provider = { ...buildChildProvider('resolved'), id: PLAYBOOK_MODEL };
+    const registry = createRegistry();
+    registry.register({
+      id: PLAYBOOK_MODEL,
+      family: 'anthropic',
+      modelName: 'playbook-model',
+      capabilities: resolvedProvider.capabilities,
+      factory: () => resolvedProvider,
+    });
+
+    // No need to read the request here (unlike the refusal test), so the
+    // scripted provider is enough: turn 1 spawns, turn 2 closes.
+    const parent = buildParentProvider([
+      {
+        tool_uses: [
+          {
+            id: 'tu1',
+            name: 'task',
+            input: { subagent: 'explore', prompt: 'go', capabilities: [] },
+          },
+        ],
+        stop_reason: 'tool_use',
+      },
+      { text: 'done', stop_reason: 'end_turn' },
+    ]);
+
+    const parentRegistry = createToolRegistry();
+    registerBuiltinTools(parentRegistry);
+    const engine = createPermissionEngine(policy(), { cwd: '/p' });
+    const subagentRegistry: SubagentSet = {
+      byName: new Map([['explore', definition({ model: PLAYBOOK_MODEL })]]),
+      shadows: [],
+    };
+    const spawn: SpawnChildProcess = (opts) => {
+      const { a, b } = fakeTransportPair();
+      const parentChannel = createChannel(a);
+      const exited = runSubagentChild({
+        sessionId: opts.sessionId,
+        dbPath,
+        providerOverride: buildChildProvider('child output'),
+        userAgentsDir: null,
+        projectAgentsDir: null,
+        errSink: () => undefined,
+        ipcVersion: 1,
+        ipcTransportFactory: () => b,
+      }).then((exitCode) => ({ exitCode }));
+      return { exited, kill: () => undefined, ipc: parentChannel };
+    };
+
+    const result = await runAgent({
+      provider: parent,
+      toolRegistry: parentRegistry,
+      permissionEngine: engine,
+      db,
+      cwd: '/p',
+      userPrompt: 'go',
+      subagentRegistry,
+      modelRegistry: registry,
+      spawnChildProcess: spawn,
+    });
+
+    expect(result.status).toBe('done');
+    // The child session records the playbook's model, not the session's.
+    const childModels = db
+      .query('SELECT model FROM sessions WHERE parent_session_id = ?')
+      .all(result.sessionId) as { model: string }[];
+    expect(childModels.length).toBeGreaterThan(0);
+    expect(childModels.every((r) => r.model === PLAYBOOK_MODEL)).toBe(true);
   });
 
   test('three task_async spawns + three task_await collect; children run in parallel', async () => {
