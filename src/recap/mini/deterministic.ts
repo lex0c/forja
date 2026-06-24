@@ -34,11 +34,14 @@ const FILE_WRITER_TOOLS: ReadonlySet<string> = new Set([
 // First user message content. Sessions almost always have at
 // least one (the original prompt); the rare race where the
 // projection runs before appendMessage just yields an empty
-// string. Inline SQL — there's only one call site.
+// string. Inline SQL — there's only one call site. Skips retracted
+// (operator un-sent) turns so a cancelled first prompt can't become
+// the mini goal / oneLineSummary or match `/recap list --search`
+// (migration 079) — the same exclusion the full projection applies.
 const firstUserMessageContent = (db: DB, sessionId: string): string => {
   const row = db
     .query<{ content: string }, [string]>(
-      "SELECT content FROM messages WHERE session_id = ? AND role = 'user' ORDER BY created_at ASC, id ASC LIMIT 1",
+      "SELECT content FROM messages WHERE session_id = ? AND role = 'user' AND retracted_at IS NULL ORDER BY created_at ASC, id ASC LIMIT 1",
     )
     .get(sessionId);
   if (row === null) return '';
