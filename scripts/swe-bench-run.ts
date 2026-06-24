@@ -23,7 +23,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -42,6 +41,7 @@ import {
   materializeSweWorkspace,
   restoreSweTests,
 } from '../src/evals/swe-bench/workspace.ts';
+import { assetName, findTarget } from './targets.ts';
 
 interface Task {
   id: string;
@@ -165,15 +165,22 @@ const buildImage = (rebuild: boolean): void => {
     });
     if (!b.success) throw new Error('swe-bench-run: `bun run build` failed');
   }
-  const binary = existsSync(dist)
-    ? readdirSync(dist).find((f) => /^forja-[\d.]+-linux-x64$/.test(f))
-    : undefined;
-  if (binary === undefined)
+  // Bake the EXACT binary `bun run build` produces, via the build's own assetName SSOT
+  // (profile-aware: forja-<version>[-<profile>]-linux-x64). Globbing dist/ instead would, in a
+  // FORJA_PROFILE shell, miss the freshly-built profiled name and silently bake a stale unprofiled
+  // sibling — corrupting pass rates as if it were model behavior, not a stale harness.
+  const target = findTarget('linux-x64');
+  if (target === undefined)
+    throw new Error('swe-bench-run: linux-x64 missing from the build-target table');
+  const expected = assetName(target);
+  const binaryPath = join(dist, expected);
+  if (!existsSync(binaryPath))
     throw new Error(
-      `swe-bench-run: no linux-x64 binary in dist/${rebuild ? ' after build' : ' (--no-build set — run `bun run build` first)'}`,
+      `swe-bench-run: ${expected} not in dist/${rebuild ? ' after build' : ' (--no-build set — run `bun run build` first)'}`,
     );
+  process.stderr.write(`swe-bench-run: baking ${expected}\n`);
   const ctx = join(repoRoot, 'evals/swe-bench/docker');
-  copyFileSync(join(dist, binary), join(ctx, 'forja'));
+  copyFileSync(binaryPath, join(ctx, 'forja'));
   copyFileSync(join(repoRoot, 'package.json'), join(ctx, 'package.json'));
   copyFileSync(join(repoRoot, 'bun.lock'), join(ctx, 'bun.lock'));
   process.stderr.write('swe-bench-run: docker build...\n');
