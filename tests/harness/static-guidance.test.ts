@@ -21,6 +21,7 @@ describe('injectStaticGuidance', () => {
     expect(text).toContain('[engineering_principles]');
     expect(text).toContain('verify its blast radius');
     expect(text).toContain('Smallest correct diff');
+    expect(text).toContain('Fix the cause, not the symptom');
   });
 
   test('appends a text block to a tool_result user message', () => {
