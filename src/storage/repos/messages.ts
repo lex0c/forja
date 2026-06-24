@@ -48,6 +48,10 @@ export interface Message {
   // so historical cost surfaces resolve a session's ACTUAL metering from the
   // models it really used, not the session's initial `sessions.model`.
   model: string | null;
+  // Operator un-send (migration 079). Epoch ms when the message was retracted
+  // (hard-abort un-send), else null. Retracted turns are skipped from the
+  // model-facing context but kept in the transcript / audit as "cancelled".
+  retractedAt: number | null;
 }
 
 interface MessageRow {
@@ -66,6 +70,7 @@ interface MessageRow {
   effort: string | null;
   source: MessageSource;
   model: string | null;
+  retracted_at: number | null;
 }
 
 const fromRow = (row: MessageRow): Message => ({
@@ -84,6 +89,7 @@ const fromRow = (row: MessageRow): Message => ({
   effort: row.effort,
   source: row.source,
   model: row.model,
+  retractedAt: row.retracted_at,
 });
 
 export interface AppendMessageInput {
@@ -201,6 +207,7 @@ export const appendMessage = (db: DB, input: AppendMessageInput): Message => {
     effort,
     source,
     model,
+    retractedAt: null,
   };
 };
 
@@ -208,11 +215,19 @@ export const getMessage = (db: DB, id: string): Message | null => {
   const row = db
     .query(
       `SELECT id, session_id, parent_id, role, content,
-              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source, model
+              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source, model, retracted_at
        FROM messages WHERE id = ?`,
     )
     .get(id) as MessageRow | null;
   return row !== null ? fromRow(row) : null;
+};
+
+// Mark a message RETRACTED (operator un-sent it after a hard abort). Append-only:
+// the row stays; `retracted_at` records the un-send so the model-facing
+// conversion (messagesToProviderMessages) skips it — durable across resume —
+// while the transcript / recap still render it as "cancelled".
+export const retractMessage = (db: DB, id: string, at: number = Date.now()): void => {
+  db.query('UPDATE messages SET retracted_at = ? WHERE id = ?').run(at, id);
 };
 
 export const listMessagesBySession = (db: DB, sessionId: string): Message[] => {
@@ -225,7 +240,7 @@ export const listMessagesBySession = (db: DB, sessionId: string): Message[] => {
   const rows = db
     .query(
       `SELECT id, session_id, parent_id, role, content,
-              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source, model
+              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source, model, retracted_at
        FROM messages
        WHERE session_id = ?
        ORDER BY seq ASC`,
@@ -327,7 +342,7 @@ export const listMessageTailBySession = (db: DB, sessionId: string, limit: numbe
   const rows = db
     .query(
       `SELECT id, session_id, parent_id, role, content,
-              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source, model
+              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source, model, retracted_at
        FROM (
          SELECT * FROM messages
          WHERE session_id = ?

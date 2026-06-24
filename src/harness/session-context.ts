@@ -3,7 +3,9 @@ import type { DB } from '../storage/db.ts';
 import {
   type MessageSource,
   appendMessage,
+  getMessage,
   listMessageTailBySession,
+  retractMessage,
 } from '../storage/repos/messages.ts';
 import { type RelevanceElideResult, relevanceElideMiddle } from './compaction-relevance.ts';
 import {
@@ -221,6 +223,39 @@ export class SessionContext {
     this.lastMessageId = msg.id;
     this.messages.push({ role: 'user', content });
     return msg.id;
+  }
+
+  // Un-send the trailing operator turn after a HARD abort that cut the request
+  // before any assistant turn settled. Drops it from the LIVE array (the
+  // provider won't see it next turn) AND marks the persisted row retracted
+  // (migration 079): append-only, so the row stays for the transcript / audit
+  // (rendered "cancelled"), but the model-facing rebuild skips it — making the
+  // un-send durable across `--resume`.
+  //
+  // Refuses (returns false) unless the operator's message is genuinely the last
+  // thing that happened:
+  //   1. the in-memory tail must be a string-content user turn (an assistant
+  //      tail, or a tool_result user turn with array content, is never an
+  //      operator message, and popping it would corrupt alternation); AND
+  //   2. `lastMessageId` must point at THAT same row. `appendAssistant` advances
+  //      `lastMessageId` even for an EMPTY turn it does NOT mirror into the array
+  //      (see its `hasContent` guard), so a string-user tail alone doesn't prove
+  //      nothing settled — if an (empty) assistant turn settled after the
+  //      message, it earned a response and is kept. Without this check the
+  //      retraction would hit the wrong row (the empty assistant), losing
+  //      durability and mislabeling the audit.
+  popLastUserMessage(): boolean {
+    const tail = this.messages[this.messages.length - 1];
+    if (tail === undefined || tail.role !== 'user' || typeof tail.content !== 'string') {
+      return false;
+    }
+    const last = getMessage(this.db, this.lastMessageId);
+    if (last === null || last.role !== 'user' || typeof last.content !== 'string') {
+      return false;
+    }
+    this.messages.pop();
+    retractMessage(this.db, this.lastMessageId);
+    return true;
   }
 
   // Heal the live array before a turn uses it. Two repairs, both in-memory

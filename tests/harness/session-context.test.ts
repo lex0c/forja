@@ -54,6 +54,71 @@ beforeEach(() => {
   sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
 });
 
+describe('SessionContext: popLastUserMessage (un-send after hard abort)', () => {
+  test('drops a trailing operator message from the live array but KEEPS the DB row + anchor', () => {
+    const ctx = SessionContext.createFresh(db, sessionId);
+    ctx.appendAssistant(textBlock('hi'), noUsage, null); // prior turn
+    const sentId = ctx.appendUser('oops, typo', null);
+    expect(ctx.length).toBe(2);
+
+    expect(ctx.popLastUserMessage()).toBe(true);
+    // Live array dropped it (provider won't see it next turn)...
+    expect(ctx.length).toBe(1);
+    expect(ctx.getMessages()[0]).toEqual({ role: 'assistant', content: textBlock('hi') });
+    // ...but the append-only log keeps the sent row, and the anchor stays so
+    // the next turn's audit chain faithfully records it followed the message.
+    expect(getMessage(db, sentId)).not.toBeNull();
+    expect(getMessage(db, sentId)?.retractedAt).not.toBeNull(); // marked retracted (durable)
+    expect(ctx.getLastMessageId()).toBe(sentId);
+  });
+
+  test('a retracted message is dropped from the rehydrated model context (durable un-send)', () => {
+    const ctx = SessionContext.createFresh(db, sessionId);
+    ctx.appendAssistant(textBlock('answer'), noUsage, null);
+    const sentId = ctx.appendUser('cancelled prompt', null);
+    ctx.popLastUserMessage();
+    // Resume in a fresh context from the SAME log: the retracted turn is skipped
+    // from the model-facing rebuild, but its row is still logged (retracted).
+    const { ctx: resumed } = SessionContext.hydrateFromDb(db, sessionId);
+    expect(resumed.getMessages().some((m) => m.content === 'cancelled prompt')).toBe(false);
+    expect(getMessage(db, sentId)?.retractedAt).not.toBeNull();
+  });
+
+  test('refuses when the tail is an assistant turn', () => {
+    const ctx = SessionContext.createFresh(db, sessionId);
+    ctx.appendUser('goal', null);
+    ctx.appendAssistant(textBlock('answer'), noUsage, null);
+    expect(ctx.popLastUserMessage()).toBe(false);
+    expect(ctx.length).toBe(2);
+  });
+
+  test('refuses when the tail is a tool_result user turn (array content)', () => {
+    const ctx = SessionContext.createFresh(db, sessionId);
+    ctx.appendUser('goal', null);
+    ctx.appendAssistant(textBlock('call'), noUsage, null);
+    ctx.appendToolResults([{ type: 'tool_result', tool_use_id: 't1', content: 'r' }], null);
+    expect(ctx.popLastUserMessage()).toBe(false);
+    expect(ctx.length).toBe(3);
+  });
+
+  test('refuses on an empty context', () => {
+    const ctx = SessionContext.createFresh(db, sessionId);
+    expect(ctx.popLastUserMessage()).toBe(false);
+  });
+
+  test('refuses when an (empty) assistant turn settled after the operator message', () => {
+    const ctx = SessionContext.createFresh(db, sessionId);
+    const userId = ctx.appendUser('did something settle?', null);
+    // Empty assistant turn (content.length === 0): advances lastMessageId but is
+    // NOT mirrored into the live array, so the in-memory tail is still the user.
+    ctx.appendAssistant([], noUsage, null);
+    expect(ctx.length).toBe(1); // empty assistant not pushed → tail is still user
+    // Something settled after the message → keep it; never retract the wrong row.
+    expect(ctx.popLastUserMessage()).toBe(false);
+    expect(getMessage(db, userId)?.retractedAt).toBeNull();
+  });
+});
+
 describe('SessionContext: append (array + row + anchor in one place)', () => {
   test('createFresh starts empty with no anchor', () => {
     const ctx = SessionContext.createFresh(db, sessionId);

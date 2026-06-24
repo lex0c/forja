@@ -16,6 +16,7 @@ import type { ParsedArgs } from '../../src/cli/args.ts';
 import type { BootstrapResult } from '../../src/cli/bootstrap.ts';
 import { runRepl } from '../../src/cli/repl.ts';
 import type { HarnessConfig, HarnessEvent, HarnessResult } from '../../src/harness/index.ts';
+import { SessionContext } from '../../src/harness/session-context.ts';
 import { DEFAULT_BUDGET } from '../../src/harness/types.ts';
 import { createPermissionEngine } from '../../src/permissions/index.ts';
 import { createDefaultRegistry } from '../../src/providers/catalog-file.ts';
@@ -23,6 +24,8 @@ import type { DB } from '../../src/storage/db.ts';
 import { openMemoryDb } from '../../src/storage/db.ts';
 import { appendHistory, countHistory, loadHistory } from '../../src/storage/history.ts';
 import { migrate } from '../../src/storage/migrate.ts';
+import { getMessage } from '../../src/storage/repos/messages.ts';
+import { createSession } from '../../src/storage/repos/sessions.ts';
 
 const PROJECT_CWD = '/tmp/forja-history-repl-test';
 
@@ -238,6 +241,97 @@ describe('repl — history persistence on submit', () => {
     expect(loadHistory(db, PROJECT_CWD)).toEqual(['line1\nline2']);
     ra.finish(0);
     await tick();
+    stdin.feed('\x04');
+    await promise;
+  });
+});
+
+describe('repl — un-send on hard abort', () => {
+  // Custom runAgent that records the operator turn in a real context, then emits
+  // a session_finished with the given abortCause so the repl gate can act.
+  const runAgentWith = (
+    abortCause: 'soft' | 'hard' | undefined,
+    onSent: (id: string) => void,
+  ): { runAgent: (cfg: HarnessConfig) => Promise<HarnessResult>; finish: () => void } => {
+    let emit: (() => void) | null = null;
+    return {
+      runAgent: (cfg) =>
+        new Promise((resolve) => {
+          const sid = createSession(db, { model: 'm', cwd: PROJECT_CWD }).id;
+          const ctx = SessionContext.createFresh(db, sid);
+          onSent(ctx.appendUser(cfg.userPrompt, null)); // operator turn → live tail
+          const result: HarnessResult = {
+            status: abortCause === 'hard' ? 'interrupted' : 'done',
+            reason: abortCause === 'hard' ? 'aborted' : 'done',
+            ...(abortCause !== undefined ? { abortCause } : {}),
+            sessionId: sid,
+            sessionContext: ctx,
+            steps: 0,
+            durationMs: 1,
+            usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+            costUsd: 0,
+            usageComplete: abortCause === undefined,
+          };
+          emit = () => {
+            cfg.onEvent?.({ type: 'session_finished', result });
+            resolve(result);
+          };
+        }),
+      finish: () => emit?.(),
+    };
+  };
+
+  test('hard abort right after submit retracts the operator message', async () => {
+    const stdin = makeStdin();
+    let sentId = '';
+    const ra = runAgentWith('hard', (id) => {
+      sentId = id;
+    });
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStubWithDb(db),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    stdin.feed('oops typo\r');
+    await tick();
+    ra.finish();
+    await tick();
+    // Un-sent: the operator's row is retracted (model context drops it; audit
+    // keeps it). The text was ALSO refilled into the editor — which is why the
+    // teardown clears it (Ctrl+C) before Ctrl+D can exit on an empty buffer.
+    expect(getMessage(db, sentId)?.retractedAt).not.toBeNull();
+    stdin.feed('\x03'); // clears the refilled buffer (proves the refill landed)
+    await tick();
+    stdin.feed('\x04');
+    await promise;
+  });
+
+  test('a normal (done) turn does NOT retract the operator message', async () => {
+    const stdin = makeStdin();
+    let sentId = '';
+    const ra = runAgentWith(undefined, (id) => {
+      sentId = id;
+    });
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStubWithDb(db),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    stdin.feed('keep me\r');
+    await tick();
+    ra.finish();
+    await tick();
+    expect(getMessage(db, sentId)?.retractedAt).toBeNull(); // not a hard abort → kept
     stdin.feed('\x04');
     await promise;
   });

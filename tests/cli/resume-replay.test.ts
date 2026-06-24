@@ -3,7 +3,7 @@ import { replayProviderMessages, replaySessionMessages } from '../../src/cli/res
 import type { ProviderMessage } from '../../src/providers/index.ts';
 import { openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
-import { appendMessage } from '../../src/storage/repos/messages.ts';
+import { appendMessage, retractMessage } from '../../src/storage/repos/messages.ts';
 import { createSession } from '../../src/storage/repos/sessions.ts';
 import { createBus } from '../../src/tui/bus.ts';
 import type { UIEvent } from '../../src/tui/events.ts';
@@ -35,6 +35,27 @@ describe('replaySessionMessages — text + tool replay (Phase 3)', () => {
     const result = replaySessionMessages(db, 's1', bus);
     expect(events).toEqual([]);
     expect(result).toEqual({ turns: 0, messagesWalked: 0, droppedFromHead: 0 });
+  });
+
+  test('a retracted user message replays as a cancelled info line, not a submit bar', () => {
+    const db = setupSession('s1');
+    appendMessage(db, {
+      id: 'u1',
+      sessionId: 's1',
+      role: 'user',
+      content: 'oops typo',
+      createdAt: 1_000_000,
+    });
+    retractMessage(db, 'u1'); // operator un-sent it (migration 079)
+    const { bus, events } = recordEvents();
+    replaySessionMessages(db, 's1', bus);
+    // No run-opening submit bar for the un-sent turn...
+    expect(events.some((e) => e.type === 'user:submit')).toBe(false);
+    // ...just a secondary info line flagged "(unsent)".
+    const info = events.find((e) => e.type === 'info');
+    expect(info).toBeDefined();
+    expect((info as { message: string }).message).toContain('(unsent)');
+    expect((info as { message: string }).message).toContain('oops typo');
   });
 
   test('single user → assistant turn emits the expected sequence', () => {

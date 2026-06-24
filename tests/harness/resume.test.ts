@@ -23,6 +23,7 @@ const msg = (role: 'user' | 'assistant' | 'tool', content: unknown): Message => 
   effort: null,
   source: 'operator',
   model: null,
+  retractedAt: null,
 });
 
 describe('messagesToProviderMessages', () => {
