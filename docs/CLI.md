@@ -221,6 +221,48 @@ list them live.
 
 ---
 
+## Playbooks
+
+Playbooks are pre-defined subagents — a name, a system prompt, a narrowed tool
+whitelist, a budget, and a structured output schema. `forja init` writes the
+bundled set into `<cwd>/.forja/playbooks/` (each a Markdown file with YAML
+frontmatter), alongside any user-authored ones. They run as subagents: the model
+spawns one via the task tools (`subagent: <name>`), or the operator invokes the
+slash alias in the REPL.
+
+| Playbook | Slash | Tools | Isolation | Budget |
+|---|---|---|---|---|
+| `code-review` | `/review` | `read_file`, `grep`, `glob`, `git` | none | 45 steps / $2.50 |
+| `general-purpose` | `/explore` | `read_file`, `grep`, `glob`, `git`, `retrieve_context`, `memory_read` | none | 40 steps / $1.50 |
+| `perf-investigate` | `/perf` | `read_file`, `grep`, `glob`, `bash`, `bash_background`, `bash_output`, `bash_kill` | worktree | 30 steps / $2.00 |
+| `security-audit` | `/audit` | `read_file`, `grep`, `glob`, `git` | none | 40 steps / $2.50 |
+
+- `code-review` and `security-audit` are read-only (a quality / threat gate that
+  reports findings, never edits); `git` is for the diff and history.
+- `general-purpose` is the read-only explorer; it adds `retrieve_context` +
+  `memory_read` to pull context but has no write tools.
+- `perf-investigate` is the only one with `bash`, and even there it is restricted
+  to a profiler/benchmark allowlist (`time`, `hyperfine`, `node --prof`,
+  `py-spy`, `perf`, `flamegraph`, `*bench*`, plus read-only inspectors like `ps`,
+  `free -h`, `cat /proc/*`) and runs in an isolated worktree.
+
+The bundled files are editable after `init` — tune tools/budget or add your own
+(see `docs/spec/PLAYBOOKS.md`).
+
+### Built-in subagents
+
+Internal to the memory-governance substrate — not operator-invocable; they run
+automatically when memories are written/verified. Tool surface is kept minimal so
+a `tools[]` regression fails loud at permission preflight:
+
+| Subagent | Tools | Role |
+|---|---|---|
+| `verify-semantic` | `read_file`, `grep`, `glob`, `memory_read` | Fact-check a memory against the current repo. |
+| `verify-conflict` | `memory_read` | Judge whether two memories contradict. |
+| `verify-override` | *(none)* | Judge whether a memory drove operator overrides. |
+
+---
+
 ## Maintenance & cleanup summary
 
 What each surface reclaims, and what cleans up on its own.
@@ -286,5 +328,6 @@ read a `.env` file.
 - `docs/AUDIT.md` — audit chain, retention, sealing.
 - `docs/SECURITY.md` — trust, sandbox, permission policy.
 - `docs/MEMORY.md` — cross-session memory and seed pack.
+- `docs/spec/PLAYBOOKS.md` — playbook (subagent) definitions and distribution.
 - `docs/spec/RECAP.md` — recap rendering.
 - `docs/TOOLS.md` — the in-session tool surface (distinct from these CLI commands).
