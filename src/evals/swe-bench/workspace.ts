@@ -1,16 +1,21 @@
-// self-SWE-bench workspace materialization (docs/TODO.md "capability signal via self-SWE-bench
-// from git history"). Turns a fix commit `C` into a runnable task workspace:
+// self-SWE-bench workspace materialization (docs/BENCHMARK.md). Turns a fix commit `C` into a runnable
+// task workspace:
 //
-//   1. `git archive C^` → the parent (buggy) tree, extracted with NO `.git` — anti-cheat, so
-//      the agent can't `git log`/`git show` the original fix out of the workspace.
-//   2. apply the `tests/**` portion of `C^..C` → the gold test exists and FAILS.
-//   3. symlink `node_modules` from the repo (no per-task reinstall).
+//   1. Clone a git BUNDLE of `C^`'s history into the workspace — the agent gets the full pre-fix repo
+//      (history, blame, BACKLOG, existing tests) the way an engineer sees it before the fix. The bundle
+//      is truncated at `C^`, so `C` and everything after it are unreachable: `git show C` fails. The
+//      anti-cheat is ABSENCE-of-the-answer, NOT absence-of-`.git` — the agent CAN `git log` the pre-fix
+//      history, which is legitimate context.
+//   2. point `node_modules` at an ISOLATED deps store OUTSIDE the answer repo (ensureIsolatedDeps), so a
+//      model can't walk `node_modules/..` back into the repo's `.git` / corpus / changelog to recover the
+//      gold.
 //
-// The `src/**` portion of `C^..C` is the GOLD patch — deliberately NOT applied; reproducing it
-// (by outcome, not by diff) is the agent's task. After the agent runs, `restoreSweTests`
-// re-extracts the canonical test files from `C` so a model that edited/deleted the oracle can't
-// cheat the verifier. All git work shells out to the host `git`; failures throw loudly (a
-// silent miss would make a task look like a model failure).
+// The agent gets a curated TICKET, not the oracle test — C's `tests/**` is WITHHELD at materialize time;
+// the `src/**` of `C^..C` is the GOLD patch, deliberately NOT applied (reproducing its OUTCOME, not its
+// diff, is the task). After the agent runs, `restoreSweTests` materializes the canonical `tests/**` from
+// `C` so the oracle exists ONLY at verify time — a model that edited/deleted a test in C^ can't cheat the
+// verifier. All git work shells out to the host `git`; failures throw loudly (a silent miss would make a
+// task look like a model failure).
 
 import { createHash } from 'node:crypto';
 import {

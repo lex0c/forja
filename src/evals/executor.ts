@@ -485,9 +485,12 @@ const evaluateExpectations = (
         // Runs AFTER the agent, in the workspace it edited. The command STRING is trusted
         // eval-author config — NEVER model-controlled, so `sh -c` carries no injection risk.
         // But the command EXECUTES the files in the workspace, which the agent (a model under
-        // eval) wrote. `sandboxed` wraps it in the `cwd-rw` profile (ro outside cwd, network
-        // off) so a self-SWE-bench verifier running model-authored code can't reach the host
-        // FS / network / keys — load-bearing there (else: ACE on the eval host). Hermetic
+        // eval) wrote. `sandboxed` wraps it in the `cwd-rw` profile: the host FS is read-VISIBLE
+        // (--ro-bind / /), but only the cwd is WRITABLE, the network is off, and --clearenv drops
+        // *_KEY/*_TOKEN — so model-authored code can't WRITE outside the workspace, reach the network,
+        // or read a key from env. Load-bearing here (else: ACE with the runner's full env / FS / network
+        // on the eval host). It can still READ the host FS, so this is write + network + key isolation,
+        // NOT read isolation — a secret it reads can only land back in the cwd it already owns. Hermetic
         // author-authored commands leave it off.
         const timeoutMs = expectation.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
         try {
