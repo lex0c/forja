@@ -117,29 +117,6 @@
     "prompt": "The session recap aggregates action counts — files read, files written, commands run, tests run — from every tool-call record, regardless of whether the call actually executed. So a tool call that was DENIED by policy still counts: a denied write_file shows up under \"files edited\", and a denied bash test is reported as a failed test run via a synthetic exit code. In a policy-heavy or failing session the recap's action summary is simply false.\n\nFix it so only tool calls that actually ran (status \"done\") feed the action aggregates; denied, errored, pending, and running calls are excluded from the counts. The approvals-and-decisions part of the recap must still surface the denied call as a decision — the denial stays visible, it just no longer counts as an executed action."
   },
   {
-    "id": "9d2ed2e0a",
-    "commit": "9d2ed2e0a901bd1ee1412a365ac12da6090089d8",
-    "subject": "fix(subagents): cap child output into parent context + bound the boot-time wedge",
-    "kind": "bug",
-    "testFiles": [
-      "tests/subagents/runtime.test.ts",
-      "tests/tools/task.test.ts"
-    ],
-    "srcFiles": [
-      "src/subagents/result-builder.ts",
-      "src/subagents/runtime.ts",
-      "src/subagents/wait-loop.ts",
-      "src/tools/builtin/task.ts"
-    ],
-    "tier": 3,
-    "passToPass": [
-      "tests/subagents/e2e.test.ts",
-      "tests/tools/task-async.test.ts",
-      "tests/tools/task-capabilities.test.ts"
-    ],
-    "prompt": "Two central subagent-lifecycle gaps.\n\n(1) Unbounded child output in the parent context. A child's final text is returned to the parent as a tool result and then re-sent on every subsequent turn, so a verbose child conclusion lodges in the parent's context for the rest of the session (the dominant context-write cost). The child's output handed back to the parent must be bounded the way other large tool outputs are — declared with a head/tail summarize policy so the model-facing copy shrinks while the full text is preserved in the audit.\n\n(2) Boot-time wedge. A child that wedges during boot, before it ever emits its first heartbeat, leaves its last-heartbeat timestamp unset, so the stale-heartbeat watchdog can never fire and only the one-hour wall-clock eventually reaps it. There must be a short startup deadline: a child that has never produced a heartbeat is escalated (terminated) after a brief startup window, while a child that has already pulsed is unaffected.\n\nFix both. Report this boot-time termination with a dedicated end reason, distinct from the stale-heartbeat reason, named startup_stalled."
-  },
-  {
     "id": "e38ea07f1",
     "commit": "e38ea07f1a6cd2ef42788a8efe2e5f7811159945",
     "subject": "fix(git): gate log against denied-subtree commits",
@@ -159,25 +136,46 @@
     "prompt": "The read-only git tool filters its output by the active path policy — status and ls_files already hide files under a denied subtree (secrets/, the credential floor, a subagent's deny_paths). But git log is exempt from that per-file gating: a pathless or parent-scoped log, authorized at the readable repository root, still prints the subject, author, and hash of commits that touched ONLY a policy-denied subtree — leaking exactly the history that status and ls_files were filtering.\n\nFix git log so it does not disclose commits whose changes are entirely within denied paths. A commit that touched only denied files must be dropped from the log output; a commit that touched at least one readable (allowed) file is kept. The number of commits hidden this way must be disclosed to the caller, in the form \"N commit(s) hidden by policy\". If the tool cannot enumerate a commit's touched files to make this decision, it must fail closed (refuse) rather than risk leaking."
   },
   {
-    "id": "89d7b19fe",
-    "commit": "89d7b19fe00fe25ffeecf5defcf26cb1faf851d4",
-    "subject": "fix(harness): include system + tool schemas in the compaction trigger size",
+    "id": "c82402ddd",
+    "commit": "c82402dddf85db16a4e8e2072af8db91ff8b57cb",
+    "subject": "fix(permissions): route cwd-scope symlink escape to Conservative",
     "kind": "bug",
     "testFiles": [
-      "tests/harness/loop.test.ts",
-      "tests/providers/tokens.test.ts"
+      "tests/permissions/engine.test.ts",
+      "tests/permissions/resolvers.test.ts"
     ],
     "srcFiles": [
-      "src/harness/loop.ts",
-      "src/providers/index.ts",
-      "src/providers/tokens.ts"
+      "src/permissions/resolvers/bash.ts"
     ],
     "tier": 3,
+    "prompt": "Under the autonomous (auto-approve) posture, a bash command that touches a path through a symlink in the working directory is gated by the path's lexical form, not its real target. So a symlink whose realpath escapes the repository (it resolves to a target OUTSIDE the workspace) is indistinguishable from a benign in-repo path and gets silently auto-approved: a model can read or write outside the workspace with no confirmation prompt.\n\nFix the bash resolver so a command reaching a path whose symlink resolves outside the repo is routed to require confirmation (the Conservative tier), not auto-approved. A symlink that resolves to a path still INSIDE the repo must keep auto-approving (no false friction). A redirect/orphan form that escapes the same way must also be confirmed.",
     "passToPass": [
-      "tests/harness/collect.test.ts",
-      "tests/harness/compaction.test.ts",
-      "tests/harness/events.test.ts"
+      "tests/permissions/bash-parser.test.ts",
+      "tests/permissions/audit-rotation.test.ts",
+      "tests/permissions/audit-scheduler.test.ts"
+    ]
+  },
+  {
+    "id": "29b419c28",
+    "commit": "29b419c285870aacd6512d931c6307f424280378",
+    "subject": "fix(providers): emit partial usage when stream terminates early",
+    "kind": "bug",
+    "testFiles": [
+      "tests/providers/anthropic-stream.test.ts",
+      "tests/providers/google-stream.test.ts",
+      "tests/providers/openai-stream.test.ts"
     ],
-    "prompt": "The harness decides when to compact the conversation by estimating the size of the next request and comparing it against the context-window budget. But that estimate counts only the messages — it ignores the system prompt and the tool schemas, which every provider call also ships (the tool definitions alone can run to several thousand tokens). So a turn whose messages are modest, but whose system-plus-tools overhead is what pushes the request near the window, slips past the trigger: compaction is skipped and the next provider call fails with a context-length-exceeded error.\n\nFix the compaction trigger so its size estimate reflects the WHOLE outbound prompt — the system prompt and the tool definitions, not just the messages. A turn that crosses the budget only because of that overhead must trigger compaction before the over-budget request is sent."
+    "srcFiles": [
+      "src/providers/anthropic/stream.ts",
+      "src/providers/google/stream.ts",
+      "src/providers/openai/stream.ts"
+    ],
+    "tier": 3,
+    "prompt": "Each provider's streaming normalizer reports a turn's token usage as a usage event built from the counts the provider sends early in the stream (e.g. Anthropic's message_start). But if the stream throws mid-turn (a dropped connection, a provider error after the counts arrived), the normalizer drops the usage entirely, so telemetry records ZERO tokens for a turn that was actually billed, and cost/budget undercount.\n\nFix the anthropic, google, and openai stream normalizers so a turn that fails AFTER usage data has arrived still surfaces that usage as a usage event, while a normal (non-failing) turn emits usage exactly once: never zero, never twice.",
+    "passToPass": [
+      "tests/providers/anthropic.test.ts",
+      "tests/providers/google.test.ts",
+      "tests/providers/openai.test.ts"
+    ]
   }
 ]
