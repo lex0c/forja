@@ -13,6 +13,7 @@ import { dirname, join } from 'node:path';
 import {
   buildRegistryFromEntries,
   createDefaultRegistry,
+  lazyModelRegistry,
   loadModelRegistry,
 } from '../../src/providers/catalog-file.ts';
 import {
@@ -71,6 +72,46 @@ const entry = (over: Partial<ModelProviderEntry> = {}): ModelProviderEntry => ({
 
 const catalogJson = (models: unknown[]): string =>
   JSON.stringify({ version: CATALOG_VERSION, models });
+
+describe('lazyModelRegistry — deferred catalog read for nested overrides', () => {
+  test('does not read the catalog at construction (defer)', () => {
+    let errs = 0;
+    // Empty workdir ⇒ loadModelRegistry would throw, but construction must not.
+    lazyModelRegistry(() => {
+      errs += 1;
+    }, env);
+    expect(errs).toBe(0);
+  });
+
+  test('degrades to an empty registry on load failure (no throw)', () => {
+    const msgs: string[] = [];
+    const reg = lazyModelRegistry((m) => msgs.push(m), env);
+    expect(reg.get('ollama/qwen3:14b')).toBeNull();
+    expect(reg.list()).toEqual([]);
+    expect(msgs.length).toBeGreaterThan(0);
+  });
+
+  test('attempts the load once and caches the degraded result', () => {
+    let errs = 0;
+    const reg = lazyModelRegistry(() => {
+      errs += 1;
+    }, env);
+    reg.get('x');
+    reg.list();
+    reg.has('y');
+    expect(errs).toBe(1);
+  });
+
+  test('serves the real catalog when present (loaded on first use)', () => {
+    writeCatalog(catalogJson([entry()]));
+    let errs = 0;
+    const reg = lazyModelRegistry(() => {
+      errs += 1;
+    }, env);
+    expect(reg.get('ollama/qwen3:14b')?.id).toBe('ollama/qwen3:14b');
+    expect(errs).toBe(0);
+  });
+});
 
 describe('loadModelProvidersFile — hard errors (init mandatory)', () => {
   test('absent file → error pointing at forja init', () => {

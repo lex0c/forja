@@ -172,3 +172,38 @@ export const loadModelRegistry = (
   if (!result.ok) throw new Error(result.error);
   return { registry: buildRegistryFromEntries(result.entries), warnings: result.warnings };
 };
+
+// A ModelRegistry that DEFERS `loadModelRegistry()` to first use and degrades to
+// an empty registry on failure (reporting via `onLoadError`). For the subagent-
+// child boot of a task-capable coordinator: eagerly reading the catalog there
+// would couple the coordinator's startup to catalog health — a file rotated or
+// corrupted between the parent's bootstrap and this child's start would THROW
+// and crash the whole coordinator, breaking even plain nested task chains that
+// never declare a grandchild `model`. With this, the read happens only when a
+// nested override / credential-forward actually consults the registry, and a
+// corrupt catalog refuses just the affected override (as an unknown model)
+// instead of taking down the coordinator. Cached after the first attempt
+// (success OR degraded) so repeated lookups in the same process don't re-read.
+export const lazyModelRegistry = (
+  onLoadError: (message: string) => void,
+  env: NodeJS.ProcessEnv = process.env,
+): ModelRegistry => {
+  let cached: ModelRegistry | null = null;
+  const ensure = (): ModelRegistry => {
+    if (cached === null) {
+      try {
+        cached = loadModelRegistry(env).registry;
+      } catch (e) {
+        onLoadError(e instanceof Error ? e.message : String(e));
+        cached = createRegistry();
+      }
+    }
+    return cached;
+  };
+  return {
+    register: (entry) => ensure().register(entry),
+    get: (id) => ensure().get(id),
+    has: (id) => ensure().has(id),
+    list: () => ensure().list(),
+  };
+};

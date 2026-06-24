@@ -69,6 +69,7 @@ export type { LoadCatalogResult } from './catalog-io.ts';
 export {
   buildRegistryFromEntries,
   createDefaultRegistry,
+  lazyModelRegistry,
   loadModelRegistry,
 } from './catalog-file.ts';
 export { CANONICAL_MODEL_PROVIDERS } from './seed-catalog.ts';
