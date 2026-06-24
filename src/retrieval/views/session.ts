@@ -179,6 +179,12 @@ export const createSessionView = (deps: SessionViewDeps): ViewSearch => ({
       const messages = listMessagesBySession(deps.db, deps.sessionId);
       for (const msg of messages) {
         messageById.set(msg.id, msg);
+        // Operator un-sent this turn (migration 079): keep it OUT of the
+        // retrieval index so a later retrieve_context query can't surface the
+        // cancelled text back to the model — the same model-facing exclusion the
+        // resume rebuild applies (messagesToProviderMessages). The row stays in
+        // the log; messageById keeps it for parent/projection lookups.
+        if (msg.retractedAt !== null) continue;
         const text = messageText(msg.content);
         const textTokens = tokenize(text);
         const tokens: string[] = [];

@@ -6,7 +6,7 @@ import { createSessionView } from '../../src/retrieval/views/session.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { appendFailureEvent } from '../../src/storage/repos/failure-events.ts';
-import { appendMessage } from '../../src/storage/repos/messages.ts';
+import { appendMessage, retractMessage } from '../../src/storage/repos/messages.ts';
 import { createSession } from '../../src/storage/repos/sessions.ts';
 import { createToolCall, finishToolCall } from '../../src/storage/repos/tool-calls.ts';
 
@@ -92,6 +92,20 @@ describe('createSessionView', () => {
     expect(cands[0]?.view).toBe('session');
     expect(cands[0]?.reason).toContain('user message');
     expect(cands[0]?.bootstrapScore).toBeGreaterThan(0);
+  });
+
+  test('a retracted (un-sent) message is not indexed — never surfaces to retrieve_context', async () => {
+    const msg = appendMessage(db, {
+      sessionId,
+      role: 'user',
+      content: 'how does the auth flow work?',
+    });
+    retractMessage(db, msg.id); // operator un-sent it (migration 079)
+    const view = createSessionView({ db, sessionId });
+    const cands = await view.search(baseQuery);
+    // Matches the query text, but the cancelled turn is excluded from the index,
+    // so it can never be returned to the model — the un-send is durable here too.
+    expect(cands).toEqual([]);
   });
 
   test('user role (3x) outranks assistant role (1x) for the same term', async () => {
