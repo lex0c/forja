@@ -35,7 +35,13 @@ export interface TaskListEntry {
   // recognizes them by `kind` alone and follows up with
   // `task_await(handle_id)` if it wants the full refusal
   // payload.
-  kind?: 'ran' | 'unknown_subagent' | 'depth_exceeded' | 'budget_exhausted' | 'subagent_escalation';
+  kind?:
+    | 'ran'
+    | 'unknown_subagent'
+    | 'depth_exceeded'
+    | 'budget_exhausted'
+    | 'subagent_escalation'
+    | 'playbook_model_unavailable';
   // Present only for `status === 'settled'` AND `kind === 'ran'`.
   // The other settled kinds carry refusal metadata not modeled
   // here; the model resolves those via a follow-up

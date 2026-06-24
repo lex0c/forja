@@ -84,7 +84,7 @@ afterEach(() => {
 
 describe('bootstrap', () => {
   test('builds a config with provider override and a fresh DB', async () => {
-    const { config, db, modelId, policyLayers } = await bootstrap({
+    const { config, db, modelId, policyLayers, registry } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -95,6 +95,10 @@ describe('bootstrap', () => {
     expect(modelId).toBe(DEFAULT_MODEL);
     expect(policyLayers).toEqual([]);
     expect(config.provider).toBe(mockProvider);
+    // PLAYBOOKS.md §1.1: the model catalog is threaded into the config so the
+    // `task` tool's spawn preflight can resolve a playbook's `model` override.
+    // Both spawn paths inherit it via this bootstrap config.
+    expect(config.modelRegistry).toBe(registry);
     expect(config.userPrompt).toBe('hi');
     expect(config.cwd).toBe(workdir);
     // No [sampling].effort in config → bootstrap applies DEFAULT_EFFORT.

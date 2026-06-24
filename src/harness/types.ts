@@ -6,7 +6,13 @@ import type { HookSpec } from '../hooks/index.ts';
 import type { EagerExposure, MemoryRegistry } from '../memory/index.ts';
 import type { OutcomeSink } from '../outcomes/index.ts';
 import type { Decision, PermissionEngine, PolicySource } from '../permissions/index.ts';
-import type { Provider, ProviderEffort, StreamEvent, UsageInfo } from '../providers/index.ts';
+import type {
+  ModelRegistry,
+  Provider,
+  ProviderEffort,
+  StreamEvent,
+  UsageInfo,
+} from '../providers/index.ts';
 import type { ReminderScheduler } from '../reminders/index.ts';
 import type { SkillCatalog } from '../skills/index.ts';
 import type { DB } from '../storage/index.ts';
@@ -968,6 +974,12 @@ export interface HarnessConfig {
   // HarnessConfig directly) and owns its own audit/persistence
   // wiring; the harness just hands it through.
   memoryRegistry?: MemoryRegistry;
+  // Model catalog (PLAYBOOKS.md §1.1). When set, the `task` tool's spawn
+  // preflight resolves a playbook's `model` override against it; absent ⇒
+  // no per-playbook model resolution (children inherit the session
+  // provider). Built once by the CLI bootstrap — the same registry the
+  // REPL `/model` command and the recap renderer read.
+  modelRegistry?: ModelRegistry;
   // Skill catalog (spec SKILLS.md). When set, the harness threads it
   // through ToolContext so skill_invoke / skill_list / skill_show can
   // dispatch, and the catalog's recordEvent writes skill_events audit

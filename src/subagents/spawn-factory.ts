@@ -141,6 +141,13 @@ export interface SpawnChildProcessOptions {
   // already in PROVIDER_API_KEY_VARS) and test mocks. The catalog loader
   // validated it as a well-formed env var name.
   apiKeyEnv?: string;
+  // Every catalog model's custom api_key_env var (the union across the
+  // resolved model registry). Preserved through scrubEnv IN ADDITION to
+  // `apiKeyEnv` so a coordinator child can authenticate a grandchild
+  // playbook's model override whose credential var is neither built-in nor
+  // this child's own. Empty/omitted when no registry is wired (leaf flows,
+  // tests).
+  catalogApiKeyEnvVars?: string[];
   // Open the live IPC channel between parent and child. When
   // true, the spawn factory MUST set `stdin: 'pipe'` and
   // `stdout: 'pipe'` (subprocess can't write the channel if
@@ -338,13 +345,21 @@ export const drainStderrToLogFile = (
 export const buildSubagentChildEnv = (
   env: NodeJS.ProcessEnv,
   apiKeyEnv?: string,
-): Record<string, string> =>
-  scrubEnv(env, {
-    keep:
-      apiKeyEnv !== undefined && !PROVIDER_API_KEY_VARS.includes(apiKeyEnv)
-        ? [...PROVIDER_API_KEY_VARS, apiKeyEnv]
-        : PROVIDER_API_KEY_VARS,
-  });
+  catalogApiKeyEnvVars: readonly string[] = [],
+): Record<string, string> => {
+  // Custom (non-built-in) credential vars to preserve on top of the built-in
+  // PROVIDER_API_KEY_VARS: the child's OWN model var (apiKeyEnv) PLUS every
+  // catalog model's var (catalogApiKeyEnvVars). The latter is load-bearing for
+  // nested spawns — a coordinator child resolves a grandchild playbook's model
+  // override, whose custom var would otherwise have been scrubbed at THIS
+  // boundary and be gone before the grandchild's factory reads it. These are
+  // model credentials (same class as the built-ins already kept for every
+  // child), so preserving the catalog set leaks no wider than today's posture.
+  const custom = [apiKeyEnv, ...catalogApiKeyEnvVars].filter(
+    (v): v is string => v !== undefined && !PROVIDER_API_KEY_VARS.includes(v),
+  );
+  return scrubEnv(env, { keep: [...PROVIDER_API_KEY_VARS, ...new Set(custom)] });
+};
 
 export const defaultSpawnChildProcess: SpawnChildProcess = (opts) => {
   // Internal flags appended in fixed order. `--subagent-temperature`
@@ -421,7 +436,7 @@ export const defaultSpawnChildProcess: SpawnChildProcess = (opts) => {
     // A custom catalog model carries its key in a non-built-in var
     // (opts.apiKeyEnv); `buildSubagentChildEnv` keeps THAT too so the child
     // rebuilding from the snapshot can authenticate.
-    env: buildSubagentChildEnv(process.env, opts.apiKeyEnv),
+    env: buildSubagentChildEnv(process.env, opts.apiKeyEnv, opts.catalogApiKeyEnvVars),
     ...(opts.ipc === true ? { stdin: 'pipe', stdout: 'pipe' } : { stdout: 'ignore' }),
     stderr: 'pipe',
   });

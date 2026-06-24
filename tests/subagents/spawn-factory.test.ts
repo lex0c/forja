@@ -33,4 +33,31 @@ describe('buildSubagentChildEnv', () => {
     const out = buildSubagentChildEnv({ ANTHROPIC_API_KEY: 'sk-ant' }, 'ANTHROPIC_API_KEY');
     expect(out.ANTHROPIC_API_KEY).toBe('sk-ant');
   });
+
+  test('preserves catalog credential vars for grandchild model overrides', () => {
+    // The child's OWN model uses VENDOR_A_KEY; a grandchild playbook may
+    // override to a model whose custom key is GRANDCHILD_KEY. Both must survive
+    // this boundary so a coordinator child can authenticate the grandchild
+    // model — otherwise GRANDCHILD_KEY is scrubbed here and gone before the
+    // nested factory reads it. An unrelated credential-shaped var still strips.
+    const env = {
+      VENDOR_A_KEY: 'sk-a',
+      GRANDCHILD_KEY: 'sk-gc',
+      UNRELATED_SECRET: 'sk-x',
+      PATH: '/usr/bin',
+    };
+    const out = buildSubagentChildEnv(env, 'VENDOR_A_KEY', ['VENDOR_A_KEY', 'GRANDCHILD_KEY']);
+    expect(out.VENDOR_A_KEY).toBe('sk-a');
+    expect(out.GRANDCHILD_KEY).toBe('sk-gc');
+    expect(out.UNRELATED_SECRET).toBeUndefined();
+    expect(out.PATH).toBe('/usr/bin');
+  });
+
+  test('catalog vars are preserved even with no own apiKeyEnv', () => {
+    const out = buildSubagentChildEnv({ GRANDCHILD_KEY: 'sk-gc', OTHER_SECRET: 'x' }, undefined, [
+      'GRANDCHILD_KEY',
+    ]);
+    expect(out.GRANDCHILD_KEY).toBe('sk-gc');
+    expect(out.OTHER_SECRET).toBeUndefined();
+  });
 });

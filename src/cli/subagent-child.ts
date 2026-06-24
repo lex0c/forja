@@ -30,6 +30,7 @@ import {
   type ProviderEffort,
   buildRegistryFromEntries,
   isSupportedFamily,
+  lazyModelRegistry,
   loadModelRegistry,
 } from '../providers/index.ts';
 import type { SystemSegment } from '../providers/types.ts';
@@ -1169,6 +1170,25 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       hookChain = resolvedHooks.hooks;
     }
 
+    // Nested playbook `model` override (PLAYBOOKS.md §1.1): a grandchild
+    // playbook may declare its own model, which this child's spawn preflight
+    // (loop.ts spawnSubagentImpl) resolves against the catalog. Only a child
+    // that can spawn (task in its whitelist → `subagents` loaded) needs it; a
+    // leaf subagent skips it. LAZY + degrade-on-failure: the catalog is read on
+    // first use, not at boot, so catalog drift between the parent's bootstrap
+    // and this child's start refuses only the affected nested override instead
+    // of crashing the whole coordinator (and plain nested chains that never
+    // declare a grandchild model boot unaffected). The single-entry snapshot
+    // used for THIS child's own provider can't resolve an arbitrary grandchild
+    // model id, so the full catalog is still what's deferred here.
+    const grandchildModelRegistry =
+      subagents !== undefined
+        ? lazyModelRegistry((msg) =>
+            errSink(
+              `forja: subagent-child: model catalog unreadable for nested overrides (${msg}); nested model overrides will be refused\n`,
+            ),
+          )
+        : undefined;
     const config = {
       provider,
       // Subagents are non-interactive: no operator watches their
@@ -1251,6 +1271,9 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // The whitelist build already excluded `task` in that
       // case, so the ctx never reaches the closure regardless.
       ...(subagents !== undefined ? { subagentRegistry: subagents } : {}),
+      // Catalog for the nested spawn preflight (resolves a grandchild
+      // playbook's `model` override). Same gate as subagentRegistry.
+      ...(grandchildModelRegistry !== undefined ? { modelRegistry: grandchildModelRegistry } : {}),
       // Recursion depth carried across the subprocess boundary
       // by the parent's `runSubagent` (via `--subagent-depth`
       // CLI flag, threaded into `opts.depth` here). Without

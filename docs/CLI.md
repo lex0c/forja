@@ -249,6 +249,36 @@ slash alias in the REPL.
 The bundled files are editable after `init` — tune tools/budget or add your own
 (see `docs/spec/PLAYBOOKS.md`).
 
+### Running a playbook on a specific model
+
+By default a playbook's subagent runs on the **session model** (whatever the
+parent run uses). To pin a playbook to a different model, add a `model` line to
+its frontmatter — a catalog id, the same form `--model` accepts:
+
+```yaml
+---
+name: code-review
+description: Reviews changes and reports findings.
+model: anthropic/claude-opus-4-8   # omit to inherit the session model
+tools: [read_file, grep, glob, git]
+budget:
+  max_steps: 45
+  max_cost_usd: 2.50
+---
+```
+
+- The id must exist in your model catalog (`forja init` seeds it; `--model`
+  reads the same list). Cross-provider is fine — e.g. an Anthropic session can
+  route `code-review` to `openai/gpt-4o`, as long as that provider's credential
+  (its `api_key_env`) is set.
+- Resolution is **fail-soft**: an unknown id or an uninstantiable provider
+  (missing credential) refuses the spawn with a clear
+  `subagent.playbook_model_unavailable` error before any work runs — it never
+  silently falls back to another model.
+- It is a **static, per-playbook** choice, not orchestration: no dynamic model
+  selection or routing. The child records its own model on its session, so
+  `--list-sessions --include-subagents` shows which model actually ran.
+
 ### Built-in subagents
 
 Internal to the memory-governance substrate — not operator-invocable; they run

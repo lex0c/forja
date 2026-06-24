@@ -220,6 +220,12 @@ export interface SubagentDefinition {
   //   - `phases` (deferred, runtime needs goal_stack) — validated
   //                                       at load so authors can
   //                                       declare the intent today.
+  // Execution model override (`PLAYBOOKS.md` §1.1). A catalog model id
+  // (e.g. `anthropic/claude-opus-4-8`); absence ⇒ inherit the session
+  // model (current behavior). The loader validates shape only — catalog
+  // existence + provider instantiation are checked at spawn preflight,
+  // where the model registry is available.
+  model?: string;
   outputSchema?: Record<string, unknown>;
   references?: string[];
   toolRestrictions?: ToolRestrictions;
