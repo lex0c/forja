@@ -148,6 +148,18 @@ export const parseMetrics = (
   };
 };
 
+// `docker run` for the agent container can fail BEFORE the entrypoint runs — a daemon outage, a bad
+// mount, a missing/corrupt image, an OCI startup error. No .agent_error is written (the entrypoint never
+// ran) and it isn't a timeout, yet the exit is non-success. That is INFRASTRUCTURE noise, not a model
+// attempt: the caller folds it into `agentError` so the task scores `error` (skipping restore + verify),
+// never a 0-step model "failure" that would pollute the corpus. `wroteError` = the entrypoint left
+// /task/.agent_error (a forja crash — already a harness error the caller handles on its own).
+export const agentRunIsInfraFailure = (o: {
+  success: boolean;
+  timedOut: boolean;
+  wroteError: boolean;
+}): boolean => !o.success && !o.timedOut && !o.wroteError;
+
 export interface ScoreInput {
   oracle: number | undefined;
   p2p: number | undefined;

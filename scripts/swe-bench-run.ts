@@ -29,6 +29,7 @@ import {
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import {
+  agentRunIsInfraFailure,
   allowHostsFor,
   apiKeyEnvsFor,
   loadCatalogEntries,
@@ -414,10 +415,25 @@ const runTaskInner = (model: string, t: Task, logDir: string, work: string): Row
   // provider error — unresolvable model, unset api_key_env, mid-loop crash). That is a HARNESS error,
   // not a model attempt: skip restore + verify and score it `error`, never a 0-step task "failure".
   const agentErrorFile = join(work, '.agent_error');
-  const agentError = existsSync(agentErrorFile);
-  if (agentError) {
+  const agentWroteError = existsSync(agentErrorFile);
+  // `docker run` itself can fail BEFORE the entrypoint runs (daemon down, mount / image / startup error),
+  // so no .agent_error is ever written. A non-success exit that is neither a timeout nor an
+  // entrypoint-written error is an INFRASTRUCTURE failure, not a model attempt — fold it into the
+  // harness-error path so it skips restore + verify and scores `error`, never a 0-step "model failure"
+  // that would pollute the corpus with infra noise.
+  const dockerFailed = agentRunIsInfraFailure({
+    success: agentRun.success,
+    timedOut: agentTimedOut,
+    wroteError: agentWroteError,
+  });
+  const agentError = agentWroteError || dockerFailed;
+  if (agentWroteError) {
     process.stderr.write(
       `swe-bench-run: ${t.id} — forja exited abnormally (code ${readFileSync(agentErrorFile, 'utf8').trim()}) before a normal finish; scoring HARNESS ERROR, not a model failure. If this repeats the config is broken (unset key / bad model id) — abort and fix.\n`,
+    );
+  } else if (dockerFailed) {
+    process.stderr.write(
+      `swe-bench-run: ${t.id} — the agent container failed to run (docker / daemon / mount / image / startup error); no agent attempt happened. Scoring HARNESS ERROR, not a model failure — abort and fix the environment if this repeats.\n`,
     );
   }
 

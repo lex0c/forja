@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   type CatalogEntry,
+  agentRunIsInfraFailure,
   allowHostsFor,
   apiKeyEnvsFor,
   loadCatalogEntries,
@@ -65,6 +66,25 @@ describe('scoreResult', () => {
       regressed: false,
       status: 'error',
     });
+  });
+});
+
+describe('agentRunIsInfraFailure', () => {
+  const f = (success: boolean, timedOut: boolean, wroteError: boolean) =>
+    agentRunIsInfraFailure({ success, timedOut, wroteError });
+  // The forwarded bug: `docker run` dies before the entrypoint (daemon / mount / image / startup) — no
+  // .agent_error, no timeout, just a non-success exit. Must read as INFRA, not a 0-step model attempt.
+  test('docker run failed, no timeout, no .agent_error → infra failure', () => {
+    expect(f(false, false, false)).toBe(true);
+  });
+  test('a normal success is not infra', () => {
+    expect(f(true, false, false)).toBe(false);
+  });
+  test('a timeout is owned by the timeout path, not infra', () => {
+    expect(f(false, true, false)).toBe(false);
+  });
+  test('an entrypoint-written .agent_error is owned by the agentError path, not infra', () => {
+    expect(f(false, false, true)).toBe(false);
   });
 });
 
