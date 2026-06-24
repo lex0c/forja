@@ -148,6 +148,7 @@ export const buildRegistryFromEntries = (
       family: entry.family,
       modelName: entry.model_name,
       capabilities: entry.capabilities,
+      ...(entry.api_key_env !== undefined ? { apiKeyEnv: entry.api_key_env } : {}),
       factory: entryToFactory(entry),
     });
   }

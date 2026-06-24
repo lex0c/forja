@@ -310,6 +310,71 @@ describe('task_async / task_await — full e2e through harness loop and real chi
     expect(childModels.every((r) => r.model === PLAYBOOK_MODEL)).toBe(true);
   });
 
+  // Spawn `wrk` (with the given whitelist) and capture the catalog credential
+  // vars the harness forwarded for it — WITHOUT running the child (the gate
+  // decides opts.catalogApiKeyEnvVars before spawnChildProcess is called, and
+  // skipping the child keeps the test off the loadModelRegistry path).
+  const captureSpawnCatalogVars = async (
+    playbookTools: string[],
+  ): Promise<string[] | undefined> => {
+    const registry = createRegistry();
+    registry.register({
+      id: 'vendor/model',
+      family: 'anthropic',
+      modelName: 'm',
+      capabilities: buildChildProvider('').capabilities,
+      apiKeyEnv: 'VLLM_KEY',
+      factory: () => buildChildProvider(''),
+    });
+    const parent = buildParentProvider([
+      {
+        tool_uses: [
+          { id: 'tu1', name: 'task', input: { subagent: 'wrk', prompt: 'go', capabilities: [] } },
+        ],
+        stop_reason: 'tool_use',
+      },
+      { text: 'done', stop_reason: 'end_turn' },
+    ]);
+    const parentRegistry = createToolRegistry();
+    registerBuiltinTools(parentRegistry);
+    const engine = createPermissionEngine(policy(), { cwd: '/p' });
+    const subagentRegistry: SubagentSet = {
+      byName: new Map([['wrk', definition({ name: 'wrk', tools: playbookTools })]]),
+      shadows: [],
+    };
+    let captured: string[] | undefined;
+    const spawn: SpawnChildProcess = (opts) => {
+      captured = opts.catalogApiKeyEnvVars;
+      return {
+        exited: Promise.resolve({ exitCode: 0 }),
+        kill: () => undefined,
+        ipc: createChannel(fakeTransportPair().a),
+      };
+    };
+    const result = await runAgent({
+      provider: parent,
+      toolRegistry: parentRegistry,
+      permissionEngine: engine,
+      db,
+      cwd: '/p',
+      userPrompt: 'go',
+      subagentRegistry,
+      modelRegistry: registry,
+      spawnChildProcess: spawn,
+    });
+    expect(result.status).toBe('done');
+    return captured;
+  };
+
+  test('forwards catalog credential vars only to a spawn-capable child (gate) — PLAYBOOKS.md §1.1', async () => {
+    // Coordinator (task whitelisted) → gets every catalog model's custom
+    // credential var so it can authenticate a grandchild's model override.
+    expect(await captureSpawnCatalogVars(['task'])).toContain('VLLM_KEY');
+    // Leaf (no spawn tool) → gated out; carries no other-model credentials.
+    const leafVars = await captureSpawnCatalogVars([]);
+    expect(leafVars === undefined || leafVars.length === 0).toBe(true);
+  });
+
   test('three task_async spawns + three task_await collect; children run in parallel', async () => {
     // The parent's tool_use script:
     //   step 1: emit three task_async calls in one turn

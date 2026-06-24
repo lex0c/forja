@@ -235,6 +235,11 @@ export interface RunSubagentInput {
   // subprocess via `--subagent-effort`). Operational caps are NOT
   // forwarded — those stay per-playbook.
   providerEffort?: ProviderEffort;
+  // Every catalog model's custom api_key_env var (from the parent's resolved
+  // model registry). Forwarded so the child's env preserves them through
+  // scrubEnv — needed when this child can spawn a grandchild whose playbook
+  // declares a model override with a custom credential var (PLAYBOOKS.md §1.1).
+  catalogApiKeyEnvVars?: string[];
   subagentRegistry?: SubagentSet;
   // Trust verdict from the parent's bootstrap (spec §9). Forwarded
   // via `--subagent-cwd-trusted` to the child process so the
@@ -783,6 +788,9 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       // families already ride PROVIDER_API_KEY_VARS.
       ...(input.provider.catalogEntry?.api_key_env !== undefined
         ? { apiKeyEnv: input.provider.catalogEntry.api_key_env }
+        : {}),
+      ...(input.catalogApiKeyEnvVars !== undefined && input.catalogApiKeyEnvVars.length > 0
+        ? { catalogApiKeyEnvVars: input.catalogApiKeyEnvVars }
         : {}),
       ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
       ...(input.providerEffort !== undefined ? { providerEffort: input.providerEffort } : {}),

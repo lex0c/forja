@@ -2094,11 +2094,33 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // `effort`). Transitive: a child that is itself a parent
           // forwards its own resolved value on the next hop.
           const childProviderEffort = resolveProviderEffort(config);
+          // Custom credential env vars for every catalog model, forwarded so the
+          // child preserves them through scrubEnv (PLAYBOOKS.md §1.1). A child
+          // resolving a grandchild's `model` override needs that model's
+          // credential var to have survived this boundary — its own apiKeyEnv
+          // isn't enough. Gated to a child that can SPAWN: only then are those
+          // OTHER-model credentials reachable. The gate mirrors the subagent-
+          // child spawn gate (`toolsWhitelist.includes('task')`), so a leaf
+          // carries no catalog credentials it cannot use (env-credential
+          // minimization — the creds never reach tools, but tighter is better).
+          const childCanSpawn = def.tools.includes('task');
+          const catalogApiKeyEnvVars =
+            childCanSpawn && config.modelRegistry !== undefined
+              ? [
+                  ...new Set(
+                    config.modelRegistry
+                      .list()
+                      .map((e) => e.apiKeyEnv)
+                      .filter((v): v is string => v !== undefined),
+                  ),
+                ]
+              : [];
           const child = await runSubagent({
             definition: def,
             prompt: args.prompt,
             parentSessionId: sessionId,
             provider: childProvider,
+            ...(catalogApiKeyEnvVars.length > 0 ? { catalogApiKeyEnvVars } : {}),
             parentToolRegistry: rootRegistry,
             permissionEngine: config.permissionEngine,
             db: config.db,
