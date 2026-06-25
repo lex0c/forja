@@ -1,5 +1,4 @@
 import { computeCost, emptyUsage } from '../providers/cost.ts';
-import { estimatePromptTokens } from '../providers/tokens.ts';
 import type {
   GenerateRequest,
   Provider,
@@ -7,6 +6,7 @@ import type {
   ProviderMessage,
   UsageInfo,
 } from '../providers/index.ts';
+import { estimatePromptTokens } from '../providers/tokens.ts';
 import { stripAnsi } from '../sanitize/index.ts';
 import type { DB } from '../storage/db.ts';
 import {
