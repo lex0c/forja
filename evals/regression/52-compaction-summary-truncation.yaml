@@ -1,0 +1,41 @@
+name: compaction survives a truncated summary without losing the task
+evaluates: harness
+# Forces the compaction summary to TRUNCATE by capping its max_tokens: a read-heavy
+# task trips compaction (threshold 0.02), and the structured summary is cut off
+# before its close marker. The run must still succeed — the original goal is
+# re-injected verbatim (independent of the summary), and the section order
+# (GOAL -> PENDING -> ERRORS first) keeps the forward-looking context ahead of the
+# cut. Pins the truncation path: a truncated summary is ACCEPTED (strategy stays
+# `llm`, not failed into a worse deterministic elision) and the task completes.
+# compaction.ts additionally flags the truncation on the compaction_events row
+# (stop_reason=max_tokens), inspected out of band.
+prompt: |
+  IMPORTANT INSTRUCTION — must be honored in your FINAL message: prefix your
+  final answer with the literal token `MARKER_52_SURVIVED` on its own line.
+
+  Now: read every TypeScript file under src/ in alphabetical order
+  (a.ts, b.ts, c.ts, d.ts, e.ts) and report the dependency name they all import
+  from, quoted verbatim. The reads are extensive — compaction will fire, and its
+  summary is capped small enough to truncate — yet goal re-injection must keep
+  this instruction alive.
+setup:
+  fixture: ../fixtures/chunky-modules
+expect:
+  - tool_called: read_file
+  - compaction_triggered:
+      strategy: llm
+      min_count: 1
+  - output_contains: MARKER_52_SURVIVED
+  - output_contains: forja-core
+  - status: done
+budget:
+  maxSteps: 12
+  maxCostUsd: 0.15
+  compactionThreshold: 0.02
+  compactionPreserveTail: 1
+  # Pin the pure-LLM path so the summary call (and its truncation) actually happens.
+  compactionRelevance: false
+  # Force truncation: too small to fit the full structured block, large enough that
+  # the emitted prefix is substantive (not an empty/markers-only body that would
+  # fall back to deterministic elision and change the strategy off `llm`).
+  compactionMaxTokens: 96

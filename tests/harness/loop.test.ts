@@ -5,6 +5,7 @@ import { runAgent } from '../../src/harness/loop.ts';
 import { createPermissionEngine } from '../../src/permissions/index.ts';
 import type { Policy } from '../../src/permissions/index.ts';
 import type { GenerateRequest, Provider, StreamEvent } from '../../src/providers/index.ts';
+import { estimateMessagesTokens } from '../../src/providers/tokens.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { createPin } from '../../src/storage/repos/context-pins.ts';
@@ -94,7 +95,7 @@ const mockProvider = (
       for (const ev of replayStep(step)) yield ev;
     },
     generateConstrained: () => Promise.reject(new Error('not implemented')),
-    countTokens: () => Promise.resolve(0),
+    countTokens: (m) => Promise.resolve(estimateMessagesTokens(m)),
   };
   return { provider, requests };
 };
@@ -1733,7 +1734,7 @@ describe('runAgent', () => {
         yield { kind: 'stop', reason: 'end_turn' };
       },
       generateConstrained: () => Promise.reject(new Error('n/a')),
-      countTokens: () => Promise.resolve(0),
+      countTokens: (m) => Promise.resolve(estimateMessagesTokens(m)),
     };
     const result = await runAgent({
       provider,
@@ -1779,7 +1780,7 @@ describe('runAgent', () => {
         yield { kind: 'stop', reason: 'end_turn' };
       },
       generateConstrained: () => Promise.reject(new Error('n/a')),
-      countTokens: () => Promise.resolve(0),
+      countTokens: (m) => Promise.resolve(estimateMessagesTokens(m)),
     };
     const result = await runAgent({
       provider,
@@ -1827,7 +1828,7 @@ describe('runAgent', () => {
         yield { kind: 'stop', reason: 'tool_use' };
       },
       generateConstrained: () => Promise.reject(new Error('n/a')),
-      countTokens: () => Promise.resolve(0),
+      countTokens: (m) => Promise.resolve(estimateMessagesTokens(m)),
     };
     const result = await runAgent({
       provider,
@@ -1871,7 +1872,7 @@ describe('runAgent', () => {
         yield { kind: 'stop', reason: 'end_turn' };
       },
       generateConstrained: () => Promise.reject(new Error('n/a')),
-      countTokens: () => Promise.resolve(0),
+      countTokens: (m) => Promise.resolve(estimateMessagesTokens(m)),
     };
     const result = await runAgent({
       provider,
@@ -1912,7 +1913,7 @@ describe('runAgent', () => {
         throw e;
       },
       generateConstrained: () => Promise.reject(new Error('n/a')),
-      countTokens: () => Promise.resolve(0),
+      countTokens: (m) => Promise.resolve(estimateMessagesTokens(m)),
     };
     const registry = createToolRegistry();
     const result = await runAgent({
@@ -1979,7 +1980,7 @@ describe('runAgent', () => {
         throw new Error('network blew up');
       },
       generateConstrained: () => Promise.reject(new Error('n/a')),
-      countTokens: () => Promise.resolve(0),
+      countTokens: (m) => Promise.resolve(estimateMessagesTokens(m)),
     };
     const registry = createToolRegistry();
     const result = await runAgent({
@@ -2475,7 +2476,7 @@ describe('runAgent', () => {
         throw new Error('connection reset');
       },
       generateConstrained: () => Promise.reject(new Error('n/a')),
-      countTokens: () => Promise.resolve(0),
+      countTokens: (m) => Promise.resolve(estimateMessagesTokens(m)),
     };
     const result = await runAgent({
       provider: partialProvider,
@@ -2518,7 +2519,7 @@ describe('runAgent', () => {
         throw new Error('upstream gone');
       },
       generateConstrained: () => Promise.reject(new Error('n/a')),
-      countTokens: () => Promise.resolve(0),
+      countTokens: (m) => Promise.resolve(estimateMessagesTokens(m)),
     };
     const result = await runAgent({
       provider: noUsageProvider,

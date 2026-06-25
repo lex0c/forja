@@ -78,6 +78,7 @@ import {
   compactionTriggerTokens,
   hashContext,
   recordCompactionEvent,
+  refineCompactionTrigger,
   relevanceVerbatimBudgetBytes,
 } from './compaction.ts';
 import { resolveProviderEffort } from './effort.ts';
@@ -2584,13 +2585,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         ) {
           return null;
         }
-        const promptTokens = estimatePromptTokens([...ctx.getMessages()], {
+        const estimateOpts = {
           ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
           // force ⇒ the tool-less synthesis request; don't count tool schemas the
           // synthesis won't send (else a tool-less-fitting history compacts needlessly).
           ...(!force && tools.length > 0 ? { tools } : {}),
           countReasoning: config.provider.replaysReasoning === true,
-        });
+        };
+        const promptTokens = estimatePromptTokens([...ctx.getMessages()], estimateOpts);
         const contextWindow = config.provider.capabilities.context_window;
         const triggerAt = compactionTriggerTokens(budget.compactionThreshold, contextWindow);
         // Need goal + something-to-fold + an assistant boundary for the tail;
@@ -2598,6 +2600,24 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         if (!(promptTokens > triggerAt && ctx.length >= budget.compactionPreserveTail + 3)) {
           return null;
         }
+        // Trigger refinement (#3 / CONTEXT_TUNING §12): the chars/4 estimate
+        // over-counts ~10-25% vs a real tokenizer, so a near-trigger estimate may
+        // be a false alarm. Confirm with the provider's real token count (the
+        // fixed system/tools part stays an estimate — small + stable) before
+        // paying for a compaction; 'skip' only when the real total is genuinely
+        // under the trigger (which still leaves 30% window headroom), so it can
+        // never relax into an over-window send. A near-threshold round-trip that
+        // averts a billed summary is a good trade.
+        // Pin the guard-narrowed ctx so the async closure doesn't re-widen it to
+        // `| undefined` across the await (ctxRef below isn't defined yet).
+        const ctxForCount = ctx;
+        const refine = await refineCompactionTrigger({
+          promptTokens,
+          triggerAt,
+          fixedTokens: estimatePromptTokens([], estimateOpts),
+          countMessages: () => config.provider.countTokens([...ctxForCount.getMessages()]),
+        });
+        if (refine === 'skip') return null;
         // PreCompact hook (blocking, spec §10.1) — fired before the
         // compaction_started event so a refusing hook skips both the LLM call
         // and the renderer's "compacting…" signal. Blocked ⇒ no compaction
@@ -2692,9 +2712,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         if (budget.compactionRelevance === true && config.memoryRegistry !== undefined) {
           // Verbatim budget derived from the trigger (shared helper, not a
           // magic constant) — see relevanceVerbatimBudgetBytes.
+          // Blend the model's live working-state focus into the relevance query
+          // so it tracks the CURRENT sub-task, not just the original goal
+          // (which drifts on a long session). Absent panel ⇒ goal-only.
+          const wsFocus = workingStateStore.get(sessionId).focus?.text;
           const elide = ctx.relevanceElide({
             verbatimBudgetBytes: relevanceVerbatimBudgetBytes(triggerAt),
             preserveTail: budget.compactionPreserveTail,
+            ...(wsFocus !== undefined && wsFocus.length > 0 ? { queryHint: wsFocus } : {}),
           });
           if (elide !== null && elide.elidedCount > 0) {
             relevanceAudit = {
@@ -2746,6 +2771,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         const compaction = await ctx.compact(config.provider, {
           preserveTail: budget.compactionPreserveTail,
           signal,
+          ...(budget.compactionMaxTokens !== undefined
+            ? { maxTokens: budget.compactionMaxTokens }
+            : {}),
           ...(pinnedBlock !== undefined ? { pinnedBlock } : {}),
         });
         const acct = accountCompaction(compaction, config.provider.capabilities);

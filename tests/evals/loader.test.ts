@@ -239,6 +239,29 @@ budget:
     expect(() => parseEvalCase(yaml, '/tmp/c.yaml')).toThrow(/maxSteps must be a positive integer/);
   });
 
+  test('parses compactionMaxTokens and rejects a non-positive / non-integer value', () => {
+    const ok = `
+name: x
+prompt: y
+expect:
+  - status: done
+budget:
+  compactionMaxTokens: 96
+`;
+    expect(parseEvalCase(ok, '/tmp/c.yaml').budget?.compactionMaxTokens).toBe(96);
+    const bad = `
+name: x
+prompt: y
+expect:
+  - status: done
+budget:
+  compactionMaxTokens: 0
+`;
+    expect(() => parseEvalCase(bad, '/tmp/c.yaml')).toThrow(
+      /compactionMaxTokens must be a positive integer/,
+    );
+  });
+
   test('parses budget and setup', () => {
     const yaml = `
 name: x

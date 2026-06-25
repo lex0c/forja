@@ -3,6 +3,7 @@ import {
   type CompactionResult,
   accountCompaction,
   compactMessages,
+  refineCompactionTrigger,
 } from '../../src/harness/compaction.ts';
 import type {
   GenerateRequest,
@@ -289,6 +290,31 @@ describe('compactMessages — LLM path', () => {
       // phrase so a softening rewrite doesn't lose the hint.
       expect(system).toContain('file:line');
     });
+  });
+
+  test('flags truncation when the summary hits the output cap (stop_reason=max_tokens)', async () => {
+    // A large middle can push the structured summary past max_tokens; the block
+    // gets cut off. The LLM strategy is still taken (a truncated summary beats
+    // losing the middle to elision), but `reason` surfaces the truncation so it
+    // is observable in the audit instead of silently dropping PENDING/ERRORS.
+    const truncatedReply = function* (): Iterable<StreamEvent> {
+      yield { kind: 'start', message_id: 'm' };
+      yield { kind: 'text_delta', text: '[compacted_history]\nGOAL: x\nPENDING: keep going' };
+      yield { kind: 'stop', reason: 'max_tokens' };
+    };
+    const handle = mockProvider(() => truncatedReply());
+    const result = await compactMessages(handle.provider, buildHistory(5), { preserveTail: 3 });
+    expect(result.strategy).toBe('llm');
+    expect(result.reason?.toLowerCase()).toContain('truncat');
+  });
+
+  test('a normal (end_turn) summary carries no truncation reason', async () => {
+    const handle = mockProvider(() =>
+      replyText('[compacted_history]\nGOAL: x\nPENDING: y\n[/compacted_history]'),
+    );
+    const result = await compactMessages(handle.provider, buildHistory(5), { preserveTail: 3 });
+    expect(result.strategy).toBe('llm');
+    expect(result.reason).toBeUndefined();
   });
 
   test('skips when history is shorter than goal + tail', async () => {
@@ -788,5 +814,57 @@ describe('compactMessages — summary exposure (for compaction_events audit)', (
     expect(result.strategy).toBe('llm');
     // The non-deterministic summary the loop persists to compaction_events.
     expect(result.summary).toContain('GOAL: keep going');
+  });
+});
+
+describe('refineCompactionTrigger', () => {
+  // triggerAt=1000, over-count margin ≈1.34 → confident-over boundary ≈1340.
+  const triggerAt = 1000;
+
+  test('confidently over the trigger → compact without a token-count round-trip', async () => {
+    let called = false;
+    const decision = await refineCompactionTrigger({
+      promptTokens: 1400, // > 1000 × 1.34
+      triggerAt,
+      fixedTokens: 100,
+      countMessages: async () => {
+        called = true;
+        return 0;
+      },
+    });
+    expect(decision).toBe('compact');
+    expect(called).toBe(false); // no round-trip when the estimate is confidently over
+  });
+
+  test('in the over-count band with a real count under trigger → skip (false alarm)', async () => {
+    const decision = await refineCompactionTrigger({
+      promptTokens: 1100, // inside the 1000..1340 band
+      triggerAt,
+      fixedTokens: 100,
+      countMessages: async () => 850, // 850 + 100 = 950 ≤ 1000 → genuinely under
+    });
+    expect(decision).toBe('skip');
+  });
+
+  test('in the band but the real count is still over → compact', async () => {
+    const decision = await refineCompactionTrigger({
+      promptTokens: 1100,
+      triggerAt,
+      fixedTokens: 100,
+      countMessages: async () => 950, // 950 + 100 = 1050 > 1000
+    });
+    expect(decision).toBe('compact');
+  });
+
+  test('a countMessages throw falls back to compact (never breaks the run)', async () => {
+    const decision = await refineCompactionTrigger({
+      promptTokens: 1100,
+      triggerAt,
+      fixedTokens: 100,
+      countMessages: async () => {
+        throw new Error('countTokens network error');
+      },
+    });
+    expect(decision).toBe('compact');
   });
 });

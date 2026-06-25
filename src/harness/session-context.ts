@@ -323,6 +323,14 @@ export class SessionContext {
   relevanceElide(opts: {
     verbatimBudgetBytes: number;
     preserveTail: number;
+    // Extra text blended into the BM25 query (the model's CURRENT focus, e.g.
+    // the working-state `focus`). The original goal (messages[0]) anchors the
+    // overall task, but on a long evolving session the active sub-task drifts
+    // from it; scoring against goal ALONE keeps tool_results relevant to the old
+    // ask and can elide ones relevant to what the model is doing NOW. Blending
+    // the live focus steers relevance toward the current direction. Optional —
+    // absent (no working-state focus) degrades to goal-only (prior behavior).
+    queryHint?: string;
   }): RelevanceElideResult | null {
     const safeTail = Math.max(0, opts.preserveTail);
     if (this.messages.length < safeTail + 2) return null;
@@ -335,8 +343,12 @@ export class SessionContext {
     if (tailStart === null) return null;
     const middle = this.messages.slice(1, tailStart);
     if (middle.length === 0) return null;
+    const query =
+      opts.queryHint !== undefined && opts.queryHint.length > 0
+        ? `${goalText(goal)}\n${opts.queryHint}`
+        : goalText(goal);
     const result = relevanceElideMiddle(middle, {
-      goalText: goalText(goal),
+      goalText: query,
       verbatimBudgetBytes: opts.verbatimBudgetBytes,
     });
     if (result.elidedCount > 0) {

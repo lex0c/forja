@@ -514,6 +514,14 @@ export interface RunBudget {
   // pure-LLM path). Optional because it is a feature flag —
   // absent ⇒ inherits the DEFAULT_BUDGET value (on).
   compactionRelevance?: boolean;
+  // Override for the compaction LLM summary's `max_tokens`
+  // (`CompactionOptions.maxTokens`). Absent ⇒ compaction.ts's 1024 default. Raise
+  // it for a session whose middle is so dense the structured summary truncates at
+  // the cap — the section order keeps GOAL/PENDING/ERRORS ahead of a cut, but a
+  // higher cap avoids the cut entirely; lower it in an eval to exercise the
+  // truncation path deterministically. Optional feature-flag shape (no
+  // DEFAULT_BUDGET entry) so absent inherits the module default, not a fixed value.
+  compactionMaxTokens?: number;
   // Hard cap on total spend for this run, in USD. AGENTIC_CLI.md §5
   // declares a default of 5 — cost is the engagement gate; step
   // count (`maxSteps`) is the runaway-loop backstop. Three states:

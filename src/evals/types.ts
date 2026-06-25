@@ -117,6 +117,11 @@ export interface EvalBudget {
   // mirroring DEFAULT_BUDGET). Lets the eval measure relevance ON vs OFF on
   // the same scenario by pinning `false`.
   compactionRelevance?: boolean;
+  // Override the compaction summary's max_tokens. A small value (e.g. 48) forces
+  // the structured summary to truncate, exercising the truncation path
+  // deterministically; the run must still succeed (goal re-injection + the
+  // GOAL/PENDING-first section order keep the thread).
+  compactionMaxTokens?: number;
 }
 
 export interface EvalCase {

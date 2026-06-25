@@ -152,6 +152,15 @@ const SUMMARY_MARKER_CLOSE = '[/compacted_history]';
 // structurally adequate and the section count hits a usability
 // floor where adding more granularity costs more attention than
 // it saves.
+//
+// Section ORDER is load-bearing: GOAL → PENDING → ERRORS lead, the recoverable
+// sections (FILES_TOUCHED, REJECTED) trail. A summary that hits the output cap
+// (`max_tokens` — `CompactionOptions.maxTokens`, default 1024, overridable via
+// the `compactionMaxTokens` budget) truncates from the END, so the forward-
+// looking context the next turn needs most survives while the cheap-to-rederive
+// tail is sacrificed.
+// `compactMessages` additionally flags such a truncation (stop_reason='max_tokens')
+// on the result's `reason` so it is observable in the audit, not silent.
 const COMPACTION_SYSTEM_PROMPT = `You are summarizing a long conversation between a user and an autonomous coding agent. Your output replaces the middle turns of the transcript so the model can continue without losing critical context. The next agent turn reads this block in place of those messages — anything not preserved here will be re-investigated next turn (extra grep / read / test calls), so prefer concrete pointers (file:line, symbol names, exact error strings) over prose. Every word costs tokens the agent could use to keep working.
 
 Preserve facts exactly as established — copy names, paths, line numbers, and error strings verbatim from the transcript; do not rewrite, generalize, or infer beyond what was stated. When unsure whether a detail matters, keep it: a dropped fact costs a full re-investigation next turn, a kept one costs a few tokens.
@@ -160,15 +169,15 @@ Output ONLY the following structured block, nothing else:
 
 ${SUMMARY_MARKER_OPEN}
 GOAL: <single line restating the user's original request>
+PENDING: <bullet list of remaining sub-tasks>
+ERRORS: <bullet list of errors hit and whether resolved>
 DECISIONS: <bullet list of concrete decisions taken with a brief rationale each; empty list if none>
 ANCHORS: <bullet list of code facts found via tools that the next turn should NOT re-discover; format \`path/file.ts:line — what\`; empty if none>
 REJECTED: <bullet list of approaches tried and dismissed; format \`<approach> — <why>\`; empty if none>
 FILES_TOUCHED: <comma-separated list of paths read/written; empty if none>
-ERRORS: <bullet list of errors hit and whether resolved>
-PENDING: <bullet list of remaining sub-tasks>
 ${SUMMARY_MARKER_CLOSE}
 
-Skip any section whose content would be empty by writing "(none)" after the colon. Do not editorialize, apologize, or add prose outside the markers.`;
+Sections are ordered most-important first: if the transcript is large, keep GOAL, PENDING, and ERRORS complete even if it means abbreviating the later sections. Skip any section whose content would be empty by writing "(none)" after the colon. Do not editorialize, apologize, or add prose outside the markers.`;
 
 // Spec ORCHESTRATION §4.6 step 6: when dropping tool_result bodies
 // alone isn't enough (text-heavy histories with few/no tool calls),
@@ -255,6 +264,12 @@ interface SummaryAttempt {
   text: string;
   usage: UsageInfo;
   usageSeen: boolean;
+  // True when the summary call stopped at max_tokens — the structured block is
+  // cut off, so trailing sections may be missing. Surfaced, NOT failed: a
+  // truncated summary still beats deterministic elision, and the section order
+  // keeps GOAL/PENDING/ERRORS ahead of the cut. The caller records it on the
+  // result's `reason` for audit observability.
+  truncated: boolean;
   // Stream-level errors (malformed JSON args from a thinking model,
   // etc). Non-empty list signals the caller should fall back, but we
   // still hand back any usage that arrived on the way.
@@ -295,6 +310,8 @@ const callSummaryProvider = async (
     text: collected.text,
     usage: collected.usage,
     usageSeen: collected.usageSeen,
+    // max_tokens ⇒ the summary was cut off before the close marker.
+    truncated: collected.stop_reason === 'max_tokens',
     errors: collected.errors.map((e) => ({ code: e.code, message: e.message })),
   };
 };
@@ -398,6 +415,42 @@ const wrapGoalWithSummary = (
 // callers (e.g. if it ever gains a clamp or per-provider floor).
 export const compactionTriggerTokens = (threshold: number, contextWindow: number): number =>
   threshold * contextWindow;
+
+// The chars/4 estimate (providers/tokens.ts) over-counts English by ~10-25% vs a
+// real tokenizer, so it fires the trigger ~10-25% early. 1/0.75 ≈ 1.34 is the
+// upper bound on that over-count: an estimate above triggerAt × this is over even
+// at the worst over-count, so refining can't change the decision.
+export const COMPACTION_OVERCOUNT_MARGIN = 1.34;
+
+// Decide whether a cheap-estimate-over-trigger is a false alarm worth refining
+// with the provider's REAL token count (CONTEXT_TUNING §12). The estimate
+// over-counts, so an estimate just over the trigger may correspond to a real
+// count UNDER it — compacting then wastes a billed summary the run didn't need.
+//
+//   - estimate confidently over (> triggerAt × margin): 'compact', no round-trip.
+//   - estimate in the over-count band: count the messages for real (Anthropic's
+//     tokenizer endpoint; a local no-op estimate elsewhere) + the fixed
+//     system/tools estimate, and 'skip' only when that is genuinely under the
+//     trigger. A `countMessages` throw (network / unsupported) ⇒ 'compact' — never
+//     let an accuracy refinement break the run.
+//
+// Safe by construction: 'skip' fires only when the REAL count is ≤ triggerAt
+// (already 30% below the window), so it can never relax into an over-window send;
+// it only suppresses a premature compaction.
+export const refineCompactionTrigger = async (opts: {
+  promptTokens: number;
+  triggerAt: number;
+  fixedTokens: number;
+  countMessages: () => Promise<number>;
+}): Promise<'compact' | 'skip'> => {
+  if (opts.promptTokens > opts.triggerAt * COMPACTION_OVERCOUNT_MARGIN) return 'compact';
+  try {
+    const accurate = (await opts.countMessages()) + opts.fixedTokens;
+    return accurate <= opts.triggerAt ? 'skip' : 'compact';
+  } catch {
+    return 'compact';
+  }
+};
 
 // Verbatim byte budget for the relevance pre-pass, derived from the
 // compaction trigger (CONTEXT_TUNING §12) rather than a magic constant:
@@ -574,6 +627,15 @@ export const compactMessages = async (
       usage: attemptUsage,
       usageSeen: attemptUsageSeen,
       summary: summaryBody,
+      // Truncation is observable, not fatal: the block is kept (GOAL/PENDING/
+      // ERRORS lead the section order, so they survive the cut), and the reason
+      // surfaces on the compaction_events row + finished event for tuning.
+      ...(attempt.truncated
+        ? {
+            reason:
+              'llm summary truncated at the output cap (max_tokens); trailing sections may be incomplete',
+          }
+        : {}),
     };
   } catch (e) {
     // If collectStep threw mid-iteration (CollectStepError), the

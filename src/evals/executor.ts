@@ -639,6 +639,9 @@ export const executeCase = async (
               ...(caseDef.budget.compactionRelevance !== undefined
                 ? { compactionRelevance: caseDef.budget.compactionRelevance }
                 : {}),
+              ...(caseDef.budget.compactionMaxTokens !== undefined
+                ? { compactionMaxTokens: caseDef.budget.compactionMaxTokens }
+                : {}),
             },
           }
         : {}),
