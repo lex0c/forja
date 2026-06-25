@@ -70,9 +70,23 @@ describe('operatorBootstrapFlags', () => {
   });
 
   test('forwards model / noRecap / maxSteps', () => {
+    // `--model` also opts the run into model-pin autosave (persistModelPin),
+    // so the next start resolves to the chosen id without re-passing the flag.
     expect(
       operatorBootstrapFlags(makeArgs({ model: 'anthropic/x', noRecap: true, maxSteps: 7 })),
-    ).toEqual({ modelId: 'anthropic/x', noRecap: true, budget: { maxSteps: 7 } });
+    ).toEqual({
+      modelId: 'anthropic/x',
+      persistModelPin: true,
+      noRecap: true,
+      budget: { maxSteps: 7 },
+    });
+  });
+
+  test('persistModelPin rides with --model and is omitted without it', () => {
+    expect('persistModelPin' in operatorBootstrapFlags(makeArgs({ model: 'anthropic/x' }))).toBe(
+      true,
+    );
+    expect('persistModelPin' in operatorBootstrapFlags(makeArgs())).toBe(false);
   });
 
   test('memory toggles propagate BOTH true and false (Slice Q)', () => {

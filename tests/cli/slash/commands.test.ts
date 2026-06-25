@@ -367,8 +367,11 @@ describe('/model', () => {
     });
     const result = await modelCommand.exec(['fake/cue'], ctx);
     if (result.kind !== 'ok') return;
-    expect(result.notes?.length).toBe(2);
-    expect(result.notes?.[1]).toContain('current turn');
+    expect(result.notes?.[0]).toContain('fake/cue');
+    // The running cue is always appended LAST by withRunningCue; a
+    // model-pin autosave note (written / warning) may sit between it and
+    // the model line, so assert position-from-the-end, not index 1.
+    expect(result.notes?.at(-1)).toContain('current turn');
   });
 
   test('/model with too many args returns error', async () => {
