@@ -20,10 +20,10 @@ import {
   loadRecapConfig,
   loadSandboxConfig,
 } from '../config/loaders.ts';
+import { persistModelPin } from '../config/writer.ts';
 import { createSqliteFailureSink } from '../failures/index.ts';
 import { DEFAULT_EFFORT } from '../harness/effort.ts';
 import type { HarnessConfig, RunBudget } from '../harness/index.ts';
-import { effectiveBudget } from '../harness/types.ts';
 import {
   type HookConfigWarning,
   resolveHookConfig,
@@ -118,6 +118,19 @@ import { DEFAULT_MODEL } from '../providers/default-model.ts';
 export interface BootstrapInput {
   prompt: string;
   modelId?: string;
+  // Autosave the resolved `--model` selection into the project
+  // `.forja/config.toml [providers].model`, so the next process start
+  // resolves to it without re-passing the flag (mirror of the `/model`
+  // in-session pin). Opt-in and set only by the two operator entrypoints
+  // that share `operatorBootstrapFlags` (one-shot cli/run.ts + REPL
+  // cli/repl.ts): the headless `forja recap` bootstrap also passes
+  // `modelId` but builds its input by hand without this flag, so it must
+  // NOT mutate the operator's config, and subagents don't bootstrap at
+  // all. Gated further on `modelId !== undefined`
+  // (nothing to save without an explicit flag) and `providerOverride`
+  // being absent (a test/dev injected provider is not an operator pin).
+  // Fail-soft: a write error warns on stderr, never aborts boot.
+  persistModelPin?: boolean;
   // `--no-recap` global flag: forces `recapEnabled=false` regardless
   // of `[recap].enabled` config.
   noRecap?: boolean;
@@ -496,6 +509,13 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     }
     provider = resolved.provider;
   }
+
+  // NOTE: the `--model` autosave (persistModelPin) used to fire HERE,
+  // right after resolution. It is now DEFERRED to the end of bootstrap —
+  // see the block just before the return — so a boot that aborts in any
+  // later boot-blocking check (subagent load/validate, permission
+  // preflight, DB migrate, a `refusing` chain verify) never rewrites the
+  // committed `.forja/config.toml` from an invocation that never started.
 
   // [budget] config — resolves before the harness builds its
   // RunBudget. Per-key merge: project [budget].max_steps wins
@@ -1688,21 +1708,31 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     outcomeSink,
   };
 
-  // maxCostUsd cannot bound an unmetered provider: cost is never tracked, so the
-  // cap never triggers. Surface it instead of letting the operator believe their
-  // cost cap protects them on a hosted/unmetered tier (e.g. Ollama Cloud). Resolve
-  // through `effectiveBudget` (NOT the partial `config.budget`): the common case is
-  // no explicit `[budget]`, yet the harness still applies DEFAULT_BUDGET.maxCostUsd
-  // ($100) and the UI presents it — an inert cap the operator should be warned about
-  // too. A genuine opt-out (`maxCostUsd: undefined`) resolves to undefined here and
-  // correctly stays silent.
-  const effectiveMaxCostUsd = effectiveBudget(config.budget, config.effort).maxCostUsd;
-  const unmeteredCapWarnings =
-    effectiveMaxCostUsd !== undefined && config.provider.capabilities.unmetered === true
-      ? [
-          `the maxCostUsd cost cap ($${effectiveMaxCostUsd}) cannot bound this run: model '${config.provider.id}' is unmetered (cost is not tracked per-token).`,
-        ]
-      : [];
+  // Autosave the `--model` selection — DEFERRED to here, the last step
+  // before a successful return, so a boot that aborts in any earlier
+  // check (subagent load/validate, permission preflight, DB migrate) or
+  // comes up `refusing` (chain broken without --accept-broken-chain, which
+  // makes run.ts exit 2) never rewrites the committed config.toml from an
+  // invocation that never actually started. Opt-in via persistModelPin
+  // (set only by the shared operator entrypoints). Guards: `modelId` came
+  // from the CLI flag (input.modelId !== undefined ⇒ it won the `??`
+  // chain), a `providerOverride` is a test/dev injection not an operator
+  // pin, and `permResult.state === 'refusing'` is a failed boot (the same
+  // predicate run.ts keys its exit-2 on). `persistModelPin` compares
+  // before writing, so a repeated `--model <same>` is a true no-op.
+  // Fail-soft — a write error warns on stderr; a SUCCESSFUL pin is silent
+  // (no boot-time chatter in the TUI — the operator already typed the id).
+  if (
+    input.persistModelPin === true &&
+    input.modelId !== undefined &&
+    input.providerOverride === undefined &&
+    permResult.state !== 'refusing'
+  ) {
+    const pin = persistModelPin({ filePath: providersLoaded.projectPath, modelId });
+    if (pin.kind === 'failed') {
+      process.stderr.write(`forja: could not persist --model to config.toml: ${pin.reason}\n`);
+    }
+  }
 
   return {
     config,
@@ -1718,7 +1748,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     memoryConfigWarnings: memoryLoaded.warnings,
     providersConfigWarnings: providersLoaded.warnings,
     recapConfigWarnings: recapLoaded.warnings,
-    budgetConfigWarnings: [...budgetLoaded.warnings, ...unmeteredCapWarnings],
+    budgetConfigWarnings: budgetLoaded.warnings,
     effortConfigWarnings: effortLoaded.warnings,
     auditConfigWarnings: auditLoaded.warnings,
     sandboxConfigWarnings: sandboxLoaded.warnings,

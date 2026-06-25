@@ -17,6 +17,10 @@
 //     key (ANTHROPIC_API_KEY etc.). Caught and reported as a clean
 //     error rather than crashing the REPL.
 
+import { join } from 'node:path';
+import { projectDirName } from '../../../config/app-namespace.ts';
+import { persistModelPin } from '../../../config/writer.ts';
+import { resolveRepoRoot } from '../../../memory/paths.ts';
 import type { Provider } from '../../../providers/types.ts';
 import { withRunningCue } from '../format.ts';
 import type { SlashCommand } from '../types.ts';
@@ -92,9 +96,26 @@ export const modelCommand: SlashCommand = {
     // updated provider via the spread copy. Current turn (if any) is
     // unaffected — its config was already snapshot.
     ctx.baseConfig.provider = provider;
+
+    // Autosave the selection so the NEXT process start resolves to this
+    // model. The in-memory mutation above is the per-turn pull path
+    // (CONTEXT_TUNING); this disk pin is orthogonal and additive. Anchor
+    // at the repo root so writer + bootstrap reader hit the SAME
+    // `<repo>/.forja/config.toml` even when the REPL launched from a
+    // subdir (mirror of the /memory governance fix). Fail-soft: a write
+    // error keeps the session on the new model and only warns — the
+    // switch itself already succeeded.
+    const notes = [`model: ${id} — takes effect on the next turn`];
+    const filePath = join(resolveRepoRoot(ctx.baseConfig.cwd), projectDirName(), 'config.toml');
+    const persisted = persistModelPin({ filePath, modelId: id });
+    if (persisted.kind === 'written') {
+      notes.push(`pinned in ${projectDirName()}/config.toml`);
+    } else if (persisted.kind === 'failed') {
+      notes.push(`warning: could not persist model to config.toml: ${persisted.reason}`);
+    }
     return {
       kind: 'ok',
-      notes: withRunningCue(ctx, [`model: ${id} — takes effect on the next turn`]),
+      notes: withRunningCue(ctx, notes),
     };
   },
 };

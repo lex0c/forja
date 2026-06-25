@@ -21,9 +21,9 @@
 // the dispatcher's `notes` channel; mutation subcommands (Tier 2)
 // add modal-confirm + audit-row emission paths.
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
 import { appDirName, projectDirName } from '../../../config/app-namespace.ts';
+import { readTomlDoc, writeTomlDocAtomic } from '../../../config/writer.ts';
 import {
   EMPTY_CORPUS_HASH,
   type MemoryFile,
@@ -3417,70 +3417,15 @@ const parseDetectorTarget = (
   }
 };
 
-// Canonical TOML emitter for `.forja/config.toml`. Bun ships only
-// TOML.parse — no stringify — so we round-trip the file as
-// parse → mutate → emit-canonical instead of text-level splicing
-// the `[memory]` block. Round-trip is robust against the shapes
-// that defeat a regex-driven splice: multi-line basic strings,
-// quoted-key tables, whitespace inside `[ memory ]`, BOM, `\r\n`,
-// and section-header lookalikes nested inside string literals.
-//
-// Trade-off: round-trip loses comments and original whitespace —
-// `[providers]`, `[budget]`, and `[memory]` are re-emitted in a
-// normalized shape (snake_case keys, alphabetical-ish by insertion
-// order, blank line between tables). Operators editing the file by hand
-// should expect rewrites to normalize formatting on the next
-// `/memory governance enable|disable`. Forja's `.forja/config.
-// toml` schema is flat (no array-of-tables, no nested sub-tables),
-// so the 40-line emitter below covers it exhaustively; if a
-// future subsystem adds nested tables, extend `emitTomlDoc`.
-const TOML_BARE_KEY_RE = /^[A-Za-z0-9_-]+$/;
-
-const emitTomlScalar = (v: unknown): string => {
-  if (typeof v === 'boolean') return v ? 'true' : 'false';
-  if (typeof v === 'number' && Number.isFinite(v)) return v.toString();
-  if (typeof v === 'string') {
-    return `"${v
-      .replace(/\\/g, '\\\\')
-      .replace(/"/g, '\\"')
-      .replace(/\n/g, '\\n')
-      .replace(/\r/g, '\\r')
-      .replace(/\t/g, '\\t')}"`;
-  }
-  if (Array.isArray(v)) return `[${v.map(emitTomlScalar).join(', ')}]`;
-  return '""';
-};
-
-const emitTomlKey = (k: string): string => {
-  if (TOML_BARE_KEY_RE.test(k)) return k;
-  return `"${k.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
-};
-
-const isScalarValue = (v: unknown): boolean =>
-  v === null || typeof v !== 'object' || Array.isArray(v);
-
-const emitTomlDoc = (doc: Record<string, unknown>): string => {
-  const sections: string[] = [];
-  const topLevel: string[] = [];
-  for (const [k, v] of Object.entries(doc)) {
-    if (isScalarValue(v)) {
-      topLevel.push(`${emitTomlKey(k)} = ${emitTomlScalar(v)}`);
-    }
-  }
-  if (topLevel.length > 0) sections.push(topLevel.join('\n'));
-  for (const [k, v] of Object.entries(doc)) {
-    if (!isScalarValue(v)) {
-      const lines: string[] = [`[${emitTomlKey(k)}]`];
-      for (const [kk, vv] of Object.entries(v as Record<string, unknown>)) {
-        if (isScalarValue(vv)) {
-          lines.push(`${emitTomlKey(kk)} = ${emitTomlScalar(vv)}`);
-        }
-      }
-      sections.push(lines.join('\n'));
-    }
-  }
-  return sections.length > 0 ? `${sections.join('\n\n')}\n` : '';
-};
+// The TOML emitter for `.forja/config.toml` lives in
+// `src/config/writer.ts` (`emitTomlDoc`) — shared with the `/model` +
+// `--model` model-pin autosave so the round-trip's quirks (comment loss,
+// whitespace normalization, nested-table handling) have one home. Bun
+// ships only `TOML.parse`, so this command round-trips the file as
+// parse → mutate → emit-canonical rather than splicing the `[memory]`
+// block by hand — robust against multi-line basic strings, quoted-key
+// tables, whitespace inside `[ memory ]`, BOM, `\r\n`, and
+// section-header lookalikes nested inside string literals.
 
 const mutateMemoryConfig = (params: {
   filePath: string;
@@ -3491,33 +3436,11 @@ const mutateMemoryConfig = (params: {
   };
 }): { ok: true } | { ok: false; reason: string } => {
   const { filePath, patches } = params;
-  const dir = dirname(filePath);
-  let raw = '';
-  if (existsSync(filePath)) {
-    try {
-      raw = readFileSync(filePath, 'utf8');
-    } catch (err) {
-      return {
-        ok: false,
-        reason: `could not read ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
-      };
-    }
-  }
-
-  let doc: Record<string, unknown> = {};
-  if (raw.length > 0) {
-    try {
-      const parsed = Bun.TOML.parse(raw);
-      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        doc = parsed as Record<string, unknown>;
-      }
-    } catch {
-      return {
-        ok: false,
-        reason: `existing ${filePath} has malformed TOML; edit manually or remove the file`,
-      };
-    }
-  }
+  // Shared read+parse (BOM-stripping, malformed → fail) — see
+  // src/config/writer.ts. Same round-trip the `/model` autosave uses.
+  const read = readTomlDoc(filePath);
+  if (!read.ok) return { ok: false, reason: read.reason };
+  const doc = read.doc;
 
   // Build the new [memory] block: preserve existing values for keys
   // NOT in the patch, apply the patch on top. Crucially, untouched
@@ -3563,20 +3486,9 @@ const mutateMemoryConfig = (params: {
     doc.memory = memBlock;
   }
 
-  const outRaw = emitTomlDoc(doc);
-
-  // Atomic temp+rename (mirror of src/memory/writer.ts pattern).
-  try {
-    mkdirSync(dir, { recursive: true });
-    const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
-    writeFileSync(tmp, outRaw);
-    renameSync(tmp, filePath);
-  } catch (err) {
-    return {
-      ok: false,
-      reason: `could not write ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
-    };
-  }
+  // Shared canonical-emit + atomic temp+rename.
+  const write = writeTomlDocAtomic(filePath, doc);
+  if (!write.ok) return { ok: false, reason: write.reason };
   return { ok: true };
 };
 

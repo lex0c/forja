@@ -519,6 +519,28 @@ model = "anthropic/claude-opus-4-7"
     }
   });
 
+  test('BOM-prefixed project config still yields [providers].model (regression)', () => {
+    // A config.toml a Windows editor saved with a UTF-8 BOM must NOT read
+    // as empty — otherwise the boot reader ignores the pinned model and
+    // falls back to DEFAULT_MODEL. loadTomlSection strips the BOM, so the
+    // model an operator pinned (incl. a `--model <same>` that left the BOM
+    // in place via the `unchanged` short-circuit) resolves on next boot.
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.forja', 'config.toml'),
+        '﻿[providers]\nmodel = "anthropic/claude-opus-4-7"\n',
+      );
+      const reg = stubRegistry(['anthropic/claude-opus-4-7']);
+      const result = loadProvidersConfig({ cwd, registry: reg, env: { HOME: '/none' } });
+      expect(result.config.model).toBe('anthropic/claude-opus-4-7');
+      expect(result.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   test('unknown model id warns and degrades to null (caller falls back to DEFAULT_MODEL)', () => {
     const cwd = makeTempCwd();
     try {

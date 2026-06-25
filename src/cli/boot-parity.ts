@@ -33,7 +33,14 @@ import type { BootstrapInput, BootstrapResult } from './bootstrap.ts';
 //    (Slice Q): `undefined` = no CLI override (bootstrap resolves from
 //    config/default); explicit `true`/`false` = operator opt-in/out.
 export const operatorBootstrapFlags = (args: ParsedArgs): Partial<BootstrapInput> => ({
-  ...(args.model !== undefined ? { modelId: args.model } : {}),
+  // `--model` autosaves the selection to `[providers].model` so the next
+  // start resolves to it. `persistModelPin` rides WITH `modelId` here —
+  // the shared helper is the one place that covers BOTH operator
+  // entrypoints (one-shot run.ts + REPL repl.ts) while excluding the
+  // headless `forja recap` bootstrap (builds its input by hand) and
+  // subagents (never bootstrap). bootstrap re-guards on the resolved id,
+  // and `persistModelPin` compares before writing (no churn on repeats).
+  ...(args.model !== undefined ? { modelId: args.model, persistModelPin: true } : {}),
   ...(args.noRecap === true ? { noRecap: true } : {}),
   ...(args.maxSteps !== undefined ? { budget: { maxSteps: args.maxSteps } } : {}),
   ...(args.acceptBrokenChain === true ? { acceptBrokenChain: true } : {}),
