@@ -1169,15 +1169,26 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // and the table out of sync. `/history on` re-checks this on
   // attempted re-enable so the operator can't override env.
   let historyEnabled = historyOptOutReason(baseConfig.cwd) === null;
+  // History entries actually recorded by `recordHistorySubmit` for the CURRENT
+  // turn (the operator submit, or each drained inbox body). The hard-abort
+  // un-send removes EXACTLY these — tracking the real records, not a
+  // reconstruction from the turn text, avoids deleting a dup-suppressed retry's
+  // earlier prompt and covers the inbox case (per-body entries vs the
+  // concatenated turn text). Set at each turn dispatch; cleared in
+  // session_finished alongside lastTurnOperatorText.
+  let lastTurnHistoryTexts: string[] = [];
 
-  const recordHistorySubmit = (text: string): void => {
+  // Returns true if a row was actually recorded (DB + mirror), false if
+  // suppressed (dup-of-last) or history is disabled — the turn dispatch keeps the
+  // truthy results so the un-send removes only what this turn really added.
+  const recordHistorySubmit = (text: string): boolean => {
     // Reset nav state regardless of persistence — next ↑ should walk
     // from the newest entry even if the operator just toggled
     // /history off, otherwise the scratch from a prior recall would
     // resurface unexpectedly on the next press.
     historyIdx = null;
     historyScratch = null;
-    if (!historyEnabled) return;
+    if (!historyEnabled) return false;
 
     // Persist FIRST, then mirror in memory. Two robustness reasons:
     //
@@ -1197,8 +1208,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     //
     // Empty text never reaches this path — applyKey gates submit on
     // `value === ''` and the slash dispatcher gates on parsed.name === ''.
+    let inserted = false;
     try {
-      appendHistory(db, baseConfig.cwd, text, { cap: historyCap });
+      inserted = appendHistory(db, baseConfig.cwd, text, { cap: historyCap });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       bus.emit({
@@ -1206,9 +1218,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         ts: now(),
         message: `history not persisted: ${msg} (this submit will not be recallable next boot)`,
       });
-      return;
+      return false;
     }
-    if (historyEntries[historyEntries.length - 1] !== text) {
+    // Mirror exactly what storage did: push iff a row was inserted, so a
+    // dup-of-last leaves the mirror untouched too and the two stay in lockstep.
+    if (inserted) {
       historyEntries.push(text);
       // Cap the mirror to match storage's trim. Without this, a
       // long-running session accumulates an unbounded array, and
@@ -1220,27 +1234,36 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       const overflow = historyEntries.length - historyCap;
       if (overflow > 0) historyEntries.splice(0, overflow);
     }
+    return inserted;
   };
 
   // Inverse of recordHistorySubmit for the hard-abort un-send: the operator
-  // retracted the prompt they just sent, so drop it from history too — it must
-  // stop resurfacing via ↑/↓, Ctrl+R, and /history (which the persistent
-  // repl_history would otherwise keep across sessions), the same way it leaves
-  // the conversation. The DB delete matches on the tail content, and the mirror
-  // pop is likewise guarded, so neither touches anything but the just-recorded
-  // entry. Nav state resets so the next ↑ walks from the (now newest) entry.
-  const removeHistorySubmit = (text: string): void => {
+  // retracted the turn they just sent, so drop its prompt(s) from history too —
+  // they must stop resurfacing via ↑/↓, Ctrl+R, and /history (which the
+  // persistent repl_history would otherwise keep across sessions), the same way
+  // they leave the conversation. Removes EXACTLY the entries recordHistorySubmit
+  // reported for this turn (`lastTurnHistoryTexts`), not a reconstruction from
+  // the turn text: a dup-suppressed retry recorded nothing (so the earlier
+  // successful prompt is left intact), and a drained inbox recorded each queued
+  // body individually (not the concatenated turn text). Reverse order so each
+  // delete targets the current tail. Nav resets so the next ↑ walks from newest.
+  const removeHistorySubmit = (): void => {
     historyIdx = null;
     historyScratch = null;
-    if (!historyEnabled) return;
-    try {
-      deleteLastHistoryIfMatches(db, baseConfig.cwd, text);
-    } catch {
-      // Non-fatal, mirroring recordHistorySubmit: a failed delete just means the
-      // entry may reappear on next boot; the mirror pop below still hides it now.
-    }
-    if (historyEntries[historyEntries.length - 1] === text) {
-      historyEntries.pop();
+    for (let i = lastTurnHistoryTexts.length - 1; i >= 0; i -= 1) {
+      const text = lastTurnHistoryTexts[i];
+      if (text === undefined) continue;
+      if (historyEnabled) {
+        try {
+          deleteLastHistoryIfMatches(db, baseConfig.cwd, text);
+        } catch {
+          // Non-fatal, mirroring recordHistorySubmit: a failed delete just means
+          // the entry may reappear on next boot; the mirror pop still hides it now.
+        }
+      }
+      if (historyEntries[historyEntries.length - 1] === text) {
+        historyEntries.pop();
+      }
     }
   };
 
@@ -1537,10 +1560,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         liveContext !== null &&
         liveContext.popLastUserMessage()
       ) {
-        // Drop the un-sent prompt from input history too — it left the
-        // conversation, so it must not linger recallable via ↑/↓, Ctrl+R, or
-        // /history (repl_history outlives the session).
-        removeHistorySubmit(lastTurnOperatorText);
+        // Drop the un-sent prompt(s) from input history too — they left the
+        // conversation, so they must not linger recallable via ↑/↓, Ctrl+R, or
+        // /history (repl_history outlives the session). Uses lastTurnHistoryTexts,
+        // so it removes only what this turn actually recorded.
+        removeHistorySubmit();
         // Only refill when the editor is empty — never clobber text the operator
         // typed while the turn ran.
         const refilled = renderer.state().input.value.length === 0;
@@ -1563,6 +1587,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         });
       }
       lastTurnOperatorText = null;
+      lastTurnHistoryTexts = [];
       trackReplSessionId(event.result.sessionId);
       cumulative.costUsd += event.result.costUsd;
       cumulative.steps += event.result.steps;
@@ -2187,7 +2212,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     inbox.length = 0;
     for (const m of kept) inbox.push(m);
     const texts = drained.map((m) => m.text);
-    for (const t of texts) recordHistorySubmit(t);
+    // Record each queued body individually (what history actually stores), and
+    // track the ones that took — the un-send removes those, not the concatenated
+    // turn text (which was never inserted).
+    lastTurnHistoryTexts = texts.filter((t) => recordHistorySubmit(t));
     bus.emit({ type: 'inbox:drained', ts: now(), texts });
     startOperatorTurn(concatQueuedBodies(texts));
   };
@@ -2765,7 +2793,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           // Idle: substitute the buffer with the match and submit it now.
           bus.emit({ type: 'input:update', ts: now(), value: match, cursor: match.length });
           bus.emit({ type: 'user:submit', ts: now(), text: match });
-          recordHistorySubmit(match);
+          lastTurnHistoryTexts = recordHistorySubmit(match) ? [match] : [];
           closeReverseSearch();
           startOperatorTurn(match);
           cancelExitArm();
@@ -3333,7 +3361,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         enqueueInbox(result.submit.text);
       } else {
         bus.emit({ type: 'user:submit', ts: now(), text: result.submit.text });
-        recordHistorySubmit(result.submit.text);
+        lastTurnHistoryTexts = recordHistorySubmit(result.submit.text) ? [result.submit.text] : [];
         startOperatorTurn(result.submit.text);
       }
     }

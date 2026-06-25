@@ -31,6 +31,20 @@ afterEach(() => {
   delete process.env.FORJA_NO_HISTORY;
 });
 
+describe('history storage — appendHistory return value', () => {
+  test('reports inserted (true) vs suppressed dup-of-last (false)', () => {
+    expect(appendHistory(db, PROJECT_A, 'first', { ts: 1 })).toBe(true);
+    expect(appendHistory(db, PROJECT_A, 'first', { ts: 2 })).toBe(false); // dup-of-last
+    expect(appendHistory(db, PROJECT_A, 'second', { ts: 3 })).toBe(true);
+  });
+
+  test('returns false when history is disabled', () => {
+    process.env.FORJA_NO_HISTORY = '1';
+    expect(appendHistory(db, PROJECT_A, 'x')).toBe(false);
+    delete process.env.FORJA_NO_HISTORY;
+  });
+});
+
 describe('history storage — deleteLastHistoryIfMatches (un-send)', () => {
   test('removes the tail only when it matches the given prompt', () => {
     appendHistory(db, PROJECT_A, 'first', { ts: 1 });

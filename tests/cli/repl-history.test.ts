@@ -337,6 +337,103 @@ describe('repl — un-send on hard abort', () => {
     stdin.feed('\x04');
     await promise;
   });
+
+  // Multi-turn variant: each runAgent call consumes the next kind; finishNext()
+  // settles them in order so a test can drive several turns.
+  const makeMultiTurnRunAgent = (
+    kinds: Array<'done' | 'hard'>,
+  ): { runAgent: (cfg: HarnessConfig) => Promise<HarnessResult>; finishNext: () => void } => {
+    let i = 0;
+    const finishers: Array<() => void> = [];
+    return {
+      runAgent: (cfg) =>
+        new Promise((resolve) => {
+          const hard = (kinds[i++] ?? 'done') === 'hard';
+          const sid = createSession(db, { model: 'm', cwd: PROJECT_CWD }).id;
+          const ctx = SessionContext.createFresh(db, sid);
+          ctx.appendUser(cfg.userPrompt, null);
+          const result: HarnessResult = {
+            status: hard ? 'interrupted' : 'done',
+            reason: hard ? 'aborted' : 'done',
+            ...(hard ? { abortCause: 'hard' as const } : {}),
+            sessionId: sid,
+            sessionContext: ctx,
+            steps: 0,
+            durationMs: 1,
+            usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+            costUsd: 0,
+            usageComplete: !hard,
+          };
+          finishers.push(() => {
+            cfg.onEvent?.({ type: 'session_finished', result });
+            resolve(result);
+          });
+        }),
+      finishNext: () => finishers.shift()?.(),
+    };
+  };
+
+  test('a hard-aborted duplicate submit keeps the prior successful prompt in history', async () => {
+    const stdin = makeStdin();
+    const ra = makeMultiTurnRunAgent(['done', 'hard']);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStubWithDb(db),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    stdin.feed('deploy\r'); // turn 1 — completes normally, records "deploy"
+    await tick();
+    ra.finishNext();
+    await tick();
+    expect(loadHistory(db, PROJECT_CWD)).toEqual(['deploy']);
+    stdin.feed('deploy\r'); // turn 2 — same text → dup-suppressed (records nothing)
+    await tick();
+    ra.finishNext(); // ...then hard-aborted
+    await tick();
+    // The retry recorded nothing, so the un-send must NOT delete the prior entry.
+    expect(loadHistory(db, PROJECT_CWD)).toEqual(['deploy']);
+    stdin.feed('\x03'); // clear the refilled buffer
+    await tick();
+    stdin.feed('\x04');
+    await promise;
+  });
+
+  test('hard-aborting a drained-inbox turn removes the queued prompts from history', async () => {
+    const stdin = makeStdin();
+    const ra = makeMultiTurnRunAgent(['done', 'hard']);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStubWithDb(db),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    stdin.feed('first\r'); // turn 1 starts → busy
+    await tick();
+    stdin.feed('q1\r'); // queued while busy (inbox — not recorded yet)
+    await tick();
+    stdin.feed('q2\r');
+    await tick();
+    ra.finishNext(); // turn 1 done → drainInbox records q1,q2 → starts turn 2 (concat)
+    await tick();
+    expect(loadHistory(db, PROJECT_CWD)).toEqual(['first', 'q1', 'q2']);
+    ra.finishNext(); // turn 2 (the drained inbox) hard-aborted → un-send
+    await tick();
+    // The un-sent turn recorded q1/q2 individually (not the concat) → both removed.
+    expect(loadHistory(db, PROJECT_CWD)).toEqual(['first']);
+    stdin.feed('\x03'); // clear the refilled buffer
+    await tick();
+    stdin.feed('\x04');
+    await promise;
+  });
 });
 
 describe('repl — ↑/↓ navigation', () => {
