@@ -42,6 +42,7 @@ import { flattenControlToLine, stripAnsi, stripControlKeepLines } from '../sanit
 import {
   HISTORY_CAP,
   appendHistory,
+  deleteLastHistoryIfMatches,
   historyOptOutReason,
   loadHistory,
   searchHistory,
@@ -1221,6 +1222,28 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     }
   };
 
+  // Inverse of recordHistorySubmit for the hard-abort un-send: the operator
+  // retracted the prompt they just sent, so drop it from history too — it must
+  // stop resurfacing via ↑/↓, Ctrl+R, and /history (which the persistent
+  // repl_history would otherwise keep across sessions), the same way it leaves
+  // the conversation. The DB delete matches on the tail content, and the mirror
+  // pop is likewise guarded, so neither touches anything but the just-recorded
+  // entry. Nav state resets so the next ↑ walks from the (now newest) entry.
+  const removeHistorySubmit = (text: string): void => {
+    historyIdx = null;
+    historyScratch = null;
+    if (!historyEnabled) return;
+    try {
+      deleteLastHistoryIfMatches(db, baseConfig.cwd, text);
+    } catch {
+      // Non-fatal, mirroring recordHistorySubmit: a failed delete just means the
+      // entry may reappear on next boot; the mirror pop below still hides it now.
+    }
+    if (historyEntries[historyEntries.length - 1] === text) {
+      historyEntries.pop();
+    }
+  };
+
   // ─── Reverse-search overlay (HISTORY.md §2.2) ──────────────────────
   // Local state mirrors the renderer's view so the editor handler
   // doesn't have to read it back via renderer.state(). Producer-side
@@ -1514,6 +1537,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         liveContext !== null &&
         liveContext.popLastUserMessage()
       ) {
+        // Drop the un-sent prompt from input history too — it left the
+        // conversation, so it must not linger recallable via ↑/↓, Ctrl+R, or
+        // /history (repl_history outlives the session).
+        removeHistorySubmit(lastTurnOperatorText);
         // Only refill when the editor is empty — never clobber text the operator
         // typed while the turn ran.
         const refilled = renderer.state().input.value.length === 0;

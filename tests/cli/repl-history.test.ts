@@ -305,6 +305,8 @@ describe('repl — un-send on hard abort', () => {
     // keeps it). The text was ALSO refilled into the editor — which is why the
     // teardown clears it (Ctrl+C) before Ctrl+D can exit on an empty buffer.
     expect(getMessage(db, sentId)?.retractedAt).not.toBeNull();
+    // ...and dropped from input history, so it can't resurface via ↑/↓ or Ctrl+R.
+    expect(loadHistory(db, PROJECT_CWD)).toEqual([]);
     stdin.feed('\x03'); // clears the refilled buffer (proves the refill landed)
     await tick();
     stdin.feed('\x04');

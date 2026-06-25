@@ -243,14 +243,24 @@ export class SessionContext {
   //      nothing settled — if an (empty) assistant turn settled after the
   //      message, it earned a response and is kept. Without this check the
   //      retraction would hit the wrong row (the empty assistant), losing
-  //      durability and mislabeling the audit.
+  //      durability and mislabeling the audit; AND
+  //   3. that row must be `source === 'operator'`. A `system`/wake user row
+  //      (migration 075 — a bg_done notification) has identical string-user
+  //      shape, so this keeps the invariant ("only the operator's submit is
+  //      un-sendable") inside the primitive instead of relying solely on the
+  //      repl gate to never call this for a wake turn.
   popLastUserMessage(): boolean {
     const tail = this.messages[this.messages.length - 1];
     if (tail === undefined || tail.role !== 'user' || typeof tail.content !== 'string') {
       return false;
     }
     const last = getMessage(this.db, this.lastMessageId);
-    if (last === null || last.role !== 'user' || typeof last.content !== 'string') {
+    if (
+      last === null ||
+      last.role !== 'user' ||
+      typeof last.content !== 'string' ||
+      last.source !== 'operator'
+    ) {
       return false;
     }
     this.messages.pop();

@@ -117,6 +117,16 @@ describe('SessionContext: popLastUserMessage (un-send after hard abort)', () => 
     expect(ctx.popLastUserMessage()).toBe(false);
     expect(getMessage(db, userId)?.retractedAt).toBeNull();
   });
+
+  test('refuses a system/wake user turn — only the operator submit is un-sendable', () => {
+    const ctx = SessionContext.createFresh(db, sessionId);
+    const id = ctx.appendUser('bg_done: background task finished', null, 'system');
+    // A system/wake row is a string-user tail too, but it is not the operator's
+    // submit — the guard reads source so it can't be un-sent.
+    expect(ctx.popLastUserMessage()).toBe(false);
+    expect(getMessage(db, id)?.retractedAt).toBeNull();
+    expect(ctx.length).toBe(1); // still live
+  });
 });
 
 describe('SessionContext: append (array + row + anchor in one place)', () => {
