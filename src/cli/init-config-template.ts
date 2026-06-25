@@ -62,6 +62,7 @@ max_step_stall_ms = ${b.maxStepStallMs}
 compaction_threshold = ${b.compactionThreshold}
 compaction_preserve_tail = ${b.compactionPreserveTail}
 compaction_relevance = ${b.compactionRelevance}
+compaction_max_tokens = ${b.compactionMaxTokens}
 
 [memory]
 verify_semantic_llm = ${m.verifySemanticLlm}

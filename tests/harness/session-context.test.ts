@@ -422,6 +422,32 @@ describe('SessionContext: relevanceElide', () => {
     expect(anyPointer).toBe(true);
   });
 
+  test('queryHint (working-state focus) steers relevance over the recency pick', () => {
+    // Goal has NO term overlap with any body → relevance is uniform-0 and recency
+    // alone keeps the LATEST eligible body. A focus hint matching an EARLIER body
+    // should promote it over that recency pick — proving the current focus, not
+    // just the original goal, drives the partition (#2).
+    const build = (): SessionContext => {
+      const c = SessionContext.createFresh(db, sessionId);
+      c.appendUser('unrelated original goal phrasing', null);
+      c.appendAssistant(toolUse('a'), noUsage, null);
+      c.appendToolResults(toolResult('a', big('migration schema database indexes')), null);
+      c.appendAssistant(toolUse('b'), noUsage, null);
+      c.appendToolResults(toolResult('b', big('totally different latest filler text')), null);
+      c.appendAssistant(toolUse('c'), noUsage, null);
+      c.appendToolResults(toolResult('c', 'short tail body'), null);
+      return c;
+    };
+    const opts = { verbatimBudgetBytes: 800, preserveTail: 1 };
+    const withoutHint = build().relevanceElide(opts);
+    const withHint = build().relevanceElide({ ...opts, queryHint: 'migration schema database' });
+    // Without the hint, earlier 'a' loses to recency and is elided.
+    expect(withoutHint?.elidedIds).toContain('a');
+    // With the focus hint matching 'a', it is promoted and kept; 'b' goes instead.
+    expect(withHint?.elidedIds).not.toContain('a');
+    expect(withHint?.elidedIds).toContain('b');
+  });
+
   test('returns null when history is too short to have a middle', () => {
     const ctx = SessionContext.createFresh(db, sessionId);
     ctx.appendUser('goal', null);

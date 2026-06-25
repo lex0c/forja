@@ -117,6 +117,16 @@ export interface EvalBudget {
   // mirroring DEFAULT_BUDGET). Lets the eval measure relevance ON vs OFF on
   // the same scenario by pinning `false`.
   compactionRelevance?: boolean;
+  // Override the compaction summary's max_tokens. A small value (e.g. 48) forces
+  // the structured summary to truncate, exercising the truncation path
+  // deterministically; the run must still succeed (goal re-injection + the
+  // GOAL/PENDING-first section order keep the thread).
+  compactionMaxTokens?: number;
+  // Enable the experimental #3 trigger refine (default-OFF in DEFAULT_BUDGET). Set
+  // true in a case to exercise the real-tokenizer skip path on a native-counter
+  // provider (Anthropic/Google) — the only place it acts — so its benefit + window
+  // edges get end-to-end coverage before it could be considered for the default.
+  compactionTriggerRefine?: boolean;
 }
 
 export interface EvalCase {

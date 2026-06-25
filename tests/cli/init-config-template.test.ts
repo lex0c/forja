@@ -48,7 +48,7 @@ describe('renderInitConfigTemplate', () => {
     expect(parsed.providers.model).toBe(DEFAULT_MODEL);
   });
 
-  test('[budget] values match DEFAULT_BUDGET (six operator-tunable keys)', () => {
+  test('[budget] values match DEFAULT_BUDGET (seven operator-tunable keys)', () => {
     const parsed = Bun.TOML.parse(renderInitConfigTemplate(defaults())) as {
       budget: Record<string, unknown>;
     };
@@ -58,6 +58,9 @@ describe('renderInitConfigTemplate', () => {
     expect(parsed.budget.max_step_stall_ms).toBe(DEFAULT_BUDGET.maxStepStallMs);
     expect(parsed.budget.compaction_threshold).toBe(DEFAULT_BUDGET.compactionThreshold);
     expect(parsed.budget.compaction_preserve_tail).toBe(DEFAULT_BUDGET.compactionPreserveTail);
+    // Surfaced so operators can raise the cap when a dense session's summary
+    // truncates (the knob the eval-only wiring used to hide from real users).
+    expect(parsed.budget.compaction_max_tokens).toBe(DEFAULT_BUDGET.compactionMaxTokens);
     // The relevance pre-pass is default-ON; the scaffold surfaces the opt-out
     // knob so operators can find `compaction_relevance = false`.
     expect(parsed.budget.compaction_relevance).toBe(DEFAULT_BUDGET.compactionRelevance);

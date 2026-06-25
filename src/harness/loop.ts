@@ -26,6 +26,7 @@ import { createDegradedBannerEmitter } from '../permissions/degraded-banner.ts';
 import { addUsage, computeCost, emptyUsage } from '../providers/cost.ts';
 import type {
   GenerateRequest,
+  ProviderMessage,
   ProviderToolDef,
   ProviderToolResultBlock,
 } from '../providers/index.ts';
@@ -69,7 +70,7 @@ import type {
   ToolSearchHit,
 } from '../tools/types.ts';
 import { type WorkingStateStore, createWorkingStateStore } from '../working-state/index.ts';
-import { StepStallError, abortableIterable, stallWatchdog } from './abortable.ts';
+import { StepStallError, abortableIterable, stallWatchdog, withAbort } from './abortable.ts';
 import { buildAssistantContent } from './assistant-content.ts';
 import { CollectStepError, type CollectedToolUse, collectStep } from './collect.ts';
 import type { RelevanceAudit } from './compaction-relevance.ts';
@@ -78,6 +79,7 @@ import {
   compactionTriggerTokens,
   hashContext,
   recordCompactionEvent,
+  refineCompactionTrigger,
   relevanceVerbatimBudgetBytes,
 } from './compaction.ts';
 import { resolveProviderEffort } from './effort.ts';
@@ -2584,14 +2586,41 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         ) {
           return null;
         }
-        const promptTokens = estimatePromptTokens([...ctx.getMessages()], {
+        const estimateOpts = {
           ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
           // force ⇒ the tool-less synthesis request; don't count tool schemas the
           // synthesis won't send (else a tool-less-fitting history compacts needlessly).
           ...(!force && tools.length > 0 ? { tools } : {}),
           countReasoning: config.provider.replaysReasoning === true,
-        });
+        };
         const contextWindow = config.provider.capabilities.context_window;
+        // The NEXT request reserves max_tokens; the provider rejects
+        // input + max_tokens > window. The 0.7 trigger's 30% headroom covers a
+        // normal output cap, but a model whose cap exceeds it (e.g. 64k on a 200k
+        // window) needs this tighter ceiling. Shared by the refine skip AND the
+        // relevance short-circuit so neither leaves the next request over-window.
+        const outputFitCeiling =
+          contextWindow - resolveMaxOutputTokens(budget, config.provider.capabilities);
+        // The real request the step loop sends appends the working-state panel +
+        // static guidance to the last user message (the forced synthesis path sends
+        // its own directive instead, so skip them under `force`). Build that
+        // POST-INJECTION shape so the trigger, the refine fit decision, AND the
+        // relevance short-circuit all measure what's ACTUALLY sent —
+        // enableStaticGuidance is on for the main CLI and a populated panel can add
+        // several KB, enough to flip a near-ceiling decision. The exact step arg
+        // only sizes the "N steps ago" labels (a few chars), so the prior
+        // iteration's `steps` is close enough.
+        const buildRequestShape = (messages: readonly ProviderMessage[]): ProviderMessage[] => {
+          const shape = [...messages];
+          if (!force) {
+            injectWorkingStateBlock(shape, workingStateStore.get(sessionId), steps);
+            if (config.enableStaticGuidance)
+              injectStaticGuidance(shape, isSmallWindow(contextWindow));
+          }
+          return shape;
+        };
+        const requestMessages = buildRequestShape(ctx.getMessages());
+        const promptTokens = estimatePromptTokens(requestMessages, estimateOpts);
         const triggerAt = compactionTriggerTokens(budget.compactionThreshold, contextWindow);
         // Need goal + something-to-fold + an assistant boundary for the tail;
         // shorter histories make compactMessages skip (and emit noisy events).
@@ -2599,14 +2628,17 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           return null;
         }
         // PreCompact hook (blocking, spec §10.1) — fired before the
-        // compaction_started event so a refusing hook skips both the LLM call
-        // and the renderer's "compacting…" signal. Blocked ⇒ no compaction
-        // this turn; the loop proceeds with the un-compacted history and the
-        // next top-of-loop call re-checks (no continue — we're at the top, so
-        // returning simply falls through to the provider call). Deliberate vs
-        // the old post-tool-result site, whose `continue` ALSO skipped that
-        // turn's detector schedulers: the turn now runs normally, because the
-        // schedulers don't depend on compaction (that coupling was accidental).
+        // compaction_started event so a refusing hook skips both the LLM call and
+        // the renderer's "compacting…" signal, AND before the native token-count
+        // refine below so a blocking hook prevents the full prompt from reaching the
+        // provider's count_tokens endpoint at all (HOOKS.md: PreCompact can cancel
+        // compaction; a policy hook may exist precisely to deny the compaction
+        // provider access). Blocked ⇒ no compaction this turn; the loop proceeds
+        // with the un-compacted history and the next top-of-loop call re-checks (no
+        // continue — we're at the top, so returning simply falls through to the
+        // provider call). Deliberate vs the old post-tool-result site, whose
+        // `continue` ALSO skipped that turn's detector schedulers: the turn now runs
+        // normally, because the schedulers don't depend on compaction.
         const preCompact = await dispatchHooks({
           schema: 'v1',
           event: 'PreCompact',
@@ -2615,6 +2647,35 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         });
         if (preCompact !== null && preCompact.blockedBy !== null) {
           return null;
+        }
+        // Trigger refinement (#3 / CONTEXT_TUNING §12) — EXPERIMENTAL, gated OFF by
+        // default (compactionTriggerRefine; see the budget-field doc). Runs AFTER
+        // the PreCompact hook so a blocking hook prevents the external count_tokens
+        // request (a blocked compaction must touch no compaction-provider endpoint).
+        // The chars/4 estimate over-counts ~10-25% vs a real tokenizer, so a
+        // near-trigger estimate may be a false alarm; when ON, confirm with the
+        // provider's real token count and 'skip' only when the real total is
+        // genuinely under both the trigger and the output-fit ceiling. When OFF
+        // (default) the over-counting estimate compacts directly — the safe,
+        // conservative path that never over-fills the window. `countTokens` takes no
+        // AbortSignal (providers/types.ts), so a hung native endpoint would block
+        // Ctrl+C / maxWallClockMs — race it against the run signal: on abort the
+        // count rejects → refine catches → 'compact', and `signal.aborted` bails the
+        // whole compaction (the run is ending). On a fallback-counter provider the
+        // count is local + instant, so the race is a no-op. `requestMessages` is an
+        // already-materialized array (the post-injection shape), so no ctx-narrowing
+        // pin is needed across the await. (A blocking hook returns above, so a
+        // PreCompact that then refine-skips fires only on the experimental path —
+        // the hook is a permission gate, not a compaction-happened signal.)
+        if (budget.compactionTriggerRefine === true) {
+          const refine = await refineCompactionTrigger({
+            promptTokens,
+            triggerAt,
+            fixedTokens: estimatePromptTokens([], estimateOpts),
+            outputFitCeiling,
+            countMessages: () => withAbort(config.provider.countTokens(requestMessages), signal),
+          });
+          if (refine === 'skip' || signal.aborted) return null;
         }
         // Read pins BEFORE emitting compaction_started, so the
         // started→finished pair has NO throwing statement between them: a DB
@@ -2637,12 +2698,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // ctxRef pins the (guard-narrowed) context so the closures below don't
         // re-widen `ctx` to `| undefined`.
         const ctxRef = ctx;
+        // Post-injection + force-aware (same buildRequestShape + estimateOpts as
+        // promptTokens) so the relevance short-circuit's tokensAfterElide and the
+        // audit's before/after deltas measure the real request, not the bare history.
         const estimateNow = (): number =>
-          estimatePromptTokens([...ctxRef.getMessages()], {
-            ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
-            ...(tools.length > 0 ? { tools } : {}),
-            countReasoning: config.provider.replaysReasoning === true,
-          });
+          estimatePromptTokens(buildRequestShape(ctxRef.getMessages()), estimateOpts);
         const beforeHash = hashContext(ctxRef.getMessages());
         // Thin adapter over the shared recorder: supplies the loop's beforeHash
         // + live array + trigger tokens. The skip-skipped / hashing /
@@ -2692,9 +2752,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         if (budget.compactionRelevance === true && config.memoryRegistry !== undefined) {
           // Verbatim budget derived from the trigger (shared helper, not a
           // magic constant) — see relevanceVerbatimBudgetBytes.
+          // Blend the model's live working-state focus into the relevance query
+          // so it tracks the CURRENT sub-task, not just the original goal
+          // (which drifts on a long session). Absent panel ⇒ goal-only.
+          const wsFocus = workingStateStore.get(sessionId).focus?.text;
           const elide = ctx.relevanceElide({
             verbatimBudgetBytes: relevanceVerbatimBudgetBytes(triggerAt),
             preserveTail: budget.compactionPreserveTail,
+            ...(wsFocus !== undefined && wsFocus.length > 0 ? { queryHint: wsFocus } : {}),
           });
           if (elide !== null && elide.elidedCount > 0) {
             relevanceAudit = {
@@ -2714,8 +2779,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             // (CONTEXT_TUNING §12.4). With pins active, fall through to the LLM
             // fold below; it runs on the already-gated history, so the pre-pass
             // still pays off, and pinnedBlock re-injection is honored.
-            if (tokensAfterElide <= triggerAt && pinnedBlock === undefined) {
-              // Relevance alone got us under the threshold, no pins — done, no LLM.
+            if (
+              tokensAfterElide <= Math.min(triggerAt, outputFitCeiling) &&
+              pinnedBlock === undefined
+            ) {
+              // Relevance alone got us under BOTH the threshold and the output-fit
+              // ceiling, no pins — done, no LLM. (Same min() the refine skip uses,
+              // and tokensAfterElide is the post-injection shape, so the next
+              // request can't re-add the panel/guidance and overflow.)
               const relevanceReason = `relevance-elide: ${elide.elidedCount} tool_results pointered, ${elide.freedBytes}B freed`;
               persistCompaction({
                 strategy: 'relevance',
@@ -2746,6 +2817,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         const compaction = await ctx.compact(config.provider, {
           preserveTail: budget.compactionPreserveTail,
           signal,
+          ...(budget.compactionMaxTokens !== undefined
+            ? { maxTokens: budget.compactionMaxTokens }
+            : {}),
           ...(pinnedBlock !== undefined ? { pinnedBlock } : {}),
         });
         const acct = accountCompaction(compaction, config.provider.capabilities);

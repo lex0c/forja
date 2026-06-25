@@ -460,7 +460,9 @@ export interface BudgetConfigKeys {
   maxStepStallMs?: number;
   compactionThreshold?: number;
   compactionPreserveTail?: number;
+  compactionMaxTokens?: number;
   compactionRelevance?: boolean;
+  compactionTriggerRefine?: boolean;
 }
 
 export interface LoadedBudgetConfig {
@@ -490,6 +492,9 @@ interface PartialBudgetLayer extends BudgetConfigKeys {}
 //     of 90s is what catches genuine hangs.
 //   compaction_preserve_tail: 1000 — preserving more than 1k
 //     turns verbatim defeats the purpose of compaction.
+//   compaction_max_tokens: 64_000 — the compaction summary's token cap; a
+//     summary larger than this rivals the window it exists to shrink. The
+//     default (1024, in src/harness/types.ts via compaction.ts) sits far below.
 //
 // Min values differ per key by documented disable semantics:
 //   - max_step_stall_ms: 0 is the runtime "disable watchdog"
@@ -518,6 +523,11 @@ const BUDGET_INT_KEYS: ReadonlyArray<{
   // min=0: aggressive compaction — drop everything except the
   // system prompt.
   { snake: 'compaction_preserve_tail', camel: 'compactionPreserveTail', min: 0, max: 1000 },
+  // Override for the compaction summary's max_tokens (absent ⇒ the 1024 default
+  // in compaction.ts). Raise it for a dense session whose structured summary
+  // truncates at the cap. min=1: a 0-token summary is degenerate (no body →
+  // fallback); max=64_000 is the "obviously a typo" ceiling above.
+  { snake: 'compaction_max_tokens', camel: 'compactionMaxTokens', min: 1, max: 64_000 },
 ];
 
 // Float-valued budget keys. Same sanity-check posture as integers.
@@ -538,15 +548,20 @@ const BUDGET_FLOAT_KEYS: ReadonlyArray<{
   { snake: 'compaction_threshold', camel: 'compactionThreshold', min: 0, max: 1 },
 ];
 
-// Boolean-valued budget keys. The relevance compaction pre-pass is default-ON
-// (DEFAULT_BUDGET.compactionRelevance in src/harness/types.ts); this is the
-// operator's CLI opt-out — `[budget] compaction_relevance = false` disables the
-// BM25 pre-pass so it can never elide a tool_result the operator needs kept
-// verbatim. Without this key the default would be uncontrollable from config.
+// Boolean-valued budget keys. `compaction_relevance` is default-ON
+// (DEFAULT_BUDGET.compactionRelevance); this is the operator's CLI opt-out so the
+// BM25 pre-pass can never elide a tool_result they need kept verbatim.
+// `compaction_trigger_refine` is the opposite shape — default-OFF, an experimental
+// opt-IN for the #3 trigger refine (real-tokenizer skip; see the budget-field doc
+// in src/harness/types.ts). Wired here so it's controllable from config even
+// though it's off by default and intentionally absent from the init scaffold.
 const BUDGET_BOOL_KEYS: ReadonlyArray<{
   snake: string;
   camel: keyof BudgetConfigKeys;
-}> = [{ snake: 'compaction_relevance', camel: 'compactionRelevance' }];
+}> = [
+  { snake: 'compaction_relevance', camel: 'compactionRelevance' },
+  { snake: 'compaction_trigger_refine', camel: 'compactionTriggerRefine' },
+];
 
 const parseBudgetLayer = (
   path: string | null,

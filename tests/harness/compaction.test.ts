@@ -3,6 +3,7 @@ import {
   type CompactionResult,
   accountCompaction,
   compactMessages,
+  refineCompactionTrigger,
 } from '../../src/harness/compaction.ts';
 import type {
   GenerateRequest,
@@ -10,6 +11,7 @@ import type {
   ProviderMessage,
   StreamEvent,
 } from '../../src/providers/index.ts';
+import { estimatePromptTokens } from '../../src/providers/tokens.ts';
 
 const baseCaps: Provider['capabilities'] = {
   tools: 'native',
@@ -51,12 +53,13 @@ const replyTextWithUsage = (
 
 const mockProvider = (
   reply: ((req: GenerateRequest) => Iterable<StreamEvent>) | Error,
+  capsOverride?: Partial<Provider['capabilities']>,
 ): MockProviderHandle => {
   const generateCalls: GenerateRequest[] = [];
   const provider: Provider = {
     id: 'mock/c',
     family: 'anthropic',
-    capabilities: baseCaps,
+    capabilities: capsOverride !== undefined ? { ...baseCaps, ...capsOverride } : baseCaps,
     async *generate(req) {
       generateCalls.push(req);
       if (reply instanceof Error) throw reply;
@@ -289,6 +292,64 @@ describe('compactMessages — LLM path', () => {
       // phrase so a softening rewrite doesn't lose the hint.
       expect(system).toContain('file:line');
     });
+  });
+
+  test('clamps the summary max_tokens to the provider output_max_tokens cap', async () => {
+    // baseCaps.output_max_tokens = 4096; an operator raising compactionMaxTokens
+    // above it (the [budget] ceiling is 64k, above some Ollama/OpenRouter caps)
+    // must NOT send an invalid max_tokens — that would fail the summary into
+    // deterministic fallback instead of producing the larger summary requested.
+    const handle = mockProvider(() =>
+      replyText('[compacted_history]\nGOAL: x\n[/compacted_history]'),
+    );
+    await compactMessages(handle.provider, buildHistory(5), { preserveTail: 3, maxTokens: 8192 });
+    expect(handle.generateCalls[0]?.max_tokens).toBe(4096);
+  });
+
+  test('clamps the summary max_tokens to the remaining context window', async () => {
+    // Small window where the transcript fills most of it: both the requested value
+    // (8000) and the output cap (8000) exceed the room left, so the WINDOW bound is
+    // binding. Without it the summary call would send input + 8000 > 4000 and fail
+    // into fallback before producing a summary.
+    const handle = mockProvider(
+      () => replyText('[compacted_history]\nGOAL: x\n[/compacted_history]'),
+      { context_window: 4000, output_max_tokens: 8000 },
+    );
+    await compactMessages(handle.provider, buildHistory(8), { preserveTail: 1, maxTokens: 8000 });
+    const req = handle.generateCalls[0];
+    expect(req).toBeDefined();
+    const inputTokens = estimatePromptTokens(req?.messages ?? [], {
+      ...(req?.system !== undefined ? { system: req.system } : {}),
+    });
+    // The summary request fits its own window: input + max_tokens ≤ context_window.
+    expect((req?.max_tokens ?? 0) + inputTokens).toBeLessThanOrEqual(4000);
+    // The window, not the 8000 output cap, was the binding limit.
+    expect(req?.max_tokens).toBeLessThan(8000);
+  });
+
+  test('flags truncation when the summary hits the output cap (stop_reason=max_tokens)', async () => {
+    // A large middle can push the structured summary past max_tokens; the block
+    // gets cut off. The LLM strategy is still taken (a truncated summary beats
+    // losing the middle to elision), but `reason` surfaces the truncation so it
+    // is observable in the audit instead of silently dropping PENDING/ERRORS.
+    const truncatedReply = function* (): Iterable<StreamEvent> {
+      yield { kind: 'start', message_id: 'm' };
+      yield { kind: 'text_delta', text: '[compacted_history]\nGOAL: x\nPENDING: keep going' };
+      yield { kind: 'stop', reason: 'max_tokens' };
+    };
+    const handle = mockProvider(() => truncatedReply());
+    const result = await compactMessages(handle.provider, buildHistory(5), { preserveTail: 3 });
+    expect(result.strategy).toBe('llm');
+    expect(result.reason?.toLowerCase()).toContain('truncat');
+  });
+
+  test('a normal (end_turn) summary carries no truncation reason', async () => {
+    const handle = mockProvider(() =>
+      replyText('[compacted_history]\nGOAL: x\nPENDING: y\n[/compacted_history]'),
+    );
+    const result = await compactMessages(handle.provider, buildHistory(5), { preserveTail: 3 });
+    expect(result.strategy).toBe('llm');
+    expect(result.reason).toBeUndefined();
   });
 
   test('skips when history is shorter than goal + tail', async () => {
@@ -788,5 +849,78 @@ describe('compactMessages — summary exposure (for compaction_events audit)', (
     expect(result.strategy).toBe('llm');
     // The non-deterministic summary the loop persists to compaction_events.
     expect(result.summary).toContain('GOAL: keep going');
+  });
+});
+
+describe('refineCompactionTrigger', () => {
+  // triggerAt=1000, over-count margin ≈1.34 → confident-over boundary ≈1340.
+  const triggerAt = 1000;
+  // Non-binding by default (well above triggerAt) so these cases isolate the
+  // over-count logic; the dedicated test below makes it the binding limit.
+  const outputFitCeiling = 100_000;
+
+  test('confidently over the trigger → compact without a token-count round-trip', async () => {
+    let called = false;
+    const decision = await refineCompactionTrigger({
+      promptTokens: 1400, // > 1000 × 1.34
+      triggerAt,
+      fixedTokens: 100,
+      outputFitCeiling,
+      countMessages: async () => {
+        called = true;
+        return 0;
+      },
+    });
+    expect(decision).toBe('compact');
+    expect(called).toBe(false); // no round-trip when the estimate is confidently over
+  });
+
+  test('in the over-count band with a real count under trigger → skip (false alarm)', async () => {
+    const decision = await refineCompactionTrigger({
+      promptTokens: 1100, // inside the 1000..1340 band
+      triggerAt,
+      fixedTokens: 100,
+      outputFitCeiling,
+      countMessages: async () => 850, // 850 + 100 = 950 ≤ 1000 → genuinely under
+    });
+    expect(decision).toBe('skip');
+  });
+
+  test('in the band but the real count is still over → compact', async () => {
+    const decision = await refineCompactionTrigger({
+      promptTokens: 1100,
+      triggerAt,
+      fixedTokens: 100,
+      outputFitCeiling,
+      countMessages: async () => 950, // 950 + 100 = 1050 > 1000
+    });
+    expect(decision).toBe('compact');
+  });
+
+  test('under the trigger but over the output-fit ceiling → compact (would overflow)', async () => {
+    // A 64k output cap on a 200k window: trigger 140k, fit ceiling 136k. A real
+    // count of 138k is under the trigger but, once max_tokens is reserved,
+    // 138k + 64k > 200k — skipping would send an over-window request.
+    const decision = await refineCompactionTrigger({
+      promptTokens: 150_000, // in the band (< 140k × 1.34)
+      triggerAt: 140_000,
+      fixedTokens: 0,
+      outputFitCeiling: 136_000, // 200k − 64k
+      countMessages: async () => 138_000, // < trigger, > fit ceiling
+    });
+    expect(decision).toBe('compact');
+  });
+
+  test('a countMessages throw falls back to compact (never breaks the run)', async () => {
+    const decision = await refineCompactionTrigger({
+      promptTokens: 1100,
+      triggerAt,
+      fixedTokens: 100,
+      outputFitCeiling,
+      countMessages: async () => {
+        throw new Error('countTokens network error');
+      },
+    });
+    expect(decision).toBe('compact');
   });
 });

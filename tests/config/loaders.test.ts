@@ -699,6 +699,39 @@ compaction_threshold = 0.65
     }
   });
 
+  test('compaction_max_tokens parses as a positive integer; out-of-range is rejected', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
+      // The operator-facing knob that was eval-only before: a real config now
+      // raises the compaction summary cap.
+      writeFileSync(
+        join(cwd, '.forja', 'config.toml'),
+        `
+[budget]
+compaction_max_tokens = 4096
+`,
+      );
+      const ok = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(ok.config.compactionMaxTokens).toBe(4096);
+      expect(ok.warnings).toEqual([]);
+
+      // 0 is below the min (1) — a 0-token summary is degenerate.
+      writeFileSync(
+        join(cwd, '.forja', 'config.toml'),
+        `
+[budget]
+compaction_max_tokens = 0
+`,
+      );
+      const bad = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(bad.config.compactionMaxTokens).toBeUndefined();
+      expect(bad.warnings[0]).toContain('out of range');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   test('compaction_threshold = 0 accepted (compact every step, lower endpoint)', () => {
     // Endpoint pin: a future tightening to (0, 1) open interval
     // would forbid the legitimate "always compact" sentinel — the
@@ -759,6 +792,27 @@ compaction_relevance = false
       );
       const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
       expect(result.config.compactionRelevance).toBe(false);
+      expect(result.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('compaction_trigger_refine = true parses (experimental opt-in for the #3 refine)', () => {
+    // Default-OFF in DEFAULT_BUDGET; this is the config opt-in so an operator (or
+    // a measurement run) can enable the experimental real-tokenizer trigger refine.
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.forja', 'config.toml'),
+        `
+[budget]
+compaction_trigger_refine = true
+`,
+      );
+      const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.compactionTriggerRefine).toBe(true);
       expect(result.warnings).toEqual([]);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
