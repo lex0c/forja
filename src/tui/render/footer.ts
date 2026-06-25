@@ -185,10 +185,11 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
     rightParts.push(dim(caps, formatCost(status.sessionTotalCostUsd)));
   }
   // Context-window occupancy, the trailing chip (after cost). Deliberately a
-  // LATE-only signal: shown solely at >= 97% as a near-the-ceiling warning that
+  // LATE-only signal: shown solely near the ceiling as a warning that
   // compaction/overflow is imminent — below that it's noise the operator
-  // doesn't need. Painted `error` (red), not `dim` — at >= 97% the window is
-  // about to overflow, the strongest passive signal the footer carries.
+  // doesn't need. Two-stage paint: `warn` (yellow) at >= 95% as the early
+  // heads-up, escalating to `error` (red) at >= 97% when the window is about
+  // to overflow — the strongest passive signal the footer carries.
   // Suppressed pre-boot (contextWindow 0), before the first measured
   // turn (lastTurnContextTokens 0), and while stale (post-compaction, before a
   // real turn re-measures from provider usage) so we never show an estimated or
@@ -202,6 +203,8 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
     );
     if (pct >= 97) {
       rightParts.push(paint(caps, 'error', `${pct}% context used`));
+    } else if (pct >= 95) {
+      rightParts.push(paint(caps, 'warn', `${pct}% context used`));
     }
   }
   const right = rightParts.join(sep);

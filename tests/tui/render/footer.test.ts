@@ -289,7 +289,7 @@ describe('renderFooter', () => {
     });
   });
 
-  describe('context-used chip (`N% context used`, >= 97% only)', () => {
+  describe('context-used chip (`N% context used`, >= 95% only)', () => {
     test('surfaces at >= 97% occupancy', () => {
       const out =
         renderFooter(
@@ -312,12 +312,21 @@ describe('renderFooter', () => {
       expect(out.indexOf('$0.50')).toBeLessThan(out.indexOf('% context used'));
     });
 
-    test('suppressed below 97%', () => {
+    test('surfaces in the 95%–96% band (early warn stage)', () => {
       const out =
         renderFooter(
           startedSession({ contextWindow: 200_000, lastTurnContextTokens: 192_000 }),
           caps,
         ) ?? ''; // 96%
+      expect(out).toContain('96% context used');
+    });
+
+    test('suppressed below 95%', () => {
+      const out =
+        renderFooter(
+          startedSession({ contextWindow: 200_000, lastTurnContextTokens: 188_000 }),
+          caps,
+        ) ?? ''; // 94%
       expect(out).not.toContain('context used');
     });
 
@@ -354,7 +363,7 @@ describe('renderFooter', () => {
       expect(out).not.toContain('105% context used');
     });
 
-    test('painted error (red) when color is enabled', () => {
+    test('painted error (red) at >= 97% when color is enabled', () => {
       const colored: Capabilities = { ...caps, color: 'basic' };
       const out =
         renderFooter(
@@ -363,6 +372,17 @@ describe('renderFooter', () => {
         ) ?? '';
       // error = SGR 31 — near-overflow is the strongest passive footer signal.
       expect(out).toContain(`${CSI}31m99% context used${CSI}0m`);
+    });
+
+    test('painted warn (yellow) in the 95%–96% band when color is enabled', () => {
+      const colored: Capabilities = { ...caps, color: 'basic' };
+      const out =
+        renderFooter(
+          startedSession({ contextWindow: 200_000, lastTurnContextTokens: 192_000 }),
+          colored,
+        ) ?? ''; // 96%
+      // warn = SGR 33 — the early heads-up before the red near-overflow alarm.
+      expect(out).toContain(`${CSI}33m96% context used${CSI}0m`);
     });
   });
 
