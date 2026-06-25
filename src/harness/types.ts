@@ -514,13 +514,15 @@ export interface RunBudget {
   // pure-LLM path). Optional because it is a feature flag —
   // absent ⇒ inherits the DEFAULT_BUDGET value (on).
   compactionRelevance?: boolean;
-  // Override for the compaction LLM summary's `max_tokens`
-  // (`CompactionOptions.maxTokens`). Absent ⇒ compaction.ts's 1024 default. Raise
-  // it for a session whose middle is so dense the structured summary truncates at
-  // the cap — the section order keeps GOAL/PENDING/ERRORS ahead of a cut, but a
-  // higher cap avoids the cut entirely; lower it in an eval to exercise the
-  // truncation path deterministically. Optional feature-flag shape (no
-  // DEFAULT_BUDGET entry) so absent inherits the module default, not a fixed value.
+  // Cap on the compaction LLM summary's `max_tokens` (`CompactionOptions.maxTokens`).
+  // Defaulted to 1024 in DEFAULT_BUDGET and surfaced as `[budget]
+  // compaction_max_tokens`, an operator-tunable like the other compaction keys;
+  // compaction.ts also falls back to 1024 for direct callers that pass no budget.
+  // Raise it for a session whose middle is so dense the structured summary
+  // truncates at the cap (the section order keeps GOAL/PENDING/ERRORS ahead of a
+  // cut, but a higher cap avoids it entirely); lower it in an eval to exercise the
+  // truncation path deterministically. Optional in the type so a partial budget
+  // override (or a programmatic caller) need not restate it.
   compactionMaxTokens?: number;
   // Hard cap on total spend for this run, in USD. AGENTIC_CLI.md §5
   // declares a default of 5 — cost is the engagement gate; step
@@ -609,6 +611,11 @@ export const DEFAULT_BUDGET: RunBudget = {
   // against the provider capability via `resolveMaxOutputTokens`.
   compactionThreshold: 0.7,
   compactionPreserveTail: 3,
+  // Default cap on the compaction summary's tokens (compaction.ts also falls back
+  // to 1024 for direct compactMessages callers that pass no budget). Operator-
+  // tunable via `[budget] compaction_max_tokens`; raise it for a dense session
+  // whose structured summary truncates at the cap.
+  compactionMaxTokens: 1024,
   // Default-ON: the relevance pre-pass runs before the (billed) LLM summary and
   // skips it entirely when it frees enough. The A/B preserved task success on
   // every run (CONTEXT_TUNING §12); ON for safety, not a fixed % (see BACKLOG).
