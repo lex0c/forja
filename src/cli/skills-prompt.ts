@@ -1,4 +1,5 @@
 import type { SkillCatalog } from '../skills/index.ts';
+import { sanitizeForPromptLine } from './prompt-codespan.ts';
 
 // Eager skill-catalog injection into the system prompt (spec
 // SKILLS.md §4.1: "surface eager, body lazy"). Renders the resolved
@@ -34,7 +35,13 @@ export const assembleSkillCatalogSection = (catalog: SkillCatalog): string => {
   }
   const lines: string[] = [SKILLS_SECTION_HEADER, ''];
   for (const entry of entries) {
-    lines.push(`- [${entry.scope}] ${entry.name} — ${entry.frontmatter.description}`);
+    // name + description are author-controlled (project-scope skills load from a
+    // cloned repo) and land in the system prompt; sanitize the single-line
+    // markdown so a crafted description can't break the list item and inject a
+    // header / pseudo-instruction. Backticks stay (legit `code` refs).
+    lines.push(
+      `- [${entry.scope}] ${sanitizeForPromptLine(entry.name)} — ${sanitizeForPromptLine(entry.frontmatter.description)}`,
+    );
   }
   return lines.join('\n');
 };

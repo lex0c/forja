@@ -26,6 +26,17 @@ describe('assembleSkillCatalogSection', () => {
     ]);
   });
 
+  test('preserves backticks in a description (line-sanitized, not code-span-mangled)', () => {
+    // Description is author-controlled and rendered into the system prompt; it is
+    // sanitized for injection (newline/control) but NOT through the code-span
+    // sanitizer, so a legitimate `code` reference must survive. A regression to
+    // sanitizeForCodeSpan would turn the backticks into apostrophes.
+    const roots = makeRoots(makeTmp());
+    writeSkill(roots.user, 'grep-tips', skillDoc('grep-tips', 'use `grep -n` to find lines'));
+    const section = assembleSkillCatalogSection(createSkillCatalog({ roots }));
+    expect(section).toContain('- [user] grep-tips — use `grep -n` to find lines');
+  });
+
   test('a shadowed skill does not appear — only resolved winners render', () => {
     const roots = makeRoots(makeTmp());
     writeSkill(roots.user, 'deploy', skillDoc('deploy', 'user version'));

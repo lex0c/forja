@@ -68,3 +68,30 @@ export const sanitizeForCodeSpan = (raw: string): string => {
   }
   return v;
 };
+
+// Sanitizer for an attacker-influenceable value rendered as a SINGLE-LINE
+// markdown value OUTSIDE a code span — a table cell (playbook discovery), a
+// list-item description (skill catalog, memory index). Unlike
+// `sanitizeForCodeSpan`, backticks are PRESERVED: these values legitimately
+// carry `code` references and, sitting outside a code span, a backtick can't
+// break out of one. The breakout vectors that DO apply are the newline (escape
+// the row/line and inject fresh markdown — a fake header, bullet, or
+// pseudo-instruction read at system priority) and control bytes (ANSI/ESC
+// smuggling); both are neutralized, mirroring the env-block hardening. No length
+// cap here: the playbook table renders `when_to_use` verbatim by contract, so
+// length stays the caller's concern.
+export const sanitizeForPromptLine = (raw: string): string => {
+  // Newlines first → visible glyph (preserves the signal a break existed) so the
+  // value folds to one line; then strip the remaining C0/DEL control bytes.
+  let v = raw.replace(/\r\n|\r|\n/g, '⏎');
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: deliberate strip
+  v = v.replace(/[\x00-\x1F\x7F]/g, '');
+  return v;
+};
+
+// Markdown-table-cell variant: also escapes `|` so a crafted value can't inject
+// an extra column or break the row. Used by the playbook discovery table, whose
+// cells (`name`, `when_to_use`) come from subagent frontmatter — operator- or
+// project-authored, i.e. attacker-influenceable in a shared/cloned repo.
+export const sanitizeForTableCell = (raw: string): string =>
+  sanitizeForPromptLine(raw).replace(/\|/g, '\\|');

@@ -1077,8 +1077,9 @@ export interface HarnessConfig {
   // (one-shot run), the loop creates a per-run set — sticky within that one run.
   // Mutated in place by the loop's searchTools; the caller owns its lifetime.
   revealedTools?: Set<string>;
-  // Inject the static operating guidance block ([workflow_discipline] +
-  // [engineering_principles]) at the bottom of [current_turn], below the
+  // Inject the static operating guidance block ([workflow_discipline] —
+  // loop-control discipline only; stable craft constraints live in the cached
+  // `# Constraints` prefix) at the bottom of [current_turn], below the
   // working-state panel. Primary-agent only: the main CLI bootstrap (cli/
   // bootstrap.ts) turns it on for the one-shot and REPL loops, while subagents
   // (which build their config in cli/subagent-child.ts, bypassing bootstrap)

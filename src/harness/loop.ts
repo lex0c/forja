@@ -60,7 +60,7 @@ import type { PermissionDecision } from '../subagents/ipc.ts';
 import { MAX_SUBAGENT_DEPTH, runSubagent } from '../subagents/runtime.ts';
 import { type TodoStore, createTodoStore } from '../todo/index.ts';
 import { rankDeferredTools } from '../tools/builtin/tool-search.ts';
-import { isDeferred } from '../tools/context-budget.ts';
+import { isDeferred, isSmallWindow } from '../tools/context-budget.ts';
 import type { ToolContext } from '../tools/index.ts';
 import type {
   SearchToolsResult,
@@ -2923,7 +2923,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // below) but gated to the primary agent: subagents have no working-state
         // machinery, so they leave `enableStaticGuidance` off (set only by the
         // main CLI bootstrap). Unlike the panel this is constant, not no-op'd.
-        if (config.enableStaticGuidance) injectStaticGuidance(reqMessages);
+        // Lean the per-step guidance on a tight window (CONTEXT_TUNING §2.2):
+        // it rides the uncached tail, so on a small (often no-cache local) model
+        // its re-paid cost is a bigger fraction of the budget. Re-picked per step
+        // off the live window so a /model swap re-tiers, like the prefix shaping.
+        if (config.enableStaticGuidance)
+          injectStaticGuidance(
+            reqMessages,
+            isSmallWindow(config.provider?.capabilities?.context_window ?? 0),
+          );
         const req: GenerateRequest = {
           model: config.provider.id,
           messages: reqMessages,

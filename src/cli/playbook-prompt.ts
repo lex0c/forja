@@ -21,6 +21,7 @@
 
 import type { SubagentSet } from '../subagents/load.ts';
 import type { SubagentDefinition } from '../subagents/types.ts';
+import { sanitizeForTableCell } from './prompt-codespan.ts';
 
 // Maximum number of rows rendered in the discovery table. Spec
 // `PLAYBOOKS.md` §1.4 caps at 12. Defs without `whenToUse` never
@@ -35,27 +36,23 @@ export const MAX_PLAYBOOK_TABLE_ROWS = 12;
 // reliably than positive descriptions of personas.
 export const PLAYBOOK_DELEGATION_PREAMBLE = `# Playbook subagents
 
-Specialized subagents are available for structured workflows. Each one runs in an isolated context with restricted tools and returns a fixed-schema report. Spawn one with \`task_sync(playbook=<name>, prompt=<self-contained instruction>)\` for sequential coordination, or \`task_async\` when fanning out independent subtasks. The \`name\` column below is the routing identifier — slash commands (when present) are operator-facing and never used for tool routing.
+Subagents run in an isolated context with their own tools and budget: named playbooks return a fixed-schema report, \`general-purpose\` returns a prose summary. Spawn one with \`task_sync(playbook=<name>, prompt=<self-contained instruction>)\` for sequential work, or \`task_async\` to fan out independent subtasks. The \`name\` column below is the routing identifier — slash commands are operator-facing, never used for tool routing.
 
-**If the request IS a loaded playbook's job, dispatch that playbook — do not do the work inline.** "review this diff/PR/branch" → \`code-review\`; "audit this / is this secure?" → \`security-audit\`; "why is this slow / find the regression" → \`perf-investigate\`. The request named the job; route it, do not re-implement it. Doing it inline floods this turn with the exact reads the playbook would isolate and drops its structured report (and, for review, its read-only guarantee).
+**If the request IS a loaded playbook's job, dispatch that playbook — do not do the work inline.** "review this diff/PR/branch" → \`code-review\`; "audit this / is this secure?" → \`security-audit\`; "why is this slow / find the regression" → \`perf-investigate\`. Doing it inline floods this turn with the exact reads the playbook would isolate and drops its structured report (and, for review, its read-only guarantee).
 
-The core benefit is context compression: a subagent's reads, greps, and tool output stay in ITS context, and only a concise summary returns to this turn. Delegate when the cost of the exploration would exceed the cost of that summary — a large, self-contained investigation whose raw trail you do not need to keep. Ask the child for findings, conclusions, and evidence (file:line), not the trail.
+The core benefit is context compression: the subagent's reads, greps, and tool output stay in ITS context; only a concise summary — findings, conclusions, evidence (file:line), not the raw trail — returns to this turn. That summary is raw material for YOUR answer, not a "task done" signal: when the operator's request WAS the delegated work ("explore the repo", "find the bug", "audit this"), present its findings to them; don't end the turn asking what's next with the report unspoken.
 
 **Delegate to a playbook when:**
-- The work is a large but self-contained investigation — repo exploration, root-cause hunt, broad code search, research — where the question is clear and the reading is voluminous. \`general-purpose\` returns the summary; the raw reads stay out of this turn.
-- The task fits a playbook's structured schema and the user benefits from the categorized output.
-- You want context isolation — the subagent's intermediate reads stay out of this turn, keeping the parent context lean.
-- You want restricted tools — e.g., a review subagent that must NOT edit code.
-- The task demands an explicit bias (e.g., paranoia for \`security-audit\`) that conflicts with the default tone.
+- The work is a large but self-contained investigation — repo exploration ("explore/understand the repo"), root-cause hunt, broad code search, research — where the question is clear and the reading is voluminous. \`general-purpose\` returns the summary; the raw reads stay out of this turn.
+- The task fits a playbook's schema, or needs restricted tools (a reviewer that must NOT edit code) or an explicit bias (paranoia for \`security-audit\`) that conflicts with the default tone.
 
 **Do NOT delegate when:**
 - The question is answerable in 1-2 reads without a schema (e.g., "where is function X defined?").
-- The problem itself is still taking shape and you are iterating interactively — delegate a self-contained investigation once the question is sharp, not an open-ended "help me think". (A clear question over voluminous reading IS a good candidate — that is compression, not premature locking.)
-- The work is tightly coupled to this turn's edits or needs continuous back-and-forth — delegation pays off for work done in isolation, not step-by-step coordination.
-- The task does not match any playbook's \`when_to_use\` and is not a clean general-purpose investigation — do not force-fit.
-- The user asked for a direct answer, not a structured report.
+- The problem is still taking shape and you are iterating interactively — delegate once the question is sharp, not an open-ended "help me think".
+- The work is tightly coupled to this turn's edits or needs continuous back-and-forth — delegation pays off in isolation, not step-by-step coordination.
+- The task matches no playbook's \`when_to_use\` and is not a clean general-purpose investigation, or the user asked for a direct answer rather than a structured report.
 
-Spawning a subagent costs context handoff, budget, and latency. For a general question, default to answering directly — delegation is the exception there. But when the request matches a playbook's domain (above), dispatching IS the default, not the exception; the benefit it pays is context compression, isolation, schema, bias, or tool restriction.`;
+Spawning a subagent costs context handoff, budget, and latency. For a general question, default to answering directly; when the request matches a playbook's domain (above), dispatching IS the default.`;
 
 // Workflow discipline that complements the delegation criteria.
 // PLAYBOOKS.md §1.4 frames delegation as a per-call decision; this
@@ -78,6 +75,22 @@ export const PLAYBOOK_WORKFLOW_HEADER = `**Workflow:**
 
 - For tasks that span multiple files or multiple verification surfaces (compile + test + runtime UI + permissions, etc.), name the discrete sub-problems before acting on any of them. Each one is then a candidate for direct work, parallel \`task_async\` fan-out, or sequential \`task_sync\` delegation. Naming the steps prevents drift mid-turn. Trivial changes — single-file edits, doc/comment tweaks, one-line fixes — skip this; decomposition has overhead too.
 - Every delegated task carries a self-contained \`prompt\` — assume the subagent has zero context from this conversation. Inline the goal, the constraints, and the expected output shape.`;
+
+// Lean playbook preamble for the tight-window tier (CONTEXT_TUNING §2.2). The
+// full preamble's delegate / do-NOT-delegate bullet lists (~250 tok of nuance)
+// and the workflow-decomposition header are dropped: on a small window — often a
+// local model with NO prefix caching, so every prefix token is re-paid each turn
+// — the ROUTING capability is what earns its keep, not the delegation nuance a
+// weak model under-uses anyway. Kept: the schema-vs-prose framing, the self-
+// contained prompt discipline (folded into the spawn line, since the workflow
+// header that carried it is gone), the dispatch rule + concrete routing
+// triggers, and the relay rule (the observed drop-the-result failure). The table
+// renders after this, same as the full path.
+export const PLAYBOOK_DELEGATION_PREAMBLE_LEAN = `# Playbook subagents
+
+Subagents run in an isolated context with their own tools and budget: named playbooks return a fixed-schema report, \`general-purpose\` returns a prose summary. Spawn with \`task_sync(playbook=<name>, prompt=<self-contained — the child sees none of this conversation>)\` for sequential work, or \`task_async\` to fan out. The \`name\` column below is the routing identifier.
+
+**If the request IS a loaded playbook's job, dispatch it — don't do the work inline.** "review this diff/PR" → \`code-review\`; "audit this" → \`security-audit\`; "why is this slow" → \`perf-investigate\`; "explore the repo" → \`general-purpose\`. The subagent's summary is YOUR answer to present, not a "task done" signal — when the request WAS the delegated work, relay its findings; don't end the turn asking what's next.`;
 
 // Names of the canonical review playbooks the closing-discipline
 // bullet references. Both ship in the playbooks step of `forja init`;
@@ -122,16 +135,20 @@ const eligibleDefinitions = (set: SubagentSet): SubagentDefinition[] => {
   return out;
 };
 
-// Render the markdown table. We intentionally do NOT escape `|`
-// inside cells: `whenToUse` is author-controlled and the spec
-// example shows free-form prose; an embedded `|` would break the
-// row but that is a lint-time problem the author can fix at
-// source. Auto-escaping here would silently mask malformed
-// frontmatter.
+// Render the markdown table. Cell values (`name`, `whenToUse`) come from
+// subagent frontmatter — operator- or project-authored, i.e. attacker-
+// influenceable in a shared/cloned repo. They land in the system prompt at
+// system priority, so each cell is sanitized: `sanitizeForTableCell` folds
+// newlines to a glyph (blocks row/markdown break-out and injected pseudo-
+// instructions), strips control bytes (ANSI/ESC), and escapes `|` (blocks
+// column injection). Backticks are preserved — a `code` reference in a
+// when_to_use cell is legitimate and can't break out of a cell.
 const renderTable = (defs: SubagentDefinition[], truncated: boolean): string => {
   const lines: string[] = ['| name | when_to_use |', '|---|---|'];
   for (const def of defs) {
-    lines.push(`| ${def.name} | ${def.whenToUse} |`);
+    lines.push(
+      `| ${sanitizeForTableCell(def.name)} | ${sanitizeForTableCell(def.whenToUse ?? '')} |`,
+    );
   }
   if (truncated) {
     // Footer line names the count of dropped entries so the
@@ -186,6 +203,33 @@ export const composeWithPlaybookHint = (
   set: SubagentSet | undefined,
 ): string | undefined => {
   const hint = buildPlaybookHint(set);
+  if (hint === null) return downstream;
+  if (downstream === undefined || downstream.length === 0) return hint;
+  return `${hint}\n\n---\n\n${downstream}`;
+};
+
+// Lean variant of `buildPlaybookHint` (CONTEXT_TUNING §2.2): lean preamble +
+// table, NO workflow header / closing-review bullet. Reuses the same eligibility
+// + table rendering so routing stays byte-identical; only the surrounding prose
+// shrinks.
+const buildPlaybookHintLean = (set: SubagentSet | undefined): string | null => {
+  if (set === undefined || set.byName.size === 0) return null;
+  const eligible = eligibleDefinitions(set);
+  if (eligible.length === 0) return null;
+  const truncated = eligible.length > MAX_PLAYBOOK_TABLE_ROWS;
+  const visible = truncated ? eligible.slice(0, MAX_PLAYBOOK_TABLE_ROWS) : eligible;
+  const table = renderTable(visible, truncated);
+  return `${PLAYBOOK_DELEGATION_PREAMBLE_LEAN}\n\n${table}`;
+};
+
+// Lean composer (tight-window tier). Same layering contract as
+// `composeWithPlaybookHint`; bootstrap precomputes both and `shapeSystemPrompt`
+// picks the lean-prefix variant when `isSmallWindow`.
+export const composeWithPlaybookHintLean = (
+  downstream: string | undefined,
+  set: SubagentSet | undefined,
+): string | undefined => {
+  const hint = buildPlaybookHintLean(set);
   if (hint === null) return downstream;
   if (downstream === undefined || downstream.length === 0) return hint;
   return `${hint}\n\n---\n\n${downstream}`;

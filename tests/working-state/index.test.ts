@@ -325,7 +325,7 @@ describe('formatWorkingState', () => {
     };
     const block = formatWorkingState(state, 20) as string;
     expect(block.startsWith('[working_state]')).toBe(true);
-    expect(block).toContain('focus: investigate glob (s.18, 2 steps atrás)');
+    expect(block).toContain('focus: investigate glob (s.18, 2 steps ago)');
     expect(block).toContain('H2 (model, 2 steps): bug in resolver');
     expect(block).toContain('evidence: engine.ts:798');
     // recency window (W=10 at step 20): step-19 entry shows, step-1 does not
