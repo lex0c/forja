@@ -428,11 +428,13 @@ export const COMPACTION_OVERCOUNT_MARGIN = 1.34;
 // count UNDER it — compacting then wastes a billed summary the run didn't need.
 //
 //   - estimate confidently over (> triggerAt × margin): 'compact', no round-trip.
-//   - estimate in the over-count band: count the messages for real (Anthropic's
-//     tokenizer endpoint; a local no-op estimate elsewhere) + the fixed
-//     system/tools estimate, and 'skip' only when that is genuinely under the
-//     trigger. A `countMessages` throw (network / unsupported) ⇒ 'compact' — never
-//     let an accuracy refinement break the run.
+//   - estimate in the over-count band: count the messages for real (a NATIVE
+//     tokenizer endpoint — Anthropic / Google; a chars/4 no-op on fallback-counter
+//     providers — OpenAI / Ollama / OpenRouter, whose countTokens returns the SAME
+//     estimate, so the skip can never fire there) + the fixed system/tools
+//     estimate, and 'skip' only when that is genuinely under the trigger. A
+//     `countMessages` throw (network / unsupported) ⇒ 'compact' — never let an
+//     accuracy refinement break the run.
 //
 // Safe by construction: 'skip' fires only when the REAL count is ≤ triggerAt
 // (already 30% below the window), so it can never relax into an over-window send;
