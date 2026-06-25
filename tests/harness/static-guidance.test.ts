@@ -12,16 +12,21 @@ const panel: WorkingState = {
 };
 
 describe('injectStaticGuidance', () => {
-  test('appends both guidance sections to a string user message', () => {
+  test('appends the loop-control guidance to a string user message', () => {
     const messages: ProviderMessage[] = [{ role: 'user', content: 'do the thing' }];
     injectStaticGuidance(messages);
     const text = messages[0]?.content as string;
     expect(text.startsWith('do the thing\n\nStanding operating context')).toBe(true);
     expect(text).toContain('\n\n[workflow_discipline]');
-    expect(text).toContain('[engineering_principles]');
     expect(text).toContain('verify its blast radius');
-    expect(text).toContain('Smallest correct diff');
-    expect(text).toContain('Fix the cause, not the symptom');
+    expect(text).toContain('Keep the working state accurate');
+    // Scope is loop-control ONLY. Stable craft constraints (smallest diff,
+    // fix-the-cause, match-conventions) live in the cached `# Constraints` prefix
+    // — paid once, not re-paid uncached at the tail every step. They must NOT
+    // reappear here, or the per-step duplication this split removed comes back.
+    expect(text).not.toContain('[engineering_principles]');
+    expect(text).not.toContain('Smallest correct diff');
+    expect(text).not.toContain('Fix the cause, not the symptom');
   });
 
   test('appends a text block to a tool_result user message', () => {

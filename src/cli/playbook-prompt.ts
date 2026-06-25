@@ -35,27 +35,23 @@ export const MAX_PLAYBOOK_TABLE_ROWS = 12;
 // reliably than positive descriptions of personas.
 export const PLAYBOOK_DELEGATION_PREAMBLE = `# Playbook subagents
 
-Specialized subagents are available for structured workflows. Each one runs in an isolated context with restricted tools and returns a fixed-schema report. Spawn one with \`task_sync(playbook=<name>, prompt=<self-contained instruction>)\` for sequential coordination, or \`task_async\` when fanning out independent subtasks. The \`name\` column below is the routing identifier — slash commands (when present) are operator-facing and never used for tool routing.
+Specialized subagents run structured workflows in an isolated context with restricted tools, returning a fixed-schema report. Spawn one with \`task_sync(playbook=<name>, prompt=<self-contained instruction>)\` for sequential work, or \`task_async\` to fan out independent subtasks. The \`name\` column below is the routing identifier — slash commands are operator-facing, never used for tool routing.
 
-**If the request IS a loaded playbook's job, dispatch that playbook — do not do the work inline.** "review this diff/PR/branch" → \`code-review\`; "audit this / is this secure?" → \`security-audit\`; "why is this slow / find the regression" → \`perf-investigate\`. The request named the job; route it, do not re-implement it. Doing it inline floods this turn with the exact reads the playbook would isolate and drops its structured report (and, for review, its read-only guarantee).
+**If the request IS a loaded playbook's job, dispatch that playbook — do not do the work inline.** "review this diff/PR/branch" → \`code-review\`; "audit this / is this secure?" → \`security-audit\`; "why is this slow / find the regression" → \`perf-investigate\`. Doing it inline floods this turn with the exact reads the playbook would isolate and drops its structured report (and, for review, its read-only guarantee).
 
-The core benefit is context compression: a subagent's reads, greps, and tool output stay in ITS context, and only a concise summary returns to this turn. Delegate when the cost of the exploration would exceed the cost of that summary — a large, self-contained investigation whose raw trail you do not need to keep. Ask the child for findings, conclusions, and evidence (file:line), not the trail.
+The core benefit is context compression: the subagent's reads, greps, and tool output stay in ITS context; only a concise summary — findings, conclusions, evidence (file:line), not the raw trail — returns to this turn.
 
 **Delegate to a playbook when:**
 - The work is a large but self-contained investigation — repo exploration, root-cause hunt, broad code search, research — where the question is clear and the reading is voluminous. \`general-purpose\` returns the summary; the raw reads stay out of this turn.
-- The task fits a playbook's structured schema and the user benefits from the categorized output.
-- You want context isolation — the subagent's intermediate reads stay out of this turn, keeping the parent context lean.
-- You want restricted tools — e.g., a review subagent that must NOT edit code.
-- The task demands an explicit bias (e.g., paranoia for \`security-audit\`) that conflicts with the default tone.
+- The task fits a playbook's schema, or needs restricted tools (a reviewer that must NOT edit code) or an explicit bias (paranoia for \`security-audit\`) that conflicts with the default tone.
 
 **Do NOT delegate when:**
 - The question is answerable in 1-2 reads without a schema (e.g., "where is function X defined?").
-- The problem itself is still taking shape and you are iterating interactively — delegate a self-contained investigation once the question is sharp, not an open-ended "help me think". (A clear question over voluminous reading IS a good candidate — that is compression, not premature locking.)
-- The work is tightly coupled to this turn's edits or needs continuous back-and-forth — delegation pays off for work done in isolation, not step-by-step coordination.
-- The task does not match any playbook's \`when_to_use\` and is not a clean general-purpose investigation — do not force-fit.
-- The user asked for a direct answer, not a structured report.
+- The problem is still taking shape and you are iterating interactively — delegate once the question is sharp, not an open-ended "help me think".
+- The work is tightly coupled to this turn's edits or needs continuous back-and-forth — delegation pays off in isolation, not step-by-step coordination.
+- The task matches no playbook's \`when_to_use\` and is not a clean general-purpose investigation, or the user asked for a direct answer rather than a structured report.
 
-Spawning a subagent costs context handoff, budget, and latency. For a general question, default to answering directly — delegation is the exception there. But when the request matches a playbook's domain (above), dispatching IS the default, not the exception; the benefit it pays is context compression, isolation, schema, bias, or tool restriction.`;
+Spawning a subagent costs context handoff, budget, and latency. For a general question, default to answering directly; when the request matches a playbook's domain (above), dispatching IS the default.`;
 
 // Workflow discipline that complements the delegation criteria.
 // PLAYBOOKS.md §1.4 frames delegation as a per-call decision; this

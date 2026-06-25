@@ -72,6 +72,14 @@ describe('constraints-prompt', () => {
     expect(CONSTRAINTS_PROMPT.toLowerCase()).toContain('hypotheses');
   });
 
+  test('CONSTRAINTS_PROMPT carries the fix-the-cause rule relocated from static guidance', () => {
+    // Moved out of the per-step static guidance block (re-paid uncached at the
+    // turn tail every step) into the cached prefix (paid once). Anchored so the
+    // move cannot silently drop it on either side.
+    expect(CONSTRAINTS_PROMPT).toContain('Fix the cause, not the symptom');
+    expect(CONSTRAINTS_PROMPT.toLowerCase()).toContain('suppressions');
+  });
+
   test('CONSTRAINTS_PROMPT tells the model to match existing code conventions', () => {
     // Always-present floor against cross-file paradigm drift
     // (functional here, OO there). Explicit project rules ride in

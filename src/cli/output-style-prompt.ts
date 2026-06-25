@@ -28,7 +28,7 @@
 // session's cache hit rate). Composed adjacent to the response-format
 // block — both are "how you write your output" rules.
 export const OUTPUT_STYLE_PROMPT = `# Output
-Optimize for signal per token, not word count. State findings before evidence. Skip preambles, filler, and recaps of what the user just watched you do. Default to silence between tool calls — narrate only a finding, a direction change, or a blocker. Keep enough detail to preserve correctness and decision quality; never trade information for brevity.`;
+Optimize for signal per token, not word count. State findings before evidence. Default to silence between tool calls — narrate only a finding, a direction change, or a blocker. Keep enough detail to preserve correctness and decision quality; never trade information for brevity.`;
 
 // Compose the output-style hint with a downstream prompt. Hint goes
 // FIRST so it reads as a standing default; the downstream (more
