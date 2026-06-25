@@ -9,7 +9,16 @@
 //     already the requested id (compare-before-write, no churn).
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { emitTomlDoc, persistModelPin } from '../../src/config/writer.ts';
@@ -188,6 +197,19 @@ name = "b"
     expect(r.kind).toBe('failed');
     if (r.kind === 'failed') expect(r.reason).toContain('not a table');
     expect(readFileSync(configPath, 'utf8')).toBe(original);
+  });
+
+  test('preserves a tightened (0600) file mode across a pin change', () => {
+    // An operator who `chmod 600`'d their config.toml must keep that mode
+    // after an autosave — a bare temp+rename would relax it to the umask
+    // default (0644). The shared atomicWrite fchmods the temp to match.
+    mkdirSync(join(workdir, '.forja'), { recursive: true });
+    writeFileSync(configPath, '[providers]\nmodel = "anthropic/claude-opus-4-8"\n');
+    chmodSync(configPath, 0o600);
+    expect(statSync(configPath).mode & 0o777).toBe(0o600);
+    const r = persistModelPin({ filePath: configPath, modelId: 'anthropic/claude-haiku-4-5' });
+    expect(r.kind).toBe('written');
+    expect(statSync(configPath).mode & 0o777).toBe(0o600);
   });
 });
 

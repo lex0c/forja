@@ -17,8 +17,8 @@
 //     `/memory governance` rewrite — a latent data-loss bug this
 //     centralization fixes for both callers.
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { atomicWrite } from '../fs/atomic-write.ts';
 
 const TOML_BARE_KEY_RE = /^[A-Za-z0-9_-]+$/;
 
@@ -135,18 +135,23 @@ export const readTomlDoc = (
   }
 };
 
-// Emit `doc` to `filePath` via atomic temp+rename (mirror of
-// src/memory/writer.ts — a partial write never leaves a truncated
-// config behind). Creates the parent dir if absent.
+// Emit `doc` to `filePath` via the repo's canonical atomic writer
+// (`src/fs/atomic-write.ts`). Beyond the temp+rename (a partial write
+// never leaves a truncated config) it is durable (fsync of temp + parent
+// dir) and — crucially — MODE-PRESERVING: it fchmods the temp to the
+// existing file's permission bits before the rename. A bare temp+rename
+// would mint a fresh inode at the umask default (typically 0644) and
+// silently relax a config an operator tightened to 0600 (the `forja init`
+// path explicitly preserves that mode; an autosave must not undo it).
+// Wrapped to keep this module's fail-soft union return — `atomicWrite`
+// throws, but `persistModelPin` / `/memory governance` must degrade to a
+// warning, never abort.
 export const writeTomlDocAtomic = (
   filePath: string,
   doc: Record<string, unknown>,
 ): { ok: true } | { ok: false; reason: string } => {
   try {
-    mkdirSync(dirname(filePath), { recursive: true });
-    const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
-    writeFileSync(tmp, emitTomlDoc(doc));
-    renameSync(tmp, filePath);
+    atomicWrite(filePath, emitTomlDoc(doc));
     return { ok: true };
   } catch (err) {
     return { ok: false, reason: `could not write ${filePath}: ${errMsg(err)}` };
