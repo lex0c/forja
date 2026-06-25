@@ -1,14 +1,18 @@
 name: compaction survives a truncated summary without losing the task
 evaluates: harness
-# Forces the compaction summary to TRUNCATE by capping its max_tokens: a read-heavy
-# task trips compaction (threshold 0.02), and the structured summary is cut off
-# before its close marker. The run must still succeed — the original goal is
-# re-injected verbatim (independent of the summary), and the section order
-# (GOAL -> PENDING -> ERRORS first) keeps the forward-looking context ahead of the
-# cut. Pins the truncation path: a truncated summary is ACCEPTED (strategy stays
-# `llm`, not failed into a worse deterministic elision) and the task completes.
-# compaction.ts additionally flags the truncation on the compaction_events row
-# (stop_reason=max_tokens), inspected out of band.
+# Caps the compaction summary's max_tokens so it cannot fit the full structured
+# block: a read-heavy task trips compaction (threshold 0.02), and the summary is
+# constrained hard. The run must still succeed regardless of how compaction
+# resolves — the original goal is re-injected verbatim (independent of the
+# summary), and the section order (GOAL -> PENDING -> ERRORS first) keeps the
+# forward-looking context ahead of any cut.
+#
+# Assertions are STRATEGY-AGNOSTIC on purpose (mirroring case 48): under a tiny
+# cap a strong model emits a truncated-but-substantive `llm` summary (accepted,
+# stop_reason=max_tokens flagged out of band), while a weaker model may emit an
+# empty/markers-only body that the empty-body guard routes to deterministic
+# `fallback`. BOTH preserve the goal, so the point is task survival under a
+# constrained summary budget, not a specific strategy.
 prompt: |
   IMPORTANT INSTRUCTION — must be honored in your FINAL message: prefix your
   final answer with the literal token `MARKER_52_SURVIVED` on its own line.
@@ -23,7 +27,6 @@ setup:
 expect:
   - tool_called: read_file
   - compaction_triggered:
-      strategy: llm
       min_count: 1
   - output_contains: MARKER_52_SURVIVED
   - output_contains: forja-core
