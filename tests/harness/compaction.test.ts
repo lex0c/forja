@@ -292,6 +292,18 @@ describe('compactMessages — LLM path', () => {
     });
   });
 
+  test('clamps the summary max_tokens to the provider output_max_tokens cap', async () => {
+    // baseCaps.output_max_tokens = 4096; an operator raising compactionMaxTokens
+    // above it (the [budget] ceiling is 64k, above some Ollama/OpenRouter caps)
+    // must NOT send an invalid max_tokens — that would fail the summary into
+    // deterministic fallback instead of producing the larger summary requested.
+    const handle = mockProvider(() =>
+      replyText('[compacted_history]\nGOAL: x\n[/compacted_history]'),
+    );
+    await compactMessages(handle.provider, buildHistory(5), { preserveTail: 3, maxTokens: 8192 });
+    expect(handle.generateCalls[0]?.max_tokens).toBe(4096);
+  });
+
   test('flags truncation when the summary hits the output cap (stop_reason=max_tokens)', async () => {
     // A large middle can push the structured summary past max_tokens; the block
     // gets cut off. The LLM strategy is still taken (a truncated summary beats

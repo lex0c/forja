@@ -54,6 +54,7 @@ All defaults are in `DEFAULT_BUDGET` (`src/harness/types.ts`).
 | `compactionThreshold` | `0.7` | fraction of the context window at which compaction triggers. `1.0` ≈ disable. |
 | `compactionPreserveTail` | `3` | minimum trailing turns kept verbatim during compaction. |
 | `compactionRelevance` | `true` | run the BM25 relevance pre-pass before the LLM summary — cheaply pointer-elide low-goal-relevance `tool_result` bodies (recoverable via `retrieve_context`). `false` keeps every `tool_result` verbatim until the fold. |
+| `compactionMaxTokens` | `1024` | cap on the compaction summary's `max_tokens`. Raise it when a dense session's structured summary truncates at the cap (sections lead with GOAL/PENDING/ERRORS, so a cut sacrifices the recoverable tail; a higher cap avoids it). Honored on every compaction path — auto, `/compact`, and summary-resume. |
 
 ---
 
@@ -80,7 +81,7 @@ Where each cap can be set:
 | Surface | Caps it can set | Scope |
 |---|---|---|
 | `DEFAULT_BUDGET` (code) | all | fallback |
-| `.forja/config.toml` `[budget]` | `max_steps`, `max_wall_clock_ms`, `max_step_stall_ms`, `compaction_preserve_tail`, `max_cost_usd`, `compaction_threshold`, `compaction_relevance` | persistent (project layer overrides user) |
+| `.forja/config.toml` `[budget]` | `max_steps`, `max_wall_clock_ms`, `max_step_stall_ms`, `compaction_preserve_tail`, `max_cost_usd`, `compaction_threshold`, `compaction_relevance`, `compaction_max_tokens` | persistent (project layer overrides user) |
 | CLI | `--max-steps` only | per-run |
 | `/effort <level>` preset | `maxSteps`, `maxConcurrentSubagents`, `maxToolErrors` | session (in memory, next turn) |
 | `/budget <sub> <val>` | `steps`, `cost`, `parallel-tools`, `subagents`, `relevance` | session (in memory, next turn) |
@@ -114,6 +115,7 @@ max_cost_usd = 20
 max_wall_clock_ms = 1800000   # 30 min
 compaction_threshold = 0.8
 compaction_relevance = false  # opt out of the relevance pre-pass (default on)
+compaction_max_tokens = 2048  # raise the summary cap for dense sessions (default 1024)
 ```
 
 ---

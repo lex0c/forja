@@ -293,7 +293,14 @@ const callSummaryProvider = async (
         content: `ORIGINAL GOAL (preserve literally in summary):\n${goalText(goal)}\n\nTRANSCRIPT TO SUMMARIZE:\n${transcript}`,
       },
     ],
-    max_tokens: options.maxTokens ?? 1024,
+    // Clamp to the provider's output ceiling. The compaction path bypasses
+    // `resolveMaxOutputTokens` (which guards normal generate calls), so an
+    // operator-raised `compactionMaxTokens` above the model's output_max_tokens
+    // (the 64k config ceiling can exceed an Ollama/OpenRouter entry's cap) would
+    // otherwise send an invalid max_tokens and fail the summary into deterministic
+    // fallback instead of producing the larger summary requested. Shared chokepoint
+    // ⇒ every path (auto loop, /compact, summary-resume, eval) is covered.
+    max_tokens: Math.min(options.maxTokens ?? 1024, provider.capabilities.output_max_tokens),
     temperature: 0,
   };
 
