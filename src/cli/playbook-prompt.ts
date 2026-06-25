@@ -35,14 +35,14 @@ export const MAX_PLAYBOOK_TABLE_ROWS = 12;
 // reliably than positive descriptions of personas.
 export const PLAYBOOK_DELEGATION_PREAMBLE = `# Playbook subagents
 
-Specialized subagents run structured workflows in an isolated context with restricted tools, returning a fixed-schema report. Spawn one with \`task_sync(playbook=<name>, prompt=<self-contained instruction>)\` for sequential work, or \`task_async\` to fan out independent subtasks. The \`name\` column below is the routing identifier — slash commands are operator-facing, never used for tool routing.
+Subagents run in an isolated context with their own tools and budget: named playbooks return a fixed-schema report, \`general-purpose\` returns a prose summary. Spawn one with \`task_sync(playbook=<name>, prompt=<self-contained instruction>)\` for sequential work, or \`task_async\` to fan out independent subtasks. The \`name\` column below is the routing identifier — slash commands are operator-facing, never used for tool routing.
 
 **If the request IS a loaded playbook's job, dispatch that playbook — do not do the work inline.** "review this diff/PR/branch" → \`code-review\`; "audit this / is this secure?" → \`security-audit\`; "why is this slow / find the regression" → \`perf-investigate\`. Doing it inline floods this turn with the exact reads the playbook would isolate and drops its structured report (and, for review, its read-only guarantee).
 
-The core benefit is context compression: the subagent's reads, greps, and tool output stay in ITS context; only a concise summary — findings, conclusions, evidence (file:line), not the raw trail — returns to this turn.
+The core benefit is context compression: the subagent's reads, greps, and tool output stay in ITS context; only a concise summary — findings, conclusions, evidence (file:line), not the raw trail — returns to this turn. That summary is raw material for YOUR answer, not a "task done" signal: when the operator's request WAS the delegated work ("explore the repo", "find the bug", "audit this"), present its findings to them; don't end the turn asking what's next with the report unspoken.
 
 **Delegate to a playbook when:**
-- The work is a large but self-contained investigation — repo exploration, root-cause hunt, broad code search, research — where the question is clear and the reading is voluminous. \`general-purpose\` returns the summary; the raw reads stay out of this turn.
+- The work is a large but self-contained investigation — repo exploration ("explore/understand the repo"), root-cause hunt, broad code search, research — where the question is clear and the reading is voluminous. \`general-purpose\` returns the summary; the raw reads stay out of this turn.
 - The task fits a playbook's schema, or needs restricted tools (a reviewer that must NOT edit code) or an explicit bias (paranoia for \`security-audit\`) that conflicts with the default tone.
 
 **Do NOT delegate when:**

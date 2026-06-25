@@ -82,6 +82,26 @@ describe('PLAYBOOK_DELEGATION_PREAMBLE', () => {
     expect(lower).toContain('self-contained');
     expect(lower).toContain('tightly coupled');
   });
+
+  test('tells the model to relay a delegated result, not treat dispatch as task-done', () => {
+    // Regression: a weak model (kimi-k2.7) delegated "explore o repo" to
+    // general-purpose, got the summary back, then asked "what's next" instead of
+    // presenting it. The block governs WHEN to delegate; it must also say what to
+    // do with the result — relay it when the request WAS the delegated work, not
+    // end the turn with the report unspoken.
+    const lower = PLAYBOOK_DELEGATION_PREAMBLE.toLowerCase();
+    expect(lower).toContain('your answer');
+    expect(lower).toContain('present its findings');
+    expect(lower).toContain('explore the repo');
+  });
+
+  test('names both subagent return shapes — fixed-schema (playbooks) and prose (general-purpose)', () => {
+    // The opening over-claimed "fixed-schema report" for every subagent, but
+    // general-purpose returns prose — a seam a weak model trips on (got prose,
+    // expected schema, unsure if done). Both shapes must be named.
+    expect(PLAYBOOK_DELEGATION_PREAMBLE).toContain('fixed-schema report');
+    expect(PLAYBOOK_DELEGATION_PREAMBLE.toLowerCase()).toContain('prose summary');
+  });
 });
 
 describe('composeWithPlaybookHint — empty registry paths', () => {
