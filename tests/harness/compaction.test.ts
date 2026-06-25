@@ -832,6 +832,9 @@ describe('compactMessages — summary exposure (for compaction_events audit)', (
 describe('refineCompactionTrigger', () => {
   // triggerAt=1000, over-count margin ≈1.34 → confident-over boundary ≈1340.
   const triggerAt = 1000;
+  // Non-binding by default (well above triggerAt) so these cases isolate the
+  // over-count logic; the dedicated test below makes it the binding limit.
+  const outputFitCeiling = 100_000;
 
   test('confidently over the trigger → compact without a token-count round-trip', async () => {
     let called = false;
@@ -839,6 +842,7 @@ describe('refineCompactionTrigger', () => {
       promptTokens: 1400, // > 1000 × 1.34
       triggerAt,
       fixedTokens: 100,
+      outputFitCeiling,
       countMessages: async () => {
         called = true;
         return 0;
@@ -853,6 +857,7 @@ describe('refineCompactionTrigger', () => {
       promptTokens: 1100, // inside the 1000..1340 band
       triggerAt,
       fixedTokens: 100,
+      outputFitCeiling,
       countMessages: async () => 850, // 850 + 100 = 950 ≤ 1000 → genuinely under
     });
     expect(decision).toBe('skip');
@@ -863,7 +868,22 @@ describe('refineCompactionTrigger', () => {
       promptTokens: 1100,
       triggerAt,
       fixedTokens: 100,
+      outputFitCeiling,
       countMessages: async () => 950, // 950 + 100 = 1050 > 1000
+    });
+    expect(decision).toBe('compact');
+  });
+
+  test('under the trigger but over the output-fit ceiling → compact (would overflow)', async () => {
+    // A 64k output cap on a 200k window: trigger 140k, fit ceiling 136k. A real
+    // count of 138k is under the trigger but, once max_tokens is reserved,
+    // 138k + 64k > 200k — skipping would send an over-window request.
+    const decision = await refineCompactionTrigger({
+      promptTokens: 150_000, // in the band (< 140k × 1.34)
+      triggerAt: 140_000,
+      fixedTokens: 0,
+      outputFitCeiling: 136_000, // 200k − 64k
+      countMessages: async () => 138_000, // < trigger, > fit ceiling
     });
     expect(decision).toBe('compact');
   });
@@ -873,6 +893,7 @@ describe('refineCompactionTrigger', () => {
       promptTokens: 1100,
       triggerAt,
       fixedTokens: 100,
+      outputFitCeiling,
       countMessages: async () => {
         throw new Error('countTokens network error');
       },

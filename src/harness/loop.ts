@@ -2621,6 +2621,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           promptTokens,
           triggerAt,
           fixedTokens: estimatePromptTokens([], estimateOpts),
+          // The NEXT request reserves max_tokens; the provider rejects
+          // input + max_tokens > window. The 0.7 trigger's 30% headroom covers a
+          // normal output cap, but a model whose cap exceeds it (e.g. 64k on a
+          // 200k window) needs this tighter ceiling so a skip can't leave the next
+          // request over-window.
+          outputFitCeiling:
+            contextWindow - resolveMaxOutputTokens(budget, config.provider.capabilities),
           countMessages: () =>
             withAbort(config.provider.countTokens([...ctxForCount.getMessages()]), signal),
         });

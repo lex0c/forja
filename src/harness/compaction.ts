@@ -435,27 +435,36 @@ export const COMPACTION_OVERCOUNT_MARGIN = 1.34;
 // count UNDER it — compacting then wastes a billed summary the run didn't need.
 //
 //   - estimate confidently over (> triggerAt × margin): 'compact', no round-trip.
+//   - estimate confidently over (> triggerAt × margin): handled above — 'compact'.
 //   - estimate in the over-count band: count the messages for real (a NATIVE
 //     tokenizer endpoint — Anthropic / Google; a chars/4 no-op on fallback-counter
 //     providers — OpenAI / Ollama / OpenRouter, whose countTokens returns the SAME
 //     estimate, so the skip can never fire there) + the fixed system/tools
-//     estimate, and 'skip' only when that is genuinely under the trigger. A
-//     `countMessages` throw (network / unsupported) ⇒ 'compact' — never let an
-//     accuracy refinement break the run.
+//     estimate, and 'skip' only when that is under BOTH the trigger AND the
+//     output-fit ceiling. A `countMessages` throw (network / unsupported) ⇒
+//     'compact' — never let an accuracy refinement break the run.
 //
-// Safe by construction: 'skip' fires only when the REAL count is ≤ triggerAt
-// (already 30% below the window), so it can never relax into an over-window send;
-// it only suppresses a premature compaction.
+// Safe by construction: the provider validates `input + max_tokens ≤ window`, so
+// `outputFitCeiling = window − resolvedMaxTokens` is the real overflow guard. The
+// 0.7 trigger's 30% headroom covers a normal output cap, but a model whose output
+// cap exceeds that headroom (e.g. a 64k cap on a 200k window) makes the fit ceiling
+// tighter than triggerAt — so a real count just under the trigger could still
+// overflow once max_tokens is reserved. Skipping only at `≤ min(triggerAt,
+// outputFitCeiling)` keeps both the compaction policy and the hard window limit;
+// it can never relax into an over-window send, only suppress a premature compaction.
 export const refineCompactionTrigger = async (opts: {
   promptTokens: number;
   triggerAt: number;
   fixedTokens: number;
+  // contextWindow − resolvedMaxTokens: the largest accurate input count that still
+  // leaves room for the output reservation on the NEXT request.
+  outputFitCeiling: number;
   countMessages: () => Promise<number>;
 }): Promise<'compact' | 'skip'> => {
   if (opts.promptTokens > opts.triggerAt * COMPACTION_OVERCOUNT_MARGIN) return 'compact';
   try {
     const accurate = (await opts.countMessages()) + opts.fixedTokens;
-    return accurate <= opts.triggerAt ? 'skip' : 'compact';
+    return accurate <= Math.min(opts.triggerAt, opts.outputFitCeiling) ? 'skip' : 'compact';
   } catch {
     return 'compact';
   }
