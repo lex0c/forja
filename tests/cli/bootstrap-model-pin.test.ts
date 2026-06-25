@@ -113,7 +113,7 @@ afterEach(() => {
 });
 
 describe('bootstrap: --model autosave', () => {
-  test('persistModelPin + real --model resolution writes the pin + announces it', async () => {
+  test('persistModelPin + real --model resolution writes the pin silently', async () => {
     const { db } = await bootstrap({ ...baseArgs(), modelId: PINNED, persistModelPin: true });
     db.close();
     expect(existsSync(configPath)).toBe(true);
@@ -121,7 +121,8 @@ describe('bootstrap: --model autosave', () => {
       providers: { model: string };
     };
     expect(parsed.providers.model).toBe(PINNED);
-    expect(stderrJoined()).toContain(`pinned model '${PINNED}'`);
+    // A successful pin is silent — no boot-time chatter in the TUI.
+    expect(stderrJoined()).not.toContain('pinned model');
   });
 
   test('providerOverride injection is NEVER persisted (subagent/test safety)', async () => {
@@ -143,7 +144,7 @@ describe('bootstrap: --model autosave', () => {
     expect(existsSync(configPath)).toBe(false);
   });
 
-  test('--json suppresses the stderr line but STILL writes the pin', async () => {
+  test('writes the pin in --json mode without polluting stderr', async () => {
     const { db } = await bootstrap({
       ...baseArgs(),
       modelId: PINNED,

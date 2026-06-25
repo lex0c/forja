@@ -1737,8 +1737,8 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // pin, and `permResult.state === 'refusing'` is a failed boot (the same
   // predicate run.ts keys its exit-2 on). `persistModelPin` compares
   // before writing, so a repeated `--model <same>` is a true no-op.
-  // Fail-soft — a write error only warns; the success line is suppressed
-  // under --json to keep NDJSON consumers' stderr quiet.
+  // Fail-soft — a write error warns on stderr; a SUCCESSFUL pin is silent
+  // (no boot-time chatter in the TUI — the operator already typed the id).
   if (
     input.persistModelPin === true &&
     input.modelId !== undefined &&
@@ -1748,8 +1748,6 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     const pin = persistModelPin({ filePath: providersLoaded.projectPath, modelId });
     if (pin.kind === 'failed') {
       process.stderr.write(`forja: could not persist --model to config.toml: ${pin.reason}\n`);
-    } else if (pin.kind === 'written' && input.json !== true) {
-      process.stderr.write(`forja: pinned model '${modelId}' in ${providersLoaded.projectPath}\n`);
     }
   }
 
