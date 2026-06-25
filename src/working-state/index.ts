@@ -296,7 +296,7 @@ const renderBlock = (
   const lines: string[] = ['[working_state]'];
   if (state.focus) {
     const age = Math.max(0, currentStep - state.focus.atStep);
-    lines.push(`focus: ${state.focus.text} (s.${state.focus.atStep}, ${age} steps atrás)`);
+    lines.push(`focus: ${state.focus.text} (s.${state.focus.atStep}, ${age} steps ago)`);
   }
   if (state.next.length > 0) {
     lines.push('next:');
@@ -315,7 +315,7 @@ const renderBlock = (
   if (opts.log) {
     const windowed = state.log.filter((e) => e.atStep >= currentStep - WS_CAPS.logRenderWindow);
     if (windowed.length > 0) {
-      lines.push(`recent log (últimos ~${WS_CAPS.logRenderWindow} steps; mais novo embaixo):`);
+      lines.push(`recent log (last ~${WS_CAPS.logRenderWindow} steps; newest at bottom):`);
       for (const e of windowed) lines.push(`  - [s.${e.atStep}] ${e.text}`);
     }
   }
