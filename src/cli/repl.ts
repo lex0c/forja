@@ -42,6 +42,7 @@ import { flattenControlToLine, stripAnsi, stripControlKeepLines } from '../sanit
 import {
   HISTORY_CAP,
   appendHistory,
+  deleteLastHistoryIfMatches,
   historyOptOutReason,
   loadHistory,
   searchHistory,
@@ -1221,6 +1222,28 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     }
   };
 
+  // Inverse of recordHistorySubmit for the hard-abort un-send: the operator
+  // retracted the prompt they just sent, so drop it from history too — it must
+  // stop resurfacing via ↑/↓, Ctrl+R, and /history (which the persistent
+  // repl_history would otherwise keep across sessions), the same way it leaves
+  // the conversation. The DB delete matches on the tail content, and the mirror
+  // pop is likewise guarded, so neither touches anything but the just-recorded
+  // entry. Nav state resets so the next ↑ walks from the (now newest) entry.
+  const removeHistorySubmit = (text: string): void => {
+    historyIdx = null;
+    historyScratch = null;
+    if (!historyEnabled) return;
+    try {
+      deleteLastHistoryIfMatches(db, baseConfig.cwd, text);
+    } catch {
+      // Non-fatal, mirroring recordHistorySubmit: a failed delete just means the
+      // entry may reappear on next boot; the mirror pop below still hides it now.
+    }
+    if (historyEntries[historyEntries.length - 1] === text) {
+      historyEntries.pop();
+    }
+  };
+
   // ─── Reverse-search overlay (HISTORY.md §2.2) ──────────────────────
   // Local state mirrors the renderer's view so the editor handler
   // doesn't have to read it back via renderer.state(). Producer-side
@@ -1313,6 +1336,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // can't leak forward.
   let abortController: AbortController | null = null;
   let softStopController: AbortController | null = null;
+  // Operator text submitted THIS turn, eligible for "un-send" on a HARD abort:
+  // drop the cancelled turn from the live context (durable — the row is
+  // retracted) and refill the editor so the operator can edit/resend. Set at
+  // startTurn for operator submits; consumed + cleared in the session_finished
+  // handler. Null for system/wake turns and empty inputs.
+  let lastTurnOperatorText: string | null = null;
   // The promise returned by the in-flight runAgent (already wrapped
   // in `.catch().finally()`, so awaiting never throws). `shutdown`
   // awaits this before closing the DB so the harness's async cleanup
@@ -1495,6 +1524,45 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       // errored before resolving one leaves this null → the next turn
       // falls back to resumeFromSessionId (re-derive from the log).
       liveContext = event.result.sessionContext ?? null;
+      // Hard-abort un-send (migration 079): if the operator hard-cancelled this
+      // turn right after sending — nothing settled, so the live tail is still
+      // their message — drop it from the live context (durable: the row is
+      // retracted) and put the text back in the editor to edit/resend. Gated to
+      // operator submits; `popLastUserMessage` refuses unless the tail really is
+      // that message (a turn that produced an assistant turn before the abort
+      // keeps it).
+      if (
+        event.result.abortCause === 'hard' &&
+        lastTurnOperatorText !== null &&
+        liveContext !== null &&
+        liveContext.popLastUserMessage()
+      ) {
+        // Drop the un-sent prompt from input history too — it left the
+        // conversation, so it must not linger recallable via ↑/↓, Ctrl+R, or
+        // /history (repl_history outlives the session).
+        removeHistorySubmit(lastTurnOperatorText);
+        // Only refill when the editor is empty — never clobber text the operator
+        // typed while the turn ran.
+        const refilled = renderer.state().input.value.length === 0;
+        if (refilled) {
+          bus.emit({
+            type: 'input:update',
+            ts: now(),
+            value: lastTurnOperatorText,
+            cursor: lastTurnOperatorText.length,
+          });
+        }
+        // The operator's card already printed to scrollback (print-once) — it
+        // can't be struck retroactively, so a follow-up secondary line marks the
+        // turn un-sent. On resume the row renders "(unsent)" from retracted_at.
+        bus.emit({
+          type: 'info',
+          ts: now(),
+          tone: 'secondary',
+          message: refilled ? '↶ message unsent — restored to input' : '↶ message unsent',
+        });
+      }
+      lastTurnOperatorText = null;
       trackReplSessionId(event.result.sessionId);
       cumulative.costUsd += event.result.costUsd;
       cumulative.steps += event.result.steps;
@@ -1960,6 +2028,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // when actually on the reuse path (liveContext set).
     const includeResumeRecap = liveContext !== null && resumeRecapPending;
     resumeRecapPending = false;
+    // Track this turn's operator text for the hard-abort un-send affordance
+    // (consumed in the session_finished handler). Null for system/wake turns.
+    lastTurnOperatorText = source === 'operator' && text.length > 0 ? text : null;
     const cfg: HarnessConfig = {
       ...baseConfig,
       // Re-shape the system prompt against the live window (overrides the frozen

@@ -128,9 +128,11 @@ const buildItem = (
   // where listSessions runs before appendMessage just yields an
   // empty preview. SQL pulled inline because there's only one
   // call site and the shape is purpose-built for the listing.
+  // Skips retracted (operator un-sent) turns so a cancelled first
+  // prompt can't become a session's preview (migration 079).
   const row = db
     .query(
-      "SELECT content FROM messages WHERE session_id = ? AND role = 'user' ORDER BY created_at ASC LIMIT 1",
+      "SELECT content FROM messages WHERE session_id = ? AND role = 'user' AND retracted_at IS NULL ORDER BY created_at ASC LIMIT 1",
     )
     .get(s.id) as { content: string } | null;
   let preview = '';

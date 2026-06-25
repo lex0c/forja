@@ -201,6 +201,10 @@ const sessionResolver = (
   if (parsed.kind === 'message') {
     const msg = getMessage(db, parsed.id);
     if (msg === null) return null;
+    // Operator un-sent this turn (migration 079): never materialize a retracted
+    // message into model-facing context, even if a stale index matched it. Same
+    // exclusion as the resume rebuild; the row stays in the audit log.
+    if (msg.retractedAt !== null) return null;
     const text = messageText(msg.content);
     if (level === 'summary') {
       const firstLine = text.split('\n', 1)[0] ?? '';

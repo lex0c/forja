@@ -222,6 +222,12 @@ export const messagesToProviderMessages = (
   const out: ProviderMessage[] = [];
   for (const row of sliced) {
     if (!isAssistantOrUser(row.role)) continue;
+    // Operator un-sent this turn (migration 079): keep it out of the
+    // model-facing context so the un-send is durable across resume. The
+    // transcript / recap still render it ("cancelled") from the raw row — only
+    // the reconstituted provider messages drop it. The window cut above was
+    // computed on the FULL set, so the visual and model windows stay aligned.
+    if (row.retractedAt !== null) continue;
     // The cast is unverified: the persistence layer stored arbitrary
     // JSON content (parseJsonSafe → unknown), and we trust that the
     // loop wrote shapes the provider can later consume. There is no

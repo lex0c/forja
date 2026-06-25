@@ -169,6 +169,34 @@ export const clearHistory = (db: DB, projectRoot: string): void => {
   db.query('DELETE FROM repl_history WHERE project_root = ?').run(projectRoot);
 };
 
+// Remove the most-recent history row for this project IF it still matches
+// `prompt`. Used by the hard-abort un-send: the operator retracted the prompt
+// they just sent, so it must stop resurfacing via ↑/↓, Ctrl+R, and /history,
+// the same way it leaves the conversation. Matches on the tail's content (not a
+// blind "delete last") so a race that recorded a newer entry leaves history
+// untouched — we only ever drop the exact row `recordHistorySubmit` just added.
+// No-op (returns false) when history is disabled, empty, or the tail differs.
+export const deleteLastHistoryIfMatches = (
+  db: DB,
+  projectRoot: string,
+  prompt: string,
+): boolean => {
+  if (isHistoryDisabled(projectRoot)) return false;
+  return db.transaction(() => {
+    const last = db
+      .query(
+        `SELECT id, prompt FROM repl_history
+         WHERE project_root = ?
+         ORDER BY ts DESC, id DESC
+         LIMIT 1`,
+      )
+      .get(projectRoot) as { id: number; prompt: string } | null;
+    if (last === null || last.prompt !== prompt) return false;
+    db.query('DELETE FROM repl_history WHERE id = ?').run(last.id);
+    return true;
+  })();
+};
+
 export const countHistory = (db: DB, projectRoot: string): number => {
   return (
     db.query('SELECT COUNT(*) AS n FROM repl_history WHERE project_root = ?').get(projectRoot) as {

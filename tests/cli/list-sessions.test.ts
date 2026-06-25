@@ -6,7 +6,7 @@ import { runListSessions } from '../../src/cli/list-sessions.ts';
 import type { ModelRegistry } from '../../src/providers/registry.ts';
 import { type DB, openDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
-import { appendMessage } from '../../src/storage/repos/messages.ts';
+import { appendMessage, retractMessage } from '../../src/storage/repos/messages.ts';
 import { completeSession, createSession } from '../../src/storage/repos/sessions.ts';
 
 let tempDir: string;
@@ -54,6 +54,26 @@ describe('runListSessions', () => {
     expect(first.status).toBe('running');
     expect(second.id).toBe(a.id);
     expect(second.status).toBe('done');
+  });
+
+  test('prompt_preview skips a retracted (un-sent) first prompt', () => {
+    const s = createSession(db, { model: 'mock/a', cwd: '/p', startedAt: 1000 });
+    const cancelled = appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'oops cancelled prompt',
+    });
+    retractMessage(db, cancelled.id); // operator un-sent it (migration 079)
+    appendMessage(db, { sessionId: s.id, role: 'user', content: 'the real prompt' });
+
+    const out: string[] = [];
+    runListSessions({ json: true, dbOverride: db, out: (line) => out.push(line) });
+    const item = JSON.parse(out.join('').trim().split('\n')[0] ?? '{}') as {
+      prompt_preview: string;
+    };
+    // The cancelled text must not represent the session in the listing.
+    expect(item.prompt_preview).toContain('real prompt');
+    expect(item.prompt_preview).not.toContain('cancelled');
   });
 
   test('resolves metering against the injected operator catalog, not just the seed', () => {

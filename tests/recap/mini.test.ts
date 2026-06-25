@@ -9,7 +9,7 @@ import {
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { appendFailureEvent } from '../../src/storage/repos/failure-events.ts';
-import { appendMessage } from '../../src/storage/repos/messages.ts';
+import { appendMessage, retractMessage } from '../../src/storage/repos/messages.ts';
 import { completeSession, createSession } from '../../src/storage/repos/sessions.ts';
 import { createToolCall, finishToolCall } from '../../src/storage/repos/tool-calls.ts';
 
@@ -131,6 +131,26 @@ describe('projectRecapMini', () => {
     expect(result.goal).toBe('do thing');
     expect(result.steps).toBe(1);
     expect(result.incomplete).toBe(false);
+  });
+
+  test('skips a retracted (un-sent) first prompt — the cancelled text is not the goal', () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/p', startedAt: 1_000 });
+    const cancelled = appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'oops cancelled prompt',
+      createdAt: 1_100,
+    });
+    retractMessage(db, cancelled.id); // operator un-sent it (migration 079)
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'the real goal',
+      createdAt: 1_200,
+    });
+    const result = projectRecapMini(db, { sessionId: s.id });
+    // The mini goal / oneLineSummary must not surface the un-sent text (or match --search).
+    expect(result.goal).toBe('the real goal');
   });
 
   test('running session: durationMs uses now - startedAt', () => {
