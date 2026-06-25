@@ -168,4 +168,22 @@ model = "${PINNED}"
     expect(readFileSync(configPath, 'utf8')).toBe(original);
     expect(stderrJoined()).not.toContain('pinned model');
   });
+
+  test('a boot that aborts after model resolution does NOT pin (deferred write)', async () => {
+    // A malformed enterprise policy throws in preflightPermissionEngine —
+    // a boot-blocking failure AFTER --model resolves. The pin is deferred
+    // to the end of a successful bootstrap, so a boot that never started
+    // must NOT have rewritten the committed config.
+    const badPolicy = join(workdir, 'bad-policy.yaml');
+    writeFileSync(badPolicy, 'defaults: { mode: [unterminated\n');
+    await expect(
+      bootstrap({
+        ...baseArgs(),
+        modelId: PINNED,
+        persistModelPin: true,
+        enterprisePolicyPath: badPolicy,
+      }),
+    ).rejects.toThrow();
+    expect(existsSync(configPath)).toBe(false);
+  });
 });

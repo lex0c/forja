@@ -511,30 +511,12 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     provider = resolved.provider;
   }
 
-  // Autosave the `--model` selection (opt-in via persistModelPin, set
-  // only by the main operator run path). Writes the resolved id into the
-  // PROJECT `[providers].model` — the very file the resolution chain
-  // above reads first — so the next start lands here without re-passing
-  // the flag. `persistModelPin` compares before writing, so a repeated
-  // `--model <same>` is a true no-op (no churn of the committed config).
-  // Guards: `modelId` came from the CLI flag (input.modelId !==
-  // undefined ⇒ it won the `??` chain), and a `providerOverride`
-  // (test/dev injection) is never an operator pin. Fail-soft — a write
-  // error surfaces on stderr and boot continues on the in-memory
-  // provider; the success line is suppressed in --json mode to keep
-  // NDJSON consumers' stderr quiet (mirrors the governance banner).
-  if (
-    input.persistModelPin === true &&
-    input.modelId !== undefined &&
-    input.providerOverride === undefined
-  ) {
-    const pin = persistModelPin({ filePath: providersLoaded.projectPath, modelId });
-    if (pin.kind === 'failed') {
-      process.stderr.write(`forja: could not persist --model to config.toml: ${pin.reason}\n`);
-    } else if (pin.kind === 'written' && input.json !== true) {
-      process.stderr.write(`forja: pinned model '${modelId}' in ${providersLoaded.projectPath}\n`);
-    }
-  }
+  // NOTE: the `--model` autosave (persistModelPin) used to fire HERE,
+  // right after resolution. It is now DEFERRED to the end of bootstrap —
+  // see the block just before the return — so a boot that aborts in any
+  // later boot-blocking check (subagent load/validate, permission
+  // preflight, DB migrate, a `refusing` chain verify) never rewrites the
+  // committed `.forja/config.toml` from an invocation that never started.
 
   // [budget] config — resolves before the harness builds its
   // RunBudget. Per-key merge: project [budget].max_steps wins
@@ -1742,6 +1724,34 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
           `the maxCostUsd cost cap ($${effectiveMaxCostUsd}) cannot bound this run: model '${config.provider.id}' is unmetered (cost is not tracked per-token).`,
         ]
       : [];
+
+  // Autosave the `--model` selection — DEFERRED to here, the last step
+  // before a successful return, so a boot that aborts in any earlier
+  // check (subagent load/validate, permission preflight, DB migrate) or
+  // comes up `refusing` (chain broken without --accept-broken-chain, which
+  // makes run.ts exit 2) never rewrites the committed config.toml from an
+  // invocation that never actually started. Opt-in via persistModelPin
+  // (set only by the shared operator entrypoints). Guards: `modelId` came
+  // from the CLI flag (input.modelId !== undefined ⇒ it won the `??`
+  // chain), a `providerOverride` is a test/dev injection not an operator
+  // pin, and `permResult.state === 'refusing'` is a failed boot (the same
+  // predicate run.ts keys its exit-2 on). `persistModelPin` compares
+  // before writing, so a repeated `--model <same>` is a true no-op.
+  // Fail-soft — a write error only warns; the success line is suppressed
+  // under --json to keep NDJSON consumers' stderr quiet.
+  if (
+    input.persistModelPin === true &&
+    input.modelId !== undefined &&
+    input.providerOverride === undefined &&
+    permResult.state !== 'refusing'
+  ) {
+    const pin = persistModelPin({ filePath: providersLoaded.projectPath, modelId });
+    if (pin.kind === 'failed') {
+      process.stderr.write(`forja: could not persist --model to config.toml: ${pin.reason}\n`);
+    } else if (pin.kind === 'written' && input.json !== true) {
+      process.stderr.write(`forja: pinned model '${modelId}' in ${providersLoaded.projectPath}\n`);
+    }
+  }
 
   return {
     config,
