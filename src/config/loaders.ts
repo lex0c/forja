@@ -462,6 +462,7 @@ export interface BudgetConfigKeys {
   compactionPreserveTail?: number;
   compactionMaxTokens?: number;
   compactionRelevance?: boolean;
+  compactionTriggerRefine?: boolean;
 }
 
 export interface LoadedBudgetConfig {
@@ -547,15 +548,20 @@ const BUDGET_FLOAT_KEYS: ReadonlyArray<{
   { snake: 'compaction_threshold', camel: 'compactionThreshold', min: 0, max: 1 },
 ];
 
-// Boolean-valued budget keys. The relevance compaction pre-pass is default-ON
-// (DEFAULT_BUDGET.compactionRelevance in src/harness/types.ts); this is the
-// operator's CLI opt-out — `[budget] compaction_relevance = false` disables the
-// BM25 pre-pass so it can never elide a tool_result the operator needs kept
-// verbatim. Without this key the default would be uncontrollable from config.
+// Boolean-valued budget keys. `compaction_relevance` is default-ON
+// (DEFAULT_BUDGET.compactionRelevance); this is the operator's CLI opt-out so the
+// BM25 pre-pass can never elide a tool_result they need kept verbatim.
+// `compaction_trigger_refine` is the opposite shape — default-OFF, an experimental
+// opt-IN for the #3 trigger refine (real-tokenizer skip; see the budget-field doc
+// in src/harness/types.ts). Wired here so it's controllable from config even
+// though it's off by default and intentionally absent from the init scaffold.
 const BUDGET_BOOL_KEYS: ReadonlyArray<{
   snake: string;
   camel: keyof BudgetConfigKeys;
-}> = [{ snake: 'compaction_relevance', camel: 'compactionRelevance' }];
+}> = [
+  { snake: 'compaction_relevance', camel: 'compactionRelevance' },
+  { snake: 'compaction_trigger_refine', camel: 'compactionTriggerRefine' },
+];
 
 const parseBudgetLayer = (
   path: string | null,

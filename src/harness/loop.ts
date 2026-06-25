@@ -2627,30 +2627,31 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         if (!(promptTokens > triggerAt && ctx.length >= budget.compactionPreserveTail + 3)) {
           return null;
         }
-        // Trigger refinement (#3 / CONTEXT_TUNING §12): the chars/4 estimate
-        // over-counts ~10-25% vs a real tokenizer, so a near-trigger estimate may
-        // be a false alarm. Confirm with the provider's real token count (the
-        // fixed system/tools part stays an estimate — small + stable) before
-        // paying for a compaction; 'skip' only when the real total is genuinely
-        // under the trigger (which still leaves 30% window headroom), so it can
-        // never relax into an over-window send. A near-threshold round-trip that
-        // averts a billed summary is a good trade.
-        // `countTokens` takes no AbortSignal (providers/types.ts), so a hung native
-        // endpoint would block Ctrl+C / maxWallClockMs. Race it against the run
-        // signal: on abort the count rejects → refine catches → 'compact', and the
-        // `signal.aborted` check below bails out of the compaction entirely (the
-        // run is ending). On a fallback-counter provider the count is local and
-        // resolves instantly, so the race is a no-op there. `requestMessages` is an
+        // Trigger refinement (#3 / CONTEXT_TUNING §12) — EXPERIMENTAL, gated OFF by
+        // default (compactionTriggerRefine; see the budget-field doc). The chars/4
+        // estimate over-counts ~10-25% vs a real tokenizer, so a near-trigger
+        // estimate may be a false alarm; when ON, confirm with the provider's real
+        // token count and 'skip' only when the real total is genuinely under both
+        // the trigger and the output-fit ceiling. When OFF (default) the
+        // over-counting estimate compacts directly — the safe, conservative path
+        // that never over-fills the window. `countTokens` takes no AbortSignal
+        // (providers/types.ts), so a hung native endpoint would block Ctrl+C /
+        // maxWallClockMs — race it against the run signal: on abort the count
+        // rejects → refine catches → 'compact', and `signal.aborted` bails the whole
+        // compaction (the run is ending). On a fallback-counter provider the count
+        // is local + instant, so the race is a no-op. `requestMessages` is an
         // already-materialized array (the post-injection shape), so no ctx-narrowing
         // pin is needed across the await.
-        const refine = await refineCompactionTrigger({
-          promptTokens,
-          triggerAt,
-          fixedTokens: estimatePromptTokens([], estimateOpts),
-          outputFitCeiling,
-          countMessages: () => withAbort(config.provider.countTokens(requestMessages), signal),
-        });
-        if (refine === 'skip' || signal.aborted) return null;
+        if (budget.compactionTriggerRefine === true) {
+          const refine = await refineCompactionTrigger({
+            promptTokens,
+            triggerAt,
+            fixedTokens: estimatePromptTokens([], estimateOpts),
+            outputFitCeiling,
+            countMessages: () => withAbort(config.provider.countTokens(requestMessages), signal),
+          });
+          if (refine === 'skip' || signal.aborted) return null;
+        }
         // PreCompact hook (blocking, spec §10.1) — fired before the
         // compaction_started event so a refusing hook skips both the LLM call
         // and the renderer's "compacting…" signal. Blocked ⇒ no compaction

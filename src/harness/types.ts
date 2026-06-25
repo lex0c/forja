@@ -524,6 +524,18 @@ export interface RunBudget {
   // truncation path deterministically. Optional in the type so a partial budget
   // override (or a programmatic caller) need not restate it.
   compactionMaxTokens?: number;
+  // EXPERIMENTAL, default-OFF. The #3 trigger refine: when the cheap chars/4
+  // estimate lands just over the compaction trigger, confirm with the provider's
+  // REAL token count (a native-counter provider only — Anthropic/Google; a no-op
+  // elsewhere) and skip the compaction if the real total is genuinely under the
+  // trigger AND fits the output reservation. Reclaims the ~10-25% the chars/4
+  // over-count fires early. OFF by default because the benefit is unmeasured and it
+  // only acts on native-counter providers, where it has no end-to-end eval coverage
+  // yet — the base behavior (compact on the over-counting estimate) is the safe,
+  // conservative path (it never over-fills the window). Flip it on in an eval to
+  // measure / harden before considering it for the default. (Independent of the
+  // post-injection counting + fit-ceiling correctness, which apply regardless.)
+  compactionTriggerRefine?: boolean;
   // Hard cap on total spend for this run, in USD. AGENTIC_CLI.md §5
   // declares a default of 5 — cost is the engagement gate; step
   // count (`maxSteps`) is the runaway-loop backstop. Three states:
@@ -620,6 +632,9 @@ export const DEFAULT_BUDGET: RunBudget = {
   // skips it entirely when it frees enough. The A/B preserved task success on
   // every run (CONTEXT_TUNING §12); ON for safety, not a fixed % (see BACKLOG).
   compactionRelevance: true,
+  // Default-OFF (experimental — see the field doc). The base trigger compacts on
+  // the chars/4 estimate, which over-counts and so fires conservatively early.
+  compactionTriggerRefine: false,
   // Default cost cap. Operator opts out via `/budget cost off`,
   // which writes an explicit `undefined` so the spread-merge
   // propagates the disable signal instead of falling back to this.

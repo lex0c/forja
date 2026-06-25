@@ -55,6 +55,7 @@ All defaults are in `DEFAULT_BUDGET` (`src/harness/types.ts`).
 | `compactionPreserveTail` | `3` | minimum trailing turns kept verbatim during compaction. |
 | `compactionRelevance` | `true` | run the BM25 relevance pre-pass before the LLM summary — cheaply pointer-elide low-goal-relevance `tool_result` bodies (recoverable via `retrieve_context`). `false` keeps every `tool_result` verbatim until the fold. |
 | `compactionMaxTokens` | `1024` | cap on the compaction summary's `max_tokens`. Raise it when a dense session's structured summary truncates at the cap (sections lead with GOAL/PENDING/ERRORS, so a cut sacrifices the recoverable tail; a higher cap avoids it). Honored on every compaction path — auto, `/compact`, and summary-resume. |
+| `compactionTriggerRefine` | `false` | **Experimental, default OFF.** When a near-trigger `chars/4` estimate looks like a false alarm, confirm with the provider's real token count (native-counter providers only — Anthropic/Google; a no-op elsewhere) and skip the compaction if the real total is genuinely under the trigger and fits the output reservation. OFF because the benefit is unmeasured and the skip path has no end-to-end eval coverage yet; the default (compact on the over-counting estimate) is the conservative, never-overflow path. Opt in with `[budget] compaction_trigger_refine = true`. Absent from the init scaffold by design. |
 
 ---
 

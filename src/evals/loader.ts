@@ -50,6 +50,7 @@ const BUDGET_KEYS: ReadonlySet<string> = new Set([
   'compactionPreserveTail',
   'compactionRelevance',
   'compactionMaxTokens',
+  'compactionTriggerRefine',
 ]);
 
 // Driven off the harness's single-source tuple (same pattern as
@@ -252,6 +253,12 @@ const parseBudget = (raw: unknown): EvalBudget | undefined => {
       throw new Error('eval: budget.compactionRelevance must be a boolean');
     }
     out.compactionRelevance = r.compactionRelevance;
+  }
+  if (r.compactionTriggerRefine !== undefined) {
+    if (typeof r.compactionTriggerRefine !== 'boolean') {
+      throw new Error('eval: budget.compactionTriggerRefine must be a boolean');
+    }
+    out.compactionTriggerRefine = r.compactionTriggerRefine;
   }
   if (r.compactionMaxTokens !== undefined) {
     if (

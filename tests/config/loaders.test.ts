@@ -798,6 +798,27 @@ compaction_relevance = false
     }
   });
 
+  test('compaction_trigger_refine = true parses (experimental opt-in for the #3 refine)', () => {
+    // Default-OFF in DEFAULT_BUDGET; this is the config opt-in so an operator (or
+    // a measurement run) can enable the experimental real-tokenizer trigger refine.
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.forja', 'config.toml'),
+        `
+[budget]
+compaction_trigger_refine = true
+`,
+      );
+      const result = loadBudgetConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.compactionTriggerRefine).toBe(true);
+      expect(result.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   test('non-boolean compaction_relevance warns and is ignored (fail-soft)', () => {
     // The common footgun is quoting the bool (`"false"`), which TOML parses as
     // a string. Reject it loudly rather than silently treating it as truthy.
