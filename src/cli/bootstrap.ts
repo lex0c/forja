@@ -20,6 +20,7 @@ import {
   loadRecapConfig,
   loadSandboxConfig,
 } from '../config/loaders.ts';
+import { persistModelPin } from '../config/writer.ts';
 import { createSqliteFailureSink } from '../failures/index.ts';
 import { DEFAULT_EFFORT } from '../harness/effort.ts';
 import type { HarnessConfig, RunBudget } from '../harness/index.ts';
@@ -118,6 +119,19 @@ import { DEFAULT_MODEL } from '../providers/default-model.ts';
 export interface BootstrapInput {
   prompt: string;
   modelId?: string;
+  // Autosave the resolved `--model` selection into the project
+  // `.forja/config.toml [providers].model`, so the next process start
+  // resolves to it without re-passing the flag (mirror of the `/model`
+  // in-session pin). Opt-in and set only by the two operator entrypoints
+  // that share `operatorBootstrapFlags` (one-shot cli/run.ts + REPL
+  // cli/repl.ts): the headless `forja recap` bootstrap also passes
+  // `modelId` but builds its input by hand without this flag, so it must
+  // NOT mutate the operator's config, and subagents don't bootstrap at
+  // all. Gated further on `modelId !== undefined`
+  // (nothing to save without an explicit flag) and `providerOverride`
+  // being absent (a test/dev injected provider is not an operator pin).
+  // Fail-soft: a write error warns on stderr, never aborts boot.
+  persistModelPin?: boolean;
   // `--no-recap` global flag: forces `recapEnabled=false` regardless
   // of `[recap].enabled` config.
   noRecap?: boolean;
@@ -495,6 +509,31 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       );
     }
     provider = resolved.provider;
+  }
+
+  // Autosave the `--model` selection (opt-in via persistModelPin, set
+  // only by the main operator run path). Writes the resolved id into the
+  // PROJECT `[providers].model` — the very file the resolution chain
+  // above reads first — so the next start lands here without re-passing
+  // the flag. `persistModelPin` compares before writing, so a repeated
+  // `--model <same>` is a true no-op (no churn of the committed config).
+  // Guards: `modelId` came from the CLI flag (input.modelId !==
+  // undefined ⇒ it won the `??` chain), and a `providerOverride`
+  // (test/dev injection) is never an operator pin. Fail-soft — a write
+  // error surfaces on stderr and boot continues on the in-memory
+  // provider; the success line is suppressed in --json mode to keep
+  // NDJSON consumers' stderr quiet (mirrors the governance banner).
+  if (
+    input.persistModelPin === true &&
+    input.modelId !== undefined &&
+    input.providerOverride === undefined
+  ) {
+    const pin = persistModelPin({ filePath: providersLoaded.projectPath, modelId });
+    if (pin.kind === 'failed') {
+      process.stderr.write(`forja: could not persist --model to config.toml: ${pin.reason}\n`);
+    } else if (pin.kind === 'written' && input.json !== true) {
+      process.stderr.write(`forja: pinned model '${modelId}' in ${providersLoaded.projectPath}\n`);
+    }
   }
 
   // [budget] config — resolves before the harness builds its
