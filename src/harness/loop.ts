@@ -2592,8 +2592,24 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           ...(!force && tools.length > 0 ? { tools } : {}),
           countReasoning: config.provider.replaysReasoning === true,
         };
-        const promptTokens = estimatePromptTokens([...ctx.getMessages()], estimateOpts);
         const contextWindow = config.provider.capabilities.context_window;
+        // Count the REAL request's message shape, not just the stored history: the
+        // step loop appends the working-state panel + static guidance to the last
+        // user message before sending. enableStaticGuidance is on for the main CLI
+        // and a populated panel can add several KB — enough to push a just-under-
+        // ceiling refine 'skip' over the window once max_tokens is reserved, so the
+        // trigger + fit decision must see them. The forced synthesis path sends its
+        // own (small) directive instead of these blocks, so skip them under `force`.
+        // The exact step arg only sizes the "N steps ago" labels (a few chars), so
+        // the prior iteration's `steps` is close enough for the estimate.
+        const requestMessages = [...ctx.getMessages()];
+        if (!force) {
+          injectWorkingStateBlock(requestMessages, workingStateStore.get(sessionId), steps);
+          if (config.enableStaticGuidance) {
+            injectStaticGuidance(requestMessages, isSmallWindow(contextWindow));
+          }
+        }
+        const promptTokens = estimatePromptTokens(requestMessages, estimateOpts);
         const triggerAt = compactionTriggerTokens(budget.compactionThreshold, contextWindow);
         // Need goal + something-to-fold + an assistant boundary for the tail;
         // shorter histories make compactMessages skip (and emit noisy events).
@@ -2608,15 +2624,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // under the trigger (which still leaves 30% window headroom), so it can
         // never relax into an over-window send. A near-threshold round-trip that
         // averts a billed summary is a good trade.
-        // Pin the guard-narrowed ctx so the async closure doesn't re-widen it to
-        // `| undefined` across the await (ctxRef below isn't defined yet).
-        const ctxForCount = ctx;
         // `countTokens` takes no AbortSignal (providers/types.ts), so a hung native
         // endpoint would block Ctrl+C / maxWallClockMs. Race it against the run
         // signal: on abort the count rejects → refine catches → 'compact', and the
         // `signal.aborted` check below bails out of the compaction entirely (the
         // run is ending). On a fallback-counter provider the count is local and
-        // resolves instantly, so the race is a no-op there.
+        // resolves instantly, so the race is a no-op there. `requestMessages` is an
+        // already-materialized array (the post-injection shape), so no ctx-narrowing
+        // pin is needed across the await.
         const refine = await refineCompactionTrigger({
           promptTokens,
           triggerAt,
@@ -2628,8 +2643,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // request over-window.
           outputFitCeiling:
             contextWindow - resolveMaxOutputTokens(budget, config.provider.capabilities),
-          countMessages: () =>
-            withAbort(config.provider.countTokens([...ctxForCount.getMessages()]), signal),
+          countMessages: () => withAbort(config.provider.countTokens(requestMessages), signal),
         });
         if (refine === 'skip' || signal.aborted) return null;
         // PreCompact hook (blocking, spec §10.1) — fired before the
