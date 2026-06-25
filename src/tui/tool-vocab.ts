@@ -156,12 +156,24 @@ export const TOOL_VOCAB: Readonly<Record<string, ToolVocab>> = {
       return parts.join(' ');
     },
   },
+  // `task` is the VISIBLE legacy alias of the deferred `task_sync` (same
+  // dispatcher, byte-identical wire — src/tools/builtin/task.ts §3.1). Since
+  // `task_sync` is deferred, `task` is the name the model actually invokes, so
+  // it MUST carry the same `silent`/`revealFailure` as the rest of the task_*
+  // family: the operator's view of a subagent is the live `Subagents` block,
+  // and a `Delegating · <name>` card stacked next to it is the exact redundant
+  // noise the silence was meant to kill. Marking only `task_sync` left the
+  // common path un-silenced. Verbs kept for the `revealFailure` chip (a
+  // delegation that dies before its child exists has no Subagents block to
+  // appear in) and the day someone flips silent off.
   task: {
     // Verb stays bare — the subject already carries the agent name;
     // saying "Delegating to subagent / └─ reviewer" duplicates
     // "subagent" without adding info. Reads as "Delegating · reviewer".
     activeVerb: 'Delegating',
     finalVerb: 'Delegated',
+    silent: true,
+    revealFailure: true,
     // Real tool fields per src/tools/builtin/task.ts: `subagent`
     // (agent name) and `prompt` (goal text). Prefer the name —
     // shorter, more useful at a glance. Fall back to prompt for the

@@ -639,11 +639,19 @@ describe('harness-adapter — tool lifecycle', () => {
   });
 
   test('task_* subagent-orchestration tools are silent (only the Subagents block shows)', () => {
-    // The parent's task_sync/task_async call is plumbing — the operator's
-    // surface is the live Subagents block, not a "Calling task_sync" chip
-    // stacked next to it. The vocab marks the task_* family `silent`.
+    // The parent's task/task_sync/task_async call is plumbing — the operator's
+    // surface is the live Subagents block, not a "Delegating · <name>" chip
+    // stacked next to it. The vocab marks the task_* family `silent`, including
+    // the visible `task` alias the model actually invokes.
     const a = createHarnessAdapter(baseCtx());
-    for (const toolName of ['task_sync', 'task_async', 'task_await', 'task_cancel', 'task_list']) {
+    for (const toolName of [
+      'task',
+      'task_sync',
+      'task_async',
+      'task_await',
+      'task_cancel',
+      'task_list',
+    ]) {
       expect(
         types(a.translate({ type: 'tool_invoking', toolUseId: 't', toolName, args: {} })),
       ).toEqual([]);

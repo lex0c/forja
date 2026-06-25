@@ -61,9 +61,24 @@ describe('tool-vocab', () => {
   });
 
   test('the task_* subagent-orchestration family is silent', () => {
-    for (const name of ['task_sync', 'task_async', 'task_await', 'task_cancel', 'task_list']) {
+    // `task` is the visible legacy alias of the deferred `task_sync` and is the
+    // name the model actually invokes — it must be silent too, else its
+    // `Delegating · <name>` card stacks redundantly next to the live Subagents
+    // block.
+    for (const name of [
+      'task',
+      'task_sync',
+      'task_async',
+      'task_await',
+      'task_cancel',
+      'task_list',
+    ]) {
       expect(TOOL_VOCAB[name]?.silent).toBe(true);
     }
+    // Both delegation entry points keep revealFailure so a pre-spawn failure
+    // (no child, hence no Subagents block) stays visible.
+    expect(TOOL_VOCAB.task?.revealFailure).toBe(true);
+    expect(TOOL_VOCAB.task_sync?.revealFailure).toBe(true);
   });
 
   test('skill_invoke / skill_show surface the skill name as subject', () => {
