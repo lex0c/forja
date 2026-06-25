@@ -140,6 +140,27 @@ export async function* stallWatchdog<T>(
 //      `once: true`) and removed in the finally block. AbortSignal
 //      only fires `abort` once anyway, but keeping the registration
 //      symmetric with the cleanup avoids surprises.
+// Race a plain promise against an abort signal: resolves with the promise's value
+// if it settles first, rejects with `AbortError` if the signal fires first. Use
+// for SDK calls that take NO AbortSignal of their own (e.g. `provider.countTokens`,
+// whose interface — providers/types.ts — has no signal param) so a hung native
+// endpoint can't outlive a Ctrl+C or `maxWallClockMs` abort. The underlying call
+// is NOT cancelled (the SDK gives us no handle) — we stop AWAITING it, so the run
+// proceeds/aborts on time while the orphaned request settles in the background and
+// is GC'd. The abort listener is removed when the race settles (either way), so a
+// promise that wins the race leaks no listener.
+export const withAbort = <T>(promise: Promise<T>, signal: AbortSignal): Promise<T> => {
+  if (signal.aborted) return Promise.reject(new AbortError());
+  let onAbort: (() => void) | null = null;
+  const abortPromise = new Promise<never>((_, reject) => {
+    onAbort = (): void => reject(new AbortError());
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  return Promise.race([promise, abortPromise]).finally(() => {
+    if (onAbort !== null) signal.removeEventListener('abort', onAbort);
+  });
+};
+
 export async function* abortableIterable<T>(
   source: AsyncIterable<T>,
   signal: AbortSignal,

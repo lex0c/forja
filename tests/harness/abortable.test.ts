@@ -4,7 +4,48 @@ import {
   StepStallError,
   abortableIterable,
   stallWatchdog,
+  withAbort,
 } from '../../src/harness/abortable.ts';
+
+describe('withAbort', () => {
+  test('resolves with the promise value when it settles first', async () => {
+    const ac = new AbortController();
+    await expect(withAbort(Promise.resolve(42), ac.signal)).resolves.toBe(42);
+  });
+
+  test('rejects with AbortError immediately when the signal is pre-aborted', async () => {
+    const ac = new AbortController();
+    ac.abort();
+    // Never-settling promise: only the pre-abort can resolve the race.
+    let caught: unknown;
+    await withAbort(new Promise<number>(() => {}), ac.signal).catch((e) => {
+      caught = e;
+    });
+    expect(caught).toBeInstanceOf(AbortError);
+  });
+
+  test('rejects with AbortError when the signal fires before the promise settles', async () => {
+    const ac = new AbortController();
+    // A promise that never settles on its own — stands in for a hung countTokens.
+    const hung = new Promise<number>(() => {});
+    const raced = withAbort(hung, ac.signal);
+    queueMicrotask(() => ac.abort());
+    let caught: unknown;
+    await raced.catch((e) => {
+      caught = e;
+    });
+    expect(caught).toBeInstanceOf(AbortError);
+  });
+
+  test('a late abort after the promise won does not surface (listener removed)', async () => {
+    const ac = new AbortController();
+    const value = await withAbort(Promise.resolve('done'), ac.signal);
+    expect(value).toBe('done');
+    // Aborting now must not throw or produce an unhandled rejection — the
+    // listener was removed when the race settled.
+    expect(() => ac.abort()).not.toThrow();
+  });
+});
 
 describe('abortableIterable', () => {
   test('passes events through when signal is never aborted', async () => {

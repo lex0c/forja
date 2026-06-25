@@ -110,6 +110,11 @@ export const compactContextNow = async (
     const result = await live.compact(provider, {
       preserveTail: budget.compactionPreserveTail,
       signal: compactSignal,
+      // Honor the operator's [budget] compaction_max_tokens on the forced path too
+      // (/compact, summary-resume) — not just auto loop compaction.
+      ...(budget.compactionMaxTokens !== undefined
+        ? { maxTokens: budget.compactionMaxTokens }
+        : {}),
       ...(pinnedBlock !== undefined ? { pinnedBlock } : {}),
     });
     // Shared accounting: fold cost into the session row + the REPL cumulative

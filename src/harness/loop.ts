@@ -69,7 +69,7 @@ import type {
   ToolSearchHit,
 } from '../tools/types.ts';
 import { type WorkingStateStore, createWorkingStateStore } from '../working-state/index.ts';
-import { StepStallError, abortableIterable, stallWatchdog } from './abortable.ts';
+import { StepStallError, abortableIterable, stallWatchdog, withAbort } from './abortable.ts';
 import { buildAssistantContent } from './assistant-content.ts';
 import { CollectStepError, type CollectedToolUse, collectStep } from './collect.ts';
 import type { RelevanceAudit } from './compaction-relevance.ts';
@@ -2611,13 +2611,20 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // Pin the guard-narrowed ctx so the async closure doesn't re-widen it to
         // `| undefined` across the await (ctxRef below isn't defined yet).
         const ctxForCount = ctx;
+        // `countTokens` takes no AbortSignal (providers/types.ts), so a hung native
+        // endpoint would block Ctrl+C / maxWallClockMs. Race it against the run
+        // signal: on abort the count rejects → refine catches → 'compact', and the
+        // `signal.aborted` check below bails out of the compaction entirely (the
+        // run is ending). On a fallback-counter provider the count is local and
+        // resolves instantly, so the race is a no-op there.
         const refine = await refineCompactionTrigger({
           promptTokens,
           triggerAt,
           fixedTokens: estimatePromptTokens([], estimateOpts),
-          countMessages: () => config.provider.countTokens([...ctxForCount.getMessages()]),
+          countMessages: () =>
+            withAbort(config.provider.countTokens([...ctxForCount.getMessages()]), signal),
         });
-        if (refine === 'skip') return null;
+        if (refine === 'skip' || signal.aborted) return null;
         // PreCompact hook (blocking, spec §10.1) — fired before the
         // compaction_started event so a refusing hook skips both the LLM call
         // and the renderer's "compacting…" signal. Blocked ⇒ no compaction
