@@ -62,6 +62,21 @@ describe('resolveHookConfig — happy path', () => {
     expect(h.locked).toBe(false);
   });
 
+  test('BOM-prefixed hooks config still parses (not silently disabled)', () => {
+    // A hooks.toml saved with a UTF-8 BOM must not parse as `{}` — that
+    // would silently drop every hook. stripBom (shared with the config
+    // readers) handles it.
+    const tmp = makeTmp();
+    const tomlPath = join(tmp, 'hooks.toml');
+    writeToml(
+      tomlPath,
+      '﻿[[hooks]]\nevent = "PostToolUse"\ncommand = "echo hi"\nmatcher = { tool = "write_file" }\n',
+    );
+    const result = resolveHookConfig(paths({ project: tomlPath }));
+    expect(result.hooks).toHaveLength(1);
+    expect(result.warnings).toEqual([]);
+  });
+
   test('hooks ordered enterprise → user → project, declaration order within layer', () => {
     const tmp = makeTmp();
     const ent = join(tmp, 'enterprise.toml');

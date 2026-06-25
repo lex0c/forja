@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { stripBom } from '../config/section.ts';
 import type { HookConfigPaths } from './paths.ts';
 import {
   DEFAULT_HOOK_TIMEOUT_MS,
@@ -335,7 +336,10 @@ const loadLayer = (
 
   let parsed: unknown;
   try {
-    parsed = Bun.TOML.parse(raw);
+    // Strip a leading BOM so a Windows-editor-saved hooks config isn't
+    // parsed as `{}` (silently disabling every hook). Shared with the
+    // config-toml readers — see config/section.ts.
+    parsed = Bun.TOML.parse(stripBom(raw));
   } catch (err) {
     return {
       specs: [],

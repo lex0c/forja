@@ -20,6 +20,20 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 
+// Strip a leading UTF-8 BOM before `Bun.TOML.parse`. `readFileSync('utf8')`
+// decodes the BOM bytes to U+FEFF but does NOT remove them, and Bun parses
+// a BOM-prefixed document as an EMPTY table (`{}`) rather than throwing —
+// so a config a Windows editor saved with a BOM would have EVERY section
+// silently ignored (resolving to defaults) at boot. The single home for
+// this strip so the read path (`loadTomlSection`, here) and the write
+// path (`config/writer.ts` readTomlDoc) can't drift — they drifted once,
+// and a BOM file that already pinned the requested model read clean on
+// the write side (→ `unchanged`, BOM left in place) yet parsed as `{}` on
+// this read side (→ pin ignored, fell back to default). Used by every
+// config-TOML reader (this loader, the writer, hooks config).
+export const stripBom = (raw: string): string =>
+  raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+
 export type SectionResult =
   | { kind: 'absent' }
   | { kind: 'no-section' }
@@ -44,7 +58,7 @@ export const loadTomlSection = (
   }
   let parsed: unknown;
   try {
-    parsed = Bun.TOML.parse(raw);
+    parsed = Bun.TOML.parse(stripBom(raw));
   } catch (err) {
     return {
       kind: 'invalid',

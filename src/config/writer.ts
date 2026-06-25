@@ -19,6 +19,7 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 import { atomicWrite } from '../fs/atomic-write.ts';
+import { stripBom } from './section.ts';
 
 const TOML_BARE_KEY_RE = /^[A-Za-z0-9_-]+$/;
 
@@ -114,13 +115,10 @@ export const readTomlDoc = (
     return { ok: false, reason: `could not read ${filePath}: ${errMsg(err)}` };
   }
   if (raw.length === 0) return { ok: true, doc: {} };
-  // Strip a leading UTF-8 BOM. `readFileSync('utf8')` decodes the BOM
-  // bytes to U+FEFF but does NOT remove them, and `Bun.TOML.parse` treats
-  // a BOM-prefixed document as empty (`{}`) rather than throwing — so
-  // without this a mutation would read `doc = {}` on a real config and
-  // clobber EVERY section on the next write (silent data loss on a file
-  // a Windows editor saved with a BOM).
-  const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+  // Strip a leading BOM via the shared helper so this write-side reader
+  // and the boot-side `loadTomlSection` handle it identically (they
+  // drifted once — see config/section.ts for the failure mode).
+  const text = stripBom(raw);
   try {
     const parsed = Bun.TOML.parse(text);
     if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
