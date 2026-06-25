@@ -33,8 +33,27 @@ export const STATIC_GUIDANCE_BLOCK = `Standing operating context — not part of
   - Claim done only with evidence (a passing test, a tool result), never inference. Validate, then review.
   - Keep the working state accurate.`;
 
+// Lean variant for the tight-window tier (CONTEXT_TUNING §2.2). This block rides
+// the UNCACHED tail and is re-paid every step; on a small window — often a local
+// model with NO prefix caching — that per-step cost is a bigger fraction of the
+// budget. So the lean variant keeps only the two highest-value items: the
+// blast-radius safety check (the most dangerous mid-loop action) and the
+// evidence-before-done rule (the premature-"done" failure that prompted this
+// whole block). The replan and panel-hygiene bullets — less critical, cheaper to
+// forgo on a window that compacts fast — drop. The framing line stays verbatim:
+// it is the derail-fix (BACKLOG 2026-06-15), not optional.
+export const STATIC_GUIDANCE_BLOCK_LEAN = `Standing operating context — not part of the user's message. Apply it silently; answer the user's actual request.
+
+[workflow_discipline]
+  - Before an action with wide or hard-to-reverse effects, verify its blast radius and that a fallback exists.
+  - Claim done only with evidence (a passing test, a tool result), never inference.`;
+
 // Append the static guidance block at the bottom of [current_turn]. Always runs
-// (no empty/condition check) so the guidance is present every step.
-export const injectStaticGuidance = (messages: ProviderMessage[]): void => {
-  appendTextToLastUserMessage(messages, STATIC_GUIDANCE_BLOCK);
+// (no empty/condition check) so the guidance is present every step. `lean` picks
+// the tight-window variant (CONTEXT_TUNING §2.2) — the harness loop passes
+// `isSmallWindow(context_window)` so a /model swap re-tiers per step, the same
+// pull-at-startTurn pattern the prefix shaping uses. Default false keeps every
+// existing caller on the full block.
+export const injectStaticGuidance = (messages: ProviderMessage[], lean = false): void => {
+  appendTextToLastUserMessage(messages, lean ? STATIC_GUIDANCE_BLOCK_LEAN : STATIC_GUIDANCE_BLOCK);
 };

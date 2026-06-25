@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { STATIC_GUIDANCE_BLOCK, injectStaticGuidance } from '../../src/harness/static-guidance.ts';
+import {
+  STATIC_GUIDANCE_BLOCK,
+  STATIC_GUIDANCE_BLOCK_LEAN,
+  injectStaticGuidance,
+} from '../../src/harness/static-guidance.ts';
 import { injectWorkingStateBlock } from '../../src/harness/working-state-inject.ts';
 import type { ProviderMessage } from '../../src/providers/types.ts';
 import { type WorkingState, emptyWorkingState } from '../../src/working-state/index.ts';
@@ -104,5 +108,25 @@ describe('injectStaticGuidance', () => {
     const messages: ProviderMessage[] = [];
     injectStaticGuidance(messages);
     expect(messages).toEqual([]);
+  });
+
+  test('lean=true injects the tight-window variant — framing + 2 bullets, rest dropped', () => {
+    // CONTEXT_TUNING §2.2: the per-step block rides the uncached tail, so on a
+    // small window it leans to the two highest-value items (blast-radius safety,
+    // evidence-before-done) and keeps the derail-fix framing line.
+    const messages: ProviderMessage[] = [{ role: 'user', content: 'do the thing' }];
+    injectStaticGuidance(messages, true);
+    const text = messages[0]?.content as string;
+    expect(text.startsWith('do the thing\n\nStanding operating context')).toBe(true);
+    expect(text).toContain('[workflow_discipline]');
+    expect(text).toContain('verify its blast radius');
+    expect(text).toContain('Claim done only with evidence');
+    // Full-tier-only bullets must NOT appear on the lean path.
+    expect(text).not.toContain('return to understand or plan');
+    expect(text).not.toContain('Keep the working state accurate');
+  });
+
+  test('lean block is smaller than the full block', () => {
+    expect(STATIC_GUIDANCE_BLOCK_LEAN.length).toBeLessThan(STATIC_GUIDANCE_BLOCK.length);
   });
 });

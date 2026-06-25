@@ -4,6 +4,7 @@ import {
   PLAYBOOK_DELEGATION_PREAMBLE,
   PLAYBOOK_WORKFLOW_HEADER,
   composeWithPlaybookHint,
+  composeWithPlaybookHintLean,
 } from '../../src/cli/playbook-prompt.ts';
 import type { SubagentSet } from '../../src/subagents/load.ts';
 import type { SubagentDefinition } from '../../src/subagents/types.ts';
@@ -413,5 +414,38 @@ describe('composeWithPlaybookHint — workflow + closing-review block', () => {
     const closingIdx = out.indexOf('consider closing with');
     expect(headerIdx).toBeGreaterThan(0);
     expect(closingIdx).toBeGreaterThan(headerIdx);
+  });
+});
+
+describe('composeWithPlaybookHintLean — tight-window variant', () => {
+  const set = makeSet([makeDef('code-review', 'gate diff before merge')]);
+
+  test('keeps the routing table + dispatch + relay, drops the bullet lists and workflow', () => {
+    // CONTEXT_TUNING §2.2 lean tier: routing must survive (the load-bearing
+    // capability on a small window where context compression matters most), but
+    // the verbose delegate/do-not nuance + workflow header are dropped.
+    const out = composeWithPlaybookHintLean(undefined, set) ?? '';
+    expect(out).toContain('| name | when_to_use |');
+    expect(out).toContain('| code-review | gate diff before merge |');
+    expect(out).toContain('task_sync');
+    expect(out).toContain('task_async');
+    expect(out.toLowerCase()).toContain('dispatch');
+    expect(out.toLowerCase()).toContain('relay its findings');
+    // The full-tier-only sections must NOT appear.
+    expect(out).not.toContain('**Delegate to a playbook when:**');
+    expect(out).not.toContain('**Do NOT delegate when:**');
+    expect(out).not.toContain('**Workflow:**');
+  });
+
+  test('is materially smaller than the full hint for the same registry', () => {
+    const lean = composeWithPlaybookHintLean(undefined, set) ?? '';
+    const full = composeWithPlaybookHint(undefined, set) ?? '';
+    expect(lean.length).toBeLessThan(full.length);
+  });
+
+  test('empty-registry paths mirror the full composer', () => {
+    expect(composeWithPlaybookHintLean('user prompt', undefined)).toBe('user prompt');
+    expect(composeWithPlaybookHintLean(undefined, undefined)).toBeUndefined();
+    expect(composeWithPlaybookHintLean('user prompt', makeSet([]))).toBe('user prompt');
   });
 });

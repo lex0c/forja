@@ -100,7 +100,7 @@ import { localIsoDate } from './local-date.ts';
 import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
 import { composeWithOutputStyle } from './output-style-prompt.ts';
 import { composeWithParallelHint } from './parallel-prompt.ts';
-import { composeWithPlaybookHint } from './playbook-prompt.ts';
+import { composeWithPlaybookHint, composeWithPlaybookHintLean } from './playbook-prompt.ts';
 import { acquireProjectGuide } from './project-context.ts';
 import { composeWithResponseFormat } from './response-format.ts';
 import { type SystemInputs, shapeSystemPrompt } from './shape-system-prompt.ts';
@@ -963,6 +963,10 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     //       canonical [system] section). Fully static, unlike
     //       the environment block's date below it.
     const withPlaybook = composeWithPlaybookHint(input.systemPrompt, subagents);
+    // Lean playbook hint for the tight-window prefix (CONTEXT_TUNING §2.2): same
+    // routing table, leaner prose. Precomputed alongside the full variant so a
+    // mid-session /model swap to a small window re-tiers with no event.
+    const withPlaybookLean = composeWithPlaybookHintLean(input.systemPrompt, subagents);
     // Environment input computed ONCE (a single git probe + date read) and shared
     // by both prefix variants below so their tails are byte-identical.
     //
@@ -990,15 +994,17 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
         ),
       );
     // Two directive tiers (CONTEXT_TUNING §2.2). FULL adds the tool-ergonomics +
-    // parallel hints; LEAN (tight window) drops both (~620 tok the window can't
-    // spare) while keeping the safety constraints and format rules. Both are
+    // parallel hints (~620 tok) and carries the full playbook hint; LEAN (tight
+    // window) drops the two hints AND swaps in the lean playbook variant (same
+    // routing table, trimmed prose — the delegate/do-not bullet lists + workflow
+    // header gone), keeping the safety constraints and format rules. Both are
     // precomputed; `shapeSystemPrompt` picks per turn against the live window, so
     // a mid-session /model swap re-tiers. At a large boot window FULL is byte-
     // identical to the legacy single-chain composition.
     const stablePrefixFull = withDirectiveTail(
       composeWithParallelHint(composeWithToolErgonomics(withPlaybook)),
     );
-    const stablePrefixLean = withDirectiveTail(withPlaybook);
+    const stablePrefixLean = withDirectiveTail(withPlaybookLean);
     resolvedSystemPrompt = stablePrefixFull;
 
     // Memory subsystem (spec MEMORY.md / §4.1). Build the registry

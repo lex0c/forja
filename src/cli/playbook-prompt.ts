@@ -76,6 +76,22 @@ export const PLAYBOOK_WORKFLOW_HEADER = `**Workflow:**
 - For tasks that span multiple files or multiple verification surfaces (compile + test + runtime UI + permissions, etc.), name the discrete sub-problems before acting on any of them. Each one is then a candidate for direct work, parallel \`task_async\` fan-out, or sequential \`task_sync\` delegation. Naming the steps prevents drift mid-turn. Trivial changes — single-file edits, doc/comment tweaks, one-line fixes — skip this; decomposition has overhead too.
 - Every delegated task carries a self-contained \`prompt\` — assume the subagent has zero context from this conversation. Inline the goal, the constraints, and the expected output shape.`;
 
+// Lean playbook preamble for the tight-window tier (CONTEXT_TUNING §2.2). The
+// full preamble's delegate / do-NOT-delegate bullet lists (~250 tok of nuance)
+// and the workflow-decomposition header are dropped: on a small window — often a
+// local model with NO prefix caching, so every prefix token is re-paid each turn
+// — the ROUTING capability is what earns its keep, not the delegation nuance a
+// weak model under-uses anyway. Kept: the schema-vs-prose framing, the self-
+// contained prompt discipline (folded into the spawn line, since the workflow
+// header that carried it is gone), the dispatch rule + concrete routing
+// triggers, and the relay rule (the observed drop-the-result failure). The table
+// renders after this, same as the full path.
+export const PLAYBOOK_DELEGATION_PREAMBLE_LEAN = `# Playbook subagents
+
+Subagents run in an isolated context with their own tools and budget: named playbooks return a fixed-schema report, \`general-purpose\` returns a prose summary. Spawn with \`task_sync(playbook=<name>, prompt=<self-contained — the child sees none of this conversation>)\` for sequential work, or \`task_async\` to fan out. The \`name\` column below is the routing identifier.
+
+**If the request IS a loaded playbook's job, dispatch it — don't do the work inline.** "review this diff/PR" → \`code-review\`; "audit this" → \`security-audit\`; "why is this slow" → \`perf-investigate\`; "explore the repo" → \`general-purpose\`. The subagent's summary is YOUR answer to present, not a "task done" signal — when the request WAS the delegated work, relay its findings; don't end the turn asking what's next.`;
+
 // Names of the canonical review playbooks the closing-discipline
 // bullet references. Both ship in the playbooks step of `forja init`;
 // an operator who hand-rolled their registry without these will
@@ -187,6 +203,33 @@ export const composeWithPlaybookHint = (
   set: SubagentSet | undefined,
 ): string | undefined => {
   const hint = buildPlaybookHint(set);
+  if (hint === null) return downstream;
+  if (downstream === undefined || downstream.length === 0) return hint;
+  return `${hint}\n\n---\n\n${downstream}`;
+};
+
+// Lean variant of `buildPlaybookHint` (CONTEXT_TUNING §2.2): lean preamble +
+// table, NO workflow header / closing-review bullet. Reuses the same eligibility
+// + table rendering so routing stays byte-identical; only the surrounding prose
+// shrinks.
+const buildPlaybookHintLean = (set: SubagentSet | undefined): string | null => {
+  if (set === undefined || set.byName.size === 0) return null;
+  const eligible = eligibleDefinitions(set);
+  if (eligible.length === 0) return null;
+  const truncated = eligible.length > MAX_PLAYBOOK_TABLE_ROWS;
+  const visible = truncated ? eligible.slice(0, MAX_PLAYBOOK_TABLE_ROWS) : eligible;
+  const table = renderTable(visible, truncated);
+  return `${PLAYBOOK_DELEGATION_PREAMBLE_LEAN}\n\n${table}`;
+};
+
+// Lean composer (tight-window tier). Same layering contract as
+// `composeWithPlaybookHint`; bootstrap precomputes both and `shapeSystemPrompt`
+// picks the lean-prefix variant when `isSmallWindow`.
+export const composeWithPlaybookHintLean = (
+  downstream: string | undefined,
+  set: SubagentSet | undefined,
+): string | undefined => {
+  const hint = buildPlaybookHintLean(set);
   if (hint === null) return downstream;
   if (downstream === undefined || downstream.length === 0) return hint;
   return `${hint}\n\n---\n\n${downstream}`;
