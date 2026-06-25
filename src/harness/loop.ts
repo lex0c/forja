@@ -2627,21 +2627,46 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         if (!(promptTokens > triggerAt && ctx.length >= budget.compactionPreserveTail + 3)) {
           return null;
         }
+        // PreCompact hook (blocking, spec §10.1) — fired before the
+        // compaction_started event so a refusing hook skips both the LLM call and
+        // the renderer's "compacting…" signal, AND before the native token-count
+        // refine below so a blocking hook prevents the full prompt from reaching the
+        // provider's count_tokens endpoint at all (HOOKS.md: PreCompact can cancel
+        // compaction; a policy hook may exist precisely to deny the compaction
+        // provider access). Blocked ⇒ no compaction this turn; the loop proceeds
+        // with the un-compacted history and the next top-of-loop call re-checks (no
+        // continue — we're at the top, so returning simply falls through to the
+        // provider call). Deliberate vs the old post-tool-result site, whose
+        // `continue` ALSO skipped that turn's detector schedulers: the turn now runs
+        // normally, because the schedulers don't depend on compaction.
+        const preCompact = await dispatchHooks({
+          schema: 'v1',
+          event: 'PreCompact',
+          sessionId,
+          data: { promptTokens, threshold: triggerAt },
+        });
+        if (preCompact !== null && preCompact.blockedBy !== null) {
+          return null;
+        }
         // Trigger refinement (#3 / CONTEXT_TUNING §12) — EXPERIMENTAL, gated OFF by
-        // default (compactionTriggerRefine; see the budget-field doc). The chars/4
-        // estimate over-counts ~10-25% vs a real tokenizer, so a near-trigger
-        // estimate may be a false alarm; when ON, confirm with the provider's real
-        // token count and 'skip' only when the real total is genuinely under both
-        // the trigger and the output-fit ceiling. When OFF (default) the
-        // over-counting estimate compacts directly — the safe, conservative path
-        // that never over-fills the window. `countTokens` takes no AbortSignal
-        // (providers/types.ts), so a hung native endpoint would block Ctrl+C /
-        // maxWallClockMs — race it against the run signal: on abort the count
-        // rejects → refine catches → 'compact', and `signal.aborted` bails the whole
-        // compaction (the run is ending). On a fallback-counter provider the count
-        // is local + instant, so the race is a no-op. `requestMessages` is an
+        // default (compactionTriggerRefine; see the budget-field doc). Runs AFTER
+        // the PreCompact hook so a blocking hook prevents the external count_tokens
+        // request (a blocked compaction must touch no compaction-provider endpoint).
+        // The chars/4 estimate over-counts ~10-25% vs a real tokenizer, so a
+        // near-trigger estimate may be a false alarm; when ON, confirm with the
+        // provider's real token count and 'skip' only when the real total is
+        // genuinely under both the trigger and the output-fit ceiling. When OFF
+        // (default) the over-counting estimate compacts directly — the safe,
+        // conservative path that never over-fills the window. `countTokens` takes no
+        // AbortSignal (providers/types.ts), so a hung native endpoint would block
+        // Ctrl+C / maxWallClockMs — race it against the run signal: on abort the
+        // count rejects → refine catches → 'compact', and `signal.aborted` bails the
+        // whole compaction (the run is ending). On a fallback-counter provider the
+        // count is local + instant, so the race is a no-op. `requestMessages` is an
         // already-materialized array (the post-injection shape), so no ctx-narrowing
-        // pin is needed across the await.
+        // pin is needed across the await. (A blocking hook returns above, so a
+        // PreCompact that then refine-skips fires only on the experimental path —
+        // the hook is a permission gate, not a compaction-happened signal.)
         if (budget.compactionTriggerRefine === true) {
           const refine = await refineCompactionTrigger({
             promptTokens,
@@ -2651,24 +2676,6 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             countMessages: () => withAbort(config.provider.countTokens(requestMessages), signal),
           });
           if (refine === 'skip' || signal.aborted) return null;
-        }
-        // PreCompact hook (blocking, spec §10.1) — fired before the
-        // compaction_started event so a refusing hook skips both the LLM call
-        // and the renderer's "compacting…" signal. Blocked ⇒ no compaction
-        // this turn; the loop proceeds with the un-compacted history and the
-        // next top-of-loop call re-checks (no continue — we're at the top, so
-        // returning simply falls through to the provider call). Deliberate vs
-        // the old post-tool-result site, whose `continue` ALSO skipped that
-        // turn's detector schedulers: the turn now runs normally, because the
-        // schedulers don't depend on compaction (that coupling was accidental).
-        const preCompact = await dispatchHooks({
-          schema: 'v1',
-          event: 'PreCompact',
-          sessionId,
-          data: { promptTokens, threshold: triggerAt },
-        });
-        if (preCompact !== null && preCompact.blockedBy !== null) {
-          return null;
         }
         // Read pins BEFORE emitting compaction_started, so the
         // started→finished pair has NO throwing statement between them: a DB
