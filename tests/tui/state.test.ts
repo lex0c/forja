@@ -2017,8 +2017,8 @@ describe('subagent lifecycle', () => {
 
   test('subagent:start strips control bytes from model-authored name + goal', () => {
     // `goal` is the raw seed prompt and `name` is child-authored; both get
-    // repainted into the LIVE region every heartbeat (head + `starting ·`
-    // fallback). A malicious child embedding `\x1b[2J` (clear screen),
+    // repainted into the LIVE region every heartbeat (they share the row
+    // head, line 1). A malicious child embedding `\x1b[2J` (clear screen),
     // `\x07` (bell), or `\x1b]0;…` (OSC window title) in either field would
     // otherwise hijack the terminal on every redraw. Sanitized at ingress.
     const evilGoal = '\x1b[2J\x1b[H\x1b]0;PWNED\x07audit the diff';

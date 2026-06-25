@@ -2380,8 +2380,8 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       const next = new Map(state.subagents);
       // `name` and `goal` are model/child-authored — `goal` is the raw
       // seed prompt verbatim — and the renderer paints them into the LIVE
-      // region every heartbeat tick (`name` in the row head, `goal` in the
-      // `starting · <goal>` line-2 fallback). Now that `liveRegionActive`
+      // region every heartbeat tick (`name` and the `goal` slice share the
+      // row head, line 1). Now that `liveRegionActive`
       // stays true for the whole subagent run, a raw ESC/BEL/CR would ring
       // the bell, forge SGR, or move the cursor on every redraw. Sanitize at
       // this STATE boundary — same chokepoint the sibling `currentTool`
@@ -2421,7 +2421,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // `currentTool` (line 2) is set on tool-start and PERSISTS until the
       // next tool starts — it is NOT cleared on `toolDone`. Clearing it
       // would blank line 2 during the gap between tools (every model
-      // round-trip), flapping back to the `starting · <goal>` fallback on
+      // round-trip), flapping back to the bare `starting…` cue on
       // each tool finish. Keeping the last tool shown (with the spinner
       // still conveying "active") reads as the subagent's most recent
       // action instead. `toolDone` only feeds the per-type aggregate.

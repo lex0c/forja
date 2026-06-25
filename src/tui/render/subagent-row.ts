@@ -6,16 +6,16 @@
 //
 // Layout (single subagent):
 //
-//   Subagents
-//     ▸ task explore · running echo · 2.4s
+//   Subagents · 1 running · 2.4s
+//     ⠋ explore: find the README in docs/      2.4s
+//       └ read engine.ts
 //
-// Multiple subagents render one row each under the shared header.
-// Live row keeps the most recent `progress` one-liner from the
-// adapter (which coalesces incoming child HarnessEvents into a
-// terse present-tense phrase: `step 2`, `running echo`, etc.).
-// When `progress` is empty (no `subagent:update` arrived yet),
-// the row shows the seed `goal` truncated — gives the operator
-// something to read while the child boots.
+// Line 1 carries the identity: spinner + name + a truncated slice of the
+// seed `goal` (the raw prompt the model passed), so the operator reads WHAT
+// each child was asked to do — not just its name. The goal persists for the
+// child's whole life; line 2 carries the in-flight tool (or `starting…`
+// before the first tool arrives). Multiple subagents render one such pair
+// each under the shared header.
 //
 // On `subagent:end` the row drops out of the live region; the
 // reducer emits a `subagent_summary` permanent item so scrollback
@@ -36,22 +36,21 @@ const SPINNER_PERIOD_MS = 80;
 // Line-2 connector for the in-flight tool, under the name.
 const TREE_GLYPH = { unicode: '└', ascii: '\\' } as const;
 
-// Padded width for the subagent name on line 1, so the elapsed/cost
-// columns align across rows. Longer names truncate with an ellipsis.
-const NAME_WIDTH = 16;
-
-// Cap on the inline line-2 detail. Frame width drives the real budget;
-// this is a defensive ceiling so a chatty subject can't blow out the row.
+// Cap on the inline line-1 goal / line-2 detail. Frame width drives the real
+// budget; this is a defensive ceiling so a chatty prompt or tool subject can't
+// blow out the row on a very wide terminal.
 const MAX_DETAIL = 80;
+
+// Floor for the line-1 goal slice on narrow terminals: even when the frame is
+// tight, show at least this many characters of the prompt rather than dropping
+// it entirely.
+const GOAL_MIN = 16;
 
 const truncate = (s: string, max: number): string => {
   const trimmed = s.replace(/\s+/g, ' ').trim();
   if (trimmed.length <= max) return trimmed;
   return `${trimmed.slice(0, max - 1)}…`;
 };
-
-const padName = (name: string): string =>
-  name.length > NAME_WIDTH ? `${name.slice(0, NAME_WIDTH - 1)}…` : name.padEnd(NAME_WIDTH);
 
 // Renderer's view of a live subagent (structural subset of the reducer's
 // inline type in state.ts — only the fields the live row reads).
@@ -104,14 +103,31 @@ export const renderSubagentRows = (
   for (const sub of subagents.values()) {
     const elapsed = formatCoarseDuration(Math.max(0, now - sub.startedAt));
     const cost = sub.liveCostUsd > 0 ? `  $${sub.liveCostUsd.toFixed(4)}` : '';
-    // Line 1: spinner (accent live-cue) + padded name (primary) + elapsed
-    // and cost (secondary chrome). padName aligns the columns across rows.
-    const head = `  ${paint(caps, 'accent', frame)} ${padName(sub.name)}`;
-    out.push(`${head}${paint(caps, 'secondary', `  ${elapsed}${cost}`)}`);
-    // Line 2: the in-flight tool (`└ read engine.ts`); before the first
-    // tool, the seed goal so a booting child still says what it's for.
-    const detail = sub.currentTool.length > 0 ? sub.currentTool : `starting · ${sub.goal}`;
-    out.push(paint(caps, 'secondary', `      ${tree} ${truncate(detail, MAX_DETAIL)}`));
+    const meta = `  ${elapsed}${cost}`;
+    // Line 1: spinner (accent live-cue) + name + a truncated slice of the seed
+    // goal/prompt (`explore: find the README…`), so the operator reads WHAT the
+    // child is doing, not just its name. The goal is budgeted against the frame
+    // width so the trailing elapsed/cost never wraps; MAX_DETAIL is the ceiling
+    // on a wide terminal, GOAL_MIN the floor on a narrow one. Name stays in the
+    // default foreground (primary); the goal + meta are secondary chrome.
+    //
+    // Fixed chrome around the goal, all of which eats into the available width:
+    // the composer's frame margin (2, added by padFrame downstream) + this row's
+    // own indent (2) + spinner (1) + space (1) + the `: ` separator (2) = 8,
+    // plus the trailing elapsed/cost (meta). Subtract both so the painted line
+    // lands within caps.cols and never soft-wraps the live region.
+    const LINE1_FIXED = 8;
+    const goalBudget = Math.max(
+      GOAL_MIN,
+      Math.min(MAX_DETAIL, caps.cols - LINE1_FIXED - sub.name.length - meta.length),
+    );
+    const goalText = sub.goal.length > 0 ? `: ${truncate(sub.goal, goalBudget)}` : '';
+    const head = `  ${paint(caps, 'accent', frame)} ${sub.name}${paint(caps, 'secondary', goalText)}`;
+    out.push(`${head}${paint(caps, 'secondary', meta)}`);
+    // Line 2: the in-flight tool (`└ read engine.ts`); before the first tool a
+    // bare `starting…` — the goal already rides line 1, so we don't repeat it.
+    const detail = sub.currentTool.length > 0 ? truncate(sub.currentTool, MAX_DETAIL) : 'starting…';
+    out.push(paint(caps, 'secondary', `      ${tree} ${detail}`));
   }
   return out;
 };

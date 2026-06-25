@@ -43,6 +43,33 @@ describe('renderSubagentRows', () => {
     expect(out[4]).toContain('grep "x"');
   });
 
+  test('line 1 carries the seed goal/prompt next to the name (persists after the first tool)', () => {
+    const map = new Map<string, SubagentRowState>([
+      [
+        'a',
+        sub({ name: 'general-purpose', goal: 'find the README', currentTool: 'read engine.ts' }),
+      ],
+    ]);
+    const out = renderSubagentRows(map, caps, 1000);
+    // identity line reads `general-purpose: find the README`, even though a
+    // tool is already in flight on line 2.
+    expect(out[1]).toContain('general-purpose');
+    expect(out[1]).toContain('find the README');
+    expect(out[2]).toContain('read engine.ts');
+  });
+
+  test('a long goal on line 1 is truncated to fit the frame (leaves room for the 2-col margin)', () => {
+    const map = new Map<string, SubagentRowState>([
+      ['a', sub({ name: 'explore', goal: `audit ${'y'.repeat(300)}`, currentTool: '' })],
+    ]);
+    const out = renderSubagentRows(map, caps, 1000); // color: 'none' → length == visual width
+    expect(out[1]?.includes('…')).toBe(true);
+    // The row line carries no frame margin yet (compose's padFrame adds the
+    // leading 2 cols downstream), so the un-framed line must stay within
+    // caps.cols - 2 for the painted line to land inside the terminal width.
+    expect(out[1]?.length ?? 0).toBeLessThanOrEqual(caps.cols - 2);
+  });
+
   test('header surfaces queued backlog and total cost', () => {
     const map = new Map<string, SubagentRowState>([['a', sub({ liveCostUsd: 0.011 })]]);
     const out = renderSubagentRows(map, caps, 1000, 2);
@@ -51,13 +78,15 @@ describe('renderSubagentRows', () => {
     expect(out[0]).toContain('$0.0110');
   });
 
-  test('line 2 falls back to the seed goal before the first tool', () => {
+  test('line 2 shows a bare `starting…` before the first tool (goal rides line 1)', () => {
     const map = new Map<string, SubagentRowState>([
       ['a', sub({ currentTool: '', goal: 'find the README' })],
     ]);
     const out = renderSubagentRows(map, caps, 1);
+    // The goal moved to line 1; line 2 is just the booting cue, not the goal.
+    expect(out[1]).toContain('find the README');
     expect(out[2]).toContain('starting');
-    expect(out[2]).toContain('find the README');
+    expect(out[2]).not.toContain('find the README');
   });
 
   test('ASCII fallback: rotating spinner on line 1, `\\` connector on line 2', () => {
