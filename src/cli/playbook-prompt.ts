@@ -21,6 +21,7 @@
 
 import type { SubagentSet } from '../subagents/load.ts';
 import type { SubagentDefinition } from '../subagents/types.ts';
+import { sanitizeForTableCell } from './prompt-codespan.ts';
 
 // Maximum number of rows rendered in the discovery table. Spec
 // `PLAYBOOKS.md` §1.4 caps at 12. Defs without `whenToUse` never
@@ -118,16 +119,20 @@ const eligibleDefinitions = (set: SubagentSet): SubagentDefinition[] => {
   return out;
 };
 
-// Render the markdown table. We intentionally do NOT escape `|`
-// inside cells: `whenToUse` is author-controlled and the spec
-// example shows free-form prose; an embedded `|` would break the
-// row but that is a lint-time problem the author can fix at
-// source. Auto-escaping here would silently mask malformed
-// frontmatter.
+// Render the markdown table. Cell values (`name`, `whenToUse`) come from
+// subagent frontmatter — operator- or project-authored, i.e. attacker-
+// influenceable in a shared/cloned repo. They land in the system prompt at
+// system priority, so each cell is sanitized: `sanitizeForTableCell` folds
+// newlines to a glyph (blocks row/markdown break-out and injected pseudo-
+// instructions), strips control bytes (ANSI/ESC), and escapes `|` (blocks
+// column injection). Backticks are preserved — a `code` reference in a
+// when_to_use cell is legitimate and can't break out of a cell.
 const renderTable = (defs: SubagentDefinition[], truncated: boolean): string => {
   const lines: string[] = ['| name | when_to_use |', '|---|---|'];
   for (const def of defs) {
-    lines.push(`| ${def.name} | ${def.whenToUse} |`);
+    lines.push(
+      `| ${sanitizeForTableCell(def.name)} | ${sanitizeForTableCell(def.whenToUse ?? '')} |`,
+    );
   }
   if (truncated) {
     // Footer line names the count of dropped entries so the

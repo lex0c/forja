@@ -10,6 +10,7 @@ import {
   shouldEagerLoadByTriggers,
 } from '../memory/index.ts';
 import { hashMemoryContent } from '../storage/repos/memory-provenance.ts';
+import { sanitizeForPromptLine } from './prompt-codespan.ts';
 
 // Eager memory index injection into the system prompt.
 //
@@ -371,8 +372,14 @@ export const assembleMemorySection = (
     // visible per-listing without changing the scope tag (the
     // body still lives in user scope per slice-7 design).
     const seedFlag = listing.subdir === 'seeds' ? ' [seed]' : '';
+    // name + hook are author-controlled (a shared-corpus memory a teammate
+    // wrote, trusted coarsely at the corpus modal) and render into the eager
+    // prompt. Sanitize the single-line markdown so a crafted hook can't smuggle
+    // control bytes or — defense-in-depth past the line-structured index — a
+    // newline that injects a fresh line. The system flags (seed/state) are
+    // harness-generated, not sanitized.
     lines.push(
-      `- [${listing.scope}] ${listing.name}${seedFlag}${stateFlag} — ${listing.entry.hook}`,
+      `- [${listing.scope}] ${sanitizeForPromptLine(listing.name)}${seedFlag}${stateFlag} — ${sanitizeForPromptLine(listing.entry.hook)}`,
     );
     eagerLoaded.push(toEagerExposure(listing.scope, listing.name, file));
   }
