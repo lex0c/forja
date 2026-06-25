@@ -81,7 +81,13 @@ export interface SubagentHandleSummary {
   // Without this discriminator, settled-without-summary was
   // ambiguous — model couldn't tell "ran with no summary"
   // from "refused"; with it, the surface is unambiguous.
-  kind?: 'ran' | 'unknown_subagent' | 'depth_exceeded' | 'budget_exhausted' | 'subagent_escalation';
+  kind?:
+    | 'ran'
+    | 'unknown_subagent'
+    | 'depth_exceeded'
+    | 'budget_exhausted'
+    | 'subagent_escalation'
+    | 'playbook_model_unavailable';
   // Present iff status is 'settled' and the envelope's `kind`
   // is `'ran'` (the only kind that carries a child outcome).
   // Other kinds — `unknown_subagent`, `depth_exceeded`,
@@ -438,6 +444,19 @@ const envelopeFromJson = (raw: Record<string, unknown>): SpawnSubagentResult => 
       requested: raw.requested,
       depth: raw.depth,
       maxDepth: raw.maxDepth,
+    };
+  }
+  if (
+    raw.kind === 'playbook_model_unavailable' &&
+    typeof raw.requested === 'string' &&
+    typeof raw.model === 'string' &&
+    typeof raw.reason === 'string'
+  ) {
+    return {
+      kind: 'playbook_model_unavailable',
+      requested: raw.requested,
+      model: raw.model,
+      reason: raw.reason,
     };
   }
   if (

@@ -1531,6 +1531,12 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
 
   const config: HarnessConfig = {
     provider,
+    // Model catalog (PLAYBOOKS.md §1.1), threaded so the `task` tool's spawn
+    // preflight can resolve a playbook's `model` override (Phase 3). Reuse the
+    // registry already loaded above — re-reading the catalog here could diverge
+    // from the snapshot the parent committed to. Both spawn paths (run.ts,
+    // repl.ts) inherit this via the bootstrap `config`, so one wiring covers both.
+    modelRegistry: registry,
     toolRegistry,
     permissionEngine,
     db,

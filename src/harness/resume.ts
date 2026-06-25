@@ -141,7 +141,25 @@ const isSafeHead = (row: Message): boolean => {
 // (keep everything), but the safe-head walk STILL runs — uncapped must not
 // orphan a leading user_tool_result any more than capped does.
 export const resumeWindowCut = (rows: Message[], cap: number = MAX_RESUME_MESSAGES): number => {
-  let cut = rows.length > cap ? rows.length - cap : 0;
+  // Initial cut so the kept slice holds at most `cap` NON-RETRACTED rows.
+  // Retracted (un-sent) rows are dropped from the model context anyway
+  // (messagesToProviderMessages) and rendered "(unsent)" in the visual, so they
+  // must not consume the resume budget — otherwise a burst of hard-aborted
+  // prompts near the tail would evict live conversation from the window. With no
+  // retracted rows this reduces to the old `rows.length - cap`.
+  let cut = 0;
+  if (Number.isFinite(cap)) {
+    let live = 0;
+    for (let i = rows.length - 1; i >= 0; i -= 1) {
+      if (rows[i]?.retractedAt === null) {
+        live += 1;
+        if (live > cap) {
+          cut = i + 1; // drop rows[0..i]; keep the last `cap` live + interspersed retracted
+          break;
+        }
+      }
+    }
+  }
   // Walk forward past unsafe heads (user_tool_result without its
   // matching assistant). If no safe boundary exists in the kept
   // window, cut walks to rows.length and the kept slice is empty —
@@ -222,6 +240,14 @@ export const messagesToProviderMessages = (
   const out: ProviderMessage[] = [];
   for (const row of sliced) {
     if (!isAssistantOrUser(row.role)) continue;
+    // Operator un-sent this turn (migration 079): keep it out of the
+    // model-facing context so the un-send is durable across resume. The
+    // transcript / recap still render it ("cancelled") from the raw row — only
+    // the reconstituted provider messages drop it. `resumeWindowCut` above budgets
+    // the window in NON-retracted rows (and the bounded fetch likewise), so a
+    // burst of un-sends near the tail can't evict live conversation; the visual
+    // replay shares that same cut, so the windows stay aligned.
+    if (row.retractedAt !== null) continue;
     // The cast is unverified: the persistence layer stored arbitrary
     // JSON content (parseJsonSafe → unknown), and we trust that the
     // loop wrote shapes the provider can later consume. There is no

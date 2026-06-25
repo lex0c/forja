@@ -830,6 +830,34 @@ const parsePhases = (raw: unknown, sourcePath: string): PhaseDef[] | undefined =
   return out;
 };
 
+// Optional `model` override (`PLAYBOOKS.md` §1.1). A catalog model id
+// (`anthropic/claude-opus-4-8`, `openai/gpt-4o`, `ollama/<model>`);
+// absence ⇒ undefined ⇒ the subagent inherits the session model. The
+// loader stays registry-agnostic: it validates SHAPE only (non-empty,
+// no surrounding whitespace, `<family>/<model>` form). Catalog
+// EXISTENCE + provider instantiation are checked at spawn preflight,
+// where the model registry is available and the error can list the
+// known ids. Catching the obvious typo (`model: opus`) here surfaces it
+// at boot, source-aware, instead of as a mid-run spawn refusal.
+const parseModel = (raw: unknown, sourcePath: string): string | undefined => {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== 'string' || raw.length === 0) {
+    throw new Error(`subagent ${sourcePath}: 'model' must be a non-empty string`);
+  }
+  if (raw !== raw.trim()) {
+    throw new Error(
+      `subagent ${sourcePath}: 'model' has leading or trailing whitespace (got ${JSON.stringify(raw)})`,
+    );
+  }
+  const slashIdx = raw.indexOf('/');
+  if (slashIdx <= 0 || slashIdx === raw.length - 1) {
+    throw new Error(
+      `subagent ${sourcePath}: 'model' must be a catalog id of the form '<family>/<model>' (e.g. 'anthropic/claude-opus-4-8'); got ${JSON.stringify(raw)}`,
+    );
+  }
+  return raw;
+};
+
 // Map a parsed file into a SubagentDefinition. The strongly-typed
 // fields are extracted; everything else lands in `meta` so future
 // playbook surfaces can read additional frontmatter without bumping
@@ -856,6 +884,7 @@ const parseDefinition = (
     throw new Error(`subagent ${sourcePath}: body (system prompt) is empty`);
   }
 
+  const model = parseModel(fm.model, sourcePath);
   const slash = parseSlash(fm.slash, sourcePath);
   const whenToUse = parseWhenToUse(fm.when_to_use, sourcePath);
   const outputSchema = parseOutputSchema(fm.output_schema, sourcePath);
@@ -879,6 +908,7 @@ const parseDefinition = (
   const known: ReadonlySet<string> = new Set([
     'name',
     'description',
+    'model',
     'tools',
     'budget',
     'isolation',
@@ -909,6 +939,7 @@ const parseDefinition = (
     isolation,
     sourcePath,
     sourceSha256,
+    ...(model !== undefined ? { model } : {}),
     ...(slash !== undefined ? { slash } : {}),
     ...(whenToUse !== undefined ? { whenToUse } : {}),
     ...(outputSchema !== undefined ? { outputSchema } : {}),

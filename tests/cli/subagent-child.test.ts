@@ -875,6 +875,87 @@ describe('runSubagentChild', () => {
     }
   });
 
+  test('threads the model catalog into a coordinator child config (nested model override)', async () => {
+    // Achado 1 / PLAYBOOKS.md §1.1: a child that can spawn (task in its
+    // whitelist → subagents loaded) must carry `modelRegistry`, so its OWN
+    // spawn preflight can resolve a grandchild playbook's `model` override.
+    // Without it, a nested playbook with `model` fails with "no model catalog
+    // wired" even when the model is valid.
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const subagentRunsRepo = await import('../../src/storage/repos/subagent-runs.ts');
+    const messagesRepo = await import('../../src/storage/repos/messages.ts');
+
+    const projectAgentsDir = mkdtempSync(join(tmpdir(), 'forja-model-catalog-agents-'));
+    try {
+      writeFileSync(
+        join(projectAgentsDir, 'worker.md'),
+        `---
+name: worker
+description: Worker.
+tools: []
+budget:
+  max_steps: 2
+  max_cost_usd: 0.01
+---
+You are the worker.`,
+      );
+
+      let coordId: string;
+      const db = openDb(dbPath);
+      try {
+        migrate(db);
+        const top = sessionsRepo.createSession(db, { model: 'mock/m', cwd: dbDir });
+        const coord = sessionsRepo.createSession(db, {
+          model: 'mock/m',
+          cwd: dbDir,
+          parentSessionId: top.id,
+        });
+        coordId = coord.id;
+        subagentRunsRepo.insertSubagentRun(db, {
+          sessionId: coord.id,
+          name: 'coordinator',
+          scope: 'project',
+          sourcePath: '/fake/coord.md',
+          sourceSha256: 'a'.repeat(64),
+          systemPrompt: 'You are the coordinator.',
+          toolsWhitelist: ['task'],
+          budgetMaxSteps: 5,
+          budgetMaxCostUsd: 0.0,
+        });
+        messagesRepo.appendMessage(db, { sessionId: coord.id, role: 'user', content: 'go' });
+      } finally {
+        db.close();
+      }
+
+      // The provider just closes the turn — never calls task — so no grandchild
+      // actually spawns; we only need the assembled config, captured via the
+      // runAgentFn seam before the run proceeds.
+      let captured: { modelRegistry: unknown; subagentRegistry: unknown } | undefined;
+      const exitCode = await runSubagentChild({
+        sessionId: coordId,
+        dbPath,
+        providerOverride: stubProvider('done'),
+        userAgentsDir: null,
+        projectAgentsDir,
+        errSink: () => {},
+        runAgentFn: (cfg) => {
+          captured = {
+            modelRegistry: cfg.modelRegistry,
+            subagentRegistry: cfg.subagentRegistry,
+          };
+          return runAgent(cfg);
+        },
+      });
+      expect(exitCode).toBe(0);
+      // task is whitelisted ⇒ subagentRegistry is wired ⇒ the catalog must be
+      // threaded alongside it for the nested spawn preflight.
+      expect(captured?.subagentRegistry).toBeDefined();
+      expect(captured?.modelRegistry).toBeDefined();
+    } finally {
+      rmSync(projectAgentsDir, { recursive: true, force: true });
+    }
+  });
+
   test('depth flows through to the child harness config', async () => {
     // The child harness's spawn closure increments
     // (config.subagentDepth ?? 0) when launching grandchildren.

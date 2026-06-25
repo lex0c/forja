@@ -7,6 +7,13 @@ export interface ModelEntry {
   // What the underlying SDK sees, e.g., "claude-sonnet-4-6".
   modelName: string;
   capabilities: ProviderCapabilities;
+  // The env var holding this model's API key (catalog `api_key_env`), when
+  // custom (non-built-in). Surfaced on the entry so a spawn boundary can
+  // preserve every catalog model's credential var through scrubEnv — a
+  // coordinator subagent may resolve a grandchild playbook's model override,
+  // whose credential must survive the child boundary. Undefined for built-in
+  // families (their var rides PROVIDER_API_KEY_VARS) and bare registrations.
+  apiKeyEnv?: string;
   // Factory accepts `unknown` at the registry boundary so the registry
   // doesn't need to learn about every family's option type. Each adapter
   // narrows internally with a structural cast. The trade-off: callers who

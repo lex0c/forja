@@ -269,7 +269,13 @@ interface SessionBundle {
 }
 
 const loadSessionBundle = (db: DB, session: Session): SessionBundle => {
-  const messages = listMessagesBySession(db, session.id);
+  // Drop retracted (operator un-sent) turns from the recap SUMMARY (migration
+  // 079): a cancelled prompt is not part of the session's actual work, so it must
+  // not become the goal, count as a step, or otherwise pollute the projection.
+  // Cost/token sums are unaffected (user rows carry none); tool calls hang off
+  // assistant rows (never retracted). The raw rows stay in the audit log, and the
+  // resume transcript still renders them "cancelled" (resume-replay.ts).
+  const messages = listMessagesBySession(db, session.id).filter((m) => m.retractedAt === null);
   const toolCalls: ToolCall[] = [];
   for (const m of messages) {
     if (m.role !== 'assistant') continue;

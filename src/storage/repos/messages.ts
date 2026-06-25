@@ -48,6 +48,10 @@ export interface Message {
   // so historical cost surfaces resolve a session's ACTUAL metering from the
   // models it really used, not the session's initial `sessions.model`.
   model: string | null;
+  // Operator un-send (migration 079). Epoch ms when the message was retracted
+  // (hard-abort un-send), else null. Retracted turns are skipped from the
+  // model-facing context but kept in the transcript / audit as "cancelled".
+  retractedAt: number | null;
 }
 
 interface MessageRow {
@@ -66,6 +70,7 @@ interface MessageRow {
   effort: string | null;
   source: MessageSource;
   model: string | null;
+  retracted_at: number | null;
 }
 
 const fromRow = (row: MessageRow): Message => ({
@@ -84,6 +89,7 @@ const fromRow = (row: MessageRow): Message => ({
   effort: row.effort,
   source: row.source,
   model: row.model,
+  retractedAt: row.retracted_at,
 });
 
 export interface AppendMessageInput {
@@ -201,6 +207,7 @@ export const appendMessage = (db: DB, input: AppendMessageInput): Message => {
     effort,
     source,
     model,
+    retractedAt: null,
   };
 };
 
@@ -208,11 +215,19 @@ export const getMessage = (db: DB, id: string): Message | null => {
   const row = db
     .query(
       `SELECT id, session_id, parent_id, role, content,
-              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source, model
+              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source, model, retracted_at
        FROM messages WHERE id = ?`,
     )
     .get(id) as MessageRow | null;
   return row !== null ? fromRow(row) : null;
+};
+
+// Mark a message RETRACTED (operator un-sent it after a hard abort). Append-only:
+// the row stays; `retracted_at` records the un-send so the model-facing
+// conversion (messagesToProviderMessages) skips it — durable across resume —
+// while the transcript / recap still render it as "cancelled".
+export const retractMessage = (db: DB, id: string, at: number = Date.now()): void => {
+  db.query('UPDATE messages SET retracted_at = ? WHERE id = ?').run(at, id);
 };
 
 export const listMessagesBySession = (db: DB, sessionId: string): Message[] => {
@@ -225,7 +240,7 @@ export const listMessagesBySession = (db: DB, sessionId: string): Message[] => {
   const rows = db
     .query(
       `SELECT id, session_id, parent_id, role, content,
-              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source, model
+              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source, model, retracted_at
        FROM messages
        WHERE session_id = ?
        ORDER BY seq ASC`,
@@ -297,12 +312,17 @@ export interface MessageTail {
   totalCount: number;
 }
 
-// Cheap COUNT(*) of persisted rows for a session — no row materialization.
-// The resume-mode modal surfaces this so the operator can weigh "load all N"
-// vs "compact" before any history is hydrated into memory.
+// Cheap COUNT(*) of model-facing rows for a session — no row materialization.
+// The resume-mode modal surfaces this as "loaded N into context" so the operator
+// can weigh "load all N" vs "compact" before any history is hydrated. Excludes
+// retracted (un-sent) rows (migration 079) so N matches what the hydrate path
+// (messagesToProviderMessages) actually loads — an un-sent turn it omits must not
+// inflate the count.
 export const countMessagesBySession = (db: DB, sessionId: string): number =>
   (
-    db.query('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?').get(sessionId) as {
+    db
+      .query('SELECT COUNT(*) AS n FROM messages WHERE session_id = ? AND retracted_at IS NULL')
+      .get(sessionId) as {
       n: number;
     }
   ).n;
@@ -319,24 +339,47 @@ export const countAssistantMessagesBySession = (db: DB, sessionId: string): numb
       .get(sessionId) as { n: number }
   ).n;
 
-// `limit < 0` (canonically -1) means "no limit" — SQLite treats `LIMIT -1`
-// as unbounded, so it returns every row for the session. Used by the
-// uncapped "full"/"summary" resume modes; the capped path passes a positive
-// limit as before.
+// `limit < 0` (canonically -1) means "no limit": every row for the session,
+// used by the uncapped "full"/"summary" resume modes.
+//
+// For a positive `limit` the window is the last `limit` NON-RETRACTED rows, plus
+// any retracted (un-sent) rows interspersed within or after them. Budgeting in
+// non-retracted rows (not raw rows) stops a burst of hard-aborted prompts near
+// the tail from consuming the resume window and evicting live conversation: the
+// retracted rows leave the model context (messagesToProviderMessages) and render
+// "(unsent)" in the visual anyway, so they must not cost live-row budget. With
+// zero retracted rows the window is exactly "the last `limit` rows", so the
+// capped resume path is unchanged; `resumeWindowCut` likewise counts
+// non-retracted, so the final cut keeps `cap` live rows. The COALESCE fallback
+// bounds the degenerate all-retracted session (no live rows) to the last `limit`
+// raw rows instead of the whole log.
 export const listMessageTailBySession = (db: DB, sessionId: string, limit: number): MessageTail => {
-  const rows = db
-    .query(
-      `SELECT id, session_id, parent_id, role, content,
-              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source, model
-       FROM (
-         SELECT * FROM messages
-         WHERE session_id = ?
-         ORDER BY seq DESC
-         LIMIT ?
-       )
-       ORDER BY seq ASC`,
-    )
-    .all(sessionId, limit) as MessageRow[];
+  const cols = `id, session_id, parent_id, role, content,
+              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source, model, retracted_at`;
+  const rows = (
+    limit < 0
+      ? db
+          .query(`SELECT ${cols} FROM messages WHERE session_id = ? ORDER BY seq ASC`)
+          .all(sessionId)
+      : db
+          .query(
+            `SELECT ${cols}
+             FROM messages
+             WHERE session_id = ?
+               AND seq >= COALESCE(
+                 (SELECT MIN(seq) FROM (
+                    SELECT seq FROM messages
+                    WHERE session_id = ? AND retracted_at IS NULL
+                    ORDER BY seq DESC LIMIT ?)),
+                 (SELECT MIN(seq) FROM (
+                    SELECT seq FROM messages
+                    WHERE session_id = ?
+                    ORDER BY seq DESC LIMIT ?))
+               )
+             ORDER BY seq ASC`,
+          )
+          .all(sessionId, sessionId, limit, sessionId, limit)
+  ) as MessageRow[];
   // Uncapped (limit < 0) fetched the whole log already, so rows.length IS the
   // total — skip the redundant COUNT(*). The capped path still needs it to
   // report how many older rows fell outside the window.

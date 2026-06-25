@@ -8,7 +8,7 @@ import { insertCheckpoint } from '../../src/storage/repos/checkpoints.ts';
 import { createPin } from '../../src/storage/repos/context-pins.ts';
 import { appendFailureEvent } from '../../src/storage/repos/failure-events.ts';
 import { createMemoryEvent } from '../../src/storage/repos/memory-events.ts';
-import { appendMessage } from '../../src/storage/repos/messages.ts';
+import { appendMessage, retractMessage } from '../../src/storage/repos/messages.ts';
 import { type Session, completeSession, createSession } from '../../src/storage/repos/sessions.ts';
 import {
   insertSubagentOutput,
@@ -157,6 +157,20 @@ describe('projectRecap', () => {
     });
     expect(out.goal.text).toBe('refactor the queue retry logic');
     expect(out.goal.sourceStepId).toBe(userId);
+  });
+
+  test('skips a retracted (un-sent) message — it is not the goal', () => {
+    const s = seedSession();
+    const cancelledId = addUserTurn(s.id, 'oops cancelled prompt', 1_100);
+    retractMessage(db, cancelledId); // operator un-sent it (migration 079)
+    const realId = addUserTurn(s.id, 'the real goal', 1_200);
+    addAssistantTurn(s.id, realId, 'on it', { ts: 1_300 });
+    const out = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+    });
+    // The retracted prompt is filtered from the summary, so the goal is the real one.
+    expect(out.goal.text).toBe('the real goal');
+    expect(out.goal.sourceStepId).toBe(realId);
   });
 
   test('goal extraction skips whitespace-only string user messages', () => {

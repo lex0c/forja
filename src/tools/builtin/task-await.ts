@@ -190,6 +190,17 @@ export const taskAwaitTool: Tool<TaskAwaitInput, TaskAwaitOutput> = {
         },
       );
     }
+    if (result.kind === 'playbook_model_unavailable') {
+      return toolError(
+        'subagent.playbook_model_unavailable',
+        `subagent '${result.requested}' declares model '${result.model}', which is unavailable: ${result.reason}`,
+        {
+          retryable: false,
+          hint: "Fix the playbook's `model` frontmatter (use a catalog id like 'anthropic/claude-opus-4-8'), wire the provider's credential, or omit `model` to inherit the session model.",
+          details: { subagent: result.requested, model: result.model, reason: result.reason },
+        },
+      );
+    }
     if (result.kind === 'subagent_escalation') {
       // PERMISSION_ENGINE.md §10.1 — declared capabilities exceeded
       // parent's. Reachable when the originating task_async passed

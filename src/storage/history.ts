@@ -62,17 +62,21 @@ export interface AppendHistoryOptions {
 //
 // The whole flow runs under a single SQLite transaction so a
 // concurrent writer can't observe an over-cap intermediate state.
+//
+// Returns true if a row was inserted, false if suppressed (dup-of-last) or
+// history is disabled — the hard-abort un-send uses this to remove only the
+// entries a submit actually created (a suppressed dup created none).
 export const appendHistory = (
   db: DB,
   projectRoot: string,
   prompt: string,
   options: AppendHistoryOptions = {},
-): void => {
-  if (isHistoryDisabled(projectRoot)) return;
+): boolean => {
+  if (isHistoryDisabled(projectRoot)) return false;
   const cap = options.cap ?? HISTORY_CAP;
   const ts = options.ts ?? Date.now();
 
-  db.transaction(() => {
+  return db.transaction(() => {
     const last = db
       .query(
         `SELECT prompt FROM repl_history
@@ -81,7 +85,7 @@ export const appendHistory = (
          LIMIT 1`,
       )
       .get(projectRoot) as { prompt: string } | null;
-    if (last !== null && last.prompt === prompt) return;
+    if (last !== null && last.prompt === prompt) return false;
 
     db.query(
       `INSERT INTO repl_history (ts, project_root, prompt)
@@ -106,6 +110,7 @@ export const appendHistory = (
          )`,
       ).run(projectRoot, total - cap);
     }
+    return true;
   })();
 };
 
@@ -167,6 +172,34 @@ export const searchHistory = (
 
 export const clearHistory = (db: DB, projectRoot: string): void => {
   db.query('DELETE FROM repl_history WHERE project_root = ?').run(projectRoot);
+};
+
+// Remove the most-recent history row for this project IF it still matches
+// `prompt`. Used by the hard-abort un-send: the operator retracted the prompt
+// they just sent, so it must stop resurfacing via ↑/↓, Ctrl+R, and /history,
+// the same way it leaves the conversation. Matches on the tail's content (not a
+// blind "delete last") so a race that recorded a newer entry leaves history
+// untouched — we only ever drop the exact row `recordHistorySubmit` just added.
+// No-op (returns false) when history is disabled, empty, or the tail differs.
+export const deleteLastHistoryIfMatches = (
+  db: DB,
+  projectRoot: string,
+  prompt: string,
+): boolean => {
+  if (isHistoryDisabled(projectRoot)) return false;
+  return db.transaction(() => {
+    const last = db
+      .query(
+        `SELECT id, prompt FROM repl_history
+         WHERE project_root = ?
+         ORDER BY ts DESC, id DESC
+         LIMIT 1`,
+      )
+      .get(projectRoot) as { id: number; prompt: string } | null;
+    if (last === null || last.prompt !== prompt) return false;
+    db.query('DELETE FROM repl_history WHERE id = ?').run(last.id);
+    return true;
+  })();
 };
 
 export const countHistory = (db: DB, projectRoot: string): number => {

@@ -351,16 +351,27 @@ export const replaySessionMessages = (
 
     if (msg.role === 'user') {
       if (typeof msg.content === 'string' && msg.content.length > 0) {
-        if (msg.source === 'system') {
+        if (msg.retractedAt !== null) {
+          // Operator un-sent this turn (migration 079): render it cancelled, not
+          // a run-opening submit bar — it produced no response. The "(unsent)"
+          // cue persists across resume from `messages.retracted_at`.
+          bus.emit({
+            type: 'info',
+            ts: msg.createdAt,
+            tone: 'secondary',
+            message: `↶ ${msg.content}  (unsent)`,
+          });
+        } else if (msg.source === 'system') {
           // Harness-injected input (a bg_done wake notification, migration
           // 075) — render as a system info line, NOT an operator-submit
           // bar, so the replayed history matches what actually happened.
           bus.emit({ type: 'info', ts: msg.createdAt, tone: 'secondary', message: msg.content });
+          runStartTs = msg.createdAt;
         } else {
           // Operator prompt: opens a new run.
           bus.emit({ type: 'user:submit', ts: msg.createdAt, text: msg.content });
+          runStartTs = msg.createdAt;
         }
-        runStartTs = msg.createdAt;
       } else if (Array.isArray(msg.content)) {
         // tool_result continuation. Emit `tool:end` for each block
         // that pairs with a known tool_use. Iteration order matches

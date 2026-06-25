@@ -26,7 +26,8 @@ export const STATIC_GUIDANCE_BLOCK = `Standing operating context — not part of
 
 [engineering_principles]
   - Match the conventions of the code you touch; diverge only with a stated reason.
-  - Smallest correct diff: no speculative abstraction, no code without a consumer.`;
+  - Smallest correct diff: no speculative abstraction, no code without a consumer.
+  - Fix the cause, not the symptom: no suppressions, swallowed errors, or special-cases to mask a failure — when a proper fix is out of scope, surface it instead of working around it.`;
 
 // Append the static guidance block at the bottom of [current_turn]. Always runs
 // (no empty/condition check) so the guidance is present every step.

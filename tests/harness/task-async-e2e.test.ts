@@ -29,6 +29,7 @@ import { runAgent } from '../../src/harness/loop.ts';
 import { createPermissionEngine } from '../../src/permissions/index.ts';
 import type { Policy } from '../../src/permissions/index.ts';
 import type { Provider, StreamEvent } from '../../src/providers/index.ts';
+import { buildRegistryFromEntries, createRegistry } from '../../src/providers/index.ts';
 import { type DB, openDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/index.ts';
 import { createChannel, fakeTransportPair } from '../../src/subagents/ipc.ts';
@@ -155,6 +156,225 @@ afterEach(() => {
 });
 
 describe('task_async / task_await — full e2e through harness loop and real child', () => {
+  test('playbook with an unresolvable model refuses the spawn (no child) — PLAYBOOKS.md §1.1', async () => {
+    // The playbook declares a `model` that is not in the catalog. The
+    // spawn preflight (loop.ts spawnSubagentImpl) must refuse with
+    // `subagent.playbook_model_unavailable` and NEVER spawn a child.
+    let received = 0;
+    let toolResult: string | undefined;
+    const parent: Provider = {
+      ...buildParentProvider([]),
+      async *generate(req) {
+        received += 1;
+        if (received === 1) {
+          for (const ev of replayStep({
+            tool_uses: [
+              {
+                id: 'tu1',
+                name: 'task',
+                input: { subagent: 'explore', prompt: 'go', capabilities: [] },
+              },
+            ],
+            stop_reason: 'tool_use',
+          })) {
+            yield ev;
+          }
+          return;
+        }
+        // Second turn: read the tool_result the harness fed back for tu1.
+        const lastUser = req.messages[req.messages.length - 1];
+        if (lastUser !== undefined && Array.isArray(lastUser.content)) {
+          for (const block of lastUser.content) {
+            if (block.type === 'tool_result' && typeof block.content === 'string') {
+              toolResult = block.content;
+            }
+          }
+        }
+        for (const ev of replayStep({ text: 'done', stop_reason: 'end_turn' })) yield ev;
+      },
+    };
+
+    const parentRegistry = createToolRegistry();
+    registerBuiltinTools(parentRegistry);
+    const engine = createPermissionEngine(policy(), { cwd: '/p' });
+    const subagentRegistry: SubagentSet = {
+      byName: new Map([['explore', definition({ model: 'nonexistent/model' })]]),
+      shadows: [],
+    };
+    let spawnCount = 0;
+    const spawn: SpawnChildProcess = () => {
+      spawnCount += 1;
+      const { a } = fakeTransportPair();
+      return {
+        exited: Promise.resolve({ exitCode: 0 }),
+        kill: () => undefined,
+        ipc: createChannel(a),
+      };
+    };
+
+    const result = await runAgent({
+      provider: parent,
+      toolRegistry: parentRegistry,
+      permissionEngine: engine,
+      db,
+      cwd: '/p',
+      userPrompt: 'go',
+      subagentRegistry,
+      // Empty catalog ⇒ the override id resolves to `unknown`.
+      modelRegistry: buildRegistryFromEntries([]),
+      spawnChildProcess: spawn,
+    });
+
+    expect(result.status).toBe('done');
+    // Preflight refused BEFORE any child process was started.
+    expect(spawnCount).toBe(0);
+    expect(toolResult).toBeDefined();
+    expect(toolResult).toContain('subagent.playbook_model_unavailable');
+    expect(toolResult).toContain('nonexistent/model');
+  });
+
+  test('a playbook with a valid model runs the child on THAT model (happy path) — PLAYBOOKS.md §1.1', async () => {
+    // The playbook declares a model present in the catalog. The spawn preflight
+    // resolves it and passes the resolved provider to runSubagent, so the child
+    // session records THAT model id — not the session's 'mock/parent'. Proves
+    // the override takes effect end-to-end (the child session is the audit/cost
+    // anchor that records which model actually ran).
+    const PLAYBOOK_MODEL = 'stub/playbook-model';
+    const resolvedProvider: Provider = { ...buildChildProvider('resolved'), id: PLAYBOOK_MODEL };
+    const registry = createRegistry();
+    registry.register({
+      id: PLAYBOOK_MODEL,
+      family: 'anthropic',
+      modelName: 'playbook-model',
+      capabilities: resolvedProvider.capabilities,
+      factory: () => resolvedProvider,
+    });
+
+    // No need to read the request here (unlike the refusal test), so the
+    // scripted provider is enough: turn 1 spawns, turn 2 closes.
+    const parent = buildParentProvider([
+      {
+        tool_uses: [
+          {
+            id: 'tu1',
+            name: 'task',
+            input: { subagent: 'explore', prompt: 'go', capabilities: [] },
+          },
+        ],
+        stop_reason: 'tool_use',
+      },
+      { text: 'done', stop_reason: 'end_turn' },
+    ]);
+
+    const parentRegistry = createToolRegistry();
+    registerBuiltinTools(parentRegistry);
+    const engine = createPermissionEngine(policy(), { cwd: '/p' });
+    const subagentRegistry: SubagentSet = {
+      byName: new Map([['explore', definition({ model: PLAYBOOK_MODEL })]]),
+      shadows: [],
+    };
+    const spawn: SpawnChildProcess = (opts) => {
+      const { a, b } = fakeTransportPair();
+      const parentChannel = createChannel(a);
+      const exited = runSubagentChild({
+        sessionId: opts.sessionId,
+        dbPath,
+        providerOverride: buildChildProvider('child output'),
+        userAgentsDir: null,
+        projectAgentsDir: null,
+        errSink: () => undefined,
+        ipcVersion: 1,
+        ipcTransportFactory: () => b,
+      }).then((exitCode) => ({ exitCode }));
+      return { exited, kill: () => undefined, ipc: parentChannel };
+    };
+
+    const result = await runAgent({
+      provider: parent,
+      toolRegistry: parentRegistry,
+      permissionEngine: engine,
+      db,
+      cwd: '/p',
+      userPrompt: 'go',
+      subagentRegistry,
+      modelRegistry: registry,
+      spawnChildProcess: spawn,
+    });
+
+    expect(result.status).toBe('done');
+    // The child session records the playbook's model, not the session's.
+    const childModels = db
+      .query('SELECT model FROM sessions WHERE parent_session_id = ?')
+      .all(result.sessionId) as { model: string }[];
+    expect(childModels.length).toBeGreaterThan(0);
+    expect(childModels.every((r) => r.model === PLAYBOOK_MODEL)).toBe(true);
+  });
+
+  // Spawn `wrk` (with the given whitelist) and capture the catalog credential
+  // vars the harness forwarded for it — WITHOUT running the child (the gate
+  // decides opts.catalogApiKeyEnvVars before spawnChildProcess is called, and
+  // skipping the child keeps the test off the loadModelRegistry path).
+  const captureSpawnCatalogVars = async (
+    playbookTools: string[],
+  ): Promise<string[] | undefined> => {
+    const registry = createRegistry();
+    registry.register({
+      id: 'vendor/model',
+      family: 'anthropic',
+      modelName: 'm',
+      capabilities: buildChildProvider('').capabilities,
+      apiKeyEnv: 'VLLM_KEY',
+      factory: () => buildChildProvider(''),
+    });
+    const parent = buildParentProvider([
+      {
+        tool_uses: [
+          { id: 'tu1', name: 'task', input: { subagent: 'wrk', prompt: 'go', capabilities: [] } },
+        ],
+        stop_reason: 'tool_use',
+      },
+      { text: 'done', stop_reason: 'end_turn' },
+    ]);
+    const parentRegistry = createToolRegistry();
+    registerBuiltinTools(parentRegistry);
+    const engine = createPermissionEngine(policy(), { cwd: '/p' });
+    const subagentRegistry: SubagentSet = {
+      byName: new Map([['wrk', definition({ name: 'wrk', tools: playbookTools })]]),
+      shadows: [],
+    };
+    let captured: string[] | undefined;
+    const spawn: SpawnChildProcess = (opts) => {
+      captured = opts.catalogApiKeyEnvVars;
+      return {
+        exited: Promise.resolve({ exitCode: 0 }),
+        kill: () => undefined,
+        ipc: createChannel(fakeTransportPair().a),
+      };
+    };
+    const result = await runAgent({
+      provider: parent,
+      toolRegistry: parentRegistry,
+      permissionEngine: engine,
+      db,
+      cwd: '/p',
+      userPrompt: 'go',
+      subagentRegistry,
+      modelRegistry: registry,
+      spawnChildProcess: spawn,
+    });
+    expect(result.status).toBe('done');
+    return captured;
+  };
+
+  test('forwards catalog credential vars only to a spawn-capable child (gate) — PLAYBOOKS.md §1.1', async () => {
+    // Coordinator (task whitelisted) → gets every catalog model's custom
+    // credential var so it can authenticate a grandchild's model override.
+    expect(await captureSpawnCatalogVars(['task'])).toContain('VLLM_KEY');
+    // Leaf (no spawn tool) → gated out; carries no other-model credentials.
+    const leafVars = await captureSpawnCatalogVars([]);
+    expect(leafVars === undefined || leafVars.length === 0).toBe(true);
+  });
+
   test('three task_async spawns + three task_await collect; children run in parallel', async () => {
     // The parent's tool_use script:
     //   step 1: emit three task_async calls in one turn
