@@ -339,24 +339,47 @@ export const countAssistantMessagesBySession = (db: DB, sessionId: string): numb
       .get(sessionId) as { n: number }
   ).n;
 
-// `limit < 0` (canonically -1) means "no limit" — SQLite treats `LIMIT -1`
-// as unbounded, so it returns every row for the session. Used by the
-// uncapped "full"/"summary" resume modes; the capped path passes a positive
-// limit as before.
+// `limit < 0` (canonically -1) means "no limit": every row for the session,
+// used by the uncapped "full"/"summary" resume modes.
+//
+// For a positive `limit` the window is the last `limit` NON-RETRACTED rows, plus
+// any retracted (un-sent) rows interspersed within or after them. Budgeting in
+// non-retracted rows (not raw rows) stops a burst of hard-aborted prompts near
+// the tail from consuming the resume window and evicting live conversation: the
+// retracted rows leave the model context (messagesToProviderMessages) and render
+// "(unsent)" in the visual anyway, so they must not cost live-row budget. With
+// zero retracted rows the window is exactly "the last `limit` rows", so the
+// capped resume path is unchanged; `resumeWindowCut` likewise counts
+// non-retracted, so the final cut keeps `cap` live rows. The COALESCE fallback
+// bounds the degenerate all-retracted session (no live rows) to the last `limit`
+// raw rows instead of the whole log.
 export const listMessageTailBySession = (db: DB, sessionId: string, limit: number): MessageTail => {
-  const rows = db
-    .query(
-      `SELECT id, session_id, parent_id, role, content,
-              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source, model, retracted_at
-       FROM (
-         SELECT * FROM messages
-         WHERE session_id = ?
-         ORDER BY seq DESC
-         LIMIT ?
-       )
-       ORDER BY seq ASC`,
-    )
-    .all(sessionId, limit) as MessageRow[];
+  const cols = `id, session_id, parent_id, role, content,
+              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, prompt_hash, effort, source, model, retracted_at`;
+  const rows = (
+    limit < 0
+      ? db
+          .query(`SELECT ${cols} FROM messages WHERE session_id = ? ORDER BY seq ASC`)
+          .all(sessionId)
+      : db
+          .query(
+            `SELECT ${cols}
+             FROM messages
+             WHERE session_id = ?
+               AND seq >= COALESCE(
+                 (SELECT MIN(seq) FROM (
+                    SELECT seq FROM messages
+                    WHERE session_id = ? AND retracted_at IS NULL
+                    ORDER BY seq DESC LIMIT ?)),
+                 (SELECT MIN(seq) FROM (
+                    SELECT seq FROM messages
+                    WHERE session_id = ?
+                    ORDER BY seq DESC LIMIT ?))
+               )
+             ORDER BY seq ASC`,
+          )
+          .all(sessionId, sessionId, limit, sessionId, limit)
+  ) as MessageRow[];
   // Uncapped (limit < 0) fetched the whole log already, so rows.length IS the
   // total — skip the redundant COUNT(*). The capped path still needs it to
   // report how many older rows fell outside the window.

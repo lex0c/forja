@@ -220,6 +220,38 @@ describe('messagesToProviderMessages', () => {
     // walk, not the cap).
     expect(resumeWindowCut(rows)).toBe(1);
   });
+
+  test('resumeWindowCut budgets the window in non-retracted rows (079)', () => {
+    const dead = (c: string): Message => ({ ...msg('user', c), retractedAt: 1 });
+    // 3 live with retracted interspersed; cap = 2. The (cap+1)-th-from-last live
+    // is live1 at idx 0, so cut drops it and keeps from idx 1 — which still holds
+    // the last 2 live (live2, live3). The old all-rows budget would have kept the
+    // last 2 RAW rows (dead2, live3), evicting live2.
+    const rows: Message[] = [
+      msg('user', 'live1'),
+      dead('dead1'),
+      msg('user', 'live2'),
+      dead('dead2'),
+      msg('user', 'live3'),
+    ];
+    expect(resumeWindowCut(rows, 2)).toBe(1);
+  });
+
+  test('a burst of retracted rows near the tail does not evict live conversation (079)', () => {
+    // MAX live rows, then MAX retracted at the very tail. The old cut (counting
+    // ALL rows) kept the last MAX = all retracted → 0 live. Budgeting in
+    // non-retracted rows keeps every live row and drops every cancelled one.
+    const live: Message[] = Array.from({ length: MAX_RESUME_MESSAGES }, (_, i) =>
+      i % 2 === 0 ? msg('user', `u${i}`) : msg('assistant', `a${i}`),
+    );
+    const retractedTail: Message[] = Array.from({ length: MAX_RESUME_MESSAGES }, () => ({
+      ...msg('user', 'cancelled'),
+      retractedAt: 1,
+    }));
+    const r = messagesToProviderMessages([...live, ...retractedTail]);
+    expect(r.messages.some((m) => m.content === 'u0')).toBe(true); // earliest live not evicted
+    expect(r.messages.some((m) => m.content === 'cancelled')).toBe(false); // no un-sent text
+  });
 });
 
 describe('messagesToProviderMessages: alignment to safe head', () => {

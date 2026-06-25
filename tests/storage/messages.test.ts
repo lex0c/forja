@@ -46,6 +46,21 @@ describe('messages repo', () => {
     expect(countMessagesBySession(db, sessionId)).toBe(1);
   });
 
+  test('listMessageTailBySession budgets the tail window in non-retracted rows (079)', () => {
+    for (let i = 0; i < 3; i++) appendMessage(db, { sessionId, role: 'user', content: `live${i}` });
+    for (let i = 0; i < 5; i++) {
+      const m = appendMessage(db, { sessionId, role: 'user', content: `dead${i}` });
+      retractMessage(db, m.id);
+    }
+    // limit=3: "last 3 raw rows" would return 3 retracted (0 live) and evict the
+    // live conversation; the non-retracted window returns all 3 live rows plus the
+    // retracted ones after them.
+    const tail = listMessageTailBySession(db, sessionId, 3);
+    const live = tail.messages.filter((m) => m.retractedAt === null);
+    expect(live.map((m) => m.content)).toEqual(['live0', 'live1', 'live2']);
+    expect(tail.totalCount).toBe(8); // totalCount stays the full row count
+  });
+
   test('records the per-turn model on assistant rows and round-trips it (migration 077)', () => {
     const a = appendMessage(db, {
       sessionId,
