@@ -1,4 +1,5 @@
 import { computeCost, emptyUsage } from '../providers/cost.ts';
+import { estimatePromptTokens } from '../providers/tokens.ts';
 import type {
   GenerateRequest,
   Provider,
@@ -283,24 +284,42 @@ const callSummaryProvider = async (
   options: CompactionOptions,
 ): Promise<SummaryAttempt> => {
   const transcript = renderTranscriptForSummary(middle);
+  const messages: ProviderMessage[] = [
+    {
+      role: 'user',
+      content: `ORIGINAL GOAL (preserve literally in summary):\n${goalText(goal)}\n\nTRANSCRIPT TO SUMMARIZE:\n${transcript}`,
+    },
+  ];
+
+  // Clamp the summary cap THREE ways — the compaction path bypasses
+  // `resolveMaxOutputTokens` (which guards normal generate calls):
+  //   1. the requested value (`compactionMaxTokens`, default 1024);
+  //   2. the provider's output ceiling — the 64k config ceiling can exceed an
+  //      Ollama/OpenRouter entry's `output_max_tokens`;
+  //   3. the room left in THIS request's window. The summary call sends the
+  //      transcript as input, so input + max_tokens must fit the context window;
+  //      near the 0.7 trigger the transcript can be ~140k on a 200k window, so a
+  //      64k cap would overflow the summary call ITSELF and degrade into fallback
+  //      before any summary is produced.
+  // The `Math.max(1, …)` floor keeps max_tokens valid when the input alone nearly
+  // fills the window (a doomed request that then fails cleanly into fallback).
+  // Shared chokepoint ⇒ every path (auto loop, /compact, summary-resume, eval) is
+  // covered.
+  const summaryInputTokens = estimatePromptTokens(messages, { system: COMPACTION_SYSTEM_PROMPT });
+  const maxTokens = Math.max(
+    1,
+    Math.min(
+      options.maxTokens ?? 1024,
+      provider.capabilities.output_max_tokens,
+      provider.capabilities.context_window - summaryInputTokens,
+    ),
+  );
 
   const req: GenerateRequest = {
     model: provider.id,
     system: COMPACTION_SYSTEM_PROMPT,
-    messages: [
-      {
-        role: 'user',
-        content: `ORIGINAL GOAL (preserve literally in summary):\n${goalText(goal)}\n\nTRANSCRIPT TO SUMMARIZE:\n${transcript}`,
-      },
-    ],
-    // Clamp to the provider's output ceiling. The compaction path bypasses
-    // `resolveMaxOutputTokens` (which guards normal generate calls), so an
-    // operator-raised `compactionMaxTokens` above the model's output_max_tokens
-    // (the 64k config ceiling can exceed an Ollama/OpenRouter entry's cap) would
-    // otherwise send an invalid max_tokens and fail the summary into deterministic
-    // fallback instead of producing the larger summary requested. Shared chokepoint
-    // ⇒ every path (auto loop, /compact, summary-resume, eval) is covered.
-    max_tokens: Math.min(options.maxTokens ?? 1024, provider.capabilities.output_max_tokens),
+    messages,
+    max_tokens: maxTokens,
     temperature: 0,
   };
 

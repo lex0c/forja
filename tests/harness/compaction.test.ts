@@ -11,6 +11,7 @@ import type {
   ProviderMessage,
   StreamEvent,
 } from '../../src/providers/index.ts';
+import { estimatePromptTokens } from '../../src/providers/tokens.ts';
 
 const baseCaps: Provider['capabilities'] = {
   tools: 'native',
@@ -52,12 +53,13 @@ const replyTextWithUsage = (
 
 const mockProvider = (
   reply: ((req: GenerateRequest) => Iterable<StreamEvent>) | Error,
+  capsOverride?: Partial<Provider['capabilities']>,
 ): MockProviderHandle => {
   const generateCalls: GenerateRequest[] = [];
   const provider: Provider = {
     id: 'mock/c',
     family: 'anthropic',
-    capabilities: baseCaps,
+    capabilities: capsOverride !== undefined ? { ...baseCaps, ...capsOverride } : baseCaps,
     async *generate(req) {
       generateCalls.push(req);
       if (reply instanceof Error) throw reply;
@@ -302,6 +304,27 @@ describe('compactMessages — LLM path', () => {
     );
     await compactMessages(handle.provider, buildHistory(5), { preserveTail: 3, maxTokens: 8192 });
     expect(handle.generateCalls[0]?.max_tokens).toBe(4096);
+  });
+
+  test('clamps the summary max_tokens to the remaining context window', async () => {
+    // Small window where the transcript fills most of it: both the requested value
+    // (8000) and the output cap (8000) exceed the room left, so the WINDOW bound is
+    // binding. Without it the summary call would send input + 8000 > 4000 and fail
+    // into fallback before producing a summary.
+    const handle = mockProvider(
+      () => replyText('[compacted_history]\nGOAL: x\n[/compacted_history]'),
+      { context_window: 4000, output_max_tokens: 8000 },
+    );
+    await compactMessages(handle.provider, buildHistory(8), { preserveTail: 1, maxTokens: 8000 });
+    const req = handle.generateCalls[0];
+    expect(req).toBeDefined();
+    const inputTokens = estimatePromptTokens(req?.messages ?? [], {
+      ...(req?.system !== undefined ? { system: req.system } : {}),
+    });
+    // The summary request fits its own window: input + max_tokens ≤ context_window.
+    expect((req?.max_tokens ?? 0) + inputTokens).toBeLessThanOrEqual(4000);
+    // The window, not the 8000 output cap, was the binding limit.
+    expect(req?.max_tokens).toBeLessThan(8000);
   });
 
   test('flags truncation when the summary hits the output cap (stop_reason=max_tokens)', async () => {
