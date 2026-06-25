@@ -312,12 +312,17 @@ export interface MessageTail {
   totalCount: number;
 }
 
-// Cheap COUNT(*) of persisted rows for a session — no row materialization.
-// The resume-mode modal surfaces this so the operator can weigh "load all N"
-// vs "compact" before any history is hydrated into memory.
+// Cheap COUNT(*) of model-facing rows for a session — no row materialization.
+// The resume-mode modal surfaces this as "loaded N into context" so the operator
+// can weigh "load all N" vs "compact" before any history is hydrated. Excludes
+// retracted (un-sent) rows (migration 079) so N matches what the hydrate path
+// (messagesToProviderMessages) actually loads — an un-sent turn it omits must not
+// inflate the count.
 export const countMessagesBySession = (db: DB, sessionId: string): number =>
   (
-    db.query('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?').get(sessionId) as {
+    db
+      .query('SELECT COUNT(*) AS n FROM messages WHERE session_id = ? AND retracted_at IS NULL')
+      .get(sessionId) as {
       n: number;
     }
   ).n;
