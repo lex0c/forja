@@ -26,6 +26,7 @@ import { createDegradedBannerEmitter } from '../permissions/degraded-banner.ts';
 import { addUsage, computeCost, emptyUsage } from '../providers/cost.ts';
 import type {
   GenerateRequest,
+  ProviderMessage,
   ProviderToolDef,
   ProviderToolResultBlock,
 } from '../providers/index.ts';
@@ -2593,22 +2594,32 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           countReasoning: config.provider.replaysReasoning === true,
         };
         const contextWindow = config.provider.capabilities.context_window;
-        // Count the REAL request's message shape, not just the stored history: the
-        // step loop appends the working-state panel + static guidance to the last
-        // user message before sending. enableStaticGuidance is on for the main CLI
-        // and a populated panel can add several KB — enough to push a just-under-
-        // ceiling refine 'skip' over the window once max_tokens is reserved, so the
-        // trigger + fit decision must see them. The forced synthesis path sends its
-        // own (small) directive instead of these blocks, so skip them under `force`.
-        // The exact step arg only sizes the "N steps ago" labels (a few chars), so
-        // the prior iteration's `steps` is close enough for the estimate.
-        const requestMessages = [...ctx.getMessages()];
-        if (!force) {
-          injectWorkingStateBlock(requestMessages, workingStateStore.get(sessionId), steps);
-          if (config.enableStaticGuidance) {
-            injectStaticGuidance(requestMessages, isSmallWindow(contextWindow));
+        // The NEXT request reserves max_tokens; the provider rejects
+        // input + max_tokens > window. The 0.7 trigger's 30% headroom covers a
+        // normal output cap, but a model whose cap exceeds it (e.g. 64k on a 200k
+        // window) needs this tighter ceiling. Shared by the refine skip AND the
+        // relevance short-circuit so neither leaves the next request over-window.
+        const outputFitCeiling =
+          contextWindow - resolveMaxOutputTokens(budget, config.provider.capabilities);
+        // The real request the step loop sends appends the working-state panel +
+        // static guidance to the last user message (the forced synthesis path sends
+        // its own directive instead, so skip them under `force`). Build that
+        // POST-INJECTION shape so the trigger, the refine fit decision, AND the
+        // relevance short-circuit all measure what's ACTUALLY sent —
+        // enableStaticGuidance is on for the main CLI and a populated panel can add
+        // several KB, enough to flip a near-ceiling decision. The exact step arg
+        // only sizes the "N steps ago" labels (a few chars), so the prior
+        // iteration's `steps` is close enough.
+        const buildRequestShape = (messages: readonly ProviderMessage[]): ProviderMessage[] => {
+          const shape = [...messages];
+          if (!force) {
+            injectWorkingStateBlock(shape, workingStateStore.get(sessionId), steps);
+            if (config.enableStaticGuidance)
+              injectStaticGuidance(shape, isSmallWindow(contextWindow));
           }
-        }
+          return shape;
+        };
+        const requestMessages = buildRequestShape(ctx.getMessages());
         const promptTokens = estimatePromptTokens(requestMessages, estimateOpts);
         const triggerAt = compactionTriggerTokens(budget.compactionThreshold, contextWindow);
         // Need goal + something-to-fold + an assistant boundary for the tail;
@@ -2636,13 +2647,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           promptTokens,
           triggerAt,
           fixedTokens: estimatePromptTokens([], estimateOpts),
-          // The NEXT request reserves max_tokens; the provider rejects
-          // input + max_tokens > window. The 0.7 trigger's 30% headroom covers a
-          // normal output cap, but a model whose cap exceeds it (e.g. 64k on a
-          // 200k window) needs this tighter ceiling so a skip can't leave the next
-          // request over-window.
-          outputFitCeiling:
-            contextWindow - resolveMaxOutputTokens(budget, config.provider.capabilities),
+          outputFitCeiling,
           countMessages: () => withAbort(config.provider.countTokens(requestMessages), signal),
         });
         if (refine === 'skip' || signal.aborted) return null;
@@ -2685,12 +2690,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // ctxRef pins the (guard-narrowed) context so the closures below don't
         // re-widen `ctx` to `| undefined`.
         const ctxRef = ctx;
+        // Post-injection + force-aware (same buildRequestShape + estimateOpts as
+        // promptTokens) so the relevance short-circuit's tokensAfterElide and the
+        // audit's before/after deltas measure the real request, not the bare history.
         const estimateNow = (): number =>
-          estimatePromptTokens([...ctxRef.getMessages()], {
-            ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
-            ...(tools.length > 0 ? { tools } : {}),
-            countReasoning: config.provider.replaysReasoning === true,
-          });
+          estimatePromptTokens(buildRequestShape(ctxRef.getMessages()), estimateOpts);
         const beforeHash = hashContext(ctxRef.getMessages());
         // Thin adapter over the shared recorder: supplies the loop's beforeHash
         // + live array + trigger tokens. The skip-skipped / hashing /
@@ -2767,8 +2771,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             // (CONTEXT_TUNING §12.4). With pins active, fall through to the LLM
             // fold below; it runs on the already-gated history, so the pre-pass
             // still pays off, and pinnedBlock re-injection is honored.
-            if (tokensAfterElide <= triggerAt && pinnedBlock === undefined) {
-              // Relevance alone got us under the threshold, no pins — done, no LLM.
+            if (
+              tokensAfterElide <= Math.min(triggerAt, outputFitCeiling) &&
+              pinnedBlock === undefined
+            ) {
+              // Relevance alone got us under BOTH the threshold and the output-fit
+              // ceiling, no pins — done, no LLM. (Same min() the refine skip uses,
+              // and tokensAfterElide is the post-injection shape, so the next
+              // request can't re-add the panel/guidance and overflow.)
               const relevanceReason = `relevance-elide: ${elide.elidedCount} tool_results pointered, ${elide.freedBytes}B freed`;
               persistCompaction({
                 strategy: 'relevance',
