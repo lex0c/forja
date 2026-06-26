@@ -14,6 +14,7 @@ import {
   recordProactiveExposures,
   resolveCachedRecall,
 } from '../../src/harness/proactive-memory-inject.ts';
+import { serializeMemoryFile } from '../../src/memory/index.ts';
 import type { ScopeRoots } from '../../src/memory/paths.ts';
 import type { RecalledMemory } from '../../src/memory/proactive-recall.ts';
 import { createMemoryRegistry } from '../../src/memory/registry.ts';
@@ -200,6 +201,39 @@ describe('createProactiveRecall (wiring)', () => {
     // The fix returns the active seed body, not the expired top-level shadow.
     expect(foo?.body).toContain('FRESH');
     expect(foo?.body).not.toContain('STALE');
+  });
+
+  test('records provenance for the injected seed, not the expired top-level shadow', async () => {
+    // Same shadow scenario, asserting the AUDIT row: its content hash must
+    // describe the ranked seed bytes, not the top-level an unqualified peek hits.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    mkdirSync(roots.user, { recursive: true });
+    writeIndex(roots.user, '- [Foo](foo.md) — auth helper\n');
+    writeFileSync(
+      join(roots.user, 'foo.md'),
+      '---\nname: foo\ndescription: auth helper\ntype: feedback\nsource: inferred\nexpires: 2020-01-01\n---\n\nSTALE auth token body\n',
+    );
+    const seedsDir = join(roots.user, 'seeds');
+    mkdirSync(seedsDir, { recursive: true });
+    writeIndex(seedsDir, '- [Foo](foo.md) — auth helper\n');
+    writeFileSync(
+      join(seedsDir, 'foo.md'),
+      '---\nname: foo\ndescription: auth helper\ntype: feedback\nsource: seed\nseed_origin: vendor\nseed_version: "1.0"\n---\n\nFRESH auth token seed body\n',
+    );
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const recall = createProactiveRecall({ registry, minScore: 0 });
+    const out = await recall({ goalText: 'auth', prompt: 'auth token' });
+    recordProactiveExposures(db, registry, sessionId, out);
+
+    const rows = listProvenanceByName(db, sessionId, 'foo');
+    expect(rows).toHaveLength(1);
+    // The hash must be the seed's, not the expired top-level shadow's.
+    const seed = registry.peek('foo', { scope: 'user', subdir: 'seeds' });
+    expect(seed.kind).toBe('present');
+    if (seed.kind === 'present') {
+      expect(rows[0]?.memoryContentHash).toBe(hashMemoryContent(serializeMemoryFile(seed.file)));
+    }
   });
 
   test('recordProactiveExposures writes a canonical proactive row per loaded memory', () => {

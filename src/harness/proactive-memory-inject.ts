@@ -57,6 +57,31 @@ export const injectProactiveMemoryBlock = (
   appendTextToLastUserMessage(messages, block);
 };
 
+// Resolve a recalled node to the SAME on-disk file the proactive view ranked —
+// used for BOTH the injected body and its provenance row, so they can never
+// refer to different bytes. The node id carries no subdir, so an unqualified
+// peek(name, {scope}) can resolve a higher-precedence shadow (e.g. an expired /
+// quarantined top-level over the active seed the view selected). Re-run the
+// view's trustedOnly listing filters (active, non-expired, deduped — mirror
+// createMemoryView's list()), find this node's surviving listing, and peek it
+// scope-pinned via listingScopeOption so the subdir matches. Re-validate trust /
+// active on the loaded bytes (fail-closed). excludeScopes isn't threaded: the
+// node was already validated through a view that applied it, so its scope was
+// never excluded — and the winner among (scope, name) is picked by state/expiry,
+// which a scope filter doesn't change.
+const resolveRankedMemoryFile = (registry: MemoryRegistry, scope: MemoryScope, name: string) => {
+  const listing = registry
+    .list({ deduplicateByName: true, states: ['active'], includeExpired: false })
+    .find((l) => l.scope === scope && l.name === name);
+  if (listing === undefined) return null;
+  const file = registry.peek(listing.name, listingScopeOption(listing));
+  if (file.kind !== 'present') return null;
+  const fm = file.file.frontmatter;
+  if (fm.trust === 'untrusted') return null;
+  if (fm.state !== undefined && fm.state !== 'active') return null;
+  return file.file;
+};
+
 // Build the proactive recall fn from the registry (MEMORY.md §4.4 P2
 // wiring). Encapsulates the §4.4 I3 view (`trustedOnly` + `loadBodies`)
 // and the body loader so the loop call site stays a one-liner. The
@@ -85,33 +110,8 @@ export const createProactiveRecall = (deps: {
     loadBody: (nodeId) => {
       const parsed = parseMemoryNodeId(nodeId);
       if (parsed === null) return null;
-      // Resolve the body via the SAME listing the view ranked — NOT an
-      // unqualified peek(name, {scope}). The node id carries no subdir, so
-      // peek(name, {scope}) can resolve a different on-disk file than BM25
-      // ranked: e.g. an expired top-level `foo.md` shadowing the active
-      // `seeds/foo.md` the view selected (the view's list() drops expired and
-      // dedupes by name, then peeks scope-pinned). Re-run those listing filters
-      // — must mirror createMemoryView's list() on the trustedOnly path (active,
-      // non-expired, deduped) — find this node's surviving listing, and peek it
-      // scope-pinned via listingScopeOption so the subdir matches the candidate.
-      const listings = deps.registry.list({
-        deduplicateByName: true,
-        states: ['active'],
-        includeExpired: false,
-        ...(deps.excludeScopes !== undefined && deps.excludeScopes.length > 0
-          ? { excludeScopes: deps.excludeScopes }
-          : {}),
-      });
-      const listing = listings.find((l) => l.scope === parsed.scope && l.name === parsed.name);
-      if (listing === undefined) return null;
-      const file = deps.registry.peek(listing.name, listingScopeOption(listing));
-      if (file.kind !== 'present') return null;
-      // Defense-in-depth on the loaded bytes: the listing already passed the
-      // filters, but fail closed if the snapshot drifted between list and peek.
-      const fm = file.file.frontmatter;
-      if (fm.trust === 'untrusted') return null;
-      if (fm.state !== undefined && fm.state !== 'active') return null;
-      return file.file.body;
+      const file = resolveRankedMemoryFile(deps.registry, parsed.scope, parsed.name);
+      return file === null ? null : file.body;
     },
     ...(deps.minScore !== undefined ? { minScore: deps.minScore } : {}),
     ...(deps.topK !== undefined ? { topK: deps.topK } : {}),
@@ -151,12 +151,13 @@ export const resolveCachedRecall = async (
 // RECOMPUTE only (not every re-inject) so a stable goal logs one exposure per
 // focus, not per step.
 //
-// Re-peeks each memory to build the exposure the way the eager /
-// retrieve_context emitters do: the content hash is over `serializeMemoryFile`
-// (frontmatter + body) so it cross-compares with those surfaces' rows for the
-// same memory, and the state is the REAL frontmatter state, not an assumption.
-// Per-row try/catch (also like eager): one audit-write failure must not drop
-// the exposures for the rest.
+// Resolves each memory via the SAME ranked listing the body was loaded from
+// (resolveRankedMemoryFile — subdir included), so the hash + state describe the
+// EXACT bytes that were injected, not a higher-precedence shadow. The hash is
+// over `serializeMemoryFile` (frontmatter + body) so it cross-compares with the
+// eager / retrieve_context rows for the same memory, and the state is the REAL
+// frontmatter state. Per-row try/catch (also like eager): one audit-write
+// failure must not drop the exposures for the rest.
 export const recordProactiveExposures = (
   db: DB,
   registry: MemoryRegistry,
@@ -166,8 +167,8 @@ export const recordProactiveExposures = (
   for (const m of recalled) {
     const parsed = parseMemoryNodeId(m.nodeId);
     if (parsed === null) continue;
-    const file = registry.peek(parsed.name, { scope: parsed.scope });
-    if (file.kind !== 'present') continue;
+    const file = resolveRankedMemoryFile(registry, parsed.scope, parsed.name);
+    if (file === null) continue;
     try {
       recordProvenance(db, {
         sessionId,
@@ -175,8 +176,8 @@ export const recordProactiveExposures = (
         memoryScope: parsed.scope,
         memoryName: parsed.name,
         surface: 'proactive',
-        memoryContentHash: hashMemoryContent(serializeMemoryFile(file.file)),
-        memoryStateAtExposure: file.file.frontmatter.state ?? 'active',
+        memoryContentHash: hashMemoryContent(serializeMemoryFile(file)),
+        memoryStateAtExposure: file.frontmatter.state ?? 'active',
       });
     } catch {
       // best-effort per row — swallow so the rest still record.
